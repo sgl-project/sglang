@@ -429,6 +429,9 @@ class HiCacheFile(HiCacheStorage):
     def __init__(
         self, storage_config: HiCacheStorageConfig, file_path: str = "/tmp/hicache"
     ):
+        self.read_workers = max(1, envs.SGLANG_HICACHE_FILE_BACKEND_READ_WORKERS.get())
+        self._read_pool = None
+        self._read_pool_lock = threading.Lock()
         self.file_path = (
             envs.SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR.get()
             or (storage_config.extra_config or {}).get("file_storage_path")
@@ -573,12 +576,38 @@ class HiCacheFile(HiCacheStorage):
         target_locations: List[torch.Tensor],
         target_sizes: Optional[Any] = None,
     ) -> List[torch.Tensor | None]:
-        return [
-            self.get(key, target_location)
-            for key, target_location in zip(
-                keys, target_locations or [None] * len(keys)
-            )
-        ]
+        return self._map_reads(
+            lambda kt: self.get(kt[0], kt[1]),
+            list(zip(keys, target_locations or [None] * len(keys))),
+        )
+
+    def _map_reads(self, fn, items: list) -> list:
+        """[fn(x) for x in items], on the read pool when read_workers > 1.
+
+        Returns only after every read has finished (they write into caller-owned
+        buffers), in input order, so callers see the same results as a serial
+        loop. A read that raises becomes a miss (None).
+        """
+        if self.read_workers <= 1 or len(items) <= 1:
+            return [fn(x) for x in items]
+        if self._read_pool is None:
+            with self._read_pool_lock:
+                if self._read_pool is None:
+                    from concurrent.futures import ThreadPoolExecutor
+
+                    self._read_pool = ThreadPoolExecutor(
+                        max_workers=self.read_workers,
+                        thread_name_prefix="hicache-file-read",
+                    )
+        futures = [self._read_pool.submit(fn, x) for x in items]
+        results = []
+        for future in futures:
+            try:
+                results.append(future.result())
+            except Exception as e:
+                logger.error(f"HiCacheFile parallel read failed: {e}")
+                results.append(None)
+        return results
 
     def set(
         self,
@@ -772,11 +801,44 @@ class HiCacheFile(HiCacheStorage):
                 results[transfer.name] = [False] * len(keys)
                 continue
 
-            results[transfer.name] = [
-                op_fn(transfer.name, key, host_pool, host_indices[i * page_size].item())
+            args = [
+                (transfer.name, key, host_pool, host_indices[i * page_size].item())
                 for i, key in enumerate(keys)
             ]
+            if op_fn == self._read_page and self.read_workers > 1 and len(args) > 1:
+                results[transfer.name] = self._read_pages_parallel(host_pool, args)
+            else:
+                results[transfer.name] = [op_fn(*a) for a in args]
         return results
+
+    def _read_pages_parallel(self, host_pool, args: list) -> List[bool]:
+        """_read_page for many pages: file reads on the read pool, pool writes here.
+
+        Only the file read (into a private staging page) runs on the pool;
+        set_from_flat_data_page stays on the calling thread, in page order. Host
+        pools may take thread-local state there (e.g. a layout lease that the
+        caller already holds for the whole transfer); calling it from a pool
+        thread can deadlock. Chunked so staging memory stays at a few pages per
+        worker.
+        """
+        chunk = 4 * self.read_workers
+        staging = [
+            host_pool.get_dummy_flat_data_page() for _ in range(min(chunk, len(args)))
+        ]
+        out: List[bool] = []
+        for start in range(0, len(args), chunk):
+            part = args[start : start + chunk]
+            pages = self._map_reads(
+                lambda ia: self.get(self._log_key(ia[1][0], ia[1][1]), staging[ia[0]]),
+                list(enumerate(part)),
+            )
+            for (_, _, _, page_offset), page in zip(part, pages):
+                if page is None:
+                    out.append(False)
+                else:
+                    host_pool.set_from_flat_data_page(page_offset, page)
+                    out.append(True)
+        return out
 
     def batch_get_v2(
         self,

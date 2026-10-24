@@ -827,6 +827,8 @@ class Envs:
     SGLANG_HICACHE_FILE_BACKEND_ENABLE_METADATA_CACHE = EnvBool(False)
     # Positive cache TTL for filesystem metadata lookups (-1 disables positive expiration)
     SGLANG_HICACHE_FILE_BACKEND_METADATA_TTL = EnvFloat(5.0)
+    # Threads that read the page files of one batch in parallel (1 = serial reads).
+    SGLANG_HICACHE_FILE_BACKEND_READ_WORKERS = EnvInt(1)
     # Buffer mode: staged prefetches pin their device anchor from IO commit
     # to consumption so eviction cannot waste the fetch. Cap = fraction of
     # the pool the pins may hold; 0 disables pinning.
