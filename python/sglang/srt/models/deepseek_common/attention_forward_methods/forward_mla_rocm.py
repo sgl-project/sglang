@@ -45,7 +45,10 @@ from sglang.srt.lora.deepseek_mla_correction import (
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+from sglang.srt.model_executor.forward_context import (
+    get_attn_backend,
+    get_token_to_kv_pool,
+)
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
@@ -970,6 +973,22 @@ class DeepseekMLARocmForwardMixin:
                 forward_batch,
                 save_kv_cache=False,
                 **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
+            )
+        elif (
+            llama_4_scaling is None
+            and topk_indices is None
+            and not self._skip_rope_for_aiter_fused_mla()
+            and get_attn_backend().supports_split_mla_qk(forward_batch, self.attn_mqa)
+        ):
+            # The backend assembles q / k with its KV write in one kernel.
+            attn_output = self.attn_mqa(
+                q_nope_out,
+                k_nope,
+                k_nope,
+                forward_batch,
+                save_kv_cache=save_kv_cache,
+                q_rope=q_pe,
+                k_rope=k_pe,
             )
         else:
             if self._skip_rope_for_aiter_fused_mla():

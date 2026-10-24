@@ -53,6 +53,7 @@ try:
         get_ps_metadata_info_v1,
         get_ps_metadata_v1,
         mha_batch_prefill_func,
+        mla_decode_stage1_asm_fwd,
         mla_prefill_ps_asm_fwd,
         mla_reduce_v1,
         paged_attention_ragged,
@@ -574,6 +575,7 @@ class AiterAttnBackend(AttentionBackend):
         )
 
         self.logits_soft_cap = 0.0
+        self._unit_q_scale_buf = None
 
         self.forward_metadata: ForwardMetadata = None
 
@@ -691,7 +693,8 @@ class AiterAttnBackend(AttentionBackend):
                 )
                 fast_mode = True
                 intra_batch_mode = False
-                self.max_split_per_batch = -1
+                split_cap = envs.SGLANG_AITER_MLA_MAX_SPLITS_PER_BATCH.get()
+                self.max_split_per_batch = -1 if split_cap is None else split_cap
 
             self.fix_max_split_per_batch = self.max_split_per_batch
 
@@ -1430,6 +1433,141 @@ class AiterAttnBackend(AttentionBackend):
             and self.cprr_kernel_heads > 0
             and _asm_cprr_supports_shape(self.cprr_kernel_heads, q_len)
         )
+
+    def _mla_verify_decode_kwargs(self, layer, k_descale) -> dict:
+        md = self.forward_metadata
+        return dict(
+            qo_indptr=md.qo_indptr,
+            kv_indptr=md.kv_indptr,
+            kv_indices=md.kv_indices,
+            kv_last_page_lens=md.kv_last_page_len,
+            max_seqlen_q=md.max_q_len,
+            sm_scale=layer.scaling,
+            logit_cap=layer.logit_cap,
+            work_meta_data=md.work_metadata,
+            work_indptr=md.work_indptr,
+            work_info_set=md.work_info_set,
+            reduce_indptr=md.reduce_indptr,
+            reduce_final_map=md.reduce_final_map,
+            reduce_partial_map=md.reduce_partial_map,
+            q_scale=k_descale,
+            kv_scale=k_descale,
+            intra_batch_mode=intra_batch_mode,
+            num_kv_splits=md.num_kv_splits,
+        )
+
+    def supports_split_mla_qk(self, forward_batch, layer) -> bool:
+        """gfx950 target verify or single-query decode on the zero-padded (h12 ->
+        qh16) asm persistent MLA kernel with an fp8 KV cache: the one path
+        where mla_decode_prep folds the q/k concats, the fp8 KV write (a plain
+        cast, as the MLA pool's set_kv_buffer), the row-0 guard and the query
+        head padding into one kernel."""
+        mode = forward_batch.forward_mode
+        return (
+            self.use_mla
+            and is_gfx95_supported()
+            and (mode.is_target_verify() or mode.is_decode())
+            and self.dcp_world_size <= 1
+            and self.kv_cache_dtype == fp8_dtype
+            and self.head_pad_mode == "zero"
+            and _use_mla_ps_kernel
+            and self.mla_verify_backend == "asm"
+            and self._asm_ps_supports_qlen(self.forward_metadata.max_q_len or 1)
+            and not self.kv_cache_is_vectorized_5d
+            and not self.use_triton_unified_attention
+            and not layer.is_cross_attention
+        )
+
+    def _unit_q_scale(self, device) -> torch.Tensor:
+        # A persistent buffer: CUDA-graph replays read it by address.
+        if self._unit_q_scale_buf is None:
+            self._unit_q_scale_buf = torch.ones((), dtype=torch.float32, device=device)
+        return self._unit_q_scale_buf
+
+    def _forward_verify_split_mla(
+        self, q_nope, q_rope, k_nope, k_rope, layer, forward_batch, save_kv_cache
+    ):
+        from sglang.kernels.ops.attention import mla_decode_prep, mla_split_reduce
+
+        assert save_kv_cache, "split MLA q/k always writes its KV rows"
+        k_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        fp8_q = envs.SGLANG_AITER_MLA_VERIFY_FP8_Q.get()
+        q_pad = mla_decode_prep.mla_qk_prep(
+            q_nope.view(-1, layer.tp_q_head_num, q_nope.shape[-1]),
+            q_rope.view(-1, layer.tp_q_head_num, q_rope.shape[-1]),
+            k_nope,
+            k_rope,
+            forward_batch.out_cache_loc,
+            k_buffer,
+            self.num_head_padded,
+            q_dtype=fp8_dtype if fp8_q else None,
+        )
+        o = q_pad.new_empty(
+            (q_pad.shape[0], self.num_head_padded, layer.v_head_dim),
+            dtype=self.input_dtype,
+        )
+        k_descale = layer.k_scale if layer.k_scale is not None else self.k_scale
+        q_descale = self._unit_q_scale(q_pad.device) if fp8_q else k_descale
+        kv_flat = k_buffer.view(-1, 1, 1, layer.qk_head_dim)
+        if q_pad.shape[0] > mla_split_reduce.MAX_ROWS:
+            kwargs = self._mla_verify_decode_kwargs(layer, k_descale)
+            kwargs["q_scale"] = q_descale
+            mla_decode_fwd(q_pad, kv_flat, o, **kwargs)
+            return o[:, : layer.tp_q_head_num, :]
+        # aiter's persistent stage 1 (as mla_decode_fwd issues it for the
+        # qh16 a16w8 verify kernel), then the split combine over the real heads.
+        md = self.forward_metadata
+        max_q = md.max_q_len
+        num_partial_rows = md.reduce_partial_map.size(0) * max_q
+        logits = torch.empty(
+            (num_partial_rows, 1, self.num_head_padded, layer.v_head_dim),
+            dtype=torch.float32,
+            device=q_pad.device,
+        )
+        attn_lse = torch.empty(
+            (num_partial_rows, 1, self.num_head_padded, 1),
+            dtype=torch.float32,
+            device=q_pad.device,
+        )
+        mla_decode_stage1_asm_fwd(
+            q_pad,
+            kv_flat,
+            md.qo_indptr,
+            md.kv_indptr,
+            md.kv_indices,
+            md.kv_last_page_len,
+            None,  # num_kv_splits_indptr: persistent mode plans splits itself
+            md.work_metadata,
+            md.work_indptr,
+            md.work_info_set,
+            max_q,
+            1,  # page_size
+            1,  # nhead_kv
+            layer.scaling,
+            logits,
+            attn_lse,
+            o,
+            None,  # final_lse
+            q_descale,
+            k_descale,
+            None,  # g_kv_indptr
+            1,  # cp_world_size
+            0,  # cp_rank
+            None,
+            0,
+            True,  # causal
+        )
+        mla_split_reduce.mla_split_reduce(
+            logits,
+            attn_lse,
+            md.reduce_indptr,
+            md.reduce_final_map,
+            md.reduce_partial_map,
+            max_q,
+            o,
+            layer.tp_q_head_num,
+        )
+        return o[:, : layer.tp_q_head_num, :]
 
     def _mla_decode_fwd_with_head_pad(
         self,
@@ -3684,8 +3822,15 @@ class AiterAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
         sinks=None,
+        q_rope: Optional[torch.Tensor] = None,
+        k_rope: Optional[torch.Tensor] = None,
     ):
         self.logits_soft_cap = layer.logit_cap
+        if k_rope is not None:
+            # Only reachable when supports_split_mla_qk() held for this batch.
+            return self._forward_verify_split_mla(
+                q, q_rope, k, k_rope, layer, forward_batch, save_kv_cache
+            )
 
         if forward_batch.attn_attend_prefix_cache:
             return self._forward_extend_prefix_chunk(q, k, v, layer, forward_batch)
@@ -4000,37 +4145,11 @@ class AiterAttnBackend(AttentionBackend):
                         qlen=self.forward_metadata.max_q_len or 1,
                     )
 
-                work_metadata = self.forward_metadata.work_metadata
-                work_indptr = self.forward_metadata.work_indptr
-                work_info_set = self.forward_metadata.work_info_set
-
-                reduce_indptr = self.forward_metadata.reduce_indptr
-                reduce_final_map = self.forward_metadata.reduce_final_map
-                reduce_partial_map = self.forward_metadata.reduce_partial_map
-
-                num_kv_splits = self.forward_metadata.num_kv_splits
-
                 o = self._mla_decode_fwd_with_head_pad(
                     q,
                     K_Buffer.view(-1, 1, 1, layer.qk_head_dim),
                     layer,
-                    qo_indptr=self.forward_metadata.qo_indptr,
-                    kv_indptr=self.forward_metadata.kv_indptr,
-                    kv_indices=self.forward_metadata.kv_indices,
-                    kv_last_page_lens=self.forward_metadata.kv_last_page_len,
-                    max_seqlen_q=self.forward_metadata.max_q_len,
-                    sm_scale=layer.scaling,
-                    logit_cap=layer.logit_cap,
-                    work_meta_data=work_metadata,
-                    work_indptr=work_indptr,
-                    work_info_set=work_info_set,
-                    reduce_indptr=reduce_indptr,
-                    reduce_final_map=reduce_final_map,
-                    reduce_partial_map=reduce_partial_map,
-                    q_scale=k_descale,
-                    kv_scale=k_descale,
-                    intra_batch_mode=intra_batch_mode,
-                    num_kv_splits=num_kv_splits,
+                    **self._mla_verify_decode_kwargs(layer, k_descale),
                 )
                 return o
             elif forward_batch.forward_mode.is_draft_extend_v2():
@@ -4655,7 +4774,14 @@ class AiterAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
         sinks=None,
+        q_rope: Optional[torch.Tensor] = None,
+        k_rope: Optional[torch.Tensor] = None,
     ):
+        if k_rope is not None:
+            # Only reachable when supports_split_mla_qk() held for this batch.
+            return self._forward_verify_split_mla(
+                q, q_rope, k, k_rope, layer, forward_batch, save_kv_cache
+            )
         q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
 
         k_descale = None

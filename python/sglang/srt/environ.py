@@ -1072,6 +1072,12 @@ class Envs:
     SGLANG_AITER_MLA_VERIFY_BACKEND = EnvStr("asm")
     # Let aiter plan the KV splits for the asm persistent MLA decode.
     SGLANG_AITER_MLA_AUTO_KV_SPLITS = EnvBool(False)
+    # Per-request cap on those planned splits; unset gives a request every CU,
+    # which makes the split reduce the bottleneck for a lone long request.
+    SGLANG_AITER_MLA_MAX_SPLITS_PER_BATCH = EnvInt(None)
+    # gfx950: run the head-padded asm MLA target verify with a unit-scale fp8 query
+    # (the a8w8 kernel) instead of bf16, as the qlen > 4 path already does.
+    SGLANG_AITER_MLA_VERIFY_FP8_Q = EnvBool(True)
     # Run gfx942 block-FP8 linears with the AITER CK blockscale GEMM instead of Triton.
     SGLANG_AITER_GFX942_BLOCKSCALE_USE_CK = EnvBool(False)
 
