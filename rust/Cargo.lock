@@ -4063,7 +4063,6 @@ dependencies = [
  "futures",
  "http",
  "itertools",
- "minijinja",
  "numpy",
  "pyo3",
  "regex-syntax",

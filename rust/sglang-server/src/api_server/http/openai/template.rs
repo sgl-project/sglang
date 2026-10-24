@@ -33,15 +33,14 @@ pub(super) fn render_chat(
     if !formatter.renders_requests() {
         return render_template(formatter, request, kwargs, defaults);
     }
-    // The continuation's leading BOS is dropped once its ids are encoded.
     match formatter.render_request(body, defaults) {
         Ok((prompt, continuation)) => Ok(RenderedChat {
             prompt,
             continuation,
         }),
-        // There is no engine to hand a request the SGLang path declines to, so
-        // the formatter's own template renders it, as it did before that path
-        // existed; a formatter with no other path declines it again.
+        // The SGLang path declines some valid requests only the engine renders;
+        // with no engine here, the formatter's template renders them (one
+        // with no other path declines them again).
         Err(TemplateError::EngineOnly { .. }) => {
             render_template(formatter, request, kwargs, defaults)
         }
@@ -80,22 +79,22 @@ impl OAIChatLikeRequest for TemplateRequest<'_> {
     fn model(&self) -> String {
         self.request.model()
     }
-    fn messages(&self) -> minijinja::Value {
+    fn messages(&self) -> sglang_processor::minijinja::Value {
         self.request.messages()
     }
     fn typed_messages(&self) -> Option<&[ChatCompletionRequestMessage]> {
         self.request.typed_messages()
     }
-    fn tools(&self) -> Option<minijinja::Value> {
+    fn tools(&self) -> Option<sglang_processor::minijinja::Value> {
         self.request.tools()
     }
-    fn tool_choice(&self) -> Option<minijinja::Value> {
+    fn tool_choice(&self) -> Option<sglang_processor::minijinja::Value> {
         self.request.tool_choice()
     }
-    fn response_format(&self) -> Option<minijinja::Value> {
+    fn response_format(&self) -> Option<sglang_processor::minijinja::Value> {
         self.request.response_format()
     }
-    fn reasoning_effort(&self) -> Option<minijinja::Value> {
+    fn reasoning_effort(&self) -> Option<sglang_processor::minijinja::Value> {
         self.request.reasoning_effort()
     }
     fn should_add_generation_prompt(&self) -> bool {
