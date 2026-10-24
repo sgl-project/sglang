@@ -15,6 +15,13 @@ records the server.
 --prefill-completions saves measured request timestamps before scoring, including
 partial completions on failure. This diagnostic file is not a validated result.
 
+L3 prefill (--prefix-source l3) writes a distinct prefix per request, then flushes
+only the device cache. Every measured prefix must be entirely off-device.
+The store must hold all warmup, measured and optional profile prefixes. Use an
+isolated fresh store for each A/B arm and the same seed/configuration; unlike a
+device flush, a new store removes suffixes persisted by an earlier arm.
+
+  python bench_engine_steps.py prefill --base-url URL --dp 2 --prefix-source l3
   python bench_engine_steps.py prefill --base-url URL --dp 4 --tokens-per-step 8192
   python bench_engine_steps.py decode --base-url URL --dp 8 --batch-per-rank 64
   python bench_engine_steps.py prefill --engine --dp 4 --model-path M --dp-size 4 ...
@@ -157,13 +164,21 @@ def gpu_count(info, dp, explicit=None):
     return info["tp_size"] * info.get("pp_size", 1) * replicas
 
 
-def check_cache(meta, new_tokens):
+def check_cache(meta, new_tokens, restored=False):
     new = meta["prompt_tokens"] - meta["cached_tokens"]
     if new != new_tokens:
         raise RuntimeError(
             f"expected {new_tokens} uncached suffix tokens, got {new}: "
             "the shared prefix was evicted/missed or part of a suffix was cached"
         )
+    if restored:
+        # The direct linker reports its off-device loads as host hits.
+        tiers = meta.get("cached_tokens_details") or {}
+        off_device = tiers.get("host", 0) + tiers.get("storage", 0)
+        if tiers.get("device") != 0 or off_device != meta["cached_tokens"]:
+            raise RuntimeError(
+                f"expected the whole prefix restored from L3, got tiers {tiers or None}"
+            )
     return new
 
 
@@ -344,7 +359,11 @@ async def batch(
         async for t, meta in tp.generate(prompt(r), params, r, False):
             new = meta["prompt_tokens"] - meta["cached_tokens"]
             if check_prefix:
-                check_cache(meta, args.new_tokens)
+                check_cache(
+                    meta,
+                    args.new_tokens,
+                    getattr(args, "prefix_source", "device") == "l3",
+                )
             done.append((t, meta.get("prefill_finished_time"), new, r))
             if on_complete is not None:
                 await on_complete(r)
@@ -610,6 +629,7 @@ OPTIONS = [  # flag, type, default, help
     ("--base-url", str, None, "a running server (or pass --engine)"),
     ("--dp", pos_int, None, "attention DP ranks to pin requests to"),
     ("--num-gpus", pos_int, None, "GPUs to divide by (default: server topology)"),
+    ("--prefix-source", str, "device", "prefill prefix source: device or l3"),
     ("--context", int, 131072, "prompt tokens: shared prefix plus suffix"),
     ("--new-tokens", pos_int, 4096, "random, uncached suffix tokens per request"),
     ("--tokens-per-step", pos_int, 65536, "prefill: new tokens per rank per step"),
@@ -657,6 +677,17 @@ def main():
 
         ServerArgs.add_cli_args(ap)
     args = ap.parse_args()
+    if args.prefix_source not in ("device", "l3"):
+        ap.error("--prefix-source must be device or l3")
+    if args.prefix_source == "l3":
+        if args.mode != "prefill":
+            ap.error("--prefix-source l3 is a prefill mode")
+        if args.no_flush:
+            ap.error(
+                "--prefix-source l3 requires a device flush after writing prefixes"
+            )
+        if args.context <= args.new_tokens:
+            ap.error("--prefix-source l3 requires a nonempty prefix")
     if args.engine == bool(args.base_url) or not args.dp:
         ap.error("pass --dp and exactly one of --engine and --base-url")
     if args.context < args.new_tokens or not 0 <= args.lo < args.hi <= 1:
@@ -690,23 +721,40 @@ def main():
 def run_benchmark(args, tp):
     import numpy as np
 
-    nc = args.new_tokens
+    nc, l3 = args.new_tokens, getattr(args, "prefix_source", "device") == "l3"
     rng = np.random.default_rng(args.seed)
 
     def ids(n, generator=rng):  # plain vocabulary ids, clear of special tokens
         return generator.integers(1000, 100000, size=n).tolist()
 
-    prefixes = [ids(args.context - nc) for _ in range(args.dp)]
+    if l3:
+        sent = [0] * args.dp
+        phase = 1
 
-    # Rank semaphores admit requests independently. Keep suffix assignment
-    # reproducible when their completion order changes between runs.
-    suffix_rngs = [np.random.default_rng([args.seed, r, 1]) for r in range(args.dp)]
+        def prompt(r):
+            sent[r] += 1
+            gen = np.random.default_rng([args.seed, 0, r, sent[r]])
+            suffix = np.random.default_rng([args.seed, phase, r, sent[r]])
+            return ids(args.context - nc, gen) + ids(nc, suffix)
 
-    def prompt(r):
-        return prefixes[r] + ids(nc, suffix_rngs[r])
+    else:
+        prefixes = [ids(args.context - nc) for _ in range(args.dp)]
+        # Rank semaphores admit requests independently. Keep suffix assignment
+        # reproducible when their completion order changes between runs.
+        suffix_rngs = [np.random.default_rng([args.seed, r, 1]) for r in range(args.dp)]
+
+        def prompt(r):
+            return prefixes[r] + ids(nc, suffix_rngs[r])
 
     info = tp.server_info()
     args.num_gpus = gpu_count(info, args.dp, args.num_gpus)
+    if l3 and (
+        not info.get("enable_unified_cache_external_linker")
+        or info.get("unified_cache_external_linker_backend") != "mooncake"
+    ):
+        raise SystemExit(
+            "--prefix-source l3 needs the Mooncake unified external-linker"
+        )
     if info.get("enable_eplb"):
         raise SystemExit("EPLB is on: rebalance steps would land in the window")
     if args.mode == "decode" and info.get("stream_interval", 1) != 1:
@@ -715,9 +763,22 @@ def run_benchmark(args, tp):
     if not args.no_flush and (err := tp.flush_cache()):
         raise SystemExit(f"flushing the server's cache failed: {err}")
 
+    warm = {"max_new_tokens": 1, "temperature": 0.0}
+    if l3:
+        per_step = max(1, args.tokens_per_step // nc)
+        need = args.warmup_steps * per_step + args.requests
+        need += args.requests if args.profile_steps else 0
+        tp.run(batch(args, tp, prompt, need, warm, [], "L3 prefix write"))
+        # Prefixes repeat, suffixes do not. Rank-local seeds keep inputs identical
+        # between arms even when ranks submit in a different order.
+        sent[:] = [0] * args.dp
+        phase = 2
+        # The direct-linker reset joins pending loads/offloads before clearing L1.
+        if err := tp.flush_cache():
+            raise SystemExit(f"flushing the device cache failed: {err}")
+
     async def run():
-        warm = {"max_new_tokens": 1, "temperature": 0.0}
-        for _ in range(2):  # the second pass hits: later requests reuse the prefix
+        for _ in range(0 if l3 else 2):
             await batch(args, tp, prompt, 1, warm, [], "prefix warmup")
         return await (prefill if args.mode == "prefill" else decode)(args, tp, prompt)
 
