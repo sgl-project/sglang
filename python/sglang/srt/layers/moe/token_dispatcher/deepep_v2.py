@@ -24,6 +24,7 @@ from sglang.srt.layers.moe.utils import (
 )
 from sglang.srt.runtime_context import (
     get_exec,
+    get_parallel,
     get_resources,
 )
 
@@ -124,6 +125,17 @@ def _get_allow_hybrid_mode() -> bool:
     return get_exec().moe.deepep_v2_mode == "hybrid"
 
 
+def _deepep_v2_precompile_tp_barrier() -> None:
+    # DeepEP's all-to-all operation has a much shorter timeout compared to torch.distributed,
+    # so if different ranks compile at different speeds, it may quickly trigger a timeout.
+    # To avoid this, we use torch.distributed's barrier during the compile stage.
+    # We apply this barrier only in the compile stage to prevent extra all-reduce overhead at runtime.
+    if envs.SGLANG_IN_DEEPGEMM_PRECOMPILE_STAGE.get():
+        parallel = get_parallel()
+        if parallel is not None and parallel.tp_group is not None:
+            parallel.tp_group.barrier()
+
+
 def _quantize_for_deepep_v2_dispatch(
     hidden_states: torch.Tensor,
     scale_format: DeepEPv2Fp8ScaleFormat,
@@ -164,11 +176,17 @@ class DeepEPv2Buffer:
         num_max_dispatch_tokens_per_rank: int,
         use_fp8_dispatch: bool,
         allow_hybrid_mode: Optional[bool] = None,
+        num_cpu_timeout_secs: Optional[int] = None,
+        num_gpu_timeout_secs: Optional[int] = None,
     ) -> ElasticBuffer:
         _ensure_deepep_v2_available()
 
         if allow_hybrid_mode is None:
             allow_hybrid_mode = _get_allow_hybrid_mode()
+        if num_cpu_timeout_secs is None:
+            num_cpu_timeout_secs = envs.SGLANG_DEEPEP_V2_CPU_TIMEOUT_SECS.get()
+        if num_gpu_timeout_secs is None:
+            num_gpu_timeout_secs = envs.SGLANG_DEEPEP_V2_GPU_TIMEOUT_SECS.get()
         state = cls._state()
         # A key change rebuilds ElasticBuffer collectively on every rank.
         key = (
@@ -179,6 +197,8 @@ class DeepEPv2Buffer:
             use_fp8_dispatch,
             allow_hybrid_mode,
             dist.get_world_size(group),
+            num_cpu_timeout_secs,
+            num_gpu_timeout_secs,
         )
         if state.buffer is not None and state.key == key:
             return state.buffer
@@ -197,6 +217,8 @@ class DeepEPv2Buffer:
             allow_hybrid_mode=allow_hybrid_mode,
             sl_idx=0,
             prefer_overlap_with_compute=False,
+            num_cpu_timeout_secs=num_cpu_timeout_secs,
+            num_gpu_timeout_secs=num_gpu_timeout_secs,
         )
         # Publish only after collective construction succeeds.
         state.buffer = buffer
@@ -204,13 +226,15 @@ class DeepEPv2Buffer:
         logger.info(
             "Initialized DeepEP v2 ElasticBuffer: world_size=%s hidden_size=%s "
             "num_topk=%s max_dispatch_tokens_per_rank=%s use_fp8_dispatch=%s "
-            "allow_hybrid_mode=%s num_bytes=%s",
+            "allow_hybrid_mode=%s cpu_timeout_secs=%s gpu_timeout_secs=%s num_bytes=%s",
             dist.get_world_size(group),
             hidden_size,
             router_topk,
             num_max_dispatch_tokens_per_rank,
             use_fp8_dispatch,
             allow_hybrid_mode,
+            num_cpu_timeout_secs,
+            num_gpu_timeout_secs,
             buffer.num_bytes,
         )
         return buffer
@@ -353,6 +377,7 @@ class _DeepEPv2Impl:
         if use_masked:
             do_cpu_sync_val = False
 
+        _deepep_v2_precompile_tp_barrier()
         buffer = self._get_buffer()
         recv_x, recv_topk_idx, recv_topk_weights, handle, event = buffer.dispatch(
             dispatch_x,
@@ -442,6 +467,7 @@ class _DeepEPv2Impl:
                 raise ValueError(
                     "DeepEP v2 combine requires model route finalization first"
                 )
+            _deepep_v2_precompile_tp_barrier()
             buffer = self._get_buffer()
             combined_x, _, event = buffer.combine(
                 combine_input.hidden_states,
