@@ -79,6 +79,9 @@ from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     build_prefill_registry,
 )
 from sglang.srt.model_executor.cuda_graph_config import Backend
+from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
+    create_chunked_prefix_cache_kv_indices,
+)
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -89,7 +92,12 @@ from sglang.srt.model_executor.forward_batch_info import (
     enable_num_token_non_padded,
     prefill_graph_tolerates_sum_len,
 )
-from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.forward_context import (
+    ForwardContext,
+    forward_context,
+    get_req_to_token_pool,
+    get_token_to_kv_pool,
+)
 from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
     BaseCudaGraphRunner,
     freeze_gc,
@@ -301,6 +309,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     # The backend's batch-dependent check, judged from a ScheduleBatch for the DP vote.
     _backend_vote_prefill_cuda_graph = None
     _captured_attn_metadata_max_bs: Optional[int] = None
+    _dcp_extend_active = False
     dllm_attention = None
 
     @property
@@ -690,6 +699,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 ),
                 None,
             )
+
+        # DCP extend attention reads KV through a gather buffer in attn_dcp_metadata;
+        # capture keeps one bucket-sized buffer per shape and replay reuses it.
+        self._dcp_extend_active = get_parallel().attn_dcp_size > 1 and hasattr(
+            model_runner.model, "prepare_context_parallel_metadata_for_dcp"
+        )
+        self._dcp_kv_buffers: Dict[ShapeKey, torch.Tensor] = {}
 
         # --- aiter chip info pre-warming (AMD) -------------------------
         maybe_pre_warm_aiter_chip_info()
@@ -1231,6 +1247,25 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             capture_batch, in_capture=False
         )
 
+    def _plan_dcp_metadata(self, forward_batch: ForwardBatch):
+        """Plan DCP extend metadata as the eager runner does; the planner needs a
+        forward context, which capture has not entered yet."""
+        model_runner = self.model_runner
+        with forward_context(ForwardContext(attn_backend=model_runner.attn_backend)):
+            return model_runner.model.prepare_context_parallel_metadata_for_dcp(
+                forward_batch.seq_lens,
+                forward_batch.extend_prefix_lens,
+                forward_batch.extend_prefix_lens_cpu,
+                forward_batch.extend_seq_lens,
+                forward_batch.req_pool_indices,
+                get_req_to_token_pool().req_to_token,
+                forward_batch.seq_lens_sum,
+                get_token_to_kv_pool().get_kv_buffer_shape()[0],
+                model_runner.kv_cache_dtype,
+                model_runner.device,
+                create_chunked_prefix_cache_kv_indices,
+            )
+
     def _init_forward_metadata_for_capture(
         self, forward_batch: ForwardBatch, shape_key: ShapeKey
     ) -> None:
@@ -1238,6 +1273,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         contract. For opt-in backends (DSV4), call the BCG-specific entry
         and stash the returned per-bucket metadata object; otherwise fall
         back to the generic eager init that BCG/TC_PIECEWISE use today."""
+        if self._dcp_extend_active:
+            # Zero-prefix capture batch: its gather buffer is bucket-sized, so
+            # it doubles as the replay buffer for this shape.
+            metadata = self._plan_dcp_metadata(forward_batch)
+            forward_batch.attn_dcp_metadata = metadata
+            self._dcp_kv_buffers[shape_key] = metadata.dcp_kv_buffer
         attn_backend = self.model_runner.attn_backend
         with forward_context(
             ForwardContext(attn_backend=attn_backend), forward_batch=forward_batch
@@ -1266,6 +1307,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         capture-stable wrapper state planned at capture time with the
         real seq_lens / prefix_lens; the captured kernels read the
         updated state at replay."""
+        if self._dcp_extend_active:
+            # The gather and the attention are breaks reading the live batch: plan
+            # live indices, but use the bucket-sized buffer (k_nope/k_pe are padded).
+            metadata = self._plan_dcp_metadata(forward_batch)
+            metadata.dcp_kv_buffer = self._dcp_kv_buffers[shape_key]
+            forward_batch.attn_dcp_metadata = metadata
+            static_forward_batch.attn_dcp_metadata = metadata
         attn_backend = self.model_runner.attn_backend
         build_snapshot = False
         if self._is_full_backend:
@@ -1386,6 +1434,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # FullCG's chunked-prefix topology covers a bounded prefix. Its capture
         # flag is FullCG-only, so this is inert for the BreakableCG vote path.
         if self._has_uncapturable_chunked_prefix(prefix_lens):
+            return False
+        # Under DCP only fresh prefills replay; a prefix hit needs the cross-rank
+        # prefix KV all-gather with per-batch shapes, which stays eager.
+        if self._dcp_extend_active and prefix_lens is not None and any(prefix_lens):
             return False
         # tc_piecewise captures with ForwardMode.EXTEND and spec_info=None.
         if is_target_verify:
