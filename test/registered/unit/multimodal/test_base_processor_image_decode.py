@@ -108,7 +108,7 @@ class TestLoadSingleItemImageDecode(CustomTestCase):
 
     def test_unreachable_image_url_is_a_client_error(self):
         with patch(
-            "sglang.srt.multimodal.processors.base_processor.load_image",
+            "sglang.srt.multimodal.media_processor.load_image",
             side_effect=requests.ConnectionError("connection refused"),
         ):
             with self.assertRaisesRegex(ValueError, "connection refused"):
@@ -122,7 +122,7 @@ class TestLoadSingleItemImageDecode(CustomTestCase):
 
     def test_unexpected_loader_bug_remains_a_server_error(self):
         with patch(
-            "sglang.srt.multimodal.processors.base_processor.load_image",
+            "sglang.srt.multimodal.media_processor.load_image",
             side_effect=TypeError("unexpected loader bug"),
         ):
             with self.assertRaisesRegex(RuntimeError, "unexpected loader bug"):
