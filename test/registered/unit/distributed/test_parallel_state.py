@@ -133,6 +133,40 @@ def test_nondeterministic_reduce_scatter_keeps_native_path(monkeypatch):
     coordinator._reduce_scatter_tensor.assert_called_once_with(output, input_)
 
 
+@pytest.mark.parametrize("op", ["all_gatherv", "reduce_scatterv"])
+@pytest.mark.parametrize("comm_kind", ["missing", "unavailable"])
+def test_pynccl_only_collectives_report_missing_pynccl(monkeypatch, op, comm_kind):
+    """Without a usable pynccl communicator these collectives must fail with the
+    explicit "pynccl is required" error, not an obscure AttributeError."""
+    monkeypatch.setenv("SGLANG_ENABLE_DETERMINISTIC_INFERENCE", "0")
+    coordinator = parallel_state.GroupCoordinator.__new__(
+        parallel_state.GroupCoordinator
+    )
+    coordinator.rank_in_group = 0
+    coordinator.world_size = 2
+
+    comm = None
+    if comm_kind == "unavailable":
+        # Built without NCCL (e.g. no GPU): change_state(enable=True) still
+        # flips `disabled` off, exactly like the real communicator.
+        comm = Mock(available=False, disabled=True)
+
+        def change_state(enable=None):
+            comm.disabled = not enable
+            return nullcontext()
+
+        comm.change_state = change_state
+    coordinator.pynccl_comm = comm
+
+    # Valid shapes for sizes=[1, 1]: rows == sizes[rank] for gatherv, sum(sizes) for scatterv.
+    tensor = torch.zeros(1 if op == "all_gatherv" else 2, 3)
+    with pytest.raises(AssertionError, match=f"pynccl is required for {op}"):
+        getattr(coordinator, op)(tensor, sizes=[1, 1])
+    if comm is not None:
+        comm.all_gather.assert_not_called()
+        comm.reduce_scatter.assert_not_called()
+
+
 def test_custom_allreduce_precedes_symmetric_memory_pynccl():
     coordinator = parallel_state.GroupCoordinator.__new__(
         parallel_state.GroupCoordinator
