@@ -123,6 +123,15 @@ MiMoV2Config = None
 logger = logging.getLogger(__name__)
 
 
+def get_attention_sliding_window_size(config):
+    # The release counts the current token in the text SWA window; SGLang
+    # attention backends and KV-cache metadata use the inclusive left extent.
+    window_size = getattr(config, "sliding_window_size", None)
+    return (
+        window_size - 1 if window_size is not None and window_size > 0 else window_size
+    )
+
+
 def load_mimo_v2_qkv_proj_weight(
     name,
     param,
@@ -888,7 +897,7 @@ class MiMoV2DecoderLayer(nn.Module):
                 head_dim=config.swa_head_dim,
                 v_head_dim=getattr(config, "swa_v_head_dim", None),
                 v_scale=getattr(config, "attention_value_scale", None),
-                sliding_window_size=config.sliding_window_size,
+                sliding_window_size=get_attention_sliding_window_size(config),
                 attention_bias=config.attention_bias,
                 attention_sink_bias=getattr(
                     config, "add_swa_attention_sink_bias", False
@@ -1331,6 +1340,9 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
     @property
     def routed_experts_weights_of_layer(self):
         return self._routed_experts_weights_of_layer.value
+
+    def get_attention_sliding_window_size(self):
+        return get_attention_sliding_window_size(self.config)
 
     def get_input_embedding(self, input_ids: torch.Tensor) -> torch.Tensor:
         assert self.model is not None, (
