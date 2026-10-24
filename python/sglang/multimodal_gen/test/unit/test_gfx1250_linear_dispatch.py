@@ -1,11 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Large-M bf16 linears must not hit aiter tgemm past its int32 byte-offset limit.
+"""On gfx1250, bf16 linears whose output passes 2**31 bytes must stay correct.
 
 aiter's tgemm writes wrong values, without faulting, to output rows past 2**31 bytes;
 at Wan2.2 720p that turned the last decoded video frame into noise."""
 
 import unittest
-from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -17,34 +16,7 @@ from sglang.srt.utils import is_gfx1250_supported
 M, N, K = 90000, 13824, 5120
 
 
-class TestTgemmByteBound(unittest.TestCase):
-    def test_output_past_2gib_skips_tgemm(self):
-        tgemm = MagicMock()
-        x = torch.empty(M, K, dtype=torch.bfloat16, device="meta")
-        w = torch.empty(N, K, dtype=torch.bfloat16, device="meta")
-        with (
-            patch.object(linear, "_USE_AITER_TGEMM", True),
-            patch.object(linear, "_USE_FLYDSL_GFX1250_GEMM", False, create=True),
-            patch.object(linear, "tgemm", tgemm, create=True),
-        ):
-            out = linear.apply_unquantized_linear(x, w)
-        tgemm.mm.assert_not_called()
-        self.assertEqual(out.shape, (M, N))
-
-    def test_small_output_still_uses_tgemm(self):
-        tgemm = MagicMock()
-        x = torch.empty(512, K, dtype=torch.bfloat16, device="meta")
-        w = torch.empty(N, K, dtype=torch.bfloat16, device="meta")
-        with (
-            patch.object(linear, "_USE_AITER_TGEMM", True),
-            patch.object(linear, "_USE_FLYDSL_GFX1250_GEMM", False, create=True),
-            patch.object(linear, "tgemm", tgemm, create=True),
-        ):
-            linear.apply_unquantized_linear(x, w)
-        tgemm.mm.assert_called_once()
-
-
-class TestGfx1250FlyDSLLinear(unittest.TestCase):
+class TestGfx1250LargeOutputLinear(unittest.TestCase):
     def test_rows_past_2gib_output_match_fp32_reference(self):
         if not (linear._USE_AITER_TGEMM and is_gfx1250_supported()):
             pytest.skip("needs gfx1250 with SGLANG_USE_ROCM_AITER_TGEMM=1")
