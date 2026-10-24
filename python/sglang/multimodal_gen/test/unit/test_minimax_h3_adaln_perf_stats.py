@@ -311,6 +311,7 @@ class TestAdalnPerfStats(CustomTestCase):
         model = torch.nn.Module()
         model.adaln_cache = cache
         model.prepare_adaln_plans = prepare
+        model.final_layer = SimpleNamespace(_pdd_heads=None)
         model._resolve_attention_backend_once = lambda: None
         model._resolved_attention_backend = None
         stage = MiniMaxH3DenoisingStage.__new__(MiniMaxH3DenoisingStage)
