@@ -3784,6 +3784,9 @@ class UnifiedRadixCache(BasePrefixCache):
     def release_session(self, session_id: str) -> None:
         self.session.release_session(session_id)
 
+    def release_retracted_turn(self, req: Req) -> None:
+        self.session.release_retracted_turn(req)
+
     def session_records(self) -> dict[str, ReqKvInfo]:
         return {sid: slot.kv for sid, slot in self.session.slots.items()}
 
