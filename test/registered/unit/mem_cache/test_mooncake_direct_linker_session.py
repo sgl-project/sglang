@@ -1,8 +1,6 @@
-"""Regression tests for concurrent Mooncake load sessions."""
+"""Regression tests for batched Mooncake load sessions."""
 
-import threading
 import unittest
-from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import Mock, call
 
@@ -30,8 +28,6 @@ class TestLayerWiseLoadSessions(CustomTestCase):
         }
         self.linker.num_layers = 1
         self.linker.layer_done_counter = Mock()
-        self.linker.session_executor = ThreadPoolExecutor(max_workers=2)
-        self.addCleanup(self.linker.session_executor.shutdown)
         self.transfers = [
             [
                 SimpleNamespace(name=name, keys=[f"{name}-{row}"], host_indices=[row])
@@ -40,13 +36,11 @@ class TestLayerWiseLoadSessions(CustomTestCase):
             for row in (4, 0)
         ]
 
-    def test_concurrent_starts_before_fence_and_ordered_ranges_after(self):
-        both_started = threading.Barrier(2, timeout=5)
+    def test_batched_start_before_fence_and_ordered_ranges_after(self):
         fence = Mock()
 
         def start(keys):
             fence.synchronize.assert_not_called()
-            both_started.wait()
             return [0] * len(keys)
 
         def locations(indices):
@@ -73,15 +67,13 @@ class TestLayerWiseLoadSessions(CustomTestCase):
                 for name in self.linker.pools
             ],
         )
-        self.store.batch_get_session_end.assert_has_calls(
-            [call([f"{name}-4", f"{name}-0"]) for name in self.linker.pools],
-            any_order=True,
-        )
+        keys = ["kv-4", "kv-0", "index-4", "index-0"]
+        self.store.batch_get_session_start.assert_called_once_with(keys)
+        self.store.batch_get_session_end.assert_called_once_with(keys)
 
     def test_failed_start_ends_successful_sessions(self):
-        self.store.batch_get_session_start.side_effect = lambda keys: (
-            [1, 1] if keys[0].startswith("index") else [0, 0]
-        )
+        # One key fails while another key in the same pool succeeds.
+        self.store.batch_get_session_start.return_value = [0, -1, 0, 0]
         with self.assertLogs(MooncakeDirectLinker.__module__, level="ERROR"):
             self.linker.load_layer_wise(7, self.transfers)
 
@@ -92,7 +84,9 @@ class TestLayerWiseLoadSessions(CustomTestCase):
             str(self.linker.layer_done_counter.fail.call_args.args[1]),
         )
         self.store.batch_get_into_multi_buffer_ranges.assert_not_called()
-        self.store.batch_get_session_end.assert_called_once_with(["kv-4", "kv-0"])
+        self.store.batch_get_session_end.assert_called_once_with(
+            ["kv-4", "kv-0", "index-4", "index-0"]
+        )
 
 
 if __name__ == "__main__":

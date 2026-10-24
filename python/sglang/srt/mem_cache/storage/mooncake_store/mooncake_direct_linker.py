@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import logging
 import threading
-from concurrent.futures import ThreadPoolExecutor
 from queue import Empty, Queue
 
 import numpy as np
@@ -161,10 +160,6 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             name=f"mooncake-load-tp{tp_rank}",
         )
         self.load_thread.start()
-        self.session_executor = ThreadPoolExecutor(
-            max_workers=len(self.pools),
-            thread_name_prefix=f"mooncake-session-tp{tp_rank}",
-        )
         self.offload_thread = threading.Thread(
             target=self.offload_thread_func,
             daemon=True,
@@ -319,20 +314,13 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             finally:
                 self.load_queue.task_done()
 
-    def _start_get_session(self, keys: list[str]) -> None:
-        result = self.storage.store.batch_get_session_start(keys)
-        if list(result) != [0] * len(keys):
-            raise RuntimeError(
-                f"Mooncake get session start failed: keys={len(keys)}, results={result}"
-            )
-
     def load_layer_wise(
         self,
         counter_index: int,
         request_transfers: list[list[PoolTransfer]],
         ready_event=None,
     ) -> None:
-        started = []
+        session_keys = []
         try:
             batches: dict[PoolName, tuple[list[str], list[int]]] = {}
             for transfers in request_transfers:
@@ -342,22 +330,16 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                         list(transfer.keys), transfer
                     )
                     keys.extend(self.storage._tag_keys(component_keys))
-            # Sessions need only the keys: start every pool's session concurrently,
-            # before waiting for the GPU work that writes the destination slots.
-            session_futures = [
-                (keys, self.session_executor.submit(self._start_get_session, keys))
-                for keys, _ in batches.values()
-            ]
-            failure = None
-            for keys, future in session_futures:
-                try:
-                    future.result()
-                except BaseException as error:
-                    failure = failure or error
-                    continue
-                started.append(keys)
-            if failure is not None:
-                raise failure
+            # Session setup needs only keys; batch all pools before the slot fence.
+            # Track every submitted key: a failed batch can still open some sessions.
+            session_keys = [key for keys, _ in batches.values() for key in keys]
+            if session_keys:
+                result = self.storage.store.batch_get_session_start(session_keys)
+                if list(result) != [0] * len(session_keys):
+                    raise RuntimeError(
+                        f"Mooncake get session start failed: keys={len(session_keys)}, "
+                        f"results={result}"
+                    )
             if ready_event is not None:
                 ready_event.synchronize()
             for transfers in request_transfers:
@@ -402,9 +384,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             self.layer_done_counter.fail(counter_index, error)
             logger.exception("Mooncake layer-wise load batch failed")
         finally:
-            for keys in started:
+            if session_keys:
                 try:
-                    self.storage.store.batch_get_session_end(keys)
+                    self.storage.store.batch_get_session_end(session_keys)
                 except BaseException as error:
                     self.layer_done_counter.fail(counter_index, error)
                     logger.exception("Mooncake layer-wise load session cleanup failed")
@@ -469,7 +451,6 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.offload_queue.put(None)
         self.load_thread.join()
         self.offload_thread.join()
-        self.session_executor.shutdown()
         logger.info("Mooncake direct linker stats: %s", self.stats)
         self.storage.close()
         if self.mla_broadcaster is not None:
