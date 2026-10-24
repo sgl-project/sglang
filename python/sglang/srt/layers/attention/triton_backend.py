@@ -686,6 +686,17 @@ class TritonAttnBackend(AttentionBackend):
                 window_kv_indices=self.cuda_graph_window_kv_indices,
             )
 
+    def _draft_extend_num_tokens_per_req(
+        self, forward_mode: ForwardMode, spec_info: Optional[SpecInput]
+    ) -> int:
+        if spec_info is not None and spec_info.num_tokens_per_req > 0:
+            return spec_info.num_tokens_per_req
+        return (
+            self.num_draft_tokens
+            if forward_mode.is_draft_extend_v2()
+            else self.speculative_num_steps + 1
+        )
+
     def _update_draft_extend_buffers(
         self,
         plan: KVLocPlan,
@@ -697,12 +708,8 @@ class TritonAttnBackend(AttentionBackend):
     ):
         """Fill QO + KV cuda-graph buffers for draft_extend mode."""
         seq_lens = seq_lens[:bs]
-        # V2 draft-extend fills num_draft_tokens per req; num_steps+1 only equals
-        # that when topk == 1.
-        num_tokens_per_req = (
-            self.num_draft_tokens
-            if forward_mode.is_draft_extend_v2()
-            else self.speculative_num_steps + 1
+        num_tokens_per_req = self._draft_extend_num_tokens_per_req(
+            forward_mode, spec_info
         )
         qo_indptr = self.qo_indptr[: bs + 1]
         qo_indptr[: bs + 1] = torch.arange(
@@ -1370,10 +1377,8 @@ class TritonAttnBackend(AttentionBackend):
                 # build qo_indptr above, else the extend kernel grid is too small
                 # for topk > 1 (num_draft_tokens > num_steps+1) and drops query
                 # blocks.
-                max_extend_len=(
-                    self.num_draft_tokens
-                    if forward_mode.is_draft_extend_v2()
-                    else self.speculative_num_steps + 1
+                max_extend_len=self._draft_extend_num_tokens_per_req(
+                    forward_mode, spec_info
                 ),
                 num_kv_splits=None,
                 kv_indptr=self.kv_indptr[: bs + 1],
