@@ -15,6 +15,7 @@ from typing import (
 import numpy as np
 import torch
 
+from sglang.srt.configs.hybrid_arch import mamba2_scan_config
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import (
@@ -1524,6 +1525,14 @@ class SchedulerBatchResultProcessor:
         post-decode cleanup to free the temporary second slot.
         """
         if req.kv.mamba_ping_pong_track_buffer is None:
+            return
+        # Verify runs on an isolated forward batch. Its disabled tracking must
+        # also leave the scheduler's saved prefill checkpoint lengths intact.
+        if (
+            not batch.spec_algorithm.is_none()
+            and get_exec().deterministic.enable_deterministic_inference
+            and mamba2_scan_config(batch.model_config) is not None
+        ):
             return
 
         lazy = get_exec().mamba.enable_mamba_extra_buffer_lazy

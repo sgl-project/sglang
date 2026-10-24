@@ -68,6 +68,7 @@ try:
 except ImportError:
     initialize_mamba_selective_state_update_backend = None
 from sglang.srt.beam_search.coordinator import BeamCoordinator
+from sglang.srt.configs.hybrid_arch import mamba2_scan_config
 from sglang.srt.configs.model_config import (
     ModelConfig,
     ModelImpl,
@@ -1740,9 +1741,14 @@ class Scheduler(
         }
         prefill_backend, _ = attention_backends()
         env_var, default_size = backend_sizes.get(prefill_backend, (None, None))
-        self.truncation_align_size = (
-            get_int_env_var(env_var, default_size) if env_var else None
-        )
+        alignments = [get_int_env_var(env_var, default_size)] if env_var else []
+        # Restart Mamba2 scans on the same logical chunk grid across forwards.
+        mamba_config = mamba2_scan_config(self.model_config)
+        if mamba_config is not None:
+            chunk_size = getattr(mamba_config, "mamba_chunk_size", None)
+            if chunk_size is not None:
+                alignments.append(chunk_size)
+        self.truncation_align_size = math.lcm(*alignments) if alignments else None
 
     def init_dsa_kpool_truncation_align(self):
         """Kpool compress-write asserts chunked extends start on pool boundaries.
@@ -4145,7 +4151,9 @@ class Scheduler(
                 adder.rem_chunk_tokens or 0,
                 self.page_size,
             )
-            self.chunked_req = adder.add_chunked_req(self.chunked_req)
+            self.chunked_req = adder.add_chunked_req(
+                self.chunked_req, truncation_align_size=self.truncation_align_size
+            )
 
         if self.enable_lora:
             running_loras = {

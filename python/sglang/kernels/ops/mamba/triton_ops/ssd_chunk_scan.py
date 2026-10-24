@@ -449,6 +449,11 @@ def _chunk_scan_fwd_kernel(
                 prev_states_ptrs += BLOCK_SIZE_K
             acc *= scale_m[:, None]
 
+    if HAS_SEQ_IDX and not HAS_INITSTATES:
+        # A new sequence must enter the dot with +0.0, rather than a signed
+        # zero from multiplying the previous sequence's state by zero.
+        acc = tl.where(seq_idx_m[:, None] == seq_idx_prev, acc, 0.0)
+
     offs_k = tl.arange(0, BLOCK_SIZE_K) + c_off
     cb_ptrs = cb_ptr + (
         offs_m[:, None] * stride_cb_csize_m + offs_k[None, :] * stride_cb_csize_k

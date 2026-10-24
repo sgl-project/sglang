@@ -4,7 +4,11 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
+from transformers import LlamaConfig
 
+from sglang.srt.configs.granitemoehybrid import GraniteMoeHybridConfig
+from sglang.srt.configs.lfm2 import Lfm2Config
+from sglang.srt.configs.mamba import FalconMambaConfig, MambaConfig
 from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
@@ -93,6 +97,114 @@ def _make_result():
 
 
 class TestMambaBoundaryMaskReuse(unittest.TestCase):
+    def test_deterministic_verify_preserves_prefill_checkpoint_lengths(self):
+        config = GraniteMoeHybridConfig(
+            num_hidden_layers=1, layer_types=["mamba"], mamba_chunk_size=TRACK_INTERVAL
+        )
+        for model, deterministic, expected in (
+            (config, True, False),
+            (config, False, True),
+            (MambaConfig(), True, True),
+            (Lfm2Config(), True, True),
+        ):
+            for lazy in (False, True):
+                with self.subTest(
+                    model=type(model).__name__, deterministic=deterministic, lazy=lazy
+                ):
+                    req, batch = _make_batch()
+                    batch.model_config.hf_config = model
+                    batch.spec_algorithm = SimpleNamespace(is_none=lambda: False)
+                    req.kv.mamba_ping_pong_track_buffer = torch.tensor([10, 11])
+                    req.kv.mamba_last_track_seqlen = TRACK_INTERVAL
+                    processor = _make_processor()
+                    with (
+                        get_context().override_server_args(
+                            enable_deterministic_inference=deterministic,
+                            mamba_radix_cache_strategy="extra_buffer_lazy"
+                            if lazy
+                            else "extra_buffer",
+                        ),
+                        patch.object(
+                            SchedulerBatchResultProcessor,
+                            "_mamba_check_track_boundary",
+                            return_value=(False, 0),
+                        ) as boundary,
+                        patch.object(
+                            SchedulerBatchResultProcessor, "_mamba_lazy_spec_update"
+                        ),
+                    ):
+                        processor._mamba_prefix_cache_update(
+                            req, batch, _make_result(), 0
+                        )
+                    self.assertEqual(boundary.called, expected)
+                    self.assertEqual(req.kv.mamba_last_track_seqlen, TRACK_INTERVAL)
+
+    def test_deterministic_mamba_decode_does_not_replace_prefill_checkpoints(self):
+        mamba_config = GraniteMoeHybridConfig(
+            num_hidden_layers=1, layer_types=["mamba"], mamba_chunk_size=TRACK_INTERVAL
+        )
+        for model, deterministic, lazy, overlap in (
+            (mamba_config, True, False, True),
+            (mamba_config, True, True, True),
+            (mamba_config, True, False, False),
+            (mamba_config, False, True, True),
+            (MambaConfig(), True, True, True),
+            (FalconMambaConfig(), True, True, True),
+            (Lfm2Config(), True, True, True),
+            (LlamaConfig(), True, True, True),
+        ):
+            for end in (TRACK_INTERVAL - 1, TRACK_INTERVAL):
+                with self.subTest(
+                    model=model,
+                    deterministic=deterministic,
+                    lazy=lazy,
+                    overlap=overlap,
+                    end=end,
+                ):
+                    _, batch = _make_batch()
+                    batch.model_config.hf_config = model
+                    batch.enable_overlap = overlap
+                    batch.seq_lens.fill_(end - 1)
+                    batch.seq_lens_cpu.fill_(end - 1)
+                    batch.orig_seq_lens.fill_(end - 1)
+                    enabled = not (model is mamba_config and deterministic)
+                    with (
+                        get_context().override_server_args(
+                            mamba_radix_cache_strategy=(
+                                "extra_buffer_lazy" if lazy else "extra_buffer"
+                            ),
+                            enable_deterministic_inference=deterministic,
+                            mamba_track_interval=TRACK_INTERVAL,
+                            _mamba_cache_chunk_size=TRACK_INTERVAL,
+                        ),
+                        patch(
+                            "sglang.srt.managers.schedule_batch.alloc_for_decode",
+                            return_value=torch.tensor([3]),
+                        ),
+                        patch(
+                            "sglang.srt.managers.schedule_batch.set_mamba_track_indices_from_reqs"
+                        ),
+                        patch.object(torch.Tensor, "pin_memory", lambda tensor: tensor),
+                        patch.object(
+                            ScheduleBatch, "mamba_lazy_prealloc_at_boundary"
+                        ) as prealloc,
+                    ):
+                        batch.prepare_for_decode()
+                    self.assertEqual(
+                        batch.mamba_track_mask_cpu,
+                        [enabled and end % TRACK_INTERVAL == 0],
+                    )
+                    self.assertEqual(
+                        batch.mamba_track_mask.tolist(), batch.mamba_track_mask_cpu
+                    )
+                    self.assertEqual(
+                        batch.mamba_track_mask_next_cpu,
+                        [enabled and end % TRACK_INTERVAL == TRACK_INTERVAL - 1]
+                        if overlap
+                        else None,
+                    )
+                    self.assertEqual(prealloc.called, lazy and enabled)
+
     def test_overlap_scheduler_handles_zero_and_one_batch_lookahead(self):
         for schedule_next_decode, expected_lookahead in ((False, 0), (True, 1)):
             with self.subTest(schedule_next_decode=schedule_next_decode):

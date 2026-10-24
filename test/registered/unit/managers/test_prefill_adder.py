@@ -1,4 +1,5 @@
 import unittest
+from itertools import product
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -347,6 +348,105 @@ class TestPrefillAdder(CustomTestCase):
         req.full_untruncated_fill_ids = list(range(8192))
         self.assertIs(adder.add_chunked_req(req), req)
         self.assertEqual(req.extend_len, 4096)
+
+    def test_first_chunk_aligns_absolute_end_after_cached_prefix(self):
+        for exact in (False, True):
+            with (
+                self.subTest(exact=exact),
+                patch.object(
+                    schedule_policy, "_use_exact_chunk_fill", return_value=exact
+                ),
+            ):
+                self.mock_tree_cache.supports_mamba.return_value = False
+                self.mock_tree_cache.supports_prefix_sharing.return_value = False
+                self.mock_token_allocator.available_size.return_value = 32768
+                adder = self.create_adder(
+                    self.create_running_batch(), rem_chunk_tokens=512
+                )
+                req = self.create_shared_req("cached-prefix")
+                req.prefix_len = 1000
+                req.full_untruncated_fill_ids = list(range(3000))
+                adder.add_one_req(req, has_chunked_req=False, truncation_align_size=256)
+                self.assertEqual(req.extend_end, 1280)
+                self.assertEqual(req.extend_len, 280)
+
+    def test_continuation_aligns_absolute_end_and_preserves_progress(self):
+        cases = (
+            (1000, 3000, 512, 1280),
+            (256, 3000, 100, 356),
+            (1000, 1100, 512, 1100),
+        )
+        for prefix, total, budget, expected_end in cases:
+            with self.subTest(prefix=prefix, total=total, budget=budget):
+                self.mock_tree_cache.supports_mamba.return_value = False
+                self.mock_tree_cache.supports_prefix_sharing.return_value = False
+                self.mock_token_allocator.available_size.return_value = 32768
+                adder = self.create_adder(
+                    self.create_running_batch(), rem_chunk_tokens=budget
+                )
+                req = self.create_shared_req("continuation")
+                req.prefix_len = prefix
+                req.full_untruncated_fill_ids = list(range(total))
+                adder.add_chunked_req(req, truncation_align_size=256)
+                self.assertEqual(req.extend_end, expected_end)
+
+    def test_continuation_alignment_respects_budget_across_boundaries(self):
+        self.mock_tree_cache.supports_mamba.return_value = False
+        self.mock_tree_cache.supports_prefix_sharing.return_value = False
+        self.mock_token_allocator.available_size.return_value = 32768
+        for prefix, remaining, budget, alignment in product(
+            (0, 1, 255, 256, 511, 1000),
+            (100, 2048),
+            (1, 255, 256, 257, 512),
+            (None, 256),
+        ):
+            with self.subTest(
+                prefix=prefix, remaining=remaining, budget=budget, alignment=alignment
+            ):
+                adder = self.create_adder(
+                    self.create_running_batch(), rem_chunk_tokens=budget
+                )
+                req = self.create_shared_req("continuation-grid")
+                req.prefix_len = prefix
+                req.full_untruncated_fill_ids = list(range(prefix + remaining))
+                unfinished = adder.add_chunked_req(req, truncation_align_size=alignment)
+                expected_len = min(remaining, budget)
+                if remaining > budget and alignment is not None:
+                    boundary = (prefix + budget) // alignment * alignment
+                    if boundary > prefix:
+                        expected_len = boundary - prefix
+                self.assertEqual(req.extend_len, expected_len)
+                self.assertGreater(req.extend_len, 0)
+                self.assertLessEqual(req.extend_len, min(remaining, budget))
+                self.assertIs(unfinished, req if remaining > budget else None)
+
+    def test_first_chunk_alignment_rejects_insufficient_budget(self):
+        self.mock_tree_cache.supports_mamba.return_value = False
+        self.mock_tree_cache.supports_prefix_sharing.return_value = False
+        self.mock_token_allocator.available_size.return_value = 32768
+        for prefix, budget, exact in product(
+            (0, 1, 255, 256, 511, 1000), (1, 255, 256, 257, 512), (False, True)
+        ):
+            with (
+                self.subTest(prefix=prefix, budget=budget, exact=exact),
+                patch.object(
+                    schedule_policy, "_use_exact_chunk_fill", return_value=exact
+                ),
+            ):
+                adder = self.create_adder(
+                    self.create_running_batch(), rem_chunk_tokens=budget
+                )
+                req = self.create_shared_req("first-chunk-grid")
+                req.prefix_len = prefix
+                req.full_untruncated_fill_ids = list(range(prefix + 2048))
+                adder.add_one_req(req, has_chunked_req=False, truncation_align_size=256)
+                expected_end = (prefix + budget) // 256 * 256
+                if expected_end <= prefix:
+                    self.assertEqual(adder.can_run_list, [])
+                else:
+                    self.assertEqual(adder.can_run_list, [req])
+                    self.assertEqual(req.extend_end, expected_end)
+                    self.assertLessEqual(req.extend_len, budget)
 
     def test_exact_chunk_fill_keeps_mamba_chunks_page_aligned(self):
         # A Mamba checkpoint only lands on a page-aligned chunk end, so an
@@ -890,6 +990,45 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(result, AddReqResult.NO_TOKEN)
         self.assertEqual(adder.can_run_list, [])
         self.assertIsNone(req.extend_end)
+
+    def test_ignore_eos_honors_alignment_and_existing_continuation(self):
+        self.mock_tree_cache.disable = True
+        self.mock_tree_cache.supports_mamba.return_value = False
+        self.mock_tree_cache.supports_prefix_sharing.return_value = False
+        self.mock_token_allocator.available_size.return_value = 32768
+        cases = (
+            (513, 1025, False, 256, 512),
+            (1, 1025, False, 256, None),
+            (513, 1025, True, 256, None),
+            (513, 1025, True, None, None),
+            (513, 257, True, 256, 257),
+            (513, 513, False, 256, 513),
+            (513, 1025, False, None, 513),
+        )
+        for budget, total, has_chunked, alignment, expected_end in cases:
+            with self.subTest(
+                budget=budget, total=total, has_chunked=has_chunked, alignment=alignment
+            ):
+                adder = self.create_adder(
+                    self.create_running_batch(), rem_chunk_tokens=budget
+                )
+                req = self.create_shared_req("ignore-eos-grid", max_new_tokens=64)
+                req.sampling_params.ignore_eos = True
+                req.origin_input_ids = list(range(total))
+                req.full_untruncated_fill_ids = list(range(total))
+                adder.add_one_req(
+                    req, has_chunked_req=has_chunked, truncation_align_size=alignment
+                )
+                if expected_end is None:
+                    self.assertEqual(adder.can_run_list, [])
+                    self.assertIsNone(req.extend_end)
+                    self.assertIsNone(adder.new_chunked_req)
+                else:
+                    self.assertEqual(adder.can_run_list, [req])
+                    self.assertEqual(req.extend_end, expected_end)
+                    self.assertIs(
+                        adder.new_chunked_req, req if expected_end < total else None
+                    )
 
     def create_sharded_adder(
         self,

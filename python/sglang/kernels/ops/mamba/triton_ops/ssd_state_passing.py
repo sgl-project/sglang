@@ -71,6 +71,7 @@ def _state_passing_fwd_kernel(
     HAS_INITSTATES: tl.constexpr,
     HAS_SEQ_IDX: tl.constexpr,
     IS_CONT_BATCHED: tl.constexpr,
+    ROUND_BOUNDARY_STATES: tl.constexpr,
     BLOCK_SIZE: tl.constexpr = 16,
 ):
     pid_b = tl.program_id(axis=1)
@@ -109,6 +110,8 @@ def _state_passing_fwd_kernel(
         #   init state
         states = tl.load(initstates_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
 
+    if ROUND_BOUNDARY_STATES:
+        states = states.to(out_ptr.dtype.element_ty).to(tl.float32)
     tl.store(out_ptrs, states, mask=offs_m < dim)
     out_ptrs += stride_out_chunk
     prev_seq_idx_chunk_end = 0
@@ -176,6 +179,9 @@ def _state_passing_fwd_kernel(
 
         scale = tl.where(scale_mask, tl.exp(dA_cs), 0.0)
         states = scale * states + new_states
+        if ROUND_BOUNDARY_STATES:
+            # A resumed scan reads this precision from its cached checkpoint.
+            states = states.to(out_ptr.dtype.element_ty).to(tl.float32)
         if c < nchunks - 1:
             tl.store(out_ptrs, states, mask=offs_m < dim)
         else:
@@ -194,6 +200,7 @@ def _state_passing_fwd(
     out_dtype=None,
     is_cont_batched=False,
     chunk_offsets=None,
+    round_boundary_states=False,
 ):
     batch, nchunks, nheads, dim = states.shape
     if chunk_size is None:
@@ -277,5 +284,6 @@ def _state_passing_fwd(
             HAS_INITSTATES=initial_states is not None,
             HAS_SEQ_IDX=seq_idx is not None,
             IS_CONT_BATCHED=is_cont_batched,
+            ROUND_BOUNDARY_STATES=round_boundary_states and out_dtype != torch.float32,
         )
     return out, final_states
