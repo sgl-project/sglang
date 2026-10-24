@@ -372,37 +372,22 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         )
 
         meta = forward_batch.attn_cp_metadata
-        q_prev = q[: meta.total_q_prev_tokens]
         logical_tokens = meta.total_q_prev_tokens + meta.total_q_next_tokens
-        q_next = q[meta.total_q_prev_tokens : logical_tokens]
 
-        prev_kwargs = {}
-        next_kwargs = {}
+        kwargs = {}
         if attention_backend == CPAttentionBackendKind.TRTLLM_MHA:
-            result = attn_fn(
-                q[:logical_tokens],
-                meta.cu_seqlens_q_combined_tensor,
-                meta.kv_len_combined_tensor,
-                meta.max_seqlen_q_combined,
+            kwargs = dict(
                 cu_seqlens_kv=meta.cu_seqlens_kv_combined_tensor,
                 use_zigzag_page_table=True,
             )
-        else:
-            result_prev = attn_fn(
-                q_prev,
-                meta.cu_seqlens_q_prev_tensor,
-                meta.kv_len_prev_tensor,
-                meta.max_seqlen_q_prev,
-                **prev_kwargs,
-            )
-            result_next = attn_fn(
-                q_next,
-                meta.cu_seqlens_q_next_tensor,
-                meta.kv_len_next_tensor,
-                meta.max_seqlen_q_next,
-                **next_kwargs,
-            )
-            result = torch.cat([result_prev, result_next], dim=0)
+        # One launch: the prev and next halves are separate batch entries.
+        result = attn_fn(
+            q[:logical_tokens],
+            meta.cu_seqlens_q_combined_tensor,
+            meta.kv_len_combined_tensor,
+            meta.max_seqlen_q_combined,
+            **kwargs,
+        )
 
         pad_size = q.shape[0] - logical_tokens
         assert pad_size >= 0
