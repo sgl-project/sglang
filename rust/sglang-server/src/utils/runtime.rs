@@ -180,8 +180,8 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
     // tokenizer is loaded, and the server emits raw `output_ids` (no decode).
     let skip_tokenizer_init = cfg.server_args.skip_tokenizer_init;
 
-    // Shared by the tokenizer pool, the OpenAI chat layer and the detok shards;
-    // `None` only under `skip_tokenizer_init`. MM text prompts tokenize in the pool.
+    // The same instance is shared by the tokenizer pool (encode), the OpenAI chat
+    // layer and the detok shards (decode); `None` only under `skip_tokenizer_init`.
     let tokenizer = tokenizer::load_tokenizer(
         // Empty only in standalone (test) configs (the Python handoff always
         // resolves it); empty → no tokenizer, allowed only under

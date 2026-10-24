@@ -65,7 +65,7 @@ pub(crate) fn render(
         .chain(tools.iter().flatten())
         .any(has_negative_zero)
     {
-        return Err("-0 requires a fallback renderer".into());
+        return Err("-0 renders on the engine".into());
     }
     // The template strips assistant content, and Python also strips U+001C..U+001F;
     // drop once dynamo-renderer includes ai-dynamo/frontend-crates#395.
@@ -73,7 +73,7 @@ pub(crate) fn render(
         .iter()
         .any(|m| m["role"] == "assistant" && has_python_only_space(&m["content"]))
     {
-        return Err("U+001C..U+001F in assistant content requires a fallback renderer".into());
+        return Err("U+001C..U+001F in assistant content renders on the engine".into());
     }
     let PromptFormatter::OAI(formatter) = formatter;
     let prompt = formatter
@@ -118,9 +118,7 @@ fn template_args(
         .iter()
         .find(|key| kwargs.contains_key(**key))
     {
-        return Err(format!(
-            "chat_template_kwargs.{key} requires a fallback renderer"
-        ));
+        return Err(format!("chat_template_kwargs.{key} renders on the engine"));
     }
     if !valid_documents(kwargs.get("documents").unwrap_or(&Value::Null)) {
         return Err("chat_template_kwargs.documents must iterate as objects".into());
@@ -181,7 +179,7 @@ fn template_message(message: Value) -> Result<Value, String> {
                 Some("tool_reference") => {
                     Ok(json!({"type": "tool_reference", "name": part["name"]}))
                 }
-                _ => Err("GLM-5.3 media requires a fallback renderer"),
+                _ => Err("GLM-5.3 media renders on the engine"),
             })
             .collect::<Result<Vec<_>, _>>()?;
         // `normalize_tool_content`: a tool result's text parts join with spaces.

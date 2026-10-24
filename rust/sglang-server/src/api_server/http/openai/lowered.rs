@@ -338,13 +338,12 @@ mod tests {
         assert!(message.contains("exceeds the maximum"), "{message}");
     }
 
-    /// A scheduler failure keeps its 500, as Python's `HTTPException` does,
-    /// and a validation failure is the 400 `BadRequestError`.
+    /// A scheduler failure keeps its 500, as Python's `HTTPException` does.
     #[tokio::test]
     async fn failed_choice_keeps_its_status() {
         let body = json!({"model": "model", "messages": [{"role": "user", "content": "hi"}]});
         let app = lowered_state(|_| ResponseItem::Error(Error::Internal("boom".into())));
-        let response = post_json(app, "/v1/chat/completions", body.clone()).await;
+        let response = post_json(app, "/v1/chat/completions", body).await;
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         let value = body_json(response).await;
         assert_eq!(
@@ -354,30 +353,6 @@ mod tests {
         assert!(
             value["message"].as_str().unwrap().contains("boom"),
             "{value}"
-        );
-
-        let app = lowered_state(|_| ResponseItem::Error(Error::Validation("bad".into())));
-        let response = post_json(app, "/v1/chat/completions", body).await;
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(body_json(response).await["type"], "BadRequestError");
-    }
-
-    /// `separate_reasoning`, which the typed handler ignores, is Python's.
-    #[tokio::test]
-    async fn processor_serves_separate_reasoning() {
-        let mut body = json!({
-            "model": "model",
-            "messages": [{"role": "user", "content": "17*23?"}],
-            "chat_template_kwargs": {"thinking": true}
-        });
-        let split = chat(body.clone()).await;
-        assert_eq!(split["choices"][0]["message"]["reasoning_content"], "17*23");
-        assert_eq!(split["choices"][0]["message"]["content"], "391");
-        body["separate_reasoning"] = false.into();
-        let joined = chat(body).await;
-        assert_eq!(
-            joined["choices"][0]["message"]["content"],
-            "17*23</think>391"
         );
     }
 

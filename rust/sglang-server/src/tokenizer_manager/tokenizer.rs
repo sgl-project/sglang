@@ -22,8 +22,10 @@ use crate::runtime::Runnable;
 use crate::tokenizer_manager::wiring::TmEvent;
 use crate::utils::{error::Error, fsm::Event};
 
-/// Load the tokenizer shared by the encode pool and (its handle) the detok shards;
-/// `tokenizer_path` may be an HF Hub repo id, read from the local cache only.
+/// Load the tokenizer shared (Arc-backed) by the encode pool and detok shards.
+/// `None` under `skip_tokenizer_init`, else required (missing/failed load → `Err`).
+/// `tokenizer_path` is a tokenizer file, a model dir, or an HF Hub repo id
+/// (resolved from the local cache — no network).
 pub fn load_tokenizer(
     tokenizer_path: Option<&str>,
     revision: Option<&str>,

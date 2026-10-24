@@ -72,16 +72,14 @@ pub(crate) fn render(
     }
     messages.iter_mut().for_each(join_text_parts);
     if messages.iter().any(trims_unlike_python) {
-        return Err(
-            "text Python's trim strips unlike minijinja's requires a fallback renderer".into(),
-        );
+        return Err("text Python's trim strips unlike minijinja's renders on the engine".into());
     }
     if messages
         .iter()
         .chain(tools.iter().flatten())
         .any(prints_unlike_python)
     {
-        return Err("numbers serde_json prints unlike Python require a fallback renderer".into());
+        return Err("numbers serde_json prints unlike Python render on the engine".into());
     }
     let PromptFormatter::OAI(formatter) = formatter;
     let prompt = formatter
@@ -126,9 +124,7 @@ fn template_args(
         .iter()
         .find(|key| kwargs.contains_key(**key))
     {
-        return Err(format!(
-            "chat_template_kwargs.{key} requires a fallback renderer"
-        ));
+        return Err(format!("chat_template_kwargs.{key} renders on the engine"));
     }
     // `render_jinja_template` raises unless `documents` iterates as dicts.
     if !valid_documents(kwargs.get("documents").unwrap_or(&Value::Null)) {
@@ -200,7 +196,7 @@ fn template_message(message: Value, content_parts: bool) -> Result<Value, String
         .iter()
         .any(|part| MEDIA_PARTS.contains(&part["type"].as_str().unwrap_or_default()))
     {
-        return Err("Qwen3.8 media requires a fallback renderer".into());
+        return Err("Qwen3.8 media renders on the engine".into());
     }
     // Strings keep only text parts, parts lists also tool references; strings and a
     // tool result's text parts join with spaces.

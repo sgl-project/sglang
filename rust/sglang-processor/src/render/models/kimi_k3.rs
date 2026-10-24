@@ -67,8 +67,7 @@ pub(crate) fn render(
     // own arguments: SGLang truncates or pads the ids, or fails on a duplicate argument.
     if TOKENIZER_ARGS.iter().any(|arg| kwargs.contains_key(*arg)) {
         return Err(
-            "Kimi K3 tokenizer arguments in chat_template_kwargs require a fallback renderer"
-                .into(),
+            "Kimi K3 tokenizer arguments in chat_template_kwargs render on the engine".into(),
         );
     }
     let thinking = kwargs
@@ -104,7 +103,7 @@ pub(crate) fn render(
                     .is_some_and(|r| !r.is_empty() && r.trim().is_empty())
         })
     {
-        return Err("whitespace-only Kimi K3 reasoning requires a fallback renderer".into());
+        return Err("whitespace-only Kimi K3 reasoning renders on the engine".into());
     }
 
     let tools = match request["tools"].as_array() {
@@ -168,9 +167,7 @@ pub(crate) fn render(
         .chain(&encoder_input.response_format)
         .any(prints_unlike_python)
     {
-        return Err(
-            "Kimi K3 numbers serde_json prints unlike Python require a fallback renderer".into(),
-        );
+        return Err("Kimi K3 numbers serde_json prints unlike Python render on the engine".into());
     }
     // SGLang renders every declared tool, whatever the tool_choice.
     let prompt = KimiK3Formatter::new(false)
@@ -190,7 +187,7 @@ fn prepare_message(mut message: Value) -> Result<Value, String> {
                 Some("image_url" | "video_url" | "audio_url" | "input_audio")
             )
         }) {
-            return Err("Kimi K3 media requires a fallback renderer".into());
+            return Err("Kimi K3 media renders on the engine".into());
         }
         parts.retain(|part| part["type"] == "text");
     }
@@ -208,7 +205,7 @@ fn prepare_message(mut message: Value) -> Result<Value, String> {
         }
         // SGLang's encoder and Dynamo parse other text differently.
         if arguments.as_str().is_some_and(|text| !text.is_empty()) {
-            return Err("non-object tool arguments require a fallback renderer".into());
+            return Err("non-object tool arguments render on the engine".into());
         }
         neutralize(arguments);
     }

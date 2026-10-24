@@ -149,7 +149,7 @@ impl ChatFormatter {
     /// `chat_template_kwargs`, returning the prompt and the
     /// `continue_final_message` prefix SGLang tokenizes separately.
     /// The body must be one SGLang's `ChatCompletionRequest` accepts; it is not
-    /// re-validated. Only the formatters [`Self::renders_requests`] names render
+    /// re-validated. Only DeepSeek-V4, V4.1, GLM-5.3, Kimi K3 and Qwen3.8 render
     /// this way; others use [`Self::render_prompt`].
     pub fn render_request(
         &self,
@@ -347,7 +347,7 @@ impl OAIChatLikeRequest for TemplateArgsRequest<'_> {
 
 /// How a parity renderer ends the message refusing a valid request, which
 /// [`ChatFormatter::render_request`] maps to [`TemplateError::NeedsRenderFallback`].
-const RENDER_FALLBACK_SUFFIX: &str = "a fallback renderer";
+const RENDER_FALLBACK_SUFFIX: &str = "on the engine";
 
 #[derive(Debug, Error)]
 pub enum TemplateError {
