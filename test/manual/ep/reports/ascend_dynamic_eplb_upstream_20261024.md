@@ -7,7 +7,7 @@ The [initial verification manifest](ascend_dynamic_eplb_upstream_20261024/verifi
 Eight production files are changed; the existing community TopK padding and shared-expert masking implementation is retained.
 The later comment and docstring cleanup leaves the executable code unchanged from the tested revision.
 
-The optimized community source passed CPU, bounded NPU graph, two-rank weight migration and fresh-process full-model AIS checks. Current-source single-node performance is reported separately from the earlier integration results. Disaggregated P/D has not been rerun on this community base.
+The optimized community source passed CPU, bounded NPU graph, two-rank weight migration and fresh-process full-model AIS checks. Current-source single-node performance is reported separately from the earlier integration results. Fresh OFF/ON disaggregated P/D acceptance at the current community revision is reported below.
 
 ## Optimization follow-up
 
@@ -101,6 +101,45 @@ At source `0d019b6ac5d6149eca8d3b975dc06d02bdc41877`, [lint passed](https://gith
 - An NPU HiCache test failed allocating host pinned memory with EPLB disabled. A separate GLM image distributed test returned no output; its root cause is unresolved.
 - An AMD LoRA latency test exceeded its threshold with EPLB disabled; this is an observed failure, without a matched baseline attribution.
 - Extra-suite gates require maintainer opt-in; some hardware jobs remain queued. No gate bypass, latency-threshold change or unrelated production fix was made.
+
+## Current community source: PD switch acceptance
+
+Source: `111a8c52b87869d3904ba00e429bf8bb959cd560`. The [PD acceptance records](ascend_dynamic_eplb_upstream_20261024/pd_acceptance.json) contain per-rank rebalance counts, actual layout-change observations, source hashes and the four verified raw archive hashes.
+
+Two Ascend 910C nodes served separate prefill and decode roles with DeepSeek-V4-Flash W8A8, B103, CANN 9.1.0, PyTorch 2.10.0 and torch_npu 2.10.0.post6. Both used the current community source and the packaging-pinned `deepseek-recipe==0.2.0`. Each OFF/ON arm started fresh processes on both nodes; source, environment and requests matched, with only `--enable-eplb` changed.
+
+Both roles used TP/EP/attention-DP 16, DP1, trivial initial placement and static dispatch, without an offline optimized layout. Radix cache, DSpark and Compact were disabled. P used DeepEP normal in eager mode, memory fraction 0.62, 16 redundant experts and interval/window 4/4. D used DeepEP low-latency with decode graphs 1/2/4/6/8/12/16, memory fraction 0.71, no redundant experts and interval/window 64/64. Placement logging was enabled equally; balancedness reporting was off. The short intervals deliberately exercise the switch and repeated layout updates.
+
+Each arm ran two planned preparations of 16 requests with 16 output tokens, followed by 64 formal requests at C16, actual input 689-708 and output 128 tokens. These are short copy inputs from the existing request bank, not the 16388/1024-token AIS performance workload.
+
+| Arm | Preparation success / failed | Formal success / failed | Copy check | Preparation + formal time |
+|---|---:|---:|---:|---:|
+| OFF | 32 / 0 | 64 / 0 | 64/64 | 27.705 s |
+| ON | 32 / 0 | 64 / 0 | 64/64 | 38.484 s |
+
+All 192 planned requests succeeded. All 64 formal input/output pairs matched exactly between OFF and ON; the 32 preparation pairs also matched. Both P and D completed real layout changes with ON, while OFF completed zero rebalance passes.
+
+| Arm | Role | Completed passes per rank | Nonzero layout-change log rows | Maximum changed physical slots in one update |
+|---|---|---:|---:|---:|
+| OFF | P | 0 | 0 | 0 |
+| OFF | D | 0 | 0 | 0 |
+| ON | P | 4 | 4 | 11644 |
+| ON | D | 9 | 9 | 10938 |
+
+Counts cover all 16 ranks per role in the timestamped client window, including both preparation rounds. Router health traffic was also present. Before that window, ON had already completed P2/D1 passes per rank during startup and health traffic. Layout rows are log observations, not unique layers or migrated bytes. No ERROR, Traceback, scheduler exception or ERR00100 signatures occurred in the client window. This verifies the PD switch and copy-task behavior; it does not establish PD speedup, general task accuracy or all-layer weight equality.
+
+Startup diagnostics are retained separately: P logged five address-in-use/configuration-store errors in each arm when it attempted to create the already-running test store; OFF D logged two transient TCP bind errors. All occurred before readiness and before the client window. Both arms subsequently completed all planned requests. No transport workaround or retry was added to the client.
+
+| Raw arm archive | SHA-256 |
+|---|---|
+| OFF P | `89c06b21da13a7232c86fece6f5cc092ecea173fd8f73cc105a929255dc1e7ba` |
+| OFF D | `611a2048d5da3bee392d349ce4b90f302afab8f8ea108b926be8bc1894ed04c2` |
+| ON P | `8385f5cafe921cf2a85f6286c98964f6a59863573edd531bf79684b47d24d047` |
+| ON D | `673f08a5a0f269385cf289b2619e74053ce980ac306ecd7ae3280132718aac0d` |
+
+![Current-community PD test scenarios and results](ascend_dynamic_eplb_upstream_20261024/pd_acceptance.png)
+
+The image is a browser-rendered screenshot of the verified records. Full raw requests, outputs and logs are retained in the sealed archives; the public JSON contains the source-bound summary.
 
 ## Initial community-port tests
 
