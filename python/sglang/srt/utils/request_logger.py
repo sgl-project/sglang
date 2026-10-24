@@ -53,11 +53,13 @@ class RequestLogger:
         log_requests_level: int,
         log_requests_format: str,
         log_requests_target: Optional[List[str]],
+        log_requests_retention_days: Optional[int] = None,
     ):
         self.log_requests = log_requests
         self.log_requests_level = log_requests_level
         self.log_requests_format = log_requests_format
         self.log_requests_target = log_requests_target
+        self.log_requests_retention_days = log_requests_retention_days
 
         self.metadata: Tuple[Optional[int], Optional[Set[str]], Optional[Set[str]]] = (
             self._compute_metadata()
@@ -68,7 +70,9 @@ class RequestLogger:
 
     def _setup_targets(self) -> List[logging.Logger]:
         return create_log_targets(
-            targets=self.log_requests_target, name_prefix=__name__
+            targets=self.log_requests_target,
+            name_prefix=__name__,
+            retention_days=self.log_requests_retention_days,
         )
 
     def configure(
