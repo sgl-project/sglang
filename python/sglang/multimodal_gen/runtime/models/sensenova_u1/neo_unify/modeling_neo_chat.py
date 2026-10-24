@@ -809,6 +809,11 @@ class NEOChatModel(PreTrainedModel):
                 t_index_condition + 1,
                 device=input_ids_condition.device,
             )
+            # The cache now also holds the reasoning and <img>; the denoise
+            # attention keeps only the first prefix_lengths cached tokens.
+            condition_prefix_lengths = condition_prefix_lengths.new_tensor(
+                [t_index_condition + 1]
+            )
             del outputs_condition
         else:
             past_key_values_condition, prefix_hidden_states = self._t2i_prefix_forward(
