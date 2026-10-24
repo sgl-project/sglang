@@ -218,6 +218,8 @@ def _maybe_enable_silu_fp4_quant_fusion(mlp: nn.Module) -> None:
     tuple. Enabled when both dense-MLP projections use the NVFP4 (W4A4)
     linear method; kill switch: SGLANG_DISABLE_SILU_FP4_QUANT_FUSION=1.
     """
+    if mlp.gate_up_proj is None:
+        return
     if os.environ.get("SGLANG_DISABLE_SILU_FP4_QUANT_FUSION", "0") == "1":
         return
     from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4LinearMethod
@@ -1167,6 +1169,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix.replace(".linear_attn", "")),
+                allow_mixed_precision=True,
                 # The stage boundary completes this stage's sum.
                 reduce_results=False,
             )
@@ -1375,6 +1378,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix.replace(".self_attn", "")),
+                allow_mixed_precision=True,
                 # The stage boundary completes this stage's sum.
                 reduce_results=False,
             )
@@ -2025,6 +2029,9 @@ class Qwen3_5ForCausalLM(nn.Module):
 
                 if "mlp.experts" in name:
                     continue
+                # Mixed-precision dense MLPs keep separate checkpoint parameters.
+                if weight_name in ("gate_proj", "up_proj") and name in params_dict:
+                    continue
 
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
@@ -2501,6 +2508,9 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     continue
 
                 if "visual" in name or "mlp.experts" in name:
+                    continue
+                # Keep weight/scale loader routing local to each unfused projection.
+                if weight_name in ("gate_proj", "up_proj") and name in params_dict:
                     continue
 
                 name = name.replace(weight_name, param_name)
