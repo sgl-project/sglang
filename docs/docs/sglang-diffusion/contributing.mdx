@@ -74,6 +74,16 @@ Please run the according testcase, then update/add the baseline to `perf_baselin
 
 See [test](https://github.com/sgl-project/sglang/tree/main/python/sglang/multimodal_gen/test) for examples
 
+### Host-sync regression tests
+
+A denoising step or a DiT forward should not block the host on the device. One `item()`, `float(t)`, `if t:`, `.cpu()`, `nonzero` or pageable `torch.tensor(..., device="cuda")` per step stops the host from queueing the next step while the GPU runs this one. `test/unit/host_sync_guard.py` has three guards for unit tests:
+
+- `no_cuda_sync(allow=...)` and `assert_no_cuda_sync(fn, ...)` run the code under `torch.cuda.set_sync_debug_mode` and fail with the call site of every sync whose issuing function is not listed in `allow` (`"<file suffix>:<function>"`). They skip without CUDA. Call the code once outside the guard first, so first-use setup is not counted.
+- `SyncOnRead` is a CPU stand-in for device tensors (timesteps, sigmas, masks): reading its values on the host raises. Run the step once with plain tensors and once with stand-ins, and require bitwise-equal outputs.
+- `forbid_host_syncs()` is a dispatch mode for code that builds its own tensors: it fails on the ops that sync on CUDA whatever tensor they read (scalar reads, `nonzero`, boolean-mask indexing, data-dependent output shapes).
+
+`test_host_sync.py` shows both on the shared denoising loop. Unit tests run in the `multimodal-gen-unit-test` CI job on an H100, so the CUDA guard runs there.
+
 ## Out-of-tree platform changes
 
 Use the `sglang.multimodal_gen.platforms` entry-point group when a hardware integration can live in a separately installed package. The [plugin guide](/docs/hardware-platforms/plugin#add-diffusion-support) describes the activation callback, diffusion platform contract, and selection behavior.

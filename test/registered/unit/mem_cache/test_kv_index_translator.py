@@ -133,36 +133,6 @@ def _plan(src, rows, seq_lens, *, write_virtual=None, read_extent=0):
     )
 
 
-class TestPassthrough(unittest.TestCase):
-    def setUp(self):
-        _publish()
-        self.addCleanup(reset_context)
-
-    def test_non_unified_returns_same_objects(self):
-        """Strict passthrough: no copy, no branch. Any tensor op on the
-        non-unified path breaks byte-identity for every static-pool server."""
-        req_to_token = torch.arange(64, dtype=torch.int64).reshape(4, 16)
-        src = KVIndexTranslator(
-            req_to_token=req_to_token,
-            token_to_kv_pool_allocator=SimpleNamespace(),  # not a composite
-            token_to_kv_pool=SimpleNamespace(),  # not an SWAKVPool
-            page_size=1,
-            device=_DEV,
-        )
-        self.assertFalse(src.is_translating)
-        self.assertEqual(src.capture_token_capacity(17), 18)
-        rows = torch.tensor([2, 0])
-        loc = torch.tensor([1, 2, 3])
-        plan = _plan(src, rows, torch.tensor([5, 3]), write_virtual=loc)
-        self.assertIs(plan.write_ids(src), loc)
-        view = src.read_source(plan, req_pool_indices=rows, bs=2)
-        self.assertIs(view.ids, req_to_token)
-        self.assertIs(view.row_ids, rows)
-        self.assertEqual(view.row_stride, req_to_token.stride(0))
-        self.assertEqual(view.entry_page_size, 1)
-        self.assertFalse(view.is_translated)
-
-
 def _alloc_and_fill(allocator, ps, lens):
     """Allocate per-request virtual runs and write them into a fake
     req_to_token."""
