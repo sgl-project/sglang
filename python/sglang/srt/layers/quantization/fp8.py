@@ -1341,7 +1341,7 @@ class Fp8LinearMethod(LinearMethodBase):
             extra_kwargs = (
                 {"weight_bf16": cached_weight} if cached_weight is not None else {}
             )
-            return self.w8a8_block_fp8_linear(
+            self.w8a8_block_fp8_linear(
                 input=input_tensor,
                 weight=layer.weight,
                 block_size=self.weight_block_size,
@@ -1351,6 +1351,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 output=output,
                 **extra_kwargs,
             )
+            return output
         result = self.apply(layer, x, bias)
         if output.dtype != result.dtype:
             raise ValueError(f"linear output must have dtype {result.dtype}")

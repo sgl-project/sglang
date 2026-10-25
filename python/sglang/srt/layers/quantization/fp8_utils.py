@@ -1562,6 +1562,8 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
         )
         if bias is not None:
             result += bias
+        if output is not None:
+            return output
         return result.view(*input.shape[:-1], weight.shape[0])
 
     input_2d = input.view(-1, input.shape[-1])
@@ -1598,6 +1600,8 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
     )
     if bias is not None:
         result += bias
+    if output is not None:
+        return output
     return result.to(dtype=output_dtype).view(*output_shape)
 
 
