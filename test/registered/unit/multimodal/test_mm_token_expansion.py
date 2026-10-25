@@ -18,6 +18,7 @@ TokenSpaceProcessor.process(media, IDs)
   processor_output / precomputed_embedding source -> ValueError
   bare source instead of a list -> TypeError
   strategy loading options -> load kwargs
+  CUDA initialized on rank device d -> IO threads set device d; serving keeps cuda:0
   worker_thread_device d, no processor pool -> inline processing on device d
 
 get_mm_processor -> TokenSpaceSGLangProcessor
@@ -270,6 +271,31 @@ class TestTokenSpaceProcessor(unittest.TestCase):
                     )
                 )
 
+    def test_trainer_io_threads_decode_on_the_rank_device(self):
+        """A new thread starts on cuda:0, not on the device its rank selected."""
+        self.assertIsNone(self._processor().io_executor._initializer)
+        with (
+            patch("torch.cuda.is_initialized", return_value=True),
+            patch("torch.cuda.current_device", return_value=3),
+        ):
+            initializer = self._processor().io_executor._initializer
+            reset_context()
+            self.addCleanup(reset_context)
+            server_args = ServerArgs(
+                model_path="dummy",
+                model_impl="sglang",
+                mm_process_config={},
+                enable_token_space_processor=True,
+                mm_processor_worker_num=1,
+            )
+            publish(server_args, role="test")
+            serving = TokenSpaceSGLangProcessor.for_strategy(_ImageWidthStrategy)(
+                None, server_args, _bare_tokenizer(), None
+            )
+            self.addCleanup(serving.shutdown)
+        self.assertIs(initializer.func, torch.cuda.set_device)
+        self.assertEqual(initializer.args, (3,))
+        self.assertIsNone(serving._core.io_executor._initializer)
     def test_inline_processing_runs_on_the_device_the_caller_passes(self):
         """With one processor worker there is no pool, so the caller's thread decodes on cuda:0."""
         with (
