@@ -53,6 +53,28 @@ class TestEnvField(unittest.TestCase):
         self.assertTrue(envs.SGLANG_TEST_RETRACT.is_set())
         self.assertIsNone(envs.SGLANG_TEST_RETRACT.get())
 
+    def test_override_restores_state_when_block_raises(self):
+        """An exception leaving the with block must not leak the override: the
+        key's previous presence, value and explicit-None state are restored."""
+        with self.assertRaises(RuntimeError):
+            with envs.SGLANG_TEST_RETRACT.override(True):
+                raise RuntimeError("boom")
+        self.assertFalse(envs.SGLANG_TEST_RETRACT.is_set())
+        self.assertIs(envs.SGLANG_TEST_RETRACT.get(), False)
+
+        envs.SGLANG_TEST_RETRACT.set(False)
+        with self.assertRaises(RuntimeError):
+            with envs.SGLANG_TEST_RETRACT.override(True):
+                raise RuntimeError("boom")
+        self.assertIs(envs.SGLANG_TEST_RETRACT.get(), False)
+
+        envs.SGLANG_TEST_RETRACT.set(None)
+        with self.assertRaises(RuntimeError):
+            with envs.SGLANG_TEST_RETRACT.override(True):
+                raise RuntimeError("boom")
+        self.assertTrue(envs.SGLANG_TEST_RETRACT.is_set())
+        self.assertIsNone(envs.SGLANG_TEST_RETRACT.get())
+
     def test_override_with_exit_stack(self):
         envs.SGLANG_TEST_RETRACT.set(None)
         exit_stack = ExitStack()
