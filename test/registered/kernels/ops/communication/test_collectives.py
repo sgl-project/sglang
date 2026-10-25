@@ -11,11 +11,7 @@ import sglang.srt.distributed.parallel_state as ps
 from sglang.kernels.jit.utils import cache_once
 from sglang.kernels.ops.attention import attn_res
 from sglang.kernels.ops.communication import all_reduce_residual as all_reduce
-from sglang.kernels.ops.communication import (
-    attn_res_collective,
-    gemm_ag,
-    sp_collective,
-)
+from sglang.kernels.ops.communication import attn_res_collective, gemm_ag, sp_collective
 from sglang.srt.distributed.comm_cleanup import register_comm_cleanup
 from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
     CustomAllReduceV2,
