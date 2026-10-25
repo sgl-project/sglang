@@ -514,8 +514,9 @@ def test_bind_failure_releases_context(harness, monkeypatch):
         return context
 
     monkeypatch.setattr(coordinated.zmq, "Context", make_context)
-    with pytest.raises(zmq.ZMQError, match="Address already in use"):
+    with pytest.raises(zmq.ZMQError) as error:
         CoordinatedScheduler(scheduler=FakeScheduler(), endpoint=harness.endpoint)
+    assert error.value.errno == zmq.EADDRINUSE
     assert len(contexts) == 1
     assert contexts[0].closed
 
