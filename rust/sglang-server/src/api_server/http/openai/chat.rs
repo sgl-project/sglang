@@ -189,7 +189,12 @@ async fn chat_completions(
     let previous_content = (raw["continue_final_message"] == true)
         .then(|| raw["messages"].as_array()?.last())
         .flatten()
-        .filter(|message| message["role"] == "assistant")
+        // Roles are compared lowercased, as Pydantic normalizes them.
+        .filter(|message| {
+            message["role"]
+                .as_str()
+                .is_some_and(|role| role.eq_ignore_ascii_case("assistant"))
+        })
         .and_then(|message| message["content"].as_str())
         .map(str::to_owned);
     let (request, rendered) = match prepare_chat_request(&state, raw, request).await {
