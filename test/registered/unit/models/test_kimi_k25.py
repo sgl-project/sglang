@@ -70,6 +70,9 @@ from sglang.srt.multimodal.transport.cuda_ipc import (
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
     CudaIpcTensorTransportProxy,
 )
+from sglang.srt.multimodal.transport.feature_transport import (
+    MultimodalFeatureTransport,
+)
 from sglang.srt.runtime_context import get_context, get_parallel, publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import ImageData
@@ -812,6 +815,9 @@ def test_kimi_k3_cached_artifact_is_composed_per_prompt():
     processor._tokenizer = _Tokenizer()
     processor.mm_feature_transport = "cpu"
     processor.use_cuda_ipc = False
+    processor._feature_transport = MultimodalFeatureTransport(
+        "cpu", base_gpu_id=0, skip_mm_pool=True
+    )
     artifact = _cached_k3_artifact("sha256:" + "ab" * 32, "sha256:" + "cd" * 32)
 
     first = processor.compose_request([1, 99, 2], [artifact])
@@ -1114,6 +1120,9 @@ def test_kimi_k3_artifact_and_data_item_share_hash_resolution():
     processor.mm_tokens = SimpleNamespace(image_token_id=99)
     processor._tokenizer = _Tokenizer()
     processor.use_cuda_ipc = False
+    processor._feature_transport = MultimodalFeatureTransport(
+        "cpu", base_gpu_id=0, skip_mm_pool=True
+    )
     feature = torch.zeros((4, 3), dtype=torch.float32)
     digest = "sha256:" + "ab" * 32
 
@@ -1336,6 +1345,9 @@ def test_kimi_k3_cpu_transport_defers_gpu_preprocessing():
     processor.mm_tokens = SimpleNamespace(image_token_id=99)
     processor.mm_feature_transport = "cpu"
     processor.use_cuda_ipc = False
+    processor._feature_transport = MultimodalFeatureTransport(
+        "cpu", base_gpu_id=0, skip_mm_pool=True
+    )
     processor._processor = SimpleNamespace(
         preprocess_config=_k3_preprocess_config(patch_size=2),
         prepare_deferred=Mock(

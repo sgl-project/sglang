@@ -520,22 +520,22 @@ class TestStreamOrderedMmFeaturePool(CustomTestCase):
         self.assertFalse(pool._recycle_thread.is_alive())
 
 
-class TestCudaIpcProcessorRollback(CustomTestCase):
+class TestCudaIpcTransportRollback(CustomTestCase):
     def test_partial_wrap_failure_restores_items_and_cancels_proxy(self):
         from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
-        from sglang.srt.multimodal.processors.base_processor import (
-            BaseMultimodalProcessor,
-        )
         from sglang.srt.multimodal.transport.cuda_ipc import (
             CudaIpcTensorTransportProxy,
         )
+        from sglang.srt.multimodal.transport.feature_transport import (
+            MultimodalFeatureTransport,
+        )
 
-        with patch.object(BaseMultimodalProcessor, "__abstractmethods__", set()):
-            processor = BaseMultimodalProcessor.__new__(BaseMultimodalProcessor)
-        processor.use_cuda_ipc = True
-        processor.cudaipc_mmfeature_pool = MagicMock()
+        transport = MultimodalFeatureTransport(
+            "cuda_ipc", base_gpu_id=0, skip_mm_pool=True
+        )
+        transport.cudaipc_mmfeature_pool = MagicMock()
         proxy = object.__new__(CudaIpcTensorTransportProxy)
-        processor._wrap_tensor_for_cuda_ipc = MagicMock(
+        transport._wrap_tensor_for_cuda_ipc = MagicMock(
             side_effect=[proxy, RuntimeError("wrap failed")]
         )
         features = [torch.ones(2), torch.ones(3)]
@@ -545,9 +545,9 @@ class TestCudaIpcProcessorRollback(CustomTestCase):
         ]
 
         with self.assertRaisesRegex(RuntimeError, "wrap failed"):
-            processor._prepare_mm_items_for_transport(items)
+            transport.prepare_mm_items_for_transport(items)
 
-        processor.cudaipc_mmfeature_pool.cancel_proxy.assert_called_once_with(proxy)
+        transport.cudaipc_mmfeature_pool.cancel_proxy.assert_called_once_with(proxy)
         self.assertIs(items[0].feature, features[0])
         self.assertIs(items[1].feature, features[1])
 
@@ -558,6 +558,9 @@ class TestPrecomputeHashBeforeCpuTransfer(CustomTestCase):
         from sglang.srt.multimodal.processors.base_processor import (
             BaseMultimodalProcessor,
         )
+        from sglang.srt.multimodal.transport.feature_transport import (
+            MultimodalFeatureTransport,
+        )
 
         with (
             patch.object(BaseMultimodalProcessor, "__abstractmethods__", set()),
@@ -565,8 +568,9 @@ class TestPrecomputeHashBeforeCpuTransfer(CustomTestCase):
         ):
             processor = BaseMultimodalProcessor()
         processor.precompute_hash_before_cpu_transfer = enabled
-        processor.use_cuda_ipc = False
-        processor.mm_feature_transport = "cpu"
+        processor._feature_transport = MultimodalFeatureTransport(
+            "cpu", base_gpu_id=0, skip_mm_pool=True
+        )
         return processor
 
     def test_enabled_path_sets_hash_and_pad_value(self):
