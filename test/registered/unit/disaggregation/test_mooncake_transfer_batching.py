@@ -74,6 +74,8 @@ class TestMooncakeTransferBatching(unittest.TestCase):
                 executor=executor,
                 dst_device_data_indices=dst_device_data_indices,
                 dst_device_entries=dst_device_entries,
+                src_keys=manager._local_keys.kv,
+                dst_keys=manager._peers["session"].keys.kv,
             )
 
     def test_slices_index_arrays_before_forming_transfer_ranges(self):

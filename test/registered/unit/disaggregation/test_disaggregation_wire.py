@@ -27,6 +27,7 @@ from sglang.srt.disaggregation.decode import DecodeRequest, DecodeTransferQueue
 from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
     ScheduleBatchDisaggregationDecodeMixin,
 )
+from sglang.srt.disaggregation.mooncake.buffers import BufferKeys
 from sglang.srt.disaggregation.mooncake.conn import (
     FailedSessionProbe,
     MooncakeKVManager,
@@ -384,7 +385,7 @@ class TestDisaggregationWire(unittest.TestCase):
         manager.state_strides_validated = set()
         manager.decode_kv_args_table = {}
         manager.transport = MooncakeTransport(engine=Mock())
-        manager._peer_buffers = {}
+        manager._peers = {}
 
         def register(dst_item_len):
             info = SimpleNamespace(
@@ -476,6 +477,8 @@ class TestDisaggregationWire(unittest.TestCase):
             dst_data_indices=np.array([5], dtype=np.int32),
             state_type=StateType.SWA,
             bootstrap_room=42,
+            src_keys=manager._local_keys.kv,
+            dst_keys=manager._peers["decode"].keys.kv,
         )
         self.assertEqual(rc, 0)
         manager._state_stride_mismatch.assert_not_called()
@@ -609,6 +612,8 @@ class TestDisaggregationWire(unittest.TestCase):
                     prefill_data_indices=np.array([2], dtype=np.int32),
                     dst_data_indices=np.array([5], dtype=np.int32),
                     state_type=StateType.SWA,
+                    src_keys=manager._local_keys.kv,
+                    dst_keys=manager._peers["decode"].keys.kv,
                 )
                 writes.assert_called_once_with(
                     "decode",
@@ -965,6 +970,7 @@ class TestQwen4StateWire(unittest.TestCase):
         )
         engine = Mock()
         mgr.transport = MooncakeTransport(engine=engine)
+        mgr._local_keys = BufferKeys.for_buffers([], [], mgr.kv_args.state_data_ptrs)
         mgr.register_buffer_to_engine()
         engine.batch_register.assert_called_once_with([100, 103, 105], [4096] * 3)
 
@@ -1047,6 +1053,8 @@ class TestQwen4StateWire(unittest.TestCase):
                         src_layer_ids=layer_ids,
                         dst_layer_ids=layer_ids,
                         dst_item_lens=dst_lens,
+                        src_keys=manager._local_keys.kv,
+                        dst_keys=manager._peers["decode"].keys.kv,
                     )
 
                     self.assertEqual(ret, 0)
@@ -1094,6 +1102,12 @@ class TestQwen4StateWire(unittest.TestCase):
         )
         manager.sent = []
         manager._send_kvcache_generic = lambda **kw: manager.sent.append(kw) or 0
+        attach_mooncake_transport(
+            manager,
+            engine_writes(Mock(return_value=0)),
+            state=[[1000]],
+            peer_state=[[2000]],
+        )
         return manager
 
     def test_qsa_compressed_layout_mismatch_rejected_before_transfer(self):
