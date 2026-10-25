@@ -23,16 +23,21 @@ pub(super) fn render_chat(
     defaults: &ChatTemplateKwargs,
 ) -> Result<RenderedChat, TemplateError> {
     let args = TemplateArgs::new(&body, defaults);
+    let ids = formatter
+        .encode_request(body.clone(), defaults)
+        .transpose()?;
     match formatter.render_request(body, defaults) {
         Err(TemplateError::NeedsRenderFallback { .. }) => formatter
             .render_template(request, &args)
             .map(|prompt| RenderedChat {
                 prompt,
                 continuation: String::new(),
+                ids: None,
             }),
         rendered => rendered.map(|(prompt, continuation)| RenderedChat {
             prompt,
             continuation,
+            ids,
         }),
     }
 }

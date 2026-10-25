@@ -298,6 +298,7 @@ mod tests {
         let chat = RenderedChat {
             prompt: RenderedPrompt::text("hi".into()),
             continuation: "abc".into(),
+            ids: None,
         };
         assert_eq!(
             run(Some(Box::new(chat))),

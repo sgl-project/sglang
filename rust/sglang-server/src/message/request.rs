@@ -554,6 +554,9 @@ pub enum TokenizeInput {
 pub struct RenderedChat {
     pub prompt: RenderedPrompt,
     pub continuation: String,
+    /// The ids a formatter that encodes its own prompts returned: DeepSeek-V4
+    /// and V4.1 through deepseek-recipe (`ChatFormatter::encode_request`).
+    pub ids: Option<Vec<u32>>,
 }
 
 impl RenderedChat {
@@ -562,6 +565,9 @@ impl RenderedChat {
         &self,
         tokenizer: &dyn sglang_processor::TextTokenizer,
     ) -> Result<Vec<i32>, sglang_processor::ProcessorError> {
+        if let Some(ids) = &self.ids {
+            return Ok(ids.iter().map(|&id| id as i32).collect());
+        }
         let segments = self.prompt.encode_segments().unwrap_or_else(|| {
             vec![sglang_processor::dynamo_tokenizers::EncodeSegment::new(
                 self.prompt.as_str(),

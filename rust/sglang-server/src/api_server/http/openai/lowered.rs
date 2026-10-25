@@ -18,7 +18,8 @@ use super::chat::ChatBody;
 use super::template::{RenderedChat, render_chat};
 use super::{AppState, ChatFormatter};
 use crate::api_server::http::native_api::{
-    GenerateItem, RequestTiming, drain_unary, generate_requests, generation_event_stream,
+    GenerateItem, RequestState, RequestTiming, drain_unary, generate_requests,
+    generation_event_stream,
 };
 use crate::message::config::ServerArgs;
 use crate::message::request::check_prompt_copies;
@@ -84,6 +85,9 @@ impl OpenAiChat {
         request: &Value,
         defaults: &super::ChatTemplateKwargs,
     ) -> Option<Vec<u32>> {
+        if let Some(ids) = formatter.encode_request(request.clone(), defaults) {
+            return ids.ok();
+        }
         // Only the template needs the typed request, so a body the SGLang path
         // renders need not fit Dynamo's stricter type.
         let rendered = match formatter.render_request(request.clone(), defaults) {
@@ -96,6 +100,7 @@ impl OpenAiChat {
                 RenderedChat {
                     prompt,
                     continuation,
+                    ids: None,
                 }
             }
         };
@@ -119,7 +124,7 @@ pub(super) async fn chat(
         .any(|name| header(name).as_deref() == Some("1"));
     let (lowering, body) = (state.clone(), body.clone());
     // Rendering and tokenizing are CPU work, kept off the async workers.
-    let (mut generate, mut responder) = tokio::task::spawn_blocking(move || {
+    let (generate, mut responder) = tokio::task::spawn_blocking(move || {
         let openai = lowering.openai_chat.as_ref()?;
         let formatter = lowering.chat_formatter.as_ref()?;
         let headers = OpenAiHeaders {
@@ -141,6 +146,7 @@ pub(super) async fn chat(
     })
     .await
     .ok()??;
+    let mut generate = serde_json::to_value(generate).expect("api.v1 types serialize to JSON");
 
     let stream = generate["stream"] == true;
     if let Err(error) = copy_prompt_per_choice(&mut generate) {
@@ -153,24 +159,27 @@ pub(super) async fn chat(
         Err((code, message, _)) => return Some(error_response(code, &message)),
     };
     let timing = RequestTiming::new();
-    let calls = match state.core.generate_batch(requests).await {
-        Ok(calls) => calls,
+    let request_states: Vec<RequestState> = requests
+        .iter()
+        .map(|request| RequestState::new(state, request, timing.clone()))
+        .collect();
+    let calls: Vec<_> = match state.core.generate_batch(requests).await {
+        Ok(calls) => calls.into_iter().zip(request_states).collect(),
         Err(error) => return Some(error_response(error.http_status(), &error.to_string())),
     };
 
     if !stream {
         // One failed choice fails the request, as Python's batch does; the
         // unfinished choices are dropped, which cancels them.
-        let drained = futures::future::try_join_all(calls.into_iter().map(|mut call| {
-            let timing = timing.clone();
-            async move {
+        let drained = futures::future::try_join_all(calls.into_iter().map(
+            |(mut call, request)| async move {
                 let rid = call.public_id().to_owned();
-                match drain_unary(&mut call, &rid, timing).await {
+                match drain_unary(&mut call, &rid, request).await {
                     (StatusCode::OK, item) => Ok(item),
                     failed => Err(failed),
                 }
-            }
-        }))
+            },
+        ))
         .await;
         let items = match drained {
             Ok(items) => items,
@@ -195,10 +204,6 @@ pub(super) async fn chat(
         });
     }
 
-    let calls = calls
-        .into_iter()
-        .map(|call| (call, timing.clone()))
-        .collect();
     let incremental = state.server_args.incremental_streaming_output;
     let frames = generation_event_stream(calls, incremental, is_batch);
     let mut frames = Box::pin(frames);
@@ -328,7 +333,8 @@ mod tests {
             reasoning_parser: Some("deepseek-v41".into()),
             ..args
         };
-        let formatter = ChatFormatter::DeepSeekV41;
+        let tokenizer_json = std::fs::read_to_string(tokenizer_path()).unwrap();
+        let formatter = ChatFormatter::deepseek_v4(true, Some(&tokenizer_json)).unwrap();
         let state =
             answering_app_state_with_item(Arc::new(args), formatter, Some(tokenizer()), answer);
         super::super::routes().with_state(state)

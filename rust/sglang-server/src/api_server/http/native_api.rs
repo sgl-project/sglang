@@ -87,7 +87,7 @@ impl RequestTiming {
 /// API-local state for one request: its timing, and the annotator a model
 /// package's [`GenerateHook`](super::generate_hook::GenerateHook) started for
 /// it.
-struct RequestState {
+pub(super) struct RequestState {
     timing: RequestTiming,
     /// The scheduler's decode latency, sent for a finished non-streaming
     /// request: this frontend sees that request's first output only up to
@@ -98,7 +98,7 @@ struct RequestState {
 }
 
 impl RequestState {
-    fn new(state: &AppState, request: &GenerateRequest, timing: RequestTiming) -> Self {
+    pub(super) fn new(state: &AppState, request: &GenerateRequest, timing: RequestTiming) -> Self {
         Self {
             timing,
             scheduler_decode_latency: None,
@@ -152,7 +152,7 @@ impl RequestState {
 /// One native `/generate` frame: the `api.v1` frame, plus the keys a model
 /// package's hook added after the schema's own.
 #[derive(Debug)]
-struct NativeFrame {
+pub(super) struct NativeFrame {
     frame: api::GenerateResponse,
     keys: Option<Box<GenerateFrameKeys>>,
 }
@@ -1128,6 +1128,7 @@ mod tests {
                 generation_policy: GenerationPolicy::default(),
                 chat_formatter: None,
                 generate_hook: hook.then(|| Arc::new(TopPHook) as Arc<dyn crate::GenerateHook>),
+                openai_chat: None,
             });
             // Both items' delta, then both terminals: an incremental stream
             // emits two frames per item.
