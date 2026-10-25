@@ -2605,7 +2605,12 @@ def _is_block_fp8(layer: torch.nn.Module) -> bool:
     return (
         isinstance(method, Fp8LinearMethod)
         and not method.use_mxfp8
+        and not method.use_marlin
         and method.weight_block_size == [128, 128]
+        and layer.weight.dtype == torch.float8_e4m3fn
+        # An aiter-preshuffled weight is no longer row-major, so it cannot be
+        # gathered along the output dim.
+        and not getattr(layer, "aiter_bpreshuffled", False)
     )
 
 
@@ -2623,6 +2628,12 @@ def _gather_block_fp8_linear(layer: torch.nn.Module, group) -> torch.nn.Module:
     replica.weight_scale_inv = torch.nn.Parameter(
         group.all_gather(scale, dim=0), requires_grad=False
     )
+    # The attributes Fp8LinearMethod's post-load step reads off a LinearBase,
+    # copied so the replica picks the same kernel (UE8M0 requant, MXFP8 view).
+    replica.orig_dtype = getattr(layer, "orig_dtype", None)
+    replica.deepgemm_mxfp8_input = getattr(layer, "deepgemm_mxfp8_input", False)
+    replica.keep_plain_weight_layout = getattr(layer, "keep_plain_weight_layout", False)
+    replica.prefix = f"{getattr(layer, 'prefix', 'q_b_proj')}.dcp_replica"
     replica.quant_method = layer.quant_method
     layer.quant_method.process_weights_after_loading(replica)
     return replica
