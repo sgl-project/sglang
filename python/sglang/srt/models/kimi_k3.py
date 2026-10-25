@@ -1465,6 +1465,7 @@ class KimiK3MoE(nn.Module):
             # both ride one collective.
             joint_finalize = (
                 defer_finalize
+                and get_device_sm() == 107
                 and num_tokens == 1
                 and hidden_size == 2 * k3_ar_fusion.NORM_DIM
                 and self.moe_hidden_size == k3_ar_fusion.NORM_DIM
