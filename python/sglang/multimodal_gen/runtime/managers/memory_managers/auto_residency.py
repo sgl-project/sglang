@@ -2774,6 +2774,8 @@ def current_placement_reserve_shortfall_bytes(
 def _binding_phase_constraints(
     report: RankResidencyReport,
     candidate_component_names: set[str],
+    *,
+    reserve_bytes: int,
 ) -> list[
     tuple[
         str,
@@ -2788,9 +2790,9 @@ def _binding_phase_constraints(
     """Keep the binding measured and conservative unobserved phases.
 
     Every candidate has the same device delta in phases with the same active
-    component set. The lower peaks are therefore provably redundant; removing
-    them reduces the exact optimizer's resource dimension without changing
-    its feasible placements. A short calibration may not reach a later
+    component set. Keep the phase with the least remaining budget, including
+    its frozen allocation limit; a smaller peak can have a tighter limit.
+    A short calibration may not reach a later
     timestep-routed component (for example the second DiT in a two-stage
     denoiser), so give each unobserved candidate a synthetic phase at the
     measured request peak. This prevents permanent residents from being
@@ -2810,6 +2812,16 @@ def _binding_phase_constraints(
     )
     current_device_bytes = dict(report.current_device_weight_bytes_by_component)
     current_active_bytes = dict(report.current_active_weight_bytes_by_component)
+
+    def phase_headroom(phase_name: str, peak: int) -> int:
+        limit = report.budget_bytes - reserve_bytes
+        allocation_limit = report.phase_allocation_limit_bytes.get(
+            phase_name.split(":layout:", 1)[0], report.peak_allocation_limit_bytes
+        )
+        if allocation_limit is not None:
+            limit = min(limit, allocation_limit)
+        return limit - peak
+
     for candidate in report.candidates:
         if (
             candidate.current_placement
@@ -2897,7 +2909,9 @@ def _binding_phase_constraints(
         measured = tuple(sorted(measured_components & candidate_component_names))
         layout = (present, measured, used, prefetched, full_weight_transitions)
         current = binding.get(layout)
-        if current is None or (phase_peak, phase_name) > (current[1], current[0]):
+        if current is None or phase_headroom(phase_name, phase_peak) < phase_headroom(
+            *current
+        ):
             binding[layout] = (phase_name, phase_peak)
     observed_components = {
         component_name
@@ -2941,7 +2955,7 @@ def _binding_phase_constraints(
             ),
         )
         current = binding.get(layout)
-        if current is None or synthetic[1] > current[1]:
+        if current is None or phase_headroom(*synthetic) < phase_headroom(*current):
             binding[layout] = synthetic
     return [
         (
@@ -3137,7 +3151,11 @@ def plan_auto_residency(*, reports: list[RankResidencyReport]) -> AutoResidencyP
 
     candidate_component_names = {candidate.component_name for candidate in candidates}
     phase_constraints = {
-        report.rank: _binding_phase_constraints(report, candidate_component_names)
+        report.rank: _binding_phase_constraints(
+            report,
+            candidate_component_names,
+            reserve_bytes=reserves_by_rank[report.rank],
+        )
         for report in reports
     }
     current_placement_reserve_shortfall = max(

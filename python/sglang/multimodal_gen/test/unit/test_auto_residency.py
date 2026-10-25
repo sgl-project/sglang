@@ -1132,6 +1132,27 @@ class TestResolveMeasuredDefaultWorkload:
 
 
 class TestPlanAutoResidency:
+    def test_smaller_phase_with_tighter_frozen_limit_remains_binding(self):
+        plan = plan_auto_residency(
+            reports=[
+                _report(
+                    budget_gib=180,
+                    estimated_gib=50,
+                    peak_allocation_limit_gib=50,
+                    phase_allocation_limits_gib={"encode": 50, "wide": 30, "tight": 20},
+                    phase_peaks_gib={"encode": 50, "wide": 29, "tight": 20},
+                    phase_components={
+                        "encode": ("encoder",),
+                        "wide": ("transformer",),
+                        "tight": ("transformer",),
+                    },
+                    candidates=[_candidate("encoder", weight_gib=1)],
+                )
+            ]
+        )
+        assert not plan.changes
+        assert plan.resource_budget_bytes["gpu:rank0:tight"] == 0
+
     @pytest.mark.parametrize("suffix", ["", ":layout:0"])
     def test_encoding_headroom_cannot_increase_a_cached_denoising_request(self, suffix):
         plan = plan_auto_residency(
