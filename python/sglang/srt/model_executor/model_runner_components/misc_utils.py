@@ -100,17 +100,15 @@ def resolve_pp_proxy_residual_num_blocks(
 
 
 @runtime_checkable
-class _SupportsDSparkPPProxy(Protocol):
-    def get_pp_proxy_dspark_hidden_size(self) -> int: ...
+class SupportsPPAuxHiddenRelay(Protocol):
+    def get_pp_proxy_aux_hidden_size(self) -> int: ...
 
 
-def resolve_pp_proxy_dspark_hidden_size(
-    *, model: Any, pp_size: int, pp_rank: int
-) -> int:
+def resolve_pp_proxy_aux_hidden_size(*, model: Any, pp_size: int, pp_rank: int) -> int:
     if pp_size <= 1 or pp_rank == 0:
         return 0
-    if isinstance(model, _SupportsDSparkPPProxy):
-        return model.get_pp_proxy_dspark_hidden_size()
+    if isinstance(model, SupportsPPAuxHiddenRelay):
+        return model.get_pp_proxy_aux_hidden_size()
     return 0
 
 

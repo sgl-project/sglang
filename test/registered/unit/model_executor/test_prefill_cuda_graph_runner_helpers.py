@@ -14,7 +14,7 @@ from sglang.srt.model_executor.cuda_graph_buffer_registry import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.model_executor.model_runner_components.misc_utils import (
-    resolve_pp_proxy_dspark_hidden_size,
+    resolve_pp_proxy_aux_hidden_size,
 )
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
@@ -193,7 +193,7 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
 
     def test_dspark_proxy_width_requires_receiving_stage_and_model_support(self):
         class Model:
-            def get_pp_proxy_dspark_hidden_size(self):
+            def get_pp_proxy_aux_hidden_size(self):
                 return 16
 
         for model, pp_size, pp_rank, expected in (
@@ -204,7 +204,7 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
         ):
             with self.subTest(pp_size=pp_size, pp_rank=pp_rank, expected=expected):
                 self.assertEqual(
-                    resolve_pp_proxy_dspark_hidden_size(
+                    resolve_pp_proxy_aux_hidden_size(
                         model=model, pp_size=pp_size, pp_rank=pp_rank
                     ),
                     expected,
@@ -328,7 +328,7 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
             pp_size=2,
             is_first_pp_rank=False,
             pp_proxy_residual_num_blocks=3,
-            pp_proxy_dspark_hidden_size=16,
+            pp_proxy_aux_hidden_size=16,
         )
 
         self.assertEqual(
@@ -339,7 +339,7 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
             {
                 "hidden_states": (16, 8),
                 "attn_res_bank": (16, 3, 8),
-                "dspark_hidden_states": (16, 16),
+                "aux_hidden_states": (16, 16),
             },
         )
 
@@ -363,18 +363,18 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
                 ),
             )
             self.assertEqual(
-                KimiK3LinearForCausalLM.get_pp_proxy_dspark_hidden_size(model),
+                KimiK3LinearForCausalLM.get_pp_proxy_aux_hidden_size(model),
                 k3_count * 8,
             )
             self.assertEqual(
-                KimiLinearForCausalLM.get_pp_proxy_dspark_hidden_size(model),
+                KimiLinearForCausalLM.get_pp_proxy_aux_hidden_size(model),
                 linear_count * 8,
             )
-            model.get_pp_proxy_dspark_hidden_size = lambda: (
-                KimiK3LinearForCausalLM.get_pp_proxy_dspark_hidden_size(model)
+            model.get_pp_proxy_aux_hidden_size = lambda: (
+                KimiK3LinearForCausalLM.get_pp_proxy_aux_hidden_size(model)
             )
             self.assertEqual(
-                KimiK3ForConditionalGeneration.get_pp_proxy_dspark_hidden_size(
+                KimiK3ForConditionalGeneration.get_pp_proxy_aux_hidden_size(
                     SimpleNamespace(language_model=model)
                 ),
                 k3_count * 8,
@@ -444,7 +444,7 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
             dtype=torch.float32,
             enable_mamba_track=False,
             pp_size=2,
-            pp_proxy_dspark_hidden_size=8,
+            pp_proxy_aux_hidden_size=8,
         )
         registry = build_prefill_registry(
             device=torch.device("cpu"),
@@ -459,7 +459,7 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
         runner.model_runner = SimpleNamespace(
             pp_group=SimpleNamespace(is_first_rank=False)
         )
-        captured = runner._capture_pp_proxy_tensors(8)["dspark_hidden_states"]
+        captured = runner._capture_pp_proxy_tensors(8)["aux_hidden_states"]
         ptr = captured.data_ptr()
         for count, value in [(7, 2.0), (3, 5.0)]:
             tokens = torch.arange(count)
@@ -467,7 +467,7 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
                 {
                     "hidden_states": torch.zeros(count, 4),
                     "residual": torch.zeros(count, 4),
-                    "dspark_hidden_states": torch.full((count, 8), value),
+                    "aux_hidden_states": torch.full((count, 8), value),
                 }
             )
             registry.fill_from(
@@ -481,7 +481,7 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
                 pp_proxy_tensors=proxy,
             )
             self.assertEqual(captured.data_ptr(), ptr)
-            torch.testing.assert_close(captured[:count], proxy["dspark_hidden_states"])
+            torch.testing.assert_close(captured[:count], proxy["aux_hidden_states"])
             self.assertEqual(torch.count_nonzero(captured[count:]).item(), 0)
 
     def test_pipeline_proxy_output_is_supported(self):

@@ -2938,7 +2938,11 @@ class TestPipelineParallelCompat(CustomTestCase):
                 )
 
     def test_eagle_is_allowed_on_prefill(self):
-        check_pipeline_parallel_compat(self._cfg(speculative_algorithm="EAGLE"))
+        for algorithm in ("EAGLE", "EAGLE3"):
+            with self.subTest(speculative_algorithm=algorithm):
+                check_pipeline_parallel_compat(
+                    self._cfg(speculative_algorithm=algorithm)
+                )
 
     def test_eagle_is_rejected_outside_prefill(self):
         for mode in ("decode", "null"):
@@ -2972,7 +2976,7 @@ class TestPipelineParallelCompat(CustomTestCase):
 
     def test_non_eagle_speculative_algorithms_are_rejected(self):
         with self.assertRaisesRegex(AssertionError, "only supports EAGLE"):
-            check_pipeline_parallel_compat(self._cfg(speculative_algorithm="EAGLE3"))
+            check_pipeline_parallel_compat(self._cfg(speculative_algorithm="DFLASH"))
 
     def test_multi_layer_eagle_is_rejected(self):
         with self.assertRaisesRegex(AssertionError, "only supports EAGLE"):

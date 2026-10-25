@@ -129,10 +129,10 @@ def check_pipeline_parallel_compat(cfg: Any) -> None:
         )
     elif cfg.speculative_algorithm is not None:
         assert (
-            cfg.speculative_algorithm.upper() == "EAGLE"
+            cfg.speculative_algorithm.upper() in ("EAGLE", "EAGLE3")
             and not cfg.enable_multi_layer_eagle
         ), (
-            "Pipeline parallelism currently only supports EAGLE "
+            "Pipeline parallelism currently only supports EAGLE or EAGLE3 "
             "(non-multi-layer) speculative decoding"
         )
         if envs.SGLANG_ENABLE_PP_SPEC.get():

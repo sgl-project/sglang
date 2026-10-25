@@ -29,7 +29,10 @@ from sglang.srt.distributed import (
     get_pp_indices,
 )
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
+from sglang.srt.layers.aux_hidden_states import (
+    aux_hidden_states_from_pp,
+    aux_hidden_states_to_pp,
+)
 from sglang.srt.layers.dual_gemm import DualGemm
 from sglang.srt.layers.layer_boundary import (
     append_stages,
@@ -482,7 +485,7 @@ class LlamaModel(nn.Module):
                 pp_proxy_tensors, forward_batch
             )
 
-        aux_hidden_states = AuxHiddenStateList()
+        aux_hidden_states = aux_hidden_states_from_pp(pp_proxy_tensors)
         for i in range(self.start_layer, self.end_layer):
             hidden_states = self.layers[i](
                 positions,
@@ -494,7 +497,9 @@ class LlamaModel(nn.Module):
             )
 
         if not self.pp_group.is_last_rank:
-            return residual_batch.to_pp(hidden_states, forward_batch)
+            return aux_hidden_states_to_pp(
+                residual_batch.to_pp(hidden_states, forward_batch), aux_hidden_states
+            )
         hidden_states = residual_batch.final_norm(
             hidden_states, forward_batch, self.norm
         )
@@ -617,7 +622,7 @@ class LlamaForCausalLM(nn.Module):
         )
 
         aux_hidden_states = None
-        if self.capture_aux_hidden_states:
+        if self.capture_aux_hidden_states and self.pp_group.is_last_rank:
             hidden_states, aux_hidden_states = hidden_states
 
         if self.pp_group.is_last_rank:
@@ -926,10 +931,12 @@ class LlamaForCausalLM(nn.Module):
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
         self.model.load_kv_cache_scales(quantization_param_path)
 
-    def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
-        if not self.pp_group.is_last_rank:
-            return
+    def get_pp_proxy_aux_hidden_size(self) -> int:
+        return self.config.hidden_size * sum(
+            layer < self.model.start_layer for layer in self.model.layers_to_capture
+        )
 
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
         if layer_ids is None:
             self.capture_aux_hidden_states = True
             num_layers = self.config.num_hidden_layers
@@ -941,9 +948,6 @@ class LlamaForCausalLM(nn.Module):
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
     def set_dflash_layers_to_capture(self, layer_ids: List[int]):
-        if not self.pp_group.is_last_rank:
-            return
-
         if layer_ids is None:
             raise ValueError(
                 "DFLASH requires explicit layer_ids for aux hidden capture."
