@@ -367,7 +367,9 @@ class TestNvFp4MoeDispatch(CustomTestCase):
                 (None, 2),
             ):
                 with self.subTest(policy=policy):
-                    layer.routing_method_type = policy
+                    layer.routing_method_type = method.get_moe_routing_method_type(
+                        layer, policy
+                    )
                     self.assertEqual(
                         method.apply(
                             layer, SimpleNamespace(hidden_states=torch.zeros((1, 4)))

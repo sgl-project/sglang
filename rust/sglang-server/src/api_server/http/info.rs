@@ -1,6 +1,6 @@
 //! Common control-plane endpoints — `/server_info`, `/get_model_info`
-//! (+ `/model_info` alias), `/flush_cache`, `/weights_checker`, backed by typed
-//! operations on
+//! (+ `/model_info` alias), `/flush_cache`, `/weights_checker`,
+//! `/abort_request`, backed by typed operations on
 //! [`crate::api_server::core::CoreHandle`]. Data-plane endpoints (incl. `/health*`,
 //! which round-trips a generate probe) live in the sibling `native_api` and
 //! `openai` modules; the shared `AppState` lives in the parent
@@ -9,10 +9,13 @@
 use axum::{
     Json, Router,
     body::{Body, Bytes},
-    extract::{Query, State, rejection::QueryRejection},
+    extract::{
+        Query, State,
+        rejection::{JsonRejection, QueryRejection},
+    },
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -36,6 +39,7 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
         .route("/model_info", get(model_info))
         .route("/flush_cache", get(flush_cache).post(flush_cache))
         .route("/weights_checker", get(check_weights).post(check_weights))
+        .route("/abort_request", post(abort_request))
 }
 
 /// Await the core's complete semantic server-info result. HTTP status and
@@ -267,6 +271,42 @@ async fn check_weights(State(state): State<Arc<AppState>>, body: Bytes) -> Respo
     (status, Json(Value::Object(response))).into_response()
 }
 
+/// Python's `AbortReq` body: the fields `/abort_request` reads.
+#[derive(Deserialize)]
+struct AbortRequestBody {
+    #[serde(default)]
+    rid: Option<String>,
+    #[serde(default)]
+    abort_all: bool,
+}
+
+/// `POST /abort_request` — cancel the live generations submitted under the
+/// public rid `rid` (every item of a batch sent under it), or all of them with
+/// `abort_all`, through the core's cancellation registry, as the gRPC `Abort`
+/// does. Python's contract: 200 with an empty body whether or not anything
+/// matched, and an empty rid without `abort_all` is ignored rather than
+/// matching every request, as `TokenizerManager.abort_request` does.
+async fn abort_request(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<AbortRequestBody>, JsonRejection>,
+) -> Response {
+    let body = match body {
+        Ok(Json(body)) => body,
+        Err(rejection) => {
+            return native_error(StatusCode::BAD_REQUEST, &rejection.body_text(), false);
+        }
+    };
+    let rid = body.rid.unwrap_or_default();
+    if body.abort_all {
+        state.core.abort(None);
+    } else if rid.is_empty() {
+        tracing::warn!("ignoring abort_request with an empty rid and abort_all=false");
+    } else {
+        state.core.abort(Some(&rid));
+    }
+    StatusCode::OK.into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use axum::{
@@ -277,11 +317,12 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
-    use crate::api_server::core::{CoreConfig, CoreHandle, CoreMetadata};
+    use crate::api_server::core::{CoreConfig, CoreEvent, CoreHandle, CoreMetadata};
     use crate::message::config::{DisaggregationMode, ModelConfig, ServerArgs};
-    use crate::message::request::RequestKind;
+    use crate::message::ids::Rid;
+    use crate::message::request::{GenerateRequest, RequestKind};
     use crate::message::response::ResponseItem;
-    use crate::tokenizer_manager::wiring::TmEvent;
+    use crate::tokenizer_manager::wiring::{AbortSource, TmEvent};
 
     fn test_state(
         server_args: ServerArgs,
@@ -303,6 +344,7 @@ mod tests {
                 is_disaggregation: false,
                 mm_limits: Default::default(),
                 metadata: CoreMetadata::from(server_args.as_ref()),
+                metrics: None,
             },
         );
         (
@@ -313,6 +355,7 @@ mod tests {
                 ),
                 server_args,
                 chat_formatter: None,
+                generate_hook: None,
             }),
             intake_rx,
             abort_rx,
@@ -794,6 +837,73 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
             assert!(intake_rx.try_recv().is_err(), "{body}");
+        }
+    }
+
+    /// `/abort_request` cancels the live generation submitted under the body's
+    /// rid, or every one with `abort_all`, and answers Python's empty 200: the
+    /// runtime is told to abort the request and the client's call ends as
+    /// cancelled. A rid nothing runs under is still a 200 with nothing
+    /// aborted, an empty rid without `abort_all` is ignored, and a malformed
+    /// body is a 400.
+    #[tokio::test]
+    async fn abort_request_cancels_the_named_generations() {
+        for (body, status, aborted) in [
+            (r#"{"rid": "client-rid"}"#, StatusCode::OK, true),
+            (r#"{"abort_all": true}"#, StatusCode::OK, true),
+            (r#"{"rid": "other-rid"}"#, StatusCode::OK, false),
+            (r#"{"rid": ""}"#, StatusCode::OK, false),
+            ("{}", StatusCode::OK, false),
+            (r#"{"rid": 3}"#, StatusCode::BAD_REQUEST, false),
+        ] {
+            let (state, intake_rx, abort_rx) = test_state(ServerArgs::default());
+            let mut call = state
+                .core
+                .generate(GenerateRequest {
+                    rid: Rid::from_client("client-rid"),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            let TmEvent::Intake { request, admission } = intake_rx.recv_async().await.unwrap()
+            else {
+                panic!("{body}: generate must submit one request");
+            };
+            assert!(admission.try_accept(), "{body}");
+
+            let response = routes()
+                .with_state(state)
+                .oneshot(
+                    HttpRequest::builder()
+                        .method("POST")
+                        .uri("/abort_request")
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status, "{body}");
+            let bytes = to_bytes(response.into_body(), 1024).await.unwrap();
+            if status == StatusCode::OK {
+                assert!(bytes.is_empty(), "{body}");
+            }
+            if aborted {
+                assert!(
+                    matches!(abort_rx.try_recv(), Ok(AbortSource::Guard(rid)) if rid == request.rid),
+                    "{body}: the runtime must be told to abort the request"
+                );
+                assert!(
+                    matches!(
+                        call.recv().await,
+                        Some(CoreEvent::Failed(CoreError::Cancelled(_)))
+                    ),
+                    "{body}: the client's call ends as cancelled"
+                );
+            } else {
+                assert!(abort_rx.try_recv().is_err(), "{body}: nothing is aborted");
+            }
+            drop(request);
         }
     }
 
