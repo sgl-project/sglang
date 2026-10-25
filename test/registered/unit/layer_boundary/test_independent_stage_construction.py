@@ -29,6 +29,7 @@ from sglang.srt.layers.layer_boundary.residual import batch
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.boundary_fixtures import build_stages
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.communicator_patch import patch_communicator
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
@@ -314,6 +315,62 @@ class TestIndependentStageConstruction(CustomTestCase):
             getattr(caught.exception, "__notes__", []),
         )
 
+    def test_a_stack_ending_on_a_partial_attention_binds_no_sliced_rows(self):
+        # On these batches that attention keeps the residual on this rank's
+        # attention-TP slice, and no stage after it on this rank brings it
+        # back: such a batch fails at the first stage instead.
+        cases = {
+            BatchVariant.INPUT_SCATTERED: (
+                fixture.parallel_of(
+                    attn_dp=1, attn_tp=2, enable_attn_tp_input_scattered=True
+                ),
+                {},
+                SimpleNamespace(sp_active=False),
+                SimpleNamespace(input_scattered=True),
+            ),
+            BatchVariant.SEQUENCE_PARALLEL: (
+                fixture.parallel_of(attn_dp=1, attn_tp=2),
+                dict(sp=True),
+                SimpleNamespace(sp_active=True),
+                SimpleNamespace(input_scattered=False),
+            ),
+        }
+        for (variant, case), ends_on_attention, handoff in itertools.product(
+            cases.items(), (True, False), (False, True)
+        ):
+            parallel, options, forward, context = case
+            with (
+                self.subTest(
+                    variant=variant.name,
+                    ends_on_attention=ends_on_attention,
+                    handoff=handoff,
+                ),
+                fixture.planning(parallel, **options),
+            ):
+                with layer_stack(next_layers=[next_layer] if handoff else []):
+                    stages = append_stages(
+                        (declare_attn(), fixture.Norm()),
+                        (declare_ffn(), fixture.Norm()),
+                    )
+                    if ends_on_attention:
+                        stages += append_stages((declare_attn(), fixture.Norm()))
+                for stage in stages:
+                    self.assertIn(BatchVariant.ORDINARY, stage.plan.paths)
+                    self.assertEqual(variant in stage.plan.paths, not ends_on_attention)
+                if not ends_on_attention:
+                    continue
+                with (
+                    patch_communicator("get_forward", lambda: forward),
+                    patch_communicator("get_attn_tp_context", lambda: context),
+                    self.assertRaisesRegex(
+                        NotImplementedError,
+                        f"no stage boundary path for the active {variant.name} batch",
+                    ),
+                ):
+                    stages[0].plan.path_for(
+                        SimpleNamespace(forward_mode=ForwardMode.EXTEND)
+                    )
+
     def test_an_ffn_without_a_fusion_object_may_defer_or_reduce_scatter(self):
         with fixture.planning(fixture.parallel_of(attn_dp=1, attn_tp=2)):
             _, boundary = build_stages(
@@ -492,11 +549,14 @@ class TestPipelineCuts(CustomTestCase):
                         for cut in range(1, count):
                             # Input-scattered attention runs only in models
                             # whose layers end with an FFN, so there a rank's
-                            # stages end on one: after an attention the
-                            # residual stays on this rank's attention-TP slice,
-                            # which is not what a handoff carries.
+                            # stages, and the stack, end on one: after an
+                            # attention the residual stays on this rank's
+                            # attention-TP slice, which is not what a handoff
+                            # carries, and a stack that ends on an attention
+                            # leaving its sum binds no input-scattered path.
                             if parallel.enable_attn_tp_input_scattered and (
                                 kinds[cut - 1] not in ("dense", "sparse")
+                                or kinds[-1] == "attention"
                             ):
                                 continue
                             with self.subTest(

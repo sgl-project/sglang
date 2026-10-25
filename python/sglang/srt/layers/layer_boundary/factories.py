@@ -837,7 +837,14 @@ def _exit_edge(stage, flow, entry):
 
 
 def _connect_line(
-    line, origins, *, before=None, after=None, arrivals=None, final_read=None
+    line,
+    origins,
+    *,
+    before=None,
+    after=None,
+    arrivals=None,
+    final_read=None,
+    ends_line=False,
 ):
     """The connections along a chain of stages, each resolved once per batch
     variant: into ``line[0]``, between each two, and out of ``line[-1]`` to
@@ -846,7 +853,15 @@ def _connect_line(
     (a stage on the previous rank, or None for the stack input) hands on; that
     rank's own entry is taken as the stack input's. An error resolving a stage
     names the append at ``origins[i]`` that declared ``line[i]``, or the one
-    next to the neighbouring rank's stage."""
+    next to the neighbouring rank's stage.
+
+    With ``ends_line`` the line ends a layer stack or a pipeline rank, whose
+    final read or handoff takes the residual on the attention's rows. An
+    attention that always leaves its sum has no exit to return it there: on
+    a variant where the last stage is one that keeps the residual on other
+    rows (this rank's attention-TP slice of an input-scattered or
+    sequence-parallel batch), no path is bound, and a batch of that variant
+    fails at the line's first stage."""
     # The global dense-TP default may be overridden by every FFN declaration.
     # Odd row counts need a separate path only when some connected FFN would
     # otherwise slice them over attention TP. Keep neighbours in this decision:
@@ -908,6 +923,12 @@ def _connect_line(
         flow = resolve(position, stage, arrivals, following)
         flows.append(flow)
         arrivals = {v: _arrival(stage, flow[v], v) for v in variants}
+    if ends_line and _finishes_directly(line[-1]):
+        kept = tuple(v for v in variants if flows[-1][v].during == _row_layouts(v)[1])
+        if kept != variants:
+            variants = kept
+            flows = [{v: flow[v] for v in variants} for flow in flows]
+            arrivals = {v: arrivals[v] for v in variants}
     if after is not None:
         flows.append(resolve(len(line) - 1, after, arrivals))
     entries = [
@@ -1190,6 +1211,16 @@ def connect_layer_line(declarations, origins, *, previous, following, final_read
         before=chained[0].previous,
         after=following,
         final_read=final_read if following is None else None,
+        ends_line=True,
+    )
+
+
+def _finishes_directly(stage):
+    """An attention that always leaves its sum: it has no exit, so the
+    residual stays on the rows it ran with."""
+    return (
+        stage.kind is StageKind.ATTENTION
+        and stage.reduction is ProducerReduction.ALWAYS_PARTIAL
     )
 
 
