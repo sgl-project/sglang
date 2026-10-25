@@ -268,7 +268,7 @@ def test_memory_bank_retains_decoded_frames(enable_memory_bank):
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA video transfer")
 class TestLTX2VideoPostprocess(CustomTestCase):
-    def test_preserves_float_samples_and_byte_frames(self):
+    def test_quantizes_frames_with_the_host_policy(self):
         for dtype in (torch.bfloat16, torch.float16, torch.float32):
             for normalize in (False, True):
                 for channels_last in (False, True):
@@ -289,13 +289,11 @@ class TestLTX2VideoPostprocess(CustomTestCase):
                         stage = SimpleNamespace(video_processor=processor)
                         expected = processor.postprocess_video(video, output_type="np")
                         actual = LTX2AVDecodingStage._postprocess_video(stage, video)
-                        self.assertEqual(actual.dtype, np.float32)
+                        self.assertEqual(actual.dtype, np.uint8)
                         self.assertEqual(actual.shape, (2, 7, 16, 24, 3))
                         self.assertTrue(actual.flags.c_contiguous)
-                        np.testing.assert_array_equal(actual, expected)
                         np.testing.assert_array_equal(
-                            (np.clip(actual, 0, 1) * 255).astype(np.uint8),
-                            (np.clip(expected, 0, 1) * 255).astype(np.uint8),
+                            actual, (np.clip(expected, 0, 1) * 255).astype(np.uint8)
                         )
                         torch.testing.assert_close(video, before, rtol=0, atol=0)
 
@@ -329,7 +327,9 @@ class TestLTX2VideoPostprocess(CustomTestCase):
             processor, "postprocess_video", wraps=processor.postprocess_video
         ) as process:
             actual = LTX2AVDecodingStage._postprocess_video(stage, video)
-        np.testing.assert_array_equal(actual, expected)
+        np.testing.assert_array_equal(
+            actual, (np.clip(expected, 0, 1) * 255).astype(np.uint8)
+        )
         self.assertGreater(process.call_count, video.shape[0])
         for call in process.call_args_list:
             self.assertEqual(call.args[0].shape[0], 1)

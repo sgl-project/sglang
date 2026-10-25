@@ -1005,7 +1005,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             self._materialize_raw_frame_transport(output_batch, req)
         elif self._encodes_on_output_rank(req):
             self._materialize_file_path_transport(output_batch, save_output_paths)
-        elif getattr(req, "return_frames", False):
+        elif self._return_frames_from_worker(req, output_batch.output):
             self._materialize_frame_outputs_for_return(output_batch, req)
 
     @staticmethod
@@ -1013,6 +1013,22 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         # the output rank encodes the outputs to save them or to return the image bytes
         return req.return_file_paths_only and (
             req.save_output or req.return_image_bytes
+        )
+
+    @staticmethod
+    def _return_frames_from_worker(req: Req, output: Any) -> bool:
+        if getattr(req, "return_frames", False):
+            return True
+        # Quantize a CUDA [B, C, T, H, W] video before the host copy instead of
+        # returning FP32. Latents, images and one-frame tensors keep their path.
+        return (
+            not getattr(req, "enable_frame_interpolation", False)
+            and not getattr(req, "enable_upscaling", False)
+            and isinstance(output, torch.Tensor)
+            and output.is_cuda
+            and output.dim() == 5
+            and output.shape[1] in (1, 3, 4)
+            and output.shape[2] > 1
         )
 
     def _materialize_raw_frame_transport(
@@ -1053,7 +1069,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         if (
             not self.is_output_rank
             or output_batch.output is None
-            or not getattr(req, "return_frames", False)
+            or not self._return_frames_from_worker(req, output_batch.output)
         ):
             return
 

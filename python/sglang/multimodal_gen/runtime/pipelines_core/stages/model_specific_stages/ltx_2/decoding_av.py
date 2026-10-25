@@ -116,7 +116,7 @@ class LTX2AVDecodingStage(DecodingStage):
         try:
             host = torch.empty(
                 (batch_size, num_frames, height, width, channels),
-                dtype=torch.float32,
+                dtype=torch.uint8,
                 device="cpu",
                 pin_memory=True,
             )
@@ -124,7 +124,8 @@ class LTX2AVDecodingStage(DecodingStage):
             return self.video_processor.postprocess_video(video.cpu(), output_type="np")
 
         # Bound each FP32 conversion to 64 MiB (or one frame), independently
-        # of clip length and batch size. Normalize in the source dtype first.
+        # of clip length and batch size. Normalize in the source dtype first,
+        # then quantize before the pinned copy: the public frames are uint8.
         chunk_frames = max(1, (64 * 1024 * 1024) // (channels * height * width * 4))
         stream = torch.cuda.current_stream(video.device)
         try:
@@ -138,6 +139,9 @@ class LTX2AVDecodingStage(DecodingStage):
                         frames[0]
                         .permute(0, 2, 3, 1)
                         .to(dtype=torch.float32, memory_format=torch.contiguous_format)
+                        .clamp(0, 1)
+                        .mul(255)
+                        .to(torch.uint8)
                     )
                     host[batch_idx, start:end].copy_(frames, non_blocking=True)
         except torch.cuda.OutOfMemoryError:

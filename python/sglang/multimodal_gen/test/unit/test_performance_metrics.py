@@ -741,3 +741,30 @@ def test_log_request_summary_records_requested_tag(monkeypatch, tmp_path):
     )
 
     assert "custom_tag" in (tmp_path / "performance.log").read_text()
+
+
+def _frame_req(**overrides):
+    values = dict(
+        return_frames=False, enable_frame_interpolation=False, enable_upscaling=False
+    )
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def test_return_frames_requests_keep_the_worker_frame_path():
+    image = torch.zeros(1, 3, 64, 64)
+    assert GPUWorker._return_frames_from_worker(_frame_req(return_frames=True), image)
+    assert not GPUWorker._return_frames_from_worker(_frame_req(), image)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_default_return_quantizes_only_multiframe_cuda_video_on_the_worker():
+    decide = GPUWorker._return_frames_from_worker
+    video = torch.zeros(1, 3, 8, 4, 4, device="cuda")
+
+    assert decide(_frame_req(), video)
+    assert not decide(_frame_req(), video.cpu())
+    assert not decide(_frame_req(), torch.zeros(1, 16, 8, 4, 4, device="cuda"))
+    assert not decide(_frame_req(), torch.zeros(1, 3, 1, 4, 4, device="cuda"))
+    assert not decide(_frame_req(enable_frame_interpolation=True), video)
+    assert not decide(_frame_req(enable_upscaling=True), video)
