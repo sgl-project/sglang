@@ -23,6 +23,11 @@ def handle_hicache(server_args: Any):
     2) Storage <-> layout compatibility (may rewrite layout).
     """
     cfg = resolving_view(server_args)
+    if cfg.enable_linker_mla_dedup and (
+        not cfg.enable_unified_cache_external_linker
+        or cfg.unified_cache_external_linker_backend != "mooncake"
+    ):
+        raise ValueError("--enable-linker-mla-dedup requires the Mooncake linker.")
     if cfg.enable_unified_cache_external_linker:
         if cfg.enable_hierarchical_cache:
             raise ValueError(
@@ -49,11 +54,26 @@ def handle_hicache(server_args: Any):
 
     validate_hicache_host_memory_mode(server_args)
 
+    if cfg.disaggregation_decode_host_receive_threshold < 1:
+        # The shared host pool must match KV transfer's per-layer buffers.
+        declare_resolution(
+            server_args, "handle_hicache", hicache_mem_layout="layer_first"
+        )
+
     # Step 1: Initial layout-io compatibility normalization.
     resolve_layout_io_compatibility(server_args)
 
     # Step 2: Storage-layout normalization without changing io backend.
     resolve_storage_layout_compatibility(server_args)
+    resolve_unified_memory_layout_io(server_args)
+    if (
+        cfg.disaggregation_decode_host_receive_threshold < 1
+        and cfg.hicache_mem_layout != "layer_first"
+    ):
+        raise ValueError(
+            f"The resolved HiCache storage layout {cfg.hicache_mem_layout!r} "
+            "cannot share the layer_first decode host pool used by KV transfer"
+        )
 
     # Step 3: DCP compatibility for the L2 (device<->host) path.
     resolve_hicache_dcp_compatibility(server_args)
@@ -69,16 +89,23 @@ def handle_hicache_ratio_default(server_args: Any):
 
     A decode server keeps the ratio unset here: kv_cache_builder resolves
     it against the retraction-backup backend (1.0 for host_pool, else 2.0).
+
+    An explicit --hicache-ratio or --hicache-size is honored as given, so it
+    resolves --hicache-host-memory-fraction to None (auto-sizing off).
     """
     cfg = resolving_view(server_args)
+    fraction = cfg.hicache_host_memory_fraction
+    if fraction is not None and not 0 < fraction <= 1:
+        raise ValueError("--hicache-host-memory-fraction must be in (0, 1].")
+    fields = {}
     if cfg.hicache_ratio is None and cfg.disaggregation_mode != "decode":
-        declare_resolution(
-            server_args,
-            "_handle_hicache_ratio_default",
-            hicache_ratio=(
-                1.2 if cfg.hicache_host_memory_mode == "buffer_only" else 2.0
-            ),
+        fields["hicache_ratio"] = (
+            1.2 if cfg.hicache_host_memory_mode == "buffer_only" else 2.0
         )
+    if cfg.hicache_ratio is not None or cfg.hicache_size > 0:
+        fields["hicache_host_memory_fraction"] = None
+    if fields:
+        declare_resolution(server_args, "_handle_hicache_ratio_default", **fields)
 
 
 def resolve_hicache_dcp_compatibility(server_args: Any):
@@ -86,13 +113,12 @@ def resolve_hicache_dcp_compatibility(server_args: Any):
     cfg = resolving_view(server_args)
     if cfg.dcp_size <= 1 or not cfg.enable_hierarchical_cache:
         return
-    if cfg.hicache_storage_backend is not None:
+    if (
+        cfg.hicache_storage_backend is not None
+        and cfg.hicache_host_memory_mode == "buffer_only"
+    ):
         raise NotImplementedError(
-            "--hicache-storage-backend (L3) with --dcp-size > 1 is not "
-            "supported yet: under DCP each rank holds a distinct "
-            "interleaved MLA KV shard, so the rank-0-only replicated-MLA "
-            "backup and the storage keys must become dcp_rank-aware "
-            "first. Run HiCache+DCP with L1/L2 only."
+            "HiCache L3 with DCP does not support buffer_only host memory."
         )
     if cfg.speculative_algorithm not in (None, "DSPARK"):
         raise NotImplementedError(
@@ -117,7 +143,7 @@ def resolve_hicache_dcp_compatibility(server_args: Any):
             "MHA host pool has none."
         )
     logger.info(
-        "HiCache + DCP enabled (L1/L2 only): host pool uses widened "
+        "HiCache + DCP enabled: host pool uses widened "
         "logical slot accounting with per-rank physical translation at "
         "the transfer boundary (dcp_size=%d).",
         cfg.dcp_size,
@@ -152,6 +178,10 @@ def resolve_layout_io_compatibility(server_args: Any):
 
 def resolve_storage_layout_compatibility(server_args: Any):
     cfg = resolving_view(server_args)
+    if cfg.hicache_storage_backend == "mooncake" and cfg.dcp_size > 1:
+        # DCP MLA pages support Mooncake multi-buffer transfers. Keep startup
+        # and runtime attachment on the same requested host layout.
+        return
     if (
         cfg.hicache_storage_backend not in ("mooncake", "npu_memcache")
         or cfg.hicache_mem_layout != "layer_first"
@@ -174,6 +204,25 @@ def resolve_storage_layout_compatibility(server_args: Any):
     logger.warning(
         f"Mooncake/Ascend MemCache storage backend does not support layer_first layout, "
         f"switching to {new_layout} layout for {cfg.hicache_io_backend} io backend"
+    )
+
+
+def resolve_unified_memory_layout_io(server_args: Any):
+    # The unified pool's token-major entries make each layer's device rows
+    # strided; the direct page_first_direct copies assume packed rows.
+    cfg = resolving_view(server_args)
+    if not cfg.enable_unified_memory or cfg.hicache_mem_layout != "page_first_direct":
+        return
+    declare_resolution(
+        server_args,
+        "_resolve_unified_memory_layout_io",
+        hicache_mem_layout="page_first",
+        hicache_io_backend="kernel",
+    )
+    logger.warning(
+        "--enable-unified-memory: the direct io backend cannot copy the unified "
+        "pool's strided KV rows, switching to the page_first layout with the "
+        "kernel io backend"
     )
 
 
@@ -209,10 +258,15 @@ def validate_hicache_host_memory_mode(server_args: Any):
             "and all cached data lives in storage."
         )
     if cfg.hicache_write_policy == "write_back":
-        raise ValueError(
-            "--hicache-host-memory-mode buffer_only does not support "
-            "--hicache-write-policy write_back; use write_through or "
-            "write_through_selective."
+        # buffer_only has no host tier to write back to; pages go to storage.
+        declare_resolution(
+            server_args,
+            "_validate_hicache_host_memory_mode",
+            hicache_write_policy="write_through",
+        )
+        logger.info(
+            "--hicache-host-memory-mode buffer_only resolves "
+            "--hicache-write-policy write_back to write_through"
         )
     if cfg.disaggregation_mode == "decode":
         raise ValueError(

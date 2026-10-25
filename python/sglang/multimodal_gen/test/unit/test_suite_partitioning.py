@@ -81,6 +81,34 @@ def test_suite_is_fully_scheduled_for_any_shard_count(suite, total_partitions):
     assert sorted(scheduled_standalone_files) == sorted(expected_standalone_files)
 
 
+@pytest.mark.parametrize("total_partitions", [1, 4, 8])
+def test_file_suite_runs_each_file_once(monkeypatch, tmp_path, total_partitions):
+    files = [f"test_{i}.py" for i in range(5)]
+    for filename in files:
+        (tmp_path / filename).touch()
+    monkeypatch.setitem(run_suite.FILE_SUITES, "unit", files)
+    executed = []
+
+    def run_files(assigned, filter_expr, junit_xml_path):
+        assert assigned
+        assert filter_expr == "not ltx2_vae_channels_last"
+        executed.extend(assigned)
+        return 1, [], {}
+
+    monkeypatch.setattr(run_suite, "run_pytest", run_files)
+    for partition_id in range(total_partitions):
+        args = SimpleNamespace(
+            suite="unit",
+            partition_id=partition_id,
+            total_partitions=total_partitions,
+            filter="not ltx2_vae_channels_last",
+        )
+        result = run_suite._run_file_suite(args, tmp_path)
+        assert result == (1 if partition_id < len(files) else 0)
+
+    assert sorted(executed) == sorted(str(tmp_path / filename) for filename in files)
+
+
 def test_failing_cases_do_not_skip_the_shards_standalone_files(monkeypatch, tmp_path):
     """Standalone files used to own a shard, so cases could not block them."""
     standalone_rel = "../single_test_file/test_disagg_server.py"
@@ -140,3 +168,8 @@ def test_qwen_quality_variants_use_the_same_generation_request():
     assert extra_high.prompt == lossless.prompt
     assert extra_high.output_size == lossless.output_size
     assert extra_high.extras == {"quality": "extra-high"}
+
+    scenarios = json.loads(_H100_BASELINE_PATH.read_text())["scenarios"]
+    for case_id in ("qwen_image_t2i_2_gpus", "qwen_image_t2i_2_gpus_extra_high"):
+        assert cases[case_id].run_perf_check
+        assert scenarios[case_id]["expected_e2e_ms"] > 0

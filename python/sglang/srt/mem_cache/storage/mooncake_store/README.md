@@ -31,6 +31,18 @@ When a cache miss occurs in L1 and L2, HiCache automatically fetches the require
 
 This integration is particularly valuable for production deployments involving long-context models, multi-turn conversations, and high-throughput serving scenarios where traditional caching approaches become capacity-constrained.
 
+### Decode context parallelism (DCP)
+
+Mooncake L3 supports DCP for one materialized MLA KV pool and optional KDA
+state, using `layer_first`, `page_first`, or `page_first_direct`. GQA/MHA, other
+host pools, split KV buffers, and separate KV scale buffers are not supported
+with DCP.
+
+DCP keys separate TP/DCP/PP/CP sizes and logical page sizes. With TP=4/DCP=2,
+ranks 0 and 1 write two shards per page; ranks 2 and 3 read those same objects.
+Use matching model settings. KV format and host layout are not yet in the keys;
+use different `extra_backend_tag` values when these differ.
+
 ## Install Mooncake
 
 **Method 1: with pip**
@@ -195,6 +207,10 @@ Mooncake loads configuration in the following priority order:
 1. If Mooncake-specific options are provided in `--hicache-storage-backend-extra-config`, they are used first.
 2. If not, Mooncake checks whether the environment variable `DEFAULT_MOONCAKE_CONFIG_PATH_ENV` is set, and loads the JSON config file from that path.
 3. If neither of the above is provided, Mooncake falls back to environment variables.
+
+For multi-node deployments that attach Mooncake at runtime via `PUT /hicache/storage-backend`, omit `local_hostname` from the attach payload and set `MOONCAKE_LOCAL_HOSTNAME` (or `LOCAL_HOSTNAME`) per node before launching SGLang. Each rank resolves `local_hostname` from its own process environment instead of a shared default.
+
+When loading from a JSON config file, `local_hostname` follows the same per-process precedence: `MOONCAKE_LOCAL_HOSTNAME`, then `LOCAL_HOSTNAME`, then the value in the JSON file, then `"localhost"`.
 
 **Using extra-config of sglang arguments to configure Mooncake**
 

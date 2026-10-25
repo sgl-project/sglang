@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::proto;
+use sglang_api_types::runtime::v1 as proto;
 
 fn regex_escape_literal(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
@@ -178,6 +178,69 @@ fn insert_disaggregated_params(
     }
 }
 
+fn prost_value_to_json(value: &prost_types::Value) -> serde_json::Value {
+    use prost_types::value::Kind;
+    match &value.kind {
+        None | Some(Kind::NullValue(_)) => serde_json::Value::Null,
+        Some(Kind::NumberValue(n)) => {
+            if n.fract() == 0.0 && *n >= i64::MIN as f64 && *n <= i64::MAX as f64 {
+                serde_json::json!(*n as i64)
+            } else {
+                serde_json::json!(n)
+            }
+        }
+        Some(Kind::StringValue(s)) => serde_json::json!(s),
+        Some(Kind::BoolValue(b)) => serde_json::json!(b),
+        Some(Kind::StructValue(s)) => prost_struct_to_json(s),
+        Some(Kind::ListValue(l)) => {
+            serde_json::Value::Array(l.values.iter().map(prost_value_to_json).collect())
+        }
+    }
+}
+
+fn prost_struct_to_json(s: &prost_types::Struct) -> serde_json::Value {
+    serde_json::Value::Object(
+        s.fields
+            .iter()
+            .map(|(k, v)| (k.clone(), prost_value_to_json(v)))
+            .collect(),
+    )
+}
+
+/// Forward the KV-hint envelope untouched. Action payloads are opaque here; the
+/// component implementing an `action_type` owns its schema.
+fn insert_kv_hints(
+    request: &mut HashMap<String, serde_json::Value>,
+    kv_hints: &Option<proto::KvHintsEnvelope>,
+) {
+    let Some(envelope) = kv_hints else {
+        return;
+    };
+    let actions: Vec<serde_json::Value> = envelope
+        .actions
+        .iter()
+        .map(|action| {
+            serde_json::json!({
+                "action_id": action.action_id,
+                "action_type": action.action_type,
+                "action_version": action.action_version,
+                "payload": action
+                    .payload
+                    .as_ref()
+                    .map_or_else(|| serde_json::json!({}), prost_struct_to_json),
+            })
+        })
+        .collect();
+    request.insert(
+        "kv_hints".into(),
+        serde_json::json!({
+            "protocol_version": envelope.protocol_version,
+            "message_id": envelope.message_id,
+            "actions": actions,
+        }),
+    );
+}
+
 fn now_timestamp() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -250,6 +313,7 @@ pub(crate) fn build_text_generate_dict(
         req.max_thinking_tokens,
     );
     insert_disaggregated_params(&mut d, &req.disaggregated_params);
+    insert_kv_hints(&mut d, &req.kv_hints);
     if let Some(trace) = trace_headers_to_json(&req.trace_headers) {
         d.insert("external_trace_header".into(), trace);
     }
@@ -265,6 +329,15 @@ pub(crate) fn build_generate_dict(
     let mut d = HashMap::new();
     d.insert("rid".into(), serde_json::json!(rid));
     d.insert("input_ids".into(), serde_json::json!(req.input_ids));
+    for (name, sources) in [
+        ("image_data", &req.image_data),
+        ("video_data", &req.video_data),
+        ("audio_data", &req.audio_data),
+    ] {
+        if !sources.is_empty() {
+            d.insert(name.into(), serde_json::json!(sources));
+        }
+    }
     d.insert(
         "sampling_params".into(),
         sampling_params_to_map(&req.sampling_params)?,
@@ -304,6 +377,7 @@ pub(crate) fn build_generate_dict(
         req.max_thinking_tokens,
     );
     insert_disaggregated_params(&mut d, &req.disaggregated_params);
+    insert_kv_hints(&mut d, &req.kv_hints);
     if let Some(trace) = trace_headers_to_json(&req.trace_headers) {
         d.insert("external_trace_header".into(), trace);
     }
@@ -452,6 +526,90 @@ mod tests {
     }
 
     #[test]
+    fn generate_dicts_forward_kv_hints_envelope() {
+        let payload = prost_types::Struct {
+            fields: [
+                (
+                    "endpoint".to_string(),
+                    prost_types::Value {
+                        kind: Some(prost_types::value::Kind::StringValue(
+                            "tcp://10.0.0.2:7000".to_string(),
+                        )),
+                    },
+                ),
+                (
+                    "block_hashes".to_string(),
+                    prost_types::Value {
+                        kind: Some(prost_types::value::Kind::ListValue(
+                            prost_types::ListValue {
+                                values: vec![prost_types::Value {
+                                    kind: Some(prost_types::value::Kind::NumberValue(7.0)),
+                                }],
+                            },
+                        )),
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let kv_hints = Some(proto::KvHintsEnvelope {
+            protocol_version: "0.1".to_string(),
+            message_id: "msg-1".to_string(),
+            actions: vec![proto::KvHintAction {
+                action_id: "a-1".to_string(),
+                action_type: "kv.example".to_string(),
+                action_version: "1.0".to_string(),
+                payload: Some(payload),
+            }],
+        });
+        let text_req = proto::TextGenerateRequest {
+            kv_hints: kv_hints.clone(),
+            ..Default::default()
+        };
+        let token_req = proto::GenerateRequest {
+            kv_hints,
+            ..Default::default()
+        };
+
+        for request in [
+            build_text_generate_dict("request-1", &text_req),
+            build_generate_dict("request-2", &token_req),
+        ] {
+            assert_eq!(
+                request.unwrap().get("kv_hints"),
+                Some(&serde_json::json!({
+                    "protocol_version": "0.1",
+                    "message_id": "msg-1",
+                    "actions": [{
+                        "action_id": "a-1",
+                        "action_type": "kv.example",
+                        "action_version": "1.0",
+                        // An integral number stays an integer: the Python side
+                        // decodes payloads into typed fields.
+                        "payload": {
+                            "endpoint": "tcp://10.0.0.2:7000",
+                            "block_hashes": [7],
+                        },
+                    }],
+                }))
+            );
+        }
+    }
+
+    #[test]
+    fn generate_dicts_omit_kv_hints_when_absent() {
+        let text_request =
+            build_text_generate_dict("request-1", &proto::TextGenerateRequest::default()).unwrap();
+        let token_request =
+            build_generate_dict("request-2", &proto::GenerateRequest::default()).unwrap();
+
+        for request in [text_request, token_request] {
+            assert!(!request.contains_key("kv_hints"));
+        }
+    }
+
+    #[test]
     fn generate_dicts_preserve_optional_generation_controls() {
         let sampling_params = proto::SamplingParams {
             seed: Some(42),
@@ -495,6 +653,65 @@ mod tests {
             assert!(!mapped.contains_key("priority"));
             assert!(!mapped.contains_key("require_reasoning"));
             assert!(!mapped.contains_key("max_thinking_tokens"));
+        }
+    }
+
+    #[test]
+    fn tokenized_multimodal_request_preserves_generation_params() {
+        let request = proto::GenerateRequest {
+            input_ids: vec![2, 10, 20],
+            image_data: vec![
+                "https://example.com/image.png".to_string(),
+                "data:image/png;base64,aW1hZ2U=".to_string(),
+            ],
+            video_data: vec!["https://example.com/clip.mp4".to_string()],
+            audio_data: vec!["data:audio/wav;base64,UklGRg==".to_string()],
+            sampling_params: Some(proto::SamplingParams {
+                temperature: Some(0.5),
+                max_new_tokens: Some(64),
+                ..Default::default()
+            }),
+            disaggregated_params: Some(proto::DisaggregatedParams {
+                bootstrap_host: "10.0.0.1".to_string(),
+                bootstrap_port: 8998,
+                bootstrap_room: i64::MAX,
+            }),
+            ..Default::default()
+        };
+
+        let mapped = build_generate_dict("request", &request).unwrap();
+
+        assert_eq!(mapped["input_ids"], serde_json::json!([2, 10, 20]));
+        assert_eq!(
+            mapped["image_data"],
+            serde_json::json!([
+                "https://example.com/image.png",
+                "data:image/png;base64,aW1hZ2U="
+            ])
+        );
+        assert_eq!(
+            mapped["video_data"],
+            serde_json::json!(["https://example.com/clip.mp4"])
+        );
+        assert_eq!(
+            mapped["audio_data"],
+            serde_json::json!(["data:audio/wav;base64,UklGRg=="])
+        );
+        assert_eq!(
+            mapped["sampling_params"],
+            serde_json::json!({"temperature": 0.5, "max_new_tokens": 64})
+        );
+        assert_eq!(mapped["bootstrap_host"], serde_json::json!("10.0.0.1"));
+        assert_eq!(mapped["bootstrap_port"], serde_json::json!(8998));
+        assert_eq!(mapped["bootstrap_room"], serde_json::json!(i64::MAX));
+    }
+
+    #[test]
+    fn tokenized_request_omits_empty_media_data() {
+        let mapped = build_generate_dict("request", &proto::GenerateRequest::default()).unwrap();
+
+        for key in ["image_data", "video_data", "audio_data"] {
+            assert!(!mapped.contains_key(key));
         }
     }
 
