@@ -63,6 +63,10 @@ class KVArgs:
     kv_cache_dtype_str: str
     # KV byte layout both PD roles must share; None for pools with only one.
     kv_layout: Optional[str] = None
+    # Width of the linear-attention state group when it spans several
+    # attention-DP groups (a multiple of attention TP); None when the state is
+    # sharded like attention. See disaggregation/common/state_group.py.
+    state_group_tp_size: Optional[int] = None
     host_kv_data_ptrs: Optional[List[int]] = None
     host_kv_data_lens: Optional[List[int]] = None
     host_kv_item_lens: Optional[List[int]] = None
