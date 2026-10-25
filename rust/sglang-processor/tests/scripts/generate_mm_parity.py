@@ -1,7 +1,8 @@
 """Record SGLang's Python CPU image path as `tests/fixtures/mm_parity/<model>.json`.
 
 Usage:
-    python tests/scripts/generate_mm_parity.py Qwen/Qwen2.5-VL-3B-Instruct
+    python tests/scripts/generate_mm_parity.py Qwen/Qwen2.5-VL-3B-Instruct --formats
+    python tests/scripts/generate_mm_parity.py Qwen/Qwen3.5-0.8B
 
 Loads the checkpoint's processor through SGLang's own `get_processor` (so the
 backend and SGLang's processor kwargs apply), records the spec SGLang's Rust
@@ -149,11 +150,27 @@ def corpus_bytes(name):
     return path.read_bytes()
 
 
-def cases():
-    """(name, images, backend, image_overrides) per case."""
-    for name in CORPUS:
+# Shapes the resize kernels treat differently: upscale to min_pixels, an odd
+# size, a non-RGB source, and a downscale.
+RESIZE_SHAPES = [
+    "tiny_10x10.png",
+    "rgb_333x251.jpg",
+    "rgba_80x60.png",
+    "large_800x600.jpg",
+]
+
+
+def cases(formats):
+    """(name, images, backend, image_overrides) per case.
+
+    The backend only picks the resize kernel and decoding is model-independent,
+    so the format sweep (`formats`) is needed for one model only.
+    """
+    for name in CORPUS if formats else RESIZE_SHAPES:
         yield name, [name], "auto", None
-        yield f"{name} pil", [name], "pil", None
+    if formats:
+        for name in RESIZE_SHAPES:
+            yield f"{name} pil", [name], "pil", None
     yield "two images", ["rgb_96x80.png", "rgb_333x251.jpg"], "auto", None
     yield (
         "pixel overrides",
@@ -290,6 +307,11 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("model")
     parser.add_argument("--revision")
+    parser.add_argument(
+        "--formats",
+        action="store_true",
+        help="also cover every image format and the PIL backend (one model is enough)",
+    )
     args = parser.parse_args()
     revision = args.revision or HfApi().model_info(args.model).sha
     model_dir = Path(
@@ -304,7 +326,7 @@ def main():
         "cases": [],
     }
     paths = {}
-    for name, image_names, backend, overrides in cases():
+    for name, image_names, backend, overrides in cases(args.formats):
         key = (backend, repr(overrides))
         if key not in paths:
             paths[key] = PythonPath(model_dir, backend, overrides)
