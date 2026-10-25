@@ -101,6 +101,8 @@ class TokenSpaceSGLangProcessor:
             _processor,
             processor_config=processor_config,
             compute_mrope_positions=True,
+            # Decode where the legacy processors do.
+            pin_io_threads_to_current_device=False,
             **kwargs,
         )
         # The tokenizer manager sets pad values through it.
