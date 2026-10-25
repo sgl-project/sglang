@@ -66,8 +66,6 @@ class TestMooncakeTransferBatching(unittest.TestCase):
             return MooncakeKVManager._send_kvcache_generic(
                 manager,
                 mooncake_session_id="session",
-                src_data_ptrs=[1000, 2000],
-                dst_data_ptrs=[5000, 6000],
                 item_lens=[10, 20],
                 prefill_data_indices=np.array([0, 1, 2, 3, 4], dtype=np.int32),
                 dst_data_indices=np.array([10, 11, 12, 13, 14], dtype=np.int32),

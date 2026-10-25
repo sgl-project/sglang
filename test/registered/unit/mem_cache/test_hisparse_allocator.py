@@ -345,8 +345,6 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         with ThreadPoolExecutor(max_workers=1) as executor:
             ret = manager._send_kvcache_generic(
                 mooncake_session_id="session",
-                src_data_ptrs=[1000, 2000, 3000],
-                dst_data_ptrs=[10000, 20000, 30000],
                 item_lens=[100, 100, 100],
                 prefill_data_indices=np.array([1, 2], dtype=np.int32),
                 dst_data_indices=np.array([7, 8], dtype=np.int32),
