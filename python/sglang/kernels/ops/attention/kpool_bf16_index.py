@@ -5,13 +5,16 @@ import torch
 BLOCK_SIZE_K = 128
 
 
-def build_pooled_page_table_64(
-    page_table_64: torch.Tensor,
+def build_pooled_page_table(
+    block_tables: torch.Tensor,
     pool_size: int,
 ) -> torch.Tensor:
-    """Pack one logical pool page into the first token page of each page group."""
+    """Subsample physical KV block IDs for the NPU pooled index cache.
+
+    The caller supplies 128-token KV page IDs. Select the first column in each
+    pool-sized page group, preserving its physical block ID; this does not
+    convert the table to 64-token pages or compact the physical addresses.
+    """
     assert BLOCK_SIZE_K % pool_size == 0
-    idx = torch.arange(
-        0, page_table_64.shape[-1], pool_size, device=page_table_64.device
-    )
-    return page_table_64[..., idx]
+    idx = torch.arange(0, block_tables.shape[-1], pool_size, device=block_tables.device)
+    return block_tables[..., idx]

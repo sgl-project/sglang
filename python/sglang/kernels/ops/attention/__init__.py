@@ -429,9 +429,9 @@ register_kernel(
 )
 register_kernel(
     KernelSpec(
-        op="attention.build_pooled_page_table_64",
+        op="attention.build_pooled_page_table",
         backend=KernelBackend.TORCH,
-        target="sglang.kernels.ops.attention.kpool_bf16_index:build_pooled_page_table_64",
+        target="sglang.kernels.ops.attention.kpool_bf16_index:build_pooled_page_table",
         capabilities=frozenset({CapabilityRequirement.NPU}),
     )
 )

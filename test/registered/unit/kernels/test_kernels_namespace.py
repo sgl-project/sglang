@@ -364,7 +364,7 @@ def test_deep_select_spec_matches_wrapper_architectures():
             KernelBackend.TRITON,
         ),
         ("attention.fused_decode_prepare_indexer", KernelBackend.TRITON),
-        ("attention.build_pooled_page_table_64", KernelBackend.TORCH),
+        ("attention.build_pooled_page_table", KernelBackend.TORCH),
         (
             "kvcache.kpool_decode_update_and_maybe_write_cache_bf16",
             KernelBackend.TRITON,

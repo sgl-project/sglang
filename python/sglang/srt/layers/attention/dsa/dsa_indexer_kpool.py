@@ -2209,7 +2209,7 @@ class IndexerKPool(MultiPlatformOp):
         import torch_npu
 
         from sglang.kernels.ops.attention.kpool_bf16_index import (
-            build_pooled_page_table_64,
+            build_pooled_page_table,
         )
 
         pool = get_token_to_kv_pool()
@@ -2228,7 +2228,7 @@ class IndexerKPool(MultiPlatformOp):
         # Expand block_tables from per-request to per-token
         token_request_ids = metadata.get_token_to_batch_idx()
         block_tables_per_token = block_tables[token_request_ids]
-        pool_block_tables = build_pooled_page_table_64(
+        pool_block_tables = build_pooled_page_table(
             block_tables_per_token, pool_size
         ).contiguous()
 

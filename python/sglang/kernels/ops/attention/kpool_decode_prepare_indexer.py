@@ -14,7 +14,7 @@ kernels:
       Section B: pool_block_tables = block_tables[:, ::POOL_SIZE]. Loads
       [N, NUM_BLOCKS] contiguously into UB as 1D tiles, then extracts the
       strided columns via reshape + split (avoids the 2x (Index+Transpose)
-      materialization of ``build_pooled_page_table_64`` + ``.contiguous()``).
+      materialization of ``build_pooled_page_table`` + ``.contiguous()``).
 
 ``actual_seq_lengths_q = arange(1, N+1)`` stays outside the operator.
 """
@@ -212,7 +212,7 @@ def fused_decode_prepare_indexer(
     # the table narrower than pool_size; pad with dummy pages — entries past
     # pool_seqlens (= seqlens_32 // pool_size) are never consumed downstream,
     # and padded width == ceil-div of the real width, matching the torch-side
-    # build_pooled_page_table_64 slicing.
+    # build_pooled_page_table slicing.
     padded_blocks = -(-NUM_BLOCKS // pool_size) * pool_size or pool_size
     if padded_blocks != NUM_BLOCKS:
         block_tables = F.pad(block_tables, (0, padded_blocks - NUM_BLOCKS))
