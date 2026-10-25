@@ -1368,6 +1368,9 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             if self.enable_teacache:
                 original_hidden_states = hidden_states.clone()
 
+            # cast once for every block's fp32 add (the TI2V table stays bf16)
+            if timestep_proj.dim() == 3:
+                timestep_proj = timestep_proj.float()
             rope_cos_sin_cache = None
             if _is_cuda and freqs_cis is not None:
                 cos, sin = freqs_cis
