@@ -74,6 +74,7 @@ from sglang.multimodal_gen.runtime.platforms import (
 from sglang.multimodal_gen.runtime.server_args.auto_tune import (
     PERFORMANCE_MODES,
     ServerArgsAutoTuner,
+    resolve_keep_resident_min_available_gb,
 )
 from sglang.multimodal_gen.runtime.server_args.disagg import DisaggServerArgsMixin
 from sglang.multimodal_gen.runtime.utils.argparse import (
@@ -900,6 +901,15 @@ class ServerArgs(DisaggServerArgsMixin):
             # holds ~7 GB more on Hopper, past an 80 GB card's speed-mode headroom
             and current_platform.get_device_total_memory() / BYTES_PER_GB
             >= LTX2_RESIDENT_AUTO_ENABLE_MEM_GB
+            and min(
+                current_platform.get_available_gpu_memory(
+                    device_id=device_id, empty_cache=False
+                )
+                for device_id in range(
+                    self.base_gpu_id, self.base_gpu_id + max(1, self.num_gpus)
+                )
+            )
+            >= resolve_keep_resident_min_available_gb(self, deployment_config)
             and (
                 self.ltx2_two_stage_device_mode == "resident"
                 or not self._is_ltx23_two_stage_pipeline()
