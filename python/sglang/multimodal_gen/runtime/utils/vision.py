@@ -17,6 +17,8 @@ import requests
 import torch
 from packaging import version
 
+from sglang.kernels import get_kernel
+from sglang.srt.environ import envs
 from sglang.srt.utils.common import get_image_bytes as srt_get_image_bytes
 
 if version.parse(version.parse(PIL.__version__).base_version) >= version.parse("9.1.0"):
@@ -89,6 +91,49 @@ def normalize(images: np.ndarray | torch.Tensor) -> np.ndarray | torch.Tensor:
             The normalized image array.
     """
     return 2.0 * images - 1.0
+
+
+def preprocess_image(
+    image: PIL.Image.Image,
+    *,
+    device: torch.device,
+    size: tuple[int, int] | None = None,
+    crop: tuple[int, int, int, int] | None = None,
+) -> torch.Tensor:
+    """Pillow Lanczos resize, crop, and [-1, 1] normalization to [1, C, H, W].
+
+    Size is (width, height); crop is (top, left, height, width).
+    Non-RGB inputs and small images retain the CPU recipe.
+    """
+    width, height = size or image.size
+    if (
+        device.type != "cuda"
+        or torch.version.hip is not None
+        or envs.SGLANG_FORCE_CPU_IMAGE_PREPROCESSING.get()
+        or image.mode != "RGB"
+        or max(image.width * image.height, width * height) < 256 * 256
+    ):
+        if size is not None:
+            image = image.resize(size, PIL.Image.Resampling.LANCZOS)
+        if crop is not None:
+            top, left, height, width = crop
+            image = image.crop((left, top, left + width, top + height))
+        return normalize(numpy_to_pt(pil_to_numpy(image))).to(device)
+
+    # upload compact pixels; the lookup table preserves the CPU FP32 rounding
+    pixels = torch.from_numpy(np.array(image)).to(device, non_blocking=True)
+    resize_rgb = get_kernel("mm.lanczos_resize")
+    if crop == (0, 0, height, width):
+        crop = None
+    pixels = resize_rgb(
+        pixels,
+        height,
+        width,
+        crop=crop,
+        mean=(0.5, 0.5, 0.5),
+        std=(0.5, 0.5, 0.5),
+    )
+    return pixels.unsqueeze(0).permute(0, 3, 1, 2)
 
 
 # adapted from diffusers.utils import load_image
