@@ -109,7 +109,7 @@ from sglang.srt.model_executor.graph_memory_usage import (
     replace_graph_time_usage,
 )
 from sglang.srt.model_executor.graph_shared_output import GraphSharedOutput
-from sglang.srt.model_executor.model_runner_components import misc_utils, pp_boundary
+from sglang.srt.model_executor.model_runner_components import misc_utils
 from sglang.srt.model_executor.model_runner_components.attention_backend_setup import (
     build_attention_backends,
     configure_aux_hidden_state_capture,
@@ -822,20 +822,6 @@ class ModelRunner:
         return misc_utils.resolve_pp_proxy_residual_num_blocks(
             model_config=self.model_config,
             start_layer=self.layer_info.start_layer,
-        )
-
-    def is_pp_proxy_input_scattered(self) -> bool:
-        return pp_boundary.input_scattered(
-            model=self.model,
-            pp_size=get_parallel().pp_size,
-            pp_rank=get_parallel().pp_rank,
-        )
-
-    def is_pp_proxy_output_scattered(self) -> bool:
-        return pp_boundary.output_scattered(
-            model=self.model,
-            pp_size=get_parallel().pp_size,
-            pp_rank=get_parallel().pp_rank,
         )
 
     def decode_num_tokens_per_req(

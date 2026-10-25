@@ -14,7 +14,6 @@ from sglang.srt.disaggregation.utils import poll_and_all_reduce_attn_cp_tp_group
 from sglang.srt.distributed.communication_op import attn_cp_tp_broadcast_pyobj
 from sglang.srt.distributed.parallel_state import P2PWork
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.overlap_utils import RelayPayload
@@ -592,25 +591,6 @@ class SchedulerPPMixin:
         self.pp_loop_size: int = (
             get_parallel().pp_size + get_parallel().pp_async_batch_depth
         )
-        # In CP mode, attention weights are duplicated, eliminating the need for the attention TP all-gather operation.
-        # A2A-MoE models (e.g. deepep) leave the PP-boundary hidden states scattered across the
-        # attn-TP group; the send-slice + recv-all-gather transport assumes replicated tensors
-        # and would scramble them, so those ranks must transfer per-rank tensors as-is.
-        runner = self.tp_worker.model_runner
-        prefill_cp = is_dsa_enable_prefill_cp()
-        self.pp_send_all_gather_group = (
-            None
-            if prefill_cp or runner.is_pp_proxy_output_scattered()
-            else self.attn_tp_group
-        )
-        self.pp_recv_all_gather_group = (
-            None
-            if prefill_cp or runner.is_pp_proxy_input_scattered()
-            else self.attn_tp_group
-        )
-        # All message kinds on a link use the same policy: a typed receive may
-        # encounter and stash an output while waiting for a proxy, or vice versa.
-        # Replicated outputs can safely travel in full on a scattered link.
         self.mbs = [None] * self.pp_loop_size
         self.last_mbs = [None] * self.pp_loop_size
         self.running_mbs = [
@@ -976,7 +956,7 @@ class SchedulerPPMixin:
             p2p_work.extend(
                 self.pp_group.send_tensor_dict(
                     tensor_dict=tensor_dict,
-                    all_gather_group=self.pp_send_all_gather_group,
+                    all_gather_group=(self.attn_tp_group),
                     async_send=async_send,
                 )
             )
@@ -1037,7 +1017,7 @@ class SchedulerPPMixin:
         if not self.pp_group.is_first_rank:
             tensor_dict, self.pp_proxy_recv_event = self._pp_recv_typed_dict(
                 expected_kind="proxy",
-                all_gather_group=self.pp_recv_all_gather_group,
+                all_gather_group=(self.attn_tp_group),
             )
             pp_proxy_tensors = PPProxyTensors(tensor_dict)
         return pp_proxy_tensors
@@ -1047,7 +1027,7 @@ class SchedulerPPMixin:
     ) -> Tuple[Dict[str, torch.Tensor], Optional[torch.Event]]:
         return self._pp_recv_typed_dict(
             expected_kind="output",
-            all_gather_group=self.pp_recv_all_gather_group,
+            all_gather_group=(self.attn_tp_group),
         )
 
     def _pp_make_skip_output_result(
@@ -1666,6 +1646,8 @@ class SchedulerPPMixin:
         batch_result = None
         send_output_work = []
 
+        all_gather_group = self.attn_tp_group
+
         # ---- Prepare send dict ----
         # On NPU, always send something (full output or a lightweight skip
         # marker) so the peer's recv in batch_isend_irecv always has a
@@ -1730,8 +1712,8 @@ class SchedulerPPMixin:
             with torch.profiler.record_function("send_recv_res_dict"):
                 recv_dict = self.pp_group.send_recv_tensor_dict(
                     send_tensor_dict=send_dict,
-                    send_all_gather_group=self.pp_send_all_gather_group,
-                    recv_all_gather_group=self.pp_recv_all_gather_group,
+                    send_all_gather_group=all_gather_group,
+                    recv_all_gather_group=all_gather_group,
                 )
             _handle_recv_dict(recv_dict)
         elif send_dict is not None:
