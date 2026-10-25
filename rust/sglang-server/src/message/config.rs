@@ -762,7 +762,7 @@ pub struct MmSpec {
     /// broadcasts across TP ranks and will unwrap `ShmPointerMMData`.
     pub feature_shm: bool,
     /// The family pipeline and its resolved processor parameters.
-    pub pipeline: sglang_mm::registry::PipelineSpec,
+    pub pipeline: sglang_processor::dynamo_multimodal::registry::ProcessorSpec,
 }
 
 #[pyo3::pymethods]
@@ -788,7 +788,7 @@ impl MmSpec {
     fn py_new(
         family: MmFamily,
         feature_shm: bool,
-        image_token_id: i64,
+        image_token_id: i32,
         patch_size: usize,
         merge_size: usize,
         temporal_patch_size: usize,
@@ -798,9 +798,10 @@ impl MmSpec {
         image_std: [f32; 3],
         resample: MmResample,
     ) -> Self {
-        use sglang_mm::registry::PipelineSpec;
+        use sglang_processor::dynamo_multimodal::models::qwen_vl::QwenVlSpec;
+        use sglang_processor::dynamo_multimodal::registry::ProcessorSpec;
         let pipeline = match family {
-            MmFamily::QwenVl => PipelineSpec::QwenVl(sglang_mm::qwen_vl::QwenVlSpec {
+            MmFamily::QwenVl => ProcessorSpec::QwenVl(QwenVlSpec {
                 image_token_id,
                 patch_size,
                 merge_size,
@@ -819,8 +820,8 @@ impl MmSpec {
     }
 }
 
-/// Which `sglang_mm` family pipeline serves the model — one variant per
-/// [`sglang_mm::registry::PipelineSpec`] arm. Exposed to Python as an enum
+/// Which `dynamo-multimodal` family serves the model — one variant per
+/// `ProcessorSpec` arm. Exposed to Python as an enum
 /// (`MmFamily.QwenVl`); `RustMmFamily.name` maps onto it at handoff.
 #[pyo3::pyclass(
     eq,
@@ -834,7 +835,7 @@ pub enum MmFamily {
 }
 
 /// The HF image processor the Rust resize must reproduce bit-exactly (see
-/// [`sglang_mm::qwen_vl::Resampler`]). Exposed to Python as an enum
+/// `dynamo-multimodal`'s `qwen_vl::Resampler`). Exposed to Python as an enum
 /// (`MmResample.AtenU8` / `.Pil`); `RustMmFamily.image_processors` maps each
 /// processor class onto it.
 #[pyo3::pyclass(
@@ -851,7 +852,7 @@ pub enum MmResample {
     Pil,
 }
 
-impl From<MmResample> for sglang_mm::qwen_vl::Resampler {
+impl From<MmResample> for sglang_processor::dynamo_multimodal::models::qwen_vl::Resampler {
     fn from(r: MmResample) -> Self {
         match r {
             MmResample::AtenU8 => Self::AtenU8,
