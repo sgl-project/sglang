@@ -347,6 +347,7 @@ def test_loaded_prequantized_checkpoint_can_use_auto_residency():
     worker.is_output_rank = True
     worker._auto_residency_budget_correction_bytes = 0
     worker._auto_residency_reference_request_duration_ns = None
+    worker._auto_residency_reference_peak_bytes = None
     worker._auto_residency_reference_stage_duration_ns = {}
     worker._auto_residency_reference_component_stages = {}
     quantized_module = torch.nn.Module()
@@ -418,6 +419,7 @@ def test_auto_residency_budget_respects_test_device_memory_cap(monkeypatch):
     worker.rank = 0
     worker.is_output_rank = True
     worker._auto_residency_reference_request_duration_ns = None
+    worker._auto_residency_reference_peak_bytes = None
     worker._auto_residency_reference_stage_duration_ns = {}
     worker._auto_residency_reference_component_stages = {}
     worker.pipeline = SimpleNamespace(
@@ -485,6 +487,29 @@ def test_auto_residency_budget_respects_test_device_memory_cap(monkeypatch):
     assert report.budget_bytes == 80 * GIB_BYTES
     assert report.planning_headroom_correction_bytes == 2 * GIB_BYTES
     assert report.device_transition_allocated_bytes == 60 * GIB_BYTES
+    assert report.peak_allocation_limit_bytes == 60 * GIB_BYTES
+
+    with patch.object(torch, "get_device_module", return_value=device_module):
+        validation = worker._build_auto_residency_report(
+            workload=DefaultWorkload(
+                width=64, height=64, num_frames=1, num_inference_steps=1
+            ),
+            records=[
+                WarmupMemoryRecord(
+                    width=64,
+                    height=64,
+                    num_frames=1,
+                    baseline_allocated_bytes=1,
+                    peak_allocated_bytes=69 * GIB_BYTES,
+                    peak_reserved_bytes=70 * GIB_BYTES,
+                    succeeded=True,
+                )
+            ],
+            include_candidates=False,
+        )
+
+    assert validation.estimated_peak_bytes == 69 * GIB_BYTES
+    assert validation.peak_allocation_limit_bytes == 60 * GIB_BYTES
 
 
 def test_baseline_config_loads_per_scenario_peak_vram(tmp_path):

@@ -523,6 +523,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         # measured candidate layout may be accepted or rolled back, but does
         # not rewrite utility and start another search.
         self._auto_residency_reference_request_duration_ns: int | None = None
+        self._auto_residency_reference_peak_bytes: int | None = None
         self._auto_residency_reference_stage_duration_ns: dict[str, int] = {}
         self._auto_residency_reference_component_stages: dict[str, tuple[str, ...]] = {}
         self._auto_residency_repeated_components: set[str] = set()
@@ -2047,12 +2048,12 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 shortfall_gib = shortfall_bytes / GIB_BYTES
                 if self.is_output_rank:
                     logger.warning(
-                        "Auto residency calibration exceeded the VRAM reserve by "
+                        "Auto residency calibration exceeded the VRAM budget by "
                         "%.1f GiB; rolling back the latest adjustment round.",
                         shortfall_gib,
                     )
                 return self._rollback_everywhere(
-                    cause=f"VRAM reserve exceeded by {shortfall_gib:.1f} GiB",
+                    cause=f"VRAM budget exceeded by {shortfall_gib:.1f} GiB",
                     already_failed=False,
                     latest_round_only=True,
                 )
@@ -2491,6 +2492,19 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 target_units=target_units,
                 component_weight_bytes=runtime_weights_by_component,
             )
+        if (
+            not warmup_oom
+            and estimated_peak_bytes is not None
+            and self._auto_residency_reference_peak_bytes is None
+        ):
+            self._auto_residency_reference_peak_bytes = max(
+                estimated_peak_bytes, max(estimated_phase_peaks.values(), default=0)
+            )
+            if self.is_output_rank:
+                logger.info(
+                    "Auto residency: preserving the initial allocated peak of %.2f GiB",
+                    self._auto_residency_reference_peak_bytes / GIB_BYTES,
+                )
         measured_used_components = {
             component_name
             for component_names in used_components_by_phase.values()
@@ -2681,6 +2695,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             budget_bytes=budget_bytes,
             estimated_peak_bytes=estimated_peak_bytes,
             planning_headroom_correction_bytes=allocator_headroom_bytes,
+            peak_allocation_limit_bytes=self._auto_residency_reference_peak_bytes,
             target_workload_measured=bool(target_records),
             observed_reserved_bytes=max(
                 (record.peak_reserved_bytes for record in target_records), default=0

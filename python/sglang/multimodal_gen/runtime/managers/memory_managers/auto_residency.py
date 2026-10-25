@@ -260,6 +260,8 @@ class RankResidencyReport(msgspec.Struct, frozen=True):
     rank: int
     budget_bytes: int
     estimated_peak_bytes: int | None
+    # fixed by the first successful calibration, separate from card capacity
+    peak_allocation_limit_bytes: int | None = None
     # Conservative margin learned from a failed candidate. It constrains only
     # future growth: the current placement was measured against the physical
     # budget and must not become retroactively infeasible after a rollback.
@@ -2725,7 +2727,7 @@ def _vram_reserve_bytes(budget_bytes: int, *, target_workload_measured: bool) ->
 def current_placement_reserve_shortfall_bytes(
     reports: Iterable[RankResidencyReport],
 ) -> int:
-    """Return the largest reserve deficit of the measured placement.
+    """Return the largest allocation or reserve deficit of the measured placement.
 
     This checks the placement that just executed without regenerating a
     candidate frontier or running the optimizer. It is therefore suitable for
@@ -2757,6 +2759,8 @@ def current_placement_reserve_shortfall_bytes(
         # must still leave the same reserve for the next request.
         realized_footprint = max(measured_peak, report.observed_reserved_bytes)
         shortfalls.append(realized_footprint + reserve - report.budget_bytes)
+        if report.peak_allocation_limit_bytes is not None:
+            shortfalls.append(measured_peak - report.peak_allocation_limit_bytes)
     return max(0, max(shortfalls, default=0))
 
 
@@ -3159,6 +3163,13 @@ def plan_auto_residency(*, reports: list[RankResidencyReport]) -> AutoResidencyP
                 - reserves_by_rank[report.rank]
                 - report.planning_headroom_correction_bytes
             )
+            if report.peak_allocation_limit_bytes is not None:
+                available = min(
+                    available,
+                    report.peak_allocation_limit_bytes
+                    - phase_peak
+                    - report.planning_headroom_correction_bytes,
+                )
             # A successful measured placement remains a feasible zero-delta
             # baseline even when it consumed the reserve. An OOM placement is
             # different: preserving the negative shortfall forces the complete
@@ -3174,11 +3185,19 @@ def plan_auto_residency(*, reports: list[RankResidencyReport]) -> AutoResidencyP
     )
     if has_device_transition_options:
         for report in reports:
-            resource_budgets[f"gpu:rank{report.rank}:placement-transition"] = max(
-                0,
+            transition_headroom = (
                 report.budget_bytes
                 - report.device_transition_allocated_bytes
-                - reserves_by_rank[report.rank],
+                - reserves_by_rank[report.rank]
+            )
+            if report.peak_allocation_limit_bytes is not None:
+                transition_headroom = min(
+                    transition_headroom,
+                    report.peak_allocation_limit_bytes
+                    - report.device_transition_allocated_bytes,
+                )
+            resource_budgets[f"gpu:rank{report.rank}:placement-transition"] = max(
+                0, transition_headroom
             )
     has_host_resources = any(
         candidate.pinned_host_delta_bytes != 0

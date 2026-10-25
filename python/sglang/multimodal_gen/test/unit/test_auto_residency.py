@@ -997,6 +997,7 @@ def _report(
     estimated_gib: float | None = 50,
     planning_headroom_correction_gib: int = 0,
     observed_reserved_gib: float = 0,
+    peak_allocation_limit_gib: float | None = None,
     candidates: list[ResidencyTarget] | None = None,
     skip_reason: str | None = None,
     phase_peaks_gib: dict[str, float] | None = None,
@@ -1029,6 +1030,11 @@ def _report(
         ),
         target_workload_measured=target_workload_measured,
         observed_reserved_bytes=observed_reserved_gib * GIB_BYTES,
+        peak_allocation_limit_bytes=(
+            None
+            if peak_allocation_limit_gib is None
+            else int(peak_allocation_limit_gib * GIB_BYTES)
+        ),
         estimated_peak_bytes_by_phase={
             name: int(value * GIB_BYTES)
             for name, value in (phase_peaks_gib or {}).items()
@@ -1121,6 +1127,64 @@ class TestResolveMeasuredDefaultWorkload:
 
 
 class TestPlanAutoResidency:
+    @pytest.mark.parametrize(
+        "peak_gib,limit_gib,expected", [(30, 30, False), (20, 30, True)]
+    )
+    def test_allocated_peak_budget_limits_resident_promotions(
+        self, peak_gib, limit_gib, expected
+    ):
+        plan = plan_auto_residency(
+            reports=[
+                _report(
+                    budget_gib=180,
+                    estimated_gib=peak_gib,
+                    peak_allocation_limit_gib=limit_gib,
+                    phase_peaks_gib={"denoise": peak_gib, "encode": 10},
+                    phase_components={
+                        "denoise": ("transformer",),
+                        "encode": ("encoder",),
+                    },
+                    candidates=[_candidate("encoder", weight_gib=5)],
+                )
+            ]
+        )
+        assert bool(plan.changes) is expected
+
+    def test_allocated_peak_budget_also_limits_materialization(self):
+        candidate = ResidencyTarget(
+            component_name="encoder",
+            residency_mode=COMPONENT_OFFLOAD,
+            target_residency_mode=RESIDENT,
+            target_resident_weight_bytes=5 * GIB_BYTES,
+            h2d_bytes_per_request=5 * GIB_BYTES,
+            device_transition_delta_bytes=5 * GIB_BYTES,
+        )
+        plan = plan_auto_residency(
+            reports=[
+                _report(
+                    budget_gib=180,
+                    estimated_gib=10,
+                    peak_allocation_limit_gib=20,
+                    device_transition_allocated_gib=19,
+                    candidates=[candidate],
+                )
+            ]
+        )
+        assert not plan.changes
+
+    @pytest.mark.parametrize("allocated_gib,expected", [(20, 0), (21, GIB_BYTES)])
+    def test_validation_checks_allocated_budget_separately_from_reserved_pool(
+        self, allocated_gib, expected
+    ):
+        report = _report(
+            budget_gib=180,
+            estimated_gib=allocated_gib,
+            peak_allocation_limit_gib=20,
+            observed_reserved_gib=30,
+            target_workload_measured=True,
+        )
+        assert current_placement_reserve_shortfall_bytes([report]) == expected
+
     def test_rank_skip_reason_propagates(self):
         plan = plan_auto_residency(
             reports=[_report(), _report(rank=1, skip_reason="no measurements")]
