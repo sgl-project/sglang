@@ -12,17 +12,20 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from array import array
 from itertools import chain
 from types import ModuleType
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import msgspec
+import psutil
 
 from sglang.srt.managers.utils import (
     MsgpackDecodeError,
     msgpack_decode_explained,
 )
+from sglang.srt.observability.startup_time import build_engine_startup_time
 from sglang.srt.runtime_context import get_exec, get_mm, get_parallel, get_serving
 from sglang.srt.rust_server.config import _build_server_args, _partition_cores
 from sglang.srt.rust_server.multimodal import (
@@ -32,6 +35,7 @@ from sglang.srt.rust_server.multimodal import (
     RustMmSpec,
     settle_shm_buffers,
 )
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils.flatten import (
     FlatPairColumns,
     NestedRowColumns,
@@ -40,12 +44,17 @@ from sglang.srt.utils.flatten import (
 from sglang.srt.utils.network import NetworkAddress
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.io_struct import BatchTokenIDOutput
-    from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
+    from sglang.srt.managers.io_struct import AbortReq, BatchTokenIDOutput
+    from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput, Req
     from sglang.srt.managers.scheduler import Scheduler
     from sglang.srt.rust_extensions._server import MmSpec, Server
 
 logger = logging.getLogger(__name__)
+
+# The extras families' header columns (`BatchHeader.out_lp_lens` through
+# `hidden_poslens`). A frame without extras that sends a later column pads
+# them empty; `push_generation` asserts the count whenever it sends extras.
+_EXTRAS_HEADER_COLS = 12
 
 
 class RustServer:
@@ -67,6 +76,29 @@ class RustServer:
         self.mm_spec = mm_spec
         self._multimodal_enabled = mm_spec is not None
         self._max_per_poll = max_per_poll
+        # The engine-level startup timings `/server_info` reports, set once
+        # the scheduler finishes initializing (see `set_startup_time`).
+        self.startup_time: Optional[Dict[str, Any]] = None
+
+    @classmethod
+    def _health_generate_headers(cls, scheduler: Scheduler) -> Dict[str, str]:
+        """Headers a healthy ``/health_generate`` carries; a deployment's
+        router may read its metadata off the deep health probe."""
+        return {}
+
+    @classmethod
+    def _default_max_new_tokens(cls, scheduler: Scheduler) -> Optional[int]:
+        """What a ``/generate`` request that omits ``max_new_tokens`` asks for:
+        ``SamplingParams``'s default, as the Python ``TokenizerManager`` leaves
+        it. A subclass may return ``None``, no limit, which the scheduler
+        clamps to what the context window leaves after the prompt."""
+        return SamplingParams().max_new_tokens
+
+    @classmethod
+    def _server_kwargs(cls, scheduler: Scheduler) -> Dict[str, Any]:
+        """Keyword arguments a model package's own ``Server`` class takes
+        beyond the shared ones (see ``_load_extension``)."""
+        return {}
 
     @classmethod
     def _load_extension(cls) -> ModuleType:
@@ -74,14 +106,18 @@ class RustServer:
 
         return load_rust_extension("sglang.srt.rust_extensions._server")
 
-    def _start_multimodal(self, scheduler: Scheduler) -> None:
-        """Start the model's Rust workers and retain their scheduler-side state."""
-        mm_host = RustMmProcessor(
+    @classmethod
+    def _resolve_multimodal(cls, scheduler: Scheduler) -> Optional[RustMmSpec]:
+        """Resolve the built-in Rust MM pipeline for a multimodal model, and
+        refuse a model it cannot serve. ``launch`` calls this before the
+        listener binds, so a refused model never accepts a connection. A
+        model package whose ``_start_multimodal`` starts its own pipeline
+        overrides this to return ``None``."""
+        mm_spec = RustMmProcessor(
             server_args=scheduler.server_args,
             model_config=scheduler.model_config,
             processor=scheduler.processor,
-        )
-        mm_spec = mm_host.resolve_spec()
+        ).resolve_spec()
         if mm_spec is None:
             supported = sorted(
                 set(chain.from_iterable(f.model_types for f in RUST_MM_FAMILIES))
@@ -92,8 +128,15 @@ class RustServer:
                 f"(supported: {', '.join(supported)}; "
                 "images only). Unset SGLANG_RUST_SERVER to serve this model."
             )
-        self.server.start_mm_workers(self._build_mm_spec(mm_spec), mm_host.mm_workers)
-        self.mm_spec = mm_spec
+        return mm_spec
+
+    def _start_multimodal(self, scheduler: Scheduler) -> None:
+        """Start the Rust workers for the pipeline ``launch`` resolved."""
+        assert self.mm_spec is not None
+        self.server.start_mm_workers(
+            self._build_mm_spec(self.mm_spec),
+            get_mm().mm_processor_worker_num or RustMmProcessor.AUTO_MM_WORKERS,
+        )
 
     @staticmethod
     def _server_core_budget(allowed_core_count: int, mm_workers: int) -> int:
@@ -114,13 +157,16 @@ class RustServer:
         """Start the embedded Rust server threads and bind the listen port.
 
         The caller gates this (``SGLANG_RUST_SERVER`` + rank 0); this always
-        creates.
+        creates. A model the server cannot serve is refused before the port
+        is bound.
         """
         # Force turn off HF tokenizers rayon's unpinned global thread pool.
         os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
         # Preserve the DP startup log; ports use node-local offsets.
-        dp_rank = get_parallel().attn_dp_rank if get_parallel().dp_size > 1 else None
+        dp_rank = (
+            get_parallel().attn_dp_rank if get_parallel().num_dp_ranks > 1 else None
+        )
         if get_exec().moe.is_ep_scale_joiner:
             # The joining TP group is entirely local to this node.
             tp_size_per_node = get_parallel().tp_size
@@ -142,23 +188,37 @@ class RustServer:
             )
         )
 
+        # Multimodal models must have a Rust pipeline — there is no Python
+        # fallback. The listener answers as soon as the server is constructed,
+        # so refuse a model without one first.
+        mm_spec = (
+            cls._resolve_multimodal(scheduler)
+            if scheduler.model_config.is_multimodal
+            else None
+        )
+
         extension = cls._load_extension()
         server = extension.Server(
-            _build_server_args(scheduler, extension=extension),
+            _build_server_args(
+                scheduler,
+                extension=extension,
+                health_generate_headers=cls._health_generate_headers(scheduler),
+                default_max_new_tokens=cls._default_max_new_tokens(scheduler),
+            ),
             # None runs unpinned; otherwise the list carries the pinning decision.
             cores=server_cores,
             port_offset=local_dp_rank,
+            **cls._server_kwargs(scheduler),
         )
         instance = cls(server, http_port=listen_port)
 
-        # Multimodal models must have a Rust pipeline — there is no Python
-        # fallback.
         if scheduler.model_config.is_multimodal:
             # New threads inherit the spawning thread's affinity, and this launch
             # thread still holds the full mask. Narrow it first so every MM thread
-            # created below (the processor's executors, the Rust MM workers) stays
-            # off the scheduler's reserved cores, where MM preprocessing would
-            # preempt the scheduler loop and inflate inter-token latency.
+            # created below (the Rust MM workers, and any a model package's
+            # `_start_multimodal` starts) stays off the scheduler's reserved
+            # cores, where MM preprocessing would preempt the scheduler loop and
+            # inflate inter-token latency.
             if server_cores is not None:
                 try:
                     os.sched_setaffinity(0, set(server_cores))
@@ -166,6 +226,7 @@ class RustServer:
                     logger.warning(
                         "rust server: cannot confine mm threads to server cores: %s", e
                     )
+            instance.mm_spec = mm_spec
             instance._start_multimodal(scheduler)
             instance._multimodal_enabled = True
 
@@ -180,7 +241,9 @@ class RustServer:
         # Under DP every rank runs its own server on its own port, so the rank is
         # what tells two otherwise identical startup lines apart.
         dp_note = (
-            "" if dp_rank is None else f" (DP rank {dp_rank}/{get_parallel().dp_size})"
+            ""
+            if dp_rank is None
+            else f" (DP rank {dp_rank}/{get_parallel().num_dp_ranks})"
         )
         logger.info(
             "SGLANG_RUST_SERVER enabled, Rust server listen on %s%s",
@@ -200,6 +263,17 @@ class RustServer:
         because ``drain`` settles its ownership after the wrapper returns."""
         assert self.mm_spec is not None
         return RustMmProcessor.wrap_encoded(self.mm_spec, buffers)
+
+    def set_startup_time(self, scheduler_startup_time: Dict[str, Any]) -> None:
+        """Record the startup timings in the shape of Python's
+        ``TokenizerManager.startup_time``. That frontend's end-to-end phase
+        (``tokenizer_e2e``) runs from launch until the schedulers are ready;
+        this one serves from inside the scheduler process, so it runs from
+        the process's spawn until its initialization ends, now."""
+        self.startup_time = build_engine_startup_time(
+            [scheduler_startup_time],
+            tokenizer_e2e=time.time() - psutil.Process().create_time(),
+        )
 
     def mm_transport_stats(self) -> Dict[str, int]:
         """Snapshot of the zero-copy accounting at the multimodal hand-off
@@ -321,7 +395,51 @@ class RustServer:
 
         self.server.push_control_result(recv_req.rid, encoded)
 
-    def push_generation(self, payload: BatchTokenIDOutput) -> None:
+    def push_abort(self, abort: AbortReq, req: Req) -> None:
+        """The terminal frame of a request the scheduler ended outside the output
+        stream (aborted while queued, preempted, retracted or rejected), which
+        Python's ``TokenizerManager._handle_abort_req`` builds from the same
+        ``AbortReq``: a one-request batch carrying no new tokens and the abort
+        finish reason. The counts are the request's own, so the frame does not
+        reset the ones a stream already reported. The frame is marked as ended
+        outside the stream: like ``_handle_abort_req``, the frontend records no
+        request metrics for it."""
+        finish_reason = abort.finished_reason or {
+            "type": "abort",
+            "message": abort.abort_message or "Abort in waiting queue",
+        }
+        header_cols = [
+            [abort.rid],
+            [finish_reason],
+            [len(req.origin_input_ids)],
+            [0],
+            [req.cached_tokens],
+            [req.reasoning_tokens],
+        ]
+        header_cols += [[]] * _EXTRAS_HEADER_COLS
+        header_cols += [
+            [abort.weight_versions] if abort.weight_versions is not None else [],
+            [],  # image_tokens
+            [],  # audio_tokens
+            [],  # video_tokens
+            [],  # decode_latencies
+            # Ended outside the output stream: `_handle_abort_req` records no
+            # request metrics for it.
+            [True],
+        ]
+        header = msgspec.msgpack.encode(header_cols)
+        if not self.server.push_decode_result_batch(header, [b""]):
+            logger.warning(
+                "Rust egress closed; dropped abort of %s during shutdown", abort.rid
+            )
+
+    def push_health_ack(self) -> None:
+        """Acknowledge the health probes skipped while the scheduler was busy."""
+        self.server.push_health_ack()
+
+    def push_generation(
+        self, payload: BatchTokenIDOutput, decode_latencies: Dict[int, float]
+    ) -> None:
         """Egress redirect for generation output (replaces the zmq detokenizer).
 
         Push the WHOLE batch into the Rust egress ring as one frame (-> detokenizer
@@ -329,10 +447,14 @@ class RustServer:
         bulk numeric columns never go through msgpack:
 
           - ``header``: msgpack ``BatchHeader`` positional array — the per-request
-            scalar columns (``rids, finish_reasons, prompt_tokens, tok_lens``) plus
+            scalar columns (``rids, finish_reasons, prompt_tokens, tok_lens,
+            cached_tokens, reasoning_tokens``) plus
             the shape metadata for the optional families (``*_lens`` element counts
             for the flat logprob columns, ``*_reqlens``/``*_poslens`` for the ragged
-            and hidden ones).
+            and hidden ones), then the finished requests' weight-version
+            spans, a multimodal model's media token counts, and
+            ``decode_latencies`` (by row: a finished non-streaming request's
+            decode latency in seconds).
           - ``data``: the raw little-endian numeric buffer: the token ids
             first, as the 8-byte ``array("q")`` bytes the scheduler already
             holds, then every logprob / hidden column as 4-byte elements
@@ -377,7 +499,14 @@ class RustServer:
         # Column order here MUST match BatchHeader (header_cols) and
         # for_each_chunk's read order (data_cols); the extras contribution
         # is ordered by the `extras` tuple below.
-        header_cols = [rids, finish_reasons, prompt_tokens, tok_lens]
+        header_cols = [
+            rids,
+            finish_reasons,
+            prompt_tokens,
+            tok_lens,
+            payload.cached_tokens,
+            payload.reasoning_tokens,
+        ]
         data_cols = [flat_ids]
 
         if has_extra:
@@ -463,9 +592,39 @@ class RustServer:
                 for i in range(batch_size):
                     accept(i)
 
+            extras_start = len(header_cols)
             for extra in extras:
                 header_cols += extra.header_cols()
                 data_cols += extra.data_cols()
+            # The padding below must line up with these columns.
+            assert len(header_cols) - extras_start == _EXTRAS_HEADER_COLS, (
+                "_EXTRAS_HEADER_COLS no longer matches the extras families"
+            )
+
+        # After the extras: the finished requests' weight-version spans (None
+        # for the others), a multimodal model's media token counts and the
+        # finished requests' decode latencies, each empty when nothing in the
+        # batch carries it. Only the last is built here, for finished rows; the
+        # header stops at its last non-empty column.
+        latencies = []
+        if decode_latencies:
+            latencies = [None] * len(rids)
+            for row, latency in decode_latencies.items():
+                latencies[row] = latency
+        media = self._multimodal_enabled
+        trailing = [
+            payload.weight_versions or [],
+            (payload.image_tokens or []) if media else [],
+            (payload.audio_tokens or []) if media else [],
+            (payload.video_tokens or []) if media else [],
+            latencies,
+        ]
+        while trailing and not trailing[-1]:
+            trailing.pop()
+        if trailing:
+            if not has_extra:
+                header_cols += [[]] * _EXTRAS_HEADER_COLS
+            header_cols += trailing
 
         header = msgspec.msgpack.encode(header_cols)
         # Pass the raw column list; the Rust side concatenates it into the frame

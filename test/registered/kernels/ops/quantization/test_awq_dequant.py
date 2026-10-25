@@ -15,7 +15,6 @@ import torch
 from sglang.kernels.ops.quantization.awq_triton import (
     AWQ_TRITON_SUPPORTED_GROUP_SIZES,
     awq_dequantize_triton,
-    awq_gemm_triton,
 )
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci
@@ -114,66 +113,6 @@ class TestAWQTriton(CustomTestCase):
         # sanity
         self.assertFalse(torch.any(torch.isinf(tri)) or torch.any(torch.isnan(tri)))
         torch.testing.assert_close(ref, tri)
-
-    # GEMM
-    def test_gemm(self):
-        N_list = [1, 2, 4, 8, 14, 17, 23, 32]
-        K_list = [128]
-        M_list = [16, 24, 32]
-        splitK_list = [1, 8]
-
-        for N in N_list:
-            for K in K_list:
-                for M in M_list:
-                    for group_size in AWQ_TRITON_SUPPORTED_GROUP_SIZES:
-                        for splitK in splitK_list:
-                            with self.subTest(N=N, K=K, M=M, g=group_size, sk=splitK):
-                                self._run_gemm_case(
-                                    N=N,
-                                    K=K,
-                                    M=M,
-                                    group_size=group_size,
-                                    splitK=splitK,
-                                )
-
-    def _run_gemm_case(self, N, K, M, group_size, splitK):
-        if group_size == -1:
-            group_size = K
-
-        torch.manual_seed(0)
-
-        x = torch.rand((N, K), dtype=torch.float32, device=device)
-        qweight = torch.randint(
-            0,
-            torch.iinfo(torch.int32).max,
-            (K, M // 8),
-            dtype=torch.int32,
-            device=device,
-        )
-        qzeros = torch.randint(
-            0,
-            torch.iinfo(torch.int32).max,
-            (K // group_size, M // 8),
-            dtype=torch.int32,
-            device=device,
-        )
-        scales = torch.rand((K // group_size, M), dtype=torch.float32, device=device)
-
-        tri_out = awq_gemm_triton(x, qweight, scales, qzeros, splitK)
-
-        self.assertFalse(
-            torch.any(torch.isinf(tri_out)) or torch.any(torch.isnan(tri_out))
-        )
-
-        # dequantize & compare
-        w_deq = awq_dequantize_triton(qweight, scales, qzeros)
-        ref_out = torch.matmul(x, w_deq)
-
-        self.assertFalse(
-            torch.any(torch.isinf(ref_out)) or torch.any(torch.isnan(ref_out))
-        )
-
-        torch.testing.assert_close(tri_out.cpu(), ref_out.cpu(), atol=1e-1, rtol=1e-1)
 
 
 if __name__ == "__main__":

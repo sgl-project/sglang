@@ -1,11 +1,22 @@
 import logging
-from typing import Optional, Tuple
+from typing import TYPE_CHECKING, NamedTuple, Optional, Tuple
 
 import torch
 import triton
 
+if TYPE_CHECKING:
+    from sglang.kernels.ops.layernorm.mhc_boundary_hip import HcCoefficients
+
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_platform
+from sglang.srt.layers.moe import get_moe_a2a_backend
+from sglang.srt.layers.moe.utils import should_skip_post_experts_all_reduce
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_forward,
+    get_parallel,
+    get_platform,
+)
 from sglang.srt.utils import get_bool_env_var, is_gfx95_supported, is_hip
 from sglang.srt.utils.common import is_gfx1250_supported
 
@@ -14,6 +25,35 @@ logger = logging.getLogger(__name__)
 _is_hip = is_hip()
 _is_gfx95_supported = is_gfx95_supported()
 _is_gfx1250_supported = is_gfx1250_supported()
+
+if _is_hip:
+    from sglang.kernels.ops.communication.all_reduce_mhc_hip import (
+        all_reduce_mhc_post,
+    )
+    from sglang.kernels.ops.layernorm.mhc_boundary_hip import (
+        hc_boundary_fused_deferred,
+    )
+if _is_gfx95_supported:
+    from sglang.srt.models.deepseek_common.amd.deepseek_v4_gfx95_dense import (
+        post_attention_norm,
+    )
+
+
+class MhcPostOperands(NamedTuple):
+    """What the fused all-reduce + hc_post kernel reads besides the sublayer rows.
+
+    The caller hands this to `apply_attention_mhc` / `apply_moe_mhc` directly; the
+    sublayer only has to be told to leave its reduce alone.
+    """
+
+    residual: torch.Tensor
+    post: torch.Tensor
+    comb: torch.Tensor
+
+
+# the fused all-reduce + hc_post kernel: DeepSeek-V4.1's hidden size, up to this many rows
+MHC_HIDDEN_SIZE = 5120
+ALL_REDUCE_MHC_MAX_ROWS = 8
 
 _FUSED_HC_POST_PRE_M_THRESHOLD = 64
 _FUSED_HC_POST_PRE_CACHE: dict[tuple, dict[str, torch.Tensor]] = {}
@@ -128,7 +168,10 @@ def _get_fused_hc_post_pre_buffers(
             num_ksplit, num_tokens, dtype=torch.float32, device=device
         ),
     }
-    _FUSED_HC_POST_PRE_CACHE[key] = bufs
+    # Cache only small batches: a caller that runs this path for every prefill
+    # size (gfx1250) would otherwise keep one buffer set per num_tokens forever.
+    if num_tokens <= _FUSED_HC_POST_PRE_M_THRESHOLD:
+        _FUSED_HC_POST_PRE_CACHE[key] = bufs
     return bufs
 
 
@@ -395,7 +438,7 @@ def apply_mhc_post_pre_boundary(
     if not _is_fused_mhc_post_pre_enabled():
         return None
 
-    from sglang.srt.models.deepseek_v4 import _get_mhc_ops
+    from sglang.srt.models.deepseek_v4 import get_mhc_ops
 
     post_in = post.unsqueeze(-1) if post.ndim == 2 else post
     (
@@ -403,7 +446,7 @@ def apply_mhc_post_pre_boundary(
         post_out,
         comb_out,
         layer_input_out,
-    ) = _get_mhc_ops().mhc_fused_post_pre(
+    ) = get_mhc_ops().mhc_fused_post_pre(
         layer_input,
         residual,
         post_in,
@@ -421,3 +464,120 @@ def apply_mhc_post_pre_boundary(
     )
     post_out = post_out.squeeze(-1) if post_out.ndim == 3 else post_out
     return residual, layer_input_out, post_out, comb_out, True
+
+
+def hc_boundary(
+    layer,
+    x: Optional[torch.Tensor],
+    residual: torch.Tensor,
+    post: Optional[torch.Tensor],
+    comb: Optional[torch.Tensor],
+    pre_prev: Optional[torch.Tensor],
+    hc_fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, "HcCoefficients"]:
+    """Fused sublayer boundary (ROCm): apply the pending hc_post of x onto residual, collapse
+    with pre_prev (copy 0 when None) and take the mixing statistics. Returns (new_residual, y,
+    coefficients); the coefficients' reduce + sinkhorn is still pending (see HcCoefficients)."""
+    new_residual, y, coefficients = hc_boundary_fused_deferred(
+        x,
+        residual,
+        post,
+        comb,
+        pre_prev,
+        hc_fn,
+        hc_scale,
+        hc_base,
+        layer.hc_mult,
+        layer.hc_sinkhorn_iters,
+        layer.rms_norm_eps,
+        layer.hc_eps,
+    )
+    if new_residual is None:
+        new_residual = residual
+    if y is None:
+        y = new_residual[:, 0, :].contiguous()
+    return new_residual, y, coefficients
+
+
+def _can_fuse_mhc(layer, residual: torch.Tensor, forward_batch) -> bool:
+    return (
+        _is_gfx95_supported
+        and 1 <= residual.shape[0] <= ALL_REDUCE_MHC_MAX_ROWS
+        and residual.shape[1:] == (4, MHC_HIDDEN_SIZE)
+        and residual.dtype == torch.bfloat16
+        and residual.is_contiguous()
+        and layer.config.model_type == "deepseek_v41"
+        and (
+            forward_batch.forward_mode.is_decode()
+            or forward_batch.forward_mode.is_target_verify()
+        )
+        and get_parallel().attn_dp_size == 1
+        and get_parallel().tp_size == 4
+        and not layer.dsa_enable_prefill_cp
+        and not get_forward().sp_active
+        and not is_batch_invariant_mode_enabled()
+        and not get_exec().deterministic.enable_deterministic_inference
+    )
+
+
+def _make_mhc_fusion(
+    residual: torch.Tensor, coefficients: "HcCoefficients", comm
+) -> Optional[MhcPostOperands]:
+    # comm is the group's aiter CustomAllreduce, or None when custom all-reduce is off
+    if comm is None or comm.disabled or not comm.enable_register_for_capturing:
+        return None
+    coefficients.materialize()
+    return MhcPostOperands(residual, coefficients.post, coefficients.comb)
+
+
+def attention_mhc_fusion(layer, residual, coefficients, forward_batch):
+    if not (
+        _can_fuse_mhc(layer, residual, forward_batch)
+        and layer.self_attn.attn_tp_size == 4
+        and layer.self_attn.wo_b.reduce_results
+    ):
+        return None
+    return _make_mhc_fusion(
+        residual, coefficients, get_parallel().attn_tp_group.ca_comm
+    )
+
+
+def moe_mhc_fusion(layer, residual, coefficients, forward_batch):
+    if not (
+        _can_fuse_mhc(layer, residual, forward_batch)
+        and layer.mlp.tp_size == 4
+        and not layer.mlp._shared_expert_tp1
+        and get_moe_a2a_backend().is_none()
+        # A reduce some later step already owns, or one the combine performed, is
+        # not ours to fuse into the post.
+        and not should_skip_post_experts_all_reduce(is_tp_path=True)
+    ):
+        return None
+    return _make_mhc_fusion(residual, coefficients, get_parallel().tp_group.ca_comm)
+
+
+def apply_attention_mhc(x: torch.Tensor, state: MhcPostOperands) -> torch.Tensor:
+    """Attention's all-reduce fused with hc_post; returns the rebuilt streams."""
+    return all_reduce_mhc_post(
+        x, state.residual, state.post, state.comb, get_parallel().attn_tp_group.ca_comm
+    )
+
+
+def apply_moe_mhc(x: torch.Tensor, state: MhcPostOperands) -> torch.Tensor:
+    """The same for the MoE's post-experts reduce, on rows it merged but left
+    unreduced."""
+    return all_reduce_mhc_post(
+        x, state.residual, state.post, state.comb, get_parallel().tp_group.ca_comm
+    )
+
+
+def _gfx95_dense_post_attention_norm(layer, x: torch.Tensor, coefficients):
+    """layer.post_attention_layernorm(x) hosting the pending reduce + sinkhorn where
+    the gfx950 norm kernel is available; the module norm plus a standalone reduce +
+    sinkhorn elsewhere."""
+    if _is_gfx95_supported:
+        return post_attention_norm(layer, x, coefficients)
+    coefficients.materialize()
+    return layer.post_attention_layernorm(x)

@@ -8,8 +8,6 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from unified_tree_core_inspection_interface import UnifiedTreeCoreInspectionInterface
-
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -27,6 +25,9 @@ from sglang.srt.mem_cache.unified_cache.tree_core_registry import (
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.kits.unified_radix_cache.unified_tree_core_inspection_interface import (
+    UnifiedTreeCoreInspectionInterface,
+)
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -53,7 +54,12 @@ class _StubFullComponent(TreeComponent):
         return None
 
     def evict_component(
-        self, node, device_frees, host_frees, target: EvictLayer = EvictLayer.DEVICE
+        self,
+        node,
+        device_frees,
+        host_frees,
+        cache_actions,
+        target: EvictLayer = EvictLayer.DEVICE,
     ) -> tuple[int, int]:
         return 0, 0
 
@@ -66,7 +72,7 @@ class _StubFullComponent(TreeComponent):
     def _evict_device_start(self, request_cnt) -> None:
         pass
 
-    def _evict_device_next_node(self, tracker, device_frees, host_frees):
+    def _evict_device_next_node(self, tracker, device_frees, host_frees, cache_actions):
         return None
 
     def _evict_device_end(self) -> None:
@@ -280,7 +286,7 @@ class UnifiedRadixCacheTreeCoreSelectionTest(CustomTestCase):
             mock.patch.dict(os.environ),
             mock.patch.dict(tree_core_registry.sys.modules),
             mock.patch.object(tree_core_registry.sys, "platform", "linux"),
-            mock.patch.object(tree_core_registry.torch, "__version__", "2.13.0"),
+            mock.patch.object(tree_core_registry.torch, "__version__", "2.14.1"),
             mock.patch.object(
                 tree_core_registry.importlib.util,
                 "find_spec",
@@ -327,7 +333,7 @@ class UnifiedRadixCacheTreeCoreSelectionTest(CustomTestCase):
                     mock.patch.dict(tree_core_registry.sys.modules),
                     mock.patch.object(tree_core_registry.sys, "platform", "linux"),
                     mock.patch.object(
-                        tree_core_registry.torch, "__version__", "2.13.0"
+                        tree_core_registry.torch, "__version__", "2.14.1"
                     ),
                     mock.patch.object(
                         tree_core_registry.importlib.util,
@@ -357,7 +363,7 @@ class TreeCoreDefaultCompatibilityTest(CustomTestCase):
             mock.patch.dict(os.environ, {"SGLANG_RUST_BUILD_MODE": "auto"}),
             mock.patch.dict(tree_core_registry.sys.modules),
             mock.patch.object(tree_core_registry.sys, "platform", "linux"),
-            mock.patch.object(tree_core_registry.torch, "__version__", "2.13.0"),
+            mock.patch.object(tree_core_registry.torch, "__version__", "2.14.1"),
             mock.patch.object(
                 tree_core_registry.importlib.util, "find_spec", return_value=None
             ),
@@ -497,7 +503,7 @@ class TreeCoreDefaultCompatibilityTest(CustomTestCase):
                 self.assertEqual(
                     select_tree_core_backend(_cache_init_params()), "python"
                 )
-        for version in ("2.10.0", "2.14.0", "unknown"):
+        for version in ("2.10.0", "2.15.0", "unknown"):
             with (
                 self.subTest(version=version),
                 mock.patch.object(tree_core_registry.torch, "__version__", version),

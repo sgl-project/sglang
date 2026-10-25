@@ -10,7 +10,7 @@ from unittest.mock import Mock, patch
 import torch
 import torch.nn.functional as F
 
-from sglang.kernels.ops.attention.dsa import triton_kernel
+from sglang.kernels.ops.quantization import act_quant_triton
 from sglang.srt.layers.attention.dsa import dsa_indexer_kpool as indexer_module
 from sglang.srt.layers.attention.dsa.dsa_indexer_kpool import IndexerKPool
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
@@ -224,6 +224,7 @@ class TestKPoolStreamScheduling(unittest.TestCase):
         )
         batch = SimpleNamespace(
             forward_mode=ForwardMode.EXTEND,
+            seq_lens=torch.tensor([8192 + num_tokens]),
             seq_lens_cpu=torch.tensor([8192 + num_tokens]),
         )
         prepare_qk = Mock(return_value=(x, x, None, None))
@@ -284,7 +285,7 @@ class TestKPoolStreamScheduling(unittest.TestCase):
                 torch.cuda, "current_stream", side_effect=lambda: streams.current
             ),
             patch.object(torch.cuda, "stream", side_effect=streams.use),
-            patch.object(triton_kernel, "act_quant", side_effect=quant),
+            patch.object(act_quant_triton, "act_quant", side_effect=quant),
         ):
             actual = IndexerKPool._forward_cuda_impl(
                 indexer, x, x, torch.arange(num_tokens), batch, 0, return_indices
@@ -416,6 +417,7 @@ def _encoding_topk(*, width, calls):
         row_starts,
         out_rows,
         page_table_row_index,
+        topk_v2_plan=None,
     ):
         calls.append(
             {"page_table": page_table, "page_table_row_index": page_table_row_index}
@@ -670,6 +672,7 @@ class TestKPoolPerRequestChunking(CustomTestCase):
             get_seqlens_expanded=lambda: seqlens_expanded,
             topk_transform_method=TopkTransformMethod.RAGGED,
             attn_metadata=SimpleNamespace(
+                page_size=64,
                 topk_indices_offset=torch.arange(token_nums, dtype=torch.int32) + 100,
             ),
         )
@@ -688,7 +691,8 @@ class TestKPoolPerRequestChunking(CustomTestCase):
             index_kpool=self.POOL,
         )
         with _chunking_patches(
-            rows_per_chunk=rows_per_chunk, kv_pool=SimpleNamespace(page_size=64)
+            rows_per_chunk=rows_per_chunk,
+            kv_pool=SimpleNamespace(page_size=256, index_page_size=64),
         ):
             result = IndexerKPool._get_topk_ragged_kpool(
                 backend,
