@@ -136,6 +136,7 @@ class HcNormed(NamedTuple):
     """Summed and normed; the sublayer can take these rows as they are."""
 
     rows: torch.Tensor
+    mega_moe_input: object = None
 
 
 class HcQuantized(NamedTuple):
@@ -244,6 +245,7 @@ class HcNextBoundary(NamedTuple):
     norm_fusable: bool
     hc: Optional[HcSubLayer] = None
     accepts_mxfp8_deepgemm: bool = False
+    mega_moe: object = None
     mega_moe_input: Optional[Callable[[torch.Tensor], Any]] = None
 
 
@@ -275,6 +277,7 @@ def make_boundary(
     accepts_mxfp8: bool,
     hc: Optional[HcSubLayer] = None,
     accepts_mxfp8_deepgemm: bool = False,
+    mega_moe=None,
     mega_moe_input: Optional[Callable[[torch.Tensor], Any]] = None,
 ) -> HcNextBoundary:
     """Can this hyper-connection's norm fold into the previous post, and does its
@@ -292,6 +295,7 @@ def make_boundary(
         ),
         hc=hc,
         accepts_mxfp8_deepgemm=accepts_mxfp8_deepgemm,
+        mega_moe=mega_moe,
         mega_moe_input=mega_moe_input,
     )
 
@@ -460,6 +464,8 @@ def combine(
             quantized.append(shortcut.pair)
         return shortcut.rows
     if isinstance(shortcut, HcNormed):
+        if quantized is not None and shortcut.mega_moe_input is not None:
+            quantized.append(shortcut.mega_moe_input)
         return shortcut.rows
     return _combine(hc, state, quantized)
 
@@ -679,10 +685,15 @@ def _post_fusion(
         and y.shape[0] > 0
     ):
         next_hc = next.hc
+        mega_moe_input = None
+        if next.mega_moe is not None:
+            from sglang.srt.layers.moe.mega_moe import prepare_mhc_mega_moe_input
+
+            mega_moe_input = prepare_mhc_mega_moe_input(next.mega_moe, y.shape[0])
         y_fp8 = y_sf = moe_input = None
         if next.accepts_mxfp8_deepgemm and fused_mxfp8_rows(y.shape[0]):
             y_fp8, y_sf = empty_deepgemm_mxfp8_pair(*y.shape, y.device)
-        elif next.mega_moe_input is not None:
+        elif mega_moe_input is None and next.mega_moe_input is not None:
             moe_input = next.mega_moe_input(y)
         updated, normalized, stats = mhc_mega_boundary(
             y,
@@ -700,13 +711,21 @@ def _post_fusion(
             next_hc.cfg.sinkhorn_iters,
             y_fp8=y_fp8,
             y_gemm_sf=y_sf,
-            moe_input=None if moe_input is None else moe_input.views(),
+            moe_input=(
+                mega_moe_input.views()
+                if mega_moe_input is not None
+                else None
+                if moe_input is None
+                else moe_input.views()
+            ),
         )
         if y_fp8 is not None:
             return HcState(updated, pre, HcQuantized(normalized, (y_fp8, y_sf)), stats)
         if moe_input is not None:
             moe_input.mark(normalized)
-        return HcState(updated, pre, HcNormed(normalized), stats)
+        if mega_moe_input is not None:
+            mega_moe_input = mega_moe_input._replace(rows=normalized)
+        return HcState(updated, pre, HcNormed(normalized, mega_moe_input), stats)
     if (
         next is not None
         and next.norm_fusable

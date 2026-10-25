@@ -1051,6 +1051,7 @@ class DeepseekV2MoE(nn.Module):
         skip_shared_experts: bool = False,
         return_moe_output: bool = False,
         leave_output_sum: bool = False,
+        prepared_mega_moe_input=None,
     ) -> Union[torch.Tensor, MoEOutput]:
         """``return_moe_output`` asks for the pieces unmerged, as `MoEOutput`; only
         the TP paths honor it. Distinct from `get_forward().defer_moe_finalize`,
@@ -1065,6 +1066,7 @@ class DeepseekV2MoE(nn.Module):
                 hidden_states,
                 forward_batch,
                 input_ids_global=input_ids_global,
+                prepared_input=prepared_mega_moe_input,
             )
 
         use_vision_topk = self.gate.e_score_correction_bias_vl is not None

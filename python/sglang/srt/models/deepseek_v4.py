@@ -3589,6 +3589,9 @@ class DeepseekV4CudaDecoderLayer(DeepseekV4DecoderLayerBase):
                 skip_shared_experts=transport.do_shared_local,
                 return_moe_output=transport.return_moe_output,
                 leave_output_sum=True,
+                prepared_mega_moe_input=residual_batch.written_residual(
+                    forward_batch
+                ).quantized,
             )
             return output.finish(hidden_states)
 
