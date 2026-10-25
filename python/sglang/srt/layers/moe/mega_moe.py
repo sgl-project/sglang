@@ -126,6 +126,7 @@ def _get_mega_moe_symm_buffer(
     num_shared_experts: int = 0,
     *,
     mma_type: str,
+    activation: str = "swiglu",
 ) -> SymmBuffer:
     import deep_gemm
 
@@ -138,6 +139,7 @@ def _get_mega_moe_symm_buffer(
             hidden,
             intermediate_hidden,
             mma_type,
+            activation,
             num_shared_experts,
             deep_gemm.get_num_sms(),
         )
@@ -152,7 +154,7 @@ def _get_mega_moe_symm_buffer(
                 intermediate_hidden,
                 num_shared_experts=num_shared_experts,
                 mma_type=mma_type,
-                activation="swiglu",
+                activation=activation,
             )
             _MEGA_MOE_SYMM_BUFFER[key] = buf
     return buf
@@ -422,6 +424,7 @@ def run_mega_routed_experts(
     num_tokens: int,
     activation_clamp: Optional[float] = None,
     routed_scaling_factor: float = 1.0,
+    activation: str = "swiglu",
     num_shared_experts: int = 0,
     shared_l1_weights=None,
     shared_l2_weights=None,
@@ -454,6 +457,7 @@ def run_mega_routed_experts(
         intermediate_hidden=intermediate_size,
         num_shared_experts=num_shared_experts,
         mma_type=mma_type,
+        activation=activation,
     )
 
     if routing_in_buffer:
@@ -507,6 +511,8 @@ def run_mega_routed_experts(
             "l2_alphas": experts.mega_l2_alphas,
             "l2_act_scales": experts.mega_l2_act_scales,
         }
+        if experts._mega_moe_trtllm_layout:
+            mega_kwargs["weight_layout"] = "trtllm"
     elif mma_type == "mxf4xmxf4":
         # FP4 path goes through DeepGEMM's mega_moe_pre_dispatch which
         # handles the E2M1 packing variant. The jit implementation
@@ -571,7 +577,7 @@ def run_mega_routed_experts(
             buf,
             shared_l1_weights=shared_l1_weights,
             shared_l2_weights=shared_l2_weights,
-            activation="swiglu",
+            activation=activation,
             activation_clamp=activation_clamp,
             fast_math=True,
             **mega_kwargs,
