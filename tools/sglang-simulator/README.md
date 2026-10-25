@@ -1027,6 +1027,20 @@ the shared timing/progress objects. Publishing a result bound to another rank
 fails. This library seam does not coordinate native peers, publish FutureMaps,
 advance clocks or open the public attention-DP2 factory/runtime guards.
 
+An internal TP2/attention-DP2 clock bridge places the existing external
+Ready/Grant Coordinator in the native data-parallel controller. Both native
+schedulers report through their actual CPU TP group; only the leader exchanges
+local IPC with that controller. Native routing retains the original dispatcher,
+explicit routed-DP requests, native load snapshots and budget algorithm, with
+its 20ms refresh cadence evaluated in virtual time. A dispatch generation is
+released only after both schedulers acknowledge actual receipt. One complete
+joint whole-worker result advances time once, and both native callbacks and
+accounting consumption precede global terminal delivery. Profile boundaries
+require both drained owners, combine request statistics using the existing
+formulas and write once. This internal integration does not open the public
+factory, physical-rank or coordinator compatibility guards. CPU transport-double
+controls alone do not establish native scheduler execution or C64 support.
+
 All operations return a new ledger. Keep the original until cost lookup,
 publication and the surrounding transaction succeed. Only typed modeled
 `DSparkStepResult` objects supply pending progress. Settlement preserves the full

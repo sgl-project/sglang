@@ -342,6 +342,39 @@ class Harness:
         self.bridge.close()
 
 
+def test_native_callback_filter_keeps_original_request_completion_owner(harness):
+    """Counterfactual mutation control; this does not diagnose a historical run."""
+    request_id = rid(1)
+    harness.send_payload(request_id)
+
+    def driver(control):
+        control.send(encode_message(Ready("run", 0, [Submit(request_id)])))
+        return decode_grant(control.recv())
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(harness.run_driver, driver)
+        assert len(harness.receive()) == 1
+        req = NativeRequest(request_id)
+        batch = SimpleNamespace(reqs=[req])
+
+        def process():
+            req.output_ids.append(99)
+            req.done = True
+            batch.reqs.clear()
+
+        harness.bridge.process_batch_result(
+            batch,
+            SimpleNamespace(auxiliary_host_output=None),
+            process=process,
+            duration=0.01,
+        )
+        grant = future.result(timeout=3)
+    assert [(row.rid, row.kind) for row in grant.terminals] == [
+        (request_id, "COMPLETED")
+    ]
+    assert request_stats_manager.get_req_stats(request_id).gen_token_latencies == [0.01]
+
+
 @pytest.mark.parametrize("fail", [False, True])
 def test_opt_in_token_ledger_only_finishes_after_native_cleanup(
     monkeypatch, tmp_path, fail

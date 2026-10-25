@@ -434,32 +434,15 @@ class CoordinatedScheduler:
         self, batch, result, *, process: Callable, duration: float | None = None
     ):
         with self._guard():
-            if duration is None:
-                duration = StateManager.get_current_inference_dur()
-            if (
-                not math.isfinite(duration)
-                or duration <= 0
-                or round(duration * 1e9) == 0
-            ):
-                raise ProtocolError(f"invalid predicted batch duration: {duration}")
-            finish_ns = self.clock.now_ns + round(duration * 1e9)
-            self._batch = batch
-            while (
-                self.clock.next_wakeup_ns is not None
-                and self.clock.next_wakeup_ns < finish_ns
-            ):
-                self._advance(self.clock.next_wakeup_ns)
-                self._grant()
-                self._settle()
-            self._advance(finish_ns)
-            self._cleanup_cancelled()
+            finish_ns = self._prepare_result_time(batch, duration)
             attach_timing_output(result, self.clock, self._token_events)
+            requests = tuple(batch.reqs)
             before = {
-                id(req): (len(req.output_ids), req.finished()) for req in batch.reqs
+                id(req): (len(req.output_ids), req.finished()) for req in requests
             }
             ret = process()
             self.scheduler.process_pending_chunked_abort()
-            for req in batch.reqs:
+            for req in requests:
                 stats = request_stats_manager.get_req_stats(req.rid)
                 output_count, finished = before[id(req)]
                 if (
@@ -473,10 +456,35 @@ class CoordinatedScheduler:
                     stats.last_event_time = finish_ns / 1e9
                 if req.finished() and not self.clock.is_terminal(req.rid):
                     self.clock.terminal(req.rid, "COMPLETED")
-            self._batch = None
-            if self.clock.has_terminals or self.clock.next_wakeup_ns == finish_ns:
-                self._grant()
+            self._finish_result_time()
             return ret
+
+    def _prepare_result_time(self, owner, duration):
+        """Advance once before native output; a DP owner supplies paired ACKs."""
+        if duration is None:
+            duration = StateManager.get_current_inference_dur()
+        if not math.isfinite(duration) or duration <= 0 or round(duration * 1e9) == 0:
+            raise ProtocolError(f"invalid predicted batch duration: {duration}")
+        if self._batch is not None:
+            raise ProtocolError("a native result still owns the clock boundary")
+        finish_ns = self.clock.now_ns + round(duration * 1e9)
+        self._batch = owner
+        while (
+            self.clock.next_wakeup_ns is not None
+            and self.clock.next_wakeup_ns < finish_ns
+        ):
+            self._advance(self.clock.next_wakeup_ns)
+            self._grant()
+            self._settle()
+        self._advance(finish_ns)
+        self._cleanup_cancelled()
+        return finish_ns
+
+    def _finish_result_time(self):
+        """Release only after native processing and accounting consumption."""
+        self._batch = None
+        if self.clock.has_terminals or self.clock.next_wakeup_ns == self.clock.now_ns:
+            self._grant()
 
     def on_idle(self) -> None:
         with self._guard():

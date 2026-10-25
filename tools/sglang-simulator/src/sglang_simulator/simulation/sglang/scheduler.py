@@ -541,14 +541,33 @@ class C_SchedulerHook(BaseHook):
                     from sglang_simulator.simulation.sglang.coordinated import (
                         CoordinatedScheduler,
                     )
-
-                    C_SchedulerHook.COORDINATOR = CoordinatedScheduler(
-                        scheduler=self,
-                        endpoint=Envs.coordinator_endpoint(),
-                        pending_work=lambda: _has_pending_dspark_work(
-                            self, C_SchedulerHook.INFERENCE_PREDICTOR
-                        ),
+                    from sglang_simulator.simulation.sglang.dp_coordinated import (
+                        DPCoordinatedScheduler,
+                        internal_endpoint,
+                        native_dp_clock_enabled,
                     )
+
+                    def pending():
+                        return _has_pending_dspark_work(
+                            self, C_SchedulerHook.INFERENCE_PREDICTOR
+                        )
+
+                    if native_dp_clock_enabled():
+                        ports = get_obj_from_args(
+                            "sglang.srt.server_args.PortArgs", *args, **kwargs
+                        )
+                        C_SchedulerHook.COORDINATOR = DPCoordinatedScheduler(
+                            scheduler=self,
+                            tp_group=self.tp_group,
+                            endpoint=internal_endpoint(ports),
+                            pending_work=pending,
+                        )
+                    else:
+                        C_SchedulerHook.COORDINATOR = CoordinatedScheduler(
+                            scheduler=self,
+                            endpoint=Envs.coordinator_endpoint(),
+                            pending_work=pending,
+                        )
             except Exception as e:
                 logger.error(
                     f"Failed to initialize inference time predictor. Error: {e}"
@@ -991,7 +1010,31 @@ class C_SchedulerHook(BaseHook):
 
             return ret
 
-        def override_profile(req, *args, _scheduler=None, **kwargs):
+        def override_profile(
+            req, *args, _scheduler=None, _dp_payload=None, _dp_writer=True, **kwargs
+        ):
+            bridge = C_SchedulerHook.COORDINATOR
+            if _dp_payload is None and callable(
+                getattr(bridge, "profile_boundary", None)
+            ):
+                return bridge.profile_boundary(
+                    req,
+                    snapshot=lambda: {
+                        "profile_stats": deepcopy(
+                            request_stats_manager.get_all_req_stats()
+                        ),
+                        "iterations": deepcopy(C_SchedulerHook.ITERATION_STATS),
+                        "predictor_metrics": C_SchedulerHook.INFERENCE_PREDICTOR.get_metrics(),
+                    },
+                    execute=lambda payload, writer: override_profile(
+                        req,
+                        *args,
+                        _scheduler=_scheduler,
+                        _dp_payload=payload,
+                        _dp_writer=writer,
+                        **kwargs,
+                    ),
+                )
             if getattr(_scheduler, _DSPARK_PENDING_RESULTS, 0):
                 ProfileReqOutput = importlib.import_module(
                     "sglang.srt.managers.io_struct"
@@ -1002,16 +1045,21 @@ class C_SchedulerHook(BaseHook):
                 )
             is_start_profile = req.req_type.name == "START_PROFILE"
             stats: list[RequestStats] = []
-            for item in request_stats_manager.get_all_req_stats():
+            for item in (
+                request_stats_manager.get_all_req_stats()
+                if _dp_payload is None
+                else _dp_payload["profile_stats"]
+            ):
                 if item.rid is not None and item.input_length > 0:
                     stats.append(deepcopy(item))
 
             stats = sorted(stats, key=lambda req: req.created_time)
 
             output_dir = Envs.output_dir()
-            os.makedirs(output_dir, exist_ok=True)
+            if _dp_writer:
+                os.makedirs(output_dir, exist_ok=True)
 
-            if len(stats) > 0:
+            if len(stats) > 0 and _dp_writer:
                 min_created_time = stats[0].created_time
                 # Align timestamps
                 for item in stats:
@@ -1028,9 +1076,22 @@ class C_SchedulerHook(BaseHook):
                     C_SchedulerHook.TOTAL_PREDICTOR_TIME_COST
                 )
                 metrics.update(
-                    calc_iteration_metrics(C_SchedulerHook.ITERATION_STATS, metrics)
+                    calc_iteration_metrics(
+                        C_SchedulerHook.ITERATION_STATS
+                        if _dp_payload is None
+                        else _dp_payload["iterations"],
+                        metrics,
+                    )
                 )
-                metrics.update(C_SchedulerHook.INFERENCE_PREDICTOR.get_metrics())
+                metrics.update(
+                    C_SchedulerHook.INFERENCE_PREDICTOR.get_metrics()
+                    if _dp_payload is None
+                    else _dp_payload["local_predictor_metrics"][0]
+                )
+                if _dp_payload is not None:
+                    metrics["attention_dp_local_predictor_metrics"] = _dp_payload[
+                        "local_predictor_metrics"
+                    ]
                 memory_budget = ConfigManager.get_memory_budget_metrics()
                 if memory_budget is not None:
                     metrics["memory_budget"] = memory_budget
@@ -1040,7 +1101,11 @@ class C_SchedulerHook(BaseHook):
                         f.write(json.dumps(metrics, cls=CustomJsonEncoder) + "\n")
 
                     with open(f"{output_dir}/iteration.jsonl", "w") as f:
-                        for item in C_SchedulerHook.ITERATION_STATS:
+                        for item in (
+                            C_SchedulerHook.ITERATION_STATS
+                            if _dp_payload is None
+                            else _dp_payload["iterations"]
+                        ):
                             f.write(json.dumps(item) + "\n")
 
                     with open(f"{output_dir}/request.jsonl", "w") as f:

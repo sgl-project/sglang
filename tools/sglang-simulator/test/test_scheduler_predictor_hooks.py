@@ -584,6 +584,64 @@ def test_dspark_profile_reset_requires_pending_results_to_drain(
     assert getattr(test.target, scheduler._DSPARK_WALL_CREDIT) == 0
 
 
+@pytest.mark.parametrize("writer", [False, True])
+def test_dp_profile_uses_existing_metrics_once_for_combined_request_stats(
+    hooked_scheduler, monkeypatch, tmp_path, writer
+):
+    """Exercise the installed real profile callback, not a replacement writer."""
+    import json
+
+    from sglang_simulator.simulation.types import RequestStats
+
+    test = hooked_scheduler
+    mock_profile_output(monkeypatch)
+    monkeypatch.setattr(
+        scheduler.Envs, "output_dir", classmethod(lambda cls: str(tmp_path))
+    )
+    combined = [
+        RequestStats(
+            rid=rid,
+            input_length=10,
+            output_length=2,
+            created_time=1.0,
+            queue_start=1.0,
+            queue_end=1.1,
+            last_event_time=1.5,
+            gen_token_latencies=[0.2, 0.2],
+        )
+        for rid in ("dp0", "dp1")
+    ]
+    predictor_metrics = [{"global_cost_once": 5}, {"global_cost_once": 0}]
+
+    def profile_boundary(req, *, snapshot, execute):
+        local = snapshot()
+        assert set(local) == {"profile_stats", "iterations", "predictor_metrics"}
+        return execute(
+            {
+                "profile_stats": combined,
+                "iterations": [],
+                "local_predictor_metrics": predictor_metrics,
+            },
+            writer,
+        )
+
+    test.hook.COORDINATOR = SimpleNamespace(profile_boundary=profile_boundary)
+    profile = next(iter(test.target._request_dispatcher._mapping.values()))
+    assert profile(test.profile_req).success
+    if writer:
+        metrics = json.loads((tmp_path / "metrics.json").read_text())
+        rows = [
+            json.loads(line)
+            for line in (tmp_path / "request.jsonl").read_text().splitlines()
+        ]
+        assert [row["rid"] for row in rows] == ["dp0", "dp1"]
+        assert metrics["global_cost_once"] == 5
+        assert metrics["attention_dp_local_predictor_metrics"] == predictor_metrics
+    else:
+        assert not list(tmp_path.iterdir())
+    assert test.hook.ITERATION_STATS == []
+
+
 def test_coordinator_active_at_dspark_launch_consumes_result_owned_accounting(
     hooked_scheduler, monkeypatch, tmp_path
 ):

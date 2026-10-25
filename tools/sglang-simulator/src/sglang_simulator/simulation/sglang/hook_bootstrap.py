@@ -62,6 +62,9 @@ def install_simulator_hooks() -> None:
         ]
     )
     if os.getenv("SGLANG_SIMULATOR_COORDINATOR"):
+        from sglang_simulator.simulation.sglang.dp_coordinated import (
+            C_DPCoordinatedHook,
+        )
         from sglang_simulator.simulation.sglang.timing_metadata import (
             C_TimingChatHook,
             C_TimingOutputStreamerHook,
@@ -69,7 +72,12 @@ def install_simulator_hooks() -> None:
         )
 
         sglang_simulator_hook.install_class_hooks(
-            [C_TimingOutputStreamerHook, C_TimingTokenizerHook, C_TimingChatHook]
+            [
+                C_TimingOutputStreamerHook,
+                C_TimingTokenizerHook,
+                C_TimingChatHook,
+                C_DPCoordinatedHook,
+            ]
         )
     _HOOKS_INSTALLED = True
 
