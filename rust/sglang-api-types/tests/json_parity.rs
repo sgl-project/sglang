@@ -36,23 +36,11 @@ fn fixtures_decode_to_their_canonical_bytes() {
         let ty = case["type"].as_str().expect("type");
         let name = format!("{ty}: {}", case["name"].as_str().expect("name"));
         let input = &case["input"];
-        if case["error"] == true {
-            assert_eq!(ty, "GenerateStreamItem", "unsupported rejection fixture");
-            assert!(
-                serde_json::from_value::<api::GenerateStreamItem>(input.clone()).is_err(),
-                "{name}: invalid input decoded"
-            );
-            continue;
-        }
         let canonical = case["canonical"].as_str().expect("canonical");
         match ty {
             "GenerateRequest" => check::<api::GenerateRequest>(&name, input, canonical),
             "SamplingParams" => check::<api::SamplingParams>(&name, input, canonical),
             "GenerateResponse" => check::<api::GenerateResponse>(&name, input, canonical),
-            "GenerateStreamItem" => check::<api::GenerateStreamItem>(&name, input, canonical),
-            "GenerateResponseOrList" => {
-                check::<api::GenerateResponseOrList>(&name, input, canonical)
-            }
             "GenerateStreamError" => check::<api::GenerateStreamError>(&name, input, canonical),
             "GetModelInfoResponse" => check::<api::GetModelInfoResponse>(&name, input, canonical),
             "GetServerInfoResponse" => check::<api::GetServerInfoResponse>(&name, input, canonical),

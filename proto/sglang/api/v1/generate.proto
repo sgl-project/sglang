@@ -230,21 +230,6 @@ message GenerateResponse {
   TokenIds prompt_token_ids = 5;
 }
 
-// HTTP /generate returns one outcome or a bare array of outcomes. Batch items
-// fail independently, so each entry can be a frame or an error (as in gRPC).
-message GenerateResponseOrList {
-  oneof value {
-    option (sglang.json.v1.oneof_json).shape = ONEOF_SHAPE_ONE_OR_MANY;
-    GenerateStreamItem one = 1;
-    GenerateResponseList many = 2;
-  }
-}
-
-message GenerateResponseList {
-  option (sglang.json.v1.message_json).shape = MESSAGE_SHAPE_BARE_LIST;
-  repeated GenerateStreamItem items = 1;
-}
-
 // One request's failure inside a Generate stream; carries its batch position
 // (the HTTP SSE shape puts `index` beside the error object the same way).
 message GenerateStreamError {
@@ -252,13 +237,11 @@ message GenerateStreamError {
   optional uint32 index = 2;
 }
 
-// One generation outcome: a frame or one request's failure. gRPC identifies
-// the outcome by its oneof tag. HTTP uses a flat object, selected by the error
-// key's presence, for unary results, batch entries, and SSE frames. A failure
-// does not stop other requests in the batch.
+// One item of the gRPC Generate stream: a frame, or one request's failure
+// (the stream continues — other batch items may still be running). On HTTP
+// the same failure is an in-stream SSE error frame.
 message GenerateStreamItem {
   oneof item {
-    option (sglang.json.v1.oneof_json).shape = ONEOF_SHAPE_UNTAGGED;
     GenerateResponse frame = 1;
     GenerateStreamError error = 2;
   }

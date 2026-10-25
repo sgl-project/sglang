@@ -122,18 +122,13 @@ class TestCrossLanguageFixtures(CustomTestCase):
         self.assertTrue(cases)
         for case in cases:
             with self.subTest(case=f"{case['type']}: {case['name']}"):
-                decode = getattr(api_types, f"decode_{case['type']}")
-                encode = getattr(api_types, f"encode_{case['type']}")
-                if case.get("error"):
-                    with self.assertRaises(api_types.JsonContractError):
-                        decode(case["input"])
-                    continue
-                decoded = decode(case["input"])
-                self.assertEqual(compact(encode(decoded)), case["canonical"])
-                again = decode(json.loads(case["canonical"]))
-                self.assertEqual(compact(encode(again)), case["canonical"])
+                cls = getattr(api_types, case["type"])
+                decoded = cls.from_json_value(case["input"])
+                self.assertEqual(compact(decoded.to_json_value()), case["canonical"])
+                again = cls.from_json_value(json.loads(case["canonical"]))
+                self.assertEqual(compact(again.to_json_value()), case["canonical"])
 
-    def test_every_fixture_type_is_generated(self):
+    def test_every_fixture_type_is_a_generated_struct(self):
         """A fixture naming a type the Python module lacks would be skipped
         silently by a lookup-by-name; make it a failure."""
         for case in load_fixtures():

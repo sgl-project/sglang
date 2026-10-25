@@ -597,54 +597,6 @@
         "hicache_write_policy": ""
       },
       "canonical": "{\"hicache_storage_backend\":\"file\",\"hicache_storage_backend_extra_config_json\":\"\",\"hicache_storage_prefetch_policy\":\"\",\"hicache_write_policy\":\"\"}"
-    },
-    {
-      "type": "GenerateStreamItem",
-      "name": "token-only output is a frame",
-      "input": {
-        "index": 2,
-        "output_ids": [
-          4000000000
-        ]
-      },
-      "canonical": "{\"text\":\"\",\"output_ids\":[4000000000],\"index\":2}"
-    },
-    {
-      "type": "GenerateResponseOrList",
-      "name": "batch preserves independent success and error outcomes",
-      "input": [
-        {
-          "text": "ok",
-          "index": 0
-        },
-        {
-          "index": 1,
-          "error": {
-            "code": 503,
-            "message": "busy"
-          }
-        }
-      ],
-      "canonical": "[{\"text\":\"ok\",\"index\":0},{\"error\":{\"message\":\"busy\",\"code\":503},\"index\":1}]"
-    },
-    {
-      "type": "GenerateResponseOrList",
-      "name": "single error outcome",
-      "input": {
-        "error": {
-          "message": "bad sampling",
-          "code": 400
-        }
-      },
-      "canonical": "{\"error\":{\"message\":\"bad sampling\",\"code\":400}}"
-    },
-    {
-      "type": "GenerateStreamItem",
-      "name": "explicit null error is rejected",
-      "input": {
-        "error": null
-      },
-      "error": true
     }
   ]
 }

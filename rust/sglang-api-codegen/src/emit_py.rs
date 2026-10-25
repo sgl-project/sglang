@@ -803,11 +803,6 @@ fn one_arm(ctx: &Ctx, name: &str, one: &VariantModel) -> OneArm {
                     },
             } => OneArm::ListOfScalar(rust_path.clone(), ty.clone()),
             MessageKind::Struct { .. } => OneArm::Class(rust_path.clone()),
-            MessageKind::Untagged { .. }
-                if py_message_shapes(ctx, rust_path).0 == vec![PyShape::Dict] =>
-            {
-                OneArm::Class(rust_path.clone())
-            }
             other => panic!("{name}: unsupported one arm {rust_path} ({other:?})"),
         },
         other => panic!("{name}: unsupported one arm {other:?}"),
@@ -1012,12 +1007,6 @@ fn emit_untagged_codec(out: &mut String, ctx: &Ctx, m: &MessageModel, variants: 
     ] {
         let claimants: Vec<&Arm> = arms.iter().filter(|a| a.shapes.contains(&shape)).collect();
         if claimants.is_empty() {
-            continue;
-        }
-        if shape == PyShape::Dict && name == "GenerateStreamItem" {
-            de.push_str(
-                "    if isinstance(value, dict):\n        if \"error\" in value:\n            payload = decode_GenerateStreamError(value)\n            if payload.error is None:\n                raise _invalid_type(None, expected=\"struct ErrorBody\")\n            return payload\n        return decode_GenerateResponse(value)\n",
-            );
             continue;
         }
         if shape != PyShape::List && claimants.len() > 1 {

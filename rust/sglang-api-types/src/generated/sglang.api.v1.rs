@@ -625,28 +625,6 @@ pub struct GenerateResponse {
     #[prost(message, optional, tag = "5")]
     pub prompt_token_ids: ::core::option::Option<TokenIds>,
 }
-/// HTTP /generate returns one outcome or a bare array of outcomes. Batch items
-/// fail independently, so each entry can be a frame or an error (as in gRPC).
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct GenerateResponseOrList {
-    #[prost(oneof = "generate_response_or_list::Value", tags = "1, 2")]
-    pub value: ::core::option::Option<generate_response_or_list::Value>,
-}
-/// Nested message and enum types in `GenerateResponseOrList`.
-pub mod generate_response_or_list {
-    #[derive(Clone, PartialEq, ::prost::Oneof)]
-    pub enum Value {
-        #[prost(message, tag = "1")]
-        One(super::GenerateStreamItem),
-        #[prost(message, tag = "2")]
-        Many(super::GenerateResponseList),
-    }
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct GenerateResponseList {
-    #[prost(message, repeated, tag = "1")]
-    pub items: ::prost::alloc::vec::Vec<GenerateStreamItem>,
-}
 /// One request's failure inside a Generate stream; carries its batch position
 /// (the HTTP SSE shape puts `index` beside the error object the same way).
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -656,10 +634,9 @@ pub struct GenerateStreamError {
     #[prost(uint32, optional, tag = "2")]
     pub index: ::core::option::Option<u32>,
 }
-/// One generation outcome: a frame or one request's failure. gRPC identifies
-/// the outcome by its oneof tag. HTTP uses a flat object, selected by the error
-/// key's presence, for unary results, batch entries, and SSE frames. A failure
-/// does not stop other requests in the batch.
+/// One item of the gRPC Generate stream: a frame, or one request's failure
+/// (the stream continues — other batch items may still be running). On HTTP
+/// the same failure is an in-stream SSE error frame.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct GenerateStreamItem {
     #[prost(oneof = "generate_stream_item::Item", tags = "1, 2")]

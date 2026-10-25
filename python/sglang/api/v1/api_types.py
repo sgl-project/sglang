@@ -877,9 +877,6 @@ NullableTopLogprobs = Optional[TopLogprobRow]
 # sglang.api.v1.HiddenStateRow: JSON bare array.
 HiddenStateRow = List[float]
 
-# sglang.api.v1.GenerateStreamItem: JSON: the value's shape picks the arm.
-GenerateStreamItem = Union[GenerateResponse, GenerateStreamError]
-
 # sglang.api.v1.ImageGridThw: JSON bare array.
 ImageGridThw = List[Int64List]
 
@@ -931,14 +928,8 @@ KvHintsEnvelopeList = List[OptionalKvHintsEnvelope]
 # sglang.api.v1.SamplingParamsOrList: JSON: one value or an array of values.
 SamplingParamsOrList = Union[SamplingParams, SamplingParamsList]
 
-# sglang.api.v1.GenerateResponseList: JSON bare array.
-GenerateResponseList = List[GenerateStreamItem]
-
 # sglang.api.v1.KvHintsEnvelopeOrList: JSON: one value or an array of values.
 KvHintsEnvelopeOrList = Union[KvHintsEnvelope, KvHintsEnvelopeList]
-
-# sglang.api.v1.GenerateResponseOrList: JSON: one value or an array of values.
-GenerateResponseOrList = Union[GenerateStreamItem, GenerateResponseList]
 
 
 # ---- codecs: parsed JSON value <-> Python value ----
@@ -1888,26 +1879,6 @@ def encode_GenerateResponse(v: GenerateResponse) -> Dict[str, Any]:
     return d
 
 
-def decode_GenerateResponseOrList(value: Any) -> GenerateResponseOrList:
-    if isinstance(value, list):
-        return decode_GenerateResponseList(value)
-    return decode_GenerateStreamItem(_expect_map(value, expected="a value or an array of values for GenerateResponseOrList"))
-
-
-def encode_GenerateResponseOrList(v: GenerateResponseOrList) -> Any:
-    if isinstance(v, list):
-        return encode_GenerateResponseList(v)
-    return encode_GenerateStreamItem(v)
-
-
-def decode_GenerateResponseList(value: Any) -> GenerateResponseList:
-    return [decode_GenerateStreamItem(e) for e in _expect_seq(value, expected="a sequence")]
-
-
-def encode_GenerateResponseList(v: GenerateResponseList) -> List[Any]:
-    return [encode_GenerateStreamItem(e) for e in v]
-
-
 def decode_GenerateStreamError(value: Any) -> GenerateStreamError:
     m = _expect_map(value, expected="struct GenerateStreamError")
     kw: Dict[str, Any] = {}
@@ -1926,25 +1897,6 @@ def encode_GenerateStreamError(v: GenerateStreamError) -> Dict[str, Any]:
     if v.index is not None:
         d["index"] = v.index
     return d
-
-
-def decode_GenerateStreamItem(value: Any) -> GenerateStreamItem:
-    if isinstance(value, dict):
-        if "error" in value:
-            payload = decode_GenerateStreamError(value)
-            if payload.error is None:
-                raise _invalid_type(None, expected="struct ErrorBody")
-            return payload
-        return decode_GenerateResponse(value)
-    raise _invalid_type(value, expected="one of the GenerateStreamItem shapes")
-
-
-def encode_GenerateStreamItem(v: GenerateStreamItem) -> Any:
-    if isinstance(v, (GenerateResponse,)):
-        return encode_GenerateResponse(v)
-    if isinstance(v, (GenerateStreamError,)):
-        return encode_GenerateStreamError(v)
-    return v
 
 
 _FIELDS_MediaRef = ("url", "detail", "max_dynamic_patch", "content_hash", "min_pixels", "max_pixels", "total_max_pixels", "fps", "num_frames", "min_frames", "max_frames", "max_tokens_per_frame", "max_image_tokens", "use_audio", "image_grid_thw",)
