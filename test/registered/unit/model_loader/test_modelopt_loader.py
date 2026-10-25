@@ -866,8 +866,6 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
         lm_head.alpha = nn.Parameter(torch.empty(1))
         lm_head.input_size_per_partition = 2048
         lm_head.output_size_per_partition = 128
-        lm_head.weight_scale_mma = lm_head.weight_scale_interleaved
-        lm_head.weight_global_scale = nn.Parameter(torch.empty(1))
         quant_method = ModelOptFp4LinearMethod(ModelOptFp4Config())
         quant_method.quant_mode = "w4a16"
 

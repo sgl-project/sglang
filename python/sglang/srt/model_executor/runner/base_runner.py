@@ -720,7 +720,7 @@ class BaseRunner(ABC):
                 buffers.num_token_non_padded if enable_num_token_non_padded() else None
             ),
             global_forward_mode=capture_forward_mode,
-            global_moe_forward_phase=moe_forward_phase_override,
+            moe_forward_phase_override=moe_forward_phase_override,
             lora_ids=lora_ids,
         )
         mr.kv_index_translator.bind_runner_slots(forward_batch)

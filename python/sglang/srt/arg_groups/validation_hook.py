@@ -30,6 +30,46 @@ from sglang.srt.utils.runai_utils import is_runai_obj_uri
 logger = logging.getLogger(__name__)
 
 
+def validate_nvfp4_phase_attention_dp(server_args: Any) -> None:
+    """Keep precision selection uniform across attention-DP ranks."""
+    cfg = resolving_view(server_args)
+    if not attn_dp_enabled_of(cfg):
+        return
+
+    phase_settings = []
+    per_token = envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.get()
+    if isinstance(per_token, str):
+        phase_settings.append(
+            f"SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION={per_token}"
+        )
+
+    w4a16 = envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()
+    if isinstance(w4a16, str):
+        moe_backends = {cfg.moe_runner_backend}
+        if cfg.speculative_algorithm not in (None, "NGRAM"):
+            moe_backends.add(
+                cfg.speculative_moe_runner_backend or cfg.moe_runner_backend
+            )
+        # Match initialize_fp4_gemm_config without importing GPU kernel modules.
+        dense_cutedsl = cfg.fp4_gemm_runner_backend == "flashinfer_cutedsl" or (
+            cfg.fp4_gemm_runner_backend == "auto" and get_platform().is_sm100
+        )
+        # W4A16 is a no-op on other backends, including TRTLLM MoE.
+        if dense_cutedsl or moe_backends.intersection(
+            {"flashinfer_cutedsl", "flashinfer_megamoe"}
+        ):
+            phase_settings.append(f"SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16={w4a16}")
+
+    if phase_settings:
+        raise ValueError(
+            "Phase-specific NVFP4 settings are not supported with attention DP "
+            "(--attn-dp-size or EP scale joining): "
+            f"{', '.join(phase_settings)}. Attention-DP ranks can execute prefill "
+            "and decode concurrently. Use global true/1 or false/0 settings, "
+            "or disable attention DP."
+        )
+
+
 def check_watermark_server_args(server_args: Any) -> None:
     cfg = resolving_view(server_args)
     if cfg.watermark_config is not None and not cfg.enable_watermark:
@@ -172,6 +212,8 @@ def check_server_args(server_args: Any):
     from sglang.srt.arg_groups.lora_hook import check_lora_server_args
 
     cfg = resolving_view(server_args)
+
+    validate_nvfp4_phase_attention_dp(server_args)
 
     # Check parallel size constraints
     if cfg.ep_join_mode != "scale":

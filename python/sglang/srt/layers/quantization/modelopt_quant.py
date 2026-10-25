@@ -1795,6 +1795,13 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
             if w4a16 and get_fp4_gemm_runner_backend().is_flashinfer_cutedsl()
             else "w4a4"
         )
+        if self.quant_mode == "phase" and not get_platform().is_sm100:
+            raise ValueError(
+                "Phase-specific SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16 for dense "
+                "CuTe DSL requires SM100-family GPUs, where W4A4 and W4A16 share "
+                "the same weight layout. Use a global true/1 or false/0 setting "
+                "on other architectures."
+            )
 
     def create_weights(
         self,
@@ -1890,7 +1897,22 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         input_scale_2 = layer.input_scale.max().to(torch.float32)
         weight_scale_2 = layer.weight_scale_2.max().to(torch.float32)
 
-        if self.quant_mode not in ("w4a4", "w4a16", "phase"):
+        if self.quant_mode == "w4a16":
+            from flashinfer import prepare_bf16_fp4_weights
+
+            # Preserve FlashInfer's architecture-specific global W4A16 layout.
+            # SM110/SM120 use a different representation from W4A4.
+            weight, weight_scale, alpha = prepare_bf16_fp4_weights(
+                layer.weight,
+                swizzle_blockscale(layer.weight_scale),
+                weight_scale_2.reshape(1),
+                backend=get_fp4_gemm_runner_backend().get_flashinfer_backend(),
+            )
+            copy_or_rebind_param(layer, "weight", weight)
+            copy_or_rebind_param(layer, "weight_scale_interleaved", weight_scale)
+            copy_or_rebind_param(layer, "alpha", alpha)
+            return
+        elif self.quant_mode not in ("w4a4", "phase"):
             raise ValueError(f"Unsupported FP4 GEMM quant mode: {self.quant_mode}")
 
         # alpha / input_scale_inv stay as scalar Parameters. Aliasing them into
@@ -2017,9 +2039,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
             layer, "weight_scale", "weight_scale_interleaved", padded_scales
         )
 
-        if get_fp4_gemm_runner_backend().is_flashinfer_cutedsl() and not getattr(
-            layer, "_interleave_for_swiglu_fusion", False
-        ):
+        if self.quant_mode == "phase":
             from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
 
             # Both kernels consume the same packed weights and swizzled scales.
@@ -2161,20 +2181,26 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
                 x = x * layer.pre_quant_scale
             input_shape = x.shape
             x = x.reshape(-1, x.shape[-1])
-            padded_k = layer.weight.shape[1] * 2
-            if x.shape[1] != padded_k:
-                x = torch.nn.functional.pad(x, (0, padded_k - x.shape[1]))
+            weight_scale = layer.weight_scale_interleaved
+            alpha = layer.alpha
+            if self.quant_mode == "phase":
+                weight_scale = layer.weight_scale_mma
+                alpha = layer.weight_global_scale
+                padded_k = layer.weight.shape[1] * 2
+                if x.shape[1] != padded_k:
+                    x = torch.nn.functional.pad(x, (0, padded_k - x.shape[1]))
             out = fp4_gemm(
                 x,
                 layer.weight,
                 None,
-                layer.weight_scale_mma,
-                layer.weight_global_scale,
+                weight_scale,
+                alpha,
                 torch.bfloat16,
                 layer.output_size_per_partition,
                 quant_mode,
             )
-            out = slice_nvfp4_output(out, layer.output_size_per_partition)
+            if self.quant_mode == "phase":
+                out = slice_nvfp4_output(out, layer.output_size_per_partition)
             if bias is not None:
                 out = out + bias
             return out.view(*input_shape[:-1], layer.output_size_per_partition)
@@ -3276,25 +3302,14 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 FlashInferMegaMoeQuantInfo,
                 ensure_nvfp4_moe_layer_for_flashinfer_megamoe,
             )
-            from sglang.srt.layers.moe.phase import is_w4a16_enabled
 
-            use_w4a16 = is_w4a16_enabled()
-            mega = ensure_nvfp4_moe_layer_for_flashinfer_megamoe(
-                layer, use_w4a16=use_w4a16
-            )
+            mega = ensure_nvfp4_moe_layer_for_flashinfer_megamoe(layer)
+            use_w4a16 = envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.enabled_for_all()
             quant_info = FlashInferMegaMoeQuantInfo(
                 mega=mega,
-                mega_forward=layer._flashinfer_megamoe_nvfp4_states[use_w4a16][1],
-                fc1_alpha=(
-                    getattr(layer, "_w4a16_g1_alphas", layer.g1_alphas)
-                    if use_w4a16
-                    else layer.g1_alphas
-                ),
-                fc2_alpha=(
-                    getattr(layer, "_w4a16_g2_alphas", layer.g2_alphas)
-                    if use_w4a16
-                    else layer.g2_alphas
-                ),
+                mega_forward=layer._flashinfer_megamoe_forward,
+                fc1_alpha=layer.g1_alphas,
+                fc2_alpha=layer.g2_alphas,
                 fc1_norm_const=None if use_w4a16 else layer.w2_input_scale_quant,
                 apply_routed_scaling_factor=(
                     not layer.should_fuse_routed_scaling_factor_in_topk

@@ -208,10 +208,6 @@ def prepare_for_draft_extend(
         extend_position_info=extend_position_info,
         kv_loc_plan=None if widen else kv_loc_plan,
     )
-    if not forward_batch.dp_spec_prefill_coordination_applied:
-        # Idle ranks retain IDLE instead of DRAFT_EXTEND_V2. Publish decode
-        # for them too, unless a coordinated stage also includes real prompts.
-        forward_batch.global_moe_forward_phase = "decode"
     # Forward sees post-write length (draft extend writes num_draft_tokens
     # slots); mutation stays on forward_batch to preserve SB.seq_lens.
     forward_batch.seq_lens = (

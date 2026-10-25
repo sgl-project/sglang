@@ -25,11 +25,10 @@ from sglang.srt.model_executor.forward_context import (  # noqa: E402
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-def _batch(mode, *, global_phase=None):
+def _batch(mode, *, phase_override=None):
     return SimpleNamespace(
         forward_mode=mode,
-        global_forward_mode=None,
-        global_moe_forward_phase=global_phase,
+        moe_forward_phase_override=phase_override,
         # Capture deliberately clears this communication flag.
         is_extend_in_batch=False,
         moe_num_token_non_padded=lambda: None,
@@ -58,19 +57,15 @@ class TestMoeForwardPhase(CustomTestCase):
                         "prefill" if mode in prefill_modes else "decode",
                     )
 
-    def test_mlp_global_phase_wins_over_local_decode_and_idle(self):
-        for mode in (ForwardMode.DECODE, ForwardMode.IDLE, ForwardMode.TARGET_VERIFY):
-            with self.subTest(mode=mode):
+    def test_dummy_forward_can_warm_both_phases_with_the_same_attention_mode(self):
+        for phase in ("prefill", "decode"):
+            with self.subTest(phase=phase):
                 self.assertEqual(
-                    moe_forward_phase_from_batch(_batch(mode, global_phase="prefill")),
-                    "prefill",
+                    moe_forward_phase_from_batch(
+                        _batch(ForwardMode.EXTEND, phase_override=phase)
+                    ),
+                    phase,
                 )
-        self.assertEqual(
-            moe_forward_phase_from_batch(
-                _batch(ForwardMode.DRAFT_EXTEND_V2, global_phase="prefill")
-            ),
-            "decode",
-        )
 
     def test_nested_attention_override_preserves_phase_and_restores_on_error(self):
         with forward_context(
@@ -88,25 +83,6 @@ class TestMoeForwardPhase(CustomTestCase):
                     raise RuntimeError("child failed")
             self.assertIs(get_forward_context(), parent)
         self.assertFalse(has_forward_context())
-
-    def test_coordinated_speculative_stages_choose_the_same_phase_on_all_ranks(self):
-        for mode in (
-            ForwardMode.EXTEND,
-            ForwardMode.DRAFT_EXTEND_V2,
-            ForwardMode.TARGET_VERIFY,
-            ForwardMode.IDLE,
-        ):
-            for phase in ("prefill", "decode"):
-                with self.subTest(mode=mode, phase=phase):
-                    batch = _batch(mode, global_phase=phase)
-                    batch.dp_spec_prefill_coordination_applied = True
-                    self.assertEqual(moe_forward_phase_from_batch(batch), phase)
-        self.assertEqual(
-            moe_forward_phase_from_batch(
-                _batch(ForwardMode.IDLE, global_phase="decode")
-            ),
-            "decode",
-        )
 
     def test_tbo_stage_binds_its_own_batch_phase(self):
         seen = []

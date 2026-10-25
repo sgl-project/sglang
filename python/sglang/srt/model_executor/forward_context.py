@@ -86,19 +86,14 @@ def get_req_to_token_pool() -> ReqToTokenPool:
 
 
 def moe_forward_phase_from_batch(forward_batch: ForwardBatch) -> str:
-    """Resolve the phase of the MLP token batch, including attention-DP peers."""
+    """Classify prompt work as prefill and speculative/generated work as decode."""
+    phase = getattr(forward_batch, "moe_forward_phase_override", None)
+    if phase is not None:
+        return phase
     mode = getattr(forward_batch, "forward_mode", None)
     if mode is None:
         return _current.moe_forward_phase if _current is not None else "decode"
-    if mode.is_draft_extend_v2() and not getattr(
-        forward_batch, "dp_spec_prefill_coordination_applied", False
-    ):
-        return "decode"
-    phase = getattr(forward_batch, "global_moe_forward_phase", None)
-    if phase is not None:
-        return phase
-    mode = getattr(forward_batch, "global_forward_mode", None) or mode
-    return "prefill" if mode.is_moe_prefill() else "decode"
+    return "prefill" if mode.is_extend_without_speculative() else "decode"
 
 
 @contextmanager

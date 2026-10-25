@@ -163,7 +163,12 @@ class TestNvFp4LinearBackends(CustomTestCase):
         self._run_backend("flashinfer_cutedsl")
 
     def test_phase_specific_cutedsl_matches_global_modes_and_cuda_graphs(self):
-        x = torch.randn((16, 512), device="cuda", dtype=torch.bfloat16) / 10
+        for shape in ((16, 256, 512), (5, 160, 336)):
+            with self.subTest(shape=shape):
+                self._run_phase_specific_cutedsl_shape(*shape)
+
+    def _run_phase_specific_cutedsl_shape(self, m, n, k):
+        x = torch.randn((m, k), device="cuda", dtype=torch.bfloat16) / 10
         setting = envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16
         with mock.patch.object(
             fp4_utils,
@@ -174,7 +179,7 @@ class TestNvFp4LinearBackends(CustomTestCase):
             for enabled in (False, True):
                 with setting.override(enabled):
                     torch.manual_seed(7)
-                    control, _ = _make_quantized_layer(256, 512)
+                    control, _ = _make_quantized_layer(n, k)
                     control.quant_method.process_weights_after_loading(control)
                     controls[enabled] = control(x)[0].clone()
             for enabled_phase in ("prefill", "decode"):
@@ -183,7 +188,7 @@ class TestNvFp4LinearBackends(CustomTestCase):
                     setting.override(enabled_phase),
                 ):
                     torch.manual_seed(7)
-                    layer, _ = _make_quantized_layer(256, 512)
+                    layer, _ = _make_quantized_layer(n, k)
                     layer.quant_method.process_weights_after_loading(layer)
                     self.assertEqual(
                         layer.weight_scale_mma.untyped_storage().data_ptr(),

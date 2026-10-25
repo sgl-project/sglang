@@ -342,18 +342,6 @@ def _update_gather_batch(
         batch.is_extend_in_batch = mlp_sync_info.is_extend_in_batch
         batch.tbo_split_seq_index = mlp_sync_info.tbo_split_seq_index
         batch.global_forward_mode = mlp_sync_info.global_forward_mode
-        # All MLP ranks must choose the same activation precision,
-        # including idle ranks and mixed decode/prefill steps. The existing
-        # gathered modes distinguish real prompts from TARGET_VERIFY, whereas
-        # is_extend_in_batch includes verification and cannot make that choice.
-        batch.global_moe_forward_phase = (
-            "prefill"
-            if any(
-                ForwardMode(mode).is_moe_prefill()
-                for mode in mlp_sync_info.tp0_info_cpu[:, 5].tolist()
-            )
-            else "decode"
-        )
 
     # Check forward mode for cuda graph
     batch.can_run_decode_cuda_graph = mlp_sync_info.can_run_decode_cuda_graph

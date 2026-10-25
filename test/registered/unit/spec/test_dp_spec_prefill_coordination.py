@@ -102,10 +102,6 @@ class TestDPSpecPrefillCoordinationPlan(CustomTestCase):
                             [logprobs[rank]] if local_only else logprobs,
                         )
                         self.assertTrue(batch.dp_spec_prefill_coordination_applied)
-                        self.assertEqual(
-                            batch.global_moe_forward_phase,
-                            "decode" if phase == "draft" else "prefill",
-                        )
                         self.assertTrue(batch.is_extend_in_batch)
                         self.assertFalse(batch.can_run_decode_cuda_graph)
                         self.assertFalse(batch.can_run_dp_prefill_cuda_graph)
@@ -137,12 +133,7 @@ class TestDPSpecPrefillCoordinationPlan(CustomTestCase):
                     num_tokens_for_logprob=32,
                     global_num_tokens=[32, 7],
                     global_num_tokens_for_logprob=[32, 7],
-                    tp0_info_cpu=torch.tensor(
-                        [
-                            [32, 32, 1, 0, 0, ForwardMode.DECODE.value],
-                            [7, 7, 1, 0, 0, ForwardMode.DECODE.value],
-                        ]
-                    ),
+                    tp0_info_cpu=torch.tensor([[32, 32, 1, 0], [7, 7, 1, 0]]),
                     is_extend_in_batch=False,
                     tbo_split_seq_index=None,
                     global_forward_mode=ForwardMode.DECODE,

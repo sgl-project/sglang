@@ -241,7 +241,6 @@ def _init_flashinfer_megamoe_layer_state(layer: FusedMoE) -> None:
     layer._flashinfer_megamoe_layer = None
     layer._flashinfer_megamoe_forward = None
     layer._flashinfer_megamoe_input_norm_const = None
-    layer._flashinfer_megamoe_nvfp4_states = {}
 
 
 def _get_or_init_flashinfer_megamoe_layer_state(layer: FusedMoE) -> Any:
@@ -256,12 +255,8 @@ def _ensure_flashinfer_megamoe_layer(
     megakernel_config: Any,
     w13_scale: torch.Tensor,
     w2_scale: torch.Tensor,
-    nvfp4_use_w4a16: bool | None = None,
 ) -> Any:
     mega = _get_or_init_flashinfer_megamoe_layer_state(layer)
-    if nvfp4_use_w4a16 is not None:
-        state = layer._flashinfer_megamoe_nvfp4_states.get(nvfp4_use_w4a16)
-        mega = state[0] if state is not None else None
     if mega is not None:
         return mega
 
@@ -319,19 +314,17 @@ def _ensure_flashinfer_megamoe_layer(
         weights=None,
         backend=backend,
     )
+    layer._flashinfer_megamoe_layer = mega
     if hasattr(megakernel_config, "knobs"):
         from sglang.srt.layers.moe.flashinfer_megamoe_autotune import (
             MegaMoeTunedForward,
         )
 
-        mega_forward = MegaMoeTunedForward(bootstrap, fleet_params, backend)
+        layer._flashinfer_megamoe_forward = MegaMoeTunedForward(
+            bootstrap, fleet_params, backend
+        )
     else:
-        mega_forward = _select_megamoe_forward(mega)
-    if nvfp4_use_w4a16 is None:
-        layer._flashinfer_megamoe_layer = mega
-        layer._flashinfer_megamoe_forward = mega_forward
-    else:
-        layer._flashinfer_megamoe_nvfp4_states[nvfp4_use_w4a16] = (mega, mega_forward)
+        layer._flashinfer_megamoe_forward = _select_megamoe_forward(mega)
     return mega
 
 
@@ -369,33 +362,13 @@ def _nvfp4_megamoe_activation_kwargs(config: MoeRunnerConfig) -> dict[str, Any]:
     raise ValueError("FlashInfer NVFP4 MegaMOE only supports gated SiLU or SiTU.")
 
 
-def ensure_nvfp4_moe_layer_for_flashinfer_megamoe(
-    layer: FusedMoE, *, use_w4a16: bool | None = None
-) -> Any:
-    setting = envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()
-    if isinstance(setting, str):
-        # The kernels share prepared weights; only their execution resources
-        # differ. Build both before either phase can enter CUDA graph capture.
-        w4a4 = _ensure_nvfp4_moe_layer(layer, use_w4a16=False)
-        w4a16 = _ensure_nvfp4_moe_layer(layer, use_w4a16=True)
-        if use_w4a16 is None:
-            from sglang.srt.layers.moe.phase import is_w4a16_enabled
-
-            use_w4a16 = is_w4a16_enabled()
-        return w4a16 if use_w4a16 else w4a4
-    if use_w4a16 is None:
-        use_w4a16 = setting is True
-    return _ensure_nvfp4_moe_layer(layer, use_w4a16=use_w4a16)
-
-
-def _ensure_nvfp4_moe_layer(layer: FusedMoE, *, use_w4a16: bool) -> Any:
-    _get_or_init_flashinfer_megamoe_layer_state(layer)
-    state = layer._flashinfer_megamoe_nvfp4_states.get(use_w4a16)
-    if state is not None:
-        return state[0]
+def ensure_nvfp4_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
+    mega = _get_or_init_flashinfer_megamoe_layer_state(layer)
+    if mega is not None:
+        return mega
 
     activation_kwargs = _nvfp4_megamoe_activation_kwargs(layer.moe_runner_config)
-    if use_w4a16:
+    if envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.enabled_for_all():
         from flashinfer.moe_ep import Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
 
         megakernel_config = Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
@@ -439,7 +412,6 @@ def _ensure_nvfp4_moe_layer(layer: FusedMoE, *, use_w4a16: bool) -> Any:
         megakernel_config=megakernel_config,
         w13_scale=layer.w13_weight_scale,
         w2_scale=layer.w2_weight_scale,
-        nvfp4_use_w4a16=use_w4a16,
     )
 
 
@@ -523,27 +495,10 @@ def make_nvfp4_megamoe_weight_loader(
 def prepare_nvfp4_moe_weights_for_flashinfer_megamoe(
     layer: FusedMoE,
 ) -> None:
-    setting = envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()
-    if isinstance(setting, str):
-        from sglang.srt.layers.utils.common import copy_or_rebind_param
-
-        # Keep calibrated W4A4 scales and weight-only W4A16 scales as fixed
-        # call arguments. Both kernels consume the same packed weight storage.
-        for name, input_scale in (
-            ("g1_alphas", layer.w13_input_scale_quant),
-            ("g2_alphas", layer.w2_input_scale_quant),
-        ):
-            copy_or_rebind_param(
-                layer, f"_w4a16_{name}", getattr(layer, name) * input_scale
-            )
-    _prepare_nvfp4_moe_weights(layer, use_w4a16=setting is True)
-
-
-def _prepare_nvfp4_moe_weights(layer: FusedMoE, *, use_w4a16: bool) -> None:
+    use_w4a16 = envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.enabled_for_all()
     # Both NVFP4 modes reload into the same prepared allocations. Preserve the
     # live layer, tuned profiles and pooled workspace owner for CUDA graphs.
-    _get_or_init_flashinfer_megamoe_layer_state(layer)
-    w4a4_state = layer._flashinfer_megamoe_nvfp4_states.get(False)
+    mega = _get_or_init_flashinfer_megamoe_layer_state(layer)
 
     from flashinfer.moe_ep import MoEWeightPack
 
@@ -561,20 +516,11 @@ def _prepare_nvfp4_moe_weights(layer: FusedMoE, *, use_w4a16: bool) -> None:
             f"of {hidden_alignment}, got {layer.hidden_size}."
         )
     if layer.quant_config.use_per_token_activation and not use_w4a16:
-        per_token_phase = getattr(
-            layer.quant_config, "per_token_activation_phase", None
+        raise ValueError(
+            "FlashInfer NVFP4 MegaMOE does not support per-token activation "
+            "scaling. Use flashinfer_trtllm/flashinfer_trtllm_routed for "
+            "ModelOpt NVFP4 per-token activation."
         )
-        # Per-token scaling has no effect in a W4A16 phase. Reject only
-        # settings that would actually require per-token W4A4 execution.
-        if (
-            per_token_phase is None
-            or per_token_phase != envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()
-        ):
-            raise ValueError(
-                "FlashInfer NVFP4 MegaMOE does not support per-token activation "
-                "scaling. Use flashinfer_trtllm/flashinfer_trtllm_routed for "
-                "ModelOpt NVFP4 per-token activation."
-            )
     if layer.intermediate_size_per_partition % intermediate_alignment != 0:
         raise ValueError(
             "FlashInfer NVFP4 MegaMOE requires intermediate_size_per_partition "
@@ -613,7 +559,7 @@ def _prepare_nvfp4_moe_weights(layer: FusedMoE, *, use_w4a16: bool) -> None:
 
         input_norm_const = _scalar_float(layer.w13_input_scale_quant)
         if (
-            w4a4_state is not None
+            mega is not None
             and input_norm_const != layer._flashinfer_megamoe_input_norm_const
         ):
             # FlashInfer captures this scalar by value; updating Python config
@@ -759,28 +705,23 @@ def warmup_all_flashinfer_megamoe_layers(model: torch.nn.Module) -> None:
     MegaMOE hits the same gap.
     """
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-    from sglang.srt.layers.quantization.modelopt_quant import (
-        ModelOptNvFp4FusedMoEMethod,
-    )
 
     n_built = 0
     for module in model.modules():
-        if not isinstance(module, FusedMoE) or not hasattr(
-            module, "_flashinfer_megamoe_layer"
-        ):
+        if not isinstance(module, FusedMoE):
             continue
-        if module._flashinfer_megamoe_layer is not None:
+        if not hasattr(module, "_flashinfer_megamoe_layer"):
+            # This layer's quant method never went through one of the
+            # prepare_*_moe_weights_for_flashinfer_megamoe hooks -- not a
+            # MegaMOE layer (or not on the flashinfer_megamoe backend).
             continue
-        setting = envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()
-        modes = (False, True) if isinstance(setting, str) else (setting is True,)
-        states = getattr(module, "_flashinfer_megamoe_nvfp4_states", {})
-        if all(mode in states for mode in modes):
-            continue
-        if isinstance(module.quant_method, ModelOptNvFp4FusedMoEMethod):
-            ensure_nvfp4_moe_layer_for_flashinfer_megamoe(
-                module,
-                use_w4a16=envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get() is True,
-            )
+        if getattr(module, "_flashinfer_megamoe_layer", None) is not None:
+            continue  # already built (e.g. warmup's dummy batch hit it)
+
+        # Dispatch mirrors modelopt_quant.py's apply(): only the nvfp4
+        # method is wired up here today.
+        if type(module.quant_method).__name__ == "ModelOptNvFp4FusedMoEMethod":
+            ensure_nvfp4_moe_layer_for_flashinfer_megamoe(module)
             n_built += 1
         else:
             logger.warning(

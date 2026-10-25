@@ -525,10 +525,10 @@ class TestNvFp4CuteDslPhaseState(CustomTestCase):
                 states["w4a16", False].scales[0], torch.tensor([4.0, 8.0])
             )
             torch.testing.assert_close(
-                states["w4a4", False][1][2], torch.tensor([6.0, 8.0])
+                states["w4a4", False].scales[2], torch.tensor([6.0, 8.0])
             )
             torch.testing.assert_close(
-                states["w4a16", False][1][2], torch.tensor([24.0, 32.0])
+                states["w4a16", False].scales[2], torch.tensor([24.0, 32.0])
             )
 
 

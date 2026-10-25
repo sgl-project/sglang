@@ -52,8 +52,6 @@ def _runtime(backend, *, per_token=False):
 def _forward(layer, x, topk, mode):
     batch = SimpleNamespace(
         forward_mode=mode,
-        global_forward_mode=None,
-        global_moe_forward_phase=None,
         moe_num_token_non_padded=lambda: None,
     )
     with forward_context(ForwardContext(attn_backend=None), forward_batch=batch):

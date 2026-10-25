@@ -48,14 +48,6 @@ class DPSpecPrefillCoordinationPlan(msgspec.Struct, frozen=True):
         batch.global_num_tokens = tokens
         batch.global_num_tokens_for_logprob = logprobs
         batch.dp_spec_prefill_coordination_applied = True
-        # Drafting has only generated tokens. Target and draft-extension
-        # stages also carry real prompts, so every rank must use prefill MoE.
-        batch.global_moe_forward_phase = (
-            "prefill"
-            if phase != "draft"
-            and any(p and n for p, n in zip(self.prefills, self.counts))
-            else "decode"
-        )
         batch.is_extend_in_batch = True
         batch.can_run_decode_cuda_graph = False
         batch.can_run_dp_prefill_cuda_graph = False
