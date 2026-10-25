@@ -12,8 +12,53 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
+from sglang.srt.function_call.utils import get_schema_properties
 
 logger = logging.getLogger(__name__)
+
+
+# Bare (suffix-less) Hunyuan special tokens. The shipping Hy3 tokenizer appends
+# a shared suffix to each (e.g. ``<tool_calls:opensource>``); resolve the real
+# token string from the vocab at runtime and fall back to these literals.
+_HUNYUAN_TOKEN_NAMES = (
+    "tool_calls",
+    "tool_call",
+    "tool_sep",
+    "arg_key",
+    "arg_value",
+    "think",
+)
+
+_HUNYUAN_TOKEN_RE = re.compile(
+    r"^<(?P<name>" + "|".join(_HUNYUAN_TOKEN_NAMES) + r")(?::[^>]+)?>$"
+)
+
+
+def resolve_hunyuan_tokens(tokenizer) -> Dict[str, str]:
+    """Map bare token names to their real (possibly suffixed) strings in vocab.
+
+    Returns ``{name: token_str}`` for each name found. A bare literal is used
+    when the tokenizer carries no suffixed form, so the same detector serves
+    both the preview (suffix-less) and shipping (suffixed) Hy3 tokenizers.
+    """
+    tokens: Dict[str, str] = {}
+    vocab = None
+    if tokenizer is not None:
+        try:
+            vocab = tokenizer.get_vocab()
+        except Exception as e:
+            logger.warning("Failed to read Hunyuan tokenizer vocab: %s", e)
+            vocab = None
+    if isinstance(vocab, dict):
+        for tok in vocab:
+            if not isinstance(tok, str):
+                continue
+            m = _HUNYUAN_TOKEN_RE.match(tok)
+            if m:
+                tokens[m.group("name")] = tok
+    for name in _HUNYUAN_TOKEN_NAMES:
+        tokens.setdefault(name, f"<{name}>")
+    return tokens
 
 
 class HunyuanDetector(BaseFormatDetector):
@@ -55,26 +100,69 @@ class HunyuanDetector(BaseFormatDetector):
     _INTEGER_PREFIXES = ("int", "uint", "long", "short", "unsigned")
     _NUMBER_PREFIXES = ("num", "float")
 
-    def __init__(self):
+    def __init__(self, tokenizer=None):
         super().__init__()
 
-        self.bot_token = "<tool_calls>"
-        self.eot_token = "</tool_calls>"
+        # Hy4 dropped <tool_sep> from its vocab entirely; Hy3 carries it (bare
+        # or suffixed). Detect the dialect from the vocab, not from the
+        # resolved literal (which falls back to "<tool_sep>" for both).
+        self._has_tool_sep = True
+        if tokenizer is not None:
+            try:
+                self._has_tool_sep = any(
+                    re.fullmatch(r"<tool_sep(?::[^>]+)?>", tok)
+                    for tok in tokenizer.get_vocab()
+                    if isinstance(tok, str)
+                )
+            except Exception:
+                pass
 
-        self.tool_call_start_token = "<tool_call>"
-        self.tool_call_end_token = "</tool_call>"
-        self.tool_sep_token = "<tool_sep>"
+        t = resolve_hunyuan_tokens(tokenizer)
+        tool_calls = t["tool_calls"]
+        tool_call = t["tool_call"]
+        tool_sep = t["tool_sep"]
+        arg_key = t["arg_key"]
+        arg_value = t["arg_value"]
 
-        self.arg_key_start_token = "<arg_key>"
-        self.arg_key_end_token = "</arg_key>"
-        self.arg_value_start_token = "<arg_value>"
-        self.arg_value_end_token = "</arg_value>"
+        def _close(open_tok: str) -> str:
+            return "</" + open_tok[1:] if open_tok.startswith("<") else open_tok
 
+        self.bot_token = tool_calls
+        self.eot_token = _close(tool_calls)
+        self.tool_call_start_token = tool_call
+        self.tool_call_end_token = _close(tool_call)
+        self.tool_sep_token = tool_sep
+        self.arg_key_start_token = arg_key
+        self.arg_key_end_token = _close(arg_key)
+        self.arg_value_start_token = arg_value
+        self.arg_value_end_token = _close(arg_value)
+
+        tc_end = _close(tool_call)
+        ak_end = _close(arg_key)
+        av_end = _close(arg_value)
         self.tool_call_regex = re.compile(
-            r"<tool_call>(.*?)<tool_sep>(.*?)</tool_call>", re.DOTALL
+            re.escape(tool_call)
+            + r"(.*?)"
+            + r"(?:"
+            + re.escape(tool_sep)
+            + r"|(?="
+            + re.escape(arg_key)
+            + r"|"
+            + re.escape(tc_end)
+            + r"))"
+            + r"(.*?)"
+            + re.escape(tc_end),
+            re.DOTALL,
         )
         self.func_args_regex = re.compile(
-            r"<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>", re.DOTALL
+            re.escape(arg_key)
+            + r"(.*?)"
+            + re.escape(ak_end)
+            + r"\s*"
+            + re.escape(arg_value)
+            + r"(.*?)"
+            + re.escape(av_end),
+            re.DOTALL,
         )
 
         # Streaming state
@@ -109,7 +197,7 @@ class HunyuanDetector(BaseFormatDetector):
             if tool.function.name == function_name:
                 if tool.function.parameters is None:
                     return {}
-                return tool.function.parameters.get("properties", {}).get(arg_key, {})
+                return get_schema_properties(tool.function.parameters).get(arg_key, {})
         return {}
 
     @staticmethod
@@ -315,14 +403,22 @@ class HunyuanDetector(BaseFormatDetector):
                         self._in_tool_calls = False
                     break
 
-                sep_pos = self._buffer.find(self.tool_sep_token, tc_start)
-                if sep_pos == -1:
+                name_start = tc_start + len(self.tool_call_start_token)
+                boundaries = [
+                    (self._buffer.find(token, name_start), token)
+                    for token in (
+                        self.tool_sep_token,
+                        self.arg_key_start_token,
+                        self.tool_call_end_token,
+                    )
+                ]
+                boundaries = [(pos, token) for pos, token in boundaries if pos != -1]
+                if not boundaries:
                     self._buffer = self._buffer[tc_start:]
                     break
+                boundary_pos, boundary_token = min(boundaries, key=lambda item: item[0])
 
-                tool_name = self._buffer[
-                    tc_start + len(self.tool_call_start_token) : sep_pos
-                ].strip()
+                tool_name = self._buffer[name_start:boundary_pos].strip()
 
                 if (
                     tool_name not in self._tool_indices
@@ -345,7 +441,9 @@ class HunyuanDetector(BaseFormatDetector):
                     )
                 )
 
-                self._buffer = self._buffer[sep_pos + len(self.tool_sep_token) :]
+                if boundary_token == self.tool_sep_token:
+                    boundary_pos += len(boundary_token)
+                self._buffer = self._buffer[boundary_pos:]
 
             # Phase 2: stream argument JSON of the current tool.
             before_name = self._streaming_tool_name
@@ -466,11 +564,25 @@ class HunyuanDetector(BaseFormatDetector):
         return []
 
     def structure_info(self) -> _GetInfoFunc:
+        # Hy4 has no <tool_sep> and no separators between adjacent
+        # <tool_call> blocks, so the Hy3 begin/end literals never match.
+        if not self._has_tool_sep:
+            return lambda name: StructureInfo(
+                begin=f"{self.bot_token}{self.tool_call_start_token}{name}",
+                end=f"{self.tool_call_end_token}{self.eot_token}",
+                trigger=self.bot_token,
+            )
         return lambda name: StructureInfo(
-            begin=f"<tool_calls>\n<tool_call>{name}<tool_sep>",
-            end="</tool_call>\n</tool_calls>",
-            trigger="<tool_calls>",
+            begin=f"{self.bot_token}\n{self.tool_call_start_token}{name}{self.tool_sep_token}",
+            end=f"{self.tool_call_end_token}\n{self.eot_token}",
+            trigger=self.bot_token,
         )
 
     def supports_structural_tag(self) -> bool:
         return False
+
+    def parses_required_natively(self) -> bool:
+        # Hy3/Hy4 both emit their structural tool-call format natively; without
+        # a dialect grammar, a json_schema constraint would force plain JSON the
+        # model was not trained to produce here.
+        return True

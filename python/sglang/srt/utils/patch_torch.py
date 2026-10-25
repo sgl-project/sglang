@@ -16,9 +16,10 @@ from typing import Callable, Union
 import torch
 from torch.multiprocessing import reductions
 
-from sglang.srt.utils.common import is_npu, torch_release
+from sglang.srt.utils.common import is_musa, is_npu, torch_release
 
 _is_npu = is_npu()
+_is_musa = is_musa()
 
 if _is_npu:
     from torch_npu.multiprocessing import reductions as npu_reductions
@@ -28,9 +29,9 @@ if _is_npu:
         return npu_reductions._rebuild_npu_tensor_original(*args)
 
     def npu_verl_to_sglang(device: int):
-        assert (
-            SGLANG_TP_RANK is not None
-        ), "SGLANG_TP_RANK is not registered. Please call register_sgl_tp_rank() first."
+        assert SGLANG_TP_RANK is not None, (
+            "SGLANG_TP_RANK is not registered. Please call register_sgl_tp_rank() first."
+        )
         return SGLANG_TP_RANK
 
 

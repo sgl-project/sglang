@@ -1,0 +1,130 @@
+"""Shared helpers: caching decorator, CI test gating, and runtime detection."""
+
+from __future__ import annotations
+
+import contextlib
+import functools
+from typing import Any, Callable, Dict, List, Sequence, TypeVar
+
+import torch
+
+F = TypeVar("F", bound=Callable[..., Any])
+T = TypeVar("T")
+
+
+def should_run_full_tests() -> bool:
+    from sglang.srt.environ import envs
+
+    return envs.SGLANG_JIT_KERNEL_RUN_FULL_TESTS.get()
+
+
+def get_ci_test_range(full_range: List[Any], ci_range: List[Any]) -> List[Any]:
+    from sglang.utils import is_in_ci
+
+    if should_run_full_tests():
+        return full_range
+    return ci_range if is_in_ci() else full_range
+
+
+_NO_GUARD = contextlib.nullcontext()
+
+
+def device_guard(t: torch.Tensor) -> contextlib.AbstractContextManager:
+    """``torch.cuda.device(t.device)``, skipped when ``t`` is already on the current device."""
+    if t.get_device() == torch.cuda.current_device():
+        return _NO_GUARD
+    return torch.cuda.device(t.device)
+
+
+def cache_once(fn: F) -> F:
+    """
+    NOTE: `functools.lru_cache` is not compatible with `torch.compile`
+    So we manually implement a simple cache_once decorator to replace it.
+    """
+    result_map = {}
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        key = (args, tuple(sorted(kwargs.items())))
+        if key not in result_map:
+            result_map[key] = fn(*args, **kwargs)
+        return result_map[key]
+
+    return wrapper  # type: ignore
+
+
+@functools.lru_cache(maxsize=None)
+def empty_sentinel(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    """Cached 0-element tensor for optional-tensor FFI slots (the numel-0
+    "not present" convention). Allocating a fresh empty per call costs
+    ~1.2us CPU on eager paths; the sentinel is never read, so one cached
+    instance per (device, dtype) is safe to share."""
+    return torch.empty(0, dtype=dtype, device=device)
+
+
+@cache_once
+def is_hip_runtime() -> bool:
+    return bool(torch.version.hip)
+
+
+@cache_once
+def is_musa_runtime() -> bool:
+    return getattr(torch.version, "musa", None) is not None
+
+
+@cache_once
+def is_sail_runtime() -> bool:
+    # T-HEAD SAIL device names carry the "ZW" tag; keep the check aligned with
+    # sglang.srt.utils.is_sail so all layers agree on what "running on SAIL" means.
+    return bool(torch.cuda.is_available() and "ZW" in torch.cuda.get_device_name())
+
+
+_REGISTERED_CLASSES: Dict[type, type] = {}
+
+
+def lazy_register_class(name: str, init_fn: Callable[[], None]) -> Callable[[T], T]:
+    """A decorator to lazily register a tvm-ffi object class on first use.
+
+    `init_fn` runs once (typically JIT-compiling and registering the C++
+    reflection) right before the class is registered under the FFI type key
+    `name`; afterwards instantiation proceeds normally.
+    """
+
+    def decorator(cls: T) -> T:
+        def __new__(cls, *args, **kwargs):
+            import tvm_ffi
+
+            if cls not in _REGISTERED_CLASSES:
+                init_fn()  # lazy initialization before registration once
+                _REGISTERED_CLASSES[cls] = tvm_ffi.register_object(name)(cls)
+            cls = _REGISTERED_CLASSES[cls]
+            return original_new(cls, *args, **kwargs)
+
+        original_new = cls.__new__
+        cls.__new__ = __new__
+        return cls
+
+    return decorator
+
+
+def aligned_new_empty(
+    shape: Sequence[int],
+    dtype: torch.dtype,
+    device: torch.device,
+    *,
+    alignment_bytes: int,
+) -> torch.Tensor:
+    """An uninitialized tensor whose row stride is a multiple of `alignment` bytes.
+
+    The last dimension is padded up and then sliced back off, so the result has
+    the requested shape and a non-contiguous stride whenever padding was needed.
+    Callers are kernels that state an alignment contract on a row address, such
+    as a TMA descriptor or a vectorized load.
+    """
+    assert alignment_bytes <= 512, "Exceed torch cached allocator min alignment"
+    assert len(shape) >= 1 and alignment_bytes % dtype.itemsize == 0
+    step = alignment_bytes // dtype.itemsize
+    last_dim = shape[-1]
+    padded_last_dim = (last_dim + step - 1) // step * step
+    aligned_shape = (*shape[:-1], padded_last_dim)
+    return torch.empty(aligned_shape, dtype=dtype, device=device)[..., :last_dim]

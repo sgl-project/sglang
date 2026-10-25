@@ -17,11 +17,12 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=40, suite="nightly-1-gpu", nightly=True)
+register_cuda_ci(est_time=70, stage="nightly", runner_config="1-gpu-large")
 register_amd_ci(est_time=40, suite="nightly-amd-1-gpu", nightly=True)
 
 
 class TestCrashDump(CustomTestCase):
+    expect_server_exit = True
     crash_dump_folder = None
     MAX_NEW_TOKENS = 4
     NUM_REQUESTS_BEFORE_CRASH = 5

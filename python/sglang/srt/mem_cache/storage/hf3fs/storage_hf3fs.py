@@ -22,7 +22,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PoolTransferResult,
 )
-from sglang.srt.mem_cache.memory_pool_host import HostKVCache
+from sglang.srt.mem_cache.pool_host import HostKVCache
 from sglang.srt.mem_cache.storage.hf3fs.hf3fs_client import Hf3fsClient
 from sglang.srt.observability.metrics_collector import StorageMetrics
 
@@ -201,8 +201,11 @@ class HiCacheHF3FS(HiCacheStorage):
         is_page_first_layout: bool = False,
         use_mock_client: bool = False,
         enable_storage_metrics: bool = False,
+        tp_size: int = 1,
     ):
         self.rank = rank
+        self.tp_rank = rank
+        self.tp_size = tp_size
         self.file_path = file_path
         self.file_size = file_size
         self.numjobs = numjobs
@@ -228,7 +231,7 @@ class HiCacheHF3FS(HiCacheStorage):
         logger.info(
             f"[Rank {self.rank}] HiCacheHF3FS Client Initializing: "
             f"file_path={self.file_path}, "
-            f"file_size={self.file_size / (2 ** 30):.2f} GB, "
+            f"file_size={self.file_size / (2**30):.2f} GB, "
             f"num_pages={self.num_pages}, "
             f"is_mla_model={self.is_mla_model}"
         )
@@ -374,6 +377,7 @@ class HiCacheHF3FS(HiCacheStorage):
             is_page_first_layout=is_page_first_layout,
             use_mock_client=use_mock_client,
             enable_storage_metrics=storage_config.enable_storage_metrics,
+            tp_size=storage_config.tp_size,
         )
 
     def _batch_get(
@@ -520,7 +524,7 @@ class HiCacheHF3FS(HiCacheStorage):
         self, keys: List[str], extra_info: Optional[HiCacheStorageExtraInfo] = None
     ) -> int:
         factor = 1
-        if self.is_zero_copy and not self.is_mla_model:
+        if self.mha_zero_copy:
             keys = self._get_mha_zero_copy_keys(keys)
             factor = 2
 
@@ -571,6 +575,7 @@ class HiCacheHF3FS(HiCacheStorage):
             "page_first",
             "page_first_direct",
         ]
+        self.mha_zero_copy = self.is_zero_copy and not self.is_mla_model
 
         logger.info(f"{self.is_zero_copy=}, layout={self.mem_pool_host.layout}")
 
@@ -646,7 +651,7 @@ class HiCacheHF3FS(HiCacheStorage):
             ]
         )
 
-        if self.is_zero_copy and not self.is_mla_model:
+        if self.mha_zero_copy:
             keys = self._get_mha_zero_copy_keys(keys)
             values = self._get_mha_zero_copy_values(values)
 
@@ -693,7 +698,9 @@ class HiCacheHF3FS(HiCacheStorage):
                 final_pages = 0
                 break
 
-            component_keys = [f"{key}_{pool_name}" for key in keys[:kv_pages]]
+            component_keys = [
+                self._pool_component_key(key, pool_name) for key in keys[:kv_pages]
+            ]
             exists_results = self.metadata_client.exists(
                 self.rank, component_keys, namespace=ctx.namespace
             )
@@ -729,7 +736,7 @@ class HiCacheHF3FS(HiCacheStorage):
         page_size = getattr(host_pool, "page_size", 1) or 1
         page_num = len(keys)
 
-        component_keys = [f"{key}_{pool_name}" for key in keys]
+        component_keys = [self._pool_component_key(key, pool_name) for key in keys]
         page_indices = self.metadata_client.get_page_indices(
             self.rank, component_keys, namespace=ctx.namespace
         )
@@ -778,6 +785,12 @@ class HiCacheHF3FS(HiCacheStorage):
 
         return results
 
+    def _pool_component_key(self, key: str, pool_name: PoolName) -> str:
+        # Mamba state is TP-sharded even when the model's MLA KV is replicated.
+        if self.is_mla_model and pool_name == PoolName.MAMBA:
+            return f"{key}_{pool_name}_{self.tp_rank}_{self.tp_size}"
+        return f"{key}_{pool_name}"
+
     def _pool_batch_set(self, transfer: PoolTransfer) -> List[bool]:
         pool_name = transfer.name
         ctx = self._pool_storage_ctx[pool_name]
@@ -787,7 +800,7 @@ class HiCacheHF3FS(HiCacheStorage):
         page_size = getattr(host_pool, "page_size", 1) or 1
         page_num = len(keys)
 
-        component_keys = [f"{key}_{pool_name}" for key in keys]
+        component_keys = [self._pool_component_key(key, pool_name) for key in keys]
         key_with_prefix = [(k, "") for k in component_keys]
         indices = self.metadata_client.reserve_and_allocate_page_indices(
             self.rank, key_with_prefix, namespace=ctx.namespace
@@ -899,7 +912,7 @@ class HiCacheHF3FS(HiCacheStorage):
             for i in range(page_num)
         ]
 
-        if self.is_zero_copy and not self.is_mla_model:
+        if self.mha_zero_copy:
             keys = self._get_mha_zero_copy_keys(keys)
             values = self._get_mha_zero_copy_values(values)
 

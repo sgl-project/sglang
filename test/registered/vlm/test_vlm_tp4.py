@@ -15,7 +15,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=133, suite="stage-c-test-4-gpu-h100")
+register_cuda_ci(est_time=136, stage="base-c", runner_config="4-gpu-h100")
 
 QWEN35_27B_MODEL = "Qwen/Qwen3.5-27B"
 MMMU_ACCURACY_THRESHOLD = 0.65
@@ -34,12 +34,12 @@ class TestVLMTP4(CustomTestCase):
             other_args=[
                 "--tp-size",
                 "4",
-                "--cuda-graph-max-bs",
+                "--cuda-graph-max-bs-decode",
                 "32",
                 "--mem-fraction-static",
                 "0.8",
                 "--trust-remote-code",
-                "--mamba-scheduler-strategy",
+                "--mamba-radix-cache-strategy",
                 "extra_buffer",
                 "--mamba-track-interval",
                 "128",
@@ -66,7 +66,7 @@ class TestVLMTP4(CustomTestCase):
             max_tokens=2048,
             chat_template_kwargs={"enable_thinking": False},
             base_url=self.base_url,
-            host="http://127.0.0.1",
+            host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
         metrics = run_eval(args)

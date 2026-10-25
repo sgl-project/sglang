@@ -1,0 +1,10 @@
+{
+    "cases": {
+        "zimage_image_t2i": {
+            "clip_threshold": 0.92,
+            "ssim_threshold": 0.86,
+            "psnr_threshold": 19.5,
+            "mean_abs_diff_threshold": 8.5
+        }
+    }
+}

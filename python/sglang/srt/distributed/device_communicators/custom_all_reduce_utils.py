@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/distributed/device_communicators/custom_all_reduce_utils.py
 
 import ctypes
@@ -19,7 +21,9 @@ from typing_extensions import ParamSpec
 
 from sglang.srt.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
+from sglang.srt.environ import envs as sglang_envs
 from sglang.srt.utils import is_cuda, is_hip, is_musa
+from sglang.srt.utils.cuda_vmm_utils import _gpu_fabric_clique
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +63,7 @@ def update_environment_variables(envs: Dict[str, str]):
     for k, v in envs.items():
         if k in os.environ and os.environ[k] != v:
             logger.warning(
-                "Overwriting environment variable %s " "from '%s' to '%s'",
+                "Overwriting environment variable %s from '%s' to '%s'",
                 k,
                 os.environ[k],
                 v,
@@ -259,8 +263,8 @@ def gpu_p2p_access_check(src: int, tgt: int) -> bool:
         cuda_visible_devices = ",".join(str(i) for i in range(num_dev))
 
     # VLLM_CACHE_ROOT -> SGLANG_CACHE_ROOT
-    # "~/.cache/vllm" -> "~/.cache/sglang"
-    SGLANG_CACHE_ROOT = os.path.expanduser("~/.cache/sglang")
+    # "~/.cache/vllm" -> envs.SGLANG_CACHE_DIR
+    SGLANG_CACHE_ROOT = os.path.expanduser(sglang_envs.SGLANG_CACHE_DIR.get())
     path = os.path.join(
         SGLANG_CACHE_ROOT, f"gpu_p2p_access_cache_for_{cuda_visible_devices}.json"
     )
@@ -388,6 +392,32 @@ def is_full_nvlink(physical_device_ids: List[int], world_size: int) -> bool:
         return True
 
 
+@with_nvml_context
+def is_one_nvlink_clique(
+    group: torch.distributed.ProcessGroup, device: torch.device
+) -> bool:
+    """True iff every rank's GPU is in the same NVLink fabric clique (one NVL72 /
+    MNNVL domain). Such a clique shares a single NVLink address space even across
+    nodes, so custom-AR v2's symm-mem storage + fabric peer VAs are valid group-wide."""
+    if _is_hip:
+        return False
+    try:
+        clique = _gpu_fabric_clique(device)
+    except Exception as e:
+        logger.warning(
+            "GPU fabric clique query failed (%r); custom-AR stays intra-node.", e
+        )
+        clique = None
+    # Always all-gather (every rank calls it once) so a failed query on any rank
+    # resolves to a clean False rather than a collective mismatch.
+    world_size = dist.get_world_size(group=group)
+    gathered: List[object] = [None] * world_size
+    dist.all_gather_object(gathered, clique, group=group)
+    if any(c is None for c in gathered):
+        return False
+    return len(set(gathered)) == 1
+
+
 def is_weak_contiguous(inp: torch.Tensor):
     return inp.is_contiguous() or (
         inp.storage().nbytes() - inp.storage_offset() * inp.element_size()
@@ -415,9 +445,9 @@ def can_use_custom_all_reduce_with_nvlink(
     supported_world_size: List[int],
     cls_name: str,
 ) -> Optional[bool]:  # None if fail; otherwise return whether NVLink is available
-    assert (
-        dist.get_backend(group) != dist.Backend.NCCL
-    ), f"{cls_name} should be attached to a non-NCCL group."
+    assert dist.get_backend(group) != dist.Backend.NCCL, (
+        f"{cls_name} should be attached to a non-NCCL group."
+    )
 
     rank = dist.get_rank(group=group)
     world_size = dist.get_world_size(group=group)
@@ -429,7 +459,7 @@ def can_use_custom_all_reduce_with_nvlink(
     # No need to initialize custom allreduce for multi-node case.
     if not all(in_the_same_node_as(group, source_rank=0)):
         logger.warning(
-            f"{cls_name} is disabled because this process group" " spans across nodes."
+            f"{cls_name} is disabled because this process group spans across nodes."
         )
         return
 

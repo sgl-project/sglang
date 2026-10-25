@@ -1,16 +1,12 @@
 """MI35x Nightly performance benchmark for GLM-5.1.
 
-Tests GLM-5.1-FP8 with NSA attention backend using bench_one_batch
+Tests GLM-5.1-FP8 with DSA attention backend using bench_one_batch
 on 8 GPUs with TP=8, FP8 KV cache.
 
 Registry: nightly-perf-8-gpu-mi35x-glm51 suite
 """
 
 import os
-
-os.environ.setdefault("HF_HOME", "/data2/models/huggingface")
-os.environ.setdefault("HF_HUB_CACHE", "/data2/models/huggingface/hub")
-
 import unittest
 from typing import List
 
@@ -49,13 +45,13 @@ def generate_simple_markdown_report(results: List[BenchmarkResult]) -> str:
 
 
 GLM51_MODEL_PATH = os.environ.get("GLM51_MODEL_PATH", "zai-org/GLM-5.1-FP8")
-PROFILE_DIR = "performance_profiles_glm51_mi35x"
+RESULT_DIR = "performance_results_glm51_mi35x"
 
 
 class TestGLM51PerfMI35x(unittest.TestCase):
     """Nightly performance benchmark for GLM-5.1 on MI35x.
 
-    Tests GLM-5.1-FP8 with NSA attention backend on TP=8.
+    Tests GLM-5.1-FP8 with DSA attention backend on TP=8.
     """
 
     @classmethod
@@ -76,9 +72,9 @@ class TestGLM51PerfMI35x(unittest.TestCase):
                 "glm47",
                 "--tp",
                 "8",
-                "--nsa-prefill-backend",
+                "--dsa-prefill-backend",
                 "tilelang",
-                "--nsa-decode-backend",
+                "--dsa-decode-backend",
                 "tilelang",
                 "--kv-cache-dtype",
                 "fp8_e4m3",
@@ -100,8 +96,8 @@ class TestGLM51PerfMI35x(unittest.TestCase):
         }
 
         os.environ.setdefault("SGLANG_BENCH_TIMEOUT", "3600")
-        cls.runner = NightlyBenchmarkRunner(PROFILE_DIR, cls.__name__, cls.base_url)
-        cls.runner.setup_profile_directory()
+        cls.runner = NightlyBenchmarkRunner(RESULT_DIR, cls.__name__, cls.base_url)
+        cls.runner.setup_result_directory()
         cls.runner.full_report = f"## {cls.__name__}\n"
 
     def test_glm51_perf(self):
@@ -119,7 +115,6 @@ class TestGLM51PerfMI35x(unittest.TestCase):
                 other_args=self.model_config["other_args"],
                 variant=self.model_config["name"],
                 extra_bench_args=["--trust-remote-code"],
-                enable_profile=False,
                 timeout=5400,
             )
             results = result_tuple[0]

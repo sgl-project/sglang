@@ -1,0 +1,349 @@
+{
+    "metadata": {
+        "model": "Diffusion Server",
+        "hardware": "CI B200 pool",
+        "description": "B200 diffusion references with stage, denoise and allocated-memory checks enabled; previously enforced E2E/load references and runner overrides retained.",
+        "last_updated": "2026-10-18",
+        "calibration_runs": [
+            38482436865,
+            38554777367,
+            38725436953,
+            38979902269,
+            39027561441,
+            39077836460
+        ],
+        "calibration_policy": "At least five comparable main CI runs per case. Newly enabled timing checks use the observed maximum plus 5%; memory references use the maximum plus 1%. Existing tolerances, E2E/load references and runner overrides remain unchanged."
+    },
+    "runner_overrides": {
+        "b200-cirrascale1-0123": {
+            "flux1_modelopt_nvfp4_t2i": {
+                "expected_e2e_ms": 1574.32
+            },
+            "qwen_image_2512_modelopt_nvfp4_t2i": {
+                "expected_e2e_ms": 17742.04
+            }
+        },
+        "b200-cirrascale1-4567": {
+            "flux1_modelopt_nvfp4_t2i": {
+                "expected_e2e_ms": 1574.32
+            },
+            "qwen_image_2512_modelopt_nvfp4_t2i": {
+                "expected_e2e_ms": 17742.04
+            }
+        },
+        "b200-cirrascale3-0123": {
+            "flux1_modelopt_nvfp4_t2i": {
+                "expected_e2e_ms": 1470.24
+            },
+            "qwen_image_2512_modelopt_nvfp4_t2i": {
+                "expected_e2e_ms": 17894.49
+            }
+        },
+        "b200-cirrascale3-4567": {
+            "flux1_modelopt_nvfp4_t2i": {
+                "expected_e2e_ms": 1471.19
+            },
+            "qwen_image_2512_modelopt_nvfp4_t2i": {
+                "expected_e2e_ms": 17346.65
+            }
+        },
+        "b200-cirrascale4-0123": {
+            "flux1_modelopt_nvfp4_t2i": {
+                "expected_e2e_ms": 1470.24
+            },
+            "qwen_image_2512_modelopt_nvfp4_t2i": {
+                "expected_e2e_ms": 17894.49
+            }
+        },
+        "b200-cirrascale4-4567": {
+            "flux1_modelopt_nvfp4_t2i": {
+                "expected_e2e_ms": 1471.19
+            },
+            "qwen_image_2512_modelopt_nvfp4_t2i": {
+                "expected_e2e_ms": 17346.65
+            }
+        },
+        "b200-di": {
+            "flux1_modelopt_nvfp4_t2i": {
+                "expected_e2e_ms": 1334.16
+            },
+            "qwen_image_2512_modelopt_nvfp4_t2i": {
+                "expected_e2e_ms": 16126.87
+            }
+        }
+    },
+    "tolerances": {
+        "long_term": {
+            "e2e": 0.15,
+            "denoise_stage": 0.1,
+            "non_denoise_stage": 0.5,
+            "denoise_step": 0.25,
+            "denoise_agg": 0.15,
+            "load_peak_vram": 0.01,
+            "runtime_peak_vram": 0.02
+        },
+        "pr_test": {
+            "e2e": 0.25,
+            "denoise_stage": 0.25,
+            "non_denoise_stage": 0.8,
+            "denoise_step": 0.3,
+            "denoise_agg": 0.2,
+            "load_peak_vram": 0.01,
+            "runtime_peak_vram": 0.02
+        }
+    },
+    "improvement_reporting": {
+        "threshold": 0.2
+    },
+    "sampling": {
+        "step_fractions": [
+            0.0,
+            0.2,
+            0.4,
+            0.6,
+            0.8,
+            1.0
+        ]
+    },
+    "scenarios": {
+        "flux1_modelopt_nvfp4_t2i": {
+            "expected_load_ms": 38841.5,
+            "stages_ms": {
+                "InputValidationStage": 0.06,
+                "TextEncodingStage": 25.48,
+                "LatentPreparationStage": 0.23,
+                "TimestepPreparationStage": 2.09,
+                "DenoisingStage": 1097.5,
+                "DecodingStage": 15.42
+            },
+            "denoise_step_ms": {
+                "0": 100.7,
+                "1": 51.43,
+                "2": 92.65,
+                "3": 50.75,
+                "4": 91.21,
+                "5": 51.0,
+                "6": 51.14,
+                "7": 91.25,
+                "8": 50.41,
+                "9": 90.48,
+                "10": 50.42,
+                "11": 90.57
+            },
+            "expected_e2e_ms": 836.71,
+            "expected_avg_denoise_ms": 91.2,
+            "expected_median_denoise_ms": 90.58,
+            "estimated_full_test_time_s": 71.2,
+            "load_peak_vram_mb": 18297.16,
+            "runtime_peak_vram_mb": 23335.04,
+            "load_peak_allocated_mb": 18112.88,
+            "runtime_peak_allocated_mb": 19195.3
+        },
+        "flux2_modelopt_nvfp4_t2i": {
+            "expected_load_ms": 71333.99,
+            "stages_ms": {
+                "InputValidationStage": 0.1,
+                "TextEncodingStage": 701.31,
+                "ImageVAEEncodingStage": 0.01,
+                "LatentPreparationStage": 0.82,
+                "TimestepPreparationStage": 4.35,
+                "DenoisingStage": 1501.8,
+                "DecodingStage": 15.72
+            },
+            "denoise_step_ms": {
+                "0": 143.39,
+                "1": 30.93,
+                "2": 121.58,
+                "3": 98.59,
+                "4": 130.89,
+                "5": 100.31,
+                "6": 100.42,
+                "7": 138.77,
+                "8": 97.93,
+                "9": 106.67,
+                "10": 99.03,
+                "11": 106.87
+            },
+            "expected_e2e_ms": 1990.84,
+            "expected_avg_denoise_ms": 115.55,
+            "expected_median_denoise_ms": 125.74,
+            "estimated_full_test_time_s": 592.3,
+            "load_peak_vram_mb": 26684.2,
+            "runtime_peak_vram_mb": 33020.94,
+            "load_peak_allocated_mb": 26206.26,
+            "runtime_peak_allocated_mb": 27679.14
+        },
+        "qwen_image_2512_modelopt_nvfp4_t2i": {
+            "expected_load_ms": 46619.98,
+            "stages_ms": {
+                "InputValidationStage": 0.07,
+                "TextEncodingStage": 247.17,
+                "LatentPreparationStage": 0.3,
+                "TimestepPreparationStage": 3.09,
+                "DenoisingStage": 18934.88,
+                "DecodingStage": 38.96
+            },
+            "denoise_step_ms": {
+                "0": 398.42,
+                "1": 190.75,
+                "2": 186.34,
+                "3": 186.88,
+                "4": 187.28,
+                "5": 185.4,
+                "6": 185.44,
+                "7": 186.61,
+                "8": 185.09,
+                "9": 190.7,
+                "10": 370.1,
+                "11": 185.68,
+                "12": 190.85,
+                "13": 186.54,
+                "14": 187.12,
+                "15": 185.83,
+                "16": 185.53,
+                "17": 186.04,
+                "18": 185.14,
+                "19": 185.39,
+                "20": 342.95,
+                "21": 188.41,
+                "22": 184.77,
+                "23": 185.5,
+                "24": 190.32,
+                "25": 187.97,
+                "26": 185.62,
+                "27": 191.78,
+                "28": 186.4,
+                "29": 356.39,
+                "30": 185.61,
+                "31": 188.86,
+                "32": 185.2,
+                "33": 186.15,
+                "34": 189.01,
+                "35": 187.05,
+                "36": 186.95,
+                "37": 189.05,
+                "38": 187.4,
+                "39": 333.99,
+                "40": 193.13,
+                "41": 187.5,
+                "42": 184.56,
+                "43": 190.36,
+                "44": 185.99,
+                "45": 185.96,
+                "46": 188.3,
+                "47": 191.32,
+                "48": 186.01,
+                "49": 595.74
+            },
+            "expected_e2e_ms": 9650.06,
+            "expected_avg_denoise_ms": 378.62,
+            "expected_median_denoise_ms": 345.81,
+            "estimated_full_test_time_s": 120.0,
+            "load_peak_vram_mb": 17806.3,
+            "runtime_peak_vram_mb": 21062.54,
+            "load_peak_allocated_mb": 17269.02,
+            "runtime_peak_allocated_mb": 18870.33
+        },
+        "wan22_modelopt_nvfp4_t2v": {
+            "expected_load_ms": 79653.94,
+            "stages_ms": {
+                "InputValidationStage": 0.04,
+                "TextEncodingStage": 346.51,
+                "LatentPreparationStage": 0.11,
+                "TimestepPreparationStage": 2.35,
+                "DenoisingStage": 5788.41,
+                "DecodingStage": 256.27
+            },
+            "denoise_step_ms": {
+                "0": 375.77,
+                "1": 410.26,
+                "2": 446.02,
+                "3": 407.43,
+                "4": 443.38,
+                "5": 406.78,
+                "6": 406.75,
+                "7": 443.45,
+                "8": 899.72,
+                "9": 562.42,
+                "10": 406.77,
+                "11": 591.1
+            },
+            "expected_e2e_ms": 5964.13,
+            "expected_avg_denoise_ms": 478.63,
+            "expected_median_denoise_ms": 443.42,
+            "estimated_full_test_time_s": 181.8,
+            "load_peak_vram_mb": 25490.0,
+            "runtime_peak_vram_mb": 35568.0,
+            "load_peak_allocated_mb": 24622.71,
+            "runtime_peak_allocated_mb": 28881.55
+        },
+        "ideogram4_nvfp4_t2i": {
+            "expected_load_ms": 33439.28,
+            "stages_ms": {
+                "InputValidationStage": 0.04,
+                "Ideogram4TextEncodingStage": 214.77,
+                "LatentPreparationStage": 0.13,
+                "DenoisingStage": 5818.9,
+                "Ideogram4DecodingStage": 56.33
+            },
+            "denoise_step_ms": {
+                "0": 124.05,
+                "1": 83.99,
+                "2": 109.67,
+                "3": 110.03,
+                "4": 109.89,
+                "5": 109.98,
+                "6": 109.73,
+                "7": 109.89,
+                "8": 111.44,
+                "9": 117.9,
+                "10": 110.23,
+                "11": 110.11,
+                "12": 109.81,
+                "13": 109.9,
+                "14": 109.81,
+                "15": 110.09,
+                "16": 109.8,
+                "17": 109.88,
+                "18": 109.82,
+                "19": 115.63,
+                "20": 109.81,
+                "21": 109.99,
+                "22": 110.21,
+                "23": 110.04,
+                "24": 109.87,
+                "25": 110.39,
+                "26": 109.8,
+                "27": 109.92,
+                "28": 119.92,
+                "29": 109.88,
+                "30": 109.83,
+                "31": 109.89,
+                "32": 109.82,
+                "33": 110.16,
+                "34": 110.24,
+                "35": 110.02,
+                "36": 109.67,
+                "37": 110.06,
+                "38": 116.34,
+                "39": 110.35,
+                "40": 110.19,
+                "41": 110.43,
+                "42": 110.15,
+                "43": 110.02,
+                "44": 109.8,
+                "45": 109.94,
+                "46": 109.81,
+                "47": 259.5
+            },
+            "expected_e2e_ms": 5421.76,
+            "expected_avg_denoise_ms": 121.13,
+            "expected_median_denoise_ms": 116.68,
+            "estimated_full_test_time_s": 300.0,
+            "load_peak_vram_mb": 13691.56,
+            "runtime_peak_vram_mb": 34903.58,
+            "load_peak_allocated_mb": 13661.57,
+            "runtime_peak_allocated_mb": 31120.37
+        }
+    }
+}

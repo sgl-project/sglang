@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Dict, Iterator, List, Optional, Tuple, Union
+from typing import Dict, Iterator, List, Literal, Optional, Tuple, Union
 
 import torch
 
@@ -23,7 +23,9 @@ class EngineBase(ABC):
         token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None,
         lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None,
         custom_logit_processor: Optional[Union[List[str], str]] = None,
-        return_hidden_states: Optional[bool] = None,
+        return_hidden_states: Optional[
+            Union[bool, Literal["last"], List[Union[bool, Literal["last"]]]]
+        ] = None,
         stream: Optional[bool] = None,
         bootstrap_host: Optional[Union[List[str], str]] = None,
         bootstrap_port: Optional[Union[List[int], int]] = None,
@@ -33,6 +35,7 @@ class EngineBase(ABC):
         data_parallel_rank: Optional[int] = None,
         rid: Optional[Union[List[str], str]] = None,
         priority: Optional[int] = None,
+        session_id: Optional[str] = None,
     ) -> Union[Dict, Iterator[Dict]]:
         """Generate outputs based on given inputs."""
         pass
@@ -40,6 +43,16 @@ class EngineBase(ABC):
     @abstractmethod
     def flush_cache(self):
         """Flush the cache of the engine."""
+        pass
+
+    @abstractmethod
+    def begin_weight_update(self, selector: str = "all"):
+        """Open a weight-update session; update_weights_from_* must run inside one."""
+        pass
+
+    @abstractmethod
+    def end_weight_update(self):
+        """Close the weight-update session and finalize quantized weights."""
         pass
 
     @abstractmethod

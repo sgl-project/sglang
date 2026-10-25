@@ -16,7 +16,7 @@
 import dataclasses
 import json
 import logging
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 from xgrammar import (
@@ -26,7 +26,9 @@ from xgrammar import (
     StructuralTag,
     StructuralTagItem,
     TokenizerInfo,
-    allocate_token_bitmask,
+    VocabType,
+    bitmask_dtype,
+    get_bitmask_shape,
 )
 
 from sglang.srt.constrained.base_grammar_backend import (
@@ -35,34 +37,52 @@ from sglang.srt.constrained.base_grammar_backend import (
     GrammarStats,
     InvalidGrammarObject,
 )
-from sglang.srt.constrained.torch_ops.bitmask_ops import (
-    apply_token_bitmask_inplace_torch,
+from sglang.srt.constrained.json_schema_validation import (
+    UnsupportedJSONSchemaFeature,
+    validate_xgrammar_json_schema,
 )
 from sglang.srt.constrained.utils import is_legacy_structural_tag
 from sglang.srt.utils import is_hip
+from sglang.srt.utils.common import is_pin_memory_available
 
 _is_hip = is_hip()
+
 if _is_hip:
     from sgl_kernel import apply_token_bitmask_inplace_cuda
 else:
-    from sglang.srt.constrained.triton_ops.bitmask_ops import (
+    from sglang.kernels.ops.grammar.bitmask_ops import (
         apply_token_bitmask_inplace_triton,
     )
 
+from sglang.kernels.ops.grammar.token_filter_ops import set_token_filter_triton
+from sglang.srt.constrained.torch_ops.token_filter_torch_ops import (
+    set_token_filter_torch,
+)
 
 logger = logging.getLogger(__name__)
 MAX_ROLLBACK_TOKENS = 200
 
 
-class XGrammarGrammar(BaseGrammarObject):
+def _allocate_token_bitmask(vocab_size: int, batch_size: int) -> torch.Tensor:
+    # Pin where pinning exists, so the later H2D can be a genuine non_blocking
+    # copy (a pageable source silently downgrades it).  MPS torch has no
+    # pin-memory kernel and asserts on pin_memory=True.
+    return torch.full(
+        get_bitmask_shape(batch_size, vocab_size),
+        -1,
+        dtype=bitmask_dtype,
+        pin_memory=is_pin_memory_available(),
+    )
 
+
+class XGrammarGrammar(BaseGrammarObject):
     def __init__(
         self,
         matcher: GrammarMatcher,
         vocab_size: int,
         ctx: CompiledGrammar,
         override_stop_tokens: Optional[Union[List[int], int]],
-        key_string: Optional[str] = None,  # TODO (sk): for debugging, remove later
+        key_string: Optional[str] = None,
         grammar_stats: Optional[GrammarStats] = GrammarStats(),
     ) -> None:
         super().__init__()
@@ -98,7 +118,7 @@ class XGrammarGrammar(BaseGrammarObject):
     def allocate_vocab_mask(
         self, vocab_size: int, batch_size: int, device
     ) -> torch.Tensor:
-        return allocate_token_bitmask(batch_size, vocab_size)
+        return _allocate_token_bitmask(vocab_size, batch_size)
 
     def fill_vocab_mask(self, vocab_mask: torch.Tensor, idx: int) -> None:
         self.matcher.fill_next_token_bitmask(vocab_mask, idx)
@@ -114,7 +134,15 @@ class XGrammarGrammar(BaseGrammarObject):
             else:
                 apply_token_bitmask_inplace_triton(logits, vocab_mask)
         elif logits.device.type == "npu":
-            apply_token_bitmask_inplace_torch(logits, vocab_mask)
+            import sgl_kernel_npu  # noqa: F401
+
+            torch.ops.npu.apply_token_bitmask(logits, vocab_mask)
+        elif logits.device.type == "cpu":
+            # Used by the MLX backend, which builds its additive mask rows
+            # on the CPU before inserting them into the lazy graph.
+            from xgrammar import apply_token_bitmask_inplace
+
+            apply_token_bitmask_inplace(logits, vocab_mask, backend="cpu")
         else:
             raise RuntimeError(f"Unsupported device: {logits.device.type}")
 
@@ -162,7 +190,14 @@ class XGrammarGrammar(BaseGrammarObject):
             self.matcher.rollback(len(old_output_ids) - k)
 
         for i in range(k, len(new_output_ids)):
-            assert self.matcher.accept_token(new_output_ids[i])
+            if not self.matcher.accept_token(new_output_ids[i]):
+                raise ValueError(
+                    f"Token not accepted during retokenization: {new_output_ids[i]} "
+                    f"at position {i}\n"
+                    f"Old output IDs: {old_output_ids}\n"
+                    f"New output IDs: {new_output_ids}\n"
+                    f"Key string: {self.key_string}"
+                )
 
     def __repr__(self):
         return f"XGrammarGrammar({self.key_string=}, {self.accepted_tokens=}, {self.current_token=})"
@@ -181,6 +216,7 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         vocab_size: int,
         model_eos_token_ids: Optional[List[int]] = None,
         any_whitespace: bool = True,
+        max_whitespace_cnt: Optional[int] = None,
     ):
         super().__init__()
 
@@ -206,10 +242,99 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
                     f"Failed to create XGrammar TokenizerInfo from tokenizer: {e}"
                 )
 
+        self._tokenizer_info = tokenizer_info
         self.grammar_compiler = GrammarCompiler(tokenizer_info=tokenizer_info)
+        self._framing_compiler = self._new_framing_compiler(tokenizer_info)
         self.vocab_size = vocab_size
         self.override_stop_tokens = override_stop_tokens
         self.any_whitespace = any_whitespace
+        self.max_whitespace_cnt = max_whitespace_cnt
+
+    @property
+    def is_support_token_filter(self):
+        return True
+
+    @staticmethod
+    def _new_framing_compiler(tokenizer_info: TokenizerInfo) -> GrammarCompiler:
+        # The cache mixes up token-level structural tags of different shapes, so
+        # framed grammars compile uncached (seen on xgrammar 0.2.1 through 0.2.7).
+        return GrammarCompiler(tokenizer_info=tokenizer_info, cache_enabled=False)
+
+    def reserve_framing_tokens(self, token_ids: Sequence[int]) -> None:
+        info = self._tokenizer_info
+        reserved = set(token_ids)
+        # A leading 0xFF is invalid UTF-8, so framed text cannot match these while
+        # token elements still match by id; string tool tags spell them, so only framing.
+        vocab = [
+            b"\xff" + piece if token_id in reserved else piece
+            for token_id, piece in enumerate(info.decoded_vocab)
+        ]
+        self._framing_compiler = self._new_framing_compiler(
+            TokenizerInfo(
+                vocab,
+                VocabType.RAW,
+                vocab_size=info.vocab_size,
+                stop_token_ids=info.stop_token_ids,
+            )
+        )
+
+    def compile_framed_grammar(
+        self, grammar: XGrammarGrammar, frame: Callable[[dict], dict]
+    ) -> XGrammarGrammar:
+        tag = json.dumps(
+            frame({"type": "grammar", "grammar": str(grammar.ctx.grammar)})
+        )
+        ctx = self._framing_compiler.compile_structural_tag(tag)
+        return self._from_context(
+            ctx, tag, GrammarStats(dispatch_type="structural_tag")
+        )
+
+    @staticmethod
+    def allocate_vocab_mask(vocab_size: int, batch_size: int, device) -> torch.Tensor:
+        return _allocate_token_bitmask(vocab_size, batch_size)
+
+    @staticmethod
+    def move_vocab_mask(vocab_mask: torch.Tensor, device) -> torch.Tensor:
+        return vocab_mask.to(device, non_blocking=True)
+
+    @staticmethod
+    def apply_vocab_mask(logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
+        if logits.device.type in {"cuda", "xpu", "musa"}:
+            if _is_hip:
+                apply_token_bitmask_inplace_cuda(logits, vocab_mask)
+            else:
+                apply_token_bitmask_inplace_triton(logits, vocab_mask)
+        elif logits.device.type == "npu":
+            import sgl_kernel_npu  # noqa: F401
+
+            torch.ops.npu.apply_token_bitmask(logits, vocab_mask)
+        else:
+            raise RuntimeError(f"Unsupported device: {logits.device.type}")
+
+    @staticmethod
+    def set_token_filter(
+        vocab_mask: torch.Tensor,
+        token_ids: List[int],
+        batch_idx: int,
+        is_allowed: bool = True,
+        reset_vocab_mask: bool = True,
+    ):
+        if _is_hip or (vocab_mask.device.type != "cuda"):
+            set_token_filter_torch(
+                vocab_mask,
+                token_ids,
+                batch_idx,
+                is_allowed=is_allowed,
+                reset_vocab_mask=reset_vocab_mask,
+            )
+        else:
+            set_token_filter_triton(
+                vocab_mask,
+                token_ids,
+                batch_idx,
+                is_allowed=is_allowed,
+                reset_vocab_mask=reset_vocab_mask,
+            )
 
     @staticmethod
     def _sanitize_structural_format(structural_format):
@@ -262,11 +387,22 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
                 # Note: This builtin JSON grammar includes *all* valid JSON (including, for example, arrays at the root)
                 ctx = self.grammar_compiler.compile_builtin_json_grammar()
             else:
+                # Inspect the decoded schema for semantic loss, then give the
+                # original string to XGrammar to preserve its parser behavior.
+                schema = json.loads(key_string)
+                validate_xgrammar_json_schema(schema)
                 ctx = self.grammar_compiler.compile_json_schema(
-                    schema=key_string, any_whitespace=self.any_whitespace
+                    schema=key_string,
+                    any_whitespace=self.any_whitespace,
+                    max_whitespace_cnt=self.max_whitespace_cnt,
                 )
 
-        except (RuntimeError, json.decoder.JSONDecodeError, UnicodeDecodeError) as e:
+        except (
+            RuntimeError,
+            UnsupportedJSONSchemaFeature,
+            json.decoder.JSONDecodeError,
+            UnicodeDecodeError,
+        ) as e:
             logger.error(f"Hit invalid json_schema: {key_string=}, {e=}")
             return InvalidGrammarObject(str(e))
         return self._from_context(ctx, key_string, GrammarStats(dispatch_type="json"))

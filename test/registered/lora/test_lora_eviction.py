@@ -23,8 +23,8 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.runners import SRTRunner
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=263, suite="stage-b-test-1-gpu-small")
-register_amd_ci(est_time=224, suite="stage-b-test-1-gpu-small-amd")
+register_cuda_ci(est_time=319, stage="extra-a", runner_config="1-gpu-small")
+register_amd_ci(est_time=224, suite="extra-a-test-1-gpu-small-amd")
 
 PROMPTS = [
     "AI is a field of computer science focused on",
@@ -41,7 +41,7 @@ ADAPTERS = [
     "philschmid/code-llama-3-1-8b-text-to-sql-lora",  # target_modules = q, k, v, o, gate, up, down
 ]
 
-BASE_MODEL = "meta-llama/Meta-Llama-3.1-8B-Instruct"
+BASE_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
 
 
 @contextlib.contextmanager

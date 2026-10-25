@@ -22,10 +22,27 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sglang.jit_kernel.diffusion.group_norm_silu import apply_group_norm_silu
+from sglang.kernels.ops.diffusion import apply_group_norm_silu
 from sglang.multimodal_gen.configs.models.vaes import HunyuanVAEConfig
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_decode_parallel_rank,
+    get_decode_parallel_world_size,
+)
 from sglang.multimodal_gen.runtime.layers.activation import get_act_fn
-from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
+from sglang.multimodal_gen.runtime.layers.parallel_conv import (
+    SpatialParallelConv3d,
+    chunk_height_by_sizes,
+    disable_spatial_parallel_decode,
+    gather_and_trim_height,
+    gather_variable_height,
+    spatial_parallel_decode_disabled,
+    split_height_for_parallel_decode,
+)
+from sglang.multimodal_gen.runtime.models.vaes.common import (
+    ParallelTiledVAE,
+    can_install_spatial_shard_parallel_decode,
+    should_run_spatial_shard_parallel_decode,
+)
 
 
 def prepare_causal_attention_mask(
@@ -45,8 +62,45 @@ def prepare_causal_attention_mask(
     return mask
 
 
-class HunyuanVAEAttention(nn.Module):
+def _make_spatial_parallel_conv3d(
+    conv: nn.Conv3d,
+    *,
+    height_pad: int,
+    width_pad: int,
+    padding_mode: str,
+) -> SpatialParallelConv3d:
+    spatial_conv = SpatialParallelConv3d(
+        in_channels=conv.in_channels,
+        out_channels=conv.out_channels,
+        kernel_size=conv.kernel_size,
+        stride=conv.stride,
+        padding=(0, height_pad, width_pad),
+        dilation=conv.dilation,
+        groups=conv.groups,
+        bias=conv.bias is not None,
+        padding_mode=padding_mode,
+    )
+    spatial_conv.weight = conv.weight
+    spatial_conv.bias = conv.bias
+    return spatial_conv
 
+
+def _apply_group_norm_silu(
+    hidden_states: torch.Tensor,
+    norm: nn.GroupNorm,
+    nonlinearity: nn.Module,
+    spatial_parallel: bool,
+) -> torch.Tensor:
+    if not spatial_parallel:
+        return apply_group_norm_silu(hidden_states, norm, nonlinearity)
+    hidden_states, heights = gather_variable_height(hidden_states)
+    hidden_states = apply_group_norm_silu(
+        hidden_states.contiguous(), norm, nonlinearity
+    )
+    return chunk_height_by_sizes(hidden_states, heights)
+
+
+class HunyuanVAEAttention(nn.Module):
     def __init__(
         self, in_channels, heads, dim_head, eps, norm_num_groups, bias
     ) -> None:
@@ -72,7 +126,11 @@ class HunyuanVAEAttention(nn.Module):
         )
 
     def forward(
-        self, hidden_states: torch.Tensor, attention_mask: torch.Tensor | None = None
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        *,
+        num_frames: int | None = None,
     ) -> torch.Tensor:
         residual = hidden_states
 
@@ -92,10 +150,30 @@ class HunyuanVAEAttention(nn.Module):
         key = key.view(batch_size, -1, self.heads, head_dim).transpose(1, 2)
         value = value.view(batch_size, -1, self.heads, head_dim).transpose(1, 2)
 
-        # Perform scaled dot-product attention
-        hidden_states = F.scaled_dot_product_attention(
-            query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
-        )
+        if num_frames is None:
+            hidden_states = F.scaled_dot_product_attention(
+                query,
+                key,
+                value,
+                attn_mask=attention_mask,
+                dropout_p=0.0,
+                is_causal=False,
+            )
+        else:
+            # each frame sees all spatial tokens in itself and earlier frames
+            # slicing the key prefix avoids a quadratic whole-video mask
+            tokens_per_frame = sequence_length // num_frames
+            hidden_states = torch.cat(
+                [
+                    F.scaled_dot_product_attention(
+                        query[:, :, start : start + tokens_per_frame],
+                        key[:, :, : start + tokens_per_frame],
+                        value[:, :, : start + tokens_per_frame],
+                    )
+                    for start in range(0, sequence_length, tokens_per_frame)
+                ],
+                dim=2,
+            )
 
         # Reshape back
         hidden_states = hidden_states.transpose(1, 2).reshape(
@@ -113,7 +191,6 @@ class HunyuanVAEAttention(nn.Module):
 
 
 class HunyuanVideoCausalConv3d(nn.Module):
-
     def __init__(
         self,
         in_channels: int,
@@ -142,20 +219,47 @@ class HunyuanVideoCausalConv3d(nn.Module):
             kernel_size[2] - 1,
             0,
         )
+        self.spatial_parallel_time_padding = (
+            0,
+            0,
+            0,
+            0,
+            kernel_size[2] - 1,
+            0,
+        )
+        self.spatial_parallel = False
 
         self.conv = nn.Conv3d(
             in_channels, out_channels, kernel_size, stride, padding, dilation, bias=bias
         )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        hidden_states = F.pad(
-            hidden_states, self.time_causal_padding, mode=self.pad_mode
+    def enable_spatial_parallel(self) -> None:
+        if isinstance(self.conv, SpatialParallelConv3d):
+            self.spatial_parallel = True
+            return
+        if self.conv.kernel_size == (1, 1, 1):
+            self.spatial_parallel = True
+            return
+        self.conv = _make_spatial_parallel_conv3d(
+            self.conv,
+            height_pad=self.time_causal_padding[2],
+            width_pad=self.time_causal_padding[0],
+            padding_mode=self.pad_mode,
         )
+        self.spatial_parallel = True
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        padding = (
+            self.spatial_parallel_time_padding
+            if self.spatial_parallel
+            else self.time_causal_padding
+        )
+        if any(padding):
+            hidden_states = F.pad(hidden_states, padding, mode=self.pad_mode)
         return self.conv(hidden_states)
 
 
 class HunyuanVideoUpsampleCausal3D(nn.Module):
-
     def __init__(
         self,
         in_channels: int,
@@ -199,12 +303,13 @@ class HunyuanVideoUpsampleCausal3D(nn.Module):
         else:
             hidden_states = first_frame
 
+        # release interpolation buffers before allocating convolution workspace
+        del first_frame, other_frames
         hidden_states = self.conv(hidden_states)
         return hidden_states
 
 
 class HunyuanVideoDownsampleCausal3D(nn.Module):
-
     def __init__(
         self,
         channels: int,
@@ -227,7 +332,6 @@ class HunyuanVideoDownsampleCausal3D(nn.Module):
 
 
 class HunyuanVideoResnetBlockCausal3D(nn.Module):
-
     def __init__(
         self,
         in_channels: int,
@@ -254,18 +358,19 @@ class HunyuanVideoResnetBlockCausal3D(nn.Module):
             self.conv_shortcut = HunyuanVideoCausalConv3d(
                 in_channels, out_channels, 1, 1, 0
             )
+        self.spatial_parallel = False
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         hidden_states = hidden_states.contiguous()
         residual = hidden_states
 
-        hidden_states = apply_group_norm_silu(
-            hidden_states, self.norm1, self.nonlinearity
+        hidden_states = _apply_group_norm_silu(
+            hidden_states, self.norm1, self.nonlinearity, self.spatial_parallel
         )
         hidden_states = self.conv1(hidden_states)
 
-        hidden_states = apply_group_norm_silu(
-            hidden_states, self.norm2, self.nonlinearity
+        hidden_states = _apply_group_norm_silu(
+            hidden_states, self.norm2, self.nonlinearity, self.spatial_parallel
         )
         hidden_states = self.dropout(hidden_states)
         hidden_states = self.conv2(hidden_states)
@@ -278,7 +383,6 @@ class HunyuanVideoResnetBlockCausal3D(nn.Module):
 
 
 class HunyuanVideoMidBlock3D(nn.Module):
-
     def __init__(
         self,
         in_channels: int,
@@ -338,7 +442,38 @@ class HunyuanVideoMidBlock3D(nn.Module):
         self.attentions = nn.ModuleList(attentions)
         self.resnets = nn.ModuleList(resnets)
 
+        self.spatial_parallel = False
         self.gradient_checkpointing = False
+
+    def _run_attention(
+        self, attn: HunyuanVAEAttention, hidden_states: torch.Tensor
+    ) -> torch.Tensor:
+        heights = None
+        spatial_parallel = (
+            self.spatial_parallel and not spatial_parallel_decode_disabled()
+        )
+        if spatial_parallel:
+            hidden_states, heights = gather_variable_height(hidden_states)
+
+        batch_size, num_channels, num_frames, height, width = hidden_states.shape
+        hidden_states = hidden_states.permute(0, 2, 3, 4, 1).flatten(1, 3)
+        if spatial_parallel:
+            hidden_states = attn(hidden_states, num_frames=num_frames)
+        else:
+            attention_mask = prepare_causal_attention_mask(
+                num_frames,
+                height * width,
+                hidden_states.dtype,
+                hidden_states.device,
+                batch_size=batch_size,
+            )
+            hidden_states = attn(hidden_states, attention_mask=attention_mask)
+        hidden_states = hidden_states.unflatten(1, (num_frames, height, width)).permute(
+            0, 4, 1, 2, 3
+        )
+        if heights is not None:
+            hidden_states = chunk_height_by_sizes(hidden_states, heights)
+        return hidden_states
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if torch.is_grad_enabled() and self.gradient_checkpointing:
@@ -348,21 +483,7 @@ class HunyuanVideoMidBlock3D(nn.Module):
 
             for attn, resnet in zip(self.attentions, self.resnets[1:], strict=True):
                 if attn is not None:
-                    batch_size, num_channels, num_frames, height, width = (
-                        hidden_states.shape
-                    )
-                    hidden_states = hidden_states.permute(0, 2, 3, 4, 1).flatten(1, 3)
-                    attention_mask = prepare_causal_attention_mask(
-                        num_frames,
-                        height * width,
-                        hidden_states.dtype,
-                        hidden_states.device,
-                        batch_size=batch_size,
-                    )
-                    hidden_states = attn(hidden_states, attention_mask=attention_mask)
-                    hidden_states = hidden_states.unflatten(
-                        1, (num_frames, height, width)
-                    ).permute(0, 4, 1, 2, 3)
+                    hidden_states = self._run_attention(attn, hidden_states)
 
                 hidden_states = self._gradient_checkpointing_func(resnet, hidden_states)
 
@@ -371,21 +492,7 @@ class HunyuanVideoMidBlock3D(nn.Module):
 
             for attn, resnet in zip(self.attentions, self.resnets[1:], strict=True):
                 if attn is not None:
-                    batch_size, num_channels, num_frames, height, width = (
-                        hidden_states.shape
-                    )
-                    hidden_states = hidden_states.permute(0, 2, 3, 4, 1).flatten(1, 3)
-                    attention_mask = prepare_causal_attention_mask(
-                        num_frames,
-                        height * width,
-                        hidden_states.dtype,
-                        hidden_states.device,
-                        batch_size=batch_size,
-                    )
-                    hidden_states = attn(hidden_states, attention_mask=attention_mask)
-                    hidden_states = hidden_states.unflatten(
-                        1, (num_frames, height, width)
-                    ).permute(0, 4, 1, 2, 3)
+                    hidden_states = self._run_attention(attn, hidden_states)
 
                 hidden_states = resnet(hidden_states)
 
@@ -393,7 +500,6 @@ class HunyuanVideoMidBlock3D(nn.Module):
 
 
 class HunyuanVideoDownBlock3D(nn.Module):
-
     def __init__(
         self,
         in_channels: int,
@@ -457,7 +563,6 @@ class HunyuanVideoDownBlock3D(nn.Module):
 
 
 class HunyuanVideoUpBlock3D(nn.Module):
-
     def __init__(
         self,
         in_channels: int,
@@ -736,6 +841,7 @@ class HunyuanVideoDecoder3D(nn.Module):
             block_out_channels[0], out_channels, kernel_size=3
         )
 
+        self.spatial_parallel = False
         self.gradient_checkpointing = False
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -757,12 +863,27 @@ class HunyuanVideoDecoder3D(nn.Module):
                 hidden_states = up_block(hidden_states)
 
         # post-process
-        hidden_states = apply_group_norm_silu(
-            hidden_states, self.conv_norm_out, self.conv_act
+        hidden_states = _apply_group_norm_silu(
+            hidden_states,
+            self.conv_norm_out,
+            self.conv_act,
+            self.spatial_parallel,
         )
         hidden_states = self.conv_out(hidden_states)
 
         return hidden_states
+
+
+def _enable_hunyuan_decoder_spatial_parallel(decoder: nn.Module) -> None:
+    for module in decoder.modules():
+        if isinstance(module, HunyuanVideoCausalConv3d):
+            module.enable_spatial_parallel()
+        elif isinstance(module, HunyuanVideoResnetBlockCausal3D):
+            module.spatial_parallel = True
+        elif isinstance(module, HunyuanVideoMidBlock3D):
+            module.spatial_parallel = True
+        elif isinstance(module, HunyuanVideoDecoder3D):
+            module.spatial_parallel = True
 
 
 class AutoencoderKLHunyuanVideo(ParallelTiledVAE):
@@ -821,6 +942,16 @@ class AutoencoderKLHunyuanVideo(ParallelTiledVAE):
             self.post_quant_conv = nn.Conv3d(
                 config.latent_channels, config.latent_channels, kernel_size=1
             )
+            self._spatial_parallel_decode_enabled = False
+            if can_install_spatial_shard_parallel_decode(self.config):
+                _enable_hunyuan_decoder_spatial_parallel(self.decoder)
+                self._spatial_parallel_decode_enabled = True
+
+    def _should_use_spatial_parallel_decode(self, z: torch.Tensor) -> bool:
+        return (
+            self._spatial_parallel_decode_enabled
+            and should_run_spatial_shard_parallel_decode(self.config, z)
+        )
 
     def _encode(self, x: torch.Tensor) -> torch.Tensor:
         x = self.encoder(x)
@@ -829,7 +960,22 @@ class AutoencoderKLHunyuanVideo(ParallelTiledVAE):
 
     def _decode(self, z: torch.Tensor) -> torch.Tensor:
         z = self.post_quant_conv(z)
-        dec = self.decoder(z)
+        if self._should_use_spatial_parallel_decode(z):
+            expected_height = (
+                z.shape[-2] * self.config.arch_config.spatial_compression_ratio
+            )
+            z, expected_height = split_height_for_parallel_decode(
+                z,
+                expected_height=expected_height,
+                world_size=get_decode_parallel_world_size(),
+                rank=get_decode_parallel_rank(),
+            )
+            dec = gather_and_trim_height(self.decoder(z), expected_height)
+        elif self._spatial_parallel_decode_enabled:
+            with disable_spatial_parallel_decode():
+                dec = self.decoder(z)
+        else:
+            dec = self.decoder(z)
         return dec
 
     def forward(

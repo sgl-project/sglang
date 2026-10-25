@@ -6,19 +6,18 @@
 import ast
 import importlib
 import os
-import pickle
-import subprocess
-import sys
-import tempfile
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Set
+from collections import deque
+from collections.abc import Set
 from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import NoReturn, TypeVar, cast
+from typing import NoReturn, cast
 
-import cloudpickle
 from torch import nn
 
+from sglang.multimodal_gen.runtime.utils.external_model_package import (
+    load_external_model_package,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -69,6 +68,8 @@ def _discover_and_register_models() -> dict[str, tuple[str, str, str]]:
             try:
                 with open(filepath, "r", encoding="utf-8") as f:
                     source = f.read()
+                if "EntryClass" not in source:
+                    continue
                 tree = ast.parse(source, filename=filename)
 
                 entry_class_node = None
@@ -76,64 +77,59 @@ def _discover_and_register_models() -> dict[str, tuple[str, str, str]]:
 
                 # Collect all class definitions and their _aliases
                 file_class_aliases: dict[str, list[str]] = {}
-                for node in ast.walk(tree):
+                # expressions cannot contain class/assignment statements; skip
+                # tensor computations while preserving breadth-first discovery
+                nodes = deque([tree])
+                while nodes:
+                    node = nodes.popleft()
+                    if isinstance(node, ast.expr):
+                        continue
+                    nodes.extend(ast.iter_child_nodes(node))
                     if isinstance(node, ast.ClassDef):
                         if first_class_def is None:
                             first_class_def = node
                         # Look for _aliases in the class body
                         for class_body_node in node.body:
-                            if isinstance(class_body_node, ast.Assign):
-                                for target in class_body_node.targets:
-                                    if (
-                                        isinstance(target, ast.Name)
-                                        and target.id == "_aliases"
-                                    ):
-                                        aliases = _parse_aliases_from_ast(
-                                            class_body_node.value
-                                        )
-                                        if aliases:
-                                            file_class_aliases[node.name] = aliases
-                    if isinstance(node, ast.Assign):
-                        for target in node.targets:
-                            if (
-                                isinstance(target, ast.Name)
-                                and target.id == "EntryClass"
+                            if isinstance(class_body_node, ast.Assign) and any(
+                                isinstance(target, ast.Name) and target.id == "_aliases"
+                                for target in class_body_node.targets
                             ):
-                                entry_class_node = node
-                                break
+                                aliases = _parse_aliases_from_ast(class_body_node.value)
+                                if aliases:
+                                    file_class_aliases[node.name] = aliases
+                    elif isinstance(node, ast.Assign) and any(
+                        isinstance(target, ast.Name) and target.id == "EntryClass"
+                        for target in node.targets
+                    ):
+                        entry_class_node = node
 
-                if entry_class_node and first_class_def:
-                    model_cls_name_list = []
-                    value_node = entry_class_node.value
+                if entry_class_node is None or first_class_def is None:
+                    continue
+                value_node = entry_class_node.value
+                if isinstance(value_node, ast.Name):
+                    entries = [value_node]
+                elif isinstance(value_node, (ast.List, ast.Tuple)):
+                    entries = value_node.elts
+                else:
+                    continue
 
-                    # EntryClass = ClassName
-                    if isinstance(value_node, ast.Name):
-                        model_cls_name_list.append(value_node.id)
-                    # EntryClass = ["...", ClassName, ...]
-                    elif isinstance(value_node, (ast.List, ast.Tuple)):
-                        for elt in value_node.elts:
-                            if isinstance(elt, ast.Constant):
-                                model_cls_name_list.append(elt.value)
-                            elif isinstance(elt, ast.Name):
-                                model_cls_name_list.append(elt.id)
-
-                    if model_cls_name_list:
-                        for model_cls_str in model_cls_name_list:
-                            if model_cls_str in discovered_models:
-                                logger.warning(
-                                    f"Duplicate architecture found: {model_cls_str}. It will be overwritten."
-                                )
-                            model_arch = model_cls_str
-                            discovered_models[model_arch] = (
-                                component,
-                                mod_relname,
-                                model_cls_str,
-                            )
-                            # Collect aliases for this class
-                            if model_cls_str in file_class_aliases:
-                                class_aliases[model_cls_str] = file_class_aliases[
-                                    model_cls_str
-                                ]
+                for entry in entries:
+                    if not isinstance(entry, (ast.Name, ast.Constant)):
+                        continue
+                    model_arch = (
+                        entry.id if isinstance(entry, ast.Name) else entry.value
+                    )
+                    if model_arch in discovered_models:
+                        logger.warning(
+                            f"Duplicate architecture found: {model_arch}. It will be overwritten."
+                        )
+                    discovered_models[model_arch] = (
+                        component,
+                        mod_relname,
+                        model_arch,
+                    )
+                    if model_arch in file_class_aliases:
+                        class_aliases[model_arch] = file_class_aliases[model_arch]
 
             except Exception as e:
                 logger.warning(f"Could not parse {filepath} to find models: {e}")
@@ -153,32 +149,8 @@ def _discover_and_register_models() -> dict[str, tuple[str, str, str]]:
 
 _SGLANG_DIFFUSION_MODELS = _discover_and_register_models()
 
-_SUBPROCESS_COMMAND = [
-    sys.executable,
-    "-m",
-    "sglang.multimodal_gen.runtime.models.dits.registry",
-]
-
-_T = TypeVar("_T")
-
-
-@dataclass(frozen=True)
-class _ModelInfo:
-    architecture: str
-
-    @staticmethod
-    def from_model_cls(model: type[nn.Module]) -> "_ModelInfo":
-        return _ModelInfo(
-            architecture=model.__name__,
-        )
-
 
 class _BaseRegisteredModel(ABC):
-
-    @abstractmethod
-    def inspect_model_cls(self) -> _ModelInfo:
-        raise NotImplementedError
-
     @abstractmethod
     def load_model_cls(self) -> type[nn.Module]:
         raise NotImplementedError
@@ -190,49 +162,10 @@ class _RegisteredModel(_BaseRegisteredModel):
     Represents a model that has already been imported in the main process.
     """
 
-    interfaces: _ModelInfo
     model_cls: type[nn.Module]
-
-    @staticmethod
-    def from_model_cls(model_cls: type[nn.Module]):
-        return _RegisteredModel(
-            interfaces=_ModelInfo.from_model_cls(model_cls),
-            model_cls=model_cls,
-        )
-
-    def inspect_model_cls(self) -> _ModelInfo:
-        return self.interfaces
 
     def load_model_cls(self) -> type[nn.Module]:
         return self.model_cls
-
-
-def _run_in_subprocess(fn: Callable[[], _T]) -> _T:
-    # NOTE: We use a temporary directory instead of a temporary file to avoid
-    # issues like https://stackoverflow.com/questions/23212435/permission-denied-to-write-to-my-temporary-file
-    with tempfile.TemporaryDirectory() as tempdir:
-        output_filepath = os.path.join(tempdir, "registry_output.tmp")
-
-        # `cloudpickle` allows pickling lambda functions directly
-        input_bytes = cloudpickle.dumps((fn, output_filepath))
-
-        # cannot use `sys.executable __file__` here because the script
-        # contains relative imports
-        returned = subprocess.run(
-            _SUBPROCESS_COMMAND, input=input_bytes, capture_output=True
-        )
-
-        # check if the subprocess is successful
-        try:
-            returned.check_returncode()
-        except Exception as e:
-            # wrap raised exception to provide more information
-            raise RuntimeError(
-                f"Error raised in subprocess:\n" f"{returned.stderr.decode()}"
-            ) from e
-
-        with open(output_filepath, "rb") as f:
-            return cast(_T, pickle.load(f))
 
 
 @dataclass(frozen=True)
@@ -242,14 +175,7 @@ class _LazyRegisteredModel(_BaseRegisteredModel):
     """
 
     module_name: str
-    component_name: str
     class_name: str
-
-    # Performed in another process to avoid initializing CUDA
-    def inspect_model_cls(self) -> _ModelInfo:
-        return _run_in_subprocess(
-            lambda: _ModelInfo.from_model_cls(self.load_model_cls())
-        )
 
     def load_model_cls(self) -> type[nn.Module]:
         mod = importlib.import_module(self.module_name)
@@ -271,28 +197,18 @@ def _try_load_model_cls(
         return None
 
 
-@lru_cache(maxsize=128)
-def _try_inspect_model_cls(
-    model_arch: str,
-    model: _BaseRegisteredModel,
-) -> _ModelInfo | None:
-    try:
-        return model.inspect_model_cls()
-    except Exception:
-        logger.exception("Error in inspecting model architecture '%s'", model_arch)
-        return None
-
-
 @dataclass
 class _ModelRegistry:
     # Keyed by model_arch
     registered_models: dict[str, _BaseRegisteredModel] = field(default_factory=dict)
 
     def get_supported_archs(self) -> Set[str]:
+        load_external_model_package()
         return self.registered_models.keys()
 
     def resolve_by_alias(self, alias: str) -> type[nn.Module] | None:
         """Resolve a model class by its alias (external module path)."""
+        load_external_model_package()
         if alias in _ALIAS_TO_MODEL:
             canonical_name = _ALIAS_TO_MODEL[alias]
             return self._try_load_model_cls(canonical_name)
@@ -304,7 +220,7 @@ class _ModelRegistry:
         model_cls: type[nn.Module] | str,
     ) -> None:
         """
-        Register an external model to be used in vLLM.
+        Register an external model to be used in SGLang-Diffusion.
 
         :code:`model_cls` can be either:
 
@@ -328,9 +244,11 @@ class _ModelRegistry:
                 msg = "Expected a string in the format `<module>:<class>`"
                 raise ValueError(msg)
 
-            model = _LazyRegisteredModel(*split_str)
+            model = _LazyRegisteredModel(
+                module_name=split_str[0], class_name=split_str[1]
+            )
         else:
-            model = _RegisteredModel.from_model_cls(model_cls)
+            model = _RegisteredModel(model_cls=model_cls)
 
         self.registered_models[model_arch] = model
 
@@ -354,16 +272,11 @@ class _ModelRegistry:
 
         return _try_load_model_cls(model_arch, self.registered_models[model_arch])
 
-    def _try_inspect_model_cls(self, model_arch: str) -> _ModelInfo | None:
-        if model_arch not in self.registered_models:
-            return None
-
-        return _try_inspect_model_cls(model_arch, self.registered_models[model_arch])
-
     def _normalize_archs(
         self,
         architectures: str | list[str],
     ) -> list[str]:
+        load_external_model_package()
         if isinstance(architectures, str):
             architectures = [architectures]
         if not architectures:
@@ -372,25 +285,19 @@ class _ModelRegistry:
         normalized_arch = []
         for arch in architectures:
             if arch not in self.registered_models:
+                # A checkpoint may name a class that is only a rename of one we
+                # already implement (e.g. LTX-2.5's `LTX2VocoderWithBWE` is
+                # `LTX2Vocoder`); `_aliases` declares those equivalences.
+                canonical = _ALIAS_TO_MODEL.get(arch)
+                if canonical is not None and canonical in self.registered_models:
+                    normalized_arch.append(canonical)
+                    continue
                 registered_models = list(self.registered_models.keys())
                 raise Exception(
                     f"Unsupported model architecture: {arch}. Registered architectures: {registered_models}"
                 )
             normalized_arch.append(arch)
         return normalized_arch
-
-    def inspect_model_cls(
-        self,
-        architectures: str | list[str],
-    ) -> tuple[_ModelInfo, str]:
-        architectures = self._normalize_archs(architectures)
-
-        for arch in architectures:
-            model_info = self._try_inspect_model_cls(arch)
-            if model_info is not None:
-                return (model_info, arch)
-
-        return self._raise_for_unsupported(architectures)
 
     def resolve_model_cls(
         self,
@@ -410,7 +317,6 @@ ModelRegistry = _ModelRegistry(
     {
         model_arch: _LazyRegisteredModel(
             module_name=f"sglang.multimodal_gen.runtime.models.{component_name}.{mod_relname}",
-            component_name=component_name,
             class_name=cls_name,
         )
         for model_arch, (

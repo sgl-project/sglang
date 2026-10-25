@@ -13,75 +13,109 @@
 # ==============================================================================
 
 import logging
+import math
+import re
+from array import array
+from functools import partial
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
-from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
+from sglang.srt.batch_overlap.two_batch_overlap import model_forward_stages
 from sglang.srt.configs.model_config import get_mimo_v2_fused_qkv_expected_tp_size
-from sglang.srt.distributed import (
-    get_moe_expert_parallel_world_size,
-    get_pp_group,
-    get_tensor_model_parallel_world_size,
-    tensor_model_parallel_all_reduce,
-)
+from sglang.srt.distributed.utils import get_group_rank_size
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
-from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.communicator import (
-    LayerCommunicator,
-    LayerScatterModes,
-    ScatterMode,
-    enable_moe_dense_fully_dp,
+from sglang.srt.layers.aux_hidden_states import (
+    AuxHiddenStateAccumulator,
+    AuxHiddenStatePacker,
 )
 from sglang.srt.layers.dp_attention import (
-    get_attention_tp_rank,
-    get_attention_tp_size,
     is_dp_attention_enabled,
 )
+from sglang.srt.layers.flashinfer_comm_fusion import uses_cutedsl_ar_fusion
+from sglang.srt.layers.layer_boundary import (
+    append_stages,
+    declare_attn,
+    declare_ffn,
+    is_dense_ffn_fully_dp,
+)
+from sglang.srt.layers.layer_boundary.fusions.cutedsl import (
+    CuteDSLFusion,
+    MoeDeferredFinalize,
+    install_cutedsl_fusion,
+)
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
+    LinearParallelGroup,
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
+    resolve_linear_parallel_group,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     get_moe_runner_backend,
-    should_skip_post_experts_all_reduce,
 )
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
-from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
+from sglang.srt.layers.moe.topk import (
+    TopK,
+    TopKOutputChecker,
+    TopKOutputFormat,
+    is_expert_remapping_enabled,
+)
+from sglang.srt.layers.moe.utils import (
+    RoutingMethodType,
+    is_deepep_class_backend,
+    sum_post_experts_output,
+)
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
+    Mxfp4FlashinferTrtllmMoEMethod,
+)
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
+    pad_mm_tokens,
 )
-from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalInputs,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     kv_cache_scales_loader,
 )
-from sglang.srt.models.mimo_audio import MiMoAudioEncoder, MiMoAudioEncoderConfig
+from sglang.srt.models.mimo_audio import AudioEncoderMixin, MiMoAudioEncoderConfig
 from sglang.srt.models.mimo_vl import MiMoVisionTransformer, MiMoVLVisionConfig
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_flags,
+    get_forward,
+    get_parallel,
+)
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
+    ceil_align,
     is_non_idle_and_non_empty,
-    make_layers,
+    make_pp_layers,
 )
 
 MiMoV2Config = None
@@ -90,12 +124,39 @@ logger = logging.getLogger(__name__)
 
 
 def load_mimo_v2_qkv_proj_weight(
-    name, param, loaded_weight, expected_fused_tp_size: Optional[int] = None
+    name,
+    param,
+    loaded_weight,
+    expected_fused_tp_size: Optional[int] = None,
+    deferred_scale_inv: Optional[Dict[str, torch.Tensor]] = None,
+    *,
+    qkv_proj: QKVParallelLinear,
 ):
-    if loaded_weight.shape == param.shape:
-        # The checkpoint already stores this rank's qkv_proj shard.
+    qkv_proj = unwrap_lora_layer(qkv_proj)
+    tp_rank, tp_size = get_group_rank_size(qkv_proj.tp_group)
+    ckpt_tp = expected_fused_tp_size if expected_fused_tp_size is not None else tp_size
+
+    if ckpt_tp == tp_size and loaded_weight.shape == param.shape:
         default_weight_loader(param, loaded_weight)
         return
+
+    if expected_fused_tp_size is not None and expected_fused_tp_size % tp_size != 0:
+        raise ValueError(
+            f"MiMoV2 fused qkv_proj checkpoint is TP={expected_fused_tp_size}-"
+            f"interleaved; got attention tp_size={tp_size} while loading {name}."
+        )
+
+    is_scale_inv = "weight_scale_inv" in name
+
+    if is_scale_inv and ckpt_tp != tp_size:
+        if deferred_scale_inv is not None:
+            deferred_scale_inv[name] = loaded_weight.clone()
+            return
+        raise ValueError(
+            f"qkv_proj scale_inv {name}: shape mismatch "
+            f"{tuple(loaded_weight.shape)} vs {tuple(param.shape)} "
+            f"due to block quantization ceiling; pass deferred_scale_inv dict"
+        )
 
     if loaded_weight.ndim != param.ndim or loaded_weight.shape[1:] != param.shape[1:]:
         raise ValueError(
@@ -103,22 +164,157 @@ def load_mimo_v2_qkv_proj_weight(
             f"expected sharded {tuple(param.shape)}"
         )
 
-    tp_size = get_attention_tp_size()
-    tp_rank = get_attention_tp_rank()
-    if expected_fused_tp_size is not None and tp_size != expected_fused_tp_size:
-        raise ValueError(
-            f"MiMoV2 fused qkv_proj checkpoint is TP={expected_fused_tp_size}-"
-            f"interleaved; got attention tp_size={tp_size} while loading {name}."
+    if tp_size == ckpt_tp:
+        fused_shape = (param.shape[0] * tp_size, *param.shape[1:])
+        if tuple(loaded_weight.shape) != fused_shape:
+            raise ValueError(
+                f"qkv_proj weight {name}: unexpected shape "
+                f"{tuple(loaded_weight.shape)}; expected fused {fused_shape} "
+                f"or sharded {tuple(param.shape)}"
+            )
+        default_weight_loader(param, loaded_weight.chunk(tp_size, dim=0)[tp_rank])
+    else:
+        shards_per_rank = ckpt_tp // tp_size
+        shards = loaded_weight.chunk(ckpt_tp, dim=0)
+        merged = torch.cat(
+            shards[tp_rank * shards_per_rank : (tp_rank + 1) * shards_per_rank],
+            dim=0,
+        )
+        default_weight_loader(param, merged)
+
+
+def _get_ckpt_qkv_shard_sizes(config, layer_name, ckpt_tp):
+    m = re.search(r"layers\.(\d+)\.", layer_name)
+    if m is None:
+        return None
+    layer_id = int(m.group(1))
+
+    pattern = getattr(config, "hybrid_layer_pattern", None)
+    is_swa = pattern is not None and pattern[layer_id] == 1
+
+    if is_swa:
+        nh = config.swa_num_attention_heads
+        nkv = config.swa_num_key_value_heads
+        hd = config.swa_head_dim
+        vhd = getattr(config, "swa_v_head_dim", hd)
+    else:
+        nh = config.num_attention_heads
+        nkv = config.num_key_value_heads
+        hd = config.head_dim
+        vhd = getattr(config, "v_head_dim", hd)
+
+    q_per_shard = (nh // ckpt_tp) * hd
+    k_per_shard = max(1, nkv // ckpt_tp) * hd
+    v_per_shard = max(1, nkv // ckpt_tp) * vhd
+    return (q_per_shard, k_per_shard, v_per_shard)
+
+
+def _deinterleave_qkv_shards(shards, q_per_shard, k_per_shard, v_per_shard):
+    all_q, all_k, all_v = [], [], []
+    for s in shards:
+        all_q.append(s[:q_per_shard])
+        all_k.append(s[q_per_shard : q_per_shard + k_per_shard])
+        all_v.append(s[q_per_shard + k_per_shard :])
+    return torch.cat(all_q + all_k + all_v, dim=0)
+
+
+def _resolve_deferred_qkv_scale_inv(
+    params_dict: Dict[str, torch.nn.Parameter],
+    deferred_scale_inv: Dict[str, torch.Tensor],
+    expected_fused_tp_size: int,
+    block_size: int = 128,
+    config=None,
+    *,
+    model: nn.Module,
+):
+    ckpt_tp = expected_fused_tp_size
+
+    for scale_name, ckpt_scale in deferred_scale_inv.items():
+        weight_name = scale_name.replace(".weight_scale_inv", ".weight")
+        if weight_name not in params_dict:
+            raise ValueError(
+                f"Cannot resolve deferred scale_inv {scale_name}: "
+                f"weight {weight_name} not found"
+            )
+
+        qkv_proj = unwrap_lora_layer(model.get_submodule(weight_name.rsplit(".", 1)[0]))
+        tp_rank, tp_size = get_group_rank_size(qkv_proj.tp_group)
+        shards_per_rank = ckpt_tp // tp_size
+        weight_param = params_dict[weight_name]
+        scale_param = params_dict[scale_name]
+        weight_data = weight_param.data
+
+        ckpt_scale_shards = ckpt_scale.chunk(ckpt_tp, dim=0)
+        my_scale_shards = ckpt_scale_shards[
+            tp_rank * shards_per_rank : (tp_rank + 1) * shards_per_rank
+        ]
+
+        weight_rows = weight_data.shape[0]
+        rows_per_ckpt_shard = weight_rows // shards_per_rank
+        block_k = ckpt_scale.shape[1]
+
+        device = weight_data.device
+        dequant_shards = []
+        for i, shard_scale in enumerate(my_scale_shards):
+            shard_weight = weight_data[
+                i * rows_per_ckpt_shard : (i + 1) * rows_per_ckpt_shard
+            ]
+            shard_scale_f32 = shard_scale.to(dtype=torch.float32, device=device)
+            scale_expanded = shard_scale_f32.repeat_interleave(
+                block_size, dim=0
+            ).repeat_interleave(block_size, dim=1)
+            scale_expanded = scale_expanded[
+                : shard_weight.shape[0], : shard_weight.shape[1]
+            ]
+            dequant_shards.append(
+                (shard_weight.to(torch.float32) * scale_expanded).to(torch.bfloat16)
+            )
+
+        qkv_sizes = (
+            _get_ckpt_qkv_shard_sizes(config, scale_name, ckpt_tp)
+            if config is not None
+            else None
+        )
+        if qkv_sizes is not None and shards_per_rank > 1:
+            merged_bf16 = _deinterleave_qkv_shards(dequant_shards, *qkv_sizes)
+        else:
+            merged_bf16 = torch.cat(dequant_shards, dim=0)
+
+        n, k = merged_bf16.shape
+        n_pad = ceil_align(n, block_size)
+        k_pad = ceil_align(k, block_size)
+        padded = torch.zeros(
+            n_pad, k_pad, dtype=merged_bf16.dtype, device=merged_bf16.device
+        )
+        padded[:n, :k] = merged_bf16
+        blocks = padded.view(
+            n_pad // block_size, block_size, k_pad // block_size, block_size
+        )
+        amax = blocks.abs().float().amax(dim=(1, 3), keepdim=True).clamp(min=1e-12)
+        finfo = torch.finfo(torch.float8_e4m3fn)
+        new_scale_inv = amax / finfo.max
+        new_fp8 = (
+            (blocks.float() / new_scale_inv)
+            .clamp(min=finfo.min, max=finfo.max)
+            .to(torch.float8_e4m3fn)
         )
 
-    fused_shape = (param.shape[0] * tp_size, *param.shape[1:])
-    if tuple(loaded_weight.shape) != fused_shape:
-        raise ValueError(
-            f"qkv_proj weight {name}: unexpected shape {tuple(loaded_weight.shape)}; "
-            f"expected fused {fused_shape} or sharded {tuple(param.shape)}"
+        n_scale = math.ceil(n / block_size)
+        k_scale = math.ceil(k / block_size)
+        weight_param.data.copy_(new_fp8.view(n_pad, k_pad)[:n, :k].contiguous())
+        default_weight_loader(
+            scale_param,
+            new_scale_inv.view(n_pad // block_size, k_pad // block_size)[
+                :n_scale, :k_scale
+            ].contiguous(),
         )
 
-    default_weight_loader(param, loaded_weight.chunk(tp_size, dim=0)[tp_rank])
+        logger.info(
+            f"Resolved deferred qkv scale_inv {scale_name}: "
+            f"dequant {shards_per_rank} shards -> requant "
+            f"({n_scale}, {k_scale})"
+            + (f", de-interleaved QKV {qkv_sizes}" if qkv_sizes else "")
+        )
 
 
 class MiMoV2MLP(nn.Module):
@@ -130,11 +326,11 @@ class MiMoV2MLP(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         reduce_results: bool = True,
         prefix: str = "",
-        tp_rank: Optional[int] = None,
-        tp_size: Optional[int] = None,
+        *,
+        parallel_group: LinearParallelGroup = "tp",
     ) -> None:
         super().__init__()
-        self.tp_size = tp_size
+        self.is_replicated = parallel_group == "replicated"
 
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
@@ -142,8 +338,7 @@ class MiMoV2MLP(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("gate_up_proj", prefix),
-            tp_rank=tp_rank,
-            tp_size=tp_size,
+            parallel_group=parallel_group,
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
@@ -152,13 +347,11 @@ class MiMoV2MLP(nn.Module):
             quant_config=quant_config,
             reduce_results=reduce_results,
             prefix=add_prefix("down_proj", prefix),
-            tp_rank=tp_rank,
-            tp_size=tp_size,
+            parallel_group=parallel_group,
         )
         if hidden_act != "silu":
             raise ValueError(
-                f"Unsupported activation: {hidden_act}. "
-                "Only silu is supported for now."
+                f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
 
@@ -166,17 +359,13 @@ class MiMoV2MLP(nn.Module):
         self,
         x,
         forward_batch: ForwardBatch = None,
-        should_allreduce_fusion: bool = False,
-        use_reduce_scatter: bool = False,
     ):
-        if (self.tp_size == 1) and x.shape[0] == 0:
+        if self.is_replicated and x.shape[0] == 0:
             return x
 
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
-        x, _ = self.down_proj(
-            x, skip_all_reduce=should_allreduce_fusion or use_reduce_scatter
-        )
+        x, _ = self.down_proj(x)
         return x
 
 
@@ -190,7 +379,7 @@ class MoEGate(nn.Module):
     ):
         super().__init__()
         self.is_nextn = is_nextn
-        self.dtype = torch.float32
+        self.dtype = getattr(torch, getattr(config, "moe_router_dtype", "float32"))
         self.weight = nn.Parameter(
             torch.empty((config.n_routed_experts, config.hidden_size), dtype=self.dtype)
         )
@@ -200,7 +389,7 @@ class MoEGate(nn.Module):
                 if quant_config is not None
                 and quant_config.get_name() == "modelopt_fp4"
                 and get_moe_runner_backend().is_flashinfer_trtllm()
-                else self.dtype
+                else torch.float32
             )
             self.e_score_correction_bias = nn.Parameter(
                 torch.empty((config.n_routed_experts), dtype=correction_bias_dtype)
@@ -209,13 +398,18 @@ class MoEGate(nn.Module):
             self.e_score_correction_bias = None
 
     def forward(self, hidden_states):
-        logits = F.linear(hidden_states.to(self.dtype), self.weight, None)
+        if self.dtype != torch.float32 and hidden_states.is_cuda:
+            return torch.mm(
+                hidden_states.to(self.dtype),
+                self.weight.t(),
+                out_dtype=torch.float32,
+            )
 
-        return logits
+        logits = F.linear(hidden_states.to(self.dtype), self.weight, None)
+        return logits.to(torch.float32)
 
 
 class MiMoV2MoE(nn.Module):
-
     def __init__(
         self,
         config: MiMoV2Config,
@@ -225,7 +419,7 @@ class MiMoV2MoE(nn.Module):
         is_nextn: bool = False,
     ):
         super().__init__()
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_size = get_parallel().tp_size
 
         self.config = config
         self.layer_id = layer_id
@@ -249,26 +443,35 @@ class MiMoV2MoE(nn.Module):
             is_nextn=is_nextn,
         )
 
+        routing_method_type = (
+            RoutingMethodType.DeepSeekV3
+            if self.gate.e_score_correction_bias is not None and config.norm_topk_prob
+            else None
+        )
         experts_type = get_moe_impl_class(quant_config)
         self.experts = experts_type(
             num_experts=config.n_routed_experts
-            + get_global_server_args().ep_num_redundant_experts,
+            + get_exec().moe.ep_num_redundant_experts,
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
             layer_id=self.layer_id,
             quant_config=quant_config,
             routed_scaling_factor=1.0,
+            routing_method_type=routing_method_type,
             prefix=add_prefix("experts", prefix),
         )
 
         self.topk = TopK(
             top_k=config.num_experts_per_tok,
+            layer_id=self.layer_id,
             renormalize=config.norm_topk_prob,
             use_grouped_topk=True,
             num_expert_group=config.n_group,
             topk_group=config.topk_group,
             correction_bias=self.gate.e_score_correction_bias,
+            is_fp4_experts=getattr(quant_config, "is_fp4_experts", False),
+            scoring_func=config.scoring_func,
             quant_config=quant_config,
             routed_scaling_factor=1.0,
             apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk,
@@ -276,14 +479,48 @@ class MiMoV2MoE(nn.Module):
             # and requires the output format to be standard. We use quant_config to determine the output format.
             output_format=TopKOutputFormat.STANDARD if quant_config is None else None,
         )
+        self.topk.bind_runner_backend(
+            self.experts.runner_backend,
+            routing_method_type=self.experts.routing_method_type,
+        )
+
+        uses_mxfp4_runner = isinstance(
+            self.experts.quant_method, Mxfp4FlashinferTrtllmMoEMethod
+        )
+        self._uses_expert_remap = (
+            not get_flags().moe.in_speculative_scope and is_expert_remapping_enabled()
+        )
+        use_bypassed_topk = (
+            uses_cutedsl_ar_fusion()
+            and not get_flags().moe.in_speculative_scope
+            and not self._uses_expert_remap
+            and not get_exec().features.enable_return_routed_experts
+            and get_exec().moe.expert_distribution_recorder_mode is None
+            and not envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
+            and not envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
+            and uses_mxfp4_runner
+            and get_moe_a2a_backend().is_none()
+            and self.experts.quant_method.configure_bypassed_topk(self.topk.topk_config)
+        )
+        if uses_mxfp4_runner:
+            self.topk.topk_config.output_format = (
+                TopKOutputFormat.BYPASSED
+                if use_bypassed_topk
+                else TopKOutputFormat.STANDARD
+            )
+        self.supports_deferred_finalize = (
+            use_bypassed_topk and envs.SGLANG_ENABLE_MOE_DEFERRED_FINALIZE.get()
+        )
 
         # todo : implement tbo forward needed
-        if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
+        self._enable_a2a_moe = (
+            is_deepep_class_backend() or get_moe_a2a_backend().is_ascend_fuseep()
+        )
+        if self._enable_a2a_moe:
             # TODO: we will support tp < ep in the future
-            self.ep_size = get_moe_expert_parallel_world_size()
+            self.ep_size = get_parallel().moe_ep_size
             self.num_experts = (
-                config.n_routed_experts
-                + get_global_server_args().ep_num_redundant_experts
+                config.n_routed_experts + get_exec().moe.ep_num_redundant_experts
             )
             self.renormalize = config.norm_topk_prob
             self.topk_group = config.topk_group
@@ -293,10 +530,6 @@ class MiMoV2MoE(nn.Module):
                 if self.gate.e_score_correction_bias is not None
                 else None
             )
-
-        self._enable_a2a_moe = (
-            get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake()
-        )
 
     def get_moe_weights(self):
         return [
@@ -309,40 +542,41 @@ class MiMoV2MoE(nn.Module):
         self,
         hidden_states: torch.Tensor,
         forward_batch: Optional[ForwardBatch] = None,
-        should_allreduce_fusion: bool = False,
-        use_reduce_scatter: bool = False,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | MoeDeferredFinalize:
         if not self._enable_a2a_moe:
-            return self.forward_normal(
-                hidden_states,
-                should_allreduce_fusion,
-                use_reduce_scatter,
-            )
+            return self.forward_normal(hidden_states)
         else:
             return self.forward_deepep(hidden_states, forward_batch)
 
     def forward_normal(
         self,
         hidden_states: torch.Tensor,
-        should_allreduce_fusion: bool = False,
-        use_reduce_scatter: bool = False,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | MoeDeferredFinalize:
 
         if hidden_states.shape[0] > 0:
-            # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states)
-            topk_output = self.topk(hidden_states, router_logits)
+            topk_output = self.topk(
+                hidden_states,
+                router_logits,
+            )
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)
 
-        final_hidden_states = self.experts(hidden_states, topk_output)
-
-        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
-            is_tp_path=True,
-            use_reduce_scatter=use_reduce_scatter,
-            should_allreduce_fusion=should_allreduce_fusion,
+        # Precomputed routing keeps FP32 weights and finalizes before the reduction.
+        if get_forward().defer_moe_finalize and TopKOutputChecker.format_is_bypassed(
+            topk_output
         ):
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+            deferred = self.experts.forward_deferred_finalize(
+                hidden_states, topk_output
+            )
+            return MoeDeferredFinalize.from_flashinfer(
+                deferred,
+                gated_shared_output=None,
+                m=hidden_states.shape[0],
+                reduce=sum_post_experts_output,
+            )
+
+        final_hidden_states = self.experts(hidden_states, topk_output)
 
         return final_hidden_states
 
@@ -355,10 +589,6 @@ class MiMoV2MoE(nn.Module):
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
-                num_token_non_padded=forward_batch.num_token_non_padded,
-                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                    layer_id=self.layer_id,
-                ),
             )
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)
@@ -388,10 +618,6 @@ class MiMoV2MoE(nn.Module):
                 state.topk_output = self.topk(
                     hidden_states=hidden_states,
                     router_logits=router_logits,
-                    num_token_non_padded=state.forward_batch.num_token_non_padded,
-                    expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                        layer_id=self.layer_id,
-                    ),
                 )
         else:
             state.topk_output = self.topk.empty_topk_output(hidden_states.device)
@@ -459,8 +685,7 @@ class MiMoV2Attention(nn.Module):
         super().__init__()
         self.hidden_size = hidden_size
 
-        attn_tp_rank = get_attention_tp_rank()
-        attn_tp_size = get_attention_tp_size()
+        attn_tp_size = get_parallel().attn_tp_size
 
         self.total_num_heads = num_heads
         assert self.total_num_heads % attn_tp_size == 0
@@ -494,8 +719,7 @@ class MiMoV2Attention(nn.Module):
             v_head_size=self.v_head_dim,
             bias=attention_bias,
             quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
             prefix=add_prefix("qkv_proj", prefix),
             skip_block_quant_check=True,
         )
@@ -505,8 +729,7 @@ class MiMoV2Attention(nn.Module):
             hidden_size,
             bias=False,
             quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
             reduce_results=False,
             prefix=add_prefix("o_proj", prefix),
         )
@@ -579,6 +802,26 @@ class MiMoV2Attention(nn.Module):
         output, _ = self.o_proj(attn_output)
         return output
 
+    def _forward_rope_store(self, qkv, positions, forward_batch):
+        from sglang.srt.model_executor.forward_context import get_attn_backend
+
+        query = self.rotary_emb.try_bf16_rope_store(
+            qkv,
+            positions,
+            get_attn_backend().get_fused_kv_write_buffers(self.attn, forward_batch),
+            value_scale=1.0 if self.v_scale is None else self.v_scale,
+        )
+        if query is None:
+            return None
+        return self.attn(
+            query,
+            None,
+            None,
+            forward_batch,
+            save_kv_cache=False,
+            sinks=self.attention_sink_bias,
+        )
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -586,6 +829,15 @@ class MiMoV2Attention(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
+        if (
+            forward_batch.forward_mode.is_target_verify()
+            and qkv.shape[0] > 0
+            and isinstance(self.rotary_emb, RotaryEmbedding)
+            and not torch.compiler.is_compiling()
+        ):
+            fused = self._forward_rope_store(qkv, positions, forward_batch)
+            if fused is not None:
+                return self.o_proj(fused)[0]
         q, k, v = qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
 
         # [t, h, dr]
@@ -671,9 +923,7 @@ class MiMoV2DecoderLayer(nn.Module):
                 prefix=add_prefix("self_attn", prefix),
             )
 
-        self.is_layer_sparse = self.is_moe_layer(layer_id)
-        is_previous_layer_sparse = self.is_moe_layer(layer_id - 1)
-        is_next_layer_sparse = self.is_moe_layer(layer_id + 1)
+        self.is_layer_sparse = self.is_moe_layer(config, layer_id)
 
         if self.is_layer_sparse:
             self.mlp = MiMoV2MoE(
@@ -683,18 +933,15 @@ class MiMoV2DecoderLayer(nn.Module):
                 layer_id=layer_id,
             )
         else:
-            if enable_moe_dense_fully_dp():
-                mlp_tp_rank, mlp_tp_size = 0, 1
-            else:
-                mlp_tp_rank, mlp_tp_size = None, None
+            mlp_parallel_group = "replicated" if is_dense_ffn_fully_dp() else "tp"
             self.mlp = MiMoV2MLP(
                 hidden_size=self.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
-                tp_rank=mlp_tp_rank,
-                tp_size=mlp_tp_size,
+                parallel_group=mlp_parallel_group,
+                reduce_results=False,
             )
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.layernorm_epsilon)
@@ -702,19 +949,28 @@ class MiMoV2DecoderLayer(nn.Module):
             config.hidden_size, eps=config.layernorm_epsilon
         )
 
-        self.layer_scatter_modes = LayerScatterModes.init_new(
-            layer_id=layer_id,
-            num_layers=config.num_hidden_layers,
-            is_layer_sparse=self.is_layer_sparse,
-            is_previous_layer_sparse=is_previous_layer_sparse,
-            is_next_layer_sparse=is_next_layer_sparse,
+        attn, ffn = self.stage_facts(config, layer_id)
+        fusions = (
+            CuteDSLFusion()
+            if uses_cutedsl_ar_fusion() and not get_flags().moe.in_speculative_scope
+            else None
         )
-        self.layer_communicator = LayerCommunicator(
-            layer_scatter_modes=self.layer_scatter_modes,
-            input_layernorm=self.input_layernorm,
-            post_attention_layernorm=self.post_attention_layernorm,
-            allow_reduce_scatter=True,
-            is_last_layer=(self.layer_id == self.config.num_hidden_layers - 1),
+        self.attn_boundary, self.ffn_boundary = append_stages(
+            (attn, self.input_layernorm, {"fusions": fusions}),
+            (ffn, self.post_attention_layernorm, {"fusions": fusions}),
+        )
+
+    @classmethod
+    def stage_facts(cls, config, layer_id: int):
+        """The stages the layer at ``layer_id`` declares, in order: the model's
+        shared declaration function, which the layer declares with too (see
+        make_layers)."""
+        return (
+            declare_attn(),
+            declare_ffn(
+                sparse=cls.is_moe_layer(config, layer_id),
+                next_layer_sparse=cls.is_moe_layer(config, layer_id + 1),
+            ),
         )
 
     def forward(
@@ -722,11 +978,13 @@ class MiMoV2DecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        residual: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        captured_last_layer_outputs: Optional[AuxHiddenStateAccumulator] = None,
+    ) -> torch.Tensor:
         # Self Attention
-        hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states, residual, forward_batch
+        hidden_states = self.attn_boundary.prepare(
+            hidden_states,
+            forward_batch,
+            capture_gathered=captured_last_layer_outputs,
         )
 
         if hidden_states.shape[0] != 0:
@@ -736,40 +994,22 @@ class MiMoV2DecoderLayer(nn.Module):
                 forward_batch=forward_batch,
             )
 
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states, residual, forward_batch
-        )
+        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
 
-        should_allreduce_fusion = (
-            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
-                forward_batch
-            )
-        )
+        with self.ffn_boundary.exit(forward_batch) as ffn_exit:
+            hidden_states = self.mlp(hidden_states, forward_batch)
+        hidden_states = ffn_exit.finish(hidden_states)
 
-        # For DP with padding, reduce scatter can be used instead of all-reduce.
-        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
-            forward_batch
-        )
+        return hidden_states
 
-        hidden_states = self.mlp(
-            hidden_states, forward_batch, should_allreduce_fusion, use_reduce_scatter
-        )
-
-        if should_allreduce_fusion:
-            hidden_states._sglang_needs_allreduce_fusion = True
-        else:
-            hidden_states, residual = self.layer_communicator.postprocess_layer(
-                hidden_states, residual, forward_batch
-            )
-
-        return hidden_states, residual
-
-    def is_moe_layer(self, layer_idx: int) -> bool:
+    @staticmethod
+    def is_moe_layer(config, layer_idx: int) -> bool:
         return (
-            hasattr(self.config, "moe_layer_freq")
-            and 0 <= layer_idx < len(self.config.moe_layer_freq)
-            and not isinstance(self.config.moe_layer_freq, int)
-            and self.config.moe_layer_freq[layer_idx]
+            hasattr(config, "moe_layer_freq")
+            and 0 <= layer_idx < len(config.moe_layer_freq)
+            and not isinstance(config.moe_layer_freq, int)
+            and config.moe_layer_freq[layer_idx]
         )
 
     def is_swa_layer(self) -> bool:
@@ -781,11 +1021,10 @@ class MiMoV2DecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        residual: Optional[torch.Tensor],
         tbo_subbatch_index: Optional[int] = None,
     ):
-        state.hidden_states_after_comm_pre_attn, state.residual_after_input_ln = (
-            self.layer_communicator.prepare_attn(hidden_states, residual, forward_batch)
+        state.hidden_states_after_comm_pre_attn = self.attn_boundary.prepare(
+            hidden_states, forward_batch
         )
         state.update(
             dict(
@@ -796,29 +1035,21 @@ class MiMoV2DecoderLayer(nn.Module):
         )
 
     def op_comm_prepare_mlp(self, state):
-        state.hidden_states_mlp_input, state.residual_after_comm_pre_mlp = (
-            self.layer_communicator.prepare_mlp(
-                state.pop("hidden_states_after_attn"),
-                state.pop("residual_after_input_ln"),
-                state.forward_batch,
-            )
+        hidden_states = self.attn_boundary.finish(
+            state.pop("hidden_states_after_attn"), state.forward_batch
+        )
+        state.hidden_states_mlp_input = self.ffn_boundary.prepare(
+            hidden_states, state.forward_batch
         )
 
-    def op_mlp(self, state):
-        hidden_states = state.pop("hidden_states_mlp_input")
-        state.hidden_states_mlp_output = self.mlp(hidden_states, state.forward_batch)
-
     def op_comm_postprocess_layer(self, state):
-        hidden_states, residual = self.layer_communicator.postprocess_layer(
-            state.pop("hidden_states_mlp_output"),
-            state.pop("residual_after_comm_pre_mlp"),
-            state.forward_batch,
+        hidden_states = self.ffn_boundary.complete_now(
+            state.pop("hidden_states_mlp_output"), state.forward_batch
         )
 
         output = dict(
             positions=state.positions,
             hidden_states=hidden_states,
-            residual=residual,
             forward_batch=state.forward_batch,
             tbo_subbatch_index=state.tbo_subbatch_index,
         )
@@ -845,7 +1076,9 @@ class MiMoV2Model(nn.Module):
         self.config = config
         self.padding_idx = getattr(config, "pad_token_id", None)
         self.vocab_size = config.vocab_size
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
+        self._kv_cache_parallel_layout = resolve_linear_parallel_group("attn_tp")
+        self.layers_to_capture = []
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -860,7 +1093,7 @@ class MiMoV2Model(nn.Module):
 
         # Use the provided decoder layer type or default to MiMoV2DecoderLayer
         decoder_layer_type = decoder_layer_type or MiMoV2DecoderLayer
-        self.layers, self.start_layer, self.end_layer = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             layer_fn=lambda idx, prefix: decoder_layer_type(
                 layer_id=idx,
@@ -868,14 +1101,26 @@ class MiMoV2Model(nn.Module):
                 quant_config=quant_config,
                 prefix=prefix,
             ),
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
             prefix=add_prefix("layers", prefix),
+            stage_facts=partial(decoder_layer_type.stage_facts, config),
         )
         if self.pp_group.is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.layernorm_epsilon)
         else:
             self.norm = PPMissingLayer(return_tuple=True)
+        if uses_cutedsl_ar_fusion():
+            install_cutedsl_fusion(
+                self.layers[self.start_layer : self.end_layer],
+                hidden_size=config.hidden_size,
+                top_k=config.num_experts_per_tok,
+                rms_epsilon=config.layernorm_epsilon,
+                can_defer_finalize=lambda layer: (
+                    isinstance(layer.mlp, MiMoV2MoE)
+                    and layer.mlp.supports_deferred_finalize
+                ),
+                label="MiMo",
+                include_shared_expert=False,
+            )
 
     def get_input_embedding(self, input_ids: torch.Tensor) -> torch.Tensor:
         if hasattr(self.config, "scale_emb"):
@@ -899,76 +1144,78 @@ class MiMoV2Model(nn.Module):
                 hidden_states = self.embed_tokens(input_ids)
             else:
                 hidden_states = input_embeds
-            residual = None
+            residual_batch.start(forward_batch)
         else:
             assert pp_proxy_tensors is not None
-            hidden_states = pp_proxy_tensors["hidden_states"]
-            residual = pp_proxy_tensors["residual"]
+            hidden_states = self.layers[self.start_layer].attn_boundary.from_pp(
+                pp_proxy_tensors, forward_batch
+            )
 
-        if forward_batch.can_run_tbo:
+        aux_hidden_states = AuxHiddenStatePacker(len(self.layers_to_capture))
+        if forward_batch.can_run_tbo and not self.layers_to_capture:
             tbo_start_layer = self.start_layer
             tbo_end_layer = self.end_layer
 
             # skip first layer for TBO when starting from layer 0
             if self.start_layer == 0:
                 layer = self.layers[0]
-                hidden_states, residual = layer(
-                    positions, hidden_states, forward_batch, residual
-                )
+                hidden_states = layer(positions, hidden_states, forward_batch)
                 tbo_start_layer = tbo_start_layer + 1
 
-            hidden_states, residual = model_forward_maybe_tbo(
+            hidden_states = model_forward_stages(
                 layers=self.layers[tbo_start_layer:tbo_end_layer],
                 enable_tbo=True,
-                input_data_scatter_mode=(
-                    ScatterMode.model_input_output()
-                    if tbo_start_layer == self.start_layer
-                    else self.layers[
-                        tbo_start_layer - 1
-                    ].layer_scatter_modes.layer_output_mode
-                ),
                 positions=positions,
                 forward_batch=forward_batch,
                 hidden_states=hidden_states,
-                residual=residual,
             )
         else:
             for i in range(self.start_layer, self.end_layer):
                 layer = self.layers[i]
-                hidden_states, residual = layer(
+                hidden_states = layer(
                     positions,
                     hidden_states,
                     forward_batch,
-                    residual,
+                    captured_last_layer_outputs=aux_hidden_states
+                    if i in self.layers_to_capture
+                    else None,
                 )
+
+        hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
+
+        # A draft targeting the final layer ("after layer
+        # num_hidden_layers-1") maps to capture index num_hidden_layers,
+        # past the layer loop; capture the pre-norm output here instead.
+        if (
+            self.pp_group.is_last_rank
+            and self.config.num_hidden_layers in self.layers_to_capture
+        ):
+            aux_hidden_states.append(
+                residual_batch.snapshot(hidden_states, forward_batch)
+            )
 
         hidden_states_before_norm = None
         if not self.pp_group.is_last_rank:
-            return PPProxyTensors(
-                {
-                    "hidden_states": hidden_states,
-                    "residual": residual,
-                }
-            )
+            return residual_batch.to_pp(hidden_states, forward_batch)
         else:
             if hidden_states.shape[0] > 0:
                 if forward_batch.return_hidden_states_before_norm:
-                    hidden_states_before_norm = (
-                        hidden_states if residual is None else hidden_states + residual
+                    hidden_states_before_norm = residual_batch.snapshot(
+                        hidden_states, forward_batch
                     )
-                if residual is None:
-                    hidden_states = self.norm(hidden_states)
-                else:
-                    hidden_states, _ = self.norm(hidden_states, residual)
+                hidden_states = residual_batch.final_norm(
+                    hidden_states, forward_batch, self.norm
+                )
 
-        return hidden_states, hidden_states_before_norm
+        if len(aux_hidden_states) == 0:
+            return hidden_states, hidden_states_before_norm
+        return hidden_states, hidden_states_before_norm, aux_hidden_states.finalize()
 
     # If this function is called, it should always initialize KV cache scale
     # factors (or else raise an exception). Thus, handled exceptions should
     # make sure to leave KV cache scale factors in a known good (dummy) state
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
-        attn_tp_rank = get_attention_tp_rank()
-        attn_tp_size = get_attention_tp_size()
+        attn_tp_rank, attn_tp_size = self._kv_cache_parallel_layout
         for layer_idx, scaling_factor in kv_cache_scales_loader(
             quantization_param_path,
             attn_tp_rank,
@@ -983,11 +1230,11 @@ class MiMoV2Model(nn.Module):
                 layer_self_attn.attn.v_scale = scaling_factor
             else:
                 raise RuntimeError(
-                    "Self attention has no KV cache scaling " "factor attribute!"
+                    "Self attention has no KV cache scaling factor attribute!"
                 )
 
 
-class MiMoV2ForCausalLM(nn.Module):
+class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
     # BitandBytes specific attributes
     default_bitsandbytes_target_modules = [
         ".gate_proj.",
@@ -1007,6 +1254,13 @@ class MiMoV2ForCausalLM(nn.Module):
         "up_proj": ("gate_up_proj", 1),
     }
 
+    # Prefixes for weight routing in encoder_only/language_only modes
+    _LANGUAGE_WEIGHT_PREFIXES = ("model.", "lm_head.")
+    _VISION_WEIGHT_PREFIXES = ("visual.", "vision_model.")
+    # ``audio_`` already covers ``audio_encoder.`` so a single prefix is enough.
+    _AUDIO_WEIGHT_PREFIXES = ("audio_",)
+    _AUDIO_WEIGHT_SUBSTRING = "speech_embeddings"
+
     def __init__(
         self,
         config: MiMoV2Config,
@@ -1014,30 +1268,40 @@ class MiMoV2ForCausalLM(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
         self.quant_config = quant_config
-        self.model = MiMoV2Model(
-            config, quant_config=quant_config, prefix=add_prefix("model", prefix)
-        )
+        self._encoder_processor = None  # lazy-created in preprocess_mm_for_encoder
 
-        if self.pp_group.is_last_rank:
-            self.lm_head = ParallelLMHead(
-                config.vocab_size,
-                config.hidden_size,
-                quant_config=quant_config,
-                prefix=add_prefix("lm_head", prefix),
-                use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+        if not self.config.encoder_only:
+            self.model = MiMoV2Model(
+                config, quant_config=quant_config, prefix=add_prefix("model", prefix)
             )
-        else:
-            # ranks other than the last rank will have a placeholder layer
-            self.lm_head = PPMissingLayer()
 
-        self.logits_processor = LogitsProcessor(config)
+            if self.pp_group.is_last_rank:
+                self.lm_head = ParallelLMHead(
+                    config.vocab_size,
+                    config.hidden_size,
+                    quant_config=quant_config,
+                    prefix=add_prefix("lm_head", prefix),
+                    use_attn_tp_group=get_parallel().enable_dp_lm_head,
+                )
+            else:
+                self.lm_head = PPMissingLayer()
+        else:
+            self.model = None
+            self.lm_head = None
+
+        self.logits_processor = (
+            LogitsProcessor(config) if not self.config.encoder_only else None
+        )
+        self.capture_aux_hidden_states = False
 
         vision_config = getattr(config, "vision_config", None)
         audio_config = getattr(config, "audio_config", None)
         self._is_multimodal = vision_config is not None and audio_config is not None
+        # Always build vision/audio encoders so P can fall back to local
+        # encoding when the EPD encoder is unreachable.
         if self._is_multimodal:
             if hasattr(vision_config, "to_dict"):
                 vision_config = vision_config.to_dict()
@@ -1050,15 +1314,18 @@ class MiMoV2ForCausalLM(nn.Module):
                 quant_config=None,
                 prefix=add_prefix("visual", prefix),
             )
-            self.audio_config = MiMoAudioEncoderConfig(**audio_config)
-            self.audio_encoder = MiMoAudioEncoder(self.audio_config)
+            self.build_audio_encoder(MiMoAudioEncoderConfig(**audio_config))
 
         self._routed_experts_weights_of_layer = LazyValue(
-            lambda: {
-                layer_id: layer.mlp.get_moe_weights()
-                for layer_id, layer in enumerate(self.model.layers)
-                if isinstance(layer.mlp, MiMoV2MoE)
-            }
+            lambda: (
+                {
+                    layer_id: layer.mlp.get_moe_weights()
+                    for layer_id, layer in enumerate(self.model.layers)
+                    if isinstance(layer.mlp, MiMoV2MoE)
+                }
+                if self.model is not None
+                else {}
+            )
         )
 
     @property
@@ -1066,11 +1333,22 @@ class MiMoV2ForCausalLM(nn.Module):
         return self._routed_experts_weights_of_layer.value
 
     def get_input_embedding(self, input_ids: torch.Tensor) -> torch.Tensor:
+        assert self.model is not None, (
+            "get_input_embedding() is not available in encoder_only mode"
+        )
         return self.model.get_input_embedding(input_ids)
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
-        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
-        return pattern.pad_input_tokens(input_ids, mm_inputs)
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
+        return pad_mm_tokens(input_ids, mm_inputs)
+
+    def preprocess_mm_for_encoder(self, mm_data, modality, config):
+        if self._encoder_processor is None:
+            from sglang.srt.multimodal.processors.mimo_v2 import MiMoProcessor
+
+            self._encoder_processor = MiMoProcessor.from_hf_config(
+                self.config, mm_config=config
+            )
+        return self._encoder_processor.preprocess_for_encoder(mm_data, modality)
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         pixel_values = torch.cat([item.feature for item in items], dim=0).type(
@@ -1090,11 +1368,76 @@ class MiMoV2ForCausalLM(nn.Module):
         assert video_grid_thw.dim() == 2, video_grid_thw.dim()
         return self.visual(pixel_values, grid_thw=video_grid_thw)
 
-    def get_audio_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        return self.audio_encoder.get_audio_feature(items)
+    @torch.inference_mode()
+    def encode_video_audio(self, mm_inputs: Dict) -> Optional[torch.Tensor]:
+        # EPD-side hook: encode audio tracks pulled from videos and trim to the
+        # interleaved per-video segments produced by MiMoProcessor (segment
+        # starts / lens / per_video_num_units). Returns None if there is no
+        # audio to encode. The server passes the result through to the receiver
+        # under aux_data["video_audio_embedding"].
+        import numpy as np
 
-    def get_input_embeddings(self) -> nn.Embedding:
-        return self.model.embed_tokens
+        audio_features = mm_inputs.get("video_audio_features")
+        if not audio_features:
+            return None
+
+        def _as_tensor(data):
+            if isinstance(data, torch.Tensor):
+                return data
+            if isinstance(data, np.ndarray):
+                return torch.tensor(data)
+            if isinstance(data, list) and data and isinstance(data[0], np.ndarray):
+                return torch.tensor(np.array(data))
+            if isinstance(data, list) and data and isinstance(data[0], (int, float)):
+                return torch.tensor(data)
+            return data
+
+        audio_feature_lens = mm_inputs["video_audio_feature_lens"]
+        audio_item = MultimodalDataItem.from_dict(
+            {
+                "modality": Modality.AUDIO,
+                "feature": _as_tensor(audio_features),
+            }
+        )
+        audio_item.set("audio_feature_lens", _as_tensor(audio_feature_lens))
+
+        audio_embedding = self.get_audio_feature([audio_item]).cpu()
+        if audio_embedding.ndim != 2:
+            audio_embedding = audio_embedding.reshape(-1, audio_embedding.shape[-1])
+
+        segment_lens_flat = mm_inputs["video_audio_segment_lens_flat"]
+        segment_starts_flat = mm_inputs["video_audio_segment_starts_flat"]
+        per_video_num_units = mm_inputs["video_audio_per_video_num_units"]
+        per_video_audio_token_lens = (
+            audio_feature_lens.tolist()
+            if hasattr(audio_feature_lens, "tolist")
+            else list(audio_feature_lens)
+        )
+
+        trimmed_chunks = []
+        emb_offset = 0
+        unit_idx = 0
+        audio_video_idx = 0
+        for num_units in per_video_num_units:
+            if num_units <= 0:
+                continue
+            vid_audio_len = per_video_audio_token_lens[audio_video_idx]
+            for _ in range(num_units):
+                start = segment_starts_flat[unit_idx]
+                seg_len = segment_lens_flat[unit_idx]
+                trimmed_chunks.append(
+                    audio_embedding[emb_offset + start : emb_offset + start + seg_len]
+                )
+                unit_idx += 1
+            emb_offset += vid_audio_len
+            audio_video_idx += 1
+
+        return (
+            torch.cat(trimmed_chunks, dim=0) if trimmed_chunks else audio_embedding[:0]
+        )
+
+    def get_input_embeddings(self) -> Optional[nn.Embedding]:
+        return self.model.embed_tokens if self.model is not None else None
 
     @torch.no_grad()
     def forward(
@@ -1105,8 +1448,16 @@ class MiMoV2ForCausalLM(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
+        assert not self.config.encoder_only, (
+            "forward() should not be called in encoder_only mode"
+        )
+
+        aux_hidden_states = None
+        # Multimodal embedding must run even when aux hidden states are captured
+        # (DFLASH/MTP). Taking the capture branch first skipped image/audio
+        # feature placement and left placeholder tokens as plain text embeddings.
         if self._is_multimodal:
-            hidden_states, hidden_states_before_norm = general_mm_embed_routine(
+            model_out = general_mm_embed_routine(
                 input_ids=input_ids,
                 forward_batch=forward_batch,
                 language_model=self.model,
@@ -1115,13 +1466,17 @@ class MiMoV2ForCausalLM(nn.Module):
                 pp_proxy_tensors=pp_proxy_tensors,
             )
         else:
-            hidden_states, hidden_states_before_norm = self.model(
+            model_out = self.model(
                 input_ids,
                 positions,
                 forward_batch,
                 input_embeds,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
+        if self.capture_aux_hidden_states:
+            hidden_states, hidden_states_before_norm, aux_hidden_states = model_out
+        else:
+            hidden_states, hidden_states_before_norm = model_out
 
         if self.pp_group.is_last_rank:
             return self.logits_processor(
@@ -1130,17 +1485,32 @@ class MiMoV2ForCausalLM(nn.Module):
                 self.lm_head,
                 forward_batch,
                 hidden_states_before_norm=hidden_states_before_norm,
+                aux_hidden_states=aux_hidden_states,
             )
         else:
             return hidden_states
 
     @property
     def start_layer(self):
-        return self.model.start_layer
+        return self.model.start_layer if self.model is not None else 0
 
     @property
     def end_layer(self):
-        return self.model.end_layer
+        return self.model.end_layer if self.model is not None else 0
+
+    def set_dflash_layers_to_capture(self, layer_ids: List[int]):
+        if not self.pp_group.is_last_rank:
+            return
+
+        if layer_ids is None:
+            raise ValueError(
+                "DFLASH requires explicit layer_ids for aux hidden capture."
+            )
+
+        self.capture_aux_hidden_states = True
+        # target_layer_ids are "after layer X" ids; capture before layer X+1,
+        # matching the draft's extract_context_feature (offset=1).
+        self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
@@ -1167,70 +1537,57 @@ class MiMoV2ForCausalLM(nn.Module):
 
         params_dict = dict(self.named_parameters())
         skipped_mtp_weights = False
+        deferred_qkv_scale_inv: Dict[str, torch.Tensor] = {}
 
         for name, loaded_weight in weights:
-            if not self._is_multimodal and (
-                name.startswith(("visual.", "vision_model.", "audio_encoder."))
-                or name.startswith("audio_")
-                or "speech_embeddings" in name
+            is_vision_weight = name.startswith(self._VISION_WEIGHT_PREFIXES)
+            is_audio_weight = (
+                name.startswith(self._AUDIO_WEIGHT_PREFIXES)
+                or self._AUDIO_WEIGHT_SUBSTRING in name
+            )
+
+            if not self._is_multimodal and (is_vision_weight or is_audio_weight):
+                continue
+
+            if self.config.encoder_only and name.startswith(
+                self._LANGUAGE_WEIGHT_PREFIXES
             ):
                 continue
 
-            if self._is_multimodal and "audio" in name:
-                if "projection" in name:
-                    if (
-                        "audio_encoder.audio_projection" in name
-                        and "audio_encoder.projection" not in name
-                    ):
-                        name = name.replace(
-                            "audio_encoder.audio_projection", "audio_encoder.projection"
-                        )
-                    elif (
-                        "audio_projection" in name
-                        and "audio_encoder.projection" not in name
-                    ):
-                        name = name.replace(
-                            "audio_projection", "audio_encoder.projection"
-                        )
-                    param = params_dict[name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, loaded_weight)
-                    continue
-
-                if "input_local_transformer" in name:
-                    if (
-                        "audio_input_local_transformer" in name
-                        and "audio_encoder.input_local_transformer" not in name
-                    ):
-                        name = name.replace(
-                            "audio_input_local_transformer",
-                            "audio_encoder.input_local_transformer",
-                        )
-                    if name not in params_dict:
-                        logger.warning(
-                            f"Parameter {name} not found in params_dict, skipping"
-                        )
+            if self._is_multimodal and is_audio_weight:
+                if name.startswith("audio_encoder."):
+                    name = name[len("audio_encoder.") :]
+                name = self.remap_audio_weight_name(name)
+                if "input_local_transformer" not in name:
+                    name = name.replace("self_attn.out_proj", "self_attn.attn.proj")
+                    audio_stacked = False
+                    for param_name, weight_name, shard_id in [
+                        ("self_attn.attn.qkv_proj", "self_attn.q_proj", "q"),
+                        ("self_attn.attn.qkv_proj", "self_attn.k_proj", "k"),
+                        ("self_attn.attn.qkv_proj", "self_attn.v_proj", "v"),
+                    ]:
+                        if weight_name in name:
+                            name = name.replace(weight_name, param_name)
+                            if name not in params_dict:
+                                break
+                            param = params_dict[name]
+                            weight_loader = param.weight_loader
+                            weight_loader(param, loaded_weight, shard_id)
+                            audio_stacked = True
+                            break
+                    if audio_stacked:
                         continue
-                    param = params_dict[name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
+                if name not in params_dict:
+                    logger.warning(
+                        f"Audio param {name} not found in params_dict, skipping"
                     )
-                    weight_loader(param, loaded_weight)
                     continue
-
-            if self._is_multimodal and "speech_embeddings" in name:
-                if (
-                    "speech_embeddings" in name
-                    and "audio_encoder.speech_embeddings" not in name
-                ):
-                    name = name.replace(
-                        "speech_embeddings", "audio_encoder.speech_embeddings"
-                    )
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight[: param.shape[0], :])
+                if self._AUDIO_WEIGHT_SUBSTRING in name:
+                    weight_loader(param, loaded_weight[: param.shape[0], :])
+                else:
+                    weight_loader(param, loaded_weight)
                 continue
 
             if self._is_multimodal and "visual" in name:
@@ -1304,6 +1661,13 @@ class MiMoV2ForCausalLM(nn.Module):
                     skipped_mtp_weights = True
                 continue
 
+            if ".mlp.experts." in name and loaded_weight.dtype == torch.uint8:
+                if name.endswith(".weight_scale"):
+                    name = name + "_inv"
+                    loaded_weight = torch.exp2(loaded_weight.to(torch.float32) - 127.0)
+                elif name.endswith(".weight"):
+                    loaded_weight = loaded_weight.view(torch.int8)
+
             # Support fused qkv_proj checkpoint (Pro format)
             if "qkv_proj" in name:
                 if name in params_dict:
@@ -1312,7 +1676,12 @@ class MiMoV2ForCausalLM(nn.Module):
                         self.config
                     )
                     load_mimo_v2_qkv_proj_weight(
-                        name, param, loaded_weight, expected_fused_tp_size
+                        name,
+                        param,
+                        loaded_weight,
+                        expected_fused_tp_size,
+                        deferred_scale_inv=deferred_qkv_scale_inv,
+                        qkv_proj=self.get_submodule(name.rsplit(".", 1)[0]),
                     )
                 continue
 
@@ -1343,6 +1712,10 @@ class MiMoV2ForCausalLM(nn.Module):
                     if weight_name not in name:
                         continue
                     name = name.replace(weight_name, param_name)
+                    # mxfp4 ckpts store expert scales without the `_inv` suffix,
+                    # while Fp8MoEMethod registers them as *_weight_scale_inv.
+                    if name.endswith("weight_scale") and (name + "_inv" in params_dict):
+                        name = name + "_inv"
                     param = params_dict[name]
                     weight_loader = param.weight_loader
                     weight_loader(
@@ -1361,7 +1734,13 @@ class MiMoV2ForCausalLM(nn.Module):
                     if name in params_dict.keys():
                         param = params_dict[name]
                         if "attention_sink_bias" in name:
-                            start = get_attention_tp_rank() * param.numel()
+                            projection = unwrap_lora_layer(
+                                self.get_submodule(name.rsplit(".", 1)[0]).qkv_proj
+                            )
+                            start = (
+                                get_group_rank_size(projection.tp_group)[0]
+                                * param.numel()
+                            )
                             param.data.copy_(
                                 loaded_weight[start : start + param.numel()]
                             )
@@ -1373,10 +1752,26 @@ class MiMoV2ForCausalLM(nn.Module):
                     else:
                         logger.warning(f"Parameter {name} not found in params_dict")
 
+        if deferred_qkv_scale_inv:
+            expected_fused_tp_size = get_mimo_v2_fused_qkv_expected_tp_size(self.config)
+            _resolve_deferred_qkv_scale_inv(
+                params_dict,
+                deferred_qkv_scale_inv,
+                expected_fused_tp_size,
+                config=self.config,
+                model=self,
+            )
+
     def get_embed_and_head(self):
+        assert self.model is not None and self.lm_head is not None, (
+            "get_embed_and_head() is not available in encoder_only mode"
+        )
         return self.model.embed_tokens.weight, self.lm_head.weight
 
     def set_embed_and_head(self, embed, head):
+        assert self.model is not None and self.lm_head is not None, (
+            "set_embed_and_head() is not available in encoder_only mode"
+        )
         del self.model.embed_tokens.weight
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed
@@ -1385,7 +1780,8 @@ class MiMoV2ForCausalLM(nn.Module):
         torch.cuda.synchronize()
 
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
-        self.model.load_kv_cache_scales(quantization_param_path)
+        if self.model is not None:
+            self.model.load_kv_cache_scales(quantization_param_path)
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):

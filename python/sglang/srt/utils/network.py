@@ -3,21 +3,30 @@ from __future__ import annotations
 import ipaddress
 import logging
 import os
+import random
 import socket
+import threading
 import time
 from dataclasses import dataclass
 from typing import Optional, Tuple, Union
 
 import psutil
 import zmq
+from zmq.auth.thread import ThreadAuthenticator
 
 logger = logging.getLogger(__name__)
 
+# libzmq allows one ZAP handler per context, so sockets created from the same
+# context share an authenticator. Keyed by `zmq.Context.underlying`.
+_zmq_authenticators: dict[int, ThreadAuthenticator] = {}
+_zmq_authenticators_lock = threading.Lock()
+
 
 def get_open_port() -> int:
-    port = os.getenv("SGLANG_PORT")
+    from sglang.srt.environ import envs
+
+    port = envs.SGLANG_PORT.get()
     if port is not None:
-        port = int(port)
         while True:
             if is_port_available(port):
                 return port
@@ -49,9 +58,28 @@ def find_process_using_port(port: int) -> Optional[psutil.Process]:
     return None
 
 
+MAX_VALID_PORT = 65535
+
+
 def wait_port_available(
-    port: int, port_name: str, timeout_s: int = 30, raise_exception: bool = True
+    port: int,
+    port_name: str,
+    timeout_s: Optional[int] = None,
+    raise_exception: bool = True,
 ) -> bool:
+    if timeout_s is None:
+        # A killed server can hold its ports well past kill_process_tree()'s
+        # return while GPU teardown completes (>30s observed on GB300), so CI
+        # raises this via SGLANG_WAIT_PORT_TIMEOUT before relaunching a server
+        # on the same port plan.
+        timeout_s = int(os.environ.get("SGLANG_WAIT_PORT_TIMEOUT", "30"))
+    if port < 0 or port > MAX_VALID_PORT:
+        raise ValueError(
+            f"{port_name} has invalid port number {port}. "
+            f"Valid TCP port range is 0-{MAX_VALID_PORT}."
+        )
+
+    error_message = f"{port_name} at {port} is not available"
     for i in range(timeout_s):
         if is_port_available(port):
             return True
@@ -62,13 +90,13 @@ def wait_port_available(
                 logger.warning(
                     f"The port {port} is in use, but we could not find the process that uses it."
                 )
-
-            pid = process.pid
-            error_message = f"{port_name} is used by a process already. {process.name()=}' {process.cmdline()=} {process.status()=} {pid=}"
-            logger.info(
-                f"port {port} is in use. Waiting for {i} seconds for {port_name} to be available. {error_message}"
-            )
-        time.sleep(0.1)
+            else:
+                pid = process.pid
+                error_message = f"{port_name} is used by a process already. {process.name()=}' {process.cmdline()=} {process.status()=} {pid=}"
+                logger.info(
+                    f"port {port} is in use. Waiting for {i} seconds for {port_name} to be available. {error_message}"
+                )
+        time.sleep(1)
 
     if raise_exception:
         raise ValueError(
@@ -174,15 +202,60 @@ def get_free_port():
     return port
 
 
+def get_free_port_below_ephemeral(low=22000, high=29999, attempts=64):
+    """Free port under the kernel ephemeral range (32768+ by default), for a
+    port that a child process binds only later."""
+    try:
+        with open("/proc/sys/net/ipv4/ip_local_port_range") as f:
+            ephemeral_low = int(f.read().split()[0])
+    except (OSError, ValueError, IndexError):
+        ephemeral_low = 32768
+    # bind(0) and connect() only hand out ports from ephemeral_low up.
+    high = min(high, ephemeral_low - 1)
+    if high - low + 1 < attempts:
+        return get_free_port()
+    for port in random.sample(range(low, high + 1), attempts):
+        try:
+            # IPv4 explicitly: the TCPStore binds the IPv4 side of this port.
+            try_bind_socket("0.0.0.0", port, reuse_addr=False).close()
+            return port
+        except OSError:
+            continue
+    return get_free_port()
+
+
 def bind_port(port):
     """Bind to a specific port, assuming it's available."""
     return try_bind_socket(port=port, listen=True)
+
+
+def restrict_zmq_peers(context: zmq.Context, socket: zmq.Socket) -> None:
+    """Reject TCP peers outside `SGLANG_ZMQ_ALLOWED_PEERS` (CVE-2026-93034).
+
+    Must be called before `socket` binds. No-op when the allowlist is unset.
+    """
+    from sglang.srt.environ import envs
+
+    peers = envs.SGLANG_ZMQ_ALLOWED_PEERS.get()
+    if not peers:
+        return
+    with _zmq_authenticators_lock:
+        if context.underlying not in _zmq_authenticators:
+            auth = ThreadAuthenticator(context)
+            auth.start()
+            # ZAP compares the peer address as a string; libzmq formats it
+            # the same way as `ipaddress` (compressed, lowercase).
+            auth.allow(*(ipaddress.ip_address(p).compressed for p in peers))
+            _zmq_authenticators[context.underlying] = auth
+    # ZAP only vets NULL-mechanism connections when a domain is set.
+    socket.zap_domain = b"sglang"
 
 
 def get_zmq_socket_on_host(
     context: zmq.Context,
     socket_type: zmq.SocketType,
     host: Optional[str] = None,
+    restrict_peers: bool = False,
 ) -> Tuple[int, zmq.Socket]:
     """Create and configure a ZeroMQ socket.
 
@@ -193,12 +266,16 @@ def get_zmq_socket_on_host(
             "127.0.0.1" (localhost-only) to avoid exposing unauthenticated
             sockets to the network (CVE-2026-3060). Callers that need
             cross-machine reachability must pass an explicit host.
+        restrict_peers: Apply `restrict_zmq_peers`. Off by default because
+            disaggregation sockets accept peers from other jobs.
 
     Returns:
         Tuple of (port, socket) where port is the randomly assigned TCP port.
     """
     socket = context.socket(socket_type)
     config_socket(socket, socket_type)
+    if restrict_peers:
+        restrict_zmq_peers(context, socket)
     if host is None:
         host = "127.0.0.1"
     if is_valid_ipv6_address(host):
@@ -211,9 +288,15 @@ def get_zmq_socket_on_host(
 
 
 def config_socket(socket, socket_type: zmq.SocketType):
-    mem = psutil.virtual_memory()
-    total_mem = mem.total / 1024**3
-    available_mem = mem.available / 1024**3
+    try:
+        mem = psutil.virtual_memory()
+        total_mem = mem.total / 1024**3
+        available_mem = mem.available / 1024**3
+    except Exception as e:
+        logger.warning(
+            "psutil.virtual_memory() failed (%s); using default ZMQ buffer size", e
+        )
+        total_mem = available_mem = 0
     if total_mem > 32 and available_mem > 16:
         buf_size = int(0.5 * 1024**3)
     else:
@@ -231,7 +314,7 @@ def config_socket(socket, socket_type: zmq.SocketType):
         set_send_opt()
     elif socket_type == zmq.PULL:
         set_recv_opt()
-    elif socket_type in [zmq.DEALER, zmq.REQ, zmq.REP]:
+    elif socket_type in [zmq.DEALER, zmq.REQ, zmq.REP, zmq.PAIR]:
         set_send_opt()
         set_recv_opt()
     else:
@@ -371,21 +454,64 @@ def get_zmq_socket(
     if endpoint is None:
         # Bind to random TCP port
         config_socket(socket, socket_type)
+        restrict_zmq_peers(context, socket)
         port = socket.bind_to_random_port("tcp://*")
         return port, socket
     else:
-        # Handle IPv6 if endpoint contains brackets
-        if endpoint.find("[") != -1:
+        if is_zmq_endpoint_ipv6(endpoint):
             socket.setsockopt(zmq.IPV6, 1)
 
         config_socket(socket, socket_type)
 
         if bind:
+            if endpoint.startswith("tcp://"):
+                restrict_zmq_peers(context, socket)
             socket.bind(endpoint)
         else:
-            socket.connect(endpoint)
+            zmq_connect(socket, endpoint)
 
         return socket
+
+
+def zmq_connect(socket: zmq.Socket, endpoint: str) -> None:
+    """Connect `socket`, pinning TCP connects to `SGLANG_ZMQ_SOURCE_IP`.
+
+    `restrict_zmq_peers` admits peers by source address. On a host with
+    several addresses (e.g. a container on host networking) the kernel may
+    pick a source outside the allowlist, and a rejected PUSH blocks forever.
+    The pin uses libzmq's `tcp://<source_endpoint>;<endpoint>` form, zmq_tcp(7).
+    """
+    socket.connect(_with_source_ip(endpoint))
+
+
+def _with_source_ip(endpoint: str) -> str:
+    from sglang.srt.environ import envs
+
+    source = envs.SGLANG_ZMQ_SOURCE_IP.get()
+    if not source or not endpoint.startswith("tcp://") or ";" in endpoint:
+        return endpoint
+    address = endpoint[len("tcp://") :]
+    host = address.rsplit(":", 1)[0].strip("[]")
+    try:
+        source_ip, host_ip = ipaddress.ip_address(source), ipaddress.ip_address(host)
+    except ValueError:
+        return endpoint
+    # A source of the other family cannot reach the host.
+    if source_ip.version != host_ip.version:
+        return endpoint
+    source_host = f"[{source_ip}]" if source_ip.version == 6 else str(source_ip)
+    return f"tcp://{source_host}:0;{address}"
+
+
+def is_zmq_endpoint_ipv6(endpoint: str) -> bool:
+    """Return whether a ZMQ TCP endpoint contains a bracketed IPv6 host."""
+    prefix = "tcp://["
+    if not endpoint.startswith(prefix):
+        return False
+    end = endpoint.find("]", len(prefix))
+    if end == -1:
+        return False
+    return is_valid_ipv6_address(endpoint[len(prefix) : end])
 
 
 def _is_ipv6(host: str) -> bool:
@@ -523,3 +649,20 @@ class NetworkAddress:
 
     def __repr__(self) -> str:
         return f"NetworkAddress({self.host!r}, {self.port})"
+
+
+def resolve_base_url(base_url: str, host: str, port: int) -> str:
+    """Base URL a client sends to: ``base_url`` if set, else ``http://host:port``
+    (IPv6-correct via :class:`NetworkAddress`)."""
+    if base_url:
+        return base_url
+    return NetworkAddress(host, port).to_url()
+
+
+def resolve_host_port(base_url: str, host: str, port: int) -> str:
+    """Like :func:`resolve_base_url` but returns the scheme-less ``host:port``
+    form (for gRPC-style endpoints): ``base_url`` if set, else ``host:port``
+    (IPv6-correct via :class:`NetworkAddress`)."""
+    if base_url:
+        return base_url
+    return NetworkAddress(host, port).to_host_port_str()

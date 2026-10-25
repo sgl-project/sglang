@@ -1,28 +1,28 @@
 import math
-from typing import Dict, Optional, Tuple, Union
+from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
-from diffusers.models.attention_processor import (
-    ADDED_KV_ATTENTION_PROCESSORS,
-    CROSS_ATTENTION_PROCESSORS,
-    AttentionProcessor,
-    AttnAddedKVProcessor,
-    AttnProcessor,
-)
 from diffusers.models.autoencoders.vae import (
     Decoder,
     DecoderOutput,
     DiagonalGaussianDistribution,
     Encoder,
 )
-from diffusers.models.modeling_outputs import AutoencoderKLOutput
 
 from sglang.multimodal_gen.configs.models.vaes.flux import Flux2VAEConfig
-from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
+from sglang.multimodal_gen.runtime.cache.conditioning import cached_vae_encode
+from sglang.multimodal_gen.runtime.models.vaes.autoencoder_kl import AutoencoderKLMixin
+from sglang.multimodal_gen.runtime.models.vaes.common import (
+    ParallelTiledVAE,
+    can_install_spatial_shard_parallel_decode,
+)
+from sglang.multimodal_gen.runtime.models.vaes.parallel.diffusers_spatial import (
+    enable_diffusers_decoder_spatial_parallel,
+)
 
 
-class AutoencoderKLFlux2(ParallelTiledVAE):
+class AutoencoderKLFlux2(AutoencoderKLMixin, ParallelTiledVAE):
     r"""
     A VAE model with KL loss for encoding images into latents and decoding latent representations into images.
 
@@ -57,7 +57,6 @@ class AutoencoderKLFlux2(ParallelTiledVAE):
         latent_channels: int = arch_config.latent_channels
         norm_num_groups: int = arch_config.norm_num_groups
         sample_size: int = arch_config.sample_size
-        force_upcast: bool = arch_config.force_upcast
         use_quant_conv: bool = arch_config.use_quant_conv
         use_post_quant_conv: bool = arch_config.use_post_quant_conv
         mid_block_add_attention: bool = arch_config.mid_block_add_attention
@@ -110,6 +109,13 @@ class AutoencoderKLFlux2(ParallelTiledVAE):
 
         self.use_slicing = False
         self.use_tiling = False
+        self._spatial_parallel_decode_enabled = False
+        self._spatial_parallel_upsample_count = 0
+        if can_install_spatial_shard_parallel_decode(self.config):
+            self._spatial_parallel_upsample_count = (
+                enable_diffusers_decoder_spatial_parallel(self.decoder)
+            )
+            self._spatial_parallel_decode_enabled = True
 
         # only relevant if vae tiling is enabled
         self.tile_sample_min_size = self.config.sample_size
@@ -123,108 +129,7 @@ class AutoencoderKLFlux2(ParallelTiledVAE):
         )
         self.tile_overlap_factor = 0.25
 
-    @property
-    # Copied from diffusers.models.unets.unet_2d_condition.UNet2DConditionModel.attn_processors
-    def attn_processors(self) -> Dict[str, AttentionProcessor]:
-        r"""
-        Returns:
-            `dict` of attention processors: A dictionary containing all attention processors used in the model with
-            indexed by its weight name.
-        """
-        # set recursively
-        processors = {}
-
-        def fn_recursive_add_processors(
-            name: str,
-            module: torch.nn.Module,
-            processors: Dict[str, AttentionProcessor],
-        ):
-            if hasattr(module, "get_processor"):
-                processors[f"{name}.processor"] = module.get_processor()
-
-            for sub_name, child in module.named_children():
-                fn_recursive_add_processors(f"{name}.{sub_name}", child, processors)
-
-            return processors
-
-        for name, module in self.named_children():
-            fn_recursive_add_processors(name, module, processors)
-
-        return processors
-
-    # Copied from diffusers.models.unets.unet_2d_condition.UNet2DConditionModel.set_attn_processor
-    def set_attn_processor(
-        self, processor: Union[AttentionProcessor, Dict[str, AttentionProcessor]]
-    ):
-        r"""
-        Sets the attention processor to use to compute attention.
-
-        Parameters:
-            processor (`dict` of `AttentionProcessor` or only `AttentionProcessor`):
-                The instantiated processor class or a dictionary of processor classes that will be set as the processor
-                for **all** `Attention` layers.
-
-                If `processor` is a dict, the key needs to define the path to the corresponding cross attention
-                processor. This is strongly recommended when setting trainable attention processors.
-
-        """
-        count = len(self.attn_processors.keys())
-
-        if isinstance(processor, dict) and len(processor) != count:
-            raise ValueError(
-                f"A dict of processors was passed, but the number of processors {len(processor)} does not match the"
-                f" number of attention layers: {count}. Please make sure to pass {count} processor classes."
-            )
-
-        def fn_recursive_attn_processor(name: str, module: torch.nn.Module, processor):
-            if hasattr(module, "set_processor"):
-                if not isinstance(processor, dict):
-                    module.set_processor(processor)
-                else:
-                    module.set_processor(processor.pop(f"{name}.processor"))
-
-            for sub_name, child in module.named_children():
-                fn_recursive_attn_processor(f"{name}.{sub_name}", child, processor)
-
-        for name, module in self.named_children():
-            fn_recursive_attn_processor(name, module, processor)
-
-    # Copied from diffusers.models.unets.unet_2d_condition.UNet2DConditionModel.set_default_attn_processor
-    def set_default_attn_processor(self):
-        """
-        Disables custom attention processors and sets the default attention implementation.
-        """
-        if all(
-            proc.__class__ in ADDED_KV_ATTENTION_PROCESSORS
-            for proc in self.attn_processors.values()
-        ):
-            processor = AttnAddedKVProcessor()
-        elif all(
-            proc.__class__ in CROSS_ATTENTION_PROCESSORS
-            for proc in self.attn_processors.values()
-        ):
-            processor = AttnProcessor()
-        else:
-            raise ValueError(
-                f"Cannot call `set_default_attn_processor` when attention processors are of type {next(iter(self.attn_processors.values()))}"
-            )
-
-        self.set_attn_processor(processor)
-
-    def _encode(self, x: torch.Tensor) -> torch.Tensor:
-        batch_size, num_channels, height, width = x.shape
-
-        if self.use_tiling and (
-            width > self.tile_sample_min_size or height > self.tile_sample_min_size
-        ):
-            return self._tiled_encode(x)
-
-        enc = self.encoder(x)
-        if self.quant_conv is not None:
-            enc = self.quant_conv(enc)
-
-        return enc
-
+    @cached_vae_encode
     def encode(
         self, x: torch.Tensor, return_dict: bool = True
     ) -> Union[DiagonalGaussianDistribution]:
@@ -254,25 +159,6 @@ class AutoencoderKLFlux2(ParallelTiledVAE):
         posterior = DiagonalGaussianDistribution(h)
         return posterior
 
-    def _decode(
-        self, z: torch.Tensor, return_dict: bool = True
-    ) -> Union[DecoderOutput, torch.Tensor]:
-        if self.use_tiling and (
-            z.shape[-1] > self.tile_latent_min_size
-            or z.shape[-2] > self.tile_latent_min_size
-        ):
-            return self.tiled_decode(z, return_dict=return_dict)
-
-        if self.post_quant_conv is not None:
-            z = self.post_quant_conv(z)
-
-        dec = self.decoder(z)
-
-        if not return_dict:
-            return (dec,)
-
-        return DecoderOutput(sample=dec)
-
     def decode(
         self, z: torch.FloatTensor, return_dict: bool = True, generator=None
     ) -> Union[DecoderOutput, torch.FloatTensor]:
@@ -297,203 +183,6 @@ class AutoencoderKLFlux2(ParallelTiledVAE):
             decoded = self._decode(z).sample
 
         return decoded
-
-    def blend_v(
-        self, a: torch.Tensor, b: torch.Tensor, blend_extent: int
-    ) -> torch.Tensor:
-        blend_extent = min(a.shape[2], b.shape[2], blend_extent)
-        for y in range(blend_extent):
-            b[:, :, y, :] = a[:, :, -blend_extent + y, :] * (1 - y / blend_extent) + b[
-                :, :, y, :
-            ] * (y / blend_extent)
-        return b
-
-    def blend_h(
-        self, a: torch.Tensor, b: torch.Tensor, blend_extent: int
-    ) -> torch.Tensor:
-        blend_extent = min(a.shape[3], b.shape[3], blend_extent)
-        for x in range(blend_extent):
-            b[:, :, :, x] = a[:, :, :, -blend_extent + x] * (1 - x / blend_extent) + b[
-                :, :, :, x
-            ] * (x / blend_extent)
-        return b
-
-    def _tiled_encode(self, x: torch.Tensor) -> torch.Tensor:
-        r"""Encode a batch of images using a tiled encoder.
-
-        When this option is enabled, the VAE will split the input tensor into tiles to compute encoding in several
-        steps. This is useful to keep memory use constant regardless of image size. The end result of tiled encoding is
-        different from non-tiled encoding because each tile uses a different encoder. To avoid tiling artifacts, the
-        tiles overlap and are blended together to form a smooth output. You may still see tile-sized changes in the
-        output, but they should be much less noticeable.
-
-        Args:
-            x (`torch.Tensor`): Input batch of images.
-
-        Returns:
-            `torch.Tensor`:
-                The latent representation of the encoded videos.
-        """
-
-        overlap_size = int(self.tile_sample_min_size * (1 - self.tile_overlap_factor))
-        blend_extent = int(self.tile_latent_min_size * self.tile_overlap_factor)
-        row_limit = self.tile_latent_min_size - blend_extent
-
-        # Split the image into 512x512 tiles and encode them separately.
-        rows = []
-        for i in range(0, x.shape[2], overlap_size):
-            row = []
-            for j in range(0, x.shape[3], overlap_size):
-                tile = x[
-                    :,
-                    :,
-                    i : i + self.tile_sample_min_size,
-                    j : j + self.tile_sample_min_size,
-                ]
-                tile = self.encoder(tile)
-                if self.config.use_quant_conv:
-                    tile = self.quant_conv(tile)
-                row.append(tile)
-            rows.append(row)
-        result_rows = []
-        for i, row in enumerate(rows):
-            result_row = []
-            for j, tile in enumerate(row):
-                # blend the above tile and the left tile
-                # to the current tile and add the current tile to the result row
-                if i > 0:
-                    tile = self.blend_v(rows[i - 1][j], tile, blend_extent)
-                if j > 0:
-                    tile = self.blend_h(row[j - 1], tile, blend_extent)
-                result_row.append(tile[:, :, :row_limit, :row_limit])
-            result_rows.append(torch.cat(result_row, dim=3))
-
-        enc = torch.cat(result_rows, dim=2)
-        return enc
-
-    def tiled_encode(
-        self, x: torch.Tensor, return_dict: bool = True
-    ) -> AutoencoderKLOutput:
-        r"""Encode a batch of images using a tiled encoder.
-
-        When this option is enabled, the VAE will split the input tensor into tiles to compute encoding in several
-        steps. This is useful to keep memory use constant regardless of image size. The end result of tiled encoding is
-        different from non-tiled encoding because each tile uses a different encoder. To avoid tiling artifacts, the
-        tiles overlap and are blended together to form a smooth output. You may still see tile-sized changes in the
-        output, but they should be much less noticeable.
-
-        Args:
-            x (`torch.Tensor`): Input batch of images.
-            return_dict (`bool`, *optional*, defaults to `True`):
-                Whether or not to return a [`~models.autoencoder_kl.AutoencoderKLOutput`] instead of a plain tuple.
-
-        Returns:
-            [`~models.autoencoder_kl.AutoencoderKLOutput`] or `tuple`:
-                If return_dict is True, a [`~models.autoencoder_kl.AutoencoderKLOutput`] is returned, otherwise a plain
-                `tuple` is returned.
-        """
-        deprecation_message = (
-            "The tiled_encode implementation supporting the `return_dict` parameter is deprecated. In the future, the "
-            "implementation of this method will be replaced with that of `_tiled_encode` and you will no longer be able "
-            "to pass `return_dict`. You will also have to create a `DiagonalGaussianDistribution()` from the returned value."
-        )
-
-        overlap_size = int(self.tile_sample_min_size * (1 - self.tile_overlap_factor))
-        blend_extent = int(self.tile_latent_min_size * self.tile_overlap_factor)
-        row_limit = self.tile_latent_min_size - blend_extent
-
-        # Split the image into 512x512 tiles and encode them separately.
-        rows = []
-        for i in range(0, x.shape[2], overlap_size):
-            row = []
-            for j in range(0, x.shape[3], overlap_size):
-                tile = x[
-                    :,
-                    :,
-                    i : i + self.tile_sample_min_size,
-                    j : j + self.tile_sample_min_size,
-                ]
-                tile = self.encoder(tile)
-                if self.config.use_quant_conv:
-                    tile = self.quant_conv(tile)
-                row.append(tile)
-            rows.append(row)
-        result_rows = []
-        for i, row in enumerate(rows):
-            result_row = []
-            for j, tile in enumerate(row):
-                # blend the above tile and the left tile
-                # to the current tile and add the current tile to the result row
-                if i > 0:
-                    tile = self.blend_v(rows[i - 1][j], tile, blend_extent)
-                if j > 0:
-                    tile = self.blend_h(row[j - 1], tile, blend_extent)
-                result_row.append(tile[:, :, :row_limit, :row_limit])
-            result_rows.append(torch.cat(result_row, dim=3))
-
-        moments = torch.cat(result_rows, dim=2)
-        posterior = DiagonalGaussianDistribution(moments)
-
-        if not return_dict:
-            return (posterior,)
-
-        return AutoencoderKLOutput(latent_dist=posterior)
-
-    def tiled_decode(
-        self, z: torch.Tensor, return_dict: bool = True
-    ) -> Union[DecoderOutput, torch.Tensor]:
-        r"""
-        Decode a batch of images using a tiled decoder.
-
-        Args:
-            z (`torch.Tensor`): Input batch of latent vectors.
-            return_dict (`bool`, *optional*, defaults to `True`):
-                Whether or not to return a [`~models.vae.DecoderOutput`] instead of a plain tuple.
-
-        Returns:
-            [`~models.vae.DecoderOutput`] or `tuple`:
-                If return_dict is True, a [`~models.vae.DecoderOutput`] is returned, otherwise a plain `tuple` is
-                returned.
-        """
-        overlap_size = int(self.tile_latent_min_size * (1 - self.tile_overlap_factor))
-        blend_extent = int(self.tile_sample_min_size * self.tile_overlap_factor)
-        row_limit = self.tile_sample_min_size - blend_extent
-
-        # Split z into overlapping 64x64 tiles and decode them separately.
-        # The tiles have an overlap to avoid seams between tiles.
-        rows = []
-        for i in range(0, z.shape[2], overlap_size):
-            row = []
-            for j in range(0, z.shape[3], overlap_size):
-                tile = z[
-                    :,
-                    :,
-                    i : i + self.tile_latent_min_size,
-                    j : j + self.tile_latent_min_size,
-                ]
-                if self.config.use_post_quant_conv:
-                    tile = self.post_quant_conv(tile)
-                decoded = self.decoder(tile)
-                row.append(decoded)
-            rows.append(row)
-        result_rows = []
-        for i, row in enumerate(rows):
-            result_row = []
-            for j, tile in enumerate(row):
-                # blend the above tile and the left tile
-                # to the current tile and add the current tile to the result row
-                if i > 0:
-                    tile = self.blend_v(rows[i - 1][j], tile, blend_extent)
-                if j > 0:
-                    tile = self.blend_h(row[j - 1], tile, blend_extent)
-                result_row.append(tile[:, :, :row_limit, :row_limit])
-            result_rows.append(torch.cat(result_row, dim=3))
-
-        dec = torch.cat(result_rows, dim=2)
-        if not return_dict:
-            return (dec,)
-
-        return DecoderOutput(sample=dec)
 
     def forward(
         self,

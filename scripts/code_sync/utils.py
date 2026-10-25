@@ -18,7 +18,7 @@ FOLDER_NAMES = [
     "docs",
     "examples",
     "python/sglang/lang",
-    "python/sglang/jit_kernel",
+    "python/sglang/kernels/jit",
     "python/sglang/srt",
     "python/sglang/test",
     "python/sglang/utils.py",
@@ -26,7 +26,6 @@ FOLDER_NAMES = [
     "sgl-kernel",
     "test/manual",
     "test/registered",
-    "test/srt",
     "test/README.md",
     "test/run_suite.py",
     "README.md",
@@ -121,14 +120,11 @@ def find_latest_oss_sync_commit(repo_root: Optional[str] = None) -> Optional[str
             if m:
                 oss_commit = m.group(1)
                 print(
-                    f"✅ Latest OSS sync commit found: {oss_commit} "
-                    f"(from: {subject})"
+                    f"✅ Latest OSS sync commit found: {oss_commit} (from: {subject})"
                 )
                 return oss_commit
 
-        print(
-            "⚠️  No '[Automated PR] Copy OSS code from commit ...' " "found in history."
-        )
+        print("⚠️  No '[Automated PR] Copy OSS code from commit ...' found in history.")
         return None
 
     except subprocess.CalledProcessError as e:

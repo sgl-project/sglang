@@ -16,14 +16,14 @@ def main():
     )
     args = parser.parse_args()
 
-    version_file = Path("sgl-kernel/python/sgl_kernel/version.py")
+    version_file = Path("python/sglang/kernels/aot/python/sgl_kernel/version.py")
 
     files_to_update = [
-        Path("sgl-kernel/pyproject.toml"),
-        Path("sgl-kernel/pyproject_cpu.toml"),
-        Path("sgl-kernel/pyproject_rocm.toml"),
-        Path("sgl-kernel/pyproject_musa.toml"),
-        Path("sgl-kernel/python/sgl_kernel/version.py"),
+        Path("python/sglang/kernels/aot/pyproject.toml"),
+        Path("python/sglang/kernels/aot/pyproject_cpu.toml"),
+        Path("python/sglang/kernels/aot/pyproject_rocm.toml"),
+        Path("python/sglang/kernels/aot/pyproject_musa.toml"),
+        Path("python/sglang/kernels/aot/python/sgl_kernel/version.py"),
     ]
 
     bump_version(args.new_version, version_file, files_to_update)

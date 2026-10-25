@@ -1,8 +1,13 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from:
 # https://github.com/vllm-project/vllm/blob/7193774b1ff8603ad5bf4598e5efba0d9a39b436/vllm/model_executor/models/mllama.py
 """PyTorch Mllama model."""
 
+from __future__ import annotations
+
 import math
+from array import array
 from typing import Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -15,10 +20,10 @@ from transformers.models.mllama.modeling_mllama import (
     _prepare_aspect_ratio_attention_mask,
 )
 
-import sglang.srt.distributed.parallel_state as ps
-from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import get_act_fn
 from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.layers.layer_boundary import layer_stack
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -38,6 +43,7 @@ from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaDecoderLayer, LlamaMLP
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix
 
 
@@ -80,7 +86,6 @@ class ColumnParallelConv2dPatch(torch.nn.Module):
 
 
 class MllamaPrecomputedAspectRatioEmbedding(nn.Module):
-
     def __init__(self, config: config_mllama.MllamaVisionConfig, is_gated: bool = True):
         super().__init__()
         self.max_num_tiles = config.max_num_tiles
@@ -193,9 +198,16 @@ class MllamaVisionEncoderLayer(nn.Module):
         super().__init__()
 
         self.hidden_size = config.hidden_size
-        self.num_attention_heads = config.attention_heads
+        self.num_attention_heads = (
+            config.original_attention_heads
+            if hasattr(config, "original_attention_heads")
+            else config.attention_heads
+        )
         self.is_gated = is_gated
         self.intermediate_size = config.intermediate_size
+        num_dummy_heads = 0
+        if hasattr(config, "original_attention_heads"):
+            num_dummy_heads = config.attention_heads - config.original_attention_heads
 
         self.self_attn = VisionAttention(
             self.hidden_size,
@@ -205,6 +217,7 @@ class MllamaVisionEncoderLayer(nn.Module):
             quant_config=quant_config,
             flatten_batch=False,
             prefix=add_prefix("self_attn", prefix),
+            num_dummy_heads=num_dummy_heads,
         )
         self.mlp = MllamaVisionMLP(
             config, quant_config, prefix=add_prefix("mlp", prefix)
@@ -305,10 +318,17 @@ class MllamaVisionModel(nn.Module):
 
         self.num_patches = (self.image_size // self.patch_size) ** 2 + 1
         self.scale = config.hidden_size**-0.5
+        out_channels = (
+            config.hidden_size
+            // config.original_attention_heads
+            * config.attention_heads
+            if hasattr(config, "original_attention_heads")
+            else config.hidden_size
+        )
 
         self.patch_embedding = ColumnParallelConv2dPatch(
             in_channels=config.num_channels,
-            out_channels=self.hidden_size,
+            out_channels=out_channels,
             kernel_size=self.patch_size,
             stride=self.patch_size,
             bias=False,
@@ -373,10 +393,14 @@ class MllamaVisionModel(nn.Module):
             pixel_values.to(self.layernorm_pre.weight.dtype)
         )
         hidden_state = patch_embeds
-        hidden_state = ps.get_tp_group().all_gather(hidden_state)
+        hidden_state = get_parallel().tp_group.all_gather(hidden_state)
 
         # tile embeddings
         _, num_patches, dim = hidden_state.shape
+        # slice off the padded part
+        if dim > self.hidden_size:
+            hidden_state = hidden_state[:, :, : self.hidden_size]
+            dim = self.hidden_size
         hidden_state = hidden_state.reshape(
             batch_size * num_concurrent_media, num_tiles, -1, dim
         )
@@ -486,7 +510,7 @@ class MllamaTextCrossAttention(nn.Module):
     ):
         super().__init__()
         self.config = config
-        self.model_parallel_size = get_tensor_model_parallel_world_size()
+        self.model_parallel_size = get_parallel().tp_size
         self.num_heads = self.config.num_attention_heads
         self.num_local_heads = self.num_heads // self.model_parallel_size
         self.num_key_value_heads = self.config.num_key_value_heads
@@ -496,6 +520,9 @@ class MllamaTextCrossAttention(nn.Module):
         self.dropout = config.dropout
         self.hidden_size = config.hidden_size
         self.head_dim = config.hidden_size // self.num_heads
+        # Use original head_dim since num_heads might be changed for TP num divisibility
+        if hasattr(config, "head_dim"):
+            self.head_dim = config.head_dim
         self.layer_id = layer_id
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.q_local_size = self.num_local_heads * self.head_dim
@@ -563,6 +590,7 @@ class MllamaTextCrossAttention(nn.Module):
         )
 
         output = self.attn(q, k, v, forward_batch)
+        output = output.view(-1, self.num_local_heads * self.head_dim)
         out, _ = self.o_proj(output)
         return out
 
@@ -651,26 +679,27 @@ class MllamaTextModel(nn.Module):
         self.cross_attention_layers = config.cross_attention_layers
 
         layers = []
-        for layer_id in range(config.num_hidden_layers):
-            if layer_id in self.cross_attention_layers:
-                layers.append(
-                    MllamaCrossAttentionDecoderLayer(
-                        config,
-                        layer_id,
-                        quant_config=quant_config,
-                        prefix=add_prefix(f"layers.{layer_id}", prefix),
+        with layer_stack():
+            for layer_id in range(config.num_hidden_layers):
+                if layer_id in self.cross_attention_layers:
+                    layers.append(
+                        MllamaCrossAttentionDecoderLayer(
+                            config,
+                            layer_id,
+                            quant_config=quant_config,
+                            prefix=add_prefix(f"layers.{layer_id}", prefix),
+                        )
                     )
-                )
-            else:
-                # TODO: force LlamaDecoderLayer to config.attention_bias=False
-                layers.append(
-                    LlamaDecoderLayer(
-                        config,
-                        quant_config=quant_config,
-                        layer_id=layer_id,
-                        prefix=add_prefix(f"layers.{layer_id}", prefix),
+                else:
+                    # TODO: force LlamaDecoderLayer to config.attention_bias=False
+                    layers.append(
+                        LlamaDecoderLayer(
+                            config,
+                            quant_config=quant_config,
+                            layer_id=layer_id,
+                            prefix=add_prefix(f"layers.{layer_id}", prefix),
+                        )
                     )
-                )
 
         self.layers = nn.ModuleList(layers)
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -699,13 +728,14 @@ class MllamaTextModel(nn.Module):
                         forward_batch=forward_batch,
                     )
             elif isinstance(decoder_layer, LlamaDecoderLayer):
-                hidden_states, residual = decoder_layer(
+                residual_batch.start(forward_batch)
+                hidden_states = decoder_layer(
                     positions=positions,
                     hidden_states=hidden_states,
                     forward_batch=forward_batch,
-                    residual=None,
                 )
-                hidden_states = hidden_states + residual
+                hidden_states = residual_batch.fold(hidden_states, forward_batch)
+                hidden_states = residual_batch.take_output(hidden_states, forward_batch)
             else:
                 raise ValueError(f"Unknown decoder layer type {type(decoder_layer)}")
         hidden_states = self.norm(hidden_states)
@@ -820,9 +850,11 @@ class MllamaForConditionalGeneration(nn.Module):
         )
         self.logits_processor = LogitsProcessor(config.text_config)
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(
+        self, input_ids: array[int], mm_inputs: MultimodalInputs
+    ) -> array[int]:
         pixel_values = torch.cat([item.feature for item in mm_inputs.mm_items], dim=0)
-        pad_values = [item.pad_value for item in mm_inputs.mm_items]
+        pad_values = array("q", (item.pad_value for item in mm_inputs.mm_items))
 
         num_concurrent_media, num_tiles = pixel_values.shape[1:3]
         num_patches = self.vision_model.num_patches
@@ -840,7 +872,6 @@ class MllamaForConditionalGeneration(nn.Module):
         # pixel_values: shape (bs, num_image, num_tiles, 3, image_res, image_res)
         max_num_images = max_num_tiles = bs = 0
         for i, mm_input in enumerate(forward_batch.mm_inputs):
-
             if not forward_batch.encoder_cached[i] and mm_input is not None:
                 pixel_values = torch.cat(
                     [item.feature for item in mm_input.mm_items], dim=0
@@ -863,9 +894,7 @@ class MllamaForConditionalGeneration(nn.Module):
                 self.image_size,
                 dtype=torch.float32,
             )
-            batched_ar_ids = torch.ones(
-                bs, max_num_images, dtype=torch.int64, device="cuda"
-            )
+            batched_ar_ids = torch.ones(bs, max_num_images, dtype=torch.int64)
             batched_ar_mask = torch.zeros(
                 bs, max_num_images, max_num_tiles, dtype=torch.int64
             )
@@ -884,11 +913,13 @@ class MllamaForConditionalGeneration(nn.Module):
                     img = pixel_values[0, j]
                     num_tiles = img.shape[0]
                     batched_images[i, j, :num_tiles] = img
-                    batched_ar_ids[i, j] = mm_input.mm_items[0].aspect_ratio_ids[0, j]
+                    batched_ar_ids[i, j] = mm_input.mm_items[0].model_specific_data[
+                        "aspect_ratio_ids"
+                    ][0, j]
 
                     batched_ar_mask[i, j, :num_tiles] = mm_input.mm_items[
                         0
-                    ].aspect_ratio_mask[0, j]
+                    ].model_specific_data["aspect_ratio_mask"][0, j]
                 i += 1
 
         return batched_images, batched_ar_ids, batched_ar_mask, encoder_lens_need
@@ -949,7 +980,7 @@ class MllamaForConditionalGeneration(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
-        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+        from sglang.srt.model_executor.runner import get_is_capture_mode
 
         batched_images, batched_ar_ids, batched_ar_mask, encoder_lens_need = (
             self._batch_image_inputs(forward_batch)
@@ -960,9 +991,18 @@ class MllamaForConditionalGeneration(nn.Module):
         cross_attention_states = None
 
         if get_is_capture_mode():
-            # NOTE: when doing cuda graph capture, we do not want to skip cross attention
-            # Make is a constant value to avoid cuda graph capture issue
-            skip_cross_attention = False
+            # NOTE: during graph capture/replay skip_cross_attention must be a
+            # compile-time constant to avoid graph breaks from data-dependent
+            # branching.  CPUGraphRunner captures two graphs per batch size (one
+            # with skip=True, one with skip=False) and sets the override via
+            # capture_with_skip_cross_attention(); fall back to False for CUDA
+            # graph capture which only captures the no-skip variant.
+            from sglang.srt.model_executor.cpu_graph_runner import (
+                get_capture_skip_cross_attention,
+            )
+
+            _override = get_capture_skip_cross_attention()
+            skip_cross_attention = _override if _override is not None else False
         else:
             # NOTE: we do not need image_inputs when prefill
             assert len(forward_batch.encoder_lens) == len(forward_batch.seq_lens)

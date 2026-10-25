@@ -8,14 +8,14 @@ from typing import cast
 
 from sglang.multimodal_gen.apps.webui import run_sgl_diffusion_webui
 from sglang.multimodal_gen.runtime.entrypoints.cli.cli_types import CLISubcommand
+from sglang.multimodal_gen.runtime.entrypoints.cli.utils import (
+    add_resolved_pipeline_config_cli_args,
+)
 from sglang.multimodal_gen.runtime.launch_server import (
     dispatch_launch,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.utils import FlexibleArgumentParser
-
-logger = init_logger(__name__)
+from sglang.multimodal_gen.runtime.utils.argparse import FlexibleArgumentParser
 
 
 def add_multimodal_gen_serve_args(parser: argparse.ArgumentParser):
@@ -27,12 +27,19 @@ def add_multimodal_gen_serve_args(parser: argparse.ArgumentParser):
         required=False,
         help="Read CLI options from a config JSON or YAML file.",
     )
-    return ServerArgs.add_cli_args(parser)
+    parser = ServerArgs.add_cli_args(parser)
+    add_resolved_pipeline_config_cli_args(parser)
+    return parser
 
 
 def execute_serve_cmd(args: argparse.Namespace, unknown_args: list[str] | None = None):
     """The entry point for the serve command."""
-    server_args = ServerArgs.from_cli_args(args, unknown_args)
+    # serving defaults: server-based warmup, throughput-oriented encoders
+    server_args = ServerArgs.from_cli_args(
+        args,
+        unknown_args,
+        default_args={"warmup_mode": "server"},
+    )
 
     dispatch_launch(server_args)
 

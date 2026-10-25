@@ -1,16 +1,26 @@
+from __future__ import annotations
+
 import logging
 import os
+import threading
+import time
+import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, List, Optional, Set
+from typing import TYPE_CHECKING, Any, List, Optional, Set
 
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.memory_pool_host import HostKVCache
+
+if TYPE_CHECKING:
+    from sglang.srt.mem_cache.pool_host import HostKVCache
 
 logger = logging.getLogger(__name__)
+
+# Max pages per batched storage IO call.
+STORAGE_BATCH_SIZE = 128
 
 
 @dataclass
@@ -27,12 +37,47 @@ class HiCacheStorageConfig:
     model_name: Optional[str]
     tp_lcm_size: Optional[int] = None
     should_split_heads: bool = False
+    # with dp-attention, tp_rank is attention-group-local; dp_rank disambiguates
+    dp_rank: int = 0
     extra_config: Optional[dict] = None
+    dcp_size: int = 1
+    dcp_rank: int = 0
+    logical_page_size: Optional[int] = None
+
+    def __post_init__(self):
+        if self.dcp_size < 1 or not 0 <= self.dcp_rank < self.dcp_size:
+            raise ValueError("Invalid DCP size or rank for HiCache storage.")
+        if self.dcp_size == 1:
+            return
+        if not self.is_mla_model:
+            raise ValueError("DCP storage shard identity currently requires MLA.")
+        if (
+            self.tp_size % self.dcp_size != 0
+            or not 0 <= self.tp_rank < self.tp_size
+            or self.tp_rank % self.dcp_size != self.dcp_rank
+        ):
+            raise ValueError("DCP storage requires contiguous DCP groups within TP.")
+        if (
+            self.logical_page_size is None
+            or self.logical_page_size <= 0
+            or self.logical_page_size % self.dcp_size != 0
+        ):
+            raise ValueError("DCP storage requires a DCP-aligned logical page size.")
+
+    @property
+    def is_storage_writer(self) -> bool:
+        """MLA replicas share one writer per DCP shard, in the first DCP group.
+
+        With DCP disabled, MLA uses rank 0 and non-MLA uses every TP rank.
+        """
+        return not self.is_mla_model or self.tp_rank == self.dcp_rank
 
 
 @dataclass
 class HiCacheStorageExtraInfo:
-    prefix_keys: Optional[List[str]] = (None,)
+    # Page hashes preceding the call's keys, from the sequence start;
+    # prefix_keys + keys is one contiguous chain for KV batches and sidecars.
+    prefix_keys: Optional[List[str]] = None
     extra_info: Optional[dict] = None
 
 
@@ -41,7 +86,35 @@ class PoolName(str, Enum):
 
     KV = "kv"
     MAMBA = "mamba"
+    SWA = "swa"
+    AUXILIARY_SWA = "auxiliary_swa"
     INDEXER = "indexer"
+    # TODO(hzh0425): Current DeepSeek V4 pool naming is verbose; will be normalized to
+    # 'COMPRESSED_KV / COMPRESSED_INDEXER / COMPRESSED_STATE' in the next PR.
+    DEEPSEEK_V4_C1 = "deepseek_v4_c1"
+    DEEPSEEK_V4_C1_INDEXER = "deepseek_v4_c1_indexer"
+    DEEPSEEK_V4_C1_INDEXER_SCALE = "deepseek_v4_c1_indexer_scale"
+    DEEPSEEK_V4_C2 = "deepseek_v4_c2"
+    DEEPSEEK_V4_C2_INDEXER = "deepseek_v4_c2_indexer"
+    DEEPSEEK_V4_C2_INDEXER_SCALE = "deepseek_v4_c2_indexer_scale"
+    DEEPSEEK_V4_C4 = "deepseek_v4_c4"
+    DEEPSEEK_V4_C4_INDEXER = "deepseek_v4_c4_indexer"
+    # FP4 indexer splits the indexer cache into separate payload/scale buffers,
+    # so it needs a second pool alongside DEEPSEEK_V4_C4_INDEXER.
+    DEEPSEEK_V4_C4_INDEXER_SCALE = "deepseek_v4_c4_indexer_scale"
+    DEEPSEEK_V4_C128 = "deepseek_v4_c128"
+    # fp8 unified_kv splits a row across a packed fp8 nope pool and a parallel
+    # bf16 rope pool, so each compressed region mirrors to two host pools.
+    DEEPSEEK_V4_C4_ROPE = "deepseek_v4_c4_rope"
+    DEEPSEEK_V4_C128_ROPE = "deepseek_v4_c128_rope"
+    DEEPSEEK_V4_C4_STATE = "deepseek_v4_c4_state"
+    DEEPSEEK_V4_C4_INDEXER_STATE = "deepseek_v4_c4_indexer_state"
+    DEEPSEEK_V4_C128_STATE = "deepseek_v4_c128_state"
+
+    # Draft KV pool
+    DRAFT = "draft"
+    DRAFT_INDEXER = "draft_indexer"
+    DRAFT_SWA = "draft_swa"
 
     def __str__(self) -> str:
         return self.value
@@ -52,10 +125,15 @@ class PoolHitPolicy(str, Enum):
 
     ALL_PAGES      : every page in [0, kv_hit) must exist (e.g. DSA).
     TRAILING_PAGES : only the last N pages must exist (e.g. Mamba/SWA states).
+    BLOCK_GROUPS   : whole key groups at block boundaries from the span start
+                     (a second form of the FULL pages, e.g. compressed blocks).
+                     The pool reports the pages its leading complete groups
+                     cover as its own verdict; it never gates the KV hit.
     """
 
     ALL_PAGES = "all_pages"
     TRAILING_PAGES = "trailing_pages"
+    BLOCK_GROUPS = "block_groups"
 
 
 @dataclass
@@ -73,6 +151,19 @@ class PoolTransfer:
     keys: Optional[List[str]] = None
     hit_policy: PoolHitPolicy = PoolHitPolicy.ALL_PAGES
     nodes_to_load: Optional[List[Any]] = None
+    indices_from_pool: Optional[PoolName] = None
+    # BLOCK_GROUPS geometry: FULL pages per block and keys (pages) per group.
+    block_pages: int = 0
+    group_pages: int = 0
+
+
+@dataclass(frozen=True)
+class SidecarPoolSpec:
+    """Pool whose transfer indices are reused from one real source pool."""
+
+    pool_name: PoolName
+    indices_from_pool: PoolName
+    hit_policy: PoolHitPolicy = PoolHitPolicy.ALL_PAGES
 
 
 @dataclass
@@ -82,19 +173,35 @@ class PoolTransferResult:
     kv_hit_pages: int
     extra_pool_hit_pages: dict[str, int]
 
+    # Pools with TRAILING_PAGES (SWA, Mamba state) only hold a window that ends on an
+    # offloaded node boundary, so 5 can be restorable while 4 and 3 are not.
+    # Each rank owns its own shard and may hold a different set, so reducing a
+    # per-rank maximum would pick a length that is illegal on another rank; the
+    # caller intersects these sets instead.
+    restorable_prefix_pages: Optional[List[int]] = None
+
     @classmethod
-    def empty(cls) -> "PoolTransferResult":
+    def empty(cls) -> PoolTransferResult:
         return cls(0, {})
 
     def update_kv_hit_pages(self, kv_hit_pages: int) -> None:
         """Accumulate kv_hit_pages across batches (max = last successful batch)."""
         self.kv_hit_pages = max(self.kv_hit_pages, kv_hit_pages)
 
-    def update_extra_pool_hit_pages(self, results: dict[str, List[bool]]) -> None:
-        """Record actual load/write success counts per extra pool."""
-        self.extra_pool_hit_pages.update(
-            {name: sum(rs) for name, rs in results.items()}
-        )
+    def update_extra_pool_hit_pages(self, results: dict[str, int]) -> None:
+        """Record actual load/write success counts per extra pool.
+
+        Every extra pool contributes a prefix that must be contiguous from the
+        start, so count the leading run of successes
+        """
+        self.extra_pool_hit_pages.update(results)
+
+
+def count_pool_hits(results: dict[str, List[bool]]) -> dict[str, int]:
+    return {
+        name: (rs.index(False) if False in rs else len(rs))
+        for name, rs in results.items()
+    }
 
 
 class HiCacheStorage(ABC):
@@ -111,6 +218,16 @@ class HiCacheStorage(ABC):
         if not hasattr(self, "registered_pools"):
             self.registered_pools = {}
         self.registered_pools[host_pool_name] = host_pool
+
+    def on_host_pools_registered(self) -> None:
+        """The initial host-pool registration burst is over: the anchor pool
+        (``register_mem_pool_host``) and every host pool group entry
+        (``register_mem_host_pool_v2``). Fires once per attach; pools
+        registered later (dynamic sidecars) arrive through v2 alone and do
+        not re-fire it. Backends that must finalize once the pool set is
+        known -- e.g. register with a remote cache manager whose spec cannot
+        be amended -- should do so here; raising fails the attach.
+        """
 
     def batch_exists_v2(
         self,
@@ -148,7 +265,7 @@ class HiCacheStorage(ABC):
     def batch_get_v2(
         self,
         transfers: List[PoolTransfer],
-        extra_info: Optional["HiCacheStorageExtraInfo"] = None,
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> dict[str, List[bool]]:
         """Read data from storage into host memory for each PoolTransfer.
 
@@ -159,7 +276,7 @@ class HiCacheStorage(ABC):
     def batch_set_v2(
         self,
         transfers: List[PoolTransfer],
-        extra_info: Optional["HiCacheStorageExtraInfo"] = None,
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> dict[str, List[bool]]:
         """Write data from host memory to storage for each PoolTransfer.
 
@@ -276,12 +393,47 @@ class HiCacheStorage(ABC):
         return None
 
 
-class HiCacheFile(HiCacheStorage):
+class MetadataCache:
+    def __init__(self, ttl_seconds: float):
+        self.ttl_seconds = ttl_seconds
+        # key -> monotonic timestamp
+        self.cache: dict[str, float] = {}
+        self.lock = threading.Lock()
 
+    def add(self, key: str):
+        with self.lock:
+            if key not in self.cache:
+                self.cache[key] = time.monotonic()
+
+    def remove(self, key: str):
+        with self.lock:
+            self.cache.pop(key, None)
+
+    def contains(self, key: str) -> bool:
+        with self.lock:
+            if key not in self.cache:
+                return False
+            if self.ttl_seconds == -1.0:
+                return True
+            if time.monotonic() - self.cache[key] > self.ttl_seconds:
+                del self.cache[key]
+                return False
+            return True
+
+    def clear(self):
+        with self.lock:
+            self.cache.clear()
+
+
+class HiCacheFile(HiCacheStorage):
     def __init__(
         self, storage_config: HiCacheStorageConfig, file_path: str = "/tmp/hicache"
     ):
-        self.file_path = envs.SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR.get() or file_path
+        self.file_path = (
+            envs.SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR.get()
+            or (storage_config.extra_config or {}).get("file_storage_path")
+            or file_path
+        )
 
         tp_rank, tp_size, pp_rank, pp_size, model_name, is_mla_model = (
             storage_config.tp_rank,
@@ -291,31 +443,105 @@ class HiCacheFile(HiCacheStorage):
             storage_config.model_name,
             storage_config.is_mla_model,
         )
+        attn_cp_rank = storage_config.attn_cp_rank
+        attn_cp_size = storage_config.attn_cp_size
         model_name = "-".join(model_name.split("/")) if model_name else ""
         enable_pp = pp_size > 1
-        self.config_suffix = f"_{model_name}"
-        if not is_mla_model:
-            self.config_suffix += f"_{tp_rank}_{tp_size}"
-        if enable_pp:
-            self.config_suffix += f"_{pp_size}_{pp_rank}"
-        if not os.path.exists(self.file_path) and tp_rank == 0:
+        shard_suffix = f"_{pp_size}_{pp_rank}" if enable_pp else ""
+        # Under NSA context parallel each CP rank holds a disjoint slice of every
+        # page, so give each rank its own file key to avoid a cross-rank write race.
+        if attn_cp_size > 1:
+            shard_suffix += f"_cp{attn_cp_rank}_{attn_cp_size}"
+        # MLA KV is replicated across TP ranks and shares one file per page;
+        # TP-sharded state is keyed by tp_config_suffix instead.
+        self.tp_config_suffix = f"_{model_name}_{tp_rank}_{tp_size}{shard_suffix}"
+        self.config_suffix = (
+            f"_{model_name}{shard_suffix}" if is_mla_model else self.tp_config_suffix
+        )
+
+        # TODO: Include KV dtype and stored layout in keys for both DCP and
+        # non-DCP caches; raw file payloads do not describe their format.
+        if storage_config.dcp_size > 1:
+            # Equivalent MLA shards in different DCP groups share a file.
+            dcp_suffix = (
+                f"_tp{tp_size}_dcp{storage_config.dcp_rank}_{storage_config.dcp_size}"
+                f"_page{storage_config.logical_page_size}"
+            )
+            self.config_suffix += dcp_suffix
+            self.tp_config_suffix += dcp_suffix
+
+        if not os.path.exists(self.file_path) and tp_rank == 0 and attn_cp_rank == 0:
             os.makedirs(self.file_path)
             logger.info(f"Created HiCacheFile storage directory at {self.file_path}")
 
+        # Metadata cache positive lookup toggle & TTL
+        enable_cache_raw = None
+        if storage_config.extra_config:
+            enable_cache_raw = storage_config.extra_config.get("enable_metadata_cache")
+        if enable_cache_raw is None:
+            enable_cache_raw = (
+                envs.SGLANG_HICACHE_FILE_BACKEND_ENABLE_METADATA_CACHE.get()
+            )
+
+        self.enable_metadata_cache = bool(enable_cache_raw)
+
+        if self.enable_metadata_cache:
+            ttl_raw = None
+            if storage_config.extra_config:
+                ttl_raw = storage_config.extra_config.get("metadata_ttl")
+            if ttl_raw is None:
+                ttl_raw = envs.SGLANG_HICACHE_FILE_BACKEND_METADATA_TTL.get()
+
+            self.metadata_ttl = float(ttl_raw) if ttl_raw is not None else 5.0
+            self.metadata_cache = MetadataCache(self.metadata_ttl)
+            self._scan_existing_files_to_metadata_cache()
+        else:
+            self.metadata_cache = None
+
+        # All LRU / size accounting and disk eviction lives in the evictor so
+        # this backend stays a thin raw-bytes store. Imported lazily: the storage
+        # package __init__ pulls in the backend factory, which imports this
+        # module, so a top-level import here would be circular.
+        from sglang.srt.mem_cache.storage.file.lru_file_evictor import LRUFileEvictor
+
+        # Each rank owns its TP-sharded state; selected DCP writers also own
+        # their shared MLA shard files.
+        owned_suffixes = (self.tp_config_suffix,)
+        if is_mla_model and storage_config.is_storage_writer:
+            owned_suffixes += (self.config_suffix,)
+        self._evictor = LRUFileEvictor(
+            self.file_path,
+            owned_suffixes=owned_suffixes,
+            tp_rank=tp_rank,
+            extra_config=storage_config.extra_config,
+            on_evict=(
+                self.metadata_cache.remove if self.metadata_cache is not None else None
+            ),
+        )
+
     def _get_suffixed_key(self, key: str) -> str:
+        # Mamba state is TP-sharded even when the model's MLA KV is replicated.
+        if key.endswith(f".{PoolName.MAMBA.value}"):
+            return key + self.tp_config_suffix
         return key + self.config_suffix
 
     def _get_component_key(self, key: str, component_name: Optional[str] = None) -> str:
         if component_name is None or component_name in ("__default__", PoolName.KV):
             return self._get_suffixed_key(key)
-        return self._get_suffixed_key(f"{key}.{component_name}")
+        return self._get_suffixed_key(self._log_key(component_name, key))
 
-    def _get_component_path(
-        self, key: str, component_name: Optional[str] = None
-    ) -> str:
-        return os.path.join(
-            self.file_path, f"{self._get_component_key(key, component_name)}.bin"
-        )
+    def _scan_existing_files_to_metadata_cache(self) -> None:
+        try:
+            names = os.listdir(self.file_path)
+        except FileNotFoundError:
+            return
+        for fn in names:
+            if not fn.endswith(".bin"):
+                continue
+            stem = fn[:-4]
+            # Only files belonging to this rank/model.
+            if stem.endswith((self.config_suffix, self.tp_config_suffix)):
+                self.metadata_cache.add(stem)
 
     def get(
         self,
@@ -323,16 +549,21 @@ class HiCacheFile(HiCacheStorage):
         target_location: torch.Tensor,
         target_sizes: Optional[Any] = None,
     ) -> torch.Tensor | None:
-        key = self._get_suffixed_key(key)
-        tensor_path = os.path.join(self.file_path, f"{key}.bin")
+        suffixed = self._get_suffixed_key(key)
+        tensor_path = os.path.join(self.file_path, f"{suffixed}.bin")
         try:
             expected = target_location.numel() * target_location.element_size()
             with open(tensor_path, "rb", buffering=0) as f:
                 buf = memoryview(target_location.view(torch.uint8).contiguous().numpy())
                 if f.readinto(buf) != expected:
-                    raise IOError(f"Short read for {key}")
+                    raise IOError(f"Short read for {suffixed}")
+            self._evictor.touch(suffixed, tensor_path)
+            if self.metadata_cache is not None:
+                self.metadata_cache.add(suffixed)
             return target_location
         except FileNotFoundError:
+            if self.metadata_cache is not None:
+                self.metadata_cache.remove(suffixed)
             logger.warning(f"Failed to fetch {key} from HiCacheFile storage.")
             return None
 
@@ -356,17 +587,43 @@ class HiCacheFile(HiCacheStorage):
         target_location: Optional[Any] = None,
         target_sizes: Optional[Any] = None,
     ) -> bool:
+        suffixed = self._get_suffixed_key(key)
+        tensor_path = os.path.join(self.file_path, f"{suffixed}.bin")
+
+        # Fast path: same key already on disk. Refresh recency and skip rewrite.
         if self.exists(key):
             logger.debug(f"Key {key} already exists. Skipped.")
+            self._evictor.touch(suffixed, tensor_path)
             return True
 
-        key = self._get_suffixed_key(key)
-        tensor_path = os.path.join(self.file_path, f"{key}.bin")
+        tmp_path = None
+        reserved = False
         try:
-            value.contiguous().view(dtype=torch.uint8).numpy().tofile(tensor_path)
+            value_bytes = value.numel() * value.element_size()
+            # Ask the evictor to admit + reserve disk space (evicting if needed).
+            if not self._evictor.reserve(suffixed, value_bytes, key=key):
+                return False
+            reserved = True
+
+            tmp_path = os.path.join(self.file_path, f".{uuid.uuid4().hex}.tmp")
+            value.contiguous().view(dtype=torch.uint8).numpy().tofile(tmp_path)
+            os.replace(tmp_path, tensor_path)
+            self._evictor.commit(suffixed)
+            if self.metadata_cache is not None:
+                self.metadata_cache.add(suffixed)
             return True
         except Exception as e:
             logger.error(f"Failed to save tensor {key}: {e}")
+            # Roll back the reservation and clean up any half-written file.
+            if reserved:
+                self._evictor.abort(suffixed)
+            if tmp_path is not None:
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+            if self.metadata_cache is not None:
+                self.metadata_cache.remove(suffixed)
             return False
 
     def batch_set(
@@ -383,8 +640,14 @@ class HiCacheFile(HiCacheStorage):
 
     def exists(self, key: str) -> bool:
         key = self._get_suffixed_key(key)
+        if self.metadata_cache is not None and self.metadata_cache.contains(key):
+            return True
         tensor_path = os.path.join(self.file_path, f"{key}.bin")
-        return os.path.exists(tensor_path)
+        if os.path.exists(tensor_path):
+            if self.metadata_cache is not None:
+                self.metadata_cache.add(key)
+            return True
+        return False
 
     def _collect_existing_component_keys(
         self,
@@ -396,11 +659,23 @@ class HiCacheFile(HiCacheStorage):
             for key in keys:
                 target_files.add(f"{self._get_component_key(key, transfer.name)}.bin")
 
+        if self.metadata_cache is None:
+            return {
+                filename
+                for filename in target_files
+                if os.path.isfile(os.path.join(self.file_path, filename))
+            }
+
         existing_files = set()
-        with os.scandir(self.file_path) as entries:
-            for entry in entries:
-                if entry.is_file() and entry.name in target_files:
-                    existing_files.add(entry.name)
+        for filename in target_files:
+            stem = filename[:-4]
+            if self.metadata_cache.contains(stem):
+                existing_files.add(filename)
+            else:
+                path = os.path.join(self.file_path, filename)
+                if os.path.exists(path):
+                    self.metadata_cache.add(stem)
+                    existing_files.add(filename)
         return existing_files
 
     def batch_exists_v2(
@@ -427,31 +702,35 @@ class HiCacheFile(HiCacheStorage):
         )
 
         hit_count: dict[str, int] = {PoolName.KV: kv_pages} if kv_pages else {}
-        final_pages = kv_pages
+        restorable = list(range(1, kv_pages + 1))
 
         for transfer in pool_transfers or []:
-            if final_pages == 0:
+            if not restorable:
                 break
             name = transfer.name
             if transfer.hit_policy == PoolHitPolicy.ALL_PAGES:
                 boundary = next(
                     (i for i in range(kv_pages) if not has_component(i, name)), kv_pages
                 )
-            else:  # trailing_pages
+                pool_restorable = set(range(1, boundary + 1))
+            elif transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
                 trailing = max(1, len(transfer.keys) if transfer.keys else 1)
-                boundary = 0
-                for prefix_len in range(kv_pages, 0, -1):
+                pool_restorable = set()
+                for prefix_len in range(1, kv_pages + 1):
                     if all(
                         has_component(i, name)
                         for i in range(max(0, prefix_len - trailing), prefix_len)
                     ):
-                        boundary = prefix_len
-                        break
+                        pool_restorable.add(prefix_len)
+                boundary = max(pool_restorable, default=0)
+            else:
+                raise ValueError(f"Unsupported pool hit policy: {transfer.hit_policy}")
             if boundary:
                 hit_count[name] = boundary
-            final_pages = min(final_pages, boundary)
+            restorable = [p for p in restorable if p in pool_restorable]
 
-        return PoolTransferResult(final_pages, hit_count)
+        final_pages = restorable[-1] if restorable else 0
+        return PoolTransferResult(final_pages, hit_count, restorable)
 
     def _log_key(self, pool_name: str, key: str) -> str:
         return key if pool_name == PoolName.KV else f"{key}.{pool_name}"
@@ -502,14 +781,14 @@ class HiCacheFile(HiCacheStorage):
     def batch_get_v2(
         self,
         transfers: List[PoolTransfer],
-        extra_info: Optional["HiCacheStorageExtraInfo"] = None,
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> dict[str, List[bool]]:
         return self._batch_io_v2(transfers, self._read_page)
 
     def batch_set_v2(
         self,
         transfers: List[PoolTransfer],
-        extra_info: Optional["HiCacheStorageExtraInfo"] = None,
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> dict[str, List[bool]]:
         return self._batch_io_v2(transfers, self._write_page)
 
@@ -519,6 +798,9 @@ class HiCacheFile(HiCacheStorage):
                 file_path = os.path.join(self.file_path, filename)
                 if os.path.isfile(file_path):
                     os.remove(file_path)
+            self._evictor.clear()
+            if self.metadata_cache is not None:
+                self.metadata_cache.clear()
             logger.info("Cleared all entries in HiCacheFile storage.")
             return True
         except Exception as e:

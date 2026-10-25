@@ -5,7 +5,6 @@ import torch
 from torch import nn
 from transformers import PersimmonConfig
 
-from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import get_act_fn
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -23,11 +22,11 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import add_prefix, make_layers
+from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils import add_prefix, make_pp_layers
 
 
 class PersimmonMLP(nn.Module):
-
     def __init__(
         self, config: PersimmonConfig, quant_config: Optional[QuantizationConfig] = None
     ):
@@ -48,7 +47,6 @@ class PersimmonMLP(nn.Module):
 
 
 class PersimmonAttention(nn.Module):
-
     def __init__(
         self,
         config: PersimmonConfig,
@@ -58,7 +56,7 @@ class PersimmonAttention(nn.Module):
     ):
         super().__init__()
         self.config = config
-        tensor_parallel_world_size = get_tensor_model_parallel_world_size()
+        tensor_parallel_world_size = get_parallel().tp_size
 
         self.hidden_size = config.hidden_size
         self.total_num_heads = config.num_attention_heads
@@ -143,7 +141,6 @@ class PersimmonAttention(nn.Module):
 
 
 class PersimmonDecoderLayer(nn.Module):
-
     def __init__(
         self,
         config: PersimmonConfig,
@@ -195,7 +192,6 @@ class PersimmonDecoderLayer(nn.Module):
 
 
 class PersimmonModel(nn.Module):
-
     def __init__(
         self,
         config: PersimmonConfig,
@@ -204,7 +200,7 @@ class PersimmonModel(nn.Module):
     ):
         super().__init__()
         self.config = config
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -213,14 +209,12 @@ class PersimmonModel(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
-        self.layers, self.start_layer, self.end_layer = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             lambda idx, prefix: PersimmonDecoderLayer(
                 config, quant_config=quant_config, prefix=prefix, idx=idx
             ),
             prefix="model.layers",
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
         )
 
         if self.pp_group.is_last_rank:
@@ -258,7 +252,6 @@ class PersimmonModel(nn.Module):
 
 
 class PersimmonForCausalLM(nn.Module):
-
     def __init__(
         self,
         config: PersimmonConfig,

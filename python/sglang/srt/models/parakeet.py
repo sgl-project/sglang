@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright 2026 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -95,7 +97,7 @@ class ProjectedParakeet(nn.Module):
             if name.startswith("sound_encoder."):
                 target_name = name[len("sound_encoder.") :]
             elif name.startswith("sound_projection."):
-                target_name = f"projection.{name[len('sound_projection.'):]}"
+                target_name = f"projection.{name[len('sound_projection.') :]}"
             else:
                 continue
 

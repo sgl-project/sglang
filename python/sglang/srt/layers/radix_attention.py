@@ -21,15 +21,28 @@ from typing import TYPE_CHECKING, Optional
 import torch
 from torch import nn
 
-from sglang.srt.compilation.compilation_config import register_split_op
-from sglang.srt.compilation.piecewise_context_manager import get_forward_context
-from sglang.srt.model_executor.breakable_cuda_graph.breakable_cuda_graph import (
-    eager_on_graph,
+from sglang.srt.layers.attention.graph_utils import (
+    _attention_on_real_rows,
+    _zero_padded_tokens,
+    allocate_attention_outputs,
+    attention_input_scope,
+    attention_output_tokens,
+    attention_query_tokens,
+    padded_extend_real_tokens,
 )
-from sglang.srt.model_executor.breakable_cuda_graph.context import (
+from sglang.srt.model_executor.forward_context import (
+    get_attn_backend,
+)
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    eager_on_graph,
     is_in_breakable_cuda_graph,
 )
-from sglang.srt.utils.custom_op import register_custom_op
+from sglang.srt.model_executor.runner_utils.forward_batch import get_forward_batch
+from sglang.srt.model_executor.runner_utils.prefill_graph import (
+    get_prefill_raw_num_tokens,
+    is_in_full_prefill_graph,
+    is_in_prefill_graph_scope,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -37,24 +50,14 @@ if TYPE_CHECKING:
 
 
 class AttentionType(Enum):
-    """
-    Attention type.
-    Use string to be compatible with `torch.compile`.
-    """
+    """String-valued attention types, compatible with torch.compile."""
 
-    # Decoder attention between previous layer Q/K/V
     DECODER = "decoder"
-    # Decoder bidirectional attention between image tokens
     DECODER_BIDIRECTIONAL = "decoder_bidirectional"
-    # Encoder attention between previous layer Q/K/V
     ENCODER_ONLY = "encoder_only"
 
 
 class RadixAttention(nn.Module):
-    """
-    The attention layer implementation.
-    """
-
     def __init__(
         self,
         num_heads: int,
@@ -72,6 +75,7 @@ class RadixAttention(nn.Module):
         attn_type: AttentionType = AttentionType.DECODER,
         use_irope: bool = False,
         prefix: str = "",
+        use_prefill_attention_wrapper: bool = True,
     ):
         super().__init__()
         self.tp_q_head_num = num_heads
@@ -86,10 +90,15 @@ class RadixAttention(nn.Module):
         self.sliding_window_size = sliding_window_size or -1
         self.is_cross_attention = is_cross_attention
         self.use_irope = use_irope
+        self.use_prefill_attention_wrapper = use_prefill_attention_wrapper
         self.k_scale = None
         self.v_scale = None
         self.k_scale_float = None
         self.v_scale_float = None
+        self.q_scale_float = None
+        self.idx_q_scale_float = None
+        self.idx_k_scale_float = None
+        self.idx_v_scale_float = None
         self.quant_method = None
 
         if quant_config is not None:
@@ -109,111 +118,118 @@ class RadixAttention(nn.Module):
         v,
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
+        key_value_num_tokens: Optional[int] = None,
         **kwargs,
     ):
         if k is not None:
-            # For cross-layer sharing, kv can be None
             assert v is not None
+            k = k.view(
+                -1,
+                self.tp_k_head_num,
+                self.v_head_dim if "k_rope" in kwargs else self.qk_head_dim,
+            )
             if "k_rope" not in kwargs:
-                k = k.view(-1, self.tp_k_head_num, self.qk_head_dim)
                 v = v.view(-1, self.tp_v_head_num, self.v_head_dim)
-            else:
-                k = k.view(-1, self.tp_k_head_num, self.v_head_dim)
-
-        if forward_batch.forward_mode.is_extend() and get_forward_context() is not None:
-            if self.qk_head_dim != self.v_head_dim:
-                output = q.new_empty((q.shape[0], self.tp_q_head_num * self.v_head_dim))
-            else:
-                output = torch.empty_like(q)
-            if is_in_breakable_cuda_graph():
-                bcg_unified_attention_with_output(
-                    q, k, v, output, save_kv_cache, self.layer_id, **kwargs
-                )
-            else:
-                unified_attention_with_output(
-                    q, k, v, output, save_kv_cache, self.layer_id, **kwargs
-                )
-            return output
-        else:
-            return forward_batch.attn_backend.forward(
+        breakable_cg = is_in_breakable_cuda_graph()
+        full_cg = is_in_full_prefill_graph()
+        use_eager_attention = (
+            self.use_prefill_attention_wrapper
+            and is_in_prefill_graph_scope()
+            and forward_batch.forward_mode.is_extend()
+            and (breakable_cg or full_cg)
+        )
+        if use_eager_attention:
+            is_sparse = kwargs.get("idx_q") is not None
+            output, idx_output = allocate_attention_outputs(
+                self, q, v, kwargs.get("idx_q")
+            )
+            lse = self._eager_attention(
                 q,
                 k,
                 v,
-                self,
-                forward_batch,
+                output,
                 save_kv_cache,
+                key_value_num_tokens,
+                idx_output,
                 **kwargs,
             )
+            if is_sparse:
+                return idx_output, output
+            if kwargs.get("return_lse") or forward_batch.mha_return_lse:
+                return output.view(-1, self.tp_q_head_num, self.v_head_dim), lse
+            return output
+        real_num_tokens = padded_extend_real_tokens(q, forward_batch)
+        if real_num_tokens is not None:
+            return _attention_on_real_rows(
+                self,
+                real_num_tokens,
+                q,
+                k,
+                v,
+                forward_batch,
+                save_kv_cache,
+                key_value_num_tokens=key_value_num_tokens,
+                **kwargs,
+            )
+        return get_attn_backend().forward(
+            q, k, v, self, forward_batch, save_kv_cache, **kwargs
+        )
 
-
-@register_custom_op(mutates_args=["output"])
-@register_split_op()
-def unified_attention_with_output(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    output: torch.Tensor,
-    save_kv_cache: bool,
-    layer_id: int,
-    *,
-    q_rope: Optional[torch.Tensor] = None,
-    k_rope: Optional[torch.Tensor] = None,
-    sinks: Optional[torch.Tensor] = None,
-) -> None:
-    context = get_forward_context()
-    forward_batch = context.forward_batch
-    attention_layers = context.attention_layers
-    attention_layer = attention_layers[layer_id]
-    real_num_tokens = forward_batch.num_token_non_padded_cpu
-
-    query = query[:real_num_tokens]
-    key = key[:real_num_tokens]
-    value = value[:real_num_tokens]
-
-    kwargs = {}
-    if q_rope is not None:
-        kwargs["q_rope"] = q_rope[:real_num_tokens]
-    if k_rope is not None:
-        kwargs["k_rope"] = k_rope[:real_num_tokens]
-    if sinks is not None:
-        kwargs["sinks"] = sinks
-
-    original_out_cache_loc = forward_batch.out_cache_loc
-    original_out_cache_loc_swa = forward_batch.out_cache_loc_swa
-    token_to_kv_pool = forward_batch.token_to_kv_pool
-    original_swa_loc = getattr(token_to_kv_pool, "swa_loc", None)
-    # Keep the original ForwardBatch object and only narrow cache locations for
-    # this backend call so model/backend state is still written to the same batch.
-    forward_batch.out_cache_loc = original_out_cache_loc[:real_num_tokens]
-    if original_out_cache_loc_swa is not None:
-        forward_batch.out_cache_loc_swa = original_out_cache_loc_swa[:real_num_tokens]
-        if hasattr(token_to_kv_pool, "set_swa_loc"):
-            token_to_kv_pool.set_swa_loc(forward_batch.out_cache_loc_swa)
-
-    # Store pre-allocated output for FA backend to write directly into.
-    # Must slice to real_num_tokens to match the narrowed query shape —
-    # the FA kernel validates out.size(0) == q.size(0).
-    forward_batch._attn_output = output[:real_num_tokens]
-
-    ret = forward_batch.attn_backend.forward(
-        query,
-        key,
-        value,
-        attention_layer,
-        forward_batch,
-        save_kv_cache,
+    @eager_on_graph
+    def _eager_attention(
+        self,
+        q,
+        k,
+        v,
+        output,
+        save_kv_cache: bool = True,
+        key_value_num_tokens: Optional[int] = None,
+        idx_output=None,
         **kwargs,
-    )
-    forward_batch.out_cache_loc = original_out_cache_loc
-    forward_batch.out_cache_loc_swa = original_out_cache_loc_swa
-    if original_out_cache_loc_swa is not None and hasattr(
-        token_to_kv_pool, "set_swa_loc"
     ):
-        token_to_kv_pool.set_swa_loc(original_swa_loc)
-
-    if ret.data_ptr() != output.data_ptr():
-        output[:real_num_tokens].view(ret.shape).copy_(ret)
-    return
-
-
-bcg_unified_attention_with_output = eager_on_graph(True)(unified_attention_with_output)
+        """Run real tokens, retaining padded outputs for the next graph segment."""
+        forward_batch = get_forward_batch()
+        rows = output.shape[0]
+        n = forward_batch.global_num_token_non_padded_cpu
+        kv_n = n if key_value_num_tokens is None else key_value_num_tokens
+        cache_n = n
+        n = attention_query_tokens(forward_batch, n)
+        return_lse = bool(kwargs.get("return_lse") or forward_batch.mha_return_lse)
+        lse = None
+        if n == 0:
+            output.zero_()
+            if idx_output is not None:
+                idx_output.zero_()
+            if return_lse:
+                lse = q.new_zeros((rows, q.shape[1]), dtype=torch.float32)
+        else:
+            with attention_input_scope(
+                forward_batch, output, n, kv_n, kwargs, cache_tokens=cache_n
+            ) as kwargs:
+                result = get_attn_backend().forward(
+                    q[:n],
+                    k[:kv_n] if k is not None else None,
+                    v[:kv_n] if v is not None else None,
+                    self,
+                    forward_batch,
+                    save_kv_cache,
+                    **kwargs,
+                )
+            if idx_output is not None:
+                idx_result, result = result
+                if idx_result is not None:
+                    idx_output[:n].view(idx_result.shape).copy_(idx_result)
+            elif return_lse:
+                result, lse, *_ = result
+            if result.data_ptr() != output.data_ptr():
+                output[:n].view(result.shape).copy_(result)
+            raw = get_prefill_raw_num_tokens()
+            raw = attention_output_tokens(forward_batch, raw)
+            _zero_padded_tokens(output, raw)
+            if idx_output is not None:
+                _zero_padded_tokens(idx_output, raw)
+            if lse is not None and lse.shape[0] != rows:
+                padded = lse.new_zeros((rows, *lse.shape[1:]))
+                padded[:n].copy_(lse)
+                lse = padded
+        return lse

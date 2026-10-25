@@ -12,20 +12,21 @@
 # limitations under the License.
 # ==============================================================================
 """
-Dataclasses for embedding injection.
+Structs for embedding injection.
 
 These are placed in a separate module to avoid circular imports between
 io_struct.py and schedule_batch.py.
 """
 
-from dataclasses import dataclass
-from typing import List, Union
+from typing import List
 
+import msgspec
 import torch
 
+from sglang.srt.utils.cuda_ipc_transport_utils import CudaIpcTensorTransportProxy
 
-@dataclass
-class PositionalEmbeds:
+
+class PositionalEmbeds(msgspec.Struct, array_like=True):
     """Embeddings to place at specific token positions.
 
     Accepts either a list of [1, hidden_dim] tensors or a pre-stacked [N, hidden_dim] tensor.
@@ -37,7 +38,8 @@ class PositionalEmbeds:
         positions: List of positions where embeddings should be injected.
     """
 
-    embeds: Union[List[torch.Tensor], torch.Tensor]
+    # torch.Tensor or CudaIpcTensorTransportProxy; msgspec cannot type that union.
+    embeds: object
     positions: List[int]
 
     def __post_init__(self):
@@ -52,8 +54,15 @@ class PositionalEmbeds:
             else:
                 # [1, hidden_dim] (already has the leading dim) → plain concat.
                 self.embeds = torch.cat(self.embeds, dim=0)
-        if self.embeds.shape[0] != len(self.positions):
+        if isinstance(self.embeds, torch.Tensor) and self.embeds.shape[0] != len(
+            self.positions
+        ):
             raise ValueError(
                 f"embeds length ({self.embeds.shape[0]}) != "
                 f"positions length ({len(self.positions)})"
             )
+
+    def reconstruct(self, target_device: int) -> None:
+        """Copy embeds out of the CUDA IPC pool onto target_device and release the slot."""
+        if isinstance(self.embeds, CudaIpcTensorTransportProxy):
+            self.embeds = self.embeds.reconstruct_on_target_device(target_device)

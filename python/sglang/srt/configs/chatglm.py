@@ -43,7 +43,7 @@ class ChatGLMConfig(PretrainedConfig):
         quantization_bit=0,
         pre_seq_len=None,
         prefix_projection=False,
-        **kwargs
+        **kwargs,
     ):
         self.num_layers = num_layers
         self.vocab_size = padded_vocab_size

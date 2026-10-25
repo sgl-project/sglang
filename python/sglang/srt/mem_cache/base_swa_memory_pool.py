@@ -1,0 +1,44 @@
+from __future__ import annotations
+
+import abc
+from typing import TYPE_CHECKING, List, Optional, Tuple
+
+import torch
+
+from sglang.srt.mem_cache.memory_pool import KVCache
+
+if TYPE_CHECKING:
+    from sglang.srt.mem_cache.dsv41_request_window import RequestWindow
+
+
+class BaseSWAKVPool(KVCache):
+    """ABC for SWA-like KV pools.
+
+    Subclasses expose a `swa_kv_pool` sub-pool plus a full -> swa index
+    mapping. Used by `SWATokenToKVPoolAllocator` and the disagg paths to
+    handle SWA state separately from the full KV state.
+    """
+
+    swa_kv_pool: KVCache
+    # Set when SWA KV is a per-request ring of this many tokens (addressed by
+    # req_pool_idx) rather than a paged token pool; SWA is then not budgeted per token.
+    swa_req_ring_size: Optional[int] = None
+    # Set when the target keeps SWA KV in per-request window rows (DeepSeek-V4.1
+    # encoder replay) instead of a paged pool; there is no full -> swa mapping.
+    request_window: Optional[RequestWindow] = None
+    # Independent draft SWA buffers can consume full-token IDs directly instead
+    # of the target SWA allocator's physical IDs. HiCache must preserve that
+    # index ownership even though both buffers implement sliding attention.
+    swa_uses_full_indices: bool = False
+
+    @abc.abstractmethod
+    def register_mapping(self, full_to_swa_index_mapping: torch.Tensor) -> None:
+        raise NotImplementedError()
+
+    @abc.abstractmethod
+    def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError()
+
+    @abc.abstractmethod
+    def get_state_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
+        raise NotImplementedError()

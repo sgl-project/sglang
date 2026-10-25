@@ -1,5 +1,6 @@
 import itertools
 import math
+from array import array
 from collections.abc import Iterable
 from typing import Any
 
@@ -18,7 +19,7 @@ import sglang.srt.model_loader.weight_utils as weight_utils
 import sglang.srt.utils as utils
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.managers.mm_utils import MultiModalityDataPaddingPatternMultimodalTokens
+from sglang.srt.managers.mm_utils import pad_mm_tokens
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
@@ -195,11 +196,9 @@ class NVILAForConditionalGeneration(nn.Module):
             for x, block_size in zip(vision_features_list, block_sizes)
         ]
 
-        vision_features = torch.stack(
+        vision_features = torch.cat(
             [einops.rearrange(x, "1 c h w -> (h w) c") for x in vision_features_list]
         )
-
-        vision_features = einops.rearrange(vision_features, "n p d -> (n p) d")
 
         return vision_features
 
@@ -210,17 +209,18 @@ class NVILAForConditionalGeneration(nn.Module):
             if name.startswith("llm."):
                 self.llm.load_weights([(name[len("llm.") :], loaded_weight)])
             else:
+                if name not in params_dict and name.startswith(
+                    "vision_tower.vision_model."
+                ):
+                    name = "vision_tower." + name[len("vision_tower.vision_model.") :]
                 param = params_dict[name]
                 weight_loader = getattr(
                     param, "weight_loader", weight_utils.default_weight_loader
                 )
                 weight_loader(param, loaded_weight)
 
-    def pad_input_ids(
-        self, input_ids: list[int], mm_inputs: MultimodalInputs
-    ) -> list[int]:
-        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
-        return pattern.pad_input_tokens(input_ids, mm_inputs)
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
+        return pad_mm_tokens(input_ids, mm_inputs)
 
 
 def merge_chessboard(x, num_split_h, num_split_w):
@@ -325,9 +325,9 @@ def merge_features_for_dynamic_s2(
                     )
                 )
 
-    assert block_cnt == len(
-        image_features
-    ), f"The number of blocks ({block_cnt}) does not match length of image_features ({len(image_features)})!"
+    assert block_cnt == len(image_features), (
+        f"The number of blocks ({block_cnt}) does not match length of image_features ({len(image_features)})!"
+    )
 
     return image_features_each_image, new_block_sizes
 

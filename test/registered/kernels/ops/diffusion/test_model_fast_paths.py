@@ -1,0 +1,2409 @@
+"""Per-model fast paths: each model wrapper must reproduce its own reference.
+
+A diffusion kernel is only as good as the wrapper that decides when to use it,
+and that decision is model-specific: FLUX.1 and GLM-Image feed different adaLN
+layouts to the same LayerNorm+modulate kernel, Sana only engages on non-default
+streams, ERNIE runs a bit-exact chain unconditionally.  Kernel-level numerics
+live in ``test_norm.py`` / ``test_modulate.py`` / ``test_rope.py``; this file
+covers the wiring: right kernel, right reference, gate ends in the right state.
+
+Two assertion styles appear, and the difference is the point:
+
+- ``torch.equal`` for the bit-exact default-on paths.  These self-verify at
+  runtime, so a tolerance here would let a real regression through -- the gate
+  would silently fall back to eager and the fusion would simply stop running.
+- a tolerance for the quality-gated paths, which are *documented* as differing
+  from eager at half-precision rounding-order level.
+
+Each section also asserts the gate ended up ``verified`` / not ``disabled``:
+without it a test still passes when the fast path never engaged at all.
+"""
+
+import sys
+import unittest
+from copy import deepcopy
+from unittest.mock import patch
+
+import pytest
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from diffusers.models.upsampling import Upsample2D
+
+import sglang.kernels.ops.diffusion.sites.hunyuan_qknorm_site as hunyuan_qknorm
+import sglang.multimodal_gen.runtime.models.dits.ernie_image as ernie_image
+import sglang.multimodal_gen.runtime.models.dits.flux as flux
+import sglang.multimodal_gen.runtime.models.dits.flux_2 as flux2
+import sglang.multimodal_gen.runtime.models.dits.glm_image as glm_image
+import sglang.multimodal_gen.runtime.models.dits.longcat_image as longcat_image
+import sglang.multimodal_gen.runtime.models.dits.ltx_2 as ltx2_module
+import sglang.multimodal_gen.runtime.models.dits.qwen_image as qwen_image
+import sglang.multimodal_gen.runtime.models.dits.qwen_image21 as qwen_image21
+import sglang.multimodal_gen.runtime.models.dits.sana as sana
+from sglang.kernels.ops.diffusion import (
+    FUSED_LN_MODULATE,
+    HUNYUAN_QKNORM,
+    LTX2_QKNORM_SPLIT_ROPE,
+    LTX2_RMS_NORM_MODULATE,
+    QWEN_IMAGE_ADDED_QKV,
+    BitExactFusionGate,
+    can_use_wan_rmsnorm_silu,
+    fused_ltx2_rms_norm_modulate,
+    hunyuan_qkv_rope_pack,
+    try_flux2_token_cat_nvfp4,
+    wan_rmsnorm_silu,
+)
+from sglang.kernels.ops.diffusion.common.platform import is_cuda
+from sglang.kernels.ops.diffusion.sites.bitexact_gate import BitExactFusionGate
+from sglang.multimodal_gen.configs.models.vaes.qwenimage21 import (
+    QwenImage21VAEArchConfig,
+    QwenImage21VAEConfig,
+)
+from sglang.multimodal_gen.configs.models.vaes.stablediffusion3 import (
+    StableDiffusion3VAEConfig,
+)
+from sglang.multimodal_gen.runtime.layers.attention.backends import sdpa as sdpa_backend
+from sglang.multimodal_gen.runtime.layers.layernorm import (
+    RMSNorm,
+    RMSNormNoWeight,
+    apply_qk_norm,
+)
+from sglang.multimodal_gen.runtime.layers.linear import MergedColumnParallelLinear
+from sglang.multimodal_gen.runtime.layers.rotary_embedding.utils import (
+    _apply_rotary_emb,
+)
+from sglang.multimodal_gen.runtime.models.dits.ernie_image import (
+    _ernie_gated_norm_scale_shift,
+    _ernie_norm_scale_shift,
+    _ernie_qknorm_rope,
+    _ernie_qknorm_rope_reference,
+)
+from sglang.multimodal_gen.runtime.models.dits.flux import (
+    _flux_fused_ln_modulate,
+    _flux_norm_modulate,
+)
+from sglang.multimodal_gen.runtime.models.dits.flux_2 import (
+    _can_use_nvfp4_swiglu_quant_fusion,
+    _flux2_norm_modulate,
+    _flux2_swiglu,
+)
+from sglang.multimodal_gen.runtime.models.dits.glm_image import (
+    _eager_ln_modulate as _glm_eager_ln_modulate,
+)
+from sglang.multimodal_gen.runtime.models.dits.glm_image import (
+    _glm_ln_modulate,
+    _glm_qk_layernorm,
+)
+from sglang.multimodal_gen.runtime.models.dits.hunyuanvideo import (
+    _hunyuan_pack_qkv,
+    _hunyuan_qknorm,
+)
+from sglang.multimodal_gen.runtime.models.dits.longcat_image import (
+    _apply_longcat_qknorm_rope,
+)
+from sglang.multimodal_gen.runtime.models.dits.ltx_2 import _ltx2_rms_norm_modulate
+from sglang.multimodal_gen.runtime.models.dits.qwen_image import (
+    QwenImageCrossAttention,
+    QwenImageTransformerBlock,
+    _qwen_modulation_cache_key,
+    _qwen_norm_out,
+    _split_unquantized_merged_linear,
+)
+from sglang.multimodal_gen.runtime.models.dits.sana import (
+    _eager_ln_modulate as _sana_eager_ln_modulate,
+)
+from sglang.multimodal_gen.runtime.models.dits.sana import (
+    sana_ln_modulate,
+)
+from sglang.multimodal_gen.runtime.models.vaes import (
+    autoencoder_kl_qwenimage as qwen_vae,
+)
+from sglang.multimodal_gen.runtime.models.vaes import flux2_vae_cuda_opt as vae_opt
+from sglang.multimodal_gen.runtime.models.vaes import (
+    qwen_image21_vae_cuda_opt as qwen21_vae_opt,
+)
+from sglang.multimodal_gen.runtime.models.vaes import (
+    wan_vae_cuda_opt,
+    wanvae,
+)
+from sglang.multimodal_gen.runtime.models.vaes.autoencoder import AutoencoderKL
+from sglang.multimodal_gen.runtime.models.vaes.autoencoder_kl_qwenimage21 import (
+    AutoencoderKLQwenImage21,
+    QwenImage21Resample,
+)
+from sglang.multimodal_gen.runtime.models.vaes.conv_fold import (
+    fold_upsample2x_conv2d_weight,
+)
+from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import use_vae_fast_path
+from sglang.multimodal_gen.runtime.models.vaes.wan_vae_cuda_opt import (
+    FusedWanRMSNormSiLU,
+    GatedChannelsLastUpsample,
+    VaeFastPathGate,
+)
+from sglang.multimodal_gen.runtime.models.vaes.wanvae import WanRMS_norm
+from sglang.multimodal_gen.runtime.platforms.interface import DeviceCapability
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
+
+register_cuda_ci(est_time=100, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+# backend-specific: preserve ROCm eager fallback coverage for CUDA-only fusions.
+register_amd_ci(est_time=6, suite="nightly-amd-kernel-1-gpu", nightly=True)
+
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+
+# The bit-exact LayerNorm/RMSNorm fusions are NVIDIA inline PTX, so their
+# guards reject on ROCm and these sites serve eager there; only the subtests
+# asserting a fused outcome are CUDA-only.
+requires_inline_ptx = pytest.mark.skipif(
+    not is_cuda(), reason="bit-exact norm fusions are NVIDIA PTX"
+)
+
+
+@pytest.fixture(autouse=True)
+def _seed_cuda():
+    """Every wrapper below asserts against a reference computed from the same
+    random draw, so the seed must be fixed per test, not per module."""
+    torch.cuda.manual_seed(0)
+
+
+@pytest.mark.skipif(
+    not is_cuda()
+    or torch.cuda.get_device_capability()[0] != 9
+    or sdpa_backend.torch_varlen_attn is None,
+    reason="packed Flash SDPA requires Hopper and PyTorch varlen attention",
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize(
+    "lengths,head_dim",
+    [
+        (([64] * 7 + [32]) * 11 + [16] * 7 + [8], 80),
+        ([0, 64, 64, 0, 32, 0], 80),
+        ([32] * 8, 64),
+        ([128, 64, 128], 128),
+        ([2048], 80),
+    ],
+)
+def test_packed_sdpa_uses_native_varlen_without_changing_values(
+    dtype, causal, lengths, head_dim
+):
+    bounds = [0]
+    for length in lengths:
+        bounds.append(bounds[-1] + length)
+    packed = torch.randn(bounds[-1], 3, 16, head_dim, device="cuda", dtype=dtype)
+    q, k, v = packed.unbind(1)
+    q, k = q.contiguous(), k.contiguous()
+    attention = sdpa_backend.SDPAImpl(
+        16, head_dim, causal=causal, softmax_scale=head_dim**-0.5
+    )
+    cu = torch.tensor(bounds, device="cuda", dtype=torch.int32)
+    with (
+        torch.no_grad(),
+        torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.FLASH_ATTENTION),
+    ):
+        expected = torch.cat(
+            [
+                attention.forward(q[a:b][None], k[a:b][None], v[a:b][None], None)[0]
+                for a, b in zip(bounds[:-1], bounds[1:])
+                if a != b
+            ]
+        )
+        with patch.object(attention, "forward", wraps=attention.forward) as forward:
+            actual = attention.forward_varlen(
+                q,
+                k,
+                v,
+                cu_seqlens=cu,
+                max_seqlen=max(lengths),
+                cu_seqlens_host=tuple(bounds),
+            )
+        assert forward.call_count == (1 if len(lengths) == 1 else 0)
+        assert torch.equal(actual, expected)
+
+
+@pytest.mark.skipif(not is_cuda(), reason="CUDA packed SDPA fallback test")
+def test_packed_sdpa_preserves_training_dropout_and_missing_api_fallbacks():
+    attention = sdpa_backend.SDPAImpl(4, 64, causal=True, softmax_scale=64**-0.5)
+    qkv = torch.randn(
+        64, 3, 4, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True
+    )
+    q, k, v = qkv.unbind(1)
+    cu = torch.tensor([0, 32, 64], device="cuda", dtype=torch.int32)
+    kwargs = dict(cu_seqlens=cu, max_seqlen=32, cu_seqlens_host=(0, 32, 64))
+    with patch.object(attention, "forward", wraps=attention.forward) as forward:
+        result = attention.forward_varlen(q, k, v, **kwargs)
+    assert forward.call_count == 2
+    result.float().square().mean().backward()
+    assert qkv.grad is not None and torch.isfinite(qkv.grad).all()
+    attention.dropout = 0.1
+    with (
+        torch.no_grad(),
+        patch.object(attention, "forward", wraps=attention.forward) as forward,
+    ):
+        attention.forward_varlen(q, k, v, **kwargs)
+    assert forward.call_count == 2
+    attention.dropout = 0.0
+    with (
+        torch.no_grad(),
+        patch.object(sdpa_backend, "torch_varlen_attn", None),
+        patch.object(attention, "forward", wraps=attention.forward) as forward,
+    ):
+        attention.forward_varlen(q, k, v, **kwargs)
+    assert forward.call_count == 2
+
+
+# -------------------------------------------------------------------------
+# Qwen-Image -- final LayerNorm + adaLN scale/shift
+# -------------------------------------------------------------------------
+
+
+@requires_inline_ptx
+def test_qwen_norm_out_matches_adaln_reference():
+    qwen_image._QWEN_NORM_OUT.disabled = False
+    qwen_image._QWEN_NORM_OUT.verified = False
+    qwen_image._QWEN_NORM_OUT_SIGS.clear()
+    torch.manual_seed(0)
+    norm_out = (
+        qwen_image.AdaLayerNormContinuous(
+            3072, 3072, elementwise_affine=False, eps=1e-6
+        )
+        .cuda()
+        .bfloat16()
+    )
+    hidden_states = torch.randn(1, 257, 3072, device="cuda", dtype=torch.bfloat16)
+    conditioning = torch.randn(1, 3072, device="cuda", dtype=torch.bfloat16)
+
+    expected = norm_out(hidden_states, conditioning)
+    actual = _qwen_norm_out(norm_out, hidden_states, conditioning)
+
+    assert torch.equal(actual, expected)
+    assert qwen_image._QWEN_NORM_OUT.verified
+    assert not qwen_image._QWEN_NORM_OUT.disabled
+
+
+def test_qwen_norm_out_preserves_compile_path(monkeypatch):
+    norm_out = (
+        qwen_image.AdaLayerNormContinuous(16, 16, elementwise_affine=False, eps=1e-6)
+        .cuda()
+        .bfloat16()
+    )
+    hidden_states = torch.randn(1, 3, 16, device="cuda", dtype=torch.bfloat16)
+    conditioning = torch.randn(1, 16, device="cuda", dtype=torch.bfloat16)
+    expected = norm_out(hidden_states, conditioning)
+
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    monkeypatch.setattr(
+        qwen_image,
+        "fused_layernorm_modulate_raw",
+        lambda *args, **kwargs: pytest.fail("compile path must not dispatch kernel"),
+    )
+
+    assert torch.equal(_qwen_norm_out(norm_out, hidden_states, conditioning), expected)
+
+
+def test_qwen_norm_out_does_not_verify_during_graph_capture(monkeypatch):
+    qwen_image._QWEN_NORM_OUT.disabled = False
+    qwen_image._QWEN_NORM_OUT.verified = False
+    qwen_image._QWEN_NORM_OUT_SIGS.clear()
+    norm_out = (
+        qwen_image.AdaLayerNormContinuous(
+            3072, 3072, elementwise_affine=False, eps=1e-6
+        )
+        .cuda()
+        .bfloat16()
+    )
+    hidden_states = torch.randn(1, 17, 3072, device="cuda", dtype=torch.bfloat16)
+    conditioning = torch.randn(1, 3072, device="cuda", dtype=torch.bfloat16)
+    expected = norm_out(hidden_states, conditioning)
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    monkeypatch.setattr(
+        qwen_image,
+        "fused_layernorm_modulate_raw",
+        lambda *args, **kwargs: pytest.fail("capture must not verify a new layout"),
+    )
+
+    assert torch.equal(_qwen_norm_out(norm_out, hidden_states, conditioning), expected)
+    assert not qwen_image._QWEN_NORM_OUT_SIGS
+
+
+# -------------------------------------------------------------------------
+# FLUX.1 -- LayerNorm + adaLN modulate, and the shared-FF GELU site
+# -------------------------------------------------------------------------
+
+
+def _flux_eager(norm, x, scale, shift):
+    return norm(x) * (1 + scale[:, None]) + shift[:, None]
+
+
+def _flux_site_inputs(shape, chunks, seed):
+    torch.manual_seed(seed)
+    batch, seq, hidden = shape
+    norm = torch.nn.LayerNorm(hidden, eps=1e-6, elementwise_affine=False).cuda()
+    x = (torch.randn(batch, seq, hidden, device="cuda") * 8).bfloat16()
+    emb = torch.randn(batch, chunks * hidden, device="cuda").bfloat16()
+    parts = emb.chunk(chunks, dim=1)  # strided adaLN projection views
+    return norm, x, parts[0], parts[1]
+
+
+@requires_inline_ptx
+@pytest.mark.parametrize(
+    "shape,chunks",
+    [
+        ((1, 4096, 3072), 6),  # dual-stream image tokens (1024^2), chunk(6)
+        ((1, 512, 3072), 6),  # dual-stream text tokens
+        ((1, 4608, 3072), 3),  # single-stream concat, chunk(3)
+        ((2, 300, 3072), 6),  # CFG batch, odd seq
+    ],
+)
+def test_flux_fused_ln_modulate_is_bit_exact(shape, chunks):
+    # Every distinct (shape, stride, eps) signature the FLUX.1 sites emit
+    # must verify torch.equal on first sight and stay enabled.
+    norm, x, shift, scale = _flux_site_inputs(shape, chunks, seed=0)
+    out = _flux_fused_ln_modulate(norm, x, scale, shift)
+    assert out is not None
+    assert torch.equal(out, _flux_eager(norm, x, scale, shift))
+    assert not flux._FLUX_LN_MOD.disabled
+    assert flux._FLUX_LN_MOD.verified
+
+
+@requires_inline_ptx
+def test_flux_norm_modulate_bitexact_supersedes_high_fold():
+    # With the quality="high" affine fold mounted, the bit-exact kernel
+    # still takes priority, so the site output stays lossless.
+    site = torch.nn.Module()
+    FUSED_LN_MODULATE.mark(site)
+    assert FUSED_LN_MODULATE.mount(site)
+    norm, x, shift, scale = _flux_site_inputs((1, 128, 3072), 6, seed=1)
+    out = _flux_norm_modulate(site, norm, x, scale, shift)
+    assert torch.equal(out, _flux_eager(norm, x, scale, shift))
+
+
+def test_flux_fused_ln_modulate_rejects_unsupported_hidden():
+    # hidden % 4 != 0 is outside the kernel contract and must bail out.
+    norm, x, shift, scale = _flux_site_inputs((1, 64, 3070), 6, seed=2)
+    assert _flux_fused_ln_modulate(norm, x, scale, shift) is None
+
+
+# -------------------------------------------------------------------------
+# FLUX.2 -- packed norm+modulate and packed SwiGLU views
+# -------------------------------------------------------------------------
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+class TestFlux2EagerFusions(CustomTestCase):
+    def setUp(self):
+        flux2._FLUX2_LN_MOD.disabled = False
+        flux2._FLUX2_LN_MOD.verified = False
+        flux2._FLUX2_LN_MOD_SIGS.clear()
+        flux2._FLUX2_SWIGLU.disabled = False
+        flux2._FLUX2_SWIGLU.verified = False
+        flux2._FLUX2_SWIGLU_SIGS.clear()
+
+    @requires_inline_ptx
+    def test_norm_modulate_is_bit_exact_across_sequence_lengths(self):
+        torch.manual_seed(0)
+        hidden = 256
+        norm = torch.nn.LayerNorm(
+            hidden, eps=1e-6, elementwise_affine=False, device="cuda"
+        )
+        # FLUX.2 modulation values are views of one packed projection.
+        params = torch.randn(1, 1, 6 * hidden, device="cuda").bfloat16()
+        shift, scale = params.chunk(6, dim=-1)[:2]
+
+        for seq in (17, 65):
+            x = torch.randn(1, seq, hidden, device="cuda").bfloat16()
+            expected = norm(x) * (1 + scale) + shift
+            actual = _flux2_norm_modulate(norm, x, scale, shift)
+            self.assertTrue(torch.equal(actual, expected))
+
+        self.assertFalse(flux2._FLUX2_LN_MOD.disabled)
+        self.assertEqual(len(flux2._FLUX2_LN_MOD_SIGS), 1)
+
+    def test_packed_swiglu_is_bit_exact_for_contiguous_and_strided_views(self):
+        torch.manual_seed(1)
+        hidden = 384
+        inputs = [
+            torch.randn(1, 19, 2 * hidden, device="cuda").bfloat16(),
+            torch.randn(1, 19, 3 * hidden, device="cuda").bfloat16()[..., : 2 * hidden],
+        ]
+        for x in inputs:
+            expected = F.silu(x[..., :hidden]) * x[..., hidden:]
+            actual = _flux2_swiglu(x)
+            self.assertTrue(torch.equal(actual, expected))
+
+        self.assertFalse(flux2._FLUX2_SWIGLU.disabled)
+        self.assertEqual(len(flux2._FLUX2_SWIGLU_SIGS), 2)
+
+    def test_nvfp4_swiglu_quant_fusion_is_sm103_only(self):
+        self.assertFalse(_can_use_nvfp4_swiglu_quant_fusion(DeviceCapability(10, 0)))
+        self.assertTrue(_can_use_nvfp4_swiglu_quant_fusion(DeviceCapability(10, 3)))
+        self.assertFalse(_can_use_nvfp4_swiglu_quant_fusion(DeviceCapability(12, 0)))
+
+    def test_fp16_preserves_reference_path(self):
+        x = torch.randn(1, 17, 512, device="cuda", dtype=torch.float16)
+        expected = F.silu(x[..., :256]) * x[..., 256:]
+        actual = _flux2_swiglu(x)
+        self.assertTrue(torch.equal(actual, expected))
+        self.assertFalse(flux2._FLUX2_SWIGLU.disabled)
+
+    def test_packed_swiglu_rejects_non_dense_outer_stride(self):
+        base = torch.randn(2, 23, 512, device="cuda", dtype=torch.bfloat16)
+        x = base[:, :19]
+        self.assertNotEqual(x.stride(0), x.shape[1] * x.stride(1))
+
+        expected = F.silu(x[..., :256]) * x[..., 256:]
+        actual = _flux2_swiglu(x)
+        self.assertTrue(torch.equal(actual, expected))
+        self.assertEqual(len(flux2._FLUX2_SWIGLU_SIGS), 0)
+
+    def test_new_swiglu_signature_is_not_verified_during_graph_capture(self):
+        first = torch.randn(1, 17, 512, device="cuda", dtype=torch.bfloat16)
+        self.assertTrue(
+            torch.equal(
+                _flux2_swiglu(first),
+                F.silu(first[..., :256]) * first[..., 256:],
+            )
+        )
+        self.assertEqual(len(flux2._FLUX2_SWIGLU_SIGS), 1)
+
+        second = torch.randn(1, 19, 768, device="cuda", dtype=torch.bfloat16)
+        with patch("torch.cuda.is_current_stream_capturing", return_value=True):
+            actual = _flux2_swiglu(second)
+
+        expected = F.silu(second[..., :384]) * second[..., 384:]
+        self.assertTrue(torch.equal(actual, expected))
+        self.assertEqual(len(flux2._FLUX2_SWIGLU_SIGS), 1)
+
+    @pytest.mark.skipif(
+        not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3),
+        reason="FLUX.2 token-cat NVFP4 requires Blackwell SM103",
+    )
+    def test_token_cat_nvfp4_matches_flashinfer(self):
+        import flashinfer
+
+        torch.manual_seed(20260830)
+        attention = torch.randn(1, 17, 6144, device="cuda", dtype=torch.bfloat16)
+        mlp = torch.randn(1, 17, 18432, device="cuda", dtype=torch.bfloat16)
+        global_scale = torch.tensor(0.625, device="cuda", dtype=torch.float32)
+
+        expected_fp4, expected_scales = flashinfer.fp4_quantize(
+            torch.cat([attention, mlp], dim=-1).view(-1, 24576), global_scale
+        )
+        actual = try_flux2_token_cat_nvfp4(attention, mlp, global_scale)
+
+        self.assertIsNotNone(actual)
+        actual_fp4, actual_scales = actual
+        self.assertTrue(torch.equal(actual_fp4, expected_fp4))
+        self.assertTrue(
+            torch.equal(
+                actual_scales.view(torch.uint8), expected_scales.view(torch.uint8)
+            )
+        )
+
+    def test_token_cat_nvfp4_falls_back_while_compiling(self):
+        attention = torch.empty(1, 1, 6144, device="cuda", dtype=torch.bfloat16)
+        mlp = torch.empty(1, 1, 18432, device="cuda", dtype=torch.bfloat16)
+        global_scale = torch.ones(1, device="cuda", dtype=torch.float32)
+
+        with patch("torch.compiler.is_compiling", return_value=True):
+            self.assertIsNone(try_flux2_token_cat_nvfp4(attention, mlp, global_scale))
+
+
+# -------------------------------------------------------------------------
+# Qwen-Image -- reuse timestep-only modulation across serial CFG branches
+# -------------------------------------------------------------------------
+
+
+class _PackedAddedQKV(MergedColumnParallelLinear):
+    # The lossless split only applies to a MergedColumnParallelLinear (LoRA
+    # wrappers are called as they are), so the fake must be one; its __init__
+    # is skipped because it needs no parallel state.
+    def __init__(self, dim: int):
+        nn.Module.__init__(self)
+        self.output_partition_sizes = [dim, dim, dim]
+        self.quant_config = None
+        self.weight = nn.Parameter(
+            torch.randn(3 * dim, dim, device="cuda", dtype=torch.bfloat16),
+            requires_grad=False,
+        )
+        self.bias = nn.Parameter(
+            torch.randn(3 * dim, device="cuda", dtype=torch.bfloat16),
+            requires_grad=False,
+        )
+        self.calls = 0
+
+    def forward(self, x):
+        self.calls += 1
+        return F.linear(x, self.weight, self.bias), None
+
+
+class _WrappedAddedQKV(nn.Module):
+    # Stands for a LoRA-wrapped projection: not a MergedColumnParallelLinear,
+    # so the lossless path must call it instead of slicing its weight.
+    def __init__(self, dim: int):
+        super().__init__()
+        self.weight = nn.Parameter(
+            torch.randn(3 * dim, dim, device="cuda", dtype=torch.bfloat16),
+            requires_grad=False,
+        )
+        self.bias = nn.Parameter(
+            torch.randn(3 * dim, device="cuda", dtype=torch.bfloat16),
+            requires_grad=False,
+        )
+        self.calls = 0
+
+    def forward(self, x):
+        self.calls += 1
+        return F.linear(x, self.weight, self.bias), None
+
+
+def _added_qkv_attention(packed):
+    attention = QwenImageCrossAttention.__new__(QwenImageCrossAttention)
+    nn.Module.__init__(attention)
+    attention.use_fused_added_qkv = True
+    attention._unquantized_added_qkv_is_packed = True
+    attention.to_added_qkv = packed
+    QWEN_IMAGE_ADDED_QKV.mark(attention)
+    return attention
+
+
+def test_qwen_added_qkv_lossless_calls_a_wrapped_linear_as_is():
+    torch.manual_seed(20260831)
+    dim = 64
+    x = torch.randn(1, 17, dim, device="cuda", dtype=torch.bfloat16)
+    wrapped = _WrappedAddedQKV(dim)
+    attention = _added_qkv_attention(wrapped)
+
+    actual = attention._get_added_qkv_projections(x)
+    expected = tuple(
+        tensor.contiguous()
+        for tensor in F.linear(x, wrapped.weight, wrapped.bias).chunk(3, dim=-1)
+    )
+    assert wrapped.calls == 1
+    assert all(torch.equal(a, e) for a, e in zip(actual, expected))
+
+
+def test_qwen_added_qkv_lossless_uses_three_reference_gemms():
+    torch.manual_seed(20260831)
+    dim = 64
+    x = torch.randn(1, 17, dim, device="cuda", dtype=torch.bfloat16)
+    packed = _PackedAddedQKV(dim)
+    attention = _added_qkv_attention(packed)
+
+    expected_lossless = _split_unquantized_merged_linear(packed, x)
+    actual_lossless = attention._get_added_qkv_projections(x)
+    assert packed.calls == 0
+    assert all(
+        torch.equal(actual, expected)
+        for actual, expected in zip(actual_lossless, expected_lossless)
+    )
+
+    assert QWEN_IMAGE_ADDED_QKV.mount(attention)
+    actual_high = attention._get_added_qkv_projections(x)
+    expected_high = tuple(
+        tensor.contiguous()
+        for tensor in F.linear(x, packed.weight, packed.bias).chunk(3, dim=-1)
+    )
+    assert packed.calls == 1
+    assert all(
+        torch.equal(actual, expected)
+        for actual, expected in zip(actual_high, expected_high)
+    )
+
+    QWEN_IMAGE_ADDED_QKV.unmount(attention)
+    attention._get_added_qkv_projections(x)
+    assert packed.calls == 1
+
+
+class _CountingProjection(nn.Module):
+    def __init__(self, offset: float):
+        super().__init__()
+        self.offset = offset
+        self.calls = 0
+
+    def forward(self, x):
+        self.calls += 1
+        return x + self.offset, None
+
+
+class TestQwenImageModulationCache(CustomTestCase):
+    def _block(self):
+        block = QwenImageTransformerBlock.__new__(QwenImageTransformerBlock)
+        nn.Module.__init__(block)
+        block.img_mod = nn.ModuleList([nn.Identity(), _CountingProjection(1.0)])
+        block.txt_mod = nn.ModuleList([nn.Identity(), _CountingProjection(2.0)])
+        block._modulation_cache = None
+        block._shard_modulation = False
+        return block
+
+    def _key(self, timestep, hidden, additional_t_cond=None):
+        with torch.no_grad():
+            return _qwen_modulation_cache_key(
+                timestep,
+                additional_t_cond,
+                hidden,
+            )
+
+    def test_matching_cfg_key_reuses_both_modulation_projections(self):
+        block = self._block()
+        timestep = torch.tensor([500.0], device="cuda")
+        hidden = torch.empty(1, 17, 32, device="cuda", dtype=torch.bfloat16)
+        img_temb = torch.randn(1, 32, device="cuda", dtype=torch.bfloat16)
+        txt_temb = torch.randn_like(img_temb)
+        key = self._key(timestep, hidden)
+
+        first = block._get_modulation_params(img_temb, txt_temb, key)
+        second = block._get_modulation_params(img_temb, txt_temb, key)
+
+        self.assertIs(first[0], second[0])
+        self.assertIs(first[1], second[1])
+        self.assertIsNone(block._modulation_cache)
+        self.assertEqual(block.img_mod[1].calls, 1)
+        self.assertEqual(block.txt_mod[1].calls, 1)
+
+    def test_tensor_identity_version_and_condition_invalidate_cache(self):
+        block = self._block()
+        timestep = torch.tensor([500.0], device="cuda")
+        hidden = torch.empty(1, 17, 32, device="cuda", dtype=torch.bfloat16)
+        temb = torch.randn(1, 32, device="cuda", dtype=torch.bfloat16)
+        key = self._key(timestep, hidden)
+        block._get_modulation_params(temb, temb, key)
+
+        with torch.no_grad():
+            timestep.add_(1)
+        mutated = self._key(timestep, hidden)
+        block._get_modulation_params(temb, temb, mutated)
+        self.assertEqual(block.img_mod[1].calls, 2)
+
+        same_value_new_tensor = self._key(timestep.clone(), hidden)
+        block._get_modulation_params(temb, temb, same_value_new_tensor)
+        self.assertEqual(block.img_mod[1].calls, 3)
+
+        condition = torch.tensor([1], device="cuda")
+        conditioned = self._key(timestep, hidden, condition)
+        block._get_modulation_params(temb, temb, conditioned)
+        self.assertEqual(block.img_mod[1].calls, 4)
+
+    def test_grad_enabled_path_disables_and_clears_cache(self):
+        block = self._block()
+        timestep = torch.tensor([500.0], device="cuda")
+        hidden = torch.empty(1, 17, 32, device="cuda", dtype=torch.bfloat16)
+        temb = torch.randn(1, 32, device="cuda", dtype=torch.bfloat16)
+        key = self._key(timestep, hidden)
+        block._get_modulation_params(temb, temb, key)
+
+        self.assertIsNone(_qwen_modulation_cache_key(timestep, None, hidden))
+        block._get_modulation_params(temb, temb, None)
+
+        self.assertIsNone(block._modulation_cache)
+        self.assertEqual(block.img_mod[1].calls, 2)
+
+    def test_inference_tensors_cache_and_graph_path_falls_back(self):
+        block = self._block()
+        with torch.inference_mode():
+            timestep = torch.tensor([500.0], device="cuda")
+            hidden = torch.empty(1, 17, 32, device="cuda", dtype=torch.bfloat16)
+            temb = torch.randn(1, 32, device="cuda", dtype=torch.bfloat16)
+            key = _qwen_modulation_cache_key(timestep, None, hidden)
+
+            first = block._get_modulation_params(temb, temb, key)
+            second = block._get_modulation_params(temb, temb, key)
+
+        self.assertIs(first[0], second[0])
+        self.assertEqual(block.img_mod[1].calls, 1)
+
+        with (
+            patch(
+                "sglang.multimodal_gen.runtime.models.dits.qwen_image.is_in_breakable_cuda_graph",
+                return_value=True,
+            ),
+            torch.no_grad(),
+        ):
+            self.assertIsNone(_qwen_modulation_cache_key(timestep, None, hidden))
+
+
+# -------------------------------------------------------------------------
+# GLM-Image -- LayerNorm + modulate and per-head qk LayerNorm
+# -------------------------------------------------------------------------
+
+
+@requires_inline_ptx
+@pytest.mark.parametrize("shape", [(1, 4096, 4096), (2, 301, 4096), (1, 1, 2560)])
+def test_glm_ln_modulate_is_bit_exact(shape):
+    # (1, 4096, 4096) is the real GLM-Image image-stream shape (1024^2,
+    # hidden 4096); the others cover the text stream and another hidden.
+    torch.manual_seed(0)
+    batch, seq, hidden = shape
+    norm = torch.nn.LayerNorm(hidden, eps=1e-5, elementwise_affine=False).cuda()
+    x = (torch.randn(batch, seq, hidden, device="cuda") * 8).bfloat16()
+    emb = torch.randn(batch, 12 * hidden, device="cuda").bfloat16()
+    chunks = emb.chunk(12, dim=1)  # strided adaLN projection views
+    shift, scale = chunks[0], chunks[2]
+    out = _glm_ln_modulate(norm, x, scale, shift, x.dtype)
+    assert torch.equal(out, _glm_eager_ln_modulate(norm, x, scale, shift, x.dtype))
+    assert glm_image._GLM_LN_MOD.verified
+    assert not glm_image._GLM_LN_MOD.disabled
+
+
+@requires_inline_ptx
+@pytest.mark.parametrize("shape", [(1, 4360, 32, 128), (2, 37, 3, 40), (1, 129, 5, 64)])
+def test_glm_qk_head_layernorm_is_bit_exact(shape):
+    # (1, 4360, 32, 128) is the real GLM-Image q/k shape (text + image
+    # tokens, 32 heads of dim 128); the others cover partially-filled warps.
+    torch.manual_seed(1)
+    batch, seq, heads, head_dim = shape
+    norm_q = torch.nn.LayerNorm(head_dim, eps=1e-5, elementwise_affine=False).cuda()
+    norm_k = torch.nn.LayerNorm(head_dim, eps=1e-5, elementwise_affine=False).cuda()
+    q = (torch.randn(batch, seq, heads, head_dim, device="cuda") * 5).bfloat16()
+    k = (torch.randn(batch, seq, heads, head_dim, device="cuda") * 5).bfloat16()
+    q_out, k_out = _glm_qk_layernorm(norm_q, norm_k, q, k, q.dtype)
+    assert torch.equal(q_out, norm_q(q).to(q.dtype))
+    assert torch.equal(k_out, norm_k(k).to(k.dtype))
+    assert glm_image._GLM_QK_LN.verified
+    assert not glm_image._GLM_QK_LN.disabled
+
+
+# -------------------------------------------------------------------------
+# Sana -- stream-conditional LayerNorm + modulate
+# -------------------------------------------------------------------------
+
+
+@requires_inline_ptx
+@pytest.mark.parametrize(
+    "shape,nmod,transposed",
+    [
+        ((2, 1024, 2240), 6, False),
+        ((2, 1024, 2240), 2, False),
+        ((1, 1024, 2240), 6, True),
+        ((1, 37, 2240), 6, False),
+    ],
+)
+def test_sana_fused_ln_modulate_is_bit_exact(shape, nmod, transposed):
+    # (., 1024, 2240) is the real Sana 1024px shape; hidden 2240 % 512 != 0
+    # exercises the kernel's partial tail chunk.  nmod mirrors the two adaLN
+    # chunk layouts, transposed the permuted layout the Sana DiT serves.
+    torch.manual_seed(0)
+    batch, seq, hidden = shape
+    norm = torch.nn.LayerNorm(hidden, eps=1e-6, elementwise_affine=False).cuda()
+    x = (torch.randn(batch, seq, hidden, device="cuda") * 4).bfloat16()
+    if transposed:
+        x = x.permute(0, 2, 1).contiguous().permute(0, 2, 1)
+    emb = torch.randn(batch, nmod, hidden, device="cuda").bfloat16()
+    shift, scale = emb.chunk(nmod, dim=1)[0], emb.chunk(nmod, dim=1)[-1]
+    # default-stream eager serving must stay on the untouched eager chain
+    n_sigs = len(sana._SANA_LN_MOD.verified_sigs)
+    sana_ln_modulate(norm, x, scale, shift)
+    assert len(sana._SANA_LN_MOD.verified_sigs) == n_sigs
+    # The fusion engages on non-default streams (the BCG warmup/capture path).
+    # x/scale/shift were filled on the default stream, so the side stream must
+    # wait for that work before reading them -- without this the fused kernel
+    # can read a half-written tensor, the first-sight torch.equal check fails,
+    # and the gate disables itself *permanently*, which then breaks every later
+    # parametrization too. It only loses the race when the GPU is contended,
+    # which is why it shows up on shared CI runners and not on an idle box.
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        out = sana_ln_modulate(norm, x, scale, shift)
+        assert len(sana._SANA_LN_MOD.verified_sigs) == n_sigs + 1  # verified
+        out2 = sana_ln_modulate(norm, x, scale, shift)  # verified-sig lane
+    torch.cuda.current_stream().wait_stream(side)
+    torch.cuda.synchronize()
+    assert torch.equal(out, _sana_eager_ln_modulate(norm, x, scale, shift))
+    assert torch.equal(out2, out) and not sana._SANA_LN_MOD.disabled
+
+
+# -------------------------------------------------------------------------
+# ERNIE-Image -- bit-exact RMSNorm scale/shift and rotate-half RoPE
+# -------------------------------------------------------------------------
+
+
+@requires_inline_ptx
+@pytest.mark.parametrize("shape", [(1, 4216, 4096), (2, 1140, 4096), (1, 128, 2048)])
+def test_ernie_norm_scale_shift_is_bit_exact(shape):
+    # (1, 4216, 4096) is the real ERNIE-Image shape (1024^2 image + text
+    # tokens, hidden 4096); 2048 covers the threads_per_row=32 regime.
+    torch.manual_seed(0)
+    batch, seq, hidden = shape
+    norm = RMSNorm(hidden, eps=1e-6).to(device="cuda", dtype=torch.bfloat16)
+    with torch.no_grad():
+        norm.weight.copy_(torch.randn(hidden))
+    x = torch.randn(batch, seq, hidden, device="cuda", dtype=torch.bfloat16)
+    residual = torch.randn_like(x)
+    update = torch.randn_like(x)
+    scale = torch.randn(batch, 1, hidden, device="cuda", dtype=torch.bfloat16) * 0.1
+    shift = torch.randn(batch, 1, hidden, device="cuda", dtype=torch.bfloat16) * 0.1
+    gate = torch.randn(batch, 1, hidden, device="cuda", dtype=torch.bfloat16)
+
+    with torch.no_grad():
+        out = _ernie_norm_scale_shift(norm, x, scale, shift)
+        ref = norm(x) * (1 + scale) + shift
+        assert torch.equal(out, ref)
+
+        out2, res = _ernie_gated_norm_scale_shift(
+            norm, residual, update, gate, scale, shift
+        )
+        res_ref = residual + gate * update
+        ref2 = norm(res_ref) * (1 + scale) + shift
+        assert torch.equal(res, res_ref)
+        assert torch.equal(out2, ref2)
+
+    # the fast paths must actually be in use (not silently disabled)
+    assert ernie_image._ERNIE_NORM.verified
+    assert ernie_image._ERNIE_GATED_NORM.verified
+    assert not ernie_image._ERNIE_NORM.disabled
+    assert not ernie_image._ERNIE_GATED_NORM.disabled
+
+
+@pytest.mark.skipif(
+    not is_cuda(), reason="the fused QKNorm+RoPE JIT kernel is CUDA-only"
+)
+def test_ernie_qknorm_rope_is_bit_exact():
+    torch.manual_seed(1)
+    ernie_image._ERNIE_QKNORM_ROPE.disabled = False
+    ernie_image._ERNIE_QKNORM_ROPE.verified = False
+    batch, seq, heads, head_dim = 1, 257, 32, 128
+    q = torch.randn(batch, seq, heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    q_norm = RMSNorm(head_dim, eps=1e-6).to(device="cuda", dtype=torch.bfloat16)
+    k_norm = RMSNorm(head_dim, eps=1e-6).to(device="cuda", dtype=torch.bfloat16)
+    cos = torch.randn(seq, head_dim, device="cuda", dtype=torch.bfloat16)
+    sin = torch.randn_like(cos)
+    cache = torch.cat((cos, sin), dim=-1).contiguous()
+    positions = torch.arange(seq, device="cuda", dtype=torch.long)
+
+    q_ref, k_ref = _ernie_qknorm_rope_reference(
+        q.clone(), k.clone(), q_norm, k_norm, head_dim, cos, sin
+    )
+    q_out, k_out = _ernie_qknorm_rope(
+        q,
+        k,
+        q_norm,
+        k_norm,
+        head_dim,
+        cos,
+        sin,
+        cache,
+        positions,
+    )
+
+    assert torch.equal(q_out, q_ref)
+    assert torch.equal(k_out, k_ref)
+    assert ernie_image._ERNIE_QKNORM_ROPE.verified
+    assert not ernie_image._ERNIE_QKNORM_ROPE.disabled
+
+
+def test_ernie_qknorm_rope_first_attempt_exception_uses_pristine_inputs():
+    torch.manual_seed(2)
+    ernie_image._ERNIE_QKNORM_ROPE.disabled = False
+    ernie_image._ERNIE_QKNORM_ROPE.verified = False
+    batch, seq, heads, head_dim = 1, 17, 4, 128
+    q = torch.randn(batch, seq, heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    q_norm = RMSNorm(head_dim, eps=1e-6).to(device="cuda", dtype=torch.bfloat16)
+    k_norm = RMSNorm(head_dim, eps=1e-6).to(device="cuda", dtype=torch.bfloat16)
+    cos = torch.randn(seq, head_dim, device="cuda", dtype=torch.bfloat16)
+    sin = torch.randn_like(cos)
+    cache = torch.cat((cos, sin), dim=-1).contiguous()
+    positions = torch.arange(seq, device="cuda", dtype=torch.long)
+    q_ref, k_ref = _ernie_qknorm_rope_reference(
+        q.clone(), k.clone(), q_norm, k_norm, head_dim, cos, sin
+    )
+
+    def mutate_then_raise(**kwargs):
+        kwargs["q"].zero_()
+        kwargs["k"].zero_()
+        raise RuntimeError("synthetic kernel failure")
+
+    with patch.object(ernie_image, "apply_qk_norm_rope", mutate_then_raise):
+        q_out, k_out = _ernie_qknorm_rope(
+            q,
+            k,
+            q_norm,
+            k_norm,
+            head_dim,
+            cos,
+            sin,
+            cache,
+            positions,
+        )
+
+    assert torch.equal(q_out, q_ref)
+    assert torch.equal(k_out, k_ref)
+    assert ernie_image._ERNIE_QKNORM_ROPE.disabled
+
+
+# -------------------------------------------------------------------------
+# LongCat-Image -- full-width interleaved QKNorm + RoPE
+# -------------------------------------------------------------------------
+
+
+@requires_inline_ptx
+def test_longcat_qknorm_rope_is_bit_exact():
+    torch.manual_seed(3)
+    batch, seq, heads, head_dim = 2, 17, 24, 128
+    offset = 11
+    q = torch.randn(batch, seq, heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    q_norm = RMSNorm(head_dim, eps=1e-6).to(device="cuda", dtype=torch.bfloat16)
+    k_norm = RMSNorm(head_dim, eps=1e-6).to(device="cuda", dtype=torch.bfloat16)
+    with torch.no_grad():
+        q_norm.weight.copy_(torch.randn_like(q_norm.weight))
+        k_norm.weight.copy_(torch.randn_like(k_norm.weight))
+
+    cos = torch.randn(offset + seq, head_dim, device="cuda")
+    sin = torch.randn_like(cos)
+    image_rotary_emb = (cos[offset:], sin[offset:])
+    cache = torch.cat((cos, sin), dim=-1).contiguous()
+    positions = torch.arange(offset, offset + seq, device="cuda", dtype=torch.int64)
+
+    q_ref, k_ref = apply_qk_norm(q.clone(), k.clone(), q_norm, k_norm, head_dim)
+    q_ref = longcat_image.apply_rotary_emb(q_ref, image_rotary_emb, sequence_dim=1)
+    k_ref = longcat_image.apply_rotary_emb(k_ref, image_rotary_emb, sequence_dim=1)
+
+    q_fused, k_fused = q.clone(), k.clone()
+    q_out, k_out = _apply_longcat_qknorm_rope(
+        q_fused,
+        k_fused,
+        q_norm,
+        k_norm,
+        head_dim,
+        image_rotary_emb,
+        cache,
+        positions,
+    )
+
+    assert q_out.data_ptr() == q_fused.data_ptr()
+    assert k_out.data_ptr() == k_fused.data_ptr()
+    assert torch.equal(q_out, q_ref)
+    assert torch.equal(k_out, k_ref)
+    assert longcat_image._LONGCAT_QKNORM_ROPE.verified
+    assert not longcat_image._LONGCAT_QKNORM_ROPE.disabled
+
+
+# -------------------------------------------------------------------------
+# LTX-2 -- weightless RMSNorm + modulate (quality-gated)
+# -------------------------------------------------------------------------
+
+
+def test_ltx2_qknorm_split_rope_hopper_site_is_quality_gated():
+    attention = nn.Module()
+    LTX2_QKNORM_SPLIT_ROPE.mark(attention)
+    assert not LTX2_QKNORM_SPLIT_ROPE.is_enabled(attention)
+    assert LTX2_QKNORM_SPLIT_ROPE.mount(attention)
+    assert LTX2_QKNORM_SPLIT_ROPE.is_enabled(attention)
+    LTX2_QKNORM_SPLIT_ROPE.unmount(attention)
+    assert not LTX2_QKNORM_SPLIT_ROPE.is_enabled(attention)
+
+
+def _ltx2_eager(rms, x, scale, shift, eps):
+    return rms(x, eps) * (1 + scale) + shift
+
+
+def _ltx2_inputs(hidden, batch=1, seq=4096):
+    rms = RMSNormNoWeight()
+    x = torch.randn(batch, seq, hidden, device="cuda", dtype=torch.bfloat16)
+    scale = torch.randn(batch, 1, hidden, device="cuda", dtype=torch.bfloat16) * 0.1
+    shift = torch.randn(batch, 1, hidden, device="cuda", dtype=torch.bfloat16) * 0.1
+    return rms, x, scale, shift
+
+
+# hidden 4096 = LTX-2 video stream, 2048 = audio stream.
+@pytest.mark.parametrize("hidden", [4096, 2048])
+def test_ltx2_lossless_default_is_bitexact(hidden):
+    # A marked-but-unmounted site uses only the self-verified bit-exact
+    # modulate fast path after the reference aten RMSNorm.
+    block = nn.Module()
+    LTX2_RMS_NORM_MODULATE.mark(block)
+    rms, x, scale, shift = _ltx2_inputs(hidden)
+    out = _ltx2_rms_norm_modulate(block, rms, x, scale, shift, 1e-6)
+    assert torch.equal(out, _ltx2_eager(rms, x, scale, shift, 1e-6))
+
+
+def test_ltx2_lossless_compile_keeps_expression_visible_to_inductor(monkeypatch):
+    block = nn.Module()
+    LTX2_RMS_NORM_MODULATE.mark(block)
+    rms, x, scale, shift = _ltx2_inputs(2048, seq=126)
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    monkeypatch.setattr(
+        ltx2_module,
+        "_ltx2_modulate",
+        lambda *_args: pytest.fail("compiled path must not call the opaque custom op"),
+    )
+
+    out = _ltx2_rms_norm_modulate(block, rms, x, scale, shift, 1e-6)
+    assert torch.equal(out, _ltx2_eager(rms, x, scale, shift, 1e-6))
+
+
+@requires_inline_ptx
+@pytest.mark.parametrize("hidden", [4096, 2048])
+def test_ltx2_mounted_high_uses_fused_kernel(hidden):
+    block = nn.Module()
+    LTX2_RMS_NORM_MODULATE.mark(block)
+    assert LTX2_RMS_NORM_MODULATE.mount(block)
+    try:
+        rms, x, scale, shift = _ltx2_inputs(hidden)
+        out = _ltx2_rms_norm_modulate(block, rms, x, scale, shift, 1e-6)
+        # The mounted path routes through the fused kernel exactly.
+        assert torch.equal(out, fused_ltx2_rms_norm_modulate(x, scale, shift, 1e-6))
+        # And stays within half-precision rounding of the eager reference.
+        ref = _ltx2_eager(rms, x, scale, shift, 1e-6)
+        assert torch.allclose(out.float(), ref.float(), atol=3e-2, rtol=1e-2)
+    finally:
+        LTX2_RMS_NORM_MODULATE.unmount(block)
+
+
+# -------------------------------------------------------------------------
+# HunyuanVideo -- QKV/RoPE pack and quality-gated QK RMSNorm
+# -------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("img_tokens,txt_tokens", [(257, 31), (4096, 256)])
+def test_hunyuan_qkv_rope_pack_is_bit_exact(img_tokens, txt_tokens):
+    torch.manual_seed(0)
+    shape_img = (1, img_tokens, 24, 128)
+    shape_txt = (1, txt_tokens, 24, 128)
+    img_q, img_k, img_v = (
+        torch.randn(shape_img, device="cuda", dtype=torch.bfloat16) for _ in range(3)
+    )
+    txt_q, txt_k, txt_v = (
+        torch.randn(shape_txt, device="cuda", dtype=torch.bfloat16) for _ in range(3)
+    )
+    cos = torch.randn(img_tokens, 64, device="cuda")
+    sin = torch.randn_like(cos)
+
+    q, k, v = _hunyuan_pack_qkv(img_q, img_k, img_v, txt_q, txt_k, txt_v, cos, sin)
+    q_ref = torch.cat(
+        (_apply_rotary_emb(img_q, cos, sin, is_neox_style=False), txt_q), dim=1
+    )
+    k_ref = torch.cat(
+        (_apply_rotary_emb(img_k, cos, sin, is_neox_style=False), txt_k), dim=1
+    )
+    v_ref = torch.cat((img_v, txt_v), dim=1)
+
+    assert torch.equal(q, q_ref)
+    assert torch.equal(k, k_ref)
+    assert torch.equal(v, v_ref)
+
+
+def test_hunyuan_qkv_rope_pack_uses_int64_row_offsets():
+    if torch.cuda.get_device_properties(0).total_memory < 16 * 2**30:
+        pytest.skip("needs >= 16 GB GPU memory")
+
+    img_tokens, txt_tokens = 115200, 8
+    num_heads, head_dim = 24, 128
+    total_tokens = img_tokens + txt_tokens
+    projection_width = 21504
+
+    projection = torch.zeros(
+        (1, total_tokens, projection_width),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    qkv = projection[..., : 3 * num_heads * head_dim].view(
+        1, total_tokens, 3, num_heads, head_dim
+    )
+    q = qkv[:, :, 0].contiguous()
+    k = qkv[:, :, 1].contiguous()
+    v = qkv[:, :, 2]
+    assert (img_tokens - 1) * v.stride(1) > torch.iinfo(torch.int32).max
+
+    cos = torch.ones((img_tokens, head_dim // 2), device="cuda")
+    sin = torch.zeros_like(cos)
+    packed = hunyuan_qkv_rope_pack(
+        q[:, :img_tokens],
+        k[:, :img_tokens],
+        v[:, :img_tokens],
+        q[:, img_tokens:],
+        k[:, img_tokens:],
+        v[:, img_tokens:],
+        cos,
+        sin,
+    )
+    torch.cuda.synchronize()
+
+    expected_shape = (1, total_tokens, num_heads, head_dim)
+    assert all(x.shape == expected_shape for x in packed)
+    assert all(x[0, img_tokens - 1, -1, -1].item() == 0 for x in packed)
+
+
+@pytest.mark.skipif(not is_cuda(), reason="FlashInfer CuTe QK RMSNorm is CUDA-only")
+def test_hunyuan_quality_qknorm_matches_rmsnorm():
+    torch.manual_seed(1)
+    site = torch.nn.Module()
+    HUNYUAN_QKNORM.mark(site)
+    q_norm = RMSNorm(128, eps=1e-6).to(device="cuda", dtype=torch.bfloat16)
+    k_norm = RMSNorm(128, eps=1e-6).to(device="cuda", dtype=torch.bfloat16)
+    packed = torch.randn(1, 257, 3, 24, 128, device="cuda", dtype=torch.bfloat16)
+    q, k = packed[:, :, 0], packed[:, :, 1]
+    q_ref = q_norm(q.contiguous()).to(q)
+    k_ref = k_norm(k.contiguous()).to(k)
+
+    q_unmounted, k_unmounted = _hunyuan_qknorm(site, q, k, q_norm, k_norm)
+    assert torch.equal(q_unmounted, q_ref)
+    assert torch.equal(k_unmounted, k_ref)
+
+    assert HUNYUAN_QKNORM.mount(site)
+    q_out, k_out = _hunyuan_qknorm(site, q, k, q_norm, k_norm)
+    torch.testing.assert_close(q_out, q_ref, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(k_out, k_ref, atol=2e-2, rtol=2e-2)
+
+    HUNYUAN_QKNORM.unmount(site)
+    q_unmounted, k_unmounted = _hunyuan_qknorm(site, q, k, q_norm, k_norm)
+    assert torch.equal(q_unmounted, q_ref)
+    assert torch.equal(k_unmounted, k_ref)
+
+
+def test_hunyuan_quality_qknorm_stays_unmounted_without_cute_kernel():
+    site = torch.nn.Module()
+    HUNYUAN_QKNORM.mark(site)
+
+    with patch.object(hunyuan_qknorm, "_get_qk_rmsnorm_cute", return_value=None):
+        assert not HUNYUAN_QKNORM.mount(site)
+
+    assert not HUNYUAN_QKNORM.is_enabled(site)
+
+
+# -------------------------------------------------------------------------
+# Wan VAE -- fused RMSNorm+SiLU module gate
+# -------------------------------------------------------------------------
+
+
+def _wan_cl3d(shape, dtype):
+    return torch.randn(shape, device="cuda", dtype=dtype).contiguous(
+        memory_format=torch.channels_last_3d
+    )
+
+
+@torch.no_grad()
+@pytest.mark.parametrize(
+    "norm_cls,frames",
+    [(WanRMS_norm, 3), (qwen_vae.QwenImageRMS_norm, 1)],
+    ids=["wan", "qwen"],
+)
+def test_wan_and_qwen_vae_norm_gate_dispatch(norm_cls, frames) -> None:
+    # Gate off must stay bit-exact; gate on must route to the fused kernel.
+    torch.cuda.manual_seed(0)
+    norm = norm_cls(96, images=False).to(device="cuda", dtype=torch.bfloat16)
+    norm.gamma.add_(torch.randn_like(norm.gamma))
+    gate = VaeFastPathGate()
+    fused = FusedWanRMSNormSiLU(norm, gate)
+    # Parameter names must not change (weight transfer matches by name).
+    assert [n for n, _ in fused.named_parameters()] == ["gamma"]
+    x = _wan_cl3d((1, 96, frames, 10, 14), torch.bfloat16)
+    assert torch.equal(fused(x), nn.SiLU()(norm(x)))
+    gate.enabled = True
+    expected = wan_rmsnorm_silu(x, norm.gamma, rms_scale=float(norm.scale))
+    assert torch.equal(fused(x), expected)
+
+
+@torch.no_grad()
+def test_wan_vae_rejects_empty_input() -> None:
+    x = torch.empty(1, 96, 0, 2, 2, device="cuda", dtype=torch.bfloat16).to(
+        memory_format=torch.channels_last_3d
+    )
+    gamma = torch.ones(96, 1, 1, 1, device="cuda", dtype=torch.bfloat16)
+    assert not can_use_wan_rmsnorm_silu(x, gamma, None)
+
+
+def _wan_tiny_decoder(seed=0):
+    torch.manual_seed(seed)
+    dec = wanvae.WanDecoder3d(
+        dim=16, z_dim=4, dim_mult=[1, 1], num_res_blocks=1, temperal_upsample=[True]
+    ).to("cuda", torch.bfloat16)
+    for m in dec.modules():
+        if isinstance(m, nn.Conv3d):
+            m.weight.data = m.weight.data.to(memory_format=torch.channels_last_3d)
+    return dec
+
+
+def _wan_decode_chunks(dec, chunks):
+    # Mirrors AutoencoderKLWan.decode: one latent frame per chunk, feature
+    # cache threaded through the contextvars the decoder reads.
+    n_conv = sum(isinstance(m, wanvae.WanCausalConv3d) for m in dec.modules())
+    cache = [None] * n_conv
+    outs = []
+    for i, z in enumerate(chunks):
+        tok_c = wanvae.feat_cache.set(cache)
+        tok_i = wanvae.feat_idx.set(0)
+        tok_f = wanvae.first_chunk.set(i == 0)
+        try:
+            outs.append(dec(z))
+        finally:
+            wanvae.feat_cache.reset(tok_c)
+            wanvae.feat_idx.reset(tok_i)
+            wanvae.first_chunk.reset(tok_f)
+    return torch.cat(outs, dim=2)
+
+
+@torch.no_grad()
+def test_wan_vae_conv_epilogue_wiring_is_bit_exact() -> None:
+    # The lossless decoder (fused cat+pad, conv bias epilogue, bias+residual
+    # fold, bias deferred into norm2) must equal the pure aten module chain.
+    dec = _wan_tiny_decoder()
+    chunks = [_wan_cl3d((1, 4, 1, 6, 6), torch.bfloat16) for _ in range(3)]
+    fast = _wan_decode_chunks(dec, chunks)
+    saved = (
+        wanvae.cat_pad_channels_last_3d,
+        wanvae.conv_bias_epilogue,
+        wanvae.can_use_conv_bias_epilogue,
+    )
+    wanvae.cat_pad_channels_last_3d = None
+    wanvae.conv_bias_epilogue = None
+    wanvae.can_use_conv_bias_epilogue = None
+    try:
+        eager = _wan_decode_chunks(dec, chunks)
+    finally:
+        (
+            wanvae.cat_pad_channels_last_3d,
+            wanvae.conv_bias_epilogue,
+            wanvae.can_use_conv_bias_epilogue,
+        ) = saved
+    assert torch.equal(fast, eager)
+    # Deferred conv1 bias through the gated wrapper, gate off: still exact.
+    gate = VaeFastPathGate()
+    wan_vae_cuda_opt._install_norm_silu(
+        dec,
+        gate,
+        residual_block_cls=(wanvae.WanResidualBlock,),
+        rms_norm_cls=WanRMS_norm,
+        label="test",
+    )
+    assert torch.equal(_wan_decode_chunks(dec, chunks), eager)
+    gate.enabled = True
+    out = _wan_decode_chunks(dec, chunks)
+    rel = ((out.float() - eager.float()).norm() / eager.float().norm()).item()
+    assert rel < 2e-2, rel
+
+
+@torch.no_grad()
+def test_wan_vae_time_interleave_matches_stack_and_keeps_layout() -> None:
+    # time_conv output [B, 2C, T, H, W] -> interleaved [B, C, 2T, H, W].
+    b, c, t, h, w = 1, 8, 3, 6, 10
+    x = _wan_cl3d((b, 2 * c, t, h, w), torch.bfloat16)
+    ref = torch.stack(
+        (x.reshape(b, 2, c, t, h, w)[:, 0], x.reshape(b, 2, c, t, h, w)[:, 1]), 3
+    ).reshape(b, c, 2 * t, h, w)
+
+    class _Holder:  # stands in for the WanResample instance
+        pass
+
+    holder = _Holder()
+    off = wanvae._interleave_time_pairs(holder, x, b, c, t, h, w)
+    assert torch.equal(off, ref) and off.is_contiguous()  # eager NCDHW path
+    holder._sgl_gate = VaeFastPathGate()
+    holder._sgl_gate.enabled = True
+    on = wanvae._interleave_time_pairs(holder, x, b, c, t, h, w)
+    assert torch.equal(on, ref)
+    assert on.is_contiguous(memory_format=torch.channels_last_3d)
+
+
+@torch.no_grad()
+def test_wan_vae_upsample_wrapper_dispatch() -> None:
+    gate = VaeFastPathGate()
+    up = GatedChannelsLastUpsample(
+        wanvae.WanUpsample(scale_factor=(2.0, 2.0), mode="nearest-exact"), gate
+    )
+    aten = nn.Upsample(scale_factor=(2.0, 2.0), mode="nearest-exact")
+    # Canonical NHWC (multi-frame chunk): the Triton gather replaces aten's
+    # NHWC kernel on both paths, same values and layout.
+    x = torch.randn(4, 8, 6, 6, device="cuda", dtype=torch.bfloat16).contiguous(
+        memory_format=torch.channels_last
+    )
+    out = up(x)
+    assert torch.equal(out, aten(x))
+    assert out.is_contiguous(memory_format=torch.channels_last)
+    # Degenerate batch stride (single frame): gate off keeps aten's NCHW
+    # result, gate on canonicalises and stays channels_last.
+    x1 = (
+        _wan_cl3d((1, 8, 1, 6, 6), torch.bfloat16)
+        .permute(0, 2, 1, 3, 4)
+        .reshape(1, 8, 6, 6)
+    )
+    ref1 = aten(x1)
+    off = up(x1)
+    assert torch.equal(off, ref1) and off.is_contiguous()
+    gate.enabled = True
+    on = up(x1)
+    assert torch.equal(on, ref1)
+    assert on.is_contiguous(memory_format=torch.channels_last)
+    # NCHW input is untouched on either path.
+    xn = torch.randn(2, 8, 6, 6, device="cuda", dtype=torch.bfloat16)
+    assert torch.equal(up(xn), aten(xn)) and up(xn).is_contiguous()
+
+
+@torch.no_grad()
+def test_wan_vae_decoder_install_wires_resample_gate() -> None:
+    torch.manual_seed(0)
+    dec = wanvae.WanDecoder3d(
+        dim=16, z_dim=4, dim_mult=[1, 1], num_res_blocks=1, temperal_upsample=[True]
+    ).to("cuda", torch.bfloat16)
+    keys = set(dec.state_dict())
+    gate = VaeFastPathGate()
+    n_norm = wan_vae_cuda_opt._install_norm_silu(
+        dec,
+        gate,
+        residual_block_cls=(wanvae.WanResidualBlock,),
+        rms_norm_cls=WanRMS_norm,
+        label="test",
+    )
+    n_up = wan_vae_cuda_opt._install_channels_last_upsample(
+        dec, gate, wanvae.WanUpsample
+    )
+    n_gated = wan_vae_cuda_opt._install_module_gates(
+        dec, gate, (wanvae.WanResample, wanvae.WanAttentionBlock)
+    )
+    # one Resample plus the mid block's attention
+    assert n_norm == 13 and n_up == 1 and n_gated == 2
+    assert set(dec.state_dict()) == keys
+    resample = next(m for m in dec.modules() if type(m) is wanvae.WanResample)
+    assert resample._sgl_gate is gate
+    attn = next(m for m in dec.modules() if type(m) is wanvae.WanAttentionBlock)
+    assert attn._sgl_gate is gate
+
+
+# -------------------------------------------------------------------------
+# Qwen-Image VAE (Wan 2.1 VAE) -- lossless causal-conv data movement and the
+# quality-gated RMSNorm+SiLU / channels_last upsample fast path
+# -------------------------------------------------------------------------
+
+
+def _qwen_causal_conv(cin, cout, channels_last=True):
+    conv = qwen_vae.QwenImageCausalConv3d(cin, cout, 3, padding=1).to(
+        "cuda", torch.bfloat16
+    )
+    if channels_last:
+        conv.weight.data = conv.weight.data.to(memory_format=torch.channels_last_3d)
+    return conv
+
+
+@torch.no_grad()
+@pytest.mark.skipif(not is_cuda(), reason="the fused cat+pad kernel is CUDA-only")
+def test_qwen_vae_causal_conv_cat_pad_is_bit_exact() -> None:
+    # Fused cat + pad + relayout must reproduce the aten chain for no cache,
+    # a one-frame cache (partial zero fill) and a full two-frame cache.
+    torch.manual_seed(0)
+    conv = _qwen_causal_conv(8, 16)
+    ref = _qwen_causal_conv(8, 16, channels_last=False)
+    ref.load_state_dict(conv.state_dict())
+    x = _wan_cl3d((1, 8, 1, 12, 10), torch.bfloat16)
+    for cache_t in (0, 1, 2):
+        cache = _wan_cl3d((1, 8, cache_t, 12, 10), torch.bfloat16) if cache_t else None
+        # The reference is the eager chain on the same (channels_last) weights.
+        expected = nn.Conv3d.forward(
+            conv,
+            qwen_vae.causal_conv3d_cat_pad(x, cache, list(conv._padding)).contiguous(
+                memory_format=torch.channels_last_3d
+            ),
+        )
+        assert qwen_vae._fused_conv_cache_supported(conv, x)
+        assert torch.equal(conv(x, cache), expected)
+    # Contiguous weights take the original path unchanged.
+    assert not qwen_vae._fused_conv_cache_supported(ref, x)
+
+
+@torch.no_grad()
+def test_qwen_vae_run_cached_causal_conv_matches_eager_bookkeeping() -> None:
+    # Stream three single-frame chunks (the image decode shape, and the first
+    # chunks of a clip) through one conv slot on the fused and the eager path;
+    # outputs and cache contents must agree, including the "Rep" slot.
+    torch.manual_seed(0)
+    fused = _qwen_causal_conv(8, 8)
+    eager = _qwen_causal_conv(8, 8, channels_last=False)
+    eager.load_state_dict(fused.state_dict())
+    chunks = [_wan_cl3d((1, 8, 1, 6, 6), torch.bfloat16) for _ in range(3)]
+    for first in (None, "Rep"):
+        fused_cache, eager_cache = [first], [first]
+        for x in chunks:
+            out_f = qwen_vae._run_cached_causal_conv(fused, x, fused_cache, 0)
+            out_e = qwen_vae._run_cached_causal_conv(eager, x, eager_cache, 0)
+            assert torch.equal(out_f, out_e)
+            # The fused path only ever stores tensors that the eager path would
+            # also consume: same values, possibly wider (never narrower).
+            fc, ec = fused_cache[0], eager_cache[0]
+            assert fc.shape[2] >= ec.shape[2]
+            assert torch.equal(fc[:, :, -ec.shape[2] :], ec)
+
+
+@torch.no_grad()
+def test_qwen_vae_upsample_skips_fp32_round_trip_bit_exactly() -> None:
+    up = qwen_vae.QwenImageUpsample(scale_factor=(2.0, 2.0), mode="nearest-exact")
+    x = torch.randn(1, 8, 12, 10, device="cuda", dtype=torch.bfloat16).contiguous(
+        memory_format=torch.channels_last
+    )
+    assert torch.equal(up(x), nn.Upsample.forward(up, x.float()).type_as(x))
+
+
+@torch.no_grad()
+def test_qwen_vae_channels_last_upsample_keeps_layout() -> None:
+    gate = VaeFastPathGate()
+    up = GatedChannelsLastUpsample(
+        qwen_vae.QwenImageUpsample(scale_factor=(2.0, 2.0), mode="nearest-exact"),
+        gate,
+    )
+    x5 = _wan_cl3d((1, 8, 1, 6, 6), torch.bfloat16)
+    x = x5.permute(0, 2, 1, 3, 4).reshape(1, 8, 6, 6)  # degenerate batch stride
+    ref = nn.Upsample(scale_factor=(2.0, 2.0), mode="nearest-exact")(x)
+    off = up(x)
+    assert torch.equal(off, ref) and off.is_contiguous()  # NCHW, as today
+    gate.enabled = True
+    on = up(x)
+    assert torch.equal(on, ref)
+    assert on.is_contiguous(memory_format=torch.channels_last)
+    assert on.stride() == (12 * 12 * 8, 1, 12 * 8, 8)
+
+
+@torch.no_grad()
+def test_qwen_vae_decoder_install_is_gated_and_close() -> None:
+    torch.manual_seed(0)
+    dec = qwen_vae.QwenImageDecoder3d(
+        dim=16, z_dim=4, dim_mult=[1, 1], num_res_blocks=1, temperal_upsample=[False]
+    ).to("cuda", torch.bfloat16)
+    for m in dec.modules():
+        if isinstance(m, nn.Conv3d):
+            m.weight.data = m.weight.data.to(memory_format=torch.channels_last_3d)
+    for p in dec.parameters():
+        p.add_(0.1 * torch.randn_like(p))
+    keys = set(dec.state_dict())
+    z = _wan_cl3d((1, 4, 1, 6, 6), torch.bfloat16)
+    ref = dec(z, feat_cache=[None] * 64, feat_idx=[0])
+
+    gate = VaeFastPathGate()
+    n_norm = wan_vae_cuda_opt._install_norm_silu(
+        dec,
+        gate,
+        residual_block_cls=(qwen_vae.QwenImageResidualBlock,),
+        rms_norm_cls=qwen_vae.QwenImageRMS_norm,
+        label="test",
+    )
+    n_up = wan_vae_cuda_opt._install_channels_last_upsample(
+        dec, gate, qwen_vae.QwenImageUpsample
+    )
+    # mid block (2 resnets) + 2 up blocks x (num_res_blocks + 1) resnets
+    # -> 6 resnets x 2 norms + norm_out; only the first up block upsamples.
+    assert n_norm == 13 and n_up == 1
+    assert set(dec.state_dict()) == keys
+    assert torch.equal(dec(z, feat_cache=[None] * 64, feat_idx=[0]), ref)
+    gate.enabled = True
+    out = dec(z, feat_cache=[None] * 64, feat_idx=[0])
+    assert out.shape == ref.shape
+    # Not bit-exact (fp32 statistics in the fused norm), but a bf16-rounding
+    # level perturbation: bound the relative error energy over the whole
+    # output rather than per element (random weights, unnormalised scale).
+    rel = ((out.float() - ref.float()).norm() / ref.float().norm()).item()
+    assert rel < 2e-2, rel
+
+
+# -------------------------------------------------------------------------
+# FLUX.2 VAE -- fused GroupNorm+SiLU and folded 2x upsample conv
+# -------------------------------------------------------------------------
+
+
+@torch.no_grad()
+def test_flux2_vae_fast_path():
+    torch.manual_seed(0)
+    gate = vae_opt.VaeFastPathGate()
+    gn = nn.GroupNorm(32, 128, eps=1e-6).to("cuda", torch.bfloat16)
+    x = torch.randn(1, 128, 64, 64, device="cuda", dtype=torch.bfloat16).to(
+        memory_format=torch.channels_last
+    )
+    ref = F.silu(gn(x))
+    fused_gn = vae_opt.FusedGroupNormSiLU(gn, gate)
+    assert set(fused_gn.state_dict()) == {"weight", "bias"}
+    assert torch.equal(fused_gn(x), ref)  # gate off: bit-exact reference
+
+    gate.enabled = True
+    fast = fused_gn(x)
+    assert fast.is_contiguous(memory_format=torch.channels_last)
+    torch.testing.assert_close(fast.float(), ref.float(), atol=0.06, rtol=0)
+
+    gate.enabled = False
+    up = Upsample2D(channels=32, use_conv=True).to("cuda", torch.bfloat16)
+    fused_up = vae_opt.FusedUpsample2xConv2d(up, gate)
+    assert set(fused_up.state_dict()) == {"conv.weight", "conv.bias"}
+    x = torch.randn(2, 32, 33, 29, device="cuda", dtype=torch.bfloat16)
+    ref = up(x)
+    assert torch.equal(fused_up(x), ref)
+    assert fused_up._fused_weight is None
+
+    gate.enabled = True
+    fast = fused_up(x)
+    assert fused_up._fused_weight is not None
+    ref_range = ref.float().max() - ref.float().min()
+    relative_mse = F.mse_loss(fast.float(), ref.float()) / ref_range.square()
+    assert relative_mse < 3.2e-5
+
+
+# ---------------------------------------------------------------------------
+# AutoencoderKL (generic) -- fast-path install must not disturb the checkpoint
+# ---------------------------------------------------------------------------
+
+
+def _small_config():
+    config = StableDiffusion3VAEConfig()
+    config.arch_config.latent_channels = 2
+    config.arch_config.block_out_channels = (4, 4)
+    config.arch_config.down_block_types = ("DownEncoderBlock2D",) * 2
+    config.arch_config.up_block_types = ("UpDecoderBlock2D",) * 2
+    config.arch_config.layers_per_block = 1
+    config.arch_config.norm_num_groups = 1
+    config.arch_config.sample_size = 8
+    return config
+
+
+@torch.no_grad()
+def test_autoencoder_kl_fastpath_install():
+    torch.manual_seed(0)
+    vae = AutoencoderKL(_small_config()).to("cuda", torch.bfloat16).eval()
+    ref_names = {n for n, _ in vae.named_parameters()}
+    ref_sd = {k: v.clone() for k, v in vae.state_dict().items()}
+    z = torch.randn(1, 2, 8, 8, device="cuda", dtype=torch.bfloat16)
+    ref = vae.decode(z)
+
+    opt = vae_opt.maybe_optimize_autoencoder_kl(vae)
+    # Wrappers must not change parameter FQNs; strict load must round-trip.
+    assert {n for n, _ in opt.named_parameters()} == ref_names
+    opt.load_state_dict(ref_sd, strict=True)
+    # Gate off: bit-for-bit the original path.
+    assert torch.equal(opt.decode(z), ref)
+    # use_vae_fast_path() is a no-op when nothing registered a gate, so check
+    # the wrappers went in before relying on it to switch paths.
+    assert any(
+        isinstance(m, (vae_opt.FusedGroupNormSiLU, vae_opt.FusedUpsample2xConv2d))
+        for m in opt.modules()
+    )
+    # Gate on: fast path runs and stays close; leaving the scope restores exact.
+    with use_vae_fast_path(opt, True):
+        torch.testing.assert_close(opt.decode(z).float(), ref.float(), atol=0.1, rtol=0)
+    assert torch.equal(opt.decode(z), ref)
+
+
+@torch.no_grad()
+@pytest.mark.skipif(not is_cuda(), reason="the fused Q/K norm is CUDA-only")
+def test_qwen21_qk_norm_verifies_and_preserves_native_fallback(monkeypatch):
+    x = torch.randn(1, 257, 8, 128, device="cuda", dtype=torch.bfloat16)
+    norm = qwen_image21.RMSNorm(
+        128, 1e-6, cast_x_before_out_mul=True, force_native=True
+    ).to(device=x.device, dtype=x.dtype)
+    norm.weight.normal_()
+    expected = norm(x)
+    gate = BitExactFusionGate("test Q/K norm")
+    monkeypatch.setattr(qwen_image21, "_QK_NORM_FUSION", gate)
+    assert torch.equal(qwen_image21.apply_qk_norm(x, norm), expected)
+    assert gate.verified and not gate.disabled
+    x.normal_()
+    assert torch.equal(qwen_image21.apply_qk_norm(x, norm), norm(x))
+
+    gate = BitExactFusionGate("test mismatched Q/K norm")
+    monkeypatch.setattr(qwen_image21, "_QK_NORM_FUSION", gate)
+    monkeypatch.setattr(
+        qwen_image21,
+        "rmsnorm_preserve_reduction",
+        lambda x, weight, eps: torch.zeros_like(x),
+    )
+    assert torch.equal(qwen_image21.apply_qk_norm(x, norm), norm(x))
+    assert gate.disabled and not gate.verified
+
+
+@torch.no_grad()
+def test_qwen21_qk_norm_does_not_verify_during_capture(monkeypatch):
+    x = torch.randn(1, 17, 2, 128, device="cuda", dtype=torch.bfloat16)
+    norm = qwen_image21.RMSNorm(
+        128, 1e-6, cast_x_before_out_mul=True, force_native=True
+    ).to(device=x.device, dtype=x.dtype)
+    norm(x)
+    gate = BitExactFusionGate("test captured Q/K norm")
+    monkeypatch.setattr(qwen_image21, "_QK_NORM_FUSION", gate)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = qwen_image21.apply_qk_norm(x, norm)
+    assert not gate.verified and not gate.disabled
+    x.normal_()
+    graph.replay()
+    assert torch.equal(out, norm(x))
+
+
+@torch.no_grad()
+@pytest.mark.skipif(not is_cuda(), reason="the fused LayerNorm modulation is CUDA-only")
+def test_qwen21_modulation_verifies_and_preserves_native_fallback(monkeypatch):
+    x = torch.randn(1, 257, 4096, device="cuda", dtype=torch.bfloat16)
+    scale = torch.randn(1, 1, 4096, device=x.device, dtype=x.dtype)
+    norm = torch.nn.LayerNorm(4096, eps=1e-6, elementwise_affine=False).cuda()
+    gate = BitExactFusionGate("test scale-only modulation")
+    monkeypatch.setattr(qwen_image21, "_MODULATION_FUSION", gate)
+    expected = norm(x) * (1 + scale)
+    actual = qwen_image21.apply_modulation(x, norm, scale)
+    assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+    assert gate.verified and not gate.disabled
+    x.normal_()
+    scale.normal_()
+    assert torch.equal(
+        qwen_image21.apply_modulation(x, norm, scale), norm(x) * (1 + scale)
+    )
+
+    gate = BitExactFusionGate("test mismatched modulation")
+    monkeypatch.setattr(qwen_image21, "_MODULATION_FUSION", gate)
+    monkeypatch.setattr(
+        qwen_image21,
+        "fused_layernorm_modulate",
+        lambda x, scale, shift, eps: torch.zeros_like(x),
+    )
+    assert torch.equal(
+        qwen_image21.apply_modulation(x, norm, scale), norm(x) * (1 + scale)
+    )
+    assert gate.disabled and not gate.verified
+
+
+@torch.no_grad()
+def test_qwen21_modulation_does_not_verify_during_capture(monkeypatch):
+    x = torch.randn(1, 17, 128, device="cuda", dtype=torch.bfloat16)
+    scale = torch.randn(1, 1, 128, device=x.device, dtype=x.dtype)
+    norm = torch.nn.LayerNorm(128, eps=1e-6, elementwise_affine=False).cuda()
+    norm(x)
+    gate = BitExactFusionGate("test captured modulation")
+    monkeypatch.setattr(qwen_image21, "_MODULATION_FUSION", gate)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = qwen_image21.apply_modulation(x, norm, scale)
+    assert not gate.verified and not gate.disabled
+    x.normal_()
+    scale.normal_()
+    graph.replay()
+    assert torch.equal(out, norm(x) * (1 + scale))
+
+
+requires_nvidia_jit = pytest.mark.skipif(
+    not is_cuda(), reason="the Qwen-Image 2.1 JIT CUDA kernels are NVIDIA-only"
+)
+
+
+def _qwen21_rope(tokens: int, device: torch.device) -> torch.Tensor:
+    angles = torch.randn(tokens, 64, device=device, dtype=torch.float32)
+    return torch.polar(torch.ones_like(angles), angles)
+
+
+@requires_nvidia_jit
+@torch.no_grad()
+def test_qwen21_cuda_qk_rope_verifies_and_preserves_native_fallback(monkeypatch):
+    x = torch.randn(1, 257, 8, 128, device="cuda", dtype=torch.bfloat16)
+    rope = _qwen21_rope(257, x.device)
+    norm = qwen_image21.RMSNorm(
+        128, 1e-6, cast_x_before_out_mul=True, force_native=True
+    ).to(device=x.device, dtype=x.dtype)
+    norm.weight.normal_()
+    expected = qwen_image21.apply_rope(norm(x), rope)
+    gate = BitExactFusionGate("test CUDA Q/K norm + RoPE")
+    monkeypatch.setattr(qwen_image21, "_QK_ROPE_CUDA_FUSION", gate)
+    assert torch.equal(qwen_image21.apply_qk_norm_rope(x, norm, rope), expected)
+    assert gate.verified and not gate.disabled
+    x.normal_()
+    assert torch.equal(
+        qwen_image21.apply_qk_norm_rope(x, norm, rope),
+        qwen_image21.apply_rope(norm(x), rope),
+    )
+
+    gate = BitExactFusionGate("test mismatched CUDA Q/K norm + RoPE")
+    monkeypatch.setattr(qwen_image21, "_QK_ROPE_CUDA_FUSION", gate)
+    monkeypatch.setattr(
+        qwen_image21,
+        "qknorm_complex_rope_cuda",
+        lambda x, weight, rope, eps: torch.zeros_like(x),
+    )
+    assert torch.equal(
+        qwen_image21.apply_qk_norm_rope(x, norm, rope),
+        qwen_image21.apply_rope(norm(x), rope),
+    )
+    assert gate.disabled and not gate.verified
+
+
+@requires_nvidia_jit
+@torch.no_grad()
+def test_qwen21_cuda_qk_rope_does_not_verify_during_capture(monkeypatch):
+    x = torch.randn(1, 17, 2, 128, device="cuda", dtype=torch.bfloat16)
+    rope = _qwen21_rope(17, x.device)
+    norm = qwen_image21.RMSNorm(
+        128, 1e-6, cast_x_before_out_mul=True, force_native=True
+    ).to(device=x.device, dtype=x.dtype)
+    qwen_image21.apply_rope(norm(x), rope)
+    gate = BitExactFusionGate("test captured CUDA Q/K norm + RoPE")
+    monkeypatch.setattr(qwen_image21, "_QK_ROPE_CUDA_FUSION", gate)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = qwen_image21.apply_qk_norm_rope(x, norm, rope)
+    assert not gate.verified and not gate.disabled
+    x.normal_()
+    graph.replay()
+    assert torch.equal(out, qwen_image21.apply_rope(norm(x), rope))
+
+
+# -------------------------------------------------------------------------
+# Qwen-Image 2.1 VAE -- bit-exact norm / bias fusions and the quality-gated channels_last decode
+# -------------------------------------------------------------------------
+
+
+def _qwen21_vae():
+    # The real latent channel count and 1/9 of the decoder width: every fold
+    # site has K >= 576 like the real decoder, and at a 64x64 latent all of them
+    # produce >= 2**18 output elements, so the first-sight comparisons decide.
+    ac = QwenImage21VAEArchConfig(
+        base_dim=16,
+        decoder_base_dim=16,
+        z_dim=64,
+        dim_mult=(1, 2, 4, 4, 4),
+        num_res_blocks=1,
+        temperal_downsample=(False, False, False, False),
+        in_channels=4,
+        out_channels=4,
+    )
+    config = QwenImage21VAEConfig(arch_config=ac)
+    config.load_encoder = False
+    vae = AutoencoderKLQwenImage21(config).cuda().bfloat16().eval()
+    torch.manual_seed(0)
+    with torch.no_grad():
+        for name, param in vae.named_parameters():
+            if name.endswith("gamma"):
+                param.copy_(1 + 0.1 * torch.randn_like(param))
+            else:
+                torch.nn.init.normal_(param, std=0.1)
+    return vae
+
+
+def _qwen21_latent(size=4):
+    return torch.randn(1, 64, 1, size, size, device="cuda", dtype=torch.bfloat16)
+
+
+def _modules_of(vae, cls):
+    return [m for m in vae.modules() if isinstance(m, cls)]
+
+
+def _first_divergence(reference, optimized, first_z, z):
+    """Where the optimized decoder first departs from the eager one on ``z``, and which fast path is responsible.
+
+    Both models keep the original module names, so hooks on the residual /
+    up blocks and the output conv line up one to one (the wrapped norms are
+    skipped: the optimized one includes the SiLU). Then fresh optimized copies
+    take their first sight on ``first_z`` with one fast-path family disabled
+    at a time and decode ``z``, so a mismatch names its family without an
+    interactive session.
+    """
+    watched = (
+        "QwenImage21ResidualBlock",
+        "QwenImage21ResidualUpBlock",
+        "QwenImage21MidBlock",
+    )
+    outputs = {"reference": [], "optimized": []}
+    handles = []
+    for tag, model in (("reference", reference), ("optimized", optimized)):
+        for name, m in model.named_modules():
+            if type(m).__name__ in watched or name == "decoder.conv_out":
+                handles.append(
+                    m.register_forward_hook(
+                        lambda mod, inp, out, tag=tag, name=name: outputs[tag].append(
+                            (name, out.detach().clone())
+                        )
+                    )
+                )
+    try:
+        ref_out, opt_out = reference.decode(z), optimized.decode(z)
+    finally:
+        for h in handles:
+            h.remove()
+    blocks = []
+    for (name, ref), (_, opt) in zip(
+        outputs["reference"], outputs["optimized"], strict=True
+    ):
+        if ref.shape != opt.shape or not torch.equal(ref, opt):
+            diff = (ref.float() - opt.float()).abs()
+            blocks.append(
+                f"{name}: max|diff| {diff.max().item():.3e}, "
+                f"{(diff > 0).sum().item()}/{diff.numel()} elements"
+            )
+            if len(blocks) == 3:
+                break
+
+    def decode_without(family):
+        model = qwen21_vae_opt.maybe_optimize_qwen_image21_vae(deepcopy(reference))
+        saved = {
+            name: getattr(qwen21_vae_opt, name)
+            for name in ("_BIAS_RESIDUAL_FUSION", "_UPSAMPLE_BIAS_FUSION")
+        }
+        try:
+            for name in saved:
+                gate = qwen21_vae_opt.BitExactFusionGate(f"isolation {name}")
+                if family == name:
+                    gate.disable()
+                setattr(qwen21_vae_opt, name, gate)
+            for m in model.modules():
+                if family == "padding fold" and isinstance(
+                    m, qwen21_vae_opt.FoldedPadConv2d
+                ):
+                    m._gates["nchw"].disable()
+                    m._gates["nhwc"].disable()
+                if family == "norm+SiLU tail" and isinstance(
+                    m, qwen21_vae_opt.FusedChannelRMSNormSiLU
+                ):
+                    m._exact_gate.disable()
+            model.decode(first_z)  # first sight for the remaining families
+            return torch.equal(model.decode(z), ref_out)
+        finally:
+            for name, gate in saved.items():
+                setattr(qwen21_vae_opt, name, gate)
+
+    families = (
+        "padding fold",
+        "norm+SiLU tail",
+        "_BIAS_RESIDUAL_FUSION",
+        "_UPSAMPLE_BIAS_FUSION",
+    )
+    isolation = ", ".join(
+        f"without {family}: {'equal' if decode_without(family) else 'differs'}"
+        for family in families
+    )
+    return (
+        "decode "
+        + ("equal" if torch.equal(ref_out, opt_out) else "differs")
+        + f"; eager repeats on this latent: {torch.equal(reference.decode(z), ref_out)}"
+        + f"; optimized repeats on this latent: {torch.equal(optimized.decode(z), opt_out)}"
+        + "; first divergent blocks: "
+        + ("; ".join(blocks) if blocks else "none")
+        + "; "
+        + isolation
+    )
+
+
+@pytest.fixture
+def qwen21_deterministic_cudnn():
+    # Bit-exactness is asserted against the eager chain, so both sides must run
+    # deterministic conv algorithms; cuDNN may otherwise pick split-K engines
+    # whose atomics reorder the sum between two calls.
+    previous = torch.backends.cudnn.deterministic
+    torch.backends.cudnn.deterministic = True
+    try:
+        yield
+    finally:
+        torch.backends.cudnn.deterministic = previous
+
+
+@pytest.fixture
+def qwen21_vae_gates(monkeypatch, qwen21_deterministic_cudnn):
+    """Fresh copies of the module-level first-sight gates, so tests do not share state."""
+    gates = {
+        "_BIAS_RESIDUAL_FUSION": qwen21_vae_opt.BitExactFusionGate(
+            "test bias + residual"
+        ),
+        "_UPSAMPLE_BIAS_FUSION": qwen21_vae_opt.BitExactFusionGate(
+            "test upsampler bias"
+        ),
+    }
+    for name, gate in gates.items():
+        monkeypatch.setattr(qwen21_vae_opt, name, gate)
+    return gates
+
+
+@requires_inline_ptx
+@torch.no_grad()
+def test_qwen21_vae_lossless_decode_is_bit_identical(qwen21_vae_gates):
+    reference = _qwen21_vae()
+    optimized = qwen21_vae_opt.maybe_optimize_qwen_image21_vae(deepcopy(reference))
+    # wrappers keep parameter names and values
+    assert set(optimized.state_dict()) == set(reference.state_dict())
+    for key, value in optimized.state_dict().items():
+        assert torch.equal(value, reference.state_dict()[key])
+
+    # 64x64 latent (1024x1024 output): every fold site is above the size floor.
+    z = _qwen21_latent(64)
+    expected = reference.decode(z)
+    assert torch.equal(reference.decode(z), expected), (
+        "the eager decode itself is not reproducible on this platform"
+    )
+    assert torch.equal(optimized.decode(z), expected)
+
+    # Kernels that are exact by construction must have engaged.
+    norm_gates = [
+        m._exact_gate
+        for m in _modules_of(optimized, qwen21_vae_opt.FusedChannelRMSNormSiLU)
+    ]
+    assert len(norm_gates) >= 8
+    for gate in norm_gates + list(qwen21_vae_gates.values()):
+        assert gate.verified and not gate.disabled, gate.name
+    # The padding fold is kept only where cuDNN's kernel for the folded
+    # descriptor reproduces the padded conv bit for bit (true on SM120, not on
+    # H100), so a declined fold is a valid outcome; each conv must have decided.
+    fold_gates = [
+        m._gates["nchw"] for m in _modules_of(optimized, qwen21_vae_opt.FoldedPadConv2d)
+    ]
+    assert len(fold_gates) >= 8
+    assert all(gate.verified or gate.disabled for gate in fold_gates)
+
+    z2 = _qwen21_latent(64)
+    assert torch.equal(optimized.decode(z2), reference.decode(z2)), _first_divergence(
+        reference, optimized, z, z2
+    )
+
+
+@requires_inline_ptx
+@torch.no_grad()
+def test_qwen21_vae_mismatch_falls_back_to_the_eager_chain(
+    qwen21_vae_gates, monkeypatch
+):
+    reference = _qwen21_vae()
+    optimized = qwen21_vae_opt.maybe_optimize_qwen_image21_vae(deepcopy(reference))
+    monkeypatch.setattr(
+        qwen21_vae_opt,
+        "channel_rmsnorm_finish_silu",
+        lambda x, norm, gamma, scale: torch.zeros_like(x),
+    )
+    monkeypatch.setattr(
+        qwen21_vae_opt, "bias_residual_add", lambda y, bias, h: torch.zeros_like(y)
+    )
+    z = _qwen21_latent()
+    assert torch.equal(optimized.decode(z), reference.decode(z))
+    norm_gates = [
+        m._exact_gate
+        for m in _modules_of(optimized, qwen21_vae_opt.FusedChannelRMSNormSiLU)
+    ]
+    assert norm_gates and all(g.disabled and not g.verified for g in norm_gates)
+    bias_gate = qwen21_vae_gates["_BIAS_RESIDUAL_FUSION"]
+    assert bias_gate.disabled and not bias_gate.verified
+
+
+@requires_inline_ptx
+@torch.no_grad()
+def test_qwen21_vae_extra_high_decode_is_close_and_lossless_is_restored(
+    qwen21_vae_gates,
+):
+    reference = _qwen21_vae()
+    optimized = qwen21_vae_opt.maybe_optimize_qwen_image21_vae(deepcopy(reference))
+    upsamplers = [
+        m
+        for m in _modules_of(optimized, QwenImage21Resample)
+        if m.mode.startswith("upsample")
+    ]
+    assert len(upsamplers) == 4
+    assert all(
+        isinstance(m.resample, qwen21_vae_opt.FusedUpsample2xConv) for m in upsamplers
+    )
+
+    z = _qwen21_latent()
+    expected = reference.decode(z)
+    with use_vae_fast_path(optimized, True):
+        fast = optimized.decode(z)
+        assert optimized.decoder._sgl_channels_last
+    torch.testing.assert_close(fast.float(), expected.float(), atol=0.05, rtol=0)
+    # gate off: layout and kernels revert, output is bit-identical again
+    assert torch.equal(optimized.decode(z), expected)
+    assert not optimized.decoder._sgl_channels_last
+
+
+@requires_inline_ptx
+@torch.no_grad()
+def test_qwen21_vae_folded_upsampler_follows_the_weights_and_moves(qwen21_vae_gates):
+    reference = _qwen21_vae()
+    optimized = qwen21_vae_opt.maybe_optimize_qwen_image21_vae(deepcopy(reference))
+    z = _qwen21_latent()
+    with use_vae_fast_path(optimized, True):
+        before = optimized.decode(z)  # builds the folded kernels
+    for model in (reference, optimized):
+        for m in _modules_of(model, QwenImage21Resample):
+            if m.mode.startswith("upsample"):
+                m.resample[1].weight.zero_()
+                m.resample[1].bias.zero_()
+    expected = reference.decode(z)
+    assert not torch.equal(expected, before)
+    with use_vae_fast_path(optimized, True):
+        fast = optimized.decode(z)
+    torch.testing.assert_close(fast.float(), expected.float(), atol=0.05, rtol=0)
+
+    # CPU offload must not leave the folded kernels, or anything else, on the GPU.
+    optimized.to("cpu")
+    for m in optimized.modules():
+        for value in list(vars(m).values()) + list(m._buffers.values()):
+            assert not (isinstance(value, torch.Tensor) and value.is_cuda), type(m)
+    optimized.to("cuda")
+    with use_vae_fast_path(optimized, True):
+        torch.testing.assert_close(
+            optimized.decode(z).float(), expected.float(), atol=0.05, rtol=0
+        )
+
+
+def test_qwen21_vae_fold_rejects_convs_it_cannot_express():
+    good = torch.nn.Conv2d(4, 6, 3, padding=1)
+    assert fold_upsample2x_conv2d_weight(good).shape == (4, 6, 4, 4)
+    for bad in (
+        torch.nn.Conv2d(4, 6, 1),
+        torch.nn.Conv2d(4, 6, 3, padding=1, stride=2),
+        torch.nn.Conv2d(4, 4, 3, padding=1, groups=2),
+        torch.nn.Conv2d(4, 6, 3, padding=1, padding_mode="reflect"),
+    ):
+        with pytest.raises(ValueError):
+            fold_upsample2x_conv2d_weight(bad)
+
+
+def test_qwen21_vae_optimizer_passes_other_vaes_through():
+    assert (
+        qwen21_vae_opt.maybe_optimize_qwen_image21_vae(torch.nn.Linear(2, 2))
+        is not None
+    )
+
+
+@pytest.mark.skipif(torch.version.hip is not None, reason="NVIDIA CUDA required")
+def test_anima_rope_dispatch_and_fallback():
+    import sglang.kernels.ops.diffusion as ops
+    import sglang.multimodal_gen.runtime.models.dits.anima as anima
+
+    generator = torch.Generator(device="cuda").manual_seed(42)
+    q, k = [
+        torch.randn(
+            2, 17, 3, 128, device="cuda", dtype=torch.bfloat16, generator=generator
+        )
+        for _ in range(2)
+    ]
+    angles = torch.randn(17, 128, device="cuda", generator=generator)
+    cos, sin = angles.cos(), angles.sin()
+    args = q, k, cos, sin
+    expected = anima._anima_rope_eager(*args)
+    expected_fp32 = anima._anima_rope_eager(q.float(), k.float(), cos, sin)
+    gate = BitExactFusionGate("Anima test", per_signature=True)
+    with (
+        patch.object(anima, "_ANIMA_ROPE", gate),
+        patch.object(
+            ops, "fused_rope_rotate_half_fp32", wraps=ops.fused_rope_rotate_half_fp32
+        ) as fused,
+        patch.object(
+            anima, "_anima_rope_eager", wraps=anima._anima_rope_eager
+        ) as eager,
+    ):
+        for _ in range(2):
+            outputs = anima._anima_rope(*args)
+            assert all(torch.equal(out, ref) for out, ref in zip(outputs, expected))
+        assert fused.call_count == 2
+        assert eager.call_count == 1  # Only the first call verifies against eager.
+        assert gate.is_verified((q.device, q.dtype, q.shape)) and not gate.disabled
+
+        fused.reset_mock()
+        outputs = anima._anima_rope(q.float(), k.float(), cos, sin)
+        fused.assert_not_called()
+        assert eager.call_count == 2
+        assert all(torch.equal(out, ref) for out, ref in zip(outputs, expected_fp32))
+
+
+@pytest.mark.skipif(not is_cuda(), reason="Requires CUDA PTX")
+@pytest.mark.parametrize("packed", [False, True])
+def test_moss_image_situ_fusion_is_bit_exact_and_verified(monkeypatch, packed):
+    from sglang.kernels.ops.diffusion import BitExactFusionGate
+    from sglang.multimodal_gen.runtime.models.dits import moss_image
+
+    gate_state = BitExactFusionGate("MOSSImage SiTU test")
+    monkeypatch.setattr(moss_image, "_SITU_FUSION", gate_state)
+    torch.manual_seed(0)
+    if packed:
+        projection = torch.randn(1, 19, 256, device="cuda", dtype=torch.bfloat16)
+        hidden, gate = projection.chunk(2, -1)
+    else:
+        hidden = torch.randn(1, 19, 128, device="cuda", dtype=torch.bfloat16)
+        gate = torch.randn_like(hidden)
+    expected = moss_image._situ_native(hidden, gate)
+    for _ in range(2):
+        assert torch.equal(moss_image._situ(hidden, gate), expected)
+    assert gate_state.verified and not gate_state.disabled
+
+
+@pytest.mark.skipif(not is_cuda(), reason="Requires CUDA")
+def test_moss_image_rope_fusion_is_bit_exact_and_verified(monkeypatch):
+    from sglang.kernels.ops.diffusion import BitExactFusionGate
+    from sglang.multimodal_gen.runtime.models.dits import moss_image
+
+    gate_state = BitExactFusionGate("MOSSImage RoPE test")
+    monkeypatch.setattr(moss_image, "_ROPE_FUSION", gate_state)
+    torch.manual_seed(0)
+    x = torch.randn(1, 17, 2, 128, device="cuda", dtype=torch.bfloat16)
+    rope = moss_image._RoPE(128, 10000).cuda()(2, 4, 9, torch.device("cuda"))
+    rope = moss_image._prepare_rope(rope.to(x.dtype))
+    expected = moss_image._rotate_native(x, rope)
+    for _ in range(2):
+        assert torch.equal(moss_image._rotate(x, rope), expected)
+    assert gate_state.verified and not gate_state.disabled
+
+
+def test_moss_image_situ_fusion_mismatch_disables_fast_path(monkeypatch):
+    from sglang.kernels.ops.diffusion import BitExactFusionGate
+    from sglang.multimodal_gen.runtime.models.dits import moss_image
+
+    gate_state = BitExactFusionGate("test SiTU")
+    monkeypatch.setattr(moss_image, "_SITU_FUSION", gate_state)
+    monkeypatch.setattr(
+        moss_image, "can_use_fused_situ_softcap_mul", lambda **kwargs: True
+    )
+    calls = []
+
+    def incorrect(hidden, gate):
+        calls.append(1)
+        return torch.zeros_like(hidden)
+
+    monkeypatch.setattr(moss_image, "fused_situ_softcap_mul_bitexact", incorrect)
+    hidden = torch.ones(1, 2, 4)
+    gate = torch.full_like(hidden, 2)
+    expected = moss_image._situ_native(hidden, gate)
+    for _ in range(2):
+        assert torch.equal(moss_image._situ(hidden, gate), expected)
+    assert gate_state.disabled and not gate_state.verified
+    assert len(calls) == 1
+
+
+def test_moss_image_rope_fusion_mismatch_disables_fast_path(monkeypatch):
+    from sglang.kernels.ops.diffusion import BitExactFusionGate
+    from sglang.multimodal_gen.runtime.models.dits import moss_image
+
+    gate_state = BitExactFusionGate("test RoPE")
+    monkeypatch.setattr(moss_image, "_ROPE_FUSION", gate_state)
+    calls = []
+
+    def incorrect(x, cos, sin):
+        calls.append(1)
+        return torch.zeros_like(x)
+
+    monkeypatch.setattr(moss_image, "fused_rope_rotate_half_bitexact", incorrect)
+    x = torch.ones(1, 3, 2, 16, device="cuda", dtype=torch.bfloat16)
+    rope = tuple(
+        torch.full((1, 3, 16), value, device=x.device, dtype=x.dtype)
+        for value in (0, 1)
+    )
+    for _ in range(2):
+        assert torch.equal(moss_image._rotate(x, rope), x)
+    assert gate_state.disabled and not gate_state.verified
+    assert len(calls) == 1
+
+
+@torch.no_grad()
+@pytest.mark.skipif(not is_cuda(), reason="Requires CUDA PTX")
+@pytest.mark.parametrize("shape", [(1, 4096, 3072), (1, 97, 24, 128)])
+def test_moss_image_rmsnorm_fusion_is_bit_exact_and_verified(monkeypatch, shape):
+    from sglang.kernels.ops.diffusion import BitExactFusionGate
+    from sglang.multimodal_gen.runtime.models.dits import moss_image
+
+    state = BitExactFusionGate("MOSSImage RMSNorm test", per_signature=True)
+    monkeypatch.setattr(moss_image, "_RMSNORM_FUSION", state)
+    norm = moss_image._RMSNorm(shape[-1]).to("cuda", torch.bfloat16)
+    norm.weight.copy_(torch.randn_like(norm.weight))
+    x = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
+    expected = norm.forward_native(x)
+    for _ in range(2):
+        assert torch.equal(norm(x), expected)
+    assert state.verified and not state.disabled
+
+
+@pytest.mark.parametrize("failure", ["mismatch", "exception"])
+def test_moss_image_rmsnorm_failure_disables_fast_path(monkeypatch, failure):
+    from sglang.kernels.ops.diffusion import BitExactFusionGate
+    from sglang.multimodal_gen.runtime.models.dits import moss_image
+
+    state = BitExactFusionGate("MOSSImage RMSNorm test", per_signature=True)
+    monkeypatch.setattr(moss_image, "_RMSNORM_FUSION", state)
+    monkeypatch.setattr(
+        moss_image, "can_use_rmsnorm_cast_before_weight", lambda **kwargs: True
+    )
+    calls = []
+
+    def incorrect(x, weight):
+        calls.append(1)
+        if failure == "exception":
+            raise RuntimeError("kernel unavailable")
+        return torch.zeros_like(x)
+
+    monkeypatch.setattr(moss_image, "rmsnorm_cast_before_weight_bitexact", incorrect)
+    norm = moss_image._RMSNorm(128)
+    x = torch.ones(1, 3, 128)
+    for _ in range(2):
+        assert torch.equal(norm(x), norm.forward_native(x))
+    assert state.disabled and not state.verified and len(calls) == 1
+
+
+@torch.no_grad()
+def test_moss_image_rmsnorm_unsupported_layout_uses_native(monkeypatch):
+    from sglang.kernels.ops.diffusion import BitExactFusionGate
+    from sglang.multimodal_gen.runtime.models.dits import moss_image
+
+    state = BitExactFusionGate("MOSSImage RMSNorm test", per_signature=True)
+    monkeypatch.setattr(moss_image, "_RMSNORM_FUSION", state)
+    norm = moss_image._RMSNorm(128).to("cuda", torch.bfloat16)
+    x = torch.randn(2, 7, 3 * 128, device="cuda", dtype=torch.bfloat16)[..., :128]
+    assert torch.equal(norm(x), norm.forward_native(x))
+    assert not state.verified and not state.disabled
+
+
+@torch.no_grad()
+@pytest.mark.skipif(not is_cuda(), reason="Requires CUDA JIT")
+@pytest.mark.parametrize("batch", [1, 2])
+def test_moss_image_block_modulation_and_residual_match_eager(monkeypatch, batch):
+    from sglang.kernels.ops.diffusion import (
+        can_use_modulate_scale_shift_cuda,
+        can_use_residual_gate_add_cuda,
+        modulate_scale_shift,
+        residual_gate_add,
+    )
+    from sglang.multimodal_gen.runtime.models.dits import moss_image
+
+    class ValueAttention(nn.Module):
+        def forward(self, q, k, v):
+            return v
+
+    monkeypatch.setattr(moss_image, "LocalAttention", lambda **kwargs: ValueAttention())
+    block = moss_image._Block(128, 256, 1).to("cuda", torch.bfloat16)
+    block.attention = ValueAttention()
+    x = torch.randn(batch, 19, 128, device="cuda", dtype=torch.bfloat16)
+    modulation = torch.randn(batch, 6, 128, device="cuda", dtype=x.dtype)
+    rope = (
+        torch.zeros(batch, 19, 128, device="cuda", dtype=x.dtype),
+        torch.ones(batch, 19, 128, device="cuda", dtype=x.dtype),
+    )
+    calls = []
+
+    def modulate(x, scale, shift):
+        calls.append(("modulate", can_use_modulate_scale_shift_cuda(x, scale, shift)))
+        return modulate_scale_shift(x, scale, shift)
+
+    def residual(x, update, gate):
+        calls.append(("residual", can_use_residual_gate_add_cuda(x, update, gate)))
+        return residual_gate_add(x, update, gate)
+
+    monkeypatch.setattr(moss_image, "modulate_scale_shift", modulate)
+    monkeypatch.setattr(moss_image, "residual_gate_add", residual)
+    actual = block(x, rope, modulation)
+    monkeypatch.setattr(
+        moss_image,
+        "modulate_scale_shift",
+        lambda x, s, b: x * (1 + s[:, None]) + b[:, None],
+    )
+    monkeypatch.setattr(moss_image, "residual_gate_add", lambda x, h, g: x + h * g)
+    expected = block(x, rope, modulation)
+    assert torch.equal(actual, expected)
+    assert calls == [("modulate", batch == 1), ("residual", True)] * 2
+
+
+@torch.no_grad()
+@pytest.mark.skipif(not is_cuda(), reason="Requires CUDA PTX and graph capture")
+def test_moss_image_rmsnorm_verifies_each_regime_and_preserves_graph_capture(
+    monkeypatch,
+):
+    from sglang.kernels.ops.diffusion import BitExactFusionGate
+    from sglang.multimodal_gen.runtime.models.dits import moss_image
+
+    state = BitExactFusionGate("MOSSImage RMSNorm test", per_signature=True)
+    monkeypatch.setattr(moss_image, "_RMSNORM_FUSION", state)
+    token_norm = moss_image._RMSNorm(3072).to("cuda", torch.bfloat16)
+    for rows in [13, 17]:
+        x = torch.randn(1, rows, 3072, device="cuda", dtype=torch.bfloat16)
+        assert torch.equal(token_norm(x), token_norm.forward_native(x))
+    assert len(state.verified_sigs) == 2
+
+    head_norm = moss_image._RMSNorm(128).to("cuda", torch.bfloat16)
+    x = torch.randn(1, 19, 128, device="cuda", dtype=torch.bfloat16)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            head_norm.forward_native(x)
+    stream.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        captured = head_norm(x)
+    graph.replay()
+    assert torch.equal(captured, head_norm.forward_native(x))
+    # A previously verified width must not permit a host-synchronizing check
+    # for a new width inside capture.
+    assert len(state.verified_sigs) == 2
+
+    assert torch.equal(head_norm(x), head_norm.forward_native(x))
+    assert len(state.verified_sigs) == 3 and not state.disabled
+    stream.wait_stream(torch.cuda.current_stream())
+    fused_graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(fused_graph, stream=stream):
+        fused = head_norm(x)
+    for _ in range(2):
+        x.copy_(torch.randn_like(x))
+        fused_graph.replay()
+        assert torch.equal(fused, head_norm.forward_native(x))
+
+
+@pytest.mark.skipif(torch.version.hip is not None, reason="Requires CUDA PTX")
+@pytest.mark.parametrize("epilogue", ["modulate", "rope"])
+def test_moss_image_norm_epilogue_gate_and_graph_replay(monkeypatch, epilogue):
+    import sglang.multimodal_gen.runtime.models.dits.moss_image as moss_image
+    from sglang.kernels.ops.diffusion import BitExactFusionGate
+
+    gate = BitExactFusionGate("test norm epilogue")
+    if epilogue == "modulate":
+        monkeypatch.setattr(moss_image, "_NORM_MOD_FUSION", gate)
+        norm = moss_image._RMSNorm(3072).cuda().bfloat16()
+        x = torch.randn(1, 33, 3072, device="cuda", dtype=torch.bfloat16)
+        scale = torch.randn(1, 3072, device="cuda", dtype=torch.bfloat16)
+        shift = torch.randn_like(scale)
+        call = lambda: moss_image._norm_modulate(norm, x, scale, shift)
+        reference = lambda: (
+            norm.forward_native(x) * (1 + scale[:, None]) + shift[:, None]
+        )
+    else:
+        monkeypatch.setattr(moss_image, "_NORM_ROPE_FUSION", gate)
+        norm = moss_image._RMSNorm(128).cuda().bfloat16()
+        x = torch.randn(1, 33, 3072, device="cuda", dtype=torch.bfloat16)
+        rope = tuple(
+            torch.randn(1, 33, 128, device="cuda", dtype=torch.bfloat16)
+            for _ in range(2)
+        )
+        call = lambda: moss_image._norm_rope(norm, x, rope, 24)
+        reference = lambda: moss_image._rotate_native(
+            norm.forward_native(x.unflatten(-1, (24, 128))), rope
+        ).flatten(2)
+    with torch.no_grad():
+        # The unverified graph must capture the existing fallback without a sync.
+        cold = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(cold):
+            cold_out = call()
+        assert not gate.verified
+        assert torch.equal(call(), reference())
+        assert gate.verified and not gate.disabled
+        hot = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(hot):
+            hot_out = call()
+        for _ in range(2):
+            x.copy_(torch.randn_like(x))
+            cold.replay()
+            hot.replay()
+            expected = reference()
+            assert torch.equal(cold_out, expected)
+            assert torch.equal(hot_out, expected)
+
+
+@pytest.mark.skipif(not is_cuda(), reason="Requires CUDA PTX")
+@pytest.mark.parametrize("operation", ["situ", "rmsnorm"])
+@torch.no_grad()
+def test_moss_image_selected_kernel_rejects_mismatched_operands(monkeypatch, operation):
+    """Invalid operands must not silently disable a selected fusion and run eager."""
+    from sglang.kernels.ops.diffusion import BitExactFusionGate
+    from sglang.multimodal_gen.runtime.models.dits import moss_image
+
+    x = torch.ones(1, 17, 128, device="cuda", dtype=torch.bfloat16)
+    if operation == "situ":
+        monkeypatch.setattr(
+            moss_image,
+            "_SITU_FUSION",
+            BitExactFusionGate("MOSSImage invalid input test"),
+        )
+        with pytest.raises(ValueError):
+            moss_image._situ(x, x[:, :-1])
+        assert not moss_image._SITU_FUSION.disabled
+    else:
+        monkeypatch.setattr(
+            moss_image,
+            "_RMSNORM_FUSION",
+            BitExactFusionGate("MOSSImage invalid input test"),
+        )
+        norm = moss_image._RMSNorm(64).to(device="cuda", dtype=torch.bfloat16)
+        with pytest.raises(ValueError):
+            norm(x)
+        assert not moss_image._RMSNORM_FUSION.disabled
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

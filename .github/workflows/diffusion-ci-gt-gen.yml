@@ -19,12 +19,12 @@ on:
         default: ''
         type: string
       publish_target_dir:
-        description: 'Remote target directory in sgl-project/ci-data. Leave empty to use sglang_generated, or official_generated when run_official_cases is true.'
+        description: 'Remote target directory in sgl-project/ci-data-diffusion. Leave empty to use sglang_generated, or official_generated when run_official_cases is true.'
         required: false
         default: ''
         type: string
       kernel_artifact_run_id:
-        description: "Optional sgl-kernel wheel source: GitHub Actions run ID of a pr-test.yml run on the SAME commit as 'ref' that uploaded wheel-python3.10-cuda13.0. Use only when this branch's torch/ABI change makes the PyPI sglang-kernel wheel incompatible. Find it under Actions > pr-test; artifacts expire after 90 days."
+        description: "Optional sgl-kernel wheel source: GitHub Actions run ID of a pr-test.yml run on the SAME commit as 'ref' that uploaded wheel-python3.11-cuda13.0. Use only when this branch's torch/ABI change makes the PyPI sglang-kernel wheel incompatible. Find it under Actions > pr-test; artifacts expire after 90 days."
         required: false
         default: ''
         type: string
@@ -39,10 +39,20 @@ on:
         default: ''
         type: string
       official_source_group:
-        description: 'Official GT source group filter: all, diffusers, wan21, or ltx23. Used only when run_official_cases is true.'
+        description: 'Official GT source group filter: all, diffusers, wan21, ltx, or ltx23. Used only when run_official_cases is true.'
         required: false
         default: ''
         type: string
+      ci_data_ref:
+        description: 'ci-data-diffusion ref to use for repro scripts when running official GT cases.'
+        required: false
+        default: 'main'
+        type: string
+      publish:
+        description: 'Publish the generated GT to sgl-project/ci-data-diffusion. false only uploads the run artifacts, which needs no GH_PAT_FOR_NIGHTLY_CI_DATA.'
+        required: false
+        default: true
+        type: boolean
 
 concurrency:
   group: diffusion-ci-gt-gen-${{ github.ref }}-${{ inputs.output_name || inputs.case_ids || inputs.official_case_ids || inputs.official_source_group || inputs.run_official_cases || 'default' }}
@@ -57,6 +67,7 @@ env:
   SGLANG_CUDA_COREDUMP: "1"
   OUTPUT_NAME: ${{ inputs.output_name || 'diffusion-ci-outputs' }}
   PUBLISH_TARGET_DIR: ${{ inputs.publish_target_dir || (inputs.run_official_cases && 'diffusion-ci/consistency_gt/official_generated' || 'diffusion-ci/consistency_gt/sglang_generated') }}
+  SGLANG_DIFFUSION_GT_PER_PLATFORM: "1"
 
 jobs:
   compute-official-gt-matrix:
@@ -66,6 +77,17 @@ jobs:
       matrix: ${{ steps.compute.outputs.matrix }}
       case-count: ${{ steps.compute.outputs.case-count }}
     steps:
+      - name: Verify write access to sgl-project/ci-data-diffusion
+        if: ${{ inputs.publish }}
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+        run: |
+          if [ "$(gh api repos/sgl-project/ci-data-diffusion --jq .permissions.push)" != "true" ]; then
+            echo "::error::GH_PAT_FOR_NIGHTLY_CI_DATA lacks write (push) access to sgl-project/ci-data-diffusion. Grant it before running GT generation."
+            exit 1
+          fi
+          echo "OK: write access to sgl-project/ci-data-diffusion confirmed"
+
       - name: Compute official case matrix
         id: compute
         env:
@@ -80,6 +102,7 @@ jobs:
               "diffusers": [
                   "flux_2_image_t2i",
                   "flux_2_klein_image_t2i",
+                  "flux_2_klein_base_image_t2i",
                   "flux_2_ti2i",
                   "flux_image_t2i",
                   "qwen_image_edit_2509_ti2i",
@@ -90,6 +113,13 @@ jobs:
                   "zimage_image_t2i",
               ],
               "wan21": ["wan2_1_t2v_1.3b"],
+              "ltx": [
+                  "ltx_2_two_stage_t2v",
+                  "ltx_2.3_two_stage_t2v_2gpus",
+                  "ltx_2_3_two_stage_ti2v_2gpus",
+                  "ltx_2.3_one_stage_ti2v",
+                  "ltx_2_3_hq_pipeline",
+              ],
               "ltx23": [
                   "ltx_2.3_two_stage_t2v_2gpus",
                   "ltx_2.3_one_stage_ti2v",
@@ -97,7 +127,7 @@ jobs:
           }
           source_group = os.environ["OFFICIAL_SOURCE_GROUP"].strip() or "all"
           if source_group == "all":
-              selected_groups = list(groups)
+              selected_groups = ["diffusers", "wan21", "ltx"]
           elif source_group in groups:
               selected_groups = [source_group]
           else:
@@ -108,8 +138,8 @@ jobs:
           h200_cases = {
               "flux_2_image_t2i",
               "flux_2_klein_image_t2i",
+              "flux_2_klein_base_image_t2i",
               "flux_2_ti2i",
-              "ltx_2.3_two_stage_t2v_2gpus",
           }
           include = []
           for group in selected_groups:
@@ -150,27 +180,31 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
 
-      - name: Checkout ci-data repro scripts
+      - name: Checkout ci-data-diffusion repro scripts
         uses: actions/checkout@v4
         with:
-          repository: sgl-project/ci-data
-          ref: main
+          repository: sgl-project/ci-data-diffusion
+          ref: ${{ inputs.ci_data_ref || 'main' }}
           path: ci-data
           token: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+          sparse-checkout: |
+            diffusion-ci/repro_scripts
+            diffusion-ci/consistency_gt/official_generated/case_map.json
+          sparse-checkout-cone-mode: false
 
-      - name: Prepare sgl-kernel/dist for prebuilt wheel
+      - name: Prepare AOT dist for prebuilt wheel
         if: inputs.kernel_artifact_run_id != ''
         run: |
-          ls -alh sgl-kernel/dist || true
-          rm -rf sgl-kernel/dist/* || true
+          ls -alh python/sglang/kernels/aot/dist || true
+          rm -rf python/sglang/kernels/aot/dist/* || true
 
       - name: Download prebuilt sgl-kernel wheel
         if: inputs.kernel_artifact_run_id != ''
         uses: actions/download-artifact@v4
         with:
-          path: sgl-kernel/dist/
+          path: python/sglang/kernels/aot/dist/
           merge-multiple: true
-          name: wheel-python3.10-cuda13.0
+          name: wheel-python3.11-cuda13.0
           run-id: ${{ inputs.kernel_artifact_run_id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -179,15 +213,15 @@ jobs:
           CUSTOM_BUILD_SGL_KERNEL="${{ inputs.kernel_artifact_run_id != '' && 'true' || 'false' }}" \
             bash scripts/ci/cuda/ci_install_dependency.sh diffusion
 
-      - name: Install official LTX-2.3 repro dependencies
-        if: matrix.source_group == 'ltx23'
+      - name: Install official LTX repro dependencies
+        if: matrix.source_group == 'ltx' || matrix.source_group == 'ltx23'
         run: |
-          UV_SYSTEM_PYTHON=1 uv pip install \
+          uv pip install --python "$(command -v python3)" \
             "transformers==4.52.4" \
             openimageio \
             --index-strategy unsafe-best-match \
             --prerelease allow
-          UV_SYSTEM_PYTHON=1 uv pip uninstall kernels
+          uv pip uninstall --python "$(command -v python3)" kernels
 
       - name: Checkout official Wan2.1 repo
         if: matrix.source_group == 'wan21'
@@ -201,7 +235,7 @@ jobs:
           git -C /tmp/mmgen-official-code/Wan2.1 rev-parse HEAD
 
       - name: Checkout official LTX-2 repo
-        if: matrix.source_group == 'ltx23'
+        if: matrix.source_group == 'ltx' || matrix.source_group == 'ltx23'
         run: |
           mkdir -p /tmp/mmgen-official-code
           if [ ! -d /tmp/mmgen-official-code/LTX-2/.git ]; then
@@ -210,65 +244,6 @@ jobs:
           git -C /tmp/mmgen-official-code/LTX-2 fetch --depth 1 origin 41d924371612b692c0fd1e4d9d94c3dfb3c02cb3
           git -C /tmp/mmgen-official-code/LTX-2 checkout 41d924371612b692c0fd1e4d9d94c3dfb3c02cb3
           git -C /tmp/mmgen-official-code/LTX-2 rev-parse HEAD
-
-      - name: Prepare official LTX-2.3 assets
-        if: matrix.source_group == 'ltx23'
-        env:
-          HF_TOKEN: ${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN || secrets.HF_TOKEN }}
-          HUGGING_FACE_HUB_TOKEN: ${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN || secrets.HF_TOKEN }}
-        run: |
-          python - <<'PY'
-          import os
-          from pathlib import Path
-
-          from huggingface_hub import hf_hub_download, snapshot_download
-
-          root = Path.home() / ".cache/sgl_diffusion/materialized_models/Lightricks__LTX-2.3-official-assets"
-          root.mkdir(parents=True, exist_ok=True)
-          text_encoder = root / "text_encoder"
-          tokenizer = root / "tokenizer"
-          text_encoder.mkdir(exist_ok=True)
-          tokenizer.mkdir(exist_ok=True)
-
-          gemma_root = Path(
-              snapshot_download(
-                  repo_id="google/gemma-3-12b-it-qat-q4_0-unquantized",
-                  ignore_patterns=["*.onnx", "*.msgpack"],
-                  max_workers=8,
-              )
-          )
-          tokenizer_names = {
-              "tokenizer.json",
-              "tokenizer.model",
-              "tokenizer_config.json",
-              "special_tokens_map.json",
-          }
-
-          def link(src: Path, dst: Path) -> None:
-              if dst.exists() or dst.is_symlink():
-                  return
-              try:
-                  dst.symlink_to(src)
-              except OSError:
-                  os.link(src, dst)
-
-          for src in gemma_root.iterdir():
-              if not src.is_file():
-                  continue
-              link(src, text_encoder / src.name)
-              if src.name in tokenizer_names:
-                  link(src, tokenizer / src.name)
-
-          for filename in (
-              "ltx-2.3-22b-distilled-lora-384.safetensors",
-              "ltx-2.3-spatial-upscaler-x2-1.1.safetensors",
-          ):
-              src = Path(hf_hub_download("Lightricks/LTX-2.3", filename))
-              link(src, root / filename)
-
-          print(root)
-          print(sorted(p.name for p in root.iterdir()))
-          PY
 
       - name: Generate official output
         env:
@@ -301,17 +276,22 @@ jobs:
               --dtype bf16 \
               --device-map none \
               --generator-device cuda
-          elif [ "$SOURCE_GROUP" = "ltx23" ]; then
+          elif [ "$SOURCE_GROUP" = "ltx" ] || [ "$SOURCE_GROUP" = "ltx23" ]; then
             cd python
+            extra_ltx_args=()
+            if [ "$CASE_ID" = "ltx_2_3_hq_pipeline" ]; then
+              extra_ltx_args+=(--num-frames 24)
+            fi
             set +e
             PYTHONPATH=/tmp/mmgen-official-code/LTX-2/packages/ltx-core/src:/tmp/mmgen-official-code/LTX-2/packages/ltx-pipelines/src:$PWD:$PYTHONPATH \
               python ../ci-data/diffusion-ci/repro_scripts/gen_official_ltx23.py \
                 --out-dir ./${{ env.OUTPUT_NAME }} \
-                --case-ids "$CASE_ID"
+                --case-ids "$CASE_ID" \
+                "${extra_ltx_args[@]}"
             status=$?
             set -e
             if [ "$status" -ne 0 ]; then
-              find ./${{ env.OUTPUT_NAME }} -name 'official_ltx23_manifest.json' -print -exec cat {} \;
+              find ./${{ env.OUTPUT_NAME }} \( -name 'official_ltx_manifest.json' -o -name 'official_ltx23_manifest.json' \) -print -exec cat {} \;
               exit "$status"
             fi
           else
@@ -327,10 +307,21 @@ jobs:
             python/${{ env.OUTPUT_NAME }}/*.jpg
             python/${{ env.OUTPUT_NAME }}/*.png
             python/${{ env.OUTPUT_NAME }}/official_gt_manifest_*.json
+            python/${{ env.OUTPUT_NAME }}/official_ltx_manifest.json
             python/${{ env.OUTPUT_NAME }}/official_ltx23_manifest.json
           retention-days: 7
 
-      - name: Publish official GT images to sgl-project/ci-data
+      - name: Validate generated GT images
+        env:
+          GITHUB_TOKEN: ${{ inputs.publish && secrets.GH_PAT_FOR_NIGHTLY_CI_DATA || github.token }}
+        run: |
+          python scripts/ci/utils/diffusion/publish_diffusion_gt.py \
+            --source-dir python/${{ env.OUTPUT_NAME }} \
+            --target-dir "${{ env.PUBLISH_TARGET_DIR }}" \
+            --check-only
+
+      - name: Publish official GT images to sgl-project/ci-data-diffusion
+        if: ${{ inputs.publish }}
         env:
           GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
         run: |
@@ -360,7 +351,18 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: '3.12'
+
+      - name: Verify write access to sgl-project/ci-data-diffusion
+        if: ${{ inputs.publish }}
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+        run: |
+          if [ "$(gh api repos/sgl-project/ci-data-diffusion --jq .permissions.push)" != "true" ]; then
+            echo "::error::GH_PAT_FOR_NIGHTLY_CI_DATA lacks write (push) access to sgl-project/ci-data-diffusion. Grant it before running GT generation."
+            exit 1
+          fi
+          echo "OK: write access to sgl-project/ci-data-diffusion confirmed"
 
       - name: Compute partitions
         id: compute
@@ -370,7 +372,8 @@ jobs:
             --target-time 1800 \
             --max-time 2400 \
             --max-partitions 10 \
-            --parametrized-only
+            --parametrized-only \
+            ${{ inputs.case_ids != '' && format('--case-ids {0}', inputs.case_ids) || '' }}
 
   multimodal-diffusion-gen-1gpu:
     needs: compute-diffusion-partitions
@@ -388,19 +391,19 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
 
-      - name: Prepare sgl-kernel/dist for prebuilt wheel
+      - name: Prepare AOT dist for prebuilt wheel
         if: inputs.kernel_artifact_run_id != ''
         run: |
-          ls -alh sgl-kernel/dist || true
-          rm -rf sgl-kernel/dist/* || true
+          ls -alh python/sglang/kernels/aot/dist || true
+          rm -rf python/sglang/kernels/aot/dist/* || true
 
       - name: Download prebuilt sgl-kernel wheel
         if: inputs.kernel_artifact_run_id != ''
         uses: actions/download-artifact@v4
         with:
-          path: sgl-kernel/dist/
+          path: python/sglang/kernels/aot/dist/
           merge-multiple: true
-          name: wheel-python3.10-cuda13.0
+          name: wheel-python3.11-cuda13.0
           run-id: ${{ inputs.kernel_artifact_run_id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -430,7 +433,17 @@ jobs:
           path: python/${{ env.OUTPUT_NAME }}
           retention-days: 7
 
-      - name: Publish GT images to sgl-project/ci-data
+      - name: Validate generated GT images
+        env:
+          GITHUB_TOKEN: ${{ inputs.publish && secrets.GH_PAT_FOR_NIGHTLY_CI_DATA || github.token }}
+        run: |
+          python scripts/ci/utils/diffusion/publish_diffusion_gt.py \
+            --source-dir python/${{ env.OUTPUT_NAME }} \
+            --target-dir "${{ env.PUBLISH_TARGET_DIR }}" \
+            --check-only
+
+      - name: Publish GT images to sgl-project/ci-data-diffusion
+        if: ${{ inputs.publish }}
         env:
           GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
         run: |
@@ -454,19 +467,19 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
 
-      - name: Prepare sgl-kernel/dist for prebuilt wheel
+      - name: Prepare AOT dist for prebuilt wheel
         if: inputs.kernel_artifact_run_id != ''
         run: |
-          ls -alh sgl-kernel/dist || true
-          rm -rf sgl-kernel/dist/* || true
+          ls -alh python/sglang/kernels/aot/dist || true
+          rm -rf python/sglang/kernels/aot/dist/* || true
 
       - name: Download prebuilt sgl-kernel wheel
         if: inputs.kernel_artifact_run_id != ''
         uses: actions/download-artifact@v4
         with:
-          path: sgl-kernel/dist/
+          path: python/sglang/kernels/aot/dist/
           merge-multiple: true
-          name: wheel-python3.10-cuda13.0
+          name: wheel-python3.11-cuda13.0
           run-id: ${{ inputs.kernel_artifact_run_id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -477,6 +490,8 @@ jobs:
 
       - name: Generate outputs
         env:
+          HF_TOKEN: ${{ secrets.MINIMAX_H3_HF_TOKEN || secrets.SGLANG_DIFFUSION_CI_HF_TOKEN || secrets.HF_TOKEN }}
+          HUGGING_FACE_HUB_TOKEN: ${{ secrets.MINIMAX_H3_HF_TOKEN || secrets.SGLANG_DIFFUSION_CI_HF_TOKEN || secrets.HF_TOKEN }}
           RUNAI_STREAMER_MEMORY_LIMIT: 0
           PARTITION_PLAN_JSON: ${{ needs.compute-diffusion-partitions.outputs.plan-2gpu }}
         run: |
@@ -496,7 +511,17 @@ jobs:
           path: python/${{ env.OUTPUT_NAME }}
           retention-days: 7
 
-      - name: Publish GT images to sgl-project/ci-data
+      - name: Validate generated GT images
+        env:
+          GITHUB_TOKEN: ${{ inputs.publish && secrets.GH_PAT_FOR_NIGHTLY_CI_DATA || github.token }}
+        run: |
+          python scripts/ci/utils/diffusion/publish_diffusion_gt.py \
+            --source-dir python/${{ env.OUTPUT_NAME }} \
+            --target-dir "${{ env.PUBLISH_TARGET_DIR }}" \
+            --check-only
+
+      - name: Publish GT images to sgl-project/ci-data-diffusion
+        if: ${{ inputs.publish }}
         env:
           GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
         run: |
@@ -520,19 +545,19 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
 
-      - name: Prepare sgl-kernel/dist for prebuilt wheel
+      - name: Prepare AOT dist for prebuilt wheel
         if: inputs.kernel_artifact_run_id != ''
         run: |
-          ls -alh sgl-kernel/dist || true
-          rm -rf sgl-kernel/dist/* || true
+          ls -alh python/sglang/kernels/aot/dist || true
+          rm -rf python/sglang/kernels/aot/dist/* || true
 
       - name: Download prebuilt sgl-kernel wheel
         if: inputs.kernel_artifact_run_id != ''
         uses: actions/download-artifact@v4
         with:
-          path: sgl-kernel/dist/
+          path: python/sglang/kernels/aot/dist/
           merge-multiple: true
-          name: wheel-python3.10-cuda13.0
+          name: wheel-python3.11-cuda13.0
           run-id: ${{ inputs.kernel_artifact_run_id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -562,7 +587,87 @@ jobs:
           path: python/${{ env.OUTPUT_NAME }}
           retention-days: 7
 
-      - name: Publish GT images to sgl-project/ci-data
+      - name: Validate generated GT images
+        env:
+          GITHUB_TOKEN: ${{ inputs.publish && secrets.GH_PAT_FOR_NIGHTLY_CI_DATA || github.token }}
+        run: |
+          python scripts/ci/utils/diffusion/publish_diffusion_gt.py \
+            --source-dir python/${{ env.OUTPUT_NAME }} \
+            --target-dir "${{ env.PUBLISH_TARGET_DIR }}" \
+            --check-only
+
+      - name: Publish GT images to sgl-project/ci-data-diffusion
+        if: ${{ inputs.publish }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+        run: |
+          python scripts/ci/utils/diffusion/publish_diffusion_gt.py \
+            --source-dir python/${{ env.OUTPUT_NAME }} \
+            --target-dir "${{ env.PUBLISH_TARGET_DIR }}"
+
+  multimodal-diffusion-gen-5090:
+    # The 5090 canary suite is six cases; it is generated whole rather than
+    # partitioned, so it needs no entry in the partition plan.
+    needs: compute-diffusion-partitions
+    if: needs.compute-diffusion-partitions.result == 'success'
+    runs-on: 1-gpu-5090
+    timeout-minutes: 150
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Prepare AOT dist for prebuilt wheel
+        if: inputs.kernel_artifact_run_id != ''
+        run: |
+          ls -alh python/sglang/kernels/aot/dist || true
+          rm -rf python/sglang/kernels/aot/dist/* || true
+
+      - name: Download prebuilt sgl-kernel wheel
+        if: inputs.kernel_artifact_run_id != ''
+        uses: actions/download-artifact@v4
+        with:
+          path: python/sglang/kernels/aot/dist/
+          merge-multiple: true
+          name: wheel-python3.11-cuda13.0
+          run-id: ${{ inputs.kernel_artifact_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install dependencies
+        run: |
+          CUSTOM_BUILD_SGL_KERNEL="${{ inputs.kernel_artifact_run_id != '' && 'true' || 'false' }}" \
+            bash scripts/ci/cuda/ci_install_dependency.sh diffusion
+
+      - name: Generate outputs
+        env:
+          RUNAI_STREAMER_MEMORY_LIMIT: 0
+        run: |
+          cd python
+          python -m sglang.multimodal_gen.test.scripts.gen_diffusion_ci_outputs \
+            --suite 1-gpu-5090 \
+            --out-dir ./${{ env.OUTPUT_NAME }} \
+            ${{ inputs.case_ids != '' && format('--case-ids {0}', inputs.case_ids) || '' }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.OUTPUT_NAME }}-5090
+          path: python/${{ env.OUTPUT_NAME }}
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Validate generated GT images
+        env:
+          GITHUB_TOKEN: ${{ inputs.publish && secrets.GH_PAT_FOR_NIGHTLY_CI_DATA || github.token }}
+        run: |
+          python scripts/ci/utils/diffusion/publish_diffusion_gt.py \
+            --source-dir python/${{ env.OUTPUT_NAME }} \
+            --target-dir "${{ env.PUBLISH_TARGET_DIR }}" \
+            --check-only
+
+      - name: Publish GT images to sgl-project/ci-data-diffusion
+        if: ${{ inputs.publish }}
         env:
           GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
         run: |

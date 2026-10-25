@@ -1,29 +1,35 @@
+import itertools
 import random
 import unittest
 
 import torch
 import torch.nn.functional as F
 
-from sglang.srt.layers.attention.triton_ops.decode_attention import (
+from sglang.kernels.ops.attention.decode_attention import (
     decode_attention_fwd,
     decode_attention_fwd_grouped,
     decode_attention_fwd_normal,
 )
-from sglang.srt.layers.attention.triton_ops.extend_attention import (
+from sglang.kernels.ops.attention.extend_attention import (
+    _compact_extend_q_tiles_per_head,
+    align_window_kv_to_tiles,
     build_unified_kv_indices,
     extend_attention_fwd,
     extend_attention_fwd_unified,
-    redundant_attention,
 )
-from sglang.srt.layers.attention.triton_ops.prefill_attention import (
+from sglang.kernels.ops.attention.prefill_attention import (
     context_attention_fwd,
 )
+from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.utils import get_device
+from sglang.srt.utils.common import temp_set_env
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.kernels.extend_attention import redundant_attention
 from sglang.test.test_utils import CustomTestCase, is_in_amd_ci
 
 # Triton attention kernel unit tests (decode, extend, prefill)
-register_cuda_ci(est_time=19, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=30, suite="stage-b-test-1-gpu-small-amd")
 
 
@@ -150,7 +156,6 @@ def decode_attention_fwd_torch(
 
 
 class TestTritonAttention(CustomTestCase):
-
     def _set_all_seeds(self, seed):
         """Set all random seeds for reproducibility."""
         random.seed(seed)
@@ -312,11 +317,218 @@ class TestTritonAttention(CustomTestCase):
     def test_extend_attention(self):
 
         # Define the varying parameter values
-        attention_values = [128, 96, 80, 13]
+        # 256 covers the head_dim > 128 block-size branch (tuned on gfx95)
+        attention_values = [256, 128, 96, 80, 13]
 
         # Loop through the values and call the method
         for value in attention_values:
             self._test_extend_attention_once(19, 12331, 12, 4, value)
+
+    def test_extend_attention_block_sizes(self):
+        from sglang.kernels.ops.attention import extend_attention as ea
+
+        if not ea._is_hip:
+            self.skipTest("HIP-only block-size selection")
+        # head_dim <= 256: tuned tile on gfx95, default elsewhere. 64 is gpt-oss,
+        # 128 is the llama/qwen family, 256 is gemma -- all measured on MI350X.
+        expected = (128, 64, 8) if ea._is_gfx95 else (64, 64, 4)
+        for head_dim in (64, 128, 256):
+            self.assertEqual(
+                ea._get_block_sizes_for_extend_attention(head_dim, head_dim)[3:],
+                expected,
+            )
+        # head_dim > 256 falls back to the default unless the automatic
+        # Triton-3.7 gfx950 Lq=576/Lv=512 spill workaround applies.
+        self.assertEqual(
+            ea._get_block_sizes_for_extend_attention(576, 576)[3:], (64, 64, 4)
+        )
+        with unittest.mock.patch.object(ea, "_is_triton_ge_37", True):
+            expected_spill = (64, 32, 4) if ea._is_gfx95 else (64, 64, 4)
+            self.assertEqual(
+                ea._get_block_sizes_for_extend_attention(576, 512)[3:],
+                expected_spill,
+            )
+        with unittest.mock.patch.object(ea, "_is_triton_ge_37", False):
+            self.assertEqual(
+                ea._get_block_sizes_for_extend_attention(576, 512)[3:],
+                (64, 64, 4),
+            )
+
+    def test_extend_attention_triton37_lq576_n32(self):
+        from sglang.kernels.ops.attention import extend_attention as ea
+
+        if not (ea._is_gfx95 and ea._is_triton_ge_37):
+            self.skipTest("Triton >=3.7 gfx950-only spill workaround")
+
+        device = get_device()
+        dtype = torch.bfloat16
+        extend_lens = [32, 23]
+        prefix_lens = [64, 96]
+        h_q, h_kv, l_q, l_v = 12, 1, 576, 512
+        n_ext, n_prefix = sum(extend_lens), sum(prefix_lens)
+
+        q = torch.randn(n_ext, h_q, l_q, dtype=dtype, device=device)
+        k = torch.randn(n_ext, h_kv, l_q, dtype=dtype, device=device)
+        v = torch.randn(n_ext, h_kv, l_v, dtype=dtype, device=device)
+        k_buffer = torch.randn(n_prefix, h_kv, l_q, dtype=dtype, device=device)
+        v_buffer = torch.randn(n_prefix, h_kv, l_v, dtype=dtype, device=device)
+        qo_indptr = torch.tensor([0, 32, 55], dtype=torch.int32, device=device)
+        kv_indptr = torch.tensor([0, 64, 160], dtype=torch.int32, device=device)
+        kv_indices = torch.arange(n_prefix, dtype=torch.int64, device=device)
+        reference = torch.empty(n_ext, h_q, l_v, dtype=dtype, device=device)
+        candidate = torch.empty_like(reference)
+
+        def run(output):
+            extend_attention_fwd(
+                q,
+                k,
+                v,
+                output,
+                k_buffer,
+                v_buffer,
+                qo_indptr,
+                kv_indptr,
+                kv_indices,
+                None,
+                True,
+                None,
+                max(extend_lens),
+                1.0,
+                1.0,
+                sm_scale=1.0 / (l_q**0.5),
+                extend_seq_lens_cpu=extend_lens,
+            )
+
+        with unittest.mock.patch.object(ea, "_is_triton_ge_37", False):
+            run(reference)
+        with unittest.mock.patch.object(ea, "_is_triton_ge_37", True):
+            run(candidate)
+        torch.testing.assert_close(candidate, reference, atol=2e-2, rtol=1e-2)
+
+    def test_compact_extend_attention_tile_count(self):
+        self.assertEqual(
+            _compact_extend_q_tiles_per_head(
+                batch_size=16,
+                max_len_extend=1000,
+                total_extend_tokens=1015,
+                block_m=64,
+                extend_seq_lens_cpu=[1] * 15 + [1000],
+            ),
+            31,
+        )
+        self.assertEqual(
+            _compact_extend_q_tiles_per_head(
+                batch_size=2,
+                max_len_extend=4224,
+                total_extend_tokens=5376,
+                block_m=64,
+                extend_seq_lens_cpu=[1152, 4224],
+            ),
+            84,
+        )
+        self.assertIsNone(
+            _compact_extend_q_tiles_per_head(
+                batch_size=4,
+                max_len_extend=64,
+                total_extend_tokens=256,
+                block_m=64,
+                extend_seq_lens_cpu=[64, 64, 64, 64],
+            )
+        )
+
+    def test_extend_attention_compact_grid(self):
+        dtype = torch.bfloat16
+        device = get_device()
+        B, H_Q, H_KV, D = 4, 8, 2, 64
+
+        b_seq_len_prefix = torch.tensor(
+            [8, 16, 32, 64], dtype=torch.int32, device=device
+        )
+        b_seq_len_extend = torch.tensor(
+            [1, 7, 13, 129], dtype=torch.int32, device=device
+        )
+        b_seq_len = b_seq_len_prefix + b_seq_len_extend
+        b_start_loc = torch.zeros((B,), dtype=torch.int32, device=device)
+        b_start_loc[1:] = torch.cumsum(b_seq_len[:-1], 0)
+        b_start_loc_extend = torch.zeros((B,), dtype=torch.int32, device=device)
+        b_start_loc_extend[1:] = torch.cumsum(b_seq_len_extend[:-1], 0)
+
+        kv_indptr = torch.zeros((B + 1,), dtype=torch.int32, device=device)
+        kv_indptr[1 : B + 1] = torch.cumsum(b_seq_len_prefix, dim=0)
+        kv_indices = torch.empty(
+            (int(b_seq_len_prefix.sum().item()),), dtype=torch.int32, device=device
+        )
+        for i in range(B):
+            kv_indices[int(kv_indptr[i]) : int(kv_indptr[i + 1])] = torch.arange(
+                int(b_start_loc[i].item()),
+                int(b_start_loc[i].item()) + int(b_seq_len_prefix[i].item()),
+                device=device,
+            )
+
+        total_token_num = int(b_seq_len.sum().item())
+        extend_token_num = int(b_seq_len_extend.sum().item())
+        k_buffer = torch.empty(
+            (total_token_num, H_KV, D), dtype=dtype, device=device
+        ).normal_(mean=0.1, std=0.2)
+        v_buffer = torch.empty(
+            (total_token_num, H_KV, D), dtype=dtype, device=device
+        ).normal_(mean=0.1, std=0.2)
+        k_extend = torch.empty((extend_token_num, H_KV, D), dtype=dtype, device=device)
+        v_extend = torch.empty((extend_token_num, H_KV, D), dtype=dtype, device=device)
+        q_extend = torch.empty((extend_token_num, H_Q, D), dtype=dtype, device=device)
+        for i in range(B):
+            extend_start_in_buffer = b_start_loc[i] + b_seq_len_prefix[i]
+            extend_end_in_buffer = b_start_loc[i] + b_seq_len[i]
+            extend_start = b_start_loc_extend[i]
+            extend_end = b_start_loc_extend[i] + b_seq_len_extend[i]
+            k_extend[extend_start:extend_end] = k_buffer[
+                extend_start_in_buffer:extend_end_in_buffer
+            ]
+            v_extend[extend_start:extend_end] = v_buffer[
+                extend_start_in_buffer:extend_end_in_buffer
+            ]
+            q_extend[extend_start:extend_end] = torch.empty(
+                (int(b_seq_len_extend[i].item()), H_Q, D),
+                dtype=dtype,
+                device=device,
+            ).normal_(mean=0.1, std=0.2)
+
+        max_len_extend = int(b_seq_len_extend.max().item())
+        qo_indptr = torch.zeros((B + 1,), dtype=torch.int32, device=device)
+        qo_indptr[1 : B + 1] = torch.cumsum(b_seq_len_extend, dim=0)
+        extend_seq_lens_cpu = b_seq_len_extend.cpu().tolist()
+
+        o_legacy = torch.empty_like(q_extend)
+        o_compact = torch.empty_like(q_extend)
+        for output, use_compact in ((o_legacy, False), (o_compact, True)):
+            with temp_set_env(
+                allow_sglang=True,
+                SGLANG_TRITON_COMPACT_EXTEND_ATTENTION=str(use_compact),
+            ):
+                extend_attention_fwd(
+                    q_extend,
+                    k_extend,
+                    v_extend,
+                    output,
+                    k_buffer,
+                    v_buffer,
+                    qo_indptr,
+                    kv_indptr,
+                    kv_indices,
+                    custom_mask=None,
+                    is_causal=True,
+                    mask_indptr=None,
+                    max_len_extend=max_len_extend,
+                    k_scale=1.0,
+                    v_scale=1.0,
+                    extend_seq_lens_cpu=extend_seq_lens_cpu,
+                )
+
+        self.assertTrue(
+            torch.allclose(o_legacy, o_compact, rtol=1e-2, atol=1e-3),
+            f"compact grid output differs from legacy grid. "
+            f"Max diff: {(o_legacy - o_compact).abs().max()}",
+        )
 
     def _test_extend_attention_sliding_window_once(
         self, B, N_CTX, H_Q, H_KV, D, WINDOW_SIZE
@@ -655,6 +867,165 @@ class TestTritonAttention(CustomTestCase):
             for B, H_Q, H_KV, D, D_V in configs:
                 self._test_grouped_decode_attention_once(B, S, H_Q, H_KV, D, D_V)
 
+    def test_decode_attention_uneven_batch_graph_replay(self):
+        """One captured decode graph replayed over uniform, padded and ragged batches.
+
+        TritonAttnBackend refreshes num_kv_splits and the uneven_batch flag in place
+        before each replay, and the captured stage-1 kernels read the flag at run time,
+        so every replay must see its own flag and match an eager run without rotation.
+        """
+        device = get_device()
+        dtype = torch.bfloat16
+        bs, pool, D, max_kv_splits = 8, 8192, 128, 8
+        rounds = [
+            ([600] * bs, 0),
+            ([600, 610, 620, 630, 640, 1, 1, 1], 1),  # CUDA-graph padding rows
+            ([600] * bs, 0),
+            ([1000] + [64] * (bs - 1), 1),
+            ([700] * bs, 0),
+        ]
+        for H_Q, H_KV in ((8, 8), (16, 2)):
+            backend = TritonAttnBackend.__new__(TritonAttnBackend)
+            backend.num_head, backend.num_kv_head = H_Q, H_KV
+            backend.max_kv_splits = max_kv_splits
+            backend.device_core_count = torch.cuda.get_device_properties(
+                device
+            ).multi_processor_count
+            backend.static_kv_splits = False
+            backend.enable_deterministic = False
+            backend.split_tile_size = None
+            backend.cuda_graph_num_kv_splits = torch.zeros(
+                bs, dtype=torch.int32, device=device
+            )
+            backend.cuda_graph_uneven_batch = torch.zeros(
+                1, dtype=torch.int32, device=device
+            )
+            backend._update_decode_kv_buffers = lambda plan, n, lens, req: (
+                None,
+                None,
+                None,
+                lens,
+            )
+
+            seq_lens = torch.zeros(bs, dtype=torch.int32, device=device)
+            kv_indptr = torch.zeros(bs + 1, dtype=torch.int32, device=device)
+            kv_indices = torch.zeros(pool, dtype=torch.int64, device=device)
+            q = torch.randn(bs, H_Q, D, dtype=dtype, device=device)
+            k_buffer = torch.randn(pool, H_KV, D, dtype=dtype, device=device)
+            v_buffer = torch.randn(pool, H_KV, D, dtype=dtype, device=device)
+            o = torch.empty(bs, H_Q, D, dtype=dtype, device=device)
+            attn_logits = torch.empty(
+                bs, H_Q, max_kv_splits, D, dtype=torch.float32, device=device
+            )
+            attn_lse = torch.empty(
+                bs, H_Q, max_kv_splits, dtype=torch.float32, device=device
+            )
+
+            def update(lens):
+                seq_lens.copy_(torch.tensor(lens, dtype=torch.int32))
+                kv_indptr[1:] = torch.cumsum(seq_lens, 0)
+                kv_indices[: sum(lens)] = torch.randperm(pool, device=device)[
+                    : sum(lens)
+                ]
+                backend._apply_cuda_graph_metadata(
+                    None, bs, None, seq_lens, ForwardMode.DECODE, None
+                )
+
+            def decode(out, uneven_batch):
+                decode_attention_fwd(
+                    q,
+                    k_buffer,
+                    v_buffer,
+                    out,
+                    kv_indptr,
+                    kv_indices,
+                    attn_logits,
+                    attn_lse,
+                    backend.cuda_graph_num_kv_splits,
+                    max_kv_splits,
+                    D**-0.5,
+                    1.0,
+                    1.0,
+                    enable_lean=False,
+                    uneven_batch=uneven_batch,
+                )
+
+            update(rounds[1][0])
+            decode(o, backend.cuda_graph_uneven_batch)
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                decode(o, backend.cuda_graph_uneven_batch)
+            flag_ptr = backend.cuda_graph_uneven_batch.data_ptr()
+            for lens, uneven in rounds:
+                with self.subTest(H_Q=H_Q, H_KV=H_KV, lens=lens):
+                    update(lens)
+                    graph.replay()
+                    ref = torch.empty_like(o)
+                    decode(ref, None)
+                    self.assertEqual(
+                        backend.cuda_graph_uneven_batch.data_ptr(), flag_ptr
+                    )
+                    self.assertEqual(backend.cuda_graph_uneven_batch.item(), uneven)
+                    self.assertTrue(torch.equal(o, ref))
+
+    def test_decode_attention_large_batch_int64_offset(self):
+        """Regression for int32 Mid_O offset overflow (PR #28788).
+
+        Under deterministic inference, max_kv_splits ~= ceil(context_len / 256)
+        can be ~792 for long-context MLA models. Combined with CUDA-graph batch
+        sizes, batch * num_head * max_kv_splits * head_dim can exceed 2**31 and
+        int32 cur_batch * stride_mid_ob overflows into a GPU memory fault.
+        """
+        device = get_device()
+        dtype = torch.bfloat16
+        B = 64
+        H_Q = 128
+        H_KV = 1
+        D = 576
+        D_V = 512
+        max_kv_splits = 792
+        seq_len = 256
+        total_tokens = B * seq_len
+        sm_scale = 1.0 / (D**0.5)
+        num_kv_splits = torch.full(
+            (B,), max_kv_splits, dtype=torch.int32, device=device
+        )
+
+        q = torch.randn(B, H_Q, D, dtype=dtype, device=device)
+        k_buffer = torch.randn(total_tokens, H_KV, D, dtype=dtype, device=device)
+        v_buffer = torch.randn(total_tokens, H_KV, D_V, dtype=dtype, device=device)
+        o = torch.zeros(B, H_Q, D_V, dtype=dtype, device=device)
+        kv_indptr = torch.arange(
+            0, (B + 1) * seq_len, seq_len, dtype=torch.int32, device=device
+        )
+        kv_indices = torch.arange(total_tokens, device=device)
+        attn_logits = torch.empty(
+            (B, H_Q, max_kv_splits, D_V), dtype=torch.float32, device=device
+        )
+        attn_lse = torch.empty(
+            (B, H_Q, max_kv_splits), dtype=torch.float32, device=device
+        )
+
+        decode_attention_fwd(
+            q,
+            k_buffer,
+            v_buffer,
+            o,
+            kv_indptr,
+            kv_indices,
+            attn_logits,
+            attn_lse,
+            num_kv_splits,
+            max_kv_splits,
+            sm_scale,
+            1.0,
+            1.0,
+            has_mla=True,
+        )
+
+        self.assertTrue(torch.isfinite(o).all())
+
     def _test_extend_attention_unified_vs_regular_once(self, B, N_CTX, H_Q, H_KV, D):
         """Test that unified kernel produces same results as 2-stage kernel."""
         dtype = torch.bfloat16
@@ -806,6 +1177,56 @@ class TestTritonAttention(CustomTestCase):
                     B, N_CTX, H_Q, H_KV, D
                 )
 
+    def test_extend_attention_unified_gfx950_tile_bitwise(self):
+        """Deterministic mode relies on the gfx950 unified-kernel tile keeping the reduction
+        order: its output must equal the default tile's output bit for bit."""
+        from sglang.kernels.ops.attention import extend_attention as ea
+
+        if not ea._is_gfx95:
+            self.skipTest("gfx950-only tile")
+        device = get_device()
+        torch.manual_seed(0)
+        prefix_lens, extend_lens = [0, 1500, 4096], [700, 2048, 333]
+        for H_Q, H_KV, D in ((32, 8, 128), (64, 8, 64)):
+            seq_lens = [p + e for p, e in zip(prefix_lens, extend_lens)]
+            q = torch.randn(
+                sum(extend_lens), H_Q, D, dtype=torch.bfloat16, device=device
+            )
+            k = torch.randn(sum(seq_lens), H_KV, D, dtype=torch.bfloat16, device=device)
+            v = torch.randn_like(k)
+            qo_indptr = torch.tensor(
+                [0, *itertools.accumulate(extend_lens)],
+                dtype=torch.int32,
+                device=device,
+            )
+            kv_indptr = torch.tensor(
+                [0, *itertools.accumulate(seq_lens)], dtype=torch.int32, device=device
+            )
+            kv_indices = torch.arange(sum(seq_lens), dtype=torch.int64, device=device)
+            prefix = torch.tensor(prefix_lens, dtype=torch.int32, device=device)
+
+            def run():
+                o = torch.empty_like(q)
+                extend_attention_fwd_unified(
+                    q,
+                    o,
+                    k,
+                    v,
+                    1.0,
+                    1.0,
+                    qo_indptr,
+                    kv_indptr,
+                    kv_indices,
+                    prefix,
+                    max_len_extend=max(extend_lens),
+                )
+                return o
+
+            o_tuned = run()
+            with unittest.mock.patch.object(ea, "_is_gfx95", False):
+                o_default = run()
+            self.assertTrue(torch.equal(o_tuned, o_default), f"head_dim {D}")
+
     def test_build_unified_kv_indices(self):
         """Test build_unified_kv_indices correctness."""
         B = 4
@@ -864,6 +1285,51 @@ class TestTritonAttention(CustomTestCase):
             # Check that prefix and extend are concatenated correctly
             unified_seq = unified_kv_indices[start_idx:end_idx]
             self.assertEqual(len(unified_seq), prefix_len + extend_len)
+
+    def test_unified_sliding_window_chunked_matches_unchunked(self):
+        """Deterministic inference: a chunk whose window starts off a tile boundary
+        must match the unchunked prefill bit for bit."""
+        torch.manual_seed(0)
+        device = get_device()
+        seq_len, window, prefix = 3000, 128, 2192  # window starts at 2064
+        q = torch.randn(seq_len, 8, 64, dtype=torch.bfloat16, device=device)
+        k = torch.randn(seq_len, 8, 64, dtype=torch.bfloat16, device=device)
+        v = torch.randn_like(k)
+        i32 = lambda *x: torch.tensor(x, dtype=torch.int32, device=device)
+        arange = lambda lo, hi: torch.arange(lo, hi, device=device)
+
+        def run(prefix_len):
+            win = min(prefix_len, window)
+            indptr, indices = align_window_kv_to_tiles(
+                i32(0, win),
+                arange(prefix_len - win, prefix_len),
+                i32(prefix_len - win),
+                1,
+            )
+            extend_len = seq_len - prefix_len
+            kv_indptr, kv_indices, kv_prefix_lens = build_unified_kv_indices(
+                indptr, indices, i32(0), i32(extend_len), arange(prefix_len, seq_len), 1
+            )
+            o = torch.empty_like(q[prefix_len:])
+            extend_attention_fwd_unified(
+                q[prefix_len:],
+                o,
+                k,
+                v,
+                1.0,
+                1.0,
+                i32(0, extend_len),
+                kv_indptr,
+                kv_indices,
+                kv_prefix_lens.to(torch.int32),
+                extend_len,
+                sm_scale=0.125,
+                sliding_window_size=window,
+                window_start_pos=i32(prefix_len) - (indptr[1:] - indptr[:-1]),
+            )
+            return o
+
+        self.assertTrue(torch.equal(run(prefix), run(0)[prefix:]))
 
 
 if __name__ == "__main__":

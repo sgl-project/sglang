@@ -22,17 +22,16 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.kernels.ops.activation.gelu_and_mul_triton import gelu_and_mul_triton
+from sglang.kernels.ops.layernorm.fused_rmsnorm import (
+    fused_dual_residual_rmsnorm,
+    fused_rmsnorm,
+)
+from sglang.kernels.ops.moe.router import fused_moe_router_shim
 from sglang.srt.distributed import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.layers.activation import GeluAndMul
-from sglang.srt.layers.elementwise import (
-    fused_dual_residual_rmsnorm,
-    fused_rmsnorm,
-    gelu_and_mul_triton,
-)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -42,7 +41,6 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
-from sglang.srt.layers.moe.router import fused_moe_router_shim
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -56,10 +54,11 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.runtime_context import get_parallel, get_stream
 from sglang.srt.utils import add_prefix, is_npu
 
 _is_npu = is_npu()
@@ -119,7 +118,6 @@ class Grok1MoE(nn.Module):
         intermediate_size: int,
         params_dtype: Optional[torch.dtype] = None,
         quant_config: Optional[QuantizationConfig] = None,
-        tp_size: Optional[int] = None,
         reduce_results: bool = True,
         use_presharded_weights: bool = False,
         inplace: bool = True,
@@ -163,6 +161,7 @@ class Grok1MoE(nn.Module):
             inplace=inplace,
             no_combine=no_combine,
         )
+        self.topk.bind_runner_backend(self.experts.runner_backend)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if not _is_npu:
@@ -333,21 +332,20 @@ class Grok1Attention(nn.Module):
         self.config = config
         self.layer_id = layer_id
         self.hidden_size = hidden_size
-        attn_tp_rank = get_tensor_model_parallel_rank()
-        attn_tp_size = get_tensor_model_parallel_world_size()
+        tp_size = get_parallel().tp_size
         self.total_num_heads = num_heads
-        assert self.total_num_heads % attn_tp_size == 0
-        self.num_heads = self.total_num_heads // attn_tp_size
+        assert self.total_num_heads % tp_size == 0
+        self.num_heads = self.total_num_heads // tp_size
         self.total_num_kv_heads = num_kv_heads
-        if self.total_num_kv_heads >= attn_tp_size:
+        if self.total_num_kv_heads >= tp_size:
             # Number of KV heads is greater than TP size, so we partition
             # the KV heads across multiple tensor parallel GPUs.
-            assert self.total_num_kv_heads % attn_tp_size == 0
+            assert self.total_num_kv_heads % tp_size == 0
         else:
             # Number of KV heads is less than TP size, so we replicate
             # the KV heads across multiple tensor parallel GPUs.
-            assert attn_tp_size % self.total_num_kv_heads == 0
-        self.num_kv_heads = max(1, self.total_num_kv_heads // attn_tp_size)
+            assert tp_size % self.total_num_kv_heads == 0
+        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
         self.head_dim = getattr(config, "head_dim", 128)
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
@@ -364,8 +362,6 @@ class Grok1Attention(nn.Module):
             self.total_num_kv_heads,
             bias=False,
             quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
             load_presharded_attn=self.load_presharded_attn,
             prefix=add_prefix("qkv_proj", prefix),
         )
@@ -375,8 +371,6 @@ class Grok1Attention(nn.Module):
             bias=False,
             quant_config=quant_config,
             reduce_results=reduce_results,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
             use_presharded_weights=self.load_presharded_attn,
             prefix=add_prefix("o_proj", prefix),
         )
@@ -542,7 +536,7 @@ class Grok1DecoderLayer(nn.Module):
             if self.residual_moe:
                 # NOTE: self.block_sparse_moe modifies the input in-place,
                 # so we have to call it later. Be aware of any possible related errors.
-                if get_tensor_model_parallel_world_size() > 1:
+                if get_parallel().tp_size > 1:
                     self.ffn = lambda x: tensor_model_parallel_all_reduce(
                         self.moe_with_rmoe(x)
                     )
@@ -593,7 +587,7 @@ class Grok1DecoderLayer(nn.Module):
             forward_batch=forward_batch,
         )
 
-        if get_tensor_model_parallel_world_size() > 1:
+        if get_parallel().tp_size > 1:
             hidden_states = tensor_model_parallel_all_reduce(hidden_states)
 
         hidden_states, residual = fused_dual_residual_rmsnorm(
@@ -647,7 +641,7 @@ class Grok1Model(nn.Module):
             prefix=add_prefix("embed_tokens", prefix),
         )
 
-        self.alt_stream = torch.cuda.Stream()
+        self.alt_stream = get_stream("alt")
         self.layers = nn.ModuleList(
             [
                 Grok1DecoderLayer(
@@ -710,7 +704,7 @@ class Grok1ForCausalLM(nn.Module):
         self.load_presharded_moe = (
             getattr(config, "load_presharded_moe", True)
             and self.config.num_local_experts > 0
-            and get_tensor_model_parallel_world_size() > 1
+            and get_parallel().tp_size > 1
         )
         self.load_presharded_attn = getattr(config, "load_presharded_attn", False)
         self.load_presharded_embedding = getattr(
@@ -722,7 +716,7 @@ class Grok1ForCausalLM(nn.Module):
             config, "replicate_lm_head", default_replicate_lm_head
         )
 
-        if get_tensor_model_parallel_world_size() > 1:
+        if get_parallel().tp_size > 1:
             setattr(DefaultModelLoader, "_prepare_weights", _prepare_presharded_weights)
 
         self.replicate_embedding = getattr(config, "replicate_embedding", False)
@@ -939,23 +933,30 @@ class Grok1ForCausalLM(nn.Module):
         return wq + wkv + out + ffn1 + ffn2 + embed
 
     def get_num_params_torch(self):
-        return (
-            sum(p.numel() for p in self.parameters())
-            * get_tensor_model_parallel_world_size()
-        )
+        return sum(p.numel() for p in self.parameters()) * get_parallel().tp_size
 
 
 old_prepare_weights = getattr(DefaultModelLoader, "_prepare_weights")
 
 
 def _prepare_presharded_weights(
-    self, model_name_or_path: str, revision: Optional[str], fall_back_to_pt: bool
+    self,
+    model_name_or_path: str,
+    revision: Optional[str],
+    fall_back_to_pt: bool,
+    allow_patterns_overrides: Optional[list[str]] = None,
 ) -> Tuple[str, list[str], bool]:
     import glob
     import os
 
-    if get_tensor_model_parallel_world_size() == 1:
-        return old_prepare_weights(self, model_name_or_path, revision, fall_back_to_pt)
+    if get_parallel().tp_size == 1 or allow_patterns_overrides is not None:
+        return old_prepare_weights(
+            self,
+            model_name_or_path,
+            revision,
+            fall_back_to_pt,
+            allow_patterns_overrides,
+        )
 
     if not os.path.isdir(model_name_or_path):
         from sglang.srt.model_loader.weight_utils import download_weights_from_hf
@@ -971,7 +972,7 @@ def _prepare_presharded_weights(
     else:
         hf_folder = model_name_or_path
 
-    tp_rank = get_tensor_model_parallel_rank()
+    tp_rank = get_parallel().tp_rank
 
     # The old format
     allow_patterns = [f"*-{tp_rank:03d}.bin"]

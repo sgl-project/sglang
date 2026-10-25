@@ -20,9 +20,18 @@ from typing import TYPE_CHECKING, Optional, Tuple, Union
 import torch
 from torch import nn
 
-from sglang.srt.compilation.compilation_config import register_split_op
-from sglang.srt.compilation.piecewise_context_manager import get_forward_context
-from sglang.srt.utils.custom_op import register_custom_op
+from sglang.srt.model_executor.forward_context import (
+    get_attn_backend,
+)
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    eager_on_graph,
+    is_in_breakable_cuda_graph,
+)
+from sglang.srt.model_executor.runner_utils.forward_batch import get_forward_batch
+from sglang.srt.model_executor.runner_utils.prefill_graph import (
+    is_in_full_prefill_graph,
+    is_in_prefill_graph_scope,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -48,6 +57,7 @@ class RadixLinearAttention(nn.Module):
         activation: str = "silu",
         A_log: Optional[torch.Tensor] = None,
         dt_bias: Optional[torch.Tensor] = None,
+        lower_bound: Optional[float] = None,
     ):
         super().__init__()
         self.layer_id = layer_id
@@ -67,6 +77,14 @@ class RadixLinearAttention(nn.Module):
 
         self.A_log = A_log
         self.dt_bias = dt_bias
+        self.lower_bound = lower_bound
+
+    def refresh_conv_weights(self, weight: torch.Tensor) -> None:
+        """Rebuild the cached convolution view after replacing its parameter."""
+        if weight.dim() == 3 and weight.size(1) == 1:
+            self.conv_weights = weight.view(weight.size(0), weight.size(2))
+        else:
+            self.conv_weights = weight.squeeze() if weight.dim() > 2 else weight
 
     def forward(
         self,
@@ -75,7 +93,18 @@ class RadixLinearAttention(nn.Module):
         a: torch.Tensor,
         b: torch.Tensor,
     ) -> torch.Tensor:
-        if forward_batch.forward_mode.is_extend() and get_forward_context() is not None:
+        is_extend = forward_batch.forward_mode.is_extend()
+        if (
+            is_in_prefill_graph_scope()
+            and is_extend
+            and (
+                is_in_full_prefill_graph()
+                or (
+                    is_in_breakable_cuda_graph()
+                    and forward_batch.forward_mode.is_extend_without_speculative()
+                )
+            )
+        ):
             # Output shape from linear attention: (1, seq_len, num_v_heads, head_v_dim)
             seq_len = mixed_qkv.shape[0]
             output = torch.empty(
@@ -83,67 +112,112 @@ class RadixLinearAttention(nn.Module):
                 dtype=mixed_qkv.dtype,
                 device=mixed_qkv.device,
             )
-            unified_linear_attention_with_output(
-                mixed_qkv,
-                a,
-                b,
-                output,
-                self.layer_id,
-            )
+            if is_in_breakable_cuda_graph() and _linear_extend_in_graph():
+                _linear_attention_with_output_impl(
+                    mixed_qkv, a, b, output, self, forward_batch
+                )
+            else:
+                self._eager_linear_attention(mixed_qkv, a, b, output)
             return output
-        else:
-            return forward_batch.attn_backend.forward(
-                layer=self,
-                forward_batch=forward_batch,
+
+        # Target verify rebuilds query_start_loc from the physical padded input,
+        # unlike ordinary extend where it retains the logical sequence ends.
+        should_trim_padded_extend = (
+            is_extend and not forward_batch.forward_mode.is_target_verify()
+        )
+        real_num_tokens = (
+            forward_batch.global_num_token_non_padded_cpu
+            if should_trim_padded_extend
+            else None
+        )
+        if real_num_tokens is not None and real_num_tokens < mixed_qkv.shape[0]:
+            # DP synchronization may append physical rows beyond the logical varlen
+            # layout; compute its real prefix, then restore the downstream shape.
+            output = torch.empty(
+                (1, mixed_qkv.shape[0], self.num_v_heads, self.head_v_dim),
+                dtype=mixed_qkv.dtype,
+                device=mixed_qkv.device,
+            )
+            _linear_attention_with_output_impl(
                 mixed_qkv=mixed_qkv,
                 a=a,
                 b=b,
+                output=output,
+                attention_layer=self,
+                forward_batch=forward_batch,
             )
+            return output
+
+        return get_attn_backend().forward(
+            layer=self,
+            forward_batch=forward_batch,
+            mixed_qkv=mixed_qkv,
+            a=a,
+            b=b,
+        )
+
+    def _capture_stub_linear_attention(self, mixed_qkv, a, b, output):
+        output.zero_()
+
+    @eager_on_graph(capture_stub=_capture_stub_linear_attention)
+    def _eager_linear_attention(self, mixed_qkv, a, b, output):
+        forward_batch = get_forward_batch()
+        _linear_attention_with_output_impl(mixed_qkv, a, b, output, self, forward_batch)
 
 
-@register_custom_op(mutates_args=["output"])
-@register_split_op()
-def unified_linear_attention_with_output(
+def _linear_attention_with_output_impl(
     mixed_qkv: torch.Tensor,
     a: torch.Tensor,
     b: torch.Tensor,
     output: torch.Tensor,
-    layer_id: int,
+    attention_layer: RadixLinearAttention,
+    forward_batch: ForwardBatch,
 ) -> None:
-    """
-    Custom op wrapper for linear attention computation only.
-    """
-    context = get_forward_context()
-    forward_batch = context.forward_batch
-    attention_layers = context.attention_layers
-    attention_layer = attention_layers[layer_id]
-    real_num_tokens = forward_batch.num_token_non_padded_cpu
+    """Run linear attention on the real prefix and initialize physical padding."""
+    real_num_tokens = min(
+        forward_batch.global_num_token_non_padded_cpu, mixed_qkv.shape[0]
+    )
+    if real_num_tokens == 0:
+        # A fully masked batch (an idle DP rank) needs no attention or state
+        # update, and GDN prefill kernels reject an empty varlen batch.
+        output.zero_()
+        return
 
     original_out_cache_loc = forward_batch.out_cache_loc
-    original_out_cache_loc_swa = forward_batch.out_cache_loc_swa
-    token_to_kv_pool = forward_batch.token_to_kv_pool
-    original_swa_loc = getattr(token_to_kv_pool, "swa_loc", None)
     # Keep the original ForwardBatch object and only narrow cache locations for
     # this backend call so model/backend state is still written to the same batch.
     forward_batch.out_cache_loc = original_out_cache_loc[:real_num_tokens]
-    if original_out_cache_loc_swa is not None:
-        forward_batch.out_cache_loc_swa = original_out_cache_loc_swa[:real_num_tokens]
-        if hasattr(token_to_kv_pool, "set_swa_loc"):
-            token_to_kv_pool.set_swa_loc(forward_batch.out_cache_loc_swa)
+    logical_output = output[:, :real_num_tokens]
+    try:
+        ret = get_attn_backend().forward(
+            layer=attention_layer,
+            forward_batch=forward_batch,
+            mixed_qkv=mixed_qkv[:real_num_tokens],
+            a=a.narrow(0 if a.ndim == 2 else 1, 0, real_num_tokens),
+            b=b.narrow(0 if b.ndim == 2 else 1, 0, real_num_tokens),
+            linear_attn_output=logical_output,
+        )
+    finally:
+        forward_batch.out_cache_loc = original_out_cache_loc
 
-    ret = forward_batch.attn_backend.forward(
-        layer=attention_layer,
-        forward_batch=forward_batch,
-        mixed_qkv=mixed_qkv[:real_num_tokens],
-        a=a[:real_num_tokens],
-        b=b[:real_num_tokens],
+    # FlashInfer GDN can write directly into the physical output's logical
+    # prefix. Other backends return their own tensor and keep the copy fallback.
+    if ret.data_ptr() != logical_output.data_ptr():
+        logical_output.copy_(ret)
+    # Physical padding participates in following residual, router, expert/MoE,
+    # and collective operations. Keep those inputs finite and deterministic.
+    output[:, real_num_tokens:].zero_()
+
+
+def _linear_extend_in_graph() -> bool:
+    """Whether the backend runs this breakable prefill capture's linear extend
+    on static tables inside the graph (no eager break at the layer)."""
+    from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+        HybridLinearAttnBackend,
     )
-    forward_batch.out_cache_loc = original_out_cache_loc
-    forward_batch.out_cache_loc_swa = original_out_cache_loc_swa
-    if original_out_cache_loc_swa is not None and hasattr(
-        token_to_kv_pool, "set_swa_loc"
-    ):
-        token_to_kv_pool.set_swa_loc(original_swa_loc)
 
-    output[:, :real_num_tokens].copy_(ret)
-    return
+    backend = get_attn_backend()
+    return (
+        isinstance(backend, HybridLinearAttnBackend)
+        and backend.linear_extend_in_graph()
+    )

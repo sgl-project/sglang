@@ -1,0 +1,1024 @@
+//! Runtime configuration: the rust-server boot knobs
+//! ([`RustServerServerArgs`]), the scheduler's typed `server_args` handoff
+//! ([`ServerArgs`] / [`ModelConfig`] / [`MetricsConfig`]), the
+//! [`RuntimeConfig`] pairing them for `runtime::start`, and the Rust MM
+//! pipeline handoff ([`MmSpec`]).
+//!
+//! [`ServerArgs`] / [`ModelConfig`] / [`MetricsConfig`] /
+//! [`DefaultSamplingParams`] / [`DisaggregationMode`] / [`MmSpec`] /
+//! [`MmFamily`] / [`MmResample`] are
+//! also `#[pyclass]`es: the Python scheduler (`RustServer._build_server_args`
+//! / `_build_mm_spec`) constructs them directly by keyword and hands them to
+//! `Server`. There is one schema — this file — and
+//! pyo3 enforces it at construction: every field is a required, typed
+//! constructor argument, so a drifted caller fails at boot rather than running
+//! on a silently-defaulted knob. The `#[pyo3::pymethods]` constructors below
+//! each struct — plus the hand-written extractions,
+//! [`PreferredSamplingParams`] and [`LaunchServerInfo`] — are the only
+//! Python-facing code in this file;
+//! the rest is pure Rust.
+
+use std::collections::BTreeMap;
+use std::net::SocketAddr;
+use std::sync::Arc;
+
+use serde::{Deserialize, Serialize};
+
+/// Boot knobs specific to the embedded rust server — none of these exist in
+/// the Python-built [`ServerArgs`]; they arrive as explicit
+/// `Server::start` parameters.
+#[derive(Clone, Debug)]
+pub struct RustServerServerArgs {
+    pub http_addr: SocketAddr,
+    /// The gRPC transport's listen address; `None` keeps it disabled.
+    pub grpc_addr: Option<SocketAddr>,
+    pub http_api_worker_num: usize,
+    pub to_scheduler_cap: usize,
+    pub from_scheduler_cap: usize,
+    pub stage_channel_cap: usize,
+    /// CPU core ids the pools pin to (e.g. this rank's NUMA-local cores minus
+    /// the scheduler's reserved launch cores). `None` → run unpinned.
+    pub cores: Option<Vec<usize>>,
+    /// This listener serves the node's `/metrics` (when metrics are on). Only
+    /// the base port does: every listener would render the same node-wide
+    /// files, so a scraper of each DP rank's port would count them N times.
+    pub metrics_listener: bool,
+}
+
+impl Default for RustServerServerArgs {
+    fn default() -> Self {
+        Self {
+            http_addr: "127.0.0.1:30000".parse().unwrap(),
+            grpc_addr: None,
+            http_api_worker_num: 2,
+            to_scheduler_cap: 8192,
+            from_scheduler_cap: 8192,
+            stage_channel_cap: 8192,
+            cores: None,
+            metrics_listener: true,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct RuntimeConfig {
+    /// Rust-server-only boot knobs (listen address, pool/ring sizes, pinning).
+    pub rust_server_args: RustServerServerArgs,
+    /// The scheduler's [`ServerArgs`] (worker counts, tokenizer source,
+    /// config-endpoint metadata). `Arc` so cloning the config (and, downstream,
+    /// each `AppState`) is cheap; immutable after construction.
+    pub server_args: Arc<ServerArgs>,
+    /// A model package's keys for native `/generate` frames.
+    pub generate_hook: Option<Arc<dyn crate::GenerateHook>>,
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        Self {
+            rust_server_args: RustServerServerArgs::default(),
+            server_args: Arc::new(ServerArgs::default()),
+            generate_hook: None,
+        }
+    }
+}
+
+/// The scheduler's launch-time handoff (`RustServer._build_server_args`):
+/// the `server_args` fields the rust server reads, the resolved
+/// [`ModelConfig`], and launch-time stamps. Values are post-`__post_init__`
+/// (all paths and names resolved). Constructed from Python via the `#[new]` in
+/// `lib.rs`, whose keyword parameters are exactly these fields.
+#[pyo3::pyclass(frozen, from_py_object, module = "sglang.srt.rust_extensions._server")]
+#[derive(Clone, Debug)]
+pub struct ServerArgs {
+    /// HF repo id / local dir of the model, reported by `/get_model_info`.
+    pub model_path: String,
+    /// Model name reported by `/v1/models` and `/server_info`.
+    pub served_model_name: String,
+    /// Tokenizer source (model dir / `tokenizer.json` / HF repo id). Empty only
+    /// in standalone (test) configs — then boot requires `skip_tokenizer_init`.
+    pub tokenizer_path: String,
+    /// HF revision, used only when `tokenizer_path` is a repo id. `None` → main.
+    pub revision: Option<String>,
+    /// Weight format selected by `--load-format`, reported by `/get_model_info`.
+    /// The blob carries the post-`__post_init__` value (`auto` is already
+    /// narrowed to `gguf` / `mistral` / `runai_streamer` / `remote` where the
+    /// checkpoint demands it). Not consumed for loading -- the scheduler owns
+    /// that; `None` only when the blob omits the key.
+    pub load_format: Option<String>,
+    /// Operator-supplied weight version, reported by `/model_info`. Defaults to
+    /// `"default"` on the Python side, so it is present in every blob; `None`
+    /// only when the blob omits the key.
+    pub weight_version: Option<String>,
+    /// HiCache storage backend configured at startup.
+    pub hicache_storage_backend: Option<String>,
+    /// Backend-specific configuration as a JSON string.
+    pub hicache_storage_backend_extra_config: Option<String>,
+    /// Policy for prefetching cached entries from HiCache storage.
+    pub hicache_storage_prefetch_policy: Option<String>,
+    /// Write policy for the hierarchical cache.
+    pub hicache_write_policy: Option<String>,
+    /// HTTP bind address (see [`Self::bind`]).
+    pub host: String,
+    pub port: u16,
+    /// Optional gRPC base port. The same per-rank offset as HTTP is applied at
+    /// the Python→Rust startup boundary; `None` keeps gRPC disabled.
+    pub grpc_port: Option<u16>,
+    /// Log levels driving the access log — uvicorn runs at
+    /// `log_level_http or log_level` (see [`Self::http_access_log_enabled`]).
+    pub log_level: String,
+    pub log_level_http: Option<String>,
+    /// Optional built-in chat-template name or path to a Jinja/legacy JSON
+    /// template file. Without an override, uses the tokenizer config template.
+    pub chat_template: Option<String>,
+    /// Parser selected by `--tool-call-parser`.
+    pub tool_call_parser: Option<String>,
+    /// Reasoning splitter selected by `--reasoning-parser` (e.g. deepseek-r1).
+    /// When set, chat completions strip the model's reasoning markers out of
+    /// `content` into `reasoning_content` — both unary and streaming.
+    pub reasoning_parser: Option<String>,
+    /// Python's global default for whether an SSE stream ends with a usage chunk.
+    pub stream_response_default_include_usage: bool,
+    /// Pinned tokenizer threads / detok shards (Python asserts both ≥ 1).
+    pub tokenizer_worker_num: usize,
+    pub detokenizer_worker_num: usize,
+    /// Token-ids-in / token-ids-out mode: no tokenizer load, raw `output_ids`
+    /// frames.
+    pub skip_tokenizer_init: bool,
+    /// Start accepting health checks immediately instead of waiting for the
+    /// main process's startup warmup request to finish.
+    pub skip_server_warmup: bool,
+    /// Extra headers on a successful `/health_generate` response, for a router
+    /// that reads deployment metadata off the deep health probe.
+    pub health_generate_headers: BTreeMap<String, String>,
+    /// Priority given to a generation request that sets none; `None` unless
+    /// priority scheduling is on (Python `_set_default_priority`).
+    pub default_priority_value: Option<i64>,
+    /// Apply the router's `x-override-*` headers to `/generate` bodies
+    /// (`SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES`).
+    pub enable_request_header_overrides: bool,
+    /// Streamed `/generate` frames carry per-step deltas instead of cumulative
+    /// text. Matches the Python `TokenizerManager`.
+    pub incremental_streaming_output: bool,
+    /// PD-disaggregation role. (On prefill, the KV bootstrap registry is mounted
+    /// on the api router — see [`Self::enable_pd_bootstrap`].)
+    pub disaggregation_mode: DisaggregationMode,
+    /// The resolved Python `ModelConfig`, attached at handoff time.
+    pub model_config: ModelConfig,
+    /// Launch-time sampling defaults merged beneath per-request values and
+    /// advertised by `/get_model_info`.
+    pub preferred_sampling_params: Option<PreferredSamplingParams>,
+    /// What a `/generate` request that sends no `max_new_tokens` (and gets
+    /// none from `preferred_sampling_params`) asks for: Python's
+    /// `SamplingParams` default unless the launcher overrides it. `None` is
+    /// no limit, which the scheduler clamps to the context window.
+    pub default_max_new_tokens: Option<i64>,
+    /// Native-generation launch policy normally applied by Python ingress.
+    pub lora_ids: BTreeMap<String, String>,
+    pub enable_strict_thinking: bool,
+    /// Per-modality media-count limits from `--limit-mm-data-per-request`, in
+    /// configured order: Python checks them in that order and reports the first
+    /// one exceeded. Empty means no per-modality limit.
+    pub limit_mm_data_per_request: Vec<(String, usize)>,
+    /// Over-long inputs are truncated to fit the context instead of 400ing, and
+    /// `max_new_tokens` is clamped rather than rejected (Python
+    /// `TokenizerManager._validate_one_request`).
+    pub allow_auto_truncate: bool,
+    /// `return_hidden_states` is refused unless the server was launched with it:
+    /// the scheduler simply won't produce them, so the request would 200 with the
+    /// field silently missing.
+    pub enable_return_hidden_states: bool,
+    /// Output slots reserved per request on top of its input (eagle stores draft
+    /// tokens there). Not a `server_args` field — `TokenizerManager` derives it and
+    /// `RustServer._build_server_args` stamps it in, so both sides count alike.
+    pub num_reserved_tokens: u64,
+    /// `/v1/tokenize`'s `max_model_len`: the Python tokenizer's
+    /// `model_max_length` (`-1` when it has none), or the context length when
+    /// that is not a 64-bit integer.
+    pub tokenizer_model_max_length: i64,
+    /// Launch-time stamps (not `server_args` fields): sglang package version
+    /// and the scheduler-derived KV token capacity, reported by `/server_info`.
+    pub version: String,
+    pub max_total_num_tokens: u64,
+    /// Resolved deployment metadata used by out-of-process orchestrators.
+    pub deployment_info: DeploymentInfo,
+    /// Python's `/server_info` fields that are fixed at launch, which
+    /// `/server_info` reports beneath its runtime fields.
+    pub launch_server_info: LaunchServerInfo,
+    /// The scheduler's shared-memory load snapshot file, its DP rank count and
+    /// this listener's own slot, which `/v1/loads` reads (`None` when snapshots
+    /// go over ZMQ instead), plus the accelerator name and per-rank count that
+    /// endpoint reports.
+    pub load_snapshot_path: Option<String>,
+    pub load_snapshot_dp_size: usize,
+    pub load_snapshot_dp_rank: usize,
+    pub accelerator: Option<String>,
+    pub num_accelerators: u32,
+    /// Prometheus metrics (`--enable-metrics`); `None` serves no `/metrics`.
+    pub metrics: Option<MetricsConfig>,
+}
+
+#[pyo3::pymethods]
+impl ServerArgs {
+    #[new]
+    #[pyo3(signature = (*,
+        model_path,
+        served_model_name,
+        tokenizer_path,
+        revision,
+        load_format,
+        weight_version,
+        hicache_storage_backend,
+        hicache_storage_backend_extra_config,
+        hicache_storage_prefetch_policy,
+        hicache_write_policy,
+        host,
+        port,
+        grpc_port,
+        log_level,
+        log_level_http,
+        chat_template,
+        tool_call_parser,
+        reasoning_parser,
+        stream_response_default_include_usage,
+        tokenizer_worker_num,
+        detokenizer_worker_num,
+        skip_tokenizer_init,
+        skip_server_warmup,
+        health_generate_headers,
+        default_priority_value,
+        enable_request_header_overrides,
+        incremental_streaming_output,
+        disaggregation_mode,
+        model_config,
+        preferred_sampling_params,
+        default_max_new_tokens,
+        lora_ids,
+        enable_strict_thinking,
+        limit_mm_data_per_request,
+        allow_auto_truncate,
+        enable_return_hidden_states,
+        num_reserved_tokens,
+        tokenizer_model_max_length,
+        version,
+        max_total_num_tokens,
+        deployment_info,
+        launch_server_info,
+        load_snapshot_path,
+        load_snapshot_dp_size,
+        load_snapshot_dp_rank,
+        accelerator,
+        num_accelerators,
+        metrics,
+    ))]
+    // The parameter list IS the schema; one keyword per field, all required.
+    #[allow(clippy::too_many_arguments)]
+    fn py_new(
+        model_path: String,
+        served_model_name: String,
+        tokenizer_path: String,
+        revision: Option<String>,
+        load_format: Option<String>,
+        weight_version: Option<String>,
+        hicache_storage_backend: Option<String>,
+        hicache_storage_backend_extra_config: Option<String>,
+        hicache_storage_prefetch_policy: Option<String>,
+        hicache_write_policy: Option<String>,
+        host: String,
+        port: u16,
+        grpc_port: Option<u16>,
+        log_level: String,
+        log_level_http: Option<String>,
+        chat_template: Option<String>,
+        tool_call_parser: Option<String>,
+        reasoning_parser: Option<String>,
+        stream_response_default_include_usage: bool,
+        tokenizer_worker_num: usize,
+        detokenizer_worker_num: usize,
+        skip_tokenizer_init: bool,
+        skip_server_warmup: bool,
+        health_generate_headers: BTreeMap<String, String>,
+        default_priority_value: Option<i64>,
+        enable_request_header_overrides: bool,
+        incremental_streaming_output: bool,
+        disaggregation_mode: DisaggregationMode,
+        model_config: ModelConfig,
+        preferred_sampling_params: Option<PreferredSamplingParams>,
+        default_max_new_tokens: Option<i64>,
+        lora_ids: BTreeMap<String, String>,
+        enable_strict_thinking: bool,
+        limit_mm_data_per_request: Vec<(String, usize)>,
+        allow_auto_truncate: bool,
+        enable_return_hidden_states: bool,
+        num_reserved_tokens: u64,
+        tokenizer_model_max_length: i64,
+        version: String,
+        max_total_num_tokens: u64,
+        deployment_info: DeploymentInfo,
+        launch_server_info: LaunchServerInfo,
+        load_snapshot_path: Option<String>,
+        load_snapshot_dp_size: usize,
+        load_snapshot_dp_rank: usize,
+        accelerator: Option<String>,
+        num_accelerators: u32,
+        metrics: Option<MetricsConfig>,
+    ) -> Self {
+        Self {
+            model_path,
+            served_model_name,
+            tokenizer_path,
+            revision,
+            load_format,
+            weight_version,
+            hicache_storage_backend,
+            hicache_storage_backend_extra_config,
+            hicache_storage_prefetch_policy,
+            hicache_write_policy,
+            host,
+            port,
+            grpc_port,
+            log_level,
+            log_level_http,
+            chat_template,
+            tool_call_parser,
+            reasoning_parser,
+            stream_response_default_include_usage,
+            tokenizer_worker_num,
+            detokenizer_worker_num,
+            skip_tokenizer_init,
+            skip_server_warmup,
+            health_generate_headers,
+            default_priority_value,
+            enable_request_header_overrides,
+            incremental_streaming_output,
+            disaggregation_mode,
+            model_config,
+            preferred_sampling_params,
+            default_max_new_tokens,
+            lora_ids,
+            enable_strict_thinking,
+            limit_mm_data_per_request,
+            allow_auto_truncate,
+            enable_return_hidden_states,
+            num_reserved_tokens,
+            tokenizer_model_max_length,
+            version,
+            max_total_num_tokens,
+            deployment_info,
+            launch_server_info,
+            load_snapshot_path,
+            load_snapshot_dp_size,
+            load_snapshot_dp_rank,
+            accelerator,
+            num_accelerators,
+            metrics,
+        }
+    }
+}
+
+impl Default for ServerArgs {
+    /// A standalone (test) config: no model, no tokenizer, unified role, but a
+    /// complete `model_config` so the runtime boots. Real launches never use
+    /// this — Python supplies every field.
+    fn default() -> Self {
+        Self {
+            model_path: String::new(),
+            served_model_name: String::new(),
+            tokenizer_path: String::new(),
+            revision: None,
+            load_format: None,
+            weight_version: None,
+            hicache_storage_backend: None,
+            hicache_storage_backend_extra_config: None,
+            hicache_storage_prefetch_policy: None,
+            hicache_write_policy: None,
+            host: "127.0.0.1".into(),
+            port: 30000,
+            grpc_port: None,
+            log_level: "info".into(),
+            log_level_http: None,
+            chat_template: None,
+            tool_call_parser: None,
+            reasoning_parser: None,
+            stream_response_default_include_usage: false,
+            tokenizer_worker_num: 1,
+            detokenizer_worker_num: 1,
+            skip_tokenizer_init: false,
+            skip_server_warmup: false,
+            health_generate_headers: BTreeMap::new(),
+            default_priority_value: None,
+            enable_request_header_overrides: false,
+            incremental_streaming_output: false,
+            disaggregation_mode: DisaggregationMode::Null,
+            model_config: ModelConfig::default(),
+            preferred_sampling_params: None,
+            default_max_new_tokens: Some(128),
+            lora_ids: BTreeMap::new(),
+            enable_strict_thinking: false,
+            limit_mm_data_per_request: Vec::new(),
+            allow_auto_truncate: false,
+            enable_return_hidden_states: false,
+            num_reserved_tokens: 0,
+            tokenizer_model_max_length: -1,
+            version: String::new(),
+            max_total_num_tokens: 0,
+            deployment_info: DeploymentInfo::default(),
+            launch_server_info: LaunchServerInfo::default(),
+            load_snapshot_path: None,
+            load_snapshot_dp_size: 0,
+            load_snapshot_dp_rank: 0,
+            accelerator: None,
+            num_accelerators: 0,
+            metrics: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct DeploymentInfo {
+    pub disaggregation_bootstrap_port: Option<u16>,
+    pub node_rank: u32,
+    pub nnodes: u32,
+    pub dp_size: u32,
+    pub dp_rank: Option<u32>,
+    pub dist_init_addr: Option<String>,
+    pub base_gpu_id: u32,
+    pub page_size: Option<u32>,
+    pub dcp_size: u32,
+    pub max_running_requests: Option<u64>,
+    pub max_prefill_tokens: u64,
+    pub enable_dp_attention: bool,
+    pub speculative_algorithm: Option<String>,
+    pub enable_hierarchical_cache: bool,
+    pub hicache_ratio: Option<f64>,
+    pub hicache_size: u64,
+    pub hicache_write_policy: Option<String>,
+    pub hicache_host_total_tokens: Option<u64>,
+    pub kv_event_sources: Vec<KvEventSource>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct KvEventSource {
+    pub dp_rank: u32,
+    pub endpoint: String,
+    pub topic: String,
+    pub block_size: u32,
+}
+
+impl<'py> pyo3::FromPyObject<'_, 'py> for DeploymentInfo {
+    type Error = pyo3::PyErr;
+
+    fn extract(obj: pyo3::Borrowed<'_, 'py, pyo3::PyAny>) -> pyo3::PyResult<Self> {
+        let text = obj.extract::<String>()?;
+        serde_json::from_str(&text).map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "deployment_info is not valid JSON: {e}"
+            ))
+        })
+    }
+}
+
+/// Prometheus metrics, as Python serves them with `--enable-metrics`.
+#[pyo3::pyclass(frozen, from_py_object, module = "sglang.srt.rust_extensions._server")]
+#[derive(Clone, Debug)]
+pub struct MetricsConfig {
+    /// `PROMETHEUS_MULTIPROC_DIR`: every process's prometheus_client files,
+    /// which `/metrics` merges on each scrape. The frontend writes its own
+    /// request metrics there too.
+    pub multiproc_dir: String,
+    /// The labels on every request metric (`tokenizer_metric_labels()`).
+    pub labels: BTreeMap<String, String>,
+    /// `--enable-priority-scheduling`: the `priority` label carries each
+    /// request's priority.
+    pub priority_label: bool,
+    /// Bucket overrides (`--bucket-*`, resolved `--*-tokens-buckets` rules);
+    /// `None` keeps Python's default buckets.
+    pub bucket_time_to_first_token: Option<Vec<f64>>,
+    pub bucket_inter_token_latency: Option<Vec<f64>>,
+    pub bucket_e2e_request_latency: Option<Vec<f64>>,
+    pub bucket_prompt_tokens: Option<Vec<f64>>,
+    pub bucket_generation_tokens: Option<Vec<f64>>,
+}
+
+#[pyo3::pymethods]
+impl MetricsConfig {
+    #[new]
+    #[pyo3(signature = (*,
+        multiproc_dir,
+        labels,
+        priority_label,
+        bucket_time_to_first_token,
+        bucket_inter_token_latency,
+        bucket_e2e_request_latency,
+        bucket_prompt_tokens,
+        bucket_generation_tokens,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn py_new(
+        multiproc_dir: String,
+        labels: BTreeMap<String, String>,
+        priority_label: bool,
+        bucket_time_to_first_token: Option<Vec<f64>>,
+        bucket_inter_token_latency: Option<Vec<f64>>,
+        bucket_e2e_request_latency: Option<Vec<f64>>,
+        bucket_prompt_tokens: Option<Vec<f64>>,
+        bucket_generation_tokens: Option<Vec<f64>>,
+    ) -> Self {
+        Self {
+            multiproc_dir,
+            labels,
+            priority_label,
+            bucket_time_to_first_token,
+            bucket_inter_token_latency,
+            bucket_e2e_request_latency,
+            bucket_prompt_tokens,
+            bucket_generation_tokens,
+        }
+    }
+}
+
+#[cfg(test)]
+impl MetricsConfig {
+    /// Default buckets, no labels, files under `dir`.
+    pub(crate) fn for_dir(dir: &std::path::Path) -> Self {
+        Self {
+            multiproc_dir: dir.to_string_lossy().into_owned(),
+            labels: BTreeMap::new(),
+            priority_label: false,
+            bucket_time_to_first_token: None,
+            bucket_inter_token_latency: None,
+            bucket_e2e_request_latency: None,
+            bucket_prompt_tokens: None,
+            bucket_generation_tokens: None,
+        }
+    }
+}
+
+/// `--preferred-sampling-params`, carried verbatim: `/get_model_info` echoes
+/// whatever Python advertises, and the keys are whatever `SamplingParams`
+/// accepts, so there is no fixed field list to model as a `#[pyclass]`.
+#[derive(Clone, Debug, Serialize)]
+#[serde(transparent)]
+pub struct PreferredSamplingParams(pub serde_json::Value);
+
+impl<'py> pyo3::FromPyObject<'_, 'py> for PreferredSamplingParams {
+    type Error = pyo3::PyErr;
+
+    fn extract(obj: pyo3::Borrowed<'_, 'py, pyo3::PyAny>) -> pyo3::PyResult<Self> {
+        let text = obj.extract::<String>()?;
+        serde_json::from_str(&text).map(Self).map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "preferred_sampling_params is not valid JSON: {e}"
+            ))
+        })
+    }
+}
+
+/// Python's launch-time `/server_info` fields (`rust_server/config.py`'s
+/// `_launch_server_info`: the resolved `server_args`, `launch_command`, the
+/// scheduler's init info, `kv_events`), carried verbatim as one JSON object.
+/// `Arc` because every `/server_info` response starts from a copy.
+#[derive(Clone, Debug, Default)]
+pub struct LaunchServerInfo(pub Arc<serde_json::Map<String, serde_json::Value>>);
+
+impl<'py> pyo3::FromPyObject<'_, 'py> for LaunchServerInfo {
+    type Error = pyo3::PyErr;
+
+    fn extract(obj: pyo3::Borrowed<'_, 'py, pyo3::PyAny>) -> pyo3::PyResult<Self> {
+        let text = obj.extract::<String>()?;
+        match serde_json::from_str(&text) {
+            Ok(serde_json::Value::Object(fields)) => Ok(Self(Arc::new(fields))),
+            Ok(_) => Err(pyo3::exceptions::PyValueError::new_err(
+                "launch_server_info must be a JSON object",
+            )),
+            Err(e) => Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "launch_server_info is not valid JSON: {e}"
+            ))),
+        }
+    }
+}
+
+/// PD-disaggregation role, the values of `--disaggregation-mode`. Exposed to
+/// Python as an enum (`DisaggregationMode.Null` / `.Prefill` / `.Decode`).
+#[pyo3::pyclass(
+    eq,
+    frozen,
+    from_py_object,
+    module = "sglang.srt.rust_extensions._server"
+)]
+// Lowercase to match the values Python reports for the same field.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DisaggregationMode {
+    /// Unified prefill + decode.
+    #[default]
+    Null,
+    Prefill,
+    Decode,
+}
+
+/// The slice of the resolved Python `ModelConfig` the rust server reads.
+#[pyo3::pyclass(frozen, from_py_object, module = "sglang.srt.rust_extensions._server")]
+#[derive(Clone, Debug)]
+pub struct ModelConfig {
+    /// Authoritative HF model type, used to select a native chat formatter.
+    pub model_type: Option<String>,
+    /// Resolved context length (`max_model_len` in `/v1/models`); the ceiling
+    /// for input + `max_new_tokens`.
+    pub context_len: u64,
+    /// Bounds client-supplied token ids — return 400s out-of-vocab ids before
+    /// they crash the scheduler's embedding lookup.
+    pub vocab_size: u64,
+    /// Whether the model accepts multimodal inputs. Gates the MM Encoding branch
+    /// in to-scheduler; `false` silently ignores mm fields, as the Python
+    /// `TokenizerManager` does with `mm_processor is None`.
+    pub is_multimodal: bool,
+    /// Resolved default sampling parameters, from Python's
+    /// `ModelConfig.get_default_sampling_params()`. Already gated on
+    /// `--sampling-defaults`: holds the model's generation_config.json values
+    /// in "model" mode, and is all-`None` in "openai" mode. Consumed when a chat
+    /// request omits `temperature`/`top_p` — the conversion must not skip
+    /// straight to the OpenAI terminal defaults.
+    pub default_sampling_params: DefaultSamplingParams,
+}
+
+#[pyo3::pymethods]
+impl ModelConfig {
+    #[new]
+    #[pyo3(signature = (*, context_len, vocab_size, is_multimodal, default_sampling_params, model_type))]
+    fn py_new(
+        context_len: u64,
+        vocab_size: u64,
+        is_multimodal: bool,
+        default_sampling_params: DefaultSamplingParams,
+        model_type: Option<String>,
+    ) -> Self {
+        Self {
+            context_len,
+            vocab_size,
+            is_multimodal,
+            default_sampling_params,
+            model_type,
+        }
+    }
+}
+
+impl Default for ModelConfig {
+    /// Test-only: a small but complete model so the runtime boots.
+    fn default() -> Self {
+        Self {
+            context_len: 2048,
+            model_type: None,
+            vocab_size: 1000,
+            is_multimodal: false,
+            default_sampling_params: DefaultSamplingParams::default(),
+        }
+    }
+}
+
+/// One `SamplingParams` field per key `get_default_sampling_params()` may emit
+/// (`repetition_penalty`, `temperature`, `top_k`, `top_p`, `min_p`); `None`
+/// where the generation config does not set it.
+///
+/// `top_k` / `min_p` / `repetition_penalty` are carried for parity with the
+/// Python dict but not yet consumed: the Dynamo chat request type only carries
+/// `temperature` and `top_p`, so the conversion resolves just those two.
+#[pyo3::pyclass(frozen, from_py_object, module = "sglang.srt.rust_extensions._server")]
+#[derive(Clone, Debug, Default)]
+#[allow(dead_code)]
+pub struct DefaultSamplingParams {
+    pub temperature: Option<f64>,
+    pub top_p: Option<f64>,
+    pub top_k: Option<i64>,
+    pub min_p: Option<f64>,
+    pub repetition_penalty: Option<f64>,
+}
+
+#[pyo3::pymethods]
+impl DefaultSamplingParams {
+    #[new]
+    #[pyo3(signature = (*, temperature = None, top_p = None, top_k = None, min_p = None, repetition_penalty = None))]
+    fn py_new(
+        temperature: Option<f64>,
+        top_p: Option<f64>,
+        top_k: Option<i64>,
+        min_p: Option<f64>,
+        repetition_penalty: Option<f64>,
+    ) -> Self {
+        Self {
+            temperature,
+            top_p,
+            top_k,
+            min_p,
+            repetition_penalty,
+        }
+    }
+}
+
+/// The Rust MM pipeline handoff, built by `RustServer._build_mm_spec` from
+/// the resolved `RustMmSpec` and passed to `Server.start_mm_workers`. Same
+/// contract as [`ServerArgs`]: every field is a required, typed constructor
+/// keyword, so a drifted Python caller fails at boot.
+#[pyo3::pyclass(frozen, from_py_object, module = "sglang.srt.rust_extensions._server")]
+#[derive(Clone, Debug)]
+pub struct MmSpec {
+    /// Park feature buffers in POSIX shm rather than inline. Set by the Python
+    /// launcher (`RustMmProcessor._use_feature_shm`) exactly when the scheduler
+    /// broadcasts across TP ranks and will unwrap `ShmPointerMMData`.
+    pub feature_shm: bool,
+    /// The family pipeline and its resolved processor parameters.
+    pub pipeline: sglang_mm::registry::PipelineSpec,
+}
+
+#[pyo3::pymethods]
+impl MmSpec {
+    /// The parameter list is flat because every family so far shares the
+    /// Qwen-VL processor geometry; a family with different knobs adds its own
+    /// keywords and match arm here.
+    #[new]
+    #[pyo3(signature = (*,
+        family,
+        feature_shm,
+        image_token_id,
+        patch_size,
+        merge_size,
+        temporal_patch_size,
+        min_pixels,
+        max_pixels,
+        image_mean,
+        image_std,
+        resample,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn py_new(
+        family: MmFamily,
+        feature_shm: bool,
+        image_token_id: i64,
+        patch_size: usize,
+        merge_size: usize,
+        temporal_patch_size: usize,
+        min_pixels: usize,
+        max_pixels: usize,
+        image_mean: [f32; 3],
+        image_std: [f32; 3],
+        resample: MmResample,
+    ) -> Self {
+        use sglang_mm::registry::PipelineSpec;
+        let pipeline = match family {
+            MmFamily::QwenVl => PipelineSpec::QwenVl(sglang_mm::qwen_vl::QwenVlSpec {
+                image_token_id,
+                patch_size,
+                merge_size,
+                temporal_patch_size,
+                min_pixels,
+                max_pixels,
+                image_mean,
+                image_std,
+                resample: resample.into(),
+            }),
+        };
+        Self {
+            feature_shm,
+            pipeline,
+        }
+    }
+}
+
+/// Which `sglang_mm` family pipeline serves the model — one variant per
+/// [`sglang_mm::registry::PipelineSpec`] arm. Exposed to Python as an enum
+/// (`MmFamily.QwenVl`); `RustMmFamily.name` maps onto it at handoff.
+#[pyo3::pyclass(
+    eq,
+    frozen,
+    from_py_object,
+    module = "sglang.srt.rust_extensions._server"
+)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MmFamily {
+    QwenVl,
+}
+
+/// The HF image processor the Rust resize must reproduce bit-exactly (see
+/// [`sglang_mm::qwen_vl::Resampler`]). Exposed to Python as an enum
+/// (`MmResample.AtenU8` / `.Pil`); `RustMmFamily.image_processors` maps each
+/// processor class onto it.
+#[pyo3::pyclass(
+    eq,
+    frozen,
+    from_py_object,
+    module = "sglang.srt.rust_extensions._server"
+)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MmResample {
+    /// `Qwen2VLImageProcessor` / `…Fast` — torchvision on a uint8 tensor.
+    AtenU8,
+    /// `Qwen2VLImageProcessorPil`, behind `--disable-fast-image-processor`.
+    Pil,
+}
+
+impl From<MmResample> for sglang_mm::qwen_vl::Resampler {
+    fn from(r: MmResample) -> Self {
+        match r {
+            MmResample::AtenU8 => Self::AtenU8,
+            MmResample::Pil => Self::Pil,
+        }
+    }
+}
+
+fn join_host_port(host: &str, port: u16) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}") // bare IPv6 (`::`) needs brackets to bind
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+impl ServerArgs {
+    /// Fail fast at startup on values the types cannot express.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.served_model_name.is_empty() {
+            return Err("empty 'served_model_name' in server_args".into());
+        }
+        for (name, value) in &self.health_generate_headers {
+            if http::HeaderName::from_bytes(name.as_bytes()).is_err()
+                || http::HeaderValue::from_str(value).is_err()
+            {
+                return Err(format!(
+                    "invalid 'health_generate_headers' entry {name:?}: {value:?}"
+                ));
+            }
+        }
+        if let Some(grpc_port) = self.grpc_port {
+            if grpc_port == 0 {
+                return Err("'grpc_port' must be between 1 and 65535".into());
+            }
+            if grpc_port == self.port {
+                return Err(format!(
+                    "'grpc_port' ({grpc_port}) must differ from 'port' ({})",
+                    self.port
+                ));
+            }
+        }
+        if let Some(preferred) = &self.preferred_sampling_params {
+            // The wire schema is the contract: a preferred value the decoder
+            // rejects would 400 every request, so reject it at boot instead.
+            serde_json::from_value::<sglang_api_types::api::v1::SamplingParams>(
+                preferred.0.clone(),
+            )
+            .map_err(|e| format!("invalid preferred_sampling_params: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// True on a prefill or decode node — requests need bootstrap routing.
+    pub fn is_disaggregation(&self) -> bool {
+        self.disaggregation_mode != DisaggregationMode::Null
+    }
+
+    /// Serve the PD KV bootstrap registry on the api listener: every prefill
+    /// rust server hosts it, unconditionally — no extra topology gating. KV
+    /// managers and decode nodes reach the registry at the resolved
+    /// `disaggregation_bootstrap_port`, which rust-server mode aliases to the
+    /// api port, so whichever prefill server that port names is the one that
+    /// receives the registrations.
+    pub fn enable_pd_bootstrap(&self) -> bool {
+        self.disaggregation_mode == DisaggregationMode::Prefill
+    }
+
+    /// Whether the served model is multimodal, from the scheduler's config. See
+    /// [`ModelConfig::is_multimodal`].
+    pub fn model_is_multimodal(&self) -> bool {
+        self.model_config.is_multimodal
+    }
+
+    /// Bind address `host:port`. `host` is expected to be an IP — the result is
+    /// parsed as a `SocketAddr`, so a bare IPv6 host gets bracketed.
+    pub fn bind(&self) -> String {
+        join_host_port(&self.host, self.port)
+    }
+
+    /// Whether the HTTP access log is emitted, mirroring the Python server:
+    /// uvicorn runs at `log_level_http or log_level` and prints access lines
+    /// only at info/debug. `--log-level-http warning` turns them off.
+    pub fn http_access_log_enabled(&self) -> bool {
+        let level = self
+            .log_level_http
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&self.log_level);
+        matches!(
+            level.to_ascii_lowercase().as_str(),
+            "trace" | "debug" | "info"
+        )
+    }
+
+    /// Pinned API threads for the embedded HTTP api-server. Python `server_args`
+    /// has no such field — this is derived: enough to cover the widest pool.
+    pub fn http_api_worker_num(&self) -> usize {
+        4.max(self.tokenizer_worker_num)
+            .max(self.detokenizer_worker_num)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bind_brackets_bare_ipv6() {
+        let sa = ServerArgs {
+            host: "::".into(),
+            port: 30001,
+            ..Default::default()
+        };
+        assert_eq!(sa.bind(), "[::]:30001");
+        assert_eq!(ServerArgs::default().bind(), "127.0.0.1:30000");
+    }
+
+    #[test]
+    fn disaggregation_mode_wire_values_match_python() {
+        let json = |m| serde_json::to_string(&m).unwrap();
+        assert_eq!(json(DisaggregationMode::Null), "\"null\"");
+        assert_eq!(json(DisaggregationMode::Prefill), "\"prefill\"");
+        assert_eq!(json(DisaggregationMode::Decode), "\"decode\"");
+    }
+
+    #[test]
+    fn pd_role_derivations() {
+        let prefill = ServerArgs {
+            disaggregation_mode: DisaggregationMode::Prefill,
+            ..Default::default()
+        };
+        assert!(prefill.is_disaggregation());
+        assert!(prefill.enable_pd_bootstrap());
+        let decode = ServerArgs {
+            disaggregation_mode: DisaggregationMode::Decode,
+            ..Default::default()
+        };
+        assert!(decode.is_disaggregation());
+        assert!(!decode.enable_pd_bootstrap());
+        assert!(!ServerArgs::default().is_disaggregation());
+    }
+
+    #[test]
+    fn validate_requires_served_model_name_and_valid_health_headers() {
+        assert!(ServerArgs::default().validate().is_err());
+        let sa = ServerArgs {
+            served_model_name: "m".into(),
+            ..Default::default()
+        };
+        assert!(sa.validate().is_ok());
+        let bad = ServerArgs {
+            health_generate_headers: [("bad header".into(), "v".into())].into(),
+            ..sa
+        };
+        assert!(
+            bad.validate()
+                .unwrap_err()
+                .contains("health_generate_headers")
+        );
+    }
+
+    #[test]
+    fn grpc_is_disabled_by_default_and_rejects_invalid_ports() {
+        assert!(ServerArgs::default().grpc_port.is_none());
+        assert!(RustServerServerArgs::default().grpc_addr.is_none());
+
+        let base = ServerArgs {
+            served_model_name: "m".into(),
+            ..Default::default()
+        };
+        assert!(base.validate().is_ok());
+        assert!(
+            ServerArgs {
+                grpc_port: Some(0),
+                ..base.clone()
+            }
+            .validate()
+            .unwrap_err()
+            .contains("between 1 and 65535")
+        );
+        assert!(
+            ServerArgs {
+                grpc_port: Some(base.port),
+                ..base
+            }
+            .validate()
+            .unwrap_err()
+            .contains("must differ")
+        );
+    }
+
+    /// `--log-level-http` overrides `--log-level` for the access log; unset or
+    /// empty falls through.
+    #[test]
+    fn access_log_follows_http_level_then_global() {
+        let mut sa = ServerArgs::default();
+        assert!(sa.http_access_log_enabled());
+        sa.log_level_http = Some("warning".into());
+        assert!(!sa.http_access_log_enabled());
+        sa.log_level_http = Some(String::new());
+        sa.log_level = "error".into();
+        assert!(!sa.http_access_log_enabled());
+    }
+}

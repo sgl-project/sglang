@@ -22,6 +22,7 @@ class LTX2SamplingParams(SamplingParams):
 
     # Audio specific
     generate_audio: bool = True
+    use_diffusion_decoder: bool = False
 
     # Denoising parameters
     guidance_scale: float = 4.0
@@ -42,11 +43,19 @@ class LTX2SamplingParams(SamplingParams):
         "inconsistent tone, cinematic oversaturation, stylized filters, or AI artifacts."
     )
 
+    def prepare_synthetic_warmup_request_for_queue(
+        self, req: Any, server_args: Any
+    ) -> None:
+        # BCG must capture the same CFG/STG/modality branches and LoRA phase
+        # strengths as real requests, including LTX-2.3 and HQ overrides.
+        self.apply_request_extra(req)
+
 
 @dataclasses.dataclass
 class LTX23SamplingParams(LTX2SamplingParams):
     """Sampling parameters matching official LTX-2.3 one-stage defaults."""
 
+    seed: int = 42
     generator_device: str = "cuda"
     guidance_scale: float = 3.0
     num_inference_steps: int = 30
@@ -68,6 +77,9 @@ class LTX23SamplingParams(LTX2SamplingParams):
 
     def build_request_extra(self) -> dict[str, Any]:
         extra = super().build_request_extra()
+        # RL rollout uses the official CFG path (guidance_scale=1, no guider).
+        if self.rollout:
+            return extra
         extra["ltx2_stage1_guider_params"] = {
             "video_cfg_scale": self.video_cfg_scale,
             "video_stg_scale": self.video_stg_scale,

@@ -5,7 +5,8 @@ from typing import Any, Dict, List, Optional
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=6, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=6, suite="base-a-test-cpu")
+register_cpu_ci(est_time=5, suite="stage-b-test-cpu-intel")
 
 import asyncio
 import json
@@ -77,12 +78,12 @@ def setUpModule():
 
     if stub_modules:
         if "sglang.srt.managers.io_struct" in stub_modules:
-            stub_modules["sglang.srt.managers.io_struct"].GenerateReqInput = (
-                _GenerateReqInput
-            )
-            stub_modules["sglang.srt.managers.io_struct"].EmbeddingReqInput = (
-                _EmbeddingReqInput
-            )
+            stub_modules[
+                "sglang.srt.managers.io_struct"
+            ].GenerateReqInput = _GenerateReqInput
+            stub_modules[
+                "sglang.srt.managers.io_struct"
+            ].EmbeddingReqInput = _EmbeddingReqInput
         if "sglang.srt.server_args" in stub_modules:
             stub_modules["sglang.srt.server_args"].ServerArgs = _ServerArgs
 
@@ -249,10 +250,6 @@ class TestFileRequestMetricsExporter(unittest.TestCase):
         self.assertIsNone(exporter._current_file_handler)
         self.assertIsNone(exporter._current_hour_suffix)
 
-    def test_close_noop_when_no_handler(self):
-        exporter = self._make_exporter()
-        exporter.close()  # should not raise
-
     def test_close_error(self):
         """Close failure is logged but state is still reset."""
         exporter = self._make_exporter()
@@ -289,16 +286,6 @@ class TestFileRequestMetricsExporter(unittest.TestCase):
         files = os.listdir(self.tmp_dir)
         self.assertEqual(len(files), 0)
 
-    def test_write_record_handler_none(self):
-        """If file handler is None after ensure, write_record returns early."""
-        exporter = self._make_exporter()
-        obj = _GenerateReqInput(rid="req-1")
-
-        with patch.object(exporter, "_ensure_file_handler"):
-            exporter._current_file_handler = None
-            asyncio.run(exporter.write_record(obj, {}))
-        # No crash, no file written
-
     def test_write_record_exception(self):
         """Exceptions during write are caught and logged."""
         exporter = self._make_exporter()
@@ -309,35 +296,6 @@ class TestFileRequestMetricsExporter(unittest.TestCase):
         ):
             asyncio.run(exporter.write_record(obj, {}))
         # Should not raise
-
-
-class TestRequestMetricsExporterManager(unittest.TestCase):
-    def setUp(self):
-        self.tmp_dir = tempfile.mkdtemp()
-
-    def tearDown(self):
-        shutil.rmtree(self.tmp_dir, ignore_errors=True)
-
-    def test_no_exporters(self):
-        server_args = _make_server_args(self.tmp_dir, enabled=False)
-        manager = RequestMetricsExporterManager(server_args)
-        self.assertFalse(manager.exporter_enabled())
-
-    def test_with_file_exporter(self):
-        server_args = _make_server_args(self.tmp_dir, enabled=True)
-        manager = RequestMetricsExporterManager(server_args)
-        self.assertTrue(manager.exporter_enabled())
-
-    def test_write_record_delegates(self):
-        server_args = _make_server_args(self.tmp_dir, enabled=True)
-        manager = RequestMetricsExporterManager(server_args)
-
-        obj = _GenerateReqInput(rid="req-1", text="hello")
-        out_dict = {"meta_info": {"latency": 1.0}}
-        asyncio.run(manager.write_record(obj, out_dict))
-
-        files = os.listdir(self.tmp_dir)
-        self.assertEqual(len(files), 1)
 
 
 class TestCreateExporters(unittest.TestCase):

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 # Copyright 2023-2025 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -22,7 +25,6 @@ import torch
 from torch import nn
 from transformers import GPTJConfig
 
-from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import get_act_fn
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -42,11 +44,11 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix
 
 
 class GPTJAttention(nn.Module):
-
     def __init__(
         self,
         layer_id: int,
@@ -75,7 +77,7 @@ class GPTJAttention(nn.Module):
             prefix=add_prefix("out_proj", prefix),
         )
 
-        tensor_model_parallel_world_size = get_tensor_model_parallel_world_size()
+        tensor_model_parallel_world_size = get_parallel().tp_size
         assert total_num_heads % tensor_model_parallel_world_size == 0
         num_heads = total_num_heads // tensor_model_parallel_world_size
 
@@ -115,7 +117,6 @@ class GPTJAttention(nn.Module):
 
 
 class GPTJMLP(nn.Module):
-
     def __init__(
         self,
         intermediate_size: int,
@@ -148,7 +149,6 @@ class GPTJMLP(nn.Module):
 
 
 class GPTJBlock(nn.Module):
-
     def __init__(
         self,
         layer_id: int,
@@ -191,7 +191,6 @@ class GPTJBlock(nn.Module):
 
 
 class GPTJModel(nn.Module):
-
     def __init__(
         self,
         config: GPTJConfig,
@@ -239,7 +238,6 @@ class GPTJModel(nn.Module):
 
 
 class GPTJForCausalLM(nn.Module):
-
     def __init__(
         self,
         config: GPTJConfig,

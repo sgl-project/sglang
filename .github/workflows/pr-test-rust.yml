@@ -8,6 +8,12 @@ on:
       - ".github/workflows/pr-test-rust.yml"
       - "scripts/ci/cuda/ci_install_dependency.sh"
       - "scripts/ci/cuda/ci_install_gateway_dependencies.sh"
+      # gateway-e2e resolves the SMG runtime deps (the smg-grpc-servicer
+      # floor) from here, via ci_install_dependency.sh's
+      # `pip install -e python[...]` — a bump there must re-run this workflow.
+      - "python/pyproject.toml"
+      # The SMG gRPC entrypoint; only this workflow exercises it.
+      - "python/sglang/srt/entrypoints/grpc_server.py"
   pull_request:
     branches: [ main ]
     types: [opened, synchronize, reopened, labeled]
@@ -16,6 +22,12 @@ on:
       - ".github/workflows/pr-test-rust.yml"
       - "scripts/ci/cuda/ci_install_dependency.sh"
       - "scripts/ci/cuda/ci_install_gateway_dependencies.sh"
+      # gateway-e2e resolves the SMG runtime deps (the smg-grpc-servicer
+      # floor) from here, via ci_install_dependency.sh's
+      # `pip install -e python[...]` — a bump there must re-run this workflow.
+      - "python/pyproject.toml"
+      # The SMG gRPC entrypoint; only this workflow exercises it.
+      - "python/sglang/srt/entrypoints/grpc_server.py"
   workflow_dispatch:
 
 concurrency:
@@ -64,7 +76,6 @@ jobs:
           shared-key: "rust-cache"
           cache-all-crates: true
           cache-on-failure: true
-          save-if: true
 
       - name: Build python binding
         run: |
@@ -154,7 +165,6 @@ jobs:
           shared-key: "rust-cache"
           cache-all-crates: true
           cache-on-failure: true
-          save-if: true
 
       - name: Run lint
         run: |
@@ -170,15 +180,6 @@ jobs:
           rustup component add --toolchain nightly-x86_64-unknown-linux-gnu rustfmt
           rustup toolchain install nightly --profile minimal
           cargo +nightly fmt -- --check
-
-      - name: Generate vision golden fixtures
-        run: |
-          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-
-          pip install transformers pillow numpy scipy
-          pip install transformers pillow numpy
-          cd sgl-model-gateway/
-          python scripts/generate_vision_golden.py
 
       - name: Run Rust tests
         timeout-minutes: 20
@@ -270,9 +271,13 @@ jobs:
     # Self-hosted GPU runners are scarce; serialize per hardware type so
     # 2-gpu-h100 and 4-gpu-h100 each run one job at a time across all
     # in-flight PRs. Queue rather than cancel — different refs shouldn't
-    # interrupt each other.
+    # interrupt each other. Include matrix.name in the group so siblings
+    # within the same run don't collide: GitHub keeps only one pending job
+    # per concurrency group, so matrix entries sharing a group (e.g.
+    # benchmarks + chat-completions-4gpu on 4-gpu-h100) would evict each
+    # other regardless of cancel-in-progress: false.
     concurrency:
-      group: pr-test-rust-${{ matrix.runner }}
+      group: pr-test-rust-${{ matrix.runner }}-${{ matrix.name }}
       cancel-in-progress: false
     steps:
       - name: Checkout code

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/6366efc67b0aedd2c1721c14385370e50b297fb3/benchmarks/backend_request_func.py
 # Adapted from https://github.com/vllm-project/vllm/blob/6366efc67b0aedd2c1721c14385370e50b297fb3/benchmarks/benchmark_serving.py
 
@@ -73,9 +75,9 @@ async def async_request_openai_completions(
     pbar: Optional[tqdm] = None,
 ) -> RequestFuncOutput:
     api_url = request_func_input.api_url
-    assert api_url.endswith(
-        "completions"
-    ), "OpenAI Completions API URL must end with 'completions'."
+    assert api_url.endswith("completions"), (
+        "OpenAI Completions API URL must end with 'completions'."
+    )
 
     async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
         payload = {
@@ -617,14 +619,6 @@ async def benchmark(
             "std_itl_ms": metrics.std_itl_ms,
             "p99_itl_ms": metrics.p99_itl_ms,
             "concurrency": metrics.concurrency,
-            "input_throughput": metrics.input_throughput,
-            "output_throughput": metrics.output_throughput,
-            "fixed_output_len": args.fixed_output_len,
-            "random_input_len": args.random_input_len,
-            "random_output_len": args.random_output_len,
-            "random_range_ratio": args.random_range_ratio,
-            "duration": benchmark_duration,
-            "completed": metrics.completed,
         }
     else:
         print(f"Error running benchmark for request rate: {request_rate}")

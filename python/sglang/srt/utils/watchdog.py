@@ -12,7 +12,7 @@ from typing import Callable, List, Optional
 
 import psutil
 
-from sglang.srt.utils.common import pyspy_dump_schedulers
+from sglang.srt.utils.cudacore_pyspy_dump_utils import pyspy_dump_schedulers
 
 logger = logging.getLogger(__name__)
 
@@ -26,9 +26,9 @@ class Watchdog:
         test_stuck_time: float = 0,
     ) -> Watchdog:
         if watchdog_timeout is None:
-            assert (
-                test_stuck_time == 0
-            ), f"stuck tester can be enabled only if soft watchdog is enabled."
+            assert test_stuck_time == 0, (
+                f"stuck tester can be enabled only if soft watchdog is enabled."
+            )
             return _WatchdogNoop()
         return _WatchdogReal(
             debug_name=debug_name,

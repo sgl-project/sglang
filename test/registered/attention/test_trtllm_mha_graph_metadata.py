@@ -1,0 +1,1375 @@
+"""Correctness tests for the fused TRTLLM-MHA cuda-graph metadata kernel.
+
+Validates the single-launch triton kernel against a pure-aten reference that
+mirrors the exact semantics of the triton port: cache_seqlens / cu_seqlens_k /
+cu_seqlens_q (all 3 q-modes) / page_table / swa_page_table / swa_out_cache_loc,
+with the SWA -1 sentinel guard.
+"""
+
+import contextlib
+import weakref
+from types import SimpleNamespace
+
+import pytest
+import torch
+from torch.utils import _pytree as pytree
+from torch.utils._python_dispatch import TorchDispatchMode
+
+import sglang.srt.layers.attention.trtllm_mha_backend as trtllm_mha_backend
+from sglang.kernels.ops.attention.trtllm_mha_graph_metadata import (
+    Q_MODE_CUMSUM,
+    Q_MODE_NONE,
+    Q_MODE_STRIDED,
+    update_trtllm_mha_graph_metadata,
+)
+from sglang.srt.environ import envs
+from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.test.ci.ci_register import register_cuda_ci
+
+# trtllm_mha kernels are sm100-only; run this kernel-unit test on Blackwell.
+register_cuda_ci(est_time=16, stage="base-b", runner_config="4-gpu-b200")
+
+DEVICE = "cuda"
+PAGE_SIZE = 128
+
+
+@pytest.fixture
+def make_xqa_backend(monkeypatch):
+    def parent_init(self, *args):
+        self.kv_cache_quant_method = SimpleNamespace(
+            resolve_attention_access=lambda *args: SimpleNamespace(
+                kind=trtllm_mha_backend.KVCacheAttentionAccessKind.PLAIN
+            )
+        )
+
+    monkeypatch.setattr(
+        trtllm_mha_backend.FlashInferAttnBackend, "__init__", parent_init
+    )
+    monkeypatch.setattr(TRTLLMHAAttnBackend, "_resolve_swa_kv_pool", lambda *args: None)
+    monkeypatch.setattr(trtllm_mha_backend, "DEFAULT_WORKSPACE_SIZE_MB", 1)
+    monkeypatch.setattr(
+        trtllm_mha_backend, "get_buffer", lambda name, factory: factory()
+    )
+    monkeypatch.setattr(
+        trtllm_mha_backend,
+        "make_persistent_multi_ctas_kv_counter_buffer",
+        lambda *a, **k: None,
+    )
+
+    def make(draft_len, is_xqa=True):
+        monkeypatch.setattr(
+            trtllm_mha_backend,
+            "get_spec",
+            lambda: SimpleNamespace(
+                speculative_eagle_topk=1, speculative_num_draft_tokens=draft_len
+            ),
+        )
+        monkeypatch.setattr(
+            trtllm_mha_backend,
+            "get_platform",
+            lambda: SimpleNamespace(is_sm90=is_xqa, is_sm120=False),
+        )
+        runner = SimpleNamespace(
+            prefill_attention_backend_str="trtllm_mha",
+            decode_attention_backend_str="trtllm_mha",
+            model_config=SimpleNamespace(
+                context_len=128, hidden_size=8, num_attention_heads=2
+            ),
+            kv_cache_dtype=torch.bfloat16,
+            dtype=torch.bfloat16,
+            page_size=32,
+            req_to_token_pool=SimpleNamespace(size=4, req_to_token=None),
+            device="cpu",
+            max_running_requests=4,
+            model=SimpleNamespace(modules=lambda: []),
+        )
+        return TRTLLMHAAttnBackend(runner)
+
+    return make
+
+
+@pytest.mark.parametrize("draft_len", [1, 8, 16, 17, 31, 32, 33, 63, 64, 65])
+def test_xqa_causal_mask_packing(make_xqa_backend, draft_len):
+    mask = make_xqa_backend(draft_len)._xqa_spec_dec_mask
+    assert mask.dtype == torch.uint16
+    assert mask.shape == (5, draft_len, (draft_len + 31) // 32 * 2)
+    assert mask.is_contiguous()
+    positions = torch.arange(mask.shape[2] * 16)
+    unpacked = (mask.to(torch.int64)[..., positions // 16] >> (positions % 16)) & 1
+    expected = positions[None, :] <= torch.arange(draft_len)[:, None]
+    torch.testing.assert_close(unpacked.bool(), expected.expand(mask.shape[0], -1, -1))
+
+
+@pytest.mark.parametrize("draft_len,is_xqa", [(None, True), (8, False)])
+def test_xqa_mask_not_allocated_when_unused(make_xqa_backend, draft_len, is_xqa):
+    assert make_xqa_backend(draft_len, is_xqa)._xqa_spec_dec_mask is None
+
+
+def _run_decode_mode_extend(backend, monkeypatch, *, mode, width, decode):
+    bs = 5
+    seq_lens = torch.tensor([30, 10, 50, 20, 40], dtype=torch.int32)
+    page_table = torch.arange(bs, dtype=torch.int32)[:, None]
+    backend.forward_metadata = SimpleNamespace(
+        is_ragged_verify=False, max_seq_len_q=width, cache_seqlens_int32=seq_lens
+    )
+    backend.token_to_kv_pool = SimpleNamespace(get_kv_buffer=lambda _: (None, None))
+    backend._should_use_fused_fp8_path = lambda *a: False
+    backend._reshape_paged_kv_cache = lambda *a: (None, None)
+    backend._get_bmm_scales = lambda *a: (1.0, 1.0)
+    backend._get_layer_page_table = lambda *a: page_table
+    monkeypatch.setattr(trtllm_mha_backend, "is_cp_active", lambda _: False)
+    monkeypatch.setattr(
+        trtllm_mha_backend,
+        "flashinfer",
+        SimpleNamespace(
+            decode=SimpleNamespace(trtllm_batch_decode_with_kv_cache=decode)
+        ),
+        raising=False,
+    )
+    q = (
+        torch.arange(bs * width * 8, dtype=torch.float32)
+        .to(torch.bfloat16)
+        .view(-1, 2, 4)
+    )
+    layer = SimpleNamespace(
+        layer_id=0,
+        tp_q_head_num=2,
+        head_dim=4,
+        sliding_window_size=-1,
+        attn_type=trtllm_mha_backend.AttentionType.DECODER,
+    )
+    fb = SimpleNamespace(out_cache_loc=None, forward_mode=mode, batch_size=bs)
+    out = backend.forward_extend(q, None, None, layer, fb, save_kv_cache=False)
+    return q, out
+
+
+@pytest.mark.parametrize("splits", [1, 2, 8])
+@pytest.mark.parametrize(
+    "is_xqa,mode,width,masked",
+    [
+        (True, ForwardMode.TARGET_VERIFY, 8, True),
+        (False, ForwardMode.TARGET_VERIFY, 8, False),
+        (True, ForwardMode.TARGET_VERIFY, 1, False),
+        (True, ForwardMode.DRAFT_EXTEND_V2, 1, False),
+        (True, ForwardMode.DRAFT_EXTEND_V2, 8, True),
+    ],
+)
+def test_xqa_verify_mask_forwarding(
+    make_xqa_backend, monkeypatch, splits, is_xqa, mode, width, masked
+):
+    """XQA needs the draft-block mask whenever q_len > 1, draft extend included."""
+    backend = make_xqa_backend(width, is_xqa)
+    backend.decode_seq_len_splits = splits
+    calls = []
+
+    def decode(**kwargs):
+        calls.append(kwargs)
+        group_bs = kwargs["seq_lens"].numel()
+        mask = kwargs.get("mask")
+        if masked:
+            assert mask.shape == (group_bs, width, 2)
+            assert mask.data_ptr() == backend._xqa_spec_dec_mask.data_ptr()
+        else:
+            assert mask is None
+        return kwargs["query"] + 1
+
+    q, out = _run_decode_mode_extend(
+        backend, monkeypatch, mode=mode, width=width, decode=decode
+    )
+    torch.testing.assert_close(out, (q + 1).view(-1, 8))
+    assert len(calls) == min(splits, q.shape[0] // width)
+
+
+@pytest.mark.parametrize(
+    "is_xqa,mode,expected_q_dtype",
+    [
+        (True, ForwardMode.TARGET_VERIFY, torch.bfloat16),
+        (True, ForwardMode.DRAFT_EXTEND_V2, torch.bfloat16),
+        (False, ForwardMode.DRAFT_EXTEND_V2, torch.float8_e4m3fn),
+    ],
+)
+def test_decode_mode_query_dtype_with_fp8_kv(
+    make_xqa_backend, monkeypatch, is_xqa, mode, expected_q_dtype
+):
+    """With FP8 KV, XQA verify and draft extend keep Q bf16; trtllm-gen casts to FP8."""
+    width = 8
+    backend = make_xqa_backend(width, is_xqa)
+    backend.data_type = torch.float8_e4m3fn
+    backend.decode_seq_len_splits = 1
+    query_dtypes = []
+
+    def decode(**kwargs):
+        query_dtypes.append(kwargs["query"].dtype)
+        return torch.zeros(kwargs["query"].shape, dtype=kwargs["out_dtype"])
+
+    _run_decode_mode_extend(backend, monkeypatch, mode=mode, width=width, decode=decode)
+    assert query_dtypes == [expected_q_dtype]
+
+
+@pytest.mark.parametrize(
+    "explicit_bytes", [None, 8 * 1024 * 1024], ids=["default", "explicit_8MiB"]
+)
+def test_fmha_v2_prefill_workspace_skips_xqa_semaphores(
+    make_xqa_backend, monkeypatch, explicit_bytes
+):
+    # XQA decode keeps its multi-block semaphores in the first 8 MiB of the
+    # workspace and needs them zero at launch; fmha_v2 prefill, sharing the
+    # buffer, leaves its tile counters at the base of what it is handed.
+    monkeypatch.setattr(trtllm_mha_backend, "DEFAULT_WORKSPACE_SIZE_MB", 16)
+    configured = explicit_bytes or 16 * 1024 * 1024
+    with (
+        envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.override(explicit_bytes)
+        if explicit_bytes is not None
+        else contextlib.nullcontext()
+    ):
+        backend = make_xqa_backend(None)
+    heads, head_dim, bs = 2, 4, 2
+    seq_lens = torch.tensor([30, 10], dtype=torch.int32)
+    cu_seqlens = torch.tensor([0, 30, 40], dtype=torch.int32)
+    backend.forward_metadata = trtllm_mha_backend.TRTLLMMHAMetadata(
+        cache_seqlens_int32=seq_lens,
+        max_seq_len_q=30,
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_k=cu_seqlens,
+        page_table=torch.arange(bs, dtype=torch.int32)[:, None],
+    )
+    kv = torch.zeros(bs * backend.page_size, heads, head_dim, dtype=torch.bfloat16)
+    backend.token_to_kv_pool = SimpleNamespace(get_kv_buffer=lambda _: (kv, kv))
+    monkeypatch.setattr(trtllm_mha_backend, "is_cp_active", lambda _: False)
+    workspaces = {}
+
+    def decode(**kwargs):
+        workspaces["xqa"] = kwargs["workspace_buffer"]
+        return torch.zeros_like(kwargs["query"])
+
+    def prefill(qkv, **kwargs):
+        workspaces["fmha_v2"] = kwargs["workspace_buffer"]
+        return torch.zeros_like(qkv[0])
+
+    monkeypatch.setattr(
+        trtllm_mha_backend,
+        "flashinfer",
+        SimpleNamespace(
+            decode=SimpleNamespace(trtllm_batch_decode_with_kv_cache=decode),
+            prefill=SimpleNamespace(trtllm_fmha_v2_prefill=prefill),
+        ),
+        raising=False,
+    )
+    layer = SimpleNamespace(
+        layer_id=0,
+        tp_q_head_num=heads,
+        tp_k_head_num=heads,
+        tp_v_head_num=heads,
+        head_dim=head_dim,
+        scaling=1.0,
+        sliding_window_size=-1,
+        attn_type=trtllm_mha_backend.AttentionType.DECODER,
+    )
+    q = torch.zeros(40, heads * head_dim, dtype=torch.bfloat16)
+    extend = SimpleNamespace(
+        forward_mode=ForwardMode.EXTEND, batch_size=bs, _attn_output=None
+    )
+    backend.forward_extend(q, None, None, layer, extend, save_kv_cache=False)
+    decode_batch = SimpleNamespace(forward_mode=ForwardMode.DECODE, batch_size=bs)
+    backend.forward_decode(q[:bs], None, None, layer, decode_batch, save_kv_cache=False)
+
+    semaphores = workspaces["xqa"].data_ptr()
+    fmha_v2 = workspaces["fmha_v2"]
+    start = fmha_v2.data_ptr()
+    end = start + fmha_v2.numel() * fmha_v2.element_size()
+    # The semaphores come on top of the configured size, so fmha_v2 keeps all of it.
+    assert end - start == configured
+    assert end <= semaphores or start >= semaphores + 8 * 1024 * 1024, (
+        f"fmha_v2 workspace [{start - semaphores}, {end - semaphores}) overlaps "
+        "XQA's semaphores [0, 8 MiB)"
+    )
+
+
+@pytest.mark.parametrize(
+    "host_lens_live,pool_pages,copied_pages",
+    [
+        # The rows' own 3 + 1 pages, not the pool.
+        (True, 64, 4),
+        # No live host lens (seq_lens_sum is None): the whole pool.
+        (False, 64, 64),
+        # The batch's pages are no fewer than the pool's: the whole pool.
+        (True, 4, 4),
+    ],
+)
+def test_fmha_v2_prefill_copies_only_the_batch_pages(
+    make_xqa_backend, monkeypatch, host_lens_live, pool_pages, copied_pages
+):
+    backend = make_xqa_backend(None)
+    page_size, heads, head_dim = backend.page_size, 2, 4
+    seq_lens = torch.tensor([70, 20], dtype=torch.int32)
+    row_pages = [[3, 1, 0], [2]]
+    # Past each row's last page the table is unwritten.
+    page_table = torch.full((2, 4), 1 << 20, dtype=torch.int32)
+    for row, pages in enumerate(row_pages):
+        page_table[row, : len(pages)] = torch.tensor(pages)
+    k = torch.randn(pool_pages * page_size, heads, head_dim).to(torch.bfloat16)
+    v = torch.randn_like(k)
+    backend.token_to_kv_pool = SimpleNamespace(get_kv_buffer=lambda _: (k, v))
+
+    backend.kv_index_translator = SimpleNamespace(
+        read_table=lambda plan, rows: SimpleNamespace(
+            ids=page_table, is_translated=True
+        ),
+        space=lambda kind: None,
+    )
+    backend.use_sliding_window_kv_pool = False
+    monkeypatch.setattr(trtllm_mha_backend, "is_cp_active", lambda _: False)
+    calls = []
+
+    def prefill(qkv, **kwargs):
+        calls.append((qkv[1], kwargs["block_tables"]))
+        return torch.zeros_like(qkv[0])
+
+    monkeypatch.setattr(
+        trtllm_mha_backend,
+        "flashinfer",
+        SimpleNamespace(prefill=SimpleNamespace(trtllm_fmha_v2_prefill=prefill)),
+        raising=False,
+    )
+    fb = SimpleNamespace(
+        forward_mode=ForwardMode.EXTEND,
+        batch_size=2,
+        spec_info=None,
+        seq_lens=seq_lens,
+        seq_lens_cpu=seq_lens.long(),
+        seq_lens_sum=int(seq_lens.sum()) if host_lens_live else None,
+        extend_seq_lens_cpu=seq_lens.tolist(),
+        extend_prefix_lens_cpu=[0, 0],
+        req_pool_indices=torch.arange(2),
+        kv_loc_plan=None,
+        _attn_output=None,
+    )
+    layer = SimpleNamespace(
+        layer_id=0,
+        tp_q_head_num=heads,
+        tp_k_head_num=heads,
+        tp_v_head_num=heads,
+        head_dim=head_dim,
+        scaling=1.0,
+        sliding_window_size=-1,
+        attn_type=trtllm_mha_backend.AttentionType.DECODER,
+    )
+    backend.init_forward_metadata(fb)
+    q = torch.zeros(int(seq_lens.sum()), heads * head_dim, dtype=torch.bfloat16)
+    backend.forward_extend(q, None, None, layer, fb, save_kv_cache=False)
+
+    assert len(calls) == 1
+    paged_kv, block_tables = calls[0]
+    assert paged_kv.shape == (copied_pages, 2, page_size, heads, head_dim)
+    if copied_pages < pool_pages:
+        # A compact copy's table addresses the copy, past a row's last page too.
+        assert int(block_tables.max()) < copied_pages
+    k_pages = k.view(pool_pages, page_size, heads, head_dim)
+    v_pages = v.view(pool_pages, page_size, heads, head_dim)
+    for row, pages in enumerate(row_pages):
+        for col, page in enumerate(pages):
+            block = block_tables[row, col]
+            assert torch.equal(paged_kv[block, 0], k_pages[page])
+            assert torch.equal(paged_kv[block, 1], v_pages[page])
+
+
+class _LiveBytes(TorchDispatchMode):
+    """Peak bytes held by the tensors the dispatched ops allocate."""
+
+    def __init__(self):
+        super().__init__()
+        self.live = self.peak = 0
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        kwargs = kwargs or {}
+        given = {
+            t.untyped_storage().data_ptr()
+            for t in pytree.tree_leaves((args, kwargs))
+            if isinstance(t, torch.Tensor)
+        }
+        out = func(*args, **kwargs)
+        for t in pytree.tree_leaves(out):
+            if (
+                isinstance(t, torch.Tensor)
+                and t.untyped_storage().data_ptr() not in given
+            ):
+                nbytes = t.untyped_storage().nbytes()
+                self.live += nbytes
+                self.peak = max(self.peak, self.live)
+                weakref.finalize(t, self._release, nbytes)
+        return out
+
+    def _release(self, nbytes):
+        self.live -= nbytes
+
+
+@pytest.mark.parametrize("strided", [False, True], ids=["packed_pool", "strided_pool"])
+@pytest.mark.parametrize("pool_fraction", [0.5, 0.75, 0.97])
+def test_fmha_v2_prefill_copy_peaks_at_its_own_size(
+    make_xqa_backend, strided, pool_fraction
+):
+    """Bug regression: gathering K and V apart and then stacking them held the
+    batch's pages twice, more than the whole-pool copy once they pass half of it."""
+    backend = make_xqa_backend(None)
+    page_size, heads, head_dim, pool_pages = backend.page_size, 2, 16, 64
+    batch_pages = int(pool_pages * pool_fraction)
+    row_lens = [batch_pages // 2, batch_pages - batch_pages // 2]
+    perm = torch.randperm(pool_pages)
+    row_pages = [perm[: row_lens[0]], perm[row_lens[0] : batch_pages]]
+    page_table = torch.full((2, max(row_lens)), 1 << 20, dtype=torch.int32)
+    for row, pages in enumerate(row_pages):
+        page_table[row, : len(pages)] = pages.to(torch.int32)
+    shape = (pool_pages, page_size, heads, head_dim)
+    if strided:
+        kv = torch.randn(pool_pages, 2, *shape[1:]).to(torch.bfloat16)
+        k, v = kv[:, 0], kv[:, 1]
+    else:
+        k = torch.randn(shape).to(torch.bfloat16)
+        v = torch.randn_like(k)
+    # A partial last page still counts whole.
+    seq_lens = torch.tensor([n * page_size - 3 for n in row_lens], dtype=torch.int32)
+    metadata = trtllm_mha_backend.TRTLLMMHAMetadata(cache_seqlens_int32=seq_lens)
+    backend._init_fmha_v2_batch_pages(
+        metadata,
+        SimpleNamespace(seq_lens_cpu=seq_lens.long(), seq_lens_sum=int(seq_lens.sum())),
+    )
+    backend.forward_metadata = metadata
+
+    with _LiveBytes() as live:
+        paged_kv, block_table = backend._fmha_v2_paged_kv(k, v, page_table)
+
+    copy_bytes = paged_kv.numel() * paged_kv.element_size()
+    page_bytes = copy_bytes // (2 * batch_pages)
+    assert paged_kv.shape[0] == batch_pages
+    assert live.peak < copy_bytes + page_bytes
+    assert live.peak < 2 * k.numel() * k.element_size()
+    for row, pages in enumerate(row_pages):
+        blocks = block_table[row, : len(pages)].long()
+        assert torch.equal(paged_kv[blocks, 0], k[pages])
+        assert torch.equal(paged_kv[blocks, 1], v[pages])
+
+
+@pytest.mark.parametrize(
+    "max_running_requests,max_draft_tokens,max_cuda_graph_bs,expected",
+    [
+        (32, None, None, 32),
+        (32, 0, 16, 32),
+        (32, 4, 64, 256),
+        (7, 16, 4, 112),
+    ],
+)
+def test_native_nvfp4_output_capacity_includes_verify_width(
+    max_running_requests, max_draft_tokens, max_cuda_graph_bs, expected
+):
+    assert (
+        trtllm_mha_backend._native_fp4_decode_output_capacity(
+            max_running_requests, max_draft_tokens, max_cuda_graph_bs
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    "max_context_len,max_prefill_tokens,chunked_prefill_limit,expected",
+    [
+        (4096, 8192, 0, 8192),
+        (8192, 4096, 0, 8192),
+        (8192, 16384, 2048, 2048),
+    ],
+)
+def test_native_nvfp4_output_capacity_includes_unchunked_batch(
+    max_context_len, max_prefill_tokens, chunked_prefill_limit, expected
+):
+    assert (
+        trtllm_mha_backend._native_fp4_prefill_output_capacity(
+            max_context_len, max_prefill_tokens, chunked_prefill_limit
+        )
+        == expected
+    )
+
+
+def _make_backend_for_hook_test(speculative_num_draft_tokens=None):
+    from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
+
+    backend = TRTLLMHAAttnBackend.__new__(TRTLLMHAAttnBackend)
+    backend.device = torch.device("cpu")
+    backend.max_context_len = 1024
+    backend.page_size = PAGE_SIZE
+    backend.max_num_pages = 8
+    backend.req_to_token = torch.zeros(4, 1024, dtype=torch.int32)
+    backend.use_sliding_window_kv_pool = False
+    backend.use_fmha_v2 = False
+    backend._swa_kv_pool = None
+    backend._swa_full_to_swa_mapping = None
+    backend.speculative_step_id = 0
+    backend.speculative_num_draft_tokens = speculative_num_draft_tokens
+    backend.expand_encoder_only_verify = False
+    backend.decode_cuda_graph_metadata = {}
+    backend.target_verify_metadata = {}
+    backend.draft_extend_metadata = {}
+    # Passthrough source (static pool): every unified-arm branch stays off,
+    # matching the real __init__'s parent binding.
+    backend.kv_index_translator = KVIndexTranslator(
+        req_to_token=backend.req_to_token,
+        token_to_kv_pool_allocator=SimpleNamespace(),
+        token_to_kv_pool=SimpleNamespace(),
+        page_size=PAGE_SIZE,
+        device="cpu",
+    )
+    backend.init_cuda_graph_state(max_bs=4, max_num_tokens=16)
+    return backend
+
+
+@pytest.mark.parametrize(
+    "uses_genmha,prefill_native,decode_native,forward_mode,expected",
+    [
+        (True, True, True, ForwardMode.EXTEND, True),
+        (True, True, True, ForwardMode.TARGET_VERIFY, True),
+        # Hybrid mode=decode routes target verification into the decode child.
+        (True, False, True, ForwardMode.TARGET_VERIFY, True),
+        (True, False, True, ForwardMode.EXTEND, False),
+        # SM120 XQA has native access metadata but not the physical GenMHA layout.
+        (False, False, True, ForwardMode.TARGET_VERIFY, False),
+    ],
+)
+def test_extend_selects_native_nvfp4_layout_per_call(
+    uses_genmha, prefill_native, decode_native, forward_mode, expected
+):
+    backend = TRTLLMHAAttnBackend.__new__(TRTLLMHAAttnBackend)
+    backend.uses_trtllm_gen_native_fp4 = uses_genmha
+    backend.prefill_uses_native_fp4 = prefill_native
+    backend.decode_uses_native_fp4 = decode_native
+
+    forward_batch = SimpleNamespace(forward_mode=forward_mode)
+    assert backend._forward_extend_uses_native_fp4(forward_batch) is expected
+
+
+def test_cuda_graph_metadata_launch_runs_in_graph_hook(monkeypatch):
+    calls = []
+
+    def fake_update(**kwargs):
+        calls.append(kwargs)
+
+    monkeypatch.setattr(
+        trtllm_mha_backend, "update_trtllm_mha_graph_metadata", fake_update
+    )
+    backend = _make_backend_for_hook_test()
+    fb = SimpleNamespace(
+        batch_size=2,
+        req_pool_indices=torch.arange(2, dtype=torch.int64),
+        seq_lens=torch.ones(2, dtype=torch.int32),
+        forward_mode=ForwardMode.DECODE,
+        spec_info=None,
+        positions=torch.arange(2, dtype=torch.int64),
+        out_cache_loc=torch.arange(2, dtype=torch.int64),
+    )
+
+    backend.init_forward_metadata_out_graph(fb, in_capture=True)
+    assert calls == []
+    assert backend.forward_metadata is backend.decode_cuda_graph_metadata[2]
+
+    backend.init_forward_metadata_in_graph(fb)
+    assert len(calls) == 1
+    assert calls[0]["out_cache_loc"] is fb.out_cache_loc
+
+    calls.clear()
+    backend.init_forward_metadata_out_graph(fb)
+    assert calls == []
+    assert backend.forward_metadata is backend.decode_cuda_graph_metadata[2]
+
+
+def test_draft_extend_in_graph_uses_captured_static_q_stride(monkeypatch):
+    calls = []
+
+    def fake_update(**kwargs):
+        calls.append(kwargs)
+
+    class ExplodingAcceptTokens:
+        def __getitem__(self, key):
+            raise AssertionError("in-graph metadata must not inspect accept tokens")
+
+    monkeypatch.setattr(
+        trtllm_mha_backend, "update_trtllm_mha_graph_metadata", fake_update
+    )
+    backend = _make_backend_for_hook_test(speculative_num_draft_tokens=4)
+    fb = SimpleNamespace(
+        batch_size=2,
+        req_pool_indices=torch.arange(2, dtype=torch.int64),
+        seq_lens=torch.ones(2, dtype=torch.int32),
+        forward_mode=ForwardMode.DRAFT_EXTEND_V2,
+        spec_info=SimpleNamespace(
+            num_tokens_per_req=4,
+            num_accept_tokens=ExplodingAcceptTokens(),
+        ),
+        positions=torch.arange(8, dtype=torch.int64),
+        out_cache_loc=torch.arange(8, dtype=torch.int64),
+    )
+
+    backend.init_forward_metadata_out_graph(fb, in_capture=True)
+    # The in-graph body must use the captured static stride, not replay-time state.
+    fb.spec_info.num_tokens_per_req = 0
+    backend.init_forward_metadata_in_graph(fb)
+
+    assert len(calls) == 1
+    assert calls[0]["q_mode"] == Q_MODE_STRIDED
+    assert calls[0]["q_stride"] == 4
+
+
+def _translate_through_a_moving_page_map(backend):
+    """Give the backend a translating pool whose virtual->physical page map the
+    test rewrites before every replay, so a page-table column the refill missed
+    still holds an earlier replay's page."""
+    from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
+    from sglang.srt.mem_cache.kv_loc_plan import IdSpace, IdSpaceKind
+
+    rows, width = backend.req_to_token.shape
+    # Row r holds virtual pages r * width / PAGE_SIZE + 1, ...; page 0 is the sink.
+    backend.req_to_token.copy_(
+        torch.arange(rows * width, dtype=torch.int32).view(rows, width) + PAGE_SIZE
+    )
+    v2p = torch.zeros(rows * width // PAGE_SIZE + 1, dtype=torch.int64)
+    translator = KVIndexTranslator.__new__(KVIndexTranslator)
+    translator.req_to_token = backend.req_to_token
+    translator.page_size = PAGE_SIZE
+    translator.device = "cpu"
+    translator.is_translating = True
+    translator.defer_read_translate = False
+    translator._capture_page_size = PAGE_SIZE
+    translator._full_v2p_table = v2p
+    translator._spaces = {
+        IdSpaceKind.FULL: IdSpace(
+            key=(IdSpaceKind.FULL, "test"), write=lambda ids: ids, read_v2p=v2p
+        )
+    }
+    translator._rows = torch.arange(rows, dtype=torch.int64)
+    backend.kv_index_translator = translator
+    return v2p
+
+
+def _move_every_page(v2p, replay):
+    v2p[1:] = torch.arange(1, v2p.numel()) + 1000 * replay
+
+
+def _assert_reads_only_current_pages(backend, v2p, bs=2):
+    metadata = backend.forward_metadata
+    for row, length in enumerate(metadata.cache_seqlens_int32[:bs].tolist()):
+        pages = -(-length // PAGE_SIZE)
+        first_tokens = backend.req_to_token[row, : pages * PAGE_SIZE : PAGE_SIZE]
+        expected = v2p[first_tokens.long() // PAGE_SIZE].to(torch.int32)
+        stale = (metadata.page_table[row, :pages] != expected).nonzero().flatten()
+        assert stale.numel() == 0, (
+            f"row {row} reads {length} tokens ({pages} pages), but page-table "
+            f"columns {stale.tolist()} hold another replay's pages"
+        )
+
+
+def _graph_batch(seq_lens, forward_mode, spec_info, tokens_per_req):
+    seq_lens = torch.tensor(seq_lens, dtype=torch.int32)
+    bs = seq_lens.numel()
+    return SimpleNamespace(
+        batch_size=bs,
+        req_pool_indices=torch.arange(bs, dtype=torch.int64),
+        seq_lens=seq_lens,
+        seq_lens_cpu=seq_lens.clone(),
+        forward_mode=forward_mode,
+        spec_info=spec_info,
+        positions=torch.arange(bs * tokens_per_req, dtype=torch.int64),
+        # The window it writes; the reads under test do not depend on its ids.
+        out_cache_loc=torch.zeros(bs * tokens_per_req, dtype=torch.int64),
+    )
+
+
+def _replay_and_check_every_read(
+    monkeypatch,
+    backend,
+    batch,
+    bind_plan,
+    replays=([5, 9], [300, 3], [129, 700]),
+):
+    # The recorded kernel writes cache_seqlens = seq_lens + offset only when the
+    # graph runs, which is after replay-prep has refilled the page table.
+    def recorded_kernel(**kwargs):
+        bs = kwargs["bs"]
+        kwargs["cache_seqlens"][:bs].copy_(
+            kwargs["seq_lens"][:bs] + kwargs["seqlen_offset"]
+        )
+
+    monkeypatch.setattr(
+        trtllm_mha_backend, "update_trtllm_mha_graph_metadata", recorded_kernel
+    )
+    v2p = _translate_through_a_moving_page_map(backend)
+    capture = batch([1, 1])
+    bind_plan(backend.kv_index_translator, capture)
+    backend.init_forward_metadata_out_graph(capture, in_capture=True)
+    backend.init_forward_metadata_in_graph(capture)
+    # Rows grow across page boundaries and trade lengths between replays.
+    for n, seq_lens in enumerate(replays, start=1):
+        _move_every_page(v2p, n)
+        replay = batch(seq_lens)
+        bind_plan(backend.kv_index_translator, replay)
+        backend.init_forward_metadata_out_graph(replay)
+        backend.init_forward_metadata_in_graph(replay)
+        _assert_reads_only_current_pages(backend, v2p)
+
+
+def test_unified_decode_replay_reads_only_this_replays_pages(monkeypatch):
+    """A decode replay's page table is the plan of its own batch: the replay
+    reads no page an earlier replay refilled."""
+
+    def batch(seq_lens):
+        return _graph_batch(seq_lens, ForwardMode.DECODE, None, 1)
+
+    _replay_and_check_every_read(
+        monkeypatch,
+        _make_backend_for_hook_test(),
+        batch,
+        lambda translator, fb: translator.bind_own_plan(fb),
+    )
+
+
+def _eager_batch(seq_lens, forward_mode, spec_info=None, tokens_per_req=1):
+    seq_lens = torch.tensor(seq_lens, dtype=torch.int32)
+    bs = seq_lens.numel()
+    return SimpleNamespace(
+        batch_size=bs,
+        req_pool_indices=torch.arange(bs, dtype=torch.int64),
+        seq_lens=seq_lens,
+        seq_lens_cpu=seq_lens.clone(),
+        forward_mode=forward_mode,
+        spec_info=spec_info,
+        input_ids=torch.zeros(bs * tokens_per_req, dtype=torch.int64),
+        out_cache_loc=torch.zeros(bs * tokens_per_req, dtype=torch.int64),
+        extend_seq_lens=seq_lens,
+        extend_seq_lens_cpu=seq_lens.tolist(),
+        extend_prefix_lens_cpu=[0] * bs,
+    )
+
+
+def test_unified_eager_table_must_be_packed():
+    """XQA and fmha_v2 index a page table as packed rows (row length = width,
+    strides ignored). A plan whose table an earlier captured reader had built in
+    its own wider buffer hands a graphs-off reader a strided view, which they
+    would misread for every row after the first."""
+    backend = _make_backend_for_hook_test()
+    v2p = _translate_through_a_moving_page_map(backend)
+    _move_every_page(v2p, 1)
+    translator = backend.kv_index_translator
+
+    forward_batch = _eager_batch([127, 300], ForwardMode.DECODE)
+    translator.bind_own_plan(forward_batch)
+    backend.init_forward_metadata(forward_batch)
+    assert backend.forward_metadata.page_table.is_contiguous()
+    _assert_reads_only_current_pages(backend, v2p)
+
+    forward_batch = _eager_batch([127, 300], ForwardMode.DECODE)
+    translator.bind_own_plan(forward_batch)
+    captured = torch.zeros((8, backend.max_num_pages), dtype=torch.int32)
+    translator.copy_page_table(forward_batch.kv_loc_plan, out=captured[:2])
+    with pytest.raises(AssertionError, match="packed rows"):
+        backend.init_forward_metadata(forward_batch)
+
+
+def _bind_iteration_plan(translator, forward_batch, window=4):
+    """The plan a speculative worker builds once per iteration: its reads reach
+    the whole draft window past the committed lengths."""
+    translator.plan(
+        req_pool_indices=forward_batch.req_pool_indices,
+        seq_lens=forward_batch.seq_lens,
+        seq_lens_cpu=forward_batch.seq_lens_cpu,
+        write_virtual=forward_batch.out_cache_loc,
+        read_extent=window,
+    ).bind(forward_batch, translator)
+
+
+@pytest.mark.parametrize(
+    "forward_mode,spec_info,step_id,tokens_per_req",
+    [
+        (ForwardMode.DECODE, SimpleNamespace(), 1, 1),
+        (ForwardMode.TARGET_VERIFY, SimpleNamespace(ragged_verify_layout=None), 0, 4),
+        (ForwardMode.DRAFT_EXTEND_V2, SimpleNamespace(num_tokens_per_req=4), 0, 4),
+    ],
+    ids=["draft_decode", "target_verify", "draft_extend"],
+)
+def test_unified_spec_replay_reads_only_this_replays_pages(
+    monkeypatch, forward_mode, spec_info, step_id, tokens_per_req
+):
+    """A speculative replay reads past seq_lens: a draft step reads back its
+    earlier steps, a verify the drafts it scores."""
+    backend = _make_backend_for_hook_test(speculative_num_draft_tokens=4)
+    backend.speculative_step_id = step_id
+
+    def batch(seq_lens):
+        return _graph_batch(seq_lens, forward_mode, spec_info, tokens_per_req)
+
+    # 127 committed tokens plus the drafts reach a page the prefix does not.
+    _replay_and_check_every_read(
+        monkeypatch,
+        backend,
+        batch,
+        _bind_iteration_plan,
+        replays=([5, 9], [127, 300], [129, 700]),
+    )
+
+
+def test_unified_ragged_verify_reads_only_this_replays_pages(monkeypatch):
+    # Ragged verify writes per-row lengths before the refill; its geometry needs
+    # GPU kernels, so this stand-in writes the same lengths the real one does.
+    verify_lens = torch.tensor([1, 7], dtype=torch.int32)
+
+    def write_ragged(metadata, forward_batch, ragged_layout, bs, in_capture=False):
+        metadata.cache_seqlens_int32[:bs].copy_(
+            forward_batch.seq_lens[:bs] + verify_lens
+        )
+
+    backend = _make_backend_for_hook_test(speculative_num_draft_tokens=4)
+    backend.is_xqa_impl = False
+    monkeypatch.setattr(backend, "_write_ragged_verify_graph_metadata", write_ragged)
+    spec_info = SimpleNamespace(ragged_verify_layout=object())
+
+    def batch(seq_lens):
+        return _graph_batch(seq_lens, ForwardMode.TARGET_VERIFY, spec_info, 8)
+
+    # 123 + 7 crosses a page boundary that 123 plus the uniform draft width does not.
+    _replay_and_check_every_read(
+        monkeypatch,
+        backend,
+        batch,
+        lambda translator, fb: _bind_iteration_plan(translator, fb, window=8),
+        replays=([5, 123], [300, 3]),
+    )
+
+
+@pytest.mark.parametrize(
+    "forward_mode,spec_info,step_id,tokens_per_req",
+    [
+        (ForwardMode.DECODE, SimpleNamespace(), 1, 1),
+        (ForwardMode.TARGET_VERIFY, SimpleNamespace(ragged_verify_layout=None), 0, 4),
+    ],
+    ids=["draft_decode", "target_verify"],
+)
+def test_unified_eager_spec_table_covers_every_page_read(
+    forward_mode, spec_info, step_id, tokens_per_req
+):
+    backend = _make_backend_for_hook_test(speculative_num_draft_tokens=4)
+    backend.speculative_step_id = step_id
+    v2p = _translate_through_a_moving_page_map(backend)
+    _move_every_page(v2p, 1)
+    # 127 committed tokens plus the drafts reach a page the prefix does not.
+    forward_batch = _eager_batch([127, 3], forward_mode, spec_info, tokens_per_req)
+    _bind_iteration_plan(backend.kv_index_translator, forward_batch)
+    backend.init_forward_metadata(forward_batch)
+    _assert_reads_only_current_pages(backend, v2p)
+
+
+def test_hybrid_wrappers_forward_in_graph_hook():
+    # The hybrid backend reads the mode from the published configuration.
+    from sglang.srt.runtime_context import get_context
+
+    override = get_context().override_server_args(speculative_attention_mode="decode")
+    override.install()
+    try:
+        """Hybrid wrappers must forward init_forward_metadata_in_graph to the
+        wrapped backend(s) — the inherited no-op would leave the fused metadata
+        rebuild out of the captured graph (stale page table on every replay)."""
+        from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
+        from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+            HybridLinearAttnBackend,
+        )
+
+        def make_fake(name, calls):
+            return SimpleNamespace(
+                token_to_kv_pool=None,
+                req_to_token_pool=None,
+                needs_cpu_seq_lens=False,
+                kv_index_translator=None,
+                init_forward_metadata_in_graph=lambda fb: calls.append(name),
+            )
+
+        fb = SimpleNamespace(forward_mode=ForwardMode.DECODE)
+
+        calls = []
+        hybrid = HybridAttnBackend(
+            SimpleNamespace(
+                kv_cache_dtype=torch.bfloat16,
+                token_to_kv_pool=None,
+                req_to_token_pool=None,
+                kv_index_translator=None,
+                server_args=SimpleNamespace(speculative_attention_mode="decode"),
+                model_config=SimpleNamespace(context_len=2048),
+            ),
+            prefill_backend=make_fake("prefill", calls),
+            decode_backend=make_fake("decode", calls),
+        )
+        hybrid.init_forward_metadata_in_graph(fb)
+        assert calls == ["decode"]
+
+        calls = []
+        hybrid_linear = HybridLinearAttnBackend(
+            full_attn_backend=make_fake("full", calls),
+            linear_attn_backend=make_fake("linear", calls),
+            full_attn_layers=[0],
+        )
+        hybrid_linear.init_forward_metadata_in_graph(fb)
+        assert calls == ["full", "linear"]
+    finally:
+        override.restore()
+
+
+def test_metadata_update_records_inside_cuda_graph():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+
+    backend = _make_backend_for_hook_test()
+    backend.device = torch.device(DEVICE)
+    backend.page_size = 2
+    backend.max_num_pages = 4
+    backend.req_to_token = torch.arange(32, dtype=torch.int32, device=DEVICE).reshape(
+        4, 8
+    )
+    backend.init_cuda_graph_state(max_bs=2, max_num_tokens=2)
+
+    fb = SimpleNamespace(
+        batch_size=2,
+        req_pool_indices=torch.arange(2, dtype=torch.int64, device=DEVICE),
+        seq_lens=torch.tensor([3, 4], dtype=torch.int32, device=DEVICE),
+        forward_mode=ForwardMode.DECODE,
+        spec_info=None,
+        positions=torch.arange(2, dtype=torch.int64, device=DEVICE),
+        out_cache_loc=torch.arange(2, dtype=torch.int64, device=DEVICE),
+    )
+
+    backend.init_forward_metadata_out_graph(fb, in_capture=True)
+    backend.init_forward_metadata_in_graph(fb)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        backend.init_forward_metadata_in_graph(fb)
+
+    fb.seq_lens.copy_(torch.tensor([5, 6], dtype=torch.int32, device=DEVICE))
+    graph.replay()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(
+        backend.forward_metadata.cache_seqlens_int32,
+        torch.tensor([5, 6], dtype=torch.int32, device=DEVICE),
+        rtol=0,
+        atol=0,
+    )
+
+
+def test_graph_read_done_event_fences_slot_mutation():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+
+    backend = _make_backend_for_hook_test()
+    backend.device = torch.device(DEVICE)
+    backend.page_size = 2
+    backend.max_num_pages = 2
+    backend.use_sliding_window_kv_pool = True
+    backend._swa_kv_pool = object()
+    backend.req_to_token = torch.tensor(
+        [[0, 1, 2, 3], [8, 9, 10, 11]], dtype=torch.int32, device=DEVICE
+    )
+    backend._swa_full_to_swa_mapping = (
+        torch.arange(32, dtype=torch.int64, device=DEVICE) * 2
+    )
+    backend.init_cuda_graph_state(max_bs=1, max_num_tokens=1)
+    forward_batch = SimpleNamespace(
+        batch_size=1,
+        req_pool_indices=torch.tensor([0], dtype=torch.int64, device=DEVICE),
+        seq_lens=torch.tensor([4], dtype=torch.int32, device=DEVICE),
+        forward_mode=ForwardMode.DECODE,
+        spec_info=None,
+        positions=torch.tensor([0], dtype=torch.int64, device=DEVICE),
+        out_cache_loc=torch.tensor([3], dtype=torch.int64, device=DEVICE),
+    )
+
+    backend.init_forward_metadata_out_graph(forward_batch, in_capture=True)
+    backend.init_forward_metadata_in_graph(forward_batch)
+    torch.cuda.synchronize()
+
+    read_done = torch.cuda.Event(external=True)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        backend.init_forward_metadata_in_graph(forward_batch)
+        read_done.record()
+
+    fence_stream = torch.cuda.Stream()
+    mutation_done = torch.cuda.Event()
+    graph.replay()
+    with torch.cuda.stream(fence_stream):
+        fence_stream.wait_event(read_done)
+        backend.req_to_token.copy_(
+            torch.tensor(
+                [[8, 9, 10, 11], [0, 1, 2, 3]],
+                dtype=torch.int32,
+                device=DEVICE,
+            )
+        )
+        backend._swa_full_to_swa_mapping.add_(64)
+        mutation_done.record()
+    torch.cuda.current_stream().wait_event(mutation_done)
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(
+        backend.forward_metadata.page_table,
+        torch.tensor([[0, 1]], dtype=torch.int32, device=DEVICE),
+    )
+    torch.testing.assert_close(
+        backend.forward_metadata.swa_page_table,
+        torch.tensor([[0, 2]], dtype=torch.int32, device=DEVICE),
+    )
+    torch.testing.assert_close(
+        backend.forward_metadata.swa_out_cache_loc,
+        torch.tensor([6], dtype=torch.int64, device=DEVICE),
+    )
+
+    graph.replay()
+    with torch.cuda.stream(fence_stream):
+        fence_stream.wait_event(read_done)
+        backend.req_to_token.copy_(
+            torch.tensor(
+                [[0, 1, 2, 3], [8, 9, 10, 11]],
+                dtype=torch.int32,
+                device=DEVICE,
+            )
+        )
+        backend._swa_full_to_swa_mapping.sub_(64)
+        mutation_done.record()
+    torch.cuda.current_stream().wait_event(mutation_done)
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(
+        backend.forward_metadata.page_table,
+        torch.tensor([[4, 5]], dtype=torch.int32, device=DEVICE),
+    )
+    torch.testing.assert_close(
+        backend.forward_metadata.swa_page_table,
+        torch.tensor([[40, 42]], dtype=torch.int32, device=DEVICE),
+    )
+    torch.testing.assert_close(
+        backend.forward_metadata.swa_out_cache_loc,
+        torch.tensor([70], dtype=torch.int64, device=DEVICE),
+    )
+
+
+def test_swa_cache_write_uses_metadata_slot_snapshot():
+    snapshot = torch.tensor([6], dtype=torch.int64)
+
+    def translate_live_mapping(_):
+        raise AssertionError("cache writes must not read the live SWA mapping")
+
+    backend = TRTLLMHAAttnBackend.__new__(TRTLLMHAAttnBackend)
+    backend._swa_kv_pool = SimpleNamespace(
+        layers_mapping={1: (0, True)},
+        translate_loc_from_full_to_swa=translate_live_mapping,
+    )
+    backend.forward_metadata = SimpleNamespace(swa_out_cache_loc=snapshot)
+    forward_batch = SimpleNamespace(out_cache_loc=torch.tensor([3], dtype=torch.int64))
+
+    cache_loc = backend._get_layer_cache_loc(SimpleNamespace(layer_id=1), forward_batch)
+
+    torch.testing.assert_close(cache_loc, snapshot, rtol=0, atol=0)
+
+
+def _build_inputs(bs, pool_size, max_num_pages, max_seq_pages, seq_max, seed):
+    """Build random pool / indices / seq_lens consistent with backend buffers."""
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    req_to_token_stride = max_num_pages * PAGE_SIZE
+    # int32 token ids in [0, pool_token_cap); -1 allowed in unused tails.
+    pool_token_cap = pool_size * req_to_token_stride
+    req_to_token = torch.randint(
+        0,
+        pool_token_cap,
+        (pool_size, req_to_token_stride),
+        generator=g,
+        dtype=torch.int32,
+    ).to(DEVICE)
+    req_pool_indices = torch.randperm(pool_size, generator=g)[:bs].to(
+        DEVICE, dtype=torch.int64
+    )
+    seq_lens = torch.randint(1, seq_max + 1, (bs,), generator=g, dtype=torch.int32).to(
+        DEVICE
+    )
+    return req_to_token, req_pool_indices, seq_lens, req_to_token_stride, pool_token_cap
+
+
+def _ref_cache_seqlens(seq_lens, seqlen_offset):
+    return (seq_lens.to(torch.int32) + seqlen_offset).to(torch.int32)
+
+
+def _ref_page_table(req_to_token, req_pool_indices, max_seq_pages):
+    strided = torch.arange(0, max_seq_pages * PAGE_SIZE, PAGE_SIZE, device=DEVICE)
+    gathered = req_to_token[req_pool_indices[:, None], strided[None, :]]
+    return gathered // PAGE_SIZE, gathered
+
+
+def _ref_swa_page_table(gathered_tokens, swa_mapping):
+    # mimic mapping[-1]=-1 sentinel: token<0 -> -1, else mapping[token]//page
+    tok = gathered_tokens.to(torch.int64)
+    safe = torch.where(tok >= 0, tok, torch.zeros_like(tok))
+    swa_token = swa_mapping[safe]
+    swa_token = torch.where(tok >= 0, swa_token, torch.full_like(swa_token, -1))
+    swa_page = torch.where(
+        swa_token < 0,
+        torch.full_like(swa_token, -1),
+        swa_token // PAGE_SIZE,
+    )
+    return swa_page.to(torch.int32)
+
+
+def _make_swa_mapping(pool_token_cap, seed):
+    g = torch.Generator(device="cpu").manual_seed(seed + 7)
+    # Random non-negative SWA pool ids, with a -1 sentinel appended (index -1).
+    mapping = torch.randint(
+        0, pool_token_cap, (pool_token_cap + PAGE_SIZE + 1,), generator=g
+    ).to(DEVICE, dtype=torch.int64)
+    mapping[-1] = -1  # sentinel for wrapped -1 index
+    return mapping
+
+
+@pytest.mark.parametrize("bs", [1, 3, 8, 17])
+@pytest.mark.parametrize("seqlen_offset", [0, 1, 4])
+@pytest.mark.parametrize("q_mode", [Q_MODE_NONE, Q_MODE_CUMSUM, Q_MODE_STRIDED])
+@pytest.mark.parametrize("with_swa", [False, True])
+# static_width=True exercises the production path: the backend passes the STATIC
+# max_num_pages upper bound, not a per-batch dynamic width. The kernel self-guards
+# on the device-side seqlen, so the checks compare only the live prefix per row.
+@pytest.mark.parametrize("static_width", [False, True])
+def test_metadata_correctness(bs, seqlen_offset, q_mode, with_swa, static_width):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+
+    seed = (
+        1234
+        + bs * 31
+        + seqlen_offset * 7
+        + q_mode * 3
+        + int(with_swa)
+        + 1000 * int(static_width)
+    )
+    pool_size = 64
+    max_num_pages = 16
+    seq_max = (max_num_pages - 2) * PAGE_SIZE  # leave headroom for seqlen_offset
+    seq_max = min(seq_max, 1500)
+
+    (
+        req_to_token,
+        req_pool_indices,
+        seq_lens,
+        req_to_token_stride,
+        pool_token_cap,
+    ) = _build_inputs(bs, pool_size, max_num_pages, None, seq_max, seed)
+
+    cache_seqlens_ref = _ref_cache_seqlens(seq_lens, seqlen_offset)
+    max_seq_len_k = int(cache_seqlens_ref.max().item())
+    if static_width:
+        # Production passes the static upper bound (self.max_num_pages), not a
+        # dynamic per-batch width — write the whole table every replay.
+        max_seq_pages = max_num_pages
+    else:
+        max_seq_pages = (max_seq_len_k + PAGE_SIZE - 1) // PAGE_SIZE
+
+    # Pre-allocated output buffers (mirror init_cuda_graph_state).
+    cache_seqlens = torch.zeros(bs, dtype=torch.int32, device=DEVICE)
+    cu_seqlens_k = torch.zeros(bs + 1, dtype=torch.int32, device=DEVICE)
+    page_table = torch.zeros(bs, max_num_pages, dtype=torch.int32, device=DEVICE)
+
+    cu_seqlens_q = None
+    qlens = None
+    q_stride = 0
+    if q_mode == Q_MODE_CUMSUM:
+        cu_seqlens_q = torch.zeros(bs + 1, dtype=torch.int32, device=DEVICE)
+        g = torch.Generator(device="cpu").manual_seed(seed + 99)
+        qlens = torch.randint(1, 6, (bs,), generator=g, dtype=torch.int32).to(DEVICE)
+    elif q_mode == Q_MODE_STRIDED:
+        cu_seqlens_q = torch.zeros(bs + 1, dtype=torch.int32, device=DEVICE)
+        q_stride = 4
+
+    swa_mapping = None
+    swa_page_table = None
+    swa_out_cache_loc = None
+    out_cache_loc = None
+    if with_swa:
+        swa_mapping = _make_swa_mapping(pool_token_cap, seed)
+        swa_page_table = torch.zeros(
+            bs, max_num_pages, dtype=torch.int32, device=DEVICE
+        )
+        num_out = bs  # one written token per request (decode-like)
+        swa_out_len = num_out + 5  # extra padding tail to validate zero-fill
+        swa_out_cache_loc = torch.full(
+            (swa_out_len,), 123, dtype=torch.int64, device=DEVICE
+        )
+        g = torch.Generator(device="cpu").manual_seed(seed + 555)
+        out_cache_loc = torch.randint(
+            0, pool_token_cap, (num_out,), generator=g, dtype=torch.int64
+        ).to(DEVICE)
+        # inject a -1 entry to exercise the sentinel path
+        out_cache_loc[0] = -1
+
+    update_trtllm_mha_graph_metadata(
+        req_pool_indices=req_pool_indices,
+        seq_lens=seq_lens,
+        req_to_token=req_to_token,
+        cache_seqlens=cache_seqlens,
+        cu_seqlens_k=cu_seqlens_k,
+        page_table=page_table,
+        bs=bs,
+        seqlen_offset=seqlen_offset,
+        max_seq_pages=max_seq_pages,
+        page_size=PAGE_SIZE,
+        swa_mapping=swa_mapping,
+        swa_page_table=swa_page_table,
+        out_cache_loc=out_cache_loc,
+        swa_out_cache_loc=swa_out_cache_loc,
+        cu_seqlens_q=cu_seqlens_q,
+        qlens=qlens,
+        q_stride=q_stride,
+        q_mode=q_mode,
+    )
+    torch.cuda.synchronize()
+
+    # ---- cache_seqlens ----
+    torch.testing.assert_close(cache_seqlens, cache_seqlens_ref, rtol=0, atol=0)
+
+    # ---- cu_seqlens_k ----
+    cu_k_ref = torch.zeros(bs + 1, dtype=torch.int32, device=DEVICE)
+    cu_k_ref[1:] = torch.cumsum(cache_seqlens_ref, dim=0, dtype=torch.int32)
+    torch.testing.assert_close(cu_seqlens_k, cu_k_ref, rtol=0, atol=0)
+
+    # ---- page_table (live [:pages(cache_seqlen)] prefix per row) ----
+    pt_ref, gathered = _ref_page_table(req_to_token, req_pool_indices, max_seq_pages)
+    live_pages = torch.clamp(
+        (cache_seqlens_ref.to(torch.int64) + PAGE_SIZE - 1) // PAGE_SIZE,
+        max=max_seq_pages,
+    )
+    live_mask = torch.arange(max_seq_pages, device=DEVICE).view(
+        1, -1
+    ) < live_pages.view(-1, 1)
+    torch.testing.assert_close(
+        page_table[:, :max_seq_pages][live_mask], pt_ref[live_mask], rtol=0, atol=0
+    )
+
+    # ---- cu_seqlens_q ----
+    if q_mode == Q_MODE_CUMSUM:
+        cu_q_ref = torch.zeros(bs + 1, dtype=torch.int32, device=DEVICE)
+        cu_q_ref[1:] = torch.cumsum(qlens, dim=0, dtype=torch.int32)
+        torch.testing.assert_close(cu_seqlens_q, cu_q_ref, rtol=0, atol=0)
+    elif q_mode == Q_MODE_STRIDED:
+        cu_q_ref = torch.zeros(bs + 1, dtype=torch.int32, device=DEVICE)
+        cu_q_ref[1:] = (
+            torch.arange(1, bs + 1, device=DEVICE, dtype=torch.int32) * q_stride
+        )
+        torch.testing.assert_close(cu_seqlens_q, cu_q_ref, rtol=0, atol=0)
+
+    # ---- swa_page_table / swa_out_cache_loc ----
+    if with_swa:
+        swa_pt_ref = _ref_swa_page_table(gathered, swa_mapping)
+        torch.testing.assert_close(
+            swa_page_table[:, :max_seq_pages][live_mask],
+            swa_pt_ref[live_mask],
+            rtol=0,
+            atol=0,
+        )
+
+        # swa_out_cache_loc reference: translate real prefix, zero-fill tail.
+        num_out = out_cache_loc.shape[0]
+        swa_out_len = swa_out_cache_loc.shape[0]
+        num_real = min(num_out, swa_out_len)
+        out_ref = torch.zeros(swa_out_len, dtype=torch.int64, device=DEVICE)
+        loc = out_cache_loc[:num_real].to(torch.int64)
+        safe = torch.where(loc >= 0, loc, torch.zeros_like(loc))
+        translated = swa_mapping[safe]
+        translated = torch.where(loc >= 0, translated, torch.full_like(translated, -1))
+        out_ref[:num_real] = translated
+        torch.testing.assert_close(swa_out_cache_loc, out_ref, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("pass_tables", [False, True])
+def test_skip_page_table_updates_seqlens_only(pass_tables):
+    """The unified-memory arm: skip_page_table=True must still rebuild the
+    seqlen metadata in-graph but leave every page-table byte alone -- the bound
+    tables are capture-stable read tables the translator refreshes
+    out-of-graph, and an in-graph write would clobber them with virtual-derived
+    pages. Covers both call shapes: page_table=None (what the backend passes)
+    and a real sentinel-filled table (pins that the writes are compiled out,
+    not just unpassed)."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+
+    bs, seqlen_offset, seed = 5, 1, 4242
+    pool_size, max_num_pages = 64, 16
+    seq_max = (max_num_pages - 2) * PAGE_SIZE
+    (
+        req_to_token,
+        req_pool_indices,
+        seq_lens,
+        _stride,
+        _cap,
+    ) = _build_inputs(bs, pool_size, max_num_pages, None, seq_max, seed)
+
+    cache_seqlens = torch.zeros(bs, dtype=torch.int32, device=DEVICE)
+    cu_seqlens_k = torch.zeros(bs + 1, dtype=torch.int32, device=DEVICE)
+    sentinel_pt = None
+    sentinel_swa = None
+    if pass_tables:
+        sentinel_pt = torch.full(
+            (bs, max_num_pages), 777, dtype=torch.int32, device=DEVICE
+        )
+        sentinel_swa = torch.full(
+            (bs, max_num_pages), 888, dtype=torch.int32, device=DEVICE
+        )
+
+    update_trtllm_mha_graph_metadata(
+        req_pool_indices=req_pool_indices,
+        seq_lens=seq_lens,
+        req_to_token=req_to_token,
+        cache_seqlens=cache_seqlens,
+        cu_seqlens_k=cu_seqlens_k,
+        page_table=sentinel_pt,
+        bs=bs,
+        seqlen_offset=seqlen_offset,
+        max_seq_pages=max_num_pages,
+        page_size=PAGE_SIZE,
+        swa_page_table=sentinel_swa,
+        skip_page_table=True,
+    )
+    torch.cuda.synchronize()
+
+    cache_seqlens_ref = _ref_cache_seqlens(seq_lens, seqlen_offset)
+    torch.testing.assert_close(cache_seqlens, cache_seqlens_ref, rtol=0, atol=0)
+    cu_k_ref = torch.zeros(bs + 1, dtype=torch.int32, device=DEVICE)
+    cu_k_ref[1:] = torch.cumsum(cache_seqlens_ref, dim=0, dtype=torch.int32)
+    torch.testing.assert_close(cu_seqlens_k, cu_k_ref, rtol=0, atol=0)
+    if pass_tables:
+        assert bool((sentinel_pt == 777).all()), "page_table written despite skip"
+        assert bool((sentinel_swa == 888).all()), "swa_page_table written despite skip"
+
+
+def test_bs_zero_noop():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    # bs == 0 should be a no-op (early return).
+    cache_seqlens = torch.zeros(0, dtype=torch.int32, device=DEVICE)
+    cu_seqlens_k = torch.zeros(1, dtype=torch.int32, device=DEVICE)
+    page_table = torch.zeros(0, 4, dtype=torch.int32, device=DEVICE)
+    update_trtllm_mha_graph_metadata(
+        req_pool_indices=torch.zeros(0, dtype=torch.int64, device=DEVICE),
+        seq_lens=torch.zeros(0, dtype=torch.int32, device=DEVICE),
+        req_to_token=torch.zeros(4, 4 * PAGE_SIZE, dtype=torch.int32, device=DEVICE),
+        cache_seqlens=cache_seqlens,
+        cu_seqlens_k=cu_seqlens_k,
+        page_table=page_table,
+        bs=0,
+        seqlen_offset=0,
+        max_seq_pages=0,
+        page_size=PAGE_SIZE,
+    )
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v", "-s"]))

@@ -13,7 +13,6 @@ Usage:
 from __future__ import annotations
 
 import logging
-import os
 import threading
 from typing import List, Optional, Tuple
 
@@ -21,11 +20,43 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.memory.ptr_table import make_ptr_table
+from sglang.srt.environ import envs
+from sglang.srt.utils import create_device_stream, device_stream_context
+
 logger = logging.getLogger(__name__)
 
 # TODO(yangminl): remove torch fallback implementations once the Triton kernels
 # have been validated in production across all configurations.
-_USE_TRITON_STAGING = not bool(os.environ.get("SGLANG_STAGING_USE_TORCH", ""))
+_USE_TRITON_STAGING = not envs.SGLANG_STAGING_USE_TORCH.get()
+
+# CUDA (including ROCm, which reports "cuda") is the original staging target;
+# XPU is the only other device validated on this path.
+_STAGING_SUPPORTED_DEVICE_TYPES = ("cuda", "xpu")
+
+
+def _device_ptr_type_str(ptr: int, device_type: str) -> str:
+    """XPU kernel-space pointers set bit 63; empty string off XPU."""
+    if device_type != "xpu":
+        return ""
+    if ptr & (1 << 63):
+        return ", ptr_type=XPU-kernel-space"
+    else:
+        return ", ptr_type=XPU-user-space"
+
+
+def _check_kv_on_staging_device(
+    k_buffers: list, v_buffers: list, staging_device: torch.device
+) -> None:
+    assert k_buffers, "k_buffers must not be empty"
+    assert v_buffers, "v_buffers must not be empty"
+    device = k_buffers[0].device
+    # The kernels read KV pointers and write staging in one launch, so a
+    # cross-device pair would fault inside the kernel rather than here.
+    assert device == staging_device, (
+        f"KV buffers are on {device} but staging is on {staging_device}; "
+        f"both must be the same device."
+    )
 
 
 @triton.jit
@@ -130,23 +161,76 @@ class StagingBuffer:
         custom_mem_pool=None,
     ):
         self.size_bytes = size_bytes
+        if isinstance(device, str):
+            device = torch.device(device)
+
+        # An explicit index on the device string wins over gpu_id, so a caller
+        # passing "xpu:3" cannot end up allocating on a different device.
+        if device.index is not None and device.index != gpu_id:
+            logger.warning(
+                f"Device index mismatch: device={device} (index={device.index}) "
+                f"but gpu_id={gpu_id}. Using device.index={device.index}."
+            )
+            gpu_id = device.index
+        elif device.index is None:
+            device = torch.device(device.type, gpu_id)
+
         self.device = device
         self.gpu_id = gpu_id
 
-        torch.cuda.set_device(gpu_id)
-        if custom_mem_pool is not None:
+        if device.type not in _STAGING_SUPPORTED_DEVICE_TYPES:
+            raise RuntimeError(
+                f"Staging buffer is not supported on device type '{device.type}' "
+                f"(supported: {', '.join(_STAGING_SUPPORTED_DEVICE_TYPES)}). "
+                f"Unset SGLANG_DISAGG_STAGING_BUFFER to disable it."
+            )
+
+        if device.type != "cuda" and custom_mem_pool is not None:
+            logger.warning(
+                f"Custom memory pools are a CUDA construct and are ignored on "
+                f"{device.type}. Using the default allocator instead; memory may "
+                f"not be RDMA-compatible."
+            )
+
+        self.device_module = torch.get_device_module(device)
+        self.device_module.set_device(gpu_id)
+
+        if device.type == "cuda" and custom_mem_pool is not None:
             with torch.cuda.use_mem_pool(custom_mem_pool):
                 self.buffer = torch.empty(size_bytes, dtype=torch.uint8, device=device)
             alloc_method = "custom_mem_pool (cuMemCreate)"
-        else:
+        elif device.type == "cuda":
             self.buffer = torch.empty(size_bytes, dtype=torch.uint8, device=device)
             alloc_method = "cudaMalloc"
+        else:
+            # XPU has no equivalent of use_mem_pool, so its default caching
+            # allocator backs the buffer.
+            self.buffer = torch.empty(size_bytes, dtype=torch.uint8, device=device)
+            alloc_method = "default allocator"
+
         self.data_ptr = self.buffer.data_ptr()
 
+        # Created on first gather; the decode-side allocator's buffer never
+        # gathers, so eager creation would leak one device stream per rank.
+        self._gather_stream: Optional[torch.Stream] = None
+
+        ptr_type_str = _device_ptr_type_str(self.data_ptr, device.type)
         logger.info(
-            f"StagingBuffer allocated: {size_bytes / (1024*1024):.1f} MB "
-            f"on {device}, method={alloc_method}, ptr=0x{self.data_ptr:x}"
+            f"StagingBuffer allocated: {size_bytes / (1024 * 1024):.1f} MB "
+            f"on {device}, method={alloc_method}, ptr=0x{self.data_ptr:x}{ptr_type_str}"
         )
+
+    def producer_stream(self) -> torch.Stream:
+        """The calling thread's current stream, for the gather to order against.
+
+        Resolved per call: the current stream is thread-local and the transfer
+        workers run on their own threads. This edge does not order the gather
+        after the prefill forward that wrote the KV rows. Under overlap, the
+        early-send path queues a chunk while that forward may still be running,
+        and TransferKVChunk.wait_event, synchronized before the gather, provides
+        the ordering; every other send runs after the forward has resolved.
+        """
+        return self.device_module.current_stream(self.device)
 
     def get_ptr(self) -> int:
         return self.data_ptr
@@ -156,6 +240,14 @@ class StagingBuffer:
 
     def fits(self, required_bytes: int) -> bool:
         return required_bytes <= self.size_bytes
+
+    def create_stream(self) -> torch.Stream:
+        return create_device_stream(self.device)
+
+    def get_gather_stream(self) -> torch.Stream:
+        if self._gather_stream is None:
+            self._gather_stream = self.create_stream()
+        return self._gather_stream
 
 
 class StagingAllocator:
@@ -194,11 +286,15 @@ class StagingAllocator:
         self.watermark_round = 0
         self.watermark_tail = 0
         self.lock = threading.Lock()
+        # Lazily created on the decode side by the first scatter; stays None
+        # until then so release_room can drain it without a defensive check.
+        self._scatter_stream = None
 
+        ptr_type_str = _device_ptr_type_str(self.base_ptr, self.buffer.device.type)
         logger.info(
             f"StagingAllocator (ring+overcommit): "
-            f"{total_size_bytes / (1024*1024):.1f} MB "
-            f"on {device}, ptr=0x{self.base_ptr:x}"
+            f"{total_size_bytes / (1024 * 1024):.1f} MB "
+            f"on {device}, ptr=0x{self.base_ptr:x}{ptr_type_str}"
         )
 
     def assign(self, required_bytes: int) -> Optional[Tuple[int, int, int]]:
@@ -233,8 +329,12 @@ class StagingAllocator:
                 self.alloc_order.pop(0)
 
             if not self.allocations:
+                # An empty ring makes the entire prior round reusable. Start a
+                # fresh round at offset zero so the watermark cannot stay stale.
+                self.round += 1
+                self.head = 0
                 self.watermark_round = self.round
-                self.watermark_tail = self.head
+                self.watermark_tail = 0
             elif self.alloc_order:
                 off, _, rnd = self.allocations[self.alloc_order[0]]
                 self.watermark_round = rnd
@@ -252,10 +352,6 @@ class StagingAllocator:
     def get_offset(self, alloc_id: int) -> int:
         offset, _, _ = self.allocations[alloc_id]
         return offset
-
-    def get_round(self, alloc_id: int) -> int:
-        _, _, rnd = self.allocations[alloc_id]
-        return rnd
 
     def get_base_ptr(self) -> int:
         return self.base_ptr
@@ -327,7 +423,6 @@ def _gather_all_layers_torch(
     src_head_start: int,
     num_heads: int,
     page_size: int,
-    gpu_id: int,
 ) -> int:
     """torch.gather path: zero per-layer allocation, one kernel per layer."""
     import numpy as np
@@ -338,8 +433,10 @@ def _gather_all_layers_torch(
     num_tokens = len(page_indices_np) * page_size
     per_layer_bytes = num_tokens * num_heads * head_dim * dtype_size
 
-    device = f"cuda:{gpu_id}"
-    torch.cuda.set_device(gpu_id)
+    device = k_buffers[0].device
+    device_module = staging_buffer.device_module
+
+    device_module.set_device(device.index)
     page_idx_tensor = torch.from_numpy(page_indices_np.astype(np.int64)).to(device)
 
     if page_size == 1:
@@ -350,16 +447,12 @@ def _gather_all_layers_torch(
 
     gather_idx = token_indices.view(-1, 1, 1).expand(num_tokens, num_heads, head_dim)
 
-    if not hasattr(staging_buffer, "_gather_stream"):
-        staging_buffer._gather_stream = torch.cuda.Stream(device=device)
-
-    staging_buffer._gather_stream.wait_stream(
-        torch.cuda.default_stream(torch.device(device))
-    )
+    gather_stream = staging_buffer.get_gather_stream()
+    gather_stream.wait_stream(staging_buffer.producer_stream())
 
     staging_view = staging_buffer.buffer
     offset = 0
-    with torch.cuda.stream(staging_buffer._gather_stream):
+    with device_stream_context(gather_stream):
         for layer_id in range(num_layers):
             dst = (
                 staging_view[offset : offset + per_layer_bytes]
@@ -389,7 +482,7 @@ def _gather_all_layers_torch(
             )
             offset += per_layer_bytes
 
-    staging_buffer._gather_stream.synchronize()
+    gather_stream.synchronize()
     return offset
 
 
@@ -401,7 +494,6 @@ def _gather_all_layers_triton(
     src_head_start: int,
     num_heads: int,
     page_size: int,
-    gpu_id: int,
 ) -> int:
     """Triton fused kernel path: single kernel launch for all layers."""
     import numpy as np
@@ -416,13 +508,14 @@ def _gather_all_layers_triton(
     per_layer_bytes = per_layer_elems * dtype_size
     total_bytes = per_layer_bytes * num_layers * 2
 
-    device = f"cuda:{gpu_id}"
-    torch.cuda.set_device(gpu_id)
+    device = k_buffers[0].device
+    device_module = staging_buffer.device_module
+
+    device_module.set_device(device.index)
     page_idx_tensor = torch.from_numpy(page_indices_np.astype(np.int64)).to(device)
 
-    layer_ptrs = torch.tensor(
+    layer_ptrs = make_ptr_table(
         [buf.data_ptr() for buf in k_buffers] + [buf.data_ptr() for buf in v_buffers],
-        dtype=torch.int64,
         device=device,
     )
     # Use integer dtype matching element size for bit-preserving copy
@@ -430,17 +523,13 @@ def _gather_all_layers_triton(
     int_dtype = int_dtype_map.get(dtype_size, torch.int16)
     staging_typed = staging_buffer.buffer[:total_bytes].view(int_dtype)
 
-    if not hasattr(staging_buffer, "_gather_stream"):
-        staging_buffer._gather_stream = torch.cuda.Stream(device=device)
-
-    staging_buffer._gather_stream.wait_stream(
-        torch.cuda.default_stream(torch.device(device))
-    )
+    gather_stream = staging_buffer.get_gather_stream()
+    gather_stream.wait_stream(staging_buffer.producer_stream())
 
     BLOCK_SIZE = 1024
     grid = (2 * num_layers, triton.cdiv(per_layer_elems, BLOCK_SIZE))
 
-    with torch.cuda.stream(staging_buffer._gather_stream):
+    with device_stream_context(gather_stream):
         _fused_gather_to_staging_kernel[grid](
             layer_ptrs,
             page_idx_tensor,
@@ -454,7 +543,7 @@ def _gather_all_layers_triton(
             BLOCK_SIZE,
         )
 
-    staging_buffer._gather_stream.synchronize()
+    gather_stream.synchronize()
     return total_bytes
 
 
@@ -466,13 +555,13 @@ def gather_all_layers_to_staging(
     src_head_start: int,
     num_heads: int,
     page_size: int,
-    gpu_id: int,
 ) -> int:
     """Gather all layers' K and V head slices into a staging buffer.
 
     Returns total bytes written.
     Dispatches to Triton fused kernel when available, falls back to torch.gather.
     """
+    _check_kv_on_staging_device(k_buffers, v_buffers, staging_buffer.device)
     if _USE_TRITON_STAGING:
         return _gather_all_layers_triton(
             k_buffers,
@@ -482,7 +571,6 @@ def gather_all_layers_to_staging(
             src_head_start,
             num_heads,
             page_size,
-            gpu_id,
         )
     return _gather_all_layers_torch(
         k_buffers,
@@ -492,7 +580,6 @@ def gather_all_layers_to_staging(
         src_head_start,
         num_heads,
         page_size,
-        gpu_id,
     )
 
 
@@ -598,9 +685,8 @@ def _scatter_staging_to_kv_triton(
     elems_per_token = num_heads * head_dim
     per_layer_elems = num_tokens * elems_per_token
 
-    layer_ptrs = torch.tensor(
+    layer_ptrs = make_ptr_table(
         [buf.data_ptr() for buf in k_buffers] + [buf.data_ptr() for buf in v_buffers],
-        dtype=torch.int64,
         device=device,
     )
 
@@ -658,6 +744,7 @@ def scatter_staging_to_kv(
     total_kv_heads: int,
 ) -> None:
     """Scatter data from a contiguous staging region into KV cache buffers."""
+    _check_kv_on_staging_device(k_buffers, v_buffers, staging_buffer_view.device)
     if _USE_TRITON_STAGING:
         return _scatter_staging_to_kv_triton(
             staging_buffer_view,
@@ -708,9 +795,11 @@ def compute_head_slice_params(
         unique_head_idx = local_tp_rank // src_replication
         dst_head_start = (unique_head_idx * src_heads_per_rank) % dst_heads_per_rank
     else:
-        src_head_start = (
-            dst_tp_rank_in_group * dst_heads_per_rank
-        ) % src_heads_per_rank
+        # GQA replication: consecutive decode ranks share a KV head
+        # (tp_rank // num_kv_head_replicas), so map by integer division not modulo.
+        dst_replication = max(1, dst_attn_tp_size // total_kv_heads)
+        unique_dst_head_idx = dst_tp_rank_in_group // dst_replication
+        src_head_start = (unique_dst_head_idx * dst_heads_per_rank) % src_heads_per_rank
         num_heads_to_send = dst_heads_per_rank
         dst_head_start = 0
 
@@ -766,3 +855,29 @@ def resolve_total_kv_heads(
         "nor kv_head_num. "
         "Ensure DecodePreallocQueue._init_kv_manager sets kv_args.kv_head_num."
     )
+
+
+def staging_grid_tokens(chunked_prefill_size: Optional[int], page_size: int) -> int:
+    """Token width of one staging grid slot; shared by prefetch and the
+    sender's grid alignment."""
+    cps = chunked_prefill_size or 8192
+    return max(1, cps // page_size) * page_size
+
+
+def compute_grid_segments(
+    start_idx: int, end_idx: int, base: int, grid_tokens: int
+) -> List[Tuple[int, int]]:
+    """Split [start_idx, end_idx) at grid boundaries base + k * grid_tokens
+    so each segment maps to exactly one staging slot. An empty range yields
+    one empty segment (a metadata-only last chunk still needs a send).
+    """
+    segments: List[Tuple[int, int]] = []
+    seg_start = start_idx
+    while seg_start < end_idx:
+        next_boundary = base + ((seg_start - base) // grid_tokens + 1) * grid_tokens
+        seg_end = min(next_boundary, end_idx)
+        segments.append((seg_start, seg_end))
+        seg_start = seg_end
+    if not segments:
+        segments = [(start_idx, end_idx)]
+    return segments

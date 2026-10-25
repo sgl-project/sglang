@@ -187,6 +187,26 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn pool_idle_timeout_secs(mut self, timeout: u64) -> Self {
+        self.config.pool_idle_timeout_secs = timeout;
+        self
+    }
+
+    pub fn connect_timeout_secs(mut self, timeout: u64) -> Self {
+        self.config.connect_timeout_secs = timeout;
+        self
+    }
+
+    pub fn pool_max_idle_per_host(mut self, max: usize) -> Self {
+        self.config.pool_max_idle_per_host = max;
+        self
+    }
+
+    pub fn tcp_keepalive_secs(mut self, timeout: u64) -> Self {
+        self.config.tcp_keepalive_secs = timeout;
+        self
+    }
+
     // ==================== Rate Limiting ====================
 
     pub fn max_concurrent_requests(mut self, max: i32) -> Self {
@@ -206,6 +226,11 @@ impl RouterConfigBuilder {
 
     pub fn queue_timeout_secs(mut self, timeout: u64) -> Self {
         self.config.queue_timeout_secs = timeout;
+        self
+    }
+
+    pub fn decode_dispatch_limit(mut self, limit: usize) -> Self {
+        self.config.decode_dispatch_limit = Some(limit);
         self
     }
 
@@ -508,6 +533,11 @@ impl RouterConfigBuilder {
 
     pub fn maybe_request_id_headers(mut self, headers: Option<Vec<String>>) -> Self {
         self.config.request_id_headers = headers;
+        self
+    }
+
+    pub fn maybe_decode_dispatch_limit(mut self, limit: Option<usize>) -> Self {
+        self.config.decode_dispatch_limit = limit;
         self
     }
 

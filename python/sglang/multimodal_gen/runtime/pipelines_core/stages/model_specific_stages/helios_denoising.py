@@ -13,20 +13,24 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from sglang.multimodal_gen.runtime.managers.component_manager import ComponentUse
+from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+    ComponentUse,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
     get_or_create_request_scheduler,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
-from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
-    PipelineStage,
-    StageParallelismType,
+from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
+    toggle_quality_fusions,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
-from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
+from sglang.multimodal_gen.runtime.utils.precision_types import PRECISION_TO_TYPE
+from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
 
 logger = init_logger(__name__)
 
@@ -102,10 +106,18 @@ class HeliosChunkedDenoisingStage(PipelineStage):
         super().__init__()
         self.transformer = transformer
         self.scheduler = scheduler
+        self._mounted_quality = "exact"
+
+    def _maybe_toggle_quality_fusions(self, batch: Req) -> None:
+        quality = getattr(batch.sampling_params, "quality", "lossless")
+        if quality == self._mounted_quality:
+            return
+        toggle_quality_fusions([self.transformer], quality)
+        self._mounted_quality = quality
 
     @property
-    def parallelism_type(self):
-        return StageParallelismType.REPLICATED
+    def role_affinity(self) -> RoleType:
+        return RoleType.DENOISER
 
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
@@ -148,6 +160,7 @@ class HeliosChunkedDenoisingStage(PipelineStage):
         """Denoise a single chunk with full timestep loop."""
         batch_size = latents.shape[0]
         do_cfg = guidance_scale > 1.0
+        profiler = SGLDiffusionProfiler.get_instance()
 
         for i, t in enumerate(timesteps):
             with StageProfiler(
@@ -245,6 +258,8 @@ class HeliosChunkedDenoisingStage(PipelineStage):
                         )
 
                 latents = scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+                if profiler:
+                    profiler.step_denoising_step()
 
         return latents
 
@@ -279,6 +294,7 @@ class HeliosChunkedDenoisingStage(PipelineStage):
         """Denoise a single chunk using pyramid super-resolution (Stage 2)."""
         batch_size, num_channel, num_frames, height, width = latents.shape
         patch_size = self.transformer.patch_size
+        profiler = SGLDiffusionProfiler.get_instance()
 
         # Downsample to lowest pyramid level
         latents = latents.permute(0, 2, 1, 3, 4).reshape(
@@ -460,6 +476,8 @@ class HeliosChunkedDenoisingStage(PipelineStage):
                         dmd_timesteps=scheduler.timesteps,
                         all_timesteps=timesteps,
                     )[0]
+                    if profiler:
+                        profiler.step_denoising_step()
 
                 step_counter += 1
 
@@ -467,6 +485,7 @@ class HeliosChunkedDenoisingStage(PipelineStage):
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         """Run the Helios chunked denoising loop."""
+        self._maybe_toggle_quality_fusions(batch)
         pipeline_config = server_args.pipeline_config
         scheduler = get_or_create_request_scheduler(batch, self.scheduler)
         device = (
@@ -496,16 +515,6 @@ class HeliosChunkedDenoisingStage(PipelineStage):
         is_distilled = pipeline_config.is_distilled
         is_amplify_first_chunk = pipeline_config.is_amplify_first_chunk
         gamma = pipeline_config.gamma
-
-        transformer_use = ComponentUse(
-            self.__class__.__name__,
-            "transformer",
-            phase="transformer",
-            preferred_ready_after_request=True,
-            memory_intensive=True,
-        )
-        manager = self._component_residency_manager
-        manager.begin_use(transformer_use, module=self.transformer)
 
         # Get encoder outputs (prompt_embeds is a list of tensors, one per encoder)
         prompt_embeds = batch.prompt_embeds
@@ -553,10 +562,10 @@ class HeliosChunkedDenoisingStage(PipelineStage):
             dtype=torch.float32,
         )
 
-        # Build frame indices
+        # Build frame indices on the device: every forward embeds them four times
         if keep_first_frame:
             indices = torch.arange(
-                0, sum([1, *history_sizes, num_latent_frames_per_chunk])
+                0, sum([1, *history_sizes, num_latent_frames_per_chunk]), device=device
             )
             (
                 indices_prefix,
@@ -570,7 +579,7 @@ class HeliosChunkedDenoisingStage(PipelineStage):
             )
         else:
             indices = torch.arange(
-                0, sum([*history_sizes, num_latent_frames_per_chunk])
+                0, sum([*history_sizes, num_latent_frames_per_chunk]), device=device
             )
             (
                 indices_latents_history_long,

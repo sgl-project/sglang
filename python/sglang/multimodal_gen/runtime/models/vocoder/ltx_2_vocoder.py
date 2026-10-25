@@ -1,6 +1,5 @@
 import math
 from abc import ABC
-from contextlib import nullcontext
 from typing import Tuple
 
 import einops
@@ -9,6 +8,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.multimodal_gen.configs.models.vocoder.ltx_vocoder import LTXVocoderConfig
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
+from sglang.multimodal_gen.runtime.utils.precision import (
+    temporary_module_fp32_dtype,
+)
 
 LRELU_SLOPE = 0.1
 
@@ -244,7 +249,6 @@ class ResBlock(nn.Module):
         padding_mode: str = "same",
     ):
         super().__init__()
-        self.dilations = dilations
         self.negative_slope = leaky_relu_negative_slope
 
         self.convs1 = nn.ModuleList(
@@ -531,10 +535,26 @@ class LTX23VocoderCore(nn.Module):
         return x
 
 
-class LTX2Vocoder(ABC, nn.Module):
+class LTX2Vocoder(ABC, nn.Module, LayerwiseOffloadableModuleMixin):
     r"""
     LTX 2.0 vocoder for converting generated mel spectrograms back to audio waveforms.
+
+    Also serves LTX-2.5, whose `LTX2VocoderWithBWE` adds a bandwidth-extension
+    stage on top of the same generator: the base stack synthesises at 16 kHz and
+    the BWE stack resynthesises at 48 kHz from a mel re-analysis.
     """
+
+    _aliases = ["LTX2VocoderWithBWE"]
+
+    layerwise_offload_dit_group_enabled = False
+    layer_names = [
+        "upsamplers",
+        "resnets",
+        "vocoder.ups",
+        "vocoder.resblocks",
+        "bwe_generator.ups",
+        "bwe_generator.resblocks",
+    ]
 
     def __init__(
         self,
@@ -686,12 +706,18 @@ class LTX2Vocoder(ABC, nn.Module):
         """
         if hasattr(self, "bwe_generator"):
             input_dtype = hidden_states.dtype
+            # [Note] Use temporary_module_fp32_dtype for the upcast on CPU.
+            # On CPU, torch.autocast("cpu", dtype=torch.float32) emits a warning and silently disables autocast (enabled = False)
+            # CPU takes the non-CUDA branch in autocast.__init__. That branch defines a device_supported_dtypes list containing only bfloat16 and float16.
+            # Since float32 is not in the list, the code hits the "target dtype is not supported. Disabling autocast." branch, warns, and turns autocast off.
+            # https://github.com/pytorch/pytorch/blob/d7245544ad8fe2816425bfac5d2312b6f6f37386/torch/amp/autocast_mode.py#L297-L305
+            # https://github.com/pytorch/pytorch/blob/d7245544ad8fe2816425bfac5d2312b6f6f37386/torch/amp/autocast_mode.py#L248
             autocast_ctx = (
                 torch.autocast(
                     device_type=hidden_states.device.type, dtype=torch.float32
                 )
                 if hidden_states.device.type != "cpu"
-                else nullcontext()
+                else temporary_module_fp32_dtype(self)
             )
             with autocast_ctx:
                 waveform = self.vocoder(hidden_states.float())
