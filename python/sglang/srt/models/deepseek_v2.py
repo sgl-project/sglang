@@ -1252,7 +1252,7 @@ class DeepseekV2MoE(nn.Module):
         if deferred_finalize and get_forward().defer_moe_finalize:
             # deferred_finalize excludes _shared_expert_tp1, so the shared add folds in.
             assert shared_output is not None
-            from sglang.srt.layers.layer_boundary.fusions.cutedsl import (
+            from sglang.srt.layers.layer_boundary.fusions.moe_finalize import (
                 MoeDeferredFinalize,
             )
 
@@ -1868,6 +1868,12 @@ class DeepseekV2MoE(nn.Module):
     @cached_property
     def _routed_mxfp8_prequant_static_enabled(self) -> bool:
         return self._compute_routed_mxfp8_prequant_enabled()[0]
+
+    @cached_property
+    def mega_gate_supported(self) -> bool:
+        from sglang.srt.layers.moe.mega_gate import mega_gate_supported
+
+        return mega_gate_supported(self)
 
     def _compute_routed_mxfp8_prequant_enabled(self) -> Tuple[bool, str]:
         from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatcher

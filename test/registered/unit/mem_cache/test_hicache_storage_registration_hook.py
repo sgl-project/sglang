@@ -132,6 +132,10 @@ def _attach(
     # the anchor pool alone.
     kwargs = {"host_pools": host_pools} if host_pools is not None else {}
     with (
+        mock.patch(
+            "sglang.srt.managers.cache_controller.get_parallel",
+            return_value=SimpleNamespace(attn_dcp_size=1),
+        ),
         mock.patch.object(
             StorageBackendFactory, "create_backend", return_value=backend
         ),
@@ -181,7 +185,7 @@ class TestRegistrationBurstOrder(CustomTestCase):
         controller = _controller(HiCacheController, pool, pool)
         backend = RecordingBackend(order, fail_on_complete=True)
 
-        with self.assertRaises(RuntimeError):
+        with self.assertRaisesRegex(RuntimeError, "registration failed in the backend"):
             _attach(controller, backend, order)
 
         self.assertEqual(order, ["v1", "complete"])
@@ -201,7 +205,7 @@ class TestRegistrationBurstOrder(CustomTestCase):
         )
         backend = RecordingBackend(order, fail_on_complete=True)
 
-        with self.assertRaises(RuntimeError):
+        with self.assertRaisesRegex(RuntimeError, "registration failed in the backend"):
             _attach(controller, backend, order, host_pools=group.entries)
 
         self.assertEqual(order, ["v1", "threads", "v2:kv", "v2:mamba", "complete"])

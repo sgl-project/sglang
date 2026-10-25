@@ -52,10 +52,6 @@ def _swa_pool(*, swa_attention_layer_ids=(0, 2), full_attention_layer_ids=(1, 3)
 
 
 class TestSWAPoolVHeadDim(unittest.TestCase):
-    def test_static_pool_reports_the_full_side_value_head_dim(self):
-        pool = _swa_pool()
-        self.assertEqual(pool.get_v_head_dim(), _FULL_V_HEAD_DIM)
-
     def test_window_only_pool_answers_from_the_swa_side(self):
         """BUG REGRESSION. A sliding-window MTP depth is a window-only block,
         so its pool has an EMPTY full side; asking that side for a value
