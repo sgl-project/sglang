@@ -1168,6 +1168,36 @@ def test_failed_offload_rolls_back_split_fragments():
     assert unlocks == [(child.id, lock_params)]
 
 
+def test_commit_completed_offloads_batch_fifo_slice():
+    """Verify batch commit_completed_offloads drains prefix in FIFO order and preserves remaining tail."""
+    linker = _FakeLinker()
+    unlocks = []
+    nodes = {
+        i: SimpleNamespace(
+            id=i,
+            external_cache_stored=False,
+            write_through_pending_id=None,
+        )
+        for i in (1, 2, 3)
+    }
+    cache = _cache_for_wrapper(
+        tree_core=_FakeExternalTreeCore(nodes),
+        inc_lock_ref=lambda node_id: SimpleNamespace(to_dec_params=lambda: f"lock_{node_id}"),
+        dec_lock_ref=lambda node_id, params: unlocks.append((node_id, params)),
+    )
+    wrapper = UnifiedCacheLinkerWrapper(cache, linker)
+    for i in (1, 2, 3):
+        wrapper.offload_nodes([i])
+
+    wrapper.commit_completed_offloads([True, False])
+    assert [p.lock_node_id for p in wrapper.pending_offloads] == [3]
+    assert nodes[1].external_cache_stored is True
+    assert nodes[2].external_cache_stored is False
+    assert nodes[3].write_through_pending_id == 3
+    assert unlocks == [(1, "lock_1"), (2, "lock_2")]
+
+
+
 def test_split_action_retargets_pending_external_offload():
     calls = []
     cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
