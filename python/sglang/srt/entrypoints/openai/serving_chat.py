@@ -191,6 +191,21 @@ def normalize_assistant_tool_call_arguments(
                     raise
 
 
+def _collect_message_media(messages):
+    """Each message's media in message order, without rendering the template."""
+    image_data, video_data, audio_data, modalities = [], [], [], []
+    for message in messages:
+        process_content_for_template_format(
+            message.model_dump(),
+            "openai",
+            image_data,
+            video_data,
+            audio_data,
+            modalities,
+        )
+    return image_data, video_data, audio_data, modalities
+
+
 def _extract_max_dynamic_patch(request: ChatCompletionRequest):
     img_vals = []
     vid_vals = []
@@ -1471,13 +1486,20 @@ class OpenAIServingChat(OpenAIServingBase):
         # When input_ids are provided, skip template tokenization entirely;
         # only stop tokens and tool_call_constraint are needed.
         if request.input_ids is not None:
+            image_data, video_data, audio_data, modalities = [], [], [], []
+            # A partially expanded request still sends every media item of the
+            # conversation, for the token-space processor to match to its IDs.
+            if request.mm_token_expansion_start_len:
+                image_data, video_data, audio_data, modalities = _collect_message_media(
+                    request.messages
+                )
             result = MessageProcessingResult(
                 prompt="",
                 prompt_ids=request.input_ids,
-                image_data=None,
-                audio_data=None,
-                video_data=None,
-                modalities=[],
+                image_data=image_data or None,
+                audio_data=audio_data or None,
+                video_data=video_data or None,
+                modalities=modalities,
                 stop=request.stop or [],
             )
         elif self.template_manager.chat_template_name is None:
