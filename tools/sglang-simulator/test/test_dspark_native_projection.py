@@ -1682,12 +1682,15 @@ def test_tp4_factory_requires_golden_policy_and_matching_topology(
 
 @pytest.mark.parametrize("cohort_case", [4], indirect=True)
 @pytest.mark.parametrize("mode", ["EXTEND", "DECODE"])
-def test_tp4_verified_projection_missing_cost_never_reaches_progress(cohort_case, mode):
+@pytest.mark.parametrize("batch", [1, 3, 4])
+def test_tp4_verified_projection_missing_cost_never_reaches_progress(
+    cohort_case, mode, batch
+):
     from sglang_simulator.simulation.sglang.dspark import DSparkSession
 
     case = cohort_case
     costs = UMDDSparkCostModel(case.database, native_source_policy=case.policy)
-    step = resolve(costs, case, mode).step
+    step = resolve(costs, case, mode, batch_size=batch).step
 
     class NoDraw:
         def predict_progress(self, before):

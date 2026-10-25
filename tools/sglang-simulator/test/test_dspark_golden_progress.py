@@ -79,6 +79,32 @@ def paired_step(*, fid=0, mode="TARGET_VERIFY"):
     )
 
 
+def ordered_step(batch, *, tp_size=2, fid=0, mode="TARGET_VERIFY"):
+    before = step(fid=fid, mode=mode, budget=2)
+    requests = []
+    for index in range(batch):
+        budget = 2 + index * 13
+        prefix = 512 + index * 37
+        recipe = {"ignore_eos": True, "is_normalized": True, "max_new_tokens": budget}
+        requests.append(
+            replace(
+                before.requests[0],
+                rid=f"request-{index}",
+                target_prefix_len=prefix,
+                draft_valid_to=prefix,
+                max_new_tokens=budget,
+                sampling_params_json=json.dumps(
+                    recipe, sort_keys=True, separators=(",", ":")
+                ),
+            )
+        )
+    return replace(
+        before,
+        topology=DSparkTopology(tp_size, 1),
+        groups=(replace(before.groups[0], requests=tuple(requests)),),
+    )
+
+
 @pytest.mark.parametrize("seed", [None, True, -1, 1.0, "42"])
 def test_explicit_seed_is_required(policy, seed):
     with pytest.raises(PredictorError, match="explicit nonnegative integer"):
@@ -153,15 +179,15 @@ def test_b2_uses_one_shared_draw_with_ordered_requests_and_independent_budgets(
     assert expected < before.requests[1].remaining_output_tokens
 
 
-@pytest.mark.parametrize("kind", ["runtime", "tp4", "batch3", "width5", "prefill"])
+@pytest.mark.parametrize("kind", ["runtime", "tp4", "batch65", "width5", "prefill"])
 def test_unsupported_before_work_has_no_fallback(policy, kind):
     before = step()
     if kind == "runtime":
         before = replace(before, runtime_profile_json='{"different":true}')
     elif kind == "tp4":
         before = replace(before, topology=DSparkTopology(4, 1))
-    elif kind == "batch3":
-        requests = tuple(replace(before.requests[0], rid=f"r{i}") for i in range(3))
+    elif kind == "batch65":
+        requests = tuple(replace(before.requests[0], rid=f"r{i}") for i in range(65))
         before = replace(
             before,
             groups=(replace(before.groups[0], requests=requests),),
@@ -268,9 +294,11 @@ def test_invalid_second_request_fails_before_event_choice_or_history_change(
     assert run._last_forward_id == -1
 
 
-@pytest.mark.parametrize("batch", [1, 2])
-def test_cost_failure_precedes_progress_and_retry_keeps_full_commit(policy, batch):
-    before = paired_step() if batch == 2 else step(budget=2)
+@pytest.mark.parametrize("tp", [2, 4])
+@pytest.mark.parametrize("batch", [1, 2, 3, 4, 64])
+def test_cost_failure_precedes_progress_and_retry_keeps_full_commit(policy, batch, tp):
+    policy.tp_size = tp
+    before = ordered_step(batch, tp_size=tp)
 
     class CountDraws(SourceGoldenDSparkProgress):
         calls = 0
@@ -351,17 +379,108 @@ def test_tp4_verified_law_uses_one_b1_event_without_tp_scaling(policy):
         assert model.predict_progress(before) == original.predict_progress(
             step(fid=fid)
         )
-    with pytest.raises(PredictorError, match="verified TP domain"):
-        model.predict_progress(replace(paired_step(), topology=DSparkTopology(4, 1)))
+    assert (
+        model.predict_progress(
+            replace(paired_step(), topology=DSparkTopology(4, 1))
+        ).committed_tokens
+        == original.predict_progress(paired_step()).committed_tokens
+    )
     with pytest.raises(PredictorError, match="topology differs"):
         model.predict_progress(step())
 
 
-def test_tp4_source_work_lookup_remains_closed(policy):
+@pytest.mark.parametrize("tp", [2, 4])
+@pytest.mark.parametrize("batch", [3, 4, 64])
+def test_ragged_ordered_batch_draws_once_for_all_requests(
+    policy, monkeypatch, tp, batch
+):
+    policy.tp_size = tp
+    model = SourceGoldenDSparkProgress(policy, model_seed=42)
+    before = ordered_step(batch, tp_size=tp, fid=17)
+    original = dspark_golden_progress.hashlib.sha256
+    calls = []
+
+    def counted(*args, **kwargs):
+        calls.append(args)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(dspark_golden_progress.hashlib, "sha256", counted)
+    result = model.predict_progress(before)
+    assert len(calls) == 1
+    commit = result.committed_tokens[0][1]
+    assert result.committed_tokens == tuple(
+        (request.rid, commit) for request in before.requests
+    )
+    assert commit > before.requests[0].remaining_output_tokens
+    assert commit < before.requests[-1].remaining_output_tokens
+    assert model.predict_progress(before) == result
+    reversed_before = replace(
+        before,
+        groups=(replace(before.groups[0], requests=before.requests[::-1]),),
+    )
+    assert (
+        model.predict_progress(reversed_before).committed_tokens
+        == result.committed_tokens[::-1]
+    )
+
+
+@pytest.mark.parametrize("failure", ["recipe", "width"])
+def test_last_large_batch_request_rejects_before_draw_and_history(
+    policy, monkeypatch, failure
+):
+    model = SourceGoldenDSparkProgress(policy, model_seed=42)
+    before = ordered_step(64)
+    last = before.requests[-1]
+    if failure == "recipe":
+        recipe = json.loads(last.sampling_params_json)
+        recipe["ignore_eos"] = False
+        last = replace(
+            last,
+            sampling_params_json=json.dumps(
+                recipe, sort_keys=True, separators=(",", ":")
+            ),
+        )
+    else:
+        last = replace(last, extend_len=5)
+    before = replace(
+        before,
+        groups=(replace(before.groups[0], requests=before.requests[:-1] + (last,)),),
+    )
+
+    def no_draw(_):
+        pytest.fail("invalid last request reached the event draw")
+
+    monkeypatch.setattr(dspark_golden_progress, "_canonical", no_draw)
+    run = DSparkSession(Cost(), model)
+    for request in before.requests:
+        run.record_history(
+            request.rid,
+            CommittedHistory(
+                request.target_prefix_len,
+                request.draft_valid_from,
+                request.draft_valid_to,
+            ),
+        )
+    history = dict(run._history)
+    with pytest.raises(PredictorError):
+        run.predict(before)
+    assert run._history == history and run._last_forward_id == -1
+
+
+def test_tp4_source_work_constructor_still_requires_verified_golden_policy(policy):
     from infercast.sdk.native_segment_module import SOURCE_WORK_POLICY
     from sglang_simulator.time_predictor.dspark_umd import UMDDSparkCostModel
 
     policy.tp_size = 4
+    model = UMDDSparkCostModel(
+        None,
+        native_source_policy=policy,
+        native_source_work_policy=SOURCE_WORK_POLICY,
+    )
+    assert model.native_source_work_policy == SOURCE_WORK_POLICY
+    # Construction has no performance database or measured cost and does not
+    # expand the SDK's separately checked B1-only source-work relation.
+    policy.golden_law = None
     with pytest.raises(PredictorError, match="native source work requires"):
         UMDDSparkCostModel(
             None,

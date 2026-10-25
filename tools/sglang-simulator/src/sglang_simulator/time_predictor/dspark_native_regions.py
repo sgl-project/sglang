@@ -63,7 +63,7 @@ def validate_native_region_phase(*, description, point, graph_phase, phase, step
             )
             in {(2, 1, 1), (4, 1, 1)}
             and len(step.groups) == 1
-            and (step.topology.tp_size == 2 or len(step.requests) == 1)
+            and 1 <= len(step.requests) <= 64
         )
         group = step.groups[0]
         region = _REGIONS[group.forward_mode][phase]

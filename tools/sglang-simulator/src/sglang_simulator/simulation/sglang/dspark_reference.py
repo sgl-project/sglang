@@ -78,7 +78,7 @@ class ReferenceCPUView:
             and all(
                 value is None
                 or type(value) is tuple
-                and 1 <= len(value) <= 8
+                and 1 <= len(value) <= 64
                 and all(_integer(length) for length in value)
                 for value in vectors
             )
@@ -225,12 +225,11 @@ class DSparkReferenceLedger:
             )
             in {(2, 1, 1), (4, 1, 1)}
             and len(step.groups) == 1
-            and (step.topology.tp_size == 2 or len(step.requests) == 1)
             and step.groups[0].attention_dp_rank == 0
             and step.groups[0].forward_mode in {"EXTEND", "TARGET_VERIFY"}
-            and 1 <= len(step.requests) <= 8
+            and 1 <= len(step.requests) <= 64
             and _integer(page_size, 1),
-            "reference bookkeeping requires TP2/ADP1/PP1 B1-B8 page domain or TP4 B1",
+            "reference bookkeeping requires TP2/TP4 ADP1/PP1 B1-B64 page domain",
         )
         rows = {row.rid: row for row in self.requests}
         prefill = step.groups[0].forward_mode == "EXTEND"

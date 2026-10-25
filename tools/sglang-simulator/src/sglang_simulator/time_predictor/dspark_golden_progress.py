@@ -30,7 +30,7 @@ def _canonical(value):
 class SourceGoldenDSparkProgress:
     """One modeled choice per DECODE event, with idempotent before-work retries.
 
-    This law represents TP2 B1-B2 or TP4 B1, with ADP1/PP1. SDK policy verifies static
+    This law represents TP2/TP4 B1-B64, with ADP1/PP1. SDK policy verifies static
     Q5/Q6, captures and the golden cost realization. Session resolves every
     measured phase before calling this owner. Missing costs never draw progress.
     """
@@ -87,7 +87,7 @@ class SourceGoldenDSparkProgress:
         _require(
             len(step.groups) == 1
             and step.groups[0].forward_mode == "TARGET_VERIFY"
-            and 1 <= len(step.requests) <= (2 if self.topology[0] == 2 else 1)
+            and 1 <= len(step.requests) <= 64
             and all(request.extend_len == 6 for request in step.requests),
             "golden progress requires static Q6 decode requests within its verified TP domain",
         )

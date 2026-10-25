@@ -476,9 +476,48 @@ def test_tp4_b1_native_binding_retains_complete_sdk_phase(mode, phase, region):
         validate_native_region_phase(**binding)
 
 
-def test_tp4_b2_remains_outside_native_binding():
+@pytest.mark.parametrize("tp", [2, 4])
+@pytest.mark.parametrize("batch,capture", [(2, 2), (3, 4), (4, 4), (64, 64)])
+@pytest.mark.parametrize("mode,phase,region", CASES)
+def test_native_batch_binding_keeps_ordered_work_and_physical_capture(
+    tp, batch, capture, mode, phase, region
+):
     binding = prepared(
-        "TARGET_VERIFY", "target_verify", "decode_target", batch_size=2, tp_size=4
+        mode, phase, region, batch_size=batch, capture_size=capture, tp_size=tp
+    )
+    assert validate_native_region_phase(**binding)
+    before = binding["step"]
+    group = before.groups[0]
+    binding["step"] = replace(
+        before, groups=(replace(group, requests=group.requests[::-1]),)
+    )
+    with pytest.raises(PredictorError, match="phase/source binding"):
+        validate_native_region_phase(**binding)
+
+
+def test_larger_native_binding_cannot_change_logical_or_physical_work():
+    from infercast.sdk.native_segment_module import NativeSegmentQuery
+
+    binding = prepared(
+        "TARGET_VERIFY",
+        "target_verify",
+        "decode_target",
+        batch_size=3,
+        capture_size=4,
+        tp_size=4,
+    )
+    before = binding["step"]
+    execution = json.loads(before.groups[0].execution_json)
+    raw = json.loads(execution["native_segment_module_variant"])
+    raw["target_capture_key"]["size"] = 8
+    raw["draft_capture_key"]["size"] = 8
+    shape = json.loads(binding["point"]["native_segment_queries"])[0]
+    shape["module_variant"] = canonical(raw)
+    # A separately legal physical key still cannot replace the bound SDK query.
+    NativeSegmentQuery.from_shape({**shape, "physical_rows": 48})
+    execution["native_segment_module_variant"] = canonical(raw)
+    binding["step"] = replace(
+        before, groups=(replace(before.groups[0], execution_json=canonical(execution)),)
     )
     with pytest.raises(PredictorError, match="phase/source binding"):
         validate_native_region_phase(**binding)

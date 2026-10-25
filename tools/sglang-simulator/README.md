@@ -123,7 +123,7 @@ profiles fail closed. The SDK owns source/material verification and the separate
 golden marginal-cost contract; there is no caller-supplied approval flag. The
 default remains empirical and retains its existing artifact and identity.
 
-Golden progress represents TP2 logical B1-B2 and TP4 logical B1, ADP1/PP1, with full
+Golden progress represents TP2/TP4 logical B1-B64, ADP1/PP1, with full
 static draft Q5/verify Q6 work and length-only output. SHA256 of the model identity
 and DECODE forward ID, modulo100, selects commit4 for residues0–50 and commit3
 otherwise. Identity includes the explicit seed, complete runtime and verified
@@ -132,12 +132,16 @@ not replay of native Torch CPU RNG history. Prefill draws nothing; the existing
 middle-chunk0/final-bonus1 path remains. Costs resolve before progress, without
 shrinking Q or scaling latency by3.51. Full committed lengths advance KV even at
 the final OSL boundary; native scheduling clips visible output separately.
-B2 repeats the one event draw across both requests in their original order;
+Each batch repeats the one event draw across all requests in their original order;
 it never draws independently per RID or clips their committed lengths to a
 remaining output budget. Every request must satisfy the length-only domain.
-The typed SDK source policy and ordinary cost reader still gate ordered B2
+The typed SDK source policy and ordinary cost reader still gate ordered batch
 work, complete sampling, actual captures and independently qualified direct
-whole-batch costs. B1 measurements cannot supply missing B2 work.
+whole-batch costs. B1 measurements cannot supply missing batched work.
+The logical domain does not replace the actual pool, sampler or padded capture
+inventory. B65+ and ADP2 remain unsupported. Root client concurrency does not
+bound native B, and diagnostic request caps or memory fractions do not establish
+equivalence to the reference serving recipe.
 Complete newly qualified golden costs are still required for an actual run.
 
 The optional `native_source_work_policy="native_region_golden351_decode_work_v1"`
@@ -151,7 +155,7 @@ requested region/profile, selected policy and original bracketing anchors; an
 ordinary empirical source string is insufficient. Missing proof fails before
 progress or history changes. The selected policy and query proof enter the phase
 evidence reference. Omitted options retain existing identities and behavior.
-EXTEND and B2 use their existing lookup paths. This plumbing supplies neither
+EXTEND and B>1 use their existing exact lookup paths. This plumbing supplies neither
 missing costs nor actual heldout validation, complete AgentX coverage or an
 accuracy claim; operational activation requires those independent results.
 Source-law implementation and CPU tests do not establish native timing or
@@ -198,6 +202,10 @@ the simulator's valid-written-KV ledger to choose that cost coordinate. Semantic
 validity, acceptance and future progress retain their existing state ownership;
 the separate legacy proposal selector keeps its saturated-history requirement.
 Schema1 region history keys remain distinct and are never relabeled as schema2.
+The immutable reference ledger and known CPU mirror vectors retain all ordered
+requests through B64 for TP2/TP4 ADP1. Page allocation, publication and FIFO
+result retirement still use each request's own geometry and output budget.
+This bookkeeping supplies neither measured batch costs nor ADP2 coordination.
 The phase binder also transports the SDK's schema3 graph-work queries unchanged.
 They retain schema2 nominal read semantics and add explicit padded or larger
 capture work; they do not acquire a legacy written-history field. The SDK still
@@ -205,14 +213,14 @@ owns capture selection, source policy and cost admission. Binding a query does
 not provide missing measured rows.
 Native phase preparation requires the SDK source policy, typed step and query
 to agree on TP size; the independent graph binder also checks query against step.
-Both paths retain a single ADP1/PP1 group: TP2 uses its existing domain, and TP4
-requires B1. The factory requires configured TP, verified source policy and
+Both paths retain a single ADP1/PP1 group with ordered logical B1-B64. The factory
+requires configured TP, verified source policy and
 progress topology to agree. TP4 uses the same source-law commit3/4 event; it adds
 no TP latency scaling. Explicit TP4 B1 source-work reuse follows the SDK's same
 versioned policy, requiring all eight target/draft FILE/context inventories,
 full capture/planner/buffer/source equality and strict P brackets. The bounded
 query proof and original row identities remain mandatory. This does not establish
-cross-OSL accuracy or full AgentX coverage. TP4 B2 and ADP2 remain closed.
+cross-OSL accuracy or full AgentX coverage. B>1 source-work reuse and ADP2 remain closed.
 
 For a HuggingFace snapshot whose `config.json` links into the cache's blob
 directory, set `model_config_root` to the explicit containing checkpoint/cache

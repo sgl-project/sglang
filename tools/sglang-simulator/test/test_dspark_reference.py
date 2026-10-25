@@ -405,7 +405,7 @@ def test_prefill_cannot_overwrite_an_unprocessed_decode():
 @pytest.mark.parametrize("page_size", [True, 0, -1, 256.0, None])
 def test_reference_prepare_rejects_unknown_or_noninteger_page_size(page_size):
     ledger = DSparkReferenceLedger(requests=(seeded(),))
-    with pytest.raises(PredictorError, match="B1-B8 page domain"):
+    with pytest.raises(PredictorError, match="B1-B64 page domain"):
         ledger.prepare(decode(), page_size=page_size)
     assert ledger.prepared is None
 
@@ -415,18 +415,18 @@ def test_reference_ledger_does_not_extend_to_other_supported_dspark_layouts(tp, 
     ledger = DSparkReferenceLedger(
         requests=(seeded(committed=512, allocated=512, published=512),)
     )
-    with pytest.raises(PredictorError, match="TP2/ADP1/PP1"):
+    with pytest.raises(PredictorError, match="TP2/TP4 ADP1/PP1"):
         ledger.prepare(step(tp, dp), page_size=256)
 
 
-def test_reference_ledger_rejects_batch_nine_and_mixed_mode():
-    rows = tuple(seeded(str(i)) for i in range(9))
+def test_reference_ledger_rejects_batch_65_and_mixed_mode():
+    rows = tuple(seeded(str(i)) for i in range(65))
     before = decode(requests=tuple(request(row.rid, prefix=240) for row in rows))
-    with pytest.raises(PredictorError, match="B1-B8"):
+    with pytest.raises(PredictorError, match="B1-B64"):
         DSparkReferenceLedger(requests=rows).prepare(before, page_size=256)
     before = decode()
     mixed = replace(before, groups=(replace(before.groups[0], forward_mode="MIXED"),))
-    with pytest.raises(PredictorError, match="TP2/ADP1/PP1"):
+    with pytest.raises(PredictorError, match="TP2/TP4 ADP1/PP1"):
         DSparkReferenceLedger(requests=(seeded(),)).prepare(mixed, page_size=256)
 
 
@@ -583,9 +583,82 @@ def test_tp4_b1_reference_uses_same_source_page_and_publication_order():
     assert published.process_result(0).request_for("a").kv_committed_len == 244
 
 
-def test_tp4_reference_rejects_b2_before_mutation():
-    original = DSparkReferenceLedger(requests=(seeded(), seeded("b")))
-    before = decode(requests=(decode().requests[0], decode(rid="b").requests[0]))
-    with pytest.raises(PredictorError, match="TP4 B1"):
-        original.prepare(replace(before, topology=DSparkTopology(4, 1)), page_size=256)
-    assert original.prepared is None and original.pending == ()
+@pytest.mark.parametrize("tp", [2, 4])
+@pytest.mark.parametrize("batch", [3, 4, 64])
+def test_ordered_ragged_batch_uses_each_native_page_and_full_commit(tp, batch):
+    rows = tuple(
+        seeded(str(i), committed=240 + i, allocated=512, published=240 + i)
+        for i in range(batch)
+    )
+    requests = tuple(request(row.rid, prefix=row.published_seq_len) for row in rows)
+    before = replace(decode(requests=requests), topology=DSparkTopology(tp, 1))
+    original = DSparkReferenceLedger(requests=rows)
+    actual = original.prepare(before, page_size=256)
+    assert actual.prepared.seed_seq_lens_cpu == tuple(240 + i for i in range(batch))
+    view = actual.prepared.resolve(future_indices_ready=True, needs_cpu_seq_lens=False)
+    assert view.seq_lens_cpu is None
+    assert view.nxt_kv_lens_cpu == actual.prepared.nxt_kv_lens_cpu
+    assert len(view.planner_seq_lens_cpu) == batch
+    result = modeled(before, count=4)
+    published = actual.publish(result)
+    for row in rows:
+        assert original.request_for(row.rid) == row
+        assert published.request_for(row.rid).kv_committed_len == row.kv_committed_len
+        assert (
+            published.request_for(row.rid).published_seq_len
+            == row.published_seq_len + 4
+        )
+    settled = published.process_result(before.forward_id)
+    assert settled.pending == ()
+    for row in rows:
+        assert settled.request_for(row.rid).kv_committed_len == row.kv_committed_len + 4
+        assert (
+            settled.request_for(row.rid).processed_output_tokens
+            == row.processed_output_tokens + 4
+        )
+
+
+@pytest.mark.parametrize("failure", ["last-prefix", "last-budget", "wrong-order"])
+def test_large_batch_failure_preserves_immutable_reference_ledger(failure):
+    rows = tuple(seeded(str(i)) for i in range(64))
+    requests = tuple(request(row.rid, prefix=240) for row in rows)
+    before = replace(decode(requests=requests), topology=DSparkTopology(4, 1))
+    original = DSparkReferenceLedger(requests=rows)
+    if failure == "wrong-order":
+        prepared = original.prepare(before, page_size=256)
+        reordered = replace(
+            before, groups=(replace(before.groups[0], requests=requests[::-1]),)
+        )
+        with pytest.raises(PredictorError, match="exact prepared"):
+            prepared.publish(modeled(reordered))
+        assert prepared.prepared.step is before and prepared.pending == ()
+    else:
+        changes = (
+            {"target_prefix_len": 239}
+            if failure == "last-prefix"
+            else {
+                "max_new_tokens": 19,
+                "sampling_params_json": '{"is_normalized":true,"max_new_tokens":19}',
+            }
+        )
+        last = replace(requests[-1], **changes, draft_valid_to=239)
+        changed = replace(
+            before,
+            groups=(replace(before.groups[0], requests=requests[:-1] + (last,)),),
+        )
+        with pytest.raises(PredictorError, match="decode differs"):
+            original.prepare(changed, page_size=256)
+    assert (
+        original.requests == rows
+        and original.prepared is None
+        and original.pending == ()
+    )
+
+
+def test_reference_cpu_view_cannot_truncate_or_coerce_large_vectors():
+    assert ReferenceCPUView(None, tuple(range(64))).planner_seq_lens_cpu == tuple(
+        range(64)
+    )
+    for value in (tuple(range(65)), (True,) * 64, list(range(64))):
+        with pytest.raises(PredictorError, match="immutable known vectors"):
+            ReferenceCPUView(None, value)
