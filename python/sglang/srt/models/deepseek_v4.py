@@ -978,26 +978,28 @@ def _engram_image_token_id(config) -> Optional[int]:
     return None
 
 
-def deepseek_v4_enter_late_layer_tail(sentinel: torch.Tensor) -> torch.Tensor:
+def deepseek_v4_enter_late_layer_tail(sentinel: torch.Tensor) -> None:
     # Decoder SWA bounded replay under the prefill CUDA graph: swap the attention
     # backend onto the tail metadata of the *live* batch (the captured args hold
     # the capture-time batch). The sentinel keeps the break in the replay sequence.
     forward_batch = get_tc_piecewise_forward_context().forward_batch
     get_attn_backend().prefill_graph_enter_late_layer_tail(forward_batch)
-    return sentinel
 
 
-def deepseek_v4_exit_late_layer_tail(sentinel: torch.Tensor) -> torch.Tensor:
+def deepseek_v4_exit_late_layer_tail(sentinel: torch.Tensor) -> None:
     forward_batch = get_tc_piecewise_forward_context().forward_batch
     get_attn_backend().prefill_graph_exit_late_layer_tail(forward_batch)
-    return sentinel
 
 
-bcg_deepseek_v4_enter_late_layer_tail = eager_on_graph(True)(
-    deepseek_v4_enter_late_layer_tail
+# The captured tail segments read the metadata these swap in, so they also run
+# while the graph captures.
+bcg_deepseek_v4_enter_late_layer_tail = eager_on_graph(
+    deepseek_v4_enter_late_layer_tail,
+    capture_stub=deepseek_v4_enter_late_layer_tail,
 )
-bcg_deepseek_v4_exit_late_layer_tail = eager_on_graph(True)(
-    deepseek_v4_exit_late_layer_tail
+bcg_deepseek_v4_exit_late_layer_tail = eager_on_graph(
+    deepseek_v4_exit_late_layer_tail,
+    capture_stub=deepseek_v4_exit_late_layer_tail,
 )
 
 
@@ -4107,7 +4109,7 @@ class DeepseekV4Model(nn.Module):
                     # Eager break: re-run at replay so the backend swaps onto the
                     # live batch's tail metadata; the gathers below are captured
                     # against the persistent index buffers.
-                    tail_sentinel = bcg_deepseek_v4_enter_late_layer_tail(tail_sentinel)
+                    bcg_deepseek_v4_enter_late_layer_tail(tail_sentinel)
                     saved_full = attn_backend.prefill_graph_late_layer_saved
                     if (
                         self.decoder_replay_tail is not None
@@ -4253,7 +4255,7 @@ class DeepseekV4Model(nn.Module):
             exit_late_layer_dp(forward_batch, saved_dp)
         if saved_full is not None:
             if tail_in_graph:
-                tail_sentinel = bcg_deepseek_v4_exit_late_layer_tail(tail_sentinel)
+                bcg_deepseek_v4_exit_late_layer_tail(tail_sentinel)
             else:
                 attn_backend.exit_late_layer_tail(saved_full, forward_batch)
             return state.residual, state.pre, tail

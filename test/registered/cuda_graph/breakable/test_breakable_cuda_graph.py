@@ -8,7 +8,7 @@ Two test classes:
 """
 
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -102,14 +102,15 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
         y = torch.zeros(4, device=self.device)
 
         @self.eager_on_graph(enable=True)
-        def eager_op(src):
-            return src * 2.0
+        def eager_op(src, out):
+            out.copy_(src * 2.0)
 
         graph = self.BreakableCUDAGraph()
         stream = torch.cuda.Stream(self.device)
         with self.BreakableCUDAGraphCapture(graph, stream=stream):
             intermediate.copy_(x + 1.0)
-            broken = eager_op(intermediate)
+            broken = torch.empty_like(intermediate)
+            eager_op(intermediate, broken)
             y.copy_(broken + 3.0)
 
         # Replay with new input
@@ -125,20 +126,22 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
         y = torch.zeros(4, device=self.device)
 
         @self.eager_on_graph(enable=True)
-        def add_one(src):
-            return src + 1.0
+        def add_one(src, out):
+            out.copy_(src + 1.0)
 
         @self.eager_on_graph(enable=True)
-        def double(src):
-            return src * 2.0
+        def double(src, out):
+            out.copy_(src * 2.0)
 
         graph = self.BreakableCUDAGraph()
         stream = torch.cuda.Stream(self.device)
         with self.BreakableCUDAGraphCapture(graph, stream=stream):
             t1 = x + 1.0  # graph segment 1
-            t2 = add_one(t1)  # break 1: eager
+            t2 = torch.empty_like(t1)
+            add_one(t1, t2)  # break 1: eager
             t3 = t2 + 1.0  # graph segment 2
-            t4 = double(t3)  # break 2: eager
+            t4 = torch.empty_like(t3)
+            double(t3, t4)  # break 2: eager
             y.copy_(t4)  # graph segment 3
 
         # Replay: x=5 -> +1=6 -> add_one=7 -> +1=8 -> double=16
@@ -165,11 +168,12 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
         """@eager_on_graph called outside capture should run the function directly."""
 
         @self.eager_on_graph(enable=True)
-        def my_fn(x):
-            return x + 1.0
+        def my_fn(x, out):
+            out.copy_(x + 1.0)
 
         t = torch.tensor([1.0, 2.0], device=self.device)
-        result = my_fn(t)
+        result = torch.empty_like(t)
+        my_fn(t, result)
         self.assertTrue(
             torch.allclose(result, torch.tensor([2.0, 3.0], device=self.device))
         )
@@ -180,14 +184,15 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
         y = torch.zeros(4, device=self.device)
 
         @self.eager_on_graph(enable=True)
-        def scale(src):
-            return src * 3.0
+        def scale(src, out):
+            out.copy_(src * 3.0)
 
         graph = self.BreakableCUDAGraph()
         stream = torch.cuda.Stream(self.device)
         with self.BreakableCUDAGraphCapture(graph, stream=stream):
             t = x + 1.0
-            t2 = scale(t)
+            t2 = torch.empty_like(t)
+            scale(t, t2)
             y.copy_(t2)
 
         # First replay: x=0 -> 0+1=1 -> 1*3=3
@@ -208,8 +213,8 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
         stream = torch.cuda.Stream(self.device)
 
         @self.eager_on_graph(enable=True)
-        def identity(src):
-            return src
+        def touch(src):
+            pass
 
         graph = self.BreakableCUDAGraph()
         capture_stream = torch.cuda.Stream(self.device)
@@ -217,7 +222,7 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
             stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(stream):
                 side_output = x + 1.0
-            identity(x)
+            touch(x)
             torch.cuda.current_stream().wait_stream(stream)
             y.copy_(side_output * 2.0)
 
@@ -225,28 +230,6 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
         graph.replay()
         torch.cuda.synchronize()
         self.assertTrue(torch.allclose(y, torch.full((4,), 12.0, device=self.device)))
-
-    def test_eager_output_is_held_strongly_for_replay_bridge(self):
-        """The replay closure must keep the eager output bridge buffer alive."""
-        x = torch.zeros(4, device=self.device)
-        y = torch.zeros(4, device=self.device)
-
-        @self.eager_on_graph(enable=True)
-        def scale(src):
-            return src * 3.0
-
-        graph = self.BreakableCUDAGraph()
-        stream = torch.cuda.Stream(self.device)
-        with self.BreakableCUDAGraphCapture(graph, stream=stream):
-            t = x + 1.0
-            broken = scale(t)
-            y.copy_(broken)
-
-        replay_closure = graph._break_fns[0].__closure__ or ()
-        self.assertTrue(
-            any(cell.cell_contents is broken for cell in replay_closure),
-            "eager output bridge buffer must be strongly captured",
-        )
 
     def test_attention_narrows_padded_positions(self):
 
@@ -290,62 +273,43 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
         self.assertEqual(forward_batch.out_cache_loc.shape[0], padded_num_tokens)
 
 
-class TestCopyOutput(CustomTestCase):
-    """Test the _copy_output helper for structured output writeback."""
+class TestCapturePassRecordsBreaks(CustomTestCase):
+    """The capture pass records a break without running its body, which would
+    read inputs the captured segments never computed."""
 
-    @classmethod
-    def setUpClass(cls):
-        if not torch.cuda.is_available():
-            raise unittest.SkipTest("CUDA not available")
-
-        from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
-            _copy_output,
+    def _capture(self):
+        from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+            breakable_cuda_graph as bcg,
         )
 
-        cls._copy_output = staticmethod(_copy_output)
-        cls.device = torch.device("cuda:0")
+        capture = Mock(_barrier_fn=None, cuda_graph=SimpleNamespace(_break_fns=[]))
+        active = patch.object(bcg, "_current_capture_var")
+        return bcg, capture, active
 
-    def test_tensor_copy(self):
-        dst = torch.zeros(4, device=self.device)
-        src = torch.ones(4, device=self.device) * 5.0
-        result = self._copy_output(dst, src)
-        self.assertIs(result, dst)
-        self.assertTrue(torch.allclose(dst, src))
-
-    def test_dict_copy(self):
-        dst = {
-            "a": torch.zeros(4, device=self.device),
-            "b": torch.zeros(4, device=self.device),
-        }
-        src = {
-            "a": torch.ones(4, device=self.device),
-            "b": torch.ones(4, device=self.device) * 2.0,
-        }
-        result = self._copy_output(dst, src)
-        self.assertIs(result, dst)
-        self.assertTrue(torch.allclose(dst["a"], torch.ones(4, device=self.device)))
-        self.assertTrue(
-            torch.allclose(dst["b"], torch.ones(4, device=self.device) * 2.0)
+    def test_capture_runs_only_the_stub_and_replay_runs_the_body(self):
+        bcg, capture, active = self._capture()
+        calls = []
+        op = bcg.eager_on_graph(
+            lambda tag: calls.append(("body", tag)),
+            capture_stub=lambda tag: calls.append(("stub", tag)),
         )
+        with active as var:
+            var.get.return_value = capture
+            self.assertIsNone(op("a"))
+        self.assertEqual(calls, [("stub", "a")])
+        capture.cuda_graph._break_fns[0]()
+        self.assertEqual(calls, [("stub", "a"), ("body", "a")])
 
-    def test_object_copy(self):
-        class FakeOutput:
-            def __init__(self, t, label):
-                self.tensor = t
-                self.label = label
-
-        dst = FakeOutput(torch.zeros(4, device=self.device), "old")
-        src = FakeOutput(torch.ones(4, device=self.device) * 3.0, "new")
-        result = self._copy_output(dst, src)
-        self.assertIs(result, dst)
-        self.assertTrue(
-            torch.allclose(dst.tensor, torch.ones(4, device=self.device) * 3.0)
-        )
-        self.assertEqual(dst.label, "new")
-
-    def test_non_tensor_fallback(self):
-        result = self._copy_output(42, 99)
-        self.assertEqual(result, 99)
+    def test_a_break_returning_a_value_fails(self):
+        bcg, capture, active = self._capture()
+        op = bcg.eager_on_graph(lambda: 1)
+        with self.assertRaises(AssertionError):
+            op()
+        with active as var:
+            var.get.return_value = capture
+            op()
+        with self.assertRaises(AssertionError):
+            capture.cuda_graph._break_fns[0]()
 
 
 class TestBreakGraphHelper(CustomTestCase):

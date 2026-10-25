@@ -181,46 +181,6 @@ def _weak_ref_if_tensor(x):
     return x
 
 
-def _copy_output(dst: Any, src: Any) -> Any:
-    """Copy src output into dst in-place where possible.
-
-    Handles plain tensors, tuples/lists of tensors, dataclass/object with
-    tensor attributes, and dicts of tensors. Returns dst if in-place copy
-    succeeded, otherwise returns src.
-    """
-    if torch.is_tensor(dst) and torch.is_tensor(src):
-        dst.copy_(src)
-        return dst
-
-    if (
-        isinstance(dst, (tuple, list))
-        and isinstance(src, (tuple, list))
-        and len(dst) == len(src)
-    ):
-        copied = [_copy_output(d, s) for d, s in zip(dst, src)]
-        return tuple(copied) if isinstance(dst, tuple) else copied
-
-    if hasattr(dst, "__dict__") and hasattr(src, "__dict__"):
-        for key, src_val in src.__dict__.items():
-            dst_val = getattr(dst, key, None)
-            if torch.is_tensor(dst_val) and torch.is_tensor(src_val):
-                dst_val.copy_(src_val)
-            else:
-                setattr(dst, key, src_val)
-        return dst
-
-    if isinstance(dst, dict) and isinstance(src, dict):
-        for key, src_val in src.items():
-            dst_val = dst.get(key)
-            if torch.is_tensor(dst_val) and torch.is_tensor(src_val):
-                dst_val.copy_(src_val)
-            else:
-                dst[key] = src_val
-        return dst
-
-    return src
-
-
 class _EagerOnGraphCallable:
     """Bind both graph-aware and explicit eager entry points to the same instance."""
 
@@ -252,9 +212,12 @@ def eager_on_graph(
 ):
     """Record an eager call between captured segments.
 
-    Arguments retain their capture-time identity. Tensors must use the static
-    buffers owned by the graph runner; request-specific state must be read
-    inside the eager function at execution time.
+    Arguments retain their capture-time identity. A break returns None: it
+    writes its results into buffers the caller allocated, which the next
+    segments read. Request-specific state must be read inside the eager
+    function at execution time. The capture pass records the call without
+    running it, since its inputs were never computed; ``capture_stub`` runs
+    in its place for host setup a later captured segment needs.
 
     Use ``fn.run_eager(...)`` to call the body inside an existing eager region.
     This explicit entry bypasses graph segmentation and capture stubs; methods
@@ -268,52 +231,42 @@ def eager_on_graph(
         return lambda inner: inner
 
     def decorator(inner: Callable):
+        def run(*args, **kwargs) -> None:
+            out = inner(*args, **kwargs)
+            assert out is None, (
+                f"{inner.__qualname__} is a graph break and must return None; "
+                "write the results into buffers the caller allocated"
+            )
+
         @functools.wraps(inner)
         def wrapper(*args, **kwargs):
             capture = _current_capture_var.get()
             if capture is None:
-                return inner(*args, **kwargs)
+                run(*args, **kwargs)
+                return
 
             # End the segment that captured up to this break point.
             capture._end_current_segment()
 
-            # Re-sync ranks after segment teardown (the slow, variable
-            # step) before break fns with rank-coupled collectives and hard
-            # timeouts (DeepEP NORMAL: 100s). Capture-only; replay bypasses
-            # this wrapper.
+            # Re-sync ranks after segment teardown (the slow, variable step)
+            # before a capture stub. Capture-only; replay bypasses this wrapper.
             if capture._barrier_fn is not None:
                 capture._barrier_fn()
 
-            # Run the break once so its outputs are allocated and their
-            # addresses recorded. A capture_stub replaces the body during
-            # capture (contents are never consumed; warmup and replay run
-            # the real inner), letting rank-coupled bodies skip the work.
             if capture_stub is not None:
-                output = capture_stub(*args, **kwargs)
-            else:
-                output = inner(*args, **kwargs)
+                capture_stub(*args, **kwargs)
 
             # Weak-ref captured inputs produced by graph segments. Their storage
             # is pinned by the segment CUDAGraphs' mempool use-count, so Python
             # refs do not need to keep every intermediate alive.
-            captured_inner = inner
             captured_args = tuple(_weak_ref_if_tensor(a) for a in args)
             captured_kwargs = {k: _weak_ref_if_tensor(v) for k, v in kwargs.items()}
-            # The eager break output is different: it is allocated between graph
-            # captures and is the static input address consumed by the next
-            # captured segment. Keep a strong reference so replay can safely
-            # copy fresh eager output into that bridge buffer.
-            captured_output = output
-
-            def replay_fn():
-                new_out = captured_inner(*captured_args, **captured_kwargs)
-                return _copy_output(captured_output, new_out)
-
-            capture.cuda_graph._break_fns.append(replay_fn)
+            capture.cuda_graph._break_fns.append(
+                functools.partial(run, *captured_args, **captured_kwargs)
+            )
 
             # Start a fresh CUDAGraph segment for the remainder of the forward.
             capture._begin_new_segment()
-            return output
 
         return functools.update_wrapper(_EagerOnGraphCallable(wrapper, inner), inner)
 
