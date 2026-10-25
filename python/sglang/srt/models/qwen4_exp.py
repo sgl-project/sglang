@@ -1842,9 +1842,7 @@ class Qwen4ExpAttentionDecoderLayer(
                 positions=positions,
                 output=output,
             )
-            return (
-                self._qsa_prefill_topk_bridges[0][:rows] if output is None else output
-            )
+            return bridges[0][:rows]
         return self._compute_qsa_topk_indices_eager(
             hidden_states=hidden_states,
             positions=positions,
