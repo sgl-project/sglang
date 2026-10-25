@@ -18,6 +18,8 @@ One row per test: what it pins, then the test.
             -> test_worker_threads_encode_timestamps_with_their_own_tokenizer
             per-source preprocess_kwargs and serving views
             -> test_video_preprocess_kwargs_apply_per_item_and_keep_serving_views
+            per-source frame and pixel options stay within the configured limits
+            -> test_video_preprocess_kwargs_cannot_raise_configured_limits
     audio   feature mask and CNN chunk lengths
             -> test_omni_audio_mask_and_cnn_chunk_lengths
     video   the Qwen2 decoder keeps the legacy resize
@@ -65,6 +67,11 @@ from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.multimodal.processors.executor import MultimodalProcessorExecutor
 from sglang.srt.multimodal.processors.qwen_vl import (
     QwenVLImageProcessor,
+)
+from sglang.srt.multimodal.qwen_vl_media_processing import (
+    FPS_MAX_FRAMES,
+    VIDEO_MAX_PIXELS,
+    VIDEO_TOTAL_PIXELS,
 )
 from sglang.srt.multimodal.token_space_mm_process.expansion import (
     expand_token_placeholders,
@@ -921,6 +928,44 @@ class TestQwenTokenizedMedia(CustomTestCase):
         )
         with self.assertRaisesRegex(ValueError, "use_audio_in_video"):
             _process_media(processor, videos=[object()], use_audio_in_video=True)
+
+    def test_video_preprocess_kwargs_cannot_raise_configured_limits(self):
+        strategy = _make_hf_processor(Qwen3VLProcessor, 16)._core.strategy
+        client_options = {
+            "fps": 60,
+            "max_frames": 10**6,
+            "max_pixels": 10**12,
+            "total_pixels": 10**15,
+            "do_normalize": False,
+        }
+        for video_config, expected in (
+            (
+                {},
+                {
+                    "max_frames": FPS_MAX_FRAMES,
+                    "max_pixels": VIDEO_MAX_PIXELS,
+                    "total_pixels": VIDEO_TOTAL_PIXELS,
+                },
+            ),
+            (
+                {"max_frames": 64, "max_pixels": 1024, "total_pixels": 4096},
+                {"max_frames": 64, "max_pixels": 1024, "total_pixels": 4096},
+            ),
+        ):
+            with self.subTest(video_config=video_config):
+                with patch.object(strategy, "video_config", video_config):
+                    self.assertEqual(
+                        strategy._bound_item_video_options(client_options),
+                        {"fps": 60, "do_normalize": False, **expected},
+                    )
+        self.assertEqual(
+            strategy._bound_item_video_options({"nframes": 8, "max_frames": 16}),
+            {"nframes": 8, "max_frames": 16},
+        )
+        with self.assertRaisesRegex(ValueError, "resized_height"):
+            strategy._bound_item_video_options(
+                {"resized_height": 10**4, "resized_width": 10**4}
+            )
 
     def test_audio_preprocess_kwargs_keep_truncation_and_batch_padding(self):
         processor = _make_hf_processor(

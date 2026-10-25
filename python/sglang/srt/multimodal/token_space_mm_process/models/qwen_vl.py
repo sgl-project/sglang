@@ -14,7 +14,10 @@ from transformers.models.qwen3_vl.video_processing_qwen3_vl import (
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.mrope_rope_index import get_rope_index
 from sglang.srt.multimodal.qwen_vl_media_processing import (
+    FPS_MAX_FRAMES,
     QWEN_VIDEO_PREPROCESS_CONFIG_KEYS,
+    VIDEO_MAX_PIXELS,
+    VIDEO_TOTAL_PIXELS,
     preprocess_video_sync,
 )
 from sglang.srt.multimodal.token_space_mm_process.process_strategy import (
@@ -141,7 +144,7 @@ class QwenTokenSpaceProcessStrategy(TokenSpaceProcessStrategy):
                 for key, value in kwargs.items()
                 if key in QWEN_VIDEO_PREPROCESS_CONFIG_KEYS
             },
-            **preprocess_kwargs,
+            **self._bound_item_video_options(preprocess_kwargs),
         }
         processor_kwargs = dict(kwargs)
         if isinstance(processor.video_processor, Qwen3VLVideoProcessor):
@@ -195,6 +198,31 @@ class QwenTokenSpaceProcessStrategy(TokenSpaceProcessStrategy):
                 for item in output["video_metadata"]
             ]
         return output
+
+    def _bound_item_video_options(self, preprocess_kwargs):
+        """Let per-item options lower, never raise, the configured frame and pixel
+        limits: in serving they come from the client's video_url."""
+        frame_cap = self.video_config.get("max_frames", FPS_MAX_FRAMES)
+        pixel_cap = self.video_config.get("max_pixels", VIDEO_MAX_PIXELS)
+        caps = {
+            "nframes": frame_cap,
+            "max_frames": frame_cap,
+            "max_pixels": pixel_cap,
+            "total_pixels": self.video_config.get("total_pixels", VIDEO_TOTAL_PIXELS),
+        }
+        options = {
+            key: min(value, caps[key]) if key in caps else value
+            for key, value in preprocess_kwargs.items()
+        }
+        # smart_resize applies no pixel limit to an explicit size.
+        if (
+            options.get("resized_height", 0) * options.get("resized_width", 0)
+            > pixel_cap
+        ):
+            raise ValueError(
+                f"resized_height * resized_width exceeds the video max_pixels {pixel_cap}"
+            )
+        return options
 
     def process_audio(self, audio, processor, preprocess_kwargs, **kwargs):
         output = dict(
