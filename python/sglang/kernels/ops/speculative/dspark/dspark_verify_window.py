@@ -729,9 +729,9 @@ class BuildOutTokens:
     @classmethod
     def execute(cls, *args, **kwargs) -> torch.Tensor:
         if inputs_on_npu(*args, **kwargs):
-            from sgl_kernel_npu.sample import build_out_tokens
+            from sgl_kernel_npu import sample as npu_sample
 
-            return build_out_tokens(*args, **kwargs)
+            return npu_sample.build_out_tokens(*args, **kwargs)
         if inputs_on_cuda(*args, **kwargs) and not _is_npu:
             return cls.triton(*args, **kwargs)
         return cls.torch(*args, **kwargs)

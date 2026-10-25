@@ -39,9 +39,9 @@ class MarkovGreedyStep:
         w2_weight: torch.Tensor,
     ) -> torch.Tensor:
         if base_logits.device.type == "npu":
-            from sgl_kernel_npu.sample import markov_greedy_step_triton
+            from sgl_kernel_npu import sample as npu_sample
 
-            return markov_greedy_step_triton(
+            return npu_sample.markov_greedy_step_triton(
                 base_logits=base_logits, prev_embeds=prev_embeds, w2_weight=w2_weight
             )
         if base_logits.is_cuda:

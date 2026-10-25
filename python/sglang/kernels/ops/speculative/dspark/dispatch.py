@@ -4,6 +4,7 @@ import torch
 
 
 def _first_tensor(*args, **kwargs) -> torch.Tensor:
+    """Use positional arguments first, then keyword arguments in insertion order."""
     for value in (*args, *kwargs.values()):
         if isinstance(value, torch.Tensor):
             return value
@@ -19,4 +20,5 @@ def inputs_on_cuda(*args, **kwargs) -> bool:
 
 
 def inputs_on_npu(*args, **kwargs) -> bool:
+    """Check actual placement before the CUDA aliases installed by transfer_to_npu."""
     return _first_tensor(*args, **kwargs).device.type == "npu"

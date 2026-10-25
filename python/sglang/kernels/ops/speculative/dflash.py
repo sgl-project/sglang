@@ -381,9 +381,9 @@ def compute_dflash_correct_drafts_and_bonus(
         raise ValueError(f"block_size must be positive, got {block_size}.")
 
     if candidates.device.type == "npu":
-        from sgl_kernel_npu.sample import compute_dflash_correct_drafts_and_bonus
+        from sgl_kernel_npu import sample as npu_sample
 
-        return compute_dflash_correct_drafts_and_bonus(
+        return npu_sample.compute_dflash_correct_drafts_and_bonus(
             candidates=candidates, target_predict=target_predict
         )
 

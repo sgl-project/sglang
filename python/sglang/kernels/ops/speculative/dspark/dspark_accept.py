@@ -279,9 +279,9 @@ class SoftmaxTemp:
     @classmethod
     def execute(cls, *args, **kwargs) -> torch.Tensor:
         if inputs_on_npu(*args, **kwargs):
-            from sgl_kernel_npu.sample import softmax_temp_triton
+            from sgl_kernel_npu import sample as npu_sample
 
-            return softmax_temp_triton(*args, **kwargs)
+            return npu_sample.softmax_temp_triton(*args, **kwargs)
         if not inputs_on_cuda(*args, **kwargs):
             return cls.torch(*args, **kwargs)
         if _flashinfer_softmax is not None:
@@ -688,30 +688,21 @@ def gather_row_bonus_triton(*, table: torch.Tensor, idx: torch.Tensor) -> torch.
 
 
 def _row_argmax(logits: torch.Tensor, fused: bool = False) -> torch.Tensor:
-    if (
-        logits.device.type == "npu"
-        and logits.dim() == 2
-        and logits.dtype == torch.float32
-        and logits.stride(1) == 1
-    ):
-        from sglang.kernels.ops.speculative.row_argmax import row_argmax
+    if logits.dim() != 2 or logits.dtype != torch.float32 or logits.stride(1) != 1:
+        return torch.argmax(logits, dim=-1)
 
-        return row_argmax(logits)
-    # torch.argmax uses one block per row; at few rows x wide vocab that is ~7x
-    # off the memory the reduction touches. The fused kernel does not reproduce
-    # torch.argmax's NaN selection, hence the opt-in.
-    if (
+    # NPU preserves torch's NaN selection. CUDA's fused kernel does not,
+    # so keep it opt-in and limited to shapes where it outperforms torch.
+    use_fused = logits.device.type == "npu" or (
         fused
         and logits.is_cuda
-        and logits.dim() == 2
-        and logits.dtype == torch.float32
-        and logits.stride(1) == 1
         and (
             logits.shape[0] <= 64
             or (logits.shape[0] <= 384 and logits.shape[1] >= 65536)
         )
         and logits.shape[1] >= 4096
-    ):
+    )
+    if use_fused:
         from sglang.kernels.ops.speculative.row_argmax import row_argmax
 
         return row_argmax(logits)

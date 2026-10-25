@@ -135,9 +135,9 @@ def row_argmax(x: torch.Tensor) -> torch.Tensor:
     """``x.argmax(dim=-1)`` for FP32 speculative logits with a wide vocab."""
     assert x.dim() == 2 and x.dtype == torch.float32 and x.stride(1) == 1
     if x.device.type == "npu":
-        from sgl_kernel_npu.sample import row_argmax as npu_row_argmax
+        from sgl_kernel_npu import sample as npu_sample
 
-        return npu_row_argmax(x)
+        return npu_sample.row_argmax(x)
     rows, n = x.shape
     if rows > 64:
         return _medium_row_argmax(x)
