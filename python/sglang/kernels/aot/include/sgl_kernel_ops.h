@@ -258,6 +258,10 @@ void moe_sum_reduce(at::Tensor& input, at::Tensor& output, double routed_scaling
 
 void moe_sum(torch::Tensor& input, torch::Tensor& output);
 
+/// \brief Weight contiguous expert rows in place, writing zero for negative expert IDs.
+/// The paired GGUF projections accept negative IDs and bound padding metadata reads.
+void apply_gguf_moe_weights(torch::Tensor& outputs, const torch::Tensor& weights, const torch::Tensor& ids);
+
 void fp8_blockwise_scaled_grouped_mm(
     torch::Tensor& output,
     torch::Tensor& a_ptrs,
