@@ -11,11 +11,8 @@
 
 #include "common.cuh"
 #include "mmq.cuh"
+#include "mmq_internal.cuh"
 #include "sgl_llama_mmq.h"
-
-namespace sgl_llama_mmq {
-extern thread_local cudaStream_t g_cur_stream;
-}
 
 // The GGML types SGLang dispatches to MMQ; one template-instances/mmq-instance-<type>.cu each.
 #define SGL_LLAMA_MMQ_TYPES(X) \
@@ -88,7 +85,7 @@ int64_t q8_buffer_bytes(int64_t M, int64_t K) {
   return M * GGML_PAD(K, MATRIX_ROW_PADDING) * (int64_t)sizeof(block_q8_1_mmq) / QK8_1_MMQ + q8_tail_bytes();
 }
 
-static ggml_backend_cuda_context& device_context(int device) {
+ggml_backend_cuda_context& device_context(int device) {
   static std::mutex mtx;
   static ggml_backend_cuda_context* ctxs[GGML_CUDA_MAX_DEVICES] = {nullptr};
   std::lock_guard<std::mutex> lock(mtx);
@@ -98,7 +95,7 @@ static ggml_backend_cuda_context& device_context(int device) {
   return *ctxs[device];
 }
 
-static void mul_mat_q_switch_type(ggml_backend_cuda_context& ctx, const mmq_args& args, cudaStream_t stream) {
+void mul_mat_q_switch_type(ggml_backend_cuda_context& ctx, const mmq_args& args, cudaStream_t stream) {
   switch (args.type_x) {
 #define X(T)                                                        \
   case GGML_TYPE_##T:                                               \
@@ -109,6 +106,39 @@ static void mul_mat_q_switch_type(ggml_backend_cuda_context& ctx, const mmq_args
     default:
       GGML_ABORT("GGML type %d is not supported by MMQ", (int)args.type_x);
   }
+}
+
+int current_device() {
+  const int id = ggml_cuda_get_device();
+  if (id >= ggml_cuda_info().device_count) {
+    GGML_ABORT("device %d: llama.cpp MMQ supports at most %d devices", id, GGML_CUDA_MAX_DEVICES);
+  }
+  return id;
+}
+
+int select_tile_J(ggml_type type, int64_t rows, int64_t ncols, int device) {
+  const int cc = ggml_cuda_info().devices[device].cc;
+  const size_t smpbo = ggml_cuda_info().devices[device].smpbo;
+  const bool fallback = ggml_cuda_mmq_needs_fallback(rows);
+  // The J with the fewest tiles along the columns that fits in shared memory (ggml_cuda_mul_mat_q).
+  int J_best = 0;
+  int ntiles_J_best = INT_MAX;
+  for (int J = 8; J <= 128 && ntiles_J_best > 1; J += 8) {
+    const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc, GGML_PREC_Q8);
+    if (config.type == GGML_TYPE_COUNT) {
+      continue;
+    }
+    if (mmq_get_nbytes_shared(config, cc) > smpbo) {
+      continue;
+    }
+    const int64_t ntiles_x = (ncols + config.J - 1) / config.J;
+    if (ntiles_x < ntiles_J_best) {
+      J_best = J;
+      ntiles_J_best = ntiles_x;
+    }
+  }
+  GGML_ASSERT(J_best > 0);
+  return J_best;
 }
 
 void mul_mat(
@@ -130,36 +160,8 @@ void mul_mat(
   GGML_ASSERT(ldw_bytes % bs == 0);
   GGML_ASSERT(ld_dst >= rows);
 
-  const int id = ggml_cuda_get_device();
-  if (id >= ggml_cuda_info().device_count) {
-    GGML_ABORT("device %d: llama.cpp MMQ supports at most %d devices", id, GGML_CUDA_MAX_DEVICES);
-  }
-  const int cc = ggml_cuda_info().devices[id].cc;
-  const size_t smpbo = ggml_cuda_info().devices[id].smpbo;
-
-  constexpr ggml_prec prec_src1 = GGML_PREC_Q8;
-  const bool fallback = ggml_cuda_mmq_needs_fallback(rows);
-
-  // Tile width along M: the J with the fewest tiles that fits in shared memory (ggml_cuda_mul_mat_q).
-  int J_best = 0;
-  {
-    int ntiles_J_best = INT_MAX;
-    for (int J = 8; J <= 128 && ntiles_J_best > 1; J += 8) {
-      const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc, prec_src1);
-      if (config.type == GGML_TYPE_COUNT) {
-        continue;
-      }
-      if (mmq_get_nbytes_shared(config, cc) > smpbo) {
-        continue;
-      }
-      const int ntiles_x = (M + config.J - 1) / config.J;
-      if (ntiles_x < ntiles_J_best) {
-        J_best = J;
-        ntiles_J_best = ntiles_x;
-      }
-    }
-  }
-  GGML_ASSERT(J_best > 0);
+  const int id = current_device();
+  const int J_best = select_tile_J(type, rows, M, id);
 
   const int64_t K_padded = GGML_PAD(K, MATRIX_ROW_PADDING);
   const int64_t s01 = ldw_bytes / bs;  // weight row stride in blocks

@@ -49,6 +49,7 @@ if _is_cuda:
     from sgl_kernel.quantization import (
         ggml_dequantize,
         ggml_moe_a8,
+        ggml_moe_mmq,
         ggml_mul_mat_a8,
         ggml_mul_mat_vec_a8,
     )
@@ -181,9 +182,14 @@ IMATRIX_QUANT_TYPES = {
 }
 DEQUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES | IMATRIX_QUANT_TYPES
 MMVQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES | IMATRIX_QUANT_TYPES
-# The MoE MMQ kernel (ggml_moe_a8) and the dense MMQ kernel on MUSA are the dp4a
-# kernels, which cover the standard and k-quant types.
+# The MoE MMQ kernel ggml_moe_a8 and the dense MMQ kernel on MUSA are the dp4a
+# kernels, which cover the standard and k-quant types; on CUDA, fused_moe_gguf
+# uses ggml_moe_mmq (llama.cpp's MMQ) for MMQ_QUANT_TYPES instead.
 MOE_MMQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES
+# Up to this many tokens fused_moe_gguf keeps the per-route MMVQ kernel
+# (ggml_moe_a8_vec) on CUDA: it wins at 1-2 tokens, the two are within ~20% at
+# 3-5, ggml_moe_mmq wins from 6 on (64 experts, top-8, RTX 5070 Ti).
+GGUF_MOE_VEC_MAX_TOKENS = 4
 if _is_cuda:
     # ggml_mul_mat_a8 on CUDA is llama.cpp's MMQ (IQ1_M through llama_mmq's own
     # tile loader): all standard, k-quant and i-quant types except Q8_1 (an
@@ -330,8 +336,23 @@ def fused_moe_gguf(
     if _is_musa and not native_musa:
         inactive = topk_ids < 0
     out_hidden_states = torch.empty_like(x)
-    # unless we decent expert reuse we are better off running moe_vec kernel
     if (
+        _is_cuda
+        and qweight_type in MMQ_QUANT_TYPES
+        and qweight_type2 in MMQ_QUANT_TYPES
+        and x.shape[0] > GGUF_MOE_VEC_MAX_TOKENS
+    ):
+        # llama.cpp's MMQ (MUL_MAT_ID): the routes are sorted by expert on the
+        # GPU, gate/up quantizes each token once; fp32 in between.
+        num_tokens = x.shape[0]
+        top_k = topk_ids.shape[1]
+        out = ggml_moe_mmq(x, w1, topk_ids, qweight_type, w1.shape[1], False)
+        out = act(out.view(num_tokens * top_k, -1))
+        out = ggml_moe_mmq(out, w2, topk_ids, qweight_type2, w2.shape[1], True)
+        out = torch.bmm(topk_weights.view(num_tokens, 1, top_k).float(), out)
+        out_hidden_states.copy_(out.view(num_tokens, -1))
+    # unless we decent expert reuse we are better off running moe_vec kernel
+    elif (
         qweight_type2 in MOE_MMQ_QUANT_TYPES
         and qweight_type in MOE_MMQ_QUANT_TYPES
         and x.shape[0] > 64
@@ -695,6 +716,41 @@ class GGUFMoEMethod(FusedMoEMethodBase):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
+
+    def process_weights_after_loading(self, layer: torch.nn.Module):
+        # The loader collects GGUF expert weights in data_container; build the
+        # [E, rows, row_bytes] tensors if that has not happened yet (as
+        # GGUFMoEAscendMethod does).
+        if hasattr(layer, "materialize_gguf_weights") and any(
+            isinstance(getattr(layer, n), UninitializedParameter)
+            for n in ("w13_qweight", "w2_qweight")
+        ):
+            layer.materialize_gguf_weights()
+        # Extend the expert weights' storage by the bytes ggml_moe_mmq may read
+        # past the last row of the last expert (gguf_mmq_tail_bytes; the other
+        # experts' over-reads land in the next expert's rows).
+        for name in ("w13_qweight", "w2_qweight"):
+            qweight = getattr(layer, name)
+            if isinstance(qweight, UninitializedParameter) or qweight.dim() != 3:
+                continue
+            qweight_type = getattr(layer, f"{name}_type").weight_type
+            tail = gguf_mmq_tail_bytes(qweight_type, qweight.shape[2])
+            available = qweight.untyped_storage().nbytes() - qweight.storage_offset()
+            if (
+                tail == 0
+                or not qweight.is_contiguous()
+                or available >= qweight.numel() + tail
+            ):
+                continue
+            storage = torch.empty(
+                qweight.numel() + tail, dtype=qweight.dtype, device=qweight.device
+            )
+            storage[qweight.numel() :].zero_()
+            data = storage[: qweight.numel()].view(qweight.shape)
+            data.copy_(qweight.data)
+            padded_param = Parameter(data, requires_grad=False)
+            set_weight_attrs(padded_param, vars(qweight))
+            layer.register_parameter(name, padded_param)
 
     def apply(
         self,

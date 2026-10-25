@@ -56,4 +56,55 @@ void mul_mat(
     int64_t ld_dst,
     cudaStream_t stream);
 
+// ---------------------------------------------------------------------------------------------
+// MoE (llama.cpp's MUL_MAT_ID path, mmq_moe.cu): dst[t, s, :] = W[expert(t, s)] @ x(t, s) for the n_used slots s of
+// each token t, with x(t, s) = x[t] (x_per_slot = false, the gate/up projection: each token is quantized once) or
+// x[t * n_used + s] (x_per_slot = true, the down projection).
+
+// Largest number of tokens per moe_mul_mat() call: mm_ids_helper keeps 4 bytes per token in shared memory
+// (smpbo / 4), and the kernels index the output and the q8_1 buffer with 32-bit ints.
+int64_t moe_max_tokens_per_call(int64_t n_used, int64_t rows, int64_t K);
+
+// topk_ids [n_slots / n_used, n_used] (int32 or int64) -> ids32 [n_slots] int32 with masked / out-of-range ids
+// (< 0 or >= n_experts) and repeats of an expert within a token replaced by INT_MAX, which matches no expert; the
+// dst rows [n_slots, rows] of those slots are zeroed (no tile writes them).
+void moe_prepare_ids(
+    const void* topk_ids,
+    bool ids_int64,
+    int64_t n_slots,
+    int64_t n_used,
+    int64_t n_experts,
+    int32_t* ids32,
+    float* dst,
+    int64_t rows,
+    cudaStream_t stream);
+
+// One call for n_tokens <= moe_max_tokens_per_call() tokens. W: n_experts x rows x row blocks with row and expert
+// strides in bytes (multiples of the block size); the storage must hold weight_tail_bytes() past the last row of
+// the last expert. x: [n_tokens, K] or [n_tokens * n_used, K] (x_per_slot), row stride ldx elements. ids32: this
+// call's [n_tokens, n_used] slice of moe_prepare_ids(). Scratch: ids_src1 [n_tokens * n_used], ids_dst
+// [n_tokens * n_used + 128], expert_bounds [n_experts + 1] int32, yq q8_buffer_bytes(n_tokens * n_used, K).
+// dst: [n_tokens, n_used, rows] fp32; rows of masked slots are not written.
+void moe_mul_mat(
+    const void* w,
+    int64_t n_experts,
+    int64_t rows,
+    int64_t K,
+    int64_t ldw_row_bytes,
+    int64_t ldw_expert_bytes,
+    int64_t type,
+    const void* x,
+    XType xtype,
+    int64_t ldx,
+    bool x_per_slot,
+    const int32_t* ids32,
+    int64_t n_tokens,
+    int64_t n_used,
+    int32_t* ids_src1,
+    int32_t* ids_dst,
+    int32_t* expert_bounds,
+    void* yq,
+    float* dst,
+    cudaStream_t stream);
+
 }  // namespace sgl_llama_mmq

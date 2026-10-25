@@ -41,3 +41,5 @@ c98bbe1dd91e03362f4136357c6f4e4e2c5328902fdc6fd857d0f608386ffb2e  ggml/src/ggml-
 a03418c7c0607a3ce3707129dd7e0fcd18d36f241c55289a274fac66f1548f93  ggml/src/ggml-cuda/template-instances/mmq-instance-iq4_nl.cu
 c4f568105a3ff273287b04c58879ea455efd5fa05aa72da9ef0efeb7ab9de520  ggml/src/ggml-cuda/template-instances/mmq-instance-iq4_xs.cu
 94f29bbed6a22c35b992c5c6ebf0e7c92f13b836b90f36f461c9cf2f0f1d010d  ggml/LICENSE
+41b1c571da649b80f438e9ee7ded5cebc035cd0003a152ce81fb54462c3cab5b  ggml/src/ggml-cuda/mmid.cu
+236962648e49c0faa2d76f505c781e36a99c833b27ff3a871111d9de135803ed  ggml/src/ggml-cuda/mmid.cuh

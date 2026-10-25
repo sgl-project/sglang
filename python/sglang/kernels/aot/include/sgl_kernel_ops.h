@@ -620,6 +620,9 @@ torch::Tensor ggml_moe_a8_vec(
 
 int64_t ggml_moe_get_block_size(int64_t type);
 
+torch::Tensor
+ggml_moe_mmq(torch::Tensor X, torch::Tensor W, torch::Tensor topk_ids, int64_t type, int64_t row, bool x_per_slot);
+
 /*
  * From csrc/spatial
  */

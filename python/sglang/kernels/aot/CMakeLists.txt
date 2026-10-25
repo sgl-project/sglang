@@ -312,7 +312,7 @@ set(INCLUDES
 )
 
 # ======================= llama.cpp MMQ (GGUF kernels) ======================= #
-# llama.cpp's int8 tensor-core MMQ kernels behind ggml_mul_mat_a8, vendored under
+# llama.cpp's int8 tensor-core MMQ kernels behind ggml_mul_mat_a8 and ggml_moe_mmq, vendored under
 # csrc/quantization/gguf/llama_mmq/ggml (see LLAMA_CPP_COMMIT there; MIT). Built once and
 # linked into both common_ops libraries:
 #   * own include paths: the vendored ggml headers define the same block structs as
@@ -367,8 +367,10 @@ if(NOT _sgl_llama_mmq_old_stamp STREQUAL _sgl_llama_mmq_stamp OR NOT EXISTS "${S
 endif()
 set(SGL_LLAMA_MMQ_INSTANCES "${SGL_LLAMA_MMQ_GGML}/src/ggml-cuda/template-instances")
 set(SGL_LLAMA_MMQ_SOURCES
+    "${SGL_LLAMA_MMQ_DIR}/ggml/src/ggml-cuda/mmid.cu"
     "${SGL_LLAMA_MMQ_DIR}/ggml_shim.cu"
     "${SGL_LLAMA_MMQ_DIR}/mmq_dense.cu"
+    "${SGL_LLAMA_MMQ_DIR}/mmq_moe.cu"
     "${SGL_LLAMA_MMQ_DIR}/quantize_mmq_q8_1.cu"
     "${SGL_LLAMA_MMQ_INSTANCES}/mmq-instance-iq1_m.cu"
     "${SGL_LLAMA_MMQ_INSTANCES}/mmq-instance-iq1_s.cu"

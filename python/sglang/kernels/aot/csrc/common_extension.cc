@@ -332,6 +332,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("ggml_moe_get_block_size(int type) -> int");
   m.impl("ggml_moe_get_block_size", &ggml_moe_get_block_size);
 
+  m.def(
+      "ggml_moe_mmq(Tensor X, Tensor W, Tensor topk_ids, int type, SymInt row, "
+      "bool x_per_slot) -> Tensor");
+  m.impl("ggml_moe_mmq", torch::kCUDA, &ggml_moe_mmq);
+
   /*
    * From csrc/mamba
    */
