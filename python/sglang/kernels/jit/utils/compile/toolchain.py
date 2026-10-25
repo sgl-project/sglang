@@ -241,7 +241,24 @@ def base_link_flags(*, with_device: bool) -> List[str]:
         ]
     if is_hip_runtime():
         return flags + [f"-L{rocm_home()}/lib", "-lamdhip64"]
-    return flags + [f"-L{cuda_home()}/lib64", "-lcudart"]
+    return flags + _cudart_link_flags(cuda_home())
+
+
+def _cudart_link_flags(cuda_root: str) -> List[str]:
+    # A toolkit ships lib64/libcudart.so; the pip CUDA wheels (nvidia/cu13) ship only
+    # lib/libcudart.so.<major>, with no unversioned link for a plain -lcudart to find.
+    for lib_dir in (f"{cuda_root}/lib64", f"{cuda_root}/lib"):
+        if os.path.exists(f"{lib_dir}/libcudart.so"):
+            return [f"-L{lib_dir}", "-lcudart"]
+        # Shortest name is the soname (libcudart.so.13, not libcudart.so.13.0.96).
+        versioned = sorted(
+            pathlib.Path(lib_dir).glob("libcudart.so.[0-9]*"),
+            key=lambda path: len(path.name),
+        )
+        if versioned:
+            return [f"-L{lib_dir}", f"-l:{versioned[0].name}"]
+    # Neither layout found: keep the toolkit flags, so the linker names what is missing.
+    return [f"-L{cuda_root}/lib64", "-lcudart"]
 
 
 def compilers() -> Tuple[str, str]:
