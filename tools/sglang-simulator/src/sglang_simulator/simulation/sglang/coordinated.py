@@ -285,6 +285,8 @@ class CoordinatedScheduler:
         try:
             while True:
                 self._pump()
+                if self._admin and self._batch is None and self.clock.run_id is None:
+                    return  # Apply bootstrap administration before accepting Ready.
                 if self._finished:
                     if self._payloads:
                         raise ProtocolError("run already finished")
@@ -323,8 +325,6 @@ class CoordinatedScheduler:
                             self._grant()
                             continue
                         return
-                if self._admin and self._batch is None and self.clock.run_id is None:
-                    return  # Bootstrap administration does not require a driver.
                 if (
                     self.clock.run_id is not None
                     and time.monotonic() - start > self.timeout_s

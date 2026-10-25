@@ -174,6 +174,27 @@ def test_native_profile_cannot_reset_an_active_run(harness):
     assert harness.bridge.clock.now_ns == 0
 
 
+def test_bootstrap_profile_returns_before_an_already_queued_ready(harness):
+    profile = ProfileReq()
+    harness.payloads.put(profile)
+
+    def driver(control):
+        control.send(encode_message(Ready("run", 0, [], finished=True)))
+        return decode_grant(control.recv())
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(harness.run_driver, driver)
+        assert harness.bridge._socket.poll(1000)
+        assert harness.receive() == [profile]
+        assert harness.bridge.clock.run_id is None
+        assert not harness.bridge._finished
+        assert not future.done()
+        # The native caller now applies profile administration before its next
+        # receive pass accepts the driver's already queued first manifest.
+        assert harness.receive() == []
+        assert future.result(timeout=3).status == "FINISHED"
+
+
 @pytest.mark.parametrize("finished", [False, True])
 @pytest.mark.parametrize(
     "pending", ["batch", "result", "reference", "native", "payload", "same_poll"]
