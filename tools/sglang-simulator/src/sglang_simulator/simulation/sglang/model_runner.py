@@ -1,5 +1,5 @@
-from contextvars import ContextVar
 import json
+from contextvars import ContextVar
 
 import torch
 from sglang_simulator.hook import BaseHook
