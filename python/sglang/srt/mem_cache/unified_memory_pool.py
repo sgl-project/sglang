@@ -236,9 +236,12 @@ class MHASubPoolSpec(SubPoolSpec):
         """One layer's K (or V) UE8M0 scales, in the FA4 interleaved layout."""
         sbs = self.scale_block_size
         assert sbs is not None
-        assert page_size % sbs == 0, (
-            f"page_size {page_size} must be a multiple of scale_block_size {sbs}"
-        )
+        # The interleaved layout is the FA4 page_size-128 atom; the packed pool's
+        # flat fallback for other page sizes has no unified counterpart.
+        if page_size != 128:
+            raise ValueError(
+                f"block-scaled unified KV cache requires page_size 128; got {page_size}"
+            )
         return (num_pages, self.head_num, sbs, page_size // sbs, self.head_dim // sbs)
 
     def layout(self) -> DenseEntryLayout:
@@ -513,6 +516,13 @@ class UnifiedKVPool:
             if isinstance(s, MHASubPoolSpec) and s.scale_block_size is not None
         )
         if scale_share:
+            # finalize_backing re-backs only the payload; the scales stay sized
+            # for the boot capacity, so post-capture sizing has no scaled path.
+            if post_capture_active:
+                raise ValueError(
+                    "UnifiedKVPool post-capture backing does not support "
+                    "block-scaled sub-pools"
+                )
             payload = int(total_bytes / (1 + scale_share))
             total_bytes = payload // ENTRY_ALIGN_BYTES * ENTRY_ALIGN_BYTES
             self.total_bytes = total_bytes
@@ -1721,6 +1731,7 @@ def init_unified_mamba_pools(
     *,
     device: str,
     kv_cache_dtype: torch.dtype,
+    scale_block_size: Optional[int] = None,
     head_num: int,
     head_dim: int,
     page_size: int,
@@ -1789,6 +1800,7 @@ def init_unified_mamba_pools(
             v_head_dim=v_head_dim,
             store_dtype=store_dtype,
             kv_cache_dtype=kv_cache_dtype,
+            scale_block_size=scale_block_size,
             grow_direction="down",
             draft_region=None if fused_draft is None else fused_draft.region("full"),
         )
@@ -1820,20 +1832,17 @@ def init_unified_mamba_pools(
     # checkpoints, a FLOOR not headroom) + the slot-0 sink. The token side is
     # not charged -- `TpModelWorker.get_worker_info` already clamps max_req_len
     # to the pool, so a too-long request is refused at admission, not livelocked.
-    _check_bs1_feasibility_floor(
-        total_bytes=total_bytes,
-        floor_terms=[
-            ("bs1_state_slots", 3 * mamba_spec.entry_bytes()),
-            ("sink", _reserved_floor_bytes([full_spec, mamba_spec], page_size)),
-        ],
-        factory="init_unified_mamba_pools",
-    )
+    bs1_floor_terms = [
+        ("bs1_state_slots", 3 * mamba_spec.entry_bytes()),
+        ("sink", _reserved_floor_bytes([full_spec, mamba_spec], page_size)),
+    ]
     shared_pool = UnifiedKVPool(
         total_bytes=total_bytes,
         sub_pool_specs=[full_spec, mamba_spec],
         device=device,
         enable_memory_saver=enable_memory_saver,
         page_size=page_size,
+        bs1_floor_terms=bs1_floor_terms,
         fused_draft=fused_draft,
     )
     req_to_token_pool = UnifiedHybridReqToTokenPool(

@@ -1830,6 +1830,9 @@ def post_capture_kv_sizing_planned(server_args: Any) -> bool:
 
         if not model_config.is_hybrid_swa or mambaish_config(model_config) is not None:
             return False
+        # The post-capture resize re-backs only the payload, not MXFP8 scales.
+        if cfg.kv_cache_dtype == "mxfp8":
+            return False
         # The solver budgets these independent draft pools again after capture.
         spec = SpeculativeAlgorithm.from_string(cfg.speculative_algorithm)
         if spec.is_eagle() or spec.is_standalone() or spec.is_dflash_family():

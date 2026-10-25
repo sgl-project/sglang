@@ -4254,20 +4254,21 @@ class TestKvCacheShardingCompatibility(CustomTestCase):
                             resolution_result(args, "chunked_prefill_size"), 2112
                         )
 
-    def test_post_capture_kv_sizing_keeps_eager_prefill_headroom(self):
+    def _post_capture_planning_args(self, **overrides):
         prefill_graph = SimpleNamespace(backend=Backend.BREAKABLE, bs=[4096])
-        args = ServerArgs(
+        return ServerArgs(
             model_path="dummy",
-            enable_kv_cache_sharding=True,
             device="cuda",
             dcp_size=1,
-            kv_cache_dtype="auto",
             prefill_only_disable_kv_cache=False,
             enable_memory_saver=False,
             disaggregation_mode="prefill",
             cuda_graph_config=CudaGraphConfig(prefill=prefill_graph),
             chunked_prefill_size=4096,
+            **overrides,
         )
+
+    def _post_capture_kv_sizing_planned(self, args, model_config):
         with (
             patch(
                 "sglang.srt.arg_groups.overrides.use_mla_backend",
@@ -4279,9 +4280,7 @@ class TestKvCacheShardingCompatibility(CustomTestCase):
             ),
             patch(
                 "sglang.srt.arg_groups.overrides.model_config_of",
-                return_value=SimpleNamespace(
-                    hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"])
-                ),
+                return_value=model_config,
             ),
             patch.object(
                 envs.SGLANG_ENABLE_POST_CAPTURE_KV_SIZING,
@@ -4294,9 +4293,31 @@ class TestKvCacheShardingCompatibility(CustomTestCase):
                 return_value=None,
             ),
         ):
-            self.assertFalse(post_capture_kv_sizing_planned(args))
-            args.enable_kv_cache_sharding = False
-            self.assertTrue(post_capture_kv_sizing_planned(args))
+            return post_capture_kv_sizing_planned(args)
+
+    def test_post_capture_kv_sizing_keeps_eager_prefill_headroom(self):
+        args = self._post_capture_planning_args(
+            enable_kv_cache_sharding=True, kv_cache_dtype="auto"
+        )
+        model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"])
+        )
+        self.assertFalse(self._post_capture_kv_sizing_planned(args, model_config))
+        args.enable_kv_cache_sharding = False
+        self.assertTrue(self._post_capture_kv_sizing_planned(args, model_config))
+
+    def test_post_capture_kv_sizing_skips_unified_mxfp8(self):
+        args = self._post_capture_planning_args(
+            enable_unified_memory=True, kv_cache_dtype="mxfp8"
+        )
+        model_config = SimpleNamespace(
+            is_hybrid_swa=True,
+            hf_config=SimpleNamespace(architectures=["GptOssForCausalLM"]),
+        )
+        with patch("sglang.srt.configs.hybrid_arch.mambaish_config", return_value=None):
+            self.assertFalse(self._post_capture_kv_sizing_planned(args, model_config))
+            args.kv_cache_dtype = "fp8_e4m3"
+            self.assertTrue(self._post_capture_kv_sizing_planned(args, model_config))
 
     def test_chunk_rounding_expands_automatic_activation_headroom(self):
         args = self._rounding_args(raw_mem_fraction=None, resolved_mem_fraction=0.9)

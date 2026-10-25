@@ -904,6 +904,7 @@ class KVCacheConfigurator:
         bundle = init_unified_mamba_pools(
             device=self.device,
             kv_cache_dtype=self.kv_cache_dtype,
+            scale_block_size=self._unified_scale_block_size(),
             head_num=self.model_config.get_num_kv_heads(
                 get_parallel().attn_tp_size, get_parallel().attn_dcp_size
             ),

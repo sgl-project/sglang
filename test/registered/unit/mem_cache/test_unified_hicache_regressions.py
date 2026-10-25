@@ -319,11 +319,13 @@ class TestUnifiedMXFP8ScaleReload(CustomTestCase):
         )
 
     def test_scales_round_trip_through_the_host_tier(self):
+        from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler as assembler
         from sglang.srt.mem_cache.pool_host.mha_mxfp8 import MHATokenToKVPoolMXFP8Host
         from sglang.srt.mem_cache.unified_memory_pool import (
             UnifiedKVPool,
             build_unified_mha_pool,
         )
+        from sglang.srt.runtime_context import get_parallel
 
         full = self._spec("full", "down")
         pool_args = dict(
@@ -345,17 +347,37 @@ class TestUnifiedMXFP8ScaleReload(CustomTestCase):
             for buf in group
         )
         self.assertLessEqual(buffer.total_bytes + scale_bytes, pool_args["total_bytes"])
-        pool = build_unified_mha_pool(
-            unified_buffer=buffer, sub_pool_name="full", page_size=self._PS
+        pool, swa_pool = (
+            build_unified_mha_pool(
+                unified_buffer=buffer, sub_pool_name=name, page_size=self._PS
+            )
+            for name in ("full", "swa")
         )
-        host = MHATokenToKVPoolMXFP8Host(
-            pool,
-            host_to_device_ratio=1.0,
-            host_size=0,
-            page_size=self._PS,
-            layout="page_first",
+        memory = SimpleNamespace(
+            hicache_ratio=1.0,
+            hicache_size=0,
+            hicache_mem_layout="page_first",
+            hicache_storage_backend=None,
         )
-        self.addCleanup(host.destroy)
+        with (
+            patch.object(assembler, "get_memory", return_value=memory),
+            patch.object(assembler, "_get_allocator_type", return_value="default"),
+            get_parallel().override(dcp_enabled=False),
+        ):
+            group = assembler.build_hybrid_swa_group(
+                page_size=self._PS,
+                full_kv_pool=pool,
+                swa_kv_pool=swa_pool,
+                full_layer_mapping={0: 0, 1: 1},
+                swa_layer_mapping={2: 0, 3: 1},
+                use_mla=False,
+            )
+        self.addCleanup(group.destroy)
+        for name in (PoolName.KV, PoolName.SWA):
+            self.assertIsInstance(
+                group.entry_map[name].host_pool, MHATokenToKVPoolMXFP8Host
+            )
+        host = group.entry_map[PoolName.KV].host_pool
 
         loc = torch.arange(3 * self._PS, 4 * self._PS, dtype=torch.int64, device="cuda")
         scales = [
