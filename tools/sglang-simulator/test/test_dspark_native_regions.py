@@ -29,8 +29,12 @@ CASES = (
 )
 
 
-def prepared(mode, phase, region, *, batch_size=1):
+def prepared(mode, phase, region, *, batch_size=1, capture_size=None):
     sdk = pytest.importorskip("infercast.sdk.native_segment_module")
+    if capture_size is not None and not hasattr(
+        sdk.NativeSegmentQuery, "from_graph_work"
+    ):
+        pytest.skip("SDK does not expose graph-work queries")
     from infercast.sdk.models.umd.templates.deepseek_v41_segments import (
         prepare_native_dspark_phase,
     )
@@ -75,15 +79,27 @@ def prepared(mode, phase, region, *, batch_size=1):
             ],
         }
     )
-    capture = dict(
-        size=batch_size, attention_variant=None, stream_idx=None, variant_label=None
-    )
+    capture = {
+        "size": batch_size if capture_size is None else capture_size,
+        "attention_variant": None,
+        "stream_idx": None,
+        "variant_label": None,
+    }
     decode = mode == "TARGET_VERIFY"
-    query = sdk.NativeSegmentQuery.from_input(
+    project = (
+        sdk.NativeSegmentQuery.from_input
+        if capture_size is None
+        else sdk.NativeSegmentQuery.from_graph_work
+    )
+    query = project(
         execution_profile_id="a" * 64,
         segment_kind=region,
         native_forward_input=native,
-        draft_history_tokens=[128] * batch_size if decode else None,
+        **(
+            {"draft_history_tokens": [128] * batch_size if decode else None}
+            if capture_size is None
+            else {}
+        ),
         buffer_capacity=0 if decode else None,
         buffer_device_matches=False if decode else None,
         draft_capture_key=capture if decode else None,
@@ -92,12 +108,12 @@ def prepared(mode, phase, region, *, batch_size=1):
         else None,
         verify_plan_cpu_max_seq_len=900 if decode else None,
     )
-    execution = dict(
-        native_segment_profile_id=query.execution_profile_id,
-        native_segment_module_variant=query.module_variant,
-        draft_buffer_capacity=0,
-        draft_buffer_device_matches=False,
-    )
+    execution = {
+        "native_segment_profile_id": query.execution_profile_id,
+        "native_segment_module_variant": query.module_variant,
+        "draft_buffer_capacity": 0,
+        "draft_buffer_device_matches": False,
+    }
     before = replace(
         before,
         groups=(
@@ -112,13 +128,13 @@ def prepared(mode, phase, region, *, batch_size=1):
     description, point, graph_phase = prepare_native_dspark_phase(
         query=query, phase=phase, runtime_profile_json=before.runtime_profile_json
     )
-    return dict(
-        description=description,
-        point=point,
-        graph_phase=graph_phase,
-        phase=phase,
-        step=before,
-    )
+    return {
+        "description": description,
+        "point": point,
+        "graph_phase": graph_phase,
+        "phase": phase,
+        "step": before,
+    }
 
 
 @pytest.mark.parametrize("mode,phase,region", CASES)
@@ -133,6 +149,38 @@ def test_all_nine_real_sdk_graphs_bind_only_the_matching_phase(mode, phase, regi
             variant["native_forward_input"]["groups"][0]["target_seq_len_upper_bound"]
             == 700
         )
+
+
+@pytest.mark.parametrize("batch_size,capture_size", [(1, 2), (9, 10)])
+@pytest.mark.parametrize("mode,phase,region", CASES[4:])
+def test_sdk_graph_work_schema3_preserves_native_phase_binding(
+    batch_size, capture_size, mode, phase, region
+):
+    binding = prepared(
+        mode, phase, region, batch_size=batch_size, capture_size=capture_size
+    )
+    native = json.loads(binding["point"]["native_segment_queries"])[0]
+    variant = json.loads(native["module_variant"])
+    assert variant["schema_version"] == 3
+    assert "draft_history_tokens" not in variant
+    assert variant["draft_capture_key"]["size"] == capture_size
+    assert len(binding["step"].requests) == batch_size
+    assert validate_native_region_phase(**binding) is True
+
+
+def test_graph_work_schema3_still_requires_the_before_step_buffer():
+    binding = prepared(
+        "TARGET_VERIFY", "target_verify", "decode_target", capture_size=2
+    )
+    before = binding["step"]
+    group = before.groups[0]
+    execution = json.loads(group.execution_json)
+    execution["draft_buffer_capacity"] = 2
+    binding["step"] = replace(
+        before, groups=(replace(group, execution_json=canonical(execution)),)
+    )
+    with pytest.raises(PredictorError, match="phase/source binding"):
+        validate_native_region_phase(**binding)
 
 
 @pytest.mark.parametrize(

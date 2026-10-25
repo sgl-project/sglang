@@ -154,6 +154,11 @@ the simulator's valid-written-KV ledger to choose that cost coordinate. Semantic
 validity, acceptance and future progress retain their existing state ownership;
 the separate legacy proposal selector keeps its saturated-history requirement.
 Schema1 region history keys remain distinct and are never relabeled as schema2.
+The phase binder also transports the SDK's schema3 graph-work queries unchanged.
+They retain schema2 nominal read semantics and add explicit padded or larger
+capture work; they do not acquire a legacy written-history field. The SDK still
+owns capture selection, source policy and cost admission. Binding a query does
+not expand the current TP2 factory or provide missing measured rows.
 
 For a HuggingFace snapshot whose `config.json` links into the cache's blob
 directory, set `model_config_root` to the explicit containing checkpoint/cache

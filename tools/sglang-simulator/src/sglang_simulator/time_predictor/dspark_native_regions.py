@@ -120,7 +120,7 @@ def validate_native_region_phase(*, description, point, graph_phase, phase, step
             variant = json.loads(query.module_variant)
             require(
                 (
-                    variant["schema_version"] == 2
+                    variant["schema_version"] in (2, 3)
                     or variant["draft_history_tokens"]
                     == [r.bounded_draft_history_tokens(128) for r in group.requests]
                 )
