@@ -378,6 +378,8 @@ class DSparkNativeRuntime:
         # Cold is the default. A factory-verified warm before-work witness may
         # seed this modeled resource without changing request/progress history.
         self._draft_buffer_capacity = initial_draft_buffer_capacity
+        self._peer_failure = None
+        self._peer_retirements = set()
         self.reference_driver = None
         if reference_events:
             from sglang_simulator.simulation.sglang.dspark_reference_driver import (
@@ -385,6 +387,28 @@ class DSparkNativeRuntime:
             )
 
             self.reference_driver = DSparkReferenceDriver(self)
+
+    def select_native_dp_peer_batch(self, scheduler, batch, **kwargs):
+        """Explicit library route; public native ADP2 capture stays closed."""
+        from sglang_simulator.simulation.sglang.dspark_native_peers import (
+            select_native_dp_peer_batch,
+        )
+
+        return select_native_dp_peer_batch(self, scheduler, batch, **kwargs)
+
+    def forward_native_dp_peer(self, **kwargs):
+        from sglang_simulator.simulation.sglang.dspark_native_peers import (
+            forward_native_dp_peer,
+        )
+
+        return forward_native_dp_peer(self, **kwargs)
+
+    def synchronize_native_dp_peer_lifecycle(self, **kwargs):
+        from sglang_simulator.simulation.sglang.dspark_native_peers import (
+            synchronize_native_dp_peer_lifecycle,
+        )
+
+        return synchronize_native_dp_peer_lifecycle(self, **kwargs)
 
     def capture(self, batch, *, resolve=True, reference=False):
         if str(batch.device) != "cpu":
@@ -638,6 +662,11 @@ class DSparkNativeRuntime:
                 )
 
     def clear_cache_pool(self):
+        if self.topology.attention_dp_size == 2:
+            raise PredictorError(
+                "invalid_reference_state",
+                "native DP reset requires the explicit joint lifecycle event",
+            )
         if self.reference_driver is not None:
             started = time.perf_counter()
             self.reference_driver.drained_reset()

@@ -228,6 +228,40 @@ advances no virtual clock. Native factory/compatibility/coordinator ADP2 guards
 remain closed. This entry point does not supply a joint HYBRID cost model or
 complete native peer publication, scheduling or whole-workload support.
 
+The explicit library route `DSparkNativeRuntime.select_native_dp_peer_batch`
+freezes each real scheduler's local reference selection after that exchange.
+The caller retains the native overlap-decision/result-processing order, then
+calls `forward_native_dp_peer` with the same native TP group, local attention-DP
+rank/counter and a source-owned `joint_execution_resolver`. The resolver receives
+the complete worker-before step, both selected-local CPU reference views and
+both local execution candidates. It must return one agreed full step changing
+execution JSON only. This is where the existing named joint whole-forward cost
+adapter can receive its exact SDK query/runtime binding. The retained-native
+`native_joint_group_execution` witness reader is not a projector for future
+dynamic simulator work. That source-led dynamic planner/graph/buffer resolver
+remains a separate missing integration; no ADP1 projection or invented native
+frame fills it here.
+
+Rank 0 alone predicts the global cost and progress. Each owner binds that shared
+result to its own reference transaction and builds its native result. Both local
+builds and reference candidates must succeed before either publication callback;
+only successful publication on both ranks permits replicated Session/FID commit.
+Failures before publication preserve Session history/FID. A publication or commit
+failure is sticky terminal; external effects are not represented as rolled back.
+Each active decode's persistent draft buffer grows from its actual local native
+sequence vector. Idle participation does not allocate or borrow a warm peer's
+buffer. Finished local references queue global history retirement until the
+explicit `synchronize_native_dp_peer_lifecycle` collective applies the same
+drained retirement/reset to both Sessions. Reset preserves the native worker's
+persistent draft buffer and forward sequence.
+
+This route advances no clock and leaves public factory/physical-rank/coordinator
+guards closed. The DPC child has a spawn-safe early bootstrap entry point; that
+alone does not implement a common clock or enable public ADP2. CPU transaction
+controls use the existing runtime/reference owners with a labeled transport
+double. Actual native communication and publication still require their own
+bounded native controls.
+
 The existing `DSparkStepTiming` also recognizes one exclusive `whole_worker`
 cost for a complete serialized TP2/ADP2 two-group step. It cannot be combined
 with region phases, used for ADP1, multiplied by DP, or obtained by summing two

@@ -5,7 +5,7 @@ native scheduler selects/prepares, decides synchronization, publishes through
 FutureMap, and processes results. This owner freezes those events for the SDK.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from sglang_simulator.simulation.sglang.dspark import dspark_result_from_native
 from sglang_simulator.simulation.sglang.dspark_reference import _require
@@ -31,6 +31,7 @@ class _Selection:
     processed_previous: bool = False
     skipped_previous: tuple[str, ...] = ()
     retirements: tuple[str, ...] = ()
+    peer_context: tuple | None = None
 
 
 class DSparkReferenceDriver:
@@ -76,6 +77,39 @@ class DSparkReferenceDriver:
         self.owner = scheduler
 
     def selected(self, scheduler, batch, *, prior_requests=()):
+        self.selection = self._selection(
+            scheduler, batch, prior_requests=prior_requests
+        )
+
+    def native_dp_selection(
+        self, scheduler, batch, step, *, peer_context, prior_requests=()
+    ):
+        """Prepare a candidate from both real partitions; caller rendezvous installs it."""
+        _, rank, _ = peer_context
+        ledger = self.adapter.ledger
+        if ledger.local_attention_dp_rank != rank:
+            _require(
+                self.owner is None
+                and not ledger.requests
+                and not ledger.pending
+                and ledger.prepared is None
+                and ledger.last_forward_id == -1,
+                "reference local DP owner changed during its run",
+            )
+            self.adapter = replace(
+                self.adapter, ledger=replace(ledger, local_attention_dp_rank=rank)
+            )
+        return self._selection(
+            scheduler,
+            batch,
+            prior_requests=prior_requests,
+            before=step,
+            peer_context=peer_context,
+        )
+
+    def _selection(
+        self, scheduler, batch, *, prior_requests=(), before=None, peer_context=None
+    ):
         self.bind(scheduler)
         _require(
             self.selection is None and self.processing is None,
@@ -96,12 +130,19 @@ class DSparkReferenceDriver:
         )
         if batch is None:
             return
-        before = self.runtime.capture(batch, resolve=False, reference=True)
-        page_size = cpu_int(batch.token_to_kv_pool_allocator.page_size, "page_size")
+        if before is None:
+            before = self.runtime.capture(batch, resolve=False, reference=True)
+        rank = self.adapter.ledger.local_attention_dp_rank
+        idle = before.groups[rank].forward_mode == "IDLE"
+        allocator = getattr(batch, "token_to_kv_pool_allocator", None)
+        if idle and allocator is None:
+            allocator = scheduler.token_to_kv_pool_allocator
+        page_size = cpu_int(allocator.page_size, "page_size")
         allocation = self.adapter.ledger.prepare(before, page_size=page_size)
         prepared = allocation.prepared
         _require(
-            cpu_vector(batch.seq_lens_cpu, len(batch.reqs), "selection seq_lens_cpu")
+            (idle and batch.seq_lens_cpu is None)
+            or cpu_vector(batch.seq_lens_cpu, len(batch.reqs), "selection seq_lens_cpu")
             == prepared.seed_seq_lens_cpu,
             "native selection seed differs from reference committed KV",
         )
@@ -152,7 +193,7 @@ class DSparkReferenceDriver:
                 == prepared.nxt_kv_lens_cpu,
                 "native allocation differs from frozen reference reservation",
             )
-        self.selection = _Selection(
+        return _Selection(
             batch,
             self.adapter,
             allocation,
@@ -160,6 +201,7 @@ class DSparkReferenceDriver:
             needs_cpu,
             simulator_needs_cpu,
             page_size,
+            peer_context=peer_context,
         )
 
     def overlap_decision(self, batch, disable_overlap):
@@ -179,7 +221,7 @@ class DSparkReferenceDriver:
             "reference sync has no previous result",
         )
 
-    def prepare_worker(self, batch):
+    def prepare_worker(self, batch, *, peer_step=None):
         self.check()
         selected = self.selection
         _require(
@@ -193,7 +235,13 @@ class DSparkReferenceDriver:
             "native previous-result event order differs from its overlap decision",
         )
         prepared = selected.allocation.prepared
-        native_seq = cpu_vector(batch.seq_lens, len(batch.reqs), "worker seq_lens")
+        rank = self.adapter.ledger.local_attention_dp_rank
+        idle = prepared.local_group.forward_mode == "IDLE"
+        native_seq = (
+            ()
+            if idle and batch.seq_lens is None
+            else cpu_vector(batch.seq_lens, len(batch.reqs), "worker seq_lens")
+        )
         _require(
             native_seq
             == (
@@ -203,12 +251,57 @@ class DSparkReferenceDriver:
             ),
             "native worker device lengths differ from the frozen source relay",
         )
-        before = self.runtime.capture(batch, resolve=False, reference=True)
         _require(
-            before.groups[0].forward_mode != "TARGET_VERIFY"
-            or tuple(req.target_prefix_len for req in before.requests) == native_seq,
+            (peer_step is None) == (selected.peer_context is None),
+            "reference worker changed its native DP source route",
+        )
+        before = (
+            self.runtime.capture(batch, resolve=False, reference=True)
+            if peer_step is None
+            else peer_step
+        )
+        _require(
+            before.groups[rank].forward_mode != "TARGET_VERIFY"
+            or tuple(req.target_prefix_len for req in before.groups[rank].requests)
+            == native_seq,
             "native worker lengths differ from previously published causal work",
         )
+        allocation = selected.allocation
+        if peer_step is not None:
+            # Both real workers were captured after their own source-selected
+            # synchronization. Only output counters can advance since selection;
+            # retain this owner's frozen allocation and the gathered peer counts.
+            original = allocation.prepared.step
+            restored = replace(
+                before,
+                groups=tuple(
+                    replace(
+                        now,
+                        requests=tuple(
+                            replace(req, output_tokens_before=old.output_tokens_before)
+                            for req, old in zip(
+                                now.requests, then.requests, strict=True
+                            )
+                        ),
+                    )
+                    for now, then in zip(before.groups, original.groups, strict=True)
+                ),
+            )
+            _require(
+                restored == original, "native peer work changed after source selection"
+            )
+            selected_step = replace(
+                original,
+                groups=tuple(
+                    group
+                    if group.attention_dp_rank == rank
+                    else before.groups[group.attention_dp_rank]
+                    for group in original.groups
+                ),
+            )
+            allocation = replace(
+                allocation, prepared=replace(allocation.prepared, step=selected_step)
+            )
         transaction = prepare_reference_step(
             selected.base.ledger,
             before,
@@ -221,7 +314,7 @@ class DSparkReferenceDriver:
             native_batch=batch,
             buffer_capacity=self.runtime._draft_buffer_capacity,
             buffer_device_matches=self.runtime._draft_buffer_capacity > 0,
-            allocation_ledger=selected.allocation,
+            allocation_ledger=allocation,
         )
         # Validate the actual CPU engine relay with its own backend policy;
         # reference query inputs retain the separately verified physical policy.
@@ -230,10 +323,15 @@ class DSparkReferenceDriver:
             needs_cpu_seq_lens=selected.simulator_needs_cpu_seq_lens,
         )
         _require(
-            batch.seq_lens_cpu is None
-            if view.seq_lens_cpu is None
-            else cpu_vector(batch.seq_lens_cpu, len(batch.reqs), "worker seq_lens_cpu")
-            == view.seq_lens_cpu,
+            (idle and batch.seq_lens_cpu is None)
+            or (
+                batch.seq_lens_cpu is None
+                if view.seq_lens_cpu is None
+                else cpu_vector(
+                    batch.seq_lens_cpu, len(batch.reqs), "worker seq_lens_cpu"
+                )
+                == view.seq_lens_cpu
+            ),
             "native worker mirror differs from its source reference event",
         )
         return transaction
@@ -275,7 +373,10 @@ class DSparkReferenceDriver:
         # until every prepared/pending successor has released this RID.
         for rid in tuple(self.retired_request_ids):
             if rid not in live:
-                self.runtime.session.forget(rid)
+                if self.runtime.topology.attention_dp_size == 2:
+                    self.runtime._peer_retirements.add(rid)
+                else:
+                    self.runtime.session.forget(rid)
                 self.retired_request_ids.remove(rid)
 
     def before_result(self, batch, native_result):
@@ -288,7 +389,7 @@ class DSparkReferenceDriver:
         reqs = tuple(batch.reqs)
         _require(
             tuple(req.rid for req in reqs)
-            == tuple(req.rid for req in prediction.step.requests),
+            == tuple(req.rid for req in prediction.local_group.requests),
             "reference result membership differs from its native FIFO entry",
         )
         _require(
