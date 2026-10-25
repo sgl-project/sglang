@@ -205,6 +205,10 @@ message GenerateMetaInfo {
   optional string weight_version = 16;
   // Omitted until terminal output; reported spans are always nonempty.
   repeated WeightVersionSpan weight_versions = 17;
+  // Media prompt tokens per modality, on every frame; omitted when zero.
+  optional uint32 image_tokens = 18;
+  optional uint32 audio_tokens = 19;
+  optional uint32 video_tokens = 20;
 }
 
 message WeightVersionSpan {

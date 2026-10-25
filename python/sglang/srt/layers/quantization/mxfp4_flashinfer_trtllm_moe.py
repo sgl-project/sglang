@@ -168,6 +168,11 @@ class Mxfp4FlashinferTrtllmMoEMethod:
     def get_moe_runner_backend(self, layer):
         return MoeRunnerBackend.FLASHINFER_MXFP4
 
+    def get_moe_routing_method_type(
+        self, layer: Module, requested_method: RoutingMethodType | None
+    ) -> RoutingMethodType | None:
+        return requested_method
+
     def create_weights(
         self,
         layer,

@@ -915,6 +915,25 @@ class SequenceParallelGroupCoordinator(GroupCoordinator):
             raise RuntimeError(
                 "Please pass argument 'ring_group' when calling init func of SequenceParallelGroupCoordinator"
             )
+        self._bind_sequence_groups(ulysses_group, ring_group)
+
+    @classmethod
+    def over_group(
+        cls, group: GroupCoordinator, ring_group: ProcessGroup
+    ) -> "SequenceParallelGroupCoordinator":
+        """Pure-Ulysses SP over ``group``'s ranks that reuses its communicators.
+
+        ``ring_group`` is this rank's single-rank group. The result owns no
+        process group: destroying ``group`` releases it, never destroy it itself.
+        """
+        sp_group = cls.__new__(cls)
+        sp_group.__dict__.update(vars(group))
+        sp_group._bind_sequence_groups(group.device_group, ring_group)
+        return sp_group
+
+    def _bind_sequence_groups(
+        self, ulysses_group: ProcessGroup, ring_group: ProcessGroup
+    ) -> None:
         self.ulysses_group = ulysses_group
         self.ring_group = ring_group
 

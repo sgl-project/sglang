@@ -57,7 +57,9 @@ from sglang.kernels.ops.attention.dsv4.opus_sparse_prefill_hip import (
     opus_sparse_prefill,
 )
 from sglang.kernels.ops.attention.dsv4.swapab_gluon_hip import swapab_attention
+from sglang.kernels.plugin_kernels.amd.spec import StepMetadata
 from sglang.srt.environ import envs
+from sglang.srt.kernel_plugins.amd.binding import is_metadata_unread
 from sglang.srt.layers.attention import deepseek_v4_backend as _cuda_backend
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.deepseek_v4_backend import (
@@ -104,8 +106,6 @@ from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.dsv41_request_window import window_layout
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.monokernels.runtime import is_metadata_unread
-from sglang.srt.monokernels.spec import StepMetadata
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,

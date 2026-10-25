@@ -63,8 +63,11 @@ class CustomAllReduceFusion:
         )
 
     def ffn_input_fusions(self, plan) -> tuple:
+        parallel = get_parallel()
         if (
             TokenAxis.ATTN_TP in plan.incoming_residual_rows.sharded
+            # The plane sums over TP, the attention-TP group only without attention DP.
+            or parallel.attn_tp_size != parallel.tp_size
             or _bf16_norm_gamma(plan.norm) is None
         ):
             return ()
@@ -101,7 +104,7 @@ class CustomAllReduceFusion:
             gamma is None
             or residual is None
             or any(
-                tensor.dtype != torch.bfloat16
+                tensor is not None and tensor.dtype != torch.bfloat16
                 for tensor in (
                     owed.routed_output,
                     owed.gated_shared_output,

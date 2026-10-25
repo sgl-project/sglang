@@ -51,9 +51,8 @@ def provider(monkeypatch):
 
     group = SimpleNamespace(ranks=[0, 1, 2, 3])
     gates = SimpleNamespace(invariant=False, scattered=False, quant_comm=False)
-    monkeypatch.setattr(
-        custom, "get_parallel", lambda: SimpleNamespace(tp_size=4, tp_group=group)
-    )
+    parallel = SimpleNamespace(tp_size=4, attn_tp_size=4, tp_group=group)
+    monkeypatch.setattr(custom, "get_parallel", lambda: parallel)
     monkeypatch.setattr(
         custom,
         "get_exec",
@@ -92,6 +91,7 @@ def provider(monkeypatch):
         plan=plan,
         batch=batch,
         group=group,
+        parallel=parallel,
         gates=gates,
         plain=plain,
         finalize=finalize,
@@ -175,6 +175,24 @@ def test_inputs_the_kernel_cannot_take_decline_fusion(provider, unsupported):
         )
     p.plain.assert_not_called()
     p.finalize.assert_not_called()
+
+
+def test_attention_dp_declines_ffn_input_fusion(provider):
+    """The FFN input sum stays inside one attention-TP group; under attention DP
+    the TP plane spans groups whose rows hold different requests."""
+    provider.parallel.attn_tp_size = 2
+    assert provider.fusion.ffn_input_fusions(provider.plan) == ()
+
+
+def test_handoff_without_shared_expert_fuses(provider):
+    """gated_shared_output=None is a valid handoff, which the finalize kernel takes."""
+    p = provider
+    handoff = replace(_handoff(), gated_shared_output=None)
+    residual = torch.zeros(2, 8, dtype=torch.bfloat16)
+    finalize, _ = p.fusion.attn_input_fusions(p.plan)
+    assert finalize(handoff, residual, p.batch, None) is not None
+    p.finalize.assert_called_once()
+    assert p.finalize.call_args.args[4] is None
 
 
 def test_declined_sum_completes_once_before_normal_read(provider):
