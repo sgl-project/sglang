@@ -15,6 +15,8 @@ from sglang.srt.managers.communicator import FanOutCommunicator
 from sglang.srt.managers.io_struct import (
     AddExternalCorpusReqInput,
     AddExternalCorpusReqOutput,
+    AttachCacheLinkerReqInput,
+    AttachCacheLinkerReqOutput,
     AttachHiCacheStorageReqInput,
     AttachHiCacheStorageReqOutput,
     BeginWeightUpdateReqInput,
@@ -27,6 +29,8 @@ from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     DestroyWeightsUpdateGroupReqInput,
     DestroyWeightsUpdateGroupReqOutput,
+    DetachCacheLinkerReqInput,
+    DetachCacheLinkerReqOutput,
     DetachHiCacheStorageReqInput,
     DetachHiCacheStorageReqOutput,
     DumperControlReqInput,
@@ -87,7 +91,6 @@ from sglang.srt.managers.load_snapshot import LoadSnapshot
 from sglang.srt.runtime_context import (
     get_disagg,
     get_lora,
-    get_memory,
     get_parallel,
     get_serving,
     get_spec,
@@ -131,6 +134,8 @@ _COMMUNICATOR_SPECS = [
     ("remove_external_corpus", RemoveExternalCorpusReqOutput),
     ("list_external_corpora", ListExternalCorporaReqOutput),
     ("clear_hicache_storage", ClearHiCacheReqOutput),
+    ("attach_cache_linker", AttachCacheLinkerReqOutput),
+    ("detach_cache_linker", DetachCacheLinkerReqOutput),
     ("attach_hicache_storage", AttachHiCacheStorageReqOutput),
     ("detach_hicache_storage", DetachHiCacheStorageReqOutput),
     ("profile", ProfileReqOutput),
@@ -341,12 +346,10 @@ class TokenizerControlMixin:
 
     async def attach_hicache_storage(
         self: TokenizerManager,
-        hicache_storage_backend: Optional[str] = None,
+        hicache_storage_backend: str,
         hicache_storage_backend_extra_config_json: Optional[str] = None,
         hicache_storage_prefetch_policy: Optional[str] = None,
         hicache_write_policy: Optional[str] = None,
-        unified_cache_external_linker_backend: Optional[str] = None,
-        unified_cache_external_linker_config: Optional[dict] = None,
     ) -> AttachHiCacheStorageReqOutput:
         """Attach (enable) HiCache storage backend at runtime."""
         self.auto_create_handle_loop()
@@ -356,21 +359,13 @@ class TokenizerControlMixin:
                 hicache_storage_backend_extra_config_json=hicache_storage_backend_extra_config_json,
                 hicache_storage_prefetch_policy=hicache_storage_prefetch_policy,
                 hicache_write_policy=hicache_write_policy,
-                unified_cache_external_linker_backend=unified_cache_external_linker_backend,
-                unified_cache_external_linker_config=unified_cache_external_linker_config,
             )
         )
 
         all_success, all_message = FanOutCommunicator.merge_results(results)
         out = AttachHiCacheStorageReqOutput(success=all_success, message=all_message)
         # TODO: partial rollback if failed
-        if all_success and get_memory().enable_unified_cache_external_linker:
-            self.record_config_updates(
-                "tokenizer.attach_cache_linker",
-                unified_cache_external_linker_backend=unified_cache_external_linker_backend,
-                unified_cache_external_linker_config=unified_cache_external_linker_config,
-            )
-        elif all_success:
+        if all_success:
             # Keep tokenizer side server_info consistent with scheduler side.
             hicache_fields = {"hicache_storage_backend": hicache_storage_backend}
             if hicache_storage_backend_extra_config_json is not None:
@@ -398,19 +393,45 @@ class TokenizerControlMixin:
         all_success, all_message = FanOutCommunicator.merge_results(results)
         out = DetachHiCacheStorageReqOutput(success=all_success, message=all_message)
         # TODO: partial rollback if failed
-        if all_success and get_memory().enable_unified_cache_external_linker:
-            self.record_config_updates(
-                "tokenizer.detach_cache_linker",
-                unified_cache_external_linker_backend=None,
-                unified_cache_external_linker_config=None,
-            )
-        elif all_success:
+        if all_success:
             self.record_config_updates(
                 "tokenizer.detach_hicache",
                 hicache_storage_backend=None,
                 hicache_storage_backend_extra_config=None,
             )
         return out
+
+    async def attach_cache_linker(
+        self: TokenizerManager, obj: AttachCacheLinkerReqInput
+    ) -> AttachCacheLinkerReqOutput:
+        self.auto_create_handle_loop()
+        results = await self.attach_cache_linker_communicator(obj)
+        success, message = FanOutCommunicator.merge_results(results)
+        # As with other fan-out admin operations, partial DP success requires
+        # explicit cleanup; update readback only when all schedulers succeeded.
+        if success:
+            self.record_config_updates(
+                "tokenizer.attach_cache_linker",
+                unified_cache_external_linker_backend=obj.backend,
+                unified_cache_external_linker_config=obj.config,
+            )
+        return AttachCacheLinkerReqOutput(success=success, message=message)
+
+    async def detach_cache_linker(
+        self: TokenizerManager,
+    ) -> DetachCacheLinkerReqOutput:
+        self.auto_create_handle_loop()
+        results = await self.detach_cache_linker_communicator(
+            DetachCacheLinkerReqInput()
+        )
+        success, message = FanOutCommunicator.merge_results(results)
+        if success:
+            self.record_config_updates(
+                "tokenizer.detach_cache_linker",
+                unified_cache_external_linker_backend=None,
+                unified_cache_external_linker_config=None,
+            )
+        return DetachCacheLinkerReqOutput(success=success, message=message)
 
     async def start_profile(
         self: TokenizerManager,

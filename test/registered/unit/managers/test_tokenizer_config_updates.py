@@ -17,8 +17,9 @@ import msgspec.structs
 
 import sglang
 from sglang.srt.managers.io_struct import (
-    AttachHiCacheStorageReqOutput,
-    DetachHiCacheStorageReqOutput,
+    AttachCacheLinkerReqInput,
+    AttachCacheLinkerReqOutput,
+    DetachCacheLinkerReqOutput,
 )
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.runtime_context import get_context, publish, reset_context
@@ -75,27 +76,26 @@ class TestTokenizerConfigUpdates(CustomTestCase):
             hicache_storage_backend_extra_config='{"legacy": true}',
         )
         manager.auto_create_handle_loop = Mock()
-        manager.attach_hicache_storage_communicator = AsyncMock(
-            return_value=[AttachHiCacheStorageReqOutput(success=True)]
+        manager.attach_cache_linker_communicator = AsyncMock(
+            return_value=[AttachCacheLinkerReqOutput(success=True)]
         )
-        manager.detach_hicache_storage_communicator = AsyncMock(
-            return_value=[DetachHiCacheStorageReqOutput(success=True)]
+        manager.detach_cache_linker_communicator = AsyncMock(
+            return_value=[DetachCacheLinkerReqOutput(success=True)]
         )
         config = {"master_server_address": "new:50051"}
         out = asyncio.run(
-            manager.attach_hicache_storage(
-                unified_cache_external_linker_backend="mooncake",
-                unified_cache_external_linker_config=config,
+            manager.attach_cache_linker(
+                AttachCacheLinkerReqInput(backend="mooncake", config=config),
             )
         )
         self.assertTrue(out.success)
-        sent = manager.attach_hicache_storage_communicator.call_args.args[0]
-        self.assertEqual(sent.unified_cache_external_linker_config, config)
-        self.assertIsNone(sent.hicache_storage_backend)
+        sent = manager.attach_cache_linker_communicator.call_args.args[0]
+        self.assertEqual(sent.config, config)
+        self.assertEqual(sent.backend, "mooncake")
         self.assertEqual(
             manager.config_value("unified_cache_external_linker_config"), config
         )
-        out = asyncio.run(manager.detach_hicache_storage())
+        out = asyncio.run(manager.detach_cache_linker())
         self.assertTrue(out.success)
         self.assertIsNone(manager.config_value("unified_cache_external_linker_config"))
         self.assertEqual(

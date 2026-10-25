@@ -110,31 +110,29 @@ class TestUnifiedCacheLinkerRuntimeAttach(CustomTestCase):
         self._loaded_tokens(stored_ids)
         self.assertGreaterEqual(self._loaded_tokens(stored_ids), min_loaded)
 
-        response = self._request("DELETE", "/hicache/storage-backend")
+        response = self._request("DELETE", "/unified-cache/external-linker")
         self.assertEqual(response.status_code, 200, response.text)
-        status = self._request("GET", "/hicache/storage-backend").json()
-        self.assertIsNone(status["unified_cache_external_linker_backend"])
-        self.assertIsNone(status["unified_cache_external_linker_config"])
+        status = self._request("GET", "/unified-cache/external-linker").json()
+        self.assertIsNone(status["backend"])
+        self.assertIsNone(status["config"])
         self.assertEqual(self._loaded_tokens(stored_ids), 0)
         self._loaded_tokens(detached_ids)
 
         attach = {
-            "unified_cache_external_linker_backend": "mooncake",
-            "unified_cache_external_linker_config": json.loads(EXTRA_CONFIG),
+            "backend": "mooncake",
+            "config": json.loads(EXTRA_CONFIG),
         }
         response = self._request(
             "PUT",
             "/hicache/storage-backend",
-            {**attach, "hicache_write_policy": "write_back"},
+            {"hicache_storage_backend": "mooncake"},
         )
         self.assertEqual(response.status_code, 400, response.text)
-        response = self._request("PUT", "/hicache/storage-backend", attach)
+        response = self._request("PUT", "/unified-cache/external-linker", attach)
         self.assertEqual(response.status_code, 200, response.text)
-        status = self._request("GET", "/hicache/storage-backend").json()
-        self.assertEqual(status["unified_cache_external_linker_backend"], "mooncake")
-        self.assertEqual(
-            status["unified_cache_external_linker_config"], json.loads(EXTRA_CONFIG)
-        )
+        status = self._request("GET", "/unified-cache/external-linker").json()
+        self.assertEqual(status["backend"], "mooncake")
+        self.assertEqual(status["config"], json.loads(EXTRA_CONFIG))
 
         self._loaded_tokens(detached_ids, flush=False)
         self.assertGreaterEqual(self._loaded_tokens(detached_ids), min_loaded)
