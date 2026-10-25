@@ -92,6 +92,38 @@ def _vae_downsample_factors(config: Any) -> tuple[int, int]:
     return vae_h, vae_w
 
 
+def _step_invariant_prefix_len(
+    image_mask: torch.Tensor,
+    timestep_index: torch.Tensor | None,
+    tokenizer_output,
+) -> int | None:
+    """Leading rows whose K/V is the same on every denoising step, or None.
+
+    The mask is causal, so rows before the first noisy-image or timestep token
+    see only prompt and clean conditioning. None means no safe prefix: no
+    varying token, or a clean image block that straddles the boundary.
+    """
+    varying = [torch.nonzero(image_mask.bool())[:, 1]]
+    if timestep_index is not None:
+        if timestep_index.dtype == torch.bool:
+            varying.append(torch.nonzero(timestep_index)[:, 1])
+        else:
+            varying.append(timestep_index.reshape(-1))
+    varying = [p for p in varying if p.numel() > 0]
+    if not varying:
+        return None
+    prefix_len = min(int(p.min()) for p in varying)
+    if prefix_len == 0:
+        return None
+    gen_slices = tokenizer_output.gen_image_slices
+    joint_slices = tokenizer_output.joint_image_slices
+    for b in range(len(gen_slices)):
+        for s in joint_slices[b] + gen_slices[b]:
+            if s.start < prefix_len < s.stop:
+                return None
+    return prefix_len
+
+
 def _build_causal_attention_mask(
     batch_size: int,
     seq_len: int,
@@ -312,6 +344,8 @@ class HunyuanImage3AR(PipelineStage):
         custom_pos_emb: tuple[torch.Tensor, torch.Tensor],
         first_step: bool,
         timestep: torch.Tensor | None = None,
+        prefix_len: int | None = None,
+        cache_slot: int = 0,
     ) -> torch.Tensor:
         hidden_size = hidden_states.shape[-1]
         hidden_states = hidden_states.reshape(-1, hidden_size).contiguous()
@@ -330,6 +364,7 @@ class HunyuanImage3AR(PipelineStage):
         if self._cache_dit_adapter is not None:
             output = self._cache_dit_adapter(hidden_states, attention_mask, (cos, sin))
         else:
+            # cache-dit drives the blocks itself, so the prefix cache is skipped there.
             output = self.ar_model.forward_block(
                 hidden_states,
                 attention_mask,
@@ -337,6 +372,8 @@ class HunyuanImage3AR(PipelineStage):
                 num_image_tokens=num_image_tokens,
                 first_step=first_step,
                 timestep=timestep,
+                prefix_len=prefix_len,
+                cache_slot=cache_slot,
             )
         # batch_size may differ after TP broadcast
         actual_batch = attention_mask.shape[0]
@@ -1210,6 +1247,9 @@ class HunyuanImage3AR(PipelineStage):
         attention_mask, (cos, sin) = self._broadcast_static_inputs(
             attention_mask, (cos, sin)
         )
+        prefix_len = _step_invariant_prefix_len(
+            image_mask, timestep_index, tokenizer_output
+        )
 
         scheduler = self._scheduler
         scheduler.set_timesteps(num_inference_steps)
@@ -1371,16 +1411,20 @@ class HunyuanImage3AR(PipelineStage):
                         hidden_states[:half],
                         cond_mask,
                         (cos[:half], sin[:half]),
-                        True,
+                        step_idx == 0,
                         timestep=t_expand[:half],
+                        prefix_len=prefix_len,
+                        cache_slot=0,
                     )
                     out_uncond = self._backbone_forward(
                         num_image_tokens,
                         hidden_states[half:],
                         uncond_mask,
                         (cos[half:], sin[half:]),
-                        True,
+                        step_idx == 0,
                         timestep=t_expand[half:],
+                        prefix_len=prefix_len,
+                        cache_slot=1,
                     )
                     backbone_out = torch.cat([out_cond, out_uncond], dim=0)
                 else:
@@ -1389,8 +1433,9 @@ class HunyuanImage3AR(PipelineStage):
                         hidden_states,
                         attention_mask,
                         (cos, sin),
-                        True,
+                        step_idx == 0,
                         timestep=t_expand,
+                        prefix_len=prefix_len,
                     )
 
                 pred = self._extract_diffusion_pred(

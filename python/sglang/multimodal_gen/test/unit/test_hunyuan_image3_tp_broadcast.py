@@ -146,5 +146,110 @@ class TestHunyuanImage3DenoiseStep(CustomTestCase):
         torch.testing.assert_close(actual, (scattered, extracted), atol=0, rtol=0)
 
 
+class TestHunyuanImage3PrefixKVCache(CustomTestCase):
+    BS, SEQ, HEADS, KV_HEADS, DIM, PREFIX = 2, 16, 4, 2, 8, 8
+
+    def _mask(self):
+        idx = torch.arange(self.SEQ)
+        mask = (idx.unsqueeze(0) <= idx.unsqueeze(1)).repeat(self.BS, 1, 1)
+        mask[:, 2:5, 2:5] = True  # clean image block inside the prefix
+        mask[:, 8:14, 8:14] = True  # noisy image block after it
+        return mask.unsqueeze(1)
+
+    def _qkv(self, seed):
+        g = torch.Generator().manual_seed(seed)
+        n = self.BS * self.SEQ
+        return (
+            torch.randn(n, self.HEADS, self.DIM, generator=g),
+            torch.randn(n, self.KV_HEADS, self.DIM, generator=g),
+            torch.randn(n, self.KV_HEADS, self.DIM, generator=g),
+        )
+
+    def _rows(self, t):
+        return t.view(self.BS, self.SEQ, *t.shape[1:])
+
+    def _suffix(self, t):
+        return self._rows(t)[:, self.PREFIX :].reshape(-1, *t.shape[1:])
+
+    def _meta(self, mask, first_step, prefix_len=None, cache_slot=0):
+        meta = hunyuan_image3_utils.create_hunyuan_image_attention_meta(
+            mask, None, first_step
+        )
+        meta.prefix_len = prefix_len
+        meta.cache_slot = cache_slot
+        return meta
+
+    def _later_step(self, step0):
+        # A later denoising step: new suffix rows, prefix rows unchanged.
+        later = self._qkv(seed=2)
+        for src, dst in zip(step0, later):
+            self._rows(dst)[:, : self.PREFIX] = self._rows(src)[:, : self.PREFIX]
+        return later
+
+    def _suffix_step(self, manager, qkv, mask, cache_slot=0):
+        suffix_mask = mask[:, :, self.PREFIX :, :]
+        return manager(
+            *(self._suffix(t) for t in qkv),
+            self._meta(suffix_mask, False, self.PREFIX, cache_slot),
+            attention_mask=suffix_mask,
+        )
+
+    def test_suffix_step_matches_full_recompute(self):
+        mask = self._mask()
+        step0 = self._qkv(seed=1)
+        later = self._later_step(step0)
+        manager = hunyuan_image3_utils.ImageKVCacheManager()
+        manager(*step0, self._meta(mask, True, self.PREFIX), attention_mask=mask)
+
+        out = self._suffix_step(manager, later, mask)
+
+        full = hunyuan_image3_utils.ImageKVCacheManager()(
+            *later, self._meta(mask, False), attention_mask=mask
+        )
+        torch.testing.assert_close(out, self._suffix(full))
+
+    def test_cfg_slots_keep_separate_prefixes(self):
+        """The cond and uncond halves share each attention module; caching one
+        half's prefix must not replace the other's."""
+        mask = self._mask()
+        step0 = self._qkv(seed=1)
+        later = self._later_step(step0)
+        manager = hunyuan_image3_utils.ImageKVCacheManager()
+        manager(*step0, self._meta(mask, True, self.PREFIX, 0), attention_mask=mask)
+        manager(
+            *self._qkv(seed=3),
+            self._meta(mask, True, self.PREFIX, 1),
+            attention_mask=mask,
+        )
+
+        out = self._suffix_step(manager, later, mask, cache_slot=0)
+
+        full = hunyuan_image3_utils.ImageKVCacheManager()(
+            *later, self._meta(mask, False), attention_mask=mask
+        )
+        torch.testing.assert_close(out, self._suffix(full))
+
+    def test_prefix_ends_at_first_varying_token_unless_a_block_straddles(self):
+        image_mask = torch.zeros(1, self.SEQ, dtype=torch.bool)
+        image_mask[0, 8:14] = True
+        timestep_index = torch.tensor([[7]])
+        clean_before = SimpleNamespace(
+            gen_image_slices=[[slice(8, 14)]], joint_image_slices=[[slice(2, 5)]]
+        )
+        self.assertEqual(
+            ar_stage._step_invariant_prefix_len(
+                image_mask, timestep_index, clean_before
+            ),
+            7,
+        )
+
+        straddling = SimpleNamespace(
+            gen_image_slices=[[slice(8, 14)]], joint_image_slices=[[slice(5, 9)]]
+        )
+        self.assertIsNone(
+            ar_stage._step_invariant_prefix_len(image_mask, None, straddling)
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

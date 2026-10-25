@@ -38,6 +38,10 @@ class HunYuanImageAttentionMeta:
     seq_lens: List[int]
     num_image_tokens: int
     first_step: bool
+    # Length of the step-invariant prefix whose K/V is cached; None disables it.
+    prefix_len: Optional[int] = None
+    # Separates cached prefixes of CFG halves that share one attention module.
+    cache_slot: int = 0
 
 
 def create_hunyuan_image_attention_meta(
@@ -257,9 +261,17 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 
 class ImageKVCacheManager:
-    """Full attention over the text+image sequence (no KV caching); packed
-    ``[tokens, heads, dim]`` inputs, 4-D bool mask.
+    """Attention over the text+image sequence; packed ``[tokens, heads, dim]``
+    inputs, 4-D bool mask.
+
+    With ``prefix_len`` set, the step-invariant prefix K/V is cached per
+    ``cache_slot`` on the first step. Later steps pass only the suffix tokens as
+    queries and attend to ``[cached prefix K/V, suffix K/V]``; the mask rows
+    must then cover just the suffix, with all prefix columns.
     """
+
+    def __init__(self):
+        self._prefix_kv: dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
 
     def __call__(self, query, key, value, attn_metadata, attention_mask=None):
         total_tokens = query.shape[0]
@@ -279,6 +291,9 @@ class ImageKVCacheManager:
         key = key.transpose(1, 2).contiguous()
         value = value.transpose(1, 2).contiguous()
 
+        if attn_metadata.prefix_len is not None:
+            key, value = self._prefix_kv_step(key, value, attn_metadata)
+
         key = repeat_kv(key, repeat_num)
         value = repeat_kv(value, repeat_num)
 
@@ -295,3 +310,53 @@ class ImageKVCacheManager:
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(total_tokens, head_num_per_rank, head_dim)
         return attn_output
+
+    def _prefix_kv_step(self, key, value, attn_metadata):
+        """Store the prefix K/V on the first step; afterwards prepend it to the
+        suffix K/V. Inputs and outputs are ``[bs, heads, seq, dim]``.
+        """
+        slot = attn_metadata.cache_slot
+        prefix_len = attn_metadata.prefix_len
+        if attn_metadata.first_step:
+            self._prefix_kv[slot] = (
+                key[:, :, :prefix_len].contiguous(),
+                value[:, :, :prefix_len].contiguous(),
+            )
+            return key, value
+
+        if slot not in self._prefix_kv:
+            raise RuntimeError(f"no cached prefix K/V for cache_slot={slot}")
+        prefix_k, prefix_v = self._prefix_kv[slot]
+        return (
+            torch.cat([prefix_k, key], dim=2),
+            torch.cat([prefix_v, value], dim=2),
+        )
+
+
+def split_suffix_inputs(
+    hidden_states: torch.Tensor,
+    attention_mask: torch.Tensor,
+    custom_pos_emb: Tuple[torch.Tensor, torch.Tensor],
+    prefix_len: int,
+) -> Tuple[torch.Tensor, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    """Keep only the rows after ``prefix_len``. ``hidden_states`` is packed
+    ``[bs * seq, hidden]``, the mask is ``[bs, 1, seq, seq]``, and the RoPE
+    tables are ``[bs, seq, head_dim]``.
+    """
+    bs, _, seq_len, _ = attention_mask.shape
+    hidden = hidden_states.reshape(bs, seq_len, -1)[:, prefix_len:]
+    cos, sin = custom_pos_emb
+    return (
+        hidden.reshape(-1, hidden.shape[-1]),
+        attention_mask[:, :, prefix_len:, :],
+        (cos[:, prefix_len:], sin[:, prefix_len:]),
+    )
+
+
+def pad_prefix_rows(suffix_out: torch.Tensor, bs: int, prefix_len: int) -> torch.Tensor:
+    """Re-expand suffix outputs to full ``[bs * seq, hidden]`` with zero prefix
+    rows; callers only read image positions, which all lie in the suffix.
+    """
+    out = suffix_out.reshape(bs, -1, suffix_out.shape[-1])
+    pad = out.new_zeros(bs, prefix_len, out.shape[-1])
+    return torch.cat([pad, out], dim=1).reshape(-1, out.shape[-1])
