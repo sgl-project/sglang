@@ -69,6 +69,7 @@ ChatFormatter::resolve_thinking(&mut kwargs, tools_enabled, named_tool_choice) -
 ChatFormatter::stop_strs() -> Option<OneOrMany<String>>
 requested_effort(&body) -> Option<&Value>
 requested_thinking(&body) -> Option<bool>
+extract_images(&messages) -> Vec<String>
 ```
 
 `select_chat_formatter` (`selection.rs`) picks a formatter from
@@ -121,6 +122,11 @@ once, for the renderer and DeepSeek-V4 and V4.1 alike. The SGLang additions hook
 | `models/kimi_k3.rs` | `serving_chat.py` (`_prepare_kimi_k3_messages`, `_encode_messages`), the checkpoint's `encoding_k3.py` | Replaces the OAI formatter's request handling. It prepares the messages, tools, thinking effort, `tool_choice` and `response_format` as SGLang does, then calls Dynamo's `KimiK3Formatter`. Shapes Dynamo renders differently are left to the engine. |
 | `models/minimax_m3.rs` | `serving_chat.py` (`_validate_minimax_m3_request`, `_normalize_minimax_m3_request`, `_canonicalize_tool_message_order`, `_apply_jinja_template`), `template_detection.py` | Picked by `model_type == "minimax_m3_vl"` (`is_minimax_m3`), or by the template (`_is_minimax_m3`) without a `config.json`, for M3 and M3.1. Rejects what SGLang's M3 contract rejects (the `thinking` type, a `reasoning_effort` outside low/medium/high/xhigh/max, a `root` message not first, unanswered or unmatched tool calls), maps `thinking` onto `thinking_mode` and settles the effort before and after the server defaults, sorts tool results into tool-call order, and renders with Dynamo's Jinja formatter, tool-argument floats printed as Python prints them. Media, `tool_reference` parts in tool results or alone in a turn, floats in tool schemas, `-0` in tool arguments, and a `chat_template` kwarg are left to the engine. |
 | `models/qwen38.rs` | `serving_chat.py` (`_process_messages`, `_apply_jinja_template`), `jinja_template_utils.py` | Picked by the template. Builds the template context SGLang builds (message, tool and tool-call dumps, content as the template's content format takes it, kwargs over the effort, server defaults), then renders it with Dynamo's Jinja formatter. A later system turn fails as the template makes it fail, where Dynamo would demote it. Media, a `chat_template` kwarg, and text or numbers that Python's `trim` or `json.dumps` treat unlike Dynamo's are left to the engine. |
+
+`extract_images` (`media.rs`) lists a chat's image sources (`image_url` and
+`input_image` parts) in message then part order, any role, as Python's
+`process_content_for_template_format` collects `image_data`, so a host can hand
+them to `mm` in the order the rendered placeholders appear.
 
 `stop_strs` returns the legacy template's stop strings; Jinja and native
 formatters have none, as in Python.
