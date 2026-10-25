@@ -24,6 +24,7 @@ SCALAR_TYPES = STRING_TYPES | INTEGER_TYPES | NUMBER_TYPES | BOOLEAN_TYPES | {"n
 CONTAINER_TYPES = {"object", "array"}
 # Exact-case only; "none"/"nil" are valid string enum values, never null-coerced.
 NULL_STRINGS = {"null", "Null", "NULL"}
+UNTYPED_LITERALS = {"true": True, "false": False, "null": None}
 
 
 class MinimaxM3Detector(BaseFormatDetector):
@@ -84,6 +85,10 @@ class MinimaxM3Detector(BaseFormatDetector):
             )
             return StreamingParseResult(normal_text=original_text, calls=[])
 
+    @classmethod
+    def parses_without_tools(cls) -> bool:
+        return True
+
     def supports_structural_tag(self) -> bool:
         return False
 
@@ -136,7 +141,18 @@ class MinimaxM3Detector(BaseFormatDetector):
             )
             action = {"name": func_name, "arguments": params}
             try:
-                parsed_calls = self.parse_base_json(action, tools)
+                # With no tools declared the call is kept as sent; the history names it.
+                parsed_calls = (
+                    self.parse_base_json(action, tools)
+                    if tools
+                    else [
+                        ToolCallItem(
+                            tool_index=-1,
+                            name=func_name,
+                            parameters=json.dumps(params, ensure_ascii=False),
+                        )
+                    ]
+                )
                 for call in parsed_calls:
                     call.tool_index = len(results)
                     results.append(call)
@@ -190,6 +206,14 @@ class MinimaxM3Detector(BaseFormatDetector):
                 break
 
         return StreamingParseResult(normal_text=normal_text, calls=calls)
+
+    def finish(self, tools: List[Tool]) -> StreamingParseResult:
+        # Outside a tool call the buffer only holds a possible marker prefix
+        # (e.g. a trailing "]"); the stream is over, so release it as text.
+        if self._in_tool_call or not self._buffer:
+            return StreamingParseResult()
+        normal_text, self._buffer = self._buffer, ""
+        return StreamingParseResult(normal_text=normal_text)
 
     def _consume_tool_call_end(self) -> bool:
         start = self._buffer.find(self.TOOL_CALL_END)
@@ -251,16 +275,26 @@ class MinimaxM3Detector(BaseFormatDetector):
 
         tag = self._buffer[start + len(self.PARAM_START_PREFIX) : gt].strip()
         end_token = self._parameter_end_token(tag)
+        param_schema = self._get_child_schema(self._current_function_schema, tag)
         rest = self._buffer[gt + 1 :]
         if rest and len(rest) < len(end_token) and end_token.startswith(rest):
             # The next tag may open a child or close this parameter; wait for it.
             return False
+        if self._is_untyped_schema(param_schema):
+            # The value's first tag decides container vs scalar; if it has not
+            # arrived yet, wait instead of streaming nested markup as a string.
+            head = rest.lstrip(self.TAG_SPACING_CHARS)
+            if len(head) < len(self.PARAM_START_PREFIX) and (
+                self.PARAM_START_PREFIX.startswith(head)
+            ):
+                return False
+            # Spacing before a nested tag is markup; a string value keeps it.
+            if head.startswith(self.PARAM_START_PREFIX):
+                rest = head
 
         self._buffer = rest
         self._current_param_name = tag
-        self._current_param_schema = self._get_child_schema(
-            self._current_function_schema, tag
-        )
+        self._current_param_schema = param_schema
         self._current_param_buffer = ""
         # Mirrors _parse_parameter: an empty scalar value is not an empty container.
         closes_empty_scalar = rest.startswith(end_token) and self._is_scalar_schema(
@@ -453,6 +487,11 @@ class MinimaxM3Detector(BaseFormatDetector):
         return {}
 
     def _convert_leaf_value(self, value: str, schema: Any) -> Any:
+        if self._is_untyped_schema(schema):
+            # Only the JSON literals are unambiguous without a schema; a numeric
+            # leaf could equally be a string ("521"), so it stays verbatim.
+            return UNTYPED_LITERALS.get(value.strip(), value)
+
         schema_types = set(self._schema_types(schema))
         null_permitted = "null" in schema_types
 
@@ -515,7 +554,12 @@ class MinimaxM3Detector(BaseFormatDetector):
         else:
             root = {}
         stack: List[Dict[str, Any]] = [
-            {"tag": "", "schema": parameters_schema, "value": root}
+            {
+                "tag": "",
+                "schema": parameters_schema,
+                "value": root,
+                "inferred_list": False,
+            }
         ]
 
         for chunk in body.split(MINIMAX_NS_TOKEN):
@@ -542,6 +586,8 @@ class MinimaxM3Detector(BaseFormatDetector):
                 tag = chunk[1:gt].strip()
                 text = chunk[gt + 1 :]
                 parent_frame = stack[-1]
+                if self._is_untyped_schema(parent_frame["schema"]):
+                    self._infer_untyped_container(parent_frame, tag)
                 child_schema = self._get_child_schema(
                     parent_frame["schema"], tag, parent_frame["value"]
                 )
@@ -550,9 +596,37 @@ class MinimaxM3Detector(BaseFormatDetector):
                     value = self._convert_leaf_value(text, child_schema)
                 else:
                     value = self._new_container_for_schema(child_schema)
-                stack.append({"tag": tag, "schema": child_schema, "value": value})
+                stack.append(
+                    {
+                        "tag": tag,
+                        "schema": child_schema,
+                        "value": value,
+                        "inferred_list": False,
+                    }
+                )
 
-        return root
+        return stack[0]["value"]
+
+    def _is_untyped_schema(self, schema: Any) -> bool:
+        # No schema to resolve XML children against, e.g. the members of a
+        # bare {"type": "object"} parameter.
+        if not isinstance(schema, dict):
+            return True
+        return not self._schema_types(schema) and not any(
+            key in schema for key in ("properties", "items", "prefixItems")
+        )
+
+    def _infer_untyped_container(self, frame: Dict[str, Any], child_tag: str) -> None:
+        # The chat template renders array elements as <item>: a leading <item>
+        # implies an array; a later named sibling folds items back under "item".
+        value = frame["value"]
+        if child_tag == "item":
+            if isinstance(value, dict) and not value:
+                frame["value"] = []
+                frame["inferred_list"] = True
+        elif frame["inferred_list"]:
+            frame["value"] = {"item": value[0] if len(value) == 1 else value}
+            frame["inferred_list"] = False
 
     def _body_starts_with_item(self, body: str) -> bool:
         for chunk in body.split(MINIMAX_NS_TOKEN):

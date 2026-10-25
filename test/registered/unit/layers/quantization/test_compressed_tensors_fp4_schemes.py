@@ -158,6 +158,29 @@ class TestFp4SchemeSelection(CustomTestCase):
                     _get_scheme("linear", _make_config(a16), SM90)
                 warn.assert_not_called()
 
+    def test_marlin_backend_serves_w4a4_weight_only_on_blackwell(self):
+        """FlashInfer mm_fp4 has no marlin backend, so --fp4-gemm-backend marlin
+        must not select the native w4a4 linear on SM100. The MoE follows
+        --moe-runner-backend instead, which the warning has to say."""
+        from sglang.srt.layers.quantization import fp4_utils
+
+        logging.Logger.warning_once.cache_clear()
+        self.addCleanup(logging.Logger.warning_once.cache_clear)
+        with (
+            mock.patch.object(
+                fp4_utils, "FP4_GEMM_RUNNER_BACKEND", Fp4GemmRunnerBackend.MARLIN
+            ),
+            self.assertLogs(SCHEME_LOGGER, level="WARNING") as captured,
+        ):
+            linear = _get_scheme("linear", _make_config("nvfp4"), SM100)
+            moe = _get_scheme("moe", _make_config("nvfp4"), SM100)
+        self.assertIsInstance(linear, CompressedTensorsW4A16Fp4)
+        self.assertTrue(linear.has_input_global_scale)
+        self.assertIsInstance(moe, CompressedTensorsW4A4Nvfp4MoE)
+        output = "\n".join(captured.output)
+        self.assertIn("marlin is weight-only", output)
+        self.assertIn("MoE layers follow --moe-runner-backend", output)
+
     def test_fp4_weights_with_non_nvfp4_activations_raise(self):
         """Mismatched activation quantization must not be served weight-only."""
         config = _make_config(

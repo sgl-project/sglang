@@ -23,12 +23,12 @@ struct AlignSingleTokenParams {
   const int32_t* __restrict__ topk_ids;  // [1, topk]
   int32_t* __restrict__ sorted_ids;      // [topk * block_size]
   int32_t* __restrict__ expert_ids;      // [topk]
-  int32_t* __restrict__ num_post;        // [1]
+  int32_t* __restrict__ num_post;        // [1] or [2]
   uint32_t topk;
   uint32_t block_size;
 };
 
-template <bool kUsePDL>
+template <bool kUsePDL, bool kWriteInactivePrefixCount = false>
 __global__ void align_single_token_kernel(const AlignSingleTokenParams __grid_constant__ params) {
   using namespace device;
   const uint32_t lane = threadIdx.x;  // one warp
@@ -61,16 +61,21 @@ __global__ void align_single_token_kernel(const AlignSingleTokenParams __grid_co
       params.sorted_ids[p] = static_cast<int32_t>(topk);
     }
   }
-  if (lane == 0) {
+  if constexpr (kWriteInactivePrefixCount) {
+    const uint32_t inactive = __ballot_sync(0xffffffff, lane < topk && my_id < 0);
+    if (lane == 0) {
+      *reinterpret_cast<int2*>(params.num_post) = make_int2(topk * bs, __popc(inactive));
+    }
+  } else if (lane == 0) {
     params.num_post[0] = static_cast<int32_t>(topk * bs);
   }
 
   PDLTriggerSecondary<kUsePDL>();
 }
 
-template <bool kUsePDL>
+template <bool kUsePDL, bool kWriteInactivePrefixCount = false>
 struct AlignSingleTokenKernel {
-  static constexpr auto kernel = align_single_token_kernel<kUsePDL>;
+  static constexpr auto kernel = align_single_token_kernel<kUsePDL, kWriteInactivePrefixCount>;
 
   static void
   run(const tvm::ffi::TensorView topk_ids,
@@ -86,6 +91,9 @@ struct AlignSingleTokenKernel {
     device.set_options<kDLCUDA>();
 
     TensorMatcher({One_, K_}).with_dtype<int32_t>().with_device(device).verify(topk_ids);
+    if constexpr (kWriteInactivePrefixCount) {
+      TensorMatcher({2}).with_dtype<int32_t>().with_device(device).ensure_alignment(8).verify(num_post);
+    }
 
     const auto topk = static_cast<uint32_t>(K_.unwrap());
     RuntimeCheck(One_.unwrap() == 1, "moe_align_single_token requires M == 1");

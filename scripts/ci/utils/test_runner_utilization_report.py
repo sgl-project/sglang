@@ -11,10 +11,14 @@ the old code required a runner_name and a completed_at, so multi-hour
 8-gpu waits never showed up in max/avg queue time.
 """
 
+import io
 import os
+import subprocess
 import sys
 import unittest
+from contextlib import redirect_stdout
 from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import runner_utilization_report as rur  # noqa: E402
@@ -41,6 +45,153 @@ def _job(**kw):
 
 def _iso(dt):
     return dt.isoformat().replace("+00:00", "Z")
+
+
+class TestGitHubRequestBudget(unittest.TestCase):
+    def test_success_uses_finite_request_timeout(self):
+        result = subprocess.CompletedProcess([], 0, stdout='{"jobs": []}')
+        with patch.object(rur.subprocess, "run", return_value=result) as run:
+            self.assertEqual(
+                rur.run_gh_command(["repos/o/r/actions/runs"]), {"jobs": []}
+            )
+        self.assertGreater(run.call_args.kwargs["timeout"], 0)
+        self.assertLessEqual(run.call_args.kwargs["timeout"], 30)
+
+    def test_permanent_error_is_not_retried(self):
+        result = subprocess.CompletedProcess([], 1, stderr="gh: Not Found (HTTP 404)")
+        with (
+            patch.object(rur.subprocess, "run", return_value=result) as run,
+            patch.object(rur.time, "sleep") as sleep,
+            self.assertRaisesRegex(RuntimeError, "after 1 attempts.*404"),
+        ):
+            rur.run_gh_command(["repos/o/r/actions/runs"])
+        self.assertEqual(run.call_count, 1)
+        sleep.assert_not_called()
+
+    def test_transient_error_recovers_and_logs_endpoint(self):
+        results = [
+            subprocess.CompletedProcess([], 1, stderr="gh: Server Error (HTTP 502)"),
+            subprocess.CompletedProcess([], 0, stdout='{"jobs": [1]}'),
+        ]
+        output = io.StringIO()
+        with (
+            patch.object(rur.subprocess, "run", side_effect=results) as run,
+            patch.object(rur.time, "sleep") as sleep,
+            redirect_stdout(output),
+        ):
+            self.assertEqual(
+                rur.run_gh_command(["repos/o/r/actions/runs"]), {"jobs": [1]}
+            )
+        self.assertEqual(run.call_count, 2)
+        sleep.assert_called_once()
+        self.assertIn(
+            "Retrying repos/o/r/actions/runs after attempt 1", output.getvalue()
+        )
+        self.assertIn("HTTP 502", output.getvalue())
+
+    def test_final_failed_attempt_does_not_sleep(self):
+        result = subprocess.CompletedProcess(
+            [], 1, stderr="gh: Server Error (HTTP 502)"
+        )
+        with (
+            patch.object(rur.subprocess, "run", return_value=result),
+            patch.object(rur.time, "sleep") as sleep,
+            self.assertRaisesRegex(RuntimeError, "after 1 attempts"),
+        ):
+            rur.run_gh_command(["repos/o/r/actions/runs"], max_retries=1)
+        sleep.assert_not_called()
+
+    def test_hung_requests_share_a_finite_retry_budget(self):
+        clock = [0.0]
+        timeouts = []
+
+        def hung_request(args, **kwargs):
+            timeout = kwargs["timeout"]
+            timeouts.append(timeout)
+            clock[0] += timeout
+            raise subprocess.TimeoutExpired(args, timeout)
+
+        def sleep(seconds):
+            clock[0] += seconds
+
+        with (
+            patch.object(rur.time, "monotonic", side_effect=lambda: clock[0]),
+            patch.object(rur.time, "sleep", side_effect=sleep),
+            patch.object(rur.random, "uniform", return_value=0),
+            patch.object(rur.subprocess, "run", side_effect=hung_request),
+            redirect_stdout(io.StringIO()),
+            self.assertRaisesRegex(RuntimeError, "after 4 attempts.*request timeout"),
+        ):
+            rur.run_gh_command(["repos/o/r/actions/runs"])
+        self.assertEqual(timeouts, [30, 30, 30, 23])
+        self.assertEqual(clock[0], 120)
+
+    def test_backoff_cannot_extend_retry_budget(self):
+        clock = [0.0]
+        waits = []
+
+        def fail_request(args, **kwargs):
+            return subprocess.CompletedProcess(
+                args, 1, stderr="gh: rate limit exceeded"
+            )
+
+        def sleep(seconds):
+            waits.append(seconds)
+            clock[0] += seconds
+
+        with (
+            patch.object(rur.time, "monotonic", side_effect=lambda: clock[0]),
+            patch.object(rur.time, "sleep", side_effect=sleep),
+            patch.object(rur.random, "uniform", return_value=0),
+            patch.object(rur.subprocess, "run", side_effect=fail_request) as run,
+            redirect_stdout(io.StringIO()),
+            self.assertRaisesRegex(RuntimeError, "after 7 attempts.*rate limit"),
+        ):
+            rur.run_gh_command(["repos/o/r/actions/runs"])
+        self.assertEqual(run.call_count, 7)
+        self.assertEqual(waits, [1, 2, 4, 8, 16, 32, 57])
+        self.assertEqual(clock[0], 120)
+
+
+class TestHostedOnlyWorkflows(unittest.TestCase):
+    def test_collection_skips_metadata_paths_but_keeps_gpu_title_collisions(self):
+        runs = [
+            {
+                "id": 1,
+                "path": ".github/workflows/pr-check-comment.yml",
+                "name": "PR Check Comment",
+                "event": "workflow_run",
+            },
+            {
+                "id": 2,
+                "path": ".github/workflows/pr-title.yml",
+                "name": "PR Title",
+                "event": "pull_request_target",
+            },
+            {
+                "id": 3,
+                "path": ".github/workflows/pr-test.yml",
+                "name": "PR #42 - Fix PR Title and PR Check Comment",
+                "event": "pull_request",
+            },
+            {
+                "id": 4,
+                "path": ".github/workflows/new-gpu-test.yml",
+                "name": "PR Title",
+                "event": "workflow_dispatch",
+            },
+            {"id": 5, "name": "PR Check Comment", "event": "workflow_dispatch"},
+        ]
+        with (
+            patch.object(rur, "get_workflow_runs", return_value=(runs, False)),
+            patch.object(rur, "get_runners", return_value=[]),
+            patch.object(rur, "get_jobs_for_run", return_value=[]) as fetch,
+            redirect_stdout(io.StringIO()),
+        ):
+            rur.calculate_utilization("o/r")
+        self.assertCountEqual(
+            [call.args[1] for call in fetch.call_args_list], [3, 4, 5]
+        )
 
 
 class TestClassifyJob(unittest.TestCase):
