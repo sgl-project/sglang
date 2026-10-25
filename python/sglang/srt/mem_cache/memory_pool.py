@@ -2058,6 +2058,17 @@ class KVCache(abc.ABC):
         """
         raise NotImplementedError(f"{type(self).__name__} has no device pool provider")
 
+    def pd_kv_layout(self) -> Optional[str]:
+        """The KV byte layout PD peers must share, or None for the default.
+
+        None means the default layout of this pool class (token-major rows for
+        MHA pools). A pool whose bytes can be laid out differently (another
+        layout option, or an out-of-tree pool) returns a stable name; PD
+        publishes it on the bootstrap server and refuses to pair a prefill and a
+        decode server that declare different layouts.
+        """
+        return None
+
     def host_pool_decls(self):
         """Host pools HiCache keeps for the buffers this device pool (and its
         sub-pools) owns: the KV pool itself, plus dependent pools such as sparse
@@ -4435,6 +4446,10 @@ class HybridLinearKVPool(KVCache):
     def get_state_conv_shard_groups(self):
         """Per-tensor conv sub-block dims (GDN) aligned with the state list."""
         return self.mamba_pool.get_state_conv_shard_groups()
+
+    def pd_kv_layout(self) -> Optional[str]:
+        # PD transfers the wrapped full-attention pool's KV bytes.
+        return self.full_kv_pool.pd_kv_layout()
 
     def maybe_get_custom_mem_pool(self):
         return self.full_kv_pool.maybe_get_custom_mem_pool()
