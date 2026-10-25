@@ -303,6 +303,9 @@ class ConfigManager:
                 "native_capture_profile",
                 "native_initial_draft_buffer",
                 "native_source_work_policy",
+                "cost_mode",
+                "native_analytic_model",
+                "native_cost_evidence_path",
                 "output_token_id",
             }
             unknown_fields = sorted(predictor_config.keys() - supported_fields)
@@ -334,6 +337,7 @@ class ConfigManager:
                 "progress_artifact",
                 "native_capture_profile",
                 "native_initial_draft_buffer",
+                "native_analytic_model",
             ):
                 ref = options.get(key)
                 if isinstance(ref, dict) and type(ref.get("path")) is str:
@@ -341,6 +345,10 @@ class ConfigManager:
                         **ref,
                         "path": cls.resolve_infercast_path(ref["path"]),
                     }
+            if type(options.get("native_cost_evidence_path")) is str:
+                options["native_cost_evidence_path"] = cls.resolve_infercast_path(
+                    options["native_cost_evidence_path"]
+                )
             return InferCastDSparkTimePredictor(
                 model,
                 hw=hw,

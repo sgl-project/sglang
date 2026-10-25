@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
+from pathlib import Path
 
 from sglang_simulator.simulation.sglang.dspark import DSparkPhaseCost, DSparkStepTiming
 from sglang_simulator.time_predictor.base import PredictorError
@@ -94,6 +96,67 @@ def _source_work_query_evidence(recorder, *, point, phase, policy, source_policy
         ) from error
 
 
+def _native_cost_query_evidence(recorder, *, point, phase, source, model):
+    """Require the existing SDK leaf proof before accepting a hybrid lookup."""
+    from infercast.sdk.native_segment_module import OP, NativeSegmentQuery
+
+    def canonical(value):
+        return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+    try:
+        shapes = json.loads(point["native_segment_queries"])
+        if len(shapes) != 1 or recorder.dropped_queries or len(recorder.nodes) != 1:
+            raise ValueError("one complete native region query is required")
+        requested = NativeSegmentQuery.from_shape(shapes[0])
+        node = recorder.nodes[0]
+        if not (
+            node["op"] == OP
+            and node["node_id"] == requested.segment_kind
+            and node["phase"] == phase
+            and node["status"] == "resolved"
+            and node["source"] == source
+            and type(node["count"]) is int
+            and node["count"] == 1
+            and type(node["repeat"]) is int
+            and node["repeat"] == 1
+            and canonical(node["shape"]) == canonical(requested.to_shape())
+            and len(node["queries"]) == 1
+        ):
+            raise ValueError("native node provenance differs")
+        query = node["queries"][0]
+        if not (
+            query["component"] == OP
+            and query["role"] == "leaf"
+            and query["source"] == source
+            and query["kernel_source"] == "sglang"
+            and query["kernel_impl"] == requested.to_shape()["kernel_impl"]
+            and canonical(query["requested_key"]) == canonical(requested.to_shape())
+        ):
+            raise ValueError("native leaf provenance differs")
+        if source == "sol":
+            document = model.to_dict()
+            metadata = query["row_metadata"]
+            if not (
+                query["resolution"] in {"sol", "fallback"}
+                and metadata["analytic_policy"] == document["policy"]
+                and metadata["analytic_model_sha256"]
+                == hashlib.sha256(canonical(document).encode()).hexdigest()
+                and metadata["execution_profile_id"]
+                == document["execution_profile_id"]
+                == requested.execution_profile_id
+            ):
+                raise ValueError("analytic model provenance differs")
+        elif source not in {"silicon", "empirical"}:
+            # One native module is one leaf. A mixed total is represented by
+            # the separate measured/theoretical phase costs, not an opaque leaf.
+            raise ValueError("native leaf source has no attributable decomposition")
+        return query
+    except (AttributeError, KeyError, IndexError, TypeError, ValueError) as error:
+        raise PredictorError(
+            "data_unavailable", "DSPark hybrid cost lacks matching SDK query evidence"
+        ) from error
+
+
 class UMDDSparkCostModel:
     """Evaluate source-owned prepared graphs; no alternate latency table.
 
@@ -110,12 +173,21 @@ class UMDDSparkCostModel:
         phase_preparers=None,
         native_source_policy=None,
         native_source_work_policy=None,
+        native_analytic_model=None,
+        cost_evidence_path=None,
     ):
         self.database = database
         self.proposal_profile_id = proposal_profile_id
         self.preparers = dict(phase_preparers or {})
         self.native_source_policy = native_source_policy
         self.native_source_work_policy = native_source_work_policy
+        self.native_analytic_model = native_analytic_model
+        self._cost_counts = {}
+        self._cost_sink = None
+        self._cost_sink_path = None
+        self._cost_sink_digest = hashlib.sha256()
+        self._cost_sink_bytes = 0
+        self._cost_sink_failed = False
         if native_source_policy is not None:
             from infercast.sdk.native_segment_projection import (
                 NativeSegmentSourcePolicy,
@@ -160,6 +232,99 @@ class UMDDSparkCostModel:
                 )
             self.preparers["proposal"] = self._prepare_proposal
         self._proposal_profile = None
+        if native_analytic_model is not None:
+            from infercast.sdk.native_segment_analytic import NativeSegmentAnalyticModel
+            from infercast.sdk.perf_database.common import DatabaseMode
+
+            if not (
+                type(native_analytic_model) is NativeSegmentAnalyticModel
+                and native_source_policy is not None
+                and database.default_mode == DatabaseMode.HYBRID
+                and native_analytic_model.to_dict()["execution_profile_id"]
+                == native_source_policy.execution_profile_id
+                and native_analytic_model.to_dict()["tp_size"]
+                == native_source_policy.tp_size
+            ):
+                raise PredictorError(
+                    "invalid_execution_profile",
+                    "analytic costs require explicit HYBRID and the matching native policy",
+                )
+            if cost_evidence_path is not None:
+                if (
+                    type(cost_evidence_path) is not str
+                    or not cost_evidence_path.strip()
+                ):
+                    raise PredictorError(
+                        "invalid_execution_profile",
+                        "cost evidence path must be explicit",
+                    )
+                path = Path(cost_evidence_path).absolute()
+                try:
+                    # The caller selects a fresh run output; never append to or
+                    # replace another run's ledger.
+                    self._cost_sink = path.open("xb", buffering=0)
+                    self._cost_sink_path = path
+                except OSError as error:
+                    raise PredictorError(
+                        "data_unavailable", "cannot create native cost evidence ledger"
+                    ) from error
+        elif cost_evidence_path is not None:
+            raise PredictorError(
+                "invalid_execution_profile", "cost evidence requires an analytic model"
+            )
+
+    def get_cost_metrics(self):
+        """Report evaluated query costs, including the complete theory fraction."""
+        if self._cost_sink_failed:
+            raise PredictorError(
+                "data_unavailable", "native cost evidence write failed"
+            )
+        if self.native_analytic_model is None:
+            return None
+        by_source = {}
+        for row in self._cost_counts.values():
+            target = by_source.setdefault(row["source"], {"queries": 0, "seconds": 0.0})
+            target["queries"] += row["queries"]
+            target["seconds"] += row["seconds"]
+        total = math.fsum(row["seconds"] for row in by_source.values())
+        theory = by_source.get("sol", {}).get("seconds", 0.0)
+        return {
+            "scope": "evaluated_cost_queries_not_committed_forward_events",
+            "model": self.native_analytic_model.to_dict(),
+            "by_source": by_source,
+            "by_phase_source": [dict(row) for row in self._cost_counts.values()],
+            "theoretical_seconds": theory,
+            "total_evaluated_seconds": total,
+            "theoretical_fraction": theory / total if total else 0.0,
+            "ledger": None
+            if self._cost_sink is None
+            else {
+                "path": str(self._cost_sink_path),
+                "bytes": self._cost_sink_bytes,
+                "sha256": self._cost_sink_digest.hexdigest(),
+                "encoding": "canonical_utf8_jsonl",
+                "write_failed": self._cost_sink_failed,
+            },
+        }
+
+    def _write_cost_line(self, line):
+        if self._cost_sink_failed:
+            raise PredictorError(
+                "data_unavailable", "native cost evidence write failed"
+            )
+        if self._cost_sink is None:
+            return
+        try:
+            if self._cost_sink.write(line) != len(line):
+                raise OSError("incomplete native cost evidence write")
+            self._cost_sink.flush()
+        except (OSError, ValueError) as error:
+            self._cost_sink_failed = True
+            raise PredictorError(
+                "data_unavailable", "native cost evidence write failed"
+            ) from error
+        self._cost_sink_digest.update(line)
+        self._cost_sink_bytes += len(line)
 
     def execution_for(
         self,
@@ -487,24 +652,27 @@ class UMDDSparkCostModel:
         }
         recorder = None
         try:
-            if source_work:
+            if source_work or self.native_analytic_model is not None:
                 from infercast.sdk.diagnostics.prediction_evidence import (
                     capture_prediction_evidence,
                 )
                 from infercast.sdk.native_segment_module import OP
 
+                options = {}
+                if source_work:
+                    options.update(
+                        source_work_policy=self.native_source_work_policy,
+                        source_policy=self.native_source_policy,
+                    )
+                if self.native_analytic_model is not None:
+                    options["analytic_model"] = self.native_analytic_model
                 with capture_prediction_evidence() as recorder:
                     result = evaluate_phase_composition(
                         self.database,
                         nodes,
                         getattr(graph, graph_phase + "_composition"),
                         **evaluation,
-                        operation_kwargs={
-                            OP: {
-                                "source_work_policy": self.native_source_work_policy,
-                                "source_policy": self.native_source_policy,
-                            }
-                        },
+                        operation_kwargs={OP: options},
                     )
             else:
                 result = evaluate_phase_composition(
@@ -526,7 +694,9 @@ class UMDDSparkCostModel:
                 policy=self.native_source_work_policy,
                 source_policy=self.native_source_policy,
             )
-        elif result.source != "silicon":
+        elif result.source != "silicon" and not (
+            result.source == "sol" and self.native_analytic_model is not None
+        ):
             raise PredictorError(
                 "data_unavailable", "DSPark requires measured silicon cost provenance"
             )
@@ -541,6 +711,41 @@ class UMDDSparkCostModel:
             )
         if source_work_evidence is not None:
             identity_fields["source_work_query"] = source_work_evidence
+        seconds = float(result) / 1000
+        if self.native_analytic_model is not None:
+            query = _native_cost_query_evidence(
+                recorder,
+                point=point,
+                phase=graph_phase,
+                source=result.source,
+                model=self.native_analytic_model,
+            )
+            identity_fields["native_cost_query"] = query
+            record = {
+                "event": "predicted_phase_cost",
+                "forward_id": step.forward_id,
+                "phase": phase,
+                "source": result.source,
+                "seconds": seconds,
+                "identity": identity_fields,
+            }
+            line = (
+                json.dumps(
+                    record, sort_keys=True, separators=(",", ":"), allow_nan=False
+                ).encode("utf-8")
+                + b"\n"
+            )
+            cost = DSparkPhaseCost(
+                phase, seconds, "umd:" + hashlib.sha256(line).hexdigest()
+            )
+            self._write_cost_line(line)
+            counts = self._cost_counts.setdefault(
+                (phase, result.source),
+                {"phase": phase, "source": result.source, "queries": 0, "seconds": 0.0},
+            )
+            counts["queries"] += 1
+            counts["seconds"] += seconds
+            return cost
         identity = json.dumps(
             identity_fields,
             sort_keys=True,
@@ -548,7 +753,7 @@ class UMDDSparkCostModel:
         )
         return DSparkPhaseCost(
             phase,
-            float(result) / 1000,
+            seconds,
             "umd:" + hashlib.sha256(identity.encode()).hexdigest(),
         )
 

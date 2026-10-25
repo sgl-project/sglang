@@ -6,6 +6,7 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
+
 from sglang_simulator.simulation.manager.config import ConfigManager
 from sglang_simulator.simulation.manager.env import Envs
 
@@ -144,6 +145,26 @@ def test_initial_buffer_witness_resolves_from_config_without_mutation(factory):
         "path": str((folder / "warm-before-work-query.json").resolve()),
         "sha256": "f" * 64,
     }
+    assert raw == original
+
+
+def test_explicit_hybrid_model_and_output_resolve_from_config(factory):
+    _, raw, folder = factory
+    raw["predictor"].update(
+        cost_mode="HYBRID",
+        native_analytic_model={"path": "analytic.json", "sha256": "e" * 64},
+        native_cost_evidence_path="run/costs.jsonl",
+    )
+    original = copy.deepcopy(raw)
+    result = ConfigManager.get_inference_time_predictor(None, None, None)
+    assert result.cost_mode == "HYBRID"
+    assert result.native_analytic_model == {
+        "path": str((folder / "analytic.json").resolve()),
+        "sha256": "e" * 64,
+    }
+    assert result.native_cost_evidence_path == str(
+        (folder / "run/costs.jsonl").resolve()
+    )
     assert raw == original
 
 

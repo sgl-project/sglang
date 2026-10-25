@@ -1,4 +1,4 @@
-"""Explicit DSPark assembly; complete worker phase measurements remain required."""
+"""Explicit DSPark assembly with measured or opt-in hybrid phase costs."""
 
 import copy
 import hashlib
@@ -735,12 +735,33 @@ class InferCastDSparkTimePredictor(InferTimePredictor):
         native_capture_profile=None,
         native_initial_draft_buffer=None,
         native_source_work_policy=None,
+        cost_mode="SILICON",
+        native_analytic_model=None,
+        native_cost_evidence_path=None,
         output_token_id=1,
         model_config_root=None,
         **kwargs,
     ):
         _require(
             not kwargs, "unknown DSPark predictor configuration", fields=sorted(kwargs)
+        )
+        _require(
+            type(cost_mode) is str and cost_mode in {"SILICON", "HYBRID"},
+            "cost_mode must be SILICON or HYBRID",
+        )
+        _require(
+            (cost_mode == "HYBRID") == (native_analytic_model is not None),
+            "HYBRID requires an explicit native_analytic_model asset",
+        )
+        _require(
+            native_cost_evidence_path is None or cost_mode == "HYBRID",
+            "native_cost_evidence_path requires explicit HYBRID costs",
+        )
+        _require(
+            cost_mode != "HYBRID"
+            or native_segment_profile_id is not None
+            and progress_kind == "source_golden351",
+            "HYBRID requires source-bound native golden regions",
         )
         _require(
             type(progress_kind) is str
@@ -916,7 +937,7 @@ class InferCastDSparkTimePredictor(InferTimePredictor):
                 "sglang",
                 config.backend_version,
                 systems_root=systems_root,
-                database_mode="SILICON",
+                database_mode=cost_mode,
             )
             stack_path = Path(database.slice_ref.stack_path)
             stack_digest = hashlib.sha256(stack_path.read_bytes()).hexdigest()
@@ -993,6 +1014,44 @@ class InferCastDSparkTimePredictor(InferTimePredictor):
                 raise PredictorError(
                     "data_unavailable", f"native source policy is unavailable: {error}"
                 ) from error
+        analytic_model, analytic_identity = None, None
+        if native_analytic_model is not None:
+            try:
+                from infercast.sdk.native_segment_analytic import (
+                    NativeSegmentAnalyticModel,
+                )
+                from infercast.sdk.perf_database.dsv41_dspark import (
+                    decode_dspark_artifact,
+                )
+
+                analytic_path, analytic_bytes, analytic_digest = _asset(
+                    native_analytic_model, "native_analytic_model"
+                )
+                analytic_model = NativeSegmentAnalyticModel.from_dict(
+                    decode_dspark_artifact(analytic_bytes)
+                )
+                document = analytic_model.to_dict()
+                _require(
+                    document["execution_profile_id"]
+                    == native_policy.execution_profile_id
+                    and document["tp_size"] == tp_size
+                    and document["model_config_sha256"]
+                    == model_config_ref["sdk_canonical_sha256"],
+                    "analytic model differs from the verified source/model topology",
+                    code="incompatible_runtime",
+                )
+                analytic_identity = {
+                    "path": str(analytic_path),
+                    "sha256": analytic_digest,
+                    "parameters": document,
+                }
+            except PredictorError:
+                raise
+            except (ImportError, OSError, KeyError, TypeError, ValueError) as error:
+                raise PredictorError(
+                    "data_unavailable", f"native analytic model is unavailable: {error}"
+                ) from error
+        # Cost approximation does not supply or relax the exact resource witness.
         initial_capacity, initial_buffer_identity = _initial_draft_buffer(
             database, native_policy, capture_profile, native_initial_draft_buffer
         )
@@ -1020,6 +1079,11 @@ class InferCastDSparkTimePredictor(InferTimePredictor):
         cost_options = {}
         if native_source_work_policy is not None:
             cost_options["native_source_work_policy"] = native_source_work_policy
+        if analytic_model is not None:
+            cost_options.update(
+                native_analytic_model=analytic_model,
+                cost_evidence_path=native_cost_evidence_path,
+            )
         costs = UMDDSparkCostModel(
             database,
             proposal_profile_id=proposal_profile_id,
@@ -1058,7 +1122,7 @@ class InferCastDSparkTimePredictor(InferTimePredictor):
                 "path": str(database.slice_ref.slice_dir),
                 "stack_path": str(stack_path),
                 "stack_sha256": stack_digest,
-                "database_mode": "SILICON",
+                "database_mode": cost_mode,
             },
         }
         if progress_kind == "source_golden351":
@@ -1067,6 +1131,8 @@ class InferCastDSparkTimePredictor(InferTimePredictor):
             self._identity["native_source_work_policy"] = native_source_work_policy
         if initial_buffer_identity is not None:
             self._identity["native_initial_draft_buffer"] = initial_buffer_identity
+        if analytic_identity is not None:
+            self._identity["native_analytic_model"] = analytic_identity
 
     def predict_infer_time(self, batch):
         raise PredictorError(
@@ -1102,7 +1168,7 @@ class InferCastDSparkTimePredictor(InferTimePredictor):
             )
             is bool
         )
-        return {
+        result = {
             "infercast_dspark": {
                 **copy.deepcopy(self._identity),
                 "phase_preparers": coverage,
@@ -1142,6 +1208,10 @@ class InferCastDSparkTimePredictor(InferTimePredictor):
                 "accuracy_admitted": False,
             }
         }
+        if "native_analytic_model" in self._identity:
+            cost_metrics = self.dspark_runtime.session.cost_model.get_cost_metrics()
+            result["infercast_dspark"]["hybrid_cost_queries"] = cost_metrics
+        return result
 
     def reset_metrics(self):
         # Identity and coverage are not interval counters or simulation state.

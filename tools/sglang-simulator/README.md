@@ -88,6 +88,24 @@ with uncovered call spans cannot become a complete target cost. Missing phases
 fail before progress is sampled. The default runtime execution resolver uses
 this same cost adapter rather than a second graph/cost planner.
 
+Native golden regions default to `cost_mode="SILICON"`. Explicit `HYBRID`
+additionally requires a `native_analytic_model` `{path, sha256}` asset whose
+versioned SDK parameters bind the same execution profile, TP layout and canonical
+model configuration. Exact measurements and supported interpolation take priority;
+only typed data misses may use the SDK's source-partitioned compute, bandwidth,
+launch and communication model. These costs retain `sol` provenance and calibrated
+anchor/assumption metadata. Invalid identity, unsupported execution and tampered
+data remain failures. Resource initialization, source-bound batching and progress
+contracts are unchanged; the exact initial-buffer witness cannot use theory.
+
+Set `native_cost_evidence_path` to a fresh run output to stream every evaluated
+phase's complete SDK query evidence as canonical UTF-8 JSONL. The phase reference
+hashes the exact line bytes, including the newline. Metrics retain the model,
+cost totals by source/phase, theoretical fraction and ledger size/SHA-256. A line
+records a predicted query, not a committed native forward; a partial run or output
+failure must not be reported as a completed simulation. Theory never creates or
+qualifies PerfDB measurement rows and does not establish native timing accuracy.
+
 `time_predictor.dspark_progress.EmpiricalDSparkProgress` reads a hash-pinned
 artifact and sibling observation/native/causal-evidence files. It verifies raw
 native frames with the shared SDK participant join, checks full recipes and
