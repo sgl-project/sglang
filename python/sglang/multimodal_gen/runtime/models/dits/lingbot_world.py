@@ -53,6 +53,7 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     RowParallelLinear,
 )
+from sglang.multimodal_gen.runtime.layers.lora.linear import BaseLayerWithLoRA
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
@@ -142,6 +143,32 @@ def _sequence_splits_are_uniform(seq_splits: list[int]) -> bool:
     return len(seq_splits) <= 1 or all(
         seq_len == seq_splits[0] for seq_len in seq_splits
     )
+
+
+def _check_sequence_split_strategy(strategy: str, seq_splits: list[int]) -> None:
+    # These gather or P2P-rotate equal-sized per-rank chunks (current_start // ws,
+    # plain all-gathers), so uneven splits would hang or corrupt the cache.
+    if strategy in (
+        "kvgather_replicated",
+        "kvgather_sharded",
+        "ring",
+    ) and not _sequence_splits_are_uniform(seq_splits):
+        raise NotImplementedError(
+            f"LingBot sequence strategy {strategy!r} requires uniform sequence splits, got {seq_splits}."
+        )
+
+
+def _share_rows_into_packed(layers, name: str) -> torch.Tensor:
+    # Pack the layers' `name` tensors along dim 0 and re-point each layer at its
+    # row slice of the packed buffer, so the copy is freed and updates alias it.
+    params = [getattr(layer, name) for layer in layers]
+    packed = torch.cat([param.data for param in params], dim=0)
+    offset = 0
+    for param in params:
+        rows = param.shape[0]
+        param.data = packed[offset : offset + rows]
+        offset += rows
+    return packed
 
 
 def _sequence_shard_tensor(
@@ -310,6 +337,19 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
     ):
         cos, sin = freqs_cis[:2]
         cos_sin_cache = freqs_cis[2] if len(freqs_cis) > 2 else None
+        if kv_cache is None:
+            # Pass un-rotated q/k: the base attention applies RoPE itself, and the
+            # in-place flashinfer RoPE below would otherwise rotate them twice.
+            return super().forward(
+                q,
+                k,
+                v,
+                (cos, sin),
+                block_mask,
+                kv_cache,
+                current_start,
+                cache_start,
+            )
         if _is_cuda and q.dim() == 4 and q.shape == k.shape:
             if cos_sin_cache is None:
                 cos_sin_cache = torch.cat(
@@ -337,22 +377,6 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
             and get_ulysses_parallel_world_size() > 1
         )
 
-        if kv_cache is None:
-            if sequence_shard_enabled:
-                raise NotImplementedError(
-                    "LingBot causal sequence sharding currently requires kv_cache-backed inference."
-                )
-            return super().forward(
-                q,
-                k,
-                v,
-                (cos, sin),
-                block_mask,
-                kv_cache,
-                current_start,
-                cache_start,
-            )
-
         strategy = lingbot_sp_strategy() if sequence_shard_enabled else "ulysses"
 
         if sequence_shard_enabled:
@@ -363,6 +387,7 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
                 )
             seq_splits = list(seq_splits)
             uniform_seq_splits = _sequence_splits_are_uniform(seq_splits)
+            _check_sequence_split_strategy(strategy, seq_splits)
 
         if sequence_shard_enabled and strategy == "ulysses":
             # Trade sequence for heads. Packed so this is one collective, not three.
@@ -1250,28 +1275,58 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
         if self._fused_qkv_weight is not None:
             return True
 
+        self.repack_qkv_projection()
+        return True
+
+    def repack_qkv_projection(self) -> None:
+        # Share one packed buffer between to_q/to_k/to_v instead of keeping a
+        # second copy: each layer's weight/bias becomes a view into it, so
+        # in-place LoRA merges and weight copies still reach the fused GEMM.
+        # The packed tensor is a plain attribute, not a Parameter, so it stays
+        # out of state_dict. Re-run after a loader replaces the layers' .data.
         layers = (self.to_q, self.to_k, self.to_v)
         with torch.no_grad():
-            self._fused_qkv_weight = nn.Parameter(
-                torch.cat([layer.weight.detach() for layer in layers], dim=0)
-                .contiguous()
-                .to(self.to_q.weight.device),
-                requires_grad=False,
+            self._fused_qkv_weight = _share_rows_into_packed(layers, "weight")
+            self._fused_qkv_bias = (
+                _share_rows_into_packed(layers, "bias")
+                if all(layer.bias is not None for layer in layers)
+                else None
             )
-            if all(layer.bias is not None for layer in layers):
-                self._fused_qkv_bias = nn.Parameter(
-                    torch.cat([layer.bias.detach() for layer in layers], dim=0)
-                    .contiguous()
-                    .to(self.to_q.weight.device),
-                    requires_grad=False,
-                )
 
+    def _qkv_pack_is_current(self) -> bool:
+        # .to(dtype/device) and offload give each layer a new weight, leaving the
+        # packed buffer on the old storage, dtype or device.
+        layers = (self.to_q, self.to_k, self.to_v)
+        for packed, name in (
+            (self._fused_qkv_weight, "weight"),
+            (self._fused_qkv_bias, "bias"),
+        ):
+            if packed is None:
+                continue
+            storage = packed.untyped_storage().data_ptr()
+            for layer in layers:
+                param = getattr(layer, name)
+                if (
+                    param.untyped_storage().data_ptr() != storage
+                    or param.dtype != packed.dtype
+                    or param.device != packed.device
+                ):
+                    return False
         return True
 
     def _project_qkv(
         self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if self.fuse_qkv_projection():
+        layers = (self.to_q, self.to_k, self.to_v)
+        # A dynamically applied LoRA adds its delta inside each layer's forward,
+        # which the fused GEMM would skip.
+        lora_active = any(
+            isinstance(layer, BaseLayerWithLoRA) and layer.lora_active
+            for layer in layers
+        )
+        if not lora_active and self.fuse_qkv_projection():
+            if not self._qkv_pack_is_current():
+                self.repack_qkv_projection()
             qkv = F.linear(hidden_states, self._fused_qkv_weight, self._fused_qkv_bias)
             return qkv.chunk(3, dim=-1)
 
@@ -1457,6 +1512,12 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
         super().post_load_weights()
         for block in self.blocks:
             block.fuse_qkv_projection()
+
+    def refresh_weight_derived_caches(self, *, weights_path: str | None) -> None:
+        super().refresh_weight_derived_caches(weights_path=weights_path)
+        for block in self.blocks:
+            if block._fused_qkv_weight is not None:
+                block.repack_qkv_projection()
 
     @lru_cache(maxsize=8)
     def _compute_rope_for_sequence_shard_with_offset(
