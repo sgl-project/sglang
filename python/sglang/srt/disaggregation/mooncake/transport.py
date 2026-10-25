@@ -123,15 +123,6 @@ class MooncakeTransport(Transport):
         An empty copy list returns no handles."""
         if not copies:
             return []
-        unknown = [c.src for c in copies if c.src not in self._registrations] + [
-            c.dst for c in copies if c.dst not in remote.bases
-        ]
-        if unknown:
-            return [
-                MooncakeHandle(
-                    Result(Status.FAILED, reason=f"unregistered buffers {unknown}")
-                )
-            ]
         # uint64 throughout: XPU pointers can set bit 63, and numpy promotes
         # uint64 mixed with int64 to float64.
         ranges = [c.ranges.astype(np.uint64, copy=False) for c in copies]
