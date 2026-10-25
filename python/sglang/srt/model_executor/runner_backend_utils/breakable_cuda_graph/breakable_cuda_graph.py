@@ -18,8 +18,8 @@ Each segment is a real torch.cuda.CUDAGraph. Its destructor calls
 releasePool on the shared mempool, so the pool's use_count tracks how
 many segments are alive; the pool stays pinned as long as any segment graph
 is alive. This lets weak_ref_tensor views of intermediate pool-allocated
-tensors remain valid across replays — we don't need Python-managed bridge
-buffers to keep break-point tensors at stable addresses.
+tensors remain valid across replays, so a break's output allocated in the
+captured region needs no other owner.
 """
 
 import functools
@@ -214,7 +214,9 @@ def eager_on_graph(
 
     Arguments retain their capture-time identity. A break returns None: it
     writes its results into buffers the caller allocated, which the next
-    segments read. Request-specific state must be read inside the eager
+    segments read. Tensor arguments are held weakly, so a buffer allocated
+    outside the captured region must be owned by an object that outlives the
+    graph. Request-specific state must be read inside the eager
     function at execution time. The capture pass records the call without
     running it, since its inputs were never computed; ``capture_stub`` runs
     in its place for host setup a later captured segment needs.
