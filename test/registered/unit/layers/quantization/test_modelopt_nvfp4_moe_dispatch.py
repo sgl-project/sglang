@@ -169,7 +169,12 @@ class TestNvFp4MoeDispatch(CustomTestCase):
         from sglang.srt.environ import envs
         from sglang.srt.layers.moe import flashinfer_megamoe
 
-        method = _method_set_up_for(MoeRunnerBackend.FLASHINFER_MEGAMOE)
+        # Exercise apply's scale selection without constructing a distributed
+        # MegaMoE runner; this test records the kernel arguments on CPU.
+        method = ModelOptNvFp4FusedMoEMethod.__new__(ModelOptNvFp4FusedMoEMethod)
+        method._moe_runner_backend = MoeRunnerBackend.FLASHINFER_MEGAMOE
+        method.moe_runner_config = MoeRunnerConfig(activation="silu")
+        method.runner = _Runner()
         layer = SimpleNamespace(
             _mega_moe_nvfp4=False,
             _flashinfer_megamoe_forward=object(),
