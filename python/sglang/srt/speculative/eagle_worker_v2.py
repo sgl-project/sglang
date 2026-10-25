@@ -78,6 +78,10 @@ from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWo
 from sglang.srt.speculative.dp_spec_prefill_coordination import (
     DPSpecPrefillCoordinationPlan,
 )
+from sglang.srt.speculative.draft_parallel import (
+    model_draft_parallel_spec,
+    resolve_draft_parallel_layout,
+)
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
@@ -200,14 +204,17 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self._rebuild_topk1_chain_buffers()
 
         # Use the same attention topology during draft construction and execution.
-        self.draft_owns_attention = (
-            get_parallel().attn_dp_enabled and self.speculative_algorithm.is_eagle3()
+        self.parallel_layout = resolve_draft_parallel_layout(
+            model_draft_parallel_spec(
+                target_worker.model_runner.spec_aux_config.draft_model_config,
+                spec_algorithm=self.speculative_algorithm,
+            )
         )
         # Only the last target PP stage loads the draft. Capture its TP group
         # before draft_pp_context hides the target's pipeline topology.
         load_group = get_pp_stage_load_group()
         with (
-            draft_tp_context(self.draft_owns_attention),
+            draft_tp_context(self.parallel_layout),
             draft_pp_context(),
             speculative_moe_backend_context(),
             speculative_moe_a2a_backend_context(),
@@ -269,7 +276,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
     def init_attention_backends(self):
         with (
             draft_pp_context(),
-            draft_tp_context(self.draft_owns_attention),
+            draft_tp_context(self.parallel_layout),
             speculative_moe_backend_context(),
             speculative_moe_a2a_backend_context(),
         ):
@@ -279,7 +286,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
     def init_cuda_graphs(self):
         with (
             draft_pp_context(),
-            draft_tp_context(self.draft_owns_attention),
+            draft_tp_context(self.parallel_layout),
             speculative_moe_backend_context(),
             speculative_moe_a2a_backend_context(),
         ):
@@ -1288,6 +1295,14 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
 
 class EAGLEWorkerV2(BaseSpecWorker):
+    @property
+    def draft_parallel_layout(self):
+        return (
+            self._draft_worker.parallel_layout
+            if self._draft_worker is not None
+            else None
+        )
+
     def __init__(
         self,
         server_args: ServerArgs,
@@ -1374,7 +1389,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # Build adaptive runtime states after target and draft backends exist.
         if self.adaptive_controller is not None:
             with (
-                draft_tp_context(self._draft_worker.draft_owns_attention),
+                draft_tp_context(self._draft_worker.parallel_layout),
                 speculative_moe_backend_context(),
                 speculative_moe_a2a_backend_context(),
             ):
@@ -1457,7 +1472,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 verify_input = self._build_trivial_verify_input(batch)
             else:
                 with (
-                    draft_tp_context(self.draft_worker.draft_owns_attention),
+                    draft_tp_context(self.draft_worker.parallel_layout),
                     speculative_moe_backend_context(),
                     speculative_moe_a2a_backend_context(),
                     spec_stage_span("draft"),
@@ -1480,7 +1495,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 self._stub_skipped_draft_extend(batch, batch_output)
             else:
                 with (
-                    draft_tp_context(self.draft_worker.draft_owns_attention),
+                    draft_tp_context(self.draft_worker.parallel_layout),
                     speculative_moe_backend_context(),
                     speculative_moe_a2a_backend_context(),
                     spec_stage_span("draft_extend"),
@@ -1512,7 +1527,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 batch.seq_lens_cpu = batch_output.new_seq_lens.to("cpu")
                 batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
                 with (
-                    draft_tp_context(self.draft_worker.draft_owns_attention),
+                    draft_tp_context(self.draft_worker.parallel_layout),
                     speculative_moe_backend_context(),
                     speculative_moe_a2a_backend_context(),
                     spec_stage_span("draft"),
@@ -1566,13 +1581,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 get_parallel().attn_dp_rank,
                 local_only=(
                     len(batch.global_num_tokens) == 1
-                    or self.draft_worker.draft_owns_attention
+                    or self.draft_worker.parallel_layout.local_dp
                 ),
             )
 
         # Draft prefill
         with (
-            draft_tp_context(self.draft_worker.draft_owns_attention),
+            draft_tp_context(self.draft_worker.parallel_layout),
             speculative_moe_backend_context(),
             speculative_moe_a2a_backend_context(),
             spec_stage_span("draft_extend"),
@@ -1597,7 +1612,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             target_local_only
             if batch.draft_global_num_tokens is None
             else len(batch.draft_global_num_tokens) == 1
-        ) or self.draft_worker.draft_owns_attention
+        ) or self.draft_worker.parallel_layout.local_dp
         is_prefill = batch.forward_mode.is_extend()
         draft_batch = batch
         if is_prefill:
@@ -1628,7 +1643,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             )
         plan.apply(draft_batch, "draft", rank, local_only=draft_local_only)
         with (
-            draft_tp_context(self.draft_worker.draft_owns_attention),
+            draft_tp_context(self.draft_worker.parallel_layout),
             speculative_moe_backend_context(),
             speculative_moe_a2a_backend_context(),
             spec_stage_span("draft"),
@@ -1652,7 +1667,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             on_publish(result.new_seq_lens)
         plan.apply(batch, "draft_extend", rank, local_only=draft_local_only)
         with (
-            draft_tp_context(self.draft_worker.draft_owns_attention),
+            draft_tp_context(self.draft_worker.parallel_layout),
             speculative_moe_backend_context(),
             speculative_moe_a2a_backend_context(),
             spec_stage_span("draft_extend"),
