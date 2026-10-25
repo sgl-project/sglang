@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import enum
+import functools
 from typing import Callable, Iterable, List, Tuple
 
 import numpy as np
@@ -24,6 +25,7 @@ class MooncakeBufferKey(BufferKey):
 
     def __init__(self, kind: BufferKind, index: int, sub: int = 0):
         self._value = (BufferKind(kind), index, sub)
+        self._hash = hash(self._value)
 
     @property
     def kind(self) -> BufferKind:
@@ -33,7 +35,7 @@ class MooncakeBufferKey(BufferKey):
         return isinstance(other, MooncakeBufferKey) and self._value == other._value
 
     def __hash__(self) -> int:
-        return hash(self._value)
+        return self._hash
 
     def __repr__(self) -> str:
         kind, index, sub = self._value
@@ -46,16 +48,10 @@ def kv_args_buffers(
     state_data_ptrs: List[List[int]],
 ) -> List[Tuple[MooncakeBufferKey, int]]:
     """Key every buffer a registration message lists, in the order it lists them."""
-    entries = [
-        (MooncakeBufferKey(BufferKind.KV, i), p) for i, p in enumerate(kv_data_ptrs)
-    ]
-    entries += [
-        (MooncakeBufferKey(BufferKind.AUX, i), p) for i, p in enumerate(aux_data_ptrs)
-    ]
+    entries = [(kv_key(i), p) for i, p in enumerate(kv_data_ptrs)]
+    entries += [(aux_key(i), p) for i, p in enumerate(aux_data_ptrs)]
     for i, ptrs in enumerate(state_data_ptrs):
-        entries += [
-            (MooncakeBufferKey(BufferKind.STATE, i, j), p) for j, p in enumerate(ptrs)
-        ]
+        entries += [(_state_key(i, j), p) for j, p in enumerate(ptrs)]
     return entries
 
 
@@ -74,17 +70,27 @@ def group_units(src_groups, dst_groups) -> npt.NDArray[np.uint64]:
     ).reshape(-1, 3)
 
 
+# Send paths name every copied buffer on every transfer, so each key is built
+# once per process and reused.
+@functools.cache
 def kv_key(index: int) -> MooncakeBufferKey:
     return MooncakeBufferKey(BufferKind.KV, index)
 
 
+@functools.cache
 def aux_key(index: int) -> MooncakeBufferKey:
     return MooncakeBufferKey(BufferKind.AUX, index)
 
 
+@functools.cache
+def _state_key(state_index: int, index: int) -> MooncakeBufferKey:
+    return MooncakeBufferKey(BufferKind.STATE, state_index, index)
+
+
+@functools.cache
 def state_keys(state_index: int) -> Callable[[int], MooncakeBufferKey]:
     """Key of each tensor of the state type at `state_index` in kv_args.state_types."""
-    return lambda index: MooncakeBufferKey(BufferKind.STATE, state_index, index)
+    return functools.partial(_state_key, state_index)
 
 
 # A decode registers a single staging ring.
