@@ -51,6 +51,7 @@ from sglang.srt.multimodal.qwen_vl_media_processing import (
 from sglang.srt.multimodal.qwen_vl_media_processing import (
     smart_nframes as smart_nframes,
 )
+from sglang.srt.multimodal.qwen_vl_media_processing import smart_resize as smart_resize
 from sglang.srt.multimodal.transport.cuda_ipc import (
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
 )
