@@ -36,6 +36,30 @@ def preprocessing_competes_with_the_scheduler(
     return platform.is_cuda_alike()
 
 
+def resolve_auto_mm_processor_worker_num(
+    *, competes_with_the_scheduler: bool, declared: Optional[int]
+) -> int:
+    """The worker count to use when the user did not ask for one.
+
+    Two workers overlap preprocessing that runs on the CPU, where the second
+    thread is real parallelism: measured on Qwen2.5-VL with full-page images
+    at 32-way concurrency, 4.46 -> 6.08 req/s on H200 and 7.07 -> 8.76 on
+    GB300.
+
+    The GPU path is capped at one worker even when a model declares more.
+    A declaration records what its author measured on one platform and one
+    image shape; contending for the device the scheduler is serving from is a
+    property of the path itself, and it does not go away because a subclass
+    asked for concurrency. Qwen-VL declares two and is the model that
+    measures 9.30 -> 4.02 req/s on GB300 full-page images, so honouring the
+    declaration here would exempt exactly the case that regresses.
+    `--mm-processor-worker-num` still overrides this.
+    """
+    if competes_with_the_scheduler:
+        return 1
+    return 2 if declared is None else declared
+
+
 def fast_image_processor_device(processor, *, base_gpu_id: int) -> Optional[str]:
     """The device for the fast image processor, or None to leave it unset."""
     if _is_cpu or get_exec().deterministic.rl_on_policy_target is not None:
