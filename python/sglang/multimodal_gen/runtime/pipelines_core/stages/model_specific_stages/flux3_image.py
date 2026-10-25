@@ -26,7 +26,9 @@ from sglang.multimodal_gen.runtime.distributed.cfg_policy import (
     CFGPolicy,
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_sp_group,
     get_sp_world_size,
+    get_tp_group,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import (
     get_forward_context,
@@ -157,13 +159,21 @@ def resolve_sequential_cfg(
         for sample in range(packed.num_samples)
     ]
     free, _ = torch.cuda.mem_get_info(packed.data["image"].device)
+    # Ranks must agree: packed CFG runs one forward per step and sequential CFG
+    # two, so a split decision pairs mismatched TP/SP collectives.
+    free = torch.tensor([free], dtype=torch.int64)
+    for group in (get_tp_group(), get_sp_group()):
+        if group.world_size > 1:
+            torch.distributed.all_reduce(
+                free, op=torch.distributed.ReduceOp.MIN, group=group.cpu_group
+            )
     activation = (
         packed.num_samples
         * max(tokens_per_sample)
         * int(hidden_size)
         * torch.bfloat16.itemsize
     )
-    return activation * _CFG_ACT_STACK >= free
+    return activation * _CFG_ACT_STACK >= int(free)
 
 
 @contextmanager
