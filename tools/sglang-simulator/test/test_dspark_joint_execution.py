@@ -161,6 +161,23 @@ def resolve(case, data):
     )
 
 
+def test_profile_cannot_omit_native_intermediate_capture_bucket(case):
+    # B2 would otherwise round to the still-materialized B4 graph. Checking
+    # membership of only the selected key cannot prove the native bucket choice.
+    profile = replace(
+        case.profiles["DECODE"],
+        graph_capture_batches=tuple(
+            size for size in case.profiles["DECODE"].graph_capture_batches if size != 2
+        ),
+    )
+    with pytest.raises(PredictorError, match="complete capture inventory"):
+        NativeJointExecutionResolver(
+            source_policy=case.policy,
+            runtime_profile_json=case.runtime,
+            profiles={**case.profiles, "DECODE": profile},
+        )
+
+
 def query(case, resolved):
     from infercast.sdk.native_joint_forward import NativeJointForwardQuery
 

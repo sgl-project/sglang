@@ -91,6 +91,29 @@ class NativeJointExecutionResolver:
             )
             graph = role["graph"]
             disabled = validate_native_padding_receipt(graph["padding_policy"])
+            keys = graph["graph_keys"]
+            expected_keys = {
+                canonical(
+                    {
+                        "size": size,
+                        "stream_idx": None,
+                        "variant_label": None,
+                        "attention_variant": variant,
+                    }
+                )
+                for size in profiles["DECODE"].graph_capture_batches
+                for variant in (
+                    (None,)
+                    if kind == "draft"
+                    else ("candidate_filtered", "candidate_unfiltered")
+                )
+            }
+            _require(
+                type(keys) is list
+                and len(keys) == len(expected_keys)
+                and {canonical(key) for key in keys} == expected_keys,
+                "complete capture inventory differs from the decode profile",
+            )
             _require(
                 disabled
                 == (profiles["DECODE"].graph_batch_policy == "exact_capture_only")
