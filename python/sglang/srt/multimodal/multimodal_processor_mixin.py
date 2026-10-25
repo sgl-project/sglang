@@ -45,6 +45,9 @@ class MultimodalProcessorMixin:
     precompute_hash_before_cpu_transfer = False
     keep_mm_features_on_device = False
 
+    def _io_thread_initializer(self):
+        return None
+
     def _initialize_processor(self, hf_config, _processor, *, processor_config):
         self.hf_config = hf_config
         self._processor = _processor
@@ -92,6 +95,7 @@ class MultimodalProcessorMixin:
         self.io_executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=self.mm_io_worker_num,
             thread_name_prefix="sglang-mm-io",
+            initializer=self._io_thread_initializer(),
         )
         if self.mm_io_worker_num > 4:
             logger.info(

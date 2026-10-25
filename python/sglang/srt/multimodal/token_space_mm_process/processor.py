@@ -2,6 +2,8 @@ import asyncio
 import functools
 import logging
 
+import torch
+
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.multimodal_processor_mixin import (
     MultimodalProcessorMixin,
@@ -47,9 +49,11 @@ class TokenSpaceProcessor(MultimodalProcessorMixin):
         *,
         processor_config=None,
         compute_mrope_positions=False,
+        pin_io_threads_to_current_device=True,
         **kwargs,
     ):
         strategy_class = self.strategy_class
+        self._pin_io_threads_to_current_device = pin_io_threads_to_current_device
         if processor_config is None:
             processor_config = MultimodalProcessorConfig()
         self._initialize_processor(
@@ -62,6 +66,16 @@ class TokenSpaceProcessor(MultimodalProcessorMixin):
         )
         # Off by default: Megatron Bridge and similar trainers compute positions themselves.
         self._compute_mrope_positions = compute_mrope_positions
+
+    def _io_thread_initializer(self):
+        # Loaders decode on device "cuda", which a new thread resolves to cuda:0
+        # whatever device this trainer rank selected.
+        if (
+            not self._pin_io_threads_to_current_device
+            or not torch.cuda.is_initialized()
+        ):
+            return None
+        return functools.partial(torch.cuda.set_device, torch.cuda.current_device())
 
     async def process(
         self,
