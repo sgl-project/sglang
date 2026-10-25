@@ -358,7 +358,7 @@ class TestKVIndexTranslatorDraftDisposition(unittest.TestCase):
                 prepare_context_hidden_for_kv=lambda layer, h: h,
                 layers=[SimpleNamespace(self_attn=attn)],
             ),
-            draft_owns_attention=False,
+            draft_parallel_layout=SimpleNamespace(tp_group=None),
             lilicorr=None,
             _use_fused_kv_materialize=False,
             _fused_kv_helper=None,
