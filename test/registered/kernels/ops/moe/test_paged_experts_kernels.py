@@ -156,7 +156,6 @@ class TestPagedExpertsKernels(CustomTestCase):
             for s, e in enumerate(ref.slot_expert):
                 self.assertTrue(torch.equal(gpu[s].cpu(), host[e]))
 
-
     def test_a_planned_page_in_matches_the_copies(self):
         """A host-planned wave paged in through its GPU plan, in one gather launch, leaves the
         same slots as one copy per expert and tensor; an empty wave launches nothing."""
@@ -192,7 +191,8 @@ class TestPagedExpertsKernels(CustomTestCase):
         )
 
         store.page_in(planned, loads, plan=plan)
-        stale = (plan[0].flip(0), plan[1], plan[2])  # would put other experts in the slots
+        # A plan that would put other experts in the slots.
+        stale = (plan[0].flip(0), plan[1], plan[2])
         store.page_in(planned, [], plan=stale)  # no page-ins: the plan is not read
         store.page_in(copied, loads)
         torch.cuda.synchronize()
