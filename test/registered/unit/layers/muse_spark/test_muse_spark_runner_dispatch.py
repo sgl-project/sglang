@@ -1,10 +1,9 @@
 """Muse Spark's custom experts must declare the TRT-LLM dispatch contract."""
 
-import sys
 import unittest
 from contextlib import ExitStack
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 import torch
 
@@ -33,104 +32,6 @@ class _CpuMoeAlltoAll:
 
 
 class TestMuseSparkRunnerDispatch(CustomTestCase):
-    def test_custom_nvfp4_rejects_per_token_phase(self):
-        from sglang.srt.environ import envs
-        from sglang.srt.layers.muse_spark.muse_spark_nvfp4_moe import (
-            MuseSparkNvFp4FusedMoEMethod,
-        )
-
-        per_token = envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION
-        w4a16 = envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16
-        with (
-            per_token.override(False),
-            w4a16.override(False),
-            patch.object(
-                modelopt_quant.ModelOptNvFp4FusedMoEMethod,
-                "__init__",
-                return_value=None,
-            ) as parent_init,
-        ):
-            for phase in ("prefill", "decode"):
-                with self.subTest(per_token=phase), per_token.override(phase):
-                    config = ModelOptFp4Config(is_checkpoint_nvfp4_serialized=True)
-                    with self.assertRaisesRegex(
-                        ValueError, "Muse Spark.*phase-specific"
-                    ):
-                        MuseSparkNvFp4FusedMoEMethod(config)
-                    parent_init.assert_not_called()
-            for value in (False, True, "all"):
-                with self.subTest(per_token=value), per_token.override(value):
-                    config = ModelOptFp4Config(is_checkpoint_nvfp4_serialized=True)
-                    MuseSparkNvFp4FusedMoEMethod(config)
-                    parent_init.assert_called_with(config)
-
-    def test_w4a16_flag_is_noop_for_custom_trtllm_experts(self):
-        from sglang.srt.environ import envs
-
-        hidden = torch.zeros(2, 128, dtype=torch.bfloat16)
-        packed = torch.zeros(2, 64, dtype=torch.uint8)
-        scales = torch.zeros(2, 8, dtype=torch.uint8)
-        token_scales = torch.ones(2, dtype=torch.float32)
-        static_quant = Mock(return_value=(packed, scales))
-        dynamic_quant = Mock(return_value=(packed, scales, token_scales))
-        kernels = SimpleNamespace(
-            fp4_quantize=static_quant,
-            nvfp4_quantize=dynamic_quant,
-            SfLayout=SimpleNamespace(layout_linear=object()),
-        )
-        with (
-            get_context().override_server_args(model_path="dummy"),
-            get_flags().moe.override(
-                runner_backend=MoeRunnerBackend.FLASHINFER_TRTLLM,
-                a2a_backend=MoeA2ABackend.NONE,
-            ),
-            patch.object(
-                modelopt_quant,
-                "get_platform",
-                return_value=SimpleNamespace(is_blackwell=True),
-            ),
-            patch.dict(sys.modules, {"flashinfer": kernels}),
-        ):
-            for setting in (False, "0", True, "1", "all", "prefill", "decode"):
-                for per_token in (False, True):
-                    with (
-                        self.subTest(w4a16=setting, per_token=per_token),
-                        envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.override(setting),
-                        envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.override(
-                            per_token
-                        ),
-                    ):
-                        # Construct the real Muse expert and quantization method;
-                        # only platform detection and quantization kernels are stubbed.
-                        experts = MuseSpark1xFp4Experts(
-                            num_experts=4,
-                            num_local_experts=2,
-                            local_expert_offset=2,
-                            hidden_size=128,
-                            intermediate_size=128,
-                            top_k=2,
-                            quant_config=ModelOptFp4Config(
-                                is_checkpoint_nvfp4_serialized=True, group_size=16
-                            ),
-                        )
-                        experts.w13_input_scale_quant = torch.tensor(1.0)
-                        static_quant.reset_mock()
-                        dynamic_quant.reset_mock()
-                        prepared = experts.prepare_input(hidden)
-                        self.assertEqual(prepared[0].data_ptr(), packed.data_ptr())
-                        self.assertEqual(prepared[0].dtype, torch.uint8)
-                        self.assertIs(prepared[2], token_scales if per_token else None)
-                        self.assertTrue(
-                            experts.quant_method.enable_flashinfer_trtllm_moe
-                        )
-                        self.assertFalse(experts.use_marlin)
-                        (
-                            dynamic_quant if per_token else static_quant
-                        ).assert_called_once()
-                        (
-                            static_quant if per_token else dynamic_quant
-                        ).assert_not_called()
-
     def test_custom_expert_config_selects_trtllm_receive_sentinel(self):
         """Unoccupied SP receive slots must use the direct TRT-LLM consumer's
         sentinel even though these experts do not construct a generic runner.

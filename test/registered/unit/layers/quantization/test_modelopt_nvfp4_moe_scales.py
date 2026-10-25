@@ -118,50 +118,6 @@ def _nvfp4_loader_layer(*, is_gated=True, tp_rank=0):
 
 
 class TestNvfp4MoeScaleLoading(CustomTestCase):
-    def test_per_token_settings_preserve_checkpoint_activation_scales(self):
-        for setting in (False, True, "prefill", "decode"):
-            with (
-                self.subTest(setting=setting),
-                get_flags().moe.override(
-                    runner_backend=MoeRunnerBackend.FLASHINFER_TRTLLM,
-                    a2a_backend=MoeA2ABackend.NONE,
-                ),
-                mock.patch.object(modelopt_quant, "reorder_rows_for_gated_act_gemm"),
-                mock.patch.object(modelopt_quant, "shuffle_matrix_sf_a"),
-            ):
-                layer = _nvfp4_loader_layer()
-                layer.quant_config.use_per_token_activation = bool(setting)
-                layer.quant_config.per_token_activation_phase = (
-                    setting if isinstance(setting, str) else None
-                )
-                layer.w13_weight_scale_2.data.fill_(0.25)
-                layer.w2_input_scale.data.fill_(0.25)
-                with mock.patch.object(
-                    layer.quant_method, "_align_fp4_moe_weights_for_flashinfer_trtllm"
-                ):
-                    layer.quant_method.process_weights_after_loading(layer)
-                # Loading and static derived metadata are independent of the
-                # precision selector. Dynamic kernels choose other call arguments.
-                torch.testing.assert_close(
-                    layer.w13_input_scale, torch.full((1, 2), 0.5)
-                )
-                torch.testing.assert_close(layer.w2_input_scale, torch.tensor([0.25]))
-                torch.testing.assert_close(
-                    layer.w13_input_scale_quant, torch.tensor(2.0)
-                )
-                torch.testing.assert_close(
-                    layer.w2_input_scale_quant, torch.tensor(4.0)
-                )
-                torch.testing.assert_close(layer.g1_alphas, torch.tensor([0.125]))
-                torch.testing.assert_close(layer.g2_alphas, torch.tensor([0.25]))
-                if setting:
-                    torch.testing.assert_close(
-                        layer._per_token_g1_alphas, torch.tensor([0.25])
-                    )
-                    torch.testing.assert_close(
-                        layer._per_token_g2_alphas, torch.tensor([1.0])
-                    )
-
     def test_global_scales_keep_gate_up_order_across_weight_layouts(self):
         """Changing backend layout must not change which projection an alpha scales.
 

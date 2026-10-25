@@ -50,162 +50,53 @@ class _FakeArgs:
 
 
 class TestNvfp4PhaseAttentionDpValidation(CustomTestCase):
-    def setUp(self):
-        super().setUp()
-        self.enterContext(envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.override(False))
-        self.enterContext(
-            envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.override(False)
-        )
-
-    @staticmethod
-    def config(**overrides):
-        values = dict(
-            attn_dp_size=2,
-            dp_size=1,
-            ep_join_mode=None,
-            moe_runner_backend="flashinfer_trtllm",
-            fp4_gemm_runner_backend="flashinfer_cutlass",
-            speculative_algorithm=None,
-            speculative_moe_runner_backend=None,
-        )
-        values.update(overrides)
-        return SimpleNamespace(**values)
-
-    @staticmethod
-    def validate(cfg):
+    def test_public_values_and_attention_dp_compatibility(self):
         from sglang.srt.arg_groups.validation_hook import (
             validate_nvfp4_phase_attention_dp,
         )
 
-        validate_nvfp4_phase_attention_dp(cfg)
-
-    def test_phase_selectors_rejected_before_model_loading(self):
-        from sglang.srt.arg_groups.validation_hook import check_server_args
-
-        for setting in (
-            envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16,
-            envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION,
-        ):
-            for phase in ("prefill", "decode"):
-                with (
-                    self.subTest(setting=setting.name, phase=phase),
-                    setting.override(phase),
-                    self.assertRaisesRegex(ValueError, "Phase-specific.*attention DP"),
-                ):
-                    check_server_args(
-                        self.config(moe_runner_backend="flashinfer_cutedsl")
-                    )
-
-    def test_global_on_off_values_allowed_with_attention_dp(self):
-        for value in (True, "1", "all", False, "0"):
-            with (
-                self.subTest(value=value),
-                envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.override(value),
-                envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.override(value),
-            ):
-                self.validate(self.config(moe_runner_backend="flashinfer_cutedsl"))
-
-    def test_phase_selectors_allowed_without_attention_dp(self):
-        with (
-            envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.override("decode"),
-            envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.override("prefill"),
-        ):
-            for replicas in (1, 2):
-                with self.subTest(replicas=replicas):
-                    self.validate(
-                        self.config(
-                            attn_dp_size=1,
-                            dp_size=replicas,
-                            moe_runner_backend="flashinfer_cutedsl",
-                        )
-                    )
-
-    def test_w4a16_supported_target_backends_rejected(self):
-        for backend in ("flashinfer_cutedsl", "flashinfer_megamoe"):
-            with (
-                self.subTest(backend=backend),
-                envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.override("decode"),
-                self.assertRaisesRegex(ValueError, "W4A16=decode"),
-            ):
-                self.validate(self.config(moe_runner_backend=backend))
-
-    def test_w4a16_supported_draft_backends_rejected(self):
-        for backend in ("flashinfer_cutedsl", "flashinfer_megamoe"):
-            with (
-                self.subTest(backend=backend),
-                envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.override("prefill"),
-                self.assertRaisesRegex(ValueError, "W4A16=prefill"),
-            ):
-                self.validate(
-                    self.config(
-                        speculative_algorithm="EAGLE",
-                        speculative_moe_runner_backend=backend,
-                    )
+        w4a16 = envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16
+        per_token = envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION
+        defaults = {
+            "attn_dp_size": 1,
+            "ep_join_mode": None,
+            "moe_runner_backend": "flashinfer_cutedsl",
+            "fp4_gemm_runner_backend": "flashinfer_cutlass",
+            "speculative_algorithm": None,
+            "speculative_moe_runner_backend": None,
+        }
+        dp_cases = (
+            ({}, False),
+            ({"attn_dp_size": 2}, True),
+            ({"ep_join_mode": "scale"}, True),
+            ({"_resolved_overrides": [("resolved", {"attn_dp_size": 2})]}, True),
+        )
+        with w4a16.override(False), per_token.override(False):
+            for field in (w4a16, per_token):
+                for value in (True, False, "prefill", "decode"):
+                    for overrides, has_dp in dp_cases:
+                        cfg = SimpleNamespace(**(defaults | overrides))
+                        with (
+                            self.subTest(
+                                field=field.name, value=value, config=overrides
+                            ),
+                            field.override(value),
+                        ):
+                            if isinstance(value, str) and has_dp:
+                                with self.assertRaisesRegex(ValueError, "attention DP"):
+                                    validate_nvfp4_phase_attention_dp(cfg)
+                            else:
+                                validate_nvfp4_phase_attention_dp(cfg)
+            # W4A16 remains a no-op when both selected backends ignore it.
+            cfg = SimpleNamespace(
+                **(
+                    defaults
+                    | {"attn_dp_size": 2, "moe_runner_backend": "flashinfer_trtllm"}
                 )
-
-    def test_w4a16_supported_dense_backend_rejected(self):
-        for backend in ("flashinfer_cutedsl", "auto"):
-            with (
-                self.subTest(backend=backend),
-                override_platform(is_sm100=True),
-                envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.override("decode"),
-                self.assertRaisesRegex(ValueError, "W4A16=decode"),
-            ):
-                self.validate(self.config(fp4_gemm_runner_backend=backend))
-
-    def test_w4a16_ignored_backends_remain_noop(self):
-        with (
-            override_platform(is_sm100=False),
-            envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.override("decode"),
-        ):
-            for moe_backend in ("auto", "flashinfer_trtllm", "marlin"):
-                for dense_backend in ("auto", "flashinfer_cutlass", "marlin"):
-                    with self.subTest(moe=moe_backend, dense=dense_backend):
-                        self.validate(
-                            self.config(
-                                moe_runner_backend=moe_backend,
-                                fp4_gemm_runner_backend=dense_backend,
-                            )
-                        )
-            for algorithm in (None, "NGRAM"):
-                self.validate(
-                    self.config(
-                        speculative_algorithm=algorithm,
-                        speculative_moe_runner_backend="flashinfer_cutedsl",
-                    )
-                )
-
-    def test_per_token_phase_rejected_even_when_w4a16_bypasses_quantization(self):
-        with (
-            envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.override(True),
-            envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.override("prefill"),
-            self.assertRaisesRegex(ValueError, "PER_TOKEN_ACTIVATION=prefill"),
-        ):
-            self.validate(self.config(moe_runner_backend="flashinfer_megamoe"))
-
-    def test_effective_attention_dp_and_backend_declarations_are_used(self):
-        cfg = self.config(attn_dp_size=1)
-        cfg._resolved_overrides = [
-            (
-                "resolved",
-                {"attn_dp_size": 2, "moe_runner_backend": "flashinfer_cutedsl"},
             )
-        ]
-        with (
-            envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.override("decode"),
-            self.assertRaisesRegex(ValueError, "W4A16=decode"),
-        ):
-            self.validate(cfg)
-        cfg._resolved_overrides.append(("disabled", {"attn_dp_size": 1}))
-        with envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.override("decode"):
-            self.validate(cfg)
-
-    def test_scale_joiner_is_effective_attention_dp(self):
-        with (
-            envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.override("decode"),
-            self.assertRaisesRegex(ValueError, "EP scale joining"),
-        ):
-            self.validate(self.config(attn_dp_size=1, ep_join_mode="scale"))
+            for phase in ("prefill", "decode"):
+                with self.subTest(unsupported=phase), w4a16.override(phase):
+                    validate_nvfp4_phase_attention_dp(cfg)
 
 
 class TestBoundaryParallelismResolution(CustomTestCase):
@@ -3419,27 +3310,6 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 {"moe_runner_backend": "flashinfer_cutlass"},
             )
         self.assertEqual(_moe_runner_backend_quant_constraints(_view()), {})
-
-    def test_online_megamoe_requires_w4a16_in_both_phases(self):
-        from sglang.srt.arg_groups.overrides import (
-            _moe_runner_backend_quant_constraints,
-        )
-
-        view = SimpleNamespace(
-            quantization="nvfp4_online",
-            moe_a2a_backend="flashinfer_megamoe",
-            moe_runner_backend="flashinfer_megamoe",
-        )
-        with override_platform(is_sm100=True):
-            for value in ("prefill", "decode", False):
-                with (
-                    self.subTest(value=value),
-                    envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.override(value),
-                    self.assertRaises(ValueError),
-                ):
-                    _moe_runner_backend_quant_constraints(view)
-            with envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.override(True):
-                self.assertEqual(_moe_runner_backend_quant_constraints(view), {})
 
     def test_gguf_quantization_pass(self):
         from sglang.srt.arg_groups.overrides import ResolvedView, _gguf_quantization

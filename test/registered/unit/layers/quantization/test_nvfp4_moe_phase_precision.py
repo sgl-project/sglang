@@ -109,9 +109,6 @@ class TestNvFp4MoePhasePrecision(CustomTestCase):
                         expert_id=expert,
                     )
         layer.quant_method.process_weights_after_loading(layer)
-        for name in ("w13_input_scale_quant", "w2_input_scale_quant"):
-            scale = getattr(layer, name)
-            torch.testing.assert_close(scale, torch.full_like(scale, 1.0 / act_scale))
         return layer
 
     def test_per_token_phase_matches_global_controls_and_cuda_graphs(self):

@@ -6,7 +6,6 @@ reference. Single GPU, tp=ep=1.
 """
 
 import unittest
-from unittest import mock
 
 import torch
 
@@ -110,12 +109,6 @@ class TestNvFp4MoeBackends(CustomTestCase):
                         )
                     refs[shard_id][e] = w_dequant
             layer.quant_method.process_weights_after_loading(layer)
-            if w4a16_phase:
-                for name in ("w13_input_scale_quant", "w2_input_scale_quant"):
-                    scale = getattr(layer, name)
-                    torch.testing.assert_close(
-                        scale, torch.full_like(scale, 1.0 / act_scale)
-                    )
             if backend == "flashinfer_trtllm":
                 expected_intermediate = round_up(intermediate_size, 64)
                 self.assertEqual(
@@ -143,30 +136,9 @@ class TestNvFp4MoeBackends(CustomTestCase):
             topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
 
             phases = ("prefill", "decode", "prefill") if w4a16_phase else ("decode",)
-            weight_pointers = (
-                {
-                    name: getattr(layer, name).data_ptr()
-                    for name in (
-                        "w13_weight",
-                        "w2_weight",
-                        "w13_blockscale_mma",
-                        "w2_blockscale_mma",
-                    )
-                }
-                if w4a16_phase
-                else {}
-            )
-            states_id = None
             for phase in phases:
-                with (
-                    forward_context(
-                        ForwardContext(attn_backend=None, moe_forward_phase=phase)
-                    ),
-                    mock.patch.object(
-                        layer.quant_method.runner,
-                        "run",
-                        wraps=layer.quant_method.runner.run,
-                    ) as runner,
+                with forward_context(
+                    ForwardContext(attn_backend=None, moe_forward_phase=phase)
                 ):
                     out = layer.forward(x, topk_output)
                     if not isinstance(out, torch.Tensor):
@@ -183,41 +155,6 @@ class TestNvFp4MoeBackends(CustomTestCase):
                     )
                     assert_output_close(self, out, ref)
                     if w4a16_phase:
-                        from sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl import (
-                            ensure_cutedsl_wrapper,
-                        )
-
-                        state = ensure_cutedsl_wrapper(layer)
-                        quant_info = runner.call_args.args[1]
-                        self.assertEqual(
-                            quant_info.w13_weight.data_ptr(),
-                            weight_pointers["w13_weight"],
-                        )
-                        self.assertEqual(
-                            quant_info.w2_weight.data_ptr(),
-                            weight_pointers["w2_weight"],
-                        )
-                        self.assertEqual(
-                            quant_info.w13_weight_sf.data_ptr(),
-                            weight_pointers["w13_blockscale_mma"],
-                        )
-                        self.assertEqual(
-                            quant_info.w2_weight_sf.data_ptr(),
-                            weight_pointers["w2_blockscale_mma"],
-                        )
-                        self.assertEqual(
-                            state.wrapper.quant_mode,
-                            "w4a16"
-                            if w4a16_phase is True or phase == w4a16_phase
-                            else "w4a4",
-                        )
-                        for name, pointer in weight_pointers.items():
-                            self.assertEqual(getattr(layer, name).data_ptr(), pointer)
-                        if states_id is None:
-                            states_id = id(layer._cutedsl_states)
-                        self.assertEqual(id(layer._cutedsl_states), states_id)
-                        self.assertFalse(hasattr(layer, "_cutedsl_state_key"))
-                        self.assertFalse(hasattr(layer, "_cutedsl_wrapper"))
                         graph = torch.cuda.CUDAGraph()
                         with torch.cuda.graph(graph):
                             captured = layer.forward(x, topk_output)

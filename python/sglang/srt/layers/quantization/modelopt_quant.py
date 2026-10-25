@@ -2857,22 +2857,13 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             self._is_cutedsl_v2_standard or moe_runner_backend.is_flashinfer_megamoe()
         ) and envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get() is True
 
-        # Always retain the checkpoint's calibrated activation metadata. Kernels
-        # that use online per-token scales or BF16 activations bypass it below.
-        # g1_alphas / g1_alphas_up are the gate (w1) and up (w3) GEMM1 scales
-        # (equal for shared-scale checkpoints).
-        g1_alphas, g1_alphas_up = _compute_gemm1_alphas(
-            layer.w13_weight_scale_2,
-            w13_input_scale,
-            layer.moe_runner_config.is_gated,
+        # Keep checkpoint activation scales and both small scalar variants.
+        # Static W4A4 uses weight * activation scales; per-token/W4A16 kernels
+        # use weight-only scales. No weight buffers change between these modes.
+        weight_g1, weight_g1_up = _compute_gemm1_alphas(
+            layer.w13_weight_scale_2, 1.0, layer.moe_runner_config.is_gated
         )
-        copy_or_rebind_param(layer, "g1_alphas", g1_alphas)
-        copy_or_rebind_param(layer, "g1_alphas_up", g1_alphas_up)
-        copy_or_rebind_param(
-            layer,
-            "g2_alphas",
-            (w2_input_scale * layer.w2_weight_scale_2).to(torch.float32),
-        )
+        weight_g2 = layer.w2_weight_scale_2.to(torch.float32)
         copy_or_rebind_param(
             layer,
             "w13_input_scale_quant",
@@ -2883,113 +2874,87 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             "w2_input_scale_quant",
             (1 / w2_input_scale).to(torch.float32),
         )
-        if layer.moe_runner_config.is_gated and self.enable_flashinfer_trtllm_moe:
-            runner_config = layer.moe_runner_config
-            is_situ = runner_config.activation == "situ"
-            gemm1_clamp_limit = (
-                None
-                if is_situ
-                else (runner_config.gemm1_clamp_limit or runner_config.swiglu_limit)
+        variants = [
+            (
+                "",
+                weight_g1 * w13_input_scale,
+                weight_g1_up * w13_input_scale,
+                weight_g2 * w2_input_scale,
             )
-            if gemm1_clamp_limit is not None:
-                # The kernel clamps both raw halves with one limit, so move both onto
-                # the larger alpha by rescaling the smaller half's E4M3 block scales.
-                untied = layer.g1_alphas != layer.g1_alphas_up
-                if untied.any():
-                    shared_alphas = torch.maximum(layer.g1_alphas, layer.g1_alphas_up)
-                    # Block-scale rows are [up, gate] in the TRT-LLM weight layout.
-                    ratios = torch.stack([layer.g1_alphas_up, layer.g1_alphas], dim=1)
-                    ratios = torch.where(
-                        untied[:, None], ratios / shared_alphas[:, None], 1.0
-                    )
-                    block_scales = layer.w13_weight_scale.data.unflatten(1, (2, -1))
-                    block_scales.copy_(
-                        block_scales.float().mul_(ratios[:, :, None, None])
-                    )
-                    copy_or_rebind_param(layer, "g1_alphas", shared_alphas)
-                    copy_or_rebind_param(layer, "g1_alphas_up", shared_alphas)
-                copy_or_rebind_param(
-                    layer,
-                    "gemm1_clamp_limit",
-                    (gemm1_clamp_limit / layer.g1_alphas).to(torch.float32),
-                )
-
-            if runner_config.gemm1_alpha is not None:
-                copy_or_rebind_param(
-                    layer,
-                    "gemm1_alpha",
-                    torch.full_like(
-                        layer.g1_alphas,
-                        runner_config.gemm1_alpha,
-                        dtype=torch.float32,
-                    ),
-                )
-                # SwiGLU adds beta to the raw up half before dequantization.
-                gemm1_beta = (
-                    torch.full_like(
-                        layer.g1_alphas,
-                        runner_config.gemm1_clamp_limit,
-                        dtype=torch.float32,
-                    )
-                    if is_situ
-                    else (1.0 / layer.g1_alphas_up).to(torch.float32)
-                )
-                copy_or_rebind_param(layer, "gemm1_beta", gemm1_beta)
-
+        ]
         if (
             self.enable_flashinfer_trtllm_moe
             and self.quant_config.use_per_token_activation
         ):
-            from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
-                _compute_g1_scale_c,
-            )
+            variants.append(("_per_token_", weight_g1, weight_g1_up, weight_g2))
 
-            # Online scales replace checkpoint activation calibration. Derive
-            # weight-only alphas directly, including the common gate/up scale
-            # used above when custom activation clamps rescale block scales.
-            dynamic_g1, dynamic_up = _compute_gemm1_alphas(
-                layer.w13_weight_scale_2, 1.0, layer.moe_runner_config.is_gated
-            )
-            runner_config = layer.moe_runner_config
-            is_situ = runner_config.activation == "situ"
-            dynamic_clamp = (
-                None
-                if is_situ or not runner_config.is_gated
-                else (runner_config.gemm1_clamp_limit or runner_config.swiglu_limit)
-            )
-            if dynamic_clamp is not None:
-                dynamic_g1 = dynamic_up = torch.maximum(dynamic_g1, dynamic_up)
+        runner_config = layer.moe_runner_config
+        for prefix, g1_alphas, g1_alphas_up, g2_alphas in variants:
+            if runner_config.is_gated and self.enable_flashinfer_trtllm_moe:
+                is_situ = runner_config.activation == "situ"
+                clamp_limit = (
+                    None
+                    if is_situ
+                    else (runner_config.gemm1_clamp_limit or runner_config.swiglu_limit)
+                )
+                if clamp_limit is not None:
+                    shared_alphas = torch.maximum(g1_alphas, g1_alphas_up)
+                    if not prefix:
+                        # Both variants use the same block-scale correction.
+                        # Apply it once; TRT-LLM rows are [up, gate].
+                        untied = g1_alphas != g1_alphas_up
+                        if untied.any():
+                            ratios = torch.stack([g1_alphas_up, g1_alphas], dim=1)
+                            ratios = torch.where(
+                                untied[:, None], ratios / shared_alphas[:, None], 1.0
+                            )
+                            block_scales = layer.w13_weight_scale.data.unflatten(
+                                1, (2, -1)
+                            )
+                            block_scales.copy_(
+                                block_scales.float().mul_(ratios[:, :, None, None])
+                            )
+                    g1_alphas = g1_alphas_up = shared_alphas
+                    copy_or_rebind_param(
+                        layer,
+                        f"{prefix}gemm1_clamp_limit",
+                        (clamp_limit / g1_alphas).to(torch.float32),
+                    )
+
+                if runner_config.gemm1_alpha is not None:
+                    if not prefix:
+                        copy_or_rebind_param(
+                            layer,
+                            "gemm1_alpha",
+                            torch.full_like(g1_alphas, runner_config.gemm1_alpha),
+                        )
+                    # SwiGLU adds beta to the raw up half before dequantization.
+                    beta = (
+                        torch.full_like(g1_alphas, runner_config.gemm1_clamp_limit)
+                        if is_situ
+                        else (1.0 / g1_alphas_up).to(torch.float32)
+                    )
+                    copy_or_rebind_param(layer, f"{prefix}gemm1_beta", beta)
+
+            copy_or_rebind_param(layer, f"{prefix}g1_alphas", g1_alphas)
+            copy_or_rebind_param(layer, f"{prefix}g1_alphas_up", g1_alphas_up)
+            copy_or_rebind_param(layer, f"{prefix}g2_alphas", g2_alphas)
+            if prefix:
+                from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+                    _compute_g1_scale_c,
+                )
+
                 copy_or_rebind_param(
                     layer,
-                    "_per_token_gemm1_clamp_limit",
-                    (dynamic_clamp / dynamic_g1).to(torch.float32),
+                    f"{prefix}g1_scale_c",
+                    _compute_g1_scale_c(
+                        torch.ones_like(layer.w2_input_scale_quant),
+                        g1_alphas,
+                        g1_alphas_up,
+                        runner_config.is_gated,
+                        runner_config.activation,
+                    ),
                 )
-            if runner_config.is_gated and runner_config.gemm1_alpha is not None:
-                dynamic_beta = (
-                    torch.full_like(
-                        dynamic_g1, runner_config.gemm1_clamp_limit, dtype=torch.float32
-                    )
-                    if is_situ
-                    else (1.0 / dynamic_up).to(torch.float32)
-                )
-                copy_or_rebind_param(layer, "_per_token_gemm1_beta", dynamic_beta)
-            copy_or_rebind_param(layer, "_per_token_g1_alphas", dynamic_g1)
-            copy_or_rebind_param(
-                layer,
-                "_per_token_g2_alphas",
-                layer.w2_weight_scale_2.to(torch.float32),
-            )
-            copy_or_rebind_param(
-                layer,
-                "_per_token_g1_scale_c",
-                _compute_g1_scale_c(
-                    torch.ones_like(layer.w2_input_scale_quant),
-                    dynamic_g1,
-                    dynamic_up,
-                    layer.moe_runner_config.is_gated,
-                    layer.moe_runner_config.activation,
-                ),
-            )
         if self.enable_flashinfer_cutlass_moe:
             from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
                 materialize_swiglu_params_for_cutlass,
@@ -3053,13 +3018,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             if use_w4a16:
                 # MegaMoE needs a contiguous gate-scale vector. Keep this fixed
                 # weight-only descriptor separate from calibrated g1_alphas.
-                weight_alpha = layer.w13_weight_scale_2
-                if weight_alpha.ndim == 2:
-                    weight_alpha = weight_alpha[:, 0]
                 copy_or_rebind_param(
                     layer,
                     "_w4a16_g1_alphas",
-                    weight_alpha.to(torch.float32).contiguous(),
+                    weight_g1,
                 )
             prepare_nvfp4_moe_weights_for_flashinfer_megamoe(layer)
             return

@@ -266,21 +266,16 @@ def _cutedsl_wrapper_activation_type(activation: str, activation_type_cls: Any) 
     )
 
 
-def _make_per_token_global_scale(
-    input_tensor: torch.Tensor, *, keep_unit_without_4over6: bool = False
-) -> torch.Tensor:
+def _make_per_token_global_scale(input_tensor: torch.Tensor) -> torch.Tensor:
     from flashinfer.quantization.nvfp4_quantization_utils import (
         current_nvfp4_4over6_config,
         make_nvfp4_global_scale,
     )
 
-    config = current_nvfp4_4over6_config()
-    if keep_unit_without_4over6 and config is None:
-        return input_tensor
     return make_nvfp4_global_scale(
         input_tensor,
         per_token_activation=True,
-        nvfp4_4over6_config=config,
+        nvfp4_4over6_config=current_nvfp4_4over6_config(),
     )
 
 
@@ -308,9 +303,6 @@ def _refresh_cutedsl_standard_scales(
     )
     if use_per_token and state.wrapper.quant_mode == "w4a4":
         used_input_scale = _make_per_token_global_scale(used_input_scale)
-        fc2_input_scale = _make_per_token_global_scale(
-            fc2_input_scale, keep_unit_without_4over6=True
-        )
 
     new_scales = (w1_alpha, fc2_input_scale, w2_alpha)
     current_scales = state.scales
@@ -458,9 +450,6 @@ def _initialize_cutedsl_wrapper(
         )
         if use_per_token:
             used_input_scale = _make_per_token_global_scale(used_input_scale)
-            fc2_input_scale = _make_per_token_global_scale(
-                fc2_input_scale, keep_unit_without_4over6=True
-            )
     return CuteDslMoeState(
         wrapper, (w1_alpha, fc2_input_scale, w2_alpha), used_input_scale, use_per_token
     )

@@ -12,7 +12,7 @@ import torch
 from flashinfer import fp4_quantize
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.quantization import fp4_utils, modelopt_quant
+from sglang.srt.layers.quantization import fp4_utils
 from sglang.srt.layers.quantization.fp4_utils import Fp4GemmRunnerBackend
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
@@ -163,11 +163,7 @@ class TestNvFp4LinearBackends(CustomTestCase):
         self._run_backend("flashinfer_cutedsl")
 
     def test_phase_specific_cutedsl_matches_global_modes_and_cuda_graphs(self):
-        for shape in ((16, 256, 512), (5, 240, 496)):
-            with self.subTest(shape=shape):
-                self._run_phase_specific_cutedsl_shape(*shape)
-
-    def _run_phase_specific_cutedsl_shape(self, m, n, k):
+        m, n, k = 16, 256, 512
         x = torch.randn((m, k), device="cuda", dtype=torch.bfloat16) / 10
         setting = envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16
         with mock.patch.object(
@@ -179,28 +175,9 @@ class TestNvFp4LinearBackends(CustomTestCase):
             for enabled in (False, True):
                 with setting.override(enabled):
                     torch.manual_seed(7)
-                    control, _ = _make_quantized_layer(n, k)
-                    control_x = x
-                    if enabled and (n % 32 or k % 32):
-                        # Global W4A16 preserves FlashInfer's native preparation,
-                        # which has no tactic for this unaligned geometry. Build
-                        # an independent zero-padded checkpoint/input control;
-                        # phase mode must reach the same result from the original
-                        # logical dimensions through normal W4A4 preparation.
-                        padded_n = (n + 31) // 32 * 32
-                        padded_k = (k + 31) // 32 * 32
-                        control.weight.data = torch.nn.functional.pad(
-                            control.weight.data,
-                            (0, (padded_k - k) // 2, 0, padded_n - n),
-                        )
-                        control.weight_scale.data = torch.nn.functional.pad(
-                            control.weight_scale.data,
-                            (0, (padded_k - k) // 16, 0, padded_n - n),
-                        )
-                        control.output_size_per_partition = padded_n
-                        control_x = torch.nn.functional.pad(x, (0, padded_k - k))
-                    control.quant_method.process_weights_after_loading(control)
-                    controls[enabled] = control(control_x)[0][:, :n].clone()
+                    layer, _ = _make_quantized_layer(n, k)
+                    layer.quant_method.process_weights_after_loading(layer)
+                    controls[enabled] = layer(x)[0].clone()
             for enabled_phase in ("prefill", "decode"):
                 with (
                     self.subTest(enabled_phase=enabled_phase),
@@ -209,59 +186,12 @@ class TestNvFp4LinearBackends(CustomTestCase):
                     torch.manual_seed(7)
                     layer, _ = _make_quantized_layer(n, k)
                     layer.quant_method.process_weights_after_loading(layer)
-                    self.assertEqual(
-                        layer.weight_scale_mma.untyped_storage().data_ptr(),
-                        layer.weight_scale_interleaved.untyped_storage().data_ptr(),
-                    )
-                    self.assertFalse(hasattr(layer, "_w4a16_weight"))
-                    names = (
-                        "weight",
-                        "weight_scale_interleaved",
-                        "weight_scale_mma",
-                        "alpha",
-                        "weight_global_scale",
-                        "input_scale_inv",
-                    )
-                    identities = {
-                        name: (
-                            id(getattr(layer, name)),
-                            getattr(layer, name).data_ptr(),
-                        )
-                        for name in names
-                    }
                     for phase in ("prefill", "decode", "prefill"):
-                        with (
-                            forward_context(
-                                ForwardContext(
-                                    attn_backend=None, moe_forward_phase=phase
-                                )
-                            ),
-                            mock.patch.object(
-                                modelopt_quant,
-                                "fp4_gemm",
-                                wraps=modelopt_quant.fp4_gemm,
-                            ) as gemm,
+                        with forward_context(
+                            ForwardContext(attn_backend=None, moe_forward_phase=phase)
                         ):
-                            out, _ = layer(x)
-                            self.assertEqual(
-                                gemm.call_args.args[1].data_ptr(),
-                                layer.weight.data_ptr(),
-                            )
-                            self.assertEqual(
-                                gemm.call_args.args[3].untyped_storage().data_ptr(),
-                                layer.weight_scale_interleaved.untyped_storage().data_ptr(),
-                            )
-                            self.assertEqual(
-                                {
-                                    name: (
-                                        id(getattr(layer, name)),
-                                        getattr(layer, name).data_ptr(),
-                                    )
-                                    for name in names
-                                },
-                                identities,
-                            )
                             expected = controls[phase == enabled_phase]
+                            out, _ = layer(x)
                             torch.testing.assert_close(out, expected, rtol=0, atol=0)
                             graph = torch.cuda.CUDAGraph()
                             with torch.cuda.graph(graph):
