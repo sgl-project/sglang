@@ -66,6 +66,19 @@ def test_reference_fifo_timer_visible_commits_and_discarded_tail_drain(
     target.collect_inflight_reqs = lambda: [req]
     target.abort_request = lambda abort: setattr(req, "to_finish", NS(aborted=True))
     native_events = []
+    processed_results = []
+    original_grant = harness.bridge._grant
+
+    def grant_after_local_accounting(**kwargs):
+        # A visible Grant may immediately cause another Ready/profile request.
+        # Every result already processed by native code must be accounted first.
+        assert all(
+            getattr(result, scheduler._DSPARK_ACCOUNTED) is True
+            for result in processed_results
+        )
+        return original_grant(**kwargs)
+
+    monkeypatch.setattr(harness.bridge, "_grant", grant_after_local_accounting)
 
     def process(batch, result):
         prediction = getattr(result, STEP_ATTRIBUTE)
@@ -85,6 +98,7 @@ def test_reference_fifo_timer_visible_commits_and_discarded_tail_drain(
             commits.append(NS(output_index=prior, token_ids=(1,) * count))
             native_events.append((prediction.step.forward_id, count))
         result.auxiliary_host_output.consume(batch, commits)
+        processed_results.append(result)
 
     target.after_process = process
     payload = TokenizedGenerateReqInput("a")

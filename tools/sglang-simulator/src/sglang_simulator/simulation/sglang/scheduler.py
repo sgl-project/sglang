@@ -847,18 +847,23 @@ class C_SchedulerHook(BaseHook):
                     )
 
             if C_SchedulerHook.COORDINATOR is not None:
+
+                def process_and_account():
+                    ret = process_native_result()
+                    consume_accounting()
+                    return ret
+
                 try:
                     ret = C_SchedulerHook.COORDINATOR.process_batch_result(
                         batch,
                         native_result,
                         duration=current_inference_dur,
-                        process=process_native_result,
+                        process=process_and_account,
                     )
                 except BaseException as error:
                     if driver is not None:
                         driver.fail("coordinated native result", error)
                     raise
-                consume_accounting()
                 # OFFLINE coordination excludes replacement CPU work entirely.
                 setattr(self, _DSPARK_WALL_CREDIT, 0.0)
                 return ret
