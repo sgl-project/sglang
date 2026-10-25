@@ -65,6 +65,14 @@ register_kernel(
 )
 register_kernel(
     KernelSpec(
+        op="speculative.draft_extend_tail",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.speculative.row_argmax:draft_extend_tail",
+        capabilities=CUDA_ONLY,
+    )
+)
+register_kernel(
+    KernelSpec(
         op="speculative.pack_verify_mask_into",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.speculative.pack_verify_mask:pack_verify_mask_into",

@@ -115,3 +115,42 @@ def gather_spec_extras(
         BLOCK=block,
     )
     return topk_p, topk_index, bonus_tokens, hidden_states
+
+
+@triton.jit
+def _scatter_spec_extras_kernel(
+    indices,
+    sources,
+    destinations,
+    INDEX_STRIDE: tl.constexpr,
+    SOURCE_STRIDES: tl.constexpr,
+    WIDTHS: tl.constexpr,
+    SLOTS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    dst = tl.load(indices + row * INDEX_STRIDE).to(tl.int64)
+    dst = tl.where(dst < 0, dst + SLOTS, dst)
+    col = tl.program_id(1).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    for i in tl.static_range(len(WIDTHS)):
+        value = tl.load(sources[i] + row * SOURCE_STRIDES[i] + col, col < WIDTHS[i])
+        tl.store(destinations[i] + dst * WIDTHS[i] + col, value, col < WIDTHS[i])
+
+
+def scatter_spec_extras(indices, pairs):
+    if indices.numel() == 0 or not pairs:
+        return
+    sources = tuple(src.reshape(src.shape[0], -1) for _, src in pairs)
+    sources = tuple(src if src.stride(1) == 1 else src.contiguous() for src in sources)
+    widths = tuple(src.shape[1] for src in sources)
+    block = min(1024, triton.next_power_of_2(max(widths)))
+    _scatter_spec_extras_kernel[(indices.numel(), triton.cdiv(max(widths), block))](
+        indices,
+        sources,
+        tuple(dst for dst, _ in pairs),
+        indices.stride(0),
+        tuple(src.stride(0) for src in sources),
+        widths,
+        pairs[0][0].shape[0],
+        BLOCK=block,
+    )

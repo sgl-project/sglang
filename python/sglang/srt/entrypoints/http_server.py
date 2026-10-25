@@ -123,7 +123,10 @@ from sglang.srt.entrypoints.openai.serving_transcription import (
 from sglang.srt.entrypoints.request_headers import apply_header_overrides
 from sglang.srt.entrypoints.systemone.protocol import SystemOneRequest
 from sglang.srt.entrypoints.systemone.serving import SystemOneServing
-from sglang.srt.entrypoints.warmup import execute_warmups
+from sglang.srt.entrypoints.warmup import (
+    execute_warmups,
+    speculative_step_cuda_graph_warmup,
+)
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import (
@@ -413,6 +416,15 @@ async def lifespan(fast_api_app: FastAPI):
             f"OpenAIServingResponses init traceback:\n{get_exception_traceback()}"
         )
 
+    # --enable-speculative-step-cuda-graph: capture the default-sampling steps
+    if (
+        get_spec().enable_speculative_step_cuda_graph
+        and not get_serving().skip_server_warmup
+    ):
+        await speculative_step_cuda_graph_warmup(
+            get_disagg().disaggregation_mode, _global_state.tokenizer_manager
+        )
+
     # Execute custom warmups
     if get_serving().warmups is not None:
         await execute_warmups(
@@ -530,6 +542,7 @@ from sglang.srt.runtime_context import (
     get_observability,
     get_parallel,
     get_serving,
+    get_spec,
     publish,
 )
 
@@ -3142,6 +3155,11 @@ def launch_server(
         # main process has no Python HTTP server / tokenizer manager to run.
         # Each Rust listener runs its own startup warmup and keeps /health at
         # 503 until it succeeds, so the main process does not warm up here.
+        if get_spec().enable_speculative_step_cuda_graph:
+            logger.info(
+                "SGLANG_RUST_SERVER skips the speculative step CUDA graph warm-up: "
+                "every step shape is captured at its first use."
+            )
         if launch_callback is not None:
             launch_callback()
         scheduler_init_result.block_until_scheduler_exits()

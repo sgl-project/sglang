@@ -233,6 +233,16 @@ class Spec(msgspec.Struct):
             resolvable=True,
         ),
     ] = False
+    enable_speculative_step_cuda_graph: A[
+        bool,
+        "Capture each EAGLE decode step (draft, target verify, draft extend and the "
+        "work between them) as one CUDA graph per batch size and sampling setup, "
+        "reusing the per-stage CUDA graphs, and turn on the fused verify and relay "
+        "paths for topk-1 chains (outputs are bitwise identical). Lowers per-step "
+        "launch and host overhead at small batch sizes. Steps it cannot capture "
+        "(e.g. logprobs, mixed constrained and unconstrained requests, batch sizes "
+        "above 8) run the regular path; the reason is logged once.",
+    ] = False
     speculative_adaptive: A[
         bool,
         "Enable adaptive speculative decoding that dynamically adjusts num_steps based on acceptance rate.",
