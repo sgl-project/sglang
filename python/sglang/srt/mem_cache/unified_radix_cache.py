@@ -305,11 +305,8 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         self.pp_rank = params.pp_rank
         self.pp_size = params.pp_size
-        # PP-sync sends not yet received downstream, grouped by scheduler round, oldest
-        # first. A gloo send completes only when the receiver posts its recv, so waiting
-        # on round k's sends ties this rank's round k+1 to the next rank's round k; the
-        # window is the pipeline's own depth and still bounds the list when idle rounds
-        # outrun the followers.
+        # Rounds of PP-sync sends to keep un-waited: the PP loop's own run-ahead,
+        # since a gloo send only completes once the next rank posts its recv.
         self.pp_sync_window = max(1, params.pp_size + params.pp_async_batch_depth)
         self.work_rounds: deque[list[torch.distributed.Work]] = deque([[]])
 
@@ -367,9 +364,9 @@ class UnifiedRadixCache(BasePrefixCache):
             torch.distributed.all_reduce(tensor, op=op, group=self.tp_group)
 
     def _bound_async_work(self) -> None:
-        """Open this round's PP-sync sends and wait out the oldest round once more
-        than pp_sync_window rounds are outstanding. Scheduler thread only."""
         self.work_rounds.append([])
+        # wait() returns when the receiver has posted its recv; waiting on anything
+        # younger than the window would tie this rank's round to the next rank's.
         while len(self.work_rounds) > self.pp_sync_window:
             for work in self.work_rounds.popleft():
                 work.wait()

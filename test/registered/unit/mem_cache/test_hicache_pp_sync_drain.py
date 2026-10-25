@@ -28,7 +28,7 @@ class _FakeWork:
 
 
 class _Holder:
-    """Minimal carrier exposing only what the PP-sync window touches."""
+    pass  # carries only the attributes the PP-sync window touches
 
 
 def _holder(*, window: int) -> _Holder:
@@ -39,7 +39,7 @@ def _holder(*, window: int) -> _Holder:
 
 
 def _round(holder: _Holder, *, sends: int) -> list[_FakeWork]:
-    """One scheduler round: bound the outstanding sends, then issue this round's."""
+    # one scheduler round: bound the outstanding sends, then issue this round's
     UnifiedRadixCache._bound_async_work(holder)
     works = [_FakeWork() for _ in range(sends)]
     holder.work_rounds[-1].extend(works)
@@ -47,10 +47,8 @@ def _round(holder: _Holder, *, sends: int) -> list[_FakeWork]:
 
 
 class TestPPSyncWindow(CustomTestCase):
-    """A gloo send completes only once the next PP rank posts its recv, so waiting on
-    the previous round's sends every round tied each rank to the next rank's progress
-    (#45351). The window waits only on rounds older than the pipeline depth and still
-    bounds the outstanding sends (#28916)."""
+    """Sends inside the window are never waited on, so a rank is not tied to the next
+    rank's progress; sends older than the window are, so the list stays bounded."""
 
     def test_rounds_within_window_are_not_waited(self):
         holder = _holder(window=3)
@@ -108,9 +106,8 @@ def _gloo_pp_rank(rank: int, port: int, result: dict) -> None:
 
 
 class TestPPSyncWindowGloo(CustomTestCase):
-    """Real gloo sends: rank 0 must issue a window's worth of rounds while rank 1 has
-    posted no recv at all. With a single-round window, rank 0's second round blocks
-    until rank 1 wakes up, which is the lock-step of #45351."""
+    """With real gloo sends, rank 0 must issue a window's worth of rounds while rank 1
+    has posted no recv; a single-round window blocks rank 0 on rank 1 instead."""
 
     def test_leader_runs_ahead_by_window(self):
         ctx = torch.multiprocessing.get_context("spawn")
@@ -132,10 +129,6 @@ class TestPPSyncWindowGloo(CustomTestCase):
 
 
 class TestUnifiedPPSyncBatching(CustomTestCase):
-register_cpu_ci(est_time=9, suite="base-a-test-cpu")
-
-
-class TestUnifiedPPSyncBatching(unittest.TestCase):
     def _make_cache(self, pp_rank, write_ready, load_ready):
         cache = object.__new__(UnifiedRadixCache)
         cache.tree_core = SimpleNamespace(
