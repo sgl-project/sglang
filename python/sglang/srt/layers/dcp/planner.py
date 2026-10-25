@@ -24,7 +24,10 @@ from sglang.kernels.ops.attention.dcp_kernels import (
     create_dcp_kv_indices,
     update_kv_lens_and_indices,
 )
-from sglang.srt.layers.dcp.layout import update_local_kv_lens_for_dcp
+from sglang.srt.layers.dcp.layout import (
+    filter_dcp_local_chunk_kv_indices,
+    update_local_kv_lens_for_dcp,
+)
 from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.runtime_context import get_device, get_parallel
@@ -56,6 +59,7 @@ def prepare_decode_context_parallel_metadata(
         dtype=torch.int32,
         device=get_device().device,
     )
+    extend_prefix_starts_cpu = torch.zeros(len(seq_lens), dtype=torch.int32)
     extend_cu_prefix_lens = torch.zeros(
         len(seq_lens) + 1,
         dtype=torch.int32,
@@ -110,11 +114,17 @@ def prepare_decode_context_parallel_metadata(
         extend_prefix_lens_sum,
         parallel.dcp_size,
     )
-    # Prefix lengths are dcp_size-aligned (widened allocator page), so no nonzero().
+    # Prefix lengths are dcp_size-aligned (widened allocator page) for prefill
+    # rows only. A mixed batch's decode rows are not. Cut each row from its own
+    # start, still with no nonzero().
     # `get_mla_kv_buffer` is a read door with the caller-translates contract.
     translator = get_attn_backend().kv_index_translator
     dcp_local_prefix_kv_indices = translator.translate_dcp_read_ids(
-        dcp_prefix_kv_indices[parallel.dcp_rank :: parallel.dcp_size]
+        filter_dcp_local_chunk_kv_indices(
+            dcp_prefix_kv_indices,
+            extend_prefix_starts_cpu,
+            torch.as_tensor(extend_prefix_lens_cpu),
+        )
     )
     dcp_kv_buffer = torch.empty(
         (
