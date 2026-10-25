@@ -644,6 +644,12 @@ class FusedMoE(torch.nn.Module):
                 backend.is_marlin()
                 or backend.is_triton_kernels()
                 or backend.is_cutlass()
+                or backend.is_aiter()
+                or backend.is_flashinfer_cutlass()
+                or backend.is_flashinfer_mxfp4()
+                or backend.is_flashinfer_cutedsl()
+                or backend.is_humming()
+                or backend.is_hpc_ops()
             ):
                 # These runners explicitly use out-of-place output regardless
                 # of the layer's inplace suggestion.

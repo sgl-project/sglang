@@ -745,8 +745,15 @@ class TestDeepseekMoeEpilogue(CustomTestCase):
         for backend in (
             MoeRunnerBackend.DEEP_GEMM,
             MoeRunnerBackend.MARLIN,
+            MoeRunnerBackend.EXPERIMENTAL_SGL_MARLIN,
             MoeRunnerBackend.TRITON_KERNELS,
             MoeRunnerBackend.CUTLASS,
+            MoeRunnerBackend.AITER,
+            MoeRunnerBackend.FLASHINFER_CUTLASS,
+            MoeRunnerBackend.FLASHINFER_MXFP4,
+            MoeRunnerBackend.FLASHINFER_CUTEDSL,
+            MoeRunnerBackend.HUMMING,
+            MoeRunnerBackend.HPC_OPS,
         ):
             with self.subTest(backend=backend):
                 moe = self._moe(inplace=True, backend=backend)
