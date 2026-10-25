@@ -135,6 +135,7 @@ from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     ConfigureLoggingReq,
     ContinueGenerationReqInput,
+    ControlAckOutput,
     DestroyWeightsUpdateGroupReqInput,
     DetachHiCacheStorageReqInput,
     DetachHiCacheStorageReqOutput,
@@ -2220,6 +2221,8 @@ class Scheduler(
                 continue
 
             output = self._request_dispatcher(recv_req)
+            if output is None:
+                output = self._rust_control_ack(recv_req)
             if output is not None:
                 if self.rust_server is None and isinstance(output, RpcReqOutput):
                     if self.ipc_channels.recv_from_rpc is not None:
@@ -2246,6 +2249,24 @@ class Scheduler(
             self.rust_server.push_abort(abort_req, req)
         else:
             self.ipc_channels.send_to_tokenizer.send_output(abort_req, req)
+
+    # The control requests whose handlers return nothing: Python's
+    # TokenizerManager fire-and-forgets them. The Rust frontend waits for one
+    # reply per control request, so under it each gets a ControlAckOutput.
+    _RUST_ACKED_CONTROL_REQUESTS = (
+        PauseGenerationReqInput,
+        ContinueGenerationReqInput,
+        FreezeGCReq,
+        ConfigureLoggingReq,
+        CloseSessionReqInput,
+    )
+
+    def _rust_control_ack(self, recv_req):
+        """The reply the Rust frontend waits for after a no-reply control
+        handler ran; None for any other request, and under the Python frontend."""
+        if not isinstance(recv_req, self._RUST_ACKED_CONTROL_REQUESTS):
+            return None
+        return ControlAckOutput() if self.rust_server is not None else None
 
     def send_control_output(self, output, recv_req) -> None:
         """Answer a control request, at dispatch or later (a deferred flush)."""
