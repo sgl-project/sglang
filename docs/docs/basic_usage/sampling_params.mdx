@@ -65,6 +65,11 @@ The `/generate` endpoint accepts the following parameters in JSON format. For de
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Whether to return log probabilities for tokens.</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>input_logprob_temperature</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`Optional[Union[List[float], float]] = None`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Temperature for input-token log probabilities, including top-k and selected-token scores. Supply a positive finite number, or one per request in a batch; omitted values use 1.0. This is a top-level `/generate` or Python Engine argument, independent of `sampling_params.temperature`, and does not change decode sampling. When log probabilities are requested, `meta_info.input_logprob_temperature` reports the scoring temperature.</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>logprob_start_len</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`Optional[Union[List[int], int]] = None`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>If return_logprob, the start location in the prompt for returning logprobs. Default is "-1", which returns logprobs for output tokens only.</td>
