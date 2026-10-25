@@ -82,6 +82,7 @@ from sglang.multimodal_gen.runtime.pipelines_core import (
     build_pipeline,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
+from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import DenoisingStage
 from sglang.multimodal_gen.runtime.platforms import (
     current_platform,
     initialize_current_platform,
@@ -257,6 +258,10 @@ def _probe_workload_units(req: Req) -> int:
         * max(1, int(req.height or 1))
         * max(1, int(req.num_frames or 1))
     )
+
+
+class _FatalDistributedForward(SystemExit):
+    """Escape request-level recovery when ranks can no longer run in lockstep."""
 
 
 class GPUWorker(GPUWorkerPostTrainingMixin):
@@ -794,6 +799,18 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                     deferred=False,
                 )
         except Exception as e:
+            if (
+                forward_failed
+                and isinstance(e, _oom_exceptions())
+                and get_replica_group().world_size > 1
+            ):
+                # Other ranks may still be inside this forward's collectives.
+                # Returning a request error would enter the next dispatch on
+                # only this rank, permanently desynchronizing the replica.
+                measure_server_warmup = False
+                raise _FatalDistributedForward(
+                    "Multi-rank forward ran out of memory; restart the server."
+                ) from e
             if propagate_forward_errors and forward_failed:
                 if isinstance(e, StopIteration):
                     raise RuntimeError(
@@ -836,20 +853,22 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         deferred: bool,
     ) -> None:
         req_label = req.request_id[:8] if req.request_id else "unnamed"
-        with maybe_record_function(f"SAVE_OUTPUTS {req_label}"):
-            self._materialize_output_transport(output_batch, req, save_output_paths)
-        if req.is_warmup and not current_platform.is_cpu():
-            # A warmup saves no output, so nothing waits for its device work;
-            # drain it here or the next request's first blocking op pays for it.
-            torch.get_device_module().synchronize()
-
-        self._record_output_peak_memory(output_batch, is_warmup=req.is_warmup)
-
-        collect_perf = (
-            req.perf_dump_path is not None or envs.SGLANG_DIFFUSION_STAGE_LOGGING
-        )
-        if collect_perf and not req.is_warmup:
-            self._record_replica_peak_memory(output_metrics)
+        try:
+            with maybe_record_function(f"SAVE_OUTPUTS {req_label}"):
+                self._materialize_output_transport(output_batch, req, save_output_paths)
+            if req.is_warmup and not current_platform.is_cpu():
+                # A warmup saves no output, so nothing waits for its device work;
+                # drain it here or the next request's first blocking op pays for it.
+                torch.get_device_module().synchronize()
+        finally:
+            self._record_output_peak_memory(output_batch, is_warmup=req.is_warmup)
+            # saving can fail only on the output rank; it must still join the
+            # metrics collective, or its peers cannot serve the next request
+            collect_perf = (
+                req.perf_dump_path is not None or envs.SGLANG_DIFFUSION_STAGE_LOGGING
+            )
+            if collect_perf and not req.is_warmup:
+                self._record_replica_peak_memory(output_metrics)
 
         if (
             self.is_output_rank
@@ -923,17 +942,22 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 )
             stream.synchronize()
 
-    def release_cache_if_idle(self) -> None:
+    def release_cache_if_idle(self) -> float | None:
         """Release the allocator cache once no request has finished for a while.
 
-        The scheduler calls this only with nothing queued or in flight.
+        The scheduler calls this only with nothing queued or in flight. Returns
+        the seconds until a pending release is due, or None when none is pending.
         """
         due = self._cache_release_due
-        if due is None or time.monotonic() < due:
-            return
+        if due is None:
+            return None
+        wait_s = due - time.monotonic()
+        if wait_s > 0:
+            return wait_s
         self._cache_release_due = None
         with maybe_record_function("EMPTY_CACHE"):
             torch.get_device_module().empty_cache()
+        return None
 
     def take_deferred_finalize(self) -> Callable[[], None] | None:
         deferred = self._deferred_finalize
@@ -1606,6 +1630,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             )
         finally:
             self._update_lora_metrics()
+            self._drop_breakable_cuda_graphs("LoRA changed")
         return OutputBatch()
 
     def merge_lora_weights(
@@ -1624,6 +1649,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             self.pipeline.merge_lora_weights(target, strength)
         finally:
             self._update_lora_metrics()
+            self._drop_breakable_cuda_graphs("LoRA changed")
         return OutputBatch()
 
     def unmerge_lora_weights(self, target: str = "all") -> OutputBatch:
@@ -1639,7 +1665,14 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             self.pipeline.unmerge_lora_weights(target)
         finally:
             self._update_lora_metrics()
+            self._drop_breakable_cuda_graphs("LoRA changed")
         return OutputBatch()
+
+    def _drop_breakable_cuda_graphs(self, reason: str) -> None:
+        # captured graphs replay the weights and LoRA branches of capture time
+        for stage in self.pipeline.stages:
+            if isinstance(stage, DenoisingStage):
+                stage.drop_breakable_cuda_graphs(reason)
 
     def _update_lora_metrics(self) -> None:
         if self.metrics is not None and isinstance(self.pipeline, LoRAPipeline):
@@ -1668,7 +1701,9 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 "sleeping": False,
                 "message": "already awake",
             }
-        return self.memory_occupation.resume_memory_occupation()
+        result = self.memory_occupation.resume_memory_occupation()
+        self._drop_breakable_cuda_graphs("weights moved by resume_memory_occupation")
+        return result
 
 
 OOM_MSG = """
@@ -1741,6 +1776,13 @@ def run_scheduler_process(
             }
         )
         scheduler.event_loop()
+    except _FatalDistributedForward:
+        logger.exception(
+            "Worker %d cannot safely continue after a multi-rank OOM", rank
+        )
+        # CUDA/NCCL teardown can wait forever on a peer's outstanding collective.
+        # Exit at the process boundary; the HTTP worker monitor rejects new work.
+        os._exit(1)
     except _oom_exceptions() as _e:
         logger.warning(OOM_MSG)
         raise

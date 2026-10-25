@@ -109,7 +109,7 @@ def _dflash_draft_cell_size(kvc: KVCacheConfigurator) -> int:
     ranks because the draft pool spans the widened virtual location space."""
     if kvc.is_draft_worker or not kvc.spec_algorithm.is_dflash_family():
         return 0
-    cell_size = kvc.spec_aux_config.dflash_draft_cell_size_per_token
+    cell_size = kvc.dflash_draft_cell_size_per_token
     if cell_size is None or int(cell_size) <= 0:
         return 0
     return int(cell_size) * get_parallel().attn_dcp_size
