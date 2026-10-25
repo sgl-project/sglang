@@ -368,6 +368,25 @@ class BaseModelLoader(ABC):
         """Load a model with the given configurations."""
         raise NotImplementedError
 
+    def before_weights_release(self, *, content_preserved: bool) -> None:
+        """Called before the weight memory is released; may block to stop external
+        readers. ``content_preserved``: the weights come back valid on resume."""
+
+    def after_weights_resume(self, *, content_preserved: bool) -> None:
+        """Called after the weight memory is resumed. If not ``content_preserved``,
+        the weights are undefined until reloaded."""
+
+    def reload_weights_inplace(
+        self,
+        *,
+        model: nn.Module,
+        model_config: ModelConfig,
+        device_config: DeviceConfig,
+    ) -> bool:
+        """Rewrite the weights into their existing storage, keeping addresses fixed
+        for CUDA graphs and the memory saver. Returns False if unsupported."""
+        return False
+
 
 def _validate_default_loader_extra_config(
     *, extra_config: dict, load_format: LoadFormat
@@ -3168,6 +3187,7 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                     f"{load_config.remote_instance_weight_loader_backend}"
                 )
         self.remote_instance_transfer_engine_weight_info = None
+        self._mx_loader: Optional[Any] = None
 
     def download_model(self, model_config: ModelConfig) -> None:
         raise NotImplementedError
@@ -3250,7 +3270,8 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                     "package. Install it in the SGLang image."
                 ) from exc
 
-            model = MxModelLoader(load_config).load_model(
+            self._mx_loader = MxModelLoader(load_config)
+            model = self._mx_loader.load_model(
                 model=model,
                 model_config=model_config,
                 device_config=device_config,
@@ -3259,6 +3280,35 @@ class RemoteInstanceModelLoader(BaseModelLoader):
             raise ValueError("Invalid remote instance weight loader backend.")
 
         return model.eval()
+
+    # hasattr: older modelexpress packages lack these hooks.
+    def before_weights_release(self, *, content_preserved: bool) -> None:
+        if self._mx_loader is not None and hasattr(
+            self._mx_loader, "before_weights_release"
+        ):
+            self._mx_loader.before_weights_release(content_preserved=content_preserved)
+
+    def after_weights_resume(self, *, content_preserved: bool) -> None:
+        if self._mx_loader is not None and hasattr(
+            self._mx_loader, "after_weights_resume"
+        ):
+            self._mx_loader.after_weights_resume(content_preserved=content_preserved)
+
+    def reload_weights_inplace(
+        self,
+        *,
+        model: nn.Module,
+        model_config: ModelConfig,
+        device_config: DeviceConfig,
+    ) -> bool:
+        if self._mx_loader is None or not hasattr(self._mx_loader, "reload_model"):
+            return False
+        self._mx_loader.reload_model(
+            model=model,
+            model_config=model_config,
+            device_config=device_config,
+        )
+        return True
 
     def load_model_from_remote_instance_by_nccl(
         self, model, client, model_config: ModelConfig, device_config: DeviceConfig

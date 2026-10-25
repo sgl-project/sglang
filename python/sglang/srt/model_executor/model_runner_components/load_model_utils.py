@@ -266,6 +266,23 @@ def maybe_enable_ipc_weight_cache(
         load_config.load_format = LoadFormat.IPC_CACHE
 
 
+def _weights_cpu_backup_requested(*, is_draft_worker: bool) -> bool:
+    return get_exec().features.enable_weights_cpu_backup or (
+        is_draft_worker and get_exec().features.enable_draft_weights_cpu_backup
+    )
+
+
+def resolve_weights_cpu_backup(*, is_draft_worker: bool) -> bool:
+    """Whether the weights memory-saver region backs weights up to CPU, i.e.
+    whether their content survives release_memory_occupation."""
+    # In zero-copy IPC mode, the weights are shared with the daemon via
+    # CUDA IPC and must not be offloaded/reloaded by the memory saver.
+    return (
+        _weights_cpu_backup_requested(is_draft_worker=is_draft_worker)
+        and get_model().weight_cache_mode == "off"
+    )
+
+
 def load_model_with_memory_saver(
     *,
     model_config: ModelConfig,
@@ -310,19 +327,15 @@ def load_model_with_memory_saver(
                         torch.cuda.current_device() if torch.cuda.is_available() else 0
                     )
 
-    enable_cpu_backup = get_exec().features.enable_weights_cpu_backup or (
-        is_draft_worker and get_exec().features.enable_draft_weights_cpu_backup
-    )
-
-    # In zero-copy IPC mode, the weights are shared with the daemon via
-    # CUDA IPC and must not be offloaded/reloaded by the memory saver.
-    is_ipc_zero_copy = get_model().weight_cache_mode != "off"
-    if is_ipc_zero_copy and enable_cpu_backup:
+    enable_cpu_backup = resolve_weights_cpu_backup(is_draft_worker=is_draft_worker)
+    if (
+        _weights_cpu_backup_requested(is_draft_worker=is_draft_worker)
+        and not enable_cpu_backup
+    ):
         logger.warning(
             "[ModelRunner] Disabling weights CPU backup in zero-copy IPC mode — "
             "IPC-mapped weights cannot be offloaded to CPU."
         )
-        enable_cpu_backup = False
 
     remote_instance_weight_info = None
     startup_weight_load = None

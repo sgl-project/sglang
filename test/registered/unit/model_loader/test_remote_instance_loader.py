@@ -73,5 +73,82 @@ class TestRemoteInstanceModelLoaderExtraConfig(CustomTestCase):
                 self.assertFalse(loader.load_config.model_loader_extra_config)
 
 
+class _FakeMxLoader:
+    def __init__(self):
+        self.calls = []
+
+    def before_weights_release(self, **kwargs):
+        self.calls.append(("before_weights_release", kwargs))
+
+    def after_weights_resume(self, **kwargs):
+        self.calls.append(("after_weights_resume", kwargs))
+
+    def reload_model(self, **kwargs):
+        self.calls.append(("reload_model", kwargs))
+
+
+class _FakeMxLoaderWithoutHooks:
+    """A modelexpress install that predates the release/resume/reload hooks."""
+
+
+def _modelexpress_loader(mx_loader):
+    loader = loader_mod.RemoteInstanceModelLoader(_load_config("modelexpress"))
+    loader._mx_loader = mx_loader
+    return loader
+
+
+class TestRemoteInstanceModelLoaderWeightHooks(CustomTestCase):
+    def test_hooks_forward_to_modelexpress(self):
+        mx_loader = _FakeMxLoader()
+        loader = _modelexpress_loader(mx_loader)
+        model, model_config, device_config = object(), object(), object()
+
+        loader.before_weights_release(content_preserved=False)
+        loader.after_weights_resume(content_preserved=False)
+        reloaded = loader.reload_weights_inplace(
+            model=model, model_config=model_config, device_config=device_config
+        )
+
+        self.assertTrue(reloaded)
+        self.assertEqual(
+            mx_loader.calls,
+            [
+                ("before_weights_release", {"content_preserved": False}),
+                ("after_weights_resume", {"content_preserved": False}),
+                (
+                    "reload_model",
+                    {
+                        "model": model,
+                        "model_config": model_config,
+                        "device_config": device_config,
+                    },
+                ),
+            ],
+        )
+
+    def test_hooks_tolerate_modelexpress_without_them(self):
+        loader = _modelexpress_loader(_FakeMxLoaderWithoutHooks())
+
+        loader.before_weights_release(content_preserved=True)
+        loader.after_weights_resume(content_preserved=True)
+        self.assertFalse(
+            loader.reload_weights_inplace(
+                model=object(), model_config=object(), device_config=object()
+            )
+        )
+
+    def test_hooks_are_inert_without_modelexpress(self):
+        for backend in OTHER_BACKENDS:
+            with self.subTest(backend=backend):
+                loader = loader_mod.RemoteInstanceModelLoader(_load_config(backend))
+                loader.before_weights_release(content_preserved=False)
+                loader.after_weights_resume(content_preserved=False)
+                self.assertFalse(
+                    loader.reload_weights_inplace(
+                        model=object(), model_config=object(), device_config=object()
+                    )
+                )
+
+
 if __name__ == "__main__":
     unittest.main()

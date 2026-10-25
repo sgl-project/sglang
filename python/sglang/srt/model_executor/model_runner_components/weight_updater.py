@@ -7,7 +7,8 @@ from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union
 
 import torch
 
-from sglang.srt.configs.load_config import LoadConfig
+from sglang.srt.configs.device_config import DeviceConfig
+from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.model_loader.loader import (
     DefaultModelLoader,
     get_model_loader,
@@ -189,6 +190,9 @@ class WeightUpdater:
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id, empty_cache=False):.2f} GB"
         )
 
+        if load_format == LoadFormat.REMOTE_INSTANCE:
+            return self._reload_weights_from_own_loader(model_path=model_path)
+
         target_device = torch.device(self.device)
         self.model_config.model_path = model_path
         # PP stages handle disk updates sequentially, unlike cold startup.
@@ -256,6 +260,27 @@ class WeightUpdater:
 
         logger.info("Update weights end.")
         return True, "Succeeded to update model weights."
+
+    def _reload_weights_from_own_loader(
+        self: WeightUpdater, *, model_path: str
+    ) -> tuple[bool, str]:
+        """Reload the weights in place through the loader that loaded them."""
+        if model_path != self.model_config.model_path:
+            return False, (
+                f"remote_instance reloads the served model "
+                f"{self.model_config.model_path!r}, got {model_path!r}."
+            )
+        loader = self.get_model_runner().loader
+        # A failure may leave the weights partially overwritten, so it propagates
+        # and stops the server, like a failed load at startup.
+        reloaded = loader.reload_weights_inplace(
+            model=self.get_model(),
+            model_config=self.model_config,
+            device_config=DeviceConfig(device=self.device, gpu_id=self.gpu_id),
+        )
+        if not reloaded:
+            return False, f"{type(loader).__name__} cannot reload weights in place."
+        return True, "Succeeded to reload model weights."
 
     def receive_weights_from_distributed(
         self: WeightUpdater,
