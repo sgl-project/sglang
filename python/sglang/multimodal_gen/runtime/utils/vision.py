@@ -5,6 +5,7 @@
 import os
 import tempfile
 from collections.abc import Callable
+from contextlib import closing
 from io import BytesIO
 from urllib.parse import unquote, urlparse
 
@@ -16,6 +17,8 @@ import requests
 import torch
 from packaging import version
 
+from sglang.kernels import get_kernel
+from sglang.srt.environ import envs
 from sglang.srt.utils.common import get_image_bytes as srt_get_image_bytes
 
 if version.parse(version.parse(PIL.__version__).base_version) >= version.parse("9.1.0"):
@@ -90,6 +93,49 @@ def normalize(images: np.ndarray | torch.Tensor) -> np.ndarray | torch.Tensor:
     return 2.0 * images - 1.0
 
 
+def preprocess_image(
+    image: PIL.Image.Image,
+    *,
+    device: torch.device,
+    size: tuple[int, int] | None = None,
+    crop: tuple[int, int, int, int] | None = None,
+) -> torch.Tensor:
+    """Pillow Lanczos resize, crop, and [-1, 1] normalization to [1, C, H, W].
+
+    Size is (width, height); crop is (top, left, height, width).
+    Non-RGB inputs and small images retain the CPU recipe.
+    """
+    width, height = size or image.size
+    if (
+        device.type != "cuda"
+        or torch.version.hip is not None
+        or envs.SGLANG_FORCE_CPU_IMAGE_PREPROCESSING.get()
+        or image.mode != "RGB"
+        or max(image.width * image.height, width * height) < 256 * 256
+    ):
+        if size is not None:
+            image = image.resize(size, PIL.Image.Resampling.LANCZOS)
+        if crop is not None:
+            top, left, height, width = crop
+            image = image.crop((left, top, left + width, top + height))
+        return normalize(numpy_to_pt(pil_to_numpy(image))).to(device)
+
+    # upload compact pixels; the lookup table preserves the CPU FP32 rounding
+    pixels = torch.from_numpy(np.array(image)).to(device, non_blocking=True)
+    resize_rgb = get_kernel("mm.lanczos_resize")
+    if crop == (0, 0, height, width):
+        crop = None
+    pixels = resize_rgb(
+        pixels,
+        height,
+        width,
+        crop=crop,
+        mean=(0.5, 0.5, 0.5),
+        std=(0.5, 0.5, 0.5),
+    )
+    return pixels.unsqueeze(0).permute(0, 3, 1, 2)
+
+
 # adapted from diffusers.utils import load_image
 def load_image(
     image: str | bytes | PIL.Image.Image,
@@ -111,9 +157,7 @@ def load_image(
         else:
             # in-memory loading path
             image = PIL.Image.open(BytesIO(srt_get_image_bytes(image)))
-    elif isinstance(image, PIL.Image.Image):
-        image = image
-    else:
+    elif not isinstance(image, PIL.Image.Image):
         raise ValueError(
             "Incorrect format used for the image. Should be bytes, a URL, a local path, base64/data URL, or a PIL image."
         )
@@ -128,12 +172,16 @@ def load_image(
     return image
 
 
+_VIDEO_DOWNLOAD_TIMEOUT_S = 60
+
+
 # adapted from diffusers.utils import load_video
 def load_video(
     video: str,
     convert_method: (
         Callable[[list[PIL.Image.Image]], list[PIL.Image.Image]] | None
     ) = None,
+    max_frames: int | None = None,
 ) -> list[PIL.Image.Image]:
     """
     Loads `video` to a list of PIL Image.
@@ -143,13 +191,17 @@ def load_video(
         convert_method (Callable[[List[PIL.Image.Image]], List[PIL.Image.Image]], *optional*):
             A conversion method to apply to the video after loading it. When set to `None` the images will be converted
             to "RGB".
+        max_frames (`int`, *optional*):
+            Stop decoding after this many frames. Decoding is sequential, so a caller that only needs a prefix of a
+            long clip should pass it here instead of slicing the result; the frames returned are the same either way.
     Returns:
         `List[PIL.Image.Image]`:
             The video as a list of PIL images.
     """
+    if max_frames is not None and max_frames <= 0:
+        raise ValueError(f"max_frames must be positive, got {max_frames}.")
     is_url = video.startswith("http://") or video.startswith("https://")
     is_file = os.path.isfile(video)
-    was_tempfile_created = False
 
     if not (is_url or is_file):
         raise ValueError(
@@ -157,29 +209,40 @@ def load_video(
         )
 
     if is_url:
-        response = requests.get(video, stream=True)
-        if response.status_code != 200:
-            raise ValueError(
-                f"Failed to download video. Status code: {response.status_code}"
-            )
-
         parsed_url = urlparse(video)
         file_name = os.path.basename(unquote(parsed_url.path))
 
         suffix = os.path.splitext(file_name)[1] or ".mp4"
-        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temp_file:
-            video_path = temp_file.name
-            video_data = response.iter_content(chunk_size=8192)
-            for chunk in video_data:
-                temp_file.write(chunk)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            video_path = os.path.join(temp_dir, f"video{suffix}")
+            with closing(
+                requests.get(video, stream=True, timeout=_VIDEO_DOWNLOAD_TIMEOUT_S)
+            ) as response:
+                if response.status_code != 200:
+                    raise ValueError(
+                        f"Failed to download video. Status code: {response.status_code}"
+                    )
+                with open(video_path, "wb") as temp_file:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        temp_file.write(chunk)
+            pil_images = _read_video_frames(video_path, max_frames)
+    else:
+        pil_images = _read_video_frames(video, max_frames)
 
-        video = video_path
+    if convert_method is not None:
+        pil_images = convert_method(pil_images)
 
+    return pil_images
+
+
+def _read_video_frames(
+    video: str, max_frames: int | None = None
+) -> list[PIL.Image.Image]:
     pil_images = []
     if video.endswith(".gif"):
         gif = PIL.Image.open(video)
         try:
-            while True:
+            while max_frames is None or len(pil_images) < max_frames:
                 pil_images.append(gif.copy())
                 gif.seek(gif.tell() + 1)
         except EOFError:
@@ -194,15 +257,12 @@ def load_video(
             ) from None
 
         with imageio.get_reader(video) as reader:
-            # Read all frames
+            # Closing the reader early stops the ffmpeg subprocess, so a prefix
+            # costs only the frames it needs.
             for frame in reader:
                 pil_images.append(PIL.Image.fromarray(frame))
-
-    if was_tempfile_created:
-        os.remove(video_path)
-
-    if convert_method is not None:
-        pil_images = convert_method(pil_images)
+                if max_frames is not None and len(pil_images) >= max_frames:
+                    break
 
     return pil_images
 

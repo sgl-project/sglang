@@ -5,6 +5,9 @@ import torch
 
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.latent_preparation import (
+    verify_latent_preparation_inputs,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     StageValidators as V,
 )
@@ -141,25 +144,7 @@ class MiniMaxH3LatentPreparationStage(PipelineStage):
         }
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
-        result = VerificationResult()
-        result.add_check(
-            "prompt_or_embeds",
-            None,
-            lambda _: (
-                V.string_or_list_strings(batch.prompt)
-                or V.list_not_empty(batch.prompt_embeds)
-            ),
-        )
-        result.add_check("prompt_embeds", batch.prompt_embeds, V.list_of_tensors)
-        result.add_check(
-            "num_videos_per_prompt", batch.num_outputs_per_prompt, V.positive_int
-        )
-        result.add_check("generator", batch.generator, V.generator_or_list_generators)
-        result.add_check("num_frames", batch.num_frames, V.positive_int)
-        result.add_check("height", batch.height, V.positive_int)
-        result.add_check("width", batch.width, V.positive_int)
-        result.add_check("latents", batch.latents, V.none_or_tensor)
-        return result
+        return verify_latent_preparation_inputs(batch)
 
     def verify_output(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         result = VerificationResult()

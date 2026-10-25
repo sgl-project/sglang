@@ -31,10 +31,8 @@ class TestLSECombineTritonVsCPU(CustomTestCase):
     def _run_combine_test(
         self, N, B, H_local, D, is_base_e, dtype=torch.bfloat16, atol=1e-2
     ):
-        from sglang.kernels.ops.attention.dcp_kernels import (
-            _lse_weighted_combine_cpu,
-            dcp_lse_combine_triton,
-        )
+        from sglang.kernels.ops.attention.dcp_kernels import dcp_lse_combine_triton
+        from sglang.test.kernels.dcp import lse_weighted_combine_cpu
 
         torch.manual_seed(42)
 
@@ -49,7 +47,7 @@ class TestLSECombineTritonVsCPU(CustomTestCase):
                 * 5.0
             )
 
-        cpu_result = _lse_weighted_combine_cpu(
+        cpu_result = lse_weighted_combine_cpu(
             partial_outputs.cpu(),
             partial_lses.cpu(),
             is_lse_base_on_e=is_base_e,
@@ -185,12 +183,20 @@ class TestLSECombineEdgeCases(CustomTestCase):
             raise unittest.SkipTest("CUDA required")
         cls.device = "cuda"
 
+    def test_all_empty_rows_stay_zero(self):
+        from sglang.kernels.ops.attention.dcp_kernels import dcp_lse_combine_triton
+
+        outputs = torch.ones(2, 2, 4, 64, device=self.device, dtype=torch.bfloat16)
+        lses = torch.zeros(2, 2, 4, device=self.device)
+        lses[:, 1] = -torch.inf
+        combined, _ = dcp_lse_combine_triton(outputs, lses, is_lse_base_on_e=False)
+        self.assertTrue((combined[0] == 1).all())
+        self.assertTrue((combined[1] == 0).all())
+
     def test_one_shard_dominant(self):
         """One shard has much larger LSE -- output should be close to that shard."""
-        from sglang.kernels.ops.attention.dcp_kernels import (
-            _lse_weighted_combine_cpu,
-            dcp_lse_combine_triton,
-        )
+        from sglang.kernels.ops.attention.dcp_kernels import dcp_lse_combine_triton
+        from sglang.test.kernels.dcp import lse_weighted_combine_cpu
 
         N, B, H_local, D = 2, 1, 1, 64
         partial_outputs = torch.randn(
@@ -203,7 +209,7 @@ class TestLSECombineEdgeCases(CustomTestCase):
         triton_result, _ = dcp_lse_combine_triton(
             partial_outputs, partial_lses, is_lse_base_on_e=True
         )
-        cpu_result = _lse_weighted_combine_cpu(
+        cpu_result = lse_weighted_combine_cpu(
             partial_outputs.cpu(), partial_lses.cpu(), is_lse_base_on_e=True
         )
 
@@ -250,7 +256,6 @@ class TestLSEBaseByBackend(CustomTestCase):
         self.assertTrue(is_mla_dcp_lse_base_on_e("flashmla"))
         self.assertTrue(is_mla_dcp_lse_base_on_e("cutedsl_mla"))
         self.assertFalse(is_mla_dcp_lse_base_on_e("flashinfer_mla"))
-        self.assertFalse(is_mla_dcp_lse_base_on_e("tokenspeed_mla"))
         self.assertFalse(is_mla_dcp_lse_base_on_e("trtllm_mla"))
         self.assertFalse(is_mla_dcp_lse_base_on_e(None))
 
