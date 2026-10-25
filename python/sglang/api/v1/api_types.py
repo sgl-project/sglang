@@ -294,6 +294,103 @@ class MemoryOccupationResponse(msgspec.Struct, kw_only=True, frozen=True):
         return encode_MemoryOccupationResponse(self)
 
 
+class AddExternalCorpusRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.AddExternalCorpusRequest: JSON object (unknown keys ignored)."""
+
+    corpus_id: Optional[str] = None
+    file_path: Optional[str] = None
+    documents: Optional[StringList] = None
+    token_chunks: Optional[TokenIdsList] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "AddExternalCorpusRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_AddExternalCorpusRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_AddExternalCorpusRequest(self)
+
+
+class AddExternalCorpusResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.AddExternalCorpusResponse: JSON object (unknown keys ignored)."""
+
+    success: bool = False
+    corpus_id: str = ""
+    message: str = ""
+    loaded_token_count: int = 0
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "AddExternalCorpusResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_AddExternalCorpusResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_AddExternalCorpusResponse(self)
+
+
+class RemoveExternalCorpusRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.RemoveExternalCorpusRequest: JSON object (unknown keys ignored)."""
+
+    corpus_id: Optional[str] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "RemoveExternalCorpusRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_RemoveExternalCorpusRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_RemoveExternalCorpusRequest(self)
+
+
+class RemoveExternalCorpusResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.RemoveExternalCorpusResponse: JSON object (unknown keys ignored)."""
+
+    success: bool = False
+    message: str = ""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "RemoveExternalCorpusResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_RemoveExternalCorpusResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_RemoveExternalCorpusResponse(self)
+
+
+class ListExternalCorporaRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.ListExternalCorporaRequest: JSON object (unknown keys ignored)."""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "ListExternalCorporaRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_ListExternalCorporaRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_ListExternalCorporaRequest(self)
+
+
+class ListExternalCorporaResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.ListExternalCorporaResponse: JSON object (unknown keys ignored)."""
+
+    success: bool = False
+    corpus_token_counts: Dict[str, int] = {}
+    message: str = ""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "ListExternalCorporaResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_ListExternalCorporaResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_ListExternalCorporaResponse(self)
+
+
 class FinishStop(msgspec.Struct, kw_only=True, frozen=True):
     """sglang.api.v1.FinishStop: JSON object (unknown keys ignored)."""
 
@@ -722,6 +819,243 @@ class HiCacheStorageResponse(msgspec.Struct, kw_only=True, frozen=True):
     def to_json_value(self) -> Dict[str, Any]:
         """Encode to a JSON-ready value (json.dumps-compatible)."""
         return encode_HiCacheStorageResponse(self)
+
+
+class ParseFunctionCallRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.ParseFunctionCallRequest: JSON object (unknown keys ignored)."""
+
+    text: str = ""
+    tools: List[ToolSpec] = []
+    tool_call_parser: Optional[str] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "ParseFunctionCallRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_ParseFunctionCallRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_ParseFunctionCallRequest(self)
+
+
+class ToolSpec(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.ToolSpec: JSON object (unknown keys ignored)."""
+
+    function: Optional[ToolFunctionSpec] = None
+    type: Optional[str] = "function"
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "ToolSpec":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_ToolSpec(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_ToolSpec(self)
+
+
+class ToolFunctionSpec(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.ToolFunctionSpec: JSON object (unknown keys ignored)."""
+
+    name: Optional[str] = None
+    description: Optional[str] = None
+    parameters: Optional[Any] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "ToolFunctionSpec":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_ToolFunctionSpec(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_ToolFunctionSpec(self)
+
+
+class ParsedToolCall(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.ParsedToolCall: JSON object (unknown keys ignored)."""
+
+    tool_index: int = 0
+    name: Optional[str] = None
+    parameters: str = ""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "ParsedToolCall":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_ParsedToolCall(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_ParsedToolCall(self)
+
+
+class ParseFunctionCallResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.ParseFunctionCallResponse: JSON object (unknown keys ignored)."""
+
+    normal_text: str = ""
+    calls: List[ParsedToolCall] = []
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "ParseFunctionCallResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_ParseFunctionCallResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_ParseFunctionCallResponse(self)
+
+
+class SeparateReasoningRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.SeparateReasoningRequest: JSON object (unknown keys ignored)."""
+
+    text: str = ""
+    reasoning_parser: str = ""
+    return_blocks: bool = False
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "SeparateReasoningRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_SeparateReasoningRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_SeparateReasoningRequest(self)
+
+
+class SeparateReasoningResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.SeparateReasoningResponse: JSON object (unknown keys ignored)."""
+
+    reasoning_text: str = ""
+    text: str = ""
+    reasoning_blocks: Optional[StringList] = None
+    text_blocks: Optional[StringList] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "SeparateReasoningResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_SeparateReasoningResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_SeparateReasoningResponse(self)
+
+
+class GetWeightsByNameRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.GetWeightsByNameRequest: JSON object (unknown keys ignored)."""
+
+    name: str = ""
+    truncate_size: Optional[int] = 100
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "GetWeightsByNameRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_GetWeightsByNameRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_GetWeightsByNameRequest(self)
+
+
+class GetWeightsByNameResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.GetWeightsByNameResponse: JSON object (unknown keys ignored)."""
+
+    parameters: List[Any] = []
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "GetWeightsByNameResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_GetWeightsByNameResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_GetWeightsByNameResponse(self)
+
+
+class InitWeightsUpdateGroupRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.InitWeightsUpdateGroupRequest: JSON object (unknown keys ignored)."""
+
+    master_address: str = ""
+    master_port: int = 0
+    rank_offset: int = 0
+    world_size: int = 0
+    group_name: Optional[str] = "weight_update_group"
+    backend: Optional[str] = "nccl"
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "InitWeightsUpdateGroupRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_InitWeightsUpdateGroupRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_InitWeightsUpdateGroupRequest(self)
+
+
+class DestroyWeightsUpdateGroupRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.DestroyWeightsUpdateGroupRequest: JSON object (unknown keys ignored)."""
+
+    group_name: Optional[str] = "weight_update_group"
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "DestroyWeightsUpdateGroupRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_DestroyWeightsUpdateGroupRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_DestroyWeightsUpdateGroupRequest(self)
+
+
+class InitWeightsSendGroupForRemoteInstanceRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.InitWeightsSendGroupForRemoteInstanceRequest: JSON object (unknown keys ignored)."""
+
+    master_address: str = ""
+    ports: str = ""
+    group_rank: int = 0
+    world_size: int = 0
+    group_name: Optional[str] = "weight_send_group"
+    backend: Optional[str] = "nccl"
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "InitWeightsSendGroupForRemoteInstanceRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_InitWeightsSendGroupForRemoteInstanceRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_InitWeightsSendGroupForRemoteInstanceRequest(self)
+
+
+class SendWeightsToRemoteInstanceRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.SendWeightsToRemoteInstanceRequest: JSON object (unknown keys ignored)."""
+
+    master_address: str = ""
+    ports: str = ""
+    group_name: Optional[str] = "weight_send_group"
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "SendWeightsToRemoteInstanceRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_SendWeightsToRemoteInstanceRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_SendWeightsToRemoteInstanceRequest(self)
+
+
+class WeightGroupResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.WeightGroupResponse: JSON object (unknown keys ignored)."""
+
+    success: bool = False
+    message: str = ""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "WeightGroupResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_WeightGroupResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_WeightGroupResponse(self)
 
 
 class ListModelsRequest(msgspec.Struct, kw_only=True, frozen=True):
@@ -1484,6 +1818,124 @@ def decode_MemoryOccupationResponse(value: Any) -> MemoryOccupationResponse:
 
 def encode_MemoryOccupationResponse(v: MemoryOccupationResponse) -> Dict[str, Any]:
     d: Dict[str, Any] = {}
+    return d
+
+
+def decode_AddExternalCorpusRequest(value: Any) -> AddExternalCorpusRequest:
+    m = _expect_map(value, expected="struct AddExternalCorpusRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "corpus_id":
+            kw["corpus_id"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "file_path":
+            kw["file_path"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "documents":
+            kw["documents"] = None if x is None else decode_StringList(x)
+        elif key == "token_chunks":
+            kw["token_chunks"] = None if x is None else decode_TokenIdsList(x)
+    return AddExternalCorpusRequest(**kw)
+
+
+def encode_AddExternalCorpusRequest(v: AddExternalCorpusRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.corpus_id is not None:
+        d["corpus_id"] = v.corpus_id
+    if v.file_path is not None:
+        d["file_path"] = v.file_path
+    if v.documents is not None:
+        d["documents"] = encode_StringList(v.documents)
+    if v.token_chunks is not None:
+        d["token_chunks"] = encode_TokenIdsList(v.token_chunks)
+    return d
+
+
+def decode_AddExternalCorpusResponse(value: Any) -> AddExternalCorpusResponse:
+    m = _expect_map(value, expected="struct AddExternalCorpusResponse")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "success":
+            kw["success"] = _expect_bool(x, expected="a boolean")
+        elif key == "corpus_id":
+            kw["corpus_id"] = _expect_str(x, expected="a string")
+        elif key == "message":
+            kw["message"] = _expect_str(x, expected="a string")
+        elif key == "loaded_token_count":
+            kw["loaded_token_count"] = _expect_int(x, expected="i64")
+    return AddExternalCorpusResponse(**kw)
+
+
+def encode_AddExternalCorpusResponse(v: AddExternalCorpusResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["success"] = v.success
+    d["corpus_id"] = v.corpus_id
+    d["message"] = v.message
+    d["loaded_token_count"] = v.loaded_token_count
+    return d
+
+
+def decode_RemoveExternalCorpusRequest(value: Any) -> RemoveExternalCorpusRequest:
+    m = _expect_map(value, expected="struct RemoveExternalCorpusRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "corpus_id":
+            kw["corpus_id"] = None if x is None else _expect_str(x, expected="a string")
+    return RemoveExternalCorpusRequest(**kw)
+
+
+def encode_RemoveExternalCorpusRequest(v: RemoveExternalCorpusRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.corpus_id is not None:
+        d["corpus_id"] = v.corpus_id
+    return d
+
+
+def decode_RemoveExternalCorpusResponse(value: Any) -> RemoveExternalCorpusResponse:
+    m = _expect_map(value, expected="struct RemoveExternalCorpusResponse")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "success":
+            kw["success"] = _expect_bool(x, expected="a boolean")
+        elif key == "message":
+            kw["message"] = _expect_str(x, expected="a string")
+    return RemoveExternalCorpusResponse(**kw)
+
+
+def encode_RemoveExternalCorpusResponse(v: RemoveExternalCorpusResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["success"] = v.success
+    d["message"] = v.message
+    return d
+
+
+def decode_ListExternalCorporaRequest(value: Any) -> ListExternalCorporaRequest:
+    m = _expect_map(value, expected="struct ListExternalCorporaRequest")
+    return ListExternalCorporaRequest()
+
+
+def encode_ListExternalCorporaRequest(v: ListExternalCorporaRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    return d
+
+
+def decode_ListExternalCorporaResponse(value: Any) -> ListExternalCorporaResponse:
+    m = _expect_map(value, expected="struct ListExternalCorporaResponse")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "success":
+            kw["success"] = _expect_bool(x, expected="a boolean")
+        elif key == "corpus_token_counts":
+            kw["corpus_token_counts"] = {} if x is None else {k: _expect_int(e, expected="i64") for k, e in _expect_map(x, expected="a map").items()}
+        elif key == "message":
+            kw["message"] = _expect_str(x, expected="a string")
+    return ListExternalCorporaResponse(**kw)
+
+
+def encode_ListExternalCorporaResponse(v: ListExternalCorporaResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["success"] = v.success
+    if v.corpus_token_counts:
+        d["corpus_token_counts"] = dict(v.corpus_token_counts)
+    d["message"] = v.message
     return d
 
 
@@ -2499,6 +2951,315 @@ def decode_HiCacheStorageResponse(value: Any) -> HiCacheStorageResponse:
 
 
 def encode_HiCacheStorageResponse(v: HiCacheStorageResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["success"] = v.success
+    d["message"] = v.message
+    return d
+
+
+def decode_ParseFunctionCallRequest(value: Any) -> ParseFunctionCallRequest:
+    m = _expect_map(value, expected="struct ParseFunctionCallRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "text":
+            kw["text"] = _expect_str(x, expected="a string")
+        elif key == "tools":
+            kw["tools"] = [] if x is None else [decode_ToolSpec(e) for e in _expect_seq(x, expected="a sequence")]
+        elif key == "tool_call_parser":
+            kw["tool_call_parser"] = None if x is None else _expect_str(x, expected="a string")
+    return ParseFunctionCallRequest(**kw)
+
+
+def encode_ParseFunctionCallRequest(v: ParseFunctionCallRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["text"] = v.text
+    if v.tools:
+        d["tools"] = [encode_ToolSpec(e) for e in v.tools]
+    if v.tool_call_parser is not None:
+        d["tool_call_parser"] = v.tool_call_parser
+    return d
+
+
+def decode_ToolSpec(value: Any) -> ToolSpec:
+    m = _expect_map(value, expected="struct ToolSpec")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "function":
+            kw["function"] = None if x is None else decode_ToolFunctionSpec(x)
+        elif key == "type":
+            kw["type"] = "function" if x is None else _expect_str(x, expected="a string")
+    return ToolSpec(**kw)
+
+
+def encode_ToolSpec(v: ToolSpec) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.function is not None:
+        d["function"] = encode_ToolFunctionSpec(v.function)
+    if v.type is not None:
+        d["type"] = v.type
+    return d
+
+
+def decode_ToolFunctionSpec(value: Any) -> ToolFunctionSpec:
+    m = _expect_map(value, expected="struct ToolFunctionSpec")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "name":
+            kw["name"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "description":
+            kw["description"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "parameters":
+            kw["parameters"] = x
+    return ToolFunctionSpec(**kw)
+
+
+def encode_ToolFunctionSpec(v: ToolFunctionSpec) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.name is not None:
+        d["name"] = v.name
+    if v.description is not None:
+        d["description"] = v.description
+    if v.parameters is not None:
+        d["parameters"] = v.parameters
+    return d
+
+
+def decode_ParsedToolCall(value: Any) -> ParsedToolCall:
+    m = _expect_map(value, expected="struct ParsedToolCall")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "tool_index":
+            kw["tool_index"] = _expect_int(x, expected="i64")
+        elif key == "name":
+            kw["name"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "parameters":
+            kw["parameters"] = _expect_str(x, expected="a string")
+    return ParsedToolCall(**kw)
+
+
+def encode_ParsedToolCall(v: ParsedToolCall) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["tool_index"] = v.tool_index
+    d["name"] = v.name
+    d["parameters"] = v.parameters
+    return d
+
+
+def decode_ParseFunctionCallResponse(value: Any) -> ParseFunctionCallResponse:
+    m = _expect_map(value, expected="struct ParseFunctionCallResponse")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "normal_text":
+            kw["normal_text"] = _expect_str(x, expected="a string")
+        elif key == "calls":
+            kw["calls"] = [] if x is None else [decode_ParsedToolCall(e) for e in _expect_seq(x, expected="a sequence")]
+    return ParseFunctionCallResponse(**kw)
+
+
+def encode_ParseFunctionCallResponse(v: ParseFunctionCallResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["normal_text"] = v.normal_text
+    if v.calls:
+        d["calls"] = [encode_ParsedToolCall(e) for e in v.calls]
+    return d
+
+
+def decode_SeparateReasoningRequest(value: Any) -> SeparateReasoningRequest:
+    m = _expect_map(value, expected="struct SeparateReasoningRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "text":
+            kw["text"] = _expect_str(x, expected="a string")
+        elif key == "reasoning_parser":
+            kw["reasoning_parser"] = _expect_str(x, expected="a string")
+        elif key == "return_blocks":
+            kw["return_blocks"] = _expect_bool(x, expected="a boolean")
+    return SeparateReasoningRequest(**kw)
+
+
+def encode_SeparateReasoningRequest(v: SeparateReasoningRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["text"] = v.text
+    d["reasoning_parser"] = v.reasoning_parser
+    d["return_blocks"] = v.return_blocks
+    return d
+
+
+def decode_SeparateReasoningResponse(value: Any) -> SeparateReasoningResponse:
+    m = _expect_map(value, expected="struct SeparateReasoningResponse")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "reasoning_text":
+            kw["reasoning_text"] = _expect_str(x, expected="a string")
+        elif key == "text":
+            kw["text"] = _expect_str(x, expected="a string")
+        elif key == "reasoning_blocks":
+            kw["reasoning_blocks"] = None if x is None else decode_StringList(x)
+        elif key == "text_blocks":
+            kw["text_blocks"] = None if x is None else decode_StringList(x)
+    return SeparateReasoningResponse(**kw)
+
+
+def encode_SeparateReasoningResponse(v: SeparateReasoningResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["reasoning_text"] = v.reasoning_text
+    d["text"] = v.text
+    if v.reasoning_blocks is not None:
+        d["reasoning_blocks"] = encode_StringList(v.reasoning_blocks)
+    if v.text_blocks is not None:
+        d["text_blocks"] = encode_StringList(v.text_blocks)
+    return d
+
+
+def decode_GetWeightsByNameRequest(value: Any) -> GetWeightsByNameRequest:
+    m = _expect_map(value, expected="struct GetWeightsByNameRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "name":
+            kw["name"] = _expect_str(x, expected="a string")
+        elif key == "truncate_size":
+            kw["truncate_size"] = 100 if x is None else _expect_int(x, expected="i64")
+    return GetWeightsByNameRequest(**kw)
+
+
+def encode_GetWeightsByNameRequest(v: GetWeightsByNameRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["name"] = v.name
+    if v.truncate_size is not None:
+        d["truncate_size"] = v.truncate_size
+    return d
+
+
+def decode_GetWeightsByNameResponse(value: Any) -> GetWeightsByNameResponse:
+    m = _expect_map(value, expected="struct GetWeightsByNameResponse")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "parameters":
+            kw["parameters"] = [] if x is None else list(_expect_seq(x, expected="a sequence"))
+    return GetWeightsByNameResponse(**kw)
+
+
+def encode_GetWeightsByNameResponse(v: GetWeightsByNameResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.parameters:
+        d["parameters"] = list(v.parameters)
+    return d
+
+
+def decode_InitWeightsUpdateGroupRequest(value: Any) -> InitWeightsUpdateGroupRequest:
+    m = _expect_map(value, expected="struct InitWeightsUpdateGroupRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "master_address":
+            kw["master_address"] = _expect_str(x, expected="a string")
+        elif key == "master_port":
+            kw["master_port"] = _expect_int(x, expected="i64")
+        elif key == "rank_offset":
+            kw["rank_offset"] = _expect_int(x, expected="i64")
+        elif key == "world_size":
+            kw["world_size"] = _expect_int(x, expected="i64")
+        elif key == "group_name":
+            kw["group_name"] = "weight_update_group" if x is None else _expect_str(x, expected="a string")
+        elif key == "backend":
+            kw["backend"] = "nccl" if x is None else _expect_str(x, expected="a string")
+    return InitWeightsUpdateGroupRequest(**kw)
+
+
+def encode_InitWeightsUpdateGroupRequest(v: InitWeightsUpdateGroupRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["master_address"] = v.master_address
+    d["master_port"] = v.master_port
+    d["rank_offset"] = v.rank_offset
+    d["world_size"] = v.world_size
+    if v.group_name is not None:
+        d["group_name"] = v.group_name
+    if v.backend is not None:
+        d["backend"] = v.backend
+    return d
+
+
+def decode_DestroyWeightsUpdateGroupRequest(value: Any) -> DestroyWeightsUpdateGroupRequest:
+    m = _expect_map(value, expected="struct DestroyWeightsUpdateGroupRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "group_name":
+            kw["group_name"] = "weight_update_group" if x is None else _expect_str(x, expected="a string")
+    return DestroyWeightsUpdateGroupRequest(**kw)
+
+
+def encode_DestroyWeightsUpdateGroupRequest(v: DestroyWeightsUpdateGroupRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.group_name is not None:
+        d["group_name"] = v.group_name
+    return d
+
+
+def decode_InitWeightsSendGroupForRemoteInstanceRequest(value: Any) -> InitWeightsSendGroupForRemoteInstanceRequest:
+    m = _expect_map(value, expected="struct InitWeightsSendGroupForRemoteInstanceRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "master_address":
+            kw["master_address"] = _expect_str(x, expected="a string")
+        elif key == "ports":
+            kw["ports"] = _expect_str(x, expected="a string")
+        elif key == "group_rank":
+            kw["group_rank"] = _expect_int(x, expected="i64")
+        elif key == "world_size":
+            kw["world_size"] = _expect_int(x, expected="i64")
+        elif key == "group_name":
+            kw["group_name"] = "weight_send_group" if x is None else _expect_str(x, expected="a string")
+        elif key == "backend":
+            kw["backend"] = "nccl" if x is None else _expect_str(x, expected="a string")
+    return InitWeightsSendGroupForRemoteInstanceRequest(**kw)
+
+
+def encode_InitWeightsSendGroupForRemoteInstanceRequest(v: InitWeightsSendGroupForRemoteInstanceRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["master_address"] = v.master_address
+    d["ports"] = v.ports
+    d["group_rank"] = v.group_rank
+    d["world_size"] = v.world_size
+    if v.group_name is not None:
+        d["group_name"] = v.group_name
+    if v.backend is not None:
+        d["backend"] = v.backend
+    return d
+
+
+def decode_SendWeightsToRemoteInstanceRequest(value: Any) -> SendWeightsToRemoteInstanceRequest:
+    m = _expect_map(value, expected="struct SendWeightsToRemoteInstanceRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "master_address":
+            kw["master_address"] = _expect_str(x, expected="a string")
+        elif key == "ports":
+            kw["ports"] = _expect_str(x, expected="a string")
+        elif key == "group_name":
+            kw["group_name"] = "weight_send_group" if x is None else _expect_str(x, expected="a string")
+    return SendWeightsToRemoteInstanceRequest(**kw)
+
+
+def encode_SendWeightsToRemoteInstanceRequest(v: SendWeightsToRemoteInstanceRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["master_address"] = v.master_address
+    d["ports"] = v.ports
+    if v.group_name is not None:
+        d["group_name"] = v.group_name
+    return d
+
+
+def decode_WeightGroupResponse(value: Any) -> WeightGroupResponse:
+    m = _expect_map(value, expected="struct WeightGroupResponse")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "success":
+            kw["success"] = _expect_bool(x, expected="a boolean")
+        elif key == "message":
+            kw["message"] = _expect_str(x, expected="a string")
+    return WeightGroupResponse(**kw)
+
+
+def encode_WeightGroupResponse(v: WeightGroupResponse) -> Dict[str, Any]:
     d: Dict[str, Any] = {}
     d["success"] = v.success
     d["message"] = v.message

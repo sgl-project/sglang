@@ -9,8 +9,11 @@ syntax = "proto3";
 package sglang.api.v1;
 
 import "sglang/api/v1/control.proto";
+import "sglang/api/v1/corpus.proto";
 import "sglang/api/v1/generate.proto";
 import "sglang/api/v1/hicache.proto";
+import "sglang/api/v1/parsers.proto";
+import "sglang/api/v1/weights.proto";
 import "sglang/json/v1/options.proto";
 
 service SglangService {
@@ -69,6 +72,25 @@ service SglangService {
   // `/release_memory_occupation`, `/resume_memory_occupation`.
   rpc ReleaseMemoryOccupation(ReleaseMemoryOccupationRequest) returns (MemoryOccupationResponse);
   rpc ResumeMemoryOccupation(ResumeMemoryOccupationRequest) returns (MemoryOccupationResponse);
+
+  // `/get_weights_by_name`: one parameter per DP rank.
+  rpc GetWeightsByName(GetWeightsByNameRequest) returns (GetWeightsByNameResponse);
+
+  // Weight-update process groups and remote-instance sends. Single-DP-rank
+  // deployments only, as in Python.
+  rpc InitWeightsUpdateGroup(InitWeightsUpdateGroupRequest) returns (WeightGroupResponse);
+  rpc DestroyWeightsUpdateGroup(DestroyWeightsUpdateGroupRequest) returns (WeightGroupResponse);
+  rpc InitWeightsSendGroupForRemoteInstance(InitWeightsSendGroupForRemoteInstanceRequest) returns (WeightGroupResponse);
+  rpc SendWeightsToRemoteInstance(SendWeightsToRemoteInstanceRequest) returns (WeightGroupResponse);
+
+  // `/parse_function_call`, `/separate_reasoning`: frontend-only parsing.
+  rpc ParseFunctionCall(ParseFunctionCallRequest) returns (ParseFunctionCallResponse);
+  rpc SeparateReasoning(SeparateReasoningRequest) returns (SeparateReasoningResponse);
+
+  // `/add_external_corpus`, `/remove_external_corpus`, `/list_external_corpora`.
+  rpc AddExternalCorpus(AddExternalCorpusRequest) returns (AddExternalCorpusResponse);
+  rpc RemoveExternalCorpus(RemoveExternalCorpusRequest) returns (RemoveExternalCorpusResponse);
+  rpc ListExternalCorpora(ListExternalCorporaRequest) returns (ListExternalCorporaResponse);
 }
 
 message ListModelsRequest {}

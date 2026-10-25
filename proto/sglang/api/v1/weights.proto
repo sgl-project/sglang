@@ -1,0 +1,86 @@
+// Weight-management control APIs shared by HTTP JSON and gRPC: the
+// state-free subset (group setup, remote-instance send, parameter read).
+// The weight updates themselves follow once the frontend holds the update
+// lock on every listener.
+syntax = "proto3";
+
+package sglang.api.v1;
+
+import "sglang/json/v1/options.proto";
+
+// `/get_weights_by_name`: read one parameter, truncated, from every DP rank.
+message GetWeightsByNameRequest {
+  string name = 1;
+  // Elements kept per dimension; Python's `truncate_size: int = 100`.
+  optional int64 truncate_size = 2 [
+    (sglang.json.v1.field_json).null_policy = NULL_POLICY_RESETS_DEFAULT,
+    (sglang.json.v1.field_json).default_i64 = 100
+  ];
+}
+
+// One parameter per DP rank in rank order, each the scheduler's
+// `List[float | List[float]]` as JSON text (a rank that found no parameter
+// contributes `null`). HTTP unwraps a single rank to the bare value, as
+// Python does.
+message GetWeightsByNameResponse {
+  repeated string parameters = 1 [(sglang.json.v1.field_json).raw_json = true];
+}
+
+// `/init_weights_update_group`: join the trainer's weight-update process group.
+message InitWeightsUpdateGroupRequest {
+  string master_address = 1;
+  int64 master_port = 2;
+  int64 rank_offset = 3;
+  int64 world_size = 4;
+  optional string group_name = 5 [
+    (sglang.json.v1.field_json).null_policy = NULL_POLICY_RESETS_DEFAULT,
+    (sglang.json.v1.field_json).default_string = "weight_update_group"
+  ];
+  optional string backend = 6 [
+    (sglang.json.v1.field_json).null_policy = NULL_POLICY_RESETS_DEFAULT,
+    (sglang.json.v1.field_json).default_string = "nccl"
+  ];
+}
+
+// `/destroy_weights_update_group`.
+message DestroyWeightsUpdateGroupRequest {
+  optional string group_name = 1 [
+    (sglang.json.v1.field_json).null_policy = NULL_POLICY_RESETS_DEFAULT,
+    (sglang.json.v1.field_json).default_string = "weight_update_group"
+  ];
+}
+
+// `/init_weights_send_group_for_remote_instance`: open the send group toward
+// another engine instance.
+message InitWeightsSendGroupForRemoteInstanceRequest {
+  string master_address = 1;
+  // One port per rank, as the comma-separated string Python takes.
+  string ports = 2;
+  int64 group_rank = 3;
+  int64 world_size = 4;
+  optional string group_name = 5 [
+    (sglang.json.v1.field_json).null_policy = NULL_POLICY_RESETS_DEFAULT,
+    (sglang.json.v1.field_json).default_string = "weight_send_group"
+  ];
+  optional string backend = 6 [
+    (sglang.json.v1.field_json).null_policy = NULL_POLICY_RESETS_DEFAULT,
+    (sglang.json.v1.field_json).default_string = "nccl"
+  ];
+}
+
+// `/send_weights_to_remote_instance`.
+message SendWeightsToRemoteInstanceRequest {
+  string master_address = 1;
+  string ports = 2;
+  optional string group_name = 3 [
+    (sglang.json.v1.field_json).null_policy = NULL_POLICY_RESETS_DEFAULT,
+    (sglang.json.v1.field_json).default_string = "weight_send_group"
+  ];
+}
+
+// `{success, message}` as Python answers every group operation; HTTP 200 on
+// success, 400 otherwise.
+message WeightGroupResponse {
+  bool success = 1;
+  string message = 2;
+}

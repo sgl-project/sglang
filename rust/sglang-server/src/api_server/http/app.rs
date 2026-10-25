@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use axum::Router;
 
-use super::{hicache, info, loads, metrics, native_api, openai};
+use super::{corpus, hicache, info, loads, metrics, native_api, openai, parsers, weights};
 use crate::HttpLayer;
 use crate::api_server::disaggregation::bootstrap as pd_bootstrap;
 use crate::api_server::handlers::{CoreHandle, HiCacheManager};
@@ -85,6 +85,9 @@ pub async fn serve(
     // Each endpoint module registers its own routes and merges here.
     let mut router = Router::new()
         .merge(info::routes())
+        .merge(weights::routes())
+        .merge(parsers::routes())
+        .merge(corpus::routes())
         .merge(loads::routes())
         .merge(native_api::routes())
         .merge(openai::routes());

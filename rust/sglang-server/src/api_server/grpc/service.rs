@@ -13,8 +13,13 @@ use tonic::{Request, Response, Status};
 use super::{info, native_api};
 use crate::api_server::core::HealthStatus;
 use crate::api_server::handlers::{CoreHandle, HiCacheManager};
+use crate::api_server::handlers::{
+    CorpusSource, ToolSpec, WeightGroupOutcome, parse_function_call, separate_reasoning,
+};
 use crate::message::config::{PreferredSamplingParams, ServerArgs};
-use crate::message::io_struct::{ExpertDistributionAction, ProfileOptions};
+use crate::message::io_struct::{
+    ExpertDistributionAction, ProfileOptions, WeightsSendGroup, WeightsUpdateGroup,
+};
 use crate::message::request::{GenerationPolicy, into_requests};
 use crate::message::wire::{ClientMaxNewTokens, fill_preferred_sampling};
 use crate::utils::environ;
@@ -88,6 +93,18 @@ impl GrpcService {
             },
         }
     }
+}
+
+/// A group operation's merged outcome as the gRPC reply; a frontend-side
+/// failure (bad request, unreachable rank) is a status instead.
+fn group_response(
+    outcome: Result<WeightGroupOutcome, crate::api_server::core::CoreError>,
+) -> Result<Response<api::WeightGroupResponse>, Status> {
+    let outcome = outcome.map_err(native_api::status)?;
+    Ok(Response::new(api::WeightGroupResponse {
+        success: outcome.success,
+        message: outcome.message,
+    }))
 }
 
 impl GrpcService {
@@ -296,6 +313,199 @@ impl SglangService for GrpcService {
             .await
             .map_err(native_api::status)?;
         Ok(Response::new(api::MemoryOccupationResponse {}))
+    }
+
+    async fn get_weights_by_name(
+        &self,
+        request: Request<api::GetWeightsByNameRequest>,
+    ) -> Result<Response<api::GetWeightsByNameResponse>, Status> {
+        let request = request.into_inner();
+        let parameters = self
+            .core
+            .get_weights_by_name(request.name, request.truncate_size.unwrap_or(100))
+            .await
+            .map_err(native_api::status)?;
+        Ok(Response::new(api::GetWeightsByNameResponse {
+            parameters: parameters.iter().map(ToString::to_string).collect(),
+        }))
+    }
+
+    async fn init_weights_update_group(
+        &self,
+        request: Request<api::InitWeightsUpdateGroupRequest>,
+    ) -> Result<Response<api::WeightGroupResponse>, Status> {
+        let request = request.into_inner();
+        group_response(
+            self.core
+                .init_weights_update_group(WeightsUpdateGroup {
+                    master_address: request.master_address,
+                    master_port: request.master_port,
+                    rank_offset: request.rank_offset,
+                    world_size: request.world_size,
+                    group_name: request
+                        .group_name
+                        .unwrap_or_else(|| "weight_update_group".into()),
+                    backend: request.backend.unwrap_or_else(|| "nccl".into()),
+                })
+                .await,
+        )
+    }
+
+    async fn destroy_weights_update_group(
+        &self,
+        request: Request<api::DestroyWeightsUpdateGroupRequest>,
+    ) -> Result<Response<api::WeightGroupResponse>, Status> {
+        let group_name = request
+            .into_inner()
+            .group_name
+            .unwrap_or_else(|| "weight_update_group".into());
+        group_response(self.core.destroy_weights_update_group(group_name).await)
+    }
+
+    async fn init_weights_send_group_for_remote_instance(
+        &self,
+        request: Request<api::InitWeightsSendGroupForRemoteInstanceRequest>,
+    ) -> Result<Response<api::WeightGroupResponse>, Status> {
+        let request = request.into_inner();
+        group_response(
+            self.core
+                .init_weights_send_group_for_remote_instance(WeightsSendGroup {
+                    master_address: request.master_address,
+                    ports: request.ports,
+                    group_rank: request.group_rank,
+                    world_size: request.world_size,
+                    group_name: request
+                        .group_name
+                        .unwrap_or_else(|| "weight_send_group".into()),
+                    backend: request.backend.unwrap_or_else(|| "nccl".into()),
+                })
+                .await,
+        )
+    }
+
+    async fn send_weights_to_remote_instance(
+        &self,
+        request: Request<api::SendWeightsToRemoteInstanceRequest>,
+    ) -> Result<Response<api::WeightGroupResponse>, Status> {
+        let request = request.into_inner();
+        group_response(
+            self.core
+                .send_weights_to_remote_instance(
+                    request.master_address,
+                    request.ports,
+                    request
+                        .group_name
+                        .unwrap_or_else(|| "weight_send_group".into()),
+                )
+                .await,
+        )
+    }
+
+    async fn parse_function_call(
+        &self,
+        request: Request<api::ParseFunctionCallRequest>,
+    ) -> Result<Response<api::ParseFunctionCallResponse>, Status> {
+        let request = request.into_inner();
+        let tools: Vec<ToolSpec> = request
+            .tools
+            .into_iter()
+            .map(|tool| {
+                let function = tool.function.unwrap_or_default();
+                ToolSpec {
+                    name: function.name,
+                    parameters: function.parameters,
+                }
+            })
+            .collect();
+        let (normal_text, calls) =
+            parse_function_call(&request.text, &tools, request.tool_call_parser.as_deref())
+                .await
+                .map_err(native_api::status)?;
+        Ok(Response::new(api::ParseFunctionCallResponse {
+            normal_text,
+            calls: calls
+                .into_iter()
+                .map(|call| api::ParsedToolCall {
+                    tool_index: call.tool_index,
+                    name: call.name,
+                    parameters: call.parameters,
+                })
+                .collect(),
+        }))
+    }
+
+    async fn separate_reasoning(
+        &self,
+        request: Request<api::SeparateReasoningRequest>,
+    ) -> Result<Response<api::SeparateReasoningResponse>, Status> {
+        let request = request.into_inner();
+        let (reasoning_text, text) = separate_reasoning(&request.text, &request.reasoning_parser)
+            .map_err(native_api::status)?;
+        let blocks = request.return_blocks;
+        Ok(Response::new(api::SeparateReasoningResponse {
+            reasoning_blocks: blocks.then(|| api::StringList {
+                items: if reasoning_text.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![reasoning_text.clone()]
+                },
+            }),
+            text_blocks: blocks.then(|| api::StringList {
+                items: vec![text.clone()],
+            }),
+            reasoning_text,
+            text,
+        }))
+    }
+
+    async fn add_external_corpus(
+        &self,
+        request: Request<api::AddExternalCorpusRequest>,
+    ) -> Result<Response<api::AddExternalCorpusResponse>, Status> {
+        let request = request.into_inner();
+        let outcome = self
+            .core
+            .add_external_corpus(CorpusSource {
+                corpus_id: request.corpus_id,
+                file_path: request.file_path,
+                documents: request.documents.map(|list| list.items),
+                token_chunks: request
+                    .token_chunks
+                    .map(|list| list.items.into_iter().map(|ids| ids.ids).collect()),
+            })
+            .await;
+        Ok(Response::new(api::AddExternalCorpusResponse {
+            success: outcome.success,
+            corpus_id: outcome.corpus_id,
+            message: outcome.message,
+            loaded_token_count: outcome.loaded_token_count,
+        }))
+    }
+
+    async fn remove_external_corpus(
+        &self,
+        request: Request<api::RemoveExternalCorpusRequest>,
+    ) -> Result<Response<api::RemoveExternalCorpusResponse>, Status> {
+        let Some(corpus_id) = request.into_inner().corpus_id.filter(|id| !id.is_empty()) else {
+            return Err(Status::invalid_argument("corpus_id is required."));
+        };
+        let outcome = self.core.remove_external_corpus(corpus_id).await;
+        Ok(Response::new(api::RemoveExternalCorpusResponse {
+            success: outcome.success,
+            message: outcome.message,
+        }))
+    }
+
+    async fn list_external_corpora(
+        &self,
+        _request: Request<api::ListExternalCorporaRequest>,
+    ) -> Result<Response<api::ListExternalCorporaResponse>, Status> {
+        let listing = self.core.list_external_corpora().await;
+        Ok(Response::new(api::ListExternalCorporaResponse {
+            success: listing.success,
+            corpus_token_counts: listing.corpus_token_counts.into_iter().collect(),
+            message: listing.message,
+        }))
     }
 
     async fn get_hi_cache_storage(

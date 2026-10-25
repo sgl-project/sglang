@@ -265,6 +265,57 @@ pub struct ResumeMemoryOccupationRequest {
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct MemoryOccupationResponse {}
+/// `/add_external_corpus`: exactly one of `file_path` (a JSONL file of strings
+/// on the server) or `documents`; `token_chunks` is for pre-tokenized input.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AddExternalCorpusRequest {
+    /// Minted when absent.
+    #[prost(string, optional, tag = "1")]
+    pub corpus_id: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "2")]
+    pub file_path: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "3")]
+    pub documents: ::core::option::Option<StringList>,
+    #[prost(message, optional, tag = "4")]
+    pub token_chunks: ::core::option::Option<TokenIdsList>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AddExternalCorpusResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(string, tag = "2")]
+    pub corpus_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub message: ::prost::alloc::string::String,
+    #[prost(int64, tag = "4")]
+    pub loaded_token_count: i64,
+}
+/// `/remove_external_corpus`.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RemoveExternalCorpusRequest {
+    #[prost(string, optional, tag = "1")]
+    pub corpus_id: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RemoveExternalCorpusResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(string, tag = "2")]
+    pub message: ::prost::alloc::string::String,
+}
+/// `/list_external_corpora`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ListExternalCorporaRequest {}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListExternalCorporaResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    /// Corpus id to its token count; every rank loads the same set.
+    #[prost(map = "string, int64", tag = "2")]
+    pub corpus_token_counts: ::std::collections::HashMap<::prost::alloc::string::String, i64>,
+    #[prost(string, tag = "3")]
+    pub message: ::prost::alloc::string::String,
+}
 /// Python's `matched` key, `Union\[str, int, List[int]\]`: the three wire shapes
 /// are disjoint, so shape alone picks the arm (untagged).
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -881,6 +932,154 @@ pub struct HiCacheStatus {
 /// Result shared by the HTTP and gRPC management APIs.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct HiCacheStorageResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(string, tag = "2")]
+    pub message: ::prost::alloc::string::String,
+}
+/// `/parse_function_call`.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ParseFunctionCallRequest {
+    #[prost(string, tag = "1")]
+    pub text: ::prost::alloc::string::String,
+    /// The tools the text may call; `tool_index` in the reply indexes this list.
+    #[prost(message, repeated, tag = "2")]
+    pub tools: ::prost::alloc::vec::Vec<ToolSpec>,
+    /// e.g. "llama3", "qwen25", "mistral"; required.
+    #[prost(string, optional, tag = "3")]
+    pub tool_call_parser: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// An OpenAI-shaped tool definition, as Python's `io_struct.Tool`.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ToolSpec {
+    #[prost(message, optional, tag = "1")]
+    pub function: ::core::option::Option<ToolFunctionSpec>,
+    #[prost(string, optional, tag = "2")]
+    pub r#type: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ToolFunctionSpec {
+    #[prost(string, optional, tag = "1")]
+    pub name: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "2")]
+    pub description: ::core::option::Option<::prost::alloc::string::String>,
+    /// The JSON Schema of the arguments, passed through as JSON text.
+    #[prost(string, optional, tag = "3")]
+    pub parameters: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// Python's `ToolCallItem`: `parameters` is the arguments as a JSON string.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ParsedToolCall {
+    #[prost(int64, tag = "1")]
+    pub tool_index: i64,
+    #[prost(string, optional, tag = "2")]
+    pub name: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, tag = "3")]
+    pub parameters: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ParseFunctionCallResponse {
+    #[prost(string, tag = "1")]
+    pub normal_text: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "2")]
+    pub calls: ::prost::alloc::vec::Vec<ParsedToolCall>,
+}
+/// `/separate_reasoning`.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SeparateReasoningRequest {
+    #[prost(string, tag = "1")]
+    pub text: ::prost::alloc::string::String,
+    /// e.g. "deepseek-r1", "qwen3"; required.
+    #[prost(string, tag = "2")]
+    pub reasoning_parser: ::prost::alloc::string::String,
+    /// Also return the segments as blocks.
+    #[prost(bool, tag = "3")]
+    pub return_blocks: bool,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SeparateReasoningResponse {
+    #[prost(string, tag = "1")]
+    pub reasoning_text: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub text: ::prost::alloc::string::String,
+    /// Only with `return_blocks`.
+    #[prost(message, optional, tag = "3")]
+    pub reasoning_blocks: ::core::option::Option<StringList>,
+    #[prost(message, optional, tag = "4")]
+    pub text_blocks: ::core::option::Option<StringList>,
+}
+/// `/get_weights_by_name`: read one parameter, truncated, from every DP rank.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GetWeightsByNameRequest {
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    /// Elements kept per dimension; Python's `truncate_size: int = 100`.
+    #[prost(int64, optional, tag = "2")]
+    pub truncate_size: ::core::option::Option<i64>,
+}
+/// One parameter per DP rank in rank order, each the scheduler's
+/// `List\[float | List[float]\]` as JSON text (a rank that found no parameter
+/// contributes `null`). HTTP unwraps a single rank to the bare value, as
+/// Python does.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GetWeightsByNameResponse {
+    #[prost(string, repeated, tag = "1")]
+    pub parameters: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
+/// `/init_weights_update_group`: join the trainer's weight-update process group.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct InitWeightsUpdateGroupRequest {
+    #[prost(string, tag = "1")]
+    pub master_address: ::prost::alloc::string::String,
+    #[prost(int64, tag = "2")]
+    pub master_port: i64,
+    #[prost(int64, tag = "3")]
+    pub rank_offset: i64,
+    #[prost(int64, tag = "4")]
+    pub world_size: i64,
+    #[prost(string, optional, tag = "5")]
+    pub group_name: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "6")]
+    pub backend: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// `/destroy_weights_update_group`.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DestroyWeightsUpdateGroupRequest {
+    #[prost(string, optional, tag = "1")]
+    pub group_name: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// `/init_weights_send_group_for_remote_instance`: open the send group toward
+/// another engine instance.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct InitWeightsSendGroupForRemoteInstanceRequest {
+    #[prost(string, tag = "1")]
+    pub master_address: ::prost::alloc::string::String,
+    /// One port per rank, as the comma-separated string Python takes.
+    #[prost(string, tag = "2")]
+    pub ports: ::prost::alloc::string::String,
+    #[prost(int64, tag = "3")]
+    pub group_rank: i64,
+    #[prost(int64, tag = "4")]
+    pub world_size: i64,
+    #[prost(string, optional, tag = "5")]
+    pub group_name: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "6")]
+    pub backend: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// `/send_weights_to_remote_instance`.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SendWeightsToRemoteInstanceRequest {
+    #[prost(string, tag = "1")]
+    pub master_address: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub ports: ::prost::alloc::string::String,
+    #[prost(string, optional, tag = "3")]
+    pub group_name: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// `{success, message}` as Python answers every group operation; HTTP 200 on
+/// success, 400 otherwise.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct WeightGroupResponse {
     #[prost(bool, tag = "1")]
     pub success: bool,
     #[prost(string, tag = "2")]

@@ -617,6 +617,48 @@
       "name": "tags are a bare string list",
       "input": {"tags": ["weights"]},
       "canonical": "{\"tags\":[\"weights\"]}"
+    },
+    {
+      "type": "GetWeightsByNameRequest",
+      "name": "truncate_size defaults to 100 when absent",
+      "input": {"name": "model.embed_tokens.weight"},
+      "canonical": "{\"name\":\"model.embed_tokens.weight\",\"truncate_size\":100}"
+    },
+    {
+      "type": "InitWeightsUpdateGroupRequest",
+      "name": "group name and backend take Python's defaults, null included",
+      "input": {"master_address": "10.0.0.1", "master_port": 29500, "rank_offset": 1, "world_size": 9, "backend": null},
+      "canonical": "{\"master_address\":\"10.0.0.1\",\"master_port\":29500,\"rank_offset\":1,\"world_size\":9,\"group_name\":\"weight_update_group\",\"backend\":\"nccl\"}"
+    },
+    {
+      "type": "SendWeightsToRemoteInstanceRequest",
+      "name": "an explicit group name is kept",
+      "input": {"master_address": "10.0.0.2", "ports": "9000,9001", "group_name": "g"},
+      "canonical": "{\"master_address\":\"10.0.0.2\",\"ports\":\"9000,9001\",\"group_name\":\"g\"}"
+    },
+    {
+      "type": "ParseFunctionCallRequest",
+      "name": "tool parameters pass through as a JSON schema object and type defaults to function",
+      "input": {"text": "t", "tools": [{"function": {"name": "f", "parameters": {"type": "object", "properties": {"x": {"type": "integer"}}}}}], "tool_call_parser": "qwen25"},
+      "canonical": "{\"text\":\"t\",\"tools\":[{\"function\":{\"name\":\"f\",\"parameters\":{\"type\":\"object\",\"properties\":{\"x\":{\"type\":\"integer\"}}}},\"type\":\"function\"}],\"tool_call_parser\":\"qwen25\"}"
+    },
+    {
+      "type": "ParseFunctionCallResponse",
+      "name": "a call with no name is emitted as null",
+      "input": {"normal_text": "", "calls": [{"tool_index": -1, "parameters": "{}"}]},
+      "canonical": "{\"normal_text\":\"\",\"calls\":[{\"tool_index\":-1,\"name\":null,\"parameters\":\"{}\"}]}"
+    },
+    {
+      "type": "AddExternalCorpusRequest",
+      "name": "pre-tokenized chunks are a bare list of bare lists",
+      "input": {"corpus_id": "c", "token_chunks": [[1, 2], [3]]},
+      "canonical": "{\"corpus_id\":\"c\",\"token_chunks\":[[1,2],[3]]}"
+    },
+    {
+      "type": "ListExternalCorporaResponse",
+      "name": "counts are a plain string-keyed object",
+      "input": {"success": true, "corpus_token_counts": {"c": 3}},
+      "canonical": "{\"success\":true,\"corpus_token_counts\":{\"c\":3},\"message\":\"\"}"
     }
   ]
 }

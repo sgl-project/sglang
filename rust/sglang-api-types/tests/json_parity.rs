@@ -73,6 +73,27 @@ fn fixtures_decode_to_their_canonical_bytes() {
             "ReleaseMemoryOccupationRequest" => {
                 check::<api::ReleaseMemoryOccupationRequest>(&name, input, canonical)
             }
+            "GetWeightsByNameRequest" => {
+                check::<api::GetWeightsByNameRequest>(&name, input, canonical)
+            }
+            "InitWeightsUpdateGroupRequest" => {
+                check::<api::InitWeightsUpdateGroupRequest>(&name, input, canonical)
+            }
+            "SendWeightsToRemoteInstanceRequest" => {
+                check::<api::SendWeightsToRemoteInstanceRequest>(&name, input, canonical)
+            }
+            "ParseFunctionCallRequest" => {
+                check::<api::ParseFunctionCallRequest>(&name, input, canonical)
+            }
+            "ParseFunctionCallResponse" => {
+                check::<api::ParseFunctionCallResponse>(&name, input, canonical)
+            }
+            "AddExternalCorpusRequest" => {
+                check::<api::AddExternalCorpusRequest>(&name, input, canonical)
+            }
+            "ListExternalCorporaResponse" => {
+                check::<api::ListExternalCorporaResponse>(&name, input, canonical)
+            }
             other => panic!("fixture type {other} has no Rust mapping; add it here"),
         }
     }

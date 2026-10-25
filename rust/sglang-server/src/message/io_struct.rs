@@ -148,6 +148,61 @@ control_messages! {
         tags: Option<Vec<String>>,
     }
 
+    /// `/get_weights_by_name`: Python's `GetWeightsByNameReqInput`.
+    GetWeightsByNameReqInput {
+        name: String,
+        truncate_size: i64,
+    }
+
+    /// `/init_weights_update_group`: Python's `InitWeightsUpdateGroupReqInput`.
+    InitWeightsUpdateGroupReqInput {
+        master_address: String,
+        master_port: i64,
+        rank_offset: i64,
+        world_size: i64,
+        group_name: String,
+        backend: String,
+    }
+
+    /// `/destroy_weights_update_group`.
+    DestroyWeightsUpdateGroupReqInput {
+        group_name: String,
+    }
+
+    /// `/init_weights_send_group_for_remote_instance`.
+    InitWeightsSendGroupForRemoteInstanceReqInput {
+        master_address: String,
+        ports: String,
+        group_rank: i64,
+        world_size: i64,
+        group_name: String,
+        backend: String,
+    }
+
+    /// `/send_weights_to_remote_instance`.
+    SendWeightsToRemoteInstanceReqInput {
+        master_address: String,
+        ports: String,
+        group_name: String,
+    }
+
+    /// `/add_external_corpus`: Python's `AddExternalCorpusReqInput`, after
+    /// the frontend tokenized `file_path` / `documents` into `token_chunks`.
+    AddExternalCorpusReqInput {
+        corpus_id: Option<String>,
+        file_path: Option<String>,
+        documents: Option<Vec<String>>,
+        token_chunks: Option<Vec<Vec<i64>>>,
+    }
+
+    /// `/remove_external_corpus`.
+    RemoveExternalCorpusReqInput {
+        corpus_id: String,
+    }
+
+    /// `/list_external_corpora`.
+    ListExternalCorporaReqInput {}
+
     /// Clear the HiCache storage backend.
     ClearHiCacheReqInput {}
 
@@ -226,6 +281,108 @@ impl<'a> From<&'a GenerateRequest> for TokenizedGenerateReqInput<'a> {
 impl SetInternalStateReq {
     pub fn new(rid: String, server_args: serde_json::Map<String, serde_json::Value>) -> Self {
         Self { rid, server_args }
+    }
+}
+
+impl GetWeightsByNameReqInput {
+    pub fn new(rid: String, name: String, truncate_size: i64) -> Self {
+        Self {
+            rid,
+            name,
+            truncate_size,
+        }
+    }
+}
+
+/// The `/init_weights_update_group` fields; the owned form of
+/// `api::InitWeightsUpdateGroupRequest` after its defaults are applied.
+#[derive(Debug, Clone)]
+pub struct WeightsUpdateGroup {
+    pub master_address: String,
+    pub master_port: i64,
+    pub rank_offset: i64,
+    pub world_size: i64,
+    pub group_name: String,
+    pub backend: String,
+}
+
+impl InitWeightsUpdateGroupReqInput {
+    pub fn new(rid: String, group: WeightsUpdateGroup) -> Self {
+        Self {
+            rid,
+            master_address: group.master_address,
+            master_port: group.master_port,
+            rank_offset: group.rank_offset,
+            world_size: group.world_size,
+            group_name: group.group_name,
+            backend: group.backend,
+        }
+    }
+}
+
+impl DestroyWeightsUpdateGroupReqInput {
+    pub fn new(rid: String, group_name: String) -> Self {
+        Self { rid, group_name }
+    }
+}
+
+/// The `/init_weights_send_group_for_remote_instance` fields.
+#[derive(Debug, Clone)]
+pub struct WeightsSendGroup {
+    pub master_address: String,
+    pub ports: String,
+    pub group_rank: i64,
+    pub world_size: i64,
+    pub group_name: String,
+    pub backend: String,
+}
+
+impl InitWeightsSendGroupForRemoteInstanceReqInput {
+    pub fn new(rid: String, group: WeightsSendGroup) -> Self {
+        Self {
+            rid,
+            master_address: group.master_address,
+            ports: group.ports,
+            group_rank: group.group_rank,
+            world_size: group.world_size,
+            group_name: group.group_name,
+            backend: group.backend,
+        }
+    }
+}
+
+impl SendWeightsToRemoteInstanceReqInput {
+    pub fn new(rid: String, master_address: String, ports: String, group_name: String) -> Self {
+        Self {
+            rid,
+            master_address,
+            ports,
+            group_name,
+        }
+    }
+}
+
+impl AddExternalCorpusReqInput {
+    pub fn new(rid: String, corpus_id: String, token_chunks: Vec<Vec<i64>>) -> Self {
+        Self {
+            rid,
+            corpus_id: Some(corpus_id),
+            file_path: None,
+            documents: None,
+            token_chunks: Some(token_chunks),
+        }
+    }
+}
+
+impl RemoveExternalCorpusReqInput {
+    pub fn new(rid: String, corpus_id: String) -> Self {
+        Self { rid, corpus_id }
+    }
+}
+
+impl ListExternalCorporaReqInput {
+    pub fn new(rid: String) -> Self {
+        Self { rid }
     }
 }
 
