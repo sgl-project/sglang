@@ -20,6 +20,7 @@ from typing import (
 import msgspec
 import torch
 
+from sglang.srt.configs.load_config import LoadFormat
 from sglang.srt.constants import (
     GPU_MEMORY_ALL_TYPES,
     GPU_MEMORY_TYPE_CUDA_GRAPH,
@@ -60,6 +61,9 @@ from sglang.srt.managers.scheduler_components.request_list import (
     PD_KINDS,
     ListKind,
     assert_empty,
+)
+from sglang.srt.model_executor.model_runner_components.load_model_utils import (
+    resolve_weights_cpu_backup,
 )
 from sglang.srt.model_executor.weight_checker import overall_checksum
 from sglang.srt.platforms import current_platform
@@ -171,10 +175,20 @@ class SchedulerWeightUpdaterManager:
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         """In-place update of the weights from disk."""
+        error = self._validate_disk_update(recv_req)
+        if error is not None:
+            logger.error(error)
+            return UpdateWeightFromDiskReqOutput(
+                success=False, message=error, num_paused_requests=0
+            )
+        # remote_instance skips drafts; _validate_disk_update requires their backup.
+        selector = (
+            "target" if recv_req.load_format == LoadFormat.REMOTE_INSTANCE else "all"
+        )
         with self._observe_weight_load("disk"):
             success, message = True, "Succeeded to update model weights."
             target_updated = False
-            for role, runner in self._select_runners():
+            for role, runner in self._select_runners(selector):
                 success, message = runner.weight_updater.update_weights_from_disk(
                     recv_req.model_path,
                     recv_req.load_format,
@@ -195,6 +209,30 @@ class SchedulerWeightUpdaterManager:
             return UpdateWeightFromDiskReqOutput(
                 success=success, message=message, num_paused_requests=0
             )
+
+    def _validate_disk_update(
+        self, recv_req: UpdateWeightFromDiskReqInput
+    ) -> Optional[str]:
+        if (
+            GPU_MEMORY_TYPE_WEIGHTS in self.offload_tags
+            and self.memory_saver_adapter.enabled
+        ):
+            # Writing into unmapped weight pages is an illegal memory access.
+            return (
+                "Cannot update weights while they are released; call "
+                "resume_memory_occupation with the 'weights' tag first."
+            )
+        if recv_req.load_format != LoadFormat.REMOTE_INSTANCE:
+            return None
+        for _, runner in self._select_runners("draft"):
+            if not self._weights_survive_release(
+                is_draft_worker=runner.is_draft_worker
+            ):
+                return (
+                    "remote_instance reloads only the target model; start the server "
+                    "with --enable-draft-weights-cpu-backup to keep the draft weights."
+                )
+        return None
 
     def init_weights_update_group(self, recv_req: InitWeightsUpdateGroupReqInput):
         """Initialize the online model parameter update group."""
@@ -506,6 +544,7 @@ class SchedulerWeightUpdaterManager:
 
         if GPU_MEMORY_TYPE_WEIGHTS in tags:
             self._assert_weight_cache_inactive("release_memory_occupation")
+            self._notify_loaders_before_weights_release()
             self.stashed_model_static_state = _export_static_state(
                 self.tp_worker.model_runner.model
             )
@@ -518,6 +557,28 @@ class SchedulerWeightUpdaterManager:
         torch.get_device_module().synchronize()
 
         return ReleaseMemoryOccupationReqOutput(success=True, message="Success")
+
+    def _weights_survive_release(self, *, is_draft_worker: bool) -> bool:
+        # Without the memory saver, release leaves the weights mapped.
+        return not self.memory_saver_adapter.enabled or resolve_weights_cpu_backup(
+            is_draft_worker=is_draft_worker
+        )
+
+    def _notify_loaders_before_weights_release(self) -> None:
+        for _, runner in self._select_runners():
+            runner.loader.before_weights_release(
+                content_preserved=self._weights_survive_release(
+                    is_draft_worker=runner.is_draft_worker
+                )
+            )
+
+    def _notify_loaders_after_weights_resume(self) -> None:
+        for _, runner in self._select_runners():
+            runner.loader.after_weights_resume(
+                content_preserved=self._weights_survive_release(
+                    is_draft_worker=runner.is_draft_worker
+                )
+            )
 
     def resume_memory_occupation(self, recv_req: ResumeMemoryOccupationReqInput):
         tags = recv_req.tags
@@ -540,6 +601,9 @@ class SchedulerWeightUpdaterManager:
                 self.stashed_model_static_state,
             )
             del self.stashed_model_static_state
+
+            torch.get_device_module().synchronize()
+            self._notify_loaders_after_weights_resume()
 
         if GPU_MEMORY_TYPE_KV_CACHE in tags:
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_KV_CACHE)
