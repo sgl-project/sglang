@@ -1042,15 +1042,12 @@ class UnifiedMHATokenToKVPoolMXFP8(UnifiedMHATokenToKVPool, MHATokenToKVPoolMXFP
         self.mxfp8_sf_interleaved = True
         self._kv_buffer_descs = self._build_kv_buffer_descs()
 
-    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+    def move_physical_pages(
+        self, tgt_pages: torch.Tensor, src_pages: torch.Tensor, page_size: int
+    ):
         """Move payload and scales by the same physical page ids."""
-        super().move_kv_cache(tgt_loc, src_loc)
-        if tgt_loc.numel() == 0:
-            return
-        ps = self.page_size
-        tgt_pages = tgt_loc.view(-1, ps)[:, 0] // ps
-        src_pages = src_loc.view(-1, ps)[:, 0] // ps
-        with record_function("UnifiedMHAMXFP8.move_scale_cache"):
+        super().move_physical_pages(tgt_pages, src_pages, page_size)
+        with record_function("UnifiedMHAMXFP8.move_scale_pages"):
             for buf in self.k_scale_buffer + self.v_scale_buffer:
                 copy_pages(
                     buf.view(torch.uint8).flatten(),

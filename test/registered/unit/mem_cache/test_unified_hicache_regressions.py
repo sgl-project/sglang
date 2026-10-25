@@ -387,7 +387,10 @@ class TestUnifiedMXFP8ScaleReload(CustomTestCase):
             buf.random_(100, 140)
         expected = [buf[3].clone() for buf in scales]
         pool.move_kv_cache(loc + self._PS, loc)
-        loc += self._PS
+        pool.move_physical_pages(
+            torch.tensor([5], device="cuda"), torch.tensor([4], device="cuda"), self._PS
+        )
+        loc += 2 * self._PS
 
         host_loc = torch.arange(self._PS, dtype=torch.int64, device="cuda")
         host.backup_from_device_all_layer(pool, host_loc, loc, io_backend="kernel")
@@ -401,7 +404,7 @@ class TestUnifiedMXFP8ScaleReload(CustomTestCase):
         torch.cuda.synchronize()
 
         for actual, reference in zip(scales, expected):
-            self.assertTrue(torch.equal(actual[4], reference))
+            self.assertTrue(torch.equal(actual[5], reference))
 
 
 if __name__ == "__main__":
