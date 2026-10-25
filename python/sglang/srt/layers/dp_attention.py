@@ -17,9 +17,6 @@ from sglang.srt.distributed import (
     GroupCoordinator,
     tensor_model_parallel_all_reduce,
 )
-from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
-    CustomAllReduceV2,
-)
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -40,7 +37,15 @@ from sglang.srt.runtime_context import (
     get_spec,
     get_stream,
 )
-from sglang.srt.utils import get_bool_env_var, is_cpu, is_hip
+from sglang.srt.utils import get_bool_env_var, is_cpu, is_hip, is_xpu
+
+if is_xpu():
+    # custom_all_reduce_v2 imports tvm_ffi, absent on XPU; isinstance(x, ()) is False.
+    CustomAllReduceV2 = ()
+else:
+    from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
+        CustomAllReduceV2,
+    )
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
