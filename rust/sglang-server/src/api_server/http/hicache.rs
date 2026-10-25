@@ -99,6 +99,7 @@ mod tests {
                 is_disaggregation: false,
                 mm_limits: Default::default(),
                 metadata: (&args).into(),
+                metrics: None,
             },
         );
         (
