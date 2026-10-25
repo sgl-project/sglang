@@ -998,6 +998,7 @@ def _report(
     planning_headroom_correction_gib: int = 0,
     observed_reserved_gib: float = 0,
     peak_allocation_limit_gib: float | None = None,
+    phase_allocation_limits_gib: dict[str, float] | None = None,
     candidates: list[ResidencyTarget] | None = None,
     skip_reason: str | None = None,
     phase_peaks_gib: dict[str, float] | None = None,
@@ -1035,6 +1036,10 @@ def _report(
             if peak_allocation_limit_gib is None
             else int(peak_allocation_limit_gib * GIB_BYTES)
         ),
+        phase_allocation_limit_bytes={
+            name: int(value * GIB_BYTES)
+            for name, value in (phase_allocation_limits_gib or {}).items()
+        },
         estimated_peak_bytes_by_phase={
             name: int(value * GIB_BYTES)
             for name, value in (phase_peaks_gib or {}).items()
@@ -1127,6 +1132,37 @@ class TestResolveMeasuredDefaultWorkload:
 
 
 class TestPlanAutoResidency:
+    @pytest.mark.parametrize("suffix", ["", ":layout:0"])
+    def test_encoding_headroom_cannot_increase_a_cached_denoising_request(self, suffix):
+        plan = plan_auto_residency(
+            reports=[
+                _report(
+                    budget_gib=180,
+                    estimated_gib=30,
+                    peak_allocation_limit_gib=30,
+                    phase_allocation_limits_gib={"denoise": 20, "encode": 30},
+                    phase_peaks_gib={f"denoise{suffix}": 20, "encode": 30},
+                    phase_components={
+                        f"denoise{suffix}": ("transformer",),
+                        "encode": ("encoder",),
+                    },
+                    candidates=[_candidate("encoder", weight_gib=5)],
+                )
+            ]
+        )
+        assert not plan.changes
+
+    @pytest.mark.parametrize("suffix", ["", ":layout:0"])
+    def test_validation_enforces_phase_limits_below_the_global_peak(self, suffix):
+        report = _report(
+            budget_gib=180,
+            estimated_gib=30,
+            peak_allocation_limit_gib=30,
+            phase_allocation_limits_gib={"denoise": 20},
+            phase_peaks_gib={f"denoise{suffix}": 25},
+        )
+        assert current_placement_reserve_shortfall_bytes([report]) == 5 * GIB_BYTES
+
     @pytest.mark.parametrize(
         "peak_gib,limit_gib,expected", [(30, 30, False), (20, 30, True)]
     )

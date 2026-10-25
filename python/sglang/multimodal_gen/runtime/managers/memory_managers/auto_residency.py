@@ -262,6 +262,7 @@ class RankResidencyReport(msgspec.Struct, frozen=True):
     estimated_peak_bytes: int | None
     # fixed by the first successful calibration, separate from card capacity
     peak_allocation_limit_bytes: int | None = None
+    phase_allocation_limit_bytes: dict[str, int] = {}
     # Conservative margin learned from a failed candidate. It constrains only
     # future growth: the current placement was measured against the physical
     # budget and must not become retroactively infeasible after a rollback.
@@ -2761,6 +2762,12 @@ def current_placement_reserve_shortfall_bytes(
         shortfalls.append(realized_footprint + reserve - report.budget_bytes)
         if report.peak_allocation_limit_bytes is not None:
             shortfalls.append(measured_peak - report.peak_allocation_limit_bytes)
+        for phase_name, phase_peak in report.estimated_peak_bytes_by_phase.items():
+            phase_limit = report.phase_allocation_limit_bytes.get(
+                phase_name.split(":layout:", 1)[0]
+            )
+            if phase_limit is not None:
+                shortfalls.append(phase_peak - phase_limit)
     return max(0, max(shortfalls, default=0))
 
 
@@ -3153,6 +3160,10 @@ def plan_auto_residency(*, reports: list[RankResidencyReport]) -> AutoResidencyP
     current_placement_reserve_shortfall = max(0, current_placement_reserve_shortfall)
     resource_budgets: dict[str, int] = {}
     for report in reports:
+        phase_limits = {
+            f"gpu:rank{report.rank}:{phase_name}": limit
+            for phase_name, limit in report.phase_allocation_limit_bytes.items()
+        }
         for resource_name, phase_peak, _, _, _, _, _ in phase_constraints[report.rank]:
             # The measured placement has already completed warmup. A negative
             # reserve headroom therefore means "do not grow this phase", not
@@ -3163,10 +3174,14 @@ def plan_auto_residency(*, reports: list[RankResidencyReport]) -> AutoResidencyP
                 - reserves_by_rank[report.rank]
                 - report.planning_headroom_correction_bytes
             )
-            if report.peak_allocation_limit_bytes is not None:
+            allocation_limit = phase_limits.get(
+                resource_name.split(":layout:", 1)[0],
+                report.peak_allocation_limit_bytes,
+            )
+            if allocation_limit is not None:
                 available = min(
                     available,
-                    report.peak_allocation_limit_bytes
+                    allocation_limit
                     - phase_peak
                     - report.planning_headroom_correction_bytes,
                 )
