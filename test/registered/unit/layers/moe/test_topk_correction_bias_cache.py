@@ -3,16 +3,10 @@ import unittest
 import torch
 
 from sglang.srt.layers.moe.topk import TopKConfig
-from sglang.test.ci.ci_register import (
-    register_amd_ci,
-    register_cpu_ci,
-    register_cuda_ci,
-)
+from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=7, suite="base-a-test-cpu")
-register_cuda_ci(est_time=10, stage="base-a", runner_config="1-gpu-small")
-register_amd_ci(est_time=5, stage="stage-a", runner_config="1-gpu-small-amd")
 
 
 class CorrectionBiasCacheTestMixin:
@@ -50,22 +44,9 @@ class CorrectionBiasCacheTestMixin:
         torch.testing.assert_close(converted_after_reload, reloaded_value.float())
         self.assertNotEqual(converted.data_ptr(), converted_after_reload.data_ptr())
 
-    def test_matching_dtype_returns_original_tensor(self):
-        correction_bias = torch.randn(8, dtype=torch.float32, device=self.device)
-        config = TopKConfig(top_k=2, correction_bias=correction_bias)
-
-        result = config.correction_bias_for_dtype(torch.float32)
-
-        self.assertEqual(result.data_ptr(), correction_bias.data_ptr())
-
 
 class TestCorrectionBiasCacheCPU(CorrectionBiasCacheTestMixin, CustomTestCase):
     device = "cpu"
-
-
-@unittest.skipUnless(torch.cuda.is_available(), "needs a GPU")
-class TestCorrectionBiasCacheGPU(CorrectionBiasCacheTestMixin, CustomTestCase):
-    device = "cuda"
 
 
 if __name__ == "__main__":

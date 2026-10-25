@@ -40,6 +40,7 @@
     },
     "scenarios": {
         "flux_2_klein_base_image_t2i": {
+            "expected_load_ms": 30018.87,
             "stages_ms": {
                 "DecodingStage": 18.19,
                 "DenoisingStage": 17612.9,
@@ -60,13 +61,14 @@
             "expected_e2e_ms": 18255.39,
             "expected_avg_denoise_ms": 338.78,
             "expected_median_denoise_ms": 345.95,
-            "load_peak_vram_mb": 8522.0,
-            "runtime_peak_vram_mb": 20056.0,
-            "load_peak_allocated_mb": 8412.0,
-            "runtime_peak_allocated_mb": 17723.0,
+            "load_peak_vram_mb": 1126.0,
+            "runtime_peak_vram_mb": 13180.0,
+            "load_peak_allocated_mb": 1019.0,
+            "runtime_peak_allocated_mb": 8912.0,
             "estimated_full_test_time_s": 94.0
         },
         "wan2_1_t2v_1.3b": {
+            "expected_load_ms": 46026.44,
             "stages_ms": {
                 "DecodingStage": 495.01,
                 "DenoisingStage": 21452.59,
@@ -86,13 +88,14 @@
             "expected_e2e_ms": 23418.73,
             "expected_avg_denoise_ms": 426.59,
             "expected_median_denoise_ms": 427.94,
-            "load_peak_vram_mb": 3808.0,
-            "runtime_peak_vram_mb": 14120.0,
-            "load_peak_allocated_mb": 3641.0,
-            "runtime_peak_allocated_mb": 9778.0,
+            "load_peak_vram_mb": 4934.0,
+            "runtime_peak_vram_mb": 18246.0,
+            "load_peak_allocated_mb": 903.0,
+            "runtime_peak_allocated_mb": 6934.0,
             "estimated_full_test_time_s": 160.9
         },
         "turbo_wan2_1_t2v_1.3b": {
+            "expected_load_ms": 43084.93,
             "stages_ms": {
                 "InputValidationStage": 0.11,
                 "TextEncodingStage": 634.42,
@@ -111,15 +114,16 @@
             "expected_e2e_ms": 2155.59,
             "expected_avg_denoise_ms": 143.62,
             "expected_median_denoise_ms": 160.64,
-            "load_peak_vram_mb": 3810.0,
-            "runtime_peak_vram_mb": 13962.0,
-            "load_peak_allocated_mb": 3643.0,
-            "runtime_peak_allocated_mb": 9625.0,
+            "load_peak_vram_mb": 928.0,
+            "runtime_peak_vram_mb": 14216.0,
+            "load_peak_allocated_mb": 903.0,
+            "runtime_peak_allocated_mb": 6925.0,
             "load_peak_host_anon_mb": 6759.33,
             "runtime_peak_host_anon_mb": 6759.33,
             "estimated_full_test_time_s": 200.3
         },
         "zimage_image_t2i": {
+            "expected_load_ms": 43930.51,
             "stages_ms": {
                 "DecodingStage": 7.11,
                 "DenoisingStage": 2178.8,
@@ -140,12 +144,13 @@
             "expected_avg_denoise_ms": 241.53,
             "expected_median_denoise_ms": 265.1,
             "load_peak_vram_mb": 13120.0,
-            "runtime_peak_vram_mb": 24372.0,
+            "runtime_peak_vram_mb": 17776.0,
             "load_peak_allocated_mb": 12852.0,
-            "runtime_peak_allocated_mb": 22062.0,
+            "runtime_peak_allocated_mb": 15133.0,
             "estimated_full_test_time_s": 329.8
         },
         "flux_image_t2i_layerwise_cpu_offload_5090": {
+            "expected_load_ms": 47725.91,
             "stages_ms": {
                 "InputValidationStage": 0.11,
                 "TextEncodingStage": 204.63,
@@ -194,6 +199,7 @@
             "estimated_full_test_time_s": 90.0
         },
         "minimax_h3_t2va_consumer_budget_1gpu_5090": {
+            "expected_load_ms": 47708.93,
             "stages_ms": {
                 "InputValidationStage": 0.06,
                 "MiniMaxH3PartitionAdmissionStage": 0.03,
@@ -206,13 +212,13 @@
                 "MiniMaxH3DecodingStage": 5257.87
             },
             "denoise_step_ms": {
-                "0": 5532.35,
-                "1": 4328.93,
-                "2": 3792.68,
-                "3": 4200.6,
-                "4": 4506.42,
-                "5": 4071.27,
-                "6": 3992.12
+                "0": 4941.69,
+                "1": 4863.02,
+                "2": 4223.75,
+                "3": 4384.88,
+                "4": 6182.67,
+                "5": 5068.86,
+                "6": 4579.34
             },
             "expected_e2e_ms": 42763.29,
             "expected_avg_denoise_ms": 4892.03,

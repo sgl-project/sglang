@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # MiniMax H3 visual VAE: 3D causal CNN encoder + ViT3D decoder (inference-only bundle).
+from __future__ import annotations
+
 import math
-import os
 from typing import List, Union
 
 import numpy as np
@@ -14,13 +15,23 @@ from diffusers.models import ModelMixin
 from diffusers.utils import logging
 from PIL import Image
 
+from sglang.kernels.ops.diffusion import (
+    can_use_minimax_h3_vae_temporal_blend_write,
+    minimax_h3_vae_output_device_supported,
+    minimax_h3_vae_temporal_blend_write,
+)
+from sglang.kernels.ops.diffusion.sites.bitexact_gate import BitExactFusionGate
+from sglang.multimodal_gen import envs
+from sglang.multimodal_gen.runtime.cache.conditioning import cached_vae_encode
 from sglang.multimodal_gen.runtime.distributed import (
     get_decode_parallel_group_coordinator,
     get_decode_parallel_rank,
     get_decode_parallel_world_size,
     model_parallel_is_initialized,
 )
+from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import VaeFastPathGate
 
+from .batching import decode_windows, forward_many
 from .processor import (
     VAEProcessor,
     get_denormalize_transform,
@@ -31,37 +42,38 @@ from .vae_vit import ViT3DDecoder
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
+# The temporal blend write reproduces the eager chain bit for bit, so it runs
+# at every quality level. The gate verifies that against the live eager
+# dispatch on first sight and falls back for good on a mismatch. The blend
+# arithmetic only runs with a previous window, so the gate is keyed by that:
+# a plain copy cannot vouch for a blend.
+_TEMPORAL_BLEND_FUSION = BitExactFusionGate(
+    "MiniMax-H3 VAE temporal blend write", per_signature=True
+)
 
-def _resolve_temporal_cat_dtype():
-    raw = (
-        os.environ.get("MINIMAX_H3_VAE_DECODER_TEMPORAL_CAT_DTYPE", "").strip().lower()
+
+def _gate_admits(gate: BitExactFusionGate, sig) -> bool:
+    # Per-signature can_attempt_once: an unverified signature still needs the
+    # eager reference and a host sync, so not inside compile or stream capture.
+    if gate.disabled:
+        return False
+    if gate.is_verified(sig):
+        return True
+    if torch.compiler.is_compiling():
+        return False
+    return not (torch.cuda.is_available() and torch.cuda.is_current_stream_capturing())
+
+
+def _output_kernel_candidate(
+    value: torch.Tensor, gate: BitExactFusionGate, sig
+) -> bool:
+    return (
+        value.is_cuda
+        and value.dtype == torch.float32
+        and not torch.is_grad_enabled()
+        and _gate_admits(gate, sig)
+        and minimax_h3_vae_output_device_supported(value.device)
     )
-    if raw in ("", "0", "false", "no", "off", "none", "keep", "default"):
-        return None
-    mapping = {
-        "fp16": torch.float16,
-        "float16": torch.float16,
-        "half": torch.float16,
-        "bf16": torch.bfloat16,
-        "bfloat16": torch.bfloat16,
-        "fp32": torch.float32,
-        "float32": torch.float32,
-    }
-    if raw not in mapping:
-        raise ValueError(
-            "MINIMAX_H3_VAE_DECODER_TEMPORAL_CAT_DTYPE must be one of "
-            "fp16|bf16|fp32|keep, got %r" % raw
-        )
-    return mapping[raw]
-
-
-def _resolve_temporal_stream_cat():
-    raw = (
-        os.environ.get("MINIMAX_H3_VAE_DECODER_STREAM_TEMPORAL_CAT", "1")
-        .strip()
-        .lower()
-    )
-    return raw not in ("0", "false", "no", "off", "disable", "disabled")
 
 
 def get_tile_parallel_state():
@@ -109,15 +121,6 @@ class ClsTokenAggregator:
         ):
             self.cls_tokens.append(self.vae.encoder.loss_info["cls_token"].clone())
 
-    def collect_stacked(self, num_tiles, sample_batch_size):
-        if (
-            hasattr(self.vae.encoder, "loss_info")
-            and "cls_token" in self.vae.encoder.loss_info
-        ):
-            cls_token = self.vae.encoder.loss_info["cls_token"]
-            cls_token = cls_token.unflatten(0, (num_tiles, sample_batch_size))
-            self.cls_tokens.extend(token.clone() for token in cls_token)
-
 
 class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
     r"""
@@ -138,7 +141,8 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         "encoder_tiling",
         "decoder_tiling",
         "parallel_tiling",
-        "stack_tiling",
+        "decoder_tile_batch",
+        "window_batch",
         "tile_size",
         "tile_overlap_min",
         "decoder_tile_size",
@@ -149,6 +153,10 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         "decoder_parallel",
         "chunk_dim",
     ]  # legacy config keys accepted by from_pretrained for checkpoint compatibility
+    # Set by minimax_h3_vae_cuda_opt at load and enabled per request by the
+    # decode stage from the quality tier; None keeps one tile and one window
+    # per decoder forward.
+    _sgl_gate: VaeFastPathGate | None = None
 
     def setup_forward(self, **kwargs):
         self.clip_length = kwargs.get("clip_length", 17)
@@ -166,7 +174,10 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
 
         self.encoder_tiling = kwargs.get("encoder_tiling", False)
         self.decoder_tiling = kwargs.get("decoder_tiling", False)
-        self.stack_tiling = kwargs.get("stack_tiling", False)
+        # Decoder tiles and temporal windows per forward while the decode gate
+        # is on (see MiniMaxH3VideoVAEConfig); 0 means all, 1 is the reference.
+        self.decoder_tile_batch = kwargs.get("decoder_tile_batch", 1)
+        self.window_batch = kwargs.get("window_batch", 1)
         self.tile_size = kwargs.get("tile_size", 256)
         self.tile_overlap_min = kwargs.get("tile_overlap_min", 64)
         self.decoder_tile_size = kwargs.get("decoder_tile_size", self.tile_size)
@@ -206,6 +217,7 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
             "pixel_norm_type": self.pixel_norm_type,
             "transform": self.transform,
             "transform_rev": self.transform_rev,
+            "transform_rev_inplace": self.transform_rev_inplace,
             "use_3d_conv": self.use_3d_conv,
         }
         if hasattr(self, "processor"):
@@ -280,6 +292,12 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
             return torch.cat([blended, b_rest], dim=dim)
         else:
             return blended
+
+    def _batch_caps(self) -> tuple[int, int]:
+        # (tiles, windows) per decoder forward; the caps apply only under the gate.
+        if self._sgl_gate is not None and self._sgl_gate.enabled:
+            return self.decoder_tile_batch, self.window_batch
+        return 1, 1
 
     def _assemble_tiles(self, rows, y_overlap, x_overlap):
         output_height = sum(
@@ -367,25 +385,16 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         return list(range(tile_rank, num_tiles, tile_world_size))
 
     def _run_tile_tasks(
-        self, tiles, tile_indices, forward_fn, stack_tiling, cls_agg=None
+        self, tiles, tile_indices, forward_fn, cls_agg=None, *, tile_batch: int = 1
     ):
-        if stack_tiling and tile_indices:
-            sample_batch_size = tiles[0].shape[0]
-            tile_batch = torch.cat([tiles[idx] for idx in tile_indices], dim=0)
-            output_batch = forward_fn(tile_batch)
-            output_tiles = output_batch.unflatten(
-                0, (len(tile_indices), sample_batch_size)
-            ).unbind(dim=0)
-            if cls_agg is not None:
-                cls_agg.collect_stacked(len(tile_indices), sample_batch_size)
-            return list(output_tiles)
-
-        tasks = []
-        for idx in tile_indices:
-            tasks.append(forward_fn(tiles[idx]))
-            if cls_agg is not None:
-                cls_agg.collect()
-        return tasks
+        # tile_batch complete tiles per call, in order; 0 = all, 1 = the released recipe.
+        local = [tiles[index] for index in tile_indices]
+        if not local:
+            return []
+        capacity = (tile_batch or len(local)) * int(local[0].shape[0])
+        return forward_many(
+            local, forward=forward_fn, capacity=capacity, collector=cls_agg
+        )
 
     def tiled_encode(self, x):
         if self.parallel_tiling:  # Fast online encoding for large videos
@@ -415,11 +424,8 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
             local_tile_indices = self._local_tile_indices(
                 num_tiles, tile_rank, tile_world_size
             )
-            stack_tiling = self.stack_tiling and not (
-                self.training and getattr(self.encoder, "mask_enabled", False)
-            )
             encoded_tasks = self._run_tile_tasks(
-                x_tiles, local_tile_indices, self.encode, stack_tiling, agg
+                x_tiles, local_tile_indices, self.encode, agg
             )
 
             if tile_world_size > 1:
@@ -481,11 +487,11 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         local_tile_indices = self._local_tile_indices(
             num_tiles, tile_rank, tile_world_size
         )
-        stack_tiling = self.stack_tiling and not (
-            self.training and getattr(self.decoder, "mask_enabled", False)
-        )
+        tile_batch, _ = self._batch_caps()
+        if self.training and self.decoder.mask_enabled:
+            tile_batch = 1
         decoded_tasks = self._run_tile_tasks(
-            z_tiles, local_tile_indices, self.decode, stack_tiling
+            z_tiles, local_tile_indices, self.decode, tile_batch=tile_batch
         )
 
         if tile_world_size > 1:
@@ -661,8 +667,54 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         pad_frames = self._decode_temporal_pad_frames(z, pad_tokens)
         return int(total_frames), int(pad_frames), int(total_frames - pad_frames)
 
+    def _iter_decoded_windows(self, z, head, tail, count):
+        _, window_batch = self._batch_caps()
+        return decode_windows(
+            self, z, head=head, tail=tail, count=count, window_limit=window_batch
+        )
+
+    def _blended_frames(self, part, overlap):
+        if overlap is None:
+            return part
+        return self.blend(overlap, part, self.frame_overlap, dim=-3)
+
+    def _write_frames(self, dec, part, overlap, *, start: int, count: int) -> None:
+        sig = overlap is not None
+        if _output_kernel_candidate(
+            part, _TEMPORAL_BLEND_FUSION, sig
+        ) and can_use_minimax_h3_vae_temporal_blend_write(
+            part,
+            overlap,
+            blend_extent=self.frame_overlap,
+            out=dec,
+            start=start,
+            count=count,
+        ):
+            reference = None
+            if not _TEMPORAL_BLEND_FUSION.is_verified(sig):
+                reference = self._blended_frames(part, overlap)[:, :, :count]
+            minimax_h3_vae_temporal_blend_write(
+                part,
+                overlap,
+                blend_extent=self.frame_overlap,
+                out=dec,
+                start=start,
+                count=count,
+            )
+            if reference is not None:
+                written = dec[:, :, start : start + count]
+                verdict = _TEMPORAL_BLEND_FUSION.accept_or_fallback(
+                    written, reference, sig=sig, logger=logger
+                )
+                if verdict is not written:
+                    written.copy_(reference)
+            return
+        dec[:, :, start : start + count].copy_(
+            self._blended_frames(part, overlap)[:, :, :count]
+        )
+
     def _decode_temporal_streaming(
-        self, z, z_head, z_tail, num_chunks, pad_tokens, temporal_cat_dtype
+        self, z, z_head, z_tail, num_chunks, pad_tokens, on_frames
     ):
         total_frames, pad_frames, output_frames = (
             self._decode_temporal_output_frame_plan(
@@ -684,7 +736,7 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         dropped_frames = 0
         decoded_count = 0
 
-        def write_part(part):
+        def write_part(part, overlap=None):
             nonlocal dec, write_pos, logical_frames, dropped_frames
             part_frames = int(part.shape[2])
             if part_frames <= 0:
@@ -698,27 +750,16 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
             remaining = int(dec.shape[2]) - write_pos
             copy_frames = min(part_frames, max(0, remaining))
             if copy_frames > 0:
-                dec[:, :, write_pos : write_pos + copy_frames, :, :].copy_(
-                    part[:, :, :copy_frames, :, :]
+                self._write_frames(
+                    dec, part, overlap, start=write_pos, count=copy_frames
                 )
                 write_pos += copy_frames
+                if on_frames is not None:
+                    on_frames(dec[:, :, write_pos - copy_frames : write_pos])
             dropped_frames += part_frames - copy_frames
 
-        for i in range(num_chunks):
-            t_start_idx = i * self.tokens_chunk_size
-            t_end_idx = t_start_idx + self.tokens_chunk_size + self.token_overlap
-            clip_z = z[:, :, t_start_idx:t_end_idx, :, :]
-
-            if i == 0 and z_head is not None:
-                clip_z = torch.cat([z_head, clip_z], dim=2)
-
-            if i == num_chunks - 1 and z_tail is not None:
-                clip_z = torch.cat([clip_z, z_tail], dim=2)
-
-            clip_dec = self._adaptive_decode(clip_z)
+        for i, clip_dec in self._iter_decoded_windows(z, z_head, z_tail, num_chunks):
             decoded_count += 1
-            if temporal_cat_dtype is not None and clip_dec.dtype != temporal_cat_dtype:
-                clip_dec = clip_dec.to(temporal_cat_dtype)
             if clip_dec.device != z.device:
                 clip_dec = clip_dec.to(z.device)
 
@@ -740,12 +781,8 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
                 clip_dec_chunk = clip_dec_chunk[:, :, self.frame_pre_padding :, :, :]
 
                 if j == 0:
-                    if dec_overlap is not None:
-                        clip_dec_chunk = self.blend(
-                            dec_overlap, clip_dec_chunk, self.frame_overlap, dim=-3
-                        )
-                        dec_overlap = None
-                    write_part(clip_dec_chunk)
+                    write_part(clip_dec_chunk, dec_overlap)
+                    dec_overlap = None
                 else:
                     # Break the view's reference to the full decoded clip so earlier
                     # temporal chunks can be released before the final output exists.
@@ -758,7 +795,7 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
                 if dec_tail is not None:
                     write_part(dec_tail)
 
-            del clip_dec, clip_z
+            del clip_dec
 
         if dec is None:
             raise RuntimeError("decode_temporal streaming produced no output tensor")
@@ -776,7 +813,7 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
 
         return dec
 
-    def decode_temporal(self, z):
+    def decode_temporal(self, z, on_frames=None):
         chunk_dec = self.tokens_chunk_size * self.vae_ratio_t
 
         isolated_token_num = 0
@@ -813,28 +850,13 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
             pad_z = z[:, :, -1:, :, :].expand(-1, -1, pad_tokens, -1, -1)
             z = torch.cat([z, pad_z], dim=2)
 
-        temporal_cat_dtype = _resolve_temporal_cat_dtype()
-        if not self.training and _resolve_temporal_stream_cat():
+        if not self.training and envs.MINIMAX_H3_VAE_DECODER_STREAM_TEMPORAL_CAT:
             return self._decode_temporal_streaming(
-                z, z_head, z_tail, num_chunks, pad_tokens, temporal_cat_dtype
+                z, z_head, z_tail, num_chunks, pad_tokens, on_frames
             )
 
         decoded_tasks = []
-        for i in range(num_chunks):
-            t_start_idx = i * self.tokens_chunk_size
-            t_end_idx = t_start_idx + self.tokens_chunk_size + self.token_overlap
-            clip_z = z[:, :, t_start_idx:t_end_idx, :, :]
-
-            if i == 0 and z_head is not None:
-                clip_z = torch.cat([z_head, clip_z], dim=2)
-
-            if i == num_chunks - 1 and z_tail is not None:
-                clip_z = torch.cat([clip_z, z_tail], dim=2)
-
-            clip_dec = self._adaptive_decode(clip_z)
-            if temporal_cat_dtype is not None and clip_dec.dtype != temporal_cat_dtype:
-                clip_dec = clip_dec.to(temporal_cat_dtype)
-
+        for i, clip_dec in self._iter_decoded_windows(z, z_head, z_tail, num_chunks):
             decoded_tasks.append((i, clip_dec))
 
         clip_dec_list = [clip_dec.to(z.device) for _, clip_dec in decoded_tasks]
@@ -887,16 +909,23 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         if pad_frames > 0:
             dec = dec[:, :, :-pad_frames, :, :]
 
+        if on_frames is not None:
+            on_frames(dec)
         return dec
 
-    def decode_base(self, z, frame_num=None, process_image=False):
+    def decode_base(self, z, frame_num=None, process_image=False, on_frames=None):
+        """``on_frames`` receives every output frame once, in order, as soon as it is final."""
+        if on_frames is not None and (
+            process_image or not self.use_3d_conv or frame_num is not None
+        ):
+            raise ValueError("on_frames needs an untrimmed temporal video decode")
         if process_image or not self.use_3d_conv:
             if not self.use_3d_conv and z.ndim == 5:
                 z = z.squeeze(2)
 
             recon = self._adaptive_decode(z)
         else:
-            recon = self.decode_temporal(z)
+            recon = self.decode_temporal(z, on_frames=on_frames)
 
         if self.use_3d_conv:
             if frame_num is not None:
@@ -1230,11 +1259,13 @@ class AutoencoderKLLegacy(AutoencoderKL):
 
         self.transform = get_normalize_transform(pixel_norm_type)
         self.transform_rev = get_denormalize_transform(pixel_norm_type)
+        self.transform_rev_inplace = get_denormalize_transform(
+            pixel_norm_type, inplace=True
+        )
 
         self.use_3d_conv = use_3d_conv
         self.causal_encoder = causal_encoder
         self.causal_decoder = causal_decoder
-        self.slidedec = self.causal_encoder and not self.causal_decoder
 
         # some registered parameters for simplicity
         self.vae_ratio = int(np.cumprod(space_down)[-1])
@@ -1281,6 +1312,7 @@ class AutoencoderKLLegacy(AutoencoderKL):
         self.decoder = ViT3DDecoder(**vit_kwargs)
 
     @torch.no_grad()
+    @cached_vae_encode
     def encode(self, x):
         return self.quant_conv(self.encoder(x))
 

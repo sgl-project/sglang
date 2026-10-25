@@ -38,13 +38,13 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version: "3.12"
 
       - name: Install build dependencies
         run: |
           pip install \
             auditwheel build patchelf wheel "setuptools>=61.0" \
-            "setuptools-rust>=1.11" "setuptools-scm>=8.0" "torch==2.13.0"
+            "setuptools-rust>=1.11" "setuptools-scm>=8.0" "torch==2.14.1"
 
       # Needed by setuptools-rust to build the bundled native gRPC extension
       # (rust/sglang-grpc) when `python -m build` builds the sglang wheel.
@@ -161,7 +161,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version: "3.12"
 
       - name: Update wheel index
         run: |

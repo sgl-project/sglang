@@ -24,7 +24,6 @@ class TransferKVChunk:
     is_last_chunk: bool
     prefill_aux_index: Optional[int]
     state_indices: Optional[List]
-    chunk_id: Optional[int] = None
     num_kv_tokens: Optional[int] = None
     trace_ctx: Union[TraceReqContext, TraceNullContext] = dataclasses.field(
         default_factory=TraceNullContext
@@ -32,8 +31,10 @@ class TransferKVChunk:
     # Set when the staging worker first counts this chunk toward the per-room
     # outstanding count; stays set across re-enqueue on a watermark defer.
     staging_counted: bool = False
-    # Mori early-send: CUDA event to synchronize before RDMA (optional).
+    # Early-send: GPU event to synchronize before reading KV (optional).
     wait_event: Optional[object] = None
+    # Must complete before reading asynchronously copied host indices.
+    indices_event: Optional[object] = None
 
 
 def pack_list_of_buffers(buffers: List[bytes]) -> bytes:

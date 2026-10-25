@@ -20,6 +20,17 @@ TORCH_DTYPE_TO_KV_CACHE_STR = {
 }
 
 
+def allow_target_draft_different_cache_dtype(
+    *, is_dflash: bool, speculative_draft_attention_backend: Optional[str]
+) -> bool:
+    """Whether fused draft KV may use a different dtype from the target.
+
+    DFLASH-family FA4 drafts use their compute dtype for KV, even when the
+    target's KV is quantized. Their fused region has its own typed views.
+    """
+    return is_dflash and speculative_draft_attention_backend == "fa4"
+
+
 def configure_kv_cache_dtype(
     *,
     server_args_kv_cache_dtype: str,
@@ -62,11 +73,6 @@ def configure_kv_cache_dtype(
         kv_cache_dtype = torch.float8_e4m3fn
     elif server_args_kv_cache_dtype in ("bf16", "bfloat16"):
         kv_cache_dtype = torch.bfloat16
-    elif server_args_kv_cache_dtype == "fp4_e2m1":
-        raise ValueError(
-            "--kv-cache-dtype=fp4_e2m1 is deprecated. "
-            "Use --kv-cache-dtype=fp4_mx_block16."
-        )
     elif server_args_kv_cache_dtype in ("nvfp4", "fp4_mx_block16"):
         if hasattr(torch, "float4_e2m1fn_x2"):
             kv_cache_dtype = torch.float4_e2m1fn_x2

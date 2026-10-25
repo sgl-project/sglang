@@ -28,9 +28,10 @@ The hook split is a decode-latency decision. ``init_forward_metadata_in_graph`` 
 *recorded* into the decode / target-verify / draft-extend graphs, so prep placed
 there replays for free; out of graph it lands on the per-step CPU path that a
 captured graph exists to avoid. ``init_forward_metadata_out_graph`` therefore takes
-only what a phase cannot record: full-cuda-graph prefill (no in-graph hook) and the
-unified pool's slot translate. Prep consequently sits outside the graph, so every
-tensor a captured kernel reads lives in a graph-static buffer refilled in place.
+only what a phase cannot record: full-cuda-graph prefill (no in-graph hook) and
+custom slot translations. The unified pool's live v2p table has a stable address,
+so its gather can be captured too. Every tensor a captured kernel reads lives
+in a graph-static buffer refilled in place.
 """
 
 from __future__ import annotations
@@ -40,15 +41,18 @@ from typing import TYPE_CHECKING, Optional
 import msgspec
 import torch
 
+from sglang.kernels.ops.mamba.mamba_state_indices_triton import (
+    fused_replay_state_indices,
+)
 from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
     scatter_mamba_states_after_mtp_verify,
 )
+from sglang.kernels.ops.mamba.sconv_tracking import fill_track_conv_indices
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     ShortConvHybridAttnBackend,
 )
 from sglang.srt.layers.attention.linear.short_conv_backend import ShortConvAttnBackend
 from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
-from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.inkling_common.kernels.sconv import (
     HIS_ONES,
@@ -68,6 +72,7 @@ from sglang.srt.runtime_context import (
     mamba_cache_chunk_size,
 )
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
+from sglang.srt.utils import is_cuda
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -85,6 +90,8 @@ class InklingShortConvMetadata(msgspec.Struct):
     # [B, conv_kernel - 1] input positions whose conv window feeds the prefix
     # cache. Extend only, and only when tracking is on.
     track_conv_indices: Optional[torch.Tensor] = None
+    # Kernel-facing checkpoint slots. ForwardBatch retains the virtual source.
+    track_cache_indices: Optional[torch.Tensor] = None
 
 
 class InklingShortConvAttnBackend(ShortConvAttnBackend):
@@ -104,12 +111,9 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
         self._mamba_cache = self.req_to_token_pool.mamba_pool.mamba_cache
         self.conv_state_len: int = self.conv_states_shape[2]
         self.mamba_cache_chunk_size = mamba_cache_chunk_size()
-        # A plain table lookup is recordable; the unified pool's translate is an
-        # allocator lookup and must stay in the out-of-graph replay prep.
-        self._slot_gather_recordable = (
-            type(self.req_to_token_pool).translate_mamba_indices
-            is HybridReqToTokenPool.translate_mamba_indices
-        )
+        # Both identity and unified v2p gathers are recordable. The allocator
+        # updates the stable device table in place, including after compaction.
+        self._slot_gather_recordable = self.req_to_token_pool.mamba_translate_is_fusable
 
         self.sconv_metadata = InklingShortConvMetadata()
 
@@ -144,7 +148,10 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
         self._graph_track_conv_indices = torch.zeros(
             (max_bs, self.conv_state_len), dtype=torch.int64, device=dev
         )
-        # Inert track fields for graph capture: a capture warmup batch that
+        # Prefill can capture before init_cuda_graph_state. Keep the translated
+        # checkpoint destinations at one address across both graph phases.
+        self._graph_track_indices = torch.empty(max_bs, dtype=torch.int64, device=dev)
+        # Inert prefill track fields (excluding draft extend): a warmup batch that
         # carries no tracking metadata must still LAUNCH the track scatter
         # (all rows masked off), or the python-level `if` specializes the
         # scatter out of the captured graph.
@@ -248,19 +255,22 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
 
     def _prepare_slot_indices(self, forward_batch: ForwardBatch):
         self._reset_step_state()
+        self._prepare_track_indices(forward_batch)
         req_pool_indices = forward_batch.req_pool_indices
         n = req_pool_indices.shape[0]
         buf = self._cache_indices_buf
-        if self._slot_gather_recordable and n <= buf.shape[0]:
-            # One launch; the base's gather-then-copy would add a second recorded
-            # kernel per step (the pool's table already has this dtype). No PAD
-            # sentinel needed: MambaSlotAllocator.clear reserves slot 0 as the dummy
-            # write target, so zero-filled padded rows already land there.
-            torch.index_select(
-                self.req_to_token_pool.req_index_to_mamba_index_mapping,
-                0,
-                req_pool_indices,
-                out=buf[:n],
+        if self._slot_gather_recordable and 0 < n <= buf.shape[0]:
+            # No PAD sentinel needed: slot 0 is the dummy write target, so the
+            # runner's zero-filled padded rows already land there. Fuse the live
+            # unified v2p gather and int32 store into the same recorded launch.
+            pool = self.req_to_token_pool
+            fused_replay_state_indices(
+                req_pool_indices=req_pool_indices.contiguous(),
+                mamba_index_mapping=pool.req_index_to_mamba_index_mapping,
+                out_state_indices=buf,
+                valid_bs=n,
+                total_bs=n,
+                v2p=pool.mamba_v2p_table,
             )
             self._cache_indices = buf[:n]
             self.forward_metadata = ForwardMetadata(
@@ -269,6 +279,25 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
             return
         self.forward_metadata = self._forward_metadata(forward_batch)
         self._refresh_cache_indices()
+
+    def _prepare_track_indices(self, forward_batch: ForwardBatch):
+        # Every metadata view must explicitly provide virtual IDs or None.
+        indices = forward_batch.mamba_track_indices
+        if indices is None or (
+            self._slot_gather_recordable
+            and self.req_to_token_pool.mamba_v2p_table is None
+        ):
+            self.sconv_metadata.track_cache_indices = indices
+            return
+        n = indices.shape[0]
+        assert n <= self._graph_track_indices.shape[0], (
+            "checkpoint-index buffer too small for the forward batch"
+        )
+        # Keep the batch virtual across repeated eager metadata initialization
+        # and across draft backends. Captured consumers read this fixed buffer.
+        out = self._graph_track_indices[:n]
+        out.copy_(self._translate_mamba_indices(indices))
+        self.sconv_metadata.track_cache_indices = out
 
     def _refresh_sconv_metadata(
         self, forward_batch: ForwardBatch, *, on_graph_path: bool
@@ -433,6 +462,11 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
         ``batch_size`` rows while the track lengths cover only live requests, and
         every row it may read must index inside *this* replay's token buffer.
         """
+        if forward_batch.forward_mode.is_draft_extend_v2():
+            # Draft extend snapshots the accepted window in its own cache update.
+            # Inert prefill tracking would overwrite its checkpoint destinations.
+            self.sconv_metadata.track_conv_indices = None
+            return
         if forward_batch.mamba_track_mask is None:
             if not on_graph_path:
                 self.sconv_metadata.track_conv_indices = None
@@ -442,6 +476,9 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
             rows = forward_batch.batch_size
             forward_batch.mamba_track_mask = self._graph_track_inert_mask[:rows]
             forward_batch.mamba_track_indices = self._graph_track_inert_indices[:rows]
+            self.sconv_metadata.track_cache_indices = self._graph_track_inert_indices[
+                :rows
+            ]
             forward_batch.mamba_track_seqlens = self._graph_track_inert_seqlens[:rows]
         rows = forward_batch.batch_size
         query_start_loc = self.sconv_metadata.query_start_loc
@@ -451,19 +488,14 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
         # batch always has them, and must still fail rather than track against
         # an invented prefix.
         prefix_lens = forward_batch.extend_prefix_lens
-        if prefix_lens is None and on_graph_path:
-            prefix_lens = torch.zeros_like(forward_batch.mamba_track_seqlens)
+        track_seqlens = forward_batch.mamba_track_seqlens
+        assert query_start_loc is not None and track_seqlens is not None
+        assert prefix_lens is not None or on_graph_path
         live = min(
             rows,
-            forward_batch.mamba_track_seqlens.shape[0],
-            prefix_lens.shape[0],
+            track_seqlens.shape[0],
+            prefix_lens.shape[0] if prefix_lens is not None else rows,
         )
-
-        lens_to_track = forward_batch.mamba_track_seqlens[:live] - prefix_lens[:live]
-        chunk_aligned = (
-            lens_to_track // self.mamba_cache_chunk_size
-        ) * self.mamba_cache_chunk_size
-        start_indices = query_start_loc[:live] + chunk_aligned - self.conv_state_len
 
         if on_graph_path:
             assert rows <= self._graph_track_conv_indices.shape[0], (
@@ -475,8 +507,30 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
             out = torch.empty(
                 (rows, self.conv_state_len),
                 dtype=torch.int64,
-                device=start_indices.device,
+                device=query_start_loc.device,
             )
+
+        if is_cuda() and query_start_loc.is_cuda:
+            fill_track_conv_indices(
+                query_start_loc=query_start_loc,
+                track_seqlens=track_seqlens,
+                prefix_lens=prefix_lens,
+                output=out,
+                live=live,
+                chunk_size=self.mamba_cache_chunk_size,
+            )
+            self.sconv_metadata.track_conv_indices = out
+            return
+
+        if prefix_lens is None:
+            prefix_lens = torch.zeros_like(track_seqlens)
+
+        lens_to_track = forward_batch.mamba_track_seqlens[:live] - prefix_lens[:live]
+        chunk_aligned = (
+            lens_to_track // self.mamba_cache_chunk_size
+        ) * self.mamba_cache_chunk_size
+        start_indices = query_start_loc[:live] + chunk_aligned - self.conv_state_len
+
         torch.add(
             start_indices.unsqueeze(-1).to(torch.int64),
             self._track_window_offsets,
@@ -514,6 +568,8 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
             slot_ids = self._translate_mamba_indices(
                 pool.get_mamba_indices(req_pool_indices)
             )
+        if mamba_track_indices is not None:
+            mamba_track_indices = self._translate_mamba_indices(mamba_track_indices)
         scatter_mamba_states_after_mtp_verify(
             pool.get_speculative_mamba2_params_all_layers(),
             slot_ids,
@@ -585,6 +641,7 @@ class InklingShortConvHybridAttnBackend(ShortConvHybridAttnBackend):
             and self.supports_draft_extend_metadata_staging
         ):
             self.short_conv_backend._reset_step_state()
+            self.short_conv_backend._prepare_track_indices(forward_batch)
             self.short_conv_backend._refresh_sconv_metadata(
                 forward_batch, on_graph_path=True
             )
