@@ -174,14 +174,15 @@ SGLang additions:
 ## openai
 
 ```rust
-lower_completion(body, &headers, &settings, tokenizer) -> Result<(generate_body, CompletionResponder), Unsupported>
-lower_chat(body, &headers, &settings, &chat_model, render, tokenizer) -> Result<(generate_body, ChatResponder), Unsupported>
+lower_completion(body, &headers, &settings, tokenizer) -> Result<(GenerateRequest, CompletionResponder), Unsupported>
+lower_chat(body, &headers, &settings, &chat_model, render, tokenizer) -> Result<(GenerateRequest, ChatResponder), Unsupported>
 Responder::unary(status, body) / responder.stream_data(frame) -> OpenAI JSON or SSE events
 ```
 
 SGLang-only: Python's OpenAI layer (`entrypoints/openai/`) over the engine's
-`/generate`, for hosts that send generation there. Lowering builds the
-`GenerateReqInput` SGLang's handler would, and the responder turns `/generate`
+`/generate`, for hosts that send generation there. Lowering returns the shared `sglang_api_types::api::v1::GenerateRequest`,
+which hosts serialize to JSON at the transport boundary. It represents the
+`GenerateReqInput` SGLang's handler would build. The responder turns `/generate`
 output into the response SGLang's handler would return. Anything not reproduced
 exactly is `Unsupported`, and the host sends it to the engine's own route.
 `tests/openai_parity.rs` replays fixtures recorded by

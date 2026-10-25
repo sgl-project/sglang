@@ -493,6 +493,9 @@ def _make_queue(timeout=30.0, enable_metrics=False):
     q.staging_handler = None
     q.tree_cache = MagicMock()
     q.metadata_buffers = SimpleNamespace(bootstrap_room={})
+    q.metadata_buffers.clear_slot = lambda idx: (
+        q.metadata_buffers.bootstrap_room.__setitem__(idx, 0)
+    )
     q.req_to_metadata_buffer_idx_allocator = _FakeIdxAllocator()
     q.scheduler = SimpleNamespace(
         enable_decode_hicache=False,
