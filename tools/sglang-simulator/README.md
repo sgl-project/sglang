@@ -110,6 +110,32 @@ predicted query, not a committed native forward; a partial run or output
 failure must not be reported as a completed simulation. Theory never creates or
 qualifies PerfDB measurement rows and does not establish native timing accuracy.
 
+The library-only `UMDDSparkCostModel.for_native_joint` selects one complete
+TP2/attention-DP2 worker cost. It accepts a typed `NativeDPProgressPolicy`, the
+immutable canonical `runtime_profile_json`, `profiles` keyed by `EXTEND` and
+`DECODE`, and optional matching `analytic_models` with the SDK joint policy and
+calibration `none` in explicit HYBRID mode. These are the existing SDK profile and
+model types; the two phases retain distinct identities. Each typed step group
+must carry the same existing `query.to_runtime(source_policy)` object in its
+canonical `execution_json`. The adapter binds the full ordered DP geometry,
+normalized recipes, source identity and runtime, while the SDK query retains
+each DP's buffer, read extent, planner bound and full capture keys.
+
+This route evaluates one `dsv41_native_forward_module` UMD leaf and returns one
+exclusive `whole_worker` timing. It never sums ADP1 estimates or splits the joint
+worker into fabricated region costs. Exact silicon takes priority; only the
+SDK's typed numeric miss can reach its explicit joint analytic model. Source,
+profile and invalid-row errors remain failures. Optional JSONL evidence retains
+the complete SDK query and ordered request IDs; metrics count the evaluated
+whole-worker query once. The test fixture `dspark_joint_declared.json` contains
+declared source facts and analytic parameters, with no measurements or timing
+qualification.
+
+Callers must supply source-resolved joint inputs; this cost adapter does not
+project native before-state or authorize a runtime. Public ADP2 factory, native
+peer execution/publication and coordinated clock guards remain closed. This
+library contract does not establish C64 serving, native timing or accuracy.
+
 `time_predictor.dspark_progress.EmpiricalDSparkProgress` reads a hash-pinned
 artifact and sibling observation/native/causal-evidence files. It verifies raw
 native frames with the shared SDK participant join, checks full recipes and

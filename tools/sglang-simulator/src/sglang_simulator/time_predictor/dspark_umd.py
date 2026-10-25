@@ -157,6 +157,61 @@ def _native_cost_query_evidence(recorder, *, point, phase, source, model):
         ) from error
 
 
+def _joint_cost_query_evidence(recorder, *, query, phase, source, model):
+    """Bind the single whole-forward SDK leaf; never split it into regions."""
+    from infercast.sdk.perf_database.dsv41_native_forward import OP
+
+    def canonical(value):
+        return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+    try:
+        node = recorder.nodes[0]
+        proof = node["queries"][0]
+        shape = query.to_shape()
+        if not (
+            recorder.dropped_queries == 0
+            and len(recorder.nodes) == len(node["queries"]) == 1
+            and node["op"] == OP
+            and node["node_id"] == "complete_native_forward"
+            and node["phase"] == phase
+            and node["status"] == "resolved"
+            and node["source"] == source
+            and type(node["count"]) is int
+            and node["count"] == 1
+            and type(node["repeat"]) is int
+            and node["repeat"] == 1
+            and canonical(node["shape"]) == canonical(shape)
+            and proof["component"] == OP
+            and proof["role"] == "leaf"
+            and proof["source"] == source
+            and proof["kernel_source"] == "sglang"
+            and proof["kernel_impl"] == shape["kernel_impl"]
+            and canonical(proof["requested_key"]) == canonical(shape)
+            and canonical(proof["resolved_key"]) == canonical(shape)
+            and proof["axes"] == []
+        ):
+            raise ValueError("whole-worker leaf differs")
+        if source == "silicon":
+            if proof["resolution"] != "exact":
+                raise ValueError("whole-worker measurement is not exact")
+        elif source == "sol" and model is not None:
+            metadata = proof["row_metadata"]
+            if not (
+                proof["resolution"] == "sol"
+                and metadata["analytic_policy"] == model.policy
+                and metadata["analytic_model_sha256"] == model.sha256
+                and metadata["execution_profile_id"] == query.execution_profile_id
+            ):
+                raise ValueError("whole-worker analytic model differs")
+        else:
+            raise ValueError("whole-worker source is unsupported")
+        return proof
+    except (AttributeError, KeyError, IndexError, TypeError, ValueError) as error:
+        raise PredictorError(
+            "data_unavailable", "DSPark joint cost lacks one matching SDK leaf"
+        ) from error
+
+
 class UMDDSparkCostModel:
     """Evaluate source-owned prepared graphs; no alternate latency table.
 
@@ -164,6 +219,106 @@ class UMDDSparkCostModel:
     The legacy proposal selector remains a separate incomplete cost grain.
     Registration alone supplies neither measured costs nor source event order.
     """
+
+    @classmethod
+    def for_native_joint(
+        cls,
+        database,
+        *,
+        source_policy,
+        runtime_profile_json,
+        profiles,
+        analytic_models=None,
+        cost_evidence_path=None,
+    ):
+        """Select the existing whole-worker grain for resolved TP2/ADP2 inputs.
+
+        This library entry point does not project native source state, enable
+        the public factory, publish results or advance a scheduler clock.
+        """
+        from infercast.sdk.decode_forward import DecodeExecutionProfile
+        from infercast.sdk.extend_forward import ExtendExecutionProfile
+        from infercast.sdk.native_dp_progress import NativeDPProgressPolicy
+        from infercast.sdk.native_joint_forward import JOINT_FORWARD_REALIZATION
+        from infercast.sdk.native_segment_analytic import (
+            JOINT_POLICY,
+            NativeSegmentAnalyticModel,
+        )
+        from infercast.sdk.perf_database.common import DatabaseMode
+
+        modes = {"EXTEND": ExtendExecutionProfile, "DECODE": DecodeExecutionProfile}
+        try:
+            runtime = json.loads(runtime_profile_json)
+            valid_runtime = (
+                type(runtime_profile_json) is str
+                and type(runtime) is dict
+                and bool(runtime)
+                and json.dumps(
+                    runtime, sort_keys=True, separators=(",", ":"), allow_nan=False
+                )
+                == runtime_profile_json
+            )
+        except (TypeError, ValueError):
+            valid_runtime = False
+        if not (
+            type(source_policy) is NativeDPProgressPolicy
+            and valid_runtime
+            and type(profiles) is dict
+            and set(profiles) == set(modes)
+            and all(
+                type(profiles[mode]) is kind
+                and profiles[mode].full_forward_realization == JOINT_FORWARD_REALIZATION
+                for mode, kind in modes.items()
+            )
+        ):
+            raise PredictorError(
+                "invalid_execution_profile",
+                "joint costs require a typed DP source policy, immutable runtime and both phase profiles",
+            )
+        if analytic_models is not None and not (
+            type(analytic_models) is dict
+            and set(analytic_models) == set(modes)
+            and database.default_mode == DatabaseMode.HYBRID
+            and all(
+                type(analytic_models[mode]) is NativeSegmentAnalyticModel
+                and analytic_models[mode].policy == JOINT_POLICY
+                and analytic_models[mode].calibration == "none"
+                and analytic_models[mode].execution_profile_id
+                == profiles[mode].profile_id
+                and analytic_models[mode].tp_size == 2
+                for mode in modes
+            )
+        ):
+            raise PredictorError(
+                "invalid_execution_profile",
+                "joint analytic costs require explicit HYBRID and both matching uncalibrated models",
+            )
+        model = cls(database)
+        model._native_joint = (
+            source_policy,
+            runtime_profile_json,
+            dict(profiles),
+            None if analytic_models is None else dict(analytic_models),
+        )
+        if cost_evidence_path is not None:
+            if (
+                analytic_models is None
+                or type(cost_evidence_path) is not str
+                or not cost_evidence_path.strip()
+            ):
+                raise PredictorError(
+                    "invalid_execution_profile",
+                    "joint cost evidence requires explicit analytic models and a fresh output path",
+                )
+            path = Path(cost_evidence_path).absolute()
+            try:
+                model._cost_sink = path.open("xb", buffering=0)
+                model._cost_sink_path = path
+            except OSError as error:
+                raise PredictorError(
+                    "data_unavailable", "cannot create native cost evidence ledger"
+                ) from error
+        return model
 
     def __init__(
         self,
@@ -275,6 +430,8 @@ class UMDDSparkCostModel:
 
     def get_cost_metrics(self):
         """Report evaluated query costs, including the complete theory fraction."""
+        if hasattr(self, "_native_joint"):
+            return self._joint_cost_metrics()
         if self._cost_sink_failed:
             raise PredictorError(
                 "data_unavailable", "native cost evidence write failed"
@@ -761,6 +918,8 @@ class UMDDSparkCostModel:
         )
 
     def predict_step(self, step):
+        if hasattr(self, "_native_joint"):
+            return self._predict_joint_step(step)
         missing = [
             phase for phase in step.required_phases if phase not in self.preparers
         ]
@@ -774,3 +933,202 @@ class UMDDSparkCostModel:
             step.forward_id,
             tuple(self.query_phase(phase, step) for phase in step.required_phases),
         ).validate_for(step)
+
+    def _predict_joint_step(self, step):
+        from infercast.sdk.diagnostics.prediction_evidence import (
+            capture_prediction_evidence,
+        )
+        from infercast.sdk.models.umd.description import (
+            bind_runtime_point,
+            build_model_description,
+        )
+        from infercast.sdk.models.umd.executor import evaluate_phase_composition
+        from infercast.sdk.models.umd.templates.deepseek_v41 import (
+            prepare_deepseek_v41_forward,
+        )
+        from infercast.sdk.native_joint_forward import NativeJointForwardQuery
+        from infercast.sdk.perf_database.database import PerfDataNotAvailableError
+        from infercast.sdk.perf_database.dsv41_native_forward import MODEL, OP
+
+        from sglang_simulator.simulation.sglang.dspark import DSparkStep, DSparkTopology
+
+        policy, runtime, profiles, models = self._native_joint
+        if type(step) is not DSparkStep:
+            raise PredictorError(
+                "invalid_dspark_step", "joint cost requires a typed step"
+            )
+        modes = {group.forward_mode for group in step.groups} - {"IDLE"}
+        if not (
+            step.topology == DSparkTopology(2, 2)
+            and step.runtime_profile_json == runtime
+            and modes in ({"EXTEND"}, {"TARGET_VERIFY"})
+        ):
+            raise PredictorError(
+                "invalid_dspark_step",
+                "joint cost requires the complete matching DP step",
+            )
+        mode = "EXTEND" if modes == {"EXTEND"} else "DECODE"
+        profile = profiles[mode]
+        try:
+            inputs = [json.loads(group.execution_json) for group in step.groups]
+            if not all(
+                type(value) is dict
+                and set(value)
+                == {"native_joint_forward_query", "native_joint_source_identity_sha256"}
+                and value == inputs[0]
+                and value["native_joint_source_identity_sha256"]
+                == policy.source_identity_sha256
+                for value in inputs
+            ):
+                raise ValueError("joint source/query provenance differs")
+            query = NativeJointForwardQuery(
+                profile.profile_id, inputs[0]["native_joint_forward_query"]
+            )
+            value = query.to_dict()
+            native = query.native_input
+            if value["runtime_profile_json"] != runtime or native.forward_mode != mode:
+                raise ValueError("joint runtime or phase differs")
+            for group, work, recipes in zip(
+                step.groups,
+                native.to_dict()["groups"],
+                native.to_dict()["sampling_recipe"]["per_attention_dp"],
+                strict=True,
+            ):
+                expected_mode = (
+                    "IDLE"
+                    if group.forward_mode == "IDLE"
+                    else "EXTEND"
+                    if group.forward_mode == "EXTEND"
+                    else "DECODE"
+                )
+                if (
+                    work["attention_dp_rank"] != group.attention_dp_rank
+                    or work["phase"] != expected_mode
+                    or work["requests"]
+                    != [
+                        {"prefix_len": r.target_prefix_len, "extend_len": r.extend_len}
+                        for r in group.requests
+                    ]
+                    or json.dumps(recipes, sort_keys=True, separators=(",", ":"))
+                    != "["
+                    + ",".join(r.sampling_params_json for r in group.requests)
+                    + "]"
+                ):
+                    raise ValueError("joint ordered geometry or sampling differs")
+            query = NativeJointForwardQuery.from_input(
+                native,
+                profile=profile,
+                source_policy=policy,
+                runtime_profile_json=runtime,
+                group_execution=value["group_execution"],
+            )
+        except (KeyError, ValueError, TypeError) as error:
+            raise PredictorError(
+                "invalid_dspark_step",
+                "joint query is not bound to the complete DP step",
+            ) from error
+        description, point = prepare_deepseek_v41_forward(
+            build_model_description(MODEL, backend="sglang"),
+            mode,
+            native.requests,
+            profile,
+            query.to_runtime(policy),
+        )
+        phase = "context" if mode == "EXTEND" else "generation"
+        graph = description.op_graph
+        options = {} if models is None else {OP: {"analytic_model": models[mode]}}
+        try:
+            with capture_prediction_evidence() as recorder:
+                result = evaluate_phase_composition(
+                    self.database,
+                    getattr(graph, phase),
+                    getattr(graph, phase + "_composition"),
+                    phase=phase,
+                    env=bind_runtime_point(description, point),
+                    layer_repeat=graph.layer_repeat,
+                    operation_kwargs=options,
+                )
+        except PerfDataNotAvailableError as error:
+            raise PredictorError(
+                "data_unavailable", "missing qualified DSPark joint worker cost"
+            ) from error
+        proof = _joint_cost_query_evidence(
+            recorder,
+            query=query,
+            phase=phase,
+            source=result.source,
+            model=None if models is None else models[mode],
+        )
+        seconds = float(result) / 1000
+        record = {
+            "event": "predicted_phase_cost",
+            "forward_id": step.forward_id,
+            "request_ids_by_attention_dp": [
+                [r.rid for r in group.requests] for group in step.groups
+            ],
+            "phase": "whole_worker",
+            "source": result.source,
+            "seconds": seconds,
+            "identity": {
+                "phase": "whole_worker",
+                "runtime": point,
+                "slice": str(self.database.slice_ref.slice_dir),
+                "native_cost_query": proof,
+            },
+        }
+        line = (
+            json.dumps(
+                record, sort_keys=True, separators=(",", ":"), allow_nan=False
+            ).encode("utf-8")
+            + b"\n"
+        )
+        cost = DSparkPhaseCost(
+            "whole_worker", seconds, "umd:" + hashlib.sha256(line).hexdigest()
+        )
+        self._write_cost_line(line)
+        counts = self._cost_counts.setdefault(
+            ("whole_worker", result.source),
+            {
+                "phase": "whole_worker",
+                "source": result.source,
+                "queries": 0,
+                "seconds": 0.0,
+            },
+        )
+        counts["queries"] += 1
+        counts["seconds"] += seconds
+        return DSparkStepTiming(step.forward_id, (cost,)).validate_for(step)
+
+    def _joint_cost_metrics(self):
+        if self._cost_sink_failed:
+            raise PredictorError(
+                "data_unavailable", "native cost evidence write failed"
+            )
+        models = self._native_joint[3]
+        by_source = {}
+        for row in self._cost_counts.values():
+            target = by_source.setdefault(row["source"], {"queries": 0, "seconds": 0.0})
+            target["queries"] += row["queries"]
+            target["seconds"] += row["seconds"]
+        total = math.fsum(row["seconds"] for row in by_source.values())
+        theory = by_source.get("sol", {}).get("seconds", 0.0)
+        return {
+            "scope": "evaluated_cost_queries_not_committed_forward_events",
+            "model": None
+            if models is None
+            else {k: v.to_dict() for k, v in models.items()},
+            "by_source": by_source,
+            "by_phase_source": [dict(row) for row in self._cost_counts.values()],
+            "theoretical_seconds": theory,
+            "total_evaluated_seconds": total,
+            "theoretical_fraction": theory / total if total else 0.0,
+            "ledger": None
+            if self._cost_sink is None
+            else {
+                "path": str(self._cost_sink_path),
+                "bytes": self._cost_sink_bytes,
+                "sha256": self._cost_sink_digest.hexdigest(),
+                "encoding": "canonical_utf8_jsonl",
+                "write_failed": self._cost_sink_failed,
+            },
+        }
