@@ -279,6 +279,38 @@ class TestMultiTokenizerMixin(CustomTestCase):
             chunk.to_lists(support_logprobs=True), ([[7, 8]], [[-0.5, -1.0]])
         )
 
+    def test_return_path_keeps_indexer_topk_layer_count(self):
+        for make_output in (_make_batch_str_output, _make_batch_token_id_output):
+            for batching in (True, False):
+                with (
+                    self.subTest(output=make_output.__name__, batching=batching),
+                    envs.SGLANG_BATCH_TOKENIZER_OUTPUTS.override(batching),
+                ):
+                    output = make_output()
+                    output.indexer_topk = ["AAAA", None]
+                    output.indexer_topk_num_layers = 7
+                    ipcs = ["worker-a", "worker-a"]
+                    sent = []
+                    mapping = SimpleNamespace(
+                        send_output=lambda target, obj, *, is_tokenizer: sent.append(
+                            (target, obj)
+                        )
+                    )
+
+                    _send_output_to_tokenizer_workers(output, ipcs, mapping)
+
+                    self.assertEqual(len(sent), 1 if batching else 2)
+                    self.assertEqual(
+                        [rid for _, obj in sent for rid in obj.rids], output.rids
+                    )
+                    self.assertEqual(
+                        [topk for _, obj in sent for topk in obj.indexer_topk],
+                        ["AAAA", None],
+                    )
+                    for target, obj in sent:
+                        self.assertEqual(target, "worker-a")
+                        self.assertEqual(obj.indexer_topk_num_layers, 7)
+
     def test_batch_str_output_without_weight_versions_stays_none(self):
         """An output from an older server without the field splits into None."""
         output = _make_batch_str_output()
