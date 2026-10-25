@@ -5,6 +5,7 @@ from unittest.mock import DEFAULT, MagicMock, Mock, patch
 
 import torch
 
+from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.io_struct import (
     BeginWeightUpdateReqInput,
@@ -12,6 +13,7 @@ from sglang.srt.managers.io_struct import (
     PluginWeightUpdateReqInput,
     PluginWeightUpdateReqOutput,
     ReleaseMemoryOccupationReqInput,
+    ResumeMemoryOccupationReqInput,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
@@ -328,6 +330,7 @@ class _WeightUpdaterManagerTestBase(CustomTestCase):
             flush_cache=lambda **kwargs: True,
             is_fully_idle=lambda **kwargs: True,
             scheduler=SimpleNamespace(
+                pause_state=SimpleNamespace(paused=False),
                 record_weight_version_change=lambda new_version: self.recorded.append(
                     new_version
                 ),
@@ -850,6 +853,170 @@ class TestPluginWeightUpdateReply(CustomTestCase):
         self.assertFalse(merged_failed.success)
         self.assertIn("no receive buffers", merged_failed.message)
         self.assertEqual(merged_failed.received_tensor_counts, [])
+
+
+class TestDiskUpdateGuards(_WeightUpdaterManagerTestBase):
+    def _patch_draft_backup(self, preserved: bool) -> None:
+        patcher = patch(
+            "sglang.srt.managers.scheduler_components.weight_updater."
+            "resolve_weights_cpu_backup",
+            return_value=preserved,
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_remote_instance_reload_skips_preserved_draft(self):
+        """remote_instance reloads only the target; the backup kept the draft valid,
+        so it must not be asked to reload."""
+        self._patch_draft_backup(True)
+        target, draft = _runner(), _runner()
+        manager = self._manager(target, draft)
+        manager.memory_saver_adapter = SimpleNamespace(enabled=True)
+
+        output = manager.update_weights_from_disk(
+            _request(load_format="remote_instance")
+        )
+
+        self.assertTrue(output.success)
+        target.weight_updater.update_weights_from_disk.assert_called_once()
+        draft.weight_updater.update_weights_from_disk.assert_not_called()
+
+    def test_remote_instance_reload_rejects_discarded_draft_before_target(self):
+        """Reloading only the target would serve with a garbage draft; reject first."""
+        target, draft = _runner(), _runner()
+        manager = self._manager(target, draft)
+        manager.draft_weights_discarded = True
+
+        output = manager.update_weights_from_disk(
+            _request(load_format="remote_instance")
+        )
+
+        self.assertFalse(output.success)
+        target.weight_updater.update_weights_from_disk.assert_not_called()
+        self.assertEqual(self.recorded, [])
+
+    def test_remote_instance_reload_allowed_when_draft_never_released(self):
+        """A server with the memory saver and no draft backup refreshes its target
+        in place while nothing was released: the draft weights are still valid."""
+        self._patch_draft_backup(False)
+        target, draft = _runner(), _runner()
+        manager = self._manager(target, draft)
+        manager.memory_saver_adapter = SimpleNamespace(enabled=True)
+
+        output = manager.update_weights_from_disk(
+            _request(load_format="remote_instance")
+        )
+
+        self.assertTrue(output.success)
+        target.weight_updater.update_weights_from_disk.assert_called_once()
+        draft.weight_updater.update_weights_from_disk.assert_not_called()
+
+    def test_disk_reload_of_all_runners_clears_discarded_draft(self):
+        """Once the default path reloads the draft, remote_instance is allowed again."""
+        manager = self._manager(_runner(), _runner())
+        manager.draft_weights_discarded = True
+
+        self.assertTrue(manager.update_weights_from_disk(_request()).success)
+        output = manager.update_weights_from_disk(
+            _request(load_format="remote_instance")
+        )
+
+        self.assertTrue(output.success)
+
+    def test_update_rejected_while_weights_released(self):
+        """Loading into unmapped weight pages is an illegal memory access that
+        kills the scheduler, so the request must fail without touching a runner."""
+        target = _runner()
+        manager = self._manager(target)
+        manager.memory_saver_adapter = SimpleNamespace(enabled=True)
+        manager.offload_tags = {GPU_MEMORY_TYPE_WEIGHTS}
+
+        output = manager.update_weights_from_disk(_request())
+
+        self.assertFalse(output.success)
+        self.assertIn("resume_memory_occupation", output.message)
+        target.weight_updater.update_weights_from_disk.assert_not_called()
+
+
+class _OrderRecordingLoader:
+    def __init__(self, name: str, events: list):
+        self._name = name
+        self._events = events
+
+    def before_weights_release(self, *, content_preserved: bool) -> None:
+        self._events.append((self._name, "before_weights_release", content_preserved))
+
+    def after_weights_resume(self, *, content_preserved: bool) -> None:
+        self._events.append((self._name, "after_weights_resume", content_preserved))
+
+
+class _OrderRecordingMemorySaver:
+    enabled = True
+
+    def __init__(self, events: list):
+        self._events = events
+
+    def pause(self, tag: str) -> None:
+        self._events.append(("memory_saver", "pause", tag))
+
+    def resume(self, tag: str) -> None:
+        self._events.append(("memory_saver", "resume", tag))
+
+
+class TestWeightMemoryOccupationLoaderNotification(_WeightUpdaterManagerTestBase):
+    def setUp(self):
+        super().setUp()
+        module = "sglang.srt.managers.scheduler_components.weight_updater"
+        for target, kwargs in (
+            (
+                f"{module}.get_model",
+                {"return_value": SimpleNamespace(weight_cache_mode="off")},
+            ),
+            (f"{module}.resolve_weights_cpu_backup", {"return_value": False}),
+            ("torch.get_device_module", {}),
+            ("torch.distributed.all_reduce", {}),
+        ):
+            patcher = patch(target, **kwargs)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _runner(self, name: str, events: list, *, is_draft_worker: bool):
+        return SimpleNamespace(
+            model=torch.nn.Module(),
+            loader=_OrderRecordingLoader(name, events),
+            is_draft_worker=is_draft_worker,
+        )
+
+    def test_loaders_stop_before_pause_and_restart_after_resume(self):
+        """A loader serving weights to peers must be told before their pages are
+        unmapped and only after they are mapped again, on every runner."""
+        events = []
+        manager = self._manager(
+            self._runner("target", events, is_draft_worker=False),
+            draft=self._runner("draft", events, is_draft_worker=True),
+            session=False,
+        )
+        manager.memory_saver_adapter = _OrderRecordingMemorySaver(events)
+
+        manager.release_memory_occupation(
+            ReleaseMemoryOccupationReqInput(tags=[GPU_MEMORY_TYPE_WEIGHTS])
+        )
+        manager.resume_memory_occupation(
+            ResumeMemoryOccupationReqInput(tags=[GPU_MEMORY_TYPE_WEIGHTS])
+        )
+
+        self.assertTrue(manager.draft_weights_discarded)
+        self.assertEqual(
+            events,
+            [
+                ("target", "before_weights_release", False),
+                ("draft", "before_weights_release", False),
+                ("memory_saver", "pause", GPU_MEMORY_TYPE_WEIGHTS),
+                ("memory_saver", "resume", GPU_MEMORY_TYPE_WEIGHTS),
+                ("target", "after_weights_resume", False),
+                ("draft", "after_weights_resume", False),
+            ],
+        )
 
 
 if __name__ == "__main__":

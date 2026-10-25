@@ -69,7 +69,10 @@ def _make_manager(events):
         lambda: SimpleNamespace(tp_group=SimpleNamespace(cpu_group=object())),
     ):
         return SchedulerWeightUpdaterManager(
-            tp_worker=SimpleNamespace(model_runner=SimpleNamespace(model=object())),
+            tp_worker=SimpleNamespace(
+                model_runner=SimpleNamespace(model=object()),
+                weight_update_runners=lambda: [],
+            ),
             draft_worker=None,
             memory_saver_adapter=SimpleNamespace(
                 pause=lambda tag: events.append(("pause", tag)),
