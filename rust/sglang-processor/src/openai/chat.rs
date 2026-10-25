@@ -6,11 +6,16 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
+use sglang_api_types::api::v1::{
+    GenerateRequest, ImagesConfig, Int64List, SamplingParams, SamplingParamsOrList, TokenIds,
+    TokenIdsOrList, WatermarkRequestConfig, sampling_params_or_list, string_or_list,
+    token_ids_or_list,
+};
 
 use super::kimi_k3_tag::auto_tool_call_tag;
 use super::request::{
-    OneOrList, ResponseFormat, StreamOptions, custom_labels, default_model, float_logit_bias,
-    format_json_schema, lora_path, one, usage_flags, yes,
+    OneOrList, ResponseFormat, StreamOptions, custom_labels, default_model, format_json_schema,
+    lora_path, one, usage_flags, yes,
 };
 use super::wire::{
     Payload, Reply, StreamState, http_status_name, malformed_output_reply, meta_u64, now,
@@ -82,7 +87,7 @@ struct ChatRequest {
     model: String,
     #[serde(default)]
     frequency_penalty: f64,
-    logit_bias: Option<Map<String, Value>>,
+    logit_bias: Option<HashMap<String, f64>>,
     #[serde(default)]
     logprobs: bool,
     top_logprobs: Option<i64>,
@@ -109,7 +114,7 @@ struct ChatRequest {
     regex: Option<String>,
     ebnf: Option<String>,
     repetition_penalty: Option<f64>,
-    stop_token_ids: Option<Vec<i64>>,
+    stop_token_ids: Option<Int64List>,
     stop_regex: Option<OneOrList<String>>,
     #[serde(default)]
     no_stop_trim: bool,
@@ -128,8 +133,8 @@ struct ChatRequest {
     chat_template_kwargs: Option<Map<String, Value>>,
     custom_logit_processor: Option<OneOrList<Option<String>>>,
     custom_params: Option<Map<String, Value>>,
-    watermark: Option<Map<String, Value>>,
-    images_config: Option<Map<String, Value>>,
+    watermark: Option<WatermarkRequestConfig>,
+    images_config: Option<ImagesConfig>,
     rid: Option<OneOrList<String>>,
     extra_key: Option<OneOrList<String>>,
     cache_salt: Option<OneOrList<String>>,
@@ -194,7 +199,7 @@ pub fn lower_chat(
     model: &ChatModel,
     render: impl FnOnce(&Value) -> Option<Vec<u32>>,
     tokenizer: Option<Arc<dyn OpenAiTokenizer>>,
-) -> Result<(Value, ChatResponder), Unsupported> {
+) -> Result<(GenerateRequest, ChatResponder), Unsupported> {
     let original: Value =
         serde_json::from_slice(body).map_err(|_| Unsupported("unparsed_request"))?;
     let Value::Object(mut raw) = original.clone() else {
@@ -210,7 +215,7 @@ pub fn lower_chat(
     {
         return Err(Unsupported("unsupported_chat_feature"));
     }
-    custom_labels(headers, settings)?;
+    let labels = custom_labels(headers, settings)?;
     if settings.return_input_ids || settings.return_output_ids || headers.sglext_ids {
         return Err(Unsupported("sglext_output"));
     }
@@ -325,16 +330,23 @@ pub fn lower_chat(
 
     let mut lowered = generate_body(
         &request, &kwargs, model, prompt_ids, thinking, headers, settings,
-    );
+    )?;
+    lowered.custom_labels = labels;
     // `get_structure_constraint`: K3's tool parser constrains `auto` calls by
     // its structural tag, unless the request is already constrained; Python
     // tests the constraints by truthiness, so empty strings are unset.
-    let sampling = &mut lowered["sampling_params"];
+    let Some(sampling_params_or_list::Value::One(sampling)) = lowered
+        .sampling_params
+        .as_mut()
+        .and_then(|p| p.value.as_mut())
+    else {
+        unreachable!("one sampling configuration")
+    };
     if let (Some((tool_parser, _)), Some(definitions)) = (&tool_parsing, &tool_definitions)
         && tool_parser == "kimi_k3"
-        && ["regex", "ebnf", "json_schema"]
+        && [&sampling.regex, &sampling.ebnf, &sampling.json_schema]
             .iter()
-            .all(|key| sampling[*key].as_str().is_none_or(str::is_empty))
+            .all(|value| value.as_deref().is_none_or(str::is_empty))
     {
         // `strip_structural_tag_excludes`: the reasoning parser owns the think tokens.
         let strip = parser
@@ -342,20 +354,19 @@ pub fn lower_chat(
             .unwrap_or_default();
         let strip: Vec<&str> = strip.into_iter().filter(|t| !t.is_empty()).collect();
         if let Some(tag) = auto_tool_call_tag(definitions, parallel_tool_calls, &strip)? {
-            sampling["structural_tag"] = python_json(&tag, true).into();
+            sampling.structural_tag = Some(python_json(&tag, true));
         }
     }
     if let Some(stop) = tool_call_stop {
-        let sampling = &mut lowered["sampling_params"];
-        let mut stops = match sampling["stop"].take() {
-            Value::Array(stops) => stops,
-            Value::Null => Vec::new(),
-            single => vec![single],
+        let mut stops = match sampling.stop.take().and_then(|s| s.value) {
+            Some(string_or_list::Value::Many(stops)) => stops.items,
+            Some(string_or_list::Value::One(stop)) => vec![stop],
+            None => Vec::new(),
         };
         if !stops.iter().any(|s| s == stop) {
-            stops.push(stop.into());
+            stops.push(stop.to_owned());
         }
-        sampling["stop"] = stops.into();
+        sampling.stop = Some(OneOrList::List(stops).into());
     }
     let (include_usage, continuous_usage_stats) =
         usage_flags(request.stream_options.as_ref(), settings);
@@ -605,13 +616,6 @@ fn validate(
     {
         return invalid;
     }
-    if request
-        .logit_bias
-        .as_ref()
-        .is_some_and(|b| !b.values().all(Value::is_number))
-    {
-        return invalid;
-    }
     let max_output = request
         .max_completion_tokens
         .filter(|&n| n != 0)
@@ -715,90 +719,108 @@ fn generate_body(
     thinking: bool,
     headers: &OpenAiHeaders<'_>,
     settings: &OpenAiSettings,
-) -> Value {
-    // `ChatCompletionRequest.to_sampling_params`: request, then generation config, then OpenAI.
+) -> Result<GenerateRequest, Unsupported> {
     let model_defaults = settings.sampling_defaults.as_deref().unwrap_or("model") == "model";
-    let param = |value: Option<Value>, name: &str, default: Value| {
-        let configured = model
-            .generation_config
-            .get(name)
-            .filter(|v| model_defaults && !v.is_null());
-        value.unwrap_or_else(|| configured.cloned().unwrap_or(default))
+    let param = |value: Option<f64>, name: &str, default: f64| -> Result<f64, Unsupported> {
+        match value {
+            Some(value) => Ok(value),
+            None => match model
+                .generation_config
+                .get(name)
+                .filter(|v| model_defaults && !v.is_null())
+            {
+                Some(value) => value
+                    .as_f64()
+                    .ok_or(Unsupported("invalid_sampling_default")),
+                None => Ok(default),
+            },
+        }
     };
-    let logit_bias = float_logit_bias(&request.logit_bias);
-    let max_new_tokens = request
-        .max_completion_tokens
-        .filter(|&n| n != 0)
-        .or(request.max_tokens);
-    let mut sampling = json!({
-        "temperature": param(request.temperature.map(Value::from), "temperature", json!(1.0)),
-        "max_new_tokens": max_new_tokens,
-        "min_new_tokens": request.min_tokens,
-        "stop": request.stop,
-        "stop_token_ids": request.stop_token_ids,
-        "stop_regex": request.stop_regex,
-        "top_p": param(request.top_p.map(Value::from), "top_p", json!(1.0)),
-        "top_k": param(request.top_k.map(Value::from), "top_k", json!(-1)),
-        "min_p": param(request.min_p.map(Value::from), "min_p", json!(0.0)),
-        "presence_penalty": request.presence_penalty,
-        "frequency_penalty": request.frequency_penalty,
-        "repetition_penalty": param(request.repetition_penalty.map(Value::from), "repetition_penalty", json!(1.0)),
-        "regex": request.regex,
-        "ebnf": request.ebnf,
-        "n": request.n,
-        "no_stop_trim": request.no_stop_trim,
-        "ignore_eos": request.ignore_eos,
-        "skip_special_tokens": request.skip_special_tokens,
-        "logit_bias": logit_bias,
-        "custom_params": request.custom_params,
-        "sampling_seed": request.seed,
-        "spaces_between_special_tokens": kwargs.get("spaces_between_special_tokens").cloned().unwrap_or(json!(true)),
-        "watermark": request.watermark,
-    });
-    if let Ok(Some(schema)) =
-        format_json_schema(request.response_format.as_ref(), model.is_kimi_k3())
-    {
-        sampling["json_schema"] = schema.into();
-    }
-    json!({
-        "input_ids": prompt_ids,
-        "image_data": null,
-        "video_data": null,
-        "audio_data": null,
-        "sampling_params": sampling,
-        "return_logprob": request.logprobs,
-        "logprob_start_len": -1,
-        "top_logprobs_num": request.top_logprobs.unwrap_or(0),
-        "return_sampling_mask": false,
-        "sampling_logprobs_mode": null,
-        "stream": request.stream,
-        "return_text_in_logprobs": true,
-        "modalities": [],
-        "lora_path": lora_path(&request.model, &request.lora_path),
-        "bootstrap_host": request.bootstrap_host,
-        "bootstrap_port": request.bootstrap_port,
-        "bootstrap_room": request.bootstrap_room,
-        "routed_dp_rank": request.routed_dp_rank.or(request.data_parallel_rank),
-        "disagg_prefill_dp_rank": request.disagg_prefill_dp_rank,
-        "return_hidden_states": false,
-        "return_routed_experts": false,
-        "routed_experts_start_len": 0,
-        "rid": request.rid,
-        "session_id": request.session_id,
-        "extra_key": request.extra_key,
-        "cache_salt": request.cache_salt,
-        "require_reasoning": thinking,
-        "priority": request.priority,
-        "routing_key": headers.routing_key,
-        "custom_labels": custom_labels(headers, settings).unwrap_or_default(),
-        "custom_logit_processor": request.custom_logit_processor,
-        "images_config": request.images_config,
-        "video_config": null,
-        "image_max_dynamic_patch": null,
-        "video_max_dynamic_patch": null,
-        "max_dynamic_patch": null,
-        "use_audio_in_video": false,
-        "return_prompt_token_ids": false,
+    let top_k = match request.top_k {
+        Some(value) => value,
+        None => match model
+            .generation_config
+            .get("top_k")
+            .filter(|v| model_defaults && !v.is_null())
+        {
+            Some(value) => value
+                .as_i64()
+                .ok_or(Unsupported("invalid_sampling_default"))?,
+            None => -1,
+        },
+    };
+    let sampling = SamplingParams {
+        temperature: Some(param(request.temperature, "temperature", 1.0)?),
+        max_new_tokens: request
+            .max_completion_tokens
+            .filter(|&n| n != 0)
+            .or(request.max_tokens),
+        min_new_tokens: Some(request.min_tokens),
+        stop: request.stop.clone().map(Into::into),
+        stop_token_ids: request.stop_token_ids.clone(),
+        stop_regex: request.stop_regex.clone().map(Into::into),
+        top_p: Some(param(request.top_p, "top_p", 1.0)?),
+        top_k: Some(top_k),
+        min_p: Some(param(request.min_p, "min_p", 0.0)?),
+        presence_penalty: Some(request.presence_penalty),
+        frequency_penalty: Some(request.frequency_penalty),
+        repetition_penalty: Some(param(
+            request.repetition_penalty,
+            "repetition_penalty",
+            1.0,
+        )?),
+        regex: request.regex.clone(),
+        json_schema: format_json_schema(request.response_format.as_ref(), model.is_kimi_k3())?,
+        ebnf: request.ebnf.clone(),
+        n: Some(request.n),
+        no_stop_trim: Some(request.no_stop_trim),
+        ignore_eos: Some(request.ignore_eos),
+        skip_special_tokens: Some(request.skip_special_tokens),
+        logit_bias: request.logit_bias.clone().unwrap_or_default(),
+        custom_params: request
+            .custom_params
+            .as_ref()
+            .map(|v| serde_json::to_string(v).expect("JSON object")),
+        sampling_seed: request.seed,
+        watermark: request.watermark.clone(),
+        spaces_between_special_tokens: Some(
+            kwargs
+                .get("spaces_between_special_tokens")
+                .map(|v| v.as_bool().ok_or(Unsupported("invalid_request")))
+                .transpose()?
+                .unwrap_or(true),
+        ),
+        ..Default::default()
+    };
+    Ok(GenerateRequest {
+        sampling_params: Some(SamplingParamsOrList {
+            value: Some(sampling_params_or_list::Value::One(sampling)),
+        }),
+        return_logprob: Some(OneOrList::One(request.logprobs).into()),
+        top_logprobs_num: Some(OneOrList::One(request.top_logprobs.unwrap_or(0)).into()),
+        stream: Some(request.stream),
+        return_text_in_logprobs: Some(true),
+        lora_path: lora_path(&request.model, &request.lora_path),
+        bootstrap_host: request.bootstrap_host.clone().map(Into::into),
+        bootstrap_port: request.bootstrap_port.clone().map(Into::into),
+        bootstrap_room: request.bootstrap_room.clone().map(Into::into),
+        routed_dp_rank: request.routed_dp_rank.or(request.data_parallel_rank),
+        disagg_prefill_dp_rank: request.disagg_prefill_dp_rank,
+        rid: request.rid.clone().map(Into::into),
+        session_id: request.session_id.clone(),
+        extra_key: request.extra_key.clone().map(Into::into),
+        cache_salt: request.cache_salt.clone().map(Into::into),
+        priority: request.priority,
+        routing_key: headers.routing_key.map(str::to_owned),
+        custom_logit_processor: request.custom_logit_processor.clone().map(Into::into),
+        images_config: request.images_config.clone(),
+        input_ids: Some(TokenIdsOrList {
+            value: Some(token_ids_or_list::Value::One(TokenIds {
+                ids: prompt_ids.into_iter().map(i64::from).collect(),
+            })),
+        }),
+        require_reasoning: Some(thinking),
+        ..Default::default()
     })
 }
 
