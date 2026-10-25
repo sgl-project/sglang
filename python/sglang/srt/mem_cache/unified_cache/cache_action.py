@@ -16,20 +16,6 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import NodeId
 
 
-class ReplaceWriteThroughOnNodeSplit(msgspec.Struct, frozen=True):
-    """Replace the pending write-through node on a node split:
-
-        parent -> node    =>    parent -> new_node -> new_child
-
-    old_node_id (the pre-split node) is replaced by new_node_id + new_child_node_id.
-    """
-
-    ack_id: int
-    old_node_id: NodeId
-    new_node_id: NodeId
-    new_child_node_id: NodeId
-
-
 class FreeDeviceKV(msgspec.Struct, frozen=True):
     """Free unreferenced device KV slots (a SWA-aware combined free)."""
 
@@ -47,6 +33,22 @@ class ComponentAction(msgspec.Struct, frozen=True):
     """Base for component-routed actions; the cache dispatches each one to
     ``component_type``'s class-level ``apply_component_action``; every subclass
     declares its ``component_type`` field."""
+
+
+class UpdatePendingBackupOnNodeSplit(ComponentAction, frozen=True):
+    """Update pending backups for the prefix and child produced by a split.
+
+    The cache first relocates write-through/linker publication lists when
+    ``ack_id`` is present, then routes this same action once to FULL for
+    component-owned buffer-write dependencies. Buffer-only splits may have
+    no tree acknowledgment.
+    """
+
+    ack_id: int | None
+    old_node_id: NodeId
+    new_node_id: NodeId
+    new_child_node_id: NodeId
+    component_type: ComponentType = ComponentType.FULL
 
 
 class FreeComponentDeviceSlot(ComponentAction, frozen=True):
@@ -115,7 +117,7 @@ class SWARebuild(ComponentAction, frozen=True):
     component_type: ComponentType = ComponentType.SWA
 
 
-# Cache-owned actions, applied by UnifiedRadixCache itself.
+# The cache handles these directly; split updates also reach their component.
 CacheAction = (
-    ReplaceWriteThroughOnNodeSplit | FreeDeviceKV | FreeDeviceKVFullOnly | BackupKV
+    UpdatePendingBackupOnNodeSplit | FreeDeviceKV | FreeDeviceKVFullOnly | BackupKV
 )

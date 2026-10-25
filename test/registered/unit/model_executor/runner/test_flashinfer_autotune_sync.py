@@ -80,6 +80,7 @@ class TestMegaMoEAutotuneStartup(CustomTestCase):
         )
         general = Mock(side_effect=lambda *_args, **_kwargs: nullcontext())
         modules = {
+            "flashinfer": SimpleNamespace(autotune_v2=lambda **_: nullcontext()),
             "flashinfer.autotuner": SimpleNamespace(
                 AutoTuner=SimpleNamespace(
                     get=lambda: SimpleNamespace(

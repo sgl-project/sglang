@@ -54,10 +54,12 @@ renders the model:
   `PromptFormatter`, replace that branch.
 - **Python calls `apply_chat_template`** (Jinja, spec `None`): give the model a
   variant holding Dynamo's Jinja `PromptFormatter`, picked in
-  `ChatFormatter::from_tokenizer_config` from the template text as
-  `parser/template_detection.py` picks it, and build the template context that
-  `_process_messages` and `_apply_jinja_template` build, like GLM-5.3
-  (`models/glm53.rs`).
+  `ChatFormatter::from_tokenizer_config` from the template text (as
+  `parser/template_detection.py` picks it, where it has a detector), and build the
+  template context that `_process_messages` and `_apply_jinja_template` build, like
+  GLM-5.3 (`models/glm53.rs`) and Qwen3.8 (`models/qwen38.rs`). Dynamo's formatter
+  rewrites shapes its load-time probes find the template rejects (a later system
+  turn, for one); SGLang raises on them, so check those before rendering.
 
 ## Method
 
@@ -137,7 +139,7 @@ renders the model:
   split (it is for DeepSeek-V4). Run each check where Python runs it: a final
   assistant turn's tool calls are discarded, so object checks on their arguments
   belong after the split. Hosts reach the model through `render_prompt` too, so
-  check the renderer's continuation handling (`sglang-renderer` `render()`) as well.
+  check their continuation handling as well.
   (`final_assistant`, `continuation_parts`, `continuation_bos`, `continuation_only`, `final_tool_call_no_arguments`, `continuation_tool_call_null_arguments`)
 - **Model-specific fields and turns**: `task` placement, a system turn mid-conversation,
   inserted empty system turns. (`task_action`, `task_after_developer`, `consecutive_task`, `mid_system`)
@@ -183,8 +185,10 @@ PYTHONPATH=$REPO/python HF_HUB_CACHE=<hub cache> HF_HUB_OFFLINE=1 \
 When a new spec needs more, extend `serving_chat()` in the script (one place):
 - **More server state:** set the extra attribute that `__init__` resolves, for
   example `_dsv41_default_reasoning_effort`.
-- **Tokenizes through `apply_chat_template(tokenize=True)`:** the recorder sees no
-  text. Record the template's text output instead.
+
+A spec that tokenizes inside `apply_chat_template(tokenize=True)` (Kimi K3) is
+recorded by the template's text output. Its `render_request` returns the
+segments the checkpoint encodes, and `tests/parity.rs` encodes them one by one.
 
 Pin `revision` to a commit hash and regenerate only on purpose.
 

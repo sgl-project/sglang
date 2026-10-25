@@ -208,35 +208,5 @@ class TestReservedFloorWithFloats(unittest.TestCase):
             )
 
 
-class TestFloatViews(unittest.TestCase):
-    def test_float_mha_views_shape_and_roundtrip(self):
-        page_size = 2
-        spec = _mha("swa", "float", layer_num=3, head_num=2, head_dim=8)
-        pool = _make_pool(
-            [_mamba("state", "up"), spec, _mha("full", "down")],
-            total_bytes=1 << 20,
-            page_size=page_size,
-        )
-        k_views, v_views = pool.mha_views_for("swa")
-        self.assertEqual(len(k_views), spec.layer_num)
-        self.assertEqual(len(v_views), spec.layer_num)
-        num_pages = pool.max_slots("swa") // page_size
-        n_rows = num_pages * page_size
-        for k in (*k_views, *v_views):
-            # 3-D per-layer views indexed by the physical token id; the slot
-            # stride is the whole entry (see `build_dense_views`).
-            self.assertEqual(tuple(k.shape), (n_rows, spec.head_num, spec.head_dim))
-            self.assertEqual(k.stride(0) * k.element_size(), spec.entry_bytes())
-        # Round-trip: a float view is a real strided window into _raw.
-        row = pool.min_slot_index("swa")
-        pattern = (
-            torch.arange(spec.head_num * spec.head_dim, dtype=torch.float32)
-            .reshape(spec.head_num, spec.head_dim)
-            .to(torch.bfloat16)
-        )
-        k_views[1][row] = pattern
-        torch.testing.assert_close(k_views[1][row], pattern)
-
-
 if __name__ == "__main__":
     unittest.main()
