@@ -9,7 +9,12 @@ from torch import nn
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import (
+    KVWriteLoc,
+    MHATokenToKVPool,
+    ReqToTokenPool,
+)
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     CudaGraphConfig,
@@ -303,6 +308,38 @@ class TinyModelConfig:
         return self.num_key_value_heads // kv_tp_size
 
 
+def _static_swa_pool(
+    *, case: DenseAttentionCase, size: int, dtype, head_dim: int, device: str
+) -> SWAKVPool:
+    """A hybrid-SWA pool with layer 0 its window layer. Its full->swa mapping
+    moves every page but the sink's to another page, offsets kept, as a paged
+    allocator hands them out, so a skipped mapping hits the wrong slot."""
+    assert case.sliding_window_size is not None, "an SWA pool needs a window"
+    pool = SWAKVPool(
+        size=size,
+        size_swa=size,
+        page_size=case.page_size,
+        dtype=dtype,
+        head_num=case.num_kv_heads,
+        head_dim=head_dim,
+        swa_attention_layer_ids=[0],
+        full_attention_layer_ids=[1],
+        device=device,
+        enable_memory_saver=False,
+        enable_alt_stream=False,
+    )
+    page = case.page_size
+    num_pages = (size + page) // page
+    generator = torch.Generator().manual_seed(7 + len(case.name))
+    # One random cycle over pages 1.., so no page keeps its own slots.
+    order = torch.randperm(num_pages - 1, generator=generator) + 1
+    swa_page = torch.zeros(num_pages, dtype=torch.int64)
+    swa_page[order] = order.roll(-1)
+    slots = (swa_page[:, None] * page + torch.arange(page)).reshape(-1)
+    pool.register_mapping(torch.cat([slots, torch.tensor([-1])]).to(device))
+    return pool
+
+
 class MockModelRunner(ModelRunner):
     def __init__(
         self,
@@ -316,6 +353,7 @@ class MockModelRunner(ModelRunner):
         disable_cuda_graph: bool = True,
         disable_piecewise_cuda_graph: bool = True,
         runner_batch_size: int | None = None,
+        swa_pool: bool = False,
     ):
         pool_batch_size = runner_batch_size or case.batch_size
         self.device = device
@@ -390,17 +428,26 @@ class MockModelRunner(ModelRunner):
             enable_memory_saver=False,
         )
         max_token_loc = case.page_size + pool_batch_size * max_context_len
-        self.token_to_kv_pool = MHATokenToKVPool(
-            size=max_token_loc + case.page_size,
-            page_size=case.page_size,
-            dtype=dtype,
-            head_num=case.num_kv_heads,
-            head_dim=head_dim,
-            layer_num=1,
-            device=device,
-            enable_memory_saver=False,
-            enable_alt_stream=False,
-        )
+        if swa_pool:
+            self.token_to_kv_pool = _static_swa_pool(
+                case=case,
+                size=max_token_loc + case.page_size,
+                dtype=dtype,
+                head_dim=head_dim,
+                device=device,
+            )
+        else:
+            self.token_to_kv_pool = MHATokenToKVPool(
+                size=max_token_loc + case.page_size,
+                page_size=case.page_size,
+                dtype=dtype,
+                head_num=case.num_kv_heads,
+                head_dim=head_dim,
+                layer_num=1,
+                device=device,
+                enable_memory_saver=False,
+                enable_alt_stream=False,
+            )
         self.token_to_kv_pool_allocator = SimpleNamespace(
             page_size=case.page_size,
             get_kvcache=lambda: self.token_to_kv_pool,
@@ -950,9 +997,15 @@ def _populate_prefix_kv(
         return
 
     loc_tensor = torch.tensor(locs, dtype=torch.int64, device=runner.device)
-    runner.token_to_kv_pool.set_kv_buffer(
+    pool = runner.token_to_kv_pool
+    loc_info = (
+        KVWriteLoc(loc_tensor, swa_loc=pool.translate_loc_from_full_to_swa(loc_tensor))
+        if isinstance(pool, SWAKVPool)
+        else loc_tensor
+    )
+    pool.set_kv_buffer(
         module.attn,
-        loc_tensor,
+        loc_info,
         torch.cat(keys, dim=0),
         torch.cat(values, dim=0),
     )
@@ -971,6 +1024,7 @@ def build_dense_attention_fixture(
     disable_piecewise_cuda_graph: bool = True,
     runner_batch_size: int | None = None,
     loc_layout: str = "shuffled_pages",
+    swa_pool: bool = False,
 ) -> DenseAttentionFixture:
     seed = 2026 + len(case.name) + case.num_kv_heads
     torch.manual_seed(seed)
@@ -994,6 +1048,7 @@ def build_dense_attention_fixture(
         disable_cuda_graph=disable_cuda_graph,
         disable_piecewise_cuda_graph=disable_piecewise_cuda_graph,
         runner_batch_size=runner_batch_size,
+        swa_pool=swa_pool,
     )
     try:
         backend = ATTENTION_BACKENDS[case.backend](runner)
