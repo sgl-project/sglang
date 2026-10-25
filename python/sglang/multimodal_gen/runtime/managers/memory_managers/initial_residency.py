@@ -126,6 +126,7 @@ def maybe_seed_initial_residency(
     if (
         auto_residency_static_skip_reason(server_args) is not None
         or server_args.use_fsdp_inference
+        or server_args.comfyui_mode
         or not current_platform.is_cuda()
     ):
         return
