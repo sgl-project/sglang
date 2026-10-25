@@ -56,7 +56,7 @@ class TestBaseProcessorConfigExtraction(CustomTestCase):
             )
         )
         return patch.multiple(
-            "sglang.srt.multimodal.processors.base_processor",
+            "sglang.srt.multimodal.serving_preprocessing",
             _is_cpu=False,
             _is_xpu=False,
             _is_npu=False,
