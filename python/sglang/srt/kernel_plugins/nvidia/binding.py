@@ -38,6 +38,7 @@ from sglang.kernels.plugin_kernels.nvidia.spec import (
 from sglang.srt.arg_groups.model_override_base import model_config_of, resolving_view
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend
+from sglang.srt.platforms import current_platform
 from sglang.srt.plugins import GENERAL_PLUGINS_GROUP
 from sglang.srt.runtime_context import (
     get_context,
@@ -220,11 +221,19 @@ MAX_DEADLINE_S, MIN_DEADLINE_S = 60.0, 5.0
 
 
 def device_isa() -> Optional[str]:
-    """This process's GPU as "sm_<major><minor>", or None without a visible GPU."""
-    if not torch.cuda.is_available():
-        return None
-    props = torch.cuda.get_device_properties(torch.cuda.current_device())
-    return f"sm_{props.major}{props.minor}"
+    """This process's device target, matched against ``Requirements.isas``: a
+    CUDA-alike GPU as "sm_<major><minor>", an out-of-tree platform's own target
+    name, or None without a visible device (``SRTPlatform.get_megakernel_target``)."""
+    return current_platform.get_megakernel_target()
+
+
+def flag_enabled(cfg: Any) -> bool:
+    """Whether --enable-megakernel or its CUDA spelling --enable-nvidia-megakernel
+    is set on a resolved view or the exec kernel bag."""
+    return bool(
+        getattr(cfg, "enable_megakernel", False)
+        or getattr(cfg, "enable_nvidia_megakernel", False)
+    )
 
 
 def deadline_s(watchdog_timeout: Optional[float]) -> float:
@@ -303,7 +312,11 @@ def megakernel_disable_reasons(
 ) -> tuple[Optional[MegakernelSpec], list[str]]:
     """The spec for this model and every reason it cannot serve this configuration."""
     if isa is None:
-        return None, ["no GPU is visible"]
+        return None, [
+            f"no device target: {type(current_platform).__name__} reports none "
+            "(no visible GPU, or the platform does not implement "
+            "get_megakernel_target)"
+        ]
     spec, why = find_spec(architectures=hf_config.architectures, isa=isa)
     if spec is None and not registered_architectures():
         # the plugin loader logs and skips a plugin that fails, so nothing registered
@@ -364,9 +377,11 @@ def handle_nvidia_megakernel(server_args: Any) -> None:
     """Resolution step: fail before the weights load when the flag cannot be served,
     listing every reason."""
     cfg = resolving_view(server_args)
-    if not cfg.enable_nvidia_megakernel:
+    if not flag_enabled(cfg):
         return
-    reasons = plugin_reasons()
+    # An out-of-tree platform registers its specs from its own plugin, under its
+    # own entry point; a registry left empty is reported by find_spec below.
+    reasons = plugin_reasons() if not current_platform.is_out_of_tree() else []
     if not reasons:
         model_config = model_config_of(server_args)
         spec, reasons = megakernel_disable_reasons(
@@ -389,7 +404,7 @@ def megakernel_enabled() -> bool:
     # the model loader also runs without a server's config (tools, unit tests)
     if not get_context().is_config_namespace_published("exec"):
         return False
-    return get_exec().kernel.enable_nvidia_megakernel
+    return flag_enabled(get_exec().kernel)
 
 
 def install_megakernel(
@@ -419,10 +434,18 @@ def install_megakernel(
         deadline_s=deadline_s(get_device().watchdog_timeout),
         binding=binding,
     )
-    start, free_before = time.perf_counter(), torch.cuda.mem_get_info()[0]
+    start, free_before = time.perf_counter(), _device_free_bytes()
     built = spec.build(model, hf_config, context)
     # not setattr: a built object that is an nn.Module must not join the state dict
     model.__dict__["_megakernel"] = built
+    # Optional on BuiltMegakernel: pools the kernel needs in its own layout, chosen
+    # here, before the KV cache is sized and its pools are built.
+    pool_layout = getattr(built, "pool_layout", None)
+    if pool_layout is not None:
+        try:
+            current_platform.activate_megakernel_pool_layout(pool_layout)
+        except NotImplementedError as e:
+            _refuse([f"{spec.name} declares a pool_layout: {e}"])
     # Different widths would leave ranks waiting in different collectives.
     megakernel_agree(tuple(built.widths), what=f"widths {spec.name} built")
     if spec.max_rows > 0 and not built.widths:
@@ -432,7 +455,7 @@ def install_megakernel(
         f"Online weight updates are not supported with {FLAG} ({spec.name})"
     )
     built_s = time.perf_counter() - start
-    used_mib = (free_before - torch.cuda.mem_get_info()[0]) / 2**20
+    used_mib = (free_before - _device_free_bytes()) / 2**20
     if not built.widths:
         # a spec that covers no step, e.g. a draft spec offering draft_sampler only
         logger.info(
@@ -454,6 +477,11 @@ def install_megakernel(
         used_mib,
         context.deadline_s,
     )
+    if current_platform.install_megakernel_dispatch(
+        model=model, built=built, binding=binding
+    ):
+        # The platform's own runner plans and runs the covered steps.
+        return
     dispatch = _Dispatch(built=built, original=model.forward, binding=binding)
     model.forward = dispatch.wrapped()
     if _decode_graphs_enabled():
@@ -560,6 +588,14 @@ def _model_disable_reasons(
         reasons += spec.model_disable_reasons(model, hf_config)
     if "forward" in model.__dict__:
         reasons.append("the model's forward is already replaced on this instance")
+    if not spec.requires.resident_blocks:
+        return reasons
+    if not current_platform.is_cuda_alike():
+        reasons.append(
+            f"resident_blocks {spec.requires.resident_blocks} is a CUDA SM count; "
+            "an out-of-tree platform checks residency in model_disable_reasons"
+        )
+        return reasons
     sms = torch.cuda.get_device_properties(
         torch.cuda.current_device()
     ).multi_processor_count
@@ -648,6 +684,13 @@ def _tokens_per_request() -> int:
     if spec_config.speculative_algorithm is None:
         return 1
     return int(spec_config.speculative_num_draft_tokens or 1)
+
+
+def _device_free_bytes() -> int:
+    """Free device memory for the build log; 0 where torch.cuda cannot tell."""
+    if not current_platform.is_cuda_alike():
+        return 0
+    return torch.cuda.mem_get_info()[0]
 
 
 def _decode_graphs_enabled() -> bool:

@@ -268,6 +268,51 @@ class SRTPlatform(DeviceMixin):
         pass
 
     # ------------------------------------------------------------------
+    # Megakernel plugins (sglang.srt.kernel_plugins.nvidia.binding)
+    # ------------------------------------------------------------------
+
+    def get_megakernel_target(self) -> Optional[str]:
+        """The device target megakernel specs are matched on
+        (``Requirements.isas``), or None when no device is visible.
+
+        The default reports a CUDA-alike GPU as ``"sm_<major><minor>"``. An
+        out-of-tree platform returns its own target name (e.g. a compiler
+        target) to serve ``--enable-megakernel``; None refuses it.
+        """
+        import torch
+
+        if not self.is_cuda_alike() or not torch.cuda.is_available():
+            return None
+        props = torch.cuda.get_device_properties(torch.cuda.current_device())
+        return f"sm_{props.major}{props.minor}"
+
+    def install_megakernel_dispatch(
+        self, *, model: torch.nn.Module, built: Any, binding: Any
+    ) -> bool:
+        """Route covered steps to ``built`` from the platform's own runner.
+
+        Called once after a megakernel is built. Return True when the
+        platform owns the dispatch (e.g. its graph runner calls
+        ``built.plan`` / ``built.forward``); core then leaves
+        ``model.forward`` and the CUDA-graph capture check alone. The
+        default False keeps core's ``model.forward`` wrapper.
+        """
+        return False
+
+    def activate_megakernel_pool_layout(self, pool_layout: Any) -> None:
+        """Select KV / state pool classes for a megakernel's ``pool_layout``.
+
+        Called after the build and before KV-cache sizing, only when the
+        built megakernel declares a non-None ``pool_layout``; the platform's
+        ``get_kv_pool_cls`` (and friends) then build pools in that layout.
+        In-tree pools have one layout each, so the default refuses.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} cannot build pools in a megakernel's "
+            f"pool_layout {pool_layout!r}"
+        )
+
+    # ------------------------------------------------------------------
     # BaseFusedOp integration
     # ------------------------------------------------------------------
 
