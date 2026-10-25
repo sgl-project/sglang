@@ -1,7 +1,7 @@
 """Embedding kernels."""
 
 from sglang.kernels.registry import register_kernel
-from sglang.kernels.spec import KernelBackend, KernelSpec
+from sglang.kernels.spec import CUDA_ONLY, KernelBackend, KernelSpec
 
 register_kernel(
     KernelSpec(
@@ -19,6 +19,14 @@ register_kernel(
         op="embeddings.engram_gather",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.embeddings.engram_gather:engram_gather",
+    )
+)
+
+register_kernel(
+    KernelSpec(
+        op="embeddings.engram_gather_peer",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.embeddings.engram_gather:engram_gather_peer",
     )
 )
 
@@ -55,3 +63,14 @@ register_kernel(
 )
 
 __all__ = []
+
+
+# Public entry points inventoried by logical operator group (RFC #29630).
+register_kernel(
+    KernelSpec(
+        op="embeddings.fused_qwen4_ngram_hash",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.embeddings.qwen4_ngram:fused_qwen4_ngram_hash",
+        capabilities=CUDA_ONLY,
+    )
+)

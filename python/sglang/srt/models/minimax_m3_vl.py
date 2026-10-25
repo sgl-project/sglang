@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import logging
+from array import array
 from typing import Iterable, List, Optional, Tuple
 
 import torch
@@ -9,15 +10,15 @@ import torch.nn as nn
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.utils import (
     get_moe_a2a_backend,
-    is_shared_experts_fusion_disabled,
+    get_num_fused_shared_experts,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.utils.common import get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
+    pad_mm_tokens,
 )
 from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
@@ -87,8 +88,10 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
 
         self.use_data_parallel = get_mm().mm_enable_dp_encoder
 
-        self.num_fused_shared_experts = 0
-        self._determine_num_fused_shared_experts()
+        # The weight loader reads this after the build.
+        self.num_fused_shared_experts = get_num_fused_shared_experts()
+        if self.num_fused_shared_experts:
+            log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
 
         vision_config_raw = config.vision_config
         assert vision_config_raw is not None, "vision_config is required"
@@ -176,15 +179,12 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
             )
         return None
 
-    def _determine_num_fused_shared_experts(self) -> None:
-        # The decision was installed by the loader; this only reads it.
-        if is_shared_experts_fusion_disabled():
-            return
-        self.num_fused_shared_experts = self.config.text_config.n_shared_experts
-        assert self.num_fused_shared_experts == 1, (
-            "Only 1 fused shared expert is supported"
-        )
-        log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
+    @classmethod
+    def num_fusable_shared_experts(cls, hf_config) -> int:
+        """Return the model's fusable shared-expert count."""
+        num_shared_experts = hf_config.text_config.n_shared_experts
+        assert num_shared_experts == 1, "Only 1 fused shared expert is supported"
+        return num_shared_experts
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
@@ -195,10 +195,8 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
             text_config
         )
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
-        return MultiModalityDataPaddingPatternMultimodalTokens().pad_input_tokens(
-            input_ids, mm_inputs
-        )
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
+        return pad_mm_tokens(input_ids, mm_inputs)
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         return get_image_feature(self.vision_tower, items, self.use_data_parallel)

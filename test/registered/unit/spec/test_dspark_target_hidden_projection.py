@@ -4,8 +4,8 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.layers.aux_hidden_states import pack_aux_hidden_states
 from sglang.srt.models.dspark import DSparkDraftMixin
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
     TargetHiddenKvInjector,
 )
@@ -48,16 +48,13 @@ class DSparkTargetHiddenProjectionTest(CustomTestCase):
             ),
         )
         with (
-            mock.patch(
-                "sglang.srt.speculative.dspark_components.dspark_worker_v2.get_pp_group",
-                return_value=SimpleNamespace(is_last_rank=False),
-            ),
+            get_parallel().override(pp_group=SimpleNamespace(is_last_rank=False)),
             mock.patch(
                 "sglang.srt.speculative.dspark_components.dspark_worker_v2.get_schedule",
                 return_value=SimpleNamespace(page_size=1),
             ),
         ):
-            worker = DSparkWorkerV2(None, 0, None, 0, target)
+            worker = DSparkWorkerV2(None, 0, 0, target)
         worker.alloc_memory_pool()
         worker.init_attention_backends()
         worker.init_cuda_graphs()
@@ -71,11 +68,6 @@ class DSparkTargetHiddenProjectionTest(CustomTestCase):
         self.assertEqual(
             worker.spec_v2_attn_backends, (target.model_runner.attn_backend,)
         )
-
-    def test_single_aux_hidden_state_is_returned_without_copy(self) -> None:
-        hidden_states = torch.empty(2, 3)
-
-        self.assertIs(hidden_states, pack_aux_hidden_states([hidden_states]))
 
     def test_preprojected_hidden_is_not_projected_again(self) -> None:
         attention = _Attention()
@@ -93,7 +85,10 @@ class DSparkTargetHiddenProjectionTest(CustomTestCase):
         pool = SimpleNamespace(set_kv_buffer=mock.Mock())
         injector = TargetHiddenKvInjector(
             draft_model=draft_model,
-            draft_model_runner=SimpleNamespace(token_to_kv_pool=pool),
+            draft_model_runner=SimpleNamespace(
+                token_to_kv_pool=pool,
+                kv_index_translator=SimpleNamespace(),
+            ),
             model_runner=SimpleNamespace(device=torch.device("cpu")),
             device=torch.device("cpu"),
             verify_num_draft_tokens=2,

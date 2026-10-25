@@ -35,6 +35,8 @@ REASONING_PARSER_NAMES = [
     "interns1",
     "gemma4",
     "inkling",
+    "iquest_q1",
     "cohere_command4",
     "gigachat35",
+    "response_template",
 ]

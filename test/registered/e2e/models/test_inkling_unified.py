@@ -141,7 +141,6 @@ class TestInklingUnifiedTriPool(CustomTestCase):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=cls.server_args(),
-            env={**os.environ, "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"},
         )
 
     @classmethod
@@ -207,8 +206,9 @@ class TestInklingUnifiedFullPrefillGraph(TestInklingUnifiedTriPool):
     capture outright. With capture on, both the captured block table and the
     SWA write loc have to come from the translator. Re-running the full->swa
     map on `out_cache_loc` does not work here -- it is already FULL-side
-    kernel-facing by then, and indexes far past the swa v2p table (a
-    device-side "index out of bounds" assert).
+    physical by then, and a full physical page number is also a valid
+    virtual page of the swa v2p, so the map would silently resolve it to an
+    unrelated token's swa slot.
     `test_input_output_logprobs_match` is the sharp guard: a wrong-slot SWA
     write moves logprobs at once, and
     `test_long_decode_slides_past_swa_window` keeps compaction running
@@ -235,7 +235,6 @@ class TestInklingUnifiedVsStaticParity(CustomTestCase):
             DEFAULT_URL_FOR_TEST,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=other_args,
-            env={**os.environ, "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"},
         )
         try:
             out = []

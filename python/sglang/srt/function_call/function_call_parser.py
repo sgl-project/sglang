@@ -35,6 +35,7 @@ from sglang.srt.function_call.hermes_detector import HermesDetector
 from sglang.srt.function_call.hunyuan_detector import HunyuanDetector
 from sglang.srt.function_call.inkling_detector import InklingDetector
 from sglang.srt.function_call.internlm_detector import InternlmDetector
+from sglang.srt.function_call.iquest_q1_detector import IQuestQ1Detector
 from sglang.srt.function_call.k2_v3_detector import K2V3Detector
 from sglang.srt.function_call.kimik2_detector import KimiK2Detector
 from sglang.srt.function_call.kimik3_detector import KimiK3Detector
@@ -58,6 +59,7 @@ from sglang.srt.function_call.utils import (
     _get_tool_schema_defs,
     get_json_schema_constraint,
 )
+from sglang.srt.parser.response_template import ResponseTemplateToolDetector
 
 logger = logging.getLogger(__name__)
 
@@ -113,9 +115,18 @@ class FunctionCallParser:
         "gigachat35": GigaChat35Detector,
         "gemma4": Gemma4Detector,
         "inkling": InklingDetector,
+        "iquest_q1": IQuestQ1Detector,
+        "response_template": ResponseTemplateToolDetector,
     }
 
-    def __init__(self, tools: List[Tool], tool_call_parser: str, tokenizer=None):
+    def __init__(
+        self,
+        tools: List[Tool],
+        tool_call_parser: str,
+        tokenizer=None,
+        tool_choice=None,
+        prefix: str = "",
+    ):
         detector_class = self.ToolCallParserEnum.get(tool_call_parser)
         if detector_class:
             kwargs = {}
@@ -123,6 +134,8 @@ class FunctionCallParser:
                 sig = inspect.signature(detector_class)
                 if "tokenizer" in sig.parameters:
                     kwargs["tokenizer"] = tokenizer
+            if prefix and issubclass(detector_class, ResponseTemplateToolDetector):
+                kwargs["prefix"] = prefix
             detector = detector_class(**kwargs)
         else:
             raise ValueError(f"Unsupported tool_call_parser: {tool_call_parser}")
@@ -131,9 +144,19 @@ class FunctionCallParser:
             detector.use_full_assistant_constraint = not any(
                 tool.function.strict for tool in tools
             )
-        self.detector = detector
+        if isinstance(tool_choice, dict):
+            tool_choice = ToolChoice(function={"name": tool_choice["name"]})
+        self._required_tool_parser = detector.get_required_tool_parser(tool_choice)
+        self.detector = self._required_tool_parser or detector
         self.tools = tools
         self.tool_strict_level = envs.SGLANG_TOOL_STRICT_LEVEL.get()
+
+    def owns_tool_format(self) -> bool:
+        return (
+            self._required_tool_parser is not None
+            or self.detector.supports_structural_tag()
+            or self.detector.parses_required_natively()
+        )
 
     def has_tool_call(self, text: str) -> bool:
         """
@@ -146,7 +169,7 @@ class FunctionCallParser:
         Returns:
             True if the text contains a tool call, False otherwise
         """
-        if not self.tools:
+        if not self.tools and not self.detector.parses_without_tools():
             return False
         return self.detector.has_tool_call(text)
 
@@ -162,7 +185,7 @@ class FunctionCallParser:
             - The remaining text after parsing that was not consumed by the detector (can be treated as normal text)
             - A list of tool calls parsed from the text
         """
-        if not self.tools:
+        if not self.tools and not self.detector.parses_without_tools():
             return full_text, []
         has_tool_call = self.detector.has_tool_call(full_text)
         parsed_result = self.detector.detect_and_parse(full_text, self.tools)
@@ -184,7 +207,7 @@ class FunctionCallParser:
             - The normal text that should be displayed to the user
             - A list of tool calls parsed from the chunk
         """
-        if not self.tools:
+        if not self.tools and not self.detector.parses_without_tools():
             return chunk_text, []
         final_normal_text = ""
         final_calls = []
@@ -204,7 +227,7 @@ class FunctionCallParser:
         Text a detector held back waiting for a marker (which can no longer
         arrive) is released as normal text; see BaseFormatDetector.finish().
         """
-        if not self.tools:
+        if not self.tools and not self.detector.parses_without_tools():
             return "", []
         sp_result = self.detector.finish(self.tools)
         return sp_result.normal_text, sp_result.calls
@@ -283,11 +306,17 @@ class FunctionCallParser:
             any(tool.function.strict for tool in self.tools)
             or self.tool_strict_level >= ToolStrictLevel.FUNCTION
         )
+        if isinstance(self.detector, ResponseTemplateToolDetector):
+            self.detector.validate_structure_constraint_request(
+                tool_choice,
+                parallel_tool_calls,
+                should_constrain_auto,
+            )
 
         try:
             if (
                 isinstance(self.detector, Glm47MoeDetector)
-                and self.detector.use_full_assistant_constraint
+                and self.detector.parses_required_natively()
             ):
                 functions = (
                     [
@@ -356,6 +385,14 @@ class FunctionCallParser:
             if (
                 tool_choice == "required" or isinstance(tool_choice, ToolChoice)
             ) and not self.detector.parses_required_natively():
+                required_parser = self.detector.get_required_tool_parser(tool_choice)
+                if required_parser is not None:
+                    return (
+                        "json_schema",
+                        required_parser.get_json_schema_constraint(
+                            self.tools, tool_choice, parallel_tool_calls
+                        ),
+                    )
                 json_schema = get_json_schema_constraint(
                     self.tools, tool_choice, parallel_tool_calls=parallel_tool_calls
                 )

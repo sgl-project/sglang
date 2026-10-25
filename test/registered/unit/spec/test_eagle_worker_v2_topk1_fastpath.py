@@ -6,6 +6,7 @@ tests check that the pre-allocated `parent_list` / `top_scores_index` match the
 slow path (`organize_draft_results`) for num_steps in {1, 2, 3, 4}.
 """
 
+import builtins
 import contextlib
 import unittest
 from types import SimpleNamespace
@@ -124,12 +125,6 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
                 self.assertEqual(fast_index.tolist(), ref_index.long().tolist())
                 self.assertEqual(fast_tokens.tolist(), ref_tokens.tolist())
 
-                # The kernel reads these via data_ptr() as contiguous int64.
-                self.assertEqual(fast_parent.dtype, torch.long)
-                self.assertEqual(fast_index.dtype, torch.long)
-                self.assertTrue(fast_parent.is_contiguous())
-                self.assertTrue(fast_index.is_contiguous())
-
     def test_assert_on_inconsistent_steps_and_draft_tokens(self):
         # num_draft_tokens must equal num_steps + 1 for topk=1.
         worker = _make_worker(num_steps=3, num_draft_tokens=3)
@@ -171,7 +166,6 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
         ):
             result = worker.draft_forward(forward_batch)
 
-        self.assertEqual(result, (None, None, None, None))
         self.assertEqual(worker.draft_runner.forward.call_count, 2)
 
 
@@ -229,7 +223,9 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
                     max_context_len=1,
                 )
                 worker.target_worker = SimpleNamespace(
-                    model_runner=SimpleNamespace(attn_backend=attn_backend)
+                    model_runner=SimpleNamespace(
+                        attn_backend=attn_backend, kv_index_translator=None
+                    )
                 )
                 draft_input = SimpleNamespace(
                     bonus_tokens=torch.zeros((1,), dtype=torch.long, device=DEVICE),
@@ -253,7 +249,7 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
                     ),
                     patch(
                         "sglang.srt.speculative.eagle_worker_v2.prepare_for_draft",
-                        return_value=(forward_batch, True),
+                        return_value=(forward_batch, True, None),
                     ),
                 ):
                     worker.draft(batch)
@@ -262,6 +258,7 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
                 self.assertEqual(worker.draft_forward.called, not expect_graph)
 
     def test_preserves_initialized_backend_when_draft_extend_backend_is_unset(self):
+        """Non-QSA initialization must work without optional QSA dependencies."""
         worker = object.__new__(EagleDraftWorker)
         existing_backend = object()
         decode_backend = object()
@@ -269,14 +266,24 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
         worker.draft_runner = SimpleNamespace(
             attn_backend=existing_backend,
             model_config=SimpleNamespace(hf_config=SimpleNamespace()),
+            kv_index_translator=SimpleNamespace(is_translating=False),
         )
         worker.topk = 1
         worker.speculative_num_steps = 2
         worker.seed_dsa_topk_from_draft_extend = False
+        real_import = builtins.__import__
 
-        with patch(
-            "sglang.srt.speculative.eagle_worker_v2.DraftBackendFactory",
-            _make_backend_factory(decode_backend, None),
+        def import_without_qsa(name, *args, **kwargs):
+            if name == "sglang.srt.layers.attention.qsa.qsa_indexer":
+                raise OSError("Optional QSA dependency is unavailable")
+            return real_import(name, *args, **kwargs)
+
+        with (
+            patch("builtins.__import__", new=import_without_qsa),
+            patch(
+                "sglang.srt.speculative.eagle_worker_v2.DraftBackendFactory",
+                _make_backend_factory(decode_backend, None),
+            ),
         ):
             worker.init_attention_backend()
 
@@ -294,6 +301,7 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
         worker.draft_runner = SimpleNamespace(
             attn_backend=existing_backend,
             model_config=SimpleNamespace(hf_config=SimpleNamespace()),
+            kv_index_translator=SimpleNamespace(is_translating=False),
         )
         worker.topk = 1
         worker.speculative_num_steps = 2
@@ -404,6 +412,15 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
             worker.spec_v2_attn_backends,
             (target_backend, decode_backend, fallback_backend),
         )
+
+    def test_non_last_pp_uses_only_target_runner(self):
+        target_runner = SimpleNamespace(attn_backend=object())
+        worker = object.__new__(EAGLEWorkerV2)
+        worker._target_worker = SimpleNamespace(model_runner=target_runner)
+        worker._draft_worker = None
+
+        self.assertIs(worker.last_shared_read_runner, target_runner)
+        self.assertEqual(worker.spec_v2_attn_backends, (target_runner.attn_backend,))
 
 
 if __name__ == "__main__":

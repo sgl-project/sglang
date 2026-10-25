@@ -3,17 +3,20 @@
 This page covers principles and essentials: folder layout, how to run tests, registration, and suite selection. For complete references, see the skill guides:
 
 - **Writing tests** — templates, fixtures, model selection, complete suite tables, checklist: [`.claude/skills/write-sglang-test/SKILL.md`](../.claude/skills/write-sglang-test/SKILL.md)
-- **CI pipeline internals** — stage flow diagrams, fast-fail layers, gating, partitioning, execution modes, debugging failures: [`.claude/skills/ci-workflow-guide/SKILL.md`](../.claude/skills/ci-workflow-guide/SKILL.md)
+- **CI pipeline internals** — stage flow diagrams, fail-fast layers, gating, partitioning, execution modes, debugging failures: [`.claude/skills/ci-workflow-guide/SKILL.md`](../.claude/skills/ci-workflow-guide/SKILL.md)
 
 ## CI Pipeline Overview
 
-The CI pipeline runs in three sequential stages: **A** (pre-flight, ~3 min) → **B** (basic, ~30 min) → **C** (advanced, ~30 min). Kernel and multimodal-gen tests run in parallel with stage B. For details on stage gating, fast-fail mechanisms, execution modes (PR vs scheduled vs manual dispatch), and debugging CI failures, see the [CI workflow guide](../.claude/skills/ci-workflow-guide/SKILL.md).
+The CI pipeline runs in three sequential stages: **A** (pre-flight, ~3 min) → **B** (basic, ~30 min) → **C** (advanced, ~30 min). Kernel and multimodal-gen tests run in parallel with stage B. For details on stage gating, fail-fast mechanisms, execution modes (PR vs scheduled vs manual dispatch), and debugging CI failures, see the [CI workflow guide](../.claude/skills/ci-workflow-guide/SKILL.md).
 
 ## Folder Organization
 
 - `registered/`: CI test files, including kernel tests and benchmarks, auto-discovered by `run_suite.py`.
 - `manual/`: Non-CI tests for local debugging or special setups.
 - `run_suite.py`: CI runner — scans `registered/` recursively.
+
+`test/srt/` is retired. Put CI tests under `registered/` and local-only tests
+under `manual/`; lint rejects files in the retired directory.
 
 The system supports both [unittest](https://docs.python.org/3/library/unittest.html) and [pytest](https://docs.pytest.org/en/stable/). The launcher runs `python filename.py -f` with **failfast enabled by default**.
 
@@ -137,6 +140,7 @@ This README mostly describes the NVIDIA GPU CI pipeline. Other hardware backends
 - Each test file should take < 500 seconds; split if longer.
 - Each GitHub Actions job should take < 30 minutes; split if longer.
 - If tests are too slow for per-commit, consider nightly suites.
+- New GSM8K or MMLU accuracy checks should use sgl-eval (`sglang.test.sgl_eval_utils.run_sgl_eval` or `sgl-eval run`) instead of adding another dataset or evaluator copy.
 
 ## Other Notes
 

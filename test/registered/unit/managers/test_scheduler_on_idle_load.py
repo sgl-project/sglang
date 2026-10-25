@@ -26,28 +26,27 @@ class TestOnIdleStallPublish(CustomTestCase):
         s.scheduler_stage_metrics = None
         s.enable_hicache_storage = False
         s.disaggregation_mode = DisaggregationMode.NULL
+        s.enable_lmcache = False
         s.maybe_send_health_check_signal = MagicMock()
         s.is_fully_idle = MagicMock(return_value=False)  # stalled, not idle
         s.publish_load_snapshot = MagicMock(return_value=None)
         s.load_publisher = MagicMock()
         s.load_inquirer = MagicMock()
         s.metrics_reporter = MagicMock()
+        s.dp_attn_adapter = MagicMock()
         s._last_stall_publish_ts = float("-inf")
         return s
 
-    def test_spinning_stall_publishes_once_within_the_floor(self):
-        s = self._stalled_scheduler()
-        with patch("sglang.srt.managers.scheduler.time.monotonic", return_value=100.0):
-            for _ in range(100):
-                s.on_idle()
-        self.assertEqual(s.publish_load_snapshot.call_count, 1)
-        self.assertEqual(s.load_publisher.publish_load_stat.call_count, 1)
-
-    def test_publishes_again_after_the_floor_elapses(self):
+    def test_stall_publish_is_wall_clock_bounded_by_the_floor(self):
         s = self._stalled_scheduler()
         with patch("sglang.srt.managers.scheduler.time.monotonic") as mono:
+            # A spinning stall inside the floor publishes once.
             mono.return_value = 100.0
-            s.on_idle()
+            for _ in range(100):
+                s.on_idle()
+            self.assertEqual(s.publish_load_snapshot.call_count, 1)
+            self.assertEqual(s.load_publisher.publish_load_stat.call_count, 1)
+            # After the floor elapses the next stall publishes again.
             mono.return_value = 100.10  # > LOAD_STALL_REFRESH_S
             s.on_idle()
         self.assertEqual(s.publish_load_snapshot.call_count, 2)

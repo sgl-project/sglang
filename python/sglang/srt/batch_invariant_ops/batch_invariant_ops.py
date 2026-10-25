@@ -602,6 +602,12 @@ def mm_batch_invariant(a, b):
     return matmul_persistent(a, b)
 
 
+def mm_out_batch_invariant(
+    a: torch.Tensor, b: torch.Tensor, *, out: torch.Tensor
+) -> torch.Tensor:
+    return out.copy_(matmul_persistent(a, b))
+
+
 def addmm_batch_invariant(bias, a, b):
     return matmul_persistent(a, b, bias=bias)
 
@@ -1014,6 +1020,7 @@ def enable_batch_invariant_mode(enable_bmm: bool = True):
     if not _is_npu:
         # Register for detected device
         _batch_invariant_LIB.impl("aten::mm", mm_batch_invariant, dispatch_key)
+        _batch_invariant_LIB.impl("aten::mm.out", mm_out_batch_invariant, dispatch_key)
         _batch_invariant_LIB.impl("aten::addmm", addmm_batch_invariant, dispatch_key)
         _batch_invariant_LIB.impl(
             "aten::_log_softmax", _log_softmax_batch_invariant, dispatch_key
@@ -1030,6 +1037,7 @@ def enable_batch_invariant_mode(enable_bmm: bool = True):
     else:
         from sglang.srt.hardware_backend.npu.batch_invariant_ops.npu_batch_invariant_ops import (
             npu_add_rms_norm_batch_invariant,
+            npu_fia_batch_invariant_get_max_workspace,
             npu_fused_infer_attention_score_batch_invariant,
             npu_log_softmax_batch_invariant,
             npu_matmul_batch_invariant,
@@ -1049,6 +1057,12 @@ def enable_batch_invariant_mode(enable_bmm: bool = True):
         )
         torch.ops.npu.npu_fused_infer_attention_score = (
             npu_fused_infer_attention_score_batch_invariant
+        )
+        torch_npu.npu_fused_infer_attention_score = (
+            npu_fused_infer_attention_score_batch_invariant
+        )
+        torch_npu._npu_fused_infer_attention_score_get_max_workspace = (
+            npu_fia_batch_invariant_get_max_workspace
         )
         torch_npu.npu_add_rms_norm = npu_add_rms_norm_batch_invariant
 
