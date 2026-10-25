@@ -53,10 +53,10 @@ jobs:
           fetch-depth: 0
           ref: ${{ inputs.ref || github.sha }}
 
-      - name: Start CI container (pull intel/sglang-dev:latest-kernel-main)
+      - name: Start CI container (pull intel/sglang-dev:latest-main-main)
         run: |
           export HF_TOKEN="$(cat ~/huggingface_token.txt)"
-          bash scripts/ci/xpu/xpu_ci_start_container.sh --image-tag latest-kernel-main
+          bash scripts/ci/xpu/xpu_ci_start_container.sh --image-tag latest-main-main
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -161,10 +161,10 @@ jobs:
           fetch-depth: 0
           ref: ${{ inputs.ref || github.sha }}
 
-      - name: Start CI container (pull intel/sglang-dev:latest-kernel-main)
+      - name: Start CI container (pull intel/sglang-dev:latest-main-main)
         run: |
           export HF_TOKEN="$(cat ~/huggingface_token.txt)"
-          bash scripts/ci/xpu/xpu_ci_start_container.sh --image-tag latest-kernel-main
+          bash scripts/ci/xpu/xpu_ci_start_container.sh --image-tag latest-main-main
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -258,10 +258,10 @@ jobs:
           fetch-depth: 0
           ref: ${{ inputs.ref || github.sha }}
 
-      - name: Start CI container (pull intel/sglang-dev:latest-kernel-main)
+      - name: Start CI container (pull intel/sglang-dev:latest-main-main)
         run: |
           export HF_TOKEN="$(cat ~/huggingface_token.txt)"
-          bash scripts/ci/xpu/xpu_ci_start_container.sh --image-tag latest-kernel-main
+          bash scripts/ci/xpu/xpu_ci_start_container.sh --image-tag latest-main-main
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -355,10 +355,10 @@ jobs:
           fetch-depth: 0
           ref: ${{ inputs.ref || github.sha }}
 
-      - name: Start CI container (pull intel/sglang-dev:latest-kernel-main)
+      - name: Start CI container (pull intel/sglang-dev:latest-main-main)
         run: |
           export HF_TOKEN="$(cat ~/huggingface_token.txt)"
-          bash scripts/ci/xpu/xpu_ci_start_container.sh --image-tag latest-kernel-main
+          bash scripts/ci/xpu/xpu_ci_start_container.sh --image-tag latest-main-main
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
