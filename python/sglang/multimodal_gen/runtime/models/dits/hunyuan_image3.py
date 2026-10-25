@@ -851,6 +851,9 @@ class HunyuanImage3Model(nn.Module):
             ]
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # CLA followers reuse the master layer's K/V instead of their own, which
+        # the per-layer prefix cache does not track; those configs run in full.
+        self.prefix_cache_supported = _get_cla_factor(config) == 1
 
     def get_input_embeddings(self, input_ids):
         return self.embed_tokens(input_ids)
@@ -892,7 +895,7 @@ class HunyuanImage3Model(nn.Module):
         prefix_len=None,
         cache_slot=0,
     ):
-        if prefix_len is not None:
+        if prefix_len is not None and self.prefix_cache_supported:
             return self._forward_block_prefix_cached(
                 hidden_states,
                 attention_mask,
@@ -923,7 +926,6 @@ class HunyuanImage3Model(nn.Module):
         """Step 0 runs the full sequence and caches each layer's prefix K/V.
         Later steps run only the suffix (the noisy image and timestep rows).
         """
-        assert _get_cla_factor(self.config) == 1, "prefix K/V cache needs CLA off"
         bs = attention_mask.shape[0]
         attn_meta = create_hunyuan_image_attention_meta(
             attention_mask, num_image_tokens, first_step
