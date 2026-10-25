@@ -88,7 +88,13 @@ pub(crate) fn python_float(f: f64) -> String {
         .replace('.', "")
         .len();
     // Exact formatting rounds the binary value half to even, as `repr` does.
-    let sci = format!("{:.*e}", len - 1, f.abs());
+    // At a power of two that nearest decimal can round to the float below,
+    // so the shortest digits are kept unless the rounded ones round-trip.
+    let rounded = format!("{:.*e}", len - 1, f.abs());
+    let sci = match rounded.parse::<f64>() == Ok(f.abs()) {
+        true => rounded,
+        false => shortest,
+    };
     let (mantissa, exp) = sci.split_once('e').expect("{:e} has an exponent");
     let digits = mantissa.replace('.', "");
     let exp: i32 = exp.parse().expect("integer exponent");
@@ -514,5 +520,18 @@ mod tests {
             python_json(&value, true),
             "{\"a\": [1, 2.5, 1e-05, 1e+16, 100.0, null], \"\\u00e9\": \"x\\\"\\n\\ud83d\\ude00\"}"
         );
+    }
+
+    /// At a power of two the gap below is half the gap above, so the nearest
+    /// decimal of `repr`'s length can belong to the float below.
+    #[test]
+    fn python_float_round_trips_powers_of_two() {
+        assert_eq!(python_float(2f64.powi(-24)), "5.960464477539063e-08");
+        assert_eq!(python_float(2f64.powi(-44)), "5.684341886080802e-14");
+        assert_eq!(python_float(2f64.powi(89)), "6.189700196426902e+26");
+        for exp in -1022..=1023 {
+            let f = 2f64.powi(exp);
+            assert_eq!(python_float(f).parse::<f64>(), Ok(f), "2^{exp}");
+        }
     }
 }
