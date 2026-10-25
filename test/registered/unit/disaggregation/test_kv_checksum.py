@@ -1,5 +1,6 @@
 """Tests for KV checksum integration in PD disaggregation."""
 
+import random
 import unittest
 import zlib
 from types import SimpleNamespace
@@ -11,9 +12,12 @@ from sglang.srt.disaggregation.checksum import (
     KvChecksumComputer,
     is_health_check_req,
 )
-from sglang.srt.disaggregation.decode import SchedulerDisaggregationDecodeMixin
+from sglang.srt.disaggregation.decode import (
+    DecodeTransferQueue,
+    SchedulerDisaggregationDecodeMixin,
+)
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
-from sglang.srt.disaggregation.utils import MetadataBuffers
+from sglang.srt.disaggregation.utils import MetadataBuffers, kv_layout_signature
 from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -67,9 +71,41 @@ class TestMetadataBuffers(unittest.TestCase):
 
     def test_set_get_kv_checksum_roundtrip(self):
         buf = _make_buf()
-        buf.set_kv_checksum(SimpleNamespace(metadata_buffer_index=1), 0xDEADBEEF)
-        self.assertEqual(buf.get_kv_checksum(1), 0xDEADBEEF)
-        self.assertEqual(buf.get_kv_checksum(0), 0)
+        buf.set_kv_checksum(SimpleNamespace(metadata_buffer_index=1), 0xDEADBEEF, 0xAB)
+        self.assertEqual(buf.get_kv_checksum(1), (0xDEADBEEF, 0xAB))
+        # An untouched row reads as "no digest".
+        self.assertEqual(buf.get_kv_checksum(0), (0, 0))
+
+    def test_clear_slot_resets_what_the_next_owner_reads(self):
+        buf = _make_buf()
+        buf.set_kv_checksum(SimpleNamespace(metadata_buffer_index=1), 0xDEADBEEF, 0xAB)
+        buf.bootstrap_room[1, 0] = 42
+        buf.clear_slot(1)
+        self.assertEqual(buf.get_kv_checksum(1), (0, 0))
+        self.assertEqual(int(buf.bootstrap_room[1, 0]), 0)
+        _make_buf(kv_checksum_enabled=False).clear_slot(1)
+
+
+class TestKvLayoutSignature(unittest.TestCase):
+    def test_tracks_layout_and_is_never_zero(self):
+        def make(**kw):
+            base = dict(
+                page_size=1,
+                kv_item_lens=[64, 64],
+                state_item_lens=[[32]],
+            )
+            base.update(kw)
+            return kv_layout_signature(SimpleNamespace(**base))
+
+        same = make()
+        self.assertNotEqual(same, 0)
+        self.assertEqual(same, make())
+        # A different TP width shows up as different per-page item lengths.
+        self.assertNotEqual(same, make(kv_item_lens=[32, 32]))
+        # A layer-sharded or PP prefill owns fewer buffers.
+        self.assertNotEqual(same, make(kv_item_lens=[64]))
+        self.assertNotEqual(same, make(page_size=16))
+        self.assertNotEqual(same, make(state_item_lens=[[16]]))
 
 
 class TestKvChecksumComputerConfig(unittest.TestCase):
@@ -207,10 +243,12 @@ class _FakeScheduler(SchedulerDisaggregationDecodeMixin):
         self.ngram_embedding_manager = Mock()
         self.chunked_req = None
         self.future_map = None
+        self.attn_tp_cpu_group = None
         self.disagg_decode_prealloc_queue = SimpleNamespace(
             kv_manager=SimpleNamespace(
                 should_verify_kv_checksum=lambda bootstrap_addr: True
-            )
+            ),
+            kv_checksum_mismatch_injector=random.Random(0),
         )
 
     def stream_output(self, reqs, return_logprob):
@@ -218,9 +256,12 @@ class _FakeScheduler(SchedulerDisaggregationDecodeMixin):
 
 
 class _FakePrefillScheduler(SchedulerDisaggregationPrefillMixin):
-    def __init__(self):
-        self.kv_checksum_computer = object()
+    def __init__(self, computer=None):
+        self.kv_checksum_computer = computer or object()
         self.disagg_metadata_buffers = SimpleNamespace(set_kv_checksum=Mock())
+        self.disagg_prefill_bootstrap_queue = SimpleNamespace(
+            kv_checksum_signature=0x1234
+        )
 
 
 def _make_req(expected_chksum, num_input_tokens, rid="r0", bootstrap_host="127.0.0.1"):
@@ -232,22 +273,77 @@ def _make_req(expected_chksum, num_input_tokens, rid="r0", bootstrap_host="127.0
         kv=SimpleNamespace(req_pool_idx=0),
         origin_input_ids=list(range(num_input_tokens)),
         fill_ids=list(range(num_input_tokens)),
+        extend_end=num_input_tokens,
         expected_kv_checksum=expected_chksum,
         return_logprob=False,
     )
 
 
-class TestPrefillHealthCheckChecksum(unittest.TestCase):
+class TestPrefillChecksum(unittest.TestCase):
+    def _send_last_chunk(self, sched, req):
+        with (
+            patch.object(
+                SchedulerDisaggregationPrefillMixin,
+                "_send_kv_chunk",
+                lambda *args, **kwargs: None,
+            ),
+            patch(
+                "sglang.srt.disaggregation.prefill.page_indices_for_request",
+                lambda *args: None,
+            ),
+            patch(
+                "sglang.srt.disaggregation.prefill.state_indices_for_request",
+                lambda *args: None,
+            ),
+        ):
+            sched.send_kv_chunk(req, last_chunk=True)
+
     def test_health_check_clears_metadata_checksum(self):
         sched = _FakePrefillScheduler()
         req = _make_req(0xDEADBEEF, 1, rid="HEALTH_CHECK_1")
-        with patch.object(
-            SchedulerDisaggregationPrefillMixin,
-            "_send_kv_chunk",
-            lambda *args, **kwargs: None,
-        ):
-            sched.send_kv_chunk(req, last_chunk=True)
-        sched.disagg_metadata_buffers.set_kv_checksum.assert_called_once_with(req, 0)
+        self._send_last_chunk(sched, req)
+        sched.disagg_metadata_buffers.set_kv_checksum.assert_called_once_with(req, 0, 0)
+
+    def test_last_chunk_ships_digest_with_layout_signature(self):
+        sched = _FakePrefillScheduler(SimpleNamespace(compute=lambda *args: 0x55))
+        req = _make_req(0, 7)
+        self._send_last_chunk(sched, req)
+        sched.disagg_metadata_buffers.set_kv_checksum.assert_called_once_with(
+            req, 0x55, 0x1234
+        )
+
+
+class TestKvChecksumComparable(unittest.TestCase):
+    def _queue(self, signature=0x77):
+        return SimpleNamespace(
+            scheduler=SimpleNamespace(
+                disagg_decode_prealloc_queue=SimpleNamespace(
+                    kv_checksum_signature=signature
+                )
+            ),
+            _skipped_checksum_signatures=set(),
+        )
+
+    def test_same_layout_compares(self):
+        self.assertTrue(
+            DecodeTransferQueue._kv_checksum_comparable(self._queue(), 0x77)
+        )
+
+    def test_no_digest_skips_quietly(self):
+        queue = self._queue()
+        self.assertFalse(DecodeTransferQueue._kv_checksum_comparable(queue, 0))
+        self.assertEqual(queue._skipped_checksum_signatures, set())
+
+    def test_other_layout_skips_and_logs_once(self):
+        queue = self._queue()
+        with self.assertLogs(
+            "sglang.srt.disaggregation.decode", level="WARNING"
+        ) as logs:
+            self.assertFalse(DecodeTransferQueue._kv_checksum_comparable(queue, 0x99))
+        self.assertEqual(len(logs.output), 1)
+        with patch("sglang.srt.disaggregation.decode.logger.warning") as warning:
+            self.assertFalse(DecodeTransferQueue._kv_checksum_comparable(queue, 0x99))
+        warning.assert_not_called()
 
 
 class TestGetNewPrebuiltBatchChecksum(unittest.TestCase):
@@ -273,7 +369,7 @@ class TestGetNewPrebuiltBatchChecksum(unittest.TestCase):
             computer = _make_computer(self.kv, self.item_len)
         return _FakeScheduler(computer, self.req_to_token)
 
-    def _run_once(self, sched, batch_ret=None):
+    def _run_once(self, sched, batch_ret=None, reduce=None):
         batch = Mock(reqs=sched.waiting_queue) if batch_ret is None else batch_ret
         batch.is_empty.side_effect = lambda: not batch.reqs
 
@@ -283,10 +379,17 @@ class TestGetNewPrebuiltBatchChecksum(unittest.TestCase):
         batch.filter_batch.side_effect = filter_batch
         sched.waiting_queue = []
         running_batch = SimpleNamespace()
-        with patch.object(
-            SchedulerDisaggregationDecodeMixin,
-            "_get_new_prebuilt_batch",
-            lambda s, rb: batch,
+        with (
+            patch.object(
+                SchedulerDisaggregationDecodeMixin,
+                "_get_new_prebuilt_batch",
+                lambda s, rb: batch,
+            ),
+            # Single rank unless a test stands in for the peers.
+            patch(
+                "sglang.srt.disaggregation.decode.all_reduce_flags",
+                reduce or (lambda flags, group, op: flags),
+            ),
         ):
             return sched.get_new_prebuilt_batch(running_batch)
 
@@ -343,11 +446,46 @@ class TestGetNewPrebuiltBatchChecksum(unittest.TestCase):
         mock_abort.assert_not_called()
         mock_release.assert_not_called()
 
-    def test_retract_re_verifies(self):
+    def test_injected_mismatch_aborts_without_raising_in_ci(self):
+        """The injector must not trip the in-CI raise it exists to exercise."""
+        sched = self._make_sched(_SENTINEL)
+        req = _make_req(self.true_chksum, self.num_pages)
+        sched.waiting_queue = [req]
+        with (
+            envs.SGLANG_IS_IN_CI.override(True),
+            envs.SGLANG_TEST_DISAGG_KV_CHECKSUM_MISMATCH_PROB.override(1.0),
+            patch("sglang.srt.disaggregation.decode.prepare_abort") as mock_abort,
+            patch("sglang.srt.disaggregation.decode.release_kv_cache"),
+        ):
+            self.assertIsNone(self._run_once(sched))
+        self.assertEqual(sched.streamed_aborts, [req])
+        mock_abort.assert_called_once()
+
+    def test_mismatch_decision_is_all_reduced(self):
+        """Every rank drops the same requests, even if only a peer saw the fault."""
+        sched = self._make_sched(_SENTINEL)
+        clean = _make_req(self.true_chksum, self.num_pages, rid="clean")
+        sched.waiting_queue = [clean]
+        with (
+            envs.SGLANG_IS_IN_CI.override(False),
+            patch("sglang.srt.disaggregation.decode.prepare_abort"),
+            patch("sglang.srt.disaggregation.decode.release_kv_cache"),
+        ):
+            batch = self._run_once(
+                sched, reduce=lambda flags, group, op: [1] * len(flags)
+            )
+        self.assertIsNone(batch)
+        self.assertEqual(sched.streamed_aborts, [clean])
+
+    def test_verified_once(self):
+        """A request is digested when it first enters a batch, not again after
+        a retraction, by which time decode has written into its last page."""
         sched = self._make_sched(_SENTINEL)
         req = _make_req(self.true_chksum, self.num_pages)
         sched.waiting_queue = [req]
         batch = self._run_once(sched)
+        self.assertEqual(req.expected_kv_checksum, 0)
+        self.kv[0][0, 0] += 1
         sched.waiting_queue = batch.reqs
         self.assertEqual(self._run_once(sched).reqs, [req])
         self.assertEqual(sched.streamed_aborts, [])

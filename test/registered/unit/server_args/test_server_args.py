@@ -223,6 +223,28 @@ class TestPrepareServerArgs(CustomTestCase):
         self.assertTrue(joined._radix_eviction_policy_explicitly_set)
         self.assertTrue(configured._radix_eviction_policy_explicitly_set)
 
+    def test_amd_monokernel_flag_spellings_in_config_and_cli(self):
+        """The deprecated --monokernel-backend amd and --enable-amd-monokernel share a
+        dest; a config file must accept either key, true or false, not reject both."""
+        cases = (
+            ("monokernel-backend: amd\n", [], True),
+            ("enable-amd-monokernel: true\n", [], True),
+            ("enable-amd-monokernel: false\n", [], False),
+            (None, ["--enable-amd-monokernel"], True),
+            (None, ["--monokernel-backend", "amd"], True),
+        )
+        for config, cli, expected in cases:
+            with self.subTest(config=config, cli=cli):
+                argv = ["--model-path", "dummy", *cli]
+                if config is not None:
+                    with tempfile.NamedTemporaryFile(
+                        mode="w", suffix=".yaml", delete=False
+                    ) as f:
+                        f.write(config)
+                    self.addCleanup(os.unlink, f.name)
+                    argv += ["--config", f.name]
+                self.assertIs(prepare_server_args(argv).enable_amd_monokernel, expected)
+
     def test_ple_embedding_offload_rejects_generic_weight_offload(self):
         for generic_offload in (
             {"cpu_offload_gb": 1},
@@ -2376,6 +2398,26 @@ class TestHiCacheArgs(CustomTestCase):
             with envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override(backend):
                 handle_hicache(args)
 
+    def test_dcp_storage_rejects_buffer_only(self):
+        for dcp_size in (2, 8):
+            for backend in ("file", "mooncake"):
+                with self.subTest(dcp_size=dcp_size, backend=backend):
+                    args = self._make_args(
+                        enable_hierarchical_cache=True,
+                        hicache_host_memory_mode="buffer_only",
+                        hicache_storage_backend=backend,
+                        dcp_size=dcp_size,
+                        tp_size=dcp_size,
+                    )
+                    with (
+                        patch(
+                            "sglang.srt.arg_groups.hicache_hook.use_mla_backend",
+                            return_value=True,
+                        ),
+                        self.assertRaisesRegex(NotImplementedError, "buffer_only"),
+                    ):
+                        handle_hicache(args)
+
     def test_buffer_only_resolves_write_back_to_write_through(self):
         """buffer_only has no retained host tier for write_back to defer
         writes into, so the mode resolves that policy to write_through
@@ -2486,6 +2528,42 @@ class TestHiCacheArgs(CustomTestCase):
                 "expected_mem_layout": "page_first_direct",
             },
             {
+                "name": "dcp_mooncake_layer_first",
+                "overrides": {
+                    "enable_hierarchical_cache": True,
+                    "hicache_storage_backend": "mooncake",
+                    "hicache_mem_layout": "layer_first",
+                    "hicache_io_backend": "kernel",
+                    "dcp_size": 2,
+                },
+                "expected_io_backend": "kernel",
+                "expected_mem_layout": "layer_first",
+            },
+            {
+                "name": "dcp_mooncake_page_first",
+                "overrides": {
+                    "enable_hierarchical_cache": True,
+                    "hicache_storage_backend": "mooncake",
+                    "hicache_mem_layout": "page_first",
+                    "hicache_io_backend": "kernel",
+                    "dcp_size": 2,
+                },
+                "expected_io_backend": "kernel",
+                "expected_mem_layout": "page_first",
+            },
+            {
+                "name": "dcp_mooncake_page_first_direct",
+                "overrides": {
+                    "enable_hierarchical_cache": True,
+                    "hicache_storage_backend": "mooncake",
+                    "hicache_mem_layout": "page_first_direct",
+                    "hicache_io_backend": "direct",
+                    "dcp_size": 2,
+                },
+                "expected_io_backend": "direct",
+                "expected_mem_layout": "page_first_direct",
+            },
+            {
                 "name": "unified_memory_with_page_first_direct",
                 "overrides": {
                     "enable_hierarchical_cache": True,
@@ -2525,7 +2603,11 @@ class TestHiCacheArgs(CustomTestCase):
         for case in cases:
             with self.subTest(case=case["name"]):
                 args = self._make_args(**case["overrides"])
-                handle_hicache(args)
+                with patch(
+                    "sglang.srt.arg_groups.hicache_hook.use_mla_backend",
+                    return_value=True,
+                ):
+                    handle_hicache(args)
                 self._assert_hicache_fields(
                     args,
                     expected_io_backend=case["expected_io_backend"],

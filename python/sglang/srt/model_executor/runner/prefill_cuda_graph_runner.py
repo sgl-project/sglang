@@ -1292,8 +1292,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             padded_view.input_ids = static_forward_batch.input_ids
             attn_backend.init_forward_metadata_out_graph(padded_view)
         elif not self.use_captured_attn_metadata:
-            attn_backend.init_forward_metadata(forward_batch)
-            build_snapshot = True
+            # An idle DP rank retains the padded graph shape for collective
+            # participation, but has no real sparse queries or KV writes.
+            if not (
+                attn_backend.skips_prefill_metadata_on_idle_dp_rank
+                and getattr(forward_batch, "global_num_token_non_padded_cpu", None) == 0
+            ):
+                attn_backend.init_forward_metadata(forward_batch)
+                build_snapshot = True
         else:
             assert self.attn_metadata_buffers is not None
             metadata = self.attn_metadata_buffers[shape_key]
@@ -1985,6 +1991,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             mamba_track_indices=mamba_track_indices,
             mamba_track_mask=mamba_track_mask,
             mamba_track_seqlens=mamba_track_seqlens,
+            # CP replay plans attention against this static view, including
+            # KDA's host-side checkpoint plan for the current request.
+            mamba_prefill_track_mask_cpu=forward_batch.mamba_prefill_track_mask_cpu,
+            mamba_track_seqlens_cpu=forward_batch.mamba_track_seqlens_cpu,
             encoder_lens=forward_batch.encoder_lens,
             return_logprob=(
                 forward_batch.return_logprob
