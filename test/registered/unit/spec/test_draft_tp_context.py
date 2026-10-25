@@ -139,7 +139,7 @@ class TestDraftTpContext(CustomTestCase):
 
     def test_cp_and_target_gather_state_restore_after_failure(self):
         from sglang.srt.layers.cp import base as cp
-        from sglang.srt.layers.dp_attention import dp_gather_slot, dp_gather_width
+        from sglang.srt.layers.dp_attention import dp_gather_width, dp_slot_in
         from sglang.srt.runtime_context import get_flags
 
         strategy = object()
@@ -157,7 +157,8 @@ class TestDraftTpContext(CustomTestCase):
             get_flags().dp.override(enabled=True),
             patch.object(cp, "_STRATEGY", strategy),
         ):
-            width, slot = dp_gather_width(), dp_gather_slot()
+            per_rank_tokens = [3, 5]
+            width, slot = dp_gather_width(), dp_slot_in(per_rank_tokens)
             layout = self._resolve()
             with self.assertRaisesRegex(RuntimeError, "draft failed"):
                 with draft_tp_context(layout):
@@ -165,7 +166,7 @@ class TestDraftTpContext(CustomTestCase):
                     self.assertFalse(get_parallel().enable_cp_tp_group_sharing)
                     self.assertIsNone(cp._STRATEGY)
                     self.assertEqual(
-                        (dp_gather_width(), dp_gather_slot()), (width, slot)
+                        (dp_gather_width(), dp_slot_in(per_rank_tokens)), (width, slot)
                     )
                     raise RuntimeError("draft failed")
             self.assertTrue(get_parallel().enable_prefill_cp)
