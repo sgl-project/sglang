@@ -371,3 +371,7 @@ def test_existing_early_dispatch_takes_precedence(make_backend, branch):
     assert _call(case) == branch
     case[0].dflash_swa_mla_fwd.assert_not_called()
     case[0]._forward_extend_kernel.assert_not_called()
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

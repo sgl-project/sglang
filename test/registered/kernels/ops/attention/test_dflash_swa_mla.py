@@ -1,6 +1,7 @@
 """Native-bitwise, independent-reference and replay tests for DFlash SWA MLA."""
 
 import math
+import sys
 
 import pytest
 import torch
@@ -272,3 +273,7 @@ def test_unsupported_window_and_block_fail_before_launch():
             dflash_swa_mla_fwd(*args, sm_scale=SCALE, num_splits=num_splits)
     with pytest.raises(ValueError, match="same-device CUDA BF16"):
         dflash_swa_mla_fwd(*args, sm_scale=SCALE)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
