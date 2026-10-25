@@ -158,6 +158,7 @@ class TestReplicatedMoeOutput(CustomTestCase):
 class TestModelsWithExplicitDpCompletion(CustomTestCase):
     def test_direct_dp_exits_publish_their_selected_sum(self):
         from sglang.srt.layers import dp_attention
+        from sglang.srt.layers.layer_boundary import ops
         from sglang.srt.layers.layer_boundary.layout import Layout, SumGroup, TokenAxis
         from sglang.srt.layers.layer_boundary.residual.add_norm import PLAIN_ADD
         from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
@@ -214,7 +215,7 @@ class TestModelsWithExplicitDpCompletion(CustomTestCase):
                         patches.enter_context(
                             get_forward().scoped(mlp_reduce_scatter=False)
                         )
-                        for module in (moe_transport, boundary):
+                        for module in (moe_transport, boundary, ops):
                             patches.enter_context(
                                 patch.object(
                                     module, "get_parallel", return_value=parallel
@@ -230,37 +231,30 @@ class TestModelsWithExplicitDpCompletion(CustomTestCase):
                             ),
                             patch.object(
                                 moe_transport,
-                                "is_dp_gatherv_active",
-                                return_value=False,
-                            ),
-                            patch.object(
-                                moe_transport,
                                 "should_use_dp_reduce_scatterv",
                                 return_value=use_rsv,
                             ),
                             patch.object(
-                                moe_transport,
+                                ops,
                                 "get_global_dp_buffer",
                                 side_effect=lambda g: torch.empty(4, 3),
                             ),
                             patch.object(
-                                moe_transport,
+                                ops,
                                 "get_local_dp_buffer",
                                 side_effect=lambda g: torch.empty(2, 3),
                             ),
                             patch.object(
-                                moe_transport,
+                                ops,
                                 "get_dp_global_num_tokens",
                                 return_value=[2, 2],
                             ),
                             patch.object(
-                                moe_transport,
+                                ops,
                                 "dp_gather_replicate",
-                                side_effect=lambda out, value, batch: out.fill_(1),
+                                side_effect=lambda out, value, batch, *a: out.fill_(1),
                             ),
-                            patch.object(
-                                moe_transport, "dp_scatter", side_effect=scatter
-                            ),
+                            patch.object(ops, "dp_scatter", side_effect=scatter),
                             patch(
                                 "sglang.srt.layers.moe.should_use_dp_reduce_scatterv",
                                 return_value=use_rsv,

@@ -12,19 +12,18 @@ from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather,
     attn_tp_all_gather_into_tensor,
     dp_gather_replicate,
-    dp_reduce_scatter_tensor,
     dp_reduce_scatterv_async,
-    dp_scatter,
-    get_dp_global_num_tokens,
     get_dp_tbo_comm_stream,
-    get_global_dp_buffer,
     get_global_dp_buffer_len,
-    get_local_dp_buffer,
     get_local_dp_buffer_len,
     get_tbo_persistent_buffer,
-    is_dp_gatherv_active,
 )
-from sglang.srt.layers.layer_boundary.ops import attn_cp_interleave_reduce_scatter
+from sglang.srt.layers.layer_boundary.exit import select_dp_return
+from sglang.srt.layers.layer_boundary.ops import (
+    attn_cp_interleave_reduce_scatter,
+    dp_gather,
+    return_to_dp_local,
+)
 from sglang.srt.layers.layer_boundary.output import DeferredFinalize
 from sglang.srt.layers.layer_boundary.row_transport import ComputeTransport
 from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scatterv
@@ -129,31 +128,23 @@ class MoeRowTransport(ComputeTransport):
                 and not get_moe_a2a_backend().is_none()
             )
         )
-        # Variable-length combine sums TP-sharded expert output while returning
-        # each DP rank's rows. The producer leaves that sum to the transport.
-        _use_reduce_scatterv = (
-            _use_tp_moe_gather
-            and is_dp_gatherv_active()
-            and forward_batch.dp_padding_mode is not None
-            and not forward_batch.dp_padding_mode.is_max_len()
+        # The stage boundary chooses how the expert output returns over
+        # attention DP; a reduce-scatter completes its sum on the way, so the
+        # MoE leaves the sum to the return. The equal-chunk reduce-scatter is
+        # opt-in here and requires one attention rank per DP shard.
+        parallel = get_parallel()
+        dp_return = (
+            select_dp_return(
+                forward_batch,
+                may_reduce_scatter=envs.SGLANG_DP_USE_REDUCE_SCATTER.get()
+                and parallel.tp_size == parallel.attn_dp_size,
+                may_reduce_scatterv=True,
+                reduce_scatterv=should_use_dp_reduce_scatterv(),
+            )
+            if _use_tp_moe_gather
+            else None
         )
-        # Equal-chunk combine requires MAX_LEN padding and one attention rank
-        # per DP shard; the variable-length path takes precedence.
-        _use_reduce_scatter = (
-            envs.SGLANG_DP_USE_REDUCE_SCATTER.get()
-            and _use_tp_moe_gather
-            and not _use_reduce_scatterv
-            and not should_use_dp_reduce_scatterv()
-            and forward_batch.dp_padding_mode is not None
-            and forward_batch.dp_padding_mode.is_max_len()
-            and get_parallel().tp_size == get_parallel().attn_dp_size
-        )
-        mlp_reduce_scatter = (
-            _use_cp
-            or _use_reduce_scatterv
-            or _use_reduce_scatter
-            or (_use_tp_moe_gather and should_use_dp_reduce_scatterv())
-        )
+        mlp_reduce_scatter = _use_cp or dp_return is not None
         # A replicated shared expert can run on local rows before the gather;
         # its output is added after returning the routed experts' local slice.
         _shared_local = None
@@ -172,19 +163,15 @@ class MoeRowTransport(ComputeTransport):
                     f"got {moe_a2a_backend.value!r}."
                 )
         elif _use_tp_moe_gather:
-            hidden_states, local_hidden_states = (
-                get_global_dp_buffer(get_parallel().tp_group),
-                hidden_states,
-            )
-            if do_shared_local and local_hidden_states.shape[0] > 0:
-                _shared_local = moe._forward_shared_experts(local_hidden_states)
+            if do_shared_local and hidden_states.shape[0] > 0:
+                _shared_local = moe._forward_shared_experts(hidden_states)
             # Pad rows are not refreshed during graph replay. Stale bf16-max
             # values can overflow the MoE and contaminate the combine output.
             if _is_hip:
-                _mask_dp_pad_rows(local_hidden_states, forward_batch)
-            # self_attn has already reduced across attention TP, so these hidden
-            # states are replicated and must not be summed by a partial gather.
-            dp_gather_replicate(hidden_states, local_hidden_states, forward_batch)
+                _mask_dp_pad_rows(hidden_states, forward_batch)
+            # self_attn has already reduced across attention TP: the rows are
+            # replicated and are gathered as such, never summed.
+            hidden_states = dp_gather(hidden_states, forward_batch)
         _a2a_scatter_chunks = None
         if _use_tp_attn_a2a_scatter:
             s, r = get_parallel().attn_tp_size, get_parallel().attn_tp_rank
@@ -208,8 +195,7 @@ class MoeRowTransport(ComputeTransport):
         self._use_cp = _use_cp
         self._use_tp_moe_gather = _use_tp_moe_gather
         self._use_tp_attn_a2a_scatter = _use_tp_attn_a2a_scatter
-        self._use_reduce_scatterv = _use_reduce_scatterv
-        self._use_reduce_scatter = _use_reduce_scatter
+        self.dp_return = dp_return
         self.mlp_reduce_scatter = mlp_reduce_scatter
         self._shared_local = _shared_local
         self.do_shared_local = do_shared_local
@@ -221,8 +207,6 @@ class MoeRowTransport(ComputeTransport):
         _use_cp = self._use_cp
         _use_tp_moe_gather = self._use_tp_moe_gather
         _use_tp_attn_a2a_scatter = self._use_tp_attn_a2a_scatter
-        _use_reduce_scatterv = self._use_reduce_scatterv
-        _use_reduce_scatter = self._use_reduce_scatter
         _shared_local = self._shared_local
         _a2a_scatter_chunks = self._a2a_scatter_chunks
         if _use_cp and get_moe_a2a_backend().is_none():
@@ -235,20 +219,9 @@ class MoeRowTransport(ComputeTransport):
             else:
                 hidden_states = attn_cp_interleave_reduce_scatter(hidden_states)
         elif _use_tp_moe_gather:
-            hidden_states, global_hidden_states = (
-                get_local_dp_buffer(get_parallel().tp_group),
-                hidden_states,
+            hidden_states = return_to_dp_local(
+                hidden_states, forward_batch, self.dp_return
             )
-            if should_use_dp_reduce_scatterv() or _use_reduce_scatterv:
-                get_parallel().tp_group.reduce_scatterv(
-                    global_hidden_states,
-                    output=hidden_states,
-                    sizes=get_dp_global_num_tokens(),
-                )
-            elif _use_reduce_scatter:
-                dp_reduce_scatter_tensor(hidden_states, global_hidden_states)
-            else:
-                dp_scatter(hidden_states, global_hidden_states, forward_batch)
             if _shared_local is not None:
                 n = hidden_states.shape[0]
                 hidden_states = hidden_states + _shared_local[:n]
