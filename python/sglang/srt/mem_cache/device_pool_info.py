@@ -85,12 +85,17 @@ class KVBuffers(msgspec.Struct, frozen=True, kw_only=True):
 class KVScaleLayout(Enum):
     TOKEN = "token"
     MXFP8_INTERLEAVED = "mxfp8_interleaved"
+    NVFP4 = "nvfp4"
 
 
 class KVScaleBuffers(msgspec.Struct, frozen=True, kw_only=True):
     k: tuple[torch.Tensor, ...]
     v: tuple[torch.Tensor, ...]
     layout: KVScaleLayout
+    # NVFP4 can retain both token-linear and page/head/token native scale
+    # allocations. These are persistent KV state, not dequant workspaces.
+    native_k: tuple[torch.Tensor, ...] = ()
+    native_v: tuple[torch.Tensor, ...] = ()
 
 
 class MHABufferInfo(msgspec.Struct, frozen=True, kw_only=True):
@@ -141,6 +146,18 @@ class MHABufferInfo(msgspec.Struct, frozen=True, kw_only=True):
                 f"MHA scales: k={len(self.scales.k)}, v={len(self.scales.v)}, "
                 f"expected layers={layers}"
             )
+        if self.scales is not None:
+            native_k, native_v = self.scales.native_k, self.scales.native_v
+            if native_k or native_v:
+                if self.scales.layout != KVScaleLayout.NVFP4:
+                    raise ValueError(
+                        "Native MHA scale buffers require the NVFP4 layout"
+                    )
+                if len(native_k) != layers or len(native_v) != layers:
+                    raise ValueError(
+                        f"MHA native scales: k={len(native_k)}, v={len(native_v)}, "
+                        f"expected layers={layers}"
+                    )
 
 
 class MLASplitBuffers(msgspec.Struct, frozen=True, kw_only=True):

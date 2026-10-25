@@ -101,6 +101,13 @@ def prepare_mha_write_back_staging(
     page_capacity: int = _WRITE_BACK_STAGING_PAGE_CHUNK,
     staging: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
+    if (
+        buffer_info.scales is not None
+        and buffer_info.scales.layout == KVScaleLayout.NVFP4
+    ):
+        from sglang.srt.mem_cache.pool_host.mha_fp4 import nvfp4_payload_info
+
+        buffer_info = nvfp4_payload_info(buffer_info)
     if not (_is_cuda or _is_hip) or layer_num == 0:
         return None
     head_num = buffer_info.head_num
@@ -1680,6 +1687,13 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
 
 
 def get_mha_host_pool_cls(buffer_info: MHABufferInfo) -> type:
+    if (
+        buffer_info.scales is not None
+        and buffer_info.scales.layout == KVScaleLayout.NVFP4
+    ):
+        from sglang.srt.mem_cache.pool_host.mha_fp4 import MHATokenToKVPoolFP4Host
+
+        return MHATokenToKVPoolFP4Host
     is_mxfp8 = (
         buffer_info.scales is not None
         and buffer_info.scales.layout == KVScaleLayout.MXFP8_INTERLEAVED

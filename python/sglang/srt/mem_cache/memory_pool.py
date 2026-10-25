@@ -2347,11 +2347,30 @@ class MHATokenToKVPool(KVCache):
         from sglang.srt.mem_cache.device_pool_info import KVScaleBuffers, KVScaleLayout
 
         if self.k_scale_buffer is None:
+            if (
+                self.quant_method.name == "nvfp4"
+                and self.native_k_scale_buffer is not None
+            ):
+                raise NotImplementedError(
+                    "NVFP4 HiCache requires token-linear scales; native-only "
+                    "scale layouts are not supported."
+                )
             return None
+        is_nvfp4 = self.quant_method.name == "nvfp4"
         return KVScaleBuffers(
             k=tuple(self.k_scale_buffer),
             v=tuple(self.v_scale_buffer),
-            layout=KVScaleLayout.TOKEN,
+            layout=KVScaleLayout.NVFP4 if is_nvfp4 else KVScaleLayout.TOKEN,
+            native_k=(
+                tuple(self.native_k_scale_buffer)
+                if is_nvfp4 and self.native_k_scale_buffer is not None
+                else ()
+            ),
+            native_v=(
+                tuple(self.native_v_scale_buffer)
+                if is_nvfp4 and self.native_v_scale_buffer is not None
+                else ()
+            ),
         )
 
     def _mha_buffer_info(self) -> MHABufferInfo:
