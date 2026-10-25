@@ -198,6 +198,10 @@ def create_unified_radix_cache(
             cache.cache_controller.layer_done_counter
         )
     elif get_memory().enable_unified_cache_external_linker:
+        from sglang.srt.mem_cache.unified_cache.linker_factory import (
+            get_startup_linker_config,
+        )
+
         cache.init_linker_attachment(
             server_args=server_args,
             params=params,
@@ -208,7 +212,7 @@ def create_unified_radix_cache(
         )
         cache.attach_cache_linker(
             get_memory().unified_cache_external_linker_backend,
-            get_memory().hicache_storage_backend_extra_config,
+            get_startup_linker_config(),
         )
     return cache
 

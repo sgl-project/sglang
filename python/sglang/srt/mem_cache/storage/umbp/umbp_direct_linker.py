@@ -6,7 +6,7 @@ import threading
 from collections import defaultdict
 from dataclasses import dataclass
 from queue import Empty, Queue
-from typing import Any, Callable, Optional
+from typing import Any, Callable
 
 import numpy as np
 import torch
@@ -130,19 +130,6 @@ def _materialize_cpu_indices(indices: torch.Tensor) -> torch.Tensor:
     return indices.detach().to(device="cpu", dtype=torch.int64).flatten()
 
 
-def _parse_storage_extra_config(raw_config):
-    # Keep the linker module importable in CPU-only unit tests. The hybrid
-    # controller imports device-specific memory-pool modules transitively.
-    from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
-        HybridCacheController,
-    )
-
-    extra_config, *_ = HybridCacheController.parse_storage_backend_extra_config(
-        raw_config
-    )
-    return extra_config
-
-
 class UMBPDirectLinker(UnifiedCacheLinker):
     def __init__(
         self,
@@ -150,7 +137,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         params: CacheInitParams,
         *,
         components,
-        storage_backend_extra_config: Optional[str] = None,
+        extra_config=None,
         _storage=None,
         forward_stream=None,
     ):
@@ -207,8 +194,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             raise ValueError(
                 f"UMBP pool mappings contain out-of-range logical layers: {invalid_layers}."
             )
-        extra_config = _parse_storage_extra_config(storage_backend_extra_config)
-        extra_config = dict(extra_config)
+        extra_config = dict(extra_config or {})
         standalone_requested = bool(
             extra_config.get("standalone_address")
             or os.getenv("UMBP_STANDALONE_ADDRESS")
@@ -350,10 +336,8 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             raise
 
         self.layer_done_counter = LayerWiseLoadCounter(self.num_layers)
-        self._req_to_token_pool = None
         if PoolName.MAMBA in self.pools:
-            self._req_to_token_pool = params.req_to_token_pool
-            self._req_to_token_pool.register_layer_transfer_counter(
+            params.req_to_token_pool.register_layer_transfer_counter(
                 self.layer_done_counter
             )
         self._pending: dict[str, list[PoolTransfer]] = {}
@@ -1022,6 +1006,4 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             self.storage.client.deregister_memory(self._registered[0][0])
         logger.info("UMBP direct linker stats: %s", self._stats)
         self.storage.close()
-        if self._req_to_token_pool is not None:
-            self._req_to_token_pool.register_layer_transfer_counter(None)
         self._closed = True

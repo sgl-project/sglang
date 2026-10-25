@@ -341,10 +341,12 @@ class TokenizerControlMixin:
 
     async def attach_hicache_storage(
         self: TokenizerManager,
-        hicache_storage_backend: str,
+        hicache_storage_backend: Optional[str] = None,
         hicache_storage_backend_extra_config_json: Optional[str] = None,
         hicache_storage_prefetch_policy: Optional[str] = None,
         hicache_write_policy: Optional[str] = None,
+        unified_cache_external_linker_backend: Optional[str] = None,
+        unified_cache_external_linker_config: Optional[dict] = None,
     ) -> AttachHiCacheStorageReqOutput:
         """Attach (enable) HiCache storage backend at runtime."""
         self.auto_create_handle_loop()
@@ -354,6 +356,8 @@ class TokenizerControlMixin:
                 hicache_storage_backend_extra_config_json=hicache_storage_backend_extra_config_json,
                 hicache_storage_prefetch_policy=hicache_storage_prefetch_policy,
                 hicache_write_policy=hicache_write_policy,
+                unified_cache_external_linker_backend=unified_cache_external_linker_backend,
+                unified_cache_external_linker_config=unified_cache_external_linker_config,
             )
         )
 
@@ -363,10 +367,8 @@ class TokenizerControlMixin:
         if all_success and get_memory().enable_unified_cache_external_linker:
             self.record_config_updates(
                 "tokenizer.attach_cache_linker",
-                unified_cache_external_linker_backend=hicache_storage_backend,
-                hicache_storage_backend_extra_config=(
-                    hicache_storage_backend_extra_config_json
-                ),
+                unified_cache_external_linker_backend=unified_cache_external_linker_backend,
+                unified_cache_external_linker_config=unified_cache_external_linker_config,
             )
         elif all_success:
             # Keep tokenizer side server_info consistent with scheduler side.
@@ -400,7 +402,7 @@ class TokenizerControlMixin:
             self.record_config_updates(
                 "tokenizer.detach_cache_linker",
                 unified_cache_external_linker_backend=None,
-                hicache_storage_backend_extra_config=None,
+                unified_cache_external_linker_config=None,
             )
         elif all_success:
             self.record_config_updates(

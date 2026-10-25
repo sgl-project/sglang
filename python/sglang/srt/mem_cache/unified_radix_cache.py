@@ -3392,16 +3392,14 @@ class UnifiedRadixCache(BasePrefixCache):
         return self._storage_attachment.detach()
 
     def attach_cache_linker(
-        self, storage_backend: str, storage_backend_extra_config: Optional[str] = None
+        self, linker_backend: str, linker_config: Optional[dict] = None
     ) -> str:
         if self._linker_attachment is None:
             raise RuntimeError(
                 "Launch with --enable-unified-cache-external-linker to attach "
                 "an external linker."
             )
-        return self._linker_attachment.attach(
-            storage_backend, storage_backend_extra_config
-        )
+        return self._linker_attachment.attach(linker_backend, linker_config)
 
     def detach_cache_linker(self, *, synchronize: bool = True) -> str:
         if self._linker_attachment is None:

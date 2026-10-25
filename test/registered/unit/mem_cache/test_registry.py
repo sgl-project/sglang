@@ -223,7 +223,7 @@ class TestCreateTreeCacheRouting(_RegistryIsolationMixin, CustomTestCase):
             get_context().override_server_args(
                 enable_unified_cache_external_linker=True,
                 unified_cache_external_linker_backend="mori",
-                hicache_storage_backend_extra_config='{"a": 1}',
+                unified_cache_external_linker_config={"a": 1},
             ),
         )
         fake_components = MagicMock()
@@ -248,7 +248,7 @@ class TestCreateTreeCacheRouting(_RegistryIsolationMixin, CustomTestCase):
             ),
             forward_stream=ctx.tp_worker.model_runner.forward_stream,
         )
-        cache.attach_cache_linker.assert_called_once_with("mori", '{"a": 1}')
+        cache.attach_cache_linker.assert_called_once_with("mori", {"a": 1})
         self.assertIs(result, cache)
 
     def test_custom_unified_cache_keeps_host_pool_setup(self):

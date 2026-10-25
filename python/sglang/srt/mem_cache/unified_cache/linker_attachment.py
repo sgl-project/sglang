@@ -2,38 +2,21 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
+from copy import deepcopy
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
+from sglang.srt.mem_cache.unified_cache.linker_factory import (
+    create_unified_cache_linker,
+)
 from sglang.srt.runtime_context import get_memory
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-    from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
-        UnifiedCacheLinker,
-    )
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
 logger = logging.getLogger(__name__)
-
-
-def _linker_class(storage_backend: str) -> type[UnifiedCacheLinker]:
-    if storage_backend == "mooncake":
-        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
-            MooncakeDirectLinker,
-        )
-
-        return MooncakeDirectLinker
-    if storage_backend == "mori":
-        from sglang.srt.mem_cache.storage.umbp.umbp_direct_linker import (
-            UMBPDirectLinker,
-        )
-
-        return UMBPDirectLinker
-    raise ValueError(
-        f"Unknown unified cache external linker backend: {storage_backend!r}"
-    )
 
 
 def runtime_change_rejection(
@@ -65,36 +48,36 @@ class CacheLinkerAttachment:
         self._kvcache = params.token_to_kv_pool_allocator.get_kvcache()
         self._register_layer_transfer_counter = register_layer_transfer_counter
         self._forward_stream = forward_stream
-        self.storage_backend: Optional[str] = None
-        self.storage_backend_extra_config: Optional[str] = None
+        self.linker_backend: Optional[str] = None
+        self.linker_config: Optional[dict[str, Any]] = None
 
     def attach(
-        self, storage_backend: str, storage_backend_extra_config: Optional[str] = None
+        self, linker_backend: str, linker_config: Optional[dict[str, Any]] = None
     ) -> str:
-        if self.storage_backend is not None:
-            if (storage_backend, storage_backend_extra_config) == (
-                self.storage_backend,
-                self.storage_backend_extra_config,
+        if self.linker_backend is not None:
+            if (linker_backend, linker_config) == (
+                self.linker_backend,
+                self.linker_config,
             ):
-                return f"External linker already attached to {storage_backend!r}."
+                return f"External linker already attached to {linker_backend!r}."
             raise RuntimeError(
-                f"External linker is attached to {self.storage_backend!r}; "
+                f"External linker is attached to {self.linker_backend!r}; "
                 "detach it before attaching another configuration."
             )
 
-        linker_cls = _linker_class(storage_backend)
         cache = self._cache
         linker, error = None, None
         try:
-            linker = linker_cls(
+            linker = create_unified_cache_linker(
                 self._server_args,
                 self._params,
                 components=set(cache.components),
-                storage_backend_extra_config=storage_backend_extra_config,
+                backend=linker_backend,
+                config=linker_config,
                 forward_stream=self._forward_stream,
             )
         except Exception as e:
-            logger.exception("Failed to build the %s external linker.", storage_backend)
+            logger.exception("Failed to build the %s external linker.", linker_backend)
             error = e
         # The linker hooks run collectives, so every rank links or none does.
         linked = torch.tensor([int(error is None)], dtype=torch.int)
@@ -103,7 +86,7 @@ class CacheLinkerAttachment:
             if linker is not None:
                 linker.close()
             raise RuntimeError(
-                f"Failed to attach the {storage_backend!r} external linker: "
+                f"Failed to attach the {linker_backend!r} external linker: "
                 f"{error or 'failed on another rank'}"
             ) from error
 
@@ -116,14 +99,14 @@ class CacheLinkerAttachment:
         counter = linker.layer_done_counter
         self._kvcache.register_layer_transfer_counter(counter)
         self._register_layer_transfer_counter(counter)
-        self.storage_backend = storage_backend
-        self.storage_backend_extra_config = storage_backend_extra_config
+        self.linker_backend = linker_backend
+        self.linker_config = deepcopy(linker_config)
         logger.info(
             "Attached the %s external linker; hashed %d existing radix nodes.",
-            storage_backend,
+            linker_backend,
             filled,
         )
-        return f"External linker attached to {storage_backend!r}."
+        return f"External linker attached to {linker_backend!r}."
 
     def detach(self, *, synchronize: bool = True) -> str:
         if not synchronize:
@@ -151,12 +134,12 @@ class CacheLinkerAttachment:
         return message
 
     def _detach_local(self) -> str:
-        if self.storage_backend is None:
+        if self.linker_backend is None:
             return "External linker is not attached."
         self._cache.close_cache_linker()
         self._kvcache.register_layer_transfer_counter(None)
         self._register_layer_transfer_counter(None)
-        storage_backend, self.storage_backend = self.storage_backend, None
-        self.storage_backend_extra_config = None
-        logger.info("Detached the %s external linker.", storage_backend)
-        return f"External linker detached from {storage_backend!r}."
+        linker_backend, self.linker_backend = self.linker_backend, None
+        self.linker_config = None
+        logger.info("Detached the %s external linker.", linker_backend)
+        return f"External linker detached from {linker_backend!r}."

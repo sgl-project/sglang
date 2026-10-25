@@ -608,7 +608,7 @@ class TestUnifiedCacheLinkerPythonBackend(
             forward_stream=forward_stream,
         )
         patcher = patch.object(
-            linker_attachment, "_linker_class", lambda backend: build_linker
+            linker_attachment, "create_unified_cache_linker", build_linker
         )
         patcher.start()
         self.addCleanup(patcher.stop)

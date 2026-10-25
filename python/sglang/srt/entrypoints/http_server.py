@@ -1135,6 +1135,8 @@ async def attach_hicache_storage_backend(
         hicache_storage_backend_extra_config_json=obj.hicache_storage_backend_extra_config_json,
         hicache_storage_prefetch_policy=obj.hicache_storage_prefetch_policy,
         hicache_write_policy=obj.hicache_write_policy,
+        unified_cache_external_linker_backend=obj.unified_cache_external_linker_backend,
+        unified_cache_external_linker_config=obj.unified_cache_external_linker_config,
     )
     msg = ret.message
     return Response(
@@ -1194,6 +1196,7 @@ async def hicache_storage_backend_status():
             "hicache_storage_prefetch_policy",
             "hicache_write_policy",
             "unified_cache_external_linker_backend",
+            "unified_cache_external_linker_config",
         )
     }
 

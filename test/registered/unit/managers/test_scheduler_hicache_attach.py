@@ -33,6 +33,61 @@ class TestSchedulerHiCacheAttach(CustomTestCase):
         with self.assertRaisesRegex(RuntimeError, "scheduler must stop"):
             scheduler.detach_hicache_storage_wrapped(DetachHiCacheStorageReqInput())
 
+    def test_linker_attach_and_detach_use_only_linker_config(self):
+        scheduler = self._scheduler(
+            hicache_storage_backend_extra_config='{"legacy": true}',
+            enable_linker_mla_dedup=False,
+        )
+        scheduler.enable_unified_cache_external_linker = True
+        scheduler.tree_cache.attach_cache_linker = Mock(return_value="attached")
+        scheduler.tree_cache.detach_cache_linker = Mock(return_value="detached")
+        config = {"linker": "Plugin", "linker_module_path": "my_plugin"}
+        out = scheduler.attach_hicache_storage_wrapped(
+            AttachHiCacheStorageReqInput(
+                unified_cache_external_linker_backend="dynamic",
+                unified_cache_external_linker_config=config,
+            )
+        )
+        self.assertTrue(out.success)
+        scheduler.tree_cache.attach_cache_linker.assert_called_once_with(
+            "dynamic", config
+        )
+        self.assertEqual(get_memory().unified_cache_external_linker_backend, "dynamic")
+        self.assertEqual(get_memory().unified_cache_external_linker_config, config)
+        self.assertEqual(
+            get_memory().hicache_storage_backend_extra_config, '{"legacy": true}'
+        )
+        out = scheduler.detach_hicache_storage_wrapped(DetachHiCacheStorageReqInput())
+        self.assertTrue(out.success)
+        self.assertIsNone(get_memory().unified_cache_external_linker_config)
+        self.assertEqual(
+            get_memory().hicache_storage_backend_extra_config, '{"legacy": true}'
+        )
+
+    def test_attach_rejects_fields_for_the_other_mode(self):
+        scheduler = self._scheduler(enable_linker_mla_dedup=False)
+        scheduler.tree_cache.attach_cache_linker = Mock()
+        out = scheduler.attach_hicache_storage_wrapped(
+            AttachHiCacheStorageReqInput(
+                unified_cache_external_linker_backend="mooncake"
+            )
+        )
+        self.assertFalse(out.success)
+        scheduler.enable_unified_cache_external_linker = True
+        for req in (
+            AttachHiCacheStorageReqInput(hicache_storage_backend="mooncake"),
+            AttachHiCacheStorageReqInput(
+                unified_cache_external_linker_backend="mooncake",
+                hicache_storage_backend_extra_config_json="{}",
+            ),
+            AttachHiCacheStorageReqInput(
+                unified_cache_external_linker_backend="mooncake",
+                hicache_write_policy="write_back",
+            ),
+        ):
+            self.assertFalse(scheduler.attach_hicache_storage_wrapped(req).success)
+        scheduler.tree_cache.attach_cache_linker.assert_not_called()
+
     def _scheduler(self, **fields):
         override = get_context().override_server_args(
             enable_hierarchical_cache=True, **fields

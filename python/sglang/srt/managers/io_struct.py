@@ -1895,14 +1895,19 @@ class ListExternalCorporaReqOutput(BaseReq, kw_only=True):
 
 
 class AttachHiCacheStorageReqInput(BaseReq, kw_only=True):
-    """Dynamically attach (enable) HiCache storage backend at runtime.
+    """Dynamically attach HiCache storage or a unified cache external linker.
+
+    Linker mode uses unified_cache_external_linker_backend and the JSON object
+    unified_cache_external_linker_config, matching the launch-time schema.
 
     Note: `hicache_storage_backend_extra_config_json` is a JSON string. It may contain both:
     - backend-specific configs (e.g., mooncake master address)
     - prefetch-related knobs (prefetch_threshold, prefetch_timeout_*, hicache_storage_pass_prefix_keys)
     """
 
-    hicache_storage_backend: str
+    hicache_storage_backend: Optional[str] = None
+    unified_cache_external_linker_backend: Optional[str] = None
+    unified_cache_external_linker_config: Optional[Dict[str, Any]] = None
     hicache_storage_backend_extra_config_json: Optional[str] = None
     hicache_storage_prefetch_policy: Optional[str] = None
     hicache_write_policy: Optional[str] = None

@@ -1086,7 +1086,13 @@ class Scheduler(
         if self.draft_worker is not None:
             preloaded_weights_bytes += self.draft_worker.preloaded_weights_bytes
         self.tp_worker.model_runner.account_preloaded_weights(preloaded_weights_bytes)
-        self.tp_worker.alloc_memory_pool()
+        self.tp_worker.alloc_memory_pool(
+            draft_parallel_layout=(
+                self.draft_worker.draft_parallel_layout
+                if self.draft_worker is not None
+                else None
+            )
+        )
 
     def init_memory_pools(self):
         """Allocate KV cache pools for target and draft workers."""
@@ -5404,6 +5410,16 @@ class Scheduler(
         if self.enable_unified_cache_external_linker:
             return self._attach_cache_linker(recv_req)
 
+        if (
+            recv_req.hicache_storage_backend is None
+            or recv_req.unified_cache_external_linker_backend is not None
+            or recv_req.unified_cache_external_linker_config is not None
+        ):
+            return AttachHiCacheStorageReqOutput(
+                success=False,
+                message="HiCache mode requires hicache_storage_backend and no linker configuration.",
+            )
+
         if not hasattr(self.tree_cache, "attach_storage_backend"):
             return AttachHiCacheStorageReqOutput(
                 success=False,
@@ -5497,6 +5513,15 @@ class Scheduler(
     def _attach_cache_linker(
         self, recv_req: AttachHiCacheStorageReqInput
     ) -> AttachHiCacheStorageReqOutput:
+        if (
+            not recv_req.unified_cache_external_linker_backend
+            or recv_req.hicache_storage_backend is not None
+            or recv_req.hicache_storage_backend_extra_config_json is not None
+        ):
+            return AttachHiCacheStorageReqOutput(
+                success=False,
+                message="Linker mode requires unified_cache_external_linker_backend and unified_cache_external_linker_config; HiCache backend fields are not accepted.",
+            )
         rejection = runtime_change_rejection(
             prefetch_policy=recv_req.hicache_storage_prefetch_policy,
             write_policy=recv_req.hicache_write_policy,
@@ -5506,17 +5531,17 @@ class Scheduler(
 
         try:
             message = self.tree_cache.attach_cache_linker(
-                recv_req.hicache_storage_backend,
-                recv_req.hicache_storage_backend_extra_config_json,
+                recv_req.unified_cache_external_linker_backend,
+                recv_req.unified_cache_external_linker_config,
             )
         except Exception as e:
             logger.exception("Attach external linker failed with exception.")
             return AttachHiCacheStorageReqOutput(success=False, message=str(e))
         get_context().override(
             "scheduler.attach_cache_linker",
-            unified_cache_external_linker_backend=recv_req.hicache_storage_backend,
-            hicache_storage_backend_extra_config=(
-                recv_req.hicache_storage_backend_extra_config_json
+            unified_cache_external_linker_backend=recv_req.unified_cache_external_linker_backend,
+            unified_cache_external_linker_config=(
+                recv_req.unified_cache_external_linker_config
             ),
         )
         return AttachHiCacheStorageReqOutput(success=True, message=message)
@@ -5532,7 +5557,7 @@ class Scheduler(
         get_context().override(
             "scheduler.detach_cache_linker",
             unified_cache_external_linker_backend=None,
-            hicache_storage_backend_extra_config=None,
+            unified_cache_external_linker_config=None,
         )
         return DetachHiCacheStorageReqOutput(success=True, message=message)
 

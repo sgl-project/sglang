@@ -368,11 +368,16 @@ Send it at the top level of a JSON body or as a multipart form field;
 
 **Endpoint:** `GET /v1/videos`
 
+Returns up to 20 jobs by default. Set `limit` from 1 to 100 and `order` to
+`asc` or `desc` (default). Responses include `first_id`, `last_id`, and
+`has_more`; pass `after=last_id` to fetch the next page. The same pagination
+contract applies to `GET /v1/meshes`. Pagination bounds each response, not
+the number of stored jobs or queued generation requests.
+
 **Python Example:**
 
 ```python Python
-videos = client.videos.list()
-for item in videos.data:
+for item in client.videos.list(limit=20):
     print(item.id, item.status)
 ```
 
@@ -394,10 +399,11 @@ import time
 
 # Poll for completion
 while True:
-    page = client.videos.list()
-    item = next((v for v in page.data if v.id == video_id), None)
-    if item and item.status == "completed":
+    item = client.videos.retrieve(video_id)
+    if item.status == "completed":
         break
+    if item.status == "failed":
+        raise RuntimeError(item.error)
     time.sleep(5)
 
 # Download content
