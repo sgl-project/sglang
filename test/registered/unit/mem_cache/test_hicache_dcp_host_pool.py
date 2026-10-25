@@ -150,6 +150,7 @@ class TestHostPoolSizingUnderDcp(CustomTestCase):
         cc.mem_pool_host = cc.storage_host_pool = pool
         cc.page_size = pool.logical_page_size
         cc.enable_storage = False
+        cc.storage_backend = None
         cc.host_memory_mode = mode
         cc.storage_stop_event = threading.Event()
         cc._stop_storage_threads = mock.Mock()

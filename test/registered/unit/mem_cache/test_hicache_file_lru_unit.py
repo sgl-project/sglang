@@ -46,6 +46,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 )
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.mem_cache.storage.backend_factory import StorageBackendFactory
 from sglang.srt.mem_cache.storage.file.lru_file_evictor import _parse_size_to_bytes
 from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.test.test_utils import CustomTestCase
@@ -825,6 +826,7 @@ class TestDcpStorage(unittest.TestCase):
         self.assertTrue(backend.exists(backend._log_key(PoolName.MAMBA, "new-state")))
 
     def test_attachment_guards(self):
+        cfg = _dcp_config(0, 2, 2)
         for case in (
             "backend",
             "non_mla",
@@ -839,47 +841,27 @@ class TestDcpStorage(unittest.TestCase):
         ):
             host = MLATokenToKVPoolHost.__new__(MLATokenToKVPoolHost)
             host.kv_buffer = None if case == "dummy" else object()
-            host.layout = "page_first"
-            if case == "split":
-                host.layout = "page_first_kv_split"
-            cc = HiCacheController.__new__(HiCacheController)
-            cc.enable_storage = False
-            cc.host_memory_mode = "cache"
-            cc.storage_host_pool = object() if case == "non_mla" else host
-            entries = [SimpleNamespace(name=PoolName.KV, host_pool=host)]
+            host.layout = "page_first_kv_split" if case == "split" else "page_first"
+            pools = {PoolName.KV: object() if case == "non_mla" else host}
             if case in ("extra_pool", "wrong_pool", "file_kda", "mooncake_kda"):
-                entries.append(
-                    SimpleNamespace(
-                        name=PoolName.SWA if case == "extra_pool" else PoolName.MAMBA,
-                        host_pool=object()
-                        if case == "wrong_pool"
-                        else MambaPoolHost.__new__(MambaPoolHost),
-                    )
+                pools[PoolName.SWA if case == "extra_pool" else PoolName.MAMBA] = (
+                    object()
+                    if case == "wrong_pool"
+                    else MambaPoolHost.__new__(MambaPoolHost)
                 )
-            cc.mem_pool_host = SimpleNamespace(entries=entries)
-            accepted = case in ("file", "mooncake", "file_kda", "mooncake_kda")
-            cc._stop_storage_threads = mock.Mock(
-                side_effect=RuntimeError("past validation") if accepted else None
+            backend = (
+                "nixl"
+                if case == "backend"
+                else "mooncake"
+                if case.startswith("mooncake")
+                else "file"
             )
-            with (
-                self.subTest(case=case),
-                mock.patch(
-                    "sglang.srt.managers.cache_controller.get_parallel",
-                    return_value=SimpleNamespace(attn_dcp_size=2),
-                ),
-                self.assertRaisesRegex(RuntimeError, "previous detach")
-                if accepted
-                else self.assertRaises(NotImplementedError),
-            ):
-                cc.attach_storage_backend(
-                    "nixl"
-                    if case == "backend"
-                    else "mooncake"
-                    if case.startswith("mooncake")
-                    else "file"
-                )
-            self.assertEqual(cc._stop_storage_threads.call_count, int(accepted))
-            self.assertFalse(cc.enable_storage)
+            with self.subTest(case=case):
+                if case in ("file", "mooncake", "file_kda", "mooncake_kda"):
+                    StorageBackendFactory.validate_backend(backend, cfg, pools)
+                else:
+                    with self.assertRaises(NotImplementedError):
+                        StorageBackendFactory.validate_backend(backend, cfg, pools)
 
 
 class TestUncachedBatchExists(HiCacheFileLRUTestBase):

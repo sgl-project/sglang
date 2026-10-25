@@ -14,9 +14,8 @@
 """The storage backend's view of the initial host-pool registration burst.
 
 ``on_host_pools_registered`` fires exactly once per attach, immediately after
-the last call of the initial burst: the anchor pool on the base controller
-(its whole burst), after the per-pool v2 loop on the hybrid controller (which
-continues the burst after super() returns). Pools registered later (dynamic
+the last call of the initial burst: the anchor pool and any per-pool v2
+registrations, all before the storage workers start. Pools registered later (dynamic
 sidecars) arrive through v2 alone and do not re-fire the hook.
 
     python3 -m pytest test/registered/unit/mem_cache/test_hicache_storage_registration_hook.py -v
@@ -25,7 +24,7 @@ sidecars) arrive through v2 alone and do not re-fire the hook.
 import threading
 import unittest
 from types import SimpleNamespace
-from typing import Any, List, Optional
+from typing import Any, List
 from unittest import mock
 
 from sglang.srt.managers.cache_controller import HiCacheController
@@ -45,6 +44,8 @@ PAGE = 16
 
 class RecordingBackend:
     """A backend that records the registration calls it receives."""
+
+    dcp_storage_capabilities = frozenset()
 
     def __init__(self, order: List[str], fail_on_complete: bool = False):
         self.order = order
@@ -102,6 +103,7 @@ def _controller(cls: type, storage_host_pool: Any, mem_pool_host: Any) -> Any:
     """Only the attributes ``attach_storage_backend`` reads."""
     controller = object.__new__(cls)
     controller.enable_storage = False
+    controller.storage_backend = None
     controller.storage_stop_event = threading.Event()
     controller.storage_host_pool = storage_host_pool
     controller.mem_pool_host = mem_pool_host
@@ -124,13 +126,9 @@ def _attach(
     controller: Any,
     backend: RecordingBackend,
     order: List[str],
-    host_pools: Optional[List[PoolEntry]] = None,
 ) -> None:
     """Run ``attach_storage_backend`` with the heavy pieces stubbed out."""
-    storage_config = SimpleNamespace(is_mla_model=False, extra_config={})
-    # Only the hybrid attach accepts host_pools; the base attach's burst is
-    # the anchor pool alone.
-    kwargs = {"host_pools": host_pools} if host_pools is not None else {}
+    storage_config = SimpleNamespace(is_mla_model=False, dcp_size=1, extra_config={})
     with (
         mock.patch(
             "sglang.srt.managers.cache_controller.get_parallel",
@@ -148,22 +146,21 @@ def _attach(
             side_effect=lambda: order.append("threads"),
         ),
     ):
-        controller.attach_storage_backend(storage_backend="dynamic", **kwargs)
+        controller.attach_storage_backend(storage_backend="dynamic")
 
 
 class TestRegistrationBurstOrder(CustomTestCase):
     def test_hybrid_hook_fires_after_its_v2_burst(self):
-        # super() completes (threads included, as before), then the hybrid
-        # burst continues and the hook fires at its end -- once.
+        # The group burst and its finalizer complete before any workers start.
         order: List[str] = []
         group = _group()
         controller = _controller(
             HybridCacheController, group.anchor_entry.host_pool, group
         )
 
-        _attach(controller, RecordingBackend(order), order, host_pools=group.entries)
+        _attach(controller, RecordingBackend(order), order)
 
-        self.assertEqual(order, ["v1", "threads", "v2:kv", "v2:mamba", "complete"])
+        self.assertEqual(order, ["v1", "v2:kv", "v2:mamba", "complete", "threads"])
 
     def test_base_hook_fires_right_after_the_anchor_pool(self):
         # Without a host pool group the burst is the anchor pool alone, so
@@ -193,11 +190,8 @@ class TestRegistrationBurstOrder(CustomTestCase):
         self.assertFalse(controller.enable_storage)
         self.assertIsNone(controller.storage_backend)
 
-    def test_hybrid_hook_failure_propagates(self):
-        # On the hybrid path the burst continues after super() has completed;
-        # a backend failure there propagates out of attach_storage_backend,
-        # failing the attach (the post-super section has no rollback of its
-        # own, exactly as for the v2 calls themselves).
+    def test_hybrid_hook_failure_rolls_the_attach_back(self):
+        # The group finalizer shares the base rollback path; no worker is started.
         order: List[str] = []
         group = _group()
         controller = _controller(
@@ -206,9 +200,12 @@ class TestRegistrationBurstOrder(CustomTestCase):
         backend = RecordingBackend(order, fail_on_complete=True)
 
         with self.assertRaisesRegex(RuntimeError, "registration failed in the backend"):
-            _attach(controller, backend, order, host_pools=group.entries)
+            _attach(controller, backend, order)
 
-        self.assertEqual(order, ["v1", "threads", "v2:kv", "v2:mamba", "complete"])
+        self.assertEqual(order, ["v1", "v2:kv", "v2:mamba", "complete"])
+        self.assertTrue(backend.closed)
+        self.assertFalse(controller.enable_storage)
+        self.assertIsNone(controller.storage_backend)
 
     def test_dynamic_sidecar_does_not_re_fire_the_hook(self):
         order: List[str] = []
@@ -218,12 +215,12 @@ class TestRegistrationBurstOrder(CustomTestCase):
         )
         backend = RecordingBackend(order)
 
-        _attach(controller, backend, order, host_pools=group.entries)
+        _attach(controller, backend, order)
         controller.register_host_pool_entry(_entry(PoolName.SWA, _fake_pool("swa")))
 
         self.assertEqual(
             order,
-            ["v1", "threads", "v2:kv", "v2:mamba", "complete", "v2:swa"],
+            ["v1", "v2:kv", "v2:mamba", "complete", "threads", "v2:swa"],
         )
 
 

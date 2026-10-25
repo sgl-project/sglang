@@ -204,11 +204,40 @@ def count_pool_hits(results: dict[str, List[bool]]) -> dict[str, int]:
     }
 
 
+# Capability names a dynamic backend declares in ``dcp_storage_capabilities``.
+DCP_CAP_MLA_SHARDED = "mla_sharded"
+DCP_CAP_LOGICAL_PAGE_INDICES = "logical_page_indices"
+DCP_CAP_MAMBA_TP_SHARDED = "mamba_tp_sharded"
+DCP_CAP_EXACT_RESTORABLE_PREFIX_PAGES = "exact_restorable_prefix_pages"
+DCP_CAP_DRAFT_MLA_SHARDED = "draft_mla_sharded"
+
+
 class HiCacheStorage(ABC):
     """
     HiCacheStorage is a class that provides a generic key-value interface for storing and retrieving KV cache.
     It abstracts the underlying storage mechanism, allowing different implementations to be used.
     """
+
+    # Dynamic implementations opt into DCP by declaring the DCP_CAP_* names
+    # they implement; the factory derives what a given pool set requires.
+    dcp_storage_capabilities: frozenset[str] = frozenset()
+
+    # A backend that registers host memory with a native client sets this so a
+    # failed close() keeps the backend around for a retried detach.
+    requires_explicit_memory_cleanup: bool = False
+
+    @classmethod
+    def validate_dcp_config(cls, storage_config, host_pools) -> None:
+        """Reject backend-specific limits on a pool set before __init__.
+
+        ``host_pools`` maps PoolName to the materialized host pools, including
+        sidecars registered after startup. Runs for every opted-in dynamic
+        backend, at DCP1 too, after the factory has checked pool types,
+        layouts and page geometry; the default accepts everything.
+        """
+
+    def close(self) -> None:
+        """Release client resources on detach; default backends hold none."""
 
     # todo, the page size of storage backend does not have to be the same as the same as host memory pool
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):

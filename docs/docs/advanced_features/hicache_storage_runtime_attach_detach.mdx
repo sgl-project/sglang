@@ -122,6 +122,26 @@ Notes:
 - Detach only makes SGLang **stop using** the L3 storage backend and stops prefetch/backup threads
 - It **does not automatically delete** data stored in Mooncake/HF3FS (or other remote backends)
 
+### Cleanup failures
+
+Check the detach response's `success` field before attaching another backend.
+A failed cleanup is reported as a failure even if storage I/O has already been
+disabled.
+
+- If workers fail to stop, the controller retains the backend and synchronization
+  groups so they remain available to those workers. Retry detach after resolving
+  the worker failure.
+- If a backend requires explicit memory cleanup and its `close()` fails, the
+  controller retains it for a later detach attempt. A new attach is rejected
+  until cleanup succeeds.
+- If host-lock or page-release bookkeeping fails after partial changes, the
+  response requests a model-process restart. The remaining records stay in
+  place and further attach/detach attempts are rejected, rather than replaying
+  an unlock or page release that may already have happened.
+
+Backend authors can find the opt-in contract in
+[dynamic backend integration](/docs/advanced_features/hicache_best_practices#dynamic-backends-with-dcp).
+
 ***
 ## 4. Behavior and caveats
 

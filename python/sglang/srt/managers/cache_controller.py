@@ -530,9 +530,29 @@ class HiCacheController:
             )
             raise RuntimeError("Failed to stop HiCache storage threads cleanly.")
 
-    # A subclass whose attach continues registering host pools after super()
-    # returns fires on_host_pools_registered() itself, once.
-    _registers_host_pools_after_super_attach = False
+    def _storage_host_pools(self):
+        if self.mem_pool_host is self.storage_host_pool:
+            return {PoolName.KV: self.storage_host_pool}
+        return {entry.name: entry.host_pool for entry in self.mem_pool_host.entries}
+
+    def _close_storage_backend(self):
+        self.enable_storage = False
+        self.page_get_func = self._generic_page_get
+        self.page_set_func = self._generic_page_set
+        backend = self.storage_backend
+        if backend is None:
+            return
+        try:
+            backend.close()
+        except Exception as e:
+            logger.exception("Failed to close storage backend cleanly.")
+            # A backend owning registered host memory stays until close succeeds.
+            if backend.requires_explicit_memory_cleanup:
+                raise RuntimeError(
+                    "Storage backend cleanup failed; backend retained for detach retry."
+                ) from e
+        self.storage_backend = None
+        self.storage_backend_type = None
 
     def attach_storage_backend(
         self,
@@ -546,47 +566,15 @@ class HiCacheController:
         Requirement: no in-flight requests. This call is expected to run on the scheduler
         thread (control path), not concurrently with prefetch/backup.
         """
-        if self.enable_storage:
-            raise RuntimeError("Storage backend already attached.")
-        if get_parallel().attn_dcp_size > 1:
-            if self.host_memory_mode == "buffer_only":
-                # Buffer-mode write staging still budgets physical host rows.
-                raise NotImplementedError(
-                    "HiCache L3 with DCP does not support buffer_only host memory."
-                )
-            from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
-            from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
-
-            if storage_backend not in ("file", "mooncake"):
-                raise NotImplementedError(
-                    "HiCache L3 with DCP requires file or Mooncake storage."
-                )
-            if (
-                not isinstance(self.storage_host_pool, MLATokenToKVPoolHost)
-                or self.storage_host_pool.kv_buffer is None
-            ):
-                raise NotImplementedError(
-                    "HiCache L3 with DCP requires a materialized MLA host pool."
-                )
-            if self.mem_pool_host is not self.storage_host_pool and any(
-                entry.host_pool is not self.storage_host_pool
-                and (
-                    entry.name != PoolName.MAMBA
-                    or not isinstance(entry.host_pool, MambaPoolHost)
-                )
-                for entry in self.mem_pool_host.entries
-            ):
-                raise NotImplementedError(
-                    "HiCache L3 with DCP supports only MLA KV and optional KDA state."
-                )
-            if self.storage_host_pool.layout not in (
-                "layer_first",
-                "page_first",
-                "page_first_direct",
-            ):
-                raise NotImplementedError(
-                    "HiCache L3 with DCP requires a generic MLA page layout."
-                )
+        if self.storage_backend is not None:
+            raise RuntimeError(
+                "Storage backend already attached, or retained after a failed detach."
+            )
+        if get_parallel().attn_dcp_size > 1 and self.host_memory_mode == "buffer_only":
+            # Buffer-mode write staging still budgets physical host rows.
+            raise NotImplementedError(
+                "HiCache L3 with DCP does not support buffer_only host memory."
+            )
 
         # Defensive: a previous partial detach may have flipped `enable_storage` but
         # left background threads alive. Attaching on top of them is unsafe.
@@ -612,11 +600,22 @@ class HiCacheController:
 
         try:
             self.storage_backend = StorageBackendFactory.create_backend(
-                storage_backend, self.storage_config, self.storage_host_pool
+                storage_backend,
+                self.storage_config,
+                self.storage_host_pool,
+                storage_host_pools=self._storage_host_pools(),
             )
             self.storage_backend.register_mem_pool_host(self.storage_host_pool)
-            if not self._registers_host_pools_after_super_attach:
-                self.storage_backend.on_host_pools_registered()
+            if self.mem_pool_host is not self.storage_host_pool:
+                # Register every validated sidecar before starting any I/O thread.
+                # Failures stay inside the normal attach rollback path.
+                for entry in self.mem_pool_host.entries:
+                    self.storage_backend.register_mem_host_pool_v2(
+                        entry.host_pool, entry.name
+                    )
+            # Finalize once all initial pools are known, before workers can use
+            # the backend. A finalizer failure follows the same attach rollback.
+            self.storage_backend.on_host_pools_registered()
 
             self.enable_storage = True
             # todo: threshold policy for prefetching
@@ -670,29 +669,20 @@ class HiCacheController:
             self.storage_stop_event.clear()
             self._start_storage_threads()
         except Exception:
-            # Best-effort cleanup for partial init.
+            # An incompletely started worker may still touch the backend or its
+            # process groups. Retain both until a later detach can stop it.
             try:
                 self._stop_storage_threads()
-            except Exception:
-                pass
+            except Exception as stop_error:
+                raise RuntimeError(
+                    "Storage threads did not stop during attach rollback; "
+                    "backend retained for detach retry."
+                ) from stop_error
             self._destroy_sync_groups(self.prefetch_hits_sync_groups)
             self._destroy_sync_groups(self.prefetch_completion_sync_groups)
             self.prefetch_hits_sync_groups = []
             self.prefetch_completion_sync_groups = []
-            try:
-                if (
-                    hasattr(self, "storage_backend")
-                    and self.storage_backend is not None
-                ):
-                    if hasattr(self.storage_backend, "close"):
-                        self.storage_backend.close()
-            except Exception:
-                pass
-            self.storage_backend = None
-            self.storage_backend_type = None
-            self.enable_storage = False
-            self.page_get_func = self._generic_page_get
-            self.page_set_func = self._generic_page_set
+            self._close_storage_backend()
             raise
 
     def detach_storage_backend(self):
@@ -722,22 +712,7 @@ class HiCacheController:
         self.prefetch_hits_sync_groups = []
         self.prefetch_completion_sync_groups = []
 
-        # Best-effort close (some backends rely on GC/destructor).
-        try:
-            if (
-                hasattr(self, "storage_backend")
-                and self.storage_backend is not None
-                and hasattr(self.storage_backend, "close")
-            ):
-                self.storage_backend.close()
-        except Exception:
-            logger.exception("Failed to close storage backend cleanly.")
-
-        self.storage_backend = None
-        self.storage_backend_type = None
-        self.enable_storage = False
-        self.page_get_func = self._generic_page_get
-        self.page_set_func = self._generic_page_set
+        self._close_storage_backend()
         # Now it's safe to clear the stop event for future re-attach.
         self.storage_stop_event.clear()
 
