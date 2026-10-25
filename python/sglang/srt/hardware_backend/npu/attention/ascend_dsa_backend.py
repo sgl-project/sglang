@@ -77,31 +77,9 @@ class AscendDSAIndexerMetadata(BaseIndexerMetadata):
         return self.attn_metadata.token_to_batch_idx
 
     def topk_transform(self, logits: torch.Tensor, topk: int, **_) -> torch.Tensor:
-        """Select request-relative logical indices with invalid slots padded by -1."""
-        rows, width = logits.shape
-        if width == 0:
-            return torch.full((rows, topk), -1, dtype=torch.int32, device=logits.device)
-
-        lengths = self.get_seqlens_expanded()[:rows].to(logits.device)
-        valid_widths = lengths.clamp(min=0, max=width)
-        cols = torch.arange(width, device=logits.device)
-        masked_logits = logits.masked_fill(
-            cols.unsqueeze(0) >= valid_widths.unsqueeze(1),
-            torch.finfo(logits.dtype).min,
+        raise NotImplementedError(
+            "NPU KPool uses the vendor lightning indexer instead of topk_transform"
         )
-        selected = min(topk, width)
-        indices = torch.topk(masked_logits, k=selected, dim=-1).indices.to(torch.int32)
-        indices = torch.where(
-            indices < valid_widths.unsqueeze(1),
-            indices,
-            -1,
-        )
-        if selected == topk:
-            return indices
-        padding = torch.full(
-            (rows, topk - selected), -1, dtype=torch.int32, device=logits.device
-        )
-        return torch.cat((indices, padding), dim=-1)
 
 
 @triton.jit
