@@ -109,7 +109,7 @@ def _dflash_draft_cell_size(kvc: KVCacheConfigurator) -> int:
     ranks because the draft pool spans the widened virtual location space."""
     if kvc.is_draft_worker or not kvc.spec_algorithm.is_dflash_family():
         return 0
-    cell_size = kvc.spec_aux_config.dflash_draft_cell_size_per_token
+    cell_size = kvc.dflash_draft_cell_size_per_token
     if cell_size is None or int(cell_size) <= 0:
         return 0
     return int(cell_size) * get_parallel().attn_dcp_size
@@ -394,6 +394,8 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
             # Add indexer KV cache overhead for DSA models (DeepSeek V3.2)
             if is_deepseek_dsa(model_config.hf_config):
+                # The index-K buffer is replicated under DCP while the latent KV
+                # shards, so this term is short by dcp_size without the scale.
                 indexer_cell_size = self._compute_dsa_indexer_cell_size(
                     kvc=kvc,
                     num_layers=num_layers,

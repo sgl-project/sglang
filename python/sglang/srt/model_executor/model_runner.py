@@ -20,11 +20,12 @@ import inspect
 import logging
 import time
 from dataclasses import dataclass
-from typing import Callable, List, Optional, Union
+from typing import List, Optional, Union
 
 import torch
 import torch.distributed as dist
 
+from sglang.srt.configs.draft_parallel import DraftParallelLayout
 from sglang.srt.configs.load_config import (
     _DEFAULT_LOAD_GROUP,
     LoadConfig,
@@ -76,6 +77,10 @@ from sglang.srt.eplb.expert_location import (
     set_global_expert_location_metadata,
 )
 from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
+from sglang.srt.kernel_plugins.amd.binding import (
+    install_monokernel_forward,
+)
+from sglang.srt.kernel_plugins.nvidia.binding import install_megakernel
 from sglang.srt.kv_canary.api import install_canary
 from sglang.srt.kv_canary.runner.canary_manager import context_tuple
 from sglang.srt.kv_canary.token_oracle.install import install_token_oracle_from_env
@@ -92,7 +97,6 @@ from sglang.srt.layers.sampler import create_sampler
 from sglang.srt.lora.lora_manager import LoRAManager, init_lora_cuda_graph_moe_buffers
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import sanity_check_mm_pad_shift_value
-from sglang.srt.megakernels.runtime import install_megakernel
 from sglang.srt.mem_cache import kv_cache_dtype
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.kv_cache_configurator import (
@@ -113,6 +117,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.forward_context import (
     ForwardContext,
     forward_context,
+    get_forward_context,
     has_forward_context,
 )
 from sglang.srt.model_executor.graph_memory_usage import (
@@ -188,7 +193,6 @@ from sglang.srt.model_executor.runner import (
     EagerRunner,
     get_batch_sizes_to_capture,
 )
-from sglang.srt.monokernels.runtime import install_monokernel_forward
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     assert_published,
@@ -390,6 +394,8 @@ class ModelRunner:
             get_spec().speculative_algorithm
         )
         self.capture_tail_hooks = []
+        # Called as hook(graph_runner, forward_batch) first inside each decode graph capture.
+        self.capture_head_hooks = []
         self.page_size = get_schedule().page_size
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -465,9 +471,6 @@ class ModelRunner:
         # Read-done mailbox: the scheduler's WAR barrier reads it from the runner
         # its worker names, and treats None as the coarse whole-forward fence.
         self.shared_read_done_event: Optional[torch.cuda.Event] = None
-        # Scoped by a speculative worker to stage its shared reads before
-        # the target prefill graph publishes the read-done event.
-        self.prefill_shared_read_stager: Optional[Callable[[ForwardBatch], bool]] = None
 
         # CPU offload
         set_offloader(create_offloader())
@@ -644,7 +647,9 @@ class ModelRunner:
             else None
         )
 
-    def init_kv_cache_configurator(self):
+    def init_kv_cache_configurator(
+        self, draft_parallel_layout: DraftParallelLayout | None = None
+    ):
         # The replica count that shares this KV budget is the deployment's, not
         # the one a draft scope reports; the pool is allocated outside any scope,
         # so the PP width comes from the runner's own group.
@@ -671,6 +676,7 @@ class ModelRunner:
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             ),
             spec_aux_config=self.spec_aux_config,
+            draft_parallel_layout=draft_parallel_layout,
             is_hybrid_swa=self.is_hybrid_swa,
             is_hybrid_swa_compress=self.is_hybrid_swa_compress,
             use_mla_backend=self.use_mla_backend,
@@ -962,12 +968,17 @@ class ModelRunner:
         """
         return self.max_decode_logits_rows()
 
-    def alloc_memory_pool(self, memory_pool_config: Optional[MemoryPoolConfig] = None):
+    def alloc_memory_pool(
+        self,
+        memory_pool_config: Optional[MemoryPoolConfig] = None,
+        *,
+        draft_parallel_layout: DraftParallelLayout | None = None,
+    ):
         """Allocate KV cache memory pools only (no backends or cuda graphs)."""
         if memory_pool_config is not None:
             self.memory_pool_config = memory_pool_config
 
-        self.init_kv_cache_configurator()
+        self.init_kv_cache_configurator(draft_parallel_layout)
         result = self.kv_cache_configurator.configure(
             pre_model_load_memory=self.pre_model_load_memory
         )
@@ -1968,9 +1979,14 @@ class ModelRunner:
         if prepare is not None:
             prepare(forward_batch)
         if has_forward_context():
-            ctx_mgr = contextlib.nullcontext()
+            ctx_mgr = forward_context(
+                get_forward_context(), forward_batch=forward_batch
+            )
         else:
-            ctx_mgr = forward_context(ForwardContext(attn_backend=self.attn_backend))
+            ctx_mgr = forward_context(
+                ForwardContext(attn_backend=self.attn_backend),
+                forward_batch=forward_batch,
+            )
         with (
             get_model().override(shared_experts=self.model.shared_experts_config),
             ctx_mgr,
