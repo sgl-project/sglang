@@ -335,6 +335,18 @@ register_kernel(
 )
 register_kernel(
     KernelSpec(
+        op="attention.fused_mqa_topk_prefill",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.dsa.fused_mqa_topk:fused_mqa_topk_prefill",
+        # tcgen05 + TMEM: the SM100 and SM103 targets the vendored kernel is built for.
+        capabilities=frozenset(
+            CapabilityRequirement.cuda(min_sm=sm, max_sm=sm)
+            for sm in ((10, 0), (10, 3))
+        ),
+    )
+)
+register_kernel(
+    KernelSpec(
         op="attention.fused_k_indexer_norm_rope",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.attention.dsa.indexer_k:fused_k_indexer_norm_rope",
