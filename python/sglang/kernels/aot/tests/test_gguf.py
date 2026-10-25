@@ -57,10 +57,11 @@ SEEDS = [0]
 # activation rounding (~6e-3).
 DEQUANT_REL_L2 = 2e-3
 MATMUL_REL_L2 = 1e-2
-# ggml_mul_mat_a8 (llama.cpp's MMQ) supports every type here except IQ1_M; the
-# sample repo has no Q4_1 / Q5_1 files, the synthetic tests below cover them.
+# ggml_mul_mat_a8 (llama.cpp's MMQ) supports every type here; the sample repo has
+# no Q4_1 / Q5_1 files, the synthetic tests below cover them.
 MMQ_QUANT_TYPES = [
     # i-matrix
+    GGMLQuantizationType.IQ1_M,
     GGMLQuantizationType.IQ1_S,
     GGMLQuantizationType.IQ2_XXS,
     GGMLQuantizationType.IQ2_XS,
@@ -217,6 +218,13 @@ def random_gguf_blocks(
         b[:, -2:] = _FP16_SCALE
     elif quant_type in (GGMLQuantizationType.Q3_K, GGMLQuantizationType.Q6_K):
         b[:, -2:] = _FP16_SCALE  # d last
+    elif quant_type == GGMLQuantizationType.IQ1_M:
+        # qs[32], qh[16], scales[8]: the fp16 d is the top nibbles of the four
+        # uint16 scale words, lowest nibble in the first
+        d = int(_FP16_SCALE[0]) | int(_FP16_SCALE[1]) << 8
+        for i in range(4):
+            hi = 32 + 16 + 2 * i + 1
+            b[:, hi] = (b[:, hi] & 0x0F) | (((d >> (4 * i)) & 0x0F) << 4)
     else:  # d first: 32-value blocks, Q4_K / Q5_K and all i-quants
         b[:, :2] = _FP16_SCALE
         if quant_type in (
@@ -317,9 +325,7 @@ def test_mmq_large_batch(quant_type: GGMLQuantizationType):
     assert rel_l2(out, x.float() @ weight.T) < MATMUL_REL_L2
 
 
-@pytest.mark.parametrize(
-    "quant_type", [GGMLQuantizationType.Q8_1, GGMLQuantizationType.IQ1_M]
-)
+@pytest.mark.parametrize("quant_type", [GGMLQuantizationType.Q8_1])
 @torch.inference_mode()
 def test_mmq_unsupported_type_raises(quant_type: GGMLQuantizationType):
     block_size, type_size = GGML_QUANT_SIZES[quant_type]

@@ -296,7 +296,7 @@ torch::Tensor ggml_mul_mat_a8(
 }
 #else
 // CUDA: llama.cpp's MMQ (int8 tensor cores on Turing and newer, llama_mmq/), for every GGML type it
-// supports (standard, k-quant and i-quant types except IQ1_M). The kernel reads up to
+// supports (standard, k-quant and i-quant types; IQ1_M through patches/0002). The kernel reads up to
 // sgl_llama_mmq::weight_tail_bytes() past the end of the last weight row, as ggml pads its buffers: those
 // bytes must be readable and finite. GGUFLinearMethod pads the weights at load time; for weights without
 // the padding a zero-padded copy is made on every call.

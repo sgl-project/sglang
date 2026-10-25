@@ -185,11 +185,11 @@ MMVQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES | IMATRIX_QUANT_TYPES
 # kernels, which cover the standard and k-quant types.
 MOE_MMQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES
 if _is_cuda:
-    # ggml_mul_mat_a8 on CUDA is llama.cpp's MMQ: all standard, k-quant and
-    # i-quant types except Q8_1 (an activation format) and IQ1_M.
+    # ggml_mul_mat_a8 on CUDA is llama.cpp's MMQ (IQ1_M through llama_mmq's own
+    # tile loader): all standard, k-quant and i-quant types except Q8_1 (an
+    # activation format).
     MMQ_QUANT_TYPES = (STANDARD_QUANT_TYPES | KQUANT_TYPES | IMATRIX_QUANT_TYPES) - {
         WeightType.Q8_1,
-        WeightType.IQ1_M,
     }
 else:
     MMQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES
@@ -278,7 +278,7 @@ def fused_mul_mat_gguf(
     # enable MMVQ in contiguous batching with batch_size=1
     if x.shape[0] <= mmvq_safe and qweight_type in MMVQ_QUANT_TYPES:
         y = ggml_mul_mat_vec_a8(qweight, x, qweight_type, qweight.shape[0])
-    # Use the MMQ kernel if it's available (on CUDA every type but IQ1_M)
+    # Use the MMQ kernel if it's available (on CUDA every weight type)
     elif qweight_type in MMQ_QUANT_TYPES:
         y = ggml_mul_mat_a8(qweight, x, qweight_type, qweight.shape[0])
     # If there is no available MMQ kernel, fallback to dequantize

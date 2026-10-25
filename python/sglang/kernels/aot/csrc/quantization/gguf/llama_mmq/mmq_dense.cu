@@ -30,6 +30,7 @@ extern thread_local cudaStream_t g_cur_stream;
   X(Q5_K)                      \
   X(Q6_K)                      \
   X(IQ1_S)                     \
+  X(IQ1_M)                     \
   X(IQ2_XXS)                   \
   X(IQ2_XS)                    \
   X(IQ2_S)                     \

@@ -370,6 +370,7 @@ set(SGL_LLAMA_MMQ_SOURCES
     "${SGL_LLAMA_MMQ_DIR}/ggml_shim.cu"
     "${SGL_LLAMA_MMQ_DIR}/mmq_dense.cu"
     "${SGL_LLAMA_MMQ_DIR}/quantize_mmq_q8_1.cu"
+    "${SGL_LLAMA_MMQ_INSTANCES}/mmq-instance-iq1_m.cu"
     "${SGL_LLAMA_MMQ_INSTANCES}/mmq-instance-iq1_s.cu"
     "${SGL_LLAMA_MMQ_INSTANCES}/mmq-instance-iq2_s.cu"
     "${SGL_LLAMA_MMQ_INSTANCES}/mmq-instance-iq2_xs.cu"
