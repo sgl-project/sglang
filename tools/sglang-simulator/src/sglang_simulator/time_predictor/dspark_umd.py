@@ -724,6 +724,9 @@ class UMDDSparkCostModel:
             record = {
                 "event": "predicted_phase_cost",
                 "forward_id": step.forward_id,
+                "request_ids_by_attention_dp": [
+                    [request.rid for request in group.requests] for group in step.groups
+                ],
                 "phase": phase,
                 "source": result.source,
                 "seconds": seconds,

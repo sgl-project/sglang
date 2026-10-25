@@ -102,7 +102,11 @@ Set `native_cost_evidence_path` to a fresh run output to stream every evaluated
 phase's complete SDK query evidence as canonical UTF-8 JSONL. The phase reference
 hashes the exact line bytes, including the newline. Metrics retain the model,
 cost totals by source/phase, theoretical fraction and ledger size/SHA-256. A line
-records a predicted query, not a committed native forward; a partial run or output
+also retains `request_ids_by_attention_dp` in attention-DP rank and native request
+order, including empty idle groups. These outer request IDs support forward-to-request
+attribution; they do not change SDK query or PerfDB identities, and their presence
+does not establish a historical request-body or token-ID join. Each line records a
+predicted query, not a committed native forward; a partial run or output
 failure must not be reported as a completed simulation. Theory never creates or
 qualifies PerfDB measurement rows and does not establish native timing accuracy.
 
