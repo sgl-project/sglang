@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import logging
 from typing import Dict, List, Sequence, Tuple
 
 import msgspec
@@ -15,8 +14,6 @@ from sglang.srt.disaggregation.transport.base import (
     Status,
     Transport,
 )
-
-logger = logging.getLogger(__name__)
 
 
 class Registration(msgspec.Struct, frozen=True):
@@ -123,17 +120,12 @@ class MooncakeTransport(Transport):
         An empty copy list returns no handles."""
         if not copies:
             return []
-        # uint64 throughout: XPU pointers can set bit 63, and numpy promotes
-        # uint64 mixed with int64 to float64.
-        ranges = [c.ranges.astype(np.uint64, copy=False) for c in copies]
+        # uint64: XPU pointers can set bit 63.
         src_addrs = [
-            np.uint64(self._registrations[c.src][0]) + r[:, 0]
-            for c, r in zip(copies, ranges)
+            np.uint64(self._registrations[c.src][0]) + c.ranges[:, 0] for c in copies
         ]
-        dst_addrs = [
-            np.uint64(remote.bases[c.dst]) + r[:, 1] for c, r in zip(copies, ranges)
-        ]
-        lengths = [r[:, 2] for r in ranges]
+        dst_addrs = [np.uint64(remote.bases[c.dst]) + c.ranges[:, 1] for c in copies]
+        lengths = [c.ranges[:, 2] for c in copies]
         ret = self._engine.batch_transfer_sync(
             remote.session_id,
             np.concatenate(src_addrs).tolist(),
