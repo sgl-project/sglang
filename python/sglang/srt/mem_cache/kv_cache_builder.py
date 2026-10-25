@@ -287,17 +287,6 @@ def validate_decode_radix_cache(
             "device-resident cache and is incompatible with "
             "--enable-hierarchical-cache."
         )
-    # DeepSeek-V4 qualifies only on the unified KV layout (bf16 or fp8 rows): its
-    # SWA ring and c128 state are request-scoped and always transferred whole, so
-    # the tree shares only the compressed full-attention pages.
-    if getattr(model_config, "is_deepseek_v4_arch", False) and not getattr(
-        token_to_kv_pool, "_unified_kv", False
-    ):
-        raise ValueError(
-            "--disaggregation-decode-enable-radix-cache with DeepSeek-V4 "
-            "requires the unified KV layout "
-            "(SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton)."
-        )
     if getattr(model_config, "is_hybrid_swa_compress", False):
         raise ValueError(
             "--disaggregation-decode-enable-radix-cache does not support "
