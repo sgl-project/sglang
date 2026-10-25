@@ -13,6 +13,7 @@ from torch import nn
 
 from sglang.kernels.ops.speculative.dflash import selector_walk_triton
 from sglang.kernels.ops.speculative.lilicorr import lilicorr_topk_lse
+from sglang.srt.configs.draft_parallel import DraftParallelSpec, DraftTPExecution
 from sglang.srt.configs.laguna import normalize_gating
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
 from sglang.srt.layers.activation import SiluAndMul
@@ -369,7 +370,9 @@ class DFlashAttention(nn.Module):
         if _is_npu:
             q, k, v = self.forward_prepare_npu(positions, hidden_states)
         elif self.use_table_qk_norm_rope and qkv.dtype == torch.bfloat16:
-            from sglang.srt.speculative.dflash_utils import table_qk_norm_rope_
+            from sglang.kernels.ops.attention.table_qk_norm_rope import (
+                table_qk_norm_rope_,
+            )
 
             table_qk_norm_rope_(
                 qkv,
@@ -641,6 +644,8 @@ class DFlashDraftModel(nn.Module):
       - `fc.weight`, `hidden_norm.weight` for projecting target context features
       - `norm.weight` for final normalization
     """
+
+    draft_parallel_spec = DraftParallelSpec(tp_execution=DraftTPExecution.SINGLE_GROUP)
 
     decoder_layer_cls = DFlashDecoderLayer
     supports_fused_context_kv = True
