@@ -486,7 +486,10 @@ def before(mode, source_case, *, batch_size=1):
         '{"selection":"pending"}',
     )
     step = DSparkStep(
-        0, DSparkTopology(2, 1), (group,), source_case.policy.runtime_profile_json
+        0,
+        DSparkTopology(source_case.policy.tp_size, 1),
+        (group,),
+        source_case.policy.runtime_profile_json,
     )
     native = NS(
         device="cpu",
@@ -1082,23 +1085,17 @@ def test_native_phase_binding_requires_equal_policy_query_and_step_tp(
         "graph_phase": graph_phase,
         "phase": phase,
     }
-    if case.policy.tp_size == 2:
-        model._prepare_native(step=step, phase=phase)
-        assert validate_native_region_phase(**binding, step=step)
-    else:
-        with pytest.raises(PredictorError, match="native SDK phase projection"):
-            model._prepare_native(step=step, phase=phase)
-        with pytest.raises(PredictorError, match="phase/source binding"):
-            validate_native_region_phase(**binding, step=step)
+    model._prepare_native(step=step, phase=phase)
+    assert validate_native_region_phase(**binding, step=step)
 
-    # Even a matching SDK-verified TP4 query remains outside G's current
-    # phase domain. A typed step cannot opt into that domain by relabeling.
-    tp4_step = replace(step, topology=DSparkTopology(4, 1))
+    # A matching typed query cannot be rebound to the other source topology.
+    other_tp = 4 if case.policy.tp_size == 2 else 2
+    mismatched = replace(step, topology=DSparkTopology(other_tp, 1))
     with pytest.raises(PredictorError, match="native SDK phase projection") as failure:
-        model._prepare_native(step=tp4_step, phase=phase)
-    assert str(failure.value.__cause__) == "native region profile requires TP2/ADP1/PP1"
+        model._prepare_native(step=mismatched, phase=phase)
+    assert "policy/query topology changed" in str(failure.value.__cause__)
     with pytest.raises(PredictorError, match="phase/source binding"):
-        validate_native_region_phase(**binding, step=tp4_step)
+        validate_native_region_phase(**binding, step=mismatched)
 
     # Recompute a well-typed query with the other TP, retaining the original
     # profile/runtime labels. Policy-vs-step and query-vs-step are independent
@@ -1306,7 +1303,9 @@ def real_factory(source_case, tmp_path, monkeypatch):
             "capture.json", canonical_json_bytes(source_case.capture_profile.to_dict())
         ),
     }
-    config = SchedulerConfig(tp_size=2, backend_version="0.5.22")
+    config = SchedulerConfig(
+        tp_size=source_case.policy.tp_size, backend_version="0.5.22"
+    )
 
     def build(**changes):
         # This toy checkpoint tests constructor identity only. Restore the
@@ -1324,6 +1323,7 @@ def real_factory(source_case, tmp_path, monkeypatch):
 
     return NS(
         build=build,
+        config=config,
         asset=asset,
         progress_calls=progress_calls,
         progress_reads=progress_reads,
@@ -1652,3 +1652,53 @@ def test_profile2_compares_every_sdk_policy_field_after_independent_validation(
     with pytest.raises(PredictorError, match="inconsistent prospective policies"):
         load_cohort_policy(case)
     assert len(calls) == 2
+
+
+@pytest.mark.parametrize("cohort_case", [4], indirect=True)
+def test_tp4_factory_requires_golden_policy_and_matching_topology(
+    cohort_case, cohort_factory
+):
+    # Source-only natural fixtures do not become golden timing evidence.
+    stage_cohort_metadata(cohort_case)
+    options = {
+        "progress_kind": "source_golden351",
+        "model_seed": 42,
+        "progress_artifact": None,
+    }
+    with pytest.raises(PredictorError, match="matching verified golden351"):
+        cohort_factory.build(**options)
+    assert cohort_factory.progress_reads == []
+    cohort_factory.config.tp_size = 2
+    with pytest.raises(PredictorError, match="configured topology differs"):
+        cohort_factory.build(**options)
+    cohort_factory.config.tp_size = 4
+    with pytest.raises(PredictorError, match="TP4 requires native golden"):
+        cohort_factory.build()
+
+
+@pytest.mark.parametrize("cohort_case", [4], indirect=True)
+@pytest.mark.parametrize("mode", ["EXTEND", "DECODE"])
+def test_tp4_verified_projection_missing_cost_never_reaches_progress(cohort_case, mode):
+    from sglang_simulator.simulation.sglang.dspark import DSparkSession
+
+    case = cohort_case
+    costs = UMDDSparkCostModel(case.database, native_source_policy=case.policy)
+    step = resolve(costs, case, mode).step
+
+    class NoDraw:
+        def predict_progress(self, before):
+            pytest.fail("missing TP4 cost reached progress")
+
+    run = DSparkSession(costs, NoDraw())
+    if mode == "DECODE":
+        for req in step.requests:
+            run.record_history(
+                req.rid,
+                CommittedHistory(
+                    req.target_prefix_len, req.draft_valid_from, req.draft_valid_to
+                ),
+            )
+    previous = dict(run._history)
+    with pytest.raises(PredictorError, match="missing qualified DSPark cost"):
+        run.predict(step)
+    assert run._history == previous and run._last_forward_id == -1

@@ -92,7 +92,7 @@ def test_explicit_seed_is_required(policy, seed):
         ("golden_law", "natural"),
         ("golden_material_sha256", None),
         ("golden_material_sha256", "A" * 64),
-        ("tp_size", 4),
+        ("tp_size", 8),
     ],
 )
 def test_old_or_mismatched_policy_fails_closed(policy, field, value):
@@ -336,4 +336,35 @@ def test_prefill_never_calls_golden_draw(policy, batch):
         run = DSparkSession(Cost(), NoDecode(policy, model_seed=42))
         assert run.predict(before).progress.committed_tokens == tuple(
             (request.rid, int(request.emits_output)) for request in requests
+        )
+
+
+def test_tp4_verified_law_uses_one_b1_event_without_tp_scaling(policy):
+    original = SourceGoldenDSparkProgress(policy, model_seed=42)
+    policy.tp_size = 4
+    model = SourceGoldenDSparkProgress(policy, model_seed=42)
+    assert model.topology == (4, 1, 1)
+    # Topology comes from the verified material. TP does not scale the draw.
+    assert model.identity == original.identity
+    for fid in (0, 1, 17, 77):
+        before = replace(step(fid=fid), topology=DSparkTopology(4, 1))
+        assert model.predict_progress(before) == original.predict_progress(
+            step(fid=fid)
+        )
+    with pytest.raises(PredictorError, match="verified TP domain"):
+        model.predict_progress(replace(paired_step(), topology=DSparkTopology(4, 1)))
+    with pytest.raises(PredictorError, match="topology differs"):
+        model.predict_progress(step())
+
+
+def test_tp4_source_work_lookup_remains_closed(policy):
+    from infercast.sdk.native_segment_module import SOURCE_WORK_POLICY
+    from sglang_simulator.time_predictor.dspark_umd import UMDDSparkCostModel
+
+    policy.tp_size = 4
+    with pytest.raises(PredictorError, match="native source work requires"):
+        UMDDSparkCostModel(
+            None,
+            native_source_policy=policy,
+            native_source_work_policy=SOURCE_WORK_POLICY,
         )

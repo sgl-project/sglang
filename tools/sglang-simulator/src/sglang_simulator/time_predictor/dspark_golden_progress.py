@@ -30,12 +30,10 @@ def _canonical(value):
 class SourceGoldenDSparkProgress:
     """One modeled choice per DECODE event, with idempotent before-work retries.
 
-    This initial law is B1-B2/TP2/ADP1/PP1 only. SDK source policy verifies static
+    This law represents TP2 B1-B2 or TP4 B1, with ADP1/PP1. SDK policy verifies static
     Q5/Q6, captures and the golden cost realization. Session resolves every
     measured phase before calling this owner. Missing costs never draw progress.
     """
-
-    topology = (2, 1, 1)
 
     def __init__(self, source_policy, *, model_seed):
         from infercast.sdk.native_segment_projection import NativeSegmentSourcePolicy
@@ -53,9 +51,11 @@ class SourceGoldenDSparkProgress:
             getattr(source_policy, "golden_law", None) == LAW
             and type(material) is str
             and re.fullmatch("[0-9a-f]{64}", material) is not None
-            and source_policy.tp_size == 2,
+            and type(source_policy.tp_size) is int
+            and source_policy.tp_size in (2, 4),
             "native source policy has no matching verified golden351 material",
         )
+        self.topology = (source_policy.tp_size, 1, 1)
         self.runtime_profile_json = source_policy.runtime_profile_json
         self.material_sha256 = material
         self.seed = model_seed
@@ -87,9 +87,9 @@ class SourceGoldenDSparkProgress:
         _require(
             len(step.groups) == 1
             and step.groups[0].forward_mode == "TARGET_VERIFY"
-            and 1 <= len(step.requests) <= 2
+            and 1 <= len(step.requests) <= (2 if self.topology[0] == 2 else 1)
             and all(request.extend_len == 6 for request in step.requests),
-            "golden progress requires one or two static Q6 decode requests",
+            "golden progress requires static Q6 decode requests within its verified TP domain",
         )
         for request in step.requests:
             recipe = json.loads(request.sampling_params_json)

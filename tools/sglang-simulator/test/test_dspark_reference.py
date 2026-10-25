@@ -8,6 +8,7 @@ from types import ModuleType
 
 import pytest
 from sglang_simulator.simulation.sglang import dspark_reference as reference
+from sglang_simulator.simulation.sglang.dspark import DSparkTopology
 from sglang_simulator.simulation.sglang.dspark_reference import (
     DSparkReferenceLedger,
     PreparedReferenceBatch,
@@ -409,7 +410,7 @@ def test_reference_prepare_rejects_unknown_or_noninteger_page_size(page_size):
     assert ledger.prepared is None
 
 
-@pytest.mark.parametrize("tp,dp", [(4, 1), (2, 2)])
+@pytest.mark.parametrize("tp,dp", [(2, 2)])
 def test_reference_ledger_does_not_extend_to_other_supported_dspark_layouts(tp, dp):
     ledger = DSparkReferenceLedger(
         requests=(seeded(committed=512, allocated=512, published=512),)
@@ -566,3 +567,25 @@ def test_explicit_pending_seeds_require_unique_order_and_published_forward_ids()
             )
     with pytest.raises(PredictorError, match="typed unique requests"):
         DSparkReferenceLedger(requests=(seeded(), seeded()))
+
+
+def test_tp4_b1_reference_uses_same_source_page_and_publication_order():
+    original = DSparkReferenceLedger(requests=(seeded(),))
+    before = decode()
+    tp4 = replace(before, topology=DSparkTopology(4, 1))
+    expected = original.prepare(before, page_size=256)
+    actual = original.prepare(tp4, page_size=256)
+    assert actual.prepared.seed_seq_lens_cpu == expected.prepared.seed_seq_lens_cpu
+    assert actual.prepared.nxt_kv_lens_cpu == expected.prepared.nxt_kv_lens_cpu
+    published = actual.publish(modeled(tp4, count=4))
+    assert published.request_for("a").kv_committed_len == 240
+    assert published.request_for("a").published_seq_len == 244
+    assert published.process_result(0).request_for("a").kv_committed_len == 244
+
+
+def test_tp4_reference_rejects_b2_before_mutation():
+    original = DSparkReferenceLedger(requests=(seeded(), seeded("b")))
+    before = decode(requests=(decode().requests[0], decode(rid="b").requests[0]))
+    with pytest.raises(PredictorError, match="TP4 B1"):
+        original.prepare(replace(before, topology=DSparkTopology(4, 1)), page_size=256)
+    assert original.prepared is None and original.pending == ()

@@ -223,13 +223,14 @@ class DSparkReferenceLedger:
                 step.topology.attention_dp_size,
                 step.topology.pp_size,
             )
-            == (2, 1, 1)
+            in {(2, 1, 1), (4, 1, 1)}
             and len(step.groups) == 1
+            and (step.topology.tp_size == 2 or len(step.requests) == 1)
             and step.groups[0].attention_dp_rank == 0
             and step.groups[0].forward_mode in {"EXTEND", "TARGET_VERIFY"}
             and 1 <= len(step.requests) <= 8
             and _integer(page_size, 1),
-            "reference bookkeeping requires its TP2/ADP1/PP1 B1-B8 page domain",
+            "reference bookkeeping requires TP2/ADP1/PP1 B1-B8 page domain or TP4 B1",
         )
         rows = {row.rid: row for row in self.requests}
         prefill = step.groups[0].forward_mode == "EXTEND"

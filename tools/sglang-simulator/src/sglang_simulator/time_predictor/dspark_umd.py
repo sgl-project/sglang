@@ -146,6 +146,7 @@ class UMDDSparkCostModel:
                 or native_source_work_policy != SOURCE_WORK_POLICY
                 or native_source_policy is None
                 or native_source_policy.golden_law != GOLDEN_LAW
+                or native_source_policy.tp_size != 2
             ):
                 raise PredictorError(
                     "invalid_execution_profile",
@@ -346,8 +347,10 @@ class UMDDSparkCostModel:
                 step.topology.tp_size,
                 step.topology.attention_dp_size,
                 step.topology.pp_size,
-            ) != (2, 1, 1) or len(step.groups) != 1:
-                raise ValueError("native region profile requires TP2/ADP1/PP1")
+            ) not in {(2, 1, 1), (4, 1, 1)} or len(step.groups) != 1:
+                raise ValueError("native region profile requires TP2/TP4 ADP1/PP1")
+            if step.topology.tp_size == 4 and len(step.requests) != 1:
+                raise ValueError("TP4 native regions require B1")
             group = step.groups[0]
             execution = json.loads(group.execution_json)
             if (

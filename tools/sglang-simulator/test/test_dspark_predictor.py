@@ -461,7 +461,10 @@ def test_native_factory_installs_one_source_event_driver(factory, monkeypatch):
     monkeypatch.setitem(sys.modules, decode.__name__, decode)
     monkeypatch.setitem(sys.modules, artifacts.__name__, artifacts)
     policy = NS(
-        runtime_profile_json=Path(factory.kwargs["runtime_profile"]["path"]).read_text()
+        runtime_profile_json=Path(
+            factory.kwargs["runtime_profile"]["path"]
+        ).read_text(),
+        tp_size=2,
     )
     monkeypatch.setattr(infercast_dspark, "_native_source_policy", lambda *args: policy)
     # Source-policy/PerfDB qualification has its real-SDK integration tests.

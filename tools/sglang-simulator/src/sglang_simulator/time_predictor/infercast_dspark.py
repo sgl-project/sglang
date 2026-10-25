@@ -195,7 +195,7 @@ def _native_source_policy(database, profile_id, capture_profile):
                 _require(
                     isinstance(refs, list)
                     and bool(refs)
-                    and (name != "proposal_paths" or len(refs) == 2),
+                    and (name != "proposal_paths" or len(refs) == candidate.tp_size),
                     "native source metadata omits original " + name,
                     code="data_unavailable",
                 )
@@ -679,8 +679,20 @@ class InferCastDSparkTimePredictor(InferTimePredictor):
                 and re.fullmatch("[0-9a-f]{40}", revision) is not None,
                 f"{name} must be a full lowercase commit",
             )
+        tp_size = getattr(config, "tp_size", None)
+        _require(
+            type(tp_size) is int
+            and tp_size in (2, 4)
+            and (
+                tp_size == 2
+                or native_segment_profile_id is not None
+                and progress_kind == "source_golden351"
+                and native_source_work_policy is None
+            ),
+            "TP4 requires native golden regions without source-work reuse",
+            code="unsupported_topology",
+        )
         for name, expected in (
-            ("tp_size", 2),
             ("dp_size", 1),
             ("pp_size", 1),
             ("ep_size", 1),
@@ -689,7 +701,7 @@ class InferCastDSparkTimePredictor(InferTimePredictor):
             value = getattr(config, name, None)
             _require(
                 type(value) is int and value == expected,
-                "DSPark predictor requires modeled TP2/DP1/PP1/EP1/CP1",
+                "DSPark predictor requires modeled DP1/PP1/EP1/CP1",
                 code="unsupported_topology",
             )
         _require(
@@ -850,6 +862,11 @@ class InferCastDSparkTimePredictor(InferTimePredictor):
                     "configured runtime differs from the verified native physical source",
                     code="incompatible_runtime",
                 )
+                _require(
+                    tp_size == native_policy.tp_size,
+                    "configured topology differs from the verified native physical source",
+                    code="incompatible_runtime",
+                )
                 capture_identity = {
                     "path": str(capture_path),
                     "sha256": capture_digest,
@@ -889,8 +906,8 @@ class InferCastDSparkTimePredictor(InferTimePredictor):
 
             progress = SourceGoldenDSparkProgress(native_policy, model_seed=model_seed)
         _require(
-            progress.topology == (2, 1, 1),
-            "progress originals require the same modeled TP2/DP1/PP1 topology",
+            progress.topology == (tp_size, 1, 1),
+            "progress originals require the same modeled TP/DP1/PP1 topology",
             code="unsupported_topology",
         )
         cost_options = {}
@@ -904,7 +921,7 @@ class InferCastDSparkTimePredictor(InferTimePredictor):
         )
         self.dspark_runtime = DSparkNativeRuntime(
             session=DSparkSession(costs, progress),
-            topology=DSparkTopology(2, 1, 1),
+            topology=DSparkTopology(tp_size, 1, 1),
             runtime_profile_json=runtime_text,
             output_token_id=output_token_id,
             reference_events=native_policy is not None,
@@ -917,7 +934,7 @@ class InferCastDSparkTimePredictor(InferTimePredictor):
             "provider_version": getattr(infercast, "__version__", None),
             "system": system,
             "framework_version": config.backend_version,
-            "topology": {"tp": 2, "dp": 1, "pp": 1, "ep": 1, "cp": 1},
+            "topology": {"tp": tp_size, "dp": 1, "pp": 1, "ep": 1, "cp": 1},
             "runtime_profile": {"path": str(runtime_path), "sha256": runtime_digest},
             "progress_artifact": {
                 "path": str(progress_path),

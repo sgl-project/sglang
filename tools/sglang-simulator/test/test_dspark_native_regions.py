@@ -8,6 +8,7 @@ import json
 from dataclasses import replace
 
 import pytest
+from sglang_simulator.simulation.sglang.dspark import DSparkTopology
 from sglang_simulator.simulation.sglang.dspark_runtime import canonical
 from sglang_simulator.time_predictor.base import PredictorError
 from sglang_simulator.time_predictor.dspark_native_regions import (
@@ -29,7 +30,7 @@ CASES = (
 )
 
 
-def prepared(mode, phase, region, *, batch_size=1, capture_size=None):
+def prepared(mode, phase, region, *, batch_size=1, capture_size=None, tp_size=2):
     sdk = pytest.importorskip("infercast.sdk.native_segment_module")
     if capture_size is not None and not hasattr(
         sdk.NativeSegmentQuery, "from_graph_work"
@@ -59,7 +60,7 @@ def prepared(mode, phase, region, *, batch_size=1, capture_size=None):
         {
             "schema_version": 2,
             "source_pin": NATIVE_SOURCE_0522.name,
-            "tp_size": 2,
+            "tp_size": tp_size,
             "attention_dp_size": 1,
             "sampling_recipe": {
                 "source_sha256": NATIVE_SOURCE_0522.sampling_params,
@@ -87,9 +88,11 @@ def prepared(mode, phase, region, *, batch_size=1, capture_size=None):
     }
     decode = mode == "TARGET_VERIFY"
     project = (
-        sdk.NativeSegmentQuery.from_input
-        if capture_size is None
-        else sdk.NativeSegmentQuery.from_graph_work
+        sdk.NativeSegmentQuery.from_graph_work
+        if capture_size is not None
+        else sdk.NativeSegmentQuery.from_read_work
+        if tp_size == 4
+        else sdk.NativeSegmentQuery.from_input
     )
     query = project(
         execution_profile_id="a" * 64,
@@ -97,7 +100,7 @@ def prepared(mode, phase, region, *, batch_size=1, capture_size=None):
         native_forward_input=native,
         **(
             {"draft_history_tokens": [128] * batch_size if decode else None}
-            if capture_size is None
+            if capture_size is None and tp_size == 2
             else {}
         ),
         buffer_capacity=0 if decode else None,
@@ -116,6 +119,7 @@ def prepared(mode, phase, region, *, batch_size=1, capture_size=None):
     }
     before = replace(
         before,
+        topology=DSparkTopology(tp_size, 1),
         groups=(
             replace(
                 before.groups[0],
@@ -358,3 +362,21 @@ def test_old_proposal_cannot_silently_overwrite_another_cost_grain():
             proposal_profile_id="a" * 64,
             phase_preparers={"proposal": lambda **_: pytest.fail("overwritten")},
         )
+
+
+@pytest.mark.parametrize("mode,phase,region", CASES)
+def test_tp4_b1_native_binding_retains_complete_sdk_phase(mode, phase, region):
+    binding = prepared(mode, phase, region, tp_size=4)
+    assert validate_native_region_phase(**binding)
+    before = binding["step"]
+    binding["step"] = replace(before, topology=DSparkTopology(2, 1))
+    with pytest.raises(PredictorError, match="phase/source binding"):
+        validate_native_region_phase(**binding)
+
+
+def test_tp4_b2_remains_outside_native_binding():
+    binding = prepared(
+        "TARGET_VERIFY", "target_verify", "decode_target", batch_size=2, tp_size=4
+    )
+    with pytest.raises(PredictorError, match="phase/source binding"):
+        validate_native_region_phase(**binding)

@@ -123,7 +123,7 @@ profiles fail closed. The SDK owns source/material verification and the separate
 golden marginal-cost contract; there is no caller-supplied approval flag. The
 default remains empirical and retains its existing artifact and identity.
 
-This first golden progress mode represents TP2/ADP1/PP1 logical B1-B2 with full
+Golden progress represents TP2 logical B1-B2 and TP4 logical B1, ADP1/PP1, with full
 static draft Q5/verify Q6 work and length-only output. SHA256 of the model identity
 and DECODE forward ID, modulo100, selects commit4 for residues0–50 and commit3
 otherwise. Identity includes the explicit seed, complete runtime and verified
@@ -155,8 +155,8 @@ EXTEND and B2 use their existing lookup paths. This plumbing supplies neither
 missing costs nor actual heldout validation, complete AgentX coverage or an
 accuracy claim; operational activation requires those independent results.
 Source-law implementation and CPU tests do not establish native timing or
-Simulator/Pareto accuracy. B2 native positive admission, completion/overlap
-validation and complete C1 AgentX coverage remain pending.
+Simulator/Pareto accuracy. Actual completion/overlap validation and complete
+C1 AgentX coverage require independent evidence beyond these CPU contracts.
 
 Actual multi-DP scheduling/heterogeneous coordination, complete measured worker
 costs (including allocation), independently reviewed progress data and target
@@ -167,7 +167,8 @@ actual Simulator accuracy or hardware performance data.
 
 Select the minimal JSON factory with `predictor.name="infercast_dspark"`. It
 assembles the existing UMD cost adapter, independent empirical progress model,
-session and native CPU runtime for modeled TP2/ADP1/PP1. It binds the local
+session and native CPU runtime for modeled TP2/ADP1/PP1, or TP4/ADP1/PP1 with
+verified native golden regions. It binds the local
 checkpoint and native text configuration to the SDK's revision-pinned source
 configuration, and requires full model and installed-provider commits plus
 hash-pinned runtime and progress assets. It opens the selected FIDB database and
@@ -201,10 +202,14 @@ The phase binder also transports the SDK's schema3 graph-work queries unchanged.
 They retain schema2 nominal read semantics and add explicit padded or larger
 capture work; they do not acquire a legacy written-history field. The SDK still
 owns capture selection, source policy and cost admission. Binding a query does
-not expand the current TP2 factory or provide missing measured rows.
+not provide missing measured rows.
 Native phase preparation requires the SDK source policy, typed step and query
 to agree on TP size; the independent graph binder also checks query against step.
-Both paths retain their TP2/ADP1/PP1, single-group domain and reject TP4 explicitly.
+Both paths retain a single ADP1/PP1 group: TP2 uses its existing domain, and TP4
+requires B1. The factory requires configured TP, verified source policy and
+progress topology to agree. TP4 uses the same source-law commit3/4 event; it adds
+no TP latency scaling. TP4 B2 and TP4 source-work reuse remain closed; ADP2
+remains closed.
 
 For a HuggingFace snapshot whose `config.json` links into the cache's blob
 directory, set `model_config_root` to the explicit containing checkpoint/cache
@@ -257,11 +262,12 @@ independently bound progress artifact.
 
 Measurement `native` windows are separately checked against the slice manifest
 and their SHA256; they need not equal the cohort's policy windows. Measurement
-proposal paths must match that cohort. Factory source validation admits no cost:
+proposal paths must match that cohort, with one original proposal receipt per
+SDK-verified TP rank. Factory source validation admits no cost:
 the existing SDK cost reader still validates original measurement frames, cells
 and independent timing qualification before progress can be queried.
 
-This first native projection domain is TP2/ADP1/PP1, B1-B8. Its seven logical
+Native projection represents TP2 B1-B8 and TP4 B1, ADP1/PP1. Its seven logical
 preparers select nine mode-specific regions; costs still use the ordinary UMD
 executor and finalized silicon PerfDB. Missing rows remain data gaps.
 
@@ -790,9 +796,9 @@ loop behavior. SGLang Simulator owns scheduling, batching, cache/lifecycle behav
 and virtual time; InferCast supplies cost queries and performance interpolation.
 
 `simulation.sglang.dspark_reference.DSparkReferenceLedger` provides an explicit,
-immutable reference CPU bookkeeping seam for the source-bounded TP2/attention-DP1,
-PP1, B1-B8, Q6 path. It keeps CPU-processed committed lengths, persistent reserved
-lengths, published prefixes, processed output counts and prefill completion
+immutable reference CPU bookkeeping seam for source-bounded TP2 B1-B8 or TP4 B1,
+attention-DP1/PP1, Q6 work. It keeps CPU-processed committed lengths, persistent
+reserved lengths, published prefixes, processed output counts and prefill completion
 separate. Decode preparation calls native `page_aligned_decode_alloc_lens` with
 the original double-buffer reserve; it does not copy the synchronous simulator's
 CPU mirror or implement another allocation formula.
