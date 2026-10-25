@@ -258,6 +258,27 @@ curl -sS -L "http://localhost:30010/v1/images/<IMAGE_ID>/content" \
   -o output.png
 ```
 
+### Mesh generation (SGLang extension)
+
+For a mesh-generation model, `POST /v1/meshes` accepts an input image and returns
+an asynchronous job. This endpoint is a SGLang extension, not an OpenAI API.
+
+```bash
+curl -sS http://localhost:30010/v1/meshes \
+  -F 'image=@input.png' \
+  -F 'output_format=glb'
+```
+
+Poll `GET /v1/meshes/{id}` until `status` is `completed` or `failed`. The content
+endpoint, `GET /v1/meshes/{id}/content`, returns 404 until the job completes
+successfully; an unfinished or failed export is not downloadable even if a
+partial file exists. When cloud storage is enabled, use the completed job's
+`url` instead.
+
+Job metadata is process-local and does not survive server restart.
+`DELETE /v1/meshes/{id}` removes the record, not the running generation or its
+output files. Manage output retention separately.
+
 ### Video Generation
 
 The server implements a subset of the OpenAI Videos API under the `/v1/videos` namespace.
@@ -579,5 +600,5 @@ The server supports adjusting output quality and compression levels for both ima
 #### Notes
 
 - **Precedence**: When both `output-quality` and `output-compression` are provided, `output-compression` takes precedence
-- **Format Support**: Quality settings apply to JPEG, and video formats. PNG uses lossless compression and ignores these settings
+- **Format Support**: Quality settings apply to JPEG, and video formats. PNG is lossless: by default it is stored without zlib compression, which encodes fastest but keeps files close to the raw pixel size; an `output-compression` other than 75 selects zlib level `round(output-compression / 100 * 9)` instead
 - **File Size vs Quality**: Lower compression values (or "low" quality preset) produce smaller files but may show visible artifacts

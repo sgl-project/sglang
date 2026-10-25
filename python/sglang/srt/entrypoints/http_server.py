@@ -19,8 +19,10 @@ This file implements HTTP APIs for the inference engine via fastapi.
 
 import asyncio
 import dataclasses
+import errno
 import logging
 import os
+import socket
 import ssl
 import tempfile
 import threading
@@ -64,10 +66,11 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 from fastapi.routing import APIRoute
+from uvicorn.supervisors.multiprocess import Multiprocess
 
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.embedding_model_spec import resolved_embedding_plan
-from sglang.srt.configs.model_config import load_joint_head_config
+from sglang.srt.configs.model_config import load_joint_head_config, load_pointer_head
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.entrypoints.anthropic.protocol import (
@@ -88,6 +91,7 @@ from sglang.srt.entrypoints.ollama.protocol import (
     OllamaShowRequest,
 )
 from sglang.srt.entrypoints.ollama.serving import OllamaServing
+from sglang.srt.entrypoints.openai.chat_encoding_adapters import native_text_parser
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     ClassifyRequest,
@@ -169,6 +173,10 @@ from sglang.srt.managers.multi_tokenizer_mixin import (
 )
 from sglang.srt.managers.tokenizer_manager import ServerStatus, TokenizerManager
 from sglang.srt.observability.func_timer import enable_func_timer
+from sglang.srt.observability.http_request_metrics import (
+    add_http_request_metrics_middleware,
+    init_http_request_metrics,
+)
 from sglang.srt.observability.trace import (
     fastapi_telemetry_disabled_kwargs,
     process_tracing_init,
@@ -181,7 +189,6 @@ from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     add_prometheus_middleware,
-    add_prometheus_track_response_middleware,
     build_server_info,
     delete_directory,
     freeze_gc,
@@ -305,6 +312,7 @@ async def lifespan(fast_api_app: FastAPI):
     if get_observability().enable_metrics:
         add_prometheus_middleware(app)
         enable_func_timer()
+        init_http_request_metrics()
 
     # Init tracing
     if get_observability().enable_trace:
@@ -501,6 +509,9 @@ if envs.SGLANG_ENABLE_REQUEST_DECOMPRESSION.get():
     )
 
     app.add_middleware(RequestDecompressionMiddleware)
+
+# Registered at import so that tokenizer workers, which re-import this module, get it too.
+add_http_request_metrics_middleware(app)
 
 # Include routers
 from sglang.srt.entrypoints.v1_loads import router as v1_loads_router
@@ -1706,15 +1717,27 @@ async def parse_function_call_request(
     """
     A native API endpoint to parse function calls from a text.
     """
-    # 1) Initialize the parser based on the request body
-    parser = FunctionCallParser(
-        tools=obj.tools,
-        tool_call_parser=obj.tool_call_parser,
-        tokenizer=get_global_state().tokenizer_manager.tokenizer,
-    )
+    chat = request.app.state.openai_serving_chat
+    try:
+        text_parser = native_text_parser(
+            obj.tool_call_parser,
+            chat_encoding_spec=chat.chat_encoding_spec,
+            adapter=chat.encoding_adapter,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=str(error))
+    if text_parser is not None:
+        normal_text, calls = text_parser.parse_function_call_text(obj.text, obj.tools)
+    else:
+        # 1) Initialize the parser based on the request body
+        parser = FunctionCallParser(
+            tools=obj.tools,
+            tool_call_parser=obj.tool_call_parser,
+            tokenizer=get_global_state().tokenizer_manager.tokenizer,
+        )
 
-    # 2) Call the non-stream parsing method (non-stream)
-    normal_text, calls = parser.parse_non_stream(obj.text)
+        # 2) Call the non-stream parsing method (non-stream)
+        normal_text, calls = parser.parse_non_stream(obj.text)
 
     # 3) Organize the response content
     response_data = {
@@ -1734,22 +1757,38 @@ async def separate_reasoning_request(
     """
     A native API endpoint to separate reasoning from a text.
     """
-    # 1) Initialize the parser based on the request body
-    parser = ReasoningParser(
-        model_type=obj.reasoning_parser,
-        request=request,
-        tokenizer=get_global_state().tokenizer_manager.tokenizer,
-    )
-
-    # 2) Call the non-stream parsing method (non-stream)
-    if obj.return_blocks:
-        blocks = parser.parse_non_stream_blocks(obj.text)
-        reasoning_blocks = [b["text"] for b in blocks if b["type"] == "reasoning"]
-        text_blocks = [b["text"] for b in blocks if b["type"] == "text"]
-        reasoning_text = "".join(reasoning_blocks)
-        normal_text = "".join(text_blocks)
+    chat = request.app.state.openai_serving_chat
+    try:
+        text_parser = native_text_parser(
+            obj.reasoning_parser,
+            chat_encoding_spec=chat.chat_encoding_spec,
+            adapter=chat.encoding_adapter,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=str(error))
+    if text_parser is not None:
+        reasoning_text, normal_text = text_parser.separate_reasoning_text(obj.text)
+        blocks = (
+            [{"type": "reasoning", "text": reasoning_text}] if reasoning_text else []
+        )
+        blocks.append({"type": "text", "text": normal_text})
     else:
-        reasoning_text, normal_text = parser.parse_non_stream(obj.text)
+        # 1) Initialize the parser based on the request body
+        parser = ReasoningParser(
+            model_type=obj.reasoning_parser,
+            request=request,
+            tokenizer=get_global_state().tokenizer_manager.tokenizer,
+        )
+
+        # 2) Call the non-stream parsing method (non-stream)
+        if obj.return_blocks:
+            blocks = parser.parse_non_stream_blocks(obj.text)
+            reasoning_text = "".join(
+                b["text"] for b in blocks if b["type"] == "reasoning"
+            )
+            normal_text = "".join(b["text"] for b in blocks if b["type"] == "text")
+        else:
+            reasoning_text, normal_text = parser.parse_non_stream(obj.text)
 
     # 3) Organize the response content
     response_data = {
@@ -1757,8 +1796,12 @@ async def separate_reasoning_request(
         "text": normal_text,
     }
     if obj.return_blocks:
-        response_data["reasoning_blocks"] = reasoning_blocks
-        response_data["text_blocks"] = text_blocks
+        response_data["reasoning_blocks"] = [
+            b["text"] for b in blocks if b["type"] == "reasoning"
+        ]
+        response_data["text_blocks"] = [
+            b["text"] for b in blocks if b["type"] == "text"
+        ]
         response_data["blocks"] = blocks
 
     return ORJSONResponse(content=response_data, status_code=200)
@@ -2396,13 +2439,18 @@ def _execute_server_warmup(server_args: ServerArgs):
         ).tolist()
         json_data["sampling_params"]["max_new_tokens"] = 0
 
-    if (
-        not model_info["is_generation"]
-        and model_info.get("architectures") == ["Qwen3_5ForConditionalGeneration"]
-        and load_joint_head_config(get_model().model_path, get_model().revision)
-        is not None
+    model = get_model()
+    if not model_info["is_generation"] and (
+        (
+            model_info.get("architectures") == ["Qwen3_5ForConditionalGeneration"]
+            and load_joint_head_config(model.model_path, model.revision) is not None
+        )
+        or (
+            model_info.get("architectures") == ["Qwen3_5ForCausalLM"]
+            and load_pointer_head(model.model_path, model.revision) is not None
+        )
     ):
-        # A Clef checkpoint answers /v1/systemone decisions only.
+        # A Clef or Kev checkpoint answers /v1/systemone decisions only.
         request_name = "/v1/systemone"
         json_data = {
             "model": "warmup",
@@ -2555,6 +2603,128 @@ def _wait_weights_ready():
     )
 
 
+class _ReusePortMultiprocess(Multiprocess):
+    """Give each uvicorn worker a private SO_REUSEPORT listener.
+
+    uvicorn's supervisor reads ``self.sockets`` once per worker it spawns, so a
+    fresh listener is handed out on every read and the parent's copy is closed
+    once the child holds it; the lifecycle (health checks, restarts, SIGTTIN)
+    stays uvicorn's own. Requires uvicorn >= 0.51, whose Process builds its
+    own Server.
+    """
+
+    def __init__(self, config: uvicorn.Config):
+        self._handed_out: List[socket.socket] = []
+        self._reserved_socket: Optional[socket.socket] = _reserve_reuseport_socket(
+            config
+        )
+        self._socket_family = self._reserved_socket.family
+        self._socket_address = self._reserved_socket.getsockname()
+        super().__init__(config, sockets=[])
+
+    @property
+    def sockets(self) -> List[socket.socket]:
+        self._close_handed_out()
+        sock = self._reserved_socket
+        self._reserved_socket = None
+        if sock is None:
+            sock = _bind_reuseport_socket(
+                self.config, self._socket_family, self._socket_address
+            )
+        self._handed_out.append(sock)
+        return [sock]
+
+    @sockets.setter
+    def sockets(self, value: List[socket.socket]) -> None:
+        if value:
+            raise ValueError("_ReusePortMultiprocess binds its own listeners")
+
+    def _close_handed_out(self) -> None:
+        # Each spawn site starts its Process before the next read, so every
+        # listener handed out so far is already held by its child.
+        for sock in self._handed_out:
+            sock.close()
+        self._handed_out.clear()
+
+    def init_processes(self) -> None:
+        try:
+            super().init_processes()
+        except BaseException:
+            self.terminate_all()
+            self.join_all()
+            raise
+        finally:
+            self._close_handed_out()
+
+    def restart_all(self) -> None:
+        try:
+            super().restart_all()
+        finally:
+            self._close_handed_out()
+
+    def keep_subprocess_alive(self) -> None:
+        try:
+            super().keep_subprocess_alive()
+        finally:
+            self._close_handed_out()
+
+    def handle_ttin(self) -> None:
+        try:
+            super().handle_ttin()
+        finally:
+            self._close_handed_out()
+
+
+def _bind_reuseport_socket(config: uvicorn.Config, family, address) -> socket.socket:
+    sock = socket.socket(family=family)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    sock.bind(address)
+    sock.listen(config.backlog)
+    sock.set_inheritable(True)
+    return sock
+
+
+def _reserve_reuseport_socket(config: uvicorn.Config) -> socket.socket:
+    try:
+        family = socket.AF_INET6 if ":" in config.host else socket.AF_INET
+        address = socket.getaddrinfo(config.host, config.port, family)[0][4]
+        if config.port == 0:
+            sock = _bind_reuseport_socket(config, family, address)
+            config.port = sock.getsockname()[1]
+            return sock
+        name = f"\0sglang-reuseport-{os.geteuid()}-{config.port}"
+        with socket.socket(socket.AF_UNIX) as reservation:
+            while True:
+                try:
+                    reservation.bind(name)
+                    break
+                except OSError as error:
+                    if error.errno != errno.EADDRINUSE:
+                        raise
+                    time.sleep(0.01)
+            with socket.socket(family=family) as probe:
+                probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                probe.bind(address)
+            return _bind_reuseport_socket(config, family, address)
+    except OSError as error:
+        logger.error(error)
+        raise SystemExit(1) from error
+
+
+def _granian_http1_settings():
+    from granian.http import HTTP1Settings
+
+    if not envs.SGLANG_TIMEOUT_KEEP_ALIVE.is_set():
+        return HTTP1Settings()
+    timeout_s = envs.SGLANG_TIMEOUT_KEEP_ALIVE.get()
+    if timeout_s <= 0:
+        raise ValueError(
+            f"SGLANG_TIMEOUT_KEEP_ALIVE must be a positive number of seconds, got {timeout_s}"
+        )
+    return HTTP1Settings(header_read_timeout=timeout_s * 1000)
+
+
 def _run_granian_server(
     host,
     port,
@@ -2598,6 +2768,7 @@ def _run_granian_server(
         port=port,
         interface=Interfaces.ASGI,
         http=HTTPModes.auto,
+        http1_settings=_granian_http1_settings(),
         http2_settings=HTTP2Settings(
             initial_connection_window_size=http2_initial_connection_window_size,
             max_concurrent_streams=http2_max_concurrent_streams,
@@ -2666,9 +2837,6 @@ def _setup_and_run_http_server(
     # Store watchdog on tokenizer_manager (single source of truth for SIGQUIT handler)
     if tokenizer_manager is not None:
         tokenizer_manager._subprocess_watchdog = subprocess_watchdog
-
-    if get_observability().enable_metrics:
-        add_prometheus_track_response_middleware(app)
 
     # Pass additional arguments to the lifespan function.
     # They will be used for additional initialization setups.
@@ -2854,22 +3022,32 @@ def _setup_and_run_http_server(
                     ssl_keyfile_password=get_serving().ssl_keyfile_password,
                 )
             else:
-                uvicorn.run(
-                    envs.SGLANG_HTTP_SERVER_APP_PATH.get(),
-                    host=get_serving().host,
-                    port=get_serving().port,
-                    root_path=get_serving().fastapi_root_path,
-                    log_level=get_observability().log_level_http
+                app_path = envs.SGLANG_HTTP_SERVER_APP_PATH.get()
+                uvicorn_options = {
+                    "host": get_serving().host,
+                    "port": get_serving().port,
+                    "root_path": get_serving().fastapi_root_path,
+                    "log_level": get_observability().log_level_http
                     or get_observability().log_level,
-                    timeout_keep_alive=envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
-                    timeout_worker_healthcheck=envs.SGLANG_UVICORN_WORKER_HEALTHCHECK_TIMEOUT.get(),
-                    loop="uvloop",
-                    workers=get_serving().tokenizer_worker_num,
-                    ssl_keyfile=get_serving().ssl_keyfile,
-                    ssl_certfile=get_serving().ssl_certfile,
-                    ssl_ca_certs=get_serving().ssl_ca_certs,
-                    ssl_keyfile_password=get_serving().ssl_keyfile_password,
-                )
+                    "timeout_keep_alive": envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
+                    "timeout_worker_healthcheck": envs.SGLANG_UVICORN_WORKER_HEALTHCHECK_TIMEOUT.get(),
+                    "loop": "uvloop",
+                    "workers": get_serving().tokenizer_worker_num,
+                    "ssl_keyfile": get_serving().ssl_keyfile,
+                    "ssl_certfile": get_serving().ssl_certfile,
+                    "ssl_ca_certs": get_serving().ssl_ca_certs,
+                    "ssl_keyfile_password": get_serving().ssl_keyfile_password,
+                }
+                if get_serving().enable_http_worker_reuseport:
+                    config = uvicorn.Config(app_path, **uvicorn_options)
+                    supervisor = _ReusePortMultiprocess(config)
+                    logger.info(
+                        f"Uvicorn running on {config.host}:{config.port} "
+                        f"with {config.workers} SO_REUSEPORT workers"
+                    )
+                    supervisor.run()
+                else:
+                    uvicorn.run(app_path, **uvicorn_options)
     finally:
         if get_serving().tokenizer_worker_num > 1:
             if multi_tokenizer_args_shm is not None:
