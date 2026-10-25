@@ -535,6 +535,14 @@ register_kernel(
 )
 register_kernel(
     KernelSpec(
+        op="gemm.router_gemv",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.gemm.router_gemv:router_gemv",
+        capabilities=frozenset({CapabilityRequirement.CUDA, CapabilityRequirement.HIP}),
+    )
+)
+register_kernel(
+    KernelSpec(
         op="gemm.router_gemm_bf16x3_cublas",
         backend=KernelBackend.TORCH,
         target="sglang.kernels.ops.gemm.router_gemv:router_gemm_bf16x3_cublas",
