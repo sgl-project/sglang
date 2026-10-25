@@ -20,6 +20,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 BASE = "sglang.srt.multimodal.processors.base_processor"
+PLACEMENT = "sglang.srt.multimodal.serving_preprocessing"
 
 
 class _Processor:
@@ -60,7 +61,7 @@ class TestFastImageProcessorDevice(CustomTestCase):
                 device_type=device_type,
             )
         )
-        with patch.multiple(BASE, platforms=platforms, **flags):
+        with patch.multiple(PLACEMENT, platforms=platforms, **flags):
             return processor._fast_image_processor_device(_Processor())
 
     def test_device_follows_the_instance_base_gpu_id(self):
@@ -94,7 +95,7 @@ class TestFastImageProcessorDevice(CustomTestCase):
             pass
 
         processor = _make(base_gpu_id=3)
-        with patch.multiple(BASE, _is_cpu=False, _is_xpu=False, _is_npu=True):
+        with patch.multiple(PLACEMENT, _is_cpu=False, _is_xpu=False, _is_npu=True):
             device = processor._fast_image_processor_device(Glm4vProcessor())
         self.assertIsNone(device)
 
@@ -185,7 +186,7 @@ class TestFastImageProcessorMemoryPool(CustomTestCase):
 
         with (
             patch.multiple(
-                BASE,
+                PLACEMENT,
                 _is_cpu=False,
                 _is_xpu=False,
                 _is_npu=False,
