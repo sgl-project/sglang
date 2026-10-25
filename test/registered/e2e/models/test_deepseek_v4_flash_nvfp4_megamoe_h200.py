@@ -3,7 +3,7 @@
 Launches the DeepSeek-V4 cookbook SM90 NVFP4 MegaMoE command (TP=8, DP-attention 8,
 EP=8, --moe-a2a-backend megamoe) and runs decode probes plus a GSM8K gate.
 
-Registry: extra-b-test-8-gpu-h200 (label-gated, 8x H200)
+Registry: weekly, 8x H200
 """
 
 import unittest
@@ -19,7 +19,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=900, stage="extra-b", runner_config="8-gpu-h200")
+register_cuda_ci(est_time=900, stage="weekly", runner_config="8-gpu-h200")
 
 
 def _flashinfer_has_sm90_megamoe() -> bool:

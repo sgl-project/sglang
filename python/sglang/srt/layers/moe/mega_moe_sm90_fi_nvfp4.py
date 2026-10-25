@@ -19,6 +19,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     get_dp_global_num_tokens,
     is_dp_attention_enabled,
+    note_shared_bucket_in_prefill_graph,
 )
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.runtime_context import get_exec
@@ -177,8 +178,11 @@ def _get_fi_symm_buffer(
 
 def _rank_invariant_tokens(num_tokens: int) -> int:
     # Plan/family selection keys on M, so every EP rank must launch with the same M.
-    # Decode graphs are captured and replayed at one padded batch size on all DP ranks.
-    if get_is_capture_mode() or not is_dp_attention_enabled():
+    # Graphs bake M in at capture, so all DP ranks must replay one shared bucket.
+    if get_is_capture_mode():
+        note_shared_bucket_in_prefill_graph()
+        return num_tokens
+    if not is_dp_attention_enabled():
         return num_tokens
     global_num_tokens = get_dp_global_num_tokens()
     if not global_num_tokens:
