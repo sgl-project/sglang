@@ -148,16 +148,7 @@ class MiniMaxH3VDNHybridAttention(nn.Module):
             ulysses_active=ulysses_active,
         )
         if attention.bcg_breakpoint:
-            softmax_out = q.new_empty(q.shape)
-            linear_out = None
-            meta = get_forward_context().attn_metadata
-            if not meta.full_cover:
-                # the single-rank readout covers the video rows only
-                layout = meta.layout
-                rows = (
-                    total if ulysses_active else layout.video_end - layout.video_start
-                )
-                linear_out = q.new_empty((rows, q.shape[1] * q.shape[2]))
+            softmax_out, linear_out = _new_hybrid_core_outputs(q, total, ulysses_active)
             _hybrid_attention_core_bcg(
                 *core_args,
                 softmax_out=softmax_out,
@@ -373,13 +364,7 @@ def _minimax_h3_hybrid_attention_core_impl(
     max_seqlen: int,
     ulysses_active: bool,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    meta = get_forward_context().attn_metadata
-    if not isinstance(meta, HybridWindowAttentionH3Metadata):
-        raise RuntimeError(
-            "VDN-H3 hybrid attention needs HybridWindowAttentionH3Metadata in the "
-            "forward context; the MiniMax-H3 denoising stage installs it per request "
-            f"(got {type(meta).__name__})."
-        )
+    meta = _hybrid_attention_metadata()
     layout = meta.layout
     softmax = functools.partial(
         _vdn_window_softmax,
@@ -570,6 +555,30 @@ def _vdn_return_to_rows(
         merged[1].reshape(merged[1].shape[0], -1) if linear_out is not None else None
     )
     return merged[0], linear_rows
+
+
+def _hybrid_attention_metadata() -> HybridWindowAttentionH3Metadata:
+    meta = get_forward_context().attn_metadata
+    if not isinstance(meta, HybridWindowAttentionH3Metadata):
+        raise RuntimeError(
+            "VDN-H3 hybrid attention needs HybridWindowAttentionH3Metadata in the "
+            "forward context; the MiniMax-H3 denoising stage installs it per request "
+            f"(got {type(meta).__name__})."
+        )
+    return meta
+
+
+def _new_hybrid_core_outputs(
+    q: torch.Tensor, total: int, ulysses_active: bool
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """The core's softmax and linear outputs, allocated before its graph break."""
+    meta = _hybrid_attention_metadata()
+    if meta.full_cover:
+        return q.new_empty(q.shape), None
+    # the single-rank readout covers the video rows only
+    layout = meta.layout
+    rows = total if ulysses_active else layout.video_end - layout.video_start
+    return q.new_empty(q.shape), q.new_empty((rows, q.shape[1] * q.shape[2]))
 
 
 @eager_on_graph
