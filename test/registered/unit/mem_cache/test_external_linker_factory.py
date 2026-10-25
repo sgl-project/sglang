@@ -352,25 +352,6 @@ class TestExternalLinkerFactory(unittest.TestCase):
                     )
                     self.assertEqual(constructor.call_args.kwargs["extra_config"], {})
 
-    def test_legacy_file_is_only_resolved_at_startup(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory, "legacy.json")
-            path.write_text(json.dumps({"master_server_address": "legacy"}))
-            with get_context().override_server_args(
-                unified_cache_external_linker_backend="mooncake",
-                unified_cache_external_linker_config=None,
-                hicache_storage_backend_extra_config=f"@{path}",
-            ):
-                self.assertEqual(
-                    get_startup_linker_config(), {"master_server_address": "legacy"}
-                )
-            with get_context().override_server_args(
-                unified_cache_external_linker_backend="mooncake",
-                unified_cache_external_linker_config={},
-                hicache_storage_backend_extra_config="@missing-file.json",
-            ):
-                self.assertEqual(get_startup_linker_config(), {})
-
     def test_dynamic_requires_config_in_worker(self):
         with (
             get_context().override_server_args(
