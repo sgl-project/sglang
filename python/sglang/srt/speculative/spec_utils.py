@@ -12,13 +12,7 @@ from huggingface_hub import snapshot_download
 
 from sglang.kernels.ops.sampling import softmax as sampling_softmax
 from sglang.kernels.ops.speculative.cache_locs import (
-    align_evict_mask_to_page_size as align_evict_mask_to_page_size,
-)
-from sglang.kernels.ops.speculative.cache_locs import (
-    assign_extend_cache_locs as assign_extend_cache_locs,
-)
-from sglang.kernels.ops.speculative.cache_locs import (
-    filter_finished_cache_loc_kernel as filter_finished_cache_loc_kernel,
+    fill_front_out_cache_loc_func as fill_front_out_cache_loc_func,
 )
 from sglang.kernels.ops.speculative.cache_locs import (
     generate_draft_decode_kv_indices as generate_draft_decode_kv_indices,
@@ -26,17 +20,12 @@ from sglang.kernels.ops.speculative.cache_locs import (
 from sglang.kernels.ops.speculative.cache_locs import (
     generate_draft_decode_window_kv_indices as generate_draft_decode_window_kv_indices,
 )
-from sglang.kernels.ops.speculative.cache_locs import (
-    get_src_tgt_cache_loc as get_src_tgt_cache_loc,
-)
-from sglang.kernels.ops.speculative.cache_locs import (
-    get_target_cache_loc as get_target_cache_loc,
-)
 from sglang.kernels.ops.speculative.eagle import (
     fill_accept_out_cache_loc_func as fill_accept_out_cache_loc_func,
 )
 from sglang.kernels.ops.speculative.row_argmax import row_argmax
 from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.configs.draft_parallel import DraftParallelLayout
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.constrained.base_grammar_backend import GrammarMask
 from sglang.srt.distributed.parallel_state import (
@@ -46,11 +35,9 @@ from sglang.srt.distributed.parallel_state import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
+from sglang.srt.layers.cp.base import disable_cp_strategy
 from sglang.srt.managers.schedule_batch import set_mamba_track_indices_from_reqs
 from sglang.srt.managers.utils import _async_d2h
-from sglang.srt.mem_cache.allocation import (
-    assign_req_to_token_pool as assign_req_to_token_pool,
-)
 from sglang.srt.mem_cache.allocation import (
     assign_req_to_token_pool_func as assign_req_to_token_pool_func,
 )
@@ -62,13 +49,11 @@ from sglang.srt.runtime_context import (
     max_speculative_num_draft_tokens,
 )
 from sglang.srt.utils import (
-    is_cpu,
     is_cuda,
     is_hip,
     is_musa,
     is_npu,
     is_xpu,
-    next_power_of_2,
 )
 from sglang.srt.utils.async_probe import maybe_detect_oob
 from sglang.srt.utils.common import fast_topk
@@ -79,7 +64,6 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _is_musa = is_musa()
 _is_xpu = is_xpu()
-_is_cpu = is_cpu()
 
 if TYPE_CHECKING:
     from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
@@ -89,8 +73,8 @@ if TYPE_CHECKING:
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 
 
-if _is_cpu:
-    from sgl_kernel import assign_extend_cache_locs_cpu
+if _is_cuda:
+    from sglang.kernels.ops.speculative.simulated_accept import simulated_accept
 
 
 logger = logging.getLogger(__name__)
@@ -126,24 +110,93 @@ def resolve_num_tokens_per_req(
     raise ValueError(f"Unknown speculative phase: {phase}")
 
 
-def fast_sample(probs: torch.Tensor, num_samples: int = 1):
-    """Draw from `probs` via the Gumbel-max trick: argmax(probs / Exp(1)).
+# Domain-separate draft proposal draws from target sampling and verify coins.
+# The per-step offset also separates successive draft draws if their absolute
+# position inputs overlap.
+_DRAFT_GUMBEL_SEED_SALT = 0x44524146545F0000
 
-    Distributionally equivalent to torch.multinomial, but avoids multinomial's
-    device-side distribution-validity assert, which the draft CUDA graph would
-    otherwise capture and replay every step. q is clamped off zero so a zero
-    draw can't yield inf/NaN scores that argmax would wrongly select; fp32
-    avoids bf16 argmax ties biasing the draw. Set SGLANG_OPT_USE_GUMBEL_SAMPLE=0
-    to fall back to torch.multinomial.
+
+def fast_sample(
+    probs: torch.Tensor,
+    num_samples: int = 1,
+    *,
+    sampling_seed: Optional[torch.Tensor] = None,
+    positions: Optional[torch.Tensor] = None,
+    draft_step: int = 0,
+):
+    """Draw from ``probs`` with the exponential-race form of Gumbel-max.
+
+    When ``sampling_seed`` is provided, derive one exponential variate per
+    request, position, draft step, and vocabulary entry with ``murmur_hash32``.
+    This makes draft proposals reproducible under batch reordering and CUDA
+    graph replay. The midpoint uint32 mapping stays strictly inside ``(0, 1)``,
+    avoiding infinite exponential/Gumbel values at either hash endpoint.
+
+    The unseeded path keeps using PyTorch's fast RNG-backed implementation.
+    Set ``SGLANG_OPT_USE_GUMBEL_SAMPLE=0`` to make that path fall back to
+    ``torch.multinomial``.
     """
-    if not envs.SGLANG_OPT_USE_GUMBEL_SAMPLE.get():
-        sample_index = torch.multinomial(probs, num_samples=num_samples)
-        return probs.gather(1, sample_index), sample_index
-    q = torch.empty_like(probs, dtype=torch.float32).exponential_(1.0)
-    q.clamp_min_(torch.finfo(torch.float32).tiny)
-    scores = probs.float() / q
+    if sampling_seed is not None:
+        if positions is None:
+            raise ValueError("positions are required for deterministic fast_sample")
+        if sampling_seed.shape != positions.shape:
+            raise ValueError(
+                "sampling_seed and positions must have matching shapes, got "
+                f"{sampling_seed.shape} and {positions.shape}"
+            )
+        if sampling_seed.numel() != probs.shape[0]:
+            raise ValueError(
+                "sampling_seed must have one value per probability row, got "
+                f"{sampling_seed.numel()} seeds for {probs.shape[0]} rows"
+            )
+
+        from sglang.kernels.ops.sampling.murmur_hash import murmur_hash32
+
+        if draft_step < 0:
+            raise ValueError(f"draft_step must be non-negative, got {draft_step}")
+        vocab_size = probs.shape[1]
+        col_offset = draft_step * vocab_size
+        if col_offset + vocab_size > 2**32:
+            raise ValueError(
+                "draft_step and vocabulary size exceed the uint32 hash-key range: "
+                f"draft_step={draft_step}, vocab_size={vocab_size}"
+            )
+
+        # Encode (draft_step, token_id) in the uint32 column block instead of
+        # altering the request seed; step zero retains its established stream.
+        salted_seed = sampling_seed + _DRAFT_GUMBEL_SEED_SALT
+        col_indices = torch.arange(
+            col_offset,
+            col_offset + vocab_size,
+            dtype=torch.int64,
+            device=probs.device,
+        )
+        hashed = murmur_hash32(
+            salted_seed.to(torch.uint64), positions.to(torch.uint64), col_indices
+        )
+
+        # If U ~ Uniform(0, 1), then -log(U) ~ Exp(1), and
+        # argmax_i probs[i] / Exp_i samples from the categorical distribution.
+        # Keep float64 for this first implementation, matching the established
+        # deterministic sampler's numerical-conservatism policy.
+        scores = hashed.to(torch.float64)
+        del hashed
+        scores.add_(0.5).div_(2.0**32).log_().neg_().reciprocal_()
+        scores.mul_(probs)
+    else:
+        if not envs.SGLANG_OPT_USE_GUMBEL_SAMPLE.get():
+            sample_index = torch.multinomial(probs, num_samples=num_samples)
+            return probs.gather(1, sample_index), sample_index
+        q = torch.empty_like(probs, dtype=torch.float32).exponential_(1.0)
+        q.clamp_min_(torch.finfo(torch.float32).tiny)
+        scores = probs.float() / q
+
     if num_samples == 1:
-        sample_index = row_argmax(scores).unsqueeze(-1)
+        # row_argmax is FP32-only; the seeded path keeps float64 scores.
+        if scores.dtype == torch.float32:
+            sample_index = row_argmax(scores).unsqueeze(-1)
+        else:
+            sample_index = scores.argmax(dim=-1, keepdim=True)
     else:
         sample_index = scores.topk(num_samples, dim=-1).indices
     sample_p = probs.gather(1, sample_index)
@@ -170,6 +223,10 @@ def sample_draft_proposal(
     next_token_logits: torch.Tensor,
     temperatures: torch.Tensor,
     top_ks: Optional[torch.Tensor] = None,
+    *,
+    sampling_seed: Optional[torch.Tensor] = None,
+    positions: Optional[torch.Tensor] = None,
+    draft_step: int = 0,
 ):
     """Leviathan draft proposal: q = softmax(logits / T), X ~ q.
 
@@ -192,7 +249,13 @@ def sample_draft_proposal(
     which is what greedy means. Drop that renorm and this stops holding.
     """
     probs = sampling_softmax(next_token_logits, temperatures=temperatures)
-    topk_p, topk_index = fast_sample(probs, num_samples=1)
+    topk_p, topk_index = fast_sample(
+        probs,
+        num_samples=1,
+        sampling_seed=sampling_seed,
+        positions=positions,
+        draft_step=draft_step,
+    )
     if top_ks is not None:
         # Assert rather than skip on a device mismatch: a host-side top_ks would
         # make this correction silently vanish, and the symptom -- draft accept
@@ -351,20 +414,6 @@ def spec_need_hidden_states() -> bool:
     return not spec.enable_multi_layer_eagle
 
 
-@torch.compile(dynamic=True, disable=_is_npu or _is_xpu)
-def create_num_accept_tokens_filter(
-    num_correct_drafts: torch.Tensor,
-    unfinished_index_device: torch.Tensor,
-    seq_lens: torch.Tensor,
-):
-    num_accept_tokens_filter = torch.zeros_like(num_correct_drafts)
-    num_accept_tokens_filter[unfinished_index_device] = (
-        num_correct_drafts[unfinished_index_device] + 1
-    )
-    seq_lens.add_(num_correct_drafts + 1)
-    return num_accept_tokens_filter
-
-
 def _select_top_k_tokens_first(
     topk_p: torch.Tensor,
     topk_index: torch.Tensor,
@@ -493,6 +542,18 @@ def generate_simulated_accept_index(
     simulate_acc_len = sample_simulated_acc_len(
         simulate_acc_len, simulate_acc_method, spec_steps + 1
     )
+
+    if _is_cuda and accept_index.is_cuda:
+        return simulated_accept(
+            accept_indices=accept_index,
+            predict_tokens=predict,
+            num_correct_drafts=num_correct_drafts,
+            candidate_tokens=candidates,
+            target_tokens=target_predict,
+            width=spec_steps + 1,
+            num_accept_tokens=simulate_acc_len,
+            real_tokens=use_real_draft_tokens,
+        )
 
     accept_indx_first_col = accept_index[:, 0].view(-1, 1)
     sim_accept_index = torch.full(
@@ -766,19 +827,26 @@ def draft_pp_context():
         yield
 
 
-def draft_tp_context(owns_attention: bool):
-    """Enter the TP placement that draft work runs under.
-
-    Work that owns attention (an attention-owning draft, or DSpark's DP-MoE
-    sync) runs on the target's attention-TP group; other draft work keeps the
-    target's TP placement. Enter it from outside any draft scope, where
-    ``attn_tp_group`` is still the target's.
-    """
-    if not owns_attention:
+def draft_tp_context(layout: DraftParallelLayout):
+    """Enter an already-resolved draft placement from outside any draft scope."""
+    if layout.tp_group is None:
         return contextlib.nullcontext()
-    return patch_tensor_parallel_group(
-        get_parallel().attn_tp_group, owns_attention=True
-    )
+    tp_context = patch_tensor_parallel_group(layout.tp_group, owns_attention=True)
+    if layout.disable_cp:
+        return _draft_without_cp(tp_context)
+    return tp_context
+
+
+@contextmanager
+def _draft_without_cp(tp_context):
+    with (
+        tp_context,
+        get_parallel().override(
+            enable_prefill_cp=False, enable_cp_tp_group_sharing=False
+        ),
+        disable_cp_strategy(),
+    ):
+        yield
 
 
 def spec_stage_span(name: str):
@@ -823,25 +891,14 @@ def move_accept_tokens_to_target_kvcache(
         device=device,
     )
     accept_out_cache_loc = torch.zeros(size, dtype=torch.int64, device=device)
-    if _is_cpu:
-        assign_extend_cache_locs_cpu(
-            batch.req_pool_indices,
-            batch.req_to_token_pool.req_to_token,
-            batch.seq_lens,
-            batch.seq_lens + num_correct_drafts + 1,
-            tgt_cache_loc,
-            batch.req_to_token_pool.req_to_token.shape[1],
-        )
-    else:
-        assign_extend_cache_locs[(bs,)](
-            batch.req_pool_indices,
-            batch.req_to_token_pool.req_to_token,
-            batch.seq_lens,
-            batch.seq_lens + num_correct_drafts + 1,
-            tgt_cache_loc,
-            batch.req_to_token_pool.req_to_token.shape[1],
-            next_power_of_2(bs),
-        )
+    # The targets lead each request's verify window. Read them from that window,
+    # not req_to_token: after verify's read-done the scheduler may hand a finished
+    # request's row to a new request.
+    fill_front_out_cache_loc_func(
+        num_correct_drafts + 1,
+        batch.out_cache_loc,
+        tgt_cache_loc,
+    )
     fill_accept_out_cache_loc_func(
         accept_index,
         batch.out_cache_loc,
@@ -993,7 +1050,7 @@ def commit_mamba_states_after_verify(
     ):
         if batch.forward_mode.is_idle() or accept_index.numel() == 0:
             return
-        from sglang.kernels.ops.attention.fla.gdn_replayssm_spec_fold import (
+        from sglang.kernels.ops.attention.linear.gdn_replayssm_spec_fold import (
             commit_gdn_replayssm_fold_after_verify,
         )
 
@@ -1029,7 +1086,7 @@ def commit_mamba_states_after_verify(
     ):
         if batch.forward_mode.is_idle() or accept_index.numel() == 0:
             return
-        from sglang.kernels.ops.attention.fla.gdn_replayssm_spec_decode import (
+        from sglang.kernels.ops.attention.linear.gdn_replayssm_spec_decode import (
             commit_gdn_replayssm_circular,
             commit_gdn_replayssm_spec,
         )
@@ -1114,7 +1171,7 @@ def commit_mamba_states_after_verify(
     ):
         if batch.forward_mode.is_idle() or accept_index.numel() == 0:
             return
-        from sglang.kernels.ops.attention.fla.kda_replayssm_spec_decode import (
+        from sglang.kernels.ops.attention.linear.kda_replayssm_spec_decode import (
             commit_kda_replayssm_after_verify,
         )
 

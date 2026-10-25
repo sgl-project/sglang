@@ -73,14 +73,17 @@ class Disagg(msgspec.Struct):
         bool,
         "Compute an Adler-32 checksum over each request's KV pages on prefill "
         "and verify it on decode. Enable on both prefill and decode engines. "
-        "A mismatch aborts the request, or raises in CI. Disabled by default.",
+        "A mismatch aborts the request, or raises in CI. With a decode-side "
+        "radix cache the digest covers only the pages prefill sends. A prefill "
+        "whose KV layout differs (TP width, PP stage, page size, dtype) is "
+        "admitted unverified with one warning. Disabled by default.",
     ] = False
     disaggregation_bootstrap_port: A[
         int, "Bootstrap server port on the prefill server. Default is 8998."
     ] = 8998
     disaggregation_ib_device: A[
         Optional[str],
-        'The InfiniBand devices for disaggregation transfer. Supports a single device (e.g., --disaggregation-ib-device mlx5_0), a shared comma-separated list (e.g., --disaggregation-ib-device mlx5_0,mlx5_1), a per-GPU JSON mapping (e.g., --disaggregation-ib-device \'{"0": "mlx5_0,mlx5_1", "1": "mlx5_2"}\'), or a path to a JSON file containing that mapping. Default is None, which triggers automatic device detection when mooncake backend is enabled.',
+        'The InfiniBand devices for disaggregation transfer. Supports a single device (e.g., --disaggregation-ib-device mlx5_0), a shared comma-separated list (e.g., --disaggregation-ib-device mlx5_0,mlx5_1), a per-GPU JSON mapping (e.g., --disaggregation-ib-device \'{"0": "mlx5_0,mlx5_1", "1": "mlx5_2"}\'), or a path to a JSON file containing that mapping. Supported by Mooncake and NIXL UCX. Mapping keys are process-visible GPU IDs (after CUDA_VISIBLE_DEVICES); use HCA names without port suffixes for NIXL UCX. For NIXL UCX, a non-empty UCX_NET_DEVICES takes precedence over this option, including per-GPU mappings. Default is None, which preserves backend device selection.',
     ] = None
     disaggregation_decode_enable_radix_cache: A[
         bool,
