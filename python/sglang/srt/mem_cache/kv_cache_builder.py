@@ -26,6 +26,8 @@ class KVCacheBuildResult:
 
 from typing import TYPE_CHECKING
 
+import torch
+
 from sglang.srt.configs.hybrid_arch import (
     glm5_next_config,
     hybrid_gdn_config,
@@ -58,7 +60,7 @@ from sglang.srt.runtime_context import (
     get_schedule,
 )
 from sglang.srt.speculative.base_spec_worker import HiCacheDraftMode
-from sglang.srt.utils import ceil_align, is_hip, is_npu
+from sglang.srt.utils import ceil_align, is_cuda, is_hip, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -183,6 +185,24 @@ def uses_ssm_state(model_config) -> bool:
     )
 
 
+def device_can_back_host_pool(device) -> bool:
+    """Whether the HiCache host pool can allocate pinned buffers for ``device``.
+
+    Devices without an entry in ``ALLOC_MEMORY_FUNCS`` fall back to
+    ``cudaHostRegister``, which only works on CUDA/ROCm. Elsewhere (CPU, and
+    out-of-tree devices that register no allocator) a host pool fails at
+    startup, so the default retraction backup must not pick it.
+    """
+    from sglang.srt.mem_cache.pool_host.common import ALLOC_MEMORY_FUNCS
+
+    device_type = device.type if isinstance(device, torch.device) else str(device)
+    device_type = device_type.split(":", 1)[0]
+    # ``in`` checks the explicit keys without creating a defaultdict entry.
+    if device_type in ALLOC_MEMORY_FUNCS:
+        return True
+    return device_type == "cuda" and (is_cuda() or is_hip())
+
+
 def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
     """Resolve the retraction backend onto the config bags and return it.
 
@@ -231,6 +251,7 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
             # Large ROCm retraction restores can fault the GPU process. Keep
             # host_pool opt-in on HIP until the retraction path is safe at scale.
             and not is_hip()
+            and device_can_back_host_pool(tp_worker.model_runner.device)
             and not get_parallel().dcp_enabled
             and not disagg.disaggregation_decode_enable_radix_cache
             # KV offload already owns a host pool; a second one double-books host memory.
