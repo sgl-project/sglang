@@ -18,6 +18,7 @@ class HostExpertStore:
 
     def __init__(self, layer, names: Sequence[str], num_experts: int, pin: bool = True):
         self.pin = pin
+        self._gather_args = None  # bound once the layer's tensors are final
         self.host: Dict[str, torch.Tensor] = {
             name: self._alloc(
                 shape=(num_experts, *getattr(layer, name).shape[1:]),
@@ -29,9 +30,17 @@ class HostExpertStore:
     def _alloc(self, shape, dtype: torch.dtype) -> torch.Tensor:
         return torch.empty(shape, dtype=dtype, device="cpu", pin_memory=self.pin)
 
-    def page_in(self, layer, loads: Sequence[Tuple[int, int]]) -> None:
-        """Copy each ``(expert, slot)`` pair's expert, of every paged tensor, into its slot."""
+    def page_in(self, layer, loads: Sequence[Tuple[int, int]], plan=None) -> None:
+        """Copy each ``(expert, slot)`` pair's expert, of every paged tensor, into its slot:
+        with ``plan``, the same pairs as GPU ``(src, dst, count)``, in one gather launch."""
+        if not loads:
+            return
+        if plan is not None and self._gather_args is not None:
+            self.gather(*plan)
+            return
         for name, host in self.host.items():
+            if host.numel() == 0:
+                continue  # e.g. GPTQ without act-order keeps empty g_idx tensors
             gpu = getattr(layer, name).data
             for expert, slot in loads:
                 gpu[slot].copy_(host[expert], non_blocking=True)

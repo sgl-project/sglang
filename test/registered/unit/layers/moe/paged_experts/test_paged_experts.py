@@ -511,7 +511,7 @@ class TestResidency(CustomTestCase):
         state.step.fill_(8)
         policy = LRUPolicy(4)
 
-        state.load_into(policy)
+        state.load_into(policy, state.readback.clone())
         self.assertEqual(
             list(policy.resident.items()), [(2, 1), (5, 3), (9, 0), (7, 2)]
         )

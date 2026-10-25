@@ -61,39 +61,60 @@ def plan_waves(policy: LRUPolicy, distinct: List[int]) -> List[Wave]:
 
 class DeviceResidency:
     """The LRU residency state on the GPU, which the decide kernel updates in place, plus the
-    buffers of its page-in plan. Slots start holding experts 0..K-1, like ``LRUPolicy``."""
+    buffers of its page-in plan. Slots start holding experts 0..K-1, like ``LRUPolicy``.
+
+    The state is one packed buffer, ``[slot_expert K | slot_lastuse K | step 1 | counts E+1 |
+    expert_slot E]``, so a host-planned step reads it with the step's per-expert routing counts
+    in one copy (``readback``) and writes it back in one (``store_from``)."""
 
     def __init__(self, num_experts: int, num_slots: int, device):
         i32 = dict(dtype=torch.int32, device=device)
-        self.step = torch.zeros(1, **i32)
-        self.slot_expert = torch.arange(num_slots, **i32)
-        self.expert_slot = torch.full((num_experts,), -1, **i32)
+        self.num_experts = num_experts
+        self.num_slots = num_slots
+        self.state = torch.zeros(2 * num_slots + 1 + 2 * num_experts + 1, **i32)
+        (
+            self.slot_expert,
+            self.slot_lastuse,
+            self.step,
+            self.counts,
+            self.expert_slot,
+        ) = self.state.split([num_slots, num_slots, 1, num_experts + 1, num_experts])
+        self.slot_expert.copy_(torch.arange(num_slots))
+        self.expert_slot.fill_(-1)
         self.expert_slot[:num_slots] = self.slot_expert
-        self.slot_lastuse = torch.zeros(num_slots, **i32)
         self.src = torch.zeros(num_slots, **i32)
         self.dst = torch.zeros(num_slots, **i32)
         self.count = torch.zeros(1, **i32)
+        self._step = 0  # the step the last ``load_into`` read
 
-    def load_into(self, policy: LRUPolicy) -> None:
-        """Make ``policy`` hold this state: the same residents, least recently used first."""
-        experts = self.slot_expert.tolist()
-        lastuse = self.slot_lastuse.tolist()
-        order = sorted(range(len(experts)), key=lambda s: (lastuse[s], s))
+    @property
+    def readback(self) -> torch.Tensor:
+        """What a host-planned step reads: the LRU state and ``counts``."""
+        return self.state[: 2 * self.num_slots + 2 + self.num_experts]
+
+    def load_into(self, policy: LRUPolicy, host: torch.Tensor) -> None:
+        """Make ``policy`` hold this state, from ``host``, a host copy of ``readback``: the same
+        residents, least recently used first."""
+        k = self.num_slots
+        experts = host[:k].tolist()
+        lastuse = host[k : 2 * k].tolist()
+        self._step = int(host[2 * k])
+        order = sorted(range(k), key=lambda s: (lastuse[s], s))
         policy.resident = OrderedDict((experts[s], s) for s in order)
 
     def store_from(self, policy: LRUPolicy) -> None:
-        """Make this state hold ``policy``'s, its recency order as the last steps."""
-        num_slots = self.slot_expert.numel()
-        base = int(self.step.item())
-        slot_expert = [0] * num_slots
-        lastuse = [0] * num_slots
+        """Make this state hold ``policy``'s, its recency order as the last steps, in one
+        upload that does not wait for the GPU."""
+        k = self.num_slots
+        slot_expert, lastuse = [0] * k, [0] * k
+        expert_slot = [-1] * self.num_experts
         for rank, (expert, slot) in enumerate(policy.resident.items(), start=1):
             slot_expert[slot] = expert
-            lastuse[slot] = base + rank
-        self.slot_expert.copy_(torch.tensor(slot_expert, dtype=torch.int32))
-        self.slot_lastuse.copy_(torch.tensor(lastuse, dtype=torch.int32))
-        self.expert_slot.fill_(-1)
-        self.expert_slot[self.slot_expert.long()] = torch.arange(
-            num_slots, dtype=torch.int32, device=self.expert_slot.device
-        )
-        self.step.fill_(base + num_slots)
+            lastuse[slot] = self._step + rank
+            expert_slot[expert] = slot
+        state = slot_expert + lastuse + [self._step + k]
+        state += [0] * (self.num_experts + 1) + expert_slot
+        host = torch.tensor(state, dtype=torch.int32)
+        if self.state.is_cuda:
+            host = host.pin_memory()
+        self.state.copy_(host, non_blocking=True)

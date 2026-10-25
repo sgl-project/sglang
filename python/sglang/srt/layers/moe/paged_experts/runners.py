@@ -46,9 +46,10 @@ class RunnerContract:
     #: experts into; the step then runs over the host store K experts at a time.
     repacks: bool = False
 
-    def run_wave(self, base_method, layer, dispatch_output, slots, merged):
-        """Compute the routed entries of one wave (``slots`` >= 0) into ``merged``, the step's
-        ``[tokens, top_k, hidden]`` entries (None before its first wave), and return it."""
+    def run_wave(self, base_method, layer, dispatch_output, slots, entries, merged):
+        """Compute the routed entries of one wave (``slots`` >= 0; ``entries`` lists their flat
+        indices in order) into ``merged``, the step's ``[tokens, top_k, hidden]`` entries (None
+        before its first wave), and return it."""
         raise NotImplementedError
 
     def finish(self, merged, hidden_states, routed_scaling_factor: float):
@@ -64,7 +65,7 @@ class RunnerContract:
 
 
 class TritonContract(RunnerContract):
-    def run_wave(self, base_method, layer, dispatch_output, slots, merged):
+    def run_wave(self, base_method, layer, dispatch_output, slots, entries, merged):
         config = runner_of(base_method, layer).config
         skips = (
             config.num_experts is None or config.num_experts != config.num_local_experts
@@ -92,14 +93,13 @@ class TritonContract(RunnerContract):
 class MarlinContract(RunnerContract):
     repacks = True
 
-    def run_wave(self, base_method, layer, dispatch_output, slots, merged):
+    def run_wave(self, base_method, layer, dispatch_output, slots, entries, merged):
         # Only the wave's entries, compacted: the runner sees no masked rows.
         hidden_states = dispatch_output.hidden_states
         assert (
             dispatch_output.hidden_states_scale is None
             and dispatch_output.hidden_states_pre_quant is None
         ), "Paged experts: compacted waves need unquantized MoE inputs"
-        entries = (slots >= 0).flatten().nonzero().squeeze(1)
         num = entries.numel()
         if num == 0:
             return merged

@@ -173,14 +173,21 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
             repacks=self.contract.repacks,
             unpaged=self.format.unpaged,
         )
+        device = getattr(layer, next(iter(self.store.host))).device
+        if device.type == "cuda" and self.store.pin:
+            try:
+                # Host-planned waves page in through the gather kernel too.
+                self.store.bind_device_gather(layer)
+            except RuntimeError:
+                if self.graphs:
+                    raise
         residency = None
         if self.graphs:
             residency = DeviceResidency(
                 num_experts=self.num_experts,
                 num_slots=self.num_resident,
-                device=getattr(layer, next(iter(self.store.host))).device,
+                device=device,
             )
-            self.store.bind_device_gather(layer)
             self.device_executor = DeviceExecutor(
                 base_method=self.format.runner_method(self.base_method),
                 store=self.store,

@@ -157,6 +157,53 @@ class TestPagedExpertsKernels(CustomTestCase):
                 self.assertTrue(torch.equal(gpu[s].cpu(), host[e]))
 
 
+    def test_a_planned_page_in_matches_the_copies(self):
+        """A host-planned wave paged in through its GPU plan, in one gather launch, leaves the
+        same slots as one copy per expert and tensor; an empty wave launches nothing."""
+        from sglang.srt.layers.moe.paged_experts.store import HostExpertStore
+
+        def layer():
+            module = torch.nn.Module()
+            for name, shape, dtype in (
+                ("w13_weight", (K, 8, 32), torch.bfloat16),
+                ("w13_weight_scale", (K, 3), torch.float32),
+                ("w2_g_idx", (K, 0), torch.int32),  # empty, as GPTQ without act-order
+            ):
+                module.register_parameter(
+                    name,
+                    torch.nn.Parameter(
+                        torch.zeros(shape, dtype=dtype, device="cuda"),
+                        requires_grad=False,
+                    ),
+                )
+            return module
+
+        planned, copied = layer(), layer()
+        names = [name for name, _ in planned.named_parameters()]
+        store = HostExpertStore(planned, names, E)
+        for host in store.host.values():
+            host.copy_(torch.randn(host.shape).to(host.dtype))
+        store.bind_device_gather(planned)
+        loads = [(5, 2), (63, 0), (17, 15)]
+        plan = (
+            torch.tensor([5, 63, 17] + [0] * (K - 3), dtype=torch.int32).cuda(),
+            torch.tensor([2, 0, 15] + [0] * (K - 3), dtype=torch.int32).cuda(),
+            torch.tensor([3], dtype=torch.int32, device="cuda"),
+        )
+
+        store.page_in(planned, loads, plan=plan)
+        stale = (plan[0].flip(0), plan[1], plan[2])  # would put other experts in the slots
+        store.page_in(planned, [], plan=stale)  # no page-ins: the plan is not read
+        store.page_in(copied, loads)
+        torch.cuda.synchronize()
+
+        for name in names:
+            self.assertTrue(
+                torch.equal(getattr(planned, name).data, getattr(copied, name).data)
+            )
+        self.assertTrue(planned.w13_weight.data[2].any())
+
+
 def _gather_args(hosts, gpus):
     return [
         torch.tensor(v, dtype=torch.int64, device="cuda")
