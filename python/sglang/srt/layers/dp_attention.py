@@ -978,6 +978,11 @@ def _note_dp_gather_in_prefill_graph() -> None:
         dp.prefill_graph_has_dp_gather = True
 
 
+def note_shared_bucket_in_prefill_graph() -> None:
+    """For collectives that need the same token count on every DP rank."""
+    _note_dp_gather_in_prefill_graph()
+
+
 def note_rank_barrier_in_prefill_graph() -> None:
     """For breaks that capture graphs of their own behind TP-group barriers."""
     dp = get_flags().dp
