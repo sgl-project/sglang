@@ -206,6 +206,50 @@ def test_local_capture_error_still_rendezvous_then_propagates_original(runtime, 
     unchanged(runtime, {})
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("native_forward_ct", -1),
+        ("native_forward_ct", False),
+        ("attention_dp_rank", True),
+        ("attention_dp_rank", 1),
+        ("_forward_id", -1),
+        ("_forward_id", False),
+        ("_draft_buffer_capacity", -1),
+        ("_draft_buffer_capacity", False),
+        ("topology", DSparkTopology(2, 1)),
+    ],
+)
+def test_bad_local_metadata_still_rendezvous(runtime, peers, monkeypatch, field, value):
+    group, _ = peers
+    peer = {
+        "forward_id": 0,
+        "native_forward_ct": 7,
+        "runtime_profile_json": runtime.runtime_profile_json,
+        "group": capture(runtime, group).groups[1],
+    }
+    group.calls = 0
+
+    def rendezvous(value):
+        group.calls += 1
+        return [value, peer]
+
+    monkeypatch.setattr(group, "all_gather_object", rendezvous)
+    kwargs = {"attention_dp_rank": 0, "native_forward_ct": 7}
+    if field in kwargs:
+        kwargs[field] = value
+    else:
+        setattr(runtime, field, value)
+    before = copy.copy(runtime.__dict__)
+    with pytest.raises(PredictorError, match="explicit before-work state"):
+        capture_native_dp_peer_step(runtime, batch(), tp_group=group, **kwargs)
+    assert group.calls == 1
+    assert runtime.__dict__ == before
+    assert runtime.session._history == {}
+    assert runtime.session.cost_model.calls == runtime.session.progress_model.calls == 0
+    assert runtime.session._last_forward_id == -1
+
+
 def test_actual_mixed_partitions_remain_rejected(runtime, peers):
     group, peer = peers
     peer.forward_mode.name = "DECODE"

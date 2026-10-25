@@ -44,25 +44,33 @@ def capture_native_dp_peer_step(
         and type(tp_group.ranks) is list
         and all(type(rank) is int for rank in tp_group.ranks)
         and len(tp_group.ranks) == len(set(tp_group.ranks)) == 2
-        and type(attention_dp_rank) is int
-        and attention_dp_rank in (0, 1)
         and type(tp_group.rank_in_group) is int
-        and tp_group.rank_in_group == attention_dp_rank
+        and tp_group.rank_in_group in (0, 1)
         and tp_group.cpu_group is not None,
         "peer exchange requires the actual two-rank native CPU TP group",
     )
-    _require(
-        runtime.topology == DSparkTopology(2, 2)
-        and type(native_forward_ct) is int
-        and native_forward_ct >= 0
-        and type(runtime._forward_id) is int
-        and runtime._forward_id >= 0
-        and type(runtime._draft_buffer_capacity) is int
-        and runtime._draft_buffer_capacity >= 0,
-        "peer exchange requires TP2/ADP2/PP1 and explicit before-work state",
+    payload = dict.fromkeys(
+        ("forward_id", "native_forward_ct", "runtime_profile_json", "group")
     )
-    local, capture_error = None, None
+    capture_error = None
     try:
+        _require(
+            runtime.topology == DSparkTopology(2, 2)
+            and type(attention_dp_rank) is int
+            and attention_dp_rank == tp_group.rank_in_group
+            and type(native_forward_ct) is int
+            and native_forward_ct >= 0
+            and type(runtime._forward_id) is int
+            and runtime._forward_id >= 0
+            and type(runtime._draft_buffer_capacity) is int
+            and runtime._draft_buffer_capacity >= 0,
+            "peer exchange requires TP2/ADP2/PP1 and explicit before-work state",
+        )
+        payload.update(
+            forward_id=runtime._forward_id,
+            native_forward_ct=native_forward_ct,
+            runtime_profile_json=runtime.runtime_profile_json,
+        )
         local = runtime._capture_local_group(
             batch, attention_dp_rank=attention_dp_rank, reference=reference
         )
@@ -76,16 +84,11 @@ def capture_native_dp_peer_step(
                 }
             ),
         )
+        payload["group"] = local
     except Exception as error:  # noqa: BLE001 - rendezvous, then re-raise unchanged
         # Both real ranks must reach the rendezvous even if one local capture
         # fails. A missing group makes every participant reject before costs.
         capture_error = error
-    payload = {
-        "forward_id": runtime._forward_id,
-        "native_forward_ct": native_forward_ct,
-        "runtime_profile_json": runtime.runtime_profile_json,
-        "group": local,
-    }
     peers = tp_group.all_gather_object(payload)
     if capture_error is not None:
         raise capture_error
