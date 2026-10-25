@@ -674,7 +674,14 @@ class UlyssesAttention_VSA(UlyssesAttention):
         return output
 
     def _new_bcg_output(
-        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *args, **kwargs
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        replicated_q: torch.Tensor | None = None,
+        replicated_k: torch.Tensor | None = None,
+        replicated_v: torch.Tensor | None = None,
+        gate_compress: torch.Tensor | None = None,
     ) -> torch.Tensor:
         return _new_attention_output(q, v)
 
@@ -1610,15 +1617,27 @@ class USPAttention(nn.Module):
         k: torch.Tensor,
         v: torch.Tensor,
         attn_mask: torch.Tensor | None = None,
-        *args,
+        num_replicated_prefix: int = 0,
+        num_replicated_suffix: int = 0,
+        num_replicated_kv_prefix: int = 0,
+        skip_sequence_parallel_override: bool = False,
+        attn_mask_meta: dict | None = None,
+        qkv_pre_all_to_all: bool = False,
+        seq_lens: list[int] | None = None,
         q_prefix: torch.Tensor | None = None,
-        **kwargs,
+        k_prefix: torch.Tensor | None = None,
+        v_prefix: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        # The masked local path attends over the segmented prefix rows too.
-        num_tokens = q.shape[1]
+        batch, rows, heads = q.shape[:3]
+        ulysses = get_ulysses_parallel_world_size()
+        skip_sp = self.skip_sequence_parallel or skip_sequence_parallel_override
+        if qkv_pre_all_to_all and not skip_sp and ulysses > 1:
+            # q arrives head-sharded; the output all-to-all shards it by rows.
+            rows, heads = rows // ulysses, heads * ulysses
         if q_prefix is not None and attn_mask is not None:
-            num_tokens += q_prefix.shape[1]
-        return q.new_empty((q.shape[0], num_tokens, q.shape[2], v.shape[-1]))
+            # The masked local path attends over the segmented prefix rows too.
+            rows += q_prefix.shape[1]
+        return q.new_empty((batch, rows, heads, v.shape[-1]))
 
     def _pipelined_ulysses(
         self,
@@ -2394,7 +2413,8 @@ def _make_breakable_attention_forward(forward_method):
     def bcg_forward(self, out, *args, **kwargs):
         result = forward_method(self, *args, **kwargs)
         outs, results = (out, result) if isinstance(out, tuple) else ((out,), (result,))
-        for dst, src in zip(outs, results):
+        for dst, src in zip(outs, results, strict=True):
+            assert (dst is None) == (src is None), "BCG attention output mispredicted"
             if dst is not None:
                 dst.copy_(src)
 
