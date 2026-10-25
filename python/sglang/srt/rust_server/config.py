@@ -17,6 +17,8 @@ from sglang.srt.entrypoints.v1_loads import (
 from sglang.srt.environ import envs
 from sglang.srt.managers.load_snapshot import ShmLoadSnapshotWriter
 from sglang.srt.managers.utils import compute_num_reserved_tokens
+from sglang.srt.observability.metrics_collector import tokenizer_metric_labels
+from sglang.srt.observability.utils import generate_buckets
 from sglang.srt.runtime_context import (
     get_device,
     get_disagg,
@@ -30,6 +32,7 @@ from sglang.srt.runtime_context import (
     get_serving,
     get_spec,
 )
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
 from sglang.srt.utils.common import build_server_info
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
@@ -47,6 +50,7 @@ def _build_server_args(
     *,
     extension: Optional[ModuleType] = None,
     health_generate_headers: Optional[Dict[str, str]] = None,
+    default_max_new_tokens: Optional[int] = SamplingParams().max_new_tokens,
 ) -> ServerArgs:
     """The typed launch configuration for the scheduler's embedded Rust server:
     the ``server_args`` fields it reads, the already-resolved
@@ -115,6 +119,10 @@ def _build_server_args(
         revision=get_model().revision,
         load_format=get_model().load_format,
         weight_version=get_serving().weight_version,
+        hicache_storage_backend=get_memory().hicache_storage_backend,
+        hicache_storage_backend_extra_config=get_memory().hicache_storage_backend_extra_config,
+        hicache_storage_prefetch_policy=get_memory().hicache_storage_prefetch_policy,
+        hicache_write_policy=get_memory().hicache_write_policy,
         host=get_serving().host,
         port=get_serving().port,
         # The shared field is also populated for legacy SMG mode; only forward
@@ -158,13 +166,18 @@ def _build_server_args(
             if get_serving().preferred_sampling_params is not None
             else None
         ),
+        default_max_new_tokens=default_max_new_tokens,
         lora_ids={
             ref.lora_name: ref.lora_id
             for ref in (get_lora().lora_paths or [])
             if ref.lora_name is not None
         },
         enable_strict_thinking=get_serving().enable_strict_thinking,
-        limit_mm_data_per_request=get_mm().limit_mm_data_per_request or {},
+        # A list of pairs keeps the configured order, which decides the error
+        # when several modalities are over their limit.
+        limit_mm_data_per_request=list(
+            (get_mm().limit_mm_data_per_request or {}).items()
+        ),
         allow_auto_truncate=get_serving().allow_auto_truncate,
         enable_return_hidden_states=sa.enable_return_hidden_states,
         # Not a `server_args` field: `TokenizerManager` derives it, and the
@@ -185,13 +198,34 @@ def _build_server_args(
         load_snapshot_dp_rank=shm_writer.dp_rank if shm_writer else 0,
         accelerator=_accelerator_name(),
         num_accelerators=_num_accelerators_per_dp_rank(),
+        metrics=(
+            _build_metrics_config(ext) if get_observability().enable_metrics else None
+        ),
+    )
+
+
+def _build_metrics_config(ext: ModuleType):
+    """What the Rust server needs to record ``TokenizerMetricsCollector``'s
+    families as Python does, and where every process's samples live."""
+    obs = get_observability()
+
+    def token_buckets(rule: Optional[List[str]]) -> Optional[List[float]]:
+        # The default rule keeps the Rust side's copy of Python's defaults.
+        if not rule or rule[0] == "default":
+            return None
+        return generate_buckets(rule, [])
+
+    return ext.MetricsConfig(
         # Every process writes its prometheus_client samples under this
         # directory (set before the schedulers start); `/metrics` merges them.
-        metrics=(
-            ext.MetricsConfig(multiproc_dir=os.environ["PROMETHEUS_MULTIPROC_DIR"])
-            if get_observability().enable_metrics
-            else None
-        ),
+        multiproc_dir=os.environ["PROMETHEUS_MULTIPROC_DIR"],
+        labels=tokenizer_metric_labels(),
+        priority_label=get_schedule().enable_priority_scheduling,
+        bucket_time_to_first_token=obs.bucket_time_to_first_token,
+        bucket_inter_token_latency=obs.bucket_inter_token_latency,
+        bucket_e2e_request_latency=obs.bucket_e2e_request_latency,
+        bucket_prompt_tokens=token_buckets(obs.prompt_tokens_buckets),
+        bucket_generation_tokens=token_buckets(obs.generation_tokens_buckets),
     )
 
 

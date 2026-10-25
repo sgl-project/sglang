@@ -298,7 +298,7 @@ def test_hopper_combine_norm(num_tokens):
         norm,
     )
     actual = model_mhc.combine(hc, model_mhc.HcState(x, pre))
-    expected = norm(mhc.hc_combine(x.flatten(1), pre, 4, x.dtype))
+    expected = norm(mhc.mhc_combine(x.flatten(1), pre, 4, x.dtype))
     torch.testing.assert_close(actual, expected, rtol=1 / 128, atol=1e-5)
 
 

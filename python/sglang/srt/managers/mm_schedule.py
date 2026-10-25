@@ -655,7 +655,15 @@ def _get_chunked_prefill_embedding(
 def _get_multimodal_mask(
     input_ids: torch.Tensor, placeholder_tensor: torch.Tensor
 ) -> torch.Tensor:
-    return torch.isin(input_ids, placeholder_tensor).unsqueeze(-1)
+    # placeholder_tensor arrives sorted from embed_mm_inputs. torch.isin
+    # brute-forces only while P < 10 * N**0.145 (P placeholders, N ids); past
+    # that it sorts with unique(), whose count syncs the host. The sorted
+    # lookup never syncs.
+    assert placeholder_tensor.numel() > 0
+    placeholders = placeholder_tensor.to(input_ids.dtype)
+    idx = torch.searchsorted(placeholders, input_ids)
+    idx.clamp_(max=placeholders.numel() - 1)
+    return (placeholders[idx] == input_ids).unsqueeze(-1)
 
 
 def _count_mm_tokens_in_extend(

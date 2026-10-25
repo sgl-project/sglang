@@ -161,7 +161,7 @@ def is_cuda():
 
 @lru_cache(maxsize=1)
 def is_cuda_alike():
-    return is_cuda() or is_hip()
+    return is_cuda() or is_hip() or is_sail()
 
 
 @lru_cache(maxsize=1)
@@ -237,6 +237,11 @@ def is_musa() -> bool:
 @lru_cache(maxsize=1)
 def is_mps() -> bool:
     return hasattr(torch, "mps") and torch.mps.is_available()
+
+
+@lru_cache(maxsize=1)
+def is_sail() -> bool:
+    return torch.cuda.is_available() and "ZW" in torch.cuda.get_device_name()
 
 
 def is_float4_e2m1fn_x2(dtype) -> bool:
@@ -387,18 +392,6 @@ def is_flashinfer_available():
     if not get_bool_env_var("SGLANG_IS_FLASHINFER_AVAILABLE", default="true"):
         return False
     return importlib.util.find_spec("flashinfer") is not None and is_cuda()
-
-
-@lru_cache(maxsize=1)
-def is_tokenspeed_mla_available():
-    """
-    Check whether the tokenspeed_mla CuTe DSL kernels are available.
-    Only available on NVIDIA Blackwell (SM100) at the moment.
-    """
-    return (
-        importlib.util.find_spec("tokenspeed_mla") is not None
-        and is_blackwell_supported()
-    )
 
 
 def is_nvidia_cublas_version_ge_12_9():
@@ -677,6 +670,12 @@ def is_device_stream_capturing(device: torch.device) -> bool:
     if not current_platform.capabilities.graph_capture:
         return False
     return torch.get_device_module(device).is_current_stream_capturing()
+
+
+def create_device_event(device):
+    if not isinstance(device, torch.device):
+        device = torch.device(device)
+    return torch.get_device_module(device).Event()
 
 
 def get_amdgpu_memory_capacity():
@@ -1036,14 +1035,21 @@ def get_device_name(device_id: int = 0) -> str:
 
 @lru_cache(maxsize=1)
 def is_mnnvl_fabric_device() -> bool:
-    """Whether the GPU sits on an MNNVL fabric (cross-node NVLink), keyed on
-    the device name: the GB200/GB300 superchips. Used to auto-select
-    fabric-dependent communication paths (NCCL cuMem/MNNVL, custom all-reduce
-    v2 multinode, DCP fi_a2a)."""
+    """Whether the GPU sits on an MNNVL fabric (cross-node NVLink). Used to
+    auto-select fabric-dependent communication paths (NCCL cuMem/MNNVL, custom
+    all-reduce v2 multinode, DCP fi_a2a).
+
+    The GB200/GB300 superchips are recognized by device name. Other NVLink
+    fabric parts (SM107 systems report a generic device name) are recognized
+    by NVML: the GPU has completed NVLink fabric registration."""
     if not (hasattr(torch, "cuda") and torch.cuda.is_available()):
         return False
     name = (torch.cuda.get_device_name(0) or "").upper()
-    return any(tag in name for tag in ("GB200", "GB300"))
+    if any(tag in name for tag in ("GB200", "GB300")):
+        return True
+    from sglang.srt.utils.cuda_vmm_utils import is_gpu_fabric_ready
+
+    return is_gpu_fabric_ready(torch.device("cuda", 0))
 
 
 def is_fi_a2a_supported(
@@ -2844,111 +2850,6 @@ def add_prometheus_middleware(app):
     app.routes.append(metrics_route)
 
 
-class RefCountedGauge:
-    def __init__(self, gauge):
-        self._gauge = gauge
-        self._refcount: Dict[str, int] = {}
-
-    def inc(self, key: str):
-        if key in self._refcount:
-            self._refcount[key] += 1
-        else:
-            self._refcount[key] = 1
-            self._gauge.inc()
-
-    def dec(self, key: str):
-        if key in self._refcount:
-            self._refcount[key] -= 1
-            if self._refcount[key] == 0:
-                del self._refcount[key]
-                self._gauge.dec()
-
-
-def add_prometheus_track_response_middleware(
-    app, extra_labels: Optional[Dict[str, str]] = None
-):
-    from prometheus_client import Counter, Gauge
-
-    extra_labels = extra_labels or {}
-    extra_label_names = list(extra_labels.keys())
-
-    http_request_counter = Counter(
-        name="sglang:http_requests_total",
-        documentation="Total number of HTTP requests by endpoint and method",
-        labelnames=extra_label_names + ["endpoint", "method"],
-    )
-
-    http_response_counter = Counter(
-        name="sglang:http_responses_total",
-        documentation="Total number of HTTP responses by endpoint and status code",
-        labelnames=extra_label_names + ["endpoint", "status_code", "method"],
-    )
-
-    http_requests_active = Gauge(
-        name="sglang:http_requests_active",
-        documentation="Number of currently active HTTP requests",
-        labelnames=extra_label_names + ["endpoint", "method"],
-        multiprocess_mode="livesum",
-    )
-
-    routing_keys_active = RefCountedGauge(
-        Gauge(
-            name="sglang:routing_keys_active",
-            documentation="Number of unique routing keys with active requests",
-            multiprocess_mode="livesum",
-        )
-    )
-
-    # Fix: replace BaseHTTPMiddleware's call_next with a pure ASGI version
-    # that passes `receive` through, so request.is_disconnected() keeps working.
-    from sglang.srt.utils.http_middleware_patch import patch_app_http_middleware
-
-    patch_app_http_middleware(app)
-
-    @app.middleware("http")
-    async def track_http_status_code(request, call_next):
-        # With recording all requests, we have the risk of high cardinality if requests have arbitrary unhandled paths.
-        # But given that SGLang engines with metrics enabled are usually behind routers this looks safe.
-        path, is_handled_path = _get_fastapi_request_path(request)
-        method = request.method
-        routing_key = request.headers.get("x-smg-routing-key")
-
-        http_request_counter.labels(**extra_labels, endpoint=path, method=method).inc()
-        http_requests_active.labels(**extra_labels, endpoint=path, method=method).inc()
-        if routing_key:
-            routing_keys_active.inc(routing_key)
-
-        try:
-            response = await call_next(request)
-
-            http_response_counter.labels(
-                **extra_labels,
-                endpoint=path,
-                method=method,
-                status_code=str(response.status_code),
-            ).inc()
-
-            return response
-        finally:
-            http_requests_active.labels(
-                **extra_labels, endpoint=path, method=method
-            ).dec()
-            if routing_key:
-                routing_keys_active.dec(routing_key)
-
-
-# https://github.com/blueswen/fastapi-observability/blob/132a3c576f8b09e5311c68bd553215013bc75685/fastapi_app/utils.py#L98
-def _get_fastapi_request_path(request) -> Tuple[str, bool]:
-    from starlette.routing import Match
-
-    for route in request.app.routes:
-        match, child_scope = route.matches(request.scope)
-        if match == Match.FULL:
-            return getattr(route, "path", request.url.path), True
-
-    return request.url.path, False
-
-
 # Copy from pytorch and OpenRLHF to allow creating multiple main groups.
 # https://github.com/pytorch/pytorch/blob/main/torch/distributed/distributed_c10d.py
 # https://github.com/OpenRLHF/OpenRLHF/blob/main/openrlhf/utils/distributed_util.py
@@ -3094,8 +2995,9 @@ def direct_register_custom_op(
 
     try:
         my_lib.define(op_name + schema_str)
-        if is_npu():
+        if is_npu() or current_platform.is_out_of_tree():
             # https://github.com/sgl-project/sglang/pull/12287/files#r2499583982
+            # Out-of-tree devices are torch PrivateUse1 backends too.
             my_lib.impl(op_name, op_func, "PrivateUse1")
         elif is_xpu():
             my_lib.impl(op_name, op_func, "XPU")

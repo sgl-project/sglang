@@ -718,6 +718,17 @@ def detect_tool_call_parser(
     return match_rules(ctx, TOOL_CALL_PARSER_RULES, "tool-call parser")
 
 
+def is_glm53_template(template: Optional[str]) -> bool:
+    """True if ``template`` is a GLM-5.3 family chat template."""
+    if not template:
+        return False
+    return _is_glm53(
+        TemplateDetectionContext(
+            template=template, reasoning_config=None, force_reasoning=False, vocab=set()
+        )
+    )
+
+
 def detect_inline_system_support(chat_template: Optional[str]) -> bool:
     """True if mid-conversation ``role: "system"`` renders inline; False if the
     template raises or silently drops it (then merge into the leading block).
@@ -762,7 +773,6 @@ def _detect_auto_parser(
             f"Auto-detected --{attr.replace('_', '-')} as '{detected}' from chat template"
         )
         return detected
-    _log_undetected_parser(attr, label)
     return None
 
 
@@ -782,6 +792,48 @@ def _log_undetected_parser(attr: str, label: str) -> None:
         f"--{attr.replace('_', '-')}=auto specified but could not detect "
         f"{label} from chat template. Disabling {label}."
     )
+
+
+def _declare_python_template_parsers(server_args, template, needs) -> None:
+    """Resolve the ``auto`` parsers to the ones a Python chat template declares."""
+    detected = {attr: getattr(template, attr) for attr in needs}
+    for attr, value in detected.items():
+        logger.info(
+            f"Auto-detected --{attr.replace('_', '-')} as '{value}' from "
+            f"Python chat template '{template.name}'"
+        )
+    declare_resolution(server_args, "template-detection", **detected)
+
+
+def _checkpoint_python_chat_template(server_args, template):
+    """The Python chat template replacing the checkpoint's ``template``, if any.
+
+    Mirrors TemplateManager's selection when ``--chat-template`` is not set.
+    """
+    from sglang.srt.parser.python_chat_template import (
+        may_replace_jinja_template,
+        resolve_python_chat_template,
+    )
+
+    if not may_replace_jinja_template(template):
+        return None
+
+    cfg = resolving_view(server_args)
+    try:
+        from sglang.srt.utils.hf_transformers_utils import get_config
+
+        config = get_config(
+            cfg.model_path,
+            trust_remote_code=cfg.trust_remote_code,
+            revision=getattr(cfg, "revision", None),
+            model_config_parser=getattr(cfg, "model_config_parser", "auto"),
+        )
+    except Exception as e:
+        logger.warning(
+            "Failed to load model config to resolve a Python chat template: %s", e
+        )
+        return None
+    return resolve_python_chat_template(config, template)
 
 
 def _architecture_auto_parsers(server_args, needs: Tuple[str, ...]) -> Dict[str, str]:
@@ -871,7 +923,8 @@ def _architecture_parser_defaults(server_args) -> Dict[str, str]:
 
 
 def resolve_auto_parsers(server_args) -> None:
-    """Resolve architecture defaults and explicit ``auto`` parser requests.
+    """Resolve architecture defaults and explicit ``auto`` parser requests;
+    ``auto`` is detected from the chat template or checkpoint metadata.
 
     Performs a lightweight tokenizer load, so it runs once in engine init. The
     decision goes to this instance's declaration stash, so every holder of it
@@ -904,9 +957,19 @@ def resolve_auto_parsers(server_args) -> None:
     if not needs:
         return
 
+    chat_template_arg = getattr(cfg, "chat_template", None)
+    if isinstance(chat_template_arg, str):
+        from sglang.srt.parser.python_chat_template import get_python_chat_template
+
+        # A built-in Python chat template declares its parsers, so neither the
+        # tokenizer nor a Jinja source needs loading.
+        python_template = get_python_chat_template(chat_template_arg)
+        if python_template is not None:
+            _declare_python_template_parsers(server_args, python_template, needs)
+            return
+
     from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 
-    chat_template_arg = getattr(cfg, "chat_template", None)
     try:
         explicit_jinja_template = _load_explicit_jinja_template(chat_template_arg)
     except Exception as e:
@@ -919,8 +982,11 @@ def resolve_auto_parsers(server_args) -> None:
     tokenizer = None
     try:
         tokenizer = get_tokenizer(
-            cfg.model_path,
+            cfg.tokenizer_path,
+            tokenizer_mode=cfg.tokenizer_mode,
             trust_remote_code=cfg.trust_remote_code,
+            revision=cfg.revision,
+            tokenizer_backend=cfg.tokenizer_backend,
         )
     except Exception as e:
         logger.warning(f"Failed to load tokenizer for auto-detection: {e}")
@@ -928,6 +994,14 @@ def resolve_auto_parsers(server_args) -> None:
     template = explicit_jinja_template
     if template is None and tokenizer is not None:
         template = getattr(tokenizer, "chat_template", None)
+
+    # A Python chat template replacing the checkpoint's renders this model's
+    # prompts, so its declared parsers decide; the Jinja source is not consulted.
+    if chat_template_arg is None:
+        python_template = _checkpoint_python_chat_template(server_args, template)
+        if python_template is not None:
+            _declare_python_template_parsers(server_args, python_template, needs)
+            return
 
     force_reasoning, reasoning_config = detect_reasoning_pattern(template)
     ctx = build_detection_context(
@@ -955,7 +1029,6 @@ def resolve_auto_parsers(server_args) -> None:
             ("tool_call_parser", "tool-call parser"),
         ):
             if attr in needs and attr not in detected:
-                _log_undetected_parser(attr, label)
                 detected[attr] = None
     else:
         for attr, rules, label in (
@@ -964,6 +1037,43 @@ def resolve_auto_parsers(server_args) -> None:
         ):
             if attr in needs:
                 detected[attr] = _detect_auto_parser(attr, ctx, rules, label)
+
+    unresolved = tuple(attr for attr in needs if detected.get(attr) is None)
+    if unresolved and tokenizer is not None and chat_template_arg is None:
+        from sglang.srt.parser.response_template import (
+            resolve_response_template,
+            validate_response_template_for_serving,
+        )
+
+        response_template = resolve_response_template(tokenizer)
+        if response_template is not None:
+            try:
+                response_template = validate_response_template_for_serving(
+                    response_template
+                )
+            except (TypeError, ValueError) as exc:
+                logger.warning(
+                    "Ignoring invalid response_template from tokenizer configuration: %s",
+                    exc,
+                )
+            else:
+                for attr, field in (
+                    ("reasoning_parser", "thinking"),
+                    ("tool_call_parser", "tool_calls"),
+                ):
+                    if attr in unresolved and field in response_template.fields:
+                        detected[attr] = "response_template"
+                        logger.info(
+                            "Auto-detected --%s as 'response_template' from tokenizer configuration",
+                            attr.replace("_", "-"),
+                        )
+
+    for attr, label in (
+        ("reasoning_parser", "reasoning parser"),
+        ("tool_call_parser", "tool-call parser"),
+    ):
+        if attr in needs and detected.get(attr) is None:
+            _log_undetected_parser(attr, label)
 
     if detected:
         declare_resolution(server_args, "template-detection", **detected)
