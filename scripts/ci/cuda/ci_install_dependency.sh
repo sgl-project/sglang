@@ -86,7 +86,10 @@ configure_environment() {
         uv venv "$UV_VENV" --python "$CI_PYTHON_VER" --python-preference only-managed --seed
     else
         # Kept across jobs so installs stay incremental and path-keyed JIT caches hit.
-        UV_VENV="/opt/sglang-ci-py${CI_PYTHON_VER}"
+        # A runner can keep it off a slow root disk; not SGLANG_CI_VENV_PATH, which
+        # ci_cleanup_venv.sh deletes.
+        UV_VENV="${SGLANG_CI_KEPT_VENV_DIR:-/opt/sglang-ci-py${CI_PYTHON_VER}}"
+        mkdir -p "$(dirname "$UV_VENV")"
         # A cancelled install leaves dist-info that later installs treat as satisfied;
         # rebuild unless the last install ran to completion.
         UV_VENV_COMPLETE_MARKER="$UV_VENV/.install-complete"
