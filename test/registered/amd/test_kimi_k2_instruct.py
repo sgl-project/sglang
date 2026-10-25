@@ -17,7 +17,7 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-register_amd_ci(est_time=3600, suite="stage-c-test-large-8-gpu-amd")
+register_amd_ci(est_time=3600, suite="nightly-amd-8-gpu", nightly=True)
 
 KIMI_K2_MODEL_PATH = "moonshotai/Kimi-K2-Instruct-0905"
 SERVER_LAUNCH_TIMEOUT = 3600
