@@ -62,6 +62,7 @@ LOG_FORWARD_ITERS = envs.SGLANG_LOG_FORWARD_ITERS.get()
 _SPEC_DECODE_SNAPSHOT_ALGORITHMS = (
     SpeculativeAlgorithm.EAGLE,
     SpeculativeAlgorithm.EAGLE3,
+    SpeculativeAlgorithm.DFLASH,
     SpeculativeAlgorithm.DSPARK,
 )
 ENABLE_METRICS_DEVICE_TIMER = envs.SGLANG_ENABLE_METRICS_DEVICE_TIMER.get()

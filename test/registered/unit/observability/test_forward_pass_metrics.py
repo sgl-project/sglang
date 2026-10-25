@@ -170,6 +170,7 @@ class TestSpecDecodeLengthSnapshot(CustomTestCase):
         for algorithm in (
             SpeculativeAlgorithm.EAGLE,
             SpeculativeAlgorithm.EAGLE3,
+            SpeculativeAlgorithm.DFLASH,
             SpeculativeAlgorithm.DSPARK,
         ):
             with self.subTest(algorithm=algorithm):
