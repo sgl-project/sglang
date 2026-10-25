@@ -1,0 +1,1346 @@
+//! `/v1/chat/completions`, as `serving_chat.py` serves it. The host renders
+//! the prompt; this builds everything around it.
+
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
+use serde::Deserialize;
+use serde_json::{Map, Value, json};
+use sglang_api_types::api::v1::{
+    GenerateRequest, ImagesConfig, Int64List, SamplingParams, SamplingParamsOrList, TokenIds,
+    TokenIdsOrList, WatermarkRequestConfig, sampling_params_or_list, string_or_list,
+    token_ids_or_list,
+};
+
+use super::kimi_k3_tag::auto_tool_call_tag;
+use super::request::{
+    OneOrList, ResponseFormat, StreamOptions, custom_labels, default_model, format_json_schema,
+    lora_path, one, usage_flags, yes,
+};
+use super::wire::{
+    Payload, Reply, StreamState, http_status_name, malformed_output_reply, meta_u64, now,
+    stream_error_event, unary_reply,
+};
+use super::{OpenAiHeaders, OpenAiSettings, OpenAiTokenizer, Unsupported};
+use crate::py::python_json;
+use crate::think::{ReasoningOptions, ThinkConfig, ThinkDetector, think_config};
+use crate::tool_call::{ToolCallItem, ToolDetector, tool_call_id, tool_detector};
+
+/// Facts about the served model that Python's chat layer reads.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ChatModel {
+    /// `get_model().context_length`.
+    pub context_length: Option<u64>,
+    /// `model_config.get_default_sampling_params()` under `--sampling-defaults model`.
+    pub generation_config: Map<String, Value>,
+    /// The chat template always reasons: `template_detection` resolves its
+    /// reasoning config to `special_case="always"`.
+    #[serde(default)]
+    pub always_thinks: bool,
+    /// The kwarg that turns the chat template's reasoning on and off, with its
+    /// default: `template_detection`'s `toggle_param` and `default_enabled`.
+    #[serde(default)]
+    pub reasoning_toggle: Option<ReasoningToggle>,
+    /// `chat_encoding_spec`, the encoder SGLang renders the model with; the
+    /// OpenAI layer special-cases `"kimi_k3"`.
+    #[serde(default)]
+    pub chat_encoding_spec: Option<String>,
+}
+
+impl ChatModel {
+    fn is_kimi_k3(&self) -> bool {
+        self.chat_encoding_spec.as_deref() == Some("kimi_k3")
+    }
+}
+
+/// A chat template's reasoning toggle (`ReasoningToggleConfig`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReasoningToggle {
+    pub toggle_param: String,
+    pub default_enabled: bool,
+}
+
+impl ReasoningToggle {
+    /// `_get_reasoning_from_request` for this config.
+    fn enabled(&self, kwargs: &Map<String, Value>) -> bool {
+        let value = kwargs.get(&self.toggle_param);
+        match self.default_enabled {
+            true => value != Some(&Value::Bool(false)),
+            false => value == Some(&Value::Bool(true)),
+        }
+    }
+}
+
+/// `KimiK3Detector.eot_token`, which K3 requests with tools also stop on.
+const KIMI_K3_TOOLS_CLOSE: &str = "<|close|>tools<|sep|>";
+
+/// `_KIMI_K3_GENERATION_STUB_TOKENS`: K3's assistant generation stub is model
+/// input, but not reported as prompt tokens.
+const KIMI_K3_GENERATION_STUB_TOKENS: u64 = 3;
+
+/// `ChatCompletionRequest` with Pydantic's defaults, for the fields that reach
+/// `GenerateReqInput` or the response. A body this rejects goes to the engine.
+#[derive(Deserialize)]
+struct ChatRequest {
+    messages: Vec<Value>,
+    #[serde(default = "default_model")]
+    model: String,
+    #[serde(default)]
+    frequency_penalty: f64,
+    logit_bias: Option<HashMap<String, f64>>,
+    #[serde(default)]
+    logprobs: bool,
+    top_logprobs: Option<i64>,
+    max_tokens: Option<i64>,
+    max_completion_tokens: Option<i64>,
+    #[serde(default = "one")]
+    n: i64,
+    #[serde(default)]
+    presence_penalty: f64,
+    response_format: Option<ResponseFormat>,
+    seed: Option<i64>,
+    stop: Option<OneOrList<String>>,
+    #[serde(default)]
+    stream: bool,
+    stream_options: Option<StreamOptions>,
+    temperature: Option<f64>,
+    top_p: Option<f64>,
+    #[allow(dead_code)]
+    user: Option<String>,
+    top_k: Option<i64>,
+    min_p: Option<f64>,
+    #[serde(default)]
+    min_tokens: i64,
+    regex: Option<String>,
+    ebnf: Option<String>,
+    repetition_penalty: Option<f64>,
+    stop_token_ids: Option<Int64List>,
+    stop_regex: Option<OneOrList<String>>,
+    #[serde(default)]
+    no_stop_trim: bool,
+    #[serde(default)]
+    ignore_eos: bool,
+    #[serde(default)]
+    continue_final_message: bool,
+    #[serde(default = "yes")]
+    skip_special_tokens: bool,
+    lora_path: Option<OneOrList<Option<String>>>,
+    session_id: Option<String>,
+    #[serde(default = "yes")]
+    separate_reasoning: bool,
+    #[serde(default = "yes")]
+    stream_reasoning: bool,
+    chat_template_kwargs: Option<Map<String, Value>>,
+    custom_logit_processor: Option<OneOrList<Option<String>>>,
+    custom_params: Option<Map<String, Value>>,
+    watermark: Option<WatermarkRequestConfig>,
+    images_config: Option<ImagesConfig>,
+    rid: Option<OneOrList<String>>,
+    extra_key: Option<OneOrList<String>>,
+    cache_salt: Option<OneOrList<String>>,
+    priority: Option<i64>,
+    data_parallel_rank: Option<i64>,
+    bootstrap_host: Option<OneOrList<String>>,
+    bootstrap_port: Option<OneOrList<Option<i64>>>,
+    bootstrap_room: Option<OneOrList<i64>>,
+    routed_dp_rank: Option<i64>,
+    disagg_prefill_dp_rank: Option<i64>,
+}
+
+/// Fields that change behavior this module does not reproduce yet.
+const UNSUPPORTED_FIELDS: &[&str] = &[
+    "input_ids",
+    "return_hidden_states",
+    "return_routed_experts",
+    "return_cached_tokens_details",
+    "return_spec_tokens_details",
+    "return_prompt_token_ids",
+    "return_token_ids",
+    "return_meta_info",
+    "return_input_ids_in_sglext",
+    "return_output_ids_in_sglext",
+    "return_sampling_mask",
+    "return_flat_raw_output_top_logprobs",
+    "sampling_logprobs_mode",
+    "video_config",
+    "max_dynamic_patch",
+    "min_dynamic_patch",
+    "use_audio_in_video",
+];
+
+const TASKS: &[&str] = &[
+    "action",
+    "query",
+    "authority",
+    "domain",
+    "title",
+    "read_url",
+];
+
+const EFFORT_TIERS: &[&str] = &["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+/// `ChatCompletionMessageGenericParam` roles, matched case-insensitively.
+const GENERIC_ROLES: &[&str] = &[
+    "system",
+    "assistant",
+    "tool",
+    "function",
+    "developer",
+    "latest_reminder",
+];
+
+/// Lower a chat body into a `/generate` body, as
+/// `OpenAIServingChat._convert_to_internal_request` does. `render` returns the
+/// prompt's token ids for the body as sent, or `None` when it cannot.
+pub fn lower_chat(
+    body: &[u8],
+    headers: &OpenAiHeaders<'_>,
+    settings: &OpenAiSettings,
+    model: &ChatModel,
+    render: impl FnOnce(&Value) -> Option<Vec<u32>>,
+    tokenizer: Option<Arc<dyn OpenAiTokenizer>>,
+) -> Result<(GenerateRequest, ChatResponder), Unsupported> {
+    let original: Value =
+        serde_json::from_slice(body).map_err(|_| Unsupported("unparsed_request"))?;
+    let Value::Object(mut raw) = original.clone() else {
+        return Err(Unsupported("unparsed_request"));
+    };
+    if UNSUPPORTED_FIELDS
+        .iter()
+        .any(|field| raw.get(*field).is_some_and(|v| v != false))
+        || raw
+            .get("messages")
+            .and_then(Value::as_array)
+            .is_some_and(|m| m.iter().any(has_tools_or_media))
+    {
+        return Err(Unsupported("unsupported_chat_feature"));
+    }
+    let labels = custom_labels(headers, settings)?;
+    if settings.return_input_ids || settings.return_output_ids || headers.sglext_ids {
+        return Err(Unsupported("sglext_output"));
+    }
+    let parser = match settings.reasoning_parser.as_deref() {
+        Some(name) => Some(think_config(name).ok_or(Unsupported("reasoning_parser"))?),
+        None => None,
+    };
+    // `_process_messages`: glm47 constrains a request with tools, `"none"`
+    // included, by a grammar flagged `ebnf_full_assistant`, which `/generate`
+    // does not accept.
+    if settings.tool_call_parser.as_deref() == Some("glm47")
+        && raw
+            .get("tools")
+            .and_then(Value::as_array)
+            .is_some_and(|tools| !tools.is_empty())
+    {
+        return Err(Unsupported("tool_grammar"));
+    }
+    let tools = request_tools(&raw)?;
+    let tool_definitions = raw.get("tools").and_then(Value::as_array).cloned();
+    let parallel_tool_calls = raw.get("parallel_tool_calls") != Some(&Value::Bool(false));
+    let tool_parsing = match (
+        settings.tool_call_parser.as_deref(),
+        &tools,
+        &tool_definitions,
+    ) {
+        (Some(parser), Some(_), Some(definitions)) => {
+            tool_detector(parser, definitions).ok_or(Unsupported("tool_parser"))?;
+            Some((parser.to_owned(), definitions.clone()))
+        }
+        _ => None,
+    };
+    // Fields the typed request below does not read, typed as Pydantic types them.
+    let task = raw.get("task").filter(|t| !t.is_null());
+    if task.is_some_and(|t| !TASKS.iter().any(|task| t == task))
+        || raw
+            .get("session_params")
+            .is_some_and(|p| !p.is_object() && !p.is_null())
+    {
+        return Err(Unsupported("invalid_request"));
+    }
+    let thinking_kwarg = normalize_reasoning_inputs(&mut raw)?;
+    if raw
+        .get("reasoning_effort")
+        .is_some_and(|e| !valid_effort(e))
+    {
+        return Err(Unsupported("invalid_request"));
+    }
+    let mut request: ChatRequest =
+        serde_json::from_value(Value::Object(raw)).map_err(|_| Unsupported("unparsed_request"))?;
+    validate(&request, settings, model)?;
+    if request.logprobs && tokenizer.is_none() {
+        return Err(Unsupported("no_tokenizer"));
+    }
+    let prompt_ids = render(&original).ok_or(Unsupported("render"))?;
+
+    // `_process_messages`: the server's default kwargs fill in the request's.
+    let mut kwargs = request.chat_template_kwargs.take().unwrap_or_default();
+    if let Some(thinking) = thinking_kwarg {
+        kwargs.entry("thinking").or_insert(thinking.clone());
+        kwargs.entry("enable_thinking").or_insert(thinking);
+    }
+    kwargs.remove("reasoning_effort");
+    for (key, value) in settings.default_chat_template_kwargs.iter().flatten() {
+        kwargs.entry(key.clone()).or_insert_with(|| value.clone());
+    }
+    let thinking = match parser.and_then(|config| config.default_thinking(&kwargs)) {
+        Some(thinking) => thinking,
+        None => {
+            parser.is_some()
+                && match &model.reasoning_toggle {
+                    Some(toggle) => toggle.enabled(&kwargs),
+                    None => {
+                        model.always_thinks || kwargs.get("thinking") == Some(&Value::Bool(true))
+                    }
+                }
+        }
+    };
+    // `_patch_reasoning_skip_special_tokens`: K3's markers are special tokens.
+    let kimi_k3 = model.is_kimi_k3();
+    if kimi_k3 || settings.reasoning_parser.as_deref() == Some("kimi_k3") {
+        request.skip_special_tokens = false;
+    }
+    // `_process_messages`: tool output keeps the parser's special tokens.
+    if tools.is_some() {
+        request.skip_special_tokens = false;
+    }
+    // K3 also stops on its tool parser's `eot_token`.
+    let tool_call_stop = match &tool_parsing {
+        Some((parser, _)) if kimi_k3 => match parser.as_str() {
+            "kimi_k3" => Some(KIMI_K3_TOOLS_CLOSE),
+            _ => return Err(Unsupported("tool_parser")),
+        },
+        _ => None,
+    };
+    let previous_content = match request.messages.last() {
+        Some(last)
+            // Roles are compared lowercased, as Pydantic normalizes them.
+            if request.continue_final_message
+                && last["role"]
+                    .as_str()
+                    .is_some_and(|r| r.eq_ignore_ascii_case("assistant")) =>
+        {
+            // Python's reasoning parser raises on null content.
+            if last["content"].is_null() && parser.is_some() && request.separate_reasoning {
+                return Err(Unsupported("invalid_request"));
+            }
+            Some(last["content"].as_str().unwrap_or_default().to_owned())
+        }
+        _ => None,
+    };
+
+    let mut lowered = generate_body(
+        &request, &kwargs, model, prompt_ids, thinking, headers, settings,
+    )?;
+    lowered.custom_labels = labels;
+    // `get_structure_constraint`: K3's tool parser constrains `auto` calls by
+    // its structural tag, unless the request is already constrained; Python
+    // tests the constraints by truthiness, so empty strings are unset.
+    let Some(sampling_params_or_list::Value::One(sampling)) = lowered
+        .sampling_params
+        .as_mut()
+        .and_then(|p| p.value.as_mut())
+    else {
+        unreachable!("one sampling configuration")
+    };
+    if let (Some((tool_parser, _)), Some(definitions)) = (&tool_parsing, &tool_definitions)
+        && tool_parser == "kimi_k3"
+        && [&sampling.regex, &sampling.ebnf, &sampling.json_schema]
+            .iter()
+            .all(|value| value.as_deref().is_none_or(str::is_empty))
+    {
+        // `strip_structural_tag_excludes`: the reasoning parser owns the think tokens.
+        let strip = parser
+            .map(|config| config.think_tokens())
+            .unwrap_or_default();
+        let strip: Vec<&str> = strip.into_iter().filter(|t| !t.is_empty()).collect();
+        if let Some(tag) = auto_tool_call_tag(definitions, parallel_tool_calls, &strip)? {
+            sampling.structural_tag = Some(python_json(&tag, true));
+        }
+    }
+    if let Some(stop) = tool_call_stop {
+        let mut stops = match sampling.stop.take().and_then(|s| s.value) {
+            Some(string_or_list::Value::Many(stops)) => stops.items,
+            Some(string_or_list::Value::One(stop)) => vec![stop],
+            None => Vec::new(),
+        };
+        if !stops.iter().any(|s| s == stop) {
+            stops.push(stop.to_owned());
+        }
+        sampling.stop = Some(OneOrList::List(stops).into());
+    }
+    let (include_usage, continuous_usage_stats) =
+        usage_flags(request.stream_options.as_ref(), settings);
+    let reasoning = parser
+        .filter(|_| request.separate_reasoning)
+        .map(|config| ReasoningConfig {
+            think: config,
+            options: ReasoningOptions {
+                force_reasoning: Some(thinking),
+                stream_reasoning: request.stream_reasoning,
+                previous_content,
+                force_nonempty_content: kwargs.get("force_nonempty_content")
+                    == Some(&Value::Bool(true)),
+            },
+        });
+    let history_tool_calls = request
+        .messages
+        .iter()
+        .filter(|m| {
+            m["role"]
+                .as_str()
+                .is_some_and(|r| r.eq_ignore_ascii_case("assistant"))
+        })
+        .filter_map(|m| m["tool_calls"].as_array())
+        .map(|calls| calls.len() as i64)
+        .sum();
+    let responder = ChatResponder {
+        model: request.model,
+        unreported_prompt_tokens: if kimi_k3 {
+            KIMI_K3_GENERATION_STUB_TOKENS
+        } else {
+            0
+        },
+        history_tool_calls,
+        n: request.n as usize,
+        logprobs: request.logprobs,
+        reasoning,
+        tools: tool_parsing,
+        include_usage,
+        continuous_usage_stats,
+        settings: settings.clone(),
+        tokenizer,
+        created: now(),
+        stream: StreamState::default(),
+        roles_sent: HashSet::new(),
+        detectors: HashMap::new(),
+        finish_reasons: Vec::new(),
+        tool_detectors: HashMap::new(),
+        has_tool_calls: HashSet::new(),
+    };
+    Ok((lowered, responder))
+}
+
+/// The names of the tools a request lets the model call, or `None` when
+/// `tool_choice` turns them off. Only `auto` without strict tools is served:
+/// it adds no constraint, while the others depend on the engine's xgrammar.
+fn request_tools(raw: &Map<String, Value>) -> Result<Option<Vec<String>>, Unsupported> {
+    let choice = raw.get("tool_choice").filter(|c| !c.is_null());
+    if choice.is_some_and(|c| c != "auto" && c != "none")
+        || raw
+            .get("parallel_tool_calls")
+            .is_some_and(|p| !p.is_boolean())
+    {
+        return Err(Unsupported("tool_choice"));
+    }
+    let tools = match raw.get("tools") {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::Array(tools)) => tools,
+        Some(_) => return Err(Unsupported("invalid_request")),
+    };
+    let mut names = Vec::with_capacity(tools.len());
+    for tool in tools {
+        let function = &tool["function"];
+        let well_formed = tool.get("type").is_none_or(Value::is_string)
+            && tool.get("defer_loading").is_none_or(Value::is_null)
+            && function.get("defer_loading").is_none_or(Value::is_null)
+            && function.get("strict").is_none_or(|s| s == false)
+            && function
+                .get("description")
+                .is_none_or(|d| d.is_string() || d.is_null())
+            && (function["parameters"].is_null() || schema_is_standard(&function["parameters"]));
+        let (true, Some(name)) = (well_formed, function["name"].as_str()) else {
+            return Err(Unsupported("tool_definition"));
+        };
+        names.push(name.to_owned());
+    }
+    let parse = !tools.is_empty() && choice.is_none_or(|c| c == "auto");
+    Ok(parse.then_some(names))
+}
+
+const SCHEMA_TYPES: &[&str] = &[
+    "string", "number", "integer", "boolean", "object", "array", "null",
+];
+
+/// A schema `normalize_json_schema_types` leaves as is and `check_schema`
+/// accepts, judged on the keywords tool schemas use.
+fn schema_is_standard(schema: &Value) -> bool {
+    let Value::Object(map) = schema else {
+        return schema.is_boolean();
+    };
+    let schemas = |v: &Value| {
+        v.as_object()
+            .is_some_and(|m| m.values().all(schema_is_standard))
+    };
+    let schema_list = |v: &Value| {
+        v.as_array()
+            .is_some_and(|l| !l.is_empty() && l.iter().all(schema_is_standard))
+    };
+    let unique_strings = |v: &Value, allowed: Option<&[&str]>| {
+        v.as_array().is_some_and(|l| {
+            let set: std::collections::HashSet<_> = l.iter().filter_map(Value::as_str).collect();
+            set.len() == l.len() && allowed.is_none_or(|a| set.iter().all(|t| a.contains(t)))
+        })
+    };
+    let strings = |v: &Value| v.as_array().is_some_and(|l| l.iter().all(Value::is_string));
+    map.iter().all(|(key, value)| match key.as_str() {
+        "type" => match value {
+            Value::String(t) => SCHEMA_TYPES.contains(&t.as_str()),
+            types => {
+                !types.as_array().is_some_and(Vec::is_empty)
+                    && unique_strings(types, Some(SCHEMA_TYPES))
+            }
+        },
+        "properties" | "$defs" | "definitions" => schemas(value),
+        "items" | "additionalProperties" | "not" | "contains" | "contentSchema" => {
+            schema_is_standard(value)
+        }
+        "anyOf" | "oneOf" | "allOf" | "prefixItems" => schema_list(value),
+        "required" => unique_strings(value, None),
+        "enum" | "examples" => value.is_array(),
+        "description" | "title" | "format" | "$ref" | "$comment" | "$schema" | "$id"
+        | "$anchor" | "$dynamicRef" | "$dynamicAnchor" | "contentEncoding" | "contentMediaType" => {
+            value.is_string()
+        }
+        "minimum" | "maximum" | "exclusiveMinimum" | "exclusiveMaximum" => value.is_number(),
+        "multipleOf" => value.as_f64().is_some_and(|m| m > 0.0),
+        "minLength" | "maxLength" | "minItems" | "maxItems" | "minProperties" | "maxProperties"
+        | "minContains" | "maxContains" => value.is_u64(),
+        "uniqueItems" | "readOnly" | "writeOnly" | "deprecated" => value.is_boolean(),
+        "dependentRequired" => value.as_object().is_some_and(|m| m.values().all(strings)),
+        // Python `re` and Rust `regex` accept different patterns; normalization
+        // also walks the remaining keywords, which tool schemas rarely use.
+        "pattern"
+        | "patternProperties"
+        | "dependentSchemas"
+        | "dependencies"
+        | "if"
+        | "then"
+        | "else"
+        | "propertyNames"
+        | "unevaluatedItems"
+        | "unevaluatedProperties" => false,
+        _ => true,
+    })
+}
+
+fn truthy(value: &Value) -> bool {
+    !matches!(value, Value::Null | Value::Bool(false))
+        && value.as_array().is_none_or(|items| !items.is_empty())
+}
+
+fn has_tools_or_media(message: &Value) -> bool {
+    let media = |part: &Value| {
+        matches!(
+            part["type"].as_str(),
+            Some("image_url" | "video_url" | "audio_url" | "input_audio")
+        )
+    };
+    message.get("tools").is_some_and(truthy)
+        || message["content"]
+            .as_array()
+            .is_some_and(|parts| parts.iter().any(media))
+}
+
+fn valid_effort(effort: &Value) -> bool {
+    match effort {
+        Value::String(tier) => EFFORT_TIERS.contains(&tier.as_str()),
+        Value::Number(n) => n.as_f64().is_some_and(|f| (0.0..=0.99).contains(&f)),
+        _ => false,
+    }
+}
+
+/// `ChatCompletionRequest.normalize_reasoning_inputs`: lift `reasoning` into
+/// `reasoning_effort` and return the `thinking` it implies.
+fn normalize_reasoning_inputs(raw: &mut Map<String, Value>) -> Result<Option<Value>, Unsupported> {
+    let mut thinking = None;
+    if let Some(Value::Object(reasoning)) = raw.get("reasoning").cloned() {
+        let effort = match reasoning.get("effort").filter(|e| !e.is_null()) {
+            Some(effort) => effort.clone(),
+            None => reasoning
+                .get("reasoning_effort")
+                .cloned()
+                .unwrap_or(Value::Null),
+        };
+        match &effort {
+            Value::String(tier) if EFFORT_TIERS.contains(&tier.as_str()) => {
+                raw.insert("reasoning_effort".into(), effort.clone());
+            }
+            Value::Number(n) => {
+                raw.insert("reasoning_effort".into(), json!(n.as_f64()));
+            }
+            Value::Null => {}
+            _ => return Err(Unsupported("invalid_request")),
+        }
+        let enabled = match reasoning.get("enabled").filter(|e| !e.is_null()) {
+            Some(enabled) => Some(enabled),
+            None => reasoning.get("enable"),
+        };
+        let enabled = match enabled {
+            Some(Value::String(s)) => {
+                ["1", "true", "yes", "y", "on"].contains(&s.trim().to_lowercase().as_str())
+            }
+            Some(Value::Bool(b)) => *b,
+            Some(Value::Null) | None => false,
+            Some(_) => return Err(Unsupported("invalid_request")),
+        };
+        if enabled {
+            thinking = Some(Value::Bool(true));
+        }
+    }
+    if let Some(effort) = raw.get("reasoning_effort").filter(|e| !e.is_null()) {
+        if effort.is_boolean() {
+            return Err(Unsupported("invalid_request"));
+        }
+        thinking = Some(Value::Bool(effort != "none"));
+    }
+    Ok(thinking)
+}
+
+/// `OpenAIServingChat._validate_request`, for the checks requests here can fail.
+fn validate(
+    request: &ChatRequest,
+    settings: &OpenAiSettings,
+    model: &ChatModel,
+) -> Result<(), Unsupported> {
+    let invalid = Err(Unsupported("invalid_request"));
+    if request.messages.is_empty() || request.n < 1 {
+        return invalid;
+    }
+    if !request.messages.iter().all(valid_message) {
+        return invalid;
+    }
+    if request
+        .chat_template_kwargs
+        .as_ref()
+        .is_some_and(|k| k.contains_key("chat_template"))
+    {
+        return invalid;
+    }
+    let max_output = request
+        .max_completion_tokens
+        .filter(|&n| n != 0)
+        .or(request.max_tokens);
+    if let Some(max_output) = max_output.filter(|&n| n != 0) {
+        let Some(context) = settings.context_length.or(model.context_length) else {
+            return Err(Unsupported("context_length_unknown"));
+        };
+        if max_output > context as i64 && !settings.allow_auto_truncate {
+            return invalid;
+        }
+    }
+    format_json_schema(request.response_format.as_ref(), false)?;
+    Ok(())
+}
+
+/// Whether Pydantic accepts `message` as a `ChatCompletionMessageParam` with
+/// text-only content. The renderer drops content parts it does not know, so
+/// any other message goes to the engine, which validates it as Python does.
+fn valid_message(message: &Value) -> bool {
+    let Some(message) = message.as_object() else {
+        return false;
+    };
+    let role = message.get("role").and_then(Value::as_str);
+    // Thinking parts are valid only in assistant messages.
+    let assistant = role.is_some_and(|r| r.eq_ignore_ascii_case("assistant"));
+    let text_content = |content: &Value| match content {
+        Value::String(_) => true,
+        Value::Array(parts) => parts.iter().all(|part| text_part(part, assistant)),
+        _ => false,
+    };
+    match role {
+        // `ChatCompletionMessageUserParam`: the role is case-sensitive and content is required.
+        Some("user") => message.get("content").is_some_and(text_content),
+        Some(role) if GENERIC_ROLES.contains(&role.to_lowercase().as_str()) => {
+            optional(message, "content", text_content)
+                && optional(message, "name", Value::is_string)
+                && optional(message, "tool_call_id", Value::is_string)
+                && optional(message, "reasoning_content", Value::is_string)
+                && optional(message, "phase", |p| {
+                    p == "commentary" || p == "final_answer"
+                })
+                && optional(message, "tool_calls", |calls| {
+                    calls
+                        .as_array()
+                        .is_some_and(|calls| calls.iter().all(valid_tool_call))
+                })
+                // Non-empty tools never get here.
+                && optional(message, "tools", |tools| {
+                    tools.as_array().is_some_and(Vec::is_empty)
+                })
+        }
+        _ => false,
+    }
+}
+
+/// A text, `tool_reference` or (in assistant messages) thinking content part.
+fn text_part(part: &Value, assistant: bool) -> bool {
+    match part["type"].as_str() {
+        Some("text") => part["text"].is_string(),
+        Some("tool_reference") => part["name"].is_string(),
+        // `ChatCompletionMessageContentThinkingPart`: exactly one of `thinking` and `text`.
+        Some("thinking" | "reasoning") if assistant => {
+            let set = |key: &str| !part[key].is_null();
+            let string = |key: &str| part[key].is_null() || part[key].is_string();
+            set("thinking") != set("text") && string("thinking") && string("text")
+        }
+        _ => false,
+    }
+}
+
+/// `ToolCall`: `type` defaults to `"function"` but is not nullable.
+fn valid_tool_call(call: &Value) -> bool {
+    let Some(call) = call.as_object() else {
+        return false;
+    };
+    optional(call, "id", Value::is_string)
+        && optional(call, "index", |i| i.is_i64() || i.is_u64())
+        && call.get("type").is_none_or(|t| t == "function")
+        && call
+            .get("function")
+            .and_then(Value::as_object)
+            .is_some_and(|function| {
+                optional(function, "name", Value::is_string)
+                    && optional(function, "arguments", |a| a.is_string() || a.is_object())
+            })
+}
+
+/// An `Optional[...]` field: absent, null, or `valid`.
+fn optional(object: &Map<String, Value>, key: &str, valid: impl Fn(&Value) -> bool) -> bool {
+    object
+        .get(key)
+        .is_none_or(|value| value.is_null() || valid(value))
+}
+
+fn generate_body(
+    request: &ChatRequest,
+    kwargs: &Map<String, Value>,
+    model: &ChatModel,
+    prompt_ids: Vec<u32>,
+    thinking: bool,
+    headers: &OpenAiHeaders<'_>,
+    settings: &OpenAiSettings,
+) -> Result<GenerateRequest, Unsupported> {
+    let model_defaults = settings.sampling_defaults.as_deref().unwrap_or("model") == "model";
+    let param = |value: Option<f64>, name: &str, default: f64| -> Result<f64, Unsupported> {
+        match value {
+            Some(value) => Ok(value),
+            None => match model
+                .generation_config
+                .get(name)
+                .filter(|v| model_defaults && !v.is_null())
+            {
+                Some(value) => value
+                    .as_f64()
+                    .ok_or(Unsupported("invalid_sampling_default")),
+                None => Ok(default),
+            },
+        }
+    };
+    let top_k = match request.top_k {
+        Some(value) => value,
+        None => match model
+            .generation_config
+            .get("top_k")
+            .filter(|v| model_defaults && !v.is_null())
+        {
+            Some(value) => value
+                .as_i64()
+                .ok_or(Unsupported("invalid_sampling_default"))?,
+            None => -1,
+        },
+    };
+    let sampling = SamplingParams {
+        temperature: Some(param(request.temperature, "temperature", 1.0)?),
+        max_new_tokens: request
+            .max_completion_tokens
+            .filter(|&n| n != 0)
+            .or(request.max_tokens),
+        min_new_tokens: Some(request.min_tokens),
+        stop: request.stop.clone().map(Into::into),
+        stop_token_ids: request.stop_token_ids.clone(),
+        stop_regex: request.stop_regex.clone().map(Into::into),
+        top_p: Some(param(request.top_p, "top_p", 1.0)?),
+        top_k: Some(top_k),
+        min_p: Some(param(request.min_p, "min_p", 0.0)?),
+        presence_penalty: Some(request.presence_penalty),
+        frequency_penalty: Some(request.frequency_penalty),
+        repetition_penalty: Some(param(
+            request.repetition_penalty,
+            "repetition_penalty",
+            1.0,
+        )?),
+        regex: request.regex.clone(),
+        json_schema: format_json_schema(request.response_format.as_ref(), model.is_kimi_k3())?,
+        ebnf: request.ebnf.clone(),
+        n: Some(request.n),
+        no_stop_trim: Some(request.no_stop_trim),
+        ignore_eos: Some(request.ignore_eos),
+        skip_special_tokens: Some(request.skip_special_tokens),
+        logit_bias: request.logit_bias.clone().unwrap_or_default(),
+        custom_params: request
+            .custom_params
+            .as_ref()
+            .map(|v| serde_json::to_string(v).expect("JSON object")),
+        sampling_seed: request.seed,
+        watermark: request.watermark.clone(),
+        spaces_between_special_tokens: Some(
+            kwargs
+                .get("spaces_between_special_tokens")
+                .map(|v| v.as_bool().ok_or(Unsupported("invalid_request")))
+                .transpose()?
+                .unwrap_or(true),
+        ),
+        ..Default::default()
+    };
+    Ok(GenerateRequest {
+        sampling_params: Some(SamplingParamsOrList {
+            value: Some(sampling_params_or_list::Value::One(sampling)),
+        }),
+        return_logprob: Some(OneOrList::One(request.logprobs).into()),
+        top_logprobs_num: Some(OneOrList::One(request.top_logprobs.unwrap_or(0)).into()),
+        stream: Some(request.stream),
+        return_text_in_logprobs: Some(true),
+        lora_path: lora_path(&request.model, &request.lora_path),
+        bootstrap_host: request.bootstrap_host.clone().map(Into::into),
+        bootstrap_port: request.bootstrap_port.clone().map(Into::into),
+        bootstrap_room: request.bootstrap_room.clone().map(Into::into),
+        routed_dp_rank: request.routed_dp_rank.or(request.data_parallel_rank),
+        disagg_prefill_dp_rank: request.disagg_prefill_dp_rank,
+        rid: request.rid.clone().map(Into::into),
+        session_id: request.session_id.clone(),
+        extra_key: request.extra_key.clone().map(Into::into),
+        cache_salt: request.cache_salt.clone().map(Into::into),
+        priority: request.priority,
+        routing_key: headers.routing_key.map(str::to_owned),
+        custom_logit_processor: request.custom_logit_processor.clone().map(Into::into),
+        images_config: request.images_config.clone(),
+        input_ids: Some(TokenIdsOrList {
+            value: Some(token_ids_or_list::Value::One(TokenIds {
+                ids: prompt_ids.into_iter().map(i64::from).collect(),
+            })),
+        }),
+        require_reasoning: Some(thinking),
+        ..Default::default()
+    })
+}
+
+struct ReasoningConfig {
+    think: ThinkConfig,
+    options: ReasoningOptions,
+}
+
+/// Builds the OpenAI chat response from the engine's `/generate` output.
+pub struct ChatResponder {
+    model: String,
+    /// Prompt tokens `_reported_prompt_tokens` leaves out of usage.
+    unreported_prompt_tokens: u64,
+    /// `_get_history_tool_calls_cnt`, which numbers K3 tool-call ids.
+    history_tool_calls: i64,
+    n: usize,
+    logprobs: bool,
+    reasoning: Option<ReasoningConfig>,
+    /// The tool parser and request tools when the output is parsed for tool calls.
+    tools: Option<(String, Vec<Value>)>,
+    include_usage: bool,
+    continuous_usage_stats: bool,
+    settings: OpenAiSettings,
+    tokenizer: Option<Arc<dyn OpenAiTokenizer>>,
+    /// The stream's `created`, which every chunk repeats.
+    created: u64,
+    stream: StreamState,
+    roles_sent: HashSet<u64>,
+    detectors: HashMap<u64, ThinkDetector>,
+    tool_detectors: HashMap<u64, Box<dyn ToolDetector>>,
+    has_tool_calls: HashSet<u64>,
+    finish_reasons: Vec<(u64, Value)>,
+}
+
+impl ChatResponder {
+    /// `_handle_non_streaming_request` over a `/generate` response.
+    pub fn unary(self, body: &[u8]) -> Option<Reply> {
+        let mut ret = match serde_json::from_slice(body).ok()? {
+            Value::Array(items) => items,
+            item => vec![item],
+        };
+        for item in &mut ret {
+            self.report_prompt_tokens(&mut item["meta_info"]);
+        }
+        let mut choices = Vec::with_capacity(ret.len());
+        for (index, item) in ret.iter().enumerate() {
+            let meta = &item["meta_info"];
+            let logprobs = self.logprobs.then(|| {
+                json!({"content": self.token_logprobs(&meta["output_token_logprobs"], &meta["output_top_logprobs"])})
+            });
+            let Some(text) = item["text"].as_str() else {
+                return Some(malformed_output_reply("text"));
+            };
+            let mut text = text.to_owned();
+            let mut reasoning = String::new();
+            if let Some(config) = &self.reasoning {
+                (reasoning, text) = ThinkDetector::new(config.think, &config.options).parse(&text);
+            }
+            // `_process_tool_calls`.
+            let mut finish_reason = meta["finish_reason"].clone();
+            let mut tool_calls = Value::Null;
+            if let Some((parser, tools)) = &self.tools
+                && let Some(detector) = tool_detector(parser, tools)
+                && detector.has_tool_call(&text)
+            {
+                let (normal, calls) = detector.parse_non_stream(&text);
+                text = normal;
+                if !calls.is_empty() {
+                    let calls = calls
+                        .iter()
+                        .enumerate()
+                        .map(|(i, call)| self.tool_call(i as i64, call));
+                    tool_calls = calls.collect();
+                    if finish_reason["type"] == "stop" {
+                        finish_reason["type"] = "tool_calls".into();
+                        finish_reason["matched"] = Value::Null;
+                    }
+                }
+            }
+            let finish_reason = &finish_reason;
+            let mut message = json!({
+                "role": "assistant",
+                "content": text,
+                "reasoning_content": (!reasoning.is_empty()).then_some(reasoning),
+            });
+            // `ChatMessage._serialize` omits absent tool calls.
+            if !tool_calls.is_null() {
+                message["tool_calls"] = tool_calls;
+            }
+            choices.push(json!({
+                "index": index,
+                "message": message,
+                "logprobs": logprobs,
+                "finish_reason": finish_reason.get("type"),
+                "matched_stop": finish_reason.get("matched"),
+            }));
+        }
+        unary_reply(
+            &ret,
+            self.n,
+            self.settings.enable_cache_report,
+            "chat.completion",
+            &self.model,
+            choices,
+        )
+    }
+
+    /// One `/generate` SSE `data:` payload, as `_generate_chat_stream` handles
+    /// it. `Err` replaces the whole stream, before anything was sent.
+    pub fn stream_data(&mut self, data: &[u8]) -> Result<Vec<String>, Reply> {
+        let mut events = match self.stream.payload(data)? {
+            Payload::Done => return Ok(self.stream_end()),
+            Payload::Frame(content) => self.stream_frame(&content),
+            Payload::Events(events) => events,
+        };
+        if self.stream.ending() {
+            events.extend(self.stream_end());
+        }
+        Ok(events)
+    }
+
+    /// Whether the stream has ended; later `/generate` frames are ignored.
+    pub fn done(&self) -> bool {
+        self.stream.done
+    }
+
+    fn stream_frame(&mut self, content: &Value) -> Vec<String> {
+        let index = content.get("index").and_then(Value::as_u64).unwrap_or(0);
+        let meta = &content["meta_info"];
+        let mut reported = meta.clone();
+        self.report_prompt_tokens(&mut reported);
+        self.stream.record(index, &reported);
+        let finish_reason = meta["finish_reason"].clone();
+        let finish_type = finish_reason["type"].as_str().map(str::to_owned);
+
+        let mut logprobs = None;
+        if self.logprobs {
+            let prev = self.stream.logprob_counts.get(&index).copied().unwrap_or(0);
+            let total = meta_u64(meta, "output_token_logprobs_length") as usize;
+            if prev < total {
+                let incremental = self.settings.incremental_streaming_output;
+                let slice = |key: &str| -> Value {
+                    let items = meta[key].as_array().cloned().unwrap_or_default();
+                    match incremental {
+                        true => Value::Array(items),
+                        false => {
+                            Value::Array(items.into_iter().skip(prev).take(total - prev).collect())
+                        }
+                    }
+                };
+                let content = self.token_logprobs(
+                    &slice("output_token_logprobs"),
+                    &slice("output_top_logprobs"),
+                );
+                logprobs = Some(json!({"content": content}));
+            }
+            self.stream.logprob_counts.insert(index, total);
+        }
+
+        let mut events = Vec::new();
+        if let Some(finish_type) = &finish_type {
+            // An abort carrying a status is an error; Python checks for an
+            // `HTTPStatus`, which `/generate` serializes as its integer.
+            if finish_type == "abort"
+                && let Some(code) = finish_reason["status_code"].as_u64()
+                && let Some(name) = http_status_name(code)
+            {
+                let message = finish_reason["message"]
+                    .as_str()
+                    .unwrap_or("Generation aborted.");
+                self.stream.stopped = true;
+                return vec![stream_error_event(message, name, code as u16)];
+            }
+            self.finish_reasons.push((index, finish_reason.clone()));
+        }
+        if self.roles_sent.insert(index) {
+            events.push(self.chunk(
+                index,
+                json!({"reasoning_content": null, "role": "assistant", "content": ""}),
+                None,
+                None,
+            ));
+        }
+
+        // `_generate_stream_content`.
+        let text = content["text"].as_str().unwrap_or_default();
+        let mut delta = match self.settings.incremental_streaming_output {
+            true => text.to_owned(),
+            false => {
+                let offset = self
+                    .stream
+                    .text_offsets
+                    .insert(index, text.chars().count())
+                    .unwrap_or(0);
+                text.chars().skip(offset).collect()
+            }
+        };
+        let mut remaining_logprobs = logprobs;
+        if let Some(config) = &self.reasoning {
+            let detector = self
+                .detectors
+                .entry(index)
+                .or_insert_with(|| ThinkDetector::new(config.think, &config.options));
+            let (mut reasoning, mut normal) = detector.push(&delta);
+            if finish_type.as_deref().is_some_and(|t| t != "abort") {
+                let (end_reasoning, end_normal) = detector.finish();
+                reasoning.push_str(&end_reasoning);
+                normal.push_str(&end_normal);
+            }
+            delta = normal;
+            if !reasoning.is_empty() {
+                let usage = self.chunk_usage(index);
+                events.push(self.chunk(
+                    index,
+                    json!({"reasoning_content": reasoning}),
+                    remaining_logprobs.take(),
+                    usage,
+                ));
+            }
+        }
+        if self.tools.is_some() {
+            // `_process_tool_call_stream`, whose chunks are Pydantic models.
+            let flush = finish_type.as_deref().is_some_and(|t| t != "abort");
+            let tools = self.tools.as_ref().expect("tools are set");
+            let detector = self.tool_detectors.entry(index).or_insert_with(|| {
+                tool_detector(&tools.0, &tools.1).expect("checked when lowering")
+            });
+            let (normal, calls) = detector.parse_stream(&delta, flush);
+            let usage = self.chunk_usage(index).unwrap_or(Value::Null);
+            // `ChatCompletionResponseStreamChoice._serialize` omits absent tool calls.
+            let delta = |content: Value, tool_calls: Option<Value>| {
+                let mut delta =
+                    json!({"role": null, "content": content, "reasoning_content": null});
+                if let Some(tool_calls) = tool_calls {
+                    delta["tool_calls"] = tool_calls;
+                }
+                delta
+            };
+            if !normal.is_empty() {
+                let mut chunk = self.chunk_json(index, delta(normal.into(), None), None, None);
+                chunk["usage"] = usage.clone();
+                events.push(format!("data: {chunk}\n\n"));
+            }
+            for call in calls {
+                self.has_tool_calls.insert(index);
+                let mut tool_call = self.tool_call(call.tool_index, &call);
+                // Python streams an id and name only for a non-empty name.
+                if call.name.is_empty() {
+                    tool_call["id"] = Value::Null;
+                    tool_call["function"]["name"] = Value::Null;
+                }
+                let calls = json!([tool_call]);
+                let mut chunk = self.chunk_json(index, delta(Value::Null, Some(calls)), None, None);
+                chunk["usage"] = usage.clone();
+                events.push(format!("data: {chunk}\n\n"));
+            }
+        } else if !delta.is_empty() {
+            let usage = self.chunk_usage(index);
+            events.push(self.chunk(
+                index,
+                json!({"reasoning_content": null, "content": delta}),
+                remaining_logprobs.take(),
+                usage,
+            ));
+        }
+        let has_parser =
+            self.settings.reasoning_parser.is_some() || self.settings.tool_call_parser.is_some();
+        if remaining_logprobs.is_some() && has_parser {
+            let usage = self.chunk_usage(index);
+            events.push(self.chunk(
+                index,
+                json!({"reasoning_content": null}),
+                remaining_logprobs,
+                usage,
+            ));
+        }
+        events
+    }
+
+    fn stream_end(&mut self) -> Vec<String> {
+        self.stream.done = true;
+        let mut events = Vec::new();
+        if !self.stream.failed && self.stream.started {
+            for (index, reason) in std::mem::take(&mut self.finish_reasons) {
+                let mut chunk =
+                    self.chunk_json(index, json!({"reasoning_content": null}), None, None);
+                let tool_calls = self.has_tool_calls.contains(&index);
+                chunk["choices"][0]["finish_reason"] = match reason["type"].as_str() {
+                    Some("stop") if tool_calls => "tool_calls".into(),
+                    _ => reason["type"].clone(),
+                };
+                chunk["choices"][0]["matched_stop"] =
+                    reason.get("matched").cloned().unwrap_or(Value::Null);
+                events.push(format!("data: {chunk}\n\n"));
+            }
+            if self.include_usage {
+                let chunk = json!({
+                    "id": self.stream.last_id,
+                    "object": "chat.completion.chunk",
+                    "created": self.created,
+                    "model": self.model,
+                    "choices": [],
+                    "usage": self.stream.total_usage(self.n, self.settings.enable_cache_report),
+                });
+                events.push(format!("data: {chunk}\n\n"));
+            }
+        }
+        events.push("data: [DONE]\n\n".into());
+        events
+    }
+
+    /// `_reported_prompt_tokens`.
+    fn report_prompt_tokens(&self, meta: &mut Value) {
+        if self.unreported_prompt_tokens > 0 && meta.is_object() {
+            let prompt = meta_u64(meta, "prompt_tokens");
+            meta["prompt_tokens"] = prompt.saturating_sub(self.unreported_prompt_tokens).into();
+        }
+    }
+
+    /// A `ToolCall` as Pydantic dumps it, with `_process_tool_call_id`'s id.
+    fn tool_call(&self, index: i64, call: &ToolCallItem) -> Value {
+        let id = match self.tools.as_ref().map(|(parser, _)| parser.as_str()) {
+            Some("kimi_k3") => format!(
+                "{}:{}",
+                call.name,
+                self.history_tool_calls + call.tool_index
+            ),
+            _ => tool_call_id(),
+        };
+        json!({
+            "id": id,
+            "index": index,
+            "type": "function",
+            "function": {"name": call.name, "arguments": call.parameters},
+        })
+    }
+
+    /// `build_sse_content`: msgspec drops a null `usage`, never a null choice field.
+    fn chunk(
+        &self,
+        index: u64,
+        delta: Value,
+        logprobs: Option<Value>,
+        usage: Option<Value>,
+    ) -> String {
+        format!(
+            "data: {}\n\n",
+            self.chunk_json(index, delta, logprobs, usage)
+        )
+    }
+
+    fn chunk_json(
+        &self,
+        index: u64,
+        delta: Value,
+        logprobs: Option<Value>,
+        usage: Option<Value>,
+    ) -> Value {
+        let mut chunk = json!({
+            "id": self.stream.last_id,
+            "object": "chat.completion.chunk",
+            "created": self.created,
+            "model": self.model,
+            "choices": [{
+                "index": index,
+                "delta": delta,
+                "logprobs": logprobs,
+                "finish_reason": null,
+                "matched_stop": null,
+            }],
+        });
+        if let Some(usage) = usage {
+            chunk["usage"] = usage;
+        }
+        chunk
+    }
+
+    fn chunk_usage(&self, index: u64) -> Option<Value> {
+        self.continuous_usage_stats.then(|| {
+            self.stream
+                .choice_usage(index, self.settings.enable_cache_report)
+        })
+    }
+
+    /// `_build_token_logprobs_from_raw`.
+    fn token_logprobs(&self, output: &Value, top: &Value) -> Vec<Value> {
+        let top_rows = top.as_array();
+        let mut out = Vec::new();
+        for (i, triple) in output.as_array().into_iter().flatten().enumerate() {
+            let text = triple[2].as_str().unwrap_or_default();
+            let top_logprobs: Vec<Value> = top_rows
+                .and_then(|rows| rows.get(i))
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .map(|t| {
+                    let text = t[2].as_str().unwrap_or_default();
+                    json!({"token": text, "bytes": self.token_bytes(&t[1], text), "logprob": t[0]})
+                })
+                .collect();
+            out.push(json!({
+                "token": text,
+                "bytes": self.token_bytes(&triple[1], text),
+                "logprob": triple[0],
+                "top_logprobs": top_logprobs,
+            }));
+        }
+        out
+    }
+
+    fn token_bytes(&self, id: &Value, text: &str) -> Vec<u8> {
+        id.as_u64()
+            .and_then(|id| self.tokenizer.as_ref()?.byte_level_bytes(id as u32))
+            .unwrap_or_else(|| text.as_bytes().to_vec())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The reason `messages` is not lowered, with a renderer that accepts anything.
+    fn unsupported(messages: Value) -> Option<&'static str> {
+        let body = serde_json::to_vec(&json!({"model": "m", "messages": messages})).unwrap();
+        let render = |_: &Value| Some(vec![1]);
+        let settings = OpenAiSettings::default();
+        lower_chat(
+            &body,
+            &OpenAiHeaders::default(),
+            &settings,
+            &ChatModel::default(),
+            render,
+            None,
+        )
+        .err()
+        .map(|reason| reason.0)
+    }
+
+    #[test]
+    fn messages_python_rejects_go_to_the_engine() {
+        for messages in [
+            json!([{"role": "user", "content": [{"type": "text", "text": "hi"}, {"type": "file", "file": {"file_id": "f"}}]}]),
+            json!([{"role": "user"}]),
+            json!([{"role": "user", "content": null}]),
+            json!([{"role": "USER", "content": "hi"}]),
+            json!([{"role": "bot", "content": "hi"}]),
+            json!([{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}]),
+            json!([{"role": "user", "content": [{"type": "thinking", "thinking": "t"}]}]),
+            json!([{"role": "assistant", "content": [{"type": "thinking", "thinking": "t", "text": "x"}]}]),
+            json!([{"role": "assistant", "content": [{"type": "thinking"}]}]),
+            json!([{"role": "user", "content": [{"type": "tool_reference"}]}]),
+            json!([{"role": "user", "content": [{"type": "text"}]}]),
+            json!([{"role": "user", "content": 1}]),
+            json!(["hi"]),
+            json!([{"role": "assistant", "content": "a", "name": 1}]),
+            json!([{"role": "assistant", "content": "a", "phase": "draft"}]),
+            json!([{"role": "system", "content": "a", "tools": false}]),
+            json!([{"role": "assistant", "content": null, "tool_calls": [{"function": null}]}]),
+            json!([{"role": "assistant", "content": null, "tool_calls": [{"type": null, "function": {}}]}]),
+            json!([{"role": "assistant", "content": null, "tool_calls": [{"function": {"arguments": 1}}]}]),
+        ] {
+            assert_eq!(
+                unsupported(messages.clone()),
+                Some("invalid_request"),
+                "{messages}"
+            );
+        }
+    }
+
+    #[test]
+    fn text_messages_are_lowered() {
+        let messages = json!([
+            {"role": "System", "content": "be brief", "tools": []},
+            {"role": "user", "content": [{"type": "text", "text": "hi"}, {"type": "tool_reference", "name": "f"}], "name": 1},
+            {"role": "Assistant", "content": [{"type": "thinking", "thinking": "t"}, {"type": "text", "text": "a"}]},
+            {"role": "assistant", "content": null, "phase": null, "tool_calls": [
+                {"id": "c", "index": 0, "type": "function", "function": {"name": "f", "arguments": {}}}
+            ]},
+            {"role": "tool", "content": "42", "tool_call_id": "c"},
+        ]);
+        assert_eq!(unsupported(messages), None);
+    }
+
+    #[test]
+    fn stream_chunks_repeat_the_stream_created() {
+        let body = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true,
+            "stream_options": {"include_usage": true},
+        });
+        let settings = OpenAiSettings::default();
+        let (_, mut responder) = lower_chat(
+            &serde_json::to_vec(&body).unwrap(),
+            &OpenAiHeaders::default(),
+            &settings,
+            &ChatModel::default(),
+            |_: &Value| Some(vec![1]),
+            None,
+        )
+        .unwrap();
+        // A `created` far in the past stands in for the clock ticking mid-stream:
+        // a chunk that re-reads the clock would report a different second.
+        responder.created = 1;
+        let meta = |finish: Value| json!({"id": "r", "finish_reason": finish, "prompt_tokens": 1, "completion_tokens": 1});
+        let mut events = Vec::new();
+        for frame in [
+            json!({"text": "a", "output_ids": [2], "meta_info": meta(Value::Null)}).to_string(),
+            json!({"text": "a", "output_ids": [2], "meta_info": meta(json!({"type": "stop"}))})
+                .to_string(),
+            "[DONE]".into(),
+        ] {
+            events.extend(responder.stream_data(frame.as_bytes()).unwrap());
+        }
+        let created: Vec<Value> = events
+            .iter()
+            .filter_map(|event| serde_json::from_str::<Value>(event.strip_prefix("data: ")?).ok())
+            .map(|chunk| chunk["created"].clone())
+            .collect();
+        assert!(created.len() > 1, "{events:?}");
+        assert!(created.iter().all(|c| *c == json!(1)), "{created:?}");
+    }
+}

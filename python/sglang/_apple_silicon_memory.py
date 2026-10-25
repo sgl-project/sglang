@@ -28,26 +28,21 @@ _warned_unknown_working_set = False
 
 
 def _warn_unknown_working_set() -> None:
-    """Warn once when the Metal working-set size cannot be determined.
-
-    The callers then fall back to plain system-memory reporting, which is
-    the overcommit-prone behavior #21443 fixed; the regression should be
-    visible in logs rather than silent.
-    """
+    """Warn once when the Metal working-set size cannot be determined."""
     global _warned_unknown_working_set
     if _warned_unknown_working_set:
         return
     _warned_unknown_working_set = True
     logger.warning(
-        "Metal working-set size is unavailable; falling back to system-memory "
-        "reporting, which may overcommit the GPU working set."
+        "Metal working-set size is unavailable; refusing to report system RAM "
+        "as usable GPU memory."
     )
 
 
 def _mlx_runtime_active() -> bool:
     """Return True when SGLang runs the native MLX backend."""
     try:
-        from sglang.srt.utils.tensor_bridge import use_mlx
+        from sglang.srt.hardware_backend.mlx.runtime import use_mlx
     except ImportError:
         # Degraded installs without sglang.srt still get torch-MPS reporting.
         return False
@@ -112,20 +107,13 @@ def apple_gpu_empty_cache() -> None:
 
 
 def apple_gpu_total_memory() -> int:
-    """GPU-usable memory in bytes: the working set, else total system RAM.
-
-    The psutil fallback keeps memory planning alive when the working-set
-    size is unknown (API missing or reporting 0) rather than advertising a
-    zero-sized device.
-    """
+    """GPU-usable memory in bytes, bounded by the Metal working set."""
     working_set = apple_gpu_working_set_size()
     if working_set > 0:
         return working_set
     _warn_unknown_working_set()
 
-    import psutil
-
-    return int(psutil.virtual_memory().total)
+    raise RuntimeError("Metal recommended working-set limit is unavailable")
 
 
 def apple_gpu_available_memory(empty_cache: bool = False) -> int:
@@ -134,8 +122,8 @@ def apple_gpu_available_memory(empty_cache: bool = False) -> int:
     Reports ``min(system available, working-set headroom)``: unified memory
     is shared with the CPU, so free system RAM bounds any allocation, while
     the remaining working-set headroom bounds what the GPU may keep
-    resident.  Falls back to system-available memory when the working-set
-    size is unknown.
+    resident. Reports no available GPU memory when the working-set limit
+    is unknown.
     """
     if empty_cache:
         apple_gpu_empty_cache()
@@ -149,4 +137,5 @@ def apple_gpu_available_memory(empty_cache: bool = False) -> int:
         available = min(available, max(headroom, 0))
     else:
         _warn_unknown_working_set()
+        return 0
     return available

@@ -19,32 +19,90 @@ import sys
 
 import pytest
 import torch
+import triton
+import triton.language as tl
 
-from sglang.kernels.ops.attention.deepseek_v4_rope import precompute_freqs_cis
 from sglang.kernels.ops.attention.dsv4 import (
     CompressorDecodePlan,
     compress_norm_rope_store,
 )
+from sglang.kernels.ops.attention.dsv4.candidate_blocks_hip import (
+    candidate_page8_table,
+    select_candidate_blocks_hip,
+    slice_candidate_blocks,
+    topk_within_candidate_blocks_hip,
+    topk_within_candidate_blocks_page8,
+    with_candidate_page8_table,
+)
 from sglang.kernels.ops.attention.dsv4.compress import CompressorPrefillPlan
 from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
+    LOW_RATIO_PAGE_TABLE_BUCKET,
     FP4KWriteMetadata,
+    FP4RowgroupDecodeWorkspace,
     _decode_cta_count,
+    _fp4_e2m1_code_rne_lean,
     _guard_page_table,
     aiter_fp4_paged_mqa_logits,
+    aiter_has_fp4_rowgroup,
     aiter_k_indexer_fp4_cache_write,
     aiter_q_indexer_fp4,
+    index_k_page8_views,
+    index_q_rope_pack_flydsl,
+    index_q_rope_pack_weights_flydsl,
+    pack_fp4_query_flydsl,
     prepare_fp4_decode_workspace,
     prepare_fp4_k_write_metadata,
     prepare_fp4_prefill_workspace,
+    prepare_fp4_rowgroup_decode_workspace,
+    prepare_fp4_rowgroup_prefill_workspace,
+    rowgroup_paged_mqa_logits,
+    rowgroup_prefill_query_start_loc,
+    rowgroup_table_columns,
+)
+from sglang.kernels.ops.attention.dsv4.fp4_indexer_rope_hip import (
+    index_k_norm_rope_pack_store_split,
+)
+from sglang.kernels.ops.attention.dsv4.fp4_indexer_schedule_hip import (
+    build_decode_schedule,
+)
+from sglang.kernels.ops.attention.dsv4.fp4_rope_fake_quant import (
+    rope_tail_fake_quant_fp4,
+)
+from sglang.kernels.ops.attention.dsv4.rope import precompute_freqs_cis
+from sglang.kernels.ops.attention.dsv4.topk import (
+    plan_topk_v2,
+    topk_transform_paged_v2,
+)
+from sglang.kernels.ops.gemm.dsv4_indexer_head_weights_hip import indexer_head_weights
+from sglang.kernels.ops.gemm.router_gemv_hip import rocm_router_gemv_split_k
+from sglang.kernels.ops.kvcache.dsv4_fp4_index_k_cache_hip import (
+    store_fp4_index_k_cache_split,
+)
+from sglang.kernels.ops.quantization.fp4_indexer_quant import (
+    _fp4_e2m1_code_rne,
+    quantize_fp4_indexer_tensor,
 )
 from sglang.srt.utils import get_device, is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
+from sglang.test.kernels.deepseek_v4.common import (
+    ceil_ue8m0_exp_ref,
+    fp4_e2m1_code_ref,
+)
+from sglang.test.kernels.deepseek_v4.fp4_index_k_reference import (
+    read_fp4_index_k_split,
+)
 
-register_amd_ci(est_time=120, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 pytestmark = pytest.mark.skipif(
     not (is_hip() and is_gfx95_supported()),
     reason="The FP4 indexer adapters wrap AITER CDNA4 (gfx95x) kernels.",
+)
+
+# The row-group kernels (8- and 64-row pages) need AITER >= ROCm/aiter#6145.
+requires_aiter_rowgroup = pytest.mark.skipif(
+    not (is_hip() and is_gfx95_supported() and aiter_has_fp4_rowgroup()),
+    reason="AITER has no row-group FP4 MQA logits kernel (ROCm/aiter#6145).",
 )
 
 HEAD_DIM = 128
@@ -62,23 +120,6 @@ SCALE_SHUFFLE_TILE = 16
 _E2M1_GRID = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
 
 
-def _ceil_ue8m0_exp_ref(x: torch.Tensor) -> torch.Tensor:
-    bits = x.to(torch.float32).contiguous().view(torch.int32)
-    exp = (bits >> 23) & 0xFF
-    mantissa = bits & 0x7FFFFF
-    exp = exp + (mantissa != 0).to(torch.int32)
-    return exp.clamp(1, 254)
-
-
-def _fp4_e2m1_code_ref(x: torch.Tensor) -> torch.Tensor:
-    ax = torch.minimum(x.abs(), torch.tensor(E2M1_MAX, device=x.device))
-    idx = torch.zeros_like(ax, dtype=torch.uint8)
-    for threshold in (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0):
-        idx += (ax > threshold).to(torch.uint8)
-    sign = ((x < 0) & (idx != 0)).to(torch.uint8) * 8
-    return idx | sign
-
-
 def _ref_quantize_fp4_indexer(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Nibble-packed E2M1 payload and per-group UE8M0 exponents.
 
@@ -89,11 +130,11 @@ def _ref_quantize_fp4_indexer(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tens
     x = x.contiguous().view(-1, HEAD_DIM).float()
     groups = x.view(-1, SCALE_GROUPS, GROUP_SIZE)
     scale_raw = (groups.abs().amax(dim=-1) / E2M1_MAX).clamp_min(1.0e-4)
-    scale_exp = _ceil_ue8m0_exp_ref(scale_raw)
+    scale_exp = ceil_ue8m0_exp_ref(scale_raw)
     scale = (scale_exp << 23).contiguous().view(torch.float32)
 
     scaled = (groups / scale.unsqueeze(-1)).view(-1, HEAD_DIM)
-    code = _fp4_e2m1_code_ref(scaled)
+    code = fp4_e2m1_code_ref(scaled)
     packed = (code[:, 0::2].to(torch.int16) | (code[:, 1::2].to(torch.int16) << 4)).to(
         torch.uint8
     )
@@ -280,6 +321,166 @@ def test_quantize_fp4_indexer_tensor(num_tokens: int) -> None:
     torch.testing.assert_close(_canonical_zero(stored_fp4), _canonical_zero(ref_fp4))
 
 
+def test_index_q_pack_weights_matches_standalone() -> None:
+    """The one-launch index-Q path (RoPE, two-stage fp4 pack in the FlyDSL layout, head
+    weights) is bitwise the three standalone launches it replaces."""
+
+    torch.manual_seed(0)
+    num_tokens, num_heads = 16, 32
+    rope_dim, hidden, max_pos = 64, 5120, 4096
+    q = (torch.randn(num_tokens, num_heads * 128, device="cuda") * 3).bfloat16()
+    freqs = precompute_freqs_cis(rope_dim, max_pos, 0, 10000, 1, 32, 1).to("cuda")
+    pos = torch.randint(0, max_pos, (num_tokens,), device="cuda", dtype=torch.int64)
+    x = torch.randn(num_tokens, hidden, device="cuda").bfloat16()
+    w = (torch.randn(num_heads, hidden, device="cuda") * 0.02).bfloat16()
+    scale = 128**-0.5 * num_heads**-0.5
+
+    ref_q = rope_tail_fake_quant_fp4(
+        q.view(num_tokens, num_heads, 128), freqs[pos], rope_dim
+    )
+    ref_fp4, ref_scale = pack_fp4_query_flydsl(ref_q)
+    ref_w = indexer_head_weights(x, w, scale)
+
+    partials = rocm_router_gemv_split_k(x, w)
+    q_fp4, q_scale, weights = index_q_rope_pack_weights_flydsl(
+        q, freqs, pos, rope_dim, partials, scale, num_heads=num_heads
+    )
+    # torch.equal ignores dtype
+    assert q_fp4.dtype == ref_fp4.dtype and q_scale.dtype == ref_scale.dtype
+    assert torch.equal(q_fp4, ref_fp4)
+    assert torch.equal(q_scale, ref_scale)
+    assert torch.equal(weights, ref_w)
+    exact_weights = (x.double() @ w.double().T * scale).bfloat16()
+    ulps = (
+        weights.view(torch.int16).int() - exact_weights.view(torch.int16).int()
+    ).abs()
+    assert int(ulps.max()) <= 1
+
+
+def _assert_index_q_rope_pack_matches(
+    q: torch.Tensor, freqs: torch.Tensor, pos: torch.Tensor, num_heads: int
+) -> None:
+    """index_q_rope_pack_flydsl is bitwise the standalone RoPE fake-quant and FlyDSL pack."""
+    rope_dim = 64
+    ref_q = rope_tail_fake_quant_fp4(
+        q.view(q.shape[0], num_heads, 128), freqs, rope_dim, positions=pos.contiguous()
+    )
+    ref_fp4, ref_scale = pack_fp4_query_flydsl(ref_q)
+    q_fp4, q_scale = index_q_rope_pack_flydsl(
+        q, freqs, pos, rope_dim, num_heads=num_heads
+    )
+    assert q_fp4.dtype == ref_fp4.dtype and q_scale.dtype == ref_scale.dtype
+    assert torch.equal(q_fp4, ref_fp4)
+    assert torch.equal(q_scale, ref_scale)
+
+
+@pytest.mark.parametrize("num_heads", [16, 32, 64])
+@pytest.mark.parametrize("num_tokens", [1, 333, 16384])
+def test_index_q_rope_pack_matches_standalone(num_tokens: int, num_heads: int) -> None:
+    """The prefill index-Q launch (RoPE and two-stage fp4 pack in the FlyDSL layout) is
+    bitwise the two standalone launches it replaces, past the decode path's caps (64 tokens
+    for the split-K GEMV, T * H <= 4096 for the fused head-weight reduce)."""
+
+    torch.manual_seed(0)
+    rope_dim, max_pos = 64, 65536
+    q = (torch.randn(num_tokens, num_heads * 128, device="cuda") * 3).bfloat16()
+    # rows small enough to reach the pack's 1e-4 scale floor; the fake-quant floor
+    # (6 * 2^-126) is covered by test_index_q_rope_pack_amax_floors
+    q[: num_tokens // 10 + 1] *= 1e-6
+    if num_tokens > 4:
+        # groups whose reciprocal scales take the inf / nan / near-overflow branches
+        q[1, 3] = float("inf")
+        q[2, 200] = float("nan")
+        q[3, :128] = 3.0e38
+        q[4, 64:] = float("-inf")
+    freqs = precompute_freqs_cis(rope_dim, max_pos, 0, 10000, 1, 32, 1).to("cuda")
+    pos = torch.randint(0, max_pos, (num_tokens,), device="cuda", dtype=torch.int64)
+    _assert_index_q_rope_pack_matches(q, freqs, pos, num_heads)
+
+
+def test_index_q_rope_pack_strided_positions() -> None:
+    """A non-contiguous positions view reads positions[t], not the t-th stored element."""
+    torch.manual_seed(0)
+    num_tokens, num_heads, max_pos = 333, 64, 65536
+    q = (torch.randn(num_tokens, num_heads * 128, device="cuda") * 3).bfloat16()
+    freqs = precompute_freqs_cis(64, max_pos, 0, 10000, 1, 32, 1).to("cuda")
+    pos = torch.randint(0, max_pos, (2 * num_tokens,), device="cuda")[::2]
+    assert not pos.is_contiguous()
+    _assert_index_q_rope_pack_matches(q, freqs, pos, num_heads)
+
+
+def _bf16_neighbors(x: float) -> list[float]:
+    """x rounded to bf16 and the bf16 values one ulp below and above it."""
+    bits = int(torch.tensor(x).bfloat16().view(torch.int16))
+    return [
+        float(torch.tensor(b, dtype=torch.int16).view(torch.bfloat16))
+        for b in (bits - 1, bits, bits + 1)
+    ]
+
+
+@pytest.mark.parametrize("num_heads", [16, 64])
+def test_index_q_rope_pack_amax_floors(num_heads: int) -> None:
+    """Zero groups, bf16 subnormals and amaxes one ulp around both floors take the
+    reciprocal-scale branches bitwise like the standalone divisions. The fake-quant floor
+    (amax 6 * 2^-126) keeps a zero group off 0 / 0; anything that small then codes 0 under
+    the pack floor (scale 1e-4, which ceils to 2^-13 and so first differs at amax 6 * 2^-14)."""
+    torch.manual_seed(0)
+    num_tokens, max_pos = 256, 65536
+    group_amax = torch.tensor(
+        [
+            0.0,
+            2.0**-133,  # smallest bf16 subnormal
+            2.0**-130,
+            127 * 2.0**-133,  # largest bf16 subnormal
+            2.0**-126,
+            *_bf16_neighbors(6 * 2.0**-126),
+            2.0**-120,
+            1.0e-30,
+            *_bf16_neighbors(6 * 2.0**-14),
+            *_bf16_neighbors(6.0e-4),
+            1.0,
+        ]
+    )
+    # every 32-group gets one of the amaxes above, its largest element at exactly that value
+    shape = (num_tokens, num_heads, 4, 32)
+    u = torch.randn(shape)
+    u = u / u.abs().amax(dim=-1, keepdim=True)
+    m = group_amax[torch.randint(0, group_amax.numel(), shape[:3])]
+    q = (u * m[..., None]).bfloat16()
+    assert torch.equal(q.float().abs().amax(dim=-1), m.bfloat16().float())
+    q[0] = 0
+    q[1, 3] = 0
+    q = q.view(num_tokens, num_heads * 128).cuda()
+    freqs = precompute_freqs_cis(64, max_pos, 0, 10000, 1, 32, 1).to("cuda")
+    pos = torch.randint(0, max_pos, (num_tokens,), device="cuda", dtype=torch.int64)
+    _assert_index_q_rope_pack_matches(q, freqs, pos, num_heads)
+
+
+@triton.jit
+def _e2m1_codes_kernel(x_ptr, ref_ptr, lean_ptr, n, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n
+    x = tl.load(x_ptr + offs, mask=mask)
+    tl.store(ref_ptr + offs, _fp4_e2m1_code_rne(x), mask=mask)
+    tl.store(lean_ptr + offs, _fp4_e2m1_code_rne_lean(x), mask=mask)
+
+
+def test_fp4_e2m1_code_rne_lean_matches() -> None:
+    """The prefill index-Q kernel's e2m1 code equals _fp4_e2m1_code_rne on every bf16 value
+    (all the kernel feeds it: bf16 values times a power of two) and on random fp32 bits."""
+    every_bf16 = torch.arange(1 << 16, dtype=torch.int32).to(torch.int16)
+    every_bf16 = every_bf16.view(torch.bfloat16).float()
+    scaled = torch.cat([every_bf16 * 2.0**k for k in (-8, -1, 0, 1, 8)])
+    random_bits = torch.randint(-(1 << 31), 1 << 31, (1 << 22,), dtype=torch.int64)
+    x = torch.cat([scaled, random_bits.to(torch.int32).view(torch.float32)]).cuda()
+    ref = torch.empty(x.shape, dtype=torch.uint8, device="cuda")
+    lean = torch.empty_like(ref)
+    _e2m1_codes_kernel[(triton.cdiv(x.numel(), 1024),)](
+        x, ref, lean, x.numel(), BLOCK=1024
+    )
+    assert torch.equal(lean, ref)
+
+
 @pytest.mark.parametrize("num_tokens", [1, 16, 96])
 def test_fp4_index_cache_store_layout(num_tokens: int) -> None:
     """Scattered slots land in the paged layout and touch nothing else."""
@@ -443,6 +644,47 @@ def test_decode_cta_count_stays_within_available_chunks(
 
     assert 1 <= cta_count <= num_queries * chunks_per_seq
     assert cta_count <= max(1024, num_queries * 4)
+
+
+@pytest.mark.parametrize("num_queries", [1, 200])
+def test_decode_schedule_matches_aiter_varctx_schedule(
+    num_queries: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The in-tree decode schedule writes AITER compute_varctx_schedule's cta_info rows and
+    split factor, including zero-length rows and prefix sums carried across row blocks.
+
+    The row block is shrunk so 200 rows span four blocks. Crossing the production block
+    (1024) needs over a thousand rows, and AITER's reference kernel holds a [256, rows]
+    tile; at 2048 it spent ~9 minutes compiling on the ROCm 10 image."""
+    from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4 import (
+        compute_varctx_schedule,
+    )
+
+    monkeypatch.setattr(
+        "sglang.kernels.ops.attention.dsv4.fp4_indexer_schedule_hip._DECODE_ROW_BLOCK",
+        64,
+    )
+
+    torch.manual_seed(num_queries)
+    max_seq_len = 65536
+    c4_seq_lens = torch.randint(
+        0, max_seq_len, (num_queries,), device=get_device(), dtype=torch.int32
+    )
+    c4_seq_lens[::7] = 0
+    cta_count = _decode_cta_count(num_queries, max_seq_len)
+    ref_safe, ref, _ = compute_varctx_schedule(
+        c4_seq_lens,
+        block_k=256,
+        parallel_unit_num=cta_count,
+        max_seq_len=max_seq_len,
+        next_n=1,
+    )
+    cta_info = torch.empty_like(ref)
+    scratch = build_decode_schedule(
+        c4_seq_lens, cta_info_out=cta_info, max_seq_len=max_seq_len
+    )
+    assert torch.equal(scratch[:1], ref_safe)
+    assert torch.equal(cta_info, ref)
 
 
 def _decode_plan(seq_lens: torch.Tensor, compress_ratio: int) -> CompressorDecodePlan:
@@ -696,6 +938,733 @@ def test_prefill_paged_mqa_logits(batch: int, seq_len: int) -> None:
     _assert_logits_agree(logits, case)
 
 
+def _verify_rows_case(case, rows_per_request: int):
+    """Each request's row as the last ``rows_per_request`` causal rows of a target-verify
+    step: page table, Q and weights repeated per row, bounds ramping up to the context."""
+    q = rows_per_request
+    offs = torch.arange(q - 1, -1, -1, device=get_device(), dtype=torch.int32)
+    row_ends = (case["context"][:, None] - offs[None, :]).clamp_min(0).reshape(-1)
+
+    def rep(t):
+        return t.repeat_interleave(q, dim=0).contiguous()
+
+    return {
+        **case,
+        "q_fp4": rep(case["q_fp4"].view(torch.uint8)).view(case["q_fp4"].dtype),
+        "q_scale": rep(case["q_scale"]),
+        "weights": rep(case["weights"]),
+        "page_table": rep(case["page_table"]),
+        "c4_seq_lens": row_ends.contiguous(),
+        "context": row_ends.contiguous(),
+        "ref_logits_fp4": rep(case["ref_logits_fp4"]),
+        "ref_logits_bf16": rep(case["ref_logits_bf16"]),
+    }
+
+
+@requires_aiter_rowgroup
+@pytest.mark.parametrize(
+    "batch,seq_len,rows_per_request",
+    [(1, 256, 1), (3, 512, 6), (4, 512, 6), (6, 1024, 6), (8, 2048, 1)],
+)
+def test_rowgroup_decode_logits_match_varctx(
+    batch: int, seq_len: int, rows_per_request: int
+) -> None:
+    """The row-group decode path agrees with the varctx kernel within tolerance and picks the
+    same top-k; a request's rows scored as one sequence or one a row are bit for bit equal."""
+    torch.manual_seed(batch * 300 + seq_len + rows_per_request)
+    case = _verify_rows_case(
+        _build_logits_case(batch, seq_len, shuffle_pages=True), rows_per_request
+    )
+    varctx = _run_logits(
+        case,
+        is_decode=True,
+        decode_ws=prepare_fp4_decode_workspace(case["page_table"], case["c4_seq_lens"]),
+    )
+    grouped_ws = prepare_fp4_rowgroup_decode_workspace(
+        case["page_table"], rows_per_request
+    )
+    per_row_ws = prepare_fp4_rowgroup_decode_workspace(case["page_table"], 1)
+    assert isinstance(grouped_ws, FP4RowgroupDecodeWorkspace)
+    assert grouped_ws.max_seq_len == (
+        prepare_fp4_decode_workspace(
+            case["page_table"], case["c4_seq_lens"]
+        ).max_seq_len
+    )
+    grouped = _run_logits(case, is_decode=True, decode_ws=grouped_ws)
+    per_row = _run_logits(case, is_decode=True, decode_ws=per_row_ws)
+
+    for row, ctx in enumerate(case["context"].tolist()):
+        if ctx == 0:
+            continue
+        assert torch.equal(grouped[row, :ctx], per_row[row, :ctx]), f"row {row}"
+        torch.testing.assert_close(
+            grouped[row, :ctx],
+            case["ref_logits_fp4"][row, :ctx],
+            rtol=2.0e-3,
+            atol=2.0e-3,
+        )
+        torch.testing.assert_close(
+            grouped[row, :ctx], varctx[row, :ctx], rtol=1e-5, atol=1e-6
+        )
+        k = min(64, ctx)
+        assert torch.equal(
+            grouped[row, :ctx].topk(k).indices.sort().values,
+            varctx[row, :ctx].topk(k).indices.sort().values,
+        ), f"row {row} top-{k}"
+
+
+def _page8_copy(payload, scale):
+    """The same K cache in the page8 layout (shapes and bytes per 64-slot page unchanged)."""
+    from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_rowgroup import (
+        pack_kv_cache,
+    )
+
+    slots = torch.arange(payload.shape[0] * PAGE_SIZE, device=get_device())
+    packed, exps = _read_index_k_cache(payload, scale, slots)
+    ref_kv, ref_ks = pack_kv_cache(packed, exps.contiguous(), page_size=8)
+    payload8 = torch.zeros_like(payload.view(torch.uint8)).view(payload.dtype)
+    scale8 = torch.zeros_like(scale)
+    kv8, ks8 = index_k_page8_views(payload8, scale8)
+    kv8.view(-1).copy_(ref_kv.reshape(-1))
+    ks8.view(-1).copy_(ref_ks.reshape(-1))
+    return payload8, scale8
+
+
+def _rowgroup_logits(case, rows_per_request: int, *, page8: bool, is_decode: bool):
+    block_tables, max_seq_len = _guard_page_table(
+        case["page_table"][::rows_per_request].contiguous()
+    )
+    rows = case["q_fp4"].shape[0]
+    return rowgroup_paged_mqa_logits(
+        q_fp4=case["q_fp4"],
+        q_scale=case["q_scale"],
+        k_payload=case["payload8"] if page8 else case["payload"],
+        k_scale=case["scale8"] if page8 else case["scale"],
+        weights=case["weights"],
+        weight_scale=case["weight_scale"],
+        block_tables=block_tables,
+        query_start_loc=torch.arange(
+            0, rows + 1, rows_per_request, dtype=torch.int32, device=get_device()
+        ),
+        row_ends=case["c4_seq_lens"],
+        max_query_len=rows_per_request,
+        max_seq_len=max_seq_len,
+        page8=page8,
+        pages_per_block=8 if page8 else 1,
+        is_decode=is_decode,
+    )
+
+
+def _page8_case(batch, seq_len, rows_per_request, *, ctx_lens=None):
+    case = _verify_rows_case(
+        _build_logits_case(batch, seq_len, ctx_lens=ctx_lens, shuffle_pages=True),
+        rows_per_request,
+    )
+    case["payload8"], case["scale8"] = _page8_copy(case["payload"], case["scale"])
+    return case
+
+
+@requires_aiter_rowgroup
+@pytest.mark.parametrize("is_decode", [True, False])
+@pytest.mark.parametrize(
+    "batch,seq_len,rows_per_request,ctx_lens",
+    [
+        (1, 256, 1, None),
+        (3, 512, 6, [512, 77, 300]),
+        (6, 1024, 6, None),
+        (8, 2048, 1, [2048, 1, 9, 1000, 2047, 64, 65, 1500]),
+    ],
+)
+def test_page8_full_scoring_matches_page64(
+    batch, seq_len, rows_per_request, ctx_lens, is_decode
+) -> None:
+    """The page8 pool scored through the 64-slot page table (pages_per_block=8) gives the
+    page-64 pool's logits: same keys, same rows; only the walk granularity differs."""
+    torch.manual_seed(batch * 400 + seq_len + rows_per_request)
+    case = _page8_case(batch, seq_len, rows_per_request, ctx_lens=ctx_lens)
+    ref = _rowgroup_logits(case, rows_per_request, page8=False, is_decode=is_decode)
+    got = _rowgroup_logits(case, rows_per_request, page8=True, is_decode=is_decode)
+    for row, ctx in enumerate(case["context"].tolist()):
+        if ctx == 0:
+            continue
+        torch.testing.assert_close(
+            got[row, :ctx], ref[row, :ctx], rtol=1e-5, atol=1e-6, msg=f"row {row}"
+        )
+        torch.testing.assert_close(
+            got[row, :ctx],
+            case["ref_logits_fp4"][row, :ctx],
+            rtol=2.0e-3,
+            atol=2.0e-3,
+        )
+
+
+@requires_aiter_rowgroup
+def test_rowgroup_prefill_workspace_scores_ragged_requests() -> None:
+    """A page8 prefill workspace scores consecutive requests' rows (one request empty) as the
+    page-64 pool scores every row alone, and reuses a row range's query_start_loc."""
+    torch.manual_seed(13)
+    lens = [4, 0, 6]
+    case = _build_logits_case(3, 512, ctx_lens=[512, 300, 77], shuffle_pages=True)
+    case["payload8"], case["scale8"] = _page8_copy(case["payload"], case["scale"])
+    counts = torch.tensor(lens, device=get_device())
+    starts = torch.tensor([0, 4, 4], device=get_device())
+    local = torch.arange(sum(lens), device=get_device()) - starts.repeat_interleave(
+        counts
+    )
+    row_ends = (
+        case["context"].repeat_interleave(counts)
+        - (counts.repeat_interleave(counts) - 1 - local)
+    ).clamp_min(0)
+    row_ends = row_ends.to(torch.int32).contiguous()
+
+    def rep(t):
+        return t.repeat_interleave(counts, dim=0).contiguous()
+
+    q_fp4 = rep(case["q_fp4"].view(torch.uint8)).view(case["q_fp4"].dtype)
+    q_scale, weights = rep(case["q_scale"]), rep(case["weights"])
+    page_table = rep(case["page_table"])
+    rows = slice(0, sum(lens))
+
+    workspace = prepare_fp4_rowgroup_prefill_workspace(page_table, lens)
+    query_start_loc = rowgroup_prefill_query_start_loc(workspace, rows, lens)
+    assert rowgroup_prefill_query_start_loc(workspace, rows, lens) is query_start_loc
+    assert query_start_loc.tolist() == [0, 4, 4, 10]
+    common = dict(
+        q_fp4=q_fp4,
+        q_scale=q_scale,
+        weights=weights,
+        weight_scale=case["weight_scale"],
+        row_ends=row_ends,
+        is_decode=False,
+    )
+    got = rowgroup_paged_mqa_logits(
+        k_payload=case["payload8"],
+        k_scale=case["scale8"],
+        block_tables=workspace.request_page_table,
+        query_start_loc=query_start_loc,
+        max_query_len=max(lens),
+        max_seq_len=workspace.max_seq_len,
+        page8=True,
+        pages_per_block=8,
+        **common,
+    )
+    per_row_table, max_seq_len = _guard_page_table(page_table)
+    ref = rowgroup_paged_mqa_logits(
+        k_payload=case["payload"],
+        k_scale=case["scale"],
+        block_tables=per_row_table,
+        query_start_loc=torch.arange(
+            sum(lens) + 1, dtype=torch.int32, device=get_device()
+        ),
+        max_query_len=1,
+        max_seq_len=max_seq_len,
+        page8=False,
+        **common,
+    )
+    for row, end in enumerate(row_ends.tolist()):
+        torch.testing.assert_close(
+            got[row, :end], ref[row, :end], rtol=1e-5, atol=1e-6, msg=f"row {row}"
+        )
+
+
+@requires_aiter_rowgroup
+def test_rowgroup_table_columns_fix_the_compiled_width() -> None:
+    """Workspaces built with rowgroup_table_columns share one block-table width whatever
+    the context, so the row-group kernel compiles one variant for it, and score exactly
+    as tables at their own width; the logits width stays each step's own."""
+    torch.manual_seed(14)
+    columns = rowgroup_table_columns(1 << 20, 1, LOW_RATIO_PAGE_TABLE_BUCKET)
+    widths = set()
+    for ctx in (300, 5000, 9000):
+        case = _build_logits_case(1, ctx, ctx_lens=[ctx], shuffle_pages=True)
+        case["payload8"], case["scale8"] = _page8_copy(case["payload"], case["scale"])
+        rows = 3
+        row_ends = torch.arange(ctx - rows + 1, ctx + 1, dtype=torch.int32).to(
+            get_device()
+        )
+        page_table = case["page_table"].expand(rows, -1).contiguous()
+        q_fp4 = case["q_fp4"].view(torch.uint8).expand(rows, -1, -1).contiguous()
+        common = dict(
+            q_fp4=q_fp4.view(case["q_fp4"].dtype),
+            q_scale=case["q_scale"].expand(rows, -1, -1, -1, -1).contiguous(),
+            weights=case["weights"].expand(rows, -1).contiguous(),
+            k_payload=case["payload8"],
+            k_scale=case["scale8"],
+            weight_scale=case["weight_scale"],
+            query_start_loc=torch.tensor(
+                [0, rows], dtype=torch.int32, device=get_device()
+            ),
+            row_ends=row_ends,
+            max_query_len=rows,
+            page8=True,
+            pages_per_block=8,
+            is_decode=False,
+        )
+        fixed = prepare_fp4_rowgroup_prefill_workspace(
+            page_table, [rows], LOW_RATIO_PAGE_TABLE_BUCKET, table_columns=columns
+        )
+        own = prepare_fp4_rowgroup_prefill_workspace(
+            page_table, [rows], LOW_RATIO_PAGE_TABLE_BUCKET
+        )
+        assert fixed.request_page_table.shape[1] == columns
+        assert fixed.max_seq_len == own.max_seq_len
+        widths.add(fixed.request_page_table.stride(0))
+        got = rowgroup_paged_mqa_logits(
+            block_tables=fixed.request_page_table,
+            max_seq_len=fixed.max_seq_len,
+            **common,
+        ).clone()
+        ref = rowgroup_paged_mqa_logits(
+            block_tables=own.request_page_table, max_seq_len=own.max_seq_len, **common
+        )
+        for row, end in enumerate(row_ends.tolist()):
+            assert torch.equal(got[row, :end], ref[row, :end]), f"{ctx=} row {row}"
+    assert widths == {columns}
+
+
+def _selected_slots(page_indices: torch.Tensor) -> list[list[int]]:
+    return [sorted(v for v in row if v >= 0) for row in page_indices.tolist()]
+
+
+# ---------------------------------------------------------------------------
+# DeepSeek-V4 C4 decode / DSpark target-verify on the row-group kernel
+# (SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP): the backend builds a row-group decode
+# workspace for both modes and the indexer scores verify rows as decode rows.
+# ---------------------------------------------------------------------------
+
+_C4_RATIO = 4
+# DeepSeek-V4-Pro's index_topk
+_C4_TOPK = 1024
+# The server's context length the C4 table width is fixed for; small enough for a test.
+_C4_MAX_CONTEXT = 1 << 18
+
+
+def _c4_step_case(seq_lens: list[int], rows_per_request: int):
+    """One DSv4 C4 indexer step: a decode (one row a request) or a DSpark target-verify
+    (rows_per_request causal rows a request, each with its own query). ``seq_lens`` are
+    the requests' token lengths after the step, so row r of request b sits at token
+    position seq_lens[b] - rows_per_request + r and sees (pos + 1) // 4 compressed keys,
+    as c4_topk_lengths_raw has it. The index-K pages are shuffled and every byte the step
+    must not read is garbage; the page table is the indexer's: one row per query row, as
+    wide as the backend's graph table, zero past the request's pages."""
+    q_rows = rows_per_request
+    batch = len(seq_lens)
+    dev = get_device()
+    keys = [-(-s // _C4_RATIO) for s in seq_lens]
+    pages_per_seq = -(-max(keys) // PAGE_SIZE)
+    padded_len = pages_per_seq * PAGE_SIZE
+    num_pages = batch * pages_per_seq + 5
+    # queries rotate at token positions, keys at compressed ones
+    cos, sin, _ = _rope_tables(max(max(seq_lens), padded_len, 256))
+    payload, scale = _empty_index_k_cache(num_pages)
+    payload.view(torch.uint8).random_(0, 256)
+    scale.random_(100, 140)
+
+    physical = torch.randperm(num_pages, device=dev)[: batch * pages_per_seq]
+    req_pages = physical.to(torch.int32).reshape(batch, pages_per_seq)
+    kv_positions = torch.arange(padded_len, device=dev).repeat(batch)
+    loc = (
+        req_pages.long()[:, :, None] * PAGE_SIZE
+        + torch.arange(PAGE_SIZE, device=dev)[None, None, :]
+    ).reshape(-1)
+    k = torch.randn(batch * padded_len, HEAD_DIM, device=dev, dtype=torch.bfloat16)
+    norm_weight = torch.randn(HEAD_DIM, device=dev, dtype=torch.bfloat16)
+    _write_index_k_cache(k, norm_weight, cos, sin, kv_positions, loc, payload, scale)
+    k_dq = _ref_dequantize_fp4_indexer(*_read_index_k_cache(payload, scale, loc))
+    k_dq = k_dq.reshape(batch, padded_len, HEAD_DIM)
+
+    pos = torch.tensor(
+        [s - q_rows + r for s in seq_lens for r in range(q_rows)], device=dev
+    ).clamp_min(0)
+    row_ends = ((pos + 1) // _C4_RATIO).to(torch.int32)
+    width = rowgroup_table_columns(_C4_MAX_CONTEXT, _C4_RATIO) - 4
+    page_table = torch.zeros(batch, width, dtype=torch.int32, device=dev)
+    page_table[:, :pages_per_seq] = req_pages
+    page_table = page_table.repeat_interleave(q_rows, dim=0).contiguous()
+
+    q = torch.randn(
+        batch * q_rows, NUM_HEADS, HEAD_DIM, device=dev, dtype=torch.bfloat16
+    )
+    q_fp4, q_scale = aiter_q_indexer_fp4(q.contiguous(), cos, sin, pos)
+    q_dq = _ref_dequantize_fp4_indexer(
+        q_fp4.view(torch.uint8),
+        _ref_quantize_fp4_indexer(_ref_q_transform(q, cos, sin, pos))[1],
+    ).reshape(batch, q_rows, NUM_HEADS, HEAD_DIM)
+    weights = torch.randn(batch * q_rows, NUM_HEADS, device=dev, dtype=torch.bfloat16)
+    weight_scale = HEAD_DIM**-0.5 * NUM_HEADS**-0.5
+    per_head = torch.einsum("bqhd,bsd->bqhs", q_dq.float(), k_dq.float()).relu()
+    ref = weight_scale * torch.einsum(
+        "bqhs,bqh->bqs", per_head, weights.float().view(batch, q_rows, NUM_HEADS)
+    )
+    return {
+        "q_fp4": q_fp4,
+        "q_scale": q_scale,
+        "payload": payload,
+        "scale": scale,
+        "weights": weights,
+        "weight_scale": weight_scale,
+        "page_table": page_table,
+        "c4_seq_lens": row_ends,
+        "context": row_ends,
+        "ref_logits_fp4": ref.reshape(batch * q_rows, padded_len),
+        "rows_per_request": q_rows,
+    }
+
+
+def _c4_rowgroup_ws(case, rows_per_request=None, **kwargs):
+    """The workspace the backend builds for a C4 decode / target-verify step: a request's
+    rows one sequence."""
+    kwargs.setdefault("min_grouped_seqs", 1)
+    return prepare_fp4_rowgroup_decode_workspace(
+        case["page_table"],
+        rows_per_request or case["rows_per_request"],
+        table_columns=rowgroup_table_columns(_C4_MAX_CONTEXT, _C4_RATIO),
+        **kwargs,
+    )
+
+
+def _c4_schedule_logits(case):
+    """Today's path: decode on the varctx kernel, target-verify on the prefill kernel."""
+    if case["rows_per_request"] == 1:
+        ws = prepare_fp4_decode_workspace(case["page_table"], case["c4_seq_lens"])
+        return _run_logits(case, is_decode=True, decode_ws=ws)
+    ws = prepare_fp4_prefill_workspace(case["page_table"], case["c4_seq_lens"])
+    return _run_logits(case, is_decode=False, prefill_ws=ws)
+
+
+def _c4_topk(case, logits):
+    """The production paged top-k (v2, index_topk 1024) over each row's own [0, len):
+    (page-table slots, raw positions)."""
+    rows = logits.shape[0]
+    pages = torch.empty(rows, _C4_TOPK, dtype=torch.int32, device=logits.device)
+    raw = torch.empty_like(pages)
+    lens = case["c4_seq_lens"]
+    topk_transform_paged_v2(
+        logits, lens, case["page_table"], pages, PAGE_SIZE, plan_topk_v2(lens), raw
+    )
+    return pages, raw
+
+
+def _assert_same_topk(case, raw_a, raw_b, scores, *, what: str) -> None:
+    """Equal top-k sets, up to keys tied with the k-th score within fp32 noise."""
+    for row, end in enumerate(case["c4_seq_lens"].tolist()):
+        a = {int(v) for v in raw_a[row].tolist() if v >= 0}
+        b = {int(v) for v in raw_b[row].tolist() if v >= 0}
+        assert len(a) == len(b) == min(end, _C4_TOPK), (what, row, len(a), len(b))
+        assert all(v < end for v in a | b), (what, row)
+        diff = a ^ b
+        if not diff:
+            continue
+        row_scores = scores[row, :end]
+        kth = row_scores.topk(min(end, _C4_TOPK)).values[-1]
+        near = (row_scores[list(diff)] - kth).abs() <= 1e-4 * kth.abs().clamp_min(1)
+        assert bool(near.all()), f"{what} row {row}: top-k differs off the tie {diff}"
+
+
+_C4_STEP_CASES = [
+    # decode: one row a request
+    ([9000], 1),
+    ([3000, 17000, 700], 1),
+    # DSpark block 3: 4 rows a request (DP8 c192+, TP c48)
+    ([9000], 4),
+    ([2500, 13000, 6000], 4),
+    ([16000, 2049, 8001, 600, 12345], 4),
+    # DSpark block 6: 7 rows a request (TP c4~c32)
+    ([12000], 7),
+    ([5000, 15000, 2100, 9100, 3, 7777], 7),
+]
+
+
+@requires_aiter_rowgroup
+@pytest.mark.parametrize("seq_lens,rows_per_request", _C4_STEP_CASES)
+def test_c4_rowgroup_matches_schedule_path_and_reference(
+    seq_lens, rows_per_request, monkeypatch
+) -> None:
+    """A C4 decode / target-verify step on the row-group kernel scores what today's
+    kernels score, against the FP4 reference, and the top-k (v2, 1024) picks the same
+    keys; grouped (a request's rows one sequence) and per-row scoring agree bit for bit.
+    The row-group logits are poisoned past each row's bound, which the top-k never reads.
+    """
+    torch.manual_seed(sum(seq_lens) + rows_per_request)
+    case = _c4_step_case(seq_lens, rows_per_request)
+    baseline = _c4_schedule_logits(case).clone()
+
+    import sglang.kernels.ops.attention.dsv4.fp4_indexer_hip as hip_mod
+
+    real_alloc = hip_mod._alloc_logits
+
+    def poisoned(num_tokens, max_seq_len, device, is_decode):
+        return real_alloc(num_tokens, max_seq_len, device, is_decode).fill_(
+            float("inf")
+        )
+
+    monkeypatch.setattr(hip_mod, "_alloc_logits", poisoned)
+    ws = _c4_rowgroup_ws(case)
+    per_row_ws = _c4_rowgroup_ws(case, rows_per_request=1)
+    assert ws.guarded_page_table.shape[1] == rowgroup_table_columns(
+        _C4_MAX_CONTEXT, _C4_RATIO
+    )
+    assert ws.rows_per_seq == rows_per_request
+    assert per_row_ws.rows_per_seq == 1
+    got = _run_logits(case, is_decode=True, decode_ws=ws).clone()
+    per_row = _run_logits(case, is_decode=True, decode_ws=per_row_ws).clone()
+
+    for row, end in enumerate(case["c4_seq_lens"].tolist()):
+        if end == 0:
+            continue
+        assert torch.equal(got[row, :end], per_row[row, :end]), f"row {row}"
+        torch.testing.assert_close(
+            got[row, :end],
+            case["ref_logits_fp4"][row, :end],
+            rtol=2.0e-3,
+            atol=2.0e-3,
+            msg=f"row {row} vs reference",
+        )
+        torch.testing.assert_close(
+            got[row, :end],
+            baseline[row, :end],
+            rtol=1e-5,
+            atol=1e-6,
+            msg=f"row {row} vs schedule path",
+        )
+
+    pages_new, raw_new = _c4_topk(case, got)
+    pages_old, raw_old = _c4_topk(case, baseline)
+    _assert_same_topk(case, raw_new, raw_old, baseline, what="vs schedule path")
+    ref = case["ref_logits_fp4"]
+    _, raw_ref = _c4_topk(case, ref.contiguous())
+    _assert_same_topk(case, raw_new, raw_ref, ref, what="vs reference")
+    # the paged output is the raw pick through the request's page table
+    sel = raw_new.clamp_min(0).long()
+    expect = case["page_table"].long().gather(1, sel // PAGE_SIZE) * PAGE_SIZE + (
+        sel % PAGE_SIZE
+    )
+    expect = torch.where(raw_new >= 0, expect, torch.full_like(expect, -1))
+    assert torch.equal(pages_new.long(), expect)
+
+
+@requires_aiter_rowgroup
+def test_c4_rowgroup_stale_workspace_stays_on_rowgroup() -> None:
+    """A row-group workspace sized for another row count (DP padding, truncated
+    activations) is rebuilt per row on the same table width, not dropped onto the
+    schedule kernels."""
+    torch.manual_seed(21)
+    case = _c4_step_case([6000, 9000, 4000, 7000], 4)
+    stale = _c4_rowgroup_ws(case)
+    rows = case["page_table"].shape[0] - 3
+    sub = {
+        **case,
+        **{
+            key: case[key][:rows]
+            for key in ("q_fp4", "q_scale", "weights", "page_table", "c4_seq_lens")
+        },
+    }
+    with_stale = _run_logits(sub, is_decode=True, decode_ws=stale)
+    fresh = _run_logits(
+        sub, is_decode=True, decode_ws=_c4_rowgroup_ws(sub, rows_per_request=1)
+    )
+    for row, end in enumerate(sub["c4_seq_lens"].tolist()):
+        assert torch.equal(with_stale[row, :end], fresh[row, :end]), f"row {row}"
+
+
+@requires_aiter_rowgroup
+@pytest.mark.parametrize("rows_per_request", [4, 7])
+def test_c4_rowgroup_workspace_and_logits_replay_in_a_graph(
+    rows_per_request: int,
+) -> None:
+    """The backend builds the workspace inside the captured graph: a replay over new
+    lengths and pages scores as an eager step does."""
+    torch.manual_seed(31 + rows_per_request)
+    first = _c4_step_case([8000, 3000, 12000, 5000, 9000], rows_per_request)
+    second = _c4_step_case([2000, 11000, 6100, 9999, 300], rows_per_request)
+    keys = ("q_fp4", "q_scale", "weights", "page_table", "c4_seq_lens")
+    static = {key: torch.empty_like(first[key]) for key in keys}
+    pool_pages = max(first["payload"].shape[0], second["payload"].shape[0])
+    payload, scale = _empty_index_k_cache(pool_pages)
+
+    def load(case):
+        for key in keys:
+            # byte views: the fp4 operands have no copy kernel of their own
+            static[key].view(torch.uint8).copy_(case[key].view(torch.uint8))
+        payload.view(torch.uint8)[: case["payload"].shape[0]].copy_(
+            case["payload"].view(torch.uint8)
+        )
+        scale[: case["scale"].shape[0]].copy_(case["scale"])
+
+    def step():
+        ws = prepare_fp4_rowgroup_decode_workspace(
+            static["page_table"],
+            rows_per_request,
+            table_columns=rowgroup_table_columns(_C4_MAX_CONTEXT, _C4_RATIO),
+            min_grouped_seqs=1,
+        )
+        return aiter_fp4_paged_mqa_logits(
+            q_fp4=static["q_fp4"],
+            q_scale=static["q_scale"],
+            k_payload=payload,
+            k_scale=scale,
+            weights=static["weights"],
+            page_table=static["page_table"],
+            c4_seq_lens=static["c4_seq_lens"],
+            weight_scale=first["weight_scale"],
+            is_decode=True,
+            decode_workspace=ws,
+        )
+
+    load(first)
+    step()  # compile outside the capture
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = step()
+    for case in (second, first):
+        load(case)
+        graph.replay()
+        eager = step()
+        torch.cuda.synchronize()
+        for row, end in enumerate(case["c4_seq_lens"].tolist()):
+            assert torch.equal(out[row, :end], eager[row, :end]), f"row {row}"
+            torch.testing.assert_close(
+                out[row, :end],
+                case["ref_logits_fp4"][row, :end],
+                rtol=2.0e-3,
+                atol=2.0e-3,
+            )
+
+
+@requires_aiter_rowgroup
+@pytest.mark.parametrize(
+    "batch,seq_len,rows_per_request,topk_blocks,topk",
+    [(2, 1024, 1, 32, 64), (3, 2048, 6, 64, 128), (4, 4096, 2, 128, 256)],
+)
+def test_page8_candidates_match_gather(
+    batch, seq_len, rows_per_request, topk_blocks, topk
+) -> None:
+    """A consumer scoring only its candidate blocks on the page8 pool selects what top-k over
+    the full context's logits gathered to those blocks selects."""
+    torch.manual_seed(batch * 500 + seq_len)
+    ctx = [seq_len - 3 * b for b in range(batch)]
+    case = _page8_case(batch, seq_len, rows_per_request, ctx_lens=ctx)
+    seq_lens = case["c4_seq_lens"]
+    full = _rowgroup_logits(case, rows_per_request, page8=False, is_decode=True)
+    candidates = select_candidate_blocks_hip(
+        full, seq_lens, topk_blocks=topk_blocks, block_size=8
+    )
+    rows = full.shape[0]
+
+    def run(page8: bool):
+        page_indices = torch.full(
+            (rows, topk), -7, dtype=torch.int32, device=get_device()
+        )
+        raw = torch.full_like(page_indices, -7)
+        common = dict(
+            page_table=case["page_table"],
+            page_size=PAGE_SIZE,
+            page_indices=page_indices,
+            raw_indices=raw,
+        )
+        if page8:
+            topk_within_candidate_blocks_page8(
+                q_fp4=case["q_fp4"],
+                q_scale=case["q_scale"],
+                weights=case["weights"],
+                k_payload=case["payload8"],
+                k_scale=case["scale8"],
+                candidates=candidates,
+                seq_lens=seq_lens,
+                **common,
+            )
+        else:
+            topk_within_candidate_blocks_hip(full, seq_lens, candidates, **common)
+        return page_indices, raw
+
+    ref_pages, ref_raw = run(False)
+    got_pages, got_raw = run(True)
+    assert _selected_slots(got_pages) == _selected_slots(ref_pages)
+    assert _selected_slots(got_raw) == _selected_slots(ref_raw)
+    for row in range(rows):
+        n = int((ref_pages[row] >= 0).sum())
+        assert (got_pages[row, :n] >= 0).all() and (got_pages[row, n:] == -1).all()
+
+
+@requires_aiter_rowgroup
+def test_sliced_page8_table_matches_rebuilt() -> None:
+    """A row chunk of candidates carrying their page8 table selects what the chunk with the
+    table rebuilt from its own rows selects."""
+    torch.manual_seed(11)
+    case = _page8_case(2, 2048, 6, ctx_lens=[2048, 1500])
+    seq_lens = case["c4_seq_lens"]
+    full = _rowgroup_logits(case, 6, page8=False, is_decode=True)
+    candidates = with_candidate_page8_table(
+        select_candidate_blocks_hip(full, seq_lens, topk_blocks=64, block_size=8),
+        seq_lens,
+        case["page_table"],
+        page_size=PAGE_SIZE,
+    )
+    rows = slice(3, 10)
+
+    def run(cands):
+        page_indices = torch.full((7, 128), -7, dtype=torch.int32, device=get_device())
+        topk_within_candidate_blocks_page8(
+            q_fp4=case["q_fp4"][rows],
+            q_scale=case["q_scale"][rows],
+            weights=case["weights"][rows],
+            k_payload=case["payload8"],
+            k_scale=case["scale8"],
+            candidates=cands,
+            seq_lens=seq_lens[rows],
+            page_table=case["page_table"][rows],
+            page_size=PAGE_SIZE,
+            page_indices=page_indices,
+            raw_indices=None,
+        )
+        return page_indices
+
+    sliced = slice_candidate_blocks(candidates, rows)
+    assert sliced.page8 is not None
+    rebuilt = candidate_page8_table(
+        sliced.ids,
+        seq_lens[rows],
+        case["page_table"][rows],
+        block_size=8,
+        page_size=PAGE_SIZE,
+    )
+    for got, ref in zip(sliced.page8, rebuilt):
+        assert torch.equal(got, ref)
+    # the top-k leaves its selection in no fixed order
+    assert _selected_slots(run(sliced)) == _selected_slots(
+        run(sliced._replace(page8=None))
+    )
+
+
+def test_candidate_page8_table_moves_newest_block_last() -> None:
+    """The newest block trades places with the last kept id; each id maps to its 8-slot page
+    through the 64-slot page table; the compact length counts the full blocks plus the newest
+    block's reachable part; query_start_loc is one row per sequence."""
+    page_table = torch.tensor(
+        [[5, 2, 9], [7, 0, 0], [4, 6, 0]], dtype=torch.int32, device="cuda"
+    )
+    ids = torch.tensor(
+        [[3, 17, 8, 0, -1], [-1, -1, -1, -1, -1], [9, 2, 15, -1, -1]],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    seq_lens = torch.tensor([140, 0, 128], dtype=torch.int32, device="cuda")
+    out_ids, pages, lens, qsl = candidate_page8_table(
+        ids, seq_lens, page_table, block_size=8, page_size=64
+    )
+    assert out_ids.tolist() == [[3, 0, 8, 17, -1], [-1] * 5, [9, 2, 15, -1, -1]]
+    # block b lives in 64-slot page page_table[b // 8], 8-slot sub-page b % 8
+    assert pages.tolist() == [
+        [5 * 8 + 3, 5 * 8 + 0, 2 * 8 + 0, 9 * 8 + 1, 0],
+        [0] * 5,
+        [6 * 8 + 1, 4 * 8 + 2, 6 * 8 + 7, 0, 0],
+    ]
+    # 140 positions: block 17 covers 136..143, 4 reachable; 128: newest block 15 is full
+    assert lens.tolist() == [3 * 8 + 4, 0, 3 * 8]
+    assert qsl.tolist() == [0, 1, 2, 3]
+
+
 @pytest.mark.parametrize("is_decode", [True, False])
 def test_logits_with_ragged_context_lengths(is_decode: bool) -> None:
     """Sizing the persistent grid for uneven contexts is the scheduler's job.
@@ -823,6 +1792,223 @@ def test_row_chunks_reproduce_the_unsplit_batch() -> None:
                 full[start + row, :ctx],
                 msg=f"row {start + row} (ctx={ctx})",
             )
+
+
+def pack_fp4_query_flydsl_torch(q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """The three-launch form of pack_fp4_query_flydsl: the shared quantizer, then
+    zeros and a permuted copy into the scale layout."""
+    num_tokens, heads = q.shape[0], q.shape[1]
+    assert heads % 16 == 0 and heads <= 64, heads
+    q_fp4, q_sf = quantize_fp4_indexer_tensor(q.flatten(0, 1), rne=True)
+    q_fp4 = q_fp4.view(num_tokens, heads, 64)
+    sf_bytes = q_sf.view(torch.uint8).view(num_tokens, heads // 16, 16, 4)
+    q_scale = torch.zeros((num_tokens, 1, 4, 16, 4), dtype=torch.uint8, device=q.device)
+    q_scale[:, 0, :, :, : heads // 16] = sf_bytes.permute(0, 3, 2, 1)
+    return q_fp4, q_scale
+
+
+def test_pack_fp4_query_flydsl_single_launch():
+    torch.manual_seed(17)
+    heads, dtype = 32, torch.bfloat16
+    q = torch.randn(40, heads, 128, device=get_device(), dtype=dtype) * 4
+    # exact fp4 grid points and tie values, zeros and a huge group
+    q[0, 0, :32] = torch.tensor(
+        [0.0, 0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0] * 4,
+        device=get_device(),
+        dtype=dtype,
+    )
+    q[0, 0, 32:64] = 0.0
+    q[0, 0, 64:96] = 3.0e4
+    ref_fp4, ref_scale = pack_fp4_query_flydsl_torch(q)
+    fp4, scale = pack_fp4_query_flydsl(q)
+    assert fp4.dtype is ref_fp4.dtype and scale.dtype is ref_scale.dtype
+    assert torch.equal(fp4, ref_fp4)
+    assert torch.equal(scale, ref_scale)
+    empty = torch.empty(0, heads, 128, device=get_device(), dtype=dtype)
+    fp4, scale = pack_fp4_query_flydsl(empty)
+    assert fp4.shape == (0, heads, 64) and scale.shape == (0, 1, 4, 16, 4)
+
+
+@pytest.mark.parametrize("compressed_kv", [False, True], ids=["False", "True"])
+def test_rope_fake_quant_gathers_freqs_by_position(compressed_kv: bool):
+
+    torch.manual_seed(19)
+    table = torch.polar(
+        torch.ones(4096, 32, device=get_device()),
+        torch.rand(4096, 32, device=get_device()) * 6.283,
+    )
+    x = torch.randn(17, 32, 128, device=get_device(), dtype=torch.bfloat16) * 3
+    for pos_dtype in (torch.int64, torch.int32):
+        pos = torch.randint(0, 4096, (17,), device=get_device(), dtype=pos_dtype)
+        ref = rope_tail_fake_quant_fp4(x, table[pos], 64, compressed_kv=compressed_kv)
+        out = rope_tail_fake_quant_fp4(
+            x, table, 64, compressed_kv=compressed_kv, positions=pos
+        )
+        assert torch.equal(out, ref)
+
+
+@pytest.mark.parametrize("ratio", [1, 4])
+def test_index_k_split_writer_matches_the_triton_chain(ratio: int) -> None:
+    """index_k_norm_rope_pack_store_split writes the bytes of RMSNorm, then the Triton
+    rope_tail_fake_quant_fp4 and store_fp4_index_k_cache_split (rne); slot 0 stays empty."""
+
+    torch.manual_seed(ratio)
+    num_tokens, page_size, num_pages, max_pos = 100, 64, 4, 4096
+    x = (torch.randn(num_tokens, 128, device="cuda") * 3).bfloat16()
+    x[3] = 0
+    norm_weight = (1 + 0.1 * torch.randn(128, device="cuda")).bfloat16()
+    freqs_cis = precompute_freqs_cis(64, max_pos, 0, 10000, 1, 32, 1).to("cuda")
+    freqs = torch.view_as_real(freqs_cis).flatten(-2)
+    positions = torch.randint(0, max_pos, (num_tokens,), device="cuda")
+    loc = torch.randperm(num_pages * page_size - 1, device="cuda")[:num_tokens] + 1
+    loc[:3] = 0
+
+    payload = torch.zeros(
+        num_pages, 1, 4, page_size, 16, dtype=torch.uint8, device="cuda"
+    )
+    scale = torch.zeros(num_pages, 1, 4, page_size, dtype=torch.uint8, device="cuda")
+    index_k_norm_rope_pack_store_split(
+        x, norm_weight, 1e-6, freqs, positions, loc, payload, scale, ratio=ratio
+    )
+
+    xf = x.float()
+    normed = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + 1e-6)
+    normed = (normed * norm_weight.float()).bfloat16()
+    # a compressed row takes the rope of its group's first position
+    roped = rope_tail_fake_quant_fp4(normed, freqs_cis[positions & ~(ratio - 1)], 64)
+    ref_payload, ref_scale = torch.zeros_like(payload), torch.zeros_like(scale)
+    store_fp4_index_k_cache_split(
+        roped[3:], ref_payload, ref_scale, loc[3:], page_size=page_size, rne=True
+    )
+    assert torch.equal(payload, ref_payload)
+    assert torch.equal(scale, ref_scale)
+
+
+@requires_aiter_rowgroup
+@pytest.mark.parametrize("writer", ["hip", "triton"])
+@pytest.mark.parametrize("ratio", [1, 2])
+def test_index_k_page8_writers_match_pack_kv_cache(writer: str, ratio: int) -> None:
+    """A page8 pool holds the bytes aiter's pack_kv_cache(page_size=8) lays out for the rows
+    the page-64 writer stores, slot for slot, and reads back as those rows."""
+    from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_rowgroup import (
+        pack_kv_cache,
+    )
+
+    torch.manual_seed(ratio + 7 * (writer == "hip"))
+    num_tokens, page_size, num_pages, max_pos = 200, 64, 5, 4096
+    x = (torch.randn(num_tokens, 128, device="cuda") * 3).bfloat16()
+    norm_weight = (1 + 0.1 * torch.randn(128, device="cuda")).bfloat16()
+    freqs_cis = precompute_freqs_cis(64, max_pos, 0, 10000, 1, 32, 1).to("cuda")
+    freqs = torch.view_as_real(freqs_cis).flatten(-2)
+    positions = torch.randint(0, max_pos, (num_tokens,), device="cuda")
+    loc = torch.randperm(num_pages * page_size - 1, device="cuda")[:num_tokens] + 1
+
+    def write(page8: bool):
+        payload = torch.zeros(
+            num_pages, 1, 4, page_size, 16, dtype=torch.uint8, device="cuda"
+        )
+        scale = torch.zeros(
+            num_pages, 1, 4, page_size, dtype=torch.uint8, device="cuda"
+        )
+        if writer == "hip":
+            index_k_norm_rope_pack_store_split(
+                x,
+                norm_weight,
+                1e-6,
+                freqs,
+                positions,
+                loc,
+                payload,
+                scale,
+                ratio=ratio,
+                page8=page8,
+            )
+        else:
+            store_fp4_index_k_cache_split(
+                x, payload, scale, loc, page_size=page_size, rne=True, page8=page8
+            )
+        return payload, scale
+
+    payload64, scale64 = write(False)
+    payload8, scale8 = write(True)
+
+    slots = torch.arange(num_pages * page_size, device="cuda")
+    rows, packed_sf = read_fp4_index_k_split(
+        payload64, scale64, slots, page_size=page_size
+    )
+    sf_bytes = torch.stack([(packed_sf >> (8 * c)) & 0xFF for c in range(4)], dim=-1)
+    ref_kv, ref_ks = pack_kv_cache(
+        rows.view(torch.uint8), sf_bytes.to(torch.uint8), page_size=8
+    )
+    kv8, ks8 = index_k_page8_views(payload8, scale8)
+    assert torch.equal(kv8.flatten(), ref_kv.flatten())
+    assert torch.equal(ks8.flatten(), ref_ks.flatten())
+
+    rows8, packed8 = read_fp4_index_k_split(
+        payload8, scale8, loc, page_size=page_size, page8=True
+    )
+    ref_rows, ref_packed = read_fp4_index_k_split(
+        payload64, scale64, loc, page_size=page_size
+    )
+    assert torch.equal(rows8, ref_rows) and torch.equal(packed8, ref_packed)
+
+
+E2M1 = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
+TIES = [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0]
+RNE = [0.0, 1.0, 1.0, 2.0, 2.0, 4.0, 4.0]
+
+
+def _tie_row(scale: float, values) -> torch.Tensor:
+    """[128]: four 32-blocks of [6, +values, -values, 0...] times a power-of-two scale."""
+    block = [6.0] + values + [-v for v in values]
+    block += [0.0] * (32 - len(block))
+    return (torch.tensor(block) * scale).repeat(4)
+
+
+def _unpack(packed: torch.Tensor) -> torch.Tensor:
+    """Packed e2m1 nibbles [..., 64] (low nibble first) -> values [..., 128]."""
+    p = packed.view(torch.uint8).to(torch.int64).cpu()
+    codes = torch.stack([p & 0xF, p >> 4], dim=-1).flatten(-2)
+    mag = E2M1[codes & 7]
+    return torch.where((codes & 8) != 0, -mag, mag)
+
+
+def test_low_ratio_triton_paths_round_half_to_even_like_cuda() -> None:
+    """Same Triton quantizer as CUDA (rne=True): ties to even on both."""
+
+    scale = 2.0**-3
+    e8m0 = 127 + int(torch.log2(torch.tensor(scale)))
+    expected = _tie_row(scale, RNE)
+
+    def check(name, got):
+        assert torch.equal(got.float().cpu(), expected), f"{name}: {got[1:8].tolist()}"
+
+    row = _tie_row(scale, TIES).cuda().to(torch.bfloat16)
+    assert torch.equal(row.float().cpu(), _tie_row(scale, TIES))
+
+    fp4, sf = quantize_fp4_indexer_tensor(row.view(1, 128), rne=True)
+    assert (sf.cpu() & 0xFF).item() == e8m0
+    check("quantize_fp4_indexer_tensor(rne=True)", _unpack(fp4)[0] * scale)
+
+    q_fp4, q_scale = pack_fp4_query_flydsl(
+        row.view(1, 1, 128).expand(1, 16, 128).contiguous()
+    )
+    assert q_scale.unique().tolist() == [0, e8m0]
+    check("pack_fp4_query_flydsl", _unpack(q_fp4)[0, 0] * scale)
+
+    payload = torch.zeros((1, 1, 4, 64, 16), dtype=torch.uint8, device="cuda")
+    k_scale = torch.zeros((1, 1, 4, 64), dtype=torch.uint8, device="cuda")
+    loc = torch.tensor([5], dtype=torch.int64, device="cuda")
+    store_fp4_index_k_cache_split(
+        row.view(1, 128), payload, k_scale, loc, page_size=64, rne=True
+    )
+    k_fp4, k_sf = read_fp4_index_k_split(payload, k_scale, loc, page_size=64)
+    assert (k_sf.cpu() & 0xFF).item() == e8m0
+    check("store_fp4_index_k_cache_split", _unpack(k_fp4)[0] * scale)
+
+    freqs = torch.ones(1, 32, dtype=torch.complex64, device="cuda")
+    fq = rope_tail_fake_quant_fp4(row.view(1, 128), freqs, 64)
+    check("rope_tail_fake_quant_fp4", fq[0])
 
 
 if __name__ == "__main__":

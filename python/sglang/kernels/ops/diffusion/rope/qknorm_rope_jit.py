@@ -33,8 +33,12 @@ def _jit_qknorm_rope_module(
     round_norm_before_rope: bool,
     pack_kv: bool = False,
     cache_has_full_width: bool = False,
+    out_of_place: bool = False,
+    half_warp: bool = True,
 ) -> Module:
-    args = make_cpp_args(
+    """``half_warp=False`` keeps the one-row-per-warp kernel where the two-rows
+    variant would apply; tests use it as the bit-exactness oracle."""
+    template_args = [
         head_dim,
         rope_dim,
         is_neox,
@@ -43,9 +47,16 @@ def _jit_qknorm_rope_module(
         cache_dtype,
         round_norm_before_rope,
         cache_has_full_width,
-    )
-    op_name = "qknorm_rope_pack_kv" if pack_kv else "qknorm_rope"
-    kernel_name = "QKNormRopePackKVKernel" if pack_kv else "QKNormRopeKernel"
+    ]
+    if pack_kv:
+        op_name, kernel_name = "qknorm_rope_pack_kv", "QKNormRopePackKVKernel"
+    elif out_of_place:
+        op_name, kernel_name = "qknorm_rope_out_of_place", "QKNormRopeOutOfPlaceKernel"
+    else:
+        op_name, kernel_name = "qknorm_rope", "QKNormRopeKernel"
+    if not pack_kv:
+        template_args.append(half_warp)
+    args = make_cpp_args(*template_args)
     return load_jit(
         op_name,
         *args,
@@ -180,6 +191,46 @@ def fused_inplace_qknorm_rope(
         cache_has_full_width,
     )
     module.qknorm_rope(q, k, q_weight, k_weight, cos_sin_cache, positions, eps)
+
+
+@register_custom_op(mutates_args=["q_out", "k_out"])
+def fused_qknorm_rope_out_of_place(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_out: torch.Tensor,
+    k_out: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    *,
+    is_neox: bool,
+    eps: float = 1e-6,
+    head_dim: int = 0,
+    rope_dim: int = 0,
+    round_norm_before_rope: bool = False,
+    cache_has_full_width: bool = False,
+) -> None:
+    """QK-norm + RoPE from ``q``/``k`` (any strides) into ``q_out``/``k_out``;
+    the inputs are left untouched. Same arithmetic as the in-place kernel."""
+    head_dim = head_dim or q.size(-1)
+    if not rope_dim:
+        cache_width = cos_sin_cache.size(-1)
+        rope_dim = cache_width // 2 if cache_has_full_width else cache_width
+    module = _jit_qknorm_rope_module(
+        head_dim,
+        rope_dim,
+        is_neox,
+        q.dtype,
+        cos_sin_cache.dtype,
+        round_norm_before_rope,
+        False,
+        cache_has_full_width,
+        True,
+    )
+    module.qknorm_rope_out_of_place(
+        q, k, q_out, k_out, q_weight, k_weight, cos_sin_cache, positions, eps
+    )
 
 
 @register_custom_op(mutates_args=["q", "packed_kv"])

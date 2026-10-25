@@ -57,6 +57,7 @@ def _patch_torch_runtime(
     stack.enter_context(
         patch.object(apple_mem, "_mlx_runtime_active", return_value=False)
     )
+    stack.enter_context(patch("torch.mps.device_count", return_value=1))
     stack.enter_context(
         patch(
             "psutil.virtual_memory",
@@ -94,6 +95,7 @@ def _patch_mlx_runtime(
     stack.enter_context(
         patch.object(apple_mem, "_mlx_runtime_active", return_value=True)
     )
+    stack.enter_context(patch("torch.mps.device_count", return_value=1))
     stack.enter_context(
         patch(
             "psutil.virtual_memory",
@@ -135,8 +137,7 @@ class TestAppleGpuMemoryTorchPath(CustomTestCase):
             self.assertEqual(apple_mem.apple_gpu_working_set_size(), 16 * GiB)
 
     def test_working_set_size_zero_when_api_missing(self):
-        # torch builds without recommended_max_memory() report 0 so callers
-        # fall back to system RAM instead of a zero-sized device.
+        # an unavailable API reports an unknown limit; callers fail closed
         with ExitStack() as stack:
             stack.enter_context(
                 patch.object(apple_mem, "_mlx_runtime_active", return_value=False)
@@ -154,15 +155,14 @@ class TestAppleGpuMemoryTorchPath(CustomTestCase):
             _patch_torch_runtime(stack, recommended=16 * GiB, total=24 * GiB)
             self.assertEqual(apple_mem.apple_gpu_total_memory(), 16 * GiB)
 
-    def test_total_memory_falls_back_to_system_ram(self):
+    def test_total_memory_rejects_unknown_working_set(self):
         with ExitStack() as stack:
             _patch_torch_runtime(stack, recommended=0, total=24 * GiB)
-            self.assertEqual(apple_mem.apple_gpu_total_memory(), 24 * GiB)
+            with self.assertRaises(RuntimeError):
+                apple_mem.apple_gpu_total_memory()
 
     def test_unknown_working_set_warns_once(self):
-        # Falling back to system-memory reporting reverts to the
-        # overcommit-prone pre-#21443 behavior; that must show up in logs,
-        # but only once per process.
+        # an unknown limit is reported once and never becomes a RAM budget
         apple_mem._warned_unknown_working_set = False
         try:
             with ExitStack() as stack:
@@ -170,8 +170,9 @@ class TestAppleGpuMemoryTorchPath(CustomTestCase):
                     stack, available=8 * GiB, total=24 * GiB, recommended=0
                 )
                 with self.assertLogs(apple_mem.logger, level="WARNING") as logs:
-                    apple_mem.apple_gpu_total_memory()
-                    apple_mem.apple_gpu_available_memory()
+                    with self.assertRaises(RuntimeError):
+                        apple_mem.apple_gpu_total_memory()
+                    self.assertEqual(apple_mem.apple_gpu_available_memory(), 0)
             self.assertEqual(len(logs.output), 1)
         finally:
             apple_mem._warned_unknown_working_set = False
@@ -229,10 +230,11 @@ class TestAppleGpuMemoryMlxDispatch(CustomTestCase):
             )
             self.assertEqual(apple_mem.apple_gpu_available_memory(), 6 * GiB)
 
-    def test_total_memory_falls_back_when_mlx_limit_unknown(self):
+    def test_total_memory_rejects_unknown_mlx_limit(self):
         with ExitStack() as stack:
             _patch_mlx_runtime(stack, total=24 * GiB, working_set=0)
-            self.assertEqual(apple_mem.apple_gpu_total_memory(), 24 * GiB)
+            with self.assertRaises(RuntimeError):
+                apple_mem.apple_gpu_total_memory()
 
     def test_empty_cache_clears_both_allocators(self):
         # MLX serving bridges tensors through torch-MPS, so both allocator
@@ -312,11 +314,10 @@ class TestGetAvailableGpuMemoryMps(CustomTestCase):
         )
         self.assertEqual(free, 0.0)
 
-    def test_falls_back_to_system_available_without_working_set(self):
-        # recommended_max_memory() == 0 means the limit is unknown; keep the
-        # legacy psutil behavior rather than reporting no memory at all.
+    def test_no_available_memory_without_working_set(self):
+        # an unknown Metal limit must not expose the host RAM budget
         free = self._free_gib(available=20 * GiB, recommended=0)
-        self.assertEqual(free, 20.0)
+        self.assertEqual(free, 0.0)
 
     def test_empty_cache_flag_forwards_to_allocator(self):
         self._free_gib(available=GiB, recommended=GiB, empty_cache=True)
@@ -355,7 +356,7 @@ class TestMpsStubDeviceProperties(CustomTestCase):
             props = mps_stub.get_device_properties()
         self.assertEqual(props.total_memory, 16 * GiB)
 
-    def test_falls_back_to_system_ram_when_working_set_unknown(self):
+    def test_rejects_unknown_working_set(self):
         for recommended in (None, 0):
             with self.subTest(recommended=recommended):
                 mps_stub._cached_props = None
@@ -377,8 +378,8 @@ class TestMpsStubDeviceProperties(CustomTestCase):
                             return_value=_VirtualMemory(total=24 * GiB),
                         )
                     )
-                    props = mps_stub.get_device_properties()
-                self.assertEqual(props.total_memory, 24 * GiB)
+                    with self.assertRaises(RuntimeError):
+                        mps_stub.get_device_properties()
 
     def test_properties_are_cached(self):
         with ExitStack() as stack:
