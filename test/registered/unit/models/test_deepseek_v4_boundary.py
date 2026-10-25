@@ -88,20 +88,41 @@ class TestHcConsumer(unittest.TestCase):
         pieces = SimpleNamespace(
             get_merged=lambda: routed, shared=shared, shared_is_replicated=True
         )
-        with (
-            patch(
-                "sglang.srt.layers.moe.post_experts_all_reduce",
-                side_effect=lambda x: x + other,
-            ) as reduce,
-            patch(
-                "sglang.srt.layers.moe.utils.should_add_replicated_moe_output",
-                return_value=True,
-            ),
-        ):
+        with patch(
+            "sglang.srt.layers.moe.utils.sum_post_experts_output",
+            side_effect=lambda x: x + other,
+        ) as reduce:
             output = boundary.MoeFinalize(pieces).complete()
         reduce.assert_called_once_with(routed)
         torch.testing.assert_close(output, (routed + other) + shared, atol=0, rtol=0)
         self.assertFalse(torch.equal(output, (routed + shared) + other))
+
+    def test_replicated_shared_left_to_a_later_sum_is_counted_once(self):
+        from sglang.srt.layers.moe import utils as moe_utils
+
+        routed = torch.ones(1, 2)
+        shared = torch.full((1, 2), 0.5)
+        for tp_rank in (0, 1):
+            pieces = SimpleNamespace(
+                get_merged=routed.clone, shared=shared, shared_is_replicated=True
+            )
+            with (
+                self.subTest(tp_rank=tp_rank),
+                patch.object(
+                    moe_utils,
+                    "get_parallel",
+                    return_value=SimpleNamespace(tp_size=2, tp_rank=tp_rank),
+                ),
+                patch.object(
+                    moe_utils, "post_experts_output_is_complete", return_value=False
+                ),
+            ):
+                output = boundary.MoeFinalize(pieces).complete(reduce=False)
+            # The TP sum that follows adds every rank's output: only rank 0
+            # contributes the replicated shared output.
+            torch.testing.assert_close(
+                output, routed + shared if tp_rank == 0 else routed
+            )
 
 
 class TestAttentionCompletion(unittest.TestCase):
@@ -283,7 +304,7 @@ class TestMoeSourceRows(unittest.TestCase):
                 patch.object(moe_utils, "get_moe_a2a_backend", return_value=backend),
                 patch.object(moe_utils, "get_parallel", return_value=parallel),
                 patch(
-                    "sglang.srt.layers.moe.post_experts_all_reduce",
+                    "sglang.srt.layers.moe.utils.sum_post_experts_output",
                     side_effect=AssertionError("an a2a output takes no TP sum"),
                 ),
             ):

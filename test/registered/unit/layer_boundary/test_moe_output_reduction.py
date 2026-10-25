@@ -284,7 +284,7 @@ class TestModelsWithExplicitDpCompletion(CustomTestCase):
                                 dp_attention, "dp_scatter", side_effect=scatter
                             ),
                             patch(
-                                "sglang.srt.layers.moe.post_experts_all_reduce",
+                                "sglang.srt.layers.moe.utils.sum_post_experts_output",
                                 side_effect=reduce,
                             ),
                         ):

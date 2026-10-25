@@ -96,7 +96,9 @@ class TestPipelineCompletion(unittest.TestCase):
                         patch.object(
                             moe_transport, "get_parallel", return_value=parallel
                         ),
-                        patch("sglang.srt.layers.moe.post_experts_all_reduce", sums),
+                        patch(
+                            "sglang.srt.layers.moe.utils.sum_post_experts_output", sums
+                        ),
                         patch.object(mhc, "run_moe_post", post),
                         patch.object(mhc, "run_attn_post", post),
                         patch.object(mhc, "make_boundary", return_value=None),

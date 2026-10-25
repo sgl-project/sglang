@@ -314,23 +314,25 @@ class MoeFinalize(DeferredFinalize, frozen=True):
     partial: object = None
 
     def complete(self, *, reduce=True):
-        from sglang.srt.layers.moe import post_experts_all_reduce
-        from sglang.srt.layers.moe.utils import should_add_replicated_moe_output
+        """Merge the pieces and, with ``reduce``, run the owed MoE sum. A
+        replicated shared output is added after that sum; left to a later sum,
+        only the rank the boundary names adds it, so it is counted once."""
+        from sglang.srt.layers.moe.utils import (
+            adds_replicated_output_to_partial,
+            sum_post_experts_output,
+        )
 
-        with get_forward().scoped(mlp_reduce_scatter=not reduce):
-            value = (
-                self.pieces.get_merged() if self.pieces is not None else self.partial
-            )
-            if reduce:
-                value = post_experts_all_reduce(value)
-            if (
-                self.pieces is not None
-                and self.pieces.shared is not None
-                and self.pieces.shared_is_replicated
-                and should_add_replicated_moe_output()
-            ):
-                value += self.pieces.shared
-            return value
+        value = self.pieces.get_merged() if self.pieces is not None else self.partial
+        if reduce:
+            value = sum_post_experts_output(value)
+        if (
+            self.pieces is not None
+            and self.pieces.shared is not None
+            and self.pieces.shared_is_replicated
+            and (reduce or adds_replicated_output_to_partial())
+        ):
+            value += self.pieces.shared
+        return value
 
 
 class OverlappedMoeTransport(ComputeTransport):
