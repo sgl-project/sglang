@@ -147,7 +147,7 @@ class RadixAttention(nn.Module):
                 kwargs.get("return_lse") or forward_batch.mha_return_lse
             )
             lse = (
-                q.new_empty((q.shape[0], q.shape[1]), dtype=torch.float32)
+                q.new_empty((q.shape[0], self.tp_q_head_num), dtype=torch.float32)
                 if return_lse
                 else None
             )
@@ -204,7 +204,9 @@ class RadixAttention(nn.Module):
         cache_n = n
         n = attention_query_tokens(forward_batch, n)
         return_lse = bool(kwargs.get("return_lse") or forward_batch.mha_return_lse)
-        if not return_lse:
+        if lse_output is not None and not return_lse:
+            # The graph was captured asking for an LSE this batch does not want.
+            lse_output.zero_()
             lse_output = None
         if n == 0:
             output.zero_()
