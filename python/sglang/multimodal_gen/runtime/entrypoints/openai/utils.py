@@ -575,15 +575,18 @@ async def process_generation_batch(
             scheduler_batches if scheduler_batches is not None else [batch]
         )
 
+        # failed finalization can leave tensors or encoded files attached
+        if result.error:
+            raise RuntimeError(
+                f"Model generation failed. Error from scheduler: {result.error}"
+            )
+
         if (
             result.output is None
             and result.output_file_paths is None
             and result.raw_frame_batches is None
         ):
-            error_msg = result.error or "Unknown error"
-            raise RuntimeError(
-                f"Model generation returned no output. Error from scheduler: {error_msg}"
-            )
+            raise RuntimeError("Model generation returned no output.")
 
         save_file_path_list = []
         if result.output_file_paths:

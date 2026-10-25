@@ -1595,8 +1595,8 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 else None
             )
 
-        hidden_states = self.patch_embedding(hidden_states)
-        hidden_states = hidden_states.flatten(2).transpose(1, 2).contiguous()
+        # token-major straight from the patchify GEMM, no [B, C, T, H, W] round trip
+        hidden_states = self.patch_embedding(hidden_states, tokens=True).contiguous()
 
         # shape is [B, T' * H' * W', C]
         seq_len_orig = hidden_states.shape[1]
@@ -1703,6 +1703,9 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             if self.enable_teacache:
                 original_hidden_states = hidden_states.clone()
 
+            # cast once for every block's fp32 add (the TI2V table stays bf16)
+            if timestep_proj.dim() == 3:
+                timestep_proj = timestep_proj.float()
             rope_cos_sin_cache = None
             if _is_cuda and freqs_cis is not None:
                 cos, sin = freqs_cis
