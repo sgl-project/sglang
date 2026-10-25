@@ -1304,6 +1304,59 @@ class Fp8LinearMethod(LinearMethodBase):
             # Activations not quantized for marlin.
             del layer.input_scale
 
+    def apply_into(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        output: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Write the linear result into caller-owned storage (the contract
+        ``RowParallelLinear`` uses for fused collective buffers). The DeepGEMM
+        block-FP8 path writes ``output`` directly; every other path computes
+        normally and copies."""
+        input_tensor = x[0] if isinstance(x, tuple) else x
+        expected_shape = (*input_tensor.shape[:-1], layer.output_size_per_partition)
+        if output.shape != expected_shape or output.device != input_tensor.device:
+            raise ValueError(
+                f"linear output must have shape {expected_shape} on "
+                f"{input_tensor.device}, got {output.shape} on {output.device}"
+            )
+        if (
+            not self.use_marlin
+            and not self.use_mxfp8
+            and self.block_quant
+            and not (
+                self.block_fp8_as_mxfp8
+                and getattr(layer, "block_fp8_mxfp8_ready", False)
+            )
+            and getattr(self.w8a8_block_fp8_linear, "func", self.w8a8_block_fp8_linear)
+            is deepgemm_w8a8_block_fp8_linear_with_fallback
+            and input_tensor.ndim == 2
+            and output.dtype == torch.bfloat16
+            and output.is_contiguous()
+            and not (isinstance(x, tuple) and x[1].dtype == torch.int32)
+        ):
+            cached_weight = getattr(layer, "_block_fp8_bf16_weight", None)
+            extra_kwargs = (
+                {"weight_bf16": cached_weight} if cached_weight is not None else {}
+            )
+            return self.w8a8_block_fp8_linear(
+                input=input_tensor,
+                weight=layer.weight,
+                block_size=self.weight_block_size,
+                weight_scale=layer.weight_scale_inv,
+                input_scale=x[1] if isinstance(x, tuple) else None,
+                bias=bias,
+                output=output,
+                **extra_kwargs,
+            )
+        result = self.apply(layer, x, bias)
+        if output.dtype != result.dtype:
+            raise ValueError(f"linear output must have dtype {result.dtype}")
+        output.copy_(result)
+        return output
+
     def apply(
         self,
         layer: torch.nn.Module,
