@@ -864,15 +864,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
     def _transfer_copies(self, mooncake_session_id: str, copies: List[Copy]) -> int:
         """Write `copies` to a decode peer through the transport; 0 on success."""
-        copies = [c for c in copies if len(c.ranges)]
-        if not copies:
+        if not any(len(c.ranges) for c in copies):
             return 0
-        peer = self._peers.get(mooncake_session_id)
-        if peer is None:
-            logger.error("No registered buffers for session %s", mooncake_session_id)
-            return -1
         result = self.transport.status_all(
-            self.transport.write_all(peer.remote, copies)
+            self.transport.write_all(self._peers[mooncake_session_id].remote, copies)
         )
         # MooncakeTransport returns DONE or FAILED, even if a failed batch
         # still has transfers in flight.
