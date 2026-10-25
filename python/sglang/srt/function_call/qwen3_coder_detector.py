@@ -32,7 +32,6 @@ class Qwen3CoderDetector(BaseFormatDetector):
         self.parameter_end_token: str = "</parameter>"
 
         # Regex for non-streaming fallback
-        self.tool_call_regex = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
         self.tool_call_function_regex = re.compile(
             r"<function=(.*?)</function>|<function=(.*)$", re.DOTALL
         )
@@ -60,6 +59,20 @@ class Qwen3CoderDetector(BaseFormatDetector):
 
     def has_tool_call(self, text: str) -> bool:
         return self.tool_call_start_token in text
+
+    def _iter_tool_call_bodies(self, text: str):
+        # Linear scan on purpose: a `<tool_call>(.*?)</tool_call>` findall rescans
+        # to the end from every opening tag when the end tag never arrives.
+        start = text.find(self.tool_call_start_token)
+        while start != -1:
+            body_start = start + len(self.tool_call_start_token)
+            end = text.find(self.tool_call_end_token, body_start)
+            if end == -1:
+                return
+            yield text[body_start:end]
+            start = text.find(
+                self.tool_call_start_token, end + len(self.tool_call_end_token)
+            )
 
     def _get_arguments_config(
         self, func_name: str, tools: Optional[list[Tool]]
@@ -184,7 +197,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
         try:
             # Simple cleanup of the text to find tool calls
             # Note: This is a simplified regex approach consistent with vLLM
-            raw_tool_calls = self.tool_call_regex.findall(text)
+            raw_tool_calls = list(self._iter_tool_call_bodies(text))
             if not raw_tool_calls:
                 # Fallback: maybe the whole text is inside the tag or tags are stripped
                 if self.tool_call_prefix in text:
