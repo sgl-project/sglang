@@ -246,7 +246,7 @@ class TestNPUDeepSeekV4Flash0731W8A8PDSEPGPQAHigh(
             dataset_name="generated-shared-prefix",
             input_len=131072,
             output_len=1024,
-            max_concurrency=8,
+            max_concurrency=16,
             gsp_num_groups=3,
             gsp_prompts_per_group=8,
             seed=100,
