@@ -648,6 +648,28 @@ def test_nvfp4_keeps_weight_scale_storage_and_activation_contract(
         torch.testing.assert_close(mega.tensors.fc2_alpha, torch.full((2,), scale + 1))
 
 
+@pytest.mark.parametrize("use_w4a16", [False, True])
+def test_nvfp4_fc1_validation_uses_weight_scales_for_w4a16(monkeypatch, use_w4a16):
+    module = _load_megamoe_module(monkeypatch)
+    monkeypatch.setattr(
+        module.envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16, "get", lambda: use_w4a16
+    )
+    weight_scales = torch.tensor([[1e-4, 2e-4], [3e-4, 3e-4]])
+    layer = types.SimpleNamespace(
+        num_local_experts=2,
+        moe_runner_config=types.SimpleNamespace(is_gated=True),
+        w13_weight_scale_2=weight_scales,
+        g1_alphas=weight_scales[:, 0] * 1e-5,
+        g1_alphas_up=weight_scales[:, 1] * 1e-5,
+    )
+    assert torch.allclose(layer.g1_alphas, layer.g1_alphas_up)
+    if use_w4a16:
+        with pytest.raises(ValueError, match="matching gate/up FC1 alpha"):
+            module._validate_nvfp4_fc1_alpha(layer)
+        weight_scales[:, 1].copy_(weight_scales[:, 0])
+    module._validate_nvfp4_fc1_alpha(layer)
+
+
 @pytest.mark.parametrize(
     "activation,situ_linear_beta", [("silu", None), ("situ", 25.0), ("situ", None)]
 )
@@ -683,6 +705,7 @@ def test_nvfp4_reload_preserves_layer_and_prepared_weight_storage(
         apply_router_weight_on_input=False,
     )
     layer.g1_alphas = layer.g1_alphas_up = torch.ones(2)
+    layer.w13_weight_scale_2 = torch.ones(2, 2)
     layer.g2_alphas = torch.ones(2)
     layer.w13_input_scale_quant = torch.tensor(1.0)
     layer.w2_input_scale_quant = torch.ones(2)

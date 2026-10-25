@@ -216,10 +216,24 @@ def resolve_cutedsl_standard_scales(
         w2_weight_scale_2 = layer.g2_alphas.to(torch.float32) * w2_q_for_w2
         return w2_weight_scale_2 / fc2_scalar
 
-    if quant_mode == "w4a16" or use_per_token_activation:
-        # W4A16 bypasses activation quantization; per-token W4A4 computes
-        # activation scales at runtime. Both need weight-only decode scales,
-        # independent from calibrated scales retained for the other phase.
+    if quant_mode == "w4a16":
+        # BF16 activations bypass the checkpoint activation scales. Keep those
+        # references intact as unused payload fields; only the weight globals
+        # enter the W4A16 kernel. Materialize a contiguous gate column at setup.
+        return (
+            _align_scale_to_alpha(
+                layer.w13_weight_scale_2, layer.g1_alphas, "w13_weight_scale_2"
+            ).contiguous(),
+            layer.w2_input_scale_quant,
+            _align_scale_to_alpha(
+                layer.w2_weight_scale_2, layer.g2_alphas, "w2_weight_scale_2"
+            ).contiguous(),
+            layer.w13_input_scale_quant,
+        )
+
+    if use_per_token_activation:
+        # Online per-token quantization has its own normalization; it does not
+        # consume the checkpoint's calibrated activation scales.
         unit = torch.ones(1, device=layer.g1_alphas.device, dtype=torch.float32)
         return (
             _resolve_w1_alpha_from_scalar_input_scale(unit),
@@ -252,16 +266,21 @@ def _cutedsl_wrapper_activation_type(activation: str, activation_type_cls: Any) 
     )
 
 
-def _make_per_token_global_scale(input_tensor: torch.Tensor) -> torch.Tensor:
+def _make_per_token_global_scale(
+    input_tensor: torch.Tensor, *, keep_unit_without_4over6: bool = False
+) -> torch.Tensor:
     from flashinfer.quantization.nvfp4_quantization_utils import (
         current_nvfp4_4over6_config,
         make_nvfp4_global_scale,
     )
 
+    config = current_nvfp4_4over6_config()
+    if keep_unit_without_4over6 and config is None:
+        return input_tensor
     return make_nvfp4_global_scale(
         input_tensor,
         per_token_activation=True,
-        nvfp4_4over6_config=current_nvfp4_4over6_config(),
+        nvfp4_4over6_config=config,
     )
 
 
@@ -289,6 +308,9 @@ def _refresh_cutedsl_standard_scales(
     )
     if use_per_token and state.wrapper.quant_mode == "w4a4":
         used_input_scale = _make_per_token_global_scale(used_input_scale)
+        fc2_input_scale = _make_per_token_global_scale(
+            fc2_input_scale, keep_unit_without_4over6=True
+        )
 
     new_scales = (w1_alpha, fc2_input_scale, w2_alpha)
     current_scales = state.scales
@@ -436,6 +458,9 @@ def _initialize_cutedsl_wrapper(
         )
         if use_per_token:
             used_input_scale = _make_per_token_global_scale(used_input_scale)
+            fc2_input_scale = _make_per_token_global_scale(
+                fc2_input_scale, keep_unit_without_4over6=True
+            )
     return CuteDslMoeState(
         wrapper, (w1_alpha, fc2_input_scale, w2_alpha), used_input_scale, use_per_token
     )

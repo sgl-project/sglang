@@ -208,12 +208,21 @@ def _local_expert_vector(value: torch.Tensor, num_local_experts: int) -> torch.T
 
 
 def _validate_nvfp4_fc1_alpha(layer: FusedMoE) -> None:
-    """MegaMOE reuses ``g1_alphas`` as fc1_alpha; the kernel takes one alpha per
-    expert, so the gate and up FC1 alphas must agree."""
+    """The kernel takes one FC1 alpha per expert, shared by gate and up."""
     if not layer.moe_runner_config.is_gated:
         return
-    gate_alpha = _local_expert_vector(layer.g1_alphas, layer.num_local_experts)
-    up_alpha = _local_expert_vector(layer.g1_alphas_up, layer.num_local_experts)
+    if envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.enabled_for_all():
+        # W4A16 ignores activation calibration. Checking calibrated alphas can
+        # hide unequal weight scales below allclose's absolute tolerance.
+        weight_scale = layer.w13_weight_scale_2
+        if weight_scale.ndim == 2 and weight_scale.shape[1] >= 2:
+            gate_alpha, up_alpha = weight_scale[:, 0], weight_scale[:, 1]
+        else:
+            gate_alpha = up_alpha = weight_scale.reshape(layer.num_local_experts)
+    else:
+        gate_alpha, up_alpha = layer.g1_alphas, layer.g1_alphas_up
+    gate_alpha = _local_expert_vector(gate_alpha, layer.num_local_experts)
+    up_alpha = _local_expert_vector(up_alpha, layer.num_local_experts)
     if not torch.allclose(gate_alpha, up_alpha):
         raise ValueError(
             "FlashInfer NVFP4 MegaMOE requires matching gate/up FC1 alpha "

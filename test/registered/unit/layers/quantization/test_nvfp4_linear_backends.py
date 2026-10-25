@@ -163,7 +163,7 @@ class TestNvFp4LinearBackends(CustomTestCase):
         self._run_backend("flashinfer_cutedsl")
 
     def test_phase_specific_cutedsl_matches_global_modes_and_cuda_graphs(self):
-        for shape in ((16, 256, 512), (5, 160, 336)):
+        for shape in ((16, 256, 512), (5, 240, 496)):
             with self.subTest(shape=shape):
                 self._run_phase_specific_cutedsl_shape(*shape)
 
@@ -180,8 +180,27 @@ class TestNvFp4LinearBackends(CustomTestCase):
                 with setting.override(enabled):
                     torch.manual_seed(7)
                     control, _ = _make_quantized_layer(n, k)
+                    control_x = x
+                    if enabled and (n % 32 or k % 32):
+                        # Global W4A16 preserves FlashInfer's native preparation,
+                        # which has no tactic for this unaligned geometry. Build
+                        # an independent zero-padded checkpoint/input control;
+                        # phase mode must reach the same result from the original
+                        # logical dimensions through normal W4A4 preparation.
+                        padded_n = (n + 31) // 32 * 32
+                        padded_k = (k + 31) // 32 * 32
+                        control.weight.data = torch.nn.functional.pad(
+                            control.weight.data,
+                            (0, (padded_k - k) // 2, 0, padded_n - n),
+                        )
+                        control.weight_scale.data = torch.nn.functional.pad(
+                            control.weight_scale.data,
+                            (0, (padded_k - k) // 16, 0, padded_n - n),
+                        )
+                        control.output_size_per_partition = padded_n
+                        control_x = torch.nn.functional.pad(x, (0, padded_k - k))
                     control.quant_method.process_weights_after_loading(control)
-                    controls[enabled] = control(x)[0].clone()
+                    controls[enabled] = control(control_x)[0][:, :n].clone()
             for enabled_phase in ("prefill", "decode"):
                 with (
                     self.subTest(enabled_phase=enabled_phase),

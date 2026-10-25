@@ -2380,7 +2380,7 @@ def _input_scale_to_local_experts(
 
 def _compute_gemm1_alphas(
     w13_weight_scale_2: torch.Tensor,
-    w13_input_scale: torch.Tensor,
+    w13_input_scale: torch.Tensor | float,
     is_gated: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """GEMM1 weight x input alphas for the gate (w1) and up (w3) halves of w13.
@@ -2856,20 +2856,11 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         use_w4a16 = (
             self._is_cutedsl_v2_standard or moe_runner_backend.is_flashinfer_megamoe()
         ) and envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get() is True
-        use_per_token_all = (
-            self.quant_config.use_per_token_activation
-            and getattr(self.quant_config, "per_token_activation_phase", None) is None
-        )
-        if use_per_token_all or use_w4a16:
-            # FlashInfer computes activation scales dynamically per token, so
-            # the static checkpoint activation scale is intentionally neutral.
-            # CuTe DSL W4A16 keeps activations in BF16, so its GEMM alphas must
-            # likewise contain only the NVFP4 weight decode scales.
-            w13_input_scale = torch.ones_like(w13_input_scale, dtype=torch.float32)
-            w2_input_scale = torch.ones_like(w2_input_scale, dtype=torch.float32)
 
-        # Create shared parameters. g1_alphas / g1_alphas_up are the gate (w1)
-        # and up (w3) GEMM1 scales (equal for shared-scale checkpoints).
+        # Always retain the checkpoint's calibrated activation metadata. Kernels
+        # that use online per-token scales or BF16 activations bypass it below.
+        # g1_alphas / g1_alphas_up are the gate (w1) and up (w3) GEMM1 scales
+        # (equal for shared-scale checkpoints).
         g1_alphas, g1_alphas_up = _compute_gemm1_alphas(
             layer.w13_weight_scale_2,
             w13_input_scale,
@@ -2948,21 +2939,45 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         if (
             self.enable_flashinfer_trtllm_moe
             and self.quant_config.use_per_token_activation
-            and not use_per_token_all
         ):
             from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
                 _compute_g1_scale_c,
             )
 
-            # Preserve the calibrated static path and derive the dynamic path
-            # after any gate/up rescaling used by custom activations.
-            dynamic_g1 = layer.g1_alphas * layer.w13_input_scale_quant
-            dynamic_up = layer.g1_alphas_up * layer.w13_input_scale_quant
+            # Online scales replace checkpoint activation calibration. Derive
+            # weight-only alphas directly, including the common gate/up scale
+            # used above when custom activation clamps rescale block scales.
+            dynamic_g1, dynamic_up = _compute_gemm1_alphas(
+                layer.w13_weight_scale_2, 1.0, layer.moe_runner_config.is_gated
+            )
+            runner_config = layer.moe_runner_config
+            is_situ = runner_config.activation == "situ"
+            dynamic_clamp = (
+                None
+                if is_situ or not runner_config.is_gated
+                else (runner_config.gemm1_clamp_limit or runner_config.swiglu_limit)
+            )
+            if dynamic_clamp is not None:
+                dynamic_g1 = dynamic_up = torch.maximum(dynamic_g1, dynamic_up)
+                copy_or_rebind_param(
+                    layer,
+                    "_per_token_gemm1_clamp_limit",
+                    (dynamic_clamp / dynamic_g1).to(torch.float32),
+                )
+            if runner_config.is_gated and runner_config.gemm1_alpha is not None:
+                dynamic_beta = (
+                    torch.full_like(
+                        dynamic_g1, runner_config.gemm1_clamp_limit, dtype=torch.float32
+                    )
+                    if is_situ
+                    else (1.0 / dynamic_up).to(torch.float32)
+                )
+                copy_or_rebind_param(layer, "_per_token_gemm1_beta", dynamic_beta)
             copy_or_rebind_param(layer, "_per_token_g1_alphas", dynamic_g1)
             copy_or_rebind_param(
                 layer,
                 "_per_token_g2_alphas",
-                layer.g2_alphas * layer.w2_input_scale_quant,
+                layer.w2_weight_scale_2.to(torch.float32),
             )
             copy_or_rebind_param(
                 layer,
@@ -2975,16 +2990,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                     layer.moe_runner_config.activation,
                 ),
             )
-            for name in ("gemm1_clamp_limit", "gemm1_beta"):
-                value = getattr(layer, name, None)
-                if value is not None:
-                    dynamic = (
-                        value
-                        if layer.moe_runner_config.activation == "situ"
-                        else value / layer.w13_input_scale_quant
-                    )
-                    copy_or_rebind_param(layer, f"_per_token_{name}", dynamic)
-
         if self.enable_flashinfer_cutlass_moe:
             from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
                 materialize_swiglu_params_for_cutlass,
@@ -3045,6 +3050,17 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 prepare_nvfp4_moe_weights_for_flashinfer_megamoe,
             )
 
+            if use_w4a16:
+                # MegaMoE needs a contiguous gate-scale vector. Keep this fixed
+                # weight-only descriptor separate from calibrated g1_alphas.
+                weight_alpha = layer.w13_weight_scale_2
+                if weight_alpha.ndim == 2:
+                    weight_alpha = weight_alpha[:, 0]
+                copy_or_rebind_param(
+                    layer,
+                    "_w4a16_g1_alphas",
+                    weight_alpha.to(torch.float32).contiguous(),
+                )
             prepare_nvfp4_moe_weights_for_flashinfer_megamoe(layer)
             return
 
@@ -3308,8 +3324,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             quant_info = FlashInferMegaMoeQuantInfo(
                 mega=mega,
                 mega_forward=layer._flashinfer_megamoe_forward,
-                fc1_alpha=layer.g1_alphas,
-                fc2_alpha=layer.g2_alphas,
+                fc1_alpha=(layer._w4a16_g1_alphas if use_w4a16 else layer.g1_alphas),
+                fc2_alpha=(layer.w2_weight_scale_2 if use_w4a16 else layer.g2_alphas),
                 fc1_norm_const=None if use_w4a16 else layer.w2_input_scale_quant,
                 apply_routed_scaling_factor=(
                     not layer.should_fuse_routed_scaling_factor_in_topk

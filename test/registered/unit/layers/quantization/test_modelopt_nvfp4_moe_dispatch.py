@@ -165,6 +165,50 @@ class TestNvFp4MoeDispatch(CustomTestCase):
                     torch.ones(NUM_EXPERTS),
                 )
 
+    def test_megamoe_w4a16_uses_weight_scales_without_activation_scales(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.layers.moe import flashinfer_megamoe
+
+        method = _method_set_up_for(MoeRunnerBackend.FLASHINFER_MEGAMOE)
+        layer = SimpleNamespace(
+            _mega_moe_nvfp4=False,
+            _flashinfer_megamoe_forward=object(),
+            _w4a16_g1_alphas=torch.tensor([2.0, 4.0]),
+            w2_weight_scale_2=torch.tensor([3.0, 6.0]),
+            g1_alphas=torch.tensor([1.0, 2.0]),
+            g2_alphas=torch.tensor([0.75, 1.5]),
+            w2_input_scale_quant=torch.tensor([4.0, 4.0]),
+            should_fuse_routed_scaling_factor_in_topk=False,
+        )
+        identities = {name: id(value) for name, value in vars(layer).items()}
+        for setting in (False, True):
+            with (
+                self.subTest(setting=setting),
+                envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.override(setting),
+                mock.patch.object(
+                    flashinfer_megamoe,
+                    "ensure_nvfp4_moe_layer_for_flashinfer_megamoe",
+                    return_value=object(),
+                ),
+            ):
+                method.apply(layer, object())
+                quant_info = method.runner.calls[-1][1]
+                self.assertIs(
+                    quant_info.fc1_alpha,
+                    layer._w4a16_g1_alphas if setting else layer.g1_alphas,
+                )
+                self.assertIs(
+                    quant_info.fc2_alpha,
+                    layer.w2_weight_scale_2 if setting else layer.g2_alphas,
+                )
+                self.assertIs(
+                    quant_info.fc1_norm_const,
+                    None if setting else layer.w2_input_scale_quant,
+                )
+                self.assertEqual(
+                    {name: id(value) for name, value in vars(layer).items()}, identities
+                )
+
     def test_routed_trtllm_takes_the_trtllm_path(self):
         for backend in (
             MoeRunnerBackend.FLASHINFER_TRTLLM_ROUTED,
@@ -423,6 +467,36 @@ class TestNvFp4MoeDispatch(CustomTestCase):
 
 
 class TestNvFp4CuteDslPhaseState(CustomTestCase):
+    def test_per_token_fc2_normalizer_preserves_default_and_uses_4over6_recipe(self):
+        from sglang.srt.layers.moe.moe_runner import flashinfer_cutedsl as cutedsl
+
+        quantization = ModuleType("flashinfer.quantization.nvfp4_quantization_utils")
+        unit = torch.ones(1)
+        online = torch.tensor([1.0 / (6.0 * 448.0)])
+        for recipe in (None, object()):
+            with self.subTest(use_4over6=recipe is not None):
+                quantization.current_nvfp4_4over6_config = lambda: recipe
+                make_scale = quantization.make_nvfp4_global_scale = mock.Mock(
+                    return_value=online
+                )
+                with mock.patch.dict(
+                    sys.modules,
+                    {"flashinfer.quantization.nvfp4_quantization_utils": quantization},
+                ):
+                    fc2 = cutedsl._make_per_token_global_scale(
+                        unit, keep_unit_without_4over6=True
+                    )
+                if recipe is None:
+                    self.assertIs(fc2, unit)
+                    make_scale.assert_not_called()
+                else:
+                    self.assertIs(fc2, online)
+                    make_scale.assert_called_once_with(
+                        unit,
+                        per_token_activation=True,
+                        nvfp4_4over6_config=recipe,
+                    )
+
     def test_phase_switch_and_reload_keep_distinct_scales_and_workspaces(self):
         from sglang.srt.environ import envs
         from sglang.srt.layers.moe.moe_runner import flashinfer_cutedsl as cutedsl

@@ -69,7 +69,7 @@ class TestNvFp4MoePhasePrecision(CustomTestCase):
         torch.set_default_device("cuda")
 
     @staticmethod
-    def _make_layer():
+    def _make_layer(activation_scale_multiplier=1.0):
         from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
         torch.manual_seed(7)
@@ -85,7 +85,7 @@ class TestNvFp4MoePhasePrecision(CustomTestCase):
             ),
             gate_up_interleaved=False,
         ).cuda()
-        act_scale = 1.0 / (FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX)
+        act_scale = activation_scale_multiplier / (FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX)
         for expert in range(E):
             for shard in ("w1", "w3", "w2"):
                 rows, cols = (
@@ -109,6 +109,9 @@ class TestNvFp4MoePhasePrecision(CustomTestCase):
                         expert_id=expert,
                     )
         layer.quant_method.process_weights_after_loading(layer)
+        for name in ("w13_input_scale_quant", "w2_input_scale_quant"):
+            scale = getattr(layer, name)
+            torch.testing.assert_close(scale, torch.full_like(scale, 1.0 / act_scale))
         return layer
 
     def test_per_token_phase_matches_global_controls_and_cuda_graphs(self):
@@ -127,7 +130,9 @@ class TestNvFp4MoePhasePrecision(CustomTestCase):
                 )
             for per_token in (False, True):
                 with _runtime(backend, per_token=per_token):
-                    layer = self._make_layer()
+                    # The per-token control has different checkpoint activation
+                    # scales: its output must depend only on online token scales.
+                    layer = self._make_layer(4.0 if per_token else 1.0)
                     controls[per_token] = _forward(
                         layer, x, topk, ForwardMode.EXTEND
                     ).clone()

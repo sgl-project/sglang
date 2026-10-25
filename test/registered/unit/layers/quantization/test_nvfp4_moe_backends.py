@@ -110,6 +110,12 @@ class TestNvFp4MoeBackends(CustomTestCase):
                         )
                     refs[shard_id][e] = w_dequant
             layer.quant_method.process_weights_after_loading(layer)
+            if w4a16_phase:
+                for name in ("w13_input_scale_quant", "w2_input_scale_quant"):
+                    scale = getattr(layer, name)
+                    torch.testing.assert_close(
+                        scale, torch.full_like(scale, 1.0 / act_scale)
+                    )
             if backend == "flashinfer_trtllm":
                 expected_intermediate = round_up(intermediate_size, 64)
                 self.assertEqual(
@@ -173,7 +179,7 @@ class TestNvFp4MoeBackends(CustomTestCase):
                         refs["w1"],
                         refs["w3"],
                         refs["w2"],
-                        use_w4a16=phase == w4a16_phase,
+                        use_w4a16=w4a16_phase is True or phase == w4a16_phase,
                     )
                     assert_output_close(self, out, ref)
                     if w4a16_phase:
@@ -201,7 +207,9 @@ class TestNvFp4MoeBackends(CustomTestCase):
                         )
                         self.assertEqual(
                             state.wrapper.quant_mode,
-                            "w4a16" if phase == w4a16_phase else "w4a4",
+                            "w4a16"
+                            if w4a16_phase is True or phase == w4a16_phase
+                            else "w4a4",
                         )
                         for name, pointer in weight_pointers.items():
                             self.assertEqual(getattr(layer, name).data_ptr(), pointer)
@@ -263,7 +271,7 @@ class TestNvFp4MoeBackends(CustomTestCase):
         self._run_backend("flashinfer_cutedsl")
 
     def test_flashinfer_cutedsl_w4a16_by_phase(self):
-        for phase in ("prefill", "decode"):
+        for phase in (True, "prefill", "decode"):
             with self.subTest(w4a16_phase=phase):
                 self._run_backend("flashinfer_cutedsl", w4a16_phase=phase)
 
