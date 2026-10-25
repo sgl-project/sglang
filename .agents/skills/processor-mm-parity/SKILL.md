@@ -132,6 +132,11 @@ PYTHONPATH=/tmp/pillow:$REPO/python \
     python tests/scripts/generate_mm_parity.py <hf-model-id> [--revision <sha>]
 ```
 
+Every fixture covers the resize shapes, a two-image prompt and the pixel
+overrides. Decoding does not depend on the model or the backend, so only one
+fixture per family runs the format sweep and the PIL backend (`--formats`); a
+new decoder or backend path is added there.
+
 The generator downloads only the processor and tokenizer files. It loads them
 through SGLang's `get_processor`, records the spec SGLang's Rust MM gate resolves
 (`RustMmProcessor.resolve_spec`), and runs `process_mm_data_async` on the CPU
