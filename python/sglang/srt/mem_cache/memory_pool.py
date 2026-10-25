@@ -5032,6 +5032,36 @@ class MLATokenToKVPool(KVCache):
             cache_k_rope,
         )
 
+    def set_mla_kv_buffer_prefix_valid(
+        self,
+        layer: RadixAttention,
+        loc_2d: torch.Tensor,
+        commit_lens: torch.Tensor,
+        cache_k_nope: torch.Tensor,
+        cache_k_rope: torch.Tensor,
+    ):
+        rows = torch.cat((cache_k_nope, cache_k_rope), dim=-1).to(self.dtype)
+        if self.store_dtype != self.dtype:
+            rows = rows.view(self.store_dtype)
+        buffer = self.kv_buffer[layer.layer_id - self.start_layer]
+        if _is_cuda or _is_hip:
+            # The MHA pool's kernel; MLA's one latent row goes in as both K and V.
+            _set_kv_buffer_prefix_valid_impl(
+                rows,
+                rows,
+                buffer,
+                buffer,
+                loc_2d,
+                commit_lens,
+                row_dim=rows.shape[-1],
+                store_dtype=self.store_dtype,
+            )
+            return
+        # As in the MHA pool, other platforms keep only the valid rows.
+        offsets = torch.arange(loc_2d.shape[1], device=loc_2d.device)
+        valid = (offsets < commit_lens[:, None]).reshape(-1)
+        buffer[loc_2d.reshape(-1)[valid]] = rows[valid]
+
     def get_mla_kv_buffer(
         self,
         layer: RadixAttention,
