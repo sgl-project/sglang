@@ -13,6 +13,7 @@ import test_declared_decoder_boundary as fixture
 import torch
 
 from sglang.srt.layers.layer_boundary import (
+    ExitRows,
     ProducerReduction,
     StageKind,
     append_stages,
@@ -203,6 +204,69 @@ class TestIndependentStageConstruction(CustomTestCase):
                         edge.incoming.produced.layout, source_input.need.layout
                     )
                     self.assertEqual(edge.incoming.residual, source_input.residual_to)
+
+    def test_line_connections_carry_the_stack_decisions(self):
+        # Dense FFNs on this rank's rows (attention DP, dense TP 1): one before
+        # a trailing attention that always leaves its sum, one ending the line.
+        with fixture.planning(
+            fixture.parallel_of(attn_dp=2, attn_tp=2, moe_dense_tp_size=1)
+        ):
+            for trailing, following in itertools.product(
+                (True, False), (None, facts_of(declare_attn()))
+            ):
+                with self.subTest(trailing=trailing, handoff=following is not None):
+                    line = [declare_attn(), declare_ffn()]
+                    if trailing:
+                        line.append(declare_attn())
+                    given = [replace(declaration) for declaration in line]
+                    connections = factories.connect_layer_line(
+                        line,
+                        ["append 0"] * len(line),
+                        previous=None,
+                        following=following,
+                    )
+                    # The decisions reach the connections, not the declarations.
+                    self.assertEqual(line, given)
+                    self.assertEqual(len(connections), len(line) + 1)
+                    self.assertIsNone(connections[0].producer)
+                    self.assertIs(connections[-1].consumer, following)
+                    stages = [c.consumer for c in connections[:-1]]
+                    for stage, outgoing in zip(stages, connections[1:]):
+                        self.assertIs(outgoing.producer, stage)
+                    self.assertIsNone(stages[0].previous)
+                    for before, stage in zip(stages, stages[1:]):
+                        self.assertEqual(stage.previous, facts_of(before))
+                    self.assertEqual(stages[-1].terminal, following is None)
+                    if trailing or following is not None:
+                        self.assertEqual(stages[1].exit_rows, ExitRows.ATTENTION)
+                    if not trailing and following is not None:
+                        self.assertTrue(stages[1].writes_at_handoff)
+
+    def test_line_connections_leave_what_no_decision_applies_to(self):
+        with fixture.planning(fixture.parallel_of(attn_dp=1, attn_tp=2)):
+            # A dense FFN on the attention-TP rows: a trailing attention moves
+            # nothing.
+            line = [declare_attn(), declare_ffn(), declare_attn()]
+            connections = factories.connect_layer_line(
+                line, ["append 0"] * len(line), previous=None, following=None
+            )
+            self.assertEqual(connections[1].consumer.exit_rows, line[1].exit_rows)
+            # A terminal FFN leaves its output on the attention-TP slice only
+            # for a final read that reads the slices.
+            line = [declare_attn(), declare_ffn()]
+            for reads_slices in (False, True):
+                with self.subTest(reads_slices=reads_slices):
+                    connections = factories.connect_layer_line(
+                        line,
+                        ["append 0"] * len(line),
+                        previous=None,
+                        following=None,
+                        final_read=SimpleNamespace(reads_attn_tp_slices=reads_slices),
+                    )
+                    self.assertEqual(
+                        connections[1].consumer.exit_rows,
+                        ExitRows.SLICE if reads_slices else line[1].exit_rows,
+                    )
 
     def test_an_ffn_without_a_fusion_object_may_defer_or_reduce_scatter(self):
         with fixture.planning(fixture.parallel_of(attn_dp=1, attn_tp=2)):

@@ -1134,24 +1134,63 @@ def _return_before_trailing_attention(line):
     is where the FFN before them returned it: no exit moves it after them.
     That FFN returns it on the attention's rows, as one that ends the stack or
     hands off does, instead of on its own rows."""
+    line = list(line)
     trailing = False
-    for append in reversed(line):
-        declarations = append.declarations
-        for index in reversed(range(len(declarations))):
-            declaration = declarations[index]
-            if (
-                declaration.kind is StageKind.ATTENTION
-                and declaration.reduction is ProducerReduction.ALWAYS_PARTIAL
-            ):
-                trailing = True
-                continue
-            if (
-                trailing
-                and declaration.kind is StageKind.FFN
-                and _ffn_on_rank_rows(declaration.sparse, declaration.dense_tp_size)
-            ):
-                declarations[index] = replace(declaration, exit_rows=ExitRows.ATTENTION)
-            return
+    for index in reversed(range(len(line))):
+        declaration = line[index]
+        if (
+            declaration.kind is StageKind.ATTENTION
+            and declaration.reduction is ProducerReduction.ALWAYS_PARTIAL
+        ):
+            trailing = True
+            continue
+        if (
+            trailing
+            and declaration.kind is StageKind.FFN
+            and _ffn_on_rank_rows(declaration.sparse, declaration.dense_tp_size)
+        ):
+            line[index] = replace(declaration, exit_rows=ExitRows.ATTENTION)
+        break
+    return line
+
+
+def connect_layer_line(declarations, origins, *, previous, following, final_read=None):
+    """The connections along the line of stages a layer stack extends, one
+    into each stage and one out of the last: ``connections[i].consumer`` is
+    stage ``i`` as it binds, and ``connections[i + 1].producer`` the same
+    declaration.
+
+    This is where the stack's place in the model changes the declarations:
+    the last stage hands off to the stage ``following`` it on the next rank,
+    or ends the model's stack, read by ``final_read``; an FFN before trailing
+    attentions that always leave their sum returns on the attention's rows;
+    and each stage's producer is the stage before it, the first one's the
+    stage ``previous`` to it on the previous rank. Binding reads the result
+    from the connections. The declarations given are left as they are;
+    ``origins[i]`` names the append that declared ``declarations[i]``, for
+    errors.
+    """
+    line = list(declarations)
+    if following is not None:
+        # The last stage hands off to the next rank.
+        line[-1] = _handed_off(line[-1])
+    line = _return_before_trailing_attention(line)
+    if following is None:
+        # Without a stage on a later rank, the last one ends the model's stack,
+        # read by the final read.
+        line[-1] = _ended(replace(line[-1], terminal=True), final_read)
+    producer = facts_of(_handed_off(previous))
+    chained = []
+    for declaration in line:
+        chained.append(replace(declaration, previous=producer, prepared_from=None))
+        producer = facts_of(chained[-1])
+    return _connect_line(
+        chained,
+        origins,
+        before=chained[0].previous,
+        after=following,
+        final_read=final_read if following is None else None,
+    )
 
 
 def _bind_stack(appends, *, previous, following, final_read=None):
@@ -1164,39 +1203,21 @@ def _bind_stack(appends, *, previous, following, final_read=None):
     then starts from the incoming connection of the stage it branches from.
     """
     line = [a for a in appends if a.prepared_from is None]
-    if following is not None:
-        # The last stage hands off to the next rank.
-        line[-1].declarations[-1] = _handed_off(line[-1].declarations[-1])
-    _return_before_trailing_attention(line)
-    if following is None:
-        # Without a stage on a later rank, the last one ends the model's stack,
-        # read by the final read.
-        line[-1].declarations[-1] = _ended(
-            replace(line[-1].declarations[-1], terminal=True), final_read
-        )
     stages = [
         (append, index) for append in line for index in range(len(append.bindings))
     ]
     bound = {id(append): [None] * len(append.bindings) for append in appends}
     # A returned declaration's stage as bound, for the branches that start from it.
     sources = {}
-    producer = facts_of(_handed_off(previous))
-    chained = []
-    for append, index in stages:
-        chained.append(
-            replace(append.declarations[index], previous=producer, prepared_from=None)
-        )
-        producer = facts_of(chained[-1])
-    connections = _connect_line(
-        chained,
+    connections = connect_layer_line(
+        [append.declarations[index] for append, index in stages],
         [append.origin for append, _ in stages],
-        before=chained[0].previous,
-        after=following,
-        final_read=final_read if following is None else None,
+        previous=previous,
+        following=following,
+        final_read=final_read,
     )
     _bind_line(
         stages,
-        chained,
         connections,
         bound,
         sources,
@@ -1233,7 +1254,7 @@ def _bind_stack(appends, *, previous, following, final_read=None):
             before=source_declaration,
             arrivals=arrivals,
         )
-        _bind_line(branch, chained, connections, bound, sources)
+        _bind_line(branch, connections, bound, sources)
     bound = [tuple(bound[id(append)]) for append in appends]
     _check_declared_gathers(appends, bound, remote_producer=previous is not None)
     for append, boundaries in zip(appends, bound):
@@ -1242,26 +1263,27 @@ def _bind_stack(appends, *, previous, following, final_read=None):
             returned.declaration = boundary.declaration
 
 
-def _bind_line(stages, chained, connections, bound, sources, *, final_read=None):
-    """Bind a chain of stages from its connections, ``connections[i]`` into
-    ``chained[i]`` and ``connections[i + 1]`` out of it. An attention that
-    always leaves its sum binds after the FFN that follows it in the same
-    append, so the attention's entry keeps the residual that FFN's capture
-    needs."""
-    last = len(chained) - 1
-    boundaries = [None] * len(chained)
+def _bind_line(stages, connections, bound, sources, *, final_read=None):
+    """Bind a chain of stages from its connections: stage ``i`` is
+    ``connections[i].consumer``, entered through ``connections[i]`` and left
+    through ``connections[i + 1]``. An attention that always leaves its sum
+    binds after the FFN that follows it in the same append, so the
+    attention's entry keeps the residual that FFN's capture needs."""
+    last = len(stages) - 1
+    boundaries = [None] * len(stages)
 
     def bind(position):
         append, index = stages[position]
         norm, options = append.bindings[index]
+        declaration = connections[position].consumer
         consumer = None
         if position < last and stages[position + 1][0] is append:
-            consumer = chained[position + 1]
-            if _carries_capture(chained[position], consumer):
+            consumer = connections[position + 1].consumer
+            if _carries_capture(declaration, consumer):
                 bind(position + 1)
         try:
             boundary = _bind_stage(
-                chained[position],
+                declaration,
                 norm,
                 connections[position],
                 connections[position + 1],
@@ -1270,8 +1292,7 @@ def _bind_line(stages, chained, connections, bound, sources, *, final_read=None)
                 and connections[position + 1].consumer is not None,
                 capture_preserves_residual=(
                     _preserves_residual(boundaries[position + 1])
-                    if consumer is not None
-                    and _carries_capture(chained[position], consumer)
+                    if consumer is not None and _carries_capture(declaration, consumer)
                     else None
                 ),
                 **options,
@@ -1286,7 +1307,7 @@ def _bind_line(stages, chained, connections, bound, sources, *, final_read=None)
             connections[position],
         )
 
-    for position in range(len(chained)):
+    for position in range(len(stages)):
         if boundaries[position] is None:
             bind(position)
 
