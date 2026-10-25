@@ -2616,18 +2616,29 @@ def _is_block_fp8(layer: torch.nn.Module) -> bool:
 
 def _gather_block_fp8_linear(layer: torch.nn.Module, group) -> torch.nn.Module:
     """Gather a column-sharded block-FP8 linear and re-run its post-load step."""
-    from sglang.srt.layers.quantization.fp8_utils import inverse_transform_scale_ue8m0
+    from sglang.srt.layers.quantization.fp8_utils import (
+        inverse_transform_scale_ue8m0,
+        transform_scale_ue8m0,
+    )
 
     scale = layer.weight_scale_inv.data
-    if scale.dtype == torch.int32:  # UE8M0-packed for DeepGEMM
+    packed_ue8m0 = scale.dtype == torch.int32  # DeepGEMM layout
+    if packed_ue8m0:
         scale = inverse_transform_scale_ue8m0(scale, mn=layer.weight.shape[0])
     replica = torch.nn.Module()
     replica.weight = torch.nn.Parameter(
         group.all_gather(layer.weight.data, dim=0), requires_grad=False
     )
-    replica.weight_scale_inv = torch.nn.Parameter(
-        group.all_gather(scale, dim=0), requires_grad=False
-    )
+    scale = group.all_gather(scale, dim=0)
+    if packed_ue8m0:
+        # The shards' weights are already requantized against these UE8M0
+        # scales. Re-pack instead of letting the post-load step requantize
+        # again: that pass is not idempotent (a block whose amax sits at a
+        # power-of-two boundary halves its scale), so the replica would not
+        # match the shards bit for bit.
+        scale = transform_scale_ue8m0(scale, mn=replica.weight.shape[0])
+    replica.weight_scale_inv = torch.nn.Parameter(scale, requires_grad=False)
+    replica.weight_scale_inv.format_ue8m0 = packed_ue8m0
     # The attributes Fp8LinearMethod's post-load step reads off a LinearBase,
     # copied so the replica picks the same kernel (UE8M0 requant, MXFP8 view).
     replica.orig_dtype = getattr(layer, "orig_dtype", None)
