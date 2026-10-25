@@ -151,6 +151,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         params: CacheInitParams,
         *,
         components,
+        extra_config=None,
         _storage=None,
         forward_stream=None,
     ):
@@ -207,9 +208,10 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             raise ValueError(
                 f"UMBP pool mappings contain out-of-range logical layers: {invalid_layers}."
             )
-        extra_config = _parse_storage_extra_config(
-            get_memory().hicache_storage_backend_extra_config
-        )
+        if extra_config is None:
+            extra_config = _parse_storage_extra_config(
+                get_memory().hicache_storage_backend_extra_config
+            )
         extra_config = dict(extra_config)
         standalone_requested = bool(
             extra_config.get("standalone_address")
