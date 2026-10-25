@@ -75,13 +75,15 @@ def dequantize_k_cache_paged_dsv4(
         assert out.shape == (num_tokens, 1, DIM_NOPE + DIM_ROPE)
         assert out.dtype == torch.bfloat16
 
-    _dequantize_k_cache_paged_kernel[(num_tokens,)](
+    tokens_per_prog = 4
+    _dequantize_k_cache_paged_kernel[(triton.cdiv(num_tokens, tokens_per_prog),)](
         out,
         buf_fp8,
         buf_bf16,
         buf_uint8,
         page_table_1_flattened,
         out.stride(0),
+        num_tokens,
         BYTES_PER_PAGE=bytes_per_page,
         PAGE_SIZE=page_size,
         DIM_NOPE=DIM_NOPE,
@@ -91,6 +93,7 @@ def dequantize_k_cache_paged_dsv4(
         NOPE_ROPE_BYTES=NOPE_ROPE_BYTES,
         PADDED_SCALE_PER_TOKEN=PADDED_SCALE_PER_TOKEN,
         S_OFFSET_BYTES=s_offset_bytes,
+        TOKENS_PER_PROG=tokens_per_prog,
     )
     return out
 
@@ -102,13 +105,13 @@ def dequantize_k_cache_paged_v41(
     out: Optional[torch.Tensor] = None,
     layout: KVLayout = KVLayout.V41,
 ) -> torch.Tensor:
-    """Dequantize a V4.1 paged cache (fp8 ``V41`` or fp4 ``V41_FP4``) for a list
+    """Dequantize a V4.1 paged cache (fp8 ``V41`` / ``V41_NEW`` or fp4 ``V41_FP4`` / ``V41_FP4_NEW``) for a list
     of token IDs into ``(num_tokens, 1, 512)`` bf16.
 
     Bit-exact with the pure-torch dequantizer of these formats.
     """
     layout = KVLayout.parse(layout)
-    assert layout in (KVLayout.V41, KVLayout.V41_FP4), layout
+    assert layout.encoding in (KVLayout.V41, KVLayout.V41_FP4), layout
     if is_hip_runtime():
         supported = is_gfx95_supported()
     else:
@@ -143,9 +146,10 @@ def dequantize_k_cache_paged_v41(
 
     kernel = (
         _dequantize_k_cache_paged_v41_fp8_kernel
-        if layout is KVLayout.V41
+        if layout.encoding is KVLayout.V41
         else _dequantize_k_cache_paged_v41_fp4_kernel
     )
+    data_stride, scale_base, scale_stride = layout.row_addressing(page_size)
     kernel[(num_tokens,)](
         out,
         buf_fp8,
@@ -157,7 +161,9 @@ def dequantize_k_cache_paged_v41(
         DATA_BYTES=layout.data_bytes,
         SCALE_BYTES=layout.scale_bytes,
         TILE_SIZE=layout.tile_size,
-        S_OFFSET_BYTES=layout.scale_offset(page_size),
+        DATA_STRIDE=data_stride,
+        SCALE_BASE=scale_base,
+        SCALE_STRIDE=scale_stride,
         IS_HIP=is_hip_runtime(),
     )
     return out
@@ -237,6 +243,7 @@ def _dequantize_k_cache_paged_kernel(
     buf_uint8_ptr,
     page_table_ptr,
     output_stride_0,
+    num_tokens,
     BYTES_PER_PAGE: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
     DIM_NOPE: tl.constexpr,
@@ -246,11 +253,18 @@ def _dequantize_k_cache_paged_kernel(
     NOPE_ROPE_BYTES: tl.constexpr,
     PADDED_SCALE_PER_TOKEN: tl.constexpr,
     S_OFFSET_BYTES: tl.constexpr,
+    TOKENS_PER_PROG: tl.constexpr,
 ):
-    # One program per token: load page_table[token_id] once and emit all
-    # NUM_SCALE_TILES nope tiles + rope tail via tl.static_range.
-    token_id = tl.program_id(0).to(tl.int64)
-    loc = tl.load(page_table_ptr + token_id).to(tl.int64)
+    # TOKENS_PER_PROG tokens per program: one [T, NUM_SCALE_TILES, TILE_SIZE]
+    # fp8 load, one [T, NUM_SCALE_TILES] scale load, one [T, DIM_ROPE] bf16
+    # load. The one-token-per-program shape issued 64-element loads and left
+    # the pass at ~12% of HBM peak; the dequant itself is elementwise, so the
+    # grid shape does not change any output bit.
+    token_ids = tl.program_id(0).to(tl.int64) * TOKENS_PER_PROG + tl.arange(
+        0, TOKENS_PER_PROG
+    ).to(tl.int64)
+    tmask = token_ids < num_tokens
+    loc = tl.load(page_table_ptr + token_ids, mask=tmask, other=0).to(tl.int64)
     page_idx = loc // PAGE_SIZE
     in_page = loc % PAGE_SIZE
     page_byte_base = page_idx * BYTES_PER_PAGE
@@ -258,26 +272,44 @@ def _dequantize_k_cache_paged_kernel(
     token_scale_base = (
         page_byte_base + S_OFFSET_BYTES + in_page * PADDED_SCALE_PER_TOKEN
     )
-    out_row_base = token_id * output_stride_0
+    out_row_base = token_ids * output_stride_0
 
-    nope_offs = tl.arange(0, TILE_SIZE)
-    for tile_id in tl.static_range(NUM_SCALE_TILES):
-        fp8_off = token_data_base + tile_id * TILE_SIZE + nope_offs
-        fp8_vals = tl.load(buf_fp8_ptr + fp8_off).to(tl.float32)
-
-        scale_u8 = tl.load(buf_uint8_ptr + token_scale_base + tile_id).to(tl.int32)
-        scale_pow2 = tl.exp2((scale_u8 - 127).to(tl.float32))
-
-        out_off = out_row_base + tile_id * TILE_SIZE + nope_offs
-        tl.store(
-            output_ptr + out_off,
-            (fp8_vals * scale_pow2).to(output_ptr.dtype.element_ty),
-        )
+    # tl.arange needs a power of two; iterate the 8-padded scale row and mask
+    # the pad tile off (NUM_SCALE_TILES == 7).
+    tiles = tl.arange(0, PADDED_SCALE_PER_TOKEN)
+    inner = tl.arange(0, TILE_SIZE)
+    tile_mask = tmask[:, None, None] & (tiles < NUM_SCALE_TILES)[None, :, None]
+    fp8_off = (
+        token_data_base[:, None, None]
+        + tiles[None, :, None] * TILE_SIZE
+        + inner[None, None, :]
+    )
+    fp8_vals = tl.load(buf_fp8_ptr + fp8_off, mask=tile_mask, other=0.0).to(tl.float32)
+    scale_u8 = tl.load(
+        buf_uint8_ptr + token_scale_base[:, None] + tiles[None, :],
+        mask=tmask[:, None],
+        other=0,
+    ).to(tl.int32)
+    scale_pow2 = tl.exp2((scale_u8 - 127).to(tl.float32))
+    out_off = (
+        out_row_base[:, None, None]
+        + tiles[None, :, None] * TILE_SIZE
+        + inner[None, None, :]
+    )
+    tl.store(
+        output_ptr + out_off,
+        (fp8_vals * scale_pow2[:, :, None]).to(output_ptr.dtype.element_ty),
+        mask=tile_mask,
+    )
 
     rope_offs = tl.arange(0, DIM_ROPE)
-    bf16_off = (token_data_base + DIM_NOPE) // 2 + rope_offs
-    rope_data = tl.load(buf_bf16_ptr + bf16_off)
-    tl.store(output_ptr + out_row_base + DIM_NOPE + rope_offs, rope_data)
+    bf16_off = (token_data_base[:, None] + DIM_NOPE) // 2 + rope_offs[None, :]
+    rope_data = tl.load(buf_bf16_ptr + bf16_off, mask=tmask[:, None], other=0.0)
+    tl.store(
+        output_ptr + out_row_base[:, None] + DIM_NOPE + rope_offs[None, :],
+        rope_data,
+        mask=tmask[:, None],
+    )
 
 
 @triton.jit
@@ -329,7 +361,9 @@ def _dequantize_k_cache_paged_v41_fp8_kernel(
     DATA_BYTES: tl.constexpr,
     SCALE_BYTES: tl.constexpr,
     TILE_SIZE: tl.constexpr,
-    S_OFFSET_BYTES: tl.constexpr,
+    DATA_STRIDE: tl.constexpr,
+    SCALE_BASE: tl.constexpr,
+    SCALE_STRIDE: tl.constexpr,
     IS_HIP: tl.constexpr,
 ):
     # V41: 512 e4m3 values per token, then 16 ue8m0 scales (one per 32 values).
@@ -339,8 +373,8 @@ def _dequantize_k_cache_paged_v41_fp8_kernel(
     page_idx = loc // PAGE_SIZE
     in_page = loc % PAGE_SIZE
     page_byte_base = page_idx * BYTES_PER_PAGE
-    token_data_base = page_byte_base + in_page * DATA_BYTES
-    token_scale_base = page_byte_base + S_OFFSET_BYTES + in_page * SCALE_BYTES
+    token_data_base = page_byte_base + in_page * DATA_STRIDE
+    token_scale_base = page_byte_base + SCALE_BASE + in_page * SCALE_STRIDE
 
     offs = tl.arange(0, DATA_BYTES)
     vals = tl.load(buf_fp8_ptr + token_data_base + offs).to(tl.float32)
@@ -364,7 +398,9 @@ def _dequantize_k_cache_paged_v41_fp4_kernel(
     DATA_BYTES: tl.constexpr,
     SCALE_BYTES: tl.constexpr,
     TILE_SIZE: tl.constexpr,
-    S_OFFSET_BYTES: tl.constexpr,
+    DATA_STRIDE: tl.constexpr,
+    SCALE_BASE: tl.constexpr,
+    SCALE_STRIDE: tl.constexpr,
     IS_HIP: tl.constexpr,
 ):
     # V41_FP4: 512 e2m1 codes packed two per byte (even index in the low nibble),
@@ -375,8 +411,8 @@ def _dequantize_k_cache_paged_v41_fp4_kernel(
     page_idx = loc // PAGE_SIZE
     in_page = loc % PAGE_SIZE
     page_byte_base = page_idx * BYTES_PER_PAGE
-    token_data_base = page_byte_base + in_page * DATA_BYTES
-    token_scale_base = page_byte_base + S_OFFSET_BYTES + in_page * SCALE_BYTES
+    token_data_base = page_byte_base + in_page * DATA_STRIDE
+    token_scale_base = page_byte_base + SCALE_BASE + in_page * SCALE_STRIDE
 
     boffs = tl.arange(0, DATA_BYTES)
     packed = tl.load(buf_uint8_ptr + token_data_base + boffs)
