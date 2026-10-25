@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use anyhow::{ensure, Context, Result};
+use axum::serve::ListenerExt;
 use clap::Parser;
 use sgl_kv_indexer::{GrpcPrefixIndex, PrefixIndex, PrefixIndexConfig};
 use sgl_router::{
@@ -430,6 +431,16 @@ async fn serve(
             result
         })
     });
+    // Disable Nagle on each accepted client connection. axum's tokio listener
+    // accepts sockets with the default compression algorithm, so a small
+    // streamed SSE chunk may sit waiting for the peer's delayed ACK (~40 ms on
+    // Linux): the same stall fixed for sgl-model-gateway via NoDelayAcceptor
+    // (#46067). The hook runs after accept, before any byte is written.
+    let listener = listener.tap_io(|stream| {
+        if let Err(error) = stream.set_nodelay(true) {
+            tracing::warn!(%error, "set TCP_NODELAY on accepted client socket failed");
+        }
+    });
     let stop = grpc_stop.clone();
     let mut result = axum::serve(listener, app)
         .with_graceful_shutdown(async move {
@@ -686,5 +697,59 @@ mod tests {
     #[test]
     fn init_tracing_accepts_json_format() {
         assert!(init_tracing("info", LogFormat::Json).is_ok());
+    }
+
+    // Mirrors main's inbound wiring: the tap_io hook must run per accepted
+    // socket and set TCP_NODELAY before the first response byte.
+    #[tokio::test]
+    async fn accepted_client_sockets_get_nodelay() {
+        use axum::{routing::get, Router};
+        use std::{
+            net::SocketAddr,
+            sync::{
+                atomic::{AtomicUsize, Ordering},
+                Arc,
+            },
+        };
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::TcpStream,
+        };
+
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        let listener = listener.tap_io({
+            let accepted = Arc::clone(&accepted);
+            move |stream: &mut TcpStream| {
+                stream.set_nodelay(true).unwrap();
+                assert!(stream.nodelay().unwrap());
+                accepted.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+
+        let app = Router::new().route("/ok", get(|| async { "ok" }));
+        let serve_task = tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(b"GET /ok HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200"));
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(b"GET /ok HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200"));
+        assert_eq!(accepted.load(Ordering::SeqCst), 2);
+
+        serve_task.abort();
     }
 }
