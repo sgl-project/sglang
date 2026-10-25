@@ -3,7 +3,7 @@ from typing import Optional, Tuple, Union
 import msgspec
 import torch
 
-from sglang.kernels.ops.attention.fla.fused_gdn_gating import fused_gdn_gating
+from sglang.kernels.ops.attention.linear.fused_gdn_gating import fused_gdn_gating
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     CAUSAL_CONV1D_FWD_BLOCK_M,
     causal_conv1d_fn,
@@ -313,15 +313,15 @@ class GDNKernelDispatcher:
                 )
 
                 cutedsl_kernel = CuteDSLGDNKernel()
-            # The CuteDSL prefill kernel only exists on SM100+ (Blackwell).
-            # On SM90 (Hopper) fall back to Triton so users can pick
+            # The CuteDSL prefill kernel only exists on SM10x. Elsewhere
+            # (SM90, SM120) fall back to Triton so users can pick
             # `cutedsl` uniformly across hardware.
             if cutedsl_kernel.supports_prefill:
                 self.extend_kernel = cutedsl_kernel
             else:
                 rank0_log(
                     "CuTe DSL GDN prefill is not supported on this GPU "
-                    "(requires SM100+). Falling back to Triton for prefill."
+                    "(requires SM10x). Falling back to Triton for prefill."
                 )
                 self.extend_kernel = triton_kernel
         elif prefill_backend.is_flashinfer():
@@ -1378,7 +1378,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         into ``temporal``. Uses the vendored CuTe DSL MTP kernel when the
         dispatcher selected the FlashInfer bf16-state verify, else the Triton
         recurrent kernel (both store the same raw window)."""
-        from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
+        from sglang.kernels.ops.attention.linear.fused_sigmoid_gating_recurrent import (
             fused_sigmoid_gating_delta_rule_update,
         )
 
@@ -1468,7 +1468,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         ([slots, HV, K, V]) is consumed directly as the kernel's [slots, HV, V, K]
         checkpoint.
         """
-        from sglang.kernels.ops.attention.fla.gdn_replayssm_spec_decode import (
+        from sglang.kernels.ops.attention.linear.gdn_replayssm_spec_decode import (
             gdn_replayssm_spec_decode,
         )
 

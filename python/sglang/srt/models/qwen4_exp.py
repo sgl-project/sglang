@@ -133,7 +133,6 @@ def _breakable_qsa_indexer(layer, hidden_states, positions):
         hidden_states=hidden_states,
         positions=positions,
         forward_batch=forward_batch,
-        use_host_prefill_lengths=True,
     )
     # Separate buffers cost up to buckets * max_tokens * block_topk * 4B * QSA layers.
     # For 8 buckets / 16K tokens / topk512 / 12 layers: 3 GiB -> 384 MiB shared.
@@ -211,17 +210,22 @@ def _breakable_ple_prefetch(ple, batch):
 
 
 @eager_on_graph(True)
-def _breakable_ple_forward(ple, hidden_states, batch):
+def _breakable_ple_forward(ple, hidden_states, batch, output):
     forward_batch = get_tc_piecewise_forward_context().forward_batch
     if batch.batch is None:
         # Idle batch replayed as a dummy extend: join the collective, add nothing.
         ple.forward_idle(forward_batch)
-        return torch.zeros_like(hidden_states)
+        output.copy_(hidden_states)
+        return
     # PLE pads its output to the token bucket after applying the live layout.
-    return ple(
-        hidden_states=hidden_states,
-        forward_batch=forward_batch,
-        batch=batch.batch,
+    torch.add(
+        hidden_states,
+        ple(
+            hidden_states=hidden_states,
+            forward_batch=forward_batch,
+            batch=batch.batch,
+        ),
+        out=output,
     )
 
 
@@ -1670,9 +1674,11 @@ class Qwen4ExpLayerExtensionMixin:
     def _add_ple_embedding(self, residual: torch.Tensor) -> torch.Tensor:
         forward_batch, ple_batch = self._ple_forward_batch, self._ple_batch
         if is_in_breakable_cuda_graph() and forward_batch.forward_mode.is_extend():
-            return residual + _breakable_ple_forward(
-                ple=self.ple, hidden_states=residual, batch=ple_batch
+            output = torch.empty_like(residual)
+            _breakable_ple_forward(
+                ple=self.ple, hidden_states=residual, batch=ple_batch, output=output
             )
+            return output
         if ple_batch is None:
             if not _get_ple_forward_mode(forward_batch).is_idle():
                 raise RuntimeError("non-idle Qwen4 PLE forward is missing its batch")
@@ -1836,8 +1842,6 @@ class Qwen4ExpAttentionDecoderLayer(
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-        *,
-        use_host_prefill_lengths: bool = False,
     ) -> torch.Tensor:
         from sglang.srt.layers.attention.qsa.glue import (
             get_qsa_indexer_metadata,
@@ -1856,13 +1860,6 @@ class Qwen4ExpAttentionDecoderLayer(
         indexer_metadata = get_qsa_indexer_metadata(
             backend, self.layer_id, forward_batch
         )
-        if use_host_prefill_lengths:
-            indexer_metadata = msgspec.structs.replace(
-                indexer_metadata,
-                prefill_sequence_lengths_cpu=tuple(
-                    forward_batch.seq_lens_cpu[: forward_batch.batch_size].tolist()
-                ),
-            )
         indexer_kwargs = {}
         if _shards_rows_over_cp(forward_batch):
             # Prefill CP: this rank's rows select against the index keys of the
@@ -1927,6 +1924,16 @@ class Qwen4ExpAttentionDecoderLayer(
             topk_indices.record_stream(current_stream)
             attention_kwargs["topk_indices"] = topk_indices
         elif self.is_qsa:
+            if _shards_rows_over_cp(forward_batch) and not get_is_capture_mode():
+                from sglang.srt.layers.attention.qsa.glue import (
+                    resolve_qsa_sparse_backend,
+                )
+
+                # Every CP rank issues the K/V gather before the index-key
+                # gather, overlapping it with the indexer's local computation.
+                resolve_qsa_sparse_backend(get_attn_backend()).prefetch_cp_kv(
+                    self.attn, k, v, forward_batch
+                )
             attention_kwargs["topk_indices"] = self._compute_qsa_topk_indices(
                 hidden_states, positions, forward_batch
             )

@@ -349,9 +349,16 @@ def run_resolution_pipeline(server_args: Any) -> None:
     run_hook(handle_model_capability_adjustments, server_args)
 
     # needs the resolved CUDA-graph, attention-backend and speculative settings
-    from sglang.srt.monokernels.guards import handle_monokernel
+    from sglang.srt.kernel_plugins.amd.binding import (
+        handle_amd_monokernel,
+    )
+    from sglang.srt.kernel_plugins.nvidia.binding import (
+        handle_nvidia_megakernel,
+    )
 
-    run_hook(handle_monokernel, server_args)
+    # first, so a server with both kernel flags gets every reason in one error
+    run_hook(handle_nvidia_megakernel, server_args)
+    run_hook(handle_amd_monokernel, server_args)
 
     finalize_cuda_graph_prefill_max_context(server_args)
 
