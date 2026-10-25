@@ -23,11 +23,12 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
 )
 from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST
 
-register_cuda_ci(est_time=300, stage="base-c", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=420, stage="base-c", runner_config="4-gpu-h100")
 
 # Per decode rank; a request survives when neither of the two ranks injects.
 _MISMATCH_PROB = 0.3
 _NUM_REQUESTS = 16
+_NUM_RADIX_REQUESTS = 6
 # Longer than the chunk size, so the digest spans a multi-chunk handoff.
 _PROMPT = "Count from one to twenty, then explain why you stopped: " * 20
 
@@ -85,6 +86,43 @@ class TestDisaggregationKVChecksum(PDDisaggregationServerBase):
         # of these fails by chance about once in 10^5 runs.
         self.assertGreater(aborted, 0, "no injected mismatch was detected")
         self.assertGreater(completed, 0, "every healthy transfer was aborted")
+        assert_process_healthy(self, "prefill", self.process_prefill, self.prefill_url)
+        assert_process_healthy(self, "decode", self.process_decode, self.decode_url)
+
+
+class TestDisaggregationKVChecksumDecodeRadixCache(PDDisaggregationServerBase):
+    """Prompts sharing a long prefix hit decode's radix cache, so prefill sends
+    and digests only the suffix. Those hits must verify; a digest over the
+    whole prompt would abort every one of them as corruption (in CI the
+    mismatch raises, so the decode would not even stay up)."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
+        cls.extra_prefill_args = [
+            "--disaggregation-enable-kv-checksum",
+            "--chunked-prefill-size",
+            "128",
+        ]
+        cls.extra_decode_args = [
+            "--disaggregation-enable-kv-checksum",
+            "--disaggregation-decode-enable-radix-cache",
+        ]
+        cls.launch_all()
+
+    def test_prefix_hits_verify(self):
+        for i in range(_NUM_RADIX_REQUESTS):
+            response = requests.post(
+                self.lb_url + "/generate",
+                json={
+                    "text": _PROMPT + f"Attempt {i}: ",
+                    "sampling_params": {"temperature": 0, "max_new_tokens": 16},
+                },
+                timeout=120,
+            )
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertTrue(response.json()["text"].strip(), response.text)
         assert_process_healthy(self, "prefill", self.process_prefill, self.prefill_url)
         assert_process_healthy(self, "decode", self.process_decode, self.decode_url)
 
