@@ -301,6 +301,7 @@ class ConfigManager:
                 "proposal_profile_id",
                 "native_segment_profile_id",
                 "native_capture_profile",
+                "native_initial_draft_buffer",
                 "native_source_work_policy",
                 "output_token_id",
             }
@@ -332,6 +333,7 @@ class ConfigManager:
                 "runtime_profile",
                 "progress_artifact",
                 "native_capture_profile",
+                "native_initial_draft_buffer",
             ):
                 ref = options.get(key)
                 if isinstance(ref, dict) and type(ref.get("path")) is str:

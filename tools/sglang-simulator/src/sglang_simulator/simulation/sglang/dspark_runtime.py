@@ -350,7 +350,16 @@ class DSparkNativeRuntime:
         execution_resolver=None,
         result_factory=None,
         reference_events=False,
+        initial_draft_buffer_capacity=0,
     ):
+        if (
+            type(initial_draft_buffer_capacity) is not int
+            or initial_draft_buffer_capacity < 0
+        ):
+            raise PredictorError(
+                "invalid_execution_profile",
+                "initial draft buffer capacity must be a nonnegative integer",
+            )
         self.session = session
         self.topology = topology
         self.runtime_profile_json = runtime_profile_json
@@ -365,7 +374,9 @@ class DSparkNativeRuntime:
             else NativeDSparkResults(output_token_id)
         )
         self._forward_id = 0
-        self._draft_buffer_capacity = 0
+        # Cold is the default. A factory-verified warm before-work witness may
+        # seed this modeled resource without changing request/progress history.
+        self._draft_buffer_capacity = initial_draft_buffer_capacity
         self.reference_driver = None
         if reference_events:
             from sglang_simulator.simulation.sglang.dspark_reference_driver import (

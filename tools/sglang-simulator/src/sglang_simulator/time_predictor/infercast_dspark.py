@@ -274,6 +274,105 @@ def _native_source_policy(database, profile_id, capture_profile):
     )
 
 
+def _initial_draft_buffer(database, policy, capture_profile, descriptor):
+    """Verify an explicit warm resource witness through the existing SDK owner.
+
+    The asset is an existing complete NativeSegmentQuery shape, not a latency
+    override. Exact silicon validation checks its original before-work buffer
+    observations. Its cost value is never used to initialize the runtime.
+    """
+    if descriptor is None:
+        return 0, None
+    _require(
+        policy is not None and capture_profile is not None,
+        "initial draft buffer requires the native source/capture profile",
+        code="invalid_execution_profile",
+    )
+    from infercast._serialization import canonical_json_bytes
+    from infercast.sdk.diagnostics.prediction_evidence import (
+        capture_prediction_evidence,
+        prediction_node,
+        record_node,
+    )
+    from infercast.sdk.native_segment_module import OP, NativeSegmentQuery
+    from infercast.sdk.operations.compute.dsv41_native_segment import DSV41NativeSegment
+    from infercast.sdk.perf_database.dsv41_dspark import decode_dspark_artifact
+
+    path, raw, digest = _asset(descriptor, "native_initial_draft_buffer")
+    query = NativeSegmentQuery.from_shape(decode_dspark_artifact(raw))
+    shape = query.to_shape()
+    variant = json.loads(query.module_variant)
+    capacity = variant["buffer_capacity"]
+    _require(
+        query.execution_profile_id == policy.execution_profile_id
+        and shape["tp_size"] == policy.tp_size
+        and shape["attention_dp_size"] == 1
+        and shape["worker_phase"] == "DECODE"
+        and shape["segment_kind"] == "decode_preamble"
+        and type(capacity) is int
+        and capacity >= shape["batch_size"]
+        and variant["buffer_device_matches"] is True
+        and capture_profile.decode_graph_backend == "full"
+        and variant["draft_capture_key"] is not None
+        and variant["target_capture_key"] is not None,
+        "initial draft buffer witness must be a matching warm native DECODE context",
+        code="invalid_execution_profile",
+    )
+    capture_profile.validate_batch(shape["batch_size"])
+    node_id = "initial-modeled-draft-buffer-witness"
+    with (
+        capture_prediction_evidence() as recorder,
+        prediction_node(node_id, "initialization"),
+    ):
+        result = DSV41NativeSegment(node_id, shape=shape).query(database)
+        _require(
+            result.source == "silicon",
+            "initial draft buffer witness requires an exact qualified silicon cell",
+            code="data_unavailable",
+        )
+        record_node(
+            node_id=node_id,
+            phase="initialization",
+            op=OP,
+            shape=shape,
+            layer_group="initialization",
+            repeat=1,
+            count=1,
+            result=result,
+            status="resolved",
+        )
+    queries = recorder.nodes[0]["queries"]
+    _require(
+        recorder.dropped_queries == 0
+        and len(queries) == 1
+        and queries[0]["component"] == OP
+        and queries[0]["source"] == "silicon"
+        and queries[0]["resolution"] == "exact"
+        and canonical_json_bytes(queries[0]["requested_key"])
+        == canonical_json_bytes(shape)
+        and canonical_json_bytes(queries[0]["resolved_key"])
+        == canonical_json_bytes(shape),
+        "initial draft buffer witness requires an exact qualified silicon cell",
+        code="data_unavailable",
+    )
+    return capacity, {
+        "path": str(path),
+        "sha256": digest,
+        "query_sha256": hashlib.sha256(canonical_json_bytes(shape)).hexdigest(),
+        "execution_profile_id": policy.execution_profile_id,
+        "capture_profile_id": capture_profile.profile_id,
+        "capacity": capacity,
+        "device_matches": True,
+        "source": "silicon",
+        "state": "observed_warm_before_work",
+        "latency_used": False,
+        "physical_CPU_buffer_claimed": False,
+        "resolution": "exact",
+        "source_reference_initial_state_equivalence": False,
+        "whole_workflow_point": False,
+    }
+
+
 def _canonical_config(value):
     return json.dumps(
         value, sort_keys=True, separators=(",", ":"), allow_nan=False
@@ -634,6 +733,7 @@ class InferCastDSparkTimePredictor(InferTimePredictor):
         proposal_profile_id=None,
         native_segment_profile_id=None,
         native_capture_profile=None,
+        native_initial_draft_buffer=None,
         native_source_work_policy=None,
         output_token_id=1,
         model_config_root=None,
@@ -745,6 +845,11 @@ class InferCastDSparkTimePredictor(InferTimePredictor):
             "native_segment_profile_id and native_capture_profile must be selected together",
         )
         _require(
+            native_initial_draft_buffer is None
+            or native_segment_profile_id is not None,
+            "initial draft buffer requires native region profiles",
+        )
+        _require(
             native_segment_profile_id is None or proposal_profile_id is None,
             "native regions and legacy proposal profiles select conflicting cost grains",
         )
@@ -839,7 +944,7 @@ class InferCastDSparkTimePredictor(InferTimePredictor):
         )
         from sglang_simulator.time_predictor.dspark_umd import UMDDSparkCostModel
 
-        native_policy, capture_identity = None, None
+        native_policy, capture_identity, capture_profile = None, None, None
         if native_segment_profile_id is not None:
             try:
                 from infercast.sdk.decode_forward import DecodeExecutionProfile
@@ -888,6 +993,9 @@ class InferCastDSparkTimePredictor(InferTimePredictor):
                 raise PredictorError(
                     "data_unavailable", f"native source policy is unavailable: {error}"
                 ) from error
+        initial_capacity, initial_buffer_identity = _initial_draft_buffer(
+            database, native_policy, capture_profile, native_initial_draft_buffer
+        )
         if progress_kind == "empirical":
             _require(
                 getattr(native_policy, "golden_law", None) is None,
@@ -924,6 +1032,7 @@ class InferCastDSparkTimePredictor(InferTimePredictor):
             runtime_profile_json=runtime_text,
             output_token_id=output_token_id,
             reference_events=native_policy is not None,
+            initial_draft_buffer_capacity=initial_capacity,
         )
         self._identity = {
             "model_id": model_id,
@@ -956,6 +1065,8 @@ class InferCastDSparkTimePredictor(InferTimePredictor):
             self._identity.update(progress_kind=progress_kind, **progress.identity)
         if native_source_work_policy is not None:
             self._identity["native_source_work_policy"] = native_source_work_policy
+        if initial_buffer_identity is not None:
+            self._identity["native_initial_draft_buffer"] = initial_buffer_identity
 
     def predict_infer_time(self, batch):
         raise PredictorError(

@@ -132,6 +132,21 @@ def test_native_segment_selector_and_existing_capture_profile_resolve_from_confi
     assert raw == original
 
 
+def test_initial_buffer_witness_resolves_from_config_without_mutation(factory):
+    _, raw, folder = factory
+    raw["predictor"]["native_initial_draft_buffer"] = {
+        "path": "warm-before-work-query.json",
+        "sha256": "f" * 64,
+    }
+    original = copy.deepcopy(raw)
+    result = ConfigManager.get_inference_time_predictor(None, None, None)
+    assert result.native_initial_draft_buffer == {
+        "path": str((folder / "warm-before-work-query.json").resolve()),
+        "sha256": "f" * 64,
+    }
+    assert raw == original
+
+
 @pytest.mark.parametrize("invalid", [123, "", " "])
 def test_model_config_root_is_optional_and_malformed_values_are_not_repaired(
     factory, invalid

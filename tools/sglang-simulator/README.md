@@ -274,6 +274,21 @@ Native projection represents TP2 B1-B8 and TP4 B1, ADP1/PP1. Its seven logical
 preparers select nine mode-specific regions; costs still use the ordinary UMD
 executor and finalized silicon PerfDB. Missing rows remain data gaps.
 
+The virtual proposal buffer starts cold by default. To start a request after
+benchmark warmup, explicitly provide `native_initial_draft_buffer` as an existing
+`{"path": "warm-before-work-query.json", "sha256": "<file SHA-256>"}` asset.
+Its contents must be one complete SDK `NativeSegmentQuery.to_shape()` for an
+observed warm `decode_preamble` cell in the same native source/profile/topology
+and configured full capture layout. The SDK must resolve it as exact `silicon`;
+interpolation, missing cells and another profile are rejected. Only its verified
+before-work buffer capacity/device state seeds the modeled resource; its latency
+is unused and request/progress history remains empty. Metrics retain the warm
+witness identity. This describes an observed warm service state, not automatic
+allocation by CUDA graph capture or a physical CPU buffer. Later allocation,
+growth and transaction failure rules are unchanged. Cold allocation costs remain
+required when the option is absent. The witness does not establish equivalence
+to the reference benchmark's initial state or qualify a whole workflow point.
+
 This is the predictor object inside the ordinary simulation configuration;
 replace digest/commit placeholders with verified values. Configure the modeled
 scheduler/backend and platform normally. There is no JSON callback, latency

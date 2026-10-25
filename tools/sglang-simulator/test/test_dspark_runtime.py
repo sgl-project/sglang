@@ -1,5 +1,6 @@
 """Native-adapter protocol checks; fixture costs never qualify performance."""
 
+import json
 from types import SimpleNamespace as NS
 
 import pytest
@@ -77,6 +78,40 @@ def forward(runtime, native_batch, publish=None):
         batch=native_batch,
         on_publish=publish,
     )
+
+
+@pytest.mark.parametrize("capacity", [True, -1, 1.5, "1"])
+def test_initial_buffer_rejects_invalid_capacity_without_state(runtime, capacity):
+    with pytest.raises(PredictorError, match="initial draft buffer capacity"):
+        adapter.DSparkNativeRuntime(
+            session=runtime.session,
+            topology=runtime.topology,
+            runtime_profile_json=runtime.runtime_profile_json,
+            output_token_id=1,
+            initial_draft_buffer_capacity=capacity,
+        )
+    assert runtime._forward_id == runtime._draft_buffer_capacity == 0
+
+
+def test_explicit_initial_buffer_seeds_only_resource_not_request_history(runtime):
+    warm = adapter.DSparkNativeRuntime(
+        session=runtime.session,
+        topology=runtime.topology,
+        runtime_profile_json=runtime.runtime_profile_json,
+        output_token_id=1,
+        execution_resolver=runtime.execution_resolver,
+        result_factory=runtime.results,
+        initial_draft_buffer_capacity=2,
+    )
+    assert warm._draft_buffer_capacity == 2 and warm._forward_id == 0
+    with pytest.raises(PredictorError, match="no prior injection/commit"):
+        warm.session.history_for("a")
+    forward(warm, batch(extend=512))
+    before = warm.capture(batch("DECODE", prefix=512))
+    execution = json.loads(before.groups[0].execution_json)
+    assert execution["draft_buffer_capacity"] == 2
+    assert execution["draft_buffer_device_matches"] is True
+    assert warm._draft_buffer_capacity == 2 and warm._forward_id == 1
 
 
 @pytest.mark.parametrize(

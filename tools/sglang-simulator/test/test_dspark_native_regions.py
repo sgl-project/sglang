@@ -4,8 +4,10 @@ Attestation strings below are protocol fixtures, not a constructed/admitted
 execution profile. No SDK prospective projector or factory activation is faked.
 """
 
+import hashlib
 import json
 from dataclasses import replace
+from types import SimpleNamespace as NS
 
 import pytest
 from sglang_simulator.simulation.sglang.dspark import DSparkTopology
@@ -139,6 +141,106 @@ def prepared(mode, phase, region, *, batch_size=1, capture_size=None, tp_size=2)
         "phase": phase,
         "step": before,
     }
+
+
+@pytest.fixture
+def initial_buffer_witness(tmp_path):
+    """Typed key only: no source profile, qualified cost or timing is invented."""
+    from infercast.sdk.native_segment_module import NativeSegmentQuery
+
+    binding = prepared("TARGET_VERIFY", "worker_preamble", "decode_preamble", tp_size=4)
+    shape = json.loads(binding["point"]["native_segment_queries"])[0]
+    variant = json.loads(shape["module_variant"])
+    variant.update(buffer_capacity=1, buffer_device_matches=True)
+    shape["module_variant"] = canonical(variant)
+    shape = NativeSegmentQuery.from_shape(shape).to_shape()
+    raw = canonical(shape).encode()
+    path = tmp_path / "warm-query.json"
+    path.write_bytes(raw)
+    return shape, {"path": str(path), "sha256": hashlib.sha256(raw).hexdigest()}
+
+
+def test_default_initial_buffer_is_cold_without_artifact_or_lookup():
+    from sglang_simulator.time_predictor.infercast_dspark import _initial_draft_buffer
+
+    assert _initial_draft_buffer(None, None, None, None) == (0, None)
+
+
+@pytest.mark.parametrize("invalid", ["profile", "topology", "capture"])
+def test_initial_buffer_rejects_other_context_before_lookup(
+    initial_buffer_witness, monkeypatch, invalid
+):
+    from infercast.sdk.operations.compute.dsv41_native_segment import DSV41NativeSegment
+    from sglang_simulator.time_predictor.infercast_dspark import _initial_draft_buffer
+
+    _, asset = initial_buffer_witness
+    policy = NS(execution_profile_id="a" * 64, tp_size=4)
+    capture = NS(decode_graph_backend="full")
+    if invalid == "profile":
+        policy.execution_profile_id = "b" * 64
+    elif invalid == "topology":
+        policy.tp_size = 2
+    else:
+        capture.decode_graph_backend = "disabled"
+    monkeypatch.setattr(
+        DSV41NativeSegment,
+        "query",
+        lambda *args: pytest.fail("invalid context reached cost owner"),
+    )
+    with pytest.raises(PredictorError, match="matching warm native"):
+        _initial_draft_buffer(object(), policy, capture, asset)
+
+
+def test_initial_buffer_requires_owner_lookup_and_rejects_empirical_source(
+    initial_buffer_witness, monkeypatch
+):
+    from infercast.sdk.operations.compute.dsv41_native_segment import DSV41NativeSegment
+    from sglang_simulator.time_predictor.infercast_dspark import _initial_draft_buffer
+
+    shape, asset = initial_buffer_witness
+    policy = NS(execution_profile_id="a" * 64, tp_size=4)
+    captured = []
+    capture = NS(decode_graph_backend="full", validate_batch=captured.append)
+    database = object()
+
+    def unqualified(operation, actual_database):
+        assert operation.identity == shape and actual_database is database
+        # No silicon result or numerical latency is fabricated by this contract.
+        return NS(source="empirical")
+
+    monkeypatch.setattr(DSV41NativeSegment, "query", unqualified)
+    with pytest.raises(PredictorError, match="exact qualified silicon"):
+        _initial_draft_buffer(database, policy, capture, asset)
+    assert captured == [1]
+
+
+@pytest.mark.parametrize("invalid", ["interpolated", "requested", "resolved"])
+def test_initial_buffer_rejects_derived_silicon_or_changed_query_proof(
+    initial_buffer_witness, monkeypatch, invalid
+):
+    from infercast.sdk.native_segment_module import OP
+    from infercast.sdk.operations.compute.dsv41_native_segment import DSV41NativeSegment
+    from infercast.sdk.perf_database.performance_result import PerformanceResult
+    from sglang_simulator.time_predictor.infercast_dspark import _initial_draft_buffer
+
+    shape, asset = initial_buffer_witness
+    policy = NS(execution_profile_id="a" * 64, tp_size=4)
+    capture = NS(decode_graph_backend="full", validate_batch=lambda size: None)
+
+    def derived(operation, database):
+        # Deliberately invalid diagnostic proof; no qualified cost is supplied.
+        changed = {**shape, "prefix_len": 513}
+        return operation._record_query(
+            PerformanceResult(0, source="silicon"),
+            component=OP,
+            requested_key=changed if invalid == "requested" else shape,
+            resolved_key=changed if invalid == "resolved" else shape,
+            resolution="interpolated" if invalid == "interpolated" else "exact",
+        )
+
+    monkeypatch.setattr(DSV41NativeSegment, "query", derived)
+    with pytest.raises(PredictorError, match="exact qualified silicon"):
+        _initial_draft_buffer(object(), policy, capture, asset)
 
 
 @pytest.mark.parametrize("mode,phase,region", CASES)
