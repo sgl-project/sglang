@@ -296,6 +296,8 @@ class ConfigManager:
                 "systems_root",
                 "runtime_profile",
                 "progress_artifact",
+                "progress_kind",
+                "model_seed",
                 "proposal_profile_id",
                 "native_segment_profile_id",
                 "native_capture_profile",

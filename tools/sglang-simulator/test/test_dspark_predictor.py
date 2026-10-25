@@ -27,6 +27,23 @@ def raw(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
 
 
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"progress_kind": "unknown"},
+        {"progress_kind": True},
+        {"model_seed": 42},
+        {"progress_kind": "source_golden351", "model_seed": True},
+        {"progress_kind": "source_golden351", "model_seed": -1},
+        {"progress_kind": "source_golden351"},
+        {"progress_kind": "source_golden351", "model_seed": 42},
+    ],
+)
+def test_invalid_progress_selection_fails_before_sdk_or_artifact_reads(options):
+    with pytest.raises(PredictorError):
+        InferCastDSparkTimePredictor(None, None, None, **options)
+
+
 def mock_config_link(monkeypatch, source, target):
     """Model link resolution deterministically on hosts without symlink privilege."""
     original_resolve, original_lstat, original_readlink = (

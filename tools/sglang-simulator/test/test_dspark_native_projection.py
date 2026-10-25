@@ -1330,6 +1330,18 @@ def real_factory(source_case, tmp_path, monkeypatch):
     )
 
 
+def test_golden_factory_rejects_real_natural_policy_without_reading_empirical_asset(
+    source_case, real_factory
+):
+    stage_policy_metadata(source_case)
+    with pytest.raises(PredictorError, match="matching verified golden351"):
+        real_factory.build(
+            progress_kind="source_golden351", model_seed=42, progress_artifact=None
+        )
+    assert real_factory.progress_reads == []
+    assert real_factory.progress_calls == []
+
+
 @pytest.mark.parametrize("mode", ["EXTEND", "DECODE"])
 def test_factory_loads_verified_existing_metadata_then_reaches_ordinary_missing_cost(
     source_case, real_factory, mode

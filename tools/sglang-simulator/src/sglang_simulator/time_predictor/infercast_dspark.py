@@ -629,6 +629,8 @@ class InferCastDSparkTimePredictor(InferTimePredictor):
         systems_root=None,
         runtime_profile=None,
         progress_artifact=None,
+        progress_kind="empirical",
+        model_seed=None,
         proposal_profile_id=None,
         native_segment_profile_id=None,
         native_capture_profile=None,
@@ -639,6 +641,22 @@ class InferCastDSparkTimePredictor(InferTimePredictor):
         _require(
             not kwargs, "unknown DSPark predictor configuration", fields=sorted(kwargs)
         )
+        _require(
+            type(progress_kind) is str
+            and progress_kind in {"empirical", "source_golden351"},
+            "progress_kind must be empirical or source_golden351",
+        )
+        if progress_kind == "empirical":
+            _require(model_seed is None, "empirical progress uses its artifact seed")
+        else:
+            _require(
+                type(model_seed) is int and model_seed >= 0,
+                "source_golden351 requires an explicit nonnegative integer model_seed",
+            )
+            _require(
+                progress_artifact is None and native_segment_profile_id is not None,
+                "source_golden351 requires native regions and no empirical progress_artifact",
+            )
         super().__init__(model, hw, config)
         _require(
             model_id == "deepseek-ai/DeepSeek-V4.1-Flash",
@@ -722,9 +740,11 @@ class InferCastDSparkTimePredictor(InferTimePredictor):
             runtime_profile, "runtime_profile"
         )
         runtime_text = _runtime_json(runtime_bytes)
-        progress_path, _, progress_digest = _asset(
-            progress_artifact, "progress_artifact"
-        )
+        progress_path, progress_digest = None, None
+        if progress_kind == "empirical":
+            progress_path, _, progress_digest = _asset(
+                progress_artifact, "progress_artifact"
+            )
 
         try:
             import infercast
@@ -837,11 +857,22 @@ class InferCastDSparkTimePredictor(InferTimePredictor):
                 raise PredictorError(
                     "data_unavailable", f"native source policy is unavailable: {error}"
                 ) from error
-        progress = EmpiricalDSparkProgress(
-            progress_path,
-            expected_sha256=progress_digest,
-            runtime_profile_json=runtime_text,
-        )
+        if progress_kind == "empirical":
+            _require(
+                getattr(native_policy, "golden_law", None) is None,
+                "golden native regions require source_golden351 progress",
+            )
+            progress = EmpiricalDSparkProgress(
+                progress_path,
+                expected_sha256=progress_digest,
+                runtime_profile_json=runtime_text,
+            )
+        else:
+            from sglang_simulator.time_predictor.dspark_golden_progress import (
+                SourceGoldenDSparkProgress,
+            )
+
+            progress = SourceGoldenDSparkProgress(native_policy, model_seed=model_seed)
         _require(
             progress.topology == (2, 1, 1),
             "progress originals require the same modeled TP2/DP1/PP1 topology",
@@ -872,7 +903,9 @@ class InferCastDSparkTimePredictor(InferTimePredictor):
             "progress_artifact": {
                 "path": str(progress_path),
                 "sha256": progress_digest,
-            },
+            }
+            if progress_kind == "empirical"
+            else None,
             "progress_model_ref": progress.model_ref,
             "proposal_profile_id": proposal_profile_id,
             "native_segment_profile_id": native_segment_profile_id,
@@ -884,6 +917,8 @@ class InferCastDSparkTimePredictor(InferTimePredictor):
                 "database_mode": "SILICON",
             },
         }
+        if progress_kind == "source_golden351":
+            self._identity.update(progress_kind=progress_kind, **progress.identity)
 
     def predict_infer_time(self, batch):
         raise PredictorError(

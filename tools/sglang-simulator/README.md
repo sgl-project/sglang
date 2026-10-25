@@ -115,6 +115,27 @@ request distributions: multiplying them into a joint batch law is not supported.
 Reading them neither admits a phase cost nor supplies current native acceptance;
 missing measurements and complete-boundary checks still fail before sampling.
 
+The explicit `progress_kind="source_golden351"` instead selects the pinned
+DSpark match-expected 3.51 source law. It requires an exact nonnegative integer
+`model_seed`, no empirical `progress_artifact`, and an SDK-verified native-region
+policy whose golden law and stable material identity match. Older SDKs or natural
+profiles fail closed. The SDK owns source/material verification and the separate
+golden marginal-cost contract; there is no caller-supplied approval flag. The
+default remains empirical and retains its existing artifact and identity.
+
+This first golden progress mode represents TP2/ADP1/PP1 logical B1 with full
+static draft Q5/verify Q6 work and length-only output. SHA256 of the model identity
+and DECODE forward ID, modulo100, selects commit4 for residues0–50 and commit3
+otherwise. Identity includes the explicit seed, complete runtime and verified
+golden material. This is an idempotent modeled realization of the 49/51 law,
+not replay of native Torch CPU RNG history. Prefill draws nothing; the existing
+middle-chunk0/final-bonus1 path remains. Costs resolve before progress, without
+shrinking Q or scaling latency by3.51. Full committed lengths advance KV even at
+the final OSL boundary; native scheduling clips visible output separately.
+Complete newly qualified golden costs are still required for an actual run.
+Source-law implementation and CPU tests do not establish native timing or
+Simulator/Pareto accuracy.
+
 Actual multi-DP scheduling/heterogeneous coordination, complete measured worker
 costs (including allocation), independently reviewed progress data and target
 source resolution remain required for a complete V4.1 AgentX run. The native runtime

@@ -90,6 +90,15 @@ def test_malformed_asset_is_passed_to_predictor_validator_not_repaired(factory):
     assert calls == [result]
 
 
+def test_golden_kind_and_explicit_model_seed_route_without_empirical_asset(factory):
+    _, raw, _ = factory
+    raw["predictor"].pop("progress_artifact")
+    raw["predictor"].update(progress_kind="source_golden351", model_seed=42)
+    result = ConfigManager.get_inference_time_predictor(None, None, None)
+    assert result.progress_kind == "source_golden351" and result.model_seed == 42
+    assert not hasattr(result, "progress_artifact")
+
+
 def test_native_segment_selector_and_existing_capture_profile_resolve_from_config(
     factory,
 ):
