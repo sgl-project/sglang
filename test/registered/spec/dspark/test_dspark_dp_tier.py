@@ -29,9 +29,10 @@ class TestDpGlobalVerifyTierNumTokens(CustomTestCase):
 class TestDraftDpSyncMetadata(CustomTestCase):
     def test_gpu_only_draft_keeps_cpu_lengths_absent(self):
         from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
-        from sglang.srt.runtime_context import get_parallel
+        from sglang.test.test_utils import published_topology
 
-        self.enterContext(get_parallel().override(moe_ep_size=1))
+        # The proposer resolves its logits layout from the published topology.
+        self.enterContext(published_topology())
         hidden = torch.arange(6, dtype=torch.float32).reshape(3, 2)
 
         def forward(batch):

@@ -12,10 +12,11 @@ from sglang.srt.layers.aux_hidden_states import (
 from sglang.srt.model_executor.model_runner_components.misc_utils import (
     resolve_aux_hidden_states_width,
 )
+from sglang.srt.mem_cache.draft_kv_budget import resolve_dflash_draft_cell_size
 from sglang.srt.model_executor.model_runner_components.spec_aux_hidden_state import (
     _map_muse_target_layer_ids,
-    _resolve_dflash_draft_cell_size,
 )
+from sglang.srt.speculative.draft_parallel import legacy_draft_attn_tp_size
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import published_topology
@@ -79,10 +80,10 @@ def test_draft_kv_budget_matches_attention_sharding(
         speculative_draft_attention_backend="trtllm_mha",
     ):
         assert (
-            _resolve_dflash_draft_cell_size(
+            resolve_dflash_draft_cell_size(
                 draft_model_config=draft,
                 draft_num_layers=5,
-                spec_algorithm=SpeculativeAlgorithm.DFLASH,
+                attn_tp_size=legacy_draft_attn_tp_size(SpeculativeAlgorithm.DFLASH),
             )
             == 5 * local_kv_heads * (128 + 128) * element_bytes
         )
