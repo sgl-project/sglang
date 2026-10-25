@@ -265,48 +265,34 @@ def _make_per_token_global_scale(input_tensor: torch.Tensor) -> torch.Tensor:
     )
 
 
+@dataclass(frozen=True)
+class CuteDslMoeState:
+    wrapper: Any
+    scales: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    input_scale: torch.Tensor
+    use_per_token_activation: bool
+
+
 def refresh_cutedsl_standard_scales_for_weight_update(
     layer: torch.nn.Module,
 ) -> None:
-    states = getattr(layer, "_cutedsl_states", None)
-    if states:
-        selected = layer._cutedsl_state_key
-        for key, state in states.items():
-            layer._cutedsl_state_key = key
-            (
-                layer._cutedsl_wrapper,
-                layer._cutedsl_scales,
-                layer._cutedsl_input_scale,
-            ) = state
-            _refresh_cutedsl_standard_scales(layer)
-        layer._cutedsl_wrapper, layer._cutedsl_scales, layer._cutedsl_input_scale = (
-            states[selected]
-        )
-        layer._cutedsl_state_key = selected
-    else:
-        _refresh_cutedsl_standard_scales(layer)
+    for state in layer._cutedsl_states.values():
+        _refresh_cutedsl_standard_scales(layer, state)
 
 
-def _refresh_cutedsl_standard_scales(layer: torch.nn.Module) -> None:
-    use_per_token = getattr(
-        layer,
-        "_cutedsl_state_key",
-        (
-            layer._cutedsl_wrapper.quant_mode,
-            layer.quant_config.use_per_token_activation,
-        ),
-    )[1]
+def _refresh_cutedsl_standard_scales(
+    layer: torch.nn.Module, state: CuteDslMoeState
+) -> None:
+    use_per_token = state.use_per_token_activation
     w1_alpha, fc2_input_scale, w2_alpha, used_input_scale = (
-        resolve_cutedsl_standard_scales(
-            layer, layer._cutedsl_wrapper.quant_mode, use_per_token
-        )
+        resolve_cutedsl_standard_scales(layer, state.wrapper.quant_mode, use_per_token)
     )
-    if use_per_token and layer._cutedsl_wrapper.quant_mode == "w4a4":
+    if use_per_token and state.wrapper.quant_mode == "w4a4":
         used_input_scale = _make_per_token_global_scale(used_input_scale)
 
     new_scales = (w1_alpha, fc2_input_scale, w2_alpha)
-    current_scales = layer._cutedsl_scales
-    current_input_scale = layer._cutedsl_input_scale
+    current_scales = state.scales
+    current_input_scale = state.input_scale
 
     # Decode CUDA graphs capture these tensor addresses, so reloads must update
     # their values without replacing the tensors.
@@ -340,7 +326,7 @@ def _refresh_cutedsl_standard_scales(layer: torch.nn.Module) -> None:
             current.copy_(new)
 
 
-def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
+def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> CuteDslMoeState:
     from sglang.srt.layers.moe.phase import (
         is_w4a16_enabled,
         use_nvfp4_per_token_activation,
@@ -364,23 +350,23 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
             for phase in ("prefill", "decode")
         )
         # Build both workspaces before either phase can be graph-captured.
+        wrappers = {}
         for mode, per_token in modes:
-            layer._cutedsl_wrapper = None
-            _initialize_cutedsl_wrapper(layer, mode, per_token)
-            states[mode, per_token] = (
-                layer._cutedsl_wrapper,
-                layer._cutedsl_scales,
-                layer._cutedsl_input_scale,
+            state = _initialize_cutedsl_wrapper(
+                layer, mode, per_token, wrapper=wrappers.get(mode)
             )
-    layer._cutedsl_state_key = selected
-    layer._cutedsl_wrapper, layer._cutedsl_scales, layer._cutedsl_input_scale = states[
-        selected
-    ]
+            wrappers[mode] = state.wrapper
+            states[mode, per_token] = state
+    return states[selected]
 
 
 def _initialize_cutedsl_wrapper(
-    layer: torch.nn.Module, quant_mode: str, use_per_token: bool
-) -> None:
+    layer: torch.nn.Module,
+    quant_mode: str,
+    use_per_token: bool,
+    *,
+    wrapper: Any = None,
+) -> CuteDslMoeState:
     """Lazily create CuteDslMoEWrapper and resolve scales on first forward.
 
     The wrapper is created lazily (not in __init__ / create_weights) because
@@ -392,9 +378,6 @@ def _initialize_cutedsl_wrapper(
     during later CUDA graph capture, which runs outside inference_mode. The
     resolved scale tensors share this scope because reload updates them in place.
     """
-    if layer._cutedsl_wrapper is not None:
-        return
-
     try:
         from flashinfer import ActivationType, CuteDslMoEWrapper
     except ImportError as e:
@@ -429,31 +412,33 @@ def _initialize_cutedsl_wrapper(
     # be inplace-updated during later CUDA graph capture (which runs outside
     # inference_mode), so we must opt out here.
     with torch.inference_mode(False):
-        layer._cutedsl_wrapper = CuteDslMoEWrapper(
-            num_experts=layer.num_experts,
-            top_k=top_k,
-            hidden_size=layer.hidden_size,
-            intermediate_size=layer.intermediate_size_per_partition,
-            use_cuda_graph=use_cuda_graph,
-            max_num_tokens=max_num_tokens,
-            num_local_experts=layer.num_local_experts,
-            local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
-            output_dtype=layer.moe_runner_config.params_dtype,
-            device=str(layer.w13_weight.device),
-            use_fused_finalize=envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get(),
-            activation_type=_cutedsl_wrapper_activation_type(
-                layer.moe_runner_config.activation, ActivationType
-            ),
-            quant_mode=quant_mode,
-        )
+        if wrapper is None:
+            wrapper = CuteDslMoEWrapper(
+                num_experts=layer.num_experts,
+                top_k=top_k,
+                hidden_size=layer.hidden_size,
+                intermediate_size=layer.intermediate_size_per_partition,
+                use_cuda_graph=use_cuda_graph,
+                max_num_tokens=max_num_tokens,
+                num_local_experts=layer.num_local_experts,
+                local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
+                output_dtype=layer.moe_runner_config.params_dtype,
+                device=str(layer.w13_weight.device),
+                use_fused_finalize=envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get(),
+                activation_type=_cutedsl_wrapper_activation_type(
+                    layer.moe_runner_config.activation, ActivationType
+                ),
+                quant_mode=quant_mode,
+            )
 
         w1_alpha, fc2_input_scale, w2_alpha, used_input_scale = (
             resolve_cutedsl_standard_scales(layer, quant_mode, use_per_token)
         )
         if use_per_token:
             used_input_scale = _make_per_token_global_scale(used_input_scale)
-    layer._cutedsl_scales = (w1_alpha, fc2_input_scale, w2_alpha)
-    layer._cutedsl_input_scale = used_input_scale
+    return CuteDslMoeState(
+        wrapper, (w1_alpha, fc2_input_scale, w2_alpha), used_input_scale, use_per_token
+    )
 
 
 # ---------------------------------------------------------------------------

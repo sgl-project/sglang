@@ -442,7 +442,6 @@ class TestNvFp4CuteDslPhaseState(CustomTestCase):
         flashinfer.CuteDslMoEWrapper = Wrapper
         flashinfer.ActivationType = SimpleNamespace(Swiglu="swiglu", Relu2="relu2")
         layer = SimpleNamespace(
-            _cutedsl_wrapper=None,
             num_experts=2,
             num_local_experts=2,
             moe_ep_rank=0,
@@ -470,48 +469,60 @@ class TestNvFp4CuteDslPhaseState(CustomTestCase):
             ),
             mock.patch.object(cutedsl, "cutedsl_moe_max_num_tokens", return_value=16),
         ):
+            identities = None
             for phase in ("prefill", "decode", "prefill"):
                 with forward_context(
                     ForwardContext(attn_backend=None, moe_forward_phase=phase)
                 ):
-                    cutedsl.ensure_cutedsl_wrapper(layer)
+                    state = cutedsl.ensure_cutedsl_wrapper(layer)
                     self.assertEqual(
-                        layer._cutedsl_wrapper.quant_mode,
+                        state.wrapper.quant_mode,
                         "w4a16" if phase == "decode" else "w4a4",
                     )
+                    current = {name: id(value) for name, value in vars(layer).items()}
+                    if identities is None:
+                        identities = current
+                    self.assertEqual(current, identities)
             self.assertEqual(len(wrappers), 2)
             self.assertIsNot(wrappers[0], wrappers[1])
             states = layer._cutedsl_states
             torch.testing.assert_close(
-                states["w4a4", False][1][0], torch.tensor([1.0, 2.0])
+                states["w4a4", False].scales[0], torch.tensor([1.0, 2.0])
             )
             torch.testing.assert_close(
-                states["w4a16", False][1][0], torch.tensor([2.0, 4.0])
+                states["w4a16", False].scales[0], torch.tensor([2.0, 4.0])
             )
             torch.testing.assert_close(
-                states["w4a4", False][1][2], torch.tensor([3.0, 4.0])
+                states["w4a4", False].scales[2], torch.tensor([3.0, 4.0])
             )
             torch.testing.assert_close(
-                states["w4a16", False][1][2], torch.tensor([12.0, 16.0])
+                states["w4a16", False].scales[2], torch.tensor([12.0, 16.0])
             )
             pointers = {
-                mode: [tensor.data_ptr() for tensor in (*scales, input_scale)]
-                for mode, (_, scales, input_scale) in states.items()
+                mode: [
+                    tensor.data_ptr() for tensor in (*state.scales, state.input_scale)
+                ]
+                for mode, state in states.items()
             }
             layer.w13_weight_scale_2.mul_(2)
             layer.w2_weight_scale_2.mul_(2)
             cutedsl.refresh_cutedsl_standard_scales_for_weight_update(layer)
-            self.assertEqual(layer._cutedsl_wrapper.quant_mode, "w4a4")
-            for mode, (_, scales, input_scale) in states.items():
+            self.assertEqual(
+                {name: id(value) for name, value in vars(layer).items()}, identities
+            )
+            for mode, state in states.items():
                 self.assertEqual(
-                    [tensor.data_ptr() for tensor in (*scales, input_scale)],
+                    [
+                        tensor.data_ptr()
+                        for tensor in (*state.scales, state.input_scale)
+                    ],
                     pointers[mode],
                 )
             torch.testing.assert_close(
-                states["w4a4", False][1][0], torch.tensor([2.0, 4.0])
+                states["w4a4", False].scales[0], torch.tensor([2.0, 4.0])
             )
             torch.testing.assert_close(
-                states["w4a16", False][1][0], torch.tensor([4.0, 8.0])
+                states["w4a16", False].scales[0], torch.tensor([4.0, 8.0])
             )
             torch.testing.assert_close(
                 states["w4a4", False][1][2], torch.tensor([6.0, 8.0])

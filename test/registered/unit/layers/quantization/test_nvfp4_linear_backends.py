@@ -12,7 +12,7 @@ import torch
 from flashinfer import fp4_quantize
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.quantization import fp4_utils
+from sglang.srt.layers.quantization import fp4_utils, modelopt_quant
 from sglang.srt.layers.quantization.fp4_utils import Fp4GemmRunnerBackend
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
@@ -185,11 +185,58 @@ class TestNvFp4LinearBackends(CustomTestCase):
                     torch.manual_seed(7)
                     layer, _ = _make_quantized_layer(256, 512)
                     layer.quant_method.process_weights_after_loading(layer)
+                    self.assertEqual(
+                        layer.weight_scale_mma.untyped_storage().data_ptr(),
+                        layer.weight_scale_interleaved.untyped_storage().data_ptr(),
+                    )
+                    self.assertFalse(hasattr(layer, "_w4a16_weight"))
+                    names = (
+                        "weight",
+                        "weight_scale_interleaved",
+                        "weight_scale_mma",
+                        "alpha",
+                        "weight_global_scale",
+                        "input_scale_inv",
+                    )
+                    identities = {
+                        name: (
+                            id(getattr(layer, name)),
+                            getattr(layer, name).data_ptr(),
+                        )
+                        for name in names
+                    }
                     for phase in ("prefill", "decode", "prefill"):
-                        with forward_context(
-                            ForwardContext(attn_backend=None, moe_forward_phase=phase)
+                        with (
+                            forward_context(
+                                ForwardContext(
+                                    attn_backend=None, moe_forward_phase=phase
+                                )
+                            ),
+                            mock.patch.object(
+                                modelopt_quant,
+                                "fp4_gemm",
+                                wraps=modelopt_quant.fp4_gemm,
+                            ) as gemm,
                         ):
                             out, _ = layer(x)
+                            self.assertEqual(
+                                gemm.call_args.args[1].data_ptr(),
+                                layer.weight.data_ptr(),
+                            )
+                            self.assertEqual(
+                                gemm.call_args.args[3].untyped_storage().data_ptr(),
+                                layer.weight_scale_interleaved.untyped_storage().data_ptr(),
+                            )
+                            self.assertEqual(
+                                {
+                                    name: (
+                                        id(getattr(layer, name)),
+                                        getattr(layer, name).data_ptr(),
+                                    )
+                                    for name in names
+                                },
+                                identities,
+                            )
                             expected = controls[phase == enabled_phase]
                             torch.testing.assert_close(out, expected, rtol=0, atol=0)
                             graph = torch.cuda.CUDAGraph()

@@ -22,7 +22,6 @@ and combine stay pure no-ops; this module owns the layer build + forward.
 
 from __future__ import annotations
 
-import copy
 import logging
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
@@ -242,6 +241,7 @@ def _init_flashinfer_megamoe_layer_state(layer: FusedMoE) -> None:
     layer._flashinfer_megamoe_layer = None
     layer._flashinfer_megamoe_forward = None
     layer._flashinfer_megamoe_input_norm_const = None
+    layer._flashinfer_megamoe_nvfp4_states = {}
 
 
 def _get_or_init_flashinfer_megamoe_layer_state(layer: FusedMoE) -> Any:
@@ -256,8 +256,12 @@ def _ensure_flashinfer_megamoe_layer(
     megakernel_config: Any,
     w13_scale: torch.Tensor,
     w2_scale: torch.Tensor,
+    nvfp4_use_w4a16: bool | None = None,
 ) -> Any:
     mega = _get_or_init_flashinfer_megamoe_layer_state(layer)
+    if nvfp4_use_w4a16 is not None:
+        state = layer._flashinfer_megamoe_nvfp4_states.get(nvfp4_use_w4a16)
+        mega = state[0] if state is not None else None
     if mega is not None:
         return mega
 
@@ -315,17 +319,19 @@ def _ensure_flashinfer_megamoe_layer(
         weights=None,
         backend=backend,
     )
-    layer._flashinfer_megamoe_layer = mega
     if hasattr(megakernel_config, "knobs"):
         from sglang.srt.layers.moe.flashinfer_megamoe_autotune import (
             MegaMoeTunedForward,
         )
 
-        layer._flashinfer_megamoe_forward = MegaMoeTunedForward(
-            bootstrap, fleet_params, backend
-        )
+        mega_forward = MegaMoeTunedForward(bootstrap, fleet_params, backend)
     else:
-        layer._flashinfer_megamoe_forward = _select_megamoe_forward(mega)
+        mega_forward = _select_megamoe_forward(mega)
+    if nvfp4_use_w4a16 is None:
+        layer._flashinfer_megamoe_layer = mega
+        layer._flashinfer_megamoe_forward = mega_forward
+    else:
+        layer._flashinfer_megamoe_nvfp4_states[nvfp4_use_w4a16] = (mega, mega_forward)
     return mega
 
 
@@ -366,25 +372,27 @@ def _nvfp4_megamoe_activation_kwargs(config: MoeRunnerConfig) -> dict[str, Any]:
 def ensure_nvfp4_moe_layer_for_flashinfer_megamoe(
     layer: FusedMoE, *, use_w4a16: bool | None = None
 ) -> Any:
-    variant = getattr(layer, "_flashinfer_megamoe_w4a16", None)
-    if variant is not None:
-        # Each precision owns its prepared layout, workspace and tuning profiles.
+    setting = envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()
+    if isinstance(setting, str):
+        # The kernels share prepared weights; only their execution resources
+        # differ. Build both before either phase can enter CUDA graph capture.
         w4a4 = _ensure_nvfp4_moe_layer(layer, use_w4a16=False)
-        w4a16 = _ensure_nvfp4_moe_layer(variant, use_w4a16=True)
+        w4a16 = _ensure_nvfp4_moe_layer(layer, use_w4a16=True)
         if use_w4a16 is None:
             from sglang.srt.layers.moe.phase import is_w4a16_enabled
 
             use_w4a16 = is_w4a16_enabled()
         return w4a16 if use_w4a16 else w4a4
     if use_w4a16 is None:
-        use_w4a16 = envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get() is True
+        use_w4a16 = setting is True
     return _ensure_nvfp4_moe_layer(layer, use_w4a16=use_w4a16)
 
 
 def _ensure_nvfp4_moe_layer(layer: FusedMoE, *, use_w4a16: bool) -> Any:
-    mega = _get_or_init_flashinfer_megamoe_layer_state(layer)
-    if mega is not None:
-        return mega
+    _get_or_init_flashinfer_megamoe_layer_state(layer)
+    state = layer._flashinfer_megamoe_nvfp4_states.get(use_w4a16)
+    if state is not None:
+        return state[0]
 
     activation_kwargs = _nvfp4_megamoe_activation_kwargs(layer.moe_runner_config)
     if use_w4a16:
@@ -431,6 +439,7 @@ def _ensure_nvfp4_moe_layer(layer: FusedMoE, *, use_w4a16: bool) -> Any:
         megakernel_config=megakernel_config,
         w13_scale=layer.w13_weight_scale,
         w2_scale=layer.w2_weight_scale,
+        nvfp4_use_w4a16=use_w4a16,
     )
 
 
@@ -516,59 +525,25 @@ def prepare_nvfp4_moe_weights_for_flashinfer_megamoe(
 ) -> None:
     setting = envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()
     if isinstance(setting, str):
-        _prepare_nvfp4_w4a16_variant(layer)
-    _prepare_nvfp4_moe_weights(layer, use_w4a16=setting is True)
+        from sglang.srt.layers.utils.common import copy_or_rebind_param
 
-
-def _prepare_nvfp4_w4a16_variant(layer: FusedMoE) -> None:
-    """Keep a second prepared layout without aliasing the W4A4 reload buffers."""
-    from sglang.srt.layers.utils.common import copy_or_rebind_param
-
-    variant = getattr(layer, "_flashinfer_megamoe_w4a16", None)
-    weight_names = ("w13_weight", "w13_weight_scale", "w2_weight", "w2_weight_scale")
-    if variant is None:
-        variant = copy.copy(layer)
-        # A shallow nn.Module copy shares its registries. Clone the registries
-        # before installing parameters so neither view rewrites the other.
-        if isinstance(layer, torch.nn.Module):
-            variant._parameters = layer._parameters.copy()
-            variant._buffers = layer._buffers.copy()
-            variant._modules = layer._modules.copy()
-        for name in (*weight_names, "g1_alphas", "g1_alphas_up", "g2_alphas"):
-            value = getattr(layer, name)
-            setattr(
-                variant,
-                name,
-                torch.nn.Parameter(value.detach().clone(), requires_grad=False),
+        # Keep calibrated W4A4 scales and weight-only W4A16 scales as fixed
+        # call arguments. Both kernels consume the same packed weight storage.
+        for name, input_scale in (
+            ("g1_alphas", layer.w13_input_scale_quant),
+            ("g2_alphas", layer.w2_input_scale_quant),
+        ):
+            copy_or_rebind_param(
+                layer, f"_w4a16_{name}", getattr(layer, name) * input_scale
             )
-        _init_flashinfer_megamoe_layer_state(variant)
-        # This is an alternate view of one layer, not another model submodule.
-        object.__setattr__(layer, "_flashinfer_megamoe_w4a16", variant)
-    else:
-        for name, (load_view, _) in variant._flashinfer_megamoe_weight_views.items():
-            getattr(variant, name).data = load_view
-        for name in weight_names:
-            getattr(variant, name).data.copy_(getattr(layer, name).data)
-
-    # The primary view keeps checkpoint activation calibration for W4A4.
-    # W4A16's alphas contain the weight decode scales only.
-    for name, input_scale in (
-        ("g1_alphas", layer.w13_input_scale_quant),
-        ("g1_alphas_up", layer.w13_input_scale_quant),
-        ("g2_alphas", layer.w2_input_scale_quant),
-    ):
-        copy_or_rebind_param(variant, name, getattr(layer, name) * input_scale)
-    _prepare_nvfp4_moe_weights(variant, use_w4a16=True)
-    if isinstance(layer, torch.nn.Module):
-        # Memory accounting and weight offload traverse the owner only.
-        for name in (*weight_names, "g1_alphas", "g1_alphas_up", "g2_alphas"):
-            layer.register_parameter(f"_w4a16_{name}", getattr(variant, name))
+    _prepare_nvfp4_moe_weights(layer, use_w4a16=setting is True)
 
 
 def _prepare_nvfp4_moe_weights(layer: FusedMoE, *, use_w4a16: bool) -> None:
     # Both NVFP4 modes reload into the same prepared allocations. Preserve the
     # live layer, tuned profiles and pooled workspace owner for CUDA graphs.
-    mega = _get_or_init_flashinfer_megamoe_layer_state(layer)
+    _get_or_init_flashinfer_megamoe_layer_state(layer)
+    w4a4_state = layer._flashinfer_megamoe_nvfp4_states.get(False)
 
     from flashinfer.moe_ep import MoEWeightPack
 
@@ -638,7 +613,7 @@ def _prepare_nvfp4_moe_weights(layer: FusedMoE, *, use_w4a16: bool) -> None:
 
         input_norm_const = _scalar_float(layer.w13_input_scale_quant)
         if (
-            mega is not None
+            w4a4_state is not None
             and input_norm_const != layer._flashinfer_megamoe_input_norm_const
         ):
             # FlashInfer captures this scalar by value; updating Python config
@@ -794,10 +769,12 @@ def warmup_all_flashinfer_megamoe_layers(model: torch.nn.Module) -> None:
             module, "_flashinfer_megamoe_layer"
         ):
             continue
-        variant = getattr(module, "_flashinfer_megamoe_w4a16", None)
-        if module._flashinfer_megamoe_layer is not None and (
-            variant is None or variant._flashinfer_megamoe_layer is not None
-        ):
+        if module._flashinfer_megamoe_layer is not None:
+            continue
+        setting = envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()
+        modes = (False, True) if isinstance(setting, str) else (setting is True,)
+        states = getattr(module, "_flashinfer_megamoe_nvfp4_states", {})
+        if all(mode in states for mode in modes):
             continue
         if isinstance(module.quant_method, ModelOptNvFp4FusedMoEMethod):
             ensure_nvfp4_moe_layer_for_flashinfer_megamoe(

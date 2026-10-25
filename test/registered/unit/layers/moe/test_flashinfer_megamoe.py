@@ -621,7 +621,7 @@ def test_nvfp4_keeps_weight_scale_storage_and_activation_contract(
     )
     quant_info = module.FlashInferMegaMoeQuantInfo(
         mega=mega,
-        mega_forward=layer._flashinfer_megamoe_forward,
+        mega_forward=layer._flashinfer_megamoe_nvfp4_states[use_w4a16][1],
         fc1_alpha=layer.g1_alphas,
         fc2_alpha=layer.g2_alphas,
         fc1_norm_const=None if use_w4a16 else layer.w2_input_scale_quant,
@@ -758,8 +758,7 @@ def test_nvfp4_reload_preserves_layer_and_prepared_weight_storage(
         _transformed_weights={name: p.data for name, p in layer.named_parameters()},
     )
     forward = object()
-    layer._flashinfer_megamoe_layer = mega
-    layer._flashinfer_megamoe_forward = forward
+    layer._flashinfer_megamoe_nvfp4_states[use_w4a16] = (mega, forward)
 
     def load(param, value):
         for name, p in layer.named_parameters():
@@ -771,8 +770,7 @@ def test_nvfp4_reload_preserves_layer_and_prepared_weight_storage(
         for param in layer.parameters():
             loader(param, value)
         module.prepare_nvfp4_moe_weights_for_flashinfer_megamoe(layer)
-        assert layer._flashinfer_megamoe_layer is mega
-        assert layer._flashinfer_megamoe_forward is forward
+        assert layer._flashinfer_megamoe_nvfp4_states[use_w4a16] == (mega, forward)
         for name, p in layer.named_parameters():
             assert (p.shape, p.stride(), p.dtype, p.data_ptr()) == prepared[name]
             # Views held by the live backend and captured graphs see new bytes.
@@ -789,12 +787,11 @@ def test_nvfp4_reload_preserves_layer_and_prepared_weight_storage(
         layer.w13_input_scale_quant.fill_(2.0)
         with pytest.raises(ValueError, match="input activation scale"):
             module.prepare_nvfp4_moe_weights_for_flashinfer_megamoe(layer)
-        assert layer._flashinfer_megamoe_layer is mega
-        assert layer._flashinfer_megamoe_forward is forward
+        assert layer._flashinfer_megamoe_nvfp4_states[use_w4a16] == (mega, forward)
         assert layer._flashinfer_megamoe_input_norm_const == 1.0
 
 
-def test_precapture_warmup_includes_online_methods_and_precision_variants(
+def test_precapture_warmup_includes_online_methods_and_both_kernels(
     monkeypatch,
 ):
     module = _load_megamoe_module(monkeypatch)
@@ -823,28 +820,33 @@ def test_precapture_warmup_includes_online_methods_and_precision_variants(
     )
     online = FusedMoE()
     online.quant_method = OnlineMethod()
-    online._flashinfer_megamoe_layer = None
+    module._init_flashinfer_megamoe_layer_state(online)
     paired = FusedMoE()
     paired.quant_method = NvFp4Method()
-    paired._flashinfer_megamoe_layer = object()
-    object.__setattr__(
-        paired,
-        "_flashinfer_megamoe_w4a16",
-        types.SimpleNamespace(_flashinfer_megamoe_layer=None),
-    )
+    module._init_flashinfer_megamoe_layer_state(paired)
+    paired._flashinfer_megamoe_nvfp4_states[False] = (object(), object())
+    ready = FusedMoE()
+    ready.quant_method = NvFp4Method()
+    module._init_flashinfer_megamoe_layer_state(ready)
+    ready._flashinfer_megamoe_nvfp4_states = {
+        False: (object(), object()),
+        True: (object(), object()),
+    }
     calls = []
     monkeypatch.setattr(
         module,
         "ensure_nvfp4_moe_layer_for_flashinfer_megamoe",
         lambda layer, **kwargs: calls.append((layer, kwargs["use_w4a16"])),
     )
-    module.warmup_all_flashinfer_megamoe_layers(torch.nn.ModuleList([online, paired]))
+    module.warmup_all_flashinfer_megamoe_layers(
+        torch.nn.ModuleList([online, paired, ready])
+    )
     assert calls == [(online, False), (paired, False)]
 
 
 @pytest.mark.parametrize("w4a16_phase", ["prefill", "decode"])
 @pytest.mark.parametrize("per_token_setting", [False, True, "prefill", "decode"])
-def test_phase_specific_nvfp4_keeps_both_layouts_and_reload_addresses(
+def test_phase_specific_nvfp4_shares_weights_and_keeps_reload_addresses(
     monkeypatch, w4a16_phase, per_token_setting
 ):
     module = _load_megamoe_module(monkeypatch)
@@ -865,6 +867,8 @@ def test_phase_specific_nvfp4_keeps_both_layouts_and_reload_addresses(
     layer.hidden_size = layer.intermediate_size_per_partition = 128
     layer.num_experts = layer.num_local_experts = 2
     layer.moe_ep_size = 1
+    layer.moe_ep_rank = layer.layer_id = 0
+    layer.top_k = 2
     layer.quant_config = types.SimpleNamespace(
         use_per_token_activation=bool(per_token_setting),
         per_token_activation_phase=(
@@ -904,11 +908,23 @@ def test_phase_specific_nvfp4_keeps_both_layouts_and_reload_addresses(
             )
         )
 
+    class Mega:
+        supports_output_view = False
+
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
     monkeypatch.setitem(
         sys.modules,
         "flashinfer.moe_ep",
         types.SimpleNamespace(
             MoEWeightPack=types.SimpleNamespace,
+            BootstrapConfig=types.SimpleNamespace,
+            FleetParams=types.SimpleNamespace,
+            MegaConfig=types.SimpleNamespace,
+            MoEEpMegaLayer=Mega,
+            Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig=types.SimpleNamespace,
+            Nvfp4CutedslMegaMoeConfig=types.SimpleNamespace,
             preprocess_bf16_nvfp4_cutedsl_mega_weights=lambda weights, **kwargs: (
                 preprocess(weights, w4a16=True, **kwargs)
             ),
@@ -917,52 +933,71 @@ def test_phase_specific_nvfp4_keeps_both_layouts_and_reload_addresses(
             ),
         ),
     )
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     if per_token_setting and per_token_setting != w4a16_phase:
         with pytest.raises(ValueError, match="does not support per-token activation"):
             module.prepare_nvfp4_moe_weights_for_flashinfer_megamoe(layer)
         return
 
     module.prepare_nvfp4_moe_weights_for_flashinfer_megamoe(layer)
-    variant = layer._flashinfer_megamoe_w4a16
-    assert prepared_modes == [True, False]
-    assert variant not in list(layer.modules())
+    assert prepared_modes == [False]
+    assert not hasattr(layer, "_flashinfer_megamoe_w4a16")
+    assert list(layer.modules()) == [layer]
     torch.testing.assert_close(layer.g1_alphas, torch.tensor([0.5, 1.0]))
-    torch.testing.assert_close(variant.g1_alphas, torch.tensor([1.0, 2.0]))
-    torch.testing.assert_close(variant.g2_alphas, torch.tensor([6.0, 16.0]))
-    states = (layer, variant)
+    torch.testing.assert_close(layer._w4a16_g1_alphas, torch.tensor([1.0, 2.0]))
+    torch.testing.assert_close(layer._w4a16_g2_alphas, torch.tensor([6.0, 16.0]))
     weight_names = tuple(layer._flashinfer_megamoe_weight_views)
-    pointers = [
-        {name: getattr(state, name).data_ptr() for name in weight_names}
-        for state in states
-    ]
-    assert all(pointers[0][name] != pointers[1][name] for name in weight_names)
+    assert set(dict(layer.named_parameters())) == set(weight_names) | {
+        "_w4a16_g1_alphas",
+        "_w4a16_g2_alphas",
+    }
+    pointers = {name: getattr(layer, name).data_ptr() for name in weight_names}
+    alpha_pointers = (
+        layer._w4a16_g1_alphas.data_ptr(),
+        layer._w4a16_g2_alphas.data_ptr(),
+    )
 
     # Explicit phase selection must initialize both native configurations, so
-    # neither phase needs first-use allocation during CUDA graph capture.
-    built = []
-
-    def ensure(state, *, use_w4a16):
-        built.append((state, use_w4a16))
-        return "w4a16" if use_w4a16 else "w4a4"
-
-    monkeypatch.setattr(module, "_ensure_nvfp4_moe_layer", ensure)
-    assert (
-        module.ensure_nvfp4_moe_layer_for_flashinfer_megamoe(layer, use_w4a16=True)
-        == "w4a16"
+    # neither phase allocates during capture. The objects share every weight
+    # address, and selecting one never replaces layer metadata or the other.
+    selected = module.ensure_nvfp4_moe_layer_for_flashinfer_megamoe(
+        layer, use_w4a16=True
     )
-    assert built == [(layer, False), (variant, True)]
+    states = layer._flashinfer_megamoe_nvfp4_states.copy()
+    assert selected is states[True][0]
+    assert states[False][0] is not states[True][0]
+    for mode in (False, True, False):
+        assert (
+            module.ensure_nvfp4_moe_layer_for_flashinfer_megamoe(layer, use_w4a16=mode)
+            is states[mode][0]
+        )
+        assert layer._flashinfer_megamoe_nvfp4_states == states
+        assert layer._flashinfer_megamoe_layer is None
+        assert layer._flashinfer_megamoe_forward is None
+    for mega, _ in states.values():
+        (w13, s13), (w2, s2) = mega.backend.transformed_weights
+        for name, value in zip(weight_names, (w13, s13, w2, s2)):
+            assert value.data_ptr() == pointers[name]
 
     loader = module.make_nvfp4_megamoe_weight_loader(
         layer, lambda param: param.data.fill_(2)
     )
     for name in weight_names:
         loader(getattr(layer, name))
+    layer.g1_alphas.mul_(2)
+    layer.g2_alphas.mul_(2)
     module.prepare_nvfp4_moe_weights_for_flashinfer_megamoe(layer)
-    assert layer._flashinfer_megamoe_w4a16 is variant
-    for state, addresses in zip(states, pointers):
-        for name in weight_names:
-            assert getattr(state, name).data_ptr() == addresses[name]
-            assert (getattr(state, name).float() == 2).all()
+    assert prepared_modes == [False, False]
+    assert layer._flashinfer_megamoe_nvfp4_states == states
+    for name in weight_names:
+        assert getattr(layer, name).data_ptr() == pointers[name]
+        assert (getattr(layer, name).float() == 2).all()
+    assert alpha_pointers == (
+        layer._w4a16_g1_alphas.data_ptr(),
+        layer._w4a16_g2_alphas.data_ptr(),
+    )
+    torch.testing.assert_close(layer._w4a16_g1_alphas, torch.tensor([2.0, 4.0]))
+    torch.testing.assert_close(layer._w4a16_g2_alphas, torch.tensor([12.0, 32.0]))
 
 
 if __name__ == "__main__":
