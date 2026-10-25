@@ -12,10 +12,10 @@ use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 use sglang_processor::openai::{ChatModel, OpenAiHeaders, OpenAiSettings, Reply, lower_chat};
-use sglang_processor::{DynamoTokenizer, TemplateError};
+use sglang_processor::{DynamoTokenizer, TemplateArgs, TemplateError};
 
 use super::chat::ChatBody;
-use super::template::{RenderedChat, render_chat};
+use super::template::RenderedChat;
 use super::{AppState, ChatFormatter};
 use crate::api_server::http::native_api::{
     GenerateItem, RequestState, RequestTiming, drain_unary, generate_requests,
@@ -90,19 +90,19 @@ impl OpenAiChat {
         }
         // Only the template needs the typed request, so a body the SGLang path
         // renders need not fit Dynamo's stricter type.
-        let rendered = match formatter.render_request(request.clone(), defaults) {
+        let (prompt, continuation) = match formatter.render_request(request.clone(), defaults) {
             Err(TemplateError::NeedsRenderFallback { .. }) => {
                 let ChatBody { request: chat, raw } = ChatBody::deserialize(request).ok()?;
-                render_chat(formatter, raw, &chat.request, defaults).ok()?
+                let args = TemplateArgs::new(&raw, defaults);
+                let prompt = formatter.render_template(&chat.request, &args).ok()?;
+                (prompt, String::new())
             }
-            rendered => {
-                let (prompt, continuation) = rendered.ok()?;
-                RenderedChat {
-                    prompt,
-                    continuation,
-                    ids: None,
-                }
-            }
+            rendered => rendered.ok()?,
+        };
+        let rendered = RenderedChat {
+            prompt,
+            continuation,
+            ids: None,
         };
         let ids = rendered.encode(&*self.tokenizer).ok()?;
         Some(ids.into_iter().map(|id| id as u32).collect())
