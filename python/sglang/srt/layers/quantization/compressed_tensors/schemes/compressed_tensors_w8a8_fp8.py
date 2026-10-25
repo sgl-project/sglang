@@ -19,6 +19,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsLinearScheme,
 )
 from sglang.srt.layers.quantization.fp8_utils import (
+    apply_fp8_channel_linear_batch_invariant,
     apply_fp8_linear,
     apply_fp8_ptpc_linear,
     deepgemm_w8a8_block_fp8_linear_with_fallback,
@@ -29,6 +30,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     validate_fp8_block_shape,
 )
 from sglang.srt.layers.quantization.utils import requantize_with_max_scale
+from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import get_bool_env_var, is_hip, is_xpu
 
 __all__ = ["CompressedTensorsW8A8Fp8"]
@@ -53,6 +55,9 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
         self.strategy = self.weight_quant.strategy
         self.is_static_input_scheme = is_static_input_scheme
         self.weight_block_size = self.weight_quant.block_structure
+        # Set in process_weights_after_loading: channel-wise weights on ROCm in
+        # deterministic mode use a batch-invariant Triton GEMM.
+        self.batch_invariant_channel = False
         if self.weight_block_size is not None:
             self.w8a8_block_fp8_linear = dispatch_w8a8_block_fp8_linear()
 
@@ -179,7 +184,10 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
             else:
                 weight_scale = layer.weight_scale.data
 
-            if _use_aiter:
+            self.batch_invariant_channel = (
+                _is_hip and get_exec().deterministic.enable_deterministic_inference
+            )
+            if _use_aiter and not self.batch_invariant_channel:
                 # keep the weight as (N, K)
                 layer.weight = Parameter(
                     shuffle_weight(weight, (16, 16)), requires_grad=False
@@ -242,6 +250,10 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if self.batch_invariant_channel:
+            return apply_fp8_channel_linear_batch_invariant(
+                x, layer.weight, layer.weight_scale, bias
+            )
         if isinstance(x, tuple):
             # Pre-quantized activation from a fused RMSNorm+FP8 quant kernel:
             # x = (fp8_input, per_tensor_input_scale[, orig_dtype]).
