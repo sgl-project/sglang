@@ -3043,6 +3043,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if (
                 recv_obj.input_top_logprobs_val is not None
                 and len(recv_obj.input_top_logprobs_val) > 0
+                and recv_obj.input_top_logprobs_val[recv_obj_index] is not None
             ):
                 state.input_top_logprobs_val.extend(
                     recv_obj.input_top_logprobs_val[recv_obj_index]
@@ -3059,7 +3060,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     recv_obj.input_top_logprobs_idx_flat[recv_obj_index],
                     recv_obj.input_top_logprobs_flat_null_prefix[recv_obj_index],
                 )
-            if recv_obj.output_top_logprobs_val is not None:
+            if (
+                recv_obj.output_top_logprobs_val is not None
+                and recv_obj.output_top_logprobs_val[recv_obj_index] is not None
+            ):
                 state.output_top_logprobs_val.extend(
                     recv_obj.output_top_logprobs_val[recv_obj_index]
                 )
@@ -3071,6 +3075,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if (
                 recv_obj.input_token_ids_logprobs_val is not None
                 and len(recv_obj.input_token_ids_logprobs_val) > 0
+                and recv_obj.input_token_ids_logprobs_val[recv_obj_index] is not None
             ):
                 state.input_token_ids_logprobs_val.extend(
                     recv_obj.input_token_ids_logprobs_val[recv_obj_index]
@@ -3078,7 +3083,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 state.input_token_ids_logprobs_idx.extend(
                     recv_obj.input_token_ids_logprobs_idx[recv_obj_index]
                 )
-            if recv_obj.output_token_ids_logprobs_val is not None:
+            if (
+                recv_obj.output_token_ids_logprobs_val is not None
+                and recv_obj.output_token_ids_logprobs_val[recv_obj_index] is not None
+            ):
                 state.output_token_ids_logprobs_val.extend(
                     recv_obj.output_token_ids_logprobs_val[recv_obj_index]
                 )
