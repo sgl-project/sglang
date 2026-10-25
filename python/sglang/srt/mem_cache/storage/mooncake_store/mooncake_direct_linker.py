@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import threading
+from copy import deepcopy
 from queue import Empty, Queue
 
 import torch
@@ -54,6 +55,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         params: CacheInitParams,
         *,
         components,
+        extra_config=None,
         storage=None,
         forward_stream=None,
     ):
@@ -77,9 +79,11 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             tp_size = torch.distributed.get_world_size(group=tp_group)
         rank_replicated = self.pool_group.rank_replicated
         self.offload_owner = not rank_replicated or tp_rank == 0
-        extra_config, *_ = HybridCacheController.parse_storage_backend_extra_config(
-            get_memory().hicache_storage_backend_extra_config
-        )
+        if extra_config is None:
+            extra_config, *_ = HybridCacheController.parse_storage_backend_extra_config(
+                get_memory().hicache_storage_backend_extra_config
+            )
+        extra_config = deepcopy(extra_config)
         # TODO: unlike `HiCacheController._generate_storage_config`, this sets no
         # `dp_rank`. Aligning the storage-config producers changes persisted
         # storage keys, so it waits for a storage-key format change.
