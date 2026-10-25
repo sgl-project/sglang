@@ -33,12 +33,15 @@ _PROMPT = "Count from one to twenty, then explain why you stopped: " * 20
 
 
 def _is_abort_result(response: requests.Response) -> bool:
-    """Same contract as test_disaggregation_chunked_prefill_abort: a 200 whose
-    finish reason is "abort", or a 5xx naming the abort."""
+    """A 200 whose finish reason is "abort", or the 500 that
+    _handle_kv_checksum_mismatch raises with its own message (no "abort" in
+    the body, so the chunked-prefill test's predicate does not apply)."""
     if response.status_code == 200:
         reason = response.json().get("meta_info", {}).get("finish_reason", {})
         return isinstance(reason, dict) and reason.get("type") == "abort"
-    return response.status_code in (500, 503) and "abort" in response.text.lower()
+    return (
+        response.status_code == 500 and "kv checksum mismatch" in response.text.lower()
+    )
 
 
 class TestDisaggregationKVChecksum(PDDisaggregationServerBase):
