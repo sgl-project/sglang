@@ -43,6 +43,7 @@ from sglang.srt.entrypoints.openai.serving_chat import (
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.kimik3_format import TOOLS_CLOSE, TOOLS_OPEN
+from sglang.srt.function_call.kimik3_native import KimiK3ParseError
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.jinja_template_utils import (
     jinja_template_may_reorder_tool_results,
@@ -3110,13 +3111,14 @@ class ServingChatTestCase(CustomTestCase):
                             )
                         )
                     self.assertIsNone(tool_calls)
-                    self.assertEqual(remaining, text)
+                    self.assertEqual(
+                        remaining, "I'll check that." if label == "prose" else text
+                    )
                     self.assertEqual(finish_reason["type"], "stop")
                     self.assertNotIn("Tool call parsing error", "\n".join(logs.output))
 
-    def test_truncated_native_tool_call_logs_and_drops(self):
-        """A tools section cut off before its closing tag parses to zero calls
-        without raising; the sync path used to drop it with no log at all."""
+    def test_native_truncation_rejected_unless_length_is_reported(self):
+        """A natural stop cannot hide an incomplete call; length stays length."""
         self.chat.tool_call_parser = "kimi_k3"
         tools = [
             {
@@ -3133,7 +3135,14 @@ class ServingChatTestCase(CustomTestCase):
         truncated = TOOLS_OPEN + '<|open|>call tool="get_weather" index="1"<|sep|>'
         for choice in ("auto", "required"):
             with self.subTest(tool_choice=choice):
-                finish_reason = {"type": "stop", "matched": None}
+                with self.assertRaisesRegex(KimiK3ParseError, "unclosed_call"):
+                    self.chat._process_tool_calls(
+                        text=truncated,
+                        tools=tools,
+                        finish_reason={"type": "stop", "matched": None},
+                        tool_choice=choice,
+                    )
+                finish_reason = {"type": "length", "matched": None}
                 with self.assertLogs(
                     "sglang.srt.entrypoints.openai.serving_chat", level="WARNING"
                 ) as logs:
@@ -3147,7 +3156,7 @@ class ServingChatTestCase(CustomTestCase):
                     )
                 self.assertIsNone(tool_calls)
                 self.assertEqual(remaining, "")
-                self.assertEqual(finish_reason["type"], "stop")
+                self.assertEqual(finish_reason["type"], "length")
                 self.assertIn("no complete call", "\n".join(logs.output))
 
     def test_required_tool_choice_json_fallback_tolerates_odd_shapes(self):

@@ -20,6 +20,7 @@ from sglang.srt.function_call.kimik3_format import (
     strip_partial_marker_suffix,
     strip_response_wrappers,
 )
+from sglang.srt.function_call.kimik3_native import KimiK3HeaderValidator
 from sglang.srt.function_call.muse_glimmer_format import (
     EOM,
     EOT,
@@ -641,6 +642,7 @@ class KimiK3Detector(BaseReasoningFormatDetector):
         continue_final_message: bool = False,
         previous_content: str = "",
         force_nonempty_content: bool = False,
+        tool_call_parser_active: bool = False,
     ):
         # strict-thinking flattens these to single token ids, so the full marker
         # "<|open|>response<|sep|>" is inexpressible. The bare name works: it
@@ -674,6 +676,9 @@ class KimiK3Detector(BaseReasoningFormatDetector):
         self._stream_text = ""
         self._streamed_reasoning: list[str] = []
         self._discard_delayed_think_close = False
+        self._native_headers = (
+            KimiK3HeaderValidator() if tool_call_parser_active else None
+        )
 
     def _clean_content(self, text: str) -> str:
         tools_idx = text.find(TOOLS_OPEN)
@@ -705,7 +710,13 @@ class KimiK3Detector(BaseReasoningFormatDetector):
     def _clean_skipped_think_content(self, text: str) -> str:
         return self._clean_content(text.replace(self.think_end_token, ""))
 
-    def detect_and_parse(self, text: str) -> StreamingParseResult:
+    def detect_and_parse(
+        self, text: str, *, allow_incomplete: bool = False
+    ) -> StreamingParseResult:
+        if self._native_headers is not None:
+            validator = KimiK3HeaderValidator()
+            validator.feed(text)
+            validator.finish(allow_incomplete=allow_incomplete)
         in_reasoning = self._in_reasoning or self.think_start_token in text
         if not in_reasoning and self.think_end_token not in text:
             return StreamingParseResult(normal_text=self._clean_content(text))
@@ -752,6 +763,8 @@ class KimiK3Detector(BaseReasoningFormatDetector):
         )
 
     def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
+        if self._native_headers is not None:
+            self._native_headers.feed(new_text)
         self._buffer += new_text
         if self._force_nonempty_content:
             self._stream_text += new_text
@@ -838,7 +851,9 @@ class KimiK3Detector(BaseReasoningFormatDetector):
 
         return StreamingParseResult(normal_text=self._drain_content())
 
-    def finish(self) -> StreamingParseResult:
+    def finish(self, *, allow_incomplete: bool = False) -> StreamingParseResult:
+        if self._native_headers is not None:
+            self._native_headers.finish(allow_incomplete=allow_incomplete)
         self._streamed_reasoning.clear()
         if not self._force_nonempty_content:
             return super().finish()
@@ -2399,9 +2414,16 @@ class ReasoningParser:
 
         self.detector = detector_class(**kwargs)
 
-    def parse_non_stream(self, full_text: str) -> Tuple[Optional[str], Optional[str]]:
+    def parse_non_stream(
+        self, full_text: str, *, finish_reason: Optional[str] = None
+    ) -> Tuple[Optional[str], Optional[str]]:
         """Non-streaming call: one-time parsing"""
-        ret = self.detector.detect_and_parse(full_text)
+        if isinstance(self.detector, KimiK3Detector):
+            ret = self.detector.detect_and_parse(
+                full_text, allow_incomplete=finish_reason == "length"
+            )
+        else:
+            ret = self.detector.detect_and_parse(full_text)
         return ret.reasoning_text, ret.normal_text
 
     def parse_non_stream_blocks(self, full_text: str) -> list[dict]:
@@ -2424,8 +2446,13 @@ class ReasoningParser:
         ret = self.detector.parse_streaming_increment(chunk_text)
         return ret.reasoning_text, ret.normal_text
 
-    def parse_stream_end(self) -> Tuple[Optional[str], Optional[str]]:
+    def parse_stream_end(
+        self, *, finish_reason: Optional[str] = None
+    ) -> Tuple[Optional[str], Optional[str]]:
         """Streaming call: flush any detector-specific buffered state once
         the stream ends."""
-        ret = self.detector.finish()
+        if isinstance(self.detector, KimiK3Detector):
+            ret = self.detector.finish(allow_incomplete=finish_reason == "length")
+        else:
+            ret = self.detector.finish()
         return ret.reasoning_text, ret.normal_text
