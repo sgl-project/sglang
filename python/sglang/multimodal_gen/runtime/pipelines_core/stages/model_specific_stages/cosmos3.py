@@ -26,7 +26,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.kernels import get_kernel
-from sglang.multimodal_gen.configs.sample.sampling_params import DataType
+from sglang.multimodal_gen.configs.sample.sampling_params import (
+    DataType,
+    quality_allows,
+)
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.distributed.communication_op import (
     cfg_model_parallel_all_reduce,
@@ -40,6 +43,9 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
+)
+from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import (
+    use_vae_fast_path,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
@@ -2598,7 +2604,13 @@ class Cosmos3DecodingStage(PipelineStage):
             stream = self._encode_while_decoding(batch, server_args)
             output_file_paths = None
             with self.use_declared_component(component_name="vae", module=self.vae):
-                with torch.no_grad():
+                with (
+                    torch.no_grad(),
+                    use_vae_fast_path(
+                        self.vae,
+                        quality_allows(batch.sampling_params.quality, "lossless"),
+                    ),
+                ):
                     try:
                         decoded = self._decode_latents(batch.latents, on_frames=stream)
                         if stream is not None:
