@@ -726,11 +726,28 @@ fn object_union_visit(
     presence_key: &str,
 ) -> String {
     let (fields, arms) = model::object_union_fields(variants, models, presence_key);
-    let names = fields
+    let identifiers = fields
         .iter()
-        .map(|f| format!("{:?}", f.json_name))
+        .map(|f| {
+            format!(
+                "                    #[serde(rename = {:?})]\n                    {},\n",
+                f.json_name,
+                model::pascal(&f.json_name)
+            )
+        })
         .collect::<Vec<_>>()
-        .join(" | ");
+        .join("");
+    let keys = fields
+        .iter()
+        .map(|f| {
+            format!(
+                "                        Field::{} => {:?},\n",
+                model::pascal(&f.json_name),
+                f.json_name
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
     let oneof_field = model::snake(oneof_ident);
     let mut builds = String::new();
     // A keyed arm wins regardless of its declaration order.
@@ -744,7 +761,7 @@ fn object_union_visit(
         .filter(|(_, (_, _, key))| key.is_none());
     for (variant, (ty, _, key)) in keyed.chain(fallback) {
         let decode = format!(
-            "let payload = <{ty} as ::serde::Deserialize>::deserialize(\n                    ::serde::de::value::MapDeserializer::<_, ::serde_json::Error>::new(\n                        fields.iter().map(|(key, value)| (key.as_ref(), value.as_ref()))\n                    )\n                ).map_err(::serde::de::Error::custom)?;\n"
+            "let payload = <{ty} as ::serde::Deserialize>::deserialize(\n                    ::serde::de::value::MapDeserializer::<_, ::serde_json::Error>::new(\n                        fields.iter().map(|(key, value)| (*key, value.as_ref()))\n                    )\n                ).map_err(::serde::de::Error::custom)?;\n"
         );
         let variant = &variant.rust_variant;
         let value = format!(
@@ -755,7 +772,7 @@ fn object_union_visit(
                 unreachable!()
             };
             builds.push_str(&format!(
-                "                if fields.iter().any(|(key, _)| key == {presence_key:?}) {{\n                    {decode}                    if payload.{}.is_none() {{\n                        return Err(::serde::de::Error::invalid_type(::serde::de::Unexpected::Unit, &\"struct {rust_path}\"));\n                    }}\n                    return {value};\n                }}\n", key.rust_ident
+                "                if fields.iter().any(|(key, _)| *key == {presence_key:?}) {{\n                    {decode}                    if payload.{}.is_none() {{\n                        return Err(::serde::de::Error::invalid_type(::serde::de::Unexpected::Unit, &\"struct {rust_path}\"));\n                    }}\n                    return {value};\n                }}\n", key.rust_ident
             ));
         } else {
             builds.push_str(&format!(
@@ -767,12 +784,21 @@ fn object_union_visit(
         r#"            fn visit_map<A: ::serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {{
                 // A discriminator may follow fields of either arm. Keep raw JSON
                 // until it is known, then validate only the selected payload.
+                #[derive(::serde::Deserialize)]
+                #[serde(field_identifier)]
+                enum Field {{
+{identifiers}                    #[serde(other)]
+                    Other,
+                }}
                 let mut fields = Vec::new();
-                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {{
-                    match key.as_ref() {{
-                        {names} => fields.push((key, map.next_value::<Box<::serde_json::value::RawValue>>()?)),
-                        _ => {{ map.next_value::<::serde::de::IgnoredAny>()?; }}
-                    }}
+                while let Some(key) = map.next_key::<Field>()? {{
+                    let key = match key {{
+{keys}                        Field::Other => {{
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                            continue;
+                        }}
+                    }};
+                    fields.push((key, map.next_value::<Box<::serde_json::value::RawValue>>()?));
                 }}
 {builds}            }}
 "#,

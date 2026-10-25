@@ -15,6 +15,7 @@ fn check<T: DeserializeOwned + Serialize>(name: &str, case: &serde_json::Value) 
     let decoded = serde_json::from_value::<T>(input.clone());
     let bytes = serde_json::to_vec(input).unwrap();
     let from_bytes = serde_json::from_slice::<T>(&bytes);
+    let from_reader = serde_json::from_reader::<_, T>(std::io::Cursor::new(&bytes));
     if let Some(expected) = case.get("error").and_then(|v| v.as_str()) {
         let error = decoded
             .err()
@@ -22,14 +23,16 @@ fn check<T: DeserializeOwned + Serialize>(name: &str, case: &serde_json::Value) 
         // Deferred raw JSON may add its own source position, including when
         // the outer input came from a Value rather than directly from bytes.
         assert!(error.to_string().starts_with(expected), "{name}: {error}");
-        let error = from_bytes
-            .err()
-            .unwrap_or_else(|| panic!("{name}: bytes unexpectedly decoded"));
-        assert!(error.to_string().starts_with(expected), "{name}: {error}");
+        for result in [from_bytes, from_reader] {
+            let error = result
+                .err()
+                .unwrap_or_else(|| panic!("{name}: input unexpectedly decoded"));
+            assert!(error.to_string().starts_with(expected), "{name}: {error}");
+        }
         return;
     }
     let canonical = case["canonical"].as_str().expect("canonical");
-    for result in [decoded, from_bytes] {
+    for result in [decoded, from_bytes, from_reader] {
         let decoded =
             result.unwrap_or_else(|error| panic!("{name}: input does not decode: {error}"));
         assert_eq!(
@@ -78,4 +81,34 @@ fn fixtures_decode_to_their_canonical_bytes() {
             other => panic!("fixture type {other} has no Rust mapping; add it here"),
         }
     }
+}
+
+/// Buffering must preserve duplicate keys for the selected payload's decoder.
+/// A JSON object map would silently collapse them before validation.
+#[test]
+fn stream_item_validates_duplicates_only_in_the_selected_payload() {
+    use api::generate_stream_item::Item;
+
+    for (input, field) in [
+        (r#"{"text":"first","text":"second"}"#, "text"),
+        (r#"{"error":{},"error":{}}"#, "error"),
+    ] {
+        let error = serde_json::from_str::<api::GenerateStreamItem>(input).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .starts_with(&format!("duplicate field `{field}`")),
+            "{error}"
+        );
+    }
+
+    // The escaped selecting key follows invalid and repeated success fields.
+    let item: api::GenerateStreamItem = serde_json::from_str(
+        r#"{"text":7,"text":false,"err\u006fr":{"message":"failed","code":500}}"#,
+    )
+    .unwrap();
+    let Some(Item::Error(error)) = item.item else {
+        panic!("expected the error outcome");
+    };
+    assert_eq!(error.error.unwrap().message, "failed");
 }

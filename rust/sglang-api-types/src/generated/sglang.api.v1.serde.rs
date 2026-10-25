@@ -3149,23 +3149,44 @@ impl<'de> ::serde::Deserialize<'de> for GenerateStreamItem {
             ) -> Result<Self::Value, A::Error> {
                 // A discriminator may follow fields of either arm. Keep raw JSON
                 // until it is known, then validate only the selected payload.
-                let mut fields = Vec::new();
-                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
-                    match key.as_ref() {
-                        "text" | "meta_info" | "output_ids" | "index" | "prompt_token_ids"
-                        | "error" => fields
-                            .push((key, map.next_value::<Box<::serde_json::value::RawValue>>()?)),
-                        _ => {
-                            map.next_value::<::serde::de::IgnoredAny>()?;
-                        }
-                    }
+                #[derive(::serde::Deserialize)]
+                #[serde(field_identifier)]
+                enum Field {
+                    #[serde(rename = "text")]
+                    Text,
+                    #[serde(rename = "meta_info")]
+                    MetaInfo,
+                    #[serde(rename = "output_ids")]
+                    OutputIds,
+                    #[serde(rename = "index")]
+                    Index,
+                    #[serde(rename = "prompt_token_ids")]
+                    PromptTokenIds,
+                    #[serde(rename = "error")]
+                    Error,
+                    #[serde(other)]
+                    Other,
                 }
-                if fields.iter().any(|(key, _)| key == "error") {
+                let mut fields = Vec::new();
+                while let Some(key) = map.next_key::<Field>()? {
+                    let key = match key {
+                        Field::Text => "text",
+                        Field::MetaInfo => "meta_info",
+                        Field::OutputIds => "output_ids",
+                        Field::Index => "index",
+                        Field::PromptTokenIds => "prompt_token_ids",
+                        Field::Error => "error",
+                        Field::Other => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                            continue;
+                        }
+                    };
+                    fields.push((key, map.next_value::<Box<::serde_json::value::RawValue>>()?));
+                }
+                if fields.iter().any(|(key, _)| *key == "error") {
                     let payload = <GenerateStreamError as ::serde::Deserialize>::deserialize(
                         ::serde::de::value::MapDeserializer::<_, ::serde_json::Error>::new(
-                            fields
-                                .iter()
-                                .map(|(key, value)| (key.as_ref(), value.as_ref())),
+                            fields.iter().map(|(key, value)| (*key, value.as_ref())),
                         ),
                     )
                     .map_err(::serde::de::Error::custom)?;
@@ -3181,9 +3202,7 @@ impl<'de> ::serde::Deserialize<'de> for GenerateStreamItem {
                 }
                 let payload = <GenerateResponse as ::serde::Deserialize>::deserialize(
                     ::serde::de::value::MapDeserializer::<_, ::serde_json::Error>::new(
-                        fields
-                            .iter()
-                            .map(|(key, value)| (key.as_ref(), value.as_ref())),
+                        fields.iter().map(|(key, value)| (*key, value.as_ref())),
                     ),
                 )
                 .map_err(::serde::de::Error::custom)?;

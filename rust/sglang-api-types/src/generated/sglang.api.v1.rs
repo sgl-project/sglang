@@ -657,9 +657,10 @@ pub struct GenerateStreamError {
     #[prost(uint32, optional, tag = "2")]
     pub index: ::core::option::Option<u32>,
 }
-/// One item of the gRPC Generate stream: a frame, or one request's failure
-/// (the stream continues — other batch items may still be running). On HTTP
-/// the same failure is an in-stream SSE error frame.
+/// One generation outcome: a frame or one request's failure. gRPC identifies
+/// the outcome by its oneof tag. HTTP uses a flat object, selected by the error
+/// key's presence, for unary results, batch entries, and SSE frames. A failure
+/// does not stop other requests in the batch.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct GenerateStreamItem {
     #[prost(oneof = "generate_stream_item::Item", tags = "1, 2")]
