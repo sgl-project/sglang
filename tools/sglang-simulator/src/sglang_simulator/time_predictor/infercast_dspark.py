@@ -687,9 +687,8 @@ class InferCastDSparkTimePredictor(InferTimePredictor):
                 tp_size == 2
                 or native_segment_profile_id is not None
                 and progress_kind == "source_golden351"
-                and native_source_work_policy is None
             ),
-            "TP4 requires native golden regions without source-work reuse",
+            "TP4 requires native golden regions",
             code="unsupported_topology",
         )
         for name, expected in (

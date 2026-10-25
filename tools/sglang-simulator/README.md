@@ -208,8 +208,11 @@ to agree on TP size; the independent graph binder also checks query against step
 Both paths retain a single ADP1/PP1 group: TP2 uses its existing domain, and TP4
 requires B1. The factory requires configured TP, verified source policy and
 progress topology to agree. TP4 uses the same source-law commit3/4 event; it adds
-no TP latency scaling. TP4 B2 and TP4 source-work reuse remain closed; ADP2
-remains closed.
+no TP latency scaling. Explicit TP4 B1 source-work reuse follows the SDK's same
+versioned policy, requiring all eight target/draft FILE/context inventories,
+full capture/planner/buffer/source equality and strict P brackets. The bounded
+query proof and original row identities remain mandatory. This does not establish
+cross-OSL accuracy or full AgentX coverage. TP4 B2 and ADP2 remain closed.
 
 For a HuggingFace snapshot whose `config.json` links into the cache's blob
 directory, set `model_config_root` to the explicit containing checkpoint/cache

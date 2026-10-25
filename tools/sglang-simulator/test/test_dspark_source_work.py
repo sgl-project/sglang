@@ -14,13 +14,15 @@ from sglang_simulator.time_predictor.dspark_umd import (
 from test_dspark_native_regions import CASES, prepared
 
 
-def protocol(*, region="decode_target", phase="target_verify", same_prefix=False):
+def protocol(
+    *, region="decode_target", phase="target_verify", same_prefix=False, tp_size=2
+):
     sdk = pytest.importorskip("infercast.sdk.native_segment_module")
     if not hasattr(sdk, "SOURCE_WORK_POLICY"):
         pytest.skip("SDK source-work API unavailable")
     from infercast.sdk.diagnostics.prediction_evidence import linear_axis
 
-    binding = prepared("TARGET_VERIFY", phase, region, capture_size=2)
+    binding = prepared("TARGET_VERIFY", phase, region, capture_size=2, tp_size=tp_size)
     original = sdk.NativeSegmentQuery.from_shape(
         json.loads(binding["point"]["native_segment_queries"])[0]
     )
@@ -95,16 +97,27 @@ def protocol(*, region="decode_target", phase="target_verify", same_prefix=False
 
 
 @pytest.mark.parametrize("same_prefix", [False, True])
+@pytest.mark.parametrize("tp_size", [2, 4])
 @pytest.mark.parametrize("mode,phase,region", CASES[4:])
 def test_bounded_original_query_proof_for_each_decode_region(
-    mode, phase, region, same_prefix
+    mode, phase, region, same_prefix, tp_size
 ):
     recorder, args, record = protocol(
-        region=region, phase=phase, same_prefix=same_prefix
+        region=region, phase=phase, same_prefix=same_prefix, tp_size=tp_size
     )
     assert _source_work_query_evidence(recorder, **args) is record
     # No numeric latency, row or qualified source-policy fixture was supplied.
     assert "latency_ms" not in record
+
+
+def test_tp4_query_proof_cannot_borrow_tp2_anchor_identities():
+    recorder, args, record = protocol(tp_size=4)
+    _, _, tp2 = protocol(tp_size=2)
+    record["row_metadata"]["anchor_identities"] = tp2["row_metadata"][
+        "anchor_identities"
+    ]
+    with pytest.raises(PredictorError, match="matching SDK source-work evidence"):
+        _source_work_query_evidence(recorder, **args)
 
 
 @pytest.mark.parametrize(

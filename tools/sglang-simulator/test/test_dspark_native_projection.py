@@ -1655,8 +1655,11 @@ def test_profile2_compares_every_sdk_policy_field_after_independent_validation(
 
 
 @pytest.mark.parametrize("cohort_case", [4], indirect=True)
+@pytest.mark.parametrize(
+    "work_policy", [None, "native_region_golden351_decode_work_v1"]
+)
 def test_tp4_factory_requires_golden_policy_and_matching_topology(
-    cohort_case, cohort_factory
+    cohort_case, cohort_factory, work_policy
 ):
     # Source-only natural fixtures do not become golden timing evidence.
     stage_cohort_metadata(cohort_case)
@@ -1664,6 +1667,7 @@ def test_tp4_factory_requires_golden_policy_and_matching_topology(
         "progress_kind": "source_golden351",
         "model_seed": 42,
         "progress_artifact": None,
+        "native_source_work_policy": work_policy,
     }
     with pytest.raises(PredictorError, match="matching verified golden351"):
         cohort_factory.build(**options)

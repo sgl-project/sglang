@@ -146,7 +146,7 @@ class UMDDSparkCostModel:
                 or native_source_work_policy != SOURCE_WORK_POLICY
                 or native_source_policy is None
                 or native_source_policy.golden_law != GOLDEN_LAW
-                or native_source_policy.tp_size != 2
+                or native_source_policy.tp_size not in (2, 4)
             ):
                 raise PredictorError(
                     "invalid_execution_profile",
