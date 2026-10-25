@@ -18,10 +18,12 @@
 
 import math
 from dataclasses import dataclass
+from itertools import accumulate
 from typing import Optional
 
 import torch
 
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
@@ -104,6 +106,7 @@ class Mamba2Metadata(ForwardMetadata):
         chunk_offsets: torch.Tensor
 
         extend_seq_lens_cpu: list[int]
+        prefill_boundaries: tuple[int, ...] | None = None
 
     mixed_metadata: MixedMetadata | None = None
     """`mixed_metadata` is used for extend/mixed requests"""
@@ -331,5 +334,12 @@ class Mamba2Metadata(ForwardMetadata):
                 chunk_indices=chunk_indices,
                 chunk_offsets=chunk_offsets,
                 extend_seq_lens_cpu=extend_seq_lens_cpu,
+                prefill_boundaries=(
+                    (0, *accumulate(extend_seq_lens_cpu))
+                    if num_prefills > 1
+                    and is_batch_invariant_mode_enabled()
+                    and extend_seq_lens_cpu is not None
+                    else None
+                ),
             ),
         )

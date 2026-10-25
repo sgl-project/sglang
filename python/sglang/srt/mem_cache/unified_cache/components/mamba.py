@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 import torch
 
+from sglang.srt.configs.hybrid_arch import mamba2_scan_config
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     EvictParams,
@@ -47,6 +48,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     mamba_cache_chunk_size,
     mamba_checkpoint_grid,
+    process_model_config,
 )
 
 if TYPE_CHECKING:
@@ -608,6 +610,17 @@ class MambaComponent(TreeComponent):
         token_ids_len: int,
         is_finished: bool,
     ) -> Optional[int]:
+        if (
+            not self.cache.enable_mamba_extra_buffer
+            and get_exec().deterministic.enable_deterministic_inference
+        ):
+            scan_config = mamba2_scan_config(process_model_config())
+            # A live no-buffer slot has no saved prefill state after decoding.
+            # Only an unfinished prefill on the scan grid can be donated.
+            if scan_config is not None and (
+                is_finished or token_ids_len % scan_config.mamba_chunk_size != 0
+            ):
+                return 0
         if self.cache.enable_mamba_extra_buffer:
             cache_len = req.kv.mamba_last_track_seqlen
         else:

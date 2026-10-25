@@ -8,6 +8,7 @@ from sglang.kernels.ops.mamba.triton_ops import (
     mamba_chunk_scan_combined,
     selective_state_update,
 )
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.configs.mamba_utils import (
     Mamba2CacheParams,
     extra_groups_for_head_shards,
@@ -641,6 +642,8 @@ class MambaMixer2(torch.nn.Module):
                     1, num_prefill_tokens, -1, self.head_dim
                 ),
                 state_dtype=ssm_state.dtype,
+                batch_invariant=is_batch_invariant_mode_enabled(),
+                batch_invariant_boundaries=mixed_metadata.prefill_boundaries,
             )
 
             # update ssm states

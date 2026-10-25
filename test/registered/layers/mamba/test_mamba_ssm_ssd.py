@@ -693,6 +693,7 @@ def test_mamba_chunk_scan_intermediate_states(
 
 
 @pytest.mark.parametrize("chunk_size", [64, 128])
+@pytest.mark.parametrize("batch_invariant", [False, True])
 @pytest.mark.parametrize(
     "seqlens",
     [
@@ -701,7 +702,9 @@ def test_mamba_chunk_scan_intermediate_states(
         (130, 200, 300),
     ],
 )
-def test_mamba_chunk_scan_track_states_at_request_boundary(chunk_size, seqlens):
+def test_mamba_chunk_scan_track_states_at_request_boundary(
+    chunk_size, batch_invariant, seqlens
+):
     device = get_device()
     if device not in ["cuda", "xpu"]:
         pytest.skip("Test only supports CUDA and XPU devices")
@@ -735,6 +738,10 @@ def test_mamba_chunk_scan_track_states_at_request_boundary(chunk_size, seqlens):
             initial_states=None,
             out=torch.empty_like(x),
             return_varlen_states=True,
+            batch_invariant=batch_invariant,
+            batch_invariant_boundaries=(
+                tuple(cu_seqlens.cpu().tolist()) if batch_invariant else None
+            ),
             **kwargs,
         )
 
@@ -778,6 +785,206 @@ def test_mamba_chunk_scan_track_states_at_request_boundary(chunk_size, seqlens):
             rtol=5e-3,
             msg=lambda m, i=i, n=n: f"request {i} snapshot at {n} tokens: " + m,
         )
+
+
+@pytest.mark.parametrize("preceding_length", [31, 255, 256, 257])
+@pytest.mark.parametrize("target_length", [256, 511, 512])
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("with_initial_state", [False, True])
+def test_mamba_chunk_scan_batch_invariant(
+    preceding_length, target_length, state_dtype, with_initial_state
+):
+    """A sequence must see the same scan grid regardless of its batch position."""
+    device = get_device()
+    if device not in ["cuda", "xpu"]:
+        pytest.skip("Test only supports CUDA and XPU devices")
+
+    torch.manual_seed(43413)
+    chunk_size = 256
+    n_heads, d_head, d_state = 48, 64, 128
+
+    def make_sequence(length):
+        return (
+            torch.randn(length, n_heads, d_head, device=device, dtype=torch.bfloat16),
+            torch.randn(length, n_heads, device=device, dtype=torch.float32) - 4,
+            torch.randn(length, 1, d_state, device=device, dtype=torch.bfloat16),
+            torch.randn(length, 1, d_state, device=device, dtype=torch.bfloat16),
+        )
+
+    target = make_sequence(target_length)
+    preceding = make_sequence(preceding_length)
+    A = -torch.exp(torch.rand(n_heads, device=device, dtype=torch.float32))
+    dt_bias = torch.randn(n_heads, device=device, dtype=torch.float32)
+    target_initial_state = torch.randn(
+        n_heads, d_head, d_state, device=device, dtype=state_dtype
+    )
+    preceding_initial_state = torch.randn_like(target_initial_state)
+
+    def run(sequences, initial_states, tracked_sequence):
+        x, dt, B, C = (
+            torch.cat([sequence[i] for sequence in sequences], dim=0).unsqueeze(0)
+            for i in range(4)
+        )
+        lengths = [sequence[0].shape[0] for sequence in sequences]
+        cu_seqlens = torch.tensor(
+            [0, *lengths], device=device, dtype=torch.int32
+        ).cumsum(dim=0)
+        seq_idx = torch.repeat_interleave(
+            torch.arange(len(lengths), device=device, dtype=torch.int32),
+            cu_seqlens.diff(),
+        ).unsqueeze(0)
+        chunk_indices = chunk_offsets = None
+        if initial_states is not None:
+            chunk_indices, chunk_offsets = (
+                Mamba2Metadata._query_start_loc_to_chunk_indices_offsets(
+                    cu_seqlens, chunk_size, x.shape[1]
+                )
+            )
+        track_start = sum(lengths[:tracked_sequence])
+        out = torch.empty_like(x)
+        intermediate, final, tracked = mamba_chunk_scan_combined(
+            x,
+            dt,
+            A,
+            B,
+            C,
+            chunk_size,
+            dt_bias=dt_bias,
+            dt_softplus=True,
+            initial_states=initial_states,
+            seq_idx=seq_idx,
+            chunk_indices=chunk_indices,
+            chunk_offsets=chunk_offsets,
+            cu_seqlens=cu_seqlens,
+            out=out,
+            return_varlen_states=True,
+            return_track_states=True,
+            track_seq_idx=torch.tensor([tracked_sequence], device=device),
+            track_end_locs=torch.tensor([track_start + 256], device=device),
+            state_dtype=state_dtype,
+            batch_invariant=True,
+            batch_invariant_boundaries=tuple(cu_seqlens.cpu().tolist()),
+        )
+        return out, intermediate, final, tracked
+
+    reference_initial = (
+        target_initial_state.unsqueeze(0) if with_initial_state else None
+    )
+    reference = run([target], reference_initial, tracked_sequence=0)
+    for target_index in (0, 1, 2):
+        sequences = [preceding, preceding]
+        sequences.insert(target_index, target)
+        initial_states = [preceding_initial_state, preceding_initial_state]
+        initial_states.insert(target_index, target_initial_state)
+        mixed = run(
+            sequences,
+            torch.stack(initial_states) if with_initial_state else None,
+            tracked_sequence=target_index,
+        )
+        start = target_index * preceding_length
+        torch.testing.assert_close(
+            mixed[0][:, start : start + target_length], reference[0], atol=0, rtol=0
+        )
+        torch.testing.assert_close(
+            mixed[2][target_index], reference[2][0], atol=0, rtol=0
+        )
+        torch.testing.assert_close(mixed[3], reference[3], atol=0, rtol=0)
+
+
+@pytest.mark.parametrize(
+    "chunk_size,length,splits,n_heads,d_head,d_state,ngroups,dtype",
+    [
+        (256, 1025, (256,), 48, 64, 128, 1, torch.bfloat16),
+        (256, 1025, (512,), 48, 64, 128, 1, torch.bfloat16),
+        (256, 1025, (768,), 48, 64, 128, 1, torch.bfloat16),
+        (64, 129, (64, 128), 4, 32, 16, 2, torch.float16),
+        (128, 384, (128, 256), 8, 64, 64, 4, torch.bfloat16),
+        (256, 1024, (256, 512, 768), 8, 80, 128, 2, torch.float16),
+        (256, 769, (256, 512, 768), 48, 64, 128, 1, torch.bfloat16),
+    ],
+)
+@pytest.mark.parametrize("with_initial_state", [False, True])
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_mamba_chunk_scan_split_boundary_state(
+    chunk_size,
+    length,
+    splits,
+    n_heads,
+    d_head,
+    d_state,
+    ngroups,
+    dtype,
+    with_initial_state,
+    state_dtype,
+):
+    """An aligned continuation must use the unsplit scan's exact FP32 state."""
+    device = get_device()
+    if device not in ["cuda", "xpu"]:
+        pytest.skip("Test only supports CUDA and XPU devices")
+
+    torch.manual_seed(43413)
+    x = torch.randn(1, length, n_heads, d_head, device=device, dtype=dtype)
+    dt = torch.randn(1, length, n_heads, device=device) - 4
+    B = torch.randn(1, length, ngroups, d_state, device=device, dtype=dtype)
+    C = torch.randn_like(B)
+    A = -torch.exp(torch.rand(n_heads, device=device))
+    dt_bias = torch.randn(n_heads, device=device)
+    initial = (
+        torch.randn(1, n_heads, d_head, d_state, device=device, dtype=state_dtype)
+        if with_initial_state
+        else None
+    )
+
+    def run(start, end, state, track=None):
+        cu_seqlens = torch.tensor([0, end - start], device=device, dtype=torch.int32)
+        indices = offsets = None
+        if state is not None:
+            indices, offsets = Mamba2Metadata._query_start_loc_to_chunk_indices_offsets(
+                cu_seqlens, chunk_size, end - start
+            )
+        out = torch.empty_like(x[:, start:end])
+        states = mamba_chunk_scan_combined(
+            x[:, start:end],
+            dt[:, start:end],
+            A,
+            B[:, start:end],
+            C[:, start:end],
+            chunk_size,
+            dt_bias=dt_bias,
+            dt_softplus=True,
+            initial_states=state,
+            cu_seqlens=cu_seqlens,
+            seq_idx=torch.zeros(1, end - start, device=device, dtype=torch.int32),
+            chunk_indices=indices,
+            chunk_offsets=offsets,
+            out=out,
+            return_varlen_states=True,
+            return_track_states=True,
+            track_seq_idx=torch.tensor([0], device=device) if track else None,
+            track_end_locs=torch.tensor([track], device=device) if track else None,
+            state_dtype=state_dtype,
+            batch_invariant=True,
+            batch_invariant_boundaries=(0, end - start),
+        )
+        return out, *states
+
+    full = run(0, length, initial)
+    state = initial
+    start = 0
+    for end in (*splits, length):
+        partial = run(start, end, state)
+        torch.testing.assert_close(full[0][:, start:end], partial[0], atol=0, rtol=0)
+        if end < length:
+            tracked = run(0, length, initial, track=end)
+            torch.testing.assert_close(
+                full[1][:, end // chunk_size], partial[2], atol=0, rtol=0
+            )
+            torch.testing.assert_close(
+                tracked[3].squeeze(0), partial[2], atol=0, rtol=0
+            )
+        else:
+            torch.testing.assert_close(full[2], partial[2], atol=0, rtol=0)
+        start, state = end, partial[2]
 
 
 if __name__ == "__main__":
