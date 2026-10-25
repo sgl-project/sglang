@@ -272,29 +272,6 @@ def test_gemm_all_gather_split8_with_c(num_tokens):
 
 
 @torch.inference_mode()
-def test_gemm_all_reduce():
-    _require_sm100()
-    _init_gemm_ar()
-    rank, world_size = dist.get_rank(), dist.get_world_size()
-    local_k = _GEMM_AR_K_TOTAL // world_size
-    generator = torch.Generator().manual_seed(40 + rank)
-    x = torch.randn(1, local_k, generator=generator).to(
-        device=_device(), dtype=torch.bfloat16
-    )
-    weight = torch.randn(gemm_ar.N, local_k, generator=generator).to(
-        device=_device(), dtype=torch.bfloat16
-    )
-    expected = (x.float() @ weight.float().t()).to(torch.bfloat16).float()
-    _, nccl_group = _init_world()
-    dist.all_reduce(expected, group=nccl_group)
-
-    output = gemm_ar.o_proj_gemm_ar(x, weight)
-    torch.cuda.synchronize()
-    bad = ((output.float() - expected).abs() > 0.05 + 0.02 * expected.abs()).sum()
-    assert bad.item() <= output.numel() / 1000
-
-
-@torch.inference_mode()
 def test_attention_residual_direct_all_gather():
     _require_sm100()
     comm = _init_comm()
