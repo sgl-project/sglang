@@ -528,6 +528,10 @@ class MoeTransport(MoeRowTransport):
     def prepare_output(self, hidden_states):
         self.input = None
         if isinstance(hidden_states, MoEOutput):
+            if self.rows.group is None:
+                # a2a backends (e.g., flashinfer_megamoe) with ep=True:
+                # transport rows declare no sum group, so complete the merge now
+                return hidden_states.get_merged()
             completion = MoeFinalize(hidden_states)
             return (
                 completion.complete(reduce=False)
