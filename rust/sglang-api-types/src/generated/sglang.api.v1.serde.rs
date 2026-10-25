@@ -3128,8 +3128,8 @@ impl<'de> ::serde::Deserialize<'de> for GenerateStreamError {
 impl ::serde::Serialize for GenerateStreamItem {
     fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match &self.item {
-            Some(generate_stream_item::Item::Frame(frame)) => frame.serialize(serializer),
-            Some(generate_stream_item::Item::Error(error)) => error.serialize(serializer),
+            Some(generate_stream_item::Item::Frame(v)) => v.serialize(serializer),
+            Some(generate_stream_item::Item::Error(v)) => v.serialize(serializer),
             None => serializer.serialize_none(),
         }
     }

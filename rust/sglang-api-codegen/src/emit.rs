@@ -479,12 +479,9 @@ fn emit_untagged(
     models: &HashMap<&str, &MessageModel>,
 ) {
     let name = &m.rust_name;
-    if name == "GenerateStreamItem" {
-        out.push_str(GENERATE_STREAM_ITEM_CODEC);
-        return;
-    }
+    let oneof_field = model::snake(oneof_ident);
     let wrap = |var: &str, expr: &str| {
-        format!("Ok({name} {{ value: Some({oneof_mod}::{oneof_ident}::{var}({expr})) }})")
+        format!("Ok({name} {{ {oneof_field}: Some({oneof_mod}::{oneof_ident}::{var}({expr})) }})")
     };
     let mut ser_arms = String::new();
     // shape -> the arms claiming it, in declaration order.
@@ -500,6 +497,22 @@ fn emit_untagged(
                 None => claims.push((shape, vec![v])),
             }
         }
+    }
+
+    out.push_str(&format!(
+        r#"impl ::serde::Serialize for {name} {{
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {{
+        match &self.{oneof_field} {{
+{ser_arms}            None => serializer.serialize_none(),
+        }}
+    }}
+}}
+
+"#
+    ));
+    if name == "GenerateStreamItem" {
+        out.push_str(GENERATE_STREAM_ITEM_DESERIALIZE);
+        return;
     }
 
     let mut visits = String::new();
@@ -666,15 +679,7 @@ fn emit_untagged(
         }
     }
     out.push_str(&format!(
-        r#"impl ::serde::Serialize for {name} {{
-    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {{
-        match &self.value {{
-{ser_arms}            None => serializer.serialize_none(),
-        }}
-    }}
-}}
-
-impl<'de> ::serde::Deserialize<'de> for {name} {{
+        r#"impl<'de> ::serde::Deserialize<'de> for {name} {{
     fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {{
         struct V;
         impl<'de> ::serde::de::Visitor<'de> for V {{
@@ -692,17 +697,7 @@ impl<'de> ::serde::Deserialize<'de> for {name} {{
 }
 
 // Serde handles the flat HTTP union; protobuf keeps its existing oneof tags.
-const GENERATE_STREAM_ITEM_CODEC: &str = r#"impl ::serde::Serialize for GenerateStreamItem {
-    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        match &self.item {
-            Some(generate_stream_item::Item::Frame(frame)) => frame.serialize(serializer),
-            Some(generate_stream_item::Item::Error(error)) => error.serialize(serializer),
-            None => serializer.serialize_none(),
-        }
-    }
-}
-
-impl<'de> ::serde::Deserialize<'de> for GenerateStreamItem {
+const GENERATE_STREAM_ITEM_DESERIALIZE: &str = r#"impl<'de> ::serde::Deserialize<'de> for GenerateStreamItem {
     fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         fn error<'de, D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<GenerateStreamError, D::Error> {
             let payload = GenerateStreamError::deserialize(deserializer)?;
