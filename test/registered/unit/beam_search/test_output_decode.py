@@ -106,6 +106,25 @@ def _decode(group, *, disable_batch_decode):
 
 
 class TestDecodeBeamSearchOutput(CustomTestCase):
+    def test_stop_at_the_length_cap_is_packed_and_trimmed_per_candidate(self):
+        for disable_batch_decode in (True, False):
+            with self.subTest(disable_batch_decode=disable_batch_decode):
+                group = BeamGroup(
+                    beam_width=2, stop_token_ids=[STOP_ID], max_new_tokens=1
+                )
+                group.advance_final(
+                    select_final_topk(
+                        group.frontier_cum_logprobs,
+                        torch.tensor([[-0.1, -0.2, -0.3, -0.4]]),
+                        torch.tensor([[STOP_ID, 7, 8, 9]]),
+                        2,
+                    )
+                )
+                group.final_results = group.finalize()
+                texts = _decode(group, disable_batch_decode=disable_batch_decode)
+                self.assertEqual(texts[(STOP_ID,)], "")
+                self.assertEqual(texts[(7,)], "7")
+
     def _assert_mixed_group_trims(self, *, stop_wins, disable_batch_decode):
         group = _mixed_group(stop_wins=stop_wins)
         texts = _decode(group, disable_batch_decode=disable_batch_decode)

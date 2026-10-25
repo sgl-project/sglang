@@ -4005,6 +4005,7 @@ class Scheduler(
         beam_width: Optional[int] = None,
         running_batch: Optional[ScheduleBatch] = None,
         num_held_rows: int = 0,
+        num_staged_beam_rows: int = 0,
     ) -> int:
         pp_budget = get_parallel().pp_max_micro_batch_size - running_bs
         # Rows the counted requests may occupy: the free rows, plus the rows that
@@ -4017,12 +4018,11 @@ class Scheduler(
             - self.beam_coordinator.pending_member_rows(active_batch),
             0,
         )
-        res = min(pp_budget, row_budget)
-        if beam_width is not None:
-            # A beam candidate owns beam_width rows once decoding.
-            res = min(res, row_budget // beam_width)
-
-        return res
+        # The caller compares this budget with the staged leader count. Charge
+        # each staged group's actual member width and reserve the candidate's
+        # members; dividing by the candidate width fails for mixed widths.
+        member_rows = num_staged_beam_rows + max((beam_width or 1) - 1, 0)
+        return min(pp_budget, max(row_budget - member_rows, 0))
 
     def get_new_batch_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:
         prefill_delayer_single_pass = None
@@ -4203,6 +4203,11 @@ class Scheduler(
                 candidate_beam_width,
                 running_batch=running_batch,
                 num_held_rows=num_held_rows,
+                num_staged_beam_rows=sum(
+                    r.beam_group.beam_width - 1
+                    for r in adder.can_run_list
+                    if r.beam_group is not None and r.beam_group.member_rows is None
+                ),
             ):
                 running_batch.batch_is_full = True
 

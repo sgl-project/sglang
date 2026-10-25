@@ -21,9 +21,14 @@ NUM_ROWS = 4
 
 
 class _Req:
-    def __init__(self, holds_row):
+    def __init__(self, holds_row, beam_width=1):
         self.kv = SimpleNamespace(holds_kv=holds_row)
-        self.beam_group = None
+        self.beam_group = (
+            SimpleNamespace(beam_width=beam_width, member_rows=None)
+            if beam_width > 1
+            else None
+        )
+        self.beam_width = beam_width
         self.token_indices_to_pool = None
         self.inflight_middle_chunks = 0
 
@@ -57,7 +62,9 @@ class _BatchBuilt(Exception):
 
 
 class TestHeldRowAdmission(CustomTestCase):
-    def _scheduler(self, disaggregation_mode, running, final_chunk, waiting):
+    def _scheduler(
+        self, disaggregation_mode, running, final_chunk, waiting, num_rows=NUM_ROWS
+    ):
         s = Scheduler.__new__(Scheduler)
         s.grammar_manager = SimpleNamespace(has_waiting_grammars=lambda: False)
         s.enable_priority_preemption = False
@@ -84,7 +91,7 @@ class TestHeldRowAdmission(CustomTestCase):
         s.is_mixed_chunk = False
         s.priority_scheduling_preemption_threshold = 0
         s.max_prefill_bs = 0
-        s.max_running_requests = NUM_ROWS
+        s.max_running_requests = num_rows
         s.dllm_config = None
         s.enable_lora = False
         s.disaggregation_mode = disaggregation_mode
@@ -94,9 +101,11 @@ class TestHeldRowAdmission(CustomTestCase):
         s.model_config = None
         s.enable_overlap = False
         s.spec_algorithm = None
-        # The final chunk and the running requests hold rows; one row is free.
+        # Continuing chunks already hold a leader row; newly staged requests do not.
         s.req_to_token_pool = SimpleNamespace(
-            available_size=lambda: NUM_ROWS - len(running) - 1
+            available_size=lambda: (
+                num_rows - len(running) - int(final_chunk is not None)
+            )
         )
         s.beam_coordinator = SimpleNamespace(pending_member_rows=lambda batch: 0)
         return s
@@ -133,6 +142,73 @@ class TestHeldRowAdmission(CustomTestCase):
                 can_run_list, batch_is_full, final_chunk, waiting = self._admitted(mode)
                 self.assertEqual(can_run_list, [final_chunk, waiting])
                 self.assertFalse(batch_is_full)
+
+    def _admitted_widths(self, widths, num_rows, *, running=(), final_chunk=None):
+        waiting = [_Req(holds_row=False, beam_width=w) for w in widths]
+        running_batch = ScheduleBatch(reqs=list(running))
+        scheduler = self._scheduler(
+            DisaggregationMode.NULL,
+            running,
+            final_chunk,
+            waiting,
+            num_rows=num_rows,
+        )
+
+        def capture(can_run_list, *args, **kwargs):
+            raise _BatchBuilt(list(can_run_list))
+
+        with (
+            get_context().override_server_args(pp_max_micro_batch_size=num_rows),
+            patch.object(ScheduleBatch, "init_new", side_effect=capture),
+            patch("sglang.srt.managers.scheduler.set_time_batch"),
+        ):
+            with self.assertRaises(_BatchBuilt) as built:
+                scheduler._get_new_batch_prefill_raw(
+                    prefill_delayer_single_pass=None, running_batch=running_batch
+                )
+        return [r.beam_width for r in built.exception.args[0]]
+
+    def test_mixed_widths_reserve_the_actual_number_of_member_rows(self):
+        for num_rows, widths, expected in [
+            (4, [4, 1], [4]),
+            (4, [2, 2, 1], [2, 2]),
+            (4, [1, 4], [1]),
+            (8, [2, 1, 4], [2, 1, 4]),
+            (8, [4, 2, 1, 1], [4, 2, 1, 1]),
+            (4, [2, 2, 2], [2, 2]),
+        ]:
+            with self.subTest(num_rows=num_rows, widths=widths):
+                self.assertEqual(self._admitted_widths(widths, num_rows), expected)
+
+    def test_held_beam_leader_still_reserves_its_unspawned_members(self):
+        self.assertEqual(
+            self._admitted_widths(
+                [1, 1],
+                4,
+                running=[_Req(holds_row=True)],
+                final_chunk=_Req(holds_row=True, beam_width=2),
+            ),
+            [2, 1],
+        )
+
+    def test_running_member_reservations_and_pp_budget_are_preserved(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.running_batch = SimpleNamespace(reqs=[])
+        scheduler.req_to_token_pool = SimpleNamespace(available_size=lambda: 7)
+        scheduler.beam_coordinator = SimpleNamespace(
+            pending_member_rows=lambda batch: 3
+        )
+        with get_context().override_server_args(pp_max_micro_batch_size=8):
+            # Four physical rows remain; the staged width-2 beam and incoming
+            # width-2 beam reserve one member each, leaving two leader slots.
+            self.assertEqual(
+                scheduler.get_num_allocatable_reqs(
+                    2, beam_width=2, num_staged_beam_rows=1
+                ),
+                2,
+            )
+        with get_context().override_server_args(pp_max_micro_batch_size=3):
+            self.assertEqual(scheduler.get_num_allocatable_reqs(2), 1)
 
 
 if __name__ == "__main__":

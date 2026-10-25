@@ -250,6 +250,49 @@ class TestBeamGroup(CustomTestCase):
         group2 = self._make_group(length_penalty=1.0)
         self.assertAlmostEqual(group2.beam_score(-0.3, 2), -0.15, places=6)
 
+    def test_stop_token_on_final_step_keeps_stop_reason(self):
+        group = self._make_group(max_new_tokens=1)
+        sel = select_final_topk(
+            group.frontier_cum_logprobs,
+            T([[-0.1, -0.2, -0.3, -0.4]], torch.float32),
+            T([[99, 3, 4, 5]], torch.int64),
+            2,
+        )
+        self.assertTrue(group.advance_final(sel))
+        results = group.finalize()
+        self.assertEqual(results[0].tokens, [99])
+        self.assertEqual(results[0].matched_token, 99)
+        self.assertIsNone(results[1].matched_token)
+
+    def test_final_step_with_ignore_eos_stays_length_finished(self):
+        group = self._make_group(max_new_tokens=1, stop_token_ids=[])
+        sel = select_final_topk(
+            group.frontier_cum_logprobs,
+            T([[-0.1, -0.2, -0.3, -0.4]], torch.float32),
+            T([[99, 3, 4, 5]], torch.int64),
+            2,
+        )
+        self.assertTrue(group.advance_final(sel))
+        self.assertTrue(all(r.matched_token is None for r in group.finalize()))
+
+    def test_stop_on_final_decode_step_keeps_each_candidates_reason(self):
+        group = self._make_group(max_new_tokens=2, stop_token_ids=[98, 99])
+        group.advance(
+            run_select([0.0], [[-0.1, -0.2, -0.3, -0.4]], [[1, 2, 3, 4]], {98, 99}, 2)
+        )
+        sel = select_final_topk(
+            group.frontier_cum_logprobs,
+            T([[-0.01, -0.02, -9.0, -10.0], [-1.0, -2.0, -3.0, -4.0]], torch.float32),
+            T([[98, 7, 8, 9], [10, 11, 12, 13]], torch.int64),
+            2,
+        )
+        self.assertTrue(group.advance_final(sel))
+        results = group.finalize()
+        self.assertEqual(results[0].tokens, [1, 98])
+        self.assertEqual(results[0].matched_token, 98)
+        self.assertEqual(results[1].tokens, [1, 7])
+        self.assertIsNone(results[1].matched_token)
+
 
 if __name__ == "__main__":
     unittest.main()
