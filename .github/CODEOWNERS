@@ -119,12 +119,5 @@
 /python/sglang/srt/models/laguna.py @Jiminator
 /python/sglang/srt/configs/laguna.py @Jiminator
 /tools/sglang-simulator @littlefatfat @hzh0425 @zhuzi-z @LinSiyuan814
-
-# Paged experts
-/docs/docs/advanced_features/paged_experts.mdx @N3mezis @BBuf
-/python/sglang/kernels/jit/csrc/moe/paged_experts.cuh @N3mezis @BBuf
-/python/sglang/kernels/ops/moe/paged_experts.py @N3mezis @BBuf
+/python/sglang/kernels/**/paged_experts.* @N3mezis @BBuf
 /python/sglang/srt/layers/moe/paged_experts/ @N3mezis @BBuf
-/test/registered/e2e/moe/test_paged_experts.py @N3mezis @BBuf
-/test/registered/kernels/ops/moe/test_paged_experts_kernels.py @N3mezis @BBuf
-/test/registered/unit/layers/moe/paged_experts/ @N3mezis @BBuf
