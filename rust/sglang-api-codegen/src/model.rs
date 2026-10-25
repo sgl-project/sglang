@@ -556,22 +556,21 @@ pub fn snake(name: &str) -> String {
     out
 }
 
-/// Payload type, fields, and the presence key for the selected arm (if any).
-pub type ObjectUnionArm<'a> = (&'a str, &'a [FieldModel], Option<&'a FieldModel>);
+/// Payload type and the presence key for the selected arm (if any).
+pub type ObjectUnionArm<'a> = (&'a str, Option<&'a FieldModel>);
 
 /// Two object arms are selected by an explicit key's presence or absence.
 /// Payload fields retain their own validation and unknown-field rules.
-pub fn object_union_fields<'a>(
+pub fn object_union_arms<'a>(
     variants: &[&VariantModel],
     models: &std::collections::HashMap<&str, &'a MessageModel>,
     presence_key: &str,
-) -> (Vec<&'a FieldModel>, Vec<ObjectUnionArm<'a>>) {
+) -> Vec<ObjectUnionArm<'a>> {
     assert_eq!(
         variants.len(),
         2,
         "presence_key needs exactly two object arms"
     );
-    let mut fields: Vec<&FieldModel> = Vec::new();
     let mut arms = Vec::new();
     for variant in variants {
         let FieldKind::Message { rust_path, .. } = &variant.kind else {
@@ -588,11 +587,6 @@ pub fn object_union_fields<'a>(
                 model.rust_name
             );
         };
-        for field in payload {
-            if !fields.iter().any(|f| f.json_name == field.json_name) {
-                fields.push(field);
-            }
-        }
         let key = payload.iter().find(|f| f.json_name == presence_key);
         if let Some(key) = key {
             assert!(
@@ -600,11 +594,11 @@ pub fn object_union_fields<'a>(
                 "presence_key must name a message-valued field"
             );
         }
-        arms.push((model.rust_name.as_str(), payload.as_slice(), key));
+        arms.push((model.rust_name.as_str(), key));
     }
     assert!(
-        arms.iter().filter(|(_, _, key)| key.is_some()).count() == 1,
+        arms.iter().filter(|(_, key)| key.is_some()).count() == 1,
         "presence_key must belong to exactly one object arm"
     );
-    (fields, arms)
+    arms
 }

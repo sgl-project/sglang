@@ -3137,81 +3137,37 @@ impl ::serde::Serialize for GenerateStreamItem {
 
 impl<'de> ::serde::Deserialize<'de> for GenerateStreamItem {
     fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct V;
-        impl<'de> ::serde::de::Visitor<'de> for V {
-            type Value = GenerateStreamItem;
-            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
-                f.write_str("one of the GenerateStreamItem shapes")
+        fn with_key<'de, D: ::serde::Deserializer<'de>>(
+            deserializer: D,
+        ) -> Result<GenerateStreamError, D::Error> {
+            let payload = <GenerateStreamError as ::serde::Deserialize>::deserialize(deserializer)?;
+            if payload.error.is_none() {
+                return Err(::serde::de::Error::missing_field("error"));
             }
-            fn visit_map<A: ::serde::de::MapAccess<'de>>(
-                self,
-                mut map: A,
-            ) -> Result<Self::Value, A::Error> {
-                // A discriminator may follow fields of either arm. Keep raw JSON
-                // until it is known, then validate only the selected payload.
-                #[derive(::serde::Deserialize)]
-                #[serde(field_identifier)]
-                enum Field {
-                    #[serde(rename = "text")]
-                    Text,
-                    #[serde(rename = "meta_info")]
-                    MetaInfo,
-                    #[serde(rename = "output_ids")]
-                    OutputIds,
-                    #[serde(rename = "index")]
-                    Index,
-                    #[serde(rename = "prompt_token_ids")]
-                    PromptTokenIds,
-                    #[serde(rename = "error")]
-                    Error,
-                    #[serde(other)]
-                    Other,
-                }
-                let mut fields = Vec::new();
-                while let Some(key) = map.next_key::<Field>()? {
-                    let key = match key {
-                        Field::Text => "text",
-                        Field::MetaInfo => "meta_info",
-                        Field::OutputIds => "output_ids",
-                        Field::Index => "index",
-                        Field::PromptTokenIds => "prompt_token_ids",
-                        Field::Error => "error",
-                        Field::Other => {
-                            map.next_value::<::serde::de::IgnoredAny>()?;
-                            continue;
-                        }
-                    };
-                    fields.push((key, map.next_value::<Box<::serde_json::value::RawValue>>()?));
-                }
-                if fields.iter().any(|(key, _)| *key == "error") {
-                    let payload = <GenerateStreamError as ::serde::Deserialize>::deserialize(
-                        ::serde::de::value::MapDeserializer::<_, ::serde_json::Error>::new(
-                            fields.iter().map(|(key, value)| (*key, value.as_ref())),
-                        ),
-                    )
-                    .map_err(::serde::de::Error::custom)?;
-                    if payload.error.is_none() {
-                        return Err(::serde::de::Error::invalid_type(
-                            ::serde::de::Unexpected::Unit,
-                            &"struct ErrorBody",
-                        ));
-                    }
-                    return Ok(GenerateStreamItem {
-                        item: Some(generate_stream_item::Item::Error(payload)),
-                    });
-                }
-                let payload = <GenerateResponse as ::serde::Deserialize>::deserialize(
-                    ::serde::de::value::MapDeserializer::<_, ::serde_json::Error>::new(
-                        fields.iter().map(|(key, value)| (*key, value.as_ref())),
-                    ),
-                )
-                .map_err(::serde::de::Error::custom)?;
-                Ok(GenerateStreamItem {
-                    item: Some(generate_stream_item::Item::Frame(payload)),
-                })
-            }
+            Ok(payload)
         }
-        deserializer.deserialize_any(V)
+        fn without_key<'de, D: ::serde::Deserializer<'de>>(_: D) -> Result<(), D::Error> {
+            Err(::serde::de::Error::custom(concat!(
+                "unexpected field ",
+                "error"
+            )))
+        }
+        #[derive(::serde::Deserialize)]
+        #[serde(untagged)]
+        enum Decoded {
+            WithKey(#[serde(deserialize_with = "with_key")] GenerateStreamError),
+            WithoutKey {
+                #[serde(default, rename = "error", deserialize_with = "without_key")]
+                _key: (),
+                #[serde(flatten)]
+                payload: GenerateResponse,
+            },
+        }
+        let item = match Decoded::deserialize(deserializer)? {
+            Decoded::WithKey(payload) => generate_stream_item::Item::Error(payload),
+            Decoded::WithoutKey { payload, .. } => generate_stream_item::Item::Frame(payload),
+        };
+        Ok(GenerateStreamItem { item: Some(item) })
     }
 }
 

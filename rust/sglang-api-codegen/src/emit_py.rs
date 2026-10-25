@@ -1034,12 +1034,11 @@ fn emit_untagged_codec(
             let variants: Vec<_> = claimants.iter().map(|a| a.v).collect();
             let presence_key =
                 presence_key.expect("overlapping object arms need an explicit presence_key");
-            let (_, payloads) =
-                crate::model::object_union_fields(&variants, &ctx.models, presence_key);
+            let payloads = crate::model::object_union_arms(&variants, &ctx.models, presence_key);
             de.push_str("    if isinstance(value, dict):\n");
-            let keyed = payloads.iter().filter(|(_, _, key)| key.is_some());
-            let fallback = payloads.iter().filter(|(_, _, key)| key.is_none());
-            for (ty, _, key) in keyed.chain(fallback) {
+            let keyed = payloads.iter().filter(|(_, key)| key.is_some());
+            let fallback = payloads.iter().filter(|(_, key)| key.is_none());
+            for (ty, key) in keyed.chain(fallback) {
                 if let Some(key) = key {
                     let FieldKind::Message { rust_path, .. } = &key.kind else {
                         unreachable!()

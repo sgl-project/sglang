@@ -106,9 +106,7 @@ enum OneofShape {
   // Unset: the message owning the oneof is a plain object.
   ONEOF_SHAPE_UNSPECIFIED = 0;
 
-  // Untagged: value shape (or presence_key) picks the variant, and mismatch
-  // errors keep serde's field-level texts (never "data did not match any
-  // variant").
+  // Untagged: value shape (or presence_key) distinguishes the variants.
   ONEOF_SHAPE_UNTAGGED = 1;
 
   // On a oneof of exactly { T one; TList many; }: a JSON scalar deserializes

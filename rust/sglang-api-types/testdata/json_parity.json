@@ -693,7 +693,7 @@
       "input": {
         "meta_info": 7
       },
-      "error": "invalid type: integer `7`, expected struct GenerateMetaInfo"
+      "error": true
     },
     {
       "type": "GenerateStreamItem",
@@ -705,7 +705,7 @@
           "code": 503
         }
       },
-      "error": "invalid type: boolean `false`, expected a string"
+      "error": true
     },
     {
       "type": "GenerateStreamItem",
@@ -713,7 +713,7 @@
       "input": {
         "error": null
       },
-      "error": "invalid type: null, expected struct ErrorBody"
+      "error": true
     },
     {
       "type": "GenerateStreamError",

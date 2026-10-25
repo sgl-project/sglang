@@ -127,7 +127,8 @@ class TestCrossLanguageFixtures(CustomTestCase):
                 if "error" in case:
                     with self.assertRaises(api_types.JsonContractError) as error:
                         decode(case["input"])
-                    self.assertEqual(str(error.exception), case["error"])
+                    if isinstance(case["error"], str):
+                        self.assertEqual(str(error.exception), case["error"])
                     continue
                 decoded = decode(case["input"])
                 self.assertEqual(compact(encode(decoded)), case["canonical"])

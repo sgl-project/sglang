@@ -516,19 +516,13 @@ fn emit_untagged(
         }
     }
 
+    if let Some(key) = presence_key {
+        out.push_str(&object_union_codec(m, models, key, &ser_arms));
+        return;
+    }
+
     let mut visits = String::new();
     for (shape, arms) in &claims {
-        if *shape == JsonShape::Map && arms.len() > 1 {
-            visits.push_str(&object_union_visit(
-                name,
-                oneof_mod,
-                oneof_ident,
-                arms,
-                models,
-                presence_key.expect("overlapping object arms need an explicit presence_key"),
-            ));
-            continue;
-        }
         if *shape != JsonShape::Seq && arms.len() > 1 {
             panic!(
                 "{name}: untagged arms {:?} all accept a JSON {shape:?}; the value's shape cannot pick one",
@@ -716,92 +710,74 @@ impl<'de> ::serde::Deserialize<'de> for {name} {{
     ));
 }
 
-/// Defer field validation until key presence selects the payload decoder.
-fn object_union_visit(
-    name: &str,
-    oneof_mod: &str,
-    oneof_ident: &str,
-    variants: &[&model::VariantModel],
+/// Let Serde match the object arms, guarding the key that distinguishes them.
+fn object_union_codec(
+    m: &MessageModel,
     models: &HashMap<&str, &MessageModel>,
     presence_key: &str,
+    ser_arms: &str,
 ) -> String {
-    let (fields, arms) = model::object_union_fields(variants, models, presence_key);
-    let identifiers = fields
-        .iter()
-        .map(|f| {
-            format!(
-                "                    #[serde(rename = {:?})]\n                    {},\n",
-                f.json_name,
-                model::pascal(&f.json_name)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("");
-    let keys = fields
-        .iter()
-        .map(|f| {
-            format!(
-                "                        Field::{} => {:?},\n",
-                model::pascal(&f.json_name),
-                f.json_name
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("");
+    let name = &m.rust_name;
+    let MessageKind::Untagged {
+        oneof_mod,
+        oneof_ident,
+        variants,
+        ..
+    } = &m.kind
+    else {
+        unreachable!()
+    };
+    let refs: Vec<_> = variants.iter().collect();
+    let arms = model::object_union_arms(&refs, models, presence_key);
+    let keyed = arms.iter().position(|(_, key)| key.is_some()).unwrap();
+    let fallback = 1 - keyed;
+    let (keyed_ty, key) = &arms[keyed];
+    let key_field = &key.unwrap().rust_ident;
+    let fallback_ty = arms[fallback].0;
+    let keyed_variant = &variants[keyed].rust_variant;
+    let fallback_variant = &variants[fallback].rust_variant;
     let oneof_field = model::snake(oneof_ident);
-    let mut builds = String::new();
-    // A keyed arm wins regardless of its declaration order.
-    let keyed = variants
-        .iter()
-        .zip(&arms)
-        .filter(|(_, (_, _, key))| key.is_some());
-    let fallback = variants
-        .iter()
-        .zip(&arms)
-        .filter(|(_, (_, _, key))| key.is_none());
-    for (variant, (ty, _, key)) in keyed.chain(fallback) {
-        let decode = format!(
-            "let payload = <{ty} as ::serde::Deserialize>::deserialize(\n                    ::serde::de::value::MapDeserializer::<_, ::serde_json::Error>::new(\n                        fields.iter().map(|(key, value)| (*key, value.as_ref()))\n                    )\n                ).map_err(::serde::de::Error::custom)?;\n"
-        );
-        let variant = &variant.rust_variant;
-        let value = format!(
-            "Ok({name} {{ {oneof_field}: Some({oneof_mod}::{oneof_ident}::{variant}(payload)) }})"
-        );
-        if let Some(key) = key {
-            let FieldKind::Message { rust_path, .. } = &key.kind else {
-                unreachable!()
-            };
-            builds.push_str(&format!(
-                "                if fields.iter().any(|(key, _)| *key == {presence_key:?}) {{\n                    {decode}                    if payload.{}.is_none() {{\n                        return Err(::serde::de::Error::invalid_type(::serde::de::Unexpected::Unit, &\"struct {rust_path}\"));\n                    }}\n                    return {value};\n                }}\n", key.rust_ident
-            ));
-        } else {
-            builds.push_str(&format!(
-                "                {decode}                {value}\n"
-            ));
-        }
-    }
     format!(
-        r#"            fn visit_map<A: ::serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {{
-                // A discriminator may follow fields of either arm. Keep raw JSON
-                // until it is known, then validate only the selected payload.
-                #[derive(::serde::Deserialize)]
-                #[serde(field_identifier)]
-                enum Field {{
-{identifiers}                    #[serde(other)]
-                    Other,
-                }}
-                let mut fields = Vec::new();
-                while let Some(key) = map.next_key::<Field>()? {{
-                    let key = match key {{
-{keys}                        Field::Other => {{
-                            map.next_value::<::serde::de::IgnoredAny>()?;
-                            continue;
-                        }}
-                    }};
-                    fields.push((key, map.next_value::<Box<::serde_json::value::RawValue>>()?));
-                }}
-{builds}            }}
-"#,
+        r#"impl ::serde::Serialize for {name} {{
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {{
+        match &self.{oneof_field} {{
+{ser_arms}            None => serializer.serialize_none(),
+        }}
+    }}
+}}
+
+impl<'de> ::serde::Deserialize<'de> for {name} {{
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {{
+        fn with_key<'de, D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<{keyed_ty}, D::Error> {{
+            let payload = <{keyed_ty} as ::serde::Deserialize>::deserialize(deserializer)?;
+            if payload.{key_field}.is_none() {{
+                return Err(::serde::de::Error::missing_field({presence_key:?}));
+            }}
+            Ok(payload)
+        }}
+        fn without_key<'de, D: ::serde::Deserializer<'de>>(_: D) -> Result<(), D::Error> {{
+            Err(::serde::de::Error::custom(concat!("unexpected field ", {presence_key:?})))
+        }}
+        #[derive(::serde::Deserialize)]
+        #[serde(untagged)]
+        enum Decoded {{
+            WithKey(#[serde(deserialize_with = "with_key")] {keyed_ty}),
+            WithoutKey {{
+                #[serde(default, rename = {presence_key:?}, deserialize_with = "without_key")]
+                _key: (),
+                #[serde(flatten)]
+                payload: {fallback_ty},
+            }},
+        }}
+        let item = match Decoded::deserialize(deserializer)? {{
+            Decoded::WithKey(payload) => {oneof_mod}::{oneof_ident}::{keyed_variant}(payload),
+            Decoded::WithoutKey {{ payload, .. }} => {oneof_mod}::{oneof_ident}::{fallback_variant}(payload),
+        }};
+        Ok({name} {{ {oneof_field}: Some(item) }})
+    }}
+}}
+
+"#
     )
 }
 
