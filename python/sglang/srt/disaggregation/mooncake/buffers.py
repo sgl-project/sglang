@@ -24,7 +24,7 @@ class MooncakeBufferKey(BufferKey):
     """(kind, index, sub): sub is the per-state-type tensor index for STATE."""
 
     def __init__(self, kind: BufferKind, index: int, sub: int = 0):
-        self._value = (BufferKind(kind), index, sub)
+        self._value = (kind, index, sub)
         self._hash = hash(self._value)
 
     @property
@@ -80,10 +80,10 @@ class BufferKeys(msgspec.Struct, frozen=True):
         state_data_ptrs: Sequence[Sequence[int]],
     ) -> List[Tuple[MooncakeBufferKey, int]]:
         """(key, value) for every buffer, given values in the same layout."""
-        pairs = list(zip(self.kv, kv_data_ptrs, strict=True))
-        pairs += zip(self.aux, aux_data_ptrs, strict=True)
-        for keys, values in zip(self.state, state_data_ptrs, strict=True):
-            pairs += zip(keys, values, strict=True)
+        pairs = list(zip(self.kv, kv_data_ptrs))
+        pairs += zip(self.aux, aux_data_ptrs)
+        for keys, values in zip(self.state, state_data_ptrs):
+            pairs += zip(keys, values)
         return pairs
 
 

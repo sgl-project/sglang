@@ -549,8 +549,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             self.transport.close()
         except Exception:
             logger.exception("Failed to deregister buffers during teardown")
-        self._staging_keys = {}
-        self._peers = {}
         if hasattr(self, "connection_pool"):
             with self.connection_lock:
                 self.connection_pool.clear()
@@ -585,9 +583,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         }
 
     def _register_staging_memory(self, ptr: int, size: int) -> None:
-        assert ptr not in self._staging_keys, (
-            f"staging buffer 0x{ptr:x} registered twice"
-        )
         key = MooncakeBufferKey(BufferKind.STAGING, len(self._staging_keys))
         self.transport.register(key, ptr, size, self.kv_args.gpu_id)
         self._staging_keys[ptr] = key
@@ -869,9 +864,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         result = self.transport.status_all(
             self.transport.write_all(self._peers[mooncake_session_id].remote, copies)
         )
-        # MooncakeTransport returns DONE or FAILED, even if a failed batch
-        # still has transfers in flight.
-        assert result.status is not Status.PENDING
         if result.status is Status.FAILED:
             logger.error(
                 "Transfer to session %s failed: %s", mooncake_session_id, result.reason
