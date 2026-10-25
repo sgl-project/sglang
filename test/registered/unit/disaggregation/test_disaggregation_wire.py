@@ -306,8 +306,8 @@ class TestDisaggregationWire(unittest.TestCase):
                     mla_compression_ratios=None, prefill_start_layer=0
                 )
                 reason = manager._state_stride_mismatch(
-                    src_data_ptrs=[0x1000, 0x1100],
-                    dst_data_ptrs=[0x2000, 0x2100],
+                    num_src_entries=2,
+                    num_dst_entries=2,
                     item_lens=[32, 32],
                     dst_item_lens=[32],
                     state_type=StateType.SWA,
@@ -469,8 +469,6 @@ class TestDisaggregationWire(unittest.TestCase):
         rc = manager._send_kvcache_generic(
             mooncake_session_id="decode",
             executor=None,
-            src_data_ptrs=[0x1000],
-            dst_data_ptrs=[0x2000],
             item_lens=[32],
             dst_item_lens=[64],
             prefill_data_indices=np.array([2], dtype=np.int32),
@@ -605,8 +603,6 @@ class TestDisaggregationWire(unittest.TestCase):
                 manager._send_kvcache_generic(
                     mooncake_session_id="decode",
                     executor=None,
-                    src_data_ptrs=src_ptrs,
-                    dst_data_ptrs=dst_ptrs,
                     item_lens=src_lens,
                     dst_item_lens=dst_lens,
                     prefill_data_indices=np.array([2], dtype=np.int32),
@@ -996,8 +992,8 @@ class TestQwen4StateWire(unittest.TestCase):
                         mla_compression_ratios=None, prefill_start_layer=0
                     )
                     reason = manager._state_stride_mismatch(
-                        src_data_ptrs=[0x1000, 0x1100],
-                        dst_data_ptrs=[0x2000, 0x2100],
+                        num_src_entries=2,
+                        num_dst_entries=2,
                         item_lens=src_lens,
                         dst_item_lens=dst_lens,
                         state_type=StateType.DSA,
@@ -1043,8 +1039,6 @@ class TestQwen4StateWire(unittest.TestCase):
 
                     ret = manager._send_kvcache_generic(
                         "decode",
-                        [0x1000, 0x1100, 0x1200],
-                        [0x2000, 0x2100, 0x2200],
                         src_lens,
                         np.array([0], dtype=np.int32),
                         np.array([0], dtype=np.int32),

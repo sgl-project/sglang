@@ -280,8 +280,6 @@ class AscendKVManager(MooncakeKVManager):
         if self.is_hybrid_mla_backend and self.pp_size > 1:
             return self._send_kvcache_generic(
                 mooncake_session_id=mooncake_session_id,
-                src_data_ptrs=self.kv_args.kv_data_ptrs,
-                dst_data_ptrs=dst_kv_ptrs,
                 item_lens=self.kv_args.kv_item_lens,
                 prefill_data_indices=prefill_kv_indices,
                 dst_data_indices=dst_kv_indices,

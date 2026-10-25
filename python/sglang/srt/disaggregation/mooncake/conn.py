@@ -254,6 +254,55 @@ class PeerBuffers(msgspec.Struct, frozen=True):
     keys: BufferKeys
 
 
+class _DcpEntryCopy(msgspec.Struct, frozen=True):
+    """One KV entry copied token by token over shared token groups."""
+
+    src: MooncakeBufferKey
+    src_offset: int
+    dst: MooncakeBufferKey
+    dst_offset: int
+    token_bytes: int
+    # group_units() rows of (first src token, first dst token, token count).
+    units: np.ndarray
+
+    def to_copy(self) -> Copy:
+        offsets = np.array([self.src_offset, self.dst_offset, 0], dtype=np.uint64)
+        return Copy(
+            src=self.src, dst=self.dst, ranges=self.units * self.token_bytes + offsets
+        )
+
+
+class _DcpDraftSlice(msgspec.Struct, frozen=True):
+    """A draft entry whose per-token width differs between peers: each token
+    copies `copy_bytes` of heads from `src_offset` to `dst_offset`."""
+
+    entry: int
+    src_offset: int
+    dst_offset: int
+    src_token_bytes: int
+    dst_token_bytes: int
+    copy_bytes: int
+
+
+def _dcp_draft_slice_copies(
+    slices: Sequence[_DcpDraftSlice],
+    *,
+    src_indices: npt.NDArray[np.int64],
+    dst_indices: npt.NDArray[np.int64],
+    src_keys: Sequence[MooncakeBufferKey],
+    dst_keys: Sequence[MooncakeBufferKey],
+) -> List[Copy]:
+    """One Copy per sliced draft entry over a batch of token pairs."""
+    copies = []
+    for s in slices:
+        ranges = np.empty((src_indices.size, 3), dtype=np.uint64)
+        ranges[:, 0] = s.src_offset + src_indices * s.src_token_bytes
+        ranges[:, 1] = s.dst_offset + dst_indices * s.dst_token_bytes
+        ranges[:, 2] = s.copy_bytes
+        copies.append(Copy(src=src_keys[s.entry], dst=dst_keys[s.entry], ranges=ranges))
+    return copies
+
+
 def _uses_flat_entry_layout(
     *,
     mla_backend: bool,
@@ -874,8 +923,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
     def _state_stride_mismatch(
         self,
         *,
-        src_data_ptrs: list[int],
-        dst_data_ptrs: list[int],
+        num_src_entries: int,
+        num_dst_entries: int,
         item_lens: list[int],
         dst_item_lens: list[int],
         state_type: Optional[StateType] = None,
@@ -895,8 +944,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             force_flat=force_flat,
             has_layer_ids=has_layer_ids,
             state_type=state_type,
-            num_src_entries=len(src_data_ptrs),
-            num_dst_entries=len(dst_data_ptrs),
+            num_src_entries=num_src_entries,
+            num_dst_entries=num_dst_entries,
         ):
             # The MHA branch splits the entries into K/V and is not covered.
             return None
@@ -904,8 +953,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             pairs = build_transfer_entry_pairs(
                 src_layer_ids or [],
                 dst_layer_ids or [],
-                len(src_data_ptrs),
-                len(dst_data_ptrs),
+                num_src_entries,
+                num_dst_entries,
                 allow_positional_fallback=self.pp_size == 1,
             )
             for i, j in pairs:
@@ -930,8 +979,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         f"dst[{j}]={dst_item_lens[j]}"
                     )
             return None
+        # The PP helper only selects by position: slice entry indices.
         _, _, layers_current_pp_stage = self.get_mla_kv_ptrs_with_pp(
-            src_data_ptrs, dst_data_ptrs, state_type
+            list(range(num_src_entries)), list(range(num_dst_entries)), state_type
         )
         # Lens are parallel to pointers, so the same slice gives each entry's
         # decode stride.
@@ -1050,8 +1100,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 continue
             try:
                 mismatch = self._state_stride_mismatch(
-                    src_data_ptrs=self.kv_args.state_data_ptrs[i],
-                    dst_data_ptrs=dst_data_ptrs,
+                    num_src_entries=len(self.kv_args.state_data_ptrs[i]),
+                    num_dst_entries=len(dst_data_ptrs),
                     item_lens=self.kv_args.state_item_lens[i],
                     dst_item_lens=dst_item_lens,
                     state_type=st,
@@ -1088,8 +1138,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
     def _send_kvcache_generic(
         self,
         mooncake_session_id: str,
-        src_data_ptrs: list[int],
-        dst_data_ptrs: list[int],
         item_lens: list[int],
         prefill_data_indices: npt.NDArray[np.int32],
         dst_data_indices: npt.NDArray[np.int32],
@@ -1113,8 +1161,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         ``force_flat`` uses the MLA-style flat (single-buffer-per-layer) layout
         even on a non-MLA backend, for K-only state buffers (e.g. MiniMax sparse
         index) whose per-layer list must not be half-split into K/V.
-        ``src_keys`` / ``dst_keys`` name the entries of ``src_data_ptrs`` /
-        ``dst_data_ptrs``; ``dst_device_entries`` lists the destination entries that use
+        ``src_keys`` / ``dst_keys`` name the source and destination entries;
+        ``dst_device_entries`` lists the destination entries that use
         ``dst_device_data_indices``.
         """
         # Host and device buffers may use different destination page spaces.
@@ -1136,8 +1184,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             and mooncake_session_id not in self.state_strides_validated
         ):
             mismatch = self._state_stride_mismatch(
-                src_data_ptrs=src_data_ptrs,
-                dst_data_ptrs=dst_data_ptrs,
+                num_src_entries=len(src_keys),
+                num_dst_entries=len(dst_keys),
                 item_lens=item_lens,
                 dst_item_lens=dst_item_lens,
                 state_type=state_type,
@@ -1155,8 +1203,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 return -1
 
         layers_params = self._generic_entry_pairs(
-            num_src_entries=len(src_data_ptrs),
-            num_dst_entries=len(dst_data_ptrs),
+            num_src_entries=len(src_keys),
+            num_dst_entries=len(dst_keys),
             item_lens=item_lens,
             dst_item_lens=dst_item_lens,
             state_type=state_type,
@@ -1458,8 +1506,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             dst_device_entries = set(range(host_backed_kv_count, len(dst_kv_ptrs)))
         return self._send_kvcache_generic(
             mooncake_session_id=mooncake_session_id,
-            src_data_ptrs=self.kv_args.kv_data_ptrs,
-            dst_data_ptrs=dst_kv_ptrs,
             item_lens=self.kv_args.kv_item_lens,
             prefill_data_indices=prefill_kv_indices,
             dst_data_indices=dst_kv_indices,
@@ -1521,16 +1567,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     self.kv_args.kv_item_lens, dst_kv_item_lens
                 )
         src_kv_ptrs = [self.kv_args.kv_data_ptrs[i] for i in src_entries]
-
-        local_kv_keys = self._local_keys.kv
+        src_keys = [self._local_keys.kv[i] for i in src_entries]
         peer_kv_keys = self._peers[mooncake_session_id].keys.kv
-
-        def src_key(entry: int) -> MooncakeBufferKey:
-            return local_kv_keys[src_entries[entry]]
-
-        def dst_key(entry: int) -> MooncakeBufferKey:
-            return peer_kv_keys[dst_entries[entry]]
-
+        dst_keys = [peer_kv_keys[j] for j in dst_entries]
         num_draft = self.kv_args.num_draft_entries
         num_target = len(src_kv_ptrs) - num_draft
 
@@ -1547,220 +1586,77 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         if plan.empty():
             return 0
 
-        # Sources as (key, offset): an unpacked entry starts at its KV buffer,
-        # a packed one inside the pack buffer.
-        target_srcs = [(src_key(entry), 0) for entry in range(num_target)]
-        src_token_indices = plan.target_src_token_indices
-        if pack_buffer is not None and src_token_indices.size:
-            from sglang.srt.disaggregation.common.dcp_pack import try_pack_dcp_src
-
-            packed = try_pack_dcp_src(
-                pack_buffer=pack_buffer,
-                kv_data_ptrs=src_kv_ptrs[:num_target],
-                src_token_indices=src_token_indices,
-                token_item_lens=dcp_token_item_lens[:num_target],
-            )
-            if packed is not None:
-                packed_ptrs, src_token_indices = packed
-                pack_base = pack_buffer.get_ptr()
-                pack_key = self._staging_keys[pack_base]
-                target_srcs = [(pack_key, ptr - pack_base) for ptr in packed_ptrs]
-
-        # (src key, src offset, dst key, dst offset, token width, group units)
-        layers_params = []
-        if src_token_indices.size:
-            target_groups = group_units(
-                *group_concurrent_contiguous(
-                    src_token_indices,
-                    plan.target_dst_token_indices,
-                )
-            )
-            layers_params += [
-                (
-                    *target_srcs[entry],
-                    dst_key(entry),
-                    0,
-                    dcp_token_item_lens[entry],
-                    target_groups,
-                )
-                for entry in range(num_target)
-            ]
-        sliced_draft_params = []
-        draft_to_pack = []
+        entry_copies = self._dcp_target_copies(
+            plan=plan,
+            pack_buffer=pack_buffer,
+            src_ptrs=src_kv_ptrs[:num_target],
+            token_bytes=dcp_token_item_lens[:num_target],
+            src_keys=src_keys[:num_target],
+            dst_keys=dst_keys[:num_target],
+        )
+        draft_slices: List[_DcpDraftSlice] = []
         if num_draft > 0 and plan.draft_src_token_indices.size:
-            if not dst_kv_item_lens and dst_attn_tp_size not in (
-                None,
-                self.attn_tp_size,
-            ):
-                raise ValueError(
-                    "PD DCP with different draft TP sizes requires destination KV lengths"
-                )
-            draft_groups = group_units(
-                *group_concurrent_contiguous(
-                    plan.draft_src_token_indices,
-                    plan.draft_dst_token_indices,
-                )
+            draft_copies, draft_slices = self._dcp_draft_plan(
+                plan=plan,
+                draft_entries=range(num_target, num_target + num_draft),
+                token_bytes=dcp_token_item_lens,
+                dst_kv_item_lens=dst_kv_item_lens,
+                dst_dcp_size=dst_dcp_size,
+                dst_tp_rank=dst_tp_rank,
+                dst_attn_tp_size=dst_attn_tp_size,
+                src_keys=src_keys,
+                dst_keys=dst_keys,
             )
-            for entry in range(num_target, num_target + num_draft):
-                src_width = dcp_token_item_lens[entry]
-                dst_width = src_width
-                if dst_kv_item_lens:
-                    dst_width, remainder = divmod(
-                        dst_kv_item_lens[entry], physical_page_size * dst_dcp_size
-                    )
-                    if remainder or dst_width <= 0:
-                        raise ValueError("Invalid PD DCP draft destination token width")
-                if src_width == dst_width:
-                    layers_params.append(
-                        (
-                            src_key(entry),
-                            0,
-                            dst_key(entry),
-                            0,
-                            src_width,
-                            draft_groups,
-                        )
-                    )
-                    continue
-                if self.is_mla_backend:
-                    raise ValueError(
-                        "PD DCP draft head slicing is unsupported for pure MLA: "
-                        "dummy prefill senders may omit draft head shards"
-                    )
-                copy_width = min(src_width, dst_width)
-                if max(src_width, dst_width) % copy_width:
-                    raise ValueError("PD DCP draft KV head shards must divide evenly")
-                if dst_attn_tp_size is None:
-                    raise ValueError(
-                        "PD DCP draft head slicing requires destination TP size"
-                    )
-                src_span = src_width * self.attn_tp_size
-                dst_span = dst_width * dst_attn_tp_size
-                src_rank = (self.kv_args.engine_rank % self.attn_tp_size) // max(
-                    1, src_span // dst_span
+            entry_copies += draft_copies
+            to_pack = [s for s in draft_slices if s.src_token_bytes > s.dst_token_bytes]
+            if pack_buffer is not None and to_pack:
+                packed = self._pack_dcp_draft(
+                    plan=plan,
+                    pack_buffer=pack_buffer,
+                    slices=to_pack,
+                    src_ptrs=src_kv_ptrs,
+                    dst_keys=dst_keys,
+                    pack_offset_bytes=plan.target_src_token_indices.size
+                    * sum(dcp_token_item_lens[:num_target]),
                 )
-                dst_rank = dst_tp_rank // max(1, dst_span // src_span)
-                src_offset = (dst_rank * dst_width) % src_width
-                dst_offset = (src_rank * src_width) % dst_width
-                params = (
-                    entry,
-                    src_offset,
-                    dst_offset,
-                    src_width,
-                    dst_width,
-                    copy_width,
-                )
-                if pack_buffer is not None and src_width > dst_width:
-                    draft_to_pack.append(params)
-                else:
-                    sliced_draft_params.append(params)
+                if packed:
+                    entry_copies += packed
+                    draft_slices = [
+                        s
+                        for s in draft_slices
+                        if s.src_token_bytes <= s.dst_token_bytes
+                    ]
 
-        if draft_to_pack:
-            from sglang.srt.disaggregation.common.dcp_pack import try_pack_dcp_src
-
-            (
-                draft_entries,
-                draft_src_offsets,
-                draft_dst_offsets,
-                src_strides,
-                _,
-                copy_widths,
-            ) = zip(*draft_to_pack)
-            target_pack_bytes = plan.target_src_token_indices.size * sum(
-                dcp_token_item_lens[:num_target]
-            )
-            packed = try_pack_dcp_src(
-                pack_buffer=pack_buffer,
-                kv_data_ptrs=[
-                    src_kv_ptrs[entry] + offset
-                    for entry, offset in zip(draft_entries, draft_src_offsets)
-                ],
-                src_token_indices=plan.draft_src_token_indices,
-                token_item_lens=copy_widths,
-                src_token_item_lens=src_strides,
-                pack_offset_bytes=target_pack_bytes,
-            )
-            if packed is None:
-                sliced_draft_params.extend(draft_to_pack)
-            else:
-                packed_ptrs, packed_indices = packed
-                packed_groups = group_units(
-                    *group_concurrent_contiguous(
-                        packed_indices, plan.draft_dst_token_indices
-                    )
-                )
-                pack_base = pack_buffer.get_ptr()
-                pack_key = self._staging_keys[pack_base]
-                layers_params.extend(
-                    (
-                        pack_key,
-                        src - pack_base,
-                        dst_key(entry),
-                        dst_offset,
-                        width,
-                        packed_groups,
-                    )
-                    for src, entry, dst_offset, width in zip(
-                        packed_ptrs, draft_entries, draft_dst_offsets, copy_widths
-                    )
-                )
-
-        def process_sliced_draft(params) -> int:
+        def send_draft_slices(slices: List[_DcpDraftSlice]) -> int:
             batch_size = self.max_transfer_batch_indices
             if batch_size <= 0:
                 batch_size = 4096
             for start in range(0, plan.draft_src_token_indices.size, batch_size):
-                src_indices = plan.draft_src_token_indices[start : start + batch_size]
-                dst_indices = plan.draft_dst_token_indices[start : start + batch_size]
-                copies = []
-                for (
-                    entry,
-                    src_offset,
-                    dst_offset,
-                    src_width,
-                    dst_width,
-                    copy_width,
-                ) in params:
-                    ranges = np.empty((src_indices.size, 3), dtype=np.uint64)
-                    ranges[:, 0] = src_offset + src_indices * src_width
-                    ranges[:, 1] = dst_offset + dst_indices * dst_width
-                    ranges[:, 2] = copy_width
-                    copies.append(
-                        Copy(src=src_key(entry), dst=dst_key(entry), ranges=ranges)
-                    )
+                copies = _dcp_draft_slice_copies(
+                    slices,
+                    src_indices=plan.draft_src_token_indices[
+                        start : start + batch_size
+                    ],
+                    dst_indices=plan.draft_dst_token_indices[
+                        start : start + batch_size
+                    ],
+                    src_keys=src_keys,
+                    dst_keys=dst_keys,
+                )
                 ret = self._transfer_copies(mooncake_session_id, copies)
                 if ret != 0:
                     return ret
             return 0
 
-        def make_layer_copy(
-            src: MooncakeBufferKey,
-            src_offset: int,
-            dst: MooncakeBufferKey,
-            dst_offset: int,
-            token_item_len: int,
-            units,
-        ) -> Copy:
-            return Copy(
-                src=src,
-                dst=dst,
-                ranges=units * token_item_len
-                + np.array([src_offset, dst_offset, 0], dtype=np.uint64),
-            )
-
-        def process_layer(*layer_params) -> int:
-            return self._transfer_copies(
-                mooncake_session_id, [make_layer_copy(*layer_params)]
-            )
-
         if self.enable_custom_mem_pool:
             futures = [
-                executor.submit(process_layer, *layer_params)
-                for layer_params in layers_params
+                executor.submit(
+                    self._transfer_copies, mooncake_session_id, [c.to_copy()]
+                )
+                for c in entry_copies
             ]
             futures.extend(
-                executor.submit(process_sliced_draft, [params])
-                for params in sliced_draft_params
+                executor.submit(send_draft_slices, [s]) for s in draft_slices
             )
             try:
                 return self._await_transfer_futures(futures)
@@ -1769,12 +1665,181 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     concurrent.futures.wait(futures)
 
         ret = self._transfer_copies(
-            mooncake_session_id,
-            [make_layer_copy(*layer_params) for layer_params in layers_params],
+            mooncake_session_id, [c.to_copy() for c in entry_copies]
         )
-        if ret != 0 or not sliced_draft_params:
+        if ret != 0 or not draft_slices:
             return ret
-        return process_sliced_draft(sliced_draft_params)
+        return send_draft_slices(draft_slices)
+
+    def _dcp_pack_sources(
+        self, pack_buffer, packed_ptrs: Sequence[int]
+    ) -> List[Tuple[MooncakeBufferKey, int]]:
+        """(key, offset) of each packed entry inside the registered pack buffer."""
+        pack_base = pack_buffer.get_ptr()
+        pack_key = self._staging_keys[pack_base]
+        return [(pack_key, ptr - pack_base) for ptr in packed_ptrs]
+
+    def _dcp_target_copies(
+        self,
+        *,
+        plan,
+        pack_buffer,
+        src_ptrs: Sequence[int],
+        token_bytes: Sequence[int],
+        src_keys: Sequence[MooncakeBufferKey],
+        dst_keys: Sequence[MooncakeBufferKey],
+    ) -> List[_DcpEntryCopy]:
+        """Copies of the target entries, read from the pack buffer when they fit."""
+        src_token_indices = plan.target_src_token_indices
+        if not src_token_indices.size:
+            return []
+        sources = [(key, 0) for key in src_keys]
+        if pack_buffer is not None:
+            from sglang.srt.disaggregation.common.dcp_pack import try_pack_dcp_src
+
+            packed = try_pack_dcp_src(
+                pack_buffer=pack_buffer,
+                kv_data_ptrs=src_ptrs,
+                src_token_indices=src_token_indices,
+                token_item_lens=token_bytes,
+            )
+            if packed is not None:
+                packed_ptrs, src_token_indices = packed
+                sources = self._dcp_pack_sources(pack_buffer, packed_ptrs)
+        units = group_units(
+            *group_concurrent_contiguous(
+                src_token_indices, plan.target_dst_token_indices
+            )
+        )
+        return [
+            _DcpEntryCopy(
+                src=src,
+                src_offset=src_offset,
+                dst=dst,
+                dst_offset=0,
+                token_bytes=width,
+                units=units,
+            )
+            for (src, src_offset), dst, width in zip(sources, dst_keys, token_bytes)
+        ]
+
+    def _dcp_draft_plan(
+        self,
+        *,
+        plan,
+        draft_entries: Sequence[int],
+        token_bytes: Sequence[int],
+        dst_kv_item_lens: Optional[List[int]],
+        dst_dcp_size: int,
+        dst_tp_rank: int,
+        dst_attn_tp_size: Optional[int],
+        src_keys: Sequence[MooncakeBufferKey],
+        dst_keys: Sequence[MooncakeBufferKey],
+    ) -> Tuple[List[_DcpEntryCopy], List[_DcpDraftSlice]]:
+        """Draft entries with equal token widths copy whole tokens; the rest copy
+        the head slice the two attention TP layouts share."""
+        if not dst_kv_item_lens and dst_attn_tp_size not in (None, self.attn_tp_size):
+            raise ValueError(
+                "PD DCP with different draft TP sizes requires destination KV lengths"
+            )
+        units = group_units(
+            *group_concurrent_contiguous(
+                plan.draft_src_token_indices, plan.draft_dst_token_indices
+            )
+        )
+        copies, slices = [], []
+        for entry in draft_entries:
+            src_width = token_bytes[entry]
+            dst_width = src_width
+            if dst_kv_item_lens:
+                dst_width, remainder = divmod(
+                    dst_kv_item_lens[entry], self.kv_args.page_size * dst_dcp_size
+                )
+                if remainder or dst_width <= 0:
+                    raise ValueError("Invalid PD DCP draft destination token width")
+            if src_width == dst_width:
+                copies.append(
+                    _DcpEntryCopy(
+                        src=src_keys[entry],
+                        src_offset=0,
+                        dst=dst_keys[entry],
+                        dst_offset=0,
+                        token_bytes=src_width,
+                        units=units,
+                    )
+                )
+                continue
+            if self.is_mla_backend:
+                raise ValueError(
+                    "PD DCP draft head slicing is unsupported for pure MLA: "
+                    "dummy prefill senders may omit draft head shards"
+                )
+            copy_width = min(src_width, dst_width)
+            if max(src_width, dst_width) % copy_width:
+                raise ValueError("PD DCP draft KV head shards must divide evenly")
+            if dst_attn_tp_size is None:
+                raise ValueError(
+                    "PD DCP draft head slicing requires destination TP size"
+                )
+            src_span = src_width * self.attn_tp_size
+            dst_span = dst_width * dst_attn_tp_size
+            src_rank = (self.kv_args.engine_rank % self.attn_tp_size) // max(
+                1, src_span // dst_span
+            )
+            dst_rank = dst_tp_rank // max(1, dst_span // src_span)
+            slices.append(
+                _DcpDraftSlice(
+                    entry=entry,
+                    src_offset=(dst_rank * dst_width) % src_width,
+                    dst_offset=(src_rank * src_width) % dst_width,
+                    src_token_bytes=src_width,
+                    dst_token_bytes=dst_width,
+                    copy_bytes=copy_width,
+                )
+            )
+        return copies, slices
+
+    def _pack_dcp_draft(
+        self,
+        *,
+        plan,
+        pack_buffer,
+        slices: Sequence[_DcpDraftSlice],
+        src_ptrs: Sequence[int],
+        dst_keys: Sequence[MooncakeBufferKey],
+        pack_offset_bytes: int,
+    ) -> Optional[List[_DcpEntryCopy]]:
+        """Gather the draft head slices behind the packed target tokens, or None
+        when they do not fit."""
+        from sglang.srt.disaggregation.common.dcp_pack import try_pack_dcp_src
+
+        packed = try_pack_dcp_src(
+            pack_buffer=pack_buffer,
+            kv_data_ptrs=[src_ptrs[s.entry] + s.src_offset for s in slices],
+            src_token_indices=plan.draft_src_token_indices,
+            token_item_lens=[s.copy_bytes for s in slices],
+            src_token_item_lens=[s.src_token_bytes for s in slices],
+            pack_offset_bytes=pack_offset_bytes,
+        )
+        if packed is None:
+            return None
+        packed_ptrs, packed_indices = packed
+        units = group_units(
+            *group_concurrent_contiguous(packed_indices, plan.draft_dst_token_indices)
+        )
+        return [
+            _DcpEntryCopy(
+                src=src,
+                src_offset=src_offset,
+                dst=dst_keys[s.entry],
+                dst_offset=s.dst_offset,
+                token_bytes=s.copy_bytes,
+                units=units,
+            )
+            for (src, src_offset), s in zip(
+                self._dcp_pack_sources(pack_buffer, packed_ptrs), slices
+            )
+        ]
 
     def send_kvcache_slice(
         self,
@@ -2106,7 +2171,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             if indices is None:
                 continue
             src_keys = self._local_keys.state[i]
-            src_data_ptrs = self.kv_args.state_data_ptrs[i]
             src_item_lens = self.kv_args.state_item_lens[i]
             src_dim_per_tensor = (
                 self.kv_args.state_dim_per_tensor[i]
@@ -2128,11 +2192,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 src_state_layer_ids[i] if i < len(src_state_layer_ids) else []
             )
             if target_rank_registration_info is not None:
-                dst_data_ptrs = (
-                    target_rank_registration_info.dst_state_data_ptrs[i]
-                    if i < len(target_rank_registration_info.dst_state_data_ptrs)
-                    else []
-                )
                 peer_state_keys = self._peers[req.mooncake_session_id].keys.state
                 dst_keys = peer_state_keys[i] if i < len(peer_state_keys) else ()
                 dst_item_lens = (
@@ -2151,7 +2210,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     else []
                 )
             else:
-                dst_data_ptrs, dst_item_lens, dst_dim_per_tensor = [], [], []
+                dst_item_lens, dst_dim_per_tensor = [], []
                 dst_state_layer_ids = []
                 dst_keys = ()
             dst_indices = (
@@ -2179,10 +2238,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         self._send_mamba_state_slice(
                             req,
                             indices,
-                            src_data_ptrs,
                             src_item_lens,
                             src_dim_per_tensor,
-                            dst_data_ptrs,
                             dst_indices,
                             dst_item_lens,
                             dst_dim_per_tensor,
@@ -2202,9 +2259,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         self._send_mamba_state(
                             req,
                             indices,
-                            src_data_ptrs,
                             src_item_lens,
-                            dst_data_ptrs,
                             dst_indices,
                             src_state_layer_ids,
                             dst_state_layer_ids,
@@ -2218,9 +2273,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 rc = (
                     self._send_slot_state(
                         req,
-                        src_data_ptrs,
                         src_item_lens,
-                        dst_data_ptrs,
                         dst_item_lens,
                         list(indices),
                         list(dst_indices),
@@ -2252,17 +2305,17 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     )
                 if is_qwen4_qsa_state and target_rank_registration_info is not None:
                     # Reject QSA state layout mismatches up front.
-                    if len(dst_item_lens) != len(dst_data_ptrs):
+                    if len(dst_item_lens) != len(dst_keys):
                         raise RuntimeError(
                             f"Replicated {st.upper()} destination pointer/item-length "
                             "metadata is inconsistent: "
-                            f"dst ptrs={len(dst_data_ptrs)} lens={len(dst_item_lens)}"
+                            f"dst ptrs={len(dst_keys)} lens={len(dst_item_lens)}"
                         )
                     qsa_entry_pairs = build_transfer_entry_pairs(
                         src_state_layer_ids,
                         dst_state_layer_ids,
-                        len(src_data_ptrs),
-                        len(dst_data_ptrs),
+                        len(src_keys),
+                        len(dst_keys),
                         allow_positional_fallback=self.pp_size == 1,
                     )
                     layout_mismatches = [
@@ -2324,9 +2377,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         self._send_swa_state_slice(
                             req=req,
                             prefill_swa_page_indices=src_indices,
-                            src_state_data_ptrs=src_data_ptrs,
                             src_state_item_lens=src_item_lens,
-                            dst_state_data_ptrs=dst_data_ptrs,
                             dst_swa_page_indices=dst_indices_local,
                             dst_state_item_lens=dst_item_lens,
                             dst_tp_rank=target_rank_registration_info.dst_tp_rank,
@@ -2343,8 +2394,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 rc = (
                     self._send_kvcache_generic(
                         mooncake_session_id=req.mooncake_session_id,
-                        src_data_ptrs=src_data_ptrs,
-                        dst_data_ptrs=dst_data_ptrs,
                         item_lens=src_item_lens,
                         prefill_data_indices=np.array(src_indices, dtype=np.int32),
                         dst_data_indices=np.array(dst_indices_local, dtype=np.int32),
@@ -2401,8 +2450,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 rc = (
                     self._send_kvcache_generic(
                         mooncake_session_id=req.mooncake_session_id,
-                        src_data_ptrs=src_data_ptrs,
-                        dst_data_ptrs=dst_data_ptrs,
                         item_lens=src_item_lens,
                         prefill_data_indices=np.array(src_indices, dtype=np.int32),
                         dst_data_indices=np.array(dst_indices_local, dtype=np.int32),
@@ -2418,9 +2465,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
     def _send_slot_state(
         self,
         req: TransferInfo,
-        src_ptrs: list[int],
         src_item_lens: list[int],
-        dst_ptrs: list[int],
         dst_item_lens: list[int],
         src_indices: list[int],
         dst_indices: list[int],
@@ -2430,26 +2475,26 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
     ) -> int:
         try:
             dst_entries = slice_dsa_tail_dst_ptrs_for_pp(
-                src_ptrs,
-                list(range(len(dst_ptrs))),
+                list(range(len(src_keys))),
+                list(range(len(dst_keys))),
                 self.kv_args.prefill_start_layer,
                 self.kv_args.prefill_end_layer,
             )
             dst_item_lens = slice_dsa_tail_dst_ptrs_for_pp(
-                src_ptrs,
+                list(range(len(src_keys))),
                 dst_item_lens,
                 self.kv_args.prefill_start_layer,
                 self.kv_args.prefill_end_layer,
             )
             if not (
-                len(src_ptrs)
+                len(src_keys)
                 == len(dst_entries)
                 == len(src_item_lens)
                 == len(dst_item_lens)
             ):
                 raise ValueError(
                     "DSA tail pointer metadata mismatch: "
-                    f"src_ptrs={len(src_ptrs)}, dst_ptrs={len(dst_entries)}, "
+                    f"src_ptrs={len(src_keys)}, dst_ptrs={len(dst_entries)}, "
                     f"src_item_lens={len(src_item_lens)}, "
                     f"dst_item_lens={len(dst_item_lens)}"
                 )
@@ -2479,9 +2524,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         self,
         req: TransferInfo,
         prefill_mamba_index: list,
-        src_state_data_ptrs: list[int],
         src_state_item_lens: list[int],
-        dst_state_data_ptrs: list[int],
         dst_mamba_index: list,
         src_layer_ids: Optional[List[int]] = None,
         dst_layer_ids: Optional[List[int]] = None,
@@ -2496,8 +2539,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         pairs = build_transfer_entry_pairs(
             src_layer_ids or [],
             dst_layer_ids or [],
-            len(src_state_data_ptrs),
-            len(dst_state_data_ptrs),
+            len(src_keys),
+            len(dst_keys),
             allow_positional_fallback=self.pp_size == 1,
         )
         for i, j in pairs:
@@ -2530,10 +2573,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         self,
         req: TransferInfo,
         prefill_mamba_index: list,
-        src_state_data_ptrs: list[int],
         src_state_item_lens: list[int],
         src_state_dim_per_tensor: list[int],
-        dst_state_data_ptrs: list[int],
         dst_mamba_index: list,
         dst_state_item_lens: list[int],
         dst_state_dim_per_tensor: list[int],
@@ -2572,9 +2613,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             return self._send_mamba_state(
                 req,
                 prefill_mamba_index,
-                src_state_data_ptrs,
                 src_state_item_lens,
-                dst_state_data_ptrs,
                 dst_mamba_index,
                 src_layer_ids,
                 dst_layer_ids,
@@ -2590,8 +2629,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         pairs = build_transfer_entry_pairs(
             src_layer_ids or [],
             dst_layer_ids or [],
-            len(src_state_data_ptrs),
-            len(dst_state_data_ptrs),
+            len(src_keys),
+            len(dst_keys),
             allow_positional_fallback=self.pp_size == 1,
         )
         for i, j in pairs:
@@ -2642,9 +2681,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         self,
         req: TransferInfo,
         prefill_swa_page_indices: List[int],
-        src_state_data_ptrs: List[int],
         src_state_item_lens: List[int],
-        dst_state_data_ptrs: List[int],
         dst_swa_page_indices: List[int],
         dst_state_item_lens: List[int],
         dst_tp_rank: int,
@@ -2655,9 +2692,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
     ) -> int:
         # Zero pointers make the helper's addresses offsets into each entry.
         blocks = self._get_mha_head_slice_blocks(
-            src_ptrs=[0] * len(src_state_data_ptrs),
+            src_ptrs=[0] * len(src_keys),
             src_item_lens=src_state_item_lens,
-            dst_ptrs=[0] * len(dst_state_data_ptrs),
+            dst_ptrs=[0] * len(dst_keys),
             dst_item_lens=dst_state_item_lens,
             src_page_indices=np.asarray(prefill_swa_page_indices),
             dst_page_indices=np.asarray(dst_swa_page_indices),
@@ -2670,8 +2707,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         )
         # Head-slice blocks follow the K-then-V entry order.
         src_k, src_v, dst_k, dst_v, _ = self.get_mha_kv_ptrs_with_pp(
-            list(range(len(src_state_data_ptrs))),
-            list(range(len(dst_state_data_ptrs))),
+            list(range(len(src_keys))),
+            list(range(len(dst_keys))),
         )
         futures = []
         for src_entry, dst_entry, (src_offsets, dst_offsets, length) in zip(
