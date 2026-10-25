@@ -66,71 +66,31 @@ class TestAutotuneTacticSyncGroup(CustomTestCase):
         self.assertIsNone(_autotune_tactic_sync_group(tp_group))
 
 
-class TestPhaseSpecificMoeAutotune(CustomTestCase):
+class TestPhaseSpecificPrecisionAutotune(CustomTestCase):
     def test_phase_selection(self):
-        runner = SimpleNamespace(is_draft_worker=False)
-        for prefill, decode, precision, expected in (
-            (None, None, False, (None,)),
-            (None, None, True, (None,)),
-            (None, None, "prefill", ("decode", "prefill")),
-            (None, None, "decode", ("decode", "prefill")),
-            ("flashinfer_trtllm", "flashinfer_cutedsl", False, ("decode", "prefill")),
-            ("flashinfer_cutedsl", "flashinfer_cutedsl", False, (None,)),
+        for w4a16, per_token, expected in (
+            (False, False, (None,)),
+            (True, True, (None,)),
+            ("prefill", False, ("decode", "prefill")),
+            ("decode", False, ("decode", "prefill")),
+            (False, "prefill", ("decode", "prefill")),
+            (False, "decode", ("decode", "prefill")),
+            ("decode", "prefill", ("decode", "prefill")),
         ):
             with (
-                self.subTest(prefill=prefill, decode=decode, precision=precision),
-                patch.object(
-                    autotune,
-                    "get_exec",
-                    return_value=SimpleNamespace(
-                        moe=SimpleNamespace(
-                            moe_runner_backend="flashinfer_trtllm",
-                            moe_prefill_runner_backend=prefill,
-                            moe_decode_runner_backend=decode,
-                        )
-                    ),
-                ),
+                self.subTest(w4a16=w4a16, per_token=per_token),
                 patch.object(
                     autotune.envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16,
                     "get",
-                    return_value=precision,
+                    return_value=w4a16,
                 ),
                 patch.object(
                     autotune.envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION,
                     "get",
-                    return_value=False,
+                    return_value=per_token,
                 ),
             ):
-                self.assertEqual(
-                    autotune.flashinfer_autotune_moe_phases(runner), expected
-                )
-
-    def test_phase_specific_per_token_scaling_warms_both(self):
-        with (
-            patch.object(
-                autotune,
-                "get_exec",
-                return_value=SimpleNamespace(
-                    moe=SimpleNamespace(moe_runner_backend="flashinfer_cutedsl")
-                ),
-            ),
-            patch.object(
-                autotune.envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16,
-                "get",
-                return_value=False,
-            ),
-            patch.object(
-                autotune.envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION,
-                "get",
-                return_value="prefill",
-            ),
-        ):
-            self.assertEqual(
-                autotune.flashinfer_autotune_moe_phases(
-                    SimpleNamespace(is_draft_worker=False)
-                ),
-                ("decode", "prefill"),
-            )
+                self.assertEqual(autotune.flashinfer_autotune_moe_phases(), expected)
 
     def test_startup_warms_both_phases_with_same_buffers(self):
         from sglang.srt.model_executor.runner import base_runner

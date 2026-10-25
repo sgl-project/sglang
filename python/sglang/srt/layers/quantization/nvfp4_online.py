@@ -61,8 +61,8 @@ class NvFp4OnlineConfig(ModelOptQuantConfig):
 
     `--quantization nvfp4_online` uses per-token FP32 activation scales by
     default, unless `SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION` selects a
-    phase or explicitly disables them. With `SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16=1`, the flashinfer_cutedsl
-    and flashinfer_megamoe backends keep activations in BF16. Use `modelopt_fp4`
+    phase or explicitly disables them. With
+    `SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16=1`, the flashinfer_cutedsl and flashinfer_megamoe backends keep activations in BF16. Use `modelopt_fp4`
     for per-tensor FP32 activation scales or serialized NVFP4 checkpoints.
     This path converts BF16/FP16/FP8 MoE expert weights as they load; dense
     layers retain their source precision or quantization.
@@ -248,15 +248,14 @@ class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
             or self._is_cutedsl_v2_standard
             or (
                 get_moe_runner_backend().is_flashinfer_megamoe()
-                and envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.enabled_for_any()
+                and envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.enabled_for_all()
             )
         ):
             raise ValueError(
                 "--quantization nvfp4_online supports flashinfer_trtllm, "
                 "flashinfer_trtllm_routed, or flashinfer_cutedsl with no A2A "
                 "or FlashInfer A2A, or flashinfer_megamoe with "
-                "SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16 enabled for the phase "
-                "that uses MegaMoE. "
+                "SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16=1 (both phases). "
                 "Use --quantization modelopt_fp4 for "
                 "per-tensor FP32 activation scales."
             )

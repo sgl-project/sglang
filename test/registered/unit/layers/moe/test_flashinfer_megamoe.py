@@ -794,7 +794,7 @@ def test_nvfp4_reload_preserves_layer_and_prepared_weight_storage(
         assert layer._flashinfer_megamoe_input_norm_const == 1.0
 
 
-def test_precapture_warmup_includes_online_decode_views_and_precision_variants(
+def test_precapture_warmup_includes_online_methods_and_precision_variants(
     monkeypatch,
 ):
     module = _load_megamoe_module(monkeypatch)
@@ -821,12 +821,9 @@ def test_precapture_warmup_includes_online_decode_views_and_precision_variants(
     monkeypatch.setattr(
         module.envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16, "get", lambda: "decode"
     )
-    owner = FusedMoE()
-    decode = FusedMoE()
-    decode.quant_method = OnlineMethod()
-    decode._moe_forward_phase = "decode"
-    decode._flashinfer_megamoe_layer = None
-    object.__setattr__(owner, "_decode_moe_view", decode)
+    online = FusedMoE()
+    online.quant_method = OnlineMethod()
+    online._flashinfer_megamoe_layer = None
     paired = FusedMoE()
     paired.quant_method = NvFp4Method()
     paired._flashinfer_megamoe_layer = object()
@@ -841,8 +838,8 @@ def test_precapture_warmup_includes_online_decode_views_and_precision_variants(
         "ensure_nvfp4_moe_layer_for_flashinfer_megamoe",
         lambda layer, **kwargs: calls.append((layer, kwargs["use_w4a16"])),
     )
-    module.warmup_all_flashinfer_megamoe_layers(torch.nn.ModuleList([owner, paired]))
-    assert calls == [(decode, True), (paired, False)]
+    module.warmup_all_flashinfer_megamoe_layers(torch.nn.ModuleList([online, paired]))
+    assert calls == [(online, False), (paired, False)]
 
 
 def test_phase_specific_nvfp4_keeps_both_layouts_and_reload_addresses(monkeypatch):

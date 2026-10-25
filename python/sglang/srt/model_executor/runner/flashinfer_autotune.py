@@ -50,22 +50,8 @@ logger = logging.getLogger(__name__)
 FLASHINFER_AUTOTUNE_WORKAROUND_SKIPS = frozenset()
 
 
-def _target_moe_backends() -> set[str | None]:
-    moe = get_exec().moe
-    return {
-        moe.moe_runner_backend,
-        getattr(moe, "moe_prefill_runner_backend", None),
-        getattr(moe, "moe_decode_runner_backend", None),
-    }
-
-
-def flashinfer_autotune_moe_phases(model_runner: ModelRunner) -> tuple:
-    """Warm both kernels when phase selection changes backend or precision."""
-    moe = get_exec().moe
-    split_backend = not model_runner.is_draft_worker and (
-        (getattr(moe, "moe_prefill_runner_backend", None) or moe.moe_runner_backend)
-        != (getattr(moe, "moe_decode_runner_backend", None) or moe.moe_runner_backend)
-    )
+def flashinfer_autotune_moe_phases() -> tuple:
+    """Warm both kernels when activation precision changes between phases."""
     split_precision = any(
         isinstance(setting.get(), str)
         for setting in (
@@ -73,7 +59,7 @@ def flashinfer_autotune_moe_phases(model_runner: ModelRunner) -> tuple:
             envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION,
         )
     )
-    return ("decode", "prefill") if split_backend or split_precision else (None,)
+    return ("decode", "prefill") if split_precision else (None,)
 
 
 def get_flashinfer_autotune_skip_ops(model_runner: ModelRunner) -> set[str]:
@@ -126,10 +112,6 @@ def should_run_flashinfer_autotune(
         backend_str = get_exec().moe.moe_runner_backend
         a2a_backend_str = get_exec().moe.moe_a2a_backend
 
-    backend_strs = {backend_str}
-    if not for_speculative_draft:
-        backend_strs.update(_target_moe_backends())
-
     # Autotune can run before the MoE backend globals are initialized, so read
     # the configured backends -- the draft leaves (`get_spec()`) or the target
     # leaves (`get_exec().moe`) above. CuteDSL v1 bypasses MoeRunner, and its
@@ -139,18 +121,14 @@ def should_run_flashinfer_autotune(
 
     # TODO smor- support other cases for flashinfer autotune, such as, mamba backend
 
-    moe_needs_autotune = bool(
-        backend_strs.intersection(
-            {
-                "flashinfer_trtllm",
-                "flashinfer_trtllm_routed",
-                "flashinfer_mxfp4",
-                "flashinfer_cutedsl",
-                "flashinfer_cutlass",
-                "flashinfer_megamoe",
-            }
-        )
-    )
+    moe_needs_autotune = backend_str in [
+        "flashinfer_trtllm",
+        "flashinfer_trtllm_routed",
+        "flashinfer_mxfp4",
+        "flashinfer_cutedsl",
+        "flashinfer_cutlass",
+        "flashinfer_megamoe",
+    ]
 
     from sglang.srt.layers.quantization.fp4_utils import (
         get_fp4_gemm_runner_backend,
@@ -203,8 +181,6 @@ def flashinfer_autotune_cache_path(model_runner: ModelRunner) -> Path:
         str(mr.dtype),
         str(get_model().quantization),
         str(get_exec().moe.moe_runner_backend),
-        str(getattr(get_exec().moe, "moe_prefill_runner_backend", None)),
-        str(getattr(get_exec().moe, "moe_decode_runner_backend", None)),
         str(envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()),
         str(envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.get()),
         str(get_parallel().tp_size),
@@ -232,7 +208,10 @@ def flashinfer_autotune_cache_path(model_runner: ModelRunner) -> Path:
     )
     cache_dir.mkdir(parents=True, exist_ok=True)
     rank_key = f"rank_tp{get_parallel().tp_rank}_pp{get_parallel().pp_rank}_dp{get_parallel().dp_rank or 0}"
-    if "flashinfer_megamoe" in _target_moe_backends() and not mr.is_draft_worker:
+    if (
+        get_exec().moe.moe_runner_backend == "flashinfer_megamoe"
+        and not mr.is_draft_worker
+    ):
         from sglang.srt.platforms import current_platform
 
         # Ordinary FlashInfer tactics use best-effort merging, but MegaMoE's
@@ -362,7 +341,7 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool)
             tuner.load_configs(str(autotune_cache))
         mega_context = empty_context()
         if (
-            "flashinfer_megamoe" in _target_moe_backends()
+            get_exec().moe.moe_runner_backend == "flashinfer_megamoe"
             and not mr.is_draft_worker
             and "flashinfer_megamoe" not in skip_ops
         ):

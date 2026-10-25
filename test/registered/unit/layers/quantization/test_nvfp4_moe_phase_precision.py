@@ -1,4 +1,4 @@
-"""Mixed NVFP4 MoE runners match independently prepared per-phase controls."""
+"""Phase-specific NVFP4 activation scaling matches global precision controls."""
 
 import unittest
 from contextlib import contextmanager
@@ -11,7 +11,7 @@ from sglang.srt.layers.moe.utils import MoeA2ABackend, MoeRunnerBackend
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
-from sglang.srt.runtime_context import get_context, get_exec, get_flags, get_parallel
+from sglang.srt.runtime_context import get_context, get_flags, get_parallel
 from sglang.srt.utils import get_device_sm
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.layer_ut_utils import init_single_process_dist
@@ -25,20 +25,14 @@ from sglang.test.test_utils import CustomTestCase
 register_cuda_ci(est_time=30, stage="base-b", runner_config="4-gpu-b200")
 
 E, H, INTERMEDIATE, TOPK, M = 8, 1024, 1024, 2, 32
-PREFILL = "flashinfer_trtllm"
-DECODE = "flashinfer_cutedsl"
 
 
 @contextmanager
-def _runtime(backend, w4a16, *, mixed=False, per_token=False):
+def _runtime(backend, *, per_token=False):
     with (
-        envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.override(w4a16),
+        envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.override(False),
         envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.override(per_token),
         get_context().override_server_args(model_path="dummy"),
-        get_exec().moe.override(
-            moe_prefill_runner_backend=PREFILL if mixed else None,
-            moe_decode_runner_backend=DECODE if mixed else None,
-        ),
         get_flags().moe.override(
             runner_backend=MoeRunnerBackend(backend),
             a2a_backend=MoeA2ABackend.NONE,
@@ -70,7 +64,7 @@ def _forward(layer, x, topk, mode):
 
 
 @unittest.skipIf(get_device_sm() < 100, "NVFP4 MoE backends require SM100+")
-class TestNvFp4MoePhaseBackends(CustomTestCase):
+class TestNvFp4MoePhasePrecision(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         init_single_process_dist(master_port=29639)
@@ -127,14 +121,14 @@ class TestNvFp4MoePhaseBackends(CustomTestCase):
             torch.manual_seed(11)
             x = torch.randn(M, H, dtype=torch.bfloat16) / 10
             logits = torch.randn(M, E, dtype=torch.float32)
-            with _runtime(backend, False):
+            with _runtime(backend):
                 topk = select_experts(
                     hidden_states=x,
                     router_logits=logits,
                     topk_config=TopKConfig(top_k=TOPK, renormalize=True),
                 )
             for per_token in (False, True):
-                with _runtime(backend, False, per_token=per_token):
+                with _runtime(backend, per_token=per_token):
                     layer = self._make_layer()
                     controls[per_token] = _forward(
                         layer, x, topk, ForwardMode.EXTEND
@@ -142,7 +136,7 @@ class TestNvFp4MoePhaseBackends(CustomTestCase):
             for selector in ("prefill", "decode"):
                 with (
                     self.subTest(backend=backend, selector=selector),
-                    _runtime(backend, False, per_token=selector),
+                    _runtime(backend, per_token=selector),
                 ):
                     layer = self._make_layer()
                     for mode, phase in (
@@ -179,74 +173,6 @@ class TestNvFp4MoePhaseBackends(CustomTestCase):
                             torch.testing.assert_close(
                                 captured, expected, rtol=1e-3, atol=1e-3
                             )
-
-    def test_mixed_runners_match_controls_and_cuda_graphs(self):
-        from sglang.srt.layers.moe.topk import TopKConfig, select_experts
-
-        with _runtime(PREFILL, False):
-            prefill = self._make_layer()
-        with _runtime(DECODE, True):
-            decode = self._make_layer()
-        with _runtime(PREFILL, "decode", mixed=True):
-            mixed = self._make_layer()
-            decode_view = mixed._decode_moe_view
-            self.assertIsNot(mixed.quant_method, decode_view.quant_method)
-            for name in ("w13_weight", "w2_weight", "w13_weight_scale_2"):
-                self.assertNotEqual(
-                    getattr(mixed, name).data_ptr(),
-                    getattr(decode_view, name).data_ptr(),
-                    name,
-                )
-
-        torch.manual_seed(11)
-        x = torch.randn(M, H, dtype=torch.bfloat16) / 10
-        logits = torch.randn(M, E, dtype=torch.float32)
-        # All runners consume the same routing decisions from the real top-k path.
-        with _runtime(PREFILL, False):
-            topk = select_experts(
-                hidden_states=x,
-                router_logits=logits,
-                topk_config=TopKConfig(top_k=TOPK, renormalize=True),
-            )
-            prefill_ref = _forward(prefill, x, topk, ForwardMode.EXTEND).clone()
-        with _runtime(DECODE, True):
-            decode_ref = _forward(decode, x, topk, ForwardMode.DECODE).clone()
-
-        modes = (
-            (ForwardMode.EXTEND, prefill_ref),
-            (ForwardMode.DECODE, decode_ref),
-            (ForwardMode.EXTEND, prefill_ref),
-            (ForwardMode.TARGET_VERIFY, decode_ref),
-        )
-        with _runtime(PREFILL, "decode", mixed=True):
-            for mode, expected in modes:
-                with self.subTest(mode=mode):
-                    torch.testing.assert_close(
-                        _forward(mixed, x, topk, mode), expected, rtol=1e-3, atol=1e-3
-                    )
-
-            # Capture the two execution paths separately, then alternate replays.
-            # Changing the current phase must not change either captured graph.
-            captures = []
-            for mode, expected in modes[:2]:
-                stream = torch.cuda.Stream()
-                stream.wait_stream(torch.cuda.current_stream())
-                with torch.cuda.stream(stream):
-                    for _ in range(3):
-                        _forward(mixed, x, topk, mode)
-                torch.cuda.current_stream().wait_stream(stream)
-                torch.cuda.synchronize()
-                graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(graph):
-                    captured = _forward(mixed, x, topk, mode)
-                captures.append((graph, captured, expected))
-            for _ in range(3):
-                for graph, captured, expected in captures:
-                    graph.replay()
-                    torch.testing.assert_close(captured, expected, rtol=1e-3, atol=1e-3)
-
-            with self.assertRaisesRegex(ValueError, "Reloading weights"):
-                mixed.quant_method.process_weights_after_loading(mixed)
 
 
 if __name__ == "__main__":

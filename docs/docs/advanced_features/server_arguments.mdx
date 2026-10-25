@@ -1676,7 +1676,7 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--speculative-moe-runner-backend`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>MOE backend for EAGLE speculative decoding, see `--moe-runner-backend` for options. Same as moe runner backend if unset.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>auto</code>, <code>deep_gemm</code>, <code>triton</code>, <code>triton_kernel</code>, <code>flashinfer_trtllm</code>, <code>experimental_sgl_trtllm</code>, <code>flashinfer_trtllm_routed</code>, <code>flashinfer_cutlass</code>, <code>flashinfer_mxfp4</code>, <code>flashinfer_cutedsl</code>, <code>flashinfer_megamoe</code>, <code>cutlass</code>, <code>aiter</code>, <code>marlin</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>auto</code>, <code>deep_gemm</code>, <code>triton</code>, <code>triton_kernel</code>, <code>flashinfer_trtllm</code>, <code>experimental_sgl_trtllm</code>, <code>flashinfer_trtllm_routed</code>, <code>flashinfer_cutlass</code>, <code>flashinfer_mxfp4</code>, <code>flashinfer_cutedsl</code>, <code>cutlass</code>, <code>aiter</code>, <code>marlin</code></td>
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--speculative-moe-a2a-backend`</td>
@@ -1848,15 +1848,9 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--moe-runner-backend`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Choose the default runner backend for MoE. Phase-specific overrides inherit this setting when omitted.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Choose the runner backend for MoE.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`auto`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>auto</code>, <code>deep_gemm</code>, <code>triton</code>, <code>triton_kernel</code>, <code>flashinfer_trtllm</code>, <code>experimental_sgl_trtllm</code>, <code>flashinfer_trtllm_routed</code>, <code>flashinfer_cutlass</code>, <code>flashinfer_mxfp4</code>, <code>flashinfer_cutedsl</code>, <code>flashinfer_megamoe</code>, <code>cutlass</code>, <code>aiter</code>, <code>marlin</code></td>
-    </tr>
-        <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--moe-prefill-runner-backend` / `--moe-decode-runner-backend`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Override the MoE runner per phase. Mixed prompt/decode batches use prefill; target verification and draft extension use decode. Different runners currently support NVFP4 experts with <code>flashinfer_trtllm</code>, <code>flashinfer_trtllm_routed</code>, and <code>flashinfer_cutedsl</code>, with <code>--moe-a2a-backend none</code> or <code>flashinfer</code>. Decode can additionally use <code>flashinfer_megamoe</code> with base A2A <code>flashinfer</code>: prefill uses FlashInfer dispatch/combine and decode uses MegaMoE fused A2A. Both prepared weight layouts remain resident. Weight reload, EPLB, paged experts, LoRA, batch overlap, DWDP, CPU offload, and Ktransformers are unsupported with different runners. Quantization-excluded layers retain their fallback backend; speculative draft backend arguments remain independent.</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Same choices as <code>--moe-runner-backend</code>; different combinations must satisfy the compatibility restrictions.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>auto</code>, <code>deep_gemm</code>, <code>triton</code>, <code>triton_kernel</code>, <code>flashinfer_trtllm</code>, <code>experimental_sgl_trtllm</code>, <code>flashinfer_trtllm_routed</code>, <code>flashinfer_cutlass</code>, <code>flashinfer_mxfp4</code>, <code>flashinfer_cutedsl</code>, <code>cutlass</code>, <code>aiter</code>, <code>marlin</code></td>
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--flashinfer-mxfp4-moe-precision`</td>
@@ -2010,30 +2004,6 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
     </tr>
 </tbody>
 </table>
-
-### Per-token W4A4 prefill and W4A16 decode
-
-On NVIDIA SM100-family GPUs, use CuTe DSL with per-token activation scales for
-prefill and FlashInfer MegaMoE with BF16 activations for decode. This example
-uses four GPUs in one NVLink domain and a BF16 checkpoint quantized to NVFP4
-at load time. Replace `MODEL_PATH` with a supported checkpoint, such as Qwen3 MoE.
-
-```bash
-SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION=prefill \
-SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16=decode \
-python -m sglang.launch_server \
-  --model-path MODEL_PATH --quantization nvfp4_online --dtype bfloat16 \
-  --tp-size 4 --ep-size 4 --attn-dp-size 4 \
-  --moe-prefill-runner-backend flashinfer_cutedsl \
-  --moe-decode-runner-backend flashinfer_megamoe \
-  --moe-a2a-backend flashinfer --flashinfer-a2a-dispatch-type bf16
-```
-
-The phase follows the MLP batch across attention-DP ranks: a mixed batch with
-prompt tokens uses prefill, while target verification uses decode. Startup
-autotuning prepares both implementations before CUDA graph capture. Prefill
-still produces the first generated token. This setting does not assign
-precision by token provenance or change KV-cache reuse.
 
 ## Mamba Cache
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>

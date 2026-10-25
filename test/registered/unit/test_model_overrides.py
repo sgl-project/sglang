@@ -3261,6 +3261,27 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
         self.assertEqual(_moe_runner_backend_quant_constraints(_view()), {})
 
+    def test_online_megamoe_requires_w4a16_in_both_phases(self):
+        from sglang.srt.arg_groups.overrides import (
+            _moe_runner_backend_quant_constraints,
+        )
+
+        view = SimpleNamespace(
+            quantization="nvfp4_online",
+            moe_a2a_backend="flashinfer_megamoe",
+            moe_runner_backend="flashinfer_megamoe",
+        )
+        with override_platform(is_sm100=True):
+            for value in ("prefill", "decode", False):
+                with (
+                    self.subTest(value=value),
+                    envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.override(value),
+                    self.assertRaises(ValueError),
+                ):
+                    _moe_runner_backend_quant_constraints(view)
+            with envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.override(True):
+                self.assertEqual(_moe_runner_backend_quant_constraints(view), {})
+
     def test_gguf_quantization_pass(self):
         from sglang.srt.arg_groups.overrides import ResolvedView, _gguf_quantization
 

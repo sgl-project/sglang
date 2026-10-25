@@ -1,4 +1,4 @@
-"""Phase selection shared by MoE backends and NVFP4 activation precision."""
+"""Select NVFP4 activation precision for the current forward phase."""
 
 from sglang.srt.environ import envs
 
@@ -26,13 +26,6 @@ def is_w4a16_enabled() -> bool:
             "a forward context with the prefill/decode phase."
         )
     return value == phase
-
-
-def w4a16_setting_for_layer(layer) -> bool | str:
-    """Narrow load-time preparation to a phase-owned backend view when present."""
-    value = envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()
-    phase = getattr(layer, "_moe_forward_phase", None)
-    return value == phase if isinstance(value, str) and phase is not None else value
 
 
 def use_nvfp4_per_token_activation(quant_config, phase: str | None = None) -> bool:

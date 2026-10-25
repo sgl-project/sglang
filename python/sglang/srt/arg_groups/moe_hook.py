@@ -40,126 +40,6 @@ from sglang.srt.utils.common import (
 logger = logging.getLogger(__name__)
 
 
-def handle_moe_phase_backends(server_args: Any) -> None:
-    """Resolve phase overrides against the original, quantization-resolved default."""
-    cfg = resolving_view(server_args)
-    if cfg.moe_prefill_runner_backend is None and cfg.moe_decode_runner_backend is None:
-        return
-
-    class PhaseView:
-        def __init__(self, backend, phase):
-            self.moe_runner_backend = backend
-            self._moe_forward_phase = phase
-            self.moe_a2a_backend = (
-                "flashinfer_megamoe"
-                if backend == "flashinfer_megamoe"
-                else cfg.moe_a2a_backend
-            )
-
-        def __getattr__(self, name):
-            return getattr(cfg, name)
-
-    def resolve(backend, phase):
-        backend = backend or cfg.moe_runner_backend
-        backend = _moe_runner_backend_quant_constraints(PhaseView(backend, phase)).get(
-            "moe_runner_backend", backend
-        )
-        if (
-            backend == "auto"
-            and cfg.quantization in ("modelopt_fp4", "modelopt_mixed")
-            and get_platform().is_sm100
-        ):
-            # Match ModelOptNvFp4FusedMoEMethod.create_moe_runner, whose
-            # default normally resolves later, when the layer is constructed.
-            backend = "flashinfer_trtllm"
-        if backend == "flashinfer_trtllm" and cfg.moe_a2a_backend == "flashinfer":
-            # FlashInfer dispatch materializes routes. Normalize each phase
-            # here so the later A2A hook cannot leave stale phase selections.
-            backend = "flashinfer_trtllm_routed"
-        return backend
-
-    prefill = resolve(cfg.moe_prefill_runner_backend, "prefill")
-    decode = resolve(cfg.moe_decode_runner_backend, "decode")
-    if prefill != decode:
-        if prefill == "flashinfer_megamoe":
-            raise ValueError(
-                "Mixed FlashInfer MegaMoE runners currently support MegaMoE for decode only."
-            )
-        supported = {
-            "flashinfer_trtllm",
-            "flashinfer_trtllm_routed",
-            "flashinfer_cutedsl",
-            "flashinfer_megamoe",
-        }
-        if {prefill, decode} - supported:
-            raise ValueError(
-                "Different prefill/decode MoE runners currently support only "
-                "flashinfer_trtllm, flashinfer_trtllm_routed, flashinfer_cutedsl and flashinfer_megamoe "
-                "with NVFP4 experts."
-            )
-        if cfg.moe_a2a_backend not in ("none", "flashinfer"):
-            raise ValueError(
-                "Different prefill/decode MoE runners require --moe-a2a-backend none or flashinfer."
-            )
-        if cfg.quantization not in ("modelopt_fp4", "modelopt_mixed", "nvfp4_online"):
-            raise ValueError(
-                "Different prefill/decode MoE runners require NVFP4 experts."
-            )
-        for name in (
-            "enable_lora",
-            "enable_eplb",
-            "enable_paged_experts",
-            "enable_two_batch_overlap",
-            "enable_single_batch_overlap",
-            "enable_waterfill",
-            "enforce_shared_experts_fusion",
-            "kt_weight_path",
-            "cpu_offload_gb",
-        ):
-            if getattr(cfg, name, False):
-                raise ValueError(
-                    f"Different prefill/decode MoE runners do not support --{name.replace('_', '-')} yet."
-                )
-        if getattr(cfg, "dwdp_size", 1) > 1:
-            raise ValueError(
-                "Different prefill/decode MoE runners do not support DWDP."
-            )
-        for phase, backend in (("prefill", prefill), ("decode", decode)):
-            if backend != "flashinfer_megamoe":
-                continue
-            if cfg.moe_a2a_backend != "flashinfer":
-                raise ValueError(
-                    "Mixing FlashInfer MegaMoE with another runner requires "
-                    "--moe-a2a-backend flashinfer; the MegaMoE phase uses its fused A2A."
-                )
-            validate_flashinfer_megamoe_model(server_args, phase=phase)
-            validate_flashinfer_megamoe_envs()
-            import torch
-
-            if (
-                not get_platform().is_sm100
-                or model_config_of(server_args).dtype != torch.bfloat16
-            ):
-                raise ValueError(
-                    "Phase-specific FlashInfer MegaMoE requires SM100-family GPUs and BF16."
-                )
-            if not attn_dp_enabled_of(cfg) or cfg.attn_dp_size != cfg.tp_size:
-                raise ValueError(
-                    "Phase-specific FlashInfer MegaMoE requires attention-DP size equal to TP size."
-                )
-            _set_flashinfer_megamoe_transport_defaults(cfg)
-
-    # Construction and checkpoint loading use prefill's canonical layout.
-    # The decode view is prepared from the same checkpoint tensors at post-load.
-    declare_resolution(
-        server_args,
-        "handle_moe_phase_backends",
-        moe_runner_backend=prefill,
-        moe_prefill_runner_backend=prefill,
-        moe_decode_runner_backend=decode,
-    )
-
-
 def _flashinfer_a2a_topology_is_supported(
     *,
     architecture: str | None,
@@ -193,10 +73,6 @@ def handle_moe_kernel_config(server_args: Any):
     # the compatibility asserts and fusion writes stay below.
 
     cfg = resolving_view(server_args)
-
-    # Resolve both phase requests before validating the construction default:
-    # the global runner may be inherited only by decode, or overridden entirely.
-    handle_moe_phase_backends(server_args)
 
     run_post_process_pass(server_args, _moe_runner_backend_quant_constraints)
 
@@ -360,9 +236,7 @@ def validate_flashinfer_megamoe_envs() -> None:
         )
 
 
-def validate_flashinfer_megamoe_model(
-    server_args: Any, phase: str | None = None
-) -> None:
+def validate_flashinfer_megamoe_model(server_args: Any) -> None:
     model_config = model_config_of(server_args)
     architectures = model_config.hf_config.architectures or []
     validated_architectures = (
@@ -393,11 +267,7 @@ def validate_flashinfer_megamoe_model(
         quantization in ("mxfp8", "modelopt_fp4")
         or (
             quantization == "nvfp4_online"
-            and (
-                envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.enabled_for(phase)
-                if phase is not None
-                else envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.enabled_for_all()
-            )
+            and envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.enabled_for_all()
         )
         or model_config.is_fp4_experts
         or model_config.nvfp4_moe_meta is not None
@@ -410,16 +280,6 @@ def validate_flashinfer_megamoe_model(
             f"quantization={quantization!r}. Standard FP8 MoE checkpoints "
             "are not supported."
         )
-
-
-def _set_flashinfer_megamoe_transport_defaults(cfg) -> None:
-    if cfg.nnodes == 1 and (
-        cfg.speculative_algorithm is None
-        or cfg.speculative_moe_a2a_backend in (None, "none")
-    ):
-        os.environ.setdefault("NVSHMEM_REMOTE_TRANSPORT", "none")
-        os.environ.setdefault("NVSHMEM_IB_ENABLE_IBGDA", "0")
-        os.environ.setdefault("NVSHMEM_DISABLE_LOCAL_ONLY_PROXY", "1")
 
 
 def handle_a2a_moe(server_args: Any):

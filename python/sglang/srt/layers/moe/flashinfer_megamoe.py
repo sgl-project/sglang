@@ -377,9 +377,7 @@ def ensure_nvfp4_moe_layer_for_flashinfer_megamoe(
             use_w4a16 = is_w4a16_enabled()
         return w4a16 if use_w4a16 else w4a4
     if use_w4a16 is None:
-        from sglang.srt.layers.moe.phase import w4a16_setting_for_layer
-
-        use_w4a16 = w4a16_setting_for_layer(layer) is True
+        use_w4a16 = envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get() is True
     return _ensure_nvfp4_moe_layer(layer, use_w4a16=use_w4a16)
 
 
@@ -516,9 +514,7 @@ def make_nvfp4_megamoe_weight_loader(
 def prepare_nvfp4_moe_weights_for_flashinfer_megamoe(
     layer: FusedMoE,
 ) -> None:
-    from sglang.srt.layers.moe.phase import w4a16_setting_for_layer
-
-    setting = w4a16_setting_for_layer(layer)
+    setting = envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()
     if isinstance(setting, str):
         _prepare_nvfp4_w4a16_variant(layer)
     _prepare_nvfp4_moe_weights(layer, use_w4a16=setting is True)
@@ -589,15 +585,7 @@ def _prepare_nvfp4_moe_weights(layer: FusedMoE, *, use_w4a16: bool) -> None:
             "FlashInfer NVFP4 MegaMOE requires hidden_size to be a multiple "
             f"of {hidden_alignment}, got {layer.hidden_size}."
         )
-    per_token_phase = getattr(layer.quant_config, "per_token_activation_phase", None)
-    own_phase = getattr(layer, "_moe_forward_phase", None)
-    if (
-        layer.quant_config.use_per_token_activation
-        and (
-            per_token_phase is None or own_phase is None or per_token_phase == own_phase
-        )
-        and not use_w4a16
-    ):
+    if layer.quant_config.use_per_token_activation and not use_w4a16:
         raise ValueError(
             "FlashInfer NVFP4 MegaMOE does not support per-token activation "
             "scaling. Use flashinfer_trtllm/flashinfer_trtllm_routed for "
@@ -787,39 +775,37 @@ def warmup_all_flashinfer_megamoe_layers(model: torch.nn.Module) -> None:
     MegaMOE hits the same gap.
     """
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-    from sglang.srt.layers.moe.phase import w4a16_setting_for_layer
     from sglang.srt.layers.quantization.modelopt_quant import (
         ModelOptNvFp4FusedMoEMethod,
     )
 
     n_built = 0
-    for owner in model.modules():
-        if not isinstance(owner, FusedMoE):
+    for module in model.modules():
+        if not isinstance(module, FusedMoE) or not hasattr(
+            module, "_flashinfer_megamoe_layer"
+        ):
             continue
-        # Secondary runner views are deliberately outside model.modules().
-        for module in (owner, getattr(owner, "_decode_moe_view", None)):
-            if module is None or not hasattr(module, "_flashinfer_megamoe_layer"):
-                continue
-            variant = getattr(module, "_flashinfer_megamoe_w4a16", None)
-            if module._flashinfer_megamoe_layer is not None and (
-                variant is None or variant._flashinfer_megamoe_layer is not None
-            ):
-                continue
-            if isinstance(module.quant_method, ModelOptNvFp4FusedMoEMethod):
-                ensure_nvfp4_moe_layer_for_flashinfer_megamoe(
-                    module, use_w4a16=w4a16_setting_for_layer(module) is True
-                )
-                n_built += 1
-            else:
-                logger.warning(
-                    "warmup_all_flashinfer_megamoe_layers: layer[%s] uses "
-                    "quant_method=%s, which this eager pre-capture warmup does "
-                    "not know how to build. If capture then fails with "
-                    "'must be initialized before CUDA graph capture', add a "
-                    "branch here for that quant method.",
-                    getattr(module, "layer_id", "?"),
-                    type(module.quant_method).__name__,
-                )
+        variant = getattr(module, "_flashinfer_megamoe_w4a16", None)
+        if module._flashinfer_megamoe_layer is not None and (
+            variant is None or variant._flashinfer_megamoe_layer is not None
+        ):
+            continue
+        if isinstance(module.quant_method, ModelOptNvFp4FusedMoEMethod):
+            ensure_nvfp4_moe_layer_for_flashinfer_megamoe(
+                module,
+                use_w4a16=envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get() is True,
+            )
+            n_built += 1
+        else:
+            logger.warning(
+                "warmup_all_flashinfer_megamoe_layers: layer[%s] uses "
+                "quant_method=%s, which this eager pre-capture warmup does "
+                "not know how to build. If capture then fails with "
+                "'must be initialized before CUDA graph capture', add a "
+                "branch here for that quant method.",
+                getattr(module, "layer_id", "?"),
+                type(module.quant_method).__name__,
+            )
 
     if n_built:
         logger.info(

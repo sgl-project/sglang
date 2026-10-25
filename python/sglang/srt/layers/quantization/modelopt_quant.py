@@ -2725,10 +2725,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Transform packed FP4 MoE weights and scales for the selected backend."""
-        from sglang.srt.layers.moe.phase_backend import prepare_phase_moe_weights
-
-        if prepare_phase_moe_weights(self, layer):
-            return
         if getattr(layer, "inference_moe_w13_interleaved", False) and not getattr(
             layer, "_w13_deinterleaved", False
         ):
@@ -2827,23 +2823,13 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             w13_input_scale = layer.w13_input_scale.max(dim=-1).values.to(torch.float32)
             w2_input_scale = layer.w2_input_scale
 
-        from sglang.srt.layers.moe.phase import (
-            use_nvfp4_per_token_activation,
-            w4a16_setting_for_layer,
-        )
-
         use_w4a16 = (
             self._is_cutedsl_v2_standard or moe_runner_backend.is_flashinfer_megamoe()
-        ) and w4a16_setting_for_layer(layer) is True
+        ) and envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get() is True
         use_per_token_all = (
             self.quant_config.use_per_token_activation
             and getattr(self.quant_config, "per_token_activation_phase", None) is None
         )
-        own_phase = getattr(layer, "_moe_forward_phase", None)
-        if own_phase is not None:
-            use_per_token_all = use_nvfp4_per_token_activation(
-                self.quant_config, own_phase
-            )
         if use_per_token_all or use_w4a16:
             # FlashInfer computes activation scales dynamically per token, so
             # the static checkpoint activation scale is intentionally neutral.
@@ -2933,7 +2919,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             self.enable_flashinfer_trtllm_moe
             and self.quant_config.use_per_token_activation
             and not use_per_token_all
-            and own_phase is None
         ):
             from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
                 _compute_g1_scale_c,

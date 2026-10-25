@@ -344,7 +344,6 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
     from sglang.srt.layers.moe.phase import (
         is_w4a16_enabled,
         use_nvfp4_per_token_activation,
-        w4a16_setting_for_layer,
     )
 
     quant_mode = "w4a16" if is_w4a16_enabled() else "w4a4"
@@ -355,17 +354,14 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
     states = getattr(layer, "_cutedsl_states", None)
     if states is None:
         states = layer._cutedsl_states = {}
-        setting = w4a16_setting_for_layer(layer)
-        phases = (getattr(layer, "_moe_forward_phase", None),)
-        if phases == (None,):
-            phases = ("prefill", "decode")
+        setting = envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()
         modes = dict.fromkeys(
             (
                 "w4a16" if setting is True or setting == phase else "w4a4",
                 not (setting is True or setting == phase)
                 and use_nvfp4_per_token_activation(layer.quant_config, phase),
             )
-            for phase in phases
+            for phase in ("prefill", "decode")
         )
         # Build both workspaces before either phase can be graph-captured.
         for mode, per_token in modes:

@@ -401,11 +401,11 @@ class BaseRunner(ABC):
         mr = self.model_runner
 
         def forward_fn():
-            # A decode-shaped dummy can tune both MoE implementations without
+            # A decode-shaped dummy can tune both activation-precision paths without
             # allocating a second buffer set or forcing speculative attention
             # through an unsupported EXTEND dummy. Each phase must run before
             # capture to prepare its precision-specific wrapper and tactics.
-            for phase in flashinfer_autotune_moe_phases(mr):
+            for phase in flashinfer_autotune_moe_phases():
                 canary_run_ctx = (
                     c.with_active_single_forward_manager(0)
                     if (c := mr.canary_manager) is not None

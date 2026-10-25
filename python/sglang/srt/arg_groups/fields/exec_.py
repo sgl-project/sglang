@@ -855,26 +855,6 @@ class ExecMoe(msgspec.Struct):
             resolvable=True,
         ),
     ] = "auto"
-    moe_prefill_runner_backend: A[
-        Optional[str],
-        Arg(
-            help="Override the MoE runner for prefill (including mixed batches). "
-            "Defaults to --moe-runner-backend. Different runners currently "
-            "support NVFP4 FlashInfer TRTLLM/CuteDSL, plus MegaMoE decode.",
-            choices=MOE_RUNNER_BACKEND_CHOICES,
-            resolvable=True,
-        ),
-    ] = None
-    moe_decode_runner_backend: A[
-        Optional[str],
-        Arg(
-            help="Override the target model's MoE runner for decode and target "
-            "verification. Defaults to --moe-runner-backend. Draft models keep "
-            "their --speculative-moe-runner-backend setting.",
-            choices=MOE_RUNNER_BACKEND_CHOICES,
-            resolvable=True,
-        ),
-    ] = None
     flashinfer_mxfp4_moe_precision: A[
         Literal["default", "bf16", "fp8"],
         "Choose the computation precision of flashinfer mxfp4 moe. "

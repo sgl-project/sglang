@@ -786,13 +786,6 @@ class TopK(BaseFusedOp):
         self.topk_config.fused_gate_packed_ids &= (
             runner_backend is not None and runner_backend.is_flashinfer_mxfp4()
         )
-        from sglang.srt.layers.moe.phase_backend import has_phase_moe_backends
-
-        if not self.is_draft and has_phase_moe_backends():
-            # Both NVFP4 runners consume materialized routing. A logits-only
-            # TRTLLM bypass cannot be passed to the decode CuteDSL runner.
-            self.topk_config.output_format = TopKOutputFormat.STANDARD
-            return
         if self.topk_config.output_format is not None:
             return
         if runner_backend is not None and runner_backend.is_triton_kernels():

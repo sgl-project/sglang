@@ -915,6 +915,7 @@ def _deepseek_v4_kv_cache_dtype(view: Any) -> dict:
 
 @register_post_process
 def _sparse_head_overlap_disable(view: Any) -> dict:
+
     if envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set():
         logger.warning(
             "Overlap scheduler is disabled when using sparse head for embedding model."
@@ -1449,11 +1450,9 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
     """Resolve MoE runner backends from quantization."""
     moe_runner_backend = view.moe_runner_backend
     if view.quantization == "nvfp4_online":
-        phase = getattr(view, "_moe_forward_phase", None)
-        use_megamoe_w4a16 = view.moe_a2a_backend == "flashinfer_megamoe" and (
-            envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.enabled_for(phase)
-            if phase is not None
-            else envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.enabled_for_all()
+        use_megamoe_w4a16 = (
+            view.moe_a2a_backend == "flashinfer_megamoe"
+            and envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.enabled_for_all()
         )
         if not get_platform().is_sm100:
             raise ValueError(
@@ -1595,6 +1594,7 @@ _A2A_EP_SPANNING_BACKENDS = frozenset(
 
 @register_post_process
 def _a2a_backend_overrides(view: Any) -> dict:
+
     moe_a2a_backend = view.moe_a2a_backend
     if view.enable_waterfill and moe_a2a_backend not in ("deepep", "megamoe"):
         logger.warning(
