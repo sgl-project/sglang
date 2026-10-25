@@ -491,6 +491,39 @@ def _ple_track_targets(
     return dst, aligned[:rows].clamp(min=0).minimum(batch.lengths)
 
 
+# The PLE short conv is depthwise and dilated. PyTorch does not send dilated grouped
+# convs to MIOpen, so ROCm runs PyTorch's native depthwise kernel, which rejects
+# inputs and outputs with 2**31 - 1 or more elements.
+_SHORT_CONV_MAX_NUMEL = torch.iinfo(torch.int32).max
+
+
+def _short_conv1d(conv_input: torch.Tensor, weight: torch.Tensor, dilation: int):
+    """Depthwise conv of [rows, channels, halo + width] into [rows, channels, width].
+
+    A prefill batch pads every request to the longest one, so the input can exceed
+    the element limit; rows and output columns are independent, so it is split.
+    """
+    rows, channels, in_width = conv_input.shape
+
+    def conv(x: torch.Tensor) -> torch.Tensor:
+        return F.conv1d(x, weight, bias=None, dilation=dilation, groups=channels)
+
+    if conv_input.numel() < _SHORT_CONV_MAX_NUMEL:
+        return conv(conv_input)
+    halo = (weight.shape[-1] - 1) * dilation
+    width = in_width - halo
+    limit = _SHORT_CONV_MAX_NUMEL - 1
+    cols = min(width, limit // channels - halo)
+    rows_per_call = limit // (channels * (cols + halo))
+    output = conv_input.new_empty((rows, channels, width))
+    for row in range(0, rows, rows_per_call):
+        for col in range(0, width, cols):
+            output[row : row + rows_per_call, :, col : col + cols] = conv(
+                conv_input[row : row + rows_per_call, :, col : col + cols + halo]
+            )
+    return output
+
+
 def _pad_token_rows(x: torch.Tensor, total_tokens: int) -> torch.Tensor:
     if x.shape[0] == total_tokens:
         return x
@@ -1168,12 +1201,10 @@ class Qwen4ExpPLELayer(nn.Module):
         )
         padded_seq[batch.req_indices, batch.token_offsets] = x
         conv_input = torch.cat([state, padded_seq.transpose(1, 2)], dim=-1)
-        conv_output = F.conv1d(
+        conv_output = _short_conv1d(
             conv_input,
             self.conv1d.weight.to(dtype=x.dtype),
-            bias=None,
-            dilation=self.short_conv_dilation,
-            groups=self.conv_channels,
+            self.short_conv_dilation,
         ).transpose(1, 2)
 
         if batch.mode.is_target_verify():
