@@ -308,7 +308,7 @@ class TestFusedSharedExpertScaling(CustomTestCase):
                             routed,
                             None,
                             routed_scaling_factor=rsf,
-                            fused_in_topk=topk_module.is_routed_scaling_factor_fused_in_topk(
+                            routed_scale_applied=topk_module.is_routed_scaling_factor_fused_in_topk(
                                 config
                             ),
                         )
@@ -389,7 +389,7 @@ class TestFusedSharedExpertScaling(CustomTestCase):
                         combined,
                         None,
                         routed_scaling_factor=self.ROUTED_SCALING_FACTOR,
-                        fused_in_topk=moe.routed_scaling_factor_fused_in_topk,
+                        routed_scale_applied=moe.routed_scaling_factor_fused_in_topk,
                     )
                     torch.testing.assert_close(
                         final,
@@ -559,6 +559,306 @@ class TestFusedSharedExpertScaling(CustomTestCase):
 
         self.assertEqual(output.topk_ids.shape, (0, 8))
         self.assertEqual(output.topk_weights.shape, (0, 8))
+
+
+class TestDeepseekMoeEpilogue(CustomTestCase):
+    def _moe(self, *, replicated=False, reduce=False, inplace=False):
+        def experts(hidden_states, *args, **kwargs):
+            return hidden_states.mul_(2.5) if inplace else hidden_states * 2.5
+
+        experts.quant_method = None
+        experts.moe_runner_config = SimpleNamespace(inplace=inplace)
+        experts.should_fuse_routed_scaling_factor_in_topk = False
+
+        def gate(hidden_states, *args, **kwargs):
+            return hidden_states
+
+        gate.e_score_correction_bias_vl = None
+        moe = DeepseekV2MoE.__new__(DeepseekV2MoE)
+        torch.nn.Module.__init__(moe)
+        vars(moe).update(
+            experts=experts,
+            gate=gate,
+            topk=lambda *args, **kwargs: SimpleNamespace(
+                format=topk_module.TopKOutputFormat.STANDARD
+            ),
+            num_fused_shared_experts=0,
+            routed_scaling_factor=2.5,
+            routed_scaling_factor_fused_in_topk=True,
+            _shared_expert_tp1=replicated,
+            _fuse_shared_experts_inside_sbo=False,
+            _enable_a2a_moe=False,
+            reduce_results=reduce,
+            is_nextn=False,
+            is_hash=False,
+            layer_id=0,
+            alt_stream=SimpleNamespace(wait_stream=lambda stream: None),
+            _maybe_quant_moe_input_once=lambda x: None,
+            _should_quant_routed_input_mxfp8=lambda x: False,
+            _forward_shared_experts=lambda x, *args, **kwargs: x * 3,
+            _can_dual_stream_graph=lambda x: False,
+        )
+        return moe
+
+    def setUp(self):
+        super().setUp()
+
+        from contextlib import ExitStack
+
+        from sglang.srt.layers.moe import utils
+
+        self.stack = ExitStack()
+        self.addCleanup(self.stack.close)
+        for name, value in (("_is_cuda", True), ("_is_hip", False)):
+            self.stack.enter_context(patch.object(deepseek_v2_module, name, value))
+        self.stack.enter_context(
+            patch(
+                "torch.cuda.current_stream",
+                return_value=SimpleNamespace(wait_stream=lambda s: None),
+            )
+        )
+        self.stack.enter_context(
+            patch("torch.cuda.stream", side_effect=lambda s: nullcontext())
+        )
+        self.stack.enter_context(
+            get_flags().moe.override(a2a_backend=MoeA2ABackend.NONE)
+        )
+        self.stack.enter_context(
+            get_parallel().override(
+                tp_size=2, tp_rank=0, moe_ep_size=1, moe_tp_size=2, dwdp_size=1
+            )
+        )
+        self.stack.enter_context(
+            patch.object(
+                utils,
+                "should_use_flashinfer_cutlass_moe_fp4_allgather",
+                return_value=False,
+            )
+        )
+        self.stack.enter_context(
+            patch(
+                "sglang.srt.layers.moe.mega_moe.should_use_mega_moe", return_value=False
+            )
+        )
+
+    def test_skip_shared_experts_survives_graph_and_capture_dispatch(self):
+        """A shared result computed before gather must not be added again by capture."""
+        x = torch.arange(1, 7, dtype=torch.float32).reshape(2, 3)
+        for graph in (False, True):
+            with self.subTest(graph=graph):
+                moe = self._moe()
+                moe._can_dual_stream_graph = lambda x: graph
+                with (
+                    patch.object(
+                        deepseek_v2_module, "get_is_capture_mode", return_value=True
+                    ),
+                    patch.object(
+                        deepseek_v2_module,
+                        "is_in_breakable_cuda_graph",
+                        return_value=False,
+                    ),
+                    patch.object(
+                        deepseek_v2_module,
+                        "dsv2_flashinfer_moe_dual_stream_graph",
+                        side_effect=lambda x, *args: moe.forward_normal_dual_stream(x),
+                    ),
+                ):
+                    actual = moe(x, skip_shared_experts=True)
+                torch.testing.assert_close(actual, x * 2.5)
+
+    def test_replicated_shared_is_counted_once_with_owned_or_deferred_sum(self):
+        """Summing two TP partials must count the replicated shared output once."""
+        x = torch.arange(1, 7, dtype=torch.float32).reshape(2, 3)
+        for dual in (False, True):
+            for reduce in (False, True):
+                with self.subTest(dual=dual, reduce=reduce):
+                    outputs = []
+                    for rank in (0, 1):
+                        moe = self._moe(replicated=True, reduce=reduce)
+                        run = (
+                            moe.forward_normal_dual_stream
+                            if dual
+                            else moe.forward_normal
+                        )
+                        with (
+                            get_parallel().override(tp_rank=rank),
+                            patch.object(
+                                deepseek_v2_module,
+                                "post_experts_all_reduce",
+                                side_effect=lambda t: t * 2,
+                            ),
+                        ):
+                            outputs.append(run(x.clone()))
+                    expected = x * (2 * 2.5 + 3)
+                    if reduce:
+                        for output in outputs:
+                            torch.testing.assert_close(output, expected)
+                    else:
+                        torch.testing.assert_close(sum(outputs), expected)
+
+    def test_raw_pieces_bypass_tensor_only_graph_op(self):
+        """A request for deferred pieces must not reduce or lose its shared operand."""
+        x = torch.ones(2, 3)
+        moe = self._moe(replicated=True)
+        moe._can_dual_stream_graph = lambda x: True
+        with (
+            patch.object(deepseek_v2_module, "get_is_capture_mode", return_value=False),
+            patch.object(
+                deepseek_v2_module,
+                "dsv2_flashinfer_moe_dual_stream_graph",
+                side_effect=lambda x, *args: moe.forward_normal_dual_stream(x),
+            ),
+        ):
+            pieces = moe(x, return_moe_output=True)
+        self.assertIsInstance(pieces, deepseek_v2_module.MoEOutput)
+        torch.testing.assert_close(pieces.get_merged(), x * 2.5)
+        torch.testing.assert_close(pieces.shared, x * 3)
+
+    def test_inplace_runner_reads_shared_before_overwriting_input(self):
+        """Capture must not let an in-place routed write change the shared input."""
+        x = torch.arange(1, 7, dtype=torch.float32).reshape(2, 3)
+        moe = self._moe(inplace=True)
+        actual = moe.forward_normal_dual_stream(x.clone())
+        torch.testing.assert_close(actual, x * 5.5)
+
+    def test_deepep_skip_leaves_complete_routed_output_unreduced(self):
+        """An A2A combine already returns complete rows; skipping shared keeps them."""
+        x = torch.ones(2, 3)
+        moe = self._moe(reduce=True)
+        moe._enable_a2a_moe = True
+        moe.alt_stream = None
+        with patch.object(
+            deepseek_v2_module, "post_experts_all_reduce", side_effect=lambda t: t * 2
+        ):
+            actual = moe(x, forward_batch=SimpleNamespace(), skip_shared_experts=True)
+        torch.testing.assert_close(actual, x * 2.5)
+
+    def test_amx_skip_does_not_enter_fused_shared_kernel(self):
+        """The AMX shared-add kernel cannot honor a request for routed output alone."""
+        x = torch.ones(2, 3)
+        moe = self._moe()
+        moe.shared_experts = SimpleNamespace(gate_up_proj=object())
+        # The fused operator's numerical contract; native AMX needs its own hardware.
+        moe.forward_cpu = lambda hidden: hidden * 5.5
+        with patch.object(
+            deepseek_v2_module, "use_intel_amx_backend", return_value=True
+        ):
+            actual = moe.forward_normal(x, skip_shared_experts=True)
+        torch.testing.assert_close(actual, x * 2.5)
+
+    def test_mega_combine_keeps_scale_and_honors_skip(self):
+        """A complete MegaMoE output must neither be scaled nor summed a second time."""
+        from sglang.srt.layers.moe import mega_moe, mega_moe_flydsl
+
+        x = torch.ones(2, 3)
+        for flydsl in (False, True):
+            for skip in (False, True):
+                with self.subTest(flydsl=flydsl, skip=skip):
+                    moe = self._moe(reduce=True)
+                    moe.alt_stream = None
+                    moe.mega_shared_l1_weights = None
+                    backend = mega_moe_flydsl if flydsl else mega_moe
+                    with (
+                        patch.object(
+                            mega_moe, "should_use_mega_moe", return_value=True
+                        ),
+                        patch.object(
+                            mega_moe, "_use_amd_flydsl_mega_moe", return_value=flydsl
+                        ),
+                        patch.object(
+                            backend,
+                            "_run_mega_routed",
+                            side_effect=lambda *args, **kwargs: x * 2.5,
+                        ),
+                        patch.object(
+                            deepseek_v2_module,
+                            "post_experts_all_reduce",
+                            side_effect=lambda t: t * 2,
+                        ),
+                    ):
+                        output = moe(x, skip_shared_experts=skip)
+                    torch.testing.assert_close(output, x * (2.5 if skip else 5.5))
+
+    def test_amx_fused_output_does_not_repeat_scale_or_shared_add(self):
+        """The fused CPU result only owes its TP reduction."""
+        x = torch.ones(2, 3)
+        moe = self._moe(reduce=True)
+        moe.experts = lambda hidden_states, **kwargs: hidden_states.clone()
+        projection = SimpleNamespace(weight=torch.ones(1))
+        moe.shared_experts = SimpleNamespace(
+            gate_up_proj=projection, down_proj=projection
+        )
+        moe.shared_experts_is_int8 = moe.shared_experts_is_fp8 = False
+        with (
+            patch.object(deepseek_v2_module, "_is_cuda", False),
+            patch.object(
+                deepseek_v2_module, "use_intel_amx_backend", return_value=True
+            ),
+            patch.object(
+                torch.ops.sgl_kernel,
+                "shared_expert_cpu",
+                create=True,
+                side_effect=lambda x, w1, w2, routed, scale, *args: (
+                    routed * scale + x * 3
+                ),
+            ),
+            patch.object(
+                deepseek_v2_module,
+                "post_experts_all_reduce",
+                side_effect=lambda t: t * 2,
+            ),
+        ):
+            output = moe.forward_cpu(x)
+        torch.testing.assert_close(output, x * 11)
+
+    def test_deferred_finalize_hands_sum_to_boundary_once(self):
+        """Returning pieces and returning a boundary finalize have distinct owners."""
+        from sglang.srt.layers.layer_boundary.fusions.moe_finalize import (
+            MoeDeferredFinalize,
+        )
+        from sglang.srt.layers.moe.moe_runner import flashinfer_trtllm
+        from sglang.srt.runtime_context import get_forward
+
+        x = torch.ones(2, 3)
+        for pieces_requested in (False, True):
+            with self.subTest(pieces_requested=pieces_requested):
+                moe = self._moe()
+                handle = flashinfer_trtllm.FlashInferTrtllmDeferredFinalizeOutput(
+                    gemm2_out=x * 2.5,
+                    expert_weights=torch.ones(2, 1),
+                    expanded_idx_to_permuted_idx=torch.arange(
+                        2, dtype=torch.int32
+                    ).reshape(2, 1),
+                    top_k=1,
+                )
+                moe.experts.supports_deferred_finalize = True
+                moe.experts.forward_deferred_finalize = lambda *args, **kwargs: handle
+                moe._deferred_finalize_max_tokens = 0
+                moe.topk = lambda *args, **kwargs: SimpleNamespace(
+                    format=topk_module.TopKOutputFormat.BYPASSED
+                )
+                with (
+                    get_forward().scoped(defer_moe_finalize=True),
+                    patch.object(
+                        flashinfer_trtllm,
+                        "finalize_flashinfer_trtllm_deferred_output",
+                        side_effect=lambda output, shared: output.gemm2_out + shared,
+                    ),
+                    patch.object(
+                        deepseek_v2_module,
+                        "sum_post_experts_output",
+                        side_effect=lambda t: t * 2,
+                    ),
+                ):
+                    output = moe.forward_normal_dual_stream(
+                        x, leave_output_sum=pieces_requested
+                    )
+                    if pieces_requested:
+                        self.assertIsInstance(output, deepseek_v2_module.MoEOutput)
+                        torch.testing.assert_close(output.get_merged(), x * 5.5)
+                    else:
+                        self.assertIsInstance(output, MoeDeferredFinalize)
+                        torch.testing.assert_close(output.complete(), x * 11)
 
 
 if __name__ == "__main__":

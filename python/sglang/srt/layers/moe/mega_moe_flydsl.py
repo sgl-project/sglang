@@ -255,25 +255,36 @@ def forward_mega_moe(
     hidden_states: torch.Tensor,
     forward_batch: ForwardBatch | None = None,
     input_ids_global: torch.Tensor | None = None,
+    *,
+    skip_shared_experts: bool = False,
 ) -> torch.Tensor:
+    from sglang.srt.models.deepseek_v2 import _scale_routed_and_add_shared
+
     num_tokens = hidden_states.shape[0]
     overlap = _should_overlap_shared_and_routed(moe, num_tokens)
     if overlap:
         current_stream = torch.cuda.current_stream()
         moe.alt_stream.wait_stream(current_stream)
-        shared_output = moe._forward_shared_experts(hidden_states)
+        shared_output = (
+            None if skip_shared_experts else moe._forward_shared_experts(hidden_states)
+        )
         stream_context = torch.cuda.stream(moe.alt_stream)
     else:
-        shared_output = moe._forward_shared_experts(hidden_states)
+        shared_output = (
+            None if skip_shared_experts else moe._forward_shared_experts(hidden_states)
+        )
         stream_context = nullcontext()
 
     with stream_context:
         output = _run_mega_routed(moe, hidden_states, forward_batch, input_ids_global)
     if overlap:
         current_stream.wait_stream(moe.alt_stream)
-    if shared_output is not None:
-        output.add_(shared_output)
-    return output
+    return _scale_routed_and_add_shared(
+        output,
+        shared_output,
+        routed_scaling_factor=moe.routed_scaling_factor,
+        routed_scale_applied=True,
+    )
 
 
 def _should_overlap_shared_and_routed(

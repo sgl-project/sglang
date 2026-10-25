@@ -210,14 +210,22 @@ def forward_mega_moe(
     hidden_states: torch.Tensor,
     forward_batch: Optional[ForwardBatch] = None,
     input_ids_global: Optional[torch.Tensor] = None,
+    *,
+    skip_shared_experts: bool = False,
 ) -> torch.Tensor:
+    from sglang.srt.models.deepseek_v2 import _scale_routed_and_add_shared
+
     if _use_amd_flydsl_mega_moe():
         from sglang.srt.layers.moe.mega_moe_flydsl import (
             forward_mega_moe as forward_flydsl_mega_moe,
         )
 
         return forward_flydsl_mega_moe(
-            moe, hidden_states, forward_batch, input_ids_global
+            moe,
+            hidden_states,
+            forward_batch,
+            input_ids_global,
+            skip_shared_experts=skip_shared_experts,
         )
 
     num_tokens = hidden_states.shape[0]
@@ -236,22 +244,34 @@ def forward_mega_moe(
     else:
         mega_stream_ctx = nullcontext()
 
-    shared_output = None if fused_shared else moe._forward_shared_experts(hidden_states)
+    shared_output = (
+        None
+        if fused_shared or skip_shared_experts
+        else moe._forward_shared_experts(hidden_states)
+    )
 
     with mega_stream_ctx:
         y = _run_mega_routed(
-            moe, hidden_states, forward_batch, input_ids_global, num_tokens
+            moe,
+            hidden_states,
+            forward_batch,
+            input_ids_global,
+            num_tokens,
+            skip_shared_experts=skip_shared_experts,
         )
 
     if fork_mega_moe:
         current_stream.wait_stream(moe.alt_stream)
 
-    if shared_output is not None:
-        y.add_(shared_output)
-    return y
+    return _scale_routed_and_add_shared(
+        y,
+        shared_output,
+        routed_scaling_factor=moe.routed_scaling_factor,
+        routed_scale_applied=True,
+    )
 
 
-def _mega_moe_buffer(moe: DeepseekV2MoE):
+def _mega_moe_buffer(moe: DeepseekV2MoE, *, skip_shared_experts: bool = False):
     from sglang.srt.runtime_context import get_parallel
 
     return _get_mega_moe_symm_buffer(
@@ -264,7 +284,9 @@ def _mega_moe_buffer(moe: DeepseekV2MoE):
         hidden=moe.config.hidden_size,
         intermediate_hidden=moe.config.moe_intermediate_size,
         num_shared_experts=(
-            0 if moe.mega_shared_l1_weights is None else moe.n_shared_experts
+            0
+            if skip_shared_experts or moe.mega_shared_l1_weights is None
+            else moe.n_shared_experts
         ),
         mma_type=_mega_moe_mma_type(moe.experts),
     )
@@ -338,6 +360,8 @@ def _run_mega_routed(
     forward_batch: Optional[ForwardBatch],
     input_ids_global: Optional[torch.Tensor],
     num_tokens: int,
+    *,
+    skip_shared_experts: bool = False,
 ) -> torch.Tensor:
     hidden_size = moe.config.hidden_size
 
@@ -347,7 +371,7 @@ def _run_mega_routed(
 
         # Only the fp8xfp4 pre-dispatch can skip its top-k copy (kCopyTopk).
         buf = (
-            _mega_moe_buffer(moe)
+            _mega_moe_buffer(moe, skip_shared_experts=skip_shared_experts)
             if _mega_moe_mma_type(moe.experts) == "fp8xfp4"
             else None
         )
@@ -402,10 +426,12 @@ def _run_mega_routed(
         activation_clamp=moe.experts.moe_runner_config.swiglu_limit,
         routed_scaling_factor=routed_scaling_factor,
         num_shared_experts=(
-            0 if moe.mega_shared_l1_weights is None else moe.n_shared_experts
+            0
+            if skip_shared_experts or moe.mega_shared_l1_weights is None
+            else moe.n_shared_experts
         ),
-        shared_l1_weights=moe.mega_shared_l1_weights,
-        shared_l2_weights=moe.mega_shared_l2_weights,
+        shared_l1_weights=None if skip_shared_experts else moe.mega_shared_l1_weights,
+        shared_l2_weights=None if skip_shared_experts else moe.mega_shared_l2_weights,
         routing_in_buffer=routing is not None and routing.in_buffer,
     )
 

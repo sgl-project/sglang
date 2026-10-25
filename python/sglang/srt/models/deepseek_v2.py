@@ -636,14 +636,14 @@ def _scale_routed_and_add_shared(
     shared: Optional[torch.Tensor],
     *,
     routed_scaling_factor: float,
-    fused_in_topk: bool,
+    routed_scale_applied: bool,
 ) -> torch.Tensor:
     """Apply any outstanding routed scale before adding the shared output."""
     if shared is not None:
-        if fused_in_topk:
+        if routed_scale_applied:
             return shared.add_(routed)
         return shared.add_(routed, alpha=routed_scaling_factor)
-    if not fused_in_topk:
+    if not routed_scale_applied:
         routed *= routed_scaling_factor
     return routed
 
@@ -1059,19 +1059,27 @@ class DeepseekV2MoE(nn.Module):
         a boundary that owns reduction and the replicated shared add."""
         from sglang.srt.layers.moe.mega_moe import forward_mega_moe, should_use_mega_moe
 
+        if skip_shared_experts and self.num_fused_shared_experts:
+            raise ValueError("Cannot skip shared experts fused into routed slots")
+
         if should_use_mega_moe(self, hidden_states):
             return forward_mega_moe(
                 self,
                 hidden_states,
                 forward_batch,
                 input_ids_global=input_ids_global,
+                skip_shared_experts=skip_shared_experts,
             )
 
         use_vision_topk = self.gate.e_score_correction_bias_vl is not None
         if use_vision_topk and _is_hip:
             use_vision_topk = _hip_moe.batch_has_images(forward_batch)
         if not self._enable_a2a_moe:
-            if self._can_dual_stream_graph(hidden_states):
+            if (
+                not skip_shared_experts
+                and (not return_moe_output or leave_output_sum)
+                and self._can_dual_stream_graph(hidden_states)
+            ):
                 fwd = get_forward()
                 if leave_output_sum:
                     routed, shared = dsv4_flashinfer_moe_dual_stream_outputs(
@@ -1098,6 +1106,8 @@ class DeepseekV2MoE(nn.Module):
                 and hidden_states.shape[0] > 0
                 and get_is_capture_mode()
                 and not is_in_breakable_cuda_graph()
+                and not skip_shared_experts
+                and not self.experts.moe_runner_config.inplace
             ):
                 return self.forward_normal_dual_stream(
                     hidden_states,
@@ -1121,7 +1131,10 @@ class DeepseekV2MoE(nn.Module):
                 )
         else:
             return self.forward_deepep(
-                hidden_states, forward_batch, input_ids_global=input_ids_global
+                hidden_states,
+                forward_batch,
+                input_ids_global=input_ids_global,
+                skip_shared_experts=skip_shared_experts,
             )
 
     def forward_normal_dual_stream(
@@ -1134,6 +1147,16 @@ class DeepseekV2MoE(nn.Module):
         return_moe_output: bool = False,
         leave_output_sum: bool = False,
     ) -> Union[torch.Tensor, MoEOutput]:
+        if self.experts.moe_runner_config.inplace:
+            return self.forward_normal(
+                hidden_states,
+                gemm_output_zero_allocator,
+                input_ids,
+                input_ids_global=input_ids_global,
+                use_vision_topk=use_vision_topk,
+                return_moe_output=return_moe_output,
+                leave_output_sum=leave_output_sum,
+            )
         # Note(kpham-sgl): issue order satisfies 3 constraints:
         # - no stream explosion: main (routed) issued before alt block -> capture reuses 1 alt stream;
         # - PDL overlap: routed is the last main-stream kernel (fuses w/ residual add);
@@ -1229,13 +1252,8 @@ class DeepseekV2MoE(nn.Module):
             )
         else:
             final_hidden_states = self.experts(hidden_states, topk_output)
-        if (
-            not _is_cuda
-            and not _is_musa
-            and not (_use_aiter and self.routed_scaling_factor_fused_in_topk)
-            or isinstance(self.experts.quant_method, KTEPWrapperMethod)
-        ):
-            final_hidden_states *= self.routed_scaling_factor
+
+        final_hidden_states = self._scale_tp_routed_output(final_hidden_states)
 
         # Shared expert on alt stream, issued AFTER the main (routed) branch. See note above.
         # Only the quant-once fp8 pair is shared with it; the routed MXFP8 pre-quant is not.
@@ -1249,52 +1267,14 @@ class DeepseekV2MoE(nn.Module):
         # The routed-input pre-quant was already joined inside the routed MoE apply.
         current_stream.wait_stream(self.alt_stream)
 
-        if deferred_finalize and get_forward().defer_moe_finalize:
-            # deferred_finalize excludes _shared_expert_tp1, so the shared add folds in.
-            assert shared_output is not None
-            from sglang.srt.layers.layer_boundary.fusions.moe_finalize import (
-                MoeDeferredFinalize,
-            )
-
-            return MoeDeferredFinalize.from_flashinfer(
-                final_hidden_states,
-                gated_shared_output=shared_output,
-                m=hidden_states.shape[0],
-                reduce=sum_post_experts_output,
-            )
-
-        if return_moe_output or leave_output_sum:
-            return MoEOutput(
-                routed=final_hidden_states,
-                shared=shared_output,
-                experts=self.experts,
-                routed_scaling_factor=self.routed_scaling_factor,
-                shared_is_replicated=self._shared_expert_tp1,
-            )
-
-        if deferred_finalize:
-            from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
-                finalize_flashinfer_trtllm_deferred_output,
-            )
-
-            final_hidden_states = finalize_flashinfer_trtllm_deferred_output(
-                final_hidden_states,
-                shared_output,
-            )
-        else:
-            final_hidden_states = maybe_fuse_routed_scale_and_shared_add(
-                self.experts,
-                final_hidden_states,
-                None if self._shared_expert_tp1 else shared_output,
-                self.routed_scaling_factor,
-            )
-        if self.reduce_results:
-            final_hidden_states = post_experts_all_reduce(final_hidden_states)
-        # TP1 shared experts are replicated: add them after this block's
-        # all-reduce, or on TP rank 0 only when the stage boundary sums.
-        if self._shared_expert_tp1 and self._adds_replicated_output():
-            final_hidden_states += shared_output
-        return final_hidden_states
+        return self._finish_tp_output(
+            final_hidden_states,
+            shared_output,
+            num_tokens=hidden_states.shape[0],
+            deferred_finalize=deferred_finalize,
+            return_moe_output=return_moe_output,
+            leave_output_sum=leave_output_sum,
+        )
 
     def forward_normal(
         self,
@@ -1307,8 +1287,14 @@ class DeepseekV2MoE(nn.Module):
         return_moe_output: bool = False,
         leave_output_sum: bool = False,
     ) -> Union[torch.Tensor, MoEOutput]:
-        if hasattr(self, "shared_experts") and use_intel_amx_backend(
-            self.shared_experts.gate_up_proj
+        if (
+            hasattr(self, "shared_experts")
+            and use_intel_amx_backend(self.shared_experts.gate_up_proj)
+            and not skip_shared_experts
+            and not return_moe_output
+            and not leave_output_sum
+            and not self._shared_expert_tp1
+            and not self.experts.moe_runner_config.inplace
         ):
             return self.forward_cpu(hidden_states)
         defer_shared = not self.experts.moe_runner_config.inplace
@@ -1411,14 +1397,8 @@ class DeepseekV2MoE(nn.Module):
                 hidden_states,
                 topk_output,
             )
-        if (
-            not _is_cuda
-            and not _is_musa
-            and not _is_xpu
-            and not (_use_aiter and self.routed_scaling_factor_fused_in_topk)
-            or isinstance(self.experts.quant_method, KTEPWrapperMethod)
-        ):
-            final_hidden_states *= self.routed_scaling_factor
+
+        final_hidden_states = self._scale_tp_routed_output(final_hidden_states)
 
         if (
             defer_shared
@@ -1432,32 +1412,76 @@ class DeepseekV2MoE(nn.Module):
                 pre_quant_input=pre_quant_input,
             )
 
-        if return_moe_output or leave_output_sum:
-            return MoEOutput(
-                routed=final_hidden_states,
-                shared=shared_output,
-                experts=self.experts,
-                routed_scaling_factor=self.routed_scaling_factor,
-                shared_is_replicated=self._shared_expert_tp1,
+        return self._finish_tp_output(
+            final_hidden_states,
+            shared_output,
+            num_tokens=hidden_states.shape[0],
+            return_moe_output=return_moe_output,
+            leave_output_sum=leave_output_sum,
+        )
+
+    def _scale_tp_routed_output(self, routed):
+        if (
+            not _is_cuda
+            and not _is_musa
+            and not _is_xpu
+            and not (_use_aiter and self.routed_scaling_factor_fused_in_topk)
+        ) or isinstance(self.experts.quant_method, KTEPWrapperMethod):
+            routed *= self.routed_scaling_factor
+
+        return routed
+
+    def _finish_tp_output(
+        self,
+        routed,
+        shared: Optional[torch.Tensor],
+        *,
+        num_tokens: int,
+        deferred_finalize: bool = False,
+        already_merged: bool = False,
+        return_moe_output: bool = False,
+        leave_output_sum: bool = False,
+    ):
+        if (
+            deferred_finalize
+            and get_forward().defer_moe_finalize
+            and not self._shared_expert_tp1
+            and not return_moe_output
+            and not leave_output_sum
+        ):
+            from sglang.srt.layers.layer_boundary.fusions.moe_finalize import (
+                MoeDeferredFinalize,
             )
 
-        final_hidden_states = maybe_fuse_routed_scale_and_shared_add(
-            self.experts,
-            final_hidden_states,
-            None if self._shared_expert_tp1 else shared_output,
-            self.routed_scaling_factor,
+            return MoeDeferredFinalize.from_flashinfer(
+                routed,
+                gated_shared_output=shared,
+                m=num_tokens,
+                reduce=sum_post_experts_output,
+            )
+
+        output_type = MergedMoEOutput if already_merged else MoEOutput
+        pieces = output_type(
+            routed=routed,
+            shared=shared,
+            experts=self.experts,
+            routed_scaling_factor=self.routed_scaling_factor,
+            shared_is_replicated=self._shared_expert_tp1,
         )
+        if return_moe_output or leave_output_sum:
+            return pieces
+
+        output = pieces.get_merged()
         if self.reduce_results:
-            final_hidden_states = post_experts_all_reduce(final_hidden_states)
-        # TP1 shared experts are replicated: add them after this block's
-        # all-reduce, or on TP rank 0 only when the stage boundary sums.
+            output = post_experts_all_reduce(output)
+        # A replicated shared expert contributes on rank zero while the TP sum is owed.
         if (
-            shared_output is not None
+            shared is not None
             and self._shared_expert_tp1
             and self._adds_replicated_output()
         ):
-            final_hidden_states += shared_output
-        return final_hidden_states
+            output += shared
+        return output
 
     def _adds_replicated_output(self) -> bool:
         """Whether this rank adds the replicated TP1 shared-expert output."""
@@ -1516,18 +1540,26 @@ class DeepseekV2MoE(nn.Module):
             ),  # block_size
             True,  # is_vnni
         )
-        if self.reduce_results:
-            final_hidden_states = post_experts_all_reduce(final_hidden_states)
-        return final_hidden_states
+        return self._finish_tp_output(
+            final_hidden_states,
+            None,
+            num_tokens=hidden_states.shape[0],
+            already_merged=True,
+        )
 
     def forward_deepep(
         self,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         input_ids_global: Optional[torch.Tensor] = None,
+        skip_shared_experts: bool = False,
     ) -> torch.Tensor:
         shared_output = None
-        sbo_enabled_flag = self._fuse_shared_experts_inside_sbo and not self.is_nextn
+        sbo_enabled_flag = (
+            self._fuse_shared_experts_inside_sbo
+            and not self.is_nextn
+            and not skip_shared_experts
+        )
         sbo_overlap_dispatch_flag = (
             sbo_enabled_flag and SboFlags.enable_dispatch_shared_one_stream_overlap()
         )
@@ -1538,7 +1570,11 @@ class DeepseekV2MoE(nn.Module):
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, forward_batch=forward_batch)
-            if not sbo_enabled_flag and self.num_fused_shared_experts == 0:
+            if (
+                not sbo_enabled_flag
+                and self.num_fused_shared_experts == 0
+                and not skip_shared_experts
+            ):
                 if self.alt_stream is not None:
                     self.alt_stream.wait_stream(torch.cuda.current_stream())
                     with torch.cuda.stream(self.alt_stream):
@@ -1723,6 +1759,7 @@ class DeepseekV2MoE(nn.Module):
             hidden_states.shape[0] > 0
             and not sbo_enabled_flag
             and self.num_fused_shared_experts == 0
+            and not skip_shared_experts
             and self.alt_stream is not None
             and not is_in_breakable_cuda_graph()
         ):
@@ -1732,7 +1769,7 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states,
             shared_output,
             routed_scaling_factor=self.routed_scaling_factor,
-            fused_in_topk=self.routed_scaling_factor_fused_in_topk,
+            routed_scale_applied=self.routed_scaling_factor_fused_in_topk,
         )
 
     def _forward_shared_experts(
@@ -2002,7 +2039,7 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states,
             state.pop("shared_output"),
             routed_scaling_factor=self.routed_scaling_factor,
-            fused_in_topk=self.routed_scaling_factor_fused_in_topk,
+            routed_scale_applied=self.routed_scaling_factor_fused_in_topk,
         )
 
 
