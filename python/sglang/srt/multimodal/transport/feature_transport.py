@@ -1,10 +1,14 @@
 """How preprocessed multimodal features reach the scheduler."""
 
+from typing import List
+
 import torch
 
+from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.multimodal.transport.cuda_ipc import (
     MM_FEATURE_CACHE_SIZE,
     MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
+    CudaIpcTensorTransportProxy,
     MmItemMemoryPool,
     get_mm_feature_pool_size_per_worker,
 )
@@ -44,6 +48,69 @@ class MultimodalFeatureTransport:
             if self.use_cuda_ipc and not skip_mm_pool
             else None
         )
+
+    def precompute_hashes_before_cpu_transfer(
+        self, mm_items: List[MultimodalDataItem]
+    ) -> None:
+        """Hash features in place, then move them to the CPU unless kept on GPU."""
+        for item in mm_items:
+            item.set_pad_value()
+            if not self.keep_mm_features_on_device:
+                item.feature = move_feature_to_cpu(item.feature)
+                item.precomputed_embeddings = move_feature_to_cpu(
+                    item.precomputed_embeddings
+                )
+
+    def prepare_mm_items_for_transport(
+        self, mm_items: List[MultimodalDataItem]
+    ) -> List[MultimodalDataItem]:
+        """Wrap final GPU features, rolling back every lease if one wrap fails."""
+        if not self.use_cuda_ipc:
+            return mm_items
+
+        # Pool misses fall back to plain CPU tensors. The scheduler copies out
+        # and releases each successful pool slice.
+        updates = []
+        try:
+            for item in mm_items:
+                fields = (
+                    ("feature", item.feature),
+                    ("precomputed_embeddings", item.precomputed_embeddings),
+                )
+                for field, tensor in fields:
+                    if not isinstance(tensor, torch.Tensor):
+                        continue
+                    wrapped = self._wrap_tensor_for_cuda_ipc(tensor)
+                    setattr(item, field, wrapped)
+                    updates.append((item, field, tensor, wrapped))
+        except BaseException as error:
+            rollback_errors = []
+            for item, field, tensor, wrapped in reversed(updates):
+                try:
+                    if isinstance(wrapped, CudaIpcTensorTransportProxy):
+                        self.cudaipc_mmfeature_pool.cancel_proxy(wrapped)
+                except BaseException as rollback_error:
+                    rollback_errors.append(rollback_error)
+                finally:
+                    setattr(item, field, tensor)
+            if rollback_errors:
+                error.add_note(
+                    f"{len(rollback_errors)} CUDA IPC rollback operation(s) also failed"
+                )
+                raise error from rollback_errors[0]
+            raise
+        return mm_items
+
+    def _wrap_tensor_for_cuda_ipc(self, tensor: torch.Tensor):
+        """helper function to turn a tensor into a cuda-ipc tensor"""
+        if not tensor.is_cuda:
+            return tensor
+
+        proxy = self.cudaipc_mmfeature_pool.wrap_tensor(
+            tensor,
+            use_pool_handle_cache=self.use_ipc_pool_handle_cache,
+        )
+        return proxy if proxy is not None else tensor.cpu()
 
 
 def _create_cuda_ipc_pool(base_gpu_id: int) -> MmItemMemoryPool:
