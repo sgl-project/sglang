@@ -628,14 +628,21 @@ def handle_unified_memory_pool(server_args: Any) -> None:
             f"spec-verify-audited attention backends {sorted(eagle_allowed)} "
             f"(got {sorted(eagle_backends, key=str)})."
         )
-        # An unset draft backend inherits the target's pair.
+        # An unset draft backend inherits the target's pair. On an MLA host
+        # the draft may be MLA or MHA; the fusion gate checks its backend
+        # against the unified pool's backends for its own attention.
         draft_backend = cfg.speculative_draft_attention_backend
         draft_backends = {draft_backend} if draft_backend else eagle_backends
-        assert draft_backends <= _SPEC_MHA_AUDITED_BACKENDS, (
+        draft_allowed = (
+            _SPEC_MHA_AUDITED_BACKENDS | unified_memory_attention_backends(mla=True)
+            if use_mla_backend(server_args)
+            else _SPEC_MHA_AUDITED_BACKENDS
+        )
+        assert draft_backends <= draft_allowed, (
             "--enable-unified-memory + EAGLE/EAGLE3 runs the draft on "
             f"{sorted(draft_backends)}, but a fused draft reads its KV through "
             "the KV-index translator, which only "
-            f"{sorted(_SPEC_MHA_AUDITED_BACKENDS)} carry on every draft path. "
+            f"{sorted(draft_allowed)} carry on every draft path. "
             "Set --speculative-draft-attention-backend to one of them."
         )
     if cfg.speculative_algorithm == "DSPARK":

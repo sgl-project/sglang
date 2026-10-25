@@ -851,6 +851,12 @@ class TestFusedDraftDecision(CustomTestCase):
         )
         self.assertIsNone(declined.placement)
         self.assertIn("does not support for MLA attention", declined.declined)
+        # An MHA draft on an MLA host reads its dense rows on the MHA rails.
+        declined = self._decide(
+            mla_host=True, target_backends=("trtllm_mla", "trtllm_mla")
+        )
+        self.assertIsNone(declined.placement)
+        self.assertIn("off the translated MHA rails", declined.declined)
 
     def test_an_mla_draft_needs_an_mla_host_and_no_window_layers(self):
         declined = self._decide(mla_draft=True)

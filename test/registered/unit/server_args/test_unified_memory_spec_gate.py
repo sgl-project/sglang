@@ -146,35 +146,42 @@ class TestUnifiedMemorySpecGate(CustomTestCase):
 
     def test_eagle_draft_backend(self):
         """An unset draft backend inherits the target's; an explicit one must
-        be on the MHA rails."""
+        be on the MHA rails of an MHA host."""
         self.assertTrue(_accepts("EAGLE", draft_backend=None))
         for draft_backend in self.MHA_RAILS:
             self.assertTrue(_accepts("EAGLE", draft_backend=draft_backend))
-        for draft_backend in self.UNAUDITED:
+        for draft_backend in self.UNAUDITED + self.MLA_ONLY:
             self.assertFalse(_accepts("EAGLE", draft_backend=draft_backend))
 
     def test_eagle_on_an_mla_host(self):
-        """An MLA mamba hybrid verifies on the audited verify set, while its
-        fused draft is MHA-shaped: an MLA-only draft backend is refused whether
-        named or inherited."""
+        """An MLA mamba hybrid verifies on the audited verify set. Its fused
+        draft may be MLA, which reads through the translator on that whole
+        set, or MHA, on the MHA rails: either kind of backend is admitted
+        here, named or inherited, and the fusion gate matches it to the
+        draft's attention."""
         mla = dict(is_hybrid_swa=False, attention_arch=AttentionArch.MLA)
         with patch.object(kv_cache_hook, "mambaish_config", return_value=object()):
             for backend in self.VERIFY_BACKENDS:
-                self.assertTrue(
-                    _accepts("EAGLE", backend=backend, draft_backend="triton", **mla),
-                    backend,
-                )
-            self.assertFalse(
-                _accepts("EAGLE", backend="fa4", draft_backend="triton", **mla)
-            )
-            for backend in ("trtllm_mla", "flashmla"):
-                for draft_backend in (None, backend):
-                    self.assertFalse(
+                for draft_backend in (None, backend, "triton"):
+                    self.assertTrue(
                         _accepts(
                             "EAGLE", backend=backend, draft_backend=draft_backend, **mla
                         ),
-                        draft_backend or backend,
+                        f"{backend} draft={draft_backend}",
                     )
+            self.assertTrue(
+                _accepts("EAGLE", backend="flashmla", draft_backend="trtllm_mha", **mla)
+            )
+            self.assertFalse(
+                _accepts("EAGLE", backend="fa4", draft_backend="triton", **mla)
+            )
+            for draft_backend in self.UNAUDITED:
+                self.assertFalse(
+                    _accepts(
+                        "EAGLE", backend="flashmla", draft_backend=draft_backend, **mla
+                    ),
+                    draft_backend,
+                )
 
     def test_unaudited_algorithms_and_tree_drafting_refused(self):
         """NGRAM and tree drafting relocate accepted tokens one at a time
