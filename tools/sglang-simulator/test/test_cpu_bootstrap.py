@@ -153,6 +153,45 @@ assert 'aiter' not in sys.modules
     )
 
 
+@requires_cpu_runtime
+def test_controller_spawn_alias_prepares_native_child_before_forwarding():
+    run_python(
+        """
+from unittest.mock import patch
+import torch
+from sglang_simulator.simulation.sglang.engine import SGLangSimulationEngine
+from sglang_simulator.simulation.sglang import hook_bootstrap
+from sglang_simulator.simulation.sglang.process_entry import install_controller_process_entry
+from sglang.srt.entrypoints import engine
+from sglang.srt.managers import data_parallel_controller
+
+native = data_parallel_controller.run_data_parallel_controller_process
+wrapper = hook_bootstrap.run_simulator_data_parallel_controller_process
+assert engine.run_data_parallel_controller_process is wrapper
+assert wrapper.__module__ == hook_bootstrap.__name__
+assert native is not wrapper
+assert SGLangSimulationEngine.run_scheduler_process_func is hook_bootstrap.run_simulator_scheduler_process
+assert SGLangSimulationEngine.run_detokenizer_process_func is hook_bootstrap.run_simulator_detokenizer_process
+install_controller_process_entry()
+
+sentinel = object()
+calls = []
+def native_child(*args, **kwargs):
+    assert hook_bootstrap._HOOKS_INSTALLED
+    assert not torch.cuda.is_available() and torch.version.hip is None
+    calls.append((args, kwargs))
+    return sentinel
+
+with patch.object(data_parallel_controller, 'run_data_parallel_controller_process', native_child):
+    assert wrapper(1, 2, pipe_writer=3) is sentinel
+assert calls == [((1, 2), {'pipe_writer': 3})]
+assert data_parallel_controller.run_data_parallel_controller_process is native
+""",
+        bootstrap=True,
+        cpu=True,
+    )
+
+
 @pytest.fixture
 def model_runner(monkeypatch):
     """Exercise the actual pool hooks with no GPU operations or SDK imports."""

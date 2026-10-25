@@ -94,3 +94,14 @@ def run_simulator_detokenizer_process(*args, **kwargs):
     from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
 
     return run_detokenizer_process(*args, **kwargs)
+
+
+def run_simulator_data_parallel_controller_process(*args, **kwargs):
+    """Prepare a spawned controller before it constructs or launches workers."""
+    install_simulator_hooks()
+
+    from sglang.srt.managers.data_parallel_controller import (
+        run_data_parallel_controller_process,
+    )
+
+    return run_data_parallel_controller_process(*args, **kwargs)

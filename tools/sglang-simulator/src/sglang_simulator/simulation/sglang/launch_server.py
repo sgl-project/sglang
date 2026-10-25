@@ -13,6 +13,9 @@ from sglang_simulator.simulation.sglang.hook_bootstrap import (
     run_simulator_detokenizer_process,
     run_simulator_scheduler_process,
 )
+from sglang_simulator.simulation.sglang.process_entry import (
+    install_controller_process_entry,
+)
 from sglang_simulator.utils import get_logger
 
 install_simulator_hooks()
@@ -73,6 +76,7 @@ def apply_simulator_defaults(raw_args: argparse.Namespace, argv: list[str]) -> N
 
 if __name__ == "__main__":
     validate_launch_runtime()
+    install_controller_process_entry()
 
     from sglang.srt.entrypoints.http_server import launch_server
     from sglang.srt.server_args import ServerArgs
