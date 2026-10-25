@@ -31,7 +31,8 @@ class TestMooncakeTransferBatching(unittest.TestCase):
             engine.batch_transfer_sync.return_value = 0
         else:
             engine.batch_transfer_sync.side_effect = side_effect
-        manager = SimpleNamespace(
+        manager = MooncakeKVManager.__new__(MooncakeKVManager)
+        manager.__dict__.update(
             engine=engine,
             is_mla_backend=True,
             is_hybrid_mla_backend=False,
@@ -44,15 +45,6 @@ class TestMooncakeTransferBatching(unittest.TestCase):
         )
         attach_mooncake_transport(
             manager, engine, kv=[1000, 2000], peer_kv=[5000, 6000]
-        )
-        manager._transfer_copies = lambda session, copies: (
-            MooncakeKVManager._transfer_copies(manager, session, copies)
-        )
-        manager._generic_entry_pairs = lambda **kwargs: (
-            MooncakeKVManager._generic_entry_pairs(manager, **kwargs)
-        )
-        manager._await_transfer_futures = lambda futures: (
-            MooncakeKVManager._await_transfer_futures(manager, futures)
         )
         return manager
 
@@ -290,7 +282,8 @@ class TestDcpDraftHeadTransfer(unittest.TestCase):
                         ]
                     return 0
 
-                manager = SimpleNamespace(
+                manager = MooncakeKVManager.__new__(MooncakeKVManager)
+                manager.__dict__.update(
                     is_mla_backend=pure_mla,
                     kv_args=SimpleNamespace(
                         page_size=page_size,
@@ -305,9 +298,6 @@ class TestDcpDraftHeadTransfer(unittest.TestCase):
                     _await_transfer_futures=lambda futures: max(
                         f.result() for f in futures
                     ),
-                )
-                manager._transfer_copies = lambda session, copies: (
-                    MooncakeKVManager._transfer_copies(manager, session, copies)
                 )
                 attach_mooncake_transport(
                     manager,

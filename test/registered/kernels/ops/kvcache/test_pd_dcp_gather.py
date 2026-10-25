@@ -123,7 +123,8 @@ class TestPdDcpGather(CustomTestCase):
                     torch.cuda.synchronize()
                     return 0
 
-                manager = SimpleNamespace(
+                manager = MooncakeKVManager.__new__(MooncakeKVManager)
+                manager.__dict__.update(
                     is_mla_backend=False,
                     kv_args=SimpleNamespace(
                         page_size=page,
@@ -136,12 +137,6 @@ class TestPdDcpGather(CustomTestCase):
                     max_transfer_batch_indices=37,
                     enable_custom_mem_pool=custom_pool,
                     enable_deferred_decode_kv_release=False,
-                )
-                manager._await_transfer_futures = lambda futures: (
-                    MooncakeKVManager._await_transfer_futures(manager, futures)
-                )
-                manager._transfer_copies = lambda session, copies: (
-                    MooncakeKVManager._transfer_copies(manager, session, copies)
                 )
                 attach_mooncake_transport(
                     manager,
