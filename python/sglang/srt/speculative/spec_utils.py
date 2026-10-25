@@ -25,6 +25,7 @@ from sglang.kernels.ops.speculative.eagle import (
 )
 from sglang.kernels.ops.speculative.row_argmax import row_argmax
 from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.configs.draft_parallel import DraftParallelLayout
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.constrained.base_grammar_backend import GrammarMask
 from sglang.srt.distributed.parallel_state import (
@@ -41,7 +42,6 @@ from sglang.srt.mem_cache.allocation import (
     assign_req_to_token_pool_func as assign_req_to_token_pool_func,
 )
 from sglang.srt.runtime_context import (
-    draft_attn_parallel_group,
     get_exec,
     get_parallel,
     get_spec,
@@ -827,19 +827,12 @@ def draft_pp_context():
         yield
 
 
-def draft_tp_context(owns_attention: bool):
-    """Enter the TP placement that draft work runs under.
-
-    Work that owns attention (an attention-owning draft, or DSpark's DP-MoE
-    sync) uses ``draft_attn_parallel_group()``. Other draft work keeps the
-    target's TP placement. Enter it from outside any draft scope.
-    """
-    if not owns_attention:
+def draft_tp_context(layout: DraftParallelLayout):
+    """Enter an already-resolved draft placement from outside any draft scope."""
+    if layout.tp_group is None:
         return contextlib.nullcontext()
-    parallel = get_parallel()
-    group = getattr(parallel, f"{draft_attn_parallel_group()}_group")
-    tp_context = patch_tensor_parallel_group(group, owns_attention=True)
-    if parallel.enable_prefill_cp:
+    tp_context = patch_tensor_parallel_group(layout.tp_group, owns_attention=True)
+    if layout.disable_cp:
         return _draft_without_cp(tp_context)
     return tp_context
 
