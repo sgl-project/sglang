@@ -353,6 +353,7 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
         }
 
         if self.use_cuda_ipc and not kwargs.get("skip_mm_pool", False):
+            base_gpu_id = self.server_args.base_gpu_id
             # SGLANG_MM_FEATURE_CACHE_MB is the total pool budget across all
             # tokenizer workers. Each worker gets an equal share so that adding
             # workers doesn't multiply the GPU-side footprint.
@@ -366,17 +367,18 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
                 "GPU %d (%.0f MiB per tokenizer worker × %d; configured "
                 "budget %.0f MiB).",
                 total_pool_size / (1024 * 1024),
-                self.server_args.base_gpu_id,
+                base_gpu_id,
                 per_worker_pool_size / (1024 * 1024),
                 worker_num,
                 MM_FEATURE_CACHE_SIZE / (1024 * 1024),
             )
-            self.cudaipc_mmfeature_pool = MmItemMemoryPool(
+            cudaipc_mmfeature_pool = MmItemMemoryPool(
                 per_worker_pool_size,
                 MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
-                self.server_args.base_gpu_id,
+                base_gpu_id,
                 get_mm_feature_consumer_count(),
             )
+            self.cudaipc_mmfeature_pool = cudaipc_mmfeature_pool
 
     @property
     def keep_mm_features_on_device(self) -> bool:
@@ -1360,12 +1362,16 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
 
     @staticmethod
     def _move_feature_to_cpu(value):
+        return BaseMultimodalProcessor.move_feature_to_cpu(value)
+
+    @staticmethod
+    def move_feature_to_cpu(value):
         if isinstance(value, torch.Tensor):
             return value.cpu()
         if isinstance(value, list):
-            return [BaseMultimodalProcessor._move_feature_to_cpu(v) for v in value]
+            return [BaseMultimodalProcessor.move_feature_to_cpu(v) for v in value]
         if isinstance(value, tuple):
-            return tuple(BaseMultimodalProcessor._move_feature_to_cpu(v) for v in value)
+            return tuple(BaseMultimodalProcessor.move_feature_to_cpu(v) for v in value)
         return value
 
     def _precompute_hashes_before_cpu_transfer(
