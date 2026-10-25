@@ -131,6 +131,9 @@ from sglang.srt.managers.utils import (
 from sglang.srt.model_executor.forward_batch_info import (
     get_server_return_hidden_states_mode,
 )
+from sglang.srt.multimodal.token_space_mm_process.sglang import (
+    TokenSpaceSGLangProcessor,
+)
 from sglang.srt.multimodal.transport import determine_tensor_transport_mode
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.metrics_collector import (
@@ -240,6 +243,20 @@ def _reject_missing_dispatched_encoder_embedding(request_obj, mm_inputs):
                 "The encoder did not return multimodal embeddings. "
                 "The request was not run locally in language-only mode."
             ),
+        )
+
+
+def _reject_unsupported_mm_token_expansion_start_len(request_obj, mm_processor):
+    """Only a token-space processor keeps an already-expanded prefix; any other
+    processor would expand that prefix's media tokens again."""
+    if (
+        isinstance(request_obj, GenerateReqInput)
+        and request_obj.mm_token_expansion_start_len
+        and not isinstance(mm_processor, TokenSpaceSGLangProcessor)
+    ):
+        raise ValueError(
+            "mm_token_expansion_start_len requires --enable-token-space-processor "
+            "and a model with a token-space processor."
         )
 
 
@@ -1159,6 +1176,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         should_run_mm_processor = self.mm_processor is not None and (
             contains_mm_input or is_mossvl
         )
+        _reject_unsupported_mm_token_expansion_start_len(obj, self.mm_processor)
 
         if should_run_mm_processor:
             if obj.image_data is not None and not isinstance(obj.image_data, list):
