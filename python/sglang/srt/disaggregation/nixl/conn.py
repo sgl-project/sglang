@@ -1254,10 +1254,22 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         Src dlist shared across decode peers (same TP size). prefill_tp < decode_tp:
         interleave num_groups per token, peers select via head_group_idx.
         prefill_tp > decode_tp: num_groups=1. Dst dlist is per-peer.
+
+        The runs below address token-major (NHD, ``[token][head][dim]``) rows,
+        the layout of the default MHA pool, which declares no PD layout. A pool
+        that declares another layout is refused instead of written wrongly.
         """
         from sglang.srt.disaggregation.common.staging_buffer import (
             compute_head_slice_params,
         )
+
+        kv_layout = getattr(self, "kv_layout", None)
+        if kv_layout is not None:
+            raise NotImplementedError(
+                "NIXL heterogeneous-TP KV slice transfer assumes token-major (NHD) "
+                f"KV rows, but the KV pool declares PD layout {kv_layout!r}. Use "
+                "equal attention TP on prefill and decode for this pool."
+            )
 
         decode_tp_size = decode_kv_args.decode_tp_size
         dst_kv_item_len = decode_kv_args.dst_kv_item_len
@@ -1295,12 +1307,15 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 decode_kv_args.decode_tp_rank,
                 total_kv_heads,
             )
-            # One group per UNIQUE head-slice, not per decode rank: replicating
-            # ranks share one, and over-counting addresses past the registered
-            # KV region, where prep_xfer_dlist raises NIXL_ERR_NOT_FOUND.
-            dst_replication = max(1, decode_tp_size // total_kv_heads)
-            num_groups = decode_tp_size // prefill_tp_size // dst_replication
-            head_group_idx = src_head_start // dst_heads_per_rank
+            # One group per UNIQUE head-slice held by this prefill rank, not per
+            # decode rank: replicating ranks share one, and over-counting
+            # addresses past the registered KV region, where prep_xfer_dlist
+            # raises NIXL_ERR_NOT_FOUND. Count it from the heads this rank holds:
+            # ``decode_tp // prefill_tp // dst_replication`` is 0 when both
+            # sides replicate heads (e.g. 2 KV heads, prefill TP4 -> decode TP8).
+            src_heads_per_rank = max(1, total_kv_heads // prefill_tp_size)
+            num_groups = src_heads_per_rank // num_heads_to_send
+            head_group_idx = src_head_start // num_heads_to_send
             dst_head_offset = 0
 
         src_kv_item_len = self.kv_args.kv_item_lens[0]
