@@ -210,6 +210,11 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
             return self.free_pages
         return torch.cat((self.free_pages, self.release_pages))
 
+    def enable_zero_on_free(self, zeroer) -> None:
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support zeroing KV pages on free"
+        )
+
     def free_group_begin(self):
         assert self.free_group is None, "free groups cannot be nested"
         self.free_group = []
