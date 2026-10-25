@@ -75,6 +75,7 @@ if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.layers.cp.base import BaseContextParallelMetadata
     from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
+    from sglang.srt.layers.engram_staging import StagedRows
     from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.managers.schedule_batch import MultimodalInputs, ScheduleBatch
@@ -790,6 +791,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # DeepSeek-V4.1 engram, extend only: the n - 1 tokens before each request's
     # first extend token, oldest first, [bs, n - 1] int32 (see EngramHasher).
     engram_history: Optional[torch.Tensor] = None
+    engram_staged_rows: Optional[StagedRows] = None
 
     # For dumper: int-hashed request / bootstrap-room IDs (derived from rids)
     rids_int: Optional[torch.Tensor] = None
@@ -1048,6 +1050,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             orig_seq_lens=batch.orig_seq_lens,
             out_cache_loc_dsv4=batch.out_cache_loc_dsv4,
             engram_history=batch.engram_history,
+            engram_staged_rows=batch.engram_staged_rows,
             mamba_track_indices=batch.mamba_track_indices,
             mamba_track_mask=batch.mamba_track_mask,
             mamba_track_seqlens=batch.mamba_track_seqlens,
@@ -1166,6 +1169,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         if ret.forward_mode.is_idle():
             ret.positions = torch.empty((0,), dtype=torch.int64, device=device)
+            if model_runner.model_config.model_is_mrope:
+                # DP padding can turn an idle rank into a target verify batch.
+                ret.mrope_positions = ret.positions.unsqueeze(0).expand(3, -1)
             if model_runner.lora_manager is not None:
                 model_runner.lora_manager.reset_lora_batch()
             return ret
@@ -1789,6 +1795,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             and not prefill_graph_tolerates_sum_len()
         ):
             dp_padding_mode = DpPaddingMode.MAX_LEN
+            # Keep every DP rank on the same captured token bucket. The raw
+            # global maximum can sit between buckets, while the BCG replay
+            # requires a common padded shape for MoE collectives and attention.
+            bucket = min(
+                size for size in prefill_cg.bs if size >= max(global_num_tokens)
+            )
+            global_num_tokens = [bucket] * sync_group_size
         if self.dp_spec_prefill_coordination_applied:
             # Preserve each rank's forward mode on coordinated steps.
             dp_padding_mode = DpPaddingMode.SUM_LEN

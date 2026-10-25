@@ -288,9 +288,12 @@ class Wan2_2_T2V_A14B_Config(WanT2V480PConfig):
         self.dit_config.torch_compile_mode = "default"
 
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        # both 14B experts plus T5 take ~66 GB per GPU; 120 keeps 80 GB cards streaming
         return ModelDeploymentConfig(
             dit_layerwise_offload_modes=("auto", "memory"),
             auto_dit_offload_prefetch_size=2,
+            keep_resident_min_available_gb=120,
+            keep_resident_components=("dit", "vae"),
         )
 
 
@@ -305,9 +308,12 @@ class Wan2_2_I2V_A14B_Config(WanI2V720PConfig):
         self.dit_config.boundary_ratio = self.boundary_ratio
 
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        # both 14B experts plus T5 take ~66 GB per GPU; 120 keeps 80 GB cards streaming
         return ModelDeploymentConfig(
             dit_layerwise_offload_modes=("auto", "memory"),
             auto_dit_offload_prefetch_size=2,
+            keep_resident_min_available_gb=120,
+            keep_resident_components=("dit", "vae"),
         )
 
 
