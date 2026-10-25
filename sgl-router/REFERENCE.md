@@ -622,38 +622,37 @@ is re-registered; its circuit breaker will open in the meantime.
 
 ## Native gRPC
 
-`--grpc-port` serves the engine's own gRPC API, `sglang.runtime.v1.SglangService`
-(`proto/sglang/runtime/v1/sglang.proto`), so a gRPC client can point at the
-router or at an engine. A call is routed exactly like its HTTP route and sent to
-the same RPC on the selected engine's native gRPC server, which engines run
-beside HTTP with their own `--grpc-port`; the router reads that port from each
-worker's `/server_info`. HTTP requests are unaffected and still reach engines
-over HTTP.
+`--grpc-port` serves `sglang.api.v1.SglangService/Generate`
+(`proto/sglang/api/v1/service.proto`). A single text prompt or token sequence is
+routed like HTTP `/generate` and forwarded to the selected engine's native
+`api.v1` gRPC server. Engines must run with `--grpc-port`; the router reads that
+port from each worker's `/server_info`. HTTP requests still reach engines over
+HTTP.
 
-| RPC | Routed like |
-|---|---|
-| `ChatComplete` | `/v1/chat/completions`: same rendering, `input_ids` forwarding, PD and DP-rank handling |
-| `Complete` | `/v1/completions` |
-| `Generate`, `TextGenerate` | `/generate` with `input_ids` or `text` |
-| `Embed`, `TextEmbed`, `OpenAIEmbed` | `/v1/embeddings` |
-| `Classify`, `OpenAIClassify` | `/v1/classify` |
-| `Rerank` | `/v1/rerank` |
+This replaces the legacy runtime service. Clients and workers must use `api.v1`;
+there is no legacy fallback. OpenAI, embedding, classify, and rerank gRPC methods
+are no longer served. Their HTTP endpoints remain available. The other `api.v1`
+RPCs, including health, metadata, detokenization, and administrative calls, answer
+`UNIMPLEMENTED` at the router.
 
-The OpenAI RPCs carry the HTTP route's JSON body, so they are prepared exactly as
-over HTTP. A typed RPC is prepared from its fields with the same rules, and the
-router's additions (rid, PD bootstrap, DP rank, sampling defaults) are set on the
-proto it forwards. A text prompt is tokenized once, as its HTTP route forwards
-`input_ids`: `TextGenerate` is sent as `Generate` with `return_text`, so the engine
-still supplies the text, and `TextEmbed` as `Embed`. They stay text RPCs under
-`--disable-input-ids-forwarding`, without a tokenizer, or, for `TextGenerate`, with
-`return_text_in_logprobs`. Other RPCs, such as
-`Tokenize`, `HealthCheck` and the admin RPCs, answer `UNIMPLEMENTED`. Request metadata and `trace_headers`
-act as HTTP headers for routing and forwarding, and a cancelled call aborts the
-engine request. Router errors arrive as a gRPC status carrying the HTTP path's
-message and an `x-router-error-code` trailer; an engine's status passes through
-unchanged. An engine without `--grpc-port` (including one launched with
-`--api-key`, which native gRPC rejects) cannot serve gRPC calls: the router warns
-when it registers, and calls routed to it fail with `UNAVAILABLE`.
+`Generate` accepts one prompt, a scalar request ID, and scalar sampling parameters.
+List variants of these fields, including one-element lists, are rejected with
+`INVALID_ARGUMENT`. The router does not expand `n` into parallel requests; the
+engine validates sampling support. Replies are typed `GenerateStreamItem` frames
+or item errors. With `stream=false`, the router collects the engine result before
+returning it through the same server-streaming RPC.
+
+The router adds its request ID, PD bootstrap fields, DP placement, and missing
+sampling defaults directly to the protobuf request. Text is tokenized once and
+forwarded as token IDs unless input-ID forwarding is disabled, no tokenizer is
+available, media is present, or text logprobs are requested.
+
+Request metadata supplies routing headers and forwarded trace context; there is
+no `trace_headers` payload field. Router errors arrive as gRPC statuses with an
+`x-router-error-code` trailer; upstream statuses and typed item errors retain
+their wire representation. Cancellation drops the upstream call and also aborts
+the router-generated request ID, when present. An engine without `--grpc-port`
+cannot serve gRPC calls: registration warns, and calls fail with `UNAVAILABLE`.
 
 ## Upgrading from `cache_aware_zmq`
 
