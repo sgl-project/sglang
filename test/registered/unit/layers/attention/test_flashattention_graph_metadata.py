@@ -12,7 +12,7 @@ from sglang.srt.layers.attention import flashattention_backend as flashattention
 from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
 from sglang.srt.mem_cache.kv_loc_plan import IdSpace, IdSpaceKind
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -41,7 +41,7 @@ class _DraftWidthModelRunner:
         )
         self.device = "cpu"
         self.req_to_token_pool = SimpleNamespace(
-            req_to_token=torch.zeros((1, 128), dtype=torch.int32)
+            req_to_token=torch.zeros((3, 128), dtype=torch.int32)
         )
         self.token_to_kv_pool = object()
         self.kv_cache_dtype = torch.float16
@@ -128,15 +128,37 @@ class TestFlashAttentionDraftWidth(CustomTestCase):
         ):
             return FlashAttentionBackend(runner, fa_impl_ver=fa_impl_ver)
 
+    def _make_forward_batch(self, *, actual_query_width):
+        actual_query_token_count = 2 * actual_query_width
+        return ForwardBatch(
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            batch_size=2,
+            input_ids=torch.zeros(actual_query_token_count, dtype=torch.int64),
+            req_pool_indices=torch.tensor([1, 2], dtype=torch.int64),
+            seq_lens=torch.tensor([3, 5], dtype=torch.int64),
+            out_cache_loc=torch.arange(actual_query_token_count, dtype=torch.int64),
+            seq_lens_sum=8,
+            seq_lens_cpu=torch.tensor([3, 5], dtype=torch.int64),
+            spec_info=SimpleNamespace(ragged_verify_layout=None),
+            encoder_lens=None,
+        )
+
     def test_fa3_and_fa4_use_draft_query_width_contract(self):
         cases = (
-            ("DSpark draft, no anchor", SpeculativeAlgorithm.DSPARK, True, False, 8),
-            ("DSpark draft, anchor", SpeculativeAlgorithm.DSPARK, True, True, 7),
-            ("DSpark target", SpeculativeAlgorithm.DSPARK, False, False, 8),
-            ("non-DSpark draft", SpeculativeAlgorithm.EAGLE, True, False, 8),
+            ("DSpark draft, no anchor", SpeculativeAlgorithm.DSPARK, True, False, 8, 8),
+            ("DSpark draft, anchor", SpeculativeAlgorithm.DSPARK, True, True, 7, 7),
+            ("DSpark target", SpeculativeAlgorithm.DSPARK, False, False, 8, 8),
+            ("non-DSpark draft", SpeculativeAlgorithm.EAGLE, True, False, 8, 8),
         )
         for fa_impl_ver in (3, 4):
-            for name, algorithm, is_draft_worker, sample_from_anchor, expected in cases:
+            for (
+                name,
+                algorithm,
+                is_draft_worker,
+                sample_from_anchor,
+                expected_width,
+                actual_query_width,
+            ) in cases:
                 with self.subTest(fa_impl_ver=fa_impl_ver, case=name):
                     backend = self._make_backend(
                         algorithm=algorithm,
@@ -146,8 +168,33 @@ class TestFlashAttentionDraftWidth(CustomTestCase):
                     )
                     self.assertEqual(
                         backend.speculative_num_draft_tokens,
-                        expected,
+                        expected_width,
                     )
+
+                    forward_batch = self._make_forward_batch(
+                        actual_query_width=actual_query_width
+                    )
+                    backend.init_forward_metadata(forward_batch)
+
+                    self.assertEqual(
+                        backend.forward_metadata.cu_seqlens_q.tolist(),
+                        [0, expected_width, 2 * expected_width],
+                    )
+                    backend.init_cuda_graph_state(
+                        max_bs=2,
+                        max_num_tokens=2 * expected_width,
+                    )
+                    self.assertEqual(
+                        backend.target_verify_metadata["cu_seqlens_q"].tolist(),
+                        [0, expected_width, 2 * expected_width],
+                    )
+                    if name == "DSpark draft, no anchor":
+                        actual_query_token_count = forward_batch.input_ids.numel()
+                        self.assertEqual(
+                            backend.forward_metadata.cu_seqlens_q[-1].item(),
+                            actual_query_token_count,
+                            "cu_seqlens_q must cover every flattened draft query row",
+                        )
 
 
 class TestFlashAttentionGraphMetadata(CustomTestCase):
