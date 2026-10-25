@@ -139,6 +139,21 @@ The typed SDK source policy and ordinary cost reader still gate ordered B2
 work, complete sampling, actual captures and independently qualified direct
 whole-batch costs. B1 measurements cannot supply missing B2 work.
 Complete newly qualified golden costs are still required for an actual run.
+
+The optional `native_source_work_policy="native_region_golden351_decode_work_v1"`
+is an experimental B1 DECODE cost lookup option with `source_golden351`. It passes
+the existing typed SDK source policy through runtime-only UMD adapter arguments;
+the SDK still verifies helper-file inventory, full capture/planner/buffer/source
+identity and qualified original costs. Full request recipes and row identities
+remain intact. Exact and ordinary in-domain prefix lookups retain their existing
+route. A source-work estimate requires a bounded SDK query record matching the
+requested region/profile, selected policy and original bracketing anchors; an
+ordinary empirical source string is insufficient. Missing proof fails before
+progress or history changes. The selected policy and query proof enter the phase
+evidence reference. Omitted options retain existing identities and behavior.
+EXTEND and B2 use their existing lookup paths. This plumbing supplies neither
+missing costs nor actual heldout validation, complete AgentX coverage or an
+accuracy claim; operational activation requires those independent results.
 Source-law implementation and CPU tests do not establish native timing or
 Simulator/Pareto accuracy. B2 native positive admission, completion/overlap
 validation and complete C1 AgentX coverage remain pending.

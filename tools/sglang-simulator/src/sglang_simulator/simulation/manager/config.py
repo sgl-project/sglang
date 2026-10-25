@@ -301,6 +301,7 @@ class ConfigManager:
                 "proposal_profile_id",
                 "native_segment_profile_id",
                 "native_capture_profile",
+                "native_source_work_policy",
                 "output_token_id",
             }
             unknown_fields = sorted(predictor_config.keys() - supported_fields)

@@ -634,6 +634,7 @@ class InferCastDSparkTimePredictor(InferTimePredictor):
         proposal_profile_id=None,
         native_segment_profile_id=None,
         native_capture_profile=None,
+        native_source_work_policy=None,
         output_token_id=1,
         model_config_root=None,
         **kwargs,
@@ -657,6 +658,12 @@ class InferCastDSparkTimePredictor(InferTimePredictor):
                 progress_artifact is None and native_segment_profile_id is not None,
                 "source_golden351 requires native regions and no empirical progress_artifact",
             )
+        _require(
+            native_source_work_policy is None
+            or progress_kind == "source_golden351"
+            and type(native_source_work_policy) is str,
+            "native source work requires explicit source_golden351 progress",
+        )
         super().__init__(model, hw, config)
         _require(
             model_id == "deepseek-ai/DeepSeek-V4.1-Flash",
@@ -752,6 +759,14 @@ class InferCastDSparkTimePredictor(InferTimePredictor):
             from infercast.sdk.models.model_config import load_model_config
             from infercast.sdk.models.umd import build_model_description
             from infercast.sdk.perf_database.dsv41_dspark_proposal import MODEL_REVISION
+
+            if native_source_work_policy is not None:
+                from infercast.sdk.native_segment_module import SOURCE_WORK_POLICY
+
+                _require(
+                    native_source_work_policy == SOURCE_WORK_POLICY,
+                    "native_source_work_policy is not the SDK versioned policy",
+                )
         except ImportError as error:
             raise PredictorError(
                 "provider_initialization_failed", "InferCast SDK is unavailable"
@@ -878,10 +893,14 @@ class InferCastDSparkTimePredictor(InferTimePredictor):
             "progress originals require the same modeled TP2/DP1/PP1 topology",
             code="unsupported_topology",
         )
+        cost_options = {}
+        if native_source_work_policy is not None:
+            cost_options["native_source_work_policy"] = native_source_work_policy
         costs = UMDDSparkCostModel(
             database,
             proposal_profile_id=proposal_profile_id,
             native_source_policy=native_policy,
+            **cost_options,
         )
         self.dspark_runtime = DSparkNativeRuntime(
             session=DSparkSession(costs, progress),
@@ -919,6 +938,8 @@ class InferCastDSparkTimePredictor(InferTimePredictor):
         }
         if progress_kind == "source_golden351":
             self._identity.update(progress_kind=progress_kind, **progress.identity)
+        if native_source_work_policy is not None:
+            self._identity["native_source_work_policy"] = native_source_work_policy
 
     def predict_infer_time(self, batch):
         raise PredictorError(

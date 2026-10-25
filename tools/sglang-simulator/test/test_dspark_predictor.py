@@ -498,6 +498,14 @@ def test_unknown_fields_fail_before_sdk_reader_seams(factory, field):
     assert not factory.calls["open"] and not factory.calls["describe"]
 
 
+def test_source_work_cannot_be_enabled_on_default_empirical_progress(factory):
+    with pytest.raises(PredictorError, match="explicit source_golden351"):
+        factory.build(
+            native_source_work_policy="native_region_golden351_decode_work_v1"
+        )
+    assert not factory.calls["open"] and not factory.calls["describe"]
+
+
 @pytest.mark.parametrize(
     "changes",
     [

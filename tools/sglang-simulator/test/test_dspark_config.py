@@ -99,6 +99,20 @@ def test_golden_kind_and_explicit_model_seed_route_without_empirical_asset(facto
     assert not hasattr(result, "progress_artifact")
 
 
+def test_explicit_source_work_option_routes_without_mutating_config(factory):
+    _, raw, _ = factory
+    raw["predictor"]["native_source_work_policy"] = (
+        "native_region_golden351_decode_work_v1"
+    )
+    original = copy.deepcopy(raw)
+    result = ConfigManager.get_inference_time_predictor(None, None, None)
+    assert (
+        result.native_source_work_policy
+        == raw["predictor"]["native_source_work_policy"]
+    )
+    assert raw == original
+
+
 def test_native_segment_selector_and_existing_capture_profile_resolve_from_config(
     factory,
 ):

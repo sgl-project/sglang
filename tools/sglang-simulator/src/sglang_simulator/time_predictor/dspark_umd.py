@@ -9,6 +9,91 @@ from sglang_simulator.simulation.sglang.dspark import DSparkPhaseCost, DSparkSte
 from sglang_simulator.time_predictor.base import PredictorError
 
 
+def _source_work_query_evidence(recorder, *, point, phase, policy, source_policy):
+    """Bind one estimated SDK lookup to its original request and row anchors."""
+    from infercast.sdk.diagnostics.prediction_evidence import linear_axis
+    from infercast.sdk.native_segment_module import OP, NativeSegmentQuery
+
+    def canonical(value):
+        return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+    def require(condition):
+        if not condition:
+            raise ValueError("missing matching SDK source-work query proof")
+
+    try:
+        shapes = json.loads(point["native_segment_queries"])
+        require(
+            len(shapes) == 1
+            and recorder.dropped_queries == 0
+            and len(recorder.nodes) == 1
+        )
+        requested = NativeSegmentQuery.from_shape(shapes[0])
+        coordinate, prefix = requested.source_work_coordinate(policy=policy)
+        node = recorder.nodes[0]
+        require(
+            node["op"] == OP
+            and node["node_id"] == requested.segment_kind
+            and node["phase"] == phase
+            and node["status"] == "resolved"
+            and node["source"] == "empirical"
+            and type(node["count"]) is int
+            and node["count"] == 1
+            and type(node["repeat"]) is int
+            and node["repeat"] == 1
+            and canonical(node["shape"]) == canonical(requested.to_shape())
+            and len(node["queries"]) == 1
+        )
+        query = node["queries"][0]
+        metadata = query["row_metadata"]
+        require(
+            query["component"] == OP
+            and query["role"] == "leaf"
+            and query["source"] == "empirical"
+            and query["kernel_source"] == "sglang"
+            and query["kernel_impl"] == requested.to_shape()["kernel_impl"]
+            and query["resolution"] in {"fallback", "interpolated"}
+            and canonical(query["requested_key"]) == canonical(requested.to_shape())
+            and requested.execution_profile_id == source_policy.execution_profile_id
+            and metadata["execution_profile_id"] == requested.execution_profile_id
+            and metadata["estimated_source_work_policy"]
+            == metadata["interpolation_method"]
+            == policy
+            and metadata["source_binding_scope"] == "conditional_helper_file_inventory"
+            and metadata["source_work_coordinate_sha256"]
+            == hashlib.sha256(coordinate.encode()).hexdigest()
+        )
+        anchors = metadata["anchor_identities"]
+        require(len(anchors) == 2)
+        endpoints = []
+        for shape in anchors:
+            anchor = NativeSegmentQuery.from_shape(shape)
+            group, position = anchor.source_work_coordinate(policy=policy)
+            require(group == coordinate)
+            endpoints.append(position)
+        lower, upper = endpoints
+        require(lower <= prefix <= upper)
+        require(lower != upper or canonical(anchors[0]) == canonical(anchors[1]))
+        weight = 0.0 if lower == upper else (prefix - lower) / (upper - lower)
+        require(
+            canonical(metadata["anchor_weights"]) == canonical([1 - weight, weight])
+        )
+        require(canonical(query["resolved_key"]) == canonical(anchors[0]))
+        require(
+            canonical(query["axes"])
+            == canonical([linear_axis("prefix_len", prefix, lower, upper, weight)])
+        )
+        require(
+            query["resolution"] == ("fallback" if lower == upper else "interpolated")
+        )
+        return query
+    except (AttributeError, KeyError, IndexError, TypeError, ValueError) as error:
+        raise PredictorError(
+            "data_unavailable",
+            "DSPark estimated cost lacks matching SDK source-work evidence",
+        ) from error
+
+
 class UMDDSparkCostModel:
     """Evaluate source-owned prepared graphs; no alternate latency table.
 
@@ -24,11 +109,13 @@ class UMDDSparkCostModel:
         proposal_profile_id=None,
         phase_preparers=None,
         native_source_policy=None,
+        native_source_work_policy=None,
     ):
         self.database = database
         self.proposal_profile_id = proposal_profile_id
         self.preparers = dict(phase_preparers or {})
         self.native_source_policy = native_source_policy
+        self.native_source_work_policy = native_source_work_policy
         if native_source_policy is not None:
             from infercast.sdk.native_segment_projection import (
                 NativeSegmentSourcePolicy,
@@ -50,6 +137,20 @@ class UMDDSparkCostModel:
                 for phases in _REGIONS.values()
                 for phase in phases
             }
+        if native_source_work_policy is not None:
+            from infercast.sdk.native_golden_material import GOLDEN_LAW
+            from infercast.sdk.native_segment_module import SOURCE_WORK_POLICY
+
+            if (
+                type(native_source_work_policy) is not str
+                or native_source_work_policy != SOURCE_WORK_POLICY
+                or native_source_policy is None
+                or native_source_policy.golden_law != GOLDEN_LAW
+            ):
+                raise PredictorError(
+                    "invalid_execution_profile",
+                    "native source work requires its versioned policy and verified golden source",
+                )
         if proposal_profile_id is not None:
             if "proposal" in self.preparers:
                 raise PredictorError(
@@ -371,29 +472,76 @@ class UMDDSparkCostModel:
             raise PredictorError(
                 "data_unavailable", "DSPark costs require measured UMD operations"
             )
+        source_work = (
+            self.native_source_work_policy is not None
+            and native_region
+            and len(step.groups) == 1
+            and step.groups[0].forward_mode == "TARGET_VERIFY"
+            and len(step.groups[0].requests) == 1
+        )
+        evaluation = {
+            "phase": graph_phase,
+            "env": bind_runtime_point(description, point),
+            "layer_repeat": graph.layer_repeat,
+        }
+        recorder = None
         try:
-            result = evaluate_phase_composition(
-                self.database,
-                nodes,
-                getattr(graph, graph_phase + "_composition"),
-                phase=graph_phase,
-                env=bind_runtime_point(description, point),
-                layer_repeat=graph.layer_repeat,
-            )
+            if source_work:
+                from infercast.sdk.diagnostics.prediction_evidence import (
+                    capture_prediction_evidence,
+                )
+                from infercast.sdk.native_segment_module import OP
+
+                with capture_prediction_evidence() as recorder:
+                    result = evaluate_phase_composition(
+                        self.database,
+                        nodes,
+                        getattr(graph, graph_phase + "_composition"),
+                        **evaluation,
+                        operation_kwargs={
+                            OP: {
+                                "source_work_policy": self.native_source_work_policy,
+                                "source_policy": self.native_source_policy,
+                            }
+                        },
+                    )
+            else:
+                result = evaluate_phase_composition(
+                    self.database,
+                    nodes,
+                    getattr(graph, graph_phase + "_composition"),
+                    **evaluation,
+                )
         except PerfDataNotAvailableError as error:
             raise PredictorError(
                 "data_unavailable", f"missing qualified DSPark cost for phase: {phase}"
             ) from error
-        if result.source != "silicon":
+        source_work_evidence = None
+        if result.source == "empirical" and source_work and recorder is not None:
+            source_work_evidence = _source_work_query_evidence(
+                recorder,
+                point=point,
+                phase=graph_phase,
+                policy=self.native_source_work_policy,
+                source_policy=self.native_source_policy,
+            )
+        elif result.source != "silicon":
             raise PredictorError(
                 "data_unavailable", "DSPark requires measured silicon cost provenance"
             )
+        identity_fields = {
+            "phase": phase,
+            "runtime": point,
+            "slice": str(self.database.slice_ref.slice_dir),
+        }
+        if source_work:
+            identity_fields["native_source_work_policy"] = (
+                self.native_source_work_policy
+            )
+        if source_work_evidence is not None:
+            identity_fields["source_work_query"] = source_work_evidence
         identity = json.dumps(
-            {
-                "phase": phase,
-                "runtime": point,
-                "slice": str(self.database.slice_ref.slice_dir),
-            },
+            identity_fields,
             sort_keys=True,
             separators=(",", ":"),
         )
