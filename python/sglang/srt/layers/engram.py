@@ -1109,8 +1109,8 @@ class EngramEmbedding(nn.Module):
             return self.peer.lookup(indices)
         if self._shared:
             if indices.shape[0] == 0:
-                return self._empty(indices)
-            out = self._empty(indices)
+                return self.new_rows(indices)
+            out = self.new_rows(indices)
             engram_gather(
                 *self._table_ptrs(),
                 indices.reshape(-1),
@@ -1168,7 +1168,7 @@ class EngramEmbedding(nn.Module):
         """Lookup when every TP rank holds the same indices: the device and
         per-rank host shards zero unowned rows and the all-reduce reassembles."""
         if indices.shape[0] == 0:
-            return self._empty(indices)
+            return self.new_rows(indices)
         values = self._owned_rows(indices)
         if self.tp_size > 1:
             values = self._reduce_owned_rows(values)
@@ -1183,7 +1183,8 @@ class EngramEmbedding(nn.Module):
             return values
         return tensor_model_parallel_all_reduce(values)
 
-    def _empty(self, indices: torch.Tensor) -> torch.Tensor:
+    def new_rows(self, indices: torch.Tensor) -> torch.Tensor:
+        """An uninitialized output for the rows of ``indices``."""
         return torch.empty(
             *indices.shape, self.dim, dtype=torch.bfloat16, device=indices.device
         )
@@ -1191,7 +1192,7 @@ class EngramEmbedding(nn.Module):
     def _owned_rows(self, indices: torch.Tensor) -> torch.Tensor:
         """Rows of `indices` this rank's shard holds, zero for the rest."""
         if self.rows == 0:
-            return self._empty(indices).zero_()
+            return self.new_rows(indices).zero_()
         if self.host_table is None and not _cuda_kernels(indices):
             local = indices - self.row_start
             owned = (local >= 0) & (local < self.rows)
@@ -1199,7 +1200,7 @@ class EngramEmbedding(nn.Module):
             rows = self.weight[local].float().unflatten(-1, (-1, FP8_BLOCK_SIZE))
             values = (rows * self.scale[local].float().unsqueeze(-1)).flatten(-2)
             return values.to(torch.bfloat16).masked_fill(~owned.unsqueeze(-1), 0)
-        out = self._empty(indices)
+        out = self.new_rows(indices)
         engram_gather(
             *self._table_ptrs(),
             indices.reshape(-1),
@@ -1224,7 +1225,7 @@ class EngramEmbedding(nn.Module):
         # The MAX_LEN gather may zero its local input in place, hence the clone.
         dp_gather_replicate(ids_global, indices.clone(), forward_batch)
         if rows == 0:
-            return self._empty(indices)
+            return self.new_rows(indices)
         values = self._owned_rows(ids_global).view(rows, -1)
         local = torch.empty(
             (indices.shape[0], values.shape[1]),
@@ -1348,7 +1349,7 @@ class Engram(nn.Module):
             and is_in_breakable_cuda_graph()
         ):
             # Every replay stages new rows, so the lookup runs between segments.
-            emb = self.embed._empty(hash_ids)
+            emb = self.embed.new_rows(hash_ids)
             _bcg_engram_embed(self, hash_ids, cp_all_tokens, emb)
         else:
             emb = self.embed_rows(hash_ids, forward_batch, cp_all_tokens)
