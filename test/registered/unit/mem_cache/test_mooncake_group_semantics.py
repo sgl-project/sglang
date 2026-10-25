@@ -80,6 +80,8 @@ def _fake_store_class():
 
         def __init__(self):
             self.batch_put_calls = []
+            self.batch_get_calls = []
+            self.get_results = None
             self.batch_exist_calls = []
             self.existing_keys = set()
             self.objects = {}
@@ -130,6 +132,18 @@ def _fake_store_class():
             )
             self.existing_keys.update(keys)
             return [0] * len(keys)
+
+        def batch_get_into(self, keys, ptrs, sizes):
+            self.batch_get_calls.append((list(keys), list(ptrs), list(sizes)))
+            return self.get_results if self.get_results is not None else list(sizes)
+
+        def batch_get_into_multi_buffers(self, keys, ptrs, sizes):
+            self.batch_get_calls.append((list(keys), list(ptrs), list(sizes)))
+            return (
+                self.get_results
+                if self.get_results is not None
+                else [sum(size) for size in sizes]
+            )
 
     return FakeMooncakeDistributedStore
 
@@ -279,6 +293,96 @@ def _make_store(
 
 
 class TestMooncakeGroupSemantics(CustomTestCase):
+    def test_v1_read_requires_complete_object_sizes(self):
+        cases = ([8, 8], [4, 8], [8, 4], [8, 0], [-1, 8], [16, 8], [8], [8, 8, 8])
+        for results in cases:
+            with self.subTest(results=results):
+                store, fake = _make_store()
+                store.register_mem_pool_host(FakeHostKVCache(objects_per_page=2))
+                fake.get_results = list(results)
+
+                self.assertEqual(
+                    store.batch_get_v1(["page"], torch.tensor([0])),
+                    [results == [8, 8]],
+                )
+
+    def test_v1_read_preserves_complete_pages_after_a_short_read(self):
+        store, fake = _make_store()
+        store.register_mem_pool_host(FakeHostKVCache(objects_per_page=2))
+        fake.get_results = [8, 4, 8, 8]
+
+        self.assertEqual(
+            store.batch_get_v1(["page0", "page1"], torch.tensor([0, 1])),
+            [False, True],
+        )
+
+    def test_mla_and_split_head_reads_require_every_object(self):
+        for config, objects in (
+            ({"is_mla_model": True}, 1),
+            ({"should_split_heads": True, "tp_size": 2, "tp_lcm_size": 4}, 4),
+        ):
+            for last_size in (8, 4):
+                with self.subTest(config=config, last_size=last_size):
+                    store, fake = _make_store(**config)
+                    store.register_mem_pool_host(FakeHostKVCache(objects))
+                    fake.get_results = [8] * (objects - 1) + [last_size]
+                    self.assertEqual(
+                        store.batch_get_v1(["page"], torch.tensor([0])),
+                        [last_size == 8],
+                    )
+
+    def test_v2_read_validates_scalar_and_scatter_gather_sizes(self):
+        for results in ([8, 24], [4, 24], [8, 16], [8, -1], [8], [8, 24, 24]):
+            with self.subTest(results=results):
+                store, fake = _make_store(is_mla_model=True)
+                store.register_mem_host_pool_v2(FakeIndexerPool(), PoolName.INDEXER)
+                store.register_mem_host_pool_v2(
+                    FakeMultiBufferPool(), PoolName.DEEPSEEK_V4_C4
+                )
+                fake.get_results = list(results)
+                actual = store.batch_get_v2(
+                    [
+                        PoolTransfer(
+                            name=name, keys=["page"], host_indices=torch.tensor([0])
+                        )
+                        for name in (PoolName.INDEXER, PoolName.DEEPSEEK_V4_C4)
+                    ]
+                )
+                expected = (
+                    [results[0] == 8, results[1] == 24]
+                    if len(results) == 2
+                    else [False, False]
+                )
+                self.assertEqual(actual[PoolName.INDEXER], [expected[0]])
+                self.assertEqual(actual[PoolName.DEEPSEEK_V4_C4], [expected[1]])
+
+    def test_zero_byte_read_is_not_a_hit(self):
+        store, fake = _make_store(is_mla_model=True)
+        pool = FakeHostKVCache(objects_per_page=1)
+        store.register_mem_pool_host(pool)
+        fake.get_results = [0]
+        with patch.object(pool, "get_page_buffer_meta", return_value=([1000], [0])):
+            self.assertEqual(store.batch_get_v1(["page"], torch.tensor([0])), [False])
+
+    def test_legacy_read_apis_reject_incomplete_buffers(self):
+        store, fake = _make_store()
+        for results in ([8], [4], [0], [-1], [], [8, 8]):
+            with self.subTest(single_read=results):
+                fake.get_results = list(results)
+                self.assertEqual(store.get("object", 1000, 8), results == [8])
+        for results, complete_pages in (
+            ([8, 8, 8, 8], 2),
+            ([8, 8, 4, 8], 1),
+            ([0, 8, 8, 8], 0),
+            ([8], 0),
+        ):
+            with self.subTest(batch_read=results):
+                fake.get_results = list(results)
+                self.assertEqual(
+                    store.batch_get(["k0", "v0", "k1", "v1"], [1000] * 4, [8] * 4),
+                    complete_pages,
+                )
+
     def test_dcp_shard_keys_and_replicas(self):
         base = replace(
             _make_config(is_mla_model=True, tp_size=4),

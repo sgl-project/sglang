@@ -1512,10 +1512,23 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         self, key_strs: List[str], buffer_ptrs: List[Any], buffer_sizes: List[Any]
     ) -> List[int]:
         if self._uses_multi_buffer(buffer_ptrs):
-            return self.store.batch_get_into_multi_buffers(
+            results = self.store.batch_get_into_multi_buffers(
                 key_strs, buffer_ptrs, buffer_sizes
             )
-        return self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
+        else:
+            results = self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
+
+        expected_bytes = [
+            sum(size) if isinstance(size, Sequence) else size for size in buffer_sizes
+        ]
+        if len(results) != len(expected_bytes):
+            return [-1] * len(expected_bytes)
+        # A positive byte count can still be a short read. Every KV object must
+        # fill all its destinations before any read API can count it as a hit.
+        return [
+            result if result < 0 or (result == size and size > 0) else -1
+            for result, size in zip(results, expected_bytes)
+        ]
 
     def _batch_exist(self, key_strs: List[str]) -> List[int]:
         return self.store.batch_is_exist(key_strs)
