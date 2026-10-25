@@ -251,15 +251,16 @@ def test_attention_replay_uses_live_batch_and_static_output_buffers(return_lse, 
     index_pointer = index_output.data_ptr() if sparse else None
     with attention_scope(live_batch, backend, raw_num_tokens=1):
         graph._break_fns[0]()
-    assert seen == [captured_batch, live_batch]
+    # The capture pass records the break; only the replay runs it.
+    assert seen == [live_batch]
     assert output.data_ptr() == pointer
-    assert torch.all(output[:1] == 2) and torch.count_nonzero(output[1:]) == 0
+    assert torch.all(output[:1] == 1) and torch.count_nonzero(output[1:]) == 0
     if sparse:
         assert index_output.data_ptr() == index_pointer
-        assert torch.all(index_output[:1] == 4)
+        assert torch.all(index_output[:1] == 3)
         assert torch.count_nonzero(index_output[1:]) == 0
     if return_lse:
-        assert torch.all(lse[:1] == 2) and torch.count_nonzero(lse[1:]) == 0
+        assert torch.all(lse[:1] == 1) and torch.count_nonzero(lse[1:]) == 0
 
 
 def test_prefill_graph_policy_restores_after_exception():
