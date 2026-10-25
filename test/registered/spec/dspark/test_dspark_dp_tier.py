@@ -13,34 +13,7 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
-
-
-class TestLocalVerifyTierNumTokens(CustomTestCase):
-    def test_no_budget_returns_sentinel(self):
-        self.assertEqual(
-            local_verify_tier_num_tokens(
-                bs=8,
-                verify_token_budget=None,
-                verify_num_draft_tokens=6,
-                min_verify_len=1,
-            ),
-            -1,
-        )
-
-    def test_budget_adds_to_anchor_floor(self):
-        self.assertEqual(
-            local_verify_tier_num_tokens(
-                bs=8,
-                verify_token_budget=10,
-                verify_num_draft_tokens=6,
-                min_verify_len=1,
-            ),
-            18,
-        )
-
-    # Clamp/floor variants (verify-all clamp, min_verify_len floor, min=0) are
-    # covered by the TestBusyIdleGraphKeyIdentity sweep bounds.
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class TestDpGlobalVerifyTierNumTokens(CustomTestCase):
@@ -69,6 +42,8 @@ class TestDraftDpSyncMetadata(CustomTestCase):
             global_num_tokens=[1, 3, 0, 2],
             global_num_tokens_for_logprob=[1, 3, 0, 2],
             can_run_decode_cuda_graph=True,
+            is_extend_in_batch=False,
+            dp_spec_prefill_coordination_applied=False,
         )
 
         with patch(

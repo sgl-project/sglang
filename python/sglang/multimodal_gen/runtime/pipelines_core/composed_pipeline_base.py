@@ -19,6 +19,10 @@ from sglang.multimodal_gen.runtime.disaggregation.roles import (
     RoleType,
     filter_modules_for_role,
 )
+from sglang.multimodal_gen.runtime.loader.comfyui_checkpoints import (
+    is_comfyui_single_file,
+    load_comfyui_transformer,
+)
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentLoader,
     PipelineComponentLoader,
@@ -48,6 +52,12 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_co
     is_legacy_dit_offload_component_name,
     is_text_encoder_component_name,
     is_vae_component_name,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.comfyui_mode import (
+    COMFYUI_REQUIRED_MODULES,
+    create_comfyui_pipeline_stages,
+    initialize_comfyui_pipeline,
+    is_comfyui_mode,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor import (
     PipelineExecutor,
@@ -145,6 +155,9 @@ class ComposedPipelineBase(ABC):
         )
         if base_required_config_modules is None:
             raise NotImplementedError("Subclass must set _required_config_modules")
+        if is_comfyui_mode(server_args):
+            # ComfyUI owns text encoding, VAE decode, and the sampler loop.
+            base_required_config_modules = COMFYUI_REQUIRED_MODULES
         self._unfiltered_required_config_modules = tuple(base_required_config_modules)
         self._required_config_modules = list(self._unfiltered_required_config_modules)
         self._extra_config_module_map = dict(self._extra_config_module_map)
@@ -206,6 +219,12 @@ class ComposedPipelineBase(ABC):
 
     def __post_init__(self) -> None:
         assert self.server_args is not None, "server_args must be set"
+        if is_comfyui_mode(self.server_args):
+            initialize_comfyui_pipeline(self, self.server_args)
+            logger.info("Creating ComfyUI pipeline stages...")
+            create_comfyui_pipeline_stages(self, self.server_args)
+            return
+
         self.initialize_pipeline(self.server_args)
 
         logger.info("Creating pipeline stages...")
@@ -292,7 +311,10 @@ class ComposedPipelineBase(ABC):
 
     def validate_disagg_role(self, role: RoleType) -> None:
         """Validate whether the requested disaggregation role is supported."""
-        return
+        if role in (RoleType.PROMPT_ENCODER, RoleType.IMAGE_ENCODER):
+            raise ValueError(
+                f"{self.pipeline_name} does not support separate prompt/image encoder roles"
+            )
 
     def _get_extra_allowed_modules_for_role(
         self, role: RoleType, task_name: str
@@ -303,6 +325,7 @@ class ComposedPipelineBase(ABC):
                 "Flux2KleinPipeline": {"vae"},
                 "QwenImageEditPipeline": {"vae"},
                 "QwenImageEditPlusPipeline": {"vae"},
+                "QwenImage21Pipeline": {"vae"},
                 "QwenImageLayeredPipeline": {"vae", "transformer"},
                 "LongCatImageEditPipeline": {"vae"},
                 "GlmImagePipeline": {"vae", "transformer"},
@@ -575,6 +598,8 @@ class ComposedPipelineBase(ABC):
         loaded_modules: Optional[Dict[str, torch.nn.Module]] = None,
         If provided, loaded_modules will be used instead of loading from config/pretrained weights.
         """
+        if is_comfyui_mode(server_args) and is_comfyui_single_file(self.model_path):
+            return load_comfyui_transformer(self, server_args, loaded_modules)
 
         model_index = self._load_config()
         logger.info("Loading pipeline modules from config: %s", model_index)
@@ -768,6 +793,9 @@ class ComposedPipelineBase(ABC):
                     module_name, load_module_name
                 )
             )
+            backend_by_role = server_args.resolve_component_backend_by_role(
+                module_name, load_module_name
+            )
             if attn_backend is not None:
                 logger.info(
                     "Using %s backend for component: %s",
@@ -784,6 +812,7 @@ class ComposedPipelineBase(ABC):
                 component_architecture=architecture,
                 component_attn_backend=attn_backend,
                 component_attn_name=matched_backend_key or module_name,
+                component_backend_by_role=backend_by_role,
             )
 
             self.memory_usages[module_name] = memory_usage
@@ -835,9 +864,7 @@ class ComposedPipelineBase(ABC):
         role_affinity: RoleType,
         stage_name: str,
     ) -> bool:
-        if self._disagg_role == RoleType.MONOLITHIC:
-            return True
-        if role_affinity == self._disagg_role:
+        if self._disagg_role.includes_stage(role_affinity):
             return True
 
         logger.info(
@@ -1250,10 +1277,7 @@ class ComposedPipelineBase(ABC):
                 main_process_only=True,
             )
 
-        self.component_residency_manager = get_global_component_residency_manager(
-            self, server_args
-        )
-        self.executor.component_residency_manager = self.component_residency_manager
+        self._install_component_residency_manager(server_args)
 
         return self.executor.execute_with_profiling(self.stages, batch, server_args)
 
@@ -1283,10 +1307,7 @@ class ComposedPipelineBase(ABC):
                 main_process_only=True,
             )
 
-        self.component_residency_manager = get_global_component_residency_manager(
-            self, server_args
-        )
-        self.executor.component_residency_manager = self.component_residency_manager
+        self._install_component_residency_manager(server_args)
         return self.executor.execute_group_with_profiling(
             self.stages, batches, server_args
         )
@@ -1305,12 +1326,23 @@ class ComposedPipelineBase(ABC):
             yield self.forward(batches[0], server_args)
             return
 
-        self.component_residency_manager = get_global_component_residency_manager(
-            self, server_args
-        )
-        self.executor.component_residency_manager = self.component_residency_manager
+        self._install_component_residency_manager(server_args)
         yield from self.executor.execute_group_sequentially_with_profiling(
             self.stages,
             batches,
             server_args,
         )
+
+    def _install_component_residency_manager(self, server_args: ServerArgs) -> None:
+        """Publish the residency manager the executor dereferences unguarded.
+
+        ``PipelineExecutor`` initializes ``component_residency_manager`` to
+        ``None``, and every ``_execute_stages`` run enters
+        ``_component_residency_request``. An entry point that reaches the
+        executor without calling this raises ``AttributeError`` on ``None``, so
+        all three forward paths must install it.
+        """
+        self.component_residency_manager = get_global_component_residency_manager(
+            self, server_args
+        )
+        self.executor.component_residency_manager = self.component_residency_manager

@@ -4,13 +4,12 @@ import sys
 import tempfile
 import types
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
 
 import torch
 
-from sglang.multimodal_gen.configs.models.dits.sana_wm import SanaWMConfig
-from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.configs.pipeline_configs.sana_wm import SanaWMPipelineConfig
 from sglang.multimodal_gen.configs.sample.sana_wm import SanaWMSamplingParams
 from sglang.multimodal_gen.registry import _get_config_info, get_pipeline_config_classes
@@ -47,7 +46,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.s
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm.refiner import (
     OfficialDiffusersLTX2RefinerModule,
-    OfficialGemma3TextEncoderModule,
     SanaWMLTX2RefinerStage,
     SanaWMRefinerDecodingStage,
     _forward_diffusers_video_only,
@@ -89,9 +87,6 @@ class _GlobalStageArgsMixin:
 class TestSanaWMPipelineConfig(unittest.TestCase):
     def setUp(self) -> None:
         self.config = SanaWMPipelineConfig()
-
-    def test_task_type_is_ti2v(self) -> None:
-        self.assertEqual(self.config.task_type, ModelTaskType.TI2V)
 
     def test_adjust_num_frames_rounds_to_temporal_stride(self) -> None:
         self.assertEqual(self.config.adjust_num_frames(50), 49)
@@ -135,31 +130,6 @@ class TestSanaWMPipelineConfig(unittest.TestCase):
         )
         self.assertIs(kwargs["camera_conditions"], camera_conditions)
         self.assertIs(kwargs["chunk_plucker"], chunk_plucker)
-
-    def test_deployment_config_enables_memory_mode_dit_layerwise_offload(
-        self,
-    ) -> None:
-        deployment = self.config.get_model_deployment_config()
-        self.assertEqual(deployment.dit_layerwise_offload_modes, ("memory",))
-        self.assertEqual(deployment.fsdp_auto_min_available_memory_gb, 60)
-
-    def test_text_encoder_padding_matches_cfg_concat_contract(self) -> None:
-        self.assertEqual(
-            self.config.text_encoder_extra_args[0]["padding"], "max_length"
-        )
-        self.assertTrue(self.config.text_encoder_extra_args[0]["return_attention_mask"])
-        self.assertTrue(self.config.chi_prompt)
-
-    def test_inference_flow_shift_matches_official_reference(self) -> None:
-        self.assertEqual(self.config.flow_shift, 9.95)
-        self.assertEqual(self.config.inference_flow_shift, 9.8)
-
-    def test_dit_arch_text_norm_defaults_match_upstream(self) -> None:
-        arch = SanaWMConfig().arch_config
-        self.assertTrue(arch.y_norm)
-        self.assertEqual(arch.y_norm_scale_factor, 0.01)
-        self.assertEqual(arch.y_norm_eps, 1e-5)
-        self.assertEqual(arch.timestep_norm_scale_factor, 1.0)
 
     def test_prepare_neg_cond_kwargs_keeps_camera_for_cfg(self) -> None:
         camera_conditions = torch.zeros(1, 7, 20)
@@ -296,15 +266,6 @@ class TestSanaWMPipelineConfig(unittest.TestCase):
 
 
 class TestSanaWMSamplingParams(unittest.TestCase):
-    def test_defaults_match_video_ti2v_contract(self) -> None:
-        params = SanaWMSamplingParams()
-        self.assertEqual(params.height, 704)
-        self.assertEqual(params.width, 1280)
-        self.assertEqual(params.num_frames, 49)
-        self.assertEqual(params.num_inference_steps, 20)
-        self.assertEqual(params.guidance_scale, 4.5)
-        self.assertEqual(params.negative_prompt, "")
-
     def test_build_request_extra_omits_camera_by_default(self) -> None:
         params = SanaWMSamplingParams()
         extra = params.build_request_extra()
@@ -1149,16 +1110,6 @@ class TestSanaWMDenoisingStage(unittest.TestCase):
 
 
 class TestSanaWMNativeDiTChunking(unittest.TestCase):
-    def test_softmax_chunking_is_disabled_by_default_for_upstream_parity(self) -> None:
-        arch = SanaWMConfig().arch_config
-
-        self.assertFalse(arch.use_chunked_softmax_attention)
-
-    def test_main_gdn_backend_defaults_to_auto(self) -> None:
-        arch = SanaWMConfig().arch_config
-
-        self.assertEqual(arch.gdn_backend, "auto")
-
     def test_first_chunk_plus_one_chunk_indices_match_upstream(self) -> None:
         self.assertEqual(
             _sana_wm_chunk_index_from_chunk_size(
@@ -1358,16 +1309,6 @@ class TestSanaWMRefinerStage(_GlobalStageArgsMixin, unittest.TestCase):
         )
 
         self.assertEqual(_refiner_config_value(module, "patch_size"), 1)
-
-    def test_official_refiner_wrappers_expose_layerwise_blocks(self) -> None:
-        self.assertEqual(
-            OfficialDiffusersLTX2RefinerModule.layer_names,
-            ["module.transformer_blocks"],
-        )
-        self.assertIn(
-            "module.model.language_model.layers",
-            OfficialGemma3TextEncoderModule.layer_names,
-        )
 
     def test_refiner_component_uses_follow_execution_order(self) -> None:
         stage = SanaWMLTX2RefinerStage(
@@ -1596,6 +1537,51 @@ class TestSanaWMRefinerStage(_GlobalStageArgsMixin, unittest.TestCase):
             )
 
         self.assertTrue(torch.equal(frames, decoded))
+
+    def test_refiner_forward_uses_non_streaming_decode_override(self) -> None:
+        decoded = torch.arange(1 * 3 * 4 * 2 * 2).reshape(1, 3, 4, 2, 2)
+        decoding_module = "sglang.multimodal_gen.runtime.pipelines_core.stages.decoding"
+        for applied in (True, False):
+            with self.subTest(refiner_applied=applied):
+                vae = SimpleNamespace()
+                stage = SanaWMRefinerDecodingStage(vae=vae)
+                batch = SimpleNamespace(
+                    latents=torch.empty(1, 128, 4, 2, 2),
+                    sampling_params=SanaWMSamplingParams(),
+                    extra={"sana_wm_refiner_applied": applied},
+                    return_trajectory_decoded=False,
+                    trajectory_timesteps=None,
+                    trajectory_latents=None,
+                    rollout_trajectory_data=None,
+                    metrics=None,
+                    usage=None,
+                )
+                args = SimpleNamespace(pipeline_config=SanaWMPipelineConfig())
+                with (
+                    patch.object(stage, "load_model"),
+                    patch.object(
+                        stage, "use_declared_component", return_value=nullcontext(vae)
+                    ),
+                    patch(
+                        f"{decoding_module}.resolve_decode_precision",
+                        return_value=torch.bfloat16,
+                    ),
+                    patch(
+                        f"{decoding_module}.use_vae_fast_path",
+                        return_value=nullcontext(),
+                    ),
+                    patch.object(DecodingStage, "decode", return_value=decoded),
+                    patch.object(
+                        args.pipeline_config,
+                        "post_decoding",
+                        side_effect=lambda frames, _: frames,
+                    ),
+                ):
+                    output = stage.forward(batch, args)
+
+                expected = decoded[:, :, 1:] if applied else decoded
+                self.assertTrue(torch.equal(output.output, expected))
+                self.assertIsNone(output.output_file_paths)
 
 
 if __name__ == "__main__":

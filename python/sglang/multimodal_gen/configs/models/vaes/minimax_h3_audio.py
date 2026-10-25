@@ -33,6 +33,11 @@ class MiniMaxH3AudioVAEConfig(VAEConfig):
         super().update_model_arch(model_dict)
 
     def post_init(self) -> None:
+        if (
+            self.arch_config.latents_mean is None
+            and self.arch_config.latents_std is None
+        ):
+            return
         validate_minimax_h3_vae_latent_stats(
             self.arch_config,
             component_name="audio_vae",

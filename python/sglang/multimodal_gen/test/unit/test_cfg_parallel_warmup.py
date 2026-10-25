@@ -4,8 +4,8 @@ Covers warmup and cfg-parallel guard paths introduced alongside this file:
 - build_warmup_reqs synthesizes warmup Reqs that actually enable
   classifier-free guidance when cfg-parallel is on.
 - DiffGenerator sends explicit warmup resolutions through the scheduler client.
-- InputValidationStage.forward rejects non-CFG requests when the server
-  has cfg-parallel on.
+- InputValidationStage.forward ACCEPTS non-CFG requests when the server
+  has cfg-parallel on, and the branch dispatcher serves them.
 - Server-based warmup can opt into model-default negative prompts so warmup
   populates the negative text embedding cache.
 - Req-based warmup remains available only through the lazy legacy path.
@@ -13,8 +13,11 @@ Covers warmup and cfg-parallel guard paths introduced alongside this file:
 All tests are CPU-only; no model loading, no distributed init.
 """
 
+import json
+import shlex
 import unittest
 from collections import deque
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import (
     ANY,
@@ -22,18 +25,30 @@ from unittest.mock import (
     patch,
 )
 
+import pytest
 import torch
 
+import sglang.multimodal_gen.test.server.test_server_common as server_test_common
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
+from sglang.multimodal_gen.configs.pipeline_configs.flux3_image import (
+    Flux3ImageSamplingParams,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.flux_finetuned import (
     Flux2FinetunedPipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.longlive2 import (
     LongLive2T2VConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.ltx_2_5 import LTX25PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.sana_wm import SanaWMPipelineConfig
 from sglang.multimodal_gen.configs.sample.longlive2 import LongLive2SamplingParams
+from sglang.multimodal_gen.configs.sample.ltx_2_5 import LTX25SamplingParams
 from sglang.multimodal_gen.configs.sample.minimax_h3 import MiniMaxH3SamplingParams
-from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.configs.sample.sampling_params import (
+    SamplingParams,
+    normalize_quality,
+)
+from sglang.multimodal_gen.configs.sample.sana_wm import SanaWMSamplingParams
 from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
     SetLoraReq,
     UnmergeLoraWeightsReq,
@@ -59,10 +74,16 @@ from sglang.multimodal_gen.runtime.warmup_request_builder import (
     DEFAULT_PLACEHOLDER_PROMPT,
     SERVER_WARMUP_IMAGE_FALLBACK_RESOLUTION,
     _apply_warmup_sampling_overrides,
+    _resolve_default_warmup_resolution,
     _resolve_warmup_num_frames,
     build_warmup_reqs,
     should_include_warmup_image,
     supports_synthetic_warmup,
+)
+from sglang.multimodal_gen.test.server.gpu_cases import ONE_GPU_CASES, TWO_GPU_CASES
+from sglang.multimodal_gen.test.server.testcase_configs import (
+    _get_extra_arg_value,
+    _with_warmup_quality,
 )
 
 
@@ -697,6 +718,134 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
         self.assertEqual(num_frames, 17)
         pipeline_config.adjust_num_frames.assert_called_once_with(17)
 
+    def test_server_warmup_preserves_explicit_frames_without_cuda_graphs(self):
+        server_args = SimpleNamespace(
+            pipeline_config=LTX25PipelineConfig(),
+            enable_breakable_cuda_graph=False,
+            pipeline_class_name="LTX2Pipeline",
+            num_gpus=2,
+            warmup_num_frames=49,
+        )
+
+        num_frames = _resolve_warmup_num_frames(
+            server_args, LTX25SamplingParams(), server_based_warmup=True
+        )
+
+        self.assertEqual(num_frames, 57)
+
+    def test_sana_ci_warmup_matches_formal_shape(self):
+        case = next(case for case in ONE_GPU_CASES if case.id == "sana_wm_ti2v")
+        resolution = _get_extra_arg_value(
+            case.server_args.extras, "--warmup-resolutions"
+        )
+        server_args = SimpleNamespace(
+            pipeline_config=SanaWMPipelineConfig(),
+            pipeline_class_name=None,
+            model_path=case.server_args.model_path,
+            model_id=None,
+            backend="sglang",
+            num_gpus=1,
+            warmup_steps=1,
+            warmup_num_frames=None,
+            warmup_sampling_params=None,
+            enable_breakable_cuda_graph=False,
+            enable_torch_compile=False,
+            enable_cfg_parallel=False,
+        )
+        with patch.object(
+            SamplingParams, "from_pretrained", return_value=SanaWMSamplingParams()
+        ):
+            reqs = build_warmup_reqs(
+                server_args,
+                warmup_resolutions=[resolution],
+                warmup_input_path="synthetic-warmup.png",
+                server_based_warmup=True,
+            )
+        self.assertEqual(resolution, case.sampling_params.output_size)
+        self.assertEqual(len(reqs), 1)
+        self.assertEqual((reqs[0].width, reqs[0].height), (384, 640))
+        self.assertEqual(reqs[0].num_frames, case.sampling_params.num_frames)
+
+    def test_ci_warmup_runs_the_request_quality(self):
+        """A request below the server default level unmounts the fusions warmup
+        mounted, so its timed run takes an unwarmed path; warmup must match."""
+        for case in ONE_GPU_CASES + TWO_GPU_CASES:
+            request_quality = case.sampling_params.extras.get("quality")
+            if request_quality is None:
+                continue
+            warmup = _get_extra_arg_value(
+                case.server_args.extras, "--warmup-sampling-params"
+            )
+            self.assertIsNotNone(warmup, case.id)
+            self.assertEqual(
+                json.loads(warmup)["quality"],
+                normalize_quality(request_quality),
+                case.id,
+            )
+
+    def test_warmup_quality_merges_into_existing_warmup_params(self):
+        merged = _with_warmup_quality(
+            ["--load-x", """--warmup-sampling-params '{"num_frames": 9}'"""],
+            "exact",
+        )
+        self.assertEqual(
+            json.loads(_get_extra_arg_value(merged, "--warmup-sampling-params")),
+            {"num_frames": 9, "quality": "exact"},
+        )
+        self.assertEqual(merged[0], "--load-x")
+        kept = _with_warmup_quality(
+            ["""--warmup-sampling-params='{"quality": "lossless"}'"""], "exact"
+        )
+        self.assertEqual(
+            json.loads(_get_extra_arg_value(kept, "--warmup-sampling-params")),
+            {"quality": "lossless"},
+        )
+
+    def test_ltx25_ci_warmup_matches_formal_decoder_and_shape(self):
+        case = next(
+            case
+            for case in TWO_GPU_CASES
+            if case.id == "ltx_2_5_diffusion_decoder_2gpus"
+        )
+        extras = case.server_args.extras
+        server_args = SimpleNamespace(
+            pipeline_config=LTX25PipelineConfig(),
+            pipeline_class_name=None,
+            model_path=case.server_args.model_path,
+            model_id=None,
+            backend="sglang",
+            num_gpus=2,
+            warmup_steps=1,
+            warmup_num_frames=int(_get_extra_arg_value(extras, "--warmup-num-frames")),
+            warmup_sampling_params=_get_extra_arg_value(
+                extras, "--warmup-sampling-params"
+            ),
+            enable_breakable_cuda_graph=False,
+            enable_torch_compile=False,
+            enable_cfg_parallel=False,
+        )
+        resolution = _get_extra_arg_value(extras, "--warmup-resolutions")
+        with patch.object(
+            SamplingParams, "from_pretrained", return_value=LTX25SamplingParams()
+        ):
+            reqs = build_warmup_reqs(
+                server_args,
+                warmup_resolutions=[resolution],
+                warmup_input_path="synthetic-warmup.png",
+                server_based_warmup=True,
+            )
+
+        self.assertEqual(len(reqs), 1)
+        req = reqs[0]
+        self.assertEqual(resolution, case.sampling_params.output_size)
+        self.assertEqual(server_args.warmup_num_frames, case.sampling_params.num_frames)
+        self.assertEqual((req.width, req.height, req.num_frames), (768, 448, 57))
+        self.assertEqual(
+            req.sampling_params.use_diffusion_decoder,
+            case.sampling_params.extras["use_diffusion_decoder"],
+        )
+        self.assertEqual(req.num_inference_steps, 2)
+
     def test_server_based_warmup_uses_video_supported_resolution_budget(self):
         server_args = MagicMock()
         server_args.warmup_steps = 1
@@ -733,6 +882,25 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
         self.assertEqual((reqs[0].width, reqs[0].height), (832, 480))
         self.assertEqual(reqs[0].num_frames, 17)
         self.assertEqual(reqs[0].num_inference_steps, 2)
+
+    def test_bcg_capture_keeps_the_full_default_video_resolution(self):
+        # graphs replay only the captured shape, so the video area cap must not apply
+        server_args = MagicMock()
+        server_args.pipeline_config.task_type = ModelTaskType.T2V
+        server_args.enable_breakable_cuda_graph = True
+        sampling_defaults = SamplingParams(
+            width=1280,
+            height=720,
+            num_frames=81,
+            supported_resolutions=[(1280, 720), (832, 480)],
+        )
+
+        self.assertEqual(
+            _resolve_default_warmup_resolution(
+                server_args, sampling_defaults, server_based_warmup=True
+            ),
+            (1280, 720),
+        )
 
     def test_ltx2_two_stage_warmup_uses_pipeline_alignment(self):
         server_args = MagicMock()
@@ -816,6 +984,8 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
         server_based_expected = {
             ModelTaskType.T2I: False,
             ModelTaskType.T2V: False,
+            ModelTaskType.V2V: False,
+            ModelTaskType.F2V: False,
             ModelTaskType.TI2I: True,
             ModelTaskType.TI2V: True,
             ModelTaskType.I2I: True,
@@ -962,6 +1132,35 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
             reqs[0].image_path,
             ["/tmp/warmup.png", "/tmp/warmup.png"],
         )
+
+    def test_breakable_warmup_uses_configured_references(self):
+        server_args = MagicMock()
+        server_args.warmup_steps = 1
+        server_args.enable_cfg_parallel = False
+        server_args.enable_torch_compile = False
+        server_args.enable_breakable_cuda_graph = True
+        server_args.pipeline_config.task_type = ModelTaskType.TI2I
+        references = ["first.png", "second.png"]
+
+        with patch(
+            "sglang.multimodal_gen.runtime.warmup_request_builder.get_model_sampling_defaults",
+            return_value=Flux3ImageSamplingParams(
+                width=512,
+                height=512,
+                image_path=references,
+                flux3_mode="i2i",
+                num_inference_steps=16,
+            ),
+        ):
+            req = build_warmup_reqs(
+                server_args,
+                warmup_resolutions=["512x512"],
+                server_based_warmup=True,
+            )[0]
+
+        self.assertEqual(req.image_path, references)
+        self.assertEqual(req.flux3_mode, "i2i")
+        self.assertEqual(req.sampling_params._explicit_fields, {"width", "height"})
 
     def test_server_based_warmup_keeps_required_image_input(self):
         server_args = MagicMock()
@@ -1115,26 +1314,28 @@ class TestImageVaeEncodingLatentRetrieval(unittest.TestCase):
         )
 
 
-class TestInputValidationCfgParallelGuard(unittest.TestCase):
-    """Commit 2: per-request cfg-parallel check.
+class TestInputValidationCfgParallelSingleBranch(unittest.TestCase):
+    """A request that turns CFG off must still be served under cfg-parallel.
+
+    This used to raise. The guard came from a warmup hang (#23198, 2026-04-23);
+    two weeks later the multi-branch refactor (#23736) taught the dispatcher to
+    handle a single branch, and the warmup builder grew its own fix (it forces
+    CFG on whenever cfg-parallel is enabled). What the guard still did was refuse
+    live traffic the runtime could serve -- and because cfg-parallel is
+    AUTO-enabled from the model's default sampling params, a plain
+    `sglang serve --num-gpus 2` on a CFG-defaulting model rejected every
+    guidance_scale=1.0 request, citing a flag the user never passed.
 
     Both tests patch _generate_seeds (the first statement of
-    InputValidationStage.forward, input_validation.py:274) to sidestep
-    its device-lookup / generator-creation code which pulls in torch
-    CUDA bindings — keeps the suite strictly CPU-only. We still need
-    num_inference_steps on the Req because the stage's
-    "num_inference_steps <= 0" check at L305-308 raises TypeError on
-    None before the new commit-2 check is reached.
+    InputValidationStage.forward) to sidestep its device-lookup / generator
+    creation, keeping the suite CPU-only. num_inference_steps must be set because
+    the "num_inference_steps <= 0" check raises TypeError on None first.
     """
 
-    def test_input_validation_rejects_cfg_parallel_without_cfg(self):
-        # negative_prompt="" (non-None) ensures the existing
-        # negative_prompt-is-None check at input_validation.py:295-298
-        # does NOT fire first — this isolates the new commit-2 check.
-        # width/height/num_outputs_per_prompt pre-set so the stage's
-        # default-dimension block at L352-361 doesn't mutate the Req
-        # in a way that obscures the assertion target.
-        req = Req(
+    def _single_branch_req(self) -> Req:
+        # negative_prompt="" (non-None) keeps the negative_prompt-is-None check
+        # from firing first, so this isolates the cfg-parallel path.
+        return Req(
             prompt="test",
             negative_prompt="",
             guidance_scale=1.0,
@@ -1144,29 +1345,26 @@ class TestInputValidationCfgParallelGuard(unittest.TestCase):
             width=512,
             height=512,
         )
+
+    def test_input_validation_accepts_cfg_parallel_without_cfg(self):
+        req = self._single_branch_req()
         self.assertIs(
             req.do_classifier_free_guidance,
             False,
-            "Sanity: test setup must leave do_cfg=False so the "
-            "commit-2 check is the one that fires, not an upstream check.",
+            "Sanity: the setup must leave do_cfg=False, or this tests nothing.",
         )
 
         stage = _make_input_validation_stage()
         server_args = _make_validation_server_args(enable_cfg_parallel=True)
 
         with patch.object(InputValidationStage, "_generate_seeds"):
-            with self.assertRaises(ValueError) as ctx:
+            try:
                 stage.forward(req, server_args)
-
-        msg = str(ctx.exception).lower()
-        self.assertIn("cfg-parallel", msg)
-        for field in (
-            "do_classifier_free_guidance",
-            "guidance_scale",
-            "true_cfg_scale",
-            "negative_prompt",
-        ):
-            self.assertIn(field, str(ctx.exception))
+            except ValueError as e:
+                self.fail(
+                    "forward() rejected a single-branch request under "
+                    f"cfg-parallel; the dispatcher can serve it: {e}"
+                )
 
     def test_input_validation_passes_cfg_parallel_with_cfg(self):
         req = Req(
@@ -1195,5 +1393,143 @@ class TestInputValidationCfgParallelGuard(unittest.TestCase):
                 self.fail(f"forward() raised ValueError on a valid CFG request: {e}")
 
 
+class TestCfgParallelServesOneBranch(unittest.TestCase):
+    """The property that makes accepting a single-branch request safe.
+
+    Dropping the validation guard is only correct because the dispatcher already
+    handles n_branches=1 on a 2-rank CFG group: rank 0 owns the branch, every
+    other rank runs it too so the all-gather has shapes, and the reorder step
+    hands both ranks the owner's prediction. Pin it from the rank that owns
+    nothing -- that is the rank the old comment said returned None and hung a
+    gloo broadcast for half an hour.
+    """
+
+    def _run_on_rank(self, cfg_rank: int, n_branches: int = 1, world_size: int = 2):
+        from sglang.multimodal_gen.runtime.distributed.cfg_policy import (
+            CFGBranch,
+            CFGPolicy,
+        )
+
+        mod = "sglang.multimodal_gen.runtime.distributed.cfg_parallel_utils"
+        branches = [CFGBranch(f"b{i}", i == 0, {"tag": i}) for i in range(n_branches)]
+        policy = CFGPolicy(branches=branches)
+        seen: list[int] = []
+
+        def predict_fn(branch):
+            seen.append(branch.kwargs["tag"])
+            return torch.full((1, 2), float(branch.kwargs["tag"]))
+
+        # A real 2-rank gather returns one tensor per rank. Both ranks ran the
+        # same branch here, so both contributions carry the same values.
+        def fake_all_gather(t, dim=0, separate_tensors=False):
+            return [t.clone() for _ in range(world_size)]
+
+        with (
+            patch(f"{mod}.get_classifier_free_guidance_rank", return_value=cfg_rank),
+            patch(
+                f"{mod}.get_classifier_free_guidance_world_size",
+                return_value=world_size,
+            ),
+            patch(f"{mod}.get_local_torch_device", return_value=torch.device("cpu")),
+            patch(f"{mod}.cfg_model_parallel_all_gather", side_effect=fake_all_gather),
+        ):
+            from sglang.multimodal_gen.runtime.distributed.cfg_parallel_utils import (
+                run_cfg_parallel,
+            )
+
+            return run_cfg_parallel(policy, predict_fn), seen
+
+    def test_branch_owner_gets_the_single_prediction(self):
+        preds, seen = self._run_on_rank(cfg_rank=0)
+        self.assertEqual(len(preds), 1)
+        self.assertEqual(seen, [0], "the owning rank runs branch 0 once")
+        self.assertTrue(torch.equal(preds[0], torch.zeros(1, 2)))
+
+    def test_rank_without_a_branch_still_returns_the_owners_prediction(self):
+        preds, seen = self._run_on_rank(cfg_rank=1)
+        self.assertEqual(
+            seen,
+            [0],
+            "the rank that owns no branch must still run one, or the "
+            "all-gather has no shapes to work with",
+        )
+        self.assertEqual(len(preds), 1)
+        self.assertIsNotNone(preds[0])
+        self.assertTrue(torch.equal(preds[0], torch.zeros(1, 2)))
+
+    def test_two_branches_still_split_across_the_ranks(self):
+        from sglang.multimodal_gen.runtime.distributed.cfg_parallel_utils import (
+            dispatch_branches,
+        )
+
+        self.assertEqual(dispatch_branches(1, 2), [[0], []])
+        self.assertEqual(dispatch_branches(2, 2), [[0], [1]])
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+@pytest.mark.parametrize("env_shape", [False, True])
+@pytest.mark.parametrize("assignment", [False, True])
+@pytest.mark.parametrize("explicit_shape", [False, True])
+def test_server_fixture_calibrates_case_shape_with_quality_defaults(
+    assignment, explicit_shape, env_shape, monkeypatch
+):
+    original = next(case for case in TWO_GPU_CASES if case.id == "wan2_2_t2v_a14b_2gpu")
+    supplied = {"quality": "exact"}
+    if explicit_shape:
+        supplied["num_frames"] = 9
+    raw = json.dumps(supplied)
+    option = (
+        f"--warmup-sampling-params={shlex.quote(raw)}"
+        if assignment
+        else f"--warmup-sampling-params {shlex.quote(raw)}"
+    )
+    case = replace(
+        original,
+        server_args=replace(
+            original.server_args,
+            extras=[
+                arg
+                for arg in original.server_args.extras
+                if not arg.startswith("--warmup-sampling-params")
+            ]
+            + [option],
+        ),
+    )
+    if env_shape:
+        monkeypatch.setenv(
+            "SGLANG_TEST_SERVE_ARGS", "--warmup-sampling-params='{\"num_frames\":7}'"
+        )
+    else:
+        monkeypatch.delenv("SGLANG_TEST_SERVE_ARGS", raising=False)
+    monkeypatch.setattr(server_test_common, "get_dynamic_server_port", lambda: 19000)
+    with patch.object(server_test_common, "ServerManager") as manager:
+        fixture = server_test_common.diffusion_server.__wrapped__(case)
+        try:
+            next(fixture)
+        finally:
+            fixture.close()
+        tokens = shlex.split(manager.call_args.kwargs["extra_args"])
+    assert (
+        sum(token.split("=", 1)[0] == "--warmup-sampling-params" for token in tokens)
+        == 1
+    )
+    resolved = json.loads(
+        _get_extra_arg_value([shlex.join(tokens)], "--warmup-sampling-params")
+    )
+    if explicit_shape:
+        assert resolved == supplied
+    elif env_shape:
+        assert resolved == {"num_frames": 7, "quality": "exact"}
+    else:
+        assert (
+            resolved == server_test_common._case_warmup_sampling_params(case) | supplied
+        )
+        assert resolved["num_frames"] == (
+            case.sampling_params.num_frames
+            if case.sampling_params.num_frames is not None
+            else case.sampling_params.seconds
+            * (case.sampling_params.fps or server_test_common.DEFAULT_FPS)
+        )

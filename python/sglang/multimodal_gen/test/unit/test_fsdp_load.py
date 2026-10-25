@@ -46,6 +46,11 @@ class _ReplicatedLinearModel(_UniformDtypeModel):
         self.proj = ReplicatedLinear(4, 4, bias=False)
 
 
+class _TransposedReplicatedLinear(ReplicatedLinear):
+    def weight_loader(self, param, loaded_weight):
+        super().weight_loader(param, loaded_weight.T)
+
+
 class _CustomEntrypointModel(_UniformDtypeModel):
     _fsdp_forward_methods = ("refine_prompt_embeds",)
 
@@ -291,6 +296,29 @@ class TestOrdinaryWeightLoading(unittest.TestCase):
             fsdp_load._can_assign_tensor_without_copy(tp_param, tensor, tp_param)
         )
 
+    def test_custom_linear_loader_is_not_bypassed(self):
+        """Storage adoption must preserve a subclass's checkpoint transformation."""
+        devices = ["cpu", "cuda:0"] if torch.cuda.is_available() else ["cpu"]
+        for device in devices:
+            with torch.device("meta"):
+                model = _UniformDtypeModel()
+                model.proj = _TransposedReplicatedLinear(4, 4, bias=False)
+            checkpoint_weight = torch.arange(
+                16, dtype=torch.float32, device=device
+            ).reshape(4, 4)
+            fsdp_load.load_model_from_full_model_state_dict(
+                model,
+                iter((("proj.weight", checkpoint_weight),)),
+                checkpoint_load_device=torch.device(device),
+                param_dtype=torch.float32,
+                strict=True,
+                param_names_mapping=fsdp_load.get_param_names_mapping({}),
+                allow_device_tensor_assignment=True,
+            )
+            torch.testing.assert_close(
+                model.proj.weight, checkpoint_weight.T, rtol=0, atol=0
+            )
+
 
 class TestDevicePostprocessMove(unittest.TestCase):
     def test_postprocess_move_preserves_meta_buffers_for_post_load_weights(self):
@@ -443,6 +471,46 @@ class TestRankLocalSafetensorsRead(unittest.TestCase):
             self.assertEqual(
                 rank_local_checkpoint.tp_local_shape(sources, 0, 2), (4, 4)
             )
+
+    def test_reads_tp_local_fused_merged_column_per_logical_matrix(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            file_path = str(Path(temp_dir) / "model.safetensors")
+            q = torch.arange(16, dtype=torch.bfloat16).reshape(4, 4)
+            k = torch.arange(16, 32, dtype=torch.bfloat16).reshape(4, 4)
+            v = torch.arange(32, 48, dtype=torch.bfloat16).reshape(4, 4)
+            fused = torch.cat((q, k, v), dim=0)
+            save_file({"qkv": fused}, file_path)
+            sources = [self._source(file_path, "qkv", (12, 4))]
+
+            with safe_open(file_path, framework="pt", device="cpu") as handle:
+                naive = rank_local_checkpoint.read_tp_local_tensor(
+                    sources,
+                    {file_path: handle},
+                    shard_dim=0,
+                    tp_rank=0,
+                    tp_size=2,
+                )
+                rank0 = rank_local_checkpoint.read_tp_local_tensor(
+                    sources,
+                    {file_path: handle},
+                    shard_dim=0,
+                    tp_rank=0,
+                    tp_size=2,
+                    output_sizes=[4, 4, 4],
+                )
+                rank1 = rank_local_checkpoint.read_tp_local_tensor(
+                    sources,
+                    {file_path: handle},
+                    shard_dim=0,
+                    tp_rank=1,
+                    tp_size=2,
+                    output_sizes=[4, 4, 4],
+                )
+
+            torch.testing.assert_close(naive, fused[:6])
+            torch.testing.assert_close(rank0, torch.cat((q[:2], k[:2], v[:2])))
+            torch.testing.assert_close(rank1, torch.cat((q[2:], k[2:], v[2:])))
+            self.assertFalse(torch.equal(rank0, naive))
 
     def test_reads_tp_local_merged_row_slice(self):
         with tempfile.TemporaryDirectory() as temp_dir:

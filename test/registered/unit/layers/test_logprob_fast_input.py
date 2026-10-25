@@ -56,6 +56,8 @@ def _build_batch(seq_specs, dtype, vocab=VOCAB):
         lp_pt += rows
         pruned_lens.append(n_lp)
     metadata = SimpleNamespace(
+        sample_indices_cpu=sample_indices,
+        input_logprob_indices_cpu=input_logprob_indices,
         extend_return_top_logprob=True,
         extend_token_ids_logprob=True,
         top_logprobs_nums=[TOPK_CYCLE[i % 3] for i in range(len(seq_specs))],
@@ -125,7 +127,7 @@ def _shape_of(nested):
 class TestFastInputLogprobs(CustomTestCase):
     def _sweep(self, dtype, rtol, atol):
         torch.manual_seed(0)
-        proc = InputLogprobProcessor()
+        proc = InputLogprobProcessor(vocab_size=VOCAB)
         combos = list(coverage_cases(SEQ_SPEC_MENU, max_seqs=3))
         self.assertEqual(len(combos), EXPECTED_CASES)
         tried = 0
@@ -178,7 +180,7 @@ class TestFastInputLogprobs(CustomTestCase):
         # rounds at the bf16 logits themselves (normalizer is fp32), so it
         # sits much closer to the truth than bf16 resolution.
         torch.manual_seed(0)
-        proc = InputLogprobProcessor()
+        proc = InputLogprobProcessor(vocab_size=VOCAB)
         for combo in coverage_cases(SEQ_SPEC_MENU, max_seqs=3):
             batch = _build_batch(list(combo), torch.bfloat16)
             pruned_states, _, input_logprob_indices, _, metadata = batch
@@ -233,7 +235,7 @@ class TestFastInputLogprobs(CustomTestCase):
         # true precision of the result), while the log_softmax path keeps
         # the logits dtype. Runs on CPU CI so the policy is pinned even
         # where the CUDA kernels never execute.
-        proc = InputLogprobProcessor()
+        proc = InputLogprobProcessor(vocab_size=VOCAB)
         batch = _build_batch([(4, 1), (3, 0)], torch.bfloat16)
         got, _ = _run(proc, batch, True, None)
         self.assertEqual(got.token_logprobs.dtype, torch.float32)
@@ -323,7 +325,7 @@ class TestFastInputLogprobs(CustomTestCase):
         # (the CPU sweeps only cover the torch fallbacks), including the
         # k > FUSED_TOPK_MAX_K fallback.
         torch.manual_seed(0)
-        proc = InputLogprobProcessor()
+        proc = InputLogprobProcessor(vocab_size=64)
         for k_override in (None, 20):
             # k=20 exceeds FUSED_TOPK_MAX_K, exercising the torch fallback;
             # it needs a vocab that can supply 20 entries.

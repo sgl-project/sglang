@@ -426,9 +426,7 @@ class HummingRunnerCore(MoeRunnerCore):
             and num_experts <= min(256, num_threads)
         )
         if use_fused_masked_act_quant:
-            from sglang.kernels.ops.attention.dsv4.moe import (
-                silu_and_mul_masked_post_quant,
-            )
+            from sglang.kernels.ops.moe.dsv4 import silu_and_mul_masked_post_quant
 
             down_input = torch.empty(
                 (num_experts, max_tokens, intermediate),

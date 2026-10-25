@@ -12,6 +12,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_weight_inv
     infer_component_weight_size_bytes,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
+    component_base_name,
     is_dit_component_name,
     is_image_encoder_component_name,
     is_text_encoder_component_name,
@@ -38,6 +39,9 @@ def _component_base_name(component_name: str) -> str:
     return component_name
 
 
+_WEIGHT_FILE_SUFFIXES = (".bin", ".pt", ".pth")
+
+
 def _component_variant_priority(component_name: str) -> int:
     _, separator, suffix = component_name.rpartition("_")
     if separator and suffix.isdigit():
@@ -47,7 +51,7 @@ def _component_variant_priority(component_name: str) -> int:
 
 def component_load_risk_rank(component_name: str) -> int:
     """Fallback type rank when checkpoint size cannot be inferred."""
-    candidate_names = (component_name, _component_base_name(component_name))
+    candidate_names = (component_name, component_base_name(component_name))
     if any(is_dit_component_name(name) for name in candidate_names):
         return 0
     if any(is_text_encoder_component_name(name) for name in candidate_names):
