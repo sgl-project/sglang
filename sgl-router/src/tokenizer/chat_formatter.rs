@@ -101,7 +101,7 @@ impl ChatFormatter {
             _ => return Ok(()),
         };
         let tokenizer = files
-            .text("tokenizer.json")?
+            .tokenizer_text()?
             .context("DeepSeek-V4 prompts need the checkpoint's tokenizer.json")?;
         self.processor = Some(
             ProcessorFormatter::deepseek_v4(v41, Some(&tokenizer)).map_err(anyhow::Error::msg)?,
