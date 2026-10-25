@@ -30,7 +30,7 @@ def _canonical(value):
 class SourceGoldenDSparkProgress:
     """One modeled choice per DECODE event, with idempotent before-work retries.
 
-    This initial law is B1/TP2/ADP1/PP1 only. SDK source policy verifies static
+    This initial law is B1-B2/TP2/ADP1/PP1 only. SDK source policy verifies static
     Q5/Q6, captures and the golden cost realization. Session resolves every
     measured phase before calling this owner. Missing costs never draw progress.
     """
@@ -87,30 +87,30 @@ class SourceGoldenDSparkProgress:
         _require(
             len(step.groups) == 1
             and step.groups[0].forward_mode == "TARGET_VERIFY"
-            and len(step.requests) == 1
-            and step.requests[0].extend_len == 6,
-            "golden progress requires one static Q6 decode request",
+            and 1 <= len(step.requests) <= 2
+            and all(request.extend_len == 6 for request in step.requests),
+            "golden progress requires one or two static Q6 decode requests",
         )
-        request = step.requests[0]
-        recipe = json.loads(request.sampling_params_json)
-        _require(
-            recipe.get("ignore_eos") is True
-            and not any(
-                recipe.get(k)
-                for k in (
-                    "stop",
-                    "stop_regex",
-                    "stop_strs",
-                    "stop_regex_strs",
-                    "stop_token_ids",
-                    "json_schema",
-                    "regex",
-                    "ebnf",
-                    "structural_tag",
-                )
-            ),
-            "golden progress requires length-only output without grammar or stop rules",
-        )
+        for request in step.requests:
+            recipe = json.loads(request.sampling_params_json)
+            _require(
+                recipe.get("ignore_eos") is True
+                and not any(
+                    recipe.get(k)
+                    for k in (
+                        "stop",
+                        "stop_regex",
+                        "stop_strs",
+                        "stop_regex_strs",
+                        "stop_token_ids",
+                        "json_schema",
+                        "regex",
+                        "ebnf",
+                        "structural_tag",
+                    )
+                ),
+                "golden progress requires length-only output without grammar or stop rules",
+            )
         # Event identity, not per-RID sampling or a mutable RNG. Different request
         # batches cannot cause multiple draws for one native DECODE event.
         event = {"model_ref": self.model_ref, "forward_id": step.forward_id}
@@ -122,5 +122,7 @@ class SourceGoldenDSparkProgress:
         # Preserve the full commit even across remaining OSL. Native publication
         # advances KV and the native scheduler separately clips visible output.
         return DSparkProgress(
-            step.forward_id, ((request.rid, committed),), self.model_ref
+            step.forward_id,
+            tuple((request.rid, committed) for request in step.requests),
+            self.model_ref,
         ).validate_for(step)

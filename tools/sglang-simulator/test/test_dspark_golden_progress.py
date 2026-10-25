@@ -14,6 +14,7 @@ from sglang_simulator.simulation.sglang.dspark import (
     DSparkStep,
     DSparkTopology,
 )
+from sglang_simulator.time_predictor import dspark_golden_progress
 from sglang_simulator.time_predictor.base import PredictorError
 from sglang_simulator.time_predictor.dspark_golden_progress import (
     LAW,
@@ -61,6 +62,23 @@ def step(*, fid=0, rid="r", mode="TARGET_VERIFY", budget=20, **changes):
     return replace(result, **changes)
 
 
+def paired_step(*, fid=0, mode="TARGET_VERIFY"):
+    before = step(fid=fid, mode=mode, budget=2)
+    recipe = {"ignore_eos": True, "is_normalized": True, "max_new_tokens": 20}
+    second = replace(
+        before.requests[0],
+        rid="second",
+        target_prefix_len=8192,
+        draft_valid_to=8192,
+        max_new_tokens=20,
+        sampling_params_json=json.dumps(recipe, sort_keys=True, separators=(",", ":")),
+    )
+    return replace(
+        before,
+        groups=(replace(before.groups[0], requests=before.requests + (second,)),),
+    )
+
+
 @pytest.mark.parametrize("seed", [None, True, -1, 1.0, "42"])
 def test_explicit_seed_is_required(policy, seed):
     with pytest.raises(PredictorError, match="explicit nonnegative integer"):
@@ -104,18 +122,49 @@ def test_eventwise_law_retry_and_seed_identity(policy):
     assert sum(values) / len(values) == pytest.approx(3.51, abs=0.04)
 
 
-@pytest.mark.parametrize("kind", ["runtime", "tp4", "batch2", "width5", "prefill"])
+@pytest.mark.parametrize("fid", [0, 1, 17, 77])
+def test_b2_uses_one_shared_draw_with_ordered_requests_and_independent_budgets(
+    policy, monkeypatch, fid
+):
+    model = SourceGoldenDSparkProgress(policy, model_seed=42)
+    before = paired_step(fid=fid)
+    expected = model.predict_progress(step(fid=fid)).committed_tokens[0][1]
+    original_sha = dspark_golden_progress.hashlib.sha256
+    calls = []
+
+    def counted(*args, **kwargs):
+        calls.append(args)
+        return original_sha(*args, **kwargs)
+
+    monkeypatch.setattr(dspark_golden_progress.hashlib, "sha256", counted)
+    result = model.predict_progress(before)
+    assert len(calls) == 1
+    assert result.committed_tokens == (("r", expected), ("second", expected))
+    assert model.predict_progress(before) == result
+    reversed_step = replace(
+        before,
+        groups=(replace(before.groups[0], requests=tuple(reversed(before.requests))),),
+    )
+    assert model.predict_progress(reversed_step).committed_tokens == (
+        ("second", expected),
+        ("r", expected),
+    )
+    assert expected > before.requests[0].remaining_output_tokens
+    assert expected < before.requests[1].remaining_output_tokens
+
+
+@pytest.mark.parametrize("kind", ["runtime", "tp4", "batch3", "width5", "prefill"])
 def test_unsupported_before_work_has_no_fallback(policy, kind):
     before = step()
     if kind == "runtime":
         before = replace(before, runtime_profile_json='{"different":true}')
     elif kind == "tp4":
         before = replace(before, topology=DSparkTopology(4, 1))
-    elif kind == "batch2":
-        request = replace(before.requests[0], rid="second")
+    elif kind == "batch3":
+        requests = tuple(replace(before.requests[0], rid=f"r{i}") for i in range(3))
         before = replace(
             before,
-            groups=(replace(before.groups[0], requests=before.requests + (request,)),),
+            groups=(replace(before.groups[0], requests=requests),),
         )
     elif kind == "width5":
         before = replace(
@@ -133,6 +182,24 @@ def test_unsupported_before_work_has_no_fallback(policy, kind):
         SourceGoldenDSparkProgress(policy, model_seed=42).predict_progress(before)
 
 
+def test_second_b2_request_also_requires_static_q6(policy):
+    before = paired_step()
+    before = replace(
+        before,
+        groups=(
+            replace(
+                before.groups[0],
+                requests=(
+                    before.requests[0],
+                    replace(before.requests[1], extend_len=5),
+                ),
+            ),
+        ),
+    )
+    with pytest.raises(PredictorError, match="static Q6"):
+        SourceGoldenDSparkProgress(policy, model_seed=42).predict_progress(before)
+
+
 @pytest.mark.parametrize(
     "field,value",
     [
@@ -144,22 +211,66 @@ def test_unsupported_before_work_has_no_fallback(policy, kind):
         ("structural_tag", '{"type":"structural_tag"}'),
     ],
 )
-def test_content_dependent_finish_is_rejected(policy, field, value):
-    before = step()
-    req = before.requests[0]
+@pytest.mark.parametrize("batch", [1, 2])
+def test_content_dependent_finish_is_rejected(policy, field, value, batch):
+    before = paired_step() if batch == 2 else step()
+    req = before.requests[-1]
     recipe = json.loads(req.sampling_params_json)
     recipe[field] = value
     req = replace(
         req,
         sampling_params_json=json.dumps(recipe, sort_keys=True, separators=(",", ":")),
     )
-    before = replace(before, groups=(replace(before.groups[0], requests=(req,)),))
+    before = replace(
+        before,
+        groups=(replace(before.groups[0], requests=before.requests[:-1] + (req,)),),
+    )
     with pytest.raises(PredictorError, match="length-only"):
         SourceGoldenDSparkProgress(policy, model_seed=42).predict_progress(before)
 
 
-def test_cost_failure_precedes_progress_and_retry_keeps_full_commit(policy):
-    before = step(budget=2)
+def test_invalid_second_request_fails_before_event_choice_or_history_change(
+    policy, monkeypatch
+):
+    model = SourceGoldenDSparkProgress(policy, model_seed=42)
+    before = paired_step()
+    recipe = json.loads(before.requests[1].sampling_params_json)
+    recipe["ignore_eos"] = False
+    requests = (
+        before.requests[0],
+        replace(
+            before.requests[1],
+            sampling_params_json=json.dumps(
+                recipe, sort_keys=True, separators=(",", ":")
+            ),
+        ),
+    )
+    before = replace(before, groups=(replace(before.groups[0], requests=requests),))
+
+    def no_event(_):
+        pytest.fail("invalid second request reached the event choice")
+
+    monkeypatch.setattr(dspark_golden_progress, "_canonical", no_event)
+    run = DSparkSession(Cost(), model)
+    for request in before.requests:
+        run.record_history(
+            request.rid,
+            CommittedHistory(
+                request.target_prefix_len,
+                request.draft_valid_from,
+                request.draft_valid_to,
+            ),
+        )
+    original = dict(run._history)
+    with pytest.raises(PredictorError, match="length-only"):
+        run.predict(before)
+    assert run._history == original
+    assert run._last_forward_id == -1
+
+
+@pytest.mark.parametrize("batch", [1, 2])
+def test_cost_failure_precedes_progress_and_retry_keeps_full_commit(policy, batch):
+    before = paired_step() if batch == 2 else step(budget=2)
 
     class CountDraws(SourceGoldenDSparkProgress):
         calls = 0
@@ -175,28 +286,54 @@ def test_cost_failure_precedes_progress_and_retry_keeps_full_commit(policy):
             raise PredictorError("data_unavailable", "missing actual cost")
 
     run = DSparkSession(MissingCost(), model)
-    run.record_history("r", CommittedHistory(512, 0, 512))
+    for request in before.requests:
+        run.record_history(
+            request.rid,
+            CommittedHistory(
+                request.target_prefix_len,
+                request.draft_valid_from,
+                request.draft_valid_to,
+            ),
+        )
+    original = dict(run._history)
     with pytest.raises(PredictorError, match="missing actual cost"):
         run.predict(before)
     assert model.calls == 0
-    assert run.history_for("r").target_prefix_len == 512
+    assert run._history == original
     run.cost_model = Cost()
     pending = run.predict(before)
     assert pending.progress == run.predict(before).progress
     count = pending.progress.committed_tokens[0][1]
     assert count in (3, 4) and count > before.requests[0].remaining_output_tokens
     run.commit(pending)
-    assert run.history_for("r").target_prefix_len == 512 + count
+    for request, (_, committed) in zip(
+        before.requests, pending.progress.committed_tokens, strict=True
+    ):
+        assert committed == count
+        assert (
+            run.history_for(request.rid).target_prefix_len
+            == request.target_prefix_len + count
+        )
 
 
-def test_prefill_never_calls_golden_draw(policy):
+@pytest.mark.parametrize("batch", [1, 2])
+def test_prefill_never_calls_golden_draw(policy, batch):
     class NoDecode(SourceGoldenDSparkProgress):
         def predict_progress(self, _):
             pytest.fail("prefill must not draw golden progress")
 
     for emits in (False, True):
-        before = step(mode="EXTEND")
-        req = replace(before.requests[0], draft_valid_from=512, emits_output=emits)
-        before = replace(before, groups=(replace(before.groups[0], requests=(req,)),))
+        before = paired_step(mode="EXTEND") if batch == 2 else step(mode="EXTEND")
+        requests = tuple(
+            replace(
+                request,
+                draft_valid_from=request.target_prefix_len,
+                emits_output=emits if index == 0 else not emits,
+            )
+            for index, request in enumerate(before.requests)
+        )
+        before = replace(before, groups=(replace(before.groups[0], requests=requests),))
         run = DSparkSession(Cost(), NoDecode(policy, model_seed=42))
-        assert run.predict(before).progress.committed_tokens == (("r", int(emits)),)
+        assert run.predict(before).progress.committed_tokens == tuple(
+            (request.rid, int(request.emits_output)) for request in requests
+        )
