@@ -139,26 +139,35 @@ class MiniMaxH3VDNHybridAttention(nn.Module):
         softmax_gate = self.softmax_gate(x) if self.softmax_gate is not None else None
         beta = self.linear_attention.beta(x)
         gate_hidden, _ = self.linear_attention.output_gate.down(x)
-        attention_core = (
-            _hybrid_attention_core_bcg
-            if attention.bcg_breakpoint
-            else _minimax_h3_hybrid_attention_core_impl
-        )
-        softmax_out, linear_out = attention_core(
-            attention,
-            x,
-            q,
-            k,
-            v,
-            softmax_gate,
-            beta,
-            gate_hidden,
+        core_args = (attention, x, q, k, v, softmax_gate, beta, gate_hidden)
+        core_kwargs = dict(
             rope_cache=rope_cache,
             cu_seqlens=cu_seqlens,
             cu_seqlens_host=cu_seqlens_host,
             max_seqlen=max_seqlen,
             ulysses_active=ulysses_active,
         )
+        if attention.bcg_breakpoint:
+            softmax_out = q.new_empty(q.shape)
+            linear_out = None
+            meta = get_forward_context().attn_metadata
+            if not meta.full_cover:
+                # the single-rank readout covers the video rows only
+                layout = meta.layout
+                rows = (
+                    total if ulysses_active else layout.video_end - layout.video_start
+                )
+                linear_out = q.new_empty((rows, q.shape[1] * q.shape[2]))
+            _hybrid_attention_core_bcg(
+                *core_args,
+                softmax_out=softmax_out,
+                linear_out=linear_out,
+                **core_kwargs,
+            )
+        else:
+            softmax_out, linear_out = _minimax_h3_hybrid_attention_core_impl(
+                *core_args, **core_kwargs
+            )
         out, _ = attention.out_proj(softmax_out.reshape(total, -1))
         if linear_out is not None:
             linear_proj, _ = self.to_out_linear(linear_out)
@@ -563,9 +572,19 @@ def _vdn_return_to_rows(
     return merged[0], linear_rows
 
 
-_hybrid_attention_core_bcg = eager_on_graph(True)(
-    _minimax_h3_hybrid_attention_core_impl
-)
+@eager_on_graph
+def _hybrid_attention_core_bcg(
+    *args,
+    softmax_out: torch.Tensor,
+    linear_out: torch.Tensor | None,
+    **kwargs,
+) -> None:
+    softmax_result, linear_result = _minimax_h3_hybrid_attention_core_impl(
+        *args, **kwargs
+    )
+    softmax_out.copy_(softmax_result)
+    if linear_out is not None:
+        linear_out.copy_(linear_result)
 
 
 def prepare_hybrid_attention_metadata(

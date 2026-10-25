@@ -244,13 +244,15 @@ class PrefixPad:
 
 
 @eager_on_graph
-def attend_past_prefix_pad(attn, q, k, v, prefix_pad):
+def attend_past_prefix_pad(attn, q, k, v, prefix_pad, out):
     # a graph break: the pad varies per request, and skipping it hands the
     # kernel exactly the eager K/V, so padded replays stay bit-exact. Calls the
     # impl like USPAttention does without SP, since its forward is a break too
     rows = prefix_pad.get()
-    return attn.attn_impl.forward(
-        q, k[:, rows:], v[:, rows:], get_forward_context().attn_metadata
+    out.copy_(
+        attn.attn_impl.forward(
+            q, k[:, rows:], v[:, rows:], get_forward_context().attn_metadata
+        )
     )
 
 
@@ -717,7 +719,9 @@ class QwenImage21Attention(nn.Module):
     def attend_target(self, q, k, v, prefix_pad):
         if prefix_pad is None:
             return self.target_attn(q, k, v)
-        return attend_past_prefix_pad(self.target_attn, q, k, v, prefix_pad)
+        out = q.new_empty((*q.shape[:-1], v.shape[-1]))
+        attend_past_prefix_pad(self.target_attn, q, k, v, prefix_pad, out)
+        return out
 
     def attend_sample(
         self,
