@@ -3143,6 +3143,22 @@ class TestCudaGraphDisaggregationRoles(CustomTestCase):
         )
         self.assertIn((Phase.DECODE, "backend"), args._cuda_graph_config_locked)
 
+    def test_platform_graph_runner_owning_prefill_keeps_decode_graph(self):
+        from sglang.srt.platforms.interface import PlatformCapabilities
+
+        platform = SimpleNamespace(
+            capabilities=PlatformCapabilities(
+                graph_capture=True, graph_runner_owns_prefill=True
+            )
+        )
+        with patch("sglang.srt.arg_groups.cuda_graph_hook.current_platform", platform):
+            args = self._handled_args(disaggregation_mode="prefill")
+
+        self.assertNotEqual(
+            resolution_result(args, "cuda_graph_config").decode.backend,
+            Backend.DISABLED,
+        )
+
 
 class TestPrefillCudaGraphLoRACompatibility(CustomTestCase):
     """LoRA no longer auto-disables the breakable prefill CUDA graph; guards

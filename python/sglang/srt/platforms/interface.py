@@ -64,6 +64,10 @@ class PlatformCapabilities(msgspec.Struct, frozen=True, kw_only=True):
     ``supports_pynccl``: model-parallel groups create a PyNccl communicator
     when the caller does not choose. Read for out-of-tree platforms; in-tree
     devices decide in ``parallel_state``.
+    ``graph_runner_owns_prefill``: the graph runner (``get_graph_runner_cls``)
+    also builds and serves the compiled prefill path, so it must exist on a
+    PD prefill server; core then does not disable the decode graph phase for
+    the prefill role (an explicit ``--cuda-graph-backend-decode`` still wins).
     """
 
     supports_triton: bool = False
@@ -71,6 +75,7 @@ class PlatformCapabilities(msgspec.Struct, frozen=True, kw_only=True):
     piecewise_graph: bool = False
     hicache_device_kernels: bool = False
     supports_pynccl: bool = False
+    graph_runner_owns_prefill: bool = False
 
 
 class SRTPlatform(DeviceMixin):
