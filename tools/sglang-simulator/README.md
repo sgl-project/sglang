@@ -188,6 +188,16 @@ nothing. Independent per-DP hashes are an explicit model assumption, not a
 replay or independence claim for native CPU generators. Each request retains
 its own visible OSL clipping and full native commit.
 
+The separate `capture_native_dp_peer_step` native adapter can exchange complete
+CPU before-work groups through a real two-rank `GroupCoordinator` CPU collective.
+It checks the native scheduler counter and model FID independently, retains each
+DP's own buffer state and exact ordered requests, and requires explicit native
+idle participation. The returned `DSparkStep` is unresolved: the adapter calls
+no cost/progress provider, publishes no result, changes no request history and
+advances no virtual clock. Native factory/compatibility/coordinator ADP2 guards
+remain closed. This entry point does not supply a joint HYBRID cost model or
+complete native peer publication, scheduling or whole-workload support.
+
 The existing `DSparkStepTiming` also recognizes one exclusive `whole_worker`
 cost for a complete serialized TP2/ADP2 two-group step. It cannot be combined
 with region phases, used for ADP1, multiplied by DP, or obtained by summing two

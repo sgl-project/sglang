@@ -187,7 +187,6 @@ def prepare_cpu_decode(draft_input, batch):
     uses ReqToTokenPool.write for the same table update.
     """
     import torch
-
     from sglang.srt.mem_cache.allocation import (
         alloc_paged_token_slots_extend,
         alloc_token_slots,
@@ -285,7 +284,6 @@ class NativeDSparkResults:
 
     def build(self, *, batch, prediction):
         import torch
-
         from sglang.srt.layers.logits_processor import LogitsProcessorOutput
         from sglang.srt.managers.utils import GenerationBatchResult
         from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
@@ -395,6 +393,27 @@ class DSparkNativeRuntime:
                 "unsupported_topology",
                 "DSPark ADP2 needs actual peer scheduling partitions and publication",
             )
+        group = self._capture_local_group(
+            batch, attention_dp_rank=0, resolve=resolve, reference=reference
+        )
+        return DSparkStep(
+            self._forward_id, self.topology, (group,), self.runtime_profile_json
+        )
+
+    def _capture_local_group(
+        self, batch, *, attention_dp_rank, resolve=False, reference=False
+    ):
+        """Read one real native partition; this does not resolve a joint cost."""
+        if (
+            str(batch.device) != "cpu"
+            or type(attention_dp_rank) is not int
+            or not 0 <= attention_dp_rank < self.topology.attention_dp_size
+        ):
+            raise PredictorError("invalid_batch", "invalid native CPU DP partition")
+        if resolve and self.topology.attention_dp_size != 1:
+            raise PredictorError(
+                "data_unavailable", "local capture cannot resolve a joint worker cost"
+            )
         if getattr(batch, "return_logprob", False) or getattr(
             batch, "return_hidden_states", False
         ):
@@ -403,8 +422,15 @@ class DSparkNativeRuntime:
                 "DSPark simulator does not synthesize logprob/hidden payloads",
             )
         mode = getattr(batch.forward_mode, "name", None)
-        if mode not in {"EXTEND", "DECODE"} or getattr(
-            batch, "is_extend_in_batch", False
+        if mode == "IDLE" and self.topology == DSparkTopology(2, 2):
+            if tuple(batch.reqs):
+                raise PredictorError(
+                    "invalid_batch", "native idle partition has requests"
+                )
+            return DSparkGroup(attention_dp_rank, "IDLE", (), '{"selection":"pending"}')
+        if mode not in {"EXTEND", "DECODE"} or (
+            getattr(batch, "is_extend_in_batch", False)
+            and (self.topology.attention_dp_size == 1 or mode != "EXTEND")
         ):
             raise PredictorError(
                 "unsupported_forward_mode",
@@ -512,11 +538,11 @@ class DSparkNativeRuntime:
                 )
             )
         internal_mode = "EXTEND" if mode == "EXTEND" else "TARGET_VERIFY"
-        group = DSparkGroup(0, internal_mode, tuple(work), '{"selection":"pending"}')
+        group = DSparkGroup(
+            attention_dp_rank, internal_mode, tuple(work), '{"selection":"pending"}'
+        )
         if not resolve:
-            return DSparkStep(
-                self._forward_id, self.topology, (group,), self.runtime_profile_json
-            )
+            return group
         buffer_capacity = self._draft_buffer_capacity
         buffer_device_matches = buffer_capacity > 0
         execution = self.execution_resolver(
@@ -532,9 +558,7 @@ class DSparkNativeRuntime:
         execution["draft_buffer_capacity"] = buffer_capacity
         execution["draft_buffer_device_matches"] = buffer_device_matches
         group = replace(group, execution_json=canonical(execution))
-        return DSparkStep(
-            self._forward_id, self.topology, (group,), self.runtime_profile_json
-        )
+        return group
 
     def forward_batch_generation(self, *, worker, batch, on_publish=None):
         started = time.perf_counter()
