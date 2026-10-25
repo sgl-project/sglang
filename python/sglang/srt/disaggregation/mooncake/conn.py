@@ -2460,21 +2460,23 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     f"src_item_lens={len(src_item_lens)}, "
                     f"dst_item_lens={len(dst_item_lens)}"
                 )
-            # Zero pointers make the helper's addresses offsets into each entry.
-            copies = [
-                Copy(
-                    src=src_keys[src_entry],
-                    dst=dst_keys[dst_entry],
-                    ranges=copy_ranges(
-                        build_dsa_tail_transfer_blocks(
-                            [0], [src_len], [0], src_indices, dst_indices, [dst_len]
+            copies = []
+            for src_entry, (src_len, dst_entry, dst_len) in enumerate(
+                zip(src_item_lens, dst_entries, dst_item_lens)
+            ):
+                # Zero pointers make the helper's addresses offsets into each entry.
+                blocks = build_dsa_tail_transfer_blocks(
+                    [0], [src_len], [0], src_indices, dst_indices, [dst_len]
+                )
+                # A zero-row indexShare entry yields no blocks and is not registered.
+                if blocks:
+                    copies.append(
+                        Copy(
+                            src=src_keys[src_entry],
+                            dst=dst_keys[dst_entry],
+                            ranges=copy_ranges(blocks),
                         )
-                    ),
-                )
-                for src_entry, (src_len, dst_entry, dst_len) in enumerate(
-                    zip(src_item_lens, dst_entries, dst_item_lens)
-                )
-            ]
+                    )
         except ValueError as exc:
             logger.error("%s: %s", label, exc)
             return -1
