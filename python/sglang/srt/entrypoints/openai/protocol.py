@@ -756,6 +756,10 @@ class ChatCompletionMessageGenericParam(BaseModel):
     name: Optional[str] = None
     phase: Optional[Literal["commentary", "final_answer"]] = None
     reasoning_content: Optional[str] = None
+    action: Optional[str] = Field(
+        default=None,
+        description="Action tag for assistant messages (used by deepseek-recipe).",
+    )
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
     tools: Optional[List[Tool]] = Field(default=None, examples=[None])
     # DeepSeek API prefix completion: continue this final assistant message.
@@ -811,6 +815,10 @@ class Function(BaseModel):
     parameters: Optional[object] = None
     strict: Optional[bool] = None
     defer_loading: Optional[bool] = None
+    namespace: Optional[str] = Field(
+        default=None,
+        description="Tool namespace for disambiguation (used by deepseek-recipe).",
+    )
     key_order: List[str] = Field(default_factory=list, exclude=True)
 
     @model_validator(mode="before")
@@ -830,6 +838,8 @@ class Function(BaseModel):
             data.pop("defer_loading", None)
         if self.strict is None:
             data.pop("strict", None)
+        if self.namespace is None:
+            data.pop("namespace", None)
         order = self.key_order
         if order:
             rest = [k for k in data if k not in order]
@@ -1287,6 +1297,7 @@ class ChatMessage(BaseModel):
     role: Optional[str] = None
     content: Optional[str] = None
     reasoning_content: Optional[str] = None
+    action: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
 
     @model_serializer(mode="wrap")
@@ -1294,6 +1305,8 @@ class ChatMessage(BaseModel):
         data = handler(self)
         if self.tool_calls is None:
             data.pop("tool_calls", None)
+        if self.action is None:
+            data.pop("action", None)
         return data
 
 
