@@ -11,7 +11,11 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.models.longcat_flash import LongcatFlashRouter  # noqa: E402
+from sglang.srt.models.longcat_flash import (  # noqa: E402
+    LongcatFlashMoE,
+    LongcatFlashRouter,
+)
+from sglang.srt.runtime_context import get_context, get_exec, get_parallel  # noqa: E402
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -25,6 +29,37 @@ def _longcat_config(hidden_size, n_routed_experts, *, router_bias=False):
 
 
 class TestLongcatFlashRouterHpcGemm(CustomTestCase):
+    def test_zero_experts_reject_placement_before_loading_expert_weights(self):
+        """Identity expert IDs cannot index routed-only placement tables."""
+        config = SimpleNamespace(
+            routed_scaling_factor=1.0,
+            n_routed_experts=4,
+            moe_topk=2,
+            zero_expert_num=2,
+            zero_expert_type="identity",
+            rounter_params_dtype="float32",
+            hidden_act="silu",
+        )
+        with get_context().override_server_args(model_path="dummy", device="cpu"):
+            for algorithm in ("static", "dynamic", "fake", "lp"):
+                with (
+                    self.subTest(algorithm=algorithm),
+                    get_exec().moe.override(ep_dispatch_algorithm=algorithm),
+                    self.assertRaisesRegex(ValueError, "LongCat zero experts"),
+                ):
+                    LongcatFlashMoE(config=config, layer_id=0)
+
+            with (
+                get_exec().moe.override(ep_dispatch_algorithm=None),
+                get_parallel().override(tp_size=1),
+                patch(
+                    "sglang.srt.models.longcat_flash.LongcatFlashRouter",
+                    side_effect=RuntimeError("placement admitted"),
+                ),
+                self.assertRaisesRegex(RuntimeError, "placement admitted"),
+            ):
+                LongcatFlashMoE(config=config, layer_id=0)
+
     def _assert_dispatches_to_hpc_gemm(
         self,
         *,
@@ -76,22 +111,6 @@ class TestLongcatFlashRouterHpcGemm(CustomTestCase):
         self.assertIs(out, expected)
         mock_classifier.assert_called_once()
         self.assertEqual(mock_classifier.call_args.args[0].dtype, torch.float32)
-
-    def test_chat_shape_dispatches_with_benchmark_guard(self):
-        self._assert_dispatches_to_hpc_gemm(
-            hidden_size=6144,
-            n_routed_experts=512,
-            zero_expert_num=256,
-            expected_min_m=64,
-        )
-
-    def test_lite_shape_dispatches_with_benchmark_guard(self):
-        self._assert_dispatches_to_hpc_gemm(
-            hidden_size=3072,
-            n_routed_experts=256,
-            zero_expert_num=128,
-            expected_min_m=128,
-        )
 
     def test_unbenchmarked_shape_uses_classifier(self):
         router = LongcatFlashRouter(

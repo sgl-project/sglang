@@ -15,6 +15,25 @@ from sglang.srt.runtime_context import get_platform
 logger = logging.getLogger(__name__)
 
 
+def _dsa_dcp_overrides(cfg: Any) -> dict:
+    if cfg.dcp_size <= 1:
+        return {}
+    if cfg.enable_hisparse or cfg.enable_hierarchical_cache:
+        raise ValueError("DSA DCP does not support HiSparse or HiCache.")
+    if cfg.disaggregation_mode != "null":
+        raise ValueError("DSA DCP does not support PD disaggregation.")
+    if cfg.speculative_eagle_topk not in (None, 1):
+        raise ValueError("DSA DCP requires --speculative-eagle-topk 1.")
+    overrides = {
+        name: "trtllm"
+        for name in ("dsa_prefill_backend", "dsa_decode_backend")
+        if getattr(cfg, name) is None
+    }
+    if cfg.dcp_replicate_q_proj is None and cfg.dcp_comm_backend in ("a2a", "fi_a2a"):
+        overrides["dcp_replicate_q_proj"] = True
+    return overrides
+
+
 @_register_for(
     "DeepseekV3ForCausalLM",
     "DeepseekV32ForCausalLM",
@@ -33,6 +52,7 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
     """Declare DeepSeek/DSA defaults; ordered CP, KV-cache, and MoE passes run in model_hook."""
     cfg = resolving_view(server_args)
     from sglang.srt.configs.model_config import (
+        get_dsa_index_kpool,
         is_deepseek_dsa,
         unwrap_modelopt_quantization_config,
     )
@@ -77,6 +97,7 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                     )
 
     if is_deepseek_dsa(hf_config):  # DeepSeek 3.2/GLM 5
+        overrides.update(_dsa_dcp_overrides(cfg))
         # Set attention backend for DeepSeek
         if is_attention_backend_not_set(cfg):
             overrides["attention_backend"] = "dsa"
@@ -118,8 +139,7 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                     f"ep_size={overrides.get('ep_size', cfg.ep_size)}, tp_size={cfg.tp_size}, "
                     f"attn_cp_size={attn_cp_size}, "
                     f"kv_cache_dtype={cfg.kv_cache_dtype}, "
-                    f"moe_a2a_backend={overrides.get('moe_a2a_backend', cfg.moe_a2a_backend)}, "
-                    f"cuda_graph_config[prefill].backend=disabled"
+                    f"moe_a2a_backend={overrides.get('moe_a2a_backend', cfg.moe_a2a_backend)}"
                 )
 
             # Deferred import to avoid a circular import at module-load
@@ -139,8 +159,18 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                     "needs Triton>=3.5.0 or AITER_ENABLE_AOT_GLUON_PA_MQA_LOGITS=1)."
                 )
             else:
-                overrides["page_size"] = 64
-                logger.warning("Setting page size to 64 for DeepSeek DSA.")
+                index_kpool = get_dsa_index_kpool(hf_config)
+                if index_kpool > 1 and cfg.dcp_size > 1:
+                    raise ValueError(
+                        "--dcp-size > 1 is not supported for DSA with "
+                        f"index_kpool={index_kpool}: a pooled index key spans "
+                        "positions owned by different DCP ranks."
+                    )
+                # A logical page must own a whole pooled index group so that a
+                # prefix hit never ends inside one.
+                page_size = 64 * index_kpool
+                overrides["page_size"] = page_size
+                logger.warning(f"Setting page size to {page_size} for DeepSeek DSA.")
         elif get_platform().is_xpu:
             overrides["page_size"] = 128
             logger.warning("Setting page size to 128 for DeepSeek DSA on XPU.")

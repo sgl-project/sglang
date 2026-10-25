@@ -62,7 +62,6 @@ def apply_all():
     _patch_flash_attn_availability()
     _patch_rope_parameters_validation()
     _patch_layer_types_validation()
-    _patch_nested_rope_validation()
     _patch_removed_symbols()
     _patch_image_processor_kwargs()
     _patch_image_process_cuda_tensor()
@@ -237,36 +236,6 @@ def _patch_layer_types_validation():
         break
 
 
-def _patch_nested_rope_validation():
-    from transformers import PretrainedConfig
-
-    validators = PretrainedConfig.__class_validators__
-    for index, validator in enumerate(validators):
-        if validator.__name__ != "validate_rope":
-            continue
-
-        def validate_rope(self, _orig=validator):
-            try:
-                return _orig(self)
-            except AttributeError:
-                # Backport of huggingface/transformers#48798; drop once transformers >= 5.18.
-                rope_parameters = getattr(self, "rope_parameters", None)
-                layer_types = getattr(self, "layer_types", None) or ()
-                if not isinstance(rope_parameters, dict):
-                    raise
-                nested = {k: v for k, v in rope_parameters.items() if k in layer_types}
-                if not nested or len(nested) == len(rope_parameters):
-                    raise
-                self.rope_parameters = nested
-                try:
-                    return _orig(self)
-                finally:
-                    self.rope_parameters = rope_parameters
-
-        validators[index] = validate_rope
-        break
-
-
 def _patch_removed_symbols():
     """Re-export ``LlamaFlashAttention2``, removed in transformers v5.4.0.
 
@@ -370,11 +339,14 @@ def _patch_image_processor_kwargs():
 
 
 def _patch_image_process_cuda_tensor():
-    """Fix ``process_image()`` crashing on CUDA tensors.
+    """Handle CUDA tensors and grayscale tensor RGB conversion in PIL processing.
 
     Transformers v5.4's PIL image processing backend calls
     ``image.numpy()`` on torch tensors, which fails for CUDA tensors.
-    Patch to call ``.cpu().numpy()`` instead.
+    Move them to CPU before processing. Its RGB conversion handles PIL images
+    but leaves tensors unchanged: a grayscale JPEG decoded as a [1, H, W]
+    tensor stays single-channel even when ``do_convert_rgb`` is requested.
+    Processors that normalize with three RGB means then fail on that channel.
 
     TODO(upstream): report to HF transformers.
     """
@@ -393,7 +365,19 @@ def _patch_image_process_cuda_tensor():
             ):
                 if isinstance(image, _Tensor) and image.is_cuda:
                     image = image.cpu()
-                return _orig(self, image, *args, **kwargs)
+                result = _orig(self, image, *args, **kwargs)
+                # Check channels after process_image converts the layout to CHW.
+                do_convert_rgb = kwargs.get(
+                    "do_convert_rgb", args[0] if args else False
+                )
+                if (
+                    do_convert_rgb
+                    and isinstance(image, _Tensor)
+                    and result.ndim == 3
+                    and result.shape[0] == 1
+                ):
+                    result = result.repeat(3, axis=0)
+                return result
 
             cls.process_image = patched_process_image
     except ImportError:
