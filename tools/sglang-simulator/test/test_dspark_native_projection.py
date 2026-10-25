@@ -1709,3 +1709,100 @@ def test_tp4_verified_projection_missing_cost_never_reaches_progress(
     with pytest.raises(PredictorError, match="missing qualified DSPark cost"):
         run.predict(step)
     assert run._history == previous and run._last_forward_id == -1
+
+
+def explicit_source_binding(case):
+    """Existing source/cohort formats only; no numerical rows or accepted decision."""
+    write_source_slice(case)
+    cohort = json.loads(case.assets[case.cohorts[0]["path"]])
+    return {
+        "root": str(case.slice_dir.resolve()),
+        "profile": case.profile_ref,
+        "cohort": case.cohorts[0],
+        "stack": cohort["stack"],
+    }
+
+
+@pytest.mark.parametrize("cohort_case", [2, 4], indirect=True)
+def test_explicit_source_binding_uses_real_sdk_cohort_without_numerical_inventory(
+    cohort_case, monkeypatch
+):
+    from infercast.sdk.perf_database import slice_manifest
+    from sglang_simulator.time_predictor import infercast_dspark
+
+    case = cohort_case
+    binding = explicit_source_binding(case)
+    monkeypatch.setattr(
+        slice_manifest,
+        "read_verified_slice_artifact",
+        lambda *a, **kw: pytest.fail("source binding read a finalized numerical slice"),
+    )
+    monkeypatch.setattr(
+        infercast_dspark,
+        "_native_source_policy",
+        lambda *a, **kw: pytest.fail("explicit binding fell back to kernel identities"),
+    )
+    policy, identity = infercast_dspark._native_source_policy_from_binding(
+        case.database, case.profile_ref["sha256"], case.capture_profile, binding
+    )
+    assert policy == case.policy and policy.tp_size == case.policy.tp_size
+    assert identity == binding
+    assert not any("measurement" in name for name in identity)
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "unknown",
+        "relative_root",
+        "descriptor_path",
+        "profile_id",
+        "stack",
+        "profile_stack_as_cohort",
+        "capture",
+        "original_bytes",
+        "missing_original",
+        "partial_epoch",
+    ],
+)
+def test_explicit_source_binding_rejects_unbound_or_mixed_originals(cohort_case, fault):
+    from sglang_simulator.time_predictor.infercast_dspark import (
+        _native_source_policy_from_binding,
+    )
+
+    case = cohort_case
+    binding = copy.deepcopy(explicit_source_binding(case))
+    capture = case.capture_profile
+    database = case.database
+    profile_id = case.profile_ref["sha256"]
+    if fault == "unknown":
+        binding["approved"] = True
+    elif fault == "relative_root":
+        binding["root"] = "relative-source"
+    elif fault == "descriptor_path":
+        binding["cohort"]["path"] = "_meta/../cohort.json"
+    elif fault == "profile_id":
+        profile_id = "f" * 64
+    elif fault == "stack":
+        database = NS(stack_meta={**case.stack, "gpu_sku": "another GPU"})
+    elif fault == "profile_stack_as_cohort":
+        profile = json.loads(case.assets[case.profile_ref["path"]])
+        binding["stack"] = profile["stack"]
+    elif fault == "capture":
+        capture = NS(
+            to_dict=lambda: {**case.capture_profile.to_dict(), "unexpected": True}
+        )
+    else:
+        cohort = json.loads(case.assets[binding["cohort"]["path"]])
+        if fault == "partial_epoch":
+            cohort["startup"] = cohort["startup"][:-1]
+            binding["cohort"] = retain(case.assets, "cohort", cohort)
+            write_source_slice(case)
+        else:
+            path = case.slice_dir / cohort["captures"][0]["path"]
+            if fault == "original_bytes":
+                path.write_bytes(path.read_bytes() + b" ")
+            else:
+                path.unlink()
+    with pytest.raises((PredictorError, ValueError, OSError)):
+        _native_source_policy_from_binding(database, profile_id, capture, binding)

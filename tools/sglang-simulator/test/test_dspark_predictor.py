@@ -44,6 +44,12 @@ def test_invalid_progress_selection_fails_before_sdk_or_artifact_reads(options):
         InferCastDSparkTimePredictor(None, None, None, **options)
 
 
+@pytest.mark.parametrize("binding", [{}, True, "source.json"])
+def test_explicit_source_binding_never_enables_default_silicon_mode(binding):
+    with pytest.raises(PredictorError, match="requires explicit HYBRID"):
+        InferCastDSparkTimePredictor(None, None, None, native_source_binding=binding)
+
+
 def mock_config_link(monkeypatch, source, target):
     """Model link resolution deterministically on hosts without symlink privilege."""
     original_resolve, original_lstat, original_readlink = (

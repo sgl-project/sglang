@@ -6,7 +6,6 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
-
 from sglang_simulator.simulation.manager.config import ConfigManager
 from sglang_simulator.simulation.manager.env import Envs
 
@@ -166,6 +165,46 @@ def test_explicit_hybrid_model_and_output_resolve_from_config(factory):
         (folder / "run/costs.jsonl").resolve()
     )
     assert raw == original
+
+
+def test_explicit_native_source_root_resolves_without_rewriting_descriptors(factory):
+    _, raw, folder = factory
+    binding = {
+        "root": "native-source",
+        "profile": {"path": "_meta/profile.json", "sha256": "a" * 64},
+        "cohort": {"path": "_meta/cohort.json", "sha256": "b" * 64},
+        "stack": {"path": "_meta/stack.json", "sha256": "c" * 64},
+    }
+    raw["predictor"]["native_source_binding"] = binding
+    original = copy.deepcopy(raw)
+    result = ConfigManager.get_inference_time_predictor(None, None, None)
+    assert result.native_source_binding == {
+        **binding,
+        "root": str((folder / "native-source").absolute()),
+    }
+    assert raw == original
+
+
+def test_source_root_link_identity_is_left_for_factory_validation(factory, monkeypatch):
+    _, raw, folder = factory
+    alias, target = folder / "source-alias", folder / "actual-source"
+    resolve = Path.resolve
+    monkeypatch.setattr(
+        Path,
+        "resolve",
+        lambda path, *a, **kw: target if path == alias else resolve(path, *a, **kw),
+    )
+    raw["predictor"]["native_source_binding"] = {"root": str(alias)}
+    result = ConfigManager.get_inference_time_predictor(None, None, None)
+    assert result.native_source_binding["root"] == str(alias.absolute())
+
+
+@pytest.mark.parametrize("root", ["", " "])
+def test_blank_source_root_is_not_repaired_into_config_directory(factory, root):
+    _, raw, _ = factory
+    raw["predictor"]["native_source_binding"] = {"root": root}
+    result = ConfigManager.get_inference_time_predictor(None, None, None)
+    assert result.native_source_binding == {"root": root}
 
 
 @pytest.mark.parametrize("invalid", [123, "", " "])

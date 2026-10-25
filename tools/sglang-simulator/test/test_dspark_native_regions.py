@@ -214,6 +214,200 @@ def test_initial_buffer_requires_owner_lookup_and_rejects_empirical_source(
     assert captured == [1]
 
 
+@pytest.fixture
+def source_buffer_protocol(initial_buffer_witness, monkeypatch):
+    """Resource-validation protocol only; no native epoch or timing is asserted."""
+    import copy
+
+    from infercast.sdk.native_segment_module import NativeSegmentQuery
+    from infercast.sdk.native_sources import NATIVE_SOURCE_0522
+    from infercast.sdk.native_verify_plan import PLANNER_SOURCE, SCOPE
+    from infercast.sdk.native_windows import WORKER_BODY_BOUNDARY
+    from sglang_simulator.time_predictor import infercast_dspark
+
+    shape, asset = initial_buffer_witness
+    query = NativeSegmentQuery.from_shape(shape)
+    variant = json.loads(query.module_variant)
+    ref = {
+        "path": "_meta/dsv41-native-segment-cohort-" + "a" * 64 + ".json",
+        "sha256": "a" * 64,
+    }
+    identity = {"cohort": ref}
+    policy = NS(
+        execution_profile_id=query.execution_profile_id,
+        tp_size=4,
+        _require_capture=lambda *a: None,
+    )
+    capture = NS(
+        decode_graph_backend="full", profile_id="b" * 64, validate_batch=lambda *a: None
+    )
+    rows = []
+    for rank in range(4):
+        rows.append(
+            {
+                "pid": rank + 1,
+                "forward_ct": 7,
+                "time_ns": 1,
+                "source_sha256": NATIVE_SOURCE_0522.worker,
+                "native_worker_body_boundary": WORKER_BODY_BOUNDARY,
+                "native_worker_body_sources": NATIVE_SOURCE_0522.body_sources,
+                "mode": "DECODE",
+                "extend": False,
+                "idle": False,
+                "coordinated_prefill": False,
+                "performance_qualified": False,
+                "request_ids": ["resource-protocol"],
+                "native_verify_plan_input": {
+                    "schema_version": 1,
+                    "planner_source_sha256": PLANNER_SOURCE,
+                    "worker_source_sha256": NATIVE_SOURCE_0522.worker,
+                    "forward_ct": 7,
+                    "forward_started_ns": 1,
+                    "observed_ns": 2,
+                    "request_ids": ["resource-protocol"],
+                    "verify_width": 6,
+                    "seq_lens_cpu": [variant["verify_plan_cpu_max_seq_len"]],
+                    "scope": SCOPE,
+                    "performance_qualified": False,
+                    "cost_import_supported": False,
+                },
+                "native_proposal_call": {
+                    "schema_version": 1,
+                    "cost_import_supported": False,
+                    "before": {
+                        "batch_size": 1,
+                        "sampling_info_is_none": False,
+                        "sampler_attached": True,
+                        "model_has_forward_embed": True,
+                        "effective_environment": {
+                            "SGLANG_DSPARK_FOLDED_PROPOSAL": True,
+                            "SGLANG_DSPARK_EMBED_IN_GRAPH": True,
+                        },
+                        "buffer": {
+                            "state": "present",
+                            "shape": [1, 5],
+                            "dtype": "torch.int64",
+                            "device": "cuda:0",
+                            "prefix_device": "cuda:0",
+                            "needs_allocation": False,
+                        },
+                    },
+                },
+                "actual_full_graph_replays": [
+                    {"is_draft_worker": draft, "shape_key": variant[name]}
+                    for draft, name in (
+                        (True, "draft_capture_key"),
+                        (False, "target_capture_key"),
+                    )
+                ],
+            }
+        )
+    frames = [{"forward_ct": 7, "participants": [{"metadata": row} for row in rows]}]
+    native = {7: query.native_input}
+    # Only the transport/epoch boundary is a protocol double. The production
+    # buffer and planner receipt validators below execute unchanged SDK code.
+    monkeypatch.setattr(
+        infercast_dspark,
+        "_native_source_policy_from_binding",
+        lambda *a: (policy, identity),
+    )
+    monkeypatch.setattr(
+        infercast_dspark,
+        "_native_source_binding_assets",
+        lambda *a: (
+            identity,
+            lambda path, digest: json.dumps({"policy_windows": [ref]}).encode(),
+        ),
+    )
+    monkeypatch.setattr(
+        "infercast.sdk.native_windows.join_native_frames", lambda *a, **kw: frames
+    )
+    monkeypatch.setattr(
+        "infercast.sdk.native_forward_observation.native_forward_inputs",
+        lambda *a, **kw: list(native.items()),
+    )
+    monkeypatch.setattr(
+        "infercast.sdk.operations.compute.dsv41_native_segment.DSV41NativeSegment.query",
+        lambda *a: pytest.fail("source resource witness queried numerical cost"),
+    )
+    return NS(
+        policy=policy,
+        capture=capture,
+        asset=asset,
+        rows=rows,
+        frames=frames,
+        native=native,
+        identity=identity,
+        copy=copy.deepcopy,
+    )
+
+
+def test_source_resource_witness_validates_all_ranks_without_numerical_cost(
+    source_buffer_protocol,
+):
+    from sglang_simulator.time_predictor.infercast_dspark import (
+        _source_initial_draft_buffer,
+    )
+
+    case = source_buffer_protocol
+    capacity, identity = _source_initial_draft_buffer(
+        object(), case.policy, case.capture, case.asset, case.identity
+    )
+    assert capacity == 1 and identity["forward_ids"] == [7]
+    assert identity["source"] == "native_source_cohort"
+    assert identity["resolution"] == "observed_before_work"
+    assert (
+        identity["latency_used"]
+        is identity["source_reference_initial_state_equivalence"]
+        is False
+    )
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "missing_rank",
+        "other_input",
+        "capacity",
+        "unknown_buffer",
+        "rank_device",
+        "graph",
+        "planner",
+    ],
+)
+def test_source_resource_witness_rejects_incomplete_or_different_before_work(
+    source_buffer_protocol, fault
+):
+    from sglang_simulator.time_predictor.infercast_dspark import (
+        _source_initial_draft_buffer,
+    )
+
+    case = source_buffer_protocol
+    row = case.rows[-1]
+    if fault == "missing_rank":
+        case.frames[0]["participants"].pop()
+    elif fault == "other_input":
+        case.native[7] = object()
+    elif fault == "capacity":
+        for item in case.rows:
+            item["native_proposal_call"]["before"]["buffer"]["shape"][0] = 2
+    elif fault == "unknown_buffer":
+        row["native_proposal_call"]["before"]["buffer"].pop("state")
+    elif fault == "rank_device":
+        row["native_proposal_call"]["before"]["buffer"].update(
+            device="cuda:1", needs_allocation=True
+        )
+    elif fault == "graph":
+        row["actual_full_graph_replays"] = case.copy(row["actual_full_graph_replays"])
+        row["actual_full_graph_replays"][0]["shape_key"]["size"] = 2
+    else:
+        row["native_verify_plan_input"]["seq_lens_cpu"] = [901]
+    with pytest.raises((PredictorError, ValueError)):
+        _source_initial_draft_buffer(
+            object(), case.policy, case.capture, case.asset, case.identity
+        )
+
+
 @pytest.mark.parametrize("invalid", ["interpolated", "requested", "resolved"])
 def test_initial_buffer_rejects_derived_silicon_or_changed_query_proof(
     initial_buffer_witness, monkeypatch, invalid

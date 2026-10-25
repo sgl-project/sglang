@@ -289,6 +289,35 @@ Partial epochs cannot be combined to establish one policy. Runtime bytes must
 exactly match the policy's canonical physical-source document and the
 independently bound progress artifact.
 
+With explicit `cost_mode: "HYBRID"` and `native_analytic_model`, an optional
+`native_source_binding` can instead select this configuration's original source
+cohort without requiring numerical rows for that profile:
+
+```json
+{
+  "native_source_binding": {
+    "root": "native-source-evidence",
+    "profile": {"path": "_meta/dsv41-native-segment-profile-<digest>.json", "sha256": "<digest>"},
+    "cohort": {"path": "_meta/dsv41-native-segment-cohort-<digest>.json", "sha256": "<digest>"},
+    "stack": {"path": "_meta/dsv41-native-segment-stack-<digest>.json", "sha256": "<digest>"}
+  }
+}
+```
+
+The root resolves from the simulation configuration directory and must be a
+resolved directory without links. These are the existing SDK content-addressed
+descriptors and profile2/cohort formats, read with the SDK's bounded regular-file
+reader and verified SHA256 values. `NativeSegmentSourcePolicy.from_cohort`
+validates each rank/role's source, startup, graph, proposal and allocated-runtime
+facts. The explicit stack descriptor selects the cohort's full original stack;
+the profile's separate stable-stack artifact is also verified. Their stable
+stack identities must both match the numerical database. Configured runtime,
+capture and topology remain exact. This source-only
+binding grants no cost qualification. Existing qualified rows remain separately
+validated, and missing numerical work follows the explicit analytic SOL path.
+Omitting the option retains the existing finalized kernel-identity loader and
+does not add a source-binding field to predictor identity.
+
 Measurement `native` windows are separately checked against the slice manifest
 and their SHA256; they need not equal the cohort's policy windows. Measurement
 proposal paths must match that cohort, with one original proposal receipt per
@@ -314,6 +343,15 @@ allocation by CUDA graph capture or a physical CPU buffer. Later allocation,
 growth and transaction failure rules are unchanged. Cold allocation costs remain
 required when the option is absent. The witness does not establish equivalence
 to the reference benchmark's initial state or qualify a whole workflow point.
+
+When `native_source_binding` is explicit, the same warm-query asset can instead
+be verified against that cohort's original policy windows. The SDK joins the
+complete rank set and original forward, preserves the full native input, and
+checks before-proposal buffer capacity/device/allocation together with actual
+graph and planner facts. At least one complete matching original is required.
+This route records `native_source_cohort` / `observed_before_work` provenance and
+its forward IDs; it reads no numerical latency row and grants no silicon timing
+qualification. The default witness path above still requires exact silicon.
 
 This is the predictor object inside the ordinary simulation configuration;
 replace digest/commit placeholders with verified values. Configure the modeled

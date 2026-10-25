@@ -306,6 +306,7 @@ class ConfigManager:
                 "cost_mode",
                 "native_analytic_model",
                 "native_cost_evidence_path",
+                "native_source_binding",
                 "output_token_id",
             }
             unknown_fields = sorted(predictor_config.keys() - supported_fields)
@@ -349,6 +350,20 @@ class ConfigManager:
                 options["native_cost_evidence_path"] = cls.resolve_infercast_path(
                     options["native_cost_evidence_path"]
                 )
+            binding = options.get("native_source_binding")
+            if (
+                type(binding) is dict
+                and type(binding.get("root")) is str
+                and binding["root"].strip()
+            ):
+                root = Path(os.path.expandvars(binding["root"])).expanduser()
+                if not root.is_absolute():
+                    root = Path(Envs.config_path()).resolve().parent / root
+                # Keep link identity for the factory's safe original reader.
+                options["native_source_binding"] = {
+                    **binding,
+                    "root": str(root.absolute()),
+                }
             return InferCastDSparkTimePredictor(
                 model,
                 hw=hw,

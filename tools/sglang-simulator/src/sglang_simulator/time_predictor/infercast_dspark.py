@@ -82,6 +82,91 @@ def _runtime_json(raw):
         ) from error
 
 
+def _native_source_binding_assets(binding):
+    """Use the SDK's existing bounded original reader, not numerical metadata."""
+    from infercast.sdk.native_windows import MAX_NATIVE_WINDOW_BYTES
+    from infercast.sdk.perf_database.dsv41_native_segment import artifact_descriptor
+    from infercast.sdk.perf_database.slice_manifest import _read_regular_metadata_file
+
+    _require(
+        type(binding) is dict
+        and set(binding) == {"root", "profile", "cohort", "stack"},
+        "native_source_binding requires exactly root, profile, cohort and stack",
+    )
+    _require(
+        type(binding["root"]) is str and bool(binding["root"].strip()),
+        "native source evidence root must be explicit",
+    )
+    root = Path(binding["root"])
+    _require(
+        root.is_absolute()
+        and root.is_dir()
+        and not root.is_symlink()
+        and root.resolve(strict=True) == root,
+        "native source evidence root must be a resolved directory without links",
+    )
+    refs = {}
+    for name in ("profile", "cohort", "stack"):
+        _require(
+            type(binding[name]) is dict, "native source descriptor must be an object"
+        )
+        path, digest = artifact_descriptor(binding[name])
+        refs[name] = {"path": path, "sha256": digest}
+
+    def read(path, digest):
+        artifact_descriptor({"path": path, "sha256": digest})
+        raw = _read_regular_metadata_file(root, path, MAX_NATIVE_WINDOW_BYTES)
+        _require(
+            hashlib.sha256(raw).hexdigest() == digest,
+            "native source original bytes differ from their descriptor",
+            code="invalid_execution_profile",
+        )
+        return raw
+
+    return {"root": str(root), **refs}, read
+
+
+def _native_source_policy_from_binding(database, profile_id, capture_profile, binding):
+    """Verify source originals independently of numerical row admission."""
+    from infercast._serialization import canonical_json_bytes
+    from infercast.sdk.native_segment_projection import NativeSegmentSourcePolicy
+    from infercast.sdk.perf_database.dsv41_dspark import decode_dspark_artifact
+    from infercast.sdk.perf_database.dsv41_native_segment import (
+        artifact_descriptor,
+        native_segment_stack_identity,
+    )
+
+    identity, read = _native_source_binding_assets(binding)
+
+    def document(ref):
+        return decode_dspark_artifact(read(*artifact_descriptor(ref)))
+
+    profile = document(identity["profile"])
+    cohort = document(identity["cohort"])
+    profile_stack = document(profile["stack"])
+    stack = document(identity["stack"])
+    _require(
+        identity["profile"]["sha256"] == profile_id
+        and artifact_descriptor(cohort["stack"])
+        == artifact_descriptor(identity["stack"])
+        and native_segment_stack_identity(profile_stack)
+        == native_segment_stack_identity(stack)
+        == native_segment_stack_identity(database.stack_meta),
+        "native source profile or stable numerical database stack differs",
+        code="incompatible_runtime",
+    )
+    policy = NativeSegmentSourcePolicy.from_cohort(
+        identity["profile"], identity["cohort"], read, stack_meta=stack
+    )
+    _require(
+        canonical_json_bytes(capture_profile.to_dict())
+        == canonical_json_bytes(document(cohort["capture_profile"])),
+        "configured native capture profile differs from its source cohort",
+        code="invalid_execution_profile",
+    )
+    return policy, identity
+
+
 def _native_source_policy(database, profile_id, capture_profile):
     """Resolve existing retained slice metadata; the SDK validates its policy."""
     from infercast._serialization import canonical_json_bytes
@@ -272,6 +357,149 @@ def _native_source_policy(database, profile_id, capture_profile):
         window_descriptors=tuple(windows[k] for k in sorted(windows)),
         proposal_descriptors=tuple(proposal[k] for k in sorted(proposal)),
     )
+
+
+def _source_initial_draft_buffer(
+    database, policy, capture_profile, descriptor, binding
+):
+    """Verify an observed warm resource through its original source cohort."""
+    from infercast._serialization import canonical_json_bytes
+    from infercast.sdk.native_forward_observation import native_forward_inputs
+    from infercast.sdk.native_segment_module import (
+        NativeSegmentQuery,
+        native_draft_read_extent,
+    )
+    from infercast.sdk.native_sources import NATIVE_SOURCE_0522
+    from infercast.sdk.native_verify_plan import verify_plan_cpu_max_seq_len
+    from infercast.sdk.native_windows import join_native_frames
+    from infercast.sdk.perf_database.dsv41_dspark import decode_dspark_artifact
+    from infercast.sdk.perf_database.dsv41_native_segment import (
+        _verify_before_buffer,
+        artifact_descriptor,
+        json_variant,
+    )
+
+    candidate, identity = _native_source_policy_from_binding(
+        database, policy.execution_profile_id, capture_profile, binding
+    )
+    _require(candidate == policy, "initial resource source policy differs")
+    path, raw, digest = _asset(descriptor, "native_initial_draft_buffer")
+    query = NativeSegmentQuery.from_shape(decode_dspark_artifact(raw))
+    shape, variant = query.to_shape(), json_variant(query)
+    capacity = variant["buffer_capacity"]
+    _require(
+        query.execution_profile_id == policy.execution_profile_id
+        and shape["tp_size"] == policy.tp_size
+        and shape["attention_dp_size"] == 1
+        and shape["worker_phase"] == "DECODE"
+        and shape["segment_kind"] == "decode_preamble"
+        and type(capacity) is int
+        and capacity >= shape["batch_size"]
+        and variant["buffer_device_matches"] is True
+        and "draft_read_extent_tokens" in variant
+        and capture_profile.decode_graph_backend == "full",
+        "initial source resource requires a matching warm native DECODE query",
+        code="invalid_execution_profile",
+    )
+    capture_profile.validate_batch(shape["batch_size"])
+    policy._require_capture(True, variant["draft_capture_key"])
+    policy._require_capture(False, variant["target_capture_key"])
+    _, read = _native_source_binding_assets(identity)
+    cohort = decode_dspark_artifact(read(*artifact_descriptor(identity["cohort"])))
+    windows = [
+        decode_dspark_artifact(read(*artifact_descriptor(ref)))
+        for ref in cohort["policy_windows"]
+    ]
+    participants = [
+        {
+            "tp_rank": rank,
+            "tp_size": policy.tp_size,
+            "attn_tp_rank": rank,
+            "attn_tp_size": policy.tp_size,
+            "attn_dp_rank": 0,
+            "attn_dp_size": 1,
+            "pp_rank": 0,
+            "pp_size": 1,
+        }
+        for rank in range(policy.tp_size)
+    ]
+    join = {
+        "participants": participants,
+        "phase_policy": "serialized",
+        "source_pin": NATIVE_SOURCE_0522.name,
+    }
+    frames = join_native_frames(windows, **join)
+    native = dict(native_forward_inputs(windows, candidate_span=16384, **join))
+    matched = []
+    for frame in frames:
+        fid = frame["forward_ct"]
+        if native[fid] != query.native_input:
+            continue
+        observed = []
+        for peer in frame["participants"]:
+            row = peer["metadata"]
+            buffer = (
+                row.get("native_proposal_call", {}).get("before", {}).get("buffer", {})
+            )
+            state = buffer.get("state")
+            _require(
+                state == "none"
+                or state == "present"
+                and type(buffer.get("shape")) is list
+                and len(buffer["shape"]) == 2,
+                "initial source resource omits actual buffer state",
+                code="invalid_execution_profile",
+            )
+            actual = dict(variant)
+            actual["buffer_capacity"] = 0 if state == "none" else buffer["shape"][0]
+            actual["buffer_device_matches"] = state == "present" and buffer.get(
+                "device"
+            ) == buffer.get("prefix_device")
+            _verify_before_buffer(row, actual)
+            actual["verify_plan_cpu_max_seq_len"] = verify_plan_cpu_max_seq_len(row)
+            actual["draft_read_extent_tokens"] = native_draft_read_extent(native[fid])
+            for role, name in (
+                (True, "draft_capture_key"),
+                (False, "target_capture_key"),
+            ):
+                keys = [
+                    replay["shape_key"]
+                    for replay in row["actual_full_graph_replays"]
+                    if replay["is_draft_worker"] is role
+                ]
+                _require(
+                    len(keys) == 1,
+                    "initial resource requires both actual graph replays",
+                )
+                actual[name] = keys[0]
+            observed.append(canonical_json_bytes(actual))
+        if len(observed) == policy.tp_size and all(
+            value == canonical_json_bytes(variant) for value in observed
+        ):
+            matched.append(fid)
+    _require(
+        bool(matched),
+        "initial resource has no complete matching original source forward",
+        code="data_unavailable",
+    )
+    return capacity, {
+        "path": str(path),
+        "sha256": digest,
+        "query_sha256": hashlib.sha256(canonical_json_bytes(shape)).hexdigest(),
+        "execution_profile_id": policy.execution_profile_id,
+        "capture_profile_id": capture_profile.profile_id,
+        "cohort": identity["cohort"],
+        "forward_ids": sorted(matched),
+        "capacity": capacity,
+        "device_matches": True,
+        "source": "native_source_cohort",
+        "state": "observed_warm_before_work",
+        "resolution": "observed_before_work",
+        "latency_used": False,
+        "physical_CPU_buffer_claimed": False,
+        "source_reference_initial_state_equivalence": False,
+        "whole_workflow_point": False,
+    }
 
 
 def _initial_draft_buffer(database, policy, capture_profile, descriptor):
@@ -738,6 +966,7 @@ class InferCastDSparkTimePredictor(InferTimePredictor):
         cost_mode="SILICON",
         native_analytic_model=None,
         native_cost_evidence_path=None,
+        native_source_binding=None,
         output_token_id=1,
         model_config_root=None,
         **kwargs,
@@ -756,6 +985,12 @@ class InferCastDSparkTimePredictor(InferTimePredictor):
         _require(
             native_cost_evidence_path is None or cost_mode == "HYBRID",
             "native_cost_evidence_path requires explicit HYBRID costs",
+        )
+        _require(
+            native_source_binding is None
+            or cost_mode == "HYBRID"
+            and type(native_source_binding) is dict,
+            "native_source_binding requires explicit HYBRID analytic costs",
         )
         _require(
             cost_mode != "HYBRID"
@@ -966,6 +1201,7 @@ class InferCastDSparkTimePredictor(InferTimePredictor):
         from sglang_simulator.time_predictor.dspark_umd import UMDDSparkCostModel
 
         native_policy, capture_identity, capture_profile = None, None, None
+        source_binding_identity = None
         if native_segment_profile_id is not None:
             try:
                 from infercast.sdk.decode_forward import DecodeExecutionProfile
@@ -979,9 +1215,19 @@ class InferCastDSparkTimePredictor(InferTimePredictor):
                 capture_profile = DecodeExecutionProfile.from_dict(
                     decode_dspark_artifact(capture_bytes)
                 )
-                native_policy = _native_source_policy(
-                    database, native_segment_profile_id, capture_profile
-                )
+                if native_source_binding is None:
+                    native_policy = _native_source_policy(
+                        database, native_segment_profile_id, capture_profile
+                    )
+                else:
+                    native_policy, source_binding_identity = (
+                        _native_source_policy_from_binding(
+                            database,
+                            native_segment_profile_id,
+                            capture_profile,
+                            native_source_binding,
+                        )
+                    )
                 _require(
                     runtime_text == native_policy.runtime_profile_json,
                     "configured runtime differs from the verified native physical source",
@@ -1051,10 +1297,23 @@ class InferCastDSparkTimePredictor(InferTimePredictor):
                 raise PredictorError(
                     "data_unavailable", f"native analytic model is unavailable: {error}"
                 ) from error
-        # Cost approximation does not supply or relax the exact resource witness.
-        initial_capacity, initial_buffer_identity = _initial_draft_buffer(
-            database, native_policy, capture_profile, native_initial_draft_buffer
-        )
+        # An explicit source binding may establish resource facts without a
+        # numerical latency row. The default silicon witness owner is unchanged.
+        if (
+            source_binding_identity is not None
+            and native_initial_draft_buffer is not None
+        ):
+            initial_capacity, initial_buffer_identity = _source_initial_draft_buffer(
+                database,
+                native_policy,
+                capture_profile,
+                native_initial_draft_buffer,
+                source_binding_identity,
+            )
+        else:
+            initial_capacity, initial_buffer_identity = _initial_draft_buffer(
+                database, native_policy, capture_profile, native_initial_draft_buffer
+            )
         if progress_kind == "empirical":
             _require(
                 getattr(native_policy, "golden_law", None) is None,
@@ -1133,6 +1392,8 @@ class InferCastDSparkTimePredictor(InferTimePredictor):
             self._identity["native_initial_draft_buffer"] = initial_buffer_identity
         if analytic_identity is not None:
             self._identity["native_analytic_model"] = analytic_identity
+        if source_binding_identity is not None:
+            self._identity["native_source_binding"] = source_binding_identity
 
     def predict_infer_time(self, batch):
         raise PredictorError(
