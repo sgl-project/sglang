@@ -22,7 +22,7 @@ class TestAscendPageDcpSend(CustomTestCase):
             mla_compression_ratios=None,
         )
         mgr._dcp_remote_decode_layout = [False, True, True]
-        mgr._transfer_data = Mock(return_value=0)
+        mgr._transfer_copies = Mock(return_value=0)
 
         with self.assertRaisesRegex(RuntimeError, "destination geometry"):
             mgr.send_kvcache_dcp(

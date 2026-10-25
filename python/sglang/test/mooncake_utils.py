@@ -4,9 +4,17 @@ import socket
 import subprocess
 import tempfile
 import time
+from types import SimpleNamespace
 
 import requests
 
+from sglang.srt.disaggregation.mooncake.buffers import (
+    PEER_STAGING_KEY,
+    BufferKind,
+    MooncakeBufferKey,
+    kv_args_buffers,
+)
+from sglang.srt.disaggregation.mooncake.transport import MooncakeTransport, Registration
 from sglang.test.server_fixtures.disaggregation_fixture import (
     get_rdma_devices_args,
 )
@@ -196,3 +204,52 @@ class MooncakeTestServices:
                 process.wait(timeout=5)
             except (ProcessLookupError, subprocess.TimeoutExpired, OSError):
                 pass
+
+
+def engine_writes(fn):
+    """A Mooncake engine stand-in whose batch_transfer_sync hands `fn`
+    (session, [(src, dst, length), ...]) and returns what `fn` returns."""
+    return SimpleNamespace(
+        batch_register=lambda ptrs, lengths: 0,
+        batch_transfer_sync=lambda session, srcs, dsts, lengths: fn(
+            session, list(zip(srcs, dsts, lengths))
+        ),
+    )
+
+
+def attach_mooncake_transport(
+    manager,
+    engine,
+    *,
+    kv=(),
+    aux=(),
+    state=(),
+    staging=(),
+    peer_kv=(),
+    peer_aux=(),
+    peer_state=(),
+    peer_staging=0,
+    sessions=("session",),
+):
+    """Give `manager` a real MooncakeTransport over `engine`: this side's buffers
+    registered, and every session in `sessions` importing the peer's."""
+    transport = MooncakeTransport(engine=engine)
+    staging_keys = {
+        ptr: MooncakeBufferKey(BufferKind.STAGING, i) for i, ptr in enumerate(staging)
+    }
+    local = kv_args_buffers(list(kv), list(aux), [list(s) for s in state])
+    local += [(key, ptr) for ptr, key in staging_keys.items()]
+    transport.register_all(
+        [Registration(key=key, ptr=ptr, length=1, device=0) for key, ptr in local]
+    )
+    peer = dict(
+        kv_args_buffers(list(peer_kv), list(peer_aux), [list(s) for s in peer_state])
+    )
+    if peer_staging:
+        peer[PEER_STAGING_KEY] = peer_staging
+    manager.transport = transport
+    manager._staging_keys = staging_keys
+    manager._peer_buffers = {
+        session: transport.import_registration(session_id=session, bases=peer)
+        for session in sessions
+    }

@@ -8,6 +8,7 @@ import numpy as np
 
 from sglang.srt.disaggregation.ascend.conn import AscendKVManager
 from sglang.srt.disaggregation.common.conn import CommonKVManager
+from sglang.srt.disaggregation.mooncake.buffers import state_keys
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
 from sglang.srt.disaggregation.prefill import _transfer_start_layer
 from sglang.srt.disaggregation.utils import (
@@ -18,6 +19,7 @@ from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 from sglang.srt.runtime_context import get_memory, publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.mooncake_utils import attach_mooncake_transport, engine_writes
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -56,6 +58,8 @@ class TestTransferStartLayer(CustomTestCase):
 class _RecordingKVManager:
     get_mha_kv_ptrs_with_pp = CommonKVManager.get_mha_kv_ptrs_with_pp
     get_mla_kv_ptrs_with_pp = CommonKVManager.get_mla_kv_ptrs_with_pp
+    _generic_entry_pairs = MooncakeKVManager._generic_entry_pairs
+    _transfer_copies = MooncakeKVManager._transfer_copies
 
     def __init__(self, *, prefill_start_layer: int, pp_size: int):
         self.is_mla_backend = False
@@ -66,8 +70,12 @@ class _RecordingKVManager:
         self.kv_args = SimpleNamespace(prefill_start_layer=prefill_start_layer)
         self.blocks = []
 
-    def _transfer_data(self, mooncake_session_id, transfer_blocks):
-        self.blocks.extend(transfer_blocks)
+    def attach(self, **buffers):
+        """Real transport over an engine that records every block it is handed."""
+        attach_mooncake_transport(self, engine_writes(self._record), **buffers)
+
+    def _record(self, session, blocks):
+        self.blocks.extend(blocks)
         return 0
 
 
@@ -89,6 +97,7 @@ class TestHybridSendUsesLayerIdPairing(CustomTestCase):
         dst_ptrs = [2000 + i for i in range(2 * num_model)]
         item_lens = [10 + i for i in range(2 * num_stage)]
         manager = _RecordingKVManager(prefill_start_layer=start_offset, pp_size=2)
+        manager.attach(kv=src_ptrs, peer_kv=dst_ptrs)
         rc = MooncakeKVManager._send_kvcache_generic(
             manager,
             mooncake_session_id="session",
@@ -128,6 +137,7 @@ class TestSingleRegionSWATransfer(CustomTestCase):
         manager.kv_args.kv_data_ptrs = [1000]
         manager.kv_args.kv_item_lens = [64]
         manager.kv_args.kv_layer_ids = []
+        manager.attach(kv=[1000], peer_kv=[2000])
         manager._validate_envelope_kv_layout = (
             MooncakeKVManager._validate_envelope_kv_layout.__get__(manager)
         )
@@ -189,6 +199,7 @@ class TestAscendHybridPpDispatch(CustomTestCase):
 class TestMambaSlotTransfer(CustomTestCase):
     def test_stage1_uses_paired_slot_sizes_and_offsets(self):
         manager = _RecordingKVManager(prefill_start_layer=1, pp_size=2)
+        manager.attach(state=[[1000]], peer_state=[[2000, 3000]])
         MooncakeKVManager._send_mamba_state(
             manager,
             req=SimpleNamespace(mooncake_session_id="session"),
@@ -200,6 +211,7 @@ class TestMambaSlotTransfer(CustomTestCase):
             src_layer_ids=[7],
             dst_layer_ids=[3, 7],
             dst_state_item_lens=[8, 16],
+            entry_key=state_keys(0),
         )
         self.assertEqual(manager.blocks, [(1032, 3048, 16)])
 
@@ -215,6 +227,7 @@ class TestMambaSlotTransfer(CustomTestCase):
                 dst_state_data_ptrs=[2000],
                 dst_mamba_index=[1],
                 dst_state_item_lens=[32],
+                entry_key=state_keys(0),
             )
         self.assertEqual(manager.blocks, [])
 
