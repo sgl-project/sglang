@@ -579,6 +579,25 @@ def test_latent_pack_decode_contract():
     )
 
 
+def test_decode_latent_stats_are_uploaded_once():
+    # decode normalizes with the first request's device tensors: a per-request
+    # upload would stall the host until the denoising loop drains
+    config = QwenImage21PipelineConfig()
+    ac = config.vae_config.arch_config
+    device = torch.device("cpu")
+    first = config.get_decode_scale_and_shift(device, torch.bfloat16, None)
+    second = config.get_decode_scale_and_shift(device, torch.bfloat16, None)
+    mean = torch.tensor(ac.latents_mean, dtype=torch.bfloat16)
+    std = torch.tensor(ac.latents_std, dtype=torch.bfloat16)
+    torch.testing.assert_close(
+        first[0], std.view(1, ac.z_dim, 1, 1, 1).reciprocal(), atol=0, rtol=0
+    )
+    torch.testing.assert_close(
+        first[1], mean.view(1, ac.z_dim, 1, 1, 1), atol=0, rtol=0
+    )
+    assert first[0] is second[0] and first[1] is second[1]
+
+
 @pytest.mark.parametrize("gfx1151", [False, True])
 @pytest.mark.parametrize("override", [None, False, True])
 def test_vae_tiling_platform_default_and_python_override(

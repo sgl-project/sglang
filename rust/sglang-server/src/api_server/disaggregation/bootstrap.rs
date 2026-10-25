@@ -479,6 +479,7 @@ mod tests {
                 ..Default::default()
             },
             server_args: Arc::new(server_args),
+            generate_hook: None,
         };
         (
             crate::runtime::start(cfg, None).expect("start runtime"),

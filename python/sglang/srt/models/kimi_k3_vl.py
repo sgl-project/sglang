@@ -425,15 +425,13 @@ class MoonViTEncoderLayer(nn.Module):
             implementation_backends = ()
         else:
             implementation_backends = (attention_backend,)
-        self.attention_backend_impls = nn.ModuleDict(
-            {
-                backend: QKV_BACKEND_IMPL[backend](
-                    use_data_parallel=True,
-                    workspace_buffer=attention_workspace,
-                )
-                for backend in implementation_backends
-            }
-        )
+        self.attention_backend_impls: dict[str, nn.Module] = {
+            backend: QKV_BACKEND_IMPL[backend](
+                use_data_parallel=True,
+                workspace_buffer=attention_workspace,
+            )
+            for backend in implementation_backends
+        }
 
     def _attention(
         self,

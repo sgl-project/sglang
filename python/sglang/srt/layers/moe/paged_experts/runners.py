@@ -4,8 +4,8 @@ The executor runs a step in waves (one wave when its experts fit the K slots). T
 returns every routed (token, expert) output already multiplied by its router weight
 (``no_combine``); the contract runs each wave over only the entries whose expert it holds,
 writes them into one merged buffer, and performs the top-k sum the runner would have performed
-itself. A quantization format names the contract of the runner its base method uses; supporting
-a new backend means adding a contract here.
+itself. The contract follows from the runner the base method builds (``contract_for``);
+supporting a new backend means adding a contract here.
 """
 
 from __future__ import annotations
@@ -30,19 +30,21 @@ def run_on_slots(base_method, layer, dispatch_output, slots, outside: int = 0):
     return base_method.apply(layer=layer, dispatch_output=wave_output).hidden_states
 
 
-class RunnerContract:
-    def runner_config(self, moe_runner_config, num_slots: int):
-        """The base runner's config: K local experts, router-weighted per-expert outputs."""
-        return replace(
-            moe_runner_config,
-            num_local_experts=num_slots,
-            inplace=False,
-            no_combine=True,
-            no_combine_keep_router_weight=True,
-        )
+def runner_config(moe_runner_config, num_slots: int):
+    """The base runner's config: K local experts, router-weighted per-expert outputs."""
+    return replace(
+        moe_runner_config,
+        num_local_experts=num_slots,
+        inplace=False,
+        no_combine=True,
+        no_combine_keep_router_weight=True,
+    )
 
-    def check(self, base_method) -> None:
-        """Raise if the base method's runner cannot honor ``runner_config``."""
+
+class RunnerContract:
+    #: Whether the runner reads a layout the base method's post-load step repacks the
+    #: experts into; the step then runs over the host store K experts at a time.
+    repacks: bool = False
 
     def run_wave(self, base_method, layer, dispatch_output, slots, merged):
         """Compute the routed entries of one wave (``slots`` >= 0) into ``merged``, the step's
@@ -50,10 +52,11 @@ class RunnerContract:
         raise NotImplementedError
 
     def finish(self, merged, hidden_states, routed_scaling_factor: float):
-        """The layer output: the top-k sum of the merged entries."""
-        out = torch.empty_like(hidden_states)
+        """The layer output: the top-k sum of the merged entries, trimmed to the input's width
+        (a runner may pad the hidden dimension, e.g. MXFP4 Marlin)."""
+        out = hidden_states.new_empty(merged.shape[0], merged.shape[-1])
         self._sum_top_k(merged, out, routed_scaling_factor)
-        return out
+        return out[..., : hidden_states.shape[-1]]
 
     def _sum_top_k(self, entries, out, routed_scaling_factor: float) -> None:
         """Sum ``[tokens, top_k, hidden]`` into ``out`` exactly as the runner would."""
@@ -61,15 +64,8 @@ class RunnerContract:
 
 
 class TritonContract(RunnerContract):
-    def check(self, base_method) -> None:
-        backend = base_method.runner.runner_backend
-        if not backend.is_triton():
-            raise RuntimeError(
-                f"Paged experts: requires the triton MoE runner, got {backend.value}"
-            )
-
     def run_wave(self, base_method, layer, dispatch_output, slots, merged):
-        config = base_method.runner.config
+        config = runner_of(base_method, layer).config
         skips = (
             config.num_experts is None or config.num_experts != config.num_local_experts
         )
@@ -94,7 +90,7 @@ class TritonContract(RunnerContract):
 
 
 class MarlinContract(RunnerContract):
-    # The Marlin MoE methods build a Marlin runner unconditionally, so there is nothing to check.
+    repacks = True
 
     def run_wave(self, base_method, layer, dispatch_output, slots, merged):
         # Only the wave's entries, compacted: the runner sees no masked rows.
@@ -103,8 +99,6 @@ class MarlinContract(RunnerContract):
             dispatch_output.hidden_states_scale is None
             and dispatch_output.hidden_states_pre_quant is None
         ), "Paged experts: compacted waves need unquantized MoE inputs"
-        if merged is None:
-            merged = hidden_states.new_zeros(*slots.shape, hidden_states.shape[-1])
         entries = (slots >= 0).flatten().nonzero().squeeze(1)
         num = entries.numel()
         if num == 0:
@@ -128,6 +122,8 @@ class MarlinContract(RunnerContract):
             ),
         )
         out = base_method.apply(layer=layer, dispatch_output=compact).hidden_states
+        if merged is None:  # at the runner's width, which may pad the hidden dimension
+            merged = out.new_zeros(*slots.shape, out.shape[-1])
         merged.view(-1, merged.shape[-1])[entries] = out.view(-1, merged.shape[-1])[
             :num
         ]
@@ -144,3 +140,31 @@ class MarlinContract(RunnerContract):
 
 TRITON = TritonContract()
 MARLIN = MarlinContract()
+
+
+def runner_of(base_method, layer):
+    """The runner the base method built: its own, or its scheme's (or the scheme kernel's)."""
+    scheme = getattr(layer, "scheme", None)
+    for owner in (base_method, scheme, getattr(scheme, "kernel", None)):
+        runner = getattr(owner, "runner", None)
+        if runner is not None:
+            return runner
+    return None
+
+
+def contract_for(runner) -> RunnerContract:
+    """The contract of the runner the base method built for paged experts."""
+    backend = getattr(runner, "runner_backend", None)
+    if backend is not None and backend.is_triton():
+        return TRITON
+    if (
+        backend is not None
+        and backend.is_marlin()
+        and not backend.is_experimental_sgl_marlin()
+    ):
+        return MARLIN
+    raise RuntimeError(
+        "Paged experts: requires the triton or Marlin MoE runner, the layer's method uses "
+        f"{getattr(backend, 'value', None)}; select one with --moe-runner-backend if its "
+        "quantization method supports it"
+    )

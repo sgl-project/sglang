@@ -394,6 +394,13 @@ register_kernel(
         capabilities=CUDA_ONLY,
     )
 )
+register_kernel(
+    KernelSpec(
+        op="attention.update_msa_v1_decode_plan",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.attention.msa_v1.decode_plan:update_msa_v1_decode_plan",
+    )
+)
 
 for _fn in ("fp4_index_logits_paged", "finish_paged_indexer_topk"):
     register_kernel(

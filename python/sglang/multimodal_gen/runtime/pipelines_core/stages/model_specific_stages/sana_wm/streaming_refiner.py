@@ -84,32 +84,38 @@ def collect_captured_kv_from_blocks(transformer: nn.Module, mode: str):
 # Absolute-position RoPE (port of refiner.py:721-750)
 # --------------------------------------------------------------------------- #
 def build_rotary_emb_for_absolute_positions(
-    *, transformer, batch_size, frame_positions, height, width, device, fps
+    *, transformer, batch_size, frame_positions: range, height, width, device, fps
 ):
+    # built on the device with scalar ops: a host upload would block every call
     rope = transformer.rope
     patch_size_t = int(rope.patch_size_t)
     patch_size = int(rope.patch_size)
-    f_positions = torch.tensor(frame_positions, dtype=torch.float32, device=device)
+    f_positions = torch.arange(
+        frame_positions.start,
+        frame_positions.stop,
+        frame_positions.step,
+        dtype=torch.float32,
+        device=device,
+    )
     if patch_size_t > 1:
         f_positions = f_positions[::patch_size_t]
     grid_h = torch.arange(0, height, patch_size, dtype=torch.float32, device=device)
     grid_w = torch.arange(0, width, patch_size, dtype=torch.float32, device=device)
     grid = torch.meshgrid(f_positions, grid_h, grid_w, indexing="ij")
     grid = torch.stack(grid, dim=0)
-    patch_delta = torch.tensor(
-        (patch_size_t, patch_size, patch_size), dtype=grid.dtype, device=device
+    patch_ends = torch.stack(
+        [grid[0] + patch_size_t, grid[1] + patch_size, grid[2] + patch_size]
     )
-    patch_ends = grid + patch_delta.view(3, 1, 1, 1)
     latent_coords = (
         torch.stack([grid, patch_ends], dim=-1)
         .flatten(1, 3)
         .unsqueeze(0)
         .repeat(batch_size, 1, 1, 1)
     )
-    scale = torch.tensor(rope.scale_factors, device=device)
-    broadcast_shape = [1] * latent_coords.ndim
-    broadcast_shape[1] = -1
-    pixel_coords = latent_coords * scale.view(*broadcast_shape)
+    pixel_coords = torch.stack(
+        [latent_coords[:, i] * scale for i, scale in enumerate(rope.scale_factors)],
+        dim=1,
+    )
     pixel_coords[:, 0, ...] = (
         pixel_coords[:, 0, ...] + rope.causal_offset - rope.scale_factors[0]
     ).clamp(min=0)
@@ -250,6 +256,24 @@ class _RefinerCore:
         self.transformer = transformer
         self.device = device
         self.dtype = dtype
+        # memo of _block_rotary_emb: a block's levels and capture share positions
+        self._block_rope_key = None
+        self._block_rope = None
+
+    def _block_rotary_emb(self, *, batch_size, frame_positions, height, width, fps):
+        key = (batch_size, frame_positions, height, width, fps)
+        if key != self._block_rope_key:
+            self._block_rope = build_rotary_emb_for_absolute_positions(
+                transformer=self.transformer,
+                batch_size=batch_size,
+                frame_positions=frame_positions,
+                height=height,
+                width=width,
+                device=self.device,
+                fps=fps,
+            )
+            self._block_rope_key = key
+        return self._block_rope
 
     def _forward_video_only_with_rope(
         self,
@@ -321,13 +345,11 @@ class _RefinerCore:
             dtype=torch.float32,
             device=self.device,
         )
-        video_rotary_emb = build_rotary_emb_for_absolute_positions(
-            transformer=self.transformer,
+        video_rotary_emb = self._block_rotary_emb(
             batch_size=batch,
             frame_positions=active_positions,
             height=int(active.shape[3]),
             width=int(active.shape[4]),
-            device=self.device,
             fps=float(fps),
         )
         set_kv_prefix_on_blocks(self.transformer, kv_prefix_per_layer)
@@ -374,13 +396,11 @@ class _RefinerCore:
         latent_tokens = pack_latents(clean_block, ps, pst)
         batch, seq_len, _ = latent_tokens.shape
         timestep = torch.zeros(batch, seq_len, dtype=torch.float32, device=self.device)
-        video_rotary_emb = build_rotary_emb_for_absolute_positions(
-            transformer=self.transformer,
+        video_rotary_emb = self._block_rotary_emb(
             batch_size=batch,
             frame_positions=frame_positions,
             height=int(clean_block.shape[3]),
             width=int(clean_block.shape[4]),
-            device=self.device,
             fps=float(fps),
         )
         set_kv_prefix_on_blocks(self.transformer, kv_prefix_per_layer)
@@ -421,7 +441,8 @@ class RefinerChunkRunner:
         self.prompt_embeds = prompt_embeds
         self.prompt_attention_mask = prompt_attention_mask
         self.fps = float(fps)
-        self.sigmas = sigmas
+        # host copy of the schedule: per-level device reads would sync every block
+        self.sigma_values = sigmas.cpu().tolist()
         self.source_sink_frames = int(source_sink_frames)
         self.block_size = int(block_size)
         self.kv_max_frames = int(kv_max_frames)
@@ -456,7 +477,7 @@ class RefinerChunkRunner:
             else:
                 self.sink_kv_pre = refiner._capture_block_kv(
                     clean_block=sink_seed_frames.contiguous(),
-                    frame_positions=list(range(self.source_sink_frames)),
+                    frame_positions=range(self.source_sink_frames),
                     prompt_embeds=self.prompt_embeds,
                     prompt_attention_mask=self.prompt_attention_mask,
                     fps=self.fps,
@@ -470,8 +491,8 @@ class RefinerChunkRunner:
             sink_pe = build_rotary_emb_for_absolute_positions(
                 transformer=refiner.transformer,
                 batch_size=batch,
-                frame_positions=list(
-                    range(sink_rope_offset, sink_rope_offset + self.source_sink_frames)
+                frame_positions=range(
+                    sink_rope_offset, sink_rope_offset + self.source_sink_frames
                 ),
                 height=self.height,
                 width=self.width,
@@ -491,7 +512,7 @@ class RefinerChunkRunner:
                     "history_v": history[1] if history is not None else None,
                 }
             )
-        sigma0 = float(self.sigmas[0].item())
+        sigma0 = self.sigma_values[0]
         eps = torch.randn(
             clean_block.shape,
             generator=self.generator,
@@ -501,10 +522,10 @@ class RefinerChunkRunner:
         x_t = ((1.0 - sigma0) * clean_block.float() + sigma0 * eps.float()).to(
             self.dtype
         )
-        active_positions = list(range(int(block_start), int(block_end)))
-        for level in range(int(self.sigmas.numel()) - 1):
-            sigma_cur = float(self.sigmas[level].item())
-            sigma_next = float(self.sigmas[level + 1].item())
+        active_positions = range(int(block_start), int(block_end))
+        for level in range(len(self.sigma_values) - 1):
+            sigma_cur = self.sigma_values[level]
+            sigma_next = self.sigma_values[level + 1]
             pred_x0 = refiner._predict_x0_active_block(
                 active=x_t,
                 active_positions=active_positions,

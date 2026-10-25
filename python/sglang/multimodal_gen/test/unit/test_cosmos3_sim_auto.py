@@ -37,6 +37,7 @@ from sglang.multimodal_gen.registry import (
     _discover_and_register_pipelines,
     _get_config_info,
 )
+from sglang.multimodal_gen.runtime.models.dits import cosmos3_sim_auto
 from sglang.multimodal_gen.runtime.models.dits.cosmos3_sim_auto import (
     ChunkShard,
     UlyssesGroup,
@@ -80,12 +81,14 @@ from sglang.multimodal_gen.runtime.models.dits.cosmos3_simulation.sim_auto_layou
 from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_simulation.sim_auto import (
     ReplayRing,
+    _FlatLayout,
     camera_major_slice,
     camera_major_write,
     fixed_step_sample,
     initial_noise,
     sde_step_seed,
 )
+from sglang.multimodal_gen.test.unit.host_sync_guard import RecordOps
 
 EXPORT_DIR = "/mnt/kdub_disk/models/Cosmos3-Nano-Sim-Auto"
 
@@ -1061,7 +1064,7 @@ class TestSampler(unittest.TestCase):
     def test_camera_major_helpers(self):
         latents = torch.arange(2 * 4).float().view(1, 1, 8, 1, 1)
         picked = camera_major_slice(
-            latents, num_views=2, frames_per_view=4, frames=(1, 3)
+            latents, num_views=2, frames_per_view=4, frames=torch.tensor([1, 3])
         )
         self.assertEqual(picked.flatten().tolist(), [1, 3, 5, 7])
         camera_major_write(
@@ -1069,7 +1072,7 @@ class TestSampler(unittest.TestCase):
             torch.zeros(1, 1, 4, 1, 1),
             num_views=2,
             frames_per_view=4,
-            frames=(1, 3),
+            frames=torch.tensor([1, 3]),
         )
         self.assertEqual(latents.flatten().tolist(), [0, 0, 2, 0, 4, 0, 6, 0])
 
@@ -1307,6 +1310,122 @@ class TestRegistry(unittest.TestCase):
         ):
             info = _get_config_info("acme/renamed-sim-auto")
         self.assertIs(info.pipeline_config_cls, Cosmos3SimAutoConfig)
+
+
+class _Projection(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.zeros(1))
+
+    def forward(self, tokens):
+        return tokens, None
+
+
+def _stream_items(condition_frames=()):
+    grid = SensorGrid(2, 2, 1, 1)
+    return [
+        StreamItem("rgb_control", (0, 1), (0, 1, 2), grid, 0.1),
+        StreamItem("rgb_target", (0, 1), (0, 1, 2), grid, 0.1, condition_frames),
+        StreamItem("lidar_control", (2,), (0, 1), grid, 0.1),
+        StreamItem("lidar_target", (2,), (0, 1), grid, 0.1),
+    ]
+
+
+def _sim_auto_model():
+    model = cosmos3_sim_auto.Cosmos3SimAutoTransformer.__new__(
+        cosmos3_sim_auto.Cosmos3SimAutoTransformer
+    )
+    torch.nn.Module.__init__(model)
+    model._rope_inputs_key = model._rope_inputs = None
+    model._generated_masks_key = model._generated_masks = None
+    return model
+
+
+class TestHostOverhead(unittest.TestCase):
+    def test_steps_scatter_and_gather_without_uploads(self):
+        items = _stream_items(condition_frames=(0,))
+        latents = [
+            torch.randn(1, 3, 6, 2, 2),
+            torch.randn(1, 3, 6, 2, 2),
+            torch.randn(1, 4, 2, 2, 2),
+            torch.randn(1, 4, 2, 2, 2),
+        ]
+        layout = _FlatLayout.of(
+            items, latents, num_views=2, noisy_rgb=(1, 2), noisy_sweeps=(1,)
+        )
+        x = torch.randn(1, layout.size)
+        with RecordOps() as ops:
+            current = layout.scatter(latents, x)
+            flat = layout.gather([current[1], current[3]])
+        self.assertEqual(ops.uploads(), [])
+        # the generated frames hold x and read back as x; the others are untouched
+        rgb = current[1].view(1, 3, 2, 3, 2, 2)
+        torch.testing.assert_close(
+            (flat, rgb[:, :, :, 0], current[3][:, :, 0]),
+            (
+                x,
+                latents[1].view(1, 3, 2, 3, 2, 2)[:, :, :, 0],
+                latents[3][:, :, 0],
+            ),
+            rtol=0,
+            atol=0,
+        )
+
+    def test_time_embed_masks_built_once_per_chunk(self):
+        model = _sim_auto_model()
+        model.proj_in = _Projection()
+        model.patchify = lambda latent, frames, h, w: latent.flatten(2).transpose(1, 2)
+        model.time_embedder = lambda timestep: timestep.view(1, 1).expand(1, 3)
+        model.rig_view_embed = torch.nn.Embedding(4, 3)
+        model.rig_lidar_id = 3
+        items = _stream_items(condition_frames=(0,))[:2]
+        latents = [torch.randn(1, 3, 6, 2, 2), torch.randn(1, 3, 6, 2, 2)]
+        rig_view_ids = torch.tensor([0, 1])
+
+        def embed(timestep):
+            with mock.patch.object(
+                cosmos3_sim_auto, "add_rig_view_rows", lambda hidden, rows, n: hidden
+            ):
+                return model.embed_items(
+                    items, latents, timestep=timestep, rig_view_ids=rig_view_ids
+                )
+
+        timesteps = [torch.tensor(500.0), torch.tensor(250.0)]
+        with mock.patch.object(torch, "tensor", wraps=torch.tensor) as upload:
+            steps = [embed(timestep) for timestep in timesteps]
+        # one generated-frame mask (the target's) for the whole chunk
+        self.assertEqual(upload.call_count, 1)
+        model._generated_masks_key = None
+        torch.testing.assert_close(steps[1], embed(timesteps[1]), rtol=0, atol=0)
+
+    def test_rope_inputs_built_once_per_chunk(self):
+        model = _sim_auto_model()
+        items = _stream_items()[::2]  # controls only: no output projection
+        num_tokens = sum(item.num_tokens for item in items)
+        model.num_hidden_layers = 0
+        model.gen_layers = []
+        model.ulysses = None
+        model.norm_moe_gen = lambda hidden: hidden
+        model.embed_items = lambda items, latents, **_: torch.zeros(1, num_tokens, 3)
+        model.chunk_position_ids = mock.Mock(return_value=torch.zeros(3, num_tokens))
+        model.language_model = SimpleNamespace(
+            rotary_emb=SimpleNamespace(
+                build_rope_cache_inputs=lambda ids, cache_dtype: (ids, ids)
+            )
+        )
+        for timestep in (torch.ones(1), torch.zeros(1), None):
+            model(
+                items=items,
+                latents=[None, None],
+                timestep=timestep,
+                text_extent=7,
+                und_kv=[],
+                history_kv=[],
+                mask=None,
+                rig_view_ids=None,
+            )
+        # the chunk's denoise steps and its clean refresh share the RoPE inputs
+        self.assertEqual(model.chunk_position_ids.call_count, 1)
 
 
 if __name__ == "__main__":

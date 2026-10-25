@@ -35,16 +35,20 @@ def _to_page_indices_gpu(idx: torch.Tensor, page_size: int) -> torch.Tensor:
     return (idx[::page_size] // page_size).contiguous()
 
 
-def page_indices_for_request(scheduler, req: Req, end_idx: int) -> torch.Tensor:
+def page_indices_for_request(
+    scheduler, req: Req, end_idx: int, start_idx: int = 0
+) -> torch.Tensor:
+    # start_idx is the page-aligned prefix decode already held, which prefill
+    # never sent; both sides digest [start_idx, end_idx) of their own row.
     page_size = scheduler.token_to_kv_pool_allocator.page_size
     kv_indices = scheduler.req_to_token_pool.req_to_token[
-        req.kv.req_pool_idx, 0:end_idx
+        req.kv.req_pool_idx, start_idx:end_idx
     ]
     return _to_page_indices_gpu(kv_indices, page_size)
 
 
 def state_indices_for_request(
-    scheduler, req: Req, seq_len: int
+    scheduler, req: Req, seq_len: int, start_idx: int = 0
 ) -> Optional[torch.Tensor]:
     pool = scheduler.token_to_kv_pool_allocator.get_kvcache()
     if isinstance(pool, HybridLinearKVPool):
@@ -59,7 +63,7 @@ def state_indices_for_request(
     if isinstance(pool, SWAKVPool):
         page_size = scheduler.token_to_kv_pool_allocator.page_size
         window_size = scheduler.sliding_window_size
-        window_start = max(0, seq_len - window_size)
+        window_start = max(start_idx, seq_len - window_size)
         window_start = (window_start // page_size) * page_size
         window_full = scheduler.req_to_token_pool.req_to_token[
             req.kv.req_pool_idx, window_start:seq_len
@@ -73,7 +77,7 @@ def state_indices_for_request(
     if isinstance(pool, DSATokenToKVPool):
         device_page_size = pool.page_size
         kv_full = scheduler.req_to_token_pool.req_to_token[
-            req.kv.req_pool_idx, :seq_len
+            req.kv.req_pool_idx, start_idx:seq_len
         ]
         return _to_page_indices_gpu(kv_full, device_page_size)
     return None

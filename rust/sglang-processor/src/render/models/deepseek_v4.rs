@@ -1,112 +1,194 @@
-//! DeepSeek-V4 prompts as SGLang's `serving_chat.py` builds them, on Dynamo's V4 encoder.
+//! DeepSeek-V4 and V4.1 prompts through deepseek-recipe, as SGLang's
+//! `serving_deepseek_recipe.py` and `parser/deepseek_recipe_renderer.py` build them.
 
 use std::collections::HashMap;
+use std::ops::Range;
 
-use dynamo_renderer::deepseek::v4::{self, ReasoningEffort, ThinkingMode};
-use serde::de::IgnoredAny;
+use deepseek_recipe::openai::ChatCompletionRequest;
+use deepseek_recipe::request::{ConversionOptions, ProtocolRequest};
+use deepseek_recipe_core::special_tokens::SpecialTokensMap;
+use deepseek_recipe_encoding::PromptEncoding;
+use deepseek_recipe_encoding::v4::dsv4::DeepseekV4Encoding;
+use deepseek_recipe_encoding::v4::dsv41::DeepseekV41Encoding;
+use dynamo_renderer::{RenderedPrompt, RenderedSegment};
 use serde_json::{Map, Value, json};
+use tokenizers::{AddedVocabulary, Tokenizer};
 
+use super::pydantic_dump::pydantic_bool;
 use super::schema_types::normalize_json_schema_types;
-use crate::model_files::resolve_model_file;
+use crate::py::python_json_compact;
 use crate::render::reasoning::{requested_effort, requested_thinking};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DeepSeekV4Profile {
-    Preview,
-    Official,
+/// The checkpoint tokenizer's image token; recipe's bundled tokenizer spells it `<｜image｜>`.
+const IMAGE_TOKEN: &str = "<｜deepseek_image｜>";
+const ASSISTANT_TOKEN: &str = "<｜Assistant｜>";
+const THINK_START_TOKEN: &str = "<think>";
+const THINK_END_TOKEN: &str = "</think>";
+/// `deepseek_recipe_renderer.TASK_TOKENS`.
+const TASK_TOKENS: [(&str, &str); 6] = [
+    ("action", "<｜action｜>"),
+    ("query", "<｜query｜>"),
+    ("authority", "<｜authority｜>"),
+    ("domain", "<｜domain｜>"),
+    ("title", "<｜title｜>"),
+    ("read_url", "<｜read_url｜>"),
+];
+/// `action` follows the generation header; the other tasks replace it.
+const TASKS_AFTER_HEADER: [&str; 1] = ["action"];
+/// V4.1 renders an integer budget as this line; recipe's "high" tier is budget 75.
+const BUDGET_TIER: &str = "high";
+const BUDGET_TIER_LINE: &str = "Reasoning Effort: 75";
+
+/// The checkpoint tokenizer, encoding a rendered prompt as SGLang does: special
+/// segments with the added vocabulary, plain text without it (recipe's
+/// `PromptTokenizer`), and a task's continuation prefix with it (`encode_text`).
+pub struct DeepSeekTokenizer {
+    full: Tokenizer,
+    plain: Tokenizer,
 }
 
-/// Render an SGLang chat request body. Returns the prompt and the
-/// `continue_final_message` prefix, which SGLang tokenizes separately.
+impl DeepSeekTokenizer {
+    /// From the checkpoint's `tokenizer.json` text.
+    pub fn from_json(tokenizer_json: &str) -> Result<Self, String> {
+        let full = Tokenizer::from_bytes(tokenizer_json.as_bytes())
+            .map_err(|error| format!("invalid tokenizer.json: {error}"))?;
+        let mut plain = full.clone();
+        plain.with_added_vocabulary(AddedVocabulary::new());
+        Ok(Self { full, plain })
+    }
+
+    pub(crate) fn encode(&self, prompt: &RenderedPrompt) -> Result<Vec<u32>, String> {
+        let segments = prompt
+            .encode_segments()
+            .ok_or("a DeepSeek prompt is segmented")?;
+        let mut ids = Vec::new();
+        for segment in segments {
+            let tokenizer = if segment.allow_special {
+                &self.full
+            } else {
+                &self.plain
+            };
+            let encoding = tokenizer
+                .encode_fast(segment.text, false)
+                .map_err(|error| error.to_string())?;
+            ids.extend_from_slice(encoding.get_ids());
+        }
+        Ok(ids)
+    }
+}
+
+impl std::fmt::Debug for DeepSeekTokenizer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DeepSeekTokenizer")
+    }
+}
+
+/// Render an SGLang chat request body for DeepSeek-V4 (`v41` false) or V4.1.
 pub(crate) fn render(
-    profile: DeepSeekV4Profile,
-    mut request: Value,
+    v41: bool,
+    request: Value,
     defaults: &HashMap<String, Value>,
-) -> Result<(String, String), String> {
-    let Some(Value::Array(messages)) = request.get_mut("messages").map(Value::take) else {
-        return Err("messages must be an array".into());
-    };
-    let mut messages = messages.into_iter().map(engine_message).collect::<Vec<_>>();
-    for message in &mut messages {
-        flatten_content(message);
-        check_tool_arguments(message)?;
-    }
-    let request = &request;
-    let prefix = split_continuation(&mut messages, request)?;
-    // SGLang fails on `messages[0]` here.
-    if messages.is_empty() {
-        return Err("no messages to render".into());
-    }
-    if let Some(task) = request.get("task").filter(|task| !task.is_null()) {
-        let message = messages
-            .iter_mut()
-            .rev()
-            .find(|m| matches!(m["role"].as_str(), Some("user" | "developer")))
-            .ok_or("task requires a user or developer message")?;
-        message["task"] = task.clone();
-    }
-    drop_merged_tasks(&mut messages);
-    normalize_messages(&mut messages)?;
-    if messages.first().is_none_or(|m| m["role"] != "system") {
-        messages.insert(0, json!({"role": "system", "content": ""}));
-    }
-    // Unlike the Jinja path, SGLang passes every request tool once `tool_choice` allows any.
-    if let Some(tools) = request["tools"]
-        .as_array()
-        .filter(|tools| !tools.is_empty())
-    {
-        let normalized = normalize_tools(tools)?;
-        if renders_tools(request, tools) {
-            messages[0]["tools"] = normalized.into();
-        }
-    }
-    let mode = if thinking(request, defaults) {
-        ThinkingMode::Thinking
-    } else {
-        ThinkingMode::Chat
-    };
-    let fallback = std::env::var("SGLANG_DSV4_REASONING_EFFORT").ok();
-    let effort = effort(profile, request, defaults, fallback);
-    let prompt = v4::encode_messages_with_options(&messages, mode, true, true, effort)
-        .map_err(|error| error.to_string())?;
-    Ok((prompt, prefix))
-}
-
-/// The `continue_final_message` prefix, taken off a final assistant turn with
-/// text content; without the flag that turn renders as a user turn.
-pub(super) fn split_continuation(
-    messages: &mut Vec<Value>,
-    request: &Value,
-) -> Result<String, String> {
-    let Some(last) = messages.last_mut().filter(|m| m["role"] == "assistant") else {
-        return Ok(String::new());
-    };
-    let Some(content) = last["content"].as_str().map(str::to_owned) else {
-        return Ok(String::new());
-    };
-    if request
+) -> Result<RenderedPrompt, String> {
+    let thinking = thinking(&request, defaults);
+    let (effort, budget) = effort(v41, &request, defaults)?;
+    let task = request
+        .get("task")
+        .filter(|task| !task.is_null())
+        .map(|task| task.as_str().ok_or("task must be a string"))
+        .transpose()?;
+    let mut continue_final = request
         .get("continue_final_message")
-        .map_or(Ok(false), pydantic_bool)?
-    {
-        messages.pop();
-        return Ok(content);
-    }
-    *last = json!({"role": "user", "content": content});
-    Ok(String::new())
-}
+        .map_or(Ok(false), pydantic_bool)?;
 
-/// `merge_tool_messages` folds a user turn into a preceding user or
-/// tool-result turn, dropping the later turn's task.
-/// Workaround for ai-dynamo/frontend-crates#366; drop once dynamo-renderer includes it.
-pub(super) fn drop_merged_tasks(messages: &mut [Value]) {
-    for index in 1..messages.len() {
-        if messages[index]["role"] == "user"
-            && matches!(messages[index - 1]["role"].as_str(), Some("user" | "tool"))
-            && let Some(message) = messages[index].as_object_mut()
-        {
-            message.remove("task");
+    let mut messages = match &request["messages"] {
+        Value::Array(messages) => messages.clone(),
+        _ => return Err("messages must be an array".into()),
+    };
+    // Pydantic lowercases message roles.
+    for message in &mut messages {
+        if let Some(role) = message["role"].as_str() {
+            message["role"] = role.to_lowercase().into();
         }
     }
+    // SGLang's trailing-assistant rule, as `_handle_last_assistant_message`.
+    let mut task_prefix = None;
+    if let Some(content) = messages
+        .last()
+        .filter(|last| last["role"] == "assistant")
+        .and_then(|last| last["content"].as_str())
+        .map(str::to_owned)
+    {
+        if !continue_final {
+            *messages.last_mut().unwrap() = json!({"role": "user", "content": content});
+        } else if task.is_some() {
+            // A task renders its own tail, so the prefix follows it.
+            messages.pop();
+            task_prefix = Some(content);
+            continue_final = false;
+        }
+    }
+
+    let mut body = Map::new();
+    body.insert("messages".into(), messages.into());
+    if let Some(response_format) = request.get("response_format").filter(|f| !f.is_null()) {
+        body.insert("response_format".into(), response_format.clone());
+    }
+    if let Some(tools) = handler_tools(&request)? {
+        body.insert("tools".into(), tools.into());
+        if let Some(choice) = request.get("tool_choice").filter(|c| !c.is_null()) {
+            body.insert("tool_choice".into(), choice.clone());
+        }
+    }
+    pre_normalize(&mut body, thinking, continue_final)?;
+    body.insert(
+        "model".into(),
+        if v41 {
+            "DeepSeek-V4.1-Flash"
+        } else {
+            "DeepSeek-V4-Pro"
+        }
+        .into(),
+    );
+    if budget.is_some() {
+        body.insert("reasoning_effort".into(), BUDGET_TIER.into());
+    } else if let Some(effort) = effort {
+        body.insert("reasoning_effort".into(), effort.into());
+    }
+
+    let request: ChatCompletionRequest = serde_json::from_value(Value::Object(body))
+        .map_err(|error| format!("invalid request body: {error}"))?;
+    let tokens = || SpecialTokensMap {
+        image: IMAGE_TOKEN.into(),
+        ..SpecialTokensMap::default()
+    };
+    let converted = request
+        .convert(ConversionOptions::default().with_special_tokens(tokens()))
+        .map_err(|error| error.to_string())?;
+    let rendered = if v41 {
+        DeepseekV41Encoding::new()
+            .with_special_tokens(tokens())
+            .render_conversation(&converted.conversation)
+    } else {
+        DeepseekV4Encoding::new()
+            .with_special_tokens(tokens())
+            .render_conversation(&converted.conversation)
+    };
+    // The processor serves text only; SGLang rejects images on a text-only server.
+    if !rendered.image_sources.is_empty() {
+        return Err("image input is not supported for this model".into());
+    }
+    let mut segments = segments(&rendered.prompt, &rendered.special_ranges);
+    if let Some(budget) = budget.filter(|_| thinking) {
+        replace_effort_budget(&mut segments, budget)?;
+    }
+    if let Some(task) = task {
+        attach_task(&mut segments, task, thinking)?;
+    }
+    if let Some(prefix) = task_prefix.filter(|prefix| !prefix.is_empty()) {
+        // `encode_text`: the checkpoint tokenizer with its special tokens.
+        segments.push(RenderedSegment::new(prefix, true));
+    }
+    Ok(RenderedPrompt::segmented(segments))
 }
 
 /// `serving_chat.py`: kwargs `thinking` wins, then what `reasoning` and the
@@ -125,421 +207,286 @@ pub(crate) fn thinking(request: &Value, defaults: &HashMap<String, Value>) -> bo
         .is_ok_and(|v| ["true", "1", "yes", "y"].contains(&v.to_lowercase().as_str()))
 }
 
-/// `encoding_dsv4.REASONING_EFFORT_PROFILES`: kwargs effort replaces the request
-/// effort, then the server's default kwargs and `fallback`
-/// (`SGLANG_DSV4_REASONING_EFFORT`) fill in; other tiers add no prefix.
+/// The named effort recipe renders, or V4.1's integer budget. Kwargs effort
+/// replaces the request effort and the server's default kwargs fill in
+/// (`serving_chat.py`); unset or `"none"` falls back to the env default
+/// (`serving_deepseek_recipe._encode`).
 fn effort(
-    profile: DeepSeekV4Profile,
+    v41: bool,
     request: &Value,
     defaults: &HashMap<String, Value>,
-    fallback: Option<String>,
-) -> Option<ReasoningEffort> {
+) -> Result<(Option<String>, Option<u32>), String> {
     let requested = Some(&request["chat_template_kwargs"]["reasoning_effort"])
         .filter(|effort| !effort.is_null())
-        .or_else(|| requested_effort(request))
+        .cloned()
+        // pydantic's `Literal[...] | float` coerces numeric request efforts to floats.
+        .or_else(|| requested_effort(request).map(request_effort_value))
         .or_else(|| {
             defaults
                 .get("reasoning_effort")
                 .filter(|effort| !effort.is_null())
+                .cloned()
         })
-        .map(|effort| effort.as_str().map(str::to_owned))
-        .unwrap_or(fallback);
-    match (profile, requested.as_deref()) {
-        (DeepSeekV4Profile::Official, Some("high")) | (DeepSeekV4Profile::Preview, Some("max")) => {
-            Some(ReasoningEffort::High)
-        }
-        (DeepSeekV4Profile::Official, Some("max")) => Some(ReasoningEffort::Max),
-        _ => None,
+        .filter(|effort| effort != "none")
+        .or_else(|| env_effort(v41));
+    match requested {
+        None => Ok((None, None)),
+        Some(Value::String(effort)) => Ok((Some(effort), None)),
+        Some(effort) if !v41 => Err(format!(
+            "DeepSeek-V4 reasoning_effort must be a named tier, got {effort}"
+        )),
+        Some(effort) => parse_effort_budget(&effort).map(|budget| (None, Some(budget))),
     }
 }
 
-/// The pydantic dump SGLang renders: roles lowercased, unknown and null fields
-/// dropped, `user` reduced to role and content, null content blanked.
-pub(super) fn engine_message(message: Value) -> Value {
-    let mut message = match message {
-        Value::Object(message) => message,
-        _ => Map::new(),
-    };
-    let role = message
-        .get("role")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_lowercase();
-    let kept: &[&str] = if role == "user" {
-        &["content"]
+/// `protocol.py`: request efforts are a tier name or a float.
+fn request_effort_value(effort: &Value) -> Value {
+    match effort {
+        Value::String(text) => text
+            .parse::<f64>()
+            .ok()
+            .filter(|_| !TIERS.contains(&text.as_str()))
+            .map_or_else(|| effort.clone(), |value| json!(value)),
+        Value::Number(number) => number.as_f64().map_or_else(|| effort.clone(), |v| json!(v)),
+        _ => effort.clone(),
+    }
+}
+
+const TIERS: [&str; 8] = [
+    "none", "minimal", "low", "medium", "high", "xhigh", "ultra", "max",
+];
+
+/// `SGLANG_DSV4_REASONING_EFFORT` / `SGLANG_DSV41_REASONING_EFFORT`: digits are a budget.
+fn env_effort(v41: bool) -> Option<Value> {
+    let name = if v41 {
+        "SGLANG_DSV41_REASONING_EFFORT"
     } else {
-        &[
-            "content",
-            "tool_call_id",
-            "name",
-            "reasoning_content",
-            "tool_calls",
-            "tools",
-        ]
+        "SGLANG_DSV4_REASONING_EFFORT"
     };
-    message.retain(|key, value| kept.contains(&key.as_str()) && !value.is_null());
-    message.insert("role".into(), role.into());
-    message.entry("content").or_insert_with(|| "".into());
-    if let Some(Value::Array(calls)) = message.get_mut("tool_calls") {
-        calls
-            .iter_mut()
-            .for_each(|call| *call = tool_call_dump(call));
+    let raw = std::env::var(name).ok()?;
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
     }
-    message.into()
-}
-
-/// `ToolCall.model_dump()`: its declared fields only, unset ones null.
-fn tool_call_dump(call: &Value) -> Value {
-    let function = &call["function"];
-    json!({
-        "id": call["id"],
-        "index": call["index"],
-        "type": "function",
-        "function": {"name": function["name"], "arguments": function["arguments"]},
+    Some(match raw.parse::<u64>() {
+        Ok(budget) if raw.chars().all(|c| c.is_ascii_digit()) => json!(budget),
+        _ => raw.into(),
     })
 }
 
-/// `process_content_for_template_format`: text parts joined with spaces.
-fn flatten_content(message: &mut Value) {
-    if let Some(parts) = message["content"].as_array() {
-        message["content"] = parts
-            .iter()
-            .filter(|part| matches!(part["type"].as_str(), Some("text" | "input_text")))
-            .filter_map(|part| part["text"].as_str())
-            .collect::<Vec<_>>()
-            .join(" ")
-            .into();
-    }
-}
-
-/// `serving_chat.normalize_assistant_tool_call_arguments`: string arguments must
-/// be a JSON object; other values wait for the final-turn handling.
-pub(super) fn check_tool_arguments(message: &mut Value) -> Result<(), String> {
-    for arguments in tool_arguments(message) {
-        if let Some(text) = arguments.as_str()
-            && (serde_json::from_str::<IgnoredAny>(text).is_err()
-                || !text.trim_start().starts_with('{'))
+/// `deepseek_recipe_renderer.parse_effort_budget`.
+fn parse_effort_budget(effort: &Value) -> Result<u32, String> {
+    if let Value::Number(number) = effort {
+        if let Some(value) = number.as_u64().filter(|_| !number.is_f64())
+            && (1..=100).contains(&value)
         {
-            return Err("assistant tool arguments must be a JSON object".into());
+            return Ok(value as u32);
+        }
+        if let Some(value) = number.as_f64().filter(|_| number.is_f64())
+            && (0.0..=0.99).contains(&value)
+        {
+            // Python's `round` breaks ties to even.
+            return Ok(((value * 100.0).round_ties_even() as u32).max(1));
         }
     }
-    Ok(())
+    Err(format!(
+        "reasoning_effort={effort} is outside the integer budget [1, 100] and the float range [0, 0.99]"
+    ))
 }
 
-/// The messages the encoder sees: empty tool lists dropped, message tools dumped,
-/// and tool arguments as JSON object text, which Dynamo parses itself.
-pub(super) fn normalize_messages(messages: &mut [Value]) -> Result<(), String> {
-    for message in messages {
-        for arguments in tool_arguments(message) {
-            match arguments {
-                Value::String(_) => {}
-                Value::Object(_) => *arguments = arguments.to_string().into(),
-                _ => return Err("assistant tool arguments must be a JSON object".into()),
+/// The handler's tool dumps: none when `tool_choice` is `"none"` or the request
+/// has no tools, only the chosen one for a named choice (`serving_chat.py`).
+fn handler_tools(request: &Value) -> Result<Option<Vec<Value>>, String> {
+    let Some(tools) = request["tools"]
+        .as_array()
+        .filter(|tools| !tools.is_empty())
+    else {
+        return Ok(None);
+    };
+    let tools = match &request["tool_choice"] {
+        Value::String(choice) if choice == "none" => return Ok(None),
+        Value::Object(_) => {
+            let name = &request["tool_choice"]["function"]["name"];
+            let chosen: Vec<Value> = tools
+                .iter()
+                .filter(|tool| &tool["function"]["name"] == name)
+                .cloned()
+                .collect();
+            if chosen.is_empty() {
+                return Ok(None);
             }
+            chosen
         }
-        let message = message.as_object_mut().ok_or("message must be an object")?;
-        // Empty lists: workaround for ai-dynamo/frontend-crates#366; drop once
-        // dynamo-renderer includes it.
-        match message.get("tools").and_then(Value::as_array) {
-            Some(tools) if tools.is_empty() => _ = message.remove("tools"),
-            Some(tools) => _ = message.insert("tools".into(), normalize_tools(tools)?.into()),
-            None => {}
-        }
-        if message
-            .get("tool_calls")
-            .and_then(Value::as_array)
-            .is_some_and(Vec::is_empty)
-        {
-            message.remove("tool_calls");
-        }
-    }
-    Ok(())
-}
-
-/// Each assistant tool call's `function.arguments`, absent ones as `null`.
-pub(super) fn tool_arguments(message: &mut Value) -> impl Iterator<Item = &mut Value> {
-    let is_assistant = message["role"] == "assistant";
-    message
-        .get_mut("tool_calls")
-        .filter(|_| is_assistant)
-        .and_then(Value::as_array_mut)
-        .into_iter()
-        .flatten()
-        .filter_map(|call| call.get_mut("function")?.as_object_mut())
-        .map(|function| function.entry("arguments").or_insert(Value::Null))
-}
-
-/// Whether `serving_chat` hands the encoder the request tools: `tool_choice`
-/// `"none"` withholds them, and a named choice needs a request tool of that name.
-pub(super) fn renders_tools(request: &Value, tools: &[Value]) -> bool {
-    match &request["tool_choice"] {
-        Value::Null => true,
-        Value::String(choice) => choice != "none",
-        named => tools
-            .iter()
-            .any(|tool| tool["function"]["name"] == named["function"]["name"]),
-    }
-}
-
-/// `protocol.py::Function.model_dump()`, in declared field order, after
-/// `_validate_request` normalizes the schema types; the encoder serializes it verbatim.
-pub(super) fn normalize_tools(tools: &[Value]) -> Result<Vec<Value>, String> {
+        _ => tools.clone(),
+    };
     tools
         .iter()
-        .map(|tool| {
-            let f = &tool["function"];
-            let name = f["name"].as_str().ok_or("tool function requires name")?;
-            let mut function = Map::new();
-            function.insert("description".into(), f["description"].clone());
-            function.insert("name".into(), name.into());
-            let mut parameters = f["parameters"].clone();
-            normalize_json_schema_types(&mut parameters);
-            function.insert("parameters".into(), parameters);
-            let strict = f.get("strict").map_or(Ok(false), pydantic_bool)?;
-            function.insert("strict".into(), strict.into());
-            if let Some(defer) = [f.get("defer_loading"), tool.get("defer_loading")]
-                .into_iter()
-                .flatten()
-                .find(|v| !v.is_null())
-            {
-                function.insert("defer_loading".into(), pydantic_bool(defer)?.into());
-            }
-            Ok(json!({"type": "function", "function": function}))
-        })
-        .collect()
+        .map(tool_dump)
+        .collect::<Result<_, _>>()
+        .map(Some)
 }
 
-/// pydantic's lax `bool`: booleans, 0 and 1, and the yes/no words in any case.
-pub(super) fn pydantic_bool(value: &Value) -> Result<bool, String> {
-    let parsed = match value {
-        Value::Bool(value) => Some(*value),
-        Value::Number(number) => match number.as_f64() {
-            Some(0.0) => Some(false),
-            Some(1.0) => Some(true),
-            _ => None,
-        },
-        Value::String(text) => match text.to_lowercase().as_str() {
-            "0" | "off" | "f" | "false" | "n" | "no" => Some(false),
-            "1" | "on" | "t" | "true" | "y" | "yes" => Some(true),
-            _ => None,
-        },
-        _ => None,
-    };
-    parsed.ok_or_else(|| format!("expected a boolean, got {value}"))
-}
-
-impl DeepSeekV4Profile {
-    /// `chat_encoding.py`: the config override, else the checkpoint encoder's
-    /// declarations (`encoding/encoding_dsv4.py` source); preview when absent.
-    pub fn from_checkpoint(profile: Option<&str>, encoder: Option<&str>) -> Result<Self, String> {
-        if let Some(profile) = profile {
-            return match profile {
-                "preview" => Ok(Self::Preview),
-                "official" => Ok(Self::Official),
-                _ => Err(format!(
-                    "invalid dsv4_reasoning_effort_profile: {profile:?}; expected \"preview\" or \"official\""
-                )),
-            };
-        }
-        let Some(source) = encoder.filter(|source| source.len() <= 1 << 20) else {
-            return Ok(Self::Preview);
-        };
-        let default = top_level_python_assignment(source, "DEFAULT_REASONING_EFFORT")
-            .and_then(python_string_literal);
-        let prompt_keys = top_level_python_assignment(source, "REASONING_EFFORT_PROMPTS")
-            .and_then(python_dict_keys)
-            .unwrap_or_default();
-        if default.as_deref() == Some("low")
-            && ["low", "high", "max"]
-                .iter()
-                .all(|key| prompt_keys.iter().any(|candidate| candidate == key))
-        {
-            Ok(Self::Official)
-        } else {
-            Ok(Self::Preview)
-        }
+/// `Tool.model_dump()` after `_validate_request` normalizes the schema types,
+/// with the null fields `serving_deepseek_recipe` strips left out.
+fn tool_dump(tool: &Value) -> Result<Value, String> {
+    let source = &tool["function"];
+    let name = source["name"]
+        .as_str()
+        .ok_or("tool function requires name")?;
+    let mut function = Map::new();
+    if let Some(description) = source.get("description").filter(|d| !d.is_null()) {
+        function.insert("description".into(), description.clone());
     }
-}
-
-pub(crate) fn resolve_dsv4_profile(
-    profile: Option<&str>,
-    model_source: &str,
-    revision: Option<&str>,
-) -> Result<DeepSeekV4Profile, String> {
-    let encoder = profile
-        .is_none()
-        .then(|| resolve_model_file(model_source, revision, "encoding/encoding_dsv4.py"))
+    function.insert("name".into(), name.into());
+    if let Some(parameters) = source.get("parameters").filter(|p| !p.is_null()) {
+        let mut parameters = parameters.clone();
+        normalize_json_schema_types(&mut parameters);
+        function.insert("parameters".into(), parameters);
+    }
+    let strict = source.get("strict").map_or(Ok(false), pydantic_bool)?;
+    function.insert("strict".into(), strict.into());
+    // `Tool._propagate_defer_loading` copies the tool's flag into the function.
+    if let Some(defer) = [source.get("defer_loading"), tool.get("defer_loading")]
+        .into_iter()
         .flatten()
-        .and_then(|encoder| std::fs::read_to_string(encoder).ok());
-    DeepSeekV4Profile::from_checkpoint(profile, encoder.as_deref())
+        .find(|value| !value.is_null())
+    {
+        function.insert("defer_loading".into(), pydantic_bool(defer)?.into());
+    }
+    let mut dump = Map::new();
+    dump.insert(
+        "type".into(),
+        tool.get("type")
+            .filter(|t| !t.is_null())
+            .cloned()
+            .unwrap_or_else(|| "function".into()),
+    );
+    dump.insert("function".into(), function.into());
+    if let Some(defer) = tool.get("defer_loading").filter(|value| !value.is_null()) {
+        dump.insert("defer_loading".into(), pydantic_bool(defer)?.into());
+    }
+    Ok(dump.into())
 }
 
-fn top_level_python_assignment<'a>(source: &'a str, name: &str) -> Option<&'a str> {
-    let mut offset = 0;
-    for line in source.split_inclusive('\n') {
-        let trimmed = line.trim_end_matches(['\r', '\n']);
-        if !trimmed.starts_with(char::is_whitespace)
-            && let Some((target, _)) = trimmed.split_once('=')
-            && target
-                .split(':')
-                .next()
-                .is_some_and(|target| target.trim() == name)
-        {
-            let equals = line.find('=')?;
-            return Some(&source[offset + equals + 1..]);
-        }
-        offset += line.len();
+/// `deepseek_recipe_renderer.pre_normalize`: translate SGLang's request for
+/// recipe's Chat Completions adapter.
+fn pre_normalize(
+    body: &mut Map<String, Value>,
+    thinking: bool,
+    continue_final: bool,
+) -> Result<(), String> {
+    body.insert(
+        "thinking".into(),
+        json!({"type": if thinking { "enabled" } else { "disabled" }}),
+    );
+    // The host enforces structural_tag with its grammar.
+    if body
+        .get("response_format")
+        .is_some_and(|format| format["type"] == "structural_tag")
+    {
+        body.remove("response_format");
     }
-    None
+    if body.contains_key("tools") {
+        match body.get("tool_choice") {
+            Some(Value::String(choice)) if choice == "required" => {
+                // SGLang enforces the choice with its grammar, which expects the
+                // model to open the calls block itself.
+                body.insert("tool_choice".into(), "auto".into());
+            }
+            Some(Value::Object(_)) => _ = body.insert("tool_choice".into(), "auto".into()),
+            _ => {}
+        }
+    } else {
+        body.remove("tool_choice");
+    }
+    let Some(Value::Array(messages)) = body.get_mut("messages") else {
+        return Err("messages must be an array".into());
+    };
+    for message in messages.iter_mut() {
+        if message["role"] == "developer" {
+            message["role"] = "system".into();
+        }
+        let calls = message
+            .get_mut("tool_calls")
+            .and_then(Value::as_array_mut)
+            .into_iter()
+            .flatten();
+        for function in calls.filter_map(|call| call.get_mut("function")?.as_object_mut()) {
+            if let Some(arguments) = function.get_mut("arguments")
+                && !arguments.is_string()
+                && !arguments.is_null()
+            {
+                *arguments = python_json_compact(arguments).into();
+            }
+        }
+    }
+    if continue_final
+        && let Some(last) = messages
+            .last_mut()
+            .filter(|last| last["role"] == "assistant")
+    {
+        last["prefix"] = true.into();
+    }
+    Ok(())
 }
 
-fn python_string_literal(source: &str) -> Option<String> {
-    let source = source.trim_start();
-    let quote = source.chars().next()?;
-    if !matches!(quote, '\'' | '"') {
-        return None;
-    }
-    let mut escaped = false;
-    let mut value = String::new();
-    for character in source[quote.len_utf8()..].chars() {
-        if escaped {
-            value.push(character);
-            escaped = false;
-        } else if character == '\\' {
-            escaped = true;
-        } else if character == quote {
-            return Some(value);
-        } else {
-            value.push(character);
+/// The prompt split at its special tokens; plain text never parses control tokens.
+fn segments(prompt: &str, special_ranges: &[Range<usize>]) -> Vec<RenderedSegment> {
+    let mut segments = Vec::with_capacity(special_ranges.len() * 2 + 1);
+    let mut start = 0;
+    for range in special_ranges {
+        if range.start > start {
+            segments.push(RenderedSegment::new(&prompt[start..range.start], false));
         }
+        segments.push(RenderedSegment::new(&prompt[range.clone()], true));
+        start = range.end;
     }
-    None
+    if start < prompt.len() {
+        segments.push(RenderedSegment::new(&prompt[start..], false));
+    }
+    segments
 }
 
-fn python_dict_keys(source: &str) -> Option<Vec<String>> {
-    let source = source.trim_start();
-    if !source.starts_with('{') {
-        return None;
-    }
-    let mut keys = Vec::new();
-    let mut depth = 0usize;
-    let mut index = 0usize;
-    let bytes = source.as_bytes();
-    while index < bytes.len() {
-        match bytes[index] {
-            b'{' | b'[' | b'(' => {
-                depth += 1;
-                index += 1;
-            }
-            b'}' | b']' | b')' => {
-                depth = depth.checked_sub(1)?;
-                index += 1;
-                if depth == 0 {
-                    return Some(keys);
-                }
-            }
-            quote @ (b'\'' | b'"') => {
-                let start = index + 1;
-                index = start;
-                let mut escaped = false;
-                while index < bytes.len() {
-                    if escaped {
-                        escaped = false;
-                    } else if bytes[index] == b'\\' {
-                        escaped = true;
-                    } else if bytes[index] == quote {
-                        break;
-                    }
-                    index += 1;
-                }
-                if index == bytes.len() {
-                    return None;
-                }
-                let value = std::str::from_utf8(&bytes[start..index]).ok()?;
-                index += 1;
-                if depth == 1 {
-                    while index < bytes.len() && bytes[index].is_ascii_whitespace() {
-                        index += 1;
-                    }
-                    if bytes.get(index) == Some(&b':') {
-                        keys.push(value.to_owned());
-                    }
-                }
-            }
-            b'#' => {
-                while index < bytes.len() && bytes[index] != b'\n' {
-                    index += 1;
-                }
-            }
-            _ => index += 1,
-        }
-    }
-    None
+/// `RecipeEncoder._replace_effort_budget`: the first effort line takes the budget.
+fn replace_effort_budget(segments: &mut [RenderedSegment], budget: u32) -> Result<(), String> {
+    let segment = segments
+        .iter_mut()
+        .find(|segment| !segment.allow_special && segment.text.contains(BUDGET_TIER_LINE))
+        .ok_or("deepseek-recipe rendered no reasoning effort line")?;
+    segment.text =
+        segment
+            .text
+            .replacen(BUDGET_TIER_LINE, &format!("Reasoning Effort: {budget}"), 1);
+    Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use dynamo_renderer::deepseek::v4::ReasoningEffort::{High, Max};
-    use serde_json::json;
-
-    use super::DeepSeekV4Profile::{Official, Preview};
-    use super::{DeepSeekV4Profile, effort, resolve_dsv4_profile};
-
-    #[test]
-    fn effort_maps_profile_tiers_and_env_fills_only_a_missing_effort() {
-        for (profile, requested, fallback, expected) in [
-            (Preview, Some("max"), None, Some(High)),
-            (Preview, Some("high"), None, None),
-            (Official, Some("high"), None, Some(High)),
-            (Official, Some("max"), None, Some(Max)),
-            (Official, Some("xhigh"), None, None),
-            (Official, None, Some("max"), Some(Max)),
-            (Official, Some("low"), Some("max"), None),
-        ] {
-            let request = json!({ "reasoning_effort": requested });
-            let fallback = fallback.map(str::to_owned);
-            assert_eq!(
-                effort(profile, &request, &Default::default(), fallback),
-                expected,
-                "{profile:?} {requested:?}"
-            );
-        }
+/// `RecipeEncoder._attach_task`: a quick instruction task on the last user turn.
+fn attach_task(
+    segments: &mut Vec<RenderedSegment>,
+    task: &str,
+    thinking: bool,
+) -> Result<(), String> {
+    let marker = if thinking {
+        THINK_START_TOKEN
+    } else {
+        THINK_END_TOKEN
+    };
+    let header = segments.len() >= 2
+        && segments[segments.len() - 2].allow_special
+        && segments[segments.len() - 2].text == ASSISTANT_TOKEN
+        && segments[segments.len() - 1].allow_special
+        && segments[segments.len() - 1].text == marker;
+    if !header {
+        return Err("task requires the conversation to end with a user message".into());
     }
-
-    #[test]
-    fn deepseek_v4_profile_resolution_uses_override_then_checkpoint_source() {
-        let directory = std::env::temp_dir().join(format!(
-            "sglang-processor-deepseek-v4-profile-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(directory.join("encoding")).unwrap();
-        std::fs::write(
-            directory.join("encoding/encoding_dsv4.py"),
-            "DEFAULT_REASONING_EFFORT: str = 'low'\n\
-REASONING_EFFORT_PROMPTS = {'low': '', 'high': 'absolute', 'max': 'beyond'}",
-        )
-        .unwrap();
-        let source = directory.to_string_lossy();
-        assert_eq!(
-            resolve_dsv4_profile(None, &source, None).unwrap(),
-            DeepSeekV4Profile::Official
-        );
-        assert_eq!(
-            resolve_dsv4_profile(Some("preview"), &source, None).unwrap(),
-            DeepSeekV4Profile::Preview
-        );
-        assert!(resolve_dsv4_profile(Some("future"), &source, None).is_err());
-
-        std::fs::write(
-            directory.join("encoding/encoding_dsv4.py"),
-            r#"DEFAULT_REASONING_EFFORT = "high"
-REASONING_EFFORT_PROMPTS = {"low": "", "high": "absolute", "max": "Beyond maximum"}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            resolve_dsv4_profile(None, &source, None).unwrap(),
-            DeepSeekV4Profile::Preview
-        );
-        std::fs::remove_dir_all(directory).unwrap();
+    let token = TASK_TOKENS
+        .iter()
+        .find(|(name, _)| *name == task)
+        .map(|(_, token)| *token)
+        .ok_or_else(|| format!("unknown task {task:?}"))?;
+    if !TASKS_AFTER_HEADER.contains(&task) {
+        segments.truncate(segments.len() - 2);
     }
+    segments.push(RenderedSegment::new(token, true));
+    Ok(())
 }

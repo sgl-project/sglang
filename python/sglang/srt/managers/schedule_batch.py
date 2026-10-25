@@ -1167,6 +1167,7 @@ class Req(ReqDllmMixin):
         self.reasoning_tokens = 0
         self._think_end_matcher: Optional[TokenSequenceMatcher] = None
         self._think_end_match_len = 0
+        self._think_start_match_len = 0
 
         # Only custom logit processors need the "__req__" reference cycle.
         if custom_logit_processor is not None and isinstance(
@@ -2279,6 +2280,30 @@ class Req(ReqDllmMixin):
 
         self._think_end_match_len = matched
         self.reasoning_tokens += len(token_id)
+
+    def update_self_opened_reasoning_tokens(
+        self, token_id, think_start_ids, think_end_ids
+    ):
+        """Count reasoning the model opens itself; an output not opening with the start tag has none."""
+        if self._is_reasoning_over:
+            return
+
+        if not isinstance(token_id, list):
+            token_id = [token_id]
+
+        consumed = 0
+        while self._think_start_match_len < len(think_start_ids):
+            if consumed == len(token_id):
+                return
+            if token_id[consumed] != think_start_ids[self._think_start_match_len]:
+                self._is_reasoning_over = True
+                return
+            self._think_start_match_len += 1
+            consumed += 1
+            if self._think_start_match_len == len(think_start_ids):
+                self.reasoning_tokens += len(think_start_ids)
+
+        self.update_reasoning_tokens(token_id[consumed:], think_end_ids)
 
     def __repr__(self):
         return (

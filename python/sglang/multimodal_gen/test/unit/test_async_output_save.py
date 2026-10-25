@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import threading
+import time
 from collections import deque
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import contextmanager
@@ -258,3 +259,43 @@ def test_reply_send_holds_the_socket_lock():
 
     assert held == [True]
     assert not scheduler._socket_lock.locked()
+
+
+def test_idle_wait_leaves_the_socket_lock_to_a_pending_reply():
+    # The finalize thread replies under _socket_lock; a loop that waited holding
+    # it and re-took it right after starved that reply for up to a second.
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler._socket_lock = threading.Lock()
+    scheduler.receiver = object()
+    scheduler._poller = SimpleNamespace(poll=lambda timeout: time.sleep(timeout / 1e3))
+    got_lock = []
+
+    def reply():
+        time.sleep(0.05)  # land inside the loop's waits
+        got_lock.append(scheduler._socket_lock.acquire(blocking=False))
+        if got_lock[0]:
+            scheduler._socket_lock.release()
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        scheduler._inflight_finalizes = deque([executor.submit(reply)])
+        deadline = time.monotonic() + 10
+        while not scheduler._inflight_finalizes[0].done():
+            assert time.monotonic() < deadline
+            scheduler._wait_idle(1.0)
+
+    assert got_lock == [True]
+
+
+def test_idle_wait_without_pending_finalize_polls_the_socket():
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler._socket_lock = threading.Lock()
+    scheduler._inflight_finalizes = deque()
+    scheduler.receiver = object()
+    polls = []
+    scheduler._poller = SimpleNamespace(
+        poll=lambda timeout: polls.append((timeout, scheduler._socket_lock.locked()))
+    )
+
+    scheduler._wait_idle(0.25)
+
+    assert polls == [(250.0, True)]

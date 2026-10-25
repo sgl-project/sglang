@@ -39,10 +39,11 @@ from sglang.multimodal_gen.registry import (
     _discover_and_register_pipelines,
     _get_config_info,
 )
+from sglang.multimodal_gen.runtime.models.dits import cosmos_dreams
 from sglang.multimodal_gen.runtime.models.dits.cosmos_dreams import (
     build_cosmos_dreams_position_ids,
     interleave_action_vision_tokens,
-    null_action_token_positions,
+    null_action_token_slices,
     split_interleaved_action_vision_tokens,
 )
 from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
@@ -77,6 +78,7 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.warmup_request_builder import (
     _lighter_valid_num_frames,
 )
+from sglang.multimodal_gen.test.unit.host_sync_guard import RecordOps
 
 # ``transformer/config.json["cosmos3_nano_sim_bimanual"]`` of Cosmos3-Nano-Sim-Bimanual
 # (checkpoint causal_8b_sf_dmd_max_4step_cam_chunk4_480p_961f@iter_000002000).
@@ -621,15 +623,50 @@ class TestCosmosDreamsPositionIds(unittest.TestCase):
         torch.testing.assert_close(unpacked_action, action)
         torch.testing.assert_close(unpacked_vision, vision)
         self.assertEqual(
-            null_action_token_positions(
+            null_action_token_slices(
                 (0, 2), num_frames=3, tokens_per_frame=10, action_tokens_per_frame=4
             ),
-            [0, 1, 2, 3, 20, 21, 22, 23],
+            [slice(0, 4), slice(20, 24)],
         )
         with self.assertRaises(ValueError):
-            null_action_token_positions(
+            null_action_token_slices(
                 (3,), num_frames=3, tokens_per_frame=10, action_tokens_per_frame=4
             )
+
+    def test_null_action_slots_zeroed_without_uploads(self):
+        attention = SimpleNamespace(
+            local_num_attention_heads=1,
+            local_num_key_value_heads=1,
+            head_dim=2,
+            to_qkv=lambda hidden: (torch.cat([hidden, hidden, hidden + 1], -1), None),
+            norm_q=None,
+            norm_k=None,
+            attn=lambda q, k, v: q,
+            to_out=lambda out: (out, None),
+        )
+        hidden = torch.randn(1, 20, 2)
+        slices = null_action_token_slices(
+            (0, 1), num_frames=2, tokens_per_frame=10, action_tokens_per_frame=4
+        )
+        with (
+            mock.patch.object(
+                cosmos_dreams, "_apply_qwen3_qk_norm_rope", lambda q, k, *_: (q, k)
+            ),
+            RecordOps() as ops,
+        ):
+            _, _, v = cosmos_dreams._joint_attention(
+                attention,
+                hidden,
+                prefix_k=torch.zeros(1, 0, 1, 2),
+                prefix_v=torch.zeros(1, 0, 1, 2),
+                cos_sin_cache=None,
+                rope_positions=None,
+                null_token_slices=slices,
+            )
+        self.assertEqual(ops.uploads(), [])
+        expected = (hidden + 1).view(1, 20, 1, 2).clone()
+        expected[:, [0, 1, 2, 3, 10, 11, 12, 13]] = 0.0
+        torch.testing.assert_close(v, expected, rtol=0, atol=0)
 
 
 class TestCosmosDreamsSdeSeeding(unittest.TestCase):

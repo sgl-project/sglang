@@ -808,6 +808,7 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
         self.assertTrue(all(isinstance(row, DatasetRow) for row in rows))
 
     def test_speed_bench_sampler(self):
+        """Each row's prompt_len is the token count of its chat-templated prompt."""
         dataset_path = self._write_speed_bench_jsonl()
         args = make_args(
             dataset_name="speed-bench",
@@ -821,7 +822,24 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
         self.assertEqual(len(rows), 3)
         self.assertTrue(all(isinstance(row, DatasetRow) for row in rows))
         self.assertTrue(all(row.output_len == 512 for row in rows))
-        self.assertTrue(all(row.prompt_len > 0 for row in rows))
+
+        with open(dataset_path) as f:
+            source_prompts = [json.loads(line)["turns"][0] for line in f]
+        templated_lens = {
+            len(
+                self.tokenizer.encode(
+                    self.tokenizer.apply_chat_template(
+                        [{"role": "user", "content": text}],
+                        tokenize=False,
+                        add_generation_prompt=True,
+                    ),
+                    add_special_tokens=False,
+                )
+            )
+            for text in source_prompts
+        }
+        for row in rows:
+            self.assertIn(row.prompt_len, templated_lens)
 
     def test_speed_bench_category_filter(self):
         dataset_path = self._write_speed_bench_jsonl()

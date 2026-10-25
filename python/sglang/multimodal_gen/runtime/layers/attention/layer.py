@@ -1515,7 +1515,19 @@ class USPAttention(nn.Module):
                 out = self.attn_impl.forward(qs, ks, vs, ctx_attn_metadata)
                 return _usp_output_all_to_all(out, head_dim=2)
 
-            out = self._pipelined_ulysses(q, k, v, attend, sequential, layout="dense")
+            out = self._pipelined_ulysses(
+                q,
+                k,
+                v,
+                attend,
+                sequential,
+                layout="dense",
+                attend_into=lambda q_group, k_group, v_group, out: (
+                    self.attn_impl.forward_into(
+                        q_group, k_group, v_group, out, ctx_attn_metadata
+                    )
+                ),
+            )
             if out is not None:
                 return out
 
@@ -1574,6 +1586,7 @@ class USPAttention(nn.Module):
         layout: str,
         replicated=(None, None, None),
         replicated_first: bool = True,
+        attend_into=None,
     ) -> torch.Tensor | None:
         """Ulysses attention with the exchange pipelined over head groups.
 
@@ -1643,6 +1656,7 @@ class USPAttention(nn.Module):
             ),
             replicated=replicated,
             replicated_first=replicated_first,
+            attend_into=attend_into,
         )
         if out is None:
             self._pipeline_declined.add(key)

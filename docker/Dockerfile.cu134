@@ -4,6 +4,15 @@ ARG TORCH_NIGHTLY_INDEX=https://download.pytorch.org/whl/nightly/cu134
 ARG TORCH_NIGHTLY_VERSION=2.15.0.dev20261005+cu134
 ARG TORCHVISION_NIGHTLY_VERSION=0.30.0.dev20261005+cu134
 ARG TORCHAUDIO_NIGHTLY_VERSION=2.11.0.dev20261004+cu134
+# Torch wheels may differ from the CUDA 13.4 toolkit used for JIT (e.g. cu130 stable
+# wheels on Blackwell). The nightly arguments stay as defaults for existing invocations.
+ARG TORCH_INDEX_URL=${TORCH_NIGHTLY_INDEX}
+ARG TORCH_VERSION=${TORCH_NIGHTLY_VERSION}
+ARG TORCHVISION_VERSION=${TORCHVISION_NIGHTLY_VERSION}
+ARG TORCHAUDIO_VERSION=${TORCHAUDIO_NIGHTLY_VERSION}
+# source: build sglang-kernel / sgl-deep-gemm / sgl-deep-ep from source; pypi: download released wheels.
+ARG SGL_WHEELS_SOURCE=source
+ARG SGL_KERNEL_VERSION=0.4.10
 # Wheel build args
 ARG MANYLINUX_IMAGE=pytorch/manylinuxaarch64-builder:cuda13.4
 ARG DEEPGEMM_REF=v0.2.3.post2
@@ -17,7 +26,7 @@ FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu24.04 AS base
 ARG TARGETARCH
 ARG BUILD_TYPE=all
 ARG BRANCH_TYPE=remote
-ARG SGL_KERNEL_VERSION=0.4.9
+ARG SGL_KERNEL_VERSION
 ARG SGL_VERSION
 ARG USE_LATEST_SGLANG=0
 ARG GDRCOPY_VERSION=2.5.1
@@ -186,8 +195,8 @@ ENV LANG=en_US.UTF-8 \
 ########################################################
 FROM ${MANYLINUX_IMAGE} AS cu134_wheel_base
 
-ARG TORCH_NIGHTLY_INDEX
-ARG TORCH_NIGHTLY_VERSION
+ARG TORCH_INDEX_URL
+ARG TORCH_VERSION
 ARG PYTHON_TAG=cp312-cp312
 ARG GITHUB_ARTIFACTORY=github.com
 ENV PYTHON_ROOT_PATH=/opt/python/${PYTHON_TAG}
@@ -208,8 +217,8 @@ RUN set -eux; \
 
 RUN --mount=type=cache,id=cu134-wheels-pip,target=/root/.cache/pip \
     ${PYTHON_ROOT_PATH}/bin/pip install --upgrade pip \
-    && ${PYTHON_ROOT_PATH}/bin/pip install "torch==${TORCH_NIGHTLY_VERSION}" \
-        --index-url "${TORCH_NIGHTLY_INDEX}" \
+    && ${PYTHON_ROOT_PATH}/bin/pip install "torch==${TORCH_VERSION}" \
+        --index-url "${TORCH_INDEX_URL}" \
     && ${PYTHON_ROOT_PATH}/bin/python -c "import torch; print('builder torch', torch.__version__)"
 
 ########################################################
@@ -369,11 +378,31 @@ RUN --mount=type=cache,id=cu134-wheels-pip,target=/root/.cache/pip \
     ls -la /wheels
 
 # Collect all three so torch_deps can COPY from a single stage.
-FROM base AS cu134_wheels
+FROM base AS cu134_wheels_source
 COPY --from=cu134_wheel_sglkernel /wheels /wheels
 COPY --from=cu134_wheel_deepgemm  /wheels /wheels
 COPY --from=cu134_wheel_deepep    /wheels /wheels
 RUN ls -la /wheels && test "$(ls /wheels/*.whl | wc -l)" -eq 3
+
+# BuildKit skips the source builders when released wheels are selected.
+FROM base AS cu134_wheels_pypi
+ARG SGL_KERNEL_VERSION
+ARG SGL_DEEP_GEMM_VERSION
+ARG SGL_DEEP_EP_VERSION
+ARG TORCH_VERSION
+# Released wheels pin the stable torch they were built against; fail here, not in pip resolution.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python3 -m pip download --only-binary=:all: --no-deps -d /wheels \
+        "sglang-kernel==${SGL_KERNEL_VERSION}" \
+        "sgl-deep-gemm==${SGL_DEEP_GEMM_VERSION}" \
+        "sgl-deep-ep==${SGL_DEEP_EP_VERSION}" \
+    && python3 -c 'import glob, os, re, sys, zipfile; \
+want = os.environ["TORCH_VERSION"].split("+")[0]; \
+metadata = {os.path.basename(w): z.read(n).decode() for w in sorted(glob.glob("/wheels/*.whl")) for z in [zipfile.ZipFile(w)] for n in z.namelist() if n.endswith(".dist-info/METADATA")}; \
+bad = {w: p for w, text in metadata.items() for p in re.findall(r"^Requires-Dist: torch\s*\(?==\s*([^\s;,)]+)", text, re.M) if p.split("+")[0] != want}; \
+bad and sys.exit(f"released wheels pin torch {bad} but TORCH_VERSION={want}; set TORCH_INDEX_URL, TORCH_VERSION, TORCHVISION_VERSION and TORCHAUDIO_VERSION to the matching stable wheels")'
+
+FROM cu134_wheels_${SGL_WHEELS_SOURCE} AS cu134_wheels
 
 ########################################################
 # PARALLEL STAGE 1: Torch/Deps Builder (starts from base)
@@ -387,10 +416,11 @@ ARG GITHUB_ARTIFACTORY
 # Renamed from NCCL_VERSION: the nvidia/cuda base image sets ENV NCCL_VERSION
 # (Debian apt format, e.g. 2.31.2-1), which shadows a same-named ARG inside RUN.
 ARG SGL_NCCL_VERSION
-ARG TORCH_NIGHTLY_INDEX
-ARG TORCH_NIGHTLY_VERSION
-ARG TORCHVISION_NIGHTLY_VERSION
-ARG TORCHAUDIO_NIGHTLY_VERSION
+ARG TORCH_INDEX_URL
+ARG TORCH_VERSION
+ARG TORCHVISION_VERSION
+ARG TORCHAUDIO_VERSION
+ARG SGL_WHEELS_SOURCE
 
 WORKDIR /sgl-workspace
 
@@ -449,22 +479,24 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && touch README.md \
     && touch LICENSE \
     && if [ "$CUDA_VERSION" = "13.4.1" ]; then \
-           TORCH_INDEX="${TORCH_NIGHTLY_INDEX}"; \
-           python3 -m pip install --index-url "${TORCH_NIGHTLY_INDEX}" \
-               "torch==${TORCH_NIGHTLY_VERSION}" \
-               "torchvision==${TORCHVISION_NIGHTLY_VERSION}" \
-               "torchaudio==${TORCHAUDIO_NIGHTLY_VERSION}" && \
-           sed -i "s|^  \"torch==.*|  \"torch==${TORCH_NIGHTLY_VERSION}\",|" pyproject.toml && \
-           sed -i "s|^  \"torchaudio==.*|  \"torchaudio==${TORCHAUDIO_NIGHTLY_VERSION}\",|" pyproject.toml && \
-           sed -i "s|^  \"torchvision\",\$|  \"torchvision==${TORCHVISION_NIGHTLY_VERSION}\",|" pyproject.toml && \
-           sed -i 's|"torchcodec==[0-9.]*|"torchcodec|' pyproject.toml && \
-           sed -i 's|^  "sglang-kernel==.*|  "sglang-kernel",|' pyproject.toml && \
-           sed -i 's|^  "sgl-deep-ep==.*|  "sgl-deep-ep",|' pyproject.toml && \
-           sed -i 's|^  "sgl-deep-gemm==.*|  "sgl-deep-gemm",|' pyproject.toml; \
+           TORCH_INDEX="${TORCH_INDEX_URL}"; \
+           python3 -m pip install --index-url "${TORCH_INDEX_URL}" \
+               "torch==${TORCH_VERSION}" \
+               "torchvision==${TORCHVISION_VERSION}" \
+               "torchaudio==${TORCHAUDIO_VERSION}" && \
+           sed -i "s|^  \"torch==.*|  \"torch==${TORCH_VERSION}\",|" pyproject.toml && \
+           sed -i "s|^  \"torchaudio==.*|  \"torchaudio==${TORCHAUDIO_VERSION}\",|" pyproject.toml && \
+           sed -i "s|^  \"torchvision\",\$|  \"torchvision==${TORCHVISION_VERSION}\",|" pyproject.toml && \
+           if [ "${SGL_WHEELS_SOURCE}" = "source" ]; then \
+               sed -i 's|"torchcodec==[0-9.]*|"torchcodec|' pyproject.toml && \
+               sed -i 's|^  "sglang-kernel==.*|  "sglang-kernel",|' pyproject.toml && \
+               sed -i 's|^  "sgl-deep-ep==.*|  "sgl-deep-ep",|' pyproject.toml && \
+               sed -i 's|^  "sgl-deep-gemm==.*|  "sgl-deep-gemm",|' pyproject.toml; \
+           fi; \
        else \
            TORCH_INDEX="https://download.pytorch.org/whl/cu${CUINDEX}"; \
        fi \
-    && python3 -m pip install --extra-index-url "${TORCH_INDEX}" ".[${BUILD_TYPE}]" \
+    && python3 -m pip install --extra-index-url "${TORCH_INDEX}" ".${BUILD_TYPE:+[${BUILD_TYPE}]}" \
     && python3 -m pip install --force-reinstall --no-deps \
            "nvidia-nccl-cu13==${SGL_NCCL_VERSION}" \
     && if [ "$CUDA_VERSION" = "13.4.1" ]; then \
@@ -499,7 +531,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # constraints.txt pins the cu134 nightly torch, which does not exist on PyPI;
 # later stages cannot satisfy it without the nightly index in scope.
 RUN if [ "$CUDA_VERSION" = "13.4.1" ]; then \
-        python3 -m pip config set global.extra-index-url "${TORCH_NIGHTLY_INDEX}"; \
+        python3 -m pip config set global.extra-index-url "${TORCH_INDEX_URL}"; \
     fi
 
 ########################################################
@@ -648,7 +680,7 @@ ARG USE_LATEST_SGLANG
 ARG GITHUB_ARTIFACTORY
 ARG MOONCAKE_VERSION
 ARG MSCCLPP_VERSION
-ARG TORCH_NIGHTLY_VERSION
+ARG TORCH_VERSION
 
 WORKDIR /sgl-workspace
 
@@ -711,8 +743,11 @@ RUN --mount=type=cache,target=/var/cache/apt,id=framework-apt \
 RUN --mount=type=cache,target=/var/cache/apt,id=framework-apt \
     apt update -y \
     && apt install -y --no-install-recommends gnupg \
-    && echo "deb http://developer.download.nvidia.com/devtools/repos/ubuntu2004/$(if [ "$(uname -m)" = "aarch64" ]; then echo "arm64"; else echo "amd64"; fi) /" | tee /etc/apt/sources.list.d/nvidia-devtools.list \
-    && apt-key adv --fetch-keys http://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/$(if [ "$(uname -m)" = "aarch64" ]; then echo "arm64"; else echo "x86_64"; fi)/7fa2af80.pub \
+    && curl --retry 3 --retry-delay 2 -fsSL -o /tmp/nvidia-devtools.pub \
+        "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/$(if [ "$(uname -m)" = "aarch64" ]; then echo "arm64"; else echo "x86_64"; fi)/7fa2af80.pub" \
+    && gpg --batch --dearmor -o /usr/share/keyrings/nvidia-devtools.gpg /tmp/nvidia-devtools.pub \
+    && rm -f /tmp/nvidia-devtools.pub \
+    && echo "deb [signed-by=/usr/share/keyrings/nvidia-devtools.gpg] https://developer.download.nvidia.com/devtools/repos/ubuntu2004/$(if [ "$(uname -m)" = "aarch64" ]; then echo "arm64"; else echo "amd64"; fi) /" > /etc/apt/sources.list.d/nvidia-devtools.list \
     && apt update -y \
     && apt install -y --no-install-recommends nsight-systems-cli \
     && rm -rf /var/lib/apt/lists/*
@@ -745,7 +780,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # one, so the constraints-pinned cu134 nightly must be restated here; otherwise
 # runai-model-streamer's "torch<3.0.0,>=2.0.0" backtracks the whole resolve.
 RUN --mount=type=cache,target=/root/.cache/pip \
-    if [ "$CUDA_VERSION" = "13.4.1" ]; then TORCH_SPEC="torch==${TORCH_NIGHTLY_VERSION}"; else TORCH_SPEC=""; fi \
+    if [ "$CUDA_VERSION" = "13.4.1" ]; then TORCH_SPEC="torch==${TORCH_VERSION}"; else TORCH_SPEC=""; fi \
     && python3 -m pip install -c /sgl-workspace/constraints.txt \
     ${TORCH_SPEC} \
     datamodel_code_generator \
@@ -774,8 +809,11 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && python3 -m pip install "cuda-python>=13,<14"
 
 # Install the latest available AI Dynamo prerelease from NVIDIA's package index.
+ARG INSTALL_AI_DYNAMO=1
 RUN --mount=type=cache,target=/root/.cache/pip \
-    python3 -m pip install --pre --extra-index-url https://pypi.nvidia.com/ ai-dynamo
+    if [ "${INSTALL_AI_DYNAMO}" = "1" ]; then \
+        python3 -m pip install --pre --extra-index-url https://pypi.nvidia.com/ ai-dynamo; \
+    fi
 
 # Add yank script
 COPY --chown=root:root --chmod=755 docker/configs/yank /usr/local/bin/yank
@@ -885,7 +923,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # SM103, compiled at runtime); disable with --build-arg ENABLE_SGL_NVIDIA_MEGA=0.
 ARG ENABLE_SGL_NVIDIA_MEGA=1
 ARG SGL_NVIDIA_MEGA_REPO="https://github.com/sgl-project/sgl-nvidia-mega.git"
-ARG SGL_NVIDIA_MEGA_COMMIT="3333e4cfac0f2b15603565d702b4c67538f1628f"
+ARG SGL_NVIDIA_MEGA_COMMIT="6fd7ac30371a45ef246bb9db2e3559c398156feb"
 RUN --mount=type=cache,target=/root/.cache/pip \
     if [ "${ENABLE_SGL_NVIDIA_MEGA}" != "1" ]; then \
         echo "[sgl-nvidia-mega] skip (ENABLE_SGL_NVIDIA_MEGA=${ENABLE_SGL_NVIDIA_MEGA})"; \
@@ -971,6 +1009,7 @@ RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
     curl \
     git \
     # Runtime libraries
+    ffmpeg \
     libopenmpi3 \
     libnuma1 \
     numactl \

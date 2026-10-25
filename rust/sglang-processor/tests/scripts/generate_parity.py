@@ -67,10 +67,15 @@ def serving_chat(model, path, revision, config, tokenizer, tool_call_parser):
     """The state `OpenAIServingChat.__init__` resolves for this checkpoint, without
     a reasoning parser. Served text-only: the processor leaves media to the engine."""
     server = object.__new__(OpenAIServingChat)
+    hf_config = SimpleNamespace(
+        model_type=config.get("model_type"),
+        architectures=config.get("architectures"),
+    )
     server.tokenizer_manager = SimpleNamespace(
         tokenizer=tokenizer,
         processor=None,
-        model_config=SimpleNamespace(is_multimodal=False),
+        model_path=path,
+        model_config=SimpleNamespace(is_multimodal=False, hf_config=hf_config),
     )
     server.template_manager = TemplateManager()
     server.template_manager.load_chat_template(server.tokenizer_manager, None, model)
@@ -79,13 +84,11 @@ def serving_chat(model, path, revision, config, tokenizer, tool_call_parser):
     server._reasoning_detector = None
     server.is_gpt_oss = server.is_gemma4 = False
     server.chat_encoding_spec = chat_encoding.resolve_chat_encoding_spec(
-        hf_config=SimpleNamespace(
-            model_type=config.get("model_type"),
-            architectures=config.get("architectures"),
-        ),
+        hf_config=hf_config,
         tokenizer=tokenizer,
         tool_call_parser=tool_call_parser,
     )
+    server._encoding_adapter = server._build_chat_encoding_adapter()
     server._tokenizer_auto_adds_specials = len(tokenizer.encode("")) > 0
     server._prompt_text_round_trip_is_lossy = server._probe_prompt_text_round_trip()
     server._chat_template_cache = OrderedDict()
@@ -148,7 +151,12 @@ def generate(fixture_path):
             case["error"] = f"{type(error).__name__}: {error}"
             continue
         case.update(
-            prompt="".join(tok.texts),
+            # An encoding adapter tokenizes with its own library, not `encode`.
+            prompt=(
+                tok.decode(ids, skip_special_tokens=False)
+                if server._encoding_adapter is not None
+                else "".join(tok.texts)
+            ),
             token_count=len(ids),
             token_sha256=hashlib.sha256(
                 b"".join(i.to_bytes(4, "little") for i in ids)

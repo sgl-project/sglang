@@ -6,8 +6,8 @@ use std::collections::HashMap;
 use dynamo_renderer::{OAIChatLikeRequest, PromptFormatter};
 use serde_json::{Value, json};
 
-use super::deepseek_v4::{engine_message, normalize_tools, pydantic_bool, split_continuation};
 use super::glm53::valid_documents;
+use super::pydantic_dump::{engine_message, normalize_tools, pydantic_bool, split_continuation};
 use crate::render::reasoning::{requested_effort, requested_thinking};
 
 /// `apply_chat_template` arguments SGLang passes itself: as kwargs they fail the

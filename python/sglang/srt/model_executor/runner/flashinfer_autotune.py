@@ -137,7 +137,7 @@ def should_run_flashinfer_autotune(
         resolve_mxfp8_dense_gemm_backend,
     )
 
-    if model_quantization == "mxfp8":
+    if model_quantization == "mxfp8" or model_quantization == "minimax_m3_nvfp4":
         fp8_gemm_needs_autotune = resolve_mxfp8_dense_gemm_backend().is_flashinfer()
     elif model_quantization in ("modelopt", "modelopt_fp8", "modelopt_mixed"):
         fp8_gemm_needs_autotune = flashinfer_per_tensor_fp8_supported()

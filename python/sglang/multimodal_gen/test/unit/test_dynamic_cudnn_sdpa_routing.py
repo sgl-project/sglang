@@ -21,7 +21,9 @@ def _qkv(q_len: int, kv_len: int, heads: int = 32, head_dim: int = 64):
 
 class TestDynamicCudnnSDPARouting(unittest.TestCase):
     def _uses_cudnn(self, q_len: int, kv_len: int) -> bool:
-        impl = SimpleNamespace(causal=False, _cudnn_failed=False, _is_sm100=True)
+        impl = SimpleNamespace(
+            causal=False, _cudnn_failed=False, _is_sm100=True, _is_sm103=False
+        )
         return DynamicCudnnSDPAImpl._use_cudnn_sdpa(impl, *_qkv(q_len, kv_len))
 
     def test_blackwell_keeps_cudnn_when_both_sides_fill_a_tile(self):

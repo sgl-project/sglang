@@ -1491,6 +1491,11 @@ class SchedulerBatchResultProcessor:
         next_token_id: Union[int, List[int]],
     ):
         if not req.require_reasoning:
+            think_start_ids = self.model_config.self_opened_think_start_ids
+            if think_start_ids:
+                req.update_self_opened_reasoning_tokens(
+                    next_token_id, think_start_ids, self.model_config.think_end_ids
+                )
             return
         think_end_ids = self.model_config.think_end_ids
         if req._think_end_matcher is None:

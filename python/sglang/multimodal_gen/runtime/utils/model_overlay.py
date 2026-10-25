@@ -26,6 +26,11 @@ logger = init_logger(__name__)
 
 # Built-in diffusion model overlay registry.
 BUILTIN_MODEL_OVERLAY_REGISTRY: dict[str, dict[str, Any]] = {
+    "tencent/Hy-Nomas": {
+        "overlay_repo_id": "Niehen6174/Hy-Nomas-overlay",
+        "overlay_revision": "14088cc131c66fb7265cefbf99276428ccd5a957",
+        "source_revision": "dea948068220d1037f1d1c10b95b6793d92bee28",
+    },
     "Lightricks/LTX-2.3": {
         "overlay_repo_id": "MickJ/LTX-2.3-overlay",
         "overlay_revision": "e0cc94f279ec16bb87c230134d40319f6ce40c5e",

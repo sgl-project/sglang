@@ -78,13 +78,12 @@ renders the model:
      It also reads the server's `--tool-call-parser` and whether the tokenizer has
      a chat template. If the deployment depends on the parser, set
      `tool_call_parser` in the fixture, and add it to `ChatFormatterOptions` in the
-     same PR. Note any per-checkpoint state the server resolves once (DeepSeek-V4's
-     effort profile reads `encoding/encoding_dsv4.py`).
+     same PR. Note any per-checkpoint state the server resolves once.
    - That spec's branch in `serving_chat._apply_jinja_template` / `_encode_messages`:
      message dumping, content flattening, `_handle_last_assistant_message`, system
      insertion, tools, model-specific fields, the encoder or `apply_chat_template`
      call, and how the prompt is tokenized.
-   - The encoder itself (for example `encoding_dsv4.py`), line by line. History
+   - The encoder itself (for example deepseek-recipe), line by line. History
      rules live there: dropped turns, `</think>` on empty reasoning, argument
      formatting, and the errors it raises.
 
@@ -184,7 +183,7 @@ PYTHONPATH=$REPO/python HF_HUB_CACHE=<hub cache> HF_HUB_OFFLINE=1 \
 
 When a new spec needs more, extend `serving_chat()` in the script (one place):
 - **More server state:** set the extra attribute that `__init__` resolves, for
-  example `_dsv41_default_reasoning_effort`.
+  example the chat encoding adapter (`_encoding_adapter`).
 
 A spec that tokenizes inside `apply_chat_template(tokenize=True)` (Kimi K3) is
 recorded by the template's text output. Its `render_request` returns the
@@ -205,8 +204,8 @@ cargo check -p sglang-processor --no-default-features --features render,tokenize
 The token check loads the pinned commit's snapshot from the cache. When the
 snapshot is missing, the test prints `token ids not checked` (visible with
 `-- --nocapture`), so confirm that line is absent before claiming token parity.
-With the snapshot cached, the test also checks that the checkpoint resolves the
-fixture's recorded DeepSeek-V4 profile.
+A formatter that encodes its own prompts (DeepSeek-V4 and V4.1, through
+`encode_request`) is checked with the checkpoint's own tokenizer.
 
 ## OpenAI layer
 

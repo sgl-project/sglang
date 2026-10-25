@@ -67,13 +67,14 @@ class DFlashVerifyInput(SpecInput):
         self,
         batch: ScheduleBatch,
         target_worker: TpModelWorker,
+        *,
+        defer_metadata_init: bool = False,
     ) -> tuple[ForwardBatch, bool]:
         """Prepare a DFLASH verify forward batch for overlap scheduling.
 
         The caller computes and stores `batch.out_cache_loc` before this
-        method is called. GPU keeps the original pre-planning path. NPU leaves
-        attention/graph metadata initialization to ModelRunner because DP/EP
-        padding can still change the compressor's runtime shapes.
+        method is called. Deferred callers leave attention/graph planning to
+        ModelRunner, after DP/EP padding has finalized the runtime shapes.
         """
         from sglang.srt.speculative.spec_utils import prepare_mamba_track_for_verify
 
@@ -116,11 +117,9 @@ class DFlashVerifyInput(SpecInput):
                 verify_forward_batch
             )
         )
-        if _is_npu:
-            # Do not pre-plan target verify on NPU. DP/EP padding can change
-            # the compressor's logical batch without changing ForwardBatch's
-            # stale-plan shape fields. Let ModelRunner select graph/eager and
-            # initialize metadata after final batch preparation.
+        if _is_npu or defer_metadata_init:
+            # DP padding can change the live rows and graph eligibility.
+            # ModelRunner owns planning after final batch preparation.
             return verify_forward_batch, can_run_cuda_graph
         elif can_run_cuda_graph:
             target_worker.model_runner.decode_cuda_graph_runner.load_batch(

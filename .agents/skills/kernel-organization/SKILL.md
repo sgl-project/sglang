@@ -44,6 +44,15 @@ logical grouping and remove the old `_jit_` filename prefix.
   FlashInfer). They are backends, not groups: register their public ops in the
   logical group with a `KernelSpec` whose target points into them, and do not
   reorganize those directories.
+- External kernel libraries that load as SGLang plugins and replace a model's
+  step (sgl-nvidia-mega behind `--enable-nvidia-megakernel`, sgl-amd-mono behind
+  `--enable-amd-monokernel`) are split at the kernel/runtime boundary. Their
+  contracts (spec, registration, capability declarations, thin kernel wrappers)
+  live in `kernels/plugin_kernels/<hardware>/<model>/` (`KernelBackend.PLUGIN`)
+  and import nothing from `srt`. SGLang's integration (config checks, weight
+  observation, CUDA graph coverage, forward dispatch, the runtime binding) lives
+  in `srt/kernel_plugins/<hardware>/binding.py`. An op exposed from the contract side
+  registers in its logical group with a `KernelSpec` that points into it.
 - Keep shared build/runtime infrastructure (including the Helion runtime
   helper) in `kernels/jit`; operator wrappers call it from their logical group.
   Keep process groups, communicator state, workspace classes, model dispatch,

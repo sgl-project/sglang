@@ -601,11 +601,11 @@ class _SingleTransformerBlock(nn.Module):
         # lossless/high site: proj_mlp GEMM + tanh-GELU epilogue,
         # mounted per batch by the denoising stage; off (bit-exact) by default.
         FUSED_LINEAR_GELU.mark(self, "proj_mlp")
-        # proj_out: RowParallelLinear reduces sharded [attn | mlp] concat via
-        # all-reduce, matching Flux2SingleTransformerBlockAttention.to_out.
+        # each rank consumes independently sharded attention and MLP inputs
         self.proj_out = RowParallelLinear(
             dim + self.mlp_hidden_dim,
             dim,
+            input_sizes=[num_attention_heads * attention_head_dim, self.mlp_hidden_dim],
             bias=True,
             input_is_parallel=True,
             prefix=f"{prefix}.proj_out",
@@ -618,37 +618,6 @@ class _SingleTransformerBlock(nn.Module):
             eps=1e-6,
             prefix=f"{prefix}.attn",
         )
-        tp_size = get_tp_world_size()
-        if tp_size > 1:
-            self._patch_proj_out_weight_loader(
-                inner_dim=num_attention_heads * attention_head_dim,
-                mlp_dim=self.mlp_hidden_dim,
-                tp_size=tp_size,
-            )
-
-    def _patch_proj_out_weight_loader(
-        self, inner_dim: int, mlp_dim: int, tp_size: int
-    ) -> None:
-        # proj_out input is [attn_shard | mlp_shard] where the two shards come
-        # from non-contiguous column ranges in the checkpoint weight matrix.
-        # Default RowParallelLinear.weight_loader slices contiguously, which is
-        # wrong here; override it to pick the correct columns per rank.
-        proj_out = self.proj_out
-        tp_rank = proj_out.tp_rank
-
-        def _loader(param, loaded_weight):
-            input_dim = getattr(param, "input_dim", None)
-            if input_dim is not None:
-                a = inner_dim // tp_size
-                m = mlp_dim // tp_size
-                attn_cols = loaded_weight.narrow(input_dim, tp_rank * a, a)
-                mlp_cols = loaded_weight.narrow(input_dim, inner_dim + tp_rank * m, m)
-                param.data.copy_(torch.cat([attn_cols, mlp_cols], dim=input_dim))
-            else:
-                param.data.copy_(loaded_weight)
-
-        proj_out.weight_loader = _loader
-        proj_out.weight.weight_loader = _loader
 
     def forward(
         self,

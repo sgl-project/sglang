@@ -13,8 +13,10 @@ from sglang.kernels.ops.diffusion import (
     FUSED_LINEAR_GELU,
     NVFP4_BIAS_GELU,
     BitExactFusionGate,
+    can_use_fused_rmsnorm_interleaved_rope,
     can_use_linear_gelu,
     fused_linear_gelu_tanh,
+    fused_rmsnorm_interleaved_rope_,
     fused_temb_table_slices,
     tensors_equal,
 )
@@ -551,6 +553,13 @@ class WanTransformerBlock(nn.Module):
         assert cross_attn_norm is True
         self.qk_norm = qk_norm
         self.tp_rmsnorm = qk_norm == "rms_norm_across_heads" and tp_size > 1
+        # the across-heads q/k RMSNorm runs FlashInfer's kernel, which the RoPE can join
+        self.fuse_qk_norm_rope = (
+            qk_norm == "rms_norm_across_heads"
+            and not self.tp_rmsnorm
+            and not self.norm_q.cast_x_before_out_mul
+            and self.norm_q._forward_method == self.norm_q.forward_cuda
+        )
         self.self_attn_residual_norm = ScaleResidualLayerNormScaleShift(
             dim,
             eps=eps,
@@ -605,25 +614,61 @@ class WanTransformerBlock(nn.Module):
     def _qkv(
         self, norm_hidden_states: torch.Tensor, local_heads: int
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self._qkv_rope(norm_hidden_states, local_heads, None)[:3]
+
+    def _qkv_rope(
+        self,
+        norm_hidden_states: torch.Tensor,
+        local_heads: int,
+        rope_cos_sin_cache: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]:
+        """q, k, v as [B, S, heads, head_dim], and whether q and k already carry the
+        RoPE of rope_cos_sin_cache (applied in the q/k norm pass)"""
         query, _ = self.to_q(norm_hidden_states)
         key, _ = self.to_k(norm_hidden_states)
         value, _ = self.to_v(norm_hidden_states)
-        if self.norm_q is not None:
-            query = (
-                tensor_parallel_rms_norm(query, self.norm_q)
-                if self.tp_rmsnorm
-                else self.norm_q(query)
+        qk_norms = ((query, self.norm_q), (key, self.norm_k))
+        roped = (
+            rope_cos_sin_cache is not None
+            and self.fuse_qk_norm_rope
+            and not torch.compiler.is_compiling()
+            and all(
+                can_use_fused_rmsnorm_interleaved_rope(
+                    x.view(-1, x.shape[-1]),
+                    norm.weight,
+                    rope_cos_sin_cache,
+                    self.dim_head,
+                )
+                for x, norm in qk_norms
             )
-        if self.norm_k is not None:
-            key = (
-                tensor_parallel_rms_norm(key, self.norm_k)
-                if self.tp_rmsnorm
-                else self.norm_k(key)
-            )
-        return tuple(
+        )
+        if roped:
+            for x, norm in qk_norms:
+                fused_rmsnorm_interleaved_rope_(
+                    x.view(-1, x.shape[-1]),
+                    norm.weight,
+                    rope_cos_sin_cache,
+                    norm.variance_epsilon,
+                    self.dim_head,
+                )
+        else:
+            if self.norm_q is not None:
+                query = (
+                    tensor_parallel_rms_norm(query, self.norm_q)
+                    if self.tp_rmsnorm
+                    else self.norm_q(query)
+                )
+            if self.norm_k is not None:
+                key = (
+                    tensor_parallel_rms_norm(key, self.norm_k)
+                    if self.tp_rmsnorm
+                    else self.norm_k(key)
+                )
+        query, key, value = (
             tensor.squeeze(1).unflatten(2, (local_heads, self.dim_head))
             for tensor in (query, key, value)
         )
+        return query, key, value, roped
 
     def _cross_and_ffn(
         self,
@@ -695,11 +740,15 @@ class WanTransformerBlock(nn.Module):
 
         # 1. Self-attention
         norm_hidden_states = self.norm1(hidden_states, shift_msa, scale_msa)
-        query, key, value = self._qkv(norm_hidden_states, self.local_num_heads)
+        query, key, value, roped = self._qkv_rope(
+            norm_hidden_states, self.local_num_heads, rope_cos_sin_cache
+        )
 
         # Apply rotary embeddings
         cos, sin = freqs_cis
-        if _is_cuda and query.shape == key.shape:
+        if roped:
+            pass
+        elif _is_cuda and query.shape == key.shape:
             # The concatenated cache only depends on freqs_cis, which is fixed
             # for the whole forward; the transformer builds it once per call.
             cos_sin_cache = rope_cos_sin_cache
@@ -1319,6 +1368,9 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             if self.enable_teacache:
                 original_hidden_states = hidden_states.clone()
 
+            # cast once for every block's fp32 add (the TI2V table stays bf16)
+            if timestep_proj.dim() == 3:
+                timestep_proj = timestep_proj.float()
             rope_cos_sin_cache = None
             if _is_cuda and freqs_cis is not None:
                 cos, sin = freqs_cis

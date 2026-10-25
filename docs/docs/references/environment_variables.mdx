@@ -949,6 +949,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Synchronize sampled token ids across tensor-parallel ranks.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>With <code>--enable-kv-cache-sharding</code>, register the prefix gather scratch of single-node shard groups as an NCCL symmetric window so NCCL 2.31.2+ runs the all-gather on copy engines (zero SMs). Older NCCL versions keep the SM-kernel all-gather. On single-node deployments this also makes the server set <code>NCCL_CUMEM_ENABLE=1</code> for every NCCL communicator unless it is already set, except under <code>--enable-memory-saver</code> or <code>SGLANG_MOONCAKE_CUSTOM_MEM_POOL</code>; see <code>--enable-kv-cache-sharding</code> for the full conditions. Set to <code>false</code> to keep the SM-kernel all-gather and the default <code>NCCL_CUMEM_ENABLE=0</code>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
+    </tr>
   </tbody>
 </table>
 

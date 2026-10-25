@@ -1,7 +1,7 @@
 //! OpenAI endpoints served through SGLang's native `/generate`, matching the
 //! Python server's OpenAI layer (`python/sglang/srt/entrypoints/openai/`).
 //!
-//! A host lowers the OpenAI body into a `/generate` body, sends it, and feeds
+//! A host lowers the OpenAI body into a typed `/generate` request, sends it, and feeds
 //! the engine's response back to the returned responder. Requests whose
 //! behavior is not reproduced here come back as [`Unsupported`], and the host
 //! sends them to the engine's own OpenAI route.
@@ -18,6 +18,7 @@ use serde::Deserialize;
 pub use chat::{ChatModel, ChatResponder, ReasoningToggle, lower_chat};
 pub use completions::{CompletionResponder, lower_completion};
 pub use pieces::TokenPieces;
+pub use sglang_api_types::api::v1::GenerateRequest;
 pub use wire::Reply;
 
 /// Builds the OpenAI response of a lowered request from the engine's `/generate` output.

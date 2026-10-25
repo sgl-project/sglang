@@ -20,7 +20,7 @@ use serde::de::IgnoredAny;
 use serde::Deserialize;
 use serde_json::{json, Number, Value};
 use sglang_processor::openai::{
-    lower_chat, lower_completion, OpenAiHeaders, OpenAiSettings, Responder,
+    lower_chat, lower_completion, GenerateRequest, OpenAiHeaders, OpenAiSettings, Responder,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -180,7 +180,13 @@ impl PreparedRequest {
             .collect();
         let with_defaults = append_fields(&body, &defaults).unwrap_or_else(|| body.clone());
         let lowered = if lower {
-            lower_openai(ctx, path, &model, headers, &with_defaults)
+            lower_openai(ctx, path, &model, headers, &with_defaults).and_then(
+                |(generate, responder)| {
+                    let generate =
+                        serde_json::to_value(generate).map_err(|_| "generate_serialization")?;
+                    Ok((generate, responder))
+                },
+            )
         } else {
             Err("native_grpc")
         };
@@ -626,7 +632,7 @@ fn lower_openai(
     model: &ModelId,
     headers: &HeaderMap,
     body: &[u8],
-) -> Result<(Value, Responder), &'static str> {
+) -> Result<(GenerateRequest, Responder), &'static str> {
     let settings = model_openai_settings(ctx, model).ok_or("engine_settings_unknown")?;
     let headers = OpenAiHeaders {
         // The router owns DP ranks; a client's header is never forwarded.

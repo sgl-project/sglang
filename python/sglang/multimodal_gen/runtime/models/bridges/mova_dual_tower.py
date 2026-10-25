@@ -84,6 +84,23 @@ def compute_rope_cos_sin(
     return cos, sin
 
 
+def rope_cos_sin_cache(freqs: Tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+    """FlashInfer cos_sin_cache [seqlen, head_dim] of compute_rope_cos_sin's (cos, sin).
+
+    The cos/sin are in the activation dtype; compute_rope_cos_sin duplicates the
+    frequencies (cat((freqs, freqs))), so each half takes the first head_dim // 2
+    """
+    cos, sin = freqs
+    half_dim = cos.shape[-1] // 2
+    return torch.cat(
+        [
+            cos.squeeze(0)[:, :half_dim].to(dtype=torch.float32).contiguous(),
+            sin.squeeze(0)[:, :half_dim].to(dtype=torch.float32).contiguous(),
+        ],
+        dim=-1,
+    )
+
+
 class PerFrameAttentionPooling(nn.Module):
     """Per-frame multi-head attention pooling.
 
@@ -231,9 +248,10 @@ class ConditionalCrossAttention(nn.Module):
         self,
         x: torch.Tensor,
         y: torch.Tensor,
-        x_freqs: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        y_freqs: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        x_freqs: Optional[torch.Tensor] = None,
+        y_freqs: Optional[torch.Tensor] = None,
     ):
+        """x_freqs / y_freqs: rope_cos_sin_cache tables of the query / key sequence"""
         ctx = y
         q, _ = self.q(x)
         k, _ = self.k(ctx)
@@ -248,46 +266,16 @@ class ConditionalCrossAttention(nn.Module):
             k = self.norm_k(k)
 
         if x_freqs is not None:
-            x_cos, x_sin = x_freqs
             q_view = rearrange(q, "b l (h d) -> b l h d", d=self.head_dim)
-            x_cos = x_cos.to(q_view.dtype).to(q_view.device).squeeze(0)
-            x_sin = x_sin.to(q_view.dtype).to(q_view.device).squeeze(0)
-            # FlashInfer expects cos_sin_cache with shape [seqlen, head_dim],
-            # where the first half is cos and the second half is sin, each with
-            # head_dim//2 elements. Since compute_rope_cos_sin duplicates the
-            # frequencies (cat((freqs, freqs))), we only take the first half.
-            half_dim = self.head_dim // 2
-            cos_sin_cache = torch.cat(
-                [
-                    x_cos[:, :half_dim].to(dtype=torch.float32).contiguous(),
-                    x_sin[:, :half_dim].to(dtype=torch.float32).contiguous(),
-                ],
-                dim=-1,
-            )
             q_view, _ = apply_flashinfer_rope_qk_inplace(
-                q_view, q_view.clone(), cos_sin_cache, is_neox=True
+                q_view, q_view.clone(), x_freqs, is_neox=True
             )
             q = rearrange(q_view, "b l h d -> b l (h d)")
 
         if y_freqs is not None:
-            y_cos, y_sin = y_freqs
             k_view = rearrange(k, "b l (h d) -> b l h d", d=self.head_dim)
-            y_cos = y_cos.to(k_view.dtype).to(k_view.device).squeeze(0)
-            y_sin = y_sin.to(k_view.dtype).to(k_view.device).squeeze(0)
-            # FlashInfer expects cos_sin_cache with shape [seqlen, head_dim],
-            # where the first half is cos and the second half is sin, each with
-            # head_dim//2 elements. Since compute_rope_cos_sin duplicates the
-            # frequencies (cat((freqs, freqs))), we only take the first half.
-            half_dim = self.head_dim // 2
-            cos_sin_cache = torch.cat(
-                [
-                    y_cos[:, :half_dim].to(dtype=torch.float32).contiguous(),
-                    y_sin[:, :half_dim].to(dtype=torch.float32).contiguous(),
-                ],
-                dim=-1,
-            )
             k_view, _ = apply_flashinfer_rope_qk_inplace(
-                k_view, k_view.clone(), cos_sin_cache, is_neox=True
+                k_view, k_view.clone(), y_freqs, is_neox=True
             )
             k = rearrange(k_view, "b l h d -> b l (h d)")
 
@@ -380,8 +368,8 @@ class ConditionalCrossAttentionBlock(nn.Module):
         self,
         x: torch.Tensor,
         y: torch.Tensor,
-        x_freqs: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        y_freqs: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        x_freqs: Optional[torch.Tensor] = None,
+        y_freqs: Optional[torch.Tensor] = None,
         video_grid_size: Optional[Tuple[int, int, int]] = None,
     ) -> torch.Tensor:
         if self.pooled_adaln:
@@ -590,8 +578,8 @@ class DualTowerConditionalBridge(
         direction: str,
         primary_hidden_states: torch.Tensor,
         condition_hidden_states: torch.Tensor,
-        x_freqs: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        y_freqs: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        x_freqs: Optional[torch.Tensor] = None,
+        y_freqs: Optional[torch.Tensor] = None,
         condition_scale: Optional[float] = None,
         video_grid_size: Optional[Tuple[int, int, int]] = None,
     ) -> torch.Tensor:
@@ -636,8 +624,8 @@ class DualTowerConditionalBridge(
         visual_hidden_states: torch.Tensor,
         audio_hidden_states: torch.Tensor,
         *,
-        x_freqs: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        y_freqs: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        x_freqs: Optional[torch.Tensor] = None,
+        y_freqs: Optional[torch.Tensor] = None,
         a2v_condition_scale: Optional[float] = None,
         v2a_condition_scale: Optional[float] = None,
         condition_scale: Optional[float] = None,

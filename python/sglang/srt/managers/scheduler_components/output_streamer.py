@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
@@ -38,6 +39,7 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.weight_versions import compute_weight_version_spans
 
 if TYPE_CHECKING:
+    from sglang.srt.observability.req_time_stats import SchedulerReqTimeStats
     from sglang.srt.rust_server.server import RustServer
 
 
@@ -45,6 +47,20 @@ logger = logging.getLogger(__name__)
 
 
 DEFAULT_FORCE_STREAM_INTERVAL = envs.SGLANG_FORCE_STREAM_INTERVAL.get()
+
+
+def _scheduler_decode_latency(time_stats: SchedulerReqTimeStats) -> Optional[float]:
+    """A finished non-streaming request's decode latency as Python's
+    TokenizerManager measures it: from the scheduler's prefill-finished stamp
+    (`_get_scheduler_first_token_time`, which has the stamp only when metrics
+    are on) to now, its terminal output (`get_decode_latency`). None where it
+    falls back to its own first-output time, which the Rust frontend
+    measures the same way."""
+    stamp = time_stats.prefill_finished_time
+    now = time.perf_counter()
+    if time_stats.enable_metrics and 0.0 < stamp <= now:
+        return now - stamp
+    return None
 
 
 @dataclass(kw_only=True, slots=True)
@@ -214,7 +230,7 @@ class SchedulerOutputStreamer:
         )
         if payload is not None:
             if self.rust_server is not None:
-                self.rust_server.push_generation(payload)
+                self.rust_server.push_generation(payload, acc.decode_latencies)
             else:
                 self.send_to_detokenizer.send_output(payload)
 
@@ -390,6 +406,9 @@ class _GenerationStreamAccumulator:
     # output tokens itself and never consumes the scheduler's incremental-detok
     # offsets (decode_ids / read_offset), so that per-step bookkeeping is skipped.
     rust_server_mode: bool = False
+    # Rust server mode: by row, the decode latency of a finished non-streaming
+    # request, whose first token the Rust frontend does not see.
+    decode_latencies: dict = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.return_hidden_states:
@@ -527,6 +546,10 @@ class _GenerationStreamAccumulator:
                     num_output_tokens=len(output_ids_),
                 )
             )
+            if self.rust_server_mode and not req.stream:
+                latency = _scheduler_decode_latency(req.time_stats)
+                if latency is not None:
+                    self.decode_latencies[len(self.rids) - 1] = latency
         else:
             self.weight_versions.append(None)
 

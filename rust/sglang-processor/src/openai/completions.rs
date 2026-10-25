@@ -5,10 +5,15 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
+use sglang_api_types::api::v1::{
+    GenerateRequest, ImagesConfig, Int64List, SamplingParams, SamplingParamsOrList, TokenIds,
+    TokenIdsList, TokenIdsOrList, WatermarkRequestConfig, sampling_params_or_list,
+    token_ids_or_list,
+};
 
 use super::request::{
-    OneOrList, ResponseFormat, StreamOptions, custom_labels, default_model, float_logit_bias,
-    format_json_schema, lora_path, one, usage_flags, yes,
+    OneOrList, ResponseFormat, StreamOptions, custom_labels, default_model, format_json_schema,
+    lora_path, one, usage_flags, yes,
 };
 use super::wire::{
     Payload, Reply, StreamState, http_status_name, malformed_output_reply, meta_u64, now,
@@ -29,7 +34,7 @@ struct CompletionRequest {
     echo: bool,
     #[serde(default)]
     frequency_penalty: f64,
-    logit_bias: Option<Map<String, Value>>,
+    logit_bias: Option<HashMap<String, f64>>,
     logprobs: Option<i64>,
     #[serde(default = "default_max_tokens")]
     max_tokens: i64,
@@ -74,7 +79,7 @@ struct CompletionRequest {
     ebnf: Option<String>,
     #[serde(default = "one_f64")]
     repetition_penalty: f64,
-    stop_token_ids: Option<Vec<i64>>,
+    stop_token_ids: Option<Int64List>,
     stop_regex: Option<OneOrList<String>>,
     #[serde(default)]
     no_stop_trim: bool,
@@ -89,8 +94,8 @@ struct CompletionRequest {
     response_format: Option<ResponseFormat>,
     custom_params: Option<Map<String, Value>>,
     custom_logit_processor: Option<String>,
-    watermark: Option<Map<String, Value>>,
-    images_config: Option<Map<String, Value>>,
+    watermark: Option<WatermarkRequestConfig>,
+    images_config: Option<ImagesConfig>,
     data_parallel_rank: Option<i64>,
     rid: Option<OneOrList<String>>,
     extra_key: Option<OneOrList<String>>,
@@ -134,18 +139,13 @@ pub fn lower_completion(
     headers: &OpenAiHeaders<'_>,
     settings: &OpenAiSettings,
     tokenizer: Option<Arc<dyn OpenAiTokenizer>>,
-) -> Result<(Value, CompletionResponder), Unsupported> {
+) -> Result<(GenerateRequest, CompletionResponder), Unsupported> {
     let mut request: CompletionRequest =
         serde_json::from_slice(body).map_err(|_| Unsupported("unparsed_request"))?;
     if settings.completion_template.is_some() {
         return Err(Unsupported("completion_template"));
     }
-    let numeric_bias = request
-        .logit_bias
-        .as_ref()
-        .is_none_or(|bias| bias.values().all(Value::is_number));
-    if request.max_tokens <= 0 || request.n < 1 || !numeric_bias || prompt_is_empty(&request.prompt)
-    {
+    if request.max_tokens <= 0 || request.n < 1 || prompt_is_empty(&request.prompt) {
         return Err(Unsupported("invalid_request"));
     }
     if request.return_hidden_states != false
@@ -155,7 +155,7 @@ pub fn lower_completion(
     {
         return Err(Unsupported("sglext_output"));
     }
-    custom_labels(headers, settings)?;
+    let labels = custom_labels(headers, settings)?;
     if (request.echo || request.logprobs.is_some()) && tokenizer.is_none() {
         return Err(Unsupported("no_tokenizer"));
     }
@@ -171,7 +171,8 @@ pub fn lower_completion(
     } else {
         Vec::new()
     };
-    let lowered = generate_body(&request, headers, settings);
+    let mut lowered = generate_body(&request, headers);
+    lowered.custom_labels = labels;
     let (include_usage, continuous_usage_stats) =
         usage_flags(request.stream_options.as_ref(), settings);
     let responder = CompletionResponder {
@@ -192,75 +193,94 @@ pub fn lower_completion(
     Ok((lowered, responder))
 }
 
-fn generate_body(
-    request: &CompletionRequest,
-    headers: &OpenAiHeaders<'_>,
-    settings: &OpenAiSettings,
-) -> Value {
-    let logit_bias = float_logit_bias(&request.logit_bias);
-    let sampling = json!({
-        "temperature": request.temperature,
-        "max_new_tokens": request.max_tokens,
-        "min_new_tokens": request.min_tokens,
-        "stop": request.stop,
-        "stop_token_ids": request.stop_token_ids,
-        "stop_regex": request.stop_regex,
-        "top_p": request.top_p,
-        "top_k": request.top_k,
-        "min_p": request.min_p,
-        "presence_penalty": request.presence_penalty,
-        "frequency_penalty": request.frequency_penalty,
-        "repetition_penalty": request.repetition_penalty,
-        "regex": request.regex,
-        "json_schema": request.json_schema,
-        "ebnf": request.ebnf,
-        "n": request.n,
-        "no_stop_trim": request.no_stop_trim,
-        "ignore_eos": request.ignore_eos,
-        "skip_special_tokens": request.skip_special_tokens,
-        "logit_bias": logit_bias,
-        "custom_params": request.custom_params,
-        "sampling_seed": request.seed,
-        "watermark": request.watermark,
-    });
-    let (prompt_key, prompt) = match &request.prompt {
-        Prompt::Text(text) => ("text", json!(text)),
-        Prompt::TextBatch(texts) => ("text", json!(texts)),
-        Prompt::Ids(ids) => ("input_ids", json!(ids)),
-        Prompt::IdBatch(ids) => ("input_ids", json!(ids)),
+fn generate_body(request: &CompletionRequest, headers: &OpenAiHeaders<'_>) -> GenerateRequest {
+    let sampling = SamplingParams {
+        temperature: Some(request.temperature),
+        max_new_tokens: Some(request.max_tokens),
+        min_new_tokens: Some(request.min_tokens),
+        stop: request.stop.clone().map(Into::into),
+        stop_token_ids: request.stop_token_ids.clone(),
+        stop_regex: request.stop_regex.clone().map(Into::into),
+        top_p: Some(request.top_p),
+        top_k: Some(request.top_k),
+        min_p: Some(request.min_p),
+        presence_penalty: Some(request.presence_penalty),
+        frequency_penalty: Some(request.frequency_penalty),
+        repetition_penalty: Some(request.repetition_penalty),
+        regex: request.regex.clone(),
+        json_schema: request.json_schema.clone(),
+        ebnf: request.ebnf.clone(),
+        n: Some(request.n),
+        no_stop_trim: Some(request.no_stop_trim),
+        ignore_eos: Some(request.ignore_eos),
+        skip_special_tokens: Some(request.skip_special_tokens),
+        logit_bias: request.logit_bias.clone().unwrap_or_default(),
+        custom_params: request
+            .custom_params
+            .as_ref()
+            .map(|v| serde_json::to_string(v).expect("JSON object")),
+        sampling_seed: request.seed,
+        watermark: request.watermark.clone(),
+        ..Default::default()
     };
-    let lora_path = lora_path(&request.model, &request.lora_path);
-    let mut body = Map::new();
-    body.insert(prompt_key.into(), prompt);
-    let fields = json!({
-        "sampling_params": sampling,
-        "return_logprob": request.logprobs.is_some(),
-        "top_logprobs_num": request.logprobs.unwrap_or(0),
-        "logprob_start_len": if request.echo && request.logprobs.is_some_and(|n| n != 0) { 0 } else { -1 },
-        "return_text_in_logprobs": true,
-        "stream": request.stream,
-        "lora_path": lora_path,
-        "bootstrap_host": request.bootstrap_host,
-        "bootstrap_port": request.bootstrap_port,
-        "bootstrap_room": request.bootstrap_room,
-        "routed_dp_rank": request.routed_dp_rank,
-        "disagg_prefill_dp_rank": request.disagg_prefill_dp_rank,
-        "return_hidden_states": false,
-        "return_routed_experts": false,
-        "routed_experts_start_len": request.routed_experts_start_len,
-        "return_prompt_token_ids": request.return_token_ids,
-        "rid": request.rid,
-        "session_id": request.session_id,
-        "extra_key": request.extra_key,
-        "cache_salt": request.cache_salt,
-        "priority": request.priority,
-        "routing_key": headers.routing_key,
-        "custom_labels": custom_labels(headers, settings).unwrap_or_default(),
-        "custom_logit_processor": request.custom_logit_processor,
-        "images_config": request.images_config,
-    });
-    body.extend(fields.as_object().expect("object literal").clone());
-    Value::Object(body)
+    let logprob_start_len = if request.echo && request.logprobs.is_some_and(|n| n != 0) {
+        0
+    } else {
+        -1
+    };
+    GenerateRequest {
+        sampling_params: Some(SamplingParamsOrList {
+            value: Some(sampling_params_or_list::Value::One(sampling)),
+        }),
+        return_logprob: Some(OneOrList::One(request.logprobs.is_some()).into()),
+        logprob_start_len: Some(OneOrList::One(logprob_start_len).into()),
+        top_logprobs_num: Some(OneOrList::One(request.logprobs.unwrap_or(0)).into()),
+        stream: Some(request.stream),
+        return_text_in_logprobs: Some(true),
+        lora_path: lora_path(&request.model, &request.lora_path),
+        bootstrap_host: request.bootstrap_host.clone().map(Into::into),
+        bootstrap_port: request.bootstrap_port.clone().map(Into::into),
+        bootstrap_room: request.bootstrap_room.clone().map(Into::into),
+        routed_dp_rank: request.routed_dp_rank,
+        disagg_prefill_dp_rank: request.disagg_prefill_dp_rank,
+        rid: request.rid.clone().map(Into::into),
+        session_id: request.session_id.clone(),
+        extra_key: request.extra_key.clone().map(Into::into),
+        cache_salt: request.cache_salt.clone().map(Into::into),
+        priority: request.priority,
+        routing_key: headers.routing_key.map(str::to_owned),
+        custom_logit_processor: request
+            .custom_logit_processor
+            .clone()
+            .map(|value| OneOrList::One(value).into()),
+        images_config: request.images_config.clone(),
+        return_prompt_token_ids: request.return_token_ids,
+        routed_experts_start_len: request.routed_experts_start_len,
+        text: match &request.prompt {
+            Prompt::Text(v) => Some(OneOrList::One(v.clone()).into()),
+            Prompt::TextBatch(v) => Some(OneOrList::List(v.clone()).into()),
+            _ => None,
+        },
+        input_ids: match &request.prompt {
+            Prompt::Ids(v) => Some(TokenIdsOrList {
+                value: Some(token_ids_or_list::Value::One(TokenIds {
+                    ids: v.iter().copied().map(i64::from).collect(),
+                })),
+            }),
+            Prompt::IdBatch(v) => Some(TokenIdsOrList {
+                value: Some(token_ids_or_list::Value::Many(TokenIdsList {
+                    items: v
+                        .iter()
+                        .map(|v| TokenIds {
+                            ids: v.iter().copied().map(i64::from).collect(),
+                        })
+                        .collect(),
+                })),
+            }),
+            _ => None,
+        },
+        ..Default::default()
+    }
 }
 
 fn prompt_is_empty(prompt: &Prompt) -> bool {

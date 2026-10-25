@@ -861,7 +861,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         if defer_finalize:
             if shared_output is None:
                 raise RuntimeError("Qwen deferred finalize requires shared output")
-            from sglang.srt.layers.layer_boundary.fusions.cutedsl import (
+            from sglang.srt.layers.layer_boundary.fusions.moe_finalize import (
                 MoeDeferredFinalize,
             )
 

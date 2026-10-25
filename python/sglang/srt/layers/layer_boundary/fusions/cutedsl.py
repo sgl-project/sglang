@@ -10,20 +10,20 @@ from __future__ import annotations
 
 import logging
 from functools import partial
-from typing import Callable, Optional, Sequence
+from typing import Callable, Sequence
 
 import torch
 
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layer_boundary import (
-    DeferredFinalize,
     FfnInputFusion,
     SumGroup,
     TokenAxis,
     UnreducedOutput,
     get_attn_tp_context,
 )
-from sglang.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
+from sglang.srt.layers.layer_boundary.fusions.moe_finalize import MoeDeferredFinalize
+from sglang.srt.layers.layer_boundary.fusions.norm import fused_norm_gamma
 from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import (
@@ -37,15 +37,6 @@ from sglang.srt.runtime_context import (
 _LayerPredicate = Callable[[torch.nn.Module], bool]
 
 logger = logging.getLogger(__name__)
-
-
-def _fused_norm_gamma(layernorm: torch.nn.Module) -> Optional[torch.Tensor]:
-    """The multiplier as applied -- GemmaRMSNorm's pre-folded w + 1. None declines."""
-    if isinstance(layernorm, GemmaRMSNorm):
-        return layernorm.gemma_weight
-    if isinstance(layernorm, RMSNorm) and layernorm.has_weight:
-        return layernorm.weight
-    return None
 
 
 def _is_supported_forward_mode(forward_mode: ForwardMode) -> bool:
@@ -73,54 +64,6 @@ def _resolve_max_m(*, max_running_requests: int | None) -> int:
     if not positive:
         raise RuntimeError("framework reported no positive fusion workspace M bound")
     return max(positive)
-
-
-class MoeDeferredFinalize(DeferredFinalize, frozen=True):
-    """Unfinalized routed output plus the separately gated shared contribution.
-    The next layer's fused finalize + AR + add + norm takes it; ``finish`` is
-    the MoE's own unfused tail, for any other reader."""
-
-    routed_output: torch.Tensor
-    expert_weights: torch.Tensor
-    permuted_indices: torch.Tensor
-    gated_shared_output: torch.Tensor | None
-    m: int
-    finish: Callable[[], torch.Tensor]
-
-    def complete(self) -> torch.Tensor:
-        return self.finish()
-
-    @classmethod
-    def from_flashinfer(
-        cls,
-        deferred_output,
-        *,
-        gated_shared_output: torch.Tensor | None,
-        m: int,
-        reduce: Callable[[torch.Tensor], torch.Tensor],
-    ) -> MoeDeferredFinalize:
-        """``reduce`` is the MoE's own sum of its finalized output."""
-        from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
-            finalize_flashinfer_trtllm_deferred_output,
-        )
-
-        top_k = int(deferred_output.top_k)
-        return cls(
-            routed_output=deferred_output.gemm2_out.view(
-                -1, deferred_output.gemm2_out.shape[-1]
-            ),
-            expert_weights=deferred_output.expert_weights.view(-1, top_k)[:m],
-            permuted_indices=deferred_output.expanded_idx_to_permuted_idx.view(
-                -1, top_k
-            )[:m],
-            gated_shared_output=gated_shared_output,
-            m=int(m),
-            finish=lambda: reduce(
-                finalize_flashinfer_trtllm_deferred_output(
-                    deferred_output, gated_shared_output
-                )
-            ),
-        )
 
 
 class CuteDSLWorkspace:
@@ -157,7 +100,7 @@ class CuteDSLWorkspace:
             top_k=self.top_k,
             max_m=int(max_m),
             rms_epsilon=self.rms_epsilon,
-            # _fused_norm_gamma() already returns the multiplier as applied.
+            # fused_norm_gamma() already returns the multiplier as applied.
             weight_bias=0.0,
             include_shared_expert=self.include_shared_expert,
         )
@@ -240,7 +183,7 @@ class CuteDSLFusion:
             TokenAxis.ATTN_TP not in plan.incoming_residual_rows.sharded
             # The workspace sums over TP, which is then the attention-TP group.
             and parallel.attn_tp_size == parallel.tp_size
-            and _fused_norm_gamma(plan.norm) is not None
+            and fused_norm_gamma(plan.norm) is not None
         ):
             return (
                 FfnInputFusion(
@@ -261,7 +204,7 @@ class CuteDSLFusion:
         handoff is completed by its producer's own tail."""
         if not isinstance(owed, MoeDeferredFinalize):
             return None
-        gamma = _fused_norm_gamma(plan.norm)
+        gamma = fused_norm_gamma(plan.norm)
         if gamma is None or not self._finalize_eligible(plan, forward_batch, owed.m):
             return None
         if post_residual_addition is not None:
@@ -284,7 +227,7 @@ class CuteDSLFusion:
         return self.service.all_reduce_residual_rms_norm(
             local_contribution=owed.partial,
             residual=residual,
-            gamma=_fused_norm_gamma(plan.norm),
+            gamma=fused_norm_gamma(plan.norm),
         )
 
     def _ffn_input_all_reduce_add_norm(
@@ -302,7 +245,7 @@ class CuteDSLFusion:
         return self.service.all_reduce_residual_rms_norm(
             local_contribution=hidden_states,
             residual=residual,
-            gamma=_fused_norm_gamma(plan.norm),
+            gamma=fused_norm_gamma(plan.norm),
         )
 
     def _finalize_eligible(self, plan, forward_batch: ForwardBatch, m: int) -> bool:
@@ -314,7 +257,7 @@ class CuteDSLFusion:
         """Incoming, and independent of this layer's own successor."""
         return (
             self._eligible(plan, forward_batch, m)
-            and _fused_norm_gamma(plan.norm) is not None
+            and fused_norm_gamma(plan.norm) is not None
             and not get_exec().comm.enable_quant_communications
         )
 
@@ -394,7 +337,7 @@ def install_cutedsl_fusion(
             layer.attn_boundary.norm,
             layer.ffn_boundary.norm,
         ):
-            if _fused_norm_gamma(norm) is None:
+            if fused_norm_gamma(norm) is None:
                 continue
             if float(norm.variance_epsilon) != float(rms_epsilon):
                 raise RuntimeError(

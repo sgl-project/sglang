@@ -308,5 +308,34 @@ def test_rounded_silu_clamp_graph(dtype, limit):
     torch.testing.assert_close(actual, reference(), rtol=0, atol=0, equal_nan=True)
 
 
+def test_swiglu_oai_split_is_the_marlin_gpt_oss_activation() -> None:
+    """Marlin's GPT-OSS-style activation, gate * sigmoid(alpha * gate) * (up + 1)
+    with gate clamped above and up clamped both ways, runs through
+    swiglu_oai_split(beta=1). It must match that formula, be no less accurate than
+    the bf16 elementwise version it replaced, and write into the given buffer."""
+    from sglang.kernels.ops.activation.minimax_m3_swiglu import swiglu_oai_split
+
+    alpha, limit, inter = 1.702, 7.0, 2880
+    g = torch.Generator(device="cuda").manual_seed(0)
+    x = (torch.randn((257, 2 * inter), device="cuda", generator=g) * 4).to(
+        torch.bfloat16
+    )
+
+    def gpt_oss(t: torch.Tensor) -> torch.Tensor:
+        gate = t[:, :inter].clamp(max=limit)
+        up = t[:, inter:].clamp(min=-limit, max=limit)
+        return gate * torch.sigmoid(gate * alpha) * (up + 1)
+
+    reference = gpt_oss(x.float())
+    out = torch.empty((x.shape[0], inter), device="cuda", dtype=torch.bfloat16)
+    result = swiglu_oai_split(x, alpha, 1.0, limit, out=out)
+
+    assert result.data_ptr() == out.data_ptr()
+    fused_err = (out.float() - reference).abs().max()
+    bf16_err = (gpt_oss(x).float() - reference).abs().max()
+    assert fused_err <= bf16_err, (fused_err, bf16_err)
+    torch.testing.assert_close(out.float(), reference, rtol=1.6e-2, atol=1e-2)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))

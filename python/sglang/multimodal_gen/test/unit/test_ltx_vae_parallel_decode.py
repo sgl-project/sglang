@@ -31,6 +31,7 @@ class _DecodeGroup:
         self.world_size = WORLD_SIZE
         self.ranks = list(range(WORLD_SIZE))
         self.device_group = dist.group.WORLD
+        self.cpu_group = dist.group.WORLD
 
     def all_gather(self, x: torch.Tensor, dim: int) -> torch.Tensor:
         gathered = [torch.empty_like(x) for _ in range(self.world_size)]

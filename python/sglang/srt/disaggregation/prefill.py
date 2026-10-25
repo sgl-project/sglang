@@ -60,6 +60,7 @@ from sglang.srt.disaggregation.utils import (
     is_aborted,
     is_mla_backend,
     is_unadmitted_reject,
+    kv_layout_signature,
     poll_and_all_reduce_attn_cp_tp_group,
     poll_and_all_reduce_prefill_pp,
     prepare_abort,
@@ -238,8 +239,10 @@ class PrefillBootstrapQueue:
                     "supported by Mooncake."
                 )
         self.kv_manager = self._init_kv_manager()
+        self.kv_checksum_signature = 0
         if get_disagg().disaggregation_enable_kv_checksum:
             kv_args = self.kv_manager.kv_args
+            self.kv_checksum_signature = kv_layout_signature(kv_args)
             self.scheduler.kv_checksum_computer = KvChecksumComputer(
                 device=torch.device(f"cuda:{get_device().gpu_id}"),
                 kv_data_ptrs=kv_args.kv_data_ptrs,
@@ -1478,14 +1481,22 @@ class SchedulerDisaggregationPrefillMixin:
         computer: Optional[KvChecksumComputer] = self.kv_checksum_computer
         if last_chunk and computer is not None:
             if is_health_check_req(req):
-                value = 0
+                digest = signature = 0
             else:
                 if end_idx is None:
                     end_idx = min(req.extend_end, len(req.origin_input_ids))
-                page_indices_gpu = page_indices_for_request(self, req, end_idx)
-                state_indices = state_indices_for_request(self, req, end_idx)
-                value = computer.compute(page_indices_gpu, state_indices)
-            self.disagg_metadata_buffers.set_kv_checksum(req, value)
+                # Only the pages this prefill sends; decode digests the same
+                # range of its row, past the prefix it promised at bootstrap.
+                start_idx = req.disagg_decode_prefix_len
+                page_indices_gpu = page_indices_for_request(
+                    self, req, end_idx, start_idx=start_idx
+                )
+                state_indices = state_indices_for_request(
+                    self, req, end_idx, start_idx=start_idx
+                )
+                digest = computer.compute(page_indices_gpu, state_indices)
+                signature = self.disagg_prefill_bootstrap_queue.kv_checksum_signature
+            self.disagg_metadata_buffers.set_kv_checksum(req, digest, signature)
         self._send_kv_chunk(req, last_chunk=last_chunk, end_idx=end_idx)
 
     def _send_kv_chunk(

@@ -344,6 +344,10 @@ class DiffusionServer:
     def dispatcher(self) -> PoolDispatcher:
         return self._dispatcher
 
+    @property
+    def is_alive(self) -> bool:
+        return self._running and self._thread is not None and self._thread.is_alive()
+
     def start(self) -> None:
         if self._running:
             return
@@ -486,31 +490,40 @@ class DiffusionServer:
             self._handle_transfer_result(frames, role)
             return
 
+        # a bad result belongs to one request, not the whole routing loop
+        try:
+            tensor_fields, scalar_fields = unpack_tensors(frames, device="cpu")
+        except Exception as error:
+            logger.warning("DiffusionServer: invalid %s result: %s", role.value, error)
+            tensor_fields = {}
+            scalar_fields = {
+                "request_id": self._extract_request_id(frames),
+                "error": f"Invalid {role.value} result: {error}",
+            }
+        if (
+            not isinstance(scalar_fields, dict)
+            or not isinstance(scalar_fields.get("request_id"), str)
+            or not scalar_fields["request_id"]
+        ):
+            logger.warning("DiffusionServer: %s result without request_id", role.value)
+            return
+
         if self._glm_distributed_state is not None and role == RoleType.DENOISER:
-            self._handle_glm_denoiser_result_frames(frames)
+            self._handle_glm_denoiser_result(tensor_fields, scalar_fields)
         elif role == RoleType.DECODER:
-            self._handle_decoder_result_frames(frames)
+            self._handle_decoder_result(tensor_fields, scalar_fields)
         else:
             # Non-transfer frames from encoder/denoiser are error results
             # sent via send_tensors (e.g., _disagg_error).
-            self._handle_role_error_frames(frames, role)
+            self._handle_role_error(scalar_fields, role)
 
-    def _handle_role_error_frames(self, frames: list, role: RoleType) -> None:
+    def _handle_role_error(self, scalar_fields: dict, role: RoleType) -> None:
         """Handle non-transfer error results from encoder/denoiser roles."""
-        try:
-            tensor_fields, scalar_fields = unpack_tensors(frames, device="cpu")
-        except Exception as e:
-            logger.warning(
-                "DiffusionServer: failed to unpack non-transfer frames from %s: %s",
-                role.value,
-                e,
-            )
-            return
+        request_id = scalar_fields["request_id"]
+        disagg_error = scalar_fields.get("_disagg_error") or scalar_fields.get("error")
 
-        request_id = scalar_fields.get("request_id")
-        disagg_error = scalar_fields.get("_disagg_error")
-
-        if request_id and disagg_error:
+        if disagg_error:
+            self._recycle_prealloc_slot(self._transfer_state.get(request_id), role)
             logger.error(
                 "DiffusionServer: %s error for %s: %s",
                 role.value,
@@ -518,16 +531,11 @@ class DiffusionServer:
                 disagg_error,
             )
             self._complete_with_error(request_id, f"{role.value} error: {disagg_error}")
-        elif request_id:
+        else:
             logger.warning(
                 "DiffusionServer: non-transfer frames from %s for %s without error",
                 role.value,
                 request_id,
-            )
-        else:
-            logger.warning(
-                "DiffusionServer: non-transfer frames from %s without request_id",
-                role.value,
             )
 
     def _handle_client_request(self, frontend: zmq.Socket) -> None:
@@ -544,36 +552,36 @@ class DiffusionServer:
 
         try:
             reqs = pickle.loads(payload)
-        except (pickle.UnpicklingError, EOFError):
-            logger.warning("DiffusionServer: failed to deserialize request")
-            return
-
-        if not isinstance(reqs, list):
-            reqs = [reqs]
-
-        req = reqs[0]
-
-        if isinstance(req, dict) or not hasattr(req, "request_id"):
-            # Send empty reply so REQ socket doesn't hang
-            try:
+            if not isinstance(reqs, list):
+                reqs = [reqs]
+            if len(reqs) != 1:
+                raise ValueError("Disaggregated serving expects exactly one request")
+            req = reqs[0]
+            if not isinstance(req, Req):
+                # preserve the lightweight ping response
                 frontend.send_multipart(
                     [client_identity, b"", pickle.dumps({"status": "ignored"})],
                     zmq.NOBLOCK,
                 )
-            except zmq.Again:
-                pass
-            return
-
-        request_id = getattr(req, "request_id", None)
-        if request_id is None:
-            request_id = f"ds-{time.monotonic()}"
-
-        try:
-            self._tracker.submit(
-                request_id, is_warmup=isinstance(req, Req) and req.is_warmup
-            )
-        except ValueError:
-            logger.warning("DiffusionServer: duplicate request_id %s", request_id)
+                return
+            if req.request_id is None:
+                req.request_id = f"ds-{time.monotonic_ns()}"
+                payload = pickle.dumps(reqs)
+            request_id = req.request_id
+            if not isinstance(request_id, str) or not request_id:
+                raise ValueError("request_id must be a nonempty string")
+            self._tracker.submit(request_id, is_warmup=req.is_warmup)
+        except Exception as error:
+            logger.warning("DiffusionServer: rejected request: %s", error)
+            # reply to this client without completing a different request with
+            # the same ID or leaving a REQ socket waiting forever
+            try:
+                frontend.send_multipart(
+                    [client_identity, b"", pickle.dumps(OutputBatch(error=str(error)))],
+                    zmq.NOBLOCK,
+                )
+            except zmq.ZMQError:
+                logger.warning("DiffusionServer: failed to send request rejection")
             return
 
         with self._lock:
@@ -817,11 +825,12 @@ class DiffusionServer:
                 registered,
             )
 
-    def _handle_glm_denoiser_result_frames(self, frames: list) -> None:
+    def _handle_glm_denoiser_result(
+        self, tensor_fields: dict, scalar_fields: dict
+    ) -> None:
         """Return decoded denoiser output to the originating HTTP request."""
         state = self._glm_distributed_state
         assert state is not None
-        tensor_fields, scalar_fields = unpack_tensors(frames, device="cpu")
         denoiser_request_id = scalar_fields.get("request_id")
         request = state.denoiser_requests.pop(denoiser_request_id, None)
         if request is None:
@@ -834,6 +843,8 @@ class DiffusionServer:
 
         error = scalar_fields.get("error")
         output = tensor_fields.get("output")
+        if output is None and not error:
+            error = "GLM distributed denoiser returned no output"
         total = max(1, int(request.req.num_outputs_per_prompt or 1))
         output_size = len(output) if output is not None else None
         if output_size is not None and output_size != total:
@@ -871,19 +882,13 @@ class DiffusionServer:
             pass
         self._tracker.remove(request.client_request_id)
 
-    def _handle_decoder_result_frames(self, frames: list) -> None:
-        request_id = self._extract_request_id(frames)
-        if request_id is None:
-            logger.warning("DiffusionServer: decoder result missing request_id")
-            return
-
+    def _handle_decoder_result(self, tensor_fields: dict, scalar_fields: dict) -> None:
+        request_id = scalar_fields["request_id"]
         logger.debug("DiffusionServer: decoder result %s", request_id)
         self._release_assignment(request_id, RoleType.DECODER)
         self._assignments.pop(request_id, None)
         p2p = self._transfer_state.get(request_id)
         self._recycle_prealloc_slot(p2p, RoleType.DECODER)
-
-        tensor_fields, scalar_fields = unpack_tensors(frames, device="cpu")
 
         output_batch = OutputBatch(
             output=tensor_fields.get("output"),
@@ -891,6 +896,12 @@ class DiffusionServer:
             audio_sample_rate=scalar_fields.get("audio_sample_rate"),
             error=scalar_fields.get("error"),
         )
+        if (
+            output_batch.output is None
+            and output_batch.audio is None
+            and not output_batch.error
+        ):
+            output_batch.error = "Decoder returned no output"
 
         try:
             if output_batch.error:
@@ -986,9 +997,15 @@ class DiffusionServer:
     def _extract_request_id(self, frames: list) -> str | None:
         try:
             metadata = json.loads(frames[0])
-            return metadata.get("scalar_fields", {}).get("request_id")
-        except (json.JSONDecodeError, IndexError, TypeError):
+        except (ValueError, IndexError, TypeError):
             return None
+        if not isinstance(metadata, dict):
+            return None
+        scalar_fields = metadata.get("scalar_fields")
+        if not isinstance(scalar_fields, dict):
+            return None
+        request_id = scalar_fields.get("request_id")
+        return request_id if isinstance(request_id, str) and request_id else None
 
     def _complete_with_error(self, request_id: str, error_msg: str) -> None:
         logger.error("DiffusionServer: %s — %s", request_id, error_msg)

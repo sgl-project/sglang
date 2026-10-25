@@ -1129,6 +1129,10 @@ class MoriKVManager(CommonKVManager):
                 dst_item_lens, register_info.dst_dcp_size
             )
         self.engine.register_remote_engine(register_info.engine_desc)
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            self.check_peer_aux_buffer_count(
+                engine_key, len(register_info.dst_aux_mem_descs)
+            )
         self.decode_kv_args_table[engine_key] = register_info
         logger.debug(
             "Registered decode peer %s (%s:%s)",
@@ -1585,7 +1589,11 @@ class MoriKVManager(CommonKVManager):
         dst_aux_index: int,
         room: int,
     ) -> List[TransferStatus]:
-        for i in range(len(self.kv_args.aux_data_ptrs)):
+        # Stop at the shorter list; see check_peer_aux_buffer_count.
+        num_bufs = min(
+            len(self.kv_args.aux_data_ptrs), len(peer_info.dst_aux_mem_descs)
+        )
+        for i in range(num_bufs):
             length = self.kv_args.aux_item_lens[i]
             src_addr = self.kv_args.aux_data_ptrs[i] + length * prefill_aux_index
             data = AuxDataCodec.serialize_data_from_buffer(src_addr, length)

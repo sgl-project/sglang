@@ -97,6 +97,7 @@ def _make_model_runner(
 
     mr.use_mla_backend = use_mla_backend
     mr.is_draft_worker = False
+    mr.dflash_draft_cell_size_per_token = None
     mr.num_effective_layers = num_layers
     mr.start_layer = 0
     mr.end_layer = num_layers
@@ -1329,6 +1330,66 @@ class TestDflashDraftKvBudget(CustomTestCase):
             0,
         )
 
+    def test_pool_setup_prices_the_resolved_layout_and_handles_no_draft(self):
+        import torch
+
+        from sglang.srt.configs.draft_parallel import DraftParallelLayout
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+        from sglang.srt.model_executor.model_runner_components.spec_aux_hidden_state import (
+            SpecAuxHiddenStateConfig,
+        )
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        runner = _make_model_runner(self)
+        draft = SimpleNamespace(
+            dtype=torch.bfloat16,
+            head_dim=64,
+            v_head_dim=32,
+            get_num_kv_heads=lambda tp: 8 // tp,
+        )
+        aux = SpecAuxHiddenStateConfig(
+            draft_model_config=draft, dflash_draft_num_layers=2
+        )
+        layout = DraftParallelLayout(tp_group=None, attn_tp_size=2)
+        for algorithm, is_draft, metadata, expected in (
+            (SpeculativeAlgorithm.DFLASH, False, aux, 4 * (64 + 32) * 2 * 2),
+            (SpeculativeAlgorithm.DFLASH, True, SpecAuxHiddenStateConfig(), None),
+            (SpeculativeAlgorithm.NONE, False, SpecAuxHiddenStateConfig(), None),
+        ):
+            with (
+                self.subTest(algorithm=algorithm, is_draft=is_draft),
+                mock_cpu_env(tp_size=8),
+            ):
+                config = KVCacheConfigurator(
+                    device="cpu",
+                    gpu_id=0,
+                    attn_dp_size=1,
+                    pp_size=1,
+                    pp_group=runner.pp_group,
+                    model=None,
+                    model_config=runner.model_config,
+                    server_args=get_server_args(),
+                    kv_cache_dtype=torch.bfloat16,
+                    model_dtype=torch.bfloat16,
+                    page_size=1,
+                    sliding_window_size=None,
+                    spec_algorithm=algorithm,
+                    is_draft_worker=is_draft,
+                    post_capture_kv_active=False,
+                    spec_aux_config=metadata,
+                    draft_parallel_layout=layout,
+                    is_hybrid_swa=False,
+                    is_hybrid_swa_compress=False,
+                    use_mla_backend=False,
+                    layer_info=runner.layer_info,
+                    forward_stream=None,
+                    req_to_token_pool=None,
+                    token_to_kv_pool_allocator=None,
+                    memory_pool_config=None,
+                )
+                self.assertEqual(config.dflash_draft_cell_size_per_token, expected)
+                self.assertIs(config.draft_parallel_layout, layout)
+
     def test_dcp_replication_scales_draft_budget(self):
         """The replicated draft pool spans every DCP virtual location."""
         draft_kv_per_token = 10_240
@@ -1337,8 +1398,9 @@ class TestDflashDraftKvBudget(CustomTestCase):
         mr.spec_aux_config = SimpleNamespace(
             eagle_draft_num_layers=None,
             dflash_draft_num_layers=5,
-            dflash_draft_cell_size_per_token=draft_kv_per_token,
         )
+
+        mr.dflash_draft_cell_size_per_token = draft_kv_per_token
 
         target_kv_per_token = 4 * (64 + 64) * 32 * KV_SIZE
         for dcp_size in (1, 8):
@@ -1373,10 +1435,10 @@ class TestDflashDraftKvBudget(CustomTestCase):
                 swa_num_kv_heads=4,
             )
             mr.spec_algorithm.is_dflash_family.return_value = True
+            mr.dflash_draft_cell_size_per_token = draft_kv_per_token
             mr.spec_aux_config = SimpleNamespace(
                 eagle_draft_num_layers=None,
                 dflash_draft_num_layers=5,
-                dflash_draft_cell_size_per_token=draft_kv_per_token,
             )
             with mock_cpu_env():
                 from sglang.srt.model_executor.pool_configurator import (

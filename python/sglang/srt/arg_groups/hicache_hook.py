@@ -23,12 +23,30 @@ def handle_hicache(server_args: Any):
     2) Storage <-> layout compatibility (may rewrite layout).
     """
     cfg = resolving_view(server_args)
+    config = cfg.unified_cache_external_linker_config
+    if config is not None and not isinstance(config, dict):
+        raise ValueError(
+            "--unified-cache-external-linker-config must be a JSON object."
+        )
+    if cfg.unified_cache_external_linker_backend == "dynamic" and (
+        cfg.enable_unified_cache_external_linker or config is not None
+    ):
+        from sglang.srt.mem_cache.unified_cache.linker_config import (
+            UnifiedCacheLinkerConfig,
+        )
+
+        UnifiedCacheLinkerConfig.from_dict(config)
     if cfg.enable_linker_mla_dedup and (
         not cfg.enable_unified_cache_external_linker
         or cfg.unified_cache_external_linker_backend != "mooncake"
     ):
         raise ValueError("--enable-linker-mla-dedup requires the Mooncake linker.")
     if cfg.enable_unified_cache_external_linker:
+        if cfg.disable_radix_cache or cfg.radix_cache_backend is not None:
+            raise ValueError(
+                "--enable-unified-cache-external-linker requires the default "
+                "UnifiedRadixCache with radix caching enabled."
+            )
         if cfg.enable_hierarchical_cache:
             raise ValueError(
                 "--enable-unified-cache-external-linker and "

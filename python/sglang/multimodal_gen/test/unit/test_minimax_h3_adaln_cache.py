@@ -20,6 +20,7 @@ from sglang.multimodal_gen.runtime.models.dits.minimax_h3_adaln_cache import (
 from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import (
     ensure_distributed_env_defaults,
 )
+from sglang.multimodal_gen.test.unit.host_sync_guard import forbid_host_syncs
 
 _ARCH = MiniMaxH3DiTArchConfig(
     num_layers=2,
@@ -190,6 +191,28 @@ def test_sidecar_resolve_slots_and_block_all_match_per_step_paths(tmp_path):
 
     with pytest.raises(ValueError, match="does not cover"):
         cache.resolve_slots([torch.tensor([9.0])])
+
+
+def test_slot_gathers_never_read_the_slot_on_host(tmp_path):
+    cache = _online_cache(tmp_path, scale=1.0)
+    plans = [torch.tensor([1.0, 2.0]), torch.tensor([3.0, 4.0])]
+    cache.build(plans, embed=_embed)
+    slot = cache.resolve_slots(plans)[1]
+    with forbid_host_syncs():
+        stacked = cache.block_all(cache_plan_index=slot, num_timesteps=2)
+        final = cache.final(slot, 2)
+    expected = [
+        _reference_block(cache, index, int(slot), 2)
+        for index in range(_ARCH.num_layers)
+    ]
+    expected_final = cache.final_params[int(slot), :2].reshape(-1, 2, _ARCH.hidden_size)
+    torch.testing.assert_close(
+        (stacked, final),
+        (expected, expected_final.unbind(dim=1)),
+        rtol=0,
+        atol=0,
+        check_stride=True,
+    )
 
 
 def test_online_cache_resolve_slots_after_build(tmp_path):

@@ -68,6 +68,8 @@ pub struct RuntimeConfig {
     /// config-endpoint metadata). `Arc` so cloning the config (and, downstream,
     /// each `AppState`) is cheap; immutable after construction.
     pub server_args: Arc<ServerArgs>,
+    /// A model package's keys for native `/generate` frames.
+    pub generate_hook: Option<Arc<dyn crate::GenerateHook>>,
 }
 
 impl Default for RuntimeConfig {
@@ -75,6 +77,7 @@ impl Default for RuntimeConfig {
         Self {
             rust_server_args: RustServerServerArgs::default(),
             server_args: Arc::new(ServerArgs::default()),
+            generate_hook: None,
         }
     }
 }
@@ -480,16 +483,74 @@ impl<'py> pyo3::FromPyObject<'_, 'py> for DeploymentInfo {
 #[derive(Clone, Debug)]
 pub struct MetricsConfig {
     /// `PROMETHEUS_MULTIPROC_DIR`: every process's prometheus_client files,
-    /// which `/metrics` merges on each scrape.
+    /// which `/metrics` merges on each scrape. The frontend writes its own
+    /// request metrics there too.
     pub multiproc_dir: String,
+    /// The labels on every request metric (`tokenizer_metric_labels()`).
+    pub labels: BTreeMap<String, String>,
+    /// `--enable-priority-scheduling`: the `priority` label carries each
+    /// request's priority.
+    pub priority_label: bool,
+    /// Bucket overrides (`--bucket-*`, resolved `--*-tokens-buckets` rules);
+    /// `None` keeps Python's default buckets.
+    pub bucket_time_to_first_token: Option<Vec<f64>>,
+    pub bucket_inter_token_latency: Option<Vec<f64>>,
+    pub bucket_e2e_request_latency: Option<Vec<f64>>,
+    pub bucket_prompt_tokens: Option<Vec<f64>>,
+    pub bucket_generation_tokens: Option<Vec<f64>>,
 }
 
 #[pyo3::pymethods]
 impl MetricsConfig {
     #[new]
-    #[pyo3(signature = (*, multiproc_dir))]
-    fn py_new(multiproc_dir: String) -> Self {
-        Self { multiproc_dir }
+    #[pyo3(signature = (*,
+        multiproc_dir,
+        labels,
+        priority_label,
+        bucket_time_to_first_token,
+        bucket_inter_token_latency,
+        bucket_e2e_request_latency,
+        bucket_prompt_tokens,
+        bucket_generation_tokens,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn py_new(
+        multiproc_dir: String,
+        labels: BTreeMap<String, String>,
+        priority_label: bool,
+        bucket_time_to_first_token: Option<Vec<f64>>,
+        bucket_inter_token_latency: Option<Vec<f64>>,
+        bucket_e2e_request_latency: Option<Vec<f64>>,
+        bucket_prompt_tokens: Option<Vec<f64>>,
+        bucket_generation_tokens: Option<Vec<f64>>,
+    ) -> Self {
+        Self {
+            multiproc_dir,
+            labels,
+            priority_label,
+            bucket_time_to_first_token,
+            bucket_inter_token_latency,
+            bucket_e2e_request_latency,
+            bucket_prompt_tokens,
+            bucket_generation_tokens,
+        }
+    }
+}
+
+#[cfg(test)]
+impl MetricsConfig {
+    /// Default buckets, no labels, files under `dir`.
+    pub(crate) fn for_dir(dir: &std::path::Path) -> Self {
+        Self {
+            multiproc_dir: dir.to_string_lossy().into_owned(),
+            labels: BTreeMap::new(),
+            priority_label: false,
+            bucket_time_to_first_token: None,
+            bucket_inter_token_latency: None,
+            bucket_e2e_request_latency: None,
+            bucket_prompt_tokens: None,
+            bucket_generation_tokens: None,
+        }
     }
 }
 

@@ -686,38 +686,51 @@ class Ideogram4Transformer2DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         )
         self.rotary_emb.register_buffer("inv_freq", inv_freq, persistent=False)
 
+    def project_llm_features(
+        self, llm_features: torch.Tensor, indicator: torch.Tensor
+    ) -> torch.Tensor:
+        """Masked LLM conditioning added to every token; constant within a request."""
+        param_dtype = self.embed_image_indicator.weight.dtype
+        llm_token_mask = (
+            (indicator.to(torch.long) == LLM_TOKEN_INDICATOR)
+            .to(param_dtype)
+            .unsqueeze(-1)
+        )
+        llm_features = llm_features.to(param_dtype) * llm_token_mask
+        llm_features = self.llm_cond_proj(self.llm_cond_norm(llm_features))
+        return llm_features * llm_token_mask
+
     def forward(
         self,
         *,
-        llm_features: torch.Tensor,
         x: torch.Tensor,
         t: torch.Tensor,
         position_ids: torch.Tensor,
         segment_ids: torch.Tensor,
         indicator: torch.Tensor,
+        llm_features: torch.Tensor | None = None,
+        llm_cond: torch.Tensor | None = None,
         attn_mask: torch.Tensor | None = None,
         attn_mask_meta: dict | None = None,
         **kwargs,
     ) -> torch.Tensor:
+        # llm_cond: project_llm_features output, which callers may compute once
+        if llm_cond is None:
+            llm_cond = self.project_llm_features(llm_features, indicator)
         param_dtype = self.embed_image_indicator.weight.dtype
         x = x.to(param_dtype)
         t = t.to(param_dtype)
-        llm_features = llm_features.to(param_dtype)
         indicator = indicator.to(torch.long)
-        llm_token_mask = (indicator == LLM_TOKEN_INDICATOR).to(x.dtype).unsqueeze(-1)
         output_image_mask = (
             (indicator == OUTPUT_IMAGE_INDICATOR).to(x.dtype).unsqueeze(-1)
         )
-        llm_features = llm_features * llm_token_mask
         x = x * output_image_mask
         x = self.input_proj(x) * output_image_mask
         t_cond = self.t_embedding(t)
         if t.dim() == 1:
             t_cond = t_cond.unsqueeze(1)
         adaln_input = F.silu(self.adaln_proj(t_cond))
-        llm_features = self.llm_cond_proj(self.llm_cond_norm(llm_features))
-        llm_features = llm_features * llm_token_mask
-        h = x + llm_features
+        h = x + llm_cond
         h = h + self.embed_image_indicator(
             (indicator == OUTPUT_IMAGE_INDICATOR).to(torch.long)
         )

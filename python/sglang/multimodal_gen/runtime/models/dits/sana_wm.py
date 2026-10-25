@@ -474,6 +474,8 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         self._plucker_emb_cache: Optional[Tuple[Tuple, torch.Tensor, torch.Tensor]] = (
             None
         )
+        # forward_long's chunk-windowed (freqs, camera, plucker) and their sources
+        self._chunk_inputs_cache: Optional[Tuple[Tuple, Tuple, Tuple]] = None
 
         # FSDP shard targets
         self.layer_names = ["blocks"]
@@ -789,37 +791,51 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         if encoder_attention_mask is not None and encoder_attention_mask.shape[0] != B:
             encoder_attention_mask = encoder_attention_mask.expand(B, -1).contiguous()
 
-        # RoPE windowed to global frame positions [start, end)
-        freqs = self._get_freqs_window(
-            start, end, H, W, x.device, frame_index=frame_index
+        # window once per chunk so the RoPE, UCPE and plucker caches hit every step
+        sources = (frame_index, camera_conditions, chunk_plucker)
+        chunk_key = (start, end, T, H, W, B, x.device) + tuple(
+            None if source is None else _tensor_cache_key(source) for source in sources
         )
-
-        # Camera conditioning: slice to the chunk, co-windowed w/ freqs
-        prope_fns = None
-        if camera_conditions is not None:
-            if camera_conditions.shape[1] != T:
-                # .contiguous(): canonical layout regardless of how the caller
-                # built the full-length tensor, so batch and realtime windows are
-                # kernel-level identical (slice offset/stride changes the reduction
-                # order otherwise — measured 1e-7 seeds amplifying to %-level drift
-                # through the bf16 block stack).
-                camera_conditions = camera_conditions[:, start:end].contiguous()
-            if camera_conditions.shape[0] != B:
-                camera_conditions = camera_conditions.repeat(
-                    B // camera_conditions.shape[0], 1, 1
+        cached = None if torch.is_grad_enabled() else self._chunk_inputs_cache
+        if cached is not None and cached[0] == chunk_key:
+            freqs, camera_conditions, chunk_plucker = cached[2]
+        else:
+            # RoPE windowed to global frame positions [start, end)
+            freqs = self._get_freqs_window(
+                start, end, H, W, x.device, frame_index=frame_index
+            )
+            # Camera conditioning: slice to the chunk, co-windowed w/ freqs
+            if camera_conditions is not None:
+                if camera_conditions.shape[1] != T:
+                    # .contiguous(): canonical layout regardless of how the caller
+                    # built the full-length tensor, so batch and realtime windows are
+                    # kernel-level identical (slice offset/stride changes the
+                    # reduction order otherwise — measured 1e-7 seeds amplifying to
+                    # %-level drift through the bf16 block stack).
+                    camera_conditions = camera_conditions[:, start:end].contiguous()
+                if camera_conditions.shape[0] != B:
+                    camera_conditions = camera_conditions.repeat(
+                        B // camera_conditions.shape[0], 1, 1
+                    )
+            # Plücker post-attn / input embedding, sliced to the chunk.
+            if chunk_plucker is not None and chunk_plucker.shape[2] != T:
+                chunk_plucker = chunk_plucker[
+                    :, :, start:end
+                ].contiguous()  # see camera note
+            if chunk_plucker is not None and chunk_plucker.shape[0] != B:
+                chunk_plucker = chunk_plucker.repeat(
+                    B // chunk_plucker.shape[0], 1, 1, 1, 1
                 )
-            prope_fns = self._get_ucpe_apply_fns(
-                camera_conditions, HW=(T, H, W), freqs=freqs
+            self._chunk_inputs_cache = (
+                chunk_key,
+                sources,
+                (freqs, camera_conditions, chunk_plucker),
             )
 
-        # Plücker post-attn / input embedding, sliced to the chunk.
-        if chunk_plucker is not None and chunk_plucker.shape[2] != T:
-            chunk_plucker = chunk_plucker[
-                :, :, start:end
-            ].contiguous()  # see camera note
-        if chunk_plucker is not None and chunk_plucker.shape[0] != B:
-            chunk_plucker = chunk_plucker.repeat(
-                B // chunk_plucker.shape[0], 1, 1, 1, 1
+        prope_fns = None
+        if camera_conditions is not None:
+            prope_fns = self._get_ucpe_apply_fns(
+                camera_conditions, HW=(T, H, W), freqs=freqs
             )
         plucker_emb = None
         needs_plucker_emb = (

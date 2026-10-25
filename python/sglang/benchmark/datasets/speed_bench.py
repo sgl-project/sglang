@@ -74,6 +74,7 @@ class SpeedBenchDataset(BaseDataset):
                     [{"role": "user", "content": prompt_text}],
                     add_generation_prompt=True,
                     tokenize=True,
+                    return_dict=False,
                 )
                 prompt = tokenizer.decode(prompt_ids)
             except Exception:

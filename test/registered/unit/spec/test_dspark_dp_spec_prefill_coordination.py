@@ -83,7 +83,7 @@ class TestDSparkDPSpecPrefillCoordination(CustomTestCase):
                 )
                 events = []
                 worker = object.__new__(DSparkWorkerV2)
-                worker._draft_dp_context_enabled = local_draft
+                worker.draft_parallel_layout = SimpleNamespace(local_dp=local_draft)
                 worker._draft_context = nullcontext
                 worker._verify_planner = MagicMock()
                 worker._observers = MagicMock()

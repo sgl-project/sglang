@@ -944,6 +944,11 @@ class Scheduler(
             )
             if think_end_ids:
                 self.model_config.think_end_ids = think_end_ids
+                self.model_config.self_opened_think_start_ids = (
+                    reasoning_parser.detector.get_self_opened_think_start_token_ids(
+                        self.tokenizer
+                    )
+                )
             else:
                 logger.warning(
                     "Reasoning parser think_end_token %r could not be encoded; "
@@ -1078,7 +1083,13 @@ class Scheduler(
         if self.draft_worker is not None:
             preloaded_weights_bytes += self.draft_worker.preloaded_weights_bytes
         self.tp_worker.model_runner.account_preloaded_weights(preloaded_weights_bytes)
-        self.tp_worker.alloc_memory_pool()
+        self.tp_worker.alloc_memory_pool(
+            draft_parallel_layout=(
+                self.draft_worker.draft_parallel_layout
+                if self.draft_worker is not None
+                else None
+            )
+        )
 
     def init_memory_pools(self):
         """Allocate KV cache pools for target and draft workers."""

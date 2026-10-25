@@ -12,6 +12,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
     MarkovGreedyStep,
 )
 from sglang.kernels.ops.speculative.dspark.markov_sample import MarkovSampleStep
+from sglang.srt.configs.draft_parallel import DraftParallelSpec, DraftTPExecution
 from sglang.srt.environ import envs
 from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -22,6 +23,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     enable_num_token_non_padded,
 )
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+from sglang.srt.speculative.draft_parallel import resolve_draft_parallel_layout
 from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
 from sglang.srt.speculative.dspark_components.dspark_planner import VerifyWindow
 from sglang.srt.speculative.spec_info import (
@@ -359,6 +361,16 @@ class DraftBlockProposer:
         )
         self._draft_sampler = None
         self._dp_moe_sync = dp_moe_sync
+        # A local logits subphase, separate from the MoE model's global layout.
+        self._base_logits_layout = resolve_draft_parallel_layout(
+            DraftParallelSpec(
+                tp_execution=(
+                    DraftTPExecution.SINGLE_GROUP
+                    if dp_moe_sync
+                    else DraftTPExecution.TARGET_LAYOUT
+                )
+            )
+        )
         # SGLANG_DSPARK_DEFER_CONTEXT_KV's staged commit, set by the worker.
         self.deferred_commit = None
         # Persistent (bs, gamma) mask-token buffer: only column 0 (the bonus
@@ -411,7 +423,7 @@ class DraftBlockProposer:
         self._staged_params_key = key
 
     def _base_logits_context(self):
-        return draft_tp_context(self._dp_moe_sync)
+        return draft_tp_context(self._base_logits_layout)
 
     def propose(
         self,

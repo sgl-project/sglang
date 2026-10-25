@@ -18,6 +18,7 @@ import logging
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
 
 from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_context, get_exec
 from sglang.srt.sampling.watermarking.core import (
     WATERMARK_CONTAINER_FIELD_NAMES,
     WATERMARK_SECRET_FIELD_NAMES,
@@ -242,9 +243,25 @@ class RequestLogger:
             target.info(msg)
 
 
+def _watermark_redaction_enabled() -> bool:
+    # Standalone formatting keeps redaction when no server config is published.
+    return (
+        not get_context().is_config_namespace_published("exec")
+        or get_exec().features.enable_watermark
+    )
+
+
+def _maybe_redact_watermark_secrets(data: Any) -> Any:
+    if not _watermark_redaction_enabled():
+        return data
+    return redact_watermark_secrets(data)
+
+
 def _redact_field(name: str, value: Any) -> Any:
     # Redact by name instead of walking the whole object: requests carry
     # ~100k-entry token-id lists, and the recursive walk costs tens of ms.
+    if not _watermark_redaction_enabled():
+        return value
     if name in WATERMARK_SECRET_FIELD_NAMES:
         return "<redacted>"
     if name in WATERMARK_CONTAINER_FIELD_NAMES:
@@ -268,12 +285,12 @@ def _dataclass_to_string_truncated(
         if len(data) > max_length:
             half_length = max_length // 2
             return (
-                str(redact_watermark_secrets(data[:half_length]))
+                str(_maybe_redact_watermark_secrets(data[:half_length]))
                 + " ... "
-                + str(redact_watermark_secrets(data[-half_length:]))
+                + str(_maybe_redact_watermark_secrets(data[-half_length:]))
             )
         else:
-            return str(redact_watermark_secrets(data))
+            return str(_maybe_redact_watermark_secrets(data))
     elif isinstance(data, dict):
         parts = []
         for k, v in data.items():
@@ -293,7 +310,7 @@ def _dataclass_to_string_truncated(
             )
         return f"{data.__class__.__name__}(" + ", ".join(parts) + ")"
     else:
-        return str(redact_watermark_secrets(data))
+        return str(_maybe_redact_watermark_secrets(data))
 
 
 def _transform_data_for_logging(
@@ -335,4 +352,4 @@ def _transform_data_for_logging(
     elif isinstance(data, (int, float, bool, type(None))):
         return data
     else:
-        return str(redact_watermark_secrets(data))
+        return str(_maybe_redact_watermark_secrets(data))

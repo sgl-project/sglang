@@ -980,13 +980,11 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
         self.norm_q = RMSNorm(dim_head, eps=eps)
         self.norm_k = RMSNorm(dim_head, eps=eps)
 
-        # Fused attention output + MLP output projection.
-        # Input is [attn_shard | mlp_shard] (independently sharded by
-        # MergedColumnParallelLinear), so patch weight loader to pick the
-        # correct non-contiguous columns per rank.
+        # each rank consumes independently sharded attention and MLP inputs
         self.to_out = RowParallelLinear(
             self.inner_dim + self.mlp_hidden_dim,
             self.out_dim,
+            input_sizes=[self.inner_dim, self.mlp_hidden_dim],
             bias=out_bias,
             input_is_parallel=True,
             quant_config=quant_config,
@@ -1004,8 +1002,6 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
             and isinstance(self.to_out.quant_method, ModelOptFp4LinearMethod)
         ):
             self._enable_nvfp4_token_cat = True
-        if self.tp_size > 1:
-            self._patch_to_out_weight_loader()
 
         self.attn = USPAttention(
             num_heads=self.local_heads,
@@ -1037,27 +1033,6 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
                 getattr(self.to_out, "quant_method", None), ModelOptFp4LinearMethod
             )
         )
-
-    def _patch_to_out_weight_loader(self) -> None:
-        inner_dim, mlp_dim = self.inner_dim, self.mlp_hidden_dim
-        tp_size, tp_rank = self.tp_size, self.to_out.tp_rank
-
-        def _loader(param, loaded_weight):
-            input_dim = getattr(param, "input_dim", None)
-            if input_dim is not None:
-                a = inner_dim // tp_size
-                m = mlp_dim // tp_size
-                attn_cols = loaded_weight.narrow(input_dim, tp_rank * a, a)
-                mlp_cols = loaded_weight.narrow(input_dim, inner_dim + tp_rank * m, m)
-                param.data.copy_(torch.cat([attn_cols, mlp_cols], dim=input_dim))
-            else:
-                param.data.copy_(loaded_weight)
-
-        self.to_out.weight_loader = _loader
-        if hasattr(self.to_out.weight, "_weight_loader"):
-            self.to_out.weight._weight_loader = _loader
-        else:
-            self.to_out.weight.weight_loader = _loader
 
     def forward(
         self,

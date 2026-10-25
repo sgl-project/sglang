@@ -21,6 +21,7 @@ register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 class TestDecodeHiCacheTreeCore(CustomTestCase):
     def test_stale_prefetch_anchor_degrades_to_l2(self):
         tree_cache = SimpleNamespace(
+            tree_core=SimpleNamespace(is_eagle=False),
             hicache_storage_pass_prefix_keys=True,
             ongoing_prefetch={},
             get_last_hash_value=Mock(side_effect=KeyError(22)),
@@ -53,6 +54,7 @@ class TestDecodeHiCacheTreeCore(CustomTestCase):
     def test_restored_indices_read_off_the_restored_path(self):
         restored_path = torch.tensor([10, 11, 12, 13, 14])
         tree_cache = SimpleNamespace(
+            tree_core=SimpleNamespace(is_eagle=False),
             init_load_back=Mock(return_value=(2, "restored")),
             path_device_indices=Mock(return_value=restored_path),
             lock=Mock(return_value="restore-lock"),

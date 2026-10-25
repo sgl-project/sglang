@@ -438,6 +438,10 @@ class LTX2AudioVideoRotaryPosEmbed(nn.Module):
                 f"Modality {modality} is not supported. Supported modalities are `video` and `audio`."
             )
         self.double_precision = bool(double_precision)
+        # device -> prepare_video_coords' constant tensors, uploaded once
+        self._video_coord_constants: dict[
+            torch.device, tuple[torch.Tensor, torch.Tensor]
+        ] = {}
 
     def prepare_video_coords(
         self,
@@ -474,17 +478,19 @@ class LTX2AudioVideoRotaryPosEmbed(nn.Module):
         grid = torch.meshgrid(grid_f, grid_h, grid_w, indexing="ij")
         grid = torch.stack(grid, dim=0)
 
-        patch_size = (self.patch_size_t, self.patch_size, self.patch_size)
-        patch_size_delta = torch.tensor(
-            patch_size, dtype=grid.dtype, device=grid.device
-        )
+        if grid.device not in self._video_coord_constants:
+            patch_size = (self.patch_size_t, self.patch_size, self.patch_size)
+            self._video_coord_constants[grid.device] = (
+                torch.tensor(patch_size, dtype=grid.dtype, device=grid.device),
+                torch.tensor(self.scale_factors, device=grid.device),
+            )
+        patch_size_delta, scale_tensor = self._video_coord_constants[grid.device]
         patch_ends = grid + patch_size_delta.view(3, 1, 1, 1)
 
         latent_coords = torch.stack([grid, patch_ends], dim=-1)
         latent_coords = latent_coords.flatten(1, 3)
         latent_coords = latent_coords.unsqueeze(0).repeat(batch_size, 1, 1, 1)
 
-        scale_tensor = torch.tensor(self.scale_factors, device=latent_coords.device)
         broadcast_shape = [1] * latent_coords.ndim
         broadcast_shape[1] = -1
         pixel_coords = latent_coords * scale_tensor.view(*broadcast_shape)

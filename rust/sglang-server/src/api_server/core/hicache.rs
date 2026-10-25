@@ -162,6 +162,7 @@ mod tests {
                 is_disaggregation: false,
                 mm_limits: Default::default(),
                 metadata: CoreMetadata::default(),
+                metrics: None,
             },
         );
         let manager = Arc::new(HiCacheManager::new(core, &ServerArgs::default()));

@@ -87,7 +87,7 @@ export const AgentX = ({ data }) => {
   // KV-offload tiers: "none" | "hicache" | "mooncake" (external linker). A derived tier strips
   // the measured tier from the cache-owning workers and adds the target tier's settings
   // (cell.kv.hicache / data.kvMooncake), mirroring the generator's kv.py.
-  const LINKER_FLAGS = ["--enable-unified-cache-external-linker", "--unified-cache-external-linker-backend", "--hicache-storage-backend-extra-config"];
+  const LINKER_FLAGS = ["--enable-unified-cache-external-linker", "--unified-cache-external-linker-backend", "--unified-cache-external-linker-config"];
   const STORE_ONLY_ENV = ["MOONCAKE_MASTER", "MOONCAKE_TE_META_DATA_SERVER", "MOONCAKE_GLOBAL_SEGMENT_SIZE", "MOONCAKE_STANDALONE_STORAGE"];
   const CACHE_ROLES = ["agg", "prefill"];
   const isKvFlag = (n) => n === "--enable-hierarchical-cache" || n.startsWith("--hicache-") || LINKER_FLAGS.includes(n);

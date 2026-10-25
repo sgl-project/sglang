@@ -97,11 +97,11 @@ class Krea2PipelineConfig(ImagePipelineConfig):
             return {"pos": torch.cat([txt_pos, img_pos], dim=1), "mask": None}
 
         pos = torch.cat([txt_pos, img_pos], dim=1)
+        # decided once per request: a mask check in every forward syncs each step
+        if text_mask is None or bool(text_mask.all()):
+            return {"pos": pos, "mask": None}
         img_mask = torch.ones(b, h_tok * w_tok, dtype=torch.bool, device=device)
-        if text_mask is None:
-            txt_mask = torch.ones(b, txt_len, dtype=torch.bool, device=device)
-        else:
-            txt_mask = text_mask.to(device=device).bool()
+        txt_mask = text_mask.to(device=device).bool()
         mask = torch.cat([txt_mask, img_mask], dim=1)
         return {"pos": pos, "mask": mask}
 

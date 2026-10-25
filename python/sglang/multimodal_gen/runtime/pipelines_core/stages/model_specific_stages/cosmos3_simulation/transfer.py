@@ -191,7 +191,7 @@ def read_video_fps(path: str) -> float | None:
 
 def load_control_frames(path: str, *, max_frames: int) -> torch.Tensor:
     """First ``max_frames`` frames of the control clip as ``uint8 [3, T, H, W]``."""
-    frames = load_video(path)
+    frames = load_video(path, max_frames=max_frames)
     if not frames:
         raise ValueError(f"No frames decoded from control video {path!r}.")
     arrays = [

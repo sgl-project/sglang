@@ -124,7 +124,7 @@ export const agentx = {
   },
   "args": [
    ["--enable-unified-cache-external-linker"],
-   ["--hicache-storage-backend-extra-config", "{\"enable_group_semantics\":true}"],
+   ["--unified-cache-external-linker-config", "{\"enable_group_semantics\":true}"],
    ["--unified-cache-external-linker-backend", "mooncake"]
   ],
   "env": {

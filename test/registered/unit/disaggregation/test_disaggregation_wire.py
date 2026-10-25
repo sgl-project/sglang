@@ -358,6 +358,7 @@ class TestDisaggregationWire(unittest.TestCase):
             state_data_ptrs=[[0x1000]],
             state_item_lens=[[32]],
             state_layer_ids=[[]],
+            aux_data_ptrs=[],
         )
         manager.is_mla_backend = True
         manager.is_hybrid_mla_backend = False
@@ -380,6 +381,7 @@ class TestDisaggregationWire(unittest.TestCase):
                 dst_state_data_ptrs=[[0x2000]],
                 dst_state_item_lens=[[dst_item_len]],
                 dst_state_layer_ids=[[]],
+                dst_aux_ptrs=[],
             )
             with get_context().override_server_args(enable_unified_memory=False):
                 return info, manager._publish_peer_registration("decode", info)

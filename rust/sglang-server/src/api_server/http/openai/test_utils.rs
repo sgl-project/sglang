@@ -35,6 +35,7 @@ pub(super) fn core_handle() -> CoreHandle {
             is_disaggregation: false,
             mm_limits: Default::default(),
             metadata: crate::api_server::core::CoreMetadata::from(server_args().as_ref()),
+            metrics: None,
         },
     )
 }
@@ -112,6 +113,7 @@ pub(super) fn app_state(core: CoreHandle) -> Arc<super::AppState> {
         generation_policy: crate::message::request::GenerationPolicy::from(server_args.as_ref()),
         server_args,
         chat_formatter: None,
+        generate_hook: None,
     })
 }
 
@@ -132,6 +134,7 @@ pub(super) fn frontend_closed() -> CoreHandle {
             is_disaggregation: false,
             mm_limits: Default::default(),
             metadata: crate::api_server::core::CoreMetadata::from(server_args().as_ref()),
+            metrics: None,
         },
     )
 }
@@ -157,6 +160,7 @@ fn answering_app_state() -> Arc<super::AppState> {
             is_disaggregation: false,
             mm_limits: Default::default(),
             metadata: crate::api_server::core::CoreMetadata::from(server_args().as_ref()),
+            metrics: None,
         },
     );
     let server_args = server_args();
@@ -169,6 +173,7 @@ fn answering_app_state() -> Arc<super::AppState> {
                 spec: super::template::builtin_template("chatml").unwrap(),
             },
         ))),
+        generate_hook: None,
     })
 }
 

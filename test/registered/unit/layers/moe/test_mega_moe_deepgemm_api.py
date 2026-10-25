@@ -143,6 +143,28 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
         self.assertIsNot(buffers[0], buffers[2])
         self.assertEqual(deep_gemm.get_symm_buffer_for_mega_moe.call_count, 2)
 
+    def test_buffer_cache_separates_activation_contracts(self):
+        self.deep_gemm.get_symm_buffer_for_mega_moe = MagicMock(
+            side_effect=lambda *args, **kw: object()
+        )
+        group = object()
+        with patch.dict(sys.modules, {"deep_gemm": self.deep_gemm}):
+            buffers = [
+                mega_moe._get_mega_moe_symm_buffer(
+                    group,
+                    num_experts=8,
+                    num_max_tokens_per_rank=64,
+                    num_topk=2,
+                    hidden=128,
+                    intermediate_hidden=256,
+                    mma_type="nvfp4xnvfp4",
+                    activation=activation,
+                )
+                for activation in ("swiglu", "swigluoai", "swiglu")
+            ]
+        self.assertIs(buffers[0], buffers[2])
+        self.assertIsNot(buffers[0], buffers[1])
+
     def test_buffer_allocation_without_sm_override(self):
         deep_gemm = self.deep_gemm
         self.max_num_sms.return_value = None

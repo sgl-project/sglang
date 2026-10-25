@@ -210,6 +210,12 @@ class PromptTokensDetails(BaseModel):
         return data
 
 
+class CompletionTokensDetails(BaseModel):
+    """Details about completion tokens."""
+
+    reasoning_tokens: int = 0
+
+
 class UsageInfo(BaseModel):
     prompt_tokens: int = 0
     total_tokens: int = 0
@@ -217,6 +223,8 @@ class UsageInfo(BaseModel):
     # Used to return cached tokens info when --enable-cache-report is set
     prompt_tokens_details: Optional[PromptTokensDetails] = None
     reasoning_tokens: Optional[int] = 0
+    # The OpenAI location of reasoning_tokens; set only when there are some.
+    completion_tokens_details: Optional[CompletionTokensDetails] = None
 
 
 class StreamOptions(BaseModel):
@@ -598,6 +606,11 @@ class ChatCompletionMessageContentImageURL(BaseModel):
     min_dynamic_patch: Optional[int] = None
     content_hash: Optional[str] = None
 
+    @field_validator("detail", mode="before")
+    @classmethod
+    def _default_detail_is_auto(cls, value: Any) -> Any:
+        return "auto" if value == "default" else value
+
     @field_validator("content_hash")
     @classmethod
     def validate_content_hash(cls, value: Optional[str]) -> Optional[str]:
@@ -729,7 +742,7 @@ class ToolCall(BaseModel):
 
 
 _GenericMessageRole = Literal[
-    "system", "assistant", "tool", "function", "developer", "latest_reminder"
+    "system", "assistant", "tool", "function", "developer", "latest_reminder", "root"
 ]
 _GENERIC_MESSAGE_ROLES: Tuple[str, ...] = get_args(_GenericMessageRole)
 
@@ -796,14 +809,31 @@ class Function(BaseModel):
     description: Optional[str] = Field(default=None, examples=[None])
     name: str
     parameters: Optional[object] = None
-    strict: bool = False
+    strict: Optional[bool] = None
     defer_loading: Optional[bool] = None
+    key_order: List[str] = Field(default_factory=list, exclude=True)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _capture_key_order(cls, data):
+        if isinstance(data, dict):
+            data = dict(data)
+            data["key_order"] = list(data.keys())
+        return data
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
+        # Chat templates render the tool schema as given; do not inject fields
+        # the client left out or reorder the ones it sent.
         data = handler(self)
         if self.defer_loading is None:
             data.pop("defer_loading", None)
+        if self.strict is None:
+            data.pop("strict", None)
+        order = self.key_order
+        if order:
+            rest = [k for k in data if k not in order]
+            data = {k: data[k] for k in order + rest if k in data}
         return data
 
 
@@ -866,7 +896,7 @@ def _has_message_level_tools(messages: Any) -> bool:
     return any(
         isinstance(message, dict)
         and isinstance(message.get("role"), str)
-        and message["role"].lower() in ("system", "developer")
+        and message["role"].lower() in ("root", "system", "developer")
         and bool(message.get("tools"))
         for message in messages
     )
@@ -946,6 +976,11 @@ class ChatCompletionRequest(PDRoutingFields):
         "'max' is an sglang extension to the OpenAI schema for "
         "models that expose a maximum-effort tier above 'high'; models that don't "
         "support it treat it the same as 'high'.",
+    )
+    thinking: Optional[Any] = Field(
+        default=None,
+        description="Thinking config such as {'type': 'adaptive'}; read only by "
+        "models whose chat template defines a thinking mode, ignored otherwise.",
     )
     task: Optional[
         Literal["action", "query", "authority", "domain", "title", "read_url"]

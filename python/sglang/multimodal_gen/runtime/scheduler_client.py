@@ -1,3 +1,4 @@
+import asyncio
 import itertools
 import pickle
 import time
@@ -28,6 +29,7 @@ from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
     UpdateWeightFromTensorReqInput,
 )
 from sglang.multimodal_gen.runtime.ipc_array import (
+    array_ipc_request,
     is_local_endpoint,
     materialize_file_refs,
 )
@@ -91,32 +93,21 @@ async def run_zeromq_broker(server_args: ServerArgs):
     ctx = zmq.asyncio.Context()
     socket = ctx.socket(zmq.REP)
     broker_endpoint = f"tcp://127.0.0.1:{server_args.broker_port}"
-    socket.bind(broker_endpoint)
-    logger.info(f"ZMQ Broker is listening for offline jobs on {broker_endpoint}")
-
     try:
+        socket.bind(broker_endpoint)
+        logger.info(f"ZMQ Broker is listening for offline jobs on {broker_endpoint}")
         while True:
+            # transport failures must stop the broker so readiness can reject work
+            payload = await socket.recv()
             try:
-                # 1. Receive a request from an offline client
-                payload = await socket.recv()
                 request_batch = pickle.loads(payload)
                 logger.debug("Broker received an offline job from a client.")
-
-                # 2. Forward the request to the main Scheduler via the shared client
                 response_batch = await async_scheduler_client.forward(request_batch)
-
-                # 3. Send the Scheduler's reply back to the offline client
-                await socket.send(pickle.dumps(response_batch))
-
+                response = pickle.dumps(response_batch)
             except Exception as e:
-                logger.error(f"Error in ZMQ Broker: {e}", exc_info=True)
-                # A reply must be sent to prevent the client from hanging
-                try:
-                    await socket.send(
-                        pickle.dumps({"status": "error", "message": str(e)})
-                    )
-                except Exception:
-                    pass
+                logger.exception("Error in ZMQ Broker request: %s", e)
+                response = pickle.dumps({"status": "error", "message": str(e)})
+            await socket.send(response)
     finally:
         socket.close(linger=0)
         ctx.destroy(linger=0)
@@ -181,12 +172,15 @@ class SchedulerClient:
             socket.setsockopt(zmq.LINGER, 0)
             effective_timeout = _resolve_timeout_ms(self.server_args, timeout_ms)
             _configure_recv_timeout(socket, effective_timeout)
-            socket.connect(endpoint)
-            socket.send_pyobj(_prepare_local_payload(endpoint, batch))
-            output_batch = socket.recv_pyobj()
-            _materialize_output_batch_file_refs(output_batch)
-            _materialize_local_cuda_refs(endpoint, output_batch)
-            return output_batch
+            with array_ipc_request(endpoint) as identity:
+                if identity is not None:
+                    socket.setsockopt(zmq.IDENTITY, identity)
+                socket.connect(endpoint)
+                socket.send_pyobj(_prepare_local_payload(endpoint, batch))
+                output_batch = socket.recv_pyobj()
+                _materialize_output_batch_file_refs(output_batch)
+                _materialize_local_cuda_refs(endpoint, output_batch)
+                return output_batch
         except zmq.error.Again:
             logger.error("Timeout waiting for response from %s.", endpoint)
             raise TimeoutError("Scheduler did not respond in time.")
@@ -248,6 +242,8 @@ class AsyncSchedulerClient:
         self.server_args = None
         self.request_logger: Optional[DiffusionRequestLogger] = None
         self._replica_counter = itertools.count()
+        self.failure_reason: str | None = None
+        self._pending_requests: set[asyncio.Task] = set()
 
     def initialize(self, server_args: ServerArgs):
         if self.context is not None and not self.context.closed:
@@ -259,7 +255,15 @@ class AsyncSchedulerClient:
         self.server_args = server_args
         self.request_logger = DiffusionRequestLogger.from_server_args(server_args)
         self.context = zmq.asyncio.Context()
+        self.failure_reason = None
         logger.debug("AsyncSchedulerClient initialized with zmq.asyncio.Context")
+
+    def mark_failed(self, reason: str) -> None:
+        """Stop admitting work and wake callers even without an RPC deadline."""
+        if self.failure_reason is None:
+            self.failure_reason = reason
+            for task in self._pending_requests:
+                task.cancel()
 
     async def forward(self, batch: Any, timeout_ms: int | None = None) -> Any:
         """Sends a batch or request to the scheduler and waits for the response."""
@@ -287,24 +291,36 @@ class AsyncSchedulerClient:
     async def _forward_one(
         self, endpoint: str, batch: Any, timeout_ms: int | None
     ) -> Any:
+        if self.failure_reason is not None:
+            raise RuntimeError(self.failure_reason)
         # a temporary REQ socket per request keeps concurrent requests from
         # interleaving on one socket's strict send/recv alternation
         socket = self.context.socket(zmq.REQ)
+        task = asyncio.current_task()
+        self._pending_requests.add(task)
         try:
             socket.setsockopt(zmq.LINGER, 0)
             effective_timeout = _resolve_timeout_ms(self.server_args, timeout_ms)
             _configure_recv_timeout(socket, effective_timeout)
-            socket.connect(endpoint)
-            await socket.send(pickle.dumps(_prepare_local_payload(endpoint, batch)))
-            payload = await socket.recv()
-            output_batch = pickle.loads(payload)
-            _materialize_output_batch_file_refs(output_batch)
-            _materialize_local_cuda_refs(endpoint, output_batch)
-            return output_batch
+            with array_ipc_request(endpoint) as identity:
+                if identity is not None:
+                    socket.setsockopt(zmq.IDENTITY, identity)
+                socket.connect(endpoint)
+                await socket.send(pickle.dumps(_prepare_local_payload(endpoint, batch)))
+                payload = await socket.recv()
+                output_batch = pickle.loads(payload)
+                _materialize_output_batch_file_refs(output_batch)
+                _materialize_local_cuda_refs(endpoint, output_batch)
+                return output_batch
+        except asyncio.CancelledError:
+            if self.failure_reason is not None:
+                raise RuntimeError(self.failure_reason) from None
+            raise
         except zmq.error.Again:
             logger.error("Timeout waiting for response from %s.", endpoint)
             raise TimeoutError("Scheduler did not respond in time.")
         finally:
+            self._pending_requests.discard(task)
             socket.close()
 
     async def ping(self) -> bool:
