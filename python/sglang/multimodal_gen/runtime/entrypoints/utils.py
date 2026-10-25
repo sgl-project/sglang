@@ -9,13 +9,16 @@ diffusion models.
 """
 
 import atexit
+import io
 import json
 import mmap
 import os
 import queue
+import struct
 import subprocess
 import tempfile
 import threading
+import zlib
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -1192,15 +1195,30 @@ def save_materialized_output(
     save_file_path: Optional[str],
     *,
     save_output: bool = True,
+    return_image_bytes: bool = False,
     audio_sample_rate: Optional[int] = None,
     output_compression: Optional[int] = None,
     x264_preset: Optional[str] = None,
-) -> None:
+) -> bytes | None:
+    """save the output when save_output; return a single-frame image's encoded bytes
+
+    return_image_bytes encodes the image even when it is not saved; a saved file holds
+    the same bytes
+    """
+    image_bytes = None
+    if (
+        return_image_bytes
+        and data_type != DataType.VIDEO
+        and len(materialized.frames) == 1
+    ):
+        image_bytes = _encode_image_frame(
+            materialized.frames[0], save_file_path, output_compression
+        )
     if not save_output:
-        return
+        return image_bytes
     if not save_file_path:
         logger.info("No output path provided, output not saved")
-        return
+        return image_bytes
 
     os.makedirs(os.path.dirname(save_file_path), exist_ok=True)
     if data_type == DataType.VIDEO:
@@ -1230,53 +1248,91 @@ def save_materialized_output(
                 fps=materialized.fps,
                 audio_sample_rate=audio_sample_rate,
             )
+    elif len(materialized.frames) > 1:
+        for i, image in enumerate(materialized.frames):
+            parts = save_file_path.rsplit(".", 1)
+            if len(parts) == 2:
+                indexed_path = f"{parts[0]}_{i}.{parts[1]}"
+            else:
+                indexed_path = f"{save_file_path}_{i}"
+            with open(indexed_path, "wb") as f:
+                f.write(_encode_image_frame(image, indexed_path, output_compression))
     else:
-        quality = output_compression if output_compression is not None else 75
-        if len(materialized.frames) > 1:
-            for i, image in enumerate(materialized.frames):
-                parts = save_file_path.rsplit(".", 1)
-                if len(parts) == 2:
-                    indexed_path = f"{parts[0]}_{i}.{parts[1]}"
-                else:
-                    indexed_path = f"{save_file_path}_{i}"
-                _save_image_frame(indexed_path, image, quality, output_compression)
-        else:
-            _save_image_frame(
-                save_file_path, materialized.frames[0], quality, output_compression
+        if image_bytes is None:
+            image_bytes = _encode_image_frame(
+                materialized.frames[0], save_file_path, output_compression
             )
+        with open(save_file_path, "wb") as f:
+            f.write(image_bytes)
     logger.info(f"Output saved to {CYAN}{save_file_path}{RESET}")
+    return image_bytes
 
 
-def _save_image_frame(
-    path: str, frame: np.ndarray, quality: int | None, output_compression: int | None
-) -> None:
+# PNG color type by channel count: gray, gray + alpha, RGB, RGBA
+_PNG_COLOR_TYPES = {1: 0, 2: 4, 3: 2, 4: 6}
+
+
+def _png_chunk(tag: bytes, data) -> bytes:
+    crc = zlib.crc32(data, zlib.crc32(tag))
+    return b"".join((struct.pack(">I", len(data)), tag, data, struct.pack(">I", crc)))
+
+
+def _encode_png_stored(frame: np.ndarray) -> bytes:
+    """an 8-bit PNG of frame with unfiltered rows in stored (uncompressed) deflate blocks
+
+    PIL still filters every row at compress_level 0, which cannot shrink stored
+    blocks; skipping the filter writes the same pixels over ten times faster
+    """
+    height, width = frame.shape[:2]
+    channels = 1 if frame.ndim == 2 else frame.shape[2]
+    rows = np.zeros((height, 1 + width * channels), np.uint8)
+    rows[:, 1:] = frame.reshape(height, width * channels)
+    header = struct.pack(
+        ">IIBBBBB", width, height, 8, _PNG_COLOR_TYPES[channels], 0, 0, 0
+    )
+    return b"".join(
+        (
+            b"\x89PNG\r\n\x1a\n",
+            _png_chunk(b"IHDR", header),
+            _png_chunk(b"IDAT", zlib.compress(rows, 0)),
+            _png_chunk(b"IEND", b""),
+        )
+    )
+
+
+def _encode_image_frame(
+    frame: np.ndarray, path: str, output_compression: int | None
+) -> bytes:
+    """encode a frame in the image format named by path's extension"""
     ext = os.path.splitext(path)[1].lower()
     if ext == ".png":
-        compress_level = 1
+        # zlib level 0 skips compression: several times faster, ~3x the bytes, same pixels
+        compress_level = 0
         if output_compression is not None and output_compression != 75:
             compress_level = max(0, min(9, round(output_compression / 100 * 9)))
         if frame.ndim == 3 and frame.shape[-1] == 1:
             frame = frame[..., 0]
-        Image.fromarray(frame).save(path, format="PNG", compress_level=compress_level)
-    else:
-        if ext in (".jpg", ".jpeg") and frame.ndim == 3 and frame.shape[-1] == 4:
-            # Models such as Qwen-Image 2.1 produce RGBA even for opaque scenes.
-            # JPEG needs RGB; composite on white instead of dropping alpha and
-            # exposing arbitrary colors from transparent pixels.
-            rgba = Image.fromarray(frame)
-            background = Image.new("RGB", rgba.size, (255, 255, 255))
-            background.paste(rgba, mask=rgba.getchannel("A"))
-            frame = np.asarray(background)
-        imageio.imwrite(path, frame, quality=quality)
+        if compress_level == 0 and frame.dtype == np.uint8:
+            return _encode_png_stored(frame)
+        buffer = io.BytesIO()
+        Image.fromarray(frame).save(buffer, format="PNG", compress_level=compress_level)
+        return buffer.getvalue()
+    if ext in (".jpg", ".jpeg") and frame.ndim == 3 and frame.shape[-1] == 4:
+        # Models such as Qwen-Image 2.1 produce RGBA even for opaque scenes.
+        # JPEG needs RGB; composite on white instead of dropping alpha and
+        # exposing arbitrary colors from transparent pixels.
+        rgba = Image.fromarray(frame)
+        background = Image.new("RGB", rgba.size, (255, 255, 255))
+        background.paste(rgba, mask=rgba.getchannel("A"))
+        frame = np.asarray(background)
+    quality = output_compression if output_compression is not None else 75
+    return imageio.imwrite("<bytes>", frame, format=ext, quality=quality)
 
 
 def warm_image_writer() -> None:
     """Run imageio's one-time plugin setup (~30 ms) before the first request saves."""
     try:
-        with tempfile.TemporaryDirectory() as tmp:
-            _save_image_frame(
-                os.path.join(tmp, "warm.jpg"), np.zeros((8, 8, 3), np.uint8), 75, None
-            )
+        _encode_image_frame(np.zeros((8, 8, 3), np.uint8), "warm.jpg", None)
     except Exception:
         logger.debug("Image writer warmup failed", exc_info=True)
 
@@ -1293,6 +1349,7 @@ def save_outputs(
     samples_out: Optional[list[Any]] = None,
     audios_out: Optional[list[Any]] = None,
     frames_out: Optional[list[Any]] = None,
+    image_bytes_out: Optional[list[bytes | None]] = None,
     output_compression: Optional[int] = None,
     x264_preset: Optional[str] = None,
     enable_frame_interpolation: bool = False,
@@ -1386,6 +1443,7 @@ def save_outputs(
             audio_sample_rate=audio_sample_rate,
             output_compression=output_compression,
             x264_preset=x264_preset,
+            image_bytes_out=image_bytes_out,
             enable_frame_interpolation=enable_frame_interpolation,
             frame_interpolation_exp=frame_interpolation_exp,
             frame_interpolation_scale=frame_interpolation_scale,
@@ -1424,8 +1482,9 @@ def post_process_sample(
     upscaling_model_path: Optional[str] = None,
     upscaling_scale: int = 4,
     x264_preset: Optional[str] = None,
+    image_bytes_out: Optional[list[bytes | None]] = None,
 ) -> list[Any]:
-    """materialize frames and save outputs (optional)"""
+    """materialize frames and save outputs (optional); image_bytes_out collects the encoded image"""
     if data_type == DataType.ACTION:
         return []
 
@@ -1441,13 +1500,16 @@ def post_process_sample(
         upscaling_model_path=upscaling_model_path,
         upscaling_scale=upscaling_scale,
     )
-    save_materialized_output(
+    image_bytes = save_materialized_output(
         materialized,
         data_type,
         save_file_path,
         save_output=save_output,
+        return_image_bytes=image_bytes_out is not None,
         audio_sample_rate=audio_sample_rate,
         output_compression=output_compression,
         x264_preset=x264_preset,
     )
+    if image_bytes_out is not None:
+        image_bytes_out.append(image_bytes)
     return materialized.frames

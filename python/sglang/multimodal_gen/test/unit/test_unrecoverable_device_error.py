@@ -77,6 +77,12 @@ def worker(monkeypatch):
     monkeypatch.setattr(
         type(gpu_worker_module.current_platform), "is_mps", lambda self: False
     )
+    # single-GPU replica: an OOM stays a request-level error
+    monkeypatch.setattr(
+        gpu_worker_module,
+        "get_replica_group",
+        lambda: SimpleNamespace(world_size=1),
+    )
     worker = GPUWorker.__new__(GPUWorker)
     worker.is_output_rank = True
     worker.server_args = SimpleNamespace(
@@ -187,7 +193,14 @@ def _health_status(client, monkeypatch):
     warmup_done = asyncio.Event()
     warmup_done.set()
     request = SimpleNamespace(
-        app=SimpleNamespace(state=SimpleNamespace(server_warmup_done=warmup_done))
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                server_warmup_done=warmup_done,
+                worker_processes=[],
+                disagg_server=None,
+                broker_task=None,
+            )
+        )
     )
     response = asyncio.run(http_server.health(request))
     return 200 if isinstance(response, dict) else response.status_code
