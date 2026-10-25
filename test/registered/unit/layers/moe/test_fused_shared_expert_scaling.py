@@ -746,6 +746,7 @@ class TestDeepseekMoeEpilogue(CustomTestCase):
             MoeRunnerBackend.DEEP_GEMM,
             MoeRunnerBackend.MARLIN,
             MoeRunnerBackend.TRITON_KERNELS,
+            MoeRunnerBackend.CUTLASS,
         ):
             with self.subTest(backend=backend):
                 moe = self._moe(inplace=True, backend=backend)
@@ -775,6 +776,80 @@ class TestDeepseekMoeEpilogue(CustomTestCase):
                 ):
                     actual = moe(x.clone())
                 self.assertEqual(calls, ["routed", "shared"])
+                torch.testing.assert_close(actual, x * 5.5)
+
+    def test_lora_wrapped_experts_preserve_capture_dispatch(self):
+        """Wrapping routed experts must retain capture overlap with shared experts."""
+        from sglang.srt.layers.moe.moe_runner import runner
+        from sglang.srt.lora.layers import FusedMoEWithLoRA
+        from sglang.srt.model_executor.runner_utils.capture_mode import (
+            model_capture_mode,
+        )
+
+        x = torch.arange(1, 7, dtype=torch.float32).reshape(2, 3)
+        moe = self._moe(inplace=True)
+        base = moe.experts
+        base.moe_runner_config.gemm1_alpha = None
+        base.moe_tp_size = 2
+        base.moe_tp_rank = 0
+        base.intermediate_size_per_partition = 3
+        base.num_experts = base.num_local_experts = 8
+        base.runner = None
+        base.quant_method = SimpleNamespace(get_triton_quant_info=lambda layer: None)
+        base.dispatcher = SimpleNamespace(
+            dispatch=lambda **kwargs: SimpleNamespace(**kwargs),
+            combine=lambda combine_input: combine_input.hidden_states,
+        )
+        calls = []
+
+        def routed(hidden, *args, **kwargs):
+            calls.append("routed")
+            return hidden * 2.5
+
+        def lora_routed(dispatched, quant_info, *, lora_info):
+            self.assertTrue(lora_info.has_active_lora)
+            calls.append("lora")
+            return SimpleNamespace(hidden_states=dispatched.hidden_states * 2.5)
+
+        def shared(hidden, *args, **kwargs):
+            calls.append("shared")
+            return hidden * 3
+
+        base.forward = routed
+        moe._forward_shared_experts = shared
+        batch = SimpleNamespace(
+            lora_ranks=torch.tensor([1]),
+            has_active_lora=True,
+            moe_lora_info=SimpleNamespace(
+                seg_indptr=torch.tensor([0, 2]),
+                req_to_lora=torch.tensor([0]),
+                adapter_enabled=torch.tensor([True]),
+                token_lora_mapping=torch.tensor([0, 0]),
+            ),
+        )
+        lora_backend = SimpleNamespace(
+            name="triton",
+            get_batch_info=lambda *args: batch,
+            prefill_cuda_graph_batch_info=None,
+            prefill_moe_cg_buffers=None,
+            moe_cg_buffers=None,
+        )
+        with (
+            get_flags().moe.override(runner_backend=MoeRunnerBackend.TRITON),
+            patch.object(
+                runner, "MoeRunner", return_value=SimpleNamespace(run=lora_routed)
+            ),
+        ):
+            moe.experts = FusedMoEWithLoRA(base, lora_backend)
+        weights = torch.zeros(1, 8, 1, 3)
+        moe.experts.set_lora_info(weights, weights, weights, weights)
+
+        for has_batch in (True, False):
+            lora_backend.get_batch_info = lambda *args: batch if has_batch else None
+            calls.clear()
+            with self.subTest(has_batch=has_batch), model_capture_mode():
+                actual = moe(x.clone())
+                self.assertEqual(calls, ["lora" if has_batch else "routed", "shared"])
                 torch.testing.assert_close(actual, x * 5.5)
 
     def test_deepgemm_shared_read_precedes_eager_disposal(self):

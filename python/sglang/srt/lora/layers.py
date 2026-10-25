@@ -32,7 +32,12 @@ from sglang.srt.lora.utils import (
     capturing_lora_graph,
     get_lm_head_lora_b_shard_size,
 )
-from sglang.srt.runtime_context import LoRABatchLayout, get_forward, get_parallel
+from sglang.srt.runtime_context import (
+    LoRABatchLayout,
+    get_flags,
+    get_forward,
+    get_parallel,
+)
 
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 
@@ -1166,6 +1171,16 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         self.gate_up_lora_b_weights = gate_up_lora_b_weights
         self.down_lora_a_weights = down_lora_a_weights
         self.down_lora_b_weights = down_lora_b_weights
+
+    @property
+    def preserves_input(self) -> bool:
+        # Match forward's choice: an adapter-free batch can use a different
+        # runner from the LoRA path, including one that disposes its input.
+        if self.lora_backend.get_batch_info(LoRABatchLayout.TP_GLOBAL) is None:
+            return self.base_layer.preserves_input
+        if self._lora_runner_backend.is_deep_gemm():
+            return get_flags().capture.disable_dispose_tensor
+        return not self.moe_runner_config.inplace
 
     def _get_lora_info(self):
         """Build the legacy engine's batch payload."""

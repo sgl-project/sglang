@@ -210,17 +210,23 @@ def test_model_handoff_and_graph_replay(group, rows, verify):
 def _moe_stub(rank, *, dual, shared_tp1):
     """A DeepseekV2MoE with fake experts (routed x * (rank + 1), shared x * 0.5), so a
     done or skipped reduction shows in its output."""
+    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
     from sglang.srt.layers.moe.topk import TopKOutputFormat
+    from sglang.srt.layers.moe.utils import MoeRunnerBackend
     from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
 
-    def experts(x, *args, **kwargs):
+    def run_experts(x, *args, **kwargs):
         return x * (rank + 1)
 
     def gate(x, *args, **kwargs):
         return x
 
+    experts = FusedMoE.__new__(FusedMoE)
+    torch.nn.Module.__init__(experts)
+    experts.forward = run_experts
     experts.quant_method = None
     experts.moe_runner_config = SimpleNamespace(inplace=False)
+    experts.runner_backend = MoeRunnerBackend.AITER
     gate.rocm_router_max_tokens = -1  # the split-K router never serves the fake gate
     moe = DeepseekV2MoE.__new__(DeepseekV2MoE)
     torch.nn.Module.__init__(moe)

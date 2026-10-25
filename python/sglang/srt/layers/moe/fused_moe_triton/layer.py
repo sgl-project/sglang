@@ -640,7 +640,11 @@ class FusedMoE(torch.nn.Module):
                 # DeepGEMM allocates its output, but may dispose the input (also
                 # with inplace=False on SM120). Capture suppresses that disposal.
                 return get_flags().capture.disable_dispose_tensor
-            if backend.is_marlin() or backend.is_triton_kernels():
+            if (
+                backend.is_marlin()
+                or backend.is_triton_kernels()
+                or backend.is_cutlass()
+            ):
                 # These runners explicitly use out-of-place output regardless
                 # of the layer's inplace suggestion.
                 return True
