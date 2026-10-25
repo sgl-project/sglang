@@ -101,7 +101,7 @@ SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3,
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>DFlash draft model (linear block verification)</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Yes</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>--speculative-algorithm DFLASH</code> + <code>--speculative-draft-model-path ...</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>No DP attention (<code>--attn-dp-size</code> &gt; 1); <code>pp_size == 1</code>; disables overlap scheduler &amp; mixed chunked prefill</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>CUDA DP attention requires <code>--enable-dp-lm-head</code> and <code>attn_cp_size == 1</code>; <code>pp_size == 1</code></td>
     </tr>
 <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>STANDALONE</td>
@@ -619,6 +619,37 @@ response = client.chat.completions.create(
 
 print(response.choices[0].message.content)
 ```
+
+### DFlash and DFlash2 with DP attention
+
+On NVIDIA CUDA, you can use attention DP with plain DFlash drafts and DFlash2
+candidate-selector checkpoints. Both use `--speculative-algorithm DFLASH`.
+Set `--enable-dp-lm-head` so the target head has the same vocabulary shards as
+its local draft replica. Pipeline parallelism and DP combined with context
+parallelism are not supported. Domino and LiLiCorr heads are not supported
+with CUDA DP attention.
+
+For example, on four NVIDIA GPUs, use TP4 with attention DP2 / TP2:
+
+```bash Command
+python3 -m sglang.launch_server \
+    --model-path Qwen/Qwen3-4B \
+    --speculative-algorithm DFLASH \
+    --speculative-draft-model-path z-lab/Qwen3-4B-DFlash-b16 \
+    --tp-size 4 \
+    --attn-dp-size 2 \
+    --enable-dp-lm-head \
+    --attention-backend flashinfer \
+    --speculative-draft-attention-backend flashinfer \
+    --cuda-graph-backend-prefill disabled
+```
+
+For DFlash2, use a matching target and selector checkpoint, such as
+`Qwen/Qwen3.8-27B` and `incoai/Qwen3.8-27B-DFlash2`.
+Each attention-DP group runs its draft within the local attention-TP group.
+Draft execution stays eager; eligible target verify batches can use CUDA graphs.
+The scheduler separates prefill and verify rounds across DP ranks. Keep the
+experimental `SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION` setting disabled.
 
 ### LiLiCorr: reranked DFlash drafts
 

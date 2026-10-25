@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 import torch
 
 from sglang.srt.beam_search.logits_capture import capture_pre_sample_logits
+from sglang.srt.configs.draft_parallel import DraftParallelLayout
 from sglang.srt.configs.load_config import _DEFAULT_LOAD_GROUP, LoadGroup
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
@@ -395,6 +396,8 @@ class TpModelWorker(BaseTpWorker):
         memory_pool_config: Optional[MemoryPoolConfig] = None,
         req_to_token_pool: Optional[ReqToTokenPool] = None,
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
+        *,
+        draft_parallel_layout: DraftParallelLayout | None = None,
     ):
         """Allocate KV cache pools only (no backends or cuda graphs)."""
         if req_to_token_pool is not None:
@@ -403,11 +406,15 @@ class TpModelWorker(BaseTpWorker):
         if token_to_kv_pool_allocator is not None:
             self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
             self.model_runner.token_to_kv_pool_allocator = token_to_kv_pool_allocator
-        self.model_runner.alloc_memory_pool(memory_pool_config)
+        self.model_runner.alloc_memory_pool(
+            memory_pool_config, draft_parallel_layout=draft_parallel_layout
+        )
         for mr in self.model_runner_list[1:]:
             mr.req_to_token_pool = self.req_to_token_pool
             mr.token_to_kv_pool_allocator = self.token_to_kv_pool_allocator
-            mr.alloc_memory_pool(memory_pool_config)
+            mr.alloc_memory_pool(
+                memory_pool_config, draft_parallel_layout=draft_parallel_layout
+            )
 
         # Validation
         assert self.model_runner.max_running_requests > 0, "max_running_request is zero"
