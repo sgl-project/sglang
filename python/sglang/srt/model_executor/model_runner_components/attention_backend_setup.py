@@ -12,7 +12,7 @@ from sglang.srt.layers.attention.attention_registry import (
 )
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.model_executor.model_runner_components.misc_utils import (
-    supports_pp_aux_hidden_relay,
+    SupportsPPAuxHiddenRelay,
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import init_cublas
@@ -58,10 +58,8 @@ def configure_aux_hidden_state_capture(
     if (
         pp_size > 1
         and eagle_use_aux_hidden_state
-        and not supports_pp_aux_hidden_relay(model)
+        and not isinstance(model, SupportsPPAuxHiddenRelay)
     ):
-        # Capture layers on earlier stages would be dropped, and the draft
-        # would silently read an incomplete aux feature on the last stage.
         raise ValueError(
             f"Model {model.__class__.__name__} does not relay aux hidden states "
             f"across pipeline stages, which EAGLE3 needs under pp_size={pp_size}."

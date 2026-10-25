@@ -130,16 +130,13 @@ class TestPPSpecConsistency(CustomTestCase):
 
 
 class TestPPSpecEagle3Consistency(TestPPSpecConsistency):
-    """EAGLE3 reads aux hidden states from layers spread over every stage; a
-    stage that drops its captures narrows the draft's feature, which crashes
-    the draft fc or, at width == hidden_size, skips it and only lowers acceptance."""
+    """EAGLE3 reads aux hidden states captured on every stage."""
 
     model = DEFAULT_TARGET_MODEL_EAGLE3
 
     def _spec_args(self, shape: str):
         num_steps, topk, num_draft_tokens = SPEC_SHAPES[shape]
         return [
-            # Canonical EAGLE3 config; the draft checkpoint is fp16.
             "--dtype",
             "float16",
             "--speculative-algorithm",

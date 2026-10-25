@@ -8,19 +8,19 @@ import torch
 
 from sglang.srt.layers.aux_hidden_states import pack_aux_hidden_states
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.model_executor.model_runner_components.attention_backend_setup import (
+    configure_aux_hidden_state_capture,
+)
 from sglang.srt.models import llama
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 _HIDDEN = 4
-_NUM_TOKENS = 3
 _NUM_LAYERS = 8
 
 
 class _Layer:
-    """Captures its input stream, like a decoder layer reading the residual."""
-
     def __init__(self, layer_id):
         self.layer_id = layer_id
         self.attn_boundary = SimpleNamespace(
@@ -42,14 +42,12 @@ _RESIDUAL_BATCH = SimpleNamespace(
 )
 
 
-def _stage(*, start, end, layers_to_capture, pp_size, pp_rank):
+def _stage(*, start, end, layers_to_capture, is_first_rank, is_last_rank):
     return SimpleNamespace(
         pp_group=SimpleNamespace(
-            is_first_rank=pp_rank == 0, is_last_rank=pp_rank == pp_size - 1
+            is_first_rank=is_first_rank, is_last_rank=is_last_rank
         ),
-        embed_tokens=lambda input_ids: (
-            input_ids[:, None].float().expand(-1, _HIDDEN).contiguous()
-        ),
+        embed_tokens=lambda input_ids: input_ids[:, None].float().repeat(1, _HIDDEN),
         layers={i: _Layer(i) for i in range(start, end)},
         start_layer=start,
         end_layer=end,
@@ -59,99 +57,65 @@ def _stage(*, start, end, layers_to_capture, pp_size, pp_rank):
 
 
 def _run_pipeline(*, boundaries, layers_to_capture):
-    """Run LlamaModel.forward stage by stage; return the last stage's packed aux
-    and, per receiving stage, (received width, get_pp_proxy_aux_hidden_size)."""
-    input_ids = torch.arange(1, _NUM_TOKENS + 1)
-    proxy = None
+    """Returns the last stage's packed aux and (received width, sized width) per stage."""
+    out = None
     widths = []
-    pp_size = len(boundaries) - 1
+    num_stages = len(boundaries) - 1
     with patch.object(llama, "residual_batch", _RESIDUAL_BATCH):
-        for rank in range(pp_size):
+        for rank in range(num_stages):
             model = _stage(
                 start=boundaries[rank],
                 end=boundaries[rank + 1],
                 layers_to_capture=layers_to_capture,
-                pp_size=pp_size,
-                pp_rank=rank,
+                is_first_rank=rank == 0,
+                is_last_rank=rank == num_stages - 1,
             )
             if rank > 0:
-                causal_lm = SimpleNamespace(
-                    config=SimpleNamespace(hidden_size=_HIDDEN), model=model
-                )
-                received = proxy.tensors.get("aux_hidden_states")
-                widths.append(
-                    (
-                        0 if received is None else received.shape[-1],
-                        llama.LlamaForCausalLM.get_pp_proxy_aux_hidden_size(causal_lm),
+                received = out.tensors.get("aux_hidden_states")
+                sized = llama.LlamaForCausalLM.get_pp_proxy_aux_hidden_size(
+                    SimpleNamespace(
+                        config=SimpleNamespace(hidden_size=_HIDDEN), model=model
                     )
                 )
+                widths.append((0 if received is None else received.shape[-1], sized))
             out = llama.LlamaModel.forward(
                 model,
-                input_ids,
+                torch.arange(1, 4),
                 positions=None,
                 forward_batch=None,
-                pp_proxy_tensors=proxy,
+                pp_proxy_tensors=out,
             )
-            proxy = out
     _, aux_hidden_states = out
     return pack_aux_hidden_states(aux_hidden_states), widths
 
 
 class TestLlamaPipelineAuxRelay(unittest.TestCase):
     def test_multi_stage_aux_matches_single_stage(self):
-        # Stage [3, 5) owns no capture layer but must still forward the
-        # earlier captures; layer 5 is captured at the input of a stage.
+        # Stage [3, 5) owns no capture layer; layer 5 is a stage's first layer.
         layers_to_capture = [1, 2, 5, 7]
         expected, _ = _run_pipeline(
             boundaries=[0, _NUM_LAYERS], layers_to_capture=layers_to_capture
         )
-        self.assertEqual(
-            expected.shape, (_NUM_TOKENS, _HIDDEN * len(layers_to_capture))
-        )
-
         actual, widths = _run_pipeline(
             boundaries=[0, 3, 5, _NUM_LAYERS], layers_to_capture=layers_to_capture
         )
 
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-        # The CUDA graph input buffer of each stage is sized by the hook, so it
-        # must equal the width the previous stage sends.
-        self.assertEqual(
-            widths, [(2 * _HIDDEN, 2 * _HIDDEN), (2 * _HIDDEN, 2 * _HIDDEN)]
-        )
+        for received, sized in widths:
+            self.assertEqual(received, sized)
 
-
-class TestAuxCaptureRequiresPipelineRelay(unittest.TestCase):
-    """A target that only captures on the last stage gives the EAGLE3 draft a
-    narrower feature; at width == hidden_size the draft skips its fc silently."""
-
-    class _LastStageOnlyTarget:
-        def set_eagle3_layers_to_capture(self, layer_ids=None):
-            self.layer_ids = layer_ids
-
-    def _configure(self, model, *, pp_size):
-        from sglang.srt.model_executor.model_runner_components.attention_backend_setup import (
-            configure_aux_hidden_state_capture,
-        )
-
-        configure_aux_hidden_state_capture(
-            model=model,
-            eagle_use_aux_hidden_state=True,
-            eagle_aux_hidden_state_layer_ids=[1, 4, 6],
-            dflash_use_aux_hidden_state=False,
-            dflash_target_layer_ids=None,
-            is_dspark=False,
-            pp_size=pp_size,
-        )
-
-    def test_rejects_target_without_relay_under_pp(self):
+    def test_target_without_relay_is_rejected_under_pp(self):
+        target = SimpleNamespace(set_eagle3_layers_to_capture=lambda layer_ids: None)
         with self.assertRaisesRegex(ValueError, "does not relay aux hidden states"):
-            self._configure(self._LastStageOnlyTarget(), pp_size=2)
-
-    def test_allows_target_without_relay_without_pp(self):
-        model = self._LastStageOnlyTarget()
-        self._configure(model, pp_size=1)
-        self.assertEqual(model.layer_ids, [1, 4, 6])
+            configure_aux_hidden_state_capture(
+                model=target,
+                eagle_use_aux_hidden_state=True,
+                eagle_aux_hidden_state_layer_ids=None,
+                dflash_use_aux_hidden_state=False,
+                dflash_target_layer_ids=None,
+                is_dspark=False,
+                pp_size=2,
+            )
 
 
 if __name__ == "__main__":

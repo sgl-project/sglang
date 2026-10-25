@@ -487,8 +487,6 @@ class LlamaModel(nn.Module):
             not self.pp_group.is_first_rank
             and "aux_hidden_states" in pp_proxy_tensors.tensors
         ):
-            # Captures of earlier stages come first so the packed feature keeps
-            # ascending layer order, as with a single stage.
             aux_hidden_states.capture(pp_proxy_tensors["aux_hidden_states"])
         for i in range(self.start_layer, self.end_layer):
             hidden_states = self.layers[i](
@@ -939,15 +937,11 @@ class LlamaForCausalLM(nn.Module):
         self.model.load_kv_cache_scales(quantization_param_path)
 
     def get_pp_proxy_aux_hidden_size(self) -> int:
-        # Width of the aux states this stage receives: one hidden-size slice per
-        # capture layer that earlier stages own.
         return self.config.hidden_size * sum(
             layer < self.model.start_layer for layer in self.model.layers_to_capture
         )
 
     def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
-        # Every stage captures its own layers; earlier stages relay theirs to
-        # the last stage through the PP proxy tensors.
         if layer_ids is None:
             self.capture_aux_hidden_states = True
             num_layers = self.config.num_hidden_layers

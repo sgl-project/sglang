@@ -100,19 +100,14 @@ def resolve_pp_proxy_residual_num_blocks(
 
 
 @runtime_checkable
-class _SupportsPPAuxHiddenRelay(Protocol):
+class SupportsPPAuxHiddenRelay(Protocol):
     def get_pp_proxy_aux_hidden_size(self) -> int: ...
-
-
-def supports_pp_aux_hidden_relay(model: Any) -> bool:
-    """Whether the model relays aux hidden states captured on earlier PP stages."""
-    return isinstance(model, _SupportsPPAuxHiddenRelay)
 
 
 def resolve_pp_proxy_aux_hidden_size(*, model: Any, pp_size: int, pp_rank: int) -> int:
     if pp_size <= 1 or pp_rank == 0:
         return 0
-    if supports_pp_aux_hidden_relay(model):
+    if isinstance(model, SupportsPPAuxHiddenRelay):
         return model.get_pp_proxy_aux_hidden_size()
     return 0
 

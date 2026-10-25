@@ -128,8 +128,6 @@ def check_pipeline_parallel_compat(cfg: Any) -> None:
             "SGLANG_ENABLE_PP_SPEC does not support DSPARK PD prefill"
         )
     elif cfg.speculative_algorithm is not None:
-        # EAGLE3 needs the target to relay aux hidden states across stages,
-        # which configure_aux_hidden_state_capture checks once the model loads.
         assert (
             cfg.speculative_algorithm.upper() in ("EAGLE", "EAGLE3")
             and not cfg.enable_multi_layer_eagle
