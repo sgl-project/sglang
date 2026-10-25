@@ -233,9 +233,9 @@ def test_default_cost_model_has_no_selected_work_policy():
 
 
 def test_same_prefix_fallback_cannot_hide_two_different_original_anchors():
+    recorder, args, record = protocol(same_prefix=True)
     from infercast.sdk.native_segment_module import NativeSegmentQuery
 
-    recorder, args, record = protocol(same_prefix=True)
     anchors = record["row_metadata"]["anchor_identities"]
     anchor = NativeSegmentQuery.from_shape(anchors[1])
     value = json.loads(anchor.module_variant)

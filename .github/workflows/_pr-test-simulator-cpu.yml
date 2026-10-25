@@ -113,3 +113,6 @@ jobs:
           python3 -m pytest -q tools/sglang-simulator/test/test_infercast_predictor.py
           python3 -m pytest -q tools/sglang-simulator/test/test_resource_budget.py
           python3 -m pytest -q tools/sglang-simulator/test/test_infercast_e2e.py
+          # SDK-backed cases report explicit skips until a public InferCast SDK
+          # is available; protocol/bootstrap cases still run without that SDK.
+          python3 -m pytest -q -ra tools/sglang-simulator/test/test_dspark*.py tools/sglang-simulator/test/test_deferred_server_args.py
