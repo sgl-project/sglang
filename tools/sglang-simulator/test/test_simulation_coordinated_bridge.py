@@ -142,6 +142,66 @@ class ShutdownReq:
     pass
 
 
+class ProfileReq:
+    pass
+
+
+@pytest.mark.parametrize("finished", [False, True])
+def test_native_profile_only_at_drained_run_boundaries(harness, finished):
+    if finished:
+
+        def driver(control):
+            control.send(encode_message(Ready("run", 0, [], finished=True)))
+            return decode_grant(control.recv())
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(harness.run_driver, driver)
+            assert harness.receive() == []
+            assert future.result(timeout=3).status == "FINISHED"
+    profile = ProfileReq()
+    harness.payloads.put(profile)
+    assert harness.receive() == [profile]
+    assert harness.bridge.clock.now_ns == 0
+    assert harness.bridge._finished is finished
+
+
+def test_native_profile_cannot_reset_an_active_run(harness):
+    harness.bridge.clock.accept_ready(Ready("run", 0, [], next_wakeup_ns=10))
+    harness.payloads.put(ProfileReq())
+    with pytest.raises(ProtocolError, match="ProfileReq requires"):
+        harness.receive()
+    assert harness.bridge._admin == []
+    assert harness.bridge.clock.now_ns == 0
+
+
+@pytest.mark.parametrize("finished", [False, True])
+@pytest.mark.parametrize(
+    "pending", ["batch", "result", "reference", "native", "payload", "same_poll"]
+)
+def test_native_profile_cannot_skip_pending_work(harness, finished, pending):
+    # Also reject inconsistent post-finish state rather than hiding a lost tail.
+    if finished:
+        harness.bridge._finished = True
+        harness.bridge.clock.run_id = "run"
+    if pending == "batch":
+        harness.bridge._batch = object()
+    elif pending == "result":
+        harness.scheduler.result_queue = [object()]
+    elif pending == "reference":
+        harness.bridge._pending_work = lambda: True
+    elif pending == "native":
+        harness.scheduler.running_batch.reqs.append(NativeRequest(rid(1)))
+    elif pending == "payload":
+        harness.bridge._payloads[rid(1)] = TokenizedGenerateReqInput(rid(1))
+    harness.payloads.put(ProfileReq())
+    if pending == "same_poll":
+        harness.send_payload(rid(1))
+    with pytest.raises(ProtocolError, match="ProfileReq requires"):
+        harness.receive()
+    assert harness.bridge._admin == []
+    assert harness.bridge.clock.now_ns == 0
+
+
 @pytest.mark.parametrize("finished", [False, True])
 def test_native_shutdown_outside_an_active_run(harness, finished):
     if finished:

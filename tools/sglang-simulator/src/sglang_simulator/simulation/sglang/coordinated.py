@@ -214,6 +214,7 @@ class CoordinatedScheduler:
             return result
 
     def _pump(self) -> None:
+        profiles = []
         for req in self._raw_receive():
             kind = type(req).__name__
             if kind == "TokenizedGenerateReqInput":
@@ -234,12 +235,34 @@ class CoordinatedScheduler:
                     self._aborts.add(req.rid)
             elif kind in ("GetInternalStateReq", "ConfigureLoggingReq", "FreezeGCReq"):
                 self._admin.append(req)
+            elif kind == "ProfileReq":
+                profiles.append(req)
             elif kind == "ShutdownReq" and (
                 self._finished or self.clock.run_id is None
             ):
                 self._admin.append(req)
             else:
                 raise ProtocolError(f"unsupported request during coordination: {kind}")
+        if profiles:
+            # Check the entire receive pass: an earlier profile request cannot
+            # reset accounting ahead of a payload from the same native poll.
+            if not (
+                (self.clock.run_id is None or self._finished)
+                and not self._reply_pending
+                and self._batch is None
+                and not self._payloads
+                and not self._pending
+                and not self._aborts
+                and not self._cancel_cleanup
+                and not self.clock.pending_rids
+                and not self.clock.open_rids
+                and not self.clock.has_terminals
+                and not self._has_native_work()
+            ):
+                raise ProtocolError(
+                    "ProfileReq requires bootstrap or a drained finished run"
+                )
+            self._admin.extend(profiles)
 
     @staticmethod
     def _validate_request(req) -> None:

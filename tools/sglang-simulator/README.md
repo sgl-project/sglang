@@ -570,6 +570,9 @@ FutureMap and reference ledger retain native event order. Every result advances
 virtual time by its own forward duration, and already launched native tails drain
 before FINISHED even after all requests become terminal. Discarded tails add no
 visible output-token event.
+Native profile start/stop administration is allowed before the first driver Ready
+and after FINISHED with all native results drained. It is rejected during an
+active coordinated run so resetting accounting cannot discard pending work.
 Coordinated runs preserve native `--prefill-decode-interval` countdowns when the
 runtime exposes the validated cadence helper and schedule-pass surfaces. A
 cadence-only pass with pending native work consumes no modeled forward time:
