@@ -32,6 +32,21 @@ Notes:
 
 ## Key Configurations with Storage Backends Enabled
 
+### Host Pool Sizing
+
+```bash Command
+# Recommended: size the host pool as a multiple of the GPU KV pool
+--hicache-ratio 2
+--hicache-size 0
+```
+
+Guidelines:
+
+- Storage (L3) hits are staged in the host pool before being loaded to the GPU, so the host pool needs free room at the time of the hit.
+- With `write_through`, every token cached on the GPU also keeps a host copy. Once the GPU pool is full, at most `host pool tokens - GPU pool tokens` is left for storage hits.
+- If the host pool is not larger than the GPU pool, storage hits are dropped and the prompt is recomputed. `sglang:storage_prefetch_unfulfilled_tokens_total{reason="host_capacity"}` grows.
+- `--hicache-size` sets the host pool in GB and overrides `--hicache-ratio`. If you set it, check that the host pool is larger than the GPU pool in tokens, as reported in the startup log.
+
 ### Memory Layout Optimization
 
 ```bash Command

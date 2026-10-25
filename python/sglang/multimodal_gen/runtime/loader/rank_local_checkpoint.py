@@ -62,8 +62,8 @@ class LocalTPShard:
 @dataclass(frozen=True)
 class _TPReadPlan:
     shard_dim: int | None
-    # Logical output matrices packed into a single checkpoint tensor.
-    packed_sizes: tuple[int, ...] = ()
+    # logical segments sharded independently along shard_dim
+    shard_sizes: tuple[int, ...] = ()
     # Custom loaders may opt in to transforming the LOCAL checkpoint slice.
     transform: Callable[[torch.Tensor], torch.Tensor] | None = None
 
@@ -139,8 +139,8 @@ def _collect_safetensors_sources(
     ]
     | None
 ):
-    corrupted_files, duplicate_files_by_key = _scan_safetensors_files(weight_files)
-    if corrupted_files or duplicate_files_by_key:
+    unreadable_files, duplicate_files_by_key = _scan_safetensors_files(weight_files)
+    if unreadable_files or duplicate_files_by_key:
         return None
 
     sources_by_target: dict[str, list[SafetensorsSource]] = defaultdict(list)
@@ -383,7 +383,7 @@ def _tp_read_plan(
         if len(sources) == 1 and sources[0].merge_index is None:
             if not sources[0].shape or sources[0].shape[0] != sum(sizes):
                 return None
-            return _TPReadPlan(dim, packed_sizes=sizes)
+            return _TPReadPlan(dim, shard_sizes=sizes)
         if (
             len(sources) != len(sizes)
             or {source.merge_index for source in sources} != set(range(len(sizes)))
@@ -393,6 +393,14 @@ def _tp_read_plan(
             )
         ):
             return None
+    if isinstance(owner, RowParallelLinear) and dim is not None:
+        sizes = tuple(owner.input_sizes or ())
+        if any(size <= 0 or size % tp_size for size in sizes):
+            return None
+        if sizes:
+            if any(source.shape[dim] != sum(sizes) for source in sources):
+                return None
+            return _TPReadPlan(dim, shard_sizes=sizes)
     return _TPReadPlan(dim)
 
 
@@ -402,20 +410,8 @@ def read_tp_local_tensor(
     shard_dim: int | None,
     tp_rank: int,
     tp_size: int,
-    packed_sizes: tuple[int, ...] = (),
+    shard_sizes: list[int] | None = None,
 ) -> torch.Tensor:
-    if packed_sizes:
-        # Fused MLP/QKV matrices must each be split, not the concatenated tensor.
-        source = sources[0]
-        view = handles[source.file_path].get_slice(source.param_name)
-        offset = 0
-        parts = []
-        for size in packed_sizes:
-            local_size = size // tp_size
-            start = offset + tp_rank * local_size
-            parts.append(view[start : start + local_size].contiguous())
-            offset += size
-        return torch.cat(parts, dim=0)
     if shard_dim is None:
         assembled_shape = assembled_source_shape(sources)
         if assembled_shape is None:
@@ -436,16 +432,37 @@ def read_tp_local_tensor(
     )
     local_parts = []
     for source in ordered_sources:
-        shard_size = source.shape[shard_dim] // tp_size
-        slices = [slice(None)] * len(source.shape)
-        slices[shard_dim] = slice(
-            tp_rank * shard_size,
-            (tp_rank + 1) * shard_size,
+        # Sources merged along dim 0 already separate column-parallel segments.
+        # Fused columns and row-parallel [attention | MLP] need per-segment reads.
+        sizes = (
+            shard_sizes
+            if shard_sizes is not None and (len(ordered_sources) == 1 or shard_dim != 0)
+            else [source.shape[shard_dim]]
         )
+        if sum(sizes) != source.shape[shard_dim] or any(
+            size % tp_size for size in sizes
+        ):
+            raise RuntimeError(
+                "Invalid TP checkpoint segments: "
+                f"sizes={sizes}, source_dim={source.shape[shard_dim]}, tp_size={tp_size}"
+            )
+        segments = []
+        offset = 0
+        for size in sizes:
+            shard_size = size // tp_size
+            slices = [slice(None)] * len(source.shape)
+            slices[shard_dim] = slice(
+                offset + tp_rank * shard_size,
+                offset + tp_rank * shard_size + shard_size,
+            )
+            segments.append(
+                handles[source.file_path]
+                .get_slice(source.param_name)[tuple(slices)]
+                .contiguous()
+            )
+            offset += size
         local_parts.append(
-            handles[source.file_path]
-            .get_slice(source.param_name)[tuple(slices)]
-            .contiguous()
+            segments[0] if len(segments) == 1 else torch.cat(segments, dim=shard_dim)
         )
     return local_parts[0] if len(local_parts) == 1 else torch.cat(local_parts, dim=0)
 
@@ -521,7 +538,7 @@ def try_load_rank_local_tp_state_dict(
                 plan.shard_dim,
                 tp_rank,
                 tp_size,
-                packed_sizes=plan.packed_sizes,
+                shard_sizes=list(plan.shard_sizes) if plan.shard_sizes else None,
             )
             if plan.transform is not None:
                 transformed = plan.transform(tensor)

@@ -227,8 +227,6 @@ def test_hybrid_pool_stats_exclude_reserved_slots():
         full_tokens_per_layer=None,
         swa_tokens_per_layer=None,
         max_total_num_tokens=42,
-        get_last_batch=lambda: None,
-        get_running_batch=lambda: None,
     )
 
     stats = observer._get_mamba_token_info()
@@ -249,6 +247,7 @@ def test_streaming_session_release_frees_compressed_slots():
         req_to_token_pool=pool,
         token_to_kv_pool_allocator=allocator,
         page_size=1,
+        unlock=lambda lock: None,
     )
     cache.free_kv_row = functools.partial(BasePrefixCache.free_kv_row, cache)
     session = StreamingSession(cache)
