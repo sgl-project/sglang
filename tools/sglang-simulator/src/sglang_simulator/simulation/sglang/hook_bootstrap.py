@@ -50,6 +50,7 @@ def install_simulator_hooks() -> None:
             dspark_worker.C_DSparkDraftInputHook,
             model_runner.C_ModelRunnerHook,
             model_runner.C_KVCacheConfiguratorHook,
+            model_runner.C_DSV4PayloadHook,
             hicache_storage.C_StorageBackendFactory,
             cache_controller.C_HiCacheController,
             cache_controller.C_HybridCacheController,

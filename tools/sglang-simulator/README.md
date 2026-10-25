@@ -454,6 +454,12 @@ when replaying a trace. These runs do not evaluate generated answers or agents
 choosing tools from model output. Results depend on the predictor data;
 the bundled replay table is an example, not a hardware performance calibration.
 
+In the explicit CPU simulator, packed DeepSeek KV/index payloads use metadata-only
+storage with their native shape and dtype. Integer allocation, request/window state
+and logical cache capacities remain real CPU state. This allows observed accelerator
+cache capacities without allocating unused model-value tensors on the host; it does
+not change native CUDA execution or estimate the capacity itself.
+
 #### Real-time HTTP clients
 
 Start a small example server from the repository root:
