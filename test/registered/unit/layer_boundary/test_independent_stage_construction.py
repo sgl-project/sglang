@@ -268,6 +268,52 @@ class TestIndependentStageConstruction(CustomTestCase):
                         ExitRows.SLICE if reads_slices else line[1].exit_rows,
                     )
 
+    def test_branch_connections_start_from_the_bound_source(self):
+        with fixture.planning(
+            fixture.parallel_of(attn_dp=2, attn_tp=2, moe_dense_tp_size=1)
+        ):
+            line = [declare_attn(), declare_ffn(sparse=True)]
+            source = factories.connect_layer_line(
+                line, ["append 0"] * len(line), previous=None, following=None
+            )[1]
+            branch = [declare_ffn(), declare_attn()]
+            given = [replace(declaration) for declaration in branch]
+            prepared = factories.connect_prepared_line(
+                branch, ["append 1"] * len(branch), source_incoming=source
+            )
+        self.assertEqual(branch, given)
+        self.assertEqual(len(prepared), len(branch) + 1)
+        first, last = (c.consumer for c in prepared[:-1])
+        self.assertIs(prepared[0].producer, source.consumer)
+        self.assertIs(prepared[1].producer, first)
+        self.assertEqual(first.prepared_from, facts_of(source.consumer))
+        self.assertIsNone(first.previous)
+        self.assertEqual(last.previous, facts_of(first))
+        # A branch neither hands off nor ends the stack.
+        self.assertIsNone(prepared[-1].consumer)
+        self.assertFalse(last.terminal)
+
+    def test_a_branch_that_cannot_fork_names_its_append(self):
+        with fixture.planning(
+            fixture.parallel_of(
+                attn_dp=1, attn_tp=2, enable_attn_tp_input_scattered=True
+            )
+        ):
+            line = [declare_attn(), declare_ffn(sparse=True)]
+            source = factories.connect_layer_line(
+                line, ["append 0"] * len(line), previous=None, following=None
+            )[1]
+            with self.assertRaisesRegex(
+                NotImplementedError, "ordinary token rows"
+            ) as caught:
+                factories.connect_prepared_line(
+                    [declare_ffn()], ["append 1"], source_incoming=source
+                )
+        self.assertIn(
+            "while binding the stages appended at append 1",
+            getattr(caught.exception, "__notes__", []),
+        )
+
     def test_an_ffn_without_a_fusion_object_may_defer_or_reduce_scatter(self):
         with fixture.planning(fixture.parallel_of(attn_dp=1, attn_tp=2)):
             _, boundary = build_stages(

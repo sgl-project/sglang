@@ -1193,6 +1193,35 @@ def connect_layer_line(declarations, origins, *, previous, following, final_read
     )
 
 
+def connect_prepared_line(declarations, origins, *, source_incoming):
+    """The connections along a branch, as ``connect_layer_line`` gives them
+    for the stack's line: one into each stage and one out of the last.
+
+    The branch starts from the stage ``source_incoming`` connects into, as it
+    bound (its ``consumer``): the branch's first stage reads what that
+    stage's entry already read, forked onto the branch's rows, and each later
+    stage's producer is the one before it. A branch neither hands off nor
+    ends the stack, so none of the line's decisions at its end apply; the
+    declarations given are left as they are.
+    """
+    source_declaration = source_incoming.consumer
+    chained = []
+    for declaration in declarations:
+        chained.append(
+            replace(
+                declaration,
+                previous=facts_of(chained[-1]) if chained else None,
+                prepared_from=None if chained else facts_of(source_declaration),
+            )
+        )
+    try:
+        arrivals = _fork_input(source_incoming)
+    except Exception as error:
+        _note_origin(error, origins[0])
+        raise
+    return _connect_line(chained, origins, before=source_declaration, arrivals=arrivals)
+
+
 def _bind_stack(appends, *, previous, following, final_read=None):
     """Bind every appended stage and fill in the boundaries each append
     returned.
@@ -1207,7 +1236,8 @@ def _bind_stack(appends, *, previous, following, final_read=None):
         (append, index) for append in line for index in range(len(append.bindings))
     ]
     bound = {id(append): [None] * len(append.bindings) for append in appends}
-    # A returned declaration's stage as bound, for the branches that start from it.
+    # The incoming connection of a returned declaration's stage as bound, for
+    # the branches that start from it.
     sources = {}
     connections = connect_layer_line(
         [append.declarations[index] for append, index in stages],
@@ -1226,34 +1256,18 @@ def _bind_stack(appends, *, previous, following, final_read=None):
     for append in appends:
         if append.prepared_from is None:
             continue
-        source = sources.get(id(append.prepared_from))
-        if source is None:
+        source_incoming = sources.get(id(append.prepared_from))
+        if source_incoming is None:
             raise ValueError(
                 "prepared_from must be the declaration of a stage appended "
                 f"earlier to the same layer stack (at {append.origin})"
             )
-        source_declaration, source_incoming = source
-        branch = [(append, index) for index in range(len(append.bindings))]
-        chained = []
-        for index, declaration in enumerate(append.declarations):
-            chained.append(
-                replace(
-                    declaration,
-                    previous=facts_of(chained[-1]) if chained else None,
-                    prepared_from=None if chained else facts_of(source_declaration),
-                )
-            )
-        try:
-            arrivals = _fork_input(source_incoming)
-        except Exception as error:
-            _note_origin(error, append.origin)
-            raise
-        connections = _connect_line(
-            chained,
-            [append.origin] * len(chained),
-            before=source_declaration,
-            arrivals=arrivals,
+        connections = connect_prepared_line(
+            append.declarations,
+            [append.origin] * len(append.declarations),
+            source_incoming=source_incoming,
         )
+        branch = [(append, index) for index in range(len(append.bindings))]
         _bind_line(branch, connections, bound, sources)
     bound = [tuple(bound[id(append)]) for append in appends]
     _check_declared_gathers(appends, bound, remote_producer=previous is not None)
@@ -1302,10 +1316,7 @@ def _bind_line(stages, connections, bound, sources, *, final_read=None):
             raise
         boundaries[position] = boundary
         bound[id(append)][index] = boundary
-        sources[id(append.boundaries[index].declaration)] = (
-            boundary.declaration,
-            connections[position],
-        )
+        sources[id(append.boundaries[index].declaration)] = connections[position]
 
     for position in range(len(stages)):
         if boundaries[position] is None:
