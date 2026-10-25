@@ -3063,6 +3063,77 @@ impl<'de> ::serde::Deserialize<'de> for GenerateStreamError {
     }
 }
 
+impl ::serde::Serialize for GenerateStreamItem {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match &self.item {
+            Some(generate_stream_item::Item::Frame(v)) => v.serialize(serializer),
+            Some(generate_stream_item::Item::Error(v)) => v.serialize(serializer),
+            None => serializer.serialize_none(),
+        }
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for GenerateStreamItem {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = GenerateStreamItem;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("one of the GenerateStreamItem shapes")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                // A discriminator may follow fields of either arm. Keep raw JSON
+                // until it is known, then validate only the selected payload.
+                let mut fields = Vec::new();
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "text" | "meta_info" | "output_ids" | "index" | "prompt_token_ids"
+                        | "error" => fields
+                            .push((key, map.next_value::<Box<::serde_json::value::RawValue>>()?)),
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                if fields.iter().any(|(key, _)| key == "error") {
+                    let payload = <GenerateStreamError as ::serde::Deserialize>::deserialize(
+                        ::serde::de::value::MapDeserializer::<_, ::serde_json::Error>::new(
+                            fields
+                                .iter()
+                                .map(|(key, value)| (key.as_ref(), value.as_ref())),
+                        ),
+                    )
+                    .map_err(::serde::de::Error::custom)?;
+                    if payload.error.is_none() {
+                        return Err(::serde::de::Error::invalid_type(
+                            ::serde::de::Unexpected::Unit,
+                            &"struct ErrorBody",
+                        ));
+                    }
+                    return Ok(GenerateStreamItem {
+                        item: Some(generate_stream_item::Item::Error(payload)),
+                    });
+                }
+                let payload = <GenerateResponse as ::serde::Deserialize>::deserialize(
+                    ::serde::de::value::MapDeserializer::<_, ::serde_json::Error>::new(
+                        fields
+                            .iter()
+                            .map(|(key, value)| (key.as_ref(), value.as_ref())),
+                    ),
+                )
+                .map_err(::serde::de::Error::custom)?;
+                Ok(GenerateStreamItem {
+                    item: Some(generate_stream_item::Item::Frame(payload)),
+                })
+            }
+        }
+        deserializer.deserialize_any(V)
+    }
+}
+
 impl ::serde::Serialize for MediaRef {
     fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut map = serializer.serialize_map(None)?;

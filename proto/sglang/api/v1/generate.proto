@@ -221,6 +221,7 @@ message GenerateResponse {
   // JSON key order is FIELD-NUMBER order: text, meta_info, then the
   // conditionally-present output_ids and index — matching frame_value's
   // insertion order byte-for-byte.
+  // Python's token-ID-only output omits text; decoding keeps its empty default.
   string text = 1;
   GenerateMetaInfo meta_info = 2;
   // Omitted while empty (a text-only frame).
@@ -242,6 +243,8 @@ message GenerateStreamError {
 // the same failure is an in-stream SSE error frame.
 message GenerateStreamItem {
   oneof item {
+    option (sglang.json.v1.oneof_json).shape = ONEOF_SHAPE_UNTAGGED;
+    option (sglang.json.v1.oneof_json).presence_key = "error";
     GenerateResponse frame = 1;
     GenerateStreamError error = 2;
   }

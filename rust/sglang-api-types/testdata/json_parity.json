@@ -597,6 +597,111 @@
         "hicache_write_policy": ""
       },
       "canonical": "{\"hicache_storage_backend\":\"file\",\"hicache_storage_backend_extra_config_json\":\"\",\"hicache_storage_prefetch_policy\":\"\",\"hicache_write_policy\":\"\"}"
+    },
+    {
+      "type": "GenerateResponse",
+      "name": "token-only output omits text",
+      "input": {
+        "output_ids": [
+          4000000000
+        ],
+        "meta_info": {
+          "id": "tokens"
+        }
+      },
+      "canonical": "{\"text\":\"\",\"meta_info\":{\"id\":\"tokens\",\"prompt_tokens\":0,\"completion_tokens\":0,\"finish_reason\":null,\"cached_tokens\":0,\"reasoning_tokens\":0},\"output_ids\":[4000000000]}"
+    },
+    {
+      "type": "GenerateStreamItem",
+      "name": "token-only frame uses fallback arm",
+      "input": {
+        "index": 2,
+        "output_ids": [
+          4000000000
+        ]
+      },
+      "canonical": "{\"text\":\"\",\"output_ids\":[4000000000],\"index\":2}"
+    },
+    {
+      "type": "GenerateStreamItem",
+      "name": "error discriminator after malformed frame fields and unknown extension",
+      "input": {
+        "output_ids": [
+          7
+        ],
+        "text": 7,
+        "meta_info": {
+          "id": false
+        },
+        "index": 1,
+        "vendor": {
+          "values": [
+            true
+          ]
+        },
+        "error": {
+          "code": 503,
+          "message": "busy"
+        }
+      },
+      "canonical": "{\"error\":{\"message\":\"busy\",\"code\":503},\"index\":1}"
+    },
+    {
+      "type": "GenerateStreamItem",
+      "name": "error ignores malformed frame fields after discriminator",
+      "input": {
+        "error": {
+          "code": 503,
+          "message": "busy"
+        },
+        "meta_info": 7
+      },
+      "canonical": "{\"error\":{\"message\":\"busy\",\"code\":503}}"
+    },
+    {
+      "type": "GenerateStreamItem",
+      "name": "selected frame fields are validated",
+      "input": {
+        "meta_info": 7
+      },
+      "error": "invalid type: integer `7`, expected struct GenerateMetaInfo"
+    },
+    {
+      "type": "GenerateStreamItem",
+      "name": "selected error fields are validated",
+      "input": {
+        "meta_info": 7,
+        "error": {
+          "message": false,
+          "code": 503
+        }
+      },
+      "error": "invalid type: boolean `false`, expected a string"
+    },
+    {
+      "type": "GenerateStreamItem",
+      "name": "explicit null error is rejected",
+      "input": {
+        "error": null
+      },
+      "error": "invalid type: null, expected struct ErrorBody"
+    },
+    {
+      "type": "GenerateStreamError",
+      "name": "standalone error payload keeps absent-field defaults",
+      "input": {
+        "index": 1
+      },
+      "canonical": "{\"index\":1}"
+    },
+    {
+      "type": "GenerateStreamError",
+      "name": "standalone error payload keeps explicit-null defaults",
+      "input": {
+        "error": null,
+        "index": 1
+      },
+      "canonical": "{\"index\":1}"
     }
   ]
 }

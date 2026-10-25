@@ -20,6 +20,7 @@ serde = { workspace = true }
 # unknown finish reason) re-serializes through serde_json::Value, and the
 # contract is "verbatim": key order must not depend on what else links the
 # crate.
-serde_json = { workspace = true, features = ["preserve_order"] }
+# raw_value defers flat-union field decoding until the selecting key is known.
+serde_json = { workspace = true, features = ["preserve_order", "raw_value"] }
 tonic = { workspace = true }
 tonic-prost = { workspace = true }

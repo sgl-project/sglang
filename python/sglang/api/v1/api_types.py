@@ -877,6 +877,9 @@ NullableTopLogprobs = Optional[TopLogprobRow]
 # sglang.api.v1.HiddenStateRow: JSON bare array.
 HiddenStateRow = List[float]
 
+# sglang.api.v1.GenerateStreamItem: JSON: key presence picks the arm.
+GenerateStreamItem = Union[GenerateResponse, GenerateStreamError]
+
 # sglang.api.v1.ImageGridThw: JSON bare array.
 ImageGridThw = List[Int64List]
 
@@ -1897,6 +1900,25 @@ def encode_GenerateStreamError(v: GenerateStreamError) -> Dict[str, Any]:
     if v.index is not None:
         d["index"] = v.index
     return d
+
+
+def decode_GenerateStreamItem(value: Any) -> GenerateStreamItem:
+    if isinstance(value, dict):
+        if "error" in value:
+            payload = decode_GenerateStreamError(value)
+            if payload.error is None:
+                raise _invalid_type(None, expected="struct ErrorBody")
+            return payload
+        return decode_GenerateResponse(value)
+    raise _invalid_type(value, expected="one of the GenerateStreamItem shapes")
+
+
+def encode_GenerateStreamItem(v: GenerateStreamItem) -> Any:
+    if isinstance(v, (GenerateResponse,)):
+        return encode_GenerateResponse(v)
+    if isinstance(v, (GenerateStreamError,)):
+        return encode_GenerateStreamError(v)
+    return v
 
 
 _FIELDS_MediaRef = ("url", "detail", "max_dynamic_patch", "content_hash", "min_pixels", "max_pixels", "total_max_pixels", "fps", "num_frames", "min_frames", "max_frames", "max_tokens_per_frame", "max_image_tokens", "use_audio", "image_grid_thw",)

@@ -122,17 +122,24 @@ class TestCrossLanguageFixtures(CustomTestCase):
         self.assertTrue(cases)
         for case in cases:
             with self.subTest(case=f"{case['type']}: {case['name']}"):
-                cls = getattr(api_types, case["type"])
-                decoded = cls.from_json_value(case["input"])
-                self.assertEqual(compact(decoded.to_json_value()), case["canonical"])
-                again = cls.from_json_value(json.loads(case["canonical"]))
-                self.assertEqual(compact(again.to_json_value()), case["canonical"])
+                decode = getattr(api_types, f"decode_{case['type']}")
+                encode = getattr(api_types, f"encode_{case['type']}")
+                if "error" in case:
+                    with self.assertRaises(api_types.JsonContractError) as error:
+                        decode(case["input"])
+                    self.assertEqual(str(error.exception), case["error"])
+                    continue
+                decoded = decode(case["input"])
+                self.assertEqual(compact(encode(decoded)), case["canonical"])
+                again = decode(json.loads(case["canonical"]))
+                self.assertEqual(compact(encode(again)), case["canonical"])
 
-    def test_every_fixture_type_is_a_generated_struct(self):
+    def test_every_fixture_type_has_generated_codecs(self):
         """A fixture naming a type the Python module lacks would be skipped
         silently by a lookup-by-name; make it a failure."""
         for case in load_fixtures():
-            self.assertTrue(hasattr(api_types, case["type"]), case["type"])
+            for name in (case["type"], f"decode_{case['type']}", f"encode_{case['type']}"):
+                self.assertTrue(hasattr(api_types, name), name)
 
 
 class TestHiCacheRequestParity(CustomTestCase):
