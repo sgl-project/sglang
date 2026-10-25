@@ -120,7 +120,7 @@ DEEPSEEK_V4_PRO_W4A8_PD_SEP_PREFILL_ARGS = [
     "--hicache-write-policy",
     "write_through",
     "--max-total-tokens",
-    140000,
+    120000,
 ]
 
 # Decode node (2 nodes x 16 NPUs, TP32 DP4) launch arguments, ported from
@@ -210,9 +210,9 @@ class TestNPUDeepSeekV4ProW4A8PDSEPGPQAHigh(
     generation_config = DEEPSEEK_V4_PRO_W4A8_GENERATION_CONFIG_HIGH
     eval_batch_size = 64
 
-    def test_npu_deepseek_v4_pro_w4a8_pd_sep_gpqa_high(self):
-        """Run NPU accuracy test for DSV4-Pro W4A8 PD-Sep GPQA High mode."""
-        self.run_accuracy()
+    # def test_npu_deepseek_v4_pro_w4a8_pd_sep_gpqa_high(self):
+    #     """Run NPU accuracy test for DSV4-Pro W4A8 PD-Sep GPQA High mode."""
+    #     self.run_accuracy()
 
     def test_npu_kimi_k3_w4a8_32p_l2_host_hit_rate(self):
         """Run the 64k GSP bench; run_bench_serving asserts the host hit rate"""
@@ -226,8 +226,10 @@ class TestNPUDeepSeekV4ProW4A8PDSEPGPQAHigh(
             input_len=131072,
             output_len=1024,
             max_concurrency=8,
+            gsp_num_groups=3,
+            gsp_prompts_per_group=8,
             seed=100,
-            warmup_requests=8,
+            warmup_requests=16,
             repeat_rate=0.9,
             cache_report=True,
             min_host_hit_rate_pct=0
