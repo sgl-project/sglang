@@ -211,7 +211,7 @@ def _transfer(req, device):
     tensors, scalars = unpack_tensors(
         [metadata, *[buffer._view for buffer in buffers]], device=device
     )
-    scheduler = SimpleNamespace(worker=SimpleNamespace(pipeline=MiniMaxH3Pipeline))
+    scheduler = SimpleNamespace(_disagg_sampling_params_cls=MiniMaxH3SamplingParams)
     return SchedulerDisaggMixin._build_disagg_req(scheduler, scalars, tensors)
 
 
@@ -285,6 +285,7 @@ def test_prefetch_cpu_extras_wait_for_async_tensor_load():
     scheduler = SimpleNamespace(
         worker=SimpleNamespace(local_rank=torch.cuda.current_device()),
         _disagg_metrics=None,
+        _disagg_sampling_params_cls=SamplingParams,
         _transfer_stream=stream,
         _transfer_manager=SimpleNamespace(load_tensors_async=load),
     )

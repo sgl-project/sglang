@@ -77,6 +77,13 @@ class TestEnableMetrics(CustomTestCase):
                     "sglang:dp_cooperation_realtime_tokens_total",
                     {"mode": "decode"},
                 ),
+                ("sglang:dp_attention_tokens_total", {"kind": "scheduled"}),
+                ("sglang:dp_attention_pairs_total", {"kind": "scheduled"}),
+                ("sglang:dp_attention_steps_total", {"rank_state": "active"}),
+                # Only the attention-rank-0 scheduler observes the ratio; the
+                # other rank's pre-seeded empty histogram must not be picked.
+                ("sglang:dp_attention_token_imbalance_ratio_count", {"tp_rank": "0"}),
+                ("sglang:dp_attention_sync_wait_seconds_count", {}),
             ]
             _check_metrics_positive(self, metrics, metrics_to_check)
 
