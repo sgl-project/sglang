@@ -604,6 +604,15 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
         )
 
     def _resolve_auto_mm_processor_worker_num(self) -> int:
+        return BaseMultimodalProcessor.resolve_auto_mm_processor_worker_num(
+            competes_with_the_scheduler=self._preprocessing_competes_with_the_scheduler(),
+            declared=self.auto_mm_processor_worker_num,
+        )
+
+    @staticmethod
+    def resolve_auto_mm_processor_worker_num(
+        *, competes_with_the_scheduler: bool, declared: Optional[int]
+    ) -> int:
         """The worker count to use when the user did not ask for one.
 
         Two workers overlap preprocessing that runs on the CPU, where the second
@@ -620,9 +629,8 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
         declaration here would exempt exactly the case that regresses.
         `--mm-processor-worker-num` still overrides this.
         """
-        if self._preprocessing_competes_with_the_scheduler():
+        if competes_with_the_scheduler:
             return 1
-        declared = self.auto_mm_processor_worker_num
         return 2 if declared is None else declared
 
     def _fast_image_processor_device(self, processor) -> Optional[str]:
