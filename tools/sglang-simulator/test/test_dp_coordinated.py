@@ -18,6 +18,7 @@ import msgspec
 import pytest
 import zmq
 from sglang_simulator.simulation.coordinator import (
+    Cancel,
     ProtocolError,
     Ready,
     Submit,
@@ -189,6 +190,7 @@ def owners(monkeypatch):
         control=control,
         events=events,
         failures=failures,
+        external=external,
     )
     try:
         yield instance
@@ -342,6 +344,102 @@ def test_one_sided_report_failure_reaches_both_ranks_without_advancing(owners):
     assert isinstance(results[1], ValueError)
     assert all(run.bridge._failure for run in owners.local)
     assert owners.owner.clock.now_ns == 0
+
+
+def test_timer_cancel_of_admitted_waiting_request_reaches_native_before_next_selection(
+    owners,
+):
+    """collect_inflight_reqs excludes waiting B while A owns an active result."""
+
+    def driver():
+        context = zmq.Context()
+        control = context.socket(zmq.REQ)
+        control.setsockopt(zmq.LINGER, 0)
+        control.setsockopt(zmq.RCVTIMEO, 3000)
+        control.connect(owners.external)
+        try:
+            control.send(
+                encode_message(
+                    Ready(
+                        "run", 0, [Submit("a"), Submit("b")], next_wakeup_ns=5_000_000
+                    )
+                )
+            )
+            timer = decode_grant(control.recv())
+            assert timer.now_ns == 5_000_000 and not timer.terminals
+            control.send(encode_message(Ready("run", 1, [Cancel("b")], finished=True)))
+            cancelled = decode_grant(control.recv())
+            assert [(row.rid, row.kind) for row in cancelled.terminals] == [
+                ("b", "CANCELLED")
+            ]
+            control.send(encode_message(Ready("run", 2, [], finished=True)))
+            completed = decode_grant(control.recv())
+            assert [(row.rid, row.kind) for row in completed.terminals] == [
+                ("a", "COMPLETED")
+            ]
+            control.send(encode_message(Ready("run", 3, [], finished=True)))
+            return decode_grant(control.recv())
+        finally:
+            control.close(linger=0)
+            context.term()
+
+    owners.incoming.put(TokenizedGenerateReqInput("a", 0))
+    owners.incoming.put(TokenizedGenerateReqInput("b", 0))
+    a, b = LocalRequest("a"), LocalRequest("b")
+    owners.local[0].scheduler.inflight = [a]
+    owners.local[0].scheduler.waiting_queue = [b]
+    aborted = []
+    for run in owners.local:
+
+        def abort(req, run=run):
+            aborted.append((run.rank, req.rid))
+            run.scheduler.waiting_queue[:] = [
+                r for r in run.scheduler.waiting_queue if r.rid != req.rid
+            ]
+
+        run.scheduler.abort_request = abort
+    step = DSparkStep(
+        0,
+        DSparkTopology(2, 2),
+        (
+            DSparkGroup(0, "TARGET_VERIFY", (request("a"),), '{"fixture":true}'),
+            DSparkGroup(1, "IDLE", (), '{"fixture":true}'),
+        ),
+        '{"fixture":true}',
+    )
+    timing = DSparkStepTiming(
+        0, (DSparkPhaseCost("whole_worker", 0.01, "protocol fixture; not measured"),)
+    )
+    progress = DSparkProgress(0, (("a", 1),), "protocol fixture")
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(driver)
+        assert [len(row) for row in receive(owners)] == [2, 0]
+
+        def execute(run):
+            reqs = [a] if run.rank == 0 else []
+            result = NS(auxiliary_host_output=None)
+            setattr(
+                result,
+                STEP_ATTRIBUTE,
+                DSparkStepResult(step, timing, progress, run.rank),
+            )
+
+            def process():
+                assert "b" in owners.owner._cancel_cleanup
+                assert not owners.local[0].scheduler.waiting_queue
+                for req in reqs:
+                    req.done = True
+
+            return run.bridge.process_batch_result(
+                NS(reqs=reqs), result, process=process, duration=0.01
+            )
+
+        assert both(owners, execute) == [None, None]
+        assert sorted(aborted) == [(0, "b"), (1, "b")]
+        assert not owners.owner._cancel_cleanup
+        assert receive(owners) == [[], []]
+        assert future.result(timeout=4).status == "FINISHED"
 
 
 @pytest.mark.parametrize("failure", ["receive", "timeout", "load_rank"])

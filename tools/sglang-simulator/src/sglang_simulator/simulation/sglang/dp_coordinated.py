@@ -146,7 +146,7 @@ class DPCoordinatedController(CoordinatedScheduler):
             for rid in self._cancel_cleanup:
                 # Use the same paired receipt barrier as ordinary admission.
                 self._admin.append(AbortReq(rid=rid))
-        self._cancel_cleanup.clear()
+            self._cancel_cleanup.clear()
 
     def _dispatch_pending(self):
         values = self._pending + self._admin
@@ -210,7 +210,11 @@ class DPCoordinatedController(CoordinatedScheduler):
             self._inflight = None
 
     def _view(self):
-        rids = {rid for row in self._reports for rid in row["rids"]}
+        # A registered request can be waiting rather than in any current/result
+        # batch. Keep it in the release until both native abort owners ACK.
+        rids = {
+            rid for row in self._reports for rid in row["rids"]
+        } | self._cancel_cleanup
         return {
             "now_ns": self.clock.now_ns,
             "arrivals": {rid: self.clock.request_arrival_ns(rid) for rid in rids},
@@ -310,6 +314,7 @@ class DPCoordinatedController(CoordinatedScheduler):
                     self.clock.terminal(rid, "COMPLETED")
             self._last_forward_id = self._joint_result[0].forward_id
             self._joint_result = None
+            self._cancel_cleanup.clear()
             self._finish_result_time()
         elif phase == "profile_prepare":
             _require(
