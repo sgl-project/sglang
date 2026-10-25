@@ -6,6 +6,7 @@ start_len list         -> one per prompt, repeated for n > 1 like input_ids
 single prompt          -> integer start_len only, whatever n is
 batch / n > 1          -> broadcast a scalar start_len
 text without IDs       -> omit start_len; tokenize later
+positive start_len, legacy or no mm processor -> ValueError; token-space -> accepted
 
 """
 
@@ -15,6 +16,13 @@ from pydantic import ValidationError
 
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.managers.tokenizer_manager import (
+    _reject_unsupported_mm_token_expansion_start_len,
+)
+from sglang.srt.multimodal.processors.qwen_vl import QwenVLImageProcessor
+from sglang.srt.multimodal.token_space_mm_process.sglang import (
+    TokenSpaceSGLangProcessor,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
@@ -73,6 +81,28 @@ class TestMMTokenExpansionStartLen(unittest.TestCase):
                 )
                 with self.assertRaisesRegex(ValueError, "mm_token_expansion_start_len"):
                     request.normalize_batch_and_arguments()
+
+    def test_only_a_token_space_processor_accepts_a_positive_start_len(self):
+        token_space = object.__new__(TokenSpaceSGLangProcessor)
+        legacy = object.__new__(QwenVLImageProcessor)
+        for mm_processor in (None, legacy):
+            with self.subTest(mm_processor=type(mm_processor).__name__):
+                with self.assertRaisesRegex(
+                    ValueError, "--enable-token-space-processor"
+                ):
+                    _reject_unsupported_mm_token_expansion_start_len(
+                        GenerateReqInput(
+                            input_ids=[10, 11], mm_token_expansion_start_len=1
+                        ),
+                        mm_processor,
+                    )
+                _reject_unsupported_mm_token_expansion_start_len(
+                    GenerateReqInput(input_ids=[10, 11]), mm_processor
+                )
+        _reject_unsupported_mm_token_expansion_start_len(
+            GenerateReqInput(input_ids=[10, 11], mm_token_expansion_start_len=1),
+            token_space,
+        )
 
     def test_chat_requires_input_ids(self):
         base = {"model": "test", "messages": [{"role": "user", "content": "hello"}]}
