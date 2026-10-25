@@ -288,6 +288,9 @@ class TestResponseParity(CustomTestCase):
                 "output_token_logprobs_length",
                 "weight_version",
                 "weight_versions",
+                "image_tokens",
+                "audio_tokens",
+                "video_tokens",
             ],
         )
 
