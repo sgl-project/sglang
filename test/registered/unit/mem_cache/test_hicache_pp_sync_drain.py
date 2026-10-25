@@ -132,6 +132,10 @@ class TestPPSyncWindowGloo(CustomTestCase):
 
 
 class TestUnifiedPPSyncBatching(CustomTestCase):
+register_cpu_ci(est_time=9, suite="base-a-test-cpu")
+
+
+class TestUnifiedPPSyncBatching(unittest.TestCase):
     def _make_cache(self, pp_rank, write_ready, load_ready):
         cache = object.__new__(UnifiedRadixCache)
         cache.tree_core = SimpleNamespace(

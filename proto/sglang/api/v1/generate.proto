@@ -1,9 +1,7 @@
-// The native `/generate` surface — the ground truth for
-// rust/sglang-server/src/message/request.rs's GenerateBody (request) and
-// api_core/frame.rs's frame shape (response). Unknown JSON keys on the
-// request are IGNORED: `deny_unknown_fields` broke real clients that send
-// Python-only `GenerateReqInput` fields (session_id,
-// ...), pinned by request.rs's unported-fields test.
+// Shared `/generate` wire contract for HTTP, gRPC, and OpenAI lowering.
+// Native Rust serving supports a subset of Python's fields; its normalization
+// explicitly ignores the Python-only extensions. Unknown JSON keys remain
+// ignored for compatibility with clients sending additional Python fields.
 
 syntax = "proto3";
 
@@ -78,6 +76,24 @@ message GenerateRequest {
   optional string routing_key = 31;
   optional uint64 max_thinking_tokens = 32;
   KvHintsEnvelopeOrList kv_hints = 29;
+
+  // Python serving extensions forwarded by the shared OpenAI processor.
+  // Their presence in the wire contract does not imply native Rust support.
+  optional string session_id = 33;
+  OptionalStringOrList custom_logit_processor = 34;
+  map<string, string> custom_labels = 35;
+  ImagesConfig images_config = 36;
+  bool return_prompt_token_ids = 37;
+  int64 routed_experts_start_len = 38;
+  BoolOrList return_sampling_mask = 39;
+  OptionalStringList modalities = 40;
+}
+
+// Per-request Unlimited-OCR options. The processor owns mode validation and
+// defaults: an absent image_mode uses "gundam", an empty prefix adds no tokens.
+message ImagesConfig {
+  optional string image_mode = 1;
+  string prefix = 2;
 }
 
 message KvHintsEnvelopeOrList {
@@ -184,6 +200,21 @@ message GenerateMetaInfo {
   // reasoning so far; reported on every frame.
   uint32 cached_tokens = 13;
   uint64 reasoning_tokens = 14;
+  // Python reports the cumulative count even for incremental logprob frames.
+  optional uint64 output_token_logprobs_length = 15;
+  optional string weight_version = 16;
+  // Omitted until terminal output; reported spans are always nonempty.
+  repeated WeightVersionSpan weight_versions = 17;
+  // Media prompt tokens per modality, on every frame; omitted when zero.
+  optional uint32 image_tokens = 18;
+  optional uint32 audio_tokens = 19;
+  optional uint32 video_tokens = 20;
+}
+
+message WeightVersionSpan {
+  string version = 1;
+  int64 start = 2;
+  int64 end = 3;
 }
 
 message GenerateResponse {
@@ -196,6 +227,7 @@ message GenerateResponse {
   TokenIds output_ids = 3;
   // Batch position; only on batch responses/frames.
   optional uint32 index = 4;
+  TokenIds prompt_token_ids = 5;
 }
 
 // One request's failure inside a Generate stream; carries its batch position
