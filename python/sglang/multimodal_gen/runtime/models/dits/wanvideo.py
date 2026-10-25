@@ -13,10 +13,8 @@ from sglang.kernels.ops.diffusion import (
     FUSED_LINEAR_GELU,
     NVFP4_BIAS_GELU,
     BitExactFusionGate,
-    can_use_fused_rmsnorm_interleaved_rope,
     can_use_linear_gelu,
     fused_linear_gelu_tanh,
-    fused_rmsnorm_interleaved_rope_,
     fused_temb_table_slices,
     tensors_equal,
 )
@@ -628,11 +626,20 @@ class WanTransformerBlock(nn.Module):
         key, _ = self.to_k(norm_hidden_states)
         value, _ = self.to_v(norm_hidden_states)
         qk_norms = ((query, self.norm_q), (key, self.norm_k))
-        roped = (
+        roped = False
+        if (
             rope_cos_sin_cache is not None
             and self.fuse_qk_norm_rope
             and not torch.compiler.is_compiling()
-            and all(
+        ):
+            # CuTe-DSL kernel: imported on use so platforms without
+            # cuda-python / CUTLASS (e.g. ROCm) can still import this module
+            from sglang.kernels.ops.diffusion import (
+                can_use_fused_rmsnorm_interleaved_rope,
+                fused_rmsnorm_interleaved_rope_,
+            )
+
+            roped = all(
                 can_use_fused_rmsnorm_interleaved_rope(
                     x.view(-1, x.shape[-1]),
                     norm.weight,
@@ -641,7 +648,6 @@ class WanTransformerBlock(nn.Module):
                 )
                 for x, norm in qk_norms
             )
-        )
         if roped:
             for x, norm in qk_norms:
                 fused_rmsnorm_interleaved_rope_(
