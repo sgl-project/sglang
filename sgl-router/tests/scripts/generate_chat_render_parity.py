@@ -10,15 +10,14 @@ import sys
 
 from transformers.utils.hub import cached_file
 
-from sglang.srt.entrypoints.openai import encoding_dsv4
-from sglang.srt.entrypoints.openai.chat_encoding import (
-    resolve_dsv4_reasoning_effort_profile,
-)
+from sglang.srt.entrypoints.openai.chat_encoding_adapters import ChatOutputHooks
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 from sglang.srt.entrypoints.openai.serving_chat import (
-    ThinkingMode,
     normalize_assistant_tool_call_arguments,
     normalize_tool_content,
+)
+from sglang.srt.entrypoints.openai.serving_deepseek_recipe import (
+    DeepSeekRecipeChatEncodingAdapter,
 )
 from sglang.srt.parser.jinja_template_utils import (
     detect_jinja_template_content_format,
@@ -66,6 +65,8 @@ SHAPES = {
     },
 }
 
+_DEEPSEEK_ADAPTERS = {}
+
 
 def snapshot_dir(model_id):
     return pathlib.Path(
@@ -91,24 +92,40 @@ def engine_messages(request, content_format):
     return out
 
 
+def deepseek_prompt_ids(model_id, tok, request):
+    """`dsv4` renders through deepseek-recipe, not Jinja, so ask the serving
+    adapter for the prompt the engine would build."""
+    adapter = _DEEPSEEK_ADAPTERS.get(model_id)
+    if adapter is None:
+        adapter = _DEEPSEEK_ADAPTERS[model_id] = DeepSeekRecipeChatEncodingAdapter(
+            chat_encoding_spec="dsv4",
+            tokenizer=tok,
+            reasoning_parser=None,
+            tool_call_parser=None,
+            chat_hooks=ChatOutputHooks(
+                thinking_requested=lambda _: False,
+                tool_call_parsing_active=lambda _: False,
+                history_tool_calls_count=lambda _: 0,
+                tool_call_id=lambda _item, _count: "",
+            ),
+            default_chat_template_kwargs=None,
+        )
+    return adapter.encode_messages(
+        messages=[message.model_dump() for message in request.messages],
+        request=request,
+        tools=None,
+        thinking=(request.chat_template_kwargs or {}).get("thinking", False),
+        image_data=[],
+    )
+
+
 def engine_prompt_ids(model_id, tok, request):
     """Mirror `_apply_jinja_template` for a text-only request without tools."""
-    snapshot = snapshot_dir(model_id)
-    model_type = json.load(open(snapshot / "config.json")).get("model_type")
+    model_type = json.load(open(snapshot_dir(model_id) / "config.json")).get(
+        "model_type"
+    )
     if model_type == "deepseek_v4":
-        messages = engine_messages(request, "string")
-        if messages[0]["role"] != "system":
-            messages.insert(0, {"role": "system", "content": ""})
-        thinking = (request.chat_template_kwargs or {}).get("thinking", False)
-        text = encoding_dsv4.encode_messages(
-            messages,
-            thinking_mode=ThinkingMode.THINKING if thinking else ThinkingMode.CHAT,
-            reasoning_effort=None,
-            reasoning_effort_profile=resolve_dsv4_reasoning_effort_profile(
-                model_path=str(snapshot)
-            ),
-        )
-        return tok.encode(text)
+        return deepseek_prompt_ids(model_id, tok, request)
 
     template = tok.chat_template
     if not isinstance(template, str):
