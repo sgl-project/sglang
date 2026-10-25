@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field, replace
 
-from sglang_simulator.simulation.sglang.dspark import DSparkStep
+from sglang_simulator.simulation.sglang.dspark import DSparkStep, DSparkStepResult
 from sglang_simulator.simulation.sglang.dspark_reference import (
     DSparkReferenceLedger,
     ReferenceCPUView,
@@ -42,10 +42,14 @@ class DSparkReferenceAdapter:
 
     def _install(self, ledger):
         owned = {
-            request.rid for result in ledger.pending for request in result.step.requests
+            request.rid
+            for result in ledger.pending
+            for request in result.local_group.requests
         }
         if ledger.prepared is not None:
-            owned.update(request.rid for request in ledger.prepared.step.requests)
+            owned.update(
+                request.rid for request in ledger.prepared.local_group.requests
+            )
         remaining = []
         for rid in self.retiring_request_ids:
             if rid in owned:
@@ -76,7 +80,7 @@ class DSparkReferenceAdapter:
         head = self.ledger.pending[0]
         skipped = tuple(
             request.rid
-            for request in head.step.requests
+            for request in head.local_group.requests
             if request.rid in self.retiring_request_ids
         )
         return self._install(
@@ -120,7 +124,11 @@ def _previous_plan(ledger, process_previous_before, skipped_previous_ids):
     _require(
         (not process_previous_before or previous is not None)
         and set(skipped_previous_ids)
-        <= (set() if previous is None else {r.rid for r in previous.step.requests}),
+        <= (
+            set()
+            if previous is None
+            else {r.rid for r in previous.local_group.requests}
+        ),
         "reference synchronization/skips have no matching previous result",
     )
     return None if previous is None else previous.step.forward_id
@@ -147,9 +155,55 @@ class ReferenceStepTransaction:
             and self.prepared_ledger.prepared is not None
             and self.prepared_ledger.prepared.step is self.step
             and type(self.view) is ReferenceCPUView
+            and self.base_ledger.local_attention_dp_rank
+            == self.prepared_ledger.local_attention_dp_rank
+            == self.view.local_attention_dp_rank
+            and self.view.is_idle
+            == (self.prepared_ledger.prepared.local_group.forward_mode == "IDLE")
             and self.previous_forward_id == previous
             and type(self.previous_forward_id) is type(previous),
             "reference transaction does not bind its exact prepared step and prior result",
+        )
+
+    def with_resolved_executions(self, step):
+        """Accept agreed execution JSON before global prediction.
+
+        The peer exchange and source validator remain external owners. Only
+        execution JSON may differ; all before-work request, topology, runtime
+        and forward facts stay frozen. CPU vectors and prior ownership survive.
+        """
+        _require(
+            type(step) is DSparkStep
+            and step.forward_id == self.step.forward_id
+            and step.topology == self.step.topology
+            and step.runtime_profile_json == self.step.runtime_profile_json
+            and all(
+                replace(group, execution_json=before.execution_json) == before
+                for group, before in zip(step.groups, self.step.groups, strict=True)
+            ),
+            "reference execution resolution changed frozen before-work",
+        )
+        prepared = replace(
+            self.prepared_ledger,
+            prepared=replace(self.prepared_ledger.prepared, step=step),
+        )
+        return replace(self, prepared_ledger=prepared, step=step)
+
+    def bind_result(self, result):
+        """Bind shared global prediction data to this receiving native owner.
+
+        Both owners must already agree on the complete resolved global step.
+        This does not merge independently resolved peer steps, run prediction,
+        publish or advance a clock. Call before building this owner's native result.
+        """
+        _require(
+            type(result) is DSparkStepResult and result.step == self.step,
+            "reference local result requires the complete matching global step",
+        )
+        return replace(
+            result,
+            step=self.step,
+            local_attention_dp_rank=self.base_ledger.local_attention_dp_rank,
         )
 
     def complete(self, result, *, current_ledger, process_previous_after=True):
@@ -219,22 +273,32 @@ def prepare_reference_step(
         # Only output count may advance between that event and worker entry.
         _require(
             type(allocation_ledger) is DSparkReferenceLedger
-            and allocation_ledger.prepared is not None,
+            and allocation_ledger.prepared is not None
+            and allocation_ledger.local_attention_dp_rank
+            == ledger.local_attention_dp_rank
+            and type(unresolved_step) is DSparkStep
+            and unresolved_step.topology == allocation_ledger.prepared.step.topology,
             "reference allocation snapshot is absent",
         )
         selected = allocation_ledger.prepared.step
+        rank = ledger.local_attention_dp_rank
+        group = unresolved_step.groups[rank]
+        selected_group = allocation_ledger.prepared.local_group
         rebound = replace(
             unresolved_step,
-            groups=(
+            groups=tuple(
                 replace(
-                    unresolved_step.groups[0],
+                    group,
                     requests=tuple(
                         replace(now, output_tokens_before=then.output_tokens_before)
                         for now, then in zip(
-                            unresolved_step.requests, selected.requests, strict=True
+                            group.requests, selected_group.requests, strict=True
                         )
                     ),
-                ),
+                )
+                if peer.attention_dp_rank == rank
+                else peer
+                for peer in unresolved_step.groups
             ),
         )
         _require(
@@ -256,7 +320,7 @@ def prepare_reference_step(
         needs_cpu_seq_lens=needs_cpu_seq_lens,
     )
     execution = execution_resolver(
-        group=unresolved_step.groups[0],
+        group=prepared.prepared.local_group,
         runtime_profile_json=unresolved_step.runtime_profile_json,
         native_batch=native_batch,
         buffer_capacity=buffer_capacity,
@@ -283,7 +347,12 @@ def prepare_reference_step(
         ) from error
     step = replace(
         unresolved_step,
-        groups=(replace(unresolved_step.groups[0], execution_json=encoded),),
+        groups=tuple(
+            replace(group, execution_json=encoded)
+            if group.attention_dp_rank == ledger.local_attention_dp_rank
+            else group
+            for group in unresolved_step.groups
+        ),
     )
     prepared = replace(prepared, prepared=replace(prepared.prepared, step=step))
     return ReferenceStepTransaction(

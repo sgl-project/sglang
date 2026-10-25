@@ -955,12 +955,13 @@ loop behavior. SGLang Simulator owns scheduling, batching, cache/lifecycle behav
 and virtual time; InferCast supplies cost queries and performance interpolation.
 
 `simulation.sglang.dspark_reference.DSparkReferenceLedger` provides an explicit,
-immutable reference CPU bookkeeping seam for source-bounded TP2 B1-B8 or TP4 B1,
-attention-DP1/PP1, Q6 work. It keeps CPU-processed committed lengths, persistent
-reserved lengths, published prefixes, processed output counts and prefill completion
-separate. Decode preparation calls native `page_aligned_decode_alloc_lens` with
-the original double-buffer reserve; it does not copy the synchronous simulator's
-CPU mirror or implement another allocation formula.
+immutable reference CPU bookkeeping seam for homogeneous TP2/TP4 attention-DP1
+or TP2 attention-DP2/PP1, local B1-B64, Q6 work. It keeps CPU-processed committed
+lengths, persistent reserved lengths, published prefixes, processed output counts
+and prefill completion separate. Decode preparation calls native
+`page_aligned_decode_alloc_lens` with the original double-buffer reserve; it does
+not copy the synchronous simulator's CPU mirror or implement another allocation
+formula.
 
 A source adapter must supply the actual event order: prepare the current batch,
 optionally process a previous result at a synchronization boundary, publish the
@@ -970,6 +971,25 @@ its CPU seed and reserved vector, so later settlement cannot retroactively alter
 the planner input. Known absent future indices retain that seed; resolving a
 published relay uses the explicitly known backend CPU-mirror policy. Unknown
 policy or missing publication rejects rather than becoming a null mirror.
+
+For the TP2/attention-DP2 library path, construct each ledger with its actual
+`local_attention_dp_rank` (default 0 preserves attention-DP1). The full global
+step retains both ordered groups and true topology. Allocation, CPU vectors,
+publication, FIFO settlement, skips and deferred retirement affect only that
+ledger's selected group. An explicitly idle group has an empty CPU view and no
+local allocation or relay; it still owns its global forward's pending result.
+The resolver receives only that selected group and its own before-buffer state,
+and the adapter preserves the peer's execution data. After the existing peer
+exchange, `transaction.with_resolved_executions(agreed_step)` accepts execution
+JSON changes only; all requests, runtime, topology, FID, local CPU vectors and
+prior ownership remain frozen. It does not project execution, perform the exchange
+or attest its source. Both owners must agree on the complete resolved global step
+before the one cost/progress prediction. Call
+`transaction.bind_result(shared_result)` before building each local native result:
+it checks the complete resolved step and binds the receiving rank, while retaining
+the shared timing/progress objects. Publishing a result bound to another rank
+fails. This library seam does not coordinate native peers, publish FutureMaps,
+advance clocks or open the public attention-DP2 factory/runtime guards.
 
 All operations return a new ledger. Keep the original until cost lookup,
 publication and the surrounding transaction succeed. Only typed modeled

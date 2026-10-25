@@ -410,13 +410,13 @@ def test_reference_prepare_rejects_unknown_or_noninteger_page_size(page_size):
     assert ledger.prepared is None
 
 
-@pytest.mark.parametrize("tp,dp", [(2, 2)])
-def test_reference_ledger_does_not_extend_to_other_supported_dspark_layouts(tp, dp):
+def test_reference_ledger_cannot_select_an_adp2_owner_from_an_adp1_step():
     ledger = DSparkReferenceLedger(
-        requests=(seeded(committed=512, allocated=512, published=512),)
+        requests=(seeded(committed=512, allocated=512, published=512),),
+        local_attention_dp_rank=1,
     )
-    with pytest.raises(PredictorError, match="TP2/TP4 ADP1/PP1"):
-        ledger.prepare(step(tp, dp), page_size=256)
+    with pytest.raises(PredictorError, match="local attention-DP rank"):
+        ledger.prepare(step(), page_size=256)
 
 
 def test_reference_ledger_rejects_batch_65_and_mixed_mode():

@@ -22,6 +22,16 @@ def _integer(value, minimum=0):
     return type(value) is int and value >= minimum
 
 
+def _local_group(step, rank):
+    _require(
+        type(step) is DSparkStep
+        and _integer(rank)
+        and rank < step.topology.attention_dp_size,
+        "reference local attention-DP rank is outside its actual step",
+    )
+    return step.groups[rank]
+
+
 def _decode_alloc_lens(reqs, *, reserve, page_size):
     # One allocation formula owner. Import only when explicit reference decode
     # preparation is requested in an environment containing native SGLang.
@@ -70,8 +80,24 @@ class ReferenceRequestKV:
 class ReferenceCPUView:
     seq_lens_cpu: tuple[int, ...] | None
     nxt_kv_lens_cpu: tuple[int, ...] | None
+    local_attention_dp_rank: int = 0
+    is_idle: bool = False
 
     def __post_init__(self):
+        _require(
+            _integer(self.local_attention_dp_rank)
+            and self.local_attention_dp_rank < 2
+            and type(self.is_idle) is bool,
+            "reference CPU view requires an explicit local owner and idle state",
+        )
+        if self.is_idle:
+            _require(
+                type(self.seq_lens_cpu) is tuple
+                and self.seq_lens_cpu == ()
+                and self.nxt_kv_lens_cpu is None,
+                "reference idle CPU view has no local request or reserved vector",
+            )
+            return
         vectors = (self.seq_lens_cpu, self.nxt_kv_lens_cpu)
         _require(
             any(value is not None for value in vectors)
@@ -102,18 +128,24 @@ class PreparedReferenceBatch:
     seed_seq_lens_cpu: tuple[int, ...]
     nxt_kv_lens_cpu: tuple[int, ...] | None
     published_seq_lens: tuple[int | None, ...]
+    local_attention_dp_rank: int = 0
+
+    @property
+    def local_group(self):
+        return _local_group(self.step, self.local_attention_dp_rank)
 
     def __post_init__(self):
         _require(type(self.step) is DSparkStep, "reference view requires a typed step")
-        size = len(self.step.requests)
-        prefill = self.step.groups[0].forward_mode == "EXTEND"
+        group = self.local_group
+        size = len(group.requests)
+        decode = group.forward_mode == "TARGET_VERIFY"
         _require(
             type(self.seed_seq_lens_cpu) is tuple
             and len(self.seed_seq_lens_cpu) == size
             and all(_integer(length) for length in self.seed_seq_lens_cpu)
             and (
                 self.nxt_kv_lens_cpu is None
-                if prefill
+                if not decode
                 else type(self.nxt_kv_lens_cpu) is tuple
                 and len(self.nxt_kv_lens_cpu) == size
                 and all(_integer(length) for length in self.nxt_kv_lens_cpu)
@@ -139,10 +171,20 @@ class PreparedReferenceBatch:
             type(future_indices_ready) is bool,
             "reference future-index readiness is unknown",
         )
+        if self.local_group.forward_mode == "IDLE":
+            _require(
+                not future_indices_ready,
+                "reference idle group cannot resolve a local decode relay",
+            )
+            return ReferenceCPUView((), None, self.local_attention_dp_rank, True)
         if not future_indices_ready:
-            return ReferenceCPUView(self.seed_seq_lens_cpu, self.nxt_kv_lens_cpu)
+            return ReferenceCPUView(
+                self.seed_seq_lens_cpu,
+                self.nxt_kv_lens_cpu,
+                self.local_attention_dp_rank,
+            )
         _require(
-            self.step.groups[0].forward_mode == "TARGET_VERIFY",
+            self.local_group.forward_mode == "TARGET_VERIFY",
             "reference homogeneous prefill does not resolve a decode relay",
         )
         _require(
@@ -156,6 +198,7 @@ class PreparedReferenceBatch:
         return ReferenceCPUView(
             self.published_seq_lens if needs_cpu_seq_lens else None,
             self.nxt_kv_lens_cpu,
+            self.local_attention_dp_rank,
         )
 
 
@@ -174,6 +217,7 @@ class DSparkReferenceLedger:
     pending: tuple[DSparkStepResult, ...] = ()
     prepared: PreparedReferenceBatch | None = None
     last_forward_id: int = -1
+    local_attention_dp_rank: int = 0
 
     def __post_init__(self):
         _require(
@@ -185,6 +229,8 @@ class DSparkReferenceLedger:
             and all(type(row) is DSparkStepResult for row in self.pending)
             and type(self.last_forward_id) is int
             and self.last_forward_id >= -1
+            and _integer(self.local_attention_dp_rank)
+            and self.local_attention_dp_rank < 2
             and (
                 self.prepared is None or type(self.prepared) is PreparedReferenceBatch
             ),
@@ -193,7 +239,15 @@ class DSparkReferenceLedger:
         ids = tuple(row.step.forward_id for row in self.pending)
         _require(
             ids == tuple(sorted(set(ids)))
-            and all(fid <= self.last_forward_id for fid in ids),
+            and all(fid <= self.last_forward_id for fid in ids)
+            and all(
+                result.local_attention_dp_rank == self.local_attention_dp_rank
+                for result in self.pending
+            )
+            and (
+                self.prepared is None
+                or self.prepared.local_attention_dp_rank == self.local_attention_dp_rank
+            ),
             "reference pending results are not in publication order",
         )
 
@@ -211,6 +265,7 @@ class DSparkReferenceLedger:
         _require(
             type(step) is DSparkStep, "reference preparation requires a typed step"
         )
+        group = _local_group(step, self.local_attention_dp_rank)
         _require(
             self.prepared is None
             and len(self.pending) <= 1
@@ -223,18 +278,26 @@ class DSparkReferenceLedger:
                 step.topology.attention_dp_size,
                 step.topology.pp_size,
             )
-            in {(2, 1, 1), (4, 1, 1)}
-            and len(step.groups) == 1
-            and step.groups[0].attention_dp_rank == 0
-            and step.groups[0].forward_mode in {"EXTEND", "TARGET_VERIFY"}
-            and 1 <= len(step.requests) <= 64
+            in {(2, 1, 1), (4, 1, 1), (2, 2, 1)}
+            and {g.forward_mode for g in step.groups} - {"IDLE"}
+            in ({"EXTEND"}, {"TARGET_VERIFY"})
+            and all(len(g.requests) <= 64 for g in step.groups)
             and _integer(page_size, 1),
-            "reference bookkeeping requires TP2/TP4 ADP1/PP1 B1-B64 page domain",
+            "reference bookkeeping requires TP2/TP4 ADP1/PP1 or TP2 ADP2/PP1 B1-B64 page domain",
         )
         rows = {row.rid: row for row in self.requests}
-        prefill = step.groups[0].forward_mode == "EXTEND"
+        _require(
+            not any(
+                request.rid in rows
+                for peer in step.groups
+                if peer.attention_dp_rank != self.local_attention_dp_rank
+                for request in peer.requests
+            ),
+            "reference peer request is already owned by this local ledger",
+        )
+        prefill = group.forward_mode == "EXTEND"
         local = []
-        for request in step.requests:
+        for request in group.requests:
             row = rows.get(request.rid)
             _require(
                 row is None or row.active,
@@ -244,7 +307,9 @@ class DSparkReferenceLedger:
                 _require(
                     not any(
                         result.local_group.forward_mode == "TARGET_VERIFY"
-                        and any(r.rid == request.rid for r in result.step.requests)
+                        and any(
+                            r.rid == request.rid for r in result.local_group.requests
+                        )
                         for result in self.pending
                     ),
                     "reference prefill cannot overwrite an unsettled decode",
@@ -285,7 +350,7 @@ class DSparkReferenceLedger:
             local.append(row)
         seed = tuple(row.kv_committed_len for row in local)
         following = None
-        if not prefill:
+        if group.forward_mode == "TARGET_VERIFY":
             current, following, needed = _decode_alloc_lens(
                 local, reserve=12, page_size=page_size
             )
@@ -307,6 +372,7 @@ class DSparkReferenceLedger:
             seed,
             following,
             tuple(row.published_seq_len for row in local),
+            self.local_attention_dp_rank,
         )
         return replace(self, requests=tuple(rows.values()), prepared=prepared)
 
@@ -314,14 +380,15 @@ class DSparkReferenceLedger:
         _require(
             type(result) is DSparkStepResult
             and self.prepared is not None
-            and result.step is self.prepared.step,
+            and result.step is self.prepared.step
+            and result.local_attention_dp_rank == self.local_attention_dp_rank,
             "reference publication requires its exact prepared modeled result",
         )
         rows = {row.rid: row for row in self.requests}
         prefill = result.local_group.forward_mode == "EXTEND"
-        for request, (_, count) in zip(
-            result.step.requests, result.progress.committed_tokens, strict=True
-        ):
+        counts = dict(result.progress.committed_tokens)
+        for request in result.local_group.requests:
+            count = counts[request.rid]
             _require(
                 not prefill or count == int(request.emits_output),
                 "reference prefill publication requires its native zero/one bonus",
@@ -353,14 +420,15 @@ class DSparkReferenceLedger:
             type(skipped_request_ids) is tuple
             and all(type(rid) is str for rid in skipped_request_ids)
             and len(set(skipped_request_ids)) == len(skipped_request_ids)
-            and set(skipped_request_ids) <= {r.rid for r in result.step.requests},
+            and set(skipped_request_ids)
+            <= {r.rid for r in result.local_group.requests},
             "reference skipped request ownership differs from its pending result",
         )
         rows = {row.rid: row for row in self.requests}
         prefill = result.local_group.forward_mode == "EXTEND"
-        for request, (_, count) in zip(
-            result.step.requests, result.progress.committed_tokens, strict=True
-        ):
+        counts = dict(result.progress.committed_tokens)
+        for request in result.local_group.requests:
+            count = counts[request.rid]
             if request.rid in skipped_request_ids:
                 rows[request.rid] = replace(self.request_for(request.rid), active=False)
                 continue
@@ -391,11 +459,13 @@ class DSparkReferenceLedger:
         _require(
             type(rid) is str and bool(rid), "reference retirement needs a request ID"
         )
-        owned = [result.step for result in self.pending]
+        owned = [result.local_group for result in self.pending]
         if self.prepared is not None:
-            owned.append(self.prepared.step)
+            owned.append(self.prepared.local_group)
         _require(
-            not any(request.rid == rid for step in owned for request in step.requests),
+            not any(
+                request.rid == rid for group in owned for request in group.requests
+            ),
             "reference request retirement still owns prepared or pending work",
         )
         return replace(
