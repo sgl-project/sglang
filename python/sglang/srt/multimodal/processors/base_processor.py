@@ -253,9 +253,6 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
         # Model processors read these; PositionalEmbedsTransport reuses the pool.
         self.mm_feature_transport = self._feature_transport.mm_feature_transport
         self.use_cuda_ipc = self._feature_transport.use_cuda_ipc
-        self.use_ipc_pool_handle_cache = (
-            self._feature_transport.use_ipc_pool_handle_cache
-        )
         self.cudaipc_mmfeature_pool = self._feature_transport.cudaipc_mmfeature_pool
         self.skip_tokenizer_init = get_serving().skip_tokenizer_init
 
@@ -1323,7 +1320,10 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
             return input_ids.flatten().to(dtype=torch.long)
         return torch.tensor(input_ids, dtype=torch.long).flatten()
 
-    def _wrap_tensor_for_cuda_ipc(self, tensor: torch.Tensor):
+    @staticmethod
+    def _wrap_tensor_for_cuda_ipc(
+        self: MultimodalFeatureTransport, tensor: torch.Tensor
+    ):
         """helper function to turn a tensor into a cuda-ipc tensor"""
         if not tensor.is_cuda:
             return tensor
@@ -1343,12 +1343,20 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
     ) -> None:
         if not self.precompute_hash_before_cpu_transfer:
             return
+        BaseMultimodalProcessor.precompute_hashes_before_cpu_transfer(
+            self._feature_transport, mm_items
+        )
 
+    @staticmethod
+    def precompute_hashes_before_cpu_transfer(
+        self: MultimodalFeatureTransport, mm_items: List[MultimodalDataItem]
+    ) -> None:
+        """Hash features in place, then move them to the CPU unless kept on GPU."""
         for item in mm_items:
             item.set_pad_value()
             if not self.keep_mm_features_on_device:
-                item.feature = self._move_feature_to_cpu(item.feature)
-                item.precomputed_embeddings = self._move_feature_to_cpu(
+                item.feature = move_feature_to_cpu(item.feature)
+                item.precomputed_embeddings = move_feature_to_cpu(
                     item.precomputed_embeddings
                 )
 
@@ -1599,6 +1607,14 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
     def _prepare_mm_items_for_transport(
         self, mm_items: List[MultimodalDataItem]
     ) -> List[MultimodalDataItem]:
+        return BaseMultimodalProcessor.prepare_mm_items_for_transport(
+            self._feature_transport, mm_items
+        )
+
+    @staticmethod
+    def prepare_mm_items_for_transport(
+        self: MultimodalFeatureTransport, mm_items: List[MultimodalDataItem]
+    ) -> List[MultimodalDataItem]:
         """Wrap final GPU features, rolling back every lease if one wrap fails."""
         if not self.use_cuda_ipc:
             return mm_items
@@ -1615,7 +1631,9 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
                 for field, tensor in fields:
                     if not isinstance(tensor, torch.Tensor):
                         continue
-                    wrapped = self._wrap_tensor_for_cuda_ipc(tensor)
+                    wrapped = BaseMultimodalProcessor._wrap_tensor_for_cuda_ipc(
+                        self, tensor
+                    )
                     setattr(item, field, wrapped)
                     updates.append((item, field, tensor, wrapped))
         except BaseException as error:

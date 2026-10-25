@@ -332,7 +332,7 @@ class TestMultimodalFeatureTransportRuntime(CustomTestCase):
 
         self.assertEqual(processor.mm_feature_transport, "cuda_ipc")
         self.assertTrue(processor.use_cuda_ipc)
-        self.assertTrue(processor.use_ipc_pool_handle_cache)
+        self.assertTrue(processor._feature_transport.use_ipc_pool_handle_cache)
         memory_pool.assert_called_once()
 
     def test_cuda_ipc_pool_handle_cache_can_be_disabled(self):
@@ -354,7 +354,7 @@ class TestMultimodalFeatureTransportRuntime(CustomTestCase):
             )
 
         self.assertTrue(processor.use_cuda_ipc)
-        self.assertFalse(processor.use_ipc_pool_handle_cache)
+        self.assertFalse(processor._feature_transport.use_ipc_pool_handle_cache)
         memory_pool.assert_called_once()
 
     def test_cpu_transport_does_not_allocate_ipc_pool(self):
@@ -377,7 +377,7 @@ class TestMultimodalFeatureTransportRuntime(CustomTestCase):
 
         self.assertEqual(processor.mm_feature_transport, "cpu")
         self.assertFalse(processor.use_cuda_ipc)
-        self.assertFalse(processor.use_ipc_pool_handle_cache)
+        self.assertFalse(processor._feature_transport.use_ipc_pool_handle_cache)
         memory_pool.assert_not_called()
 
     def test_cuda_vmm_keeps_features_on_device_without_ipc_pool(self):
