@@ -1280,11 +1280,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         src_layer_ids: Optional[List[int]],
         dst_layer_ids: Optional[List[int]],
     ) -> Optional[List[Tuple[int, int, int]]]:
-        """(src entry, dst entry, item_len) to copy, or None on a layout error.
-
-        The PP helpers only select by position, so they slice entry indices
-        here exactly as they slice pointer lists elsewhere.
-        """
+        """(src entry, dst entry, item_len) to copy, or None on a layout error."""
         src_entries = list(range(num_src_entries))
         dst_entries = list(range(num_dst_entries))
         # Decode pp size should be equal to prefill pp size or 1
@@ -1516,7 +1512,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             if dst_kv_item_lens:
                 dst_kv_item_lens = [dst_kv_item_lens[j] for j in dst_indices]
         else:
-            # The PP helper only selects by position: slice entry indices.
             src_entries, dst_entries, _ = self.get_mla_kv_ptrs_with_pp(
                 list(range(len(self.kv_args.kv_data_ptrs))),
                 list(range(len(dst_kv_ptrs))),
@@ -1854,7 +1849,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 allow_positional_fallback=self.pp_size == 1,
             )
         else:
-            # The PP helper only selects by position: slice entry indices.
             src_k, src_v, dst_k, dst_v, layers_current_pp_stage = (
                 self.get_mha_kv_ptrs_with_pp(
                     list(range(len(src_data_ptrs))), list(range(len(dst_kv_ptrs)))
@@ -2435,7 +2429,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_keys: Sequence[MooncakeBufferKey],
     ) -> int:
         try:
-            # The PP helper only selects by position: slice entry indices.
             dst_entries = slice_dsa_tail_dst_ptrs_for_pp(
                 src_ptrs,
                 list(range(len(dst_ptrs))),
@@ -2675,8 +2668,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             "Using SWA state head-slice transfer for different attention TP sizes: "
             f"prefill={self.attn_tp_size}, decode={dst_attn_tp_size}."
         )
-        # _get_mha_head_slice_blocks returns one item per entry, ordered as the
-        # K then V halves the PP helper selects; it only selects by position.
+        # Head-slice blocks follow the K-then-V entry order.
         src_k, src_v, dst_k, dst_v, _ = self.get_mha_kv_ptrs_with_pp(
             list(range(len(src_state_data_ptrs))),
             list(range(len(dst_state_data_ptrs))),

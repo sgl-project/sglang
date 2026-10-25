@@ -86,7 +86,7 @@ class Transport(ABC):
         self, remote: RemoteBuffers, src: BufferKey, dst: BufferKey, ranges: np.ndarray
     ) -> Handle:
         """Start copying local buffer `src` into peer buffer `dst`. Each row of
-        `ranges` is (src_offset, dst_offset, length). Returns without waiting.
+        `ranges` is (src_offset, dst_offset, length).
 
         Transfer errors, including a rejected post, are reported as FAILED on
         the returned handle, so work already posted stays tracked by it. Ranges

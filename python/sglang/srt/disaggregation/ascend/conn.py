@@ -297,8 +297,6 @@ class AscendKVManager(MooncakeKVManager):
             prefill_kv_indices, dst_kv_indices
         )
 
-        # (src entry, dst entry, item_len). The PP helpers only select by
-        # position, so they slice entry indices as they slice pointer lists.
         src_entries = list(range(len(self.kv_args.kv_data_ptrs)))
         dst_entries = list(range(len(dst_kv_ptrs)))
         if self.pp_size > 1:
@@ -425,7 +423,6 @@ class AscendKVManager(MooncakeKVManager):
                 dst_attn_tp_size=dst_attn_tp_size,
             )
 
-        # The PP helper only selects by position: slice entry indices.
         src_kv_ptrs = self.kv_args.kv_data_ptrs
         _, dst_entries, _ = self.get_mla_kv_ptrs_with_pp(
             list(range(len(src_kv_ptrs))), list(range(len(dst_kv_ptrs)))
