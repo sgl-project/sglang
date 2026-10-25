@@ -864,7 +864,7 @@ def write_source_slice(case):
 
 
 @pytest.fixture
-def cohort_case(source_case):
+def cohort_case(source_case, request):
     """Two complete source epochs sharing material identity, without timing rows."""
     if not hasattr(NativeSegmentSourcePolicy, "from_cohort"):
         pytest.skip("requires the SDK profile2 source-cohort API")
@@ -882,6 +882,37 @@ def cohort_case(source_case):
         name: [json.loads(assets[ref["path"]]) for ref in refs]
         for name, refs in case.descriptors.items()
     }
+    tp_size = getattr(request, "param", 2)
+    if tp_size == 4:
+        # Structural CPU fixture only: keep each rank's target/draft ownership
+        # and let the real SDK verify the complete four-rank source cohort.
+        def rank_copy(value, offset=0):
+            if isinstance(value, list):
+                return [rank_copy(item, offset) for item in value]
+            if not isinstance(value, dict):
+                return value
+            result = {}
+            for key, item in value.items():
+                if key in {"tp_size", "attn_tp_size", "moe_tp_size"}:
+                    result[key] = tp_size
+                elif key in {"rank", "tp_rank", "attn_tp_rank", "moe_tp_rank", "pid"}:
+                    result[key] = item + offset
+                else:
+                    result[key] = rank_copy(item, offset)
+            if "allocated_runtime_artifact" in result:
+                result["allocated_runtime_artifact"] = (
+                    f"allocated-runtime-pid-{result['pid']}.json"
+                )
+            return result
+
+        for name, rows in originals.items():
+            originals[name] = [rank_copy(row) for row in rows] + [
+                rank_copy(row, 2) for row in rows
+            ]
+        roles = physical["roles"]
+        physical["roles"] = [rank_copy(row) for row in roles] + [
+            rank_copy(row, 2) for row in roles
+        ]
     for role in physical["roles"]:
         capture = next(
             row
@@ -916,6 +947,7 @@ def cohort_case(source_case):
             stack=retain(assets, "stack", native_segment_stack_identity(stack)),
             schema_version=2,
             driver=driver,
+            tp_size=tp_size,
         ),
     )
     case.stack = stack
@@ -1008,6 +1040,78 @@ def cohort_case(source_case):
         stack_meta=stack,
     )
     return case
+
+
+@pytest.mark.parametrize("cohort_case", [2, 4], indirect=True)
+@pytest.mark.parametrize(
+    "mode,phase", [("EXTEND", "target_prefill"), ("DECODE", "target_verify")]
+)
+def test_native_phase_binding_requires_equal_policy_query_and_step_tp(
+    cohort_case, mode, phase
+):
+    from infercast.sdk.models.umd.templates.deepseek_v41_segments import (
+        prepare_native_dspark_phase,
+    )
+
+    case = cohort_case
+    model = UMDDSparkCostModel(None, native_source_policy=case.policy)
+    step, native, view = before(mode, case)
+    execution = model.execution_for(
+        group=step.groups[0],
+        runtime_profile_json=step.runtime_profile_json,
+        native_batch=native,
+        reference_view=view,
+        buffer_capacity=4,
+        buffer_device_matches=True,
+    )
+    execution.update(draft_buffer_capacity=4, draft_buffer_device_matches=True)
+    group = replace(step.groups[0], execution_json=canonical(execution))
+    step = replace(step, groups=(group,))
+    query = NativeSegmentQuery(
+        case.policy.execution_profile_id,
+        "prefill_target" if mode == "EXTEND" else "decode_target",
+        execution["native_segment_module_variant"],
+    )
+    assert query.native_input.to_dict()["tp_size"] == case.policy.tp_size
+    description, point, graph_phase = prepare_native_dspark_phase(
+        query=query, phase=phase, runtime_profile_json=step.runtime_profile_json
+    )
+    binding = {
+        "description": description,
+        "point": point,
+        "graph_phase": graph_phase,
+        "phase": phase,
+    }
+    if case.policy.tp_size == 2:
+        model._prepare_native(step=step, phase=phase)
+        assert validate_native_region_phase(**binding, step=step)
+    else:
+        with pytest.raises(PredictorError, match="native SDK phase projection"):
+            model._prepare_native(step=step, phase=phase)
+        with pytest.raises(PredictorError, match="phase/source binding"):
+            validate_native_region_phase(**binding, step=step)
+
+    # Even a matching SDK-verified TP4 query remains outside G's current
+    # phase domain. A typed step cannot opt into that domain by relabeling.
+    tp4_step = replace(step, topology=DSparkTopology(4, 1))
+    with pytest.raises(PredictorError, match="native SDK phase projection") as failure:
+        model._prepare_native(step=tp4_step, phase=phase)
+    assert str(failure.value.__cause__) == "native region profile requires TP2/ADP1/PP1"
+    with pytest.raises(PredictorError, match="phase/source binding"):
+        validate_native_region_phase(**binding, step=tp4_step)
+
+    # Recompute a well-typed query with the other TP, retaining the original
+    # profile/runtime labels. Policy-vs-step and query-vs-step are independent
+    # guards; changing the query must not hide either mismatch.
+    variant = json.loads(query.module_variant)
+    variant["native_forward_input"]["tp_size"] = 4 if case.policy.tp_size == 2 else 2
+    changed = NativeSegmentQuery(
+        query.execution_profile_id, query.segment_kind, canonical(variant)
+    )
+    execution["native_segment_module_variant"] = changed.module_variant
+    step = replace(step, groups=(replace(group, execution_json=canonical(execution)),))
+    with pytest.raises(PredictorError, match="native SDK phase projection"):
+        model._prepare_native(step=step, phase=phase)
 
 
 def stage_cohort_metadata(case, *, cohorts=None):

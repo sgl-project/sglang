@@ -93,6 +93,7 @@ def validate_native_region_phase(*, description, point, graph_phase, phase, step
         native = query.native_input
         require(
             query.segment_kind == region
+            and native.to_dict()["tp_size"] == step.topology.tp_size
             and _canonical(node.shape)
             == _canonical(
                 {key: ["lit", value] for key, value in query.to_shape().items()}

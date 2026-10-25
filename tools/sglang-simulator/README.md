@@ -159,6 +159,9 @@ They retain schema2 nominal read semantics and add explicit padded or larger
 capture work; they do not acquire a legacy written-history field. The SDK still
 owns capture selection, source policy and cost admission. Binding a query does
 not expand the current TP2 factory or provide missing measured rows.
+Native phase preparation requires the SDK source policy, typed step and query
+to agree on TP size; the independent graph binder also checks query against step.
+Both paths retain their TP2/ADP1/PP1, single-group domain and reject TP4 explicitly.
 
 For a HuggingFace snapshot whose `config.json` links into the cache's blob
 directory, set `model_config_root` to the explicit containing checkpoint/cache

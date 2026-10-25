@@ -263,6 +263,14 @@ class UMDDSparkCostModel:
                 _REGIONS[group.forward_mode][phase],
                 execution["native_segment_module_variant"],
             )
+            if not (
+                self.native_source_policy.tp_size
+                == step.topology.tp_size
+                == query.native_input.to_dict()["tp_size"]
+            ):
+                raise ValueError(
+                    "native region policy/query topology changed after projection"
+                )
             return prepare_native_dspark_phase(
                 query=query, phase=phase, runtime_profile_json=step.runtime_profile_json
             )
