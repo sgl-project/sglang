@@ -590,6 +590,21 @@ class UlyssesAttention(nn.Module):
             output = _usp_output_all_to_all_varlen(output, seq_lens, head_dim=2)
         return output, replicated_output
 
+    def _new_bcg_output(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        replicated_q: torch.Tensor | None = None,
+        replicated_k: torch.Tensor | None = None,
+        replicated_v: torch.Tensor | None = None,
+        seq_lens: list[int] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        output = _new_attention_output(q, v)
+        if replicated_q is None:
+            return output, None
+        return output, _new_attention_output(replicated_q, replicated_v)
+
 
 class UlyssesAttention_VSA(UlyssesAttention):
     """Distributed attention layer with VSA support."""
@@ -657,6 +672,11 @@ class UlyssesAttention_VSA(UlyssesAttention):
         )
 
         return output
+
+    def _new_bcg_output(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *args, **kwargs
+    ) -> torch.Tensor:
+        return _new_attention_output(q, v)
 
 
 class LocalAttention(nn.Module):
@@ -785,6 +805,15 @@ class LocalAttention(nn.Module):
 
         output = self.attn_impl.forward(q, k, v, attn_metadata=ctx_attn_metadata)
         return output
+
+    def _new_bcg_output(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        attn_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return _new_attention_output(q, v)
 
 
 class USPAttention(nn.Module):
@@ -1575,6 +1604,22 @@ class USPAttention(nn.Module):
 
         return out
 
+    def _new_bcg_output(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        attn_mask: torch.Tensor | None = None,
+        *args,
+        q_prefix: torch.Tensor | None = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        # The masked local path attends over the segmented prefix rows too.
+        num_tokens = q.shape[1]
+        if q_prefix is not None and attn_mask is not None:
+            num_tokens += q_prefix.shape[1]
+        return q.new_empty((q.shape[0], num_tokens, q.shape[2], v.shape[-1]))
+
     def _pipelined_ulysses(
         self,
         q: torch.Tensor,
@@ -2328,22 +2373,8 @@ class USPAttention(nn.Module):
         return out if out is not None else sequential()
 
 
-class _BCGBoxedTupleOutput:
-    """Box a tuple-returning break-point output as tensor attributes.
-
-    ``_copy_output`` copies tensors and objects-with-tensor-attributes in
-    place across replays but ignores tuples, so tuple-returning attention
-    forwards (``UlyssesAttention``) are boxed for the break point and
-    unboxed after.
-    """
-
-    def __init__(self, values: tuple) -> None:
-        self.num_values = len(values)
-        for i, value in enumerate(values):
-            setattr(self, f"value_{i}", value)
-
-    def astuple(self) -> tuple:
-        return tuple(getattr(self, f"value_{i}") for i in range(self.num_values))
+def _new_attention_output(q: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    return q.new_empty((*q.shape[:-1], v.shape[-1]))
 
 
 def _make_breakable_attention_forward(forward_method):
@@ -2353,15 +2384,19 @@ def _make_breakable_attention_forward(forward_method):
     During BCG capture the whole attention forward runs eagerly between
     captured graph segments -- the sequence-parallel all-to-all collectives,
     varlen packing, and dynamic/sparse attention kernels that live here
-    cannot (or should not) be captured into a static CUDA graph. When BCG is
-    disabled this is a transparent pass-through to the original method.
+    cannot (or should not) be captured into a static CUDA graph. The outputs
+    are allocated by the module's ``_new_bcg_output`` before the break, and
+    the break writes them. When BCG is disabled this is a transparent
+    pass-through to the original method.
     """
 
-    def _forward_boxing_tuples(*args, **kwargs):
-        out = forward_method(*args, **kwargs)
-        return _BCGBoxedTupleOutput(out) if isinstance(out, tuple) else out
-
-    bcg_forward = eager_on_graph(True)(_forward_boxing_tuples)
+    @eager_on_graph
+    def bcg_forward(self, out, *args, **kwargs):
+        result = forward_method(self, *args, **kwargs)
+        outs, results = (out, result) if isinstance(out, tuple) else ((out,), (result,))
+        for dst, src in zip(outs, results):
+            if dst is not None:
+                dst.copy_(src)
 
     @functools.wraps(forward_method)
     def forward(self, *args, **kwargs):
@@ -2380,8 +2415,9 @@ def _make_breakable_attention_forward(forward_method):
                 )
             )
             if not capture_dense:
-                out = bcg_forward(self, *args, **kwargs)
-                return out.astuple() if isinstance(out, _BCGBoxedTupleOutput) else out
+                out = self._new_bcg_output(*args, **kwargs)
+                bcg_forward(self, out, *args, **kwargs)
+                return out
         return forward_method(self, *args, **kwargs)
 
     return forward
