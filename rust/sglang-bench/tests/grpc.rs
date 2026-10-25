@@ -155,6 +155,161 @@ impl SglangService for Mock {
     ) -> Result<Response<api::HiCacheStorageResponse>, Status> {
         Err(Status::unimplemented("clear_hi_cache_storage"))
     }
+
+    async fn set_internal_state(
+        &self,
+        _: Request<api::SetInternalStateRequest>,
+    ) -> Result<Response<api::SetInternalStateResponse>, Status> {
+        Err(Status::unimplemented("set_internal_state"))
+    }
+    async fn start_profile(
+        &self,
+        _: Request<api::StartProfileRequest>,
+    ) -> Result<Response<api::ProfileResponse>, Status> {
+        Err(Status::unimplemented("start_profile"))
+    }
+    async fn stop_profile(
+        &self,
+        _: Request<api::StopProfileRequest>,
+    ) -> Result<Response<api::ProfileResponse>, Status> {
+        Err(Status::unimplemented("stop_profile"))
+    }
+    async fn start_expert_distribution_record(
+        &self,
+        _: Request<api::ExpertDistributionRecordRequest>,
+    ) -> Result<Response<api::ExpertDistributionRecordResponse>, Status> {
+        Err(Status::unimplemented("start_expert_distribution_record"))
+    }
+    async fn stop_expert_distribution_record(
+        &self,
+        _: Request<api::ExpertDistributionRecordRequest>,
+    ) -> Result<Response<api::ExpertDistributionRecordResponse>, Status> {
+        Err(Status::unimplemented("stop_expert_distribution_record"))
+    }
+    async fn dump_expert_distribution_record(
+        &self,
+        _: Request<api::ExpertDistributionRecordRequest>,
+    ) -> Result<Response<api::ExpertDistributionRecordResponse>, Status> {
+        Err(Status::unimplemented("dump_expert_distribution_record"))
+    }
+    async fn slow_down(
+        &self,
+        _: Request<api::SlowDownRequest>,
+    ) -> Result<Response<api::SlowDownResponse>, Status> {
+        Err(Status::unimplemented("slow_down"))
+    }
+    async fn release_memory_occupation(
+        &self,
+        _: Request<api::ReleaseMemoryOccupationRequest>,
+    ) -> Result<Response<api::MemoryOccupationResponse>, Status> {
+        Err(Status::unimplemented("release_memory_occupation"))
+    }
+    async fn resume_memory_occupation(
+        &self,
+        _: Request<api::ResumeMemoryOccupationRequest>,
+    ) -> Result<Response<api::MemoryOccupationResponse>, Status> {
+        Err(Status::unimplemented("resume_memory_occupation"))
+    }
+    async fn get_weights_by_name(
+        &self,
+        _: Request<api::GetWeightsByNameRequest>,
+    ) -> Result<Response<api::GetWeightsByNameResponse>, Status> {
+        Err(Status::unimplemented("get_weights_by_name"))
+    }
+    async fn init_weights_update_group(
+        &self,
+        _: Request<api::InitWeightsUpdateGroupRequest>,
+    ) -> Result<Response<api::WeightGroupResponse>, Status> {
+        Err(Status::unimplemented("init_weights_update_group"))
+    }
+    async fn destroy_weights_update_group(
+        &self,
+        _: Request<api::DestroyWeightsUpdateGroupRequest>,
+    ) -> Result<Response<api::WeightGroupResponse>, Status> {
+        Err(Status::unimplemented("destroy_weights_update_group"))
+    }
+    async fn init_weights_send_group_for_remote_instance(
+        &self,
+        _: Request<api::InitWeightsSendGroupForRemoteInstanceRequest>,
+    ) -> Result<Response<api::WeightGroupResponse>, Status> {
+        Err(Status::unimplemented(
+            "init_weights_send_group_for_remote_instance",
+        ))
+    }
+    async fn send_weights_to_remote_instance(
+        &self,
+        _: Request<api::SendWeightsToRemoteInstanceRequest>,
+    ) -> Result<Response<api::WeightGroupResponse>, Status> {
+        Err(Status::unimplemented("send_weights_to_remote_instance"))
+    }
+    async fn get_remote_instance_transfer_engine_info(
+        &self,
+        _: Request<api::RemoteInstanceTransferEngineInfoRequest>,
+    ) -> Result<Response<api::RemoteInstanceTransferEngineInfoResponse>, Status> {
+        Err(Status::unimplemented(
+            "get_remote_instance_transfer_engine_info",
+        ))
+    }
+    async fn parse_function_call(
+        &self,
+        _: Request<api::ParseFunctionCallRequest>,
+    ) -> Result<Response<api::ParseFunctionCallResponse>, Status> {
+        Err(Status::unimplemented("parse_function_call"))
+    }
+    async fn separate_reasoning(
+        &self,
+        _: Request<api::SeparateReasoningRequest>,
+    ) -> Result<Response<api::SeparateReasoningResponse>, Status> {
+        Err(Status::unimplemented("separate_reasoning"))
+    }
+    async fn add_external_corpus(
+        &self,
+        _: Request<api::AddExternalCorpusRequest>,
+    ) -> Result<Response<api::AddExternalCorpusResponse>, Status> {
+        Err(Status::unimplemented("add_external_corpus"))
+    }
+    async fn remove_external_corpus(
+        &self,
+        _: Request<api::RemoveExternalCorpusRequest>,
+    ) -> Result<Response<api::RemoveExternalCorpusResponse>, Status> {
+        Err(Status::unimplemented("remove_external_corpus"))
+    }
+    async fn list_external_corpora(
+        &self,
+        _: Request<api::ListExternalCorporaRequest>,
+    ) -> Result<Response<api::ListExternalCorporaResponse>, Status> {
+        Err(Status::unimplemented("list_external_corpora"))
+    }
+    async fn freeze_gc(
+        &self,
+        _: Request<api::FreezeGcRequest>,
+    ) -> Result<Response<api::FreezeGcResponse>, Status> {
+        Err(Status::unimplemented("freeze_gc"))
+    }
+    async fn pause_generation(
+        &self,
+        _: Request<api::PauseGenerationRequest>,
+    ) -> Result<Response<api::GenerationPauseResponse>, Status> {
+        Err(Status::unimplemented("pause_generation"))
+    }
+    async fn continue_generation(
+        &self,
+        _: Request<api::ContinueGenerationRequest>,
+    ) -> Result<Response<api::GenerationPauseResponse>, Status> {
+        Err(Status::unimplemented("continue_generation"))
+    }
+    async fn pd_role_switch(
+        &self,
+        _: Request<api::PdRoleSwitchRequest>,
+    ) -> Result<Response<api::PdRoleSwitchResponse>, Status> {
+        Err(Status::unimplemented("pd_role_switch"))
+    }
+    async fn update_weight_version(
+        &self,
+        _: Request<api::UpdateWeightVersionRequest>,
+    ) -> Result<Response<api::UpdateWeightVersionResponse>, Status> {
+        Err(Status::unimplemented("update_weight_version"))
+    }
 }
 
 /// Bind on a free port and serve the mock on its own runtime thread, so the
