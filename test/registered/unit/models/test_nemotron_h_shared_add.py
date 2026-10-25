@@ -17,6 +17,7 @@ import torch
 import torch.nn.functional as F
 
 from sglang.srt.layers.linear import ReplicatedLinear
+from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.layers import ReplicatedLinearWithLoRA
 from sglang.srt.models.nemotron_h import (
     NemotronHMoE,
@@ -34,6 +35,8 @@ class _DoubleMethod:
 class _FakeLoRABackend:
     batch_info = object()
     skip_inactive_lora_batches = False
+    skip_inactive_dense_lora = False
+    forward_with_base = BaseLoRABackend.forward_with_base
 
     def get_batch_info(self, layout=None):
         return self.batch_info
