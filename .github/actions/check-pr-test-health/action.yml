@@ -16,6 +16,7 @@ runs:
         SKIP_PR_TEST_HEALTH_CHECK: ${{ env.SKIP_PR_TEST_HEALTH_CHECK }}
       with:
         github-token: ${{ inputs.github-token }}
+        retries: 3
         script: |
           core.info(`[health-check] START -- event=${context.eventName}, runId=${context.runId}`);
 
@@ -62,12 +63,23 @@ runs:
             return;
           }
 
-          const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, {
-            owner: context.repo.owner,
-            repo: context.repo.repo,
-            run_id: context.runId,
-            per_page: 100,
-          });
+          let jobs;
+          try {
+            jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: context.runId,
+              per_page: 100,
+            });
+          } catch (err) {
+            // Only reached once the `retries: 3` above are exhausted.
+            core.warning(
+              `[health-check] SKIP: could not list this run's jobs after 3 retries ` +
+              `(HTTP ${err.status}: ${err.message}). This is a GitHub API error, ` +
+              `not a test failure; this shard will run its tests.`
+            );
+            return;
+          }
           core.info(`[health-check] Total jobs in run: ${jobs.length}`);
           const failedJobs = jobs.filter(j => j.status === 'completed' && j.conclusion === 'failure');
           core.info(`[health-check] Failed jobs (before filtering): ${failedJobs.map(j => `${j.name}(${j.conclusion})`).join(', ') || 'none'}`);
