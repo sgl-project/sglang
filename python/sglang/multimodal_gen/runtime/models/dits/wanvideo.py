@@ -10,14 +10,14 @@ import torch
 import torch.nn as nn
 
 from sglang.kernels.ops.diffusion import (
+    FUSED_LINEAR_GELU,
+    NVFP4_BIAS_GELU,
     BitExactFusionGate,
+    can_use_fused_rmsnorm_interleaved_rope,
     can_use_linear_gelu,
-    fused_gelu_active,
     fused_linear_gelu_tanh,
+    fused_rmsnorm_interleaved_rope_,
     fused_temb_table_slices,
-    mark_fused_gelu_site,
-    mark_nvfp4_bias_gelu_site,
-    nvfp4_bias_gelu_active,
     tensors_equal,
 )
 from sglang.multimodal_gen.configs.models.dits import WanVideoConfig
@@ -102,22 +102,22 @@ class _WanGELUMLP(MLP):
             quant_config=quant_config,
             fuse_bias_gelu_tanh=False,
         )
-        mark_fused_gelu_site(self, "fc_in")
+        FUSED_LINEAR_GELU.mark(self, "fc_in")
         self.fuse_bias_gelu_tanh = isinstance(
             self.fc_in.quant_method, ModelOptFp4LinearMethod
         )
         if self.fuse_bias_gelu_tanh:
-            mark_nvfp4_bias_gelu_site(self)
+            NVFP4_BIAS_GELU.mark(self)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if fused_gelu_active(self) and can_use_linear_gelu(self.fc_in, x):
+        if FUSED_LINEAR_GELU.is_enabled(self) and can_use_linear_gelu(self.fc_in, x):
             x = fused_linear_gelu_tanh(x, self.fc_in.weight, self.fc_in.bias)
         else:
             x, bias = self.fc_in(x)
             x = self._apply_activation(
                 x,
                 bias,
-                use_fused_bias_gelu=nvfp4_bias_gelu_active(self),
+                use_fused_bias_gelu=NVFP4_BIAS_GELU.is_enabled(self),
             )
         x, _ = self.fc_out(x)
         return x
@@ -405,31 +405,18 @@ def _wan_temb_table_slices(
     so the result is bit-identical to the eager chain; the first call still
     verifies ``torch.equal`` and falls back permanently on mismatch.
     """
-    verified = _WAN_TEMB_SLICES.verified
-    if (
-        not _WAN_TEMB_SLICES.disabled
-        and _is_cuda
-        and temb.is_cuda
-        and (verified or _WAN_TEMB_SLICES.can_attempt_once())
-    ):
-        try:
-            buf = fused_temb_table_slices(table, temb)
-        except Exception as exc:
-            _WAN_TEMB_SLICES.on_exception(exc, logger=logger)
-        else:
-            out = tuple(buf[j] for j in range(6))
-            if verified:
-                return out
-            return _WAN_TEMB_SLICES.accept_or_fallback(
-                out,
-                _eager_temb_table_slices(table, temb),
-                equal=tensors_equal,
-                logger=logger,
-                mismatch_msg=(
-                    "Wan fused temb-table slices are not bit-exact on this "
-                    "platform; falling back to eager"
-                ),
-            )
+
+    def fused():
+        buf = fused_temb_table_slices(table, temb)
+        return tuple(buf[j] for j in range(6))
+
+    if _is_cuda and temb.is_cuda:
+        return _WAN_TEMB_SLICES.run(
+            fused,
+            lambda: _eager_temb_table_slices(table, temb),
+            equal=tensors_equal,
+            logger=logger,
+        )
     return _eager_temb_table_slices(table, temb)
 
 
@@ -566,6 +553,13 @@ class WanTransformerBlock(nn.Module):
         assert cross_attn_norm is True
         self.qk_norm = qk_norm
         self.tp_rmsnorm = qk_norm == "rms_norm_across_heads" and tp_size > 1
+        # the across-heads q/k RMSNorm runs FlashInfer's kernel, which the RoPE can join
+        self.fuse_qk_norm_rope = (
+            qk_norm == "rms_norm_across_heads"
+            and not self.tp_rmsnorm
+            and not self.norm_q.cast_x_before_out_mul
+            and self.norm_q._forward_method == self.norm_q.forward_cuda
+        )
         self.self_attn_residual_norm = ScaleResidualLayerNormScaleShift(
             dim,
             eps=eps,
@@ -620,25 +614,61 @@ class WanTransformerBlock(nn.Module):
     def _qkv(
         self, norm_hidden_states: torch.Tensor, local_heads: int
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self._qkv_rope(norm_hidden_states, local_heads, None)[:3]
+
+    def _qkv_rope(
+        self,
+        norm_hidden_states: torch.Tensor,
+        local_heads: int,
+        rope_cos_sin_cache: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]:
+        """q, k, v as [B, S, heads, head_dim], and whether q and k already carry the
+        RoPE of rope_cos_sin_cache (applied in the q/k norm pass)"""
         query, _ = self.to_q(norm_hidden_states)
         key, _ = self.to_k(norm_hidden_states)
         value, _ = self.to_v(norm_hidden_states)
-        if self.norm_q is not None:
-            query = (
-                tensor_parallel_rms_norm(query, self.norm_q)
-                if self.tp_rmsnorm
-                else self.norm_q(query)
+        qk_norms = ((query, self.norm_q), (key, self.norm_k))
+        roped = (
+            rope_cos_sin_cache is not None
+            and self.fuse_qk_norm_rope
+            and not torch.compiler.is_compiling()
+            and all(
+                can_use_fused_rmsnorm_interleaved_rope(
+                    x.view(-1, x.shape[-1]),
+                    norm.weight,
+                    rope_cos_sin_cache,
+                    self.dim_head,
+                )
+                for x, norm in qk_norms
             )
-        if self.norm_k is not None:
-            key = (
-                tensor_parallel_rms_norm(key, self.norm_k)
-                if self.tp_rmsnorm
-                else self.norm_k(key)
-            )
-        return tuple(
+        )
+        if roped:
+            for x, norm in qk_norms:
+                fused_rmsnorm_interleaved_rope_(
+                    x.view(-1, x.shape[-1]),
+                    norm.weight,
+                    rope_cos_sin_cache,
+                    norm.variance_epsilon,
+                    self.dim_head,
+                )
+        else:
+            if self.norm_q is not None:
+                query = (
+                    tensor_parallel_rms_norm(query, self.norm_q)
+                    if self.tp_rmsnorm
+                    else self.norm_q(query)
+                )
+            if self.norm_k is not None:
+                key = (
+                    tensor_parallel_rms_norm(key, self.norm_k)
+                    if self.tp_rmsnorm
+                    else self.norm_k(key)
+                )
+        query, key, value = (
             tensor.squeeze(1).unflatten(2, (local_heads, self.dim_head))
             for tensor in (query, key, value)
         )
+        return query, key, value, roped
 
     def _cross_and_ffn(
         self,
@@ -710,11 +740,15 @@ class WanTransformerBlock(nn.Module):
 
         # 1. Self-attention
         norm_hidden_states = self.norm1(hidden_states, shift_msa, scale_msa)
-        query, key, value = self._qkv(norm_hidden_states, self.local_num_heads)
+        query, key, value, roped = self._qkv_rope(
+            norm_hidden_states, self.local_num_heads, rope_cos_sin_cache
+        )
 
         # Apply rotary embeddings
         cos, sin = freqs_cis
-        if _is_cuda and query.shape == key.shape:
+        if roped:
+            pass
+        elif _is_cuda and query.shape == key.shape:
             # The concatenated cache only depends on freqs_cis, which is fixed
             # for the whole forward; the transformer builds it once per call.
             cos_sin_cache = rope_cos_sin_cache
@@ -1226,8 +1260,8 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 else None
             )
 
-        hidden_states = self.patch_embedding(hidden_states)
-        hidden_states = hidden_states.flatten(2).transpose(1, 2).contiguous()
+        # token-major straight from the patchify GEMM, no [B, C, T, H, W] round trip
+        hidden_states = self.patch_embedding(hidden_states, tokens=True).contiguous()
 
         # shape is [B, T' * H' * W', C]
         seq_len_orig = hidden_states.shape[1]
@@ -1334,6 +1368,9 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             if self.enable_teacache:
                 original_hidden_states = hidden_states.clone()
 
+            # cast once for every block's fp32 add (the TI2V table stays bf16)
+            if timestep_proj.dim() == 3:
+                timestep_proj = timestep_proj.float()
             rope_cos_sin_cache = None
             if _is_cuda and freqs_cis is not None:
                 cos, sin = freqs_cis

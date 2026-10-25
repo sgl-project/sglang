@@ -34,15 +34,21 @@ from sglang.srt.utils.common import (
     is_npu,
     is_xpu,
 )
+from sglang.utils import LazyImport
 
 if is_cuda():
-    from flashinfer.sampling import (
-        min_p_sampling_from_probs,
-        top_k_top_p_sampling_from_probs,
-    )
     from sgl_kernel import (
         top_k_renorm_prob,
         top_p_renorm_prob,
+    )
+
+    # Resolved on first call: CUDA builds without FlashInfer must still import
+    # this module; they default to the pytorch sampling backend.
+    min_p_sampling_from_probs = LazyImport(
+        "flashinfer.sampling", "min_p_sampling_from_probs"
+    )
+    top_k_top_p_sampling_from_probs = LazyImport(
+        "flashinfer.sampling", "top_k_top_p_sampling_from_probs"
     )
 
 if is_musa() or is_xpu():
@@ -868,6 +874,7 @@ def top_k_top_p_min_p_sampling_from_logits_ascend(
     """
     # torch_npu.npu_top_k_top_p requires top_k value range in [1, 1024]
     if hasattr(torch_npu, "npu_top_k_top_p") and npu_top_k_top_p_eligible:
+        top_ps = top_ps.to(logits.dtype)
         logits_top_k_top_p = torch_npu.npu_top_k_top_p(logits, top_ps, top_ks)
         probs_top_k_top_p = logits_top_k_top_p.softmax(dim=-1)
 

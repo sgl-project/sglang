@@ -12,6 +12,8 @@ from typing import TYPE_CHECKING, Optional, Sequence
 
 import msgspec
 
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+
 # Tree node id -- the node handle used outside the TreeCore. The concrete tree
 # node is a TreeCore-internal type.
 NodeId = int
@@ -21,7 +23,7 @@ class BaseEvictionResult(msgspec.Struct):
     """Base of the eviction step results: the component-keyed device/host
     values the step freed, for the Controller to drain right after the call
     returns, plus `tracker` -- the step's per-component evicted counts for the
-    Controller to accumulate."""
+    Controller to accumulate. Free the values, then drain cache actions."""
 
     device_frees: dict[ComponentType, list[torch.Tensor]] = msgspec.field(
         default_factory=lambda: defaultdict(list)
@@ -32,12 +34,15 @@ class BaseEvictionResult(msgspec.Struct):
     tracker: dict[ComponentType, int] = msgspec.field(
         default_factory=lambda: defaultdict(int)
     )
+    cache_actions: list[CacheAction | ComponentAction] = msgspec.field(
+        default_factory=list
+    )
 
     def __del__(self) -> None:
-        # Drop tripwire: every returned value must be drained before disposal.
-        assert not self.device_frees and not self.host_frees, (
-            "BaseEvictionResult dropped with undrained values"
-        )
+        # Drop tripwire: every returned resource must be drained before disposal.
+        assert (
+            not self.device_frees and not self.host_frees and not self.cache_actions
+        ), "BaseEvictionResult dropped with undrained resources"
 
 
 class EvictDeviceNextNodeResult(BaseEvictionResult):
@@ -114,6 +119,7 @@ class TreePathNodeInfo(msgspec.Struct, frozen=True):
     path_end: int
     # Logical FULL device indices; None when the value is absent.
     full_value_len: Optional[int]
+    num_children: int
 
 
 class InsertStepResult(msgspec.Struct, frozen=True):
@@ -151,7 +157,6 @@ if TYPE_CHECKING:
     )
     from sglang.srt.mem_cache.unified_cache.components import (
         CacheTransferPhase,
-        ComponentType,
     )
     from sglang.srt.mem_cache.unified_cache.unified_tree_core import (
         StorageBackupSpec,
@@ -429,6 +434,8 @@ class UnifiedTreeCoreInterface(ABC):
 
         Roots and nodes without device values are no-ops. Missing handles raise
         KeyError; disabled components raise ValueError.
+        Negative totals raise ValueError without updating the count. Rust also
+        rejects fixed-width overflow; Python integers are unbounded.
         """
         ...
 
@@ -544,9 +551,11 @@ class UnifiedTreeCoreInterface(ABC):
         tail_node_id: NodeId,
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
+        cache_actions: list[CacheAction | ComponentAction],
     ) -> None:
         """Evict shallow Mamba device checkpoints beyond the per-path cap on the
-        tail's root path, collecting freed values into the caller's dicts."""
+        tail's root path, collecting freed values and actions into the caller's
+        buffers. The caller frees values, then drains actions, even on error."""
         ...
 
     # ==== HiCache ====
@@ -728,7 +737,11 @@ class UnifiedTreeCoreInterface(ABC):
 
     @abstractmethod
     def swa_tombstone_ranges(
-        self, key: RadixKey, start: int, end: int
+        self,
+        key: RadixKey,
+        start: int,
+        end: int,
+        component_type: ComponentType = ComponentType.SWA,
     ) -> list[tuple[int, int]]:
         """Return maximal missing SWA ranges within the matched [start, end) span."""
         ...
@@ -740,6 +753,7 @@ class UnifiedTreeCoreInterface(ABC):
         window_start: int,
         window_end: int,
         swa_values: torch.Tensor,
+        component_type: ComponentType = ComponentType.SWA,
     ) -> list[CacheAction | ComponentAction]:
         """Attach a loaded SWA window to tombstoned spans, returning split actions.
 
