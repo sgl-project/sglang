@@ -32,6 +32,7 @@ from sglang.srt.layers.linear import (
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
+    resolve_linear_parallel_group,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
@@ -160,6 +161,7 @@ class HunYuanSparseMoeBlock(nn.Module):
             layer_id=layer_id,
             quant_config=quant_config,
         )
+        self.topk.bind_runner_backend(self.experts.runner_backend)
 
         self.gate = ReplicatedLinear(
             config.hidden_size, config.num_experts, bias=False, quant_config=None
@@ -573,6 +575,7 @@ class HunYuanMoEV1ForCausalLM(nn.Module):
         super().__init__()
 
         self.config = config
+        self._kv_cache_parallel_layout = resolve_linear_parallel_group("tp")
 
         self.model = HunYuanModel(config, quant_config, prefix="model")
         self.unpadded_vocab_size = config.vocab_size
@@ -769,8 +772,7 @@ class HunYuanMoEV1ForCausalLM(nn.Module):
     # factors (or else raise an exception). Thus, handled exceptions should
     # make sure to leave KV cache scale factors in a known good (dummy) state
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
-        tp_size = get_parallel().tp_size
-        tp_rank = get_parallel().tp_rank
+        tp_rank, tp_size = self._kv_cache_parallel_layout
         for layer_idx, scaling_factor in kv_cache_scales_loader(
             quantization_param_path,
             tp_rank,
