@@ -64,6 +64,48 @@ def _perf_record(memory_snapshots: dict[str, dict]) -> RequestPerfRecord:
     )
 
 
+@pytest.mark.parametrize("replica_size", [1, 2])
+@pytest.mark.parametrize("propagate", [False, True])
+def test_forward_oom_cannot_reuse_a_multi_rank_replica(
+    replica_size, propagate, monkeypatch
+):
+    worker = GPUWorker.__new__(GPUWorker)
+    worker.is_output_rank = True
+    worker._realtime_sessions = SimpleNamespace(attach=Mock())
+    worker._release_warmup_pool = Mock()
+    worker._record_output_peak_memory = Mock()
+    monkeypatch.setattr(current_platform, "is_cpu", lambda: True)
+    monkeypatch.setattr(
+        gpu_worker_module,
+        "get_replica_group",
+        lambda: SimpleNamespace(world_size=replica_size),
+    )
+    req = SimpleNamespace(is_warmup=False, extra={})
+    oom = torch.OutOfMemoryError("allocator OOM")
+
+    def run():
+        return worker._execute_forward_common(
+            req,
+            forward_fn=Mock(side_effect=oom),
+            log_reqs=[],
+            return_req=False,
+            save_output_paths=Mock(),
+            error_context="test",
+            propagate_forward_errors=propagate,
+        )
+
+    if replica_size > 1:
+        # Must escape the scheduler's request-level `except Exception` handlers.
+        with pytest.raises(SystemExit, match="restart"):
+            run()
+        worker._record_output_peak_memory.assert_not_called()
+    elif propagate:
+        with pytest.raises(torch.OutOfMemoryError):
+            run()
+    else:
+        assert "allocator OOM" in run().error
+
+
 @pytest.mark.parametrize("is_output_rank", [False, True])
 @pytest.mark.parametrize("is_warmup", [False, True])
 def test_worker_perf_dump_has_one_writer_per_replica(
@@ -677,3 +719,25 @@ def test_timing_tolerance_override_leaves_memory_guards_alone():
     with patch.object(current_platform, "is_hip", return_value=False):
         with pytest.raises(AssertionError, match="Runtime Peak VRAM"):
             validator.validate_peak_vram(regression, 10_000.0, 10_000.0)
+
+
+def test_request_metrics_compare_by_identity():
+    """Distinct RequestMetrics instances must not compare equal."""
+    assert perf_logger_module.RequestMetrics("a") != perf_logger_module.RequestMetrics(
+        "b"
+    )
+
+
+def test_log_request_summary_records_requested_tag(monkeypatch, tmp_path):
+    """log_request_summary must record the tag it is given."""
+    monkeypatch.setattr(perf_logger_module, "get_git_commit_hash", lambda: "test")
+    monkeypatch.setattr(perf_logger_module, "get_is_main_process", lambda: True)
+    monkeypatch.setattr(
+        perf_logger_module, "get_diffusion_perf_log_dir", lambda: str(tmp_path)
+    )
+
+    perf_logger_module.PerformanceLogger.log_request_summary(
+        perf_logger_module.RequestMetrics("r1"), tag="custom_tag"
+    )
+
+    assert "custom_tag" in (tmp_path / "performance.log").read_text()

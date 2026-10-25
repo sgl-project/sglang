@@ -26,6 +26,9 @@ def mhc_mega_boundary(
     hc_eps,
     norm_eps,
     sinkhorn_iters,
+    y_fp8=None,
+    y_gemm_sf=None,
+    moe_input=None,
 ):
     """Update the residual, collapse with carried pre, and compute next stats.
 
@@ -33,6 +36,7 @@ def mhc_mega_boundary(
     produced from the updated residual. Preserve this DSv4.1 shifted ordering.
     Used by the opt-in SM10x prefill path. Before CUDA graph capture, warm up
     on the capture stream to initialize DeepGEMM's per-stream barriers.
+    ``y_fp8`` / ``y_gemm_sf`` also receive the normed rows as a DeepGEMM MXFP8 pair.
     """
     rows, hidden = x.shape
     hc = residual.shape[1]
@@ -41,6 +45,11 @@ def mhc_mega_boundary(
     next_pre = torch.empty((rows, hc, 1), device=x.device, dtype=torch.float32)
     next_post = torch.empty_like(next_pre)
     next_comb = torch.empty_like(comb)
+    y_routed_sf = y_shared_sf = None
+    shared_sf_block_m = 0
+    if moe_input is not None:
+        assert y_fp8 is None
+        y_fp8, y_routed_sf, y_shared_sf, shared_sf_block_m = moe_input
     deep_gemm.mega_mhc(
         x=x,
         residual=residual,
@@ -64,5 +73,10 @@ def mhc_mega_boundary(
         new_post_mix=next_post,
         new_comb_res_mix=next_comb,
         y_bf16=normalized,
+        y_fp8=y_fp8,
+        y_gemm_sf=y_gemm_sf,
+        y_routed_sf=y_routed_sf,
+        y_shared_sf=y_shared_sf,
+        shared_sf_block_m=shared_sf_block_m,
     )
     return updated, normalized, (next_pre.squeeze(-1), next_post.squeeze(-1), next_comb)
