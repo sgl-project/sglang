@@ -79,6 +79,9 @@ if TYPE_CHECKING:
 
 _MLA_DECODE_MIN_BLOCK_KV = 32
 
+# Qualified (local query heads, batch) -> value-column partitions on GB300.
+_DFLASH_SWA_MLA_VALUE_SPLITS = {(12, 1): 8, (24, 1): 4, (12, 4): 2}
+
 
 def _mla_decode_kv_splits_cap(
     base_max_kv_splits: int, sm_count: int, max_context_len: int
@@ -409,6 +412,30 @@ class TritonAttnBackend(AttentionBackend):
         self._verify_mask = None
         # Tree-mask scratch is fetched from the target backend only.
         self.is_draft_runner = model_runner.is_draft_worker
+
+        self.use_dflash_swa_mla = (
+            _is_cuda
+            and envs.SGLANG_OPT_DFLASH_SWA_MLA_VALUE_SPLIT.get()
+            and self.is_draft_runner
+            and model_runner.spec_algorithm.is_dflash()
+            and self.use_mla
+            and self.dcp_size == 1
+            and not self.enable_deterministic
+            and not dllm_fa4
+            and self.num_draft_tokens == 8
+            and self.sliding_window_size == 4095
+            and self.num_head in (12, 24)
+            and model_runner.kv_cache_dtype == torch.bfloat16
+            and torch.cuda.get_device_capability(model_runner.gpu_id) == (10, 3)
+        )
+        if self.use_dflash_swa_mla:
+            from sglang.kernels.ops.attention.dflash_swa_mla import (
+                dflash_swa_mla_fwd,
+            )
+
+            self.dflash_swa_mla_fwd = torch.compiler.disable(dflash_swa_mla_fwd)
+            # Larger batches and unmeasured head/batch combinations stay native.
+            self.dflash_swa_mla_max_bs = min(max_bs, 4)
 
         # Auto-detect BLOCK_M that extend_attention kernel will use for this model.
         # This is used by the scheduler's tile-budget admission logic to match
@@ -1883,6 +1910,51 @@ class TritonAttnBackend(AttentionBackend):
                 max_bs=self.req_to_token_pool.size,
             )
         ):
+            return o
+
+        if (
+            self.use_dflash_swa_mla
+            and forward_batch.forward_mode.is_target_verify()
+            and causal
+            and sliding_window_size == 4095
+            and layer.qk_head_dim == 576
+            and layer.v_head_dim == 512
+            and layer.tp_q_head_num == self.num_head
+            and self.forward_metadata.max_extend_len == 8
+            and self.forward_metadata.custom_mask is None
+            and sinks is None
+            and score_mod is None
+            and aux_tensors is None
+            and logits_soft_cap == 0
+            and layer.xai_temperature_len <= 0
+            and layer.k_scale is None
+            and layer.v_scale is None
+            and k is not None
+            and v is not None
+            and k.shape[1:] == (1, 576)
+            and v.shape[1:] == (1, 512)
+            and q.dtype == k.dtype == v.dtype == o.dtype == torch.bfloat16
+            and q.shape[0] == 8 * (self.forward_metadata.qo_indptr.numel() - 1)
+            and 0 < q.shape[0] <= 8 * self.dflash_swa_mla_max_bs
+            and (self.num_head, self.forward_metadata.qo_indptr.numel() - 1)
+            in _DFLASH_SWA_MLA_VALUE_SPLITS
+        ):
+            batch = self.forward_metadata.qo_indptr.numel() - 1
+            num_splits = _DFLASH_SWA_MLA_VALUE_SPLITS[(self.num_head, batch)]
+            self.dflash_swa_mla_fwd(
+                q.view(-1, layer.tp_q_head_num, 576),
+                k.contiguous(),
+                v.contiguous(),
+                o.view(-1, layer.tp_q_head_num, 512),
+                self.token_to_kv_pool.get_key_buffer(layer.layer_id),
+                self.token_to_kv_pool.get_value_buffer(layer.layer_id),
+                self.forward_metadata.qo_indptr,
+                kv_indptr,
+                kv_indices,
+                sm_scale=layer.scaling,
+                num_splits=num_splits,
+                page_size=self.page_size,
+            )
             return o
 
         self._forward_extend_kernel(

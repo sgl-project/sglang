@@ -1492,6 +1492,9 @@ class Envs:
     SGLANG_OPT_FUSED_KDA_VERIFY = EnvBool(False)
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
+    # Native-order BF16 block8/SWA4096 MLA value-column split on GB300.
+    # Opt in only for measured local-head/batch combinations; otherwise native.
+    SGLANG_OPT_DFLASH_SWA_MLA_VALUE_SPLIT = EnvBool(False)
     SGLANG_ENABLE_LILICORR_SAMPLING = EnvBool(False)
     SGLANG_LILICORR_REQUIRE_SAMPLING = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
