@@ -20,7 +20,10 @@ _CONFIGS = {
     (2304, 1536): (64, 6, 8),
 }
 
-_workspaces: dict[torch.device, tuple[torch.Tensor, torch.Tensor]] = {}
+# Split-K partials and arrival counters, one set per (device, stream): the
+# counters are re-armed by the last CTA, so two launches must not share them
+# unless they are stream-ordered.
+_workspaces: dict[tuple[torch.device, int], tuple[torch.Tensor, torch.Tensor]] = {}
 _descriptors: dict[tuple, TensorDescriptor] = {}
 
 
@@ -109,14 +112,15 @@ def _tiny_gemm_fp8_blockwise_kernel(
 
 
 def _workspace(device):
-    if device not in _workspaces:
+    key = (device, torch.cuda.current_stream(device).cuda_stream)
+    if key not in _workspaces:
         partials = max(split * 16 * n for (n, _), (_, split, _) in _CONFIGS.items())
         counters = max(triton.cdiv(n, bw) for (n, _), (bw, _, _) in _CONFIGS.items())
-        _workspaces[device] = (
+        _workspaces[key] = (
             torch.empty(partials, device=device, dtype=torch.float32),
             torch.zeros(counters, device=device, dtype=torch.int32),
         )
-    return _workspaces[device]
+    return _workspaces[key]
 
 
 def _descriptor(weight, bw):
