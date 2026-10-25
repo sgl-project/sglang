@@ -326,7 +326,8 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
     # request the stage regains that whole transfer, well past the
     # non_denoise_stage tolerance. load_peak_vram carries the placed set, so
     # it also pins that the placement happens at load, not on the first use.
-    # The encoder is already layerwise under the default component set.
+    # The encoder is pinned layerwise: on an 80 GB card auto would keep the
+    # whole 1.3B checkpoint resident.
     # No consistency check: the lifetime moves weights, not math, so the
     # output is the base case's and that case already guards it.
     DiffusionTestCase(
@@ -334,6 +335,7 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         DiffusionServerArgs(
             model_path=DEFAULT_WAN_2_1_T2V_1_3B_MODEL_NAME_FOR_TEST,
             extras=[
+                "--component-residency text_encoder=layerwise-offload "
                 "--layerwise-resident-layers text_encoder=0.8 "
                 "--layerwise-residency-lifetime text_encoder=permanent",
             ],
@@ -1361,6 +1363,12 @@ TWO_GPU_CASES = [
         "zimage_image_t2i_2_gpus",
         DiffusionServerArgs(
             model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+        ),
+        # 85x48 image tokens pad to the 1024x1024 warmup's 4096 (2048 per rank)
+        # over another grid, so RoPE tables kept from the warmup corrupt it
+        lead_sampling_params=DiffusionSamplingParams(
+            prompt=T2I_sampling_params.prompt,
+            output_size="1360x768",
         ),
     ),
     DiffusionTestCase(

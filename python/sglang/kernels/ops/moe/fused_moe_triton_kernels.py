@@ -382,6 +382,9 @@ def fused_moe_kernel(
     FUSE_SWIGLU: tl.constexpr = False,
     USE_GDC: tl.constexpr = False,
     GDC_EARLY: tl.constexpr = False,
+    A_OUTPUT_SLICES: tl.constexpr = 1,
+    A_OUTPUT_SLICE_WIDTH: tl.constexpr = 0,
+    A_OUTPUT_SLICE_K: tl.constexpr = 0,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -420,7 +423,14 @@ def fused_moe_kernel(
     # This is done in a grouped ordering to promote L2 data reuse.
     pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
-    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    if A_OUTPUT_SLICES == 2:
+        # Gate/up outputs use separate rank halves of the same shrink result.
+        # Keep each N tile inside one half, including ragged output widths.
+        slice_width: tl.constexpr = A_OUTPUT_SLICE_WIDTH
+        num_pid_n_per_slice: tl.constexpr = tl.cdiv(slice_width, BLOCK_SIZE_N)
+        num_pid_n = 2 * num_pid_n_per_slice
+    else:
+        num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
     group_id = pid // num_pid_in_group
     first_pid_m = group_id * GROUP_SIZE_M
@@ -445,7 +455,11 @@ def fused_moe_kernel(
     off_experts_i32 = tl.load(expert_ids_ptr + pid_m)
     off_experts = off_experts_i32.to(tl.int64)
 
-    if off_experts == -1:
+    if A_OUTPUT_SLICES == 2:
+        inactive_expert = off_experts < 0
+    else:
+        inactive_expert = off_experts == -1
+    if inactive_expert:
         # The down GEMM never reads inactive sorted or half-width intermediates.
         # Add/reduce outputs already hold their initial value and must stay intact.
         if not (c_sorted or FUSE_SWIGLU or FUSE_ADD_TO_OUTPUT or FUSE_SUM_ALL_REDUCE):
@@ -463,7 +477,15 @@ def fused_moe_kernel(
             )
         return
 
-    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
+    if A_OUTPUT_SLICES == 2:
+        output_slice = pid_n // num_pid_n_per_slice
+        local_pid_n = pid_n % num_pid_n_per_slice
+        local_columns = local_pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(
+            tl.int64
+        )
+        offs_bn = local_columns % slice_width + output_slice * slice_width
+    else:
+        offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
     offs_k = tl.arange(0, BLOCK_SIZE_K)
     if a_desc is not None:
         assert use_fp8_w8a8 and group_n > 0 and group_k > 0
@@ -472,6 +494,8 @@ def fused_moe_kernel(
         a_ptrs = a_ptr + (
             offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak
         )
+        if A_OUTPUT_SLICES == 2:
+            a_ptrs += output_slice * A_OUTPUT_SLICE_K * stride_ak
 
     if b_desc is not None:
         start_offs_n = pid_n * BLOCK_SIZE_N
@@ -610,7 +634,12 @@ def fused_moe_kernel(
     accumulator = accumulator.to(compute_type)
     # -----------------------------------------------------------
     # Write back the block of the output
-    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    if A_OUTPUT_SLICES == 2:
+        offs_cn = local_columns + output_slice * slice_width
+        output_column_mask = local_columns < slice_width
+    else:
+        offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        output_column_mask = offs_cn < N
 
     if FUSE_SWIGLU:
         # W13 rows were interleaved at load time, so gate/up of the same
@@ -667,7 +696,7 @@ def fused_moe_kernel(
         offs_token_out = offs_token // ROUTER_TOPK
         add_mask = tl.load(add_mask_ptr + offs_token_out, mask=token_mask, other=False)
         c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
-        c_mask = token_mask[:, None] & add_mask[:, None] & (offs_cn[None, :] < N)
+        c_mask = token_mask[:, None] & add_mask[:, None] & output_column_mask[None, :]
         existing = tl.load(c_ptrs, mask=c_mask, other=0.0)
         tl.store(c_ptrs, existing + accumulator, mask=c_mask)
     # ===== TO BE REFACTORED ====
@@ -810,10 +839,38 @@ def invoke_fused_moe_kernel(
     mask_output: bool = False,
     lora_preserve_base: bool = False,
     fuse_swiglu: bool = False,
+    a_output_slices: int = 1,
 ) -> None:
-    """Inactive expert IDs are always skipped, including with filter_expert=False."""
+    """Skip inactive experts, including with filter_expert=False.
+
+    a_output_slices=2 pairs consecutive A rank halves with B/C output halves
+    on the unquantized add path, without splitting the shrink/expand launches.
+    """
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
+    assert a_output_slices in (1, 2)
+    a_output_slice_width = 0
+    a_output_slice_k = 0
+    if a_output_slices == 2:
+        assert fuse_add_to_output
+        assert add_output_mask is not None
+        assert not mul_routed_weight
+        assert not (use_fp8_w8a8 or use_int8_w8a8 or use_int8_w8a16 or use_int4_w4a16)
+        assert not per_channel_quant and block_shape is None
+        assert not (a_use_tma or b_use_tma or fuse_swiglu or c_sorted)
+        assert not (
+            fuse_sum_all_reduce or mask_output or lora_preserve_base or no_combine
+        )
+        assert bias is None and A_scale is None and B_scale is None and B_zp is None
+        assert A.dtype in (torch.float16, torch.bfloat16)
+        assert B.dtype == C.dtype == A.dtype
+        assert compute_type == (tl.float16 if A.dtype == torch.float16 else tl.bfloat16)
+        assert A.ndim == 2 and B.ndim == 3
+        assert A.shape[1] == 2 * B.shape[2]
+        assert B.shape[1] > 0 and B.shape[1] % 2 == 0
+        assert C.shape[-1] == B.shape[1]
+        a_output_slice_width = B.shape[1] // 2
+        a_output_slice_k = B.shape[2]
 
     if fuse_swiglu:
         # The epilogue assumes an interleaved-gate/up bf16 up-GEMM writing a
@@ -887,7 +944,11 @@ def invoke_fused_moe_kernel(
 
     grid = lambda META: (
         triton.cdiv(sorted_token_ids.shape[0], META["BLOCK_SIZE_M"])
-        * triton.cdiv(B.shape[1], META["BLOCK_SIZE_N"]),
+        * (
+            triton.cdiv(B.shape[1], META["BLOCK_SIZE_N"])
+            if a_output_slices == 1
+            else 2 * triton.cdiv(a_output_slice_width, META["BLOCK_SIZE_N"])
+        ),
     )
 
     K = B.shape[2] - padded_size
@@ -1037,6 +1098,9 @@ def invoke_fused_moe_kernel(
             c_sorted=c_sorted,
             swap_ab=swap_ab,
             FUSE_ADD_TO_OUTPUT=fuse_add_to_output,
+            A_OUTPUT_SLICES=a_output_slices,
+            A_OUTPUT_SLICE_WIDTH=a_output_slice_width,
+            A_OUTPUT_SLICE_K=a_output_slice_k,
             MASK_OUTPUT=mask_output,
             FUSE_SUM_ALL_REDUCE=fuse_sum_all_reduce,
             ROUTER_TOPK=router_topk,

@@ -460,8 +460,21 @@ def _flux2_norm_modulate(
     )
 
 
-def _flux2_swiglu(x: torch.Tensor) -> torch.Tensor:
-    """Bit-exact fused SwiGLU for the packed FLUX.2 FFN projection."""
+def _flux2_swiglu(x: torch.Tensor, out: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """Bit-exact fused SwiGLU for the packed FLUX.2 FFN projection.
+
+    With ``out`` (e.g. a column slice of the next GEMM's input) the result is
+    written there and ``out`` is returned.
+    """
+    if out is None:
+        return _flux2_swiglu_impl(x, None)
+    result = _flux2_swiglu_impl(x, out)
+    if result.data_ptr() != out.data_ptr():
+        out.copy_(result)
+    return out
+
+
+def _flux2_swiglu_impl(x: torch.Tensor, out: Optional[torch.Tensor]) -> torch.Tensor:
     half = x.shape[-1] // 2
     # Let Inductor fuse the reference expression in torch.compile mode.
     if torch.compiler.is_compiling():
@@ -492,7 +505,7 @@ def _flux2_swiglu(x: torch.Tensor) -> torch.Tensor:
         return F.silu(x[..., :half]) * x[..., half:]
     if can_fuse:
         try:
-            out = fused_packed_silu_mul_bitexact(x)
+            out = fused_packed_silu_mul_bitexact(x, out)
         except Exception as exc:
             _FLUX2_SWIGLU.on_exception(exc, logger=logger)
         else:
@@ -513,8 +526,10 @@ class Flux2SwiGLU(nn.Module):
     layer fused into the first linear layer of the FF sub-block. Thus, this module has no trainable parameters.
     """
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return _flux2_swiglu(x)
+    def forward(
+        self, x: torch.Tensor, out: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        return _flux2_swiglu(x, out)
 
 
 class Flux2FeedForward(nn.Module):
@@ -965,13 +980,11 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
         self.norm_q = RMSNorm(dim_head, eps=eps)
         self.norm_k = RMSNorm(dim_head, eps=eps)
 
-        # Fused attention output + MLP output projection.
-        # Input is [attn_shard | mlp_shard] (independently sharded by
-        # MergedColumnParallelLinear), so patch weight loader to pick the
-        # correct non-contiguous columns per rank.
+        # each rank consumes independently sharded attention and MLP inputs
         self.to_out = RowParallelLinear(
             self.inner_dim + self.mlp_hidden_dim,
             self.out_dim,
+            input_sizes=[self.inner_dim, self.mlp_hidden_dim],
             bias=out_bias,
             input_is_parallel=True,
             quant_config=quant_config,
@@ -989,8 +1002,6 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
             and isinstance(self.to_out.quant_method, ModelOptFp4LinearMethod)
         ):
             self._enable_nvfp4_token_cat = True
-        if self.tp_size > 1:
-            self._patch_to_out_weight_loader()
 
         self.attn = USPAttention(
             num_heads=self.local_heads,
@@ -1022,27 +1033,6 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
                 getattr(self.to_out, "quant_method", None), ModelOptFp4LinearMethod
             )
         )
-
-    def _patch_to_out_weight_loader(self) -> None:
-        inner_dim, mlp_dim = self.inner_dim, self.mlp_hidden_dim
-        tp_size, tp_rank = self.tp_size, self.to_out.tp_rank
-
-        def _loader(param, loaded_weight):
-            input_dim = getattr(param, "input_dim", None)
-            if input_dim is not None:
-                a = inner_dim // tp_size
-                m = mlp_dim // tp_size
-                attn_cols = loaded_weight.narrow(input_dim, tp_rank * a, a)
-                mlp_cols = loaded_weight.narrow(input_dim, inner_dim + tp_rank * m, m)
-                param.data.copy_(torch.cat([attn_cols, mlp_cols], dim=input_dim))
-            else:
-                param.data.copy_(loaded_weight)
-
-        self.to_out.weight_loader = _loader
-        if hasattr(self.to_out.weight, "_weight_loader"):
-            self.to_out.weight._weight_loader = _loader
-        else:
-            self.to_out.weight.weight_loader = _loader
 
     def forward(
         self,
@@ -1100,6 +1090,19 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
         )
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.to(query.dtype)
+
+        # BF16: build the output projection's [attn | mlp] input in place. SwiGLU
+        # writes its columns directly and only the narrower attention output is
+        # copied, instead of a full-width cat; the GEMM input is byte-identical.
+        if not (self._enable_fp8_token_cat or self._enable_nvfp4_token_cat):
+            attn_dim = hidden_states.shape[-1]
+            gemm_input = hidden_states.new_empty(
+                (*hidden_states.shape[:-1], attn_dim + mlp_hidden_states.shape[-1] // 2)
+            )
+            self.mlp_act_fn(mlp_hidden_states, out=gemm_input[..., attn_dim:])
+            gemm_input[..., :attn_dim].copy_(hidden_states)
+            hidden_states, _ = self.to_out(gemm_input)
+            return hidden_states
 
         # Handle the feedforward (FF) logic
         mlp_hidden_states = self.mlp_act_fn(mlp_hidden_states)
