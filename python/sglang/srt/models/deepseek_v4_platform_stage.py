@@ -5,8 +5,9 @@ The mixins own platform mHC state, fusion, and TBO operations.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from functools import cached_property
-from typing import TYPE_CHECKING, Optional, Tuple, Union
+from typing import TYPE_CHECKING, NamedTuple, Optional, Tuple, Union
 
 import torch
 
@@ -321,7 +322,7 @@ class NonCudaDecoderMixin:
             return hidden_states, None, None, None
 
         # Return the deferred FFN hc_post state; the next layer consumes it with
-        # cross-layer fusion, and the final layer is completed in DeepseekV4Model.
+        # cross-layer fusion, and PlatformLayerLoop.leave completes the last one.
         return hidden_states, residual, post, comb
 
     def _run_moe_ffn_dp_sync(
@@ -596,6 +597,96 @@ class NonCudaDSparkMixin(NonCudaDecoderMixin):
             x, forward_batch, input_ids=None, input_ids_global=None
         )
         return y.view(shape)
+
+
+class DeferredHcPost(NamedTuple):
+    """A decoder layer's output off CUDA. With fused post+pre, ``residual``,
+    ``post`` and ``comb`` are the FFN hc_post that ``layer`` left for the next
+    layer to fuse; without it they are None and the streams are complete."""
+
+    hidden_states: torch.Tensor
+    residual: Optional[torch.Tensor] = None
+    post: Optional[torch.Tensor] = None
+    comb: Optional[torch.Tensor] = None
+    layer: Optional[NonCudaDecoderMixin] = None
+
+    def complete(self) -> torch.Tensor:
+        if self.residual is None:
+            return self.hidden_states
+        return self.layer.hc_post(
+            self.hidden_states, self.residual, self.post, self.comb
+        )
+
+
+class PlatformLayerLoop:
+    """How a loop over decoder layers carries the residual off CUDA: the loop holds
+    each layer's `DeferredHcPost` and completes the last one itself.
+
+    The interface matches `deepseek_v4_boundary.CudaLayerLoop`.
+    """
+
+    def __init__(self, layers):
+        self.layers = layers
+
+    @staticmethod
+    @contextmanager
+    def forward_scope(forward_batch):
+        yield
+
+    def enter(self, hidden_states, forward_batch):
+        return DeferredHcPost(hidden_states)
+
+    def run(self, i, carry, **call):
+        layer = self.layers[i]
+        hidden_states, residual, post, comb = layer(
+            hidden_states=carry.hidden_states,
+            prev_residual=carry.residual,
+            prev_post=carry.post,
+            prev_comb=carry.comb,
+            **call,
+        )
+        return DeferredHcPost(hidden_states, residual, post, comb, layer)
+
+    def peek(self, carry, forward_batch):
+        return carry.complete()
+
+    def leave(self, carry, forward_batch):
+        return carry.complete()
+
+    @staticmethod
+    def close(forward_batch):
+        pass
+
+
+class PlatformDSparkLoop:
+    """`PlatformLayerLoop` for DSpark stages, which carry a lagged pre-mix instead
+    of a deferred post. Like CUDA's final read, `leave` returns the streams with
+    that pre-mix as an `HcState`, and plain streams without one."""
+
+    def __init__(self, stages):
+        self.stages = stages
+
+    @staticmethod
+    @contextmanager
+    def forward_scope(forward_batch):
+        yield
+
+    def enter(self, hidden_states, forward_batch):
+        return hidden_states, None
+
+    def run(self, i, carry, **call):
+        hidden_states, pre = carry
+        return self.stages[i](hidden_states=hidden_states, prev_pre=pre, **call)
+
+    def leave(self, carry, forward_batch):
+        hidden_states, pre = carry
+        if pre is None:
+            return hidden_states
+        return mhc.HcState(hidden_states, pre)
+
+    @staticmethod
+    def close(forward_batch):
+        pass
 
 
 def forward_layer_fused_boundary(

@@ -22,7 +22,6 @@ from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
 )
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layer_boundary import layer_stack
-from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.utils import get_num_fused_shared_experts
@@ -52,7 +51,10 @@ from sglang.srt.models.deepseek_v4 import (
     hc_head_torch,
     make_hc_head_params,
 )
-from sglang.srt.models.deepseek_v4_platform_stage import NonCudaDSparkMixin
+from sglang.srt.models.deepseek_v4_platform_stage import (
+    NonCudaDSparkMixin,
+    PlatformDSparkLoop,
+)
 from sglang.srt.models.dspark import (
     BaseDSparkMarkovHead,
     DSparkConfidenceHead,
@@ -680,6 +682,7 @@ class DSparkV4PlatformStage(
 
 
 DSparkV4Stage = DSparkV4CudaStage if _is_cuda else DSparkV4PlatformStage
+DSparkLayerLoop = hc_boundary.CudaLayerLoop if _is_cuda else PlatformDSparkLoop
 
 
 class DeepseekV4ForCausalLMDSpark(nn.Module):
@@ -927,39 +930,21 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         get_embedding: bool = False,
         pp_proxy_tensors=None,
     ) -> LogitsProcessorOutput:
-        if not _is_cuda:
+        with DSparkLayerLoop.forward_scope(forward_batch):
             return self._forward_impl(input_ids, positions, forward_batch, input_embeds)
-        from sglang.srt.layers.moe.mega_gate import mega_gate_forward_scope
-
-        try:
-            with mega_gate_forward_scope(forward_batch):
-                return self._forward_impl(
-                    input_ids, positions, forward_batch, input_embeds
-                )
-        finally:
-            residual_batch.clear(forward_batch)
 
     def _forward_impl(self, input_ids, positions, forward_batch, input_embeds):
         if input_embeds is None:
             input_embeds = self.forward_embed(input_ids)
-        x = input_embeds
-        pre = None
-        if _is_cuda:
-            residual_batch.start(forward_batch)
+        loop = DSparkLayerLoop(self.stages)
+        x = loop.enter(input_embeds, forward_batch)
         # Draft stages do not have recorder layer indices.
         with get_global_expert_distribution_recorder().disable_this_region():
-            for stage in self.stages:
-                if _is_cuda:
-                    x = stage(positions, x, forward_batch)
-                else:
-                    x, pre = stage(positions, x, forward_batch, pre)
-        if _is_cuda:
-            x = residual_batch.read_output(
-                x, forward_batch, hc_boundary.FinalRead(), None
-            )
-            if self.hc_pre_from_prev_sublayer:
-                pre, x = x.pre, x.residual
+            for i in range(len(self.stages)):
+                x = loop.run(i, x, positions=positions, forward_batch=forward_batch)
+        x = loop.leave(x, forward_batch)
         if self.hc_pre_from_prev_sublayer:
+            pre, x = x.pre, x.residual
             from sglang.kernels.ops.layernorm.mhc import mhc_combine
 
             # The kernel widens each element to fp32 as it loads it.

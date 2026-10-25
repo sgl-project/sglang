@@ -176,6 +176,7 @@ from sglang.srt.models.deepseek_v2 import (
 from sglang.srt.models.deepseek_v4_mhc import MHC_POST_MULT_VALUE
 from sglang.srt.models.deepseek_v4_platform_stage import (
     NonCudaDecoderMixin,
+    PlatformLayerLoop,
     forward_layer_fused_boundary,
     fused_boundary_attn_input,
 )
@@ -3708,6 +3709,7 @@ class DeepseekV4PlatformDecoderLayer(NonCudaDecoderMixin, DeepseekV4DecoderLayer
 DeepseekV4DecoderLayer = (
     DeepseekV4CudaDecoderLayer if _is_cuda else DeepseekV4PlatformDecoderLayer
 )
+LayerLoop = hc_boundary.CudaLayerLoop if _is_cuda else PlatformLayerLoop
 
 
 class DeepseekV4Model(nn.Module):
@@ -3819,12 +3821,6 @@ class DeepseekV4Model(nn.Module):
                 config,
                 self.engram_layout,
                 image_token_id=_engram_image_token_id(config),
-            )
-
-        if not _is_cuda:
-            self.use_fused_mhc_post_pre = (
-                is_cross_layer_mhc_fusion_enabled()
-                or _is_fused_mhc_post_pre_enabled_xpu()
             )
 
         self.dspark_layers_to_capture: Optional[List[int]] = None
@@ -4341,9 +4337,8 @@ class DeepseekV4Model(nn.Module):
                 outputs_arr[0], outputs_arr[1], "hidden_states", hidden_states.shape[0]
             )
         finally:
-            if _is_cuda:
-                for child in forward_batch.tbo_children:
-                    residual_batch.clear(child)
+            for child in forward_batch.tbo_children:
+                LayerLoop.close(child)
 
     @torch.no_grad()
     def forward(
@@ -4354,19 +4349,10 @@ class DeepseekV4Model(nn.Module):
         input_embeds: Optional[torch.Tensor],
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
-        if not _is_cuda:
+        with LayerLoop.forward_scope(forward_batch):
             return self._forward_impl(
                 input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
             )
-        from sglang.srt.layers.moe.mega_gate import mega_gate_forward_scope
-
-        try:
-            with mega_gate_forward_scope(forward_batch):
-                return self._forward_impl(
-                    input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
-                )
-        finally:
-            residual_batch.clear(forward_batch)
 
     @torch.no_grad()
     def _forward_impl(
@@ -4473,63 +4459,32 @@ class DeepseekV4Model(nn.Module):
                 forward_batch=forward_batch,
             )
         else:
-            if _is_cuda:
-                residual_batch.start(forward_batch)
-            use_fused = not _is_cuda and self.use_fused_mhc_post_pre
-            prev_residual, prev_post, prev_comb = None, None, None
-            last_layer = None
+            loop = LayerLoop(self.layers)
+            carry = loop.enter(hidden_states, forward_batch)
+            del hidden_states
             for i in range(self.start_layer, self.end_layer):
-                layer = self.layers[i]
-                last_layer = layer
                 ctx = (
                     nullcontext()
                     if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
                     else get_global_expert_distribution_recorder().with_current_layer(i)
                 )
                 with ctx:
-                    if _is_cuda:
-                        hidden_states = layer(
-                            positions=positions,
-                            hidden_states=hidden_states,
-                            forward_batch=forward_batch,
-                            input_ids=input_ids,
-                            input_ids_global=input_ids_global,
-                        )
-                    else:
-                        hidden_states, prev_residual, prev_post, prev_comb = layer(
-                            positions=positions,
-                            hidden_states=hidden_states,
-                            forward_batch=forward_batch,
-                            input_ids=input_ids,
-                            input_ids_global=input_ids_global,
-                            prev_residual=prev_residual,
-                            prev_post=prev_post,
-                            prev_comb=prev_comb,
-                        )
+                    carry = loop.run(
+                        i,
+                        carry,
+                        positions=positions,
+                        forward_batch=forward_batch,
+                        input_ids=input_ids,
+                        input_ids_global=input_ids_global,
+                    )
                 if capture_dspark and i in self.dspark_layers_to_capture:
                     from sglang.kernels.ops.layernorm.mhc import mhc_stream_mean
 
-                    if _is_cuda:
-                        completed = hc_boundary.materialize(
-                            hidden_states, forward_batch, consume=False
-                        )
-                    elif use_fused:
-                        completed = layer.hc_post(
-                            hidden_states, prev_residual, prev_post, prev_comb
-                        )
-                    else:
-                        completed = hidden_states
+                    completed = loop.peek(carry, forward_batch)
                     mhc_stream_mean(
                         completed, out=dspark_aux_hidden_states.slot(completed[:, 0])
                     )
-            if _is_cuda:
-                hidden_states = residual_batch.read_output(
-                    hidden_states, forward_batch, hc_boundary.FinalRead(), None
-                )
-            elif use_fused and last_layer is not None:
-                hidden_states = last_layer.hc_post(
-                    hidden_states, prev_residual, prev_post, prev_comb
-                )
+            hidden_states = loop.leave(carry, forward_batch)
 
         if not self.pp_group.is_last_rank:
             # Flatten 3D mHC tensor for PP IPC.

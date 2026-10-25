@@ -1,5 +1,6 @@
 """DeepSeek hyper-connection reads, updates and operand row transport."""
 
+from contextlib import contextmanager
 from functools import partial
 
 import msgspec
@@ -371,6 +372,50 @@ def materialize(hidden_states, batch, *, consume=True, next=None):
     if consume:
         stream.write(result)
     return result
+
+
+class CudaLayerLoop:
+    """How a loop over decoder layers carries the residual on CUDA: in the batch's
+    residual stream, with the loop holding the handle each layer returns.
+
+    Off CUDA, `deepseek_v4_platform_stage.PlatformLayerLoop` (and
+    `PlatformDSparkLoop` for DSpark stages) have the same interface, so the
+    model, NextN and DSpark loops do not branch on the platform.
+    """
+
+    def __init__(self, layers):
+        self.layers = layers
+
+    @staticmethod
+    @contextmanager
+    def forward_scope(forward_batch):
+        """A whole model forward: MegaGate's per-forward row masks, and the stream
+        cleared however the forward ends."""
+        from sglang.srt.layers.moe.mega_gate import mega_gate_forward_scope
+
+        try:
+            with mega_gate_forward_scope(forward_batch):
+                yield
+        finally:
+            residual_batch.clear(forward_batch)
+
+    def enter(self, hidden_states, forward_batch):
+        residual_batch.start(forward_batch)
+        return hidden_states
+
+    def run(self, i, carry, **call):
+        return self.layers[i](hidden_states=carry, **call)
+
+    def peek(self, carry, forward_batch):
+        """The completed streams; the pending update stays with the stream."""
+        return materialize(carry, forward_batch, consume=False)
+
+    def leave(self, carry, forward_batch):
+        return residual_batch.read_output(carry, forward_batch, FinalRead(), None)
+
+    @staticmethod
+    def close(forward_batch):
+        residual_batch.clear(forward_batch)
 
 
 def stages(config, layer_id, *, layer=None):

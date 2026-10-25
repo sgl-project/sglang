@@ -1,6 +1,7 @@
 """Non-CUDA platforms keep decoder, draft and operation contracts."""
 
 import unittest
+import weakref
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -8,6 +9,7 @@ from unittest.mock import Mock, patch
 import torch
 
 from sglang.srt.models import deepseek_v4
+from sglang.srt.models import deepseek_v4_boundary as hc_boundary
 from sglang.srt.models import deepseek_v4_dspark as dspark
 from sglang.srt.models import deepseek_v4_nextn as nextn
 from sglang.srt.models import deepseek_v4_platform_stage as platform_stage
@@ -41,7 +43,7 @@ class TestPlatformDispatch(unittest.TestCase):
         ids = torch.tensor([1])
         batch = SimpleNamespace(input_ids=ids, attn_cp_metadata=None)
         with (
-            patch.object(deepseek_v4, "_is_cuda", True),
+            patch.object(deepseek_v4, "LayerLoop", hc_boundary.CudaLayerLoop),
             patch.object(deepseek_v4, "_is_npu", False),
             patch.object(
                 deepseek_v4,
@@ -91,7 +93,7 @@ class TestPlatformDispatch(unittest.TestCase):
             spec_info=SimpleNamespace(hidden_states=torch.ones(1, 2, 2))
         )
         with (
-            patch.object(nextn, "_is_cuda", True),
+            patch.object(nextn, "LayerLoop", hc_boundary.CudaLayerLoop),
             patch.object(nextn, "_is_npu", False),
             patch.object(
                 nextn, "get_parallel", return_value=SimpleNamespace(attn_dp_size=1)
@@ -126,7 +128,7 @@ class TestPlatformDispatch(unittest.TestCase):
         ids = torch.tensor([1])
         batch = SimpleNamespace(spec_info=SimpleNamespace(hidden_states=streams))
         with (
-            patch.object(nextn, "_is_cuda", False),
+            patch.object(nextn, "LayerLoop", platform_stage.PlatformLayerLoop),
             patch.object(nextn, "_is_npu", False),
             patch.object(
                 nextn, "get_parallel", return_value=SimpleNamespace(attn_dp_size=1)
@@ -163,6 +165,227 @@ class TestPlatformDispatch(unittest.TestCase):
         first = (value + 0.5) * 2 + value
         torch.testing.assert_close(result, (first + 0.5 + 7) + first)
         self.assertIsNone(pre)
+
+
+class TestLayerLoop(unittest.TestCase):
+    """The model, NextN and DSpark loops carry the residual through one interface
+    per platform."""
+
+    @staticmethod
+    def make_model(layers, taps=None):
+        model = deepseek_v4.DeepseekV4Model.__new__(deepseek_v4.DeepseekV4Model)
+        torch.nn.Module.__init__(model)
+        model.pp_group = SimpleNamespace(is_first_rank=True, is_last_rank=True)
+        model.hc_mult = 2
+        model.hc_pre_from_prev_sublayer = False
+        model.dspark_layers_to_capture = taps
+        model.start_layer, model.end_layer = 0, len(layers)
+        model._can_run_tbo = lambda batch: False
+        model.hc_head = lambda value, *args: value.mean(1)
+        model.hc_head_fn = model.hc_head_scale = model.hc_head_base = None
+        model.norm = torch.nn.Identity()
+        model.layers = layers
+        return model
+
+    @staticmethod
+    def run_model(model, loop, broadcasts=None):
+        def broadcast(value, n):
+            streams = value[:, None].repeat(1, n, 1)
+            if broadcasts is not None:
+                broadcasts.append(weakref.ref(streams))
+            return streams
+
+        ids = torch.tensor([1])
+        batch = SimpleNamespace(input_ids=ids, attn_cp_metadata=None)
+        with (
+            patch.object(deepseek_v4, "LayerLoop", loop),
+            patch.object(deepseek_v4, "_is_npu", False),
+            patch.object(
+                deepseek_v4,
+                "get_parallel",
+                return_value=SimpleNamespace(attn_dp_size=1),
+            ),
+            patch.object(deepseek_v4, "get_attn_backend", return_value=object()),
+            patch.object(deepseek_v4, "check_cuda_graph_backend", return_value=False),
+            patch.object(
+                deepseek_v4,
+                "get_global_expert_distribution_recorder",
+                return_value=SimpleNamespace(
+                    with_current_layer=lambda i: nullcontext()
+                ),
+            ),
+            patch("sglang.kernels.ops.layernorm.mhc.hc_broadcast", broadcast),
+        ):
+            return model(ids, ids, batch, torch.ones(1, 2))
+
+    def test_non_cuda_loop_completes_each_deferred_post_once(self):
+        class Layer:
+            def __init__(self, i):
+                self.i = i
+                self.calls = []
+                self.hc_post = Mock(side_effect=lambda x, r, p, c: x + r + p + c)
+
+            def __call__(self, **kwargs):
+                self.calls.append(kwargs)
+                h = kwargs["hidden_states"] + self.i + 1
+                return h, h * 10, torch.full((1,), float(self.i)), torch.full((1,), 2.0)
+
+        layers = [Layer(0), Layer(1)]
+        (result, _), aux = self.run_model(
+            self.make_model(layers, taps=[0]), platform_stage.PlatformLayerLoop
+        )
+        # Layer 1 fuses layer 0's post; the tap reads it completed: 2 + 20 + 0 + 2.
+        torch.testing.assert_close(
+            layers[1].calls[0]["prev_residual"], torch.full((1, 2, 2), 20.0)
+        )
+        torch.testing.assert_close(aux, torch.full((1, 2), 24.0))
+        layers[0].hc_post.assert_called_once()
+        # Only the loop completes the last post: 4 + 40 + 1 + 2.
+        layers[1].hc_post.assert_called_once()
+        torch.testing.assert_close(result, torch.full((1, 2), 47.0))
+
+    def test_loop_releases_its_input_after_the_first_layer(self):
+        from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
+
+        for loop in (hc_boundary.CudaLayerLoop, platform_stage.PlatformLayerLoop):
+            with self.subTest(loop=loop.__name__):
+                broadcasts = []
+
+                def cuda_layer(i):
+                    def run(**kwargs):
+                        if i == 1:
+                            self.assertIsNone(broadcasts[0]())
+                        return residual_batch.set_written(
+                            kwargs["hidden_states"] + 1, kwargs["forward_batch"]
+                        )
+
+                    return run
+
+                def platform_layer(i):
+                    def run(**kwargs):
+                        if i == 1:
+                            self.assertIsNone(broadcasts[0]())
+                        return kwargs["hidden_states"] + 1, None, None, None
+
+                    return run
+
+                make = (
+                    cuda_layer if loop is hc_boundary.CudaLayerLoop else platform_layer
+                )
+                model = self.make_model([make(0), make(1)])
+                result, _ = self.run_model(model, loop, broadcasts)
+                torch.testing.assert_close(result, torch.full((1, 2), 3.0))
+
+    def test_dspark_model_drives_its_real_stage_classes(self):
+        # The loops call the stages by keyword, so the stage classes' own
+        # signatures are what this checks; their computation is stubbed.
+        from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
+
+        def platform_stage_():
+            stage = dspark.DSparkV4PlatformStage.__new__(dspark.DSparkV4PlatformStage)
+            torch.nn.Module.__init__(stage)
+            stage.hc_pre_from_prev_sublayer = False
+            for name in (
+                "hc_attn_fn",
+                "hc_attn_scale",
+                "hc_attn_base",
+                "hc_ffn_fn",
+                "hc_ffn_scale",
+                "hc_ffn_base",
+            ):
+                setattr(stage, name, object())
+            stage.input_layernorm = stage.post_attention_layernorm = torch.nn.Identity()
+            stage.hc_pre = lambda value, *args: (value + 0.5, object(), object(), False)
+            stage.hc_post = lambda value, residual, *args: value + residual
+            stage.self_attn = Mock(
+                side_effect=lambda positions, value, batch: value * 2
+            )
+            stage.self_attn.maybe_use_decode_attn_tp.return_value = nullcontext()
+            stage._run_ffn = lambda value, batch: value + 7
+            return stage
+
+        def cuda_stage():
+            stage = dspark.DSparkV4CudaStage.__new__(dspark.DSparkV4CudaStage)
+            torch.nn.Module.__init__(stage)
+            return stage
+
+        def decoder_forward(
+            self,
+            positions,
+            hidden_states,
+            input_ids,
+            forward_batch,
+            input_ids_global,
+            *,
+            allow_cross_layer_fusion,
+        ):
+            self.assertIsNone(input_ids)
+            self.assertFalse(allow_cross_layer_fusion)
+            return residual_batch.set_written(hidden_states + 1, forward_batch)
+
+        def stage_step(value):
+            first = (value + 0.5) * 2 + value
+            return (first + 0.5 + 7) + first
+
+        embed = torch.ones(1, 2, 2)
+        for cuda in (False, True):
+            with self.subTest(cuda=cuda):
+                model = dspark.DeepseekV4ForCausalLMDSpark.__new__(
+                    dspark.DeepseekV4ForCausalLMDSpark
+                )
+                torch.nn.Module.__init__(model)
+                model.hc_pre_from_prev_sublayer = False
+                make = cuda_stage if cuda else platform_stage_
+                model.stages = torch.nn.ModuleList([make(), make()])
+                model.forward_embed = lambda ids: embed
+                batch = SimpleNamespace()
+                loop = (
+                    hc_boundary.CudaLayerLoop
+                    if cuda
+                    else platform_stage.PlatformDSparkLoop
+                )
+                with (
+                    patch.object(dspark, "DSparkLayerLoop", loop),
+                    patch.object(
+                        dspark,
+                        "get_global_expert_distribution_recorder",
+                        return_value=SimpleNamespace(disable_this_region=nullcontext),
+                    ),
+                    patch.object(
+                        deepseek_v4.DeepseekV4CudaDecoderLayer,
+                        "forward",
+                        lambda stage, *args, **kwargs: decoder_forward(
+                            self, *args, **kwargs
+                        ),
+                    ),
+                ):
+                    out = model(torch.tensor([1]), torch.tensor([0]), batch)
+                expected = embed + 2 if cuda else stage_step(stage_step(embed))
+                torch.testing.assert_close(out.hidden_states, expected)
+                self.assertIsNone(getattr(batch, "residual_stream", None))
+
+    def test_dspark_loop_returns_the_lagged_pre_with_the_streams(self):
+        def stage(i, lagged):
+            def run(*, positions, hidden_states, forward_batch, prev_pre):
+                self.assertEqual(prev_pre, None if i == 0 or not lagged else 0.0)
+                return hidden_states + 1, (float(i) if lagged else None)
+
+            return run
+
+        for lagged in (False, True):
+            with self.subTest(lagged=lagged):
+                loop = platform_stage.PlatformDSparkLoop(
+                    [stage(0, lagged), stage(1, lagged)]
+                )
+                carry = loop.enter(torch.zeros(1), None)
+                for i in range(2):
+                    carry = loop.run(i, carry, positions=None, forward_batch=None)
+                out = loop.leave(carry, None)
+                if lagged:
+                    torch.testing.assert_close(out.residual, torch.full((1,), 2.0))
+                    self.assertEqual(out.pre, 1.0)
+                else:
+                    torch.testing.assert_close(out, torch.full((1,), 2.0))
 
 
 class TestStageLifecycle(unittest.TestCase):

@@ -20,7 +20,6 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layer_boundary import layer_stack
-from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -40,6 +39,7 @@ from sglang.srt.models import deepseek_v4_boundary as hc_boundary
 from sglang.srt.models.deepseek_v4 import (
     DeepseekV4DecoderLayer,
     DeepseekV4ForCausalLM,
+    LayerLoop,
     _is_cuda,
     _is_npu,
     wo_a_fp8_gemm_enabled,
@@ -200,35 +200,23 @@ class DeepseekV4ModelNextN(nn.Module):
             # decoder layer reads the memoized gather instead of re-gathering.
             prime_rope_cos_sin([self.decoder.self_attn], forward_batch, positions)
 
-        if _is_cuda:
-            residual_batch.start(forward_batch)
-            try:
-                hidden_states = self.decoder(
-                    positions=positions,
-                    hidden_states=hidden_states,
-                    forward_batch=forward_batch,
-                    input_ids=input_ids,
-                    input_ids_global=input_ids_global,
-                )
-                hidden_states = residual_batch.read_output(
-                    hidden_states, forward_batch, hc_boundary.FinalRead(), None
-                )
-            finally:
-                residual_batch.clear(forward_batch)
-        else:
-            hidden_states, residual, post, comb = self.decoder(
+        # The single decoder layer leaves no later layer to fuse a deferred hc_post:
+        # leave() completes it.
+        loop = LayerLoop([self.decoder])
+        carry = loop.enter(hidden_states, forward_batch)
+        del hidden_states
+        try:
+            carry = loop.run(
+                0,
+                carry,
                 positions=positions,
-                hidden_states=hidden_states,
                 forward_batch=forward_batch,
                 input_ids=input_ids,
                 input_ids_global=input_ids_global,
             )
-            if residual is not None:
-                # NextN has a single decoder layer, so no later layer can consume a
-                # deferred fused hc_post state.
-                hidden_states = self.decoder.hc_post(
-                    hidden_states, residual, post, comb
-                )
+            hidden_states = loop.leave(carry, forward_batch)
+        finally:
+            loop.close(forward_batch)
 
         pre_hc_head = hidden_states.flatten(1)
 
