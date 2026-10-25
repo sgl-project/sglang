@@ -420,6 +420,9 @@ class ServerArgsAutoTuner:
         args = self.server_args
         if (
             args.use_fsdp_inference
+            and args.num_gpus > 1
+            and args.dp_size == 1
+            and args.transformer_weights_path is None
             and args.is_arg_explicitly_set("use_fsdp_inference")
             and args.explicit_residency_mode("transformer") is None
         ):
