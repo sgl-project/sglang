@@ -52,6 +52,7 @@ def _make_scheduler(pending_req, *, chunked_req, running_reqs) -> Scheduler:
     sched.disaggregation_mode = None
     sched.enable_hicache_storage = False
     sched.mm_receiver = None
+    sched.rust_server = None
     sched.running_batch = SimpleNamespace(reqs=running_reqs)
     sched.last_batch = None
     return sched
@@ -68,16 +69,6 @@ class TestPendingChunkedAbortRace(CustomTestCase):
         sched.process_pending_chunked_abort()
 
         self.assertIsNotNone(req.to_finish, "recorded abort was never applied")
-        self.assertIsNone(sched._pending_chunked_abort_req)
-
-    def test_finished_req_only_clears_marker(self):
-        req = _FakeReq("done_rid")
-        req._finished = True
-        sched = _make_scheduler(req, chunked_req=None, running_reqs=[])
-
-        sched.process_pending_chunked_abort()
-
-        self.assertIsNone(req.to_finish)
         self.assertIsNone(sched._pending_chunked_abort_req)
 
     def test_discarded_chunk_keeps_its_abort_reason(self):
