@@ -21,6 +21,9 @@ from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
+    from sglang.srt.speculative.dspark_components.dspark_config import (
+        DSparkDraftConfig,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -734,6 +737,8 @@ def _handle_dspark(server_args: ServerArgs) -> None:
             "gamma resolution. Error: %s",
             e,
         )
+    if draft_config is not None:
+        _publish_dspark_mla_draft_backend(server_args, draft_config)
 
     gamma: Optional[int] = None
     if cfg.speculative_dspark_block_size is not None:
@@ -812,6 +817,35 @@ def _handle_dspark(server_args: ServerArgs) -> None:
             "--speculative-dspark-sps-table-path feeds the ragged-verify budget "
             "scheduler, which is off under SGLANG_RAGGED_VERIFY_MODE=static; it "
             "will be a no-op."
+        )
+
+
+def _keep_mla_draft_off_trtllm_mha(
+    draft_backend: Optional[str], *, is_mla: bool
+) -> Optional[str]:
+    # trtllm_mha serves only MHA/GQA layers and implies CUDA.
+    if is_mla and draft_backend == "trtllm_mha":
+        logger.warning("MLA drafts cannot use 'trtllm_mha'; using 'flashinfer'.")
+        return "flashinfer"
+    return draft_backend
+
+
+def _publish_dspark_mla_draft_backend(
+    server_args: ServerArgs, draft_config: DSparkDraftConfig
+) -> None:
+    cfg = resolving_view(server_args)
+    draft_backend = cfg.speculative_draft_attention_backend
+    if draft_backend is None:
+        draft_backend, _ = attention_backends_of(resolved_view(server_args))
+    mla_backend = _keep_mla_draft_off_trtllm_mha(
+        draft_backend, is_mla=draft_config.is_mla
+    )
+    if mla_backend != draft_backend:
+        # Declared at launch so the KV planners see the backend the draft runs.
+        declare_resolution(
+            server_args,
+            "_handle_dspark",
+            speculative_draft_attention_backend=mla_backend,
         )
 
 
@@ -898,15 +932,11 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
             and set(layer_types) == {"sliding_attention"}
         )
         all_causal = getattr(draft_text_config, "is_causal", False) is True
-        if parse_dflash_draft_config(draft_hf_config=draft_hf_config).is_mla:
-            # trtllm_mha serves only MHA/GQA layers.
-            fallback_backend = get_fallback_backend()
-            logger.warning(
-                "DFLASH MLA drafts cannot use 'trtllm_mha'. Falling back to '%s'.",
-                fallback_backend,
-            )
-            draft_backend = fallback_backend
-        elif not (all_sliding or all_causal):
+        draft_backend = _keep_mla_draft_off_trtllm_mha(
+            draft_backend,
+            is_mla=parse_dflash_draft_config(draft_hf_config=draft_hf_config).is_mla,
+        )
+        if draft_backend == "trtllm_mha" and not (all_sliding or all_causal):
             fallback_backend = get_fallback_backend()
             # Preserve the CUDA FA4 path without overriding out-of-tree defaults.
             if not current_platform.is_out_of_tree() and get_platform().is_sm100:

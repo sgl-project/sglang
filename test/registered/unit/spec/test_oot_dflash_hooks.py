@@ -4,6 +4,7 @@ from unittest.mock import Mock, patch
 
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.arg_groups.speculative_hook import (
+    _publish_dspark_mla_draft_backend,
     _resolve_dflash_draft_attention_backend,
 )
 from sglang.srt.platforms.interface import SRTPlatform
@@ -109,7 +110,14 @@ class TestOOTDFlashHooks(CustomTestCase):
 class TestDFlashDraftBackendResolution(CustomTestCase):
     """MLA drafts fall back to the default MLA draft backend."""
 
-    def _resolve(self, draft_backend, *, mla, target_backend="fa3"):
+    def _resolve(
+        self,
+        draft_backend,
+        *,
+        mla,
+        target_backend="fa3",
+        resolver=_resolve_dflash_draft_attention_backend,
+    ):
         args = _make_dflash_args(draft_backend)
         platform = Mock(spec=SRTPlatform)
         platform.is_out_of_tree.return_value = False
@@ -133,7 +141,7 @@ class TestDFlashDraftBackendResolution(CustomTestCase):
                 return_value=config,
             ),
         ):
-            _resolve_dflash_draft_attention_backend(args)
+            resolver(args)
         return resolution_result(args, "speculative_draft_attention_backend")
 
     def test_mla_drafts_take_the_default_mla_backend(self):
@@ -144,6 +152,22 @@ class TestDFlashDraftBackendResolution(CustomTestCase):
             self._resolve(None, mla=True, target_backend="trtllm_mla"), "flashinfer"
         )
         self.assertEqual(self._resolve("trtllm_mha", mla=False), "trtllm_mha")
+
+    def test_mla_dspark_draft_publishes_its_fallback(self):
+        """The KV planners read the published draft backend, so an MLA DSpark
+        draft that would inherit trtllm_mha must publish flashinfer."""
+        for mla, expected in ((True, "flashinfer"), (False, None)):
+            self.assertEqual(
+                self._resolve(
+                    None,
+                    mla=mla,
+                    target_backend="trtllm_mha",
+                    resolver=lambda args, mla=mla: _publish_dspark_mla_draft_backend(
+                        args, SimpleNamespace(is_mla=mla)
+                    ),
+                ),
+                expected,
+            )
 
 
 if __name__ == "__main__":

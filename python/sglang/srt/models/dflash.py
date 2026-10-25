@@ -540,13 +540,10 @@ class DFlashMLAAttention(DeepseekV2AttentionMLA):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
         get_attn_tp_context().set_attn_inputs(
             AttentionInputs(hidden_states, forward_batch, self.prepare_qkv_latent)
-        )
-        # Sized for the fp8 bmm scales, which unquantized drafts never take.
-        zero_allocator = BumpAllocator(
-            buffer_size=2, dtype=torch.float32, device=hidden_states.device
         )
         output = super().forward(
             positions=positions,
@@ -748,6 +745,7 @@ class DFlashDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
+        **attn_kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if hidden_states.numel() == 0:
             # Keep return types consistent for upstream callers.
@@ -770,6 +768,7 @@ class DFlashDecoderLayer(nn.Module):
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
+            **attn_kwargs,
         )
         if attention_kernel is not None:
             attn_out = self.attention_conv.finish(attn_out, attention_kernel)
@@ -986,10 +985,18 @@ class DFlashDraftModel(nn.Module):
                 )
         hidden_states = input_embeds
         residual: Optional[torch.Tensor] = None
+        attn_kwargs = {}
+        if self.draft_config.is_mla:
+            # Two fp8 bmm scales per layer, as in DeepseekV2Model.
+            attn_kwargs["zero_allocator"] = BumpAllocator(
+                buffer_size=2 * len(self.layers),
+                dtype=torch.float32,
+                device=hidden_states.device,
+            )
 
         for layer in self.layers:
             hidden_states, residual = layer(
-                positions, hidden_states, forward_batch, residual
+                positions, hidden_states, forward_batch, residual, **attn_kwargs
             )
 
         if hidden_states.numel() != 0:

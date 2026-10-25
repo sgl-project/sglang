@@ -107,6 +107,7 @@ class FlashInferMhaChunkKVRunner:
         self.kv_indptr = attn_backend.kv_indptr
         self.workspace_buffer = attn_backend.workspace_buffer
         self.fmha_backend = attn_backend.fmha_backend
+        self.causal = attn_backend.causal
 
         self.chunk_ragged_wrappers = []
         self.ragged_wrapper = attn_backend.prefill_wrapper_ragged
@@ -168,7 +169,7 @@ class FlashInferMhaChunkKVRunner:
                 head_dim_qk=self.qk_nope_head_dim + self.qk_rope_head_dim,
                 head_dim_vo=self.v_head_dim,
                 q_data_type=self.q_data_type,
-                causal=True,
+                causal=self.causal,
             )
 
     def forward(
@@ -202,7 +203,7 @@ class FlashInferMhaChunkKVRunner:
                 q.view(-1, layer.tp_q_head_num, layer.head_dim),
                 k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype),
                 v.view(-1, layer.tp_v_head_num, layer.v_head_dim).to(q.dtype),
-                causal=True,
+                causal=layer.attn_type != AttentionType.ENCODER_ONLY,
                 sm_scale=layer.scaling,
                 logits_soft_cap=logits_soft_cap,
             )

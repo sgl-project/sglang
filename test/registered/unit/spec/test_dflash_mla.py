@@ -27,6 +27,10 @@ from sglang.srt.speculative.dflash_utils import (
     dflash_draft_cell_size_per_token,
     parse_dflash_draft_config,
 )
+from sglang.srt.speculative.dspark_components.dspark_config import (
+    parse_dspark_draft_config,
+)
+from sglang.srt.utils import BumpAllocator
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.parallel_groups import publish
 from sglang.test.test_utils import CustomTestCase
@@ -178,7 +182,8 @@ def _serve_block(attn, ctx_hidden, ctx_positions, hidden, positions):
             attn.kv_b_proj, "forward", side_effect=AssertionError("expanded K/V")
         ),
     ):
-        return attn(positions, hidden, batch)
+        allocator = BumpAllocator(buffer_size=2, dtype=torch.float32, device="cpu")
+        return attn(positions, hidden, batch, zero_allocator=allocator)
 
 
 class TestDFlashMLA(CustomTestCase):
@@ -196,6 +201,8 @@ class TestDFlashMLA(CustomTestCase):
         ):
             config = {"num_hidden_layers": 2, "dflash_config": dflash_config}
             self.assertTrue(parse_dflash_draft_config(draft_hf_config=config).is_mla)
+            # The DSpark launch hook reads it from DSpark's own parse.
+            self.assertTrue(parse_dspark_draft_config(draft_hf_config=config).is_mla)
         config = {"num_hidden_layers": 2}
         self.assertFalse(parse_dflash_draft_config(draft_hf_config=config).is_mla)
         with self.assertRaisesRegex(ValueError, "mix mla"):
@@ -290,29 +297,6 @@ class TestDFlashMLA(CustomTestCase):
             attn = DFlashMLAAttention(config, layer_id=0)
         self.assertEqual(attn.attn_mqa.sliding_window_size, 3)
 
-    def test_dspark_mla_draft_leaves_inherited_trtllm_mha(self):
-        """A GQA target on Blackwell runs trtllm_mha, which a DSpark draft inherits;
-        an MLA draft must take flashinfer instead or its backend fails to build."""
-        from sglang.srt.speculative.dspark_components import dspark_config
-
-        resolve = "sglang.srt.speculative.draft_worker_common.resolve_draft_worker_attention_backend"
-        mla, gqa = Qwen3Config(**_export_fields()), Qwen3Config(num_hidden_layers=1)
-        for config, inherited, expected in (
-            (mla, "trtllm_mha", "flashinfer"),
-            (gqa, "trtllm_mha", None),
-            (mla, "triton", None),
-        ):
-            with (
-                patch.object(
-                    dspark_config, "_load_draft_hf_config", return_value=config
-                ),
-                patch(resolve, return_value=inherited),
-            ):
-                self.assertEqual(
-                    dspark_config.draft_attention_backend_override(draft_is_moe=False),
-                    expected,
-                )
-
     def test_matches_specforge_reference(self):
         """Context-KV materialization and the block forward reproduce SpecForge's
         expanded attention: partial RoPE, pair convention, K/V of different width."""
@@ -349,6 +333,35 @@ class TestDFlashMLA(CustomTestCase):
                     attn, ctx_hidden, ctx_positions, hidden, positions
                 )
                 torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+
+    def test_prefix_valid_write_skips_rows_past_commit_lens(self):
+        """Rows past commit_lens are not written anywhere, slot 0 included,
+        like the MHA pool's prefix-valid write."""
+        # CUDA runs the tiled kernel, other platforms the row selection.
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        pool = MLATokenToKVPool(
+            size=15,
+            page_size=1,
+            dtype=torch.bfloat16,
+            kv_lora_rank=KV_LORA,
+            qk_rope_head_dim=ROPE,
+            layer_num=1,
+            device=device,
+            enable_memory_saver=False,
+        )
+        pool.kv_buffer[0].fill_(7)
+        latent = torch.randn(6, 1, KV_LORA, dtype=torch.bfloat16, device=device)
+        rope = torch.randn(6, 1, ROPE, dtype=torch.bfloat16, device=device)
+        pool.set_mla_kv_buffer_prefix_valid(
+            SimpleNamespace(layer_id=0),
+            torch.tensor([[3, 4, 5], [8, 9, 10]], device=device),
+            torch.tensor([2, 1], dtype=torch.int32, device=device),
+            latent,
+            rope,
+        )
+        expected = torch.full_like(pool.kv_buffer[0], 7)
+        expected[[3, 4, 8]] = torch.cat((latent, rope), dim=-1)[[0, 1, 3]]
+        torch.testing.assert_close(pool.kv_buffer[0], expected, rtol=0, atol=0)
 
     def test_dspark_commits_verify_rows_through_mla_layer(self):
         """DSpark's fused context-KV paths slice a qkv_proj; an MLA draft must commit
