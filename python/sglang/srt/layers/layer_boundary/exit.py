@@ -25,6 +25,7 @@ from sglang.srt.distributed import GroupCoordinator
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     can_use_dp_reduce_scatter,
+    dp_gather_is_variable,
     is_dp_attention_enabled,
     is_enable_moe_cp_allgather,
 )
@@ -39,10 +40,10 @@ from sglang.srt.layers.layer_boundary.layout import (
     _sum_group,
 )
 from sglang.srt.layers.layer_boundary.ops import (
-    _dp_scatter_step,
     all_reduce_to_dp_local,
     dp_reduce_scatter,
     dp_reduce_scatterv,
+    return_to_dp_local,
     sum_output,
     to_dp_local,
 )
@@ -73,22 +74,30 @@ from sglang.srt.runtime_context import (
 )
 
 
-def _select_dp_reduce_scatter(
+def select_dp_return(
     forward_batch: ForwardBatch,
     *,
     may_reduce_scatter: bool,
+    may_reduce_scatterv: bool,
     reduce_scatterv: bool,
 ) -> Optional[Callable[[torch.Tensor, torch.Tensor, ForwardBatch], None]]:
     """The reduce-scatter that brings an FFN output gathered over attention
     DP back to this rank's tokens when the FFN leaves its sum to it (see
     OutputContract); None when the FFN reduces the output and only a scatter
-    remains. Whether the reduce-scatter is usable follows the DP group, which
-    an elastic scale-up changes, so it is read for each batch."""
-    if reduce_scatterv:
+    remains. ``reduce_scatterv`` is whether the parallel configuration allows
+    the reduce-scatterv; a batch gathered with the variable-length all-gather
+    takes it too, as that gather's inverse, when ``may_reduce_scatterv``.
+    Whether the reduce-scatter is usable follows the DP group, which an
+    elastic scale-up changes, so it is read for each batch."""
+    if reduce_scatterv or (
+        may_reduce_scatterv and dp_gather_is_variable(forward_batch)
+    ):
         return dp_reduce_scatterv
+    padding = forward_batch.dp_padding_mode
     if (
         may_reduce_scatter
-        and forward_batch.dp_padding_mode.is_max_len()
+        and padding is not None
+        and padding.is_max_len()
         and can_use_dp_reduce_scatter()
     ):
         return dp_reduce_scatter
@@ -248,9 +257,10 @@ class ExitPolicy:
         only scatter, or does not move tokens."""
         if not steps.returns_over_dp:
             return None
-        return _select_dp_reduce_scatter(
+        return select_dp_return(
             forward_batch,
             may_reduce_scatter=steps.output.may_reduce_scatter,
+            may_reduce_scatterv=steps.output.may_reduce_scatterv,
             reduce_scatterv=steps.exit.reduce_scatterv,
         )
 
@@ -384,9 +394,7 @@ class ExitPolicy:
         if steps.output.transform is not None:
             hidden_states = steps.output.transform.apply(hidden_states)
         if steps.returns_over_dp:
-            hidden_states = to_dp_local(
-                dp_step or _dp_scatter_step, forward_batch, hidden_states
-            )
+            hidden_states = return_to_dp_local(hidden_states, forward_batch, dp_step)
         else:
             hidden_states, residual = output_move(
                 hidden_states=hidden_states,

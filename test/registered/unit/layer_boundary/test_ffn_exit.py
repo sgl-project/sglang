@@ -360,7 +360,7 @@ class TestSelectFfnCompletion(CustomTestCase):
         return communicator
 
     def left(self, communicator, step, forward_batch=None):
-        with patch_communicator("_select_dp_reduce_scatter", return_value=step):
+        with patch_communicator("select_dp_return", return_value=step):
             completion = communicator.output._decide(
                 forward_batch, communicator.output.plan.path_for(forward_batch)
             )

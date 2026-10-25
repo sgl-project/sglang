@@ -442,7 +442,7 @@ class TestDeferFfnReduction(CustomTestCase):
             residual_stream=types.SimpleNamespace(residual=torch.ones(batch_size, 4)),
         )
         with (
-            patch_communicator("_select_dp_reduce_scatter", return_value=step),
+            patch_communicator("select_dp_return", return_value=step),
             get_forward().scoped(sp_active=sp_active),
             patch_communicator("is_enable_moe_cp_allgather", return_value=False),
             patch_communicator("flashinfer_ar_fusion_applies", return_value=fused),

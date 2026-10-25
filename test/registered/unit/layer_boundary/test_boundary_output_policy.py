@@ -118,11 +118,19 @@ class TestBoundaryOutputPolicy(unittest.TestCase):
     def test_dp_skip_and_collective_are_selected_together(self):
         import itertools
 
-        for policy, varlen, max_len, can_rs in itertools.product(
-            ("ar", "rs", "rsv", "rs+rsv"), (False, True), (False, True), (False, True)
+        for policy, varlen, gatherv, max_len, can_rs in itertools.product(
+            ("ar", "rs", "rsv", "rs+rsv"),
+            (False, True),
+            (False, True),
+            (False, True),
+            (False, True),
         ):
             with self.subTest(
-                policy=policy, varlen=varlen, max_len=max_len, can_rs=can_rs
+                policy=policy,
+                varlen=varlen,
+                gatherv=gatherv,
+                max_len=max_len,
+                can_rs=can_rs,
             ):
                 parallel = fixture.parallel_of(attn_dp=2, attn_tp=1)
                 # Whether the DP return is the reduce-scatterv is the configuration's.
@@ -142,9 +150,11 @@ class TestBoundaryOutputPolicy(unittest.TestCase):
                     calls.append("AR")
                     return value * 2
 
+                # A batch gathered with the variable-length all-gather returns
+                # through its inverse, whatever the configuration allows.
                 selected = (
                     "dp_reduce_scatterv"
-                    if varlen and policy in ("rsv", "rs+rsv")
+                    if (varlen or gatherv) and policy in ("rsv", "rs+rsv")
                     else "dp_reduce_scatter"
                     if max_len and can_rs and policy in ("rs", "rs+rsv")
                     else "_dp_scatter_step"
@@ -152,6 +162,7 @@ class TestBoundaryOutputPolicy(unittest.TestCase):
                 with (
                     fixture.planning(parallel),
                     patch_communicator("can_use_dp_reduce_scatter", lambda: can_rs),
+                    patch_communicator("dp_gather_is_variable", lambda batch: gatherv),
                     patch_communicator("to_dp_local", move),
                     patch_communicator("sum_output", summed),
                 ):

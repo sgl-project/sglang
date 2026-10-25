@@ -324,12 +324,12 @@ class TestMhcOnTheDeclarations(CustomTestCase):
                     dp_padding_mode=SimpleNamespace(is_max_len=lambda: is_max_len),
                     forward_mode=ForwardMode.DECODE,
                 )
-                choose = MagicMock(wraps=comm_exit._select_dp_reduce_scatter)
+                choose = MagicMock(wraps=comm_exit.select_dp_return)
                 to_local_tokens = MagicMock(side_effect=lambda step, fb, h: h[:2])
                 with (
                     planning(parallel),
                     patch_communicator("can_use_dp_reduce_scatter", lambda: True),
-                    patch_communicator("_select_dp_reduce_scatter", choose),
+                    patch_communicator("select_dp_return", choose),
                     patch_communicator("to_dp_local", to_local_tokens),
                 ):
                     with communicator.ffn.plan.output.ffn_exit(

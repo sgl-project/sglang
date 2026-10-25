@@ -352,6 +352,19 @@ def to_dp_local(
     return local_hidden_states
 
 
+def return_to_dp_local(
+    hidden_states: torch.Tensor,
+    forward_batch: ForwardBatch,
+    reduce_scatter: Optional[
+        Callable[[torch.Tensor, torch.Tensor, ForwardBatch], None]
+    ] = None,
+) -> torch.Tensor:
+    """An output gathered over attention DP, brought back to this rank's
+    tokens: by ``reduce_scatter``, which also completes the sum it owes, or by
+    a scatter of a complete one."""
+    return to_dp_local(reduce_scatter or _dp_scatter_step, forward_batch, hidden_states)
+
+
 def all_reduce_to_dp_local(
     group: GroupCoordinator, forward_batch: ForwardBatch, hidden_states: torch.Tensor
 ) -> torch.Tensor:

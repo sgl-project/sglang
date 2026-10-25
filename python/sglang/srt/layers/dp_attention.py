@@ -913,6 +913,16 @@ def is_dp_gatherv_active() -> bool:
     )
 
 
+def dp_gather_is_variable(forward_batch: ForwardBatch) -> bool:
+    """Whether this batch's DP gather is the variable-length all_gatherv, which
+    a reduce_scatterv over the same per-rank sizes inverts."""
+    return (
+        is_dp_gatherv_active()
+        and forward_batch.dp_padding_mode is not None
+        and not forward_batch.dp_padding_mode.is_max_len()
+    )
+
+
 def _dp_gatherv_sizes(forward_batch) -> Optional[List[int]]:
     """Per-rank CPU token counts for the buffer being gathered. The MoE gather
     passes a ForwardBatch (global_num_tokens_cpu); the logits gather passes a
@@ -1007,11 +1017,7 @@ def _dp_gather(
             global_tokens, local_tokens, forward_batch, is_partial, cp_shard_counts
         )
         return
-    if (
-        is_dp_gatherv_active()
-        and forward_batch.dp_padding_mode is not None
-        and not forward_batch.dp_padding_mode.is_max_len()
-    ):
+    if dp_gather_is_variable(forward_batch):
         # The gatherv per-rank sizes MUST sum to the pre-allocated global buffer
         # (the MoE runs on the whole buffer, so any unfilled tail = garbage).
         # The buffer was sized from the ceil_align'd global_num_tokens stored via
