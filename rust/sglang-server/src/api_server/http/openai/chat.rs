@@ -185,6 +185,13 @@ async fn chat_completions(
         &raw,
         &state.server_args.default_chat_template_kwargs,
     );
+    // `ReasoningParser`: a continued assistant turn's text is its previous content.
+    let previous_content = (raw["continue_final_message"] == true)
+        .then(|| raw["messages"].as_array()?.last())
+        .flatten()
+        .filter(|message| message["role"] == "assistant")
+        .and_then(|message| message["content"].as_str())
+        .map(str::to_owned);
     let (request, rendered) = match prepare_chat_request(&state, raw, request).await {
         Ok(prepared) => prepared,
         Err(response) => return response,
@@ -238,7 +245,7 @@ async fn chat_completions(
     // As Python, the continued text decides whether generation starts in reasoning.
     let reasoning_options = ReasoningOptions {
         force_reasoning,
-        previous_content: Some(rendered.continuation.clone()),
+        previous_content,
         ..Default::default()
     };
     let mut prompt = Some(Box::new(rendered));
@@ -1137,7 +1144,13 @@ mod tests {
             "continue_final_message": true,
             "chat_template_kwargs": {"thinking": true}
         });
-        let message = chat_message("deepseek-v4", ChatFormatter::DeepSeekV41, " 391.", body).await;
+        let message = chat_message(
+            "deepseek-v4",
+            ChatFormatter::DeepSeekV41(None),
+            " 391.",
+            body,
+        )
+        .await;
         assert_eq!(message["content"], " 391.");
         assert!(message["reasoning_content"].is_null());
     }
