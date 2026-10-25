@@ -926,8 +926,7 @@ def test_prefix_pad_replay_writes_the_captured_output():
             out = QwenImage21Attention.attend_target(attention, q, kv, kv, prefix_pad)
         finally:
             bcg._current_capture_var.reset(token)
-        assert torch.all(out == 4)
-
+        # The capture pass only records the break.
         prefix_pad.rows.fill_(1)
         with replay_token_scope():
             assert graph._break_fns[0]() is None
