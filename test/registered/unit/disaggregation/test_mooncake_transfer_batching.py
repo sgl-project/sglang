@@ -15,6 +15,7 @@ from sglang.srt.disaggregation.common.utils import TransferKVChunk
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager, MooncakeKVSender
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.mooncake_utils import attach_mooncake_transport, engine_writes
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
@@ -39,12 +40,16 @@ class TestMooncakeTransferBatching(unittest.TestCase):
             custom_mem_pool_type="NVLINK" if enable_custom_mem_pool else None,
             enable_deferred_decode_kv_release=False,
             max_transfer_batch_indices=max_batch_indices,
-            get_mla_kv_ptrs_with_pp=MagicMock(
-                return_value=([1000, 2000], [5000, 6000], 2)
-            ),
+            get_mla_kv_ptrs_with_pp=MagicMock(return_value=([0, 1], [0, 1], 2)),
         )
-        manager._transfer_data = lambda session, blocks: (
-            MooncakeKVManager._transfer_data(manager, session, blocks)
+        attach_mooncake_transport(
+            manager, engine, kv=[1000, 2000], peer_kv=[5000, 6000]
+        )
+        manager._transfer_copies = lambda session, copies: (
+            MooncakeKVManager._transfer_copies(manager, session, copies)
+        )
+        manager._generic_entry_pairs = lambda **kwargs: (
+            MooncakeKVManager._generic_entry_pairs(manager, **kwargs)
         )
         manager._await_transfer_futures = lambda futures: (
             MooncakeKVManager._await_transfer_futures(manager, futures)
@@ -55,7 +60,7 @@ class TestMooncakeTransferBatching(unittest.TestCase):
     def _send(
         manager,
         dst_device_data_indices=None,
-        dst_device_data_ptrs=None,
+        dst_device_entries=None,
     ):
         with concurrent.futures.ThreadPoolExecutor() as executor:
             return MooncakeKVManager._send_kvcache_generic(
@@ -68,7 +73,7 @@ class TestMooncakeTransferBatching(unittest.TestCase):
                 dst_data_indices=np.array([10, 11, 12, 13, 14], dtype=np.int32),
                 executor=executor,
                 dst_device_data_indices=dst_device_data_indices,
-                dst_device_data_ptrs=dst_device_data_ptrs,
+                dst_device_entries=dst_device_entries,
             )
 
     def test_slices_index_arrays_before_forming_transfer_ranges(self):
@@ -111,7 +116,7 @@ class TestMooncakeTransferBatching(unittest.TestCase):
         ret = self._send(
             manager,
             dst_device_data_indices=np.array([20, 21, 22, 23, 24], dtype=np.int32),
-            dst_device_data_ptrs={6000},
+            dst_device_entries={1},
         )
 
         self.assertEqual(ret, 0)
@@ -143,8 +148,8 @@ class TestMiniMaxStateTransfer(CustomTestCase):
     def test_index_truncates_but_dense_rejects_mismatched_page_lists(self):
         """Legacy index transfers copy the common prefix; incomplete dense KV must fail."""
 
-        def copy_bytes(session, sources, destinations, lengths):
-            for src, dst, length in zip(sources, destinations, lengths, strict=True):
+        def copy_bytes(session, blocks):
+            for src, dst, length in blocks:
                 ctypes.memmove(dst, src, length)
             return 0
 
@@ -161,7 +166,13 @@ class TestMiniMaxStateTransfer(CustomTestCase):
                         state_dim_per_tensor=[[]],
                         state_layer_ids=[[]],
                     )
-                    manager.engine = SimpleNamespace(batch_transfer_sync=copy_bytes)
+                    attach_mooncake_transport(
+                        manager,
+                        engine_writes(copy_bytes),
+                        state=[[src.ctypes.data]],
+                        peer_state=[[dst.ctypes.data]],
+                        sessions=("cpu",),
+                    )
                     manager.pp_size = manager.attn_tp_size = 1
                     manager.is_mla_backend = manager.is_hybrid_mla_backend = False
                     manager.enable_custom_mem_pool = False
@@ -291,10 +302,18 @@ class TestDcpDraftHeadTransfer(unittest.TestCase):
                     attn_tp_size=src_tp,
                     max_transfer_batch_indices=batch_size,
                     enable_custom_mem_pool=custom_pool,
-                    _transfer_data=transfer,
                     _await_transfer_futures=lambda futures: max(
                         f.result() for f in futures
                     ),
+                )
+                manager._transfer_copies = lambda session, copies: (
+                    MooncakeKVManager._transfer_copies(manager, session, copies)
+                )
+                attach_mooncake_transport(
+                    manager,
+                    engine_writes(transfer),
+                    kv=[10000, 100000, 200000],
+                    peer_kv=[1000000, 2000000, 3000000, 4000000],
                 )
                 with concurrent.futures.ThreadPoolExecutor() as executor:
                     result = MooncakeKVManager.send_kvcache_dcp(
@@ -321,7 +340,7 @@ class TestDcpDraftHeadTransfer(unittest.TestCase):
                         dst_attn_tp_size=dst_tp,
                     )
                 if fail_draft:
-                    self.assertEqual(result, 17)
+                    self.assertEqual(result, -1)
                     self.assertEqual(len(failed_batches), 1)
                     return
                 self.assertEqual(result, 0)
@@ -387,12 +406,20 @@ class TestDcpPackLifetime(CustomTestCase):
                 num_kv_tokens=2,
                 executor=executor,
                 dst_layer_ids=[],
-                pack_buffer=object(),
+                pack_buffer=SimpleNamespace(get_ptr=lambda: 1000),
             )
             source[0] = 22
             return result
 
-        manager._transfer_data = transfer
+        # try_pack_dcp_src is patched to pack at 1000 and 2000, inside the
+        # pack buffer registered at 1000.
+        attach_mooncake_transport(
+            manager,
+            engine_writes(transfer),
+            kv=[1000, 2000],
+            staging=[1000],
+            peer_kv=[5000, 6000],
+        )
         with (
             patch(
                 "sglang.srt.disaggregation.common.dcp_pack.try_pack_dcp_src",
@@ -408,7 +435,7 @@ class TestDcpPackLifetime(CustomTestCase):
                     future.result(timeout=1)
             finally:
                 release.set()
-            self.assertEqual(future.result(timeout=10), 17)
+            self.assertEqual(future.result(timeout=10), -1)
         self.assertEqual(observed, [11])
 
 
