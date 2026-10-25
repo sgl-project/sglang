@@ -66,8 +66,6 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
             ctx=PlacementContext(
                 host_names=("full", "swa") if target_window else ("full", "mamba"),
                 target_window=target_window,
-                asymmetric_rows_ok=False,
-                draft_backends=("triton",),
             ),
             store_dtype=torch.bfloat16,
         )
