@@ -106,12 +106,13 @@ enum OneofShape {
   // Unset: the message owning the oneof is a plain object.
   ONEOF_SHAPE_UNSPECIFIED = 0;
 
-  // Untagged: variants serialize without a tag and deserialize by matching
-  // their JSON values.
+  // Untagged: the value's shape picks the variant, and variant mismatch
+  // errors keep serde's field-level texts (never "data did not match any
+  // variant").
   ONEOF_SHAPE_UNTAGGED = 1;
 
-  // On a oneof of exactly { T one; TList many; }: JSON contains one value
-  // or an array of values; serialization flattens the same way.
+  // On a oneof of exactly { T one; TList many; }: a JSON scalar deserializes
+  // as `one`, a JSON array as `many`; serialization flattens the same way.
   ONEOF_SHAPE_ONE_OR_MANY = 2;
 
   // Internally tagged by the key in `tag` (e.g. finish_reason's

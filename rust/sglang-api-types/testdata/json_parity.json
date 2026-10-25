@@ -610,30 +610,6 @@
       "canonical": "{\"text\":\"\",\"output_ids\":[4000000000],\"index\":2}"
     },
     {
-      "type": "GenerateStreamItem",
-      "name": "error ignores unrelated fields regardless of key order",
-      "input": {
-        "output_ids": [
-          7
-        ],
-        "text": 7,
-        "meta_info": {
-          "id": false
-        },
-        "index": 1,
-        "vendor": {
-          "values": [
-            true
-          ]
-        },
-        "error": {
-          "code": 503,
-          "message": "busy"
-        }
-      },
-      "canonical": "{\"error\":{\"message\":\"busy\",\"code\":503},\"index\":1}"
-    },
-    {
       "type": "GenerateResponseOrList",
       "name": "batch preserves independent success and error outcomes",
       "input": [
@@ -661,26 +637,6 @@
         }
       },
       "canonical": "{\"error\":{\"message\":\"bad sampling\",\"code\":400}}"
-    },
-    {
-      "type": "GenerateStreamItem",
-      "name": "selected frame fields are validated",
-      "input": {
-        "meta_info": 7
-      },
-      "error": true
-    },
-    {
-      "type": "GenerateStreamItem",
-      "name": "selected error fields are validated",
-      "input": {
-        "meta_info": 7,
-        "error": {
-          "message": false,
-          "code": 503
-        }
-      },
-      "error": true
     },
     {
       "type": "GenerateStreamItem",

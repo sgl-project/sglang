@@ -194,7 +194,7 @@ pub enum MessageKind {
         deny_unknown: bool,
         fields: Vec<FieldModel>,
     },
-    /// gRPC-only (a plain oneof container): no HTTP
+    /// gRPC-only (a plain oneof container like GenerateStreamItem): no HTTP
     /// JSON contract, no serde emitted.
     Skip,
 }
@@ -360,7 +360,7 @@ fn message_model(msg: &MessageDescriptor, ext: &Extensions) -> MessageModel {
                 },
             };
         }
-        // A plain oneof container has no HTTP JSON
+        // A plain oneof container (e.g. GenerateStreamItem) has no HTTP JSON
         // contract of its own — it is gRPC-only. Emit nothing.
         return MessageModel {
             rust_name,
