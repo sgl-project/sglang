@@ -642,6 +642,9 @@ class ResponseTemplateReasoningDetector:
     def get_think_end_token_ids(self, tokenizer) -> list[int]:
         return tokenizer.encode(self.think_end_token, add_special_tokens=False)
 
+    def get_self_opened_think_start_token_ids(self, tokenizer) -> list[int] | None:
+        return None
+
     def starts_message(self, prefix: str) -> bool:
         """Whether output after `prefix` starts the assistant message, and so
         may skip the reasoning."""
