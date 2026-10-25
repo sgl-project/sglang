@@ -22,8 +22,6 @@ class BufferKind(enum.IntEnum):
 class MooncakeBufferKey(BufferKey):
     """(kind, index, sub): sub is the per-state-type tensor index for STATE."""
 
-    __slots__ = ("_value",)
-
     def __init__(self, kind: BufferKind, index: int, sub: int = 0):
         self._value = (BufferKind(kind), index, sub)
 
