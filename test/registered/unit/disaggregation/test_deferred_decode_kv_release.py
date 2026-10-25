@@ -365,6 +365,7 @@ class TestDeferredAckTargets(CustomTestCase):
         sender = _TestSender.__new__(_TestSender)
         sender.kv_mgr = mgr
         sender.bootstrap_room = 7
+        sender.conclude_state = None
 
         sender.clear()
 
@@ -382,6 +383,7 @@ class TestDeferredAckTargets(CustomTestCase):
         sender = _TestSender.__new__(_TestSender)
         sender.kv_mgr = mgr
         sender.bootstrap_room = 7
+        sender.conclude_state = None
 
         sender.clear()
 
