@@ -1930,6 +1930,64 @@ class ServingChatTestCase(CustomTestCase):
         self.assertEqual(adapted.extra_key, "classification")
         conv_mock.assert_not_called()
 
+    # Two user turns with media around a text-only assistant turn; the second
+    # turn interleaves a video, an image and an audio clip.
+    _MULTI_TURN_MEDIA_MESSAGES = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": "turn1.png"}},
+                {"type": "text", "text": "what is this?"},
+            ],
+        },
+        {"role": "assistant", "content": "a cat"},
+        {
+            "role": "user",
+            "content": [
+                {"type": "video_url", "video_url": {"url": "turn2.mp4"}},
+                {"type": "image_url", "image_url": {"url": "turn2.png"}},
+                {"type": "audio_url", "audio_url": {"url": "turn2.wav"}},
+                {"type": "text", "text": "and these?"},
+            ],
+        },
+    ]
+
+    def _convert_input_ids_request(self, **kwargs):
+        self.tm.tokenizer = None
+        req = ChatCompletionRequest(
+            model="x",
+            messages=self._MULTI_TURN_MEDIA_MESSAGES,
+            input_ids=[101, 102, 103],
+            **kwargs,
+        )
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
+        ) as conv_mock:
+            adapted, _ = self.chat._convert_to_internal_request(
+                req, self.fastapi_request
+            )
+        conv_mock.assert_not_called()
+        self.assertEqual(adapted.input_ids, [101, 102, 103])
+        return adapted
+
+    def test_partially_expanded_input_ids_keep_every_turn_media_in_order(self):
+        adapted = self._convert_input_ids_request(mm_token_expansion_start_len=1)
+
+        self.assertEqual(adapted.mm_token_expansion_start_len, 1)
+        self.assertEqual(
+            [image.url for image in adapted.image_data], ["turn1.png", "turn2.png"]
+        )
+        self.assertEqual(adapted.video_data, ["turn2.mp4"])
+        self.assertEqual(adapted.audio_data, ["turn2.wav"])
+
+    def test_input_ids_without_start_len_still_drop_message_media(self):
+        adapted = self._convert_input_ids_request()
+
+        self.assertEqual(adapted.mm_token_expansion_start_len, 0)
+        self.assertIsNone(adapted.image_data)
+        self.assertIsNone(adapted.video_data)
+        self.assertIsNone(adapted.audio_data)
+
     def test_kimi_k3_usage_excludes_assistant_generation_stub(self):
         self.chat.chat_encoding_spec = "kimi_k3"
         ret = [
