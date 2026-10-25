@@ -75,14 +75,15 @@ from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.utils import add_prefix
 
-try:
+if current_platform.is_xpu():
+    # CuTe DSL (cutlass) is unavailable on XPU; use the unfused q/k norm path.
+    can_use_fused_rmsnorm_interleaved_rope = lambda *args, **kwargs: False
+    fused_rmsnorm_interleaved_rope_ = None
+else:
     from sglang.kernels.ops.diffusion import (
         can_use_fused_rmsnorm_interleaved_rope,
         fused_rmsnorm_interleaved_rope_,
     )
-except ImportError:  # CuTe DSL (cutlass) is not installed, e.g. on XPU/ROCm
-    can_use_fused_rmsnorm_interleaved_rope = lambda *args, **kwargs: False
-    fused_rmsnorm_interleaved_rope_ = None
 
 logger = init_logger(__name__)
 _is_cuda = current_platform.is_cuda()
