@@ -9,7 +9,7 @@ import numpy.typing as npt
 from sglang.srt.disaggregation.ascend.transfer_engine import AscendTransferEngine
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.utils import group_concurrent_contiguous
-from sglang.srt.disaggregation.mooncake.buffers import group_units, kv_key
+from sglang.srt.disaggregation.mooncake.buffers import group_units
 from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVBootstrapServer,
     MooncakeKVManager,
@@ -288,6 +288,8 @@ class AscendKVManager(MooncakeKVManager):
                 executor=executor,
                 src_layer_ids=self.kv_args.kv_layer_ids,
                 dst_layer_ids=dst_layer_ids,
+                src_keys=self._local_keys.kv,
+                dst_keys=self._peers[mooncake_session_id].keys.kv,
             )
 
         # Group by indices
@@ -343,10 +345,14 @@ class AscendKVManager(MooncakeKVManager):
             ]
 
         kv_units = group_units(prefill_kv_blocks, dst_kv_blocks)
+        local_kv_keys = self._local_keys.kv
+        peer_kv_keys = self._peers[mooncake_session_id].keys.kv
 
         def make_layer_copy(src_entry: int, dst_entry: int, item_len: int) -> Copy:
             return Copy(
-                src=kv_key(src_entry), dst=kv_key(dst_entry), ranges=kv_units * item_len
+                src=local_kv_keys[src_entry],
+                dst=peer_kv_keys[dst_entry],
+                ranges=kv_units * item_len,
             )
 
         # Worker function for processing a single layer
@@ -453,6 +459,7 @@ class AscendKVManager(MooncakeKVManager):
             num_kv_tokens=num_kv_tokens,
         )
 
+        peer_kv_keys = self._peers[mooncake_session_id].keys.kv
         copies: List[Copy] = []
         for entry, uses_global_slots in enumerate(layout):
             page_bytes = self.kv_args.kv_item_lens[entry]
@@ -476,8 +483,8 @@ class AscendKVManager(MooncakeKVManager):
             units = group_units(*group_concurrent_contiguous(src_pages, dst_pages))
             copies.append(
                 Copy(
-                    src=kv_key(entry),
-                    dst=kv_key(dst_entries[entry]),
+                    src=self._local_keys.kv[entry],
+                    dst=peer_kv_keys[dst_entries[entry]],
                     ranges=units * page_bytes,
                 )
             )

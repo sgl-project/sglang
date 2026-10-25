@@ -8,7 +8,6 @@ import numpy as np
 
 from sglang.srt.disaggregation.ascend.conn import AscendKVManager
 from sglang.srt.disaggregation.common.conn import CommonKVManager
-from sglang.srt.disaggregation.mooncake.buffers import state_keys
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
 from sglang.srt.disaggregation.prefill import _transfer_start_layer
 from sglang.srt.disaggregation.utils import (
@@ -109,6 +108,8 @@ class TestHybridSendUsesLayerIdPairing(CustomTestCase):
             executor=None,
             src_layer_ids=stage_full_ids * 2,
             dst_layer_ids=model_full_ids * 2,
+            src_keys=manager._local_keys.kv,
+            dst_keys=manager._peers["session"].keys.kv,
         )
         self.assertEqual(rc, 0)
         expected = [
@@ -168,6 +169,12 @@ class _RecordingAscendManager:
             kv_layer_ids=[31, 35, 31, 35],
         )
         self.generic_call = None
+        attach_mooncake_transport(
+            self,
+            engine_writes(lambda session, blocks: 0),
+            kv=self.kv_args.kv_data_ptrs,
+            peer_kv=range(8),
+        )
 
     def _validate_envelope_kv_layout(self, *args):
         pass
@@ -211,12 +218,14 @@ class TestMambaSlotTransfer(CustomTestCase):
             src_layer_ids=[7],
             dst_layer_ids=[3, 7],
             dst_state_item_lens=[8, 16],
-            entry_key=state_keys(0),
+            src_keys=manager._local_keys.state[0],
+            dst_keys=manager._peers["session"].keys.state[0],
         )
         self.assertEqual(manager.blocks, [(1032, 3048, 16)])
 
     def test_slot_size_mismatch_rejected_before_transfer(self):
         manager = _RecordingKVManager(prefill_start_layer=0, pp_size=1)
+        manager.attach(state=[[1000]], peer_state=[[2000]])
         with self.assertRaisesRegex(RuntimeError, "Mamba slot size mismatch"):
             MooncakeKVManager._send_mamba_state(
                 manager,
@@ -227,7 +236,8 @@ class TestMambaSlotTransfer(CustomTestCase):
                 dst_state_data_ptrs=[2000],
                 dst_mamba_index=[1],
                 dst_state_item_lens=[32],
-                entry_key=state_keys(0),
+                src_keys=manager._local_keys.state[0],
+                dst_keys=manager._peers["session"].keys.state[0],
             )
         self.assertEqual(manager.blocks, [])
 

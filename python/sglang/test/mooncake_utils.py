@@ -10,10 +10,11 @@ import requests
 
 from sglang.srt.disaggregation.mooncake.buffers import (
     PEER_STAGING_KEY,
+    BufferKeys,
     BufferKind,
     MooncakeBufferKey,
-    kv_args_buffers,
 )
+from sglang.srt.disaggregation.mooncake.conn import PeerBuffers
 from sglang.srt.disaggregation.mooncake.transport import MooncakeTransport, Registration
 from sglang.test.server_fixtures.disaggregation_fixture import (
     get_rdma_devices_args,
@@ -237,19 +238,28 @@ def attach_mooncake_transport(
     staging_keys = {
         ptr: MooncakeBufferKey(BufferKind.STAGING, i) for i, ptr in enumerate(staging)
     }
-    local = kv_args_buffers(list(kv), list(aux), [list(s) for s in state])
-    local += [(key, ptr) for ptr, key in staging_keys.items()]
+    local = (list(kv), list(aux), [list(s) for s in state])
+    local_keys = BufferKeys.for_buffers(*local)
+    local_buffers = local_keys.pair(*local)
+    local_buffers += [(key, ptr) for ptr, key in staging_keys.items()]
     transport.register_all(
-        [Registration(key=key, ptr=ptr, length=1, device=0) for key, ptr in local]
+        [
+            Registration(key=key, ptr=ptr, length=1, device=0)
+            for key, ptr in local_buffers
+        ]
     )
-    peer = dict(
-        kv_args_buffers(list(peer_kv), list(peer_aux), [list(s) for s in peer_state])
-    )
+    peer = (list(peer_kv), list(peer_aux), [list(s) for s in peer_state])
+    peer_keys = BufferKeys.for_buffers(*peer)
+    peer_bases = dict(peer_keys.pair(*peer))
     if peer_staging:
-        peer[PEER_STAGING_KEY] = peer_staging
+        peer_bases[PEER_STAGING_KEY] = peer_staging
     manager.transport = transport
     manager._staging_keys = staging_keys
-    manager._peer_buffers = {
-        session: transport.import_registration(session_id=session, bases=peer)
+    manager._local_keys = local_keys
+    manager._peers = {
+        session: PeerBuffers(
+            remote=transport.import_registration(session_id=session, bases=peer_bases),
+            keys=peer_keys,
+        )
         for session in sessions
     }

@@ -353,6 +353,8 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
                 executor=executor,
                 dst_device_data_indices=np.array([21, 22], dtype=np.int32),
                 dst_device_entries={1, 2},
+                src_keys=manager._local_keys.kv,
+                dst_keys=manager._peers["session"].keys.kv,
             )
 
         self.assertEqual(ret, 0)
@@ -378,6 +380,12 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
             prefill_end_layer=2,
         )
         manager._send_kvcache_generic = MagicMock(return_value=0)
+        attach_mooncake_transport(
+            manager,
+            engine_writes(MagicMock(return_value=0)),
+            kv=manager.kv_args.kv_data_ptrs,
+            peer_kv=[10000, 20000, 30000],
+        )
         executor = MagicMock()
 
         # send_kvcache reads the memory bag (the unified-memory envelope-layout

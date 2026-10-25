@@ -6,6 +6,7 @@ import numpy as np
 
 from sglang.srt.disaggregation.ascend.conn import AscendKVManager
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.mooncake_utils import attach_mooncake_transport, engine_writes
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -22,7 +23,13 @@ class TestAscendPageDcpSend(CustomTestCase):
             mla_compression_ratios=None,
         )
         mgr._dcp_remote_decode_layout = [False, True, True]
-        mgr._transfer_copies = Mock(return_value=0)
+        attach_mooncake_transport(
+            mgr,
+            engine_writes(Mock(return_value=0)),
+            kv=mgr.kv_args.kv_data_ptrs,
+            peer_kv=[10_000, 20_000, 30_000],
+            sessions=("decode",),
+        )
 
         with self.assertRaisesRegex(RuntimeError, "destination geometry"):
             mgr.send_kvcache_dcp(
