@@ -931,13 +931,13 @@ rejects. This smoke does not establish physical mirror policy, silicon timing,
 AgentX completion or coverage of every synchronization/dynamic-membership path.
 
 In the matching pinned SGLang/PyTorch CPU environment, with Simulator and the
-matching InferCast SDK source mounted at `/work/G` and `/work/sdk`, run:
+matching InferCast SDK source mounted at `/work/sglang` and `/work/infercast`, run:
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 \
-PYTHONPATH=/work/G/tools/sglang-simulator/src:/work/G/tools/sglang-simulator/test:/work/sdk/src:/work/sdk \
+PYTHONPATH=/work/sglang/tools/sglang-simulator/src:/work/sglang/tools/sglang-simulator/test:/work/infercast/src:/work/infercast \
 python3 -B -m pytest -q -ra -p no:cacheprovider \
-  /work/G/tools/sglang-simulator/test/test_dspark_native_results.py
+  /work/sglang/tools/sglang-simulator/test/test_dspark_native_results.py
 ```
 
 The subprocess enables the CPU bootstrap itself. Missing torch/SGLang explicitly
