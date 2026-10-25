@@ -928,6 +928,7 @@ class HeliosTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             )
             timestep_proj_t0 = (
                 timestep_proj_t0.unflatten(-1, (6, -1))
+                .float()
                 .view(1, 6, 1, -1)
                 .expand(batch_size, -1, history_context_length, -1)
             )
@@ -941,7 +942,8 @@ class HeliosTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         cross_attn_key_values = self._get_cross_attn_key_values(
             encoder_hidden_states, forward_batch
         )
-        timestep_proj = timestep_proj.unflatten(-1, (6, -1))
+        # cast the compact rows to fp32 once; the blocks' .float() is then a no-op
+        timestep_proj = timestep_proj.unflatten(-1, (6, -1)).float()
 
         if indices_hidden_states is not None and not self.zero_history_timestep:
             main_repeat_size = hidden_states.shape[1]

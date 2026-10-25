@@ -37,6 +37,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.f
     targets_to_actions,
     text_ids,
 )
+from sglang.multimodal_gen.test.unit.host_sync_guard import SyncOnRead
 
 DROID_CONFIG = {
     "action_dim": 8,
@@ -491,6 +492,35 @@ def test_cosmos_unipc_feeds_reference_ticks_and_reuses_the_scheduler():
             shift=5.0,
         )
         assert seen == [999, 937, 833, 624]
+
+
+class _DeviceTickScheduler(FlowUniPCMultistepScheduler):
+    def set_timesteps(self, *args, **kwargs):
+        super().set_timesteps(*args, **kwargs)
+        self.timesteps = self.timesteps.as_subclass(SyncOnRead)
+
+
+def test_cosmos_unipc_reads_ticks_on_the_host_once():
+    generator = torch.Generator().manual_seed(0)
+    start = {"a": torch.randn(1, 3, 2, generator=generator)}
+    velocity = {"a": torch.randn(1, 3, 2, generator=generator)}
+    results = []
+    for scheduler in (
+        _unipc_scheduler(),
+        _DeviceTickScheduler(**_unipc_scheduler().config),
+    ):
+        seen = []
+        result = cosmos_unipc(
+            dict(start),
+            lambda samples, t: (seen.append(t), velocity)[1],
+            scheduler=scheduler,
+            n_steps=4,
+            shift=5.0,
+        )
+        results.append((seen, result["a"].as_subclass(torch.Tensor)))
+    (seen, expected), (device_seen, actual) = results
+    assert device_seen == seen
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
 def test_cosmos_unipc_recovers_x0_on_a_straight_flow():
