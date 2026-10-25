@@ -68,6 +68,7 @@ class TestAutotuneTacticSyncGroup(CustomTestCase):
 
 class TestPhaseSpecificPrecisionAutotune(CustomTestCase):
     def test_phase_selection(self):
+        runner = SimpleNamespace(is_draft_worker=False)
         for w4a16, per_token, expected in (
             (False, False, (None,)),
             (True, True, (None,)),
@@ -80,6 +81,13 @@ class TestPhaseSpecificPrecisionAutotune(CustomTestCase):
             with (
                 self.subTest(w4a16=w4a16, per_token=per_token),
                 patch.object(
+                    autotune,
+                    "get_exec",
+                    return_value=SimpleNamespace(
+                        moe=SimpleNamespace(moe_runner_backend="flashinfer_cutedsl")
+                    ),
+                ),
+                patch.object(
                     autotune.envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16,
                     "get",
                     return_value=w4a16,
@@ -90,7 +98,153 @@ class TestPhaseSpecificPrecisionAutotune(CustomTestCase):
                     return_value=per_token,
                 ),
             ):
-                self.assertEqual(autotune.flashinfer_autotune_moe_phases(), expected)
+                self.assertEqual(
+                    autotune.flashinfer_autotune_moe_phases(runner), expected
+                )
+
+    def test_w4a16_is_inert_for_unsupported_backends(self):
+        from sglang.srt.layers.quantization import fp4_utils
+
+        runner = SimpleNamespace(is_draft_worker=False)
+        for backend in (
+            "auto",
+            "marlin",
+            "flashinfer_trtllm",
+            "flashinfer_trtllm_routed",
+            "flashinfer_cutlass",
+        ):
+            with (
+                self.subTest(backend=backend),
+                patch.object(
+                    autotune,
+                    "get_exec",
+                    return_value=SimpleNamespace(
+                        moe=SimpleNamespace(moe_runner_backend=backend)
+                    ),
+                ),
+                patch.object(
+                    fp4_utils,
+                    "get_fp4_gemm_runner_backend",
+                    return_value=fp4_utils.Fp4GemmRunnerBackend.FLASHINFER_CUTLASS,
+                ),
+                autotune.envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.override(
+                    False
+                ),
+            ):
+                for value in (False, True, "prefill", "decode"):
+                    with autotune.envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.override(
+                        value
+                    ):
+                        self.assertIs(autotune._flashinfer_w4a16_setting(runner), False)
+                        self.assertEqual(
+                            autotune.flashinfer_autotune_moe_phases(runner), (None,)
+                        )
+                with (
+                    autotune.envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.override(
+                        "prefill"
+                    )
+                ):
+                    self.assertEqual(
+                        autotune.flashinfer_autotune_moe_phases(runner),
+                        ("decode", "prefill"),
+                    )
+
+    def test_w4a16_gate_honors_dense_and_speculative_backends(self):
+        from sglang.srt.layers.quantization import fp4_utils
+
+        for target, draft, dense, is_draft, expected in (
+            ("flashinfer_trtllm", None, "flashinfer_cutedsl", False, "decode"),
+            ("flashinfer_megamoe", None, "flashinfer_cutlass", False, "decode"),
+            ("flashinfer_cutedsl", "flashinfer_trtllm", "marlin", True, False),
+            ("flashinfer_trtllm", "flashinfer_cutedsl", "marlin", True, "decode"),
+        ):
+            with (
+                self.subTest(target=target, draft=draft, dense=dense),
+                autotune.envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.override("decode"),
+                patch.object(
+                    autotune,
+                    "get_exec",
+                    return_value=SimpleNamespace(
+                        moe=SimpleNamespace(moe_runner_backend=target)
+                    ),
+                ),
+                patch.object(
+                    autotune,
+                    "get_spec",
+                    return_value=SimpleNamespace(speculative_moe_runner_backend=draft),
+                ),
+                patch.object(
+                    fp4_utils,
+                    "get_fp4_gemm_runner_backend",
+                    return_value=fp4_utils.Fp4GemmRunnerBackend(dense),
+                ),
+            ):
+                self.assertEqual(
+                    autotune._flashinfer_w4a16_setting(
+                        SimpleNamespace(is_draft_worker=is_draft)
+                    ),
+                    expected,
+                )
+
+    def test_ignored_w4a16_setting_preserves_autotune_cache_path(self):
+        from sglang.srt.layers.quantization import fp4_utils
+
+        runner = SimpleNamespace(
+            is_draft_worker=False,
+            device="cuda",
+            dtype=torch.bfloat16,
+            model_config=SimpleNamespace(hf_config=SimpleNamespace()),
+        )
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            autotune.envs.SGLANG_CACHE_DIR.override(directory),
+            patch.dict(
+                sys.modules, {"flashinfer": SimpleNamespace(__version__="test")}
+            ),
+            patch.object(torch.cuda, "get_device_capability", return_value=(10, 0)),
+            patch.object(
+                autotune,
+                "get_model",
+                return_value=SimpleNamespace(
+                    model_path="test-model", quantization="modelopt_fp4"
+                ),
+            ),
+            patch.object(
+                autotune,
+                "get_exec",
+                return_value=SimpleNamespace(
+                    moe=SimpleNamespace(moe_runner_backend="flashinfer_trtllm")
+                ),
+            ),
+            patch.object(
+                autotune,
+                "get_parallel",
+                return_value=SimpleNamespace(
+                    tp_size=1,
+                    pp_size=1,
+                    attn_dp_size=1,
+                    moe_ep_size=1,
+                    tp_rank=0,
+                    pp_rank=0,
+                    dp_rank=0,
+                ),
+            ),
+            patch.object(
+                autotune, "get_flashinfer_autotune_skip_ops", return_value=set()
+            ),
+            patch.object(
+                fp4_utils,
+                "get_fp4_gemm_runner_backend",
+                return_value=fp4_utils.Fp4GemmRunnerBackend.FLASHINFER_CUTLASS,
+            ),
+        ):
+            paths = []
+            for value in (False, True, "prefill", "decode"):
+                with autotune.envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.override(
+                    value
+                ):
+                    paths.append(autotune.flashinfer_autotune_cache_path(runner))
+            self.assertEqual(len(set(paths)), 1)
 
     def test_startup_warms_both_phases_with_same_buffers(self):
         from sglang.srt.model_executor.runner import base_runner

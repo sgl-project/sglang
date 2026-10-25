@@ -405,7 +405,7 @@ class BaseRunner(ABC):
             # allocating a second buffer set or forcing speculative attention
             # through an unsupported EXTEND dummy. Each phase must run before
             # capture to prepare its precision-specific wrapper and tactics.
-            for phase in flashinfer_autotune_moe_phases():
+            for phase in flashinfer_autotune_moe_phases(mr):
                 canary_run_ctx = (
                     c.with_active_single_forward_manager(0)
                     if (c := mr.canary_manager) is not None

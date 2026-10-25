@@ -342,7 +342,7 @@ def _update_gather_batch(
         batch.is_extend_in_batch = mlp_sync_info.is_extend_in_batch
         batch.tbo_split_seq_index = mlp_sync_info.tbo_split_seq_index
         batch.global_forward_mode = mlp_sync_info.global_forward_mode
-        # All MLP ranks must choose the same backend and activation precision,
+        # All MLP ranks must choose the same activation precision,
         # including idle ranks and mixed decode/prefill steps. The existing
         # gathered modes distinguish real prompts from TARGET_VERIFY, whereas
         # is_extend_in_batch includes verification and cannot make that choice.

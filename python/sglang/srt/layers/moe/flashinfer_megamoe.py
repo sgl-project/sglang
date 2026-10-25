@@ -586,11 +586,20 @@ def _prepare_nvfp4_moe_weights(layer: FusedMoE, *, use_w4a16: bool) -> None:
             f"of {hidden_alignment}, got {layer.hidden_size}."
         )
     if layer.quant_config.use_per_token_activation and not use_w4a16:
-        raise ValueError(
-            "FlashInfer NVFP4 MegaMOE does not support per-token activation "
-            "scaling. Use flashinfer_trtllm/flashinfer_trtllm_routed for "
-            "ModelOpt NVFP4 per-token activation."
+        per_token_phase = getattr(
+            layer.quant_config, "per_token_activation_phase", None
         )
+        # Per-token scaling has no effect in a W4A16 phase. Reject only
+        # settings that would actually require per-token W4A4 execution.
+        if (
+            per_token_phase is None
+            or per_token_phase != envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()
+        ):
+            raise ValueError(
+                "FlashInfer NVFP4 MegaMOE does not support per-token activation "
+                "scaling. Use flashinfer_trtllm/flashinfer_trtllm_routed for "
+                "ModelOpt NVFP4 per-token activation."
+            )
     if layer.intermediate_size_per_partition % intermediate_alignment != 0:
         raise ValueError(
             "FlashInfer NVFP4 MegaMOE requires intermediate_size_per_partition "

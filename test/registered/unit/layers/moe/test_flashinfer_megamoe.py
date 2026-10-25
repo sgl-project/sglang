@@ -842,10 +842,16 @@ def test_precapture_warmup_includes_online_methods_and_precision_variants(
     assert calls == [(online, False), (paired, False)]
 
 
-def test_phase_specific_nvfp4_keeps_both_layouts_and_reload_addresses(monkeypatch):
+@pytest.mark.parametrize("w4a16_phase", ["prefill", "decode"])
+@pytest.mark.parametrize("per_token_setting", [False, True, "prefill", "decode"])
+def test_phase_specific_nvfp4_keeps_both_layouts_and_reload_addresses(
+    monkeypatch, w4a16_phase, per_token_setting
+):
     module = _load_megamoe_module(monkeypatch)
     monkeypatch.setattr(
-        module.envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16, "get", lambda: "decode"
+        module.envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16,
+        "get",
+        lambda: w4a16_phase,
     )
     spec = importlib.util.spec_from_file_location(
         "sglang.srt.layers.utils.common",
@@ -859,7 +865,12 @@ def test_phase_specific_nvfp4_keeps_both_layouts_and_reload_addresses(monkeypatc
     layer.hidden_size = layer.intermediate_size_per_partition = 128
     layer.num_experts = layer.num_local_experts = 2
     layer.moe_ep_size = 1
-    layer.quant_config = types.SimpleNamespace(use_per_token_activation=False)
+    layer.quant_config = types.SimpleNamespace(
+        use_per_token_activation=bool(per_token_setting),
+        per_token_activation_phase=(
+            per_token_setting if isinstance(per_token_setting, str) else None
+        ),
+    )
     layer.moe_runner_config = types.SimpleNamespace(
         is_gated=True,
         activation="silu",
@@ -906,6 +917,11 @@ def test_phase_specific_nvfp4_keeps_both_layouts_and_reload_addresses(monkeypatc
             ),
         ),
     )
+    if per_token_setting and per_token_setting != w4a16_phase:
+        with pytest.raises(ValueError, match="does not support per-token activation"):
+            module.prepare_nvfp4_moe_weights_for_flashinfer_megamoe(layer)
+        return
+
     module.prepare_nvfp4_moe_weights_for_flashinfer_megamoe(layer)
     variant = layer._flashinfer_megamoe_w4a16
     assert prepared_modes == [True, False]
