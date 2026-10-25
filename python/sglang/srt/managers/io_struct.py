@@ -66,7 +66,10 @@ from sglang.srt.multimodal.mm_utils import has_valid_data
 from sglang.srt.sampling.sampling_mask import SamplingMaskChunk
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import ImageData, VideoData
-from sglang.srt.utils.field_validators import validate_optional_list_i64_1d_2d
+from sglang.srt.utils.field_validators import (
+    validate_filename_component,
+    validate_optional_list_i64_1d_2d,
+)
 from sglang.srt.utils.msgpack_utils import dec_hook, enc_hook, ext_hook
 from sglang.srt.utils.msgspec_utils import (
     Base64Bytes,
@@ -2386,6 +2389,13 @@ class ProfileReq(BaseReq, kw_only=True):
     profile_stages: Optional[List[str]] = None
     # Add iteration-level annotations (KV / request aggregates) for roofline-style analysis
     detailed_annotations: bool = False
+
+    def __post_init__(self):
+        validate_filename_component(self.profile_prefix, "profile_prefix")
+        validate_filename_component(self.profile_id, "profile_id")
+        if self.profile_stages:
+            for stage in self.profile_stages:
+                validate_filename_component(stage, "profile_stages element")
 
 
 class ProfileReqOutput(BaseReq, kw_only=True):
