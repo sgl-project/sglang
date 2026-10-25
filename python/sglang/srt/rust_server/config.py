@@ -92,6 +92,8 @@ def _build_server_args(
         "enable_dp_attention": get_parallel().attn_dp_size > 1,
         "speculative_algorithm": get_spec().speculative_algorithm,
         "speculative_ngram_external_corpus_max_tokens": get_spec().speculative_ngram_external_corpus_max_tokens,
+        "gc_threshold": get_device().gc_threshold,
+        "enable_pd_role_switch": get_disagg().enable_pd_role_switch,
         "enable_hierarchical_cache": get_memory().enable_hierarchical_cache,
         "hicache_ratio": get_memory().hicache_ratio,
         "hicache_size": get_memory().hicache_size,

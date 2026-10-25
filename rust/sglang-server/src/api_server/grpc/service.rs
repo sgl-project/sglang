@@ -18,7 +18,7 @@ use crate::api_server::handlers::{
 };
 use crate::message::config::{PreferredSamplingParams, ServerArgs};
 use crate::message::io_struct::{
-    ExpertDistributionAction, ProfileOptions, WeightsSendGroup, WeightsUpdateGroup,
+    ExpertDistributionAction, PdRoleSwitch, ProfileOptions, WeightsSendGroup, WeightsUpdateGroup,
 };
 use crate::message::request::{GenerationPolicy, into_requests};
 use crate::message::wire::{ClientMaxNewTokens, fill_preferred_sampling};
@@ -190,7 +190,7 @@ impl SglangService for GrpcService {
         &self,
         _request: Request<api::GetModelInfoRequest>,
     ) -> Result<Response<api::GetModelInfoResponse>, Status> {
-        info::model_info(self.core.model_info())
+        info::model_info(self.core.model_info().await)
             .map(Response::new)
             .map_err(Status::internal)
     }
@@ -508,6 +508,94 @@ impl SglangService for GrpcService {
         }))
     }
 
+    async fn freeze_gc(
+        &self,
+        _request: Request<api::FreezeGcRequest>,
+    ) -> Result<Response<api::FreezeGcResponse>, Status> {
+        self.core.freeze_gc().await.map_err(native_api::status)?;
+        Ok(Response::new(api::FreezeGcResponse {}))
+    }
+
+    async fn pause_generation(
+        &self,
+        request: Request<api::PauseGenerationRequest>,
+    ) -> Result<Response<api::GenerationPauseResponse>, Status> {
+        let mode = request.into_inner().mode.unwrap_or_else(|| "abort".into());
+        self.core
+            .pause_generation(&mode)
+            .await
+            .map_err(native_api::status)?;
+        Ok(Response::new(api::GenerationPauseResponse {
+            message: "Generation paused successfully.".into(),
+            status: "ok".into(),
+        }))
+    }
+
+    async fn continue_generation(
+        &self,
+        request: Request<api::ContinueGenerationRequest>,
+    ) -> Result<Response<api::GenerationPauseResponse>, Status> {
+        self.core
+            .continue_generation(request.into_inner().torch_empty_cache.unwrap_or(true))
+            .await
+            .map_err(native_api::status)?;
+        Ok(Response::new(api::GenerationPauseResponse {
+            message: "Generation continued successfully.".into(),
+            status: "ok".into(),
+        }))
+    }
+
+    async fn pd_role_switch(
+        &self,
+        request: Request<api::PdRoleSwitchRequest>,
+    ) -> Result<Response<api::PdRoleSwitchResponse>, Status> {
+        let request = request.into_inner();
+        let outcome = self
+            .core
+            .pd_role_switch(PdRoleSwitch {
+                new_role: request.new_role.unwrap_or_default(),
+                decode_cuda_graph_bs: request.decode_cuda_graph_bs.map(|list| list.items),
+                decode_cuda_graph_memory_gb: request.decode_cuda_graph_memory_gb,
+                prepare_only: request.prepare_only,
+            })
+            .await
+            .map_err(native_api::status)?;
+        Ok(Response::new(api::PdRoleSwitchResponse {
+            success: outcome.success,
+            message: outcome.message,
+            old_role: outcome.old_role,
+            new_role: outcome.new_role,
+            safe_to_restore: outcome.safe_to_restore,
+        }))
+    }
+
+    async fn update_weight_version(
+        &self,
+        request: Request<api::UpdateWeightVersionRequest>,
+    ) -> Result<Response<api::UpdateWeightVersionResponse>, Status> {
+        let request = request.into_inner();
+        let new_version = request.new_version;
+        match self
+            .core
+            .update_weight_version(
+                new_version.clone(),
+                request.abort_all_requests.unwrap_or(true),
+            )
+            .await
+        {
+            Ok(()) => Ok(Response::new(api::UpdateWeightVersionResponse {
+                success: true,
+                message: format!("Weight version updated to {new_version}"),
+                new_version: Some(new_version),
+            })),
+            Err(error) => Ok(Response::new(api::UpdateWeightVersionResponse {
+                success: false,
+                message: format!("Failed to update weight version: {error}"),
+                new_version: None,
+            })),
+        }
+    }
+
     async fn get_hi_cache_storage(
         &self,
         _request: Request<api::GetHiCacheStorageRequest>,
@@ -556,7 +644,7 @@ impl SglangService for GrpcService {
         _request: Request<api::ListModelsRequest>,
     ) -> Result<Response<api::ListModelsResponse>, Status> {
         Ok(Response::new(api::ListModelsResponse {
-            models: self.core.list_models(),
+            models: self.core.list_models().await,
         }))
     }
 

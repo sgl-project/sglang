@@ -73,7 +73,7 @@ async fn chat_completions(
             return openai_error(StatusCode::BAD_REQUEST, rejection.body_text(), false);
         }
     };
-    if let Some(message) = model_error(&request.model, &state.server_args.served_model_name) {
+    if let Some(message) = model_error(&request.model, &state.core.served_model_name().await) {
         return openai_error(StatusCode::BAD_REQUEST, message, false);
     }
     if request.messages.is_empty() {

@@ -449,6 +449,10 @@ pub struct DeploymentInfo {
     /// `--speculative-ngram-external-corpus-max-tokens`; 0 when the launcher
     /// did not pass it.
     pub speculative_ngram_external_corpus_max_tokens: u64,
+    /// `--gc-threshold`, which `/freeze_gc` forwards to every scheduler.
+    pub gc_threshold: Option<Vec<i64>>,
+    /// `--enable-pd-role-switch`.
+    pub enable_pd_role_switch: bool,
     pub enable_hierarchical_cache: bool,
     pub hicache_ratio: Option<f64>,
     pub hicache_size: u64,
@@ -557,7 +561,7 @@ impl<'py> pyo3::FromPyObject<'_, 'py> for LaunchServerInfo {
     module = "sglang.srt.rust_extensions._server"
 )]
 // Lowercase to match the values Python reports for the same field.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DisaggregationMode {
     /// Unified prefill + decode.
@@ -565,6 +569,17 @@ pub enum DisaggregationMode {
     Null,
     Prefill,
     Decode,
+}
+
+impl DisaggregationMode {
+    /// The value Python reports for the same field.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Null => "null",
+            Self::Prefill => "prefill",
+            Self::Decode => "decode",
+        }
+    }
 }
 
 /// The slice of the resolved Python `ModelConfig` the rust server reads.

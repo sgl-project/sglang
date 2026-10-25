@@ -265,6 +265,79 @@ pub struct ResumeMemoryOccupationRequest {
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct MemoryOccupationResponse {}
+/// `/freeze_gc`: freeze the Python garbage collector on every DP rank's
+/// scheduler, with the launch's `--gc-threshold`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct FreezeGcRequest {}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct FreezeGcResponse {}
+/// `/pause_generation`. `in_place` holds the scheduler loop with its batches
+/// intact; `retract` returns running requests to the waiting queue; `abort`
+/// cancels them and is handled by the frontend alone.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct PauseGenerationRequest {
+    #[prost(string, optional, tag = "1")]
+    pub mode: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// `/continue_generation`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ContinueGenerationRequest {
+    #[prost(bool, optional, tag = "1")]
+    pub torch_empty_cache: ::core::option::Option<bool>,
+}
+/// Python's `{"message": ..., "status": "ok"}` body for pause and continue.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GenerationPauseResponse {
+    #[prost(string, tag = "1")]
+    pub message: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub status: ::prost::alloc::string::String,
+}
+/// `/pd_role_switch`: flip this instance between prefill and decode at
+/// runtime (`--enable-pd-role-switch`). With several DP ranks the frontend
+/// first runs a `prepare_only` preflight on every rank.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PdRoleSwitchRequest {
+    #[prost(string, optional, tag = "1")]
+    pub new_role: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "2")]
+    pub decode_cuda_graph_bs: ::core::option::Option<Int64List>,
+    #[prost(double, optional, tag = "3")]
+    pub decode_cuda_graph_memory_gb: ::core::option::Option<f64>,
+    #[prost(bool, tag = "4")]
+    pub prepare_only: bool,
+}
+/// Python's `PdRoleSwitchReqOutput`.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct PdRoleSwitchResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(string, tag = "2")]
+    pub message: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub old_role: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub new_role: ::prost::alloc::string::String,
+    #[prost(bool, tag = "5")]
+    pub safe_to_restore: bool,
+}
+/// `/update_weight_version`: relabel the served weights on every DP rank.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct UpdateWeightVersionRequest {
+    #[prost(string, tag = "1")]
+    pub new_version: ::prost::alloc::string::String,
+    #[prost(bool, optional, tag = "2")]
+    pub abort_all_requests: ::core::option::Option<bool>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct UpdateWeightVersionResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(string, tag = "2")]
+    pub message: ::prost::alloc::string::String,
+    #[prost(string, optional, tag = "3")]
+    pub new_version: ::core::option::Option<::prost::alloc::string::String>,
+}
 /// `/add_external_corpus`: exactly one of `file_path` (a JSONL file of strings
 /// on the server) or `documents`; `token_chunks` is for pre-tokenized input.
 #[derive(Clone, PartialEq, ::prost::Message)]

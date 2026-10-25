@@ -7,36 +7,75 @@ use crate::message::ids::Rid;
 use crate::message::info::{InternalState, ModelInfo, ServerInfo};
 use crate::message::io_struct::{ControlRequest, GetInternalStateReq};
 
+use std::sync::Arc;
+
+use super::frontend_state::ModelFacts;
 use super::handle::CoreHandle;
 use crate::api_server::core::CoreError;
 
 impl CoreHandle {
-    /// Return static model metadata without exposing the full launch config.
-    pub(crate) fn model_info(&self) -> ModelInfo {
+    /// The scheduler-owned model facts: the cache, refreshed from the local
+    /// scheduler when a control call since may have changed them. A failed
+    /// refresh keeps the last facts (logged), so metadata reads never fail
+    /// because a scheduler is busy.
+    pub(crate) async fn model_facts(&self) -> Arc<ModelFacts> {
+        let frontend = &self.inner.frontend;
+        if !frontend.is_stale() {
+            return frontend.cached().await;
+        }
+        match self.local_model_facts().await {
+            Ok(facts) => frontend.store(facts, true).await,
+            Err(error) => {
+                tracing::warn!(%error, "model facts refresh failed; serving the last known");
+                frontend.cached().await
+            }
+        }
+    }
+
+    /// The served model name a request's `model` must match.
+    pub(crate) async fn served_model_name(&self) -> String {
+        self.model_facts().await.served_model_name.clone()
+    }
+
+    async fn local_model_facts(&self) -> Result<ModelFacts, CoreError> {
+        let bytes = self
+            .submit_control_req(ControlRequest::GetInternalStateReq(
+                GetInternalStateReq::new(Rid::new().to_string()),
+            ))
+            .await?;
+        rmp_serde::from_slice::<ModelFactsEnvelope>(&bytes)
+            .map(|envelope| envelope.internal_state)
+            .map_err(|error| {
+                CoreError::InvalidResponse(format!("invalid internal-state response: {error}"))
+            })
+    }
+
+    /// Return model metadata without exposing the full launch config.
+    pub(crate) async fn model_info(&self) -> ModelInfo {
+        let facts = self.model_facts().await;
         let metadata = &self.inner.metadata;
         ModelInfo {
-            model_path: metadata.model_path.clone(),
-            served_model_name: metadata.served_model_name.clone(),
+            model_path: facts.model_path.clone(),
+            served_model_name: facts.served_model_name.clone(),
             tokenizer_path: metadata.tokenizer_path.clone(),
             is_generation: true,
             preferred_sampling_params: metadata.preferred_sampling_params.clone(),
-            weight_version: metadata.weight_version.clone(),
-            load_format: metadata.load_format.clone(),
+            weight_version: facts.weight_version.clone(),
+            load_format: facts.load_format.clone(),
             reasoning_parser: metadata.reasoning_parser.clone(),
             tool_call_parser: metadata.tool_call_parser.clone(),
-            disaggregation_mode: metadata.disaggregation_mode,
+            disaggregation_mode: facts.disaggregation_mode,
         }
     }
 
     /// Return the served model cards shared by HTTP and gRPC discovery.
-    /// This is static metadata; no runtime request is submitted.
-    pub(crate) fn list_models(&self) -> Vec<api::ModelCard> {
-        let metadata = &self.inner.metadata;
+    pub(crate) async fn list_models(&self) -> Vec<api::ModelCard> {
+        let facts = self.model_facts().await;
         vec![api::ModelCard {
-            id: metadata.served_model_name.clone(),
-            root: metadata.served_model_name.clone(),
+            id: facts.served_model_name.clone(),
+            root: facts.served_model_name.clone(),
             parent: None,
-            max_model_len: metadata.max_context_length,
+            max_model_len: self.inner.metadata.max_context_length,
         }]
     }
 
@@ -45,6 +84,7 @@ impl CoreHandle {
     /// cross the core boundary.
     pub(crate) async fn server_info(&self) -> Result<ServerInfo, CoreError> {
         let mut internal_states = self.internal_states().await?;
+        let facts = self.model_facts().await;
         // Every listener records its own startup timings; the lowest rank's
         // stand for the deployment, as Python's one `TokenizerManager`'s do.
         let startup_time = internal_states
@@ -53,8 +93,8 @@ impl CoreHandle {
         let metadata = &self.inner.metadata;
         Ok(ServerInfo {
             launch_fields: metadata.launch_server_info.clone(),
-            model_path: metadata.model_path.clone(),
-            served_model_name: metadata.served_model_name.clone(),
+            model_path: facts.model_path.clone(),
+            served_model_name: facts.served_model_name.clone(),
             tokenizer_path: metadata.tokenizer_path.clone(),
             max_context_length: metadata.max_context_length,
             max_total_num_tokens: metadata.max_total_num_tokens,
@@ -65,7 +105,7 @@ impl CoreHandle {
             host: metadata.host.clone(),
             port: metadata.port,
             incremental_streaming_output: metadata.incremental_streaming_output,
-            disaggregation_mode: metadata.disaggregation_mode,
+            disaggregation_mode: facts.disaggregation_mode,
             deployment_info: metadata.deployment_info.clone(),
         })
     }
@@ -88,6 +128,14 @@ impl CoreHandle {
     }
 }
 
+/// The model facts inside the scheduler's internal-state envelope, which
+/// starts from the resolved server args (so a weight update's new
+/// `model_path` / `weight_version` and a role switch's mode are in it).
+#[derive(serde::Deserialize)]
+struct ModelFactsEnvelope {
+    internal_state: ModelFacts,
+}
+
 /// Private scheduler response envelope. This MessagePack shape is decoded at
 /// the runtime boundary and deliberately is not part of the core contract.
 #[derive(serde::Deserialize)]
@@ -102,8 +150,8 @@ mod tests {
     use crate::api_server::handlers::test_utils::*;
     use crate::api_server::handlers::{CoreConfig, CoreMetadata};
 
-    #[test]
-    fn list_models_returns_static_cards_without_runtime_work() {
+    #[tokio::test]
+    async fn list_models_returns_static_cards_without_runtime_work() {
         let (intake_tx, intake_rx) = flume::unbounded();
         let (abort_tx, abort_rx) = flume::unbounded();
         let handle = CoreHandle::new(
@@ -125,7 +173,7 @@ mod tests {
         );
 
         assert_eq!(
-            handle.list_models(),
+            handle.list_models().await,
             vec![api::ModelCard {
                 id: "served-model".into(),
                 root: "served-model".into(),

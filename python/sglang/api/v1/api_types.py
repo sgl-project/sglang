@@ -294,6 +294,148 @@ class MemoryOccupationResponse(msgspec.Struct, kw_only=True, frozen=True):
         return encode_MemoryOccupationResponse(self)
 
 
+class FreezeGcRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.FreezeGcRequest: JSON object (unknown keys ignored)."""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "FreezeGcRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_FreezeGcRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_FreezeGcRequest(self)
+
+
+class FreezeGcResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.FreezeGcResponse: JSON object (unknown keys ignored)."""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "FreezeGcResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_FreezeGcResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_FreezeGcResponse(self)
+
+
+class PauseGenerationRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.PauseGenerationRequest: JSON object (unknown keys ignored)."""
+
+    mode: Optional[str] = "abort"
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "PauseGenerationRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_PauseGenerationRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_PauseGenerationRequest(self)
+
+
+class ContinueGenerationRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.ContinueGenerationRequest: JSON object (unknown keys ignored)."""
+
+    torch_empty_cache: Optional[bool] = True
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "ContinueGenerationRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_ContinueGenerationRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_ContinueGenerationRequest(self)
+
+
+class GenerationPauseResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.GenerationPauseResponse: JSON object (unknown keys ignored)."""
+
+    message: str = ""
+    status: str = ""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "GenerationPauseResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_GenerationPauseResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_GenerationPauseResponse(self)
+
+
+class PdRoleSwitchRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.PdRoleSwitchRequest: JSON object (unknown keys ignored)."""
+
+    new_role: Optional[str] = ""
+    decode_cuda_graph_bs: Optional[Int64List] = None
+    decode_cuda_graph_memory_gb: Optional[float] = None
+    prepare_only: bool = False
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "PdRoleSwitchRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_PdRoleSwitchRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_PdRoleSwitchRequest(self)
+
+
+class PdRoleSwitchResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.PdRoleSwitchResponse: JSON object (unknown keys ignored)."""
+
+    success: bool = False
+    message: str = ""
+    old_role: str = ""
+    new_role: str = ""
+    safe_to_restore: bool = False
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "PdRoleSwitchResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_PdRoleSwitchResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_PdRoleSwitchResponse(self)
+
+
+class UpdateWeightVersionRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.UpdateWeightVersionRequest: JSON object (unknown keys ignored)."""
+
+    new_version: str = ""
+    abort_all_requests: Optional[bool] = True
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "UpdateWeightVersionRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_UpdateWeightVersionRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_UpdateWeightVersionRequest(self)
+
+
+class UpdateWeightVersionResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.UpdateWeightVersionResponse: JSON object (unknown keys ignored)."""
+
+    success: bool = False
+    message: str = ""
+    new_version: Optional[str] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "UpdateWeightVersionResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_UpdateWeightVersionResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_UpdateWeightVersionResponse(self)
+
+
 class AddExternalCorpusRequest(msgspec.Struct, kw_only=True, frozen=True):
     """sglang.api.v1.AddExternalCorpusRequest: JSON object (unknown keys ignored)."""
 
@@ -1818,6 +1960,171 @@ def decode_MemoryOccupationResponse(value: Any) -> MemoryOccupationResponse:
 
 def encode_MemoryOccupationResponse(v: MemoryOccupationResponse) -> Dict[str, Any]:
     d: Dict[str, Any] = {}
+    return d
+
+
+def decode_FreezeGcRequest(value: Any) -> FreezeGcRequest:
+    m = _expect_map(value, expected="struct FreezeGcRequest")
+    return FreezeGcRequest()
+
+
+def encode_FreezeGcRequest(v: FreezeGcRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    return d
+
+
+def decode_FreezeGcResponse(value: Any) -> FreezeGcResponse:
+    m = _expect_map(value, expected="struct FreezeGcResponse")
+    return FreezeGcResponse()
+
+
+def encode_FreezeGcResponse(v: FreezeGcResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    return d
+
+
+def decode_PauseGenerationRequest(value: Any) -> PauseGenerationRequest:
+    m = _expect_map(value, expected="struct PauseGenerationRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "mode":
+            kw["mode"] = "abort" if x is None else _expect_str(x, expected="a string")
+    return PauseGenerationRequest(**kw)
+
+
+def encode_PauseGenerationRequest(v: PauseGenerationRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.mode is not None:
+        d["mode"] = v.mode
+    return d
+
+
+def decode_ContinueGenerationRequest(value: Any) -> ContinueGenerationRequest:
+    m = _expect_map(value, expected="struct ContinueGenerationRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "torch_empty_cache":
+            kw["torch_empty_cache"] = True if x is None else _expect_bool(x, expected="a boolean")
+    return ContinueGenerationRequest(**kw)
+
+
+def encode_ContinueGenerationRequest(v: ContinueGenerationRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.torch_empty_cache is not None:
+        d["torch_empty_cache"] = v.torch_empty_cache
+    return d
+
+
+def decode_GenerationPauseResponse(value: Any) -> GenerationPauseResponse:
+    m = _expect_map(value, expected="struct GenerationPauseResponse")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "message":
+            kw["message"] = _expect_str(x, expected="a string")
+        elif key == "status":
+            kw["status"] = _expect_str(x, expected="a string")
+    return GenerationPauseResponse(**kw)
+
+
+def encode_GenerationPauseResponse(v: GenerationPauseResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["message"] = v.message
+    d["status"] = v.status
+    return d
+
+
+def decode_PdRoleSwitchRequest(value: Any) -> PdRoleSwitchRequest:
+    m = _expect_map(value, expected="struct PdRoleSwitchRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "new_role":
+            kw["new_role"] = "" if x is None else _expect_str(x, expected="a string")
+        elif key == "decode_cuda_graph_bs":
+            kw["decode_cuda_graph_bs"] = None if x is None else decode_Int64List(x)
+        elif key == "decode_cuda_graph_memory_gb":
+            kw["decode_cuda_graph_memory_gb"] = None if x is None else _expect_float(x, expected="f64")
+        elif key == "prepare_only":
+            kw["prepare_only"] = _expect_bool(x, expected="a boolean")
+    return PdRoleSwitchRequest(**kw)
+
+
+def encode_PdRoleSwitchRequest(v: PdRoleSwitchRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.new_role is not None:
+        d["new_role"] = v.new_role
+    if v.decode_cuda_graph_bs is not None:
+        d["decode_cuda_graph_bs"] = encode_Int64List(v.decode_cuda_graph_bs)
+    if v.decode_cuda_graph_memory_gb is not None:
+        d["decode_cuda_graph_memory_gb"] = float(v.decode_cuda_graph_memory_gb)
+    d["prepare_only"] = v.prepare_only
+    return d
+
+
+def decode_PdRoleSwitchResponse(value: Any) -> PdRoleSwitchResponse:
+    m = _expect_map(value, expected="struct PdRoleSwitchResponse")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "success":
+            kw["success"] = _expect_bool(x, expected="a boolean")
+        elif key == "message":
+            kw["message"] = _expect_str(x, expected="a string")
+        elif key == "old_role":
+            kw["old_role"] = _expect_str(x, expected="a string")
+        elif key == "new_role":
+            kw["new_role"] = _expect_str(x, expected="a string")
+        elif key == "safe_to_restore":
+            kw["safe_to_restore"] = _expect_bool(x, expected="a boolean")
+    return PdRoleSwitchResponse(**kw)
+
+
+def encode_PdRoleSwitchResponse(v: PdRoleSwitchResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["success"] = v.success
+    d["message"] = v.message
+    d["old_role"] = v.old_role
+    d["new_role"] = v.new_role
+    d["safe_to_restore"] = v.safe_to_restore
+    return d
+
+
+def decode_UpdateWeightVersionRequest(value: Any) -> UpdateWeightVersionRequest:
+    m = _expect_map(value, expected="struct UpdateWeightVersionRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "new_version":
+            kw["new_version"] = _expect_str(x, expected="a string")
+        elif key == "abort_all_requests":
+            kw["abort_all_requests"] = True if x is None else _expect_bool(x, expected="a boolean")
+    return UpdateWeightVersionRequest(**kw)
+
+
+def encode_UpdateWeightVersionRequest(v: UpdateWeightVersionRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["new_version"] = v.new_version
+    if v.abort_all_requests is not None:
+        d["abort_all_requests"] = v.abort_all_requests
+    return d
+
+
+def decode_UpdateWeightVersionResponse(value: Any) -> UpdateWeightVersionResponse:
+    m = _expect_map(value, expected="struct UpdateWeightVersionResponse")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "success":
+            kw["success"] = _expect_bool(x, expected="a boolean")
+        elif key == "message":
+            kw["message"] = _expect_str(x, expected="a string")
+        elif key == "new_version":
+            kw["new_version"] = None if x is None else _expect_str(x, expected="a string")
+    return UpdateWeightVersionResponse(**kw)
+
+
+def encode_UpdateWeightVersionResponse(v: UpdateWeightVersionResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["success"] = v.success
+    d["message"] = v.message
+    if v.new_version is not None:
+        d["new_version"] = v.new_version
     return d
 
 

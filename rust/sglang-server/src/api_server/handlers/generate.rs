@@ -21,6 +21,8 @@ impl CoreHandle {
         &self,
         mut request: GenerateRequest,
     ) -> Result<CoreCall, CoreError> {
+        // Python holds client generates while paused, before tokenizing.
+        self.inner.frontend.wait_unpaused().await;
         let mut generation = self
             .inner
             .generations
@@ -59,6 +61,7 @@ impl CoreHandle {
         if requests.is_empty() {
             return Ok(Vec::new());
         }
+        self.inner.frontend.wait_unpaused().await;
         let mut generations: Vec<_> = requests
             .iter()
             .map(|request| {
@@ -281,6 +284,12 @@ struct Entry {
 }
 
 impl Generations {
+    /// Whether any client generation is between registration and its
+    /// terminal response.
+    pub(super) fn is_empty(&self) -> bool {
+        self.0.lock().unwrap().is_empty()
+    }
+
     fn register(&self, rid: Rid, abort_tx: flume::Sender<AbortSource>) -> Generation {
         let admission = RequestAdmission::pending();
         let (cancelled, cancellation) = oneshot::channel();

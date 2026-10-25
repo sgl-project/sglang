@@ -5,6 +5,7 @@
 
 mod control;
 mod corpus;
+mod frontend_state;
 mod generate;
 mod handle;
 mod health;

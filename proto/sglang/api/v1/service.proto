@@ -91,6 +91,14 @@ service SglangService {
   rpc AddExternalCorpus(AddExternalCorpusRequest) returns (AddExternalCorpusResponse);
   rpc RemoveExternalCorpus(RemoveExternalCorpusRequest) returns (RemoveExternalCorpusResponse);
   rpc ListExternalCorpora(ListExternalCorporaRequest) returns (ListExternalCorporaResponse);
+
+  // `/freeze_gc`, `/pause_generation`, `/continue_generation`,
+  // `/pd_role_switch`, `/update_weight_version`.
+  rpc FreezeGc(FreezeGcRequest) returns (FreezeGcResponse);
+  rpc PauseGeneration(PauseGenerationRequest) returns (GenerationPauseResponse);
+  rpc ContinueGeneration(ContinueGenerationRequest) returns (GenerationPauseResponse);
+  rpc PdRoleSwitch(PdRoleSwitchRequest) returns (PdRoleSwitchResponse);
+  rpc UpdateWeightVersion(UpdateWeightVersionRequest) returns (UpdateWeightVersionResponse);
 }
 
 message ListModelsRequest {}

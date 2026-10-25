@@ -203,6 +203,36 @@ control_messages! {
     /// `/list_external_corpora`.
     ListExternalCorporaReqInput {}
 
+    /// `/freeze_gc`: Python's `FreezeGCReq`.
+    FreezeGCReq {
+        gc_threshold: Option<Vec<i64>>,
+    }
+
+    /// `/pause_generation`: Python's `PauseGenerationReqInput`. The scheduler
+    /// accepts `in_place` and `retract`; `abort` never reaches it.
+    PauseGenerationReqInput {
+        mode: String,
+    }
+
+    /// `/continue_generation`: Python's `ContinueGenerationReqInput`.
+    ContinueGenerationReqInput {
+        torch_empty_cache: bool,
+    }
+
+    /// `/pd_role_switch`: Python's `PdRoleSwitchReqInput`.
+    PdRoleSwitchReqInput {
+        new_role: String,
+        decode_cuda_graph_bs: Option<Vec<i64>>,
+        decode_cuda_graph_memory_gb: Option<f64>,
+        prepare_only: bool,
+    }
+
+    /// `/update_weight_version`: Python's `UpdateWeightVersionReqInput`.
+    UpdateWeightVersionReqInput {
+        new_version: String,
+        abort_all_requests: bool,
+    }
+
     /// Clear the HiCache storage backend.
     ClearHiCacheReqInput {}
 
@@ -383,6 +413,58 @@ impl RemoveExternalCorpusReqInput {
 impl ListExternalCorporaReqInput {
     pub fn new(rid: String) -> Self {
         Self { rid }
+    }
+}
+
+impl FreezeGCReq {
+    pub fn new(rid: String, gc_threshold: Option<Vec<i64>>) -> Self {
+        Self { rid, gc_threshold }
+    }
+}
+
+impl PauseGenerationReqInput {
+    pub fn new(rid: String, mode: String) -> Self {
+        Self { rid, mode }
+    }
+}
+
+impl ContinueGenerationReqInput {
+    pub fn new(rid: String, torch_empty_cache: bool) -> Self {
+        Self {
+            rid,
+            torch_empty_cache,
+        }
+    }
+}
+
+/// The `/pd_role_switch` fields; the owned form of `api::PdRoleSwitchRequest`.
+#[derive(Debug, Clone)]
+pub struct PdRoleSwitch {
+    pub new_role: String,
+    pub decode_cuda_graph_bs: Option<Vec<i64>>,
+    pub decode_cuda_graph_memory_gb: Option<f64>,
+    pub prepare_only: bool,
+}
+
+impl PdRoleSwitchReqInput {
+    pub fn new(rid: String, switch: PdRoleSwitch) -> Self {
+        Self {
+            rid,
+            new_role: switch.new_role,
+            decode_cuda_graph_bs: switch.decode_cuda_graph_bs,
+            decode_cuda_graph_memory_gb: switch.decode_cuda_graph_memory_gb,
+            prepare_only: switch.prepare_only,
+        }
+    }
+}
+
+impl UpdateWeightVersionReqInput {
+    pub fn new(rid: String, new_version: String, abort_all_requests: bool) -> Self {
+        Self {
+            rid,
+            new_version,
+            abort_all_requests,
+        }
     }
 }
 

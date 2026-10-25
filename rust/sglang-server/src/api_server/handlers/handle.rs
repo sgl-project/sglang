@@ -18,6 +18,7 @@ use crate::tokenizer_manager::wiring::{AbortSource, RequestAdmission, TmEvent};
 use crate::utils::error::Error;
 use crate::utils::fsm::RequestState;
 
+use super::frontend_state::FrontendState;
 use super::generate::{Generation, Generations};
 use crate::api_server::core::CoreError;
 use crate::api_server::core::fanout::{ControlTarget, RankId};
@@ -109,6 +110,8 @@ pub(super) struct CoreInner {
     /// The DP rank the local scheduler answers for, and the targets for the rest.
     pub(super) dp_rank: RankId,
     pub(super) peer_endpoints: Vec<Arc<dyn ControlTarget>>,
+    /// The pause flag and the model-facts cache; see `frontend_state`.
+    pub(super) frontend: FrontendState,
 }
 
 impl CoreHandle {
@@ -117,7 +120,8 @@ impl CoreHandle {
         abort_tx: flume::Sender<AbortSource>,
         config: CoreConfig,
     ) -> Self {
-        let dp_rank = config.metadata.deployment_info.dp_rank.unwrap_or(0);
+        let metadata = config.metadata;
+        let dp_rank = metadata.deployment_info.dp_rank.unwrap_or(0);
         Self {
             inner: Arc::new(CoreInner {
                 intake_tx,
@@ -128,10 +132,11 @@ impl CoreHandle {
                 is_disaggregation: config.is_disaggregation,
                 mm_limits: config.mm_limits,
                 mm_processor: OnceLock::new(),
-                metadata: config.metadata,
                 generations: Generations::default(),
                 dp_rank,
                 peer_endpoints: config.peer_endpoints,
+                frontend: FrontendState::new(&metadata),
+                metadata,
             }),
         }
     }

@@ -3,15 +3,18 @@
 
 use crate::message::ids::Rid;
 use crate::message::io_struct::{
-    CheckWeightsReqInput, ControlRequest, ExpertDistributionAction, ExpertDistributionReq,
-    FlushCacheReqInput, ProfileOptions, ProfileReq, ReleaseMemoryOccupationReqInput,
+    CheckWeightsReqInput, ContinueGenerationReqInput, ControlRequest, ExpertDistributionAction,
+    ExpertDistributionReq, FlushCacheReqInput, FreezeGCReq, PauseGenerationReqInput, PdRoleSwitch,
+    PdRoleSwitchReqInput, ProfileOptions, ProfileReq, ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput, SetInternalStateReq, SlowDownReqInput,
+    UpdateWeightVersionReqInput,
 };
 use crate::message::request::RequestKind;
 use crate::message::response::ResponseItem;
 use crate::message::types::ForwardedControlReq;
 use crate::utils::environ;
 
+use super::frontend_state::RelayedEffect;
 use super::handle::{CoreHandle, translate_runtime_error};
 use crate::api_server::core::CoreError;
 use crate::api_server::core::fanout::{self, RequestBuilder};
@@ -105,6 +108,180 @@ impl CoreHandle {
                 .map(|outcome| (outcome.success, outcome.message.as_str())),
         );
         Ok(ProfileOutcome { success, message })
+    }
+
+    /// Freeze the Python garbage collector on every DP rank's scheduler with
+    /// the launch's `--gc-threshold`. The frontend itself has no GC to freeze.
+    pub(crate) async fn freeze_gc(&self) -> Result<(), CoreError> {
+        let gc_threshold = self.inner.metadata.deployment_info.gc_threshold.clone();
+        self.ack("freeze-gc", &|| {
+            ControlRequest::FreezeGCReq(FreezeGCReq::new(
+                Rid::new().to_string(),
+                gc_threshold.clone(),
+            ))
+        })
+        .await
+    }
+
+    /// Pause generation, as Python's `TokenizerManager.pause_generation`: this
+    /// listener stops admitting generates first, then `in_place` / `retract`
+    /// reach every scheduler (and, through the relay, every other listener's
+    /// flag), while `abort` is frontend-only: cancel what is in flight and
+    /// wait for it to drain.
+    pub(crate) async fn pause_generation(&self, mode: &str) -> Result<(), CoreError> {
+        if !matches!(mode, "abort" | "in_place" | "retract") {
+            return Err(CoreError::InvalidArgument(format!(
+                "mode must be one of abort, in_place, retract; got {mode:?}"
+            )));
+        }
+        if mode == "abort" && !self.inner.peer_endpoints.is_empty() {
+            // Python's abort mode never reaches a scheduler, so there is no
+            // message to relay the pause to the other listeners with.
+            return Err(CoreError::InvalidArgument(
+                "pause_generation mode 'abort' is not supported across DP ranks; use in_place or retract".into(),
+            ));
+        }
+        self.inner.frontend.set_paused(true);
+        if mode == "abort" {
+            loop {
+                self.abort(None);
+                if self.inner.generations.is_empty() {
+                    return Ok(());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+        self.ack("pause-generation", &|| {
+            ControlRequest::PauseGenerationReqInput(PauseGenerationReqInput::new(
+                Rid::new().to_string(),
+                mode.to_owned(),
+            ))
+        })
+        .await
+    }
+
+    /// Resume generation on every DP rank and admit generates again.
+    pub(crate) async fn continue_generation(
+        &self,
+        torch_empty_cache: bool,
+    ) -> Result<(), CoreError> {
+        self.inner.frontend.set_paused(false);
+        self.ack("continue-generation", &|| {
+            ControlRequest::ContinueGenerationReqInput(ContinueGenerationReqInput::new(
+                Rid::new().to_string(),
+                torch_empty_cache,
+            ))
+        })
+        .await
+    }
+
+    /// Switch the PD role on every DP rank, as Python's
+    /// `TokenizerManager.pd_role_switch`: with several ranks a `prepare_only`
+    /// preflight runs first and the switch only if every rank is ready.
+    pub(crate) async fn pd_role_switch(
+        &self,
+        switch: PdRoleSwitch,
+    ) -> Result<PdRoleSwitchOutcome, CoreError> {
+        if !self.inner.metadata.deployment_info.enable_pd_role_switch {
+            return Ok(PdRoleSwitchOutcome {
+                success: false,
+                message: "--enable-pd-role-switch is not set on this server".into(),
+                old_role: self
+                    .model_facts()
+                    .await
+                    .disaggregation_mode
+                    .as_str()
+                    .to_owned(),
+                new_role: switch.new_role,
+                safe_to_restore: true,
+            });
+        }
+        let dp_size = self.inner.metadata.deployment_info.dp_size.max(1);
+        let mut results = if dp_size > 1 {
+            let prepare = PdRoleSwitch {
+                prepare_only: true,
+                ..switch.clone()
+            };
+            let results = self.role_switch_round(&prepare).await?;
+            if results.iter().all(|result| result.success) && !switch.prepare_only {
+                self.role_switch_round(&switch).await?
+            } else {
+                results
+            }
+        } else {
+            self.role_switch_round(&switch).await?
+        };
+        let all_success = !results.is_empty() && results.iter().all(|result| result.success);
+        let safe_to_restore =
+            !results.is_empty() && results.iter().all(|result| result.safe_to_restore);
+        let message = if all_success && !switch.prepare_only {
+            // The role changed on every scheduler; refresh the cached mode.
+            self.inner.frontend.invalidate();
+            "ok".to_owned()
+        } else if all_success {
+            "ready".to_owned()
+        } else {
+            results
+                .iter()
+                .filter(|result| !result.success)
+                .map(|result| result.message.as_str())
+                .collect::<Vec<_>>()
+                .join("; ")
+        };
+        let old_role = if results.is_empty() {
+            String::new()
+        } else {
+            std::mem::take(&mut results[0].old_role)
+        };
+        Ok(PdRoleSwitchOutcome {
+            success: all_success,
+            message,
+            old_role,
+            new_role: switch.new_role,
+            safe_to_restore,
+        })
+    }
+
+    async fn role_switch_round(
+        &self,
+        switch: &PdRoleSwitch,
+    ) -> Result<Vec<PdRoleSwitchOutcome>, CoreError> {
+        self.control(&|| {
+            ControlRequest::PdRoleSwitchReqInput(PdRoleSwitchReqInput::new(
+                Rid::new().to_string(),
+                switch.clone(),
+            ))
+        })
+        .await
+        .decode::<PdRoleSwitchOutcome>("pd-role-switch")
+    }
+
+    /// Relabel the served weights on every DP rank. `abort_all_requests`
+    /// cancels this listener's in-flight generations first, as Python's
+    /// handler does. The cached `weight_version` is refreshed afterwards.
+    pub(crate) async fn update_weight_version(
+        &self,
+        new_version: String,
+        abort_all_requests: bool,
+    ) -> Result<(), CoreError> {
+        if new_version.is_empty() {
+            return Err(CoreError::InvalidArgument(
+                "missing field `new_version`".into(),
+            ));
+        }
+        if abort_all_requests {
+            self.abort(None);
+        }
+        self.ack("update-weight-version", &|| {
+            ControlRequest::UpdateWeightVersionReqInput(UpdateWeightVersionReqInput::new(
+                Rid::new().to_string(),
+                new_version.clone(),
+                abort_all_requests,
+            ))
+        })
+        .await?;
+        self.inner.frontend.invalidate();
+        Ok(())
     }
 
     /// Start, stop, or dump the expert-distribution recorder on every DP rank.
@@ -215,19 +392,35 @@ impl CoreHandle {
         .await
     }
 
-    /// Serve a peer's control request on the local scheduler only; never fan out again.
+    /// Serve a peer's control request on the local scheduler only; never fan
+    /// out again. Afterwards apply the request's frontend effect here too
+    /// (the origin listener applied it to itself), so pause and the model
+    /// facts are deployment-wide. Applied after the reply, not before, or a
+    /// read in between would re-cache the old facts.
     pub(crate) async fn forward_control_req(
         &self,
         header: bytes::Bytes,
     ) -> Result<bytes::Bytes, CoreError> {
         let forwarded = ForwardedControlReq::parse(header)
             .map_err(|error| CoreError::InvalidArgument(error.to_string()))?;
-        self.submit_control_req(ControlRequest::Forwarded(forwarded))
-            .await
+        let effect = RelayedEffect::for_tag(&forwarded.tag);
+        let reply = self
+            .submit_control_req(ControlRequest::Forwarded(forwarded))
+            .await;
+        match effect {
+            RelayedEffect::None => {}
+            // Set regardless of the reply, as the origin did before fanning out.
+            RelayedEffect::SetPaused(paused) => self.inner.frontend.set_paused(paused),
+            RelayedEffect::Invalidate => self.inner.frontend.invalidate(),
+        }
+        reply
     }
 
     /// Deliver one control request to the local scheduler only.
-    async fn submit_control_req(&self, request: ControlRequest) -> Result<bytes::Bytes, CoreError> {
+    pub(super) async fn submit_control_req(
+        &self,
+        request: ControlRequest,
+    ) -> Result<bytes::Bytes, CoreError> {
         let mut call = self.submit(RequestKind::Control(Box::new(request))).await?;
         match call.recv().await {
             Some(ResponseItem::Control(bytes)) => Ok(bytes),
@@ -263,6 +456,20 @@ fn parse_server_args(
         )));
     }
     Ok(map)
+}
+
+/// The scheduler's `PdRoleSwitchReqOutput`, and the merged outcome.
+#[derive(Debug, Default, PartialEq, serde::Deserialize)]
+pub(crate) struct PdRoleSwitchOutcome {
+    pub(crate) success: bool,
+    #[serde(default)]
+    pub(crate) message: String,
+    #[serde(default)]
+    pub(crate) old_role: String,
+    #[serde(default)]
+    pub(crate) new_role: String,
+    #[serde(default)]
+    pub(crate) safe_to_restore: bool,
 }
 
 /// A scheduler output with no fields of its own (`BaseReq` only).
@@ -323,8 +530,9 @@ mod tests {
     use super::*;
     use crate::api_server::handlers::test_utils::*;
     use crate::api_server::handlers::{CoreConfig, CoreMetadata};
+    use crate::message::ids::Rid;
     use crate::message::io_struct::GetInternalStateReq;
-    use crate::message::request::Request;
+    use crate::message::request::{GenerateRequest, Request};
     use bytes::Bytes;
 
     /// A multi-rank operation reaches the local scheduler once and every
@@ -571,6 +779,226 @@ mod tests {
             outcome.unwrap_or_else(|error| panic!("{tag}: {error}"));
             assert_eq!(value, expected, "{tag}");
         }
+    }
+
+    /// Pause holds this listener's generates before the schedulers hear of
+    /// it, continue releases them, and a relayed pause from another listener
+    /// does the same here after the local scheduler replied.
+    #[tokio::test]
+    async fn pause_and_continue_gate_generates_locally_and_through_the_relay() {
+        let harness = Harness::unbounded(8);
+        let bare =
+            Bytes::from(rmp_serde::to_vec_named(&serde_json::json!({"success": true})).unwrap());
+        let handle = harness.handle.clone();
+        let (outcome, mode) = tokio::join!(handle.pause_generation("in_place"), async {
+            let request = accept_intake(harness.intake_rx.recv_async().await.unwrap());
+            assert!(
+                harness.handle.inner.frontend.is_paused(),
+                "paused before the scheduler is asked"
+            );
+            let RequestKind::Control(control) = &request.kind else {
+                panic!("expected a control request");
+            };
+            let rmpv::Value::Array(items) =
+                rmpv::decode::read_value(&mut &control.encode().unwrap()[..]).unwrap()
+            else {
+                panic!("positional wire");
+            };
+            request
+                .sink
+                .try_send(ResponseItem::Control(bare.clone()))
+                .unwrap();
+            items[3].as_str().map(str::to_owned)
+        });
+        outcome.unwrap();
+        assert_eq!(mode.as_deref(), Some("in_place"));
+
+        let gen_handle = harness.handle.clone();
+        let parked = tokio::spawn(async move {
+            gen_handle
+                .generate(GenerateRequest {
+                    rid: Rid::new(),
+                    input_ids: Some(vec![1]),
+                    ..Default::default()
+                })
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        assert!(!parked.is_finished(), "generate waits while paused");
+        assert!(harness.intake_rx.try_recv().is_err());
+
+        let handle = harness.handle.clone();
+        let (outcome, ()) = tokio::join!(handle.continue_generation(true), async {
+            let request = accept_intake(harness.intake_rx.recv_async().await.unwrap());
+            request
+                .sink
+                .try_send(ResponseItem::Control(bare.clone()))
+                .unwrap();
+        });
+        outcome.unwrap();
+        let released = accept_intake(harness.intake_rx.recv_async().await.unwrap());
+        assert!(matches!(released.kind, RequestKind::Generate(_)));
+        drop(parked);
+
+        let header = ControlRequest::PauseGenerationReqInput(PauseGenerationReqInput::new(
+            "peer-rid".into(),
+            "retract".into(),
+        ))
+        .encode()
+        .unwrap();
+        let handle = harness.handle.clone();
+        let (reply, ()) = tokio::join!(handle.forward_control_req(header), async {
+            let request = accept_intake(harness.intake_rx.recv_async().await.unwrap());
+            assert!(
+                !harness.handle.inner.frontend.is_paused(),
+                "the flag flips only after the scheduler replied"
+            );
+            request
+                .sink
+                .try_send(ResponseItem::Control(bare.clone()))
+                .unwrap();
+        });
+        reply.unwrap();
+        assert!(harness.handle.inner.frontend.is_paused());
+        assert_eq!(
+            harness
+                .handle
+                .pause_generation("sideways")
+                .await
+                .unwrap_err()
+                .kind(),
+            crate::api_server::core::CoreErrorKind::InvalidArgument
+        );
+    }
+
+    /// Abort-mode pause is frontend-only: it cancels the in-flight generates
+    /// and returns once they are gone, never asking a scheduler.
+    #[tokio::test]
+    async fn abort_pause_drains_in_flight_generations_without_a_scheduler_round_trip() {
+        let harness = Harness::unbounded(8);
+        let gen_handle = harness.handle.clone();
+        let call = tokio::spawn(async move {
+            gen_handle
+                .generate(GenerateRequest {
+                    rid: Rid::from_client("in-flight"),
+                    input_ids: Some(vec![1]),
+                    ..Default::default()
+                })
+                .await
+        });
+        let request = accept_intake(harness.intake_rx.recv_async().await.unwrap());
+        let mut call = call.await.unwrap().unwrap();
+        harness.handle.pause_generation("abort").await.unwrap();
+        assert!(harness.handle.inner.frontend.is_paused());
+        assert!(
+            harness.intake_rx.try_recv().is_err(),
+            "no scheduler message"
+        );
+        assert!(matches!(
+            call.recv().await,
+            Some(crate::api_server::core::CoreEvent::Failed(
+                CoreError::Cancelled(_)
+            ))
+        ));
+        drop(request);
+    }
+
+    /// A role switch on several ranks preflights with `prepare_only` and only
+    /// then switches; the cached role is refreshed after a real switch.
+    #[tokio::test]
+    async fn pd_role_switch_preflights_across_ranks_and_refreshes_the_role() {
+        use crate::api_server::core::fanout::testing::DummyTarget;
+        use crate::message::config::DeploymentInfo;
+        let (intake_tx, intake_rx) = flume::unbounded();
+        let (abort_tx, _abort_rx) = flume::unbounded();
+        let reply = |success: bool| {
+            Bytes::from(
+                rmp_serde::to_vec_named(&serde_json::json!({
+                    "success": success, "message": "", "old_role": "prefill",
+                    "new_role": "decode", "safe_to_restore": true,
+                }))
+                .unwrap(),
+            )
+        };
+        let handle = CoreHandle::new(
+            intake_tx,
+            abort_tx,
+            CoreConfig {
+                response_capacity: 8,
+                response_activity: Default::default(),
+                startup_ready: true,
+                is_disaggregation: true,
+                mm_limits: Vec::new(),
+                metadata: CoreMetadata {
+                    deployment_info: DeploymentInfo {
+                        dp_size: 2,
+                        enable_pd_role_switch: true,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                peer_endpoints: vec![DummyTarget::replying(&[1], move |_| Ok(reply(true)))],
+            },
+        );
+        let switch = PdRoleSwitch {
+            new_role: "decode".into(),
+            decode_cuda_graph_bs: None,
+            decode_cuda_graph_memory_gb: None,
+            prepare_only: false,
+        };
+        let (outcome, prepare_flags) = tokio::join!(handle.pd_role_switch(switch), async {
+            let mut flags = Vec::new();
+            for _ in 0..2 {
+                let request = accept_intake(intake_rx.recv_async().await.unwrap());
+                let RequestKind::Control(control) = &request.kind else {
+                    panic!("expected a control request");
+                };
+                let rmpv::Value::Array(items) =
+                    rmpv::decode::read_value(&mut &control.encode().unwrap()[..]).unwrap()
+                else {
+                    panic!("positional wire");
+                };
+                // [tag, rid, ipc, new_role, decode_cuda_graph_bs, memory_gb, prepare_only]
+                flags.push(items[6].as_bool().unwrap());
+                request
+                    .sink
+                    .try_send(ResponseItem::Control(reply(true)))
+                    .unwrap();
+            }
+            flags
+        });
+        assert_eq!(
+            prepare_flags,
+            [true, false],
+            "preflight first, then the switch"
+        );
+        assert_eq!(
+            outcome.unwrap(),
+            PdRoleSwitchOutcome {
+                success: true,
+                message: "ok".into(),
+                old_role: "prefill".into(),
+                new_role: "decode".into(),
+                safe_to_restore: true,
+            }
+        );
+        assert!(
+            handle.inner.frontend.is_stale(),
+            "the role changed; refresh next read"
+        );
+
+        let disabled = Harness::unbounded(8).handle;
+        let outcome = disabled
+            .pd_role_switch(PdRoleSwitch {
+                new_role: "decode".into(),
+                decode_cuda_graph_bs: None,
+                decode_cuda_graph_memory_gb: None,
+                prepare_only: false,
+            })
+            .await
+            .unwrap();
+        assert!(!outcome.success && outcome.safe_to_restore);
+        assert_eq!(outcome.old_role, "null");
     }
 
     #[tokio::test]

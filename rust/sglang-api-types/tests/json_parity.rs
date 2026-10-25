@@ -94,6 +94,13 @@ fn fixtures_decode_to_their_canonical_bytes() {
             "ListExternalCorporaResponse" => {
                 check::<api::ListExternalCorporaResponse>(&name, input, canonical)
             }
+            "PauseGenerationRequest" => {
+                check::<api::PauseGenerationRequest>(&name, input, canonical)
+            }
+            "PdRoleSwitchRequest" => check::<api::PdRoleSwitchRequest>(&name, input, canonical),
+            "UpdateWeightVersionRequest" => {
+                check::<api::UpdateWeightVersionRequest>(&name, input, canonical)
+            }
             other => panic!("fixture type {other} has no Rust mapping; add it here"),
         }
     }

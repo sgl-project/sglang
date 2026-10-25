@@ -75,3 +75,69 @@ message ResumeMemoryOccupationRequest {
   optional StringList tags = 1;
 }
 message MemoryOccupationResponse {}
+
+// `/freeze_gc`: freeze the Python garbage collector on every DP rank's
+// scheduler, with the launch's `--gc-threshold`.
+message FreezeGcRequest {}
+message FreezeGcResponse {}
+
+// `/pause_generation`. `in_place` holds the scheduler loop with its batches
+// intact; `retract` returns running requests to the waiting queue; `abort`
+// cancels them and is handled by the frontend alone.
+message PauseGenerationRequest {
+  optional string mode = 1 [
+    (sglang.json.v1.field_json).null_policy = NULL_POLICY_RESETS_DEFAULT,
+    (sglang.json.v1.field_json).default_string = "abort"
+  ];
+}
+
+// `/continue_generation`.
+message ContinueGenerationRequest {
+  optional bool torch_empty_cache = 1 [
+    (sglang.json.v1.field_json).null_policy = NULL_POLICY_RESETS_DEFAULT,
+    (sglang.json.v1.field_json).default_bool = true
+  ];
+}
+
+// Python's `{"message": ..., "status": "ok"}` body for pause and continue.
+message GenerationPauseResponse {
+  string message = 1;
+  string status = 2;
+}
+
+// `/pd_role_switch`: flip this instance between prefill and decode at
+// runtime (`--enable-pd-role-switch`). With several DP ranks the frontend
+// first runs a `prepare_only` preflight on every rank.
+message PdRoleSwitchRequest {
+  optional string new_role = 1 [
+    (sglang.json.v1.field_json).null_policy = NULL_POLICY_RESETS_DEFAULT,
+    (sglang.json.v1.field_json).default_string = ""
+  ];
+  optional Int64List decode_cuda_graph_bs = 2;
+  optional double decode_cuda_graph_memory_gb = 3;
+  bool prepare_only = 4;
+}
+
+// Python's `PdRoleSwitchReqOutput`.
+message PdRoleSwitchResponse {
+  bool success = 1;
+  string message = 2;
+  string old_role = 3;
+  string new_role = 4;
+  bool safe_to_restore = 5;
+}
+
+// `/update_weight_version`: relabel the served weights on every DP rank.
+message UpdateWeightVersionRequest {
+  string new_version = 1;
+  optional bool abort_all_requests = 2 [
+    (sglang.json.v1.field_json).null_policy = NULL_POLICY_RESETS_DEFAULT,
+    (sglang.json.v1.field_json).default_bool = true
+  ];
+}
+
+message UpdateWeightVersionResponse {
+  bool success = 1;
+  string message = 2;
+  optional string new_version = 3;
+}

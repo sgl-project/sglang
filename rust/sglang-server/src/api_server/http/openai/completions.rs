@@ -80,7 +80,7 @@ async fn completions(
     let stream = request.stream.unwrap_or(false);
     let echo = request.echo.unwrap_or(false);
     let model = request.model.clone();
-    if let Some(message) = model_error(&model, &state.server_args.served_model_name) {
+    if let Some(message) = model_error(&model, &state.core.served_model_name().await) {
         return openai_error(StatusCode::BAD_REQUEST, message, false);
     }
 

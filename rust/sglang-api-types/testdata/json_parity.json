@@ -659,6 +659,24 @@
       "name": "counts are a plain string-keyed object",
       "input": {"success": true, "corpus_token_counts": {"c": 3}},
       "canonical": "{\"success\":true,\"corpus_token_counts\":{\"c\":3},\"message\":\"\"}"
+    },
+    {
+      "type": "PauseGenerationRequest",
+      "name": "mode defaults to abort as in Python",
+      "input": {},
+      "canonical": "{\"mode\":\"abort\"}"
+    },
+    {
+      "type": "PdRoleSwitchRequest",
+      "name": "the batch-size list is bare and the sentinel role is the default",
+      "input": {"decode_cuda_graph_bs": [1, 8], "prepare_only": true},
+      "canonical": "{\"new_role\":\"\",\"decode_cuda_graph_bs\":[1,8],\"prepare_only\":true}"
+    },
+    {
+      "type": "UpdateWeightVersionRequest",
+      "name": "abort_all_requests defaults on",
+      "input": {"new_version": "v2"},
+      "canonical": "{\"new_version\":\"v2\",\"abort_all_requests\":true}"
     }
   ]
 }
