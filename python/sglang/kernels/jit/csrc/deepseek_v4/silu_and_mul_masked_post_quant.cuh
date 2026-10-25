@@ -397,6 +397,7 @@ struct SiluAndMulClampKernel {
     constexpr uint32_t kVecSize = 16 / sizeof(DType);
     const auto out_dim = static_cast<uint32_t>(H.unwrap());
     const auto num_tokens = static_cast<uint32_t>(M.unwrap());
+    if (num_tokens == 0) return;
     RuntimeCheck(out_dim > 0, "out_dim must be positive");
     RuntimeCheck(out_dim % kVecSize == 0, "out_dim must be divisible by vector size");
     const auto out_vecs = out_dim / kVecSize;
@@ -569,6 +570,7 @@ struct SiluAndMulContigPostQuantKernel {
     }
 
     const auto num_tokens = static_cast<uint32_t>(M.unwrap());
+    if (num_tokens == 0) return;
 
     const auto params = SiluMulQuantContigParams{
         .input = static_cast<const bf16_t*>(input.data_ptr()),

@@ -412,6 +412,32 @@ def test_fp32_silu_post_quant(group_size, hidden, swiglu_limit):
             assert mismatch.item() < 1e-4
 
 
+@pytest.mark.parametrize("transposed", [False, True])
+def test_silu_kernels_accept_no_rows(transposed):
+    """A MoE can run on no rows, e.g. an overlapped micro-batch that is empty on
+    every DP rank. The activation kernels must then launch nothing."""
+    from sglang.kernels.ops.activation.silu_and_mul_clamp import (
+        silu_and_mul_clamp,
+        silu_and_mul_contig_post_quant,
+    )
+
+    group_size, hidden = 128, 2048
+    x = torch.empty(0, 2 * hidden, device="cuda", dtype=torch.bfloat16)
+    out = torch.empty(0, hidden, device="cuda", dtype=torch.bfloat16)
+    silu_and_mul_clamp(x, out, 10.0)
+
+    q = torch.empty(0, hidden, device="cuda", dtype=fp8_dtype)
+    groups = hidden // group_size
+    if transposed:
+        scale = torch.empty(groups // 4, 0, device="cuda", dtype=torch.int32).T
+    else:
+        scale = torch.empty(0, groups, device="cuda", dtype=torch.float32)
+    silu_and_mul_contig_post_quant(
+        x, q, scale, group_size, scale_ue8m0=transposed, transposed=transposed
+    )
+    torch.cuda.synchronize()
+
+
 @pytest.mark.parametrize("counts_kind", ["all_zero", "one_hot", "uneven", "full"])
 @pytest.mark.parametrize("transposed", [False, True])
 def test_masked_post_quant_writes_exactly_the_real_rows(transposed, counts_kind):
