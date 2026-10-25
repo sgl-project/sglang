@@ -3358,6 +3358,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "sglang-api-types",
  "thiserror 2.0.20",
  "tracing",
  "uuid",
