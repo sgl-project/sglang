@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
 _HIDDEN = 3584
+_MAX_TOKENS = 64  # route_radix covers up to 64 tokens per launch
 _GROUP_SIZE = 32
 _NUM_GROUPS = _HIDDEN // _GROUP_SIZE
 

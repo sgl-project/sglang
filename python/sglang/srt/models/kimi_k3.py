@@ -1330,6 +1330,10 @@ class KimiK3MoE(nn.Module):
             latent.copy_(expert_output)
 
     def _nvfp4_preparation_covered(self, router_logits, routed_input):
+        from sglang.srt.layers.quantization.modelopt_quant import (
+            ModelOptNvFp4FusedMoEMethod,
+        )
+
         if not (
             self._defer_moe_finalize
             and isinstance(self.experts.quant_method, ModelOptNvFp4FusedMoEMethod)
