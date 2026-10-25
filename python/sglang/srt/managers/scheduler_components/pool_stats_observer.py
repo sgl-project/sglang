@@ -33,16 +33,19 @@ def kv_private_tokens(kv: ReqKvInfo, page_size: int) -> int:
 
 
 def kv_private_swa_tokens(kv: ReqKvInfo, page_size: int) -> int:
+    # Window eviction frees only [swa_dead_lo, evicted); [protected, swa_dead_lo)
+    # stays held until the request finishes, even after the cursor jumps past it.
     allocated = ceil_align(kv.kv_allocated_len, page_size)
-    return allocated - max(
-        kv.cache_protected_len, kv.get_evicted_seqlen(ComponentType.SWA)
+    window_freed = max(
+        0, kv.get_evicted_seqlen(ComponentType.SWA) - kv.swa_dead_lo(page_size)
     )
+    return allocated - kv.cache_protected_len - window_freed
 
 
 def kv_mamba_slots(kv: ReqKvInfo) -> int:
     total = kv.mamba_pool_idx.numel() if kv.holds_mamba else 0
     if kv.mamba_ping_pong_track_buffer is not None:
-        total += int((kv.mamba_ping_pong_track_buffer != -1).sum().item())
+        total += kv.mamba_ping_pong_empty.count(False)
     return total
 
 
@@ -58,7 +61,7 @@ class PoolStats:
     is_hybrid_ssm: bool = False
     is_hisparse: bool = False
 
-    # For hybrid-swa pools
+    # Denominator of full_token_usage (always set); swa_capacity for hybrid-swa pools
     full_capacity: Optional[int] = None
     swa_capacity: Optional[int] = None
     swa_num_used: Optional[int] = None
@@ -239,6 +242,7 @@ class SchedulerPoolStatsObserver:
             full_token_usage=token_usage,
             full_available_size=available_size,
             full_evictable_size=evictable_size,
+            full_capacity=self.max_total_num_tokens,
         )
 
     def _get_hisparse_token_info(self, pool_stats: PoolStats) -> PoolStats:
@@ -294,6 +298,7 @@ class SchedulerPoolStatsObserver:
             full_token_usage=full_token_usage,
             full_available_size=full_available_size,
             full_evictable_size=full_evictable_size,
+            full_capacity=full_capacity,
             mamba_num_used=mamba_num_used,
             mamba_usage=mamba_usage,
             mamba_available_size=mamba_available_size,

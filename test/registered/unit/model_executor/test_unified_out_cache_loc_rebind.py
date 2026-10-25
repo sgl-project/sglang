@@ -13,18 +13,16 @@
 # ==============================================================================
 """ForwardBatch construction wires the unified write-loc rebind.
 
-`init_new` must call `kv_index_translator.rebind_write_loc`: a construction
-path that skips it ships VIRTUAL write ids to the kernels, a silent
-wrong-slot store. Also runs the REAL `_pad_inputs_to_size` against a live
-translator, since pad lanes are zeros and zeros must derive to the slot-0
-sink. Sliding-window semantics are pinned in test_kv_index_translator.py.
+`init_new` must bind the batch to a plan (`translator.own_plan`,
+`kv_loc_plan.bind`): a construction path that skips it ships VIRTUAL write
+ids to the kernels, a silent wrong-slot store. Also runs the REAL
+`_pad_inputs_to_size` against a live translator, since pad lanes are zeros
+and must write the slot-0 sink in every id space. Sliding-window semantics
+are pinned in test_kv_index_translator.py.
 
     python -m pytest test/registered/unit/model_executor/test_unified_out_cache_loc_rebind.py -v
 """
 
-import ast
-import inspect
-import textwrap
 import unittest
 from types import SimpleNamespace
 from unittest.mock import create_autospec
@@ -32,6 +30,7 @@ from unittest.mock import create_autospec
 import torch
 
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
+from sglang.srt.mem_cache.kv_loc_plan import IdSpace, IdSpaceKind
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -70,47 +69,20 @@ def _armed_source(v2p, swa_map):
     )
     src.is_translating = True
     src._translate_full = lambda t, out=None: v2p[t.to(torch.int64)]
-    # The WRITE loc has its own translate because under DCP it arrives widened;
-    # at dcp_size == 1 it is the read translate, so arm it with the same fake.
-    src._translate_write_full = src._translate_full
-    # Phase 2 derives from physical values through p2v + the swa v2p; arm the
-    # inverse of the fake v2p (ps=1, so the expected swa loc for virtual t is
-    # swa_map[t]).
-    p2v = torch.zeros(int(v2p.max()) + 1, dtype=torch.int64)
-    p2v[v2p] = torch.arange(v2p.numel(), dtype=torch.int64)
-    src._full_p2v_table = p2v
-    src._swa_v2p_table = swa_map
+    src._spaces = {
+        # The WRITE loc has its own translate because under DCP it arrives
+        # widened; at dcp_size == 1 it is the read translate.
+        IdSpaceKind.FULL: IdSpace(
+            key=(IdSpaceKind.FULL, "test"), write=src._translate_full
+        ),
+        # The sliding-window ids derive from the virtual window (ps=1, so the
+        # swa id for virtual t is swa_map[t]).
+        IdSpaceKind.SLIDING_WINDOW: IdSpace(
+            key=(IdSpaceKind.SLIDING_WINDOW, "test"),
+            write=lambda t: swa_map[t.to(torch.int64)],
+        ),
+    }
     return src
-
-
-def _call_names(func) -> list:
-    """Dotted call targets appearing in `func`'s body, e.g.
-    'model_runner.kv_index_translator.rebind_write_loc'."""
-    tree = ast.parse(textwrap.dedent(inspect.getsource(func)))
-    names = []
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Call):
-            parts = []
-            cur = node.func
-            while isinstance(cur, ast.Attribute):
-                parts.append(cur.attr)
-                cur = cur.value
-            if isinstance(cur, ast.Name):
-                parts.append(cur.id)
-            names.append(".".join(reversed(parts)))
-    return names
-
-
-class TestForwardBatchWiring(CustomTestCase):
-    """Critical-path bookkeeping: the construction-time call sites."""
-
-    def test_init_new_calls_the_rebind(self):
-        self.assertIn(
-            "model_runner.kv_index_translator.rebind_write_loc",
-            _call_names(ForwardBatch.init_new.__func__),
-            "init_new must rebind the write loc through the source; a batch "
-            "built without it ships virtual ids to the kernels",
-        )
 
 
 class TestPadComposesWithDerivation(CustomTestCase):
@@ -120,11 +92,11 @@ class TestPadComposesWithDerivation(CustomTestCase):
             kv_index_translator=src,
         )
 
-    def test_pad_lanes_derive_to_sink_and_slices_stay_pointwise(self):
-        """The REAL `_pad_inputs_to_size` composes with phase 2: pad lanes are
-        zeros, zeros derive to the slot-0 sink, and any slice of the padded
-        tensor (the TBO-child shape) derives pointwise -- no handover call
-        exists for the pad to make."""
+    def test_pad_lanes_write_the_sink_in_both_spaces(self):
+        """The REAL `_pad_inputs_to_size` pads the batch's write ids, and the
+        sliding-window ids its plan hands out follow them: pad lanes write the
+        slot-0 sink in both spaces, and both stay the same length as the
+        batch's tokens."""
         n, padded = 3, 6
         v2p = torch.arange(64, dtype=torch.int64) * 3
         swa_map = torch.arange(64, dtype=torch.int64) * 5
@@ -133,36 +105,37 @@ class TestPadComposesWithDerivation(CustomTestCase):
         fb = _make_fb(virt.clone())
         fb.positions = torch.arange(n, dtype=torch.int64)
         fb.lora_ids = [None] * fb.batch_size
-        src.rebind_write_loc(fb)
+        src.bind_own_plan(fb)
+        swa = IdSpaceKind.SLIDING_WINDOW
         self.assertTrue(torch.equal(fb.out_cache_loc, v2p[virt]))
+        self.assertTrue(torch.equal(src.write_ids(fb, swa), swa_map[virt]))
 
         fb._pad_inputs_to_size(self._fake_runner_for_pad(src), padded, fb.batch_size)
 
-        self.assertEqual(fb.out_cache_loc.shape[0], padded)
         # Padded tail lanes go to slot 0 -- the reserved dummy-write sink.
-        self.assertTrue(bool((fb.out_cache_loc[n:] == 0).all()))
-        loc = src._swa_write_loc_unified(fb.out_cache_loc)
-        self.assertTrue(torch.equal(loc[:n], swa_map[virt]))
-        self.assertTrue(bool((loc[n:] == 0).all()))
-        self.assertEqual(loc.dtype, torch.int64)
-        # The TBO-child shape: a slice of the PADDED tensor derives pointwise.
-        sub = src._swa_write_loc_unified(fb.out_cache_loc[1:5])
-        self.assertTrue(torch.equal(sub, loc[1:5]))
+        for loc, want in (
+            (fb.out_cache_loc, v2p[virt]),
+            (src.write_ids(fb, swa), swa_map[virt]),
+        ):
+            self.assertEqual(loc.shape[0], padded)
+            self.assertTrue(torch.equal(loc[:n], want))
+            self.assertTrue(bool((loc[n:] == 0).all()))
+            self.assertEqual(loc.dtype, torch.int64)
 
     def test_empty_loc_rebinds_to_empty(self):
         src = _armed_source(
             torch.arange(8, dtype=torch.int64), torch.arange(8, dtype=torch.int64)
         )
         fb = _make_fb(torch.empty(0, dtype=torch.int64))
-        src.rebind_write_loc(fb)
+        src.bind_own_plan(fb)
         self.assertEqual(fb.out_cache_loc.numel(), 0)
-        self.assertEqual(src._swa_write_loc_unified(fb.out_cache_loc).numel(), 0)
+        self.assertEqual(src.write_ids(fb, IdSpaceKind.SLIDING_WINDOW).numel(), 0)
 
 
 class TestReadRailTranslatesAtProduction(CustomTestCase):
-    """The model-door READ indices (req_to_token-derived, VIRTUAL under the
-    unified pool) are translated at their PRODUCTION site -- the cache then
-    holds the physical result and the pool door never translates."""
+    """The model-door READ indices are physical from their PRODUCTION site
+    (a gather from the iteration's plan under the unified pool) -- the cache
+    then holds the physical result and the pool door never translates."""
 
     def _fb_for_one_shot(self):
         fb = _make_fb(torch.tensor([1, 2], dtype=torch.int64))
@@ -172,39 +145,84 @@ class TestReadRailTranslatesAtProduction(CustomTestCase):
         fb.req_pool_indices = torch.tensor([0, 1], dtype=torch.int64)
         return fb
 
-    def test_one_shot_indices_translated_once_and_cached(self):
+    def test_one_shot_indices_gathered_from_the_plan_once_and_cached(self):
+        from unittest.mock import patch
+
+        from sglang.srt.model_executor import forward_batch_deepseek_mha_mixin as mix
+
+        plans = []
+
+        def pack(plan, *, req_pool_indices, seq_lens, indptr, out, **_):
+            plans.append(plan)
+            out.fill_(7)
+            return True
+
+        fb = self._fb_for_one_shot()
+        fb.kv_loc_plan = object()
+        # autospec, not a bare namespace: setting a name the translator does
+        # not have raises, so renaming the method breaks this test loudly.
+        fake_translator = create_autospec(KVIndexTranslator, instance=True)
+        fake_translator.pack_read_stream = pack
+        fake_backend = SimpleNamespace(kv_index_translator=fake_translator)
+        with patch.object(mix, "get_attn_backend", return_value=fake_backend):
+            r1 = fb.fetch_mha_one_shot_kv_indices()
+            r2 = fb.fetch_mha_one_shot_kv_indices()
+
+        # One gather, from the iteration's plan; the cache holds its result.
+        self.assertEqual(plans, [fb.kv_loc_plan])
+        self.assertIs(r2, r1)
+        self.assertTrue(torch.equal(r1, torch.full((5,), 7, dtype=torch.int32)))
+
+    def _fb_for_chunks(self):
+        fb = self._fb_for_one_shot()
+        fb.kv_loc_plan = object()
+        fb.num_prefix_chunks = 2
+        fb.prefix_chunk_starts = [torch.tensor([0, 0]), torch.tensor([2, 1])]
+        fb.prefix_chunk_seq_lens = [torch.tensor([2, 1]), torch.tensor([1, 2])]
+        fb.prefix_chunk_cu_seq_lens = [
+            torch.tensor([0, 2, 3], dtype=torch.int32),
+            torch.tensor([0, 1, 3], dtype=torch.int32),
+        ]
+        fb.prefix_chunk_num_tokens = [3, 3]
+        fb.prefix_chunk_starts_cpu = [[0, 0], [2, 1]]
+        fb.prefix_chunk_seq_lens_cpu = [[2, 1], [1, 2]]
+        return fb
+
+    def test_chunk_indices_gathered_from_the_plan(self):
+        """On a translating pool each prefix chunk's ids come out of the plan's
+        table: one gather per chunk, at the chunk's start, no translate."""
         from unittest.mock import patch
 
         from sglang.srt.model_executor import forward_batch_deepseek_mha_mixin as mix
 
         calls = []
-        sentinel = torch.arange(5, dtype=torch.int64) + 5000
 
-        def translate(t):
-            calls.append(t)
-            return sentinel
+        def pack(plan, *, req_pool_indices, seq_lens, indptr, out, kv_start_idx):
+            calls.append((plan, seq_lens, indptr, kv_start_idx))
+            out.fill_(9)
+            return True
 
-        fb = self._fb_for_one_shot()
-        fake_pool = SimpleNamespace(
-            req_to_token=torch.zeros((4, 16), dtype=torch.int32)
-        )
-        # autospec, not a bare namespace: setting a name the translator does
-        # not have raises, so renaming the method breaks this test loudly.
+        fb = self._fb_for_chunks()
         fake_translator = create_autospec(KVIndexTranslator, instance=True)
-        fake_translator.translate_full_attn_ids = translate
+        fake_translator.reads_are_translated = True
+        fake_translator.pack_read_stream = pack
         fake_backend = SimpleNamespace(kv_index_translator=fake_translator)
+        fake_pool = SimpleNamespace(req_to_token=torch.zeros((4, 8), dtype=torch.int32))
         with (
-            patch.object(mix, "get_req_to_token_pool", return_value=fake_pool),
             patch.object(mix, "get_attn_backend", return_value=fake_backend),
-            patch.object(mix, "create_flashinfer_kv_indices_triton"),
+            patch.object(mix, "get_req_to_token_pool", return_value=fake_pool),
         ):
-            r1 = fb.fetch_mha_one_shot_kv_indices()
-            r2 = fb.fetch_mha_one_shot_kv_indices()
+            fb.prepare_chunked_kv_indices(torch.device("cpu"))
 
-        self.assertIs(r1, sentinel)  # production site translated
-        self.assertIs(r2, sentinel)  # cache holds the TRANSLATED result
-        self.assertEqual(len(calls), 1)  # translated exactly once
-        self.assertEqual(calls[0].dtype, torch.int32)  # raw producer output
+        self.assertEqual(len(calls), 2)
+        for idx, (plan, seq_lens, indptr, kv_start_idx) in enumerate(calls):
+            self.assertIs(plan, fb.kv_loc_plan)
+            self.assertIs(seq_lens, fb.prefix_chunk_seq_lens[idx])
+            self.assertIs(indptr, fb.prefix_chunk_cu_seq_lens[idx])
+            self.assertIs(kv_start_idx, fb.prefix_chunk_starts[idx])
+        fake_translator.translate_dcp_read_ids.assert_not_called()
+        for chunk in fb.prefix_chunk_kv_indices:
+            self.assertTrue(bool((chunk == 9).all()))
 
     def test_one_shot_indices_noop_on_unmigrated_backend(self):
         from unittest.mock import patch

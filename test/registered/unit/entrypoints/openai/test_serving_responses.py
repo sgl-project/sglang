@@ -1,8 +1,10 @@
 import argparse
 import asyncio
+import functools
 import sys
 import unittest
 from contextlib import asynccontextmanager
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 import orjson
@@ -37,9 +39,9 @@ from sglang.srt.entrypoints.openai.protocol import (
 from sglang.srt.entrypoints.openai.serving_responses import (
     OpenAIServingResponses,
     _build_output_text_logprobs,
-    _should_emit_normal_text_as_message,
 )
 from sglang.srt.function_call.core_types import ToolCallItem
+from sglang.srt.parser.response_template import ResponseTemplateReasoningDetector
 from sglang.srt.parser.template_detection import ReasoningToggleConfig
 from sglang.srt.runtime_context import get_serving, publish, reset_context
 from sglang.srt.sampling.sampling_params import (
@@ -655,6 +657,183 @@ class SkipSpecialTokensForwardingTestCase(CustomTestCase):
         # no such field), so leave it unset for --preferred-sampling-params.
         self.assertNotIn("skip_special_tokens", params)
 
+    def test_response_template_parser_keeps_special_tokens_unspaced(self):
+        serving = make_serving()
+        serving.reasoning_parser = "response_template"
+        serving._reasoning_detector = ResponseTemplateReasoningDetector(
+            response_template={
+                "start_anchor": "<assistant>",
+                "fields": {"content": {"content": "text"}},
+            },
+        )
+        params = self._create_responses_sampling_params(serving)
+        self.assertFalse(params["skip_special_tokens"])
+        self.assertFalse(params["spaces_between_special_tokens"])
+
+
+class ResponseTemplateRequiredToolTestCase(CustomTestCase):
+    # Every field is delimited, so the template gives no field to the JSON.
+    TEMPLATE = {
+        "start_anchor": "<assistant>",
+        "fields": {
+            "thinking": {"open": "<think>", "close": "</think>"},
+            "content": {"open": "<answer>", "close": "</answer>"},
+            "tool_calls": {
+                "open_pattern": r"<call:(?P<name>\w+)>",
+                "close": "</call>",
+                "content": "json",
+                "repeats": True,
+                "transform": {
+                    "type": "function",
+                    "function": {"name": "{name}", "arguments": "{content}"},
+                },
+            },
+        },
+    }
+
+    @staticmethod
+    def _output(text, matched):
+        return {
+            "text": text,
+            "meta_info": {
+                "prompt_tokens": 3,
+                "completion_tokens": 9,
+                "cached_tokens": 0,
+                "finish_reason": {"type": "stop", "matched": matched},
+            },
+        }
+
+    def _respond(
+        self, stream, *, output, tool_call_parser="response_template", **request_fields
+    ):
+        serving = make_serving()
+        serving.default_chat_template_kwargs = None
+        serving.reasoning_parser = "response_template"
+        serving.tool_call_parser = tool_call_parser
+        serving._reasoning_detector = ResponseTemplateReasoningDetector(
+            response_template=self.TEMPLATE
+        )
+        # Always-on reasoning: the output grammar starts after the reasoning.
+        serving.template_manager.reasoning_config = ReasoningToggleConfig(
+            special_case="always"
+        )
+        tokenizer = serving.tokenizer_manager.tokenizer
+        tokenizer.response_template = self.TEMPLATE
+        tokenizer.encode.side_effect = lambda literal, **_: (
+            [7] if literal == "</call>" else [1, 2, 3]
+        )
+        tokenizer.decode.return_value = "<assistant>"
+
+        async def fake_generate(
+            request_id, request_prompt, adapted_request, sampling_params, context, **_
+        ):
+            context.append_output(output)
+            yield context
+
+        serving._generate_with_builtin_tools = fake_generate
+        request = ResponsesRequest(
+            model="x",
+            input="Weather?",
+            tools=[
+                {
+                    "type": "function",
+                    "name": "get_weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                    },
+                }
+            ],
+            stream=stream,
+            store=False,
+            **request_fields,
+        )
+        rendered = MessageProcessingResult(
+            prompt="<assistant>",
+            prompt_ids=[1, 2, 3],
+            image_data=None,
+            audio_data=None,
+            video_data=None,
+            modalities=[],
+            stop=[],
+        )
+
+        async def respond():
+            response = await serving.create_responses(request)
+            if stream:
+                events = [event async for event in response]
+                return event_payloads(events)[-1]["response"]
+            return response.model_dump()
+
+        with patch.object(
+            serving, "_apply_conversation_template", return_value=rendered
+        ):
+            return asyncio.run(respond())
+
+    def test_required_tool_json_is_parsed_under_delimited_template(self):
+        """Required-tool JSON after the reasoning becomes a completed function
+        call, also when it ends on the tool closer that detokenization keeps."""
+        output = self._output(
+            "<think>Check the forecast.</think>"
+            '[{"name": "get_weather", "parameters": {"city": "Paris"}}]</call>',
+            matched=7,
+        )
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                response = self._respond(stream, output=output, tool_choice="required")
+
+                self.assertEqual(response["status"], "completed")
+                self.assertEqual(
+                    [item["type"] for item in response["output"]],
+                    ["reasoning", "function_call"],
+                )
+                call = response["output"][1]
+                self.assertEqual(call["name"], "get_weather")
+                self.assertEqual(orjson.loads(call["arguments"]), {"city": "Paris"})
+
+    def test_json_text_format_with_auto_tools_stays_message(self):
+        """A JSON text format with automatic tools must return the JSON intact;
+        template tool syntax inside its strings is never a function call."""
+        payload = '{"example": "<call:get_weather>{}</call>"}'
+        output = self._output(f"<think>Plan</think>{payload}", matched=2)
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                response = self._respond(
+                    stream,
+                    output=output,
+                    tool_choice="auto",
+                    text={"format": {"type": "json_object"}},
+                )
+
+                self.assertEqual(response["status"], "completed")
+                self.assertEqual(
+                    [item["type"] for item in response["output"]],
+                    ["reasoning", "message"],
+                )
+                self.assertEqual(response["output"][1]["content"][0]["text"], payload)
+
+    def test_json_text_format_with_natively_required_tools_stays_message(self):
+        """A required or named choice that a tool parser owns natively accepts a
+        JSON text format; the JSON answer stays a message, never a tool call."""
+        payload = '{"name": "get_weather", "parameters": {"city": "Paris"}}'
+        output = self._output(f"<think>Plan</think>{payload}", matched=2)
+        for tool_choice in ("required", {"type": "function", "name": "get_weather"}):
+            with self.subTest(tool_choice=tool_choice):
+                response = self._respond(
+                    False,
+                    output=output,
+                    tool_call_parser="glm47",
+                    tool_choice=tool_choice,
+                    text={"format": {"type": "json_object"}},
+                )
+
+                self.assertEqual(response["status"], "completed")
+                self.assertEqual(
+                    [item["type"] for item in response["output"]],
+                    ["reasoning", "message"],
+                )
+                self.assertEqual(response["output"][1]["content"][0]["text"], payload)
+
 
 class InputItemNormalizationTestCase(CustomTestCase):
     def test_function_call_becomes_assistant_tool_call(self):
@@ -1068,6 +1247,302 @@ class OutputItemsTestCase(CustomTestCase):
         self.assertIsInstance(output_items[0], ResponseOutputMessage)
 
 
+class InklingOutputItemsTestCase(CustomTestCase):
+    """Inkling output items come from sampled token IDs in both response modes."""
+
+    def setUp(self):
+        self.serving = make_serving()
+        self.serving.tokenizer_manager.tokenizer = None
+        self.serving.chat_encoding_spec = "inkling"
+        self.serving.reasoning_parser = self.serving.tool_call_parser = "inkling"
+        self.serving._encoding_adapter = self.serving._build_chat_encoding_adapter()
+        self.request = ResponsesRequest(
+            model="x",
+            input="weather?",
+            stream=True,
+            store=False,
+            tools=[
+                {
+                    "type": "function",
+                    "name": "weather",
+                    "parameters": {"type": "object"},
+                }
+            ],
+        )
+
+    @staticmethod
+    def _output_ids() -> list[int]:
+        from sglang.srt.parser.inkling_renderer import load_tml_renderers
+
+        tokenizer = load_tml_renderers().tokenizer
+        special, text = tokenizer.encode_special, tokenizer.encode_ordinary
+        return [
+            special("message_model"),
+            special("content_thinking"),
+            *text("plan"),
+            special("end_message"),
+            special("message_model"),
+            special("content_text"),
+            *text("see <|end_message|> here"),
+            special("end_message"),
+            special("message_model"),
+            *text("weather"),
+            special("content_invoke_tool_json"),
+            *text('{"name":"weather","args":{"city":"SF"}}'),
+            special("end_message"),
+            special("content_model_end_sampling"),
+        ]
+
+    @staticmethod
+    def _summary(items: list[dict]) -> list[tuple]:
+        summary = []
+        for item in items:
+            if item["type"] == "function_call":
+                summary.append((item["name"], orjson.loads(item["arguments"])))
+            else:
+                summary.append((item["type"], item["content"][0]["text"]))
+        return summary
+
+    def test_stream_and_non_stream_items_match(self):
+        output_ids = self._output_ids()
+        finish = {"type": "stop", "matched": output_ids[-1]}
+        expected = [
+            ("reasoning", "plan"),
+            ("message", "see <|end_message|> here"),
+            ("weather", {"city": "SF"}),
+        ]
+        items = self.serving._make_response_output_items(
+            self.request,
+            "",
+            Mock(),
+            require_reasoning=False,
+            output_ids=output_ids,
+            finish_reason=finish,
+        )
+        self.assertEqual(self._summary([i.model_dump() for i in items]), expected)
+
+        for split in (3, len(output_ids) // 2, len(output_ids) - 2):
+            with self.subTest(split=split):
+                chunks = []
+                for ids, finish_reason in (
+                    (output_ids[:split], None),
+                    (output_ids, finish),
+                ):
+                    chunk = engine_chunk("", len(ids))
+                    chunk["output_ids"] = ids
+                    chunk["meta_info"]["finish_reason"] = finish_reason
+                    chunks.append(chunk)
+                events = StreamFixture(self.serving, self.request).run(chunks)
+                output = event_payloads(events)[-1]["response"]["output"]
+                self.assertEqual(self._summary(output), expected)
+
+    def test_required_tool_choice_parses_json_array_without_native_parser(self):
+        """With only the Inkling reasoning parser, required/named tool output is
+        the generic JSON array and must still become function_call items."""
+        from sglang.srt.parser.inkling_renderer import load_tml_renderers
+
+        self.serving.tool_call_parser = None
+        self.serving._encoding_adapter = self.serving._build_chat_encoding_adapter()
+        tokenizer = load_tml_renderers().tokenizer
+        special, text = tokenizer.encode_special, tokenizer.encode_ordinary
+        thinking = [
+            special("message_model"),
+            special("content_thinking"),
+            *text("plan"),
+            special("end_message"),
+        ]
+        calls = text(
+            '[{"name": "weather", "parameters": {"city": "SF"}}, '
+            '{"name": "weather", "parameters": {"city": "NYC"}}]'
+        )
+        eos = special("content_model_end_sampling")
+        # Headerless after thinking, or framed as a text message as the Inkling
+        # constraint frame samples it.
+        shapes = {
+            "headerless": [*thinking, *calls, eos],
+            "framed": [
+                *thinking,
+                special("message_model"),
+                special("content_text"),
+                *calls,
+                special("end_message"),
+                eos,
+            ],
+        }
+        expected = [
+            ("reasoning", "plan"),
+            ("weather", {"city": "SF"}),
+            ("weather", {"city": "NYC"}),
+        ]
+
+        for shape, output_ids in shapes.items():
+            finish = {"type": "stop", "matched": eos}
+            # Engine chunks may batch tokens; arguments must not depend on where
+            # the JSON payload is split, including a final stop-only chunk.
+            chunkings = {
+                "per_token": list(range(1, len(output_ids) + 1)),
+                "stop_only_last_chunk": [len(output_ids) - 1, len(output_ids)],
+                "single_terminal_chunk": [len(output_ids)],
+            }
+            for tool_choice in ("required", {"type": "function", "name": "weather"}):
+                request = self.request.model_copy(update={"tool_choice": tool_choice})
+                with self.subTest(shape=shape, tool_choice=tool_choice, stream=False):
+                    items = self.serving._make_response_output_items(
+                        request,
+                        "",
+                        Mock(),
+                        require_reasoning=False,
+                        output_ids=output_ids,
+                        finish_reason=finish,
+                    )
+                    self.assertEqual(
+                        self._summary([i.model_dump() for i in items]), expected
+                    )
+                for chunking, ends in chunkings.items():
+                    with self.subTest(
+                        shape=shape, tool_choice=tool_choice, stream=chunking
+                    ):
+                        chunks = []
+                        for end in ends:
+                            chunk = engine_chunk("", end)
+                            chunk["output_ids"] = output_ids[:end]
+                            chunk["meta_info"]["finish_reason"] = (
+                                finish if end == len(output_ids) else None
+                            )
+                            chunks.append(chunk)
+                        events = StreamFixture(self.serving, request).run(chunks)
+                        output = event_payloads(events)[-1]["response"]["output"]
+                        self.assertEqual(self._summary(output), expected)
+
+
+class ChatEncodingAdapterDispatchTestCase(CustomTestCase):
+    @staticmethod
+    def _hooks():
+        from sglang.srt.entrypoints.openai import chat_encoding_adapters
+
+        return chat_encoding_adapters.ChatOutputHooks(
+            thinking_requested=Mock(),
+            tool_call_parsing_active=Mock(),
+            history_tool_calls_count=Mock(),
+            tool_call_id=Mock(),
+        )
+
+    def test_only_a_selected_inkling_encoding_requires_tml_renderers(self):
+        """Serving another model must not need tml-renderers, while selecting
+        Inkling must still fail at construction when it is missing."""
+        from sglang.srt.entrypoints.openai import chat_encoding_adapters
+        from sglang.srt.parser.inkling_renderer import load_tml_renderers
+
+        load_tml_renderers.cache_clear()
+        self.addCleanup(load_tml_renderers.cache_clear)
+
+        def ctx(encoding):
+            return chat_encoding_adapters.ChatEncodingAdapterContext(
+                chat_encoding_spec=encoding,
+                tokenizer=None,
+                reasoning_parser="inkling",
+                tool_call_parser="inkling",
+                chat_hooks=self._hooks(),
+                hf_config=None,
+                model_path="model",
+                revision=None,
+            )
+
+        with patch.dict(sys.modules, {"tml_renderers": None}):
+            for encoding in ("kimi_k3", "dsv32"):
+                with self.subTest(encoding=encoding):
+                    self.assertIsNone(
+                        chat_encoding_adapters.build_chat_encoding_adapter(
+                            ctx(encoding)
+                        )
+                    )
+            with self.assertRaises(ImportError):
+                chat_encoding_adapters.build_chat_encoding_adapter(ctx("inkling"))
+
+    def test_inkling_parser_cannot_be_mixed_with_another_parser(self):
+        from sglang.srt.entrypoints.openai.serving_inkling import (
+            InklingChatEncodingAdapter,
+        )
+
+        for reasoning_parser, tool_call_parser in (
+            ("inkling", "qwen25"),
+            ("qwen3", "inkling"),
+        ):
+            with self.subTest(reasoning=reasoning_parser, tool=tool_call_parser):
+                with self.assertRaises(ValueError):
+                    InklingChatEncodingAdapter(
+                        tokenizer=None,
+                        reasoning_parser=reasoning_parser,
+                        tool_call_parser=tool_call_parser,
+                        chat_hooks=self._hooks(),
+                    )
+        for reasoning_parser, tool_call_parser in (("inkling", None), (None, None)):
+            with self.subTest(reasoning=reasoning_parser, tool=tool_call_parser):
+                InklingChatEncodingAdapter(
+                    tokenizer=None,
+                    reasoning_parser=reasoning_parser,
+                    tool_call_parser=tool_call_parser,
+                    chat_hooks=self._hooks(),
+                )
+
+    def test_inkling_adapter_rejects_a_served_tokenizer_with_other_ids(self):
+        """The served tokenizer detokenizes and matches stops, while prompts and
+        outputs go through tml-renderers; a vocabulary that differs must fail boot."""
+        from sglang.srt.entrypoints.openai.serving_inkling import (
+            InklingChatEncodingAdapter,
+        )
+        from sglang.srt.parser.inkling_renderer import load_tml_renderers
+
+        tml = load_tml_renderers().tokenizer
+
+        def served(shift_token=None, ordinary=tml.encode_ordinary):
+            # Only encode(), as on the tiktoken tokenizer wrapper.
+            def encode(text, add_special_tokens):
+                if text.startswith("<|") and text.endswith("|>"):
+                    return [tml.encode_special(text[2:-2]) + (text == shift_token)]
+                return list(ordinary(text))
+
+            return SimpleNamespace(encode=encode)
+
+        build = functools.partial(
+            InklingChatEncodingAdapter,
+            reasoning_parser="inkling",
+            tool_call_parser="inkling",
+            chat_hooks=self._hooks(),
+        )
+        build(tokenizer=served())
+        with self.assertRaisesRegex(ValueError, "<\\|end_message\\|>"):
+            build(tokenizer=served(shift_token="<|end_message|>"))
+        with self.assertRaisesRegex(ValueError, "ordinary text"):
+            build(tokenizer=served(ordinary=lambda text: tml.encode_ordinary(text)[1:]))
+
+    def test_responses_adapter_hooks_belong_to_the_handler(self):
+        """The Responses handler reuses the adapter from its base init; its
+        chat hooks must belong to that handler, not to another instance."""
+        from sglang.srt.entrypoints.openai import (
+            chat_encoding_adapters,
+            serving_inkling,
+        )
+        from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
+
+        with (
+            patch.object(
+                OpenAIServingChat, "_resolve_chat_encoding_spec", return_value="inkling"
+            ),
+            patch.object(serving_inkling, "_check_served_tokenizer"),
+            patch.object(
+                chat_encoding_adapters,
+                "build_chat_encoding_adapter",
+                wraps=chat_encoding_adapters.build_chat_encoding_adapter,
+            ) as build,
+        ):
+            serving = make_serving()
+
+        hooks = build.call_args.args[0].chat_hooks
+        self.assertIs(hooks.tool_call_id.__self__, serving)
+        self.assertIsNotNone(serving._encoding_adapter)
+
+
 class HarmonyResponsesTestCase(CustomTestCase):
     def test_developer_message_skips_unsupported_tool_types(self):
         from sglang.srt.entrypoints.harmony_utils import get_developer_message
@@ -1137,16 +1612,6 @@ class ChatToolChoiceConversionTestCase(CustomTestCase):
             fn({"type": "function", "name": "get_weather"}),
             {"type": "function", "function": {"name": "get_weather"}},
         )
-
-
-class ShouldEmitNormalTextTestCase(CustomTestCase):
-    def test_whitespace_suppressed_only_while_a_tool_is_open(self):
-        emit = _should_emit_normal_text_as_message
-        self.assertFalse(emit("", any_tool_call_in_progress=False))
-        # whitespace between tool blocks is an inter-call separator, not content
-        self.assertFalse(emit("\n", any_tool_call_in_progress=True))
-        self.assertTrue(emit("\n", any_tool_call_in_progress=False))
-        self.assertTrue(emit("hello", any_tool_call_in_progress=True))
 
 
 class EnginePassthroughTestCase(CustomTestCase):

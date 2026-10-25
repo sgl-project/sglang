@@ -18,7 +18,7 @@ ARG PIP_DEFAULT_INDEX
 ARG UBUNTU_MIRROR
 ARG GITHUB_ARTIFACTORY=github.com
 ARG INSTALL_FLASHINFER_JIT_CACHE=0
-ARG FLASHINFER_VERSION=0.7.0.post1
+ARG FLASHINFER_VERSION=0.7.2
 ARG MOONCAKE_VERSION=0.3.13.post1
 ARG MSCCLPP_VERSION=sglang-v0.10.1
 
@@ -202,13 +202,13 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     # --no-deps prevents uv from pulling torch from default PyPI
     && uv pip install sglang-kernel==${SGL_KERNEL_VERSION} --reinstall --no-deps
 
-# Copy the dependency spec, Rust extension sources, and shared protocol crate.
-# Split from the dependency install so changes to these build inputs invalidate the
+# Copy the dependency spec, Rust extension sources, and shared API types.
+# Split from the pip install so changes to these build inputs invalidate the
 # dependency layer, while unrelated Python source changes do not.
 COPY python/pyproject.toml /tmp/sglang_deps/python/pyproject.toml
 COPY rust/sglang-grpc      /tmp/sglang_deps/rust/sglang-grpc
 COPY rust/sglang-mm        /tmp/sglang_deps/rust/sglang-mm
-COPY proto                 /tmp/sglang_deps/proto
+COPY rust/sglang-api-types /tmp/sglang_deps/rust/sglang-api-types
 
 # Install sglang dependencies (torch, transformers, etc.).
 # Generate constraints.txt to prevent reinstalling these deps in later stages.
@@ -626,6 +626,26 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --reinstall /tmp/gateway_wheels/*.whl \
     && rm -rf /tmp/gateway_wheels
 
+# sgl-nvidia-mega: the NVIDIA megakernel plugin, inert unless a server passes
+# --enable-nvidia-megakernel. Installed with CUDA >= 12.9 only (its kernels are
+# SM103, compiled at runtime); disable with --build-arg ENABLE_SGL_NVIDIA_MEGA=0.
+ARG ENABLE_SGL_NVIDIA_MEGA=1
+ARG SGL_NVIDIA_MEGA_REPO="https://github.com/sgl-project/sgl-nvidia-mega.git"
+ARG SGL_NVIDIA_MEGA_COMMIT="6fd7ac30371a45ef246bb9db2e3559c398156feb"
+RUN --mount=type=cache,target=/root/.cache/uv \
+    if [ "${ENABLE_SGL_NVIDIA_MEGA}" != "1" ]; then \
+        echo "[sgl-nvidia-mega] skip (ENABLE_SGL_NVIDIA_MEGA=${ENABLE_SGL_NVIDIA_MEGA})"; \
+    elif ! printf '%s\n' 12.9 "${CUDA_VERSION}" | sort -V -C; then \
+        echo "[sgl-nvidia-mega] skip (CUDA_VERSION=${CUDA_VERSION} < 12.9)"; \
+    else \
+        git clone "${SGL_NVIDIA_MEGA_REPO}" /sgl-workspace/sgl-nvidia-mega \
+        && cd /sgl-workspace/sgl-nvidia-mega \
+        && git checkout -f "${SGL_NVIDIA_MEGA_COMMIT}" \
+        && uv pip install --no-deps -e . \
+        && cd / \
+        && python3 -c "from importlib.metadata import entry_points; assert any(e.name == 'nvidia_megakernel' for e in entry_points(group='sglang.srt.plugins')), 'sgl-nvidia-mega plugin not registered'"; \
+    fi
+
 # Set workspace directory
 WORKDIR /sgl-workspace/sglang
 
@@ -691,6 +711,7 @@ RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
     # Runtime libraries
     libopenmpi3 \
     libnuma1 \
+    numactl \
     libibverbs1 \
     libibumad3 \
     librdmacm1 \

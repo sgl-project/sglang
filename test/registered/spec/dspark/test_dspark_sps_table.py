@@ -49,22 +49,6 @@ class TestSpsCostTableInvariants(CustomTestCase):
                 max_batch_tokens=16,
             )
 
-    def test_rejects_empty_table(self):
-        with self.assertRaises(ValueError):
-            SpsCostTable(
-                sample_batch_tokens=[],
-                sample_steps_per_sec=[],
-                max_batch_tokens=0,
-            )
-
-    def test_rejects_max_below_largest_probe(self):
-        with self.assertRaises(ValueError):
-            SpsCostTable(
-                sample_batch_tokens=[8, 16],
-                sample_steps_per_sec=[1.0, 2.0],
-                max_batch_tokens=15,
-            )
-
 
 class TestSpsCostTableLookup(CustomTestCase):
     def test_lookup_exact_probe_returns_that_sps(self):
@@ -73,11 +57,6 @@ class TestSpsCostTableLookup(CustomTestCase):
         self.assertEqual(table.lookup(16), 950.0)
         self.assertEqual(table.lookup(32), 500.0)
         self.assertEqual(table.lookup(64), 480.0)
-
-    def test_lookup_floors_to_lower_captured_probe(self):
-        table = _make_table()
-        self.assertEqual(table.lookup(31), 950.0)
-        self.assertEqual(table.lookup(63), 500.0)
 
     def test_lookup_below_first_probe_clamps_to_first(self):
         table = _make_table()

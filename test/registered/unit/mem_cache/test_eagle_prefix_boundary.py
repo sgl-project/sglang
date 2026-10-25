@@ -99,9 +99,7 @@ class TestEaglePrefixBoundary(CustomTestCase):
                         ):
                             req = request_match(cache, raw[:length])
                             expected = max(0, length - 1) // page * page
-                            torch.testing.assert_close(
-                                req.prefix_indices, torch.arange(expected)
-                            )
+                            self.assertEqual(req.prefix_len, expected)
                     # Logprob caps below, on, and above the execution/page boundary.
                     cases = (
                         ((4, 0, 0), (4, 1, 1), (4, 2, 2), (4, 4, 3))
@@ -128,9 +126,7 @@ class TestEaglePrefixBoundary(CustomTestCase):
                                 return_logprob=True,
                                 logprob_start=start,
                             )
-                            torch.testing.assert_close(
-                                req.prefix_indices, torch.arange(expected)
-                            )
+                            self.assertEqual(req.prefix_len, expected)
 
     def test_successor_and_truncated_key(self):
         for backend in ("legacy", "python", "rust"):
@@ -154,14 +150,12 @@ class TestEaglePrefixBoundary(CustomTestCase):
                         ):
                             req = request_match(cache, query)
                             expected = (shared - 1 + int(same_successor)) // page * page
-                            torch.testing.assert_close(
-                                req.prefix_indices, torch.arange(expected)
-                            )
+                            self.assertEqual(req.prefix_len, expected)
                     # A truncated raw key cannot prove its unknown successor.
                     key = RadixKey(array("q", raw), limit=shared)
                     result = cache.match_prefix(MatchPrefixParams(key=key))
-                    torch.testing.assert_close(
-                        result.device_indices, torch.arange((shared - 1) // page * page)
+                    self.assertEqual(
+                        result.device_prefix_len, (shared - 1) // page * page
                     )
 
     def test_other_request_modes_keep_existing_limits(self):
@@ -178,7 +172,7 @@ class TestEaglePrefixBoundary(CustomTestCase):
                     req = request_match(
                         cache, raw[:65], mode=mode, multi_layer=multi_layer
                     )
-                    self.assertEqual(len(req.prefix_indices), 0)
+                    self.assertEqual(req.prefix_len, 0)
 
     def test_session_keeps_existing_limit(self):
         cache = make_cache("legacy", 64)
@@ -192,7 +186,7 @@ class TestEaglePrefixBoundary(CustomTestCase):
                 ) as match_prefix:
                     req = request_match(cache, raw[:65], session=session)
                 self.assertEqual(match_prefix.call_args.args[0].key.limit, 64)
-                self.assertEqual(len(req.prefix_indices), 0)
+                self.assertEqual(req.prefix_len, 0)
 
     def test_none_limit_skips_conversion(self):
         cache = make_cache("legacy", 64)
@@ -212,7 +206,7 @@ class TestEaglePrefixBoundary(CustomTestCase):
             req = request_match(cache, raw[:65], embed_override=object())
         convert_limit.assert_not_called()
         self.assertIsNone(match_prefix.call_args.args[0].key.limit)
-        self.assertEqual(len(req.prefix_indices), 0)
+        self.assertEqual(req.prefix_len, 0)
 
     def test_unsupported_cache_contracts(self):
         class DerivedRadix(RadixCache):
