@@ -86,8 +86,8 @@ if USE_AITER_GFX1250:
         return out.view(*x.shape[:-1], n)
 
 
-# Below this M the GEMM is weight-bandwidth bound and hipBLASLt is faster; K must
-# cover the 4-stage pipeline (num_k_tiles >= 3 at tile_k=64).
+# Only M >= 256 was measured; below it torch.compile fuses the small GEMMs into
+# neighbours (modulation mm + SiLU). K must give the 4-stage pipeline 3+ tiles.
 _FLYDSL_MIN_M = 256
 _FLYDSL_MIN_K = 256
 
