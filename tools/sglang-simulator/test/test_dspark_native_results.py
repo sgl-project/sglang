@@ -72,6 +72,63 @@ assert req.decode_batch_idx == 1
     )
 
 
+def test_idle_local_result_matches_native_helper_in_both_joint_phases():
+    run_python(
+        """
+from dataclasses import replace
+from types import SimpleNamespace as NS
+import torch
+from sglang_simulator.simulation.sglang.hook_bootstrap import install_simulator_hooks
+install_simulator_hooks()
+from sglang.srt.speculative.dspark_components.dspark_worker_v2 import DSparkWorkerV2
+from sglang_simulator.simulation.sglang.dspark import (
+    DSparkGroup, DSparkPhaseCost, DSparkProgress, DSparkRequest,
+    DSparkStep, DSparkStepResult, DSparkStepTiming, DSparkTopology,
+)
+from sglang_simulator.simulation.sglang.dspark_runtime import NativeDSparkResults
+
+# Execute the installed native helper without a model/worker constructor.
+# Compare its actual CPU tensor/default contract, not a copied expected result.
+native = DSparkWorkerV2._decode_idle_result(
+    NS(device='cpu', verify_num_draft_tokens=6), on_publish=None)
+for active_mode in ('EXTEND', 'TARGET_VERIFY'):
+    for idle_rank in (0, 1):
+        req = DSparkRequest('a', 512, 6, 384, 512, 1, 20, '{"max_new_tokens":20}')
+        if active_mode == 'EXTEND':
+            req = replace(req, target_prefix_len=0, extend_len=17,
+                          draft_valid_from=0, draft_valid_to=0, output_tokens_before=0)
+        groups = tuple(
+            DSparkGroup(rank, 'IDLE', (), '{"source":"CPU fixture"}')
+            if rank == idle_rank else
+            DSparkGroup(rank, active_mode, (req,), '{"source":"CPU fixture"}')
+            for rank in (0, 1))
+        step = DSparkStep(0, DSparkTopology(2, 2), groups, '{"source":"CPU fixture"}')
+        timing = DSparkStepTiming(0, (DSparkPhaseCost('whole_worker', .01, 'CPU fixture'),))
+        progress = DSparkProgress(0, (('a', 1 if active_mode == 'EXTEND' else 2),), 'CPU fixture')
+        prediction = DSparkStepResult(step, timing, progress, idle_rank)
+        result = NativeDSparkResults(1).build(
+            batch=NS(seq_lens=torch.empty((0,), dtype=torch.int64)), prediction=prediction)
+        assert type(result) is type(native)
+        assert result.logits_output is native.logits_output is None
+        for field in ('next_token_ids', 'accept_lens', 'block_accept_lens', 'new_seq_lens'):
+            actual, expected = getattr(result, field), getattr(native, field)
+            assert actual.dtype == expected.dtype and actual.shape == expected.shape == (0,)
+            assert torch.equal(actual, expected)
+        assert type(result.next_draft_input) is type(native.next_draft_input)
+        for field in ('bonus_tokens', 'new_seq_lens'):
+            assert torch.equal(getattr(result.next_draft_input, field),
+                               getattr(native.next_draft_input, field))
+        for field in ('speculative_output_stride', 'cap_lens',
+                      'can_run_cuda_graph', 'speculative_num_draft_tokens'):
+            assert getattr(result, field) == getattr(native, field)
+        assert prediction.local_group.forward_mode == 'IDLE'
+        assert prediction.timing is timing and prediction.progress is progress
+""",
+        bootstrap=True,
+        cpu=True,
+    )
+
+
 def test_native_overlap_scheduler_future_map_and_reference_driver_drain_together():
     pytest.importorskip("infercast.sdk.native_sampling")
     # One native request, including a launched successor whose predecessor

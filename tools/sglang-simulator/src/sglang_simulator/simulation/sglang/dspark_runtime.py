@@ -290,6 +290,7 @@ class NativeDSparkResults:
 
         requests = prediction.local_group.requests
         prefill = prediction.local_group.forward_mode == "EXTEND"
+        idle = prediction.local_group.forward_mode == "IDLE"
         counts = dict(prediction.progress.committed_tokens)
         prefix = [request.target_prefix_len for request in requests]
         commits = [counts[request.rid] for request in requests]
@@ -310,7 +311,9 @@ class NativeDSparkResults:
         next_input = make_draft_input_v2(bonus_tokens=bonus, new_seq_lens=new_seq_lens)
         setattr(next_input, INPUT_ATTRIBUTE, width)
         result = GenerationBatchResult(
-            logits_output=LogitsProcessorOutput(next_token_logits=None),
+            logits_output=None
+            if idle
+            else LogitsProcessorOutput(next_token_logits=None),
             next_token_ids=tokens if prefill else tokens.reshape(-1),
             new_seq_lens=new_seq_lens,
             next_draft_input=next_input,
@@ -318,10 +321,10 @@ class NativeDSparkResults:
             # The progress artifact models committed counts. It does not
             # predict pre-trim block acceptance, and the current adapter has
             # no ragged layout. Preserve the native optional/unknown fields.
-            block_accept_lens=None,
+            block_accept_lens=torch.empty((0,), dtype=torch.int32) if idle else None,
             cap_lens=None,
             speculative_num_draft_tokens=width,
-            speculative_output_stride=None if prefill else width,
+            speculative_output_stride=None if prefill or idle else width,
             num_correct_drafts=0 if prefill else sum(commits) - len(commits),
             can_run_cuda_graph=False,
         )
