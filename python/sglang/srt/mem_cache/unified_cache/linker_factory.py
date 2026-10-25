@@ -5,7 +5,7 @@ from __future__ import annotations
 import importlib
 import inspect
 from copy import deepcopy
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from sglang.srt.mem_cache.unified_cache.linker_config import UnifiedCacheLinkerConfig
 from sglang.srt.runtime_context import get_memory
@@ -21,19 +21,39 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 
+def get_startup_linker_config() -> dict[str, Any] | None:
+    """Resolve legacy launch options once, outside the linker implementations."""
+    memory = get_memory()
+    config = memory.unified_cache_external_linker_config
+    if config is None and memory.unified_cache_external_linker_backend in (
+        "mooncake",
+        "mori",
+    ):
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+            HybridCacheController,
+        )
+
+        config, *_ = HybridCacheController.parse_storage_backend_extra_config(
+            memory.hicache_storage_backend_extra_config
+        )
+    return deepcopy(config)
+
+
 def create_unified_cache_linker(
     server_args: ServerArgs,
     params: CacheInitParams,
     *,
+    backend: str,
+    config: dict[str, Any] | None,
     components: set[ComponentType],
     forward_stream: torch.cuda.Stream | None = None,
 ) -> UnifiedCacheLinker:
-    memory = get_memory()
-    backend = memory.unified_cache_external_linker_backend
-    if backend == "dynamic":
-        config = UnifiedCacheLinkerConfig.from_dict(
-            memory.unified_cache_external_linker_config
+    if config is not None and not isinstance(config, dict):
+        raise ValueError(
+            "--unified-cache-external-linker-config must be a JSON object."
         )
+    if backend == "dynamic":
+        config = UnifiedCacheLinkerConfig.from_dict(config)
         # Do not mask ImportError from the plugin's own dependencies.
         module = importlib.import_module(config.linker_module_path)
         linker_cls = getattr(module, config.linker, None)
@@ -79,6 +99,6 @@ def create_unified_cache_linker(
         server_args,
         params,
         components=components,
-        extra_config=deepcopy(memory.unified_cache_external_linker_config),
+        extra_config=deepcopy(config or {}),
         forward_stream=forward_stream,
     )
