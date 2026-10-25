@@ -1254,6 +1254,37 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                             [("_mimo_v2_overrides", expected)],
                         )
 
+    def test_kimi_k3_flashinfer_mxfp4_rejects_situ_without_trtllm_gen(self):
+        """An explicit flashinfer_mxfp4 on SM90/SM120 ran K3's SiTU experts as SwiGLU."""
+        from sglang.srt.arg_groups.model_overrides.kimi_k3 import (
+            _kimi_k3_moe_runner_overrides,
+        )
+
+        def _k3_hf(hidden_act):
+            qc = {"config_groups": {"group_0": {"format": "mxfp4-pack-quantized"}}}
+            return SimpleNamespace(
+                text_config=SimpleNamespace(
+                    hidden_act=hidden_act, quantization_config=qc
+                )
+            )
+
+        def _run(runner, hf_config, **platform):
+            with override_platform(**platform):
+                return _kimi_k3_moe_runner_overrides(
+                    SimpleNamespace(moe_runner_backend=runner), hf_config
+                )
+
+        hopper = dict(is_sm90=True, is_sm100=False, is_sm120=False, device_sm=90)
+        sm120 = dict(is_sm90=False, is_sm100=False, is_sm120=True, device_sm=120)
+        b200 = dict(is_sm90=False, is_sm100=True, is_sm120=False, device_sm=100)
+        for platform in (hopper, sm120):
+            with self.subTest(**platform):
+                with self.assertRaisesRegex(RuntimeError, "marlin"):
+                    _run("flashinfer_mxfp4", _k3_hf("situ"), **platform)
+        self.assertEqual(_run("flashinfer_mxfp4", _k3_hf("situ"), **b200), {})
+        self.assertEqual(_run("marlin", _k3_hf("situ"), **hopper), {})
+        self.assertEqual(_run("flashinfer_mxfp4", _k3_hf("silu"), **hopper), {})
+
     def test_mimo_v2_family_is_registered(self):
         with override_platform(is_sm100=False):
             self.assertEqual(

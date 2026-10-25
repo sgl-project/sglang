@@ -1469,6 +1469,17 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             "cutlass_sm120",
             "trtllm_sm100",
         ):
+            if (
+                self._fi_kernel != "trtllm_sm100"
+                and moe_runner_config.activation == "situ"
+            ):
+                # The CUTLASS runners read gemm1_alpha/gemm1_clamp_limit as
+                # GPT-OSS SwiGLU scalars; SiTU needs flashinfer-ai/flashinfer#4209.
+                raise NotImplementedError(
+                    f"moe_runner_backend=flashinfer_mxfp4 ({self._fi_kernel}) does "
+                    "not implement the SiTU activation; use "
+                    "--moe-runner-backend marlin."
+                )
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
         else:
             raise NotImplementedError(

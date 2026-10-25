@@ -169,6 +169,22 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
     return overrides
 
 
+def _reject_flashinfer_mxfp4_cutlass_situ(hf_config: Any) -> None:
+    # The SM90 and SM120 FlashInfer MXFP4 runners are CUTLASS kernels that
+    # compute GPT-OSS SwiGLU; only the SM100-family trtllm-gen runner has SiTU.
+    if not (get_platform().is_sm90 or get_platform().is_sm120):
+        return
+    if not _is_mxfp4_pack_quantized(hf_config):
+        return
+    if hf_config.text_config.hidden_act != "situ":
+        return
+    raise RuntimeError(
+        "Kimi-K3 with moe_runner_backend='flashinfer_mxfp4' on SM90/SM120 would "
+        "run the routed experts with GPT-OSS SwiGLU instead of SiTU. Use "
+        "--moe-runner-backend marlin on this GPU."
+    )
+
+
 @_register_for("KimiK3ForConditionalGeneration")
 def _kimi_k3_moe_runner_overrides(server_args: Any, hf_config: Any) -> dict:
     # MoE runner default, independent of the attention-backend gate above.
@@ -177,6 +193,8 @@ def _kimi_k3_moe_runner_overrides(server_args: Any, hf_config: Any) -> dict:
     # SM107 uses the same packed-MXFP4 runner; leaving auto unresolved falls
     # back to BF16 weight materialization during model loading.
     cfg = resolving_view(server_args)
+    if cfg.moe_runner_backend == "flashinfer_mxfp4":
+        _reject_flashinfer_mxfp4_cutlass_situ(hf_config)
     if cfg.moe_runner_backend != "auto":
         return {}
     if not (get_platform().is_sm100 and get_platform().device_sm in (100, 103, 107)):
