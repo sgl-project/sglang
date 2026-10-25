@@ -19,6 +19,10 @@ from sglang.multimodal_gen.configs.models.dits.nomas import (
     NomasArchConfig,
     NomasConfig,
 )
+from sglang.multimodal_gen.runtime.layers.kvcache.nomas_segment_cache import (
+    NomasAttentionPlan,
+    NomasCache,
+)
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     RowParallelLinear,
@@ -29,10 +33,6 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     LayerwiseOffloadableModuleMixin,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
-from sglang.multimodal_gen.runtime.models.dits.nomas_kv_cache import (
-    NomasAttentionPlan,
-    NomasCache,
-)
 from sglang.multimodal_gen.runtime.models.dits.nomas_layers import (
     FinalLayerPerBlock,
     IndividualTokenRefiner,
