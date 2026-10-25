@@ -86,6 +86,7 @@ class MoeDeferredFinalize(DeferredFinalize, frozen=True):
     gated_shared_output: torch.Tensor | None
     m: int
     finish: Callable[[], torch.Tensor]
+    completion_group: Optional[SumGroup] = None
 
     def complete(self) -> torch.Tensor:
         return self.finish()
@@ -120,6 +121,7 @@ class MoeDeferredFinalize(DeferredFinalize, frozen=True):
                     deferred_output, gated_shared_output
                 )
             ),
+            completion_group=None,  # Explicitly set to None for compatibility
         )
 
 
