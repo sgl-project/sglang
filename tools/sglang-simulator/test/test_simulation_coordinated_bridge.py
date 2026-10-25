@@ -83,6 +83,29 @@ def test_coordinator_rejects_unsupported_configuration(
         validate_simulator_server_args(args)
 
 
+@pytest.mark.parametrize("profile", [False, True])
+@pytest.mark.parametrize("algorithm", ["DSPARK", "EAGLE"])
+def test_coordinator_speculation_requires_the_native_dspark_source_path(
+    monkeypatch, tmp_path, profile, algorithm
+):
+    config = tmp_path / "simulator.json"
+    predictor = {"name": "infercast_dspark"}
+    if profile:
+        predictor["native_segment_profile_id"] = "b" * 64
+    config.write_text(json.dumps({"predictor": predictor}), encoding="utf-8")
+    monkeypatch.setenv("SGLANG_SIMULATOR_CONFIG_PATH", str(config))
+    monkeypatch.setenv("SGLANG_SIMULATOR_COORDINATOR", "tcp://127.0.0.1:12345")
+    monkeypatch.setenv("SGLANG_SIMULATOR_OUTPUT_MODE", "OFFLINE")
+    args = SimpleNamespace(speculative_algorithm=algorithm)
+    apply_simulator_server_args(args)
+    if profile and algorithm == "DSPARK":
+        validate_simulator_server_args(args)
+        assert args.disable_overlap_schedule is False
+    else:
+        with pytest.raises(ValueError, match="source-bound native DSPark"):
+            validate_simulator_server_args(args)
+
+
 def rid(index):
     return f"{'0' * 32}:{index:016x}"
 

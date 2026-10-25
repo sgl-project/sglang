@@ -93,10 +93,12 @@ def _validate_coordinator_server_args(args, endpoint: str) -> None:
         "enable_hierarchical_cache",
         "enable_lora",
         "enable_dp_attention",
-        "speculative_algorithm",
     ):
         if getattr(args, name, None):
             raise ValueError(f"coordinator does not support {name}")
+    algorithm = getattr(args, "speculative_algorithm", None)
+    if algorithm and not (algorithm == "DSPARK" and native_reference_requested(args)):
+        raise ValueError("coordinator requires source-bound native DSPark speculation")
     interval = getattr(args, "prefill_decode_interval", None)
     if interval is not None and (type(interval) is not int or interval < 0):
         raise ValueError(

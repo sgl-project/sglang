@@ -67,6 +67,22 @@ class _DSparkResultAccounting:
     preprocess_duration: float
 
 
+def _has_pending_dspark_work(owner, predictor):
+    runtime = getattr(predictor, "dspark_runtime", None)
+    driver = getattr(runtime, "reference_driver", None)
+    if driver is not None:
+        driver.check()
+        ledger = driver.adapter.ledger
+        if (
+            driver.selection is not None
+            or driver.processing is not None
+            or ledger.prepared is not None
+            or ledger.pending
+        ):
+            return True
+    return bool(getattr(owner, _DSPARK_PENDING_RESULTS, 0))
+
+
 def _validate_dspark_batch(prediction, batch):
     group = prediction.local_group
     source_mode = getattr(batch.forward_mode, "name", None)
@@ -527,7 +543,11 @@ class C_SchedulerHook(BaseHook):
                     )
 
                     C_SchedulerHook.COORDINATOR = CoordinatedScheduler(
-                        scheduler=self, endpoint=Envs.coordinator_endpoint()
+                        scheduler=self,
+                        endpoint=Envs.coordinator_endpoint(),
+                        pending_work=lambda: _has_pending_dspark_work(
+                            self, C_SchedulerHook.INFERENCE_PREDICTOR
+                        ),
                     )
             except Exception as e:
                 logger.error(
@@ -716,12 +736,11 @@ class C_SchedulerHook(BaseHook):
                             ),
                         )
                         setattr(ret, _DSPARK_ACCOUNTED, False)
-                        if C_SchedulerHook.COORDINATOR is None:
-                            setattr(
-                                self,
-                                _DSPARK_PENDING_RESULTS,
-                                getattr(self, _DSPARK_PENDING_RESULTS, 0) + 1,
-                            )
+                        setattr(
+                            self,
+                            _DSPARK_PENDING_RESULTS,
+                            getattr(self, _DSPARK_PENDING_RESULTS, 0) + 1,
+                        )
                         if (
                             C_SchedulerHook.SIM_MODE == SimulationMode.OFFLINE
                             and C_SchedulerHook.COORDINATOR is None
@@ -742,14 +761,6 @@ class C_SchedulerHook(BaseHook):
             return ret
 
         def wrapped_process_batch_result(self, *args, **kwargs):
-            if C_SchedulerHook.COORDINATOR is not None:
-                return C_SchedulerHook.COORDINATOR.process_batch_result(
-                    args[0],
-                    args[1],
-                    process=lambda: original_process_batch_result(
-                        self, *args, **kwargs
-                    ),
-                )
             batch = get_obj_from_args(
                 "sglang.srt.managers.schedule_batch.ScheduleBatch", *args, **kwargs
             )
@@ -795,6 +806,62 @@ class C_SchedulerHook(BaseHook):
                 if accounting is not None
                 else C_SchedulerHook.GET_NEW_BATCH_PREFILL_TIME_COST
             )
+            driver = reference_driver()
+            native_output_before = None
+            reference_wall = 0.0
+
+            def process_native_result():
+                nonlocal native_output_before, reference_wall
+                if driver is not None:
+                    started = time.perf_counter()
+                    try:
+                        native_output_before = {
+                            id(req): (len(req.output_ids), req.finished())
+                            for req in batch.reqs
+                        }
+                        driver.before_result(batch, native_result)
+                    except Exception as error:
+                        driver.fail("native result preparation", error)
+                        raise
+                    reference_wall += time.perf_counter() - started
+                try:
+                    ret = original_process_batch_result(self, *args, **kwargs)
+                    if driver is not None:
+                        started = time.perf_counter()
+                        driver.after_result()
+                        reference_wall += time.perf_counter() - started
+                        reference_wall += driver.take_callback_wall_seconds()
+                    return ret
+                except BaseException as error:
+                    if driver is not None:
+                        driver.fail("native result processing", error)
+                    raise
+
+            def consume_accounting():
+                if accounting is not None:
+                    setattr(native_result, _DSPARK_ACCOUNTED, True)
+                    setattr(
+                        self,
+                        _DSPARK_PENDING_RESULTS,
+                        getattr(self, _DSPARK_PENDING_RESULTS) - 1,
+                    )
+
+            if C_SchedulerHook.COORDINATOR is not None:
+                try:
+                    ret = C_SchedulerHook.COORDINATOR.process_batch_result(
+                        batch,
+                        native_result,
+                        duration=current_inference_dur,
+                        process=process_native_result,
+                    )
+                except BaseException as error:
+                    if driver is not None:
+                        driver.fail("coordinated native result", error)
+                    raise
+                consume_accounting()
+                # OFFLINE coordination excludes replacement CPU work entirely.
+                setattr(self, _DSPARK_WALL_CREDIT, 0.0)
+                return ret
             blocked_l2_wall_dur = 0.0
             if (
                 C_SchedulerHook.SIM_MODE == SimulationMode.BLOCKING
@@ -812,32 +879,7 @@ class C_SchedulerHook(BaseHook):
                     ),
                 )
             process_batch_result_start = time.perf_counter()
-            driver = reference_driver()
-            native_output_before = None
-            reference_wall = 0.0
-            if driver is not None:
-                started = time.perf_counter()
-                try:
-                    native_output_before = {
-                        id(req): (len(req.output_ids), req.finished())
-                        for req in batch.reqs
-                    }
-                    driver.before_result(batch, native_result)
-                except Exception as error:
-                    driver.fail("native result preparation", error)
-                    raise
-                reference_wall += time.perf_counter() - started
-            try:
-                ret = original_process_batch_result(self, *args, **kwargs)
-                if driver is not None:
-                    started = time.perf_counter()
-                    driver.after_result()
-                    reference_wall += time.perf_counter() - started
-                    reference_wall += driver.take_callback_wall_seconds()
-            except BaseException as error:
-                if driver is not None:
-                    driver.fail("native result processing", error)
-                raise
+            ret = process_native_result()
             if driver is not None:
                 setattr(
                     self,
@@ -940,13 +982,7 @@ class C_SchedulerHook(BaseHook):
                 StateManager.set_last_real_time_ts(now)
                 setattr(self, _DSPARK_WALL_CREDIT, 0.0)
 
-            if accounting is not None:
-                setattr(native_result, _DSPARK_ACCOUNTED, True)
-                setattr(
-                    self,
-                    _DSPARK_PENDING_RESULTS,
-                    getattr(self, _DSPARK_PENDING_RESULTS) - 1,
-                )
+            consume_accounting()
 
             return ret
 

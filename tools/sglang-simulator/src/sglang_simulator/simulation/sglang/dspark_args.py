@@ -161,8 +161,8 @@ def _validate(native, server_args, cfg):
         "does not support native simulated acceptance",
     )
     _require(
-        not os.environ.get("SGLANG_SIMULATOR_COORDINATOR"),
-        "does not support the coordinator",
+        not os.environ.get("SGLANG_SIMULATOR_COORDINATOR") or native_reference,
+        "requires native reference regions for the coordinator",
     )
 
 

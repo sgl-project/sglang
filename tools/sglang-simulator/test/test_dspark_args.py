@@ -117,8 +117,9 @@ assert install_cpu_dspark_args() is False
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+@pytest.mark.parametrize("coordinated", [False, True])
 def test_native_region_config_activates_original_overlap_before_cpu_resolution(
-    native, monkeypatch, tmp_path
+    native, monkeypatch, tmp_path, coordinated
 ):
     from sglang_simulator.compat import apply_simulator_server_args
 
@@ -135,6 +136,9 @@ def test_native_region_config_activates_original_overlap_before_cpu_resolution(
         encoding="utf-8",
     )
     monkeypatch.setenv("SGLANG_SIMULATOR_CONFIG_PATH", "")
+    if coordinated:
+        monkeypatch.setenv("SGLANG_SIMULATOR_COORDINATOR", "tcp://127.0.0.1:9000")
+        monkeypatch.setenv("SGLANG_SIMULATOR_OUTPUT_MODE", "OFFLINE")
     args = arguments(sim_config_path=str(config))
     apply_simulator_server_args(args)
     assert args.disable_overlap_schedule is False

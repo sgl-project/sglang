@@ -321,9 +321,13 @@ scheduler/backend and platform normally. There is no JSON callback, latency
 override, fallback table or live acceptance option. Generic forward prediction
 is rejected: the scheduler consumes the result attached by the native DSPark
 worker. Use explicit `--skip-server-warmup`, no custom warmups, `/health` for
-readiness, and a bounded page-aligned native KV capacity for the initial run;
+readiness with `SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION=0`, and a bounded
+page-aligned native KV capacity for the initial run;
 default warmup and `/health_generate` submit separate unsupported recipes.
-The coordinator and optional InferCast `memory_budget` do not support this path.
+The optional InferCast `memory_budget` does not support this path. Coordinated
+`OFFLINE` execution requires the native reference profile and a driver implementing
+the existing Ready/Grant and timing-metadata protocol; an ordinary HTTP workload
+continues to require `BLOCKING`.
 Synthetic token content requires `ignore_eos=true` and no token, string or regex
 stop rules. Unsupported stop semantics fail before cost, progress or publication.
 
@@ -560,14 +564,18 @@ exchange must not be retried on the same run.
 
 The initial scope is one local driver and scheduler, text generation with
 ordinary radix cache, and completion-triggered workflows. HiCache, PD, explicit
-sessions, LoRA, speculative decoding, and asynchronous grammar are rejected.
+sessions, LoRA, and asynchronous grammar are rejected. Speculation is limited to
+the explicit source-bound native DSPark profile: its original overlap loop,
+FutureMap and reference ledger retain native event order. Every result advances
+virtual time by its own forward duration, and already launched native tails drain
+before FINISHED even after all requests become terminal. Discarded tails add no
+visible output-token event.
 Coordinated runs preserve native `--prefill-decode-interval` countdowns when the
 runtime exposes the validated cadence helper and schedule-pass surfaces. A
 cadence-only pass with pending native work consumes no modeled forward time:
 it neither advances the clock nor grants a future client timer. Unsupported
 native cadence surfaces fail before coordinator binding. Other compatibility
-guards, including speculative decoding, DP attention and overlapping execution,
-remain unchanged.
+guards, including other speculative algorithms and DP attention, remain unchanged.
 
 Phase deadlines are driver-owned virtual timers; native wall-time waiting/running
 timeouts must be disabled. HTTP/SSE transport and predictor execution time do not

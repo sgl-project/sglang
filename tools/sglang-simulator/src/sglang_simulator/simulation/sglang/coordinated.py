@@ -1,4 +1,4 @@
-"""A causal boundary around the existing, non-overlapping SGLang scheduler."""
+"""A causal boundary around native scheduler results and external driver events."""
 
 import inspect
 import math
@@ -113,11 +113,19 @@ class CoordinatedScheduler:
     run, including its warmup; restarting it gives the next run a clean cache.
     """
 
-    def __init__(self, *, scheduler, endpoint: str, timeout_s: float = 30.0):
+    def __init__(
+        self,
+        *,
+        scheduler,
+        endpoint: str,
+        timeout_s: float = 30.0,
+        pending_work: Callable[[], bool] | None = None,
+    ):
         endpoint = validate_coordinator_endpoint(endpoint)
         # Model defaults can resolve cadence absent from the raw launch arguments.
         _validate_prefill_cadence_runtime(scheduler)
         self.scheduler = scheduler
+        self._pending_work = pending_work
         self.clock = Coordinator()
         self.timeout_s = timeout_s
         self._closed = False
@@ -342,7 +350,9 @@ class CoordinatedScheduler:
     def _has_native_work(self) -> bool:
         # Cancellation is logically terminal before native decode/chunked cleanup.
         return bool(
-            self.scheduler.waiting_queue
+            (self._pending_work is not None and self._pending_work())
+            or getattr(self.scheduler, "result_queue", ())
+            or self.scheduler.waiting_queue
             or self.scheduler.chunked_req is not None
             or self.scheduler._pending_chunked_abort_req is not None
             or any(not req.finished() for req in self.scheduler.collect_inflight_reqs())
@@ -397,9 +407,12 @@ class CoordinatedScheduler:
         self._reply_pending = False
         self._finished = finished
 
-    def process_batch_result(self, batch, result, *, process: Callable):
+    def process_batch_result(
+        self, batch, result, *, process: Callable, duration: float | None = None
+    ):
         with self._guard():
-            duration = StateManager.get_current_inference_dur()
+            if duration is None:
+                duration = StateManager.get_current_inference_dur()
             if (
                 not math.isfinite(duration)
                 or duration <= 0
@@ -418,11 +431,19 @@ class CoordinatedScheduler:
             self._advance(finish_ns)
             self._cleanup_cancelled()
             attach_timing_output(result, self.clock, self._token_events)
+            before = {
+                id(req): (len(req.output_ids), req.finished()) for req in batch.reqs
+            }
             ret = process()
             self.scheduler.process_pending_chunked_abort()
             for req in batch.reqs:
                 stats = request_stats_manager.get_req_stats(req.rid)
-                if req.output_ids:
+                output_count, finished = before[id(req)]
+                if (
+                    not finished
+                    and not self.clock.is_cancelled(req.rid)
+                    and len(req.output_ids) > output_count
+                ):
                     stats.gen_token_latencies.append(
                         finish_ns / 1e9 - stats.last_event_time
                     )

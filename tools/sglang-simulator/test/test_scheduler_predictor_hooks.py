@@ -517,7 +517,8 @@ def test_dspark_coordinator_processing_keeps_existing_delegation(hooked_schedule
     batch, result = launch_dspark(test, prediction)
     observed = []
 
-    def process(actual_batch, actual_result, *, process):
+    def process(actual_batch, actual_result, *, process, duration):
+        assert duration == pytest.approx(0.05)
         observed.append((actual_batch, actual_result))
         process()
         return "coordinator result"
@@ -526,7 +527,8 @@ def test_dspark_coordinator_processing_keeps_existing_delegation(hooked_schedule
     assert test.target.process_batch_result(batch, result) == "coordinator result"
     assert observed == [(batch, result)]
     assert test.hook.ITERATION_STATS == []
-    assert getattr(result, scheduler._DSPARK_ACCOUNTED) is False
+    assert getattr(result, scheduler._DSPARK_ACCOUNTED) is True
+    assert getattr(test.target, scheduler._DSPARK_PENDING_RESULTS) == 0
     assert StateManager.get_global_clock() == 100
 
 
@@ -582,7 +584,7 @@ def test_dspark_profile_reset_requires_pending_results_to_drain(
     assert getattr(test.target, scheduler._DSPARK_WALL_CREDIT) == 0
 
 
-def test_coordinator_active_at_dspark_launch_does_not_register_local_accounting(
+def test_coordinator_active_at_dspark_launch_consumes_result_owned_accounting(
     hooked_scheduler, monkeypatch, tmp_path
 ):
     test = hooked_scheduler
@@ -592,8 +594,8 @@ def test_coordinator_active_at_dspark_launch_does_not_register_local_accounting(
     )
     observed = []
 
-    def process(batch, result, *, process):
-        observed.append((batch, result, StateManager.get_current_inference_dur()))
+    def process(batch, result, *, process, duration):
+        observed.append((batch, result, duration))
         value = process()
         for req in batch.reqs:
             scheduler.request_stats_manager.get_req_stats(
