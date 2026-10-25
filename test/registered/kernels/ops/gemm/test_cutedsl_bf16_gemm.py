@@ -90,9 +90,9 @@ def test_k3_front_fp32_router_sm107(m):
     assert use_cutedsl_bf16_gemm(m, n, k)
     torch.manual_seed(42028 + m)
     x = torch.randn(m, k, dtype=torch.bfloat16, device="cuda")
-    weight = (
-        torch.randn(n, k, dtype=torch.float32, device="cuda") / math.sqrt(k)
-    ).to(torch.bfloat16)
+    weight = (torch.randn(n, k, dtype=torch.float32, device="cuda") / math.sqrt(k)).to(
+        torch.bfloat16
+    )
     out = torch.empty(m, n, dtype=torch.float32, device="cuda")
     cutedsl_bf16_gemm_out(x, weight, out)
     ref = torch.mm(x, weight.T, out_dtype=torch.float32)

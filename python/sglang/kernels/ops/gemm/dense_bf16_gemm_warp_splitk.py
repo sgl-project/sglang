@@ -13,15 +13,14 @@ import math
 import cuda.bindings.driver as _cuda
 import cutlass
 import cutlass.cute as cute
-from cutlass.experimental import primitives as prims
 import torch as _torch
 from cutlass import const_expr
-from cutlass.cutlass_dsl import dsl_user_op
 from cutlass._mlir.dialects import llvm
 from cutlass.cute import experimental as cute_ext
 from cutlass.cute.nvgpu import warp
 from cutlass.cute.runtime import from_dlpack
-
+from cutlass.cutlass_dsl import dsl_user_op
+from cutlass.experimental import primitives as prims
 
 _MMA_SHAPE = (16, 8, 16)
 _COMPUTE_WARPS = 4

@@ -1384,9 +1384,14 @@ def use_cutedsl_bf16_gemm(m: int, n: int, k: int) -> bool:
     m_range = _MUSE_SPARK_TGV_M_RANGES.get((n, k))
     if m_range is not None:
         return m_range[0] <= m <= m_range[1]
-    if get_device_sm() == 107 and m in _K3_FRONT_WARP_SPLITK and (n, k) == (
-        6016,
-        7168,
+    if (
+        get_device_sm() == 107
+        and m in _K3_FRONT_WARP_SPLITK
+        and (n, k)
+        == (
+            6016,
+            7168,
+        )
     ):
         return True
     if m <= 8 and (n, k) in _K3_TGV_WIN_SHAPES:
