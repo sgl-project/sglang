@@ -14,6 +14,7 @@
 """The baseclass of a backend for reasoner grammar-guided constrained decoding."""
 
 import logging
+import time
 from collections import OrderedDict
 from concurrent.futures import Future
 from typing import List, Optional, Sequence, Tuple, Union
@@ -407,12 +408,16 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
     def _init_value_dispatch(
         self, key: Tuple[str, str], reasoning: bool
     ) -> Optional[BaseGrammarObject]:
+        start = time.perf_counter()
         key_type, _, variant = key[0].partition(":")
         key = (key_type, key[1])
         ret = self.grammar_backend._init_value_dispatch(key, reasoning)
         if ret is None or isinstance(ret, InvalidGrammarObject):
             return ret
         if key[0] == "full_assistant_ebnf":
+            ret = self.grammar_backend.wrap_full_assistant_grammar(ret, key[1])
+            if ret.grammar_stats is not None:
+                ret.grammar_stats.compilation_time = time.perf_counter() - start
             return ret
         if self._is_framed(key[0]):
             # The frame delimits thinking by message kind, so it owns the whole
