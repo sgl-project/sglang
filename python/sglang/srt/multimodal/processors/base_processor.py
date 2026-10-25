@@ -1339,17 +1339,7 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
 
     @staticmethod
     def _move_feature_to_cpu(value):
-        return BaseMultimodalProcessor.move_feature_to_cpu(value)
-
-    @staticmethod
-    def move_feature_to_cpu(value):
-        if isinstance(value, torch.Tensor):
-            return value.cpu()
-        if isinstance(value, list):
-            return [BaseMultimodalProcessor.move_feature_to_cpu(v) for v in value]
-        if isinstance(value, tuple):
-            return tuple(BaseMultimodalProcessor.move_feature_to_cpu(v) for v in value)
-        return value
+        return move_feature_to_cpu(value)
 
     def _precompute_hashes_before_cpu_transfer(
         self, mm_items: List[MultimodalDataItem]
@@ -1693,3 +1683,13 @@ def _create_cuda_ipc_pool(base_gpu_id: int) -> MmItemMemoryPool:
         get_mm_feature_consumer_count(),
     )
     return cudaipc_mmfeature_pool
+
+
+def move_feature_to_cpu(value):
+    if isinstance(value, torch.Tensor):
+        return value.cpu()
+    if isinstance(value, list):
+        return [move_feature_to_cpu(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(move_feature_to_cpu(v) for v in value)
+    return value
