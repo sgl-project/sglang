@@ -193,6 +193,7 @@ from sglang.srt.model_executor.runner import (
     EagerRunner,
     get_batch_sizes_to_capture,
 )
+from sglang.srt.model_executor.runner_utils.pool import set_global_graph_memory_pool
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     assert_published,
@@ -589,7 +590,7 @@ class ModelRunner:
             custom_weight_loaders=get_model().custom_weight_loader,
             get_model=lambda: self.model,
             update_model_fields=self.update_model_fields,
-            recapture_cuda_graph=self.recapture_decode_cuda_graph,
+            recapture_cuda_graph=self.recapture_cuda_graph,
             get_model_runner=lambda: self,
         )
 
@@ -1631,6 +1632,20 @@ class ModelRunner:
         self.decode_cuda_graph_capture_bs = list(
             getattr(self.decode_cuda_graph_runner, "capture_bs", []) or []
         )
+
+    def recapture_cuda_graph(self):
+        # Prefill graphs also retain weight addresses. Recapture them before
+        # decode, matching startup's shared-pool capture order. Draft graphs
+        # are owned by the spec worker and require its placement scopes.
+        if not self.is_draft_worker and self.prefill_cuda_graph_runner is not None:
+            if self.prefill_cuda_graph_runner is not self.eager_runner:
+                current_platform.synchronize()
+                self.prefill_cuda_graph_runner.backend.cleanup()
+                # Cleanup can drain the old pool. Both new capture passes
+                # must share a fresh pool rather than revive its handle.
+                set_global_graph_memory_pool(None)
+                self.init_prefill_cuda_graph()
+        self.recapture_decode_cuda_graph()
 
     def recapture_decode_cuda_graph(self):
         # A spec worker that captures its draft's graphs inside the draft
