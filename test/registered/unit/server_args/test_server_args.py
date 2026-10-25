@@ -540,6 +540,26 @@ class TestPrepareServerArgs(CustomTestCase):
                 ["--model-path", "dummy", "--sampling-mask-max-tokens", "0"]
             ).resolve_once()
 
+    def test_goodput_slo_rejects_unknown_metrics_and_non_positive_values(self):
+        for goodput_slo, valid in (
+            ({"ttft": 500, "tpot": 50, "e2el": 3000}, True),
+            ({"itl": 10}, False),
+            ({"ttft": 0}, False),
+        ):
+            with self.subTest(goodput_slo=goodput_slo):
+                args = ServerArgs(
+                    model_path="dummy",
+                    served_model_name="dummy",
+                    device="cpu",
+                    chunked_prefill_size=-1,
+                    goodput_slo=goodput_slo,
+                )
+                if valid:
+                    args.check_server_args()
+                else:
+                    with self.assertRaisesRegex(AssertionError, "--goodput-slo"):
+                        args.check_server_args()
+
     def test_legacy_sampling_mask_env_requires_migration(self):
         """Legacy configuration must not silently disable PD sampling masks."""
         for value in ("0", "128", "invalid", ""):

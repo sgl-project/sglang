@@ -141,6 +141,30 @@ histogram_quantile(
 
 Mean TPOT is `rate(..._sum[5m]) / rate(..._count[5m])`. Per-request decode tokens/s is its reciprocal, so p5 TPS is `1 / p95 TPOT`; the reciprocal of mean TPOT is not mean TPS.
 
+## Goodput and SLO attainment
+
+`--goodput-slo` takes latency SLOs in milliseconds for `ttft` (time to first token), `tpot` (request-level time per output token) and `e2el` (end-to-end latency):
+
+```bash
+python -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --enable-metrics \
+  --goodput-slo '{"ttft": 500, "tpot": 50}'
+```
+
+`sglang:num_good_requests_total` then counts the requests that finished normally and met every given SLO, with the labels of `sglang:num_requests_total`. A request without a request-level TPOT meets the `tpot` SLO. Aborted requests and PD prefill workers do not contribute.
+
+Request goodput in requests/s, and SLO attainment among the requests the engine finished:
+
+```promql
+sum by (model_name) (rate(sglang:num_good_requests_total[5m]))
+
+sum by (model_name) (rate(sglang:num_good_requests_total[5m]))
+  / sum by (model_name) (rate(sglang:num_requests_total[5m]))
+```
+
+A request rejected before it runs, for example by `--max-queued-requests`, is in neither counter. To count those as misses, divide by `sglang:http_requests_total` of the serving endpoint instead.
+
+The latency histograms cannot give this number: each one covers a single latency, so they do not show how many requests met all SLOs at once.
+
 ## Diffusion metrics
 
 SGLang Diffusion exposes request, queue, stage and LoRA metrics with

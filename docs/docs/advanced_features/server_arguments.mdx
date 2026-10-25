@@ -963,6 +963,12 @@ Please consult the documentation below and [server_args.py](https://github.com/s
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>List[str]</td>
     </tr>
         <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--goodput-slo`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Latency SLOs in milliseconds for sglang:num_good_requests_total, as a JSON dict with keys from ttft, tpot and e2el, e.g. '&#123;"ttft": 500, "tpot": 50&#125;'. A request is good if it finishes normally and meets every given SLO.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: JSON / Dict</td>
+    </tr>
+        <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--gc-warning-threshold-secs`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The threshold for long GC warning. If a GC takes longer than this, a warning will be logged. Set to 0 to disable.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`0.0`</td>

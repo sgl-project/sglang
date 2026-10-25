@@ -483,5 +483,57 @@ class TestRequestTimePerOutputToken(CustomTestCase):
         )
 
 
+class TestGoodRequests(CustomTestCase):
+    LABELS = {"model_name": "test"}
+    SLO = {"ttft": 500, "tpot": 50, "e2el": 3000}
+
+    def _good_requests(self, goodput_slo, **kwargs):
+        with get_context().override_server_args(
+            prompt_tokens_buckets=None, generation_tokens_buckets=None
+        ):
+            collector = _RecordingTokenizerMetricsCollector(
+                labels=self.LABELS, goodput_slo=goodput_slo
+            )
+        collector.observe_one_finished_request(
+            labels=self.LABELS,
+            prompt_tokens=20,
+            generation_tokens=101,
+            cached_tokens=0,
+            e2e_latency=2.5,
+            has_grammar=False,
+            **kwargs,
+        )
+        return collector.num_good_requests_total.increments
+
+    def test_counted_only_if_every_slo_is_met(self):
+        good = self._good_requests(
+            self.SLO,
+            is_streaming=True,
+            time_to_first_token=0.2,
+            time_per_output_token=0.02,
+        )
+        self.assertEqual(good, [({**self.LABELS, "is_streaming": "true"}, 1)])
+
+        late_tokens = self._good_requests(
+            self.SLO, time_to_first_token=0.2, time_per_output_token=0.08
+        )
+        self.assertEqual(late_tokens, [])
+
+    def test_response_without_decode_interval_meets_tpot_slo(self):
+        good = self._good_requests(
+            self.SLO, time_to_first_token=0.2, time_per_output_token=None
+        )
+        self.assertEqual(len(good), 1)
+
+    def test_not_counted_when_aborted_or_without_slo(self):
+        aborted = self._good_requests({"e2el": 3000}, time_to_first_token=None)
+        self.assertEqual(aborted, [])
+
+        no_slo = self._good_requests(
+            None, time_to_first_token=0.2, time_per_output_token=0.02
+        )
+        self.assertEqual(no_slo, [])
+
+
 if __name__ == "__main__":
     unittest.main()

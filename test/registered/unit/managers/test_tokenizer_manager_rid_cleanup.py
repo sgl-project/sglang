@@ -516,6 +516,7 @@ class TestRequestTpotGating(CustomTestCase):
         *,
         stream=False,
         prefill_finished_time=0.0,
+        key="time_per_output_token",
     ):
         tm = _make_tokenizer_manager(self)
         tm.enable_metrics = True
@@ -539,7 +540,7 @@ class TestRequestTpotGating(CustomTestCase):
             batch_output.time_stats = wrap_as_pickle([sched_stats])
             asyncio.run(tm._handle_batch_output(batch_output))
         (call,) = tm.metrics_collector.observe_one_finished_request.call_args_list
-        return call.kwargs["time_per_output_token"]
+        return call.kwargs[key]
 
     def test_single_batch_finish(self):
         produced = time.perf_counter() - 0.5
@@ -573,6 +574,13 @@ class TestRequestTpotGating(CustomTestCase):
                     self.assertGreater(tpot, 0.0)
                 else:
                     self.assertIsNone(tpot)
+                # TTFT, which goodput needs, is passed for the same requests as TPOT.
+                ttft = self._run(
+                    [(1, _NOT_FINISHED), (3, finished_reason)],
+                    disaggregation_mode=mode,
+                    key="time_to_first_token",
+                )
+                self.assertEqual(ttft is not None, recorded)
 
 
 class TestNonStreamingFirstTokenTime(CustomTestCase):

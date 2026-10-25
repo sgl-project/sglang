@@ -19,6 +19,7 @@ from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import
     parse_ib_device_config,
 )
 from sglang.srt.environ import envs
+from sglang.srt.observability.utils import GOODPUT_SLO_METRICS
 from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform, num_dp_ranks_of
 from sglang.srt.sampling.watermarking.config import (
     MAX_WATERMARK_CONTEXT_WINDOW,
@@ -275,6 +276,7 @@ def check_server_args(server_args: Any):
     assert cfg.mm_io_worker_num >= 0, "Multimodal I/O worker num must >= 0"
     validate_buckets_rule("--prompt-tokens-buckets", cfg.prompt_tokens_buckets)
     validate_buckets_rule("--generation-tokens-buckets", cfg.generation_tokens_buckets)
+    validate_goodput_slo(cfg.goodput_slo)
 
     # Check scheduling policy
     if cfg.enable_priority_scheduling:
@@ -429,6 +431,17 @@ def validate_buckets_rule(arg_name: str, buckets_rule: List[str]):
         assert all(val >= 0 for val in bucket_values), (
             f"{arg_name} custom rule bucket values should be non-negative"
         )
+
+
+def validate_goodput_slo(goodput_slo: Optional[Dict[str, float]]):
+    if not goodput_slo:
+        return
+
+    for name, slo_ms in goodput_slo.items():
+        assert name in GOODPUT_SLO_METRICS, (
+            f"Unsupported --goodput-slo key: '{name}'. Must be one of: {', '.join(GOODPUT_SLO_METRICS)}"
+        )
+        assert slo_ms > 0, f"--goodput-slo {name} must be positive, got: {slo_ms}"
 
 
 def check_load_publish_args(server_args: Any):
