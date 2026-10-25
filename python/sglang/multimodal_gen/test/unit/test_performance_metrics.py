@@ -17,6 +17,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency impor
     GIB_BYTES,
     DefaultWorkload,
     WarmupMemoryRecord,
+    current_placement_reserve_shortfall_bytes,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     WarmupPhasePeak,
@@ -510,6 +511,7 @@ def test_auto_residency_budget_respects_test_device_memory_cap(monkeypatch):
 
     assert validation.estimated_peak_bytes == 69 * GIB_BYTES
     assert validation.peak_allocation_limit_bytes == 60 * GIB_BYTES
+    assert current_placement_reserve_shortfall_bytes([validation]) == 9 * GIB_BYTES
 
 
 def test_baseline_config_loads_per_scenario_peak_vram(tmp_path):

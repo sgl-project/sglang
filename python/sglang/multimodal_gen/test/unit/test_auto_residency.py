@@ -1137,9 +1137,9 @@ class TestPlanAutoResidency:
             reports=[
                 _report(
                     budget_gib=180,
-                    estimated_gib=peak_gib,
+                    estimated_gib=limit_gib,
                     peak_allocation_limit_gib=limit_gib,
-                    phase_peaks_gib={"denoise": peak_gib, "encode": 10},
+                    phase_peaks_gib={"denoise": peak_gib, "encode": limit_gib},
                     phase_components={
                         "denoise": ("transformer",),
                         "encode": ("encoder",),
@@ -1149,6 +1149,21 @@ class TestPlanAutoResidency:
             ]
         )
         assert bool(plan.changes) is expected
+
+    def test_allocated_peak_budget_must_fit_every_rank(self):
+        plan = plan_auto_residency(
+            reports=[
+                _report(
+                    rank=rank,
+                    budget_gib=180,
+                    estimated_gib=peak,
+                    peak_allocation_limit_gib=30,
+                    candidates=[_candidate("encoder", weight_gib=5)],
+                )
+                for rank, peak in [(0, 10), (1, 30)]
+            ]
+        )
+        assert not plan.changes
 
     def test_allocated_peak_budget_also_limits_materialization(self):
         candidate = ResidencyTarget(
