@@ -199,13 +199,19 @@ class TestServerInfoTransportParity(CustomTestCase):
                             grpc_port=50051,
                             smg_grpc_mode=False,
                             grpc_mode=False,
+                            api_key="metadata-key",
+                            admin_api_key="metadata-admin-key",
                         ),
                     ),
                     patch("sglang.srt.rust_extensions.load_rust_extension") as load,
                 ):
                     common.start_follower_grpc_server(args, bridge.scheduler_info)
                 load.return_value.start_metadata_server.assert_called_once_with(
-                    host="127.0.0.1", port=50051, server_info_json=leader_json
+                    host="127.0.0.1",
+                    port=50051,
+                    server_info_json=leader_json,
+                    api_key="metadata-key",
+                    admin_api_key="metadata-admin-key",
                 )
 
     def test_rust_server_followers_skip_runtime_metadata_server(self):

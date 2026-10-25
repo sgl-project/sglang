@@ -10,6 +10,126 @@ use tonic::Code;
 // Keep that read separate from the environment override test below.
 static PAYLOAD_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+#[tokio::test]
+async fn api_and_admin_keys_match_http_permissions_before_dispatch() {
+    use sglang_api_types::runtime::v1::{GetServerInfoRequest, GetServerInfoResponse};
+    use tonic_prost::ProstCodec;
+
+    let _guard = PAYLOAD_ENV_LOCK.lock().await;
+    for (api_key, admin_api_key) in [
+        (None, None),
+        (Some("user-key"), None),
+        (None, Some("admin-key")),
+        (Some("user-key"), Some("admin-key")),
+    ] {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+        let server_shutdown = shutdown.clone();
+        let server = tokio::spawn(super::serve_grpc(
+            listener,
+            super::MetadataService {
+                server_info_json: "{}".into(),
+            },
+            server_shutdown,
+            None,
+            crate::auth::ApiKeyAuth::new(
+                api_key.map(str::to_owned),
+                admin_api_key.map(str::to_owned),
+            ),
+        ));
+        let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+            .unwrap()
+            .timeout(std::time::Duration::from_secs(5))
+            .connect()
+            .await
+            .unwrap();
+        let mut client = tonic::client::Grpc::new(channel);
+        for (method, streaming, admin) in [
+            ("GetServerInfo", false, false),
+            ("GetModelInfo", false, false),
+            ("HealthCheck", false, false),
+            ("ListModels", false, false),
+            ("GetLoad", false, false),
+            ("TextEmbed", false, false),
+            ("Embed", false, false),
+            ("Classify", false, false),
+            ("Tokenize", false, false),
+            ("Detokenize", false, false),
+            ("OpenAIEmbed", false, false),
+            ("OpenAIClassify", false, false),
+            ("Score", false, false),
+            ("Rerank", false, false),
+            ("PauseGeneration", false, true),
+            ("ContinueGeneration", false, true),
+            ("Abort", false, true),
+            ("FlushCache", false, true),
+            ("StartProfile", false, true),
+            ("StopProfile", false, true),
+            ("UpdateWeightsFromDisk", false, true),
+            ("Generate", true, false),
+            ("TextGenerate", true, false),
+            ("ChatComplete", true, false),
+            ("Complete", true, false),
+            ("WatchEngineState", true, false),
+        ] {
+            for token in [None, Some("wrong"), Some("user-key"), Some("admin-key")] {
+                let mut request = tonic::Request::new(GetServerInfoRequest {});
+                if let Some(token) = token {
+                    request
+                        .metadata_mut()
+                        .insert("authorization", format!("Bearer {token}").parse().unwrap());
+                }
+                let path = format!("/sglang.runtime.v1.SglangService/{method}")
+                    .parse()
+                    .unwrap();
+                client.ready().await.unwrap();
+                let result = if streaming {
+                    client
+                        .server_streaming::<_, GetServerInfoResponse, _>(
+                            request,
+                            path,
+                            ProstCodec::default(),
+                        )
+                        .await
+                        .map(|_| ())
+                } else {
+                    client
+                        .unary::<_, GetServerInfoResponse, _>(request, path, ProstCodec::default())
+                        .await
+                        .map(|_| ())
+                };
+                let expected_key = if method == "HealthCheck" {
+                    None
+                } else if admin {
+                    admin_api_key.or(api_key)
+                } else {
+                    api_key
+                };
+                if expected_key.is_some() && token != expected_key {
+                    assert_eq!(
+                        result.unwrap_err().code(),
+                        Code::Unauthenticated,
+                        "{method}"
+                    );
+                } else if method == "GetServerInfo" {
+                    result.unwrap();
+                } else {
+                    // Authorized calls reach the metadata-only service's default handler.
+                    assert_eq!(result.unwrap_err().code(), Code::Unimplemented, "{method}");
+                }
+            }
+        }
+        shutdown.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+}
+
 #[test]
 fn openai_status_code_uses_forwarded_status_when_present() {
     let meta_info = HashMap::from([(String::from("status_code"), String::from("429"))]);
@@ -114,7 +234,13 @@ async fn follower_metadata_server_exposes_only_server_info_and_shuts_down() {
     };
     let handle = std::thread::spawn(move || {
         runtime
-            .block_on(super::serve_grpc(listener, service, server_shutdown, None))
+            .block_on(super::serve_grpc(
+                listener,
+                service,
+                server_shutdown,
+                None,
+                crate::auth::ApiKeyAuth::new(None, None),
+            ))
             .unwrap();
     });
     assert!(!handle.is_finished());
