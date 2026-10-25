@@ -527,13 +527,6 @@ register_kernel(
 )
 register_kernel(
     KernelSpec(
-        op="gemm.split_fp32_to_bf16x3",
-        backend=KernelBackend.TRITON,
-        target="sglang.kernels.ops.gemm.router_gemv:split_fp32_to_bf16x3",
-    )
-)
-register_kernel(
-    KernelSpec(
         op="gemm.router_gemm_bf16x3_cublas",
         backend=KernelBackend.TORCH,
         target="sglang.kernels.ops.gemm.router_gemv:router_gemm_bf16x3_cublas",

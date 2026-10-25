@@ -32,10 +32,10 @@ from sglang.kernels.ops.gemm.router_gemv import (
     router_gemm_bf16x3_cublas,
     router_gemv,
     router_gemv_supported,
-    split_fp32_to_bf16x3,
 )
 from sglang.kernels.ops.gemm.tiny_gemm import tiny_gemm_bf16
 from sglang.kernels.ops.layernorm.beam_fused import BeamSandwichResidualRMSNormOp
+from sglang.kernels.ops.quantization.bf16x3_split import split_fp32_to_bf16x3
 from sglang.kernels.spec import KernelBackend
 from sglang.srt.configs.beam import BeamConfig
 from sglang.srt.distributed import (
