@@ -560,13 +560,14 @@ class NixlKVManager(CpuBufferMixin, StagingManagerMixin, CommonKVManager):
                     StateType.MAMBA,
                     StateType.QSA_PENDING,
                     StateType.QSA_COMPRESSED,
+                    StateType.DSA,
                 )
                 for state_type in (args.state_types or [])
             )
             or args.is_hybrid_mla_backend
         ):
             raise ValueError(
-                "CPU-buffer PD supports only Mamba/GDN and QSA extra state, without hybrid MLA layouts"
+                "CPU-buffer PD supports only Mamba/GDN, QSA and DSA extra state, without hybrid MLA layouts"
             )
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
         self._cpu_pool = None

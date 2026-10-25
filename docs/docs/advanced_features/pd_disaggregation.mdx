@@ -68,8 +68,14 @@ generation. Both sides must have identical state layouts and attention TP sizes.
 With `--disaggregation-enable-kv-checksum`, verification includes all three state
 components using their respective physical indices.
 
+For DSA models such as GLM-5.3, the final chunk also transfers index-key pages
+and their scales. Layers that reuse another layer's top-k have no index-key
+payload. Decode restores these pages before generation; KV checksum verification
+covers the index-key cache as well. Use matching page sizes and skip-topk layouts
+on both workers. Compressed DSA tail state is not supported.
+
 It does not support speculative decoding, hybrid MLA layouts, other extra state
-components beyond Mamba/GDN and QSA, PLE embedding offload, HiCache,
+components beyond Mamba/GDN, QSA and DSA, PLE embedding offload, HiCache,
 HiSparse, decode KV offload, decode host receive, GPU staging, or runtime PD role switching.
 Do not combine `--nixl-use-cpu-buffer` with `--enable-kv-cache-sharding`.
 Sharding produces noncontiguous send positions, while CPU-buffer transfers
@@ -88,7 +94,7 @@ value is preserved. The `host_pool` backend is rejected because it allocates a
 CUDA-registered HiCache pool even when incoming KV uses CPU buffers.
 
 Size the pool for concurrent requests: decode holds every received KV page for
-a request, together with its Mamba/GDN and QSA state when present, until GPU
+a request, together with its Mamba/GDN, QSA or DSA state when present, until GPU
 restoration completes. Prefill holds each packed chunk until its NIXL transfer
 settles. Pool exhaustion fails the affected
 request instead of waiting for pool space. An aborted decode request

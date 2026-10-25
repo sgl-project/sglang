@@ -35,7 +35,10 @@ class TestNixlCpuBufferTransfer(CustomTestCase):
     def test_real_qsa_chunked_transfer(self):
         self._roundtrip(with_qsa=True)
 
-    def _roundtrip(self, *, with_qsa):
+    def test_real_dsa_chunked_transfer(self):
+        self._roundtrip(with_qsa=False, with_dsa=True)
+
+    def _roundtrip(self, *, with_qsa, with_dsa=False):
         from nixl._api import nixl_agent, nixl_agent_config, nixl_thread_sync_t
 
         device = os.environ.get("NIXL_TEST_DEVICE", "cuda")
@@ -69,6 +72,11 @@ class TestNixlCpuBufferTransfer(CustomTestCase):
             if with_qsa
             else []
         )
+        if with_dsa:
+            # Each page carries index keys followed by their FP32 scales.
+            state_source = [
+                [torch.arange(16 * 132, device=device).to(torch.uint8).reshape(16, 132)]
+            ]
         state_target = [[torch.zeros_like(t) for t in group] for group in state_source]
         state_types = (
             [StateType.MAMBA, StateType.QSA_PENDING, StateType.QSA_COMPRESSED]
@@ -82,6 +90,10 @@ class TestNixlCpuBufferTransfer(CustomTestCase):
         dst_state_ids = (
             [np.array([1]), np.array([8]), np.array([3, 10, 2, 6])] if with_qsa else []
         )
+        if with_dsa:
+            state_types = [StateType.DSA]
+            src_state_ids = [np.array([9, 3, 14, 1, 7])]
+            dst_state_ids = [np.array([2, 10, 0, 5, 15])]
         managers = []
         registrations = []
         for tensors, state_tensors in ((source, state_source), (target, state_target)):
@@ -151,7 +163,7 @@ class TestNixlCpuBufferTransfer(CustomTestCase):
                         time.monotonic(), deadline, "NIXL transfer timed out"
                     )
                     time.sleep(0.001)
-            if with_qsa:
+            if with_qsa or with_dsa:
                 sender._send_cpu_state(
                     req,
                     peer,
@@ -165,7 +177,7 @@ class TestNixlCpuBufferTransfer(CustomTestCase):
                         sender.agent.check_xfer_state(handles[-1]), "ERR"
                     )
                     self.assertLess(
-                        time.monotonic(), deadline, "QSA transfer timed out"
+                        time.monotonic(), deadline, "State transfer timed out"
                     )
                     time.sleep(0.001)
             if with_qsa and device != "cpu":
@@ -213,7 +225,7 @@ class TestNixlCpuBufferTransfer(CustomTestCase):
             sender._cpu_pool.reap(sender.agent)
             self.assertFalse(sender._cpu_pool._ranges)
             print(
-                f"NIXL CPU-buffer roundtrip passed: device={device}, qsa={with_qsa}, chunks=2, kv_bytes={len(src_ids) * sum(widths)}"
+                f"NIXL CPU-buffer roundtrip passed: device={device}, qsa={with_qsa}, dsa={with_dsa}, chunks=2, kv_bytes={len(src_ids) * sum(widths)}"
             )
         finally:
             # Keep backing tensors and registration descriptors alive until

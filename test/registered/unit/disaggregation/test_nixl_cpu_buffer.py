@@ -629,6 +629,68 @@ class TestCpuBufferMambaState(CustomTestCase):
         self.assertNotIn(11, mgr._cpu_receives)
 
 
+class TestCpuBufferDsaState(CustomTestCase):
+    def test_skip_topk_layers_and_sparse_page_restore(self):
+        mgr = manager()
+        kv = torch.zeros((8, 4), dtype=torch.uint8)
+        index = torch.arange(8 * 12, dtype=torch.uint8).reshape(8, 12)
+        other = torch.arange(8 * 20, dtype=torch.uint8).reshape(8, 20)
+        skipped = torch.empty((0, 12), dtype=torch.uint8)
+        mgr.kv_args.kv_data_ptrs = [kv.data_ptr()]
+        mgr.kv_args.state_types = [StateType.DSA]
+        # Wire order differs from pool order, with a skipped layer in between.
+        mgr.kv_args.state_data_ptrs = [
+            [other.data_ptr(), skipped.data_ptr(), index.data_ptr()]
+        ]
+        mgr.kv_args.state_item_lens = [[20, 0, 12]]
+        mgr.set_cpu_kv_buffers(
+            SimpleNamespace(
+                kv_buffer=[kv], index_k_with_scale_buffer=[index, skipped, other]
+            )
+        )
+        self.assertEqual([view.shape[1] for view in mgr._cpu_state_views[0]], [20, 12])
+        sources = [t[[6, 1, 4]].clone() for t in (other, index)]
+        region = mgr._allocate_cpu_receive(1, np.array([0]), 1, [[0, 3, 7]])
+        region.buffer[:4].zero_()
+        pack_pages(mgr._cpu_state_views[0], np.array([6, 1, 4]), region.buffer[4:])
+        self.assertTrue(
+            torch.equal(region.buffer[4:], torch.cat([t.flatten() for t in sources]))
+        )
+        mgr._finish_cpu_receive(1)
+        for tensor, source in zip((other, index), sources):
+            self.assertTrue(torch.equal(tensor[[0, 3, 7]], source))
+            self.assertTrue(torch.equal(tensor[[6, 1, 4]], source))
+        self.assertFalse(mgr._cpu_pool._ranges)
+        for invalid in ([[8]], [[-1]], [[1.5]]):
+            with self.subTest(indices=invalid), self.assertRaises(ValueError):
+                mgr._allocate_cpu_receive(2, np.array([0]), 1, invalid)
+        self.assertFalse(mgr._cpu_receives)
+
+    def test_tail_and_hybrid_mla_rejected_before_initialization(self):
+        with patch(
+            "sglang.srt.disaggregation.nixl.conn.get_disagg",
+            return_value=SimpleNamespace(nixl_use_cpu_buffer=True),
+        ):
+            for types, hybrid in (
+                ([StateType.DSA_TAIL], False),
+                ([StateType.DSA], True),
+            ):
+                args = SimpleNamespace(state_types=types, is_hybrid_mla_backend=hybrid)
+                with (
+                    self.subTest(types=types, hybrid=hybrid),
+                    self.assertRaisesRegex(ValueError, "CPU-buffer PD"),
+                ):
+                    NixlKVManager(args, None, None)
+
+    def test_empty_page_indices_from_wire(self):
+        mgr = manager()
+        mgr.kv_args.state_types = [StateType.DSA]
+        mgr._cpu_state_views = [[torch.zeros((4, 12), dtype=torch.uint8)]]
+        ids = mgr._cpu_state_index([[]])
+        self.assertEqual(ids[0].dtype, np.int64)
+        self.assertEqual(mgr._cpu_state_bytes(ids), 0)
+
+
 class TestCpuBufferQsaState(CustomTestCase):
     def make_manager(self, size=2048):
         mgr = manager(size)

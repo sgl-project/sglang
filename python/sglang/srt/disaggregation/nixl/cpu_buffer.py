@@ -190,6 +190,17 @@ class CpuBufferMixin:
                 ]
             elif state_type == StateType.QSA_COMPRESSED:
                 tensors = pool.qsa_compressed_k_buffer_pool
+            elif state_type == StateType.DSA:
+                tensors = pool.index_k_with_scale_buffer
+                # Skip-topk layers have zero-row placeholders. They occupy wire
+                # metadata entries but contribute no bytes to the packed state.
+                active = [
+                    (ptr, width)
+                    for ptr, width in zip(pointers, widths, strict=True)
+                    if width
+                ]
+                pointers = [ptr for ptr, _ in active]
+                widths = [width for _, width in active]
             else:
                 raise ValueError(f"Unsupported CPU-buffer state type: {state_type}")
             self._cpu_state_views.append(page_views(tensors, pointers, widths))
@@ -276,9 +287,14 @@ class CpuBufferMixin:
             self.kv_args.state_types, groups, indices, strict=True
         ):
             ids = np.asarray(ids)
+            if ids.ndim == 1 and not ids.size:
+                ids = ids.astype(np.int64)
             if ids.ndim != 1 or ids.dtype.kind not in "iu":
                 raise ValueError("CPU-buffer state indices must be integer vectors")
-            if state_type != StateType.QSA_COMPRESSED and len(ids) != 1:
+            if (
+                state_type not in (StateType.QSA_COMPRESSED, StateType.DSA)
+                and len(ids) != 1
+            ):
                 raise ValueError("CPU-buffer slot state requires one physical slot")
             if len(ids) and (
                 np.min(ids) < 0
