@@ -1,6 +1,6 @@
 ---
 title: GLM-5.3-Flash
-description: "Deploy GLM-5.3-Flash with SGLang using recipes for H100, H200, B200, B300, GB200, GB300, and MI355X, with MTP and multimodal serving."
+description: "Deploy GLM-5.3-Flash with SGLang using recipes for H100, H200, B200, B300, GB200, GB300, MI355X, and TPU7x, with MTP and multimodal serving, plus Ascend A3 and 950PR/DT series NPU recipes."
 tag: NEW
 ---
 
@@ -20,14 +20,75 @@ For the listed NVIDIA hardware, the deployment panel can render a complete `dock
 
 For MI355X, follow the [AMD GPU installation guide](/docs/hardware-platforms/amd_gpu) and run the generated **Python** command on four GPUs. Select FP8 or [MXFP4](https://huggingface.co/OneNexus/GLM-5.3-Flash-MXFP4); SGLang downloads the model and tokenizer automatically.
 
+For TPU7x, install [sglang-torchtpu](https://github.com/sgl-project/sglang-torchtpu) from source (its `main` branch; the `v0.1.0-tpu` image predates the GLM-5.3-Flash MTP fixes) and run the generated **Python** command on one TPU7x host with 4 chips:
+
+```bash Command
+git clone https://github.com/sgl-project/sglang-torchtpu.git
+cd sglang-torchtpu
+cp python/pyproject_tpu.toml python/pyproject.toml
+pip install --extra-index-url https://download.pytorch.org/whl/cpu -e python/
+pip install --no-deps -e .
+```
+
 </Accordion>
 
-Choose your hardware, then choose the operating point that matches your workload:
+<Accordion title="Install and prepare Ascend NPUs">
+
+Use a Linux host with the Ascend driver and a compatible CANN / TorchNPU environment. Follow the
+[Ascend installation guide](/docs/hardware-platforms/ascend-npus/getting-started/installation) and the
+[GLM-5.3-Flash deployment tutorial](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/glm_5_3_flash#installation) to start a container with the NPU devices, driver mounts, and checkpoint directory. Run the setup and the generated **Python** command inside that container.
+
+<Tabs>
+<Tab title="A3">
+
+```bash Command
+docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-glm5.3-flash
+```
+
+Run the following setup before copying the generated command (CANN 9.1.0). CPU tuning requires host privileges.
+
+```bash Command
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY ASCEND_LAUNCH_BLOCKING
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+source /usr/local/Ascend/cann-9.1.0/opp/vendors/customize/bin/set_env.bash
+```
+
+</Tab>
+<Tab title="950PR/DT series">
+
+Use a CANN 9.1.0 SGLang image with the custom operators and MemFabric runtime required by the tutorial; PD mode also requires DP-attention support. The tutorial does not specify a 950PR/DT series image tag.
+
+```bash Command
+NPU_IMAGE="<your-compatible-950pr-dt-series-image>"
+docker pull "$NPU_IMAGE"
+```
+
+```bash Command
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY ASCEND_LAUNCH_BLOCKING
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
+source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/custom_transformer/bin/set_env.bash
+source /usr/local/memfabric_hybrid/set_env.sh
+```
+
+</Tab>
+</Tabs>
+
+Replace the model path in the generated command with your mounted ModelSlim checkpoint directory. Include its configuration, tokenizer, quantization metadata, and MTP weights.
+
+Use [W8A8](https://www.modelscope.cn/models/Eco-Tech/GLM-5.3-Flash-w8a8) for A3 and [W8A8_MXFP8](https://www.modelscope.cn/models/Eco-Tech/GLM-5.3-Flash-w8a8-mxfp8) for 950PR/DT series.
+
+Replace network placeholders such as `<network-interface>`, `<prefill-head-ip>`, and `<decode-head-ip>` in the generated NPU command with your cluster settings.
+
+</Accordion>
+
+The cookbook opens on **B300**. Choose your hardware, then choose the operating point that matches your workload:
 
 - **Low Latency** starts with MTP 5/1/6 speculative decoding and tensor parallelism to shorten interactive responses.
 - **High Throughput** starts with speculative decoding off, which avoids draft-and-verify overhead under sustained batches.
 
-Every listed hardware platform exposes both strategies. A **Verified** badge means that exact hardware and command were tested. **Final Verification In Progress** means the recipe runs and is queued for measurement on the final weights. **Not Verified** means the command is a supported starting point that still needs workload validation. A choice is disabled only when the underlying runtime combination is known to be unsupported.
+Every listed GPU platform exposes both strategies; TPU7x has a Low Latency recipe only. A **Verified** badge means that exact hardware and command were tested. **Final Verification In Progress** means the recipe runs and is queued for measurement on the final weights. **Not Verified** means the command is a supported starting point that still needs workload validation. A choice is disabled only when the underlying runtime combination is known to be unsupported.
 
 The recommended selection is only a starting point. The same panel also lets you override the KV/DSA pairing, multimodal feature transport, Breakable Cuda Graph, and HiCache tiers. The MI355X commands are marked **Not Verified** because the selector defaults to HiCache off, whereas the measured AgentX configuration adds the host tier described in [Extend the cache hierarchy](#extend-the-cache-hierarchy). Do not treat the CUDA benchmark rows as MI355X measurements.
 
@@ -45,7 +106,7 @@ Generated commands leave `--mamba-full-memory-ratio` at its `0.9` default, which
 
 ## Playground
 
-Use the Playground for lower-level tuning such as attention parallelism, MoE communication, speculative decoding, and reasoning or tool parsers. It inherits every selection from the deployment panel and shows only the command-line diff.
+Use the Playground for lower-level tuning such as attention parallelism, MoE communication, PD disaggregation, speculative decoding, and reasoning or tool parsers. It inherits every selection from the deployment panel and shows only the command-line diff. The MoE backend defaults to `flashinfer_trtllm` on B300, B200, GB300 and GB200, to DeepGemm on Hopper, and to AITER on MI355X.
 
 import { Playground } from "/src/snippets/_playground.jsx";
 
@@ -110,6 +171,10 @@ The **Speculative** card in the Playground changes the algorithm without leaving
 
 Neither algorithm runs with DP-Attention; the card disables the affected chips and names the reason. DFlash2's FA4 draft path is also disabled on MI355X.
 
+### Serve on TPU7x
+
+The TPU7x recipe serves the language model with DeepSeek Sparse Attention on the Pallas sparse MLA kernels and MTP 3/1/4 on the experimental chain speculative worker (`SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER=1`). On TPU7x, 3/1/4 decodes faster than 5/1/6 at the same accept length, because each extra draft row widens the target verify. It is sized for one request with 8K input and 1K output: `--context-length 10240`, `--max-running-requests 1`, and a 20,480-token KV pool. Raise `--context-length`, `--max-total-tokens`, `--max-running-requests` and `--max-mamba-cache-size` together for longer or concurrent requests; those settings are outside the verified command. The first start compiles every decode and prefill shape listed in `--tpu-compile-bs` and `--tpu-compile-tokens`, so it takes longer than later starts that reuse the compilation cache.
+
 ### Size both memory pools
 
 GLM-5.3-Flash maintains a paged KV pool for attention and a separate KDA state pool. The KDA state pool can limit concurrency before the KV pool is full. If startup reduces `max_running_requests` because of KDA state capacity, increase `--mamba-full-memory-ratio` or set `--max-mamba-cache-size` for the expected concurrency, then tune `--max-running-requests` to the workload.
@@ -122,6 +187,8 @@ Keep the checkpoint's KDA lower-bound setting unchanged. In particular, do not o
 
 On Blackwell, the recipes default to an FP8 KV cache with TRT-LLM DSA: on GB300 this pairing measured 2.9–5.7% higher throughput and about 1.8x the KV token capacity at identical pool bytes, with GSM8K accuracy within noise of BF16. BF16 KV with TileLang DSA remains selectable in the deployment panel and is the default on H100 and H200, where FP8 KV with TRT-LLM DSA is disabled. MI355X instead uses FP8 KV with TileLang DSA in the recorded ROCm recipe. Switch the dtype and both DSA backends together; TileLang DSA with FP8 KV is not a valid CUDA combination, and TRT-LLM DSA is not the MI355X backend.
 
+On Hopper, BF16 KV can also run the sparse prefill in FP8 with `--dsa-prefill-backend flashmla_sparse_q8` (decode stays on `tilelang` and the cache stays BF16): on H200 this pairing measured 5.8–12.1% higher throughput on prefill-only requests, with GSM8K accuracy within noise of BF16 + TileLang. It is SM90-only and requires a build that includes [PR #41790](https://github.com/sgl-project/sglang/pull/41790); FP8 KV is not available with it for this model.
+
 ### Extend the cache hierarchy
 
 Keep **HiCache** off when GPU memory is sufficient. Select **L1 + L2** to spill reusable cache entries into host memory. Select **+ L3** only after configuring Mooncake on every serving node; the generated command exposes the required configuration path. These options remain selectable but are marked **Not Verified** until the resulting command is validated on the chosen hardware.
@@ -130,7 +197,7 @@ For agentic MXFP4 serving on MI355X, select **Low Latency** with **L1 + L2**. Th
 
 ### Multimodal memory
 
-All strategies enable multimodal serving. Image and video input need a Transformers build that ships `Glm5NextProcessor` (the current `transformers==5.17.0` dependency includes it and requires `tokenizers>=0.23.1`). With older `transformers==5.12.1`, the server loads only the tokenizer and silently answers image requests from the text alone. On MI355X, text, image, and an image-bearing follow-up were qualified with Transformers commit `e4052f55`; video was not evaluated. The processor samples video at 2 FPS and caps video input at 240,000 visual tokens. Install `torchcodec` in the serving environment before sending video requests. For very long videos on 4x GB300, use encoder disaggregation to isolate the vision encoder's memory spikes from language decoding.
+All strategies enable multimodal serving. Image and video input use `Glm5NextProcessor`, which the pinned Transformers release ships (the MI355X checks predate that release and used commit `e4052f55`). On MI355X, text, image, and an image-bearing follow-up were qualified with that build; video was not evaluated. The processor samples video at 2 FPS and caps video input at 240,000 visual tokens. Install `torchcodec` in the serving environment before sending video requests. For very long videos on 4x GB300, use encoder disaggregation to isolate the vision encoder's memory spikes from language decoding.
 
 The default multimodal feature transport is automatic, and on a single CUDA node auto resolves to CPU transport. The MI355X selection explicitly emits CPU transport, matching its image-serving check. CUDA IPC is opt-in: pass `--mm-feature-transport cuda_ipc` when lower transfer latency matters more than the GPU memory the IPC pool reserves. CUDA VMM transport applies only to multi-node GB200/GB300 systems on the MNNVL fabric, where auto selects it.
 
@@ -206,6 +273,8 @@ Install `torchcodec` for video and see the [encoder disaggregation guide](/docs/
 
 Use prefill context parallelism (CP) to distribute DSA prefill computation for long prompts, including multimodal inputs. This hybrid model uses **interleave CP for DSA layers** and **head-wise tensor parallelism for KDA layers**, sharing the same communication group. Layer boundaries all-gather the context shards before KDA and reduce-scatter its output back onto those shards. The mHC residual streams and their coefficients stay local, with each output's reduction completed before the residual update.
 
+In the Playground's **Attention** card, select **TP=8** and **CP=8** on B300 or B200 to add `--attn-cp-size 8 --enable-prefill-cp --cp-strategy interleave`. For CP4, set TP=4 and CP=4. With CP enabled, the **MoE** card restricts EP to **1** or the CP size; an incompatible EP selection falls back to 1. Choosing EP=CP also adds `--moe-dense-tp-size` with the CP size. Prefill CP and PD disaggregation cannot be enabled together for this model.
+
 <Accordion title="Example of launching with Prefill CP on Blackwell GPU">
 
 ```bash Command
@@ -236,6 +305,8 @@ sglang serve \
 ### 3.6 PD disaggregation (preview)
 
 PD splits prefill and decode into separate server groups behind a router. For this hybrid model, the transfer moves both the paged DSA KV and the KDA recurrent state.
+
+The Playground's **PD Disagg** card defaults to **Off**, with **Mooncake** as its only transfer backend. Select **Prefill** or **Decode** to add `--disaggregation-mode prefill` or `--disaggregation-mode decode`, respectively, together with `--disaggregation-transfer-backend mooncake`. Selecting either role disables prefill CP. The generated prefill and decode commands use ports 30000 and 30100, respectively.
 
 <Warning>
 PD serving is mechanically validated with dummy weights only — startup, bootstrap, state transfer, and request flow all work on 4x GB300. It has not been load- or accuracy-tested. Treat it as a preview until the real-weight gate completes.

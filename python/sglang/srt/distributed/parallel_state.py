@@ -84,6 +84,11 @@ _is_npu = is_npu()
 _is_cpu = is_cpu()
 _is_xpu = is_xpu()
 _is_musa = is_musa()
+# Under CUDA-graph capture, stage aiter custom all-gather / reduce-scatter inputs
+# through the pre-registered IPC pool instead of registering graph-pool tensors:
+# the registered path makes peers read stale data over IPC on replay (garbage
+# rows / NaN under DP attention + TP MoE on MI355X). Set to 0 to restore it.
+_AITER_CAPTURE_COPY_IN = os.environ.get("SGLANG_AITER_CAPTURE_COPY_IN", "0") == "1"
 
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 
@@ -326,19 +331,7 @@ class GroupCoordinator:
         # Scale cohorts create these groups without the serving ranks.
         use_local_synchronization = rank_offset > 0 and not recovered_rank
 
-        if is_cuda_alike():
-            device_id = (
-                0 if envs.SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS.get() else local_rank
-            )
-            self.device = torch.device(f"cuda:{device_id}")
-        elif _is_npu:
-            self.device = torch.device(f"npu:{local_rank}")
-        elif _is_xpu:
-            self.device = torch.device(f"xpu:{local_rank}")
-        elif _is_musa:
-            self.device = torch.device(f"musa:{local_rank}")
-        else:
-            self.device = torch.device("cpu")
+        self.device = _group_coordinator_device(local_rank)
         self.device_module = torch.get_device_module(self.device)
 
         for ranks in group_ranks:
@@ -1190,7 +1183,7 @@ class GroupCoordinator:
             return False
         if getattr(ca_comm, "_IS_CAPTURING", False):
             if torch.cuda.is_current_stream_capturing():
-                if envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get():
+                if envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get() or _AITER_CAPTURE_COPY_IN:
                     ca_comm.reduce_scatter(input, output, registered=False)
                 else:
                     ca_comm.reduce_scatter(input, output, registered=True)
@@ -1309,7 +1302,10 @@ class GroupCoordinator:
         ):
             if getattr(ca_comm, "_IS_CAPTURING", False):
                 if torch.cuda.is_current_stream_capturing():
-                    if envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get():
+                    if (
+                        envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
+                        or _AITER_CAPTURE_COPY_IN
+                    ):
                         ca_comm.all_gather_unreg(input, out=output, dim=0)
                     else:
                         ca_comm.all_gather_reg(input, out=output, dim=0)
@@ -2114,6 +2110,24 @@ class GroupCoordinator:
             self.mq_broadcaster = None
 
 
+def _group_coordinator_device(local_rank: int) -> torch.device:
+    if is_cuda_alike():
+        device_id = (
+            0 if envs.SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS.get() else local_rank
+        )
+        return torch.device(f"cuda:{device_id}")
+    if _is_npu:
+        return torch.device(f"npu:{local_rank}")
+    if _is_xpu:
+        return torch.device(f"xpu:{local_rank}")
+    if _is_musa:
+        return torch.device(f"musa:{local_rank}")
+    platform = platforms.current_platform
+    if platform.is_out_of_tree():
+        return platform.get_group_coordinator_device(local_rank)
+    return torch.device("cpu")
+
+
 _WORLD: Optional[GroupCoordinator] = None
 
 
@@ -2165,15 +2179,17 @@ def init_model_parallel_group(
         use_mscclpp = _ENABLE_MSCCLPP
     if use_torch_symm_mem_allreduce is None:
         use_torch_symm_mem_allreduce = _ENABLE_TORCH_SYMM_MEM_ALL_REDUCE
+    if use_pynccl is None:
+        platform = platforms.current_platform
+        if platform.is_out_of_tree() and not platform.capabilities.supports_pynccl:
+            use_pynccl = False
+        else:
+            use_pynccl = not (_is_npu or _is_xpu or backend == "mooncake")
     return GroupCoordinator(
         group_ranks=group_ranks,
         local_rank=local_rank,
         torch_distributed_backend=backend,
-        use_pynccl=(
-            not (_is_npu or _is_xpu or backend == "mooncake")
-            if use_pynccl is None
-            else use_pynccl
-        ),
+        use_pynccl=use_pynccl,
         use_mscclpp=use_mscclpp,
         use_custom_allreduce=use_custom_allreduce,
         use_torch_symm_mem_all_reduce=use_torch_symm_mem_allreduce,
@@ -2640,10 +2656,12 @@ def initialize_model_parallel(
         raise RuntimeError(
             f"decode_context_parallel_size ({decode_context_parallel_size}) must be >= 1"
         )
-    if decode_context_parallel_size > 1 and not (is_hip() or is_cuda() or _is_npu):
+    if decode_context_parallel_size > 1 and not (
+        is_hip() or is_cuda() or _is_npu or _is_xpu
+    ):
         raise RuntimeError(
             "Decode context parallel (decode_context_parallel_size > 1) is "
-            "currently only supported on the AMD HIP, CUDA, or NPU "
+            "currently only supported on the AMD HIP, CUDA, NPU, or Intel XPU "
             "platform, but got decode_context_parallel_size "
             f"({decode_context_parallel_size}) on an unsupported platform."
         )

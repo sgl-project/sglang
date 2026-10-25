@@ -147,6 +147,22 @@ class TestSamplingParamsValidate(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, r"boundary_ratio"):
             SamplingParams(boundary_ratio=math.nan)
 
+    def test_postprocess_scale_ranges(self):
+        """Out-of-range upscaling/interpolation scales must not reach the kernels."""
+        for field, value in [
+            ("frame_interpolation_scale", 0.0),
+            ("frame_interpolation_scale", math.nan),
+            ("frame_interpolation_scale", 100.0),
+            ("upscaling_scale", 0),
+            ("upscaling_scale", 1000),
+            ("upscaling_scale", True),
+        ]:
+            with self.subTest(field=field, value=value):
+                with self.assertRaisesRegex(ValueError, field):
+                    SamplingParams(**{field: value})
+        SamplingParams(frame_interpolation_scale=0.25, upscaling_scale=1)
+        SamplingParams(frame_interpolation_scale=4.0, upscaling_scale=8)
+
     def test_teacache_and_spectrum_are_mutually_exclusive(self):
         with self.assertRaisesRegex(
             ValueError, r"enable_teacache and enable_spectrum are mutually exclusive"
@@ -297,26 +313,21 @@ class TestSamplingParamsSubclass(unittest.TestCase):
 
         self.assertEqual(params.get_coefficients(), [9.0, 8.0, 7.0, 6.0, 5.0])
 
-    def test_wan_teacache_boundaries_match_legacy_behavior(self):
-        legacy_equivalent_cases = [
-            (WanT2V_1_3B_SamplingParams().teacache_params, False, (5, 50)),
-            (WanT2V_1_3B_SamplingParams().teacache_params, True, (10, 100)),
-            (WanT2V_14B_SamplingParams().teacache_params, False, (1, 49)),
-            (WanT2V_14B_SamplingParams().teacache_params, True, (2, 98)),
-            (WanI2V_14B_480P_SamplingParam().teacache_params, False, (5, 50)),
-            (WanI2V_14B_480P_SamplingParam().teacache_params, True, (10, 100)),
-            (WanI2V_14B_720P_SamplingParam().teacache_params, False, (5, 50)),
-            (WanI2V_14B_720P_SamplingParam().teacache_params, True, (10, 100)),
+    def test_wan_teacache_skip_step_ranges(self):
+        cases = [
+            (WanT2V_1_3B_SamplingParams().teacache_params, (5, 50)),
+            (WanT2V_14B_SamplingParams().teacache_params, (1, 49)),
+            (WanI2V_14B_480P_SamplingParam().teacache_params, (5, 50)),
+            (WanI2V_14B_720P_SamplingParam().teacache_params, (5, 50)),
         ]
 
-        for teacache_params, do_cfg, expected in legacy_equivalent_cases:
+        for teacache_params, expected in cases:
             with self.subTest(
                 use_ret_steps=teacache_params.use_ret_steps,
-                do_cfg=do_cfg,
                 expected=expected,
             ):
                 self.assertEqual(
-                    teacache_params.get_skip_boundaries(50, do_cfg),
+                    teacache_params.get_skip_step_range(50),
                     expected,
                 )
 
@@ -375,6 +386,17 @@ class TestSamplingParamsCliArgs(unittest.TestCase):
         self.assertEqual(kwargs["guidance_scale"], SamplingParams.guidance_scale)
         self.assertEqual(kwargs["negative_prompt"], SamplingParams.negative_prompt)
         self.assertTrue(kwargs["save_output"])
+
+    def test_cli_accepts_url_postprocess_model_paths(self):
+        """URL weights stay supported outside HTTP; only network entry points reject them."""
+        url = "https://example.com/weights.pth"
+        params = SamplingParams(
+            **self._parse_cli_kwargs(
+                ["--upscaling-model-path", url, "--frame-interpolation-model-path", url]
+            )
+        )
+        self.assertEqual(params.upscaling_model_path, url)
+        self.assertEqual(params.frame_interpolation_model_path, url)
 
     def test_get_cli_args_accepts_seed_list(self):
         self.assertEqual(self._parse_cli_kwargs(["--seed", "7"])["seed"], 7)

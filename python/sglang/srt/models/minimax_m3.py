@@ -17,12 +17,18 @@
 
 import logging
 from contextlib import nullcontext
+from functools import partial
 from typing import Iterable, List, Optional, Set, Tuple, Union
 
 import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.kernels.ops.activation.swiglu_mxfp8_swizzled import (
+    can_use_silu_mul_mxfp8,
+    swiglu_oai_mxfp8,
+    swiglu_oai_mxfp8_deepgemm,
+)
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_stages
 from sglang.srt.configs.model_config import (
     get_minimax_sparse_disable_value_layer_ids,
@@ -30,7 +36,6 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
-from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateAccumulator,
@@ -61,9 +66,14 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.moe.utils import (
     get_moe_a2a_backend,
-    is_shared_experts_fusion_disabled,
+    get_num_fused_shared_experts,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.mxfp8_input import (
+    Mxfp8SwizzledInput,
+    accepts_mxfp8_deepgemm_input,
+    accepts_mxfp8_swizzled_input,
+)
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer
@@ -90,7 +100,7 @@ from sglang.srt.model_loader.weight_utils import (
 from sglang.srt.models.deepseek_common.utils import tiny_router_gemm_max_tokens
 from sglang.srt.models.minimax_m2 import MiniMaxM2RMSNormTP
 from sglang.srt.models.utils import WeightsMapper
-from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
+from sglang.srt.runtime_context import get_exec, get_forward, get_parallel, get_stream
 from sglang.srt.utils import (
     add_prefix,
     get_device_sm,
@@ -286,6 +296,7 @@ class MiniMaxM3MLP(nn.Module):
         super().__init__()
         hidden_size = config.hidden_size
         hidden_act = config.hidden_act
+        self.fuse_swiglu_oai_mxfp8 = hidden_act == "swigluoai"
 
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
@@ -307,9 +318,11 @@ class MiniMaxM3MLP(nn.Module):
         if hidden_act == "silu":
             self.act_fn = SiluAndMul()
         elif hidden_act == "swigluoai":
+            self.swiglu_alpha = float(config.swiglu_alpha)
+            self.swiglu_limit = float(config.swiglu_limit)
             if _is_npu:
                 self.act_fn = lambda x: self._swigluoai_fused(
-                    x, config.swiglu_alpha, config.swiglu_limit
+                    x, self.swiglu_alpha, self.swiglu_limit
                 )
             else:
                 from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
@@ -317,12 +330,30 @@ class MiniMaxM3MLP(nn.Module):
                 )
 
                 self.act_fn = lambda x: swiglu_no_interleaved_with_alpha_and_limit(
-                    x, config.swiglu_alpha, config.swiglu_limit
+                    x, self.swiglu_alpha, self.swiglu_limit
                 )
         else:
             raise ValueError(
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
+
+    def _swiglu_oai_mxfp8(self, gate_up: torch.Tensor):
+        if not (
+            self.fuse_swiglu_oai_mxfp8
+            and gate_up.shape[0] > 0
+            and not get_forward().sp_active
+            and can_use_silu_mul_mxfp8(gate_up)
+        ):
+            return None
+        if accepts_mxfp8_swizzled_input(self.down_proj):
+            return Mxfp8SwizzledInput(
+                *swiglu_oai_mxfp8(gate_up, self.swiglu_alpha, self.swiglu_limit)
+            )
+        if accepts_mxfp8_deepgemm_input(self.down_proj):
+            return swiglu_oai_mxfp8_deepgemm(
+                gate_up, self.swiglu_alpha, self.swiglu_limit
+            )
+        return None
 
     def forward(
         self,
@@ -330,7 +361,9 @@ class MiniMaxM3MLP(nn.Module):
         forward_batch: Optional[ForwardBatch] = None,
     ):
         gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
+        x = self._swiglu_oai_mxfp8(gate_up)
+        if x is None:
+            x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
 
@@ -350,9 +383,7 @@ class MiniMaxM3MoE(nn.Module):
         self.tp_size = get_parallel().tp_size
         self.alt_stream = alt_stream
         self.n_shared_experts = getattr(config, "n_shared_experts", None)
-        self.num_fused_shared_experts = (
-            0 if is_shared_experts_fusion_disabled() else config.n_shared_experts
-        )
+        self.num_fused_shared_experts = get_num_fused_shared_experts()
 
         if self.tp_size > config.num_local_experts:
             raise ValueError(
@@ -390,15 +421,15 @@ class MiniMaxM3MoE(nn.Module):
             gate_up_interleaved=False,
         )
         self.topk = TopK(
-            top_k=config.num_experts_per_tok + self.num_fused_shared_experts,
+            top_k=config.num_experts_per_tok,
             renormalize=True,
             layer_id=layer_id,
             scoring_func=config.scoring_func,
             correction_bias=self.e_score_correction_bias,
-            num_fused_shared_experts=self.num_fused_shared_experts,
             routed_scaling_factor=self.routed_scaling_factor,
             apply_routed_scaling_factor_on_output=True,
         )
+        self.topk.bind_runner_backend(self.experts.runner_backend)
 
         if self.n_shared_experts is not None and self.num_fused_shared_experts == 0:
             intermediate_size = config.intermediate_size * self.n_shared_experts
@@ -503,10 +534,6 @@ class MiniMaxM3MoE(nn.Module):
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
-                num_token_non_padded=forward_batch.moe_num_token_non_padded(),
-                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                    layer_id=self.layer_id,
-                ),
             )
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)
@@ -1226,9 +1253,9 @@ class MiniMaxM3Attention(nn.Module):
                 positions, q, k, idx_q, idx_k
             )
             and getattr(forward_batch, "out_cache_loc", None) is not None
-            and v.dim() == 2
+            # V agreeing with K on rank and shape is the kernel's contract, which
+            # `sparse_qk_index_gemma_rmsnorm_rope_cache` asserts.
             and v.dtype == q.dtype
-            and v.shape == k.shape
         )
         if can_use_cache_fusion and kv_pool is not None:
             layer_id = self.attn.layer_id
@@ -1487,12 +1514,9 @@ class MiniMaxM3DecoderLayer(nn.Module):
             disable_index_value=disable_index_value,
         )
 
-        moe_layer_freq = getattr(config, "moe_layer_freq", None)
         # Means "MLP is a sparse MoE", not attention sparsity. Kept as ``is_layer_sparse``
         # because model construction and downstream integrations read this attr.
-        self.is_layer_sparse = (
-            moe_layer_freq[layer_id] != 0 if moe_layer_freq is not None else True
-        )
+        self.is_layer_sparse = self._is_layer_sparse(config, layer_id)
 
         if self.is_layer_sparse:
             self.mlp = MiniMaxM3MoE(
@@ -1527,25 +1551,39 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 config.hidden_size, eps=config.rms_norm_eps
             )
 
-        def _is_layer_sparse(lid):
-            if moe_layer_freq is None:
-                return True
-            if lid < 0 or lid >= config.num_hidden_layers:
-                return True
-            return moe_layer_freq[lid] != 0
-
-        is_next_layer_sparse = _is_layer_sparse(layer_id + 1)
-
+        attn, ffn = self.stage_facts(config, layer_id)
         self.attn_boundary, self.ffn_boundary = append_stages(
-            (declare_attn(), self.input_layernorm),
-            (
-                declare_ffn(
-                    sparse=self.is_layer_sparse,
-                    next_layer_sparse=is_next_layer_sparse,
-                ),
-                self.post_attention_layernorm,
+            (attn, self.input_layernorm),
+            (ffn, self.post_attention_layernorm),
+        )
+
+    @classmethod
+    def stage_facts(cls, config: PretrainedConfig, layer_id: int):
+        """The stages the layer at ``layer_id`` declares, in order: the model's
+        shared declaration function, which the layer declares with too (see
+        make_layers)."""
+        return (
+            declare_attn(),
+            declare_ffn(
+                sparse=cls._is_layer_sparse(config, layer_id),
+                next_layer_sparse=cls._is_next_layer_sparse(config, layer_id),
             ),
         )
+
+    @staticmethod
+    def _is_layer_sparse(config: PretrainedConfig, layer_id: int) -> bool:
+        moe_layer_freq = getattr(config, "moe_layer_freq", None)
+        return moe_layer_freq[layer_id] != 0 if moe_layer_freq is not None else True
+
+    @staticmethod
+    def _is_next_layer_sparse(config: PretrainedConfig, layer_id: int) -> bool:
+        moe_layer_freq = getattr(config, "moe_layer_freq", None)
+        lid = layer_id + 1
+        if moe_layer_freq is None:
+            return True
+        if lid < 0 or lid >= config.num_hidden_layers:
+            return True
+        return moe_layer_freq[lid] != 0
 
     def forward(
         self,
@@ -1620,6 +1658,7 @@ class MiniMaxM3Model(nn.Module):
             config.num_hidden_layers,
             layer_fn,
             prefix=add_prefix("layers", prefix),
+            stage_facts=partial(MiniMaxM3DecoderLayer.stage_facts, config),
         )
         if self.pp_group.is_last_rank:
             if self.use_gemma_norm:
@@ -1717,8 +1756,10 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
         self.quant_config = quant_config
         self.pp_group = get_parallel().pp_group
 
-        self.num_fused_shared_experts = 0
-        self.determine_num_fused_shared_experts()
+        # The weight loader reads this after the build.
+        self.num_fused_shared_experts = get_num_fused_shared_experts()
+        if self.num_fused_shared_experts:
+            log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
 
         self.model = MiniMaxM3Model(
             config, quant_config, prefix=add_prefix("model", prefix)
@@ -1765,15 +1806,13 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
             return "Shared experts fusion is not supported when Deepep MoE backend is enabled."
         return None
 
-    def determine_num_fused_shared_experts(self):
-        # The decision was installed by the loader; this only reads it.
-        if is_shared_experts_fusion_disabled():
-            return
-        self.num_fused_shared_experts = self.config.n_shared_experts
-        assert self.num_fused_shared_experts == 1, (
+    @classmethod
+    def num_fusable_shared_experts(cls, hf_config) -> int:
+        """Shared experts fused as routed slots when fusion is on."""
+        assert hf_config.n_shared_experts == 1, (
             "Only 1 fused shared expert is supported for MiniMax-M3"
         )
-        log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
+        return hf_config.n_shared_experts
 
     def set_eagle3_layers_to_capture(self, layer_ids: Optional[list[int]] = None):
         if not self.pp_group.is_last_rank:

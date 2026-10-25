@@ -34,6 +34,7 @@ def _make_backend():
     backend.prefill_split_tile_size = None
     backend.num_wrappers = 1
     backend.prefill_uses_dequant_workspace = True
+    backend.prefill_uses_native_fp4 = False
     backend.kv_cache_quant_method = SimpleNamespace(needs_global_scale=lambda: True)
     backend.req_to_token_pool = SimpleNamespace(
         req_to_token=torch.arange(64, dtype=torch.int32).view(2, 32)

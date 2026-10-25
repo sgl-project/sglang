@@ -17,7 +17,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.utils import get_device_core_count
+from sglang.srt.utils import get_device_core_count, is_sm120
 
 
 @triton.jit
@@ -231,8 +231,13 @@ def dequantize_nvfp4_kv_for_speculative_extend(
     if _cached_num_workers is None:
         _cached_num_workers = max(1, get_device_core_count())
 
+    num_workers = _cached_num_workers
+    if row_elements == 512 and is_sm120():
+        # Use multiple CTAs per SM to expose parallelism in the row loop.
+        num_workers *= 8
+
     block_elements = triton.next_power_of_2(row_elements)
-    _dequantize_nvfp4_kv_for_speculative_extend_kernel[(_cached_num_workers,)](
+    _dequantize_nvfp4_kv_for_speculative_extend_kernel[(num_workers,)](
         k_fp4,
         v_fp4,
         k_block_scales,

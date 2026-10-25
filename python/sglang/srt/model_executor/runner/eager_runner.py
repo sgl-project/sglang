@@ -46,15 +46,12 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.forward_context import (
     ForwardContext,
     forward_context,
+    get_forward_context,
     get_req_to_token_pool,
     get_token_to_kv_pool,
 )
 from sglang.srt.model_executor.runner.base_runner import BaseRunner
-from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
-    enable_tc_piecewise_cuda_graph,
-    set_tc_piecewise_forward_context,
-)
-from sglang.srt.model_executor.runner_utils import (
+from sglang.srt.model_executor.runner_utils.shared_read_event import (
     maybe_publish_prefill_shared_read_done,
 )
 from sglang.srt.runtime_context import (
@@ -213,20 +210,21 @@ class EagerRunner(BaseRunner):
     def execute(
         self, forward_batch: ForwardBatch, pp_proxy_tensors=None, **kwargs
     ) -> Any:
-        mode = forward_batch.forward_mode
-        if mode.is_mixed() and not is_npu() and get_cp_strategy() is None:
-            # A mixed batch is extend-shaped (decode tails are 1-token
-            # extends); run it as EXTEND. NPU keeps MIXED for its dedicated
-            # kernel; CP keeps it to skip the zigzag split.
-            forward_batch.forward_mode = ForwardMode.EXTEND
-            mode = ForwardMode.EXTEND
-        if mode.is_decode():
-            return self._execute_decode(forward_batch, pp_proxy_tensors)
-        if mode.is_idle():
-            return self._execute_idle(forward_batch, pp_proxy_tensors)
-        if mode.is_extend(include_draft_extend_v2=True):
-            return self._execute_extend(forward_batch, pp_proxy_tensors)
-        raise ValueError(f"Invalid forward mode for eager runner: {mode}")
+        with self.model_context():
+            mode = forward_batch.forward_mode
+            if mode.is_mixed() and not is_npu() and get_cp_strategy() is None:
+                # A mixed batch is extend-shaped (decode tails are 1-token
+                # extends); run it as EXTEND. NPU keeps MIXED for its dedicated
+                # kernel; CP keeps it to skip the zigzag split.
+                forward_batch.forward_mode = ForwardMode.EXTEND
+                mode = ForwardMode.EXTEND
+            if mode.is_decode():
+                return self._execute_decode(forward_batch, pp_proxy_tensors)
+            if mode.is_idle():
+                return self._execute_idle(forward_batch, pp_proxy_tensors)
+            if mode.is_extend(include_draft_extend_v2=True):
+                return self._execute_extend(forward_batch, pp_proxy_tensors)
+            raise ValueError(f"Invalid forward mode for eager runner: {mode}")
 
     def _resolve_decode_pdmux(
         self,
@@ -262,7 +260,11 @@ class EagerRunner(BaseRunner):
 
         ctx = device_timer_ctx(model_runner.device_timer, "decode")
 
-        with ctx, pdmux_ctx:
+        with (
+            ctx,
+            pdmux_ctx,
+            forward_context(get_forward_context(), forward_batch=forward_batch),
+        ):
             return model_runner.model.forward(
                 forward_batch.input_ids,
                 forward_batch.positions,
@@ -324,13 +326,15 @@ class EagerRunner(BaseRunner):
                 # e.g. Moss-VL's prefill cross-attention custom mask.
                 model_runner.model.prepare_forward_batch(forward_batch)
             model_runner.attn_backend.init_forward_metadata(forward_batch)
-            model_runner.attn_backend.prepare_prefill_shared_read_snapshot(
-                forward_batch,
-                num_qo_tokens=len(forward_batch.input_ids),
+            shared_read_ends = (
+                model_runner.attn_backend.resolve_prefill_shared_read_ends(
+                    forward_batch,
+                    num_qo_tokens=len(forward_batch.input_ids),
+                )
             )
             maybe_publish_prefill_shared_read_done(
                 model_runner,
-                forward_batch,
+                shared_read_ends,
                 torch.get_device_module(model_runner.device),
             )
 
@@ -342,35 +346,11 @@ class EagerRunner(BaseRunner):
             if forward_batch.forward_mode.is_target_verify()
             else "extend"
         )
-        with device_timer_ctx(model_runner.device_timer, category):
-            pcg_runner = model_runner.prefill_cuda_graph_runner
-            if (
-                _is_hip
-                and pcg_runner is not None
-                and not isinstance(pcg_runner, EagerRunner)
-                and not cp_active
-            ):
-                # HIP PCG eager fallback: enter the PCG context so Dynamo guards
-                # and PCG-specific MoE/attention paths stay consistent.
-                with (
-                    enable_tc_piecewise_cuda_graph(),
-                    set_tc_piecewise_forward_context(
-                        forward_batch,
-                        model_runner.attention_layers,
-                        getattr(model_runner.model, "quant_config", None),
-                        model_runner.moe_layers,
-                        model_runner.moe_fusions,
-                        dsa_indexers=model_runner.dsa_indexers,
-                        mha_companion_layers=model_runner.mha_companion_layers,
-                    ),
-                ):
-                    ret = model_runner.model.forward(
-                        forward_batch.input_ids,
-                        forward_batch.positions,
-                        forward_batch,
-                        **kwargs,
-                    )
-            elif cp_active and (
+        with (
+            device_timer_ctx(model_runner.device_timer, category),
+            forward_context(get_forward_context(), forward_batch=forward_batch),
+        ):
+            if cp_active and (
                 not get_parallel().enable_cp_tp_group_sharing
                 or getattr(model_runner.model, "prepare_cp_inputs", None) is not None
             ):
@@ -406,6 +386,7 @@ class EagerRunner(BaseRunner):
             model_kwargs = {}
             if (pp_proxy_tensors := kwargs.get("pp_proxy_tensors")) is not None:
                 model_kwargs["pp_proxy_tensors"] = pp_proxy_tensors
+
         with cp_shard_model_inputs(
             input_embeds,
             positions,
@@ -475,7 +456,10 @@ class EagerRunner(BaseRunner):
             model_runner.attn_backend.forward_metadata = None
 
         kwargs = model_runner._pp_kwargs(pp_proxy_tensors)
-        with device_timer_ctx(model_runner.device_timer, "idle"):
+        with (
+            device_timer_ctx(model_runner.device_timer, "idle"),
+            forward_context(get_forward_context(), forward_batch=forward_batch),
+        ):
             return model_runner.model.forward(
                 forward_batch.input_ids,
                 forward_batch.positions,

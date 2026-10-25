@@ -1,4 +1,5 @@
 use super::*;
+use crate::cache_action::UpdatePendingBackupOnNodeSplit;
 use crate::components::{ComponentSet, FULL};
 use crate::node::NodeAccessError;
 use crate::test_utils::accumulate_step;
@@ -496,13 +497,13 @@ fn host_reclaim_orders_pending_internal_split_fragments_by_ack() {
     // asynchronously under write_back; matching can split it before the ack.
     let (prefix_idx, action) = tc.split_node_(tc.arena.resolve(a).unwrap(), 2);
     let published_a = match action {
-        Some(CacheAction::ReplaceWriteThroughOnNodeSplit {
+        Some(UpdatePendingBackupOnNodeSplit {
             ack_id,
             old_node_id,
             new_node_id,
             new_child_node_id,
         }) => {
-            assert_eq!((ack_id, old_node_id, new_child_node_id), (a, a, a));
+            assert_eq!((ack_id, old_node_id, new_child_node_id), (Some(a), a, a));
             assert_eq!(new_node_id, tc.arena.node(prefix_idx).id);
             vec![new_node_id, new_child_node_id]
         }
@@ -865,11 +866,7 @@ fn lock_round_trips_on_a_root_anchor_are_noops() {
     assert_eq!(tc.arena.device_lock_ref(root, FULL), 1);
     tc.dec_lock_ref(
         tc.arena.node(root).id,
-        /* params = */
-        &DecLockRefParams {
-            skipped_lock_components: ComponentSet::EMPTY,
-            ..Default::default()
-        },
+        /* params = */ &result.to_dec_params(),
         /* skip_swa = */ false,
     )
     .expect("live test node");
@@ -904,6 +901,7 @@ fn lock_walks_stop_at_the_root_of_a_salted_chain() {
         tc.arena.node(n1).id,
         /* params = */
         &DecLockRefParams {
+            node_id: Some(tc.arena.node(n1).id),
             skipped_lock_components: ComponentSet::EMPTY,
             ..Default::default()
         },
@@ -946,6 +944,7 @@ fn lock_walks_treat_a_present_but_empty_value_as_device_on() {
         tc.arena.node(n1).id,
         /* params = */
         &DecLockRefParams {
+            node_id: Some(tc.arena.node(n1).id),
             skipped_lock_components: ComponentSet::EMPTY,
             ..Default::default()
         },
@@ -968,6 +967,7 @@ fn dec_lock_ref_unlocks_and_restores_sizes() {
         tc.arena.node(n2).id,
         /* params = */
         &DecLockRefParams {
+            node_id: Some(tc.arena.node(n2).id),
             skipped_lock_components: ComponentSet::EMPTY,
             ..Default::default()
         },
@@ -1022,6 +1022,7 @@ fn dec_lock_ref_replays_the_skip_set() {
         .inc_lock_ref(tc.arena.node(n3).id, ComponentSet::EMPTY)
         .expect("live test node");
     let params = DecLockRefParams {
+        node_id: Some(tc.arena.node(n3).id),
         skipped_lock_components: result.skipped_lock_components,
         ..Default::default()
     };
@@ -1093,6 +1094,7 @@ fn temp_lock_counts_the_evicted_anchor_and_mirrors_on_release() {
     assert_eq!(tc.arena.device_lock_ref(a, FULL), 2);
     // Each release takes back exactly its own refs.
     let temp_params = DecLockRefParams {
+        node_id: Some(tc.arena.node(anchor).id),
         skipped_lock_components: temp_lock.skipped_lock_components,
         ..Default::default()
     };
@@ -1106,6 +1108,7 @@ fn temp_lock_counts_the_evicted_anchor_and_mirrors_on_release() {
     assert_eq!(tc.arena.device_lock_ref(y, FULL), 1);
     assert_eq!(tc.arena.device_lock_ref(a, FULL), 1);
     let second_params = DecLockRefParams {
+        node_id: Some(tc.arena.node(anchor).id),
         skipped_lock_components: second_lock.skipped_lock_components,
         ..Default::default()
     };
@@ -1153,6 +1156,7 @@ fn dec_lock_ref_panics_on_double_release() {
         tc.arena.node(n2).id,
         /* params = */
         &DecLockRefParams {
+            node_id: Some(tc.arena.node(n2).id),
             skipped_lock_components: ComponentSet::EMPTY,
             ..Default::default()
         },
@@ -1163,6 +1167,7 @@ fn dec_lock_ref_panics_on_double_release() {
         tc.arena.node(n2).id,
         /* params = */
         &DecLockRefParams {
+            node_id: Some(tc.arena.node(n2).id),
             skipped_lock_components: ComponentSet::EMPTY,
             ..Default::default()
         },
@@ -1181,6 +1186,7 @@ fn dec_lock_ref_with_skip_swa_still_releases_full() {
         tc.arena.node(n2).id,
         /* params = */
         &DecLockRefParams {
+            node_id: Some(tc.arena.node(n2).id),
             skipped_lock_components: ComponentSet::EMPTY,
             ..Default::default()
         },
@@ -1203,6 +1209,7 @@ fn nested_locks_release_pairwise() {
         tc.arena.node(n2).id,
         /* params = */
         &DecLockRefParams {
+            node_id: Some(tc.arena.node(n2).id),
             skipped_lock_components: ComponentSet::EMPTY,
             ..Default::default()
         },
@@ -1217,6 +1224,7 @@ fn nested_locks_release_pairwise() {
         tc.arena.node(n2).id,
         /* params = */
         &DecLockRefParams {
+            node_id: Some(tc.arena.node(n2).id),
             skipped_lock_components: ComponentSet::EMPTY,
             ..Default::default()
         },
@@ -1238,6 +1246,7 @@ fn dec_lock_ref_panics_on_an_unlocked_node() {
         tc.arena.node(n2).id,
         /* params = */
         &DecLockRefParams {
+            node_id: Some(tc.arena.node(n2).id),
             skipped_lock_components: ComponentSet::EMPTY,
             ..Default::default()
         },
@@ -1310,6 +1319,7 @@ fn dec_lock_ref_panics_on_protected_underflow() {
         tc.arena.node(n2).id,
         /* params = */
         &DecLockRefParams {
+            node_id: Some(tc.arena.node(n2).id),
             skipped_lock_components: ComponentSet::EMPTY,
             ..Default::default()
         },
@@ -1486,8 +1496,14 @@ fn dec_host_lock_ref_unpins_and_restores_the_h_leaf_set() {
 fn dec_host_lock_ref_on_an_unlocked_anchor_is_a_noop() {
     let mut tc = core();
     let node = host_lock_anchor(&mut tc);
-    tc.dec_host_lock_ref(tc.arena.node(node).id, &DecLockRefParams::default())
-        .expect("live test node");
+    tc.dec_host_lock_ref(
+        tc.arena.node(node).id,
+        &DecLockRefParams {
+            node_id: Some(tc.arena.node(node).id),
+            ..Default::default()
+        },
+    )
+    .expect("live test node");
     assert_eq!(tc.arena.host_lock_ref(node, FULL), 0);
 }
 
@@ -2484,6 +2500,7 @@ fn evict_device_pushes_value_and_decrements_size() {
         node,
         &mut device_frees,
         &mut host_frees,
+        &mut Vec::new(),
         EvictLayer::Device,
     );
     assert_eq!(freed, 3);
@@ -2517,6 +2534,7 @@ fn evict_device_on_valueless_node_is_noop() {
         node,
         &mut device_frees,
         &mut host_frees,
+        &mut Vec::new(),
         EvictLayer::Device,
     );
     assert_eq!(freed, 0);
@@ -2552,6 +2570,7 @@ fn evict_device_pushes_a_present_but_empty_value() {
         node,
         &mut device_frees,
         &mut host_frees,
+        &mut Vec::new(),
         EvictLayer::Device,
     );
     assert_eq!(freed, 0);
@@ -2583,6 +2602,7 @@ fn evict_host_pushes_host_value_and_tombstones() {
         node,
         &mut device_frees,
         &mut host_frees,
+        &mut Vec::new(),
         EvictLayer::Host,
     );
     assert_eq!(freed, 0);
@@ -2618,6 +2638,7 @@ fn evict_host_on_node_without_host_value_is_noop() {
         node,
         &mut device_frees,
         &mut host_frees,
+        &mut Vec::new(),
         EvictLayer::Host,
     );
     assert_eq!(freed, 0);
@@ -2652,6 +2673,7 @@ fn evict_host_pushes_a_present_but_empty_host_value() {
         node,
         &mut device_frees,
         &mut host_frees,
+        &mut Vec::new(),
         EvictLayer::Host,
     );
     assert_eq!(host_freed, 0);
@@ -2692,6 +2714,7 @@ fn evict_host_accumulates_into_shared_host_frees() {
         a,
         &mut device_frees,
         &mut host_frees,
+        &mut Vec::new(),
         EvictLayer::Host,
     );
     let freed_b = FullComponent.evict_component(
@@ -2699,6 +2722,7 @@ fn evict_host_accumulates_into_shared_host_frees() {
         b,
         &mut device_frees,
         &mut host_frees,
+        &mut Vec::new(),
         EvictLayer::Host,
     );
     assert_eq!(freed_a, (0, 2));
@@ -2734,6 +2758,7 @@ fn evict_device_leaves_host_value_untouched() {
         node,
         &mut device_frees,
         &mut host_frees,
+        &mut Vec::new(),
         EvictLayer::Device,
     );
     assert_eq!(freed, 1);
@@ -2768,6 +2793,7 @@ fn evict_all_frees_both_layers() {
         node,
         &mut device_frees,
         &mut host_frees,
+        &mut Vec::new(),
         EvictLayer::All,
     );
     assert_eq!(freed, 3);
@@ -2815,6 +2841,7 @@ fn evict_device_accumulates_into_shared_device_frees() {
         a,
         &mut device_frees,
         &mut host_frees,
+        &mut Vec::new(),
         EvictLayer::Device,
     );
     FullComponent.evict_component(
@@ -2822,6 +2849,7 @@ fn evict_device_accumulates_into_shared_device_frees() {
         b,
         &mut device_frees,
         &mut host_frees,
+        &mut Vec::new(),
         EvictLayer::Device,
     );
     let pushed = &device_frees[&FULL];
@@ -2854,6 +2882,7 @@ fn evict_device_pushed_entry_aliases_the_node_value() {
         node,
         &mut device_frees,
         &mut host_frees,
+        &mut Vec::new(),
         EvictLayer::Device,
     );
     // The pushed entry shares storage with the node's value (Python appends cd.value).
@@ -2876,6 +2905,7 @@ fn evict_panics_on_missing_node() {
         NodeIdx_(999),
         &mut device_frees,
         &mut host_frees,
+        &mut Vec::new(),
         EvictLayer::Device,
     );
 }
@@ -2904,6 +2934,7 @@ fn evict_panics_when_size_would_underflow() {
         node,
         &mut device_frees,
         &mut host_frees,
+        &mut Vec::new(),
         EvictLayer::Device,
     );
 }
