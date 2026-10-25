@@ -225,11 +225,15 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
     def pending_member_rows(self, batch: ScheduleBatch) -> int:
         """Rows admitted-but-not-yet-spawned groups will claim; the admission
         gate subtracts this so it never over-commits the req slot pool."""
+        return self.pending_member_rows_of(batch.reqs)
+
+    def pending_member_rows_of(self, reqs: Sequence[Req]) -> int:
+        """pending_member_rows over a request list, e.g. the prefill being built."""
         if self._num_live_groups == 0:
             return 0
         return sum(
             r.beam_group.beam_width - 1
-            for r in batch.reqs
+            for r in reqs
             if r.beam_group is not None
             and r.beam_group.member_rows is None
             and not r.beam_group.retired
