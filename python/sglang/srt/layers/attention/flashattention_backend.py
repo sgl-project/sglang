@@ -1786,6 +1786,18 @@ class FlashAttentionBackend(AttentionBackend):
                     **kwargs,
                 )
             else:
+                # MTP target-verify is decode-shaped (a few query tokens per request over the
+                # whole context). On runtimes that only plan SplitKV for decode, give it the
+                # decode policy and static bound, or full-attention layers run one CTA per
+                # request and verify cost grows linearly with context.
+                verify_split_kv = (
+                    self._decode_uses_static_max_seqlen_k
+                    and forward_batch.forward_mode.is_target_verify()
+                    and not is_swa_layer
+                    and not use_cascade_attn
+                )
+                if verify_split_kv:
+                    kwargs["max_seqlen_k"] = self.max_context_len
                 result = flash_attn_with_kvcache(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     k_cache=key_cache,
@@ -1800,7 +1812,9 @@ class FlashAttentionBackend(AttentionBackend):
                     window_size=window_size,
                     softcap=layer.logit_cap,
                     return_softmax_lse=use_cascade_attn or return_lse,
-                    num_splits=self.num_splits,
+                    num_splits=(
+                        self.decode_num_splits if verify_split_kv else self.num_splits
+                    ),
                     out=_fa_out,
                     ver=self.fa_impl_ver,
                     **kwargs,
