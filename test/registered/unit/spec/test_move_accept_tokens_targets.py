@@ -58,6 +58,7 @@ class TestMoveAcceptTokensTargets(CustomTestCase):
             accept_index,
             num_accepted - 1,
             SimpleNamespace(get_kvcache=lambda: kv_cache),
+            state_captures=(),
         )
         self.assertTrue(torch.equal(kv_cache.tgt_loc.cpu(), expected_tgt))
         self.assertTrue(torch.equal(kv_cache.src_loc.cpu(), expected_src))
