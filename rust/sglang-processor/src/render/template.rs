@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 use dynamo_protocols::types::{ChatCompletionRequestMessage, CreateChatCompletionRequest};
 use dynamo_renderer::RenderedPrompt;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use super::models::{normalize_json_schema_types, pydantic_bool};
 use super::{
@@ -105,15 +105,31 @@ fn tool_model_dump(tool: &Value) -> Value {
     let f = &tool["function"];
     let mut parameters = f["parameters"].clone();
     normalize_json_schema_types(&mut parameters);
-    let mut function = json!({
-        "description": f["description"],
-        "name": f["name"],
-        "parameters": parameters,
-        "strict": flag(&f["strict"]).unwrap_or(false),
-    });
-    // `Tool._propagate_defer_loading`; `Function` drops an unset flag.
-    if let Some(defer) = flag(&f["defer_loading"]).or_else(|| flag(&tool["defer_loading"])) {
-        function["defer_loading"] = defer.into();
+    // `Function`'s fields as declared; `Tool._propagate_defer_loading` fills its
+    // flag, and `Function._serialize` drops an unset `strict` or `defer_loading`.
+    let declared = [
+        ("description", Some(f["description"].clone())),
+        ("name", Some(f["name"].clone())),
+        ("parameters", Some(parameters)),
+        ("strict", flag(&f["strict"]).map(Value::from)),
+        (
+            "defer_loading",
+            flag(&f["defer_loading"])
+                .or_else(|| flag(&tool["defer_loading"]))
+                .map(Value::from),
+        ),
+    ];
+    // `Function._serialize`: the keys in the order the client sent them, then
+    // the rest as declared.
+    let sent = f
+        .as_object()
+        .into_iter()
+        .flat_map(|f| f.keys().map(String::as_str));
+    let mut function = Map::new();
+    for key in sent.chain(declared.iter().map(|(key, _)| *key)) {
+        if let Some((_, Some(value))) = declared.iter().find(|(name, _)| *name == key) {
+            function.entry(key).or_insert_with(|| value.clone());
+        }
     }
     let kind = tool
         .get("type")
@@ -208,7 +224,13 @@ mod tests {
         let formatter = jinja("{{ tools | tojson }}");
         let tool = json!({"type": "function", "function": {"name": "f", "parameters": {}}});
         let body = json!({"messages": [{"role": "user", "content": "Hi"}], "tools": [tool]});
-        let dumped = r#"[{"type": "function", "function": {"description": null, "name": "f", "parameters": {}, "strict": false}, "defer_loading": null}]"#;
+        let dumped = r#"[{"type": "function", "function": {"name": "f", "parameters": {}, "description": null}, "defer_loading": null}]"#;
+        assert_eq!(render(&formatter, body, &HashMap::new()).0, dumped);
+        // A set `strict` stays where the client put it; a tool-level flag propagates.
+        let tool = json!({"type": "function", "defer_loading": true,
+            "function": {"strict": true, "name": "f", "description": "d"}});
+        let body = json!({"messages": [{"role": "user", "content": "Hi"}], "tools": [tool]});
+        let dumped = r#"[{"type": "function", "function": {"strict": true, "name": "f", "description": "d", "parameters": null, "defer_loading": true}, "defer_loading": true}]"#;
         assert_eq!(render(&formatter, body, &HashMap::new()).0, dumped);
     }
 
