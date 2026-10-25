@@ -14,7 +14,6 @@ from sglang.srt.layers.hc_mix_flydsl import (
 )
 
 
-
 @lru_cache(None)
 def _hc_gate_stream(device: int) -> torch.cuda.Stream:
     return torch.cuda.Stream(device=device)
@@ -189,10 +188,8 @@ class GatedResidual(HyperConnectionBase):
                 and (self.hc_count * self.hidden_size) % 2048 == 0
             )
             vecs = self.hc_count * self.hidden_size // 8
-            # Off on ROCm/HIP: on gfx950 Qwen decode both halves of the split pair
-            # sit at the ~4.2us launch floor, slower than the single fused kernel.
             self._split_combine_ok = (
-                and self._jit_combine_ok
+                self._jit_combine_ok
                 and vecs % (8 * 160) == 0
                 and (self.hidden_size // 8) % (vecs // 8) == 0
             )
