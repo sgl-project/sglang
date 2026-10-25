@@ -44,7 +44,7 @@ if _HAS_MLX:
     from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner
-    from sglang.srt.model_executor.runner.eager_runner import EagerRunner, BaseRunner
+    from sglang.srt.model_executor.runner.eager_runner import BaseRunner, EagerRunner
 
 
 @unittest.skipUnless(_HAS_MLX, _SKIP_REASON)
