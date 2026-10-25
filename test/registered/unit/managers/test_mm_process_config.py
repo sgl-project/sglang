@@ -314,13 +314,14 @@ class TestMultimodalFeatureTransportRuntime(CustomTestCase):
     def test_cuda_ipc_pool_uses_resolved_server_arg(self):
         # Transport policy resolves from the mm bag, so the test publishes it.
         from sglang.srt.multimodal.processors import base_processor
+        from sglang.srt.multimodal.transport import feature_transport
 
         with (
             envs.SGLANG_USE_IPC_POOL_HANDLE_CACHE.override(True),
             patch.object(
                 base_processor.BaseMultimodalProcessor, "__abstractmethods__", set()
             ),
-            patch.object(base_processor, "MmItemMemoryPool") as memory_pool,
+            patch.object(feature_transport, "MmItemMemoryPool") as memory_pool,
         ):
             processor = base_processor.BaseMultimodalProcessor(
                 hf_config=MagicMock(),
@@ -336,13 +337,14 @@ class TestMultimodalFeatureTransportRuntime(CustomTestCase):
 
     def test_cuda_ipc_pool_handle_cache_can_be_disabled(self):
         from sglang.srt.multimodal.processors import base_processor
+        from sglang.srt.multimodal.transport import feature_transport
 
         with (
             envs.SGLANG_USE_IPC_POOL_HANDLE_CACHE.override(False),
             patch.object(
                 base_processor.BaseMultimodalProcessor, "__abstractmethods__", set()
             ),
-            patch.object(base_processor, "MmItemMemoryPool") as memory_pool,
+            patch.object(feature_transport, "MmItemMemoryPool") as memory_pool,
         ):
             processor = base_processor.BaseMultimodalProcessor(
                 hf_config=MagicMock(),
@@ -357,13 +359,14 @@ class TestMultimodalFeatureTransportRuntime(CustomTestCase):
 
     def test_cpu_transport_does_not_allocate_ipc_pool(self):
         from sglang.srt.multimodal.processors import base_processor
+        from sglang.srt.multimodal.transport import feature_transport
 
         with (
             envs.SGLANG_USE_IPC_POOL_HANDLE_CACHE.override(True),
             patch.object(
                 base_processor.BaseMultimodalProcessor, "__abstractmethods__", set()
             ),
-            patch.object(base_processor, "MmItemMemoryPool") as memory_pool,
+            patch.object(feature_transport, "MmItemMemoryPool") as memory_pool,
         ):
             processor = base_processor.BaseMultimodalProcessor(
                 hf_config=MagicMock(),
@@ -379,6 +382,7 @@ class TestMultimodalFeatureTransportRuntime(CustomTestCase):
 
     def test_cuda_vmm_keeps_features_on_device_without_ipc_pool(self):
         from sglang.srt.multimodal.processors import base_processor
+        from sglang.srt.multimodal.transport import feature_transport
 
         hf_processor = self._processor()
         feature = torch.empty(1, device="meta")
@@ -387,7 +391,7 @@ class TestMultimodalFeatureTransportRuntime(CustomTestCase):
             patch.object(
                 base_processor.BaseMultimodalProcessor, "__abstractmethods__", set()
             ),
-            patch.object(base_processor, "MmItemMemoryPool") as memory_pool,
+            patch.object(feature_transport, "MmItemMemoryPool") as memory_pool,
         ):
             processor = base_processor.BaseMultimodalProcessor(
                 hf_config=MagicMock(),

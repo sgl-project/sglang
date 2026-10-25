@@ -49,7 +49,8 @@ from sglang.srt.multimodal.transport.cuda_ipc import (
     CudaIpcTensorTransportProxy,
 )
 from sglang.srt.multimodal.transport.feature_transport import (
-    _create_cuda_ipc_pool,
+    MultimodalFeatureTransport,
+    keeps_mm_features_on_device,
     move_feature_to_cpu,
 )
 from sglang.srt.runtime_context import (
@@ -244,16 +245,18 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
     ):
         self.server_args = server_args
         self.transport_mode = transport_mode
-        configured_mm_feature_transport = get_mm().mm_feature_transport
-        self.mm_feature_transport = (
-            configured_mm_feature_transport
-            if configured_mm_feature_transport in ("cpu", "cuda_ipc", "cuda_vmm")
-            else "cpu"
+        self._feature_transport = MultimodalFeatureTransport(
+            get_mm().mm_feature_transport,
+            base_gpu_id=server_args.base_gpu_id,
+            skip_mm_pool=kwargs.get("skip_mm_pool", False),
         )
-        self.use_cuda_ipc = self.mm_feature_transport == "cuda_ipc"
+        # Model processors read these; PositionalEmbedsTransport reuses the pool.
+        self.mm_feature_transport = self._feature_transport.mm_feature_transport
+        self.use_cuda_ipc = self._feature_transport.use_cuda_ipc
         self.use_ipc_pool_handle_cache = (
-            self.use_cuda_ipc and envs.SGLANG_USE_IPC_POOL_HANDLE_CACHE.get()
+            self._feature_transport.use_ipc_pool_handle_cache
         )
+        self.cudaipc_mmfeature_pool = self._feature_transport.cudaipc_mmfeature_pool
         self.skip_tokenizer_init = get_serving().skip_tokenizer_init
 
         processor_config = MultimodalProcessorConfig(
@@ -351,15 +354,10 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
             # "precomputed_embeddings" - handled specially as it can be any modality
         }
 
-        if self.use_cuda_ipc and not kwargs.get("skip_mm_pool", False):
-            base_gpu_id = self.server_args.base_gpu_id
-            cudaipc_mmfeature_pool = _create_cuda_ipc_pool(base_gpu_id)
-            self.cudaipc_mmfeature_pool = cudaipc_mmfeature_pool
-
     @property
     def keep_mm_features_on_device(self) -> bool:
         """Whether feature transport expects processor outputs to stay on GPU."""
-        return self.mm_feature_transport in ("cuda_ipc", "cuda_vmm")
+        return keeps_mm_features_on_device(self.mm_feature_transport)
 
     def preprocess_fingerprint_payload(self) -> dict[str, Any]:
         """Return every stable setting that can change a media artifact.
