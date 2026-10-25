@@ -45,9 +45,6 @@ from sglang.srt.multimodal.serving_preprocessing import (
     preprocessing_competes_with_the_scheduler,
     resolve_hf_image_token_counts,
 )
-from sglang.srt.multimodal.transport.cuda_ipc import (
-    CudaIpcTensorTransportProxy,
-)
 from sglang.srt.multimodal.transport.feature_transport import (
     MultimodalFeatureTransport,
     keeps_mm_features_on_device,
@@ -1321,20 +1318,6 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
         return torch.tensor(input_ids, dtype=torch.long).flatten()
 
     @staticmethod
-    def _wrap_tensor_for_cuda_ipc(
-        self: MultimodalFeatureTransport, tensor: torch.Tensor
-    ):
-        """helper function to turn a tensor into a cuda-ipc tensor"""
-        if not tensor.is_cuda:
-            return tensor
-
-        proxy = self.cudaipc_mmfeature_pool.wrap_tensor(
-            tensor,
-            use_pool_handle_cache=self.use_ipc_pool_handle_cache,
-        )
-        return proxy if proxy is not None else tensor.cpu()
-
-    @staticmethod
     def _move_feature_to_cpu(value):
         return move_feature_to_cpu(value)
 
@@ -1343,22 +1326,7 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
     ) -> None:
         if not self.precompute_hash_before_cpu_transfer:
             return
-        BaseMultimodalProcessor.precompute_hashes_before_cpu_transfer(
-            self._feature_transport, mm_items
-        )
-
-    @staticmethod
-    def precompute_hashes_before_cpu_transfer(
-        self: MultimodalFeatureTransport, mm_items: List[MultimodalDataItem]
-    ) -> None:
-        """Hash features in place, then move them to the CPU unless kept on GPU."""
-        for item in mm_items:
-            item.set_pad_value()
-            if not self.keep_mm_features_on_device:
-                item.feature = move_feature_to_cpu(item.feature)
-                item.precomputed_embeddings = move_feature_to_cpu(
-                    item.precomputed_embeddings
-                )
+        self._feature_transport.precompute_hashes_before_cpu_transfer(mm_items)
 
     def resolve_image_token_counts(self, images: List) -> List[int]:
         """Per-image expanded token counts, computed without re-tokenizing.
@@ -1607,52 +1575,7 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
     def _prepare_mm_items_for_transport(
         self, mm_items: List[MultimodalDataItem]
     ) -> List[MultimodalDataItem]:
-        return BaseMultimodalProcessor.prepare_mm_items_for_transport(
-            self._feature_transport, mm_items
-        )
-
-    @staticmethod
-    def prepare_mm_items_for_transport(
-        self: MultimodalFeatureTransport, mm_items: List[MultimodalDataItem]
-    ) -> List[MultimodalDataItem]:
-        """Wrap final GPU features, rolling back every lease if one wrap fails."""
-        if not self.use_cuda_ipc:
-            return mm_items
-
-        # Pool misses fall back to plain CPU tensors. The scheduler copies out
-        # and releases each successful pool slice.
-        updates = []
-        try:
-            for item in mm_items:
-                fields = (
-                    ("feature", item.feature),
-                    ("precomputed_embeddings", item.precomputed_embeddings),
-                )
-                for field, tensor in fields:
-                    if not isinstance(tensor, torch.Tensor):
-                        continue
-                    wrapped = BaseMultimodalProcessor._wrap_tensor_for_cuda_ipc(
-                        self, tensor
-                    )
-                    setattr(item, field, wrapped)
-                    updates.append((item, field, tensor, wrapped))
-        except BaseException as error:
-            rollback_errors = []
-            for item, field, tensor, wrapped in reversed(updates):
-                try:
-                    if isinstance(wrapped, CudaIpcTensorTransportProxy):
-                        self.cudaipc_mmfeature_pool.cancel_proxy(wrapped)
-                except BaseException as rollback_error:
-                    rollback_errors.append(rollback_error)
-                finally:
-                    setattr(item, field, tensor)
-            if rollback_errors:
-                error.add_note(
-                    f"{len(rollback_errors)} CUDA IPC rollback operation(s) also failed"
-                )
-                raise error from rollback_errors[0]
-            raise
-        return mm_items
+        return self._feature_transport.prepare_mm_items_for_transport(mm_items)
 
     async def process_and_combine_mm_data_async(
         self,
