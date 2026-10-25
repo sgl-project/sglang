@@ -66,7 +66,11 @@ _REPLICA: GroupCoordinator | None = None
 # Corresponding TP lanes across the replicated encoder copies in one pipeline
 # replica. None means the encoder has only one TP copy, so batch DP cannot run.
 _ENCODER_DP: GroupCoordinator | None = None
+_SRT_MOE_EP = None
 _VAE_DECODE: GroupCoordinator | None = None
+# the CFG ranks as one Ulysses group for stages that run without CFG; a view
+# over _CFG's communicators, built only when cfg > 1 and sp == 1
+_CFG_SP: SequenceParallelGroupCoordinator | None = None
 _DIT: ProcessGroup | None = None
 _VAE: ProcessGroup | None = None
 _VAE_DECODE_PARALLEL_AXES = "tp-sp-pp-cfg"
@@ -112,6 +116,28 @@ def _clear_srt_world_group() -> None:
         srt_parallel_state._WORLD = None
 
 
+def _init_srt_moe_ep_group():
+    """SRT's MOE EP group for FusedMoE layers.
+
+    multimodal_gen has no expert parallelism: every rank keeps all experts
+    and TP shards the weights inside each expert (``_MOE_TP = _TP``). The EP
+    group must therefore be single-rank (``moe_ep_size=1``); aliasing
+    ``_MOE_EP`` to ``_TP`` would partition experts across ranks and break
+    FusedMoE dispatch.
+    """
+    import sglang.srt.distributed.parallel_state as srt_parallel_state
+
+    world_size = torch.distributed.get_world_size()
+    return srt_parallel_state.init_model_parallel_group(
+        group_ranks=[[r] for r in range(world_size)],
+        local_rank=get_world_group().local_rank,
+        backend=torch.distributed.get_backend(get_world_group().device_group),
+        use_pynccl=False,
+        use_custom_allreduce=False,
+        group_name="moe_ep",
+    )
+
+
 def _sync_srt_tp_group() -> None:
     """Expose this package's TP group, widths, and ranks to shared SRT layers.
 
@@ -119,6 +145,7 @@ def _sync_srt_tp_group() -> None:
     the TP size in the dummy SRT configuration. Other parallel dimensions are
     one. Overrides also work before SRT configuration is published.
     """
+    global _SRT_MOE_EP
     import sglang.srt.distributed.parallel_state as srt_parallel_state
     from sglang.srt.runtime_context import derive_parallel_widths, get_parallel
 
@@ -126,6 +153,16 @@ def _sync_srt_tp_group() -> None:
         srt_parallel_state._TP = _TP
     if srt_parallel_state._ATTN_TP is None:
         srt_parallel_state._ATTN_TP = _TP
+    if srt_parallel_state._TP is _TP and srt_parallel_state._MOE_TP is None:
+        srt_parallel_state._MOE_TP = _TP
+    if (
+        _TP is not None
+        and srt_parallel_state._TP is _TP
+        and srt_parallel_state._MOE_TP is _TP
+        and srt_parallel_state._MOE_EP is None
+    ):
+        _SRT_MOE_EP = _init_srt_moe_ep_group()
+        srt_parallel_state._MOE_EP = _SRT_MOE_EP
     if srt_parallel_state._ATTN_TP is _TP:
         get_parallel().override_permanently(
             tp_group=_TP,
@@ -150,6 +187,7 @@ def _sync_srt_tp_group() -> None:
 
 
 def _clear_srt_tp_group() -> None:
+    global _SRT_MOE_EP
     import sglang.srt.distributed.parallel_state as srt_parallel_state
     from sglang.srt.runtime_context import get_parallel
 
@@ -161,6 +199,13 @@ def _clear_srt_tp_group() -> None:
             get_parallel().override_permanently(world_group=srt_parallel_state._WORLD)
     if srt_parallel_state._TP is _TP:
         srt_parallel_state._TP = None
+    if srt_parallel_state._MOE_TP is _TP:
+        srt_parallel_state._MOE_TP = None
+    if _SRT_MOE_EP is not None:
+        _SRT_MOE_EP.destroy()
+        if srt_parallel_state._MOE_EP is _SRT_MOE_EP:
+            srt_parallel_state._MOE_EP = None
+        _SRT_MOE_EP = None
 
 
 def init_parallel_group_coordinator(
@@ -490,6 +535,11 @@ def initialize_model_parallel(
         ring_group=PROCESS_GROUP.RING_PG,
     )
 
+    global _CFG_SP
+    assert _CFG_SP is None, "CFG sequence parallel group is already initialized"
+    if classifier_free_guidance_degree > 1 and sequence_parallel_degree == 1:
+        _CFG_SP = SequenceParallelGroupCoordinator.over_group(_CFG, _SP.ring_group)
+
     global _TP
     assert _TP is None, "Tensor parallel group is already initialized"
     _TP = init_parallel_group_coordinator(
@@ -570,6 +620,26 @@ def initialize_model_parallel(
     if vae_parallel_size > 0:
         init_vae_group(dit_parallel_size, vae_parallel_size, backend)
     init_dit_group(dit_parallel_size, backend)
+
+
+def get_cfg_sequence_parallel_group() -> SequenceParallelGroupCoordinator | None:
+    return _CFG_SP
+
+
+@contextmanager
+def use_sequence_parallel_group(sp_group: SequenceParallelGroupCoordinator):
+    """Route every SP accessor in the scope to ``sp_group``.
+
+    Latent shards, RoPE offsets and the Ulysses all-to-alls all read the group
+    through these accessors, so a stage runs entirely on one topology.
+    """
+    global _SP
+    old_sp_group = _SP
+    _SP = sp_group
+    try:
+        yield
+    finally:
+        _SP = old_sp_group
 
 
 def get_sp_world_size() -> int:
@@ -767,11 +837,6 @@ def get_sequence_parallel_world_size() -> int:
     return get_sp_world_size()
 
 
-def get_sequence_parallel_rank() -> int:
-    """Return my rank for the sequence parallel group."""
-    return get_sp_parallel_rank()
-
-
 def get_ulysses_parallel_world_size() -> int:
     return get_sp_group().ulysses_world_size
 
@@ -803,32 +868,6 @@ def get_ring_ctx() -> tuple[int, int]:
     return get_ring_parallel_world_size(), get_ring_parallel_rank()
 
 
-# PP
-def get_pp_group() -> GroupCoordinator:
-    assert _PP is not None, "pipeline model parallel group is not initialized"
-    return _PP
-
-
-def get_pipeline_parallel_world_size() -> int:
-    """Return world size for the pipeline model parallel group."""
-    return get_pp_group().world_size
-
-
-def get_pipeline_parallel_rank() -> int:
-    """Return my rank for the pipeline model parallel group."""
-    return get_pp_group().rank_in_group
-
-
-def is_pipeline_first_stage() -> bool:
-    """Return True if in the first pipeline model parallel stage, False otherwise."""
-    return get_pipeline_parallel_rank() == 0
-
-
-def is_pipeline_last_stage() -> bool:
-    """Return True if in the last pipeline model parallel stage, False otherwise."""
-    return get_pipeline_parallel_rank() == (get_pipeline_parallel_world_size() - 1)
-
-
 # CFG
 def get_cfg_group() -> GroupCoordinator:
     assert _CFG is not None, (
@@ -850,47 +889,6 @@ def get_classifier_free_guidance_rank() -> int:
 def get_data_parallel_world_size() -> int:
     """Return world size for the data parallel group."""
     return get_dp_world_size()
-
-
-def get_data_parallel_rank() -> int:
-    """Return my rank for the data parallel group."""
-    return get_dp_rank()
-
-
-def is_dp_last_group() -> bool:
-    """Return True if in the last data parallel group, False otherwise."""
-    return (
-        get_sequence_parallel_rank() == (get_sequence_parallel_world_size() - 1)
-        and get_classifier_free_guidance_rank()
-        == (get_classifier_free_guidance_world_size() - 1)
-        and get_pipeline_parallel_rank() == (get_pipeline_parallel_world_size() - 1)
-    )
-
-
-def get_dit_world_size() -> int:
-    """Return world size for the DiT model (excluding VAE)."""
-    return (
-        get_data_parallel_world_size()
-        * get_classifier_free_guidance_world_size()
-        * get_sequence_parallel_world_size()
-        * get_pipeline_parallel_world_size()
-        * get_tensor_model_parallel_world_size()
-    )
-
-
-def get_vae_parallel_group() -> ProcessGroup:
-    assert _VAE is not None, "VAE parallel group is not initialized"
-    return _VAE
-
-
-def get_vae_parallel_world_size() -> int:
-    """Return world size for the VAE parallel group."""
-    return torch.distributed.get_world_size(group=get_vae_parallel_group())
-
-
-def get_vae_parallel_rank() -> int:
-    """Return my rank for the VAE parallel group."""
-    return torch.distributed.get_rank(group=get_vae_parallel_group())
 
 
 def get_decode_parallel_group_coordinator() -> GroupCoordinator:
@@ -935,14 +933,17 @@ def init_vae_group(
 def destroy_model_parallel() -> None:
     """Set the groups to none and destroy them."""
     global _TP, _SP, _DP, _CFG, _PP, _VAE_DECODE, _DIT, _VAE, _REPLICA, _ENCODER_DP
+    global _CFG_SP
 
     _clear_srt_tp_group()
     # The IPC transport keeps CUDA mappings associated with the current
     # Ulysses group. Drop them before tearing down the process groups.
     from .device_communicators.ipc_a2a import IPC_A2A
+    from .device_communicators.ipc_a2a_multi import IPC_A2A_MULTI
     from .parallel_groups import PROCESS_GROUP
 
     IPC_A2A.reset()
+    IPC_A2A_MULTI.reset()
 
     destroyed_groups = []
     for group in (
@@ -987,3 +988,5 @@ def destroy_model_parallel() -> None:
     _TP, _SP, _DP, _CFG, _PP, _VAE_DECODE, _DIT, _VAE, _REPLICA, _ENCODER_DP = (
         None,
     ) * 10
+    # a view over _CFG's communicators, released with it
+    _CFG_SP = None

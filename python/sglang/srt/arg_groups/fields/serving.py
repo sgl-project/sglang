@@ -68,6 +68,10 @@ class Serving(msgspec.Struct):
         str,
         "App is behind a path based routing proxy.",
     ] = ""
+    enable_http_worker_reuseport: A[
+        bool,
+        "Give each Uvicorn HTTP worker its own SO_REUSEPORT listener.",
+    ] = False
     smg_grpc_mode: A[
         bool,
         "Use the legacy SMG gRPC server (smg-grpc-servicer) instead of the HTTP "
@@ -80,7 +84,8 @@ class Serving(msgspec.Struct):
         Optional[int],
         "Port for the native gRPC server, started alongside HTTP. Setting this "
         "(or SGLANG_GRPC_PORT) enables the native gRPC server; it is off by "
-        "default. In legacy --smg-grpc-mode this is the SMG server port and "
+        "default. Follower nodes expose GetServerInfo only. "
+        "In legacy --smg-grpc-mode this is the SMG server port and "
         "defaults to --port + 10000.",
     ] = None
     grpc_response_timeout_secs: A[

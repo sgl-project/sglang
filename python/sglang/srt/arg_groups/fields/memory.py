@@ -95,7 +95,10 @@ class Memory(msgspec.Struct):
     # -------------------------------------------------------------------------
     # Hierarchical cache
     # -------------------------------------------------------------------------
-    enable_hierarchical_cache: A[bool, "Enable hierarchical cache"] = False
+    enable_hierarchical_cache: A[
+        bool,
+        Arg(help="Enable hierarchical cache", aliases=["--enable-hicache"]),
+    ] = False
     hicache_host_memory_mode: A[
         str,
         Arg(
@@ -145,7 +148,7 @@ class Memory(msgspec.Struct):
     hicache_storage_backend: A[
         Optional[str],
         Arg(
-            help="The storage backend for hierarchical KV cache. Built-in backends: file, mooncake, npu_memcache, hf3fs, nixl, aibrix, tensorcast. For dynamic backend, use --hicache-storage-backend-extra-config to specify: backend_name (custom name), module_path (Python module path), class_name (backend class name).",
+            help="The storage backend for hierarchical KV cache. Built-in backends: file, mooncake, npu_memcache, hf3fs, nixl, aibrix, tensorcast, seaweedfs. For dynamic backend, use --hicache-storage-backend-extra-config to specify: backend_name (custom name), module_path (Python module path), class_name (backend class name).",
             choices=[
                 "file",
                 "sim",
@@ -160,6 +163,7 @@ class Memory(msgspec.Struct):
                 "mori",
                 "shm",
                 "tensorcast",
+                "seaweedfs",
             ],
         ),
     ] = None
@@ -210,9 +214,25 @@ class Memory(msgspec.Struct):
         str,
         Arg(
             help="Storage backend for --enable-unified-cache-external-linker.",
-            choices=["mooncake", "mori"],
+            choices=["mooncake", "mori", "dynamic"],
         ),
     ] = "mooncake"
+    unified_cache_external_linker_config: A[
+        Optional[Dict[str, Any]],
+        Arg(
+            help=(
+                "JSON configuration for the selected linker backend. Built-in "
+                "backends accept storage options directly. The dynamic backend "
+                "requires linker (class name), linker_module_path (Python "
+                "module), and optional linker_extra_config (object). May be "
+                "supplied while the linker is disabled. For built-in backends, "
+                "replaces --hicache-storage-backend-extra-config when provided. "
+                "The fallback to that flag for external linkers is deprecated; "
+                "ordinary HiCache use of that flag is unaffected."
+            ),
+            type_parser=json.loads,
+        ),
+    ] = None
     enable_linker_mla_dedup: A[
         bool,
         "Load replicated MLA KV on rank 0 and broadcast each layer with the Mooncake linker.",

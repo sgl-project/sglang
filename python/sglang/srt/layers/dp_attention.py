@@ -17,8 +17,15 @@ from sglang.srt.distributed import (
     GroupCoordinator,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
+    CustomAllReduceV2,
+)
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
+)
+from sglang.srt.elastic_ep.topology import (
+    attn_replica_size,
+    physical_ep_rank_to_dp_rank,
 )
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
@@ -30,6 +37,7 @@ from sglang.srt.runtime_context import (
     get_forward,
     get_parallel,
     get_resources,
+    get_spec,
     get_stream,
 )
 from sglang.srt.utils import get_bool_env_var, is_cpu, is_hip
@@ -90,16 +98,20 @@ def dp_slot_in(per_rank) -> int:
 def dp_gather_slot() -> int:
     """Return this process's index in the DP gather.
 
-    After elastic scale-up, use the TP rank plus the join offset; otherwise
-    use the attention-DP rank. Inside a draft scope that owns its attention,
-    it is still the slot in the target's gather (see patch_tensor_parallel_group).
+    After elastic scale-up, convert the physical EP rank (the TP rank plus the
+    join offset) to its logical attention-DP replica; otherwise use the local
+    attention-DP rank. Inside a draft scope that owns its attention, it is still
+    the slot in the target's gather (see patch_tensor_parallel_group).
     """
     scoped = get_flags().dp.scoped_gather_slot
     if scoped is not None:
         return scoped
     parallel = get_parallel()
     if world_dp_gather_enabled():
-        return parallel.tp_rank + parallel.ep_join_rank_offset
+        return physical_ep_rank_to_dp_rank(
+            parallel.tp_rank + parallel.ep_join_rank_offset,
+            attn_replica_size(),
+        )
     return parallel.attn_dp_rank
 
 
@@ -174,6 +186,9 @@ class DpPaddingMode(IntEnum):
                 return DpPaddingMode.MAX_LEN
             return DpPaddingMode.SUM_LEN
 
+        if _decode_sum_len_fits_custom_all_reduce(global_num_tokens):
+            return cls.SUM_LEN
+
         # we choose the mode that minimizes the communication cost
         # prefer MAX_LEN when communication cost is equal to enable symmetric memory
         max_len = max(global_num_tokens)
@@ -184,13 +199,43 @@ class DpPaddingMode(IntEnum):
             return cls.SUM_LEN
 
     @classmethod
-    def get_default_mode_in_cuda_graph(cls) -> DpPaddingMode:
+    def get_default_mode_in_cuda_graph(
+        cls, global_num_tokens: Optional[List[int]] = None
+    ) -> DpPaddingMode:
+        """``global_num_tokens``: a decode capture's per-rank token counts."""
         # TODO(kkhuang-amd): noqa, temporary work-around for rocm 7.0.0 alpha
         # it can be safely removed later, once RCCL fixed
-        if _USE_ROCM700A_WA:
+        if _USE_ROCM700A_WA or (
+            global_num_tokens is not None
+            and _decode_sum_len_fits_custom_all_reduce(global_num_tokens)
+        ):
             return cls.SUM_LEN
         else:
             return cls.MAX_LEN
+
+
+def _decode_sum_len_fits_custom_all_reduce(global_num_tokens: List[int]) -> bool:
+    """SUM_LEN gathers and combines DP decode rows with one TP all-reduce of the
+    summed buffer; take it while the custom all-reduce can hold that buffer.
+    A one-rank gather or a batch with an idle rank keeps the cost-based choice."""
+    from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+
+    if (
+        dp_gather_width() <= 1
+        or len(global_num_tokens) <= 1
+        or min(global_num_tokens) == 0
+        or not get_moe_a2a_backend().is_none()
+        or get_spec().speculative_algorithm is not None
+    ):
+        return False
+    comm = get_parallel().tp_group.ca_comm
+    dp = get_flags().dp
+    nbytes = sum(global_num_tokens) * dp.buffer_hidden_size * dp.buffer_dtype.itemsize
+    return (
+        isinstance(comm, CustomAllReduceV2)
+        and not comm.disabled
+        and nbytes <= comm.max_size
+    )
 
 
 class _DpGatheredBufferWrapper:
@@ -355,7 +400,7 @@ def set_dp_buffer_len_from_batch(forward_batch: ForwardBatch) -> None:
     global_num_tokens = forward_batch.global_num_tokens_padded_cpu
     if global_num_tokens is None:
         global_num_tokens = forward_batch.global_num_tokens_cpu
-    dp_rank = get_parallel().attn_dp_rank if len(global_num_tokens) > 1 else 0
+    dp_rank = dp_slot_in(global_num_tokens)
     set_dp_buffer_len(
         forward_batch.global_dp_buffer_len,
         global_num_tokens[dp_rank],
@@ -791,10 +836,9 @@ def mask_dp_pad_moe_topk_ids(topk_ids: torch.Tensor) -> None:
     outputs are then discarded by the post-reorder scatter — pure wasted
     compute, and a masked-grouped-GEMM workspace blow-up when they collide
     on the same top-k.  -1 is the drop sentinel both the triton fused_moe
-    (filter_expert) and the DeepGEMM EP preprocess honor; it must be applied
-    AFTER the local_expert_mapping gather (a pre-translation -1 aliases to
-    the mapping table's last entry).  Capture-safe: per-batch state is read
-    only from the replay-updated global_num_tokens_gpu tensor.
+    (filter_expert) and the DeepGEMM EP preprocess honor.  Capture-safe:
+    per-batch state is read only from the replay-updated
+    global_num_tokens_gpu tensor.
     """
     counts = _DpGatheredBufferWrapper.get_dp_global_num_tokens_gpu()
     if counts is None:
@@ -932,6 +976,13 @@ def _note_dp_gather_in_prefill_graph() -> None:
     dp = get_flags().dp
     if dp.capturing_prefill_graph:
         dp.prefill_graph_has_dp_gather = True
+
+
+def note_rank_barrier_in_prefill_graph() -> None:
+    """For breaks that capture graphs of their own behind TP-group barriers."""
+    dp = get_flags().dp
+    if dp.capturing_prefill_graph:
+        dp.prefill_graph_has_rank_barrier = True
 
 
 def _dp_gather(

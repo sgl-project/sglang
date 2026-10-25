@@ -5,9 +5,9 @@ use std::collections::HashMap;
 
 use tch::Tensor;
 
-use crate::node::{ChildKeyType, NodeArena, NodeIdx_, TreeCoreRuntimeError};
+use crate::node::{ChildKeyType, Node, NodeArena, NodeId, NodeIdx_, TreeCoreRuntimeError};
 use crate::unified_tree_core::{
-    CacheAction, CacheTransferPhase, DecLockRefParams, EvictLayer, IncLockRefResult, InsertParams,
+    CacheActions, CacheTransferPhase, DecLockRefParams, EvictLayer, IncLockRefResult, InsertParams,
     InsertResult, LRURefreshPhase, MatchPrefixParams, MatchResult, PoolTransfer,
     PoolTransferResult, UnifiedTreeCore,
 };
@@ -59,6 +59,15 @@ pub(crate) fn all_values_flatten<K: ChildKeyType>(
 pub trait TreeComponent<K: ChildKeyType> {
     /// The component this driver serves.
     fn component_type(&self) -> ComponentType;
+
+    /// Allocator slots reclaimed from this component's device value.
+    /// Roots and absent device values contribute zero; splits preserve the total.
+    fn reclaimable_value_len(&self, node: &Node<K>) -> usize {
+        node.device_reclaimable_value_len(self.component_type())
+    }
+
+    /// Drop component-owned metadata after the node is removed.
+    fn on_node_removed(&self, _node_id: NodeId) {}
 
     /// Return the node's lock-segment UUID, minting and storing one when absent.
     fn get_or_fill_uuid(
@@ -174,6 +183,7 @@ pub trait TreeComponent<K: ChildKeyType> {
     }
 
     /// Called per-node when an insert's key overlaps an existing node.
+    /// `preserve_full_ids` keeps canonical FULL IDs during auxiliary recovery.
     /// Returns the index within `value_slice` from which this component
     /// consumed (took ownership of) the underlying KV pool slots.
     /// Returns `prefix_len` if nothing was consumed (default).
@@ -187,8 +197,9 @@ pub trait TreeComponent<K: ChildKeyType> {
         total_prefix_len: usize,
         value_slice: Tensor,
         params: &InsertParams<'_, K>,
+        preserve_full_ids: bool,
         result: &mut InsertResult,
-        cache_actions: &mut Vec<CacheAction>,
+        cache_actions: &mut CacheActions,
     ) -> usize {
         prefix_len
     }
@@ -205,7 +216,7 @@ pub trait TreeComponent<K: ChildKeyType> {
         total_prefix_len: usize,
         params: &InsertParams<'_, K>,
         result: &mut InsertResult,
-        cache_actions: &mut Vec<CacheAction>,
+        cache_actions: &mut CacheActions,
     ) {
     }
 
@@ -228,7 +239,7 @@ pub trait TreeComponent<K: ChildKeyType> {
         is_new_leaf: bool,
         params: &InsertParams<'_, K>,
         result: &mut InsertResult,
-        cache_actions: &mut Vec<CacheAction>,
+        cache_actions: &mut CacheActions,
     ) {
     }
 
@@ -240,6 +251,7 @@ pub trait TreeComponent<K: ChildKeyType> {
         tail_node_id: NodeIdx_,
         device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        cache_actions: &mut CacheActions,
     ) {
     }
 
@@ -295,6 +307,7 @@ pub trait TreeComponent<K: ChildKeyType> {
         node_id: NodeIdx_,
         device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        cache_actions: &mut CacheActions,
         target: EvictLayer,
     ) -> (usize, usize);
 
@@ -317,6 +330,7 @@ pub trait TreeComponent<K: ChildKeyType> {
         tracker: &mut HashMap<ComponentType, usize>,
         device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        cache_actions: &mut CacheActions,
     ) -> Option<NodeIdx_>;
 
     /// Clear this component's device-eviction walk state.
@@ -392,6 +406,7 @@ pub trait TreeComponent<K: ChildKeyType> {
         _params: &DecLockRefParams,
         _device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         _host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        _cache_actions: &mut CacheActions,
     ) {
         unimplemented!("release_window_lock is SWA-only")
     }
@@ -445,7 +460,7 @@ pub trait TreeComponent<K: ChildKeyType> {
         node_id: NodeIdx_,
         phase: CacheTransferPhase,
         transfers: Vec<PoolTransfer>,
-        cache_actions: &mut Vec<CacheAction>,
+        cache_actions: &mut CacheActions,
         insert_result: Option<&mut InsertResult>,
         pool_storage_result: Option<&PoolTransferResult>,
     ) {
@@ -474,6 +489,7 @@ pub trait TreeComponent<K: ChildKeyType> {
         _tracker: &mut HashMap<ComponentType, usize>,
         _device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         _host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        _cache_actions: &mut CacheActions,
     ) {
     }
 
@@ -487,6 +503,7 @@ pub trait TreeComponent<K: ChildKeyType> {
         _tracker: &mut HashMap<ComponentType, usize>,
         _device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         _host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        _cache_actions: &mut CacheActions,
     ) {
     }
 }

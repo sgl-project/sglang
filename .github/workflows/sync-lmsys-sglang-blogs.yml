@@ -55,6 +55,6 @@ jobs:
             gh pr create \
               --base main \
               --head "$BRANCH" \
-              --title "docs: sync LMSYS SGLang blog cards" \
+              --title "[Doc] blogs: Sync LMSYS SGLang blog cards" \
               --body $'Automated sync of the LMSYS SGLang blog cards in `docs/index.mdx`.\n\n🤖 Generated with GitHub Actions'
           fi
