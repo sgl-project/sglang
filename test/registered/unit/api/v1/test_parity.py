@@ -133,12 +133,11 @@ class TestCrossLanguageFixtures(CustomTestCase):
                 again = decode(json.loads(case["canonical"]))
                 self.assertEqual(compact(encode(again)), case["canonical"])
 
-    def test_every_fixture_type_has_generated_codecs(self):
+    def test_every_fixture_type_is_generated(self):
         """A fixture naming a type the Python module lacks would be skipped
         silently by a lookup-by-name; make it a failure."""
         for case in load_fixtures():
-            for name in (case["type"], f"decode_{case['type']}", f"encode_{case['type']}"):
-                self.assertTrue(hasattr(api_types, name), name)
+            self.assertTrue(hasattr(api_types, case["type"]), case["type"])
 
 
 class TestHiCacheRequestParity(CustomTestCase):

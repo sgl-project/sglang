@@ -877,7 +877,7 @@ NullableTopLogprobs = Optional[TopLogprobRow]
 # sglang.api.v1.HiddenStateRow: JSON bare array.
 HiddenStateRow = List[float]
 
-# sglang.api.v1.GenerateStreamItem: JSON: a generation frame or error.
+# sglang.api.v1.GenerateStreamItem: JSON: the value's shape picks the arm.
 GenerateStreamItem = Union[GenerateResponse, GenerateStreamError]
 
 # sglang.api.v1.ImageGridThw: JSON bare array.

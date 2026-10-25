@@ -183,7 +183,7 @@ pub enum MessageKind {
         variants: Vec<VariantModel>,
         passthrough: Option<VariantModel>,
     },
-    /// Single oneof with an untagged JSON representation.
+    /// Single oneof, untagged: the value's shape picks the variant.
     Untagged {
         oneof_mod: String,
         oneof_ident: String,
@@ -194,7 +194,8 @@ pub enum MessageKind {
         deny_unknown: bool,
         fields: Vec<FieldModel>,
     },
-    /// No HTTP JSON contract, no serde emitted.
+    /// gRPC-only (a plain oneof container): no HTTP
+    /// JSON contract, no serde emitted.
     Skip,
 }
 
@@ -359,8 +360,8 @@ fn message_model(msg: &MessageDescriptor, ext: &Extensions) -> MessageModel {
                 },
             };
         }
-        // A oneof without JSON shape options has no HTTP JSON contract of its
-        // own. Emit nothing.
+        // A plain oneof container has no HTTP JSON
+        // contract of its own — it is gRPC-only. Emit nothing.
         return MessageModel {
             rust_name,
             kind: MessageKind::Skip,

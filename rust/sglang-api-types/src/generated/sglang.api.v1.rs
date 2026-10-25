@@ -612,7 +612,6 @@ pub struct GenerateResponse {
     /// JSON key order is FIELD-NUMBER order: text, meta_info, then the
     /// conditionally-present output_ids and index — matching frame_value's
     /// insertion order byte-for-byte.
-    /// Python's token-ID-only output omits text; decoding keeps its empty default.
     #[prost(string, tag = "1")]
     pub text: ::prost::alloc::string::String,
     #[prost(message, optional, tag = "2")]

@@ -577,11 +577,7 @@ fn alias_def(m: &MessageModel) -> Option<(String, &'static str, Vec<String>)> {
             let kinds: Vec<&FieldKind> = variants.iter().map(|v| &v.kind).collect();
             Some((
                 format!("Union[{}]", arms.join(", ")),
-                if m.rust_name == "GenerateStreamItem" {
-                    "JSON: a generation frame or error"
-                } else {
-                    "JSON: the value's shape picks the arm"
-                },
+                "JSON: the value's shape picks the arm",
                 refs(&kinds),
             ))
         }
