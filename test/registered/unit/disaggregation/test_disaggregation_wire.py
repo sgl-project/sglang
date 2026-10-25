@@ -32,6 +32,7 @@ from sglang.srt.disaggregation.mooncake.conn import (
     FailedSessionProbe,
     MooncakeKVManager,
     MooncakeKVSender,
+    PeerBuffers,
     TransferInfo,
 )
 from sglang.srt.disaggregation.mooncake.transport import MooncakeTransport
@@ -969,6 +970,54 @@ class TestQwen4StateWire(unittest.TestCase):
         mgr._local_keys = BufferKeys.for_buffers([], [], mgr.kv_args.state_data_ptrs)
         mgr.register_buffer_to_engine()
         engine.batch_register.assert_called_once_with([100, 103, 105], [4096] * 3)
+
+    def test_dsa_tail_send_skips_layers_that_were_not_registered(self):
+        """A zero-row index-K layer is skipped at registration, so the DSA tail
+        send must not name it either; live layers still move their tail slots."""
+        src_ptrs, dst_ptrs = [0x1000, 0x2000, 0x3000], [0x5000, 0x6000, 0x7000]
+        mgr = MooncakeKVManager.__new__(MooncakeKVManager)
+        mgr.kv_args = SimpleNamespace(
+            kv_data_ptrs=[],
+            kv_data_lens=[],
+            aux_data_ptrs=[],
+            aux_data_lens=[],
+            state_data_ptrs=[src_ptrs],
+            state_data_lens=[[512, 0, 512]],
+            gpu_id=0,
+            prefill_start_layer=0,
+            prefill_end_layer=None,
+        )
+        writes = Mock(return_value=0)
+        mgr.transport = MooncakeTransport(engine=engine_writes(writes))
+        mgr._local_keys = BufferKeys.for_buffers([], [], [src_ptrs])
+        mgr.register_buffer_to_engine()
+        peer_keys = BufferKeys.for_buffers([], [], [dst_ptrs])
+        mgr._peers = {
+            "decode": PeerBuffers(
+                remote=mgr.transport.import_registration(
+                    session_id="decode",
+                    bases=dict(peer_keys.pair([], [], [dst_ptrs])),
+                ),
+                keys=peer_keys,
+            )
+        }
+
+        # Ring of 4 slots, 16 bytes each; one live slot from row 1 to row 2.
+        rc = mgr._send_slot_state(
+            SimpleNamespace(mooncake_session_id="decode"),
+            src_item_lens=[64, 0, 64],
+            dst_item_lens=[64, 0, 64],
+            src_indices=[1, 0, 1, 0, 0, 4],
+            dst_indices=[2, 0, 1, 0, 0, 4],
+            label="dsa_tail",
+            src_keys=mgr._local_keys.state[0],
+            dst_keys=peer_keys.state[0],
+        )
+
+        self.assertEqual(rc, 0)
+        writes.assert_called_once_with(
+            "decode", [(0x1000 + 64, 0x5000 + 128, 16), (0x3000 + 64, 0x7000 + 128, 16)]
+        )
 
     def test_stride_check_accepts_one_sided_elided_dsa_entry(self):
         """A prefill that elides a shared-topk layer's index-K must still pair
