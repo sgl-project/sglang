@@ -1932,6 +1932,190 @@ class ServingChatTestCase(CustomTestCase):
         kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
         self.assertEqual(kwargs["tools"], expected_tools)
 
+    @staticmethod
+    def _message_render_tool(name):
+        return {
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": f"Schema for {name}.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"value": {"type": "string"}},
+                    "required": ["value"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+
+    def test_jinja_allowed_message_tools_include_filtered_schemas(self):
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.chat.chat_encoding_spec = None
+
+        for role in ("root", "system", "developer"):
+            for mixed in (False, True):
+                with self.subTest(role=role, mixed=mixed):
+                    self.tm.tokenizer.apply_chat_template.reset_mock()
+                    messages = [
+                        {
+                            "role": role,
+                            "content": "",
+                            "tools": [
+                                self._message_render_tool("keep"),
+                                self._message_render_tool("drop"),
+                            ],
+                        },
+                        {
+                            "role": "assistant",
+                            "tool_calls": [
+                                {
+                                    "id": "old-call",
+                                    "type": "function",
+                                    "function": {"name": "drop", "arguments": "{}"},
+                                }
+                            ],
+                        },
+                        {"role": "tool", "tool_call_id": "old-call", "content": "done"},
+                        {"role": "user", "content": "Call keep."},
+                    ]
+                    original_messages = json.loads(json.dumps(messages))
+                    tools = (
+                        [
+                            self._message_render_tool("top_keep"),
+                            self._message_render_tool("top_drop"),
+                        ]
+                        if mixed
+                        else None
+                    )
+                    names = ["top_keep", "keep"] if mixed else ["keep"]
+                    request = ChatCompletionRequest(
+                        model="x",
+                        messages=messages,
+                        tools=tools,
+                        tool_choice={
+                            "type": "allowed_tools",
+                            "allowed_tools": {
+                                "mode": "required",
+                                "tools": [
+                                    {"type": "function", "function": {"name": name}}
+                                    for name in names
+                                ],
+                            },
+                        },
+                    )
+                    expected_tools = [
+                        tool.model_dump() for tool in request.tools or []
+                    ] + [tool.model_dump() for tool in request.messages[0].tools]
+
+                    self.chat._process_messages(request, is_multimodal=False)
+
+                    call = self.tm.tokenizer.apply_chat_template.call_args
+                    self.assertEqual(call.kwargs["tools"], expected_tools)
+                    self.assertEqual(
+                        [tool["function"]["name"] for tool in call.kwargs["tools"]],
+                        names,
+                    )
+                    self.assertEqual(call.kwargs["tool_choice"], "required")
+                    self.assertEqual(
+                        call.args[0][1]["tool_calls"][0]["function"]["name"], "drop"
+                    )
+                    self.assertEqual(messages, original_messages)
+                    self.assertEqual(
+                        [tool.function.name for tool in request.messages[0].tools],
+                        ["keep"],
+                    )
+                    self.assertEqual(
+                        [tool.function.name for tool in request.tools or []],
+                        ["top_keep"] if mixed else [],
+                    )
+
+    def test_jinja_message_tools_respect_none_and_empty_allowed_subset(self):
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.chat.chat_encoding_spec = None
+        for choice in (
+            "none",
+            {
+                "type": "allowed_tools",
+                "allowed_tools": {"mode": "auto", "tools": []},
+            },
+        ):
+            with self.subTest(choice=choice):
+                request = ChatCompletionRequest(
+                    messages=[
+                        {
+                            "role": "root",
+                            "content": "",
+                            "tools": [self._message_render_tool("drop")],
+                        },
+                        {"role": "user", "content": "Hi."},
+                    ],
+                    tool_choice=choice,
+                )
+
+                self.chat._process_messages(request, is_multimodal=False)
+
+                self.assertIsNone(
+                    self.tm.tokenizer.apply_chat_template.call_args.kwargs["tools"]
+                )
+
+    def test_jinja_named_message_tool_is_rendered(self):
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.chat.chat_encoding_spec = None
+        request = ChatCompletionRequest(
+            messages=[
+                {
+                    "role": "root",
+                    "content": "",
+                    "tools": [
+                        self._message_render_tool("keep"),
+                        self._message_render_tool("drop"),
+                    ],
+                },
+                {"role": "user", "content": "Call keep."},
+            ],
+            tools=[self._message_render_tool("top_drop")],
+            tool_choice=ToolChoice(function=ToolChoiceFuncName(name="keep")),
+        )
+
+        self.chat._process_messages(request, is_multimodal=False)
+
+        rendered = self.tm.tokenizer.apply_chat_template.call_args.kwargs["tools"]
+        self.assertEqual(rendered, [request.messages[0].tools[0].model_dump()])
+
+    def test_jinja_message_tools_preserve_muse_template_override(self):
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.chat.chat_encoding_spec = None
+        self.chat.tool_call_parser = "muse"
+        request = ChatCompletionRequest(
+            messages=[
+                {
+                    "role": "root",
+                    "content": "",
+                    "tools": [self._message_render_tool("message_tool")],
+                },
+                {"role": "user", "content": "Hi."},
+            ],
+            tools=[self._message_render_tool("codex.keep")],
+        )
+        template_tools = [
+            {
+                "type": "namespace",
+                "name": "codex",
+                "tools": [self._message_render_tool("keep")],
+            }
+        ]
+        request._template_tools = template_tools
+
+        self.chat._apply_jinja_template(request, template_tools, is_multimodal=False)
+
+        rendered = self.tm.tokenizer.apply_chat_template.call_args.kwargs["tools"]
+        self.assertEqual(rendered, template_tools)
+        self.assertIs(request._template_tools, template_tools)
+
     def test_glm47_without_tools_has_no_tool_call_constraint(self):
         """A plain GLM47 chat must not get the full-assistant EBNF: its
         terminal state finishes the request even under ignore_eos."""

@@ -1765,6 +1765,23 @@ class OpenAIServingChat(OpenAIServingBase):
                     prompt_ids, assistant_prefix
                 )
         else:
+            # Native encoders keep message-scoped declarations in their messages.
+            # Generic Jinja templates consume them through the tools argument.
+            if request.tool_choice != "none" and not (
+                tools
+                and isinstance(request.tool_choice, str)
+                and self.tool_call_parser == "muse"
+                and request._template_tools
+            ):
+                template_tools = self._effective_tools(request)
+                if not isinstance(request.tool_choice, str):
+                    template_tools = [
+                        tool
+                        for tool in template_tools
+                        if tool.function.name == request.tool_choice.function.name
+                    ]
+                tools = [tool.model_dump() for tool in template_tools] or None
+
             # The M3 template renders tool results by position, not by tool_call_id.
             if (
                 self.template_manager.jinja_template_may_reorder_tool_results
