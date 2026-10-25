@@ -164,6 +164,7 @@ class TestGraphRoutingContext(CustomTestCase):
         runner.is_draft_worker = False
         runner.spec_algorithm = SpeculativeAlgorithm.NONE
         runner.capture_tail_hooks = []
+        runner.capture_head_hooks = []
         runner.canary_manager = None
         runner.model = model
         return runner

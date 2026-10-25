@@ -8,7 +8,7 @@ import tempfile
 import time
 from collections.abc import Coroutine
 from contextlib import suppress
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Literal, Optional
 
 from fastapi import (
     APIRouter,
@@ -361,11 +361,15 @@ async def _save_first_input_image(
 
 
 async def _upload_and_cleanup_videos(paths: list[str]) -> list[str | None]:
-    return list(
-        await asyncio.gather(
-            *(cloud_storage.upload_and_cleanup(path) for path in paths)
-        )
+    results = await asyncio.gather(
+        *(cloud_storage.upload_and_cleanup(path) for path in paths),
+        return_exceptions=True,
     )
+    # join every upload before a cancellation or failure permits directory cleanup
+    for result in results:
+        if isinstance(result, BaseException):
+            raise result
+    return results
 
 
 async def _dispatch_job_async(
@@ -823,12 +827,12 @@ async def create_video(
 @router.get("", response_model=VideoListResponse)
 async def list_videos(
     after: Optional[str] = Query(None),
-    limit: Optional[int] = Query(None, ge=1, le=100),
-    order: Optional[str] = Query("desc"),
+    limit: int = Query(20, ge=1, le=100),
+    order: Literal["asc", "desc"] = Query("desc"),
 ):
-    jobs = await VIDEO_STORE.list_page(after=after, limit=limit, order=order)
-    items = [VideoResponse(**job) for job in jobs]
-    return VideoListResponse(data=items)
+    return VideoListResponse(
+        **await VIDEO_STORE.list_page(after=after, limit=limit, order=order)
+    )
 
 
 @router.get("/{video_id}", response_model=VideoResponse)

@@ -433,6 +433,12 @@ def _bf16_gemm_dispatch_impl(
         _use_hopper_bf16_gemv is not None
         and bias is None
         and _use_hopper_bf16_gemv(m, weight.shape[0], weight.shape[1])
+        # The GEMV reads x and weight with 16-byte vector loads;
+        # other layouts take the cuBLAS routes below.
+        and x.is_contiguous()
+        and weight.is_contiguous()
+        and x.data_ptr() % 16 == 0
+        and weight.data_ptr() % 16 == 0
     ):
         output = _hopper_bf16_gemv(x.view(-1, x.shape[-1]), weight).view(
             *x.shape[:-1], -1
