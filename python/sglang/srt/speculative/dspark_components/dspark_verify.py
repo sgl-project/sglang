@@ -969,6 +969,11 @@ class DsparkVerifyEpilogue:
             return None
         return self.block_accept_lens_buf[:bs]
 
+    def snapshot_block_accept_lens(self, bs: int) -> Optional[torch.Tensor]:
+        # Same hazard as snapshot_accept: the overlap readback copies this late.
+        view = self.read_block_accept_lens(bs)
+        return None if view is None else view.clone()
+
     @property
     def folds_commit(self) -> bool:
         if self.commit_ctx is None:

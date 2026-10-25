@@ -199,6 +199,21 @@ class TestFoldedAcceptSnapshot(CustomTestCase):
         for field in accept.__struct_fields__:
             self.assertTrue(torch.equal(getattr(accept, field), expected[field]), field)
 
+    def test_block_accept_lens_snapshot_does_not_alias_the_buffer(self):
+        epilogue = DsparkVerifyEpilogue(
+            max_bs=BS + 1,
+            verify_num_draft_tokens=STRIDE,
+            device="cpu",
+            tp_sync=_RecordingTpSync(),
+        )
+        epilogue.block_accept_lens_buf = None
+        self.assertIsNone(epilogue.snapshot_block_accept_lens(BS))
+        epilogue.block_accept_lens_buf = torch.arange(BS + 1, dtype=torch.int32)
+        snap = epilogue.snapshot_block_accept_lens(BS)
+        self.assertFalse(_shares_storage(snap, epilogue.block_accept_lens_buf))
+        epilogue.block_accept_lens_buf.fill_(-1)  # the next verify replay
+        self.assertEqual(snap.tolist(), list(range(BS)))
+
 
 class _NoSiteTpSync(_RecordingTpSync):
     def enabled(self, site):
