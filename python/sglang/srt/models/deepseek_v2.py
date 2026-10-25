@@ -1107,7 +1107,7 @@ class DeepseekV2MoE(nn.Module):
                 and get_is_capture_mode()
                 and not is_in_breakable_cuda_graph()
                 and not skip_shared_experts
-                and not self.experts.moe_runner_config.inplace
+                and self.experts.preserves_input
             ):
                 return self.forward_normal_dual_stream(
                     hidden_states,
@@ -1147,7 +1147,7 @@ class DeepseekV2MoE(nn.Module):
         return_moe_output: bool = False,
         leave_output_sum: bool = False,
     ) -> Union[torch.Tensor, MoEOutput]:
-        if self.experts.moe_runner_config.inplace:
+        if not self.experts.preserves_input:
             return self.forward_normal(
                 hidden_states,
                 gemm_output_zero_allocator,
@@ -1294,7 +1294,6 @@ class DeepseekV2MoE(nn.Module):
             and not return_moe_output
             and not leave_output_sum
             and not self._shared_expert_tp1
-            and not self.experts.moe_runner_config.inplace
         ):
             return self.forward_cpu(hidden_states)
         defer_shared = not self.experts.moe_runner_config.inplace
@@ -1503,9 +1502,8 @@ class DeepseekV2MoE(nn.Module):
         assert use_intel_amx_backend(
             self.shared_experts.gate_up_proj
         ) == use_intel_amx_backend(self.shared_experts.down_proj)
-        # [Note] inplace should be False in fused_experts.
-        # If inplace is True in fused_experts (self.experts), hidden_states will be changed after fused_experts
-        # While hidden_states is still needed in shared_expert.
+        # Native CPU routed kernels pass inplace=False independently of the
+        # layer's suggestion, preserving hidden_states for the shared expert.
         final_hidden_states = torch.ops.sgl_kernel.shared_expert_cpu(
             hidden_states,
             self.shared_experts.gate_up_proj.weight,

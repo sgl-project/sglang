@@ -15,8 +15,9 @@ import torch
 
 from sglang.srt.batch_overlap.operations import _StateDict
 from sglang.srt.layers.moe import topk as topk_module
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK, TopKConfig
-from sglang.srt.layers.moe.utils import MoeA2ABackend
+from sglang.srt.layers.moe.utils import MoeA2ABackend, MoeRunnerBackend
 from sglang.srt.model_executor.model_runner_components import moe_ep_setup
 from sglang.srt.models import deepseek_v2 as deepseek_v2_module
 from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
@@ -562,12 +563,24 @@ class TestFusedSharedExpertScaling(CustomTestCase):
 
 
 class TestDeepseekMoeEpilogue(CustomTestCase):
-    def _moe(self, *, replicated=False, reduce=False, inplace=False):
-        def experts(hidden_states, *args, **kwargs):
-            return hidden_states.mul_(2.5) if inplace else hidden_states * 2.5
+    def _moe(
+        self,
+        *,
+        replicated=False,
+        reduce=False,
+        inplace=False,
+        mutates_input=False,
+        backend=MoeRunnerBackend.TRITON,
+    ):
+        def run_experts(hidden_states, *args, **kwargs):
+            return hidden_states.mul_(2.5) if mutates_input else hidden_states * 2.5
 
+        experts = FusedMoE.__new__(FusedMoE)
+        torch.nn.Module.__init__(experts)
+        experts.forward = run_experts
         experts.quant_method = None
         experts.moe_runner_config = SimpleNamespace(inplace=inplace)
+        experts.runner_backend = backend
         experts.should_fuse_routed_scaling_factor_in_topk = False
 
         def gate(hidden_states, *args, **kwargs):
@@ -717,9 +730,75 @@ class TestDeepseekMoeEpilogue(CustomTestCase):
     def test_inplace_runner_reads_shared_before_overwriting_input(self):
         """Capture must not let an in-place routed write change the shared input."""
         x = torch.arange(1, 7, dtype=torch.float32).reshape(2, 3)
-        moe = self._moe(inplace=True)
+        moe = self._moe(inplace=True, mutates_input=True)
         actual = moe.forward_normal_dual_stream(x.clone())
         torch.testing.assert_close(actual, x * 5.5)
+
+    def test_capture_preserves_overlap_with_inplace_suggestion(self):
+        """Input-preserving runners must retain routed-first capture scheduling."""
+        from sglang.srt.model_executor.runner_utils.capture_mode import (
+            model_capture_mode,
+        )
+        from sglang.srt.utils import dispose_tensor
+
+        x = torch.arange(1, 7, dtype=torch.float32).reshape(2, 3)
+        for backend in (
+            MoeRunnerBackend.DEEP_GEMM,
+            MoeRunnerBackend.MARLIN,
+            MoeRunnerBackend.TRITON_KERNELS,
+        ):
+            with self.subTest(backend=backend):
+                moe = self._moe(inplace=True, backend=backend)
+                calls = []
+
+                def routed(hidden, *args, **kwargs):
+                    calls.append("routed")
+                    output = hidden * 2.5
+                    if backend.is_deep_gemm():
+                        dispose_tensor(hidden)
+                    return output
+
+                def shared(hidden, *args, **kwargs):
+                    calls.append("shared")
+                    return hidden * 3
+
+                moe.experts.forward = routed
+                moe._forward_shared_experts = shared
+                with (
+                    model_capture_mode(),
+                    get_flags().moe.override(runner_backend=MoeRunnerBackend.TRITON),
+                    patch.object(
+                        deepseek_v2_module,
+                        "is_in_breakable_cuda_graph",
+                        return_value=False,
+                    ),
+                ):
+                    actual = moe(x.clone())
+                self.assertEqual(calls, ["routed", "shared"])
+                torch.testing.assert_close(actual, x * 5.5)
+
+    def test_deepgemm_shared_read_precedes_eager_disposal(self):
+        """Capture preservation must not enable overlap once disposal is active."""
+        from sglang.srt.model_executor.runner_utils.capture_mode import (
+            model_capture_mode,
+        )
+        from sglang.srt.utils import dispose_tensor
+
+        x = torch.ones(2, 3)
+        moe = self._moe(inplace=True, backend=MoeRunnerBackend.DEEP_GEMM)
+
+        def routed(hidden, *args, **kwargs):
+            output = hidden * 2.5
+            dispose_tensor(hidden)
+            return output
+
+        moe.experts.forward = routed
+        with model_capture_mode():
+            torch.testing.assert_close(moe(x.clone()), x * 5.5)
+        with get_flags().capture.override(disable_dispose_tensor=False):
+            torch.testing.assert_close(
+                moe.forward_normal_dual_stream(x.clone()), x * 5.5
+            )
 
     def test_deepep_skip_leaves_complete_routed_output_unreduced(self):
         """An A2A combine already returns complete rows; skipping shared keeps them."""
@@ -782,8 +861,10 @@ class TestDeepseekMoeEpilogue(CustomTestCase):
     def test_amx_fused_output_does_not_repeat_scale_or_shared_add(self):
         """The fused CPU result only owes its TP reduction."""
         x = torch.ones(2, 3)
-        moe = self._moe(reduce=True)
-        moe.experts = lambda hidden_states, **kwargs: hidden_states.clone()
+        moe = self._moe(reduce=True, inplace=True, backend=None)
+        moe.experts.forward = lambda hidden_states, *args, **kwargs: (
+            hidden_states.clone()
+        )
         projection = SimpleNamespace(weight=torch.ones(1))
         moe.shared_experts = SimpleNamespace(
             gate_up_proj=projection, down_proj=projection
@@ -801,14 +882,15 @@ class TestDeepseekMoeEpilogue(CustomTestCase):
                 side_effect=lambda x, w1, w2, routed, scale, *args: (
                     routed * scale + x * 3
                 ),
-            ),
+            ) as fused_shared,
             patch.object(
                 deepseek_v2_module,
                 "post_experts_all_reduce",
                 side_effect=lambda t: t * 2,
             ),
         ):
-            output = moe.forward_cpu(x)
+            output = moe(x)
+        fused_shared.assert_called_once()
         torch.testing.assert_close(output, x * 11)
 
     def test_deferred_finalize_hands_sum_to_boundary_once(self):
