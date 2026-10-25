@@ -827,6 +827,13 @@ def draft_pp_context():
         yield
 
 
+def draft_owns_attention() -> bool:
+    """Whether a DFLASH-family draft runs on its own attention placement: per-DP
+    attention TP under DP, full TP without CP under CP. Resolve in the target scope."""
+    parallel = get_parallel()
+    return parallel.attn_dp_enabled or parallel.attn_cp_size > 1
+
+
 def draft_tp_context(owns_attention: bool):
     """Enter the TP placement that draft work runs under.
 

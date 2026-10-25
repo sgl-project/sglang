@@ -9,8 +9,7 @@ from sglang.srt.model_executor.model_runner_components.spec_aux_hidden_state imp
     _resolve_dflash_draft_cell_size,
 )
 from sglang.srt.runtime_context import draft_attn_tp_size, get_parallel
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.speculative.spec_utils import draft_tp_context
+from sglang.srt.speculative.spec_utils import draft_owns_attention, draft_tp_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, published_topology
 
@@ -90,6 +89,22 @@ class TestDraftTpContext(CustomTestCase):
             self.assertEqual(get_parallel().attn_cp_size, 4)
             self.assertFalse(parallel_state._TP_STATE_PATCHED)
 
+    def test_cp_draft_owns_attention_like_a_dp_draft(self):
+        """A CP draft must enter draft_tp_context, or its pool shards KV heads by
+        attention TP (1 under CP) while its attention shards by full TP."""
+        for widths, expected in (
+            (dict(attn_tp_size=4, attn_dp_size=1, attn_cp_size=1), False),
+            (dict(attn_tp_size=2, attn_dp_size=2, attn_cp_size=1), True),
+            (dict(attn_tp_size=1, attn_dp_size=1, attn_cp_size=4), True),
+        ):
+            with (
+                self.subTest(**widths),
+                get_parallel().override(
+                    **widths, attn_dp_enabled=widths["attn_dp_size"] > 1
+                ),
+            ):
+                self.assertEqual(draft_owns_attention(), expected)
+
     def test_target_kv_budget_matches_draft_execution_geometry(self):
         model = SimpleNamespace(
             dtype=torch.bfloat16,
@@ -111,7 +126,6 @@ class TestDraftTpContext(CustomTestCase):
                 budget = _resolve_dflash_draft_cell_size(
                     draft_model_config=model,
                     draft_num_layers=2,
-                    spec_algorithm=SpeculativeAlgorithm.DFLASH,
                 )
                 with draft_tp_context(True):
                     self.assertEqual(get_parallel().attn_tp_size, draft_width)

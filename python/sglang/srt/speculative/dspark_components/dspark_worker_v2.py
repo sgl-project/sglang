@@ -22,6 +22,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_loader.weight_utils import get_pp_stage_load_group
 from sglang.srt.runtime_context import (
+    draft_attn_parallel_group,
     get_disagg,
     get_exec,
     get_memory,
@@ -87,6 +88,7 @@ from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.srt.speculative.spec_utils import (
     GrammarTree,
     build_grammar_vocab_mask,
+    draft_owns_attention,
     draft_pp_context,
     draft_tp_context,
     prepare_mamba_track_for_verify,
@@ -191,6 +193,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             return
 
         self._draft_is_moe = draft_is_deepseek_v4()
+        # A DSV4-shaped draft keeps the target's placement for its DP-MoE sync.
+        self._draft_owns_attention = draft_owns_attention() and not self._draft_is_moe
         self._draft_dp_context_enabled = (
             get_parallel().attn_dp_enabled and not self._draft_is_moe
         )
@@ -263,8 +267,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         parallel = get_parallel()
         self._tp_sync = SpecTpSync(get_dp_tp_group())
         self._draft_graph_group = (
-            parallel.attn_tp_group
-            if self._draft_dp_context_enabled
+            getattr(parallel, f"{draft_attn_parallel_group()}_group")
+            if self._draft_owns_attention
             else parallel.tp_group
         )
 
@@ -539,7 +543,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         return getattr(self.target_worker, name)
 
     def _draft_context(self):
-        return draft_tp_context(self._draft_dp_context_enabled)
+        return draft_tp_context(self._draft_owns_attention)
 
     def alloc_memory_pool(
         self,
@@ -549,11 +553,13 @@ class DSparkWorkerV2(BaseSpecWorker):
     ):
         if not self._hosts_draft:
             return
-        self._draft_worker.alloc_memory_pool(
-            memory_pool_config=memory_pool_config,
-            req_to_token_pool=req_to_token_pool,
-            token_to_kv_pool_allocator=token_to_kv_pool_allocator,
-        )
+        # The pool shards KV heads by the draft's placement, like its attention.
+        with self._draft_context():
+            self._draft_worker.alloc_memory_pool(
+                memory_pool_config=memory_pool_config,
+                req_to_token_pool=req_to_token_pool,
+                token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+            )
 
     def init_attention_backends(self):
         if not self._hosts_draft:

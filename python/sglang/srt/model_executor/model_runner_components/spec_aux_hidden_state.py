@@ -9,7 +9,6 @@ from sglang.srt.configs.model_config import ModelConfig, is_deepseek_v4
 from sglang.srt.runtime_context import (
     draft_attn_tp_size,
     get_model,
-    get_parallel,
     get_spec,
 )
 
@@ -235,7 +234,6 @@ def _resolve_dflash_aux_hidden_state(
         config.dflash_draft_cell_size_per_token = _resolve_dflash_draft_cell_size(
             draft_model_config=draft_model_config,
             draft_num_layers=int(draft_num_layers),
-            spec_algorithm=spec_algorithm,
         )
 
 
@@ -243,7 +241,6 @@ def _resolve_dflash_draft_cell_size(
     *,
     draft_model_config: ModelConfig,
     draft_num_layers: int,
-    spec_algorithm: SpeculativeAlgorithm,
 ) -> int | None:
     """Bytes/token the DFLASH draft KV pool will cost the target's pool budget.
 
@@ -272,11 +269,7 @@ def _resolve_dflash_draft_cell_size(
             draft_model_config=draft_model_config,
             draft_num_layers=draft_num_layers,
             draft_kv_cache_dtype=draft_kv_cache_dtype,
-            tp_size=(
-                draft_attn_tp_size()
-                if spec_algorithm.is_dflash()
-                else get_parallel().attn_tp_size
-            ),
+            tp_size=draft_attn_tp_size(),
         )
     except Exception as e:  # noqa: BLE001
         logger.warning(
