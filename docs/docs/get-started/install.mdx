@@ -62,7 +62,10 @@ The container shell is ready for `sglang serve`.
 </Tab>
 <Tab title="pip / uv" id="method-1-with-pip-or-uv">
 
-Use Python 3.11 or higher and a compatible CUDA 13 environment.
+Use Python 3.11 or higher and a CUDA 13 environment that includes:
+
+- **CUDA Toolkit 13 with `nvcc`.** SGLang compiles some CUDA kernels at runtime, so a GPU driver alone is not enough. SGLang looks for the toolkit in `CUDA_HOME` (or `CUDA_PATH`), then the directory of `nvcc` on your `PATH`, then `/usr/local/cuda`.
+- **A C compiler and the Python development headers.** Triton compiles a small launcher when it initializes. On Debian or Ubuntu, install `build-essential`. Python builds managed by uv include the headers; if you use the system Python instead, also install its development package, such as `python3.12-dev`.
 
 <Accordion title="CUDA version compatibility">
 
@@ -79,10 +82,10 @@ pip install --upgrade pip
 pip install uv
 ```
 
-Create and activate a virtual environment:
+Create and activate a virtual environment. `--python-preference only-managed` makes uv use its own Python build, which includes the development headers, even when a system Python 3.12 is installed:
 
 ```bash Command
-uv venv --python 3.12
+uv venv --python 3.12 --python-preference only-managed
 source .venv/bin/activate
 ```
 
@@ -112,7 +115,28 @@ For `CUDA_HOME` errors, see [Troubleshooting](#cuda_home).
 </Tab>
 <Tab title="From source" id="method-2-from-source">
 
-Use Python 3.11 or higher in an activated Python environment, with CUDA dependencies appropriate for the version you build.
+Use Python 3.11 or higher in an activated Python environment. The CUDA Toolkit, C compiler, and Python header requirements from the pip / uv tab also apply.
+
+**Install the Rust toolchain**
+
+Installing from source builds SGLang's Rust extensions with Cargo. Install Rust with [rustup](https://rustup.rs/). The repository pins the toolchain version in `rust/rust-toolchain.toml`, and rustup installs that version automatically during the build:
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+source "$HOME/.cargo/env"
+```
+
+<Accordion title="Install without Rust">
+
+To skip the Rust extensions, set `SGLANG_BUILD_RUST_EXTS=none` when you install:
+
+```bash
+SGLANG_BUILD_RUST_EXTS=none pip install -e "python"
+```
+
+Basic model serving works without them. Features backed by a Rust extension, such as the gRPC server, build their extension with Cargo the first time you use them, so they still need the Rust toolchain at that point.
+
+</Accordion>
 
 **Get the source**
 
@@ -301,6 +325,18 @@ export CUDA_HOME="/path/to/cuda"
 ```
 
 For a versioned installation, this is typically `/usr/local/cuda-VERSION`. Alternatively, install FlashInfer first using the [FlashInfer installation instructions](https://docs.flashinfer.ai/installation.html), then retry the SGLang installation.
+
+### nvcc not found
+
+If the server exits during startup with `Failed to build JIT module` and `nvcc: not found`, or with `Could not find nvcc`, SGLang cannot find the CUDA Toolkit. Install CUDA Toolkit 13, or set `CUDA_HOME` to an existing installation as described in [CUDA_HOME](#cuda_home).
+
+### Triton falls back to CPU
+
+On an NVIDIA GPU, the warning `Triton is not supported on current platform, roll back to CPU.` usually means Triton could not compile its launcher, not that the GPU is unsupported. The server then fails with `Failed to find C compiler` or `Python.h: No such file or directory`. Install a C compiler and the Python development headers, as described in the pip / uv tab.
+
+### cargo is required
+
+If installing from source fails with `cargo is required to discover the Rust extension modules`, install the Rust toolchain, or set `SGLANG_BUILD_RUST_EXTS=none` to install without the Rust extensions. See the From source tab.
 
 ### FlashInfer
 
