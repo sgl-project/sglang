@@ -15,8 +15,11 @@ from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     DevicePoolEntry,
     DevicePoolGroup,
     _build_deepseek_v4_device_pool_group,
+    _mamba_slot_state_entry,
+    _qsa_indexer_entry,
     resolve_hybrid_device_pool_group,
 )
+from sglang.srt.mem_cache.ple_state_pool import NGramPool, ShortConvPool
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -734,6 +737,7 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
     def test_mla_mamba_maps_kv_pages_and_state_slots(self):
         from sglang.srt.mem_cache.hybrid_cache import linker_pool_assembler
         from sglang.srt.mem_cache.memory_pool import (
+            DSATokenToKVPool,
             HybridLinearKVPool,
             MHATokenToKVPool,
             MLATokenToKVPool,
@@ -804,8 +808,17 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "plain MLA"):
             resolve()
         params.mtp_draft_device_pools = ()
-        kvcache.full_kv_pool = MHATokenToKVPool.__new__(MHATokenToKVPool)
-        with self.assertRaisesRegex(ValueError, "plain MLA"):
+        mha = MHATokenToKVPool.__new__(MHATokenToKVPool)
+        mha.k_scale_buffer = mha.native_k_scale_buffer = None
+        mha.k_buffer = [torch.zeros((8, 3), dtype=torch.uint8) for _ in range(2)]
+        mha.v_buffer = [torch.zeros((8, 3), dtype=torch.uint8) for _ in range(2)]
+        kvcache.full_kv_pool = mha
+        # K and V of one full-attention layer ride the same transfer layer.
+        self.assertEqual(
+            resolve().entry_map[PoolName.KV].layer_mapping, {1: (0, 2), 3: (1, 3)}
+        )
+        kvcache.full_kv_pool = DSATokenToKVPool.__new__(DSATokenToKVPool)
+        with self.assertRaisesRegex(ValueError, "plain MLA or MHA"):
             resolve()
 
     def test_unsupported_strategy_fails_with_context(self):
@@ -822,6 +835,72 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
                 params=SimpleNamespace(),
                 components={ComponentType.FULL, ComponentType.SWA},
             )
+
+
+class TestMambaSlotStateEntry(CustomTestCase):
+    def _req_to_token_pool(self, *, side_states: bool):
+        short_conv = ShortConvPool(
+            size=4,
+            state_shape=(2, 3),
+            layer_ids=[3, 7] if side_states else [],
+            dtype=torch.float32,
+            device="cpu",
+        )
+        ngram = NGramPool(
+            size=4, context_len=2 if side_states else 0, eos_token_id=0, device="cpu"
+        )
+        return SimpleNamespace(
+            short_conv_pool=short_conv,
+            ngram_pool=ngram,
+            mamba_map={1: 0, 5: 1},
+            mamba_pool=object(),
+        )
+
+    def test_side_states_follow_mamba_slots_on_their_reader_layers(self):
+        pool = self._req_to_token_pool(side_states=True)
+        entry = _mamba_slot_state_entry(pool, start_layer=0)
+
+        self.assertEqual(entry.name, PoolName.MAMBA_SLOT_STATE)
+        self.assertEqual(entry.indices_from_pool, PoolName.MAMBA)
+        # Short-conv states load with their own layer; the N-gram history, read
+        # before the first layer, with the first Mamba layer.
+        self.assertEqual(entry.layer_mapping, {3: (0,), 7: (1,), 1: (2,)})
+
+        slot = 2
+        conv0 = pool.short_conv_pool.conv_state[0]
+        ngram = pool.ngram_pool.context
+        ptrs, sizes, offsets = entry.get_prepared_layer_range_meta([slot], 3)
+        self.assertEqual(ptrs, [[conv0[slot].data_ptr()]])
+        self.assertEqual(sizes, [[conv0[slot].nbytes]])
+        self.assertEqual(offsets, [[0]])
+        ptrs, sizes, offsets = entry.get_prepared_layer_range_meta([slot], 1)
+        self.assertEqual(ptrs, [[ngram[slot].data_ptr()]])
+        self.assertEqual(offsets, [[2 * conv0[slot].nbytes]])
+
+    def test_no_entry_without_side_states(self):
+        pool = self._req_to_token_pool(side_states=False)
+        self.assertIsNone(_mamba_slot_state_entry(pool, start_layer=0))
+
+
+class TestQSAIndexerEntry(CustomTestCase):
+    def test_full_page_maps_to_its_compressed_page(self):
+        # 64-token full pages, ratio 4: page p owns compressed rows [16p, 16p + 16).
+        buffers = [torch.zeros((80, 1, 8), dtype=torch.uint8) for _ in range(2)]
+        kvcache = SimpleNamespace(
+            qsa_compress_ratio=4,
+            qsa_compressed_page_size=16,
+            qsa_compressed_k_buffer_pool=buffers,
+        )
+        entry = _qsa_indexer_entry(kvcache, {1: 0, 3: 1})
+
+        self.assertEqual(entry.indices_from_pool, PoolName.KV)
+        full_page_2 = torch.arange(128, 192)
+        compressed = entry.translate_indices(full_page_2)
+        self.assertEqual(compressed.tolist(), list(range(32, 48)))
+        self.assertEqual(entry.prepare_locations(compressed), [32])
+        ptrs, sizes, _ = entry.get_prepared_layer_range_meta([32], 3)
+        self.assertEqual(ptrs, [[buffers[1][32].data_ptr()]])
+        self.assertEqual(sizes, [[16 * buffers[1][32].nbytes]])
 
 
 if __name__ == "__main__":

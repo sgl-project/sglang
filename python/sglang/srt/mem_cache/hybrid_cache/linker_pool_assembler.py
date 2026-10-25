@@ -498,15 +498,10 @@ def _mamba_device_pool_entry(
             "The direct external linker does not support --enable-unified-memory "
             "on hybrid Mamba models yet."
         )
-    # TODO(alphabetc1): support int8 Mamba checkpoints and Mamba side states.
-    if (
-        req_to_token_pool.mamba_ckpt_pool is not None
-        or req_to_token_pool.short_conv_pool.enabled
-        or req_to_token_pool.ngram_pool.enabled
-    ):
+    # TODO(alphabetc1): support int8 Mamba checkpoints.
+    if req_to_token_pool.mamba_ckpt_pool is not None:
         raise ValueError(
-            "The direct external linker does not support int8 Mamba checkpoints "
-            "or Mamba side states yet."
+            "The direct external linker does not support int8 Mamba checkpoints yet."
         )
 
     mamba_pool = req_to_token_pool.mamba_pool
@@ -531,6 +526,45 @@ def _mamba_device_pool_entry(
     )
 
 
+def _mamba_slot_state_entry(
+    req_to_token_pool: Any, start_layer: int
+) -> DevicePoolEntry | None:
+    from sglang.srt.mem_cache.ple_state_pool import PLE_NGRAM_STATE_LAYER_ID
+
+    buffers, layer_mapping = [], {}
+    states = (req_to_token_pool.short_conv_pool, req_to_token_pool.ngram_pool)
+    for state in (state for state in states if state.enabled):
+        for _, buffer, _, layer_id in state.iter_transfer_state_entries():
+            # Request-wide history is read before the first layer; it rides the
+            # first Mamba layer, the layer its reader waits for.
+            if layer_id == PLE_NGRAM_STATE_LAYER_ID:
+                layer_id = min(req_to_token_pool.mamba_map)
+            layer = layer_id - start_layer
+            layer_mapping[layer] = (*layer_mapping.get(layer, ()), len(buffers))
+            buffers.append(buffer)
+    if not buffers:
+        return None
+    return DevicePoolEntry(
+        name=PoolName.MAMBA_SLOT_STATE,
+        indices_from_pool=PoolName.MAMBA,
+        device_pool=req_to_token_pool.mamba_pool,
+        components=[buffers],
+        layer_mapping=layer_mapping,
+        page_size=1,
+        rows_are_pages=True,
+    )
+
+
+def _mamba_device_pool_entries(
+    req_to_token_pool: Any, start_layer: int
+) -> list[DevicePoolEntry]:
+    entries = [_mamba_device_pool_entry(req_to_token_pool, start_layer)]
+    slot_state = _mamba_slot_state_entry(req_to_token_pool, start_layer)
+    if slot_state is not None:
+        entries.append(slot_state)
+    return entries
+
+
 def _build_mamba_swa_device_pool_group(
     kvcache: Any, params: Any, page_size: int
 ) -> DevicePoolGroup:
@@ -546,10 +580,30 @@ def _build_mamba_swa_device_pool_group(
         _mha_device_pool_entry(
             PoolName.SWA, kvcache.swa_kv_pool, swa_mapping, page_size
         ),
-        _mamba_device_pool_entry(params.req_to_token_pool, kvcache.start_layer),
+        *_mamba_device_pool_entries(params.req_to_token_pool, kvcache.start_layer),
     ]
     num_layers = max(layer for entry in entries for layer in entry.layer_mapping)
     return DevicePoolGroup(entries, num_layers + 1, page_size)
+
+
+def _qsa_indexer_entry(kvcache: Any, full_mapping: dict[int, int]) -> DevicePoolEntry:
+    ratio = kvcache.qsa_compress_ratio
+
+    def compressed_indices(indices: torch.Tensor) -> torch.Tensor:
+        # A full page holds whole compression groups, so it maps to one
+        # compressed page; its pending ring is empty at every page boundary.
+        return indices.reshape(-1, ratio)[:, 0].div(ratio, rounding_mode="floor")
+
+    return DevicePoolEntry(
+        name=PoolName.INDEXER,
+        indices_from_pool=PoolName.KV,
+        device_pool=kvcache,
+        components=[kvcache.qsa_compressed_k_buffer_pool],
+        layer_mapping=full_mapping,
+        page_size=kvcache.qsa_compressed_page_size,
+        rows_are_pages=False,
+        index_mapper=compressed_indices,
+    )
 
 
 def _build_mamba_device_pool_group(
@@ -560,36 +614,47 @@ def _build_mamba_device_pool_group(
     )
     from sglang.srt.mem_cache.memory_pool import (
         HybridLinearKVPool,
+        MHATokenToKVPool,
         MLATokenToKVPool,
     )
+    from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
 
     # TODO(alphabetc1): support other full-attention pools, DCP and packed draft KV.
     full_kv_pool = kvcache.full_kv_pool
     if (
-        type(kvcache) is not HybridLinearKVPool
-        or type(full_kv_pool) is not MLATokenToKVPool
+        type(kvcache) not in (HybridLinearKVPool, QSATokenToKVPool)
+        or type(full_kv_pool) not in (MLATokenToKVPool, MHATokenToKVPool)
         or get_parallel().attn_dcp_size > 1
         or params.mtp_draft_device_pools
     ):
         raise ValueError(
             "The direct external linker supports FULL + MAMBA models only with a "
-            "plain MLA pool, without DCP or packed draft KV."
+            "plain MLA or MHA pool, without DCP or packed draft KV."
         )
 
-    entries = [
-        DevicePoolEntry(
+    full_mapping = _stage_local_layer_mapping(
+        kvcache.full_attention_layer_id_mapping, kvcache.start_layer
+    )
+    if type(full_kv_pool) is MHATokenToKVPool:
+        kv_entry = _mha_device_pool_entry(
+            PoolName.KV, full_kv_pool, full_mapping, page_size
+        )
+    else:
+        kv_entry = DevicePoolEntry(
             name=PoolName.KV,
             indices_from_pool=PoolName.KV,
             device_pool=full_kv_pool,
             components=[full_kv_pool.kv_buffer],
-            layer_mapping=_stage_local_layer_mapping(
-                kvcache.full_attention_layer_id_mapping, kvcache.start_layer
-            ),
+            layer_mapping=full_mapping,
             page_size=page_size,
             rows_are_pages=False,
-        ),
-        _mamba_device_pool_entry(params.req_to_token_pool, kvcache.start_layer),
+        )
+    entries = [
+        kv_entry,
+        *_mamba_device_pool_entries(params.req_to_token_pool, kvcache.start_layer),
     ]
+    if type(kvcache) is QSATokenToKVPool:
+        entries.append(_qsa_indexer_entry(kvcache, full_mapping))
     for draft_pool in params.sidecar_draft_device_pools:
         if draft_pool.page_size != page_size:
             raise ValueError("Draft KV page size must match the tree page size.")
