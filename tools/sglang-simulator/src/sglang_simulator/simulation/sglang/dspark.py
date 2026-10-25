@@ -209,7 +209,7 @@ class DSparkPhaseCost:
     evidence_ref: str
 
     def __post_init__(self):
-        if self.phase not in _PREFILL_PHASES + _DECODE_PHASES:
+        if self.phase not in _PREFILL_PHASES + _DECODE_PHASES + ("whole_worker",):
             _fail("unknown DSPark worker cost boundary")
         if (
             type(self.seconds) not in (float, int)
@@ -218,7 +218,7 @@ class DSparkPhaseCost:
             or type(self.evidence_ref) is not str
             or not self.evidence_ref
         ):
-            _fail("DSPark cost requires positive measured time and provenance")
+            _fail("DSPark cost requires positive time and provenance")
 
 
 @dataclass(frozen=True)
@@ -229,12 +229,29 @@ class DSparkStepTiming:
     phases: tuple[DSparkPhaseCost, ...]
 
     def validate_for(self, step):
+        whole_worker = (
+            type(self.phases) is tuple
+            and len(self.phases) == 1
+            and type(self.phases[0]) is DSparkPhaseCost
+            and self.phases[0].phase == "whole_worker"
+        )
+        if whole_worker:
+            modes = {group.forward_mode for group in step.groups} - {"IDLE"}
+            if step.topology != DSparkTopology(2, 2) or modes not in (
+                {"EXTEND"},
+                {"TARGET_VERIFY"},
+            ):
+                raise PredictorError(
+                    "data_unavailable",
+                    "whole-worker timing requires complete serialized TP2/ADP2 groups",
+                )
         if (
             type(self.forward_id) is not int
             or self.forward_id != step.forward_id
             or type(self.phases) is not tuple
             or any(type(cost) is not DSparkPhaseCost for cost in self.phases)
-            or tuple(cost.phase for cost in self.phases) != step.required_phases
+            or not whole_worker
+            and tuple(cost.phase for cost in self.phases) != step.required_phases
         ):
             raise PredictorError(
                 "data_unavailable", "DSPark timing omits or reorders worker boundaries"

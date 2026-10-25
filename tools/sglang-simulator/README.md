@@ -180,6 +180,26 @@ Source-law implementation and CPU tests do not establish native timing or
 Simulator/Pareto accuracy. Actual completion/overlap validation and complete
 C1 AgentX coverage require independent evidence beyond these CPU contracts.
 
+The source-only ADP2 library seam is separate from this factory. Its
+`SourceGoldenDPProgress` requires the SDK's `NativeDPProgressPolicy` and an
+explicit canonical cost-runtime context. Each active attention-TP singleton
+gets one local event hash shared by its ordered requests; idle groups draw
+nothing. Independent per-DP hashes are an explicit model assumption, not a
+replay or independence claim for native CPU generators. Each request retains
+its own visible OSL clipping and full native commit.
+
+The existing `DSparkStepTiming` also recognizes one exclusive `whole_worker`
+cost for a complete serialized TP2/ADP2 two-group step. It cannot be combined
+with region phases, used for ADP1, multiplied by DP, or obtained by summing two
+ADP1 calls. The existing session queries this one global-FID cost before progress
+and commits all causal histories once. A cost provider still owns full joint
+geometry, idle participation, per-DP buffers/planners/captures, source labeling
+and evidence. Cold buffers start independently; a warm peer supplies no state.
+The source policy validates neither the caller's cost-runtime JSON nor latency.
+This seam adds no performance row, theoretical formula or qualification and does
+not enable the native factory, actual peer scheduler routing or mixed phases.
+An ADP2 C64 run remains unavailable until those integrations and costs exist.
+
 Actual multi-DP scheduling/heterogeneous coordination, complete measured worker
 costs (including allocation), independently reviewed progress data and target
 source resolution remain required for a complete V4.1 AgentX run. The native runtime

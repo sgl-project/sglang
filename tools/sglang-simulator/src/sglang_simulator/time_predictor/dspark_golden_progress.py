@@ -126,3 +126,115 @@ class SourceGoldenDSparkProgress:
             tuple((request.rid, committed) for request in step.requests),
             self.model_ref,
         ).validate_for(step)
+
+
+class SourceGoldenDPProgress:
+    """Separate local draws for attention-TP singletons, not global TP sharing.
+
+    Independent per-DP hashes are an explicit modeled joint assumption. Native
+    CPU generators and their correlations/consumption are not reproduced. The
+    source-only SDK policy does not qualify costs or the caller's runtime JSON.
+    """
+
+    def __init__(self, source_policy, *, runtime_profile_json, model_seed):
+        from infercast.sdk.native_dp_progress import NativeDPProgressPolicy
+
+        _require(
+            type(source_policy) is NativeDPProgressPolicy,
+            "DP progress requires its SDK-verified singleton source policy",
+        )
+        _require(
+            type(model_seed) is int and model_seed >= 0,
+            "DP progress requires an explicit nonnegative integer model_seed",
+        )
+        try:
+            runtime = json.loads(runtime_profile_json)
+            valid = (
+                type(runtime_profile_json) is str
+                and isinstance(runtime, dict)
+                and bool(runtime)
+                and _canonical(runtime) == runtime_profile_json
+            )
+        except (TypeError, ValueError):
+            valid = False
+        _require(
+            valid, "DP progress requires a canonical explicit cost-runtime context"
+        )
+        _require(source_policy.golden_law == LAW, "DP progress source law differs")
+        self.runtime_profile_json = runtime_profile_json
+        self.capacities = source_policy.sampler_capacities
+        self.identity = {
+            "law": LAW,
+            "algorithm": "sha256_decode_event_dp_mod100_v1",
+            "joint_assumption": "independent_local_hashes_not_native_rng_replay",
+            "model_seed": model_seed,
+            "source_identity_sha256": source_policy.source_identity_sha256,
+            "runtime_profile_sha256": hashlib.sha256(
+                runtime_profile_json.encode()
+            ).hexdigest(),
+        }
+        self.model_ref = (
+            "sha256:" + hashlib.sha256(_canonical(self.identity).encode()).hexdigest()
+        )
+
+    def predict_progress(self, step):
+        _require(
+            (
+                step.topology.tp_size,
+                step.topology.attention_dp_size,
+                step.topology.pp_size,
+            )
+            == (2, 2, 1)
+            and step.runtime_profile_json == self.runtime_profile_json
+            and {group.forward_mode for group in step.groups} - {"IDLE"}
+            == {"TARGET_VERIFY"},
+            "DP progress requires complete serialized TP2/ADP2 decode groups and matching runtime context",
+        )
+        # Validate EVERY group before any event draw, including the last RID.
+        for group, capacity in zip(step.groups, self.capacities, strict=True):
+            _require(
+                len(group.requests) <= capacity,
+                "DP progress exceeds the source local sampler capacity",
+            )
+            for request in group.requests:
+                recipe = json.loads(request.sampling_params_json)
+                _require(
+                    request.extend_len == 6
+                    and request.emits_output is True
+                    and recipe.get("ignore_eos") is True
+                    and not any(
+                        recipe.get(k)
+                        for k in (
+                            "stop",
+                            "stop_regex",
+                            "stop_strs",
+                            "stop_regex_strs",
+                            "stop_token_ids",
+                            "json_schema",
+                            "regex",
+                            "ebnf",
+                            "structural_tag",
+                        )
+                    ),
+                    "DP progress requires static Q6 length-only requests",
+                )
+        counts = []
+        for group in step.groups:
+            if group.forward_mode == "IDLE":
+                continue
+            event = {
+                "model_ref": self.model_ref,
+                "forward_id": step.forward_id,
+                "attention_dp_rank": group.attention_dp_rank,
+            }
+            draw = (
+                int.from_bytes(
+                    hashlib.sha256(_canonical(event).encode()).digest(), "big"
+                )
+                % 100
+            )
+            committed = 4 if draw < 51 else 3
+            counts.extend((request.rid, committed) for request in group.requests)
+        return DSparkProgress(
+            step.forward_id, tuple(counts), self.model_ref
+        ).validate_for(step)
