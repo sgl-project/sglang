@@ -24,7 +24,6 @@ from sglang.srt.layers.dp_attention import (
     dp_gather_replicate,
     note_rank_barrier_in_prefill_graph,
 )
-from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -572,21 +571,17 @@ class DecoderReplayTail:
         """The graphs' body; mirrors the model loop past the tail switch."""
         model = self._model
         aux: List[torch.Tensor] = []
-        residual_batch.start(forward_batch)
-        hidden_states = residual_batch.set_written(state, forward_batch)
+        loop = hc_boundary.CudaLayerLoop.for_model(model)
+        carry = loop.enter_state(state, forward_batch)
         try:
             for i in self._layer_ids:
-                layer = model.layers[i]
-                assert layer.engram is None
+                assert model.layers[i].engram is None
                 if capture_dspark and i in model.dspark_layers_to_capture:
-                    call = hc_boundary.LayerCall(input_ids, input_ids_global)
-                    next_boundary = (
-                        hc_boundary.HcRead(layer, True)
-                        .bind(forward_batch, call)
-                        .next_boundary
-                    )
-                    hidden_states = state = hc_boundary.materialize(
-                        hidden_states, forward_batch, next=next_boundary
+                    carry, state = loop.state_before(
+                        i,
+                        carry,
+                        forward_batch,
+                        hc_boundary.LayerCall(input_ids, input_ids_global),
                     )
                     from sglang.kernels.ops.layernorm.mhc import mhc_stream_mean
 
@@ -598,18 +593,17 @@ class DecoderReplayTail:
                     else get_global_expert_distribution_recorder().with_current_layer(i)
                 )
                 with ctx:
-                    hidden_states = layer(
+                    carry = loop.run(
+                        i,
+                        carry,
                         positions=positions,
-                        hidden_states=hidden_states,
                         input_ids=input_ids,
                         forward_batch=forward_batch,
                         input_ids_global=input_ids_global,
                     )
-            state = residual_batch.read_output(
-                hidden_states, forward_batch, hc_boundary.FinalRead(), None
-            )
+            state = loop.leave(carry, forward_batch)
         finally:
-            residual_batch.clear(forward_batch)
+            loop.close(forward_batch)
         state = state.materialized(model.layers[self._layer_ids[-1]].hc_cfg)
         return state.residual, state.pre, aux
 

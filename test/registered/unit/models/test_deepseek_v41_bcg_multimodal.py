@@ -8,6 +8,7 @@ from unittest.mock import patch
 import torch
 
 import sglang.srt.models.deepseek_v4 as dsv4
+import sglang.srt.models.deepseek_v4_platform_stage as platform_stage
 from sglang.srt.layers.engram import engram_gate
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
@@ -117,6 +118,7 @@ class TestDeepseekV41BCGMultimodal(CustomTestCase):
                 ),
                 patch.object(dsv4, "check_cuda_graph_backend", return_value=True),
                 patch.object(dsv4, "_is_hip", False),
+                patch.object(platform_stage, "_is_hip", False),
             ):
                 actual, _, _ = dsv4.DeepseekV4Model._forward_layers_hc_pre_from_prev(
                     model, torch.arange(3), hidden, batch, ids, ids, False, []

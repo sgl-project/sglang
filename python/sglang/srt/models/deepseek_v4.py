@@ -176,9 +176,8 @@ from sglang.srt.models.deepseek_v2 import (
 from sglang.srt.models.deepseek_v4_mhc import MHC_POST_MULT_VALUE
 from sglang.srt.models.deepseek_v4_platform_stage import (
     NonCudaDecoderMixin,
+    PlatformLaggedLayerLoop,
     PlatformLayerLoop,
-    forward_layer_fused_boundary,
-    fused_boundary_attn_input,
 )
 from sglang.srt.models.deepseek_v4_replay_tail import (
     DecoderReplayTail,
@@ -3710,6 +3709,7 @@ DeepseekV4DecoderLayer = (
     DeepseekV4CudaDecoderLayer if _is_cuda else DeepseekV4PlatformDecoderLayer
 )
 LayerLoop = hc_boundary.CudaLayerLoop if _is_cuda else PlatformLayerLoop
+LaggedLayerLoop = hc_boundary.CudaLayerLoop if _is_cuda else PlatformLaggedLayerLoop
 
 
 class DeepseekV4Model(nn.Module):
@@ -4013,45 +4013,32 @@ class DeepseekV4Model(nn.Module):
             )
         tail_sentinel = positions.new_zeros((1,)) if tail_in_graph else None
         saved_full = None
-        # The HIP defer_post gate excludes residual readers. CUDA materializes
-        # its producer update explicitly before these readers below.
+        # The HIP defer_post gate excludes residual readers. On CUDA the loop
+        # completes the producer update before these readers (state_before).
         # mHC assumes full token rows per rank; LayerNorm SP needs its own path.
         assert not get_forward().sp_active
+        loop = LaggedLayerLoop.for_model(self, capture_dspark=capture_dspark)
         state = mhc.HcState(hidden_states)
-        if _is_cuda:
-            residual_batch.start(forward_batch)
-            hidden_states = residual_batch.set_written(state, forward_batch)
+        del hidden_states
+        carry = loop.enter_state(state, forward_batch)
         for i in range(self.start_layer, self.end_layer):
-            if _is_cuda:
-                layer = self.layers[i]
-                if (
-                    (
-                        (tail is not None or use_tail_graph)
-                        and i == self.late_layer_start
-                    )
-                    or layer.engram is not None
-                    or (capture_dspark and i in self.dspark_layers_to_capture)
-                ):
-                    call = hc_boundary.LayerCall(
-                        input_ids,
-                        input_ids_global,
-                    )
-                    next_boundary = (
-                        hc_boundary.HcRead(layer, True)
-                        .bind(forward_batch, call)
-                        .next_boundary
-                    )
-                    hidden_states = state = hc_boundary.materialize(
-                        hidden_states, forward_batch, next=next_boundary
-                    )
+            if (
+                ((tail is not None or use_tail_graph) and i == self.late_layer_start)
+                or self.layers[i].engram is not None
+                or (capture_dspark and i in self.dspark_layers_to_capture)
+            ):
+                carry, state = loop.state_before(
+                    i,
+                    carry,
+                    forward_batch,
+                    hc_boundary.LayerCall(input_ids, input_ids_global),
+                )
             if tail is not None and i == self.late_layer_start:
                 if self.tail_writes_source_kv:
                     source = self.layers[i]
-                    if _is_hip and source.hc_boundary_fused:
-                        # The previous FFN hc_post has not run yet, so run it here too.
-                        source_x = fused_boundary_attn_input(source, state)
-                    else:
-                        source_x = mhc.combine(source.attn_hc, state)
+                    # On HIP, a fused boundary has not run the previous hc_post
+                    # yet; source_input runs it here too.
+                    source_x = loop.source_input(i, state)
                     if _low_ratio_sources_break(attn_backend, forward_batch):
                         bcg_deepseek_v4_write_tail_source_kv(
                             source.self_attn, source_x, positions
@@ -4093,14 +4080,13 @@ class DeepseekV4Model(nn.Module):
                         )
                         if capture_dspark:
                             dspark_aux_hidden_states.extend(aux)
-                        residual_batch.clear(forward_batch)
+                        loop.close(forward_batch)
                         bcg_deepseek_v4_exit_late_layer_tail(tail_sentinel)
                         return residual, pre, tail
                 else:
                     saved_full = attn_backend.enter_late_layer_tail(forward_batch)
                 state = state.take_rows(tail.rows)
-                if _is_cuda:
-                    hidden_states = residual_batch.set_written(state, forward_batch)
+                carry = loop.write(carry, state, forward_batch)
                 input_ids = tail.rows(input_ids)
                 if not (
                     get_parallel().attn_dp_size > 1 and get_moe_a2a_backend().is_none()
@@ -4121,7 +4107,7 @@ class DeepseekV4Model(nn.Module):
                     )
                     if capture_dspark:
                         dspark_aux_hidden_states.extend(aux)
-                    residual_batch.clear(forward_batch)
+                    loop.close(forward_batch)
                     attn_backend.exit_late_layer_tail(saved_full, forward_batch)
                     return residual, pre, tail
             if use_tail_graph and tail is None and i == self.late_layer_start:
@@ -4136,7 +4122,7 @@ class DeepseekV4Model(nn.Module):
                 )
                 if capture_dspark:
                     dspark_aux_hidden_states.extend(aux)
-                residual_batch.clear(forward_batch)
+                loop.close(forward_batch)
                 return residual, pre, None
             if late_dp_counts is not None and i == self.late_layer_start:
                 saved_dp = enter_late_layer_dp(forward_batch, late_dp_counts)
@@ -4151,16 +4137,16 @@ class DeepseekV4Model(nn.Module):
             if engram is not None:
                 # No local name holds the pre-Engram residual: it would stay alive
                 # until the next Engram layer.
-                hidden_states = engram(
-                    state.residual,
-                    hash_ids[:, engram.layer_hash_index],
-                    forward_batch,
-                    input_ids=input_ids,
-                    cp_all_tokens=cp_extend,
+                state = state.with_residual(
+                    engram(
+                        state.residual,
+                        hash_ids[:, engram.layer_hash_index],
+                        forward_batch,
+                        input_ids=input_ids,
+                        cp_all_tokens=cp_extend,
+                    )
                 )
-                state = state.with_residual(hidden_states)
-                if _is_cuda:
-                    hidden_states = residual_batch.set_written(state, forward_batch)
+                carry = loop.write(carry, state, forward_batch)
             if capture_dspark and i in self.dspark_layers_to_capture:
                 from sglang.kernels.ops.layernorm.mhc import mhc_stream_mean
 
@@ -4175,40 +4161,21 @@ class DeepseekV4Model(nn.Module):
                 if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
                 else get_global_expert_distribution_recorder().with_current_layer(i)
             )
+            # Across the layer only the carry holds the residual: a state kept
+            # from a seam would outlive it where the layer does not release it
+            # (HIP's fused boundary).
+            state = None
             with ctx:
-                if _is_cuda:
-                    hidden_states = self.layers[i](
-                        positions=positions,
-                        hidden_states=hidden_states,
-                        input_ids=input_ids,
-                        forward_batch=forward_batch,
-                        input_ids_global=input_ids_global,
-                    )
-                else:
-                    if _is_hip and self.layers[i].hc_boundary_fused:
-                        state = forward_layer_fused_boundary(
-                            self,
-                            i,
-                            state,
-                            positions=positions,
-                            input_ids=input_ids,
-                            forward_batch=forward_batch,
-                            input_ids_global=input_ids_global,
-                            capture_dspark=capture_dspark,
-                        )
-                        continue
-                    state = self.layers[i].forward_hc_pre_from_prev(
-                        positions=positions,
-                        state=state,
-                        input_ids=input_ids,
-                        forward_batch=forward_batch,
-                        input_ids_global=input_ids_global,
-                    )
-        if _is_cuda:
-            state = residual_batch.read_output(
-                hidden_states, forward_batch, hc_boundary.FinalRead(), None
-            )
-            residual_batch.clear(forward_batch)
+                carry = loop.run(
+                    i,
+                    carry,
+                    positions=positions,
+                    input_ids=input_ids,
+                    forward_batch=forward_batch,
+                    input_ids_global=input_ids_global,
+                )
+        state = loop.leave(carry, forward_batch)
+        loop.close(forward_batch)
         state = state.materialized(self.layers[self.end_layer - 1].hc_cfg)
         if saved_dp is not None:
             exit_late_layer_dp(forward_batch, saved_dp)

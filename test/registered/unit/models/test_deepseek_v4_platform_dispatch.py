@@ -364,6 +364,56 @@ class TestLayerLoop(unittest.TestCase):
                 torch.testing.assert_close(out.hidden_states, expected)
                 self.assertIsNone(getattr(batch, "residual_stream", None))
 
+    def test_non_cuda_lagged_loop_sends_fused_layers_through_the_fused_boundary(self):
+        from sglang.srt.models import deepseek_v4_mhc as mhc
+
+        calls = []
+
+        class Layer:
+            def __init__(self, i, fused):
+                self.i, self.hc_boundary_fused = i, fused
+                self.attn_hc = f"attn_hc{i}"
+
+            def forward_hc_pre_from_prev(self, *, state, **call):
+                calls.append(("layer", self.i, sorted(call)))
+                return mhc.HcState(state.residual + 1)
+
+        def fused_boundary(model, i, state, *, capture_dspark, **call):
+            calls.append(("fused", i, capture_dspark, sorted(call)))
+            return mhc.HcState(state.residual + 10)
+
+        model = SimpleNamespace(layers=[Layer(0, True), Layer(1, False)])
+        call = dict(positions=1, input_ids=2, forward_batch=3, input_ids_global=4)
+        with (
+            patch.object(platform_stage, "_is_hip", True),
+            patch.object(
+                platform_stage, "forward_layer_fused_boundary", fused_boundary
+            ),
+            patch.object(
+                platform_stage,
+                "fused_boundary_attn_input",
+                side_effect=lambda layer, state: ("fused input", layer.i),
+            ),
+            patch.object(
+                platform_stage.mhc,
+                "combine",
+                side_effect=lambda hc, state: ("combine", hc),
+            ),
+        ):
+            loop = platform_stage.PlatformLaggedLayerLoop.for_model(
+                model, capture_dspark=True
+            )
+            carry = loop.enter_state(mhc.HcState(torch.zeros(1)), None)
+            self.assertEqual(loop.state_before(0, carry, None, None), (carry, carry))
+            for i in range(2):
+                carry = loop.run(i, carry, **call)
+            self.assertEqual(loop.source_input(0, carry), ("fused input", 0))
+            self.assertEqual(loop.source_input(1, carry), ("combine", "attn_hc1"))
+        state = loop.leave(carry, None)
+        torch.testing.assert_close(state.residual, torch.full((1,), 11.0))
+        keys = sorted(call)
+        self.assertEqual(calls, [("fused", 0, True, keys), ("layer", 1, keys)])
+
     def test_dspark_loop_returns_the_lagged_pre_with_the_streams(self):
         def stage(i, lagged):
             def run(*, positions, hidden_states, forward_batch, prev_pre):

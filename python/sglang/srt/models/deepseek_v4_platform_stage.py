@@ -6,7 +6,7 @@ The mixins own platform mHC state, fusion, and TBO operations.
 from __future__ import annotations
 
 from contextlib import contextmanager
-from functools import cached_property
+from functools import cached_property, partial
 from typing import TYPE_CHECKING, NamedTuple, Optional, Tuple, Union
 
 import torch
@@ -37,7 +37,7 @@ from sglang.srt.models.deepseek_common.moe_transport import (
     _tbo_wait_moe_output,
     shared_expert_runs_locally,
 )
-from sglang.srt.models.deepseek_v2 import MoEOutput
+from sglang.srt.models.deepseek_v2 import MoEOutput, _is_hip
 from sglang.srt.models.deepseek_v4_mhc import MHC_POST_MULT_VALUE, AttnOutput
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_gfx95_supported
@@ -622,7 +622,8 @@ class PlatformLayerLoop:
     """How a loop over decoder layers carries the residual off CUDA: the loop holds
     each layer's `DeferredHcPost` and completes the last one itself.
 
-    The interface matches `deepseek_v4_boundary.CudaLayerLoop`.
+    The interface matches `deepseek_v4_boundary.CudaLayerLoop`;
+    `PlatformLaggedLayerLoop` is its counterpart for the lagged pre-mix.
     """
 
     def __init__(self, layers):
@@ -652,6 +653,53 @@ class PlatformLayerLoop:
 
     def leave(self, carry, forward_batch):
         return carry.complete()
+
+    @staticmethod
+    def close(forward_batch):
+        pass
+
+
+class PlatformLaggedLayerLoop:
+    """`PlatformLayerLoop` for the lagged pre-mix: the loop carries the
+    `HcState` each layer returns, which is already the state a seam reads.
+    On HIP a layer with ``hc_boundary_fused`` runs through
+    ``fused_boundary`` (`forward_layer_fused_boundary`, bound to the model by
+    `for_model`)."""
+
+    def __init__(self, layers, fused_boundary):
+        self.layers = layers
+        self.fused_boundary = fused_boundary
+
+    @classmethod
+    def for_model(cls, model, *, capture_dspark=False):
+        return cls(
+            model.layers,
+            partial(forward_layer_fused_boundary, model, capture_dspark=capture_dspark),
+        )
+
+    def enter_state(self, state, forward_batch):
+        return state
+
+    def run(self, i, carry, **call):
+        layer = self.layers[i]
+        if _is_hip and layer.hc_boundary_fused:
+            return self.fused_boundary(i, carry, **call)
+        return layer.forward_hc_pre_from_prev(state=carry, **call)
+
+    def state_before(self, i, carry, forward_batch, call):
+        return carry, carry
+
+    def write(self, carry, state, forward_batch):
+        return state
+
+    def source_input(self, i, state):
+        layer = self.layers[i]
+        if _is_hip and layer.hc_boundary_fused:
+            return fused_boundary_attn_input(layer, state)
+        return mhc.combine(layer.attn_hc, state)
+
+    def leave(self, carry, forward_batch):
+        return carry
 
     @staticmethod
     def close(forward_batch):

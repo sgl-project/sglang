@@ -62,7 +62,7 @@ class TestHcConsumer(unittest.TestCase):
         aux = AuxHiddenStatePacker(1)
         recorder = SimpleNamespace(with_current_layer=lambda _: nullcontext())
         with (
-            patch.object(deepseek_v4, "_is_cuda", True),
+            patch.object(deepseek_v4, "LaggedLayerLoop", boundary.CudaLayerLoop),
             patch.object(deepseek_v4, "_is_hip", False),
             patch.object(deepseek_v4, "is_cp_active", return_value=False),
             patch.object(deepseek_v4, "check_cuda_graph_backend", return_value=False),

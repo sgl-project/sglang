@@ -378,13 +378,19 @@ class CudaLayerLoop:
     """How a loop over decoder layers carries the residual on CUDA: in the batch's
     residual stream, with the loop holding the handle each layer returns.
 
-    Off CUDA, `deepseek_v4_platform_stage.PlatformLayerLoop` (and
-    `PlatformDSparkLoop` for DSpark stages) have the same interface, so the
-    model, NextN and DSpark loops do not branch on the platform.
+    Off CUDA, `deepseek_v4_platform_stage.PlatformLayerLoop`,
+    `PlatformLaggedLayerLoop` (the lagged pre-mix) and `PlatformDSparkLoop`
+    (DSpark stages) each implement the part of this interface their loops use,
+    so the model, NextN, DSpark and replay-tail loops do not branch on the
+    platform.
     """
 
     def __init__(self, layers):
         self.layers = layers
+
+    @classmethod
+    def for_model(cls, model, *, capture_dspark=False):
+        return cls(model.layers)
 
     @staticmethod
     @contextmanager
@@ -403,12 +409,34 @@ class CudaLayerLoop:
         residual_batch.start(forward_batch)
         return hidden_states
 
+    def enter_state(self, state, forward_batch):
+        residual_batch.start(forward_batch)
+        return residual_batch.set_written(state, forward_batch)
+
     def run(self, i, carry, **call):
         return self.layers[i](hidden_states=carry, **call)
 
     def peek(self, carry, forward_batch):
         """The completed streams; the pending update stays with the stream."""
         return materialize(carry, forward_batch, consume=False)
+
+    def state_before(self, i, carry, forward_batch, call):
+        """Complete the pending update into the `HcState` layer ``i`` reads, for a
+        seam (tail start, Engram, DSpark capture) that reads the residual first.
+        Returns the new carry and that state."""
+        next_boundary = (
+            HcRead(self.layers[i], True).bind(forward_batch, call).next_boundary
+        )
+        state = materialize(carry, forward_batch, next=next_boundary)
+        return state, state
+
+    def write(self, carry, state, forward_batch):
+        """Replace the residual with ``state`` (Engram's output, the tail's rows)."""
+        return residual_batch.set_written(state, forward_batch)
+
+    def source_input(self, i, state):
+        """Layer ``i``'s attention input from a completed ``state``."""
+        return mhc.combine(self.layers[i].attn_hc, state)
 
     def leave(self, carry, forward_batch):
         return residual_batch.read_output(carry, forward_batch, FinalRead(), None)
