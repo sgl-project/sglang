@@ -10,6 +10,8 @@ suite reaches them. Runs on 2 ranks, and on 4 when four GPUs are visible:
 
 from __future__ import annotations
 
+import ctypes
+import errno
 import os
 import subprocess
 import sys
@@ -43,6 +45,35 @@ def _attend_rows(q, k, v):
         - v.roll(1, 1)[:, -rows:]
         + v[:, :rows] * 0.5
     ).to(q.dtype)
+
+
+def _deny_pidfd_getfd() -> None:
+    """Fail pidfd_getfd with EPERM in this process, as containers without ptrace
+    rights do; importing an expandable-segment IPC handle needs it."""
+
+    class Insn(ctypes.Structure):  # struct sock_filter
+        _fields_ = [
+            ("code", ctypes.c_uint16),
+            ("jt", ctypes.c_uint8),
+            ("jf", ctypes.c_uint8),
+            ("k", ctypes.c_uint32),
+        ]
+
+    class Prog(ctypes.Structure):  # struct sock_fprog
+        _fields_ = [("len", ctypes.c_uint16), ("filter", ctypes.POINTER(Insn))]
+
+    insns = (Insn * 4)(
+        Insn(0x20, 0, 0, 0),  # load the syscall number
+        Insn(0x15, 0, 1, 438),  # pidfd_getfd, the same number on every arch
+        Insn(0x06, 0, 0, 0x00050000 | errno.EPERM),  # SECCOMP_RET_ERRNO
+        Insn(0x06, 0, 0, 0x7FFF0000),  # SECCOMP_RET_ALLOW
+    )
+    libc = ctypes.CDLL(None, use_errno=True)
+    # PR_SET_NO_NEW_PRIVS, then PR_SET_SECCOMP with SECCOMP_MODE_FILTER
+    if libc.prctl(38, 1, 0, 0, 0) or libc.prctl(
+        22, 2, ctypes.byref(Prog(len(insns), insns)), 0, 0
+    ):
+        raise OSError(ctypes.get_errno(), "could not install the seccomp filter")
 
 
 def _worker() -> int:
@@ -326,7 +357,7 @@ def _worker() -> int:
 
 
 class TestIpcA2AMultiGpu(CustomTestCase):
-    def _run(self, world: int, port: int):
+    def _run(self, world: int, port: int, *worker_args: str, **env: str):
         if not current_platform.is_cuda():
             self.skipTest("CUDA-IPC transport is unavailable on this platform")
         if torch.cuda.device_count() < world:
@@ -340,10 +371,12 @@ class TestIpcA2AMultiGpu(CustomTestCase):
                 f"--master-port={port}",
                 __file__,
                 "--worker",
+                *worker_args,
             ],
             capture_output=True,
             text=True,
             timeout=1200,
+            env={**os.environ, **env},
         )
         print(proc.stdout[-4000:])
         if proc.returncode != 0:
@@ -358,8 +391,18 @@ class TestIpcA2AMultiGpu(CustomTestCase):
     def test_four_ranks_match_sequential_bitwise(self):
         self._run(4, 29537)
 
+    def test_two_ranks_engage_under_expandable_segments_without_pidfd_getfd(self):
+        self._run(
+            2,
+            29547,
+            "--deny-pidfd-getfd",
+            PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True",
+        )
+
 
 if __name__ == "__main__":
     if "--worker" in sys.argv:
+        if "--deny-pidfd-getfd" in sys.argv:
+            _deny_pidfd_getfd()
         raise SystemExit(_worker())
     unittest.main()
