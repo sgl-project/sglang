@@ -178,5 +178,5 @@ class Disagg(msgspec.Struct):
     sm_group_num: A[int, "Number of sm partition groups."] = 8
     disaggregation_decode_host_receive_threshold: A[
         float,
-        "Device token usage fraction at which incoming KV is received in the decode retraction host pool, excluding evictable cache pages. Range [0, 1]; 1 disables host receive (default), 0 always uses host receive. Size with --hicache-size or --hicache-ratio; requires dense NHD MHA buffers (including separate paged SWA pools) and a transfer backend that supports host destinations. No built-in backend currently supports this.",
+        "Device token usage fraction at which incoming KV is received in the decode retraction host pool, excluding evictable cache pages. Range [0, 1]; 1 disables host receive (default), 0 always uses host receive. Size with --hicache-size or --hicache-ratio; requires matching Host/Device page layouts and a transfer backend that supports host destinations. Supported layouts include dense NHD MHA (including GQA/MQA and separate paged SWA pools) and uncompressed layer_first MLA/shared-index DSA.",
     ] = 1.0

@@ -8,7 +8,7 @@ from typing import Any
 import torch
 
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
-from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
 from sglang.srt.mem_cache.pool_host.base import HostKVCache, shared_host_layout_domains
 
 
@@ -110,6 +110,40 @@ class HostPoolGroup:
                 continue
             host = entry.host_pool
             pools = (entry.device_pool, *entry.packed_draft_device_pools)
+            if isinstance(entry.device_pool, MLATokenToKVPool):
+                is_indexer = entry.name in (PoolName.INDEXER, PoolName.DRAFT_INDEXER)
+                infos = [
+                    pool.get_state_buf_infos()
+                    if is_indexer
+                    else pool.get_contiguous_buf_infos()
+                    for pool in pools
+                ]
+                device = tuple(
+                    [value for info in infos for value in info[i]] for i in range(3)
+                )
+                if is_indexer:
+                    # Native DSA wire retains skipped layers; Host storage is compact.
+                    host_by_device_ptr[0] = (0, 0, 0)
+                    for device_buffer, host_buffer in zip(
+                        host.packed_device_index_buffers,
+                        host.index_k_data_refs,
+                        strict=True,
+                    ):
+                        host_by_device_ptr[device_buffer.data_ptr()] = (
+                            host_buffer.data_ptr(),
+                            host_buffer.nbytes,
+                            host.indexer_page_stride_size,
+                        )
+                else:
+                    host_infos = host.get_contiguous_buf_infos()
+                    if device[2] != host_infos[2]:
+                        raise ValueError("Host main KV wire geometry differs")
+                    host_by_device_ptr.update(
+                        zip(device[0], zip(*host_infos), strict=True)
+                    )
+                for combined, values in zip(device_infos, device, strict=True):
+                    combined.extend(values)
+                continue
             for pool in pools:
                 dense_mha = (
                     isinstance(pool, MHATokenToKVPool)

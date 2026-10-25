@@ -156,6 +156,7 @@ class PrefillServerInfo:
 class PrefillRankInfo:
     rank_ip: str
     rank_port: int
+    supports_host_transfer: bool = False
 
     def __post_init__(self):
         self.rank_ip = str(self.rank_ip)
@@ -273,6 +274,7 @@ class DeferredAbortAckState(msgspec.Struct):
 
 
 class CommonKVManager(BaseKVManager):
+    supports_host_transfer: bool = False
     defer_decode_allocation: bool = False
     deferred_bootstrap: Optional[DeferredBootstrap] = None
 
@@ -1479,6 +1481,7 @@ class CommonKVManager(BaseKVManager):
             "system_dp_rank": self.system_dp_rank,
             "rank_ip": self.local_ip,
             "rank_port": self.rank_port,
+            "supports_host_transfer": self.supports_host_transfer,
             "page_size": self.kv_args.page_size,
             "kv_cache_dtype": self.kv_cache_dtype_str,
             "kv_layout": self.kv_layout,
@@ -2854,6 +2857,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             tp_group_table[pp_rank] = PrefillRankInfo(
                 rank_ip=rank_ip,
                 rank_port=rank_port,
+                supports_host_transfer=bool(data.get("supports_host_transfer", False)),
             )
 
             self._registered_count += 1

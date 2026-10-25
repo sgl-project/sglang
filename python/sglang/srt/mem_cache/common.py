@@ -361,6 +361,8 @@ def restore_kv_cache(
     req_to_token_pool: ReqToTokenPool,
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
     backend: str,
+    *,
+    defer_completion: bool = False,
 ) -> None:
     if backend == "cpu_tensor":
         req.load_kv_cache(req_to_token_pool, token_to_kv_pool_allocator)
@@ -372,8 +374,11 @@ def restore_kv_cache(
 
     unified_cache = cast("UnifiedRadixCache", tree_cache)
     assert req.kv.retraction_backup is not None
-    unified_cache.restore_kv_cache(req, req.kv.retraction_backup)
-    req.kv.retraction_backup = None
+    unified_cache.restore_kv_cache(
+        req, req.kv.retraction_backup, defer_completion=defer_completion
+    )
+    if not defer_completion:
+        req.kv.retraction_backup = None
 
 
 def discard_kv_cache_backup(

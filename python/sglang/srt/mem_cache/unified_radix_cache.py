@@ -63,7 +63,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     PPPrefetchDecision,
     PrefetchOperation,
 )
-from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
@@ -113,7 +113,7 @@ from sglang.srt.observability.metrics_collector import (
 )
 from sglang.srt.runtime_context import get_memory, get_model, get_observability
 from sglang.srt.session.streaming_session import StreamingSession, is_virtual_node
-from sglang.srt.utils.common import ceil_align
+from sglang.srt.utils.common import ceil_align, is_npu
 from sglang.srt.utils.poll_timer import PollTimer
 
 if TYPE_CHECKING:
@@ -170,8 +170,10 @@ class _OngoingLoadBack(NamedTuple):
     """Tracks an in-flight H→D load-back operation."""
 
     node_id: NodeId
-    lock_params: DecLockRefParams
-    host_lock_params: DecLockRefParams
+    lock_params: Optional[DecLockRefParams]
+    host_lock_params: Optional[DecLockRefParams]
+    req: Optional[Req] = None
+    backup: Optional[RetractionBackup] = None
 
 
 class _StoragePrefetchWait(msgspec.Struct):
@@ -1438,15 +1440,20 @@ class UnifiedRadixCache(BasePrefixCache):
                 }
                 <= self.host_pool_group.entry_map.keys()
             )
-        return isinstance(kv_cache, MHATokenToKVPool) and (
-            PoolName.KV in self.host_pool_group.entry_map
+        return PoolName.KV in self.host_pool_group.entry_map and (
+            isinstance(kv_cache, MHATokenToKVPool)
+            or (
+                isinstance(kv_cache, MLATokenToKVPool)
+                and not is_npu()
+                and not getattr(kv_cache, "kpool_use_compress", False)
+            )
         )
 
     def validate_retraction_host_capacity(self) -> None:
         if not self.supports_retraction_backup():
             raise ValueError(
                 "--disaggregation-decode-retraction-backup=host_pool requires "
-                "an MHA or hybrid-SWA HiCache host stack."
+                "a compatible HiCache host pool stack."
             )
 
         for spec in self.sidecar_pool_specs:
@@ -1569,7 +1576,13 @@ class UnifiedRadixCache(BasePrefixCache):
             raise
         return backup
 
-    def restore_kv_cache(self, req: Req, backup: RetractionBackup) -> None:
+    def restore_kv_cache(
+        self, req: Req, backup: RetractionBackup, *, defer_completion: bool = False
+    ) -> None:
+        # Request-owned operations use negative IDs, outside the tree node namespace.
+        restore_id = -id(backup)
+        if defer_completion and restore_id in self.ongoing_load_back:
+            return
         device_indices, current_transfers = self._retraction_device_transfers(req)
         assert len(backup.host_indices) == len(device_indices), (
             f"Host backup has {len(backup.host_indices)} slots, but restore has "
@@ -1604,6 +1617,13 @@ class UnifiedRadixCache(BasePrefixCache):
             node_id=-1,
             pool_transfers=resolved,
         )
+        if defer_completion:
+            operation.node_ids = [restore_id]
+            self.ongoing_load_back[restore_id] = _OngoingLoadBack(
+                restore_id, None, None, req, backup
+            )
+            self.cache_controller.load_queue.append(operation)
+            return
         load_host, load_device, load_pools = self.cache_controller._move_op_indices(
             operation
         )
@@ -1617,6 +1637,17 @@ class UnifiedRadixCache(BasePrefixCache):
         self.discard_kv_cache_backup(backup)
 
     def discard_kv_cache_backup(self, backup: RetractionBackup) -> None:
+        if -id(backup) in self.ongoing_load_back:
+            # Abort/pause may release a waiting request before its H2D ack is reaped.
+            ack = next(
+                ack
+                for ack in self.cache_controller.ack_load_queue
+                if -id(backup) in ack.node_ids
+            )
+            ack.finish_event.synchronize()
+            self.ongoing_load_back[-id(backup)] = self.ongoing_load_back[
+                -id(backup)
+            ]._replace(req=None)
         self.host_pool_group.free(backup.host_indices)
         self.host_pool_group.release_transfers(backup.pool_transfers)
 
@@ -3530,11 +3561,19 @@ class UnifiedRadixCache(BasePrefixCache):
                     and self.buffer_pipeline.try_finish_load_back(ack_id)
                 ):
                     continue
-                node, lock_params, host_lock_params = self.ongoing_load_back.pop(ack_id)
-                self.dec_lock_ref(node, lock_params)
-                self.dec_host_lock_ref(node, host_lock_params)
-                # Unpin the loaded nodes; host copies stay as reclaimable duplicates.
-                self.tree_core.finish_load_back(node)
+                load_back = self.ongoing_load_back.pop(ack_id)
+                if load_back.backup is not None:
+                    req = load_back.req
+                    if req is not None:
+                        self.discard_kv_cache_backup(load_back.backup)
+                        req.kv.retraction_backup = None
+                else:
+                    self.dec_lock_ref(load_back.node_id, load_back.lock_params)
+                    self.dec_host_lock_ref(
+                        load_back.node_id, load_back.host_lock_params
+                    )
+                    # Unpin loaded nodes; their host copies remain reclaimable.
+                    self.tree_core.finish_load_back(load_back.node_id)
 
             if self.metrics_collector is not None:
                 for pool, num_tokens in (ack.num_tokens_by_pool or {}).items():
@@ -3856,7 +3895,9 @@ class UnifiedRadixCache(BasePrefixCache):
                 (nid, wt.node_id) for nid, wt in self.ongoing_write_through.items()
             ]
         ongoing_load_back = [
-            (nid, lb.node_id) for nid, lb in self.ongoing_load_back.items()
+            (nid, lb.node_id)
+            for nid, lb in self.ongoing_load_back.items()
+            if lb.backup is None
         ]
         self.tree_core.sanity_check(ongoing_write_through, ongoing_load_back)
 

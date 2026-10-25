@@ -663,13 +663,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if get_disagg().disaggregation_decode_host_receive_threshold < 1:
             pool = self.token_to_kv_pool
             group = self.tree_cache.host_pool_group
-            if (kv_args.state_types and kv_args.state_types != [StateType.SWA]) or any(
+            if any(
+                state not in (StateType.SWA, StateType.DSA)
+                for state in kv_args.state_types
+            ) or any(
                 spec.indices_from_pool not in (PoolName.KV, PoolName.SWA)
                 for spec in self.tree_cache.sidecar_pool_specs
             ):
-                raise ValueError(
-                    "Host receive supports full KV and separate paged SWA pools"
-                )
+                raise ValueError("Unsupported Host receive state or index source")
             self.host_pool = group.get_pool(PoolName.KV)
             self.host_reserved_tokens = decode_retraction_max_tokens(
                 self.req_to_token_pool, pool
@@ -687,8 +688,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     if spec.indices_from_pool == source
                 }
 
+            state_pools = {
+                StateType.SWA: pool_names(PoolName.SWA),
+                StateType.DSA: {PoolName.INDEXER, PoolName.DRAFT_INDEXER},
+            }
+            separate_state_pools = set()
+            for state in kv_args.state_types:
+                separate_state_pools.update(state_pools[state])
             device_buffers, host_buffers = group.get_contiguous_buf_infos(
-                pool_names(PoolName.KV)
+                pool_names(PoolName.KV) - separate_state_pools
             )
             if device_buffers != (
                 kv_args.kv_data_ptrs,
@@ -705,7 +713,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             ) = host_buffers
             self.host_swa_pool = None
             self.host_swa_reserved_tokens = 0
-            if kv_args.state_types:
+            if StateType.SWA in kv_args.state_types:
                 self.host_swa_pool = group.get_pool(PoolName.SWA)
                 self.host_swa_reserved_tokens = min(
                     decode_retraction_max_tokens(
@@ -723,22 +731,24 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         "SWA host pool must hold a retraction and a receive page; "
                         "increase --hicache-size or --hicache-ratio"
                     )
+            kv_args.host_state_data_ptrs = []
+            kv_args.host_state_data_lens = []
+            kv_args.host_state_item_lens = []
+            for i, state in enumerate(kv_args.state_types):
                 device_state, host_state = group.get_contiguous_buf_infos(
-                    pool_names(PoolName.SWA)
+                    state_pools[state]
                 )
                 if device_state != (
-                    kv_args.state_data_ptrs[0],
-                    kv_args.state_data_lens[0],
-                    kv_args.state_item_lens[0],
+                    kv_args.state_data_ptrs[i],
+                    kv_args.state_data_lens[i],
+                    kv_args.state_item_lens[i],
                 ):
                     raise ValueError(
-                        "Host receive buffers must match the SWA transfer layout"
+                        "Host receive buffers must match the state transfer layout"
                     )
-                (
-                    kv_args.host_state_data_ptrs,
-                    kv_args.host_state_data_lens,
-                    kv_args.host_state_item_lens,
-                ) = ([values] for values in host_state)
+                kv_args.host_state_data_ptrs.append(host_state[0])
+                kv_args.host_state_data_lens.append(host_state[1])
+                kv_args.host_state_item_lens.append(host_state[2])
 
         kv_args.ib_device = get_disagg().disaggregation_ib_device
         kv_args.gpu_id = get_device().gpu_id
@@ -1872,7 +1882,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             return False
         indices_by_pool = {PoolName.KV: host_indices}
         transfers = []
-        state_indices = None
         if self.host_swa_pool is not None:
             swa_host_indices = self.host_swa_pool.alloc(swa_num_tokens)
             if swa_host_indices is None:
@@ -1882,7 +1891,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             transfers.append(
                 PoolTransfer(name=PoolName.SWA, host_indices=swa_host_indices)
             )
-            state_indices = [kv_to_page_indices(swa_host_indices, page_size)]
+        state_indices = [
+            kv_to_page_indices(
+                indices_by_pool[
+                    PoolName.SWA if state == StateType.SWA else PoolName.KV
+                ],
+                page_size,
+            )
+            for state in self.kv_manager.kv_args.state_types
+        ] or None
         assert decode_req.req.kv.retraction_backup is None
         decode_req.req.kv.retraction_backup = RetractionBackup(
             host_indices=host_indices,
@@ -3327,6 +3344,27 @@ class SchedulerDisaggregationDecodeMixin:
             else:
                 waiting_queue.append(req)
 
+        if get_disagg().disaggregation_decode_host_receive_threshold < 1:
+            restoring = [
+                req for req in can_run_list if req.kv.retraction_backup is not None
+            ]
+            if restoring and self.tree_cache.has_free_load_back_slot():
+                for req in restoring:
+                    restore_kv_cache(
+                        req,
+                        self.tree_cache,
+                        self.req_to_token_pool,
+                        self.token_to_kv_pool_allocator,
+                        "host_pool",
+                        defer_completion=True,
+                    )
+                self.tree_cache.ready_to_load_host_cache()
+            # Native ack processing clears the backup only after rank-agreed
+            # completion. Until then, retain the request and its device slots.
+            waiting_queue = restoring + waiting_queue
+            can_run_list = [
+                req for req in can_run_list if req.kv.retraction_backup is None
+            ]
         self.waiting_queue = waiting_queue
         if len(can_run_list) == 0:
             return None
@@ -3350,21 +3388,14 @@ class SchedulerDisaggregationDecodeMixin:
             # A finished request can still have one redundant forward in flight.
             # Drain it before a prebuilt request seeds a potentially reused row.
             self.schedule_stream.wait_stream(self.forward_stream)
-        if get_disagg().disaggregation_decode_host_receive_threshold < 1:
-            for req in new_batch.reqs:
-                if req.kv.retraction_backup is not None:
-                    restore_kv_cache(
-                        req,
-                        self.tree_cache,
-                        self.req_to_token_pool,
-                        self.token_to_kv_pool_allocator,
-                        "host_pool",
-                    )
         return new_batch
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
     def process_decode_queue(self: Scheduler):
-        if self.enable_decode_hicache:
+        if (
+            self.enable_decode_hicache
+            or get_disagg().disaggregation_decode_host_receive_threshold < 1
+        ):
             self.tree_cache.check_hicache_events()
 
         if get_disagg().disaggregation_decode_enable_offload_kvcache:

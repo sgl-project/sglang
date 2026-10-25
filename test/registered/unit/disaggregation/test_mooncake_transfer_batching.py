@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, call, patch
 
 import numpy as np
 
-from sglang.srt.disaggregation.base.conn import KVPoll, StateType
+from sglang.srt.disaggregation.base.conn import KVPoll, KVTransferDestination, StateType
 from sglang.srt.disaggregation.common.utils import TransferKVChunk
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager, MooncakeKVSender
 from sglang.srt.disaggregation.utils import DisaggregationMode
@@ -467,6 +467,7 @@ class TestMooncakeEarlySend(unittest.TestCase):
         peer = SimpleNamespace(
             is_dummy=False,
             mooncake_session_id="peer",
+            destination=KVTransferDestination.DEVICE,
             dst_device_kv_indices=None,
             dst_kv_indices=[10],
         )
