@@ -529,9 +529,11 @@ class MoeTransport(MoeRowTransport):
         self.input = None
         if isinstance(hidden_states, MoEOutput):
             completion = MoeFinalize(hidden_states)
+            # No declared sum group means the compute (a2a combine, MegaMoE)
+            # already completed the sum; only the local finalize is left.
             return (
                 completion.complete(reduce=False)
-                if self.mlp_reduce_scatter
+                if self.mlp_reduce_scatter or self.rows.group is None
                 else completion
             )
         if self.rows.group is not None and not self.mlp_reduce_scatter:
