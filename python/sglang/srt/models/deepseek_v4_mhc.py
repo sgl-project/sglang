@@ -536,8 +536,8 @@ def post(
     if _is_npu:
         if not is_npu_arch35():
             return torch.ops.custom.npu_hc_post(x, residual, post_mix, comb)
-        # The A5 build of npu_hc_post is batched -- it requires a leading batch axis
-        # on every operand.
+        # The Ascend 950 build of npu_hc_post is batched -- it requires a leading
+        # batch axis on every operand.
         return torch.ops.custom.npu_hc_post(
             x.unsqueeze(0),
             residual.unsqueeze(0),
