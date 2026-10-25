@@ -4,6 +4,7 @@ import importlib.util
 import os
 import subprocess
 import sys
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -92,6 +93,63 @@ for method, hf in [('unknown', None), ('awq', {'quant_method': 'fp8'})]:
 """,
         bootstrap=True,
         cpu=True,
+    )
+
+
+@pytest.mark.parametrize("cpu_override", [None, "0", "1"])
+def test_in_process_entry_prepares_compat_before_runtime_import(cpu_override):
+    # Intercept only the compatibility call. Import the actual public entry
+    # point in a fresh interpreter, without needing accelerator dependencies.
+    run_python(
+        f"""
+import os, sys
+sys.path.insert(0, {str(Path(__file__).resolve().parents[3])!r})
+assert 'SGLANG_SIMULATOR_BOOTSTRAP' not in os.environ
+assert 'SGLANG_USE_CPU_ENGINE' not in os.environ
+override = {cpu_override!r}
+if override is not None:
+    os.environ['SGLANG_USE_CPU_ENGINE'] = override
+import usercustomize
+
+class CompatReached(Exception):
+    pass
+
+def check_compat():
+    assert os.environ['SGLANG_SIMULATOR_BOOTSTRAP'] == '1'
+    assert os.environ['SGLANG_USE_CPU_ENGINE'] == (override or '1')
+    raise CompatReached
+
+usercustomize.apply_cpu_simulation_compat = check_compat
+try:
+    from benchmark.simulator.bench_runner import SGLangBenchmarkRunner
+except CompatReached:
+    pass
+else:
+    raise AssertionError('public entry skipped early compatibility setup')
+"""
+    )
+
+
+@requires_cpu_runtime
+def test_in_process_public_entry_imports_native_quantization_with_flags_absent():
+    run_python(
+        f"""
+import os, sys
+sys.path.insert(0, {str(Path(__file__).resolve().parents[3])!r})
+assert 'SGLANG_SIMULATOR_BOOTSTRAP' not in os.environ
+assert 'SGLANG_USE_CPU_ENGINE' not in os.environ
+from benchmark.simulator.bench_runner import SGLangBenchmarkRunner
+from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.layers.quantization import QUANTIZATION_METHODS
+from sglang.srt.layers.quantization.fp8 import Fp8Config
+import torch
+assert SGLangBenchmarkRunner.__module__ == 'benchmark.simulator.bench_runner'
+assert os.environ['SGLANG_SIMULATOR_BOOTSTRAP'] == '1'
+assert os.environ['SGLANG_USE_CPU_ENGINE'] == '1'
+assert torch.version.hip is None
+assert QUANTIZATION_METHODS['fp8'] is Fp8Config
+assert 'aiter' not in sys.modules
+"""
     )
 
 

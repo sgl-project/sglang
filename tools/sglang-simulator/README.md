@@ -370,6 +370,11 @@ python3 -m pytest -q test/test_simulation_sglang_runner.py
 python3 -m pytest -q test/test_simulation_sglang_serving.py
 ```
 
+The direct `SGLangBenchmarkRunner` entry point defaults both CPU bootstrap
+flags to `1` before importing SGLang, matching the serving benchmark adapter.
+Explicit environment values are preserved. The compatibility shim still
+requires both flags to equal `1`; native quantization validation remains active.
+
 Read these tests as the minimal maintained examples for constructing a dataset,
 running a benchmark, starting a simulator server, sending programmatic, ShareGPT,
 or timestamped traffic, comparing execution modes, and collecting request,

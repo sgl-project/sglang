@@ -6,12 +6,24 @@ import json
 import os
 from typing import Iterator
 
-import numpy as np
-from msgspec.structs import asdict
-from sglang_simulator.compat import apply_simulator_server_args
-from sglang_simulator.dataset import BaseDataset, GenericRequest
-from sglang_simulator.simulation.benchmark import BaseBenchmarkRunner, BenchmarkConfig
-from sglang_simulator.utils.logger import get_logger
+# Like the serving benchmark entry point, direct simulator use defaults to
+# CPU dummy execution before importing SGLang's accelerator-sensitive modules.
+os.environ.setdefault("SGLANG_USE_CPU_ENGINE", "1")
+os.environ.setdefault("SGLANG_SIMULATOR_BOOTSTRAP", "1")
+
+from usercustomize import apply_cpu_simulation_compat
+
+apply_cpu_simulation_compat()
+
+import numpy as np  # noqa: E402
+from msgspec.structs import asdict  # noqa: E402
+from sglang_simulator.compat import apply_simulator_server_args  # noqa: E402
+from sglang_simulator.dataset import BaseDataset, GenericRequest  # noqa: E402
+from sglang_simulator.simulation.benchmark import (  # noqa: E402
+    BaseBenchmarkRunner,
+    BenchmarkConfig,
+)
+from sglang_simulator.utils.logger import get_logger  # noqa: E402
 
 SGLANG_SIMULATOR_OUTPUT_DIR = os.getenv(
     "SGLANG_SIMULATOR_OUTPUT_DIR", "/tmp/sglang_simulator/output"
