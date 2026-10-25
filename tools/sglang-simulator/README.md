@@ -983,8 +983,8 @@ The ordinary scheduler path binds DSPark shape and timing accounting to the exac
 returned result. Offline accounting excludes replacement-worker wall time once
 in the host interval containing its launches, including multiple launches before
 result processing. Pending results must drain before profiling resets accounting.
-In coordinated runs, native result processing and its pending-result decrement
-both finish before the coordinator publishes a terminal or timer Grant.
+After native result processing, its pending-result decrement completes before
+the coordinator publishes any post-result terminal or timer Grant.
 Coordinator delegation retains its existing clock contract. The native-region
 driver uses the original overlap loop; other predictors retain their existing
 loop behavior. SGLang Simulator owns scheduling, batching, cache/lifecycle behavior
