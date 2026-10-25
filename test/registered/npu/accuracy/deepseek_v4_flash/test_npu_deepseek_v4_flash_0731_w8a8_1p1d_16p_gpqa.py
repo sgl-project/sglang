@@ -137,6 +137,7 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS = [
     1.5,
     "--hicache-write-policy",
     "write_through",
+    "--enable-cache-report",
     "--max-total-tokens",
     130000,
 ]
