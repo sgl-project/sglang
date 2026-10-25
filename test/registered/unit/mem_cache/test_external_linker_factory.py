@@ -25,8 +25,9 @@ from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
 from sglang.srt.mem_cache.unified_cache.linker_config import UnifiedCacheLinkerConfig
 from sglang.srt.mem_cache.unified_cache.linker_factory import (
     create_unified_cache_linker,
+    get_startup_linker_config,
 )
-from sglang.srt.runtime_context import get_context
+from sglang.srt.runtime_context import get_context, get_memory
 from sglang.srt.server_args import ServerArgs
 
 _CONFIG = {
@@ -57,6 +58,15 @@ class AbstractLinker(UnifiedCacheLinker):
 
 not_a_class = 42
 """
+
+
+def _create_startup_linker(*args, **kwargs):
+    return create_unified_cache_linker(
+        *args,
+        backend=get_memory().unified_cache_external_linker_backend,
+        config=get_startup_linker_config(),
+        **kwargs,
+    )
 
 
 class TestExternalLinkerConfig(unittest.TestCase):
@@ -207,7 +217,7 @@ class TestExternalLinkerFactory(unittest.TestCase):
             unified_cache_external_linker_backend="dynamic",
             unified_cache_external_linker_config={**_CONFIG, **config},
         ):
-            return create_unified_cache_linker(
+            return _create_startup_linker(
                 "args", "params", components={"full"}, forward_stream=forward_stream
             )
 
@@ -266,14 +276,14 @@ class TestExternalLinkerFactory(unittest.TestCase):
                     ),
                     patch(target) as constructor,
                 ):
-                    result = create_unified_cache_linker(
+                    result = _create_startup_linker(
                         "args", "params", components={"full"}, forward_stream=stream
                     )
                     constructor.assert_called_once_with(
                         "args",
                         "params",
                         components={"full"},
-                        extra_config=config,
+                        extra_config=config or {},
                         forward_stream=stream,
                     )
                     self.assertIs(result, constructor.return_value)
@@ -284,6 +294,28 @@ class TestExternalLinkerFactory(unittest.TestCase):
                         passed_config["backend_option"]["value"] = 2
                         self.assertEqual(config["backend_option"]["value"], 1)
 
+    def test_explicit_config_does_not_read_launch_defaults(self):
+        with get_context().override_server_args(
+            unified_cache_external_linker_backend="dynamic",
+            unified_cache_external_linker_config=_CONFIG,
+            hicache_storage_backend_extra_config='{"master_server_address": "old"}',
+        ):
+            for config in (None, {}):
+                with (
+                    self.subTest(config=config),
+                    patch(
+                        "sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker.MooncakeDirectLinker"
+                    ) as constructor,
+                ):
+                    create_unified_cache_linker(
+                        "args",
+                        "params",
+                        backend="mooncake",
+                        config=config,
+                        components={"full"},
+                    )
+                    self.assertEqual(constructor.call_args.kwargs["extra_config"], {})
+
     def test_dynamic_requires_config_in_worker(self):
         with (
             get_context().override_server_args(
@@ -292,7 +324,7 @@ class TestExternalLinkerFactory(unittest.TestCase):
             ),
             self.assertRaisesRegex(ValueError, "must be a JSON object"),
         ):
-            create_unified_cache_linker("args", "params", components={"full"})
+            _create_startup_linker("args", "params", components={"full"})
 
 
 class TestBuiltinLinkerConfig(unittest.TestCase):
@@ -343,7 +375,7 @@ class TestBuiltinLinkerConfig(unittest.TestCase):
                     ) as storage_config,
                     self.assertRaisesRegex(RuntimeError, "storage boundary"),
                 ):
-                    create_unified_cache_linker("args", params, components={"full"})
+                    _create_startup_linker("args", params, components={"full"})
                 passed = storage_config.call_args.kwargs["extra_config"]
                 expected = legacy if config is None else config
                 self.assertEqual(

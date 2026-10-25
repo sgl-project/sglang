@@ -1485,8 +1485,15 @@ class SchedulerDisaggregationPrefillMixin:
             else:
                 if end_idx is None:
                     end_idx = min(req.extend_end, len(req.origin_input_ids))
-                page_indices_gpu = page_indices_for_request(self, req, end_idx)
-                state_indices = state_indices_for_request(self, req, end_idx)
+                # Only the pages this prefill sends; decode digests the same
+                # range of its row, past the prefix it promised at bootstrap.
+                start_idx = req.disagg_decode_prefix_len
+                page_indices_gpu = page_indices_for_request(
+                    self, req, end_idx, start_idx=start_idx
+                )
+                state_indices = state_indices_for_request(
+                    self, req, end_idx, start_idx=start_idx
+                )
                 digest = computer.compute(page_indices_gpu, state_indices)
                 signature = self.disagg_prefill_bootstrap_queue.kv_checksum_signature
             self.disagg_metadata_buffers.set_kv_checksum(req, digest, signature)

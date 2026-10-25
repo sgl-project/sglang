@@ -70,7 +70,7 @@ class _DSV41FlashLinkerServer:
                 "64",
                 "--enable-cache-report",
                 "--enable-unified-cache-external-linker",
-                "--hicache-storage-backend-extra-config",
+                "--unified-cache-external-linker-config",
                 json.dumps({"enable_group_semantics": True}),
                 *cls.extra_args,
             ],
