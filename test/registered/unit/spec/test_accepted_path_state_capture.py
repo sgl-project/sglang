@@ -134,14 +134,23 @@ class TestAcceptedPathStateCapture(CustomTestCase):
             forward_mode=ForwardMode.TARGET_VERIFY,
             seq_lens_cpu=torch.tensor([SEQ_LEN, SEQ_LEN]),
         )
-        scheduler = SimpleNamespace(token_to_kv_pool_allocator=object())
-        with patch(
-            "sglang.srt.speculative.spec_utils.move_accept_tokens_to_target_kvcache",
-            autospec=True,
-        ) as move:
-            SchedulerPPMixin._pp_spec_compact_accept_kv(
+        scheduler = SimpleNamespace(
+            token_to_kv_pool_allocator=object(),
+            pp_group=SimpleNamespace(is_last_rank=True),
+        )
+        with (
+            patch(
+                "sglang.srt.speculative.spec_utils.move_accept_tokens_to_target_kvcache",
+                autospec=True,
+            ) as move,
+            patch(
+                "sglang.srt.managers.scheduler_pp_mixin.get_spec",
+                return_value=SimpleNamespace(speculative_eagle_topk=4),
+            ),
+        ):
+            SchedulerPPMixin._pp_spec_commit_relayed_accept(
                 scheduler,
-                SimpleNamespace(),
+                SimpleNamespace(tree_cache=object()),
                 fwd_batch,
                 ["first", "second"],
                 ["second"],
