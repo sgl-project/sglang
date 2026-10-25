@@ -1,5 +1,6 @@
 import asyncio
 import pickle
+import threading
 import uuid
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -8,12 +9,85 @@ import pytest
 import zmq
 import zmq.asyncio
 
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.runtime.distributed.ipc_cuda import CudaIpcRef
+from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.scheduler_client import (
     AsyncSchedulerClient,
     SchedulerClient,
     run_zeromq_broker,
 )
 from sglang.multimodal_gen.runtime.server_args import MAX_SCHEDULER_RPC_TIMEOUT_S
+
+
+@pytest.mark.parametrize(
+    "invalid", ["pickle", "truncated", "protocol", "module", "empty", "cuda"]
+)
+@pytest.mark.parametrize("reply_blocked", [False, True])
+def test_scheduler_isolates_invalid_messages_and_replies(invalid, reply_blocked):
+    bad_ref = CudaIpcRef(
+        dtype="invalid_dtype",
+        shape=(1,),
+        stride=(1,),
+        storage_offset=0,
+        device_index=0,
+        handle=b"",
+        storage_size_bytes=1,
+        storage_offset_bytes=0,
+        ref_counter_handle=b"",
+        ref_counter_offset=0,
+        event_handle=b"",
+        event_sync_required=False,
+    )
+    payload = {
+        "pickle": b"invalid pickle",
+        "truncated": b"",
+        "protocol": b"\x80\xff.",
+        "module": b"cnot_installed_sglang_extension\nMissingRequest\n.",
+        "empty": pickle.dumps([]),
+        "cuda": pickle.dumps({"tensor": bad_ref}),
+    }[invalid]
+    context = zmq.Context()
+    receiver = context.socket(zmq.ROUTER)
+    client = context.socket(zmq.DEALER)
+    endpoint = f"inproc://message-isolation-{uuid.uuid4().hex}"
+    receiver.bind(endpoint)
+    client.connect(endpoint)
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.receiver = receiver
+    scheduler._socket_lock = threading.Lock()
+    scheduler.server_args = SimpleNamespace(
+        comfyui_mode=False,
+        sp_degree=1,
+        enable_cfg_parallel=False,
+        tp_size=1,
+    )
+    try:
+        before = Req(sampling_params=SamplingParams(prompt="before"))
+        after = Req(sampling_params=SamplingParams(prompt="after"))
+        for message in (pickle.dumps([before]), payload, pickle.dumps([after])):
+            client.send_multipart([b"", message])
+        if reply_blocked:
+            scheduler.receiver = MagicMock(wraps=receiver)
+            scheduler.receiver.send_multipart.side_effect = zmq.Again()
+        items = scheduler.recv_reqs()
+        assert [req.prompt for _, req in items] == ["before", "after"]
+        if reply_blocked:
+            scheduler.receiver.send_multipart.assert_called_once()
+        else:
+            assert client.poll(1000)
+            reply = client.recv_multipart()
+            assert reply[0] == b""
+            result = pickle.loads(reply[1])
+            assert isinstance(result, OutputBatch)
+            assert result.error.startswith("Invalid scheduler request:")
+        client.send_multipart([b"", pickle.dumps([after])])
+        assert scheduler.recv_reqs()[0][1].prompt == "after"
+    finally:
+        client.close(linger=0)
+        receiver.close(linger=0)
+        context.term()
 
 
 def test_sync_scheduler_client_converts_configured_seconds_to_milliseconds():

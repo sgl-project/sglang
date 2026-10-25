@@ -77,6 +77,7 @@ else:
     )
     from sgl_kernel.memory import weak_ref_tensor
     from sgl_kernel.moe import (
+        apply_gguf_moe_weights,
         apply_shuffle_mul_sum,
         fp8_blockwise_scaled_grouped_mm,
         fused_qk_norm_rope,
@@ -145,6 +146,7 @@ else:
         )
 
     _DEBUG_EXPORT_NAMES = [
+        "apply_gguf_moe_weights",
         "apply_shuffle_mul_sum",
         "apply_token_bitmask_inplace_cuda",
         "build_tree_kernel_efficient",
