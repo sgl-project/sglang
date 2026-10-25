@@ -2,10 +2,10 @@ import torch
 import triton  # type: ignore
 import triton.language as tl  # type: ignore
 
+from sglang.kernels.numerics import mul_rn_f32
 from sglang.kernels.ops.diffusion.common.fallback_torch import (
     fuse_scale_shift_kernel_native,
 )
-from sglang.kernels.ops.diffusion.common.numerics import mul_rn_f32
 from sglang.kernels.ops.diffusion.common.platform import (
     is_cuda,
     is_hip,
@@ -557,6 +557,11 @@ def fuse_scale_shift_kernel(
                 output.copy_(x)
                 return output
 
+        # NVIDIA: rows of up to 1024 channels, 4096 elements per program, 1.5-1.65x
+        # the 128x128 tile on B300 from ~10M elements up (same bytes)
+        if x.is_cuda and not is_hip():
+            block_c = min(1024, triton.next_power_of_2(C))
+            block_l = max(1, 4096 // block_c)
         grid = (triton.cdiv(L, block_l), triton.cdiv(C, block_c), B)
         fuse_scale_shift_kernel_blc_opt[grid](
             x,

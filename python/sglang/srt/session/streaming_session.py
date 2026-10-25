@@ -80,10 +80,19 @@ class StreamingSession:
         if slot is None or not slot.kv.holds_kv:
             return None
         if req.to_finish is not None:
+            req.release_mm_inputs_on_abort()
             req.session.abort_req()
             req.session = None
             return None
         return slot
+
+    def will_lend_record(self, req: Optional[Req]) -> bool:
+        """Whether req has a slot record to borrow. Unlike find_active_slot, it
+        leaves a pre-aborted req attached."""
+        if not _is_streaming(req) or req.to_finish is not None:
+            return False
+        slot = self.slots.get(req.session.session_id)
+        return slot is not None and slot.kv.holds_kv
 
     def try_match_prefix(self, params: MatchPrefixParams) -> Optional[MatchResult]:
         """Returns a MatchResult iff the request hits an active session slot;
@@ -160,6 +169,7 @@ class StreamingSession:
             # Hand the record and the tree lock back; the caller releases them.
             del self.slots[req.session.session_id]
             req.lock, slot.lock = slot.lock, None
+            req.release_mm_inputs_on_abort()
             req.session.abort_req()
             return False
 
@@ -245,9 +255,12 @@ class StreamingSession:
             mamba_allocator.free(slot.kv.mamba_pool_idx.unsqueeze(0))
             slot.kv.mamba_pool_idx = None
         if slot.kv.mamba_ping_pong_track_buffer is not None:
-            indices = slot.kv.mamba_ping_pong_track_buffer
-            mamba_allocator.free(indices[indices != -1])
+            buffer = slot.kv.mamba_ping_pong_track_buffer
+            for position, empty in enumerate(slot.kv.mamba_ping_pong_empty):
+                if not empty:
+                    mamba_allocator.free(buffer[position : position + 1])
             slot.kv.mamba_ping_pong_track_buffer = None
+            slot.kv.mamba_ping_pong_empty = None
 
     # -- Internal helpers (streaming body bits) --
 
@@ -280,9 +293,9 @@ class StreamingSession:
     def _free_kv_aligned(self, kv: ReqKvInfo, target: int, end: int) -> None:
         """Free [ceil_align(target), end): paged free returns whole pages, so
         the partial page stays until release_session."""
-        if end <= target:
-            return
         start = target
         if self.cache.page_size > 1:
             start = ceil_align(start, self.cache.page_size)
+        if end <= start:
+            return
         self.cache.free_kv_row(kv, [(start, end)])

@@ -106,11 +106,12 @@ class HiCacheNixl(HiCacheStorage):
         self.backup_skip = self.is_mla_model and storage_config.tp_rank != 0
 
         model_name = "-".join(model_name.split("/")) if model_name else ""
+        self.tp_config_suffix = f"_{model_name}_{tp_rank}_{tp_size}"
 
         if self.is_mla_model:
             self.config_suffix = f"_{model_name}"
         else:
-            self.config_suffix = f"_{model_name}_{tp_rank}_{tp_size}"
+            self.config_suffix = self.tp_config_suffix
 
         sync_mode = getattr(
             nixlBind, "NIXL_THREAD_SYNC_RW", nixlBind.NIXL_THREAD_SYNC_STRICT
@@ -182,7 +183,10 @@ class HiCacheNixl(HiCacheStorage):
         if self._l3_cleaner is not None:
             self._l3_cleaner.start()
 
-    def _get_suffixed_key(self, key: str) -> str:
+    def _get_suffixed_key(self, key: str, pool_name: Optional[PoolName] = None) -> str:
+        # Mamba state is TP-sharded even when the model's MLA KV is replicated.
+        if pool_name == PoolName.MAMBA:
+            return key + self.tp_config_suffix
         return key + self.config_suffix
 
     def _get_component_key(
@@ -190,7 +194,7 @@ class HiCacheNixl(HiCacheStorage):
     ) -> str:
         if component_name in (None, PoolName.KV):
             return self._get_suffixed_key(key)
-        return f"{self._get_suffixed_key(key)}_{component_name}"
+        return f"{self._get_suffixed_key(key, component_name)}_{component_name}"
 
     def _get_component_keys(
         self, keys: List[str], pool_name: Optional[PoolName] = None
@@ -213,7 +217,7 @@ class HiCacheNixl(HiCacheStorage):
             suffixes = [f"_{pool_name}_{i}" for i in range(key_multiplier)]
 
         return [
-            f"{self._get_suffixed_key(key)}{suffix}"
+            f"{self._get_suffixed_key(key, pool_name)}{suffix}"
             for key in keys
             for suffix in suffixes
         ]
@@ -392,14 +396,15 @@ class HiCacheNixl(HiCacheStorage):
             # so each slot matches what the v1 path would otherwise allocate.
             sample = mem_pool_host.get_dummy_flat_data_page()
             page_numel = sample.numel()
+            page_dtype = sample.dtype
             self._bounce_page_bytes = page_numel * sample.element_size()
             del sample
             pin_memory = bool(getattr(mem_pool_host, "pin_memory", False))
             self._bounce_set = self._alloc_registered(
-                page_numel, mem_pool_host.dtype, pin_memory, "bounce_set"
+                page_numel, page_dtype, pin_memory, "bounce_set"
             )
             self._bounce_get = self._alloc_registered(
-                page_numel, mem_pool_host.dtype, pin_memory, "bounce_get"
+                page_numel, page_dtype, pin_memory, "bounce_get"
             )
 
         logger.info(
@@ -426,15 +431,17 @@ class HiCacheNixl(HiCacheStorage):
         else:
             sample = host_pool.get_dummy_flat_data_page()
             page_numel = sample.numel()
+            # Serialized index and Mamba pages can differ from the pool dtype.
+            page_dtype = sample.dtype
             page_bytes = page_numel * sample.element_size()
             del sample
 
             pin_memory = bool(getattr(host_pool, "pin_memory", False))
             bounce_set = self._alloc_registered(
-                page_numel, host_pool.dtype, pin_memory, f"{host_pool_name}_bounce_set"
+                page_numel, page_dtype, pin_memory, f"{host_pool_name}_bounce_set"
             )
             bounce_get = self._alloc_registered(
-                page_numel, host_pool.dtype, pin_memory, f"{host_pool_name}_bounce_get"
+                page_numel, page_dtype, pin_memory, f"{host_pool_name}_bounce_get"
             )
             self._hybrid_pool_ctx[host_pool_name] = _HybridPoolContext(
                 host_pool=host_pool,
