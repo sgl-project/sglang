@@ -362,7 +362,11 @@ class TestGlm5NextGate(_FusionGateCase):
                 self.assertIsNone(self._reason_on_gfx950(tp_size=tp_size))
 
     def test_unvalidated_tp_and_expert_geometry_are_rejected(self):
-        self.assertIn("TP4 and TP8", self._reason_on_gfx950(tp_size=2))
+        self.assertIn("tp_size in (4, 8)", self._reason_on_gfx950(tp_size=2))
+        self.assertIn(
+            "tp_size in (2, 4, 8)",
+            self._reason_on_gfx950(tp_size=1, quant=_quant("quark")),
+        )
         self.assertIn(
             "E=288/topk=8",
             self._reason_on_gfx950(config=self._config(n_routed_experts=256)),
@@ -436,9 +440,14 @@ class TestGlm5NextGate(_FusionGateCase):
         )
         return quant
 
-    def test_quark_mxfp4_is_admitted(self):
+    def test_quark_mxfp4_is_admitted_at_tp2_tp4_and_tp8(self):
         config = self._config(num_hidden_layers=45)
-        self.assertIsNone(self._reason_on_gfx950(config=config, quant=self._quark()))
+        quant = self._quark()
+        for tp_size in (2, 4, 8):
+            with self.subTest(tp_size=tp_size):
+                self.assertIsNone(
+                    self._reason_on_gfx950(tp_size=tp_size, config=config, quant=quant)
+                )
 
     def test_quark_target_layer_experts_must_share_one_mxfp4_spec(self):
         config = self._config(num_hidden_layers=45)
