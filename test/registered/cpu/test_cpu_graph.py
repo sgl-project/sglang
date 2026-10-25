@@ -16,7 +16,7 @@ from sglang.srt.arg_groups.cuda_graph_hook import (
 from sglang.srt.arg_groups.memory_hook import handle_gpu_memory_settings
 from sglang.srt.arg_groups.overrides import resolved_view
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
+from sglang.srt.layers.rotary_embedding.utils import rotary_embedding_cpu
 from sglang.srt.model_executor.cpu_graph_runner import (
     CPUGraphRunner,
     _mark_dynamic,
@@ -35,10 +35,7 @@ from sglang.srt.model_executor.forward_context import (
     get_forward_context,
 )
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.server_args import (
-    ServerArgs,
-    set_global_server_args_for_scheduler,
-)
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_cpu_ids_by_node, kill_process_tree
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.sgl_eval_utils import run_sgl_eval
@@ -87,9 +84,10 @@ def _make_cpu_prefill_forward_batch(num_tokens=6, batch_size=2):
 class _MiniTransformerBlock(torch.nn.Module):
     """Minimal transformer block incorporating RoPE, linears, MLP, and layer boundary."""
 
-    def __init__(self, rope):
+    def __init__(self):
         super().__init__()
-        self.rope = rope
+        self.head_size = 128
+        self.cos_sin_cache = torch.randn(2048, 128, dtype=torch.bfloat16)
         self.q_proj = torch.nn.Linear(2048, 2048, bias=False, dtype=torch.bfloat16)
         self.k_proj = torch.nn.Linear(2048, 2048, bias=False, dtype=torch.bfloat16)
         self.v_proj = torch.nn.Linear(2048, 2048, bias=False, dtype=torch.bfloat16)
@@ -103,7 +101,9 @@ class _MiniTransformerBlock(torch.nn.Module):
         q = self.q_proj(input_ids)
         k = self.k_proj(input_ids)
         v = self.v_proj(input_ids)
-        q, k = self.rope.forward_cpu(positions, q, k)
+        q, k = rotary_embedding_cpu(
+            positions, q, k, self.head_size, self.cos_sin_cache, is_neox=True
+        )
         attn = q * k + v
         hidden = self.out_proj(attn)
 
@@ -313,9 +313,7 @@ class TestCPUGraph(CustomTestCase):
         self.assertEqual(compile_count, 1)
 
     def test_cpu_graph_transformer_layer_has_no_graph_break(self):
-        set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
-        rope = RotaryEmbedding(128, 128, 2048, 10000, True, torch.bfloat16)
-        model = _MiniTransformerBlock(rope)
+        model = _MiniTransformerBlock()
 
         num_tokens = 8
         fb = ForwardBatch(
@@ -348,9 +346,7 @@ class TestCPUGraph(CustomTestCase):
         )
 
     def test_cpu_graph_dynamic_shapes_have_no_unexpected_recompilation(self):
-        set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
-        rope = RotaryEmbedding(128, 128, 2048, 10000, True, torch.bfloat16)
-        model = _MiniTransformerBlock(rope)
+        model = _MiniTransformerBlock()
 
         compile_count = [0]
 
@@ -446,6 +442,156 @@ class TestCPUGraph(CustomTestCase):
         self.assertEqual(args.torch_compile_max_bs, 4)
         self.assertEqual(args.cuda_graph_config.decode.max_bs, 4)
         self.assertEqual(args.cuda_graph_config.decode.bs, [1, 2, 4])
+
+        # Explicit decode.max_bs overrides default torch_compile_max_bs (32)
+        args = self._resolve_cpu_graph_args(
+            cuda_graph_config=CudaGraphConfig(decode=PhaseConfig(max_bs=4))
+        )
+        self.assertEqual(args.torch_compile_max_bs, 4)
+        self.assertEqual(args.cuda_graph_config.decode.max_bs, 4)
+        self.assertEqual(args.cuda_graph_config.decode.bs[-1], 4)
+
+        args = self._resolve_cpu_graph_args(
+            cuda_graph_config=CudaGraphConfig(decode=PhaseConfig(max_bs=64))
+        )
+        self.assertEqual(args.torch_compile_max_bs, 64)
+        self.assertEqual(args.cuda_graph_config.decode.max_bs, 64)
+        self.assertEqual(args.cuda_graph_config.decode.bs[-1], 64)
+
+    def test_fused_experts_cpu_fake_dispatch_omits_optional_activation(self):
+        from torch._subclasses.fake_tensor import FakeTensorMode
+
+        cpu_graph_runner_module.register_fake_ops(1)
+        hidden = torch.randn(2, 64, dtype=torch.bfloat16)
+        w1 = torch.randn(4, 64, 128, dtype=torch.bfloat16)
+        w2 = torch.randn(4, 128, 64, dtype=torch.bfloat16)
+        topk_weights = torch.ones(2, 2, dtype=torch.float32)
+        topk_ids = torch.zeros(2, 2, dtype=torch.int32)
+
+        with FakeTensorMode(allow_non_fake_inputs=True):
+            out = torch.ops.sgl_kernel.fused_experts_cpu(
+                hidden,
+                w1,
+                w2,
+                topk_weights,
+                topk_ids,
+                False,
+                0,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                True,
+            )
+            self.assertEqual(out.shape, hidden.shape)
+            self.assertEqual(out.dtype, torch.bfloat16)
+
+    def test_cpu_graph_rejects_unsupported_backends(self):
+        model_runner = SimpleNamespace(
+            device="cpu",
+            is_draft_worker=False,
+            _uses_cpu_graph_attention_backend=lambda: True,
+        )
+        with (
+            patch.object(
+                graph_setup,
+                "get_flags",
+                return_value=SimpleNamespace(
+                    capture=SimpleNamespace(enable_torch_compile=True)
+                ),
+            ),
+            patch.object(
+                graph_setup,
+                "get_exec",
+                return_value=SimpleNamespace(
+                    graph=SimpleNamespace(
+                        cuda_graph_config=CudaGraphConfig(
+                            prefill=PhaseConfig(backend=Backend.BREAKABLE),
+                            decode=PhaseConfig(backend=Backend.FULL),
+                        )
+                    )
+                ),
+            ),
+        ):
+            with self.assertRaisesRegex(
+                ValueError, "Unsupported CPU prefill graph backend"
+            ):
+                graph_setup.capture_prefill_graph(
+                    model_runner=model_runner,
+                    eager_runner=object(),
+                )
+
+    def test_cpu_graph_prefill_only_operation(self):
+        model_runner = SimpleNamespace(
+            device="cpu",
+            is_generation=True,
+            is_draft_worker=False,
+            spec_algorithm=SimpleNamespace(is_speculative=lambda: False),
+            _uses_cpu_graph_attention_backend=lambda: True,
+            prefill_cuda_graph_runner=None,
+        )
+        with (
+            patch.object(
+                graph_setup,
+                "get_flags",
+                return_value=SimpleNamespace(
+                    capture=SimpleNamespace(enable_torch_compile=True)
+                ),
+            ),
+            patch.object(
+                graph_setup,
+                "get_exec",
+                return_value=SimpleNamespace(
+                    graph=SimpleNamespace(
+                        cuda_graph_config=CudaGraphConfig(
+                            prefill=PhaseConfig(backend=Backend.FULL, max_bs=128),
+                            decode=PhaseConfig(backend=Backend.DISABLED),
+                        )
+                    )
+                ),
+            ),
+            patch.object(
+                graph_setup, "CPUGraphRunner", return_value=object()
+            ) as mock_runner_cls,
+        ):
+            prefill_cap = graph_setup.capture_prefill_graph(
+                model_runner=model_runner,
+                eager_runner=object(),
+            )
+            self.assertIsNotNone(prefill_cap.runner)
+            model_runner.prefill_cuda_graph_runner = prefill_cap.runner
+
+            decode_cap = graph_setup.capture_decode_graph(
+                model_runner=model_runner,
+                prefill_runner=prefill_cap.runner,
+            )
+            # When decode is disabled, decode runner should be None
+            self.assertIsNone(decode_cap.runner)
+
+    def test_cpu_graph_compile_backend_can_be_customized(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.model_executor.cpu_graph_runner import patch_model
+
+        class ToyModel(torch.nn.Module):
+            def forward(self, x):
+                return x + 1.0
+
+        model = ToyModel()
+        dummy_tp = SimpleNamespace(ca_comm=None)
+        inp = torch.tensor([2.0])
+
+        for backend_name in ("inductor", "eager"):
+            with envs.SGLANG_CPU_GRAPH_COMPILE_BACKEND.override(backend_name):
+                with patch_model(
+                    model, enable_compile=True, tp_group=dummy_tp, dynamic=False
+                ) as compiled_fwd:
+                    out = compiled_fwd(inp)
+                    self.assertEqual(out.item(), 3.0)
 
     def test_cpu_prefill_graph_requires_intel_amx_and_torch_compile(self):
         eager_runner = object()

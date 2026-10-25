@@ -21,7 +21,6 @@ import bisect
 import copy
 import itertools
 import logging
-import os
 import types
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Callable, Optional, Union
@@ -465,9 +464,7 @@ def patch_model(
                 _disable_cpu_graph_custom_op_aliasing_check(),
                 torch._dynamo.config.patch(allow_unspec_int_on_nn_module=True),
             ):
-                compile_backend = os.environ.get(
-                    "SGLANG_CPU_GRAPH_COMPILE_BACKEND", "inductor"
-                )
+                compile_backend = envs.SGLANG_CPU_GRAPH_COMPILE_BACKEND.get()
                 yield torch.compile(
                     _make_compile_wrapper(model, model_forward),
                     backend=compile_backend,
@@ -642,7 +639,6 @@ def register_fake_ops(tp_size: int):
         w2_scale,
         w1_zero,
         w2_zero,
-        a1_scale,
         block_size,
         w1_bias,
         w2_bias,
@@ -1006,6 +1002,19 @@ class CPUGraphRunner:
     one dynamic fallback per phase, while the default is eager fallback.
     """
 
+    graphs: dict = {}
+    graphs_cross: dict = {}
+    decode_dynamic_graphs: dict = {}
+    decode_dynamic_batch_templates: dict = {}
+    disable_padding: bool = False
+    max_bs: int = 0
+    model_is_mrope: bool = False
+    capture_num_tokens: list = []
+    prefill_graphs: dict = {}
+    prefill_graphs_bs1: dict = {}
+    prefill_dynamic_graph: Optional[Callable] = None
+    prefill_dynamic_graph_bs1: Optional[Callable] = None
+
     def __init__(self, model_runner: ModelRunner):
         # Parse args
         self.model_runner = model_runner
@@ -1035,6 +1044,11 @@ class CPUGraphRunner:
         self.enable_dynamic_graph = envs.SGLANG_TORCH_DYNAMIC_SHAPE.get()
         self.disable_padding = get_exec().graph.disable_cuda_graph_padding
         self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
+        self.model_is_mrope = (
+            getattr(model_runner.model_config, "model_is_mrope", False)
+            if hasattr(model_runner, "model_config")
+            else False
+        )
         self.require_gathered_buffer = require_gathered_buffer()
         self.require_mlp_tp_gather = require_mlp_tp_gather()
         self.require_mlp_sync = require_mlp_sync()
@@ -1095,7 +1109,8 @@ class CPUGraphRunner:
         assert self.dp_size == 1, "CPUGraphRunner does not support DP yet."
         assert self.pp_size == 1, "CPUGraphRunner does not support PP yet."
 
-        if self.is_generation:
+        decode_disabled = check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED)
+        if self.is_generation and not decode_disabled:
             # Batch sizes to capture
             self.capture_bs = get_batch_sizes_to_capture(model_runner)
             log_info_on_rank0(logger, f"Capture cpu graph bs {self.capture_bs}")
@@ -1126,8 +1141,8 @@ class CPUGraphRunner:
             )
         else:
             # No decode steps for non-generation (embedding/reward/classification)
-            # models -- leave decode state empty; can_run_graph rejects DECODE
-            # mode below and everything falls through to the prefill path.
+            # models or when decode graph is disabled -- leave decode state empty;
+            # can_run_graph rejects DECODE mode below and everything falls through to the prefill path.
             self.capture_bs = []
             self.captured_forward_batches = {}
             self.captured_forward_batches_cross = {}
@@ -1139,7 +1154,7 @@ class CPUGraphRunner:
             register_fake_ops(self.tp_size)
             set_torch_compile_config()
 
-        if self.is_generation:
+        if self.is_generation and not decode_disabled:
             # Graph inputs
             with torch.device(self.device):
                 self.input_ids = torch.zeros(
@@ -1243,8 +1258,9 @@ class CPUGraphRunner:
                 model_capture_mode if self.is_encoder_decoder else empty_context
             )
             with cpu_graph_patch_boundary_classes():
-                with capture_context():
-                    self.capture()
+                if self.capture_bs:
+                    with capture_context():
+                        self.capture()
                 if self.capture_num_tokens:
                     self.capture_prefill()
         except RuntimeError as e:
@@ -1388,7 +1404,7 @@ class CPUGraphRunner:
         # not a runtime model-specific forward branch.
         mrope_positions = (
             self.mrope_positions[:, :num_tokens].contiguous()
-            if getattr(self.model_runner.model_config, "model_is_mrope", False)
+            if self.model_is_mrope
             else None
         )
         self.num_token_non_padded[...] = num_tokens
@@ -1623,25 +1639,22 @@ class CPUGraphRunner:
                 forward_batch.encoder_out_cache_loc = None
                 captured_forward_batch.encoder_out_cache_loc = None
             if enable_num_token_non_padded():
-                captured_forward_batch.num_token_non_padded.copy_(
+                src_num_token = (
                     forward_batch.num_token_non_padded
+                    if forward_batch.num_token_non_padded is not None
+                    else forward_batch.global_num_token_non_padded
                 )
+                if (
+                    src_num_token is not None
+                    and captured_forward_batch.num_token_non_padded is not None
+                ):
+                    captured_forward_batch.num_token_non_padded.copy_(src_num_token)
             self._refresh_dynamic_forward_batch_metadata(
                 captured_forward_batch,
                 forward_batch,
                 include_extend_metadata=False,
             )
-            replay_init = getattr(
-                self.model_runner.attn_backend,
-                "init_forward_metadata_cpu_graph_replay",
-                None,
-            )
-            if replay_init is None:
-                self.model_runner.attn_backend.init_forward_metadata(
-                    captured_forward_batch
-                )
-            else:
-                replay_init(captured_forward_batch)
+            self.model_runner.attn_backend.init_forward_metadata(captured_forward_batch)
             return captured_forward_batch
 
         raw_num_token = raw_bs * self.captured_req_width
@@ -1681,24 +1694,23 @@ class CPUGraphRunner:
             )
             captured_forward_batch.encoder_out_cache_loc = None
         if enable_num_token_non_padded():
-            captured_forward_batch.num_token_non_padded.copy_(
+            src_num_token = (
                 forward_batch.num_token_non_padded
+                if forward_batch.num_token_non_padded is not None
+                else forward_batch.global_num_token_non_padded
             )
+            if (
+                src_num_token is not None
+                and captured_forward_batch.num_token_non_padded is not None
+            ):
+                captured_forward_batch.num_token_non_padded.copy_(src_num_token)
         self._refresh_dynamic_forward_batch_metadata(
             captured_forward_batch,
             forward_batch,
             include_extend_metadata=False,
         )
 
-        replay_init = getattr(
-            self.model_runner.attn_backend,
-            "init_forward_metadata_cpu_graph_replay",
-            None,
-        )
-        if replay_init is None:
-            self.model_runner.attn_backend.init_forward_metadata(captured_forward_batch)
-        else:
-            replay_init(captured_forward_batch)
+        self.model_runner.attn_backend.init_forward_metadata(captured_forward_batch)
         return captured_forward_batch
 
     def execute(
@@ -1845,9 +1857,7 @@ class CPUGraphRunner:
                 [torch.arange(l, dtype=torch.int64) for l in lens_cpu]
             )
             mrope_positions = (
-                positions.unsqueeze(0).repeat(3, 1)
-                if getattr(self.model_runner.model_config, "model_is_mrope", False)
-                else None
+                positions.unsqueeze(0).repeat(3, 1) if self.model_is_mrope else None
             )
             num_token_non_padded = torch.tensor([num_tokens], dtype=torch.int64)
 
@@ -2154,6 +2164,7 @@ class CPUGraphRunner:
     def _compile_decode_dynamic_graphs(self) -> None:
         if not (
             self.is_generation
+            and not check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED)
             and self.enable_dynamic_graph
             and self.enable_torch_compile
         ):
@@ -2208,7 +2219,7 @@ class CPUGraphRunner:
             return False
         if forward_batch.input_embeds is not None:
             return False
-        if getattr(forward_batch, "replace_embeds", None) is not None:
+        if forward_batch.replace_embeds is not None:
             return False
         if forward_batch.batch_size > self.prefill_max_bs:
             return False

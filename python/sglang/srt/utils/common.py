@@ -88,21 +88,6 @@ import pybase64
 import requests
 import torch
 import torch.distributed as dist
-
-# Cache CPU capability checks at import time to prevent Dynamo from tracing lru_cache wrappers.
-_IS_HOST_CPU_X86 = (
-    platform.machine().lower() in ("x86_64", "amd64", "i386", "i686")
-    and hasattr(torch, "cpu")
-    and torch.cpu.is_available()
-)
-_IS_HOST_CPU_ARM64 = (
-    platform.machine().lower() in ("aarch64", "arm64")
-    and hasattr(torch, "cpu")
-    and torch.cpu.is_available()
-)
-_IS_CPU_ENGINE = os.getenv("SGLANG_USE_CPU_ENGINE", "0") == "1" and (
-    _IS_HOST_CPU_X86 or _IS_HOST_CPU_ARM64
-)
 import triton
 from packaging import version as pkg_version
 from PIL import Image, ImageOps, UnidentifiedImageError
@@ -213,6 +198,20 @@ def is_npu() -> bool:
     return True
 
 
+# Cache host CPU capability checks at import time to prevent TorchDynamo
+# from graph-breaking on `torch.cpu.is_available()` (torch op returning non-Tensor).
+_IS_HOST_CPU_X86 = (
+    platform.machine().lower() in ("x86_64", "amd64", "i386", "i686")
+    and hasattr(torch, "cpu")
+    and torch.cpu.is_available()
+)
+_IS_HOST_CPU_ARM64 = (
+    platform.machine().lower() in ("aarch64", "arm64")
+    and hasattr(torch, "cpu")
+    and torch.cpu.is_available()
+)
+
+
 @lru_cache(maxsize=1)
 def is_host_cpu_x86() -> bool:
     return _IS_HOST_CPU_X86
@@ -222,8 +221,10 @@ def is_host_cpu_arm64() -> bool:
     return _IS_HOST_CPU_ARM64
 
 
+@lru_cache(maxsize=1)
 def is_cpu() -> bool:
-    return _IS_CPU_ENGINE
+    is_host_cpu_supported = is_host_cpu_x86() or is_host_cpu_arm64()
+    return os.getenv("SGLANG_USE_CPU_ENGINE", "0") == "1" and is_host_cpu_supported
 
 
 @lru_cache(maxsize=1)
@@ -2991,8 +2992,9 @@ def direct_register_custom_op(
 
     try:
         my_lib.define(op_name + schema_str)
-        if is_npu():
+        if is_npu() or current_platform.is_out_of_tree():
             # https://github.com/sgl-project/sglang/pull/12287/files#r2499583982
+            # Out-of-tree devices are torch PrivateUse1 backends too.
             my_lib.impl(op_name, op_func, "PrivateUse1")
         elif is_xpu():
             my_lib.impl(op_name, op_func, "XPU")
