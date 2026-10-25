@@ -1467,6 +1467,8 @@ def _tgv_bf16_gemm_out_run(
         and out.dtype == torch.float32
         and bias is None
     ):
+        # Temporary vendored copy of FlashInfer's warp split-K kernel with an
+        # FP32 output path; switch to flashinfer.gemm once it accepts FP32 out.
         from sglang.kernels.ops.gemm.dense_bf16_gemm_warp_splitk import (
             WarpSplitKTactic,
             run_warp_splitk_dense,

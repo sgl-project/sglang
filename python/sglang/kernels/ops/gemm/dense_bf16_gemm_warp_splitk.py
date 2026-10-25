@@ -1,7 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
-# Adapted from flashinfer-ai/flashinfer v0.7.0 (commit 4d75a33f19aa).
-# The output tensor may be FP32 so K3 can retain router-logit precision.
+# Adapted from flashinfer-ai/flashinfer v0.7.0 (commit 4d75a33f19aa),
+# flashinfer/gemm/kernels/dense_bf16_gemm_warp_splitk.py.
+#
+# TEMPORARY COPY. FlashInfer ships this kernel (``run_warp_splitk_dense``, also
+# reachable through ``flashinfer.gemm.bf16_gemm_sm100`` with the cute-dsl
+# runners), but its ``validate_inputs`` only accepts a bf16 ``out``. The one
+# functional difference here is an FP32 output path, which K3's merged MoE
+# front projection needs to keep router-logit precision. Delete this module
+# and call FlashInfer's kernel from ``cutedsl_bf16_gemm.py`` once a FlashInfer
+# release accepts an FP32 ``out``.
 """BF16 GEMM with cp.async and four compute warps holding split-K partials."""
 
 from __future__ import annotations
