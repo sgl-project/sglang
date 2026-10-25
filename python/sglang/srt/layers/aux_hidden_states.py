@@ -7,7 +7,10 @@ from typing import TYPE_CHECKING, Iterable, List, Optional, Union
 import torch
 
 if TYPE_CHECKING:
-    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    from sglang.srt.model_executor.forward_batch_info import (
+        ForwardBatch,
+        PPProxyTensors,
+    )
 
 # Two representations coexist: models migrated to AuxHiddenStatePacker pass one
 # packed [tokens, K * hidden] tensor, the rest still pass a list of K tensors.
@@ -100,3 +103,21 @@ def pack_aux_hidden_states(aux_hidden_states: AuxHiddenStates) -> torch.Tensor:
     if len(aux_hidden_states) == 1:
         return aux_hidden_states[0]
     return torch.cat(aux_hidden_states, dim=-1)
+
+
+def aux_hidden_states_from_pp(
+    pp_proxy_tensors: Optional[PPProxyTensors],
+) -> AuxHiddenStateList:
+    """Start a stage's captures from the ones earlier pipeline stages relayed."""
+    aux_hidden_states = AuxHiddenStateList()
+    if pp_proxy_tensors is not None and "aux_hidden_states" in pp_proxy_tensors.tensors:
+        aux_hidden_states.capture(pp_proxy_tensors["aux_hidden_states"])
+    return aux_hidden_states
+
+
+def aux_hidden_states_to_pp(
+    proxy: PPProxyTensors, aux_hidden_states: AuxHiddenStateList
+) -> PPProxyTensors:
+    if len(aux_hidden_states) > 0:
+        proxy.tensors["aux_hidden_states"] = torch.cat(aux_hidden_states, dim=-1)
+    return proxy

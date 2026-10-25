@@ -29,7 +29,10 @@ from sglang.srt.distributed import (
     get_pp_indices,
 )
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
+from sglang.srt.layers.aux_hidden_states import (
+    aux_hidden_states_from_pp,
+    aux_hidden_states_to_pp,
+)
 from sglang.srt.layers.dual_gemm import DualGemm
 from sglang.srt.layers.layer_boundary import (
     append_stages,
@@ -482,12 +485,7 @@ class LlamaModel(nn.Module):
                 pp_proxy_tensors, forward_batch
             )
 
-        aux_hidden_states = AuxHiddenStateList()
-        if (
-            not self.pp_group.is_first_rank
-            and "aux_hidden_states" in pp_proxy_tensors.tensors
-        ):
-            aux_hidden_states.capture(pp_proxy_tensors["aux_hidden_states"])
+        aux_hidden_states = aux_hidden_states_from_pp(pp_proxy_tensors)
         for i in range(self.start_layer, self.end_layer):
             hidden_states = self.layers[i](
                 positions,
@@ -499,12 +497,9 @@ class LlamaModel(nn.Module):
             )
 
         if not self.pp_group.is_last_rank:
-            proxy = residual_batch.to_pp(hidden_states, forward_batch)
-            if len(aux_hidden_states) > 0:
-                proxy.tensors["aux_hidden_states"] = torch.cat(
-                    aux_hidden_states, dim=-1
-                )
-            return proxy
+            return aux_hidden_states_to_pp(
+                residual_batch.to_pp(hidden_states, forward_batch), aux_hidden_states
+            )
         hidden_states = residual_batch.final_norm(
             hidden_states, forward_batch, self.norm
         )

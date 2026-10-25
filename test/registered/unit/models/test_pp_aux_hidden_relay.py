@@ -1,4 +1,4 @@
-"""EAGLE3 aux hidden states captured on earlier pipeline stages reach the last stage."""
+"""Aux hidden states captured on earlier pipeline stages reach the last stage."""
 
 import unittest
 from types import SimpleNamespace
@@ -11,13 +11,17 @@ from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.model_runner_components.attention_backend_setup import (
     configure_aux_hidden_state_capture,
 )
-from sglang.srt.models import llama
+from sglang.srt.models import llama, qwen3
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 _HIDDEN = 4
 _NUM_LAYERS = 8
+_TARGETS = [
+    (llama, llama.LlamaModel, llama.LlamaForCausalLM),
+    (qwen3, qwen3.Qwen3Model, qwen3.Qwen3ForCausalLM),
+]
 
 
 class _Layer:
@@ -38,7 +42,7 @@ _RESIDUAL_BATCH = SimpleNamespace(
     to_pp=lambda hidden_states, forward_batch: PPProxyTensors(
         {"hidden_states": hidden_states}
     ),
-    final_norm=lambda hidden_states, forward_batch, norm: hidden_states,
+    final_norm=lambda hidden_states, forward_batch, norm, **kwargs: hidden_states,
 )
 
 
@@ -56,12 +60,13 @@ def _stage(*, start, end, layers_to_capture, is_first_rank, is_last_rank):
     )
 
 
-def _run_pipeline(*, boundaries, layers_to_capture):
+def _run_pipeline(target, *, boundaries, layers_to_capture):
     """Returns the last stage's packed aux and (received width, sized width) per stage."""
+    module, model_cls, causal_lm_cls = target
     out = None
     widths = []
     num_stages = len(boundaries) - 1
-    with patch.object(llama, "residual_batch", _RESIDUAL_BATCH):
+    with patch.object(module, "residual_batch", _RESIDUAL_BATCH):
         for rank in range(num_stages):
             model = _stage(
                 start=boundaries[rank],
@@ -72,13 +77,13 @@ def _run_pipeline(*, boundaries, layers_to_capture):
             )
             if rank > 0:
                 received = out.tensors.get("aux_hidden_states")
-                sized = llama.LlamaForCausalLM.get_pp_proxy_aux_hidden_size(
+                sized = causal_lm_cls.get_pp_proxy_aux_hidden_size(
                     SimpleNamespace(
                         config=SimpleNamespace(hidden_size=_HIDDEN), model=model
                     )
                 )
                 widths.append((0 if received is None else received.shape[-1], sized))
-            out = llama.LlamaModel.forward(
+            out = model_cls.forward(
                 model,
                 torch.arange(1, 4),
                 positions=None,
@@ -89,20 +94,26 @@ def _run_pipeline(*, boundaries, layers_to_capture):
     return pack_aux_hidden_states(aux_hidden_states), widths
 
 
-class TestLlamaPipelineAuxRelay(unittest.TestCase):
+class TestPipelineAuxHiddenRelay(unittest.TestCase):
     def test_multi_stage_aux_matches_single_stage(self):
         # Stage [3, 5) owns no capture layer; layer 5 is a stage's first layer.
         layers_to_capture = [1, 2, 5, 7]
-        expected, _ = _run_pipeline(
-            boundaries=[0, _NUM_LAYERS], layers_to_capture=layers_to_capture
-        )
-        actual, widths = _run_pipeline(
-            boundaries=[0, 3, 5, _NUM_LAYERS], layers_to_capture=layers_to_capture
-        )
+        for target in _TARGETS:
+            with self.subTest(model=target[1].__name__):
+                expected, _ = _run_pipeline(
+                    target,
+                    boundaries=[0, _NUM_LAYERS],
+                    layers_to_capture=layers_to_capture,
+                )
+                actual, widths = _run_pipeline(
+                    target,
+                    boundaries=[0, 3, 5, _NUM_LAYERS],
+                    layers_to_capture=layers_to_capture,
+                )
 
-        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-        for received, sized in widths:
-            self.assertEqual(received, sized)
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                for received, sized in widths:
+                    self.assertEqual(received, sized)
 
     def test_target_without_relay_is_rejected_under_pp(self):
         target = SimpleNamespace(set_eagle3_layers_to_capture=lambda layer_ids: None)
