@@ -16,6 +16,7 @@ import torch
 from sglang.srt.batch_overlap.operations import _StateDict
 from sglang.srt.layers.moe import topk as topk_module
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.moe.topk import TopK, TopKConfig
 from sglang.srt.layers.moe.utils import MoeA2ABackend, MoeRunnerBackend
 from sglang.srt.model_executor.model_runner_components import moe_ep_setup
@@ -179,10 +180,14 @@ class TestFusedSharedExpertScaling(CustomTestCase):
         hash_layer=False,
         fused_shared=0,
         ep_size=1,
+        tp_size=1,
+        separate_shared=False,
+        experts=None,
+        alt_stream=None,
     ):
         config = SimpleNamespace(
             routed_scaling_factor=self.ROUTED_SCALING_FACTOR,
-            n_shared_experts=fused_shared or None,
+            n_shared_experts=fused_shared or int(separate_shared) or None,
             n_routed_experts=16,
             num_experts_per_tok=2,
             hidden_act="silu",
@@ -196,13 +201,15 @@ class TestFusedSharedExpertScaling(CustomTestCase):
             vocab_size=4,
         )
         gate = SimpleNamespace(
-            e_score_correction_bias=torch.zeros(16) if correction_bias else None
+            e_score_correction_bias=torch.zeros(16) if correction_bias else None,
+            e_score_correction_bias_vl=None,
         )
-        experts = SimpleNamespace(
-            should_fuse_routed_scaling_factor_in_topk=folded_in_topk,
-            runner_backend=None,
-            routing_method_type=None,
-        )
+        if experts is None:
+            experts = SimpleNamespace(
+                should_fuse_routed_scaling_factor_in_topk=folded_in_topk,
+                runner_backend=None,
+                routing_method_type=None,
+            )
         exec_config = SimpleNamespace(
             moe=SimpleNamespace(enable_waterfill=False, ep_num_redundant_experts=0)
         )
@@ -214,7 +221,7 @@ class TestFusedSharedExpertScaling(CustomTestCase):
             patch.object(
                 module,
                 "get_parallel",
-                return_value=SimpleNamespace(tp_size=1, moe_ep_size=ep_size),
+                return_value=SimpleNamespace(tp_size=tp_size, moe_ep_size=ep_size),
             ),
             patch.object(module, "get_exec", return_value=exec_config),
             patch.object(topk_module, "get_exec", return_value=exec_config),
@@ -225,6 +232,17 @@ class TestFusedSharedExpertScaling(CustomTestCase):
             ),
             patch.object(module, "MoEGate", return_value=gate),
             patch.object(
+                module,
+                "DeepseekV2MLP",
+                return_value=SimpleNamespace(
+                    gate_up_proj=SimpleNamespace(
+                        output_size_per_partition=16,
+                        quant_method=None,
+                        weight=torch.empty(16, 8),
+                    )
+                ),
+            ),
+            patch.object(
                 module, "get_moe_impl_class", return_value=lambda **kwargs: experts
             ),
             patch.object(
@@ -234,7 +252,10 @@ class TestFusedSharedExpertScaling(CustomTestCase):
             ),
         ):
             return module.DeepseekV2MoE(
-                config=config, layer_id=0, is_deepseek_v4=deepseek_v4
+                config=config,
+                layer_id=0,
+                is_deepseek_v4=deepseek_v4,
+                alt_stream=alt_stream,
             )
 
     def test_deepseek_moe_takes_the_fold_from_the_router_it_builds(self):
@@ -257,6 +278,58 @@ class TestFusedSharedExpertScaling(CustomTestCase):
                     folded_in_topk=folded_in_topk, use_aiter=use_aiter, **route
                 )
                 self.assertEqual(moe.routed_scaling_factor_fused_in_topk, expected)
+
+    def test_capture_admits_ascend_tp_and_flashinfer_megamoe(self):
+        """Both constructed paths reach ordinary capture despite their dispatchers."""
+        from sglang.srt.model_executor.runner_utils.capture_mode import (
+            model_capture_mode,
+        )
+
+        x = torch.ones(2, 8)
+        for backend, a2a, ep_size in (
+            (MoeRunnerBackend.ASCEND, MoeA2ABackend.NONE, 1),
+            (
+                MoeRunnerBackend.FLASHINFER_MEGAMOE,
+                MoeA2ABackend.FLASHINFER_MEGAMOE,
+                2,
+            ),
+        ):
+            with (
+                self.subTest(backend=backend),
+                get_flags().moe.override(runner_backend=backend, a2a_backend=a2a),
+            ):
+                experts = FusedMoE.__new__(FusedMoE)
+                torch.nn.Module.__init__(experts)
+                experts.runner_backend = backend
+                experts.moe_runner_config = MoeRunnerConfig()
+                experts.should_fuse_routed_scaling_factor_in_topk = True
+                experts.routing_method_type = None
+                moe = self._build_deepseek_moe(
+                    folded_in_topk=True,
+                    use_aiter=False,
+                    tp_size=2,
+                    ep_size=ep_size,
+                    separate_shared=True,
+                    experts=experts,
+                    alt_stream=object(),
+                )
+                self.assertTrue(experts.moe_runner_config.inplace)
+                self.assertFalse(moe._enable_a2a_moe)
+                with (
+                    model_capture_mode(),
+                    patch.object(
+                        deepseek_v2_module,
+                        "is_in_breakable_cuda_graph",
+                        return_value=False,
+                    ),
+                    patch.object(moe, "forward_normal", return_value=x) as serial,
+                    patch.object(
+                        moe, "forward_normal_dual_stream", return_value=x
+                    ) as dual,
+                ):
+                    self.assertIs(moe(x), x)
+                dual.assert_called_once()
+                serial.assert_not_called()
 
     def test_dynamic_bias_preserves_the_final_routed_scale(self):
         """Per-token bias must preserve the final scale of the static AITER route."""
@@ -754,6 +827,8 @@ class TestDeepseekMoeEpilogue(CustomTestCase):
             MoeRunnerBackend.FLASHINFER_CUTEDSL,
             MoeRunnerBackend.HUMMING,
             MoeRunnerBackend.HPC_OPS,
+            MoeRunnerBackend.ASCEND,
+            MoeRunnerBackend.FLASHINFER_MEGAMOE,
         ):
             with self.subTest(backend=backend):
                 moe = self._moe(inplace=True, backend=backend)

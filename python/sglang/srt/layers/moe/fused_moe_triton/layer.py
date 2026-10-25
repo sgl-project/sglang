@@ -650,9 +650,11 @@ class FusedMoE(torch.nn.Module):
                 or backend.is_flashinfer_cutedsl()
                 or backend.is_humming()
                 or backend.is_hpc_ops()
+                or backend.is_ascend()
+                or backend.is_flashinfer_megamoe()
             ):
-                # These runners explicitly use out-of-place output regardless
-                # of the layer's inplace suggestion.
+                # These execution paths keep the original input separate from
+                # expert output, regardless of the layer's inplace suggestion.
                 return True
         return not self.moe_runner_config.inplace
 
