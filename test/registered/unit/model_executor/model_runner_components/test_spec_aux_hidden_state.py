@@ -9,10 +9,10 @@ from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStatePacker,
     pack_aux_hidden_states,
 )
+from sglang.srt.mem_cache.draft_kv_budget import resolve_dflash_draft_cell_size
 from sglang.srt.model_executor.model_runner_components.misc_utils import (
     resolve_aux_hidden_states_width,
 )
-from sglang.srt.mem_cache.draft_kv_budget import resolve_dflash_draft_cell_size
 from sglang.srt.model_executor.model_runner_components.spec_aux_hidden_state import (
     _map_muse_target_layer_ids,
 )
