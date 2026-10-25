@@ -453,6 +453,9 @@ pub struct DeploymentInfo {
     pub gc_threshold: Option<Vec<i64>>,
     /// `--enable-pd-role-switch`.
     pub enable_pd_role_switch: bool,
+    /// The engine-info bootstrap server (`--engine-info-bootstrap-port`), as
+    /// the base URL Python's `ServerArgs.engine_info_bootstrap_url` builds.
+    pub engine_info_bootstrap_url: Option<String>,
     pub enable_hierarchical_cache: bool,
     pub hicache_ratio: Option<f64>,
     pub hicache_size: u64,

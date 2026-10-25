@@ -1158,6 +1158,20 @@ pub struct WeightGroupResponse {
     #[prost(string, tag = "2")]
     pub message: ::prost::alloc::string::String,
 }
+/// `/remote_instance_transfer_engine_info?rank=N` (and its deprecated alias
+/// `/get_remote_instance_transfer_engine_info`): the transfer-engine info a
+/// rank registered with this node's engine-info bootstrap server, proxied.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RemoteInstanceTransferEngineInfoRequest {
+    #[prost(int64, tag = "1")]
+    pub rank: i64,
+}
+/// The bootstrap server's reply as it sent it: `{"rank": N,  "remote_instance_transfer_engine_info": \[...\]}`, passed through as JSON.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RemoteInstanceTransferEngineInfoResponse {
+    #[prost(string, optional, tag = "1")]
+    pub info: ::core::option::Option<::prost::alloc::string::String>,
+}
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ListModelsRequest {}
 #[derive(Clone, PartialEq, ::prost::Message)]

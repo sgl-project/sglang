@@ -1200,6 +1200,36 @@ class WeightGroupResponse(msgspec.Struct, kw_only=True, frozen=True):
         return encode_WeightGroupResponse(self)
 
 
+class RemoteInstanceTransferEngineInfoRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.RemoteInstanceTransferEngineInfoRequest: JSON object (unknown keys ignored)."""
+
+    rank: int = 0
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "RemoteInstanceTransferEngineInfoRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_RemoteInstanceTransferEngineInfoRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_RemoteInstanceTransferEngineInfoRequest(self)
+
+
+class RemoteInstanceTransferEngineInfoResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.RemoteInstanceTransferEngineInfoResponse: JSON object (unknown keys ignored)."""
+
+    info: Optional[Any] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "RemoteInstanceTransferEngineInfoResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_RemoteInstanceTransferEngineInfoResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_RemoteInstanceTransferEngineInfoResponse(self)
+
+
 class ListModelsRequest(msgspec.Struct, kw_only=True, frozen=True):
     """sglang.api.v1.ListModelsRequest: JSON object (unknown keys ignored)."""
 
@@ -3570,6 +3600,37 @@ def encode_WeightGroupResponse(v: WeightGroupResponse) -> Dict[str, Any]:
     d: Dict[str, Any] = {}
     d["success"] = v.success
     d["message"] = v.message
+    return d
+
+
+def decode_RemoteInstanceTransferEngineInfoRequest(value: Any) -> RemoteInstanceTransferEngineInfoRequest:
+    m = _expect_map(value, expected="struct RemoteInstanceTransferEngineInfoRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "rank":
+            kw["rank"] = _expect_int(x, expected="i64")
+    return RemoteInstanceTransferEngineInfoRequest(**kw)
+
+
+def encode_RemoteInstanceTransferEngineInfoRequest(v: RemoteInstanceTransferEngineInfoRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["rank"] = v.rank
+    return d
+
+
+def decode_RemoteInstanceTransferEngineInfoResponse(value: Any) -> RemoteInstanceTransferEngineInfoResponse:
+    m = _expect_map(value, expected="struct RemoteInstanceTransferEngineInfoResponse")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "info":
+            kw["info"] = x
+    return RemoteInstanceTransferEngineInfoResponse(**kw)
+
+
+def encode_RemoteInstanceTransferEngineInfoResponse(v: RemoteInstanceTransferEngineInfoResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.info is not None:
+        d["info"] = v.info
     return d
 
 

@@ -5,10 +5,13 @@ use std::sync::Arc;
 
 use axum::{
     Json, Router,
-    extract::{State, rejection::JsonRejection},
+    extract::{
+        Query, State,
+        rejection::{JsonRejection, QueryRejection},
+    },
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::post,
+    routing::{get, post},
 };
 use serde_json::Value;
 use sglang_api_types::api::v1 as api;
@@ -41,6 +44,64 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
             "/send_weights_to_remote_instance",
             post(send_weights_to_remote_instance),
         )
+        .route(
+            "/remote_instance_transfer_engine_info",
+            get(remote_instance_transfer_engine_info),
+        )
+        .route(
+            "/get_remote_instance_transfer_engine_info",
+            get(get_remote_instance_transfer_engine_info),
+        )
+}
+
+#[derive(serde::Deserialize)]
+struct TransferEngineInfoQuery {
+    rank: Option<i64>,
+}
+
+/// `GET /remote_instance_transfer_engine_info?rank=N` — the bootstrap server's
+/// JSON verbatim, or Python's `{"error": {"message"}}` 400.
+async fn remote_instance_transfer_engine_info(
+    State(state): State<Arc<AppState>>,
+    query: Result<Query<TransferEngineInfoQuery>, QueryRejection>,
+) -> Response {
+    let rank = match query {
+        Ok(Query(query)) => query.rank,
+        Err(_) => None,
+    };
+    let Some(rank) = rank.filter(|rank| *rank >= 0) else {
+        return python_error(StatusCode::BAD_REQUEST, "Missing or invalid rank parameter");
+    };
+    match state.core.remote_instance_transfer_engine_info(rank).await {
+        Ok(info) => (
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            info,
+        )
+            .into_response(),
+        Err(error) => python_error(StatusCode::BAD_REQUEST, &error.to_string()),
+    }
+}
+
+/// The deprecated alias Python keeps, warning on each use.
+async fn get_remote_instance_transfer_engine_info(
+    state: State<Arc<AppState>>,
+    query: Result<Query<TransferEngineInfoQuery>, QueryRejection>,
+) -> Response {
+    tracing::warn!(
+        "Endpoint '/get_remote_instance_transfer_engine_info' is deprecated and will be removed \
+         in a future version. Please use '/remote_instance_transfer_engine_info' instead."
+    );
+    remote_instance_transfer_engine_info(state, query).await
+}
+
+/// Python's `_create_error_response`: `{"error": {"message": ...}}` with no code.
+fn python_error(status: StatusCode, message: &str) -> Response {
+    (
+        status,
+        Json(serde_json::json!({"error": {"message": message}})),
+    )
+        .into_response()
 }
 
 /// The parsed body, or the rejection text for a 400.
@@ -275,6 +336,38 @@ mod tests {
         let status = response.status();
         let bytes = to_bytes(response.into_body(), 1 << 16).await.unwrap();
         (status, serde_json::from_slice(&bytes).unwrap(), items)
+    }
+
+    /// A missing, negative, or non-numeric rank is Python's 400 before any
+    /// lookup; the deprecated alias behaves the same.
+    #[tokio::test]
+    async fn transfer_engine_info_rejects_a_bad_rank_before_looking_it_up() {
+        for uri in [
+            "/remote_instance_transfer_engine_info",
+            "/remote_instance_transfer_engine_info?rank=-1",
+            "/remote_instance_transfer_engine_info?rank=abc",
+            "/get_remote_instance_transfer_engine_info",
+        ] {
+            let (state, _intake_rx) = test_state();
+            let response = routes()
+                .with_state(state)
+                .oneshot(
+                    HttpRequest::builder()
+                        .method("GET")
+                        .uri(uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+            let bytes = to_bytes(response.into_body(), 1 << 16).await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                body["error"]["message"], "Missing or invalid rank parameter",
+                "{uri}"
+            );
+        }
     }
 
     /// A single-rank read answers the bare parameter; a missing one is

@@ -84,3 +84,16 @@ message WeightGroupResponse {
   bool success = 1;
   string message = 2;
 }
+
+// `/remote_instance_transfer_engine_info?rank=N` (and its deprecated alias
+// `/get_remote_instance_transfer_engine_info`): the transfer-engine info a
+// rank registered with this node's engine-info bootstrap server, proxied.
+message RemoteInstanceTransferEngineInfoRequest {
+  int64 rank = 1;
+}
+
+// The bootstrap server's reply as it sent it: `{"rank": N,
+// "remote_instance_transfer_engine_info": [...]}`, passed through as JSON.
+message RemoteInstanceTransferEngineInfoResponse {
+  optional string info = 1 [(sglang.json.v1.field_json).raw_json = true];
+}

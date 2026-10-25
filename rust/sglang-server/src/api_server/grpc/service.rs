@@ -596,6 +596,20 @@ impl SglangService for GrpcService {
         }
     }
 
+    async fn get_remote_instance_transfer_engine_info(
+        &self,
+        request: Request<api::RemoteInstanceTransferEngineInfoRequest>,
+    ) -> Result<Response<api::RemoteInstanceTransferEngineInfoResponse>, Status> {
+        let info = self
+            .core
+            .remote_instance_transfer_engine_info(request.into_inner().rank)
+            .await
+            .map_err(native_api::status)?;
+        Ok(Response::new(
+            api::RemoteInstanceTransferEngineInfoResponse { info: Some(info) },
+        ))
+    }
+
     async fn get_hi_cache_storage(
         &self,
         _request: Request<api::GetHiCacheStorageRequest>,

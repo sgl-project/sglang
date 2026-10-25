@@ -83,6 +83,10 @@ service SglangService {
   rpc InitWeightsSendGroupForRemoteInstance(InitWeightsSendGroupForRemoteInstanceRequest) returns (WeightGroupResponse);
   rpc SendWeightsToRemoteInstance(SendWeightsToRemoteInstanceRequest) returns (WeightGroupResponse);
 
+  // `/remote_instance_transfer_engine_info`: proxied from the engine-info
+  // bootstrap server.
+  rpc GetRemoteInstanceTransferEngineInfo(RemoteInstanceTransferEngineInfoRequest) returns (RemoteInstanceTransferEngineInfoResponse);
+
   // `/parse_function_call`, `/separate_reasoning`: frontend-only parsing.
   rpc ParseFunctionCall(ParseFunctionCallRequest) returns (ParseFunctionCallResponse);
   rpc SeparateReasoning(SeparateReasoningRequest) returns (SeparateReasoningResponse);

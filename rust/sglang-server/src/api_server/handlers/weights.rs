@@ -128,6 +128,71 @@ impl CoreHandle {
     }
 }
 
+/// Python answers both a missing bootstrap reply and a rejected one with
+/// this message and a 400.
+fn transfer_info_unavailable(rank: i64) -> CoreError {
+    CoreError::InvalidArgument(format!(
+        "Failed to get transfer engine info for rank {rank}"
+    ))
+}
+
+impl CoreHandle {
+    /// The transfer-engine info `rank` registered with this node's engine-info
+    /// bootstrap server, as the bootstrap server's JSON text. A proxy, not a
+    /// scheduler control: Python's handler does the same outbound GET with a
+    /// five-second timeout.
+    pub(crate) async fn remote_instance_transfer_engine_info(
+        &self,
+        rank: i64,
+    ) -> Result<String, CoreError> {
+        if rank < 0 {
+            return Err(CoreError::InvalidArgument(
+                "Missing or invalid rank parameter".into(),
+            ));
+        }
+        let Some(base_url) = &self
+            .inner
+            .metadata
+            .deployment_info
+            .engine_info_bootstrap_url
+        else {
+            return Err(transfer_info_unavailable(rank));
+        };
+        let url = format!(
+            "{}/get_transfer_engine_info",
+            base_url.trim_end_matches('/')
+        );
+        let response = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .map_err(|error| CoreError::Internal(error.to_string()))?
+            .get(url)
+            .query(&[("rank", rank)])
+            .send()
+            .await;
+        let response = match response {
+            Ok(response) if response.status().is_success() => response,
+            Ok(response) => {
+                tracing::warn!(rank, status = %response.status(), "transfer engine info lookup refused");
+                return Err(transfer_info_unavailable(rank));
+            }
+            Err(error) => {
+                tracing::warn!(rank, %error, "transfer engine info lookup failed");
+                return Err(transfer_info_unavailable(rank));
+            }
+        };
+        let body = response
+            .text()
+            .await
+            .map_err(|_| transfer_info_unavailable(rank))?;
+        // Python returns `resp.json()`, so a body that is not JSON is the
+        // same failure as no body.
+        serde_json::from_str::<serde::de::IgnoredAny>(&body)
+            .map_err(|_| transfer_info_unavailable(rank))?;
+        Ok(body)
+    }
+}
+
 /// The scheduler's `GetWeightsByNameReqOutput`: the parameter as the
 /// scheduler shaped it (`List[float | List[float]]`), left untyped.
 #[derive(Debug, serde::Deserialize)]
@@ -215,6 +280,81 @@ mod tests {
                 .unwrap_err()
                 .kind(),
             CoreErrorKind::InvalidArgument
+        );
+    }
+
+    /// The proxy relays the bootstrap server's JSON as is, and maps a missing
+    /// rank, a refused lookup, and an unconfigured bootstrap server onto
+    /// Python's one failure message.
+    #[tokio::test]
+    async fn transfer_engine_info_is_proxied_from_the_bootstrap_server() {
+        use axum::{Router, routing::get};
+        use std::future::IntoFuture;
+        let app = Router::new().route(
+            "/get_transfer_engine_info",
+            get(
+                |axum::extract::Query(q): axum::extract::Query<
+                    std::collections::HashMap<String, i64>,
+                >| async move {
+                    match q.get("rank") {
+                        Some(0) => (
+                            axum::http::StatusCode::OK,
+                            r#"{"rank": 0, "remote_instance_transfer_engine_info": ["h", 1]}"#,
+                        ),
+                        _ => (axum::http::StatusCode::NOT_FOUND, r#"{"detail": "no"}"#),
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(axum::serve(listener, app).into_future());
+
+        let (intake_tx, _intake_rx) = flume::unbounded();
+        let (abort_tx, _abort_rx) = flume::unbounded();
+        let handle = CoreHandle::new(
+            intake_tx,
+            abort_tx,
+            CoreConfig {
+                response_capacity: 8,
+                response_activity: Default::default(),
+                startup_ready: true,
+                is_disaggregation: false,
+                mm_limits: Vec::new(),
+                metadata: CoreMetadata {
+                    deployment_info: DeploymentInfo {
+                        engine_info_bootstrap_url: Some(url),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                peer_endpoints: Vec::new(),
+            },
+        );
+        let info = handle
+            .remote_instance_transfer_engine_info(0)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&info).unwrap(),
+            serde_json::json!({"rank": 0, "remote_instance_transfer_engine_info": ["h", 1]})
+        );
+        for rank in [-1, 7] {
+            let error = handle
+                .remote_instance_transfer_engine_info(rank)
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), CoreErrorKind::InvalidArgument, "{rank}");
+        }
+        assert!(
+            Harness::unbounded(8)
+                .handle
+                .remote_instance_transfer_engine_info(0)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("rank 0"),
+            "no bootstrap server configured"
         );
     }
 
