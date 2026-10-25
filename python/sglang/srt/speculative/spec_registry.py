@@ -89,7 +89,9 @@ class CustomSpecAlgo:
         from the layers the draft's ``eagle_config`` names, and the draft reads
         their concatenation. Lets an EAGLE-family plugin get only that
         EAGLE-3 behavior without answering ``is_eagle3()``."""
-        return False
+        # Preserve the contract of plugins that already identify as EAGLE-3.
+        # A plugin can still override this independently of its algorithm name.
+        return self.is_eagle3()
 
     def is_frozen_kv_mtp(self) -> bool:
         return False
@@ -236,7 +238,6 @@ class CustomSpecAlgo:
         return resolving_view(server_args).speculative_num_draft_tokens
 
     def create_worker(self, server_args: ServerArgs) -> Type:
-
         cfg = resolving_view(server_args)
         # eagle-harness 0.1.1 builds its own CUDA/HIP draft and verify kernels.
         # It cannot use the builtin EAGLE NPU/CPU kernels as a fallback.

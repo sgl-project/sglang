@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 import torch
 
 from sglang.kernels.ops.sampling import softmax as sampling_softmax
-from sglang.kernels.ops.sampling.renorm import top_k_renorm_prob, top_p_renorm_prob
 from sglang.kernels.ops.speculative.spec_tree import (
     TreeMaskMode,
     build_tree_kernel_efficient_func,
@@ -26,7 +25,7 @@ from sglang.srt.mem_cache.allocation_sizing import (
     get_alloc_reserve_per_decode,
     page_aligned_decode_alloc_lens,
 )
-from sglang.srt.runtime_context import get_spec
+from sglang.srt.runtime_context import get_exec, get_spec
 from sglang.srt.utils import (
     is_cpu,
     is_cuda,
@@ -50,6 +49,17 @@ _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_xpu = is_xpu()
 _is_cpu = is_cpu()
+
+if _is_cuda:
+    # Match Sampler's CUDA primitives, including sgl_kernel's fallback when
+    # FlashInfer is unavailable. Its FlashInfer branch delegates to the same
+    # kernels used for ordinary sampling.
+    from sgl_kernel import top_k_renorm_prob, top_p_renorm_prob
+else:
+    from sglang.kernels.ops.sampling.renorm import (
+        top_k_renorm_prob,
+        top_p_renorm_prob,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -493,23 +503,42 @@ def _filter_verify_target_probs(
     sampling_info: SamplingBatchInfo,
     draft_token_num: int,
     *,
+    sampling_backend: str,
     top_k_renorm_prob,
     top_p_renorm_prob,
 ) -> torch.Tensor:
     """The distribution the sampler draws each verify row's token from.
 
-    This is what Sampler draws without speculation: the top-k and the top-p
-    cut both apply to the unfiltered probabilities (the joint support of
-    top_k_top_p_sampling_from_probs and of the pytorch backend), then min-p
-    drops what is below min_p times the most likely token's probability, and
-    the rest is renormalized. Cutting top-p after a top-k renorm instead keeps
-    fewer tokens whenever the top-k cut binds, and ignoring min-p keeps tokens
-    the sampler never draws: either way speculative decoding stops matching
-    the target model's sampling distribution.
+    FlashInfer/Intel XPU with a min-p request uses sequential top-k, top-p,
+    min-p filtering for the entire batch. Its other path and the PyTorch
+    sampler use joint top-k/top-p filtering. This must follow the batch-level
+    switch in Sampler._sample_from_probs so mixed batches retain the native
+    distribution.
     """
 
     def per_row(values: torch.Tensor) -> torch.Tensor:
         return torch.repeat_interleave(values, draft_token_num, dim=0)
+
+    if (
+        sampling_backend in ("flashinfer", "intel_xpu")
+        and sampling_info.need_min_p_sampling
+    ):
+        # Sampler._sample_from_probs applies both kernels in this order, even when
+        # an individual row has min_p=0 or no top-k/top-p restriction.
+        probs = top_k_renorm_prob(probs, per_row(sampling_info.top_ks))
+        probs = top_p_renorm_prob(probs, per_row(sampling_info.top_ps))
+        threshold = probs.amax(dim=-1, keepdim=True) * per_row(
+            sampling_info.min_ps
+        ).view(-1, 1)
+        probs = probs.masked_fill(probs < threshold, 0.0)
+        return probs / probs.sum(dim=-1, keepdim=True)
+
+    if not (
+        sampling_info.need_top_k_sampling
+        or sampling_info.need_top_p_sampling
+        or sampling_info.need_min_p_sampling
+    ):
+        return probs
 
     keep = None
     if sampling_info.need_top_k_sampling:
@@ -523,8 +552,6 @@ def _filter_verify_target_probs(
         ).view(-1, 1)
         min_p_keep = probs >= threshold
         keep = min_p_keep if keep is None else keep & min_p_keep
-    if keep is None:
-        return probs
     probs = probs.masked_fill(~keep, 0.0)
     return probs / probs.sum(dim=-1, keepdim=True)
 
@@ -776,6 +803,7 @@ def eagle_sample(
             target_probs,
             sampling_info,
             verify_input.draft_token_num,
+            sampling_backend=get_exec().kernel.sampling_backend,
             top_k_renorm_prob=top_k_renorm_prob,
             top_p_renorm_prob=top_p_renorm_prob,
         )

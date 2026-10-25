@@ -394,6 +394,15 @@ class TestRelayDefaults(_RegistryIsolated):
         self.assertTrue(eagle.need_topk())
         self.assertTrue(eagle.carries_draft_hidden_states())
 
+    def test_legacy_eagle3_plugin_keeps_aux_hidden_states(self):
+        class LegacyEagle3(CustomSpecAlgo):
+            def is_eagle3(self) -> bool:
+                return True
+
+        legacy = LegacyEagle3("MY_EAGLE3", MagicMock)
+        self.assertTrue(legacy.uses_aux_hidden_states())
+        self.assertFalse(CustomSpecAlgo("MY_PLAIN", MagicMock).uses_aux_hidden_states())
+
     def test_create_future_map_builds_the_relay_for_this_algorithm(self):
         from sglang.srt.managers import overlap_utils
 

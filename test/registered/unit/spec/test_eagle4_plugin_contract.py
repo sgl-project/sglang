@@ -52,7 +52,7 @@ def test_multimodal_requests_are_rejected_before_scheduling(algorithm):
 
 
 @pytest.mark.parametrize(
-    "request, message",
+    "req, message",
     [
         (SimpleNamespace(custom_logit_processor="processor"), "custom logit"),
         (
@@ -63,9 +63,9 @@ def test_multimodal_requests_are_rejected_before_scheduling(algorithm):
         ),
     ],
 )
-def test_request_features_cannot_bypass_sampling(algorithm, request, message):
+def test_request_features_cannot_bypass_sampling(algorithm, req, message):
     assert message in algorithm.validate_request(
-        request, has_mm_inputs=False, enable_overlap=True
+        req, has_mm_inputs=False, enable_overlap=True
     )
 
 
