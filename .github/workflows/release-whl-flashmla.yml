@@ -112,7 +112,7 @@ jobs:
             tests: current legacy
             timeout: 180
           - arch_label: sm103-aarch64
-            runner: 4-gpu-gb300
+            runner: 2-gpu-gb300
             wheel_arch: aarch64
             tests: current legacy
             timeout: 180
