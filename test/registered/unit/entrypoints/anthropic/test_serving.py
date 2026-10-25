@@ -11,10 +11,17 @@ maybe_stub_sgl_kernel()  # must precede imports that may pull in sgl_kernel
 from fastapi import HTTPException  # noqa: E402
 from fastapi.responses import JSONResponse  # noqa: E402
 from jinja2 import Environment  # noqa: E402
+from pydantic import ValidationError  # noqa: E402
 
 from sglang.srt.entrypoints.anthropic.protocol import (  # noqa: E402
+    AnthropicBashTool,
+    AnthropicComputerTool,
+    AnthropicCountTokensRequest,
+    AnthropicCustomTool,
     AnthropicMessage,
     AnthropicMessagesRequest,
+    AnthropicTextEditorTool,
+    AnthropicWebSearchTool,
 )
 from sglang.srt.entrypoints.anthropic.serving import AnthropicServing  # noqa: E402
 from sglang.srt.entrypoints.openai.protocol import (  # noqa: E402
@@ -525,6 +532,88 @@ class TestAnthropicServing(unittest.TestCase):
                     "tools": [{"name": "custom_without_schema"}],
                 }
             )
+
+    def test_non_string_tool_type_is_a_validation_error(self):
+        # NVBug 6917691: a list/bool/int ``tools[*].type`` used to escape the
+        # discriminated union as a bare AttributeError (``t.startswith``) in
+        # _tool_discriminator, so FastAPI never saw a RequestValidationError
+        # and the client got a plain-text HTTP 500. It must be a pydantic
+        # ValidationError that names the field.
+        for bad_type in (["web_search_2025"], True, 123, {"x": 1}):
+            with self.subTest(tool_type=bad_type):
+                with self.assertRaises(ValidationError) as caught:
+                    AnthropicMessagesRequest.model_validate(
+                        {
+                            "model": "test-model",
+                            "max_tokens": 16,
+                            "messages": [{"role": "user", "content": "hi"}],
+                            "tools": [
+                                {
+                                    "name": "demo",
+                                    "description": "Demo tool",
+                                    "input_schema": {
+                                        "type": "object",
+                                        "properties": {},
+                                    },
+                                    "type": bad_type,
+                                }
+                            ],
+                        }
+                    )
+                # The error must point the client at tools[0].type.
+                locs = [err["loc"] for err in caught.exception.errors()]
+                self.assertTrue(
+                    any(("tools", 0) == loc[:2] and loc[-1] == "type" for loc in locs),
+                    locs,
+                )
+
+    def test_non_string_tool_type_is_a_validation_error_count_tokens(self):
+        with self.assertRaises(ValidationError):
+            AnthropicCountTokensRequest.model_validate(
+                {
+                    "model": "test-model",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "tools": [
+                        {
+                            "name": "demo",
+                            "input_schema": {"type": "object"},
+                            "type": True,
+                        }
+                    ],
+                }
+            )
+
+    def test_string_tool_types_still_select_their_variant(self):
+        cases = {
+            None: AnthropicCustomTool,
+            "custom": AnthropicCustomTool,
+            "web_search_20250305": AnthropicWebSearchTool,
+            "computer_20250124": AnthropicComputerTool,
+            "bash_20250124": AnthropicBashTool,
+            "text_editor_20250124": AnthropicTextEditorTool,
+        }
+        names = {
+            AnthropicWebSearchTool: "web_search",
+            AnthropicComputerTool: "computer",
+            AnthropicBashTool: "bash",
+            AnthropicTextEditorTool: "str_replace_based_edit_tool",
+        }
+        for tool_type, expected in cases.items():
+            with self.subTest(tool_type=tool_type):
+                tool = {"name": names.get(expected, "demo")}
+                if expected is AnthropicCustomTool:
+                    tool["input_schema"] = {"type": "object"}
+                if tool_type is not None:
+                    tool["type"] = tool_type
+                request = AnthropicMessagesRequest.model_validate(
+                    {
+                        "model": "test-model",
+                        "max_tokens": 16,
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "tools": [tool],
+                    }
+                )
+                self.assertIsInstance(request.tools[0], expected)
 
     def test_non_streaming_openai_error_response_is_forwarded(self):
         serving = AnthropicServing(_FakeNonStreamingErrorOpenAI())
