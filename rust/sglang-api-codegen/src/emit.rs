@@ -39,16 +39,7 @@ pub fn emit_serde(descriptor_bytes: &[u8], package: &str) -> String {
                 oneof_mod,
                 oneof_ident,
                 variants,
-                presence_key,
-            } => emit_untagged(
-                &mut out,
-                m,
-                oneof_mod,
-                oneof_ident,
-                variants,
-                &by_name,
-                presence_key.as_deref(),
-            ),
+            } => emit_untagged(&mut out, m, oneof_mod, oneof_ident, variants, &by_name),
             MessageKind::TaggedUnion {
                 oneof_mod,
                 oneof_ident,
@@ -486,19 +477,14 @@ fn emit_untagged(
     oneof_ident: &str,
     variants: &[model::VariantModel],
     models: &HashMap<&str, &MessageModel>,
-    presence_key: Option<&str>,
 ) {
     let name = &m.rust_name;
-    let oneof_field = model::snake(oneof_ident);
-    assert!(
-        presence_key.is_none()
-            || variants
-                .iter()
-                .all(|v| kind_shapes(&v.kind, models) == vec![JsonShape::Map]),
-        "{name}: presence_key needs object-shaped arms"
-    );
+    if name == "GenerateStreamItem" {
+        out.push_str(GENERATE_STREAM_ITEM_CODEC);
+        return;
+    }
     let wrap = |var: &str, expr: &str| {
-        format!("Ok({name} {{ {oneof_field}: Some({oneof_mod}::{oneof_ident}::{var}({expr})) }})")
+        format!("Ok({name} {{ value: Some({oneof_mod}::{oneof_ident}::{var}({expr})) }})")
     };
     let mut ser_arms = String::new();
     // shape -> the arms claiming it, in declaration order.
@@ -514,11 +500,6 @@ fn emit_untagged(
                 None => claims.push((shape, vec![v])),
             }
         }
-    }
-
-    if let Some(key) = presence_key {
-        out.push_str(&object_union_codec(m, models, key, &ser_arms));
-        return;
     }
 
     let mut visits = String::new();
@@ -687,7 +668,7 @@ fn emit_untagged(
     out.push_str(&format!(
         r#"impl ::serde::Serialize for {name} {{
     fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {{
-        match &self.{oneof_field} {{
+        match &self.value {{
 {ser_arms}            None => serializer.serialize_none(),
         }}
     }}
@@ -710,76 +691,49 @@ impl<'de> ::serde::Deserialize<'de> for {name} {{
     ));
 }
 
-/// Let Serde match the object arms, guarding the key that distinguishes them.
-fn object_union_codec(
-    m: &MessageModel,
-    models: &HashMap<&str, &MessageModel>,
-    presence_key: &str,
-    ser_arms: &str,
-) -> String {
-    let name = &m.rust_name;
-    let MessageKind::Untagged {
-        oneof_mod,
-        oneof_ident,
-        variants,
-        ..
-    } = &m.kind
-    else {
-        unreachable!()
-    };
-    let refs: Vec<_> = variants.iter().collect();
-    let arms = model::object_union_arms(&refs, models, presence_key);
-    let keyed = arms.iter().position(|(_, key)| key.is_some()).unwrap();
-    let fallback = 1 - keyed;
-    let (keyed_ty, key) = &arms[keyed];
-    let key_field = &key.unwrap().rust_ident;
-    let fallback_ty = arms[fallback].0;
-    let keyed_variant = &variants[keyed].rust_variant;
-    let fallback_variant = &variants[fallback].rust_variant;
-    let oneof_field = model::snake(oneof_ident);
-    format!(
-        r#"impl ::serde::Serialize for {name} {{
-    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {{
-        match &self.{oneof_field} {{
-{ser_arms}            None => serializer.serialize_none(),
-        }}
-    }}
-}}
+// Serde handles the flat HTTP union; protobuf keeps its existing oneof tags.
+const GENERATE_STREAM_ITEM_CODEC: &str = r#"impl ::serde::Serialize for GenerateStreamItem {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match &self.item {
+            Some(generate_stream_item::Item::Frame(frame)) => frame.serialize(serializer),
+            Some(generate_stream_item::Item::Error(error)) => error.serialize(serializer),
+            None => serializer.serialize_none(),
+        }
+    }
+}
 
-impl<'de> ::serde::Deserialize<'de> for {name} {{
-    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {{
-        fn with_key<'de, D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<{keyed_ty}, D::Error> {{
-            let payload = <{keyed_ty} as ::serde::Deserialize>::deserialize(deserializer)?;
-            if payload.{key_field}.is_none() {{
-                return Err(::serde::de::Error::missing_field({presence_key:?}));
-            }}
+impl<'de> ::serde::Deserialize<'de> for GenerateStreamItem {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        fn error<'de, D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<GenerateStreamError, D::Error> {
+            let payload = GenerateStreamError::deserialize(deserializer)?;
+            if payload.error.is_none() {
+                return Err(::serde::de::Error::missing_field("error"));
+            }
             Ok(payload)
-        }}
-        fn without_key<'de, D: ::serde::Deserializer<'de>>(_: D) -> Result<(), D::Error> {{
-            Err(::serde::de::Error::custom(concat!("unexpected field ", {presence_key:?})))
-        }}
+        }
+        fn reject_error<'de, D: ::serde::Deserializer<'de>>(_: D) -> Result<(), D::Error> {
+            Err(::serde::de::Error::custom("unexpected error field"))
+        }
         #[derive(::serde::Deserialize)]
         #[serde(untagged)]
-        enum Decoded {{
-            WithKey(#[serde(deserialize_with = "with_key")] {keyed_ty}),
-            WithoutKey {{
-                #[serde(default, rename = {presence_key:?}, deserialize_with = "without_key")]
-                _key: (),
+        enum Outcome {
+            Error(#[serde(deserialize_with = "error")] GenerateStreamError),
+            Frame {
+                #[serde(default, rename = "error", deserialize_with = "reject_error")]
+                _error: (),
                 #[serde(flatten)]
-                payload: {fallback_ty},
-            }},
-        }}
-        let item = match Decoded::deserialize(deserializer)? {{
-            Decoded::WithKey(payload) => {oneof_mod}::{oneof_ident}::{keyed_variant}(payload),
-            Decoded::WithoutKey {{ payload, .. }} => {oneof_mod}::{oneof_ident}::{fallback_variant}(payload),
-        }};
-        Ok({name} {{ {oneof_field}: Some(item) }})
-    }}
-}}
-
-"#
-    )
+                frame: GenerateResponse,
+            },
+        }
+        let item = match Outcome::deserialize(deserializer)? {
+            Outcome::Error(payload) => generate_stream_item::Item::Error(payload),
+            Outcome::Frame { frame, .. } => generate_stream_item::Item::Frame(frame),
+        };
+        Ok(Self { item: Some(item) })
+    }
 }
+
+"#;
 
 /// Serialize one struct/payload field into `map` (a SerializeMap), honoring
 /// the field's presence/null rules. `always_emit_null` = tagged-union payload

@@ -183,12 +183,11 @@ pub enum MessageKind {
         variants: Vec<VariantModel>,
         passthrough: Option<VariantModel>,
     },
-    /// Single oneof: select by value shape or an explicit object key's presence.
+    /// Single oneof with an untagged JSON representation.
     Untagged {
         oneof_mod: String,
         oneof_ident: String,
         variants: Vec<VariantModel>,
-        presence_key: Option<String>,
     },
     /// A plain object.
     Struct {
@@ -284,12 +283,6 @@ fn message_model(msg: &MessageDescriptor, ext: &Extensions) -> MessageModel {
         let shape = oopts.map(|m| opt_enum(m, "shape")).unwrap_or(0);
         let (untagged, one_or_many, tagged) = (shape == 1, shape == 2, shape == 3);
         let tag = oopts.and_then(|m| opt_str(m, "tag"));
-        let presence_key = oopts.and_then(|m| opt_str(m, "presence_key"));
-        assert!(
-            presence_key.is_none() || (untagged && oneof.fields().len() == 2),
-            "{}: presence_key needs an untagged union of two objects",
-            msg.full_name()
-        );
         assert_eq!(
             tagged,
             tag.is_some(),
@@ -363,7 +356,6 @@ fn message_model(msg: &MessageDescriptor, ext: &Extensions) -> MessageModel {
                     oneof_mod,
                     oneof_ident,
                     variants,
-                    presence_key,
                 },
             };
         }
@@ -554,51 +546,4 @@ pub fn snake(name: &str) -> String {
         }
     }
     out
-}
-
-/// Payload type and the presence key for the selected arm (if any).
-pub type ObjectUnionArm<'a> = (&'a str, Option<&'a FieldModel>);
-
-/// Two object arms are selected by an explicit key's presence or absence.
-/// Payload fields retain their own validation and unknown-field rules.
-pub fn object_union_arms<'a>(
-    variants: &[&VariantModel],
-    models: &std::collections::HashMap<&str, &'a MessageModel>,
-    presence_key: &str,
-) -> Vec<ObjectUnionArm<'a>> {
-    assert_eq!(
-        variants.len(),
-        2,
-        "presence_key needs exactly two object arms"
-    );
-    let mut arms = Vec::new();
-    for variant in variants {
-        let FieldKind::Message { rust_path, .. } = &variant.kind else {
-            panic!("object union arm must be a message");
-        };
-        let model = models[rust_path.as_str()];
-        let MessageKind::Struct {
-            deny_unknown: false,
-            fields: payload,
-        } = &model.kind
-        else {
-            panic!(
-                "{}: object union arms must be objects that ignore unknown fields",
-                model.rust_name
-            );
-        };
-        let key = payload.iter().find(|f| f.json_name == presence_key);
-        if let Some(key) = key {
-            assert!(
-                matches!(key.kind, FieldKind::Message { .. }),
-                "presence_key must name a message-valued field"
-            );
-        }
-        arms.push((model.rust_name.as_str(), key));
-    }
-    assert!(
-        arms.iter().filter(|(_, key)| key.is_some()).count() == 1,
-        "presence_key must belong to exactly one object arm"
-    );
-    arms
 }

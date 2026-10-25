@@ -3128,8 +3128,8 @@ impl<'de> ::serde::Deserialize<'de> for GenerateStreamError {
 impl ::serde::Serialize for GenerateStreamItem {
     fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match &self.item {
-            Some(generate_stream_item::Item::Frame(v)) => v.serialize(serializer),
-            Some(generate_stream_item::Item::Error(v)) => v.serialize(serializer),
+            Some(generate_stream_item::Item::Frame(frame)) => frame.serialize(serializer),
+            Some(generate_stream_item::Item::Error(error)) => error.serialize(serializer),
             None => serializer.serialize_none(),
         }
     }
@@ -3137,37 +3137,34 @@ impl ::serde::Serialize for GenerateStreamItem {
 
 impl<'de> ::serde::Deserialize<'de> for GenerateStreamItem {
     fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        fn with_key<'de, D: ::serde::Deserializer<'de>>(
+        fn error<'de, D: ::serde::Deserializer<'de>>(
             deserializer: D,
         ) -> Result<GenerateStreamError, D::Error> {
-            let payload = <GenerateStreamError as ::serde::Deserialize>::deserialize(deserializer)?;
+            let payload = GenerateStreamError::deserialize(deserializer)?;
             if payload.error.is_none() {
                 return Err(::serde::de::Error::missing_field("error"));
             }
             Ok(payload)
         }
-        fn without_key<'de, D: ::serde::Deserializer<'de>>(_: D) -> Result<(), D::Error> {
-            Err(::serde::de::Error::custom(concat!(
-                "unexpected field ",
-                "error"
-            )))
+        fn reject_error<'de, D: ::serde::Deserializer<'de>>(_: D) -> Result<(), D::Error> {
+            Err(::serde::de::Error::custom("unexpected error field"))
         }
         #[derive(::serde::Deserialize)]
         #[serde(untagged)]
-        enum Decoded {
-            WithKey(#[serde(deserialize_with = "with_key")] GenerateStreamError),
-            WithoutKey {
-                #[serde(default, rename = "error", deserialize_with = "without_key")]
-                _key: (),
+        enum Outcome {
+            Error(#[serde(deserialize_with = "error")] GenerateStreamError),
+            Frame {
+                #[serde(default, rename = "error", deserialize_with = "reject_error")]
+                _error: (),
                 #[serde(flatten)]
-                payload: GenerateResponse,
+                frame: GenerateResponse,
             },
         }
-        let item = match Decoded::deserialize(deserializer)? {
-            Decoded::WithKey(payload) => generate_stream_item::Item::Error(payload),
-            Decoded::WithoutKey { payload, .. } => generate_stream_item::Item::Frame(payload),
+        let item = match Outcome::deserialize(deserializer)? {
+            Outcome::Error(payload) => generate_stream_item::Item::Error(payload),
+            Outcome::Frame { frame, .. } => generate_stream_item::Item::Frame(frame),
         };
-        Ok(GenerateStreamItem { item: Some(item) })
+        Ok(Self { item: Some(item) })
     }
 }
 

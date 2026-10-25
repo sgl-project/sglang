@@ -106,11 +106,12 @@ enum OneofShape {
   // Unset: the message owning the oneof is a plain object.
   ONEOF_SHAPE_UNSPECIFIED = 0;
 
-  // Untagged: value shape (or presence_key) distinguishes the variants.
+  // Untagged: variants serialize without a tag and deserialize by matching
+  // their JSON values.
   ONEOF_SHAPE_UNTAGGED = 1;
 
-  // On a oneof of exactly { T one; TList many; }: a JSON scalar deserializes
-  // as `one`, a JSON array as `many`; serialization flattens the same way.
+  // On a oneof of exactly { T one; TList many; }: JSON contains one value
+  // or an array of values; serialization flattens the same way.
   ONEOF_SHAPE_ONE_OR_MANY = 2;
 
   // Internally tagged by the key in `tag` (e.g. finish_reason's
@@ -123,7 +124,7 @@ enum OneofShape {
 // its body. A oneof is a tagged union on the protobuf wire (the field number
 // is the tag); JSON has no such tag, so `shape` picks how the union is
 // spelled there and how the deserializer recovers the variant: by value
-// shape or key presence (untagged), scalar versus array (one_or_many), or a
+// matching (untagged), one value versus an array (one_or_many), or a
 // discriminator key named by `tag` (tagged). `unknown_variant_passthrough` lets
 // a tagged union round-trip a variant this schema does not know.
 message OneofJson {
@@ -138,12 +139,6 @@ message OneofJson {
   // and round-trips unchanged -- the forward-compatibility escape hatch for
   // values another component may extend (e.g. finish_reason).
   bool unknown_variant_passthrough = 3;
-
-  // With ONEOF_SHAPE_UNTAGGED and exactly two object arms: presence of this
-  // message-valued key selects the arm declaring it; absence selects the other.
-  // Its value must be non-null. Only the selected arm's fields are validated;
-  // standalone payload decoding is unchanged.
-  string presence_key = 4;
 }
 
 extend google.protobuf.MessageOptions {

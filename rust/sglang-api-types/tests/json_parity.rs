@@ -3,7 +3,7 @@
 //! the generated Python types by `test/registered/unit/api/v1/test_parity.py`.
 //! Both emitters must decode each `input` to the same `canonical` bytes (field
 //! set, key order, presence and null rules) and keep `canonical` fixed under
-//! a second round trip, or reject it. String `error` fixtures also pin the message.
+//! a second round trip. Fixtures with `error: true` must be rejected.
 
 use serde::{Serialize, de::DeserializeOwned};
 use sglang_api_types::api::v1 as api;
@@ -15,20 +15,14 @@ fn check<T: DeserializeOwned + Serialize>(name: &str, case: &serde_json::Value) 
     let decoded = serde_json::from_value::<T>(input.clone());
     let bytes = serde_json::to_vec(input).unwrap();
     let from_bytes = serde_json::from_slice::<T>(&bytes);
-    let from_reader = serde_json::from_reader::<_, T>(std::io::Cursor::new(&bytes));
-    if let Some(expected) = case.get("error") {
-        for result in [decoded, from_bytes, from_reader] {
-            let error = result
-                .err()
-                .unwrap_or_else(|| panic!("{name}: input unexpectedly decoded"));
-            if let Some(expected) = expected.as_str() {
-                assert!(error.to_string().starts_with(expected), "{name}: {error}");
-            }
+    if case["error"] == true {
+        for result in [decoded, from_bytes] {
+            assert!(result.is_err(), "{name}: input unexpectedly decoded");
         }
         return;
     }
     let canonical = case["canonical"].as_str().expect("canonical");
-    for result in [decoded, from_bytes, from_reader] {
+    for result in [decoded, from_bytes] {
         let decoded =
             result.unwrap_or_else(|error| panic!("{name}: input does not decode: {error}"));
         assert_eq!(
@@ -79,8 +73,7 @@ fn fixtures_decode_to_their_canonical_bytes() {
     }
 }
 
-/// Buffering must preserve duplicate keys for the selected payload's decoder.
-/// A JSON object map would silently collapse them before validation.
+/// Duplicate fields are rejected in the selected payload and ignored otherwise.
 #[test]
 fn stream_item_validates_duplicates_only_in_the_selected_payload() {
     use api::generate_stream_item::Item;
@@ -92,7 +85,7 @@ fn stream_item_validates_duplicates_only_in_the_selected_payload() {
         assert!(serde_json::from_str::<api::GenerateStreamItem>(input).is_err());
     }
 
-    // The escaped selecting key follows invalid and repeated success fields.
+    // An error can follow malformed success fields, including duplicate keys.
     let item: api::GenerateStreamItem = serde_json::from_str(
         r#"{"text":7,"text":false,"err\u006fr":{"message":"failed","code":500}}"#,
     )

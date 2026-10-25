@@ -229,11 +229,9 @@ pub fn emit_python(descriptor_bytes: &[u8], package: &str) -> String {
             MessageKind::OneOrMany { one, many, .. } => {
                 emit_one_or_many_codec(&mut out, &ctx, m, one, many)
             }
-            MessageKind::Untagged {
-                variants,
-                presence_key,
-                ..
-            } => emit_untagged_codec(&mut out, &ctx, m, variants, presence_key.as_deref()),
+            MessageKind::Untagged { variants, .. } => {
+                emit_untagged_codec(&mut out, &ctx, m, variants)
+            }
             MessageKind::TaggedUnion {
                 tag,
                 variants,
@@ -574,17 +572,13 @@ fn alias_def(m: &MessageModel) -> Option<(String, &'static str, Vec<String>)> {
             "JSON: one value or an array of values",
             refs(&[&one.kind, &many.kind]),
         )),
-        MessageKind::Untagged {
-            variants,
-            presence_key,
-            ..
-        } => {
+        MessageKind::Untagged { variants, .. } => {
             let arms: Vec<String> = variants.iter().map(|v| inner_ty(&v.kind)).collect();
             let kinds: Vec<&FieldKind> = variants.iter().map(|v| &v.kind).collect();
             Some((
                 format!("Union[{}]", arms.join(", ")),
-                if presence_key.is_some() {
-                    "JSON: key presence picks the arm"
+                if m.rust_name == "GenerateStreamItem" {
+                    "JSON: a generation frame or error"
                 } else {
                     "JSON: the value's shape picks the arm"
                 },
@@ -961,13 +955,7 @@ fn py_elements_are_lists(ctx: &Ctx, name: &str) -> bool {
     }
 }
 
-fn emit_untagged_codec(
-    out: &mut String,
-    ctx: &Ctx,
-    m: &MessageModel,
-    variants: &[VariantModel],
-    presence_key: Option<&str>,
-) {
+fn emit_untagged_codec(out: &mut String, ctx: &Ctx, m: &MessageModel, variants: &[VariantModel]) {
     let name = &m.rust_name;
     let mut de = format!("def decode_{name}(value: Any) -> {name}:\n");
     let mut en = format!("def encode_{name}(v: {name}) -> Any:\n");
@@ -1030,27 +1018,10 @@ fn emit_untagged_codec(
         if claimants.is_empty() {
             continue;
         }
-        if shape == PyShape::Dict && claimants.len() > 1 {
-            let variants: Vec<_> = claimants.iter().map(|a| a.v).collect();
-            let presence_key =
-                presence_key.expect("overlapping object arms need an explicit presence_key");
-            let payloads = crate::model::object_union_arms(&variants, &ctx.models, presence_key);
-            de.push_str("    if isinstance(value, dict):\n");
-            let keyed = payloads.iter().filter(|(_, key)| key.is_some());
-            let fallback = payloads.iter().filter(|(_, key)| key.is_none());
-            for (ty, key) in keyed.chain(fallback) {
-                if let Some(key) = key {
-                    let FieldKind::Message { rust_path, .. } = &key.kind else {
-                        unreachable!()
-                    };
-                    de.push_str(&format!(
-                        "        if {presence_key:?} in value:\n            payload = decode_{ty}(value)\n            if payload.{} is None:\n                raise _invalid_type(None, expected=\"struct {rust_path}\")\n            return payload\n",
-                        py_ident(&key.json_name),
-                    ));
-                } else {
-                    de.push_str(&format!("        return decode_{ty}(value)\n"));
-                }
-            }
+        if shape == PyShape::Dict && name == "GenerateStreamItem" {
+            de.push_str(
+                "    if isinstance(value, dict):\n        if \"error\" in value:\n            payload = decode_GenerateStreamError(value)\n            if payload.error is None:\n                raise _invalid_type(None, expected=\"struct ErrorBody\")\n            return payload\n        return decode_GenerateResponse(value)\n",
+            );
             continue;
         }
         if shape != PyShape::List && claimants.len() > 1 {

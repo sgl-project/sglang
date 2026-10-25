@@ -260,7 +260,6 @@ message GenerateStreamError {
 message GenerateStreamItem {
   oneof item {
     option (sglang.json.v1.oneof_json).shape = ONEOF_SHAPE_UNTAGGED;
-    option (sglang.json.v1.oneof_json).presence_key = "error";
     GenerateResponse frame = 1;
     GenerateStreamError error = 2;
   }
