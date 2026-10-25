@@ -13,10 +13,8 @@ from sglang.kernels.ops.diffusion import (
     FUSED_LINEAR_GELU,
     NVFP4_BIAS_GELU,
     BitExactFusionGate,
-    can_use_fused_rmsnorm_interleaved_rope,
     can_use_linear_gelu,
     fused_linear_gelu_tanh,
-    fused_rmsnorm_interleaved_rope_,
     fused_temb_table_slices,
     tensors_equal,
 )
@@ -76,6 +74,15 @@ from sglang.multimodal_gen.runtime.platforms.aiter import USE_AITER
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.utils import add_prefix
+
+try:
+    from sglang.kernels.ops.diffusion import (
+        can_use_fused_rmsnorm_interleaved_rope,
+        fused_rmsnorm_interleaved_rope_,
+    )
+except ImportError:  # CuTe DSL (cutlass) is not installed, e.g. on XPU/ROCm
+    can_use_fused_rmsnorm_interleaved_rope = lambda *args, **kwargs: False
+    fused_rmsnorm_interleaved_rope_ = None
 
 logger = init_logger(__name__)
 _is_cuda = current_platform.is_cuda()
