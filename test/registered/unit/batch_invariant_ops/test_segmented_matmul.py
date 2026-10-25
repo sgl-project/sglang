@@ -86,6 +86,20 @@ class TestSegmentedMatmul(CustomTestCase):
                 ):
                     self.assertTrue(torch.equal(_mm(a, b), ref))
 
+    def test_short_k_rows_do_not_depend_on_the_batch(self):
+        """K up to _SEGMENT_MIN_K (e.g. an MoE shared expert's down projection at TP4)
+        stays on the persistent kernel, so every row is the same in any batch."""
+        for N, K in [(2304, 256), (4096, 128), (2048, 96), (2304, 512)]:
+            a, b = _inputs(N, K)
+            full = batch_invariant_ops.matmul_persistent(a, b)
+            for m in ROWS:
+                with self.subTest(N=N, K=K, M=m):
+                    self.assertTrue(
+                        torch.equal(
+                            batch_invariant_ops.matmul_persistent(a[:m], b), full[:m]
+                        )
+                    )
+
     def test_close_to_fp32(self):
         for N, K in SHAPES:
             a, b = _inputs(N, K, M=256)

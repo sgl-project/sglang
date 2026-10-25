@@ -276,6 +276,10 @@ def _matmul_persistent_triton(
 # on MI350X; changing either changes the numerics.
 _SEGMENT_COUNT = 4
 _SEGMENT_BLOCK_K = 64
+# With a single BLOCK_K step per segment the compiler folds the segment's sum into the
+# running total when the segments run in one program, so the split and unsplit launches
+# round differently; K up to this size keeps the persistent kernel.
+_SEGMENT_MIN_K = _SEGMENT_COUNT * _SEGMENT_BLOCK_K
 
 
 @triton.jit
@@ -559,7 +563,12 @@ def matmul_persistent(
             out += bias
         return out
 
-    if _is_gfx95 and a.dtype == torch.bfloat16 and out_dtype == torch.bfloat16:
+    if (
+        _is_gfx95
+        and a.dtype == torch.bfloat16
+        and out_dtype == torch.bfloat16
+        and K > _SEGMENT_MIN_K
+    ):
         return _matmul_segmented_triton(a=a, b=b, bias=bias, out_dtype=out_dtype)
 
     return _matmul_persistent_triton(a=a, b=b, bias=bias, out_dtype=out_dtype)
