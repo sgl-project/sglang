@@ -931,8 +931,14 @@ KvHintsEnvelopeList = List[OptionalKvHintsEnvelope]
 # sglang.api.v1.SamplingParamsOrList: JSON: one value or an array of values.
 SamplingParamsOrList = Union[SamplingParams, SamplingParamsList]
 
+# sglang.api.v1.GenerateResponseList: JSON bare array.
+GenerateResponseList = List[GenerateStreamItem]
+
 # sglang.api.v1.KvHintsEnvelopeOrList: JSON: one value or an array of values.
 KvHintsEnvelopeOrList = Union[KvHintsEnvelope, KvHintsEnvelopeList]
+
+# sglang.api.v1.GenerateResponseOrList: JSON: one value or an array of values.
+GenerateResponseOrList = Union[GenerateStreamItem, GenerateResponseList]
 
 
 # ---- codecs: parsed JSON value <-> Python value ----
@@ -1880,6 +1886,26 @@ def encode_GenerateResponse(v: GenerateResponse) -> Dict[str, Any]:
     if v.prompt_token_ids is not None:
         d["prompt_token_ids"] = encode_TokenIds(v.prompt_token_ids)
     return d
+
+
+def decode_GenerateResponseOrList(value: Any) -> GenerateResponseOrList:
+    if isinstance(value, list):
+        return decode_GenerateResponseList(value)
+    return decode_GenerateStreamItem(_expect_map(value, expected="a value or an array of values for GenerateResponseOrList"))
+
+
+def encode_GenerateResponseOrList(v: GenerateResponseOrList) -> Any:
+    if isinstance(v, list):
+        return encode_GenerateResponseList(v)
+    return encode_GenerateStreamItem(v)
+
+
+def decode_GenerateResponseList(value: Any) -> GenerateResponseList:
+    return [decode_GenerateStreamItem(e) for e in _expect_seq(value, expected="a sequence")]
+
+
+def encode_GenerateResponseList(v: GenerateResponseList) -> List[Any]:
+    return [encode_GenerateStreamItem(e) for e in v]
 
 
 def decode_GenerateStreamError(value: Any) -> GenerateStreamError:

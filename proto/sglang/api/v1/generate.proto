@@ -231,6 +231,21 @@ message GenerateResponse {
   TokenIds prompt_token_ids = 5;
 }
 
+// HTTP /generate returns one outcome or a bare array of outcomes. Batch items
+// fail independently, so each entry can be a frame or an error (as in gRPC).
+message GenerateResponseOrList {
+  oneof value {
+    option (sglang.json.v1.oneof_json).shape = ONEOF_SHAPE_ONE_OR_MANY;
+    GenerateStreamItem one = 1;
+    GenerateResponseList many = 2;
+  }
+}
+
+message GenerateResponseList {
+  option (sglang.json.v1.message_json).shape = MESSAGE_SHAPE_BARE_LIST;
+  repeated GenerateStreamItem items = 1;
+}
+
 // One request's failure inside a Generate stream; carries its batch position
 // (the HTTP SSE shape puts `index` beside the error object the same way).
 message GenerateStreamError {

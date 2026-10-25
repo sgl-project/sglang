@@ -813,6 +813,11 @@ fn one_arm(ctx: &Ctx, name: &str, one: &VariantModel) -> OneArm {
                     },
             } => OneArm::ListOfScalar(rust_path.clone(), ty.clone()),
             MessageKind::Struct { .. } => OneArm::Class(rust_path.clone()),
+            MessageKind::Untagged { .. }
+                if py_message_shapes(ctx, rust_path).0 == vec![PyShape::Dict] =>
+            {
+                OneArm::Class(rust_path.clone())
+            }
             other => panic!("{name}: unsupported one arm {rust_path} ({other:?})"),
         },
         other => panic!("{name}: unsupported one arm {other:?}"),

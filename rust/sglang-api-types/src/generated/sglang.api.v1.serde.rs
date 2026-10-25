@@ -3007,6 +3007,68 @@ impl<'de> ::serde::Deserialize<'de> for GenerateResponse {
     }
 }
 
+impl ::serde::Serialize for GenerateResponseOrList {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match &self.value {
+            Some(generate_response_or_list::Value::One(v)) => v.serialize(serializer),
+            Some(generate_response_or_list::Value::Many(v)) => v.serialize(serializer),
+            None => serializer.serialize_none(),
+        }
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for GenerateResponseOrList {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = GenerateResponseOrList;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("a value or an array of values for GenerateResponseOrList")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let one = <GenerateStreamItem as ::serde::Deserialize>::deserialize(
+                    ::serde::de::value::MapAccessDeserializer::new(map),
+                )?;
+                Ok(GenerateResponseOrList {
+                    value: Some(generate_response_or_list::Value::One(one)),
+                })
+            }
+            fn visit_seq<A: ::serde::de::SeqAccess<'de>>(
+                self,
+                seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let many = <GenerateResponseList as ::serde::Deserialize>::deserialize(
+                    ::serde::de::value::SeqAccessDeserializer::new(seq),
+                )?;
+                Ok(GenerateResponseOrList {
+                    value: Some(generate_response_or_list::Value::Many(many)),
+                })
+            }
+        }
+        deserializer.deserialize_any(V)
+    }
+}
+
+impl ::serde::Serialize for GenerateResponseList {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.items.iter())
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for GenerateResponseList {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(GenerateResponseList {
+            items:
+                <::prost::alloc::vec::Vec<GenerateStreamItem> as ::serde::Deserialize>::deserialize(
+                    deserializer,
+                )?,
+        })
+    }
+}
+
 impl ::serde::Serialize for GenerateStreamError {
     fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut map = serializer.serialize_map(None)?;

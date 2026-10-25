@@ -60,6 +60,7 @@ fn fixtures_decode_to_their_canonical_bytes() {
             "SamplingParams" => check::<api::SamplingParams>(&name, case),
             "GenerateResponse" => check::<api::GenerateResponse>(&name, case),
             "GenerateStreamItem" => check::<api::GenerateStreamItem>(&name, case),
+            "GenerateResponseOrList" => check::<api::GenerateResponseOrList>(&name, case),
             "GenerateStreamError" => check::<api::GenerateStreamError>(&name, case),
             "GetModelInfoResponse" => check::<api::GetModelInfoResponse>(&name, case),
             "GetServerInfoResponse" => check::<api::GetServerInfoResponse>(&name, case),
