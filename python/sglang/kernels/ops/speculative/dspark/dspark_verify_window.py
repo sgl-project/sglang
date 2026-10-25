@@ -6,7 +6,10 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.speculative.cache_locs import assign_extend_cache_locs_func
-from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_cuda
+from sglang.kernels.ops.speculative.dspark.dispatch import (
+    inputs_on_cuda,
+    inputs_on_npu,
+)
 from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import swa_ring_rows
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
@@ -725,6 +728,10 @@ def build_commit_inject_layout_triton(
 class BuildOutTokens:
     @classmethod
     def execute(cls, *args, **kwargs) -> torch.Tensor:
+        if inputs_on_npu(*args, **kwargs):
+            from sgl_kernel_npu.sample import build_out_tokens
+
+            return build_out_tokens(*args, **kwargs)
         if inputs_on_cuda(*args, **kwargs) and not _is_npu:
             return cls.triton(*args, **kwargs)
         return cls.torch(*args, **kwargs)

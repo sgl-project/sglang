@@ -1,6 +1,7 @@
 """Numerical coverage for DSpark's SGLang-to-NPU dispatch boundary."""
 
 import unittest
+from unittest import mock
 
 import torch
 import torch_npu  # noqa: F401
@@ -17,6 +18,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_accept import (
     SoftmaxTemp,
 )
 from sglang.kernels.ops.speculative.dspark.dspark_draft_model import MarkovGreedyStep
+from sglang.kernels.ops.speculative.dspark.dspark_verify_window import BuildOutTokens
 from sglang.kernels.ops.speculative.dspark.markov_sample import MarkovSampleStep
 from sglang.kernels.ops.speculative.row_argmax import row_argmax
 from sglang.test.ci.ci_register import register_npu_ci
@@ -28,6 +30,46 @@ register_npu_ci(est_time=90, suite="base-b-test-1-npu-a3")
 class TestDSparkNpuDispatch(CustomTestCase):
     def setUp(self):
         torch.manual_seed(42)
+
+    def test_build_out_tokens_matches_full_torch_buffer(self):
+        from sgl_kernel_npu import sample
+
+        for bs, gamma in ((0, 7), (1, 0), (33, 7)):
+            for len_dtype in (torch.int32, torch.int64):
+                for step in (1, 2):
+                    with self.subTest(bs=bs, gamma=gamma, dtype=len_dtype, step=step):
+                        draft = torch.arange(bs * gamma * step).reshape(
+                            bs, gamma * step
+                        )
+                        draft = (draft + 2**40).npu()[:, ::step]
+                        lengths = (
+                            (torch.arange(bs * step) // step % (gamma + 1))
+                            .to(len_dtype)
+                            .npu()[::step]
+                        )
+                        bonus = (torch.arange(bs * step) - 2**40).npu()[::step]
+                        inputs = {
+                            "draft_tokens": draft,
+                            "correct_len": lengths,
+                            "bonus": bonus,
+                            "verify_num_draft_tokens": gamma + 1,
+                            "gamma": gamma,
+                        }
+                        reference = dict(
+                            inputs,
+                            draft_tokens=draft.cpu(),
+                            correct_len=lengths.cpu(),
+                            bonus=bonus.cpu(),
+                        )
+                        expected = BuildOutTokens.torch(**reference)
+                        with mock.patch.object(
+                            sample, "build_out_tokens", wraps=sample.build_out_tokens
+                        ) as kernel:
+                            actual = BuildOutTokens.execute(**inputs)
+                        kernel.assert_called_once_with(**inputs)
+                        self.assertEqual(actual.dtype, torch.int64)
+                        self.assertEqual(actual.device, draft.device)
+                        self.assertTrue(torch.equal(actual.cpu(), expected))
 
     def test_placement_uses_first_tensor(self):
         cpu = torch.zeros(1)
