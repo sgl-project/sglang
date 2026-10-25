@@ -747,6 +747,9 @@ are explicit import settings for the declared target; they do not detect or
 establish available GPU hardware. The check exercises real native result types,
 CPU request-table buffers and the public allocation seam with protocol fixture
 costs; it does not validate measured latency or a full Simulator run.
+The joint Scheduler/FutureMap/reference-driver case additionally requires
+InferCast's native sampling contract and skips when that optional SDK is absent;
+the primitive native result/allocation case remains independent of the SDK.
 
 CPU DSPark argument compatibility is installed only with both explicit bootstrap
 flags above. It preserves `device=cpu` and delegates non-CPU calls to the native
@@ -765,6 +768,10 @@ Native `ServerArgs.from_cli_args()` only constructs the raw record. The simulato
 launcher explicitly calls `resolve_once()` before launch; the native engine's
 later call is idempotent. Resolution declarations preserve the raw argument
 values. Argument smokes must perform resolution before reading the resolved view.
+Scheduler selection composes the cadence observer with the reference adapter:
+the original native selector runs once inside the cadence boundary, then the
+reference adapter observes its returned plan. The native signature, cadence
+counter checks and original selection exceptions are preserved.
 
 For offline DSPark timing, the native adapter records its entire CPU replacement
 worker call as simulation overhead. The scheduler excludes that wall time from

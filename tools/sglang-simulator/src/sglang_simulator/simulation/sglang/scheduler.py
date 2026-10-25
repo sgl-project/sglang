@@ -5,7 +5,7 @@ import os
 import time
 from copy import deepcopy
 from dataclasses import asdict, dataclass
-from functools import partial
+from functools import partial, wraps
 from typing import Any
 
 from sglang_simulator.compat import validate_simulator_server_args
@@ -379,7 +379,6 @@ class C_SchedulerHook(BaseHook):
         original_process_batch_result = target.process_batch_result
         original_event_loop_normal = target.event_loop_normal
         original_event_loop_overlap = getattr(target, "event_loop_overlap", None)
-        original_get_next_batch = getattr(target, "get_next_batch_to_run", None)
         original_overlap_decision = getattr(
             target, "is_disable_overlap_for_batch", None
         )
@@ -391,6 +390,7 @@ class C_SchedulerHook(BaseHook):
         )
 
         install_prefill_cadence_hooks(target, lambda: C_SchedulerHook.COORDINATOR)
+        original_get_next_batch = getattr(target, "get_next_batch_to_run", None)
 
         def reference_driver():
             runtime = getattr(
@@ -410,6 +410,7 @@ class C_SchedulerHook(BaseHook):
             # To reduce the complexity of the simulation, the overlapping schedule is not needed.
             return original_event_loop_normal(self, *args, **kwargs)
 
+        @wraps(original_get_next_batch)
         def wrapped_get_next_batch(self, *args, **kwargs):
             driver = reference_driver()
             prior_requests = ()

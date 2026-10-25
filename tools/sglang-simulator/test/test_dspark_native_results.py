@@ -73,6 +73,7 @@ assert req.decode_batch_idx == 1
 
 
 def test_native_overlap_scheduler_future_map_and_reference_driver_drain_together():
+    pytest.importorskip("infercast.sdk.native_sampling")
     # One native request, including a launched successor whose predecessor
     # finishes it. The installed Scheduler owns the entire event sequence.
     run_python(

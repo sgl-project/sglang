@@ -62,8 +62,23 @@ def hooked_scheduler(monkeypatch):
         def get_new_batch_prefill(self):
             return None
 
-        def get_next_batch_to_run(self, **kwargs):
+        def get_next_batch_to_run(self, running_batch=None, last_batch=None):
+            if hasattr(self, "prefill_decode_interval"):
+                self.selection_calls.append("native selection")
+                if self._should_defer_prefill():
+                    return SimpleNamespace(batch_to_run=None)
             return self.plan
+
+        def _should_defer_prefill(self):
+            self.selection_calls.append("native defer")
+            if self._prefill_decode_interval_remaining == 0:
+                return False
+            self._prefill_decode_interval_remaining -= 1
+            return True
+
+        def _arm_prefill_decode_interval(self, batch):
+            if self.prefill_decode_interval and batch is not None:
+                self._prefill_decode_interval_remaining = self.prefill_decode_interval
 
         def is_disable_overlap_for_batch(self, batch, **kwargs):
             return self.disable_overlap
@@ -157,6 +172,89 @@ def make_batch(rid="request"):
             extend_prefix_lens_cpu=[0],
         ),
     )
+
+
+@pytest.mark.parametrize("interval", [0, 1, 192])
+@pytest.mark.parametrize("reference", [False, True])
+def test_cadence_and_reference_hooks_compose_without_replacing_native_selection(
+    hooked_scheduler, interval, reference
+):
+    from sglang_simulator.simulation.sglang.coordinated import (
+        _validate_prefill_cadence_runtime,
+    )
+
+    test = hooked_scheduler
+    target = test.target
+    target.prefill_decode_interval = interval
+    target._prefill_decode_interval_remaining = min(interval, 1)
+    target.selection_calls = []
+    target.plan = SimpleNamespace(batch_to_run=make_batch())
+    bridge = SimpleNamespace(
+        _in_scheduler_pass=False, _cadence_deferred=False, _cadence_only_pass=False
+    )
+    test.hook.COORDINATOR = bridge
+    selected = []
+
+    def selected_batch(owner, batch, *, prior_requests):
+        assert owner is target
+        assert not bridge._in_scheduler_pass
+        selected.append(batch)
+
+    if reference:
+        test.predictor.dspark_runtime = SimpleNamespace(
+            reference_driver=SimpleNamespace(selected=selected_batch)
+        )
+
+    _validate_prefill_cadence_runtime(target)
+    first = target.get_next_batch_to_run(running_batch=None, last_batch=None)
+    assert target.selection_calls == ["native selection", "native defer"]
+    assert bridge._in_scheduler_pass is False
+    assert bridge._cadence_deferred is bool(interval)
+    assert bridge._cadence_only_pass is bool(interval)
+    assert first.batch_to_run is (None if interval else target.plan.batch_to_run)
+    assert selected == ([first.batch_to_run] if reference else [])
+
+    target.selection_calls.clear()
+    second = target.get_next_batch_to_run(None, None)
+    assert target.selection_calls == ["native selection", "native defer"]
+    assert target._prefill_decode_interval_remaining == 0
+    assert bridge._cadence_deferred is False
+    assert bridge._cadence_only_pass is False
+    assert second is target.plan
+    assert selected == ([first.batch_to_run, second.batch_to_run] if reference else [])
+
+
+def test_composed_selection_error_keeps_native_exception_and_clears_cadence(
+    hooked_scheduler,
+):
+    test = hooked_scheduler
+    error = RuntimeError("native selection failed")
+
+    class FailingTrace(list):
+        def append(self, value):
+            super().append(value)
+            if value == "native defer":
+                raise error
+
+    target = test.target
+    target.prefill_decode_interval = 1
+    target._prefill_decode_interval_remaining = 0
+    target.selection_calls = FailingTrace()
+    bridge = SimpleNamespace(
+        _in_scheduler_pass=False, _cadence_deferred=False, _cadence_only_pass=False
+    )
+    test.hook.COORDINATOR = bridge
+    test.predictor.dspark_runtime = SimpleNamespace(
+        reference_driver=SimpleNamespace(
+            selected=lambda *args, **kwargs: pytest.fail("failed selection published")
+        )
+    )
+    with pytest.raises(RuntimeError) as caught:
+        target.get_next_batch_to_run(None, None)
+    assert caught.value is error
+    assert target.selection_calls == ["native selection", "native defer"]
+    assert bridge._in_scheduler_pass is False
+    assert bridge._cadence_only_pass is False
 
 
 def test_prepared_metadata_is_opt_in(hooked_scheduler):
