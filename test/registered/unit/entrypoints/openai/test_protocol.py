@@ -279,7 +279,7 @@ class TestChatCompletionRequest(unittest.TestCase):
         from pydantic import ValidationError
 
         messages = [{"role": "user", "content": "Hello"}]
-        for effort in ("xhigh", "max"):
+        for effort in ("xhigh", "ultra", "max"):
             with self.subTest(effort=effort, request_form="top-level"):
                 request = ChatCompletionRequest(
                     model="test-model",
@@ -301,7 +301,7 @@ class TestChatCompletionRequest(unittest.TestCase):
             ChatCompletionRequest(
                 model="test-model",
                 messages=messages,
-                reasoning_effort="ultra",
+                reasoning_effort="extreme",
             )
 
     def test_chat_completion_reasoning_effort_is_strictly_validated(self):

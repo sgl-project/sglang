@@ -12,8 +12,12 @@ import pytest
 import torch
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
+from openai import AsyncOpenAI
 from starlette.datastructures import UploadFile
 
+from sglang.multimodal_gen.configs.pipeline_configs.hunyuan3d import (
+    Hunyuan3D2PipelineConfig,
+)
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.entrypoints.openai import (
     image_api,
@@ -21,6 +25,8 @@ from sglang.multimodal_gen.runtime.entrypoints.openai import (
     utils,
     video_api,
 )
+from sglang.multimodal_gen.runtime.entrypoints.openai.stores import AsyncDictStore
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.postprocess import (
     bounded_cache,
     realesrgan_upscaler,
@@ -31,6 +37,78 @@ from sglang.multimodal_gen.runtime.postprocess.bounded_cache import (
     cache_put,
 )
 from sglang.multimodal_gen.runtime.utils.image_io import ensure_path_within_root
+
+
+@pytest.mark.parametrize("api,kind", [(video_api, "video"), (mesh_api, "mesh")])
+def test_job_list_is_bounded_and_has_complete_cursor_metadata(monkeypatch, api, kind):
+    store = AsyncDictStore()
+    monkeypatch.setattr(api, f"{kind.upper()}_STORE", store)
+    jobs = [{"id": str(i), "created_at": i % 4} for i in range(45)]
+
+    async def populate():
+        for job in jobs:
+            await store.upsert(job["id"], job)
+
+    asyncio.run(populate())
+    app = FastAPI()
+    app.include_router(api.router)
+    endpoint = api.router.prefix
+    with TestClient(app) as client:
+        assert len(client.get(endpoint).json()["data"]) == 20
+        for order in ("asc", "desc"):
+            expected = sorted(
+                jobs, key=lambda item: item["created_at"], reverse=order == "desc"
+            )
+            ids = []
+            params = {"order": order, "limit": 7}
+            for start in range(0, len(jobs), 7):
+                page = client.get(endpoint, params=params).json()
+                page_ids = [job["id"] for job in page["data"]]
+                assert page_ids == [job["id"] for job in expected[start : start + 7]]
+                assert page["first_id"] == page_ids[0]
+                assert page["last_id"] == page_ids[-1]
+                assert page["has_more"] is (start + 7 < len(jobs))
+                ids.extend(page_ids)
+                params["after"] = page["last_id"]
+            assert len(ids) == len(set(ids)) == len(jobs)
+        empty = client.get(endpoint, params={"after": "missing"}).json()
+        assert empty == {
+            "object": "list",
+            "data": [],
+            "first_id": None,
+            "last_id": None,
+            "has_more": False,
+        }
+        for params in ({"limit": 0}, {"limit": 101}, {"order": "invalid"}):
+            assert client.get(endpoint, params=params).status_code == 422
+
+
+def test_openai_video_iterator_stops_at_the_last_nonempty_page(monkeypatch):
+    store = AsyncDictStore()
+    monkeypatch.setattr(video_api, "VIDEO_STORE", store)
+    app = FastAPI()
+    app.include_router(video_api.router)
+    requests = []
+
+    async def record_request(request):
+        requests.append(request)
+
+    async def run():
+        for i in range(21):
+            await store.upsert(str(i), {"id": str(i), "created_at": i})
+        async with AsyncOpenAI(
+            api_key="unused",
+            base_url="http://test/v1",
+            http_client=httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app),
+                event_hooks={"request": [record_request]},
+            ),
+        ) as client:
+            ids = [job.id async for job in client.videos.list(limit=7)]
+        assert ids == [str(i) for i in reversed(range(21))]
+        assert len(requests) == 3
+
+    asyncio.run(run())
 
 
 @pytest.mark.parametrize(
@@ -189,6 +267,133 @@ def test_multipart_upload_is_sanitized_before_generation(
         )
     assert response.status_code == 418, response.text
     assert not (tmp_path / "evil.png").exists()
+
+
+@pytest.mark.parametrize("status", ["queued", "in_progress", "failed", "completed"])
+def test_mesh_content_is_not_published_before_success(monkeypatch, tmp_path, status):
+    """A partial mesh may exist while generation is running or after it fails."""
+    path = tmp_path / "mesh.glb"
+    path.write_bytes(b"mesh bytes")
+    store = AsyncDictStore()
+    monkeypatch.setattr(mesh_api, "MESH_STORE", store)
+    app = FastAPI()
+    app.include_router(mesh_api.router)
+
+    async def run_test():
+        await store.upsert("mesh", {"status": status, "file_path": str(path)})
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            response = await client.get("/v1/meshes/mesh/content")
+        assert response.status_code == (200 if status == "completed" else 404)
+        if status == "completed":
+            assert response.content == path.read_bytes()
+
+    asyncio.run(run_test())
+
+
+@pytest.mark.parametrize("output_exists", [False, True])
+def test_mesh_completion_requires_a_downloadable_file(
+    monkeypatch, tmp_path, output_exists
+):
+    """A worker-returned path is not proof that a local output can be published."""
+    path = tmp_path / "mesh.glb"
+    if output_exists:
+        path.write_bytes(b"mesh bytes")
+    store = AsyncDictStore()
+    monkeypatch.setattr(mesh_api, "MESH_STORE", store)
+    monkeypatch.setattr(mesh_api.cloud_storage, "enabled", False)
+
+    async def generate(*args, **kwargs):
+        return [str(path)], OutputBatch()
+
+    monkeypatch.setattr(mesh_api, "process_generation_batch", generate)
+
+    async def run_test():
+        await store.upsert("mesh", {"status": "queued", "file_path": str(path)})
+        await mesh_api._dispatch_job_async("mesh", None)
+        job = await store.get("mesh")
+        assert job["status"] == ("completed" if output_exists else "failed")
+        if output_exists:
+            assert job["file_size_bytes"] == path.stat().st_size
+        else:
+            assert job["error"] and job["file_path"] is None
+
+    asyncio.run(run_test())
+
+
+def test_rejected_mesh_preparation_does_not_create_a_queued_job(monkeypatch, tmp_path):
+    """Failure before scheduler submission must not leave a permanently queued job."""
+    store = AsyncDictStore()
+    monkeypatch.setattr(mesh_api, "MESH_STORE", store)
+    monkeypatch.setattr(mesh_api, "get_global_server_args", lambda: SimpleNamespace())
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        mesh_api,
+        "_build_sampling_params_from_request",
+        lambda *args: SamplingParams(
+            prompt="mesh", output_path=str(tmp_path), output_file_name="mesh.glb"
+        ),
+    )
+    rejected = asyncio.Event()
+
+    def reject(**kwargs):
+        rejected.set()
+        raise ValueError("request preparation failed")
+
+    monkeypatch.setattr(mesh_api, "prepare_request", reject)
+    app = FastAPI()
+    app.include_router(mesh_api.router)
+
+    async def run_test():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app, raise_app_exceptions=False),
+            base_url="http://test",
+        ) as client:
+            response = await client.post(
+                "/v1/meshes", json={"input_image": "data:image/png;base64,aW1hZ2U="}
+            )
+        assert response.status_code == 500
+        assert rejected.is_set()
+        assert (await store.list_page())["data"] == []
+
+    asyncio.run(run_test())
+
+
+@pytest.mark.parametrize("seed,device", [(None, None), (0, "cpu"), ([0, 7], "cuda")])
+def test_mesh_optional_sampling_fields_preserve_defaults(
+    monkeypatch, tmp_path, seed, device
+):
+    args = SimpleNamespace(
+        model_path="mesh",
+        backend="native",
+        model_id=None,
+        pipeline_config=Hunyuan3D2PipelineConfig(),
+        output_path=str(tmp_path),
+        comfyui_mode=False,
+    )
+    monkeypatch.setattr(mesh_api, "get_global_server_args", lambda: args)
+    monkeypatch.setattr(
+        SamplingParams, "from_pretrained", lambda *a, **kw: SamplingParams()
+    )
+    request = mesh_api.MeshGenerationsRequest(
+        seed=seed,
+        generator_device=device,
+        num_inference_steps=4,
+        guidance_scale=5.0,
+        negative_prompt="test",
+    )
+    sampling = mesh_api._build_sampling_params_from_request(
+        "mesh", request, "input.png"
+    )
+    defaults = SamplingParams()
+    assert sampling.seed == (defaults.seed if seed is None else seed)
+    assert sampling.generator_device == (
+        defaults.generator_device if device is None else device
+    )
+    assert sampling.num_inference_steps == 4
+    assert sampling.guidance_scale == 5.0
+    assert sampling.negative_prompt == "test"
 
 
 def test_invalid_output_quality_is_a_400_not_a_500(monkeypatch):

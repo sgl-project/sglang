@@ -21,6 +21,7 @@ register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 class TestDecodeHiCacheTreeCore(CustomTestCase):
     def test_stale_prefetch_anchor_degrades_to_l2(self):
         tree_cache = SimpleNamespace(
+            tree_core=SimpleNamespace(is_eagle=False),
             hicache_storage_pass_prefix_keys=True,
             ongoing_prefetch={},
             get_last_hash_value=Mock(side_effect=KeyError(22)),
@@ -65,6 +66,7 @@ class TestDecodeHiCacheTreeCore(CustomTestCase):
             return 2, "restored"
 
         tree_cache = SimpleNamespace(
+            tree_core=SimpleNamespace(is_eagle=False),
             match_prefix=Mock(return_value=rematch),
             init_load_back=Mock(side_effect=init_load_back),
             path_device_indices=Mock(return_value=restored_path),

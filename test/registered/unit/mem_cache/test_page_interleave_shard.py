@@ -37,16 +37,20 @@ Pins the pure arithmetic that rotated owner-classed allocation hangs on:
 8. Real sharded MLA pools: N ranks of stock-size pools hold N times one pool's
    tokens, each token stored on exactly one rank.
 
-The real NCCL MLA/MHA/MTP gathers over 2 GPUs live in
+The real NCCL MLA/MHA/MTP gathers, zero-SM gather correctness and release,
+and symmetric buffer lifetime tests live in
 ``test_page_interleave_gather_multi_gpu.py``. DSA indexer and attention
 coverage lives in ``test_page_sharded_dsa_attention.py``.
 """
 
+import ctypes
+import gc
+import math
 import shutil
 import unittest
 import unittest.mock
 from array import array
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from types import SimpleNamespace
 
 import numpy as np
@@ -55,6 +59,10 @@ from parameterized import parameterized_class
 
 from sglang.srt.disaggregation.common.conn import CommonKVSender
 from sglang.srt.disaggregation.utils import filter_kv_indices_for_shard_rank
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    _release_nccl_window_buffer,
+    allocate_symmetric_buffer,
+)
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache import page_interleave
@@ -85,9 +93,12 @@ from sglang.srt.mem_cache.page_interleave import (
     make_page_shard_spec,
 )
 from sglang.srt.mem_cache.page_interleave_pool import (
+    _NCCL_SYMMETRIC_SCRATCH_MIN_VERSION,
     PageInterleaveKVPoolMixin,
     PageInterleaveMHATokenToKVPool,
     PageInterleaveMLATokenToKVPool,
+    _symmetric_scratch_layout,
+    _symmetric_scratch_supported,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
@@ -216,12 +227,147 @@ class TestPageShardScratchSizing(CustomTestCase):
                     if use_mla
                     else PageInterleaveMHATokenToKVPool
                 )
-                tensors = pool_cls._scratch_tensor_specs(pool, spec.scratch_rows)
+                specs = pool_cls._scratch_tensor_specs(pool, spec.scratch_rows)
                 actual = 2 * sum(
-                    tensor.numel() * tensor.element_size()
-                    for tensor in tensors.values()
+                    math.prod(shape) * dtype.itemsize for shape, dtype in specs.values()
                 )
                 self.assertEqual(estimated, actual)
+                # The zero-SM buffer adds at most one window alignment per tensor.
+                _, symmetric_bytes = _symmetric_scratch_layout(specs, num_slots=2)
+                self.assertGreaterEqual(symmetric_bytes, estimated)
+                self.assertLess(symmetric_bytes, estimated + 2 * len(specs) * 4096)
+
+
+class TestZeroSmScratchLayout(CustomTestCase):
+    def test_requires_nccl_with_copy_engine_race_fix(self):
+        self.assertEqual(_NCCL_SYMMETRIC_SCRATCH_MIN_VERSION, 23102)
+        for version in (22902, 23007, 23101, 23102):
+            with (
+                self.subTest(version=version),
+                envs.SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER.override(True),
+                unittest.mock.patch(
+                    "sglang.srt.mem_cache.page_interleave_pool.is_cuda",
+                    return_value=True,
+                ),
+                unittest.mock.patch(
+                    "sglang.srt.mem_cache.page_interleave_pool.NCCLLibrary"
+                ) as library,
+                unittest.mock.patch(
+                    "sglang.srt.mem_cache.page_interleave_pool.in_the_same_node_as",
+                    return_value=[True, True],
+                ) as same_node,
+            ):
+                library.return_value.ncclGetRawVersion.return_value = version
+                self.assertEqual(
+                    _symmetric_scratch_supported(
+                        memory_saver_enabled=False,
+                        custom_mem_pool=None,
+                        shard_group=SimpleNamespace(cpu_group=object()),
+                    ),
+                    version >= _NCCL_SYMMETRIC_SCRATCH_MIN_VERSION,
+                )
+                if version < _NCCL_SYMMETRIC_SCRATCH_MIN_VERSION:
+                    same_node.assert_not_called()
+
+    def test_slot_tensors_are_window_aligned_and_disjoint(self):
+        """Both slots share one symmetric window: every tensor must start on
+        NCCL's 4 KiB window alignment and no two tensors may overlap."""
+        rows = 13 * 16  # neither row width below fills a whole 4 KiB block
+        specs = {
+            "kv": ((rows, 1, 576), torch.bfloat16),
+            "index_k": ((rows // 16, 16 * 132), torch.uint8),
+        }
+        offsets, nbytes = _symmetric_scratch_layout(specs, num_slots=2)
+        spans = sorted(
+            (slot[name], slot[name] + math.prod(shape) * dtype.itemsize)
+            for slot in offsets
+            for name, (shape, dtype) in specs.items()
+        )
+        self.assertEqual(len(spans), 4)
+        self.assertTrue(all(start % 4096 == 0 for start, _ in spans))
+        for (_, end), (next_start, _) in zip(spans, spans[1:]):
+            self.assertLessEqual(end, next_start)
+        self.assertLessEqual(spans[-1][1], nbytes)
+
+
+class TestSymmetricBufferFailureCleanup(CustomTestCase):
+    @contextmanager
+    def _fixture(self):
+        comm = SimpleNamespace(
+            device=torch.device("cuda:0"),
+            nccl=SimpleNamespace(
+                ncclMemAlloc=unittest.mock.Mock(return_value=1234),
+                ncclMemFree=unittest.mock.Mock(),
+            ),
+            register_comm_window_raw=unittest.mock.Mock(
+                return_value=ctypes.c_void_p(5678)
+            ),
+            deregister_comm_window=unittest.mock.Mock(),
+        )
+        with (
+            unittest.mock.patch("torch.cuda.device", return_value=nullcontext()),
+            unittest.mock.patch("torch.cuda.synchronize"),
+            unittest.mock.patch("torch.as_tensor") as as_tensor,
+        ):
+            yield comm, as_tensor
+
+    def test_registration_failure_frees_allocation(self):
+        with self._fixture() as (comm, as_tensor):
+            comm.register_comm_window_raw.side_effect = RuntimeError("register failed")
+            with self.assertRaisesRegex(RuntimeError, "register failed"):
+                allocate_symmetric_buffer(comm, 8192)
+            gc.collect()
+            as_tensor.assert_not_called()
+            comm.deregister_comm_window.assert_not_called()
+            comm.nccl.ncclMemFree.assert_called_once_with(1234)
+
+    def test_tensor_setup_failures_release_once(self):
+        for operation in ("wrap", "zero"):
+            with (
+                self.subTest(operation=operation),
+                self._fixture() as (comm, as_tensor),
+            ):
+                if operation == "wrap":
+                    as_tensor.side_effect = RuntimeError("wrap failed")
+                else:
+                    as_tensor.return_value.zero_.side_effect = RuntimeError(
+                        "zero failed"
+                    )
+                with self.assertRaisesRegex(RuntimeError, f"{operation} failed"):
+                    allocate_symmetric_buffer(comm, 8192)
+                # Drop Mock's saved owner reference as well: a registered
+                # finalizer must not run a second time after eager cleanup.
+                as_tensor.reset_mock()
+                gc.collect()
+                comm.deregister_comm_window.assert_called_once()
+                self.assertEqual(
+                    comm.deregister_comm_window.call_args.args[0].value, 5678
+                )
+                comm.nccl.ncclMemFree.assert_called_once_with(1234)
+
+    def test_cleanup_failure_preserves_setup_error_without_double_free(self):
+        with self._fixture() as (comm, as_tensor):
+            as_tensor.side_effect = RuntimeError("wrap failed")
+            comm.deregister_comm_window.side_effect = RuntimeError("deregister failed")
+            with (
+                self.assertLogs(
+                    "sglang.srt.distributed.device_communicators.pynccl_allocator",
+                    level="ERROR",
+                ),
+                self.assertRaisesRegex(RuntimeError, "wrap failed"),
+            ):
+                allocate_symmetric_buffer(comm, 8192)
+            as_tensor.reset_mock()
+            gc.collect()
+            comm.deregister_comm_window.assert_called_once()
+            comm.nccl.ncclMemFree.assert_called_once_with(1234)
+
+    def test_deregister_failure_still_frees_allocation(self):
+        with self._fixture() as (comm, _):
+            comm.deregister_comm_window.side_effect = RuntimeError("deregister failed")
+            with self.assertRaisesRegex(RuntimeError, "deregister failed"):
+                _release_nccl_window_buffer(comm, 1234, ctypes.c_void_p(5678))
+            comm.nccl.ncclMemFree.assert_called_once_with(1234)
 
 
 def _make_mtp_configurator(use_mla=True):

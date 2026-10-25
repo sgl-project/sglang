@@ -59,6 +59,11 @@ class HiCacheRestoreResult(Enum):
     FAILED = "failed"
 
 
+def _bigram_boundary_tokens(tree_cache) -> int:
+    # An EAGLE tree keys N bigrams with N + 1 token ids; prefix lengths count bigrams.
+    return int(tree_cache.tree_core.is_eagle)
+
+
 class DecodeHiCachePreallocMixin:
     """HiCache hooks for ``DecodePreallocQueue``: issue prefetch + reserve tokens."""
 
@@ -218,13 +223,16 @@ class DecodeHiCacheTransferMixin:
 
         # The transfer suffix is already allocated: rematch only promised tokens,
         # without overwriting the request's preallocation state or lock receipt.
+        rematch_token_len = pm.decode_prefix_len + _bigram_boundary_tokens(
+            self.tree_cache
+        )
         rematch = self.tree_cache.match_prefix(
             MatchPrefixParams(
                 key=_req_radix_key(
                     self.tree_cache,
                     dr.req,
                     dr.req.origin_input_ids,
-                    pm.decode_prefix_len,
+                    rematch_token_len,
                 ),
                 cow_mamba=False,
                 req=dr.req,

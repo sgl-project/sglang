@@ -22,6 +22,7 @@ TODO: move dsv4 MHC into the same abstraction
 
 from __future__ import annotations
 
+from functools import partial
 from typing import Any, Callable, NamedTuple, Optional, Tuple, TypeAlias, Union
 
 import msgspec
@@ -67,12 +68,9 @@ def fused_mxfp8_rows(rows: int) -> bool:
     return rows <= FUSED_MXFP8_PRODUCER_MAX_ROWS
 
 
-def empty_deepgemm_mxfp8_pair(
-    rows: int, cols: int, device
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Empty fp8 rows and DeepGEMM-packed UE8M0 scales for a producer to fill."""
-    data = torch.empty((rows, cols), device=device, dtype=torch.float8_e4m3fn)
-    scales = create_per_token_group_quant_fp8_output_scale(
+def empty_deepgemm_mxfp8_scales(rows: int, cols: int, device) -> torch.Tensor:
+    """Empty DeepGEMM-packed UE8M0 scales for ``rows`` x ``cols`` fp8 data."""
+    return create_per_token_group_quant_fp8_output_scale(
         (rows, cols),
         device,
         32,
@@ -80,7 +78,14 @@ def empty_deepgemm_mxfp8_pair(
         scale_tma_aligned=True,
         scale_ue8m0=True,
     )
-    return data, scales
+
+
+def empty_deepgemm_mxfp8_pair(
+    rows: int, cols: int, device
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Empty fp8 rows and DeepGEMM-packed UE8M0 scales for a producer to fill."""
+    data = torch.empty((rows, cols), device=device, dtype=torch.float8_e4m3fn)
+    return data, empty_deepgemm_mxfp8_scales(rows, cols, device)
 
 
 def fused_mhc_tp_ok(tp_size: int) -> bool:
@@ -239,6 +244,7 @@ class HcNextBoundary(NamedTuple):
     norm_fusable: bool
     hc: Optional[HcSubLayer] = None
     accepts_mxfp8_deepgemm: bool = False
+    mega_moe_input: Optional[Callable[[torch.Tensor], Any]] = None
 
 
 def is_deferred_finalize(routed) -> bool:
@@ -250,12 +256,26 @@ def is_deferred_finalize(routed) -> bool:
     return isinstance(routed, FlashInferTrtllmDeferredFinalizeOutput)
 
 
+def mega_moe_input_of(
+    layer, forward_batch: Optional[ForwardBatch]
+) -> Optional[Callable[[torch.Tensor], Any]]:
+    if not envs.SGLANG_OPT_DEEPGEMM_MEGA_GATE.get():
+        return None
+    mlp = getattr(layer, "mlp", None)
+    if not hasattr(mlp, "mega_shared_l1_weights"):
+        return None
+    from sglang.srt.layers.moe.mega_moe import mega_moe_input_target
+
+    return partial(mega_moe_input_target, mlp, forward_batch=forward_batch)
+
+
 def make_boundary(
     norm: RMSNorm,
     *,
     accepts_mxfp8: bool,
     hc: Optional[HcSubLayer] = None,
     accepts_mxfp8_deepgemm: bool = False,
+    mega_moe_input: Optional[Callable[[torch.Tensor], Any]] = None,
 ) -> HcNextBoundary:
     """Can this hyper-connection's norm fold into the previous post, and does its
     sublayer take a pre-quantized input."""
@@ -272,6 +292,7 @@ def make_boundary(
         ),
         hc=hc,
         accepts_mxfp8_deepgemm=accepts_mxfp8_deepgemm,
+        mega_moe_input=mega_moe_input,
     )
 
 
@@ -658,9 +679,11 @@ def _post_fusion(
         and y.shape[0] > 0
     ):
         next_hc = next.hc
-        y_fp8 = y_sf = None
+        y_fp8 = y_sf = moe_input = None
         if next.accepts_mxfp8_deepgemm and fused_mxfp8_rows(y.shape[0]):
             y_fp8, y_sf = empty_deepgemm_mxfp8_pair(*y.shape, y.device)
+        elif next.mega_moe_input is not None:
+            moe_input = next.mega_moe_input(y)
         updated, normalized, stats = mhc_mega_boundary(
             y,
             residual,
@@ -677,9 +700,12 @@ def _post_fusion(
             next_hc.cfg.sinkhorn_iters,
             y_fp8=y_fp8,
             y_gemm_sf=y_sf,
+            moe_input=None if moe_input is None else moe_input.views(),
         )
         if y_fp8 is not None:
             return HcState(updated, pre, HcQuantized(normalized, (y_fp8, y_sf)), stats)
+        if moe_input is not None:
+            moe_input.mark(normalized)
         return HcState(updated, pre, HcNormed(normalized), stats)
     if (
         next is not None

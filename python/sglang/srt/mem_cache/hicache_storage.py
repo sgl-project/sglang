@@ -40,6 +40,37 @@ class HiCacheStorageConfig:
     # with dp-attention, tp_rank is attention-group-local; dp_rank disambiguates
     dp_rank: int = 0
     extra_config: Optional[dict] = None
+    dcp_size: int = 1
+    dcp_rank: int = 0
+    logical_page_size: Optional[int] = None
+
+    def __post_init__(self):
+        if self.dcp_size < 1 or not 0 <= self.dcp_rank < self.dcp_size:
+            raise ValueError("Invalid DCP size or rank for HiCache storage.")
+        if self.dcp_size == 1:
+            return
+        if not self.is_mla_model:
+            raise ValueError("DCP storage shard identity currently requires MLA.")
+        if (
+            self.tp_size % self.dcp_size != 0
+            or not 0 <= self.tp_rank < self.tp_size
+            or self.tp_rank % self.dcp_size != self.dcp_rank
+        ):
+            raise ValueError("DCP storage requires contiguous DCP groups within TP.")
+        if (
+            self.logical_page_size is None
+            or self.logical_page_size <= 0
+            or self.logical_page_size % self.dcp_size != 0
+        ):
+            raise ValueError("DCP storage requires a DCP-aligned logical page size.")
+
+    @property
+    def is_storage_writer(self) -> bool:
+        """MLA replicas share one writer per DCP shard, in the first DCP group.
+
+        With DCP disabled, MLA uses rank 0 and non-MLA uses every TP rank.
+        """
+        return not self.is_mla_model or self.tp_rank == self.dcp_rank
 
 
 @dataclass
@@ -428,6 +459,17 @@ class HiCacheFile(HiCacheStorage):
             f"_{model_name}{shard_suffix}" if is_mla_model else self.tp_config_suffix
         )
 
+        # TODO: Include KV dtype and stored layout in keys for both DCP and
+        # non-DCP caches; raw file payloads do not describe their format.
+        if storage_config.dcp_size > 1:
+            # Equivalent MLA shards in different DCP groups share a file.
+            dcp_suffix = (
+                f"_tp{tp_size}_dcp{storage_config.dcp_rank}_{storage_config.dcp_size}"
+                f"_page{storage_config.logical_page_size}"
+            )
+            self.config_suffix += dcp_suffix
+            self.tp_config_suffix += dcp_suffix
+
         if not os.path.exists(self.file_path) and tp_rank == 0 and attn_cp_rank == 0:
             os.makedirs(self.file_path)
             logger.info(f"Created HiCacheFile storage directory at {self.file_path}")
@@ -462,10 +504,10 @@ class HiCacheFile(HiCacheStorage):
         # module, so a top-level import here would be circular.
         from sglang.srt.mem_cache.storage.file.lru_file_evictor import LRUFileEvictor
 
-        # Each rank creates and evicts its TP-sharded files; rank 0 also owns
-        # the shared MLA files.
+        # Each rank owns its TP-sharded state; selected DCP writers also own
+        # their shared MLA shard files.
         owned_suffixes = (self.tp_config_suffix,)
-        if is_mla_model and tp_rank == 0:
+        if is_mla_model and storage_config.is_storage_writer:
             owned_suffixes += (self.config_suffix,)
         self._evictor = LRUFileEvictor(
             self.file_path,
@@ -486,7 +528,7 @@ class HiCacheFile(HiCacheStorage):
     def _get_component_key(self, key: str, component_name: Optional[str] = None) -> str:
         if component_name is None or component_name in ("__default__", PoolName.KV):
             return self._get_suffixed_key(key)
-        return self._get_suffixed_key(f"{key}.{component_name}")
+        return self._get_suffixed_key(self._log_key(component_name, key))
 
     def _scan_existing_files_to_metadata_cache(self) -> None:
         try:
@@ -660,31 +702,35 @@ class HiCacheFile(HiCacheStorage):
         )
 
         hit_count: dict[str, int] = {PoolName.KV: kv_pages} if kv_pages else {}
-        final_pages = kv_pages
+        restorable = list(range(1, kv_pages + 1))
 
         for transfer in pool_transfers or []:
-            if final_pages == 0:
+            if not restorable:
                 break
             name = transfer.name
             if transfer.hit_policy == PoolHitPolicy.ALL_PAGES:
                 boundary = next(
                     (i for i in range(kv_pages) if not has_component(i, name)), kv_pages
                 )
-            else:  # trailing_pages
+                pool_restorable = set(range(1, boundary + 1))
+            elif transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
                 trailing = max(1, len(transfer.keys) if transfer.keys else 1)
-                boundary = 0
-                for prefix_len in range(kv_pages, 0, -1):
+                pool_restorable = set()
+                for prefix_len in range(1, kv_pages + 1):
                     if all(
                         has_component(i, name)
                         for i in range(max(0, prefix_len - trailing), prefix_len)
                     ):
-                        boundary = prefix_len
-                        break
+                        pool_restorable.add(prefix_len)
+                boundary = max(pool_restorable, default=0)
+            else:
+                raise ValueError(f"Unsupported pool hit policy: {transfer.hit_policy}")
             if boundary:
                 hit_count[name] = boundary
-            final_pages = min(final_pages, boundary)
+            restorable = [p for p in restorable if p in pool_restorable]
 
-        return PoolTransferResult(final_pages, hit_count)
+        final_pages = restorable[-1] if restorable else 0
+        return PoolTransferResult(final_pages, hit_count, restorable)
 
     def _log_key(self, pool_name: str, key: str) -> str:
         return key if pool_name == PoolName.KV else f"{key}.{pool_name}"
