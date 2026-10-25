@@ -44,6 +44,18 @@ def handle_nvfp4_prefill_kv_dequant_dtype(server_args: Any) -> None:
             )
         return
 
+    if attention_backends_of(cfg) == ("dsa", "dsa"):
+        # DSA owns a separate packed 416-byte MLA recipe. Its sparse prefill
+        # consumes BF16 KV (dequantized when reading a cached prefix), and its
+        # native FlashMLA decode reads the packed rows directly. The MHA
+        # FP8-workspace/native-prefill selector below does not apply to it.
+        if requested_dtype != "auto":
+            raise ValueError(
+                "DSA NVFP4 uses its own prefill dequantization path; leave "
+                "--prefill-kv-cache-dequant-dtype=auto."
+            )
+        return
+
     if requested_dtype == "auto":
         explicit_backend = cfg.prefill_attention_backend or cfg.attention_backend
         if explicit_backend in _NVFP4_PREFILL_DEQUANT_DTYPE:
@@ -296,6 +308,7 @@ def handle_kv4_compatibility(server_args: Any) -> None:
             else:
                 if uses_mla:  # !FA4 + MLA
                     KV4_ATTENTION_MLA_BACKEND_CHOICES = [
+                        "dsa",
                         "flashinfer",
                         "trtllm_mla",
                     ]

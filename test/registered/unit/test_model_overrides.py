@@ -233,6 +233,47 @@ class TestModelOverridableWhitelist(CustomTestCase):
         )
 
 
+class TestUnifiedDSALayerSplitValidation(CustomTestCase):
+    def test_rejects_topologies_with_different_queries_on_owner_ranks(self):
+        """Owner broadcasts require the same complete query batch on every rank."""
+        from sglang.srt.arg_groups.model_hook import (
+            _validate_unified_dsa_cache_layer_split,
+        )
+        from sglang.srt.server_args import ServerArgs
+
+        defaults = dict(
+            model_path="dummy",
+            kv_cache_dtype="nvfp4",
+            tp_size=8,
+            attn_cp_size=8,
+            dp_size=1,
+            attn_dp_size=1,
+            dcp_size=1,
+            pp_size=1,
+            dsa_prefill_backend="flashmla_sparse",
+            dsa_decode_backend="flashmla_kv",
+        )
+        _validate_unified_dsa_cache_layer_split(
+            ServerArgs(**defaults), "GlmMoeDsaForCausalLM"
+        )
+        invalid = (
+            ({"attn_cp_size": 4}, "TP=CP"),
+            ({"dp_size": 2, "attn_dp_size": 2}, "attention DP"),
+            ({"dcp_size": 2}, "DCP=1"),
+            ({"pp_size": 2}, "PP=1"),
+            ({"enable_cp_decode_attn_tp": True}, "decode attention TP"),
+            ({"enable_two_batch_overlap": True}, "two-batch overlap"),
+            ({"kv_cache_dtype": "fp8_e4m3"}, "nvfp4"),
+            ({"dsa_decode_backend": "trtllm"}, "flashmla_kv"),
+        )
+        for changed, error in invalid:
+            with self.subTest(changed=changed):
+                with self.assertRaisesRegex(ValueError, error):
+                    _validate_unified_dsa_cache_layer_split(
+                        ServerArgs(**(defaults | changed)), "GlmMoeDsaForCausalLM"
+                    )
+
+
 class TestBoundaryReductionDefaults(CustomTestCase):
     def test_defaults_wrappers_and_explicit_policies_reach_runtime(self):
         from unittest.mock import patch
@@ -2478,6 +2519,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 dsa_prefill_backend=None,
                 dsa_decode_backend=None,
                 enable_hisparse=False,
+                page_size=64,
             )
             defaults.update(kw)
             return ResolvedView(
@@ -2546,6 +2588,60 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             self.assertEqual(
                 _dsa_split_backend_resolution(_view(arch="LlamaForCausalLM")), {}
             )
+        with (
+            patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True),
+            override_platform(is_npu=False),
+            override_platform(is_xpu=False),
+            override_platform(is_hip=False),
+            patch("torch.cuda.get_device_capability", return_value=(10, 0)),
+        ):
+            self.assertEqual(
+                _dsa_split_backend_resolution(
+                    _view(
+                        arch="GlmMoeDsaForCausalLM",
+                        kv_cache_dtype="nvfp4",
+                    )
+                ),
+                {
+                    "dsa_prefill_backend": "flashmla_sparse",
+                    "dsa_decode_backend": "flashmla_kv",
+                },
+            )
+            self.assertEqual(
+                _dsa_split_backend_resolution(
+                    _view(
+                        arch="GlmMoeDsaForCausalLM",
+                        kv_cache_dtype="nvfp4",
+                        dsa_prefill_backend="flashmla_sparse",
+                        dsa_decode_backend="flashmla_kv",
+                    )
+                ),
+                {},
+            )
+            with self.assertRaisesRegex(ValueError, "page-size=64"):
+                _dsa_split_backend_resolution(
+                    _view(
+                        arch="GlmMoeDsaForCausalLM",
+                        kv_cache_dtype="nvfp4",
+                        page_size=32,
+                    )
+                )
+            with self.assertRaisesRegex(ValueError, "prefill-backend=flashmla_sparse"):
+                _dsa_split_backend_resolution(
+                    _view(
+                        arch="GlmMoeDsaForCausalLM",
+                        kv_cache_dtype="nvfp4",
+                        dsa_prefill_backend="fa3",
+                    )
+                )
+            with self.assertRaisesRegex(ValueError, "decode-backend=flashmla_kv"):
+                _dsa_split_backend_resolution(
+                    _view(
+                        arch="GlmMoeDsaForCausalLM",
+                        kv_cache_dtype="nvfp4",
+                        dsa_decode_backend="trtllm",
+                    )
+                )
         with (
             patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True),
             override_platform(is_npu=False),
@@ -2752,12 +2848,18 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             _dsa_kv_cache_dtype_default,
         )
 
-        def _view(**kw):
-            hf = SimpleNamespace(architectures=["DeepseekV32ForCausalLM"])
+        def _view(arch="DeepseekV32ForCausalLM", **kw):
+            hf = SimpleNamespace(architectures=[arch])
             defaults = dict(
                 kv_cache_dtype="auto",
                 dsa_prefill_backend=None,
                 dsa_decode_backend=None,
+                enable_prefill_cp=False,
+                cp_strategy=None,
+                dcp_size=1,
+                enable_dsa_cache_layer_split=False,
+                enable_cp_decode_attn_tp=False,
+                enable_hisparse=False,
             )
             defaults.update(kw)
             return ResolvedView(
@@ -2792,6 +2894,95 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 self.assertEqual(
                     _dsa_kv_cache_dtype_default(_view()),
                     {"kv_cache_dtype": "fp8_e4m3"},
+                )
+                with override_platform(is_hip=False):
+                    self.assertEqual(
+                        _dsa_kv_cache_dtype_default(
+                            _view(
+                                arch="GlmMoeDsaForCausalLM",
+                                kv_cache_dtype="nvfp4",
+                            )
+                        ),
+                        {},
+                    )
+                    with self.assertRaisesRegex(ValueError, "specialized for GLM-5.2"):
+                        _dsa_kv_cache_dtype_default(_view(kv_cache_dtype="nvfp4"))
+                    self.assertEqual(
+                        _dsa_kv_cache_dtype_default(
+                            _view(
+                                arch="GlmMoeDsaForCausalLM",
+                                kv_cache_dtype="nvfp4",
+                                enable_prefill_cp=True,
+                                cp_strategy="interleave",
+                            )
+                        ),
+                        {},
+                    )
+                    with self.assertRaisesRegex(
+                        ValueError, "does not yet support decode context parallelism"
+                    ):
+                        _dsa_kv_cache_dtype_default(
+                            _view(
+                                arch="GlmMoeDsaForCausalLM",
+                                kv_cache_dtype="nvfp4",
+                                dcp_size=2,
+                            )
+                        )
+                    with self.assertRaisesRegex(
+                        ValueError, "only with --cp-strategy=interleave"
+                    ):
+                        _dsa_kv_cache_dtype_default(
+                            _view(
+                                arch="GlmMoeDsaForCausalLM",
+                                kv_cache_dtype="nvfp4",
+                                enable_prefill_cp=True,
+                                cp_strategy="zigzag",
+                            )
+                        )
+                    self.assertEqual(
+                        _dsa_kv_cache_dtype_default(
+                            _view(
+                                arch="GlmMoeDsaForCausalLM",
+                                kv_cache_dtype="nvfp4",
+                                enable_prefill_cp=True,
+                                cp_strategy="interleave",
+                                enable_dsa_cache_layer_split=True,
+                            )
+                        ),
+                        {},
+                    )
+                    with self.assertRaisesRegex(
+                        ValueError, "requires H64 attention-DP decode"
+                    ):
+                        _dsa_kv_cache_dtype_default(
+                            _view(
+                                arch="GlmMoeDsaForCausalLM",
+                                kv_cache_dtype="nvfp4",
+                                enable_prefill_cp=True,
+                                cp_strategy="interleave",
+                                enable_cp_decode_attn_tp=True,
+                            )
+                        )
+                    with self.assertRaisesRegex(
+                        ValueError, "does not yet support HiSparse"
+                    ):
+                        _dsa_kv_cache_dtype_default(
+                            _view(
+                                arch="GlmMoeDsaForCausalLM",
+                                kv_cache_dtype="nvfp4",
+                                enable_hisparse=True,
+                            )
+                        )
+            with (
+                patch("torch.cuda.get_device_capability", return_value=(9, 0)),
+                override_platform(is_hip=False),
+                self.assertRaisesRegex(ValueError, "requires an SM100 GPU"),
+            ):
+                _dsa_kv_cache_dtype_default(
+                    _view(
+                        arch="GlmMoeDsaForCausalLM",
+                        kv_cache_dtype="nvfp4",
+                    )
                 )
 
     def test_deepseek_v4_kv_cache_dtype_pass(self):

@@ -85,11 +85,17 @@ Prefill CP can coexist with supported speculative-decoding configurations. The C
 
 The shared CP breakable-prefill-graph path currently requires `zigzag`, the `trtllm_mha` prefill backend, PP=1, and attention CP size equal to TP size. It uses CP-local static input buffers and selects capture buckets large enough for each rank's padded input. Support for combining other attention backends with prefill CP and Breakable CUDA Graph is under development.
 
-### Prefill CP × PD disaggregation and DSA cache LayerSplit
+### Prefill CP × DSA cache LayerSplit
 
 In supported DSA deployments, `--enable-dsa-cache-layer-split` distributes GPU KV/indexer cache layers across CP ranks to reduce per-rank cache memory. Each rank owns a range of layers and uses scratch storage for remote-layer data. This is layer-wise cache ownership, separate from the interleave token assignment used for computation, and is not applied to draft workers.
 
-LayerSplit requires a PD prefill worker (`--disaggregation-mode prefill`), `--enable-prefill-cp --cp-strategy interleave`, and PP=1. It currently supports the `mooncake` and `mooncake_tcp` transfer backends. Do not enable LayerSplit on decode or non-PD workers; the decode side receives full cache shards through PD transfer. Use the [PD disaggregation guide](https://docs.sglang.io/docs/advanced_features/pd_disaggregation) and model-specific launch recipes to configure both sides of the transfer; enabling prefill CP alone does not configure a PD deployment.
+In PD mode, LayerSplit requires a prefill worker (`--disaggregation-mode prefill`), `--enable-prefill-cp --cp-strategy interleave`, and PP=1. It supports the `mooncake` and `mooncake_tcp` transfer backends. Do not enable LayerSplit on a PD decode worker; that worker receives full cache shards through PD transfer. Use the [PD disaggregation guide](/docs/advanced_features/pd_disaggregation) and model-specific launch recipes to configure both sides. Existing PD FP8 configurations keep their model and backend requirements. The [PD NVFP4 recipe](/docs/advanced_features/quantized_kv_cache#pd-layer-splitting-with-nvfp4) uses the GLM-5.2 FlashMLA path.
+
+Unified serving (`--disaggregation-mode null`) also supports LayerSplit for GLM-5.2 DSA with NVFP4 KV on SM100. It requires TP=CP greater than one, DP=1, attention DP=1, DCP=1, PP=1, interleave prefill CP, 64-token pages, and unpooled index keys. Use `flashmla_sparse` for prefill and `flashmla_kv` for decode. Unified FP8 LayerSplit, CP decode attention TP, and two-batch overlap are not supported. EAGLE/MTP draft workers retain their complete cache.
+
+In this unified mode, eager CP prefill transfers the full batch's required physical pages into remote scratch. Decode and target verification run each layer's attention on its cache owner. See the [eight-GPU launch example](/docs/advanced_features/quantized_kv_cache#unified-serving-with-nvfp4-layer-splitting).
+
+To compare capacity, use the same per-GPU KV byte budget for ON and OFF. Include remote scratch, global scales, the complete draft pool, both prefill staging buffers, and page-ID storage. Choose token capacity separately for each mode. Sweep client concurrency independently so ON can use its additional capacity. Record actual running requests and active KV occupancy, then compare throughput at the same latency limit. See the [comparison procedure](/docs/advanced_features/quantized_kv_cache#compare-on-and-off-with-the-same-kv-byte-budget). Prefill CP alone does not shard cache storage, and LayerSplit does not guarantee a throughput improvement.
 
 ## Usage and Examples
 

@@ -209,3 +209,99 @@ install(TARGETS flashmla_ops LIBRARY DESTINATION "sgl_kernel")
 # FlashMLA's csrc/api/*.cpp register their ops through pybind by default; sgl-kernel
 # links them as plain libtorch C++ and registers the ops itself in flashmla_extension.cc.
 target_compile_definitions(flashmla_ops PRIVATE FLASH_MLA_LIBTORCH_ONLY)
+
+# The GLM-5.2 NVFP4 producer uses the validated V3.2 kernel. Keep that
+# dependency separate from main's V4.1 FlashMLA, whose parameter structures and
+# sparse-decode ABI differ. In particular, never patch the FP8 dependency.
+if(FLASHMLA_ENABLE_SM100)
+    FetchContent_Declare(
+        repo-flashmla-nvfp4
+        URL      https://${GITHUB_ARTIFACTORY}/sgl-project/FlashMLA/archive/05e26647fe840b8baedae486c2d86d5ce4efeb7c.tar.gz
+        URL_HASH SHA256=ce369489bbfc42cdfbba9aa949de0270e64469d530748dea9f4f60b3c69dea9b
+    )
+    FetchContent_Populate(repo-flashmla-nvfp4)
+
+    # Extend the pinned open-source FlashMLA V32 producer with the GLM-5.2
+    # 416-byte NVFP4/BF16 cache. The packed E2M1 producer materializes the
+    # same BF16 tiles consumed by the stock FlashMLA QK/PV pipeline.
+    set(FLASHMLA_NVFP4_PATCH
+        "${CMAKE_CURRENT_LIST_DIR}/../patches/flashmla_sm100_nvfp4.patch")
+    set(FLASHMLA_SM100_HEAD64_KERNEL_FILE
+        "${repo-flashmla-nvfp4_SOURCE_DIR}/csrc/sm100/decode/head64/kernel.cuh")
+    set(FLASHMLA_NVFP4_MARKER
+        "SGLANG_SM100_GLM52_NVFP4_BF16_V1")
+
+    file(READ "${FLASHMLA_SM100_HEAD64_KERNEL_FILE}"
+        FLASHMLA_SM100_HEAD64_KERNEL_CONTENT)
+    string(FIND "${FLASHMLA_SM100_HEAD64_KERNEL_CONTENT}"
+        "${FLASHMLA_NVFP4_MARKER}" FLASHMLA_NVFP4_PATCHED)
+    if(FLASHMLA_NVFP4_PATCHED EQUAL -1)
+        find_program(FLASHMLA_PATCH_EXECUTABLE patch REQUIRED)
+        execute_process(
+            COMMAND "${FLASHMLA_PATCH_EXECUTABLE}" --batch --forward
+                    --ignore-whitespace -p1
+                    -i "${FLASHMLA_NVFP4_PATCH}"
+            WORKING_DIRECTORY "${repo-flashmla-nvfp4_SOURCE_DIR}"
+            RESULT_VARIABLE FLASHMLA_NVFP4_PATCH_RESULT
+            OUTPUT_VARIABLE FLASHMLA_NVFP4_PATCH_STDOUT
+            ERROR_VARIABLE FLASHMLA_NVFP4_PATCH_STDERR)
+        if(NOT FLASHMLA_NVFP4_PATCH_RESULT EQUAL 0)
+            message(FATAL_ERROR
+                "Failed to apply ${FLASHMLA_NVFP4_PATCH}:\n"
+                "${FLASHMLA_NVFP4_PATCH_STDOUT}\n"
+                "${FLASHMLA_NVFP4_PATCH_STDERR}")
+        endif()
+
+        file(READ "${FLASHMLA_SM100_HEAD64_KERNEL_FILE}"
+            FLASHMLA_SM100_HEAD64_KERNEL_CONTENT)
+        string(FIND "${FLASHMLA_SM100_HEAD64_KERNEL_CONTENT}"
+            "${FLASHMLA_NVFP4_MARKER}" FLASHMLA_NVFP4_PATCHED)
+        if(FLASHMLA_NVFP4_PATCHED EQUAL -1)
+            message(FATAL_ERROR
+                "FlashMLA NVFP4 patch completed without expected marker "
+                "${FLASHMLA_NVFP4_MARKER}")
+        endif()
+        message(STATUS "Applied SM100 GLM-5.2 NVFP4/BF16 FlashMLA patch")
+    else()
+        message(STATUS "SM100 GLM-5.2 NVFP4/BF16 FlashMLA patch already applied")
+    endif()
+
+    set(FlashMLA_NVFP4_SOURCES
+        csrc/flashmla_nvfp4_sm100.cu
+        ${repo-flashmla-nvfp4_SOURCE_DIR}/csrc/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.cu
+        ${repo-flashmla-nvfp4_SOURCE_DIR}/csrc/smxx/decode/combine/combine.cu
+        ${repo-flashmla-nvfp4_SOURCE_DIR}/csrc/sm90/decode/sparse_fp8/instantiations/model1_persistent_h64.cu
+        ${repo-flashmla-nvfp4_SOURCE_DIR}/csrc/sm90/decode/sparse_fp8/instantiations/model1_persistent_h128.cu
+        ${repo-flashmla-nvfp4_SOURCE_DIR}/csrc/sm90/decode/sparse_fp8/instantiations/v32_persistent_h64.cu
+        ${repo-flashmla-nvfp4_SOURCE_DIR}/csrc/sm90/decode/sparse_fp8/instantiations/v32_persistent_h128.cu
+        ${repo-flashmla-nvfp4_SOURCE_DIR}/csrc/sm100/decode/head64/instantiations/v32.cu
+        ${repo-flashmla-nvfp4_SOURCE_DIR}/csrc/sm100/decode/head64/instantiations/model1.cu
+        ${repo-flashmla-nvfp4_SOURCE_DIR}/csrc/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512.cu
+    )
+    Python_add_library(flashmla_nvfp4_ops MODULE USE_SABI ${SKBUILD_SABI_VERSION}
+        WITH_SOABI ${FlashMLA_NVFP4_SOURCES})
+    target_compile_options(flashmla_nvfp4_ops PRIVATE
+        $<$<COMPILE_LANGUAGE:CXX>:-std=c++20>
+        $<$<COMPILE_LANGUAGE:CUDA>:-std=c++20>
+        $<$<COMPILE_LANGUAGE:CUDA>:${FLASHMLA_CUDA_FLAGS}>
+        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-fvisibility=hidden>
+        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-fvisibility-inlines-hidden>
+    )
+    # The two upstream revisions reuse C++ type/function names with different
+    # ABIs. Do not export the legacy symbols into the process symbol table.
+    # PyMODINIT_FUNC still exports the Python module initializer.
+    set_target_properties(flashmla_nvfp4_ops PROPERTIES
+        CXX_VISIBILITY_PRESET hidden
+        VISIBILITY_INLINES_HIDDEN YES)
+    target_include_directories(flashmla_nvfp4_ops PRIVATE
+        ${repo-flashmla-nvfp4_SOURCE_DIR}/csrc
+        ${repo-flashmla-nvfp4_SOURCE_DIR}/csrc/kerutils/include
+        ${repo-flashmla-nvfp4_SOURCE_DIR}/csrc/sm90
+        # Both FlashMLA revisions pin the same CUTLASS commit.
+        ${repo-flashmla_SOURCE_DIR}/csrc/cutlass/include
+        ${repo-flashmla_SOURCE_DIR}/csrc/cutlass/tools/util/include
+        ${FLASHMLA_CCCL_INCLUDE}
+    )
+    target_link_libraries(flashmla_nvfp4_ops PRIVATE ${TORCH_LIBRARIES} c10 cuda)
+    install(TARGETS flashmla_nvfp4_ops LIBRARY DESTINATION "sgl_kernel")
+endif()

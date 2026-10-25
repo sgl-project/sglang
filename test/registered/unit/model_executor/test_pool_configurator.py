@@ -399,6 +399,123 @@ class TestDefaultConfigurator(CustomTestCase):
             fused = create_memory_pool_configurator(mr)
         self.assertEqual(fused._cell_size, 77777)
 
+    def test_pd_nvfp4_layer_split_sizes_owned_layers_and_remote_scratch(self):
+        from sglang.srt.model_executor.pool_configurator import DefaultPoolConfigurator
+
+        for shard_size in (2, 4):
+            with self.subTest(shard_size=shard_size):
+                mr = _make_model_runner(
+                    self,
+                    num_layers=10,
+                    page_size=64,
+                    use_mla_backend=True,
+                    disaggregation_mode="prefill",
+                )
+                _configure_dsa_model(mr)
+                _publish_config(
+                    self,
+                    kv_cache_dtype="nvfp4",
+                    enable_dsa_cache_layer_split=True,
+                )
+                mr.server_args = get_server_args()
+                with (
+                    mock_cpu_env(kv_size=1, tp_size=shard_size),
+                    get_parallel().override(
+                        attn_tp_size=1, attn_cp_size=shard_size, attn_cp_rank=0
+                    ),
+                    patch(
+                        "sglang.srt.model_executor.pool_configurator."
+                        "is_float4_e2m1fn_x2",
+                        return_value=True,
+                    ),
+                ):
+                    configurator = DefaultPoolConfigurator(mr)
+                    # 416 is already a byte count. Both the main KV and the
+                    # 132-byte indexer need owned layers plus one remote layer.
+                    layers = (10 + shard_size - 1) // shard_size + 1
+                    self.assertEqual(configurator._cell_size, (416 + 132) * layers)
+                    self.assertEqual(
+                        configurator._compute_dsa_indexer_cell_size(
+                            kvc=mr, num_layers=2, allocate_all_layers=True
+                        ),
+                        132 * 2,
+                    )
+                    mr.spec_algorithm.is_eagle.return_value = True
+                    mr.spec_aux_config.eagle_draft_num_layers = 2
+                    with_draft = DefaultPoolConfigurator(mr)
+                    self.assertEqual(with_draft._cell_size, (416 + 132) * (layers + 2))
+
+    def test_unified_nvfp4_prefill_workspace_fits_exact_budget_with_full_draft(self):
+        from sglang.srt.model_executor.pool_configurator import DefaultPoolConfigurator
+
+        budget = 152 * 1024**3
+        for mode, split, draft in (
+            ("null", True, False),
+            ("prefill", True, False),
+            ("null", False, False),
+            ("null", True, True),
+        ):
+            with self.subTest(mode=mode, split=split, draft=draft):
+                mr = _make_model_runner(
+                    self,
+                    num_layers=1 if draft else 78,
+                    page_size=64,
+                    use_mla_backend=True,
+                    disaggregation_mode=mode,
+                    speculative_algorithm="EAGLE",
+                )
+                _configure_dsa_model(mr)
+                mr.model_config.hf_config.index_topk_freq = 4
+                mr.model_config.hf_config.index_skip_topk_offset = 3
+                mr.is_draft_worker = draft
+                mr.model_config.is_draft_model = draft
+                mr.kv_cache_dtype_str = "nvfp4"
+                mr.spec_algorithm.is_eagle.return_value = True
+                mr.spec_algorithm.is_none.return_value = False
+                mr.spec_aux_config.eagle_draft_num_layers = 1
+                _publish_config(
+                    self,
+                    kv_cache_dtype="nvfp4",
+                    enable_dsa_cache_layer_split=split,
+                    disaggregation_mode=mode,
+                )
+                with (
+                    mock_cpu_env(kv_size=1, tp_size=8),
+                    get_parallel().override(
+                        attn_tp_size=1, attn_cp_size=8, attn_cp_rank=0
+                    ),
+                    patch(
+                        "sglang.srt.model_executor.pool_configurator.is_float4_e2m1fn_x2",
+                        return_value=True,
+                    ),
+                ):
+                    cfg = DefaultPoolConfigurator(mr)
+                    capacity = cfg.calculate_pool_sizes(budget, 64).max_total_num_tokens
+                unified_target = mode == "null" and split and not draft
+                self.assertEqual(cfg._layer_split_prefill_workspace, unified_target)
+                if unified_target:
+                    self.assertEqual(cfg._cell_size, 5784)
+                    self.assertEqual(cfg._layer_split_scale_bytes, 316)
+                    self.assertEqual(capacity, 28_210_368)
+
+                    # Independent allocation sum, including the 64-token guard
+                    # page, both bounded stages, page IDs and target/draft scales.
+                    def allocated(tokens):
+                        pages = tokens // 64 + 1
+                        return (
+                            (tokens + 64) * (416 * 12 + 132 * 6)
+                            + 79 * 4
+                            + min(1024, pages) * 64 * (416 + 132)
+                            + pages * 8
+                        )
+
+                    self.assertLessEqual(allocated(capacity), budget)
+                    self.assertGreater(allocated(capacity + 64), budget)
+                else:
+                    self.assertEqual(cfg._layer_split_scale_bytes, 0)
+                    self.assertEqual(capacity, (budget // cfg._cell_size) // 64 * 64)
+                    if draft:
+                        self.assertEqual(cfg._cell_size, 416 + 132)
 
 class TestHybridSWAConfigurator(CustomTestCase):
     """Hybrid SWA: full/swa split, ratio, memory invariant."""
