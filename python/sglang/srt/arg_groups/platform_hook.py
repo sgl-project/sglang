@@ -9,8 +9,10 @@ from typing import Any
 
 from sglang.srt.arg_groups.overrides import (
     declare_resolution,
+    model_config_of,
     record_foreign_defaults,
     resolving_view,
+    use_mla_backend,
 )
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
@@ -153,6 +155,27 @@ def handle_xpu_backends(server_args: Any):
                     cfg.cuda_graph_config, Phase.DECODE, backend=Backend.DISABLED
                 ),
             )
+
+
+def handle_sail_backends(server_args: Any):
+    if not get_platform().is_sail:
+        return
+    from sglang.srt.configs.model_config import is_deepseek_dsa
+
+    cfg = resolving_view(server_args)
+    # A captured prefill graph pins MLA to the absorbed path, which hands the
+    # backend a non-None q_v; the SAIL FA3 interface rejects that argument, so
+    # MLA prefill must stay eager on SAIL. DSA models keep their own policy.
+    if use_mla_backend(server_args) and not is_deepseek_dsa(
+        model_config_of(server_args).hf_config
+    ):
+        declare_resolution(
+            server_args,
+            "_handle_sail_backends",
+            cuda_graph_config=with_phase(
+                cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
+            ),
+        )
 
 
 def handle_cpu_backends(server_args: Any):
