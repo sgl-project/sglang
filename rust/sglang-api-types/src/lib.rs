@@ -13,8 +13,6 @@ pub mod api {
     // Generated code optimizes for template uniformity, not lint cleanliness.
     #[allow(clippy::all)]
     pub mod v1 {
-        pub use crate::ext::decode_generate_http_response;
-
         include!("generated/sglang.api.v1.rs");
         include!("generated/sglang.api.v1.serde.rs");
         include!("generated/sglang.api.v1.tonic.rs");

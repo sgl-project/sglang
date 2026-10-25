@@ -4,30 +4,7 @@
 
 use std::borrow::Cow;
 
-use crate::api::v1::{
-    FinishReason, FinishStop, GenerateResponse, GenerateStreamError, Matched, MatchedTokens,
-    finish_reason, matched,
-};
-
-/// Decode one HTTP `/generate` object or a batch into successes or engine errors.
-pub fn decode_generate_http_response(
-    bytes: &[u8],
-) -> serde_json::Result<Vec<Result<GenerateResponse, GenerateStreamError>>> {
-    fn item(
-        value: serde_json::Value,
-    ) -> serde_json::Result<Result<GenerateResponse, GenerateStreamError>> {
-        if value.get("error").is_some() {
-            serde_json::from_value::<GenerateStreamError>(value).map(Err)
-        } else {
-            serde_json::from_value::<GenerateResponse>(value).map(Ok)
-        }
-    }
-
-    match serde_json::from_slice(bytes)? {
-        serde_json::Value::Array(items) => items.into_iter().map(item).collect(),
-        value => item(value).map(|item| vec![item]),
-    }
-}
+use crate::api::v1::{FinishReason, FinishStop, Matched, MatchedTokens, finish_reason, matched};
 
 impl FinishReason {
     /// A stop reason (`type: "stop"`), optionally carrying what matched.
