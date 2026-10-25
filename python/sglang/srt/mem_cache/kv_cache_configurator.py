@@ -855,8 +855,9 @@ class KVCacheConfigurator:
                 raise ValueError(
                     f"Fused draft KV: the draft resolved its KV cache dtype to "
                     f"{self.kv_cache_dtype}, but its region inside the target's "
-                    f"pages holds {region_kv_dtype}. The draft KV dtype must "
-                    "match the dtype used to size its fused region."
+                    f"pages holds {region_kv_dtype}. Set "
+                    "--speculative-draft-kv-cache-dtype explicitly so the region "
+                    "is sized in the draft's KV dtype."
                 )
         return placement
 
@@ -2517,6 +2518,9 @@ class KVCacheConfigurator:
         return token_to_kv_pool
 
     def _build_minimax_sparse_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
+        from sglang.srt.configs.model_config import (
+            uses_minimax_m3_nvfp4_native_stack,
+        )
         from sglang.srt.server_args import m3_fp8_attn_gemm_enabled
 
         _hf_config = self.model_config.hf_config
@@ -2533,7 +2537,12 @@ class KVCacheConfigurator:
             hisparse_kwargs["host_to_device_ratio"] = (
                 parse_hisparse_config().host_to_device_ratio
             )
-        token_to_kv_pool = MiniMaxSparseKVPool(
+        pool_cls = MiniMaxSparseKVPool
+        if uses_minimax_m3_nvfp4_native_stack(self.model_config.quantization):
+            from sglang.srt.mem_cache.minimax_m3_nvfp4_pool import MiniMaxM3Nvfp4KVPool
+
+            pool_cls = MiniMaxM3Nvfp4KVPool
+        token_to_kv_pool = pool_cls(
             size=max_total_num_tokens,
             page_size=self.pool_page_size,
             dtype=self.kv_cache_dtype,

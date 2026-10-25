@@ -200,12 +200,15 @@ def create_unified_radix_cache(
     elif get_memory().enable_unified_cache_external_linker:
         from sglang.srt.mem_cache.unified_cache.linker_factory import (
             create_unified_cache_linker,
+            get_startup_linker_config,
         )
 
         cache.init_cache_linker(
             create_unified_cache_linker(
                 server_args,
                 params,
+                backend=get_memory().unified_cache_external_linker_backend,
+                config=get_startup_linker_config(),
                 components=set(cache.components),
                 forward_stream=ctx.tp_worker.model_runner.forward_stream,
             )
