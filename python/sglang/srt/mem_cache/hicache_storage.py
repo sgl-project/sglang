@@ -89,6 +89,9 @@ class PoolName(str, Enum):
     SWA = "swa"
     AUXILIARY_SWA = "auxiliary_swa"
     INDEXER = "indexer"
+    # Direct-linker DSA index-K object: the layers that compute top-k, then the
+    # draft's. Named apart from INDEXER, whose linker objects hold every layer.
+    COMPACT_INDEXER = "compact_indexer"
     # TODO(hzh0425): Current DeepSeek V4 pool naming is verbose; will be normalized to
     # 'COMPRESSED_KV / COMPRESSED_INDEXER / COMPRESSED_STATE' in the next PR.
     DEEPSEEK_V4_C1 = "deepseek_v4_c1"

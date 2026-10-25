@@ -446,17 +446,44 @@ def _build_dsa_device_pool_group(
             page_size=page_size,
             rows_are_pages=False,
         ),
-        DevicePoolEntry(
-            name=PoolName.INDEXER,
-            indices_from_pool=PoolName.KV,
-            device_pool=kvcache,
-            components=[[*kvcache.index_k_with_scale_buffer, *draft_indexer_buffers]],
-            layer_mapping=layer_mapping,
-            page_size=page_size,
-            rows_are_pages=True,
-        ),
     ]
+    indexer_buffers, indexer_mapping = _dsa_indexer_layers(
+        kvcache.index_k_with_scale_buffer, draft_indexer_buffers
+    )
+    if indexer_buffers:
+        entries.append(
+            DevicePoolEntry(
+                name=PoolName.COMPACT_INDEXER,
+                indices_from_pool=PoolName.KV,
+                device_pool=kvcache,
+                components=[indexer_buffers],
+                layer_mapping=indexer_mapping,
+                page_size=page_size,
+                rows_are_pages=True,
+            )
+        )
     return DevicePoolGroup(entries, num_layers, page_size, rank_replicated=True)
+
+
+def _dsa_indexer_layers(
+    target_buffers: Sequence[torch.Tensor], draft_buffers: Sequence[torch.Tensor]
+) -> tuple[list[torch.Tensor], dict[int, int | tuple[int, ...]]]:
+    """Index-K buffers that hold keys, and the transfer-layer mapping into them.
+
+    Shared-topk layers own a 0-row placeholder and never write index keys, so
+    they are left out; draft depth N rides on transfer layer N as in the KV pool.
+    """
+    layers = [layer for layer, buffer in enumerate(target_buffers) if buffer.shape[0]]
+    buffers = [target_buffers[layer] for layer in layers]
+    mapping: dict[int, int | tuple[int, ...]] = {
+        layer: slot for slot, layer in enumerate(layers)
+    }
+    for depth, buffer in enumerate(draft_buffers):
+        target = mapping.get(depth)
+        draft = len(buffers)
+        buffers.append(buffer)
+        mapping[depth] = draft if target is None else (target, draft)
+    return buffers, mapping
 
 
 def _mha_device_pool_entry(
