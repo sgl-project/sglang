@@ -144,6 +144,11 @@ class SchedulerStats:
     kv_transfer_speed_gb_s: float = 0.0
     kv_transfer_latency_ms: float = 0.0
     pending_prealloc_token_usage: float = 0.0
+    # Share of the full / SWA KV pool held by decode requests whose KV transfer
+    # is still pending (preallocated, not yet running), on the capacity basis of
+    # full_token_usage / swa_token_usage; the difference is the running batch's share.
+    prealloc_full_token_usage: float = 0.0
+    prealloc_swa_token_usage: float = 0.0
 
     # Utilization
     utilization: float = 0.0
@@ -641,6 +646,18 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self.pending_prealloc_token_usage = Gauge(
             name="sglang:pending_prealloc_token_usage",
             documentation="The token usage for pending preallocated tokens (not preallocated yet).",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.prealloc_full_token_usage = Gauge(
+            name="sglang:prealloc_full_token_usage",
+            documentation="Share of the full-attention KV pool held by decode requests whose KV transfer is pending (preallocated, not yet running); same capacity basis as sglang:full_token_usage.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.prealloc_swa_token_usage = Gauge(
+            name="sglang:prealloc_swa_token_usage",
+            documentation="Share of the SWA KV pool held by decode requests whose KV transfer is pending; same capacity basis as sglang:swa_token_usage.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -1326,7 +1343,9 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
     ) -> SchedulerMetricsCollectorContext:
         enable_metrics = get_observability().enable_metrics
         parallel = get_parallel()
-        is_stats_logging_rank = parallel.attn_tp_rank == 0
+        is_stats_logging_rank = (
+            parallel.attn_tp_rank == 0 and parallel.attn_cp_rank == 0
+        )
         current_scheduler_metrics_enabled = enable_metrics and (
             is_stats_logging_rank
             or get_observability().enable_metrics_for_all_schedulers
@@ -1673,6 +1692,8 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self._log_gauge(
             self.pending_prealloc_token_usage, stats.pending_prealloc_token_usage
         )
+        self._log_gauge(self.prealloc_full_token_usage, stats.prealloc_full_token_usage)
+        self._log_gauge(self.prealloc_swa_token_usage, stats.prealloc_swa_token_usage)
 
         # Utilization
         self._log_gauge(self.utilization, stats.utilization)
@@ -1752,6 +1773,24 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self._log_gauge(
             self.startup_available_gpu_memory_gb, startup_available_gpu_memory_gb
         )
+
+
+def tokenizer_metric_labels() -> Dict[str, str]:
+    """The labels on every ``TokenizerMetricsCollector`` metric. The priority
+    and custom labels start empty; each request fills them in."""
+    labels = {
+        "model_name": get_serving().served_model_name,
+        "engine_type": DisaggregationMode.to_engine_type(
+            get_disagg().disaggregation_mode
+        ),
+    }
+    if get_schedule().enable_priority_scheduling:
+        labels["priority"] = ""
+    for label in get_observability().tokenizer_metrics_allowed_custom_labels or ():
+        labels[label] = ""
+    if get_observability().extra_metric_labels:
+        labels.update(get_observability().extra_metric_labels)
+    return labels
 
 
 class TokenizerMetricsCollector(_StatLoggerDIMixin):
@@ -2175,7 +2214,8 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             "device_overlap means the live device prefix diverged from the "
             "request's view at splice time, so the span beyond it was released; "
             "cache_admission_shortfall means an L3-loaded L2 span was no longer "
-            "reusable when cache-mode admission ran.",
+            "reusable when cache-mode admission ran; deadline means the "
+            "storage prefetch stop policy ended the read before it completed.",
             labelnames=list(labels.keys()) + ["reason"],
         )
         for reason in (
@@ -2184,6 +2224,7 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             "device_capacity",
             "device_covered",
             "storage_transfer",
+            "deadline",
             "anchor_lost",
             "aux_window_trim",
             "device_overlap",

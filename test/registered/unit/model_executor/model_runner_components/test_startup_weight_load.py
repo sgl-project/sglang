@@ -739,6 +739,7 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
         )
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.enable_overlap = enable_overlap
+        scheduler.enable_unified_memory = False
         scheduler.init_tp_model_worker = lambda: setattr(scheduler, "tp_worker", worker)
         scheduler.maybe_init_draft_worker = lambda: setattr(
             scheduler, "draft_worker", draft_worker

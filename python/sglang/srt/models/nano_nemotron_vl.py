@@ -28,8 +28,9 @@ from sglang.srt.layers.activation import ReLU2
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternTokenPairs,
     general_mm_embed_routine,
+    pad_mm_token_pairs,
+    pad_mm_tokens,
 )
 from sglang.srt.managers.schedule_batch import (
     Modality,
@@ -58,9 +59,20 @@ class NemotronH_Nano_VL_V2(EVS):
         },
     )
 
+    supported_lora_modules = NemotronHForCausalLM.supported_lora_modules
+
     @staticmethod
     def create_evs_config(config: NemotronH_Nano_VL_V2_Config):
         return EVSConfig(video_pruning_rate=config.video_pruning_rate)
+
+    def should_apply_lora(self, module_name: str) -> bool:
+        return module_name.startswith("language_model.")
+
+    def get_hidden_dim(self, module_name, layer_idx):
+        return self.language_model.get_hidden_dim(module_name, layer_idx)
+
+    def get_stacked_multiply(self, module_name):
+        return self.language_model.get_stacked_multiply(module_name)
 
     def __init__(
         self,
@@ -117,31 +129,37 @@ class NemotronH_Nano_VL_V2(EVS):
 
         self.config = config
 
-    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
-        im_start_id: int = mm_inputs.im_start_id
-        im_end_id: int = mm_inputs.im_end_id
+    @property
+    def routed_experts_weights_of_layer(self):
+        return self.language_model.routed_experts_weights_of_layer
 
+    @classmethod
+    def get_model_config_for_expert_location(cls, config):
+        return NemotronHForCausalLM.get_model_config_for_expert_location(
+            config.llm_config
+        )
+
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         visual_items = [item for item in mm_inputs.mm_items if not item.is_audio()]
         audio_items = [item for item in mm_inputs.mm_items if item.is_audio()]
 
         all_data_offsets = []
 
         if visual_items:
+            # Literal boundary tokens in text must not change which spans are images.
             mm_inputs.mm_items = visual_items
-            helper = MultiModalityDataPaddingPatternTokenPairs(
-                [(im_start_id, im_end_id)]
+            input_ids = pad_mm_tokens(input_ids, mm_inputs)
+            all_data_offsets.extend(
+                start - 1 for item in visual_items for start, _ in item.offsets
             )
-            input_ids = helper.pad_input_tokens(input_ids, mm_inputs)
-            all_data_offsets.extend(mm_inputs.data_offsets)
 
         audio_start_id = getattr(mm_inputs, "audio_start_id", None)
         audio_end_id = getattr(mm_inputs, "audio_end_id", None)
         if audio_items and audio_start_id is not None and audio_end_id is not None:
             mm_inputs.mm_items = audio_items
-            helper = MultiModalityDataPaddingPatternTokenPairs(
-                [(audio_start_id, audio_end_id)]
+            input_ids = pad_mm_token_pairs(
+                input_ids, mm_inputs, data_token_pairs=[(audio_start_id, audio_end_id)]
             )
-            input_ids = helper.pad_input_tokens(input_ids, mm_inputs)
             all_data_offsets.extend(mm_inputs.data_offsets)
 
         mm_inputs.mm_items = visual_items + audio_items
@@ -427,6 +445,9 @@ class NemotronH_Omni_Reasoning_V3(NemotronH_Nano_VL_V2):
             if (config.llm_config.num_nextn_predict_layers or 0) > 0
             else None
         )
+
+    def prepare_for_forward(self, forward_batch: ForwardBatch) -> None:
+        self.language_model.prepare_for_forward(forward_batch)
 
     @property
     def lm_head(self):
