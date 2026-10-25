@@ -8,6 +8,8 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.speculative.row_argmax import _argmax_pair
+
 _IDX_SENTINEL = tl.constexpr(2147483647)
 _MARKOV_BLOCK_V = 256
 _MARKOV_BLOCK_R = 32
@@ -114,11 +116,13 @@ def _markov_greedy_partial_kernel(
         base_ptr + row * stride_base_row + offs_v, mask=mask_v, other=float("-inf")
     ).to(tl.float32)
     score = tl.where(mask_v, base + acc, float("-inf"))
-    tile_best = tl.max(score, axis=0)
-    # First-index tie-break within the tile, matching torch.argmax.
-    idx = tl.where(score == tile_best, offs_v, _IDX_SENTINEL)
+    # Match torch.argmax's NaN priority and first-index tie-break, excluding
+    # padded lanes even when every valid score is NaN or negative infinity.
+    tile_best, idx = tl.reduce(
+        (score, tl.where(mask_v, offs_v, _IDX_SENTINEL)), 0, _argmax_pair
+    )
     tl.store(tile_val_ptr + row * n_tiles + tile, tile_best)
-    tl.store(tile_idx_ptr + row * n_tiles + tile, tl.min(idx, axis=0))
+    tl.store(tile_idx_ptr + row * n_tiles + tile, idx)
 
 
 @triton.jit
@@ -134,10 +138,8 @@ def _markov_greedy_combine_kernel(
     mask = offs < n_tiles
     vals = tl.load(tile_val_ptr + row * n_tiles + offs, mask=mask, other=float("-inf"))
     idxs = tl.load(tile_idx_ptr + row * n_tiles + offs, mask=mask, other=_IDX_SENTINEL)
-    best = tl.max(vals, axis=0)
-    # Lowest global index among equal-valued tiles, matching torch.argmax.
-    cand = tl.where(vals == best, idxs, _IDX_SENTINEL)
-    tl.store(next_tokens_ptr + row, tl.min(cand, axis=0).to(tl.int64))
+    _, index = tl.reduce((vals, idxs), 0, _argmax_pair)
+    tl.store(next_tokens_ptr + row, index.to(tl.int64))
 
 
 def markov_greedy_step_triton(
