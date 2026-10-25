@@ -633,6 +633,15 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
         return processor, _tokenizer_of(processor)
 
     def _preprocessing_competes_with_the_scheduler(self) -> bool:
+        return BaseMultimodalProcessor.preprocessing_competes_with_the_scheduler(
+            self._processor,
+            disable_fast_image_processor=self.disable_fast_image_processor,
+        )
+
+    @staticmethod
+    def preprocessing_competes_with_the_scheduler(
+        processor, *, disable_fast_image_processor: bool
+    ) -> bool:
         """Whether image preprocessing contends with the serving accelerator.
 
         The fast image processor runs inside the tokenizer process but may run on
@@ -645,9 +654,9 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
             or is_true_on_policy_enabled()
         ):
             return False
-        if self.disable_fast_image_processor:
+        if disable_fast_image_processor:
             return False
-        image_processor = getattr(self._processor, "image_processor", None)
+        image_processor = getattr(processor, "image_processor", None)
         if not isinstance(image_processor, BaseImageProcessor):
             return False
         if _is_xpu or _is_npu:
@@ -678,12 +687,14 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
         return 2 if declared is None else declared
 
     def _fast_image_processor_device(self, processor) -> Optional[str]:
-        """The device for the fast image processor, or None to leave it unset.
+        # Engines sharing a tokenizer process each carry their own base_gpu_id.
+        return BaseMultimodalProcessor.fast_image_processor_device(
+            processor, base_gpu_id=self.server_args.base_gpu_id
+        )
 
-        Resolved from this processor's own ``server_args``: engines sharing a
-        tokenizer process each carry their own ``base_gpu_id``.
-        """
-        server_args = self.server_args
+    @staticmethod
+    def fast_image_processor_device(processor, *, base_gpu_id: int) -> Optional[str]:
+        """The device for the fast image processor, or None to leave it unset."""
         if (
             _is_cpu
             or get_exec().deterministic.rl_on_policy_target is not None
@@ -696,9 +707,7 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
             platform = platforms.current_platform
             if not platform.is_cuda_alike():
                 return None
-            # Per-worker placement travels as a constructor argument, and
-            # this record is that argument.
-            return f"{platform.device_type}:{server_args.base_gpu_id}"
+            return f"{platform.device_type}:{base_gpu_id}"
         if processor.__class__.__name__ == "MiniMaxVLProcessor":
             # MiniMax's image/video processors create 10-dim tensors during
             # patch extraction, exceeding the Ascend 8-dim limit; patch them
@@ -1418,6 +1427,13 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
         does not implement it (e.g. Kimi) override this method.
 
         """
+        return BaseMultimodalProcessor.resolve_hf_image_token_counts(
+            self._processor, images
+        )
+
+    @staticmethod
+    def resolve_hf_image_token_counts(processor, images: List) -> List[int]:
+        """Per-image token counts from the HF processor's own helper."""
         assert images is not None
         image_sizes = [
             (
@@ -1427,7 +1443,7 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
             )
             for image in images
         ]
-        num_image_tokens = self._processor._get_num_multimodal_tokens(
+        num_image_tokens = processor._get_num_multimodal_tokens(
             image_sizes=image_sizes
         ).num_image_tokens
         return [int(count) for count in num_image_tokens]
