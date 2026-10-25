@@ -26,10 +26,13 @@ get_mm_processor -> TokenSpaceSGLangProcessor
   tokenizer + strategy -> served output; caller IDs never decoded
   --allowed-media-domains / max file size -> the core's media URL policy
   adjacent images -> two offsets from mm_spans, not one scanned run
+  chat turns' media + partially expanded IDs -> prefix kept, new turn expanded
 """
 
 import asyncio
+import base64
 import contextlib
+import io
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -39,6 +42,9 @@ from PIL import Image
 from tokenizers import Tokenizer, models, pre_tokenizers
 from transformers import PreTrainedTokenizerFast
 
+from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
+from sglang.srt.entrypoints.openai.serving_chat import _collect_message_media
+from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.multimodal_processor import (
     PROCESSOR_MAPPING,
     get_mm_processor,
@@ -500,6 +506,57 @@ class TestTokenSpaceSGLangProcessor(unittest.TestCase):
             )(None, server_args, _bare_tokenizer(), None)
         self.addCleanup(processor.shutdown)
         configure.assert_called_once_with(["media.example.com"], 7)
+
+    def test_chat_media_reach_a_partially_expanded_request(self):
+        """Chat sends every turn's image; only the new turn's placeholder expands."""
+        reset_context()
+        self.addCleanup(reset_context)
+        server_args = ServerArgs(
+            model_path="dummy",
+            model_impl="sglang",
+            mm_process_config={},
+            enable_token_space_processor=True,
+            mm_processor_worker_num=1,
+        )
+        publish(server_args, role="test")
+        processor = TokenSpaceSGLangProcessor.for_strategy(_ImageWidthStrategy)(
+            None, server_args, _bare_tokenizer(), None
+        )
+        self.addCleanup(processor.shutdown)
+
+        def image_part(width):
+            buffer = io.BytesIO()
+            Image.new("RGB", (width, 1)).save(buffer, format="PNG")
+            data = base64.b64encode(buffer.getvalue()).decode()
+            return {
+                "type": "image_url",
+                "image_url": {"url": f"data:image/png;base64,{data}"},
+            }
+
+        # Turn 1's image (width 2) is already expanded; turn 2's (width 3) is not.
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {"role": "user", "content": [image_part(2)]},
+                {"role": "assistant", "content": "a"},
+                {"role": "user", "content": [image_part(3)]},
+            ],
+            input_ids=[1, IMAGE, IMAGE, 2, IMAGE],
+            mm_token_expansion_start_len=4,
+        )
+        image_data, _, _, _ = _collect_message_media(request.messages)
+        obj = GenerateReqInput(
+            input_ids=request.input_ids,
+            image_data=image_data,
+            mm_token_expansion_start_len=request.mm_token_expansion_start_len,
+        )
+        output = asyncio.run(
+            processor.process_mm_data_async(
+                image_data=obj.image_data, input_text=obj.input_ids, request_obj=obj
+            )
+        )
+        self.assertEqual(output.input_ids, [1, IMAGE, IMAGE, 2, IMAGE, IMAGE, IMAGE])
+        self.assertEqual([item.offsets for item in output.mm_items], [[(1, 2), (4, 6)]])
 
     def test_serving_offsets_come_from_mm_spans(self):
         """Adjacent images form one placeholder run; only mm_spans can divide it."""
