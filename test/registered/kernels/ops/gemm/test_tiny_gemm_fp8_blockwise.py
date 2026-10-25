@@ -23,11 +23,13 @@ FP8_MAX = 448.0
 def _quantize_fp8_blockwise_ue8m0(w: torch.Tensor, block: int = 128):
     """Checkpoint-format block-FP8 weight with power-of-two scales."""
     n, k = w.shape
-    tiles = w.float().reshape(n // block, block, k // block, block)
+    n_pad = -(-n // block) * block  # N may end in a partial 128-row block
+    w = torch.nn.functional.pad(w, (0, 0, 0, n_pad - n))
+    tiles = w.float().reshape(n_pad // block, block, k // block, block)
     amax = tiles.abs().amax(dim=(1, 3)).clamp(min=1e-12)
     scale = torch.exp2(torch.ceil(torch.log2(amax / FP8_MAX)))
     w_fp8 = (tiles / scale[:, None, :, None]).to(torch.float8_e4m3fn)
-    return w_fp8.reshape(n, k), scale
+    return w_fp8.reshape(n_pad, k)[:n].contiguous(), scale
 
 
 @unittest.skipUnless(
