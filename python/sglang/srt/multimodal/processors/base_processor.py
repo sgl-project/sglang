@@ -808,16 +808,11 @@ class BaseMultimodalProcessor(ABC):
             getattr(processor, "video_processor", None),
         )
         if processor.__class__.__name__ == "Glm5NextProcessor" or any(
-            any(
-                family in type(inner).__module__.lower()
-                for family in ("glm5_next", "glmga")
-            )
+            "glm5_next" in type(inner).__module__.lower()
             or type(inner).__name__
             in {
                 "Glm5NextImageProcessor",
                 "Glm5NextVideoProcessor",
-                "GlmgaImageProcessor",
-                "GlmgaVideoProcessor",
             }
             for inner in inner_processors
             if inner is not None

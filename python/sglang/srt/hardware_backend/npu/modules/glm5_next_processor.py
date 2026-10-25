@@ -1,8 +1,8 @@
 """NPU-safe patch extraction for Transformers GLM5-Next processors.
 
 The generated Transformers GLM5-Next image and video processors materialize
-9- and 10-dimensional tensors in ``patchify``. Ascend supports tensors with at
-most 8 dimensions, so keep the upstream preprocessing flow and replace only
+9- and 10-dimensional tensors in ``patchify``. Ascend's ``aclnnPermute`` supports
+at most 8 dimensions, so keep the upstream preprocessing flow and replace only
 that layout transformation.
 """
 
@@ -66,8 +66,7 @@ def npu_apply_glm5_next_preprocess_patch(processor) -> bool:
     ``trust_remote_code`` loads classes below ``transformers_modules.*`` rather
     than ``transformers.models.glm5_next.*``. Patching the instances' concrete
     classes covers both layouts without depending on a generated module name.
-    Image and video implementations may use different APIs in the same build.
-    Return True only when every present inner processor has a supported patch.
+    Return True only when every present inner processor exposes ``patchify``.
     """
     patches = []
     for kind, wrapper in (
@@ -78,29 +77,8 @@ def npu_apply_glm5_next_preprocess_patch(processor) -> bool:
         if inner is None:
             continue
         inner_type = type(inner)
-        if callable(getattr(inner_type, "patchify", None)):
-            patches.append((inner, "patchify", wrapper, _NPU_PATCH_MARKER))
-        elif (
-            "glmga" in inner_type.__module__.lower()
-            or inner_type.__name__ in {"GlmgaImageProcessor", "GlmgaVideoProcessor"}
-        ) and callable(getattr(inner_type, "_preprocess", None)):
-            # Keep GLMGA dependencies lazy: current patchify processors do not
-            # need the legacy model namespace installed in Transformers.
-            from sglang.srt.hardware_backend.npu.modules.glmga_processor import (
-                _NPU_GLMGA_PATCH_MARKER,
-                npu_wrapper_glmga_image_preprocess,
-                npu_wrapper_glmga_video_preprocess,
-            )
-
-            legacy_wrapper = (
-                npu_wrapper_glmga_video_preprocess
-                if kind == "video"
-                else npu_wrapper_glmga_image_preprocess
-            )
-            patches.append(
-                (inner, "_preprocess", legacy_wrapper, _NPU_GLMGA_PATCH_MARKER)
-            )
-        else:
+        if not callable(getattr(inner_type, "patchify", None)):
             return False
+        patches.append((inner, "patchify", wrapper, _NPU_PATCH_MARKER))
 
     return bool(patches) and all(_patch_processor_method(*args) for args in patches)
