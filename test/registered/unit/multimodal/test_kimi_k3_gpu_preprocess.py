@@ -131,5 +131,74 @@ def test_fill_transparent_bg_no_config_drops_alpha():
     assert torch.equal(out, batch[:, :3])
 
 
+def _cpu_chw(image) -> torch.Tensor:
+    return torch.from_numpy(np.asarray(image)).permute(2, 0, 1).contiguous()
+
+
+def _norm_tensors():
+    return torch.full((1, 3, 1, 1), 1 / 127.5), torch.full((1, 3, 1, 1), -1.0)
+
+
+def test_gpu_preprocess_chunks_match_single_batch(monkeypatch):
+    """Byte-bounded sub-batches produce the same patches as one batch."""
+    images = [
+        Image.fromarray(np.roll(_natural_image(112, 168), 5 * i, axis=1))
+        for i in range(5)
+    ]
+    configs = [dict(new_height=56, new_width=84, pad_height=0, pad_width=0)] * 5
+    scale, bias = _norm_tensors()
+    args = (images, configs, scale, bias, 14)
+    whole, whole_grids = kimi_k25._gpu_preprocess_images(*args, to_chw=_cpu_chw)
+
+    monkeypatch.setattr(kimi_k25, "_GPU_PREPROCESS_CHUNK_BYTES", 1)
+    assert len(kimi_k25._byte_bounded_chunks(list(range(5)), 56 * 84)) == 5
+    chunked, chunked_grids = kimi_k25._gpu_preprocess_images(*args, to_chw=_cpu_chw)
+
+    torch.testing.assert_close(chunked, whole)
+    assert torch.equal(chunked_grids, whole_grids)
+
+
+def test_prepare_image_features_falls_back_to_cpu_on_gpu_oom(monkeypatch):
+    """A tokenizer-side GPU OOM is served by the CPU path, not surfaced."""
+    images = [Image.fromarray(_natural_image(56, 84))] * 2
+    scale, bias = _norm_tensors()
+    cpu_calls = []
+
+    def cpu_call(text, imgs):
+        cpu_calls.append(len(imgs))
+        configs = [kimi_k25.navit_resize_config(84, 56, 14, 2, 16384, 512, None)] * len(
+            imgs
+        )
+        pixel_values, grids = kimi_k25._gpu_preprocess_images(
+            imgs, configs, scale, bias, 14, to_chw=_cpu_chw
+        )
+        return {"pixel_values": pixel_values, "image_grid_thw": grids}
+
+    def gpu_oom(*args, **kwargs):
+        raise torch.OutOfMemoryError("CUDA out of memory")
+
+    fake = SimpleNamespace(
+        _patch_size=14,
+        _merge_kernel_size=2,
+        _in_patch_limit=16384,
+        _patch_limit_on_one_side=512,
+        _fixed_output_tokens=None,
+        _transparent_bg_config=None,
+        _image_token="<image>",
+        _get_gpu_norm_tensors=lambda: (scale, bias),
+        _cpu_call=cpu_call,
+    )
+    monkeypatch.setattr(kimi_k3, "_gpu_preprocess_images", gpu_oom)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+
+    features, _, _, grids = kimi_k3.KimiK3GPUProcessorWrapper.prepare_image_features(
+        fake, images
+    )
+
+    assert cpu_calls == [2]
+    assert len(features) == len(grids) == 2
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

@@ -263,6 +263,15 @@ def _resize_images_by_source_shape(
     return [resized_by_index[index] for index, _ in indexed_images]
 
 
+_GPU_PREPROCESS_CHUNK_BYTES = 512 * 1024 * 1024
+
+
+def _byte_bounded_chunks(group: list, pixels_per_item: int) -> list[list]:
+    """Split a size group so each chunk's fp32 RGBA pixels fit the budget."""
+    step = max(1, _GPU_PREPROCESS_CHUNK_BYTES // max(1, 4 * 4 * pixels_per_item))
+    return [group[i : i + step] for i in range(0, len(group), step)]
+
+
 def _gpu_preprocess_images(
     images: list[Union[torch.Tensor, Image.Image]],
     resize_configs: list[dict],
@@ -310,35 +319,40 @@ def _gpu_preprocess_images(
             all_patches[idx] = patches
             all_grids[idx] = _grid_thw_from_resize_config(config, patch_size)
         else:
-            indexed_images = [(idx, to_chw(image)) for idx, image, _ in group]
+            # Bound the transient fp32 working set so a many-image request
+            # cannot exhaust the GPU that also holds weights and KV cache.
+            for sub_group in _byte_bounded_chunks(group, padded_h * padded_w):
+                indexed_images = [(idx, to_chw(image)) for idx, image, _ in sub_group]
 
-            # One NaViT target group can include several original resolutions.
-            # Batch only source-compatible images, which removes redundant
-            # bicubic launches for common multi-image requests without padding
-            # random-size inputs to a larger source resolution.
-            resized = _resize_images_by_source_shape(indexed_images, target_h, target_w)
-            if post_resize is not None:
-                # Before the concat: a hook may change the channel count (K3
-                # composites RGBA onto a background and returns RGB), and mixed
-                # 3/4-channel sources cannot be concatenated first.
-                resized = [post_resize(part) for part in resized]
-            batch = torch.cat(resized, dim=0)
+                # One NaViT target group can include several original resolutions.
+                # Batch only source-compatible images, which removes redundant
+                # bicubic launches for common multi-image requests without padding
+                # random-size inputs to a larger source resolution.
+                resized = _resize_images_by_source_shape(
+                    indexed_images, target_h, target_w
+                )
+                if post_resize is not None:
+                    # Before the concat: a hook may change the channel count (K3
+                    # composites RGBA onto a background and returns RGB), and mixed
+                    # 3/4-channel sources cannot be concatenated first.
+                    resized = [post_resize(part) for part in resized]
+                batch = torch.cat(resized, dim=0)
 
-            T = 1
-            gh, gw = padded_h // patch_size, padded_w // patch_size
-            batch = normalize_and_patchify(
-                batch,
-                image_scale,
-                image_bias,
-                patch_size,
-                padded_h,
-                padded_w,
-            )
+                T = 1
+                gh, gw = padded_h // patch_size, padded_w // patch_size
+                batch = normalize_and_patchify(
+                    batch,
+                    image_scale,
+                    image_bias,
+                    patch_size,
+                    padded_h,
+                    padded_w,
+                )
 
-            grid = (T, gh, gw)
-            for i, (idx, _, _) in enumerate(group):
-                all_patches[idx] = batch[i]
-                all_grids[idx] = grid
+                grid = (T, gh, gw)
+                for i, (idx, _, _) in enumerate(sub_group):
+                    all_patches[idx] = batch[i]
+                    all_grids[idx] = grid
 
     pixel_values = torch.cat(all_patches, dim=0)
     grid_thws = torch.tensor(all_grids, dtype=torch.int64)
