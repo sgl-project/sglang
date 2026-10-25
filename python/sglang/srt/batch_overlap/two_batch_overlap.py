@@ -400,7 +400,6 @@ class TboDPAttentionPreparer:
         self,
         local_batch: ScheduleBatch,
     ):
-
         deepep_mode = get_deepep_mode()
         enable_a2a_moe = not get_moe_a2a_backend().is_none()
         enable_two_batch_overlap = is_tbo_enabled()
@@ -774,6 +773,7 @@ class TboForwardBatchPreparer:
             "dp_prefill_cuda_graph_max_prefix_len",
             "dp_padding_mode",
             "global_forward_mode",
+            "global_moe_forward_phase",
             "is_prefill_only",
             "contains_last_prefill_chunk",
             "spec_algorithm",

@@ -108,6 +108,8 @@ def cutedsl_quant_scale_to_scalar(
 
 def resolve_cutedsl_standard_scales(
     layer: torch.nn.Module,
+    quant_mode: str = "w4a4",
+    use_per_token_activation: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Resolve standard-path CuteDSL scales (baseline: scalar fc2/w13 input scales).
 
@@ -214,6 +216,18 @@ def resolve_cutedsl_standard_scales(
         w2_weight_scale_2 = layer.g2_alphas.to(torch.float32) * w2_q_for_w2
         return w2_weight_scale_2 / fc2_scalar
 
+    if quant_mode == "w4a16" or use_per_token_activation:
+        # W4A16 bypasses activation quantization; per-token W4A4 computes
+        # activation scales at runtime. Both need weight-only decode scales,
+        # independent from calibrated scales retained for the other phase.
+        unit = torch.ones(1, device=layer.g1_alphas.device, dtype=torch.float32)
+        return (
+            _resolve_w1_alpha_from_scalar_input_scale(unit),
+            unit.clone(),
+            _resolve_w2_alpha_from_scalar_fc2_input_scale(unit),
+            unit,
+        )
+
     fc2_input_scale = cutedsl_quant_scale_to_scalar(
         layer.w2_input_scale_quant,
         name="w2_input_scale_quant",
@@ -254,13 +268,40 @@ def _make_per_token_global_scale(input_tensor: torch.Tensor) -> torch.Tensor:
 def refresh_cutedsl_standard_scales_for_weight_update(
     layer: torch.nn.Module,
 ) -> None:
+    states = getattr(layer, "_cutedsl_states", None)
+    if states:
+        selected = layer._cutedsl_state_key
+        for key, state in states.items():
+            layer._cutedsl_state_key = key
+            (
+                layer._cutedsl_wrapper,
+                layer._cutedsl_scales,
+                layer._cutedsl_input_scale,
+            ) = state
+            _refresh_cutedsl_standard_scales(layer)
+        layer._cutedsl_wrapper, layer._cutedsl_scales, layer._cutedsl_input_scale = (
+            states[selected]
+        )
+        layer._cutedsl_state_key = selected
+    else:
+        _refresh_cutedsl_standard_scales(layer)
+
+
+def _refresh_cutedsl_standard_scales(layer: torch.nn.Module) -> None:
+    use_per_token = getattr(
+        layer,
+        "_cutedsl_state_key",
+        (
+            layer._cutedsl_wrapper.quant_mode,
+            layer.quant_config.use_per_token_activation,
+        ),
+    )[1]
     w1_alpha, fc2_input_scale, w2_alpha, used_input_scale = (
-        resolve_cutedsl_standard_scales(layer)
+        resolve_cutedsl_standard_scales(
+            layer, layer._cutedsl_wrapper.quant_mode, use_per_token
+        )
     )
-    if (
-        layer.quant_config.use_per_token_activation
-        and layer._cutedsl_wrapper.quant_mode == "w4a4"
-    ):
+    if use_per_token and layer._cutedsl_wrapper.quant_mode == "w4a4":
         used_input_scale = _make_per_token_global_scale(used_input_scale)
 
     new_scales = (w1_alpha, fc2_input_scale, w2_alpha)
@@ -300,6 +341,50 @@ def refresh_cutedsl_standard_scales_for_weight_update(
 
 
 def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
+    from sglang.srt.layers.moe.phase import (
+        is_w4a16_enabled,
+        use_nvfp4_per_token_activation,
+        w4a16_setting_for_layer,
+    )
+
+    quant_mode = "w4a16" if is_w4a16_enabled() else "w4a4"
+    use_per_token = quant_mode == "w4a4" and use_nvfp4_per_token_activation(
+        layer.quant_config
+    )
+    selected = (quant_mode, use_per_token)
+    states = getattr(layer, "_cutedsl_states", None)
+    if states is None:
+        states = layer._cutedsl_states = {}
+        setting = w4a16_setting_for_layer(layer)
+        phases = (getattr(layer, "_moe_forward_phase", None),)
+        if phases == (None,):
+            phases = ("prefill", "decode")
+        modes = dict.fromkeys(
+            (
+                "w4a16" if setting is True or setting == phase else "w4a4",
+                not (setting is True or setting == phase)
+                and use_nvfp4_per_token_activation(layer.quant_config, phase),
+            )
+            for phase in phases
+        )
+        # Build both workspaces before either phase can be graph-captured.
+        for mode, per_token in modes:
+            layer._cutedsl_wrapper = None
+            _initialize_cutedsl_wrapper(layer, mode, per_token)
+            states[mode, per_token] = (
+                layer._cutedsl_wrapper,
+                layer._cutedsl_scales,
+                layer._cutedsl_input_scale,
+            )
+    layer._cutedsl_state_key = selected
+    layer._cutedsl_wrapper, layer._cutedsl_scales, layer._cutedsl_input_scale = states[
+        selected
+    ]
+
+
+def _initialize_cutedsl_wrapper(
+    layer: torch.nn.Module, quant_mode: str, use_per_token: bool
+) -> None:
     """Lazily create CuteDslMoEWrapper and resolve scales on first forward.
 
     The wrapper is created lazily (not in __init__ / create_weights) because
@@ -321,8 +406,6 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
             "flashinfer_cutedsl backend requires FlashInfer with CuteDSL support. "
             "Install with: pip install flashinfer"
         ) from e
-
-    quant_mode = "w4a16" if envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get() else "w4a4"
 
     assert layer.intermediate_size_per_partition > 0, (
         f"CuteDSL MoE: intermediate_size_per_partition must be > 0, "
@@ -369,9 +452,9 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
         )
 
         w1_alpha, fc2_input_scale, w2_alpha, used_input_scale = (
-            resolve_cutedsl_standard_scales(layer)
+            resolve_cutedsl_standard_scales(layer, quant_mode, use_per_token)
         )
-        if layer.quant_config.use_per_token_activation and quant_mode == "w4a4":
+        if use_per_token:
             used_input_scale = _make_per_token_global_scale(used_input_scale)
     layer._cutedsl_scales = (w1_alpha, fc2_input_scale, w2_alpha)
     layer._cutedsl_input_scale = used_input_scale

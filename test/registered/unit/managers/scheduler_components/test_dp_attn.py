@@ -98,6 +98,7 @@ class TestDPBalanceStats(CustomTestCase):
         reqs: Optional[list] = None,
         peer_attention_pairs: Optional[int] = None,
         peer_health_check: bool = False,
+        peer_forward_mode: Optional[ForwardMode] = None,
         get_idle_batch=None,
         sync_wait_carry=None,
         wait_seconds=None,
@@ -110,6 +111,12 @@ class TestDPBalanceStats(CustomTestCase):
         batch = SimpleNamespace(
             forward_mode=forward_mode,
             batch_size=lambda: local_tokens,
+            extend_num_tokens=local_tokens,
+            encoder_swa_reset=None,
+            extend_logprob_start_lens=[0] * local_tokens,
+            extend_lens=[1] * local_tokens,
+            prefix_lens=[0] * local_tokens,
+            return_logprob=False,
             spec_info=None,
             reqs=list(reqs),
             # Spec batches carry no CPU seq_lens at schedule time.
@@ -125,6 +132,9 @@ class TestDPBalanceStats(CustomTestCase):
             peer = local.clone()
             peer[0] = peer[1] = peer_tokens  # num_tokens, num_tokens_for_logprob
             peer[9] = int(peer_health_check)
+            if peer_forward_mode is not None:
+                peer[5] = peer_forward_mode.value
+                peer[3] = int(peer_forward_mode.is_extend())
             # attention_pairs; one-token rows unless the test says otherwise.
             peer[10] = (
                 peer_tokens if peer_attention_pairs is None else peer_attention_pairs
@@ -180,6 +190,24 @@ class TestDPBalanceStats(CustomTestCase):
                 offload_tags=set(),
                 sync_wait_carry=sync_wait_carry,
             )
+
+    def test_moe_phase_uses_global_prompt_presence(self):
+        for local_mode, peer_mode, expected in (
+            (ForwardMode.DECODE, ForwardMode.EXTEND, "prefill"),
+            (ForwardMode.IDLE, ForwardMode.EXTEND, "prefill"),
+            (ForwardMode.TARGET_VERIFY, ForwardMode.EXTEND, "prefill"),
+            (ForwardMode.IDLE, ForwardMode.TARGET_VERIFY, "decode"),
+            (ForwardMode.DECODE, ForwardMode.TARGET_VERIFY, "decode"),
+            (ForwardMode.TARGET_VERIFY, ForwardMode.TARGET_VERIFY, "decode"),
+        ):
+            with self.subTest(local_mode=local_mode, peer_mode=peer_mode):
+                result = self._prepare_dp2_batch(
+                    local_mode,
+                    local_tokens=1,
+                    peer_tokens=4,
+                    peer_forward_mode=peer_mode,
+                )
+                self.assertEqual(result.global_moe_forward_phase, expected)
 
     def test_attached_to_batch_after_dp_gather(self):
         result = self._prepare_dp2_batch(

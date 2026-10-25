@@ -11,9 +11,11 @@ from unittest import mock
 import torch
 from flashinfer import fp4_quantize
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.quantization import fp4_utils
 from sglang.srt.layers.quantization.fp4_utils import Fp4GemmRunnerBackend
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
+from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.utils import get_device_sm
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.layer_ut_utils import (
@@ -159,6 +161,44 @@ class TestNvFp4LinearBackends(CustomTestCase):
 
     def test_flashinfer_cutedsl(self):
         self._run_backend("flashinfer_cutedsl")
+
+    def test_phase_specific_cutedsl_matches_global_modes_and_cuda_graphs(self):
+        x = torch.randn((16, 512), device="cuda", dtype=torch.bfloat16) / 10
+        setting = envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16
+        with mock.patch.object(
+            fp4_utils,
+            "FP4_GEMM_RUNNER_BACKEND",
+            Fp4GemmRunnerBackend("flashinfer_cutedsl"),
+        ):
+            controls = {}
+            for enabled in (False, True):
+                with setting.override(enabled):
+                    torch.manual_seed(7)
+                    control, _ = _make_quantized_layer(256, 512)
+                    control.quant_method.process_weights_after_loading(control)
+                    controls[enabled] = control(x)[0].clone()
+            for enabled_phase in ("prefill", "decode"):
+                with (
+                    self.subTest(enabled_phase=enabled_phase),
+                    setting.override(enabled_phase),
+                ):
+                    torch.manual_seed(7)
+                    layer, _ = _make_quantized_layer(256, 512)
+                    layer.quant_method.process_weights_after_loading(layer)
+                    for phase in ("prefill", "decode", "prefill"):
+                        with forward_context(
+                            ForwardContext(attn_backend=None, moe_forward_phase=phase)
+                        ):
+                            out, _ = layer(x)
+                            expected = controls[phase == enabled_phase]
+                            torch.testing.assert_close(out, expected, rtol=0, atol=0)
+                            graph = torch.cuda.CUDAGraph()
+                            with torch.cuda.graph(graph):
+                                captured, _ = layer(x)
+                            graph.replay()
+                            torch.testing.assert_close(
+                                captured, expected, rtol=0, atol=0
+                            )
 
     def test_flashinfer_cutlass(self):
         self._run_backend("flashinfer_cutlass")

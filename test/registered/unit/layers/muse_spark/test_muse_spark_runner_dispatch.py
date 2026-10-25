@@ -32,6 +32,45 @@ class _CpuMoeAlltoAll:
 
 
 class TestMuseSparkRunnerDispatch(CustomTestCase):
+    def test_custom_nvfp4_rejects_phase_precision_but_preserves_booleans(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.layers.muse_spark.muse_spark_nvfp4_moe import (
+            MuseSparkNvFp4FusedMoEMethod,
+        )
+
+        per_token = envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION
+        w4a16 = envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16
+        with (
+            per_token.override(False),
+            w4a16.override(False),
+            patch.object(
+                modelopt_quant.ModelOptNvFp4FusedMoEMethod,
+                "__init__",
+                return_value=None,
+            ) as parent_init,
+        ):
+            for field in (per_token, w4a16):
+                for phase in ("prefill", "decode"):
+                    with (
+                        self.subTest(field=field.name, phase=phase),
+                        field.override(phase),
+                    ):
+                        config = ModelOptFp4Config(is_checkpoint_nvfp4_serialized=True)
+                        with self.assertRaisesRegex(
+                            ValueError, "Muse Spark.*phase-specific"
+                        ):
+                            MuseSparkNvFp4FusedMoEMethod(config)
+                        parent_init.assert_not_called()
+            for value in (False, True, "all"):
+                with (
+                    self.subTest(value=value),
+                    per_token.override(value),
+                    w4a16.override(value),
+                ):
+                    config = ModelOptFp4Config(is_checkpoint_nvfp4_serialized=True)
+                    MuseSparkNvFp4FusedMoEMethod(config)
+                    parent_init.assert_called_with(config)
+
     def test_custom_expert_config_selects_trtllm_receive_sentinel(self):
         """Unoccupied SP receive slots must use the direct TRT-LLM consumer's
         sentinel even though these experts do not construct a generic runner.

@@ -373,6 +373,10 @@ class FusedMoE(torch.nn.Module):
         self.layer_name = prefix
         self.layer_id = layer_id
         self.is_draft = get_flags().moe.in_speculative_scope
+        from sglang.srt.layers.moe.phase_backend import has_phase_moe_backends
+
+        if not self.is_draft and has_phase_moe_backends():
+            self._moe_forward_phase = "prefill"
         self.uses_expert_location = uses_expert_location and not self.is_draft
         self.top_k = top_k
         self.hidden_size = hidden_size
@@ -616,6 +620,10 @@ class FusedMoE(torch.nn.Module):
         self._dwdp_bound = False
 
         self.runner = self.quant_method.runner
+
+        from sglang.srt.layers.moe.phase_backend import configure_phase_moe_layer
+
+        configure_phase_moe_layer(self)
 
     def _set_runner_flags(self) -> None:
         backend = self.runner_backend
@@ -1611,6 +1619,19 @@ class FusedMoE(torch.nn.Module):
         topk_output: TopKOutput,
         pre_quant_input: Optional[Tuple] = None,
     ):
+        if getattr(self, "_phase_moe_backends", None):
+            from sglang.srt.layers.moe.phase_backend import (
+                moe_backend_scope,
+                phase_moe_layer,
+            )
+
+            view = phase_moe_layer(self)
+            if view is not self:
+                with moe_backend_scope(view.runner_backend):
+                    return view.forward_impl(
+                        hidden_states, topk_output, pre_quant_input
+                    )
+
         origin_hidden_states_dim = hidden_states.shape[-1]
         assert self.quant_method is not None
 

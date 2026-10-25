@@ -819,6 +819,27 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
 
         self.assertFalse(config.use_per_token_activation)
 
+    def test_nvfp4_per_token_phase_config_for_serialized_and_online_weights(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.layers.moe.phase import use_nvfp4_per_token_activation
+        from sglang.srt.layers.quantization.nvfp4_online import NvFp4OnlineConfig
+
+        field = envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION
+        for value in (True, False, "prefill", "decode"):
+            with self.subTest(value=value), field.override(value):
+                configs = (
+                    ModelOptFp4Config(is_checkpoint_nvfp4_serialized=True),
+                    NvFp4OnlineConfig(),
+                )
+                for config in configs:
+                    for phase in ("prefill", "decode"):
+                        self.assertEqual(
+                            use_nvfp4_per_token_activation(config, phase),
+                            value is True or value == phase,
+                        )
+        with patch.object(field, "is_set", return_value=False):
+            self.assertTrue(NvFp4OnlineConfig().use_per_token_activation)
+
     def test_lm_head_guard_accepts_modelopt_fp4_marlin_runtime_state(self):
         lm_head = nn.Module()
         lm_head.weight = nn.Parameter(
@@ -859,6 +880,24 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
                 lm_head, ModelOptFp4LinearMethod(ModelOptFp4Config())
             )
         )
+
+    def test_lm_head_guard_requires_both_phase_runtime_states(self):
+        lm_head = nn.Module()
+        lm_head.weight = nn.Parameter(
+            torch.empty(128, 1024, dtype=torch.uint8), requires_grad=False
+        )
+        lm_head.weight_scale_interleaved = nn.Parameter(torch.empty(1))
+        lm_head.alpha = nn.Parameter(torch.empty(1))
+        lm_head.input_scale_inv = nn.Parameter(torch.empty(1))
+        lm_head.input_size_per_partition = 2048
+        lm_head.output_size_per_partition = 128
+        quant_method = ModelOptFp4LinearMethod(ModelOptFp4Config())
+        quant_method.quant_mode = "phase"
+        self.assertFalse(should_apply_lm_head_quant_method(lm_head, quant_method))
+        lm_head._w4a16_weight = lm_head.weight
+        lm_head._w4a16_weight_scale_interleaved = lm_head.weight_scale_interleaved
+        lm_head._w4a16_alpha = lm_head.alpha
+        self.assertTrue(should_apply_lm_head_quant_method(lm_head, quant_method))
 
     def test_lm_head_guard_rejects_stale_modelopt_fp4_attrs_on_dense_head(self):
         lm_head = nn.Module()

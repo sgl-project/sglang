@@ -99,6 +99,52 @@ class TestEnvField(unittest.TestCase):
         self.assertIn("Invalid value", str(caught[0].message))
 
 
+class TestEnvBoolOrPhase(unittest.TestCase):
+    def test_per_token_flag_uses_the_same_phase_contract(self):
+        field = envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION
+        for value in ("true", "1", "prefill", "decode", "false", "0"):
+            with self.subTest(value=value), field.override(value):
+                for phase in ("prefill", "decode"):
+                    self.assertEqual(
+                        field.enabled_for(phase), value in ("true", "1", phase)
+                    )
+
+    def test_boolean_spellings_keep_global_semantics(self):
+        field = envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16
+        for value in ("true", "1", "yes", "y", "all", "TRUE", True):
+            with self.subTest(value=value), field.override(value):
+                self.assertTrue(field.enabled_for_all())
+                self.assertTrue(field.enabled_for("prefill"))
+                self.assertTrue(field.enabled_for("decode"))
+        for value in ("false", "0", "no", "n", False):
+            with self.subTest(value=value), field.override(value):
+                self.assertFalse(field.enabled_for_any())
+                self.assertFalse(field.enabled_for("prefill"))
+                self.assertFalse(field.enabled_for("decode"))
+
+    def test_phase_selection(self):
+        field = envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16
+        for phase in ("prefill", "decode"):
+            with self.subTest(phase=phase), field.override(phase.upper()):
+                self.assertTrue(field.enabled_for_any())
+                self.assertFalse(field.enabled_for_all())
+                self.assertTrue(field.enabled_for(phase))
+                other = "decode" if phase == "prefill" else "prefill"
+                self.assertFalse(field.enabled_for(other))
+
+    def test_invalid_values_are_not_truthy_opt_ins(self):
+        field = envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16
+        with (
+            field.override("invalid-phase"),
+            self.assertWarnsRegex(
+                UserWarning, 'must be a boolean, "all", "prefill", or "decode"'
+            ),
+        ):
+            self.assertFalse(field.enabled_for_any())
+        with self.assertRaisesRegex(ValueError, "Unknown inference phase"):
+            field.enabled_for("extend")
+
+
 class TestDeprecatedEnvRegistry(unittest.TestCase):
     def _apply(self, old_name, deprecation):
         with warnings.catch_warnings(record=True) as caught:

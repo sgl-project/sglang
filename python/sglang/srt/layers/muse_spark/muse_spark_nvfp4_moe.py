@@ -6,6 +6,7 @@ from typing import cast
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptNvFp4FusedMoEMethod,
     _compute_gemm1_alphas,
@@ -83,6 +84,20 @@ def _align_fp4_moe_weights_for_flashinfer_trtllm(layer) -> None:
 
 class MuseSparkNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
     """Prepare Muse FP4 experts without process-global mutation or duplication."""
+
+    def __init__(self, quant_config):
+        if getattr(
+            quant_config, "per_token_activation_phase", None
+        ) is not None or isinstance(
+            envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get(), str
+        ):
+            raise ValueError(
+                "Muse Spark custom NVFP4 experts do not support phase-specific "
+                "SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION or "
+                "SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16 settings. "
+                "Use boolean settings for this model."
+            )
+        super().__init__(quant_config)
 
     def create_weights(
         self,

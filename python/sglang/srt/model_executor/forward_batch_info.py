@@ -292,6 +292,10 @@ class ForwardMode(IntEnum):
     def is_extend_without_speculative(self):
         return self.is_extend() and not self.is_target_verify()
 
+    def is_moe_prefill(self):
+        """Prompt work uses prefill MoE; speculative verification uses decode."""
+        return self.is_extend_without_speculative()
+
     def is_prebuilt(self):
         return self == ForwardMode.PREBUILT
 
@@ -585,6 +589,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     can_run_dp_prefill_cuda_graph: bool = False
     dp_prefill_cuda_graph_max_prefix_len: int = 0
     global_forward_mode: Optional[ForwardMode] = None
+    # The MLP sees tokens from every attention-DP rank. Unlike the TBO-only
+    # global_forward_mode, this is populated for every scheduler gather.
+    global_moe_forward_phase: Optional[str] = None
 
     # Current layer-stack invocation; each TBO child owns a separate stream.
     residual_stream: Optional[ResidualStream] = None
@@ -1080,6 +1087,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             can_run_dp_prefill_cuda_graph=batch.can_run_dp_prefill_cuda_graph,
             dp_prefill_cuda_graph_max_prefix_len=batch.dp_prefill_cuda_graph_max_prefix_len,
             global_forward_mode=batch.global_forward_mode,
+            global_moe_forward_phase=getattr(batch, "global_moe_forward_phase", None),
             is_prefill_only=batch.is_prefill_only,
             contains_last_prefill_chunk=contains_last_prefill_chunk,
             spec_algorithm=batch.spec_algorithm,

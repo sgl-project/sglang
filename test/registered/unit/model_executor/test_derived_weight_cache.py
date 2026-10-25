@@ -22,6 +22,36 @@ class TestDerivedWeightCache(unittest.TestCase):
             torch.nn.Sequential(torch.nn.Module()),
         )
         model[1][0]._derived_weight_cache_error = "derived scales require restart"
+        self.assert_update_preserves_weights(model, "derived scales require restart")
+
+    def test_phase_moe_rejects_updates_before_overwriting_captured_weights(self):
+        from sglang.srt.layers.moe import phase_backend
+        from sglang.srt.layers.quantization.modelopt_quant import (
+            ModelOptNvFp4FusedMoEMethod,
+        )
+
+        model = torch.nn.Sequential(torch.nn.Linear(2, 2, bias=False, device="cpu"))
+        layer = model[0]
+        layer.is_draft = False
+        layer.quant_method = object.__new__(ModelOptNvFp4FusedMoEMethod)
+        with (
+            patch.object(phase_backend, "has_phase_moe_backends", return_value=True),
+            patch.object(
+                phase_backend,
+                "get_exec",
+                return_value=SimpleNamespace(
+                    moe=SimpleNamespace(
+                        moe_prefill_runner_backend="flashinfer_cutedsl",
+                        moe_decode_runner_backend="flashinfer_megamoe",
+                    )
+                ),
+            ),
+        ):
+            phase_backend.configure_phase_moe_layer(layer)
+        self.assertIn("prefill/decode MoE runners", layer._derived_weight_cache_error)
+        self.assert_update_preserves_weights(model, layer._derived_weight_cache_error)
+
+    def assert_update_preserves_weights(self, model, error):
         original = model[0].weight.detach().clone()
         updater = WeightUpdater(
             tp_rank=0,
@@ -42,7 +72,7 @@ class TestDerivedWeightCache(unittest.TestCase):
                 updater.update_weights_from_tensor(
                     [("0.weight", torch.zeros_like(original))], load_format="direct"
                 ),
-                (False, "derived scales require restart"),
+                (False, error),
             )
         self.assertTrue(torch.equal(model[0].weight, original))
 

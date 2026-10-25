@@ -133,6 +133,38 @@ def _method_set_up_for(backend: MoeRunnerBackend) -> ModelOptNvFp4FusedMoEMethod
 
 
 class TestNvFp4MoeDispatch(CustomTestCase):
+    def test_online_activation_scale_fallback_is_initialized_for_each_setting(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.layers.quantization.nvfp4_online import NvFp4OnlineConfig
+
+        for setting in (False, True, "prefill", "decode"):
+            with (
+                self.subTest(setting=setting),
+                envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.override(setting),
+                _live_backend(MoeRunnerBackend.FLASHINFER_TRTLLM),
+            ):
+                method = _method_set_up_for(MoeRunnerBackend.FLASHINFER_TRTLLM)
+                method.quant_config = NvFp4OnlineConfig()
+                layer = torch.nn.Module()
+                layer.num_local_experts = layer.num_experts = NUM_EXPERTS
+                layer.moe_runner_config = method.moe_runner_config
+                method.create_weights(
+                    layer,
+                    NUM_EXPERTS,
+                    HIDDEN,
+                    INTERMEDIATE,
+                    torch.bfloat16,
+                    weight_loader=lambda *args, **kwargs: None,
+                )
+                torch.testing.assert_close(
+                    layer.w13_input_scale,
+                    torch.ones(NUM_EXPERTS, 2),
+                )
+                torch.testing.assert_close(
+                    layer.w2_input_scale,
+                    torch.ones(NUM_EXPERTS),
+                )
+
     def test_routed_trtllm_takes_the_trtllm_path(self):
         for backend in (
             MoeRunnerBackend.FLASHINFER_TRTLLM_ROUTED,
@@ -388,6 +420,105 @@ class TestNvFp4MoeDispatch(CustomTestCase):
 
         self.assertIn("g1_scale_c", str(ctx.exception))
         self.assertEqual(method.runner.calls, [])
+
+
+class TestNvFp4CuteDslPhaseState(CustomTestCase):
+    def test_phase_switch_and_reload_keep_distinct_scales_and_workspaces(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.layers.moe.moe_runner import flashinfer_cutedsl as cutedsl
+        from sglang.srt.model_executor.forward_context import (
+            ForwardContext,
+            forward_context,
+        )
+
+        wrappers = []
+
+        class Wrapper:
+            def __init__(self, **kwargs):
+                self.quant_mode = kwargs["quant_mode"]
+                wrappers.append(self)
+
+        flashinfer = ModuleType("flashinfer")
+        flashinfer.CuteDslMoEWrapper = Wrapper
+        flashinfer.ActivationType = SimpleNamespace(Swiglu="swiglu", Relu2="relu2")
+        layer = SimpleNamespace(
+            _cutedsl_wrapper=None,
+            num_experts=2,
+            num_local_experts=2,
+            moe_ep_rank=0,
+            top_k=1,
+            hidden_size=128,
+            intermediate_size_per_partition=128,
+            moe_runner_config=SimpleNamespace(
+                activation="silu", params_dtype=torch.bfloat16
+            ),
+            quant_config=SimpleNamespace(use_per_token_activation=False),
+            w13_weight=torch.zeros(2, 256, 64, dtype=torch.uint8),
+            g1_alphas=torch.tensor([1.0, 2.0]),
+            g2_alphas=torch.tensor([3.0, 4.0]),
+            w13_weight_scale_2=torch.tensor([2.0, 4.0]),
+            w2_weight_scale_2=torch.tensor([12.0, 16.0]),
+            w13_input_scale_quant=torch.tensor([2.0, 2.0]),
+            w2_input_scale_quant=torch.tensor([4.0, 4.0]),
+        )
+        with (
+            envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.override("decode"),
+            mock.patch.dict(sys.modules, {"flashinfer": flashinfer}),
+            mock.patch.object(cutedsl, "cuda_graph_fully_disabled", return_value=True),
+            mock.patch.object(
+                cutedsl, "get_parallel", return_value=SimpleNamespace(num_dp_ranks=1)
+            ),
+            mock.patch.object(cutedsl, "cutedsl_moe_max_num_tokens", return_value=16),
+        ):
+            for phase in ("prefill", "decode", "prefill"):
+                with forward_context(
+                    ForwardContext(attn_backend=None, moe_forward_phase=phase)
+                ):
+                    cutedsl.ensure_cutedsl_wrapper(layer)
+                    self.assertEqual(
+                        layer._cutedsl_wrapper.quant_mode,
+                        "w4a16" if phase == "decode" else "w4a4",
+                    )
+            self.assertEqual(len(wrappers), 2)
+            self.assertIsNot(wrappers[0], wrappers[1])
+            states = layer._cutedsl_states
+            torch.testing.assert_close(
+                states["w4a4", False][1][0], torch.tensor([1.0, 2.0])
+            )
+            torch.testing.assert_close(
+                states["w4a16", False][1][0], torch.tensor([2.0, 4.0])
+            )
+            torch.testing.assert_close(
+                states["w4a4", False][1][2], torch.tensor([3.0, 4.0])
+            )
+            torch.testing.assert_close(
+                states["w4a16", False][1][2], torch.tensor([12.0, 16.0])
+            )
+            pointers = {
+                mode: [tensor.data_ptr() for tensor in (*scales, input_scale)]
+                for mode, (_, scales, input_scale) in states.items()
+            }
+            layer.w13_weight_scale_2.mul_(2)
+            layer.w2_weight_scale_2.mul_(2)
+            cutedsl.refresh_cutedsl_standard_scales_for_weight_update(layer)
+            self.assertEqual(layer._cutedsl_wrapper.quant_mode, "w4a4")
+            for mode, (_, scales, input_scale) in states.items():
+                self.assertEqual(
+                    [tensor.data_ptr() for tensor in (*scales, input_scale)],
+                    pointers[mode],
+                )
+            torch.testing.assert_close(
+                states["w4a4", False][1][0], torch.tensor([2.0, 4.0])
+            )
+            torch.testing.assert_close(
+                states["w4a16", False][1][0], torch.tensor([4.0, 8.0])
+            )
+            torch.testing.assert_close(
+                states["w4a4", False][1][2], torch.tensor([6.0, 8.0])
+            )
+            torch.testing.assert_close(
+                states["w4a16", False][1][2], torch.tensor([24.0, 32.0])
+            )
 
 
 if __name__ == "__main__":

@@ -325,6 +325,7 @@ class ModelOptQuantConfig(QuantizationConfig):
         self.exclude_modules = exclude_modules or []
         self.kv_cache_quant_algo = kv_cache_quant_algo
         self.use_per_token_activation = False
+        self.per_token_activation_phase = None
 
     def _get_quant_method(
         self,
@@ -1514,10 +1515,14 @@ class ModelOptFp4Config(ModelOptQuantConfig):
                 )
             self.use_per_token_activation = False
         else:
-            self.use_per_token_activation = (
+            per_token_activation = (
                 envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.get()
                 if use_per_token_activation is None
                 else use_per_token_activation
+            )
+            self.use_per_token_activation = bool(per_token_activation)
+            self.per_token_activation_phase = (
+                per_token_activation if isinstance(per_token_activation, str) else None
             )
 
     @classmethod
@@ -1784,12 +1789,10 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
 
     def __init__(self, quant_config: ModelOptFp4Config):
         self.quant_config = quant_config
+        w4a16 = envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()
         self.quant_mode = (
-            "w4a16"
-            if (
-                envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()
-                and get_fp4_gemm_runner_backend().is_flashinfer_cutedsl()
-            )
+            ("w4a16" if w4a16 is True else "phase")
+            if w4a16 and get_fp4_gemm_runner_backend().is_flashinfer_cutedsl()
             else "w4a4"
         )
 
@@ -1887,19 +1890,24 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         input_scale_2 = layer.input_scale.max().to(torch.float32)
         weight_scale_2 = layer.weight_scale_2.max().to(torch.float32)
 
-        if self.quant_mode == "w4a16":
+        if self.quant_mode in ("w4a16", "phase"):
             from flashinfer import prepare_bf16_fp4_weights
 
             weight, weight_scale, alpha = prepare_bf16_fp4_weights(
-                layer.weight,
+                # The W4A4 path may rewrite its canonical weight allocation.
+                layer.weight.clone() if self.quant_mode == "phase" else layer.weight,
                 swizzle_blockscale(layer.weight_scale),
                 weight_scale_2.reshape(1),
                 backend=get_fp4_gemm_runner_backend().get_flashinfer_backend(),
             )
-            copy_or_rebind_param(layer, "weight", weight)
-            copy_or_rebind_param(layer, "weight_scale_interleaved", weight_scale)
-            copy_or_rebind_param(layer, "alpha", alpha)
-            return
+            prefix = "_w4a16_" if self.quant_mode == "phase" else ""
+            copy_or_rebind_param(layer, f"{prefix}weight", weight)
+            copy_or_rebind_param(
+                layer, f"{prefix}weight_scale_interleaved", weight_scale
+            )
+            copy_or_rebind_param(layer, f"{prefix}alpha", alpha)
+            if self.quant_mode == "w4a16":
+                return
         elif self.quant_mode != "w4a4":
             raise ValueError(f"Unsupported FP4 GEMM quant mode: {self.quant_mode}")
 
@@ -2091,7 +2099,13 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
                 bias=bias,
             )
 
-        if self.quant_mode == "w4a4":
+        quant_mode = self.quant_mode
+        if quant_mode == "phase":
+            from sglang.srt.layers.moe.phase import is_w4a16_enabled
+
+            quant_mode = "w4a16" if is_w4a16_enabled() else "w4a4"
+
+        if quant_mode == "w4a4":
             # `_accepts_prequantized_fp4` is the explicit opt-in so an accidental
             # tuple from unrelated code can't silently bypass quantization.
             if getattr(layer, "_accepts_prequantized_fp4", False) and isinstance(
@@ -2143,18 +2157,19 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
             if bias is not None:
                 out = out + bias
             return out.view(*output_shape)
-        elif self.quant_mode == "w4a16":
+        elif quant_mode == "w4a16":
             if self.quant_config.is_awq:
                 x = x * layer.pre_quant_scale
+            prefix = "_w4a16_" if self.quant_mode == "phase" else ""
             out = fp4_gemm(
                 x.reshape(-1, x.shape[-1]),
-                layer.weight,
+                getattr(layer, f"{prefix}weight"),
                 None,
-                layer.weight_scale_interleaved,
-                layer.alpha,
+                getattr(layer, f"{prefix}weight_scale_interleaved"),
+                getattr(layer, f"{prefix}alpha"),
                 torch.bfloat16,
                 layer.output_size_per_partition,
-                self.quant_mode,
+                quant_mode,
             )
             if bias is not None:
                 out = out + bias
@@ -2627,14 +2642,13 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             {"quant_method": FusedMoeWeightScaleSupported.TENSOR.value}
         )
 
-        is_nvfp4_online = self.quant_config.get_name() == "nvfp4_online"
-        # nvfp4_online installs per-token activation scales after loading;
-        # per-tensor paths default to 1.0 here.
-        input_scale_fill = 1.0 if not is_nvfp4_online else None
+        # Source checkpoints used by nvfp4_online have no calibrated NVFP4
+        # activation scales. Initialize the static fallback too: a phase
+        # selector can leave one phase using per-tensor activation quantization.
         w13_input_scale = _make_per_tensor_scale_parameter(
             (layer.num_experts, num_shards),
             weight_loader=weight_loader,
-            fill_value=input_scale_fill,
+            fill_value=1.0,
         )
         w13_input_scale._sglang_require_global_experts = True
         layer.register_parameter("w13_input_scale", w13_input_scale)
@@ -2642,7 +2656,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         w2_input_scale = _make_per_tensor_scale_parameter(
             (layer.num_experts,),
             weight_loader=weight_loader,
-            fill_value=input_scale_fill,
+            fill_value=1.0,
         )
         w2_input_scale._sglang_require_global_experts = True
         layer.register_parameter("w2_input_scale", w2_input_scale)
@@ -2711,6 +2725,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Transform packed FP4 MoE weights and scales for the selected backend."""
+        from sglang.srt.layers.moe.phase_backend import prepare_phase_moe_weights
+
+        if prepare_phase_moe_weights(self, layer):
+            return
         if getattr(layer, "inference_moe_w13_interleaved", False) and not getattr(
             layer, "_w13_deinterleaved", False
         ):
@@ -2809,10 +2827,24 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             w13_input_scale = layer.w13_input_scale.max(dim=-1).values.to(torch.float32)
             w2_input_scale = layer.w2_input_scale
 
+        from sglang.srt.layers.moe.phase import (
+            use_nvfp4_per_token_activation,
+            w4a16_setting_for_layer,
+        )
+
         use_w4a16 = (
             self._is_cutedsl_v2_standard or moe_runner_backend.is_flashinfer_megamoe()
-        ) and envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()
-        if self.quant_config.use_per_token_activation or use_w4a16:
+        ) and w4a16_setting_for_layer(layer) is True
+        use_per_token_all = (
+            self.quant_config.use_per_token_activation
+            and getattr(self.quant_config, "per_token_activation_phase", None) is None
+        )
+        own_phase = getattr(layer, "_moe_forward_phase", None)
+        if own_phase is not None:
+            use_per_token_all = use_nvfp4_per_token_activation(
+                self.quant_config, own_phase
+            )
+        if use_per_token_all or use_w4a16:
             # FlashInfer computes activation scales dynamically per token, so
             # the static checkpoint activation scale is intentionally neutral.
             # CuTe DSL W4A16 keeps activations in BF16, so its GEMM alphas must
@@ -2844,7 +2876,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             "w2_input_scale_quant",
             (1 / w2_input_scale).to(torch.float32),
         )
-
         if layer.moe_runner_config.is_gated and self.enable_flashinfer_trtllm_moe:
             runner_config = layer.moe_runner_config
             is_situ = runner_config.activation == "situ"
@@ -2897,6 +2928,47 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                     else (1.0 / layer.g1_alphas_up).to(torch.float32)
                 )
                 copy_or_rebind_param(layer, "gemm1_beta", gemm1_beta)
+
+        if (
+            self.enable_flashinfer_trtllm_moe
+            and self.quant_config.use_per_token_activation
+            and not use_per_token_all
+            and own_phase is None
+        ):
+            from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+                _compute_g1_scale_c,
+            )
+
+            # Preserve the calibrated static path and derive the dynamic path
+            # after any gate/up rescaling used by custom activations.
+            dynamic_g1 = layer.g1_alphas * layer.w13_input_scale_quant
+            dynamic_up = layer.g1_alphas_up * layer.w13_input_scale_quant
+            copy_or_rebind_param(layer, "_per_token_g1_alphas", dynamic_g1)
+            copy_or_rebind_param(
+                layer,
+                "_per_token_g2_alphas",
+                layer.g2_alphas * layer.w2_input_scale_quant,
+            )
+            copy_or_rebind_param(
+                layer,
+                "_per_token_g1_scale_c",
+                _compute_g1_scale_c(
+                    torch.ones_like(layer.w2_input_scale_quant),
+                    dynamic_g1,
+                    dynamic_up,
+                    layer.moe_runner_config.is_gated,
+                    layer.moe_runner_config.activation,
+                ),
+            )
+            for name in ("gemm1_clamp_limit", "gemm1_beta"):
+                value = getattr(layer, name, None)
+                if value is not None:
+                    dynamic = (
+                        value
+                        if layer.moe_runner_config.activation == "situ"
+                        else value / layer.w13_input_scale_quant
+                    )
+                    copy_or_rebind_param(layer, f"_per_token_{name}", dynamic)
 
         if self.enable_flashinfer_cutlass_moe:
             from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
@@ -3137,6 +3209,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             import sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl  # noqa: F401 – triggers @register_fused_func
 
             layer._cutedsl_wrapper = None
+            layer._cutedsl_states = None
 
         if moe_runner_backend.is_flashinfer_cutlass():
             import sglang.srt.layers.moe.moe_runner.flashinfer_cutlass  # noqa: F401
@@ -3215,14 +3288,22 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 FlashInferMegaMoeQuantInfo,
                 ensure_nvfp4_moe_layer_for_flashinfer_megamoe,
             )
+            from sglang.srt.layers.moe.phase import is_w4a16_enabled
 
-            mega = ensure_nvfp4_moe_layer_for_flashinfer_megamoe(layer)
-            use_w4a16 = envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()
+            use_w4a16 = is_w4a16_enabled()
+            mega = ensure_nvfp4_moe_layer_for_flashinfer_megamoe(
+                layer, use_w4a16=use_w4a16
+            )
+            state = (
+                getattr(layer, "_flashinfer_megamoe_w4a16", layer)
+                if use_w4a16
+                else layer
+            )
             quant_info = FlashInferMegaMoeQuantInfo(
                 mega=mega,
-                mega_forward=layer._flashinfer_megamoe_forward,
-                fc1_alpha=layer.g1_alphas,
-                fc2_alpha=layer.g2_alphas,
+                mega_forward=state._flashinfer_megamoe_forward,
+                fc1_alpha=state.g1_alphas,
+                fc2_alpha=state.g2_alphas,
                 fc1_norm_const=None if use_w4a16 else layer.w2_input_scale_quant,
                 apply_routed_scaling_factor=(
                     not layer.should_fuse_routed_scaling_factor_in_topk
@@ -3242,7 +3323,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
                 FlashInferTrtllmFp4MoeQuantInfo,
             )
+            from sglang.srt.layers.moe.phase import use_nvfp4_per_token_activation
             from sglang.srt.layers.moe.utils import RoutingMethodType
+
+            use_per_token = use_nvfp4_per_token_activation(self.quant_config)
 
             # Determine routing method type based on layer configuration
             routing_method_type = getattr(
@@ -3252,21 +3336,38 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             gemm1_clamp = getattr(layer, "gemm1_clamp_limit", None)
             gemm1_alpha = getattr(layer, "gemm1_alpha", None)
             gemm1_beta = getattr(layer, "gemm1_beta", None)
+            if use_per_token:
+                gemm1_clamp = getattr(
+                    layer, "_per_token_gemm1_clamp_limit", gemm1_clamp
+                )
+                gemm1_beta = getattr(layer, "_per_token_gemm1_beta", gemm1_beta)
             quant_info = FlashInferTrtllmFp4MoeQuantInfo(
                 w13_weight=layer.w13_weight.data,
                 w2_weight=layer.w2_weight.data,
                 w13_weight_scale=layer.w13_weight_scale.data,
                 w2_weight_scale=layer.w2_weight_scale.data,
-                g1_scale_c=layer.g1_scale_c.data,
-                g1_alphas=layer.g1_alphas.data,
-                g2_alphas=layer.g2_alphas.data,
+                g1_scale_c=(
+                    getattr(layer, "_per_token_g1_scale_c", layer.g1_scale_c)
+                    if use_per_token
+                    else layer.g1_scale_c
+                ).data,
+                g1_alphas=(
+                    getattr(layer, "_per_token_g1_alphas", layer.g1_alphas)
+                    if use_per_token
+                    else layer.g1_alphas
+                ).data,
+                g2_alphas=(
+                    getattr(layer, "_per_token_g2_alphas", layer.g2_alphas)
+                    if use_per_token
+                    else layer.g2_alphas
+                ).data,
                 w13_input_scale_quant=layer.w13_input_scale_quant,
                 global_num_experts=layer.num_experts,
                 local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
                 local_num_experts=layer.num_local_experts,
                 intermediate_size_per_partition=layer.intermediate_size_per_partition,
                 routing_method_type=routing_method_type,
-                use_per_token_activation=self.quant_config.use_per_token_activation,
+                use_per_token_activation=use_per_token,
                 padded_hidden_size=layer.trtllm_padded_hidden_size,
                 gemm1_alpha=gemm1_alpha.data if gemm1_alpha is not None else None,
                 gemm1_beta=gemm1_beta.data if gemm1_beta is not None else None,
@@ -3282,7 +3383,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             )
 
             if self._is_cutedsl_v1_deepep:
-                if envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get():
+                from sglang.srt.layers.moe.phase import is_w4a16_enabled
+
+                if is_w4a16_enabled():
                     raise ValueError(
                         "SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16 does not support "
                         "the CuTe DSL v1 DeepEP masked MoE path."
@@ -3324,9 +3427,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 a1_scale=layer._cutedsl_input_scale,
                 a2_scale=fc2_input_scale,
                 wrapper=layer._cutedsl_wrapper,
-                use_per_token_activation=(
-                    self.quant_config.use_per_token_activation and quant_mode == "w4a4"
-                ),
+                use_per_token_activation=layer._cutedsl_state_key[1],
                 quant_mode=quant_mode,
             )
             return self.runner.run(dispatch_output, quant_info)

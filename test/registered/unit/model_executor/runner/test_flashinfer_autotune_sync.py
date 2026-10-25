@@ -66,6 +66,105 @@ class TestAutotuneTacticSyncGroup(CustomTestCase):
         self.assertIsNone(_autotune_tactic_sync_group(tp_group))
 
 
+class TestPhaseSpecificMoeAutotune(CustomTestCase):
+    def test_phase_selection(self):
+        runner = SimpleNamespace(is_draft_worker=False)
+        for prefill, decode, precision, expected in (
+            (None, None, False, (None,)),
+            (None, None, True, (None,)),
+            (None, None, "prefill", ("decode", "prefill")),
+            (None, None, "decode", ("decode", "prefill")),
+            ("flashinfer_trtllm", "flashinfer_cutedsl", False, ("decode", "prefill")),
+            ("flashinfer_cutedsl", "flashinfer_cutedsl", False, (None,)),
+        ):
+            with (
+                self.subTest(prefill=prefill, decode=decode, precision=precision),
+                patch.object(
+                    autotune,
+                    "get_exec",
+                    return_value=SimpleNamespace(
+                        moe=SimpleNamespace(
+                            moe_runner_backend="flashinfer_trtllm",
+                            moe_prefill_runner_backend=prefill,
+                            moe_decode_runner_backend=decode,
+                        )
+                    ),
+                ),
+                patch.object(
+                    autotune.envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16,
+                    "get",
+                    return_value=precision,
+                ),
+                patch.object(
+                    autotune.envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION,
+                    "get",
+                    return_value=False,
+                ),
+            ):
+                self.assertEqual(
+                    autotune.flashinfer_autotune_moe_phases(runner), expected
+                )
+
+    def test_phase_specific_per_token_scaling_warms_both(self):
+        with (
+            patch.object(
+                autotune,
+                "get_exec",
+                return_value=SimpleNamespace(
+                    moe=SimpleNamespace(moe_runner_backend="flashinfer_cutedsl")
+                ),
+            ),
+            patch.object(
+                autotune.envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16,
+                "get",
+                return_value=False,
+            ),
+            patch.object(
+                autotune.envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION,
+                "get",
+                return_value="prefill",
+            ),
+        ):
+            self.assertEqual(
+                autotune.flashinfer_autotune_moe_phases(
+                    SimpleNamespace(is_draft_worker=False)
+                ),
+                ("decode", "prefill"),
+            )
+
+    def test_startup_warms_both_phases_with_same_buffers(self):
+        from sglang.srt.model_executor.runner import base_runner
+
+        runner = SimpleNamespace(
+            model_runner=SimpleNamespace(canary_manager=None),
+            _dummy_run=Mock(),
+        )
+        buffers = object()
+        with (
+            patch.object(
+                base_runner,
+                "flashinfer_autotune_moe_phases",
+                return_value=("decode", "prefill"),
+            ),
+            patch.object(
+                base_runner,
+                "run_flashinfer_autotune_forward",
+                side_effect=lambda _mr, forward_fn, **_: forward_fn(),
+            ),
+        ):
+            base_runner.BaseRunner._flashinfer_autotune(
+                runner, buffers=buffers, batch_size=32
+            )
+        calls = runner._dummy_run.call_args_list
+        self.assertEqual(
+            [call.kwargs["moe_forward_phase_override"] for call in calls],
+            ["decode", "prefill"],
+        )
+        for call in calls:
+            self.assertIs(call.kwargs["buffers"], buffers)
+            self.assertEqual(call.kwargs["batch_size"], 32)
+
+
 class TestMegaMoEAutotuneStartup(CustomTestCase):
     def test_context_bridges_profile_limits(self):
         from sglang.srt.layers.moe import flashinfer_megamoe_autotune as mega_autotune

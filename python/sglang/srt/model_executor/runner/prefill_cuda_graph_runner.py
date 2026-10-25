@@ -2023,6 +2023,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 static_num_tokens
             ),
             global_forward_mode=pcg_global_forward_mode,
+            global_moe_forward_phase=forward_batch.global_moe_forward_phase,
             lora_ids=forward_batch.lora_ids,
             sampling_info=forward_batch.sampling_info,
             mm_inputs=forward_batch.mm_inputs,

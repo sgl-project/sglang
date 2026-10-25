@@ -309,6 +309,8 @@ POSITIONAL_FIELD_ORDER = (
     "enable_w4a4_mxfp4_megamoe",
     "deepep_v2_mode",
     "moe_runner_backend",
+    "moe_prefill_runner_backend",
+    "moe_decode_runner_backend",
     "flashinfer_mxfp4_moe_precision",
     "deepep_mode",
     "fuseep_mode",
