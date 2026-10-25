@@ -202,6 +202,18 @@ class Memory(msgspec.Struct):
             ),
         ),
     ] = 8
+    hicache_storage_prefetch_host_capacity_wait_ms: A[
+        float,
+        Arg(
+            help=(
+                "Wait up to this many milliseconds for a complete storage hit "
+                "to fit in host memory. 0 preserves partial prefix staging. "
+                "Applies only to single-engine cache mode; a positive value "
+                "uses full staging or recomputation, with retries capped by "
+                "--hicache-storage-prefetch-retry-max-attempts."
+            ),
+        ),
+    ] = 0.0
 
     # -------------------------------------------------------------------------
     # Unified Radix Cache
