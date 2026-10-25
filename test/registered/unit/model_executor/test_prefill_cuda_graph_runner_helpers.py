@@ -181,7 +181,9 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
                 batch.extend_seq_lens_cpu = lengths
                 batch.req_pool_indices = torch.arange(1, len(lengths) + 1)
                 if lengths == [8]:
-                    holder = qwen4_exp._breakable_prepare_ple_batch(
+                    holder = qwen4_exp._BreakablePLEBatch()
+                    qwen4_exp._breakable_prepare_ple_batch(
+                        holder,
                         input_ids=torch.arange(8),
                         ngram_size=None,
                         ngram_eos_token_id=None,
