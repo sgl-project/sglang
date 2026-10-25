@@ -2044,8 +2044,10 @@ class TestOffloadDefaults(_CudaPlatformTestCase):
             Wan2_2_I2V_A14B_Config(),
         ):
             dual_dit_deployment = dual_dit_config.get_model_deployment_config()
-            self.assertIsNone(dual_dit_deployment.keep_resident_min_available_gb)
-            self.assertEqual(dual_dit_deployment.keep_resident_components, ("vae",))
+            self.assertEqual(dual_dit_deployment.keep_resident_min_available_gb, 120)
+            self.assertEqual(
+                dual_dit_deployment.keep_resident_components, ("dit", "vae")
+            )
 
         # default keeps only vae resident (encoders are large, dit owned by FSDP)
         self.assertEqual(qwen_deployment.keep_resident_components, ("vae",))
