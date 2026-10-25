@@ -299,25 +299,9 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             f"{type(current_platform).__name__} on device {cfg.device!r}."
         )
 
-    if cfg.pp_size != 1:
-        raise ValueError(
-            "Currently DFLASH speculative decoding only supports pp_size == 1."
-        )
-
-    if cfg.speculative_draft_model_path is None:
-        raise ValueError(
-            "DFLASH speculative decoding requires setting --speculative-draft-model-path."
-        )
-
     if attn_dp_enabled_of(cfg) and cfg.device != "npu":
         if not cfg.device.startswith("cuda"):
             raise ValueError("DFLASH with dp attention requires CUDA or NPU.")
-        # Validated on Beam targets only.
-        target_archs = model_config_of(server_args).hf_config.architectures
-        if "BeamForCausalLM" not in target_archs:
-            raise ValueError(
-                "DFLASH with dp attention on CUDA currently supports only Beam targets."
-            )
         # Both greedy projection and the selector borrow the target head.
         if not cfg.enable_dp_lm_head:
             raise ValueError("DFLASH with dp attention requires --enable-dp-lm-head.")
@@ -330,27 +314,16 @@ def _handle_dflash(server_args: ServerArgs) -> None:
                 "DFLASH with dp attention requires "
                 "SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION=0."
             )
-        if cfg.moe_a2a_backend not in ("none", "flashinfer_megamoe"):
-            raise ValueError(
-                "DFLASH with dp attention requires moe_a2a_backend 'none' or "
-                "'flashinfer_megamoe'."
-            )
-        from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
-        from sglang.srt.utils.hf_transformers_utils import get_config
 
-        draft_hf_config = get_config(
-            cfg.speculative_draft_model_path,
-            trust_remote_code=cfg.trust_remote_code,
-            revision=cfg.speculative_draft_model_revision,
-            model_override_args=json.loads(cfg.json_model_override_args),
+    if cfg.pp_size != 1:
+        raise ValueError(
+            "Currently DFLASH speculative decoding only supports pp_size == 1."
         )
-        if parse_dflash_draft_config(draft_hf_config=draft_hf_config).is_domino or (
-            "LiLiCorrDraftModel" in (draft_hf_config.architectures or [])
-        ):
-            raise ValueError(
-                "DFLASH with dp attention on CUDA supports plain DFlash and "
-                "DFlash2 drafts; Domino and LiLiCorr heads are not supported."
-            )
+
+    if cfg.speculative_draft_model_path is None:
+        raise ValueError(
+            "DFLASH speculative decoding requires setting --speculative-draft-model-path."
+        )
 
     # DFLASH does not use EAGLE-style `num_steps`/`topk`, but those fields still
     # affect generic scheduler/KV-cache accounting (buffer sizing, KV freeing,

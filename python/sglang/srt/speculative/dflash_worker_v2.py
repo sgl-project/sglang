@@ -748,13 +748,11 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._draft_worker.init_cuda_graphs(
                 capture_decode_cuda_graph=capture_decode_cuda_graph
             )
-            if self.selector is not None and self._draft_sampler is None:
-                # No captured graph runs the selector, so its kernels (flashinfer's
-                # top-k may JIT for minutes) would first build in a served decode,
-                # under the scheduler watchdog.
+            if target_dp_enabled and not _is_npu and self.selector is not None:
                 self._warm_eager_selector()
 
     def _warm_eager_selector(self) -> None:
+        # Build selector kernels before serving rather than under the watchdog.
         hidden = torch.zeros(
             (int(self.block_size), int(self.draft_model.config.hidden_size)),
             dtype=self.draft_model_runner.dtype,
