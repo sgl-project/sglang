@@ -169,6 +169,16 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
       { id: "a5", label: "950PR/DT Series",  vram: "128GB",    npuDevices: 8  },
     ],
   };
+  const vendorOf = (hwId) => {
+    for (const [vendor, list] of Object.entries(HARDWARE_CATALOG)) {
+      if (list.some((h) => h.id === hwId)) return vendor;
+    }
+    const extra = (config.hardware || []).find((h) => h.id === hwId);
+    return (extra && extra.vendor) || "nvidia";
+  };
+  // Benchmark throughput is normalized per device; only GPU vendors call it a GPU.
+  const NON_GPU_VENDORS = new Set(["tpu", "npu", "cpu", "apple"]);
+  const deviceUnitOf = (hwId) => NON_GPU_VENDORS.has(vendorOf(hwId)) ? "chip" : "gpu";
 
   // ==== 2. Style helper (dark-mode-aware) ====
   const makeStyles = (isDark) => ({
@@ -874,13 +884,6 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
       const servePort = portFlag ? portFlag.slice("--port".length).trim() : "{{PORT}}";
       const hostNetwork = multinode || cell.pd || (typeof config.dockerHostNetworkWhen === "function"
         && config.dockerHostNetworkWhen(sel, { flags, env: cellEnv }));
-      const vendorOf = (hwId) => {
-        for (const [vendor, list] of Object.entries(HARDWARE_CATALOG)) {
-          if (list.some((h) => h.id === hwId)) return vendor;
-        }
-        const extra = (config.hardware || []).find((h) => h.id === hwId);
-        return (extra && extra.vendor) || "nvidia";
-      };
       // `config.hardware` overrides by id, as in buildHardwareGroups.
       const catalogEntryOf = (hwId) => {
         const extra = (config.hardware || []).find((h) => h.id === hwId);
@@ -1004,12 +1007,14 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
     // [key, label, unit, compute?]. Optional compute(measurement) supplies
     // derived metrics (preferred over measurement[key] when present).
     const pct = (entry && entry.latencyPercentile) || config.latencyPercentile || "P50";
+    const deviceUnit = deviceUnitOf(sel.hw);
     const SPEED_LABELS = [
       ["ttft_ms",                `TTFT (${pct})`,      "ms"],
       ["tpot_ms",                `TPOT (${pct})`,      "ms"],
       // throughput per gpu = total(input+output)/elapsed/GPU;
       // stored directly in the benchmarks file (= output tok/s/GPU × (isl+osl)/osl).
-      ["tokens_per_sec_per_gpu", "throughput per gpu", "tok/s"],
+      // Non-GPU hardware (TPU, NPU, CPU) is labeled per chip.
+      ["tokens_per_sec_per_gpu", `throughput per ${deviceUnit}`, "tok/s"],
       ["interactivity",          "interactivity",   "tokens/s/user",
         (m) => (m.tpot_ms != null && m.tpot_ms !== 0)
           ? Math.round((1000 / m.tpot_ms) * 10) / 10
@@ -1154,7 +1159,7 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
       return { title: "Speed", sharedText, colHeaders, rows,
                colCount: measurements.length,
                legend: [
-                 `throughput per gpu = (input+output tokens)/elapsed/GPU`,
+                 `throughput per ${deviceUnit} = (input+output tokens)/elapsed/${deviceUnit === "gpu" ? "GPU" : deviceUnit}`,
                  `interactivity = 1000/TPOT(ms) (tokens/s/user)`,
                ] };
     };
