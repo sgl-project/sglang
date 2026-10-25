@@ -1441,6 +1441,18 @@ class SchedulerMetricsReporter:
         self.stats.num_decode_host_receive_queue_reqs = QueueCount.from_reqs(
             host_reqs, priority_enabled
         )
+        full_tokens, swa_tokens = (
+            self.scheduler.disagg_decode_prealloc_queue.pre_allocated_token_counts()
+        )
+        pool_stats = self.scheduler.pool_stats_observer.get_pool_stats()
+        self.stats.prealloc_full_token_usage = (
+            full_tokens / pool_stats.full_capacity if pool_stats.full_capacity else 0.0
+        )
+        self.stats.prealloc_swa_token_usage = (
+            swa_tokens / pool_stats.swa_capacity
+            if pool_stats.is_hybrid_swa and pool_stats.swa_capacity
+            else 0.0
+        )
 
     def _maybe_log_idle_metrics(self):
         """Reset forward timing and publish idle metrics when needed."""

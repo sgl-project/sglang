@@ -181,6 +181,10 @@ class AttentionBackend(ABC):
     # the EXTEND graph is a known serving-performance regression.
     prefer_eager_mixed_prefill_under_dp_attention: bool = False
 
+    # An idle DP rank replays the padded prefill graph without attention
+    # metadata; only backends whose replay reads none on such a rank opt in.
+    skips_prefill_metadata_on_idle_dp_rank: bool = False
+
     # True when prefill graph metadata can use ForwardBatch.max_seq_len_override.
     supports_prefill_cuda_graph_max_context_size: bool = False
     # Replayed context limit when the user sets none; None when nothing the backend
