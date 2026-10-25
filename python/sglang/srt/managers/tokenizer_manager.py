@@ -1881,10 +1881,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if customized_info_keys is not None:
                 incremental_streaming_keys.update(customized_info_keys)
             for key in incremental_streaming_keys:
-                if any(key in m for m in meta_info_list):
-                    meta_info[key] = [
-                        item for m in meta_info_list for item in m.get(key, [])
-                    ]
+                values = [m[key] for m in meta_info_list if key in m]
+                if values:
+                    meta_info[key] = [item for value in values for item in value]
             out["meta_info"] = meta_info
         return out
 
