@@ -11,6 +11,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from sglang.kernels.ops.sampling.topk import radix_topk
 from sglang.kernels.ops.speculative.dflash import selector_walk_triton
 from sglang.kernels.ops.speculative.lilicorr import lilicorr_topk_lse
 from sglang.srt.configs.laguna import normalize_gating
@@ -46,7 +47,7 @@ from sglang.srt.speculative.dflash_utils import (
     is_nemotron_35_draft_config,
     parse_dflash_draft_config,
 )
-from sglang.srt.utils import is_npu, set_weight_attrs
+from sglang.srt.utils import is_flashinfer_available, is_npu, set_weight_attrs
 from sglang.srt.utils.common import get_compiler_backend
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
@@ -54,18 +55,6 @@ _is_npu = is_npu()
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
 logger = logging.getLogger(__name__)
-
-try:
-    from flashinfer import top_k as _flashinfer_top_k
-except ImportError:
-    _flashinfer_top_k = None
-
-
-def _radix_topk(scores: torch.Tensor, k: int) -> Tuple[torch.Tensor, torch.Tensor]:
-    # The selector's largest single cost: it reads the whole logits tensor.
-    if _flashinfer_top_k is not None:
-        return _flashinfer_top_k(scores, k, sorted=True, deterministic=True)
-    return torch.topk(scores, k, dim=-1)
 
 
 def _logical_linear_weight_shape(
@@ -94,8 +83,8 @@ def _project_candidate_logits(
         weight = lm_head.weight
         return torch.matmul(hidden.to(weight.dtype), weight[:num_org].T)
     # A packed weight can't be row-sliced to the org vocab like the dense path,
-    # and flashinfer's radix top-k rejects the crop view (non-contiguous), so
-    # mask the padded tail out of the top-k instead.
+    # and flashinfer's radix top-k only reads dense rows (a crop view would be
+    # copied), so mask the padded tail out of the top-k instead.
     logits = lm_head.quant_method.apply(lm_head, hidden, None).contiguous()
     if logits.shape[-1] > num_org:
         logits[:, num_org:] = float("-inf")
@@ -138,7 +127,8 @@ def candidate_topk(
     if with_partition:
         vals, ids, lse = lilicorr_topk_lse(logits, k)
     else:
-        vals, ids = _radix_topk(logits, k)
+        # The selector's largest single cost: it reads the whole logits tensor.
+        vals, ids = radix_topk(logits, k)
     if tp:
         return ids.long(), vals, lse
     global_ids = ids.long() + int(lm_head.shard_indices.org_vocab_start_index)
@@ -1115,7 +1105,7 @@ class CandidateSelector(nn.Module):
         top_k: int,
     ) -> None:
         super().__init__()
-        if _flashinfer_top_k is None:
+        if not is_flashinfer_available():
             logger.warning(
                 "flashinfer is unavailable; the DFlash2 selector falls back to "
                 "torch.topk, which roughly halves end-to-end throughput on a large "
