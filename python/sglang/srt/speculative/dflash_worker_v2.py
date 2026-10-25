@@ -4,7 +4,6 @@ import os
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
-import torch.distributed as dist
 
 from sglang.kernels.ops.speculative.cache_locs import (
     assign_extend_cache_locs_func,
@@ -27,7 +26,6 @@ from sglang.srt.layers.logits_processor import (
     should_apply_lm_head_quant_method,
 )
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
-from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -58,6 +56,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
+from sglang.srt.speculative.dflash_dp import gather_draft_embedding
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
@@ -73,6 +72,10 @@ from sglang.srt.speculative.dflash_utils import (
 from sglang.srt.speculative.domino_utils import (
     domino_greedy_rollout,
     validate_domino_runtime,
+)
+from sglang.srt.speculative.draft_parallel import (
+    model_draft_parallel_spec,
+    resolve_draft_parallel_layout,
 )
 from sglang.srt.speculative.draft_worker_common import (
     build_block_pos_offsets,
@@ -415,12 +418,16 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         # DP drafts use per-DP attention TP, independent of idle peers. CP
         # drafts use full TP without CP, including their backend and KV pool.
-        self.draft_owns_attention = (
-            get_parallel().attn_dp_enabled or get_parallel().attn_cp_size > 1
+        self.draft_parallel_layout = resolve_draft_parallel_layout(
+            model_draft_parallel_spec(
+                target_worker.model_runner.spec_aux_config.draft_model_config,
+                spec_algorithm=target_worker.model_runner.spec_algorithm,
+            ),
+            collapse_cp=True,
         )
         # Inside the draft scope the context answers the draft's narrowed rank.
         self._target_tp_rank = get_parallel().tp_rank
-        with draft_pp_context(), draft_tp_context(self.draft_owns_attention):
+        with draft_pp_context(), draft_tp_context(self.draft_parallel_layout):
             bundle = build_draft_tp_worker(
                 server_args=server_args,
                 gpu_id=gpu_id,
@@ -445,6 +452,12 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_hf_config=self.draft_model_runner.model_config.hf_config
         )
         self._is_domino = draft_config.is_domino
+        if get_parallel().attn_dp_enabled and not _is_npu:
+            if self._is_domino or self.lilicorr is not None:
+                raise ValueError(
+                    "DFLASH with dp attention supports plain DFlash and DFlash2 "
+                    "drafts; Domino and LiLiCorr heads are not supported."
+                )
         self.domino_candidate_pool_size = int(
             get_spec().speculative_domino_candidate_pool_size
         )
@@ -660,7 +673,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         # enabled, the draft worker keeps a private compact req->token table
         # over the same global KV index space, so radix-cache/prefix-hit KV
         # remains reusable while draft attention sees only the recent window.
-        with draft_tp_context(self.draft_owns_attention):
+        with draft_tp_context(self.draft_parallel_layout):
             self._draft_worker.alloc_memory_pool(
                 memory_pool_config=memory_pool_config,
                 req_to_token_pool=(
@@ -672,7 +685,7 @@ class DFlashWorkerV2(BaseSpecWorker):
     def init_attention_backends(self):
         with (
             draft_pp_context(),
-            draft_tp_context(self.draft_owns_attention),
+            draft_tp_context(self.draft_parallel_layout),
         ):
             self._draft_worker.init_attention_backends()
         self._need_mamba_verify_commit = mambaish_config(
@@ -683,9 +696,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
 
     def init_cuda_graphs(self):
+        target_dp_enabled = get_parallel().attn_dp_enabled
         with (
             draft_pp_context(),
-            draft_tp_context(self.draft_owns_attention),
+            draft_tp_context(self.draft_parallel_layout),
         ):
             capture_decode_cuda_graph = (
                 get_exec().graph.cuda_graph_config.decode.backend != Backend.DISABLED
@@ -701,10 +715,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                     "device graph capture.",
                     type(current_platform).__name__,
                 )
-            if get_parallel().attn_dp_enabled and capture_decode_cuda_graph:
-                # Idle DP ranks skip the draft step, so they cannot join a
-                # shared graph capture/replay; keep the draft eager under dp
-                # attention.
+            if target_dp_enabled and capture_decode_cuda_graph:
+                # Keep the eager-draft policy for idle/unequal DP batches.
+                # The narrowed draft scope hides the target's DP flag.
                 capture_decode_cuda_graph = False
                 if self._target_tp_rank == 0:
                     logger.warning(
@@ -1367,51 +1380,15 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
 
     def _cache_full_embed_weight(self) -> None:
-        """Cache the full target embedding replicated on GPU during init.
-
-        Under dp attention, idle DP ranks skip the draft step, so the attn-TP
-        all_reduce inside VocabParallelEmbedding gets mismatched calls. Gather
-        the full embedding once during init and keep it replicated, making
-        the draft block-id lookup a collective-free on-device F.embedding.
-        """
         if not get_parallel().attn_dp_enabled:
             return
-
-        target_model = self._target_worker.model_runner.model
-        embed_module = unwrap_lora_layer(target_model.get_input_embeddings())
-        # Other embeddings (e.g. Gemma's scaled nn.Embedding) are replicated and
-        # run no collective, so the draft keeps calling the module itself.
-        if not isinstance(embed_module, VocabParallelEmbedding):
-            return
-        if embed_module.num_added_embeddings:
-            raise ValueError(
-                "DFLASH with dp attention does not support target embeddings "
-                "with added-vocabulary rows."
+        embedding = unwrap_lora_layer(
+            _resolve_dflash_embedding_module(
+                self.draft_model, self._target_worker.model_runner.model
             )
-        # A replicated table (e.g. enable_tp=False) already holds every row.
-        if embed_module.tp_size == 1:
-            self._full_embed_gpu = embed_module.weight
-            return
-        tp_group = (
-            get_parallel().attn_tp_group
-            if embed_module.use_attn_tp_group
-            else get_parallel().tp_group
         )
-
-        local_w = embed_module.weight.data
-        # Gather the equal padded vocabulary rows; the valid tail can differ by rank.
-        num_org = embed_module.shard_indices.num_org_elements_padded
-        vocab_size = int(self._target_worker.model_runner.model_config.vocab_size)
-
-        shard_t = local_w[:num_org].contiguous()
-        parts = [torch.empty_like(shard_t) for _ in range(embed_module.tp_size)]
-        dist.all_gather(parts, shard_t, group=tp_group.device_group)
-        self._full_embed_gpu = torch.cat(parts, dim=0)[:vocab_size]
-        if get_parallel().tp_rank == 0:
-            logger.info(
-                "DFLASH cached full embed on GPU for dp attention: shape=%s",
-                list(self._full_embed_gpu.shape),
-            )
+        # Reconstruct on the table's own group before DP ranks can go idle.
+        self._full_embed_gpu = gather_draft_embedding(embedding)
 
     def _resolve_mask_token_id(
         self, *, mask_token: str, mask_token_id: Optional[int] = None
@@ -1949,7 +1926,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         # req_to_token rebuild.
         with (
             torch.inference_mode(),
-            draft_tp_context(self.draft_owns_attention),
+            draft_tp_context(self.draft_parallel_layout),
         ):
             ctx_hidden = self.draft_model.project_target_hidden(target_hidden)
             if self.lilicorr is not None:
@@ -2481,7 +2458,6 @@ class DFlashWorkerV2(BaseSpecWorker):
                     batch=None,
                     forward_batch=idle_verify_forward_batch,
                     is_verify=True,
-                    # CUDA plans after DP padding; NPU keeps its existing idle path.
                     skip_attn_backend_init=True if _is_npu else None,
                 )
             empty_ids = torch.empty((0,), dtype=torch.int64, device=self.device)
@@ -2596,8 +2572,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             verify_out_cache_loc_2d.copy_(verify_out_cache_loc.view(bs, block_size))
 
         if self._full_embed_gpu is not None:
-            # Replicated lookup avoids the mismatched attn-TP all_reduce
-            # inside VocabParallelEmbedding under dp attention.
+            # A borrowed embedding may use target-wide collectives, while
+            # other DP replicas are idle or looking up different token IDs.
             noise_embedding = torch.nn.functional.embedding(
                 block_ids, self._full_embed_gpu
             )
@@ -2708,7 +2684,7 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         with (
             torch.inference_mode(),
-            draft_tp_context(self.draft_owns_attention),
+            draft_tp_context(self.draft_parallel_layout),
         ):
             draft_out = self.draft_model_runner.forward(forward_batch)
         draft_logits_output = draft_out.logits_output
@@ -2777,7 +2753,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     self._draft_sampler.q_out[:bs],
                 )
         elif self.selector is not None:
-            with draft_tp_context(self.draft_owns_attention):
+            with draft_tp_context(self.draft_parallel_layout):
                 draft_next = self._propose_selector_block(
                     draft_logits_output=draft_logits_output,
                     bs=bs,
@@ -2803,7 +2779,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_hidden = draft_logits_output.hidden_states
             if draft_hidden is None:
                 raise RuntimeError("DFLASH draft model returned no hidden states.")
-            with draft_tp_context(self.draft_owns_attention):
+            with draft_tp_context(self.draft_parallel_layout):
                 draft_next, lilicorr_candidate_ids, lilicorr_q_rows = (
                     propose_lilicorr_block(
                         head=self.lilicorr,
@@ -2824,7 +2800,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             if draft_hidden is None:
                 raise RuntimeError("DFLASH draft model returned no hidden states.")
             draft_hidden = draft_hidden.view(bs, int(self.block_size), -1)
-            with draft_tp_context(self.draft_owns_attention):
+            with draft_tp_context(self.draft_parallel_layout):
                 draft_next = self._greedy_sample_from_vocab_parallel_head(
                     hidden_states=draft_hidden[:, 1:, :].reshape(
                         -1, draft_hidden.shape[-1]

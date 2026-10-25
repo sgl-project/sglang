@@ -318,11 +318,17 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             raise ValueError(
                 "DFLASH with dp attention on CUDA currently supports only Beam targets."
             )
+        # Both greedy projection and the selector borrow the target head.
         if not cfg.enable_dp_lm_head:
             raise ValueError("DFLASH with dp attention requires --enable-dp-lm-head.")
         if cfg.attn_cp_size != 1:
             raise ValueError(
                 "DFLASH with dp attention does not support context parallel."
+            )
+        if envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get():
+            raise ValueError(
+                "DFLASH with dp attention requires "
+                "SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION=0."
             )
         if cfg.moe_a2a_backend not in ("none", "flashinfer_megamoe"):
             raise ValueError(
