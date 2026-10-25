@@ -23,12 +23,14 @@ from sglang.srt.mem_cache.layout.fused_draft import (
     DraftStateGeometry,
     DraftStateRegion,
     FusedDraftPlacement,
+    LatentDraftRegion,
 )
 from sglang.srt.mem_cache.layout.token_major import align_entry_bytes
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.unified_draft_pool import (
     UnifiedDraftKVPool,
     UnifiedDraftMambaPool,
+    UnifiedDraftMLAKVPool,
     UnifiedDraftSWAKVPool,
 )
 from sglang.srt.mem_cache.unified_memory_pool import (
@@ -566,6 +568,206 @@ class TestFusedMLAHost(unittest.TestCase):
         self.assertEqual(
             dp.k_buffer[0].stride(0) * dp.k_buffer[0].element_size(), entry
         )
+
+
+def _latent_region(lane_num=2):
+    # 32 B latent rows, the host's own width.
+    return LatentDraftRegion(
+        lane_num=lane_num, kv_lora_rank=8, qk_rope_head_dim=8, store_dtype=_DTYPE
+    )
+
+
+def _unified_mamba_allocator(pool, page_size):
+    from sglang.srt.mem_cache.allocator.unified_mamba import (
+        UnifiedMambaTokenToKVPoolAllocator,
+    )
+
+    class _FakeKV:
+        def attach_allocator(self, allocator):
+            self.allocator = allocator
+
+    return UnifiedMambaTokenToKVPoolAllocator(
+        unified_buffer=pool,
+        kvcache=SimpleNamespace(full_kv_pool=_FakeKV(), mamba_pool=_FakeKV()),
+        device=_DEV,
+        page_size=page_size,
+        need_sort=False,
+        forward_stream=None,
+        lazy_compaction=False,
+    )
+
+
+class TestLatentDraftOnMLAHost(unittest.TestCase):
+    """An MLA draft's latent rows are one more part of an MLA host's entries,
+    read and written through a draft MLA pool over its own lanes."""
+
+    PS = 2
+    PAGES = 8
+
+    def setUp(self):
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+
+    def _pool(self):
+        full = _mla_host_spec(_latent_region())
+        mamba = _mamba_filler_spec()
+        total = self.PAGES * self.PS * full.entry_bytes() + 4 * mamba.entry_bytes()
+        return UnifiedKVPool(
+            total_bytes=total,
+            sub_pool_specs=[full, mamba],
+            device=_DEV,
+            enable_memory_saver=False,
+            page_size=self.PS,
+            fused_draft=_placement(full.draft_region),
+        )
+
+    def test_fused_entry_appends_one_latent_part(self):
+        f = _mla_host_spec(_latent_region())
+        self.assertEqual(f.draft_offset_in_entry(), 64)
+        self.assertEqual(f.entry_bytes(), align_entry_bytes(64 + 2 * 32))
+        layout = f.layout()
+        self.assertEqual([p.name for p in layout.parts], ["kv", "draft_kv"])
+        part = layout.part("draft_kv")
+        self.assertEqual(
+            (
+                part.offset_bytes,
+                part.layer_stride_bytes,
+                part.layer_num,
+                part.row_shape,
+            ),
+            (64, 32, 2, (1, 16)),
+        )
+
+    def test_an_mha_host_refuses_a_latent_region(self):
+        with self.assertRaises(AssertionError):
+            _host_spec(_latent_region())
+
+    def test_draft_writes_stay_in_their_lane(self):
+        """A write through the draft pool lands in its own lane of the slot:
+        not in the host's rows, not in the other runner's lane."""
+        pool = self._pool()
+        spec = pool.mla_spec("full")
+        dp = UnifiedDraftMLAKVPool(
+            unified_buffer=pool,
+            host_sub_pool_name="full",
+            host_allocator=object(),
+            layer_lanes={7: 1},
+            page_size=self.PS,
+        )
+        entry = spec.entry_bytes()
+        view = dp.get_key_buffer(7)
+        self.assertEqual(view.shape[1:], (1, 16))
+        self.assertEqual(view.stride(0) * view.element_size(), entry)
+        raw = pool._raw
+        t = 2 * self.PS + 1
+        raw.zero_()
+        rows = torch.full((1, 1, 16), 3.0, dtype=_DTYPE)
+        dp.set_kv_buffer(
+            SimpleNamespace(layer_id=7),
+            KVWriteLoc(torch.tensor([t]), physical=True),
+            rows,
+            None,
+        )
+        nz = raw.nonzero().flatten()
+        lane_lo = t * entry + spec.draft_offset_in_entry() + 32
+        self.assertEqual(int(nz.min()), lane_lo)
+        self.assertEqual(int(nz.max()), lane_lo + 32 - 1)
+        self.assertEqual(float(view[t].float().sum()), 3.0 * 16)
+        self.assertEqual(dp.get_value_buffer(7).shape[-1], 8)
+
+    def test_reports_the_value_width_a_hybrid_host_draft_pool_reports(self):
+        """BUG REGRESSION: on a hybrid-linear host the triton backend asks the
+        draft's pool for its value head dim at startup, as it does the default
+        pool's draft pool; the fused MLA draft pool must answer with its value
+        rows' width, or the draft worker fails to start on triton."""
+        dp = UnifiedDraftMLAKVPool(
+            unified_buffer=self._pool(),
+            host_sub_pool_name="full",
+            host_allocator=object(),
+            layer_lanes={7: 1},
+            page_size=self.PS,
+        )
+        self.assertEqual(dp.get_v_head_dim(), dp.get_value_buffer(7).shape[-1])
+
+    def test_translator_takes_the_fused_disposition(self):
+        """The translator must recognize the draft MLA pool as fused: a
+        passthrough would read and write its physical views with virtual ids."""
+        from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
+
+        pool = self._pool()
+        alloc = _unified_mamba_allocator(pool, self.PS)
+        dp = UnifiedDraftMLAKVPool(
+            unified_buffer=pool,
+            host_sub_pool_name="full",
+            host_allocator=alloc,
+            layer_lanes={0: 0},
+            page_size=self.PS,
+        )
+        translator = KVIndexTranslator(
+            req_to_token=torch.zeros((2, 8), dtype=torch.int32),
+            token_to_kv_pool_allocator=alloc,
+            token_to_kv_pool=dp,
+            page_size=self.PS,
+            device=_DEV,
+        )
+        self.assertTrue(translator.is_translating)
+        self.assertIs(
+            translator.full_v2p_table, alloc.full_attn_allocator.virtual_to_physical
+        )
+
+    def test_the_binder_builds_a_draft_mla_pool_of_the_region_width(self):
+        """A latent region binds the draft's MLA layers to its lanes; a built
+        draft whose rows are narrower than the region refuses to bind."""
+        from sglang.srt.mem_cache import unified_draft_pool
+
+        pool = self._pool()
+        bind = dict(
+            placement=pool.fused_draft,
+            runner=0,
+            unified_buffer=pool,
+            host_allocator=object(),
+            model=SimpleNamespace(),
+            req_to_token_pool=None,
+            page_size=self.PS,
+        )
+        with patch.object(
+            unified_draft_pool, "draft_kv_layer_ids", return_value=[30, 31]
+        ):
+            bound = unified_draft_pool.bind_fused_draft(
+                model_config=SimpleNamespace(kv_lora_rank=8, qk_rope_head_dim=8), **bind
+            )
+            self.assertIsInstance(bound.token_to_kv_pool, UnifiedDraftMLAKVPool)
+            self.assertEqual(bound.token_to_kv_pool.layer_lanes, {30: 0, 31: 1})
+            with self.assertRaisesRegex(ValueError, "holds 16-wide ones"):
+                unified_draft_pool.bind_fused_draft(
+                    model_config=SimpleNamespace(kv_lora_rank=8, qk_rope_head_dim=0),
+                    **bind,
+                )
+
+    def test_a_host_page_move_carries_the_latent_rows(self):
+        from sglang.srt.mem_cache.unified_memory_pool import UnifiedMLATokenToKVPool
+
+        pool = self._pool()
+        host = UnifiedMLATokenToKVPool(
+            unified_buffer=pool,
+            sub_pool_name="full",
+            kv_cache_dtype=_DTYPE,
+            page_size=self.PS,
+        )
+        dp = UnifiedDraftMLAKVPool(
+            unified_buffer=pool,
+            host_sub_pool_name="full",
+            host_allocator=object(),
+            layer_lanes={0: 0, 1: 1},
+            page_size=self.PS,
+        )
+        src, dst = 3 * self.PS, 5 * self.PS
+        dp.get_key_buffer(1)[src] = 7.0
+        host.move_physical_pages(torch.tensor([5]), torch.tensor([3]), self.PS)
+        self.assertEqual(float(dp.get_key_buffer(1)[dst].float().sum()), 7.0 * 16)
+        with self.assertRaises(NotImplementedError):
+            dp.move_kv_cache(torch.tensor([dst]), torch.tensor([src]))
 
 
 class TestUnifiedDraftSWAKVPool(unittest.TestCase):

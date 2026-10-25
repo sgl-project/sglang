@@ -112,12 +112,71 @@ class DenseDraftRegion(msgspec.Struct, frozen=True, kw_only=True):
         )
 
 
+class LatentDraftRegion(msgspec.Struct, frozen=True, kw_only=True):
+    """An MLA draft's latent rows fused into every slot of an MLA host sub-pool:
+    one ``kv_lora_rank + qk_rope_head_dim`` row per lane, laid out like the
+    host's own rows (V is a prefix of the same row)."""
+
+    lane_num: int
+    kv_lora_rank: int
+    qk_rope_head_dim: int
+    store_dtype: torch.dtype
+    # The KV cache dtype the rows hold, where it differs from how they are
+    # stored: fp8 rows are stored as uint8.
+    kv_dtype: Optional[torch.dtype] = None
+
+    def validate(self) -> None:
+        assert self.lane_num > 0, f"lane_num must be positive; got {self.lane_num}"
+        assert self.kv_lora_rank > 0, (
+            f"kv_lora_rank must be positive; got {self.kv_lora_rank}"
+        )
+        assert self.qk_rope_head_dim > 0, (
+            f"qk_rope_head_dim must be positive; got {self.qk_rope_head_dim}"
+        )
+
+    @property
+    def kv_cache_dim(self) -> int:
+        return self.kv_lora_rank + self.qk_rope_head_dim
+
+    def resolved_kv_dtype(self) -> torch.dtype:
+        return self.store_dtype if self.kv_dtype is None else self.kv_dtype
+
+    def row_bytes(self) -> int:
+        return self.kv_cache_dim * self.store_dtype.itemsize
+
+    def entry_bytes(self) -> int:
+        """Draft bytes per slot, before the host entry's alignment."""
+        return self.lane_num * self.row_bytes()
+
+    def parts(self, offset_bytes: int) -> Tuple[DensePart]:
+        """The draft's latent part, laid out from ``offset_bytes`` inside the
+        host entry."""
+        return (
+            DensePart(
+                name="draft_kv",
+                offset_bytes=offset_bytes,
+                layer_stride_bytes=self.row_bytes(),
+                layer_num=self.lane_num,
+                row_shape=(1, self.kv_cache_dim),
+                dtype=self.store_dtype,
+            ),
+        )
+
+
 class DraftKVGeometry(msgspec.Struct, frozen=True, kw_only=True):
     """Per-GPU K/V row geometry of one kind of draft attention layer."""
 
     head_num: int
     head_dim: int
     v_head_dim: int
+
+
+class DraftLatentGeometry(msgspec.Struct, frozen=True, kw_only=True):
+    """Latent row geometry of an MLA draft's attention layers; MLA rows are not
+    split across attention TP ranks."""
+
+    kv_lora_rank: int
+    qk_rope_head_dim: int
 
 
 class DraftStateGeometry(msgspec.Struct, frozen=True, kw_only=True):
@@ -162,7 +221,7 @@ class DraftStateRegion(msgspec.Struct, frozen=True, kw_only=True):
         return self.lane_num * self.state.layer_bytes()
 
 
-DraftRegion = Union[DenseDraftRegion, DraftStateRegion]
+DraftRegion = Union[DenseDraftRegion, LatentDraftRegion, DraftStateRegion]
 
 
 class DraftLayerSet(msgspec.Struct, frozen=True, kw_only=True):
@@ -253,8 +312,16 @@ class DenseHostKind(HostKind):
         lane_num: int,
         store_dtype: torch.dtype,
         kv_dtype: Optional[torch.dtype],
-    ) -> DenseDraftRegion:
+    ) -> Union[DenseDraftRegion, LatentDraftRegion]:
         geometry = layers.geometry
+        if isinstance(geometry, DraftLatentGeometry):
+            return LatentDraftRegion(
+                lane_num=lane_num,
+                kv_lora_rank=geometry.kv_lora_rank,
+                qk_rope_head_dim=geometry.qk_rope_head_dim,
+                store_dtype=store_dtype,
+                kv_dtype=kv_dtype,
+            )
         assert isinstance(geometry, DraftKVGeometry), geometry
         return DenseDraftRegion(
             lane_num=lane_num,
@@ -272,6 +339,12 @@ class DenseHostKind(HostKind):
             if kv_dtype == region.store_dtype
             else f"{kv_dtype} (stored as {region.store_dtype})"
         )
+        if isinstance(region, LatentDraftRegion):
+            return (
+                f"fused draft region in {self.name!r}: {region.lane_num} lane(s) x "
+                f"{region.kv_lora_rank}+{region.qk_rope_head_dim} latent row @ "
+                f"{stored} = {region.entry_bytes()} B/token; runner lanes {list(lanes)}"
+            )
         return (
             f"fused draft region in {self.name!r}: {region.lane_num} lane(s) x "
             f"{region.head_num} kv head(s) x {region.head_dim}/"
@@ -334,6 +407,8 @@ class WindowHostKind(DenseHostKind):
         reason = super().admits(layers=layers, ctx=ctx)
         if reason is not None:
             return reason
+        if isinstance(layers.geometry, DraftLatentGeometry):
+            return "its rows are MLA latent rows, which only the full sub-pool carries"
         if layers.window is None:
             return "the draft declares no sliding window size"
         if ctx.target_window is None:
@@ -497,10 +572,12 @@ def draft_kv_profile(
     attn_tp_size: int,
     num_depths: Optional[int] = None,
 ) -> DraftKVProfile:
-    """The profile of a draft `ModelConfig`, heads divided by attn_tp the way
-    the target divides its own (drafts never join the DCP group).
-    ``num_depths`` overrides the config's `num_nextn_predict_layers`."""
+    """The profile of a draft `ModelConfig`: K/V heads divided by attn_tp the
+    way the target divides its own (drafts never join the DCP group), or an MLA
+    draft's latent rows. ``num_depths`` overrides the config's
+    `num_nextn_predict_layers`."""
     from sglang.srt.configs.hybrid_arch import mambaish_config
+    from sglang.srt.configs.model_config import AttentionArch
 
     mc = draft_model_config
     if num_depths is None:
@@ -511,12 +588,21 @@ def draft_kv_profile(
     assert set(window_ids) <= set(range(num_layers)), (
         f"draft window layer ids {window_ids} outside range({num_layers})"
     )
+    latent = (
+        DraftLatentGeometry(
+            kv_lora_rank=int(mc.kv_lora_rank),
+            qk_rope_head_dim=int(mc.qk_rope_head_dim),
+        )
+        if mc.attention_arch == AttentionArch.MLA
+        else None
+    )
     kinds: Dict[str, DraftLayerSet] = {}
     full_ids = tuple(i for i in range(num_layers) if i not in window_ids)
     if full_ids:
         kinds[LAYER_FULL] = DraftLayerSet(
             layer_ids=full_ids,
-            geometry=DraftKVGeometry(
+            geometry=latent
+            or DraftKVGeometry(
                 head_num=int(mc.get_num_kv_heads(attn_tp_size)),
                 head_dim=int(mc.head_dim),
                 v_head_dim=int(mc.v_head_dim),
@@ -525,7 +611,8 @@ def draft_kv_profile(
     if window_ids:
         kinds[LAYER_WINDOW] = DraftLayerSet(
             layer_ids=window_ids,
-            geometry=DraftKVGeometry(
+            geometry=latent
+            or DraftKVGeometry(
                 head_num=int(mc.get_swa_num_kv_heads(attn_tp_size)),
                 head_dim=int(mc.swa_head_dim),
                 v_head_dim=int(mc.swa_v_head_dim),
@@ -589,6 +676,16 @@ def _kv_rows_declined(
     geometry: Any, *, store_dtype: torch.dtype, asymmetric_rows_ok: bool
 ) -> Optional[str]:
     """Why one kind's K/V rows cannot be fused entry parts, or None."""
+    if isinstance(geometry, DraftLatentGeometry):
+        row_bytes = (
+            geometry.kv_lora_rank + geometry.qk_rope_head_dim
+        ) * store_dtype.itemsize
+        if row_bytes % ROW_ALIGN_BYTES:
+            return (
+                f"the draft's latent rows are {row_bytes} B, not a multiple of "
+                f"the {ROW_ALIGN_BYTES}-B row alignment a fused entry part needs"
+            )
+        return None
     if not isinstance(geometry, DraftKVGeometry):
         return None
     if geometry.head_dim != geometry.v_head_dim and not asymmetric_rows_ok:
