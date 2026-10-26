@@ -1,8 +1,8 @@
 """ROCm glue of DSparkWorkerV2 on gfx950: with the MiniMax draft, the target verify reduces
-its logits to their row argmax without their TP gather (25-77 MB a rank at 32-96 requests
-over xGMI), and only the steps that read the logits gather them; a decode step queues its
-draft before its host seq lens land (overlap_utils_hip); FusedStepBiasMarkov is the
-MiniMax draft's markov head. dspark_worker_v2 binds it under _is_hip."""
+its logits to their row argmax without their TP gather, and only the steps that read the
+logits gather them; a decode step queues its draft before its host seq lens land
+(overlap_utils_hip); FusedStepBiasMarkov is the MiniMax draft's markov head.
+dspark_worker_v2 binds it under _is_hip."""
 
 from __future__ import annotations
 

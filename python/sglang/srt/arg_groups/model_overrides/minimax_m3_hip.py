@@ -158,7 +158,7 @@ def _is_m31_quark_export(hf_config: Any) -> bool:
 def _m31_quark_gfx950_overrides(cfg: Any, overrides: dict) -> None:
     """The gfx950 defaults minimax_m3_nvfp4 resolves, for an M3.1 Quark export: same
     MXFP8 linears, same MXFP4 aiter experts. At TP4 on MI355X the Triton MXFP8
-    GEMMs alone halve batch-1 decode (94 vs 206 tok/s at 8K input)."""
+    GEMMs alone halve batch-1 decode."""
     # the aiter block-scale GEMMs (tuned rows registered by the caller) instead of
     # the Triton MXFP8 linear kernel
     if not envs.SGLANG_FORCE_MXFP8_BLOCK_CONVERT_DENSE.is_set():

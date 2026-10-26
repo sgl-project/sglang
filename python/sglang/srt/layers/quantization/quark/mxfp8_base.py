@@ -23,15 +23,12 @@ if TYPE_CHECKING:
 
 
 def is_mxfp8_base_nvfp4_moe_source(config: Dict[str, Any]) -> bool:
-    """Whether `config` describes an MXFP8-serialized base (attention, dense
-    MLP, shared experts: fp8 weight + e8m0 [1, 32] `weight_scale_inv`) whose
-    routed experts are NVFP4 in llm-compressor's `nvfp4-pack-quantized` layout
-    (`weight_packed` / fp8 `weight_scale` / fp32 `weight_global_scale`).
+    """Whether `config` is an MXFP8-serialized base whose routed experts are NVFP4 in
+    llm-compressor's `nvfp4-pack-quantized` layout, as MiniMax-M3.1 ships it.
 
-    Produced for MiniMax-M3.1 (`quant_method="mxfp8"`, `moe_quant_algo="NVFP4"`).
-    Unlike the ModelOpt MIXED_PRECISION convention there is no per-layer map:
-    every linear layer outside `ignored_layers` is MXFP8 and only FusedMoE
-    routed experts are NVFP4.
+    Unlike ModelOpt MIXED_PRECISION there is no per-layer map: every linear outside
+    `ignored_layers` is MXFP8 (fp8 weight + e8m0 [1, 32] `weight_scale_inv`), and only
+    the FusedMoE routed experts are NVFP4.
     """
     if str(config.get("quant_method", "")).lower() != "mxfp8":
         return False

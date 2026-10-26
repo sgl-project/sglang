@@ -34,8 +34,8 @@ def quark_shared_experts_fusion_disable_reason(quant_config) -> Optional[str]:
 def mxfp8_linear_scale_alias(name: str, params_dict: dict) -> str:
     """Newer Quark exports name the MXFP8 [1, 32] e8m0 scale of a linear layer
     `weight_scale`; Fp8LinearMethod registers it as `weight_scale_inv`. Only an
-    unmatched name is redirected, so checkpoints whose `weight_scale` is a real
-    parameter (per-tensor FP8, NVFP4 experts) load as before."""
+    unmatched name is redirected, so a `weight_scale` that is a real parameter
+    (per-tensor FP8, NVFP4 experts) keeps its name."""
     if (
         name.endswith(".weight_scale")
         and name not in params_dict
