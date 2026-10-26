@@ -1,5 +1,4 @@
 import json
-import weakref
 
 import msgspec
 import numpy as np
@@ -32,7 +31,8 @@ class MemoryBackend(StorageBackend):
         for key, named in zip(keys, parts):
             self.reads.append([name for name, _ in named])
             stored = self.objects[key]
-            out.append({name: memoryview(stored[name]) for name, _ in named})
+            # Like a real backend: the caller owns what a read returns.
+            out.append({name: memoryview(bytearray(stored[name])) for name, _ in named})
         return out
 
     def delete_many(self, keys, *, parts):
@@ -94,6 +94,13 @@ def through_json(ref: StoreRef) -> StoreRef:
     return StoreRef.from_builtins(json.loads(json.dumps(ref.to_builtins())))
 
 
+def read_all(store: OutputStore, refs, *, stash_type):
+    """Every field of each ref."""
+    return store.read_many(
+        [(ref, [s.name for s in ref.fields]) for ref in refs], stash_type=stash_type
+    )
+
+
 def test_round_trip_through_a_json_ref():
     backend = MemoryBackend()
     store = OutputStore(backend=backend)
@@ -109,8 +116,8 @@ def test_round_trip_through_a_json_ref():
         6 * 48 * 8 * 4,
     )
 
-    got = store.get_many(
-        [through_json(ref) for ref in refs], stash_type=TokenOutputStash
+    got = read_all(
+        store, [through_json(ref) for ref in refs], stash_type=TokenOutputStash
     )
     for g, w in zip(got, stashes):
         assert_stash_equal(g, w)
@@ -124,7 +131,7 @@ def test_any_routed_experts_dtype_round_trips(dtype):
     assert {s.name: s.dtype for s in ref.fields}["routed_experts"] == np.dtype(
         dtype
     ).name
-    (got,) = store.get_many([ref], stash_type=TokenOutputStash)
+    (got,) = read_all(store, [ref], stash_type=TokenOutputStash)
     assert_stash_equal(got, stash)
 
 
@@ -134,9 +141,7 @@ def test_reading_a_subset_fetches_only_those_parts():
     stash = token_stash(4)
     (ref,) = store.put_many([stash])
 
-    (got,) = store.get_many(
-        [ref], stash_type=TokenOutputStash, fields=["routed_experts"]
-    )
+    (got,) = store.read_many([(ref, ["routed_experts"])], stash_type=TokenOutputStash)
     assert backend.reads[-1] == ["routed_experts"]
     np.testing.assert_array_equal(got.routed_experts, stash.routed_experts)
     assert got.indexer_topk is None and got.output_token_sampling_logprobs is None
@@ -150,7 +155,7 @@ def test_empty_fields_live_only_in_the_ref():
 
     assert all(s.nbytes == 0 for s in ref.fields)
     assert backend.objects[ref.key] == {}
-    (got,) = store.get_many([ref], stash_type=TokenOutputStash)
+    (got,) = read_all(store, [ref], stash_type=TokenOutputStash)
     assert_stash_equal(got, stash)
 
 
@@ -158,7 +163,7 @@ def test_dtype_is_opaque_to_the_store():
     store = OutputStore(backend=MemoryBackend())
     raw = RawField(dtype="bfloat16", shape=(2, 3), data=memoryview(bytes(range(12))))
     (ref,) = store.put_many([BytesStash(fields={"latents": raw})])
-    (got,) = store.get_many([ref], stash_type=BytesStash)
+    (got,) = read_all(store, [ref], stash_type=BytesStash)
     field = got.fields["latents"]
     assert (field.dtype, field.shape, bytes(field.data)) == (
         "bfloat16",
@@ -186,7 +191,7 @@ def test_refs_of_another_backend_are_rejected():
     (ref,) = store.put_many([token_stash(9)])
     other = msgspec.structs.replace(ref, backend="mooncake")
     with pytest.raises(ValueError, match="mooncake"):
-        store.get_many([other], stash_type=TokenOutputStash)
+        store.read_many([(other, ["routed_experts"])], stash_type=TokenOutputStash)
     with pytest.raises(ValueError, match="mooncake"):
         store.delete_many([other])
 
@@ -207,8 +212,10 @@ def test_unknown_codecs_fail_on_both_sides():
     (ref,) = store.put_many([token_stash(11)])
     fields = tuple(msgspec.structs.replace(s, codec="zstd") for s in ref.fields)
     with pytest.raises(ValueError, match="unknown codec"):
-        store.get_many(
-            [msgspec.structs.replace(ref, fields=fields)], stash_type=TokenOutputStash
+        read_all(
+            store,
+            [msgspec.structs.replace(ref, fields=fields)],
+            stash_type=TokenOutputStash,
         )
 
 
@@ -231,56 +238,18 @@ def test_empty_stash():
     assert not token_stash(12).is_empty()
 
 
-class BufferedBackend(MemoryBackend):
-    """Like a Mooncake client: a read fails unless it fits next to the read results still
-    referenced, and a result stays referenced while any view of it lives."""
-
-    def __init__(self, capacity_bytes: int):
-        super().__init__()
-        self.capacity_bytes = capacity_bytes
-        self.live_bytes = 0
-
-    def get_many(self, keys, *, parts):
-        requested = sum(nbytes for named in parts for _, nbytes in named)
-        if self.live_bytes + requested > self.capacity_bytes:
-            raise RuntimeError(
-                f"read buffer full: {self.live_bytes} live + {requested} requested"
-            )
-        out = []
-        for key, named in zip(keys, parts):
-            self.reads.append([name for name, _ in named])
-            got = {}
-            for name, _ in named:
-                buffer = _ReadBuffer(self.objects[key][name])
-                self.live_bytes += len(buffer)
-                weakref.finalize(buffer, self._release, len(buffer))
-                got[name] = memoryview(buffer)
-            out.append(got)
-        return out
-
-    def _release(self, nbytes):
-        self.live_bytes -= nbytes
-
-
-class _ReadBuffer(bytearray):
-    pass
-
-
-def test_read_many_reads_named_fields_in_chunks_and_copies_them_out():
-    stashes = [token_stash(20 + i) for i in range(3)]
-    largest = max(s.routed_experts.nbytes + s.indexer_topk.nbytes for s in stashes)
-    backend = BufferedBackend(capacity_bytes=largest)
+def test_read_many_reads_named_fields_into_arrays_the_caller_owns():
+    backend = MemoryBackend()
     store = OutputStore(backend=backend)
+    stashes = [token_stash(20 + i) for i in range(3)]
     refs = store.put_many(stashes)
 
     got = store.read_many(
         [(ref, ["routed_experts", "indexer_topk"]) for ref in refs],
         stash_type=TokenOutputStash,
-        buffer_bytes=largest,
     )
 
-    assert len(backend.reads) == 3
-    assert backend.live_bytes == 0
+    assert backend.reads == [["routed_experts", "indexer_topk"]] * 3
     for g, w in zip(got, stashes):
         np.testing.assert_array_equal(g.routed_experts, w.routed_experts)
         np.testing.assert_array_equal(g.indexer_topk, w.indexer_topk)
@@ -288,47 +257,13 @@ def test_read_many_reads_named_fields_in_chunks_and_copies_them_out():
         assert g.routed_experts.flags.writeable
 
 
-def test_read_many_splits_one_ref_across_chunks():
-    stash = token_stash(30)
-    backend = MemoryBackend()
-    store = OutputStore(backend=backend)
-    (ref,) = store.put_many([stash])
-    names = [
-        "routed_experts",
-        "output_token_sampling_mask_lengths",
-        "output_token_sampling_mask_token_ids",
-    ]
-
-    (got,) = store.read_many(
-        [(ref, names)],
-        stash_type=TokenOutputStash,
-        buffer_bytes=stash.routed_experts.nbytes,
-    )
-
-    assert backend.reads == [
-        ["routed_experts"],
-        ["output_token_sampling_mask_lengths", "output_token_sampling_mask_token_ids"],
-    ]
-    np.testing.assert_array_equal(got.routed_experts, stash.routed_experts)
-    np.testing.assert_array_equal(
-        got.output_token_sampling_mask_token_ids,
-        stash.output_token_sampling_mask_token_ids,
-    )
-
-
-def test_read_many_fails_before_reading_an_oversized_or_missing_field():
+def test_read_many_fails_before_reading_a_missing_field():
     backend = MemoryBackend()
     store = OutputStore(backend=backend)
     (ref,) = store.put_many([token_stash(31)])
-    with pytest.raises(ValueError, match="read buffer"):
-        store.read_many(
-            [(ref, ["indexer_topk", "routed_experts"])],
-            stash_type=TokenOutputStash,
-            buffer_bytes=1024,
-        )
     with pytest.raises(ValueError, match="no fields"):
         store.read_many(
-            [(ref, ["hidden_states"])], stash_type=TokenOutputStash, buffer_bytes=1024
+            [(ref, ["routed_experts", "hidden_states"])], stash_type=TokenOutputStash
         )
     assert backend.reads == []
 
@@ -337,8 +272,6 @@ def test_read_many_returns_empty_fields_without_reading():
     backend = MemoryBackend()
     store = OutputStore(backend=backend)
     (ref,) = store.put_many([token_stash(32, num_tokens=0, mask_rows=0)])
-    (got,) = store.read_many(
-        [(ref, ["routed_experts"])], stash_type=TokenOutputStash, buffer_bytes=0
-    )
+    (got,) = store.read_many([(ref, ["routed_experts"])], stash_type=TokenOutputStash)
     assert got.routed_experts.shape == (0, 48, 8)
     assert backend.reads == [[]]
