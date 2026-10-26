@@ -77,7 +77,7 @@ def partial_gluon(
     SCALE_BYTES: gl.constexpr,
     TILE: gl.constexpr,
 ):
-    gl.static_assert(SWAP_AB and H == 16 and (BT == 64 or BT == 128))
+    gl.static_assert(SWAP_AB and H == 16 and (BT == 32 or BT == 64 or BT == 128))
     b, t = gl.program_id(0), gl.program_id(1)
     kv_layout: gl.constexpr = gl.BlockedLayout([1, 8], [8, 8], [1, 4], [1, 0])
     n = gl.arange(0, BT, gl.SliceLayout(1, kv_layout))
@@ -158,4 +158,6 @@ def partial_gluon(
 
 
 # the SM100 host path (sink, combine, inverse RoPE) on the gfx950 split-KV kernel above
-swapab_attention = functools.partial(_swapab_attention, partial_gluon=partial_gluon)
+swapab_attention = functools.partial(
+    _swapab_attention, partial_gluon=partial_gluon, block=32
+)

@@ -107,11 +107,13 @@ def swapab_attention(
     extra_lengths=None,
     inv_rope=None,
     partial_gluon=None,
+    block=64,
 ):
     """V4-layout attention on 16 heads, or 32 as two head groups (SM100 kernel
     only); `extra_*` is a second slot range appended to each request's keys, and
     the attention sink is folded in exactly once.
-    `partial_gluon` replaces the SM100 split-KV kernel (swapab_gluon_hip passes gfx950's)."""
+    `partial_gluon` replaces the SM100 split-KV kernel and `block` is its tokens
+    per program (the SM100 kernel takes 64 or 128)."""
     b, h, d = q.shape[0], q.shape[-2], q.shape[-1]
     head_groups = h // NUM_HEADS
     assert h == NUM_HEADS or (h == 2 * NUM_HEADS and partial_gluon is None)
@@ -119,7 +121,6 @@ def swapab_attention(
     if partial_gluon is None:
         from .decode_attention_sm100_gluon import partial_gluon
 
-    block = 64
     assert q.ndim in (3, 4) and (q.ndim == 3 or q.shape[1] == 1)
     assert 0 < b <= MAX_ROWS and d == HEAD_DIM
     assert q.dtype == torch.bfloat16 and q.stride(-1) == 1
