@@ -287,6 +287,8 @@ class UnifiedGeometry(msgspec.Struct, frozen=True, kw_only=True):
     context_len: int = 256
     max_num_reqs: int = 4
     lazy: bool = True
+    # Paged extend and decode launch device kernels; their callers need "cuda".
+    device: str = "cpu"
 
 
 def _state_cache_params(geometry: UnifiedGeometry) -> SimpleNamespace:
@@ -311,7 +313,7 @@ def build_unified_bundle(geometry: UnifiedGeometry):
     g = geometry
     layer_ids = g.full_layer_ids + g.swa_layer_ids + g.state_layer_ids
     common = dict(
-        device="cpu",
+        device=g.device,
         kv_cache_dtype=g.kv_cache_dtype,
         page_size=g.page_size,
         start_layer=g.start_layer,
