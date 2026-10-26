@@ -31,11 +31,11 @@ class NpuEplbCommunication:
 
     # Resolve lazily so distributed initialization and WORLD replacement remain valid.
     @property
-    def group(self):
+    def group(self) -> torch.distributed.ProcessGroup | None:
         return get_eplb_device_group()
 
     @property
-    def device(self):
+    def device(self) -> str:
         return distribution.get_device_namespace().device
 
 
@@ -55,7 +55,9 @@ class NpuExpertDistributionGatherer(distribution._SelectExpertsSinglePassGathere
 
     Capture fixes the buffer slices written by each graph. Replay restores the
     graph's batching flag because Python routing hooks do not run on replay.
-    The recorder owns reset/collect around each recorded forward.
+    The recorder resets before a recorded forward and collects after all writes.
+    Buffered graph replays share storage and cannot be accumulated by replaying
+    multiple graphs for the same layers without an intervening collect/reset.
     """
 
     def __init__(self, *args, **kwargs):

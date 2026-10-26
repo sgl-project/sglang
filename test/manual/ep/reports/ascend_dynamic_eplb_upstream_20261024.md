@@ -1,7 +1,6 @@
 # Ascend dynamic EPLB: validation scope
 
-Status as of 2026-10-26, after consolidating NPU adapters at factories and
-the migration entry point.
+Status as of 2026-10-26, after NPU migration validation and copy refinements.
 Community base: `de7055f59645ebe03784b0980e1f222789f468a3`.
 
 ## Implementation scope
@@ -11,19 +10,29 @@ communication group, and ND staging for internal-format expert weights.
 It preserves upstream rebalance scheduling; the earlier automatic 64-step
 initial learning policy is not included.
 
+Before migrating a chunk, NPU validates corresponding tensor counts, shapes,
+dtypes, devices, and staging requirements. Ordinary tensors bypass ND staging;
+unchanged local placements still participate in sends but skip ND writeback.
+Workspaces are reused within a chunk and are not cached between rebalances.
+
 Six production files differ from the base: three NPU files and the shared
 recorder factory, weight updater, and ModelRunner entry points. The shared
 EPLB manager and decode graph runner are unchanged from the base.
 
 ## Validation status
 
-| Check | Status after adapter consolidation |
+| Check | Status after migration refinements |
 | --- | --- |
 | Source and call-chain review | Completed; this is not execution validation. |
 | Formatting and static checks during cleanup | Completed; no functional result is implied. |
-| CPU unit tests and GPU regression after adapter consolidation | Not run. |
+| CPU unit tests and GPU regression after migration refinements | Not run. |
 | NPU graph execution and HCCL weight migration after cleanup | Not run. |
 | Full-model correctness, PD acceptance, and performance after cleanup | Not run. |
+
+These copy reductions follow from the implementation; their latency and peak
+memory effects have not been measured. Debug workspace bytes describe logical
+tensor storage and exclude allocator padding and caching. Graph-statistics hooks
+are wired to the NPU full decode backend; other graph modes are not validated.
 
 The added unit tests and manual probes have been moved out of this PR and
 remain available in the [historical test tree](https://github.com/AkiYangDev/sglang/tree/46393a1ce8359fc226704702b14a157dfa77c7ee/test).

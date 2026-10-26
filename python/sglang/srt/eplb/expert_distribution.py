@@ -135,7 +135,11 @@ class ExpertDistributionMetrics:
 
 
 class ExpertDistributionRecorder(ABC):
-    """Global expert distribution recording"""
+    """Coordinate recording around each forward pass.
+
+    A gatherer produces per-layer counts for one pass; an accumulator retains
+    those counts across passes for reporting and EPLB placement decisions.
+    """
 
     @staticmethod
     def init_new(

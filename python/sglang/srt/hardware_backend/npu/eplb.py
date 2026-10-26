@@ -20,6 +20,7 @@ Import torch_npu only when an NPU operation actually needs it.
 
 import logging
 from functools import wraps
+from typing import Callable
 
 import torch
 import torch.distributed as dist
@@ -48,7 +49,7 @@ def get_eplb_device_group() -> dist.ProcessGroup | None:
 
         options = torch_npu._C._distributed_c10d.ProcessGroupHCCL.Options()
         # Keep migration off the forward graph's device-expanded HCCL group.
-        # EPLB needs a smaller buffer than the MoE dispatch group.
+        # Use a smaller buffer to limit this separate group's memory footprint.
         options.hccl_config = {
             "hccl_buffer_size": 32,
             "hccl_op_expansion_mode": 1,
@@ -61,8 +62,21 @@ def get_eplb_device_group() -> dist.ProcessGroup | None:
     return _device_group
 
 
-def prepare_expert_weight_update(weights_by_layer, layer_ids, old_map, new_map, update):
-    """Prepare one NPU migration chunk while reusing the shared slot algorithm."""
+def prepare_expert_weight_update(
+    *,
+    weights_by_layer: dict[int, list[torch.Tensor]],
+    layer_ids: list[int],
+    old_map: torch.Tensor,
+    new_map: torch.Tensor,
+    update_single_layer: Callable[..., object],
+) -> tuple[list[int], list[torch.Tensor] | None, Callable[..., object] | None]:
+    """Return selected layers, receive buffers, and a single-layer update callable.
+
+    Validate the entire chunk before allocating workspaces or moving weights.
+    The callable loads internal-format weights into ND storage, invokes the
+    shared migration algorithm, and writes changed local slots back in place.
+    Workspaces live only for this chunk and are reused across compatible layers.
+    """
     from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 
     if ElasticEPStateManager.instance() is None:
@@ -75,21 +89,76 @@ def prepare_expert_weight_update(weights_by_layer, layer_ids, old_map, new_map, 
     if not layer_ids:
         return layer_ids, None, None
 
+    rank = dist.get_rank()
+    _validate_migration_weights(weights_by_layer, layer_ids, rank)
     sample = weights_by_layer[layer_ids[0]]
     temp_buffers = create_temp_buffers(sample)
     staging = ExpertWeightStaging(sample)
     group = get_eplb_device_group()
+    if logger.isEnabledFor(logging.DEBUG):
+        # Logical tensor bytes exclude allocator padding and cached memory.
+        workspace_bytes = sum(t.numel() * t.element_size() for t in temp_buffers) + sum(
+            t.numel() * t.element_size() for t in staging.buffers if t is not None
+        )
+        logger.debug(
+            "[NPU EPLB] rank=%d layers=%d workspace_logical_bytes=%d",
+            rank,
+            len(layer_ids),
+            workspace_bytes,
+        )
 
-    def update_layer(*, routed_experts_weights, **kwargs):
-        result = update(
+    def update_layer(*, routed_experts_weights: list[torch.Tensor], **kwargs) -> object:
+        start = kwargs["rank"] * kwargs["num_local_physical_experts"]
+        end = start + kwargs["num_local_physical_experts"]
+        local_changed = (
+            kwargs["old_physical_to_logical_map"][start:end]
+            != kwargs["new_physical_to_logical_map"][start:end]
+        )
+        result = update_single_layer(
             routed_experts_weights=staging.load(routed_experts_weights),
             group=group,
             **kwargs,
         )
-        staging.store(routed_experts_weights)
+        # Unchanged local slots may still send; only their writeback is redundant.
+        if local_changed:
+            staging.store(routed_experts_weights)
         return result
 
     return layer_ids, temp_buffers, update_layer
+
+
+def _validate_migration_weights(
+    weights_by_layer: dict[int, list[torch.Tensor]], layer_ids: list[int], rank: int
+) -> None:
+    def specification(tensor):
+        return (
+            tuple(tensor.shape),
+            tensor.dtype,
+            tensor.device,
+            needs_nd_staging(tensor),
+        )
+
+    sample_layer = layer_ids[0]
+    expected = [specification(t) for t in weights_by_layer[sample_layer]]
+    if not expected:
+        raise ValueError(
+            f"[NPU EPLB] rank={rank} layer={sample_layer}: no expert weights"
+        )
+    for layer in layer_ids:
+        weights = weights_by_layer[layer]
+        if len(weights) != len(expected):
+            raise ValueError(
+                f"[NPU EPLB] rank={rank} layer={layer}: expected {len(expected)} "
+                f"weight tensors from layer {sample_layer}, got {len(weights)}"
+            )
+        for index, (tensor, spec) in enumerate(zip(weights, expected, strict=True)):
+            actual = specification(tensor)
+            if actual != spec:
+                raise ValueError(
+                    f"[NPU EPLB] rank={rank} layer={layer} tensor={index}: incompatible "
+                    f"migration workspace; (shape, dtype, device, needs_nd_staging) "
+                    f"expected {spec} from layer {sample_layer}, got {actual}"
+                )
 
 
 def needs_nd_staging(tensor: torch.Tensor) -> bool:
@@ -112,31 +181,31 @@ def create_temp_buffers(sample_tensors: list[torch.Tensor]) -> list[torch.Tensor
 
 
 class ExpertWeightStaging:
-    """Reuse one ND workspace across layers with matching weight shapes.
+    """Reuse ND buffers for internal-format tensors in a validated layer chunk.
 
     load() prepares the tensors that the updater mutates; store() copies the
     result into model storage without changing addresses held by captured graphs.
-    Ordinary weights pass through unchanged and need no extra workspace.
+    Ordinary tensors pass through directly, even in mixed-format weight lists.
     """
 
     def __init__(self, sample_tensors: list[torch.Tensor]):
         # Per-expert NZ conversion can copy the whole backing tensor.
-        self.buffers = (
-            create_temp_buffers(sample_tensors)
-            if any(needs_nd_staging(tensor) for tensor in sample_tensors)
+        self.buffers: list[torch.Tensor | None] = [
+            torch.empty(tensor.shape, dtype=tensor.dtype, device=tensor.device)
+            if needs_nd_staging(tensor)
             else None
-        )
+            for tensor in sample_tensors
+        ]
 
     def load(self, weights: list[torch.Tensor]) -> list[torch.Tensor]:
-        if self.buffers is None:
-            return weights
-        for buffer, weight in zip(self.buffers, weights, strict=True):
-            buffer.copy_(weight)
-        return self.buffers
+        return [
+            buffer.copy_(weight) if buffer is not None else weight
+            for buffer, weight in zip(self.buffers, weights, strict=True)
+        ]
 
     def store(self, weights: list[torch.Tensor]) -> None:
-        if self.buffers is not None:
-            for weight, buffer in zip(weights, self.buffers, strict=True):
+        for weight, buffer in zip(weights, self.buffers, strict=True):
+            if buffer is not None:
                 weight.copy_(buffer)
 
 

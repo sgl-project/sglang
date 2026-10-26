@@ -155,11 +155,11 @@ def _update_expert_weights_raw(
 
     if _is_npu:
         update_layer_ids, temp_buffers, update_layer = prepare_expert_weight_update(
-            routed_experts_weights_of_layer,
-            update_layer_ids,
-            old_expert_location_metadata.physical_to_logical_map_cpu,
-            new_expert_location_metadata.physical_to_logical_map_cpu,
-            update_expert_weights_single_layer,
+            weights_by_layer=routed_experts_weights_of_layer,
+            layer_ids=update_layer_ids,
+            old_map=old_expert_location_metadata.physical_to_logical_map_cpu,
+            new_map=new_expert_location_metadata.physical_to_logical_map_cpu,
+            update_single_layer=update_expert_weights_single_layer,
         )
         if not update_layer_ids:
             return {}
