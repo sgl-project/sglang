@@ -14,6 +14,7 @@ use dynamo_multimodal::processor::{
     ProcessedItem, Tensor, TensorData, TokenLayout,
 };
 use dynamo_multimodal::token_layout::layout_by_placeholder;
+use image::metadata::Orientation;
 use image::{DynamicImage, ImageDecoder, ImageFormat, ImageReader};
 
 /// Dynamo's planning spec plus the normalize and resize knobs it lacks.
@@ -196,8 +197,13 @@ pub(super) fn decode(
     limits: &DecodeLimits,
 ) -> Result<(Vec<u8>, usize, usize), MmError> {
     let (rgb, h, w) = decode_rgb_exif_transposed(data, limits)?;
-    match rgba(data)? {
-        Some(rgba) if rgba.len() == h * w * 4 => Ok((composite(&rgba, h, w), h, w)),
+    match alpha(data)? {
+        Some(alpha) if alpha.len() == h * w => {
+            let rgba: Vec<u8> = (rgb.chunks_exact(3).zip(alpha))
+                .flat_map(|(pixel, a)| [pixel[0], pixel[1], pixel[2], a])
+                .collect();
+            Ok((composite(&rgba, h, w), h, w))
+        }
         Some(_) => Err(MmError::invalid_input(
             "glm5_next: alpha and RGB decodes disagree",
         )),
@@ -205,24 +211,112 @@ pub(super) fn decode(
     }
 }
 
-/// The EXIF-transposed RGBA pixels of a PNG or WebP that carries alpha
-/// (PIL's RGBA, LA, or `transparency`).
-fn rgba(data: &[u8]) -> Result<Option<Vec<u8>>, MmError> {
+/// The alpha of PIL's `convert("RGBA")` for an image `smart_to_rgb` composites
+/// (RGBA, LA, or `transparency`), oriented as Dynamo orients the RGB.
+fn alpha(data: &[u8]) -> Result<Option<Vec<u8>>, MmError> {
     let invalid = |error: image::ImageError| MmError::invalid_input(error.to_string());
-    let reader = ImageReader::new(Cursor::new(data))
-        .with_guessed_format()
-        .map_err(|error| MmError::invalid_input(error.to_string()))?;
-    if !matches!(reader.format(), Some(ImageFormat::Png | ImageFormat::WebP)) {
-        return Ok(None);
-    }
-    let mut decoder = reader.into_decoder().map_err(invalid)?;
+    let format = match image::guess_format(data) {
+        Ok(ImageFormat::Gif) => return gif_alpha(data),
+        Ok(format @ (ImageFormat::Png | ImageFormat::WebP)) => format,
+        _ => return Ok(None),
+    };
+    let decoder = ImageReader::with_format(Cursor::new(data), format)
+        .into_decoder()
+        .map_err(invalid)?;
     if !decoder.color_type().has_alpha() {
         return Ok(None);
     }
-    let orientation = decoder.orientation().map_err(invalid)?;
     let mut image = DynamicImage::from_decoder(decoder).map_err(invalid)?;
-    image.apply_orientation(orientation);
-    Ok(Some(image.into_rgba8().into_raw()))
+    image.apply_orientation(exif_orientation(data, format)?);
+    Ok(Some(
+        image.into_rgba8().pixels().map(|pixel| pixel[3]).collect(),
+    ))
+}
+
+/// PIL opens a GIF's first frame as `P` with the frame's transparent index as
+/// `transparency`, and fills the canvas outside the frame with it (Dynamo's `GifImage`).
+fn gif_alpha(data: &[u8]) -> Result<Option<Vec<u8>>, MmError> {
+    let invalid = |error: gif::DecodingError| MmError::invalid_input(error.to_string());
+    let mut options = gif::DecodeOptions::new();
+    options.set_color_output(gif::ColorOutput::Indexed);
+    let mut decoder = options.read_info(data).map_err(invalid)?;
+    let (screen_w, screen_h) = (usize::from(decoder.width()), usize::from(decoder.height()));
+    let Some(frame) = decoder.read_next_frame().map_err(invalid)? else {
+        return Ok(None);
+    };
+    let Some(transparent) = frame.transparent else {
+        return Ok(None);
+    };
+    let (top, left) = (usize::from(frame.top), usize::from(frame.left));
+    let frame_w = usize::from(frame.width);
+    let w = screen_w.max(left + frame_w);
+    let h = screen_h.max(top + usize::from(frame.height));
+    let mut alpha = vec![0u8; h * w];
+    for (y, row) in frame.buffer.chunks_exact(frame_w).enumerate() {
+        let start = (top + y) * w + left;
+        for (a, &index) in alpha[start..start + frame_w].iter_mut().zip(row) {
+            *a = if index == transparent { 0 } else { 255 };
+        }
+    }
+    Ok(Some(alpha))
+}
+
+/// Dynamo's private `image::decode::exif_orientation`, which PIL follows and
+/// `ImageDecoder::orientation` does not: PNG falls back to a `Raw profile type exif`
+/// text chunk, and WebP EXIF may keep its `Exif\0\0` prefix. Dynamo already
+/// parsed the same bytes, so its rejections need no copy here.
+// TODO(sherlockwu): call Dynamo's once it is public.
+fn exif_orientation(data: &[u8], format: ImageFormat) -> Result<Orientation, MmError> {
+    let exif = match format {
+        ImageFormat::Png => png_exif(data)?,
+        _ => ImageReader::with_format(Cursor::new(data), format)
+            .into_decoder()
+            .and_then(|mut decoder| decoder.exif_metadata())
+            .map_err(|error| MmError::invalid_input(error.to_string()))?,
+    };
+    Ok(exif
+        .as_deref()
+        .and_then(|bytes| {
+            Orientation::from_exif_chunk(bytes.strip_prefix(b"Exif\0\0").unwrap_or(bytes))
+        })
+        .unwrap_or(Orientation::NoTransforms))
+}
+
+fn png_exif(data: &[u8]) -> Result<Option<Vec<u8>>, MmError> {
+    const KEYWORD: &str = "Raw profile type exif";
+    let invalid = |error: png::DecodingError| MmError::invalid_input(error.to_string());
+    let mut decoder = png::Decoder::new(Cursor::new(data));
+    decoder.set_ignore_iccp_chunk(true);
+    let mut reader = decoder.read_info().map_err(invalid)?;
+    if let Some(exif) = &reader.info().exif_metadata {
+        return Ok(Some(exif.to_vec()));
+    }
+    // Text chunks may follow IDAT; Dynamo accepts a truncated stream here too.
+    let _ = reader.finish();
+    let info = reader.info();
+    let mut plain = info.uncompressed_latin1_text.iter().rev();
+    let mut compressed = info.compressed_latin1_text.iter().rev();
+    let text = if let Some(chunk) = plain.find(|chunk| chunk.keyword == KEYWORD) {
+        chunk.text.clone()
+    } else if let Some(chunk) = compressed.find(|chunk| chunk.keyword == KEYWORD) {
+        let mut chunk = chunk.clone();
+        chunk.decompress_text().map_err(invalid)?;
+        chunk.get_text().map_err(invalid)?
+    } else {
+        return Ok(None);
+    };
+    // Pillow skips the three-line profile header, then reads whitespace-separated hex.
+    let nibbles: Option<Vec<u8>> = (text.split('\n').skip(3).flat_map(str::chars))
+        .filter(|c| !c.is_ascii_whitespace())
+        .map(|c| c.to_digit(16).map(|digit| digit as u8))
+        .collect();
+    Ok(nibbles
+        .filter(|nibbles| nibbles.len() % 2 == 0)
+        .map(|nibbles| {
+            (nibbles.chunks_exact(2))
+                .map(|pair| pair[0] * 16 + pair[1])
+                .collect()
+        }))
 }
 
 /// `background.paste(image, mask=alpha)`, with PIL's `BLEND` / `DIV255` rounding.

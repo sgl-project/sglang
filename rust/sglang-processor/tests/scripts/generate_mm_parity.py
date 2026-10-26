@@ -24,7 +24,7 @@ from types import SimpleNamespace
 import numpy as np
 import PIL
 from huggingface_hub import HfApi, snapshot_download
-from PIL import Image
+from PIL import Image, PngImagePlugin
 from transformers import AutoConfig
 
 from sglang.test.test_utils import maybe_stub_sgl_kernel
@@ -94,6 +94,24 @@ def animated_gif():
     )
 
 
+def transparent_gif():
+    image = Image.fromarray(gradient(56, 56, 18)).convert("P")
+    image.paste(0, (12, 8, 44, 40))
+    return encode(image, "GIF", transparency=0)
+
+
+def raw_profile_exif_rgba_png():
+    # Orientation in a text chunk: PIL reads it, eXIf-only readers miss it.
+    exif = Image.Exif()
+    exif[0x0112] = 6
+    data = exif.tobytes()
+    info = PngImagePlugin.PngInfo()
+    info.add_text("Raw profile type exif", f"\nexif\n{len(data):8d}\n{data.hex()}\n")
+    return encode(
+        Image.fromarray(gradient(56, 48, 19, channels=4)), "PNG", pnginfo=info
+    )
+
+
 # name -> encoded bytes. Small, deterministic, and each exercising one decode path.
 CORPUS = {
     "rgb_96x80.png": lambda: encode(Image.fromarray(gradient(96, 80)), "PNG"),
@@ -129,6 +147,8 @@ CORPUS = {
     "lossless_alpha_60x40.webp": lambda: encode(
         Image.fromarray(gradient(60, 40, 13, channels=4)), "WEBP", lossless=True
     ),
+    "transparent_56x56.gif": transparent_gif,
+    "rgba_raw_exif6_56x48.png": raw_profile_exif_rgba_png,
     "rgb_50x40.bmp": lambda: encode(Image.fromarray(gradient(50, 40, 14)), "BMP"),
     "tiny_10x10.png": lambda: encode(Image.fromarray(gradient(10, 10, 15)), "PNG"),
     "large_800x600.jpg": lambda: encode(

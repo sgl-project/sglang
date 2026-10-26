@@ -7,6 +7,7 @@ import logging
 from typing import TYPE_CHECKING, Any, Callable, Dict, FrozenSet, Optional, Tuple
 
 import msgspec
+from PIL import Image
 
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_mm, get_parallel, get_serving
@@ -81,6 +82,9 @@ def _rust_resample(image_processor, resamples: Dict[str, str]) -> Optional[str]:
     if not all(getattr(image_processor, stage, True) for stage in stages):
         return None
     if getattr(image_processor, "rescale_factor", None) != 1 / 255:
+        return None
+    # Both Rust resamplers are bicubic.
+    if image_processor.resample != Image.Resampling.BICUBIC:
         return None
     return resample
 

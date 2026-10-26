@@ -11,6 +11,8 @@ silently reroute them.
 import unittest
 from types import SimpleNamespace
 
+from PIL import Image
+
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
@@ -50,6 +52,20 @@ class TestRustMmGate(CustomTestCase):
         cls = processor_cls_for("Glm5NextForConditionalGeneration", "glm5_next")
         family = rust_mm_family_for(cls, "glm5_next")
         self.assertEqual(family and family.name, "glm5_next")
+
+    def test_glm5_next_serves_only_bicubic(self):
+        from transformers.models.glm5_next import Glm5NextImageProcessor
+
+        from sglang.srt.rust_server.multimodal import (
+            _GLM5_NEXT_RESAMPLE,
+            _rust_resample,
+        )
+
+        bicubic = Glm5NextImageProcessor()
+        self.assertEqual(_rust_resample(bicubic, _GLM5_NEXT_RESAMPLE), "aten_u8")
+        # Rust would still resize bicubic.
+        nearest = Glm5NextImageProcessor(resample=Image.Resampling.NEAREST)
+        self.assertIsNone(_rust_resample(nearest, _GLM5_NEXT_RESAMPLE))
 
     def test_deepseek_v41_resolves_its_family(self):
         cls = processor_cls_for("DeepseekV4ForCausalLM", "deepseek_v41")
