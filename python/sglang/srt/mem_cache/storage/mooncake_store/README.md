@@ -43,7 +43,9 @@ configuration:
 --linker-prefetch-policy timeout
 ```
 
-Keep Mooncake connection settings in `--hicache-storage-backend-extra-config`.
+Set Mooncake connection settings with `--unified-cache-external-linker-config`.
+The deprecated `--hicache-storage-backend-extra-config` is used only when the
+linker configuration is omitted.
 
 Prefetch starts when the scheduler enqueues a request through
 `_prefetch_kvcache()`. It reads into private GPU slots, then inserts complete KV
@@ -61,7 +63,7 @@ Select the linker admission policy with `--linker-prefetch-policy`:
 - `timeout` (default): wait up to `prefetch_timeout_base` plus the requested token
   count / 1024 times `prefetch_timeout_per_ki_token`, starting at the first
   blocked admission poll. The defaults are 1 second and 0.25 seconds per 1024
-  tokens. Set these through `--hicache-storage-backend-extra-config`.
+  tokens. Set these through the same linker configuration.
 
 Only complete, successful full-layer reads are published. Stopping the wait
 cancels queued reads; a running Store read retains its private slots until all
@@ -69,6 +71,18 @@ ranks stop writing, then releases them without publishing. Those slots continue
 to consume GPU capacity during cleanup. Reset and shutdown also drain the load
 thread before freeing slots. Layer-wise queues, counters, and MLA broadcast are
 unchanged.
+
+### Decode context parallelism (DCP)
+
+Mooncake L3 supports DCP for one materialized MLA KV pool and optional KDA
+state, using `layer_first`, `page_first`, or `page_first_direct`. GQA/MHA, other
+host pools, split KV buffers, and separate KV scale buffers are not supported
+with DCP.
+
+DCP keys separate TP/DCP/PP/CP sizes and logical page sizes. With TP=4/DCP=2,
+ranks 0 and 1 write two shards per page; ranks 2 and 3 read those same objects.
+Use matching model settings. KV format and host layout are not yet in the keys;
+use different `extra_backend_tag` values when these differ.
 
 ## Install Mooncake
 

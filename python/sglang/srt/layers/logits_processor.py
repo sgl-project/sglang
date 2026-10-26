@@ -24,6 +24,7 @@ import torch
 from torch import nn
 
 from sglang.kernels.ops.activation.softcap import (
+    cast_to_float32_logits,
     gathered_softcap_logits,
 )
 from sglang.kernels.ops.activation.softcap import (
@@ -463,6 +464,9 @@ class LogitsProcessor(nn.Module):
         self.use_tp_lm_head_all_to_all = get_parallel().enable_tp_lm_head_all_to_all
         self.use_fp32_lm_head = get_exec().features.enable_fp32_lm_head or getattr(
             config, "enable_lm_head_fp32", False
+        )
+        self.use_fp32_lm_head_output = getattr(
+            config, "enable_lm_head_output_fp32", False
         )
         if self.use_attn_tp_group:
             self.attn_tp_size = get_parallel().attn_tp_size
@@ -1091,7 +1095,9 @@ class LogitsProcessor(nn.Module):
             )
             # A shared FP32 buffer must not change the lm_head's output precision.
             # Keep the same rounding as the unbuffered path unless FP32 is enabled.
-            if use_mm_out_dtype and self.use_fp32_lm_head:
+            if use_mm_out_dtype and (
+                self.use_fp32_lm_head or self.use_fp32_lm_head_output
+            ):
                 logits = torch.mm(
                     hidden_states,
                     lm_head.weight.T,
@@ -1279,6 +1285,9 @@ class LogitsProcessor(nn.Module):
             logits.shape
         ):
             assert logits_buffer.dtype == torch.float
+            if logits.is_cuda and logits.dtype in (torch.float16, torch.bfloat16):
+                # Measured on GB300: torch's dtype-casting copy_ is ~2.8x slower.
+                return cast_to_float32_logits(logits, logits_buffer)
             logits_buffer.copy_(logits)
             logits = logits_buffer
         else:

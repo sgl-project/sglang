@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import atexit
+import json
 import logging
 import threading
 import time
@@ -322,6 +323,8 @@ class UnifiedRadixCache(BasePrefixCache):
         # constructs the pipeline collaborator (None = cache mode).
         self.host_memory_mode = "cache"
         self.buffer_pipeline: Optional[BufferModePipeline] = None
+        # Session of the insert whose actions are being applied (see ``insert``).
+        self.insert_session_id: Optional[str] = None
         # Write-side dedupe: beliefs about what storage already holds, so
         # re-inserts of hot prefixes skip the redundant backup.
         self.storage_existence_cache = StorageExistenceCache()
@@ -410,7 +413,9 @@ class UnifiedRadixCache(BasePrefixCache):
     def init_cache_linker(self, cache_linker: UnifiedCacheLinker) -> None:
         """Attach an external KV store directly to the device pools."""
         if cache_linker.load_mode == "prefetch":
-            self.prefetch_stop_policy = get_memory().linker_prefetch_policy
+            memory = get_memory()
+            self.prefetch_stop_policy = memory.linker_prefetch_policy
+            config = memory.unified_cache_external_linker_config
             (
                 _,
                 _,
@@ -418,7 +423,9 @@ class UnifiedRadixCache(BasePrefixCache):
                 timeout_per_ki_token,
                 _,
             ) = HybridCacheController.parse_storage_backend_extra_config(
-                get_memory().hicache_storage_backend_extra_config
+                json.dumps(config)
+                if config is not None
+                else memory.hicache_storage_backend_extra_config
             )
             self.prefetch_timeout_per_page = (
                 self.page_size / 1024 * timeout_per_ki_token
@@ -677,6 +684,8 @@ class UnifiedRadixCache(BasePrefixCache):
         assert not self.tree_core.has_ongoing_insert(), "re-entrant insert"
         if self.buffer_pipeline is not None:
             self.buffer_pipeline.begin_insert_walk()
+        # External linker offloads (BackupKV) issued by this insert carry its session.
+        self.insert_session_id = params.session_id
         # Pump the resumable insert, applying each step's actions at its barrier.
         try:
             step = self.tree_core.begin_insert(params)
@@ -689,7 +698,10 @@ class UnifiedRadixCache(BasePrefixCache):
                 step = self.tree_core.resume_insert()
         finally:
             # Drain still-pending actions so frees reach the allocator on abort.
-            self._apply_cache_actions(self.tree_core.end_insert())
+            try:
+                self._apply_cache_actions(self.tree_core.end_insert())
+            finally:
+                self.insert_session_id = None
             if self.buffer_pipeline is not None:
                 self.buffer_pipeline.end_insert_walk()
 
