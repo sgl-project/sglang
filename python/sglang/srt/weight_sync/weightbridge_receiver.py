@@ -66,8 +66,8 @@ class WeightBridgeReceiver:
             f"[wbridge] receiver ready: {tp_rank=} {tp_size=} {engine_port=} coordinator={ipc}"
         )
 
-    def poll(self, *, quiesce: Callable[[], None]) -> Optional[int]:
-        """Service one control round; return the update's epoch once its weights are loaded.
+    def poll(self, *, quiesce: Callable[[], None]) -> Optional[str]:
+        """Service one control round; return the update's weight version once its weights are loaded.
 
         ``quiesce`` runs on every rank after WeightBridge's GO and before any weight is written.
         """
@@ -86,8 +86,16 @@ class WeightBridgeReceiver:
             f"[wbridge] consume_end epoch={epoch[0]} tp_rank={self._tp_rank} "
             f"t_ns={time.time_ns()}"
         )
-        return epoch[0]
+        return _weight_version_of(self._adapter.update_metadata, epoch=epoch[0])
 
     def flush_profile_outputs(self) -> None:
         """Release WeightBridge profiling output once the scheduler has resumed (rollout block_end)."""
         self._adapter.flush_profile_outputs()
+
+
+def _weight_version_of(metadata: object, *, epoch: int) -> str:
+    # Trainers tag each update with send_weights(metadata={"weight_version": v}); an untagged update
+    # falls back to the count of updates received, which starts at 1.
+    if isinstance(metadata, dict) and metadata.get("weight_version") is not None:
+        return str(metadata["weight_version"])
+    return str(epoch + 1)
