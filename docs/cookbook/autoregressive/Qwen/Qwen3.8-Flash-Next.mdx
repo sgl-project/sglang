@@ -82,6 +82,23 @@ import { agentx } from "/src/snippets/agentx/Qwen/qwen3.8-flash-next.jsx";
 
 <AgentX data={agentx} />
 
+### ReplaySSM verify pipeline tuning
+
+The measured Rubin TP1 recipe uses BF16 SSM checkpoints, NEXTN with three steps
+and four draft tokens, and `--enable-linear-replayssm-spec`. Add this environment
+setting to that worker's launch recipe:
+
+```bash
+export SGLANG_GDN_REPLAYSSM_VERIFY_NUM_STAGES=3
+```
+
+The default is `2`. Three stages reduced verify latency on this Rubin recipe,
+but GB300 microbenchmarks showed regressions with FP32 checkpoints and some
+other head/batch shapes. Keep the default for unmeasured configurations, or
+compare both values on the deployment GPU before opting in. This setting affects
+only GDN ReplaySSM target verification; KDA, ordinary decode and prefill retain
+their existing launches.
+
 ## 1. Model Introduction
 
 **Qwen3.8-Flash-Next** is a multimodal Mixture-of-Experts model released as an early preview of the architecture Qwen4 is being built on — the same role Qwen3-Next played for Qwen3.5, whose hybrid Gated DeltaNet + Gated Attention design then carried through the Qwen3.5, Qwen3.6, Qwen3.7 and Qwen3.8 series. Qwen is publishing the architectural changes ahead of the full Qwen4 family so the community can evaluate them independently.
