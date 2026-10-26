@@ -488,14 +488,9 @@ def get_available_gpu_memory(
 
     elif device == "cpu":
         # TODO: rename the variables in the current function to be not GPU specific
-        # Per-rank bytes: min(host available / NUMA nodes, cgroup remaining / local ranks)
-        parallel = get_parallel()
-        free_gpu_memory = get_free_cpu_memory_per_rank(
-            num_local_ranks=parallel.dp_size
-            * parallel.tp_size
-            * parallel.pp_size
-            // parallel.nnodes
-        )
+        total_free_memory = get_free_cpu_memory()
+        n_numa_node: int = len(get_cpu_ids_by_node())
+        free_gpu_memory = round(total_free_memory / n_numa_node, 3)
     elif device == "npu":
         num_gpus = torch.npu.device_count()
         assert gpu_id < num_gpus
@@ -899,33 +894,17 @@ def get_instance_memory_status(cgroup_file: str) -> Optional[int]:
 
 def get_free_cpu_memory() -> int:
     free_cpu_memory = psutil.virtual_memory().available
-    instance_free_cpu_memory = _get_free_cgroup_memory()
-    if instance_free_cpu_memory is not None:
-        free_cpu_memory = min(free_cpu_memory, instance_free_cpu_memory)
-    return free_cpu_memory
-
-
-def get_free_cpu_memory_per_rank(*, num_local_ranks: int) -> float:
-    num_local_ranks = num_local_ranks or 1
-    numa_count = len({node for _, _, _, node in parse_lscpu_topology()}) or 1
-    memory_per_rank = psutil.virtual_memory().available / numa_count
-    instance_free_cpu_memory = _get_free_cgroup_memory()
-    if instance_free_cpu_memory is not None:
-        # Local model workers are assumed to share this cgroup's allowance.
-        memory_per_rank = min(
-            memory_per_rank, instance_free_cpu_memory / num_local_ranks
-        )
-    return round(memory_per_rank, 3)
-
-
-def _get_free_cgroup_memory() -> Optional[int]:
     instance_max_cpu_memory = get_instance_memory_status("/sys/fs/cgroup/memory.max")
     instance_current_cpu_memory = get_instance_memory_status(
         "/sys/fs/cgroup/memory.current"
     )
-    if instance_max_cpu_memory is None or instance_current_cpu_memory is None:
-        return None
-    return max(0, instance_max_cpu_memory - instance_current_cpu_memory)
+    if instance_max_cpu_memory is not None and instance_current_cpu_memory is not None:
+        instance_free_cpu_memory = max(
+            0, instance_max_cpu_memory - instance_current_cpu_memory
+        )
+        free_cpu_memory = min(free_cpu_memory, instance_free_cpu_memory)
+
+    return free_cpu_memory
 
 
 def get_cpu_memory_capacity():
@@ -4530,6 +4509,7 @@ def get_physical_cpus_by_numa():
 
 
 # Only physical cores are used. Logical cores are excluded.
+@lru_cache(maxsize=1)
 def get_cpu_ids_by_node():
     node_to_cpus = get_physical_cpus_by_numa()
     # Sort by NUMA node index
