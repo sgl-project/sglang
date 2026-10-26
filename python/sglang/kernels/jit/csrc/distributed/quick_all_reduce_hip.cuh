@@ -1,7 +1,5 @@
-// TVM-FFI entry points over the JIT quick all-reduce (quick_all_reduce/quick_all_reduce.h): the
-// calls sgl-kernel exposes as qr_* (kernels/aot/csrc/allreduce/quick_all_reduce.cu), on a
-// latency-restructured two-shot kernel, for INT4 and INT8 at TP4 on bf16 cast to fp16 only, where it
-// matches sgl-kernel's bitwise.
+// TVM-FFI entry points for sgl-kernel's qr_* calls (kernels/aot/csrc/allreduce/quick_all_reduce.cu) over the
+// JIT copy in quick_all_reduce/, which serves INT4 and INT8 at TP4 on bf16 cast to fp16 only.
 #pragma once
 
 #ifndef USE_ROCM

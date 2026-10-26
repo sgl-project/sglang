@@ -359,8 +359,6 @@ struct AllReduceTwoshot {
     }
   }
 
-  // Each send phase: every wave waits for its own remote stores, then one lane per rank raises
-  // that rank's flag.
   __quickreduce_device_inline__ static void
   raise_flags(uint8_t* const* peer, uint32_t flags_offset, int rank, uint32_t flag_color) {
     int thread = threadIdx.x + threadIdx.y * kWavefront;

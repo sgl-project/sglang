@@ -1,6 +1,6 @@
-// JIT copy of sgl-kernel's kernels/aot/csrc/allreduce/quick_all_reduce_base.h, cut to what the INT4 two-shot
-// of quick_all_reduce.cuh uses: fp16 arithmetic on bf16 data cast at load and store. The grid cap comes from the
-// Python loader (QR_MAX_BLOCKS). Keep the arithmetic in step with the AOT copy: the outputs are bit-identical to it.
+// JIT copy of sgl-kernel's kernels/aot/csrc/allreduce/quick_all_reduce_base.h, cut to what the INT4 / INT8
+// two-shot of quick_all_reduce.cuh uses: fp16 arithmetic on bf16 data cast at load and store. Keep the
+// arithmetic in step with the AOT copy: the outputs are bit-identical to it.
 #pragma once
 
 #include <hip/hip_bf16.h>
