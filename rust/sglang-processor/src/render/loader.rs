@@ -170,6 +170,27 @@ mod tests {
         .unwrap()
     }
 
+    /// A DeepSeek-V3.2 checkpoint's own template wins over the native encoder, as in Python.
+    #[test]
+    fn deepseek_v32_template_precedes_native_encoder() {
+        let dir = std::env::temp_dir().join(format!("sglang-dsv32-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.json"), r#"{"model_type":"deepseek_v32"}"#).unwrap();
+        let render = |config: &str| {
+            std::fs::write(dir.join("tokenizer_config.json"), config).unwrap();
+            let options = ChatFormatterOptions {
+                tokenizer_path: dir.to_str().unwrap().into(),
+                ..Default::default()
+            };
+            let formatter = select_chat_formatter(&options).0.unwrap();
+            formatter.render(&request()).unwrap()
+        };
+        assert!(render("{}").contains("<｜User｜>Hello"));
+        let custom = r#"{"chat_template": "CUSTOM {{ messages[1].content }}"}"#;
+        assert_eq!(render(custom), "CUSTOM Hello");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn json_legacy_template_is_rendered_natively() {
         let base = std::env::temp_dir().join(format!(
