@@ -369,7 +369,8 @@ def server(monkeypatch, tmp_path):
             path = tmp_path / f"{batch.request_id}_{idx}.png"
             Image.new("RGB", (16, 16), "red").save(path)
             paths.append(str(path))
-        return OutputBatch(output_file_paths=paths)
+        image_bytes = [open(path, "rb").read() for path in paths]
+        return OutputBatch(output_file_paths=paths, output_image_bytes=image_bytes)
 
     monkeypatch.setattr(async_scheduler_client, "forward", forward)
     app = http_server.create_app(args)

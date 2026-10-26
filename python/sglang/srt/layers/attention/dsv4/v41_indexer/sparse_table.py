@@ -200,7 +200,7 @@ class SparseTableBackend:
         k_cache = get_index_k_cache(
             token_to_kv_pool=self.token_to_kv_pool,
             layer_id=inputs.layer_id,
-            page_size=inputs.paged_metadata.compressed_page_size,
+            page_size=inputs.index_page_size,
         )
         logits = _prefill_table_logits(published, q_fp4, q_sf, inputs.weights, k_cache)
         topk = min(indexer.index_topk, published.blocks.shape[1] * CANDIDATE_BLOCK_SIZE)

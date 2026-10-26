@@ -293,7 +293,10 @@ class TestRowBucketMoeBound(CustomTestCase):
 
                 def record(body, rows, count, batch, start, free_before):
                     body()
-                    return SimpleNamespace(batch=(), num_token_non_padded=count)
+                    return SimpleNamespace(
+                        batch=(),
+                        num_token_non_padded=count,
+                    )
 
                 runner = RowBucketGraphRunner(row_step=8, max_rows=8, label="test")
                 with (
@@ -309,6 +312,7 @@ class TestRowBucketMoeBound(CustomTestCase):
                         body,
                         lambda batch, inputs: nullcontext(),
                     )
+                    self.assertIsNone(graph.global_num_token_non_padded)
                     graph.num_token_non_padded.fill_(7)
                     outer_batch.num_token_non_padded.fill_(1)
                     if active_context:
@@ -319,16 +323,186 @@ class TestRowBucketMoeBound(CustomTestCase):
                         )
                 self.assertFalse(has_forward_context())
 
+    def test_global_tail_count_replays_without_borrowing_the_parent(self):
+        """Gathered MoE rows use the live GLOBAL prefix, including an idle replay;
+        each attention-TP rank retains a separately localized count."""
+        for rank in range(4):
+            with (
+                self.subTest(rank=rank),
+                get_parallel().override(
+                    attn_dp_size=1, attn_cp_size=1, attn_tp_size=4, attn_tp_rank=rank
+                ),
+                sparse_moe_input("ffn"),
+            ):
+                parent = _forward_batch(sharded=True, local=27, glob=97)
+                if rank in (1, 3):
+                    parent.num_token_non_padded = parent.num_token_non_padded.reshape(1)
+                if rank in (2, 3):
+                    parent.global_num_token_non_padded = (
+                        parent.global_num_token_non_padded.reshape(1)
+                    )
+                original_local = parent.num_token_non_padded
+                original_global = parent.global_num_token_non_padded
+                runner = RowBucketGraphRunner(row_step=8, max_rows=16, label="test")
+                observed = []
+
+                def body(inputs, batch):
+                    bound = get_forward_context().moe_num_token_non_padded()
+                    if bound is None:
+                        observed.append((None, None, None))
+                        return [torch.zeros(inputs[0].shape[0], 1, dtype=torch.bool)]
+                    expected = (
+                        batch.global_num_token_non_padded
+                        if batch.attn_tp_sequence_sharded
+                        else batch.num_token_non_padded
+                    )
+                    self.assertIs(bound, expected)
+                    self.assertIsNot(bound, original_global)
+                    self.assertIsNot(batch.num_token_non_padded, original_local)
+                    self.assertEqual(
+                        batch.num_token_non_padded.shape, original_local.shape
+                    )
+                    if batch.attn_tp_sequence_sharded:
+                        self.assertEqual(bound.shape, original_global.shape)
+                        self.assertIsNot(bound, batch.num_token_non_padded)
+                    observed.append(
+                        (int(bound), int(batch.num_token_non_padded), bound)
+                    )
+                    return [(torch.arange(inputs[0].shape[0]) < bound).reshape(-1, 1)]
+
+                def record(body, rows, count, batch, start, free_before):
+                    outputs = body()
+
+                    def replay():
+                        for output, value in zip(outputs, body()):
+                            output.copy_(value)
+
+                    return SimpleNamespace(
+                        graph=SimpleNamespace(replay=replay),
+                        batch=(),
+                        outputs=outputs,
+                        num_token_non_padded=count,
+                    )
+
+                addresses = {}
+                with (
+                    forward_context(
+                        ForwardContext(attn_backend=None), forward_batch=parent
+                    ),
+                    patch.object(torch.cuda, "mem_get_info", return_value=(1, 2)),
+                    patch.object(runner, "_record", side_effect=record),
+                    patch(
+                        "sglang.srt.model_executor.runner.row_bucket_graph_runner.graph_pool_replay_scope",
+                        side_effect=nullcontext,
+                    ),
+                ):
+                    for live, bucket, local_counts in (
+                        (10, 16, [4, 4, 2, 0]),
+                        (3, 8, [2, 1, 0, 0]),
+                        (7, 8, [2, 2, 2, 1]),
+                        (0, 8, [0, 0, 0, 0]),
+                        (10, 16, [4, 4, 2, 0]),
+                    ):
+                        outputs = runner.run(
+                            key=(),
+                            live=[torch.ones(live, 1)],
+                            forward_batch=parent,
+                            body=body,
+                            context=lambda batch: nullcontext(),
+                            bucket_from=bucket,
+                            global_num_rows=live,
+                        )
+                        self.assertEqual(observed[-1][:2], (live, local_counts[rank]))
+                        self.assertTrue(outputs[0].all())
+                        pointer = observed[-1][2].data_ptr()
+                        self.assertEqual(addresses.setdefault(bucket, pointer), pointer)
+                        self.assertIs(parent.num_token_non_padded, original_local)
+                        self.assertIs(
+                            parent.global_num_token_non_padded, original_global
+                        )
+                        self.assertEqual(int(original_local), 27)
+                        self.assertEqual(int(original_global), 97)
+                        self.assertIs(
+                            get_forward_context().moe_num_token_non_padded(),
+                            original_global,
+                        )
+                    parent.attn_tp_sequence_sharded = False
+                    runner.run(
+                        key=(),
+                        live=[torch.ones(3, 1)],
+                        forward_batch=parent,
+                        body=body,
+                        context=lambda batch: nullcontext(),
+                    )
+                    self.assertEqual(observed[-1][:2], (3, 3))
+                    self.assertNotEqual(observed[-1][2].data_ptr(), addresses[8])
+                    parent.attn_tp_sequence_sharded = True
+                    runner.run(
+                        key=(),
+                        live=[torch.ones(3, 1)],
+                        forward_batch=parent,
+                        body=body,
+                        context=lambda batch: nullcontext(),
+                        global_num_rows=3,
+                    )
+                    self.assertEqual(observed[-1][2].data_ptr(), addresses[8])
+                    parent.attn_tp_sequence_sharded = False
+                    parent.num_token_non_padded = None
+                    runner.run(
+                        key=(),
+                        live=[torch.ones(3, 1)],
+                        forward_batch=parent,
+                        body=body,
+                        context=lambda batch: nullcontext(),
+                    )
+                    self.assertEqual(observed[-1], (None, None, None))
+                    parent.num_token_non_padded = original_local
+                self.assertNotEqual(addresses[8], addresses[16])
+
+    def test_global_tail_count_rejects_an_out_of_bucket_prefix(self):
+        runner = RowBucketGraphRunner(row_step=8, max_rows=8, label="test")
+        for count in (-1, 9):
+            with self.subTest(count=count), self.assertRaises(AssertionError):
+                runner.run(
+                    key=(),
+                    live=[torch.ones(3, 1)],
+                    forward_batch=_forward_batch(sharded=True),
+                    body=lambda inputs, batch: inputs,
+                    context=lambda batch: nullcontext(),
+                    global_num_rows=count,
+                )
+        for field in ("num_token_non_padded", "global_num_token_non_padded"):
+            for invalid in (
+                torch.ones((), dtype=torch.int64),
+                torch.ones(2, dtype=torch.int32),
+                torch.ones(1, 1, dtype=torch.int32),
+            ):
+                with (
+                    self.subTest(field=field, dtype=invalid.dtype, shape=invalid.shape),
+                    patch.object(torch.cuda, "mem_get_info", return_value=(1, 2)),
+                    self.assertRaises(AssertionError),
+                ):
+                    batch = _forward_batch(sharded=True)
+                    setattr(batch, field, invalid)
+                    runner._capture(
+                        8,
+                        3,
+                        [torch.zeros(8, 1)],
+                        batch,
+                        lambda inputs, batch: inputs,
+                        lambda batch, inputs: nullcontext(),
+                        global_num_rows=3,
+                    )
+
 
 class TestDecoderReplayTailMoeBound(CustomTestCase):
-    # A row graph replaces LOCAL only, so even equal-valued or aliased GLOBAL
-    # buffers cannot establish that the captured getter reads its own count.
+    # GLOBAL is opted in only for the gathered, attention-TP-sharded layout.
     _CASES = (
         ("local", False, 3, 7, False, True),
-        ("global", True, 3, 7, False, False),
-        ("equal_global", True, 3, 3, False, False),
-        ("aliased_local", False, 3, 3, True, False),
-        ("aliased_global", True, 3, 3, True, False),
+        ("global", True, 3, 7, False, True),
+        ("equal_global", True, 3, 3, False, True),
+        ("aliased_local", False, 3, 3, True, True),
+        ("aliased_global", True, 3, 3, True, True),
         ("unbounded_global", True, 3, None, False, True),
         ("absent_local", True, None, 7, False, True),
     )
@@ -346,7 +520,7 @@ class TestDecoderReplayTailMoeBound(CustomTestCase):
         )
         return batch, tail
 
-    def test_eager_prefill_declines_a_separate_moe_count_buffer(self):
+    def test_eager_prefill_admits_only_owned_moe_count_domains(self):
         for label, sharded, local, glob, alias, expected in self._CASES:
             with (
                 self.subTest(bound=label),
@@ -386,7 +560,7 @@ class TestDecoderReplayTailMoeBound(CustomTestCase):
                 self.assertIsNone(dp_rows)
                 self.assertIs(batch.global_num_token_non_padded, original_global)
 
-    def test_prefill_graph_break_keeps_a_separate_moe_count_eager(self):
+    def test_prefill_graph_break_admits_only_owned_moe_count_domains(self):
         for label, sharded, local, glob, alias, expected in self._CASES:
             with (
                 self.subTest(bound=label),
@@ -442,6 +616,15 @@ class TestDecoderReplayTailMoeBound(CustomTestCase):
                 )
                 backend.exit_late_layer_tail.assert_called_once_with(None, batch)
                 self.assertIs(batch.global_num_token_non_padded, original_global)
+
+    def test_custom_moe_count_has_no_graph_owner(self):
+        batch = _forward_batch(sharded=True)
+        with patch.object(
+            ForwardBatch, "moe_num_token_non_padded", return_value=torch.tensor(3)
+        ):
+            self.assertFalse(
+                replay_tail.DecoderReplayTail._can_capture_moe_bound(batch)
+            )
 
 
 if __name__ == "__main__":

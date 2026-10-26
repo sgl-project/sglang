@@ -1120,8 +1120,12 @@ class GemmaRMSNorm(BaseFusedOp):
     def _weight_loader(self, param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
         assert param.size() == loaded_weight.size()
         param.data.copy_(loaded_weight)
+        self.refresh_gemma_weight()
+
+    def refresh_gemma_weight(self) -> None:
         # Keep storage stable for CUDA graphs or fused paths that capture this buffer.
-        torch.add(param.data, 1.0, out=self.gemma_weight)
+        # CPU offload may move the parameter to host while the buffer stays on device.
+        self.gemma_weight.copy_(self.weight.data).add_(1.0)
 
     def _forward_impl(
         self,
