@@ -1682,11 +1682,16 @@ class OpenAIServingResponses(OpenAIServingChat):
             return messages
 
         # Most chat templates expect a single leading ``system`` message;
-        # coalesce any ``instructions`` + interleaved ``developer`` entries.
+        # coalesce ``instructions`` + the ``developer`` entries before the first
+        # turn. Later ones are sent as user turns in place: hoisting them would
+        # rewrite the prompt prefix on every appended instruction.
         system_chunks: list[str] = []
         other_msgs: list = []
         for m in messages:
-            if isinstance(m, dict) and m.get("role") == "system":
+            is_system = isinstance(m, dict) and m.get("role") == "system"
+            if is_system and other_msgs:
+                other_msgs.append({**m, "role": "user"})
+            elif is_system:
                 content = m.get("content")
                 if isinstance(content, str):
                     system_chunks.append(content)
