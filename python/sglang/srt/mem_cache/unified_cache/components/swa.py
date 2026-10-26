@@ -22,6 +22,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransferResult,
 )
 from sglang.srt.mem_cache.unified_cache.cache_action import (
+    EvictExcessPathStates,
     FreeComponentDeviceSlot,
     FreeComponentHostSlot,
     FreeDeviceKVFullOnly,
@@ -42,6 +43,9 @@ from sglang.srt.mem_cache.unified_cache.components.base import (
     PreparePrefetchResult,
     TreeComponent,
     next_component_uuid,
+)
+from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
+    BaseEvictionResult,
 )
 
 if TYPE_CHECKING:
@@ -97,6 +101,7 @@ class SWAComponent(TreeComponent):
         ) // params.page_size
         # HiCache state: set to host SWA pool when HiCache enabled
         self._swa_kv_pool_host = None
+        self.swa_max_states_per_path = params.swa_max_states_per_path
 
     component_type = ComponentType.SWA
     pool_name = PoolName.SWA
@@ -588,6 +593,30 @@ class SWAComponent(TreeComponent):
             result=result,
             cap_leaf=True,
             cache_actions=cache_actions,
+        )
+        if self.swa_max_states_per_path > 0:
+            # Queued after the SWARebuild actions that stamp this insert's windows.
+            cache_actions.append(
+                EvictExcessPathStates(
+                    tail_node_id=node.id, component_type=self.component_type
+                )
+            )
+
+    def _evict_excess_path_states(
+        self,
+        tail: UnifiedTreeNode,
+        device_frees: dict[ComponentType, list[torch.Tensor]],
+        host_frees: dict[ComponentType, list[torch.Tensor]],
+        cache_actions: list[CacheAction | ComponentAction],
+    ) -> None:
+        self._evict_path_states_beyond_cap(
+            tail,
+            self.swa_max_states_per_path,
+            device_frees,
+            host_frees,
+            cache_actions,
+            # A repeat of the tail matches up to one page short of its end.
+            protected_tail_tokens=self.sliding_window_size + self.tree_core.page_size,
         )
 
     def _maybe_split_leaf_for_swa_lock(
@@ -1556,6 +1585,20 @@ class SWAComponent(TreeComponent):
 
     def apply_component_action(self, action: ComponentAction) -> None:
         alloc = self.cache.token_to_kv_pool_allocator
+        if isinstance(action, EvictExcessPathStates):
+            result = BaseEvictionResult()
+            # The walk runs behind the tree-core interface (Rust runs it natively).
+            try:
+                self.tree_core.evict_excess_path_states(
+                    action.tail_node_id,
+                    self.component_type,
+                    result.device_frees,
+                    result.host_frees,
+                    result.cache_actions,
+                )
+            finally:
+                self.cache._apply_eviction_result(result)
+            return
         if isinstance(action, FreeComponentDeviceSlot):
             for indices in action.indices:
                 # Component values are page-aligned copies of a kv row.

@@ -121,6 +121,7 @@ def build_fixture(
         dict[ComponentType, type[TreeComponent]]
     ] = None,
     tree_core_backend: Optional[str] = None,
+    swa_max_states_per_path: int = -1,
     kv_event_lora_names: Optional[KvEventLoraNames] = None,
 ):
     """Create (tree, allocator, req_to_token_pool) from a CacheConfig.
@@ -247,6 +248,7 @@ def build_fixture(
         page_size=cfg.page_size if tree_page_size is None else tree_page_size,
         disable=False,
         sliding_window_size=cfg.sliding_window_size,
+        swa_max_states_per_path=swa_max_states_per_path,
         draft_swa_window=cfg.draft_swa_window,
         decoder_swa_bounded_replay=cfg.decoder_swa_bounded_replay,
         tree_components=cfg.components,

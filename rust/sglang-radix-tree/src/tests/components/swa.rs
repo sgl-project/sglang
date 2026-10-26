@@ -6676,3 +6676,101 @@ fn insert_reports_whether_it_reached_the_branch_boundary() {
         );
     }
 }
+
+fn swa_core_with_cap(cap: usize, window: usize) -> UnifiedTreeCore<Vec<i64>> {
+    UnifiedTreeCore::new(
+        CacheInitParams {
+            page_size: 1,
+            swa_max_states_per_path: Some(cap),
+            ..swa_params_with_window(window)
+        },
+        vec![FULL, SWA],
+    )
+}
+
+fn set_full_and_swa_device(tc: &mut UnifiedTreeCore<Vec<i64>>, node: NodeIdx_, slot: i64) {
+    for component in [FULL, SWA] {
+        tc.arena
+            .set_device_value(node, component, Tensor::from_slice(&[slot]));
+        tc.device_lru_list_mut(component).insert_mru(node);
+        tc.inc_evictable_size(component, 1);
+    }
+}
+
+#[test]
+fn evict_excess_path_states_removes_the_shallowest_windows_beyond_the_cap() {
+    let mut tc = swa_core_with_cap(/* cap = */ 1, /* window = */ 1);
+    let [a, b, c, d] = chain::<4>(&mut tc);
+    for (node, slot) in [(a, 6), (b, 7), (c, 8), (d, 9)] {
+        set_full_and_swa_device(&mut tc, node, slot);
+    }
+    let result = tc
+        .evict_excess_path_states(tc.arena.node(d).id, SWA)
+        .expect("live test node");
+    assert!(result.device_frees.contains_key(&SWA));
+    assert!(result.host_frees.is_empty());
+    assert!(tc.arena.node(a).try_device_value(SWA).is_none());
+    assert!(tc.arena.node(b).try_device_value(SWA).is_none());
+    assert!(tc.arena.node(c).try_device_value(SWA).is_some());
+    assert!(tc.arena.node(d).try_device_value(SWA).is_some());
+    // Full KV stays on every trimmed node.
+    for node in [a, b, c, d] {
+        assert!(tc.arena.node(node).try_device_value(FULL).is_some());
+    }
+}
+
+#[test]
+fn evict_excess_path_states_preserves_forks_locked_nodes_and_the_tail() {
+    let mut tc = swa_core_with_cap(/* cap = */ 1, /* window = */ 1);
+    let [a, b, c, d] = chain::<4>(&mut tc);
+    for (node, slot) in [(a, 6), (b, 7), (c, 8), (d, 9)] {
+        set_full_and_swa_device(&mut tc, node, slot);
+    }
+    tc.arena
+        .alloc_child(
+            a,
+            /* key = */ vec![9],
+            /* priority = */ 0,
+            /* extra_key = */ None,
+        )
+        .unwrap();
+    tc.arena
+        .node_mut(b)
+        .set_lock_ref_(ValueSlotIdx::device(SWA), 1);
+    let result = tc
+        .evict_excess_path_states(tc.arena.node(d).id, SWA)
+        .expect("live test node");
+    assert!(result.device_frees.is_empty());
+    for node in [a, b, c, d] {
+        assert!(tc.arena.node(node).try_device_value(SWA).is_some());
+    }
+}
+
+#[test]
+fn evict_excess_path_states_keeps_the_tails_window_across_ancestors() {
+    let mut tc = swa_core_with_cap(/* cap = */ 1, /* window = */ 2);
+    let [a, b, c, d] = chain::<4>(&mut tc);
+    for (node, slot) in [(a, 6), (b, 7), (c, 8), (d, 9)] {
+        set_full_and_swa_device(&mut tc, node, slot);
+    }
+    tc.evict_excess_path_states(tc.arena.node(d).id, SWA)
+        .expect("live test node");
+    assert!(tc.arena.node(a).try_device_value(SWA).is_none());
+    // A match one page short of the tail's end needs the window ending at c,
+    // which reaches back into b.
+    assert!(tc.arena.node(b).try_device_value(SWA).is_some());
+    assert!(tc.arena.node(c).try_device_value(SWA).is_some());
+}
+
+#[test]
+fn evict_excess_path_states_without_a_cap_is_a_no_op() {
+    let mut tc = swa_core(/* window = */ 1, /* page_size = */ 1);
+    let [a, b] = chain::<2>(&mut tc);
+    set_full_and_swa_device(&mut tc, a, 7);
+    set_full_and_swa_device(&mut tc, b, 8);
+    let result = tc
+        .evict_excess_path_states(tc.arena.node(b).id, SWA)
+        .expect("live test node");
+    assert!(result.device_frees.is_empty());
+    assert!(tc.arena.node(a).try_device_value(SWA).is_some());
+}

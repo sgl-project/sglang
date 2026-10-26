@@ -21,9 +21,9 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransferResult,
 )
 from sglang.srt.mem_cache.unified_cache.cache_action import (
+    EvictExcessPathStates,
     FreeComponentDeviceSlot,
     FreeComponentHostSlot,
-    MambaEvictExcessPathStates,
 )
 from sglang.srt.mem_cache.unified_cache.components.base import (
     BASE_COMPONENT_TYPE,
@@ -260,7 +260,11 @@ class MambaComponent(TreeComponent):
         """Defer the path-cap eviction so it runs after the insert's BackupKV."""
         if self.mamba_max_states_per_path < 0:
             return
-        cache_actions.append(MambaEvictExcessPathStates(tail.id))
+        cache_actions.append(
+            EvictExcessPathStates(
+                tail_node_id=tail.id, component_type=self.component_type
+            )
+        )
 
     def _evict_excess_path_states(
         self,
@@ -269,55 +273,13 @@ class MambaComponent(TreeComponent):
         host_frees: dict[ComponentType, list[torch.Tensor]],
         cache_actions: list[CacheAction | ComponentAction],
     ) -> None:
-        """Evict shallow eligible device checkpoints beyond the path cap.
-
-        Full KV and any existing host backup are retained. The tail, forks,
-        locked nodes (including a pending backup chain's write-through locks),
-        and device leaves are preserved, so the cap is a best-effort soft
-        limit. Freed slots are collected into the caller's dicts.
-        """
-        cap = self.mamba_max_states_per_path
-        if cap < 0:
-            return
-
-        ct = self.component_type
-        holders = []
-        node = tail
-        while node is not None and node is not self.tree_core.root_node:
-            if node.component_data[ct].value is not None:
-                holders.append(node)
-            node = node.parent
-
-        excess = len(holders) - cap
-        if excess <= 0:
-            return
-
-        tracker = {component: 0 for component in self.cache.tree_components}
-        for node in reversed(holders):
-            if excess <= 0 or node is tail:
-                break
-            if node.component_data[ct].lock_ref > 0 or len(node.children) != 1:
-                continue
-            if node in self.tree_core.evictable_device_leaves:
-                continue
-            self.tree_core._evict_component_and_detach_lru(
-                node,
-                self,
-                device_frees,
-                host_frees,
-                target=EvictLayer.DEVICE,
-                tracker=tracker,
-                cache_actions=cache_actions,
-            )
-            self.tree_core._cascade_evict(
-                node,
-                self,
-                tracker,
-                device_frees,
-                host_frees,
-                cache_actions=cache_actions,
-            )
-            excess -= 1
+        self._evict_path_states_beyond_cap(
+            tail,
+            self.mamba_max_states_per_path,
+            device_frees,
+            host_frees,
+            cache_actions,
+        )
 
     def redistribute_on_node_split(
         self, new_parent: UnifiedTreeNode, child: UnifiedTreeNode
@@ -1075,13 +1037,14 @@ class MambaComponent(TreeComponent):
             self.cache.host_pool_group.free(host_value, pool=PoolName.MAMBA)
 
     def apply_component_action(self, action: ComponentAction) -> None:
-        if isinstance(action, MambaEvictExcessPathStates):
+        if isinstance(action, EvictExcessPathStates):
             result = BaseEvictionResult()
             # Drain even if the walk raises so tombstoned slots are not leaked;
             # the walk runs behind the tree-core interface (Rust runs it natively).
             try:
                 self.tree_core.evict_excess_path_states(
                     action.tail_node_id,
+                    self.component_type,
                     result.device_frees,
                     result.host_frees,
                     result.cache_actions,

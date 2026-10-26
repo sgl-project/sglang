@@ -2,8 +2,8 @@
 
 use super::*;
 use crate::cache_action::{
-    BackupKV, FreeComponentDeviceSlot, FreeComponentHostSlot, FreeDeviceKV, FreeDeviceKVFullOnly,
-    MambaEvictExcessPathStates, RebuildFullToSwaMapping, RecoverSwaWithLockedFull, SwaRebuild,
+    BackupKV, EvictExcessPathStates, FreeComponentDeviceSlot, FreeComponentHostSlot, FreeDeviceKV,
+    FreeDeviceKVFullOnly, RebuildFullToSwaMapping, RecoverSwaWithLockedFull, SwaRebuild,
     UpdatePendingBackupOnNodeSplit,
 };
 
@@ -44,10 +44,15 @@ impl UpdatePendingBackupOnNodeSplit {
     }
 }
 
-impl MambaEvictExcessPathStates {
+impl EvictExcessPathStates {
     pub(crate) fn into_py_tagged(self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let tag = self.tag();
-        (tag, self.tail_node_id).into_py_any(py)
+        (
+            tag,
+            self.tail_node_id,
+            component_type_to_u8(self.component_type),
+        )
+            .into_py_any(py)
     }
 }
 

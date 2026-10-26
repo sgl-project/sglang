@@ -429,6 +429,11 @@ def handle_cache_compatibility(server_args: Any) -> None:
     prefix_tails = resolved_view(server_args).swa_prefix_tails
     if prefix_tails is not None and prefix_tails < 0:
         raise ValueError("--swa-prefix-tails should be a non-negative integer.")
+    if cfg.swa_max_states_per_path == 0 or cfg.swa_max_states_per_path < -1:
+        raise ValueError(
+            "--swa-max-states-per-path must be -1 (unlimited) or a positive "
+            f"integer, got {cfg.swa_max_states_per_path}."
+        )
 
     if cfg.enable_lmcache:
         if cfg.enable_hierarchical_cache:

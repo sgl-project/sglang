@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 use tch::Tensor;
 
-use crate::cache_action::{FreeComponentHostSlot, MambaEvictExcessPathStates};
+use crate::cache_action::{EvictExcessPathStates, FreeComponentHostSlot};
 use crate::components::TreeComponent;
 use crate::components::{ComponentType, FULL, MAMBA};
 use crate::node::ChildKeyType;
@@ -76,7 +76,10 @@ impl MambaComponent {
         if self.mamba_max_states_per_path.is_none() {
             return;
         }
-        cache_actions.push(Box::new(MambaEvictExcessPathStates { tail_node_id }));
+        cache_actions.push(Box::new(EvictExcessPathStates {
+            tail_node_id,
+            component_type: MAMBA,
+        }));
     }
 }
 
@@ -203,58 +206,16 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
         host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         cache_actions: &mut CacheActions,
     ) {
-        let Some(cap) = self.mamba_max_states_per_path else {
-            return;
-        };
-        // Mamba-value holders on the root path, tail-first.
-        let mut holders: Vec<NodeIdx_> = Vec::new();
-        let mut cursor = Some(tail_node_id);
-        while let Some(node_id) = cursor {
-            let node = tree_core.arena.node(node_id);
-            if node.is_root() {
-                break;
-            }
-            if node.has_device_value(MAMBA) {
-                holders.push(node_id);
-            }
-            cursor = node.parent;
-        }
-        let mut excess = holders.len().saturating_sub(cap);
-        if excess == 0 {
-            return;
-        }
-        // Cache-level apply: the counts are not reported, only the frees.
-        let mut tracker: HashMap<ComponentType, usize> = HashMap::new();
-        for &node_id in holders.iter().rev() {
-            if excess == 0 || node_id == tail_node_id {
-                break;
-            }
-            let node = tree_core.arena.node(node_id);
-            if node.device_lock_ref(MAMBA) > 0 || node.children.len() != 1 {
-                continue;
-            }
-            if tree_core.evictable_device_leaves.contains(node_id) {
-                continue;
-            }
-            tree_core.evict_component_and_detach_lru_(
-                node_id,
+        if let Some(cap) = self.mamba_max_states_per_path {
+            tree_core.evict_path_states_beyond_cap_(
                 MAMBA,
+                tail_node_id,
+                cap,
+                0,
                 device_frees,
                 host_frees,
                 cache_actions,
-                EvictLayer::Device,
-                Some(&mut tracker),
             );
-            tree_core.cascade_evict_(
-                node_id,
-                MAMBA,
-                &mut tracker,
-                device_frees,
-                host_frees,
-                cache_actions,
-                EvictLayer::Device,
-            );
-            excess -= 1;
         }
     }
 

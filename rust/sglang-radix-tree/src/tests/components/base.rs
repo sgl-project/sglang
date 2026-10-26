@@ -1,5 +1,5 @@
 use super::*;
-use crate::cache_action::{CacheAction, MambaEvictExcessPathStates};
+use crate::cache_action::{CacheAction, EvictExcessPathStates};
 use crate::components::{FULL, FullComponent, MAMBA, MambaComponent, SWA, SwaComponent};
 use crate::test_utils::expect_action;
 use crate::unified_tree_core::CacheInitParams;
@@ -61,8 +61,9 @@ impl TreeComponent<Vec<i64>> for DefaultComponentForTest {
         cache_actions: &mut CacheActions,
         target: EvictLayer,
     ) -> (usize, usize) {
-        cache_actions.push(Box::new(MambaEvictExcessPathStates {
+        cache_actions.push(Box::new(EvictExcessPathStates {
             tail_node_id: tree_core.arena.node(node_id).id,
+            component_type: MAMBA,
         }));
         FullComponent.evict_component(
             tree_core,
@@ -239,7 +240,7 @@ fn action_node(
 fn action_node_ids(actions: &[Box<dyn CacheAction>]) -> Vec<usize> {
     actions
         .iter()
-        .map(|action| expect_action::<MambaEvictExcessPathStates>(action.as_ref()).tail_node_id)
+        .map(|action| expect_action::<EvictExcessPathStates>(action.as_ref()).tail_node_id)
         .collect()
 }
 

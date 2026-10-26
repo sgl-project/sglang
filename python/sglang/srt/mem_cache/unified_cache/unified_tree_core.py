@@ -1948,11 +1948,12 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def evict_excess_path_states(
         self,
         tail_node_id: NodeId,
+        component_type: ComponentType,
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
         cache_actions: list[CacheAction | ComponentAction],
     ) -> None:
-        self.components_by_type[ComponentType.MAMBA]._evict_excess_path_states(
+        self.components_by_type[component_type]._evict_excess_path_states(
             self.node_by_id(tail_node_id),
             device_frees,
             host_frees,

@@ -54,6 +54,7 @@ class CacheInitParams:
     chunked_prefill_size: Optional[int] = None
 
     sliding_window_size: Optional[int] = None
+    swa_max_states_per_path: int = -1
     # False when tree nodes do not own the SWA state (a per-request SWA ring, or a
     # paged SWA pool only a draft uses), so it must not gate prefix matching.
     swa_gates_prefix_match: bool = True

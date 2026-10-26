@@ -549,13 +549,15 @@ class UnifiedTreeCoreInterface(ABC):
     def evict_excess_path_states(
         self,
         tail_node_id: NodeId,
+        component_type: ComponentType,
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
         cache_actions: list[CacheAction | ComponentAction],
     ) -> None:
-        """Evict shallow Mamba device checkpoints beyond the per-path cap on the
-        tail's root path, collecting freed values and actions into the caller's
-        buffers. The caller frees values, then drains actions, even on error."""
+        """Evict ``component_type``'s shallow device values beyond its per-path cap
+        on the tail's root path, collecting freed values and actions into the
+        caller's buffers. The caller frees values, then drains actions, even on
+        error."""
         ...
 
     # ==== HiCache ====

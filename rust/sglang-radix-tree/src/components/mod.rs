@@ -244,7 +244,7 @@ pub trait TreeComponent<K: ChildKeyType> {
     }
 
     /// Evict shallow device checkpoints beyond the per-path state cap on the
-    /// tail's root path; only the Mamba component caps its states.
+    /// tail's root path; the Mamba and SWA components cap their values.
     fn evict_excess_path_states(
         &self,
         tree_core: &mut UnifiedTreeCore<K>,

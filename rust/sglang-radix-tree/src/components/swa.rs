@@ -8,8 +8,8 @@ use std::collections::HashMap;
 use tch::{Kind, Tensor};
 
 use crate::cache_action::{
-    FreeComponentHostSlot, FreeDeviceKVFullOnly, RebuildFullToSwaMapping, RecoverSwaWithLockedFull,
-    SwaRebuild,
+    EvictExcessPathStates, FreeComponentHostSlot, FreeDeviceKVFullOnly, RebuildFullToSwaMapping,
+    RecoverSwaWithLockedFull, SwaRebuild,
 };
 use crate::components::TreeComponent;
 use crate::components::{ComponentType, FULL, SWA};
@@ -28,6 +28,8 @@ pub struct SwaComponent {
     sliding_window_size: usize,
     /// Per-request rings are rebuilt by the request and do not gate tree reuse.
     swa_req_ring: bool,
+    /// Per-root-path cap on device SWA windows; None means unlimited.
+    swa_max_states_per_path: Option<usize>,
 }
 
 impl SwaComponent {
@@ -38,6 +40,22 @@ impl SwaComponent {
 }
 
 impl SwaComponent {
+    /// Defer the path-cap eviction so it runs after this insert's SWA rebuilds.
+    fn emit_excess_path_windows_eviction_<K: ChildKeyType>(
+        &self,
+        tree_core: &UnifiedTreeCore<K>,
+        node_id: NodeIdx_,
+        cache_actions: &mut CacheActions,
+    ) {
+        if self.swa_max_states_per_path.is_none() {
+            return;
+        }
+        cache_actions.push(Box::new(EvictExcessPathStates {
+            tail_node_id: tree_core.arena.node(node_id).id,
+            component_type: SWA,
+        }));
+    }
+
     /// Build the driver from the tree's init params.
     pub fn new(params: &CacheInitParams) -> Self {
         let sliding_window_size = params
@@ -50,6 +68,7 @@ impl SwaComponent {
         SwaComponent {
             sliding_window_size,
             swa_req_ring: params.swa_req_ring,
+            swa_max_states_per_path: params.swa_max_states_per_path,
         }
     }
 
@@ -594,6 +613,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
             let split_pos = params.swa_evicted_seqlen - node_start;
             if split_pos >= tree_core.arena.node(node_id).key.atom_len() {
                 // Entire leaf is outside the SWA window — left as a tombstone.
+                self.emit_excess_path_windows_eviction_(tree_core, node_id, cache_actions);
                 return;
             }
             if split_pos > 0 {
@@ -623,6 +643,30 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
             node_id: tree_core.arena.node(node_id).id,
             source_value: tree_core.arena.device_value(node_id, FULL).shallow_clone(),
         }));
+        self.emit_excess_path_windows_eviction_(tree_core, node_id, cache_actions);
+    }
+
+    fn evict_excess_path_states(
+        &self,
+        tree_core: &mut UnifiedTreeCore<K>,
+        tail_node_id: NodeIdx_,
+        device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        cache_actions: &mut CacheActions,
+    ) {
+        if let Some(cap) = self.swa_max_states_per_path {
+            // A repeat of the tail matches up to one page short of its end.
+            let protected_tail_tokens = self.sliding_window_size + tree_core.page_size;
+            tree_core.evict_path_states_beyond_cap_(
+                SWA,
+                tail_node_id,
+                cap,
+                protected_tail_tokens,
+                device_frees,
+                host_frees,
+                cache_actions,
+            );
+        }
     }
 
     fn redistribute_on_node_split(
