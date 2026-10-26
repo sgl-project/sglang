@@ -1187,12 +1187,26 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
     # topk > 1 + page_size > 1 needs the two-pass cascade draft-decode (shared prefix
     # pass + per-branch expand pass with prefix-tail dup). Only these backends implement
     # it; flashmla / trtllm_mla can't express the per-branch tree, so reject.
+    #
+    # Ascend DSA is the exception: it never builds a per-branch page table. Tree
+    # visibility lives in the per-row sparse_indices (token positions), which the
+    # kernel maps to pages itself, so one block table per request serves every
+    # candidate. page_size == 1 is not an option there either: the Ascend lightning
+    # indexer requires a block size that is a multiple of 16.
     _PAGE_TREE_SPEC_BACKENDS = ("flashinfer", "fa3", "triton")
     view = resolved_view(server_args)
+    # Local import: this hook runs once at startup, and keeping it out of the
+    # module header avoids a new model_config <-> arg_groups import edge.
+    from sglang.srt.configs.model_config import is_deepseek_dsa
+
+    dsa_on_ascend = view.attention_backend == "ascend" and is_deepseek_dsa(
+        model_config_of(server_args).hf_config
+    )
     if (
         cfg.speculative_eagle_topk > 1
         and view.page_size > 1
         and view.attention_backend not in _PAGE_TREE_SPEC_BACKENDS
+        and not dsa_on_ascend
     ):
         raise ValueError(
             f"speculative_eagle_topk > 1 with page_size > 1 is only supported on "
