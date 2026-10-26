@@ -477,8 +477,8 @@ class DecoderReplayTail:
         block_rows: int,
         source_kv_layer_id: Optional[int],
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], List[torch.Tensor]]:
-        """Runs the tail in one break of the outer prefill graph; the break fills
-        the bridge this caller passes, over its ``block_rows`` block."""
+        """Runs the tail in one break of the outer prefill graph and returns views of
+        the bridge over its ``block_rows`` block, which the break fills."""
         leaves, has_pre, rebuild = _flatten_state(state)
         bridge_key = (capture_dspark, has_pre)
         bridge = self._bridge(bridge_key, block_rows)
@@ -496,7 +496,7 @@ class DecoderReplayTail:
             input_ids,
             input_ids if input_ids_global is None else input_ids_global,
         )
-        if bridge is None:
+        if bridge is None:  # first run: the break allocated the bridge
             bridge = self._bridge(bridge_key, block_rows)
         residual, pre, *aux = (
             None if buf is None else buf[:block_rows] for buf in bridge
@@ -506,8 +506,8 @@ class DecoderReplayTail:
     def _bridge(
         self, key: Tuple[bool, bool], block_rows: int
     ) -> Optional[List[Optional[torch.Tensor]]]:
-        """The newest bridge buffers that hold ``block_rows`` rows, or None before
-        the tail first runs or when the block outgrows them."""
+        """The newest bridge buffers for ``key``, or None when there are none yet or
+        they hold fewer than ``block_rows`` rows."""
         sets = self._bridge_buffers.get(key)
         if sets and sets[0][0].shape[0] >= block_rows:
             return sets[0]
@@ -520,9 +520,9 @@ class DecoderReplayTail:
         bridge: Optional[List[Optional[torch.Tensor]]],
         outputs: List[Optional[torch.Tensor]],
     ) -> None:
-        """Copies the tail rows into the bridge, first allocating it when the caller
-        had none. Rows past the tail hold stale values, which reach only rows that
-        _scatter_tail_rows and the real_rows_count cut drop."""
+        """Copies the tail rows into ``bridge``, allocating a new one for ``key`` when
+        it is None. Rows past the tail keep stale values, which flow only into rows
+        that _scatter_tail_rows and the real_rows_count cut drop."""
         if bridge is None:
             bridge = [
                 None if t is None else t.new_zeros((block_rows, *t.shape[1:]))
