@@ -238,16 +238,14 @@ class CPUGPTQConfig(GPTQConfig):
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional[LinearMethodBase]:
-        from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
-        if isinstance(layer, LinearBase):
-            layer.scheme = self.get_linear_scheme(layer)
-            return GPTQLinearMethod(self)
         if isinstance(layer, FusedMoE):
             layer.scheme = self.get_moe_scheme(layer)
             return GPTQMoEMethod(self)
-        return None
+        return get_linear_quant_method(
+            self, layer, prefix=prefix, linear_method_cls=GPTQLinearMethod
+        )
 
     def get_linear_scheme(self, layer: torch.nn.Module):
         from sglang.srt.layers.linear import LinearBase
