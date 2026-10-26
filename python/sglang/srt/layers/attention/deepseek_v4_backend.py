@@ -1087,6 +1087,10 @@ class DSV4Metadata:
     # Captured with the late layers on a tail block (decoder SWA bounded replay
     # inside the prefill CUDA graph); replay rebuilds the tail metadata iff set.
     prefill_graph_tail: bool = False
+    # SGLANG_DSV41_FUSED_TAIL target verify: the late layers' (swa_page_indices,
+    # swa_topk_lengths), floored at each fed tail's start; the model swaps them in
+    # from late_layer_start on.
+    verify_late_swa: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
 
     @property
     def core_metadata(self) -> DSV4AttnMetadata:
@@ -1148,11 +1152,20 @@ class DSV4RawVerifyMetadata:
     extend_start_loc: Optional[torch.Tensor] = None
     verify_lens: Optional[torch.Tensor] = None
     total_verify_tokens: int = 0
+    # SGLANG_DSV41_FUSED_TAIL: per-request late-layer SWA floor, a view of the
+    # backend's persistent buffer (so capture and replay share it).
+    swa_floor: Optional[torch.Tensor] = None
 
     def copy_(self, other: DSV4RawVerifyMetadata):
         self.req_pool_indices.copy_(other.req_pool_indices)
         self.seq_lens.copy_(other.seq_lens)
         self.out_cache_loc.copy_(other.out_cache_loc)
+        if (
+            self.swa_floor is not None
+            and other.swa_floor is not None
+            and self.swa_floor.data_ptr() != other.swa_floor.data_ptr()
+        ):
+            self.swa_floor.copy_(other.swa_floor)
 
         self.extend_seq_lens = other.extend_seq_lens
         self.seq_lens_cpu = other.seq_lens_cpu
@@ -1306,6 +1319,15 @@ class DeepseekV4AttnBackend(
         self.enable_decoder_swa_bounded_replay: bool = (
             get_exec().features.enable_decoder_swa_bounded_replay
         )
+        # SGLANG_DSV41_FUSED_TAIL: target verify floors the late layers' SWA window
+        # at each fed tail's start; the per-request floors live in one persistent
+        # buffer that eager steps, graph capture and replay all read.
+        self.verify_swa_floor_enabled: bool = (
+            self.enable_decoder_swa_bounded_replay
+            and get_disagg().dsv41_encoder_only_prefill
+            and envs.SGLANG_DSV41_FUSED_TAIL.get()
+        )
+        self._verify_swa_floor_buf: Optional[torch.Tensor] = None
         # The model switches onto this metadata in enter_late_layer_tail.
         self.tail_forward_metadata: Optional[DSV4Metadata] = None
         # Set by write_tail_source_kv until exit_late_layer_tail.
@@ -2168,6 +2190,11 @@ class DeepseekV4AttnBackend(
     ) -> Union[DSV4Metadata, DSV4RawVerifyMetadata]:
         assert out_cache_loc is not None
         bs = len(seq_lens)
+        floor_view = None
+        if self.verify_swa_floor_enabled and ragged_layout is None:
+            # Read only: set_verify_swa_floor fills it before the verify, so the
+            # replay prep stays pointer-stable.
+            floor_view = self.verify_swa_floor_buffer(seq_lens.device)[:bs]
         if self.needs_cpu_seq_lens:
             assert seq_lens_cpu is not None
             seq_lens_cpu_list = seq_lens_cpu.tolist()
@@ -2204,6 +2231,7 @@ class DeepseekV4AttnBackend(
             extend_start_loc=extend_start_loc,
             verify_lens=verify_lens,
             total_verify_tokens=total_verify_tokens,
+            swa_floor=floor_view,
         )
 
     def init_forward_metadata_dspark_draft_block(
@@ -2344,7 +2372,60 @@ class DeepseekV4AttnBackend(
             ),
             c4_compress_metadata=create(compress_ratio=4) if self.has_c4 else None,
             c128_compress_metadata=c128_compress_metadata,
+            verify_late_swa=(
+                self._floored_verify_swa(
+                    core_attn_metadata,
+                    req_pool_indices_repeated,
+                    raw_metadata.swa_floor.repeat_interleave(num_draft_tokens),
+                )
+                if raw_metadata.swa_floor is not None and not is_ragged
+                else None
+            ),
         )
+
+    def verify_swa_floor_buffer(self, device) -> torch.Tensor:
+        if self._verify_swa_floor_buf is None:
+            self._verify_swa_floor_buf = torch.zeros(
+                self.req_to_token.shape[0], dtype=torch.int64, device=device
+            )
+        return self._verify_swa_floor_buf
+
+    def set_verify_swa_floor(self, floor: Optional[torch.Tensor]) -> None:
+        """Before each target verify: the per-request late-layer SWA floor
+        ([bs] int64, None when nothing is fed). Graph-padded rows and requests
+        not being fed keep floor 0."""
+        buf = self.verify_swa_floor_buffer(self.req_to_token.device)
+        buf.zero_()
+        if floor is not None:
+            buf[: floor.shape[0]].copy_(floor)
+
+    def _floored_verify_swa(
+        self,
+        core: DSV4AttnMetadata,
+        req_pool_indices_repeated: torch.Tensor,
+        row_floor: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """The verify rows' SWA page indices and lengths with the window floored
+        at row_floor, as the extend path's bounded replay floors its tail: a fed
+        tail has no late-layer KV below its start. Rows with floor 0 match the
+        unfloored ones."""
+        assert self.token_to_kv_pool.request_window is None
+        indices = BuildCausalSwaPageIndices.execute(
+            req_to_token=self.req_to_token,
+            full_to_swa_mapping=self.token_to_kv_pool.full_to_swa_index_mapping,
+            req_pool_indices_repeated=req_pool_indices_repeated,
+            seq_lens_casual=core.seq_lens_casual,
+            swa_window=SWA_WINDOW,
+            page_index_aligned_size=PAGE_INDEX_ALIGNED_SIZE,
+            swa_replay_start=row_floor,
+        )
+        positions = core.positions_casual
+        floored = positions - row_floor.to(positions.dtype) + 1
+        lengths = torch.minimum(
+            core.swa_topk_lengths,
+            floored.clamp_min(0).to(core.swa_topk_lengths.dtype),
+        )
+        return _pad_last_dim(indices), lengths
 
     def make_forward_metadata_from_raw_decode(
         self,

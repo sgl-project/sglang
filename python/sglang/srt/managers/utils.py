@@ -60,6 +60,12 @@ class GenerationBatchResult:
         Union[torch.Tensor, List[torch.Tensor], List[List[int]]]
     ] = None
     num_correct_drafts: int = 0  # no bonus included
+    # SGLANG_DSV41_FUSED_TAIL: requests whose accepted run was all fed prompt
+    # tokens; they took a verify slot but produced no output this step.
+    num_fed_only_reqs: int = 0
+    # Per request, the fed prompt tokens at the head of its accepted run (None
+    # when the step fed none); their logprobs are skipped like the tokens.
+    num_fed_per_req: Optional[List[int]] = None
     num_correct_drafts_per_req_cpu: Optional[List[int]] = None
     num_block_accept_tokens: int = 0
     num_cap_tokens: int = 0

@@ -4213,7 +4213,26 @@ class DeepseekV4Model(nn.Module):
         if _is_cuda:
             residual_batch.start(forward_batch)
             hidden_states = residual_batch.set_written(state, forward_batch)
+        verify_floor_core = verify_saved_swa = None
         for i in range(self.start_layer, self.end_layer):
+            if (
+                i == self.late_layer_start
+                and forward_batch.forward_mode.is_target_verify()
+            ):
+                # SGLANG_DSV41_FUSED_TAIL: the late layers hold no KV below a fed
+                # tail's start, so their SWA window is floored there.
+                verify_metadata = get_attn_backend().forward_metadata
+                late_swa = getattr(verify_metadata, "verify_late_swa", None)
+                if late_swa is not None:
+                    verify_floor_core = verify_metadata.core_attn_metadata
+                    verify_saved_swa = (
+                        verify_floor_core.swa_page_indices,
+                        verify_floor_core.swa_topk_lengths,
+                    )
+                    (
+                        verify_floor_core.swa_page_indices,
+                        verify_floor_core.swa_topk_lengths,
+                    ) = late_swa
             if _is_cuda:
                 layer = self.layers[i]
                 if (
@@ -4411,6 +4430,11 @@ class DeepseekV4Model(nn.Module):
             )
             residual_batch.clear(forward_batch)
         state = state.materialized(self.layers[self.end_layer - 1].hc_cfg)
+        if verify_saved_swa is not None:
+            (
+                verify_floor_core.swa_page_indices,
+                verify_floor_core.swa_topk_lengths,
+            ) = verify_saved_swa
         if saved_dp is not None:
             exit_late_layer_dp(forward_batch, saved_dp)
         if saved_full is not None:

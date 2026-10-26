@@ -1131,6 +1131,14 @@ class Req(ReqDllmMixin):
         # PD decode with --dsv41-encoder-only-prefill: the prompt position where
         # the transferred encoder prefix ends and this worker's extend begins.
         self.dsv41_tail_start: Optional[int] = None
+        # SGLANG_DSV41_FUSED_TAIL: the tail is fed through verify steps instead.
+        # feed_floor is the tail start (the late layers' SWA floor), feed_next the
+        # position of the next scheduled step's first verify row (None once the
+        # whole tail is scheduled), and feed_prompt_left the prompt tokens still to
+        # come back in accepted runs, which never become output.
+        self.dsv41_feed_floor: Optional[int] = None
+        self.dsv41_feed_next: Optional[int] = None
+        self.dsv41_feed_prompt_left: int = 0
         self.dllm_initialized: bool = False
 
         self.session = session
@@ -2097,6 +2105,10 @@ class Req(ReqDllmMixin):
         self.temp_input_token_ids_logprobs_val = None
         self.temp_input_token_ids_logprobs_idx = None
         self.inflight_middle_chunks = 0
+        # A fed tail restarts from prefill like any retracted split request.
+        self.dsv41_feed_floor = None
+        self.dsv41_feed_next = None
+        self.dsv41_feed_prompt_left = 0
         self.kv.mamba_pool_idx = None
         self.kv.mamba_ping_pong_track_buffer = None
         self.kv.mamba_ping_pong_empty = None
@@ -2567,6 +2579,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Per engram layer, the rows the scheduler staged (EngramRowStager).
     engram_staged_rows: Optional[StagedRows] = None
     encoder_swa_reset: Optional[List[bool]] = None
+    # DeepSeek-V4.1 fused decode tails, decode steps only, rebuilt every step:
+    # [bs, verify width] int64 prompt token forced after each verify row (-1:
+    # verify as usual), and [bs] int64 late-layer SWA floor (0 for other requests).
+    dsv41_forced_tokens: Optional[torch.Tensor] = None
+    dsv41_swa_floor: Optional[torch.Tensor] = None
 
     req_pool_indices: torch.Tensor = None  # shape: [b], int64
     seq_lens: torch.Tensor = None  # shape: [b], int64

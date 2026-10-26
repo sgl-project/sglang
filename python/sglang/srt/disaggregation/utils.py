@@ -1988,6 +1988,25 @@ def dsv41_encoder_only_unsupported(req: Req) -> Optional[str]:
     return None
 
 
+def dsv41_tail_can_feed(req: Req) -> bool:
+    """Whether SGLANG_DSV41_FUSED_TAIL can feed this request's tail through verify
+    steps; the rest take the tail extend.
+
+    The feed starts on a transferred prefix (prompt logprobs are rejected for
+    the split already); a grammar would see the fed prompt tokens, and a
+    re-bootstrapped request's tail holds output tokens the feed would not
+    re-emit correctly.
+    """
+    return (
+        req.dsv41_tail_start is not None
+        and req.dsv41_tail_start > 0
+        and req.kv.kv_allocated_len == req.dsv41_tail_start
+        and len(req.output_ids) == 0
+        and req.grammar is None
+        and not getattr(req, "pd_rebootstrap_in_progress", False)
+    )
+
+
 def prepare_abort(req: Req, error_message: str, status_code=None):
     from sglang.srt.managers.schedule_batch import FINISH_ABORT
 

@@ -313,6 +313,18 @@ def validate_deepseek_v41_encoder_only_prefill(server_args: ServerArgs) -> None:
     for feature, enabled in incompatible:
         if enabled:
             raise ValueError(f"--dsv41-encoder-only-prefill does not support {feature}")
+    if (
+        is_decode
+        and envs.SGLANG_DSV41_FUSED_TAIL.get()
+        and (
+            cfg.speculative_algorithm != "DSPARK"
+            or envs.SGLANG_RAGGED_VERIFY_MODE.get() != "static"
+        )
+    ):
+        # Fed tails ride the uniform verify rows; every forced row is accepted.
+        raise ValueError(
+            "SGLANG_DSV41_FUSED_TAIL requires DSpark with SGLANG_RAGGED_VERIFY_MODE=static"
+        )
     if not is_decode:
         # Prefill stops at the last KV source and never runs the decoder layers.
         declare_resolution(

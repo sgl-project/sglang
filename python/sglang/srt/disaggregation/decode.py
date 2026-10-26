@@ -66,6 +66,7 @@ from sglang.srt.disaggregation.utils import (
     dsv41_encoder_only_prefill_enabled,
     dsv41_encoder_only_unsupported,
     dsv41_encoder_prefix_len,
+    dsv41_tail_can_feed,
     get_dsa_tail_state_indices,
     get_kv_class,
     get_kv_transfer_buf_infos,
@@ -3437,6 +3438,7 @@ class SchedulerDisaggregationDecodeMixin:
         """Process prebuilt batch and schedule the next decode batch."""
         if dsv41_encoder_only_prefill_enabled():
             running_batch = self._merge_dsv41_tail_extend(running_batch)
+            running_batch = self._admit_dsv41_fed_tails(running_batch)
             tail_batch = self._get_new_dsv41_tail_extend_batch(running_batch)
             # As in collocated scheduling, spec with DP attention keeps extend
             # and decode on separate steps: ranks without a tail run idle.
@@ -3483,8 +3485,141 @@ class SchedulerDisaggregationDecodeMixin:
 
         ret = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(ret)
         if ret:
+            if dsv41_encoder_only_prefill_enabled():
+                self._set_dsv41_feed_inputs(ret)
             set_schedule_time_batch(ret)
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
+
+    def _admit_dsv41_fed_tails(
+        self: Scheduler, running_batch: ScheduleBatch
+    ) -> ScheduleBatch:
+        """SGLANG_DSV41_FUSED_TAIL: join transferred requests to the running decode
+        batch, so their tails ride the verify steps decode runs anyway.
+
+        A request enters like a stock PD prebuilt one, with its KV at the tail
+        start s and the prompt token at s as the next verify input; the verify
+        steps then take the rest of the prompt six tokens at a time (see
+        _set_dsv41_feed_inputs). Requests the feed cannot serve stay queued for
+        the tail extend, as do all requests while the rank has nothing running:
+        the extend's single step gives the faster first token then.
+
+        A fed request holds a batch slot for every step of its feed without
+        producing tokens, so admission keeps the batch within the largest
+        captured decode CUDA graph; past it every step would run eagerly. The
+        requests it turns away take the tail extend, as without the flag.
+        """
+        if (
+            not envs.SGLANG_DSV41_FUSED_TAIL.get()
+            or not self.waiting_queue
+            or running_batch.is_empty()
+        ):
+            return running_batch
+        max_reqs = min(self.req_to_token_pool.size, self.max_running_requests)
+        graph_bs = self.tp_worker.get_decode_cuda_graph_bs()
+        if graph_bs:
+            max_reqs = min(max_reqs, max(graph_bs))
+        num_free_reqs = max_reqs - running_batch.batch_size()
+        page_size = self.token_to_kv_pool_allocator.page_size
+        num_free_tokens = self.token_to_kv_pool_allocator.available_size()
+        fed: List[Req] = []
+        queued: List[Req] = []
+        num_alloc_tokens = 0
+        for req in self.waiting_queue:
+            start = req.dsv41_tail_start
+            fill_len = len(req.origin_input_ids)
+            alloc_len = ceil_align(fill_len, page_size) - ceil_align(
+                start or 0, page_size
+            )
+            if (
+                len(fed) < num_free_reqs
+                and dsv41_tail_can_feed(req)
+                and num_alloc_tokens + alloc_len <= num_free_tokens
+            ):
+                fed.append(req)
+                num_alloc_tokens += alloc_len
+            else:
+                queued.append(req)
+        if not fed:
+            return running_batch
+        self.waiting_queue = queued
+
+        for req in fed:
+            start = req.dsv41_tail_start
+            # The prebuilt batch covers the transferred prefix [0, start).
+            req.prefix_len = 0
+            req.extend_end = start
+            req.already_computed = start
+            req._cache_breakdown_computed = True
+            req.dsv41_tail_start = None
+            req.dsv41_feed_floor = start
+            req.dsv41_feed_next = start
+            req.dsv41_feed_prompt_left = len(req.origin_input_ids) - 1 - start
+        set_time_batch(fed, "set_forward_entry_time")
+
+        new_batch = ScheduleBatch.init_new(
+            fed,
+            self.req_to_token_pool,
+            self.token_to_kv_pool_allocator,
+            self.tree_cache,
+            self.model_config,
+            self.enable_overlap,
+            self.spec_algorithm,
+        )
+        new_batch.prepare_for_prebuilt()
+        if self.enable_overlap:
+            # As for a prebuilt batch: drain an in-flight forward of a request
+            # that just finished before a new request seeds its row.
+            self.schedule_stream.wait_stream(self.forward_stream)
+        self.ngram_embedding_manager.prepare_for_forward(new_batch, chunked_req=None)
+        new_batch.process_prebuilt(self.future_map)
+        for req in fed:
+            req.time_stats.set_decode_prebuilt_finish_time()
+        running_batch.merge_batch(new_batch)
+        self.dsv41_fed_tail_ct = getattr(self, "dsv41_fed_tail_ct", 0) + len(fed)
+        now = time.monotonic()
+        if now - getattr(self, "dsv41_fed_tail_log_t", -1e9) > 5:
+            self.dsv41_fed_tail_log_t = now
+            logger.info(
+                "SGLANG_DSV41_FUSED_TAIL: %d tails fed through verify steps so far",
+                self.dsv41_fed_tail_ct,
+            )
+        return running_batch
+
+    def _set_dsv41_feed_inputs(self: Scheduler, batch: ScheduleBatch) -> None:
+        """Give this decode step's fed requests their next prompt tokens.
+
+        A fed request's verify rows sit at positions p .. p + w - 1, row 0 holding
+        the prompt token at p. Forcing the token after each row to the prompt's
+        makes the verify accept the prompt and hand the next prompt token on as
+        the bonus; the first row past the prompt verifies as usual, so the first
+        output token is sampled from the last prompt position. Progress is a
+        function of this schedule alone (every forced row is accepted), so it
+        runs ahead of the overlapped results.
+        """
+        batch.dsv41_forced_tokens = None
+        batch.dsv41_swa_floor = None
+        if not batch.forward_mode.is_decode() or not any(
+            req.dsv41_feed_next is not None for req in batch.reqs
+        ):
+            return
+        # The verify width the DSpark worker resolved (draft block + 1).
+        width = self.model_worker.verify_num_draft_tokens
+        forced = [[-1] * width for _ in batch.reqs]
+        floor = [0] * len(batch.reqs)
+        for i, req in enumerate(batch.reqs):
+            p = req.dsv41_feed_next
+            if p is None:
+                continue
+            prompt = req.origin_input_ids
+            end = min(len(prompt), p + width + 1)
+            forced[i][: end - p - 1] = prompt[p + 1 : end]
+            floor[i] = req.dsv41_feed_floor
+            nxt = p + width
+            req.dsv41_feed_next = nxt if nxt + 1 < len(prompt) else None
+        batch.dsv41_forced_tokens = async_h2d(
+            forced, dtype=torch.int64, device=batch.device
+        )
+        batch.dsv41_swa_floor = async_h2d(floor, dtype=torch.int64, device=batch.device)
 
     def get_new_prebuilt_batch(
         self, running_batch: ScheduleBatch

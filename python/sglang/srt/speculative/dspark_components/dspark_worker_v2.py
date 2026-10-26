@@ -82,6 +82,7 @@ from sglang.srt.speculative.dspark_components.dspark_verify import (
     CommitInjectCtx,
     DsparkVerifyEpilogue,
     TargetVerifyExecutor,
+    force_verify_rows,
     verify_logits_adjustments_are_noop,
 )
 from sglang.srt.speculative.spec_sampling_mask import (
@@ -203,6 +204,12 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
         )
         self._is_pd_prefill = get_disagg().disaggregation_mode == "prefill"
+        # SGLANG_DSV41_FUSED_TAIL on a split PD decode: fed tails ride the verify.
+        self._dsv41_fused_tail = (
+            get_disagg().dsv41_encoder_only_prefill
+            and get_disagg().disaggregation_mode == "decode"
+            and envs.SGLANG_DSV41_FUSED_TAIL.get()
+        )
         self._decode_graph_allowed = (
             get_exec().graph.cuda_graph_config.decode.backend != Backend.DISABLED
             and not self._is_pd_prefill
@@ -1010,6 +1017,12 @@ class DSparkWorkerV2(BaseSpecWorker):
         batch.seq_lens.record_stream(
             torch.get_device_module(self.device).current_stream()
         )
+        for scheduled in (batch.dsv41_forced_tokens, batch.dsv41_swa_floor):
+            if scheduled is not None:
+                # Built on the schedule stream, read by this step's kernels.
+                scheduled.record_stream(
+                    torch.get_device_module(self.device).current_stream()
+                )
         bs = len(batch.seq_lens)
         device = self.device
         prefix_lens = batch.seq_lens
@@ -1105,8 +1118,25 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
         run_compact = self._verify_planner.should_run_compact(layout=layout)
 
+        # SGLANG_DSV41_FUSED_TAIL: fed tails verify their next prompt tokens.
+        forced_tokens = batch.dsv41_forced_tokens
+        if forced_tokens is not None:
+            assert layout is None and not run_compact, (
+                "fused decode tails need the static verify layout"
+            )
+            gamma = draft_tokens.shape[1]
+            draft_tokens.copy_(
+                torch.where(
+                    forced_tokens[:, :gamma] >= 0,
+                    forced_tokens[:, :gamma].to(draft_tokens.dtype),
+                    draft_tokens,
+                )
+            )
+
         verify_ids_2d = proposal.verify_ids
-        if verify_ids_2d is None:
+        if verify_ids_2d is None or forced_tokens is not None:
+            # Forced rows replace draft tokens, so ids folded in the draft graph
+            # are stale for them; build the verify ids from the patched block.
             verify_ids_2d = torch.cat(
                 [draft_block_ids[:, :1], draft_tokens], dim=1
             ).contiguous()
@@ -1137,6 +1167,8 @@ class DSparkWorkerV2(BaseSpecWorker):
                 or self._verify_executor.verify_epilogue.simulate_fold
             )
             and not batch.has_grammar
+            # Fed tails force rows of the logits below, after the graph.
+            and forced_tokens is None
         )
         if not self._sim_draw_ahead:
             self._verify_executor.begin_simulated_step()
@@ -1150,6 +1182,11 @@ class DSparkWorkerV2(BaseSpecWorker):
                     ),
                 )
         prepare_mamba_track_for_verify(batch)
+        if self._dsv41_fused_tail:
+            # Every verify step, so a step without fed tails clears the floors.
+            self.target_worker.model_runner.attn_backend.set_verify_swa_floor(
+                batch.dsv41_swa_floor
+            )
         with self._observers.segment(InfoSegment.TARGET_VERIFY):
             if run_compact:
                 target_verify, hidden_strided = self._verify_executor.run_compact(
@@ -1191,6 +1228,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
             if grammar_mask is not None:
                 grammar_mask.apply(logits_output.next_token_logits)
+        if forced_tokens is not None:
+            force_verify_rows(logits_output.next_token_logits, forced_tokens)
 
         epilogue = self._verify_executor.verify_epilogue
         folded_accept = (
@@ -1201,6 +1240,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         region_accept = None
         if (
             not folded_accept
+            # Fed tails take the eager accept, which keeps their forced rows.
+            and forced_tokens is None
             and can_run_cuda_graph
             and not run_compact
             and self._sampling_graph_eligible(
@@ -1232,6 +1273,12 @@ class DSparkWorkerV2(BaseSpecWorker):
                 prefix_lens=prefix_lens,
                 draft_tokens=draft_tokens,
                 simulate_bonus_sampling_info=simulate_bonus_sampling_info,
+                # Fed tails keep their forced accept under simulated acceptance.
+                forced_rows=(
+                    None
+                    if forced_tokens is None
+                    else (forced_tokens >= 0).any(dim=1)
+                ),
             )
         engram_in_graph = (
             folded_accept and not run_compact and epilogue.folds_engram_commit

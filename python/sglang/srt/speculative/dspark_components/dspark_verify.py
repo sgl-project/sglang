@@ -92,6 +92,25 @@ def verify_logits_adjustments_are_noop(sampling_info) -> bool:
     return True
 
 
+def force_verify_rows(
+    next_token_logits: torch.Tensor, forced_tokens: torch.Tensor
+) -> None:
+    """Make every verify row with a forced token (>= 0) pick exactly that token.
+
+    forced_tokens is [bs, verify width], one entry per verify row in row order.
+    A forced row's logits become one-hot (0 at the token, -inf elsewhere), so the
+    unchanged accept takes the draft that equals it and draws it as the bonus
+    under any temperature; the other rows keep their logits.
+    """
+    rows = forced_tokens.reshape(-1)
+    logits = next_token_logits[: rows.shape[0]]
+    forced = (rows >= 0).unsqueeze(1)
+    index = rows.clamp_min(0).unsqueeze(1)
+    kept = logits.gather(1, index)
+    logits.masked_fill_(forced, float("-inf"))
+    logits.scatter_(1, index, torch.where(forced, torch.zeros_like(kept), kept))
+
+
 class TargetVerifyResult(msgspec.Struct, frozen=True):
     logits_output: object
     can_run_cuda_graph: bool
@@ -176,15 +195,17 @@ class TargetVerifyExecutor:
         prefix_lens: torch.Tensor,
         draft_tokens: torch.Tensor,
         simulate_bonus_sampling_info=None,
+        forced_rows: Optional[torch.Tensor] = None,
     ) -> AcceptOuts:
         """Produce the per-request accept outcome after target verify.
 
         Folded path: the accept/finalize/out-token kernels already ran inside
         the target-verify cuda graph (DsparkVerifyEpilogue); read its buffers.
         Eager path: run them here. Both apply the SGLANG_SIMULATE_ACC_LEN
-        override drawn by begin_simulated_step.
+        override drawn by begin_simulated_step, except to ``forced_rows``.
         """
         if folded_accept:
+            assert forced_rows is None, "forced verify rows take the eager accept"
             self.verify_epilogue.note_static_verify(bs)
             return self.verify_epilogue.read_accept(bs)
 
@@ -223,6 +244,7 @@ class TargetVerifyExecutor:
             simulated_correct_len=self._simulated_correct_len,
             target_logits=target_logits,
             simulate_bonus_sampling_info=simulate_bonus_sampling_info,
+            forced_rows=forced_rows,
         )
 
     def begin_simulated_step(self) -> None:
@@ -1113,13 +1135,21 @@ def build_accept_outs(
     simulated_correct_len: Optional[torch.Tensor] = None,
     target_logits: Optional[torch.Tensor] = None,
     simulate_bonus_sampling_info=None,
+    forced_rows: Optional[torch.Tensor] = None,
     out: Optional[AcceptOuts] = None,
     block_accept_lens_out: Optional[torch.Tensor] = None,
 ) -> AcceptOuts:
     """``out``: static buffers (the in-graph accept's) to copy the results into;
-    ``block_accept_lens_out`` (with ``out``) gets commit_lens + cap_trim_lens."""
+    ``block_accept_lens_out`` (with ``out``) gets commit_lens + cap_trim_lens.
+
+    ``forced_rows`` ([bs] bool): requests whose verify rows carry forced tokens
+    (SGLANG_DSV41_FUSED_TAIL feeds prompt tokens through them). They keep the
+    served accept under SGLANG_SIMULATE_ACC_LEN: their scheduler assumes every
+    forced row is accepted, so a simulated length would commit the wrong tokens.
+    """
     bs = correct_len.shape[0]
     if simulated_correct_len is not None:
+        served_correct_len, served_bonus = correct_len, bonus
         # The accept runs as served; only its length is replaced.
         correct_len = simulated_correct_len.repeat(bs).to(correct_len.dtype)
         if simulate_bonus_sampling_info is not None:
@@ -1131,6 +1161,11 @@ def build_accept_outs(
                 sampling_info=simulate_bonus_sampling_info,
                 bs=bs,
                 verify_num_draft_tokens=verify_num_draft_tokens,
+            )
+        if forced_rows is not None:
+            correct_len = torch.where(forced_rows, served_correct_len, correct_len)
+            bonus = torch.where(
+                forced_rows.view(-1, *([1] * (bonus.dim() - 1))), served_bonus, bonus
             )
     tp_sync.sync(sync_site, correct_len)
     tp_sync.sync(sync_site, bonus)

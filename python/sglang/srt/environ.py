@@ -1822,6 +1822,10 @@ class Envs:
     # so every rank decides alike. 0 runs waiting tails on the next step that
     # alternates with decode.
     SGLANG_DSV41_TAIL_HOLD_MS = EnvInt(0)
+    # PD decode with --dsv41-encoder-only-prefill and DSpark: feed each tail through
+    # the verify steps decode runs anyway, six prompt tokens per step, instead of a
+    # separate extend step. Ranks without running requests keep the extend.
+    SGLANG_DSV41_FUSED_TAIL = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
     # gfx950 DeepSeek-V4.1 prefill: attend with aiter's OPUS sparse kernel over a bf16

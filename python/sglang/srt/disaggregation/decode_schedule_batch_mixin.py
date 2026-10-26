@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, List
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.mem_cache.common import checkpoint_kv_cache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -42,6 +43,8 @@ class ScheduleBatchDisaggregationDecodeMixin:
 
         # Fill the tensor in one pass
         offset = 0
+        # A fed tail (SGLANG_DSV41_FUSED_TAIL) carries a feed floor; nothing else does.
+        fused_tail = envs.SGLANG_DSV41_FUSED_TAIL.get()
         for i, req in enumerate(reqs):
             req_pool_indices.append(req.kv.req_pool_idx)
             pre_len = req.prefix_len
@@ -55,7 +58,11 @@ class ScheduleBatchDisaggregationDecodeMixin:
             out_cache_loc[offset : offset + req.extend_len] = chunk
             offset += req.extend_len
 
-            seq_len = len(req.origin_input_ids) + max(0, len(req.output_ids) - 1)
+            if fused_tail and req.dsv41_feed_floor is not None:
+                # A fed tail enters at its transferred prefix (SGLANG_DSV41_FUSED_TAIL).
+                seq_len = req.dsv41_feed_floor
+            else:
+                seq_len = len(req.origin_input_ids) + max(0, len(req.output_ids) - 1)
             seq_lens.append(seq_len)
             if len(req.output_ids) == 0:
                 assert seq_len - pre_len == req.extend_len, (
@@ -114,8 +121,13 @@ class ScheduleBatchDisaggregationDecodeMixin:
     ):
         """Assign the buffered last input id to schedule batch"""
         last_tokens: List[int] = []
+        fused_tail = envs.SGLANG_DSV41_FUSED_TAIL.get()
         for req in self.reqs:
-            last_tokens.append(req.output_ids[-1])
+            if fused_tail and req.dsv41_feed_floor is not None:
+                # A fed tail's first verify input is the prompt token at its start.
+                last_tokens.append(req.origin_input_ids[req.dsv41_feed_floor])
+            else:
+                last_tokens.append(req.output_ids[-1])
             # PREBUILT does not materialize a local SWA branching window.
             if req.swa_branching_seqlen is not None:
                 req.swa_branching_seqlen = None

@@ -444,6 +444,14 @@ class _GenerationStreamAccumulator:
     def accept(self, *, req: Req) -> None:
         if req.beam_group is not None and not self._beam_admits(req=req):
             return
+        if (
+            envs.SGLANG_DSV41_FUSED_TAIL.get()
+            and req.dsv41_feed_floor is not None
+            and not req.output_ids
+            and not req.finished()
+        ):
+            # A fed tail (SGLANG_DSV41_FUSED_TAIL) has nothing to send yet.
+            return
         if req.finished():
             assert not req.finished_output
             req.finished_output = True

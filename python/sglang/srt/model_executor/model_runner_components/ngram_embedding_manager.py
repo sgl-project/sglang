@@ -9,6 +9,7 @@ import torch
 
 from sglang.kernels.ops.embeddings.ngram_embedding import update_token_table
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ForwardMode
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.runtime_context import get_schedule
@@ -189,10 +190,21 @@ class NgramEmbeddingManager:
             # prefill sampled, which is the token decode feeds next.
             history = self.engram_hasher.history
             rows = []
+            fused_tail = envs.SGLANG_DSV41_FUSED_TAIL.get()
             for req in batch.reqs:
                 # full_untruncated_fill_ids is only refreshed on the extend and
                 # decode paths, which a PD decode request has not run yet.
                 # Slice the tail first: origin_input_ids can be ~100k tokens.
+                if fused_tail and req.dsv41_feed_floor is not None:
+                    # A fed tail (SGLANG_DSV41_FUSED_TAIL) feeds the prompt token
+                    # at its start next.
+                    start = req.dsv41_feed_floor
+                    rows.append(
+                        self.engram_hasher.history_row(
+                            req.origin_input_ids[max(0, start - n1) : start]
+                        )
+                    )
+                    continue
                 tail = (req.origin_input_ids[-(n1 + 1) :] + req.output_ids)[-(n1 + 1) :]
                 rows.append(self.engram_hasher.history_row(tail[:-1]))
             # Pinned copies keep the admission fence from stalling the CPU.
