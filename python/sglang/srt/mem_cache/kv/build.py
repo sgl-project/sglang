@@ -244,14 +244,16 @@ def _build_full_state(
     full_pool.host_capacity_bytes = (
         sizing.full_tokens * allocator.full_attn_allocator.entry_bytes
     )
-    mamba_slot_allocator = _wire_mamba_slot_allocator(
+    _wire_mamba_slot_allocator(
         mamba_end=allocator.mamba_allocator,
         take=allocator.alloc_state_slots,
         req_to_token_pool=req_to_token_pool,
         device=ctx.device,
     )
     # Only HybridLinearKVPool's retraction CPU-copy path uses this hook.
-    token_to_kv_pool._mamba_translate = mamba_slot_allocator.translate
+    token_to_kv_pool._mamba_translate = allocator.state_ids(
+        req_to_token_pool.state_sub_pool
+    ).ids
     _log_banner(
         "UNIFIED MEMORY POOL ENABLED -- path=Mamba hybrid (%s full side)"
         % ("MLA" if use_mla else "MHA"),

@@ -1819,7 +1819,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             req_pool = self.model_runner.req_to_token_pool
             mamba_pool = getattr(req_pool, "mamba_pool", None)
             if mamba_pool is not None and not prefix_num_chunks:
-                capture_state_indices = req_pool.translate_mamba_indices(
+                state_ids = self.model_runner.kv_index_translator.state_ids(
+                    req_pool.state_sub_pool
+                )
+                capture_state_indices = state_ids.ids(
                     req_pool.get_mamba_indices(forward_batch.req_pool_indices)
                 ).unique()
 

@@ -323,6 +323,7 @@ class MockGDNModelRunner(ModelRunner):
             page_size=case.page_size,
             get_kvcache=lambda: self.token_to_kv_pool,
             hands_out_virtual_ids=False,
+            state_id_spaces=lambda: {},
         )
         self.is_draft_worker = False
         self.init_kv_index_translator()

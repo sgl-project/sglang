@@ -113,7 +113,7 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
         self.mamba_cache_chunk_size = mamba_cache_chunk_size()
         # Both identity and unified v2p gathers are recordable. The allocator
         # updates the stable device table in place, including after compaction.
-        self._slot_gather_recordable = self.req_to_token_pool.mamba_translate_is_fusable
+        self._slot_gather_recordable = True
 
         self.sconv_metadata = InklingShortConvMetadata()
 
@@ -270,7 +270,7 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
                 out_state_indices=buf,
                 valid_bs=n,
                 total_bs=n,
-                v2p=pool.mamba_v2p_table,
+                v2p=self._state_ids.read_v2p,
             )
             self._cache_indices = buf[:n]
             self.forward_metadata = ForwardMetadata(
@@ -284,8 +284,7 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
         # Every metadata view must explicitly provide virtual IDs or None.
         indices = forward_batch.mamba_track_indices
         if indices is None or (
-            self._slot_gather_recordable
-            and self.req_to_token_pool.mamba_v2p_table is None
+            self._slot_gather_recordable and self._state_ids.read_v2p is None
         ):
             self.sconv_metadata.track_cache_indices = indices
             return

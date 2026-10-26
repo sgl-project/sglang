@@ -599,15 +599,13 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             if id(pool) in seen:
                 continue
             seen.add(id(pool))
-            # The pool is a PHYSICAL store; a unified req pool hands out
+            # The pool is a PHYSICAL store; the unified allocator hands out
             # virtual slot ids (identity on a static pool).
+            state_ids = runner.kv_index_translator.state_ids(req_pool.state_sub_pool)
             if clear is not None and len(clear) > 0:
-                pool.clear_slots(req_pool.translate_mamba_indices(clear))
+                pool.clear_slots(state_ids.ids(clear))
             if cow_src is not None and len(cow_src) > 0:
-                pool.copy_from(
-                    req_pool.translate_mamba_indices(cow_src),
-                    req_pool.translate_mamba_indices(cow_dst),
-                )
+                pool.copy_from(state_ids.ids(cow_src), state_ids.ids(cow_dst))
         forward_batch.mamba_clear_indices = None
         forward_batch.mamba_cow_src_indices = None
         forward_batch.mamba_cow_dst_indices = None

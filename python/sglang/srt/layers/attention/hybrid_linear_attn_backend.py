@@ -93,11 +93,15 @@ class MambaAttnBackendBase(AttentionBackend):
         self._model_runner = model_runner
         self._mamba_chunk_size: Optional[int] = None
         pool = self.req_to_token_pool
-        self._fused_state_indices_ok = (
-            torch.device(self.device).type == "cuda"
-            and isinstance(pool, HybridReqToTokenPool)
-            and pool.mamba_translate_is_fusable
+        # The request table's slot ids as the state pool indexes them: the
+        # identity or one gather through the id space's table, both of which
+        # `fused_replay_state_indices` reproduces in its own launch.
+        self._state_ids = model_runner.kv_index_translator.state_ids(
+            pool.state_sub_pool
         )
+        self._fused_state_indices_ok = torch.device(
+            self.device
+        ).type == "cuda" and isinstance(pool, HybridReqToTokenPool)
         self.forward_metadata: ForwardMetadata = None
         self.state_indices_list = []
         # Static (max_bs,) track-dest buffer captured by pointer, refreshed in-place
@@ -142,10 +146,11 @@ class MambaAttnBackendBase(AttentionBackend):
         return self._mamba_chunk_size
 
     def _translate_mamba_indices(self, mamba_indices: torch.Tensor) -> torch.Tensor:
-        """Virtual->physical mamba slot-id translate (identity for the non-unified
-        pool). Must run everywhere mamba ids feed the SSM/conv kernels or mamba-pool
-        state ops, incl. the cuda-graph replay-prep copy into ``state_indices_list``."""
-        return self.req_to_token_pool.translate_mamba_indices(mamba_indices)
+        """The request table's slot ids as the state pool indexes them (the
+        identity unless its allocator hands out virtual slot ids). Must run
+        everywhere mamba ids feed the SSM/conv kernels or mamba-pool state ops,
+        incl. the cuda-graph replay-prep copy into ``state_indices_list``."""
+        return self._state_ids.ids(mamba_indices)
 
     @staticmethod
     def _has_cpu_prefill_track_metadata(forward_batch: ForwardBatch) -> bool:
@@ -773,7 +778,7 @@ class MambaAttnBackendBase(AttentionBackend):
                 out_state_indices=self.state_indices_list[bs - 1],
                 valid_bs=bs - int(num_padding),
                 total_bs=bs,
-                v2p=self.req_to_token_pool.mamba_v2p_table,
+                v2p=self._state_ids.read_v2p,
             )
         else:
             # Make sure forward metadata is correctly handled for padding reqs

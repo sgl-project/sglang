@@ -71,6 +71,19 @@ def _wire_chain(chain: Sequence[MultiEndedAllocator]) -> None:
         high.bind_low_peer(low)
 
 
+def slot_id_space(band: MultiEndedAllocator, *, owner: Hashable) -> IdSpace:
+    """How a state band's slots are named: a request's slot id is virtual and
+    maps to its physical slot through the band's table, one slot per entry, so
+    the write is exactly a gather through ``read_v2p``, which a fused index
+    kernel can reproduce in its own launch."""
+    return IdSpace(
+        key=(band.sub_pool_name, owner),
+        write=lambda ids: band.virtual_to_physical[ids].to(torch.int32),
+        read_v2p=band.virtual_to_physical,
+        table=band.virtual_to_physical,
+    )
+
+
 class ChainAllocator(BaseTokenToKVPoolAllocator):
     """Token, window and state allocation over one shared byte buffer."""
 
@@ -468,6 +481,13 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                 table=window.virtual_to_physical,
             )
         return spaces
+
+    def state_id_spaces(self) -> Dict[str, IdSpace]:
+        """The state band's id space (`slot_id_space`)."""
+        band = self.mamba_allocator
+        if band is None:
+            return {}
+        return {band.sub_pool_name: slot_id_space(band, owner=id(self))}
 
     def translate_write_loc(
         self,

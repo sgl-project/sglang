@@ -15,6 +15,7 @@ from sglang.srt.layers.attention.mamba.mamba2_metadata import (
     Mamba2Metadata,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.mem_cache.kv_loc_plan import IdSpace
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -74,8 +75,8 @@ def make_metadata_backend():
     backend.topk = 1
     backend.req_to_token_pool = SimpleNamespace(
         get_mamba_indices=lambda rows: rows,
-        translate_mamba_indices=lambda slots: slots,
     )
+    backend._state_ids = IdSpace(key=("mamba", None))
     return backend
 
 

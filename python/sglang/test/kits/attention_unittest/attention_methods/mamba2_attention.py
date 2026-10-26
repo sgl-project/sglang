@@ -456,6 +456,7 @@ class MockMamba2ModelRunner(ModelRunner):
         self.token_to_kv_pool_allocator = SimpleNamespace(
             page_size=case.page_size,
             hands_out_virtual_ids=False,
+            state_id_spaces=lambda: {},
         )
         self.is_draft_worker = False
         self.init_kv_index_translator()

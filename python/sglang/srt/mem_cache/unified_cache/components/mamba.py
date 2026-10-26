@@ -671,12 +671,15 @@ class MambaComponent(TreeComponent):
                 )
             else:
                 mamba_value_donated = self._alloc_mamba_slot(req)
-                # mamba_pool is a pure PHYSICAL store; translate both slot ids
-                # virtual->physical (identity for the non-unified memory pool) first.
-                translate = self.cache.req_to_token_pool.translate_mamba_indices
-                self.cache.req_to_token_pool.mamba_pool.copy_from(
-                    translate(req.kv.mamba_pool_idx.unsqueeze(0)),
-                    translate(mamba_value_donated),
+                # mamba_pool is a pure PHYSICAL store; map both slot ids into
+                # its id space (identity unless the slot ids are virtual) first.
+                req_pool = self.cache.req_to_token_pool
+                state_ids = self.cache.token_to_kv_pool_allocator.state_ids(
+                    req_pool.state_sub_pool
+                )
+                req_pool.mamba_pool.copy_from(
+                    state_ids.ids(req.kv.mamba_pool_idx.unsqueeze(0)),
+                    state_ids.ids(mamba_value_donated),
                 )
             insert_params.mamba_value = mamba_value_donated
             return cache_len
@@ -785,7 +788,10 @@ class MambaComponent(TreeComponent):
         write_pos = pool.mamba_pool.replayssm_write_pos
         if write_pos is not None:
             slot = req.kv.mamba_pool_idx.unsqueeze(0)
-            write_pos[pool.translate_mamba_indices(slot)] = 0
+            state_ids = self.cache.token_to_kv_pool_allocator.state_ids(
+                pool.state_sub_pool
+            )
+            write_pos[state_ids.ids(slot)] = 0
         req.kv.mamba_cow_src_index = None
         req.kv.mamba_needs_clear = False
 

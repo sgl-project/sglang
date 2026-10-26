@@ -16,11 +16,12 @@ limitations under the License.
 from __future__ import annotations
 
 import abc
-from typing import TYPE_CHECKING, Hashable, Protocol
+from typing import TYPE_CHECKING, Dict, Hashable, Protocol
 
 import torch
 
 if TYPE_CHECKING:
+    from sglang.srt.mem_cache.kv_loc_plan import IdSpace
     from sglang.srt.mem_cache.memory_pool import KVCache
 
 
@@ -74,6 +75,19 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         """Whether a sliding-window pool sits beside the full-attention one,
         with the window allocation surface (`free_swa`, `swa_available_size`, ...)."""
         return False
+
+    def state_id_spaces(self) -> Dict[str, IdSpace]:
+        """The id space of each recurrent-state sub-pool whose slots this
+        allocator hands out, keyed by sub-pool name. Empty when the slot ids the
+        request table holds index the state pool as they are."""
+        return {}
+
+    def state_ids(self, sub_pool: str) -> IdSpace:
+        """How the state sub-pool ``sub_pool`` indexes the slot ids the request
+        table holds, for a consumer outside a forward (the tree, PD transfers)."""
+        from sglang.srt.mem_cache.kv_loc_plan import state_id_space
+
+        return state_id_space(self.state_id_spaces(), sub_pool)
 
     # -- scheduler-facing capacity hooks --
     # The scheduler calls these unconditionally, with no allocator-type branches

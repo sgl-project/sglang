@@ -12,6 +12,7 @@ from sglang.srt.layers.attention.linear.inkling_sconv_backend import (
     InklingShortConvHybridAttnBackend,
 )
 from sglang.srt.mem_cache.allocator.unified_sub_pool import MultiEndedAllocator
+from sglang.srt.mem_cache.kv.alloc.chain import slot_id_space
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
@@ -97,9 +98,12 @@ class TestInklingCheckpointIndices(CustomTestCase):
         backend.device = "cuda"
         backend.conv_state_len = 3
         backend._cache_indices_buf = None
-        backend._slot_gather_recordable = (
-            req_pool.mamba_translate_is_fusable if fused else static
+        backend._state_ids = (
+            IdSpace(key=("mamba", None))
+            if static
+            else slot_id_space(allocator, owner=None)
         )
+        backend._slot_gather_recordable = fused or static
         config = SimpleNamespace(
             decode=SimpleNamespace(bs=[1, 2, 4], max_bs=4),
             prefill=SimpleNamespace(bs=[8]),
@@ -878,7 +882,7 @@ class TestInklingCheckpointIndices(CustomTestCase):
                 backend.init_forward_metadata_in_graph(batch)
         pointer = backend._cache_indices_buf.data_ptr()
         track_pointer = backend._graph_track_indices.data_ptr()
-        table_pointer = pool.mamba_v2p_table.data_ptr()
+        table_pointer = backend._state_ids.read_v2p.data_ptr()
         before = backend._cache_indices.clone()
         # Free live physical holes and move both active and checkpoint states.
         for hole in (slots[:1], slots[5:6]):
@@ -904,7 +908,7 @@ class TestInklingCheckpointIndices(CustomTestCase):
             self.assertEqual(backend.sconv_metadata.track_cache_indices[-2].item(), -1)
             self.assertEqual(backend._cache_indices_buf.data_ptr(), pointer)
             self.assertEqual(backend._graph_track_indices.data_ptr(), track_pointer)
-            self.assertEqual(pool.mamba_v2p_table.data_ptr(), table_pointer)
+            self.assertEqual(backend._state_ids.read_v2p.data_ptr(), table_pointer)
             with (
                 patch.object(pool, "get_speculative_mamba2_params_all_layers"),
                 patch(_BACKEND + ".scatter_mamba_states_after_mtp_verify") as scatter,

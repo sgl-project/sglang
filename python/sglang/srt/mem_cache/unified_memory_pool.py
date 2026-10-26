@@ -1064,7 +1064,8 @@ class UnifiedMambaSlotAllocator:
 
 class UnifiedHybridReqToTokenPool(HybridReqToTokenPool):
     """`HybridReqToTokenPool` whose `mamba_pool` is a `UnifiedMambaPool`. The inherited
-    mamba-id state now holds VIRTUAL ids; adds `translate_mamba_indices` for v->p."""
+    mamba-id state now holds VIRTUAL ids, which the allocator's id space for
+    `state_sub_pool` maps to physical slots."""
 
     def __init__(
         self,
@@ -1086,7 +1087,7 @@ class UnifiedHybridReqToTokenPool(HybridReqToTokenPool):
         pre_alloc_size: int = 0,
     ):
         self._unified_buffer = unified_buffer
-        self._mamba_sub_pool_name = mamba_sub_pool_name
+        self.state_sub_pool = mamba_sub_pool_name
         self._shared_mamba_size = (
             unified_buffer.max_slots(mamba_sub_pool_name) - 1
         )  # reserve slot 0
@@ -1156,7 +1157,7 @@ class UnifiedHybridReqToTokenPool(HybridReqToTokenPool):
         )
         assert mamba_size == self._shared_mamba_size, (
             f"UnifiedHybridReqToTokenPool._init_mamba_pool: mamba_size={mamba_size} "
-            f"!= unified_buffer.max_slots({self._mamba_sub_pool_name!r}) - 1 "
+            f"!= unified_buffer.max_slots({self.state_sub_pool!r}) - 1 "
             f"= {self._shared_mamba_size}"
         )
         assert len(cache_params.layers) >= len(mamba_layer_ids), (
@@ -1165,7 +1166,7 @@ class UnifiedHybridReqToTokenPool(HybridReqToTokenPool):
         )
         self.mamba_pool = UnifiedMambaPool(
             unified_buffer=self._unified_buffer,
-            sub_pool_name=self._mamba_sub_pool_name,
+            sub_pool_name=self.state_sub_pool,
             spec_state_size=mamba_spec_state_size,
             mamba_layer_ids=mamba_layer_ids,
             enable_memory_saver=self.enable_memory_saver,
@@ -1205,7 +1206,7 @@ class UnifiedHybridReqToTokenPool(HybridReqToTokenPool):
         clone = copy.copy(self)
         clone.mamba_pool = UnifiedDraftMambaPool(
             unified_buffer=self._unified_buffer,
-            sub_pool_name=self._mamba_sub_pool_name,
+            sub_pool_name=self.state_sub_pool,
             layer_lanes=layer_lanes,
         )
         clone.mamba_map = {
@@ -1213,19 +1214,6 @@ class UnifiedHybridReqToTokenPool(HybridReqToTokenPool):
         }
         clone.mamba_ckpt_pool = None
         return clone
-
-    @property
-    def mamba_v2p_table(self) -> Optional[torch.Tensor]:
-        """This pool's ids ARE virtual; page_size is 1, so the translate is the
-        plain gather this table serves, which keeps `mamba_translate_is_fusable`
-        true despite the override."""
-        if self.mamba_allocator is None:
-            return None
-        return self.mamba_allocator.virtual_to_physical
-
-    def translate_mamba_indices(self, virtual_ids: torch.Tensor) -> torch.Tensor:
-        """Virtual mamba ids -> physical slot ids."""
-        return self.mamba_allocator.translate(virtual_ids).to(torch.int32)
 
 
 class UnifiedHybridLinearKVPool(HybridLinearKVPool):

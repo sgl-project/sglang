@@ -450,7 +450,9 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             self.evict(EvictParams(num_tokens=0, mamba_num=1))
             slot = allocator.alloc(1)
         if slot is not None:
-            physical = self.req_to_token_pool.translate_mamba_indices(slot)
+            physical = self.token_to_kv_pool_allocator.state_ids(
+                self.req_to_token_pool.state_sub_pool
+            ).ids(slot)
             self.lmcache_connector.reset_mamba_checkpoint_metadata(physical)
         return slot
 

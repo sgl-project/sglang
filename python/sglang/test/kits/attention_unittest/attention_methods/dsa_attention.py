@@ -405,6 +405,7 @@ class DSAMockModelRunner(ModelRunner):
         self.token_to_kv_pool_allocator = SimpleNamespace(
             page_size=case.page_size,
             hands_out_virtual_ids=False,
+            state_id_spaces=lambda: {},
         )
         self.init_kv_index_translator()
         self.attention_chunk_size = None

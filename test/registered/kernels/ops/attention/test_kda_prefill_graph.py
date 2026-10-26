@@ -22,6 +22,7 @@ from sglang.srt.layers.attention.linear.kda_backend import (
 )
 from sglang.srt.layers.attention.linear.kda_prefill_graph import KDAPrefillGraphMetadata
 from sglang.srt.layers.attention.linear.utils import LinearAttnKernelBackend
+from sglang.srt.mem_cache.kv_loc_plan import IdSpace
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -69,8 +70,8 @@ def _backend(conv_pool, ssm_pool, prefill_backend=LinearAttnKernelBackend.TRITON
         get_mamba_indices=lambda req_pool_indices: (req_pool_indices + 1).to(
             torch.int32
         ),
-        translate_mamba_indices=lambda indices: indices,
     )
+    backend._state_ids = IdSpace(key=("mamba", None))
     backend.device = torch.device("cuda")
     backend._mamba_chunk_size = CHUNK
     backend.conv_states_shape = conv_pool.transpose(-1, -2).shape

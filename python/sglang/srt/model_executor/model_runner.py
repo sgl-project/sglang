@@ -1966,7 +1966,9 @@ class ModelRunner:
             # mamba_pool is a pure PHYSICAL store; translate before zeroing or
             # clear_slots zeroes the wrong physical slots.
             pool.mamba_pool.clear_slots(
-                pool.translate_mamba_indices(forward_batch.mamba_clear_indices)
+                self.kv_index_translator.state_ids(pool.state_sub_pool).ids(
+                    forward_batch.mamba_clear_indices
+                )
             )
         if (
             forward_batch.mamba_cow_src_indices is not None
@@ -1981,9 +1983,10 @@ class ModelRunner:
                 )
             else:
                 # mamba_pool is a pure PHYSICAL store; translate both COW slot ids.
+                state_ids = self.kv_index_translator.state_ids(pool.state_sub_pool)
                 pool.copy_mamba_state(
-                    pool.translate_mamba_indices(forward_batch.mamba_cow_src_indices),
-                    pool.translate_mamba_indices(forward_batch.mamba_cow_dst_indices),
+                    state_ids.ids(forward_batch.mamba_cow_src_indices),
+                    state_ids.ids(forward_batch.mamba_cow_dst_indices),
                 )
         forward_batch.mamba_clear_indices = None
         forward_batch.mamba_cow_src_indices = None

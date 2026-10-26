@@ -1359,6 +1359,9 @@ class HybridReqToTokenPool(ReqToTokenPool):
     """A memory pool that maps a request to its token locations."""
 
     mamba_pool_cls = MambaPool
+    # The state sub-pool the slot ids in `req_index_to_mamba_index_mapping`
+    # name; the allocator's id space for it says how the pool indexes them.
+    state_sub_pool: str = "mamba"
 
     def __init__(
         self,
@@ -1637,34 +1640,11 @@ class HybridReqToTokenPool(ReqToTokenPool):
     def get_mamba_indices(self, req_indices: torch.Tensor) -> torch.Tensor:
         return self.req_index_to_mamba_index_mapping[req_indices]
 
-    @property
-    def mamba_v2p_table(self) -> Optional[torch.Tensor]:
-        """The mamba virtual->physical slot table, or None when the ids this
-        pool hands out are already physical."""
-        return None
-
-    @property
-    def mamba_translate_is_fusable(self) -> bool:
-        """Whether `fused_replay_state_indices` can reproduce this pool's
-        `translate_mamba_indices` in its own launch.
-
-        The kernel expresses exactly two shapes: the identity, and one gather
-        through `mamba_v2p_table`. A subclass that replaces the translate with
-        anything else is excluded here rather than silently mis-served.
-        """
-        if self.mamba_v2p_table is not None:
-            return True
-        return (
-            type(self).translate_mamba_indices
-            is HybridReqToTokenPool.translate_mamba_indices
-        )
-
     def translate_mamba_indices(self, mamba_indices: torch.Tensor) -> torch.Tensor:
-        """Virtual->physical mamba-slot translate. Identity for a static pool
-        (slots are physical); UnifiedHybridReqToTokenPool overrides it for the
-        unified memory pool, where mamba slot ids are virtual. Callers translate
-        before calling the pool's physical-id state ops (copy_from / clear_slots
-        / get_cpu_copy / load_cpu_copy)."""
+        """The state pool's slot ids for ``mamba_indices``: the same ids, since a
+        static table's slots index its state pool as they are. sglang's own code
+        maps state slot ids through the allocator's id space; this stays for
+        integrations outside sglang that call it (LMCache's sglang adapter)."""
         return mamba_indices
 
     def mamba2_layer_index(self, layer_id: int) -> int:
