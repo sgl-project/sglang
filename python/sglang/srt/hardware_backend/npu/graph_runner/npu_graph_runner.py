@@ -381,8 +381,9 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
             if mla_dcp_graph:
                 seq_lens = get_mla_dcp_backend(
                     self._replay_attn_backend()
-                ).get_mla_dcp_graph_replay_lengths(
-                    forward_batch,
+                ).get_mla_dcp_graph_lengths(
+                    forward_batch.seq_lens,
+                    forward_batch.forward_mode,
                     bs=self.bs,
                     query_len=self.captured_req_width,
                 )

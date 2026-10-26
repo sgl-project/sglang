@@ -485,13 +485,21 @@ class AscendAttnBackend(AttentionBackend):
             return not dsa_use_prefill_cp(forward_batch) and not mode.is_idle()
         return self.use_mla and (mode.is_decode() or mode.is_target_verify())
 
-    def get_mla_dcp_graph_replay_lengths(
-        self, forward_batch: ForwardBatch, *, bs: int, query_len: int
+    def get_mla_dcp_graph_lengths(
+        self,
+        seq_lens: torch.Tensor,
+        forward_mode: ForwardMode,
+        *,
+        bs: int,
+        query_len: int,
+        spec_info: Optional[SpecInput] = None,
     ) -> list[int]:
-        """Build FIA's Host lengths independently of captured device buffers."""
-        seq_lens_cpu = forward_batch.seq_lens.cpu()
-        if forward_batch.forward_mode.is_target_verify():
+        """Build capture/replay FIA Host lengths from global prefix lengths."""
+        seq_lens_cpu = seq_lens.cpu()
+        if forward_mode.is_target_verify():
             seq_lens_cpu = seq_lens_cpu + query_len
+        elif forward_mode.is_decode_or_idle() and spec_info is not None:
+            seq_lens_cpu = seq_lens_cpu + self.speculative_step_id + 1
         local_seq_lens = get_dcp_lens(
             seq_lens_cpu,
             self.dcp_size,
@@ -549,22 +557,14 @@ class AscendAttnBackend(AttentionBackend):
             forward_batch.seq_lens.cpu() if in_capture else forward_batch.seq_lens_cpu
         )
         if in_capture:
+            self._init_cuda_graph_metadata(forward_batch, seq_lens_cpu)
             if (
                 self.dense_mla_dcp_target
                 and forward_batch.forward_mode.is_target_verify()
                 and _is_dflash_verify(forward_batch.spec_info)
             ):
-                # Capture starts from device prefix lengths. Match the DFlash
-                # worker's Host bound before initializing or applying metadata.
+                # Match the DFlash worker's Host bound for page-table preparation.
                 seq_lens_cpu = seq_lens_cpu + self.speculative_num_draft_tokens
-            self._init_cuda_graph_metadata(
-                bs,
-                forward_batch.forward_mode,
-                forward_batch.seq_lens,
-                forward_batch.out_cache_loc,
-                seq_lens_cpu=seq_lens_cpu,
-                spec_info=forward_batch.spec_info,
-            )
         self._apply_cuda_graph_metadata(
             bs=bs,
             req_pool_indices=forward_batch.req_pool_indices,
@@ -925,34 +925,14 @@ class AscendAttnBackend(AttentionBackend):
         """
         pass
 
-    def _get_graph_attention_kv_lens_cpu(
-        self,
-        seq_lens_cpu: torch.Tensor,
-        bs: int,
-        forward_mode: ForwardMode,
-        spec_info: Optional[SpecInput],
-    ) -> torch.Tensor:
-        """Normalize Host lengths; DFlash inputs already include verify KV."""
-        attention_kv_lens_cpu = seq_lens_cpu[:bs].int()
-        if forward_mode.is_target_verify() and not _is_dflash_verify(spec_info):
-            attention_kv_lens_cpu = (
-                attention_kv_lens_cpu + self.speculative_num_draft_tokens
-            )
-        elif forward_mode.is_decode_or_idle() and spec_info is not None:
-            attention_kv_lens_cpu = attention_kv_lens_cpu + self.speculative_step_id + 1
-        return attention_kv_lens_cpu
-
     def _init_cuda_graph_metadata(
-        self,
-        bs: int,
-        forward_mode: ForwardMode,
-        seq_lens: torch.Tensor,
-        out_cache_loc: Optional[torch.Tensor] = None,
-        *,
-        seq_lens_cpu: torch.Tensor,
-        spec_info: Optional[SpecInput],
+        self, forward_batch: ForwardBatch, prefix_lens_cpu: torch.Tensor
     ) -> ForwardMetadata:
         """Create and store the per-bs ForwardMetadata for CUDA graph capture."""
+        bs = forward_batch.batch_size
+        forward_mode = forward_batch.forward_mode
+        seq_lens = forward_batch.seq_lens
+        out_cache_loc = forward_batch.out_cache_loc
         metadata = ForwardMetadata()
         if self.enable_sparsity_driven_kv_offload:
             from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.host_callback import (
@@ -990,15 +970,13 @@ class AscendAttnBackend(AttentionBackend):
             num_tokens = out_cache_loc.shape[0]
             metadata.swa_out_cache_loc = self.cuda_graph_swa_out_cache_loc[:num_tokens]
         if self.dense_mla_dcp_target:
-            attention_kv_lens_cpu = self._get_graph_attention_kv_lens_cpu(
-                seq_lens_cpu, bs, forward_mode, spec_info
+            metadata.seq_lens_cpu_list = self.get_mla_dcp_graph_lengths(
+                prefix_lens_cpu,
+                forward_mode,
+                bs=bs,
+                query_len=self.speculative_num_draft_tokens,
+                spec_info=forward_batch.spec_info,
             )
-            metadata.seq_lens_cpu_list = get_dcp_lens(
-                attention_kv_lens_cpu,
-                self.dcp_size,
-                self.dcp_rank,
-                interleave_size=self.page_size,
-            ).tolist()
         else:
             metadata.seq_lens_cpu_list = seq_lens.cpu().int().tolist()
         metadata.seq_lens = seq_lens
@@ -1082,9 +1060,17 @@ class AscendAttnBackend(AttentionBackend):
                 self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc)
             )
         if self.needs_cpu_seq_lens:
-            attention_kv_lens_cpu = self._get_graph_attention_kv_lens_cpu(
-                seq_lens_cpu, bs, forward_mode, spec_info
-            )
+            # DFlash Host bounds already include verify KV; other verify inputs
+            # need the draft block, and speculative decode needs its step offset.
+            attention_kv_lens_cpu = seq_lens_cpu[:bs].int()
+            if forward_mode.is_target_verify() and not _is_dflash_verify(spec_info):
+                attention_kv_lens_cpu = (
+                    attention_kv_lens_cpu + self.speculative_num_draft_tokens
+                )
+            elif forward_mode.is_decode_or_idle() and spec_info is not None:
+                attention_kv_lens_cpu = (
+                    attention_kv_lens_cpu + self.speculative_step_id + 1
+                )
             max_len = attention_kv_lens_cpu.max().item()
             max_seq_pages = (max_len + self.page_size - 1) // self.page_size
 
