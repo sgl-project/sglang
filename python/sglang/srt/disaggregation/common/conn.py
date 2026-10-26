@@ -308,7 +308,8 @@ class CommonKVManager(BaseKVManager):
     kv_shard_rank: int = 0
     kv_shard_size: int = 1
     # Prefill KV sharding under CP-TP group sharing: decode pulls KV pages from
-    # every CP rank, but GDN/QSA/PLE state only from its rank-matched one.
+    # every CP rank, but GDN/QSA/PLE state and aux only from its rank-matched
+    # one (see _is_request_peer).
     kv_shard_state_peer_only: bool = False
 
     # Used by decode when the prefill reported Failed without a reason frame.
@@ -529,11 +530,47 @@ class CommonKVManager(BaseKVManager):
             and not get_parallel().enable_cp_tp_group_sharing
         )
 
-    def _is_state_peer(self, dst_tp_rank: int, dst_attn_tp_size: int) -> bool:
-        """Decode pairs its TP rank r with prefill rank r (equal TP sizes)."""
+    # The three helpers below hold under ``kv_shard_state_peer_only`` only;
+    # callers check that flag first, so unsharded transfers read nothing new.
+
+    def _is_request_peer(self, dst_tp_rank: int) -> bool:
+        """Whether this prefill rank sends the per-request state and aux to
+        decode attention-TP rank ``dst_tp_rank``.
+
+        Under KV sharding with CP-TP group sharing every prefill rank sends its
+        KV pages to every decode rank, but only one sends the rest. The GDN
+        heads are split over the TP group here and over attention TP on decode,
+        so head shard r lives on prefill TP rank r (``engine_rank``) and on
+        decode attention-TP rank r. QSA and PLE state and the aux are identical
+        on every rank and travel with it, so each decode slot has one writer.
+        ``_kv_shard_peer_mismatch`` rejects decode peers of another width, so
+        the ranks pair one to one.
+        """
+        return dst_tp_rank == self.kv_args.engine_rank
+
+    def _kv_shard_peer_mismatch(self, dst_attn_tp_size: int) -> Optional[str]:
+        """Why a decode peer cannot pair with this prefill, if it cannot. Every
+        prefill rank checks it, not only the state peer, so it holds even
+        without the decode-side assert in ``_resolve_rank_mapping``."""
+        if dst_attn_tp_size == self.state_tp_size:
+            return None
         return (
-            dst_tp_rank % dst_attn_tp_size
-            == self.kv_args.engine_rank % self.state_tp_size
+            "KV cache sharding sends the request state from prefill rank r to "
+            "decode attention-TP rank r, so the sizes must match: "
+            f"prefill={self.state_tp_size} decode={dst_attn_tp_size}"
+        )
+
+    def _kv_shard_fan_in_mismatch(self, required_dst_info_num: int) -> Optional[str]:
+        """Why a decode cannot read this prefill's KV pages, if it cannot:
+        each prefill rank owns only a subset of them, so every decode
+        attention-TP rank must pull from every prefill rank."""
+        if required_dst_info_num == self.kv_shard_size:
+            return None
+        return (
+            "KV cache sharding needs every decode attention-TP rank to pull "
+            f"from every prefill rank, but {required_dst_info_num} of "
+            f"{self.kv_shard_size} decode ranks registered for a request; the "
+            "decode may predate KV-shard fan-in for CP-TP group sharing"
         )
 
     def requires_dcp_relayout(self, dst_dcp_size: int, dst_dcp_rank: int) -> bool:

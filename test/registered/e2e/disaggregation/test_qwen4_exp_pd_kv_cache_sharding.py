@@ -103,8 +103,13 @@ class TestQwen4ExpPDKVCacheSharding(GSM8KMixin, PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
+        cls.configure_transfer_backend()
         cls.tokenizer = AutoTokenizer.from_pretrained(cls.model)
         cls.launch_all()
+
+    @classmethod
+    def configure_transfer_backend(cls):
+        """Keep the fixture's transfer backend (Mooncake in CI)."""
 
     def _server_info(self, url: str) -> dict:
         response = requests.get(url + "/server_info", timeout=60)

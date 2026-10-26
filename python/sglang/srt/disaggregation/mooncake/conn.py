@@ -314,7 +314,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             self.failed_session_probes: Dict[str, FailedSessionProbe] = {}
             # Separate from failed_sessions, which _run_one_probe_pass clears
             # on a successful probe: an incompatible decode is still reachable,
-            # so only a re-registration may lift this.
+            # so only a re-registration may lift this. Also holds KV-shard
+            # pairing rejections (see _reject_decode_without_fan_in).
             self.state_layout_rejections: Dict[str, str] = {}
             # Peers already cleared at registration; skip the per-transfer check.
             self.state_strides_validated: Set[str] = set()
@@ -933,6 +934,25 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             self.decode_kv_args_table[mooncake_session_id] = decode_kv_args
         return mismatch
 
+    def _reject_decode_without_fan_in(
+        self, mooncake_session_id: str, required_dst_info_num: int
+    ) -> None:
+        """Reject a decode that does not pull from every KV-sharded prefill
+        rank, as for a layout mismatch: every request from it fails instead of
+        finishing with only some of its KV pages."""
+        mismatch = self._kv_shard_fan_in_mismatch(required_dst_info_num)
+        if mismatch is None:
+            return
+        with self.session_lock:
+            if mooncake_session_id in self.state_layout_rejections:
+                return
+            self.state_layout_rejections[mooncake_session_id] = mismatch
+        logger.error(
+            "Rejecting transfers to decode session %s: %s",
+            mooncake_session_id,
+            mismatch,
+        )
+
     def _validate_peer_state_layout(
         self, registration_info: KVArgsRegisterInfo
     ) -> Tuple[bool, Optional[str]]:
@@ -943,6 +963,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         a reason rejects the peer, ``fully_checked`` retires the per-transfer
         check.
         """
+        if self.kv_shard_state_peer_only:
+            mismatch = self._kv_shard_peer_mismatch(registration_info.dst_attn_tp_size)
+            if mismatch is not None:
+                return False, mismatch
         if (
             get_spec().speculative_algorithm == "DFLASH"
             # Bootstrap runs concurrently with temporary draft TP scopes.
@@ -1883,14 +1907,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         # shards it per rank).
         if self._should_skip_cp_replicated_state_transfer():
             skip_state = True
-        if (
-            self.kv_shard_state_peer_only
-            and info is not None
-            and not self._is_state_peer(
-                dst_tp_rank=info.dst_tp_rank, dst_attn_tp_size=info.dst_attn_tp_size
-            )
-        ):
-            skip_state = True
 
         if not self.is_hybrid_mla_backend:
             return skip_kv, skip_state
@@ -2742,7 +2758,17 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             break
 
                         if kv_chunk.is_last_chunk:
-                            if kv_chunk.state_indices and not skip_state:
+                            is_request_peer = (
+                                not self.kv_shard_state_peer_only
+                                or self._is_request_peer(
+                                    target_rank_registration_info.dst_tp_rank
+                                )
+                            )
+                            if (
+                                kv_chunk.state_indices
+                                and not skip_state
+                                and is_request_peer
+                            ):
                                 state_rc = self.maybe_send_extra(
                                     req,
                                     kv_chunk.state_indices,
@@ -2778,11 +2804,16 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                     )
                                     break
 
-                            # Only the last chunk we need to send the aux data
-                            ret = self.send_aux(
-                                req,
-                                kv_chunk.prefill_aux_index,
-                                target_rank_registration_info.dst_aux_ptrs,
+                            # Only the last chunk we need to send the aux data;
+                            # a non-peer sends KV pages only.
+                            ret = (
+                                self.send_aux(
+                                    req,
+                                    kv_chunk.prefill_aux_index,
+                                    target_rank_registration_info.dst_aux_ptrs,
+                                )
+                                if is_request_peer
+                                else 0
                             )
                             if ret != 0:
                                 # The aux write targets decode's metadata
@@ -2998,6 +3029,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     continue
                 else:
                     required_dst_info_num = int(waiting_req_bytes[7].decode("ascii"))
+                    if self.kv_shard_state_peer_only:
+                        self._reject_decode_without_fan_in(
+                            mooncake_session_id, required_dst_info_num
+                        )
                     room = int(room)
                     if room not in self.transfer_infos:
                         self.transfer_infos[room] = {}
