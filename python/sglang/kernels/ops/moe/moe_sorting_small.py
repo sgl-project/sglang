@@ -721,9 +721,10 @@ def apply_aiter_small_moe_sort_patch() -> None:
             else None
         )
         zero_moe_buf = accumulate and addend is None
+        unmasked_sort = plain_sort and expert_mask is None and num_local_tokens is None
         presorted = (
             _take_presorted(topk_ids, num_experts, model_dim, moebuf_dtype, block_size)
-            if plain_sort and expert_mask is None and num_local_tokens is None
+            if unmasked_sort
             else None
         )
         if presorted is not None:
@@ -782,10 +783,9 @@ def apply_aiter_small_moe_sort_patch() -> None:
                 num_valid_ids,
                 moe_buf if addend is None else addend,
             )
+        fp4_input = _pending_fp4_input.get()
         if (
-            plain_sort
-            and expert_mask is None
-            and num_local_tokens is None
+            unmasked_sort
             and model_dim == 6144
             and moe_sort_quant_supported(topk_ids, topk_weights, int(num_experts))
         ):
@@ -795,25 +795,20 @@ def apply_aiter_small_moe_sort_patch() -> None:
                 dtype=moebuf_dtype,
                 device=topk_ids.device,
             )
-            fp4_input = _pending_fp4_input.get()
-            if M > MAX_QUANT_TOKENS:
-                fp4_input = None
+            quant_input = fp4_input if M <= MAX_QUANT_TOKENS else None
             sorted_ret = moe_sort_quant(
                 topk_ids,
                 topk_weights,
                 int(num_experts),
                 int(block_size),
                 moe_buf,
-                x=fp4_input,
+                x=quant_input,
             )
-            if fp4_input is not None:
-                _emitted_fp4_quant.set((*sorted_ret[4:], sorted_ret[0], fp4_input))
+            if quant_input is not None:
+                _emitted_fp4_quant.set((*sorted_ret[4:], sorted_ret[0], quant_input))
             return (*sorted_ret[:4], moe_buf if addend is None else addend)
-        fp4_input = _pending_fp4_input.get()
         if (
-            plain_sort
-            and expert_mask is None
-            and num_local_tokens is None
+            unmasked_sort
             and fp4_input is not None
             and topk_ids.shape[0] > MAX_TOKENS
             and moe_sort_quant_large_supported(

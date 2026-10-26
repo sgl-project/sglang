@@ -89,8 +89,12 @@ assert ctypes.sizeof(SharedArgs) == 164, (
 )
 
 
+def _token_bucket(m: int) -> int:
+    return 8 if m <= 8 else 16
+
+
 def _tile(m: int):
-    return _TILES[8 if m <= 8 else 16]
+    return _TILES[_token_bucket(m)]
 
 
 def m31_router_supported(
@@ -256,7 +260,7 @@ def m31_shared_router_supported(
         and wq.shape == (SHARED_N, HIDDEN)
         and smallm_fp8_gfx950.smallm_fp8_gemm_supported(xq, wq, x_scale, torch.bfloat16)
         and tuple(smallm_fp8_gfx950.smallm_fp8_gemm_config(m, *wq.shape))
-        == _SHARED[8 if m <= 8 else 16][2]
+        == _SHARED[_token_bucket(m)][2]
     )
 
 
@@ -277,7 +281,7 @@ def m31_shared_router(
         return None
     r_args, out = launch
     m, n = x.shape[0], wq.shape[0]
-    name, r_grid, (nt, _, waves, _) = _SHARED[8 if m <= 8 else 16]
+    name, r_grid, (nt, _, waves, _) = _SHARED[_token_bucket(m)]
     gate_up = torch.empty(m, n, dtype=torch.bfloat16, device=x.device)
     xs = x_scale.view(m, -1)[:, 0]
     g_args = smallm_fp8_gfx950.Args(
