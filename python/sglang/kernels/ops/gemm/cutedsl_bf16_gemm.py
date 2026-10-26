@@ -1345,6 +1345,9 @@ _K3_TGV_WIN_SHAPES = frozenset(
         (3584, 7168),  # MoE latent down (unfused fallback)
         (7168, 3584),  # MoE latent up
         (7168, 768),  # shared down
+        (7168, 1792),  # DSpark draft down
+        (7168, 512),  # DSpark draft o_proj
+        (8448, 7168),  # dense MLP gate_up
     }
 )
 
