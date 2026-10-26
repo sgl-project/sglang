@@ -145,13 +145,20 @@ class TestDeepseekV4FlashFp8Tbo(CustomTestCase):
                 "model": self.model,
                 "messages": [{"role": "user", "content": "What is 7 + 5?"}],
                 "temperature": 0,
-                "max_tokens": 32,
+                # The server thinks by default (SGLANG_DEFAULT_THINKING), and the
+                # reasoning counts against max_tokens: leave room for the answer.
+                "max_tokens": 512,
             },
         )
 
         self.assertEqual(response.status_code, 200)
-        text = response.json()["choices"][0]["message"]["content"]
-        self.assertIn("12", text, f"Expected 12, got {text!r}")
+        choice = response.json()["choices"][0]
+        text = choice["message"]["content"]
+        self.assertIn(
+            "12",
+            text,
+            f"Expected 12, got {text!r} (finish_reason={choice['finish_reason']!r})",
+        )
 
     def test_gsm8k_tbo(self):
         args = SimpleNamespace(
