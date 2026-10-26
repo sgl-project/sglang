@@ -19,13 +19,16 @@ from typing import TYPE_CHECKING, Optional
 import torch
 from torch import nn
 
-from sglang.kernels.ops.muse_spark.fused_post_expert_norm_weighted_sum_triton import (
-    fused_post_expert_norm_weighted_sum,
-)
-from sglang.kernels.ops.muse_spark.fused_post_expert_norm_weighted_sum_trtllm import (
+from sglang.kernels.ops.communication.muse_spark_moe_finalize_all_reduce import (
     FusedPostExpertNormWeightedSumTRTLLM,
 )
-from sglang.kernels.ops.muse_spark.norm_fp4_quant import fused_norm_fp4_quant
+from sglang.kernels.ops.layernorm.muse_spark_rmsnorm_nvfp4_quant import (
+    fused_norm_fp4_quant,
+    fused_norm_fp4_quant_static,
+)
+from sglang.kernels.ops.moe.muse_spark_post_expert_finalize_triton import (
+    fused_post_expert_norm_weighted_sum,
+)
 from sglang.srt.layers.moe import MoeRunnerBackend, get_moe_runner_backend
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.muse_spark.muse_spark_nvfp4_moe import (
@@ -35,7 +38,7 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.utils.common import get_device_capability, is_cuda
 
 if TYPE_CHECKING:
-    from sglang.kernels.ops.muse_spark.fi_trtllm_moe_finalize_with_rmsnorm_cutedsl import (
+    from sglang.srt.layers.communication.muse_spark_finalize_workspace import (
         FinalizePushWorkspace,
     )
     from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
@@ -106,11 +109,13 @@ class MuseSpark1xFp4Experts(nn.Module):
         self.top_k = top_k
         self.params_dtype = params_dtype or torch.get_default_dtype()
         self.quant_config = quant_config
+        self.moe_runner_backend = _resolve_moe_runner_backend()
         # SwiGLU, and no routed_scaling here -- Muse folds its route_scale into
         # the topk weights before they reach us.
         self.moe_runner_config = MoeRunnerConfig(
             num_experts=num_experts,
             num_local_experts=num_local_experts,
+            runner_backend=self.moe_runner_backend,
             hidden_size=hidden_size,
             intermediate_size_per_partition=intermediate_size,
             top_k=top_k,
@@ -125,7 +130,6 @@ class MuseSpark1xFp4Experts(nn.Module):
         self.dispatcher = _DirectDispatcher()
 
         capability = get_device_capability() if is_cuda() else None
-        self.moe_runner_backend = _resolve_moe_runner_backend()
         self.use_marlin = self.moe_runner_backend.is_marlin()
         self._sm_major = capability[0] if capability is not None else 0
         if not self.use_marlin and capability is not None and capability < (10, 0):
@@ -378,12 +382,16 @@ class MuseSpark1xFp4Experts(nn.Module):
         hidden_states: torch.Tensor,
         topk_scores: torch.Tensor,
         topk_ids: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Project local routes; finalization skips undefined inactive slots."""
         from sgl_kernel.scalar_type import scalar_types
 
         from sglang.kernels.ops.activation.activation import silu_and_mul
         from sglang.kernels.ops.moe.moe_wna16_marlin import moe_wna16_marlin_gemm
         from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
+        from sglang.srt.layers.moe.token_dispatcher.standard import (
+            _map_topk_ids_to_local_experts,
+        )
         from sglang.srt.layers.quantization.marlin_utils import marlin_make_workspace
 
         hidden_states = hidden_states.contiguous()
@@ -395,7 +403,7 @@ class MuseSpark1xFp4Experts(nn.Module):
 
         local_topk_ids = topk_ids.to(torch.int32)
         if expert_map is not None:
-            local_topk_ids = expert_map[local_topk_ids]
+            local_topk_ids = _map_topk_ids_to_local_experts(local_topk_ids, expert_map)
         local_topk_ids = local_topk_ids.contiguous()
         topk_weights = topk_scores.to(torch.float32).contiguous()
 
@@ -409,7 +417,9 @@ class MuseSpark1xFp4Experts(nn.Module):
             )
 
             sorted_token_ids, expert_ids, num_tokens_post_padded = (
-                moe_align_single_token(local_topk_ids, block_size_m)
+                moe_align_single_token(
+                    local_topk_ids, block_size_m, return_inactive_prefix_count=True
+                )
             )
         else:
             align_num_experts = (
@@ -418,9 +428,14 @@ class MuseSpark1xFp4Experts(nn.Module):
                 else self.num_local_experts
             )
             sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-                local_topk_ids, block_size_m, align_num_experts
+                local_topk_ids,
+                block_size_m,
+                align_num_experts,
+                return_inactive_prefix_count=expert_map is None,
             )
 
+        # Both aligners emit ascending block IDs with inactive blocks first;
+        # no expert remapping occurs after this ordering is established.
         workspace = marlin_make_workspace(hidden_states.device, max_blocks_per_sm=4)
         cache2 = torch.empty(
             (num_tokens * topk, size_n),
@@ -462,6 +477,8 @@ class MuseSpark1xFp4Experts(nn.Module):
             use_atomic_add=False,
             use_fp32_reduce=True,
             is_zp_float=False,
+            expert_ids_are_sorted=True,
+            has_inactive_prefix_count=expert_map is None,
         )
         silu_and_mul(
             cache1.view(-1, gemm1_n),
@@ -496,6 +513,8 @@ class MuseSpark1xFp4Experts(nn.Module):
             use_atomic_add=False,
             use_fp32_reduce=True,
             is_zp_float=False,
+            expert_ids_are_sorted=True,
+            has_inactive_prefix_count=expert_map is None,
         ).view(num_tokens, topk, size_k), local_topk_ids
 
     def _forward_marlin(
@@ -538,6 +557,7 @@ class MuseSpark1xFp4Experts(nn.Module):
             topk_scores=topk_scores,
             post_expert_norm=post_expert_norm,
             out_dtype=hidden_states.dtype,
+            slot_expert_ids=local_topk_ids,
         )
 
     def prepare_input(
@@ -577,9 +597,15 @@ class MuseSpark1xFp4Experts(nn.Module):
             hs_scale_linear = hs_sf_bytes.view(torch.float8_e4m3fn).reshape(
                 seq_len, hidden_size // 16
             )
+        elif pre_expert_norm is not None:
+            per_token_scale = None
+            hs_fp4, hs_scale_linear = fused_norm_fp4_quant_static(
+                hidden_states,
+                self._pre_norm_weight(pre_expert_norm),
+                pre_expert_norm.eps,
+                self.w13_input_scale_quant,
+            )
         else:
-            if pre_expert_norm is not None:
-                hidden_states = pre_expert_norm(hidden_states)
             # Match the known-good public vLLM activation path. SGLang's
             # helper selects FlashInfer's experimental CuTeDSL quantizer on
             # SM100, while vLLM's scaled_fp4_quant uses the stable CUDA
@@ -742,10 +768,20 @@ def finalize_identity_with_post_expert_norm(
     topk_scores: torch.Tensor,
     post_expert_norm: nn.Module,
     out_dtype: torch.dtype,
+    slot_expert_ids: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    """Apply row-local expert normalization before combining live routes."""
     num_tokens, top_k = expert_outputs.shape[0], expert_outputs.shape[1]
     normed = post_expert_norm(expert_outputs)
     weights = topk_scores.reshape(num_tokens, top_k).to(normed.dtype)
+    if slot_expert_ids is not None:
+        return fused_post_expert_norm_weighted_sum(
+            normed,
+            weights,
+            apply_norm=False,
+            slot_expert_ids=slot_expert_ids,
+            round_product=True,
+        ).to(out_dtype)
     return (normed * weights.unsqueeze(-1)).sum(dim=1).to(out_dtype)
 
 

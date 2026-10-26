@@ -176,6 +176,9 @@ class VideoGenerationsRequest(BaseModel):
 class VideoListResponse(BaseModel):
     data: List[VideoResponse]
     object: str = "list"
+    first_id: Optional[str] = None
+    last_id: Optional[str] = None
+    has_more: bool = False
 
 
 class RealtimeVideoGenerationsRequest(VideoGenerationsRequest):
@@ -239,6 +242,9 @@ class MeshGenerationsRequest(BaseModel):
 class MeshListResponse(BaseModel):
     data: List[MeshResponse]
     object: str = "list"
+    first_id: Optional[str] = None
+    last_id: Optional[str] = None
+    has_more: bool = False
 
 
 @dataclass

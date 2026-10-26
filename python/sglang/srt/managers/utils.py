@@ -28,6 +28,10 @@ if TYPE_CHECKING:
     from sglang.srt.managers.auxiliary_output import HostAuxiliaryOutput
     from sglang.srt.managers.scheduler import GenerationBatchResult
     from sglang.srt.mem_cache.kv_loc_plan import KVLocPlan
+    from sglang.srt.observability.forward_pass_metrics import (
+        FpmTiming,
+        ScheduledRequestMetrics,
+    )
     from sglang.srt.speculative.spec_info import SpecInput
 
 
@@ -145,9 +149,9 @@ class GenerationBatchResult:
     # metrics
     expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
 
-    # Forward pass metrics (FPM) — GPU-accurate timing via CUDA events
-    fpm_start_event: Optional[torch.cuda.Event] = None
-    fpm_end_event: Optional[torch.cuda.Event] = None
+    # Forward pass metrics (FPM)
+    fpm_timing: Optional[FpmTiming] = None
+    fpm_scheduled_requests: Optional[ScheduledRequestMetrics] = None
 
     auxiliary_host_output: Optional[HostAuxiliaryOutput] = None
 
@@ -393,6 +397,7 @@ class EmbeddingBatchResult:
     pooled_hidden_states: Optional[torch.Tensor] = None
     copy_done: Optional[Union[torch.cuda.Event, HostCopyDone]] = None
     can_run_cuda_graph: bool = False
+    fpm_timing: Optional[FpmTiming] = None
 
     @torch.profiler.record_function("copy_embedding_to_cpu")
     def copy_to_cpu(self):
