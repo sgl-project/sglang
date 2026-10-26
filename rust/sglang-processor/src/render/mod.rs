@@ -2,13 +2,11 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use dynamo_protocols::types::ChatCompletionRequestMessage;
-use dynamo_renderer::deepseek::common::tokens;
 use dynamo_renderer::kimi_k3::KimiK3Formatter;
-use dynamo_renderer::{
-    OAIChatLikeRequest, OAIPromptFormatter, PromptFormatter, RenderedPrompt, RenderedSegment,
-};
+use dynamo_renderer::{OAIChatLikeRequest, OAIPromptFormatter, PromptFormatter, RenderedPrompt};
 use serde_json::Value;
 use thiserror::Error;
 
@@ -21,11 +19,10 @@ mod thinking;
 
 use self::legacy::LegacyFormatter;
 pub use self::loader::load_chat_formatter;
-pub use self::models::DeepSeekV4Profile;
+pub use self::models::DeepSeekTokenizer;
 use self::models::{
     deep_sort, deepseek_v4_thinking, encode_tools_to_typescript, is_glm53, is_qwen38,
-    render_deepseek_v4, render_deepseek_v41, render_glm53, render_kimi_k3, render_qwen38,
-    takes_content_parts,
+    render_deepseek_v4, render_glm53, render_kimi_k3, render_qwen38, takes_content_parts,
 };
 pub use self::reasoning::{requested_effort, requested_thinking};
 pub use self::selection::{ChatFormatterOptions, select_chat_formatter};
@@ -50,8 +47,10 @@ pub enum ChatFormatter {
         formatter: PromptFormatter,
         thinking: ThinkingTemplates,
     },
-    DeepSeekV4(DeepSeekV4Profile),
-    DeepSeekV41,
+    /// DeepSeek-V4 through deepseek-recipe, with the checkpoint tokenizer when known.
+    DeepSeekV4(Option<Arc<DeepSeekTokenizer>>),
+    /// DeepSeek-V4.1 through deepseek-recipe, with the checkpoint tokenizer when known.
+    DeepSeekV41(Option<Arc<DeepSeekTokenizer>>),
     /// GLM-5.3's Jinja template, which `render_request` renders as SGLang does.
     Glm53(PromptFormatter),
     /// Dynamo's K3 formatter: [`Self::render_prompt`] keeps Dynamo's request
@@ -108,7 +107,7 @@ impl ChatFormatter {
                         message: error.to_string(),
                     })
             }
-            ChatFormatter::DeepSeekV4(_) | ChatFormatter::DeepSeekV41 => {
+            ChatFormatter::DeepSeekV4(_) | ChatFormatter::DeepSeekV41(_) => {
                 // Typed messages serialize straight to JSON, skipping minijinja.
                 let messages = match request.typed_messages() {
                     Some(messages) => serde_json::to_value(messages),
@@ -124,17 +123,8 @@ impl ChatFormatter {
                     "continue_final_message": !request.should_add_generation_prompt(),
                 });
                 body["messages"] = messages;
-                let (prompt, prefix) = self.render_request(body, &HashMap::new())?;
-                let prompt = prompt.into_text();
-                // SGLang tokenizes the prefix on its own and drops its leading BOS.
-                let prefix = prefix.strip_prefix(tokens::BOS).unwrap_or(&prefix);
-                if prefix.is_empty() {
-                    return Ok(RenderedPrompt::text(prompt));
-                }
-                Ok(RenderedPrompt::segmented(vec![
-                    RenderedSegment::new(prompt, true),
-                    RenderedSegment::new(prefix, true),
-                ]))
+                self.render_request(body, &HashMap::new())
+                    .map(|(prompt, _)| prompt)
             }
             ChatFormatter::Legacy(formatter) => formatter.render(request).map(RenderedPrompt::text),
         }
@@ -153,10 +143,11 @@ impl ChatFormatter {
     ) -> Result<(RenderedPrompt, String), TemplateError> {
         let text = |(prompt, prefix)| (RenderedPrompt::text(prompt), prefix);
         match self {
-            ChatFormatter::DeepSeekV4(profile) => {
-                render_deepseek_v4(*profile, request, default_kwargs).map(text)
-            }
-            ChatFormatter::DeepSeekV41 => render_deepseek_v41(request, default_kwargs).map(text),
+            // recipe renders a continued final message itself, so no prefix follows.
+            ChatFormatter::DeepSeekV4(_) => render_deepseek_v4(false, request, default_kwargs)
+                .map(|prompt| (prompt, String::new())),
+            ChatFormatter::DeepSeekV41(_) => render_deepseek_v4(true, request, default_kwargs)
+                .map(|prompt| (prompt, String::new())),
             ChatFormatter::Glm53(formatter) => {
                 render_glm53(formatter, request, default_kwargs).map(text)
             }
@@ -171,6 +162,44 @@ impl ChatFormatter {
         .map_err(|message| TemplateError::Renderer { message })
     }
 
+    /// DeepSeek-V4 or V4.1 through deepseek-recipe; `tokenizer_json`, the
+    /// checkpoint's `tokenizer.json` text, lets [`Self::encode_request`] return ids.
+    pub fn deepseek_v4(v41: bool, tokenizer_json: Option<&str>) -> Result<Self, String> {
+        let tokenizer = tokenizer_json
+            .map(DeepSeekTokenizer::from_json)
+            .transpose()?
+            .map(Arc::new);
+        Ok(if v41 {
+            ChatFormatter::DeepSeekV41(tokenizer)
+        } else {
+            ChatFormatter::DeepSeekV4(tokenizer)
+        })
+    }
+
+    /// The prompt ids of [`Self::render_request`], for formatters that encode
+    /// their own prompts: DeepSeek-V4 and V4.1 with their checkpoint tokenizer,
+    /// whose plain text never parses as special tokens. `None` for the others.
+    pub fn encode_request(
+        &self,
+        request: Value,
+        default_kwargs: &HashMap<String, Value>,
+    ) -> Option<Result<Vec<u32>, TemplateError>> {
+        let tokenizer = match self {
+            ChatFormatter::DeepSeekV4(tokenizer) | ChatFormatter::DeepSeekV41(tokenizer) => {
+                tokenizer.as_ref()?
+            }
+            _ => return None,
+        };
+        Some(
+            self.render_request(request, default_kwargs)
+                .and_then(|(prompt, _)| {
+                    tokenizer
+                        .encode(&prompt)
+                        .map_err(|message| TemplateError::Renderer { message })
+                }),
+        )
+    }
+
     /// The template's stop strings — Python `Conversation.stop_str`
     /// (`str | list[str] | None`). Legacy/builtin templates define them (e.g.
     /// chatml's `<|im_end|>`); the HuggingFace renderer carries none, matching
@@ -180,7 +209,7 @@ impl ChatFormatter {
             ChatFormatter::HuggingFace { .. }
             | ChatFormatter::KimiK25 { .. }
             | ChatFormatter::DeepSeekV4(_)
-            | ChatFormatter::DeepSeekV41
+            | ChatFormatter::DeepSeekV41(_)
             | ChatFormatter::Glm53(_)
             | ChatFormatter::KimiK3
             | ChatFormatter::Qwen38 { .. } => None,
@@ -217,7 +246,7 @@ impl ChatFormatter {
             ChatFormatter::KimiK3 => ThinkingTemplates::native(true, true)
                 .for_request(tools_enabled)
                 .apply(args, named_tool_choice),
-            ChatFormatter::DeepSeekV4(_) | ChatFormatter::DeepSeekV41 => {
+            ChatFormatter::DeepSeekV4(_) | ChatFormatter::DeepSeekV41(_) => {
                 let enabled = deepseek_v4_thinking(
                     &serde_json::json!({ "chat_template_kwargs": args }),
                     &HashMap::new(),
