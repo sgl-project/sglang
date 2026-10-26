@@ -3485,15 +3485,21 @@ class DeepseekV4AttnBackend(
                 else:
                     # Eager break: dense scoring over the live context; the
                     # candidate source writes its block table for the consumers.
+                    source = layer.indexer.is_candidate_source
+                    candidates = self.prefill_candidates
                     table = None
-                    if layer.indexer.is_candidate_source:
-                        table = self.prefill_candidates.prefill_graph_table(
-                            layer.layer_id, layer.compress_ratio, x.shape[0], x.device
+                    if source:
+                        table = candidates.prefill_graph_table(
+                            layer.layer_id, x.shape[0]
                         )
                     _bcg_prefill_graph_full_topk(layer, x, q_lora, pos, table)
-                    if table is not None:
+                    if source:
+                        if table is None:
+                            table = candidates.prefill_graph_table(
+                                layer.layer_id, x.shape[0]
+                            )
                         self.forward_metadata.candidate_metadata = (
-                            self.prefill_candidates.bind_prefill_graph_table(table)
+                            candidates.bind_prefill_graph_table(table)
                         )
             return
         if run_compressor and layer.compressor is not None:
@@ -4077,7 +4083,7 @@ class DeepseekV4AttnBackend(
         if not indexer.is_candidate_source:
             self.full_topk_indexer.topk_prefill(inputs)
             return
-        self.prefill_candidates.publish_prefill_graph(inputs, table)
+        self.prefill_candidates.publish_prefill_graph(inputs, x.shape[0], table)
 
     def get_swa_out_cache_loc(self, forward_batch: ForwardBatch) -> torch.Tensor:
         """Idle never trusts its metadata, which may be stale or unset: it writes
