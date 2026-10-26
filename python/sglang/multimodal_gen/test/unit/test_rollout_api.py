@@ -412,6 +412,31 @@ class TestBuildSamplingKwargs(unittest.TestCase):
         self.assertNotIn("rollout_sde_step_indices", kwargs)
         self.assertNotIn("rollout_return_step_indices", kwargs)
 
+    def test_generated_output_switch_reaches_the_pipeline_request(self):
+        from sglang.multimodal_gen.configs.sample.sampling_params import (
+            SamplingParams,
+        )
+        from sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api import (
+            _build_sampling_kwargs,
+        )
+        from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+
+        kwargs = _build_sampling_kwargs(
+            self._make_request(rollout_return_generated_output=False)
+        )
+        self.assertIs(kwargs["rollout_return_generated_output"], False)
+        sp = SamplingParams(
+            prompt="x",
+            rollout_return_generated_output=kwargs["rollout_return_generated_output"],
+        )
+        self.assertIs(Req(sampling_params=sp).rollout_return_generated_output, False)
+        self.assertIs(
+            Req(
+                sampling_params=SamplingParams(prompt="x")
+            ).rollout_return_generated_output,
+            True,
+        )
+
     def test_sampling_params_exposes_filters_via_req_getattr(self):
         from sglang.multimodal_gen.configs.sample.sampling_params import (
             SamplingParams,
@@ -489,6 +514,78 @@ class TestStagesHeader(unittest.TestCase):
     def test_no_metrics_or_no_stages_yields_no_header(self):
         self.assertEqual(stages_header(None), "")
         self.assertEqual(stages_header(types.SimpleNamespace(stages={})), "")
+
+
+class TestRolloutWithoutGeneratedOutput(unittest.TestCase):
+    """rollout_return_generated_output=False: the decoders return the trajectory without running the VAE."""
+
+    def _request(self):
+        from sglang.multimodal_gen.configs.sample.sampling_params import (
+            SamplingParams,
+        )
+        from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+
+        req = Req(
+            sampling_params=SamplingParams(
+                prompt="x", rollout=True, rollout_return_generated_output=False
+            )
+        )
+        req.rollout_trajectory_data = RolloutTrajectoryData(
+            rollout_log_probs=torch.randn(2, 3)
+        )
+        return req
+
+    def test_decoders_return_the_trajectory_without_the_vae(self):
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import (
+            DecodingStage,
+        )
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.decoding import (
+            MiniMaxH3DecodingStage,
+        )
+
+        class _UnusedVAE(torch.nn.Module):
+            def decode(self, latents):
+                raise AssertionError("the VAE ran")
+
+        for stage in (
+            DecodingStage(_UnusedVAE()),
+            object.__new__(MiniMaxH3DecodingStage),
+        ):
+            req = self._request()
+            output = stage.forward(req, server_args=None)
+            self.assertIsNone(output.output)
+            self.assertIs(output.rollout_trajectory_data, req.rollout_trajectory_data)
+
+    def test_h3_verification_accepts_only_a_rollout_trajectory_without_media(self):
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import (
+            rollout_output_without_decode,
+        )
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.decoding import (
+            MiniMaxH3DecodingStage,
+        )
+
+        stage = object.__new__(MiniMaxH3DecodingStage)
+        trajectory_only = rollout_output_without_decode(self._request())
+        self.assertTrue(stage.verify_output(trajectory_only, None).is_valid())
+        # An empty output that is not a rollout trajectory still fails.
+        self.assertFalse(stage.verify_output(OutputBatch(), None).is_valid())
+
+    def test_response_has_one_entry_per_output_and_no_media(self):
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import (
+            rollout_output_without_decode,
+        )
+
+        batch = rollout_output_without_decode(self._request())
+        resps = _build_response("rn", "p", 0, True, batch, num_outputs=2)
+        self.assertEqual(len(resps), 2)
+        for index, resp in enumerate(resps):
+            self.assertIsNone(resp.generated_output)
+            self.assertTrue(
+                torch.equal(
+                    bytes_to_tensor(resp.rollout_log_probs["data"]),
+                    batch.rollout_trajectory_data.rollout_log_probs[index],
+                )
+            )
 
 
 if __name__ == "__main__":
