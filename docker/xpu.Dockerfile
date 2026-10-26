@@ -86,13 +86,17 @@ RUN echo "Cloning ${SG_LANG_BRANCH} from ${SG_LANG_REPO}" && \
     cd sglang && cd python && \
     if [ "${SG_LANG_KERNEL_SOURCE}" = "source" ]; then \
         echo "Building sgl-kernel-xpu ${SG_LANG_KERNEL_BRANCH} from ${SG_LANG_KERNEL_REPO}" && \
-        sed -i -E "s|\"sglang-kernel-xpu @ [^\"]*\"|\"sglang-kernel-xpu @ git+${SG_LANG_KERNEL_REPO}@${SG_LANG_KERNEL_BRANCH}\"|" pyproject_xpu.toml && \
-        grep -q "sglang-kernel-xpu @ git+" pyproject_xpu.toml; \
+        sed -i -E \
+            -e 's|"sglang-kernel-xpu==[^"]*"|"sglang-kernel-xpu"|' \
+            -e "s|^sglang-kernel-xpu = \{ index = [^}]* \}$|sglang-kernel-xpu = { git = \"${SG_LANG_KERNEL_REPO}\", rev = \"${SG_LANG_KERNEL_BRANCH}\" }|" \
+            pyproject_xpu.toml && \
+        grep -q '"sglang-kernel-xpu",' pyproject_xpu.toml && \
+        grep -q '^sglang-kernel-xpu = { git = ' pyproject_xpu.toml; \
     elif [ "${SG_LANG_KERNEL_SOURCE}" != "wheel" ]; then \
         echo "Invalid SG_LANG_KERNEL_SOURCE=${SG_LANG_KERNEL_SOURCE} (expected wheel or source)" && exit 1; \
     fi && \
     cp pyproject_xpu.toml pyproject.toml && \
-    pip install --no-cache-dir ".[dev,diffusion]" --extra-index-url https://download.pytorch.org/whl/xpu && \
+    uv pip install --no-cache ".[dev,diffusion]" && \
     pip install --no-cache-dir --no-deps xgrammar==0.1.33
 
 # Install torch_memory_saver for release/resume_memory_occupation ("memory saver").

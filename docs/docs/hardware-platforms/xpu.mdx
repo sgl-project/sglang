@@ -31,13 +31,12 @@ curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.rustup
 # Make cargo available in the current shell
 source "$HOME/.cargo/env"
 
-# Create and activate a conda environment
-conda create -n sgl-xpu python=3.12 -y
-conda activate sgl-xpu
+# Install uv, then create and activate a virtual environment
+pip install uv
+uv venv --python 3.12 sgl-xpu
+source sgl-xpu/bin/activate
 
-# Set PyTorch XPU as primary pip install channel to avoid installing the larger CUDA-enabled version and prevent potential runtime issues.
-pip3 install torch==2.14.0+xpu torchvision==0.29.0+xpu torchaudio==2.11.0+xpu --index-url https://download.pytorch.org/whl/xpu
-pip3 install xgrammar==0.1.33 --no-deps # xgrammar will introduce CUDA-enabled triton which might conflict with XPU
+uv pip install xgrammar==0.1.33 --no-deps # xgrammar will introduce CUDA-enabled triton which might conflict with XPU
 
 # Clone the SGLang code
 git clone https://github.com/sgl-project/sglang.git
@@ -48,8 +47,7 @@ git checkout <YOUR-DESIRED-VERSION>
 cd python
 cp pyproject_xpu.toml pyproject.toml
 # Install SGLang dependent libs, and build SGLang main package
-pip install --upgrade pip setuptools
-pip install -v ".[dev,diffusion]" --extra-index-url https://download.pytorch.org/whl/xpu
+uv pip install -v ".[dev,diffusion]"
 ```
 
 ### Install Using Docker

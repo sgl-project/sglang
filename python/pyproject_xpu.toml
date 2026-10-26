@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61.0", "setuptools-rust>=1.10", "setuptools-scm>=8.0", "torch==2.14.0+xpu", "wheel"]
+requires = ["setuptools>=61.0", "setuptools-rust>=1.10", "setuptools-scm>=8.0", "torch==2.14.0+xpu", "triton-xpu", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -57,7 +57,7 @@ dependencies = [
   "scipy",
   "sentencepiece==0.2.1",  # 0.2.2 rejects null pieces in InternVL tokenizers.
   "setproctitle",
-  "sglang-kernel-xpu @ https://github.com/sgl-project/whl/releases/download/v0.4.0+xpu/sglang_kernel_xpu-0.4.0-cp310-abi3-manylinux_2_38_x86_64.whl",
+  "sglang-kernel-xpu==0.4.0",
   "smg-grpc-servicer>=0.9.0",
   "soundfile==0.13.1",
   "tiktoken",
@@ -68,11 +68,29 @@ dependencies = [
   "torchvision==0.29.0+xpu",
   "tqdm",
   "transformers==5.19.0",
+  "triton-xpu",
   "uvicorn",
   "xxhash",
   "uvloop",
   # "xgrammar==0.2.7", xgrammar depends on CUDA PyTorch and Triton only
 ]
+
+[[tool.uv.index]]
+name = "pytorch-xpu"
+url = "https://download.pytorch.org/whl/xpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "sglang-xpu"
+url = "https://docs.sglang.io/whl/xpu/"
+explicit = true
+
+[tool.uv.sources]
+sglang-kernel-xpu = { index = "sglang-xpu" }
+torch = { index = "pytorch-xpu" }
+torchaudio = { index = "pytorch-xpu" }
+torchvision = { index = "pytorch-xpu" }
+triton-xpu = { index = "pytorch-xpu" }
 
 [project.optional-dependencies]
 checkpoint-engine = ["checkpoint-engine @ git+https://github.com/MoonshotAI/checkpoint-engine.git@f772d1858204fa82bdb0436fdfec137f5de2972c"]
