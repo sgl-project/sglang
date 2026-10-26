@@ -59,6 +59,18 @@ struct Owner {
     followers: AtomicU64,
 }
 
+impl Owner {
+    /// Extend the record to `expiry`. A record that had already expired is a
+    /// new stake, not a continuation of the old one, so its followers start
+    /// over; the cap counts requests one stake attracted within its TTL.
+    fn refresh(&self, now_ms: u64, expiry: u64) {
+        if self.expiry_ms.load(Ordering::Relaxed) <= now_ms {
+            self.followers.store(0, Ordering::Relaxed);
+        }
+        self.expiry_ms.fetch_max(expiry, Ordering::Relaxed);
+    }
+}
+
 #[derive(Debug, Default)]
 struct State {
     /// Workers routed through each block. Block hashes chain, so holding a
@@ -148,17 +160,27 @@ impl PendingPrefixes {
     /// confirmed matches (looked up first, always) or else by the load
     /// policy, instead of piling onto one worker.
     pub fn record_follow(&self, url: &str, hashes: &[i64]) {
+        self.record_follow_at(url, hashes, Instant::now());
+    }
+
+    fn record_follow_at(&self, url: &str, hashes: &[i64], now: Instant) {
         if !self.is_enabled() || hashes.is_empty() {
             return;
         }
-        // Charge the DEEPEST record of the stake the request matched: the
-        // block that is specific to this prompt. The leading blocks (a shared
-        // system prompt, say) are owned by every stake on the worker, and
-        // charging them would cap every conversation on the worker at once.
+        // Charge the DEEPEST live record of the stake the request matched:
+        // the block that is specific to this prompt, and the one
+        // [`Self::depths`] reported. The leading blocks (a shared system
+        // prompt, say) are owned by every stake on the worker, and charging
+        // them would cap every conversation on the worker at once.
+        let now_ms = self.millis(now);
         let state = self.state.read();
         let tail = hashes
             .iter()
-            .map(|hash| state.owner(*hash, url))
+            .map(|hash| {
+                state
+                    .owner(*hash, url)
+                    .filter(|o| o.expiry_ms.load(Ordering::Relaxed) > now_ms)
+            })
             .take_while(Option::is_some)
             .last()
             .flatten();
@@ -191,7 +213,7 @@ impl PendingPrefixes {
                 .iter()
                 .take_while(|&&hash| match state.owner(hash, url) {
                     Some(owner) => {
-                        owner.expiry_ms.fetch_max(expiry, Ordering::Relaxed);
+                        owner.refresh(now_ms, expiry);
                         true
                     }
                     None => false,
@@ -208,9 +230,7 @@ impl PendingPrefixes {
         for &hash in hashes[known..].iter().rev() {
             let owners = state.by_hash.entry(hash).or_default();
             match owners.iter().find(|o| o.url == url) {
-                Some(owner) => {
-                    owner.expiry_ms.fetch_max(expiry, Ordering::Relaxed);
-                }
+                Some(owner) => owner.refresh(now_ms, expiry),
                 None => {
                     owners.push(Owner {
                         url: Arc::clone(&url),
@@ -398,6 +418,53 @@ mod tests {
         assert!(pending.depths_at(&[1], at(90)).is_empty());
         pending.record_at("b", &[2], at(90));
         assert!(!pending.state.read().by_hash.contains_key(&1));
+    }
+
+    #[test]
+    fn a_follow_charges_the_live_tail_and_a_revived_stake_starts_fresh() {
+        let pending = PendingPrefixes::default();
+        pending.enable(Duration::from_millis(50));
+        pending.set_max_followers(1);
+        let t0 = pending.epoch;
+        let at = |ms| t0 + Duration::from_millis(ms);
+        // Blocks 1..3 staked at 0; a shorter turn refreshes only 1..2 at 40.
+        pending.record_at("a", &[1, 2, 3], at(0));
+        pending.record_at("a", &[1, 2], at(40));
+        // At 60 the lookup sees depth 2 (block 3 expired, not yet trimmed),
+        // so the follow is charged on block 2, the record the lookup reported.
+        assert_eq!(
+            sorted(pending.depths_at(&[1, 2, 3], at(60))),
+            [("a".into(), 2)]
+        );
+        pending.record_follow_at("a", &[1, 2, 3], at(60));
+        assert!(pending.depths_at(&[1, 2, 3], at(60)).is_empty(), "capped");
+        assert_eq!(
+            pending
+                .state
+                .read()
+                .owner(3, "a")
+                .unwrap()
+                .followers
+                .load(Ordering::Relaxed),
+            0
+        );
+        // Once the whole stake has expired, re-staking it is a new stake: the
+        // cap starts over.
+        assert!(pending.depths_at(&[1, 2], at(100)).is_empty());
+        pending.record_at("a", &[1, 2, 3], at(100));
+        assert_eq!(
+            sorted(pending.depths_at(&[1, 2, 3], at(100))),
+            [("a".into(), 3)]
+        );
+        pending.record_follow_at("a", &[1, 2], at(100));
+        assert!(
+            pending.depths_at(&[1, 2], at(100)).is_empty(),
+            "capped on block 2"
+        );
+        assert_eq!(
+            sorted(pending.depths_at(&[1, 2, 3], at(100))),
+            [("a".into(), 3)]
+        );
     }
 
     #[test]

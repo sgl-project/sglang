@@ -344,7 +344,8 @@ pub struct CacheArgs {
     /// Confirmed-first pending prefixes: a stake counts only where it is
     /// strictly deeper than the confirmed KV-event match, and the pending
     /// store is consulted and staked only while the confirmed match covers
-    /// less than this share of the prompt (0 to 1; 1 = always consult). A
+    /// less than this share of the prompt (above 0, at most 1; 1 = always
+    /// consult; to switch the tier off, unset the TTL instead). A
     /// warm turn routes on its confirmed history and pays nothing for the
     /// tier. Unset keeps the original behavior: pending depths merge with the
     /// confirmed ones by maximum on every request. Requires
@@ -923,8 +924,8 @@ impl CacheArgs {
         );
         ensure!(
             self.cache_pending_prefix_consult_below
-                .is_none_or(|r| (0.0..=1.0).contains(&r)),
-            "--cache-pending-prefix-consult-below must be within 0 and 1"
+                .is_none_or(|r| r > 0.0 && r <= 1.0),
+            "--cache-pending-prefix-consult-below must be above 0 and at most 1 (0 would never consult the tier; unset --cache-pending-prefix-ttl-ms to switch it off)"
         );
         let cache_aware_uses_indexer = policy == PolicyKind::CacheAware
             && cache_prefix_provider == CachePrefixProvider::Indexer;
@@ -3064,6 +3065,8 @@ mod tests {
         for args in [
             "--policy cache_aware --cache-pending-prefix-consult-below 0.5",
             "--policy cache_aware --cache-pending-prefix-ttl-ms 500 --cache-pending-prefix-consult-below 1.5",
+            "--policy cache_aware --cache-pending-prefix-ttl-ms 500 --cache-pending-prefix-consult-below 0",
+            "--policy cache_aware --cache-pending-prefix-ttl-ms 500 --cache-pending-prefix-consult-below NaN",
         ] {
             let err = cfg_of(args).unwrap_err().to_string();
             assert!(err.contains("--cache-pending-prefix-consult-below"), "{args}: {err}");

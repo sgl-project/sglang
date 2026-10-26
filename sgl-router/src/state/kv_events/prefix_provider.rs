@@ -86,21 +86,20 @@ impl RadixTreePrefixProvider {
         } else {
             Vec::new()
         };
-        let pending_best = pending
-            .iter()
-            .map(|(_, depth)| u32::try_from(*depth).unwrap_or(u32::MAX))
-            .max();
-        let mut pending_winners = Vec::new();
-        if merge_pending || pending_best > confirmed {
-            for (url, depth) in pending {
+        // Confirmed-first merges a stake only where it is strictly deeper than
+        // the best confirmed match, each on its own: a stake no deeper than
+        // that match never becomes a candidate, even beside one that is.
+        for (url, depth) in pending {
+            let deeper = Some(u32::try_from(depth).unwrap_or(u32::MAX)) > confirmed;
+            if merge_pending || deeper {
                 merge_depth(&mut depth_by_url, url.to_string(), depth);
             }
-            pending_winners = depth_by_url
-                .iter()
-                .filter(|(url, depth)| confirmed_by_url.get(*url) < Some(depth))
-                .map(|(url, _)| url.clone())
-                .collect();
         }
+        let pending_winners: Vec<String> = depth_by_url
+            .iter()
+            .filter(|(url, depth)| confirmed_by_url.get(*url) < Some(depth))
+            .map(|(url, _)| url.clone())
+            .collect();
         let outcome = match depth_by_url.values().copied().max() {
             None => PrefixOutcome::Empty,
             Some(best_prefix_blocks) => {
@@ -294,6 +293,42 @@ mod tests {
         );
         assert_eq!(signal.pending_winners, vec!["http://b".to_string()]);
         assert_eq!(provider.tree.pending().hits(), 1);
+    }
+
+    #[test]
+    fn only_strictly_deeper_stakes_join_the_candidates() {
+        let first = provider(60_000, 0).with_pending_consult_below(1.0);
+        let prompt = tokens(10);
+        confirm(&first, "http://a", &prompt, 2);
+        // c stakes 3 blocks (deeper than a's 2), d stakes 2 (equal) and e 1.
+        for (url, blocks) in [("http://c", 3), ("http://d", 2), ("http://e", 1)] {
+            let probe = lookup(&first, &prompt[..blocks * BLOCK as usize]);
+            first.record_route(&probe, url);
+        }
+        let signal = lookup(&first, &prompt);
+        assert_eq!(
+            depths(&signal),
+            [("http://a".into(), 2), ("http://c".into(), 3)],
+            "the stakes no deeper than a's match are not candidates"
+        );
+        assert_eq!(signal.pending_winners, vec!["http://c".to_string()]);
+        // Without the switch, every stake merges by maximum as before.
+        let plain = provider(60_000, 0);
+        confirm(&plain, "http://a", &prompt, 2);
+        for (url, blocks) in [("http://c", 3), ("http://d", 2), ("http://e", 1)] {
+            let probe = lookup(&plain, &prompt[..blocks * BLOCK as usize]);
+            plain.record_route(&probe, url);
+        }
+        let signal = lookup(&plain, &prompt);
+        assert_eq!(
+            depths(&signal),
+            [
+                ("http://a".into(), 2),
+                ("http://c".into(), 3),
+                ("http://d".into(), 2),
+                ("http://e".into(), 1)
+            ]
+        );
     }
 
     #[test]
