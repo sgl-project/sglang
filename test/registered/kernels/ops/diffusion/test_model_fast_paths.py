@@ -78,6 +78,7 @@ from sglang.multimodal_gen.runtime.layers.layernorm import (
     apply_qk_norm,
 )
 from sglang.multimodal_gen.runtime.layers.linear import MergedColumnParallelLinear
+from sglang.multimodal_gen.runtime.layers.rotary_embedding import RotaryEmbedding
 from sglang.multimodal_gen.runtime.layers.rotary_embedding.utils import (
     _apply_rotary_emb,
 )
@@ -90,6 +91,7 @@ from sglang.multimodal_gen.runtime.models.dits.ernie_image import (
     _ernie_norm_scale_shift,
     _ernie_qknorm_rope,
     _ernie_qknorm_rope_reference,
+    _ernie_qknorm_rotary,
 )
 from sglang.multimodal_gen.runtime.models.dits.flux import (
     _flux_fused_ln_modulate,
@@ -895,6 +897,12 @@ def test_ernie_qknorm_rope_is_bit_exact():
     sin = torch.randn_like(cos)
     cache = torch.cat((cos, sin), dim=-1).contiguous()
     positions = torch.arange(seq, device="cuda", dtype=torch.long)
+    rotary_emb = RotaryEmbedding(
+        head_size=head_dim,
+        rotary_dim=head_dim,
+        is_neox_style=True,
+        use_precomputed_cache=False,
+    )
 
     q_ref, k_ref = _ernie_qknorm_rope_reference(
         q.clone(), k.clone(), q_norm, k_norm, head_dim, cos, sin
@@ -909,6 +917,9 @@ def test_ernie_qknorm_rope_is_bit_exact():
         sin,
         cache,
         positions,
+        rotary_emb=rotary_emb,
+        shared_rope_cos=cos,
+        shared_rope_sin=sin,
     )
 
     assert torch.equal(q_out, q_ref)
@@ -930,8 +941,22 @@ def test_ernie_qknorm_rope_first_attempt_exception_uses_pristine_inputs():
     sin = torch.randn_like(cos)
     cache = torch.cat((cos, sin), dim=-1).contiguous()
     positions = torch.arange(seq, device="cuda", dtype=torch.long)
-    q_ref, k_ref = _ernie_qknorm_rope_reference(
-        q.clone(), k.clone(), q_norm, k_norm, head_dim, cos, sin
+    rotary_emb = RotaryEmbedding(
+        head_size=head_dim,
+        rotary_dim=head_dim,
+        is_neox_style=True,
+        use_precomputed_cache=False,
+    )
+    # the exception arm runs the class, which is not bit-exact with the oracle
+    q_ref, k_ref = _ernie_qknorm_rotary(
+        q.clone(),
+        k.clone(),
+        q_norm,
+        k_norm,
+        head_dim,
+        rotary_emb=rotary_emb,
+        shared_rope_cos=cos,
+        shared_rope_sin=sin,
     )
 
     def mutate_then_raise(**kwargs):
@@ -950,6 +975,9 @@ def test_ernie_qknorm_rope_first_attempt_exception_uses_pristine_inputs():
             sin,
             cache,
             positions,
+            rotary_emb=rotary_emb,
+            shared_rope_cos=cos,
+            shared_rope_sin=sin,
         )
 
     assert torch.equal(q_out, q_ref)
