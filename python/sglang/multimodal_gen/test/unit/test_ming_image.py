@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import sys
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -216,30 +217,31 @@ def test_ming_norm_fusion_replay_and_native_fallback(dim, monkeypatch):
     x = torch.randn(1, 17, dim, device="cuda", dtype=torch.bfloat16)
     with torch.no_grad():
         norm.weight.copy_(torch.randn_like(norm.weight))
-    calls = []
-    kernel = ming_image.rmsnorm_cast_before_weight_bitexact
-
-    def counted(*args):
-        calls.append(True)
-        return kernel(*args)
-
-    monkeypatch.setattr(ming_image, "rmsnorm_cast_before_weight_bitexact", counted)
+    kernel = Mock(wraps=ming_image.rmsnorm_cast_before_weight_bitexact)
+    monkeypatch.setattr(ming_image, "rmsnorm_cast_before_weight_bitexact", kernel)
     assert torch.equal(norm(x), RMSNorm.forward_native(norm, x))
-    assert len(calls) == 1 and gate.verified and not gate.disabled
+    assert kernel.call_count == 1 and gate.verified and not gate.disabled
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         output = norm(x)
     x.copy_(torch.randn_like(x))
     graph.replay()
     assert torch.equal(output, RMSNorm.forward_native(norm, x))
-    fused_calls = len(calls)
+    # These arguments are unused by the native path without a residual.
+    kwargs = {"post_residual_addition": x, "quant_linear": object()}
+    assert torch.equal(
+        norm.forward_native(x, **kwargs), RMSNorm.forward_native(norm, x, **kwargs)
+    )
+    fused_calls = kernel.call_count
     for inputs in (x[:, ::2], x.float()):
         assert torch.equal(norm(inputs), RMSNorm.forward_native(norm, inputs))
     residual = torch.randn_like(x)
     actual = norm(x, residual)
     expected = RMSNorm.forward_native(norm, x, residual)
     assert all(torch.equal(a, b) for a, b in zip(actual, expected))
-    assert len(calls) == fused_calls
+    compiled = torch.compile(norm, backend="eager", fullgraph=True)
+    assert torch.equal(compiled(x), RMSNorm.forward_native(norm, x))
+    assert kernel.call_count == fused_calls
 
 
 def test_padding_replacement_keeps_valid_rows_and_registers():

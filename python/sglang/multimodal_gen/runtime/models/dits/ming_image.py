@@ -48,8 +48,6 @@ class MingRMSNorm(RMSNorm):
         if (
             torch.compiler.is_compiling()
             or residual is not None
-            or post_residual_addition is not None
-            or quant_linear is not None
             or x.shape[-1] != self.hidden_size
             or self.weight.dtype != x.dtype
             or not self.weight.is_contiguous()

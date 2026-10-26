@@ -324,7 +324,10 @@ def rmsnorm_cast_before_weight_bitexact(
 ) -> torch.Tensor:
     """Match ``(x.float() * rsqrt(mean(x.float()**2) + eps)).bf16() * w``."""
     if not _valid_rmsnorm_cast_before_weight(x, weight) or eps not in (1e-6, 1e-5):
-        raise ValueError("RMSNorm requires contiguous CUDA BF16 inputs and weight.")
+        raise ValueError(
+            "RMSNorm requires contiguous CUDA BF16 inputs and weight, "
+            "with eps=1e-6 or eps=1e-5."
+        )
     with torch.cuda.device(x.device):
         out = torch.empty_like(x)
         dim = x.shape[-1]
