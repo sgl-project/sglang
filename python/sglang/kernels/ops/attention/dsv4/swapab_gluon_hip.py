@@ -7,8 +7,39 @@ from triton.experimental.gluon import language as gl
 
 from .decode_attention_sm100 import swapab_attention as _swapab_attention
 
-# the V4 page load is plain gluon (no Blackwell ops), so the SM100 kernel's serves gfx950 too
-from .decode_attention_sm100_gluon import _load_v4
+
+@gluon.jit
+def _load_v4_hip(
+    CACHE,
+    ids,
+    valid,
+    PAGE: gl.constexpr,
+    STRIDE: gl.constexpr,
+    KV_LAYOUT: gl.constexpr,
+    DATA_BYTES: gl.constexpr,
+    SCALE_BYTES: gl.constexpr,
+    TILE: gl.constexpr,
+):
+    d = gl.arange(0, 512, gl.SliceLayout(0, KV_LAYOUT))
+    base = (ids // PAGE).to(gl.int64)[:, None] * STRIDE
+    slot = (ids % PAGE)[:, None]
+    mask = valid[:, None] & (d[None, :] < 448)
+    bits = gl.load(CACHE + base + slot * DATA_BYTES + d[None, :], mask, 0)
+    exponent = gl.load(
+        CACHE + base + PAGE * DATA_BYTES + slot * SCALE_BYTES + d[None, :] // TILE,
+        mask,
+        0,
+    )
+    nope = gl.amd.cdna4.scaled_upcast(
+        bits.to(gl.float8e4nv, bitcast=True), exponent, gl.bfloat16
+    )
+    # a uint8 pointer splits the rope into 2-byte masked loads; bf16-typed it
+    # stays one 16-byte load per thread
+    rope_ptr = (CACHE + base + slot * DATA_BYTES + 448).to(
+        gl.pointer_type(gl.bfloat16)
+    ) + (d[None, :] - 448)
+    rope = gl.load(rope_ptr, valid[:, None] & (d[None, :] >= 448), 0)
+    return gl.where(d[None, :] < 448, nope, rope)
 
 
 @gluon.jit
@@ -55,7 +86,7 @@ def partial_gluon(
         length = gl.load(L + b)
         ids = gl.load(IDX + b * IS + at, at < NK, -1)
         valid = (at < NK) & (at < length) & (ids >= 0) & (ids < KTOKENS)
-        kv = _load_v4(
+        kv = _load_v4_hip(
             K,
             gl.maximum(ids, 0),
             valid,
@@ -71,7 +102,7 @@ def partial_gluon(
         length = gl.load(EL + b)
         ids = gl.load(EI + b * EIS + at, at < NE, -1)
         valid = (at < NE) & (at < length) & (ids >= 0) & (ids < ETOKENS)
-        kv = _load_v4(
+        kv = _load_v4_hip(
             E,
             gl.maximum(ids, 0),
             valid,
