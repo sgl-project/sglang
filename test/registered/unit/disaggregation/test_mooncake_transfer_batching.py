@@ -418,11 +418,14 @@ class TestMooncakeEarlySend(CustomTestCase):
             with self.subTest(last=last):
                 ready = MagicMock()
                 manager = MagicMock()
-                sender = SimpleNamespace(
+                sender = object.__new__(MooncakeKVSender)
+                vars(sender).update(
                     kv_mgr=manager,
                     bootstrap_room=1,
                     aux_index=0,
                     trace_ctx=MagicMock(),
+                    conclude_state=None,
+                    _transfer_start_time=None,
                     _early_send_wait_event=ready,
                     _prepare_send_indices=lambda ids, state: (
                         ids,
@@ -432,15 +435,17 @@ class TestMooncakeEarlySend(CustomTestCase):
                     ),
                     _record_transfer_indices=MagicMock(),
                 )
-                MooncakeKVSender.send(sender, [0])
-                self.assertIs(
-                    manager.add_transfer_request.call_args.kwargs["wait_event"], ready
-                )
+                indices_ready = MagicMock()
+                sender.send([0], indices_event=indices_ready)
+                kwargs = manager.add_transfer_request.call_args.kwargs
+                self.assertIs(kwargs["wait_event"], ready)
+                self.assertIs(kwargs["indices_event"], indices_ready)
                 ready.synchronize.assert_not_called()
-                MooncakeKVSender.send(sender, [1])
-                self.assertIsNone(
-                    manager.add_transfer_request.call_args.kwargs["wait_event"]
-                )
+                indices_ready.synchronize.assert_not_called()
+                sender.send([1])
+                kwargs = manager.add_transfer_request.call_args.kwargs
+                self.assertIsNone(kwargs["wait_event"])
+                self.assertIsNone(kwargs["indices_event"])
 
     def test_manager_preserves_event_in_queued_chunk(self):
         queue = SimpleQueue()
@@ -452,11 +457,21 @@ class TestMooncakeEarlySend(CustomTestCase):
             transfer_infos={1: {"127.0.0.1:80": object()}},
             transfer_queues=[queue],
         )
+        indices_ready = MagicMock()
         MooncakeKVManager.add_transfer_request(
-            manager, 1, [0], slice(0, 1), False, wait_event=ready
+            manager,
+            1,
+            [0],
+            slice(0, 1),
+            False,
+            wait_event=ready,
+            indices_event=indices_ready,
         )
-        self.assertIs(queue.get_nowait().wait_event, ready)
+        chunk = queue.get_nowait()
+        self.assertIs(chunk.wait_event, ready)
+        self.assertIs(chunk.indices_event, indices_ready)
         ready.synchronize.assert_not_called()
+        indices_ready.synchronize.assert_not_called()
 
     def _worker(self, event):
         chunk = TransferKVChunk(

@@ -528,7 +528,7 @@ POSITIONAL_FIELD_ORDER = (
     "speculative_draft_sink_size",
     "disable_aiter_allreduce_fusion_in_prefill",
     "disable_aiter_allreduce_fusion_in_decode",
-    "monokernel_backend",
+    "enable_amd_monokernel",
     "dsa_triton_union",
     "enable_dsa_fused_indexer",
     "enable_cp_tp_group_sharing",
@@ -548,5 +548,6 @@ POSITIONAL_FIELD_ORDER = (
     "enable_megamoe_for_layernorm_sp",
     "enable_http_worker_reuseport",
     "prefill_decode_interval_min_bs",
+    "unified_cache_external_linker_config",
 )
 # fmt: on
