@@ -381,7 +381,7 @@ def speculative_sampling_target_only_chain_kernel(
 
     # Fallback for upper-endpoint coin_final where floating-point
     # total_cumsum <= target_u (mirrors ``TreeSpeculativeSamplingTargetOnly``).
-    if not found:
+    if found == 0:
         if last_valid_token >= 0:
             final_token = last_valid_token
 
