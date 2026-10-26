@@ -24,7 +24,7 @@ from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import (
     MoeRunnerConfig,
-    get_ascend_ops_config,
+    get_moe_ascend_ops_config,
     get_deepep_mode,
     get_moe_a2a_backend,
     get_moe_runner_backend,
@@ -190,7 +190,7 @@ def create_moe_dispatcher(
 ) -> BaseDispatcher:
     a2a_backend = get_moe_a2a_backend()
     if a2a_backend.is_ascend_ops():
-        return AscendOpsDispatcher(moe_runner_config, get_ascend_ops_config())
+        return AscendOpsDispatcher(moe_runner_config, get_moe_ascend_ops_config())
     elif (
         a2a_backend.is_none()
         or a2a_backend.is_megamoe()

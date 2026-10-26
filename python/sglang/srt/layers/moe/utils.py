@@ -135,23 +135,23 @@ class AscendOpsConfig:
     def __post_init__(self) -> None:
         if self.prefill not in self.PREFILL_CHOICES:
             raise ValueError(
-                f"invalid ascend-ops-config prefill mode {self.prefill!r}; "
+                f"invalid moe-ascend-ops-config prefill mode {self.prefill!r}; "
                 f"expected one of {self.PREFILL_CHOICES}"
             )
         if self.decode not in self.DECODE_CHOICES:
             raise ValueError(
-                f"invalid ascend-ops-config decode mode {self.decode!r}; "
+                f"invalid moe-ascend-ops-config decode mode {self.decode!r}; "
                 f"expected one of {self.DECODE_CHOICES}"
             )
         if self.decode == "fused_op":
             raise ValueError(
-                "ascend-ops-config decode mode 'fused_op' is not implemented; "
+                "moe-ascend-ops-config decode mode 'fused_op' is not implemented; "
                 "use 'low_latency'"
             )
 
     @classmethod
     def from_json_str(cls, s: Optional[str]) -> "AscendOpsConfig":
-        """Parse ``--ascend-ops-config`` JSON into a validated config.
+        """Parse ``--moe-ascend-ops-config`` JSON into a validated config.
 
         ``None`` or an empty string returns the defaults. Unknown keys or an
         invalid mode raise ``ValueError``.
@@ -161,10 +161,10 @@ class AscendOpsConfig:
         try:
             data = json.loads(s)
         except json.JSONDecodeError as exc:
-            raise ValueError(f"ascend-ops-config is not valid JSON: {s!r}") from exc
+            raise ValueError(f"moe-ascend-ops-config is not valid JSON: {s!r}") from exc
         if not isinstance(data, dict):
             raise ValueError(
-                f"ascend-ops-config must be a JSON object, got {type(data).__name__}"
+                f"moe-ascend-ops-config must be a JSON object, got {type(data).__name__}"
             )
         unknown = set(data) - {
             "prefill",
@@ -174,7 +174,7 @@ class AscendOpsConfig:
         }
         if unknown:
             raise ValueError(
-                f"ascend-ops-config has unknown keys {sorted(unknown)}; "
+                f"moe-ascend-ops-config has unknown keys {sorted(unknown)}; "
                 "only 'prefill', 'decode', 'll_dispatch_alg' and "
                 "'ll_combine_alg' are supported"
             )
@@ -568,7 +568,9 @@ def initialize_moe_config():
     )
     moe.deepep_mode = DeepEPMode(exec_moe.deepep_mode)
     moe.deepep_config = exec_moe.deepep_config or ""
-    moe.ascend_ops_config = AscendOpsConfig.from_json_str(exec_moe.ascend_ops_config)
+    moe.moe_ascend_ops_config = AscendOpsConfig.from_json_str(
+        exec_moe.moe_ascend_ops_config
+    )
     moe.tbo_enabled = overlap.enable_two_batch_overlap
     moe.sbo_enabled = overlap.enable_single_batch_overlap
     if moe.sbo_enabled and is_cuda():
@@ -742,12 +744,12 @@ def get_deepep_config() -> str:
     return moe.deepep_config
 
 
-def get_ascend_ops_config() -> AscendOpsConfig:
+def get_moe_ascend_ops_config() -> AscendOpsConfig:
     """Return the validated ``ascend_ops`` configuration for the active scope."""
     moe = get_flags().moe
-    if moe.ascend_ops_config is None:
-        moe.ascend_ops_config = AscendOpsConfig()
-    return moe.ascend_ops_config
+    if moe.moe_ascend_ops_config is None:
+        moe.moe_ascend_ops_config = AscendOpsConfig()
+    return moe.moe_ascend_ops_config
 
 
 def is_tbo_enabled() -> bool:

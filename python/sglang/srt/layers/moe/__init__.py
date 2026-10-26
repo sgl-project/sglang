@@ -7,7 +7,7 @@ from sglang.srt.layers.moe.utils import (
     can_merge_post_experts_all_reduce,
     deferred_post_experts_all_reduce,
     get_deepep_config,
-    get_ascend_ops_config,
+    get_moe_ascend_ops_config,
     get_deepep_mode,
     get_moe_a2a_backend,
     get_moe_runner_backend,
@@ -52,5 +52,5 @@ __all__ = [
     "is_tbo_enabled",
     "get_tbo_token_distribution_threshold",
     "get_deepep_config",
-    "get_ascend_ops_config",
+    "get_moe_ascend_ops_config",
 ]

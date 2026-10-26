@@ -902,7 +902,7 @@ class ExecMoe(msgspec.Struct):
         Optional[str],
         "Tuned DeepEP config suitable for your own cluster. It can be either a string with JSON content or a file path.",
     ] = None
-    ascend_ops_config: A[
+    moe_ascend_ops_config: A[
         Optional[str],
         (
             "Configuration for the ascend_ops MoE backend used by the main "

@@ -2539,7 +2539,7 @@ class TestWaterfillArgs(CustomTestCase):
         server_args = ServerArgs(
             model_path="dummy",
             moe_a2a_backend="ascend_ops",
-            ascend_ops_config="{}",
+            moe_ascend_ops_config="{}",
             enable_waterfill=True,
         )
         with self.assertRaisesRegex(ValueError, "incompatible.*ascend_ops"):
@@ -2552,6 +2552,18 @@ class TestWaterfillArgs(CustomTestCase):
             speculative_moe_a2a_backend="ascend_ops",
         )
         with self.assertRaisesRegex(ValueError, "only supported on NPU"):
+            validate_ascend_ops_speculative_draft(server_args)
+
+    # Protects the target/draft backend invariant required by the shared
+    # Ascend Ops configuration and communication groups.
+    @override_platform(is_npu=True, is_cuda=False, is_hip=False, is_xpu=False)
+    def test_ascend_ops_requires_matching_target_and_draft_backend(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            moe_a2a_backend="ascend_ops",
+            speculative_moe_a2a_backend="deepep",
+        )
+        with self.assertRaisesRegex(ValueError, "must both use ascend_ops"):
             validate_ascend_ops_speculative_draft(server_args)
 
     def test_waterfill_enforces_shared_experts_fusion(self):
