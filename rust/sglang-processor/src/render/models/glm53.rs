@@ -7,6 +7,7 @@ use dynamo_renderer::{OAIChatLikeRequest, PromptFormatter};
 use serde_json::{Value, json};
 
 use super::pydantic_dump::{engine_message, normalize_tools, split_continuation};
+use crate::render::RenderError;
 use crate::render::reasoning::{requested_effort, requested_thinking};
 
 /// `apply_chat_template` arguments SGLang passes itself: as kwargs they fail the
@@ -44,7 +45,7 @@ pub(crate) fn render(
     formatter: &PromptFormatter,
     mut request: Value,
     defaults: &HashMap<String, Value>,
-) -> Result<(String, String), String> {
+) -> Result<(String, String), RenderError> {
     let args = template_args(&request, defaults)?;
     let tools = template_tools(&request)?;
     let Some(Value::Array(messages)) = request.get_mut("messages").map(Value::take) else {
@@ -65,7 +66,7 @@ pub(crate) fn render(
         .chain(tools.iter().flatten())
         .any(has_negative_zero)
     {
-        return Err("-0 renders on the engine".into());
+        return Err(RenderError::Declined("-0".into()));
     }
     // The template strips assistant content, and Python also strips U+001C..U+001F;
     // drop once dynamo-renderer includes ai-dynamo/frontend-crates#395.
@@ -73,7 +74,9 @@ pub(crate) fn render(
         .iter()
         .any(|m| m["role"] == "assistant" && has_python_only_space(&m["content"]))
     {
-        return Err("U+001C..U+001F in assistant content renders on the engine".into());
+        return Err(RenderError::Declined(
+            "U+001C..U+001F in assistant content".into(),
+        ));
     }
     let PromptFormatter::OAI(formatter) = formatter;
     let prompt = formatter
@@ -91,7 +94,7 @@ pub(crate) fn render(
 fn template_args(
     request: &Value,
     defaults: &HashMap<String, Value>,
-) -> Result<HashMap<String, Value>, String> {
+) -> Result<HashMap<String, Value>, RenderError> {
     let mut kwargs: HashMap<String, Value> = match &request["chat_template_kwargs"] {
         Value::Null => HashMap::new(),
         Value::Object(kwargs) => kwargs.clone().into_iter().collect(),
@@ -118,7 +121,7 @@ fn template_args(
         .iter()
         .find(|key| kwargs.contains_key(**key))
     {
-        return Err(format!("chat_template_kwargs.{key} renders on the engine"));
+        return Err(RenderError::Declined(format!("chat_template_kwargs.{key}")));
     }
     if !valid_documents(kwargs.get("documents").unwrap_or(&Value::Null)) {
         return Err("chat_template_kwargs.documents must iterate as objects".into());
@@ -161,7 +164,7 @@ fn template_tools(request: &Value) -> Result<Option<Vec<Value>>, String> {
 /// The message SGLang's Jinja path hands the template: the pydantic dump without
 /// null fields, string tool arguments parsed, and the content parts
 /// `process_content_for_template_format` keeps.
-fn template_message(message: Value) -> Result<Value, String> {
+fn template_message(message: Value) -> Result<Value, RenderError> {
     let mut message = engine_message(message);
     if let Some(fields) = message.as_object_mut() {
         // Only request tools reach the template; Dynamo rejects message-level ones.
@@ -179,7 +182,7 @@ fn template_message(message: Value) -> Result<Value, String> {
                 Some("tool_reference") => {
                     Ok(json!({"type": "tool_reference", "name": part["name"]}))
                 }
-                _ => Err("GLM-5.3 media renders on the engine"),
+                _ => Err(RenderError::Declined("GLM-5.3 media".into())),
             })
             .collect::<Result<Vec<_>, _>>()?;
         // `normalize_tool_content`: a tool result's text parts join with spaces.
