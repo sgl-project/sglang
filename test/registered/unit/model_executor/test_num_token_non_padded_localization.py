@@ -638,7 +638,7 @@ class TestDecoderReplayTailBridge(CustomTestCase):
         self.assertIsNone(tail._bridge(key, 4))
         tail._write_bridge(key, 4, None, [torch.ones(3, 2), None])
         small = tail._bridge(key, 4)
-        self.assertIs(tail._bridge(key, 2), small)
+        self.assertEqual(tail._bridge(key, 2)[0].data_ptr(), small[0].data_ptr())
         # A larger block gets a new set; the smaller graph still writes its own.
         self.assertIsNone(tail._bridge(key, 8))
         tail._write_bridge(key, 8, None, [torch.ones(8, 2), None])

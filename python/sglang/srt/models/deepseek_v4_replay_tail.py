@@ -498,20 +498,18 @@ class DecoderReplayTail:
         )
         if bridge is None:  # first run: the break allocated the bridge
             bridge = self._bridge(bridge_key, block_rows)
-        residual, pre, *aux = (
-            None if buf is None else buf[:block_rows] for buf in bridge
-        )
+        residual, pre, *aux = bridge
         return residual, pre, aux
 
     def _bridge(
         self, key: Tuple[bool, bool], block_rows: int
     ) -> Optional[List[Optional[torch.Tensor]]]:
-        """The newest bridge buffers for ``key``, or None when there are none yet or
-        they hold fewer than ``block_rows`` rows."""
+        """The newest bridge buffers for ``key`` cut to ``block_rows`` rows, or None
+        when there are none yet or they are too small."""
         sets = self._bridge_buffers.get(key)
-        if sets and sets[0][0].shape[0] >= block_rows:
-            return sets[0]
-        return None
+        if not sets or sets[0][0].shape[0] < block_rows:
+            return None
+        return [None if buf is None else buf[:block_rows] for buf in sets[0]]
 
     def _write_bridge(
         self,
