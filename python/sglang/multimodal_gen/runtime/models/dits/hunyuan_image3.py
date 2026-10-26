@@ -894,6 +894,7 @@ class HunyuanImage3Model(nn.Module):
         first_step=False,
         prefix_len=None,
         cache_slot=0,
+        attn_segments=None,
     ):
         if prefix_len is not None and self.prefix_cache_supported:
             return self._forward_block_prefix_cached(
@@ -904,11 +905,13 @@ class HunyuanImage3Model(nn.Module):
                 first_step=first_step,
                 prefix_len=prefix_len,
                 cache_slot=cache_slot,
+                attn_segments=attn_segments,
             )
         if attn_meta is None:
             attn_meta = create_hunyuan_image_attention_meta(
                 attention_mask, num_image_tokens, first_step
             )
+            attn_meta.attn_segments = attn_segments
         return self._run_layers(
             hidden_states, attention_mask, custom_pos_emb, attn_meta
         )
@@ -922,6 +925,7 @@ class HunyuanImage3Model(nn.Module):
         first_step,
         prefix_len,
         cache_slot,
+        attn_segments,
     ):
         """Step 0 runs the full sequence and caches each layer's prefix K/V.
         Later steps run only the suffix (the noisy image and timestep rows).
@@ -932,6 +936,7 @@ class HunyuanImage3Model(nn.Module):
         )
         attn_meta.prefix_len = prefix_len
         attn_meta.cache_slot = cache_slot
+        attn_meta.attn_segments = attn_segments
         if first_step:
             return self._run_layers(
                 hidden_states, attention_mask, custom_pos_emb, attn_meta
@@ -1066,6 +1071,7 @@ class HunyuanImage3ForCausalMM(CachableDiT):
         timestep=None,
         prefix_len=None,
         cache_slot=0,
+        attn_segments=None,
     ):
         # TeaCache gate: skip similar steps and reuse the cached residual;
         # one decision covers the packed CFG batch.
@@ -1082,6 +1088,7 @@ class HunyuanImage3ForCausalMM(CachableDiT):
             first_step=first_step,
             prefix_len=prefix_len,
             cache_slot=cache_slot,
+            attn_segments=attn_segments,
         )
 
         if timestep is not None:

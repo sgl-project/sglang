@@ -356,6 +356,9 @@ class HunyuanImage3Pipeline(LoRAPipeline, ComposedPipelineBase):
                     if server_args.batching_max_size > 1
                     else None
                 ),
+                # --attention-backend fa3/fa4 resolves to "fa"; FA3 is not
+                # bitwise equal to masked SDPA, so it stays opt-in.
+                use_flash_segments=server_args.attention_backend == "fa",
             ),
             "hunyuan_image3_ar",
         )

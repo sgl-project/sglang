@@ -25,6 +25,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager im
 from sglang.multimodal_gen.runtime.models.dits.hunyuan_image3 import (
     Hi3CacheBlockAdapter,
 )
+from sglang.multimodal_gen.runtime.models.dits.hunyuan_image3_utils import (
+    build_attention_segments,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
@@ -122,6 +125,18 @@ def _step_invariant_prefix_len(
             if s.start < prefix_len < s.stop:
                 return None
     return prefix_len
+
+
+def _attention_segments(tokenizer_output, seq_len: int) -> tuple | None:
+    """Per-row segments matching ``_build_causal_attention_mask``, or None to
+    keep the masked path."""
+    gen_slices = tokenizer_output.gen_image_slices
+    joint_slices = tokenizer_output.joint_image_slices
+    rows = tuple(
+        build_attention_segments(seq_len, joint_slices[b] + gen_slices[b])
+        for b in range(len(gen_slices))
+    )
+    return None if any(row is None for row in rows) else rows
 
 
 def _build_causal_attention_mask(
@@ -240,6 +255,7 @@ class HunyuanImage3AR(PipelineStage):
         vision_model,
         vision_aligner,
         max_cond_encode_chunk: int | None = None,
+        use_flash_segments: bool = False,
     ):
         super().__init__()
         self.ar_model = ar_model
@@ -251,6 +267,7 @@ class HunyuanImage3AR(PipelineStage):
         self._vision_aligner = vision_aligner
         # Initial cond-encode chunk cap from --batching-max-size.
         self._max_cond_encode_chunk = max_cond_encode_chunk
+        self._use_flash_segments = use_flash_segments
         self._custom_tokenizer = HunyuanImage3TokenizerWrapper(tokenizer)
         self._gen_config_cache: dict | None = None
         self._cache_dit_adapter = None
@@ -346,6 +363,7 @@ class HunyuanImage3AR(PipelineStage):
         timestep: torch.Tensor | None = None,
         prefix_len: int | None = None,
         cache_slot: int = 0,
+        attn_segments: tuple | None = None,
     ) -> torch.Tensor:
         hidden_size = hidden_states.shape[-1]
         hidden_states = hidden_states.reshape(-1, hidden_size).contiguous()
@@ -374,6 +392,7 @@ class HunyuanImage3AR(PipelineStage):
                 timestep=timestep,
                 prefix_len=prefix_len,
                 cache_slot=cache_slot,
+                attn_segments=attn_segments,
             )
         # batch_size may differ after TP broadcast
         actual_batch = attention_mask.shape[0]
@@ -1250,6 +1269,11 @@ class HunyuanImage3AR(PipelineStage):
         prefix_len = _step_invariant_prefix_len(
             image_mask, timestep_index, tokenizer_output
         )
+        attn_segments = (
+            _attention_segments(tokenizer_output, tok["seq_len"])
+            if self._use_flash_segments
+            else None
+        )
 
         scheduler = self._scheduler
         scheduler.set_timesteps(num_inference_steps)
@@ -1415,6 +1439,7 @@ class HunyuanImage3AR(PipelineStage):
                         timestep=t_expand[:half],
                         prefix_len=prefix_len,
                         cache_slot=0,
+                        attn_segments=attn_segments and attn_segments[:half],
                     )
                     out_uncond = self._backbone_forward(
                         num_image_tokens,
@@ -1425,6 +1450,7 @@ class HunyuanImage3AR(PipelineStage):
                         timestep=t_expand[half:],
                         prefix_len=prefix_len,
                         cache_slot=1,
+                        attn_segments=attn_segments and attn_segments[half:],
                     )
                     backbone_out = torch.cat([out_cond, out_uncond], dim=0)
                 else:
@@ -1436,6 +1462,7 @@ class HunyuanImage3AR(PipelineStage):
                         step_idx == 0,
                         timestep=t_expand,
                         prefix_len=prefix_len,
+                        attn_segments=attn_segments,
                     )
 
                 pred = self._extract_diffusion_pred(

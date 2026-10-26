@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
+import torch.nn.functional as F
 
 from sglang.multimodal_gen.runtime.models.dits import (
     hunyuan_image3,
@@ -255,6 +256,53 @@ class TestHunyuanImage3PrefixKVCache(CustomTestCase):
         self.assertIsNone(
             ar_stage._step_invariant_prefix_len(image_mask, None, straddling)
         )
+
+    def test_segmented_attention_matches_masked_attention(self):
+        """FA3 segments (causal text runs, bidirectional image blocks) must equal
+        SDPA with the dense mask, for full steps and suffix-only steps."""
+        mask = self._mask()
+        blocks = [slice(2, 5), slice(8, 14)]
+        segments = tuple(
+            hunyuan_image3_utils.build_attention_segments(self.SEQ, blocks)
+            for _ in range(self.BS)
+        )
+        self.assertIsNone(
+            hunyuan_image3_utils.build_attention_segments(
+                self.SEQ, [slice(2, 6), slice(5, 9)]
+            )
+        )
+
+        def attend(q, k, v, causal):
+            # Reference for FA3 varlen: GQA, causal mask aligned bottom-right.
+            g = q.shape[1] // k.shape[1]
+            k, v = k.repeat_interleave(g, dim=1), v.repeat_interleave(g, dim=1)
+            m = None
+            if causal:
+                m = torch.ones(q.shape[0], k.shape[0], dtype=torch.bool).tril(
+                    k.shape[0] - q.shape[0]
+                )
+            out = F.scaled_dot_product_attention(
+                q.transpose(0, 1), k.transpose(0, 1), v.transpose(0, 1), attn_mask=m
+            )
+            return out.transpose(0, 1)
+
+        q, k, v = self._qkv(seed=4)
+        full = hunyuan_image3_utils.ImageKVCacheManager()(
+            q, k, v, self._meta(mask, False), attention_mask=mask
+        )
+        seg = hunyuan_image3_utils.segmented_attention(
+            self._rows(q), self._rows(k), self._rows(v), segments, attend
+        )
+        torch.testing.assert_close(seg.reshape(full.shape), full)
+
+        suffix = hunyuan_image3_utils.segmented_attention(
+            self._rows(q)[:, self.PREFIX :],
+            self._rows(k),
+            self._rows(v),
+            segments,
+            attend,
+        )
+        torch.testing.assert_close(suffix, self._rows(full)[:, self.PREFIX :])
 
 
 class TestHunyuanImage3MoEAndSchedule(CustomTestCase):
