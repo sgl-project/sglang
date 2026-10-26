@@ -1525,6 +1525,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             return [-1] * len(expected_bytes)
         # A positive byte count can still be a short read. Every KV object must
         # fill all its destinations before any read API can count it as a hit.
+        # Zero-size objects stay misses under HiCache's nonempty KV hit policy,
+        # consistent with v1/v2 postprocessing.
         return [
             result if result < 0 or (result == size and size > 0) else -1
             for result, size in zip(results, expected_bytes)

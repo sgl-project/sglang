@@ -357,12 +357,31 @@ class TestMooncakeGroupSemantics(CustomTestCase):
                 self.assertEqual(actual[PoolName.DEEPSEEK_V4_C4], [expected[1]])
 
     def test_zero_byte_read_is_not_a_hit(self):
+        """Characterize v1's existing nonempty KV hit policy."""
         store, fake = _make_store(is_mla_model=True)
         pool = FakeHostKVCache(objects_per_page=1)
         store.register_mem_pool_host(pool)
         fake.get_results = [0]
         with patch.object(pool, "get_page_buffer_meta", return_value=([1000], [0])):
             self.assertEqual(store.batch_get_v1(["page"], torch.tensor([0])), [False])
+
+    def test_zero_size_read_is_normalized_to_miss(self):
+        for ptrs, sizes in (([1000], [0]), ([[1000, 1001]], [[0, 0]])):
+            with self.subTest(sizes=sizes):
+                store, fake = _make_store()
+                fake.get_results = [0]
+                self.assertEqual(
+                    store._get_batch_zero_copy_impl(["object"], ptrs, sizes), [-1]
+                )
+
+    def test_read_preserves_sdk_error_code(self):
+        for ptrs, sizes in (([1000], [8]), ([[1000, 1001]], [[8, 16]])):
+            with self.subTest(sizes=sizes):
+                store, fake = _make_store()
+                fake.get_results = [-704]
+                self.assertEqual(
+                    store._get_batch_zero_copy_impl(["object"], ptrs, sizes), [-704]
+                )
 
     def test_legacy_read_apis_reject_incomplete_buffers(self):
         store, fake = _make_store()
