@@ -3637,6 +3637,17 @@ class UnifiedRadixCache(BasePrefixCache):
     def _deferred_ready_sync_group(self):
         """The dedicated group, or None when the plain synchronous path applies."""
         state = getattr(self, "_hcs_state", None)
+        if state and self.enable_storage:
+            # A storage backend was attached at runtime. Its queues are drained
+            # only on the synchronous path, so settle the in-flight sync and
+            # fall back for good; attach runs in the same step on every rank.
+            self._consume_deferred_ready_sync()
+            self._hcs_state = False
+            logger.warning(
+                "--hicache-async-ready-sync: storage backend attached; the "
+                "ready-count sync is synchronous from now on"
+            )
+            return None
         if state is not None:
             return state or None
         self._hcs_state = False
@@ -3694,27 +3705,32 @@ class UnifiedRadixCache(BasePrefixCache):
                 return i + 1
         return 0
 
+    def _consume_deferred_ready_sync(self) -> None:
+        pending = getattr(self, "_hcs_pending", None)
+        if pending is None:
+            return
+        cc = self.cache_controller
+        work, counts, write_snap, load_snap = pending
+        self._hcs_pending = None
+        work.wait()
+        write_n, load_n, digest_min, neg_digest_max = map(int, counts.tolist())
+        assert digest_min == -neg_digest_max, (
+            "write_back duplicate-reclaim victims diverged across TP ranks"
+        )
+        self.writing_check(
+            finish_count=self._deferred_consume_count(
+                cc.ack_write_queue, write_snap, write_n
+            )
+        )
+        self.loading_check(
+            finish_count=self._deferred_consume_count(
+                cc.ack_load_queue, load_snap, load_n
+            )
+        )
+
     def _check_hicache_events_deferred(self, group) -> None:
         cc = self.cache_controller
-        pending = self._hcs_pending
-        if pending is not None:
-            work, counts, write_snap, load_snap = pending
-            self._hcs_pending = None
-            work.wait()
-            write_n, load_n, digest_min, neg_digest_max = map(int, counts.tolist())
-            assert digest_min == -neg_digest_max, (
-                "write_back duplicate-reclaim victims diverged across TP ranks"
-            )
-            self.writing_check(
-                finish_count=self._deferred_consume_count(
-                    cc.ack_write_queue, write_snap, write_n
-                )
-            )
-            self.loading_check(
-                finish_count=self._deferred_consume_count(
-                    cc.ack_load_queue, load_snap, load_n
-                )
-            )
+        self._consume_deferred_ready_sync()
         write_snap = cc.ack_write_queue[: self._count_ready_acks(cc.ack_write_queue)]
         load_snap = cc.ack_load_queue[: self._count_ready_acks(cc.ack_load_queue)]
         digest = self.tree_core.write_back_duplicate_reclaim_digest
