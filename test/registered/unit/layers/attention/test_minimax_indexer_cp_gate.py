@@ -1,5 +1,6 @@
 import unittest
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.minimax_sparse_ops.indexer_cp import (
     draft_is_chain_layout,
     unsupported_reason,
@@ -41,7 +42,6 @@ class TestMiniMaxIndexerCPGate(CustomTestCase):
             ("EAGLE", 1): True,
             ("EAGLE3", 1): True,
             ("EAGLE3", 4): False,  # tree draft
-            ("DSPARK", None): False,  # ragged verify lengths
             ("NGRAM", None): False,  # tree lives in the verify mask
             ("DFLASH", None): False,
             ("STANDALONE", 1): False,
@@ -52,6 +52,19 @@ class TestMiniMaxIndexerCPGate(CustomTestCase):
                     **{
                         **SUPPORTED,
                         "draft_is_chain": draft_is_chain_layout(algorithm, eagle_topk),
+                    }
+                )
+                self.assertEqual(reason is None, expected, reason)
+
+    def test_dspark_enables_cp_only_under_static_verify(self):
+        """Static verify scores every request's whole draft block as chain rows; ragged
+        verify trims rows per request, which the CP tile cannot score."""
+        for mode, expected in (("static", True), ("ragged", False)):
+            with self.subTest(mode=mode), envs.SGLANG_RAGGED_VERIFY_MODE.override(mode):
+                reason = unsupported_reason(
+                    **{
+                        **SUPPORTED,
+                        "draft_is_chain": draft_is_chain_layout("DSPARK", None),
                     }
                 )
                 self.assertEqual(reason is None, expected, reason)

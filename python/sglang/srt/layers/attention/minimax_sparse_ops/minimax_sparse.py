@@ -384,7 +384,9 @@ def minimax_sparse_decode(
         and block_size_k == 128
         and topk == 16
         and dense_main_attn_fn is None
-        and indexer_cp.supports(idx_q, idx_k_cache, max_seqlen, req_to_token)
+        and indexer_cp.supports(
+            idx_q, idx_k_cache, max_seqlen, req_to_token, packed_queries, local_blocks
+        )
     ):
         idx_o = real_seq_lens = None
         topk_idx = indexer_cp(
