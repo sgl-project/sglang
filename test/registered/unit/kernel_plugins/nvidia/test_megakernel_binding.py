@@ -12,8 +12,18 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
 )
 from sglang.srt.layers.attention.linear.kda_backend import KDAAttnBackend
-from sglang.srt.layers.attention.trtllm_mla_backend import TRTLLMMLABackend
-from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
+from sglang.srt.layers.attention.trtllm_mla_backend import (
+    TRTLLMMLABackend,
+    TRTLLMMLADecodeMetadata,
+)
+from sglang.srt.mem_cache.memory_pool import (
+    HybridLinearKVPool,
+    HybridReqToTokenPool,
+)
+from sglang.srt.mem_cache.memory_pool import (
+    MambaPool as StatePool,
+)
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -83,29 +93,47 @@ class TokenPool(HybridLinearKVPool):
 
 
 class MambaPool:
-    def __init__(self):
+    def __init__(self, *, verify=False, q=4):
         self.size = 5
         self.conv = [torch.zeros(2, self.size, 3)]
         self.temporal = torch.zeros(2, self.size, 4)
+        self.verify = verify
+        self.intermediate_conv_window = [torch.zeros(2, self.size + 1, q, 3)]
+        self.intermediate_ssm = torch.zeros(2, self.size + 1, q, 4)
 
 
 class RequestPool(HybridReqToTokenPool):
-    def __init__(self):
-        self.mamba_pool = MambaPool()
+    def __init__(self, *, verify=False, q=4):
+        self.mamba_pool = MambaPool(verify=verify, q=q)
+        self.size = self.mamba_pool.size
         self.mamba_map = {0: 0, 2: 1}
 
     def mamba2_layer_cache(self, layer_id):
         dense = self.mamba_map[layer_id]
+        if self.mamba_pool.verify:
+            return StatePool.SpeculativeState(
+                conv=[self.mamba_pool.conv[0][dense]],
+                temporal=self.mamba_pool.temporal[dense],
+                intermediate_conv_window=[
+                    self.mamba_pool.intermediate_conv_window[0][dense]
+                ],
+                intermediate_ssm=(
+                    self.mamba_pool.intermediate_ssm[dense]
+                    if self.mamba_pool.intermediate_ssm is not None
+                    else None
+                ),
+            )
         return SimpleNamespace(
             conv=[self.mamba_pool.conv[0][dense]],
             temporal=self.mamba_pool.temporal[dense],
             replayssm_d=None,
+            replayssm_rawv=None,
         )
 
 
-def hybrid_backend():
-    token_pool, request_pool = TokenPool(), RequestPool()
-    full_metadata = SimpleNamespace(
+def hybrid_backend(*, verify=False, q=4):
+    token_pool, request_pool = TokenPool(), RequestPool(verify=verify, q=q)
+    full_metadata = TRTLLMMLADecodeMetadata(
         block_kv_indices=torch.zeros(2, 4, dtype=torch.int32),
         seq_lens_k=torch.zeros(2, dtype=torch.int32),
     )
@@ -127,16 +155,26 @@ def hybrid_backend():
     linear = child(
         KDAAttnBackend,
         forward_metadata=SimpleNamespace(
-            mamba_cache_indices=torch.zeros(2, dtype=torch.int32)
+            mamba_cache_indices=torch.tensor([4, 2], dtype=torch.int32),
+            query_start_loc=torch.tensor([0, q, 2 * q], dtype=torch.int32),
+            retrieve_parent_token=None,
         ),
         _track_mamba_state_decode=track,
+        accept_lens_pool=None,
+        verify_intermediate_state_indices=torch.tensor(
+            [0, 3, 1, 2, 4], dtype=torch.int32
+        ),
     )
     value = Mock(spec=HybridLinearAttnBackend, token_to_kv_pool=token_pool)
     value.req_to_token_pool = request_pool
     value.full_attn_backend = full
     value.linear_attn_backend = linear
     value.attn_backend_list = [full, linear]
-    runner = SimpleNamespace(attn_backend=value)
+    runner = SimpleNamespace(
+        attn_backend=value,
+        dtype=torch.bfloat16,
+        get_aux_hidden_states_width=lambda: 12,
+    )
     return SimpleNamespace(
         runner=runner,
         backend=value,
@@ -150,16 +188,263 @@ def hybrid_backend():
     )
 
 
-def forward_batch():
+def forward_batch(*, verify=False, q=4):
     return SimpleNamespace(
         batch_size=2,
-        forward_mode="decode",
-        out_cache_loc=torch.zeros(2, dtype=torch.int32),
+        forward_mode=ForwardMode.TARGET_VERIFY if verify else ForwardMode.DECODE,
+        input_ids=torch.zeros(2 * q if verify else 2, dtype=torch.int64),
+        out_cache_loc=torch.zeros(2 * q if verify else 2, dtype=torch.int32),
         out_cache_loc_is_physical=True,
+        req_pool_indices=torch.tensor([2, 4], dtype=torch.int32),
+        spec_info=SimpleNamespace(draft_token_num=q, ragged_verify_layout=None),
+        aux_hidden_states_buffer=None,
     )
 
 
 class TestMegakernelBinding(CustomTestCase):
+    def test_uniform_verify_widths_keep_native_metadata_and_capture_owners(self):
+        for q in (4, 5, 6, 7, 8):
+            with self.subTest(q=q):
+                fixture = hybrid_backend(verify=True, q=q)
+                self.assertIsNone(fixture.full.forward_decode_metadata.max_seq_len_q)
+                binding = mb.MegakernelBinding(model=torch.nn.Module())
+                prepared = binding.preparation_view(fixture.runner)
+                batch = forward_batch(verify=True, q=q)
+                allocation = torch.empty(4 * q, 12, dtype=torch.bfloat16)
+                runner = SimpleNamespace(
+                    buffers=SimpleNamespace(aux_hidden_states=allocation)
+                )
+                batch.aux_hidden_states_buffer = allocation[: 2 * q]
+                with (
+                    patch(BACKEND, return_value=fixture.backend),
+                    patch.object(
+                        torch.cuda, "is_current_stream_capturing", return_value=True
+                    ),
+                ):
+                    view = binding.forward_view(batch)
+                    binding.seal_capture_view(batch, view)
+                    binding.seal_capture_buffers(runner)
+                self.assertEqual(view.hybrid.mla.tokens_per_request, q)
+                self.assertEqual(
+                    tuple(view.hybrid.aux_hidden_states.shape), (2 * q, 12)
+                )
+                self.assertEqual(view.hybrid.mla.sequence_lengths.numel(), 2)
+                self.assertEqual(view.hybrid.mla.write_slots.numel(), 2 * q)
+                self.assertEqual(
+                    view.hybrid.kda.verify_scratch_indices.tolist(), [0, 3]
+                )
+                self.assertEqual(
+                    prepared.hybrid.kda.state(2).intermediate_ssm.shape[1], q
+                )
+                fixture.linear.verify_intermediate_state_indices[:2] = torch.tensor(
+                    [3, 0]
+                )
+                binding.assert_live()
+                self.assertEqual(
+                    view.hybrid.kda.verify_scratch_indices.tolist(), [3, 0]
+                )
+                runner.buffers.aux_hidden_states = allocation.clone()
+                with self.assertRaisesRegex(
+                    RuntimeError, "decode_graph_aux_hidden_states"
+                ):
+                    binding.assert_live()
+
+    def test_verify_borrows_scratch_separately_and_forbids_decode_tracking(self):
+        fixture = hybrid_backend(verify=True)
+        self.assertIsNone(fixture.full.forward_decode_metadata.max_seq_len_q)
+        binding = mb.MegakernelBinding(model=torch.nn.Module())
+        prepared = binding.preparation_view(fixture.runner)
+        batch = forward_batch(verify=True)
+        with (
+            patch(BACKEND, return_value=fixture.backend),
+            patch.object(torch.cuda, "is_current_stream_capturing", return_value=False),
+        ):
+            view = binding.forward_view(batch).hybrid
+            again = binding.forward_view(batch).hybrid
+        state = prepared.hybrid.kda.state(2)
+        self.assertEqual(
+            state.intermediate_ssm.data_ptr(),
+            fixture.mamba_pool.intermediate_ssm[1].data_ptr(),
+        )
+        self.assertEqual(
+            state.intermediate_conv_window[0].data_ptr(),
+            fixture.mamba_pool.intermediate_conv_window[0][1].data_ptr(),
+        )
+        self.assertEqual(view.kda.state_indices.tolist(), [4, 2])
+        self.assertEqual(view.kda.verify_scratch_indices.tolist(), [0, 3])
+        self.assertEqual(
+            view.kda.verify_scratch_indices.data_ptr(),
+            fixture.linear.verify_intermediate_state_indices.data_ptr(),
+        )
+        self.assertEqual(view.mla.tokens_per_request, 4)
+        self.assertEqual(view.mla.sequence_lengths.numel(), 2)
+        self.assertEqual(view.mla.write_slots.numel(), 8)
+        self.assertEqual(tuple(view.aux_hidden_states.shape), (8, 12))
+        self.assertIs(view.aux_hidden_states.dtype, torch.bfloat16)
+        self.assertIs(view.aux_hidden_states, batch.aux_hidden_states_buffer)
+        self.assertIs(again.aux_hidden_states, view.aux_hidden_states)
+        with self.assertRaisesRegex(RuntimeError, "decode tracking is forbidden"):
+            view.kda.track_decode_state(2)
+        self.assertEqual(fixture.tracked, [])
+
+    def test_verify_capture_requires_and_seals_the_runner_auxiliary_owner(self):
+        for replacement in ("slice", "owner", "buffers"):
+            with self.subTest(replacement=replacement):
+                fixture = hybrid_backend(verify=True)
+                binding = mb.MegakernelBinding(model=torch.nn.Module())
+                binding.preparation_view(fixture.runner)
+                batch = forward_batch(verify=True)
+                allocation = torch.empty(16, 12, dtype=torch.bfloat16)
+                runner = SimpleNamespace(
+                    buffers=SimpleNamespace(aux_hidden_states=allocation)
+                )
+                with (
+                    patch(BACKEND, return_value=fixture.backend),
+                    patch.object(
+                        torch.cuda, "is_current_stream_capturing", return_value=True
+                    ),
+                ):
+                    with self.assertRaisesRegex(
+                        RuntimeError, "runner auxiliary buffer"
+                    ):
+                        binding.forward_view(batch)
+                    self.assertIsNone(batch.aux_hidden_states_buffer)
+                    batch.aux_hidden_states_buffer = allocation[:8]
+                    view = binding.forward_view(batch)
+                    binding.seal_capture_view(batch, view)
+                    binding.seal_capture_buffers(runner)
+                allocation.fill_(1)
+                fixture.linear.verify_intermediate_state_indices[:2] = torch.tensor(
+                    [3, 0], dtype=torch.int32
+                )
+                binding.assert_live()
+                self.assertEqual(
+                    view.hybrid.kda.verify_scratch_indices.tolist(), [3, 0]
+                )
+                if replacement == "slice":
+                    batch.aux_hidden_states_buffer = torch.empty_like(allocation[:8])
+                    expected = "aux_hidden_states"
+                elif replacement == "owner":
+                    runner.buffers.aux_hidden_states = torch.empty_like(allocation)
+                    expected = "decode_graph_aux_hidden_states"
+                else:
+                    runner.buffers = SimpleNamespace(aux_hidden_states=allocation)
+                    expected = "decode_graph_buffers"
+                with self.assertRaisesRegex(RuntimeError, expected):
+                    binding.assert_live()
+
+    def test_verify_rejects_wrong_capture_owner_and_unprepared_state(self):
+        fixture = hybrid_backend(verify=True)
+        binding = mb.MegakernelBinding(model=torch.nn.Module())
+        binding.preparation_view(fixture.runner)
+        batch = forward_batch(verify=True)
+        batch.aux_hidden_states_buffer = torch.empty(8, 12, dtype=torch.bfloat16)
+        with patch(BACKEND, return_value=fixture.backend):
+            binding.seal_capture_view(batch, binding.forward_view(batch))
+        runner = SimpleNamespace(
+            buffers=SimpleNamespace(
+                aux_hidden_states=torch.empty_like(batch.aux_hidden_states_buffer)
+            )
+        )
+        with self.assertRaisesRegex(RuntimeError, "slices differ from runner buffer"):
+            binding.seal_capture_buffers(runner)
+        fixture = hybrid_backend()
+        binding = mb.MegakernelBinding(model=torch.nn.Module())
+        binding.preparation_view(fixture.runner)
+        with (
+            patch(BACKEND, return_value=fixture.backend),
+            self.assertRaisesRegex(ValueError, "prepared uniform q4-8 state"),
+        ):
+            binding.forward_view(forward_batch(verify=True))
+
+    def test_verify_pool_replacements_are_detected(self):
+        replacements = {
+            "kda_intermediate_conv_window": lambda f: (
+                f.mamba_pool.intermediate_conv_window.__setitem__(
+                    0, torch.empty_like(f.mamba_pool.intermediate_conv_window[0])
+                )
+            ),
+            "kda_intermediate_ssm": lambda f: setattr(
+                f.mamba_pool,
+                "intermediate_ssm",
+                torch.empty_like(f.mamba_pool.intermediate_ssm),
+            ),
+            "kda_verify_scratch_indices": lambda f: setattr(
+                f.linear,
+                "verify_intermediate_state_indices",
+                torch.empty_like(f.linear.verify_intermediate_state_indices),
+            ),
+            "kda_accept_lens_pool": lambda f: setattr(
+                f.linear, "accept_lens_pool", torch.zeros(5, dtype=torch.int32)
+            ),
+        }
+        for expected, change in replacements.items():
+            with self.subTest(expected=expected):
+                fixture = hybrid_backend(verify=True)
+                binding = mb.MegakernelBinding(model=torch.nn.Module())
+                binding.preparation_view(fixture.runner)
+                change(fixture)
+                with self.assertRaisesRegex(RuntimeError, expected):
+                    binding.assert_live()
+
+    def test_verify_rejects_incompatible_state_and_step_contracts(self):
+        for field, value, expected in (
+            ("draft_token_num", 3, "uniform q4-8"),
+            ("draft_token_num", 9, "uniform q4-8"),
+            ("ragged_verify_layout", object(), "uniform q4-8"),
+            ("retrieve_parent_token", torch.zeros(2), "uniform q4-8"),
+            ("input_ids", torch.zeros(6, dtype=torch.int64), "request/token metadata"),
+            ("out_cache_loc", torch.zeros(2), "request/token metadata"),
+            ("aux_hidden_states_buffer", torch.zeros(8, 12), "auxiliary buffer layout"),
+        ):
+            with self.subTest(field=field):
+                fixture = hybrid_backend(verify=True)
+                binding = mb.MegakernelBinding(model=torch.nn.Module())
+                binding.preparation_view(fixture.runner)
+                batch = forward_batch(verify=True)
+                owner = (
+                    batch.spec_info
+                    if field in ("draft_token_num", "ragged_verify_layout")
+                    else fixture.linear.forward_metadata
+                    if field == "retrieve_parent_token"
+                    else batch
+                )
+                setattr(owner, field, value)
+                with (
+                    patch(BACKEND, return_value=fixture.backend),
+                    self.assertRaisesRegex(ValueError, expected),
+                ):
+                    binding.forward_view(batch)
+        for change, expected in (
+            (
+                lambda f: setattr(f.mamba_pool, "intermediate_ssm", None),
+                "intermediate SSM",
+            ),
+            (
+                lambda f: setattr(f.linear, "accept_lens_pool", torch.zeros(5)),
+                "fused verify",
+            ),
+            (
+                lambda f: setattr(f.runner, "get_aux_hidden_states_width", lambda: 0),
+                "auxiliary width",
+            ),
+        ):
+            fixture = hybrid_backend(verify=True)
+            change(fixture)
+            with (
+                self.subTest(expected=expected),
+                self.assertRaisesRegex(ValueError, expected),
+            ):
+                mb.MegakernelBinding(model=torch.nn.Module()).preparation_view(
+                    fixture.runner
+                )
+        with patch.dict("os.environ", SGLANG_ENABLE_PP_SPEC="1"):
+            fixture = hybrid_backend(verify=True)
+            with self.assertRaisesRegex(ValueError, "PP-stable"):
+                mb.MegakernelBinding(model=torch.nn.Module()).preparation_view(
+                    fixture.runner
+                )
+
     def test_hybrid_preparation_requires_the_supported_backend_and_pool_types(self):
         cases = {
             "lookalike": lambda f: setattr(
@@ -237,13 +522,18 @@ class TestMegakernelBinding(CustomTestCase):
                 binding.assert_live()
 
     def test_hybrid_preparation_rejects_replayssm_on_any_kda_layer(self):
-        for layer_id in (0, 2):
-            with self.subTest(layer_id=layer_id):
+        for layer_id, field in (
+            (0, "replayssm_d"),
+            (2, "replayssm_d"),
+            (0, "replayssm_rawv"),
+            (2, "replayssm_rawv"),
+        ):
+            with self.subTest(layer_id=layer_id, field=field):
                 fixture = hybrid_backend()
                 binding = mb.MegakernelBinding(model=torch.nn.Module())
                 layer_cache = fixture.request_pool.mamba2_layer_cache
                 replay_state = layer_cache(layer_id)
-                replay_state.replayssm_d = torch.zeros(1)
+                setattr(replay_state, field, torch.zeros(1))
                 with (
                     patch.object(
                         fixture.request_pool,
@@ -353,6 +643,9 @@ class TestMegakernelBinding(CustomTestCase):
             view.hybrid.kda.state_indices,
             fixture.linear.forward_metadata.mamba_cache_indices,
         )
+        self.assertEqual(view.hybrid.mla.tokens_per_request, 1)
+        self.assertIsNone(view.hybrid.kda.verify_scratch_indices)
+        self.assertIsNone(view.hybrid.aux_hidden_states)
         self.assertFalse(hasattr(view, "kv_pool"))
         self.assertFalse(hasattr(view, "metadata"))
 
@@ -440,6 +733,14 @@ class TestMegakernelBinding(CustomTestCase):
             for missing in (False, True):
                 with self.subTest(owner=owner, field=field, missing=missing):
                     fixture = hybrid_backend()
+                    if owner == "mla" and missing:
+                        # Native metadata has class-level None defaults; use a
+                        # malformed object to exercise a genuinely missing field.
+                        metadata = fixture.full.forward_decode_metadata
+                        fixture.full.forward_decode_metadata = SimpleNamespace(
+                            block_kv_indices=metadata.block_kv_indices,
+                            seq_lens_k=metadata.seq_lens_k,
+                        )
                     binding = mb.MegakernelBinding(model=torch.nn.Module())
                     binding.preparation_view(fixture.runner)
                     batch = forward_batch()

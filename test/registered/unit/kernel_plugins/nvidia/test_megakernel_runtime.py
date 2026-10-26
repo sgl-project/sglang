@@ -138,6 +138,43 @@ class TestMegakernelRuntime(CustomTestCase):
             forward_batch, "view"
         )
 
+    def test_verify_build_widths_are_token_rows_but_capture_keys_are_requests(self):
+        for q in (4, 5, 6, 7, 8):
+            with self.subTest(q=q):
+                contexts = []
+
+                def build(model, hf_config, context):
+                    contexts.append(context)
+                    return SimpleNamespace(
+                        widths=context.widths,
+                        summary=lambda: "uniform verify",
+                        plan=lambda ids, fb: registry.Step(
+                            "target_verify", ids.numel()
+                        ),
+                        forward=lambda *args, **kwargs: "megakernel",
+                    )
+
+                model = self._install_spec(
+                    replace(SPEC, max_rows=64, build=build), tokens=q
+                )
+                self.assertEqual(contexts[0].tokens_per_request, q)
+                self.assertEqual(contexts[0].widths, tuple(range(q, 65, q)))
+                forward_batch = batch(3)
+                forward_batch.input_ids = torch.zeros(3 * q)
+                with patch.object(
+                    torch.cuda, "is_current_stream_capturing", return_value=True
+                ):
+                    model(forward_batch.input_ids, None, forward_batch)
+                # The wrapper's bound dispatch keeps the native request-sized key.
+                dispatch = model.forward.__closure__
+                captured = next(
+                    cell.cell_contents.captured
+                    for cell in dispatch
+                    if isinstance(cell.cell_contents, binding._Dispatch)
+                )
+                self.assertEqual(set(captured), {3})
+                self.assertEqual(captured[3].rows, 3 * q)
+
     def test_preparation_runs_after_model_once_per_warmup_lifecycle(self):
         """All phase runners share preparation; an explicit warmup reset repeats it."""
         events = []
@@ -312,6 +349,22 @@ class TestMegakernelRuntime(CustomTestCase):
         capture([2, 8], capture_bs=[2, 8])
         with self.assertRaisesRegex(ValueError, "none of the 2 captured decode graphs"):
             capture([8, 16], capture_bs=[8, 16])
+
+    def test_capture_tail_seals_the_auxiliary_allocation_owner(self):
+        """Replacing the runner pool must invalidate its captured auxiliary slices."""
+        hooks = []
+        lm = install(tokens=1, hooks=hooks)
+        aux = torch.empty(8, 12, dtype=torch.bfloat16)
+        lm.context.binding._capture_aux_buffers["target_verify:1"] = aux[:4]
+        runner = SimpleNamespace(
+            capture_bs=[4], buffers=SimpleNamespace(aux_hidden_states=aux)
+        )
+        with patch.object(torch.cuda, "is_current_stream_capturing", return_value=True):
+            lm(batch(4).input_ids, None, batch(4))
+            hooks[0](runner, None, batch(4), 4)
+        runner.buffers.aux_hidden_states = torch.empty_like(aux)
+        with self.assertRaisesRegex(RuntimeError, "decode_graph_aux_hidden_states"):
+            lm.context.binding.assert_live()
 
 
 if __name__ == "__main__":
