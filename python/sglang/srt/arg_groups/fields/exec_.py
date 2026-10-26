@@ -331,8 +331,8 @@ class ExecKernel(msgspec.Struct):
         Arg(
             help="DeepSeek V4 attention backend. 'auto' (default) resolves to "
             "'flashmla' where 'flashmla_mega' is unsupported or, outside PD "
-            "disaggregation, where an attention-TP rank holds fewer than 64 "
-            "query heads, and to 'flashmla_mega' otherwise. "
+            "disaggregation, where attention is tensor-parallel across ranks "
+            "(attention TP > 1), and to 'flashmla_mega' otherwise. "
             "'trtllm' (opt-in, SM100/SM103 with FP8 KV cache) "
             "switches the SWA/compressed KV pools to a "
             "uniform 512-dim FP8 layout and runs decode and sparse prefill "
