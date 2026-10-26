@@ -2656,6 +2656,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 else None
             ),
             global_num_token_non_padded_cpu=bs * block_size,
+            can_run_decode_cuda_graph=batch.can_run_decode_cuda_graph,
         )
         # The draft block writes the whole window. A compact draft reads its
         # own `req_to_token` rows over its own lengths.
