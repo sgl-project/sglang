@@ -25,13 +25,11 @@ Lifecycle:
 
 from __future__ import annotations
 
-from typing import Iterator, Mapping, Optional, Sequence, TypeVar
-
-import numpy as np
+from typing import Mapping, Optional, Sequence, TypeVar
 
 from radix_transfer_plugins.backend import StorageBackend
 from radix_transfer_plugins.codec import IDENTITY, get_codec
-from radix_transfer_plugins.schema import FieldSpec, RawField, Stash, StoreRef
+from radix_transfer_plugins.schema import FieldSpec, Stash, StoreRef
 
 S = TypeVar("S", bound=Stash)
 
@@ -64,25 +62,21 @@ class OutputStore:
             for key, (specs, _) in zip(keys, encoded)
         ]
 
-    def get_many(
+    def read_many(
         self,
-        refs: Sequence[StoreRef],
+        requests: Sequence[tuple[StoreRef, Sequence[str]]],
         *,
         stash_type: type[S],
-        fields: Optional[Sequence[str]] = None,
     ) -> list[S]:
-        """Read the stashes back; ``fields`` limits which fields are read.
+        """Read the named fields of each ref into arrays the caller owns.
 
-        The arrays are backend views: for Mooncake they hold the client's read buffer
-        while they live, so a reader that keeps them should use ``read_many``.
+        One backend read for all of them; fails before reading anything when a ref has
+        no field of a requested name.
         """
-        self._check_backend(refs)
-        wanted = [
-            tuple(s for s in ref.fields if fields is None or s.name in fields)
-            for ref in refs
-        ]
+        self._check_backend([ref for ref, _ in requests])
+        wanted = [_named_specs(ref, names) for ref, names in requests]
         stored = self._backend.get_many(
-            [ref.key for ref in refs],
+            [ref.key for ref, _ in requests],
             parts=[[(s.name, s.nbytes) for s in specs if s.nbytes] for specs in wanted],
         )
         return [
@@ -96,34 +90,6 @@ class OutputStore:
             )
             for specs, data in zip(wanted, stored)
         ]
-
-    def read_many(
-        self,
-        requests: Sequence[tuple[StoreRef, Sequence[str]]],
-        *,
-        stash_type: type[S],
-        buffer_bytes: int,
-    ) -> list[S]:
-        """Read the named fields of each ref into arrays the caller owns.
-
-        Reads in chunks whose stored bytes fit ``buffer_bytes``, the backend's read buffer
-        (for Mooncake, the client's local buffer), and copies each chunk out before reading
-        the next, so the backend holds at most one chunk. Fails before reading anything when
-        a field is missing or larger than the buffer.
-        """
-        self._check_backend([ref for ref, _ in requests])
-        wanted = [_named_specs(ref, names) for ref, names in requests]
-        for (ref, _), specs in zip(requests, wanted):
-            for spec in specs:
-                if spec.nbytes > buffer_bytes:
-                    raise ValueError(
-                        f"field {spec.name} of {ref.key} has {spec.nbytes} bytes, "
-                        f"more than the {buffer_bytes}-byte read buffer"
-                    )
-        fields: list[dict[str, RawField]] = [{} for _ in requests]
-        for chunk in _chunk_by_bytes(wanted, buffer_bytes=buffer_bytes):
-            self._read_chunk(requests, chunk, out=fields)
-        return [stash_type.from_fields(named) for named in fields]
 
     def delete_many(self, refs: Sequence[StoreRef]) -> None:
         """Delete every field of each ref."""
@@ -166,32 +132,6 @@ class OutputStore:
                     f"ref of backend {ref.backend!r} given to a {self._backend.name!r} store"
                 )
 
-    def _read_chunk(
-        self,
-        requests: Sequence[tuple[StoreRef, Sequence[str]]],
-        chunk: dict[int, list[FieldSpec]],
-        *,
-        out: list[dict[str, RawField]],
-    ) -> None:
-        """Read one chunk and copy it into ``out``; the backend's views die when this returns."""
-        indices = list(chunk)
-        stored = self._backend.get_many(
-            [requests[i][0].key for i in indices],
-            parts=[[(s.name, s.nbytes) for s in chunk[i] if s.nbytes] for i in indices],
-        )
-        for i, data in zip(indices, stored):
-            for s in chunk[i]:
-                field = get_codec(s.codec).decode(
-                    data[s.name] if s.nbytes else _EMPTY, spec=s
-                )
-                # numpy copies without holding the GIL;
-                # bytearray() would hold it for the whole field and stall other threads.
-                out[i][s.name] = RawField(
-                    dtype=field.dtype,
-                    shape=field.shape,
-                    data=memoryview(np.frombuffer(field.data, dtype=np.uint8).copy()),
-                )
-
 
 def _as_bytes(data: memoryview) -> memoryview:
     return data if data.format == "B" and data.ndim == 1 else data.cast("B")
@@ -203,20 +143,3 @@ def _named_specs(ref: StoreRef, names: Sequence[str]) -> list[FieldSpec]:
     if missing:
         raise ValueError(f"{ref.key} has no fields {missing}")
     return [specs[name] for name in names]
-
-
-def _chunk_by_bytes(
-    wanted: Sequence[Sequence[FieldSpec]], *, buffer_bytes: int
-) -> Iterator[dict[int, list[FieldSpec]]]:
-    """Group (request index, field) pairs, in order, into chunks of at most ``buffer_bytes``."""
-    chunk: dict[int, list[FieldSpec]] = {}
-    used = 0
-    for i, specs in enumerate(wanted):
-        for spec in specs:
-            if chunk and used + spec.nbytes > buffer_bytes:
-                yield chunk
-                chunk, used = {}, 0
-            chunk.setdefault(i, []).append(spec)
-            used += spec.nbytes
-    if chunk:
-        yield chunk
