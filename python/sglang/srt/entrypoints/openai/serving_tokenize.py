@@ -98,6 +98,7 @@ class OpenAIServingTokenize(OpenAIServingBase):
         if validation_error:
             raise ValueError(validation_error)
 
+        self.chat_serving._prepare_reasoning_effort(chat_request)
         is_multimodal = self.tokenizer_manager.model_config.is_multimodal
         processed_messages = self.chat_serving._process_messages(
             chat_request, is_multimodal

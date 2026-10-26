@@ -1237,21 +1237,7 @@ class OpenAIServingChat(OpenAIServingBase):
             and not processed_messages.modalities
         )
 
-    def _convert_to_internal_request(
-        self,
-        request: ChatCompletionRequest,
-        raw_request: Request = None,
-    ) -> tuple[GenerateReqInput, ChatCompletionRequest]:
-
-        # Header-based opt-in (same rationale as request_headers.py).
-        if raw_request is not None and not request.return_input_ids_in_sglext:
-            if raw_request.headers.get("x-sglext-return-input-ids") == "1":
-                request.return_input_ids_in_sglext = True
-
-        if raw_request is not None and not request.return_output_ids_in_sglext:
-            if raw_request.headers.get("x-sglext-return-output-ids") == "1":
-                request.return_output_ids_in_sglext = True
-
+    def _prepare_reasoning_effort(self, request: ChatCompletionRequest) -> None:
         reasoning_effort = None
         if not uses_hunyuan_reasoning_effort(
             self.reasoning_parser, self.template_manager.reasoning_config
@@ -1269,6 +1255,23 @@ class OpenAIServingChat(OpenAIServingBase):
 
         if reasoning_effort is not None:
             request.reasoning_effort = reasoning_effort
+
+    def _convert_to_internal_request(
+        self,
+        request: ChatCompletionRequest,
+        raw_request: Request = None,
+    ) -> tuple[GenerateReqInput, ChatCompletionRequest]:
+
+        # Header-based opt-in (same rationale as request_headers.py).
+        if raw_request is not None and not request.return_input_ids_in_sglext:
+            if raw_request.headers.get("x-sglext-return-input-ids") == "1":
+                request.return_input_ids_in_sglext = True
+
+        if raw_request is not None and not request.return_output_ids_in_sglext:
+            if raw_request.headers.get("x-sglext-return-output-ids") == "1":
+                request.return_output_ids_in_sglext = True
+
+        self._prepare_reasoning_effort(request)
 
         if request.stream:
             if request.return_prompt_token_ids:
