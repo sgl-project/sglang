@@ -18,11 +18,14 @@ from sglang.srt.multimodal.qwen_vl_media_processing import (
     QWEN_VIDEO_PREPROCESS_CONFIG_KEYS,
     VIDEO_MAX_PIXELS,
     VIDEO_TOTAL_PIXELS,
+    preprocess_qwen3_vl_video_sync,
     preprocess_video_sync,
+    qwen3_vl_video_pixel_limits,
 )
 from sglang.srt.multimodal.token_space_mm_process.process_strategy import (
     TokenSpaceProcessStrategy,
 )
+from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 
 
 class QwenTokenSpaceProcessStrategy(TokenSpaceProcessStrategy):
@@ -137,6 +140,17 @@ class QwenTokenSpaceProcessStrategy(TokenSpaceProcessStrategy):
             raise ValueError("Qwen token expansion does not support use_audio_in_video")
         kwargs.pop("seconds_per_chunk", None)
         kwargs.pop("position_id_per_seconds", None)
+        # This family takes frames that qwen-vl-utils already sampled and resized.
+        qwen3_vl_video = isinstance(
+            processor.video_processor, Qwen3VLVideoProcessor
+        ) and isinstance(video, VideoDecoderWrapper)
+        pixel_limits = None
+        if qwen3_vl_video:
+            image_factor = (
+                processor.video_processor.patch_size
+                * processor.video_processor.merge_size
+            )
+            pixel_limits = qwen3_vl_video_pixel_limits(image_factor)
         video_config = {
             **self.video_config,
             **{
@@ -144,9 +158,19 @@ class QwenTokenSpaceProcessStrategy(TokenSpaceProcessStrategy):
                 for key, value in kwargs.items()
                 if key in QWEN_VIDEO_PREPROCESS_CONFIG_KEYS
             },
-            **self._bound_item_video_options(preprocess_kwargs),
+            **self._bound_item_video_options(
+                preprocess_kwargs, pixel_limits=pixel_limits
+            ),
         }
         processor_kwargs = dict(kwargs)
+        if qwen3_vl_video:
+            return self._process_qwen3_vl_video(
+                video,
+                processor,
+                video_config,
+                processor_kwargs,
+                image_factor=image_factor,
+            )
         if isinstance(processor.video_processor, Qwen3VLVideoProcessor):
             processor_kwargs.update(
                 {
@@ -198,16 +222,27 @@ class QwenTokenSpaceProcessStrategy(TokenSpaceProcessStrategy):
             ]
         return output
 
-    def _bound_item_video_options(self, preprocess_kwargs):
+    def _bound_item_video_options(self, preprocess_kwargs, *, pixel_limits=None):
         """Let per-item options lower, never raise, the configured frame and pixel
-        limits: in serving they come from the client's video_url."""
+        limits: in serving they come from the client's video_url.
+
+        ``pixel_limits`` replaces the default max_pixels and total_pixels the
+        configuration falls back to; the Qwen3-VL route passes its own.
+        """
+        if pixel_limits is None:
+            pixel_limits = {
+                "max_pixels": VIDEO_MAX_PIXELS,
+                "total_pixels": VIDEO_TOTAL_PIXELS,
+            }
         frame_cap = self.video_config.get("max_frames", FPS_MAX_FRAMES)
-        pixel_cap = self.video_config.get("max_pixels", VIDEO_MAX_PIXELS)
+        pixel_cap = self.video_config.get("max_pixels", pixel_limits["max_pixels"])
         caps = {
             "nframes": frame_cap,
             "max_frames": frame_cap,
             "max_pixels": pixel_cap,
-            "total_pixels": self.video_config.get("total_pixels", VIDEO_TOTAL_PIXELS),
+            "total_pixels": self.video_config.get(
+                "total_pixels", pixel_limits["total_pixels"]
+            ),
         }
         options = {
             key: min(value, caps[key]) if key in caps else value
@@ -222,6 +257,32 @@ class QwenTokenSpaceProcessStrategy(TokenSpaceProcessStrategy):
                 f"resized_height * resized_width exceeds the video max_pixels {pixel_cap}"
             )
         return options
+
+    def _process_qwen3_vl_video(
+        self, video, processor, video_config, processor_kwargs, *, image_factor
+    ):
+        video_processor = processor.video_processor
+        frames, metadata = preprocess_qwen3_vl_video_sync(
+            video,
+            image_factor=image_factor,
+            video_config={
+                key: value
+                for key, value in video_config.items()
+                if key in QWEN_VIDEO_PREPROCESS_CONFIG_KEYS
+            },
+        )
+        processor_kwargs = {
+            key: value
+            for key, value in processor_kwargs.items()
+            if key not in QWEN_VIDEO_PREPROCESS_CONFIG_KEYS
+        }
+        # The frames are final: no second sampling or resize in the HF processor.
+        processor_kwargs.update(
+            do_sample_frames=False, do_resize=False, return_metadata=True
+        )
+        return dict(
+            video_processor([frames], video_metadata=[metadata], **processor_kwargs)
+        )
 
     def process_audio(self, audio, processor, preprocess_kwargs, **kwargs):
         output = dict(
