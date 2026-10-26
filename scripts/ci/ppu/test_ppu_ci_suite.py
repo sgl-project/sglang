@@ -36,7 +36,7 @@ class TestPPUCISuite(CustomTestCase):
             list((RUNNER.parent / "registered").rglob("test_ppu_ci_*.py")), []
         )
 
-    def test_ppu_suite_contains_speculative_and_mla_model_sanity_files(self):
+    def test_ppu_suite_contains_speculative_and_attention_model_sanity_files(self):
         registered = RUNNER.parent / "registered"
         files = [
             str(path)
@@ -59,7 +59,7 @@ class TestPPUCISuite(CustomTestCase):
             [
                 "core/test_basic_sanity_eagle3.py",
                 "core/test_basic_sanity_dflash.py",
-                "ppu/test_sail_mla_backends.py",
+                "ppu/test_sail_attention_backends.py",
             ],
         )
 
