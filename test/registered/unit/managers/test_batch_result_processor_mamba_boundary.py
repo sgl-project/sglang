@@ -15,9 +15,11 @@ from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
 from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
@@ -40,7 +42,10 @@ def _make_batch() -> tuple[Req, ScheduleBatch]:
     req.output_ids.append(3)
     req.kv.kv_committed_len = 2
 
-    batch = ScheduleBatch(reqs=[req])
+    batch = ScheduleBatch(
+        reqs=[req],
+        req_to_token_pool=ReqToTokenPool(1, 16, "cpu", enable_memory_saver=False),
+    )
     batch.tree_cache = SimpleNamespace(page_size=TRACK_INTERVAL)
     batch.device = "cpu"
     batch.model_config = SimpleNamespace(is_encoder_decoder=False)
@@ -92,6 +97,46 @@ def _make_result():
         next_token_ids=[4],
         speculative_num_draft_tokens=0,
     )
+
+
+class TestPromptOnlyDecode(CustomTestCase):
+    def test_decode_preserves_the_prompt_checkpoint(self):
+        """Leaving prefill must clear tracking without advancing the prompt checkpoint."""
+        req, batch = _make_batch()
+        batch.req_to_token_pool.mamba_cache_prompt_only = True
+        req.kv.mamba_ping_pong_track_buffer = torch.tensor([10, 11])
+        req.kv.mamba_last_track_seqlen = 2
+        req.kv.mamba_next_track_idx = 0
+        batch.mamba_track_mask = torch.tensor([True])
+        batch.mamba_track_indices = torch.tensor([10])
+        batch.mamba_track_buffer_indices = [0]
+        processor = _make_processor()
+        with (
+            get_context().override_server_args(
+                mamba_radix_cache_strategy="extra_buffer",
+                mamba_track_interval=TRACK_INTERVAL,
+                _mamba_cache_chunk_size=TRACK_INTERVAL,
+            ),
+            patch(
+                "sglang.srt.managers.schedule_batch.alloc_for_decode",
+                return_value=torch.tensor([3]),
+            ),
+            patch(
+                "sglang.srt.managers.schedule_batch.set_mamba_track_indices_from_reqs",
+                side_effect=AssertionError("prompt-only decode selected a checkpoint"),
+            ),
+        ):
+            for _ in range(2):
+                batch.prepare_for_decode()
+                processor._mamba_prefix_cache_update(req, batch, _make_result(), 0)
+
+        self.assertEqual(batch.seq_lens.tolist(), [4])
+        self.assertEqual(req.decode_batch_idx, 2)
+        self.assertIsNone(batch.mamba_track_mask)
+        self.assertIsNone(batch.mamba_track_indices)
+        self.assertIsNone(batch.mamba_track_buffer_indices)
+        self.assertEqual(req.kv.mamba_last_track_seqlen, 2)
+        self.assertEqual(req.kv.mamba_next_track_idx, 0)
 
 
 class TestMambaBoundaryMaskReuse(unittest.TestCase):
@@ -194,9 +239,7 @@ class TestMambaPrevTrackSeqlen(unittest.TestCase):
         req.kv.mamba_next_track_idx = 0
         req.kv.mamba_last_track_idx = 1
         batch.mamba_track_buffer_indices = None
-        batch.req_to_token_pool = SimpleNamespace(
-            get_mamba_ping_pong_other_idx=lambda idx: 1 - idx
-        )
+        batch.req_to_token_pool.get_mamba_ping_pong_other_idx = lambda idx: 1 - idx
         with (
             get_context().override_server_args(
                 mamba_radix_cache_strategy="extra_buffer",

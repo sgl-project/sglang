@@ -375,6 +375,9 @@ def _resolve_fused_scale(
 class ReqToTokenPool:
     """A memory pool that maps a request to its token locations."""
 
+    # note (wirybeaver): fixed before graph capture; the caller suppresses tail inserts.
+    mamba_cache_prompt_only: bool = False
+
     enable_mamba_extra_buffer_lazy: bool = False
     # Extra pre-allocation headroom (reserved for in-transfer decode requests).
     # 0 for a plain pool; the decode-flavored pool (DecodeReqToTokenPool) sets a

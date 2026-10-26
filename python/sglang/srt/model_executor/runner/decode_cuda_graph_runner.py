@@ -457,6 +457,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         enable_mamba_track = (
             get_exec().mamba.enable_mamba_extra_buffer
+            and not self.model_runner.req_to_token_pool.mamba_cache_prompt_only
             and self.model_runner.spec_algorithm.is_none()
         )
 

@@ -155,6 +155,8 @@ class TritonAttnBackend(AttentionBackend):
     # kv_indptr/qo_indptr are preallocated at (req pool + 1); an extend batch
     # can never carry more seqs than the pool.
     extend_dummy_seqs_capped_by_req_pool: bool = True
+    # note (wirybeaver): unify prefill without changing decode splitting.
+    use_unified_prefill: bool = False
 
     def __init__(
         self,
@@ -1795,7 +1797,7 @@ class TritonAttnBackend(AttentionBackend):
             )
 
         # Deterministic mode: use unified 1-stage kernel
-        if self.enable_deterministic:
+        if self.enable_deterministic or self.use_unified_prefill:
             return self._forward_extend_unified(
                 q,
                 o,

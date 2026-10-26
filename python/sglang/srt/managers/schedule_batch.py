@@ -3822,7 +3822,18 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 self.req_pool_indices_cpu,
             )
 
-        if get_exec().mamba.enable_mamba_extra_buffer:
+        if (
+            get_exec().mamba.enable_mamba_extra_buffer
+            and self.req_to_token_pool.mamba_cache_prompt_only
+        ):
+            self.mamba_track_indices = None
+            self.mamba_track_buffer_indices = None
+            self.mamba_track_mask = None
+            self.mamba_track_seqlens = None
+            self.mamba_track_mask_cpu = None
+            self.mamba_track_mask_next_cpu = None
+            self.mamba_decode_batch_idx_cpu = None
+        elif get_exec().mamba.enable_mamba_extra_buffer:
             mamba_track_interval = mamba_track_grid(self.tree_cache.page_size)
 
             if len(self.reqs) == 0:
