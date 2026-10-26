@@ -104,7 +104,9 @@ def reasons_for(cfg, arch=ARCH, isa="gfx950", model_type="fake"):
         hf_config=SimpleNamespace(architectures=[arch], model_type=model_type),
         dtype="bfloat16",
     )
-    return monokernel_disable_reasons(cfg=cfg, model_config=model_config, isa=isa)
+    return monokernel_disable_reasons(
+        cfg=cfg, backend=BACKEND, model_config=model_config, isa=isa
+    )
 
 
 def batch(mode, bs, rows):
@@ -462,6 +464,28 @@ class TestMonokernelFramework(CustomTestCase):
                 ("target_verify", 8, 48),
             ],
         )
+
+    def test_the_nvidia_megakernel_flag_selects_the_msa_backend(self):
+        for field, backend in (
+            ("enable_amd_monokernel", BACKEND),
+            ("enable_nvidia_megakernel", binding.MSA_BACKEND),
+        ):
+            with self.subTest(field=field):
+                publish(ServerArgs(model_path="dummy", **{field: True}), role="test")
+                self.assertEqual(binding._backend(), backend)
+                reset_context()
+        with patch.dict(registry._REGISTRY, {binding.MSA_BACKEND: {ARCH: "x:y"}}):
+            self.assertTrue(binding.msa_serves([ARCH]))
+            self.assertFalse(binding.msa_serves(["OtherForCausalLM"]))
+
+    def test_the_legacy_spec_module_registers_into_the_same_registry(self):
+        """The MSA plugin pinned in docker/Dockerfile.cu134 imports
+        sglang.srt.monokernels.spec; its specs must reach the registry the binding reads."""
+        from sglang.srt.monokernels import spec as legacy
+
+        self.assertIs(legacy.register, registry.register)
+        self.assertIs(legacy.MonoSpec, MonoSpec)
+        self.assertEqual(legacy.MONOKERNEL_API_VERSION, registry.MONOKERNEL_API_VERSION)
 
     def test_deadlines_stay_below_the_watchdog(self):
         self.assertEqual(deadline_s(None), MAX_DEADLINE_S)
