@@ -582,6 +582,9 @@ class HiCacheStorageFailureInjector(HiCacheStorage):
     def register_mem_host_pool_v2(self, host_pool: HostKVCache, host_pool_name):
         self._backend.register_mem_host_pool_v2(host_pool, host_pool_name)
 
+    def on_host_pools_registered(self) -> None:
+        self._backend.on_host_pools_registered()
+
     def batch_exists_v2(
         self,
         keys: List[str],
