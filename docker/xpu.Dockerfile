@@ -108,4 +108,19 @@ ARG TORCH_MEMORY_SAVER_REF=a5c99f11b18ebb8e9fda71a68812e476ae49e417
 RUN TMS_PLATFORM=xpu pip install --no-cache-dir --no-build-isolation \
     git+https://github.com/fzyzcjy/torch_memory_saver.git@${TORCH_MEMORY_SAVER_REF}
 
+# Temporary: XPU graph with TP>1 requires these, newer than torch 2.14.0+xpu pins; drop once torch pins them.
+RUN pip install --no-cache-dir \
+      "intel-cmplr-lib-rt==2026.1.1" \
+      "intel-cmplr-lib-ur==2026.1.1" \
+      "intel-cmplr-lic-rt==2026.1.1" \
+      "intel-sycl-rt==2026.1.1" \
+      "oneccl-devel==2022.1.2; platform_system == 'Linux' and platform_machine == 'x86_64'" \
+      "oneccl==2022.1.2; platform_system == 'Linux' and platform_machine == 'x86_64'" \
+      "dpcpp-cpp-rt==2026.1.1" \
+      "intel-opencl-rt==2026.1.1" \
+      "intel-openmp==2026.1.1" \
+      "intel-pti==1.1.0"
+# The base image's system oneAPI (2026.1.0) is on LD_LIBRARY_PATH; load the venv's runtime first.
+ENV LD_LIBRARY_PATH="/opt/venv/lib:${LD_LIBRARY_PATH}"
+
 CMD ["bash"]

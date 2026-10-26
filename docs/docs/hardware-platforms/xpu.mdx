@@ -50,6 +50,19 @@ cp pyproject_xpu.toml pyproject.toml
 # Install SGLang dependent libs, and build SGLang main package
 pip install --upgrade pip setuptools
 pip install -v ".[dev,diffusion]" --extra-index-url https://download.pytorch.org/whl/xpu
+
+# Needed for XPU graph with --tp > 1; pip's warning about torch's pins is expected
+pip install \
+      "intel-cmplr-lib-rt==2026.1.1" \
+      "intel-cmplr-lib-ur==2026.1.1" \
+      "intel-cmplr-lic-rt==2026.1.1" \
+      "intel-sycl-rt==2026.1.1" \
+      "oneccl-devel==2022.1.2; platform_system == 'Linux' and platform_machine == 'x86_64'" \
+      "oneccl==2022.1.2; platform_system == 'Linux' and platform_machine == 'x86_64'" \
+      "dpcpp-cpp-rt==2026.1.1" \
+      "intel-opencl-rt==2026.1.1" \
+      "intel-openmp==2026.1.1" \
+      "intel-pti==1.1.0"
 ```
 
 ### Install Using Docker
@@ -178,6 +191,9 @@ SGLang enables XPU graph capture to reduce per-step kernel-launch overhead.
 |---|---|---|---|
 | Decode | `full` | One `torch.xpu.XPUGraph` per batch size, captured on startup | **Off** (opt-in) |
 | Prefill | `breakable` | Segmented `torch.xpu.XPUGraph` capture/replay (no `torch.compile`); eager break points at attention / MoE boundaries | **Off** (opt-in) |
+
+> **Note:** XPU graphs with `--tp` > 1 require oneAPI 2026.1.1, oneCCL 2022.1.2 and PTI 1.1.0. The Docker image
+> includes them; for a source install, see [Install From Source](#install-from-source).
 
 ### Enable Decode Graph
 
