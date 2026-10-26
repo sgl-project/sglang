@@ -491,6 +491,7 @@ POSITIONAL_FIELD_ORDER = (
     "enable_draft_weights_cpu_backup",
     "enable_weightbridge_receiver",
     "weightbridge_pause_mode",
+    "weightbridge_hub_addr",
     "enable_custom_logit_processor",
     "enable_return_hidden_states",
     "return_hidden_states_mode",

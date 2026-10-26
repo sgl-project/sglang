@@ -75,6 +75,11 @@ class ExecFeatures(msgspec.Struct):
         "How a WeightBridge update clears in-flight requests before writing weights: 'retract' requeues them "
         "to recompute under the new weights, 'abort' finishes them with an abort.",
     ] = "retract"
+    weightbridge_hub_addr: A[
+        Optional[str],
+        "tcp://host:port where the engine's global rank 0 hosts the WeightBridge control hub; required when "
+        "the engine spans several nodes (single-node engines use a local IPC hub).",
+    ] = None
     enable_custom_logit_processor: A[
         bool,
         "Enable users to pass custom logit processors to the server (disabled by default for security)",

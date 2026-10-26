@@ -2118,6 +2118,9 @@ class Scheduler(
         The one place a new per-iteration input source belongs; the return
         value exists for the pipeline stages that relay requests onward.
         """
+        # Before any receive: PP stages > 0 block below on the previous stage's requests, so every
+        # rank must reach WeightBridge's per-pass hub barrier first.
+        self.maybe_apply_weightbridge_update()
         local_reqs = []
         # Avoid re-enqueuing timeout aborts while dispatch is stopped at a pause.
         if (
@@ -2145,7 +2148,6 @@ class Scheduler(
             # Count successful receive/broadcast time as active; empty polls stay idle.
             self.metrics_reporter.record_scheduler_active(recv_start_ns)
         self.process_input_requests(recv_reqs)
-        self.maybe_apply_weightbridge_update()
         return recv_reqs
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_REQUESTS)
@@ -2316,12 +2318,18 @@ class Scheduler(
         self.weightbridge_receiver = None
         if not get_exec().features.enable_weightbridge_receiver:
             return
+        parallel = get_parallel()
         self.weightbridge_receiver = WeightBridgeReceiver(
             model=self.tp_worker.model_runner.model,
             hf_checkpoint=get_model().model_path,
             engine_port=get_serving().port,
-            tp_rank=get_parallel().tp_rank,
-            tp_size=get_parallel().tp_size,
+            rank=parallel.pp_rank * parallel.tp_size + parallel.tp_rank,
+            num_workers=parallel.pp_size * parallel.tp_size,
+            hub_addr=(
+                get_exec().features.weightbridge_hub_addr
+                if self.server_args.nnodes > 1
+                else None
+            ),
         )
 
     def init_lora_drainer(self) -> None:
@@ -5454,8 +5462,9 @@ class Scheduler(
         """Poll WeightBridge on every loop pass; apply an update under the pause-session semantics.
 
         The session matches an HTTP-driven update: pause (drain + clear requests), write weights,
-        flush the cache, bump the weight version, resume. Every TP rank reaches this point in
-        lockstep because ingest_requests broadcasts across the TP group on every pass.
+        flush the cache, bump the weight version, resume. Every TP and PP rank calls this once per
+        loop pass, before receiving that pass's requests; WeightBridge's hub makes each call a barrier
+        across the engine, so all ranks act on rank 0's decision at the same pass.
         """
         if self.weightbridge_receiver is None:
             return
@@ -5472,8 +5481,13 @@ class Scheduler(
         self.weightbridge_receiver.flush_profile_outputs()
 
     def _quiesce_for_weightbridge_update(self) -> None:
-        # Retract drains the overlap batch still on the GPU and frees every running request's KV.
-        self.pause_generation(PauseGenerationReqInput(mode="retract"))
+        if get_parallel().pp_size > 1:
+            # Retire the micro-batches in flight across stages, then requeue their requests.
+            self._engine_paused = True
+            self.pp_retract_all_for_weight_update(mb_id=self._pp_cur_mb_id)
+        else:
+            # Retract drains the overlap batch still on the GPU and frees every running request's KV.
+            self.pause_generation(PauseGenerationReqInput(mode="retract"))
         if get_exec().features.weightbridge_pause_mode == "abort":
             self.abort_request(AbortReq(abort_all=True))
         # No kernel launched under the old weights may still be reading them.

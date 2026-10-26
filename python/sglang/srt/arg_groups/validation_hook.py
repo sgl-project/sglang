@@ -109,14 +109,22 @@ def check_weightbridge_receiver_args(server_args: Any) -> None:
     cfg = resolving_view(server_args)
     if not cfg.enable_weightbridge_receiver:
         return
-    # The receiver counts one worker per TP rank under a single-node rank0 hub.
-    if cfg.pp_size != 1 or cfg.dp_size != 1 or cfg.nnodes != 1:
+    # One receiver per TP x PP rank; global rank 0 decides and relays every update.
+    if cfg.dp_size != 1 or cfg.attn_dp_size > 1:
         raise ValueError(
-            "--enable-weightbridge-receiver supports a single-node engine with pp_size == dp_size == 1"
+            "--enable-weightbridge-receiver does not support data parallelism"
         )
-    if cfg.disaggregation_mode != "null":
+    if cfg.disaggregation_mode != "null" or cfg.enable_pdmux:
         raise ValueError(
             "--enable-weightbridge-receiver does not support PD disaggregation"
+        )
+    if cfg.pp_size > 1 and cfg.speculative_algorithm is not None:
+        raise ValueError(
+            "--enable-weightbridge-receiver does not support speculative decoding with pp_size > 1"
+        )
+    if cfg.nnodes > 1 and not cfg.weightbridge_hub_addr:
+        raise ValueError(
+            "--enable-weightbridge-receiver on a multi-node engine needs --weightbridge-hub-addr"
         )
 
 

@@ -17,7 +17,12 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.overlap_utils import RelayPayload
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ScheduleBatch
+from sglang.srt.managers.schedule_batch import (
+    FINISH_ABORT,
+    Req,
+    ScheduleBatch,
+    retract_all,
+)
 from sglang.srt.managers.utils import (
     GenerationBatchResult,
     allocate_distinct_stream,
@@ -96,6 +101,8 @@ class SchedulerPPMixin:
     # ran init_pp_loop_state (plain TP, unit-test doubles) read False;
     # init_pp_loop_state overwrites it per instance.
     _pp_spec_relay: bool = False
+    # Micro-batch slot event_loop_pp is about to run; read by the weight-update quiesce.
+    _pp_cur_mb_id: int = 0
 
     @DynamicGradMode()
     def event_loop_pp(self: Scheduler):
@@ -128,6 +135,7 @@ class SchedulerPPMixin:
             for mb_id in range(self.pp_loop_size):
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = self.last_mbs[mb_id]
+                self._pp_cur_mb_id = mb_id
                 next_first_rank_mb_id = (
                     mb_id + get_parallel().pp_size
                 ) % self.pp_loop_size
@@ -554,6 +562,73 @@ class SchedulerPPMixin:
                 self._sched_idled = True
                 if queue_size == 0:
                     self.on_idle()
+
+    def pp_retract_all_for_weight_update(self: Scheduler, mb_id: int) -> None:
+        """Empty the pipeline at the start of slot ``mb_id`` and requeue every live request.
+
+        Every PP/TP rank calls this at the same loop position. It first runs one full round of
+        loop iterations that launch nothing: each launched micro-batch's outputs still travel the
+        stage ring and are processed exactly as in an idle pass, so every P2P send keeps its
+        matching receive. The requests still alive afterwards are retracted (KV freed) into the
+        waiting queue, and the micro-batch state is reset.
+        """
+        for step in range(self.pp_loop_size):
+            self._pp_finish_in_flight_slot((mb_id + step) % self.pp_loop_size)
+        live_reqs = self._pp_take_live_reqs()
+        retract_all(
+            reqs=live_reqs,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            tree_cache=self.tree_cache,
+            hisparse_coordinator=self.hisparse_coordinator,
+            offload_kv=False,
+        )
+        for req in live_reqs:
+            self._add_request_to_queue(req)
+        self.running_batch = self.running_mbs[mb_id]
+        self.last_batch = None
+        self.cur_batch_for_debug = None
+
+    def _pp_finish_in_flight_slot(self: Scheduler, mb_id: int) -> None:
+        """One event_loop_pp iteration with no new batch: exchange and process outputs only."""
+        self.running_batch = self.running_mbs[mb_id]
+        self.last_batch = self.last_mbs[mb_id]
+        # This slot's previous batch was processed one iteration ago (as next_mb_id).
+        self.mbs[mb_id] = None
+        self.mb_metadata[mb_id] = None
+        next_first_rank_mb_id = (mb_id + get_parallel().pp_size) % self.pp_loop_size
+        next_mb_id = (mb_id + 1) % self.pp_loop_size
+        self._pp_commit_proxy_send_work()
+        next_pp_outputs, next_batch_result, d2h_event = (
+            self._pp_commit_send_output_work_and_preprocess_output_tensors(
+                next_first_rank_mb_id,
+                next_mb_id,
+            )
+        )
+        if self.mbs[next_mb_id] is not None:
+            d2h_event.synchronize()
+            self._pp_process_batch_result(self.mbs[next_mb_id], next_batch_result)
+            self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
+        self.pp_outputs = next_pp_outputs
+
+    def _pp_take_live_reqs(self: Scheduler) -> List[Req]:
+        """Unfinished requests held by any micro-batch slot or the chunked prefill; clears those slots."""
+        live: Dict[int, Req] = {}
+        for batch in [*self.running_mbs, *self.last_mbs]:
+            for req in batch.reqs if batch is not None else ():
+                if not req.finished():
+                    live[id(req)] = req
+        if self.chunked_req is not None and not self.chunked_req.finished():
+            live[id(self.chunked_req)] = self.chunked_req
+        self.chunked_req = None
+        self.mbs = [None] * self.pp_loop_size
+        self.last_mbs = [None] * self.pp_loop_size
+        self.mb_metadata = [None] * self.pp_loop_size
+        self.running_mbs = [
+            ScheduleBatch(reqs=[], batch_is_full=False)
+            for _ in range(self.pp_loop_size)
+        ]
+        return list(live.values())
 
     def init_pp_loop_state(self: Scheduler):
         self.pp_loop_size: int = (
