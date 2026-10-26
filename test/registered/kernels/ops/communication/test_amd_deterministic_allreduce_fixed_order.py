@@ -8,6 +8,7 @@ CUDA graphs, with data whose float32 sum depends on the order of the ranks.
 import multiprocessing as mp
 import os
 import socket
+import sys
 import traceback
 
 import pytest
@@ -125,3 +126,7 @@ def test_fixed_rank_order_at_every_size(world_size):
         found.append(failures.get())
     assert all(p.exitcode == 0 for p in procs), found
     assert not found, "\n".join(found)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
