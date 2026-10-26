@@ -237,6 +237,19 @@ class TestCreateGrammarBackend(unittest.TestCase):
         self.assertEqual(received["vocab_size"], 50000)
         self.assertEqual(received["eos_token_ids"], {0, 2})
 
+    def test_custom_backend_receives_tokenizer_stop_tokens(self):
+        received = {}
+
+        def init_fn(server_args, tokenizer, vocab_size, eos_token_ids):
+            received["eos_token_ids"] = eos_token_ids
+            return MagicMock()
+
+        register_grammar_backend("capture_stop", init_fn)
+        args = self._make_server_args("capture_stop")
+        tokenizer = SimpleNamespace(eos_token_id=1, additional_stop_token_ids={3})
+        create_grammar_backend(args, tokenizer, 50000, {0, 2})
+        self.assertEqual(received["eos_token_ids"], {0, 1, 2, 3})
+
     def test_custom_backend_skips_reasoner_wrapping(self):
         """Custom registered backends return directly, bypassing reasoner wrapping."""
         mock_inner = MagicMock(spec=BaseGrammarBackend)
@@ -423,7 +436,7 @@ class TestGrammarStopTokenIds(unittest.TestCase):
     def test_includes_every_scheduler_stop_token(self):
         tokenizer = SimpleNamespace(eos_token_id=163585, additional_stop_token_ids={7})
         self.assertEqual(
-            grammar_stop_token_ids(tokenizer, {163586}), [7, 163585, 163586]
+            grammar_stop_token_ids(tokenizer, {163586}), {7, 163585, 163586}
         )
         self.assertIsNone(grammar_stop_token_ids(SimpleNamespace(), None))
 
