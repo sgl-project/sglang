@@ -40,6 +40,7 @@ __all__ = [
     "ancestor_width_for",
     "gather_tree_blocks",
     "draft_ancestors",
+    "draft_step_ancestor_positions",
     "merge_tree_sparse_indices",
 ]
 
@@ -257,3 +258,101 @@ def merge_tree_sparse_indices(
         rel < 0, anc_val, torch.where(rel < prefix_width, pref_val, neg_one)
     )
     return merged.to(torch.int32)
+
+
+def draft_step_ancestor_positions(
+    paths: Optional[torch.Tensor],
+    parent_slot: Optional[torch.Tensor],
+    prefix_len: torch.Tensor,
+    step: int,
+    topk: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Ancestor paths and absolute positions of one draft-decode step.
+
+    Draft-stage counterpart of the verify tree: the draft keeps a fixed width,
+    so the tree is ``topk`` nodes per level, and level ``d`` occupies KV
+    positions ``prefix + d * topk + slot``. A step-``i`` candidate therefore sees
+    one node per earlier level (its own chain) plus itself: ``i + 1`` entries.
+    Its parent chain terminates inside the prefix (the already-committed token
+    the first level hangs off), which the prefix top-k covers, not this list.
+
+    Args:
+        paths: ``[bs, topk, step - 1]`` request-local slot ids of each previous
+            level's ancestors, as returned by the previous call. ``None`` at
+            step 0.
+        parent_slot: ``[bs, topk]`` slot (``0 <= s < topk``) of this level's
+            parent within the previous level. ``None`` at step 0.
+        prefix_len: ``[bs]`` committed KV length, **including** the parent token
+            the first level hangs off.
+        step: 0-based draft step.
+        topk: tree width (the previous ``speculative_topk``).
+
+    Returns:
+        ``(paths, positions)`` int32: ``paths`` is ``[bs, topk, step]`` (one
+        ancestor slot per level ``0 .. step - 1``), ``positions`` is
+        ``[bs, topk, step + 1]`` (those ancestors followed by self). Positions
+        strictly ascend and no slot repeats inside a row.
+
+    Raises:
+        ValueError: bad ``step``/``topk``, a parent outside ``[0, topk)``, a
+            negative prefix length, or shape/level mismatches.
+    """
+    step = int(step)
+    topk = int(topk)
+    if step < 0:
+        raise ValueError(f"draft step must be >= 0, got {step}")
+    if topk < 1:
+        raise ValueError(f"topk must be >= 1, got {topk}")
+    if prefix_len.dim() != 1:
+        raise ValueError(f"prefix_len must be 1-D, got {prefix_len.shape}")
+    if bool((prefix_len < 0).any()):
+        raise ValueError("prefix_len must be non-negative")
+
+    bs = int(prefix_len.numel())
+    device = prefix_len.device
+    prefix = prefix_len.to(torch.int64).to(device).view(bs, 1)
+    slots = torch.arange(topk, device=device, dtype=torch.int64).view(1, topk)
+
+    if step == 0:
+        if parent_slot is not None and int(parent_slot.numel()):
+            raise ValueError("step 0 has no parent level")
+        if paths is not None and int(paths.numel()):
+            raise ValueError("step 0 has no earlier level")
+        self_pos = prefix + slots  # 0 * topk collapses
+        return (
+            torch.empty((bs, topk, 0), dtype=torch.int32, device=device),
+            self_pos.unsqueeze(-1).to(torch.int32),
+        )
+
+    if parent_slot is None:
+        raise ValueError(f"step {step} needs parent_slot")
+    if tuple(parent_slot.shape) != (bs, topk):
+        raise ValueError(
+            f"parent_slot must be [bs={bs}, topk={topk}], got "
+            f"{tuple(parent_slot.shape)}"
+        )
+    if paths is None or tuple(paths.shape) != (bs, topk, step - 1):
+        raise ValueError(
+            f"paths must be [bs={bs}, topk={topk}, step-1={step - 1}], got "
+            f"{None if paths is None else tuple(paths.shape)}"
+        )
+
+    parent = parent_slot.to(torch.int64).to(device)
+    if bool((parent < 0).any()) or bool((parent >= topk).any()):
+        raise ValueError(
+            f"parent_slot must be in [0, {topk}), got "
+            f"[{int(parent.min())}, {int(parent.max())}]"
+        )
+
+    paths = paths.to(torch.int64).to(device)
+    # One level down: this row's ancestors = its parent's ancestors + the parent.
+    gathered = torch.gather(
+        paths, 1, parent.unsqueeze(-1).expand(bs, topk, step - 1)
+    )
+    new_paths = torch.cat([gathered, parent.unsqueeze(-1)], dim=-1)
+
+    levels = torch.arange(step, device=device, dtype=torch.int64).view(1, 1, step)
+    abs_ancestors = prefix.unsqueeze(-1) + levels * topk + new_paths
+    self_pos = prefix + step * topk + slots
+    positions = torch.cat([abs_ancestors, self_pos.unsqueeze(-1)], dim=-1)
+    return new_paths.to(torch.int32), positions.to(torch.int32)

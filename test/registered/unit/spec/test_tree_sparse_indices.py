@@ -31,6 +31,7 @@ try:  # normal path (Linux CI, sglang installed / PYTHONPATH=python)
     from sglang.srt.hardware_backend.npu.attention.tree_sparse_indices import (
         ancestor_width_for,
         draft_ancestors,
+        draft_step_ancestor_positions,
         gather_tree_blocks,
         merge_tree_sparse_indices,
     )
@@ -50,6 +51,7 @@ except Exception:  # Windows dev boxes cannot import sglang (stdlib `resource`)
     _spec.loader.exec_module(_mod)
     ancestor_width_for = _mod.ancestor_width_for
     draft_ancestors = _mod.draft_ancestors
+    draft_step_ancestor_positions = _mod.draft_step_ancestor_positions
     gather_tree_blocks = _mod.gather_tree_blocks
     merge_tree_sparse_indices = _mod.merge_tree_sparse_indices
 
@@ -402,6 +404,114 @@ class TestMergeTreeSparseIndices(unittest.TestCase):
                     len(valid), len(expected) + prefix.shape[1], "prefix intact"
                 )
                 self.assertTrue(all(v < prefix_len for v in valid[len(expected):]))
+
+
+class TestDraftStepAncestorPositions(unittest.TestCase):
+    """Draft-stage ancestor paths (D3), pure geometry, no backend."""
+
+    def test_step0_has_only_self(self):
+        paths, pos = draft_step_ancestor_positions(
+            paths=None,
+            parent_slot=None,
+            prefix_len=torch.tensor([10]),
+            step=0,
+            topk=2,
+        )
+
+        self.assertEqual(tuple(paths.shape), (1, 2, 0))
+        self.assertEqual(tuple(pos.shape), (1, 2, 1))
+        self.assertEqual(pos.tolist(), [[[10], [11]]])
+
+    def test_step1_links_to_level0(self):
+        paths, pos = draft_step_ancestor_positions(
+            paths=torch.zeros((1, 2, 0), dtype=torch.int32),
+            parent_slot=torch.tensor([[0, 1]]),
+            prefix_len=torch.tensor([10]),
+            step=1,
+            topk=2,
+        )
+
+        self.assertEqual(paths.tolist(), [[[0], [1]]])
+        # level-0 ancestor, then self (level 1).
+        self.assertEqual(pos.tolist(), [[[10, 12], [11, 13]]])
+
+    def test_step2_walks_the_chain(self):
+        paths, pos = draft_step_ancestor_positions(
+            paths=torch.tensor([[[0], [1]]], dtype=torch.int32),
+            parent_slot=torch.tensor([[1, 0]]),
+            prefix_len=torch.tensor([10]),
+            step=2,
+            topk=2,
+        )
+
+        # Candidate 0's parent is level-1 slot 1, whose own parent is level-0 slot 1.
+        self.assertEqual(paths.tolist(), [[[1, 1], [0, 0]]])
+        self.assertEqual(pos.tolist(), [[[11, 13, 14], [10, 12, 15]]])
+
+    def test_per_request_prefix_len(self):
+        _, pos = draft_step_ancestor_positions(
+            paths=torch.zeros((2, 2, 0), dtype=torch.int32),
+            parent_slot=torch.tensor([[0, 1], [1, 0]]),
+            prefix_len=torch.tensor([10, 20]),
+            step=1,
+            topk=2,
+        )
+
+        self.assertEqual(pos[0].tolist(), [[10, 12], [11, 13]])
+        self.assertEqual(pos[1].tolist(), [[21, 22], [20, 23]])
+
+    def test_width_is_step_plus_one_and_ascending(self):
+        torch.manual_seed(0)
+        topk, step_max, prefix = 3, 4, 17
+        paths, parent = None, None
+        for step in range(step_max):
+            if step > 0:
+                parent = torch.randint(0, topk, (1, topk), dtype=torch.int32)
+            paths, pos = draft_step_ancestor_positions(
+                paths=paths,
+                parent_slot=parent,
+                prefix_len=torch.tensor([prefix]),
+                step=step,
+                topk=topk,
+            )
+            self.assertEqual(tuple(pos.shape), (1, topk, step + 1))
+            for j in range(topk):
+                row = pos[0, j].tolist()
+                self.assertEqual(len(row), step + 1)
+                self.assertEqual(row, sorted(row), "positions must ascend")
+                self.assertEqual(len(set(row)), len(row), "no repeated slot")
+                self.assertEqual(row[-1], prefix + step * topk + j)
+                self.assertTrue(all(v < prefix + (step + 1) * topk for v in row))
+
+    def test_rejects_bad_parent_slot(self):
+        with self.assertRaises(ValueError):
+            draft_step_ancestor_positions(
+                paths=torch.zeros((1, 2, 0), dtype=torch.int32),
+                parent_slot=torch.tensor([[0, 4]]),
+                prefix_len=torch.tensor([10]),
+                step=1,
+                topk=2,
+            )
+
+    def test_rejects_parent_at_step0(self):
+        with self.assertRaises(ValueError):
+            draft_step_ancestor_positions(
+                paths=None,
+                parent_slot=torch.tensor([[0, 1]]),
+                prefix_len=torch.tensor([10]),
+                step=0,
+                topk=2,
+            )
+
+    def test_rejects_negative_prefix(self):
+        with self.assertRaises(ValueError):
+            draft_step_ancestor_positions(
+                paths=None,
+                parent_slot=None,
+                prefix_len=torch.tensor([-1]),
+                step=0,
+                topk=2,
+            )
 
 
 if __name__ == "__main__":
