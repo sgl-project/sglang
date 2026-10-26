@@ -116,6 +116,9 @@ class PipelineExecutor(ABC):
                 refresh=self._is_warmup_payload(payload),
             ):
                 yield
+        except Exception:
+            self.component_residency_manager.capture_failed_warmup_phase()
+            raise
         finally:
             self.finish_component_residency_request()
 
