@@ -49,7 +49,6 @@ class TestHostFreeDraftPrep(CustomTestCase):
     def test_every_other_setup_says_why(self):
         cases = {
             "not the DSpark draft runner": dict(is_dspark_draft=False),
-            "trtllm-gen attention": dict(trtllm_attn=True),
             "online c128 MTP": dict(
                 online_c128_mtp=SimpleNamespace(enabled=lambda: True)
             ),
