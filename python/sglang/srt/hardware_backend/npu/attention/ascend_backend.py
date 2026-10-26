@@ -3536,6 +3536,17 @@ class AscendAttnMultiStepDraftBackend:
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
 
+        # Tree drafting on a DSA model: the indexer needs each candidate's own
+        # ancestors, not its siblings. Installed only here, so the shared draft
+        # loop's hook stays inert on every other platform and algorithm.
+        self.tree_sparse_state = None
+        if topk > 1 and is_deepseek_dsa(model_runner.model_config.hf_config):
+            from sglang.srt.hardware_backend.npu.attention.tree_sparse_indices import (
+                DraftTreeSparseState,
+            )
+
+            self.tree_sparse_state = DraftTreeSparseState(topk, speculative_num_steps)
+
         self.attn_backends = []
         for step_id in range(self.speculative_num_steps):
             self.attn_backends.append(

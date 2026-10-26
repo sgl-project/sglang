@@ -787,6 +787,14 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 ):
                     out_cache_loc = out_cache_loc.contiguous()
                 forward_batch.out_cache_loc = out_cache_loc[i]
+                # NPU tree drafting: inert unless the draft backend installed a
+                # tree-sparse state (DSA model with topk > 1); all of the logic
+                # lives in the NPU attention package.
+                tree_sparse = getattr(
+                    self.draft_attn_backend, "tree_sparse_state", None
+                )
+                if tree_sparse is not None:
+                    tree_sparse.begin_step(i, forward_batch, parents_list)
                 spec_info.hidden_states = hidden_states
 
                 canary_index_ctx = (

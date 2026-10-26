@@ -5,6 +5,14 @@ from functools import lru_cache
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.npu.attention.tree_sparse_indices import (
+    DRAFT_TREE_ANCESTORS_ATTR,
+    DRAFT_TREE_PREFIX_ATTR,
+    ancestor_width_for,
+    draft_ancestors,
+    gather_tree_blocks,
+    merge_tree_sparse_indices,
+)
 from sglang.srt.layers.cp.utils import cp_gather_full_sequence_states
 from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -323,6 +331,22 @@ class DSANPUIndexerMixin:
                     use_quant_indexer=use_quant_indexer,
                 )
 
+            draft_tree_ancestors = getattr(
+                forward_batch, DRAFT_TREE_ANCESTORS_ATTR, None
+            )
+            if draft_tree_ancestors is not None:
+                return self._build_draft_tree_topk_indices(
+                    q=q,
+                    weights=weights,
+                    pool=pool,
+                    layer_id=layer_id,
+                    block_table=block_table,
+                    actual_seq_lengths_q=actual_seq_lengths_q,
+                    forward_batch=forward_batch,
+                    ancestors=draft_tree_ancestors,
+                    use_quant_indexer=use_quant_indexer,
+                )
+
             if use_quant_indexer:
                 query, query_scale = _quantize_npu_indexer_activation(
                     q.view(-1, self.n_heads, self.head_dim),
@@ -447,12 +471,6 @@ class DSANPUIndexerMixin:
         ``-1`` terminates the scan) and why no position may repeat (SFA does
         not deduplicate, so a repeated position double-counts in the softmax).
         """
-        from sglang.srt.hardware_backend.npu.attention.tree_sparse_indices import (
-            ancestor_width_for,
-            draft_ancestors,
-            gather_tree_blocks,
-            merge_tree_sparse_indices,
-        )
         from sglang.srt.runtime_context import get_spec
 
         spec = forward_batch.spec_info
@@ -534,6 +552,74 @@ class DSANPUIndexerMixin:
             n,
             topk,
         )
+
+    def _build_draft_tree_topk_indices(
+        self,
+        *,
+        q: torch.Tensor,
+        weights: torch.Tensor,
+        pool,
+        layer_id: int,
+        block_table: torch.Tensor,
+        actual_seq_lengths_q: torch.Tensor,
+        forward_batch: ForwardBatch,
+        ancestors: torch.Tensor,
+        use_quant_indexer: bool,
+    ) -> torch.Tensor:
+        """Sparse indices for one draft-decode step of a DSA model (topk > 1).
+
+        ``ancestors`` is built by the draft loop and already holds absolute KV
+        positions, ordered ``[.. ancestors .., self]``, one row per candidate.
+        Every candidate of a level has the same number of ancestors, so unlike
+        verify there is no per-row padding: the prefix block simply follows and
+        the row is exactly ``index_topk`` wide.
+        """
+        prefix_len = getattr(forward_batch, DRAFT_TREE_PREFIX_ATTR, None)
+        if prefix_len is None:
+            raise RuntimeError(
+                "draft tree sparse indices need forward_batch."
+                f"{DRAFT_TREE_PREFIX_ATTR}"
+            )
+
+        topk = int(self.index_topk)
+        rows = int(q.shape[0])
+        if int(ancestors.shape[0]) != rows:
+            raise RuntimeError(
+                f"draft tree ancestors have {int(ancestors.shape[0])} rows, "
+                f"expected one per query ({rows})"
+            )
+        anc = ancestors.reshape(rows, -1).to(torch.int32)
+        ancestor_width = int(anc.shape[1])
+        prefix_width = topk - ancestor_width
+        if prefix_width <= 0:
+            raise ValueError(
+                f"index_topk={topk} is too small for "
+                f"ancestor_width={ancestor_width}"
+            )
+
+        prefix_idx = self._run_lightning_indexer(
+            q=q,
+            weights=weights,
+            pool=pool,
+            layer_id=layer_id,
+            block_table=block_table,
+            actual_seq_lengths_q=actual_seq_lengths_q,
+            actual_seq_lengths_key=prefix_len,
+            sparse_count=prefix_width,
+            use_quant_indexer=use_quant_indexer,
+            sparse_mode=0,
+        )
+        if int(prefix_idx.shape[0]) != rows:
+            raise RuntimeError(
+                f"prefix indexer returned {int(prefix_idx.shape[0])} rows, "
+                f"expected {rows}"
+            )
+        if int(prefix_idx.shape[1]) != prefix_width:
+            raise RuntimeError(
+                f"prefix indexer returned width {int(prefix_idx.shape[1])}, "
+                f"expected {prefix_width}"
+            )
+        return torch.cat([anc, prefix_idx.to(torch.int32)], dim=-1)
 
     def do_npu_cp_balance_indexer(
         self,

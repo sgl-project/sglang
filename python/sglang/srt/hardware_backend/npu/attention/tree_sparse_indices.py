@@ -42,6 +42,10 @@ __all__ = [
     "draft_ancestors",
     "draft_step_ancestor_positions",
     "merge_tree_sparse_indices",
+    "parent_slots_from_parents_list",
+    "DraftTreeSparseState",
+    "DRAFT_TREE_ANCESTORS_ATTR",
+    "DRAFT_TREE_PREFIX_ATTR",
 ]
 
 
@@ -266,6 +270,7 @@ def draft_step_ancestor_positions(
     prefix_len: torch.Tensor,
     step: int,
     topk: int,
+    check: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Ancestor paths and absolute positions of one draft-decode step.
 
@@ -286,6 +291,9 @@ def draft_step_ancestor_positions(
             the first level hangs off.
         step: 0-based draft step.
         topk: tree width (the previous ``speculative_topk``).
+        check: validate device values (parent range, prefix sign). Off while the
+            draft is under graph capture, where a host read is illegal; the
+            structural checks (shape, step, topk) always run.
 
     Returns:
         ``(paths, positions)`` int32: ``paths`` is ``[bs, topk, step]`` (one
@@ -305,7 +313,7 @@ def draft_step_ancestor_positions(
         raise ValueError(f"topk must be >= 1, got {topk}")
     if prefix_len.dim() != 1:
         raise ValueError(f"prefix_len must be 1-D, got {prefix_len.shape}")
-    if bool((prefix_len < 0).any()):
+    if check and bool((prefix_len < 0).any()):
         raise ValueError("prefix_len must be non-negative")
 
     bs = int(prefix_len.numel())
@@ -338,7 +346,7 @@ def draft_step_ancestor_positions(
         )
 
     parent = parent_slot.to(torch.int64).to(device)
-    if bool((parent < 0).any()) or bool((parent >= topk).any()):
+    if check and (bool((parent < 0).any()) or bool((parent >= topk).any())):
         raise ValueError(
             f"parent_slot must be in [0, {topk}), got "
             f"[{int(parent.min())}, {int(parent.max())}]"
@@ -356,3 +364,143 @@ def draft_step_ancestor_positions(
     self_pos = prefix + step * topk + slots
     positions = torch.cat([abs_ancestors, self_pos.unsqueeze(-1)], dim=-1)
     return new_paths.to(torch.int32), positions.to(torch.int32)
+
+
+# Batch attributes the draft loop fills in and the NPU DSA indexer reads back.
+# Same idiom as `forward_batch.npu_indexer_sin_cos_cache`: platform-local state
+# that never enters a shared dataclass.
+DRAFT_TREE_ANCESTORS_ATTR = "npu_draft_tree_ancestors"
+DRAFT_TREE_PREFIX_ATTR = "npu_draft_tree_prefix_len"
+
+
+def parent_slots_from_parents_list(
+    parents: torch.Tensor,
+    step: int,
+    topk: int,
+    check: bool = True,
+) -> torch.Tensor:
+    """Recover one draft level's parent slot from ``select_top_k_tokens``.
+
+    ``_select_top_k_tokens_later`` scores the ``topk * topk`` (parent slot,
+    child) pairs and returns their flat index shifted by
+    ``topk**2 * (step - 1) + topk``; ``draft_forward`` keeps that row in
+    ``parents_list[step]``. Removing the shift recovers the flat score index,
+    and ``// topk`` is the parent's slot in the previous level (``% topk`` picks
+    the child). Inverting it here keeps the shared ``spec_utils`` untouched.
+
+    Args:
+        parents: ``[bs, topk]`` row of ``parents_list[step]`` (``step >= 1``).
+        step: draft step whose parents are described (``1 <= step``).
+        topk: tree width.
+        check: validate the recovered range (host read; off under capture).
+
+    Returns:
+        ``[bs, topk]`` int32 parent slots in ``[0, topk)``.
+    """
+    step = int(step)
+    topk = int(topk)
+    if topk < 1:
+        raise ValueError(f"topk must be >= 1, got {topk}")
+    if step < 1:
+        raise ValueError(f"parent slots need step >= 1, got {step}")
+    if parents.dim() != 2:
+        raise ValueError(f"parents must be 2-D, got {tuple(parents.shape)}")
+    if int(parents.shape[1]) != topk:
+        raise ValueError(
+            f"parents must have topk={topk} columns, got {tuple(parents.shape)}"
+        )
+
+    offset = topk * topk * (step - 1) + topk
+    flat = parents.to(torch.int64) - offset
+    if check and (bool((flat < 0).any()) or bool((flat >= topk * topk).any())):
+        raise ValueError(
+            f"parent row out of range after removing offset {offset}: "
+            f"[{int(flat.min())}, {int(flat.max())}]"
+        )
+    return (flat // topk).to(torch.int32)
+
+
+class DraftTreeSparseState:
+    """Per-step ancestor bookkeeping for the DSA draft tree (Ascend only).
+
+    One instance per draft worker. ``begin_step`` is called from the shared
+    draft loop through a three-line, attribute-guarded hook and leaves this
+    step's absolute ancestor positions on ``forward_batch`` for the NPU DSA
+    indexer. Nothing here runs on other platforms: the hook only fires when this
+    object is installed, and it is installed only for a DSA draft with
+    ``topk > 1``.
+
+    All tensor work is device-side so the sequence survives graph capture; the
+    only host reads are the optional value checks, which switch themselves off
+    while a stream capture is active.
+    """
+
+    def __init__(self, topk: int, num_steps: int, check: bool = True) -> None:
+        topk = int(topk)
+        num_steps = int(num_steps)
+        if topk < 1:
+            raise ValueError(f"topk must be >= 1, got {topk}")
+        if num_steps < 1:
+            raise ValueError(f"num_steps must be >= 1, got {num_steps}")
+        self.topk = topk
+        self.num_steps = num_steps
+        self.check = bool(check)
+        self._paths = None
+
+    def reset(self) -> None:
+        """Forget the previous iteration (step 0 resets implicitly)."""
+        self._paths = None
+
+    def _validating(self) -> bool:
+        # A host read inside a capture raises, so skip the optional checks there.
+        if not self.check:
+            return False
+        probe = getattr(
+            getattr(torch, "npu", None), "is_current_stream_capturing", None
+        )
+        if probe is None:
+            return True
+        try:
+            return not bool(probe())
+        except Exception:
+            return True
+
+    def begin_step(
+        self,
+        step: int,
+        forward_batch,
+        parents_list,
+    ) -> torch.Tensor:
+        """Compute this step's ancestor positions and stash them on the batch."""
+        step = int(step)
+        if not 0 <= step < self.num_steps:
+            raise ValueError(f"draft step {step} outside [0, {self.num_steps})")
+        if not parents_list or len(parents_list) <= step:
+            raise ValueError(
+                f"parents_list has {len(parents_list)} rows, need index {step}"
+            )
+
+        bs = int(parents_list[step].shape[0])
+        validate = self._validating()
+        if step == 0:
+            parent_slot = None
+        else:
+            parent_slot = parent_slots_from_parents_list(
+                parents_list[step], step, self.topk, check=validate
+            )
+
+        seq_lens = getattr(forward_batch, "seq_lens", None)
+        if seq_lens is None:
+            raise ValueError("draft tree sparse needs forward_batch.seq_lens")
+        if int(seq_lens.numel()) < bs:
+            raise ValueError(
+                f"seq_lens has {int(seq_lens.numel())} entries for {bs} requests"
+            )
+        prefix_len = seq_lens[:bs]
+
+        self._paths, positions = draft_step_ancestor_positions(
+            self._paths, parent_slot, prefix_len, step, self.topk, check=validate
+        )
+        setattr(forward_batch, DRAFT_TREE_ANCESTORS_ATTR, positions)
+        setattr(forward_batch, DRAFT_TREE_PREFIX_ATTR, prefix_len)
+        return positions

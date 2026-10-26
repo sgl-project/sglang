@@ -29,11 +29,15 @@ import torch
 
 try:  # normal path (Linux CI, sglang installed / PYTHONPATH=python)
     from sglang.srt.hardware_backend.npu.attention.tree_sparse_indices import (
+        DRAFT_TREE_ANCESTORS_ATTR,
+        DRAFT_TREE_PREFIX_ATTR,
+        DraftTreeSparseState,
         ancestor_width_for,
         draft_ancestors,
         draft_step_ancestor_positions,
         gather_tree_blocks,
         merge_tree_sparse_indices,
+        parent_slots_from_parents_list,
     )
 except Exception:  # Windows dev boxes cannot import sglang (stdlib `resource`)
     _MODULE = (
@@ -52,6 +56,10 @@ except Exception:  # Windows dev boxes cannot import sglang (stdlib `resource`)
     ancestor_width_for = _mod.ancestor_width_for
     draft_ancestors = _mod.draft_ancestors
     draft_step_ancestor_positions = _mod.draft_step_ancestor_positions
+    parent_slots_from_parents_list = _mod.parent_slots_from_parents_list
+    DraftTreeSparseState = _mod.DraftTreeSparseState
+    DRAFT_TREE_ANCESTORS_ATTR = _mod.DRAFT_TREE_ANCESTORS_ATTR
+    DRAFT_TREE_PREFIX_ATTR = _mod.DRAFT_TREE_PREFIX_ATTR
     gather_tree_blocks = _mod.gather_tree_blocks
     merge_tree_sparse_indices = _mod.merge_tree_sparse_indices
 
@@ -512,6 +520,92 @@ class TestDraftStepAncestorPositions(unittest.TestCase):
                 step=0,
                 topk=2,
             )
+
+
+class TestParentSlotsFromParentsList(unittest.TestCase):
+    def test_recovers_parent_slots_from_the_offset_row(self):
+        topk, step = 3, 2
+        offset = topk * topk * (step - 1) + topk  # 12
+        flat = torch.tensor([[0, 4, 2], [7, 1, 3]])
+
+        got = parent_slots_from_parents_list(flat + offset, step, topk)
+
+        self.assertEqual(got.tolist(), [[0, 1, 0], [2, 0, 1]])
+        self.assertEqual(got.dtype, torch.int32)
+
+    def test_step1_offset(self):
+        # step 1 -> offset = topk * topk * 0 + topk = 2
+        got = parent_slots_from_parents_list(torch.tensor([[2, 3]]), 1, 2)
+        self.assertEqual(got.tolist(), [[0, 0]])
+        got = parent_slots_from_parents_list(torch.tensor([[3, 2]]), 1, 2)
+        self.assertEqual(got.tolist(), [[0, 0]])
+
+    def test_rejects_out_of_range(self):
+        # step 2, topk 2 -> offset 6, so an unshifted row goes negative.
+        with self.assertRaises(ValueError):
+            parent_slots_from_parents_list(torch.tensor([[0, 1]]), 2, 2)
+
+    def test_rejects_bad_step_and_shape(self):
+        with self.assertRaises(ValueError):
+            parent_slots_from_parents_list(torch.zeros((1, 2)), 0, 2)
+        with self.assertRaises(ValueError):
+            parent_slots_from_parents_list(torch.zeros((1, 3)), 1, 2)
+        with self.assertRaises(ValueError):
+            parent_slots_from_parents_list(torch.zeros(4), 1, 2)
+
+
+class TestDraftTreeSparseState(unittest.TestCase):
+    def _batch(self, prefix=10):
+        import types
+
+        return types.SimpleNamespace(seq_lens=torch.tensor([prefix]))
+
+    def test_accumulates_across_steps_and_stashes_positions(self):
+        topk, steps = 2, 3
+        state = DraftTreeSparseState(topk, steps)
+        fb = self._batch()
+        parents_list = [torch.arange(-1, topk).expand(1, topk + 1)]
+
+        pos0 = state.begin_step(0, fb, parents_list)
+        self.assertEqual(pos0.tolist(), [[[10], [11]]])
+        self.assertIs(getattr(fb, DRAFT_TREE_ANCESTORS_ATTR), pos0)
+        self.assertEqual(getattr(fb, DRAFT_TREE_PREFIX_ATTR).tolist(), [10])
+
+        # step 1: flat [0, 3] -> parent slots [0, 1], offset 2
+        parents_list.append(torch.tensor([[0, 3]]) + 2)
+        pos1 = state.begin_step(1, fb, parents_list)
+        self.assertEqual(pos1.tolist(), [[[10, 12], [11, 13]]])
+
+        # step 2: flat [2, 1] -> parent slots [1, 0], offset 6
+        parents_list.append(torch.tensor([[2, 1]]) + 6)
+        pos2 = state.begin_step(2, fb, parents_list)
+        self.assertEqual(pos2.tolist(), [[[11, 13, 14], [10, 12, 15]]])
+
+    def test_new_iteration_restarts_at_step0(self):
+        topk = 2
+        state = DraftTreeSparseState(topk, 3)
+        fb = self._batch()
+        first = [torch.arange(-1, topk).expand(1, topk + 1)]
+        pos_a = state.begin_step(0, fb, first)
+        fb2 = self._batch()
+        pos_b = state.begin_step(0, fb2, first)
+        self.assertEqual(pos_a.tolist(), pos_b.tolist())
+
+    def test_per_request_prefix(self):
+        state = DraftTreeSparseState(2, 2)
+        import types
+
+        fb = types.SimpleNamespace(seq_lens=torch.tensor([10, 20]))
+        parents = [torch.zeros((2, 3), dtype=torch.long)]
+        pos = state.begin_step(0, fb, parents)
+        self.assertEqual(pos.tolist(), [[[10], [11]], [[20], [21]]])
+
+    def test_rejects_bad_step(self):
+        state = DraftTreeSparseState(2, 2)
+        with self.assertRaises(ValueError):
+            state.begin_step(2, self._batch(), [torch.zeros((1, 3))])
+        with self.assertRaises(ValueError):
+            state.begin_step(0, self._batch(), [])
 
 
 if __name__ == "__main__":
