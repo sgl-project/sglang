@@ -18,19 +18,26 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
+def _kv_pool(state_pool):
+    """A KV pool whose router binds ``state_pool`` as the recurrent state."""
+    return SimpleNamespace(
+        layer_router=SimpleNamespace(part_view=lambda part: state_pool),
+        state_pool=state_pool,
+    )
+
+
 def _worker(monkeypatch, draft_config, target_pool, draft_pools):
     monkeypatch.setattr(
         spec, "get_memory", lambda: SimpleNamespace(enable_hierarchical_cache=True)
     )
     target = SimpleNamespace(
         spec_algorithm=SpeculativeAlgorithm.EAGLE,
-        req_to_token_pool=SimpleNamespace(mamba_pool=target_pool),
+        token_to_kv_pool=_kv_pool(target_pool),
     )
     runners = tuple(
         SimpleNamespace(
             model_config=draft_config,
-            token_to_kv_pool=object(),
-            req_to_token_pool=SimpleNamespace(mamba_pool=pool),
+            token_to_kv_pool=_kv_pool(pool),
         )
         for pool in draft_pools
     )
@@ -99,7 +106,7 @@ def test_inkling_checkpoint_packs_every_draft_pool(monkeypatch, tmp_path, local_
     assert plan.device_pools == tuple(r.token_to_kv_pool for r in runners)
     assert target.mtp_draft_device_pools == plan.device_pools
     assert target.mtp_draft_mamba_pools == tuple(
-        r.req_to_token_pool.mamba_pool for r in runners
+        r.token_to_kv_pool.state_pool for r in runners
     )
 
 

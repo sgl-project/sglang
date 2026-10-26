@@ -1211,9 +1211,9 @@ class UnifiedHybridReqToTokenPool(HybridReqToTokenPool):
         # The clone's own storage: assigning through the shared one would
         # rebind the target's.
         clone.state = StateStorage.empty(self.state_sub_pool)
-        clone.mamba_allocator = self.mamba_allocator
-        clone.short_conv_pool = self.short_conv_pool
-        clone.ngram_pool = self.ngram_pool
+        clone.state.slots = self.state.slots
+        clone.state.short_conv_pool = self.state.short_conv_pool
+        clone.state.ngram_pool = self.state.ngram_pool
         clone.mamba_pool = UnifiedDraftMambaPool(
             unified_buffer=self._unified_buffer,
             sub_pool_name=self.state_sub_pool,

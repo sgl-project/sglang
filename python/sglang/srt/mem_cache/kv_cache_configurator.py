@@ -478,11 +478,14 @@ class KVCacheConfigurator:
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
         )
         if pools.req_to_token_pool.mamba_pool is not None:
+            state = pools.req_to_token_pool.state
             # State reads go through the KV pool's router, which owns the
             # layer-wise load-back wait.
-            pools.req_to_token_pool.bind_state_routes(
-                pools.token_to_kv_pool.layer_router
-            )
+            state.bind_routes(pools.token_to_kv_pool.layer_router)
+            if not self.is_draft_worker:
+                # A draft worker shares the target's allocator, and with it
+                # the target's state.
+                pools.token_to_kv_pool_allocator.state = state
 
         swa_max_total_num_tokens = sizes.swa_max_total_num_tokens
         alloc = pools.token_to_kv_pool_allocator

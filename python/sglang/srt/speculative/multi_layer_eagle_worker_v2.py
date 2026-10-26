@@ -34,6 +34,7 @@ from sglang.srt.layers.moe.utils import (
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.mem_cache.kv.router import STATE_PART
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.mem_cache.unified_draft_pool import UnifiedDraftSWAKVPool
 from sglang.srt.model_executor.cuda_graph_config import (
@@ -270,7 +271,8 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             )
             return
         if isinstance(self.req_to_token_pool, HybridReqToTokenPool):
-            conv_state = self.req_to_token_pool.mamba_pool.mamba_cache.conv
+            target_pool = self.target_worker.model_runner.token_to_kv_pool
+            conv_state = target_pool.layer_router.part_view(STATE_PART).mamba_cache.conv
             self.draft_extend_num_warmup_tokens = min(conv_state[0].shape[2:])
         self.draft_extend_num_front_tokens = (
             self.speculative_num_steps - 1 + self.draft_extend_num_warmup_tokens
@@ -595,7 +597,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         seen = set()
         for runner in self.draft_runner_list:
             req_pool = runner.req_to_token_pool
-            pool = req_pool.mamba_pool
+            pool = runner.token_to_kv_pool.layer_router.part_view(STATE_PART)
             if id(pool) in seen:
                 continue
             seen.add(id(pool))

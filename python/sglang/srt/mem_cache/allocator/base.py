@@ -16,11 +16,12 @@ limitations under the License.
 from __future__ import annotations
 
 import abc
-from typing import TYPE_CHECKING, Dict, Hashable, Protocol
+from typing import TYPE_CHECKING, Dict, Hashable, Optional, Protocol
 
 import torch
 
 if TYPE_CHECKING:
+    from sglang.srt.mem_cache.kv.state_storage import StateStorage
     from sglang.srt.mem_cache.kv_loc_plan import IdSpace
     from sglang.srt.mem_cache.memory_pool import KVCache
 
@@ -43,6 +44,14 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     # Ids handed out index a virtual space the allocator translates to physical
     # rows (a unified pool's chain), not the pool's rows themselves.
     hands_out_virtual_ids = False
+    # A request's recurrent state and its slots, when the model has them; the
+    # KV cache configurator binds the request table's.
+    state: Optional[StateStorage] = None
+
+    @property
+    def state_slots(self):
+        """The state slot allocator, or None without recurrent state."""
+        return None if self.state is None else self.state.slots
 
     @abc.abstractmethod
     def __init__(

@@ -78,7 +78,7 @@ class TestHeldRowAdmission(CustomTestCase):
         s.tree_cache = SimpleNamespace(
             buffer_pipeline=None, storage_prefetch_retries=None
         )
-        s.token_to_kv_pool_allocator = None
+        s.token_to_kv_pool_allocator = SimpleNamespace(state_slots=None)
         s.new_token_ratio_tracker = SimpleNamespace(current=0.0)
         s.max_prefill_tokens = 1 << 20
         s.is_mixed_chunk = False
@@ -97,8 +97,7 @@ class TestHeldRowAdmission(CustomTestCase):
         s.spec_algorithm = None
         # The final chunk and the running requests hold rows; one row is free.
         s.req_to_token_pool = SimpleNamespace(
-            available_size=lambda: NUM_ROWS - len(running) - 1,
-            mamba_allocator=None,
+            available_size=lambda: NUM_ROWS - len(running) - 1
         )
         s.beam_coordinator = SimpleNamespace(pending_member_rows=lambda batch: 0)
         return s

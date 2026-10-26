@@ -250,6 +250,7 @@ def _build_full_state(
         req_to_token_pool=req_to_token_pool,
         device=ctx.device,
     )
+    allocator.state = req_to_token_pool.state
     # Only HybridLinearKVPool's retraction CPU-copy path uses this hook.
     token_to_kv_pool._mamba_translate = allocator.state_ids(
         req_to_token_pool.state_sub_pool
@@ -339,6 +340,7 @@ def _build_full_window_state(
         req_to_token_pool=req_to_token_pool,
         device=ctx.device,
     )
+    allocator.state = req_to_token_pool.state
     _log_banner(
         "UNIFIED MEMORY POOL ENABLED -- path=SWA+Mamba tri-pool",
         "  full_layers=%d, swa_layers=%d, state_layers=%d, page_size=%d"

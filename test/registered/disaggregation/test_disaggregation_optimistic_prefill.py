@@ -428,6 +428,8 @@ class TestOptimisticPrefillMambaRetryRelease(CustomTestCase):
             kvcache=pool,
             need_sort=False,
         )
+        # As the KV cache configurator does: the allocator carries the state.
+        allocator.state = req_to_token_pool.state
         tree = UnifiedRadixCache(
             params=CacheInitParams(
                 disable=False,

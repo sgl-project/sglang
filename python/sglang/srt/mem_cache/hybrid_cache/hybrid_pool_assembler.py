@@ -73,7 +73,7 @@ def _evict_mamba_for_device_alloc(cache: UnifiedRadixCache, required_size: int) 
     from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 
     available_size = (
-        cache.req_to_token_pool.mamba_allocator.schedulable_available_size()
+        cache.token_to_kv_pool_allocator.state_slots.schedulable_available_size()
     )
     shortfall = max(0, required_size - available_size)
     if shortfall > 0:
@@ -1315,7 +1315,7 @@ def build_hybrid_mamba_stack(
     transfer_layer_id_max = (
         max(full_layer_mapping.keys() | mamba_layer_mapping.keys()) + 1
     )
-    mamba_allocator = params.req_to_token_pool.mamba_allocator
+    mamba_allocator = params.token_to_kv_pool_allocator.state_slots
     qsa_draft_pools = params.mtp_draft_device_pools if qsa_pool is not None else ()
     config = prepare_host_pool_config(
         decls=decls,
@@ -1463,7 +1463,7 @@ def build_hybrid_mamba_swa_stack(
         + 1
     )
     swa_attn_allocator = params.token_to_kv_pool_allocator.swa_attn_allocator
-    mamba_allocator = params.req_to_token_pool.mamba_allocator
+    mamba_allocator = params.token_to_kv_pool_allocator.state_slots
     kv_host_size, swa_host_size, mamba_host_size = None, None, 0
     if get_memory().hicache_size > 0:
         kv_host_size, swa_host_size, mamba_host_size = _split_hicache_size(
@@ -2070,7 +2070,7 @@ class _MambaStrategy(StackStrategy):
         host_pool_group, cache_controller, config = build_hybrid_mamba_stack(
             params=params,
             decls=kvcache.host_pool_decls(),
-            mamba_pool=params.req_to_token_pool.mamba_pool,
+            mamba_pool=params.token_to_kv_pool_allocator.state.pool,
             full_layer_mapping=full_layer_mapping,
             start_layer=kvcache.start_layer,
             load_cache_event=load_cache_event,
@@ -2218,7 +2218,7 @@ class _MambaSwaStrategy(StackStrategy):
             params=params,
             full_kv_pool=kvcache.full_kv_pool,
             swa_kv_pool=kvcache.swa_kv_pool,
-            mamba_pool=params.req_to_token_pool.mamba_pool,
+            mamba_pool=params.token_to_kv_pool_allocator.state.pool,
             full_layer_mapping=full_layer_mapping,
             swa_layer_mapping=swa_layer_mapping,
             start_layer=kvcache.start_layer,

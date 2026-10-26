@@ -72,7 +72,7 @@ def _estimate_hicache_bytes(
         )
     total = _pool_bytes(pool)
     if isinstance(params.req_to_token_pool, HybridReqToTokenPool):
-        total += _pool_bytes(params.req_to_token_pool.mamba_pool)
+        total += _pool_bytes(params.token_to_kv_pool_allocator.state.pool)
     drafts = params.mtp_draft_device_pools
     if draft_plan is not None and draft_plan.mode == "sidecar":
         drafts = draft_plan.device_pools

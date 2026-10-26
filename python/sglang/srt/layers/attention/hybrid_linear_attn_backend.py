@@ -36,6 +36,7 @@ from sglang.srt.layers.attention.mamba.replay_state_indices_validator import (
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.kv.router import STATE_PART, KVLayer
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
+from sglang.srt.mem_cache.ple_state_pool import NGRAM_PART, SHORT_CONV_PART
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -87,6 +88,11 @@ class MambaAttnBackendBase(AttentionBackend):
         self.is_draft_worker = model_runner.is_draft_worker
         self.req_to_token_pool: HybridReqToTokenPool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
+        # The state sub-pool's storage and each state layer's index in it, as
+        # the KV pool's router binds them.
+        router = self.token_to_kv_pool.layer_router
+        self.state_pool = router.part_view(STATE_PART)
+        self.state_layer_indices = router.part_indices(STATE_PART)
         self.enable_unified_memory = get_memory().enable_unified_memory
         # model_config must not be touched here: backend selection reads the
         # linear_attn_backends stamp first, and that guard test constructs
@@ -239,7 +245,7 @@ class MambaAttnBackendBase(AttentionBackend):
             # (advance-by-accept-count once per verify step). Advancing it here as
             # well inserts one phantom/stale ring entry per step and cumulatively
             # poisons the reconstruction (degenerate repetition at 10k+ tokens).
-            mamba_pool = self.req_to_token_pool.mamba_pool
+            mamba_pool = self.state_pool
             write_pos_buf = (
                 mamba_pool.replayssm_write_pos
                 if mamba_pool is not None and mamba_pool.enable_linear_replayssm
@@ -603,7 +609,7 @@ class MambaAttnBackendBase(AttentionBackend):
         and the decode-kernel ring rerouting downstream) must stay fully
         dormant for the spec ring.
         """
-        mamba_pool = self.req_to_token_pool.mamba_pool
+        mamba_pool = self.state_pool
         if mamba_pool is None:
             return False
         return bool(mamba_pool.enable_linear_replayssm)
@@ -808,7 +814,7 @@ class MambaAttnBackendBase(AttentionBackend):
                 mamba_indices.detach().cpu(),
                 valid_bs=valid_bs,
                 total_bs=bs,
-                num_state_slots=self.req_to_token_pool.mamba_pool.size + 1,
+                num_state_slots=self.state_pool.size + 1,
                 pad_slot_id=self.pad_slot_id,
             )
         # Refresh the static track-dest buffer in-place (translated); the captured
@@ -828,7 +834,7 @@ class MambaAttnBackendBase(AttentionBackend):
         replayssm_write_pos = None
         replayssm_force_flush = None
         if self.replayssm_write_pos_list is not None:
-            mamba_pool = self.req_to_token_pool.mamba_pool
+            mamba_pool = self.state_pool
             write_pos_buf = mamba_pool.replayssm_write_pos
             static_wp = self.replayssm_write_pos_list[bs - 1]
             static_ff = self.replayssm_force_flush_list[bs - 1]
@@ -972,10 +978,10 @@ class MambaAttnBackendBase(AttentionBackend):
         if cached is False:
             pools = None
             try:
-                mamba_cache = self.req_to_token_pool.mamba_pool.mamba_cache
+                mamba_cache = self.state_pool.mamba_cache
                 conv_pool = mamba_cache.conv[0]
                 ssm_pool = mamba_cache.temporal
-                last_pool_idx = max(self.req_to_token_pool.mamba_map.values())
+                last_pool_idx = max(self.state_layer_indices.values())
                 if (
                     conv_pool.dim() >= 3
                     and ssm_pool.dim() >= 3
@@ -1010,7 +1016,7 @@ class MambaAttnBackendBase(AttentionBackend):
             pools = self._track_pools()
             if pools is not None:
                 conv_pool, ssm_pool, last_pool_idx = pools
-                if self.req_to_token_pool.mamba_map.get(layer_id) != last_pool_idx:
+                if self.state_layer_indices.get(layer_id) != last_pool_idx:
                     return
                 track_mamba_states_all_layers(
                     conv_pool,
@@ -1086,9 +1092,7 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
-        self.conv_states_shape = (
-            model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape
-        )
+        self.conv_states_shape = self.state_pool.mamba_cache.conv[0].shape
 
         if get_exec().mamba.enable_mamba_extra_buffer:
             assert self.conv_states_shape[-1] < self.mamba_chunk_size, (
@@ -1560,8 +1564,8 @@ class HybridLinearAttnBackend(AttentionBackend):
                 ]
             )
 
-        req_pool = self.linear_attn_backend.req_to_token_pool
-        mamba_caches = req_pool.get_speculative_mamba2_params_all_layers()
+        mamba_pool = self.linear_attn_backend.state_pool
+        mamba_caches = mamba_pool.get_speculative_mamba2_params_all_layers()
 
         # ReplaySSM-KDA: the accepted drafts live in the per-slot ring (written
         # during verify); no intermediate_ssm is allocated. Replay the accepted
@@ -1570,7 +1574,6 @@ class HybridLinearAttnBackend(AttentionBackend):
         # handles replayssm before reaching here (returns early), so this branch is
         # only hit by the direct callers. Chain layout only (topk <= 1), so
         # accept_lens == last_correct_step_indices + 1.
-        mamba_pool = req_pool.mamba_pool
         if mamba_pool.replayssm_is_kda:
             from sglang.kernels.ops.attention.linear.kda_replayssm_spec_decode import (
                 commit_kda_replayssm_after_verify,
@@ -1682,14 +1685,15 @@ class HybridLinearAttnBackend(AttentionBackend):
         src_indices_raw: Optional[torch.Tensor] = None,
     ):
         """Roll the accepted per-step PLE side states into their main slots."""
-        req_to_token_pool = self.linear_attn_backend.req_to_token_pool
+        router = self.linear_attn_backend.token_to_kv_pool.layer_router
         if mamba_track_indices is not None:
             assert mamba_steps_to_track is not None
 
         state_pairs = []
-        short_conv_pool = req_to_token_pool.short_conv_pool
+        short_conv_pool = router.part_view(SHORT_CONV_PART)
         if (
-            short_conv_pool.conv_state is not None
+            short_conv_pool is not None
+            and short_conv_pool.conv_state is not None
             and short_conv_pool.intermediate_conv_state is not None
         ):
             state_pairs.append(
@@ -1699,9 +1703,10 @@ class HybridLinearAttnBackend(AttentionBackend):
                 )
             )
 
-        ngram_pool = req_to_token_pool.ngram_pool
+        ngram_pool = router.part_view(NGRAM_PART)
         if (
-            ngram_pool.context is not None
+            ngram_pool is not None
+            and ngram_pool.context is not None
             and ngram_pool.intermediate_context is not None
         ):
             state_pairs.append(

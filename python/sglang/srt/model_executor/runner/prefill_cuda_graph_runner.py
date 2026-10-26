@@ -74,6 +74,7 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
+from sglang.srt.mem_cache.kv.router import STATE_PART
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     CudaGraphBufferRegistry,
     build_prefill_registry,
@@ -1817,7 +1818,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         if isinstance(self.backend, BreakableCudaGraphBackend):
             post_warmup_hook = None
             req_pool = self.model_runner.req_to_token_pool
-            mamba_pool = req_pool.mamba_pool
+            mamba_pool = self.model_runner.token_to_kv_pool.layer_router.part_view(
+                STATE_PART
+            )
             if mamba_pool is not None and not prefix_num_chunks:
                 state_ids = self.model_runner.kv_index_translator.state_ids(
                     req_pool.state_sub_pool

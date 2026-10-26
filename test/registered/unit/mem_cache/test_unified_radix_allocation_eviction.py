@@ -1,6 +1,7 @@
 """CPU-only tests for allocation-aware UnifiedRadixCache eviction."""
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import torch
@@ -99,8 +100,9 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
         # The window band takes no part in the full donor path.
         allocator.swa_attn_allocator = None
         allocator.members = (allocator.full_attn_allocator, allocator.mamba_allocator)
+        allocator.state = SimpleNamespace(slots=allocator.mamba_allocator)
         cache.token_to_kv_pool_allocator = allocator
-        cache.req_to_token_pool = MagicMock(mamba_allocator=allocator.mamba_allocator)
+        cache.req_to_token_pool = MagicMock()
         return cache, capacity, allocator
 
     def test_allocation_eviction_stops_when_shared_capacity_is_sufficient(self):
@@ -177,7 +179,8 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
         mamba_allocator.schedulable_available_size.side_effect = lambda: capacity[
             "available"
         ]
-        cache.req_to_token_pool = MagicMock(mamba_allocator=mamba_allocator)
+        cache.token_to_kv_pool_allocator.state_slots = mamba_allocator
+        cache.req_to_token_pool = MagicMock()
 
         def next_node(component_type, tracker):
             return (None, False) if tracker[component_type] >= 3 else (1, True)

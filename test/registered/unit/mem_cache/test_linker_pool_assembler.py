@@ -685,9 +685,11 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         from sglang.srt.speculative import base_spec_worker as spec
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
+        no_state = SimpleNamespace(
+            layer_router=SimpleNamespace(part_view=lambda part: None)
+        )
         draft = SimpleNamespace(
-            token_to_kv_pool=object(),
-            req_to_token_pool=SimpleNamespace(mamba_pool=None),
+            token_to_kv_pool=no_state,
             model_config=SimpleNamespace(
                 num_nextn_predict_layers=0,
                 hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"]),
@@ -695,7 +697,7 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         )
         target = SimpleNamespace(
             spec_algorithm=SpeculativeAlgorithm.EAGLE,
-            req_to_token_pool=SimpleNamespace(mamba_pool=None),
+            token_to_kv_pool=no_state,
         )
         worker = SimpleNamespace(
             target_worker=SimpleNamespace(model_runner=target),
@@ -759,12 +761,14 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         params = SimpleNamespace(
             mtp_draft_device_pools=(),
             sidecar_draft_device_pools=(draft,),
-            req_to_token_pool=SimpleNamespace(
-                mamba_pool=SimpleNamespace(mamba_cache=mamba_cache, num_mamba_layers=2),
-                mamba_map={0: 0, 2: 1},
-                mamba_ckpt_pool=None,
-                short_conv_pool=SimpleNamespace(enabled=False),
-                ngram_pool=SimpleNamespace(enabled=False),
+            token_to_kv_pool_allocator=SimpleNamespace(
+                state=SimpleNamespace(
+                    pool=SimpleNamespace(mamba_cache=mamba_cache, num_mamba_layers=2),
+                    layer_map={0: 0, 2: 1},
+                    ckpt_pool=None,
+                    short_conv_pool=SimpleNamespace(enabled=False),
+                    ngram_pool=SimpleNamespace(enabled=False),
+                )
             ),
         )
 

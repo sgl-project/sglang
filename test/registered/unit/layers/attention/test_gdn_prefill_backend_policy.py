@@ -74,9 +74,13 @@ def make_runner(
             linear_key_head_dim=key_dim,
             linear_value_head_dim=value_dim,
         ),
-        req_to_token_pool=SimpleNamespace(
-            mamba_pool=SimpleNamespace(
-                mamba_cache=SimpleNamespace(temporal=SimpleNamespace(dtype=state_dtype))
+        token_to_kv_pool=SimpleNamespace(
+            layer_router=SimpleNamespace(
+                part_view=lambda part: SimpleNamespace(
+                    mamba_cache=SimpleNamespace(
+                        temporal=SimpleNamespace(dtype=state_dtype)
+                    )
+                )
             )
         ),
     )

@@ -1625,7 +1625,7 @@ class SchedulerBatchResultProcessor:
             pool = batch.req_to_token_pool
             keep_idx = req.kv.mamba_next_track_idx
             keep_val = req.kv.mamba_ping_pong_track_buffer[keep_idx]
-            pool.mamba_allocator.free(keep_val.unsqueeze(0))
+            batch.token_to_kv_pool_allocator.state_slots.free(keep_val.unsqueeze(0))
             pool.set_mamba_ping_pong_slot(req, keep_idx, -1)
             req.kv.mamba_next_track_idx = planned_pos
         # else: in-place fallback, or promoted by an earlier confirmation —
@@ -1692,7 +1692,7 @@ class SchedulerBatchResultProcessor:
         other_idx = 1 - track_idx
         pool = batch.req_to_token_pool
         if not req.kv.mamba_ping_pong_empty[other_idx]:
-            pool.mamba_allocator.free(
+            batch.token_to_kv_pool_allocator.state_slots.free(
                 req.kv.mamba_ping_pong_track_buffer[other_idx].unsqueeze(0)
             )
             pool.set_mamba_ping_pong_slot(req, other_idx, -1)

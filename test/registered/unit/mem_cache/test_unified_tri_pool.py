@@ -20,6 +20,7 @@ Pure CPU; fakes stand in for the KV pools (data markers verify moves).
 
 import inspect
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -389,8 +390,9 @@ class TestUnifiedTriPool(unittest.TestCase):
                 cache.is_swa_enabled = True
                 cache.cache_controller = None
                 cache.metrics_collector = None
+                allocator.state = SimpleNamespace(slots=mamba_slots)
                 cache.token_to_kv_pool_allocator = allocator
-                cache.req_to_token_pool = MagicMock(mamba_allocator=mamba_slots)
+                cache.req_to_token_pool = MagicMock()
 
                 tree_core = MagicMock()
                 tree_core.full_evictable_size.return_value = len(full_leaves)
@@ -1033,7 +1035,14 @@ class TestTriFactorySizing(unittest.TestCase):
                             mamba_ping_pong_empty=[index == -1 for index in ids],
                         )
                     )
-                    session = StreamingSession(SimpleNamespace(req_to_token_pool=pool))
+                    session = StreamingSession(
+                        SimpleNamespace(
+                            req_to_token_pool=pool,
+                            token_to_kv_pool_allocator=SimpleNamespace(
+                                state_slots=allocator
+                            ),
+                        )
+                    )
                     session.slots = {"test": slot}
                     self.assertEqual(kv_mamba_slots(slot.kv), count + 1)
                     session._free_slot_mamba(slot)

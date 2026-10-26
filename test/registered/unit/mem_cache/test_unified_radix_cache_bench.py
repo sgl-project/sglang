@@ -223,6 +223,10 @@ def create_bench_cache(
             need_sort=False,
         )
 
+    if req_to_token_pool.mamba_pool is not None:
+        # As the KV cache configurator does: the allocator carries the state.
+        allocator.state = req_to_token_pool.state
+
     # --- tree ---
     backend_override = (
         envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override(_TREE_CORE_TEST_BACKEND)

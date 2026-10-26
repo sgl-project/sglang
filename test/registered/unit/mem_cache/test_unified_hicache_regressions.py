@@ -241,14 +241,14 @@ class TestTriPoolAssembly(CustomTestCase):
                     if unified
                     else SimpleNamespace(alloc=Mock(), free=Mock())
                 )
-                composite = SimpleNamespace(swa_attn_allocator=swa_allocator)
+                composite = SimpleNamespace(
+                    swa_attn_allocator=swa_allocator,
+                    state_slots=SimpleNamespace(alloc=Mock(), free=Mock()),
+                )
                 params = SimpleNamespace(
                     mtp_draft_device_pools=(),
                     mtp_draft_mamba_pools=(),
                     token_to_kv_pool_allocator=composite,
-                    req_to_token_pool=SimpleNamespace(
-                        mamba_allocator=SimpleNamespace(alloc=Mock(), free=Mock())
-                    ),
                 )
                 memory = MagicMock(enable_unified_memory=unified, hicache_size=0)
                 host = MagicMock()

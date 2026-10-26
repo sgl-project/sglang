@@ -194,7 +194,7 @@ class SchedulerInvariantChecker:
         )
 
     def _check_mamba_pool(self, ps: PoolStats) -> Tuple[bool, str]:
-        ckpt_pool = self.req_to_token_pool.mamba_ckpt_pool
+        ckpt_pool = self.token_to_kv_pool_allocator.state.ckpt_pool
         if ckpt_pool is not None:
             return self._check_mamba_pool_with_int8(ps, ckpt_pool)
         leak, msg = self._check_pool_invariant(
@@ -203,7 +203,7 @@ class SchedulerInvariantChecker:
             ps.mamba_evictable_size,
             self.tree_cache.mamba_protected_size(),
             self.pool_stats_observer.session_held_mamba_slots(),
-            self.req_to_token_pool.mamba_pool.size,
+            self.token_to_kv_pool_allocator.state.pool.size,
         )
         if leak:
             # Pools without a page free list return None; skip the census rather
@@ -227,7 +227,7 @@ class SchedulerInvariantChecker:
                     expected_full_pages - free_full_pages - cached_full_pages
                 )
                 full_page_msg = f", leaked_full_pages={leaked_full_pages or None}"
-            mamba_allocator = self.req_to_token_pool.mamba_allocator
+            mamba_allocator = self.token_to_kv_pool_allocator.state_slots
             free_mamba_pages = set(mamba_allocator.free_slots.tolist())
             cached_mamba_pages = set(
                 self.tree_cache.all_mamba_values_flatten().tolist()
@@ -259,7 +259,7 @@ class SchedulerInvariantChecker:
             ps.mamba_evictable_size,  # 0 in int8 mode (radix owns no active slots)
             0,
             self.pool_stats_observer.session_held_mamba_slots(),
-            self.req_to_token_pool.mamba_pool.size,
+            self.token_to_kv_pool_allocator.state.pool.size,
         )
         int8_leak, int8_msg = self._check_pool_invariant(
             "mamba-int8",

@@ -41,6 +41,7 @@ from sglang.srt.managers.utils import _async_d2h
 from sglang.srt.mem_cache.allocation import (
     assign_req_to_token_pool_func as assign_req_to_token_pool_func,
 )
+from sglang.srt.mem_cache.kv.router import STATE_PART
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
@@ -1132,7 +1133,7 @@ def commit_mamba_states_after_verify(
     # skip only the SSM scatter. GDN-only + linear-chain (topk<=1) -- the runtime
     # ring is allocated only then; KDA never allocates the cursors.
     req_pool = model_runner.req_to_token_pool
-    mamba_pool = req_pool.mamba_pool
+    mamba_pool = model_runner.token_to_kv_pool.layer_router.part_view(STATE_PART)
     bs = accept_lens.shape[0]
     src_indices_raw = (
         batch.req_pool_indices[:bs] if pp_spec_stable_rows_enabled() else None

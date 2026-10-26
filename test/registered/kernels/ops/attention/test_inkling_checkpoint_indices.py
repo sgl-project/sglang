@@ -15,6 +15,7 @@ from sglang.srt.mem_cache.allocator.unified_sub_pool import MultiEndedAllocator
 from sglang.srt.mem_cache.kv.alloc.chain import slot_id_space
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
+from sglang.srt.mem_cache.kv.state_storage import StateStorage
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
 from sglang.srt.mem_cache.kv_loc_plan import IdSpace, IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
@@ -88,6 +89,7 @@ class TestInklingCheckpointIndices(CustomTestCase):
         req_type = HybridReqToTokenPool if static else UnifiedHybridReqToTokenPool
         req_pool = req_type.__new__(req_type)
         req_pool.size = 4
+        req_pool.state = StateStorage.empty("mamba")
         req_pool.mamba_pool = pool
         req_pool.mamba_allocator = UnifiedMambaSlotAllocator(
             allocator, max_size=pool.size, device="cuda"

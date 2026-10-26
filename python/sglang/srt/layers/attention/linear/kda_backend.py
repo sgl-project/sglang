@@ -492,9 +492,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         # The KDA pool stores conv states as [kernel-1, dim] — transposed vs
         # Mamba2/GDN's [dim, kernel-1] — so expose the transposed shape here.
         self.conv_states_shape = (
-            model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0]
-            .transpose(-1, -2)
-            .shape
+            self.state_pool.mamba_cache.conv[0].transpose(-1, -2).shape
         )
         backends = model_runner.linear_attn_backends
         decode_backend = backends.decode

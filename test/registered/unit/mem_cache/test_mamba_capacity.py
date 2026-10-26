@@ -10,6 +10,7 @@ from sglang.srt.disaggregation.decode import (
 from sglang.srt.mem_cache.allocation import alloc_req_slots, ensure_mamba_capacity
 from sglang.srt.mem_cache.allocation_sizing import get_mamba_tracking_slots
 from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
+from sglang.srt.mem_cache.kv.state_storage import StateStorage
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -18,6 +19,7 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 def make_pool(free, *, lazy=False, extra_buffer=True, track_buffer_size=2):
     pool = object.__new__(HybridReqToTokenPool)
+    pool.state = StateStorage.empty("mamba")
     pool.mamba_allocator = MambaSlotAllocator(5, "cpu")
     pool.enable_mamba_extra_buffer = extra_buffer
     pool.enable_mamba_extra_buffer_lazy = lazy
@@ -86,6 +88,7 @@ class TestMambaCapacity(unittest.TestCase):
                         enable_mamba_extra_buffer_lazy=lazy,
                     )
                 self.assertEqual(pool.mamba_initial_tracking_slots, expected)
+                pool.state = StateStorage.empty("mamba")
                 pool.mamba_allocator = MambaSlotAllocator(1 + expected, "cpu")
                 req = make_req()
                 held = pool.mamba_allocator.alloc(1)

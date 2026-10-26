@@ -108,7 +108,7 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
         super().__init__(model_runner)
         # Pool-wide, bound at pool construction: conv[stream] is
         # [n_layers, n_slots, conv_kernel - 1, conv_dim].
-        self._mamba_cache = self.req_to_token_pool.mamba_pool.mamba_cache
+        self._mamba_cache = self.state_pool.mamba_cache
         self.conv_state_len: int = self.conv_states_shape[2]
         self.mamba_cache_chunk_size = mamba_cache_chunk_size()
         # Both identity and unified v2p gathers are recordable. The allocator

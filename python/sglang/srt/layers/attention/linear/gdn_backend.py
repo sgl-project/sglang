@@ -38,6 +38,7 @@ from sglang.srt.layers.attention.linear.utils import (
     select_verify_intermediate_state_indices,
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
+from sglang.srt.mem_cache.kv.router import STATE_PART
 from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
@@ -242,7 +243,9 @@ def flashinfer_gdn_prefill_default(model_runner: ModelRunner) -> Optional[str]:
         or not 1 <= chunk_size <= max_chunk
         or getattr(config, "linear_key_head_dim", None) != 128
         or getattr(config, "linear_value_head_dim", None) != 128
-        or model_runner.req_to_token_pool.mamba_pool.mamba_cache.temporal.dtype
+        or model_runner.token_to_kv_pool.layer_router.part_view(
+            STATE_PART
+        ).mamba_cache.temporal.dtype
         != expected_state_dtype
     ):
         return None
@@ -550,9 +553,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         super().__init__(model_runner)
         self.enable_mis = get_exec().features.enable_mis
         self.mis_metadata: Optional[GDNMISMetadata] = None
-        self.conv_states_shape = (
-            model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape
-        )
+        self.conv_states_shape = self.state_pool.mamba_cache.conv[0].shape
         if not is_cpu() and not is_npu():
             assert self.conv_states_shape[-1] < FLA_CHUNK_SIZE, (
                 f"{self.conv_states_shape[-1]=} should be less than {FLA_CHUNK_SIZE}"
@@ -785,7 +786,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             return
 
         metadata = self.forward_metadata
-        mamba_pool = self.req_to_token_pool.mamba_pool
+        mamba_pool = self.state_pool
         mamba_cache = mamba_pool.mamba_cache
         is_gdn_replayssm = not mamba_pool.replayssm_is_kda
         use_replayssm_fold = (
@@ -1245,7 +1246,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 cache_indices[: query_start_loc.shape[0] - 1] >= 0,
                 self.req_to_token_pool.size,
             )
-            mamba_pool = self.req_to_token_pool.mamba_pool
+            mamba_pool = self.state_pool
             use_replayssm_fold = (
                 mamba_cache_params.replayssm_rawv is not None
                 and mamba_pool.replayssm_spec_fold

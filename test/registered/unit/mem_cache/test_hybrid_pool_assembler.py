@@ -119,11 +119,10 @@ class TestHybridStageLayerMappings(CustomTestCase):
                         use_mla=False,
                         host_pool_decls=lambda: (),
                     )
-                    req_pool = SimpleNamespace(
-                        mamba_pool=object(),
-                    )
+                    state = SimpleNamespace(pool=object())
                     params = SimpleNamespace(
-                        req_to_token_pool=req_pool,
+                        req_to_token_pool=SimpleNamespace(),
+                        token_to_kv_pool_allocator=SimpleNamespace(state=state),
                         tp_cache_group=None,
                         pp_cache_group=None,
                     )
@@ -222,10 +221,7 @@ class TestMambaInfoRouting(CustomTestCase):
                             mtp_draft_device_pools=(),
                             mtp_draft_mamba_pools=drafts,
                             token_to_kv_pool_allocator=SimpleNamespace(
-                                swa_attn_allocator=allocator
-                            ),
-                            req_to_token_pool=SimpleNamespace(
-                                mamba_allocator=allocator
+                                swa_attn_allocator=allocator, state_slots=allocator
                             ),
                             tp_cache_group=None,
                             pp_cache_group=None,
@@ -949,16 +945,13 @@ class TestHybridMambaDeclaredIndexer(CustomTestCase):
             page_size=64,
             mtp_draft_device_pools=(),
             mtp_draft_mamba_pools=(),
-            token_to_kv_pool_allocator=None,
+            token_to_kv_pool_allocator=SimpleNamespace(
+                state_slots=SimpleNamespace(alloc=lambda n: None, free=lambda x: None)
+            ),
             tp_cache_group=None,
             attn_cp_cache_group=None,
             attn_tp_cache_group=None,
             pp_cache_group=None,
-            req_to_token_pool=SimpleNamespace(
-                mamba_allocator=SimpleNamespace(
-                    alloc=lambda n: None, free=lambda x: None
-                )
-            ),
         )
         real_indexer_host = pool_host_dsa.DSAIndexerPoolHost
 

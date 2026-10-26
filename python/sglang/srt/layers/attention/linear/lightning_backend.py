@@ -93,9 +93,7 @@ class LightningAttentionBackend(MambaAttnBackendBase):
                 "--speculative-eagle-topk 1."
             )
         # lightning attn does not need conv cache, but to keep the interface for mamba cache
-        self.conv_states_shape = (
-            model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape
-        )
+        self.conv_states_shape = self.state_pool.mamba_cache.conv[0].shape
 
         assert not (
             model_runner.sliding_window_size is not None

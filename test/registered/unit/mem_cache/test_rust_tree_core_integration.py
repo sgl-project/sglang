@@ -2873,7 +2873,7 @@ def _swa_mamba_cache(
 
     _, allocator = _swa_cache(window=window, backend=backend)
     request_pool = Mock(spec=HybridReqToTokenPool)
-    request_pool.mamba_allocator = Mock()
+    allocator.state = Mock()
     with (
         get_context().override_server_args(
             _mamba_cache_chunk_size=256, mamba_max_states_per_path=-1
@@ -3822,7 +3822,7 @@ def test_full_load_back_does_not_pin_restored_ancestor_aux(
     else:
         allocator = TokenToKVPoolAllocator(64, torch.bfloat16, "cpu", None, False)
         request_pool = Mock(spec=HybridReqToTokenPool)
-        request_pool.mamba_allocator = Mock()
+        allocator.state = Mock()
         with (
             get_context().override_server_args(
                 _mamba_cache_chunk_size=256, mamba_max_states_per_path=-1

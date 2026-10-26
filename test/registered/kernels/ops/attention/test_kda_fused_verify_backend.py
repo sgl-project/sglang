@@ -133,11 +133,11 @@ class TestKDAFusedVerifyBackend(CustomTestCase):
         # conv rollback below all use the production backend and GPU kernels.
         backend = KDAAttnBackend.__new__(KDAAttnBackend)
         backend.state_layer_cache = state.at_layer_idx
-        backend.req_to_token_pool = SimpleNamespace(
-            size=state.temporal.shape[1],
+        backend.state_pool = SimpleNamespace(
+            replayssm_is_kda=ring,
             get_speculative_mamba2_params_all_layers=lambda: state,
-            mamba_pool=SimpleNamespace(replayssm_is_kda=ring),
         )
+        backend.req_to_token_pool = SimpleNamespace(size=state.temporal.shape[1])
         backend.forward_metadata = SimpleNamespace(
             query_start_loc=torch.arange(
                 slots.numel() + 1, device="cuda", dtype=torch.int32
