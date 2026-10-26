@@ -573,6 +573,10 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         self._cached_default_workload: DefaultWorkload | None = None
         self._cached_default_workload_failed = False
 
+        # settle the import/model-loading GC debt before serving requests, rather
+        # than letting the first denoise step trigger a full-heap collection
+        gc.collect()
+
     def _default_workload_for_hint(self) -> DefaultWorkload | None:
         if (
             self._cached_default_workload is None
@@ -586,10 +590,6 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 logger.debug("Default workload unresolvable", exc_info=True)
                 self._cached_default_workload_failed = True
         return self._cached_default_workload
-
-        # settle the import/model-loading GC debt before serving requests, rather
-        # than letting the first denoise step trigger a full-heap collection
-        gc.collect()
 
     def release_realtime_session(self, session_id: str) -> OutputBatch:
         """release the session of a realtime connection"""
