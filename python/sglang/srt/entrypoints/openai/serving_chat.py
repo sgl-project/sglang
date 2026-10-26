@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
 import logging
@@ -2056,9 +2057,12 @@ class OpenAIServingChat(OpenAIServingBase):
             return self.create_error_response(str(e))
 
         async def prepend_first_chunk():
-            yield first_chunk
-            async for chunk in generator:
-                yield chunk
+            try:
+                yield first_chunk
+                async for chunk in generator:
+                    yield chunk
+            finally:
+                await generator.aclose()
 
         return StreamingResponse(
             prepend_first_chunk(),
@@ -2408,6 +2412,16 @@ class OpenAIServingChat(OpenAIServingBase):
                 raise
             error = self.create_streaming_error_response(str(e))
             yield f"data: {error}\n\n"
+        except (asyncio.CancelledError, GeneratorExit):
+            if getattr(adapted_request, "rid", None):
+                rids = (
+                    [adapted_request.rid]
+                    if getattr(adapted_request, "is_single", True)
+                    else adapted_request.rid
+                )
+                for rid in rids if isinstance(rids, list) else [rids]:
+                    self.tokenizer_manager.abort_request(rid, force=True)
+            raise
 
         yield "data: [DONE]\n\n"
 
@@ -2424,6 +2438,16 @@ class OpenAIServingChat(OpenAIServingBase):
             ).__anext__()
         except ValueError as e:
             return self.create_error_response(str(e))
+        except asyncio.CancelledError:
+            if getattr(adapted_request, "rid", None):
+                rids = (
+                    [adapted_request.rid]
+                    if getattr(adapted_request, "is_single", True)
+                    else adapted_request.rid
+                )
+                for rid in rids if isinstance(rids, list) else [rids]:
+                    self.tokenizer_manager.abort_request(rid, force=True)
+            raise
 
         if not isinstance(ret, list):
             ret = [ret]

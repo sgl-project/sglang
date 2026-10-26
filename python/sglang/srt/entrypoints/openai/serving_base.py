@@ -84,6 +84,7 @@ class OpenAIServingBase(ABC):
         If you want to override this method, you should be careful to record the validation time.
         """
         received_time = monotonic_time()
+        adapted_request = None
 
         try:
             # Validate request
@@ -116,6 +117,16 @@ class OpenAIServingBase(ABC):
                 return await self._handle_non_streaming_request(
                     adapted_request, processed_request, raw_request
                 )
+        except asyncio.CancelledError:
+            if adapted_request is not None and getattr(adapted_request, "rid", None):
+                rids = (
+                    [adapted_request.rid]
+                    if getattr(adapted_request, "is_single", True)
+                    else adapted_request.rid
+                )
+                for rid in rids if isinstance(rids, list) else [rids]:
+                    self.tokenizer_manager.abort_request(rid, force=True)
+            raise
         except HTTPException as e:
             return self.create_error_response(
                 message=e.detail, err_type=str(e.status_code), status_code=e.status_code

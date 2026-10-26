@@ -2050,6 +2050,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 yield out
                 break
 
+            if (
+                request is not None
+                and not obj.background
+                and await request.is_disconnected()
+            ):
+                # Abort the request for disconnected requests (running)
+                self.abort_request(obj.rid)
+                # Use exception to kill the whole call stack and asyncio task
+                raise ValueError(
+                    f"Request is disconnected from the client side (type 3). Abort request {obj.rid=}"
+                )
+
             if is_stream:
                 # Record response sent time right before we send response.
                 if not state.time_stats.response_sent_to_client_time:
@@ -2058,18 +2070,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         state.time_stats.get_response_sent_to_client_realtime()
                     )
                 yield out
-            else:
-                if (
-                    request is not None
-                    and not obj.background
-                    and await request.is_disconnected()
-                ):
-                    # Abort the request for disconnected requests (non-streaming, running)
-                    self.abort_request(obj.rid)
-                    # Use exception to kill the whole call stack and asyncio task
-                    raise ValueError(
-                        f"Request is disconnected from the client side (type 3). Abort request {obj.rid=}"
-                    )
 
     async def _handle_batch_request(
         self,
@@ -2238,19 +2238,23 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 return_exceptions=True,
             )
 
-    def abort_request(self, rid: str = "", abort_all: bool = False):
+    def abort_request(
+        self, rid: str = "", abort_all: bool = False, force: bool = False
+    ):
         # Empty rid would startswith-match every request on the scheduler.
         if not abort_all and not rid:
             logger.warning("Ignore abort_request with empty rid and abort_all=False")
             return
         state = None if abort_all else self.rid_to_state.get(rid)
-        if not abort_all:
+        if not abort_all and not force:
             if state is not None:
                 if state.abort_sent:
                     return
                 state.abort_sent = True
             elif get_serving().tokenizer_worker_num == 1:
                 return
+        if state is not None:
+            state.abort_sent = True
         req = AbortReq(rid=rid, abort_all=abort_all)
         try:
             self._dispatch_to_scheduler(req)
@@ -2432,6 +2436,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             for rid in rids:
                 if rid in self.rid_to_state:
                     self.abort_request(rid)
+                else:
+                    self.abort_request(rid, force=True)
 
         background_tasks = BackgroundTasks()
         background_tasks.add_task(abort_request)
@@ -2501,6 +2507,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 logger.warning(
                     f"Received output for {rid=} but the state was deleted in TokenizerManager."
                 )
+                if recv_obj.finished_reasons[i] is None:
+                    # Request is still decoding on the scheduler without state in TokenizerManager.
+                    # Force an abort so the scheduler ceases decoding the zombie request.
+                    self.abort_request(rid=rid, force=True)
                 continue
 
             # Build meta_info and return value

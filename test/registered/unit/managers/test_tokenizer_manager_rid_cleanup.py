@@ -1449,5 +1449,136 @@ class TestPriorityRange(CustomTestCase):
                         tm._init_req_state.assert_not_called()
 
 
+class TestChatDisconnectAbort(CustomTestCase):
+    """Regression tests for Issue #46517: Disconnected chat requests must abort on scheduler."""
+
+    def test_batch_output_aborts_orphan_ongoing_request(self):
+        """When an unfinished output arrives for an rid deleted from rid_to_state,
+        TokenizerManager must force-dispatch an AbortReq to stop the scheduler."""
+        tm = _make_tokenizer_manager(self)
+        tm._dispatch_to_scheduler = Mock()
+        orphan_rid = "orphan_decode_rid"
+        self.assertNotIn(orphan_rid, tm.rid_to_state)
+
+        batch_output = _make_batch_str_output(orphan_rid, finished_reason=_NOT_FINISHED)
+        asyncio.run(tm._handle_batch_output(batch_output))
+
+        sent = [c.args[0] for c in tm._dispatch_to_scheduler.call_args_list]
+        aborts = [m for m in sent if isinstance(m, AbortReq) and m.rid == orphan_rid]
+        self.assertEqual(len(aborts), 1, "orphan output must trigger forced AbortReq")
+
+    def test_batch_output_ignores_orphan_finished_request(self):
+        """When a finished output arrives for an rid already gone, no abort is sent."""
+        tm = _make_tokenizer_manager(self)
+        tm._dispatch_to_scheduler = Mock()
+        orphan_rid = "already_finished_rid"
+        self.assertNotIn(orphan_rid, tm.rid_to_state)
+
+        batch_output = _make_batch_str_output(
+            orphan_rid, finished_reason={"type": "stop"}
+        )
+        asyncio.run(tm._handle_batch_output(batch_output))
+
+        sent = [c.args[0] for c in tm._dispatch_to_scheduler.call_args_list]
+        aborts = [m for m in sent if isinstance(m, AbortReq) and m.rid == orphan_rid]
+        self.assertEqual(len(aborts), 0)
+
+    def test_force_abort_request(self):
+        """force=True must dispatch AbortReq even when rid is not in rid_to_state."""
+        tm = _make_tokenizer_manager(self)
+        tm.server_args.tokenizer_worker_num = 1
+        tm._dispatch_to_scheduler = Mock()
+        missing_rid = "not_in_state_rid"
+        self.assertNotIn(missing_rid, tm.rid_to_state)
+
+        # Without force, single-worker returns early
+        tm.abort_request(missing_rid, force=False)
+        self.assertFalse(tm._dispatch_to_scheduler.called)
+
+        # With force, AbortReq is sent to the scheduler
+        tm.abort_request(missing_rid, force=True)
+        self.assertTrue(tm._dispatch_to_scheduler.called)
+        req = tm._dispatch_to_scheduler.call_args[0][0]
+        self.assertIsInstance(req, AbortReq)
+        self.assertEqual(req.rid, missing_rid)
+
+    def test_streaming_disconnect_aborts_in_stream_one_response(self):
+        """Streaming request must detect client disconnect on intermediate chunk and abort."""
+        tm = _make_tokenizer_manager(self)
+        tm._dispatch_to_scheduler = Mock()
+        rid = "stream_disconnect_rid"
+        obj = Mock(spec=GenerateReqInput)
+        obj.rid = rid
+        obj.stream = True
+        obj.background = False
+        obj.return_logprob = False
+        obj.lora_path = None
+        obj.log_metrics = False
+        state = ReqState(
+            out_list=[{"text": "token1", "meta_info": {}}],
+            finished=False,
+            event=asyncio.Event(),
+            obj=obj,
+            time_stats=APIServerReqTimeStats(),
+        )
+        state.dispatched = True
+        state.event.set()
+        tm.rid_to_state[rid] = state
+
+        mock_request = Mock()
+        mock_request.is_disconnected = AsyncMock(return_value=True)
+
+        async def drive():
+            async for _ in tm._stream_one_response(
+                obj=obj, state=state, request=mock_request
+            ):
+                pass
+
+        with self.assertRaisesRegex(
+            ValueError, "Request is disconnected from the client side"
+        ):
+            asyncio.run(drive())
+
+        sent = [c.args[0] for c in tm._dispatch_to_scheduler.call_args_list]
+        aborts = [m for m in sent if isinstance(m, AbortReq) and m.rid == rid]
+        self.assertTrue(aborts, "streaming disconnect must dispatch AbortReq")
+
+    def test_openai_serving_chat_cancellation_aborts_request(self):
+        """Cancellation of chat completion request must abort running request with force=True."""
+        from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
+        from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
+
+        tm = _make_tokenizer_manager(self)
+        tm.abort_request = Mock()
+        template_manager = Mock()
+        handler = object.__new__(OpenAIServingChat)
+        handler.tokenizer_manager = tm
+        handler.template_manager = template_manager
+
+        adapted_request = Mock(spec=GenerateReqInput)
+        adapted_request.rid = "cancelled_chat_rid"
+        adapted_request.is_single = True
+
+        async def cancel_non_streaming():
+            class FailingGen:
+                def __aiter__(self):
+                    return self
+
+                async def __anext__(self):
+                    raise asyncio.CancelledError()
+
+            tm.generate_request = Mock(return_value=FailingGen())
+
+            req = Mock(spec=ChatCompletionRequest)
+            raw_req = Mock()
+            with self.assertRaises(asyncio.CancelledError):
+                await handler._handle_non_streaming_request(
+                    adapted_request, req, raw_req
+                )
+
+        asyncio.run(cancel_non_streaming())
+        tm.abort_request.assert_called_with("cancelled_chat_rid", force=True)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
