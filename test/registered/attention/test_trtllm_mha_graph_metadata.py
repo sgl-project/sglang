@@ -24,6 +24,7 @@ from sglang.kernels.ops.attention.trtllm_mha_graph_metadata import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
+from sglang.srt.mem_cache.kv_loc_plan import IdSpace, IdSpaceKind
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -515,7 +516,9 @@ def _make_backend_for_hook_test(speculative_num_draft_tokens=None):
     backend.kv_index_translator = KVIndexTranslator(
         req_to_token=backend.req_to_token,
         token_to_kv_pool_allocator=SimpleNamespace(hands_out_virtual_ids=False),
-        token_to_kv_pool=SimpleNamespace(),
+        token_to_kv_pool=SimpleNamespace(
+            id_spaces=lambda: {IdSpaceKind.FULL: IdSpace(key=(IdSpaceKind.FULL, None))}
+        ),
         page_size=PAGE_SIZE,
         device="cpu",
     )

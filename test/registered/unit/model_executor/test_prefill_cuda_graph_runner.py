@@ -19,6 +19,7 @@ from sglang.srt.managers.scheduler_components.dp_attn import (
     _local_prefill_cuda_graph_vote,
 )
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
+from sglang.srt.mem_cache.kv_loc_plan import IdSpace, IdSpaceKind
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     LayerWiseLoadCounter,
 )
@@ -49,7 +50,9 @@ def _static_pool_translator():
     return KVIndexTranslator(
         req_to_token=torch.zeros((1, 8), dtype=torch.int32),
         token_to_kv_pool_allocator=None,
-        token_to_kv_pool=object(),
+        token_to_kv_pool=SimpleNamespace(
+            id_spaces=lambda: {IdSpaceKind.FULL: IdSpace(key=(IdSpaceKind.FULL, None))}
+        ),
         page_size=1,
         device="cpu",
     )

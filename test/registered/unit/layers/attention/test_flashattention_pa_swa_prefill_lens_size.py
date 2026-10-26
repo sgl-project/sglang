@@ -25,6 +25,7 @@ import torch
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
+from sglang.srt.mem_cache.kv_loc_plan import IdSpace, IdSpaceKind
 from sglang.srt.mem_cache.page_interleave_pool import PageInterleaveKVPoolMixin
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -34,7 +35,8 @@ register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-small")
 
 
 class _FakeShardPool(PageInterleaveKVPoolMixin):
-    pass
+    def id_spaces(self):
+        return {IdSpaceKind.FULL: IdSpace(key=(IdSpaceKind.FULL, None))}
 
 
 def _make_prefill_aware_swa_runner(
@@ -69,7 +71,13 @@ def _make_prefill_aware_swa_runner(
         disable_radix_cache=False,
         enable_prefill_cp=False,
     )
-    token_to_kv_pool = token_to_kv_pool if token_to_kv_pool is not None else object()
+    token_to_kv_pool = (
+        token_to_kv_pool
+        if token_to_kv_pool is not None
+        else SimpleNamespace(
+            id_spaces=lambda: {IdSpaceKind.FULL: IdSpace(key=(IdSpaceKind.FULL, None))}
+        )
+    )
     token_to_kv_pool_allocator = SimpleNamespace(hands_out_virtual_ids=False)
     return SimpleNamespace(
         sliding_window_size=None,

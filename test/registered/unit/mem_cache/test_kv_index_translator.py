@@ -35,7 +35,7 @@ from test_multi_ended_allocator import _FakeKVCache, _FakeUnifiedSWAKVPool
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
-from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
+from sglang.srt.mem_cache.kv_loc_plan import IdSpace, IdSpaceKind
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_memory_pool import UnifiedKVPool
 from sglang.srt.state_capturer.base import BaseTopkCapturer
@@ -88,6 +88,11 @@ def _build_composite(ps, n_full_pages=16, n_swa_pages=8):
     # carries the pool-level full->swa translate, so the fake must too.
     kvcache.translate_loc_from_full_to_swa = allocator.translate_loc_from_full_to_swa
     return allocator
+
+
+def _plain_id_spaces():
+    """A static pool's one token sub-pool, indexed by its own ids."""
+    return {IdSpaceKind.FULL: IdSpace(key=(IdSpaceKind.FULL, None))}
 
 
 def _make_source(allocator, req_to_token, ps):
@@ -313,7 +318,7 @@ class TestCopyPageTable(unittest.TestCase):
         src = KVIndexTranslator(
             req_to_token=torch.zeros((2, 4), dtype=torch.int64),
             token_to_kv_pool_allocator=SimpleNamespace(hands_out_virtual_ids=False),
-            token_to_kv_pool=SimpleNamespace(),
+            token_to_kv_pool=SimpleNamespace(id_spaces=_plain_id_spaces),
             page_size=1,
             device=_DEV,
         )
@@ -382,7 +387,9 @@ class TestPoolOwnership(unittest.TestCase):
         """Same allocator, different pool: must stay disabled."""
         alloc = _build_composite(ps=1)
         req_to_token = torch.zeros((2, 8), dtype=torch.int32, device=_DEV)
-        own_pool = SimpleNamespace()  # a separate buffer, not the composite's
+        own_pool = SimpleNamespace(
+            id_spaces=_plain_id_spaces
+        )  # a separate buffer, not the composite's
         src = KVIndexTranslator(
             req_to_token=req_to_token,
             token_to_kv_pool_allocator=alloc,
@@ -401,7 +408,7 @@ class TestPoolOwnership(unittest.TestCase):
         src = KVIndexTranslator(
             req_to_token=req_to_token,
             token_to_kv_pool_allocator=alloc,
-            token_to_kv_pool=SimpleNamespace(),
+            token_to_kv_pool=SimpleNamespace(id_spaces=_plain_id_spaces),
             page_size=1,
             device=_DEV,
         )
@@ -662,7 +669,7 @@ class TestWriteIds(CustomTestCase):
         plain = KVIndexTranslator(
             req_to_token=torch.zeros((2, 4), dtype=torch.int64),
             token_to_kv_pool_allocator=SimpleNamespace(hands_out_virtual_ids=False),
-            token_to_kv_pool=SimpleNamespace(),
+            token_to_kv_pool=SimpleNamespace(id_spaces=_plain_id_spaces),
             page_size=1,
             device=_DEV,
         )

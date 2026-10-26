@@ -76,8 +76,6 @@ from sglang.kernels.ops.kvcache.kv_read_table import (
     build_kv_read_table_packed,
 )
 from sglang.srt.layers.dcp.layout import localize_dcp_indices
-from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
-from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.kv_loc_plan import (
     IdSpace,
     IdSpaceKind,
@@ -90,6 +88,14 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_npu
 
 _is_npu = is_npu()
+
+
+def _localized(name: str, space: IdSpace, localize) -> IdSpace:
+    """``space`` behind an NPU DCP rank's localization of the write window."""
+    if name == IdSpaceKind.FULL:
+        return IdSpace(key=(IdSpaceKind.FULL, "dcp-rank-local"), write=localize)
+    to_space = space.write
+    return msgspec.structs.replace(space, write=lambda ids: to_space(localize(ids)))
 
 
 class KVIndexTable(msgspec.Struct, frozen=True):
@@ -137,43 +143,34 @@ class KVIndexTranslator:
             host_allocator is not None and host_allocator is token_to_kv_pool_allocator
         )
         self.is_translating = is_unified_target or is_fused_draft
-        self._spaces: Dict[IdSpaceKind, IdSpace] = {}
+        # Keyed by sub-pool name; a runner reads the token sub-pools its pool
+        # routes layers to. A consumer outside an iteration's plan maps ids as
+        # the pool does (`_call_spaces`): only an NPU DCP target's plan
+        # localizes its writes.
+        self._spaces: Dict[str, IdSpace] = {}
+        self._call_spaces: Optional[Dict[str, IdSpace]] = None
         if self.is_translating:
             alloc = token_to_kv_pool_allocator
             self._capture_page_size = alloc.page_size
-            self._full_v2p_table = alloc.full_v2p_page_table
             self._translate_full = alloc.translate_kv_loc
             # DCP read ids stay WIDENED to the consumer: selecting this rank's
             # share changes the length, so only the production site can do it.
             self.defer_read_translate = get_parallel().attn_dcp_size > 1
             # Keyed by the allocator, which owns the tables: a fused draft's
-            # runner shares the target's full sub-pool, and so its key.
-            self._spaces[IdSpaceKind.FULL] = IdSpace(
-                key=(IdSpaceKind.FULL, id(alloc)),
-                # The WRITE loc is the one id that arrives DCP-WIDENED: read
-                # indices are collapsed by the DCP index kernels, `out_cache_loc`
-                # still carries the owner rule in `loc % dcp_size`.
-                write=alloc.translate_write_loc,
-                read_v2p=None if self.defer_read_translate else self._full_v2p_table,
-            )
-            routes_window_layers = is_unified_target or isinstance(
-                token_to_kv_pool, BaseSWAKVPool
-            )
-            if alloc.has_window_pool and routes_window_layers:
-                # Straight from the virtual ids through the sliding-window
-                # sub-pool's own table.
-                self._spaces[IdSpaceKind.SLIDING_WINDOW] = IdSpace(
-                    key=(IdSpaceKind.SLIDING_WINDOW, id(alloc)),
-                    write=alloc.translate_loc_from_full_to_swa,
-                    read_v2p=(
-                        None if self.defer_read_translate else alloc.swa_v2p_page_table
-                    ),
-                )
+            # runner shares the target's sub-pools, and so their keys. A fused
+            # draft reads the ones its own pool routes layers to.
+            alloc_spaces = alloc.id_spaces(defer_reads=self.defer_read_translate)
+            routed = alloc_spaces if is_unified_target else token_to_kv_pool.id_spaces()
+            self._spaces = {
+                name: space for name, space in alloc_spaces.items() if name in routed
+            }
+            self._full_v2p_table = self._spaces[IdSpaceKind.FULL].table
         else:
             self._capture_page_size = page_size
             self._full_v2p_table = None
             self._translate_full = None
             self.defer_read_translate = False
+            self._spaces = token_to_kv_pool.id_spaces()
             parallel = get_parallel()
             if _is_npu and parallel.dcp_enabled and not is_draft_worker:
                 # An NPU DCP target writes its rank's share of the window in
@@ -186,28 +183,11 @@ class KVIndexTranslator:
                     dcp_rank=parallel.dcp_rank,
                     interleave_size=page_size,
                 )
-                self._spaces[IdSpaceKind.FULL] = IdSpace(
-                    key=(IdSpaceKind.FULL, "dcp-rank-local"), write=localize
-                )
-            else:
-                localize = None
-                self._spaces[IdSpaceKind.FULL] = IdSpace(key=(IdSpaceKind.FULL, None))
-            # `translate_loc_from_full_to_swa` is abstract on `BaseSWAKVPool`,
-            # which is also what the backends' `_resolve_swa_kv_pool` keys on.
-            # Reads stay in `req_to_token`; the backends map them themselves.
-            if isinstance(token_to_kv_pool, BaseSWAKVPool) and (
-                not isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
-                or token_to_kv_pool.request_window is None
-            ):
-                to_swa = token_to_kv_pool.translate_loc_from_full_to_swa
-                self._spaces[IdSpaceKind.SLIDING_WINDOW] = IdSpace(
-                    key=(IdSpaceKind.SLIDING_WINDOW, id(token_to_kv_pool)),
-                    write=(
-                        to_swa
-                        if localize is None
-                        else lambda ids: to_swa(localize(ids))
-                    ),
-                )
+                self._call_spaces = self._spaces
+                self._spaces = {
+                    name: _localized(name, space, localize)
+                    for name, space in self._spaces.items()
+                }
 
         self._rows: Optional[torch.Tensor] = (
             torch.arange(req_to_token.shape[0], dtype=torch.int64, device=device)
@@ -215,10 +195,18 @@ class KVIndexTranslator:
             else None
         )
 
-    def space(self, kind: IdSpaceKind) -> Optional[IdSpace]:
-        """How this runner's ``kind`` sub-pool names the iteration's slots, or
-        None when its pool has no such sub-pool."""
+    def space(self, kind: str) -> Optional[IdSpace]:
+        """How this runner's ``kind`` sub-pool (a kind or a sub-pool name)
+        names the iteration's slots, or None when its pool has no such
+        sub-pool."""
         return self._spaces.get(kind)
+
+    def ids_in(self, kind: str, virtual_ids: torch.Tensor) -> torch.Tensor:
+        """``virtual_ids`` as this runner's ``kind`` sub-pool indexes them, for
+        a consumer outside an iteration's plan (a static pool's per-call read,
+        a transfer). Reads inside an iteration take the plan's tables."""
+        spaces = self._spaces if self._call_spaces is None else self._call_spaces
+        return spaces[kind].ids(virtual_ids)
 
     @property
     def window_kv_kind(self) -> IdSpaceKind:

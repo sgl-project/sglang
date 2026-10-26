@@ -53,15 +53,16 @@ if TYPE_CHECKING:
     )
 
 
-class IdSpaceKind(enum.Enum):
-    """A sub-pool of a runner's KV pool, as the consumers that index it name
-    it."""
+class IdSpaceKind(str, enum.Enum):
+    """The names of the two token sub-pools today's consumers ask for by
+    role. Id spaces are keyed by sub-pool name, so any sub-pool's name works
+    wherever a kind does."""
 
     # Full-attention layers: the pool's own token ids.
-    FULL = enum.auto()
+    FULL = "full"
     # The sliding-window layers of a hybrid pool: the same token ids through
     # the sliding-window sub-pool's table.
-    SLIDING_WINDOW = enum.auto()
+    SLIDING_WINDOW = "swa"
 
 
 class IdSpace(msgspec.Struct, frozen=True):
@@ -70,12 +71,19 @@ class IdSpace(msgspec.Struct, frozen=True):
     ``write`` maps the iteration's virtual token ids to this sub-pool's ids
     (None: they index it as they are). ``read_v2p`` is the page table its reads
     go through (None: reads stay in `req_to_token`, for the consumer to
-    finish). Runners whose pools share a sub-pool share its ``key``, and with
-    it a plan's ids for it."""
+    finish). ``table`` is the sub-pool's page table even when reads stay
+    virtual (DCP), for builders that gather a rank's share themselves.
+    Runners whose pools share a sub-pool share its ``key``, and with it a
+    plan's ids for it."""
 
     key: Hashable
     write: Optional[Callable[[torch.Tensor], torch.Tensor]] = None
     read_v2p: Optional[torch.Tensor] = None
+    table: Optional[torch.Tensor] = None
+
+    def ids(self, virtual_ids: torch.Tensor) -> torch.Tensor:
+        """``virtual_ids`` as this sub-pool indexes them."""
+        return virtual_ids if self.write is None else self.write(virtual_ids)
 
 
 def window_read_extent(forward_mode, spec_info, write_ids, batch_size: int) -> int:
