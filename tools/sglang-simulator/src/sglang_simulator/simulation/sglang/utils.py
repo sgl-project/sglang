@@ -37,6 +37,8 @@ def resolve_scheduler_config(
     server_args: "ServerArgs",
     model_config: typing.Optional["ModelConfig"] = None,
 ) -> SchedulerConfig:
+    from sglang_simulator.simulation.manager.config import ConfigManager
+
     from sglang.version import __version__
 
     resolved = _resolved_server_args(server_args)
@@ -60,7 +62,20 @@ def resolve_scheduler_config(
         max_total_tokens=get_arg("max_total_tokens"),
         tp_size=get_arg("tp_size"),
         ep_size=get_arg("ep_size"),
-        dp_size=get_arg("dp_size"),
+        dp_size=ConfigManager.modeled_attention_dp_size(
+            {
+                key: get_arg(key) if key == "dp_size" else get_arg(key, 1)
+                for key in (
+                    "tp_size",
+                    "dp_size",
+                    "attn_dp_size",
+                    "pp_size",
+                    "attn_cp_size",
+                    "ep_size",
+                    "nnodes",
+                )
+            }
+        ),
         pp_size=get_arg("pp_size"),
         cp_size=get_arg("attn_cp_size", 1),
         cp_style=get_arg("cp_style", "none"),

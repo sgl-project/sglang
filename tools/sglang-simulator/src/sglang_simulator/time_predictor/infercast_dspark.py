@@ -98,7 +98,7 @@ def _native_joint_runtime(
 
     The caller retains the independent runtime/capture/allocated-source custody.
     A progress policy attests the local law and mirror observations, not that
-    physical context. Public JSON construction remains closed for ADP2.
+    physical context. Public native factory/clock activation remains guarded.
     """
     from sglang_simulator.simulation.sglang.dspark import DSparkSession, DSparkTopology
     from sglang_simulator.simulation.sglang.dspark_joint_execution import (
@@ -165,6 +165,344 @@ def _native_joint_runtime(
         output_token_id=output_token_id,
         reference_events=True,
         joint_execution_resolver=resolver,
+    )
+
+
+def _native_joint_source_from_binding(binding, runtime_profile_json, model_revision):
+    """Rebuild physical coordinates from bounded original source material.
+
+    These receipts establish source/resource facts, not timing qualification.
+    Supplemental FILEs and configured environment defaults remain conditional
+    semantics; they do not attest that every module was loaded in the process.
+    """
+    from infercast._serialization import canonical_json_bytes
+    from infercast.sdk.native_dp_progress import NativeDPProgressPolicy
+    from infercast.sdk.native_segment_analytic import _JOINT_SOURCES
+    from infercast.sdk.native_sources import NATIVE_SOURCE_0522
+    from infercast.sdk.native_windows import MAX_NATIVE_WINDOW_BYTES
+    from infercast.sdk.perf_database.dsv41_dspark import (
+        NATIVE_RUNTIME_ENVIRONMENT,
+        decode_dspark_artifact,
+        decode_dspark_json,
+        validate_allocated_pools,
+        validate_native_startup,
+    )
+    from infercast.sdk.perf_database.dsv41_native_forward import (
+        parse_forward_profile,
+        validate_native_graph_captures,
+    )
+    from infercast.sdk.perf_database.dsv41_native_runtime import (
+        forward_environment,
+        select_forward_runtime,
+    )
+    from infercast.sdk.perf_database.slice_manifest import _read_regular_metadata_file
+
+    fields = {
+        "root",
+        "source_runtime",
+        "startup",
+        "proposal",
+        "windows",
+        "captures",
+        "allocated",
+        "profiles",
+        "container",
+        "supplemental_files",
+    }
+    _require(
+        type(binding) is dict and set(binding) == fields,
+        "native_joint_source_binding requires its exact original asset fields",
+    )
+    _require(
+        type(binding["root"]) is str and bool(binding["root"].strip()),
+        "joint source root must be explicit",
+    )
+    root = Path(binding["root"])
+    _require(
+        root.is_absolute()
+        and root.is_dir()
+        and not root.is_symlink()
+        and root.resolve(strict=True) == root,
+        "joint source root must be a resolved directory without links",
+    )
+
+    def read(ref):
+        _require(
+            type(ref) is dict
+            and set(ref) == {"path", "sha256"}
+            and type(ref["path"]) is str
+            and type(ref["sha256"]) is str
+            and re.fullmatch("[0-9a-f]{64}", ref["sha256"]) is not None,
+            "joint source requires exact standard path/sha256 descriptors",
+        )
+        raw = _read_regular_metadata_file(root, ref["path"], MAX_NATIVE_WINDOW_BYTES)
+        _require(
+            hashlib.sha256(raw).hexdigest() == ref["sha256"],
+            "joint source original bytes differ from descriptor",
+            code="invalid_execution_profile",
+        )
+        return raw
+
+    def document(ref):
+        return decode_dspark_artifact(read(ref))
+
+    originals = {}
+    for name, count in (
+        ("startup", 4),
+        ("proposal", 2),
+        ("windows", 2),
+        ("captures", 4),
+        ("allocated", 2),
+    ):
+        refs = binding[name]
+        _require(
+            type(refs) is list and len(refs) == count,
+            "joint source omits original " + name,
+        )
+        originals[name] = [document(ref) for ref in refs]
+        _require(
+            len({ref["path"] for ref in refs}) == count,
+            "joint source repeats original " + name,
+        )
+    startup, proposal, windows = (
+        originals[n] for n in ("startup", "proposal", "windows")
+    )
+    captures, allocated = originals["captures"], originals["allocated"]
+    raw_runtime = document(binding["source_runtime"])
+    selected = select_forward_runtime(raw_runtime)
+    _require(
+        selected.source == NATIVE_SOURCE_0522,
+        "joint source requires the supported native realization",
+    )
+    _require(
+        type(binding["profiles"]) is dict
+        and set(binding["profiles"]) == {"EXTEND", "DECODE"},
+        "joint source requires distinct EXTEND and DECODE profile descriptors",
+    )
+    profiles = {
+        mode: parse_forward_profile(document(ref))
+        for mode, ref in binding["profiles"].items()
+    }
+    first = startup[0]
+    for key, original in (
+        ("execution", "exec_runtime"),
+        ("server_args", "server_args"),
+        ("runtime_environment", "runtime_environment"),
+        ("resolved_model_config", "resolved_model_config"),
+        ("model_metadata_files", "model_metadata_files"),
+    ):
+        _require(
+            raw_runtime[key] == first[original],
+            "original runtime differs from its startup " + original,
+            code="incompatible_runtime",
+        )
+    _require(
+        first["sglang_version"] == raw_runtime["framework_runtime_version"],
+        "joint source framework version differs",
+        code="incompatible_runtime",
+    )
+    environment = first["runtime_environment"]
+    startup_environment = {
+        key: environment[key]
+        for key in forward_environment(NATIVE_RUNTIME_ENVIRONMENT, selected)
+    }
+    for profile in profiles.values():
+        validate_native_startup(
+            startup,
+            profile,
+            runtime_version=raw_runtime["framework_runtime_version"],
+            model_snapshot_revision=model_revision,
+            tp_size=2,
+            attention_dp_size=2,
+            runtime_environment=startup_environment,
+            source_pin=selected.source.name,
+        )
+    validate_allocated_pools(
+        allocated, tp_size=2, attention_dp_size=2, source_pin=selected.source.name
+    )
+    validate_native_graph_captures(
+        captures,
+        participants=[row["topology"] for row in proposal],
+        profile=profiles["DECODE"],
+        startup=startup,
+        windows=windows,
+        source_pin=selected.source.name,
+    )
+    policy = NativeDPProgressPolicy(
+        startup=tuple(startup), proposal=tuple(proposal), windows=tuple(windows)
+    )
+    _require(
+        type(policy.reference_needs_cpu_seq_lens) is bool,
+        "joint source omits original reference mirror observations",
+        code="data_unavailable",
+    )
+
+    roles, modules = [], {}
+    by_rank = {row["topology"]["tp_rank"]: row for row in proposal}
+    for start in startup:
+        rank, draft = start["parallel"]["tp_rank"], start["is_draft_worker"]
+        _require(
+            all(
+                start[k] == first[k]
+                for k in (
+                    "server_args",
+                    "exec_runtime",
+                    "runtime_environment",
+                    "actual_model_dtype",
+                )
+            )
+            and start["resolved_model_config"]["quantization_config"]
+            == first["resolved_model_config"]["quantization_config"],
+            "joint startup execution/model coordinates differ",
+            code="incompatible_runtime",
+        )
+        allocation = next(
+            row for row in allocated if row["topology"]["tp_rank"] == rank
+        )
+        allocated_ref = binding["allocated"][allocated.index(allocation)]
+        owner = by_rank[rank]
+        _require(
+            owner["allocated_runtime_artifact"] == Path(allocated_ref["path"]).name
+            and max(row["time_ns"] for row in startup if row["rank"] == rank)
+            <= allocation["time_ns"]
+            <= owner["time_ns"],
+            "joint allocated pool does not belong to its proposal epoch",
+        )
+        runner = next(
+            row for row in allocation["runners"] if row["is_draft_worker"] is draft
+        )
+        capture = next(
+            row
+            for row in captures
+            if row["pid"] == start["pid"] and row["is_draft_worker"] is draft
+        )
+        roles.append(
+            dict(
+                role="draft" if draft else "target",
+                parallel={
+                    key: value
+                    for key, value in start["parallel"].items()
+                    if key not in ("launch_world_rank", "launch_world_size")
+                },
+                monokernel_installed=runner["monokernel_route"]["installed"],
+                graph={
+                    key: capture[key]
+                    for key in (
+                        "captured_req_width",
+                        "request_pool_size",
+                        "padding_policy",
+                        "graph_keys",
+                        "capture_batches",
+                    )
+                },
+            )
+        )
+        for module, row in start["loaded_realization_modules"].items():
+            if module in _JOINT_SOURCES:
+                digest = row["sha256"]
+                _require(
+                    module not in modules or modules[module] == {"sha256": digest},
+                    "joint startup module identities differ",
+                )
+                modules[module] = {"sha256": digest}
+    for row in proposal:
+        for module, source in (
+            (
+                "sglang.srt.environ",
+                row["facts"]["golden_acceptance"]["sources"]["environment"],
+            ),
+            (
+                "sglang.srt.speculative.dspark_components.dspark_worker_v2",
+                row["facts"]["sources"]["worker"],
+            ),
+        ):
+            value = {"sha256": source["sha256"]}
+            _require(
+                module not in modules or modules[module] == value,
+                "joint proposal module identities differ",
+            )
+            modules[module] = value
+    missing = set(_JOINT_SOURCES) - modules.keys()
+    _require(
+        type(binding["supplemental_files"]) is dict
+        and set(binding["supplemental_files"]) == missing,
+        "joint source requires exactly its missing conditional FILE originals",
+    )
+    for module, ref in binding["supplemental_files"].items():
+        modules[module] = {"sha256": hashlib.sha256(read(ref)).hexdigest()}
+    _require(
+        modules
+        == {name: {"sha256": digest} for name, digest in _JOINT_SOURCES.items()},
+        "joint conditional source FILE identities differ",
+        code="incompatible_runtime",
+    )
+
+    inspect = decode_dspark_json(read(binding["container"]))
+    _require(
+        type(inspect) is list
+        and len(inspect) == 1
+        and inspect[0]["Config"]["Image"] == selected.image,
+        "joint container image differs from its native source",
+    )
+    configured = {}
+    for item in inspect[0]["Config"]["Env"]:
+        key, value = item.split("=", 1)
+        _require(key not in configured, "joint container environment repeats a name")
+        configured[key] = value
+    env = dict(environment)
+    defaults = []
+    for name in (
+        "SGLANG_USE_ROCM700A",
+        "SGLANG_AITER_MEGA_RANK_SYNC",
+        "SGLANG_DSV4_FP4_DEQUANT",
+        "SGLANG_DP_USE_REDUCE_SCATTER",
+        "SGLANG_SHARED_EXPERT_TP1",
+        "SGLANG_DP_SHARED_EXPERT_LOCAL",
+        "SGLANG_DP_USE_GATHERV",
+        "SGLANG_ENABLE_DP_GATHER_FP8",
+    ):
+        if name in env:
+            _require(
+                name not in configured or configured[name] == env[name],
+                "joint configured environment differs from original startup",
+            )
+        else:
+            env[name] = configured.get(name)
+            defaults.append(name)
+    sections = {
+        key: copy.deepcopy(first["exec_runtime"][key])
+        for key in ("kernel", "comm", "moe", "offload", "overlap", "graph", "features")
+    }
+    for mode in ("decode", "prefill"):
+        sections["graph"]["cuda_graph_backend_" + mode] = first["server_args"][
+            "cuda_graph_config"
+        ][mode]["backend"]
+    physical = dict(
+        schema_version=1,
+        software=dict(sglang=first["sglang_version"], modules=modules),
+        model_realization=dict(
+            model_dtype=first["actual_model_dtype"],
+            quantization_config=first["resolved_model_config"]["quantization_config"],
+        ),
+        roles=sorted(roles, key=lambda row: (row["role"], row["parallel"]["tp_rank"])),
+        execution=dict(sections=sections, environment=env),
+    )
+    _require(
+        canonical_json_bytes(physical).decode() == runtime_profile_json,
+        "configured joint runtime differs from original physical source",
+        code="incompatible_runtime",
+    )
+    return (
+        policy,
+        profiles,
+        {
+            **copy.deepcopy(binding),
+            "root": str(root),
+            "conditional_FILE_modules": sorted(binding["supplemental_files"]),
+            "container_configured_environment_coordinates": defaults,
+            "source_identity_sha256": policy.source_identity_sha256,
+            "timing_qualified": False,
+        },
     )
 
 
@@ -1053,6 +1391,7 @@ class InferCastDSparkTimePredictor(InferTimePredictor):
         native_analytic_model=None,
         native_cost_evidence_path=None,
         native_source_binding=None,
+        native_joint_source_binding=None,
         output_token_id=1,
         model_config_root=None,
         **kwargs,
@@ -1078,9 +1417,29 @@ class InferCastDSparkTimePredictor(InferTimePredictor):
             and type(native_source_binding) is dict,
             "native_source_binding requires explicit HYBRID analytic costs",
         )
+        joint = native_joint_source_binding is not None
+        _require(
+            not joint
+            or cost_mode == "HYBRID"
+            and progress_kind == "source_golden351"
+            and type(native_joint_source_binding) is dict
+            and all(
+                value is None
+                for value in (
+                    native_source_binding,
+                    native_segment_profile_id,
+                    native_capture_profile,
+                    native_initial_draft_buffer,
+                    native_source_work_policy,
+                    proposal_profile_id,
+                    progress_artifact,
+                )
+            ),
+            "native joint source requires explicit HYBRID/source_golden351 without regional selectors",
+        )
         _require(
             cost_mode != "HYBRID"
-            or native_segment_profile_id is not None
+            or (native_segment_profile_id is not None or joint)
             and progress_kind == "source_golden351",
             "HYBRID requires source-bound native golden regions",
         )
@@ -1097,7 +1456,8 @@ class InferCastDSparkTimePredictor(InferTimePredictor):
                 "source_golden351 requires an explicit nonnegative integer model_seed",
             )
             _require(
-                progress_artifact is None and native_segment_profile_id is not None,
+                progress_artifact is None
+                and (native_segment_profile_id is not None or joint),
                 "source_golden351 requires native regions and no empirical progress_artifact",
             )
         _require(
@@ -1134,7 +1494,7 @@ class InferCastDSparkTimePredictor(InferTimePredictor):
             code="unsupported_topology",
         )
         for name, expected in (
-            ("dp_size", 1),
+            ("dp_size", 2 if joint else 1),
             ("pp_size", 1),
             ("ep_size", 1),
             ("cp_size", 1),
@@ -1142,9 +1502,14 @@ class InferCastDSparkTimePredictor(InferTimePredictor):
             value = getattr(config, name, None)
             _require(
                 type(value) is int and value == expected,
-                "DSPark predictor requires modeled DP1/PP1/EP1/CP1",
+                "DSPark predictor requires its selected modeled attention-DP/PP1/EP1/CP1 topology",
                 code="unsupported_topology",
             )
+        _require(
+            not joint or tp_size == 2,
+            "joint DSPark requires two chips, shared MLP TP2 and singleton attention TP1",
+            code="unsupported_topology",
+        )
         _require(
             config.backend_name == "sglang"
             and type(config.backend_version) is str
@@ -1273,6 +1638,88 @@ class InferCastDSparkTimePredictor(InferTimePredictor):
             raise PredictorError(
                 "data_unavailable", f"DSPark SDK model/slice is unavailable: {error}"
             ) from error
+
+        if joint:
+            try:
+                from infercast.sdk.native_segment_analytic import (
+                    JOINT_POLICY,
+                    NativeSegmentAnalyticModel,
+                )
+                from infercast.sdk.perf_database.dsv41_dspark import (
+                    decode_dspark_artifact,
+                )
+
+                policy, profiles, source_identity = _native_joint_source_from_binding(
+                    native_joint_source_binding, runtime_text, model_revision
+                )
+                _require(
+                    type(native_analytic_model) is dict
+                    and set(native_analytic_model) == {"EXTEND", "DECODE"},
+                    "joint costs require two phase analytic model descriptors",
+                )
+                models, model_identity = {}, {}
+                for mode, ref in native_analytic_model.items():
+                    path, raw, digest = _asset(ref, "native_analytic_model." + mode)
+                    models[mode] = value = NativeSegmentAnalyticModel.from_dict(
+                        decode_dspark_artifact(raw)
+                    )
+                    _require(
+                        value.policy == JOINT_POLICY
+                        and value.calibration == "none"
+                        and value.tp_size == 2
+                        and value.execution_profile_id == profiles[mode].profile_id,
+                        "joint analytic model differs from its phase/source profile",
+                        code="incompatible_runtime",
+                    )
+                    model_identity[mode] = dict(
+                        path=str(path), sha256=digest, parameters=value.to_dict()
+                    )
+                self.dspark_runtime = _native_joint_runtime(
+                    database,
+                    source_policy=policy,
+                    runtime_profile_json=runtime_text,
+                    profiles=profiles,
+                    analytic_models=models,
+                    model_config_sha256=model_config_ref["sdk_canonical_sha256"],
+                    model_seed=model_seed,
+                    output_token_id=output_token_id,
+                    cost_evidence_path=native_cost_evidence_path,
+                )
+            except PredictorError:
+                raise
+            except (
+                ImportError,
+                OSError,
+                KeyError,
+                ValueError,
+                TypeError,
+                StopIteration,
+            ) as error:
+                raise PredictorError(
+                    "data_unavailable", f"joint source is unavailable: {error}"
+                ) from error
+            self._identity = dict(
+                model_id=model_id,
+                model_revision=model_revision,
+                native_model_config=model_config_ref,
+                provider_revision=provider_revision,
+                provider_version=getattr(infercast, "__version__", None),
+                system=system,
+                framework_version=config.backend_version,
+                topology=dict(tp=2, dp=2, pp=1, ep=1, cp=1),
+                runtime_profile=dict(path=str(runtime_path), sha256=runtime_digest),
+                progress_kind=progress_kind,
+                progress_model_ref=self.dspark_runtime.session.progress_model.model_ref,
+                native_joint_source_binding=source_identity,
+                native_analytic_model=model_identity,
+                slice=dict(
+                    path=str(database.slice_ref.slice_dir),
+                    stack_path=str(stack_path),
+                    stack_sha256=stack_digest,
+                    database_mode=cost_mode,
+                ),
+            )
+            return
 
         from sglang_simulator.simulation.sglang.dspark import (
             DSparkSession,
@@ -1488,6 +1935,20 @@ class InferCastDSparkTimePredictor(InferTimePredictor):
         )
 
     def get_metrics(self):
+        if "native_joint_source_binding" in self._identity:
+            # One joint whole-worker price, never seven fabricated regional costs.
+            runtime = self.dspark_runtime
+            return {
+                "infercast_dspark": {
+                    **copy.deepcopy(self._identity),
+                    "cost_grain": "whole_worker",
+                    "source_resolution": "sdk_native_joint_source_originals",
+                    "hybrid_cost_queries": runtime.session.cost_model.get_cost_metrics(),
+                    "timing_qualified": False,
+                    "accuracy_admitted": False,
+                    "public_factory_clock_supported": False,
+                }
+            }
         from sglang_simulator.simulation.sglang.dspark import (
             _DECODE_PHASES,
             _PREFILL_PHASES,

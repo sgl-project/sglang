@@ -204,12 +204,51 @@ class ConfigManager:
         return cls._scheduler_config
 
     @classmethod
+    def modeled_attention_dp_size(cls, native: dict):
+        """Translate only the explicitly source-bound joint simulator domain.
+
+        Native DP1 still means one TP2 worker, not two model replicas. The
+        modeled field represents its two verified singleton attention groups.
+        The factory independently validates the retained source topology.
+        """
+        ordinary = native.get("dp_size", 1)
+        if cls._raw_config is None and not os.getenv("SGLANG_SIMULATOR_CONFIG_PATH"):
+            return ordinary
+        predictor = cls._get_raw_config().get("predictor", {})
+        if (
+            predictor.get("name") != "infercast_dspark"
+            or predictor.get("native_joint_source_binding") is None
+        ):
+            return ordinary
+        expected = {
+            "tp_size": 2,
+            "dp_size": 1,
+            "attn_dp_size": 2,
+            "pp_size": 1,
+            "attn_cp_size": 1,
+            "ep_size": 1,
+            "nnodes": 1,
+        }
+        if (
+            predictor.get("cost_mode", "SILICON") != "HYBRID"
+            or predictor.get("progress_kind", "empirical") != "source_golden351"
+            or any(
+                type(native.get(key)) is not int or native[key] != value
+                for key, value in expected.items()
+            )
+        ):
+            raise ValueError(
+                "joint DSPark requires native DP1/TP2/attention-DP2/PP1/CP1/EP1/one node"
+            )
+        return 2
+
+    @classmethod
     def _parse_server_args(cls, server_args: dict, backend: str) -> SchedulerConfig:
         if backend == "sglang":
             return SchedulerConfig(
                 tp_size=server_args.get("tp_size", 1),
                 ep_size=server_args.get("ep_size", 1),
-                dp_size=server_args.get("dp_size", 1),
+                dp_size=cls.modeled_attention_dp_size(server_args),
                 pp_size=server_args.get("pp_size", 1),
                 cp_size=server_args.get("attn_cp_size", 1),
                 cp_style=server_args.get("cp_style", "none"),
@@ -307,6 +346,7 @@ class ConfigManager:
                 "native_analytic_model",
                 "native_cost_evidence_path",
                 "native_source_binding",
+                "native_joint_source_binding",
                 "output_token_id",
             }
             unknown_fields = sorted(predictor_config.keys() - supported_fields)
@@ -346,24 +386,31 @@ class ConfigManager:
                         **ref,
                         "path": cls.resolve_infercast_path(ref["path"]),
                     }
+            if options.get("native_joint_source_binding") is not None:
+                models = options.get("native_analytic_model")
+                if type(models) is dict:
+                    options["native_analytic_model"] = {
+                        mode: {**ref, "path": cls.resolve_infercast_path(ref["path"])}
+                        if type(ref) is dict and type(ref.get("path")) is str
+                        else ref
+                        for mode, ref in models.items()
+                    }
             if type(options.get("native_cost_evidence_path")) is str:
                 options["native_cost_evidence_path"] = cls.resolve_infercast_path(
                     options["native_cost_evidence_path"]
                 )
-            binding = options.get("native_source_binding")
-            if (
-                type(binding) is dict
-                and type(binding.get("root")) is str
-                and binding["root"].strip()
-            ):
-                root = Path(os.path.expandvars(binding["root"])).expanduser()
-                if not root.is_absolute():
-                    root = Path(Envs.config_path()).resolve().parent / root
-                # Keep link identity for the factory's safe original reader.
-                options["native_source_binding"] = {
-                    **binding,
-                    "root": str(root.absolute()),
-                }
+            for name in ("native_source_binding", "native_joint_source_binding"):
+                binding = options.get(name)
+                if (
+                    type(binding) is dict
+                    and type(binding.get("root")) is str
+                    and binding["root"].strip()
+                ):
+                    root = Path(os.path.expandvars(binding["root"])).expanduser()
+                    if not root.is_absolute():
+                        root = Path(Envs.config_path()).resolve().parent / root
+                    # Keep link identity for the factory's safe original reader.
+                    options[name] = {**binding, "root": str(root.absolute())}
             return InferCastDSparkTimePredictor(
                 model,
                 hw=hw,

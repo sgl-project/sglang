@@ -1260,3 +1260,38 @@ The AgentX reference output-token throughput counts output from successful
 profiling requests over their observed earliest-start/latest-end span. It uses a
 different output cohort and denominator; report it separately from fixed-window
 committed throughput.
+# Explicit joint source construction
+
+The existing `infercast_dspark` provider accepts `native_joint_source_binding`
+only with `cost_mode: HYBRID`, `progress_kind: source_golden351` and a modeled
+TP2/attention-DP2/PP1 topology. This is internal construction support; the native
+public factory and common-clock activation guards remain closed pending entry
+controls. It does not establish C64 workflow support or timing qualification.
+
+The binding has exactly `root`, `source_runtime`, `startup`, `proposal`, `windows`,
+`captures`, `allocated`, `profiles`, `container` and `supplemental_files`. Under
+the resolved root, all originals are byte-preserved regular `_meta/<basename>`
+assets addressed by standard `{path, sha256}` descriptors. Keep allocated
+basenames referenced by proposal receipts. Counts are four startup roles, two
+proposal paths, two windows, four graph inventories and two allocated pools.
+`profiles` maps `EXTEND` and `DECODE` to their own standard profile descriptors;
+the separate `native_analytic_model` maps the same phases to explicit joint,
+uncalibrated model assets. Regional/proposal selectors and warm-witness options
+cannot be combined with this joint binding. Each live DP buffer starts cold and
+subsequently follows the actual worker's source-owned state.
+
+Construction reuses the SDK startup, allocated-pool and capture validators and
+reconstructs the complete normalized `runtime_profile` from those originals.
+The retained container configuration supplies finite otherwise-unobserved
+environment coordinates; missing configured values are declared defaults, not
+observed process absence. Supplemental source FILEs establish conditional source
+semantics, not loaded alias equivalence. Missing mirror observations remain
+unknown and fail. Both source phase profiles/models remain independent of numeric
+row qualification; only typed numeric misses may use the existing joint SOL path.
+One whole-worker price represents the coupled forward, with no invented regional
+prices or ADP1 cost summation.
+
+Only this explicit domain maps native `dp_size: 1, attn_dp_size: 2, tp_size: 2`
+to modeled attention-DP2. Native process counts and raw arguments are unchanged;
+the model still has two chips, shared MLP TP2 and singleton attention TP1. Other
+predictors and the default ADP1 provider retain their existing mapping.
