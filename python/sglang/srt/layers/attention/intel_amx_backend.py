@@ -6,6 +6,7 @@ import torch
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.radix_attention import AttentionType
+from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -29,6 +30,7 @@ class IntelAMXAttnBackend(AttentionBackend):
         # corresponding ForwardBatch fields.
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
+        self.kv_index_translator = model_runner.kv_index_translator
         self.use_mla = model_runner.use_mla_backend
         self.max_context_len = model_runner.model_config.context_len
 
@@ -151,8 +153,8 @@ class IntelAMXAttnBackend(AttentionBackend):
 
     def _init_swa_forward_metadata(self, out_cache_loc: torch.Tensor | None) -> None:
         if self.use_sliding_window_kv_pool and out_cache_loc is not None:
-            self.swa_out_cache_loc = (
-                self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc)
+            self.swa_out_cache_loc = self.kv_index_translator.ids_in(
+                IdSpaceKind.SLIDING_WINDOW, out_cache_loc
             )
         else:
             self.swa_out_cache_loc = None
@@ -186,9 +188,9 @@ class IntelAMXAttnBackend(AttentionBackend):
             return cached[1], cached[2]
 
         rows = req_to_token[req_pool_indices, : int(seq_lens.max())]
-        translated = self.token_to_kv_pool.translate_loc_from_full_to_swa(rows).to(
-            req_to_token.dtype
-        )
+        translated = self.kv_index_translator.ids_in(
+            IdSpaceKind.SLIDING_WINDOW, rows
+        ).to(req_to_token.dtype)
         indices = torch.arange(
             translated.shape[0], dtype=torch.int64, device=translated.device
         )

@@ -12,6 +12,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 import msgspec
 import torch
 
+from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
 from sglang.srt.mem_cache.layout.fused_draft import (
     HOST_KINDS,
     DraftStateRegion,
@@ -228,7 +229,9 @@ class UnifiedDraftSWAKVPool(SWAKVPool):
 
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
         """Virtual token ids -> swa-physical token ids, through the host."""
-        return self.host_allocator.translate_loc_from_full_to_swa(kv_indices)
+        return self.host_allocator.id_spaces()[IdSpaceKind.SLIDING_WINDOW].ids(
+            kv_indices
+        )
 
     def get_state_buf_infos(self):
         raise NotImplementedError(

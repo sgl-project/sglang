@@ -7,6 +7,7 @@ import torch
 from sglang.kernels.ops.memory.adler32 import adler32_strided_checksum
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
     HybridLinearKVPool,
@@ -72,11 +73,9 @@ def state_indices_for_request(
         window_full = scheduler.req_to_token_pool.req_to_token[
             req.kv.req_pool_idx, window_start:seq_len
         ]
-        window_swa = (
-            scheduler.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
-                window_full
-            )
-        )
+        window_swa = scheduler.token_to_kv_pool_allocator.id_spaces()[
+            IdSpaceKind.SLIDING_WINDOW
+        ].ids(window_full)
         return _to_page_indices_gpu(window_swa, page_size)
     if isinstance(pool, (DSATokenToKVPool, MiniMaxSparseKVPool)):
         device_page_size = pool.page_size
