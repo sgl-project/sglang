@@ -24,6 +24,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
     check_cuda_graph_backend,
+    cuda_graph_fully_disabled,
 )
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -34,7 +35,10 @@ from sglang.srt.model_executor.graph_memory_usage import (
     merge_graph_time_usage,
 )
 from sglang.srt.model_executor.graph_shared_output import GraphSharedOutput
-from sglang.srt.model_executor.hook_manager import register_forward_hooks
+from sglang.srt.model_executor.hook_manager import (
+    register_forward_hooks,
+    warn_if_cuda_graphs_skip_forward_hooks,
+)
 from sglang.srt.model_executor.runner import (
     EagerRunner,
     PrefillCudaGraphRunner,
@@ -455,8 +459,13 @@ def finalize_cuda_graph_capture(model_runner: ModelRunner) -> None:
     # not traced into any captured graph — capture stays hook-free and hooks
     # fire only on the eager forward path (capture replay never runs Python
     # hooks anyway).
-    if get_observability().forward_hooks:
-        register_forward_hooks(model_runner.model, get_observability().forward_hooks)
+    hook_specs = get_observability().forward_hooks
+    if hook_specs:
+        warn_if_cuda_graphs_skip_forward_hooks(
+            hook_specs,
+            cuda_graphs_enabled=not cuda_graph_fully_disabled(),
+        )
+        register_forward_hooks(model_runner.model, hook_specs)
 
     prealloc_symmetric_memory_pool(
         is_draft_worker=model_runner.is_draft_worker,
