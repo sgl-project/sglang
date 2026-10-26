@@ -9,14 +9,14 @@ on:
   workflow_dispatch:
     inputs:
       run_all_tests:
-        description: "Run the preflight even if the last commit touched no PPU path"
+        description: "Build and run both sanity files even without PPU path changes"
         required: false
         type: boolean
         default: true
   workflow_call:
     inputs:
       ref:
-        description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the default branch.'
+        description: "Git ref to test; defaults to the triggering event SHA"
         required: false
         type: string
         default: ''
@@ -27,8 +27,7 @@ on:
         default: false
 
 concurrency:
-  # Newer runs cancel older runs for the same ref; unrelated label events
-  # use isolated groups to avoid interfering with active runs.
+  # Unrelated label events must not cancel or replace the active PPU checks.
   group: >-
     pr-test-ppu-${{
       (github.event_name == 'pull_request' &&
@@ -40,11 +39,15 @@ concurrency:
     }}
   cancel-in-progress: true
 
+defaults:
+  run:
+    shell: bash
+
+env:
+  GIT_CONFIG_NOSYSTEM: "1"
+
 jobs:
-  # ==================== Check Changes ==================== #
   check-changes:
-    # Give skipped checks from unrelated labels distinct names so they cannot
-    # replace the corresponding checks from an active run.
     name: >-
       ${{ (github.event_name == 'pull_request' && github.event.action == 'labeled' &&
            github.event.label.name != 'run-ci' && github.event.label.name != 'run-ci-ppu') &&
@@ -59,25 +62,28 @@ jobs:
       contents: read
       pull-requests: read
     outputs:
-      # Scope only; the shared pr-gate checks both required labels.
       ppu: ${{ steps.filter.outputs.ppu == 'true' || steps.run-mode.outputs.run_all_tests == 'true' }}
+      source-sha: ${{ steps.source.outputs.sha }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          # github.sha (not github.ref) so a runner that dequeues after main
-          # advances still validates the SHA that triggered the run.
           ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+
+      - name: Pin the source revision for every job
+        id: source
+        run: printf 'sha=%s\n' "$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Determine run mode
         id: run-mode
+        env:
+          RUN_ALL_TESTS: ${{ inputs.run_all_tests }}
         run: |
-          if [[ "${{ inputs.run_all_tests }}" == "true" ]]; then
+          if [[ "$RUN_ALL_TESTS" == "true" ]]; then
             echo "run_all_tests=true" >> "$GITHUB_OUTPUT"
-            echo "Run mode: ALL TESTS"
           else
             echo "run_all_tests=false" >> "$GITHUB_OUTPUT"
-            echo "Run mode: FILTERED (triggered by ${{ github.event_name }})"
           fi
 
       - name: Detect file changes
@@ -85,16 +91,18 @@ jobs:
         uses: dorny/paths-filter@v3
         if: steps.run-mode.outputs.run_all_tests != 'true'
         with:
-          # PPU-specific paths only.
           filters: |
             ppu:
               - ".github/workflows/pr-test-ppu.yml"
               - "scripts/ci/ppu/**"
-              - "python/sglang/srt/platforms/ppu.py"
-              - "python/sglang/srt/hardware_backend/ppu/**"
-              - "python/sglang/kernels/aot/csrc/ppu/**"
+              - "python/sglang/srt/platforms/sail.py"
+              - "python/sglang/kernels/aot/setup_sail.py"
+              - "python/sglang/kernels/aot/pyproject_sail.toml"
+              - "python/sglang/kernels/aot/csrc/common_extension_sail.cc"
+              - "python/sglang/kernels/jit/utils/compile/sailify.py"
+              - "test/registered/core/test_basic_sanity_eagle3.py"
+              - "test/registered/core/test_basic_sanity_dflash.py"
 
-  # ==================== PR Gate ==================== #
   pr-gate:
     name: >-
       ${{ (github.event_name == 'pull_request' && github.event.action == 'labeled' &&
@@ -108,62 +116,168 @@ jobs:
       require-label: run-ci-ppu
     secrets: inherit
 
-  # ==================== PPU Runner Preflight ==================== #
-  # Validates the runner contract only; the SRT platform and AOT kernels land
-  # in later PRs and build their first real test on top of this job.
-  ppu-preflight:
+  ppu-build:
     name: >-
       ${{ (github.event_name == 'pull_request' && github.event.action == 'labeled' &&
            github.event.label.name != 'run-ci' && github.event.label.name != 'run-ci-ppu') &&
-          'ignored-label-ppu-preflight' || 'ppu-preflight' }}
+          'ignored-label-ppu-build' || 'ppu-build' }}
     needs: [check-changes, pr-gate]
     if: needs.check-changes.outputs.ppu == 'true'
-    runs-on: 1-ppu-m890p
-    timeout-minutes: 60
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    container:
+      image: download.t-head.cn/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-hggcrt3-py312-20261005
     env:
-      SGLANG_IS_IN_CI: true
+      PPU_CI_SOURCE_SHA: ${{ needs.check-changes.outputs.source-sha }}
+      MAX_JOBS: "2"
+      SGL_KERNEL_COMPILE_THREADS: "2"
+    outputs:
+      wheel-artifact-id: ${{ steps.wheels.outputs.artifact-id }}
     steps:
-      - name: Checkout code
+      - name: Initialize private build directories and Git configuration
+        run: |
+          work="$(mktemp -d "${RUNNER_TEMP}/ppu-build.XXXXXX")"
+          touch "$work/gitconfig"
+          mkdir "$work/wheels" "$work/artifacts"
+          {
+            printf 'GIT_CONFIG_GLOBAL=%s\n' "$work/gitconfig"
+            printf 'PPU_CI_WHEEL_DIR=%s\n' "$work/wheels"
+            printf 'PPU_CI_ARTIFACT_DIR=%s\n' "$work/artifacts"
+          } >> "$GITHUB_ENV"
+
+      # Same ref as check-changes. build_and_test.sh rejects any HEAD other than
+      # PPU_CI_SOURCE_SHA, so a workflow_call branch that moves after
+      # check-changes fails the run instead of building different code.
+      - name: Checkout the triggering source revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+
+      - name: Build native SAIL wheels
+        run: |
+          mkdir -p "$PPU_CI_WHEEL_DIR"
+          bash scripts/ci/ppu/build_and_test.sh build
+
+      - name: Upload PPU wheels
+        id: wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-wheels-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.PPU_CI_WHEEL_DIR }}
+          if-no-files-found: error
+
+      - name: Upload build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-build-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.PPU_CI_ARTIFACT_DIR }}
+          if-no-files-found: warn
+
+  ppu-sanity:
+    name: >-
+      ${{ (github.event_name == 'pull_request' && github.event.action == 'labeled' &&
+           github.event.label.name != 'run-ci' && github.event.label.name != 'run-ci-ppu') &&
+          format('ignored-label-ppu-sanity ({0})', matrix.runner) ||
+          format('ppu-sanity ({0})', matrix.runner) }}
+    needs: [check-changes, pr-gate, ppu-build]
+    if: needs.check-changes.outputs.ppu == 'true'
+    # Both PPU generations reuse the same wheels; each host supplies its own
+    # runtime image and device, while checkpoints come from the shared NAS.
+    strategy:
+      # A failure on one generation must not hide the other generation's result.
+      fail-fast: false
+      matrix:
+        runner: [8-ppu-m890p, 16-ppu-zw810e]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      actions: read
+    env:
+      PPU_CI_SOURCE_SHA: ${{ needs.check-changes.outputs.source-sha }}
+    steps:
+      - name: Initialize private runtime directories and Git configuration
+        run: |
+          work="$(mktemp -d "${RUNNER_TEMP}/ppu-runtime.XXXXXX")"
+          touch "$work/gitconfig"
+          mkdir "$work/wheels" "$work/artifacts"
+          {
+            printf 'GIT_CONFIG_GLOBAL=%s\n' "$work/gitconfig"
+            printf 'PPU_CI_WHEEL_DIR=%s\n' "$work/wheels"
+            printf 'PPU_CI_ARTIFACT_DIR=%s\n' "$work/artifacts"
+          } >> "$GITHUB_ENV"
+
+      # Same ref as check-changes; run_test.sh rejects any HEAD other than
+      # PPU_CI_SOURCE_SHA.
+      - name: Checkout the triggering source revision
         timeout-minutes: 10
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
 
-      - name: Validate PPU runner contract
-        timeout-minutes: 10
-        run: python3 scripts/ci/ppu/check_ppu_environment.py
+      - name: Download the matching PPU wheel artifact
+        uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ needs.ppu-build.outputs.wheel-artifact-id }}
+          merge-multiple: true
+          path: ${{ env.PPU_CI_WHEEL_DIR }}
 
-  # ==================== Finish ==================== #
+      - name: Run both speculative sanity files in isolated Docker
+        env:
+          CONFIG_PPU_CI_DEVICE: ${{ vars.PPU_CI_DEVICE }}
+          CONFIG_PPU_CI_TARGET_MODEL_PATH: ${{ vars.PPU_CI_TARGET_MODEL_PATH }}
+          CONFIG_PPU_CI_EAGLE3_MODEL_PATH: ${{ vars.PPU_CI_EAGLE3_MODEL_PATH }}
+          CONFIG_PPU_CI_DFLASH_MODEL_PATH: ${{ vars.PPU_CI_DFLASH_MODEL_PATH }}
+          CONFIG_PPU_CI_EVAL_CACHE: ${{ vars.PPU_CI_EVAL_CACHE }}
+        run: |
+          for key in PPU_CI_DEVICE PPU_CI_TARGET_MODEL_PATH PPU_CI_EAGLE3_MODEL_PATH PPU_CI_DFLASH_MODEL_PATH PPU_CI_EVAL_CACHE; do
+            override="CONFIG_$key"
+            if [[ -n "${!override}" ]]; then
+              export "$key=${!override}"
+            fi
+          done
+          exec bash scripts/ci/ppu/run_test.sh
+
+      - name: Upload runtime diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-runtime-logs-${{ matrix.runner }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.PPU_CI_ARTIFACT_DIR }}
+          if-no-files-found: warn
+
   pr-test-ppu-finish:
     name: >-
       ${{ (github.event_name == 'pull_request' && github.event.action == 'labeled' &&
            github.event.label.name != 'run-ci' && github.event.label.name != 'run-ci-ppu') &&
           'ignored-label-pr-test-ppu-finish' || 'pr-test-ppu-finish' }}
-    needs: [pr-gate, check-changes, ppu-preflight]
+    needs: [pr-gate, check-changes, ppu-build, ppu-sanity]
     if: always() && needs.check-changes.result != 'skipped'
     runs-on: ubuntu-latest
+    permissions: {}
     steps:
-      - name: Check all dependent job statuses
+      - name: Require successful native build and both PPU sanity files when requested
+        env:
+          NEEDS_JSON: ${{ toJson(needs) }}
+          PPU_IN_SCOPE: ${{ needs.check-changes.outputs.ppu }}
+          BUILD_RESULT: ${{ needs.ppu-build.result }}
+          SANITY_RESULT: ${{ needs.ppu-sanity.result }}
         run: |
-          json_needs='${{ toJson(needs) }}'
-          for job in $(echo "$json_needs" | jq -r 'keys_unsorted[]'); do
-            result=$(echo "$json_needs" | jq -r --arg j "$job" '.[$j].result')
-            echo "$job: $result"
-            if [[ "$result" == "failure" || "$result" == "cancelled" ]]; then
-              echo "The above jobs failed."
-              exit 1
-            fi
-          done
-          echo "All jobs completed successfully"
-
-      - name: Require the preflight when PPU is in scope
-        run: |
-          in_scope='${{ needs.check-changes.outputs.ppu }}'
-          preflight='${{ needs.ppu-preflight.result }}'
-          echo "PPU in scope: '$in_scope' / ppu-preflight: '$preflight'"
-
-          if [[ "$in_scope" == "true" && "$preflight" != "success" ]]; then
-            echo "PPU was in scope but ppu-preflight did not succeed."
+          if jq -e 'any(.[]; .result == "failure" or .result == "cancelled")' <<< "$NEEDS_JSON" >/dev/null; then
+            printf '%s\n' '::error::A PPU CI dependency failed or was cancelled.'
             exit 1
           fi
-          echo "Preflight status is consistent with the requested scope."
+          if [[ "$PPU_IN_SCOPE" == "true" ]]; then
+            if [[ "$BUILD_RESULT" != "success" || "$SANITY_RESULT" != "success" ]]; then
+              printf '%s\n' '::error::PPU scope requires a successful native build and both PPU sanity files.'
+              exit 1
+            fi
+            printf '%s\n' 'Native build and both PPU sanity files passed.'
+          else
+            printf '%s\n' 'PPU is outside this run scope; no PPU tests were requested.'
+          fi

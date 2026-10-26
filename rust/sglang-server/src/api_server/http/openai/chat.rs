@@ -6,32 +6,36 @@ use std::sync::Arc;
 
 use axum::{
     Json, Router,
-    extract::{State, rejection::JsonRejection},
-    http::StatusCode,
+    body::Bytes,
+    extract::State,
+    http::{HeaderMap, StatusCode},
     response::{
         IntoResponse, Response,
         sse::{Event, Sse},
     },
     routing::post,
 };
-use dynamo_parsers::tool_calling::jail::Annotated;
-use dynamo_parsers::{ToolChoice as DynamoToolChoice, ToolDefinition};
-use dynamo_protocols::types::{
+use futures::StreamExt;
+use serde::Deserialize;
+use serde_json::Value;
+use sglang_processor::dynamo_parsers::tool_calling::jail::Annotated;
+use sglang_processor::dynamo_parsers::{ToolChoice as DynamoToolChoice, ToolDefinition};
+use sglang_processor::dynamo_protocols::types::{
     ChatChoice, ChatChoiceLogprobs, ChatChoiceStream, ChatCompletionMessageContent,
     ChatCompletionResponseMessage, ChatCompletionTokenLogprob, ChatCompletionToolChoiceOption,
     CreateChatCompletionRequest, CreateChatCompletionResponse, CreateChatCompletionStreamResponse,
     FinishReason as OpenAIFinishReason, ResponseFormat, Role, ServiceTier as ChatServiceTier, Stop,
     TopLogprobs,
 };
-use futures::StreamExt;
-use serde::Deserialize;
 use sglang_processor::{
     ReasoningOptions, ReasoningStreamSplitter, dynamo_tool_choice, split_reasoning,
     tool_call_stream,
 };
 
 use super::completions::completion_usage;
+use super::lowered;
 use super::pd_routing::PDRoutingFields;
+use super::template::{RenderedChat, render_chat};
 use super::tools::{apply_tool_constraint, chat_delta, chat_finish_reason, parse_chat_tool_calls};
 use super::{
     AppState, ChatFormatter, ChatTemplateKwargs, collect_output, contains_media, error_payload,
@@ -50,24 +54,47 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
 }
 
 #[derive(Deserialize)]
-struct ChatRequest {
+pub(super) struct ChatRequest {
     #[serde(flatten)]
-    request: CreateChatCompletionRequest,
+    pub(super) request: CreateChatCompletionRequest,
+    /// The renderer reads it off the raw body; typed here so a malformed one
+    /// is a 400, as Python's request model makes it.
+    #[allow(dead_code)]
     chat_template_kwargs: Option<ChatTemplateKwargs>,
     #[serde(flatten)]
     routing: PDRoutingFields,
 }
 
+/// A chat request with its raw JSON, which SGLang's renderers read for fields
+/// the typed request drops (`continue_final_message`, `task`, ...).
+pub(super) struct ChatBody {
+    pub(super) request: ChatRequest,
+    pub(super) raw: Value,
+}
+
+impl<'de> Deserialize<'de> for ChatBody {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = Value::deserialize(deserializer)?;
+        let request = ChatRequest::deserialize(&raw).map_err(serde::de::Error::custom)?;
+        Ok(Self { request, raw })
+    }
+}
+
 async fn chat_completions(
     State(state): State<Arc<AppState>>,
-    body: Result<Json<ChatRequest>, JsonRejection>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Response {
-    let ChatRequest {
-        request,
-        chat_template_kwargs,
-        routing,
-    } = match body {
-        Ok(Json(request)) => request,
+    if let Some(response) = lowered::chat(&state, &headers, &body).await {
+        return response;
+    }
+    let ChatBody {
+        request: ChatRequest {
+            request, routing, ..
+        },
+        raw,
+    } = match Json::from_bytes(&body) {
+        Ok(Json(body)) => body,
         Err(rejection) => {
             return openai_error(StatusCode::BAD_REQUEST, rejection.body_text(), false);
         }
@@ -145,11 +172,10 @@ async fn chat_completions(
     let tools = (!tools.is_empty()).then_some(tools);
     let tools_slice = tools.as_deref().unwrap_or_default();
 
-    let (request, prompt) =
-        match prepare_chat_request(&state, request, chat_template_kwargs.as_ref()).await {
-            Ok(prepared) => prepared,
-            Err(response) => return response,
-        };
+    let (request, rendered) = match prepare_chat_request(&state, raw, request).await {
+        Ok(prepared) => prepared,
+        Err(response) => return response,
+    };
 
     let sampling = match chat_sampling(
         &request,
@@ -191,8 +217,9 @@ async fn chat_completions(
         || state.server_args.stream_response_default_include_usage;
     let mut submitted = Vec::with_capacity(choices_per_prompt);
 
-    let starts_in_reasoning = starts_in_reasoning(reasoning_parser.as_deref(), &prompt);
-    let mut prompt = Some(prompt);
+    let starts_in_reasoning =
+        starts_in_reasoning(reasoning_parser.as_deref(), rendered.prompt.as_str());
+    let mut prompt = Some(Box::new(rendered));
     for index in 0..choices_per_prompt {
         let rid = Rid::from_client(&format!("{response_id}-{index}"));
         let choice_prompt = if index + 1 == choices_per_prompt {
@@ -205,10 +232,7 @@ async fn chat_completions(
         };
         let native = GenerateRequest {
             rid: rid.clone(),
-            text: Some(choice_prompt),
-            // Rendered templates own their special tokens — the pool must not
-            // add another BOS/EOS (Python's `add_special_tokens=False`).
-            skip_special_tokens: true,
+            chat_prompt: Some(choice_prompt),
             sampling_params: sampling.clone(),
             stream,
             return_logprob: want_logprobs,
@@ -267,14 +291,12 @@ async fn chat_completions(
 }
 
 /// Render the chat template for an OpenAI request, mapping a missing
-/// formatter or a render failure to the standard 400. The rendered prompt is
-/// submitted as text — the tokenizer pool encodes it (with
-/// `skip_special_tokens`, since the template owns its special tokens).
+/// formatter or a render failure to the standard 400.
 pub(super) async fn prepare_chat_request(
     state: &AppState,
+    body: Value,
     mut request: CreateChatCompletionRequest,
-    kwargs: Option<&ChatTemplateKwargs>,
-) -> Result<(CreateChatCompletionRequest, String), Response> {
+) -> Result<(CreateChatCompletionRequest, RenderedChat), Response> {
     let Some(formatter) = state.chat_formatter.clone() else {
         return Err(openai_error(
             StatusCode::BAD_REQUEST,
@@ -287,14 +309,20 @@ pub(super) async fn prepare_chat_request(
     // token-id stop cannot be merged into the string list (Python has no such
     // field), so it is kept alone.
     merge_template_stops(&mut request, &formatter);
-    let prompt = formatter.render(&request, kwargs).map_err(|error| {
+    let rendered = render_chat(
+        &formatter,
+        body,
+        &request,
+        &state.server_args.default_chat_template_kwargs,
+    )
+    .map_err(|error| {
         openai_error(
             StatusCode::BAD_REQUEST,
             format!("chat template render failed: {error}"),
             false,
         )
     })?;
-    Ok((request, prompt))
+    Ok((request, rendered))
 }
 
 /// Full sampling resolution for an OpenAI request, mirroring the Python
@@ -341,8 +369,8 @@ fn merge_template_stops(request: &mut CreateChatCompletionRequest, formatter: &C
         return;
     };
     let mut stops = match template_stops {
-        OneOrMany::One(one) => vec![one],
-        OneOrMany::Many(many) => many,
+        sglang_processor::OneOrMany::One(one) => vec![one],
+        sglang_processor::OneOrMany::Many(many) => many,
     };
     if let Some(request_stop) = &request.stop {
         let Some(request_stops) = request_stop.strings() else {
@@ -484,7 +512,7 @@ pub(super) async fn unary_chat(
             reasoning_parser.as_deref(),
             &reasoning_options,
             &output.text,
-            &output.token_ids,
+            output.stop_trimmed_token_ids(),
         );
         let (content, tool_calls) = parse_chat_tool_calls(
             text,
@@ -622,7 +650,7 @@ pub(super) fn chat_event_stream(
             let mut emitted = Vec::with_capacity(2);
             if reasoning_enabled {
                 let (reasoning_text, normal_text) =
-                    reasoning_splitters[index].split(&output.text, &output.token_ids);
+                    reasoning_splitters[index].split(&output.text, output.stop_trimmed_token_ids());
                 let mut remaining_logprobs =
                     want_logprobs.then(|| chat_logprobs(output.extras.as_deref()));
                 if !reasoning_text.is_empty() {
@@ -857,6 +885,7 @@ fn starts_in_reasoning(reasoning_parser: Option<&str>, prompt: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::super::ChatFormatter;
     use super::super::test_utils::{chat_submitted, chunk};
     use super::{
         SamplingDefaults, chat_event_stream, chat_logprobs, chat_sampling_params,
@@ -865,8 +894,8 @@ mod tests {
     use crate::message::config::DefaultSamplingParams;
     use crate::message::response::ChunkExtras;
     use axum::http::StatusCode;
-    use dynamo_protocols::types::{CreateChatCompletionRequest, Stop};
     use futures::StreamExt;
+    use sglang_processor::dynamo_protocols::types::{CreateChatCompletionRequest, Stop};
 
     fn request() -> CreateChatCompletionRequest {
         serde_json::from_value(serde_json::json!({
@@ -949,13 +978,11 @@ mod tests {
     /// the request's own stops.
     #[test]
     fn template_stops_merge_before_request_stops() {
-        let chatml = super::super::template::builtin_template("chatml").unwrap();
-        let formatter = super::super::ChatFormatter::Legacy(Box::new(
-            super::super::template::LegacyFormatter { spec: chatml },
-        ));
+        let formatter =
+            sglang_processor::load_chat_formatter(None, None, None, Some("chatml")).unwrap();
         assert_eq!(
             formatter.stop_strs(),
-            Some(crate::message::types::OneOrMany::Many(vec![
+            Some(sglang_processor::OneOrMany::Many(vec![
                 "<|endoftext|>".into(),
                 "<|im_end|>".into()
             ]))
@@ -1002,22 +1029,13 @@ mod tests {
         assert_eq!(req.stop, Some(Stop::TokenIdArray(vec![2, 3])));
     }
 
-    /// The HuggingFace renderer carries no template stops (Python's jinja path
-    /// keeps only the request's stops), so the request is left unchanged.
+    /// A formatter without template stops (Python's jinja path keeps only the
+    /// request's stops) leaves the request unchanged.
     #[test]
-    fn huggingface_formatter_leaves_request_stops_alone() {
+    fn formatter_without_stops_leaves_request_stops_alone() {
         let mut req = request();
         req.stop = Some(Stop::String("x".into()));
-        // A prompt formatter is not constructible here without a tokenizer; the
-        // empty-legacy-spec twin proves the merge is formatter-gated, and the
-        // `HuggingFace` arm returns `None` by construction (see `stop_strs`).
-        let legacy = super::super::ChatFormatter::Legacy(Box::new(
-            super::super::template::LegacyFormatter {
-                spec: super::super::template::LegacySpec::default(),
-            },
-        ));
-        assert!(legacy.stop_strs().is_none());
-        merge_template_stops(&mut req, &legacy);
+        merge_template_stops(&mut req, &ChatFormatter::KimiK3);
         assert_eq!(req.stop, Some(Stop::String("x".into())));
     }
 
@@ -1247,15 +1265,16 @@ mod tests {
                     is_disaggregation: false,
                     mm_limits: Default::default(),
                     metadata: CoreMetadata::from(args.as_ref()),
+                    metrics: None,
                 },
             );
-            let formatter =
-                dynamo_renderer::kimi_k3_formatter_for(&Some("kimi_k3".into()), "kimi_k3", false)
-                    .unwrap();
             let state = Arc::new(super::super::AppState {
                 core,
+                generation_policy: crate::message::request::GenerationPolicy::from(args.as_ref()),
                 server_args: args,
-                chat_formatter: Some(super::super::ChatFormatter::HuggingFace(formatter)),
+                chat_formatter: Some(super::super::ChatFormatter::KimiK3),
+                generate_hook: None,
+                openai_chat: None,
             });
             let responder = tokio::spawn(async move {
                 let TmEvent::Intake { request, admission } = intake_rx.recv_async().await.unwrap()
@@ -1266,7 +1285,8 @@ mod tests {
                 let RequestKind::Generate(generate) = &request.kind else {
                     panic!("expected generation");
                 };
-                assert!(generate.text.as_ref().unwrap().contains("lookup"));
+                let prompt = generate.chat_prompt.as_ref().unwrap();
+                assert!(prompt.prompt.as_str().contains("lookup"));
                 assert!(
                     generate
                         .sampling_params
@@ -1280,7 +1300,7 @@ mod tests {
             });
             let response = post_json(super::super::routes().with_state(state), "/v1/chat/completions", serde_json::json!({
                 "model":"model", "stream":stream,
-                "messages":[{"role":"system","tools":[{"name":"lookup","parameters":{"type":"object","properties":{}}}]},
+                "messages":[{"role":"system","tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object","properties":{}}}}]},
                             {"role":"user","content":"Call lookup"}],
                 "tool_choice":{"type":"function","function":{"name":"lookup"}},
                 "chat_template_kwargs":{"thinking":false}

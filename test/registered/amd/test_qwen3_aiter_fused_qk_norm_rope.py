@@ -39,8 +39,8 @@ class TestQwen3AiterFusedQKNormRopeSetKV(CustomTestCase):
         os.environ.setdefault("SGLANG_USE_AITER", "1")
         from sglang.srt.models import qwen3
 
-        if not qwen3._has_fused_qk_norm_mrope:
-            raise unittest.SkipTest("aiter fused_qk_norm_mrope kernel unavailable")
+        if not (qwen3._has_fused_qk_norm_mrope or qwen3._has_fused_qk_norm_rope):
+            raise unittest.SkipTest("aiter fused QK-norm + RoPE kernels unavailable")
         cls.qwen3 = qwen3
         cls.device = torch.device("cuda", 0)
 
@@ -50,6 +50,11 @@ class TestQwen3AiterFusedQKNormRopeSetKV(CustomTestCase):
         norm = RMSNorm(HEAD_DIM, eps=EPS).to(self.device, torch.bfloat16)
         norm.weight.data.copy_(1.0 + 0.1 * torch.randn(HEAD_DIM, device=self.device))
         return norm
+
+    def _rope(self):
+        from sglang.srt.layers.rotary_embedding import get_rope
+
+        return get_rope(HEAD_DIM, HEAD_DIM, MAX_POS, 1000000).to(self.device)
 
     def _mrope(self):
         from sglang.srt.layers.rotary_embedding import get_rope
@@ -116,7 +121,23 @@ class TestQwen3AiterFusedQKNormRopeSetKV(CustomTestCase):
         self.assertFalse(k_cache[untouched].any().item(), "K written to other slots")
         self.assertFalse(v_cache[untouched].any().item(), "V written to other slots")
 
+    def test_rope_nhd_cache(self):
+        if not self.qwen3._has_fused_qk_norm_rope:
+            self.skipTest("aiter fused_qk_norm_rope kernel unavailable")
+        torch.manual_seed(0)
+        rotary_emb = self._rope()
+        # (32, 8): Qwen3-8B at TP1; (8, 2): Qwen3-8B at TP4.
+        for num_heads, num_kv_heads in ((32, 8), (8, 2)):
+            for num_tokens in (1, 7, 64, 256):
+                with self.subTest(heads=(num_heads, num_kv_heads), tokens=num_tokens):
+                    positions = torch.randint(
+                        0, MAX_POS, (num_tokens,), device=self.device
+                    )
+                    self._check(rotary_emb, positions, num_heads, num_kv_heads)
+
     def test_mrope_nhd_cache(self):
+        if not self.qwen3._has_fused_qk_norm_mrope:
+            self.skipTest("aiter fused_qk_norm_mrope kernel unavailable")
         torch.manual_seed(0)
         rotary_emb = self._mrope()
         # (32, 8): Qwen3-VL-8B at TP1; (16, 2): Qwen3-VL-32B at TP4.

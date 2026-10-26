@@ -1,5 +1,6 @@
 """MiniMax-H3's indexed scale/shift and gate kernels against the same arithmetic in
-torch, byte for byte, across row widths the column tiles split differently."""
+torch, byte for byte, across row widths the column tiles split differently. The fp32
+variants serve serialized INT8 checkpoints, whose AdaLN tables stay in fp32."""
 
 import sys
 
@@ -9,7 +10,10 @@ import torch
 from sglang.kernels.ops.diffusion import (
     indexed_gate_bf16,
     indexed_gate_bf16_,
+    indexed_gate_fp32,
+    indexed_gate_fp32_,
     indexed_scale_shift_bf16_,
+    indexed_scale_shift_fp32_,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -55,6 +59,40 @@ def test_indexed_gate_matches_torch(rows: int, hidden: int) -> None:
     ref = (x.float() + _bf16(gate[indices].float() * other.float())).to(torch.bfloat16)
     assert torch.equal(indexed_gate_bf16(x, gate, other, indices), ref)
     assert torch.equal(indexed_gate_bf16_(x.clone(), gate, other, indices), ref)
+
+
+def _fp32_table(rows: int, hidden: int, seed: int) -> torch.Tensor:
+    """A [rows, hidden] slice of a [rows, 6 * hidden] AdaLN table: row stride > width."""
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    table = torch.randn(rows, 6 * hidden, device="cuda", generator=g)
+    return table[:, 2 * hidden : 3 * hidden]
+
+
+@pytest.mark.parametrize("hidden", HIDDEN)
+@pytest.mark.parametrize("rows", ROWS)
+def test_indexed_scale_shift_fp32_matches_torch(rows: int, hidden: int) -> None:
+    x, _, _, _, indices = _inputs(rows, hidden, rows * hidden + 2)
+    shift = _fp32_table(3, hidden, rows + 3)
+    scale = 0.1 * _fp32_table(3, hidden, rows + 4)
+    # A product whose rounding differs once it is contracted into an FMA.
+    scale[indices[0], 0] = -0.9999999403953552
+    shift[indices[0], 0] = 1.234567e-7
+    ref = (x.float() * (1.0 + scale[indices]) + shift[indices]).to(torch.bfloat16)
+    assert torch.equal(indexed_scale_shift_fp32_(x.clone(), shift, scale, indices), ref)
+
+
+@pytest.mark.parametrize("hidden", HIDDEN)
+@pytest.mark.parametrize("rows", ROWS)
+def test_indexed_gate_fp32_matches_torch(rows: int, hidden: int) -> None:
+    x, other, _, _, indices = _inputs(rows, hidden, rows * hidden + 5)
+    gate = _fp32_table(3, hidden, rows + 6)
+    x[0, 0], other[0, 0] = -0.1484375, 14.25
+    gate[indices[0], 0] = 0.01041664183139801
+    ref = (x.float() + gate[indices] * other.float()).to(torch.bfloat16)
+    original = x.clone()
+    assert torch.equal(indexed_gate_fp32(x, gate, other, indices), ref)
+    assert torch.equal(x, original)
+    assert torch.equal(indexed_gate_fp32_(x.clone(), gate, other, indices), ref)
 
 
 if __name__ == "__main__":

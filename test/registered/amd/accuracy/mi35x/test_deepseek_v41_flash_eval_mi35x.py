@@ -84,7 +84,6 @@ class TestDeepseekV41FlashEvalMI35x(CustomTestCase):
             "256",
             "--max-running-requests",
             "256",
-            "--enable-decoder-swa-bounded-replay",
             "--reasoning-parser",
             "auto",
             "--tool-call-parser",
