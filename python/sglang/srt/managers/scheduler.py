@@ -4269,7 +4269,7 @@ class Scheduler(
                     running_batch.reqs,
                 )
 
-        mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
+        mamba_allocator = self.req_to_token_pool.mamba_allocator
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
         buffer_pipeline = self.tree_cache.buffer_pipeline
@@ -4555,9 +4555,7 @@ class Scheduler(
                 self.decode_offload_manager.drain_before_retraction()
             old_available_tokens = self.token_to_kv_pool_allocator.available_size()
             old_ratio = self.new_token_ratio_tracker.current
-            mamba_allocator = getattr(
-                self.tree_cache.req_to_token_pool, "mamba_allocator", None
-            )
+            mamba_allocator = self.tree_cache.req_to_token_pool.mamba_allocator
             old_mamba_available = (
                 mamba_allocator.available_size()
                 if mamba_allocator is not None

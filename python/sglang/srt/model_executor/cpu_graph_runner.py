@@ -797,10 +797,10 @@ class CPUGraphRunner:
 
     def _reset_mamba_cache_if_needed(self) -> None:
 
-        mamba_pool = getattr(self.model_runner.req_to_token_pool, "mamba_pool", None)
+        mamba_pool = self.model_runner.req_to_token_pool.mamba_pool
         if mamba_pool is None:
             return
-        mamba_cache = getattr(mamba_pool, "mamba_cache", None)
+        mamba_cache = mamba_pool.mamba_cache
         if mamba_cache is None:
             return
 

@@ -75,6 +75,7 @@ def make_metadata_backend():
     backend.topk = 1
     backend.req_to_token_pool = SimpleNamespace(
         get_mamba_indices=lambda rows: rows,
+        mamba_pool=None,
     )
     backend._state_ids = IdSpace(key=("mamba", None))
     return backend

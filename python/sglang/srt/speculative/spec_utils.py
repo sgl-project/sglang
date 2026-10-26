@@ -1132,7 +1132,7 @@ def commit_mamba_states_after_verify(
     # skip only the SSM scatter. GDN-only + linear-chain (topk<=1) -- the runtime
     # ring is allocated only then; KDA never allocates the cursors.
     req_pool = model_runner.req_to_token_pool
-    mamba_pool = getattr(req_pool, "mamba_pool", None)
+    mamba_pool = req_pool.mamba_pool
     bs = accept_lens.shape[0]
     src_indices_raw = (
         batch.req_pool_indices[:bs] if pp_spec_stable_rows_enabled() else None
@@ -1143,8 +1143,8 @@ def commit_mamba_states_after_verify(
     # track slot, so no SSM scatter or force-flush is needed here.
     if (
         mamba_pool is not None
-        and getattr(mamba_pool, "replayssm_spec_fold", False)
-        and not getattr(mamba_pool, "replayssm_is_kda", False)
+        and mamba_pool.replayssm_spec_fold
+        and not mamba_pool.replayssm_is_kda
     ):
         if batch.forward_mode.is_idle() or accept_index.numel() == 0:
             return
@@ -1179,8 +1179,8 @@ def commit_mamba_states_after_verify(
 
     if (
         mamba_pool is not None
-        and getattr(mamba_pool, "replayssm_cache_base", None) is not None
-        and not getattr(mamba_pool, "replayssm_is_kda", False)
+        and mamba_pool.replayssm_cache_base is not None
+        and not mamba_pool.replayssm_is_kda
     ):
         if batch.forward_mode.is_idle() or accept_index.numel() == 0:
             return
@@ -1264,8 +1264,8 @@ def commit_mamba_states_after_verify(
     # never allocated under fold, so they cannot serve as the signal).
     if (
         mamba_pool is not None
-        and getattr(mamba_pool, "replayssm_spec_fold", False)
-        and getattr(mamba_pool, "replayssm_is_kda", False)
+        and mamba_pool.replayssm_spec_fold
+        and mamba_pool.replayssm_is_kda
     ):
         if batch.forward_mode.is_idle() or accept_index.numel() == 0:
             return

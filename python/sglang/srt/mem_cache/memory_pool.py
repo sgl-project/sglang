@@ -387,6 +387,11 @@ class ReqToTokenPool:
     # Class default: some decode pools borrow another __init__ (see
     # DecodeReqToTokenPool) but inherit alloc_rows.
     _on_alloc_rows: Optional[Callable[[List[int]], None]] = None
+    # A table without recurrent state holds no state slots: no state pool, slot
+    # allocator or checkpoint pool. Tables with state set all three.
+    mamba_pool: Optional[MambaPool] = None
+    mamba_allocator = None
+    mamba_ckpt_pool = None
 
     def __init__(
         self,

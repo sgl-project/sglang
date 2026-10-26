@@ -185,6 +185,10 @@ class DecodeReqToTokenPool:
 
     # Mirrors ReqToTokenPool.register_on_alloc_rows.
     _on_alloc_rows: Optional[Callable[[List[int]], None]] = None
+    # No recurrent state (`ReqToTokenPool.mamba_pool`).
+    mamba_pool = None
+    mamba_allocator = None
+    mamba_ckpt_pool = None
 
     def __init__(
         self,

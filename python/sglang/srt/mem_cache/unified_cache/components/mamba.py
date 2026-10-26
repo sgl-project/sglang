@@ -554,7 +554,7 @@ class MambaComponent(TreeComponent):
 
     @property
     def int8_ckpt_pool(self):
-        return getattr(self.cache.req_to_token_pool, "mamba_ckpt_pool", None)
+        return self.cache.req_to_token_pool.mamba_ckpt_pool
 
     def _alloc_int8_ckpt_slot(self) -> torch.Tensor:
         slot = self.int8_ckpt_pool.alloc(1)

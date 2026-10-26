@@ -787,15 +787,15 @@ class GDNAttnBackend(MambaAttnBackendBase):
         metadata = self.forward_metadata
         mamba_pool = self.req_to_token_pool.mamba_pool
         mamba_cache = mamba_pool.mamba_cache
-        is_gdn_replayssm = not getattr(mamba_pool, "replayssm_is_kda", False)
+        is_gdn_replayssm = not mamba_pool.replayssm_is_kda
         use_replayssm_fold = (
             mamba_cache.replayssm_rawv is not None
-            and getattr(mamba_pool, "replayssm_spec_fold", False)
+            and mamba_pool.replayssm_spec_fold
             and is_gdn_replayssm
         )
         use_replayssm_spec = (
             mamba_cache.replayssm_d is not None
-            and getattr(mamba_pool, "replayssm_cache_base", None) is not None
+            and mamba_pool.replayssm_cache_base is not None
             and is_gdn_replayssm
         )
         self._use_strided_target_verify_qkv = self._target_verify_supports_strided_qkv(
@@ -1248,13 +1248,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
             mamba_pool = self.req_to_token_pool.mamba_pool
             use_replayssm_fold = (
                 mamba_cache_params.replayssm_rawv is not None
-                and getattr(mamba_pool, "replayssm_spec_fold", False)
-                and not getattr(mamba_pool, "replayssm_is_kda", False)
+                and mamba_pool.replayssm_spec_fold
+                and not mamba_pool.replayssm_is_kda
             )
             use_replayssm_spec = (
                 mamba_cache_params.replayssm_d is not None
-                and getattr(mamba_pool, "replayssm_cache_base", None) is not None
-                and not getattr(mamba_pool, "replayssm_is_kda", False)
+                and mamba_pool.replayssm_cache_base is not None
+                and not mamba_pool.replayssm_is_kda
             )
 
         # Page-major envelope: the prefill kernels (CUDA causal_conv1d_fwd,

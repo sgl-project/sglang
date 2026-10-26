@@ -248,7 +248,7 @@ class StreamingSession:
 
     def _free_slot_mamba(self, slot: SessionSlot) -> None:
         """Return a session slot's mamba pool state to the allocator."""
-        mamba_allocator = getattr(self.cache.req_to_token_pool, "mamba_allocator", None)
+        mamba_allocator = self.cache.req_to_token_pool.mamba_allocator
         if mamba_allocator is None:
             return
         if slot.kv.holds_mamba:

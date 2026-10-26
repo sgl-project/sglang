@@ -302,12 +302,9 @@ class BaseSpecWorker(ABC):
             )
         if _can_pack_hicache_mtp(spec_algorithm, draft_runners):
             target_model_runner.mtp_draft_device_pools = draft_pools
-            target_mamba_pool = getattr(
-                target_model_runner.req_to_token_pool, "mamba_pool", None
-            )
+            target_mamba_pool = target_model_runner.req_to_token_pool.mamba_pool
             draft_mamba_pools = tuple(
-                getattr(runner.req_to_token_pool, "mamba_pool", None)
-                for runner in draft_runners
+                runner.req_to_token_pool.mamba_pool for runner in draft_runners
             )
             # Shared state is already backed up with the target. Separate
             # draft state follows the target's Mamba slot indices.

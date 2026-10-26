@@ -97,7 +97,8 @@ class TestHeldRowAdmission(CustomTestCase):
         s.spec_algorithm = None
         # The final chunk and the running requests hold rows; one row is free.
         s.req_to_token_pool = SimpleNamespace(
-            available_size=lambda: NUM_ROWS - len(running) - 1
+            available_size=lambda: NUM_ROWS - len(running) - 1,
+            mamba_allocator=None,
         )
         s.beam_coordinator = SimpleNamespace(pending_member_rows=lambda batch: 0)
         return s

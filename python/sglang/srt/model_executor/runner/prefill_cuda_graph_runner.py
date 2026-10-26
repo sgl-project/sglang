@@ -1817,7 +1817,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         if isinstance(self.backend, BreakableCudaGraphBackend):
             post_warmup_hook = None
             req_pool = self.model_runner.req_to_token_pool
-            mamba_pool = getattr(req_pool, "mamba_pool", None)
+            mamba_pool = req_pool.mamba_pool
             if mamba_pool is not None and not prefix_num_chunks:
                 state_ids = self.model_runner.kv_index_translator.state_ids(
                     req_pool.state_sub_pool

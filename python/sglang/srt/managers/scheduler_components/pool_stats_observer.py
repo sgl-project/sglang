@@ -274,9 +274,7 @@ class SchedulerPoolStatsObserver:
         # int8 pool, so they own ZERO active slots: report evictable=0 against the active
         # pool (otherwise active.size - (available + radix_cached) goes negative). The
         # int8 cache pool's own occupancy is validated separately in the invariant check.
-        has_int8_ckpt = (
-            getattr(self.req_to_token_pool, "mamba_ckpt_pool", None) is not None
-        )
+        has_int8_ckpt = self.req_to_token_pool.mamba_ckpt_pool is not None
         mamba_evictable_size = (
             self.tree_cache.mamba_evictable_size()
             if (is_mamba_radix_cache and not has_int8_ckpt)

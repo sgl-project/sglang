@@ -228,7 +228,7 @@ class MambaAttnBackendBase(AttentionBackend):
             # (advance-by-accept-count once per verify step). Advancing it here as
             # well inserts one phantom/stale ring entry per step and cumulatively
             # poisons the reconstruction (degenerate repetition at 10k+ tokens).
-            mamba_pool = getattr(self.req_to_token_pool, "mamba_pool", None)
+            mamba_pool = self.req_to_token_pool.mamba_pool
             write_pos_buf = (
                 mamba_pool.replayssm_write_pos
                 if mamba_pool is not None and mamba_pool.enable_linear_replayssm
@@ -243,7 +243,7 @@ class MambaAttnBackendBase(AttentionBackend):
                 L = mamba_pool.linear_replayssm_cache_len
                 # KDA has no radix coordination: flush only on the natural write_pos
                 # == L-1 wrap. GDN adds the radix-aligned force-flush below.
-                is_kda = getattr(mamba_pool, "replayssm_is_kda", False)
+                is_kda = mamba_pool.replayssm_is_kda
                 # Force-flush on the radix track's seq_lens % mamba_track_interval
                 # == 0 boundary so the ring folds into temporal[slot] when read.
                 if not is_kda:
@@ -592,7 +592,7 @@ class MambaAttnBackendBase(AttentionBackend):
         and the decode-kernel ring rerouting downstream) must stay fully
         dormant for the spec ring.
         """
-        mamba_pool = getattr(self.req_to_token_pool, "mamba_pool", None)
+        mamba_pool = self.req_to_token_pool.mamba_pool
         if mamba_pool is None:
             return False
         return bool(mamba_pool.enable_linear_replayssm)
@@ -835,7 +835,7 @@ class MambaAttnBackendBase(AttentionBackend):
                 # (same condition as the radix track). Zeroed during capture.
                 force_flush_dev = None
                 # KDA: no radix coordination -> leave zeroed so the advance is a pure wrap.
-                is_kda = getattr(mamba_pool, "replayssm_is_kda", False)
+                is_kda = mamba_pool.replayssm_is_kda
                 if (
                     not is_kda
                     and forward_mode.is_decode_or_idle()
@@ -1560,7 +1560,7 @@ class HybridLinearAttnBackend(AttentionBackend):
         # only hit by the direct callers. Chain layout only (topk <= 1), so
         # accept_lens == last_correct_step_indices + 1.
         mamba_pool = req_pool.mamba_pool
-        if getattr(mamba_pool, "replayssm_is_kda", False):
+        if mamba_pool.replayssm_is_kda:
             from sglang.kernels.ops.attention.linear.kda_replayssm_spec_decode import (
                 commit_kda_replayssm_after_verify,
             )

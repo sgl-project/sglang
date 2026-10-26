@@ -194,7 +194,7 @@ class SchedulerInvariantChecker:
         )
 
     def _check_mamba_pool(self, ps: PoolStats) -> Tuple[bool, str]:
-        ckpt_pool = getattr(self.req_to_token_pool, "mamba_ckpt_pool", None)
+        ckpt_pool = self.req_to_token_pool.mamba_ckpt_pool
         if ckpt_pool is not None:
             return self._check_mamba_pool_with_int8(ps, ckpt_pool)
         leak, msg = self._check_pool_invariant(
