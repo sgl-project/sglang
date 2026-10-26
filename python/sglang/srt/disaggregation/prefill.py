@@ -816,9 +816,9 @@ class SchedulerDisaggregationPrefillMixin:
                         self.maybe_prefetch_staging_for_batch(batch)
                     batch_result = self.run_batch(batch)
                     if self._war_barrier_is_coarse():
-                        # Deferred, so result processing does not wait for the whole
-                        # forward: it and the inflight queue mutate no request in
-                        # this forward; a continuing chunked one is only read.
+                        # Defer a whole-forward barrier past result processing: it and
+                        # the inflight queue mutate no request in this forward (a
+                        # continuing chunked one is only read).
                         war_barrier_pending = True
                     else:
                         self._apply_war_barrier()
