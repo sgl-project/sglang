@@ -557,7 +557,14 @@ class AscendAttnBackend(AttentionBackend):
             forward_batch.seq_lens.cpu() if in_capture else forward_batch.seq_lens_cpu
         )
         if in_capture:
-            self._init_cuda_graph_metadata(forward_batch, seq_lens_cpu)
+            self._init_cuda_graph_metadata(
+                bs,
+                forward_batch.forward_mode,
+                forward_batch.seq_lens,
+                forward_batch.out_cache_loc,
+                prefix_lens_cpu=seq_lens_cpu,
+                spec_info=forward_batch.spec_info,
+            )
             if (
                 self.dense_mla_dcp_target
                 and forward_batch.forward_mode.is_target_verify()
@@ -920,13 +927,16 @@ class AscendAttnBackend(AttentionBackend):
         pass
 
     def _init_cuda_graph_metadata(
-        self, forward_batch: ForwardBatch, prefix_lens_cpu: torch.Tensor
+        self,
+        bs: int,
+        forward_mode: ForwardMode,
+        seq_lens: torch.Tensor,
+        out_cache_loc: Optional[torch.Tensor] = None,
+        *,
+        prefix_lens_cpu: torch.Tensor,
+        spec_info: Optional[SpecInput],
     ) -> ForwardMetadata:
         """Create and store the per-bs ForwardMetadata for CUDA graph capture."""
-        bs = forward_batch.batch_size
-        forward_mode = forward_batch.forward_mode
-        seq_lens = forward_batch.seq_lens
-        out_cache_loc = forward_batch.out_cache_loc
         metadata = ForwardMetadata()
         if self.enable_sparsity_driven_kv_offload:
             from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.host_callback import (
@@ -969,7 +979,7 @@ class AscendAttnBackend(AttentionBackend):
                 forward_mode,
                 bs=bs,
                 query_len=self.speculative_num_draft_tokens,
-                spec_info=forward_batch.spec_info,
+                spec_info=spec_info,
             )
         else:
             metadata.seq_lens_cpu_list = seq_lens.cpu().int().tolist()
