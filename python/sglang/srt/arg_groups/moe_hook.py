@@ -300,6 +300,25 @@ def _check_mooncake_xpu_scope(cfg: Any) -> None:
         )
 
 
+def _fit_batches_to_mooncake_dispatch(server_args: Any, cfg: Any) -> None:
+    # A Mooncake EP dispatch takes at most this many tokens per rank, and TP
+    # attention puts 1/tp_size of each batch on every rank.
+    limit = envs.SGLANG_MOONCAKE_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get() * cfg.tp_size
+    chunked = cfg.chunked_prefill_size
+    if chunked is None or chunked <= 0 or chunked > limit:
+        declare_resolution(server_args, "_handle_a2a_moe", chunked_prefill_size=limit)
+        logger.warning(
+            f"chunked_prefill_size set to {limit} to fit Mooncake EP's per-rank "
+            "dispatch (SGLANG_MOONCAKE_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK x tp_size)"
+        )
+    if cfg.max_running_requests is None or cfg.max_running_requests > limit:
+        declare_resolution(server_args, "_handle_a2a_moe", max_running_requests=limit)
+        logger.warning(
+            f"max_running_requests set to {limit} to fit Mooncake EP's per-rank "
+            "dispatch"
+        )
+
+
 def handle_a2a_moe(server_args: Any):
     # The backend overrides and the ep_size=tp_size adjustments moved to
     # the resolution pipeline (arg_groups/overrides.py:
@@ -594,6 +613,7 @@ def handle_a2a_moe(server_args: Any):
     if a2a_backend == "mooncake":
         if cfg.device == "xpu":
             _check_mooncake_xpu_scope(cfg)
+            _fit_batches_to_mooncake_dispatch(server_args, cfg)
         if cfg.deepep_mode == "normal":
             raise ValueError(
                 "moe_a2a_backend='mooncake' only supports low-latency mode; "
