@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gc
 import logging
+from copy import copy
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union
 
@@ -190,19 +191,20 @@ class WeightUpdater:
         )
 
         target_device = torch.device(self.device)
-        self.model_config.model_path = model_path
+        updated_config = copy(self.model_config)
+        updated_config.model_path = model_path
         # PP stages handle disk updates sequentially, unlike cold startup.
         load_config = LoadConfig(
             load_format=load_format, load_group=get_pp_stage_load_group()
         )
 
         # Only support DefaultModelLoader for now
-        loader = get_model_loader(load_config, self.model_config)
+        loader = get_model_loader(load_config, updated_config)
         if not isinstance(loader, DefaultModelLoader):
             message = f"Failed to get model loader: {loader}."
             return False, message
 
-        def get_weight_iter(config):
+        def get_weight_iter(loader, config):
             iter = loader._get_weights_iterator(
                 DefaultModelLoader.Source.init_new(config, self.get_model())
             )
@@ -213,28 +215,34 @@ class WeightUpdater:
 
             return iter
 
-        def model_load_weights(model, iter):
+        def model_load_weights(model, iter, loader):
             loader.load_weights_and_postprocess(model, iter, target_device)
             return model
 
         with set_default_torch_dtype(self.model_config.dtype):
             try:
-                iter = get_weight_iter(self.model_config)
+                iter = get_weight_iter(loader, updated_config)
             except Exception as e:
                 message = f"Failed to get weights iterator: {e}."
                 return False, message
             try:
-                model = model_load_weights(self.get_model(), iter)
+                model = model_load_weights(self.get_model(), iter, loader)
             except Exception as e:
                 message = (
                     f"Failed to update weights: {e}.\nRolling back to original weights."
                 )
                 del iter
                 gc.collect()
-                iter = get_weight_iter(self.model_config)
-                model_load_weights(self.get_model(), iter)
+                original_load_config = copy(self.get_model_runner().load_config)
+                original_load_config.load_group = load_config.load_group
+                original_loader = get_model_loader(
+                    original_load_config, self.model_config
+                )
+                iter = get_weight_iter(original_loader, self.model_config)
+                model_load_weights(self.get_model(), iter, original_loader)
                 return False, message
 
+        self.model_config.model_path = model_path
         self.update_model_fields(
             model,
             model_path=model_path,
