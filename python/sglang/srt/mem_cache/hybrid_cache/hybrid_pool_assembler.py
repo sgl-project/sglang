@@ -1259,6 +1259,15 @@ def build_deepseek_v4_hicache_stack(
     return host_pool_group, cache_controller
 
 
+def _state_host_layout() -> str:
+    # MambaPoolHost only supports page_first_direct; the global layout may be
+    # page_first_kv_split (e.g. MLA + KDA hybrid on NPU). The Mamba/KDA state
+    # pool has no separate K/V buffers, so kv_split does not apply; override
+    # to page_first_direct.
+    layout = get_memory().hicache_mem_layout
+    return "page_first_direct" if layout == "page_first_kv_split" else layout
+
+
 def build_mamba_host_pool(
     mamba_pool,
     pool_info: DevicePoolInfo,
@@ -1346,20 +1355,11 @@ def build_hybrid_mamba_stack(
         host_size=kv_host_size,
         mtp_draft_device_pools=root.packed_draft_device_pools,
     )
-    # MambaPoolHost only supports page_first_direct; the global layout may be
-    # page_first_kv_split (e.g. MLA + KDA hybrid on NPU). The Mamba/KDA state
-    # pool has no separate K/V buffers, so kv_split does not apply; override
-    # to page_first_direct.
-    mamba_layout = (
-        "page_first_direct"
-        if get_memory().hicache_mem_layout == "page_first_kv_split"
-        else get_memory().hicache_mem_layout
-    )
     mamba_host_pool = build_mamba_host_pool(
         mamba_pool,
         mamba_info,
         host_size=mamba_host_size,
-        layout=mamba_layout,
+        layout=_state_host_layout(),
         mtp_draft_device_pools=params.mtp_draft_mamba_pools,
     )
     mamba_layer_mapping = with_packed_draft_layer_mapping(
@@ -1494,7 +1494,7 @@ def build_hybrid_mamba_swa_stack(
         mamba_pool,
         mamba_info,
         host_size=mamba_host_size,
-        layout=get_memory().hicache_mem_layout,
+        layout=_state_host_layout(),
         mtp_draft_device_pools=params.mtp_draft_mamba_pools,
     )
     mamba_layer_mapping = with_packed_draft_layer_mapping(
@@ -2203,8 +2203,6 @@ class _MambaSwaStrategy(StackStrategy):
         params,
         server_args,
         load_cache_event,
-        attn_cp_group=None,
-        attn_tp_group=None,
         storage_backend=None,
         storage_backend_extra_config=None,
         prefetch_threshold=256,
@@ -2223,8 +2221,8 @@ class _MambaSwaStrategy(StackStrategy):
             page_size=cache.page_size,
             tp_group=params.tp_cache_group,
             load_cache_event=load_cache_event,
-            attn_cp_group=attn_cp_group,
-            attn_tp_group=attn_tp_group,
+            attn_cp_group=params.attn_cp_cache_group,
+            attn_tp_group=params.attn_tp_cache_group,
             pp_group=params.pp_cache_group,
             storage_backend=storage_backend,
             host_swa_evict_fn=lambda n: cache.evict_host(n, ComponentType.SWA),
