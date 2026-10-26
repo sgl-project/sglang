@@ -17,9 +17,8 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
-# SM90 scores pages that hold whole blocks, as every case here, with its paged kernel.
 pytestmark = pytest.mark.skipif(
-    get_platform().is_sm90, reason="SM90 keeps the paged per-row kernel"
+    get_platform().is_sm90, reason="SM90 keeps its per-row score kernels"
 )
 
 HD, TOPK, PAGE, NDT, BLK = 128, 16, 128, 4, 128

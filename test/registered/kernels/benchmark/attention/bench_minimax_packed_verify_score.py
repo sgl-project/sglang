@@ -11,9 +11,8 @@ from sglang.kernels.ops.attention.minimax_sparse.decode.flash_with_topk_idx impo
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(
-    est_time=30, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
-)
+# On B200: SM90 does not pack verify rows, so both arms would time its own kernels.
+register_cuda_ci(est_time=30, stage="nightly", runner_config="4-gpu-b200")
 
 HD, BLK, TOPK, PAGE, NDT = 128, 128, 16, 128, 4
 PACK = {"per_row": 1, "packed": NDT}

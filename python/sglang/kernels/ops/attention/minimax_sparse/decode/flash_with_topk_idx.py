@@ -1291,11 +1291,12 @@ def flash_decode_with_topk_idx(
     skip_trivial_topk_score = use_dense_main_attn or use_jit_topk
 
     # EAGLE verify rows of one request share its index K: score them in one pass
-    # (CUDA; ROCm keeps its fixed per-row config and its own indexer CP path, and
-    # SM90 its paged kernel when a page holds whole blocks).
+    # (CUDA; SM90 keeps its paged and per-row kernels, ROCm its fixed per-row
+    # config and its own indexer CP path).
     use_packed = (
         q.is_cuda
         and not _ON_HIP
+        and not get_platform().is_sm90
         and disable_index_value
         and packed_queries > 1
         and batch_size % packed_queries == 0

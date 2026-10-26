@@ -262,7 +262,7 @@ def test_eager_verify_matches_causal_rows(monkeypatch, with_value):
         case.idx_v,
     )
     # Score-only layers score a request's draft rows in one pass over its index K;
-    # SM90 scores each row of these whole-block pages with its paged kernel.
+    # SM90 keeps its per-row score kernels.
     assert packed.count == (0 if with_value or get_platform().is_sm90 else 1)
     _assert_same(got, case.reference(), exact=True)
     # Verify leaves the batch's per-request metadata to the dense layers.
