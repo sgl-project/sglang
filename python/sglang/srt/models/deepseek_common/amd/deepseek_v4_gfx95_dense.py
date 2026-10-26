@@ -17,6 +17,7 @@ from sglang.kernels.ops.layernorm.rmsnorm_fake_quant_amd_gfx95 import (
 from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
     Fp8GridActivation,
     Mxfp8Activation,
+    _launch_fp8_grid_quant,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -255,3 +256,32 @@ def wo_a_fp8_grid_matmul(
     if fp8_grid:
         return Fp8GridActivation(y)
     return y.view(o.shape[0], wo_a.shape[0], wo_a.shape[1])
+
+
+# hipBLASLt before HIP 7.15 (ROCm 10) miscomputes a bmm into a strided out= at many shapes
+_STRIDED_BMM_OUT_OK = _is_hip and tuple(
+    int(v) for v in torch.version.hip.split(".")[:2]
+) >= (7, 15)
+
+# the measured failure set of the ROCm 7.2 torch wheel's hipBLASLt for the TP4 (2-group) verify
+# bmm into token-major bf16 (every row count 1-384 swept)
+_WO_A_VERIFY_STRIDED_BMM_BAD_ROWS = range(289, 295)
+
+
+def wo_a_verify_matmul(o: torch.Tensor, wo_a: torch.Tensor, emit_fp8: bool):
+    """TP4 target-verify wo_a before HIP 7.15. For an MXFP8 wo_b (emit_fp8): the einsum,
+    quantized in one launch over its group-major output into wo_b's token-major fp8 + ue8m0,
+    in place of the strided bmm plus wo_b's own quant. For a bf16 wo_b: the einsum copied
+    token-major at the rows the strided bmm gets wrong. None keeps the strided bmm."""
+    if _STRIDED_BMM_OUT_OK:
+        return None
+    if not emit_fp8:
+        if o.shape[0] in _WO_A_VERIFY_STRIDED_BMM_BAD_ROWS:
+            return torch.einsum("tgd,grd->tgr", o, wo_a).contiguous()
+        return None
+    y = torch.einsum("tgd,grd->tgr", o, wo_a)
+    T, G, R = y.shape
+    q = torch.empty((T, G * R), dtype=torch.float8_e4m3fn, device=o.device)
+    scale = torch.empty((T, G * R // 32), dtype=torch.uint8, device=o.device)
+    _launch_fp8_grid_quant(y, q, scale)
+    return Mxfp8Activation(q, scale)

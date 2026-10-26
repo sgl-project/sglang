@@ -178,7 +178,9 @@ def _fp8_grid_quant_kernel(
     scale_ptr,
     M,
     K,
+    group_k,
     stride_xm,
+    stride_xg,
     stride_om,
     stride_sm,
     BLOCK_M: tl.constexpr,
@@ -186,14 +188,19 @@ def _fp8_grid_quant_kernel(
     EMIT_FP8: tl.constexpr,
 ):
     """Per-32 ue8m0 fp8 e4m3 quantization, one program per [BLOCK_M, BLOCK_K]: the fp8
-    codes and ue8m0 exponents with EMIT_FP8, else their dequantized values."""
+    codes and ue8m0 exponents with EMIT_FP8, else their dequantized values. x's columns
+    come in groups of group_k, group g at x_ptr + g * stride_xg."""
     pid_m = tl.program_id(0)
     pid_k = tl.program_id(1)
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_k = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
+    g = pid_k * BLOCK_K // group_k
     m_mask = offs_m < M
     x = tl.load(
-        x_ptr + offs_m[:, None] * stride_xm + offs_k[None, :],
+        x_ptr
+        + g * stride_xg
+        + offs_m[:, None] * stride_xm
+        + (offs_k - g * group_k)[None, :],
         mask=m_mask[:, None],
         other=0.0,
     ).to(tl.float32)
@@ -219,14 +226,17 @@ def _fp8_grid_quant_kernel(
 def _launch_fp8_grid_quant(
     x: torch.Tensor, out: torch.Tensor, scale: Optional[torch.Tensor]
 ) -> None:
-    M, K = x.shape
+    # x is [M, K], or [M, G, K // G] (unit last stride) quantized into out [M, K] in one launch
+    x = x if x.dim() == 3 else x.unsqueeze(1)
+    M, G, group_k = x.shape
+    K = G * group_k
     if M == 0:
         return
     # per-element op, so the tile never changes the result
-    if M >= 1024 and K % 512 == 0:
+    if M >= 1024 and group_k % 512 == 0:
         BLOCK_M, BLOCK_K, num_warps = 32, 512, 8
     else:
-        BLOCK_K = 256 if K % 256 == 0 else (128 if K % 128 == 0 else 32)
+        BLOCK_K = 256 if group_k % 256 == 0 else (128 if group_k % 128 == 0 else 32)
         BLOCK_M, num_warps = (16 if M >= 1024 else 8), 4
     grid = (triton.cdiv(M, BLOCK_M), K // BLOCK_K)
     _fp8_grid_quant_kernel[grid](
@@ -235,7 +245,9 @@ def _launch_fp8_grid_quant(
         scale if scale is not None else out,
         M,
         K,
+        group_k,
         x.stride(0),
+        x.stride(1),
         out.stride(0),
         scale.stride(0) if scale is not None else 0,
         BLOCK_M=BLOCK_M,

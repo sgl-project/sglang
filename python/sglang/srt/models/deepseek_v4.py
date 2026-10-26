@@ -538,6 +538,10 @@ def _apply_wo_a_bf16_matmul(
             if fuse_mxfp8_quant:
                 return Mxfp8SwizzledInput(*wo_a_bf16_small_batch_mxfp8(o, wo_a))
             return wo_a_bf16_small_batch(o, wo_a)
+        if hip_decode_verify:
+            y = _hip.wo_a_verify_matmul(o, wo_a, emit_fp8)
+            if y is not None:
+                return y
         return _wo_a_bf16_bmm_token_major(o, wo_a)
     # The DSpark draft runs its block as target verify past 384 rows and with any
     # group count (8 without attention TP); the strided bmm still matches einsum.
