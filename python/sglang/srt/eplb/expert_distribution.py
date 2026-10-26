@@ -790,24 +790,20 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        # Threshold decisions need utilization history even with reporting off.
-        self._enable = reports_expert_balancedness() or not math.isclose(
-            get_exec().moe.eplb_min_rebalancing_utilization_threshold, 1.0
-        )
+        self._enable = reports_expert_balancedness()
 
         if self._enable:
             self.window_sizes = EPLB_BALANCEDNESS_WINDOW_SIZES
             self._history = _DequeCollection(maxlens=self.window_sizes)
             self._reset_server_log_history = True
             self._rank = torch.distributed.get_rank()
-            if reports_expert_balancedness():
-                expert_dispatch_cls = resolve_collector_class(
-                    STAT_LOGGER_ROLE_EXPERT_DISPATCH,
-                    ExpertDispatchCollector,
-                )
-                self._expert_dispatch_collector = expert_dispatch_cls(
-                    self._expert_location_metadata.ep_size
-                )
+            expert_dispatch_cls = resolve_collector_class(
+                STAT_LOGGER_ROLE_EXPERT_DISPATCH,
+                ExpertDispatchCollector,
+            )
+            self._expert_dispatch_collector = expert_dispatch_cls(
+                self._expert_location_metadata.ep_size
+            )
             self._metric_heatmap_collection_counter = 0
 
     def append(
@@ -848,8 +844,7 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
         )
 
         if self._rank == 0:
-            if reports_expert_balancedness():
-                self._handle_metric_eplb_heatmap(gpu_physical_count)
+            self._handle_metric_eplb_heatmap(gpu_physical_count)
 
             utilization_rate_gpu = torch.mean(
                 compute_utilization_rate(gpu_physical_count)
@@ -858,17 +853,16 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
                 get_exec().moe.eplb_min_rebalancing_utilization_threshold, 1.0
             )
 
-            if reports_expert_balancedness():
-                should_log = logs_expert_balancedness_to_server_log()
-                outputs["metrics"] = ExpertDistributionMetrics(
-                    forward_pass_id=forward_pass_id,
-                    eplb_balancedness=utilization_rate_gpu,
-                    gpu_physical_count_sum=(
-                        gpu_physical_count.sum() if should_log else None
-                    ),
-                    reset_server_log_history=self._reset_server_log_history,
-                )
-                self._reset_server_log_history = False
+            should_log = logs_expert_balancedness_to_server_log()
+            outputs["metrics"] = ExpertDistributionMetrics(
+                forward_pass_id=forward_pass_id,
+                eplb_balancedness=utilization_rate_gpu,
+                gpu_physical_count_sum=(
+                    gpu_physical_count.sum() if should_log else None
+                ),
+                reset_server_log_history=self._reset_server_log_history,
+            )
+            self._reset_server_log_history = False
 
             if should_track_history:
                 self._history.append(utilization_rate_gpu.item())

@@ -4,7 +4,7 @@ Run with torchrun --standalone --nproc-per-node=2 \
     test/manual/ep/test_eplb_online_loop.py
 
 Add --rebalance-threshold 0.9 to also check that uniform routing eventually
-skips migration while balancedness reporting stays off.
+skips migration with balancedness reporting enabled, as required upstream.
 
 P/D roles run sequentially with separate configurations. This checks manager
 behavior, not PD request transfer or device graph execution.
@@ -116,6 +116,9 @@ def main():
                         eplb_rebalance_num_iterations=4,
                         eplb_rebalance_layers_per_chunk=1,
                         eplb_min_rebalancing_utilization_threshold=args.rebalance_threshold,
+                        expert_balancedness_report_mode=(
+                            "server_log" if args.rebalance_threshold < 1 else "off"
+                        ),
                         expert_distribution_recorder_mode="stat",
                         expert_distribution_recorder_buffer_size=4,
                     ),
@@ -247,7 +250,7 @@ def main():
                 if args.rebalance_threshold < 1:
                     # Keep the same manager/history alive as the routing turns
                     # uniform. Once old skew ages out, decisions must skip the
-                    # updater on BOTH ranks, with reporting still off.
+                    # updater on BOTH ranks, using the upstream reporting-enabled path.
                     uniform = torch.ones(8, dtype=torch.int32)
                     for index in range(100):
                         if index == 84:

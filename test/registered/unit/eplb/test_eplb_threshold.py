@@ -1,4 +1,4 @@
-"""Rebalance threshold control is independent of balancedness reporting."""
+"""EPLB communication and device adaptation retain upstream threshold semantics."""
 
 import unittest
 from types import SimpleNamespace
@@ -15,7 +15,7 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class TestEPLBThreshold(unittest.TestCase):
-    def accumulator(self, rank=0, threshold=0.9, report_mode="off"):
+    def accumulator(self, rank=0, threshold=0.9, report_mode="server_log"):
         publish(
             ServerArgs(
                 model_path="dummy",
@@ -28,27 +28,25 @@ class TestEPLBThreshold(unittest.TestCase):
             role="test",
         )
         metadata = SimpleNamespace(num_layers=2, num_physical_experts=8, ep_size=2)
-        with patch.object(
-            distribution.torch.distributed, "get_rank", return_value=rank
+        with (
+            patch.object(distribution.torch.distributed, "get_rank", return_value=rank),
+            patch.object(
+                distribution, "resolve_collector_class", return_value=lambda _: None
+            ),
         ):
             return distribution._StatAccumulator(metadata, rank)
 
-    def test_disabled_reporting_still_tracks_threshold(self):
-        accumulator = self.accumulator()
-        outputs = {}
-        # Each layer sends six routes to rank 0 and two to rank 1.
-        counts = torch.tensor([[2, 2, 1, 1, 1, 1, 0, 0]] * 2)
-        with (
-            patch.object(distribution.torch.distributed, "reduce") as reduce,
-            patch.object(distribution.torch.distributed, "broadcast"),
-        ):
-            accumulator.append(0, "primary", {"global_physical_count": counts}, outputs)
-            self.assertAlmostEqual(
-                accumulator._get_global_average_utilization_rate(),
-                (4 + 1e-5) / (6 + 1e-5),
+    def test_disabled_reporting_keeps_upstream_threshold_behavior(self):
+        accumulator = self.accumulator(report_mode="off")
+        with patch.object(distribution.torch.distributed, "reduce") as reduce:
+            accumulator.append(
+                0,
+                "primary",
+                {"global_physical_count": torch.ones(2, 8, dtype=torch.int32)},
+                {},
             )
-        self.assertNotIn("metrics", outputs)
-        self.assertIsNone(reduce.call_args.kwargs["group"])
+            self.assertIsNone(accumulator._get_global_average_utilization_rate())
+        reduce.assert_not_called()
 
     def test_threshold_statistics_use_selected_communication_group(self):
         accumulator = self.accumulator()
@@ -91,7 +89,7 @@ class TestEPLBThreshold(unittest.TestCase):
                     )
 
     def test_default_threshold_keeps_reporting_off_path_inactive(self):
-        accumulator = self.accumulator(threshold=1.0)
+        accumulator = self.accumulator(threshold=1.0, report_mode="off")
         with patch.object(distribution.torch.distributed, "reduce") as reduce:
             accumulator.append(
                 0,
