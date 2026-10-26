@@ -272,7 +272,18 @@ def prepare_for_draft(
         # A chain draft's slots lead the iteration's window: gather the whole
         # window in the same launch.
         window_cols = num_draft_tokens if plans_window else num_steps
-        if page_size == 1 or topk == 1:
+        # A backend that expresses tree visibility in per-row sparse indices
+        # (Ascend DSA) reads one contiguous window, so page>1 must not switch to
+        # the GPU per-branch page-aligned regions and their duplicated prefix
+        # tails -- that layout only exists for the CUDA expand pass.
+        page_aligned_branches = (
+            page_size > 1
+            and topk > 1
+            and not getattr(
+                draft_model_runner, "draft_tree_uses_sparse_indices", False
+            )
+        )
+        if not page_aligned_branches:
             batch.out_cache_loc = torch.empty(
                 (bs * topk * window_cols,),
                 dtype=torch.int64,

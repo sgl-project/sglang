@@ -19,20 +19,25 @@ from __future__ import annotations
 __all__ = ["draft_step_kv_offset", "draft_step_query_lens"]
 
 
-def draft_step_kv_offset(step: int, topk: int) -> int:
+def draft_step_kv_offset(step: int, topk: int, num_steps: int) -> int:
     """KV slots live at draft step ``step``, counted from the prefix.
 
-    Step ``i`` writes ``topk`` slots (one tree level) and a query reads its own
-    slot inclusively, so the window has to reach the end of that level:
-    ``(i + 1) * topk``. For ``topk == 1`` this is the historical ``step + 1``.
+    Draft slots are laid out branch-major: branch ``t`` owns the contiguous
+    positions ``prefix + t * num_steps + [0, num_steps)``, so at step ``s`` the
+    farthest written slot is ``prefix + (topk - 1) * num_steps + s`` and the
+    window has to reach it inclusively. For ``topk == 1`` this is the historical
+    ``step + 1``.
     """
     step = int(step)
     topk = int(topk)
+    num_steps = int(num_steps)
     if step < 0:
         raise ValueError(f"draft step must be >= 0, got {step}")
     if topk < 1:
         raise ValueError(f"topk must be >= 1, got {topk}")
-    return (step + 1) * topk
+    if num_steps < 1:
+        raise ValueError(f"num_steps must be >= 1, got {num_steps}")
+    return (topk - 1) * num_steps + step + 1
 
 
 def draft_step_query_lens(num_requests: int, topk: int) -> list[int]:

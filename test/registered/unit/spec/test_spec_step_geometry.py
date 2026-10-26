@@ -53,17 +53,25 @@ class TestDraftStepGeometry(unittest.TestCase):
     def test_topk1_reproduces_the_chain_values(self):
         """Regression guard: the production chain path must not move."""
         self.assertEqual(
-            [draft_step_kv_offset(s, 1) for s in range(4)], [1, 2, 3, 4]
+            [draft_step_kv_offset(s, 1, 3) for s in range(4)], [1, 2, 3, 4]
+        )
+        # num_steps must not matter for a chain.
+        self.assertEqual(
+            [draft_step_kv_offset(s, 1, 7) for s in range(4)], [1, 2, 3, 4]
         )
         self.assertEqual(draft_step_query_lens(3, 1), [1, 2, 3])
 
-    def test_a_wider_tree_scales_both_quantities(self):
-        # One step writes topk slots, so the window ends at (step + 1) * topk.
-        self.assertEqual([draft_step_kv_offset(s, 2) for s in range(3)], [2, 4, 6])
-        self.assertEqual(draft_step_query_lens(2, 5), [5, 10])
+    def test_a_wider_tree_reaches_the_last_branch(self):
+        # Branch-major: at step s the farthest slot is prefix + (topk-1)*steps + s.
+        self.assertEqual(
+            [draft_step_kv_offset(s, 2, 3) for s in range(3)], [4, 5, 6]
+        )
+        self.assertEqual([draft_step_kv_offset(s, 3, 4) for s in range(4)],
+                         [9, 10, 11, 12])
+        self.assertEqual(draft_step_query_lens(2, 3), [3, 6])
 
     def test_invalid_inputs_raise(self):
-        for bad in ((-1, 2), (0, 0)):
+        for bad in ((-1, 2, 3), (0, 0, 3), (0, 2, 0)):
             with self.assertRaises(ValueError):
                 draft_step_kv_offset(*bad)
         for bad in ((-1, 2), (2, 0)):

@@ -267,6 +267,7 @@ def draft_step_ancestor_positions(
     prefix_len: torch.Tensor,
     step: int,
     topk: int,
+    num_steps: int,
     check: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Ancestor paths and absolute positions of one draft-decode step.
@@ -304,10 +305,13 @@ def draft_step_ancestor_positions(
     """
     step = int(step)
     topk = int(topk)
+    num_steps = int(num_steps)
     if step < 0:
         raise ValueError(f"draft step must be >= 0, got {step}")
     if topk < 1:
         raise ValueError(f"topk must be >= 1, got {topk}")
+    if num_steps < 1:
+        raise ValueError(f"num_steps must be >= 1, got {num_steps}")
     if prefix_len.dim() != 1:
         raise ValueError(f"prefix_len must be 1-D, got {prefix_len.shape}")
     if check and bool((prefix_len < 0).any()):
@@ -323,7 +327,7 @@ def draft_step_ancestor_positions(
             raise ValueError("step 0 has no parent level")
         if paths is not None and int(paths.numel()):
             raise ValueError("step 0 has no earlier level")
-        self_pos = prefix + slots  # 0 * topk collapses
+        self_pos = prefix + slots * num_steps  # branch-major, level 0
         return (
             torch.empty((bs, topk, 0), dtype=torch.int32, device=device),
             self_pos.unsqueeze(-1).to(torch.int32),
@@ -357,8 +361,9 @@ def draft_step_ancestor_positions(
     new_paths = torch.cat([gathered, parent.unsqueeze(-1)], dim=-1)
 
     levels = torch.arange(step, device=device, dtype=torch.int64).view(1, 1, step)
-    abs_ancestors = prefix.unsqueeze(-1) + levels * topk + new_paths
-    self_pos = prefix + step * topk + slots
+    # Branch-major slots: branch t owns [prefix + t*num_steps, +num_steps).
+    abs_ancestors = prefix.unsqueeze(-1) + new_paths * num_steps + levels
+    self_pos = prefix + slots * num_steps + step
     positions = torch.cat([abs_ancestors, self_pos.unsqueeze(-1)], dim=-1)
     return new_paths.to(torch.int32), positions.to(torch.int32)
 
@@ -496,7 +501,13 @@ class DraftTreeSparseState:
         prefix_len = seq_lens[:bs]
 
         self._paths, positions = draft_step_ancestor_positions(
-            self._paths, parent_slot, prefix_len, step, self.topk, check=validate
+            self._paths,
+            parent_slot,
+            prefix_len,
+            step,
+            self.topk,
+            self.num_steps,
+            check=validate,
         )
         setattr(forward_batch, DRAFT_TREE_ANCESTORS_ATTR, positions)
         setattr(forward_batch, DRAFT_TREE_PREFIX_ATTR, prefix_len)

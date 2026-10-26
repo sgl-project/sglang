@@ -98,7 +98,9 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
             for speculative_step_id in range(self.speculative_num_steps - 1):
                 seq_lens_cpu = (
                     forward_batch.seq_lens_cpu[: self.raw_bs]
-                    + draft_step_kv_offset(speculative_step_id, topk)
+                    + draft_step_kv_offset(
+                        speculative_step_id, topk, self.speculative_num_steps
+                    )
                 )
                 seq_lens = seq_lens_cpu.tolist() + [0] * (self.bs - self.raw_bs)
                 seq_lens_for_each_draft_step.append(seq_lens)

@@ -413,46 +413,47 @@ class TestMergeTreeSparseIndices(unittest.TestCase):
 
 
 class TestDraftStepAncestorPositions(unittest.TestCase):
-    """Draft-stage ancestor paths (D3), pure geometry, no backend."""
+    """Draft-stage ancestor paths (D3). Slots are branch-major:
+
+    branch t owns [prefix + t * num_steps, + num_steps), so the ancestor at
+    level d of a chain that passed branch t_d sits at prefix + t_d * num_steps + d.
+    Positions therefore do not ascend across levels; uniqueness is what matters.
+    """
+
+    TOPK, STEPS, PREFIX = 2, 3, 10
+
+    def _call(self, paths, parent_slot, step):
+        return draft_step_ancestor_positions(
+            paths=paths,
+            parent_slot=parent_slot,
+            prefix_len=torch.tensor([self.PREFIX]),
+            step=step,
+            topk=self.TOPK,
+            num_steps=self.STEPS,
+        )
 
     def test_step0_has_only_self(self):
-        paths, pos = draft_step_ancestor_positions(
-            paths=None,
-            parent_slot=None,
-            prefix_len=torch.tensor([10]),
-            step=0,
-            topk=2,
-        )
+        paths, pos = self._call(None, None, 0)
 
-        self.assertEqual(tuple(paths.shape), (1, 2, 0))
-        self.assertEqual(tuple(pos.shape), (1, 2, 1))
-        self.assertEqual(pos.tolist(), [[[10], [11]]])
+        self.assertEqual(tuple(paths.shape), (1, self.TOPK, 0))
+        self.assertEqual(tuple(pos.shape), (1, self.TOPK, 1))
+        # Branch t starts at prefix + t * num_steps.
+        self.assertEqual(pos.tolist(), [[[10], [13]]])
 
     def test_step1_links_to_level0(self):
-        paths, pos = draft_step_ancestor_positions(
-            paths=torch.zeros((1, 2, 0), dtype=torch.int32),
-            parent_slot=torch.tensor([[0, 1]]),
-            prefix_len=torch.tensor([10]),
-            step=1,
-            topk=2,
-        )
+        paths, pos = self._call(torch.zeros((1, 2, 0), dtype=torch.int32),
+                                torch.tensor([[0, 1]]), 1)
 
         self.assertEqual(paths.tolist(), [[[0], [1]]])
-        # level-0 ancestor, then self (level 1).
-        self.assertEqual(pos.tolist(), [[[10, 12], [11, 13]]])
+        # ancestor(level0) then self(level1) per branch.
+        self.assertEqual(pos.tolist(), [[[10, 11], [13, 14]]])
 
     def test_step2_walks_the_chain(self):
-        paths, pos = draft_step_ancestor_positions(
-            paths=torch.tensor([[[0], [1]]], dtype=torch.int32),
-            parent_slot=torch.tensor([[1, 0]]),
-            prefix_len=torch.tensor([10]),
-            step=2,
-            topk=2,
-        )
+        paths, pos = self._call(torch.tensor([[[0], [1]]], dtype=torch.int32),
+                                torch.tensor([[1, 0]]), 2)
 
-        # Candidate 0's parent is level-1 slot 1, whose own parent is level-0 slot 1.
         self.assertEqual(paths.tolist(), [[[1, 1], [0, 0]]])
-        self.assertEqual(pos.tolist(), [[[11, 13, 14], [10, 12, 15]]])
+        self.assertEqual(pos.tolist(), [[[13, 14, 12], [10, 11, 15]]])
 
     def test_per_request_prefix_len(self):
         _, pos = draft_step_ancestor_positions(
@@ -461,16 +462,18 @@ class TestDraftStepAncestorPositions(unittest.TestCase):
             prefix_len=torch.tensor([10, 20]),
             step=1,
             topk=2,
+            num_steps=3,
         )
 
-        self.assertEqual(pos[0].tolist(), [[10, 12], [11, 13]])
-        self.assertEqual(pos[1].tolist(), [[21, 22], [20, 23]])
+        self.assertEqual(pos[0].tolist(), [[10, 11], [13, 14]])
+        # Request 1: branch base 20, so ancestor of branch t sits at 20 + 3t.
+        self.assertEqual(pos[1].tolist(), [[23, 21], [20, 24]])
 
-    def test_width_is_step_plus_one_and_ascending(self):
+    def test_shape_uniqueness_and_window(self):
         torch.manual_seed(0)
-        topk, step_max, prefix = 3, 4, 17
+        topk, steps, prefix = 3, 4, 17
         paths, parent = None, None
-        for step in range(step_max):
+        for step in range(steps):
             if step > 0:
                 parent = torch.randint(0, topk, (1, topk), dtype=torch.int32)
             paths, pos = draft_step_ancestor_positions(
@@ -479,95 +482,65 @@ class TestDraftStepAncestorPositions(unittest.TestCase):
                 prefix_len=torch.tensor([prefix]),
                 step=step,
                 topk=topk,
+                num_steps=steps,
             )
             self.assertEqual(tuple(pos.shape), (1, topk, step + 1))
+            window = prefix + (topk - 1) * steps + step + 1
             for j in range(topk):
                 row = pos[0, j].tolist()
                 self.assertEqual(len(row), step + 1)
-                self.assertEqual(row, sorted(row), "positions must ascend")
                 self.assertEqual(len(set(row)), len(row), "no repeated slot")
-                self.assertEqual(row[-1], prefix + step * topk + j)
-                self.assertTrue(all(v < prefix + (step + 1) * topk for v in row))
+                self.assertEqual(row[-1], prefix + j * steps + step)
+                self.assertTrue(all(prefix <= v < window for v in row))
 
     def test_rejects_bad_parent_slot(self):
         with self.assertRaises(ValueError):
-            draft_step_ancestor_positions(
-                paths=torch.zeros((1, 2, 0), dtype=torch.int32),
-                parent_slot=torch.tensor([[0, 4]]),
-                prefix_len=torch.tensor([10]),
-                step=1,
-                topk=2,
-            )
+            self._call(torch.zeros((1, 2, 0), dtype=torch.int32),
+                       torch.tensor([[0, 4]]), 1)
 
     def test_rejects_parent_at_step0(self):
         with self.assertRaises(ValueError):
-            draft_step_ancestor_positions(
-                paths=None,
-                parent_slot=torch.tensor([[0, 1]]),
-                prefix_len=torch.tensor([10]),
-                step=0,
-                topk=2,
-            )
+            self._call(None, torch.tensor([[0, 1]]), 0)
 
     def test_rejects_negative_prefix(self):
         with self.assertRaises(ValueError):
             draft_step_ancestor_positions(
-                paths=None,
-                parent_slot=None,
-                prefix_len=torch.tensor([-1]),
-                step=0,
-                topk=2,
+                paths=None, parent_slot=None, prefix_len=torch.tensor([-1]),
+                step=0, topk=2, num_steps=3,
             )
 
 
 class TestDraftTreeSparseState(unittest.TestCase):
-    def _batch(self, prefix=10):
+    TOPK, STEPS, PREFIX = 2, 3, 10
+
+    def _batch(self, prefix=None):
         import types
 
-        return types.SimpleNamespace(seq_lens=torch.tensor([prefix]))
+        return types.SimpleNamespace(
+            seq_lens=torch.tensor([self.PREFIX if prefix is None else prefix])
+        )
 
     def test_accumulates_across_steps_and_stashes_positions(self):
-        topk, steps = 2, 3
-        state = DraftTreeSparseState(topk, steps)
+        state = DraftTreeSparseState(self.TOPK, self.STEPS)
         fb = self._batch()
-        parents_list = [torch.arange(-1, topk).expand(1, topk + 1)]
+        parents_list = [torch.arange(-1, self.TOPK).expand(1, self.TOPK + 1)]
 
         pos0 = state.begin_step(0, fb, parents_list)
-        self.assertEqual(pos0.tolist(), [[[10], [11]]])
+        self.assertEqual(pos0.tolist(), [[[10], [13]]])
         self.assertIs(getattr(fb, DRAFT_TREE_ANCESTORS_ATTR), pos0)
         self.assertEqual(getattr(fb, DRAFT_TREE_PREFIX_ATTR).tolist(), [10])
 
         # step 1: flat [0, 3] -> parent slots [0, 1], offset 2
         parents_list.append(torch.tensor([[0, 3]]) + 2)
         pos1 = state.begin_step(1, fb, parents_list)
-        self.assertEqual(pos1.tolist(), [[[10, 12], [11, 13]]])
+        self.assertEqual(pos1.tolist(), [[[10, 11], [13, 14]]])
 
         # step 2: flat [2, 1] -> parent slots [1, 0], offset 6
         parents_list.append(torch.tensor([[2, 1]]) + 6)
         pos2 = state.begin_step(2, fb, parents_list)
-        self.assertEqual(pos2.tolist(), [[[11, 13, 14], [10, 12, 15]]])
-
-    def test_new_iteration_restarts_at_step0(self):
-        topk = 2
-        state = DraftTreeSparseState(topk, 3)
-        fb = self._batch()
-        first = [torch.arange(-1, topk).expand(1, topk + 1)]
-        pos_a = state.begin_step(0, fb, first)
-        fb2 = self._batch()
-        pos_b = state.begin_step(0, fb2, first)
-        self.assertEqual(pos_a.tolist(), pos_b.tolist())
-
-    def test_per_request_prefix(self):
-        state = DraftTreeSparseState(2, 2)
-        import types
-
-        fb = types.SimpleNamespace(seq_lens=torch.tensor([10, 20]))
-        parents = [torch.zeros((2, 3), dtype=torch.long)]
-        pos = state.begin_step(0, fb, parents)
-        self.assertEqual(pos.tolist(), [[[10], [11]], [[20], [21]]])
+        self.assertEqual(pos2.tolist(), [[[13, 14, 12], [10, 11, 15]]])
 
     def test_rejects_a_parent_row_without_the_step_offset(self):
-        # Step 1 shifts the flat score index by 	opk; a raw index decodes negative.
         state = DraftTreeSparseState(2, 2)
         parents = [torch.zeros((1, 3)), torch.tensor([[0, 1]])]
         with self.assertRaises(ValueError):

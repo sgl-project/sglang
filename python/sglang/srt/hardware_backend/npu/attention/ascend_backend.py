@@ -320,6 +320,7 @@ class AscendAttnBackend(AttentionBackend):
         model_runner: ModelRunner,
         speculative_step_id: int = 0,
         speculative_topk: int = 1,
+        speculative_num_steps: int = 1,
     ):
         super().__init__()
         self.forward_metadata = None
@@ -331,7 +332,7 @@ class AscendAttnBackend(AttentionBackend):
         # scale with it; at topk == 1 these reduce to the chain values.
         self.speculative_topk = max(1, int(speculative_topk))
         self.speculative_step_offset = draft_step_kv_offset(
-            speculative_step_id, self.speculative_topk
+            speculative_step_id, self.speculative_topk, speculative_num_steps
         )
         self.speculative_step_offset_npu = torch.tensor(
             self.speculative_step_offset, device="npu"
@@ -3549,6 +3550,10 @@ class AscendAttnMultiStepDraftBackend:
                 self.tree_sparse_state = DraftTreeSparseState(
                     topk, speculative_num_steps
                 )
+                # Keep the contiguous draft slot layout: the per-branch
+                # page-aligned regions (and their duplicated prefix tails) exist
+                # only for the GPU expand pass, which this backend does not run.
+                model_runner.draft_tree_uses_sparse_indices = True
             else:
                 # Never let a wider tree silently fall back to a linear causal
                 # draft view: the accept-rate work would look "done" and do
@@ -3570,6 +3575,7 @@ class AscendAttnMultiStepDraftBackend:
                     model_runner,
                     speculative_step_id=step_id,
                     speculative_topk=topk,
+                    speculative_num_steps=speculative_num_steps,
                 )
             )
         self.needs_cpu_seq_lens = any(b.needs_cpu_seq_lens for b in self.attn_backends)
