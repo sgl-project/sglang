@@ -248,6 +248,7 @@ _RANK_AND_WIDTH = (
     ("attn_dp_rank", "attn_dp_size"),
     ("attn_cp_rank", "attn_cp_size"),
     ("moe_ep_rank", "moe_ep_size"),
+    ("qsa_cache_sharding_rank", "qsa_cache_sharding_size"),
 )
 
 # MoE-DP may alias a wider attention-CP group, so its configured width
@@ -258,6 +259,7 @@ _WIDTH_AND_GROUP = (
     ("attn_tp_size", "attn_tp_group"),
     ("attn_cp_size", "attn_cp_group"),
     ("moe_ep_size", "moe_ep_group"),
+    ("qsa_cache_sharding_size", "qsa_cache_sharding_group"),
 )
 
 _UNREADABLE = object()
@@ -1563,9 +1565,11 @@ def _configure_context(
             ),
         )
     context._publish_role = role
-    # Disabled DCP has rank zero even in processes without a rank bundle.
+    # Disabled DCP and QSA cache sharding have rank zero without a rank bundle.
     if not context.parallel.dcp_enabled:
         context.parallel.override_permanently(attn_dcp_rank=0)
+    if context.parallel.qsa_cache_sharding_size == 1:
+        context.parallel.override_permanently(qsa_cache_sharding_rank=0)
     # The device is assigned by the launcher; it is not a config field.
     context.config_bag("device")._set(
         "gpu_id", ranks.gpu_id if ranks is not None else None
@@ -1592,6 +1596,9 @@ def _configure_context(
         if parallel.dcp_enabled:
             placement["dcp_rank"] = placement["tp_rank"] % parallel.dcp_size
         placement["attn_dcp_rank"] = placement.get("dcp_rank", 0)
+        placement["qsa_cache_sharding_rank"] = (
+            placement["tp_rank"] % parallel.qsa_cache_sharding_size
+        )
         parallel.override_permanently(**placement)
         _validate_parallel(parallel, "publish")
     if _ROLE_NS_MODE == "record":

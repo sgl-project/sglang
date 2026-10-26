@@ -1,14 +1,29 @@
+import argparse
+import os
+import socket
 import sys
 from itertools import accumulate
 from types import MethodType, ModuleType, SimpleNamespace
 
 import pytest
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 
 from sglang.kernels.ops.attention import qwen38_qsa_sm121_varlen
 from sglang.srt.configs.qwen4_exp import Qwen4ExpConfig
 from sglang.srt.layers.attention import qwen_sparse_attn_backend as qsa_backend_module
 from sglang.srt.layers.attention.qsa import qsa_indexer as qsa_indexer_module
+from sglang.srt.layers.attention.qsa.cache_sharding import (
+    QSACacheShardingStaticBuffers,
+    resolve_qsa_cache_sharding_runtime,
+    validate_qsa_cache_sharding,
+)
+from sglang.srt.layers.attention.qsa.distributed_topk import (
+    fused_publish_and_merge_qsa_topk_candidates,
+    gather_and_merge_qsa_topk_candidates,
+    merge_qsa_topk_candidates,
+)
 from sglang.srt.layers.attention.qsa.kernel import (
     expand_qsa_block_indices,
     qsa_fast_topk,
@@ -35,7 +50,13 @@ from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
     QwenSparseAttnBackend,
     QwenSparseMultiStepDraftBackend,
 )
+from sglang.srt.mem_cache.qsa_kv_pool import (
+    QSACompressedBlockSharding,
+    QSARawKVSharding,
+    QSATokenToKVPool,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
@@ -44,6 +65,917 @@ COMPRESS_RATIO = 4
 TOKEN_TOPK = 2048
 BLOCK_TOPK = TOKEN_TOPK // COMPRESS_RATIO
 FINAL_TOPK = TOKEN_TOPK + COMPRESS_RATIO - 1
+
+
+def test_qsa_cache_sharding_layers_share_one_static_arena():
+    buffers = QSACacheShardingStaticBuffers(
+        max_rows=8,
+        topk=16,
+        owner_topk=32,
+        num_heads=8,
+        head_dim=128,
+        world_size=4,
+        device="cpu",
+        dtype=torch.bfloat16,
+        layer_ids=(2, 5, 9),
+    )
+
+    layer_buffers = [buffers.for_layer(layer_id) for layer_id in (2, 5, 9)]
+    assert all(layer_buffer is buffers for layer_buffer in layer_buffers)
+    assert len({layer_buffer.q_send.data_ptr() for layer_buffer in layer_buffers}) == 1
+    assert (
+        len({layer_buffer.candidate_recv.data_ptr() for layer_buffer in layer_buffers})
+        == 1
+    )
+    with pytest.raises(KeyError, match="no static transport slice"):
+        buffers.for_layer(10)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_qsa_cache_sharding_max_graph_bucket_matches_budget():
+    dimensions = {
+        "max_rows": 1024,
+        "topk": 512,
+        "owner_topk": 2051,
+        "num_heads": 32,
+        "head_dim": 128,
+        "world_size": 4,
+        "dtype": torch.bfloat16,
+    }
+    buffers = QSACacheShardingStaticBuffers(
+        **dimensions,
+        device="cuda",
+        layer_ids=tuple(range(48)),
+    )
+
+    tensors = [
+        value for value in vars(buffers).values() if isinstance(value, torch.Tensor)
+    ]
+    actual_bytes = sum(tensor.numel() * tensor.element_size() for tensor in tensors)
+    assert actual_bytes < 100 * 1024**2
+    assert all(buffers.for_layer(layer_id) is buffers for layer_id in range(48))
+
+
+class _QSAIntegrationGroup:
+    def __init__(self, rank, world_size):
+        self.rank_in_group = rank
+        self.world_size = world_size
+        self.device_group = dist.group.WORLD
+
+    def all_gather_into_tensor(self, output, value):
+        dist.all_gather_into_tensor(output, value, group=self.device_group)
+        return output
+
+    def all_to_all_single(self, output, value):
+        dist.all_to_all_single(output, value, group=self.device_group)
+        return output
+
+    def all_gather(self, value, dim=0):
+        gathered = [torch.empty_like(value) for _ in range(self.world_size)]
+        dist.all_gather(gathered, value, group=self.device_group)
+        return torch.cat(gathered, dim=dim)
+
+
+def _assert_qsa_integration_close(
+    selected,
+    output,
+    lse,
+    expected_selected,
+    expected_output,
+    expected_lse,
+    control_group,
+):
+    local_status = torch.tensor(
+        [
+            torch.equal(
+                selected.sort(dim=-1).values,
+                expected_selected.sort(dim=-1).values,
+            ),
+            torch.allclose(output, expected_output, rtol=2e-2, atol=2e-2),
+            torch.allclose(lse, expected_lse, rtol=2e-3, atol=2e-3),
+        ],
+        dtype=torch.int32,
+    )
+    global_status = local_status.clone()
+    dist.all_reduce(global_status, op=dist.ReduceOp.MIN, group=control_group)
+    if not bool(torch.all(global_status).item()):
+        raise AssertionError(
+            "QSA multi-rank integration mismatch: "
+            f"local={local_status.tolist()}, global={global_status.tolist()}"
+        )
+
+
+def _qsa_integration_inputs(world_size, rank, device):
+    rows, local_heads, head_dim = 2, 2, 128
+    local_blocks, compress_ratio, token_topk = 640, 4, 2048
+    global_blocks = local_blocks * world_size
+    global_tokens = global_blocks * compress_ratio
+    generator = torch.Generator().manual_seed(20261012)
+    index_q = torch.randn(
+        rows, 8, head_dim, dtype=torch.bfloat16, generator=generator
+    ).to(device)
+    compressed = torch.randn(
+        global_blocks, 1, head_dim, dtype=torch.bfloat16, generator=generator
+    ).to(device)
+    full_q = torch.randn(
+        rows,
+        local_heads * world_size,
+        head_dim,
+        dtype=torch.bfloat16,
+        generator=generator,
+    ).to(device)
+    full_k = torch.randn(
+        global_tokens, 1, head_dim, dtype=torch.bfloat16, generator=generator
+    ).to(device)
+    full_v = torch.randn(
+        global_tokens, 1, head_dim, dtype=torch.bfloat16, generator=generator
+    ).to(device)
+    return SimpleNamespace(
+        rows=rows,
+        local_heads=local_heads,
+        head_dim=head_dim,
+        local_blocks=local_blocks,
+        global_blocks=global_blocks,
+        global_tokens=global_tokens,
+        compress_ratio=compress_ratio,
+        token_topk=token_topk,
+        index_q=index_q,
+        local_compressed=compressed[rank::world_size].contiguous(),
+        global_compressed=compressed,
+        local_q=full_q[:, rank * local_heads : (rank + 1) * local_heads].contiguous(),
+        full_q=full_q,
+        local_k=full_k[rank::world_size].contiguous(),
+        local_v=full_v[rank::world_size].contiguous(),
+        full_k=full_k,
+        full_v=full_v,
+    )
+
+
+def _qsa_integration_tokens(
+    inputs,
+    indexer,
+    mode,
+    compressed,
+    *,
+    logical_positions=None,
+    static_buffers=None,
+):
+    query_positions = torch.full(
+        (inputs.rows,),
+        inputs.global_tokens - 1,
+        dtype=torch.int64,
+        device=inputs.index_q.device,
+    )
+    sequence_lengths = query_positions + 1
+    local_blocks = compressed.shape[0]
+    if mode == "prefill":
+        kwargs = {}
+        if indexer.distributed_topk_group is not None:
+            kwargs = {
+                "collective_keys": inputs.global_blocks * inputs.rows,
+                "collective_world_size": indexer.distributed_topk_group.world_size,
+            }
+        return indexer.select_prefill_tokens(
+            inputs.index_q,
+            compressed,
+            torch.zeros(inputs.rows, dtype=torch.int32, device=inputs.index_q.device),
+            torch.full(
+                (inputs.rows,),
+                local_blocks,
+                dtype=torch.int32,
+                device=inputs.index_q.device,
+            ),
+            query_positions,
+            sequence_lengths,
+            logical_block_positions=logical_positions,
+            static_buffers=static_buffers,
+            **kwargs,
+        )
+
+    page_size = 16
+    compressed_cache = compressed.reshape(-1, page_size, 1, inputs.head_dim)
+    page_table = (
+        torch.arange(
+            compressed_cache.shape[0],
+            dtype=torch.int32,
+            device=inputs.index_q.device,
+        )
+        .unsqueeze(0)
+        .expand(inputs.rows, -1)
+    )
+    return indexer.select_decode_tokens(
+        inputs.index_q,
+        compressed_cache,
+        page_table,
+        torch.full(
+            (inputs.rows,),
+            local_blocks,
+            dtype=torch.int32,
+            device=inputs.index_q.device,
+        ),
+        local_blocks,
+        query_positions,
+        sequence_lengths,
+        logical_block_positions=logical_positions,
+        static_buffers=static_buffers,
+    )
+
+
+def _run_qsa_multirank_production_integration(rank, world_size, port):
+    from sglang.srt.layers.attention.qsa.owner_sparse_attn import (
+        owner_sparse_attention,
+    )
+
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    os.environ["SGLANG_QSA_CANDIDATE_SYMM_MEM"] = "0"
+    torch.cuda.set_device(rank)
+    device = torch.device("cuda", rank)
+    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    try:
+        control_group = dist.new_group(backend="gloo")
+        group = _QSAIntegrationGroup(rank, world_size)
+        inputs = _qsa_integration_inputs(world_size, rank, device)
+        indexer = QSAIndexer.__new__(QSAIndexer)
+        indexer.block_topk = inputs.token_topk // inputs.compress_ratio
+        indexer.token_topk = inputs.token_topk
+        indexer.compress_ratio = inputs.compress_ratio
+        indexer.distributed_topk_group = group
+        reference_indexer = QSAIndexer.__new__(QSAIndexer)
+        reference_indexer.block_topk = indexer.block_topk
+        reference_indexer.token_topk = indexer.token_topk
+        reference_indexer.compress_ratio = indexer.compress_ratio
+        reference_indexer.distributed_topk_group = None
+        logical_positions = (
+            torch.arange(inputs.local_blocks, device=device) * world_size + rank
+        ).to(torch.int32)
+        logical_positions = logical_positions.unsqueeze(0).expand(inputs.rows, -1)
+        buffers = QSACacheShardingStaticBuffers(
+            max_rows=inputs.rows,
+            topk=indexer.block_topk,
+            owner_topk=inputs.token_topk + inputs.compress_ratio - 1,
+            num_heads=inputs.local_heads * world_size,
+            head_dim=inputs.head_dim,
+            world_size=world_size,
+            device=device,
+            dtype=torch.bfloat16,
+            layer_ids=(0, 1),
+            candidate_group=None,
+        )
+        sharding = QSARawKVSharding(
+            local_capacity=inputs.local_k.shape[0],
+            world_size=world_size,
+            rank=rank,
+        )
+        reference_sharding = QSARawKVSharding(
+            local_capacity=inputs.full_k.shape[0],
+            world_size=1,
+            rank=0,
+        )
+
+        def run(mode):
+            selected = _qsa_integration_tokens(
+                inputs,
+                indexer,
+                mode,
+                inputs.local_compressed,
+                logical_positions=logical_positions,
+                static_buffers=buffers.for_layer(0),
+            )
+            output, lse = owner_sparse_attention(
+                inputs.local_q,
+                inputs.local_k,
+                inputs.local_v,
+                selected,
+                sharding,
+                group=group,
+                static_buffers=buffers.for_layer(1),
+            )
+            return selected, output, lse
+
+        for mode in ("prefill", "decode"):
+            expected_selected = _qsa_integration_tokens(
+                inputs, reference_indexer, mode, inputs.global_compressed
+            )
+            expected_output, expected_lse = owner_sparse_attention(
+                inputs.full_q,
+                inputs.full_k,
+                inputs.full_v,
+                expected_selected,
+                reference_sharding,
+            )
+            head_slice = slice(
+                rank * inputs.local_heads, (rank + 1) * inputs.local_heads
+            )
+            expected_output = expected_output[:, head_slice]
+            expected_lse = expected_lse[:, head_slice]
+
+            actual = run(mode)
+            _assert_qsa_integration_close(
+                actual[0],
+                actual[1],
+                actual[2],
+                expected_selected,
+                expected_output,
+                expected_lse,
+                control_group,
+            )
+
+            warmup_stream = torch.cuda.Stream()
+            warmup_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(warmup_stream):
+                run(mode)
+            torch.cuda.current_stream().wait_stream(warmup_stream)
+            torch.cuda.synchronize()
+            dist.barrier(device_ids=[rank])
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                graph_outputs = run(mode)
+            inputs.index_q.add_(
+                torch.tensor(0.03125, dtype=torch.bfloat16, device=device)
+            )
+            inputs.local_q.add_(
+                torch.tensor(0.015625, dtype=torch.bfloat16, device=device)
+            )
+            inputs.full_q.add_(
+                torch.tensor(0.015625, dtype=torch.bfloat16, device=device)
+            )
+            expected_selected = _qsa_integration_tokens(
+                inputs, reference_indexer, mode, inputs.global_compressed
+            )
+            expected_output, expected_lse = owner_sparse_attention(
+                inputs.full_q,
+                inputs.full_k,
+                inputs.full_v,
+                expected_selected,
+                reference_sharding,
+            )
+            expected_selected = expected_selected.cpu()
+            expected_output = expected_output[:, head_slice].cpu()
+            expected_lse = expected_lse[:, head_slice].cpu()
+            graph.replay()
+            torch.cuda.synchronize()
+            replay_selected = graph_outputs[0].cpu()
+            replay_output = graph_outputs[1].cpu()
+            replay_lse = graph_outputs[2].cpu()
+            _assert_qsa_integration_close(
+                replay_selected,
+                replay_output,
+                replay_lse,
+                expected_selected,
+                expected_output,
+                expected_lse,
+                control_group,
+            )
+            del graph_outputs, graph
+            torch.cuda.synchronize()
+    finally:
+        dist.destroy_process_group()
+
+
+def _find_free_port():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def _run_qsa_multimem_candidate_transport(rank, world_size, port):
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    os.environ["SGLANG_QSA_CANDIDATE_SYMM_MEM"] = "1"
+    torch.cuda.set_device(rank)
+    device = torch.device("cuda", rank)
+    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    try:
+        group = _QSAIntegrationGroup(rank, world_size)
+        rows, topk, page_size = 2, 512, 16
+        global_ids = torch.arange(topk * world_size, dtype=torch.int32, device=device)
+        logical_positions = (
+            global_ids[(global_ids // page_size) % world_size == rank]
+            .unsqueeze(0)
+            .expand(rows, -1)
+            .contiguous()
+        )
+        local_indices = (
+            torch.arange(topk, dtype=torch.int32, device=device)
+            .unsqueeze(0)
+            .expand(rows, -1)
+            .contiguous()
+        )
+        row_starts = torch.zeros(rows, dtype=torch.int32, device=device)
+        logits = -logical_positions.to(torch.float32)
+        logits = (
+            logits
+            + torch.arange(rows, dtype=torch.float32, device=device).unsqueeze(1) * 0.25
+        )
+        buffers = QSACacheShardingStaticBuffers(
+            max_rows=rows,
+            topk=topk,
+            num_heads=world_size,
+            head_dim=128,
+            world_size=world_size,
+            device=device,
+            dtype=torch.bfloat16,
+            candidate_group=group,
+        )
+        if buffers.candidate_symm_state is None:
+            raise AssertionError("H20 multimem candidate transport was not enabled")
+
+        def reference():
+            return gather_and_merge_qsa_topk_candidates(
+                logits,
+                logical_positions,
+                group=group,
+                topk=topk,
+            )
+
+        expected_scores, expected_indices = reference()
+        gathered_scores, gathered_indices = gather_and_merge_qsa_topk_candidates(
+            logits,
+            logical_positions,
+            group=group,
+            topk=topk,
+            static_buffers=buffers,
+        )
+        torch.testing.assert_close(gathered_scores, expected_scores, rtol=0, atol=0)
+        torch.testing.assert_close(gathered_indices, expected_indices, rtol=0, atol=0)
+
+        fused_scores, fused_indices = fused_publish_and_merge_qsa_topk_candidates(
+            logits,
+            local_indices,
+            row_starts,
+            logical_positions,
+            group=group,
+            topk=topk,
+            static_buffers=buffers,
+        )
+        torch.testing.assert_close(fused_scores, expected_scores, rtol=0, atol=0)
+        torch.testing.assert_close(fused_indices, expected_indices, rtol=0, atol=0)
+
+        dist.barrier(device_ids=[rank])
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            graph_scores, graph_indices = fused_publish_and_merge_qsa_topk_candidates(
+                logits,
+                local_indices,
+                row_starts,
+                logical_positions,
+                group=group,
+                topk=topk,
+                static_buffers=buffers,
+            )
+        logits.add_(rank * 4096.0)
+        expected_scores, expected_indices = reference()
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(graph_scores, expected_scores, rtol=0, atol=0)
+        torch.testing.assert_close(graph_indices, expected_indices, rtol=0, atol=0)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("world_size", [2, 4])
+def test_qsa_multirank_production_pipeline_eager_and_cuda_graph(world_size):
+    if not torch.cuda.is_available() or torch.cuda.device_count() < world_size:
+        pytest.skip(f"{world_size} CUDA devices are required")
+    mp.spawn(
+        _run_qsa_multirank_production_integration,
+        args=(world_size, _find_free_port()),
+        nprocs=world_size,
+        join=True,
+    )
+
+
+def test_qsa_multimem_candidate_transport_eager_and_cuda_graph():
+    world_size = 4
+    if not torch.cuda.is_available() or torch.cuda.device_count() < world_size:
+        pytest.skip(f"{world_size} CUDA devices are required")
+    mp.spawn(
+        _run_qsa_multimem_candidate_transport,
+        args=(world_size, _find_free_port()),
+        nprocs=world_size,
+        join=True,
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("cache_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("capture", [False, True])
+def test_qsa_graph_compression_fallback_local_writes(
+    monkeypatch, rank, cache_dtype, capture
+):
+    from sglang.srt.layers.layernorm import GemmaRMSNorm
+    from sglang.srt.layers.rotary_embedding import get_rope
+
+    device = "cuda"
+    indexer = QSAIndexer.__new__(QSAIndexer)
+    torch.nn.Module.__init__(indexer)
+    indexer.layer_id = 0
+    indexer.index_head_dim = 128
+    indexer.index_kv_heads = 1
+    indexer.compress_ratio = COMPRESS_RATIO
+    indexer.rotary_emb = get_rope(
+        head_size=128,
+        rotary_dim=64,
+        max_position=64,
+        base=10000,
+        rope_scaling={
+            "rope_type": "default",
+            "mrope_section": [8, 12, 12],
+            "mrope_interleaved_glm": True,
+        },
+        dtype=torch.float32,
+    ).to(device)
+    indexer.k_layernorm = GemmaRMSNorm(128, eps=1e-6).to(
+        device=device, dtype=torch.bfloat16
+    )
+    # Graph runners publish capture mode before invoking the indexer.
+    monkeypatch.setattr(qsa_indexer_module, "get_is_capture_mode", lambda: True)
+    generator = torch.Generator(device=device).manual_seed(42)
+    keys = torch.randn(
+        16, 1, 128, dtype=torch.bfloat16, device=device, generator=generator
+    )
+    cache = torch.full((128, 1, 128), -3, dtype=cache_dtype, device=device)
+    pool = SimpleNamespace(
+        qsa_compressed_sharding=QSACompressedBlockSharding(256, 16, 2, rank),
+        qsa_rope_position_buffer=torch.zeros(16, 3, dtype=torch.int64, device=device),
+        get_qsa_key_state_buffer=lambda _: keys,
+        get_qsa_compressed_k_buffer=lambda _: cache,
+    )
+    pool.set_qsa_compressed_k_buffer = MethodType(
+        QSATokenToKVPool.set_qsa_compressed_k_buffer, pool
+    )
+    assert not indexer._use_fused_compress(pool)
+    local_locs = torch.tensor([0, 33, 0, 0], dtype=torch.int32, device=device)
+    owners = torch.tensor([True, True, False, False], device=device)
+    metadata = SimpleNamespace(
+        token_to_kv_pool=pool,
+        graph_ring_group_locs=torch.arange(16, device=device).reshape(4, 4),
+        graph_write_locs=local_locs,
+        write_owner_mask=owners,
+    )
+    pooled = keys.float().reshape(4, 4, 1, 128).mean(1).to(keys.dtype)
+    compressed = indexer.normalize_compressed_keys(
+        pooled, torch.zeros(3, 4, dtype=torch.int64, device=device)
+    ).to(cache_dtype)
+    graph = None
+    if capture:
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            indexer._compress_decode_cuda_graph(metadata)
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            indexer._compress_decode_cuda_graph(metadata)
+    for slots, mask in (
+        ([0, 33, 0, 0], [True, True, False, False]),
+        ([0, 0, 65, 0], [False, False, True, True]),
+        ([0, 0, 0, 0], [False, False, False, False]),
+    ):
+        local_locs.copy_(torch.tensor(slots, device=device))
+        owners.copy_(torch.tensor(mask, device=device))
+        cache.fill_(-3)
+        expected = cache.float()
+        for row, (slot, owned) in enumerate(zip(slots, mask)):
+            if owned:
+                expected[slot] = compressed[row].float()
+        if graph is None:
+            indexer._compress_decode_cuda_graph(metadata)
+        else:
+            graph.replay()
+        torch.testing.assert_close(cache.float(), expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("is_graph", [False, True])
+@pytest.mark.parametrize("expanded", [False, True])
+def test_owner_fallback_expands_blocks_and_pending_tail(
+    monkeypatch, device, is_graph, expanded
+):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    backend = QwenSparseAttnBackend.__new__(QwenSparseAttnBackend)
+    backend.compress_ratio = COMPRESS_RATIO
+    backend.qsa_profile = SimpleNamespace(block_topk=BLOCK_TOPK, budget=TOKEN_TOPK)
+    backend._qsa_cache_sharding_buffers = None
+    positions = torch.arange(11, 15, device=device)
+    lengths = positions + 1
+    slots = torch.arange(63, -1, -1, device=device).repeat(4, 1)
+    backend.req_to_token = slots.flip(0)
+    metadata = SimpleNamespace(
+        token_to_batch_idx=torch.arange(4, device=device),
+        sequence_lengths=lengths,
+        is_cuda_graph=is_graph,
+        row_req_pool_indices=torch.arange(3, -1, -1, device=device),
+        token_slot_table=slots,
+        indexer_metadata=SimpleNamespace(
+            decode_logical_positions=positions,
+            get_seqlens_int32=lambda: lengths.to(torch.int32),
+        ),
+    )
+    backend.forward_metadata = metadata
+    k = torch.zeros(64, 1, 8, device=device)
+    v = torch.arange(64, device=device, dtype=torch.float32)[:, None, None].expand(
+        64, 1, 8
+    )
+    backend.token_to_kv_pool = SimpleNamespace(
+        qsa_raw_kv_sharding=object(),
+        qsa_owner_group=object(),
+        get_key_buffer=lambda _: k,
+        get_value_buffer=lambda _: v,
+        set_kv_buffer=lambda *args: None,
+    )
+    backend._select_attention_kv_heads = lambda k, v, layer: (k, v)
+    backend._fused_kv_pool_eligible = True
+    monkeypatch.setattr(
+        qsa_backend_module, "_resolve_trtllm_sparse_decode", lambda: None
+    )
+    expected_slots = torch.full((4, FINAL_TOPK), -1, device=device, dtype=torch.int32)
+    for row in range(4):
+        expected_slots[row, :4] = slots[row, 8:12]
+        expected_slots[row, 4 : 4 + row] = slots[row, 12 : 12 + row]
+
+    def owner(q, k, v, actual_slots, runtime, **kwargs):
+        torch.testing.assert_close(actual_slots, expected_slots)
+        return qsa_sparse_attention(q, k, v, actual_slots), None
+
+    monkeypatch.setattr(qsa_backend_module, "owner_sparse_attention", owner)
+    blocks = torch.full((4, BLOCK_TOPK), -1, device=device, dtype=torch.int32)
+    blocks[:, 0] = 2
+    indices = (
+        expand_qsa_block_indices(blocks, positions, lengths, COMPRESS_RATIO, TOKEN_TOPK)
+        if expanded
+        else blocks
+    )
+    q = torch.zeros(4, 1, 8, device=device)
+    layer = SimpleNamespace(layer_id=0, scaling=1.0, tp_q_head_num=1, head_dim=8)
+    batch = SimpleNamespace(forward_mode=ForwardMode.DECODE, out_cache_loc=None)
+    actual = backend.forward_decode(q, k[:4], v[:4], layer, batch, topk_indices=indices)
+    expected = qsa_sparse_attention(q, k, v, expected_slots).reshape(4, -1)
+    torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize(
+    ("tp_size", "kv_heads", "sharding_size", "valid"),
+    [
+        (4, 2, 4, False),
+        (4, 2, 2, True),
+        (8, 2, 4, True),
+        (8, 2, 8, False),
+        (8, 4, 2, True),
+        (8, 4, 4, False),
+    ],
+)
+def test_qsa_sharding_stays_inside_kv_replicas(tp_size, kv_heads, sharding_size, valid):
+    kwargs = dict(
+        device="cuda",
+        is_qsa=True,
+        tp_size=tp_size,
+        sharding_size=sharding_size,
+        pp_size=1,
+        attn_cp_size=1,
+        enable_prefill_cp=False,
+        ep_size=tp_size,
+        moe_dp_size=1,
+        disaggregation_mode="null",
+        num_attention_heads=24,
+        num_key_value_heads=kv_heads,
+    )
+    if valid:
+        validate_qsa_cache_sharding(**kwargs)
+    else:
+        with pytest.raises(ValueError, match="KV-head replica"):
+            validate_qsa_cache_sharding(**kwargs)
+
+
+def _pack_global_topk_candidates(scores, *, world_size, page_size, topk):
+    ranks = []
+    for rank in range(world_size):
+        global_ids = [
+            block
+            for block in range(scores.shape[1])
+            if (block // page_size) % world_size == rank
+        ]
+        rank_scores = torch.full((scores.shape[0], topk), float("-inf"))
+        rank_ids = torch.full((scores.shape[0], topk), -1, dtype=torch.int32)
+        for row in range(scores.shape[0]):
+            selected = sorted(
+                global_ids, key=lambda block: (-float(scores[row, block]), block)
+            )[:topk]
+            if selected:
+                selected_tensor = torch.tensor(selected)
+                width = len(selected)
+                rank_scores[row, :width] = scores[row, selected_tensor]
+                rank_ids[row, :width] = selected_tensor
+        packed = torch.empty(scores.shape[0], topk, 2, dtype=torch.float32)
+        packed[..., 0] = rank_scores
+        packed[..., 1].view(torch.int32).copy_(rank_ids)
+        ranks.append(packed)
+    return torch.stack(ranks)
+
+
+def _select_page_sharded_topk_candidates(scores, *, world_size, page_size, topk):
+    global_ids = torch.arange(scores.shape[1], device=scores.device)
+    packed_ranks = []
+    for rank in range(world_size):
+        rank_ids = global_ids[(global_ids // page_size) % world_size == rank]
+        rank_scores = scores.index_select(1, rank_ids)
+        row_starts = torch.zeros(
+            scores.shape[0], dtype=torch.int32, device=scores.device
+        )
+        row_ends = torch.full_like(row_starts, rank_scores.shape[1])
+        local_indices = qsa_fast_topk(
+            rank_scores,
+            row_starts,
+            row_ends,
+            topk=topk,
+        )
+        selected_ids = rank_ids[local_indices.long()].to(torch.int32)
+        selected_scores = rank_scores.gather(1, local_indices.long())
+        packed = torch.empty(
+            (*local_indices.shape, 2),
+            dtype=torch.float32,
+            device=scores.device,
+        )
+        packed[..., 0].copy_(selected_scores)
+        packed[..., 1].view(torch.int32).copy_(selected_ids)
+        packed_ranks.append(packed)
+    return merge_qsa_topk_candidates(torch.stack(packed_ranks), topk=topk)
+
+
+def test_distributed_topk_matches_test_oracle_for_ties_and_ragged_shards():
+    scores = torch.tensor(
+        [
+            [0.1, 9.0, 2.0, 8.0, 7.0, 3.0, 6.0, 4.0, 5.0, 0.0],
+            [4.0, 1.0, 4.0, 3.0, 2.0, 4.0, -1.0, 0.0, 4.0, 2.0],
+        ]
+    )
+    actual_scores, actual_indices = merge_qsa_topk_candidates(
+        _pack_global_topk_candidates(scores, world_size=3, page_size=2, topk=5),
+        topk=5,
+    )
+    expected_indices = torch.tensor(
+        [[1, 3, 4, 6, 8], [0, 2, 5, 8, 3]], dtype=torch.int32
+    )
+    torch.testing.assert_close(actual_indices, expected_indices)
+    torch.testing.assert_close(actual_scores, scores.gather(1, expected_indices.long()))
+
+    ragged = _pack_global_topk_candidates(
+        torch.tensor([[2.0, 1.0]]), world_size=4, page_size=1, topk=4
+    )
+    actual_scores, actual_indices = merge_qsa_topk_candidates(ragged, topk=4)
+    torch.testing.assert_close(
+        actual_indices, torch.tensor([[0, 1, -1, -1]], dtype=torch.int32)
+    )
+    torch.testing.assert_close(
+        actual_scores, torch.tensor([[2.0, 1.0, float("-inf"), float("-inf")]])
+    )
+
+
+@pytest.mark.parametrize("topk", [512, 2048])
+def test_page_sharded_local_topk_matches_global_ids_without_ties(topk):
+    torch.manual_seed(20261013 + topk)
+    scores = torch.randn(1, topk * 8, dtype=torch.float32, device="cuda")
+    _, actual_indices = _select_page_sharded_topk_candidates(
+        scores,
+        world_size=4,
+        page_size=16,
+        topk=topk,
+    )
+    expected_indices = torch.topk(scores, topk, dim=1, sorted=False).indices.to(
+        torch.int32
+    )
+    torch.testing.assert_close(
+        actual_indices.sort(dim=1).values,
+        expected_indices.sort(dim=1).values,
+    )
+
+
+@pytest.mark.parametrize("topk", [512, 2048])
+def test_page_sharded_local_topk_preserves_score_multiset_at_boundary_ties(topk):
+    scores = torch.full(
+        (1, topk * 8),
+        -1.0,
+        dtype=torch.float32,
+        device="cuda",
+    )
+    strict_count = topk - 12
+    scores[0, :strict_count] = torch.arange(
+        strict_count,
+        0,
+        -1,
+        dtype=torch.float32,
+        device=scores.device,
+    )
+    scores[0, strict_count : strict_count + 64] = 0.0
+
+    actual_scores, _ = _select_page_sharded_topk_candidates(
+        scores,
+        world_size=4,
+        page_size=16,
+        topk=topk,
+    )
+    expected_scores = torch.topk(scores, topk, dim=1, sorted=False).values
+    torch.testing.assert_close(
+        actual_scores.sort(dim=1).values,
+        expected_scores.sort(dim=1).values,
+    )
+
+
+def test_distributed_topk_requires_explicit_logical_block_positions():
+    indexer = QSAIndexer.__new__(QSAIndexer)
+    indexer.block_topk = 2
+    indexer.distributed_topk_group = SimpleNamespace(
+        world_size=2,
+        rank_in_group=0,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="distributed QSA top-k requires logical block positions",
+    ):
+        indexer._maybe_merge_distributed_topk(
+            logits=torch.tensor([[3.0, 2.0, 1.0]]),
+            local_indices=torch.tensor([[0, 1]], dtype=torch.int32),
+            row_starts=torch.tensor([0], dtype=torch.int32),
+        )
+
+
+def test_fused_publish_requires_explicit_logical_block_positions():
+    with pytest.raises(
+        ValueError,
+        match="fused candidate publish requires logical block positions",
+    ):
+        fused_publish_and_merge_qsa_topk_candidates(
+            logits=torch.empty(1, 2),
+            local_indices=torch.empty(1, 2, dtype=torch.int32),
+            row_starts=torch.zeros(1, dtype=torch.int32),
+            logical_block_positions=None,
+            group=SimpleNamespace(world_size=2, rank_in_group=0),
+            topk=2,
+            static_buffers=None,
+        )
+
+
+@pytest.mark.parametrize("option", ["--qsa-cache-sharding-size", "--state-cp-size"])
+def test_qsa_cache_sharding_cli_keeps_state_cp_alias(option):
+    parser = argparse.ArgumentParser()
+    ServerArgs.add_cli_args(parser)
+    parsed = parser.parse_args(["--model", "dummy", option, "4"])
+    assert ServerArgs.from_cli_args(parsed).qsa_cache_sharding_size == 4
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"device": "cpu"}, "CUDA"),
+        ({"is_qsa": False}, "QSA"),
+        ({"tp_size": 3, "sharding_size": 2}, "divide"),
+        ({"pp_size": 2}, "pipeline"),
+        ({"attn_cp_size": 2}, "attention context"),
+        ({"enable_prefill_cp": True}, "prefill"),
+        ({"disaggregation_mode": "decode"}, "PD disaggregation"),
+        ({"dcp_size": 2}, "decode context"),
+    ],
+)
+def test_qsa_cache_sharding_rejects_unsupported_combinations(overrides, message):
+    kwargs = {
+        "device": "cuda",
+        "is_qsa": True,
+        "tp_size": 4,
+        "sharding_size": 2,
+        "num_attention_heads": 24,
+        "num_key_value_heads": 2,
+        "pp_size": 1,
+        "attn_cp_size": 1,
+        "enable_prefill_cp": False,
+        "ep_size": 2,
+        "moe_dp_size": 1,
+        "disaggregation_mode": "null",
+    }
+    kwargs.update(overrides)
+    with pytest.raises(ValueError, match=message):
+        validate_qsa_cache_sharding(**kwargs)
+
+
+@pytest.mark.parametrize("sharding_size", [2, 4])
+def test_qsa_cache_sharding_accepts_supported_degrees(sharding_size):
+    validate_qsa_cache_sharding(
+        device="cuda",
+        is_qsa=True,
+        tp_size=8,
+        sharding_size=sharding_size,
+        num_attention_heads=24,
+        num_key_value_heads=2,
+        pp_size=1,
+        attn_cp_size=1,
+        enable_prefill_cp=False,
+        ep_size=8,
+        moe_dp_size=1,
+        disaggregation_mode="null",
+    )
 
 
 def test_qsa_chunk_prefill_accepts_fp8_cached_prefix():
@@ -324,7 +1256,13 @@ def test_qsa_glue_builds_compressed_indexer(monkeypatch):
 
     class _FakeIndexer:
         def __init__(
-            self, config, layer_id, quant_config=None, prefix="", rotary_emb=None
+            self,
+            config,
+            layer_id,
+            quant_config=None,
+            prefix="",
+            rotary_emb=None,
+            cache_sharding_runtime=None,
         ):
             recorded.update(
                 config=config,
@@ -535,6 +1473,7 @@ def test_qsa_indexer_ignores_dp_attention_token_padding():
     def run(num_rows):
         mapping = torch.zeros(15, dtype=torch.int32)
         metadata = SimpleNamespace(
+            is_cuda_graph=False,
             token_to_kv_pool=None,
             compress_member_rows=None,
             decode_logical_positions=None,
@@ -564,7 +1503,7 @@ def test_qsa_indexer_ignores_dp_attention_token_padding():
                     rope_rows=rope.numel(),
                 )
             ),
-            select_prefill_tokens=lambda q, keys, starts, ends, logical, lengths: (
+            select_prefill_tokens=lambda q, keys, starts, ends, logical, lengths, **kwargs: (
                 q.squeeze(1)
             ),
         )
@@ -637,12 +1576,16 @@ def test_qsa_cuda_extend_ignores_dp_attention_padding(monkeypatch):
 
 def _make_paged_extend_backend():
     metadata = SimpleNamespace(
+        is_cuda_graph=False,
         token_to_batch_idx=torch.zeros(3, dtype=torch.int32),
         sequence_lengths=torch.tensor([8], dtype=torch.int32),
         token_slot_table=torch.arange(16, dtype=torch.int32).reshape(1, 16),
     )
     backend = QwenSparseAttnBackend()
     backend.forward_metadata = metadata
+    backend.owner_sparse_attn_group = None
+    backend.owner_sparse_attn_runtime = None
+    backend._select_attention_kv_heads = lambda k, v, layer: (k, v)
 
     class Pool:
         def set_kv_buffer(self, layer, loc, k, v):
@@ -859,6 +1802,7 @@ def test_qsa_speculative_pseudo_extend_is_rejected():
 
 
 class _FakeQSAPool:
+    cache_sharding_runtime = resolve_qsa_cache_sharding_runtime(SimpleNamespace())
     qsa_index_kv_heads = 1
     qsa_index_head_dim = 128
     qsa_compressed_page_size = 64
@@ -977,11 +1921,11 @@ class _DispatchIndexer:
         rows = hidden_states.shape[0]
         return torch.zeros(rows, 4, 128), torch.zeros(rows, 1, 128), False
 
-    def select_prefill_tokens(self, *args):
+    def select_prefill_tokens(self, *args, **kwargs):
         self.selected = "prefill"
         return torch.tensor([1])
 
-    def select_decode_tokens(self, *args, defer_expansion=False):
+    def select_decode_tokens(self, *args, defer_expansion=False, **kwargs):
         self.selected = "decode"
         return torch.tensor([2])
 
@@ -992,6 +1936,7 @@ class _DispatchIndexer:
 
 
 class _DispatchMetadata:
+    is_cuda_graph = False
     token_to_kv_pool = None
     out_cache_loc = None
     compress_member_rows = None
@@ -1201,6 +2146,82 @@ def test_qsa_prefill_selection_microchunks_rows(monkeypatch):
     torch.testing.assert_close(actual, expected)
 
 
+def test_qsa_prefill_logical_positions_are_gathered_per_microchunk(monkeypatch):
+    rows, keys, heads, head_dim = 65, 64, 4, 8
+    indexer = SimpleNamespace(token_topk=8, compress_ratio=4, block_topk=2)
+    q = torch.zeros(rows, heads, head_dim, dtype=torch.bfloat16)
+    k = torch.zeros(keys, 1, head_dim, dtype=torch.bfloat16)
+    starts = torch.zeros(rows, dtype=torch.int32)
+    ends = torch.full((rows,), keys, dtype=torch.int32)
+    positions = torch.full((rows,), keys * 4 - 1, dtype=torch.long)
+    sequence_lengths = torch.full((rows,), keys * 4, dtype=torch.int32)
+    logical_by_sequence = torch.stack((torch.arange(keys), torch.arange(keys) + 100))
+    sequence_ids = torch.arange(rows).remainder(2)
+    seen = []
+
+    monkeypatch.setattr(
+        qsa_indexer_module,
+        "_QSA_PREFILL_LOGITS_BUDGET_BYTES",
+        32 * keys * torch.float32.itemsize,
+    )
+    monkeypatch.setattr(
+        qsa_indexer_module,
+        "qsa_mqa_prefill",
+        lambda q, *_args: torch.zeros(q.shape[0], keys),
+    )
+    monkeypatch.setattr(
+        qsa_indexer_module,
+        "qsa_fast_topk",
+        lambda logits, *_args, **_kwargs: torch.zeros(
+            logits.shape[0], 2, dtype=torch.int32
+        ),
+    )
+    monkeypatch.setattr(
+        qsa_indexer_module,
+        "expand_qsa_block_indices",
+        lambda blocks, *_args, **_kwargs: torch.zeros(
+            blocks.shape[0], 11, dtype=torch.int32
+        ),
+    )
+
+    def record_logical(
+        _self, _logits, block_indices, _starts, logical, _static_buffers
+    ):
+        seen.append(logical.clone())
+        return block_indices
+
+    monkeypatch.setattr(QSAIndexer, "_maybe_merge_distributed_topk", record_logical)
+    QSAIndexer.select_prefill_tokens(
+        indexer,
+        q,
+        k,
+        starts,
+        ends,
+        positions,
+        sequence_lengths,
+        logical_block_positions=logical_by_sequence,
+        logical_block_sequence_ids=sequence_ids,
+    )
+
+    assert [chunk.shape[0] for chunk in seen] == [32, 32, 1]
+    torch.testing.assert_close(torch.cat(seen), logical_by_sequence[sequence_ids])
+
+
+def test_qsa_prefill_collective_schedule_is_rank_invariant():
+    rows = 8192
+    schedules = []
+    for local_keys in (5590, 5600):
+        chunk = qsa_indexer_module._qsa_prefill_row_chunk_size(
+            rows,
+            local_keys,
+            heads=8,
+            collective_keys=22400,
+            collective_world_size=4,
+        )
+        schedules.append([min(chunk, rows), rows - min(chunk, rows)])
+    assert schedules[0] == schedules[1]
+
+
 def test_qsa_forward_cuda_dispatches_prefill_and_decode_mqa():
     indexer = _DispatchIndexer()
     metadata = _DispatchMetadata()
@@ -1352,6 +2373,7 @@ def test_qsa_graph_metadata_kernels_match_legacy_host_path(max_pages):
         qsa_compress_ratio = ratio
         # compressed slots per full-KV page (page 64 tokens / ratio 4)
         qsa_compressed_page_size = full_page // ratio
+        qsa_compressed_sharding = None
         qsa_block_topk = 512
 
     def run_case(mode, bs, num_rows, seq_lens_list, extend_len, extend_lens=None):
@@ -1391,8 +2413,15 @@ def test_qsa_graph_metadata_kernels_match_legacy_host_path(max_pages):
                 graph_write_locs=torch.zeros(
                     num_rows, dtype=torch.int32, device=device
                 ),
+                write_owner_mask=torch.zeros(num_rows, dtype=torch.bool, device=device),
                 graph_compressed_page_table=torch.zeros(
                     (num_rows, max_pages), dtype=torch.int32, device=device
+                ),
+                decode_block_positions=torch.full(
+                    (num_rows, max_pages * (full_page // ratio)),
+                    -1,
+                    dtype=torch.int32,
+                    device=device,
                 ),
                 graph_compressed_lengths=torch.zeros(
                     num_rows, dtype=torch.int32, device=device
@@ -1449,7 +2478,6 @@ def test_qsa_graph_metadata_kernels_match_legacy_host_path(max_pages):
         )
         for field in (
             "graph_write_locs",
-            "graph_compressed_page_table",
             "graph_compressed_lengths",
             "decode_logical_positions",
             "pending_ring_slots",
@@ -1458,6 +2486,20 @@ def test_qsa_graph_metadata_kernels_match_legacy_host_path(max_pages):
             kernel_buf = getattr(kernel_metadata.indexer_metadata, field)
             host_buf = getattr(host_metadata.indexer_metadata, field)
             assert torch.equal(kernel_buf, host_buf), (mode, field)
+        for row, compressed_len in enumerate(
+            kernel_metadata.indexer_metadata.graph_compressed_lengths.tolist()
+        ):
+            visible_pages = (
+                compressed_len + pool.qsa_compressed_page_size - 1
+            ) // pool.qsa_compressed_page_size
+            assert torch.equal(
+                kernel_metadata.indexer_metadata.graph_compressed_page_table[
+                    row, :visible_pages
+                ],
+                host_metadata.indexer_metadata.graph_compressed_page_table[
+                    row, :visible_pages
+                ],
+            ), (mode, "graph_compressed_page_table", row)
 
     # Decode: lengths straddling boundaries (256 is a boundary, others not).
     run_case(mode=0, bs=4, num_rows=4, seq_lens_list=[255, 256, 257, 512], extend_len=0)
@@ -1519,6 +2561,7 @@ def test_qsa_graph_layout_covers_speculative_rows_and_padded_tail(seq_offset):
     class _Pool:
         qsa_compress_ratio = ratio
         qsa_compressed_page_size = full_page // ratio
+        qsa_compressed_sharding = None
         qsa_block_topk = 512
 
     def run_case(mode, bs, num_rows, seq_lens, extend_lens, extend_len, num_padding):
@@ -1544,8 +2587,15 @@ def test_qsa_graph_layout_covers_speculative_rows_and_padded_tail(seq_offset):
             req_pool_indices=torch.zeros(num_rows, dtype=torch.int32, device=device),
             is_cuda_graph=True,
             graph_write_locs=torch.zeros(num_rows, dtype=torch.int32, device=device),
+            write_owner_mask=torch.zeros(num_rows, dtype=torch.bool, device=device),
             graph_compressed_page_table=torch.zeros(
                 (num_rows, max_pages), dtype=torch.int32, device=device
+            ),
+            decode_block_positions=torch.full(
+                (num_rows, max_pages * (full_page // ratio)),
+                -1,
+                dtype=torch.int32,
+                device=device,
             ),
             graph_compressed_lengths=torch.zeros(
                 num_rows, dtype=torch.int32, device=device
@@ -1678,8 +2728,14 @@ def test_qsa_draft_metadata_multi_step_graph(bs, padding):
         indexer = SimpleNamespace(
             graph_compressed_lengths=torch.empty(bs, dtype=torch.int32, device="cuda"),
             graph_write_locs=torch.empty(bs, dtype=torch.int32, device="cuda"),
+            write_owner_mask=torch.empty(bs, dtype=torch.bool, device="cuda"),
             graph_compressed_page_table=torch.empty(
                 (bs, pages), dtype=torch.int32, device="cuda"
+            ),
+            decode_block_positions=torch.empty(
+                (bs, pages * (full_page // ratio)),
+                dtype=torch.int32,
+                device="cuda",
             ),
             decode_logical_positions=torch.empty(bs, dtype=torch.int32, device="cuda"),
             pending_ring_slots=torch.empty(bs, dtype=torch.int64, device="cuda"),
@@ -1728,10 +2784,32 @@ def test_qsa_draft_metadata_multi_step_graph(bs, padding):
                 out.row_req_pool_indices, ref.row_req_pool_indices, rtol=0, atol=0
             )
             for key, value in vars(out.indexer_metadata).items():
-                if isinstance(value, torch.Tensor):
-                    torch.testing.assert_close(
-                        value, getattr(ref.indexer_metadata, key), rtol=0, atol=0
-                    )
+                if not isinstance(value, torch.Tensor):
+                    continue
+                reference = getattr(ref.indexer_metadata, key)
+                if key == "graph_compressed_page_table":
+                    for row, length in enumerate(
+                        out.indexer_metadata.graph_compressed_lengths.tolist()
+                    ):
+                        visible_pages = (length + 15) // 16
+                        torch.testing.assert_close(
+                            value[row, :visible_pages],
+                            reference[row, :visible_pages],
+                            rtol=0,
+                            atol=0,
+                        )
+                elif key == "decode_block_positions":
+                    for row, length in enumerate(
+                        out.indexer_metadata.graph_compressed_lengths.tolist()
+                    ):
+                        torch.testing.assert_close(
+                            value[row, :length],
+                            reference[row, :length],
+                            rtol=0,
+                            atol=0,
+                        )
+                else:
+                    torch.testing.assert_close(value, reference, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("strided", [False, True])

@@ -174,6 +174,7 @@ def _sparse_gqa_chunk_prefill(
     k,
     v,
     out,
+    lse,
     indices,
     cu_q,
     cu_k,
@@ -192,6 +193,8 @@ def _sparse_gqa_chunk_prefill(
     so_m: tl.constexpr,
     so_h: tl.constexpr,
     so_d: tl.constexpr,
+    sl_m: tl.constexpr,
+    sl_h: tl.constexpr,
     si_m: tl.constexpr,
     si_g: tl.constexpr,
     si_n: tl.constexpr,
@@ -200,6 +203,7 @@ def _sparse_gqa_chunk_prefill(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     HEAD_DIM: tl.constexpr,
+    RETURN_LSE: tl.constexpr,
 ):
     query_relative = tl.program_id(0).to(tl.int64)
     batch_group = tl.program_id(1)
@@ -260,7 +264,12 @@ def _sparse_gqa_chunk_prefill(
         )
         normalizer = normalizer * alpha + tl.sum(probabilities, 1)
         max_value = next_max
-    output = accumulator / normalizer[:, None]
+    has_tokens = normalizer > 0
+    output = tl.where(
+        has_tokens[:, None],
+        accumulator / tl.maximum(normalizer[:, None], 1.0),
+        0.0,
+    )
     tl.store(
         out
         + query * so_m
@@ -269,6 +278,17 @@ def _sparse_gqa_chunk_prefill(
         output,
         mask=(offs_h < GROUP_SIZE)[:, None],
     )
+    if RETURN_LSE:
+        row_lse = tl.where(
+            has_tokens,
+            (max_value + tl.log2(normalizer)) * 0.6931471805599453,
+            -float("inf"),
+        )
+        tl.store(
+            lse + query * sl_m + (group * GROUP_SIZE + offs_h) * sl_h,
+            row_lse,
+            mask=offs_h < GROUP_SIZE,
+        )
 
 
 @triton.jit(do_not_specialize=["TOTAL_K", "BS"])
@@ -388,6 +408,7 @@ def sparse_gqa_fwd_interface_triton_ck(
         k,
         v,
         out,
+        out,
         indices,
         cu_q,
         cu_k,
@@ -406,6 +427,8 @@ def sparse_gqa_fwd_interface_triton_ck(
         out.stride(0),
         out.stride(1),
         out.stride(2),
+        0,
+        0,
         indices.stride(0),
         indices.stride(1) if indices.ndim == 3 else 0,
         indices.stride(2) if indices.ndim == 3 else indices.stride(1),
@@ -414,6 +437,7 @@ def sparse_gqa_fwd_interface_triton_ck(
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         HEAD_DIM=head_dim,
+        RETURN_LSE=False,
         num_warps=warps,
         num_stages=stages,
     )
@@ -440,6 +464,7 @@ def sparse_gqa_packed_decode_triton(q, k, v, indices, cu_q, cu_k, kv_lens, scale
         k,
         v,
         out,
+        out,
         indices,
         cu_q,
         cu_k,
@@ -458,6 +483,8 @@ def sparse_gqa_packed_decode_triton(q, k, v, indices, cu_q, cu_k, kv_lens, scale
         out.stride(0),
         out.stride(1),
         out.stride(2),
+        0,
+        0,
         indices.stride(0),
         indices.stride(1) if indices.ndim == 3 else 0,
         indices.stride(2) if indices.ndim == 3 else indices.stride(1),
@@ -466,10 +493,72 @@ def sparse_gqa_packed_decode_triton(q, k, v, indices, cu_q, cu_k, kv_lens, scale
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         HEAD_DIM=head_dim,
+        RETURN_LSE=False,
         num_warps=warps,
         num_stages=stages,
     )
     return out
+
+
+def sparse_gqa_packed_decode_with_lse_triton(
+    q, k, v, indices, scale
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Owner-local sparse decode returning FP32 normalized O and natural-log LSE."""
+
+    if not q.is_cuda:
+        raise ValueError("production owner sparse attention requires CUDA tensors")
+    k, v, indices = k.contiguous(), v.contiguous(), indices.contiguous()
+    total_q, num_q_heads, head_dim = q.shape
+    num_kv_heads = k.shape[1]
+    group_size = num_q_heads // num_kv_heads
+    block_m = max(16, triton.next_power_of_2(group_size))
+    block_n, warps, stages = _get_best_config(total_q)
+    out = torch.empty(q.shape, dtype=torch.float32, device=q.device)
+    lse = torch.empty(q.shape[:2], dtype=torch.float32, device=q.device)
+    cu_q = torch.arange(total_q + 1, dtype=torch.int32, device=q.device)
+    cu_k = torch.zeros(total_q + 1, dtype=torch.int32, device=q.device)
+    kv_lens = torch.full(
+        (total_q,), indices.shape[-1], dtype=torch.int32, device=q.device
+    )
+    _sparse_gqa_chunk_prefill[(1, total_q * num_kv_heads)](
+        q,
+        k,
+        v,
+        out,
+        lse,
+        indices,
+        cu_q,
+        cu_k,
+        kv_lens,
+        scale,
+        indices.shape[-1],
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        v.stride(0),
+        v.stride(1),
+        v.stride(2),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        lse.stride(0),
+        lse.stride(1),
+        indices.stride(0),
+        indices.stride(1) if indices.ndim == 3 else 0,
+        indices.stride(2) if indices.ndim == 3 else indices.stride(1),
+        NUM_KV_HEADS=num_kv_heads,
+        GROUP_SIZE=group_size,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        HEAD_DIM=head_dim,
+        RETURN_LSE=True,
+        num_warps=warps,
+        num_stages=stages,
+    )
+    return out, lse
 
 
 @triton.jit
@@ -676,4 +765,5 @@ __all__ = [
     "sparse_gqa_fwd_interface_triton",
     "sparse_gqa_fwd_interface_triton_ck",
     "sparse_gqa_packed_decode_triton",
+    "sparse_gqa_packed_decode_with_lse_triton",
 ]
