@@ -1959,6 +1959,11 @@ class Envs:
     SGLANG_DSA_FUSE_TOPK = EnvBool(True)
     # Enabled for supported CUDA KPool geometry; set to 0 to use ordinary metadata.
     SGLANG_EXPERIMENTAL_DSA_KPOOL_METADATA_FUSION = EnvBool(True)
+    # Bound the per-replay DSA metadata kernels (decode, target verify, draft
+    # extend) by a program budget that strides over each row's live kv blocks,
+    # instead of one program per 128 columns of the --context-length-wide table
+    # (CUDA, kpool 1, no KPool metadata fusion). Outputs are bit-identical.
+    SGLANG_DSA_BOUNDED_REPLAY_METADATA = EnvBool(True)
     SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC = EnvBool(False)
     SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK = EnvStr(None)
     SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvInt(2048)

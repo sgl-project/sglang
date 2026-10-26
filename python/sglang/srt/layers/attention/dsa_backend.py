@@ -1970,19 +1970,25 @@ class DeepseekSparseAttnBackend(
             # selection, not by reshaping the page table here.
             max_seqlen_k = self._graph_page_table_width(metadata)
             total_extend_len = self.speculative_num_draft_tokens * bs
+            use_fused_metadata = (
+                (is_cuda() or _is_hip) and self.dsa_index_kpool <= 1
+            ) or self.experimental_kpool_metadata_fusion
 
             # See target-verify note: fill on-device to avoid the blocking
-            # pageable H2D from torch.tensor(list, device=cuda).
-            extend_seq_lens = torch.full(
-                (bs,),
-                self.speculative_num_draft_tokens,
-                dtype=torch.int32,
-                device=self.device,
+            # pageable H2D from torch.tensor(list, device=cuda). The bounded
+            # kernel takes the static length (max_extend_len) as a scalar.
+            extend_seq_lens = (
+                None
+                if use_fused_metadata and self.dsa_meta_bounded
+                else torch.full(
+                    (bs,),
+                    self.speculative_num_draft_tokens,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
             )
 
-            if (
-                (is_cuda() or _is_hip) and self.dsa_index_kpool <= 1
-            ) or self.experimental_kpool_metadata_fusion:
+            if use_fused_metadata:
                 self._fused_draft_extend_metadata(
                     seq_lens=seq_lens,
                     extend_seq_lens=extend_seq_lens,
