@@ -1738,12 +1738,34 @@ class KVCacheConfigurator:
                     assert not enable_page_major, (
                         "page-major KV layout is not supported with fp4 KV cache"
                     )
+                follows_target_swa = self._draft_follows_target_swa()
                 token_to_kv_pool = self._build_mha_kv_pool(
-                    max_total_num_tokens=sizes.max_total_num_tokens,
+                    max_total_num_tokens=(
+                        self.memory_pool_config.swa_max_total_num_tokens
+                        if follows_target_swa
+                        else sizes.max_total_num_tokens
+                    ),
                     mha_pool_class=mha_pool_class,
                     quant_method=quant_method,
                 )
+                if follows_target_swa:
+                    token_to_kv_pool.follows_target_swa_ids = True
+                    logger.info(
+                        "DFLASH draft KV pool follows the target's SWA ids: "
+                        "%d rows (target full pool %d rows)",
+                        token_to_kv_pool.size,
+                        sizes.max_total_num_tokens,
+                    )
         return token_to_kv_pool
+
+    def _draft_follows_target_swa(self) -> bool:
+        """Whether this draft pool takes the target's sliding-window ids, as the
+        target decided when it priced the pools."""
+        return (
+            self.is_draft_worker
+            and self.memory_pool_config is not None
+            and self.memory_pool_config.dflash_draft_follows_swa
+        )
 
     def _build_dsv4_kv_pool(
         self,
@@ -2681,6 +2703,15 @@ class KVCacheConfigurator:
         )
 
         slack_gb = pre_model_load_memory * (1 - get_schedule().mem_fraction_static)
+        reserve_override_gb = envs.SGLANG_KV_NON_STATIC_RESERVE_GB.get()
+        if reserve_override_gb is not None:
+            logger.info(
+                "KV sizing: non-static reserve %.2f GB from "
+                "SGLANG_KV_NON_STATIC_RESERVE_GB (fraction-based %.2f GB ignored)",
+                reserve_override_gb,
+                slack_gb,
+            )
+            slack_gb = float(reserve_override_gb)
         # Every prefill batch fits a captured bucket when batches are capped at the
         # request slots; the exemption also needs an explicit Mamba size: a larger
         # rest_memory would otherwise auto-size a bigger physical Mamba pool below.
@@ -2712,6 +2743,17 @@ class KVCacheConfigurator:
             mm_feature_transport=get_mm().mm_feature_transport,
         )
         rest_memory = available_gpu_memory - slack_gb - mm_reservation_gb
+        logger.info(
+            "KV sizing budget: available %.2f GB - non-static reserve %.2f GB "
+            "(pre_model_load %.2f GB, mem_fraction_static %.3f) - mm %.2f GB "
+            "= %.2f GB",
+            available_gpu_memory,
+            slack_gb,
+            pre_model_load_memory,
+            get_schedule().mem_fraction_static,
+            mm_reservation_gb,
+            rest_memory,
+        )
         if self.mambaish_config is not None:
             rest_memory = self._handle_max_mamba_cache(rest_memory)
 

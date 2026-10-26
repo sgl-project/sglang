@@ -769,6 +769,12 @@ class DsparkStepObservers:
             )
         self._sts_collect_path = envs.SGLANG_DSPARK_STS_COLLECT_PATH.get()
         self._sts_recorder: Optional[StsDataRecorder] = None
+        # observe_verify_step reads the full target logits (argmax, accept estimate).
+        self.reads_target_logits = (
+            bool(self._sts_collect_path)
+            or self._block_accept_recorder is not None
+            or envs.SGLANG_DSPARK_DEBUG_CONFIDENCE_METRICS.get()
+        )
 
     # --- step lifecycle -------------------------------------------------
 

@@ -78,6 +78,7 @@ def test_selector_rejects_a_quantized_target_lm_head():
     model = SimpleNamespace(
         lm_head=SimpleNamespace(weight=torch.empty(8, 4, dtype=torch.int8)),
         candidate_selector=SimpleNamespace(top_k=4),
+        merge_candidates_fused=False,
     )
     with pytest.raises(RuntimeError, match="requires a dense"):
         DFlash2DraftModel.compute_candidates(model, torch.randn(2, 4))
@@ -136,6 +137,7 @@ def test_selector_projects_a_quantized_target_lm_head_through_its_quant_method(
         lm_head=lm_head,
         candidate_selector=SimpleNamespace(top_k=4),
         _transform_unary_logits=lambda logits: logits.float(),
+        merge_candidates_fused=False,
     )
     monkeypatch.setattr(
         "sglang.srt.models.dflash.get_parallel",
@@ -179,6 +181,7 @@ def test_selector_gathers_global_candidates_across_vocab_shards(monkeypatch):
         lm_head=lm_head,
         candidate_selector=SimpleNamespace(top_k=k),
         _transform_unary_logits=lambda logits: logits.float(),
+        merge_candidates_fused=False,
     )
 
     # Rank 0's gathered contribution, synthesized from the reference weights.

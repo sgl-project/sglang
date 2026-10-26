@@ -1778,14 +1778,21 @@ class TritonAttnBackend(AttentionBackend):
             verify_fwd = self.verify_splitkv_fwd
         else:
             verify_fwd = None
-        if (
+        try_verify = (
             verify_fwd is not None
             and score_mod is None
             and forward_batch.forward_mode.is_target_verify()
+        )
+        # One contiguous copy of the K/V views for both the verify try and the extend fallback (a declined verify
+        # used to copy them twice per layer).
+        if try_verify or self.dllm_attention is None:
+            k_contig, v_contig = k.contiguous(), v.contiguous()
+        if (
+            try_verify
             and verify_fwd(
                 q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                k.contiguous(),
-                v.contiguous(),
+                k_contig,
+                v_contig,
                 o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
                 self.token_to_kv_pool.get_key_buffer(layer.layer_id),
                 self.token_to_kv_pool.get_value_buffer(layer.layer_id),
@@ -1812,8 +1819,8 @@ class TritonAttnBackend(AttentionBackend):
         self._forward_extend_kernel(
             layer,
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-            k.contiguous() if self.dllm_attention is None else k,
-            v.contiguous() if self.dllm_attention is None else v,
+            k_contig if self.dllm_attention is None else k,
+            v_contig if self.dllm_attention is None else v,
             o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
             self.token_to_kv_pool.get_key_buffer(layer.layer_id),
             self.token_to_kv_pool.get_value_buffer(layer.layer_id),

@@ -6,6 +6,7 @@ import torch
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_dp_tp_group
+from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -88,6 +89,7 @@ from sglang.srt.utils import (
     is_npu,
     is_pin_memory_available,
 )
+from sglang.srt.utils.common import async_h2d
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -332,6 +334,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             greedy_draft=self._greedy_draft,
             dp_moe_sync=self._draft_is_moe and get_parallel().attn_dp_enabled,
         )
+        self._target_logits_processor = self._defer_target_verify_gather()
         self._verify_epilogue = None
         target_is_dsv41 = (
             getattr(
@@ -363,6 +366,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 fused_argmax=target_is_dsv41,
                 simulated_correct_len=self._simulated_correct_len,
                 simulate_fold=_is_hip and envs.SGLANG_DSPARK_SIMULATE_FOLD.get(),
+                target_logits_processor=self._target_logits_processor,
                 commit_ctx=CommitInjectCtx(
                     draft_model=self.draft_model,
                     block_pos_offsets=self._block_pos_offsets,
@@ -411,6 +415,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             simulate_acc_len=self._simulate_acc_len,
             simulated_correct_len=self._simulated_correct_len,
             block_verification=get_spec().speculative_use_block_verification,
+            target_logits_processor=self._target_logits_processor,
         )
 
         self._forced_budget_frac: Optional[float] = None
@@ -427,6 +432,40 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         if self._is_pd_prefill and not self._draft_is_moe:
             self.draft_model.prune_to_ctx_kv_injection()
+
+    def _defer_target_verify_gather(self) -> Optional[LogitsProcessor]:
+        """The target's LogitsProcessor, told to leave verify logits vocab-sharded
+        (SGLANG_MUSE_SHARDED_GREEDY_LOGITS); None keeps the in-forward gather."""
+        if not (_is_hip and envs.SGLANG_MUSE_SHARDED_GREEDY_LOGITS.get()):
+            return None
+        processors = [
+            module
+            for module in self.target_worker.model_runner.model.modules()
+            if isinstance(module, LogitsProcessor)
+        ]
+        if len(processors) != 1:
+            return None
+        processors[0].defer_verify_gather = True
+        return processors[0]
+
+    def _verify_accept_is_sharded_greedy(
+        self, batch: ScheduleBatch, sampling_info
+    ) -> bool:
+        """Every consumer of this step's target logits reads only the argmax (or the
+        simulated bonus rows), so the vocab shards need not be gathered."""
+        if self._target_logits_processor is None:
+            return False
+        if batch.has_grammar or batch.return_logprob:
+            return False
+        if self._observers.reads_target_logits:
+            return False
+        if sampling_info is None:
+            return True
+        return (
+            sampling_info.is_all_greedy
+            and sampling_info.sampling_mask_batch_indices is None
+            and verify_logits_adjustments_are_noop(sampling_info)
+        )
 
     def _resolve_target_embed_tokens(self, target_model):
         if hasattr(target_model, "get_input_embeddings"):
@@ -717,13 +756,16 @@ class DSparkWorkerV2(BaseSpecWorker):
             # A newly placed request's ring holds nothing below its cached prefix.
             placed = [i for i, reset in enumerate(batch.encoder_swa_reset) if reset]
             if placed:
+                # Pinned copies and a device gather: a list index or a pageable
+                # copy here would wait for the whole target forward.
+                placed_rows = async_h2d(placed, dtype=torch.int64, device=device)
+                valid_from = async_h2d(
+                    [batch.prefix_lens[i] for i in placed],
+                    dtype=torch.int64,
+                    device=device,
+                )
                 draft_pool.reset_swa_req_ring(
-                    batch.req_pool_indices[placed],
-                    torch.tensor(
-                        [batch.prefix_lens[i] for i in placed],
-                        dtype=torch.int64,
-                        device=device,
-                    ),
+                    batch.req_pool_indices.index_select(0, placed_rows), valid_from
                 )
         # The draft KV goes to the slots the target prefill just wrote.
         cache_loc = self._kv_injector.ids_for(batch_output.kv_loc_plan)
@@ -961,6 +1003,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 ),
             )
         prepare_mamba_track_for_verify(batch)
+        sharded_greedy = self._verify_accept_is_sharded_greedy(batch, sampling_info)
         with self._observers.segment(InfoSegment.TARGET_VERIFY):
             if run_compact:
                 target_verify, hidden_strided = self._verify_executor.run_compact(
@@ -973,6 +1016,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                     sampling_info=sampling_info,
                     verify_window=verify_window,
                     inject_gate=fold_eligible,
+                    sharded_greedy=sharded_greedy,
                 )
             else:
                 if (
@@ -986,6 +1030,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                     verify_ids_2d=verify_ids_2d,
                     verify_window=verify_window,
                     sampling_info=sampling_info,
+                    sharded_greedy=sharded_greedy,
                 )
                 hidden_strided = None
         logits_output = target_verify.logits_output

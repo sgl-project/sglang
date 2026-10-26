@@ -343,45 +343,80 @@ def softmax_temp(
 
 
 @triton.jit
-def _softmax_temp_kernel(
+def _softmax_temp_stats_kernel(
     logits_ptr,
     temp_ptr,
-    out_ptr,
+    stats_ptr,
     vocab,
+    chunk,
     rows_per_request,
     logits_row_stride,
+    num_splits,
     BLOCK_V: tl.constexpr,
 ):
+    # Online max / sum-exp over one vocab chunk of a row; lanes that saw only -inf keep a zero sum.
     row = tl.program_id(0)
+    split = tl.program_id(1)
     temp = tl.load(temp_ptr + row // rows_per_request).to(tl.float32)
     base = logits_ptr + row.to(tl.int64) * logits_row_stride
+    start = split * chunk
+    end = tl.minimum(start + chunk, vocab)
+    m = tl.full([BLOCK_V], -float("inf"), tl.float32)
+    acc = tl.zeros([BLOCK_V], tl.float32)
+    for v0 in range(start, end, BLOCK_V):
+        offs = v0 + tl.arange(0, BLOCK_V)
+        x = tl.load(base + offs, mask=offs < end, other=-float("inf")).to(tl.float32)
+        x = x / temp
+        m_new = tl.maximum(m, x)
+        live = m_new > -float("inf")
+        acc = tl.where(live, acc * tl.exp(m - m_new) + tl.exp(x - m_new), 0.0)
+        m = m_new
+    row_max = tl.max(m, axis=0)
+    sum_exp = tl.sum(
+        tl.where(m > -float("inf"), acc * tl.exp(m - row_max), 0.0), axis=0
+    )
+    out = stats_ptr + (row * num_splits + split) * 2
+    tl.store(out, row_max)
+    tl.store(out + 1, sum_exp)
+
+
+@triton.jit
+def _softmax_temp_write_kernel(
+    logits_ptr,
+    temp_ptr,
+    stats_ptr,
+    out_ptr,
+    vocab,
+    chunk,
+    rows_per_request,
+    logits_row_stride,
+    num_splits,
+    BLOCK_V: tl.constexpr,
+    BLOCK_S: tl.constexpr,
+):
+    row = tl.program_id(0)
+    split = tl.program_id(1)
+    temp = tl.load(temp_ptr + row // rows_per_request).to(tl.float32)
+    s = tl.arange(0, BLOCK_S)
+    smask = s < num_splits
+    stats = stats_ptr + (row * num_splits + s) * 2
+    part_max = tl.load(stats, mask=smask, other=-float("inf"))
+    part_sum = tl.load(stats + 1, mask=smask, other=0.0)
+    row_max = tl.max(part_max, axis=0)
+    sum_exp = tl.sum(
+        tl.where(part_max > -float("inf"), part_sum * tl.exp(part_max - row_max), 0.0),
+        axis=0,
+    )
+    base = logits_ptr + row.to(tl.int64) * logits_row_stride
     out_base = out_ptr + row.to(tl.int64) * vocab
-
-    row_max = -float("inf")
-    for v0 in range(0, vocab, BLOCK_V):
+    start = split * chunk
+    end = tl.minimum(start + chunk, vocab)
+    for v0 in range(start, end, BLOCK_V):
         offs = v0 + tl.arange(0, BLOCK_V)
-        vmask = offs < vocab
+        vmask = offs < end
         x = tl.load(base + offs, mask=vmask, other=-float("inf")).to(tl.float32)
         x = x / temp
-        row_max = tl.maximum(row_max, tl.max(x, axis=0))
-
-    sum_exp = 0.0
-    for v0 in range(0, vocab, BLOCK_V):
-        offs = v0 + tl.arange(0, BLOCK_V)
-        vmask = offs < vocab
-        x = tl.load(base + offs, mask=vmask, other=-float("inf")).to(tl.float32)
-        x = x / temp
-        e = tl.exp(x - row_max)
-        e = tl.where(vmask, e, 0.0)
-        sum_exp += tl.sum(e, axis=0)
-
-    for v0 in range(0, vocab, BLOCK_V):
-        offs = v0 + tl.arange(0, BLOCK_V)
-        vmask = offs < vocab
-        x = tl.load(base + offs, mask=vmask, other=-float("inf")).to(tl.float32)
-        x = x / temp
-        e = tl.exp(x - row_max)
-        tl.store(out_base + offs, e / sum_exp, mask=vmask)
+        tl.store(out_base + offs, tl.exp(x - row_max) / sum_exp, mask=vmask)
 
 
 def softmax_temp_triton(
@@ -397,15 +432,41 @@ def softmax_temp_triton(
     )
     temperatures = temperatures.reshape(bs).to(torch.float32).contiguous()
     out = torch.empty((num_rows, vocab), dtype=torch.float32, device=logits.device)
-    BLOCK_V = 4096
-    _softmax_temp_kernel[(num_rows,)](
+    if num_rows == 0:
+        return out
+    # A verify has only bs x block rows: split each row over enough programs to fill the GPU. One pass writes
+    # per-chunk max / sum-exp, the second combines them and writes its normalized chunk.
+    BLOCK_V = 2048
+    num_splits = max(1, min(64, triton.cdiv(1024, num_rows)))
+    chunk = triton.cdiv(triton.cdiv(vocab, num_splits), BLOCK_V) * BLOCK_V
+    num_splits = triton.cdiv(vocab, chunk)
+    stats = torch.empty(
+        (num_rows, num_splits, 2), dtype=torch.float32, device=logits.device
+    )
+    grid = (num_rows, num_splits)
+    _softmax_temp_stats_kernel[grid](
         logits,
         temperatures,
-        out,
+        stats,
         vocab,
+        chunk,
         rows_per_request,
         logits.stride(0),
+        num_splits,
         BLOCK_V=BLOCK_V,
+    )
+    _softmax_temp_write_kernel[grid](
+        logits,
+        temperatures,
+        stats,
+        out,
+        vocab,
+        chunk,
+        rows_per_request,
+        logits.stride(0),
+        num_splits,
+        BLOCK_V=BLOCK_V,
+        BLOCK_S=triton.next_power_of_2(num_splits),
     )
     return out
 
@@ -599,6 +660,7 @@ class AcceptGreedy:
         verify_num_draft_tokens: int,
         cutoff_verify_lens: Optional[torch.Tensor] = None,
         fused_argmax: bool = False,
+        target_predict: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return accept_greedy(
             candidates=candidates,
@@ -606,6 +668,7 @@ class AcceptGreedy:
             verify_num_draft_tokens=verify_num_draft_tokens,
             cutoff_verify_lens=cutoff_verify_lens,
             fused_argmax=fused_argmax,
+            target_predict=target_predict,
         )
 
     @classmethod
@@ -617,6 +680,7 @@ class AcceptGreedy:
         verify_num_draft_tokens: int,
         cutoff_verify_lens: Optional[torch.Tensor] = None,
         fused_argmax: bool = False,
+        target_predict: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return accept_greedy_triton(
             candidates=candidates,
@@ -624,6 +688,7 @@ class AcceptGreedy:
             verify_num_draft_tokens=verify_num_draft_tokens,
             cutoff_verify_lens=cutoff_verify_lens,
             fused_argmax=fused_argmax,
+            target_predict=target_predict,
         )
 
 
@@ -634,11 +699,13 @@ def accept_greedy(
     verify_num_draft_tokens: int,
     cutoff_verify_lens: Optional[torch.Tensor] = None,
     fused_argmax: bool = False,
+    target_predict: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     bs = candidates.shape[0]
-    target_predict = _row_argmax(target_logits, fused=fused_argmax).view(
-        bs, verify_num_draft_tokens
-    )
+    # target_predict: the per-row argmax already resolved (e.g. across vocab shards).
+    if target_predict is None:
+        target_predict = _row_argmax(target_logits, fused=fused_argmax)
+    target_predict = target_predict.view(bs, verify_num_draft_tokens)
     correct_len, bonus = compute_dflash_correct_drafts_and_bonus(
         candidates=candidates,
         target_predict=target_predict,
@@ -709,11 +776,12 @@ def accept_greedy_triton(
     verify_num_draft_tokens: int,
     cutoff_verify_lens: Optional[torch.Tensor] = None,
     fused_argmax: bool = False,
+    target_predict: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     bs = candidates.shape[0]
-    target_predict = _row_argmax(target_logits, fused=fused_argmax).view(
-        bs, verify_num_draft_tokens
-    )
+    if target_predict is None:
+        target_predict = _row_argmax(target_logits, fused=fused_argmax)
+    target_predict = target_predict.view(bs, verify_num_draft_tokens)
     correct_len, bonus = compute_dflash_correct_drafts_and_bonus(
         candidates=candidates,
         target_predict=target_predict,

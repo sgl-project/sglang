@@ -74,6 +74,7 @@ from sglang.kernels.ops.kvcache.kv_read_table import (
     build_kv_read_table_packed,
 )
 from sglang.srt.layers.dcp.layout import localize_dcp_indices
+from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
     UnifiedSWAAllocatorBase,
 )
@@ -195,6 +196,11 @@ class KVIndexTranslator:
                 self._spaces[IdSpaceKind.FULL] = IdSpace(
                     key=(IdSpaceKind.FULL, "dcp-rank-local"), write=localize
                 )
+            elif token_to_kv_pool.follows_target_swa_ids:
+                localize = None
+                self._spaces[IdSpaceKind.FULL] = self._target_swa_space(
+                    token_to_kv_pool_allocator
+                )
             else:
                 localize = None
                 self._spaces[IdSpaceKind.FULL] = IdSpace(key=(IdSpaceKind.FULL, None))
@@ -219,6 +225,32 @@ class KVIndexTranslator:
             torch.arange(req_to_token.shape[0], dtype=torch.int64, device=device)
             if self.is_translating
             else None
+        )
+
+    @staticmethod
+    def _target_swa_space(token_to_kv_pool_allocator) -> IdSpace:
+        """The id space of a draft pool whose rows are the target's sliding-window
+        ids: the target's own SWA space (same key and write), so a plan translates
+        the window once for the target's SWA layers and the draft alike."""
+        target_pool = token_to_kv_pool_allocator.get_kvcache()
+        if not isinstance(target_pool, BaseSWAKVPool) or not isinstance(
+            token_to_kv_pool_allocator, SWATokenToKVPoolAllocator
+        ):
+            raise ValueError(
+                "SGLANG_ENABLE_DFLASH_SWA_DRAFT_KV: the draft pool follows the "
+                "target's SWA ids, but the target allocator "
+                f"({type(token_to_kv_pool_allocator).__name__}) has no paged SWA pool."
+            )
+        if token_to_kv_pool_allocator.swa_req_ring or isinstance(
+            token_to_kv_pool_allocator, UnifiedSWAAllocatorBase
+        ):
+            raise ValueError(
+                "SGLANG_ENABLE_DFLASH_SWA_DRAFT_KV needs the paged full->SWA "
+                "mapping; the per-request SWA ring and the unified pool have none."
+            )
+        return IdSpace(
+            key=(IdSpaceKind.SLIDING_WINDOW, id(target_pool)),
+            write=target_pool.translate_loc_from_full_to_swa,
         )
 
     def space(self, kind: IdSpaceKind) -> Optional[IdSpace]:

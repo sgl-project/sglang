@@ -2030,6 +2030,9 @@ class KVCache(abc.ABC):
     # Whether get_cpu_copy/load_cpu_copy carry the recurrent state. False when the
     # state lives on the request pool instead, and the caller has to move it.
     cpu_copy_carries_mamba: bool = False
+    # A draft pool whose rows are the target's sliding-window ids
+    # (SGLANG_ENABLE_DFLASH_SWA_DRAFT_KV), not its full-attention ids.
+    follows_target_swa_ids: bool = False
 
     @abc.abstractmethod
     def __init__(
@@ -3291,15 +3294,25 @@ class MHATokenToKVPool(KVCache):
                 f"head_dim={self.head_dim} v_head_dim={self.v_head_dim}."
             )
 
-        fused_k_scale = _resolve_fused_scale(
-            k_scale,
-            getattr(layer, "k_scale", None),
-            getattr(layer, "k_scale_float", None),
+        # No scale: the eager fallback below is a plain saturating cast, which the fused kernel does bit-exactly
+        # at scale 1.0 (one launch instead of five per layer).
+        fused_k_scale = (
+            1.0
+            if k_scale is None
+            else _resolve_fused_scale(
+                k_scale,
+                getattr(layer, "k_scale", None),
+                getattr(layer, "k_scale_float", None),
+            )
         )
-        fused_v_scale = _resolve_fused_scale(
-            v_scale,
-            getattr(layer, "v_scale", None),
-            getattr(layer, "v_scale_float", None),
+        fused_v_scale = (
+            1.0
+            if v_scale is None
+            else _resolve_fused_scale(
+                v_scale,
+                getattr(layer, "v_scale", None),
+                getattr(layer, "v_scale_float", None),
+            )
         )
         # fuse quantization and writing into the same kernel
         if (

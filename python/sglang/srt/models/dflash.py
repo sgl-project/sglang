@@ -15,6 +15,7 @@ from sglang.kernels.ops.speculative.dflash import selector_walk_triton
 from sglang.kernels.ops.speculative.lilicorr import lilicorr_topk_lse
 from sglang.srt.configs.laguna import normalize_gating
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
+from sglang.srt.environ import envs
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -27,6 +28,10 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import (
     LogitsProcessorOutput,
     should_apply_lm_head_quant_method,
+)
+from sglang.srt.layers.quantization.unquant import (
+    UnquantizedLinearMethod,
+    register_gfx950_unquantized_gemm_shapes,
 )
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -46,13 +51,37 @@ from sglang.srt.speculative.dflash_utils import (
     is_nemotron_35_draft_config,
     parse_dflash_draft_config,
 )
-from sglang.srt.utils import is_npu, set_weight_attrs
+from sglang.srt.utils import is_gfx95_supported, is_hip, is_npu, set_weight_attrs
 from sglang.srt.utils.common import get_compiler_backend
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 _is_npu = is_npu()
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
+_is_gfx95 = is_hip() and is_gfx95_supported()
+if _is_gfx95:
+    from sglang.kernels.ops.gemm.bf16_tiled_small_m_gemm import (
+        rowmajor_gemm_applies,
+        rowmajor_gemm_partials,
+    )
+    from sglang.kernels.ops.speculative.dflash_candidates import (
+        MAX_PACKED_ID,
+        merge_candidates,
+        topk_packed,
+    )
+    from sglang.kernels.ops.speculative.dflash_grouped_conv import (
+        conv_applies,
+        conv_finish_add_rmsnorm,
+        conv_prepare,
+    )
+
+# MI355X, TP4 Muse Spark draft (SGLANG_MUSE_DFLASH_DENSE): the QKV [2560, 8192], MLP down [8192, 7168] and
+# gate/up [14336, 8192] weights on the row-major split-K GEMM at the widths it is tuned for (the ROW_MAJOR table);
+# the gate/up from 33 to 128 rows on hipBLASLt, since aiter's tuned table picks a slower split-K kernel there with
+# HBM-resident weights (63.5 vs 48.5 us at 64 rows, with the SiLU-and-mul).
+_GFX950_ROWMAJOR_WEIGHTS = ((2560, 8192), (8192, 7168), (14336, 8192))
+_GFX950_HIPBLASLT_WEIGHTS = ((14336, 8192),)
+_GFX950_HIPBLASLT_ROWS = range(33, 129)
 logger = logging.getLogger(__name__)
 
 try:
@@ -108,12 +137,16 @@ def candidate_topk(
     k: int,
     *,
     with_partition: bool = False,
+    merged_unary_transform: Optional[Tuple[float, Optional[float]]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """Global top-k candidates from the target head: hidden [N, H] -> ids / vals [N, K].
 
     Under TP (vocab-sharded lm_head): local top-k per shard, all-gather K logits/ids (not
     the full vocab), then a global top-k -- identical candidates at O(tp*K) instead of
     O(vocab) gather bandwidth. with_partition also returns the full-vocabulary lse [N] fp32.
+    merged_unary_transform (TP > 1 without the partition, power-of-two TP, gfx950 kernels):
+    ``(multiplier, softcap)``; the local top-k packs values and ids for one FP32 all-gather,
+    one kernel merges them and returns ``tanh(v * multiplier / softcap) * softcap`` as the values.
     """
     # The worker screens the head before capture, but the eager fallbacks attach
     # whatever the target has.
@@ -134,6 +167,16 @@ def candidate_topk(
     logits = _project_candidate_logits(
         hidden, lm_head, num_org=num_org, use_quant_head=use_quant_head
     )
+    if merged_unary_transform is not None and not tp and not with_partition:
+        multiplier, softcap = merged_unary_transform
+        start = int(lm_head.shard_indices.org_vocab_start_index)
+        gathered = tensor_model_parallel_all_gather(
+            topk_packed(logits, k, start), dim=-1
+        )
+        ids, vals = merge_candidates(
+            gathered, k, multiplier=multiplier, softcap=softcap
+        )
+        return ids, vals, None
     lse = None
     if with_partition:
         vals, ids, lse = lilicorr_topk_lse(logits, k)
@@ -474,9 +517,18 @@ class DFlashMLP(nn.Module):
                 f"Unsupported DFlash activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
+        self.gate_up_on_hipblaslt = (
+            _is_gfx95
+            and envs.SGLANG_MUSE_DFLASH_DENSE.get()
+            and isinstance(self.gate_up_proj.quant_method, UnquantizedLinearMethod)
+            and tuple(self.gate_up_proj.weight.shape) in _GFX950_HIPBLASLT_WEIGHTS
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate_up, _ = self.gate_up_proj(x)
+        if self.gate_up_on_hipblaslt and x.shape[0] in _GFX950_HIPBLASLT_ROWS:
+            gate_up = F.linear(x, self.gate_up_proj.weight)
+        else:
+            gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
@@ -497,6 +549,19 @@ def _grouped_conv(hidden_states, delta, base, block_size, num_groups, group_size
         shifted = torch.where((position >= tap).view(-1, 1, 1), shifted, 0)
         out = out + coefficients[:, tap] * shifted
     return out.flatten(-2)
+
+
+def _is_plain_rmsnorm(norm: RMSNorm) -> bool:
+    """Whether ``norm`` computes the plain BF16 add-RMSNorm the fused output convolution implements."""
+    return (
+        type(norm) is RMSNorm
+        and norm.has_weight
+        and norm.weight.dtype == torch.bfloat16
+        and not norm.cast_x_before_out_mul
+        and not norm.fp32_residual
+        and norm.override_orig_dtype is None
+        and norm.variance_size_override is None
+    )
 
 
 class DFlashGroupedConv(nn.Module):
@@ -527,6 +592,17 @@ class DFlashGroupedConv(nn.Module):
         self.kernel_projection = nn.Linear(
             hidden_size, 2 * self.taps * self.num_groups, bias=False
         )
+        # MI355X (SGLANG_MUSE_DFLASH_FUSED_CONV): the projection's row-major split-K partials are summed inside the
+        # input convolution kernel, and the output convolution runs inside the next residual add + RMSNorm.
+        self.fused = _is_gfx95 and envs.SGLANG_MUSE_DFLASH_FUSED_CONV.get()
+
+    def _fused_applies(self, hidden_states: torch.Tensor) -> bool:
+        return self.fused and conv_applies(
+            hidden_states,
+            block_size=self.block_size,
+            taps=self.taps,
+            num_groups=self.num_groups,
+        )
 
     def _convolve(self, hidden_states, delta, side: int) -> torch.Tensor:
         # Marked here, not inside: by the time the compiled function traces, the dim
@@ -545,6 +621,21 @@ class DFlashGroupedConv(nn.Module):
         )
 
     def prepare(self, hidden_states: torch.Tensor):
+        if self._fused_applies(hidden_states):
+            weight = self.kernel_projection.weight
+            projection = (
+                rowmajor_gemm_partials(hidden_states, weight)
+                if rowmajor_gemm_applies(hidden_states, weight)
+                else self.kernel_projection(hidden_states)
+            )
+            return conv_prepare(
+                projection,
+                hidden_states,
+                self.base_kernel[0],
+                block_size=self.block_size,
+                taps=self.taps,
+                num_groups=self.num_groups,
+            )
         coefficients = self.kernel_projection(hidden_states).reshape(
             *hidden_states.shape[:-1], 2, self.taps, self.num_groups
         )
@@ -555,6 +646,26 @@ class DFlashGroupedConv(nn.Module):
 
     def finish(self, hidden_states: torch.Tensor, coefficients) -> torch.Tensor:
         return self._convolve(hidden_states, coefficients, side=1)
+
+    def finish_add_norm(
+        self,
+        hidden_states: torch.Tensor,
+        coefficients,
+        residual: torch.Tensor,
+        norm: RMSNorm,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """``norm(finish(hidden_states, coefficients), residual)``, in one kernel on the fused path."""
+        if self._fused_applies(hidden_states) and _is_plain_rmsnorm(norm):
+            return conv_finish_add_rmsnorm(
+                hidden_states,
+                coefficients,
+                self.base_kernel[1],
+                residual,
+                norm.weight,
+                norm.variance_epsilon,
+                block_size=self.block_size,
+            )
+        return norm(self.finish(hidden_states, coefficients), residual)
 
 
 class DFlashDecoderLayer(nn.Module):
@@ -596,17 +707,32 @@ class DFlashDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        input_conv: Optional[Tuple[DFlashGroupedConv, torch.Tensor]] = None,
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        Optional[Tuple[DFlashGroupedConv, torch.Tensor]],
+    ]:
+        """Returns ``(hidden_states, residual, output_conv)``.
+
+        ``input_conv`` / ``output_conv`` is an output convolution ``(conv, coefficients)`` still to apply to the
+        hidden states it travels with; the consumer runs it inside its residual add + RMSNorm.
+        """
         if hidden_states.numel() == 0:
             # Keep return types consistent for upstream callers.
             if residual is None:
                 residual = hidden_states
-            return hidden_states, residual
+            return hidden_states, residual, None
 
         # Pre-norm attention with fused residual+norm when possible (Qwen3-style).
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
+        elif input_conv is not None:
+            conv, coefficients = input_conv
+            hidden_states, residual = conv.finish_add_norm(
+                hidden_states, coefficients, residual, self.input_layernorm
+            )
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
@@ -620,17 +746,21 @@ class DFlashDecoderLayer(nn.Module):
             forward_batch=forward_batch,
         )
         if attention_kernel is not None:
-            attn_out = self.attention_conv.finish(attn_out, attention_kernel)
-
-        hidden_states, residual = self.post_attention_layernorm(attn_out, residual)
+            hidden_states, residual = self.attention_conv.finish_add_norm(
+                attn_out, attention_kernel, residual, self.post_attention_layernorm
+            )
+        else:
+            hidden_states, residual = self.post_attention_layernorm(attn_out, residual)
 
         mlp_kernel = None
         if self.mlp_conv is not None:
             hidden_states, mlp_kernel = self.mlp_conv.prepare(hidden_states)
         hidden_states = self.mlp(hidden_states)
-        if mlp_kernel is not None:
-            hidden_states = self.mlp_conv.finish(hidden_states, mlp_kernel)
-        return hidden_states, residual
+        if mlp_kernel is None:
+            return hidden_states, residual, None
+        if self.mlp_conv.fused:
+            return hidden_states, residual, (self.mlp_conv, mlp_kernel)
+        return self.mlp_conv.finish(hidden_states, mlp_kernel), residual, None
 
 
 class DFlashDraftModel(nn.Module):
@@ -671,6 +801,11 @@ class DFlashDraftModel(nn.Module):
                 hidden_size,
                 quant_config=quant_config,
                 prefix=embed_prefix,
+            )
+
+        if _is_gfx95 and envs.SGLANG_MUSE_DFLASH_DENSE.get():
+            register_gfx950_unquantized_gemm_shapes(
+                rowmajor_weights=_GFX950_ROWMAJOR_WEIGHTS
             )
 
         def grouped_conv():
@@ -824,15 +959,21 @@ class DFlashDraftModel(nn.Module):
                 )
         hidden_states = input_embeds
         residual: Optional[torch.Tensor] = None
+        output_conv = None
 
         for layer in self.layers:
-            hidden_states, residual = layer(
-                positions, hidden_states, forward_batch, residual
+            hidden_states, residual, output_conv = layer(
+                positions, hidden_states, forward_batch, residual, output_conv
             )
 
         if hidden_states.numel() != 0:
             if residual is None:
                 hidden_states = self.norm(hidden_states)
+            elif output_conv is not None:
+                conv, coefficients = output_conv
+                hidden_states, _ = conv.finish_add_norm(
+                    hidden_states, coefficients, residual, self.norm
+                )
             else:
                 hidden_states, _ = self.norm(hidden_states, residual)
 
@@ -1238,6 +1379,16 @@ class DFlash2DraftModel(DFlashDraftModel):
         # The draft has no head of its own; the worker points this at the target's
         # before capture.
         self.lm_head: Optional[nn.Module] = None
+        # MI355X (SGLANG_MUSE_DFLASH_FUSED_CANDIDATES): under TP the ranks' candidates
+        # travel in one all-gather and one kernel merges them and applies the transform.
+        tp_size = int(get_parallel().tp_size)
+        self.merge_candidates_fused = (
+            _is_gfx95
+            and envs.SGLANG_MUSE_DFLASH_FUSED_CANDIDATES.get()
+            and tp_size > 1
+            and tp_size & (tp_size - 1) == 0
+            and int(config.vocab_size) < MAX_PACKED_ID
+        )
 
     def _transform_unary_logits(self, logits: torch.Tensor) -> torch.Tensor:
         logits = logits.float()
@@ -1254,6 +1405,17 @@ class DFlash2DraftModel(DFlashDraftModel):
         """Top-k base candidates via the target lm_head: hidden [N, H] -> global
         candidate_ids / unary_logits [N, K]."""
         assert self.lm_head is not None, "draft_model.lm_head unset before capture"
+        if self.merge_candidates_fused:
+            ids, vals, _ = candidate_topk(
+                hidden,
+                self.lm_head,
+                self.candidate_selector.top_k,
+                merged_unary_transform=(
+                    self.draft_config.output_multiplier,
+                    self.draft_config.final_logit_softcapping,
+                ),
+            )
+            return ids, vals
         ids, vals, _ = candidate_topk(
             hidden, self.lm_head, self.candidate_selector.top_k
         )

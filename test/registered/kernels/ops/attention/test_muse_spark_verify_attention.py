@@ -72,15 +72,35 @@ def test_gqa_verify_splitkv(bs, window, kv_heads):
 
 
 @pytest.mark.parametrize("bs", [1, 8, 48])
+@pytest.mark.parametrize("fp8", [False, True])
 @pytest.mark.parametrize("kv_heads", [2, 4])
-def test_gqa_verify_splitkv_2kv(bs, kv_heads):
+def test_gqa_verify_splitkv_2kv(bs, kv_heads, fp8):
     from sglang.kernels.ops.attention.gqa_verify_splitkv_2kv import (
         gqa_verify_splitkv_2kv,
     )
 
     q, kc, vc, seq, table, kd, vd = _paged_inputs(bs, kv_heads=kv_heads, seed=100 + bs)
     out = torch.empty_like(q)
-    gqa_verify_splitkv_2kv(q, kc, vc, out, seq, table, SCALE, kd, vd)
+    gqa_verify_splitkv_2kv(q, kc, vc, out, seq, table, SCALE, kd, vd, fp8=fp8)
+    ref = _reference(q, kc, vc, seq, table, kd, vd, 0)
+    if fp8:
+        # FP8 Q / P: 3-4.5% relative L2 error with isolated larger elements (e4m3 P), as the prefill FP8 path.
+        assert (out.float() - ref).norm() / ref.norm() < 0.06
+        torch.testing.assert_close(out.float(), ref, rtol=0.5, atol=0.25)
+    else:
+        torch.testing.assert_close(out.float(), ref, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.parametrize("bs", [1, 8, 12])
+@pytest.mark.parametrize("kv_heads", [2, 4])
+def test_gqa_verify_flydsl(bs, kv_heads):
+    flydsl = pytest.importorskip("flydsl")
+    from sglang.kernels.ops.attention.muse_verify_flydsl import gqa_verify_flydsl
+
+    q, kc, vc, seq, table, kd, vd = _paged_inputs(bs, kv_heads=kv_heads, seed=200 + bs)
+    out = torch.empty_like(q)
+    gqa_verify_flydsl(q, kc, vc, out, seq, table, SCALE, kd, vd)
+    # exact BF16 QK / PV: BF16 rounding only, as the Triton pair kernel
     torch.testing.assert_close(
         out.float(), _reference(q, kc, vc, seq, table, kd, vd, 0), rtol=2e-2, atol=2e-2
     )

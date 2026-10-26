@@ -602,6 +602,15 @@ class Envs:
     SGLANG_AITER_PAGED_PREFILL_ASM = EnvBool(True)
     # size the KV pool after CUDA-graph capture
     SGLANG_ENABLE_POST_CAPTURE_KV_SIZING = EnvBool(False)
+    # GiB of free GPU memory the pre-capture KV sizing leaves for graphs and
+    # activations, replacing pre_model_load * (1 - mem_fraction_static) (and the
+    # aiter long-context 0.85 scale folded into it). Unset keeps the fraction.
+    SGLANG_KV_NON_STATIC_RESERVE_GB = EnvFloat(None)
+    # Index a compact-window DFLASH draft KV pool by the hybrid-SWA target's
+    # sliding-window slots (pool and HiCache host pool sized like the target's
+    # SWA pool) instead of its full-attention slots. Needs draft window <= the
+    # target's sliding window.
+    SGLANG_ENABLE_DFLASH_SWA_DRAFT_KV = EnvBool(False)
 
     # ===================================================================
     # Scheduler token budgeting and admission
@@ -1882,6 +1891,18 @@ class Envs:
     SGLANG_MUSE_REUSE_VERIFY_LENGTHS = EnvBool(True)
     # FP8 Q (per-tensor dynamic scale) for full-layer extend of >= 256 tokens.
     SGLANG_MUSE_EXTEND_FP8_Q = EnvBool(True)
+    # That FP8 extend on the gfx950 Gluon kernel (P kept in registers between the two MFMAs) instead of aiter's
+    # unified 2D kernel.
+    SGLANG_MUSE_EXTEND_GLUON = EnvBool(True)
+    # Spec-v2 decode without the per-step seq_lens_cpu D2H (the aiter Muse verify path reads GPU lengths only).
+    SGLANG_MUSE_SYNC_FREE_VERIFY = EnvBool(True)
+    # Target verify: merge the split-KV attention partials inside the output norm-gate kernel (one launch for both).
+    SGLANG_MUSE_VERIFY_REDUCE_NORM_GATE = EnvBool(True)
+    # Target verify full layers on FP8 Q / K MFMA and FP8 P (the prefill FP8 path's numerics); =0 keeps exact BF16.
+    SGLANG_MUSE_VERIFY_FP8 = EnvBool(True)
+    # Target verify full layers on the FlyDSL kernel (exact BF16, 4.75 TB/s at TP4 n8) when flydsl is importable;
+    # =0 keeps the Triton pair kernel (SGLANG_MUSE_VERIFY_FULL_V2 / _FP8).
+    SGLANG_MUSE_VERIFY_FLYDSL = EnvBool(True)
     # aiter patch 05 tiles: long-prefill 2D config, unmasked interior 2D tiles,
     # 64-row verify tiles with an exact q-block grid and 256 split-KV segments.
     SGLANG_MUSE_PREFILL_2D_TILES = EnvBool(True)
@@ -1895,9 +1916,29 @@ class Envs:
     SGLANG_MUSE_VERIFY_FULL_GQA = EnvBool(True)
     # Triton extend: DFlash draft block (8 x 8 heads, 1 KV head, HD128) split-KV.
     SGLANG_MUSE_DFLASH_SPLITKV = EnvBool(True)
-    # Tiled 17..64-row GEMMs for the weight shapes the ROCm Muse Spark model
-    # registers (O projection, MoE pooler, DFlash draft MLP).
+    # DFlash draft grouped conv: kernel projection on the row-major split-K GEMM with its partials summed inside
+    # the input conv kernel; the output conv runs inside the next residual add + RMSNorm.
+    SGLANG_MUSE_DFLASH_FUSED_CONV = EnvBool(True)
+    # DFlash draft dense GEMMs up to 128 rows: TP4 QKV / MLP down / gate-up on the row-major split-K GEMM where it
+    # is tuned, gate/up from 33 rows on hipBLASLt instead of aiter's tuned table.
+    SGLANG_MUSE_DFLASH_DENSE = EnvBool(True)
+    # DFlash selector candidates under TP: each rank's top-k values and global ids share one FP32 all-gather, and
+    # one kernel merges them into the global top-k with the unary-logit transform.
+    SGLANG_MUSE_DFLASH_FUSED_CANDIDATES = EnvBool(True)
+    # Split-K 17..128-row GEMMs (tiled copy or row-major) for the weight shapes the
+    # ROCm Muse Spark model registers (O projection, MoE pooler / unpooler, DFlash draft MLP).
     SGLANG_MUSE_DENSE_TILED = EnvBool(True)
+    # FP8-weight small-M GEMMs (activations quantized in-kernel per row and K group) for the attention QKV / O
+    # projections and the MoE unpooler at decode / verify widths; =0 keeps BF16 weights.
+    SGLANG_MUSE_DENSE_FP8 = EnvBool(True)
+    # Prefill widths (plain extend, > 128 rows): the attention QKV / O projections and the MoE pooler / unpooler on
+    # those FP8 weight copies through aiter's CK a8w8 GEMM, activations quantized per row by the boundary kernels or
+    # one Triton pass; the Ulysses gathered projections are then kept in FP8 only. Needs SGLANG_MUSE_DENSE_FP8;
+    # =0 keeps BF16 hipBLASLt.
+    SGLANG_MUSE_PREFILL_DENSE_FP8 = EnvBool(True)
+    # Greedy / simulated target verify keeps the logits vocab-sharded: each rank all-gathers its per-row
+    # softcapped argmax ([rows, 2]) and only the bonus rows a simulated sample needs, not the full logits.
+    SGLANG_MUSE_SHARDED_GREEDY_LOGITS = EnvBool(True)
     # ROCm Muse Spark model (sglang.srt.rocm_muse_spark): fused QKV projection /
     # QK norm / RoPE / FP8 cache write, QK norm / RoPE / cache write, unpooler +
     # FFN-boundary fusion, compact A4 verify MoE, a4w4 prefill MoE, sequence-
@@ -1910,9 +1951,31 @@ class Envs:
     SGLANG_MUSE_A4W4_MOE = EnvBool(True)
     SGLANG_MUSE_PREFILL_SP = EnvBool(True)
     SGLANG_MUSE_PREFILL_ULYSSES = EnvBool(True)
+    # Ulysses keeps the attention output gate on the token shard: the QKV all-to-all carries only q|k|v and the
+    # per-head norm-gate runs after the output all-to-all (same kernel, same values); =0 sends the gate along.
+    SGLANG_MUSE_ULYSSES_LOCAL_GATE = EnvBool(True)
+    # Ulysses all-to-alls in row chunks on a side stream, overlapped with the chunks' QKV / O projections
+    # (needs SGLANG_MUSE_ULYSSES_LOCAL_GATE).
+    SGLANG_MUSE_ULYSSES_PIPELINE = EnvBool(True)
+    # SP prefill experts in two half-shard passes: one half's gather / reduce-scatter overlaps the other's experts.
+    SGLANG_MUSE_PREFILL_MOE_OVERLAP = EnvBool(True)
+    # TP4 compact A4 verify: one kernel runs the MoE finalize and pushes the all-reduce over xGMI (bitwise the
+    # FlyDSL finalize + aiter two-stage all-reduce); off until measured end to end.
+    SGLANG_MUSE_FINALIZE_AR_PUSH = EnvBool(False)
     SGLANG_MUSE_DENSE_TUNED = EnvBool(True)
     SGLANG_MUSE_SHARED_ROUTER_POOLER = EnvBool(True)
     SGLANG_MUSE_JOINT_ROUTER_POOLER = EnvBool(True)
+    # Directory for the routed-expert statistics of decode / verify forwards (rocm_muse_spark/expert_stats.py);
+    # unset records nothing.
+    SGLANG_MUSE_EXPERT_STATS_PATH = EnvStr(None)
+    # JSON per-layer expert placement over the EP ranks (rocm_muse_spark/expert_placement.py); unset keeps
+    # the checkpoint order (rank r owns experts [r * E / EP, (r + 1) * E / EP)).
+    SGLANG_MUSE_EXPERT_PLACEMENT = EnvStr(None)
+    # Redundant expert replicas per EP rank and MoE layer for TP4 compact A4 verify
+    # (rocm_muse_spark/expert_replicas.py); 0 keeps one copy of every expert.
+    SGLANG_MUSE_EXPERT_REPLICAS = EnvInt(0)
+    # Replica plan JSON (harness replica_plan.py); required when SGLANG_MUSE_EXPERT_REPLICAS > 0.
+    SGLANG_MUSE_EXPERT_REPLICA_PLAN = EnvStr(None)
     SGLANG_USE_CUSTOM_ROUTER_SUM = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_USE_TRITON_ROUTER_SUM"
     )

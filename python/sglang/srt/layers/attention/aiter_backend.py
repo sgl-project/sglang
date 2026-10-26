@@ -87,6 +87,14 @@ except ImportError:
     muse_paged_gqa_decode_flydsl = None
     prepare_muse_paged_gqa_decode_scratch = None
 
+try:
+    from sglang.kernels.ops.attention.muse_extend_gluon import (
+        muse_extend_applies,
+        muse_extend_attention,
+    )
+except ImportError:  # Triton without Gluon's CDNA4 ops
+    muse_extend_attention = None
+
 from sglang.kernels.ops.attention.dcp_kernels import (
     compact_dcp_verify_token_table_to_ragged,
     create_mla_kv_page_table_for_dcp,
@@ -98,6 +106,14 @@ from sglang.kernels.ops.attention.gqa_verify_splitkv_2kv import (
 )
 from sglang.kernels.ops.attention.merge_state import merge_state_triton
 from sglang.kernels.ops.attention.swa_verify_splitkv import swa_verify_splitkv
+from sglang.kernels.ops.attention.verify_reduce_norm_gate import (
+    DEFERRAL as _VERIFY_REDUCE_DEFERRAL,
+)
+
+try:
+    from sglang.kernels.ops.attention.muse_verify_flydsl import gqa_verify_flydsl
+except Exception:  # no flydsl / aiter FlyDSL in this environment
+    gqa_verify_flydsl = None
 from sglang.kernels.ops.attention.utils import (
     launch_reshape_and_cache_flash,
     pad_sequence_with_mask,
@@ -199,6 +215,12 @@ _MUSE_VERIFY_FULL_GQA = (8, 64, 64, 4)
 _muse_verify_v2_logged: set = set()
 
 
+def _defer_or_merged(result, v_descale) -> None:
+    # A deferred call returns the (partial, maximum, denom) of its merge; the model merges them itself.
+    if isinstance(result, tuple):
+        _VERIFY_REDUCE_DEFERRAL.state = (*result, v_descale)
+
+
 def _muse_verify_attention(
     q,
     k,
@@ -246,35 +268,64 @@ def _muse_verify_attention(
     kv_scale = max(1, num_kv_heads // 2)
     if sliding_window == 2047 and window_size[1] == 0:
         if "swa_splitkv" in kernels and 0 < num_seqs <= 8:
-            swa_verify_splitkv(
-                q, k, v, out, cu_seqlens_q, max_seqlen_q, seqused_k, None,
-                softmax_scale, True, window_size, block_table, softcap,
-                None, k_descale, v_descale, num_splits=16 // kv_scale,
+            _defer_or_merged(
+                swa_verify_splitkv(
+                    q, k, v, out, cu_seqlens_q, max_seqlen_q, seqused_k, None,
+                    softmax_scale, True, window_size, block_table, softcap,
+                    None, k_descale, v_descale, num_splits=16 // kv_scale,
+                    defer_reduce=_VERIFY_REDUCE_DEFERRAL.requested,
+                ),
+                v_descale,
             )  # fmt: skip
             return True
         if "swa_gqa" in kernels and num_seqs > 8:
-            gqa_verify_splitkv(
-                q, k, v, out, cu_seqlens_q, seqused_k, block_table, softmax_scale,
-                sliding_window, k_descale, v_descale,
-                splits=(16 if num_seqs <= 16 else 8) // kv_scale, bn=64, num_warps=4,
-                num_stages=2,
+            _defer_or_merged(
+                gqa_verify_splitkv(
+                    q, k, v, out, cu_seqlens_q, seqused_k, block_table, softmax_scale,
+                    sliding_window, k_descale, v_descale,
+                    splits=(16 if num_seqs <= 16 else 8) // kv_scale, bn=64, num_warps=4,
+                    num_stages=2, defer_reduce=_VERIFY_REDUCE_DEFERRAL.requested,
+                ),
+                v_descale,
             )  # fmt: skip
             return True
         return False
     if sliding_window != 0:
         return False
+    if (
+        "full_fly" in kernels
+        and gqa_verify_flydsl is not None
+        and num_kv_heads in (2, 4)
+        and k.stride() == v.stride()
+    ):
+        if ("fly", num_seqs) not in _muse_verify_v2_logged:
+            _muse_verify_v2_logged.add(("fly", num_seqs))
+            logger.info("Muse verify FlyDSL full layers: num_seqs=%d mode=exact", num_seqs)
+        _defer_or_merged(
+            gqa_verify_flydsl(
+                q, k, v, out, seqused_k, block_table, softmax_scale, k_descale, v_descale,
+                defer_reduce=_VERIFY_REDUCE_DEFERRAL.requested,
+            ),
+            v_descale,
+        )  # fmt: skip
+        return True
     if "full_v2" in kernels and num_kv_heads in (2, 4) and k.stride() == v.stride():
         splits = pick_splits_v2(num_seqs, pairs=num_kv_heads // 2)
         if num_seqs not in _muse_verify_v2_logged:
             _muse_verify_v2_logged.add(num_seqs)
             logger.info(
-                "Muse verify v2 full layers: num_seqs=%d mode=exact splits=%d",
+                "Muse verify v2 full layers: num_seqs=%d mode=%s splits=%d",
                 num_seqs,
+                "fp8" if "full_v2_fp8" in kernels else "exact",
                 splits,
             )
-        gqa_verify_splitkv_2kv(
-            q, k, v, out, seqused_k, block_table, softmax_scale, k_descale, v_descale,
-            splits=splits,
+        _defer_or_merged(
+            gqa_verify_splitkv_2kv(
+                q, k, v, out, seqused_k, block_table, softmax_scale, k_descale, v_descale,
+                splits=splits, defer_reduce=_VERIFY_REDUCE_DEFERRAL.requested,
+                fp8="full_v2_fp8" in kernels,
+            ),
+            v_descale,
         )  # fmt: skip
         return True
     min_seqs, splits, bn, warps = _MUSE_VERIFY_FULL_GQA
@@ -282,9 +333,13 @@ def _muse_verify_attention(
         # With the KV-head-pair kernel off: GQA-folded at every batch size (untuned below 8 requests).
         min_seqs, splits = 1, splits // kv_scale
     if "full_gqa" in kernels and num_seqs >= min_seqs:
-        gqa_verify_splitkv(
-            q, k, v, out, cu_seqlens_q, seqused_k, block_table, softmax_scale, 0,
-            k_descale, v_descale, splits=splits, bn=bn, num_warps=warps, num_stages=2,
+        _defer_or_merged(
+            gqa_verify_splitkv(
+                q, k, v, out, cu_seqlens_q, seqused_k, block_table, softmax_scale, 0,
+                k_descale, v_descale, splits=splits, bn=bn, num_warps=warps, num_stages=2,
+                defer_reduce=_VERIFY_REDUCE_DEFERRAL.requested,
+            ),
+            v_descale,
         )  # fmt: skip
         return True
     return False
@@ -724,8 +779,22 @@ class AiterAttnBackend(AttentionBackend):
             and self._use_unified_verify
             and envs.SGLANG_MUSE_REUSE_VERIFY_LENGTHS.get()
         )
+        # Muse unified verify sizes from its page table and the GPU seq_lens, so spec-v2 can skip the per-step
+        # seq_lens_cpu D2H; with it the scheduler blocks on the verify before launching the draft (~1 ms idle).
+        if (
+            self.use_muse_attention_paths
+            and self._use_unified_verify
+            and envs.SGLANG_MUSE_SYNC_FREE_VERIFY.get()
+        ):
+            self.needs_cpu_seq_lens = False
         self.muse_extend_fp8_q = (
             self.use_muse_attention_paths and envs.SGLANG_MUSE_EXTEND_FP8_Q.get()
+        )
+        self.muse_extend_gluon = (
+            self.muse_extend_fp8_q
+            and muse_extend_attention is not None
+            and is_gfx95_supported()
+            and envs.SGLANG_MUSE_EXTEND_GLUON.get()
         )
         self._muse_extend_fp8_logged = False
         self.muse_verify_kernels = frozenset(
@@ -734,6 +803,8 @@ class AiterAttnBackend(AttentionBackend):
                 ("swa_splitkv", envs.SGLANG_MUSE_VERIFY_SWA_SPLITKV),
                 ("swa_gqa", envs.SGLANG_MUSE_VERIFY_SWA_GQA),
                 ("full_v2", envs.SGLANG_MUSE_VERIFY_FULL_V2),
+                ("full_v2_fp8", envs.SGLANG_MUSE_VERIFY_FP8),
+                ("full_fly", envs.SGLANG_MUSE_VERIFY_FLYDSL),
                 ("full_gqa", envs.SGLANG_MUSE_VERIFY_FULL_GQA),
             )
             if self.use_muse_attention_paths and self._use_unified_verify and env.get()
@@ -1492,10 +1563,35 @@ class AiterAttnBackend(AttentionBackend):
                     q_u.shape[0],
                     self.forward_metadata.max_q_len,
                 )
+        k_paged = k_cache.view(
+            -1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
+        )
+        v_paged = v_cache.view(
+            -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
+        )
+        if (
+            q_descale is not None
+            and self.muse_extend_gluon
+            and muse_extend_applies(q_u, k_paged)
+        ):
+            muse_extend_attention(
+                q_u,
+                k_paged,
+                v_paged,
+                o,
+                cu_seqlens_q,
+                forward_batch.seq_lens,
+                pt,
+                q_descale,
+                k_descale,
+                v_descale,
+                layer.scaling,
+            )
+            return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
         unified_attention(
             q=q_u,
-            k=k_cache.view(-1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim),
-            v=v_cache.view(-1, self.page_size, layer.tp_v_head_num, layer.v_head_dim),
+            k=k_paged,
+            v=v_paged,
             out=o,
             cu_seqlens_q=cu_seqlens_q,
             seqused_k=forward_batch.seq_lens,

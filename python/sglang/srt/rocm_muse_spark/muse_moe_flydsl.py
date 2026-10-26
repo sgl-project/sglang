@@ -88,6 +88,13 @@ def _pick_flydsl_config(M: int, topk: int, E: int, mxfp4: bool) -> dict:
         cfg["num_warps"] = 4
         cfg["GEMM1_FLYDSL_K_UNROLL"] = 2
         cfg["GEMM2_FLYDSL_K_UNROLL"] = 4
+    if not mxfp4 and 32 < M <= 128:
+        # Verify widths at EP4 (64 local experts), six routings each: 33..64 rows -9% mean / never slower than the
+        # mid tile (BM32 BN64 BK64, K unroll 2 / 4); 65..128 rows -9% with the narrow BM16 BN32 BK128 tile.
+        if M <= 64:
+            cfg.update(BLOCK_M=32, BLOCK_N=64, BLOCK_K=64, num_warps=4, GEMM1_FLYDSL_K_UNROLL=2, GEMM2_FLYDSL_K_UNROLL=4)
+        else:
+            cfg.update(BLOCK_M=16, BLOCK_N=32, BLOCK_K=128, num_warps=4, GEMM1_FLYDSL_K_UNROLL=2, GEMM2_FLYDSL_K_UNROLL=2)
     if M * topk > 1024:
         use_wide_bf16_m = not mxfp4 and M >= 4096
         cfg["num_warps"] = 8 if use_wide_bf16_m else 4

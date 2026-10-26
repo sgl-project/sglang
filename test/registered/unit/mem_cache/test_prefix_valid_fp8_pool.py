@@ -147,7 +147,7 @@ class TestPrefixValidFp8Pool(CustomTestCase):
                     )
 
     def test_eager_fallbacks(self):
-        """Unresolved/missing scales and non-FP8 storage retain the old writer."""
+        """Unresolved GPU scales and non-FP8 storage retain the old writer; a missing scale fuses at 1.0."""
         unresolved = SimpleNamespace(
             layer_id=0,
             k_scale=torch.tensor(0.625, device=DEVICE),
@@ -171,7 +171,9 @@ class TestPrefixValidFp8Pool(CustomTestCase):
                 unresolved.v_scale,
                 True,
             ),
-            ("missing_k_scale", fp8_dtype, missing, None, missing.v_scale, True),
+            # No K scale is the eager path's plain saturating cast, which the fused kernel does at 1.0.
+            ("missing_k_scale", fp8_dtype, missing, None, missing.v_scale, False),
+            ("no_scales", fp8_dtype, SimpleNamespace(layer_id=0), None, None, False),
             (
                 "non_fp8_cache",
                 torch.bfloat16,

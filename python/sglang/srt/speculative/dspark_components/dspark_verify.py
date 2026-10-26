@@ -26,7 +26,7 @@ from sglang.kernels.ops.speculative.dspark.simulated_bonus import (
     simulated_bonus_sample,
     simulated_bonus_sample_graph,
 )
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
@@ -117,8 +117,11 @@ class TargetVerifyExecutor:
         simulate_acc_len: float = 0.0,
         simulated_correct_len: Optional[torch.Tensor] = None,
         block_verification: bool = False,
+        target_logits_processor: Optional[LogitsProcessor] = None,
     ) -> None:
         self.target_worker = target_worker
+        # Set when the target keeps verify logits vocab-sharded (defer_verify_gather).
+        self._target_logits_processor = target_logits_processor
         # candidate_max_seq_len_upper_bound only feeds the V4.1 candidate graphs.
         self._target_is_dsv41 = (
             getattr(
@@ -168,6 +171,11 @@ class TargetVerifyExecutor:
         # Simulated acceptance overwrites correct_len below, so a sampling accept
         # (draft/target softmax + rejection) would be computed only to be discarded.
         accept_sampling_info = None if simulate and _is_hip else sampling_info
+        target_predict = None
+        if self._is_vocab_shard(target_logits):
+            target_predict = self._target_logits_processor.deferred_argmax(
+                target_logits
+            )
         correct_len, bonus, cap_trim_lens = accept_draft_tokens(
             candidates=verify_ids_2d,
             target_logits=target_logits,
@@ -179,6 +187,7 @@ class TargetVerifyExecutor:
             cutoff_layout=layout,
             fused_argmax=self._target_is_dsv41,
             block_verification=self._block_verification,
+            target_predict=target_predict,
         )
         sync_site = (
             SpecTpSyncSite.DSPARK_ACCEPT_GREEDY
@@ -198,7 +207,25 @@ class TargetVerifyExecutor:
             simulated_correct_len=self._simulated_correct_len,
             target_logits=target_logits,
             simulate_bonus_sampling_info=simulate_bonus_sampling_info,
+            target_logits_processor=self._target_logits_processor,
         )
+
+    def _is_vocab_shard(self, logits: Optional[torch.Tensor]) -> bool:
+        return (
+            self._target_logits_processor is not None
+            and logits is not None
+            and self._target_logits_processor.is_deferred_shard(logits)
+        )
+
+    def _finish_verify_logits(
+        self, logits_output: LogitsProcessorOutput, sharded_greedy: bool
+    ) -> None:
+        """Gather a vocab-sharded verify output unless the accept stays sharded."""
+        logits = logits_output.next_token_logits
+        if not sharded_greedy and self._is_vocab_shard(logits):
+            logits_output.next_token_logits = (
+                self._target_logits_processor.finish_deferred_gather(logits)
+            )
 
     def begin_simulated_step(self) -> None:
         """Draw this step's SGLANG_SIMULATE_ACC_LEN correct length, before the
@@ -269,6 +296,7 @@ class TargetVerifyExecutor:
         verify_ids_2d: torch.Tensor,
         verify_window: VerifyWindow,
         sampling_info,
+        sharded_greedy: bool = False,
     ) -> TargetVerifyResult:
         verify_w = self.verify_num_draft_tokens
         positions_2d = verify_window.positions_2d
@@ -299,6 +327,7 @@ class TargetVerifyExecutor:
             verify_input=verify_input,
             seq_lens_cpu_backup=seq_lens_cpu_backup,
             seq_lens_sum_backup=seq_lens_sum_backup,
+            sharded_greedy=sharded_greedy,
         )
 
         if sampling_info is not None:
@@ -317,6 +346,7 @@ class TargetVerifyExecutor:
         verify_input: DFlashVerifyInput,
         seq_lens_cpu_backup,
         seq_lens_sum_backup,
+        sharded_greedy: bool = False,
     ) -> TargetVerifyResult:
         if verify_input.live_seq_lens_cpu is None and self._target_is_dsv41:
             verify_input.candidate_max_seq_len_upper_bound = (
@@ -334,6 +364,7 @@ class TargetVerifyExecutor:
             is_verify=True,
             skip_attn_backend_init=True if not _is_npu else None,
         )
+        self._finish_verify_logits(target_out.logits_output, sharded_greedy)
         return TargetVerifyResult(
             logits_output=target_out.logits_output,
             can_run_cuda_graph=target_out.can_run_cuda_graph,
@@ -393,6 +424,7 @@ class TargetVerifyExecutor:
         ragged_window: RaggedVerifyWindow,
         sampling_info,
         kv_loc_plan,
+        sharded_greedy: bool,
     ) -> TargetVerifyResult:
         verify_input = DFlashVerifyInput(
             draft_token=ragged_window.verify_ids,
@@ -425,6 +457,7 @@ class TargetVerifyExecutor:
             verify_input=verify_input,
             seq_lens_cpu_backup=seq_lens_cpu_backup,
             seq_lens_sum_backup=seq_lens_sum_backup,
+            sharded_greedy=sharded_greedy,
         )
 
     def run_compact(
@@ -439,6 +472,7 @@ class TargetVerifyExecutor:
         sampling_info,
         verify_window: VerifyWindow,
         inject_gate: bool = False,
+        sharded_greedy: bool = False,
     ) -> tuple[TargetVerifyResult, torch.Tensor]:
         ragged_window = BuildRaggedVerifyWindow.execute(
             batch=batch,
@@ -458,6 +492,7 @@ class TargetVerifyExecutor:
             ragged_window=ragged_window,
             sampling_info=sampling_info,
             kv_loc_plan=verify_window.kv_loc_plan,
+            sharded_greedy=sharded_greedy,
         )
         logits_output = target_verify.logits_output
 
@@ -471,6 +506,10 @@ class TargetVerifyExecutor:
             )
             strided_logits = strided_logits[: bs * stride]
             hidden_strided = hidden_strided[: bs * stride]
+            if not sharded_greedy and self._is_vocab_shard(strided_logits):
+                strided_logits = self._target_logits_processor.finish_deferred_gather(
+                    strided_logits
+                )
         else:
             compact_logits = logits_output.next_token_logits
             strided_logits = ScatterCompactToStrided.execute(
@@ -537,8 +576,10 @@ class DsparkVerifyEpilogue:
         fused_argmax: bool = False,
         simulated_correct_len: Optional[torch.Tensor] = None,
         simulate_fold: bool = False,
+        target_logits_processor: Optional[LogitsProcessor] = None,
     ) -> None:
         self.max_bs = int(max_bs)
+        self._target_logits_processor = target_logits_processor
         # SGLANG_SIMULATE_ACC_LEN with a sampled bonus inside the graph too: the bonus
         # is drawn at the simulated correct_len from these buffers, which
         # begin_sim_bonus writes before replay (<= 0 temperature: argmax).
@@ -764,23 +805,37 @@ class DsparkVerifyEpilogue:
         self, *, candidates, logits, draft_tokens, seq_lens, cutoff_verify_lens=None
     ) -> torch.Tensor:
         bs = candidates.shape[0]
+        lp = self._target_logits_processor
+        vocab_shard = lp is not None and lp.is_deferred_shard(logits)
         correct_len, bonus, cap_trim_lens = AcceptGreedy.execute(
             candidates=candidates,
             target_logits=logits,
             verify_num_draft_tokens=self.stride,
             cutoff_verify_lens=cutoff_verify_lens,
             fused_argmax=self._fused_argmax,
+            target_predict=lp.deferred_argmax(logits) if vocab_shard else None,
         )
         if self.simulate_fold:
+            sample_correct_len = self.simulated_correct_len.repeat(bs)
+            sample_logits, rows_per_request = logits, self.stride
+            if vocab_shard:
+                sample_logits = lp.gather_deferred_rows(
+                    logits,
+                    row_index=bonus_row_index(sample_correct_len, bs, self.stride),
+                )
+                sample_correct_len, rows_per_request = (
+                    torch.zeros_like(sample_correct_len),
+                    1,
+                )
             # Before the TP broadcast in build_accept_outs: every rank commits rank 0's draw.
             bonus = (
                 simulated_bonus_sample_graph(
-                    target_logits=logits,
-                    correct_len=self.simulated_correct_len.repeat(bs),
+                    target_logits=sample_logits,
+                    correct_len=sample_correct_len,
                     temperatures=self.sim_temperatures_buf[:bs],
                     seed=self.sim_seed_buf,
                     bs=bs,
-                    rows_per_request=self.stride,
+                    rows_per_request=rows_per_request,
                 )
                 .to(bonus.dtype)
                 .view_as(bonus)
@@ -852,6 +907,7 @@ def build_accept_outs(
     target_logits: Optional[torch.Tensor] = None,
     simulate_bonus_sampling_info=None,
     out: Optional[AcceptOuts] = None,
+    target_logits_processor: Optional[LogitsProcessor] = None,
 ) -> AcceptOuts:
     """``out``: static buffers (the in-graph accept's) to copy the results into."""
     bs = correct_len.shape[0]
@@ -867,6 +923,7 @@ def build_accept_outs(
                 sampling_info=simulate_bonus_sampling_info,
                 bs=bs,
                 verify_num_draft_tokens=verify_num_draft_tokens,
+                target_logits_processor=target_logits_processor,
             )
     tp_sync.sync(sync_site, correct_len)
     tp_sync.sync(sync_site, bonus)
@@ -903,6 +960,14 @@ def build_accept_outs(
     return accept
 
 
+def bonus_row_index(
+    correct_len: torch.Tensor, bs: int, rows_per_request: int
+) -> torch.Tensor:
+    """Row of each request's correct_len in the [bs * rows_per_request, vocab] layout."""
+    rows = torch.arange(bs, device=correct_len.device) * rows_per_request
+    return rows + correct_len.to(torch.int64)
+
+
 def sample_simulated_bonus(
     *,
     target_logits: torch.Tensor,
@@ -911,9 +976,20 @@ def sample_simulated_bonus(
     sampling_info,
     bs: int,
     verify_num_draft_tokens: int,
+    target_logits_processor: Optional[LogitsProcessor] = None,
 ) -> torch.Tensor:
     """Temperature-sample every verify row and return the row at the (simulated)
     correct_len as the bonus token. Temperature only: callers exclude top-p/top-k/min-p."""
+    if (
+        target_logits_processor is not None
+        and target_logits_processor.is_deferred_shard(target_logits)
+    ):
+        # Only the bs sampled rows leave the vocab shard.
+        target_logits = target_logits_processor.gather_deferred_rows(
+            target_logits,
+            row_index=bonus_row_index(correct_len, bs, verify_num_draft_tokens),
+        )
+        correct_len, verify_num_draft_tokens = torch.zeros_like(correct_len), 1
     bonus = simulated_bonus_sample(
         target_logits=target_logits,
         correct_len=correct_len,
@@ -936,10 +1012,14 @@ def accept_draft_tokens(
     cutoff_layout: Optional[RaggedVerifyLayout] = None,
     fused_argmax: bool = False,
     block_verification: bool = False,
+    target_predict: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     greedy_mask = draft_block.greedy_mask
     cutoff_verify_lens = None if cutoff_layout is None else cutoff_layout.verify_lens
     all_greedy = sampling_info is None or sampling_info.is_all_greedy
+    assert target_predict is None or all_greedy, (
+        "a resolved target argmax (vocab-sharded logits) only serves the greedy accept"
+    )
     if all_greedy:
         return AcceptGreedy.execute(
             candidates=candidates,
@@ -947,6 +1027,7 @@ def accept_draft_tokens(
             verify_num_draft_tokens=verify_num_draft_tokens,
             cutoff_verify_lens=cutoff_verify_lens,
             fused_argmax=fused_argmax,
+            target_predict=target_predict,
         )
     if draft_block.greedy_draft:
         # An argmax draft is one-hot: rejection accepts at the target probability.
