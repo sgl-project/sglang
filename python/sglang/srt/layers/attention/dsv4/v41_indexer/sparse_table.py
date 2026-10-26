@@ -132,7 +132,7 @@ class SparseTableBackend:
         self._cached_row_ids: Optional[torch.Tensor] = None
         # captured graphs keep reading the buffers they saw
         self._retired_cached_row_ids: list = []
-        # per layer, newest first: the table tensors captured prefill buckets read
+        # per layer, newest first; graphs captured on older ones keep reading them
         self._graph_tables: dict = {}
 
     def publish_prefill(self, inputs: PrefillInputs):
@@ -219,10 +219,10 @@ class SparseTableBackend:
         transform(published.blocks, inputs.out_raw_indices)
 
     def prefill_graph_table(self, layer_id: int, num_rows: int) -> Optional[tuple]:
-        """Views over ``num_rows`` rows of the layer's newest table buffers, or None
-        before the candidate source first runs or when the rows outgrow them. Buckets
-        share them: graphs replay one at a time, and DeepGEMM finds schedule entries
-        from its header, so a smaller bucket never reads past its own."""
+        """The layer's newest table buffers cut to ``num_rows`` rows, or None when it
+        has none yet or they are too small. Buckets share the buffers, since graphs
+        replay one at a time; the schedule is not cut, as DeepGEMM reads its length
+        from the header."""
         tables = self._graph_tables.get(layer_id)
         if not tables or tables[0][0].shape[0] < num_rows:
             return None
@@ -237,9 +237,9 @@ class SparseTableBackend:
     def publish_prefill_graph(
         self, inputs: PrefillInputs, num_rows: int, table: Optional[tuple]
     ) -> None:
-        """Writes the candidate source's table over ``num_rows`` rows into ``table``,
-        first allocating the layer's buffers when the caller had none. Rows past the
-        live ones repeat the last."""
+        """Writes the candidate source's table into ``table``, padded to ``num_rows``
+        rows by repeating the last live row; allocates new buffers for the layer when
+        ``table`` is None."""
         published = self.publish_prefill(inputs)
         assert published is not None, "candidate source published no sparse table"
         live = published.blocks.shape[0]
