@@ -204,9 +204,8 @@ class RadixAttention(nn.Module):
         cache_n = n
         n = attention_query_tokens(forward_batch, n)
         return_lse = bool(kwargs.get("return_lse") or forward_batch.mha_return_lse)
-        if lse_output is not None and not return_lse:
-            # The graph was captured asking for an LSE this batch does not want.
-            lse_output.zero_()
+        if not return_lse:
+            # A buffer from a capture that wanted an LSE keeps what it holds.
             lse_output = None
         if n == 0:
             output.zero_()
