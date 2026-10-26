@@ -592,6 +592,7 @@ class TestUnifiedSWAHeadGeometry(CustomTestCase):
 
     def _configurator(self):
         cfg = kcc.KVCacheConfigurator.__new__(kcc.KVCacheConfigurator)
+        cfg.draft_parallel_layout = None
         cfg.is_hybrid_swa = True
         cfg.is_hybrid_swa_compress = False
         cfg.use_mla_backend = False
@@ -659,12 +660,14 @@ class TestFusedDraftDecision(CustomTestCase):
         dcp_size=1,
         hicache=False,
         retraction_backup=None,
+        draft_parallel_layout=None,
     ):
         from sglang.srt.configs.model_config import AttentionArch
         from sglang.srt.mem_cache import kv_cache_configurator as kvc
         from sglang.srt.speculative import draft_worker_common
 
         cfg = kvc.KVCacheConfigurator.__new__(kvc.KVCacheConfigurator)
+        cfg.draft_parallel_layout = draft_parallel_layout
         cfg.is_hybrid_swa = True
         cfg.mambaish_config = None
         cfg.use_mla_backend = False
@@ -730,6 +733,18 @@ class TestFusedDraftDecision(CustomTestCase):
 
     def test_a_stateless_draft_is_placed(self):
         self.assertIsNotNone(self._decide().placement)
+
+    def test_fused_placement_uses_resolved_width_for_every_protocol(self):
+        from sglang.srt.configs.draft_parallel import DraftParallelLayout
+
+        layout = DraftParallelLayout(tp_group=None, attn_tp_size=2)
+        for algorithm in ("EAGLE", "DFLASH", "DSPARK"):
+            with self.subTest(algorithm=algorithm):
+                decision = self._decide(
+                    algorithm=algorithm, tp_size=4, draft_parallel_layout=layout
+                )
+                self.assertIsNotNone(decision.placement, decision.declined)
+                self.assertEqual(decision.placement.region("full").head_num, 2)
 
     def test_cp_draft_placement_keeps_dp_isolated(self):
         for algorithm, cp, dp, heads in (

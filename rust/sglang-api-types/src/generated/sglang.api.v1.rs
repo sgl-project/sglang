@@ -590,6 +590,13 @@ pub struct GenerateMetaInfo {
     /// Omitted until terminal output; reported spans are always nonempty.
     #[prost(message, repeated, tag = "17")]
     pub weight_versions: ::prost::alloc::vec::Vec<WeightVersionSpan>,
+    /// Media prompt tokens per modality, on every frame; omitted when zero.
+    #[prost(uint32, optional, tag = "18")]
+    pub image_tokens: ::core::option::Option<u32>,
+    #[prost(uint32, optional, tag = "19")]
+    pub audio_tokens: ::core::option::Option<u32>,
+    #[prost(uint32, optional, tag = "20")]
+    pub video_tokens: ::core::option::Option<u32>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct WeightVersionSpan {
