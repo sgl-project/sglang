@@ -301,6 +301,9 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
             result.delay_sample_func = sample
         return result
 
+    def _war_barrier_is_coarse(self):
+        return True
+
     def _apply_war_barrier(self):
         pass
 
