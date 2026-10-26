@@ -2894,8 +2894,8 @@ class MHATokenToKVPool(KVCache):
             self._get_key_buffer(layer_id).unsqueeze(1),
             self._get_value_buffer(layer_id).unsqueeze(1),
             loc,
-            # Like the store_cache fallback, skip reserved slot 0. Unlike it, skip
-            # rather than device-assert on a slot outside [0, size + page_size).
+            # Slot 0 is the padding slot: store_cache skips it too, the naive fallback
+            # writes it. An out-of-range slot is skipped, where store_cache asserts.
             reserved_skip_index=0,
             size_limit=self.size + self.page_size,
         )

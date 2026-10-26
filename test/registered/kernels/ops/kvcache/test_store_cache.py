@@ -581,6 +581,64 @@ def test_can_store_kv_fused_cast_rejects_scales_that_divide() -> None:
     assert not _can_store(_PoolStub(), k_scale=torch.ones(1, device=DEVICE))
 
 
+class _SetKVPoolStub(_PoolStub):
+    """Adds the state set_kv_buffer's unfused store reads."""
+
+    _store_kv_layer = MHATokenToKVPool._store_kv_layer
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.row_dim = self.v_row_dim = GUARD_ROW
+        self.device_module = torch.cuda
+        self.alt_stream = None
+
+
+@pytest.mark.parametrize("scale_kind", ["host_one", "host", "tensor"])
+def test_set_kv_buffer_divides_unless_scale_is_host_one(scale_kind: str) -> None:
+    # A host 1.0 is never divided, so the caller's K/V stay untouched; host and tensor
+    # scales divide. Dividing by 1.0 can clear a NaN's sign, so NaN need only stay NaN.
+    pool = _SetKVPoolStub()
+    values = torch.arange(-(2**15), 2**15, dtype=torch.int32, device=DEVICE)
+    num_tokens = values.numel() // GUARD_ROW
+    cache_k = (
+        values.to(torch.int16)
+        .view(DTYPE)
+        .view(num_tokens, GUARD_HEAD_NUM, GUARD_HEAD_DIM)
+    )
+    cache_v = cache_k.flip(0)
+    scale = {
+        "host_one": 1.0,
+        "host": 2.0,
+        "tensor": torch.tensor(2.0, device=DEVICE),
+    }[scale_kind]
+    divisor = 1.0 if scale_kind == "host_one" else 2.0
+    sources = (cache_k, cache_v)
+    expected = [(src / divisor).to(pool.dtype).view(torch.uint8) for src in sources]
+    src_nan = [src.isnan() for src in sources]
+    versions = (cache_k._version, cache_v._version)
+    # store_cache skips the reserved padding slot 0.
+    loc = torch.arange(1, num_tokens + 1, dtype=torch.int64, device=DEVICE)
+
+    MHATokenToKVPool.set_kv_buffer(
+        pool,
+        SimpleNamespace(layer_id=0),
+        loc,
+        cache_k,
+        cache_v,
+        k_scale=scale,
+        v_scale=scale,
+    )
+
+    for buffer, want, nan in zip(
+        (pool.k_buffer[0], pool.v_buffer[0]), expected, src_nan
+    ):
+        got = buffer[loc]
+        torch.testing.assert_close(got[~nan], want[~nan], rtol=0.0, atol=0.0)
+        assert torch.all(_fp8_isnan(got[nan], pool.dtype)), "NaN must stay NaN"
+    if scale_kind == "host_one":
+        assert (cache_k._version, cache_v._version) == versions
+
+
 def test_can_store_kv_fused_cast_rejects_e5m2() -> None:
     assert not _can_store(_PoolStub(dtype=torch.float8_e5m2))
 
