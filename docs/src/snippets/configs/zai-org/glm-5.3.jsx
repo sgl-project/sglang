@@ -237,12 +237,12 @@ sgl-eval run aime25 \\
           flags: ["--speculative-algorithm EAGLE", "--speculative-num-steps 5",
                   "--speculative-eagle-topk 1", "--speculative-num-draft-tokens 6"],
           disable: { hw: ["mi355x", "mi325x", "mi300x"] },
-          disableReason: "MTP/EAGLE speculative decoding is not yet validated on AMD ROCm (MI300X/MI325X/MI355X): the gfx950 spec-decode draft kernel is not yet validated and at --speculative-num-steps > 3 hits a separate build issue; the DSA nextn draft path is CUDA-only." },
+          disableReason: "Not validated on AMD ROCm (MI300X/MI325X/MI355X): --speculative-num-steps > 3 hits a separate build issue on gfx950. MI355X runs EAGLE 3-1-4 in the agentic recipe of section 3.6." },
         { id: "mtp-112", label: "EAGLE / MTP 1-1-2 (balanced)",
           flags: ["--speculative-algorithm EAGLE", "--speculative-num-steps 1",
                   "--speculative-eagle-topk 1", "--speculative-num-draft-tokens 2"],
           disable: { hw: ["mi355x", "mi325x", "mi300x"] },
-          disableReason: "MTP/EAGLE speculative decoding is not yet validated on AMD ROCm (MI300X/MI325X/MI355X): the gfx950 spec-decode draft kernel is not yet validated and at --speculative-num-steps > 3 hits a separate build issue; the DSA nextn draft path is CUDA-only." },
+          disableReason: "Not validated on AMD ROCm (MI300X/MI325X/MI355X). MI355X runs EAGLE 3-1-4 in the agentic recipe of section 3.6." },
         { id: "dflash", label: "DFlash2 (block diffusion)",
           // Block-wise draft from a separate checkpoint, not the in-checkpoint
           // MTP layer. The block size (8) comes from the draft's own
@@ -1089,9 +1089,10 @@ sgl-eval run aime25 \\
 
     // ====================================================================
     // AMD MI300X / MI325X / MI355X (ROCm) — TP8, DSA tilelang backend.
-    // No MTP: disabled in the Speculative card for AMD (the gfx950 spec-decode
-    // draft kernel is not yet validated, and num-steps>3 hits a separate build
-    // issue). Strategies differ only by batch-shaping levers
+    // No MTP: the Speculative card keeps its presets off on AMD (num-steps>3
+    // hits a separate build issue on gfx950); MI355X runs EAGLE 3-1-4 in the
+    // MDX agentic recipe (section 3.6).
+    // Strategies differ only by batch-shaping levers
     // (cuda-graph-max-bs / max-running-requests / chunked-prefill):
     //   low-latency      — large chunked-prefill, default bs.
     //   balanced         — chunked-prefill 32768 + bs128, max-running 80.
