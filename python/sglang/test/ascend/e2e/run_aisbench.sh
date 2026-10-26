@@ -573,9 +573,17 @@ EOF
             echo "Input tokens: ${INPUT_LEN} | Output tokens: ${OUTPUT_LEN} | Batch size: ${BATCH_SIZE} | Prompts num: ${NUM_PROMPTS}"
             echo "Executing from temp dir: ${INTERNAL_TEMPLATE_DIR}"
 
+            # The toolkit parses --repeat_rate as a ratio: "100%" or "1" mean
+            # full overlap, while a bare "100" is out of the [0,1] range.
+            # Append a percent sign when the caller passed a percentage.
+            TOOLKIT_REPEAT_RATE="${REPEAT_RATE}"
+            if awk "BEGIN{exit !(${TOOLKIT_REPEAT_RATE:-0} > 1)}"; then
+                TOOLKIT_REPEAT_RATE="${TOOLKIT_REPEAT_RATE}%"
+            fi
+
             # The toolkit opens default_api.py relative to the cwd and writes
             # temp artifacts there, so run from inside the copied toolkit dir.
-            PREFIX_TEST_CMD="cd ${INTERNAL_TEMPLATE_DIR} && python3 aisbench_test.py --input_len ${INPUT_LEN} --output_len ${OUTPUT_LEN} --data_num ${NUM_PROMPTS} --concurrency ${BATCH_SIZE} --request_rate ${REQUEST_RATE} --dataset_type prefix_cache --repeat_rate ${REPEAT_RATE} --prefix_test --dp ${DP}"
+            PREFIX_TEST_CMD="cd ${INTERNAL_TEMPLATE_DIR} && python3 aisbench_test.py --input_len ${INPUT_LEN} --output_len ${OUTPUT_LEN} --data_num ${NUM_PROMPTS} --concurrency ${BATCH_SIZE} --request_rate ${REQUEST_RATE} --dataset_type prefix_cache --repeat_rate ${TOOLKIT_REPEAT_RATE} --prefix_test --dp ${DP}"
             echo "Executing: ${PREFIX_TEST_CMD}"
 
             source ${PYTHON_ENV_FOR_AISBENCH}/bin/activate
