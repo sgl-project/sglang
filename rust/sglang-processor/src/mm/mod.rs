@@ -1,15 +1,16 @@
 //! Multimodal preprocessing over `dynamo-multimodal`.
 
-use dynamo_multimodal::image::decode::{DecodeLimits, decode_rgb};
+use dynamo_multimodal::image::decode::DecodeLimits;
 use dynamo_multimodal::processor::{
     DecodedMedia, MmFamilyProcessor, NamedTensors, PositionOutput, ProcessedItem, Tensor,
 };
-use dynamo_multimodal::registry::ProcessorSpec;
 use dynamo_multimodal::{MmError, content_hash_bytes, token_layout};
 
 use crate::ProcessorError;
 
 mod models;
+
+pub use models::MmPipelineSpec;
 
 /// PIL raises `DecompressionBombError` above twice its default `MAX_IMAGE_PIXELS`.
 const PIL_DECOMPRESSION_BOMB_PIXELS: usize = 2 * 89_478_485;
@@ -17,6 +18,7 @@ const PIL_DECOMPRESSION_BOMB_PIXELS: usize = 2 * 89_478_485;
 /// One model's image pipeline, resolved once at boot and shared by every request.
 pub struct MmProcessor {
     family: Box<dyn MmFamilyProcessor>,
+    decode: models::Decode,
     limits: DecodeLimits,
 }
 
@@ -42,13 +44,15 @@ pub struct MmOutputItem {
 impl MmProcessor {
     /// The pipeline for a spec SGLang resolved from the model's HF processor
     /// (`rust_server/multimodal.py::RustMmProcessor.resolve_spec`).
-    pub fn from_spec(spec: ProcessorSpec) -> Result<Self, ProcessorError> {
+    pub fn from_spec(spec: MmPipelineSpec) -> Result<Self, ProcessorError> {
         let limits = DecodeLimits {
             max_pixels: Some(PIL_DECOMPRESSION_BOMB_PIXELS),
             ..DecodeLimits::default()
         };
+        let (family, decode) = models::build(spec).map_err(mm_error)?;
         Ok(Self {
-            family: models::build(spec).map_err(mm_error)?,
+            family,
+            decode,
             limits,
         })
     }
@@ -94,9 +98,8 @@ impl MmProcessor {
         })
     }
 
-    /// Python's Qwen path decodes with PIL and only `convert("RGB")`s: no EXIF transpose.
     fn process_image(&self, bytes: &[u8]) -> Result<ProcessedItem, ProcessorError> {
-        let (rgb, height, width) = decode_rgb(bytes, &self.limits).map_err(mm_error)?;
+        let (rgb, height, width) = (self.decode)(bytes, &self.limits).map_err(mm_error)?;
         self.family
             .process_item(&DecodedMedia::Image { rgb, height, width })
             .map_err(mm_error)

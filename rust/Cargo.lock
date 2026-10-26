@@ -4163,6 +4163,7 @@ dependencies = [
  "dynamo-tokenizers",
  "futures",
  "hf-hub",
+ "image",
  "minijinja",
  "regex",
  "serde",

@@ -8,8 +8,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 use sglang_processor::dynamo_multimodal::processor::{PositionOutput, TensorData};
-use sglang_processor::dynamo_multimodal::registry::ProcessorSpec;
-use sglang_processor::{MmOutput, MmProcessor};
+use sglang_processor::{MmOutput, MmPipelineSpec, MmProcessor};
 use sha2::{Digest, Sha256};
 
 fn fixtures() -> PathBuf {
@@ -48,7 +47,7 @@ fn check(fixture: &Value) -> Vec<String> {
 }
 
 fn check_case(case: &Value) -> Result<(), String> {
-    let spec: ProcessorSpec = serde_json::from_value(case["spec"].clone()).unwrap();
+    let spec: MmPipelineSpec = serde_json::from_value(case["spec"].clone()).unwrap();
     let images: Vec<Vec<u8>> = (case["images"].as_array().unwrap().iter())
         .map(|name| std::fs::read(fixtures().join("images").join(name.as_str().unwrap())).unwrap())
         .collect();

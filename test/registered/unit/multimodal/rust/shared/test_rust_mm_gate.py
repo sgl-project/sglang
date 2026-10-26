@@ -46,6 +46,11 @@ class TestRustMmGate(CustomTestCase):
         family = rust_mm_family_for(cls, "qwen2_5_vl")
         self.assertEqual(family and family.name, "qwen_vl")
 
+    def test_glm5_next_resolves_its_family(self):
+        cls = processor_cls_for("Glm5NextForConditionalGeneration", "glm5_next")
+        family = rust_mm_family_for(cls, "glm5_next")
+        self.assertEqual(family and family.name, "glm5_next")
+
     def test_deepseek_v41_resolves_its_family(self):
         cls = processor_cls_for("DeepseekV4ForCausalLM", "deepseek_v41")
         family = rust_mm_family_for(cls, "deepseek_v41")

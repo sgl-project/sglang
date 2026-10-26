@@ -3,11 +3,12 @@
 Usage:
     python tests/scripts/generate_mm_parity.py Qwen/Qwen2.5-VL-3B-Instruct --formats
     python tests/scripts/generate_mm_parity.py Qwen/Qwen3.5-0.8B
+    python tests/scripts/generate_mm_parity.py zai-org/GLM-5.3-Flash --formats
 
 Loads the checkpoint's processor through SGLang's own `get_processor` (so the
 backend and SGLang's processor kwargs apply), records the spec SGLang's Rust
-MM gate resolves from it, then runs each case through
-`QwenVLImageProcessor.process_mm_data_async` with images decoded by PIL and
+MM gate resolves from it, then runs each case through the model's SGLang
+processor's `process_mm_data_async` with images decoded by PIL and
 resized on CPU: the path `MmProcessor::process` must reproduce bit for bit.
 Writes the images it needs into `tests/fixtures/mm_parity/images/` when missing.
 """
@@ -30,12 +31,15 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.managers.multimodal_processor import import_processors  # noqa: E402
-from sglang.srt.multimodal.processors.qwen_vl import (  # noqa: E402
-    QwenVLImageProcessor,
+from sglang.srt.managers.multimodal_processor import (  # noqa: E402
+    get_mm_processor_cls,
+    import_processors,
 )
 from sglang.srt.runtime_context import publish, reset_context  # noqa: E402
-from sglang.srt.rust_server.multimodal import RustMmProcessor  # noqa: E402
+from sglang.srt.rust_server.multimodal import (  # noqa: E402
+    RUST_MM_FAMILIES,
+    RustMmProcessor,
+)
 from sglang.srt.server_args import ServerArgs  # noqa: E402
 from sglang.srt.utils.hf_transformers.processor import get_processor  # noqa: E402
 
@@ -160,11 +164,25 @@ RESIZE_SHAPES = [
 ]
 
 
-def cases(formats):
+# Per family: the chat template's ids around one image placeholder, and
+# `--mm-process-config` image overrides it mirrors.
+FAMILIES = {
+    "qwen_vl": (
+        ("vision_start_token_id", "vision_end_token_id"),
+        {"min_pixels": 64 * 64, "max_pixels": 320 * 320},
+    ),
+    "glm5_next": (
+        ("image_start_token_id", "image_end_token_id"),
+        {"min_image_tokens": 4, "max_image_tokens": 64},
+    ),
+}
+
+
+def cases(formats, family):
     """(name, images, backend, image_overrides) per case.
 
-    The backend only picks the resize kernel and decoding is model-independent,
-    so the format sweep (`formats`) is needed for one model only.
+    The backend only picks the resize kernel and decoding is the same for a
+    family's models, so the format sweep (`formats`) is needed for one model each.
     """
     for name in CORPUS if formats else RESIZE_SHAPES:
         yield name, [name], "auto", None
@@ -172,16 +190,11 @@ def cases(formats):
         for name in RESIZE_SHAPES:
             yield f"{name} pil", [name], "pil", None
     yield "two images", ["rgb_96x80.png", "rgb_333x251.jpg"], "auto", None
-    yield (
-        "pixel overrides",
-        ["large_800x600.jpg"],
-        "auto",
-        {"min_pixels": 64 * 64, "max_pixels": 320 * 320},
-    )
+    yield "pixel overrides", ["large_800x600.jpg"], "auto", FAMILIES[family][1]
 
 
 class PythonPath:
-    """SGLang's Qwen-VL processor over one checkpoint, one backend and one config."""
+    """SGLang's processor over one checkpoint, one backend and one config."""
 
     def __init__(self, model_dir, backend, image_overrides):
         mm_process_config = {"image": image_overrides} if image_overrides else {}
@@ -217,17 +230,18 @@ class PythonPath:
         )
         self.hf_config = AutoConfig.from_pretrained(model_dir)
         processor = get_processor(str(model_dir), image_processor_backend=backend)
-        self.processor = QwenVLImageProcessor(
+        import_processors("sglang.srt.multimodal.processors")
+        processor_cls = get_mm_processor_cls(self.hf_config)
+        self.processor = processor_cls(
             self.hf_config, server_args, processor, None, skip_mm_pool=True
         )
         # The CPU path: PIL decode (read by a classmethod), and CPU image kernels.
-        QwenVLImageProcessor.gpu_image_decode = False
+        processor_cls.gpu_image_decode = False
         self.processor._fast_image_processor_device = lambda _processor: "cpu"
         self.spec = self.rust_spec(server_args, processor)
 
     def rust_spec(self, server_args, processor):
         """The Dynamo `ProcessorSpec` the Rust server gets, from SGLang's own gate."""
-        import_processors("sglang.srt.multimodal.processors")
         # Skip __init__: it would load the processor again.
         host = RustMmProcessor.__new__(RustMmProcessor)
         host.model_config = SimpleNamespace(hf_config=self.hf_config)
@@ -244,11 +258,8 @@ class PythonPath:
 
     def prompt(self, num_images):
         config = self.hf_config
-        block = [
-            config.vision_start_token_id,
-            config.image_token_id,
-            config.vision_end_token_id,
-        ]
+        start, end = FAMILIES[self.spec["family"]][0]
+        block = [getattr(config, start), config.image_token_id, getattr(config, end)]
         text = self.processor._processor.tokenizer.encode(
             "Describe.", add_special_tokens=False
         )
@@ -323,8 +334,10 @@ def main():
         "pillow": PIL.__version__,
         "cases": [],
     }
+    model_type = AutoConfig.from_pretrained(model_dir).model_type
+    family = next(f.name for f in RUST_MM_FAMILIES if model_type in f.model_types)
     paths = {}
-    for name, image_names, backend, overrides in cases(args.formats):
+    for name, image_names, backend, overrides in cases(args.formats, family):
         key = (backend, repr(overrides))
         if key not in paths:
             paths[key] = PythonPath(model_dir, backend, overrides)
