@@ -27,9 +27,8 @@ from __future__ import annotations
 
 import copy
 import logging
-from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import ClassVar, Dict, List, NamedTuple, Optional, Tuple
+from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import torch
 from torch.profiler import record_function
@@ -38,15 +37,18 @@ from sglang.kernels.ops.kvcache.copy_pages import copy_pages
 from sglang.kernels.ops.kvcache.zero_pages import zero_pages
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.kv.layout.base import (
+    SubPoolSpec,
+    _check_row_alignment,
+    _store_dtype_for,
+)
 from sglang.srt.mem_cache.kv_vmm_backing import KvVmmBufferOwner
 from sglang.srt.mem_cache.layout.fused_draft import (
     DenseDraftRegion,
-    DraftRegion,
     DraftStateRegion,
     FusedDraftPlacement,
 )
 from sglang.srt.mem_cache.layout.token_major import (
-    ROW_ALIGN_BYTES,
     DenseEntryLayout,
     DensePart,
     align_entry_bytes,
@@ -78,70 +80,6 @@ def _prod(iterable) -> int:
     for x in iterable:
         out *= int(x)
     return out
-
-
-def _check_row_alignment(sub_pool: str, **row_bytes: int) -> None:
-    """Entry parts are laid out in ROW_ALIGN_BYTES units; a model whose
-    per-rank rows are not cannot use the unified pool."""
-    for part, nbytes in row_bytes.items():
-        if nbytes % ROW_ALIGN_BYTES:
-            raise ValueError(
-                f"--enable-unified-memory needs every per-rank KV row to be a "
-                f"multiple of {ROW_ALIGN_BYTES} bytes; sub-pool {sub_pool!r} has a "
-                f"{nbytes}-byte {part} row. Run this model without "
-                "--enable-unified-memory."
-            )
-
-
-def _store_dtype_for(kv_cache_dtype: torch.dtype) -> torch.dtype:
-    if kv_cache_dtype in (
-        torch.float8_e5m2,
-        torch.float8_e4m3fn,
-        torch.float8_e4m3fnuz,
-    ):
-        return torch.uint8
-    return kv_cache_dtype
-
-
-@dataclass(frozen=True, kw_only=True)
-class SubPoolSpec(ABC):
-    """Abstract per-slot layout of one sub-pool in a `UnifiedKVPool`.
-
-    ``grow_direction`` places the sub-pool in the buffer's chain: the two
-    ``"up"``/``"down"`` END pools own the buffer's two ends and grow inward;
-    ``"float"`` middles live between the ends' frontiers (a float's position is
-    carried entirely by its allocator's two watermarks — every view spans the
-    whole buffer, so relocation never rebuilds views).
-    """
-
-    # Grow directions this subclass accepts. Scratch-class specs (e.g. the
-    # spec-decode band) narrow this to ("float",).
-    _allowed_grow_directions: ClassVar[Tuple[str, ...]] = ("up", "down", "float")
-
-    name: str
-    layer_num: int
-    grow_direction: str  # "up" | "down" | "float"
-    # Fused draft region riding in this sub-pool's entries; None = unfused.
-    # Each kind accepts the region kind its entry can lay out, after the host
-    # block at `draft_offset_in_entry()`.
-    draft_region: Optional[DraftRegion] = None
-
-    def __post_init__(self):
-        assert self.grow_direction in self._allowed_grow_directions, (
-            f"{type(self).__name__}.grow_direction must be one of "
-            f"{self._allowed_grow_directions}; got {self.grow_direction!r}"
-        )
-        assert self.layer_num > 0, f"layer_num must be positive; got {self.layer_num}"
-
-    @abstractmethod
-    def entry_bytes(self) -> int:
-        """Bytes for one slot across all `layer_num` layers."""
-        raise NotImplementedError
-
-    @abstractmethod
-    def get_dtype(self) -> torch.dtype:
-        """Storage dtype (informational). Multi-dtype subclasses return the dominant buffer's."""
-        raise NotImplementedError
 
 
 @dataclass(frozen=True, kw_only=True)
