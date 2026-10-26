@@ -67,6 +67,25 @@ class TestAscendOpsDispatcherContracts(CustomTestCase):
         with self.assertRaisesRegex(NotImplementedError, "mc2.*fp8"):
             dispatcher._quant_mode("mc2")
 
+    # Protects AllGather row metadata when attention CP/DP creates uneven shards.
+    def test_allgather_row_sizes_use_actual_rank_local_rows(self):
+        def fake_all_gather(outputs, local_rows, group):
+            outputs[0].copy_(local_rows)
+            outputs[1].fill_(3)
+
+        with patch(
+            "sglang.srt.layers.moe.token_dispatcher.ascend_ops.dist.get_world_size",
+            return_value=2,
+        ), patch(
+            "sglang.srt.layers.moe.token_dispatcher.ascend_ops.dist.all_gather",
+            side_effect=fake_all_gather,
+        ):
+            row_sizes = AscendOpsDispatcher._allgather_row_sizes(
+                2, group=None, device=torch.device("cpu")
+            )
+
+        self.assertEqual(row_sizes, [2, 3])
+
     # Protects the forward-state handoff: combine must work without a cached
     # dispatch result stored on the dispatcher instance.
     def test_combine_uses_forward_state_instead_of_dispatcher_state(self):

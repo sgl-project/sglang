@@ -13,10 +13,7 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.dp_attention import (
-    get_dp_global_num_tokens,
-    get_is_extend_in_batch,
-)
+from sglang.srt.layers.dp_attention import get_is_extend_in_batch
 from sglang.srt.hardware_backend.npu.moe.routing import (
     INT8_QUANT_MODE,
     MXFP8_QUANT_MODE,
@@ -148,7 +145,6 @@ class AscendOpsDispatcher(BaseDispatcher):
         self.moe_ascend_ops_config = moe_ascend_ops_config or AscendOpsConfig()
         parallel = get_parallel()
         self.tp_group = parallel.tp_group.device_group
-        self.attn_tp_size = parallel.attn_tp_size
         self.ep_coordinator = parallel.moe_ep_group
         self.ep_group = self.ep_coordinator.device_group
         self.ep_size = self.ep_coordinator.world_size
@@ -163,13 +159,12 @@ class AscendOpsDispatcher(BaseDispatcher):
         if self.moe_ascend_ops_config.prefill == "allgather":
             if not (
                 parallel.tp_size == parallel.moe_ep_size
-                and parallel.attn_cp_size == 1
                 and self.num_local_experts * self.ep_size == self.num_experts
                 and not moe_runner_config.num_fused_shared_experts
             ):
                 raise ValueError(
-                    "NPU AllGather requires TP=EP, Attention CP=1, "
-                    "contiguous expert placement and no fused shared experts"
+                    "NPU AllGather requires TP=EP, contiguous expert placement "
+                    "and no fused shared experts"
                 )
 
     def set_quant_config(self, quant_config: dict) -> None:
@@ -423,6 +418,20 @@ class AscendOpsDispatcher(BaseDispatcher):
 
     # Prefill: AllGather
 
+    @staticmethod
+    def _allgather_row_sizes(local_rows: int, group, device) -> list[int]:
+        """Exchange the actual token rows contributed by every TP rank."""
+
+        world_size = dist.get_world_size(group)
+        local_rows_tensor = torch.tensor(
+            [local_rows], dtype=torch.int64, device=device
+        )
+        gathered_rows = [
+            torch.empty_like(local_rows_tensor) for _ in range(world_size)
+        ]
+        dist.all_gather(gathered_rows, local_rows_tensor, group=group)
+        return [int(rows.item()) for rows in gathered_rows]
+
     def _dispatch_allgather(self, hidden_states, topk_weights, topk_ids, group):
         """Gather the full batch on every TP rank."""
         input_dtype = hidden_states.dtype
@@ -431,21 +440,15 @@ class AscendOpsDispatcher(BaseDispatcher):
             raise NotImplementedError(
                 "NPU AllGather supports BF16, INT8 and MXFP8 routing"
             )
-        world_size = dist.get_world_size(group)
-        sizes = get_dp_global_num_tokens()
-        if sizes is None:
-            raise RuntimeError("NPU AllGather requires scheduler DP token counts")
-        row_sizes = []
-        for rows in sizes:
-            base, extra = divmod(rows, self.attn_tp_size)
-            row_sizes.extend(
-                base + (rank < extra) for rank in range(self.attn_tp_size)
-            )
-        if (
-            len(row_sizes) != world_size
-            or row_sizes[dist.get_rank(group)] != hidden_states.shape[0]
-        ):
-            raise ValueError("NPU AllGather input rows disagree with DP token counts")
+        # CP and DP can split a batch unevenly (for example with interleaved or
+        # zigzag schedules).  Deriving row counts from DP metadata assumes an
+        # equal split and becomes incorrect as soon as CP is enabled.  Exchange
+        # the actual local row count so the subsequent padded all-gather and
+        # reduce-scatter use the exact layout produced by the attention path.
+        row_sizes = self._allgather_row_sizes(
+            hidden_states.shape[0], group, hidden_states.device
+        )
+        world_size = len(row_sizes)
         max_rows = max(row_sizes)
         if max_rows == 0:
             raise RuntimeError("NPU prefill requires at least one global token")
