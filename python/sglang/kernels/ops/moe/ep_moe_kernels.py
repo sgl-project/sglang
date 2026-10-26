@@ -145,13 +145,27 @@ def deepep_post_reorder_triton_kernel(
 
 @triton.jit
 def compute_src2dst_triton_kernel(
-    reorder_ids, src2dst, num_toks, BLOCK_SIZE: tl.constexpr
+    sorted_topk_ids, reorder_ids, src2dst, num_toks, BLOCK_SIZE: tl.constexpr
 ):
+    first_nonnegative = 0
+    if tl.load(sorted_topk_ids) < 0:
+        left, right = 0, num_toks
+        while left < right:
+            middle = left + (right - left) // 2
+            expert_id = tl.load(sorted_topk_ids + middle)
+            if expert_id < 0:
+                left = middle + 1
+            else:
+                right = middle
+        first_nonnegative = left
+
     pid = tl.program_id(axis=0)
     dst_id = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = dst_id < num_toks
     src_id = tl.load(reorder_ids + dst_id, mask=mask)
-    tl.store(src2dst + src_id, dst_id, mask=mask)
+    # Native expert offsets omit negative IDs, so packed rows must omit that prefix.
+    packed_id = tl.where(dst_id >= first_nonnegative, dst_id - first_nonnegative, -1)
+    tl.store(src2dst + src_id, packed_id, mask=mask)
 
 
 @triton.jit
@@ -189,16 +203,93 @@ def deepep_run_moe_deep_preprocess(topk_ids: torch.Tensor, num_experts: int):
 
 
 def cutlass_w4_run_moe_ep_preproess(topk_ids: torch.Tensor):
-    _, reorder_ids = torch.sort(topk_ids.view(-1), stable=True)
+    src2dst = torch.empty(topk_ids.numel(), device=topk_ids.device, dtype=torch.int32)
+    if topk_ids.numel() == 0:
+        return src2dst
+    sorted_topk_ids, reorder_ids = torch.sort(topk_ids.view(-1), stable=True)
 
     BLOCK_SIZE = 512
     grid = (triton.cdiv(topk_ids.numel(), BLOCK_SIZE),)
-    src2dst = torch.empty(topk_ids.numel(), device=topk_ids.device, dtype=torch.int32)
     compute_src2dst_triton_kernel[grid](
-        reorder_ids, src2dst, topk_ids.numel(), BLOCK_SIZE
+        sorted_topk_ids, reorder_ids, src2dst, topk_ids.numel(), BLOCK_SIZE
     )
 
     return src2dst
+
+
+@triton.jit
+def _compute_cutlass_w4a8_moe_input_scale_kernel(
+    input_ptr,
+    topk_ids_ptr,
+    output_s_ptr,
+    stride_input_row,
+    stride_input_col,
+    stride_ids_row,
+    stride_ids_col,
+    hidden_size: tl.constexpr,
+    topk: tl.constexpr,
+    num_local_experts: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    BLOCK_TOPK: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    routes = tl.arange(0, BLOCK_TOPK)
+    expert_ids = tl.load(
+        topk_ids_ptr + row * stride_ids_row + routes * stride_ids_col,
+        mask=routes < topk,
+        other=-1,
+    )
+    local_route = (expert_ids >= 0) & (expert_ids < num_local_experts)
+    active = tl.sum(local_route.to(tl.int32), 0) > 0
+    columns = tl.arange(0, BLOCK_SIZE)
+    values = tl.load(
+        input_ptr + row * stride_input_row + columns * stride_input_col,
+        mask=(columns < hidden_size) & active,
+        other=0.0,
+    ).to(tl.float32)
+    absmax = tl.max(tl.abs(values), 0)
+    tl.atomic_max(output_s_ptr, absmax / FP8_MAX, sem="relaxed")
+
+
+def compute_cutlass_w4a8_moe_input_scale(
+    input: torch.Tensor,
+    topk_ids: torch.Tensor,
+    output_s: torch.Tensor,
+    num_local_experts: int,
+):
+    """Accumulate the FP8 scale from rows with a local expert route.
+
+    The caller initializes output_s to its minimum finite scale. Inputs and IDs
+    are preserved, and fully inactive rows never load activations, including NaNs.
+    """
+    assert input.ndim == 2
+    assert input.dtype in (torch.float16, torch.bfloat16, torch.float32)
+    assert topk_ids.ndim == 2 and topk_ids.shape[0] == input.shape[0]
+    assert topk_ids.dtype in (torch.int32, torch.int64)
+    assert output_s.numel() == 1 and output_s.dtype == torch.float32
+    assert input.is_cuda
+    assert input.device == topk_ids.device == output_s.device
+    if input.numel() == 0 or topk_ids.shape[1] == 0:
+        return
+    hidden_size = input.shape[1]
+    block_size = triton.next_power_of_2(max(1, hidden_size))
+    _compute_cutlass_w4a8_moe_input_scale_kernel[(input.shape[0],)](
+        input,
+        topk_ids,
+        output_s,
+        input.stride(0),
+        input.stride(1),
+        topk_ids.stride(0),
+        topk_ids.stride(1),
+        hidden_size=hidden_size,
+        topk=topk_ids.shape[1],
+        num_local_experts=num_local_experts,
+        FP8_MAX=torch.finfo(torch.float8_e4m3fn).max,
+        BLOCK_SIZE=block_size,
+        BLOCK_TOPK=triton.next_power_of_2(topk_ids.shape[1]),
+        num_warps=4 if block_size < 4096 else 8,
+    )
 
 
 @triton.jit
@@ -241,7 +332,7 @@ def pre_reorder_triton_kernel_for_cutlass_moe(
         out_data = (in_data * a1_scale).to(OutDtype)
         for idx in range(topk):
             expert_id = tl.load(token_topk_ids_ptr + idx)
-            if expert_id != num_local_experts:
+            if (expert_id >= 0) & (expert_id < num_local_experts):
                 dst_idx = tl.load(token_src2dst_ptr + idx).to(tl.int64)
                 tl.store(dst_ptr_offs + dst_idx * hidden_size, out_data, mask=mask)
 
@@ -855,7 +946,7 @@ def post_reorder_triton_kernel_for_cutlass_moe(
         sum_vec = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
         for idx in range(topk):
             expert_id = tl.load(token_topk_ids_ptr + idx)
-            if expert_id != num_local_experts:
+            if (expert_id >= 0) & (expert_id < num_local_experts):
                 dst_idx_int32 = tl.load(token_src2dst_ptr + idx)
                 dst_idx = dst_idx_int32.to(tl.int64)
                 dst_idx = dst_idx

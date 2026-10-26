@@ -83,8 +83,13 @@ from sglang.srt.entrypoints.openai.responses_adapters import (
     encode_custom_tool_input,
     encode_reasoning_state,
     label_developer_content,
+    namespace_function_names,
+    namespace_functions,
 )
-from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
+from sglang.srt.entrypoints.openai.serving_chat import (
+    OpenAIServingChat,
+    _incomplete_tool_call_indices,
+)
 from sglang.srt.entrypoints.openai.tool_server import MCPToolServer, ToolServer
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
 from sglang.srt.entrypoints.openai.utils import to_openai_style_logprobs
@@ -489,6 +494,11 @@ class OpenAIServingResponses(OpenAIServingChat):
                         not processed_messages.skip_special_tokens
                     ):
                         sampling_params["skip_special_tokens"] = False
+                    if (
+                        processed_messages is not None
+                        and processed_messages.uses_response_template
+                    ):
+                        sampling_params["spaces_between_special_tokens"] = False
 
                     context: ConversationContext
                     if self.use_harmony:
@@ -575,6 +585,15 @@ class OpenAIServingResponses(OpenAIServingChat):
 
             assert len(generators) == 1
             (result_generator,) = generators
+            if (
+                processed_messages is not None
+                and processed_messages.uses_response_template
+            ):
+                self._set_response_parser_context(
+                    request,
+                    adapted_request,
+                    tool_call_constraint=processed_messages.tool_call_constraint,
+                )
 
             # Store the input messages
             persist = self.enable_response_store and bool(request.store)
@@ -689,6 +708,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             reasoning_effort=(request.reasoning.effort if request.reasoning else None),
             chat_template_kwargs=request.chat_template_kwargs,
         )
+        chat_request._template_tools = self._response_tools_to_template_tools(request)
 
         media_error = self._validate_media_content(chat_request)
         if media_error:
@@ -799,7 +819,15 @@ class OpenAIServingResponses(OpenAIServingChat):
             )
             output = self._make_response_output_items(
                 request,
-                final_res["text"],
+                self._drop_kept_tool_close(
+                    final_res["text"],
+                    (
+                        meta_info.get("finish_reason")
+                        if isinstance(meta_info, dict)
+                        else None
+                    ),
+                    request,
+                ),
                 tokenizer,
                 output_logprobs=output_logprobs,
                 require_reasoning=require_reasoning,
@@ -928,10 +956,14 @@ class OpenAIServingResponses(OpenAIServingChat):
 
     @staticmethod
     def _make_tool_call_item(
-        name: str, arguments: str, custom_names: set[str]
+        name: str,
+        arguments: str,
+        custom_names: set[str],
+        namespace_names: Optional[dict[str, tuple[str, str]]] = None,
     ) -> Union[ResponseFunctionToolCall, ResponseCustomToolCall]:
         """A call against a ``custom`` tool reports its freeform payload rather
-        than the JSON arguments of the shim function tool."""
+        than the JSON arguments of the shim function tool. A call against a
+        namespace member reports ``namespace`` and the bare function ``name``."""
         call_id = f"call_{random_uuid()[:24]}"
         if name in custom_names:
             return ResponseCustomToolCall(
@@ -941,6 +973,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 name=name,
                 input=decode_custom_tool_input(arguments),
             )
+        namespace, name = (namespace_names or {}).get(name, (None, name))
         return ResponseFunctionToolCall(
             arguments=arguments,
             call_id=call_id,
@@ -948,6 +981,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             name=name,
             id=f"fc_{random_uuid()[:8]}",
             status="completed",
+            **({"namespace": namespace} if namespace else {}),
         )
 
     @staticmethod
@@ -1037,10 +1071,17 @@ class OpenAIServingResponses(OpenAIServingChat):
     ):
         chat_tools = self._response_tools_to_chat_tools(request)
         custom_names = custom_tool_names(request.tools)
+        namespace_names = (
+            namespace_function_names(request.tools)
+            if self.tool_call_parser == "muse"
+            else {}
+        )
         encoding_output = self._encoding_output()
         if encoding_output is not None:
             required_json = self._uses_required_tool_json(request, chat_tools)
             reasoning_content, content, calls = encoding_output.parse_responses_output(
+                request=request,
+                require_reasoning=require_reasoning,
                 output_ids=output_ids or [],
                 finish_reason=finish_reason,
                 separate_reasoning=bool(self.reasoning_parser),
@@ -1051,11 +1092,13 @@ class OpenAIServingResponses(OpenAIServingChat):
             )
             if required_json and content:
                 content, tool_call_items = self._parse_required_tool_json(
-                    content, custom_names
+                    content, custom_names, namespace_names
                 )
             else:
                 tool_call_items = [
-                    self._make_tool_call_item(call.name, call.parameters, custom_names)
+                    self._make_tool_call_item(
+                        call.name, call.parameters, custom_names, namespace_names
+                    )
                     for call in calls
                 ]
         else:
@@ -1064,6 +1107,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 final_output,
                 chat_tools,
                 custom_names,
+                namespace_names=namespace_names,
                 require_reasoning=require_reasoning,
             )
 
@@ -1104,6 +1148,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         chat_tools: list[Tool],
         custom_names: set[str],
         *,
+        namespace_names: dict[str, tuple[str, str]],
         require_reasoning: bool,
     ) -> tuple[
         Optional[str],
@@ -1122,9 +1167,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                 request=request,
                 tokenizer=self.tokenizer_manager.tokenizer,
                 tool_call_parser_active=bool(
-                    chat_tools
-                    and self.tool_call_parser
-                    and request.tool_choice != "none"
+                    self.tool_call_parser
+                    and self._tool_parsing_active(request, chat_tools)
                 ),
             )
             reasoning_content, content = reasoning_parser.parse_non_stream(final_output)
@@ -1141,15 +1185,15 @@ class OpenAIServingResponses(OpenAIServingChat):
         detector_owns_format = False
         if (
             content
-            and chat_tools
             and self.tool_call_parser
-            and request.tool_choice != "none"
+            and self._tool_parsing_active(request, chat_tools)
         ):
             parser = FunctionCallParser(
                 chat_tools,
                 self.tool_call_parser,
                 tokenizer=self.tokenizer_manager.tokenizer,
                 tool_choice=tool_choice,
+                prefix=request._response_parser_prefix,
             )
             detector_owns_format = self._tool_parser_owns_format(parser)
             should_try_native = not is_required or detector_owns_format
@@ -1162,6 +1206,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                                 call_info.name,
                                 call_info.parameters or "",
                                 custom_names,
+                                namespace_names,
                             )
                         )
                     parsed_via_native = bool(call_info_list)
@@ -1170,17 +1215,22 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         if (
             content
-            and chat_tools
+            and self._tool_parsing_active(request, chat_tools)
             and is_required
             and not parsed_via_native
             and not detector_owns_format
         ):
-            content, json_items = self._parse_required_tool_json(content, custom_names)
+            content, json_items = self._parse_required_tool_json(
+                content, custom_names, namespace_names
+            )
             tool_call_items.extend(json_items)
         return reasoning_content, content, tool_call_items
 
     def _parse_required_tool_json(
-        self, content: str, custom_names: set[str]
+        self,
+        content: str,
+        custom_names: set[str],
+        namespace_names: Optional[dict[str, tuple[str, str]]] = None,
     ) -> tuple[str, list[Union[ResponseFunctionToolCall, ResponseCustomToolCall]]]:
         tool_call_items = []
         try:
@@ -1195,7 +1245,9 @@ class OpenAIServingResponses(OpenAIServingChat):
                         tool.get("parameters", {}), ensure_ascii=False
                     )
                     tool_call_items.append(
-                        self._make_tool_call_item(tool["name"], arguments, custom_names)
+                        self._make_tool_call_item(
+                            tool["name"], arguments, custom_names, namespace_names
+                        )
                     )
                 content = ""
         except Exception as e:
@@ -1225,6 +1277,14 @@ class OpenAIServingResponses(OpenAIServingChat):
     ) -> bool:
         return bool(
             chat_tools and self.tool_call_parser and request.tool_choice != "none"
+        )
+
+    @staticmethod
+    def _tool_parsing_active(request: ResponsesRequest, chat_tools: list) -> bool:
+        return bool(
+            chat_tools
+            and request.tool_choice != "none"
+            and not request._response_parser_json_response_format
         )
 
     @staticmethod
@@ -1273,12 +1333,29 @@ class OpenAIServingResponses(OpenAIServingChat):
             return tool_choice
         return {"type": "function", "function": {"name": tool_choice["name"]}}
 
-    @staticmethod
-    def _response_tools_to_chat_tools(request: ResponsesRequest) -> list[Tool]:
+    def _response_tools_to_chat_tools(self, request: ResponsesRequest) -> list[Tool]:
         # ``function`` and ``custom`` tools flow to chat; built-ins go through
         # harmony. A custom tool is shimmed into a single-string function tool.
         chat_tools = []
+        is_muse = self.tool_call_parser == "muse"
         for tool in request.tools:
+            if is_muse and tool.type == "namespace" and tool.name:
+                # Members are called as ``<namespace>.<function>``; register those
+                # names so the tool-call parser accepts the calls.
+                for member in namespace_functions(tool):
+                    chat_tools.append(
+                        Tool(
+                            type="function",
+                            function=Function(
+                                name=f"{tool.name}.{member['name']}",
+                                description=member.get("description"),
+                                parameters=member.get("parameters"),
+                                strict=bool(member.get("strict", False)),
+                                defer_loading=member.get("defer_loading"),
+                            ),
+                        )
+                    )
+                continue
             if tool.type == "function":
                 description, parameters = tool.description, tool.parameters
             elif tool.type == "custom" and tool.name:
@@ -1294,10 +1371,50 @@ class OpenAIServingResponses(OpenAIServingChat):
                         description=description,
                         parameters=parameters,
                         strict=tool.strict,
+                        defer_loading=tool.defer_loading if is_muse else None,
                     ),
                 )
             )
         return chat_tools
+
+    def _response_tools_to_template_tools(
+        self,
+        request: ResponsesRequest,
+    ) -> Optional[list[dict]]:
+        """Tools for Muse's chat template when the request has namespace tools:
+        namespaces stay nested, so the template can render namespace metadata and
+        namespace-level ``defer_loading``. None keeps the flattened tool list."""
+        if self.tool_call_parser != "muse" or not any(
+            tool.type == "namespace" for tool in request.tools
+        ):
+            return None
+        template_tools: list[dict] = []
+        for tool in request.tools:
+            if tool.type == "namespace" and tool.name:
+                namespace = {
+                    "type": "namespace",
+                    "name": tool.name,
+                    "description": tool.description or "",
+                    "tools": [dict(member) for member in namespace_functions(tool)],
+                }
+                if tool.defer_loading is not None:
+                    namespace["defer_loading"] = tool.defer_loading
+                template_tools.append(namespace)
+            elif tool.type in ("function", "custom") and tool.name:
+                function = {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.parameters,
+                }
+                if tool.type == "custom":
+                    function["description"] = custom_tool_description(
+                        tool.description, tool.format
+                    )
+                    function["parameters"] = custom_tool_parameters()
+                if tool.defer_loading is not None:
+                    function["defer_loading"] = tool.defer_loading
+                template_tools.append({"type": "function", "function": function})
+        return template_tools
 
     @staticmethod
     def _normalize_response_content_part_for_chat(content_part: Any) -> Any:
@@ -1320,7 +1437,11 @@ class OpenAIServingResponses(OpenAIServingChat):
                 image_url_obj = {"url": image_url}
             if not image_url_obj.get("detail"):
                 image_url_obj["detail"] = content_part.get("detail") or "auto"
-            for key in ("min_dynamic_patch", "max_dynamic_patch"):
+            for key in (
+                "min_dynamic_patch",
+                "max_dynamic_patch",
+                "max_long_side_pixel",
+            ):
                 if key in content_part and key not in image_url_obj:
                     image_url_obj[key] = content_part[key]
             return {"type": "image_url", "image_url": image_url_obj}
@@ -1365,7 +1486,9 @@ class OpenAIServingResponses(OpenAIServingChat):
         }
 
     @classmethod
-    def _normalize_response_message_for_chat(cls, message: Any) -> Any:
+    def _normalize_response_message_for_chat(
+        cls, message: Any, *, tool_call_parser: Optional[str] = None
+    ) -> Any:
         """Convert one Responses-API input item to a chat-completions message."""
         if hasattr(message, "model_dump"):
             message = message.model_dump(exclude_none=True)
@@ -1399,7 +1522,10 @@ class OpenAIServingResponses(OpenAIServingChat):
                 raw = orjson.dumps(raw).decode("utf-8")
             else:
                 raw = "{}"
-            return cls._chat_tool_call_message(message, message.get("name"), raw)
+            name = message.get("name")
+            if tool_call_parser == "muse" and message.get("namespace"):
+                name = f"{message['namespace']}.{name}"
+            return cls._chat_tool_call_message(message, name, raw)
         if msg_type == "custom_tool_call":
             # Replay through the same single-string shim the tool was offered as.
             return cls._chat_tool_call_message(
@@ -1547,7 +1673,9 @@ class OpenAIServingResponses(OpenAIServingChat):
             )
 
         for input_item in self._response_input_history(request):
-            normalized = self._normalize_response_message_for_chat(input_item)
+            normalized = self._normalize_response_message_for_chat(
+                input_item, tool_call_parser=self.tool_call_parser
+            )
             if normalized is not None:
                 messages.append(normalized)
 
@@ -2099,11 +2227,18 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         chat_tools = self._response_tools_to_chat_tools(request)
         custom_names = custom_tool_names(request.tools)
+        namespace_names = (
+            namespace_function_names(request.tools)
+            if self.tool_call_parser == "muse"
+            else {}
+        )
         tool_choice = request.effective_tool_choice()
         required_json = self._uses_required_tool_json(request, chat_tools)
         encoding_output = self._encoding_output()
         token_stream = (
             encoding_output.new_responses_stream(
+                request=request,
+                require_reasoning=require_reasoning,
                 separate_reasoning=bool(self.reasoning_parser),
                 parse_tool_calls=(
                     self._tool_call_parsing_enabled(request, chat_tools)
@@ -2116,14 +2251,17 @@ class OpenAIServingResponses(OpenAIServingChat):
         tool_parser: Optional[Union[FunctionCallParser, JsonArrayParser]] = None
         if required_json:
             tool_parser = JsonArrayParser()
-        elif token_stream is None and self._tool_call_parsing_enabled(
-            request, chat_tools
+        elif (
+            token_stream is None
+            and self._tool_call_parsing_enabled(request, chat_tools)
+            and not request._response_parser_json_response_format
         ):
             tool_parser = FunctionCallParser(
                 chat_tools,
                 self.tool_call_parser,
                 tokenizer=self.tokenizer_manager.tokenizer,
                 tool_choice=tool_choice,
+                prefix=request._response_parser_prefix,
             )
         reasoning_parser_obj: Optional[ReasoningParser] = None
         if token_stream is None and self.reasoning_parser:
@@ -2318,6 +2456,9 @@ class OpenAIServingResponses(OpenAIServingChat):
             message_state["open"] = False
             return events
 
+        def _namespace_field(state: dict) -> dict:
+            return {"namespace": state["namespace"]} if state["namespace"] else {}
+
         def _close_tool_call_state(tool_index: int):
             state = tool_call_states.get(tool_index)
             if state is None or state.get("done"):
@@ -2363,13 +2504,19 @@ class OpenAIServingResponses(OpenAIServingChat):
                     )
                 )
             else:
+                item_status = (
+                    "incomplete"
+                    if tool_index in _incomplete_tool_call_indices(tool_parser)
+                    else "completed"
+                )
                 completed_item = ResponseFunctionToolCall(
                     arguments=arguments,
                     call_id=state["call_id"],
                     name=state["name"] or "",
                     type="function_call",
                     id=state["item_id"],
-                    status="completed",
+                    status=item_status,
+                    **_namespace_field(state),
                 )
                 events.append(
                     _send_event(
@@ -2429,6 +2576,10 @@ class OpenAIServingResponses(OpenAIServingChat):
                     else:
                         delta = text[stream_offset:]
                         stream_offset = len(text)
+                    if finish_reason is not None:
+                        delta = self._drop_kept_tool_close(
+                            delta, finish_reason, request
+                        )
                     if not delta and finish_reason is None:
                         continue
                     # finish_reason is sticky, so it would otherwise re-flush.
@@ -2536,6 +2687,10 @@ class OpenAIServingResponses(OpenAIServingChat):
                     normal_text, tool_calls = self._drain_json_array(
                         tool_parser, delta, chat_tools
                     )
+                    if flush:
+                        end = tool_parser.finish(chat_tools)
+                        normal_text += end.normal_text
+                        tool_calls = list(tool_calls) + end.calls
                 elif token_stream is not None:
                     normal_text, tool_calls = delta, token_calls
                 elif tool_parser is not None:
@@ -2575,6 +2730,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                             current_output_index += 1
                             name = call.name or ""
                             is_custom = name in custom_names
+                            namespace, name = namespace_names.get(name, (None, name))
                             state = {
                                 "item_id": (
                                     f"ctc_{random_uuid()[:8]}"
@@ -2584,6 +2740,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                                 "call_id": f"call_{random_uuid()[:24]}",
                                 "output_index": current_output_index,
                                 "name": name,
+                                "namespace": namespace,
                                 "arguments": "",
                                 "custom": is_custom,
                                 "payload": "",
@@ -2609,6 +2766,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                                     type="function_call",
                                     id=state["item_id"],
                                     status="in_progress",
+                                    **_namespace_field(state),
                                 )
                             yield _send_event(
                                 openai_responses_types.ResponseOutputItemAddedEvent(

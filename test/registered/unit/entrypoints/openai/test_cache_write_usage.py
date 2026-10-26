@@ -1,6 +1,9 @@
 """Measured cache writes must retain their meaning on the API wire."""
 
+import asyncio
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
@@ -88,6 +91,62 @@ class TestCacheWriteUsage(CustomTestCase):
             enable_cache_report=True,
         )
         self.assertIsNone(usage.prompt_tokens_details.cache_write_tokens)
+
+    def test_encoding_output_multi_choice_continuous_writes_remain_unknown(self):
+        from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
+        from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
+
+        for n in (1, 2):
+            with self.subTest(n=n):
+                server = OpenAIServingChat.__new__(OpenAIServingChat)
+                server.chat_encoding_spec = None
+                seen = []
+                adapter = SimpleNamespace(
+                    stream_chat_chunks=lambda **kwargs: (
+                        seen.append(kwargs["usage"]) or []
+                    )
+                )
+                server._encoding_output = lambda: adapter
+                request = ChatCompletionRequest(
+                    model="test", messages=[{"role": "user", "content": "test"}], n=n
+                )
+
+                async def collect():
+                    async for _ in server._generate_stream_content(
+                        {
+                            "meta_info": {
+                                "prompt_tokens": 20,
+                                "cached_tokens": 4,
+                                "cache_write_tokens": 16,
+                            }
+                        },
+                        0,
+                        request,
+                        0,
+                        {},
+                        {},
+                        {},
+                        {},
+                        None,
+                        None,
+                        True,
+                        {},
+                        {},
+                        {},
+                    ):
+                        pass
+
+                with patch(
+                    "sglang.srt.entrypoints.openai.serving_chat.get_serving",
+                    return_value=SimpleNamespace(enable_cache_report=True),
+                ):
+                    asyncio.run(collect())
+                self.assertEqual(len(seen), 1)
+                details = seen[0]["prompt_tokens_details"]
+                if n == 1:
+                    self.assertEqual(details["cache_write_tokens"], 16)
+                else:
+                    self.assertNotIn("cache_write_tokens", details)
 
 
 if __name__ == "__main__":

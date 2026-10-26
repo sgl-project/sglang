@@ -274,10 +274,12 @@ class TestCacheWriteReportingWindowTransport(CustomTestCase):
             OpenAIServingResponses,
         )
 
-        async def run(encoding, stream):
+        async def run(encoding, stream, uses_response_template):
             server = OpenAIServingResponses.__new__(OpenAIServingResponses)
             server.chat_encoding_spec = encoding
-            server.tokenizer_manager = SimpleNamespace(tokenizer=None)
+            server.tokenizer_manager = SimpleNamespace(
+                tokenizer=SimpleNamespace(decode=lambda *a, **k: "rendered prefix")
+            )
             server.enable_response_store = False
             server.use_harmony = False
             server.tool_server = None
@@ -294,6 +296,7 @@ class TestCacheWriteReportingWindowTransport(CustomTestCase):
                 audio_data=None,
                 modalities=None,
                 require_reasoning=False,
+                uses_response_template=uses_response_template,
             )
 
             async def make_request(*args):
@@ -317,11 +320,10 @@ class TestCacheWriteReportingWindowTransport(CustomTestCase):
             server._generate_with_builtin_tools = generate
             server.responses_stream_generator_non_harmony = lambda *a, **k: "stream"
             server.responses_full_generator = full
-            result = await server.create_responses(
-                ResponsesRequest(
-                    model="test", input="hello", stream=stream, store=False
-                )
+            request = ResponsesRequest(
+                model="test", input="hello", stream=stream, store=False
             )
+            result = await server.create_responses(request)
             self.assertEqual(result, "stream" if stream else "full")
             self.assertEqual(len(captured), 1)
             self.assertEqual(len(captured[0].input_ids), 512)
@@ -329,11 +331,18 @@ class TestCacheWriteReportingWindowTransport(CustomTestCase):
                 captured[0]._cache_write_reporting_suffix_tokens,
                 3 if encoding == "kimi_k3" else 0,
             )
+            if uses_response_template:
+                self.assertEqual(request._response_parser_prefix, "rendered prefix")
 
         for encoding in ("kimi_k3", None):
             for stream in (False, True):
-                with self.subTest(encoding=encoding, stream=stream):
-                    asyncio.run(run(encoding, stream))
+                for uses_response_template in (False, True):
+                    with self.subTest(
+                        encoding=encoding,
+                        stream=stream,
+                        uses_response_template=uses_response_template,
+                    ):
+                        asyncio.run(run(encoding, stream, uses_response_template))
 
     def test_responses_tool_retry_keeps_the_server_reporting_policy(self):
         from sglang.srt.entrypoints.openai.serving_responses import (
