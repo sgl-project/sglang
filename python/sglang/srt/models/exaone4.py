@@ -42,6 +42,7 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.models.utils import apply_qk_norm
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
@@ -652,8 +653,8 @@ class Exaone4ForCausalLM(nn.Module):
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        current_platform.empty_cache()
+        current_platform.synchronize()
 
     def set_embed(self, embed):
         # NOTE: If draft hidden size != target hidden size, the embed weight cannot be shared for EAGLE3
@@ -664,8 +665,8 @@ class Exaone4ForCausalLM(nn.Module):
             return
         del self.model.embed_tokens.weight
         self.model.embed_tokens.weight = embed
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        current_platform.empty_cache()
+        current_platform.synchronize()
 
 
 EntryClass = Exaone4ForCausalLM

@@ -48,6 +48,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
     is_xpu,
+    print_warning_once,
 )
 from sglang.srt.utils.async_probe import maybe_detect_nan, maybe_detect_oob
 from sglang.srt.utils.device import is_pin_memory_available
@@ -1037,6 +1038,12 @@ def _tree_accept(
     target_predict = None
     accept_lens = None
     if greedy:
+        if not sampling_info.is_all_greedy:
+            print_warning_once(
+                "Speculative verify falls back to the target argmax on this device: "
+                "temperature, top_p, top_k and min_p are ignored while speculative "
+                "decoding is on."
+            )
         target_predict = (
             sampling_argmax(next_token_logits)
             if sharded_predict is None
