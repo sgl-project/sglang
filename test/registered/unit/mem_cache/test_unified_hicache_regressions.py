@@ -36,9 +36,10 @@ class TestHiCacheIndexDomains(unittest.TestCase):
 
         transfer = L2Transfer(
             SimpleNamespace(dcp_size=dcp_size),
-            SimpleNamespace(host_transfer_translate=translate),
+            SimpleNamespace(),
             logical.clone(),
             logical,
+            device_translate=translate,
         )
         resolved = L2TransferEngine._resolve_device_indices(transfer)
         for rank in range(dcp_size):
@@ -168,10 +169,7 @@ class TestTransferStreamOrdering(unittest.TestCase):
             ),
         )
         transfer = L2Transfer(
-            host,
-            SimpleNamespace(host_transfer_translate=translate),
-            torch.arange(3),
-            ids,
+            host, SimpleNamespace(), torch.arange(3), ids, device_translate=translate
         )
         completion = engine.submit_host_to_device(
             [transfer], transfer_layer_id_max=1, start_event=start
@@ -221,9 +219,10 @@ class TestDirectBackendTranslation(unittest.TestCase):
 
         transfer = L2Transfer(
             SimpleNamespace(),
-            SimpleNamespace(device="cuda", host_transfer_translate=translate),
+            SimpleNamespace(device="cuda"),
             torch.tensor([0, 1]),
             torch.tensor([2, 1]),
+            device_translate=translate,
         )
         result = L2TransferEngine._resolve_device_indices(transfer)
         self.assertEqual(result.device.type, "cpu")

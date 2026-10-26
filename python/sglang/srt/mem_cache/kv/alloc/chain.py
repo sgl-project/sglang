@@ -195,10 +195,6 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
 
         if self.swa_attn_allocator is not None:
             self._size_window_host_pools()
-        # HiCache indexes the owner's per-layer views with physical ids.
-        self.views[
-            roles.owner
-        ].host_transfer_translate = self.full_attn_allocator.translate_kv_loc
         # Translated before the pool when the pool indexes host copies physically.
         self.free_page_reps_group: Optional[List[torch.Tensor]] = None
         self.full_page_reps_group: List[torch.Tensor] = []

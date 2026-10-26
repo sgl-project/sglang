@@ -97,8 +97,8 @@ class TestMambaSlotWiringIsShared(CustomTestCase):
         self.assertEqual(
             sorted(set(self._assignments_to("slots"))),
             ["_wire_mamba_slot_allocator"],
-            "a factory wraps the mamba end itself; it will miss "
-            "host_transfer_translate exactly as the tri-pool factory did",
+            "a factory wraps the mamba end itself; it will miss the "
+            "slot allocator's wiring exactly as the tri-pool factory did",
         )
 
     def test_every_unified_state_builder_calls_the_shared_hook(self):

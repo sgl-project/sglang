@@ -12,6 +12,7 @@ from __future__ import annotations
 from typing import Any, Callable, Dict, Optional, Sequence, Tuple
 
 import msgspec
+import torch
 
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
@@ -140,6 +141,20 @@ class KVStorage:
             return self._allocator.swa_available_size()
         assert sub_pool == self._allocator.roles.state, sub_pool
         return self._allocator.state_slots.schedulable_available_size()
+
+    def host_ids(
+        self, sub_pool: str
+    ) -> Optional[Callable[[torch.Tensor], torch.Tensor]]:
+        """How a host transfer turns the controller's ids for the sub-pool into
+        the rows its view indexes, or None when they index it as they are (a
+        window's host loads bind physical pages). Called on the transfer
+        stream; pins keep the rows in place until the copy is acknowledged."""
+        roles = self._allocator.roles
+        if sub_pool == roles.owner:
+            return self._allocator.full_attn_allocator.translate_kv_loc
+        if sub_pool == roles.state:
+            return self._allocator.state.slots.translate
+        return None
 
     def add_pin_source(
         self, sub_pools: Sequence[str], busy: Callable[[], bool]

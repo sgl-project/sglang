@@ -1208,7 +1208,7 @@ def _wire_mamba_slot_allocator(
     state: StateStorage,
     device,
 ) -> UnifiedMambaSlotAllocator:
-    """Install Mamba slot allocation, host capacities, and transfer translation."""
+    """Install Mamba slot allocation and host capacities."""
     state_pool = state.pool
     slot_allocator = UnifiedMambaSlotAllocator(
         mamba_end,
@@ -1217,7 +1217,6 @@ def _wire_mamba_slot_allocator(
         take=take,
     )
     state.slots = slot_allocator
-    state_pool.host_transfer_translate = slot_allocator.translate
     state_pool.host_capacity_tokens = state_pool.size
     state_pool.host_capacity_bytes = (
         state_pool.host_capacity_tokens * mamba_end.entry_bytes

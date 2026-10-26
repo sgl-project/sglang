@@ -280,6 +280,7 @@ def build_pool_entry(
     device_alloc_fn: Optional[Callable[[int], Any]] = None,
     device_free_fn: Optional[Callable[[Any], Any]] = None,
     packed_draft_device_pools: tuple[Any, ...] = (),
+    device_translate: Optional[Callable[[Any], Any]] = None,
 ) -> PoolEntry:
     return PoolEntry(
         name=name,
@@ -292,6 +293,7 @@ def build_pool_entry(
         device_alloc_fn=device_alloc_fn,
         device_free_fn=device_free_fn,
         packed_draft_device_pools=packed_draft_device_pools,
+        device_translate=device_translate,
     )
 
 
@@ -1654,6 +1656,8 @@ def build_unified_host_stack(
         root_host_pool=host_pools[owner],
         # The owner's host pool evicts on demand only when it shares a backing.
         root_host_evict_fn=evict_host(owner_component) if envelope else None,
+        translated_device_pool=storage.view(owner),
+        device_translate=storage.host_ids(owner),
     )
     component_host_pools = {owner_component: host_pools[owner]}
     for s in sub_pools:
@@ -1708,6 +1712,7 @@ def build_unified_host_stack(
                 device_alloc_fn=alloc[0],
                 device_free_fn=alloc[1],
                 packed_draft_device_pools=drafts,
+                device_translate=storage.host_ids(s.name),
             )
         )
         if owner_id_drafts and not s.holds_state:
@@ -1776,7 +1781,12 @@ def _build_pool_entries(
     config: HostPoolGroupConfig,
     root_host_pool: Any,
     root_host_evict_fn: Optional[Callable[[int], Any]] = None,
+    translated_device_pool: Any = None,
+    device_translate: Optional[Callable[[Any], Any]] = None,
 ) -> list[PoolEntry]:
+    """``device_translate`` maps controller ids to rows for the entries over
+    ``translated_device_pool`` (a unified owner's view); sidecars over other
+    device pools index them as they are."""
     host_pools = {config.pools[0].decl.pool_name: root_host_pool}
     entries = []
     for pool_config in config.pools:
@@ -1798,6 +1808,11 @@ def _build_pool_entries(
                 is_anchor=decl.is_primary,
                 host_evict_fn=root_host_evict_fn if decl.is_layout_root else None,
                 packed_draft_device_pools=pool_config.packed_draft_device_pools,
+                device_translate=(
+                    device_translate
+                    if decl.device_pool is translated_device_pool
+                    else None
+                ),
             )
         )
     return entries
