@@ -14,7 +14,6 @@
 
 namespace quickreduce {
 
-typedef __hip_bfloat16 nv_bfloat16;
 typedef __hip_bfloat162 nv_bfloat162;
 
 using int32x2_t = __attribute__((__vector_size__(2 * sizeof(int)))) int;
