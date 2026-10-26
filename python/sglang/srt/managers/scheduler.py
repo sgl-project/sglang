@@ -30,7 +30,6 @@ from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Set, Tuple, 
 
 from sglang.srt.runtime_context import (
     SpawnRanks,
-    attention_backends,
     get_context,
     get_device,
     get_disagg,
@@ -349,7 +348,6 @@ from sglang.srt.utils import (
     freeze_gc,
     get_available_gpu_memory,
     get_bool_env_var,
-    get_int_env_var,
     is_cuda,
     is_hip,
     is_mps,
@@ -694,8 +692,8 @@ class Scheduler(
         # Init Ngram Embedding
         self.maybe_init_ngram_embedding()
 
-        # Init prefill kv split size when deterministic inference is enabled with various attention backends
-        self.init_deterministic_inference_config()
+        # Init prefill chunk alignment for attention backends that need it (deterministic flashinfer)
+        self.init_prefill_chunk_align()
         self.init_dsa_kpool_truncation_align()
         self.init_mamba_truncation_align()
         self.check_truncation_align_fits_chunk()
@@ -1742,21 +1740,10 @@ class Scheduler(
         )
         self.use_ngram_embedding = self.tp_worker.model_config.use_ngram_embedding
 
-    def init_deterministic_inference_config(self):
-        """Initialize deterministic inference configuration for different attention backends."""
-        if not get_exec().deterministic.enable_deterministic_inference:
-            self.truncation_align_size = None
-            return
-
-        # Only flashinfer needs chunks on its prefill split tiles; triton tiles
-        # keys at absolute positions (align_window_kv_to_tiles).
-        backend_sizes = {
-            "flashinfer": ("SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE", 4096),
-        }
-        prefill_backend, _ = attention_backends()
-        env_var, default_size = backend_sizes.get(prefill_backend, (None, None))
+    def init_prefill_chunk_align(self):
+        """Take the prefill chunk grid the attention backend asks for."""
         self.truncation_align_size = (
-            get_int_env_var(env_var, default_size) if env_var else None
+            self.tp_worker.model_runner.attn_backend.prefill_chunk_align
         )
 
     def init_dsa_kpool_truncation_align(self):
@@ -1819,9 +1806,7 @@ class Scheduler(
             f"Chunked prefill is aligned to {align} tokens, but each rank's "
             f"chunked prefill size is {chunk}{dp_note}; a prompt longer than "
             f"{chunk} tokens could never be scheduled. Raise --chunked-prefill-size "
-            f"to at least {align * attn_dp_size}, or, with the flashinfer backend "
-            f"under deterministic inference, lower "
-            f"SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE."
+            f"to at least {align * attn_dp_size}."
         )
 
     def init_request_dispatcher(self):
