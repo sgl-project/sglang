@@ -296,9 +296,9 @@ class DSANPUIndexerMixin:
             and self.dsa_enable_prefill_cp
             and forward_batch.attn_cp_metadata is not None
         ):
-            if use_quant_indexer and pool.indexer_kv_store_int8:
+            if use_quant_indexer:
                 raise RuntimeError(
-                    "SGLANG_NPU_INDEXER_INT8 is on together with prefill CP (attn_cp_size>1)"
+                    "DSANPUIndexerMixin.do_npu_cp_balance_indexer is not implemented for quantized indexer cache"
                 )
             topk_indices = self.do_npu_cp_balance_indexer(
                 q.view(-1, self.n_heads, self.head_dim),
@@ -331,7 +331,9 @@ class DSANPUIndexerMixin:
                     else weights
                 )
 
-                if envs.SGLANG_NPU_INDEXER_INT8.get():
+                if pool.index_k_store_dtype == torch.int8:
+                    # torch_npu.npu_quant_lightning_indexer is not working
+                    # for int8 cache in case of custom_ops imported
                     quant_lightning_indexer = torch.ops.npu.npu_quant_lightning_indexer
                 else:
                     quant_lightning_indexer = torch_npu.npu_quant_lightning_indexer
