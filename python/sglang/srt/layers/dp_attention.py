@@ -1193,27 +1193,69 @@ def _tbo_event(key) -> torch.cuda.Event:
     return ev
 
 
-def dp_gather_partial_async(
+def dp_shard_sizes(
+    rank_sizes: List[int], attn_tp_size: int
+) -> Tuple[List[int], List[int]]:
+    """Split per-TP-rank row counts of a value replicated over attention TP into
+    one count per DP rank and one shard per TP rank: the layout that
+    ``dp_gather_async`` gathers into and ``dp_reduce_scatterv_async`` returns
+    from."""
+    if attn_tp_size < 1 or len(rank_sizes) % attn_tp_size != 0:
+        raise ValueError(f"Invalid TBO topology: {len(rank_sizes)=}, {attn_tp_size=}")
+
+    dp_sizes = []
+    shard_sizes = []
+    for start in range(0, len(rank_sizes), attn_tp_size):
+        replicas = rank_sizes[start : start + attn_tp_size]
+        if any(size != replicas[0] for size in replicas):
+            raise ValueError(f"TBO token counts differ within attention TP: {replicas}")
+        if replicas[0] % attn_tp_size != 0:
+            raise ValueError(
+                f"TBO token count {replicas[0]} is not divisible by "
+                f"attention TP size {attn_tp_size}"
+            )
+        dp_sizes.append(replicas[0])
+        shard_sizes.extend([replicas[0] // attn_tp_size] * attn_tp_size)
+    return dp_sizes, shard_sizes
+
+
+def dp_attn_tp_shard(local_tokens: torch.Tensor, shard_sizes: List[int]):
+    """This rank's attention-TP shard of DP-local rows replicated over attention
+    TP, the rows it contributes to a gather over ``shard_sizes``."""
+    parallel = get_parallel()
+    shard = local_tokens
+    if parallel.attn_tp_size > 1:
+        shard = local_tokens.tensor_split(parallel.attn_tp_size)[
+            parallel.attn_tp_rank
+        ].contiguous()
+    assert shard.shape[0] == shard_sizes[parallel.tp_group.rank_in_group]
+    return shard
+
+
+def dp_gather_async(
     global_tokens: torch.Tensor,
     local_tokens: torch.Tensor,
     forward_batch: ForwardBatch,
+    shard_sizes: List[int],
     event_key=("gather", 0),
-) -> torch.cuda.Event:
-    """Launch `dp_gather_partial` (all_gatherv) on the shared DP TBO comm stream;
-    re-record + return a PERSISTENT event (keyed by `event_key`) that fires when
-    the gather completes. Caller yields, then `compute_stream.wait_event(ev)`
-    before reading `global_tokens`."""
+) -> Tuple[torch.cuda.Event, torch.Tensor]:
+    """Launch the TBO DP gather on the shared comm stream, the inverse of
+    ``dp_reduce_scatterv_async`` over the same ``shard_sizes``. Returns the
+    event and the tensor the gather reads, to keep alive until the event."""
+    parallel = get_parallel()
+    sent = dp_attn_tp_shard(local_tokens, shard_sizes)
     comm = get_dp_tbo_comm_stream()
     compute = torch.cuda.current_stream()
-    # Keep buffers alive across streams (caching allocator).
-    local_tokens.record_stream(comm)
-    global_tokens.record_stream(comm)
     ev = _tbo_event(event_key)
     with torch.cuda.stream(comm):
-        comm.wait_stream(compute)  # inputs were produced on the compute stream
-        dp_gather_partial(global_tokens, local_tokens, forward_batch)
+        comm.wait_stream(compute)
+        if parallel.attn_tp_size == 1:
+            # Keeps the DP gather's optional FP8 wire format.
+            dp_gather_replicate(global_tokens, local_tokens, forward_batch)
+        else:
+            parallel.tp_group.all_gatherv(sent, sizes=shard_sizes, output=global_tokens)
         ev.record(comm)
-    return ev
+    return ev, sent
 
 
 # Persistent grow-only buffers for non-EP DP TBO, keyed by (kind, tbo_subbatch).

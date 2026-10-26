@@ -82,7 +82,9 @@ from sglang.srt.layers.cp.utils import (
 from sglang.srt.layers.deep_gemm_wrapper.configurer import DEEPGEMM_SCALE_UE8M0
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_reduce,
+    dp_attn_tp_shard,
     dp_gather_replicate,
+    dp_shard_sizes,
     get_global_dp_buffer_len,
     is_allocation_symmetric,
     is_dp_attention_enabled,
@@ -372,31 +374,6 @@ def _flashinfer_hc_pre(
 
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
-
-
-def _tbo_collective_sizes(
-    rank_sizes: List[int], attn_tp_size: int
-) -> Tuple[List[int], List[int]]:
-    # Collapse attention-TP replicas into DP counts and split each count into TP shards.
-    if attn_tp_size < 1 or len(rank_sizes) % attn_tp_size != 0:
-        raise ValueError(f"Invalid TBO topology: {len(rank_sizes)=}, {attn_tp_size=}")
-
-    dp_sizes = []
-    tp_sizes = []
-    for start in range(0, len(rank_sizes), attn_tp_size):
-        replicas = rank_sizes[start : start + attn_tp_size]
-        if any(size != replicas[0] for size in replicas):
-            raise ValueError(f"TBO token counts differ within attention TP: {replicas}")
-        if replicas[0] % attn_tp_size != 0:
-            raise ValueError(
-                f"TBO token count {replicas[0]} is not divisible by "
-                f"attention TP size {attn_tp_size}"
-            )
-        dp_sizes.append(replicas[0])
-        tp_sizes.extend([replicas[0] // attn_tp_size] * attn_tp_size)
-    return dp_sizes, tp_sizes
-
-
 _is_gfx95_supported = is_gfx95_supported()
 _is_gfx942_supported = is_gfx942_supported()
 _is_gfx1250_supported = is_gfx1250_supported()
@@ -4338,10 +4315,9 @@ class DeepseekV4Model(nn.Module):
             tp_group.all_gather_into_tensor(gathered, local_lens)
             gathered_cpu = gathered.tolist()
             dp_rank = get_parallel().attn_dp_rank
-            attn_tp_rank = get_parallel().attn_tp_rank
             for idx, child in enumerate(children):
                 rank_sizes = [gathered_cpu[r][idx] for r in range(world)]
-                dp_sizes, tp_sizes = _tbo_collective_sizes(rank_sizes, attn_tp_size)
+                dp_sizes, tp_sizes = dp_shard_sizes(rank_sizes, attn_tp_size)
                 child.global_num_tokens_cpu = dp_sizes
                 child.global_num_tokens_gpu = gathered[::attn_tp_size, idx].contiguous()
                 child.global_dp_buffer_len = sum(dp_sizes)
@@ -4360,15 +4336,14 @@ class DeepseekV4Model(nn.Module):
                     padded_ids = local_ids[:rows]
                 else:
                     padded_ids = local_ids
-                local_ids_shard = padded_ids.tensor_split(attn_tp_size)[
-                    attn_tp_rank
-                ].contiguous()
                 gids = torch.empty(
                     (sum(dp_sizes),),
                     dtype=local_ids.dtype,
                     device=local_ids.device,
                 )
-                tp_group.all_gatherv(local_ids_shard, sizes=tp_sizes, output=gids)
+                tp_group.all_gatherv(
+                    dp_attn_tp_shard(padded_ids, tp_sizes), sizes=tp_sizes, output=gids
+                )
                 child._tbo_global_input_ids = gids
 
         try:

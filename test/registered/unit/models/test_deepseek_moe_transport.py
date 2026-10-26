@@ -1,7 +1,6 @@
 """DeepSeek MoE transport isolates overlapping microbatches."""
 
 import unittest
-from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -21,7 +20,6 @@ class TestOverlappedTransport(unittest.TestCase):
         compute = SimpleNamespace(
             wait_event=lambda event: trace.append(("wait", event.key))
         )
-        comm = SimpleNamespace(wait_stream=lambda stream: trace.append(("fork",)))
         buffers = {}
 
         def buffer(key, n, h, dtype, device):
@@ -29,9 +27,10 @@ class TestOverlappedTransport(unittest.TestCase):
             buffers[key] = value
             return value
 
-        def gather(out, value, batch):
+        def gather(out, value, batch, sizes, *, event_key):
             trace.append(("gather", batch.sub))
             out.copy_(torch.cat((value, value + 10)))
+            return event(event_key), value
 
         def event(key):
             return SimpleNamespace(
@@ -57,18 +56,7 @@ class TestOverlappedTransport(unittest.TestCase):
                 "sglang.srt.models.deepseek_common.moe_transport.get_moe_a2a_backend",
                 return_value=SimpleNamespace(is_none=lambda: True),
             ),
-            patch(
-                "sglang.srt.models.deepseek_common.moe_transport.get_parallel",
-                return_value=SimpleNamespace(
-                    attn_tp_size=1,
-                    tp_group=SimpleNamespace(rank_in_group=0),
-                ),
-            ),
             patch.object(torch.cuda, "current_stream", return_value=compute),
-            patch.object(
-                torch.cuda, "stream", side_effect=lambda stream: nullcontext()
-            ),
-            patch.object(moe_transport, "get_dp_tbo_comm_stream", return_value=comm),
             patch.object(
                 moe_transport, "get_tbo_persistent_buffer", side_effect=buffer
             ),
@@ -76,8 +64,7 @@ class TestOverlappedTransport(unittest.TestCase):
                 moe_transport, "get_global_dp_buffer_len", side_effect=lengths
             ),
             patch.object(moe_transport, "get_local_dp_buffer_len", side_effect=[2, 1]),
-            patch.object(moe_transport, "dp_gather_replicate", side_effect=gather),
-            patch.object(moe_transport, "_tbo_event", side_effect=event),
+            patch.object(moe_transport, "dp_gather_async", side_effect=gather),
             patch.object(
                 moe_transport, "dp_reduce_scatterv_async", side_effect=combine
             ),

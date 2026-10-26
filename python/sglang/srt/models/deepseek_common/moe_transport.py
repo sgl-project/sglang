@@ -8,15 +8,14 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.cp.interleave import attn_cp_interleave_gather
 from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.dp_attention import (
-    _tbo_event,
     attn_tp_all_gather,
     attn_tp_all_gather_into_tensor,
+    dp_gather_async,
     dp_gather_replicate,
     dp_reduce_scatter_tensor,
     dp_reduce_scatterv_async,
     dp_scatter,
     get_dp_global_num_tokens,
-    get_dp_tbo_comm_stream,
     get_global_dp_buffer,
     get_global_dp_buffer_len,
     get_local_dp_buffer,
@@ -291,30 +290,10 @@ def _tbo_gather_moe_input(moe, local, batch, sub, do_shared_local):
         local.dtype,
         local.device,
     )
-    parallel = get_parallel()
-    local_shard = (
-        local
-        if parallel.attn_tp_size == 1
-        else local.tensor_split(parallel.attn_tp_size)[
-            parallel.attn_tp_rank
-        ].contiguous()
+    event, sent = dp_gather_async(
+        global_hidden, local, batch, batch._tbo_tp_sizes, event_key=("gather", sub)
     )
-    tp_sizes = batch._tbo_tp_sizes
-    assert local_shard.shape[0] == tp_sizes[parallel.tp_group.rank_in_group]
-    comm = get_dp_tbo_comm_stream()
-    compute = torch.cuda.current_stream()
-    with torch.cuda.stream(comm):
-        comm.wait_stream(compute)
-        if parallel.attn_tp_size == 1:
-            # Keeps the DP gather's optional FP8 wire format.
-            dp_gather_replicate(global_hidden, local, batch)
-        else:
-            parallel.tp_group.all_gatherv(
-                local_shard, sizes=tp_sizes, output=global_hidden
-            )
-        event = _tbo_event(("gather", sub))
-        event.record(comm)
-    return global_hidden, event, shared_local, local_shard
+    return global_hidden, event, shared_local, sent
 
 
 def _tbo_combine_moe_output(output, batch, sub):
