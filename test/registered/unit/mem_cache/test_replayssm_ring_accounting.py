@@ -9,6 +9,9 @@ under spec, see MambaPool). If the MambaPool allocation changes shape, update
 both the allocation and this expectation together.
 """
 
+import os
+from unittest.mock import patch
+
 import pytest
 import torch
 
@@ -18,6 +21,8 @@ from sglang.srt.configs.mamba_utils import (
     Mamba2CacheParams,
     Mamba2StateDType,
     Mamba2StateShape,
+    kimi_linear_state_dtype,
+    mamba2_state_dtype,
 )
 from sglang.srt.mem_cache.kv_cache_configurator import (  # noqa: F401
     _pp_local_per_request_bytes,
@@ -28,8 +33,8 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 # temporal = (hv=4, v_dim=8, k_dim=8), num_k_heads_per_tp = 4, record_len = 8,
-# 2 layers. conv bf16 (2B), fp32 gate/beta (4B). Ring tensors (per slot, per
-# layer):
+# 2 layers. GDN records follow conv dtype; KDA records follow SSM dtype.
+# Gate/beta remain fp32 (4B). Ring tensors (per slot, per layer):
 # GDN stores compact d/k plus scalar g. KDA stores raw v/k, vector g, beta,
 # and its existing d/k rings.
 DTYPE = Mamba2StateDType(conv=torch.bfloat16, temporal=torch.float32)
@@ -37,11 +42,11 @@ RL = 8
 LAYERS = [0, 1]
 
 
-def _kda_params():
+def _kda_params(dtype=DTYPE):
     shape = KimiLinearStateShape.create(
         tp_world_size=1, num_heads=4, head_dim=8, num_k_heads=4, head_k_dim=8
     )
-    return KimiLinearCacheParams(shape=shape, dtype=DTYPE, layers=LAYERS)
+    return KimiLinearCacheParams(shape=shape, dtype=dtype, layers=LAYERS)
 
 
 def _gdn_params(temporal_dtype=torch.float32):
@@ -76,16 +81,42 @@ class TestReplaySSMRingAccounting(CustomTestCase):
         )
 
     def test_kda_fold(self):
-        # rawv 512 + rawk 512 + g(per-K, 4*8*8*4) 1024 + beta 128
-        # + d 512 + k 512 (KDA keeps the chunked rings under spec) = 3200
-        self.assertEqual(
-            _kda_params().replayssm_ring_bytes_per_req(record_len=RL),
-            3200 * len(LAYERS),
-        )
+        # Four rawv/rawk/d/k rings: 4 * 4 * 8 * 8 elements per layer.
+        # Vector g and beta add 1024 + 128 bytes regardless of state dtype.
+        for ssm, expected in [(torch.float32, 5248), (torch.bfloat16, 3200)]:
+            for conv in (torch.float32, torch.bfloat16):
+                with self.subTest(ssm=ssm, conv=conv):
+                    dtype = Mamba2StateDType(conv=conv, temporal=ssm)
+                    self.assertEqual(
+                        _kda_params(dtype).replayssm_ring_bytes_per_req(record_len=RL),
+                        expected * len(LAYERS),
+                    )
 
     def test_zero_len_ring(self):
         self.assertEqual(_gdn_params().replayssm_ring_bytes_per_req(record_len=0), 0)
         self.assertEqual(_kda_params().replayssm_ring_bytes_per_req(record_len=0), 0)
+
+    def test_state_precision_and_override(self):
+        for name, dtype in [("float32", torch.float32), ("bfloat16", torch.bfloat16)]:
+            with self.subTest(dtype=name), patch.dict(os.environ, clear=False):
+                os.environ["SGLANG_MAMBA_SSM_DTYPE"] = name
+                os.environ.pop("SGLANG_MAMBA_CONV_DTYPE", None)
+                expected = Mamba2StateDType(conv=dtype, temporal=dtype)
+                self.assertEqual(kimi_linear_state_dtype(), expected)
+                params = KimiLinearCacheParams(shape=None, layers=[])
+                self.assertEqual(params.dtype, expected)
+                # Other Mamba model families keep their convolution default.
+                self.assertEqual(mamba2_state_dtype().conv, torch.bfloat16)
+                os.environ["SGLANG_MAMBA_CONV_DTYPE"] = "bfloat16"
+                self.assertEqual(
+                    kimi_linear_state_dtype(),
+                    Mamba2StateDType(conv=torch.bfloat16, temporal=dtype),
+                )
+
+    def test_explicit_dtype_is_preserved(self):
+        dtype = Mamba2StateDType(conv=torch.bfloat16, temporal=torch.float32)
+        params = KimiLinearCacheParams(shape=None, layers=[], dtype=dtype)
+        self.assertEqual(params.dtype, dtype)
 
 
 if __name__ == "__main__":
