@@ -1932,6 +1932,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Token count above which <code>SGLANG_ROCM_K3_FUSE_KDA_INPROJ</code> stops applying and the split projection runs instead. The merged shape is only faster while the projection is bandwidth bound.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>256</code></td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_QWEN3_5_MONO_DECODE</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Run Qwen3.8 MXFP4 decode steps of 8 rows or fewer as two persistent FlyDSL launches per layer (gfx950, TP8, needs the shared expert unfused (the default for the Quark MXFP4 checkpoint)). With speculative decoding, only target-verify steps use it. Without speculative decoding, it also needs an fp32 or bf16 SSM state and no ReplaySSM ring. It turns itself off and logs why when a requirement is not met.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
   </tbody>
 </table>
 

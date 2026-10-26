@@ -86,6 +86,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
     resolve_linear_parallel_group,
 )
+from sglang.srt.layers.moe import qwen3_5_mono_decode
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.utils import (
     is_shared_experts_fusion_disabled,
@@ -971,10 +972,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(z_shape_og)
-        core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
-
-        output, _ = self.out_proj(core_attn_out)
-        return output
+        return core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
 
     def forward(
         self,
@@ -987,6 +985,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         2. Core attention (custom op)
         3. Output projection
         """
+        output, _ = self.out_proj(self.core(hidden_states, forward_batch))
+        return output
+
+    def core(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch):
+        """Input projection and core attention: ``out_proj``'s input."""
         projected_states_qkvz, projected_states_ba = self._forward_input_proj(
             hidden_states
         )
@@ -1106,17 +1109,14 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 activation=self.norm.activation,
                 quant_heads=nv,
             )
-            return self.out_proj(fp8)[0]
+            return fp8
 
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(z_shape_og)
-        core_attn_out = core_attn_out.reshape(
+        return core_attn_out.reshape(
             *core_attn_out.shape[:-2],
             core_attn_out.shape[-2] * core_attn_out.shape[-1],
         )
-
-        output, _ = self.out_proj(core_attn_out)
-        return output
 
 
 class Qwen3_5LinearDecoderLayer(nn.Module):
@@ -1624,6 +1624,17 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         """Full attention forward pass."""
+        attn_output = self.attention_core(positions, hidden_states, forward_batch)
+        output, _ = self.o_proj(attn_output)
+        return output
+
+    def attention_core(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        """Full attention up to o_proj's input."""
         q, k, v, gate = self._prepare_qkv_gate(
             positions=positions,
             hidden_states=hidden_states,
@@ -1640,9 +1651,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             else:
                 gate_val = gate.reshape(gate.shape[0], -1) if gate.ndim == 3 else gate
                 attn_output = npu_fused_sigmoid_mul(attn_output, gate_val.contiguous())
-
-        output, _ = self.o_proj(attn_output)
-        return output
+        return attn_output
 
     def forward(
         self,
@@ -1861,6 +1870,10 @@ class Qwen3_5ForCausalLM(nn.Module):
 
         self.layers_to_capture = []
 
+        self._mono = None
+        if not is_nextn and qwen3_5_mono_decode.enabled():
+            self._mono = qwen3_5_mono_decode.MonoDecode(self)
+
     def _build_embed_tokens(self, config: Qwen3_5TextConfig) -> nn.Module:
         """Embedding sharding hook for models reusing this backbone."""
         if not self.pp_group.is_first_rank:
@@ -1914,6 +1927,10 @@ class Qwen3_5ForCausalLM(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
         input_deepstack_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
+        if self._mono is not None and self._mono.eligible(
+            input_ids, forward_batch, input_embeds, pp_proxy_tensors
+        ):
+            return self._mono.forward(input_ids, positions, forward_batch)
         if (
             self.flashinfer_mnnvl_cutedsl_fusion is not None
             and input_deepstack_embeds is not None
