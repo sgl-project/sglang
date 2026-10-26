@@ -1765,7 +1765,7 @@ class UnifiedRadixCache(BasePrefixCache):
             extra_pools=aux_xfers or None,
             flush=False,
             # KV sharding: host slots follow the owners of the device pages.
-            start_class=self.tree_core.rotation_phase_of(node_id),
+            start_owner=self.tree_core.rotation_phase_of(node_id),
         )
 
     def _track_write_through_node(

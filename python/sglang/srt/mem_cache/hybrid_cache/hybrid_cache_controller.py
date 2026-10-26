@@ -204,6 +204,8 @@ class PrefetchSubmission:
 
 
 class HybridCacheController(BaseHiCacheController):
+    is_kv_sharded: bool = False
+
     def __init__(
         self,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
@@ -225,6 +227,9 @@ class HybridCacheController(BaseHiCacheController):
         host_memory_mode: str = "cache",
     ):
         startup_storage_backend = storage_backend
+        self.is_kv_sharded = isinstance(
+            mem_pool_host.anchor_entry.host_pool, PageInterleaveHostPool
+        )
         self.extra_host_mem_release_queues: dict[PoolName, Queue[torch.Tensor]] = {}
         self.pp_prefetch_command_group = None
         self.pp_prefetch_command_thread = None
@@ -514,7 +519,7 @@ class HybridCacheController(BaseHiCacheController):
         extra_pools: Optional[list[PoolTransfer]] = None,
         *,
         reclaim: Optional[Callable[[int], Any]] = None,
-        start_class: Optional[int] = None,
+        start_owner: Optional[int] = None,
     ) -> Optional[tuple[torch.Tensor, Optional[list[PoolTransfer]]]]:
         if self._uses_shared_host_domain(extra_pools):
             allocation = self.allocate_shared_host_transfers(
@@ -533,7 +538,7 @@ class HybridCacheController(BaseHiCacheController):
             return allocation
 
         host_indices = self.mem_pool_host.alloc(
-            len(device_indices), reclaim=reclaim, start_class=start_class
+            len(device_indices), reclaim=reclaim, start_owner=start_owner
         )
         if host_indices is None:
             return None
@@ -554,10 +559,10 @@ class HybridCacheController(BaseHiCacheController):
         node_id: int = -1,
         extra_pools: Optional[list[PoolTransfer]] = None,
         flush: bool = True,
-        start_class: Optional[int] = None,
+        start_owner: Optional[int] = None,
     ) -> Optional[torch.Tensor]:
         allocation = self.allocate_host_transfers(
-            device_indices, extra_pools, start_class=start_class
+            device_indices, extra_pools, start_owner=start_owner
         )
         if allocation is None:
             return None
@@ -840,9 +845,7 @@ class HybridCacheController(BaseHiCacheController):
     def _move_op_indices(
         self, op: CacheOperation
     ) -> tuple[torch.Tensor, torch.Tensor, Optional[list[PoolTransfer]]]:
-        if isinstance(
-            self.mem_pool_host.anchor_entry.host_pool, PageInterleaveHostPool
-        ):
+        if self.is_kv_sharded:
             # Queued loads and direct retraction transfers both resolve at the
             # L2 boundary. Keep the mirrored tree/queue indices logical until then.
             return op.host_indices, op.device_indices, op.pool_transfers
@@ -852,7 +855,7 @@ class HybridCacheController(BaseHiCacheController):
         self, op: CacheOperation
     ) -> tuple[torch.Tensor, torch.Tensor, Optional[list[PoolTransfer]]]:
         host_group = self.mem_pool_host
-        if isinstance(host_group.anchor_entry.host_pool, PageInterleaveHostPool):
+        if self.is_kv_sharded:
             return op.host_indices, op.device_indices, op.pool_transfers
         if self.io_backend != "kernel" or host_group.layout != "page_first":
             return self.move_hybrid_indices(op)
@@ -871,6 +874,52 @@ class HybridCacheController(BaseHiCacheController):
         *,
         write_back_jit: bool = True,
     ) -> list[L2Transfer]:
+        if self.is_kv_sharded:
+            return self._kv_shard_l2_transfers(
+                host_indices,
+                device_indices,
+                pool_transfers,
+                write_back_jit=write_back_jit,
+            )
+        anchor = self.mem_pool_host.anchor_entry
+        transfers = []
+        if host_indices.numel() > 0:
+            transfers.append(
+                L2Transfer(
+                    host_pool=anchor.host_pool,
+                    device_pool=anchor.device_pool,
+                    host_indices=host_indices,
+                    device_indices=device_indices,
+                    layer_mapper=anchor.layer_mapper,
+                )
+            )
+        for pool_transfer in pool_transfers or []:
+            if (
+                pool_transfer.host_indices is None
+                or pool_transfer.device_indices is None
+            ):
+                raise ValueError(f"Unresolved L2 transfer for {pool_transfer.name}.")
+            entry = self.mem_pool_host.entry_map[pool_transfer.name]
+            transfers.append(
+                L2Transfer(
+                    host_pool=entry.host_pool,
+                    device_pool=entry.device_pool,
+                    host_indices=pool_transfer.host_indices,
+                    device_indices=pool_transfer.device_indices,
+                    layer_mapper=entry.layer_mapper,
+                )
+            )
+        return transfers
+
+    def _kv_shard_l2_transfers(
+        self,
+        host_indices: torch.Tensor,
+        device_indices: torch.Tensor,
+        pool_transfers: Optional[list[PoolTransfer]],
+        *,
+        write_back_jit: bool,
+    ) -> list[L2Transfer]:
+        """Resolve logical transfers to this rank's physical rows once per pair."""
         anchor = self.mem_pool_host.anchor_entry
         pools = [(anchor, host_indices, device_indices)] if host_indices.numel() else []
         for transfer in pool_transfers or []:
@@ -883,27 +932,19 @@ class HybridCacheController(BaseHiCacheController):
                     transfer.device_indices,
                 )
             )
-
-        sharded = isinstance(anchor.host_pool, PageInterleaveHostPool)
         local_indices = {}
         transfers = []
         for entry, host, device in pools:
-            if sharded:
-                # KV-derived indexers share the anchor's ownership. Reuse the
-                # gather when pools reference the same logical index tensors.
-                key = (id(host), id(device))
-                if key not in local_indices:
-                    local_indices[key] = anchor.host_pool.owned_rows(host, device)
-                host, device = local_indices[key]
-                if host.numel() == 0:
-                    continue
-                host, device = self._move_pool_indices(
-                    entry.host_pool,
-                    host,
-                    device,
-                    write_back_jit=write_back_jit,
-                    logical_indices=False,
-                )
+            # Target/draft indexers may reuse the anchor's logical index tensors.
+            key = (id(host), id(device))
+            if key not in local_indices:
+                local_indices[key] = anchor.host_pool.owned_rows(host, device)
+            host, device = local_indices[key]
+            if host.numel() == 0:
+                continue
+            host, device = self._move_pool_indices(
+                entry.host_pool, host, device, write_back_jit=write_back_jit
+            )
             transfers.append(
                 L2Transfer(
                     host_pool=entry.host_pool,
@@ -913,8 +954,7 @@ class HybridCacheController(BaseHiCacheController):
                     layer_mapper=entry.layer_mapper,
                 )
             )
-        # Empty owners still submit an empty operation, publishing the same
-        # completion events and ACKs as the other ranks.
+        # Empty owners still submit an operation and publish completion/ACKs.
         return transfers
 
     def _l2_load_transfers(
@@ -987,7 +1027,7 @@ class HybridCacheController(BaseHiCacheController):
         anchor = self.mem_pool_host.anchor_entry
 
         def transferred_tokens(indices):
-            if isinstance(anchor.host_pool, PageInterleaveHostPool):
+            if self.is_kv_sharded:
                 return int(
                     anchor.host_pool.placement.local_mask(
                         indices, anchor.host_pool.shard_rank
@@ -997,7 +1037,7 @@ class HybridCacheController(BaseHiCacheController):
 
         kv_tokens = (
             transferred_tokens(op.host_indices)
-            if isinstance(anchor.host_pool, PageInterleaveHostPool)
+            if self.is_kv_sharded
             else len(op.device_indices)
         )
         num_bytes = kv_tokens * anchor.host_pool.size_per_token
@@ -1532,21 +1572,10 @@ class HybridCacheController(BaseHiCacheController):
         return max(i for i, ok in enumerate(restorable) if ok) * self.page_size
 
     def _move_pool_indices(
-        self,
-        host_pool,
-        host_indices,
-        device_indices,
-        *,
-        write_back_jit: bool,
-        logical_indices: bool = True,
+        self, host_pool, host_indices, device_indices, *, write_back_jit: bool
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if uses_shared_host_layout(host_pool):
             return host_indices, device_indices
-        if logical_indices and isinstance(host_pool, PageInterleaveHostPool):
-            # Each shard rank copies only its own pages, as local rows.
-            host_indices, device_indices = host_pool.owned_rows(
-                host_indices=host_indices, device_indices=device_indices
-            )
         if write_back_jit and host_pool.can_use_write_back_jit:
             if host_indices.is_cuda:
                 host_indices = host_indices.cpu()

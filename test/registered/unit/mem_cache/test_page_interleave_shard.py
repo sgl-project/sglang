@@ -1959,7 +1959,7 @@ class TestShardedHostSlots(CustomTestCase):
         self.assertEqual(pool.size, (2 * 32 + 1) * PS)
         self.assertEqual(pool.logical_size, N * pool.size)
         # Every slot maps into this rank's host rows; local page 0 stays unused.
-        slots = pool.alloc(pool.available_size(), start_class=0)
+        slots = pool.alloc(pool.available_size(), start_owner=0)
         self.assertEqual(slots.numel(), N * (pool.size - PS))
         self.assertLess(int(pool.placement.local_index(slots).max()), pool.size)
 
@@ -1972,7 +1972,7 @@ class TestShardedHostSlots(CustomTestCase):
         self.assertIs(pool.lock, native.lock)
         native_available = native.available_size()
         capacity = pool.available_size()
-        pool.alloc(PS, start_class=1)
+        pool.alloc(PS, start_owner=1)
         self.assertLess(pool.available_size(), capacity)
         self.assertEqual(native.available_size(), native_available)
         with unittest.mock.patch.object(native, "clear", side_effect=AssertionError):
@@ -1981,7 +1981,7 @@ class TestShardedHostSlots(CustomTestCase):
         self.assertIs(pool.load_to_device_per_layer.__self__, native)
         self.assertIs(pool.backup_from_device_all_layer.__self__, native)
 
-    def test_alloc_without_a_start_class_fails_loud(self):
+    def test_alloc_without_a_start_owner_fails_loud(self):
         with self.assertRaises(AssertionError):
             _host_pool(shard_rank=0).alloc(PS)
 
@@ -1990,9 +1990,9 @@ class TestShardedHostSlots(CustomTestCase):
         values agree on every shard rank."""
 
         def run(pool):
-            first = pool.alloc(5 * PS, start_class=2)
+            first = pool.alloc(5 * PS, start_owner=2)
             pool.free(first[: 2 * PS])
-            return torch.cat([first, pool.alloc(3 * PS, start_class=0)])
+            return torch.cat([first, pool.alloc(3 * PS, start_owner=0)])
 
         outs = [run(_host_pool(r)) for r in range(N)]
         for out in outs[1:]:
@@ -2016,8 +2016,8 @@ class TestOwnedRows(CustomTestCase):
         for r in range(N):
             dev[r][placement.local_index(chain[owners == r])] = values[owners == r]
 
-        start_class = int(chain[0]) // PS % N
-        host = [p.alloc(chain.numel(), start_class=start_class) for p in pools][0]
+        start_owner = int(chain[0]) // PS % N
+        host = [p.alloc(chain.numel(), start_owner=start_owner) for p in pools][0]
         for r in range(N):
             h_rows, d_rows = pools[r].owned_rows(
                 host_indices=host, device_indices=chain
@@ -2048,11 +2048,14 @@ class TestOwnedRows(CustomTestCase):
     def test_controller_narrows_before_moving_indices(self):
         pool = _host_pool(shard_rank=2)
         device = _make_allocator().alloc_cyclic(start_class=0, need_size=6 * PS)
-        host = pool.alloc(6 * PS, start_class=0)
-        controller = SimpleNamespace(move_indices=lambda h, d: (h, d))
-        h_rows, d_rows = HybridCacheController._move_pool_indices(
-            controller, pool, host, device, write_back_jit=False
-        )
+        host = pool.alloc(6 * PS, start_owner=0)
+        controller = HybridCacheController.__new__(HybridCacheController)
+        controller.is_kv_sharded = True
+        entry = SimpleNamespace(host_pool=pool, device_pool=object(), layer_mapper=None)
+        controller.mem_pool_host = SimpleNamespace(anchor_entry=entry)
+        controller.move_indices = lambda h, d: (h, d)
+        (transfer,) = controller._l2_transfers(host, device, write_back_jit=False)
+        h_rows, d_rows = transfer.host_indices, transfer.device_indices
         expected = pool.owned_rows(host_indices=host, device_indices=device)
         self.assertTrue(torch.equal(h_rows, expected[0]))
         self.assertTrue(torch.equal(d_rows, expected[1]))
@@ -2087,7 +2090,7 @@ class TestOwnerMatchedLoadBack(CustomTestCase):
         self.assertIsNotNone(allocator.alloc_cyclic(start_class=2, need_size=PS))
 
     def test_controller_load_draws_the_host_pages_owners(self):
-        host = _host_pool(0).alloc(5 * PS, start_class=2)
+        host = _host_pool(0).alloc(5 * PS, start_owner=2)
         controller = SimpleNamespace(
             mem_pool_device_allocator=_make_allocator(),
             device="cpu",

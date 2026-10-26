@@ -70,13 +70,13 @@ class PageInterleaveHostPool:
 
     @synchronized
     def alloc(
-        self, need_size: int, start_class: Optional[int] = None
+        self, need_size: int, start_owner: Optional[int] = None
     ) -> Optional[torch.Tensor]:
-        assert start_class is not None, (
+        assert start_owner is not None, (
             "sharded host slots must follow the owners of the device pages "
             "they back up; pass the first page's owner class"
         )
-        return self._slots.alloc_cyclic(start_class=start_class, need_size=need_size)
+        return self._slots.alloc_cyclic(start_class=start_owner, need_size=need_size)
 
     @synchronized
     def free(self, indices: torch.Tensor) -> int:
