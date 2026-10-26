@@ -87,32 +87,52 @@ pub(super) fn tool_arguments(message: &mut Value) -> impl Iterator<Item = &mut V
         .map(|function| function.entry("arguments").or_insert(Value::Null))
 }
 
-/// `protocol.py::Function.model_dump()`, in declared field order, after
-/// `_validate_request` normalizes the schema types; the encoder serializes it verbatim.
+/// `Tool.model_dump()`'s `function` for each request tool, typed `"function"`;
+/// the encoder serializes it verbatim.
 pub(super) fn normalize_tools(tools: &[Value]) -> Result<Vec<Value>, String> {
     tools
         .iter()
-        .map(|tool| {
-            let f = &tool["function"];
-            let name = f["name"].as_str().ok_or("tool function requires name")?;
-            let mut function = Map::new();
-            function.insert("description".into(), f["description"].clone());
-            function.insert("name".into(), name.into());
-            let mut parameters = f["parameters"].clone();
-            normalize_json_schema_types(&mut parameters);
-            function.insert("parameters".into(), parameters);
-            let strict = f.get("strict").map_or(Ok(false), pydantic_bool)?;
-            function.insert("strict".into(), strict.into());
-            if let Some(defer) = [f.get("defer_loading"), tool.get("defer_loading")]
-                .into_iter()
-                .flatten()
-                .find(|v| !v.is_null())
-            {
-                function.insert("defer_loading".into(), pydantic_bool(defer)?.into());
-            }
-            Ok(json!({"type": "function", "function": function}))
-        })
+        .map(|tool| Ok(json!({"type": "function", "function": function_dump(tool)?})))
         .collect()
+}
+
+/// `protocol.py::Function.model_dump()`, after `Tool._propagate_defer_loading`
+/// and `_validate_request`'s schema-type normalization. `Function._serialize`
+/// keeps the keys in the order the client sent them, then the rest as declared,
+/// and leaves out an unset `strict` or `defer_loading`.
+pub(crate) fn function_dump(tool: &Value) -> Result<Map<String, Value>, String> {
+    let f = &tool["function"];
+    let name = f["name"].as_str().ok_or("tool function requires name")?;
+    let flag = |value: Option<&Value>| {
+        value
+            .filter(|value| !value.is_null())
+            .map(pydantic_bool)
+            .transpose()
+    };
+    let defer = match flag(f.get("defer_loading"))? {
+        Some(defer) => Some(defer),
+        None => flag(tool.get("defer_loading"))?,
+    };
+    let mut parameters = f["parameters"].clone();
+    normalize_json_schema_types(&mut parameters);
+    let declared = [
+        ("description", Some(f["description"].clone())),
+        ("name", Some(name.into())),
+        ("parameters", Some(parameters)),
+        ("strict", flag(f.get("strict"))?.map(Value::from)),
+        ("defer_loading", defer.map(Value::from)),
+    ];
+    let sent = f
+        .as_object()
+        .into_iter()
+        .flat_map(|function| function.keys().map(String::as_str));
+    let mut function = Map::new();
+    for key in sent.chain(declared.iter().map(|(key, _)| *key)) {
+        if let Some((_, Some(value))) = declared.iter().find(|(name, _)| *name == key) {
+            function.entry(key).or_insert_with(|| value.clone());
+        }
+    }
+    Ok(function)
 }
 
 /// pydantic's lax `bool`: booleans, 0 and 1, and the yes/no words in any case.

@@ -6,9 +6,9 @@ use std::collections::HashMap;
 
 use dynamo_protocols::types::{ChatCompletionRequestMessage, CreateChatCompletionRequest};
 use dynamo_renderer::RenderedPrompt;
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 
-use super::models::{normalize_json_schema_types, pydantic_bool};
+use super::models::{function_dump, pydantic_bool};
 use super::{
     ChatFormatter, TemplateArgsRequest, TemplateError, requested_effort, requested_thinking,
 };
@@ -94,48 +94,23 @@ fn jinja_tools(body: &Value) -> Option<Value> {
     let tools: Vec<Value> = tools
         .iter()
         .filter(|tool| named.is_none_or(|name| tool["function"]["name"] == name))
-        .map(tool_model_dump)
+        // A tool Python's validation rejects never reaches its template.
+        .filter_map(tool_model_dump)
         .collect();
     (!tools.is_empty()).then_some(Value::Array(tools))
 }
 
 /// `Tool.model_dump()`, after `_validate_request` normalizes the schema types.
-fn tool_model_dump(tool: &Value) -> Value {
-    let flag = |value: &Value| pydantic_bool(value).ok();
-    let f = &tool["function"];
-    let mut parameters = f["parameters"].clone();
-    normalize_json_schema_types(&mut parameters);
-    // `Function`'s fields as declared; `Tool._propagate_defer_loading` fills its
-    // flag, and `Function._serialize` drops an unset `strict` or `defer_loading`.
-    let declared = [
-        ("description", Some(f["description"].clone())),
-        ("name", Some(f["name"].clone())),
-        ("parameters", Some(parameters)),
-        ("strict", flag(&f["strict"]).map(Value::from)),
-        (
-            "defer_loading",
-            flag(&f["defer_loading"])
-                .or_else(|| flag(&tool["defer_loading"]))
-                .map(Value::from),
-        ),
-    ];
-    // `Function._serialize`: the keys in the order the client sent them, then
-    // the rest as declared.
-    let sent = f
-        .as_object()
-        .into_iter()
-        .flat_map(|f| f.keys().map(String::as_str));
-    let mut function = Map::new();
-    for key in sent.chain(declared.iter().map(|(key, _)| *key)) {
-        if let Some((_, Some(value))) = declared.iter().find(|(name, _)| *name == key) {
-            function.entry(key).or_insert_with(|| value.clone());
-        }
-    }
+fn tool_model_dump(tool: &Value) -> Option<Value> {
+    let defer = match &tool["defer_loading"] {
+        Value::Null => Value::Null,
+        defer => pydantic_bool(defer).ok()?.into(),
+    };
     let kind = tool
         .get("type")
         .cloned()
         .unwrap_or_else(|| "function".into());
-    json!({"type": kind, "function": function, "defer_loading": flag(&tool["defer_loading"])})
+    Some(json!({"type": kind, "function": function_dump(tool).ok()?, "defer_loading": defer}))
 }
 
 /// Python's `_handle_last_assistant_message`: a trailing assistant message's text

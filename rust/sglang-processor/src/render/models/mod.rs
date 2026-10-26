@@ -15,6 +15,5 @@ pub(super) use self::deepseek_v4::{
 pub(super) use self::glm53::{is_glm53, render as render_glm53};
 pub(super) use self::kimi_k3::render as render_kimi_k3;
 pub(super) use self::kimi_k25::{deep_sort, encode_tools_to_typescript};
-pub(super) use self::pydantic_dump::pydantic_bool;
+pub(super) use self::pydantic_dump::{function_dump, pydantic_bool};
 pub(super) use self::qwen38::{is_qwen38, render as render_qwen38, takes_content_parts};
-pub(super) use self::schema_types::normalize_json_schema_types;
