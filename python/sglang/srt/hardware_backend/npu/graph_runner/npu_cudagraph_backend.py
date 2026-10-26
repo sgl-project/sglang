@@ -24,6 +24,7 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
+from sglang.srt.hardware_backend.npu.eplb import isolate_npu_draft_recording
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
@@ -50,6 +51,7 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         *,
         enable_memory_saver: bool = False,
     ) -> None:
+        self.is_draft_worker = cuda_graph_runner.model_runner.is_draft_worker
         self._graphs: Dict[Any, Any] = {}
         self._outputs: Dict[Any, Any] = {}
         self._eplb_capture_states: Dict[ShapeKey, Dict[str, bool]] = {}
@@ -87,6 +89,7 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         finally:
             self._capture_stream = None
 
+    @isolate_npu_draft_recording
     def capture_one(
         self,
         shape_key: ShapeKey,

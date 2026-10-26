@@ -16,7 +16,7 @@
 
 import logging
 import os
-from contextlib import nullcontext
+from contextlib import contextmanager
 
 import torch
 
@@ -42,12 +42,20 @@ class NpuEplbCommunication:
 class NpuExpertDistributionRecorder(distribution._ExpertDistributionRecorderReal):
     """Reuse upstream recording while isolating NPU draft forward lifecycles."""
 
-    def with_forward_pass(self, forward_pass_id, forward_batch):
+    @contextmanager
+    def with_forward_pass(
+        self, forward_pass_id, forward_batch, *, is_draft_worker=False
+    ):
         # Draft runners share target statistics. Disabling hooks alone still
         # lets the base lifecycle reset counts and append an empty draft pass.
-        if self._disable_all:
-            return nullcontext({})
-        return super().with_forward_pass(forward_pass_id, forward_batch)
+        if is_draft_worker:
+            with self.disable_this_region():
+                yield {}
+        elif self._disable_all:
+            yield {}
+        else:
+            with super().with_forward_pass(forward_pass_id, forward_batch) as outputs:
+                yield outputs
 
 
 class NpuExpertDistributionGatherer(distribution._SelectExpertsSinglePassGatherer):
