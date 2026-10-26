@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -8,11 +9,25 @@ from sglang.srt.layers.attention.swa_mla import FlashInferMLASWA
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
-register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 
 def test_cpu_keeps_fallback():
     assert FlashInferMLASWA.create("cpu") is None
+
+
+def test_older_flashinfer_keeps_fallback(monkeypatch):
+    import flashinfer.mla as mla
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (9, 0))
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device: SimpleNamespace(shared_memory_per_block_optin=227328),
+    )
+    monkeypatch.setattr(mla, "batch_decode_with_kv_cache_mla_swa", None, raising=False)
+    assert FlashInferMLASWA.create("cuda:0") is None
 
 
 @pytest.mark.parametrize(
@@ -181,3 +196,7 @@ def test_public_api_adapter_and_fallback(monkeypatch, tmp_path, sq):
     with pytest.raises(RuntimeError, match="must propagate"):
         adapter.forward(q, kv, table, lengths, layer, 1088, 1024, 513)
     assert len(calls) == 1
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__]))
