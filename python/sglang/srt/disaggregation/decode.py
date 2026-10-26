@@ -469,15 +469,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
 
         enable_kv_checksum = get_disagg().disaggregation_enable_kv_checksum
-        if enable_kv_checksum and get_disagg().disaggregation_decode_enable_radix_cache:
-            # The digest covers the whole prompt; with a decode-side prefix
-            # hit the prefill sends only the suffix, so every hit would look
-            # like corruption. No digest is the safe direction.
-            logger.warning(
-                "KV checksum disabled: not supported together with "
-                "--disaggregation-decode-enable-radix-cache."
-            )
-            enable_kv_checksum = False
         self.kv_checksum_signature = 0
         # Test-only mismatch injector. Its own generator, seeded per rank: the
         # global `random` is seeded identically on every TP rank, so drawing
@@ -3304,8 +3295,16 @@ class SchedulerDisaggregationDecodeMixin:
             # no longer describes it.
             req.expected_kv_checksum = 0
             seq_len = len(req.origin_input_ids)
-            page_indices_gpu = page_indices_for_request(self, req, seq_len)
-            state_indices = state_indices_for_request(self, req, seq_len)
+            # The tree cache owns [0, cache_protected_len): the prefix this
+            # decode promised at bootstrap, so prefill sent and digested only
+            # what follows it.
+            start_idx = req.kv.cache_protected_len
+            page_indices_gpu = page_indices_for_request(
+                self, req, seq_len, start_idx=start_idx
+            )
+            state_indices = state_indices_for_request(
+                self, req, seq_len, start_idx=start_idx
+            )
             actual = computer.compute(page_indices_gpu, state_indices)
             if (
                 mismatch_prob > 0

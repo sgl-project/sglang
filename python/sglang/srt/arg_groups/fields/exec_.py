@@ -330,7 +330,9 @@ class ExecKernel(msgspec.Struct):
         str,
         Arg(
             help="DeepSeek V4 attention backend. 'auto' (default) resolves to "
-            "'flashmla_mega' where it is supported and 'flashmla' otherwise. "
+            "'flashmla' where 'flashmla_mega' is unsupported or, outside PD "
+            "disaggregation, where attention is tensor-parallel across ranks "
+            "(attention TP > 1), and to 'flashmla_mega' otherwise. "
             "'trtllm' (opt-in, SM100/SM103 with FP8 KV cache) "
             "switches the SWA/compressed KV pools to a "
             "uniform 512-dim FP8 layout and runs decode and sparse prefill "
@@ -956,7 +958,7 @@ class ExecMoe(msgspec.Struct):
     ] = False
     enforce_shared_experts_fusion: A[
         bool,
-        "Enforce shared experts fusion even when it would normally be disabled (e.g. under DeepEP). Mutually exclusive with --disable-shared-experts-fusion.",
+        "Enforce shared experts fusion even when it would normally be disabled (e.g. under DeepEP). On a Quark MXFP4 Qwen3.5/Qwen3.8 checkpoint that excludes its shared expert from quantization, this also quantizes that shared expert to MXFP4 while loading so it can be fused, which runs its weights and its input activations at MXFP4 where the standalone path ran in BF16 - validate accuracy before using it. Mutually exclusive with --disable-shared-experts-fusion.",
     ] = False
 
     # -------------------------------------------------------------------------
@@ -965,9 +967,10 @@ class ExecMoe(msgspec.Struct):
     enable_paged_experts: A[
         bool,
         "Keep only --paged-experts-num-resident routed experts per MoE layer on the GPU and page "
-        "the rest from pinned host memory on demand. Unquantized, block-FP8 or GPTQ experts, "
-        "single GPU. Decode CUDA graphs (full backend) are captured up to K // top_k requests; "
-        "prefill graphs must be breakable or disabled.",
+        "the rest from pinned host memory on demand. Single GPU; the experts must run on the "
+        "triton or Marlin MoE runner (supported quantizations: see the Paged Experts docs). "
+        "Decode CUDA graphs (full backend) are captured up to K // top_k requests; prefill "
+        "graphs must be breakable or disabled.",
     ] = False
     paged_experts_num_resident: A[
         Optional[int],
