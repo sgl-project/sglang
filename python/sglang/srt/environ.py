@@ -609,8 +609,8 @@ class Envs:
     # Index a compact-window DFLASH draft KV pool by the hybrid-SWA target's
     # sliding-window slots (pool and HiCache host pool sized like the target's
     # SWA pool) instead of its full-attention slots. Needs draft window <= the
-    # target's sliding window.
-    SGLANG_ENABLE_DFLASH_SWA_DRAFT_KV = EnvBool(False)
+    # target's sliding window; ignored (with the reason logged) where it does not apply.
+    SGLANG_ENABLE_DFLASH_SWA_DRAFT_KV = EnvBool(True)
 
     # ===================================================================
     # Scheduler token budgeting and admission
@@ -1957,25 +1957,12 @@ class Envs:
     # Ulysses all-to-alls in row chunks on a side stream, overlapped with the chunks' QKV / O projections
     # (needs SGLANG_MUSE_ULYSSES_LOCAL_GATE).
     SGLANG_MUSE_ULYSSES_PIPELINE = EnvBool(True)
-    # SP prefill experts in two half-shard passes: one half's gather / reduce-scatter overlaps the other's experts.
-    SGLANG_MUSE_PREFILL_MOE_OVERLAP = EnvBool(True)
     # TP4 compact A4 verify: one kernel runs the MoE finalize and pushes the all-reduce over xGMI (bitwise the
-    # FlyDSL finalize + aiter two-stage all-reduce); off until measured end to end.
-    SGLANG_MUSE_FINALIZE_AR_PUSH = EnvBool(False)
+    # FlyDSL finalize + aiter two-stage all-reduce).
+    SGLANG_MUSE_FINALIZE_AR_PUSH = EnvBool(True)
     SGLANG_MUSE_DENSE_TUNED = EnvBool(True)
     SGLANG_MUSE_SHARED_ROUTER_POOLER = EnvBool(True)
     SGLANG_MUSE_JOINT_ROUTER_POOLER = EnvBool(True)
-    # Directory for the routed-expert statistics of decode / verify forwards (rocm_muse_spark/expert_stats.py);
-    # unset records nothing.
-    SGLANG_MUSE_EXPERT_STATS_PATH = EnvStr(None)
-    # JSON per-layer expert placement over the EP ranks (rocm_muse_spark/expert_placement.py); unset keeps
-    # the checkpoint order (rank r owns experts [r * E / EP, (r + 1) * E / EP)).
-    SGLANG_MUSE_EXPERT_PLACEMENT = EnvStr(None)
-    # Redundant expert replicas per EP rank and MoE layer for TP4 compact A4 verify
-    # (rocm_muse_spark/expert_replicas.py); 0 keeps one copy of every expert.
-    SGLANG_MUSE_EXPERT_REPLICAS = EnvInt(0)
-    # Replica plan JSON (harness replica_plan.py); required when SGLANG_MUSE_EXPERT_REPLICAS > 0.
-    SGLANG_MUSE_EXPERT_REPLICA_PLAN = EnvStr(None)
     SGLANG_USE_CUSTOM_ROUTER_SUM = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_USE_TRITON_ROUTER_SUM"
     )

@@ -268,19 +268,11 @@ def run_compact_a4_allreduce(
     eps,
     gain,
     quantized=None,
-    replicas=None,
 ):
-    """Compact A4 experts of this rank, then the fused finalize + TP all-reduce: the reduced MoE output.
-    ``replicas`` (expert_replicas.LayerReplicas) runs the rank's step share of home + replica experts."""
+    """Compact A4 experts of this rank, then the fused finalize + TP all-reduce: the reduced MoE output."""
     from sglang.kernels.ops.moe.mxfp4_compact_a4_moe import compact_a4_experts
-    from sglang.srt.rocm_muse_spark.mxfp4_moe import (
-        _compact_a4_operands,
-        compact_a4_with_replicas,
-    )
+    from sglang.srt.rocm_muse_spark.mxfp4_moe import _compact_a4_operands
 
-    if replicas is not None:
-        y, lids = compact_a4_with_replicas(x, ids, experts, replicas, quantized)
-        return op(y, norm_weight, scores, lids, 0, replicas.num_local, eps, gain)
     y = compact_a4_experts(
         x, ids, *_compact_a4_operands(experts), local_start=local_start,
         shuffled=experts.native_dropped, quantized=quantized,
