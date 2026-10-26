@@ -23,6 +23,7 @@ from sglang.srt.beam_search.output import (
     pack_beam_search_output,
 )
 from sglang.srt.disaggregation.mode import DisaggregationMode
+from sglang.srt.elastic_ep.topology import response_dp_rank
 from sglang.srt.environ import envs
 from sglang.srt.managers.incremental_detokenize import build_detokenize_header
 from sglang.srt.managers.io_struct import (
@@ -331,7 +332,7 @@ class SchedulerOutputStreamer:
 
         # Send to detokenizer
         payload = acc.to_payload(
-            dp_rank=get_parallel().dp_rank,
+            dp_rank=response_dp_rank(),
             is_idle_batch=is_idle_batch,
         )
         if payload is not None:
