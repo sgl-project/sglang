@@ -16,7 +16,7 @@ from sglang.srt.utils import is_gfx95_supported
 
 
 @triton.jit
-def scale_cast_to_cache(x, inv_scale, cache_ptr, SCALED: tl.constexpr):
+def _scale_cast_to_cache(x, inv_scale, cache_ptr, SCALED: tl.constexpr):
     # Same bytes as the unfused store: torch divides a bf16/fp16 tensor by a
     # Python scalar as x * (1/scale) in fp32, rounds to the input dtype, then
     # casts to the cache dtype.
@@ -25,7 +25,7 @@ def scale_cast_to_cache(x, inv_scale, cache_ptr, SCALED: tl.constexpr):
     return x.to(cache_ptr.dtype.element_ty)
 
 
-def cache_inv_scale(
+def _cache_inv_scale(
     scale: Optional[float], x: torch.Tensor, cache: torch.Tensor
 ) -> Optional[float]:
     # As in MHATokenToKVPool.set_kv_buffer: a scale applies only where the store
@@ -747,19 +747,19 @@ def _kv_block(
             k_cache_ptr + loc * k_cache_stride_s + heads * k_cache_stride_h,
             k_cache_stride_d,
             kv_mask,
-            scale_cast_to_cache(a, k_inv_scale, k_cache_ptr, K_SCALED),
-            scale_cast_to_cache(b, k_inv_scale, k_cache_ptr, K_SCALED),
-            scale_cast_to_cache(c, k_inv_scale, k_cache_ptr, K_SCALED),
-            scale_cast_to_cache(d, k_inv_scale, k_cache_ptr, K_SCALED),
+            _scale_cast_to_cache(a, k_inv_scale, k_cache_ptr, K_SCALED),
+            _scale_cast_to_cache(b, k_inv_scale, k_cache_ptr, K_SCALED),
+            _scale_cast_to_cache(c, k_inv_scale, k_cache_ptr, K_SCALED),
+            _scale_cast_to_cache(d, k_inv_scale, k_cache_ptr, K_SCALED),
         )
         _store_quarters(
             v_cache_ptr + loc * v_cache_stride_s + heads * v_cache_stride_h,
             v_cache_stride_d,
             kv_mask,
-            scale_cast_to_cache(v_a, v_inv_scale, v_cache_ptr, V_SCALED),
-            scale_cast_to_cache(v_b, v_inv_scale, v_cache_ptr, V_SCALED),
-            scale_cast_to_cache(v_c, v_inv_scale, v_cache_ptr, V_SCALED),
-            scale_cast_to_cache(v_d, v_inv_scale, v_cache_ptr, V_SCALED),
+            _scale_cast_to_cache(v_a, v_inv_scale, v_cache_ptr, V_SCALED),
+            _scale_cast_to_cache(v_b, v_inv_scale, v_cache_ptr, V_SCALED),
+            _scale_cast_to_cache(v_c, v_inv_scale, v_cache_ptr, V_SCALED),
+            _scale_cast_to_cache(v_d, v_inv_scale, v_cache_ptr, V_SCALED),
         )
 
 
@@ -1033,7 +1033,7 @@ def _sparse_qk_index_gemma_rmsnorm_rope_cache_kernel(
     )
     tl.store(
         cache_k_base,
-        scale_cast_to_cache(out_typed, k_inv_scale, k_cache_ptr, K_SCALED),
+        _scale_cast_to_cache(out_typed, k_inv_scale, k_cache_ptr, K_SCALED),
         mask=store_kv,
     )
 
@@ -1047,7 +1047,7 @@ def _sparse_qk_index_gemma_rmsnorm_rope_cache_kernel(
     )
     tl.store(
         cache_v_base,
-        scale_cast_to_cache(v_val, v_inv_scale, v_cache_ptr, V_SCALED),
+        _scale_cast_to_cache(v_val, v_inv_scale, v_cache_ptr, V_SCALED),
         mask=store_kv,
     )
 
@@ -1332,8 +1332,8 @@ def sparse_qk_index_gemma_rmsnorm_rope_cache(
     k_out = torch.empty(k.shape, dtype=k.dtype, device=k.device)
     idx_q_out = torch.empty(idx_q.shape, dtype=idx_q.dtype, device=idx_q.device)
     idx_k_out = torch.empty(idx_k.shape, dtype=idx_k.dtype, device=idx_k.device)
-    k_inv_scale = None if nvfp4 else cache_inv_scale(k_scale, k, k_cache)
-    v_inv_scale = None if nvfp4 else cache_inv_scale(v_scale, v, v_cache)
+    k_inv_scale = None if nvfp4 else _cache_inv_scale(k_scale, k, k_cache)
+    v_inv_scale = None if nvfp4 else _cache_inv_scale(v_scale, v, v_cache)
     # The tiled kernel is laid out for the MiniMax-M3 head (128 columns, 64 rotary)
     # and measured on gfx950; elsewhere the per-head kernel gives the same bits.
     if not (
