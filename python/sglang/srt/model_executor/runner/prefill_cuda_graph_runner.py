@@ -49,19 +49,16 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 import torch
 import tqdm
 
-from sglang.kernels.ops.kvcache.kv_indices import (
+from sglang.kernels.ops.attention.kv_indices import (
     create_chunked_prefix_cache_kv_indices,
 )
 from sglang.srt.configs.model_config import is_qwen4_exp
 from sglang.srt.distributed.parallel_state import graph_capture
+from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
-from sglang.srt.layers.cp.bcg import (
+from sglang.srt.layers.cp.bcg import supports_prefill_cp_bcg
+from sglang.srt.layers.cp.bcg.bcg import (
     PrefillCPBCGInput,
-)
-from sglang.srt.layers.cp.bcg import (
-    enable_cp_bcg_capture as should_enable_cp_bcg_capture,
-)
-from sglang.srt.layers.cp.bcg import (
     execute_prefill_cp_bcg,
     filter_prefill_cp_bcg_capture_num_tokens,
 )
@@ -117,9 +114,6 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     TCPCG_FAILURE_HINT,
     set_tc_piecewise_forward_context,
 )
-from sglang.srt.model_executor.runner_utils import (
-    maybe_publish_prefill_shared_read_done,
-)
 from sglang.srt.model_executor.runner_utils.buffers import (
     PrefillInputBuffers,
 )
@@ -127,6 +121,10 @@ from sglang.srt.model_executor.runner_utils.capture_mode import model_capture_mo
 from sglang.srt.model_executor.runner_utils.forward_batch import set_forward_batch
 from sglang.srt.model_executor.runner_utils.pool import (
     get_or_create_global_graph_capture_stream,
+)
+from sglang.srt.model_executor.runner_utils.prefill_graph import prefill_graph_scope
+from sglang.srt.model_executor.runner_utils.shared_read_event import (
+    maybe_publish_prefill_shared_read_done,
 )
 from sglang.srt.model_loader.utils import resolve_language_model
 from sglang.srt.runtime_context import (
@@ -300,6 +298,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     _use_draft_input_embeds = False
     _fa4_prefill = False
     _backend_can_run_prefill_cuda_graph = None
+    # The backend's batch-dependent check, judged from a ScheduleBatch for the DP vote.
+    _backend_vote_prefill_cuda_graph = None
     _captured_attn_metadata_max_bs: Optional[int] = None
     dllm_attention = None
 
@@ -325,6 +325,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             if self.dllm_attention is not None
             else getattr(model_runner.attn_backend, "can_run_prefill_cuda_graph", None)
         )
+        self._backend_vote_prefill_cuda_graph = getattr(
+            model_runner.attn_backend, "vote_prefill_cuda_graph", None
+        )
         prefill_attn_backend = getattr(
             model_runner.attn_backend, "prefill_backend", model_runner.attn_backend
         )
@@ -332,6 +335,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # --- model flags ----------------------------------------------
         self.quant_config = getattr(model_runner.model, "quant_config", None)
         self.is_multimodal = model_runner.model_config.is_multimodal
+        self.is_dsv41_model = (
+            model_runner.model_config.hf_config.model_type == "deepseek_v41"
+        )
         self.enable_lora = model_runner.lora_manager is not None
         # Classification/reward forwards branch on return_pooled_hidden_states;
         # capture must use the same flag value as replay for those models.
@@ -366,6 +372,16 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self.max_bs = model_runner.req_to_token_pool.size
         self.max_context_size = prefill_config.max_context_size
         self.max_seq_len = prefill_config.max_seq_len
+        if self.max_seq_len is None:
+            self.max_seq_len = (
+                model_runner.attn_backend.prefill_cuda_graph_default_max_seq_len
+            )
+            if self.max_seq_len is not None:
+                logger.info(
+                    "Prefill CUDA graph replays contexts up to %d tokens, the "
+                    "attention backend's default; longer contexts run eager prefill.",
+                    self.max_seq_len,
+                )
         self._validate_max_context_capacity(
             max_context_size=self.max_context_size,
             table_width=model_runner.req_to_token_pool.req_to_token.shape[1],
@@ -592,7 +608,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         server_args = model_runner.server_args
         self.enable_cp_bcg_capture = isinstance(
             self.backend, BreakableCudaGraphBackend
-        ) and should_enable_cp_bcg_capture(server_args)
+        ) and supports_prefill_cp_bcg(server_args)
         if self.enable_cp_bcg_capture:
             if self.max_context_size is not None:
                 # TODO(SYChen123): Preserve max_seq_len_override through CP's padded
@@ -764,6 +780,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
     def _get_layer_model_positions(self, forward_batch: ForwardBatch) -> torch.Tensor:
         """Mirror outer multimodal wrappers when BCG captures layer_model directly."""
+        if self.enable_cp_bcg_capture:
+            cp_positions = self.prefill_cp_bcg_input.model_positions(forward_batch)
+            if cp_positions is not None:
+                return cp_positions
         if forward_batch.mrope_positions is None:
             return forward_batch.positions
 
@@ -795,8 +815,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     ):
         with (
             set_forward_batch(forward_batch),
+            prefill_graph_scope(
+                full_graph=self._is_full_backend, raw_num_tokens=raw_num_tokens
+            ),
             forward_context(
-                ForwardContext(attn_backend=self.model_runner.attn_backend)
+                ForwardContext(attn_backend=self.model_runner.attn_backend),
+                forward_batch=forward_batch,
             ),
             set_tc_piecewise_forward_context(
                 forward_batch,
@@ -928,8 +952,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         with (
             set_forward_batch(fb),
+            prefill_graph_scope(full_graph=self._is_full_backend),
             forward_context(
-                ForwardContext(attn_backend=self.model_runner.attn_backend)
+                ForwardContext(attn_backend=self.model_runner.attn_backend),
+                forward_batch=fb,
             ),
             set_tc_piecewise_forward_context(
                 fb,
@@ -953,12 +979,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # DSV4 DP attention / DeepEP collectives need every DP rank to enter
         # the same replay path. Sparse-DP batches (one or more ranks with
         # zero local tokens) fall back to eager to avoid hanging ranks.
-        # MegaMoE graphs without a captured DP gather tolerate per-rank buckets
-        # and an eager idle rank; graphs with one fall through to the check.
+        # MegaMoE graphs without a captured DP gather or rank barrier tolerate
+        # per-rank buckets and an eager idle rank; others fall through.
         global_num_tokens = forward_batch.global_num_tokens_cpu
         if global_num_tokens is None:
             return False
-        if prefill_graph_tolerates_sum_len():
+        if (
+            prefill_graph_tolerates_sum_len()
+            and not get_flags().dp.prefill_graph_has_rank_barrier
+        ):
             return False
         return len(global_num_tokens) > 1 and any(
             int(num_tokens) == 0 for num_tokens in global_num_tokens
@@ -1210,7 +1239,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         and stash the returned per-bucket metadata object; otherwise fall
         back to the generic eager init that BCG/TC_PIECEWISE use today."""
         attn_backend = self.model_runner.attn_backend
-        with forward_context(ForwardContext(attn_backend=attn_backend)):
+        with forward_context(
+            ForwardContext(attn_backend=attn_backend), forward_batch=forward_batch
+        ):
             if not self.use_captured_attn_metadata:
                 attn_backend.init_forward_metadata(forward_batch)
                 return
@@ -1227,7 +1258,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         forward_batch: ForwardBatch,
         static_forward_batch: ForwardBatch,
         shape_key: ShapeKey,
-    ) -> None:
+    ) -> SharedReadEnds:
         """Replay-time metadata refresh for the BCG-with-captured-metadata
         contract. For opt-in backends, refresh the stashed per-bucket
         metadata in place against the current batch; otherwise fall back
@@ -1236,6 +1267,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         real seq_lens / prefix_lens; the captured kernels read the
         updated state at replay."""
         attn_backend = self.model_runner.attn_backend
+        build_snapshot = False
         if self._is_full_backend:
             # Slot-padded shallow view: plan() must see exactly req_slots
             # entries (real values in [:bs], sentinels in [bs:req_slots]
@@ -1259,19 +1291,28 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             padded_view.max_seq_len_override = static_forward_batch.max_seq_len_override
             padded_view.input_ids = static_forward_batch.input_ids
             attn_backend.init_forward_metadata_out_graph(padded_view)
-            return
-        if not self.use_captured_attn_metadata:
-            attn_backend.init_forward_metadata(forward_batch)
-            attn_backend.prepare_prefill_shared_read_snapshot(
-                forward_batch, num_qo_tokens=shape_key.size
+        elif not self.use_captured_attn_metadata:
+            # An idle DP rank retains the padded graph shape for collective
+            # participation, but has no real sparse queries or KV writes.
+            if not (
+                attn_backend.skips_prefill_metadata_on_idle_dp_rank
+                and getattr(forward_batch, "global_num_token_non_padded_cpu", None) == 0
+            ):
+                attn_backend.init_forward_metadata(forward_batch)
+                build_snapshot = True
+        else:
+            assert self.attn_metadata_buffers is not None
+            metadata = self.attn_metadata_buffers[shape_key]
+            attn_backend.prepare_forward_metadata_for_breakable_cuda_graph_replay(
+                metadata,
+                forward_batch,
+                static_forward_batch=static_forward_batch,
             )
-            return
-        assert self.attn_metadata_buffers is not None
-        metadata = self.attn_metadata_buffers[shape_key]
-        attn_backend.prepare_forward_metadata_for_breakable_cuda_graph_replay(
-            metadata,
+
+        return attn_backend.resolve_prefill_shared_read_ends(
             forward_batch,
-            static_forward_batch=static_forward_batch,
+            num_qo_tokens=shape_key.size,
+            build_snapshot=build_snapshot,
         )
 
     @staticmethod
@@ -1304,6 +1345,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         ``capture_hidden_mode=None`` when unknown at the call site (it is
         rank-uniform; forward-time-only checking cannot split the group).
         """
+        if getattr(
+            self, "enable_cp_bcg_capture", False
+        ) and not self.prefill_cp_bcg_input.allows_replay(
+            batch_size, num_tokens, prefix_lens, contains_mm_inputs
+        ):
+            return False
         if contains_mm_inputs and (
             self._qwen_bcg_hc_sidechannel or self._qwen_bcg_mtp_draft
         ):
@@ -1634,6 +1681,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         return forward_batch, self.model_runner.attn_backend
 
     def capture(self) -> None:
+        with self.model_context():
+            self._capture()
+
+    def _capture(self) -> None:
         # Warm up + autotune kernels once before capture (run-once across the
         # decode + prefill runners; see BaseRunner.warmup).
         self.warmup()
@@ -1696,6 +1747,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         """
         num_tokens = size
         forward_batch, attn_backend = self.capture_prepare(num_tokens)
+        # Recapture can follow decode replay, which may change model-owned storage.
+        prepare = getattr(self.model_runner.model, "prepare_for_forward", None)
+        if prepare is not None:
+            prepare(forward_batch)
         if self.enable_cp_bcg_capture:
             assert self.prefill_cp_bcg_input is not None
             self.prefill_cp_bcg_input.prepare(
@@ -1739,6 +1794,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             self._init_forward_metadata_for_capture(forward_batch, shape_key)
 
         def run_once():
+            if forward_batch.lora_ids is not None:
+                self.model_runner.lora_manager.reset_routing_cache()
             # Record LoRA kernels even when capture uses base-model requests.
             with (
                 model_capture_mode()
@@ -1785,10 +1842,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             post_warmup_hook=post_warmup_hook,
         )
 
-    def load_batch(self, forward_batch: ForwardBatch, **kwargs) -> ForwardBatch:
-        """Pad, populate static buffers, and build the static_forward_batch
-        the model code reads during replay.
-        """
+    def load_batch(
+        self, forward_batch: ForwardBatch, **kwargs
+    ) -> tuple[ForwardBatch, SharedReadEnds]:
+        """Pad, fill static buffers, and prepare replay metadata and its read end."""
         num_tokens = len(forward_batch.input_ids)
         static_num_tokens = self._pad_to_bucket(num_tokens, self.capture_num_tokens)
         if getattr(self, "enable_cp_bcg_capture", False) and is_cp_active(
@@ -1934,6 +1991,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             mamba_track_indices=mamba_track_indices,
             mamba_track_mask=mamba_track_mask,
             mamba_track_seqlens=mamba_track_seqlens,
+            # CP replay plans attention against this static view, including
+            # KDA's host-side checkpoint plan for the current request.
+            mamba_prefill_track_mask_cpu=forward_batch.mamba_prefill_track_mask_cpu,
+            mamba_track_seqlens_cpu=forward_batch.mamba_track_seqlens_cpu,
             encoder_lens=forward_batch.encoder_lens,
             return_logprob=(
                 forward_batch.return_logprob
@@ -1991,6 +2052,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # The n-gram hasher runs outside the graph and reads this at replay.
         static_forward_batch.ngram_embedding_info = forward_batch.ngram_embedding_info
         static_forward_batch.engram_history = forward_batch.engram_history
+        # The engram lookup break reads the staged rows at replay.
+        static_forward_batch.engram_staged_rows = forward_batch.engram_staged_rows
+        # The encoder replay fold: a replay builds the same window floors and
+        # compressor slots as an eager prefill.
+        static_forward_batch.encoder_swa_replay = forward_batch.encoder_swa_replay
+        static_forward_batch.encoder_swa_row_floor = forward_batch.encoder_swa_row_floor
+        static_forward_batch.encoder_swa_compress_rows = (
+            forward_batch.encoder_swa_compress_rows
+        )
         static_forward_batch = self.model_runner.prepare_dummy_forward_batch(
             static_forward_batch
         )
@@ -2062,11 +2132,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             metadata_forward_batch = static_forward_batch
 
         shape_key = self._shape_key(static_num_tokens, forward_batch)
-        self._prepare_forward_metadata_for_replay(
+        shared_read_ends = self._prepare_forward_metadata_for_replay(
             metadata_forward_batch, static_forward_batch, shape_key
         )
 
-        return static_forward_batch
+        return static_forward_batch, shared_read_ends
 
     def _fill_input_embeds_slot(self, args, layer_kwargs, static_num_tokens: int):
         """A text-only batch would otherwise replay the captured input_embeds."""
@@ -2115,6 +2185,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         full_path = self._is_full_backend
 
         def replay_layer_forward(*args, **layer_kwargs):
+            prepared_ids = layer_kwargs.get("input_ids", args[0] if args else None)
+            # TODO: Add general multimodal replay tests before enabling for other models.
+            if self.is_dsv41_model and prepared_ids is not None:
+                static_forward_batch.input_ids[: prepared_ids.shape[0]].copy_(
+                    prepared_ids
+                )
             # The captured body graph reads activations from the static
             # input_embeds slot. The outer model.forward (run eagerly)
             # passes the live embeddings into layer_model.forward as the
@@ -2254,23 +2330,35 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 f"capture mode ({self.capture_hidden_mode.name})."
             )
 
+    def _wait_for_layer_loads(self) -> None:
+        # Full replay skips the per-layer load waits in the pool accessors; breakable
+        # replay still runs them at its eager breaks.
+        if not self._is_full_backend:
+            return
+        counter = self.model_runner.token_to_kv_pool.layer_transfer_counter
+        if counter is not None and counter.consumer_index >= 0:
+            counter.wait_until(counter.num_layers - 1)
+
     def execute(
         self, forward_batch: ForwardBatch, **kwargs
     ) -> Optional[Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]]:
         self._validate_capture_hidden_mode(forward_batch)
-        with self.backend.replay_session():
-            static_forward_batch = self.load_batch(forward_batch, **kwargs)
+        with self.model_context(), self.backend.replay_session():
+            static_forward_batch, shared_read_ends = self.load_batch(
+                forward_batch, **kwargs
+            )
             static_num_tokens = len(static_forward_batch.input_ids)
             raw_num_tokens = self.raw_num_tokens
             shape_key = self._shape_key(static_num_tokens, forward_batch)
             # The only variants this runner records are chunked-prefix ones.
             if shape_key.variant_label is not None:
                 self._prepare_chunked_prefix_replay(shape_key, forward_batch)
-            # Replay prep, including the optional chunked-prefix gather above,
-            # has finished every scheduler-shared read.
+            # Publish after replay prep, including the chunked-prefix gather
+            # above, which also reads the shared tables.
             maybe_publish_prefill_shared_read_done(
-                self.model_runner, forward_batch, self.device_module
+                self.model_runner, shared_read_ends, self.device_module
             )
+            self._wait_for_layer_loads()
 
             if self.enable_cp_bcg_capture:
                 assert self.max_context_size is None, (
