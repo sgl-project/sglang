@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import math
 import pickle
 import uuid
 from array import array
@@ -231,6 +232,11 @@ class GenerateReqInput:
     # If return logprobs, the start location in the prompt for returning logprobs.
     # By default, this value is "-1", which means it will only return logprobs for output tokens.
     logprob_start_len: Optional[Union[List[int], int]] = None
+    # Temperature applied only when computing input-token logprobs. This is
+    # independent of sampling_params.temperature, which controls decoding.
+    input_logprob_temperature: Optional[Union[List[float], float]] = field(
+        default=None, kw_only=True
+    )
     # If return logprobs, the number of top logprobs to return at each position.
     top_logprobs_num: Optional[Union[List[int], int]] = None
     # If return logprobs, the token ids to return logprob for.
@@ -566,6 +572,9 @@ class GenerateReqInput:
             self.return_logprob = False
         if self.logprob_start_len is None:
             self.logprob_start_len = -1
+        if self.input_logprob_temperature is None:
+            self.input_logprob_temperature = 1.0
+        self._validate_input_logprob_temperatures([self.input_logprob_temperature])
         if self.top_logprobs_num is None:
             self.top_logprobs_num = 0
         if not self.token_ids_logprob:  # covers both None and []
@@ -796,6 +805,15 @@ class GenerateReqInput:
         self.logprob_start_len = normalize_param(
             self.logprob_start_len, -1, "logprob_start_len"
         )
+        self.input_logprob_temperature = normalize_param(
+            self.input_logprob_temperature, 1.0, "input_logprob_temperature"
+        )
+        if len(self.input_logprob_temperature) != num:
+            raise ValueError(
+                "The length of input_logprob_temperature should be equal to "
+                "the batch size."
+            )
+        self._validate_input_logprob_temperatures(self.input_logprob_temperature)
         self.top_logprobs_num = normalize_param(
             self.top_logprobs_num, 0, "top_logprobs_num"
         )
@@ -818,6 +836,19 @@ class GenerateReqInput:
         elif self.parallel_sample_num > 1:
             raise ValueError(
                 "Cannot use list token_ids_logprob with parallel_sample_num > 1"
+            )
+
+    @staticmethod
+    def _validate_input_logprob_temperatures(temperatures):
+        if any(
+            isinstance(temperature, bool)
+            or not isinstance(temperature, (int, float))
+            or not math.isfinite(temperature)
+            or temperature <= 0
+            for temperature in temperatures
+        ):
+            raise ValueError(
+                "input_logprob_temperature must contain positive finite numbers."
             )
 
     def _normalize_return_hidden_states(self, num):
@@ -983,6 +1014,7 @@ class GenerateReqInput:
             watermark=self.watermark[i],
             return_logprob=self.return_logprob[i],
             logprob_start_len=self.logprob_start_len[i],
+            input_logprob_temperature=self.input_logprob_temperature[i],
             top_logprobs_num=self.top_logprobs_num[i],
             token_ids_logprob=self.token_ids_logprob[i],
             return_sampling_mask=self.return_sampling_mask[i],
@@ -1177,6 +1209,9 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     sampling_logprobs_mode: SamplingLogprobsMode = "selected"
     # LoRA adapter name; KV events namespace this request's blocks by it.
     lora_name: Optional[str] = None
+
+    # Temperature applied only when computing input-token logprobs.
+    input_logprob_temperature: float = 1.0
 
     def wrap_pickle_fields(self):
         self.time_stats = wrap_as_pickle(self.time_stats)

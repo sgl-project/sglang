@@ -310,6 +310,7 @@ class Session:
             stream=req.stream,
             return_logprob=req.return_logprob,
             top_logprobs_num=req.top_logprobs_num,
+            input_logprob_temperature=req.input_logprob_temperature,
             token_ids_logprob=req.token_ids_logprob,
             return_sampling_mask=req.return_sampling_mask,
             sampling_logprobs_mode=req.sampling_logprobs_mode,
