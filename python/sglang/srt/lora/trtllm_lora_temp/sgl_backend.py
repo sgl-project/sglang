@@ -12,7 +12,7 @@ Registration occurs when this module is imported during model construction.
 from sglang.srt.layers.moe.moe_runner.base import register_fused_func
 
 
-@register_fused_func("none", "experimental_sgl_trtllm")
+@register_fused_func("none", "experimental_sgl_trtllm", preserves_input=True)
 def fused_experts_none_to_experimental_sgl_trtllm(
     dispatch_output, quant_info, runner_config
 ):

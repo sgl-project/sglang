@@ -224,7 +224,7 @@ def _moe_stub(rank, *, dual, shared_tp1):
     experts = FusedMoE.__new__(FusedMoE)
     torch.nn.Module.__init__(experts)
     experts.forward = run_experts
-    experts.quant_method = None
+    experts.quant_method = SimpleNamespace(preserves_input=lambda layer: True)
     experts.moe_runner_config = SimpleNamespace(inplace=False)
     experts.runner_backend = MoeRunnerBackend.AITER
     gate.rocm_router_max_tokens = -1  # the split-K router never serves the fake gate

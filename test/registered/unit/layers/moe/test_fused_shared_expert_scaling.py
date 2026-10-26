@@ -860,6 +860,66 @@ class TestDeepseekMoeEpilogue(CustomTestCase):
                 self.assertEqual(calls, ["routed", "shared"])
                 torch.testing.assert_close(actual, x * 5.5)
 
+    def test_experimental_aliases_preserve_base_capture_overlap(self):
+        """Experimental aliases must retain routed-first capture without adapters."""
+        from sglang.srt.layers.moe.moe_runner import (  # noqa: F401
+            flashinfer_trtllm,
+            marlin,
+        )
+        from sglang.srt.layers.moe.moe_runner.runner import MoeRunner
+        from sglang.srt.lora.layers import FusedMoEWithLoRA
+        from sglang.srt.lora.marlin_lora_temp import (  # noqa: F401
+            sgl_backend as marlin_alias,
+        )
+        from sglang.srt.lora.trtllm_lora_temp import (  # noqa: F401
+            sgl_backend as trtllm_alias,
+        )
+        from sglang.srt.model_executor.runner_utils.capture_mode import (
+            model_capture_mode,
+        )
+
+        x = torch.arange(1, 7, dtype=torch.float32).reshape(2, 3)
+        for alias, stock in (
+            (MoeRunnerBackend.EXPERIMENTAL_SGL_MARLIN, MoeRunnerBackend.MARLIN),
+            (
+                MoeRunnerBackend.EXPERIMENTAL_SGL_TRTLLM,
+                MoeRunnerBackend.FLASHINFER_TRTLLM,
+            ),
+        ):
+            for wrapped in (False, True):
+                with self.subTest(alias=alias, wrapped=wrapped):
+                    moe = self._moe(inplace=True, backend=alias)
+                    base = moe.experts
+                    stock_runner = MoeRunner(stock, base.moe_runner_config)
+                    self.assertTrue(stock_runner.preserves_input)
+                    calls = []
+
+                    def routed(hidden, *args, **kwargs):
+                        calls.append("routed")
+                        return hidden * 2.5
+
+                    def shared(hidden, *args, **kwargs):
+                        calls.append("shared")
+                        return hidden * 3
+
+                    base.forward = routed
+                    moe._forward_shared_experts = shared
+                    if wrapped:
+                        wrapper = FusedMoEWithLoRA.__new__(FusedMoEWithLoRA)
+                        torch.nn.Module.__init__(wrapper)
+                        wrapper.base_layer = base
+                        wrapper.quant_method = base.quant_method
+                        wrapper.moe_runner_config = base.moe_runner_config
+                        wrapper.lora_backend = SimpleNamespace(
+                            get_batch_info=lambda *args: None
+                        )
+                        moe.experts = wrapper
+                    with model_capture_mode():
+                        actual = moe(x.clone())
+                    self.assertEqual(calls, ["routed", "shared"])
+                    self.assertEqual(base.preserves_input, stock_runner.preserves_input)
+                    torch.testing.assert_close(actual, x * 5.5)
+
     def test_direct_quant_methods_preserve_capture_overlap(self):
         """Direct kernels need their own input contract even without a named runner."""
         from sglang.srt.layers.quantization.bitsandbytes import BitsAndBytesMoEMethod
