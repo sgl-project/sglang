@@ -322,7 +322,9 @@ class TestCopyPageTable(unittest.TestCase):
         src = KVIndexTranslator(
             req_to_token=torch.zeros((2, 4), dtype=torch.int64),
             token_to_kv_pool_allocator=SimpleNamespace(hands_out_virtual_ids=False),
-            token_to_kv_pool=SimpleNamespace(id_spaces=_plain_id_spaces),
+            token_to_kv_pool=SimpleNamespace(
+                id_spaces=_plain_id_spaces, requires_physical_write_loc=False
+            ),
             page_size=1,
             device=_DEV,
         )
@@ -391,9 +393,10 @@ class TestPoolOwnership(unittest.TestCase):
         """Same allocator, different pool: must stay disabled."""
         alloc = _build_composite(ps=1)
         req_to_token = torch.zeros((2, 8), dtype=torch.int32, device=_DEV)
+        # A separate buffer, not the composite's, indexed by the allocator's ids.
         own_pool = SimpleNamespace(
-            id_spaces=_plain_id_spaces
-        )  # a separate buffer, not the composite's
+            id_spaces=_plain_id_spaces, requires_physical_write_loc=False
+        )
         src = KVIndexTranslator(
             req_to_token=req_to_token,
             token_to_kv_pool_allocator=alloc,
@@ -412,7 +415,9 @@ class TestPoolOwnership(unittest.TestCase):
         src = KVIndexTranslator(
             req_to_token=req_to_token,
             token_to_kv_pool_allocator=alloc,
-            token_to_kv_pool=SimpleNamespace(id_spaces=_plain_id_spaces),
+            token_to_kv_pool=SimpleNamespace(
+                id_spaces=_plain_id_spaces, requires_physical_write_loc=False
+            ),
             page_size=1,
             device=_DEV,
         )
@@ -680,7 +685,9 @@ class TestWriteIds(CustomTestCase):
         plain = KVIndexTranslator(
             req_to_token=torch.zeros((2, 4), dtype=torch.int64),
             token_to_kv_pool_allocator=SimpleNamespace(hands_out_virtual_ids=False),
-            token_to_kv_pool=SimpleNamespace(id_spaces=_plain_id_spaces),
+            token_to_kv_pool=SimpleNamespace(
+                id_spaces=_plain_id_spaces, requires_physical_write_loc=False
+            ),
             page_size=1,
             device=_DEV,
         )

@@ -38,6 +38,7 @@ def _worker(monkeypatch, draft_config, target_pool, draft_pools):
         SimpleNamespace(
             model_config=draft_config,
             token_to_kv_pool=_kv_pool(pool),
+            kv_index_translator=SimpleNamespace(is_fused_draft=False),
         )
         for pool in draft_pools
     )

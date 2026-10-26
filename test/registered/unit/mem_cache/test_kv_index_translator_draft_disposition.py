@@ -40,7 +40,7 @@ from sglang.srt.mem_cache.layout.fused_draft import (
 )
 from sglang.srt.mem_cache.unified_draft_pool import (
     UnifiedDraftKVPool,
-    UnifiedDraftSWAKVPool,
+    routed_draft_pool,
 )
 from sglang.srt.mem_cache.unified_memory_pool import UnifiedKVPool
 from sglang.srt.runtime_context import publish, reset_context
@@ -55,6 +55,9 @@ _PS = 2
 
 
 class _FakeKVCache:
+    # A private pool, indexed by the allocator's ids as they are.
+    requires_physical_write_loc = False
+
     def __init__(self, max_slots):
         self.buf = torch.full((max_slots,), -1, dtype=torch.int64)
         self.allocator = None
@@ -131,7 +134,6 @@ def _build(n_full=32, n_swa=16, *, swa_region=None):
     draft_pool = UnifiedDraftKVPool(
         unified_buffer=pool,
         host_sub_pool_name="full",
-        host_allocator=allocator,
         layer_lanes={0: 0},
         page_size=_PS,
     )
@@ -185,12 +187,11 @@ class TestKVIndexTranslatorDraftDisposition(unittest.TestCase):
             lane_num=1, head_num=1, head_dim=8, store_dtype=torch.bfloat16
         )
         pool, allocator, kvcache, _ = _build(swa_region=swa_region)
-        composite = UnifiedDraftSWAKVPool(
+        composite = routed_draft_pool(
             unified_buffer=pool,
-            host_allocator=allocator,
+            owner="full",
             page_size=_PS,
-            full_layer_lanes={0: 0},
-            swa_layer_lanes={1: 0},
+            lanes_by_host={"full": {0: 0}, "swa": {1: 0}},
         )
         v = allocator.alloc(2 * _PS)
         self.assertIsNotNone(v)
@@ -239,12 +240,11 @@ class TestKVIndexTranslatorDraftDisposition(unittest.TestCase):
             lane_num=1, head_num=1, head_dim=8, store_dtype=torch.bfloat16
         )
         pool, allocator, kvcache, dense_pool = _build(swa_region=swa_region)
-        window_pool = UnifiedDraftSWAKVPool(
+        window_pool = routed_draft_pool(
             unified_buffer=pool,
-            host_allocator=allocator,
+            owner="full",
             page_size=_PS,
-            full_layer_lanes={},
-            swa_layer_lanes={1: 0},
+            lanes_by_host={"swa": {1: 0}},
         )
         v = allocator.alloc(2 * _PS)
         self.assertIsNotNone(v)

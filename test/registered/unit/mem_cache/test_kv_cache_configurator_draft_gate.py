@@ -58,7 +58,6 @@ from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_draft_pool import (
     UnifiedDraftKVPool,
-    UnifiedDraftSWAKVPool,
 )
 from sglang.srt.mem_cache.unified_memory_pool import UnifiedKVPool
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
@@ -121,8 +120,16 @@ def _bare(cls, **attrs):
 def _multi_layer_worker(pools_and_windows, *, front):
     """A multi-layer MTP worker whose draft runners hold these (pool, window)
     pairs and whose draft extend is widened by `front` rows."""
+    # A draft runner's translator calls its pool fused when the pool's writes
+    # take the shared allocator's physical ids.
     runners = [
-        SimpleNamespace(token_to_kv_pool=pool, sliding_window_size=window)
+        SimpleNamespace(
+            token_to_kv_pool=pool,
+            sliding_window_size=window,
+            kv_index_translator=SimpleNamespace(
+                is_fused_draft=pool.requires_physical_write_loc
+            ),
+        )
         for pool, window in pools_and_windows
     ]
     draft = _bare(
@@ -374,10 +381,11 @@ class TestDraftBindingDispatch(CustomTestCase):
         self.assertIsInstance(pools.token_to_kv_pool, UnifiedDraftKVPool)
         self.assertEqual(pools.req_to_token_pool.kind, "private-compact")
 
-    def test_window_draft_binds_the_swa_composite(self):
+    def test_window_draft_routes_its_layer_to_the_swa_sub_pool(self):
         """MiMoV2MTP shape: the runner's one layer is a window layer placed in
-        the swa sub-pool, so it binds the SWA-shaped composite (the backends
-        key their swa rail on it), with no full side at all."""
+        the swa sub-pool, so its pool routes that layer to the swa sub-pool's
+        view (the backends read the window through the router), with no full
+        side at all."""
         alloc = self._swa_allocator(with_draft_region=True, window_draft=True)
         with patch.object(unified_draft_pool, "draft_swa_layer_ids", return_value=(0,)):
             pools = self._run(
@@ -386,9 +394,7 @@ class TestDraftBindingDispatch(CustomTestCase):
                 max_total_num_tokens=alloc.size_full,
             )
         pool = pools.token_to_kv_pool
-        self.assertIsInstance(pool, UnifiedDraftSWAKVPool)
-        self.assertEqual(pool.layers_mapping, {0: (0, True)})
-        self.assertIsNone(pool.full_kv_pool)
+        self._assert_routes_only_the_window(pool)
         self.assertIs(pools.token_to_kv_pool_allocator, alloc)
 
     def test_a_per_depth_window_runner_trusts_the_placement(self):
@@ -407,10 +413,14 @@ class TestDraftBindingDispatch(CustomTestCase):
                 alloc=alloc,
                 max_total_num_tokens=alloc.size_full,
             )
-        pool = pools.token_to_kv_pool
-        self.assertIsInstance(pool, UnifiedDraftSWAKVPool)
-        self.assertEqual(pool.layers_mapping, {0: (0, True)})
-        self.assertIsNone(pool.full_kv_pool)
+        self._assert_routes_only_the_window(pools.token_to_kv_pool)
+
+    def _assert_routes_only_the_window(self, pool):
+        router = pool.layer_router
+        self.assertEqual(router.route(0).sub_pool, "swa")
+        self.assertEqual(router.route(0).index, 0)
+        self.assertIsNone(router.sub_pool("full"))
+        self.assertTrue(pool.requires_physical_write_loc)
 
     def _bound_draft_pool(self, *, window_draft: bool):
         alloc = self._swa_allocator(with_draft_region=True, window_draft=window_draft)
@@ -430,7 +440,7 @@ class TestDraftBindingDispatch(CustomTestCase):
         window 511 and a draft extend widened by 5 front rows. The draft reads
         516 tokens back, so eviction keeps 516 while the window stays 511."""
         pool = self._bound_draft_pool(window_draft=True)
-        self.assertIsInstance(pool, UnifiedDraftSWAKVPool)
+        self.assertEqual(pool.layer_router.route(0).sub_pool, "swa")
         worker = _multi_layer_worker([(pool, 511)] * 3, front=5)
         self.assertEqual(worker.draft_swa_window, 516)
         params = _swa_cache_params(

@@ -50,13 +50,14 @@ def resolve_window_id_space(
     model_runner: ModelRunner, window_pool: Optional[KVCache]
 ) -> Optional[IdSpace]:
     """How ``window_pool``'s window sub-pool names the iteration's slots: by
-    its allocator's tables when the allocator hands out virtual ids for that
-    pool (the unified pool's tables are its allocator's), else as the pool
+    its allocator's tables when the allocator hands out virtual ids and the
+    pool's writes take physical ones (the unified pool, and a draft fused into
+    it, view the sub-pools whose tables are the allocator's), else as the pool
     maps them itself."""
     if window_pool is None:
         return None
     allocator = model_runner.token_to_kv_pool_allocator
-    if allocator.hands_out_virtual_ids and allocator.get_kvcache() is window_pool:
+    if allocator.hands_out_virtual_ids and window_pool.requires_physical_write_loc:
         return allocator.id_spaces().get(IdSpaceKind.SLIDING_WINDOW)
     return window_pool.id_spaces().get(IdSpaceKind.SLIDING_WINDOW)
 
