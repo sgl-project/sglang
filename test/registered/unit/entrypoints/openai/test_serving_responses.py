@@ -1421,6 +1421,7 @@ class ChatEncodingAdapterDispatchTestCase(CustomTestCase):
         from sglang.srt.entrypoints.openai import chat_encoding_adapters
 
         return chat_encoding_adapters.ChatOutputHooks(
+            thinking_requested=Mock(),
             tool_call_parsing_active=Mock(),
             history_tool_calls_count=Mock(),
             tool_call_id=Mock(),

@@ -217,10 +217,12 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
         "joyai-echo",
         "lightricks/ltx-2",
         "lightricks/ltx-2.3",
+        "lightricks/ltx-2.5-diffusers",
         "meituan-longcat/longcat-image",
         "meituan-longcat/longcat-image-edit-turbo",
         "ltx-2",
         "ltx-2.3",
+        "ltx-2.5-diffusers",
         "minimax-h3",
         "minimaxai/minimax-h3",
         "inclusionai/ming-image-0.1-design",
@@ -577,6 +579,7 @@ class ServerArgs(DisaggServerArgsMixin):
     batching_config: str | None = None
     enable_batching_metrics: bool = False
     async_output_save: bool = False
+    sleep_on_idle: bool = False
 
     # Strict port mode: fail if requested port is unavailable instead of auto-selecting
     strict_ports: bool = False
@@ -662,6 +665,13 @@ class ServerArgs(DisaggServerArgsMixin):
     @property
     def broker_port(self) -> int:
         return self.port + 1
+
+    @property
+    def progress_endpoint(self) -> str | None:
+        # replica drivers send video progress here; ipc only reaches this node
+        if self.port is None or self.disagg_role != RoleType.MONOLITHIC:
+            return None
+        return f"ipc://{tempfile.gettempdir()}/sglang-diffusion-progress-{self.port}"
 
     def _adjust_path(self):
         expand_path_fields(self)
@@ -3083,6 +3093,14 @@ class ServerArgs(DisaggServerArgsMixin):
             action="store_true",
             default=ServerArgs.enable_batching_metrics,
             help="Log periodic batch efficiency metrics such as realized batch size and queue wait time.",
+        )
+        parser.add_argument(
+            "--sleep-on-idle",
+            action="store_true",
+            default=ServerArgs.sleep_on_idle,
+            help="Reduce idle CPU usage by waiting for requests instead of busy polling. "
+            "Disabled by default to minimize wake-up latency. Applies only to "
+            "single-rank monolithic replicas; TP/SP/CFG multi-rank replicas keep polling.",
         )
         parser.add_argument(
             "--async-output-save",

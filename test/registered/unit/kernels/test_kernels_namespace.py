@@ -283,17 +283,19 @@ def test_operator_and_test_groups_agree():
         assert actual <= groups, actual - groups
 
 
-def test_agent_kernels_register_their_backend():
-    """Agent-generated kernels are listed by backend, so directory and backend must agree."""
-    agent_backends = {
+def test_backend_directories_register_their_backend():
+    """Kernels in a backend directory are listed by backend, so the two must agree."""
+    directory_backends = {
         "sglang.kernels.kda_kernels.": KernelBackend.KDA,
         "sglang.kernels.cake_kernels.": KernelBackend.CAKE,
+        "sglang.kernels.plugin_kernels.": KernelBackend.PLUGIN,
     }
     for spec in K.registry.all_specs():
         expected = next(
-            (b for p, b in agent_backends.items() if spec.target.startswith(p)), None
+            (b for p, b in directory_backends.items() if spec.target.startswith(p)),
+            None,
         )
-        if expected is not None or spec.backend in agent_backends.values():
+        if expected is not None or spec.backend in directory_backends.values():
             assert spec.backend is expected, spec
 
 
