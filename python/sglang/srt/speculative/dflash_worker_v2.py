@@ -1096,11 +1096,14 @@ class DFlashWorkerV2(BaseSpecWorker):
         return getattr(self.target_worker, name)
 
     def clear_cache_pool(self):
-        # The target worker owns the shared KV allocator/cache. For the compact
-        # sliding-window path, the draft req->token view is rebuilt from committed
-        # target state before each draft forward, so there is nothing persistent
-        # to flush here.
-        pass
+        # Drop prepared graphs before the scheduler empties the CUDA allocator.
+        # Their external workspaces must remain alive until replay completes.
+        graphs = self.__dict__.pop("_context_prepare_graphs", None)
+        if graphs:
+            torch.cuda.synchronize(self.model_runner.device)
+            graphs.clear()
+        # The target worker owns the shared KV allocator/cache. The compact
+        # draft req->token view is rebuilt before each draft forward.
 
     def _gather_req_to_token_masked(
         self,
@@ -1950,6 +1953,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             graphs = self._context_prepare_graphs = {}
         entry = graphs.get(key)
         if entry is None:
+            helper = self._fused_kv_helper
             static = {
                 name: value.clone() if value is not None else None
                 for name, value in kwargs.items()
@@ -1964,13 +1968,16 @@ class DFlashWorkerV2(BaseSpecWorker):
                 with torch.cuda.graph(graph, stream=ctx.stream):
                     self._append_target_hidden_eager(**static)
             torch.cuda.current_stream().wait_stream(ctx.stream)
-            entry = graphs[key] = (graph, static)
+            # These buffers were allocated outside capture. A later long
+            # prefill can grow the helper's workspace and release its old tensors.
+            resources = helper.graph_resources()
+            entry = graphs[key] = (graph, static, resources)
             logger.info(
                 "DFLASH context preparation graph captured: rows=%d, bs=%d",
                 hidden.shape[0],
                 kwargs["commit_lens"].numel(),
             )
-        graph, static = entry
+        graph, static, _resources = entry
         with torch.profiler.record_function("k3_dflash_context_prepare_graph"):
             for name, value in kwargs.items():
                 if value is not None:

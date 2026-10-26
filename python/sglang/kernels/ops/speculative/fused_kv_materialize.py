@@ -386,6 +386,22 @@ class FusedKVMaterializeHelper:
         self._workspace_capacity = new_capacity
         self._workspace_dtype = dtype
 
+    def graph_resources(self) -> tuple[torch.Tensor, ...]:
+        """Keep external allocations alive for the lifetime of a captured graph.
+
+        Workspace growth replaces these tensors. CUDA graphs retain their device
+        addresses, not the Python references that keep their storage allocated.
+        """
+        return (
+            self._proj_workspace,
+            self._k_workspace,
+            self._v_workspace,
+            self.rotary_emb.cos_sin_cache,
+            self.flat_kv_weight_t,
+            self.k_norm_weights,
+            self.eps_values,
+        )
+
     def materialize(
         self,
         ctx_hidden: torch.Tensor,
