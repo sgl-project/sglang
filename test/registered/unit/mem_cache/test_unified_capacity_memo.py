@@ -26,6 +26,10 @@ stale capacity is silent over-/under-admission, not a crash.
 
 import random
 import unittest
+from contextlib import contextmanager
+from unittest.mock import patch
+
+import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -286,6 +290,81 @@ class TestTriCapacityMemoCoherence(CustomTestCase):
                 allocator.clear()
                 ma.clear()
                 self._assert_memos_fresh(allocator)
+
+
+# The paging kernels are Triton; neither the epoch nor the memos depend on the
+# ids they write, so they are stood in for on CPU.
+_PAGING_KERNELS = "sglang.srt.mem_cache.allocator.unified_sub_pool"
+
+
+class _NoOpKernel:
+    def __getitem__(self, grid):
+        return self
+
+    def __call__(self, *args, **kwargs):
+        pass
+
+
+@contextmanager
+def _stub_paging_kernels():
+    with (
+        patch(f"{_PAGING_KERNELS}.alloc_extend_kernel", _NoOpKernel()),
+        patch(f"{_PAGING_KERNELS}.alloc_decode_kernel", _NoOpKernel()),
+    ):
+        yield
+
+
+def _ids(*values):
+    return torch.tensor(values, dtype=torch.int64)
+
+
+class TestPagedStepKeepsTheEpoch(unittest.TestCase):
+    def test_a_decode_within_its_pages_keeps_the_capacity_memos(self):
+        """BUG REGRESSION. A paged decode that took no new page rebound the
+        owner's free virtual ids anyway, which moves the capacity epoch: every
+        capacity memo of the chain was dropped and recomputed at each such
+        step. A decode within its pages keeps the epoch, and the next capacity
+        query is served from the memos; a decode that opens a page moves it."""
+        from sglang.test.unified_allocator_fixtures import (
+            build_swa_pool,
+            setup_allocator_context,
+        )
+
+        setup_allocator_context()
+        page = 4
+        allocator = build_swa_pool(page_size=page)
+        owner = allocator.full_attn_allocator
+        with _stub_paging_kernels():
+            # One request of 2 tokens: its first page holds 2 of 4.
+            out = allocator.alloc_extend(
+                _ids(0), _ids(0), _ids(2), _ids(2), _ids(-1), 2
+            )
+            self.assertIsNotNone(out)
+            allocator.available_size()
+            epoch = owner._chain_capacity_epoch()
+            for seq_len in (3, 4):
+                out = allocator.alloc_decode(_ids(seq_len), _ids(seq_len), _ids(0))
+                self.assertIsNotNone(out)
+                self.assertEqual(owner._chain_capacity_epoch(), epoch)
+            with (
+                patch.object(
+                    allocator._policy,
+                    "_compute_available_size",
+                    wraps=allocator._policy._compute_available_size,
+                ) as joint,
+                patch.object(
+                    owner, "_available_tokens", wraps=owner._available_tokens
+                ) as own,
+            ):
+                allocator.available_size()
+                owner.available_size()
+            joint.assert_not_called()
+            own.assert_not_called()
+            # The fifth token opens the request's second page.
+            out = allocator.alloc_decode(_ids(5), _ids(5), _ids(0))
+            self.assertIsNotNone(out)
+            self.assertGreater(owner._chain_capacity_epoch(), epoch)
+        self.assertEqual(allocator.verify_byte_accounting(), [])
 
 
 if __name__ == "__main__":

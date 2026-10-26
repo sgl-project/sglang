@@ -38,7 +38,6 @@ from sglang.srt.mem_cache.kv.alloc.pricing import (
     float_high_target,
     float_reclaim_satisfied,
     float_token_id_capacity,
-    snapshot_chain,
 )
 from sglang.srt.runtime_context import get_disagg, get_memory, get_parallel
 from sglang.srt.utils.common import get_num_new_pages
@@ -49,9 +48,7 @@ if TYPE_CHECKING:
 
 
 def _snapshot(c: ChainAllocator) -> ChainSnapshot:
-    return snapshot_chain(
-        c.bands, page_size=c.page_size, total_bytes=c.unified_buffer.total_bytes
-    )
+    return c.pricing_snapshot()
 
 
 class _InterimPolicy:
@@ -299,18 +296,27 @@ class _TokenEndsPolicy(_WindowPolicy):
     """Two token ends: the owner and its window, with asymmetric shared-byte
     reservations."""
 
+    def __init__(self, c: ChainAllocator, **kwargs):
+        super().__init__(c, **kwargs)
+        self._ends_memo: Optional[Tuple[tuple, TokenEnds]] = None
+
     @property
     def unit_name(self) -> str:
         return "two token ends"
 
     def _ends(self, c: ChainAllocator) -> TokenEnds:
-        return TokenEnds(
-            owner=c.roles.owner,
-            window=c.roles.window,
-            empty_gap_bytes=self._empty_shared_gap_bytes,
-            size_full=self._size_full,
-            size_swa=self._size_swa,
-        )
+        constants = (self._empty_shared_gap_bytes, self._size_full, self._size_swa)
+        memo = self._ends_memo
+        if memo is None or memo[0] != constants:
+            ends = TokenEnds(
+                owner=c.roles.owner,
+                window=c.roles.window,
+                empty_gap_bytes=constants[0],
+                size_full=constants[1],
+                size_swa=constants[2],
+            )
+            memo = self._ends_memo = (constants, ends)
+        return memo[1]
 
     def _compute_available_size(self, c: ChainAllocator) -> int:
         """Joint byte budget in TOKENS: each chain alloc(1) consumes one
@@ -634,10 +640,18 @@ class _FloatChainPolicy(_WindowPolicy):
 
     # -- capacity --
 
+    def __init__(self, c: ChainAllocator, **kwargs):
+        super().__init__(c, **kwargs)
+        self._float_chain: Optional[FloatChain] = None
+
     def _chain(self, c: ChainAllocator) -> FloatChain:
-        return FloatChain(
-            owner=c.roles.owner, window=c.roles.window, state=c.roles.state
-        )
+        chain = getattr(self, "_float_chain", None)
+        if chain is None:
+            roles = c.roles
+            chain = self._float_chain = FloatChain(
+                owner=roles.owner, window=roles.window, state=roles.state
+            )
+        return chain
 
     def can_reserve(
         self,

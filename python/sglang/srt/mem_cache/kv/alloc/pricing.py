@@ -15,7 +15,7 @@ prices its float band in place and credits end flushes per member.
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING, Callable, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, Optional, Tuple
 
 import msgspec
 
@@ -23,7 +23,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator.unified_sub_pool import MultiEndedAllocator
 
 
-class BandSnapshot(msgspec.Struct, frozen=True, kw_only=True):
+class BandSnapshot(msgspec.Struct, frozen=True, gc=False):
     """One band's counts and byte frontiers; pages are this band's own pages."""
 
     name: str
@@ -68,39 +68,41 @@ class BandSnapshot(msgspec.Struct, frozen=True, kw_only=True):
         return max(0, hi - lo)
 
 
-class ChainSnapshot(msgspec.Struct, frozen=True, kw_only=True):
+class ChainSnapshot(msgspec.Struct, frozen=True, gc=False):
     """Bands in chain order, low byte to high byte."""
 
     bands: Tuple[BandSnapshot, ...]
     page_size: int
     total_bytes: int
+    positions: Dict[str, int]  # band name -> index in `bands`
 
     def index(self, name: str) -> int:
-        for i, band in enumerate(self.bands):
-            if band.name == name:
-                return i
-        raise KeyError(name)
+        return self.positions[name]
 
     def band(self, name: str) -> BandSnapshot:
-        return self.bands[self.index(name)]
+        return self.bands[self.positions[name]]
 
     def high_frontier_below(self, name: str) -> int:
         """High byte frontier of the nearest opaque band below; 0 if none."""
-        for band in reversed(self.bands[: self.index(name)]):
-            if not band.transparent:
+        bands = self.bands
+        for i in range(self.positions[name] - 1, -1, -1):
+            band = bands[i]
+            if band.live or band.grow != "float":
                 return band.high_byte
         return 0
 
     def low_frontier_above(self, name: str) -> int:
         """Low byte frontier of the nearest opaque band above; the top if none."""
-        for band in self.bands[self.index(name) + 1 :]:
-            if not band.transparent:
+        bands = self.bands
+        for i in range(self.positions[name] + 1, len(bands)):
+            band = bands[i]
+            if band.live or band.grow != "float":
                 return band.low_byte
         return self.total_bytes
 
     def gap_bytes(self, name: str) -> int:
         """Free bytes between an end's frontier and the nearest opaque band."""
-        band = self.band(name)
+        band = self.bands[self.positions[name]]
         if band.grow == "up":
             return max(0, self.low_frontier_above(name) - band.high_byte)
         return max(0, band.low_byte - self.high_frontier_below(name))
@@ -108,39 +110,45 @@ class ChainSnapshot(msgspec.Struct, frozen=True, kw_only=True):
 
 def snapshot_band(band: MultiEndedAllocator) -> BandSnapshot:
     floats = band.grow_direction == "float"
+    span = band._allocated_pages()
+    free_virtual_ids = band.free_virtual_ids
     return BandSnapshot(
-        name=band.sub_pool_name,
-        grow=band.grow_direction,
-        page_bytes=band.entry_bytes_per_page,
-        entry_bytes=band.entry_bytes,
-        page_size=band.page_size,
-        num_pages=band.num_pages,
-        min_page=band.min_page_index,
-        lazy=band.lazy_compaction,
-        blocked=band.moves_blocked(),
-        holes=int(band._free_phys_pages.numel()),
-        live=band.allocated_count() // band.page_size,
-        span=band._allocated_pages(),
-        low_byte=band._byte_low_frontier(),
-        high_byte=band._byte_high_frontier(),
+        band.sub_pool_name,
+        band.grow_direction,
+        band.entry_bytes_per_page,
+        band.entry_bytes,
+        band.page_size,
+        band.num_pages,
+        band.min_page_index,
+        band.lazy_compaction,
+        band.moves_blocked(),
+        band._free_phys_pages.numel(),
+        # `allocated_count() // page_size`: lazy ends count live pages apart
+        # from the holes and pending pages inside their span.
+        band.live_page_count if band.lazy_compaction else span,
+        span,
+        band._byte_low_frontier(),
+        band._byte_high_frontier(),
         # Only the id owner mints virtual pages; a window binds the owner's.
-        free_virtual_pages=(
-            0 if band.free_virtual_ids is None else int(band.free_virtual_ids.numel())
-        ),
-        num_virtual_pages=band.num_virtual_ids,
-        low_page=band.low_wm_page if floats else 0,
-        high_page=band.high_wm_page if floats else 0,
+        0 if free_virtual_ids is None else free_virtual_ids.numel(),
+        band.num_virtual_ids,
+        band.low_wm_page if floats else 0,
+        band.high_wm_page if floats else 0,
     )
 
 
 def snapshot_chain(
-    bands: Tuple[MultiEndedAllocator, ...], *, page_size: int, total_bytes: int
+    bands: Tuple[MultiEndedAllocator, ...],
+    *,
+    page_size: int,
+    total_bytes: int,
+    positions: Optional[Dict[str, int]] = None,
 ) -> ChainSnapshot:
-    return ChainSnapshot(
-        bands=tuple(snapshot_band(band) for band in bands),
-        page_size=page_size,
-        total_bytes=total_bytes,
-    )
+    """``positions`` maps each band's name to its index, when the caller keeps one."""
+    snaps = tuple([snapshot_band(band) for band in bands])
+    if positions is None:
+        positions = {b.name: i for i, b in enumerate(snaps)}
+    return ChainSnapshot(snaps, page_size, total_bytes, positions)
 
 
 def _first_fit(high: int, predicate: Callable[[int], bool]) -> int:
@@ -170,27 +178,34 @@ class TokenEnds(msgspec.Struct, frozen=True, kw_only=True):
     size_swa: int  # tokens
 
 
+def _ends_bands(
+    snap: ChainSnapshot, ends: TokenEnds
+) -> Tuple[BandSnapshot, BandSnapshot]:
+    positions, bands = snap.positions, snap.bands
+    return bands[positions[ends.owner]], bands[positions[ends.window]]
+
+
 def ends_compaction_allowed(snap: ChainSnapshot, ends: TokenEnds) -> bool:
     """Compaction is credited only when no member's moves are blocked."""
-    return not (snap.band(ends.owner).blocked or snap.band(ends.window).blocked)
+    fa, sa = _ends_bands(snap, ends)
+    return not (fa.blocked or sa.blocked)
 
 
-def ends_fit(
-    snap: ChainSnapshot,
-    ends: TokenEnds,
+def _ends_fit(
+    fa: BandSnapshot,
+    sa: BandSnapshot,
+    gap_bytes: int,
+    empty_gap_bytes: int,
     full_pages: int,
     swa_pages: int,
-    *,
-    full_reclaim_pages: int = 0,
-    swa_reclaim_pages: int = 0,
+    full_reclaim_pages: int,
+    swa_reclaim_pages: int,
     compacted: bool,
-    empty_pool: bool = False,
+    empty_pool: bool,
 ) -> bool:
-    """Whether one owner/window page demand fits, as the chain stands or after
-    both ends pack to their live pages (``compacted``)."""
+    """`ends_fit` on resolved bands; ``gap_bytes`` is the owner's current gap."""
     if min(full_pages, swa_pages) < 0:
         return False
-    fa, sa = snap.band(ends.owner), snap.band(ends.window)
     if empty_pool:
         full_live = swa_live = 0
         full_reclaim_pages = swa_reclaim_pages = 0
@@ -212,15 +227,14 @@ def ends_fit(
         full_index_room = full_capacity - full_live
         swa_index_room = swa_capacity - swa_live
         gap_bytes = (
-            ends.empty_gap_bytes - full_live * fa.page_bytes - swa_live * sa.page_bytes
+            empty_gap_bytes - full_live * fa.page_bytes - swa_live * sa.page_bytes
         )
     else:
         full_virtual_room = fa.free_virtual_pages + full_reclaim_pages
         full_holes = fa.holes + full_reclaim_pages
         swa_holes = sa.holes + swa_reclaim_pages
-        full_index_room = fa.index_room
-        swa_index_room = sa.index_room
-        gap_bytes = snap.gap_bytes(ends.owner)
+        full_index_room = fa.num_pages - fa.min_page - fa.span
+        swa_index_room = sa.num_pages - sa.min_page - sa.span
 
     if full_pages > full_virtual_room:
         return False
@@ -235,9 +249,37 @@ def ends_fit(
     )
 
 
+def ends_fit(
+    snap: ChainSnapshot,
+    ends: TokenEnds,
+    full_pages: int,
+    swa_pages: int,
+    *,
+    full_reclaim_pages: int = 0,
+    swa_reclaim_pages: int = 0,
+    compacted: bool,
+    empty_pool: bool = False,
+) -> bool:
+    """Whether one owner/window page demand fits, as the chain stands or after
+    both ends pack to their live pages (``compacted``)."""
+    fa, sa = _ends_bands(snap, ends)
+    return _ends_fit(
+        fa,
+        sa,
+        snap.gap_bytes(ends.owner),
+        ends.empty_gap_bytes,
+        full_pages,
+        swa_pages,
+        full_reclaim_pages,
+        swa_reclaim_pages,
+        compacted,
+        empty_pool,
+    )
+
+
 def ends_available_tokens(snap: ChainSnapshot, ends: TokenEnds) -> int:
     """Tokens of equal owner/window demand that fit as the chain stands."""
-    fa, sa = snap.band(ends.owner), snap.band(ends.window)
+    fa, sa = _ends_bands(snap, ends)
     e_f, e_s = fa.page_bytes, sa.page_bytes
     if fa.grow == "up":
         gap_bytes = max(0, sa.low_byte - fa.high_byte)
@@ -281,26 +323,30 @@ def ends_reclaim_plan(
     ps = snap.page_size
     full_pages = (math.ceil(full_tokens) + ps - 1) // ps
     swa_pages = (math.ceil(swa_tokens) + ps - 1) // ps
-    fa = snap.band(ends.owner)
-    compacted = empty_pool or not fa.lazy or ends_compaction_allowed(snap, ends)
+    fa, sa = _ends_bands(snap, ends)
+    compacted = empty_pool or not fa.lazy or not (fa.blocked or sa.blocked)
+    # A compacted projection prices from the empty chain's gap, not the current one.
+    gap_bytes = 0 if compacted else snap.gap_bytes(ends.owner)
+    empty_gap_bytes = ends.empty_gap_bytes
 
     def fits(full_reclaim: int, swa_reclaim: int) -> bool:
-        return ends_fit(
-            snap,
-            ends,
+        return _ends_fit(
+            fa,
+            sa,
+            gap_bytes,
+            empty_gap_bytes,
             full_pages,
             swa_pages,
-            full_reclaim_pages=full_reclaim,
-            swa_reclaim_pages=swa_reclaim,
-            compacted=compacted,
-            empty_pool=empty_pool,
+            full_reclaim,
+            swa_reclaim,
+            compacted,
+            empty_pool,
         )
 
     if empty_pool:
         return (0, 0) if fits(0, 0) else None
     if fits(0, 0):
         return (0, 0)
-    sa = snap.band(ends.window)
     max_full = min(fa.live, max(0, int(full_evictable_tokens)) // ps)
     max_swa = min(sa.live, max(0, int(swa_evictable_tokens)) // ps)
     if not fits(max_full, max_swa):
@@ -354,17 +400,27 @@ class EndsRealization(msgspec.Struct, frozen=True):
     flush_ends: bool = False
 
 
+_FITS = EndsRealization(fits=True)
+_REFUSED = EndsRealization(fits=False)
+_FITS_AFTER_FLUSH = EndsRealization(fits=True, flush_ends=True)
+
+
 def ends_realization(
     snap: ChainSnapshot, ends: TokenEnds, full_pages: int, swa_pages: int
 ) -> EndsRealization:
-    if ends_fit(snap, ends, full_pages, swa_pages, compacted=False):
-        return EndsRealization(fits=True)
-    fa = snap.band(ends.owner)
-    if not fa.lazy or not ends_compaction_allowed(snap, ends):
-        return EndsRealization(fits=False)
-    if not ends_fit(snap, ends, full_pages, swa_pages, compacted=True):
-        return EndsRealization(fits=False)
-    return EndsRealization(fits=True, flush_ends=True)
+    fa, sa = _ends_bands(snap, ends)
+    gap_bytes, empty_gap_bytes = snap.gap_bytes(ends.owner), ends.empty_gap_bytes
+    if _ends_fit(
+        fa, sa, gap_bytes, empty_gap_bytes, full_pages, swa_pages, 0, 0, False, False
+    ):
+        return _FITS
+    if not fa.lazy or fa.blocked or sa.blocked:
+        return _REFUSED
+    if not _ends_fit(
+        fa, sa, gap_bytes, empty_gap_bytes, full_pages, swa_pages, 0, 0, True, False
+    ):
+        return _REFUSED
+    return _FITS_AFTER_FLUSH
 
 
 # ---------------------------------------------------------------------------
@@ -412,17 +468,21 @@ def float_available_tokens(snap: ChainSnapshot, chain: FloatChain) -> int:
     else:
         high_band_low = sa.high_byte
         low_room = sa.pages_in_band(low_byte=below, high_byte=sa.low_byte)
+    # `sa.pages_in_band(low_byte=high_band_low, high_byte=...)`, its low end fixed.
+    e_f, e_s, full_low = fa.page_bytes, sa.page_bytes, fa.low_byte
+    band_lo = max((high_band_low + e_s - 1) // e_s, sa.min_page)
+    num_pages = sa.num_pages
     lo, hi = 0, min(h_f + fa.index_room, h_s + sa.index_room)
     while lo < hi:
         mid = (lo + hi + 1) // 2
-        full_bytes = max(0, mid - h_f) * fa.page_bytes
-        room = max(
-            low_room,
-            sa.pages_in_band(
-                low_byte=high_band_low, high_byte=fa.low_byte - full_bytes
-            ),
-        )
-        if full_bytes <= full_gap and max(0, mid - h_s) <= room:
+        full_bytes = (mid - h_f) * e_f if mid > h_f else 0
+        if full_bytes > full_gap:
+            hi = mid - 1
+            continue
+        high_end = (full_low - full_bytes) // e_s
+        high_room = (high_end if high_end < num_pages else num_pages) - band_lo
+        room = low_room if low_room > high_room else high_room
+        if mid - h_s <= room or mid <= h_s:
             lo = mid
         else:
             hi = mid - 1

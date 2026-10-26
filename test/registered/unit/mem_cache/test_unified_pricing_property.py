@@ -12,7 +12,9 @@ allocator):
 - on a chain whose window floats, the as-is price, the end-flush certificate and
   the float retreat target each imply that the allocation succeeds, and a
   positive byte shortfall implies that it fails;
-- a refused allocation leaves every band's live pages as they were.
+- a refused allocation leaves every band's live pages as they were;
+- the snapshot the chain keeps between decisions equals a fresh one after
+  writes and after move-gate flips.
 
 A price that its realization does not deliver, or a realization the price does
 not credit, turns this red.
@@ -141,6 +143,33 @@ class TestUnifiedPricingProperty(CustomTestCase):
                     self.assertTrue(allocated, (as_is, certified, retreat))
                 if short:
                     self.assertFalse(allocated)
+
+    def test_kept_snapshot_follows_writes_and_gates(self):
+        """The chain keeps one pricing snapshot until a band is written or a
+        move gate's answer changes, which no capacity field records."""
+        for chain in ("swa", "tri"):
+            with self.subTest(chain=chain):
+                adapter = BuilderAdapter(
+                    TraceConfig(chain=chain, page_size=1, lazy=True)
+                )
+                c = adapter.allocator
+                kept = c.pricing_snapshot()
+                self.assertIs(c.pricing_snapshot(), kept)
+                ids = adapter.alloc(8)
+                written = c.pricing_snapshot()
+                self.assertIsNot(written, kept)
+                self.assertEqual(written, chain_snapshot(c))
+                adapter.free(ids[:4])
+                self.assertEqual(c.pricing_snapshot(), chain_snapshot(c))
+                adapter.gate(False)
+                closed = c.pricing_snapshot()
+                self.assertTrue(any(band.blocked for band in closed.bands))
+                self.assertEqual(closed, chain_snapshot(c))
+                adapter.gate(True)
+                opened = c.pricing_snapshot()
+                self.assertFalse(any(band.blocked for band in opened.bands))
+                self.assertEqual(opened, chain_snapshot(c))
+                self.assertEqual(c.verify_byte_accounting(), [])
 
 
 if __name__ == "__main__":

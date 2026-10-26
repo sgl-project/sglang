@@ -32,6 +32,7 @@ from sglang.srt.mem_cache.allocator.unified_sub_pool import (
     install_move_gate,
 )
 from sglang.srt.mem_cache.kv.alloc.interim import interim_policy_for
+from sglang.srt.mem_cache.kv.alloc.pricing import ChainSnapshot, snapshot_chain
 from sglang.srt.mem_cache.unified_memory_pool import UnifiedKVPool
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.common import get_num_new_pages
@@ -164,6 +165,9 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         )
         self.bands = _chain_order(self.members)
         _wire_chain(self.bands)
+        self._band_positions = {b.sub_pool_name: i for i, b in enumerate(self.bands)}
+        self._snapshot_key: Optional[int] = None
+        self._snapshot_memo: Optional[ChainSnapshot] = None
         self._policy = interim_policy_for(
             self,
             full_max_total_num_tokens=full_max_total_num_tokens,
@@ -221,6 +225,49 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         return () if self.swa_attn_allocator is None else (self.swa_attn_allocator,)
 
     # -- capacity views (the interim policy of the chain's shape) --
+
+    def _snapshot_key_now(self) -> int:
+        """The chain's capacity epoch and, per band, its compaction mode and
+        whether a move gate is closed: neither is a capacity field. A band's
+        blocked bit is its pending host loads, a capacity field, or a closed
+        gate; the gates are callables, so the epoch alone misses a flip."""
+        epoch = bits = 0
+        for band in self.bands:
+            epoch += band._capacity_epoch
+            disagg, host = band.disagg_move_gate, band.host_transfer_move_gate
+            closed = (disagg is not None and not disagg()) or (
+                host is not None and not host()
+            )
+            bits = (bits << 2) | (2 if band.lazy_compaction else 0) | closed
+        return (epoch << (2 * len(self.bands))) | bits
+
+    def pricing_snapshot(self) -> ChainSnapshot:
+        """The bands' snapshot every capacity decision prices on, kept until
+        the epoch moves or a gate's answer changes."""
+        key = self._snapshot_key_now()
+        if key != self._snapshot_key:
+            self._snapshot_memo = snapshot_chain(
+                self.bands,
+                page_size=self.page_size,
+                total_bytes=self.unified_buffer.total_bytes,
+                positions=self._band_positions,
+            )
+            self._snapshot_key = key
+        return self._snapshot_memo
+
+    def _snapshot_memo_violations(self) -> List[str]:
+        """Idle-time check: a kept snapshot that differs from a fresh one means a
+        capacity field changed without moving the epoch. Empty == healthy."""
+        if self._snapshot_key != self._snapshot_key_now():
+            return []
+        fresh = snapshot_chain(
+            self.bands,
+            page_size=self.page_size,
+            total_bytes=self.unified_buffer.total_bytes,
+        )
+        if fresh == self._snapshot_memo:
+            return []
+        return [f"[chain] stale pricing snapshot: {self._snapshot_memo} != {fresh}"]
 
     def available_size(self) -> int:
         return self._policy.available_size(self)
@@ -518,9 +565,11 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             return sum(m.flush_opportunistic() for m in ends_first)
 
     def verify_byte_accounting(self) -> List[str]:
-        return _chain_byte_accounting_violations(
-            list(self.bands)
-        ) + self._policy.memo_violations(self)
+        return (
+            _chain_byte_accounting_violations(list(self.bands))
+            + self._policy.memo_violations(self)
+            + self._snapshot_memo_violations()
+        )
 
     # -- alloc --
 

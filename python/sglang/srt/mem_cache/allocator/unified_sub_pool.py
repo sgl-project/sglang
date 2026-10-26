@@ -290,6 +290,8 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
     watermark_physical: _CapacityField[int] = _CapacityField()
     live_page_count: _CapacityField[int] = _CapacityField()
     _free_phys_pages: _CapacityField[torch.Tensor] = _CapacityField()
+    # The owner's unminted virtual pages (None on a band that binds the owner's).
+    free_virtual_ids: _CapacityField[Optional[torch.Tensor]] = _CapacityField()
 
     def __init__(
         self,
@@ -1259,7 +1261,9 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                 if phys_pages is None:
                     return None  # defensive; pre-check should have prevented it
 
-            self.free_virtual_ids = self.free_virtual_ids[num_new_pages:]
+            # A rebind moves the capacity epoch; a step within its pages takes none.
+            if num_new_pages > 0:
+                self.free_virtual_ids = self.free_virtual_ids[num_new_pages:]
             return out_indices  # virtual token ids
 
     def alloc_decode(
@@ -1313,7 +1317,9 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                 if phys_pages is None:
                     return None
 
-            self.free_virtual_ids = self.free_virtual_ids[num_new_pages:]
+            # A rebind moves the capacity epoch; a step within its pages takes none.
+            if num_new_pages > 0:
+                self.free_virtual_ids = self.free_virtual_ids[num_new_pages:]
             return out_indices  # virtual token ids
 
     # -- free with eager compaction --
