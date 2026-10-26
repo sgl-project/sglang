@@ -109,34 +109,82 @@ this is distinct from fabric NVLink, which requires exportable memory.
 For workers on different hosts, configure the appropriate RDMA or fabric
 transport instead of `MC_INTRANODE_NVLINK`.
 
+Run prefill and decode in separate terminals on the same host.
+
+### Prefill worker (GPUs 0–1)
+
 ```bash
 export SGLANG_DISAGG_STAGING_BUFFER=0
 export SGLANG_MOONCAKE_CUSTOM_MEM_POOL=INTRA_NODE_NVLINK
 export MC_INTRANODE_NVLINK=true
 
-COMMON_ARGS=(
-  --model-path nvidia/GLM-5.2-NVFP4 --trust-remote-code
-  --tp-size 2 --context-length 16384 --max-running-requests 1
-  --mem-fraction-static 0.85 --page-size 64 --kv-cache-dtype fp8_e4m3
-  --dsa-prefill-backend trtllm --dsa-decode-backend trtllm
-  --speculative-algorithm EAGLE --speculative-num-steps 3
-  --speculative-eagle-topk 1 --speculative-num-draft-tokens 4
-  --disaggregation-transfer-backend mooncake
-  --disaggregation-bootstrap-port 8998
-  --enable-metrics --enable-cache-report
-)
+python3 -m sglang.launch_server \
+  --model-path nvidia/GLM-5.2-NVFP4 \
+  --trust-remote-code \
+  --tp-size 2 \
+  --context-length 16384 \
+  --max-running-requests 1 \
+  --mem-fraction-static 0.85 \
+  --page-size 64 \
+  --kv-cache-dtype fp8_e4m3 \
+  --dsa-prefill-backend trtllm \
+  --dsa-decode-backend trtllm \
+  --speculative-algorithm EAGLE \
+  --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --disaggregation-transfer-backend mooncake \
+  --disaggregation-bootstrap-port 8998 \
+  --enable-metrics \
+  --enable-cache-report \
+  --disaggregation-mode prefill \
+  --port 30001 \
+  --nccl-port 29501 \
+  --enable-kv-cache-sharding \
+  --enable-prefill-cp \
+  --attn-cp-size 2 \
+  --cp-strategy interleave \
+  --chunked-prefill-size 2048 \
+  --max-total-tokens 4096 \
+  --enable-hierarchical-cache \
+  --hicache-ratio 4 \
+  --hicache-write-policy write_through \
+  --hicache-io-backend kernel \
+  --hicache-mem-layout page_first
+```
 
-python3 -m sglang.launch_server "${COMMON_ARGS[@]}" \
-  --disaggregation-mode prefill --port 30001 --nccl-port 29501 \
-  --enable-kv-cache-sharding --enable-prefill-cp --attn-cp-size 2 \
-  --cp-strategy interleave --chunked-prefill-size 2048 --max-total-tokens 4096 \
-  --enable-hierarchical-cache --hicache-ratio 4 \
-  --hicache-write-policy write_through --hicache-io-backend kernel \
-  --hicache-mem-layout page_first &
+### Decode worker (GPUs 2–3)
 
-python3 -m sglang.launch_server "${COMMON_ARGS[@]}" \
-  --disaggregation-mode decode --port 30002 --nccl-port 29502 \
-  --base-gpu-id 2 --max-total-tokens 16384 --cuda-graph-max-bs-decode 1
+```bash
+export SGLANG_DISAGG_STAGING_BUFFER=0
+export SGLANG_MOONCAKE_CUSTOM_MEM_POOL=INTRA_NODE_NVLINK
+export MC_INTRANODE_NVLINK=true
+
+python3 -m sglang.launch_server \
+  --model-path nvidia/GLM-5.2-NVFP4 \
+  --trust-remote-code \
+  --tp-size 2 \
+  --context-length 16384 \
+  --max-running-requests 1 \
+  --mem-fraction-static 0.85 \
+  --page-size 64 \
+  --kv-cache-dtype fp8_e4m3 \
+  --dsa-prefill-backend trtllm \
+  --dsa-decode-backend trtllm \
+  --speculative-algorithm EAGLE \
+  --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --disaggregation-transfer-backend mooncake \
+  --disaggregation-bootstrap-port 8998 \
+  --enable-metrics \
+  --enable-cache-report \
+  --disaggregation-mode decode \
+  --port 30002 \
+  --nccl-port 29502 \
+  --base-gpu-id 2 \
+  --max-total-tokens 16384 \
+  --cuda-graph-max-bs-decode 1
 ```
 
 Connect the two endpoints through the [P/D router](#router-integration).
