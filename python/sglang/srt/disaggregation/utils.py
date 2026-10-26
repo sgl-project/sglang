@@ -265,12 +265,18 @@ def kv_layout_signature(kv_args: KVArgs) -> int:
 
     Two sides can compare digests only if they cover the same bytes. A prefill
     with another TP width has other per-page item lengths; a PP or
-    layer-sharded prefill owns fewer buffers. Shipped beside the digest, so
-    those become one logged skip instead of a mismatch on every request.
-    Positive int64 and never 0, which marks "no digest" in the metadata row.
+    layer-sharded prefill owns fewer buffers; the same byte sizes under another
+    dtype or page layout (fp16 vs bf16, two V4 layouts) hold other bytes.
+    Shipped beside the digest, so those become one logged skip instead of a
+    mismatch on every request. Positive int64 and never 0, which marks "no
+    digest" in the metadata row.
     """
     layout = (
         kv_args.page_size,
+        kv_args.kv_cache_dtype_str,
+        kv_args.kv_layout,
+        kv_args.swa_kv_cache_layout,
+        [state_type.value for state_type in kv_args.state_types],
         list(kv_args.kv_item_lens),
         [list(lens) for lens in kv_args.state_item_lens],
     )

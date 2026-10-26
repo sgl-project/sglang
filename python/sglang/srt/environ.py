@@ -846,6 +846,8 @@ class Envs:
     # "use_direct_io": false key in --hicache-storage-backend-extra-config.
     SGLANG_HICACHE_NIXL_USE_DIRECT_IO = EnvBool(True)
     SGLANG_HUGEPAGE_SIZE = EnvStr("")
+    SGLANG_TEST_HICACHE_BACKEND_RANDOM_DELAY = EnvFloat(None)
+    SGLANG_TEST_HICACHE_BACKEND_RANDOM_FAILURE = EnvFloat(None)
 
     # ===================================================================
     # KV-transfer staging and Mooncake transport
@@ -1105,6 +1107,12 @@ class Envs:
     # Ascend NPU
     # ===================================================================
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
+    # Requantize plain block-FP8 (fp32-scale) checkpoints to MXFP8 at load
+    # time so arch35 (Atlas A5) dense linears run on the native quantized
+    # GEMM instead of the Triton emulation path. Lossy (128x128 fp32 block
+    # scales -> 1x32 UE8M0): off by default; enable explicitly for
+    # performance after validating accuracy for the workload.
+    SGLANG_NPU_ARCH35_REQUANT_BLOCK_FP8 = EnvBool(False)
     SGLANG_NPU_USE_MULTI_STREAM = EnvBool(False)
     # Kimi-K3 attention-TP shared experts: overlap AG / MLP / RS with the
     # routed front / DeepEP dispatch / routed GEMMs, respectively.
