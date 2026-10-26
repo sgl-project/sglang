@@ -119,9 +119,15 @@ def partial_gluon(
     mf: gl.constexpr = gl.amd.AMDMFMALayout(
         version=4, instr_shape=[16, 16, 16], transposed=True, warps_per_cta=[4, 1]
     )
+    kv_smem = gl.allocate_shared_memory(
+        gl.bfloat16,
+        [BT, 512],
+        gl.PaddedSharedLayout.with_identity_for([[128, 8]], [BT, 512], [1, 0]),
+        kv,
+    )
     scores = (
         gl.amd.cdna4.mfma(
-            gl.convert_layout(kv, gl.DotOperandLayout(0, mf, 8)),
+            kv_smem.load(gl.DotOperandLayout(0, mf, 8)),
             gl.convert_layout(q.permute((1, 0)), gl.DotOperandLayout(1, mf, 8)),
             gl.zeros((BT, H), gl.float32, mf),
         )
@@ -134,15 +140,16 @@ def partial_gluon(
     prob = gl.exp(scores - mx[None, :])
     denom = gl.sum(prob, 0)
     hi = prob.to(gl.bfloat16)
+    kv_t = kv_smem.permute((1, 0))
     value = gl.amd.cdna4.mfma(
-        gl.convert_layout(kv.permute((1, 0)), gl.DotOperandLayout(0, mf, 8)),
+        kv_t.load(gl.DotOperandLayout(0, mf, 8)),
         gl.convert_layout(hi, gl.DotOperandLayout(1, mf, 8)),
         gl.zeros((512, H), gl.float32, mf),
     )
     if COMPENSATE:
         lo = (prob - hi.to(gl.float32)).to(gl.bfloat16)
         value = gl.amd.cdna4.mfma(
-            gl.convert_layout(kv.permute((1, 0)), gl.DotOperandLayout(0, mf, 8)),
+            kv_t.load(gl.DotOperandLayout(0, mf, 8)),
             gl.convert_layout(lo, gl.DotOperandLayout(1, mf, 8)),
             value,
         )
