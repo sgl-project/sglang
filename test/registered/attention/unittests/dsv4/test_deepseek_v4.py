@@ -17,7 +17,6 @@ from types import SimpleNamespace
 from unittest import mock
 
 import torch
-
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.attention_unittest.attention_methods.dsv4_attention import (  # noqa: E402
@@ -678,7 +677,9 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             return replay_metadata
 
         backend._build_forward_metadata = fake_build_forward_metadata
-        forward_batch = SimpleNamespace(name="live", max_seq_len_override=None, extend_prefix_lens_cpu=None)
+        forward_batch = SimpleNamespace(
+            name="live", max_seq_len_override=None, extend_prefix_lens_cpu=None
+        )
         static_forward_batch = SimpleNamespace(
             name="static",
             max_seq_len_override=None,

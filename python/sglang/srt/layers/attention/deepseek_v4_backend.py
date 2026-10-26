@@ -19,7 +19,6 @@ from typing import (
 import msgspec
 import torch
 import torch.nn.functional as F
-
 from sglang.kernels.ops.attention.dsv4.attn_metadata_kernels import (
     BuildCausalSwaPageIndices,
     BuildPageTablePositions,
@@ -3321,9 +3320,7 @@ class DeepseekV4AttnBackend(
         metadata_batch = (
             static_forward_batch if static_forward_batch is not None else forward_batch
         )
-        max_seq_len = self._prefill_graph_context_width(
-            metadata_batch
-        )
+        max_seq_len = self._prefill_graph_context_width(metadata_batch)
         static_metadata = self._build_forward_metadata(
             metadata_batch,
             max_seq_len_override=max_seq_len,

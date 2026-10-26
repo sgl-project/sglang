@@ -3,7 +3,6 @@
 from types import SimpleNamespace
 
 import pytest
-
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention import deepseek_v4_backend as backend_module
 from sglang.srt.layers.attention.deepseek_v4_backend import (
@@ -99,6 +98,7 @@ def test_page_indices_only_when_a_step_can_read_direct(
     monkeypatch.setattr(bcg_context, "is_in_breakable_cuda_graph", lambda: in_graph)
     backend = object.__new__(DeepseekV4AttnBackend)
     backend.trtllm_attn = False
+    backend.mega_attn = False
     backend.tail_forward_metadata = None
     backend.forward_metadata = SimpleNamespace(
         late_layer_tail=None, sparse_prefill_direct=direct

@@ -2,7 +2,6 @@ import sys
 
 import pytest
 import torch
-
 from sglang.srt.runtime_context import get_platform
 from sglang.test.ci.ci_register import register_cuda_ci
 
