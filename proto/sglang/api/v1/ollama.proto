@@ -1,0 +1,157 @@
+// Ollama-compatible data plane: `/api/chat`, `/api/generate`, `/api/tags`,
+// `/api/show`, as `entrypoints/ollama/protocol.py` declares them. A thin
+// translation onto the native generate path; shared by the HTTP adapter, the
+// gRPC service, and the router.
+syntax = "proto3";
+
+package sglang.api.v1;
+
+import "sglang/api/v1/common.proto";
+import "sglang/json/v1/options.proto";
+
+message OllamaMessage {
+  string role = 1;
+  string content = 2;
+  // Base64 images; accepted and not rendered.
+  optional StringList images = 3;
+}
+
+// The Ollama `options` keys SGLang maps onto its sampling params; any other
+// key is ignored, as Python's `_convert_options_to_sampling_params` does.
+message OllamaOptions {
+  optional double temperature = 1;
+  optional double top_p = 2;
+  optional int64 top_k = 3;
+  // `max_new_tokens`; defaults to 2048 when absent (Ollama answers run long).
+  optional int64 num_predict = 4;
+  optional StringOrList stop = 5;
+  optional double presence_penalty = 6;
+  optional double frequency_penalty = 7;
+  // `sampling_seed`.
+  optional int64 seed = 8;
+}
+
+// `POST /api/chat`.
+message OllamaChatRequest {
+  string model = 1;
+  repeated OllamaMessage messages = 2;
+  optional bool stream = 3 [
+    (sglang.json.v1.field_json).null_policy = NULL_POLICY_RESETS_DEFAULT,
+    (sglang.json.v1.field_json).default_bool = true
+  ];
+  // "json" or a JSON schema; accepted and ignored.
+  optional string format = 4 [(sglang.json.v1.field_json).raw_json = true];
+  optional OllamaOptions options = 5;
+  // Seconds or a duration string; accepted and ignored (no model unloading).
+  optional string keep_alive = 6 [(sglang.json.v1.field_json).raw_json = true];
+  // Bool or "low" | "medium" | "high"; accepted and ignored.
+  optional string think = 7 [(sglang.json.v1.field_json).raw_json = true];
+}
+
+// One `/api/chat` frame. Unary: the whole answer with `done` set and the
+// counters filled. Streamed: a delta per frame, then a `done` frame whose
+// counters are filled (Python leaves them out; the Ollama API fills them).
+// Durations are nanoseconds, as Ollama reports them.
+message OllamaChatResponse {
+  string model = 1;
+  string created_at = 2;
+  OllamaMessage message = 3;
+  bool done = 4;
+  optional string done_reason = 5;
+  optional int64 total_duration = 6;
+  optional int64 load_duration = 7;
+  optional int64 prompt_eval_count = 8;
+  optional int64 prompt_eval_duration = 9;
+  optional int64 eval_count = 10;
+  optional int64 eval_duration = 11;
+}
+
+// `POST /api/generate`. `prompt` is sent raw; `system` is prepended with a
+// blank line. `suffix`, `template`, `context`, `raw`, `format`, `images`,
+// `keep_alive`, and `think` are accepted and ignored, as in Python.
+message OllamaGenerateRequest {
+  string model = 1;
+  string prompt = 2;
+  optional string suffix = 3;
+  optional string system = 4;
+  optional string template = 5;
+  optional Int64List context = 6;
+  optional bool stream = 7 [
+    (sglang.json.v1.field_json).null_policy = NULL_POLICY_RESETS_DEFAULT,
+    (sglang.json.v1.field_json).default_bool = true
+  ];
+  optional bool raw = 8 [
+    (sglang.json.v1.field_json).null_policy = NULL_POLICY_RESETS_DEFAULT,
+    (sglang.json.v1.field_json).default_bool = false
+  ];
+  optional string format = 9 [(sglang.json.v1.field_json).raw_json = true];
+  optional OllamaOptions options = 10;
+  optional string keep_alive = 11 [(sglang.json.v1.field_json).raw_json = true];
+  optional StringList images = 12;
+  optional bool think = 13;
+}
+
+// One `/api/generate` frame; the same unary / streamed contract as
+// OllamaChatResponse. `context` is never filled (no conversation encoding).
+message OllamaGenerateResponse {
+  string model = 1;
+  string created_at = 2;
+  string response = 3;
+  bool done = 4;
+  optional string done_reason = 5;
+  optional Int64List context = 6;
+  optional int64 total_duration = 7;
+  optional int64 load_duration = 8;
+  optional int64 prompt_eval_count = 9;
+  optional int64 prompt_eval_duration = 10;
+  optional int64 eval_count = 11;
+  optional int64 eval_duration = 12;
+}
+
+// `GET /api/tags`.
+message OllamaTagsRequest {}
+
+message OllamaTagsResponse {
+  repeated OllamaModelInfo models = 1;
+}
+
+// One served model as an Ollama model card: SGLang has no model files, so
+// `size` is 0 and `digest` a fixed placeholder.
+message OllamaModelInfo {
+  string name = 1;
+  string model = 2;
+  string modified_at = 3;
+  int64 size = 4;
+  string digest = 5;
+  OllamaModelDetails details = 6;
+}
+
+// Ollama's `details` block. `/api/tags` fills format, family, and
+// parameter_size; `/api/show` fills every field.
+message OllamaModelDetails {
+  optional string parent_model = 1;
+  string format = 2;
+  string family = 3;
+  repeated string families = 4;
+  string parameter_size = 5;
+  optional string quantization_level = 6;
+}
+
+// `POST /api/show`.
+message OllamaShowRequest {
+  string model = 1;
+}
+
+// A model card synthesized from the model name and context length.
+message OllamaShowResponse {
+  string license = 1;
+  string modelfile = 2;
+  string parameters = 3;
+  string template = 4;
+  string modified_at = 5;
+  OllamaModelDetails details = 6;
+  // Ollama's GGUF-style metadata; its keys are prefixed with the model
+  // family (`<family>.context_length`), so it is an open object.
+  optional string model_info = 7 [(sglang.json.v1.field_json).raw_json = true];
+  repeated string capabilities = 8;
+}

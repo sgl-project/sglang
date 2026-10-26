@@ -276,33 +276,40 @@ pub(super) async fn prepare_chat_request(
     mut request: CreateChatCompletionRequest,
     kwargs: Option<&ChatTemplateKwargs>,
 ) -> Result<(CreateChatCompletionRequest, String), Response> {
-    let Some(formatter) = state.chat_formatter.clone() else {
+    let Some(formatter) = state.chat_formatter.as_ref() else {
         return Err(openai_error(
             StatusCode::BAD_REQUEST,
             "this model has no usable chat template",
             false,
         ));
     };
+    let prompt = prepare_chat_prompt(formatter, &mut request, kwargs)
+        .map_err(|message| openai_error(StatusCode::BAD_REQUEST, message, false))?;
+    Ok((request, prompt))
+}
+
+/// Merge the template's stops into `request` and render its prompt; the
+/// chat-shaped frontends (OpenAI, Anthropic) share this step.
+pub(crate) fn prepare_chat_prompt(
+    formatter: &ChatFormatter,
+    request: &mut CreateChatCompletionRequest,
+    kwargs: Option<&ChatTemplateKwargs>,
+) -> Result<String, String> {
     // Template stops first, then the request's own — Python
     // `_apply_conversation_template` (`conv.stop_str` + `request.stop`). A
     // token-id stop cannot be merged into the string list (Python has no such
     // field), so it is kept alone.
-    merge_template_stops(&mut request, &formatter);
-    let prompt = formatter.render(&request, kwargs).map_err(|error| {
-        openai_error(
-            StatusCode::BAD_REQUEST,
-            format!("chat template render failed: {error}"),
-            false,
-        )
-    })?;
-    Ok((request, prompt))
+    merge_template_stops(request, formatter);
+    formatter
+        .render(request, kwargs)
+        .map_err(|error| format!("chat template render failed: {error}"))
 }
 
 /// Full sampling resolution for an OpenAI request, mirroring the Python
 /// handler: endpoint defaults → tool-choice validation + constraint → clamp.
 /// The tool-choice checks run regardless of whether a parser is configured
 /// (see `apply_tool_constraint`).
-pub(super) fn chat_sampling(
+pub(crate) fn chat_sampling(
     request: &CreateChatCompletionRequest,
     defaults: SamplingDefaults,
     parser: Option<&str>,
@@ -358,7 +365,7 @@ fn merge_template_stops(request: &mut CreateChatCompletionRequest, formatter: &C
 /// `to_sampling_params` priority: user value > model generation_config (when
 /// `--sampling-defaults model`) > OpenAI terminal default
 /// (`_DEFAULT_SAMPLING_PARAMS`: chat uses 1.0/1.0).
-pub(super) struct SamplingDefaults {
+pub(crate) struct SamplingDefaults {
     /// Model defaults; `None` when the model config doesn't set them or when
     /// `--sampling-defaults openai` (the Python dump is then empty).
     temperature: Option<f64>,
@@ -370,7 +377,7 @@ pub(super) struct SamplingDefaults {
 
 impl SamplingDefaults {
     /// `protocol.py` chat `_DEFAULT_SAMPLING_PARAMS`: temperature 1.0, top_p 1.0.
-    pub(super) const CHAT: SamplingDefaults = SamplingDefaults {
+    pub(crate) const CHAT: SamplingDefaults = SamplingDefaults {
         temperature: None,
         top_p: None,
         fallback_temperature: 1.0,
@@ -456,6 +463,42 @@ pub(super) async fn unary_chat(
     parallel_tool_calls: bool,
     service_tier: Option<ChatServiceTier>,
 ) -> Response {
+    match unary_chat_response(
+        submitted,
+        response_id,
+        model,
+        created,
+        want_logprobs,
+        parser,
+        reasoning_parser,
+        starts_in_reasoning,
+        tools,
+        parallel_tool_calls,
+        service_tier,
+    )
+    .await
+    {
+        Ok(response) => Json(response).into_response(),
+        Err((status, message)) => openai_error(status, message, false),
+    }
+}
+
+/// The unary chat completion as a value, for the frontends that re-shape it
+/// (Anthropic) as well as the OpenAI route.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn unary_chat_response(
+    submitted: Vec<(usize, CoreCall)>,
+    response_id: String,
+    model: String,
+    created: u32,
+    want_logprobs: bool,
+    parser: Option<String>,
+    reasoning_parser: Option<String>,
+    starts_in_reasoning: bool,
+    tools: Option<Vec<ToolDefinition>>,
+    parallel_tool_calls: bool,
+    service_tier: Option<ChatServiceTier>,
+) -> Result<CreateChatCompletionResponse, (StatusCode, String)> {
     let reasoning_options = ReasoningOptions {
         force_reasoning: starts_in_reasoning.then_some(true),
         ..Default::default()
@@ -465,12 +508,7 @@ pub(super) async fn unary_chat(
     let mut completion_tokens = 0u64;
 
     for (index, call) in submitted {
-        let output = match collect_output(call).await {
-            Ok(output) => output,
-            Err((status, message)) => {
-                return openai_error(status, message, false);
-            }
-        };
+        let output = collect_output(call).await?;
 
         if prompt_tokens == 0 {
             prompt_tokens = output.prompt_tokens;
@@ -518,7 +556,7 @@ pub(super) async fn unary_chat(
         });
     }
 
-    Json(CreateChatCompletionResponse {
+    Ok(CreateChatCompletionResponse {
         id: response_id,
         choices,
         created,
@@ -531,11 +569,10 @@ pub(super) async fn unary_chat(
             u32::try_from(completion_tokens).unwrap_or(u32::MAX),
         )),
     })
-    .into_response()
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn chat_event_stream(
+pub(crate) fn chat_event_stream(
     submitted: Vec<(usize, CoreCall)>,
     response_id: String,
     model: String,
@@ -849,7 +886,7 @@ pub(super) fn chat_logprobs(extras: Option<&ChunkExtras>) -> ChatChoiceLogprobs 
 
 /// V4, GLM-5.3 and Qwen3.8 prefill `<think>` (Qwen3.8 with a newline) when
 /// thinking, so the generated stream has no opening marker.
-fn starts_in_reasoning(reasoning_parser: Option<&str>, prompt: &str) -> bool {
+pub(crate) fn starts_in_reasoning(reasoning_parser: Option<&str>, prompt: &str) -> bool {
     matches!(
         reasoning_parser,
         Some("deepseek-v4" | "deepseek_v4" | "deepseekv4" | "glm45" | "qwen3")

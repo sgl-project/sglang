@@ -25,7 +25,7 @@ use crate::api_server::handlers::{CoreCall, CoreHandle};
 use crate::message::config::ServerArgs;
 use crate::message::response::{ChunkEvent, ResponseItem};
 use crate::tokenizer_manager::wiring::TmEvent;
-pub(super) fn core_handle() -> CoreHandle {
+pub(crate) fn core_handle() -> CoreHandle {
     CoreHandle::new(
         flume::unbounded().0,
         flume::unbounded().0,
@@ -141,7 +141,7 @@ pub(super) fn frontend_closed() -> CoreHandle {
 
 /// App state whose core intake answers every generation with one finished
 /// `ok` chunk, with the ChatML template so chat can render.
-fn answering_app_state() -> Arc<super::AppState> {
+pub(in crate::api_server::http) fn answering_app_state() -> Arc<super::AppState> {
     let (intake_tx, intake_rx) = flume::unbounded();
     tokio::spawn(async move {
         while let Ok(TmEvent::Intake { request, admission }) = intake_rx.recv_async().await {
@@ -168,12 +168,15 @@ fn answering_app_state() -> Arc<super::AppState> {
         core,
         generation_policy: crate::message::request::GenerationPolicy::from(server_args.as_ref()),
         server_args,
-        chat_formatter: Some(super::ChatFormatter::Legacy(Box::new(
-            super::template::LegacyFormatter {
-                spec: super::template::builtin_template("chatml").unwrap(),
-            },
-        ))),
+        chat_formatter: Some(chatml_formatter()),
     })
+}
+
+/// The built-in chatml template, for tests that render a chat prompt.
+pub(crate) fn chatml_formatter() -> super::ChatFormatter {
+    super::ChatFormatter::Legacy(Box::new(super::template::LegacyFormatter {
+        spec: super::template::builtin_template("chatml").unwrap(),
+    }))
 }
 
 /// Serve one request through the full router (extractors, auth, routing).

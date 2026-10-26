@@ -13,25 +13,25 @@ use crate::utils::error::Error;
 /// Python's OpenAI PDRoutingFields, using generated API carriers. Unlike the
 /// native API, OpenAI allows null list elements only for bootstrap_port.
 #[derive(Deserialize)]
-pub(super) struct PDRoutingFields {
-    bootstrap_host: Option<StringOrList>,
-    bootstrap_port: Option<OptionalInt64OrList>,
-    bootstrap_room: Option<Int64OrList>,
-    routed_dp_rank: Option<i64>,
-    disagg_prefill_dp_rank: Option<i64>,
+pub(crate) struct PDRoutingFields {
+    pub(crate) bootstrap_host: Option<StringOrList>,
+    pub(crate) bootstrap_port: Option<OptionalInt64OrList>,
+    pub(crate) bootstrap_room: Option<Int64OrList>,
+    pub(crate) routed_dp_rank: Option<i64>,
+    pub(crate) disagg_prefill_dp_rank: Option<i64>,
 }
 
 /// Validated per-prompt columns, ready for admission.
-pub(super) struct NormalizedPDRouting {
-    pub(super) bootstrap: BootstrapColumns,
-    pub(super) routed_dp_rank: Option<i64>,
-    pub(super) disagg_prefill_dp_rank: Option<i64>,
+pub(crate) struct NormalizedPDRouting {
+    pub(crate) bootstrap: BootstrapColumns,
+    pub(crate) routed_dp_rank: Option<i64>,
+    pub(crate) disagg_prefill_dp_rank: Option<i64>,
 }
 
 impl PDRoutingFields {
     /// Normalize bootstrap fields per prompt and bound the handlers' host clones
     /// across choices. DP hints remain scalar.
-    pub(super) fn normalize(
+    pub(crate) fn normalize(
         self,
         prompt_count: usize,
         choices_per_prompt: usize,

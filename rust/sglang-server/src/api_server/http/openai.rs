@@ -8,18 +8,18 @@ use axum::{Router, http::StatusCode, response::Response};
 use futures::StreamExt;
 use std::sync::Arc;
 
-mod chat;
+pub(crate) mod chat;
 mod completions;
 mod models;
-mod pd_routing;
+pub(crate) mod pd_routing;
 mod template;
 mod template_builtins;
 mod template_legacy;
 mod template_loader;
 mod tokenize;
-mod tools;
+pub(crate) mod tools;
 
-pub(super) use template::{ChatFormatter, ChatTemplateKwargs};
+pub(crate) use template::{ChatFormatter, ChatTemplateKwargs};
 
 use super::app::AppState;
 use crate::api_server::core::{CoreError, CoreEvent, CoreOutput};
@@ -28,6 +28,7 @@ use crate::message::config::ServerArgs;
 use crate::message::request::GenerateRequest;
 use crate::tokenizer_manager::tokenizer;
 use crate::utils::response::error_response;
+use dynamo_protocols::types::CreateChatCompletionRequest;
 
 const MAX_OPENAI_CHOICES: usize = 4096;
 
@@ -40,12 +41,23 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
         .merge(tokenize::routes())
 }
 
+/// Render `request`'s messages with the served chat template, for the other
+/// chat-shaped frontends (Ollama) that share the OpenAI adapter's formatter.
+pub(crate) fn render_chat_prompt(
+    formatter: &ChatFormatter,
+    request: &CreateChatCompletionRequest,
+) -> Result<String, String> {
+    formatter
+        .render(request, None)
+        .map_err(|error| error.to_string())
+}
+
 /// Resolve the chat formatter, or `None` to disable the OpenAI chat-completions
 /// endpoint. Tokenization is the tokenizer pool's job (the api server never
 /// encodes); the formatter needs at most `tokenizer_config.json` — a built-in
 /// `--chat-template` name or a model-path-inferred legacy template resolve
 /// without it, so its absence must not disable chat.
-pub(super) fn load_chat_support(server_args: &ServerArgs) -> Option<ChatFormatter> {
+pub(crate) fn load_chat_support(server_args: &ServerArgs) -> Option<ChatFormatter> {
     // Chat needs the tokenizer pool behind it: under `skip_tokenizer_init`
     // there is none (text cannot be submitted), so chat is disabled.
     if server_args.skip_tokenizer_init || server_args.tokenizer_path.is_empty() {
@@ -84,12 +96,12 @@ fn unix_seconds() -> u64 {
         .unwrap_or(0)
 }
 
-fn unix_seconds_u32() -> u32 {
+pub(crate) fn unix_seconds_u32() -> u32 {
     u32::try_from(unix_seconds()).unwrap_or(u32::MAX)
 }
 
 /// The OpenAI error payload.
-pub(super) fn error_payload(code: StatusCode, message: impl Into<String>) -> serde_json::Value {
+pub(crate) fn error_payload(code: StatusCode, message: impl Into<String>) -> serde_json::Value {
     let message = message.into();
     let error_type = if code == StatusCode::UNAUTHORIZED {
         "AuthenticationError"
@@ -111,7 +123,7 @@ pub(super) fn error_payload(code: StatusCode, message: impl Into<String>) -> ser
 
 /// Form an OpenAI error response: unary → `code` plus the JSON `body`,
 /// streaming → 200 with one SSE error frame + `[DONE]`.
-pub(super) fn openai_error(code: StatusCode, message: impl Into<String>, stream: bool) -> Response {
+pub(crate) fn openai_error(code: StatusCode, message: impl Into<String>, stream: bool) -> Response {
     error_response(code, error_payload(code, message), stream)
 }
 
@@ -180,7 +192,7 @@ fn indexed_decode_stream(
     .boxed()
 }
 
-fn contains_media(value: &serde_json::Value) -> bool {
+pub(crate) fn contains_media(value: &serde_json::Value) -> bool {
     match value {
         serde_json::Value::Array(values) => values.iter().any(contains_media),
         serde_json::Value::Object(object) => {
@@ -215,4 +227,4 @@ fn model_error(model: &str, served_model_name: &str) -> Option<String> {
 }
 
 #[cfg(test)]
-mod test_utils;
+pub(crate) mod test_utils;

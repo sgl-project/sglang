@@ -43,6 +43,7 @@ pub fn emit_serde(descriptor_bytes: &[u8], package: &str) -> String {
             MessageKind::TaggedUnion {
                 oneof_mod,
                 oneof_ident,
+                oneof_field,
                 tag,
                 variants,
                 passthrough,
@@ -51,6 +52,7 @@ pub fn emit_serde(descriptor_bytes: &[u8], package: &str) -> String {
                 m,
                 oneof_mod,
                 oneof_ident,
+                oneof_field,
                 tag,
                 variants,
                 passthrough.as_ref(),
@@ -425,6 +427,38 @@ fn message_shapes(name: &str, models: &HashMap<&str, &MessageModel>) -> Vec<Json
 }
 
 /// For a bare-list message: the shapes of one ELEMENT.
+/// Whether a bare list's elements are themselves arrays of arrays (a matrix
+/// list), which the first element alone cannot tell from a plain nested list.
+fn nested_elements(name: &str, models: &HashMap<&str, &MessageModel>) -> bool {
+    let m = models
+        .get(name)
+        .unwrap_or_else(|| panic!("unknown message {name}"));
+    let MessageKind::BareList { item } = &m.kind else {
+        return false;
+    };
+    let FieldKind::RepeatedMessage { rust_path } = &item.kind else {
+        return false;
+    };
+    let Some(element) = models.get(rust_path.as_str()) else {
+        return false;
+    };
+    matches!(&element.kind, MessageKind::BareList { .. })
+        && element_shapes(rust_path, models).contains(&JsonShape::Seq)
+}
+
+/// The tag the generated `visit_seq` derives from an array's first element.
+fn seq_shape_tag(shape: &JsonShape) -> &'static str {
+    match shape {
+        JsonShape::Seq => "seq",
+        JsonShape::Str => "str",
+        JsonShape::Int => "int",
+        JsonShape::Float => "float",
+        JsonShape::Map => "map",
+        JsonShape::Bool => "bool",
+        JsonShape::Null => "null",
+    }
+}
+
 fn element_shapes(name: &str, models: &HashMap<&str, &MessageModel>) -> Vec<JsonShape> {
     let m = models
         .get(name)
@@ -549,8 +583,19 @@ fn emit_untagged(
                 build("StrDeserializer", "v.to_owned()"),
                 build("StringDeserializer", "v")
             )),
-            JsonShape::Int => visits.push_str(&format!(
-                r#"            fn visit_i64<E: ::serde::de::Error>(self, v: i64) -> Result<Self::Value, E> {{
+            JsonShape::Int => {
+                // A double arm also takes integers; the value widens.
+                let direct = match &arm.kind {
+                    FieldKind::Scalar {
+                        ty: ScalarTy::F64, ..
+                    }
+                    | FieldKind::OptScalar {
+                        ty: ScalarTy::F64, ..
+                    } => "v as f64",
+                    _ => "v",
+                };
+                visits.push_str(&format!(
+                    r#"            fn visit_i64<E: ::serde::de::Error>(self, v: i64) -> Result<Self::Value, E> {{
                 {}
             }}
             fn visit_u64<E: ::serde::de::Error>(self, v: u64) -> Result<Self::Value, E> {{
@@ -558,9 +603,10 @@ fn emit_untagged(
                 {}
             }}
 "#,
-                build("I64Deserializer", "v"),
-                build("I64Deserializer", "v")
-            )),
+                    build("I64Deserializer", direct),
+                    build("I64Deserializer", direct)
+                ))
+            }
             JsonShape::Float => visits.push_str(&format!(
                 r#"            fn visit_f64<E: ::serde::de::Error>(self, v: f64) -> Result<Self::Value, E> {{
                 {}
@@ -611,51 +657,87 @@ fn emit_untagged(
                         ty = msg_ty.expect("seq arm is a message")
                     ));
                 } else {
-                    // Two array-shaped arms: the one whose ELEMENTS are arrays
-                    // is the nested form; the first element decides, and `[]`
-                    // is the flat form.
-                    assert_eq!(arms.len(), 2, "{name}: more than two array-shaped untagged arms");
-                    let elem_is_seq = |a: &model::VariantModel| match &a.kind {
-                        FieldKind::Message { rust_path, .. } => {
-                            element_shapes(rust_path, models).contains(&JsonShape::Seq)
+                    // Several array-shaped arms: the first element's shape
+                    // picks the arm (an array element is told from an array
+                    // of arrays by one more level), `[]` is the first
+                    // declared arm, and a shape two arms take goes to the
+                    // first declared.
+                    let mut claims: Vec<(&'static str, &model::VariantModel)> = Vec::new();
+                    for arm in arms {
+                        let FieldKind::Message { rust_path, .. } = &arm.kind else {
+                            panic!("{name}: array-shaped arm {} must be a message", arm.json_name);
+                        };
+                        let mut tags = Vec::new();
+                        for shape in element_shapes(rust_path, models) {
+                            tags.push(match shape {
+                                JsonShape::Seq if nested_elements(rust_path, models) => "seq2",
+                                other => seq_shape_tag(&other),
+                            });
                         }
-                        _ => false,
-                    };
-                    let (nested, flat) = match (elem_is_seq(arms[0]), elem_is_seq(arms[1])) {
-                        (true, false) => (arms[0], arms[1]),
-                        (false, true) => (arms[1], arms[0]),
-                        _ => panic!(
-                            "{name}: array-shaped arms {} and {} cannot be told apart by their first element",
-                            arms[0].json_name, arms[1].json_name
-                        ),
-                    };
+                        let mut claimed = false;
+                        for tag in tags {
+                            if claims.iter().all(|(t, _)| *t != tag) {
+                                claims.push((tag, arm));
+                                claimed = true;
+                            }
+                        }
+                        assert!(
+                            claimed,
+                            "{name}: array-shaped arm {} cannot be told apart by its first element",
+                            arm.json_name
+                        );
+                    }
                     let ty_of = |a: &model::VariantModel| match &a.kind {
                         FieldKind::Message { rust_path, .. } => rust_path.clone(),
                         _ => unreachable!(),
                     };
+                    let mut match_arms = String::new();
+                    for (i, arm) in arms.iter().enumerate() {
+                        let mut patterns: Vec<String> = claims
+                            .iter()
+                            .filter(|(_, a)| a.json_name == arm.json_name)
+                            .map(|(tag, _)| format!("{tag:?}"))
+                            .collect();
+                        if i == 0 {
+                            patterns.push("\"empty\"".to_string());
+                        }
+                        match_arms.push_str(&format!(
+                            r#"                    {} => {{
+                        let v: {ty} = ::serde_json::from_value(reparse)
+                            .map_err(::serde::de::Error::custom)?;
+                        {ok}
+                    }}
+"#,
+                            patterns.join(" | "),
+                            ty = ty_of(arm),
+                            ok = wrap(&arm.rust_variant, "v"),
+                        ));
+                    }
                     visits.push_str(&format!(
                         r#"            fn visit_seq<A: ::serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {{
                 let mut items: Vec<::serde_json::Value> = Vec::new();
                 while let Some(v) = seq.next_element::<::serde_json::Value>()? {{
                     items.push(v);
                 }}
-                let nested = items.first().is_some_and(|f| f.is_array());
+                let shape = match items.first() {{
+                    None => "empty",
+                    Some(::serde_json::Value::Array(inner)) if inner.first().is_some_and(|x| x.is_array()) => "seq2",
+                    Some(::serde_json::Value::Array(_)) => "seq",
+                    Some(::serde_json::Value::String(_)) => "str",
+                    Some(::serde_json::Value::Number(n)) if n.is_i64() || n.is_u64() => "int",
+                    Some(::serde_json::Value::Number(_)) => "float",
+                    Some(::serde_json::Value::Object(_)) => "map",
+                    Some(::serde_json::Value::Bool(_)) => "bool",
+                    Some(::serde_json::Value::Null) => "null",
+                }};
                 let reparse = ::serde_json::Value::Array(items);
-                if nested {{
-                    let v: {nested_ty} = ::serde_json::from_value(reparse)
-                        .map_err(::serde::de::Error::custom)?;
-                    {nested_ok}
-                }} else {{
-                    let v: {flat_ty} = ::serde_json::from_value(reparse)
-                        .map_err(::serde::de::Error::custom)?;
-                    {flat_ok}
+                match shape {{
+{match_arms}                    other => Err(::serde::de::Error::custom(format!(
+                        "no {name} array form takes {{other}} elements"
+                    ))),
                 }}
             }}
-"#,
-                        nested_ty = ty_of(nested),
-                        flat_ty = ty_of(flat),
-                        nested_ok = wrap(&nested.rust_variant, "v"),
-                        flat_ok = wrap(&flat.rust_variant, "v"),
+"#
                     ));
                 }
             }
@@ -962,29 +1044,109 @@ impl<'de> ::serde::Deserialize<'de> for {name} {{
     ));
 }
 
+/// One tagged-payload field read from the buffered `raw` map: the absent
+/// key yields the kind's default, a value that does not parse falls back to
+/// the passthrough arm (or the unknown-tag error).
+fn tagged_read(f: &FieldModel) -> String {
+    let key = &f.json_name;
+    let parse = |ty: &str, wrap: &str| {
+        format!(
+            "Some(v) => match ::serde_json::from_value::<{ty}>(v.clone()) {{ Ok(v) => {wrap}, Err(_) => return fallback(raw) }}"
+        )
+    };
+    match &f.kind {
+        FieldKind::Scalar { ty, null_default } => {
+            let default = match null_default {
+                Some(default) => default.rust(),
+                None => "Default::default()".to_string(),
+            };
+            let null = match null_default {
+                Some(default) => format!("Some(::serde_json::Value::Null) => {}", default.rust()),
+                None => "Some(::serde_json::Value::Null) => return fallback(raw)".to_string(),
+            };
+            format!(
+                "match raw.get({key:?}) {{ None => {default}, {null}, {} }}",
+                parse(ty.rust(), "v")
+            )
+        }
+        FieldKind::OptScalar {
+            ty,
+            null_is_none_default,
+            null_default,
+            ..
+        } => {
+            let (absent, null) = match (null_is_none_default, null_default) {
+                (Some(default), _) => (format!("Some({})", default.rust()), "None".to_string()),
+                (None, Some(default)) => (
+                    format!("Some({})", default.rust()),
+                    format!("Some({})", default.rust()),
+                ),
+                (None, None) => ("None".to_string(), "None".to_string()),
+            };
+            format!(
+                "match raw.get({key:?}) {{ None => {absent}, Some(::serde_json::Value::Null) => {null}, {} }}",
+                parse(ty.rust(), "Some(v)")
+            )
+        }
+        FieldKind::Message { rust_path, .. } => format!(
+            "match raw.get({key:?}) {{ None | Some(::serde_json::Value::Null) => None, {} }}",
+            parse(rust_path, "Some(v)")
+        ),
+        FieldKind::RepeatedScalar { ty } => format!(
+            "match raw.get({key:?}) {{ None | Some(::serde_json::Value::Null) => Vec::new(), {} }}",
+            parse(&format!("Vec<{}>", ty.rust()), "v")
+        ),
+        FieldKind::RepeatedMessage { rust_path } => format!(
+            "match raw.get({key:?}) {{ None | Some(::serde_json::Value::Null) => Vec::new(), {} }}",
+            parse(&format!("Vec<{rust_path}>"), "v")
+        ),
+        FieldKind::RepeatedRawJson => format!(
+            "match raw.get({key:?}) {{ None | Some(::serde_json::Value::Null) => Vec::new(), Some(::serde_json::Value::Array(items)) => items.iter().map(|v| v.to_string()).collect(), Some(_) => return fallback(raw) }}"
+        ),
+        FieldKind::Map { value } => format!(
+            "match raw.get({key:?}) {{ None | Some(::serde_json::Value::Null) => Default::default(), {} }}",
+            parse(
+                &format!("::std::collections::HashMap<String, {}>", value.rust()),
+                "v"
+            )
+        ),
+        FieldKind::RawJson { .. } => format!(
+            "match raw.get({key:?}) {{ None | Some(::serde_json::Value::Null) => None, Some(v) => Some(v.to_string()) }}"
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn emit_tagged(
     out: &mut String,
     m: &MessageModel,
     oneof_mod: &str,
     oneof_ident: &str,
+    oneof_field: &str,
     tag: &str,
     variants: &[model::VariantModel],
     passthrough: Option<&model::VariantModel>,
 ) {
     let name = &m.rust_name;
 
-    // Serialize: {tag: variant_name, ...payload fields inlined (optional
-    // members as explicit nulls, matching serde's tagged-enum output)}.
+    // Serialize: {tag: variant_name, ...payload fields inlined, each under
+    // its own presence and null rules}.
     let mut ser_arms = String::new();
     for v in variants {
         let var = &v.rust_variant;
         let tag_value = &v.json_name;
         let mut payload = String::new();
         for f in &v.payload_fields {
-            payload.push_str(&ser_field(f, "v.", true));
+            payload.push_str(&ser_field(f, "v.", false));
         }
+        // An empty payload (a bare `{"type": ...}` event) binds nothing.
+        let binding = if v.payload_fields.is_empty() {
+            "_"
+        } else {
+            "v"
+        };
         ser_arms.push_str(&format!(
-            r#"            Some({oneof_mod}::{oneof_ident}::{var}(v)) => {{
+            r#"            Some({oneof_mod}::{oneof_ident}::{var}({binding})) => {{
         let mut map = serializer.serialize_map(None)?;
         ::serde::ser::SerializeMap::serialize_entry(&mut map, {tag:?}, {tag_value:?})?;
 {payload}        ::serde::ser::SerializeMap::end(map)
@@ -1012,24 +1174,16 @@ fn emit_tagged(
         let mut fields = String::new();
         for f in &v.payload_fields {
             let ident = &f.rust_ident;
-            let key = &f.json_name;
-            let read = match &f.kind {
-                FieldKind::OptScalar { ty, .. } => format!(
-                    "match raw.get({key:?}) {{ None | Some(::serde_json::Value::Null) => None, Some(v) => match ::serde_json::from_value::<{ty}>(v.clone()) {{ Ok(v) => Some(v), Err(_) => return fallback(raw) }} }}",
-                    ty = ty.rust()
-                ),
-                FieldKind::Message { rust_path, .. } => format!(
-                    "match raw.get({key:?}) {{ None | Some(::serde_json::Value::Null) => None, Some(v) => match ::serde_json::from_value::<{rust_path}>(v.clone()) {{ Ok(v) => Some(v), Err(_) => return fallback(raw) }} }}"
-                ),
-                other => panic!("{name}: tagged payload field kind {other:?} unsupported"),
-            };
-            fields.push_str(&format!("                    {ident}: {read},\n"));
+            fields.push_str(&format!(
+                "                    {ident}: {},\n",
+                tagged_read(f)
+            ));
         }
         de_arms.push_str(&format!(
             r#"            Some({tag_value:?}) => {{
                 let payload = {payload_ty} {{
 {fields}                }};
-                Ok({name} {{ kind: Some({oneof_mod}::{oneof_ident}::{var}(payload.into())) }})
+                Ok({name} {{ {oneof_field}: Some({oneof_mod}::{oneof_ident}::{var}(payload.into())) }})
             }}
 "#,
             payload_ty = match &v.kind {
@@ -1043,7 +1197,7 @@ fn emit_tagged(
             let var = &p.rust_variant;
             format!(
                 r#"        fn fallback<E: ::serde::de::Error>(raw: ::serde_json::Map<String, ::serde_json::Value>) -> Result<{name}, E> {{
-            Ok({name} {{ kind: Some({oneof_mod}::{oneof_ident}::{var}(::serde_json::Value::Object(raw).to_string())) }})
+            Ok({name} {{ {oneof_field}: Some({oneof_mod}::{oneof_ident}::{var}(::serde_json::Value::Object(raw).to_string())) }})
         }}
 "#
             )
@@ -1059,7 +1213,7 @@ fn emit_tagged(
     out.push_str(&format!(
         r#"impl ::serde::Serialize for {name} {{
     fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {{
-        match &self.kind {{
+        match &self.{oneof_field} {{
 {ser_arms}            None => serializer.serialize_none(),
         }}
     }}

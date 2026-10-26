@@ -3,9 +3,11 @@
 //! pipeline; `http` and `grpc` are the wire adapters on top of it. Generation
 //! handlers render semantic core events as unary JSON, SSE, or gRPC frames;
 //! control handlers serialize typed core results such as server metadata.
+pub(crate) mod anthropic;
 pub(crate) mod core;
 mod disaggregation;
 pub(crate) mod grpc;
 pub(crate) mod handlers;
 pub(crate) mod http;
 mod log;
+pub(crate) mod ollama;

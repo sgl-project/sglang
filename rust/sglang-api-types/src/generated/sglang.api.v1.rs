@@ -140,6 +140,17 @@ pub struct OptionalStringList {
     #[prost(message, repeated, tag = "1")]
     pub items: ::prost::alloc::vec::Vec<OptionalString>,
 }
+/// A nullable double list element (e.g. a completion token logprob).
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct OptionalDouble {
+    #[prost(double, optional, tag = "1")]
+    pub value: ::core::option::Option<f64>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DoubleList {
+    #[prost(double, repeated, tag = "1")]
+    pub items: ::prost::alloc::vec::Vec<f64>,
+}
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct OptionalInt64 {
     #[prost(int64, optional, tag = "1")]
@@ -174,6 +185,505 @@ pub struct ErrorBody {
     pub message: ::prost::alloc::string::String,
     #[prost(uint32, tag = "2")]
     pub code: u32,
+}
+/// `error.type` is one of Anthropic's documented values (invalid_request_error,
+/// authentication_error, permission_error, not_found_error, request_too_large,
+/// rate_limit_error, api_error, overloaded_error); strict SDK clients parse it.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AnthropicError {
+    #[prost(string, tag = "1")]
+    pub r#type: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub message: ::prost::alloc::string::String,
+}
+/// The HTTP error envelope: `{"type": "error", "error": {...}}`.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AnthropicErrorResponse {
+    #[prost(string, tag = "1")]
+    pub r#type: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "2")]
+    pub error: ::core::option::Option<AnthropicError>,
+}
+/// `input_tokens` excludes cached prompt tokens, which go to
+/// `cache_read_input_tokens`. A streamed `message_delta` carries only
+/// `output_tokens`; `message_start` and the unary reply carry both.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AnthropicUsage {
+    #[prost(int64, optional, tag = "1")]
+    pub input_tokens: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "2")]
+    pub output_tokens: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "3")]
+    pub cache_creation_input_tokens: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "4")]
+    pub cache_read_input_tokens: ::core::option::Option<i64>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AnthropicContentBlock {
+    #[prost(
+        oneof = "anthropic_content_block::Block",
+        tags = "1, 2, 3, 4, 5, 6, 7, 8"
+    )]
+    pub block: ::core::option::Option<anthropic_content_block::Block>,
+}
+/// Nested message and enum types in `AnthropicContentBlock`.
+pub mod anthropic_content_block {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Block {
+        #[prost(message, tag = "1")]
+        Text(super::AnthropicTextBlock),
+        #[prost(message, tag = "2")]
+        Image(super::AnthropicImageBlock),
+        #[prost(message, tag = "3")]
+        ToolUse(super::AnthropicToolUseBlock),
+        #[prost(message, tag = "4")]
+        ToolResult(super::AnthropicToolResultBlock),
+        #[prost(message, tag = "5")]
+        ToolReference(super::AnthropicToolReferenceBlock),
+        #[prost(message, tag = "6")]
+        SearchResult(super::AnthropicSearchResultBlock),
+        #[prost(message, tag = "7")]
+        Thinking(super::AnthropicThinkingBlock),
+        #[prost(message, tag = "8")]
+        RedactedThinking(super::AnthropicRedactedThinkingBlock),
+    }
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AnthropicContentBlockList {
+    #[prost(message, repeated, tag = "1")]
+    pub items: ::prost::alloc::vec::Vec<AnthropicContentBlock>,
+}
+/// A message's `content` and the request `system`: a string or a block list.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AnthropicContent {
+    #[prost(oneof = "anthropic_content::Value", tags = "1, 2")]
+    pub value: ::core::option::Option<anthropic_content::Value>,
+}
+/// Nested message and enum types in `AnthropicContent`.
+pub mod anthropic_content {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Value {
+        #[prost(string, tag = "1")]
+        Text(::prost::alloc::string::String),
+        #[prost(message, tag = "2")]
+        Blocks(super::AnthropicContentBlockList),
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AnthropicTextBlock {
+    #[prost(string, tag = "1")]
+    pub text: ::prost::alloc::string::String,
+}
+/// `source` is `{"type": "base64", "media_type", "data"}` or `{"url"}`; a bare
+/// string is accepted and ignored, as in Python.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AnthropicImageBlock {
+    #[prost(message, optional, tag = "1")]
+    pub source: ::core::option::Option<AnthropicImageSource>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AnthropicImageSource {
+    #[prost(oneof = "anthropic_image_source::Value", tags = "1, 2")]
+    pub value: ::core::option::Option<anthropic_image_source::Value>,
+}
+/// Nested message and enum types in `AnthropicImageSource`.
+pub mod anthropic_image_source {
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Value {
+        #[prost(string, tag = "1")]
+        Reference(::prost::alloc::string::String),
+        #[prost(message, tag = "2")]
+        Object(super::AnthropicImageSourceObject),
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AnthropicImageSourceObject {
+    #[prost(string, optional, tag = "1")]
+    pub r#type: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "2")]
+    pub media_type: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "3")]
+    pub data: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "4")]
+    pub url: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// The tool arguments object, passed through as JSON text.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AnthropicToolUseBlock {
+    #[prost(string, tag = "1")]
+    pub id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(string, optional, tag = "3")]
+    pub input: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// `tool_use_id` per the spec; legacy payloads send `id` instead.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AnthropicToolResultBlock {
+    #[prost(string, optional, tag = "1")]
+    pub tool_use_id: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "2")]
+    pub id: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "3")]
+    pub content: ::core::option::Option<AnthropicContent>,
+    #[prost(bool, optional, tag = "4")]
+    pub is_error: ::core::option::Option<bool>,
+}
+/// SGLang extension: names a deferred-loaded tool (`tool_name` or `name`).
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AnthropicToolReferenceBlock {
+    #[prost(string, optional, tag = "1")]
+    pub name: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "2")]
+    pub tool_name: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "3")]
+    pub id: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AnthropicSearchResultBlock {
+    #[prost(message, optional, tag = "1")]
+    pub source: ::core::option::Option<AnthropicSearchSource>,
+    #[prost(string, optional, tag = "2")]
+    pub title: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, repeated, tag = "3")]
+    pub content: ::prost::alloc::vec::Vec<AnthropicSearchResultItem>,
+}
+/// A URL / identifier string, or an object with `url` or `text`.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AnthropicSearchSource {
+    #[prost(oneof = "anthropic_search_source::Value", tags = "1, 2")]
+    pub value: ::core::option::Option<anthropic_search_source::Value>,
+}
+/// Nested message and enum types in `AnthropicSearchSource`.
+pub mod anthropic_search_source {
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Value {
+        #[prost(string, tag = "1")]
+        Reference(::prost::alloc::string::String),
+        #[prost(message, tag = "2")]
+        Object(super::AnthropicSearchSourceObject),
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AnthropicSearchSourceObject {
+    #[prost(string, optional, tag = "1")]
+    pub url: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "2")]
+    pub text: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// Only `type: "text"` items are read.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AnthropicSearchResultItem {
+    #[prost(string, optional, tag = "1")]
+    pub r#type: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "2")]
+    pub text: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// `signature` is omitted when the backend has none; an empty string would
+/// fail downstream signature verifiers.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AnthropicThinkingBlock {
+    #[prost(string, tag = "1")]
+    pub thinking: ::prost::alloc::string::String,
+    #[prost(string, optional, tag = "2")]
+    pub signature: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AnthropicRedactedThinkingBlock {
+    #[prost(string, optional, tag = "1")]
+    pub data: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// `role` is "user", "assistant", or "system".
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AnthropicMessage {
+    #[prost(string, tag = "1")]
+    pub role: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "2")]
+    pub content: ::core::option::Option<AnthropicContent>,
+}
+/// One flat shape for every tool family. A custom tool has no `type` (or
+/// "custom") and an `input_schema`; the server tools (`web_search_*`,
+/// `computer_*`, `bash_*`, `text_editor_*`) carry their own knobs and are
+/// skipped by the server, which has no implementation for them.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AnthropicTool {
+    #[prost(string, optional, tag = "1")]
+    pub r#type: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, tag = "2")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(string, optional, tag = "3")]
+    pub description: ::core::option::Option<::prost::alloc::string::String>,
+    /// The JSON Schema of the arguments; `{"type": "object"}` is filled when the
+    /// schema has no `type`.
+    #[prost(string, optional, tag = "4")]
+    pub input_schema: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(bool, optional, tag = "5")]
+    pub defer_loading: ::core::option::Option<bool>,
+    #[prost(int64, optional, tag = "6")]
+    pub max_uses: ::core::option::Option<i64>,
+    #[prost(string, repeated, tag = "7")]
+    pub allowed_domains: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(string, repeated, tag = "8")]
+    pub blocked_domains: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(int64, optional, tag = "9")]
+    pub display_width_px: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "10")]
+    pub display_height_px: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "11")]
+    pub display_number: ::core::option::Option<i64>,
+}
+/// `type` is "auto", "any", "tool" (with `name`), or "none".
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AnthropicToolChoice {
+    #[prost(string, tag = "1")]
+    pub r#type: ::prost::alloc::string::String,
+    #[prost(string, optional, tag = "2")]
+    pub name: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// `type` is "enabled" (`budget_tokens` >= 1024 required), "disabled" (no
+/// other field), or "adaptive" (no `budget_tokens`). The budget is accepted
+/// and not enforced; `display` "omitted" cannot hide reasoning here.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AnthropicThinkingParam {
+    #[prost(string, tag = "1")]
+    pub r#type: ::prost::alloc::string::String,
+    #[prost(int64, optional, tag = "2")]
+    pub budget_tokens: ::core::option::Option<i64>,
+    #[prost(string, optional, tag = "3")]
+    pub display: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// A soft hint; `max_tokens` stays the hard cap.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AnthropicTaskBudget {
+    #[prost(string, tag = "1")]
+    pub r#type: ::prost::alloc::string::String,
+    #[prost(int64, tag = "2")]
+    pub total: i64,
+    #[prost(int64, optional, tag = "3")]
+    pub remaining: ::core::option::Option<i64>,
+}
+/// `effort` is "minimal" | "low" | "medium" | "high" | "xhigh" | "max".
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AnthropicOutputConfig {
+    #[prost(string, optional, tag = "1")]
+    pub effort: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "2")]
+    pub task_budget: ::core::option::Option<AnthropicTaskBudget>,
+}
+/// `POST /v1/messages`. The routing fields are the P/D and DP hints a router
+/// may inject, as on the OpenAI routes.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AnthropicMessagesRequest {
+    #[prost(string, tag = "1")]
+    pub model: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "2")]
+    pub messages: ::prost::alloc::vec::Vec<AnthropicMessage>,
+    #[prost(int64, tag = "3")]
+    pub max_tokens: i64,
+    /// Opaque client metadata; accepted and ignored.
+    #[prost(string, optional, tag = "4")]
+    pub metadata: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, repeated, tag = "5")]
+    pub stop_sequences: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(bool, optional, tag = "6")]
+    pub stream: ::core::option::Option<bool>,
+    #[prost(message, optional, tag = "7")]
+    pub system: ::core::option::Option<AnthropicContent>,
+    #[prost(double, optional, tag = "8")]
+    pub temperature: ::core::option::Option<f64>,
+    #[prost(message, optional, tag = "9")]
+    pub thinking: ::core::option::Option<AnthropicThinkingParam>,
+    #[prost(message, optional, tag = "10")]
+    pub tool_choice: ::core::option::Option<AnthropicToolChoice>,
+    #[prost(message, repeated, tag = "11")]
+    pub tools: ::prost::alloc::vec::Vec<AnthropicTool>,
+    #[prost(int64, optional, tag = "12")]
+    pub top_k: ::core::option::Option<i64>,
+    #[prost(double, optional, tag = "13")]
+    pub top_p: ::core::option::Option<f64>,
+    #[prost(message, optional, tag = "14")]
+    pub output_config: ::core::option::Option<AnthropicOutputConfig>,
+    /// SDK beta opt-ins; accepted and ignored.
+    #[prost(string, repeated, tag = "15")]
+    pub betas: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "16")]
+    pub bootstrap_host: ::core::option::Option<StringOrList>,
+    #[prost(message, optional, tag = "17")]
+    pub bootstrap_port: ::core::option::Option<OptionalInt64OrList>,
+    #[prost(message, optional, tag = "18")]
+    pub bootstrap_room: ::core::option::Option<Int64OrList>,
+    #[prost(int64, optional, tag = "19")]
+    pub routed_dp_rank: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "20")]
+    pub disagg_prefill_dp_rank: ::core::option::Option<i64>,
+}
+/// The unary reply, and the `message` of a streamed `message_start` (where
+/// `content` is empty and `output_tokens` 0). `stop_reason` is "end_turn",
+/// "max_tokens", "stop_sequence", or "tool_use".
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AnthropicMessagesResponse {
+    #[prost(string, tag = "1")]
+    pub id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub r#type: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub role: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "4")]
+    pub content: ::core::option::Option<AnthropicContentBlockList>,
+    #[prost(string, tag = "5")]
+    pub model: ::prost::alloc::string::String,
+    #[prost(string, optional, tag = "6")]
+    pub stop_reason: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "7")]
+    pub stop_sequence: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "8")]
+    pub usage: ::core::option::Option<AnthropicUsage>,
+}
+/// `POST /v1/messages/count_tokens`: the rendered prompt's token count.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AnthropicCountTokensRequest {
+    #[prost(string, tag = "1")]
+    pub model: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "2")]
+    pub messages: ::prost::alloc::vec::Vec<AnthropicMessage>,
+    #[prost(message, optional, tag = "3")]
+    pub system: ::core::option::Option<AnthropicContent>,
+    #[prost(message, optional, tag = "4")]
+    pub thinking: ::core::option::Option<AnthropicThinkingParam>,
+    #[prost(message, optional, tag = "5")]
+    pub tool_choice: ::core::option::Option<AnthropicToolChoice>,
+    #[prost(message, repeated, tag = "6")]
+    pub tools: ::prost::alloc::vec::Vec<AnthropicTool>,
+    #[prost(message, optional, tag = "7")]
+    pub output_config: ::core::option::Option<AnthropicOutputConfig>,
+    #[prost(string, repeated, tag = "8")]
+    pub betas: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AnthropicCountTokensResponse {
+    #[prost(int64, tag = "1")]
+    pub input_tokens: i64,
+}
+/// One SSE event of a streamed `/v1/messages`; the SSE `event:` name is the
+/// tag. The sequence is message_start, then content_block_start / delta /
+/// stop groups, then message_delta and message_stop; a failure closes any
+/// open block, then emits error and message_stop.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AnthropicStreamEvent {
+    #[prost(
+        oneof = "anthropic_stream_event::Event",
+        tags = "1, 2, 3, 4, 5, 6, 7, 8"
+    )]
+    pub event: ::core::option::Option<anthropic_stream_event::Event>,
+}
+/// Nested message and enum types in `AnthropicStreamEvent`.
+pub mod anthropic_stream_event {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Event {
+        #[prost(message, tag = "1")]
+        MessageStart(super::AnthropicMessageStartEvent),
+        #[prost(message, tag = "2")]
+        MessageDelta(super::AnthropicMessageDeltaEvent),
+        #[prost(message, tag = "3")]
+        MessageStop(super::AnthropicMessageStopEvent),
+        #[prost(message, tag = "4")]
+        ContentBlockStart(super::AnthropicContentBlockStartEvent),
+        #[prost(message, tag = "5")]
+        ContentBlockDelta(super::AnthropicContentBlockDeltaEvent),
+        #[prost(message, tag = "6")]
+        ContentBlockStop(super::AnthropicContentBlockStopEvent),
+        #[prost(message, tag = "7")]
+        Ping(super::AnthropicPingEvent),
+        #[prost(message, tag = "8")]
+        Error(super::AnthropicErrorEvent),
+    }
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AnthropicMessageStartEvent {
+    #[prost(message, optional, tag = "1")]
+    pub message: ::core::option::Option<AnthropicMessagesResponse>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AnthropicMessageDeltaEvent {
+    #[prost(message, optional, tag = "1")]
+    pub delta: ::core::option::Option<AnthropicMessageEndDelta>,
+    #[prost(message, optional, tag = "2")]
+    pub usage: ::core::option::Option<AnthropicUsage>,
+}
+/// No `type` inside: the event name already says message_delta.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AnthropicMessageEndDelta {
+    #[prost(string, optional, tag = "1")]
+    pub stop_reason: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "2")]
+    pub stop_sequence: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AnthropicMessageStopEvent {}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AnthropicContentBlockStartEvent {
+    #[prost(int64, tag = "1")]
+    pub index: i64,
+    #[prost(message, optional, tag = "2")]
+    pub content_block: ::core::option::Option<AnthropicContentBlock>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AnthropicContentBlockDeltaEvent {
+    #[prost(int64, tag = "1")]
+    pub index: i64,
+    #[prost(message, optional, tag = "2")]
+    pub delta: ::core::option::Option<AnthropicContentDelta>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AnthropicContentBlockStopEvent {
+    #[prost(int64, tag = "1")]
+    pub index: i64,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AnthropicPingEvent {}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AnthropicErrorEvent {
+    #[prost(message, optional, tag = "1")]
+    pub error: ::core::option::Option<AnthropicError>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AnthropicContentDelta {
+    #[prost(oneof = "anthropic_content_delta::Delta", tags = "1, 2, 3, 4")]
+    pub delta: ::core::option::Option<anthropic_content_delta::Delta>,
+}
+/// Nested message and enum types in `AnthropicContentDelta`.
+pub mod anthropic_content_delta {
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Delta {
+        #[prost(message, tag = "1")]
+        TextDelta(super::AnthropicTextDelta),
+        #[prost(message, tag = "2")]
+        InputJsonDelta(super::AnthropicInputJsonDelta),
+        #[prost(message, tag = "3")]
+        ThinkingDelta(super::AnthropicThinkingDelta),
+        #[prost(message, tag = "4")]
+        SignatureDelta(super::AnthropicSignatureDelta),
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AnthropicTextDelta {
+    #[prost(string, tag = "1")]
+    pub text: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AnthropicInputJsonDelta {
+    #[prost(string, tag = "1")]
+    pub partial_json: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AnthropicThinkingDelta {
+    #[prost(string, tag = "1")]
+    pub thinking: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AnthropicSignatureDelta {
+    #[prost(string, tag = "1")]
+    pub signature: ::prost::alloc::string::String,
 }
 /// `/set_internal_state`: numeric scheduler knobs to override at runtime.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -1009,6 +1519,1746 @@ pub struct HiCacheStorageResponse {
     pub success: bool,
     #[prost(string, tag = "2")]
     pub message: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OllamaMessage {
+    #[prost(string, tag = "1")]
+    pub role: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub content: ::prost::alloc::string::String,
+    /// Base64 images; accepted and not rendered.
+    #[prost(message, optional, tag = "3")]
+    pub images: ::core::option::Option<StringList>,
+}
+/// The Ollama `options` keys SGLang maps onto its sampling params; any other
+/// key is ignored, as Python's `_convert_options_to_sampling_params` does.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OllamaOptions {
+    #[prost(double, optional, tag = "1")]
+    pub temperature: ::core::option::Option<f64>,
+    #[prost(double, optional, tag = "2")]
+    pub top_p: ::core::option::Option<f64>,
+    #[prost(int64, optional, tag = "3")]
+    pub top_k: ::core::option::Option<i64>,
+    /// `max_new_tokens`; defaults to 2048 when absent (Ollama answers run long).
+    #[prost(int64, optional, tag = "4")]
+    pub num_predict: ::core::option::Option<i64>,
+    #[prost(message, optional, tag = "5")]
+    pub stop: ::core::option::Option<StringOrList>,
+    #[prost(double, optional, tag = "6")]
+    pub presence_penalty: ::core::option::Option<f64>,
+    #[prost(double, optional, tag = "7")]
+    pub frequency_penalty: ::core::option::Option<f64>,
+    /// `sampling_seed`.
+    #[prost(int64, optional, tag = "8")]
+    pub seed: ::core::option::Option<i64>,
+}
+/// `POST /api/chat`.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OllamaChatRequest {
+    #[prost(string, tag = "1")]
+    pub model: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "2")]
+    pub messages: ::prost::alloc::vec::Vec<OllamaMessage>,
+    #[prost(bool, optional, tag = "3")]
+    pub stream: ::core::option::Option<bool>,
+    /// "json" or a JSON schema; accepted and ignored.
+    #[prost(string, optional, tag = "4")]
+    pub format: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "5")]
+    pub options: ::core::option::Option<OllamaOptions>,
+    /// Seconds or a duration string; accepted and ignored (no model unloading).
+    #[prost(string, optional, tag = "6")]
+    pub keep_alive: ::core::option::Option<::prost::alloc::string::String>,
+    /// Bool or "low" | "medium" | "high"; accepted and ignored.
+    #[prost(string, optional, tag = "7")]
+    pub think: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// One `/api/chat` frame. Unary: the whole answer with `done` set and the
+/// counters filled. Streamed: a delta per frame, then a `done` frame whose
+/// counters are filled (Python leaves them out; the Ollama API fills them).
+/// Durations are nanoseconds, as Ollama reports them.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OllamaChatResponse {
+    #[prost(string, tag = "1")]
+    pub model: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub created_at: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "3")]
+    pub message: ::core::option::Option<OllamaMessage>,
+    #[prost(bool, tag = "4")]
+    pub done: bool,
+    #[prost(string, optional, tag = "5")]
+    pub done_reason: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(int64, optional, tag = "6")]
+    pub total_duration: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "7")]
+    pub load_duration: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "8")]
+    pub prompt_eval_count: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "9")]
+    pub prompt_eval_duration: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "10")]
+    pub eval_count: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "11")]
+    pub eval_duration: ::core::option::Option<i64>,
+}
+/// `POST /api/generate`. `prompt` is sent raw; `system` is prepended with a
+/// blank line. `suffix`, `template`, `context`, `raw`, `format`, `images`,
+/// `keep_alive`, and `think` are accepted and ignored, as in Python.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OllamaGenerateRequest {
+    #[prost(string, tag = "1")]
+    pub model: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub prompt: ::prost::alloc::string::String,
+    #[prost(string, optional, tag = "3")]
+    pub suffix: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "4")]
+    pub system: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "5")]
+    pub template: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "6")]
+    pub context: ::core::option::Option<Int64List>,
+    #[prost(bool, optional, tag = "7")]
+    pub stream: ::core::option::Option<bool>,
+    #[prost(bool, optional, tag = "8")]
+    pub raw: ::core::option::Option<bool>,
+    #[prost(string, optional, tag = "9")]
+    pub format: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "10")]
+    pub options: ::core::option::Option<OllamaOptions>,
+    #[prost(string, optional, tag = "11")]
+    pub keep_alive: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "12")]
+    pub images: ::core::option::Option<StringList>,
+    #[prost(bool, optional, tag = "13")]
+    pub think: ::core::option::Option<bool>,
+}
+/// One `/api/generate` frame; the same unary / streamed contract as
+/// OllamaChatResponse. `context` is never filled (no conversation encoding).
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OllamaGenerateResponse {
+    #[prost(string, tag = "1")]
+    pub model: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub created_at: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub response: ::prost::alloc::string::String,
+    #[prost(bool, tag = "4")]
+    pub done: bool,
+    #[prost(string, optional, tag = "5")]
+    pub done_reason: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "6")]
+    pub context: ::core::option::Option<Int64List>,
+    #[prost(int64, optional, tag = "7")]
+    pub total_duration: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "8")]
+    pub load_duration: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "9")]
+    pub prompt_eval_count: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "10")]
+    pub prompt_eval_duration: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "11")]
+    pub eval_count: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "12")]
+    pub eval_duration: ::core::option::Option<i64>,
+}
+/// `GET /api/tags`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OllamaTagsRequest {}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OllamaTagsResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub models: ::prost::alloc::vec::Vec<OllamaModelInfo>,
+}
+/// One served model as an Ollama model card: SGLang has no model files, so
+/// `size` is 0 and `digest` a fixed placeholder.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OllamaModelInfo {
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub model: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub modified_at: ::prost::alloc::string::String,
+    #[prost(int64, tag = "4")]
+    pub size: i64,
+    #[prost(string, tag = "5")]
+    pub digest: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "6")]
+    pub details: ::core::option::Option<OllamaModelDetails>,
+}
+/// Ollama's `details` block. `/api/tags` fills format, family, and
+/// parameter_size; `/api/show` fills every field.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OllamaModelDetails {
+    #[prost(string, optional, tag = "1")]
+    pub parent_model: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, tag = "2")]
+    pub format: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub family: ::prost::alloc::string::String,
+    #[prost(string, repeated, tag = "4")]
+    pub families: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(string, tag = "5")]
+    pub parameter_size: ::prost::alloc::string::String,
+    #[prost(string, optional, tag = "6")]
+    pub quantization_level: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// `POST /api/show`.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OllamaShowRequest {
+    #[prost(string, tag = "1")]
+    pub model: ::prost::alloc::string::String,
+}
+/// A model card synthesized from the model name and context length.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OllamaShowResponse {
+    #[prost(string, tag = "1")]
+    pub license: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub modelfile: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub parameters: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub template: ::prost::alloc::string::String,
+    #[prost(string, tag = "5")]
+    pub modified_at: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "6")]
+    pub details: ::core::option::Option<OllamaModelDetails>,
+    /// Ollama's GGUF-style metadata; its keys are prefixed with the model
+    /// family (`<family>.context_length`), so it is an open object.
+    #[prost(string, optional, tag = "7")]
+    pub model_info: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, repeated, tag = "8")]
+    pub capabilities: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
+/// Python's `ErrorResponse`, the body of every OpenAI-route error.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OpenAiErrorResponse {
+    #[prost(string, tag = "1")]
+    pub object: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub message: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub r#type: ::prost::alloc::string::String,
+    #[prost(string, optional, tag = "4")]
+    pub param: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(int64, tag = "5")]
+    pub code: i64,
+}
+/// `CachedTokensDetails`: where cached prompt tokens came from; the storage
+/// pair appears only with an L3 backend.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OpenAiCachedTokensDetails {
+    #[prost(int64, tag = "1")]
+    pub device: i64,
+    #[prost(int64, tag = "2")]
+    pub host: i64,
+    #[prost(int64, optional, tag = "3")]
+    pub storage: ::core::option::Option<i64>,
+    #[prost(string, optional, tag = "4")]
+    pub storage_backend: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// `PromptTokensDetails`; the multimodal counts appear only when present.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OpenAiPromptTokensDetails {
+    #[prost(int64, tag = "1")]
+    pub cached_tokens: i64,
+    #[prost(int64, optional, tag = "2")]
+    pub image_tokens: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "3")]
+    pub audio_tokens: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "4")]
+    pub video_tokens: ::core::option::Option<i64>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OpenAiCompletionTokensDetails {
+    #[prost(int64, tag = "1")]
+    pub reasoning_tokens: i64,
+}
+/// `UsageInfo`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OpenAiUsage {
+    #[prost(int64, tag = "1")]
+    pub prompt_tokens: i64,
+    #[prost(int64, tag = "2")]
+    pub total_tokens: i64,
+    #[prost(int64, optional, tag = "3")]
+    pub completion_tokens: ::core::option::Option<i64>,
+    #[prost(message, optional, tag = "4")]
+    pub prompt_tokens_details: ::core::option::Option<OpenAiPromptTokensDetails>,
+    #[prost(int64, optional, tag = "5")]
+    pub reasoning_tokens: ::core::option::Option<i64>,
+    #[prost(message, optional, tag = "6")]
+    pub completion_tokens_details: ::core::option::Option<OpenAiCompletionTokensDetails>,
+}
+/// `SpecTokensDetails`: per-request speculative decoding statistics.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenAiSpecTokensDetails {
+    #[prost(double, tag = "1")]
+    pub spec_accept_rate: f64,
+    #[prost(double, tag = "2")]
+    pub spec_accept_length: f64,
+    #[prost(double, tag = "3")]
+    pub spec_cap_length: f64,
+    #[prost(double, tag = "4")]
+    pub spec_block_accept_length: f64,
+    #[prost(int64, tag = "5")]
+    pub spec_num_correct_drafts: i64,
+    #[prost(int64, tag = "6")]
+    pub spec_num_proposed_drafts: i64,
+    #[prost(int64, tag = "7")]
+    pub spec_verify_ct: i64,
+    #[prost(int64, repeated, tag = "8")]
+    pub spec_correct_drafts_histogram: ::prost::alloc::vec::Vec<i64>,
+    #[prost(int64, repeated, tag = "9")]
+    pub spec_cap_lens_histogram: ::prost::alloc::vec::Vec<i64>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenAiSpecTokensDetailsList {
+    #[prost(message, repeated, tag = "1")]
+    pub items: ::prost::alloc::vec::Vec<OpenAiSpecTokensDetails>,
+}
+/// One per request, or one per choice.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenAiSpecTokensDetailsOrList {
+    #[prost(oneof = "open_ai_spec_tokens_details_or_list::Value", tags = "1, 2")]
+    pub value: ::core::option::Option<open_ai_spec_tokens_details_or_list::Value>,
+}
+/// Nested message and enum types in `OpenAiSpecTokensDetailsOrList`.
+pub mod open_ai_spec_tokens_details_or_list {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Value {
+        #[prost(message, tag = "1")]
+        One(super::OpenAiSpecTokensDetails),
+        #[prost(message, tag = "2")]
+        Many(super::OpenAiSpecTokensDetailsList),
+    }
+}
+/// `SglExt`: SGLang's extension block on OpenAI responses; unset fields are
+/// left out.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenAiSglExt {
+    #[prost(string, optional, tag = "1")]
+    pub routed_experts: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "2")]
+    pub cached_tokens_details: ::core::option::Option<OpenAiCachedTokensDetails>,
+    #[prost(message, optional, tag = "3")]
+    pub spec_tokens_details: ::core::option::Option<OpenAiSpecTokensDetailsOrList>,
+    #[prost(message, optional, tag = "4")]
+    pub input_ids: ::core::option::Option<Int64List>,
+    #[prost(message, optional, tag = "5")]
+    pub output_ids: ::core::option::Option<TokenIdsList>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OpenAiStreamOptions {
+    #[prost(bool, optional, tag = "1")]
+    pub include_usage: ::core::option::Option<bool>,
+    #[prost(bool, optional, tag = "2")]
+    pub continuous_usage_stats: ::core::option::Option<bool>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OpenAiJsonSchemaResponseFormat {
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(string, optional, tag = "2")]
+    pub description: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "3")]
+    pub schema: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(bool, optional, tag = "4")]
+    pub strict: ::core::option::Option<bool>,
+}
+/// One `structures` entry of the legacy structural-tag format.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OpenAiStructureResponseFormat {
+    #[prost(string, tag = "1")]
+    pub begin: ::prost::alloc::string::String,
+    #[prost(string, optional, tag = "2")]
+    pub schema: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, tag = "3")]
+    pub end: ::prost::alloc::string::String,
+}
+/// `response_format`: `type` is "text" | "json_object" | "json_schema" with
+/// `json_schema`, or "structural_tag" with either the legacy `structures` /
+/// `triggers` / `at_least_one` fields or xgrammar's `format` object.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenAiResponseFormat {
+    #[prost(string, tag = "1")]
+    pub r#type: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "2")]
+    pub json_schema: ::core::option::Option<OpenAiJsonSchemaResponseFormat>,
+    #[prost(message, repeated, tag = "3")]
+    pub structures: ::prost::alloc::vec::Vec<OpenAiStructureResponseFormat>,
+    #[prost(string, repeated, tag = "4")]
+    pub triggers: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(bool, optional, tag = "5")]
+    pub at_least_one: ::core::option::Option<bool>,
+    #[prost(string, optional, tag = "6")]
+    pub format: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// `return_hidden_states`: every layer (true) or "last".
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OpenAiReturnHiddenStates {
+    #[prost(oneof = "open_ai_return_hidden_states::Value", tags = "1, 2")]
+    pub value: ::core::option::Option<open_ai_return_hidden_states::Value>,
+}
+/// Nested message and enum types in `OpenAiReturnHiddenStates`.
+pub mod open_ai_return_hidden_states {
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Value {
+        #[prost(bool, tag = "1")]
+        Flag(bool),
+        #[prost(string, tag = "2")]
+        Mode(::prost::alloc::string::String),
+    }
+}
+/// `LogProbs` (completions): `top_logprobs` rows are `{token: logprob}`
+/// objects or null, passed through.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenAiLogProbs {
+    #[prost(int64, repeated, tag = "1")]
+    pub text_offset: ::prost::alloc::vec::Vec<i64>,
+    #[prost(message, repeated, tag = "2")]
+    pub token_logprobs: ::prost::alloc::vec::Vec<OptionalDouble>,
+    #[prost(string, repeated, tag = "3")]
+    pub tokens: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(string, repeated, tag = "4")]
+    pub top_logprobs: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenAiTopLogprob {
+    #[prost(string, tag = "1")]
+    pub token: ::prost::alloc::string::String,
+    #[prost(int64, repeated, tag = "2")]
+    pub bytes: ::prost::alloc::vec::Vec<i64>,
+    #[prost(double, tag = "3")]
+    pub logprob: f64,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenAiChatCompletionTokenLogprob {
+    #[prost(string, tag = "1")]
+    pub token: ::prost::alloc::string::String,
+    #[prost(int64, repeated, tag = "2")]
+    pub bytes: ::prost::alloc::vec::Vec<i64>,
+    #[prost(double, tag = "3")]
+    pub logprob: f64,
+    #[prost(message, repeated, tag = "4")]
+    pub top_logprobs: ::prost::alloc::vec::Vec<OpenAiTopLogprob>,
+}
+/// `ChoiceLogprobs` (chat).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenAiChoiceLogprobs {
+    #[prost(message, repeated, tag = "1")]
+    pub content: ::prost::alloc::vec::Vec<OpenAiChatCompletionTokenLogprob>,
+}
+/// `prompt`: text, texts, token ids, or token-id lists.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenAiCompletionPrompt {
+    #[prost(oneof = "open_ai_completion_prompt::Value", tags = "1, 2, 3, 4")]
+    pub value: ::core::option::Option<open_ai_completion_prompt::Value>,
+}
+/// Nested message and enum types in `OpenAiCompletionPrompt`.
+pub mod open_ai_completion_prompt {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Value {
+        #[prost(string, tag = "1")]
+        Text(::prost::alloc::string::String),
+        #[prost(message, tag = "2")]
+        Texts(super::StringList),
+        #[prost(message, tag = "3")]
+        Ids(super::TokenIds),
+        #[prost(message, tag = "4")]
+        IdsList(super::TokenIdsList),
+    }
+}
+/// `POST /v1/completions`.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenAiCompletionRequest {
+    #[prost(string, optional, tag = "1")]
+    pub model: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "2")]
+    pub prompt: ::core::option::Option<OpenAiCompletionPrompt>,
+    #[prost(int64, optional, tag = "3")]
+    pub best_of: ::core::option::Option<i64>,
+    #[prost(bool, tag = "4")]
+    pub echo: bool,
+    #[prost(double, tag = "5")]
+    pub frequency_penalty: f64,
+    #[prost(map = "string, double", tag = "6")]
+    pub logit_bias: ::std::collections::HashMap<::prost::alloc::string::String, f64>,
+    #[prost(int64, optional, tag = "7")]
+    pub logprobs: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "8")]
+    pub max_tokens: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "9")]
+    pub n: ::core::option::Option<i64>,
+    #[prost(double, tag = "10")]
+    pub presence_penalty: f64,
+    #[prost(int64, optional, tag = "11")]
+    pub seed: ::core::option::Option<i64>,
+    #[prost(message, optional, tag = "12")]
+    pub stop: ::core::option::Option<StringOrList>,
+    #[prost(bool, tag = "13")]
+    pub stream: bool,
+    #[prost(message, optional, tag = "14")]
+    pub stream_options: ::core::option::Option<OpenAiStreamOptions>,
+    #[prost(string, optional, tag = "15")]
+    pub suffix: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(double, optional, tag = "16")]
+    pub temperature: ::core::option::Option<f64>,
+    #[prost(double, optional, tag = "17")]
+    pub top_p: ::core::option::Option<f64>,
+    #[prost(string, optional, tag = "18")]
+    pub user: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "19")]
+    pub return_hidden_states: ::core::option::Option<OpenAiReturnHiddenStates>,
+    #[prost(bool, tag = "20")]
+    pub return_routed_experts: bool,
+    #[prost(int64, tag = "21")]
+    pub routed_experts_start_len: i64,
+    #[prost(bool, tag = "22")]
+    pub return_cached_tokens_details: bool,
+    #[prost(bool, tag = "23")]
+    pub return_spec_tokens_details: bool,
+    #[prost(bool, tag = "24")]
+    pub return_token_ids: bool,
+    /// SGLang sampling extensions.
+    #[prost(int64, optional, tag = "25")]
+    pub top_k: ::core::option::Option<i64>,
+    #[prost(double, tag = "26")]
+    pub min_p: f64,
+    #[prost(int64, tag = "27")]
+    pub min_tokens: i64,
+    /// Already a JSON string in Python.
+    #[prost(string, optional, tag = "28")]
+    pub json_schema: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "29")]
+    pub regex: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "30")]
+    pub ebnf: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(double, optional, tag = "31")]
+    pub repetition_penalty: ::core::option::Option<f64>,
+    #[prost(message, optional, tag = "32")]
+    pub stop_token_ids: ::core::option::Option<Int64List>,
+    #[prost(message, optional, tag = "33")]
+    pub stop_regex: ::core::option::Option<StringOrList>,
+    #[prost(bool, tag = "34")]
+    pub no_stop_trim: bool,
+    #[prost(bool, tag = "35")]
+    pub ignore_eos: bool,
+    #[prost(bool, optional, tag = "36")]
+    pub skip_special_tokens: ::core::option::Option<bool>,
+    #[prost(message, optional, tag = "37")]
+    pub lora_path: ::core::option::Option<OptionalStringOrList>,
+    #[prost(string, optional, tag = "38")]
+    pub session_id: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "39")]
+    pub session_params: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "40")]
+    pub response_format: ::core::option::Option<OpenAiResponseFormat>,
+    #[prost(string, optional, tag = "41")]
+    pub custom_params: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "42")]
+    pub custom_logit_processor: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "43")]
+    pub watermark: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "44")]
+    pub images_config: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "45")]
+    pub mm_processor_kwargs: ::core::option::Option<::prost::alloc::string::String>,
+    /// Deprecated alias of `routed_dp_rank`.
+    #[prost(int64, optional, tag = "46")]
+    pub data_parallel_rank: ::core::option::Option<i64>,
+    #[prost(message, optional, tag = "47")]
+    pub rid: ::core::option::Option<StringOrList>,
+    #[prost(message, optional, tag = "48")]
+    pub extra_key: ::core::option::Option<StringOrList>,
+    #[prost(message, optional, tag = "49")]
+    pub cache_salt: ::core::option::Option<StringOrList>,
+    #[prost(int64, optional, tag = "50")]
+    pub priority: ::core::option::Option<i64>,
+    #[prost(map = "string, string", tag = "51")]
+    pub custom_labels:
+        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "52")]
+    pub bootstrap_host: ::core::option::Option<StringOrList>,
+    #[prost(message, optional, tag = "53")]
+    pub bootstrap_port: ::core::option::Option<OptionalInt64OrList>,
+    #[prost(message, optional, tag = "54")]
+    pub bootstrap_room: ::core::option::Option<Int64OrList>,
+    #[prost(int64, optional, tag = "55")]
+    pub routed_dp_rank: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "56")]
+    pub disagg_prefill_dp_rank: ::core::option::Option<i64>,
+}
+/// One choice, unary or streamed (`CompletionResponseChoice` and its stream
+/// twin share every field). `finish_reason` is "stop" | "length" |
+/// "content_filter" | "abort".
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenAiCompletionChoice {
+    #[prost(int64, tag = "1")]
+    pub index: i64,
+    #[prost(string, tag = "2")]
+    pub text: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "3")]
+    pub logprobs: ::core::option::Option<OpenAiLogProbs>,
+    #[prost(string, optional, tag = "4")]
+    pub finish_reason: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "5")]
+    pub matched_stop: ::core::option::Option<Matched>,
+    #[prost(string, optional, tag = "6")]
+    pub hidden_states: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "7")]
+    pub token_ids: ::core::option::Option<Int64List>,
+    #[prost(message, optional, tag = "8")]
+    pub prompt_token_ids: ::core::option::Option<Int64List>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenAiCompletionResponse {
+    #[prost(string, tag = "1")]
+    pub id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub object: ::prost::alloc::string::String,
+    #[prost(int64, tag = "3")]
+    pub created: i64,
+    #[prost(string, tag = "4")]
+    pub model: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "5")]
+    pub choices: ::prost::alloc::vec::Vec<OpenAiCompletionChoice>,
+    #[prost(message, optional, tag = "6")]
+    pub usage: ::core::option::Option<OpenAiUsage>,
+    #[prost(string, optional, tag = "7")]
+    pub metadata: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "8")]
+    pub sglext: ::core::option::Option<OpenAiSglExt>,
+}
+/// One SSE frame of a streamed completion; the trailing usage frame has no
+/// choices and is emitted without nulls.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenAiCompletionStreamResponse {
+    #[prost(string, tag = "1")]
+    pub id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub object: ::prost::alloc::string::String,
+    #[prost(int64, tag = "3")]
+    pub created: i64,
+    #[prost(string, tag = "4")]
+    pub model: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "5")]
+    pub choices: ::prost::alloc::vec::Vec<OpenAiCompletionChoice>,
+    #[prost(message, optional, tag = "6")]
+    pub usage: ::core::option::Option<OpenAiUsage>,
+    #[prost(message, optional, tag = "7")]
+    pub sglext: ::core::option::Option<OpenAiSglExt>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OpenAiImageUrl {
+    #[prost(string, tag = "1")]
+    pub url: ::prost::alloc::string::String,
+    /// "auto" | "low" | "high"; "default" reads as "auto".
+    #[prost(string, optional, tag = "2")]
+    pub detail: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(int64, optional, tag = "3")]
+    pub max_dynamic_patch: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "4")]
+    pub min_dynamic_patch: ::core::option::Option<i64>,
+    #[prost(string, optional, tag = "5")]
+    pub content_hash: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenAiVideoUrl {
+    #[prost(string, tag = "1")]
+    pub url: ::prost::alloc::string::String,
+    #[prost(int64, optional, tag = "2")]
+    pub max_dynamic_patch: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "3")]
+    pub min_dynamic_patch: ::core::option::Option<i64>,
+    #[prost(double, optional, tag = "4")]
+    pub fps: ::core::option::Option<f64>,
+    #[prost(int64, optional, tag = "5")]
+    pub max_frames: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "6")]
+    pub max_tokens_per_frame: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "7")]
+    pub max_image_tokens: ::core::option::Option<i64>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OpenAiAudioUrl {
+    #[prost(string, tag = "1")]
+    pub url: ::prost::alloc::string::String,
+}
+/// OpenAI's inline audio: base64 `data` in "wav" | "mp3".
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OpenAiInputAudio {
+    #[prost(string, tag = "1")]
+    pub data: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub format: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OpenAiTextPart {
+    #[prost(string, tag = "1")]
+    pub text: ::prost::alloc::string::String,
+}
+/// `type` "thinking" or "reasoning": exactly one of `thinking` / `text`.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OpenAiThinkingPart {
+    #[prost(string, optional, tag = "1")]
+    pub thinking: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "2")]
+    pub text: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OpenAiImagePart {
+    #[prost(message, optional, tag = "1")]
+    pub image_url: ::core::option::Option<OpenAiImageUrl>,
+    /// "image" | "multi-images" | "video".
+    #[prost(string, optional, tag = "2")]
+    pub modalities: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenAiVideoPart {
+    #[prost(message, optional, tag = "1")]
+    pub video_url: ::core::option::Option<OpenAiVideoUrl>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OpenAiAudioUrlPart {
+    #[prost(message, optional, tag = "1")]
+    pub audio_url: ::core::option::Option<OpenAiAudioUrl>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OpenAiInputAudioPart {
+    #[prost(message, optional, tag = "1")]
+    pub input_audio: ::core::option::Option<OpenAiInputAudio>,
+}
+/// GLM extension used with `defer_loading` tools: the template renders the
+/// named tool's schema inline for the turn.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OpenAiToolReferencePart {
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+}
+/// `ChatCompletionMessageContentPart`, tagged by `type`.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenAiChatContentPart {
+    #[prost(
+        oneof = "open_ai_chat_content_part::Part",
+        tags = "1, 2, 3, 4, 5, 6, 7, 8"
+    )]
+    pub part: ::core::option::Option<open_ai_chat_content_part::Part>,
+}
+/// Nested message and enum types in `OpenAiChatContentPart`.
+pub mod open_ai_chat_content_part {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Part {
+        #[prost(message, tag = "1")]
+        Text(super::OpenAiTextPart),
+        #[prost(message, tag = "2")]
+        Thinking(super::OpenAiThinkingPart),
+        #[prost(message, tag = "3")]
+        Reasoning(super::OpenAiThinkingPart),
+        #[prost(message, tag = "4")]
+        ImageUrl(super::OpenAiImagePart),
+        #[prost(message, tag = "5")]
+        VideoUrl(super::OpenAiVideoPart),
+        #[prost(message, tag = "6")]
+        AudioUrl(super::OpenAiAudioUrlPart),
+        #[prost(message, tag = "7")]
+        InputAudio(super::OpenAiInputAudioPart),
+        #[prost(message, tag = "8")]
+        ToolReference(super::OpenAiToolReferencePart),
+    }
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenAiChatContentPartList {
+    #[prost(message, repeated, tag = "1")]
+    pub items: ::prost::alloc::vec::Vec<OpenAiChatContentPart>,
+}
+/// A message's `content`: a string or content parts. Also the rerank
+/// `query` / `documents` shape (text, image_url, video_url parts).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenAiChatContent {
+    #[prost(oneof = "open_ai_chat_content::Value", tags = "1, 2")]
+    pub value: ::core::option::Option<open_ai_chat_content::Value>,
+}
+/// Nested message and enum types in `OpenAiChatContent`.
+pub mod open_ai_chat_content {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Value {
+        #[prost(string, tag = "1")]
+        Text(::prost::alloc::string::String),
+        #[prost(message, tag = "2")]
+        Parts(super::OpenAiChatContentPartList),
+    }
+}
+/// A tool call's function: `arguments` is a JSON string on the wire for
+/// responses, and a string or an object on requests, so it passes through as
+/// JSON text (a quoted string stays quoted).
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OpenAiFunctionCall {
+    #[prost(string, optional, tag = "1")]
+    pub name: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "2")]
+    pub arguments: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// `ToolCall`, on request history and on replies.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OpenAiToolCall {
+    #[prost(string, optional, tag = "1")]
+    pub id: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(int64, optional, tag = "2")]
+    pub index: ::core::option::Option<i64>,
+    #[prost(string, optional, tag = "3")]
+    pub r#type: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "4")]
+    pub function: ::core::option::Option<OpenAiFunctionCall>,
+}
+/// `Function`: the tool schema is rendered as given, so `parameters` passes
+/// through and unset flags are left out.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OpenAiFunction {
+    #[prost(string, optional, tag = "1")]
+    pub description: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, tag = "2")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(string, optional, tag = "3")]
+    pub parameters: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(bool, optional, tag = "4")]
+    pub strict: ::core::option::Option<bool>,
+    #[prost(bool, optional, tag = "5")]
+    pub defer_loading: ::core::option::Option<bool>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OpenAiTool {
+    #[prost(string, optional, tag = "1")]
+    pub r#type: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "2")]
+    pub function: ::core::option::Option<OpenAiFunction>,
+    #[prost(bool, optional, tag = "3")]
+    pub defer_loading: ::core::option::Option<bool>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OpenAiToolChoiceFunction {
+    #[prost(string, optional, tag = "1")]
+    pub name: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OpenAiNamedToolChoice {
+    #[prost(message, optional, tag = "1")]
+    pub function: ::core::option::Option<OpenAiToolChoiceFunction>,
+    #[prost(string, optional, tag = "2")]
+    pub r#type: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// `tool_choice`: "auto" | "required" | "none", or a named function.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OpenAiToolChoice {
+    #[prost(oneof = "open_ai_tool_choice::Value", tags = "1, 2")]
+    pub value: ::core::option::Option<open_ai_tool_choice::Value>,
+}
+/// Nested message and enum types in `OpenAiToolChoice`.
+pub mod open_ai_tool_choice {
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Value {
+        #[prost(string, tag = "1")]
+        Mode(::prost::alloc::string::String),
+        #[prost(message, tag = "2")]
+        Named(super::OpenAiNamedToolChoice),
+    }
+}
+/// `reasoning_effort`: a tier ("none" | "minimal" | "low" | "medium" | "high"
+/// \| "xhigh" | "ultra" | "max") or, as an SGLang extension, a value in
+/// \[0.0, 0.99\].
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenAiReasoningEffort {
+    #[prost(oneof = "open_ai_reasoning_effort::Value", tags = "1, 2")]
+    pub value: ::core::option::Option<open_ai_reasoning_effort::Value>,
+}
+/// Nested message and enum types in `OpenAiReasoningEffort`.
+pub mod open_ai_reasoning_effort {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Value {
+        #[prost(string, tag = "1")]
+        Tier(::prost::alloc::string::String),
+        #[prost(double, tag = "2")]
+        Level(f64),
+    }
+}
+/// `ChatCompletionMessageParam`: `role` is "user" | "system" | "assistant" |
+/// "tool" | "function" | "developer" | "latest_reminder" | "root" (matched
+/// case-insensitively). Thinking parts are valid on assistant turns only.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenAiChatMessage {
+    #[prost(string, tag = "1")]
+    pub role: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "2")]
+    pub content: ::core::option::Option<OpenAiChatContent>,
+    #[prost(string, optional, tag = "3")]
+    pub tool_call_id: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "4")]
+    pub name: ::core::option::Option<::prost::alloc::string::String>,
+    /// "commentary" | "final_answer".
+    #[prost(string, optional, tag = "5")]
+    pub phase: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "6")]
+    pub reasoning_content: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, repeated, tag = "7")]
+    pub tool_calls: ::prost::alloc::vec::Vec<OpenAiToolCall>,
+    /// Message-level tools on root / system / developer turns.
+    #[prost(message, repeated, tag = "8")]
+    pub tools: ::prost::alloc::vec::Vec<OpenAiTool>,
+    /// DeepSeek prefix completion: continue this final assistant message.
+    #[prost(bool, optional, tag = "9")]
+    pub prefix: ::core::option::Option<bool>,
+}
+/// `POST /v1/chat/completions`.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenAiChatCompletionRequest {
+    #[prost(message, repeated, tag = "1")]
+    pub messages: ::prost::alloc::vec::Vec<OpenAiChatMessage>,
+    #[prost(string, optional, tag = "2")]
+    pub model: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(double, tag = "3")]
+    pub frequency_penalty: f64,
+    #[prost(map = "string, double", tag = "4")]
+    pub logit_bias: ::std::collections::HashMap<::prost::alloc::string::String, f64>,
+    #[prost(bool, tag = "5")]
+    pub logprobs: bool,
+    #[prost(int64, optional, tag = "6")]
+    pub top_logprobs: ::core::option::Option<i64>,
+    /// Deprecated in favor of `max_completion_tokens`.
+    #[prost(int64, optional, tag = "7")]
+    pub max_tokens: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "8")]
+    pub max_completion_tokens: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "9")]
+    pub n: ::core::option::Option<i64>,
+    #[prost(double, tag = "10")]
+    pub presence_penalty: f64,
+    #[prost(message, optional, tag = "11")]
+    pub response_format: ::core::option::Option<OpenAiResponseFormat>,
+    #[prost(int64, optional, tag = "12")]
+    pub seed: ::core::option::Option<i64>,
+    #[prost(message, optional, tag = "13")]
+    pub stop: ::core::option::Option<StringOrList>,
+    #[prost(bool, tag = "14")]
+    pub stream: bool,
+    #[prost(message, optional, tag = "15")]
+    pub stream_options: ::core::option::Option<OpenAiStreamOptions>,
+    #[prost(double, optional, tag = "16")]
+    pub temperature: ::core::option::Option<f64>,
+    #[prost(double, optional, tag = "17")]
+    pub top_p: ::core::option::Option<f64>,
+    #[prost(string, optional, tag = "18")]
+    pub user: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, repeated, tag = "19")]
+    pub tools: ::prost::alloc::vec::Vec<OpenAiTool>,
+    /// Unset reads as "none" without tools and "auto" with them.
+    #[prost(message, optional, tag = "20")]
+    pub tool_choice: ::core::option::Option<OpenAiToolChoice>,
+    #[prost(bool, optional, tag = "21")]
+    pub parallel_tool_calls: ::core::option::Option<bool>,
+    #[prost(message, optional, tag = "22")]
+    pub return_hidden_states: ::core::option::Option<OpenAiReturnHiddenStates>,
+    #[prost(bool, tag = "23")]
+    pub return_routed_experts: bool,
+    #[prost(int64, tag = "24")]
+    pub routed_experts_start_len: i64,
+    #[prost(bool, tag = "25")]
+    pub return_cached_tokens_details: bool,
+    #[prost(bool, tag = "26")]
+    pub return_spec_tokens_details: bool,
+    #[prost(bool, tag = "27")]
+    pub return_prompt_token_ids: bool,
+    #[prost(bool, tag = "28")]
+    pub return_token_ids: bool,
+    #[prost(bool, tag = "29")]
+    pub return_meta_info: bool,
+    #[prost(bool, tag = "30")]
+    pub return_input_ids_in_sglext: bool,
+    #[prost(bool, tag = "31")]
+    pub return_output_ids_in_sglext: bool,
+    #[prost(bool, tag = "32")]
+    pub return_sampling_mask: bool,
+    /// "selected" | "support".
+    #[prost(string, optional, tag = "33")]
+    pub sampling_logprobs_mode: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(bool, tag = "34")]
+    pub return_flat_raw_output_top_logprobs: bool,
+    #[prost(bool, optional, tag = "35")]
+    pub return_flat_raw_top_logprobs_b64: ::core::option::Option<bool>,
+    #[prost(message, optional, tag = "36")]
+    pub reasoning_effort: ::core::option::Option<OpenAiReasoningEffort>,
+    /// A thinking config such as `{"type": "adaptive"}`; read by the template.
+    #[prost(string, optional, tag = "37")]
+    pub thinking: ::core::option::Option<::prost::alloc::string::String>,
+    /// DeepSeek-V4 quick instruction task: "action" | "query" | "authority" |
+    /// "domain" | "title" | "read_url".
+    #[prost(string, optional, tag = "38")]
+    pub task: ::core::option::Option<::prost::alloc::string::String>,
+    /// SGLang sampling extensions; unset falls back to the model's defaults.
+    #[prost(int64, optional, tag = "39")]
+    pub top_k: ::core::option::Option<i64>,
+    #[prost(double, optional, tag = "40")]
+    pub min_p: ::core::option::Option<f64>,
+    #[prost(int64, tag = "41")]
+    pub min_tokens: i64,
+    #[prost(string, optional, tag = "42")]
+    pub regex: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "43")]
+    pub ebnf: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(double, optional, tag = "44")]
+    pub repetition_penalty: ::core::option::Option<f64>,
+    #[prost(message, optional, tag = "45")]
+    pub stop_token_ids: ::core::option::Option<Int64List>,
+    #[prost(message, optional, tag = "46")]
+    pub stop_regex: ::core::option::Option<StringOrList>,
+    #[prost(bool, tag = "47")]
+    pub no_stop_trim: bool,
+    #[prost(bool, tag = "48")]
+    pub ignore_eos: bool,
+    #[prost(bool, tag = "49")]
+    pub continue_final_message: bool,
+    #[prost(bool, optional, tag = "50")]
+    pub skip_special_tokens: ::core::option::Option<bool>,
+    #[prost(message, optional, tag = "51")]
+    pub lora_path: ::core::option::Option<OptionalStringOrList>,
+    #[prost(string, optional, tag = "52")]
+    pub session_id: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "53")]
+    pub session_params: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(bool, optional, tag = "54")]
+    pub separate_reasoning: ::core::option::Option<bool>,
+    #[prost(bool, optional, tag = "55")]
+    pub stream_reasoning: ::core::option::Option<bool>,
+    #[prost(string, optional, tag = "56")]
+    pub chat_template_kwargs: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(int64, optional, tag = "57")]
+    pub max_dynamic_patch: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "58")]
+    pub min_dynamic_patch: ::core::option::Option<i64>,
+    #[prost(bool, tag = "59")]
+    pub use_audio_in_video: bool,
+    #[prost(string, optional, tag = "60")]
+    pub images_config: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "61")]
+    pub video_config: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "62")]
+    pub mm_processor_kwargs: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "63")]
+    pub custom_logit_processor: ::core::option::Option<OptionalStringOrList>,
+    #[prost(string, optional, tag = "64")]
+    pub custom_params: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "65")]
+    pub watermark: ::core::option::Option<::prost::alloc::string::String>,
+    /// Pre-tokenized prompt: bypasses the template; messages still drive stops
+    /// and the tool-call constraint.
+    #[prost(message, optional, tag = "66")]
+    pub input_ids: ::core::option::Option<Int64List>,
+    #[prost(message, optional, tag = "67")]
+    pub rid: ::core::option::Option<StringOrList>,
+    #[prost(message, optional, tag = "68")]
+    pub extra_key: ::core::option::Option<StringOrList>,
+    #[prost(message, optional, tag = "69")]
+    pub cache_salt: ::core::option::Option<StringOrList>,
+    #[prost(int64, optional, tag = "70")]
+    pub priority: ::core::option::Option<i64>,
+    /// Deprecated alias of `routed_dp_rank`.
+    #[prost(int64, optional, tag = "71")]
+    pub data_parallel_rank: ::core::option::Option<i64>,
+    #[prost(message, optional, tag = "72")]
+    pub bootstrap_host: ::core::option::Option<StringOrList>,
+    #[prost(message, optional, tag = "73")]
+    pub bootstrap_port: ::core::option::Option<OptionalInt64OrList>,
+    #[prost(message, optional, tag = "74")]
+    pub bootstrap_room: ::core::option::Option<Int64OrList>,
+    #[prost(int64, optional, tag = "75")]
+    pub routed_dp_rank: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "76")]
+    pub disagg_prefill_dp_rank: ::core::option::Option<i64>,
+}
+/// `ChatMessage`, the unary reply's message.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenAiChatMessageResponse {
+    #[prost(string, optional, tag = "1")]
+    pub role: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "2")]
+    pub content: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "3")]
+    pub reasoning_content: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, repeated, tag = "4")]
+    pub tool_calls: ::prost::alloc::vec::Vec<OpenAiToolCall>,
+}
+/// `finish_reason` is "stop" | "length" | "tool_calls" | "content_filter" |
+/// "function_call" | "abort".
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenAiChatCompletionChoice {
+    #[prost(int64, tag = "1")]
+    pub index: i64,
+    #[prost(message, optional, tag = "2")]
+    pub message: ::core::option::Option<OpenAiChatMessageResponse>,
+    #[prost(message, optional, tag = "3")]
+    pub logprobs: ::core::option::Option<OpenAiChoiceLogprobs>,
+    #[prost(string, optional, tag = "4")]
+    pub finish_reason: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "5")]
+    pub matched_stop: ::core::option::Option<Matched>,
+    #[prost(string, optional, tag = "6")]
+    pub hidden_states: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "7")]
+    pub prompt_token_ids: ::core::option::Option<Int64List>,
+    #[prost(message, optional, tag = "8")]
+    pub response_token_ids: ::core::option::Option<Int64List>,
+    #[prost(string, optional, tag = "9")]
+    pub meta_info: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenAiChatCompletionResponse {
+    #[prost(string, tag = "1")]
+    pub id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub object: ::prost::alloc::string::String,
+    #[prost(int64, tag = "3")]
+    pub created: i64,
+    #[prost(string, tag = "4")]
+    pub model: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "5")]
+    pub choices: ::prost::alloc::vec::Vec<OpenAiChatCompletionChoice>,
+    #[prost(message, optional, tag = "6")]
+    pub usage: ::core::option::Option<OpenAiUsage>,
+    #[prost(string, optional, tag = "7")]
+    pub metadata: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "8")]
+    pub sglext: ::core::option::Option<OpenAiSglExt>,
+}
+/// `DeltaMessage`.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenAiDeltaMessage {
+    #[prost(string, optional, tag = "1")]
+    pub role: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "2")]
+    pub content: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "3")]
+    pub reasoning_content: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, repeated, tag = "4")]
+    pub tool_calls: ::prost::alloc::vec::Vec<OpenAiToolCall>,
+    #[prost(string, optional, tag = "5")]
+    pub hidden_states: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenAiChatCompletionStreamChoice {
+    #[prost(int64, tag = "1")]
+    pub index: i64,
+    #[prost(message, optional, tag = "2")]
+    pub delta: ::core::option::Option<OpenAiDeltaMessage>,
+    #[prost(message, optional, tag = "3")]
+    pub logprobs: ::core::option::Option<OpenAiChoiceLogprobs>,
+    #[prost(string, optional, tag = "4")]
+    pub finish_reason: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "5")]
+    pub matched_stop: ::core::option::Option<Matched>,
+}
+/// One SSE frame of a streamed chat completion.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenAiChatCompletionStreamResponse {
+    #[prost(string, tag = "1")]
+    pub id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub object: ::prost::alloc::string::String,
+    #[prost(int64, tag = "3")]
+    pub created: i64,
+    #[prost(string, tag = "4")]
+    pub model: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "5")]
+    pub choices: ::prost::alloc::vec::Vec<OpenAiChatCompletionStreamChoice>,
+    #[prost(message, optional, tag = "6")]
+    pub usage: ::core::option::Option<OpenAiUsage>,
+    #[prost(message, optional, tag = "7")]
+    pub sglext: ::core::option::Option<OpenAiSglExt>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OpenAiMultimodalEmbeddingInput {
+    #[prost(string, optional, tag = "1")]
+    pub text: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "2")]
+    pub image: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "3")]
+    pub video: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenAiMultimodalEmbeddingInputList {
+    #[prost(message, repeated, tag = "1")]
+    pub items: ::prost::alloc::vec::Vec<OpenAiMultimodalEmbeddingInput>,
+}
+/// `input`: text, texts, token ids, token-id lists, or multimodal items.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenAiEmbeddingInput {
+    #[prost(oneof = "open_ai_embedding_input::Value", tags = "1, 2, 3, 4, 5")]
+    pub value: ::core::option::Option<open_ai_embedding_input::Value>,
+}
+/// Nested message and enum types in `OpenAiEmbeddingInput`.
+pub mod open_ai_embedding_input {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Value {
+        #[prost(string, tag = "1")]
+        Text(::prost::alloc::string::String),
+        #[prost(message, tag = "2")]
+        Texts(super::StringList),
+        #[prost(message, tag = "3")]
+        Ids(super::TokenIds),
+        #[prost(message, tag = "4")]
+        IdsList(super::TokenIdsList),
+        #[prost(message, tag = "5")]
+        Multimodal(super::OpenAiMultimodalEmbeddingInputList),
+    }
+}
+/// `POST /v1/embeddings`.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenAiEmbeddingRequest {
+    #[prost(message, optional, tag = "1")]
+    pub input: ::core::option::Option<OpenAiEmbeddingInput>,
+    #[prost(string, optional, tag = "2")]
+    pub model: ::core::option::Option<::prost::alloc::string::String>,
+    /// "float" | "base64".
+    #[prost(string, optional, tag = "3")]
+    pub encoding_format: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(int64, optional, tag = "4")]
+    pub dimensions: ::core::option::Option<i64>,
+    #[prost(string, optional, tag = "5")]
+    pub user: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "6")]
+    pub rid: ::core::option::Option<StringOrList>,
+    #[prost(int64, optional, tag = "7")]
+    pub priority: ::core::option::Option<i64>,
+    #[prost(message, optional, tag = "8")]
+    pub lora_path: ::core::option::Option<OptionalStringOrList>,
+    #[prost(int64, optional, tag = "9")]
+    pub embed_override_token_id: ::core::option::Option<i64>,
+    /// One `[num_replacements][hidden]` matrix per input, or null to skip it.
+    #[prost(string, repeated, tag = "10")]
+    pub embed_overrides: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
+/// `embedding`: floats, or base64 with `encoding_format` "base64".
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenAiEmbeddingVector {
+    #[prost(oneof = "open_ai_embedding_vector::Value", tags = "1, 2")]
+    pub value: ::core::option::Option<open_ai_embedding_vector::Value>,
+}
+/// Nested message and enum types in `OpenAiEmbeddingVector`.
+pub mod open_ai_embedding_vector {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Value {
+        #[prost(message, tag = "1")]
+        Floats(super::DoubleList),
+        #[prost(string, tag = "2")]
+        Base64(::prost::alloc::string::String),
+    }
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenAiEmbeddingObject {
+    #[prost(message, optional, tag = "1")]
+    pub embedding: ::core::option::Option<OpenAiEmbeddingVector>,
+    #[prost(int64, tag = "2")]
+    pub index: i64,
+    #[prost(string, tag = "3")]
+    pub object: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenAiEmbeddingResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub data: ::prost::alloc::vec::Vec<OpenAiEmbeddingObject>,
+    #[prost(string, tag = "2")]
+    pub model: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub object: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "4")]
+    pub usage: ::core::option::Option<OpenAiUsage>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OpenAiClassifyInput {
+    #[prost(oneof = "open_ai_classify_input::Value", tags = "1, 2, 3")]
+    pub value: ::core::option::Option<open_ai_classify_input::Value>,
+}
+/// Nested message and enum types in `OpenAiClassifyInput`.
+pub mod open_ai_classify_input {
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Value {
+        #[prost(string, tag = "1")]
+        Text(::prost::alloc::string::String),
+        #[prost(message, tag = "2")]
+        Texts(super::StringList),
+        #[prost(message, tag = "3")]
+        Ids(super::TokenIds),
+    }
+}
+/// `POST /v1/classify`.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OpenAiClassifyRequest {
+    #[prost(string, optional, tag = "1")]
+    pub model: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "2")]
+    pub input: ::core::option::Option<OpenAiClassifyInput>,
+    #[prost(string, optional, tag = "3")]
+    pub user: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "4")]
+    pub rid: ::core::option::Option<StringOrList>,
+    #[prost(int64, optional, tag = "5")]
+    pub priority: ::core::option::Option<i64>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenAiClassifyData {
+    #[prost(int64, tag = "1")]
+    pub index: i64,
+    #[prost(string, tag = "2")]
+    pub label: ::prost::alloc::string::String,
+    #[prost(double, repeated, tag = "3")]
+    pub probs: ::prost::alloc::vec::Vec<f64>,
+    #[prost(int64, tag = "4")]
+    pub num_classes: i64,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenAiClassifyResponse {
+    #[prost(string, tag = "1")]
+    pub id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub object: ::prost::alloc::string::String,
+    #[prost(int64, tag = "3")]
+    pub created: i64,
+    #[prost(string, tag = "4")]
+    pub model: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "5")]
+    pub data: ::prost::alloc::vec::Vec<OpenAiClassifyData>,
+    #[prost(message, optional, tag = "6")]
+    pub usage: ::core::option::Option<OpenAiUsage>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OpenAiScoreQuery {
+    #[prost(oneof = "open_ai_score_query::Value", tags = "1, 2")]
+    pub value: ::core::option::Option<open_ai_score_query::Value>,
+}
+/// Nested message and enum types in `OpenAiScoreQuery`.
+pub mod open_ai_score_query {
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Value {
+        #[prost(string, tag = "1")]
+        Text(::prost::alloc::string::String),
+        #[prost(message, tag = "2")]
+        Ids(super::TokenIds),
+    }
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenAiScoreItems {
+    #[prost(oneof = "open_ai_score_items::Value", tags = "1, 2, 3")]
+    pub value: ::core::option::Option<open_ai_score_items::Value>,
+}
+/// Nested message and enum types in `OpenAiScoreItems`.
+pub mod open_ai_score_items {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Value {
+        #[prost(string, tag = "1")]
+        Text(::prost::alloc::string::String),
+        #[prost(message, tag = "2")]
+        Texts(super::StringList),
+        #[prost(message, tag = "3")]
+        IdsList(super::TokenIdsList),
+    }
+}
+/// `POST /v1/score`.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenAiScoreRequest {
+    #[prost(message, optional, tag = "1")]
+    pub query: ::core::option::Option<OpenAiScoreQuery>,
+    #[prost(message, optional, tag = "2")]
+    pub items: ::core::option::Option<OpenAiScoreItems>,
+    #[prost(int64, optional, tag = "3")]
+    pub embed_override_token_id: ::core::option::Option<i64>,
+    /// `[num_query_embed_overrides][hidden]`.
+    #[prost(message, repeated, tag = "4")]
+    pub query_embed_overrides: ::prost::alloc::vec::Vec<DoubleList>,
+    /// One `[num_item_embed_overrides][hidden]` matrix per item, or null.
+    #[prost(string, repeated, tag = "5")]
+    pub item_embed_overrides: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Shared candidates, or one candidate list per item.
+    #[prost(message, optional, tag = "6")]
+    pub label_token_ids: ::core::option::Option<TokenIdsOrList>,
+    #[prost(bool, tag = "7")]
+    pub apply_softmax: bool,
+    #[prost(double, optional, tag = "8")]
+    pub temperature: ::core::option::Option<f64>,
+    #[prost(bool, tag = "9")]
+    pub return_token_logprobs: bool,
+    #[prost(bool, tag = "10")]
+    pub item_first: bool,
+    #[prost(bool, tag = "11")]
+    pub return_pooled_hidden_states: bool,
+    /// Setwise readout: score at every occurrence of this token instead of the
+    /// last position; `scores` is then nested per item.
+    #[prost(string, optional, tag = "12")]
+    pub score_extraction_token: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "13")]
+    pub model: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// `[num_rows][num_labels]`.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenAiScoreMatrix {
+    #[prost(message, repeated, tag = "1")]
+    pub rows: ::prost::alloc::vec::Vec<DoubleList>,
+}
+/// One matrix per item (setwise).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenAiScoreMatrixList {
+    #[prost(message, repeated, tag = "1")]
+    pub items: ::prost::alloc::vec::Vec<OpenAiScoreMatrix>,
+}
+/// `scores`: pointwise `[rows][labels]` or setwise `[items][rows][labels]`;
+/// the nesting depth tells them apart.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenAiScores {
+    #[prost(oneof = "open_ai_scores::Value", tags = "1, 2")]
+    pub value: ::core::option::Option<open_ai_scores::Value>,
+}
+/// Nested message and enum types in `OpenAiScores`.
+pub mod open_ai_scores {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Value {
+        #[prost(message, tag = "1")]
+        Pointwise(super::OpenAiScoreMatrix),
+        #[prost(message, tag = "2")]
+        Setwise(super::OpenAiScoreMatrixList),
+    }
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenAiScoreResponse {
+    #[prost(message, optional, tag = "1")]
+    pub scores: ::core::option::Option<OpenAiScores>,
+    /// Parallel to `scores`, rows nullable: `[rows][hidden]` or
+    /// `[items][rows][hidden]`.
+    #[prost(string, optional, tag = "2")]
+    pub pooled_hidden_states: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, repeated, tag = "3")]
+    pub token_logprobs: ::prost::alloc::vec::Vec<DoubleList>,
+    #[prost(string, tag = "4")]
+    pub model: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "5")]
+    pub usage: ::core::option::Option<OpenAiUsage>,
+    #[prost(string, tag = "6")]
+    pub object: ::prost::alloc::string::String,
+}
+/// `POST /v1/rerank` (`V1RerankReqInput`): text or multimodal parts.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenAiRerankRequest {
+    #[prost(message, optional, tag = "1")]
+    pub query: ::core::option::Option<OpenAiChatContent>,
+    #[prost(message, repeated, tag = "2")]
+    pub documents: ::prost::alloc::vec::Vec<OpenAiChatContent>,
+    #[prost(string, optional, tag = "3")]
+    pub instruct: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(int64, optional, tag = "4")]
+    pub top_n: ::core::option::Option<i64>,
+    #[prost(bool, optional, tag = "5")]
+    pub return_documents: ::core::option::Option<bool>,
+}
+/// One ranked document; the route answers a list of these.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenAiRerankResult {
+    #[prost(double, tag = "1")]
+    pub score: f64,
+    #[prost(string, optional, tag = "2")]
+    pub document: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(int64, tag = "3")]
+    pub index: i64,
+    #[prost(string, optional, tag = "4")]
+    pub meta_info: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenAiRerankResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub items: ::prost::alloc::vec::Vec<OpenAiRerankResult>,
+}
+/// `POST /v1/tokenize`: exactly one of `prompt` or `messages`; the chat form
+/// renders the template with the tool and reasoning settings.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenAiTokenizeRequest {
+    #[prost(string, optional, tag = "1")]
+    pub model: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "2")]
+    pub prompt: ::core::option::Option<StringOrList>,
+    #[prost(message, repeated, tag = "3")]
+    pub messages: ::prost::alloc::vec::Vec<OpenAiChatMessage>,
+    #[prost(message, repeated, tag = "4")]
+    pub tools: ::prost::alloc::vec::Vec<OpenAiTool>,
+    #[prost(message, optional, tag = "5")]
+    pub tool_choice: ::core::option::Option<OpenAiToolChoice>,
+    #[prost(message, optional, tag = "6")]
+    pub reasoning_effort: ::core::option::Option<OpenAiReasoningEffort>,
+    #[prost(bool, tag = "7")]
+    pub continue_final_message: bool,
+    #[prost(string, optional, tag = "8")]
+    pub chat_template_kwargs: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(bool, optional, tag = "9")]
+    pub add_special_tokens: ::core::option::Option<bool>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenAiTokenizeResponse {
+    #[prost(message, optional, tag = "1")]
+    pub tokens: ::core::option::Option<TokenIdsOrList>,
+    #[prost(message, optional, tag = "2")]
+    pub count: ::core::option::Option<Int64OrList>,
+    #[prost(int64, tag = "3")]
+    pub max_model_len: i64,
+}
+/// `POST /v1/detokenize`.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenAiDetokenizeRequest {
+    #[prost(string, optional, tag = "1")]
+    pub model: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "2")]
+    pub tokens: ::core::option::Option<TokenIdsOrList>,
+    #[prost(bool, optional, tag = "3")]
+    pub skip_special_tokens: ::core::option::Option<bool>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OpenAiDetokenizeResponse {
+    #[prost(message, optional, tag = "1")]
+    pub text: ::core::option::Option<StringOrList>,
+}
+/// `reasoning`: `effort` is a tier (see OpenAiReasoningEffort), `summary` is
+/// "auto" | "concise" | "detailed".
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OpenAiResponseReasoning {
+    #[prost(string, optional, tag = "1")]
+    pub effort: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "2")]
+    pub summary: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// `ResponseTool`: `type` is one of function, web_search, web_search_preview,
+/// code_interpreter, file_search, image_generation, computer_use_preview,
+/// local_shell, mcp, custom, namespace, tool_search; a function tool needs a
+/// `name`.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OpenAiResponseTool {
+    #[prost(string, tag = "1")]
+    pub r#type: ::prost::alloc::string::String,
+    #[prost(string, optional, tag = "2")]
+    pub name: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "3")]
+    pub description: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "4")]
+    pub parameters: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(bool, tag = "5")]
+    pub strict: bool,
+    /// Inner schemas of a `namespace` tool.
+    #[prost(string, repeated, tag = "6")]
+    pub tools: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(bool, optional, tag = "7")]
+    pub defer_loading: ::core::option::Option<bool>,
+    /// A `custom` tool's input format: `{"type": "text"}` or a grammar.
+    #[prost(string, optional, tag = "8")]
+    pub format: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// `POST /v1/responses`.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenAiResponsesRequest {
+    #[prost(bool, optional, tag = "1")]
+    pub background: ::core::option::Option<bool>,
+    /// "code_interpreter_call.outputs" | "computer_call_output.output.image_url"
+    /// \| "file_search_call.results" | "message.input_image.image_url" |
+    /// "message.output_text.logprobs" | "reasoning.encrypted_content".
+    #[prost(string, repeated, tag = "2")]
+    pub include: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// A string, or the SDK input item list.
+    #[prost(string, optional, tag = "3")]
+    pub input: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "4")]
+    pub instructions: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(int64, optional, tag = "5")]
+    pub max_output_tokens: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "6")]
+    pub max_tool_calls: ::core::option::Option<i64>,
+    #[prost(string, optional, tag = "7")]
+    pub metadata: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "8")]
+    pub model: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(bool, optional, tag = "9")]
+    pub parallel_tool_calls: ::core::option::Option<bool>,
+    #[prost(string, optional, tag = "10")]
+    pub previous_response_id: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "11")]
+    pub reasoning: ::core::option::Option<OpenAiResponseReasoning>,
+    /// "auto" | "default" | "flex" | "scale" | "priority".
+    #[prost(string, optional, tag = "12")]
+    pub service_tier: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(bool, optional, tag = "13")]
+    pub store: ::core::option::Option<bool>,
+    #[prost(bool, optional, tag = "14")]
+    pub stream: ::core::option::Option<bool>,
+    #[prost(double, optional, tag = "15")]
+    pub temperature: ::core::option::Option<f64>,
+    /// The SDK `ResponseTextConfig` (`{"format": {...}}`).
+    #[prost(string, optional, tag = "16")]
+    pub text: ::core::option::Option<::prost::alloc::string::String>,
+    /// "auto" | "required" | "none", or a tool object.
+    #[prost(string, optional, tag = "17")]
+    pub tool_choice: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, repeated, tag = "18")]
+    pub tools: ::prost::alloc::vec::Vec<OpenAiResponseTool>,
+    #[prost(int64, optional, tag = "19")]
+    pub top_logprobs: ::core::option::Option<i64>,
+    #[prost(double, optional, tag = "20")]
+    pub top_p: ::core::option::Option<f64>,
+    /// "auto" | "disabled".
+    #[prost(string, optional, tag = "21")]
+    pub truncation: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "22")]
+    pub user: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "23")]
+    pub chat_template_kwargs: ::core::option::Option<::prost::alloc::string::String>,
+    /// Minted as `resp_<uuid>` when absent.
+    #[prost(string, optional, tag = "24")]
+    pub request_id: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "25")]
+    pub session_id: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(int64, tag = "26")]
+    pub priority: i64,
+    #[prost(string, optional, tag = "27")]
+    pub extra_key: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "28")]
+    pub cache_salt: ::core::option::Option<::prost::alloc::string::String>,
+    /// Deprecated alias of `routed_dp_rank`.
+    #[prost(int64, optional, tag = "29")]
+    pub data_parallel_rank: ::core::option::Option<i64>,
+    #[prost(double, tag = "30")]
+    pub frequency_penalty: f64,
+    #[prost(double, tag = "31")]
+    pub presence_penalty: f64,
+    #[prost(message, optional, tag = "32")]
+    pub stop: ::core::option::Option<StringOrList>,
+    #[prost(int64, optional, tag = "33")]
+    pub top_k: ::core::option::Option<i64>,
+    #[prost(double, optional, tag = "34")]
+    pub min_p: ::core::option::Option<f64>,
+    #[prost(double, optional, tag = "35")]
+    pub repetition_penalty: ::core::option::Option<f64>,
+    #[prost(message, optional, tag = "36")]
+    pub bootstrap_host: ::core::option::Option<StringOrList>,
+    #[prost(message, optional, tag = "37")]
+    pub bootstrap_port: ::core::option::Option<OptionalInt64OrList>,
+    #[prost(message, optional, tag = "38")]
+    pub bootstrap_room: ::core::option::Option<Int64OrList>,
+    #[prost(int64, optional, tag = "39")]
+    pub routed_dp_rank: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "40")]
+    pub disagg_prefill_dp_rank: ::core::option::Option<i64>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OpenAiResponsesInputTokensDetails {
+    #[prost(int64, tag = "1")]
+    pub cached_tokens: i64,
+    #[prost(int64, tag = "2")]
+    pub cache_write_tokens: i64,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OpenAiResponsesOutputTokensDetails {
+    #[prost(int64, tag = "1")]
+    pub reasoning_tokens: i64,
+}
+/// The Responses usage shape (not the chat `UsageInfo`).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OpenAiResponsesUsage {
+    #[prost(int64, tag = "1")]
+    pub input_tokens: i64,
+    #[prost(message, optional, tag = "2")]
+    pub input_tokens_details: ::core::option::Option<OpenAiResponsesInputTokensDetails>,
+    #[prost(int64, tag = "3")]
+    pub output_tokens: i64,
+    #[prost(message, optional, tag = "4")]
+    pub output_tokens_details: ::core::option::Option<OpenAiResponsesOutputTokensDetails>,
+    #[prost(int64, tag = "5")]
+    pub total_tokens: i64,
+}
+/// `status` is "queued" | "in_progress" | "completed" | "incomplete" |
+/// "failed" | "cancelled". `output` items are SDK output items.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenAiResponsesResponse {
+    #[prost(string, tag = "1")]
+    pub id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub object: ::prost::alloc::string::String,
+    #[prost(int64, tag = "3")]
+    pub created_at: i64,
+    #[prost(string, tag = "4")]
+    pub model: ::prost::alloc::string::String,
+    #[prost(string, repeated, tag = "5")]
+    pub output: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(string, tag = "6")]
+    pub status: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "7")]
+    pub usage: ::core::option::Option<OpenAiResponsesUsage>,
+    #[prost(bool, tag = "8")]
+    pub parallel_tool_calls: bool,
+    #[prost(string, optional, tag = "9")]
+    pub tool_choice: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, repeated, tag = "10")]
+    pub tools: ::prost::alloc::vec::Vec<OpenAiResponseTool>,
+    #[prost(string, optional, tag = "11")]
+    pub error: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "12")]
+    pub incomplete_details: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "13")]
+    pub instructions: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(int64, optional, tag = "14")]
+    pub max_output_tokens: ::core::option::Option<i64>,
+    #[prost(string, optional, tag = "15")]
+    pub previous_response_id: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "16")]
+    pub reasoning: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(bool, optional, tag = "17")]
+    pub store: ::core::option::Option<bool>,
+    #[prost(double, optional, tag = "18")]
+    pub temperature: ::core::option::Option<f64>,
+    #[prost(string, optional, tag = "19")]
+    pub text: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(double, optional, tag = "20")]
+    pub top_p: ::core::option::Option<f64>,
+    #[prost(string, optional, tag = "21")]
+    pub truncation: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "22")]
+    pub user: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "23")]
+    pub metadata: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// `GET /v1/models` and `GET /v1/models/{model}`.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OpenAiModelCard {
+    #[prost(string, tag = "1")]
+    pub id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub object: ::prost::alloc::string::String,
+    #[prost(int64, tag = "3")]
+    pub created: i64,
+    #[prost(string, tag = "4")]
+    pub owned_by: ::prost::alloc::string::String,
+    #[prost(string, optional, tag = "5")]
+    pub root: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "6")]
+    pub parent: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(int64, optional, tag = "7")]
+    pub max_model_len: ::core::option::Option<i64>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenAiModelList {
+    #[prost(string, tag = "1")]
+    pub object: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "2")]
+    pub data: ::prost::alloc::vec::Vec<OpenAiModelCard>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OpenAiListModelsRequest {}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OpenAiRetrieveModelRequest {
+    #[prost(string, tag = "1")]
+    pub model: ::prost::alloc::string::String,
 }
 /// `/parse_function_call`.
 #[derive(Clone, PartialEq, ::prost::Message)]

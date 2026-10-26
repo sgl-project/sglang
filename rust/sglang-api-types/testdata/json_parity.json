@@ -677,6 +677,948 @@
       "name": "abort_all_requests defaults on",
       "input": {"new_version": "v2"},
       "canonical": "{\"new_version\":\"v2\",\"abort_all_requests\":true}"
+    },
+    {
+      "type": "OllamaChatRequest",
+      "name": "stream defaults to true and the ignored open fields pass through as raw JSON",
+      "input": {
+        "model": "m",
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi",
+            "images": [
+              "aGk="
+            ]
+          }
+        ],
+        "format": {
+          "type": "object"
+        },
+        "options": {
+          "temperature": 0.5,
+          "num_predict": 7,
+          "stop": [
+            "x"
+          ],
+          "num_ctx": 4096
+        },
+        "keep_alive": "5m",
+        "think": "low"
+      },
+      "canonical": "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\",\"images\":[\"aGk=\"]}],\"stream\":true,\"format\":{\"type\":\"object\"},\"options\":{\"temperature\":0.5,\"num_predict\":7,\"stop\":[\"x\"]},\"keep_alive\":\"5m\",\"think\":\"low\"}"
+    },
+    {
+      "type": "OllamaChatRequest",
+      "name": "an explicit null stream resets to the default",
+      "input": {
+        "model": "m",
+        "messages": [],
+        "stream": null,
+        "options": {
+          "stop": "x",
+          "seed": 3
+        }
+      },
+      "canonical": "{\"model\":\"m\",\"stream\":true,\"options\":{\"stop\":\"x\",\"seed\":3}}"
+    },
+    {
+      "type": "OllamaChatResponse",
+      "name": "a streamed delta carries no counters; a done frame carries the ones it knows",
+      "input": {
+        "model": "m",
+        "created_at": "2026-10-25T00:00:00.000Z",
+        "message": {
+          "role": "assistant",
+          "content": "ok"
+        },
+        "done": true,
+        "done_reason": "stop",
+        "total_duration": 12,
+        "prompt_eval_count": 5,
+        "eval_count": 1
+      },
+      "canonical": "{\"model\":\"m\",\"created_at\":\"2026-10-25T00:00:00.000Z\",\"message\":{\"role\":\"assistant\",\"content\":\"ok\"},\"done\":true,\"done_reason\":\"stop\",\"total_duration\":12,\"prompt_eval_count\":5,\"eval_count\":1}"
+    },
+    {
+      "type": "OllamaGenerateRequest",
+      "name": "raw defaults to false and the ignored fields are kept",
+      "input": {
+        "model": "m",
+        "prompt": "hi",
+        "system": "be brief",
+        "context": [
+          1,
+          2
+        ],
+        "images": [
+          "aGk="
+        ],
+        "think": true
+      },
+      "canonical": "{\"model\":\"m\",\"prompt\":\"hi\",\"system\":\"be brief\",\"context\":[1,2],\"stream\":true,\"raw\":false,\"images\":[\"aGk=\"],\"think\":true}"
+    },
+    {
+      "type": "OllamaGenerateResponse",
+      "name": "an empty-prompt done frame has no counters",
+      "input": {
+        "model": "m",
+        "created_at": "2026-10-25T00:00:00.000Z",
+        "response": "",
+        "done": true,
+        "done_reason": "stop"
+      },
+      "canonical": "{\"model\":\"m\",\"created_at\":\"2026-10-25T00:00:00.000Z\",\"response\":\"\",\"done\":true,\"done_reason\":\"stop\"}"
+    },
+    {
+      "type": "OllamaTagsResponse",
+      "name": "tags fill the three details Python fills",
+      "input": {
+        "models": [
+          {
+            "name": "m",
+            "model": "m",
+            "modified_at": "2026-10-25T00:00:00.000Z",
+            "size": 0,
+            "digest": "sha256:0",
+            "details": {
+              "format": "sglang",
+              "family": "m",
+              "parameter_size": "unknown"
+            }
+          }
+        ]
+      },
+      "canonical": "{\"models\":[{\"name\":\"m\",\"model\":\"m\",\"modified_at\":\"2026-10-25T00:00:00.000Z\",\"size\":0,\"digest\":\"sha256:0\",\"details\":{\"format\":\"sglang\",\"family\":\"m\",\"parameter_size\":\"unknown\"}}]}"
+    },
+    {
+      "type": "OllamaShowResponse",
+      "name": "model_info is an open object carried as raw JSON",
+      "input": {
+        "license": "",
+        "modelfile": "FROM m\nPARAMETER num_ctx 8\n",
+        "parameters": "num_ctx 8",
+        "template": "",
+        "modified_at": "2026-10-25T00:00:00.000Z",
+        "details": {
+          "parent_model": "",
+          "format": "sglang",
+          "family": "m",
+          "families": [
+            "m"
+          ],
+          "parameter_size": "unknown",
+          "quantization_level": ""
+        },
+        "model_info": {
+          "general.architecture": "m",
+          "m.context_length": 8
+        },
+        "capabilities": [
+          "completion"
+        ]
+      },
+      "canonical": "{\"license\":\"\",\"modelfile\":\"FROM m\\nPARAMETER num_ctx 8\\n\",\"parameters\":\"num_ctx 8\",\"template\":\"\",\"modified_at\":\"2026-10-25T00:00:00.000Z\",\"details\":{\"parent_model\":\"\",\"format\":\"sglang\",\"family\":\"m\",\"families\":[\"m\"],\"parameter_size\":\"unknown\",\"quantization_level\":\"\"},\"model_info\":{\"general.architecture\":\"m\",\"m.context_length\":8},\"capabilities\":[\"completion\"]}"
+    },
+    {
+      "type": "OllamaShowRequest",
+      "name": "the model name",
+      "input": {
+        "model": "m"
+      },
+      "canonical": "{\"model\":\"m\"}"
+    },
+    {
+      "type": "AnthropicMessagesRequest",
+      "name": "string and block content, tools, and stream default false",
+      "input": {
+        "model": "m",
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi"
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "text",
+                "text": "a"
+              },
+              {
+                "type": "tool_use",
+                "id": "t1",
+                "name": "f",
+                "input": {
+                  "x": 1
+                }
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "tool_result",
+                "tool_use_id": "t1",
+                "content": [
+                  {
+                    "type": "text",
+                    "text": "42"
+                  }
+                ],
+                "is_error": false
+              }
+            ]
+          }
+        ],
+        "max_tokens": 8,
+        "metadata": {
+          "user_id": "u"
+        },
+        "stop_sequences": [
+          "END"
+        ],
+        "system": "be brief",
+        "temperature": 0.5,
+        "thinking": {
+          "type": "enabled",
+          "budget_tokens": 1024
+        },
+        "tool_choice": {
+          "type": "tool",
+          "name": "f"
+        },
+        "tools": [
+          {
+            "name": "f",
+            "description": "d",
+            "input_schema": {
+              "type": "object",
+              "properties": {}
+            }
+          },
+          {
+            "type": "web_search_20250305",
+            "name": "web_search",
+            "max_uses": 3
+          }
+        ],
+        "top_k": 5,
+        "top_p": 0.9,
+        "output_config": {
+          "effort": "high",
+          "task_budget": {
+            "type": "tokens",
+            "total": 100
+          }
+        },
+        "betas": [
+          "b"
+        ]
+      },
+      "canonical": "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"},{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"a\"},{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"f\",\"input\":{\"x\":1}}]},{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"t1\",\"content\":[{\"type\":\"text\",\"text\":\"42\"}],\"is_error\":false}]}],\"max_tokens\":8,\"metadata\":{\"user_id\":\"u\"},\"stop_sequences\":[\"END\"],\"stream\":false,\"system\":\"be brief\",\"temperature\":0.5,\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":1024},\"tool_choice\":{\"type\":\"tool\",\"name\":\"f\"},\"tools\":[{\"name\":\"f\",\"description\":\"d\",\"input_schema\":{\"type\":\"object\",\"properties\":{}}},{\"type\":\"web_search_20250305\",\"name\":\"web_search\",\"max_uses\":3}],\"top_k\":5,\"top_p\":0.9,\"output_config\":{\"effort\":\"high\",\"task_budget\":{\"type\":\"tokens\",\"total\":100}},\"betas\":[\"b\"]}"
+    },
+    {
+      "type": "AnthropicMessagesRequest",
+      "name": "image, search_result, thinking, and redacted_thinking blocks; system as blocks",
+      "input": {
+        "model": "m",
+        "max_tokens": 1,
+        "system": [
+          {
+            "type": "text",
+            "text": "s"
+          }
+        ],
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "image",
+                "source": {
+                  "type": "base64",
+                  "media_type": "image/png",
+                  "data": "AA=="
+                }
+              },
+              {
+                "type": "image",
+                "source": "ref"
+              },
+              {
+                "type": "search_result",
+                "source": {
+                  "url": "http://x"
+                },
+                "title": "T",
+                "content": [
+                  {
+                    "type": "text",
+                    "text": "c"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "thinking",
+                "thinking": "hmm",
+                "signature": "sig"
+              },
+              {
+                "type": "redacted_thinking",
+                "data": "d"
+              },
+              {
+                "type": "tool_reference",
+                "tool_name": "f"
+              }
+            ]
+          }
+        ],
+        "stream": null
+      },
+      "canonical": "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":\"image/png\",\"data\":\"AA==\"}},{\"type\":\"image\",\"source\":\"ref\"},{\"type\":\"search_result\",\"source\":{\"url\":\"http://x\"},\"title\":\"T\",\"content\":[{\"type\":\"text\",\"text\":\"c\"}]}]},{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"hmm\",\"signature\":\"sig\"},{\"type\":\"redacted_thinking\",\"data\":\"d\"},{\"type\":\"tool_reference\",\"tool_name\":\"f\"}]}],\"max_tokens\":1,\"stream\":false,\"system\":[{\"type\":\"text\",\"text\":\"s\"}]}"
+    },
+    {
+      "type": "AnthropicMessagesResponse",
+      "name": "the unary reply: blocks, stop reason, usage; absent stop_sequence omitted",
+      "input": {
+        "id": "msg_1",
+        "type": "message",
+        "role": "assistant",
+        "content": [
+          {
+            "type": "thinking",
+            "thinking": "t"
+          },
+          {
+            "type": "text",
+            "text": "ok"
+          },
+          {
+            "type": "tool_use",
+            "id": "toolu_1",
+            "name": "f",
+            "input": {}
+          }
+        ],
+        "model": "m",
+        "stop_reason": "tool_use",
+        "usage": {
+          "input_tokens": 5,
+          "output_tokens": 3,
+          "cache_read_input_tokens": 2
+        }
+      },
+      "canonical": "{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"t\"},{\"type\":\"text\",\"text\":\"ok\"},{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"f\",\"input\":{}}],\"model\":\"m\",\"stop_reason\":\"tool_use\",\"usage\":{\"input_tokens\":5,\"output_tokens\":3,\"cache_read_input_tokens\":2}}"
+    },
+    {
+      "type": "AnthropicStreamEvent",
+      "name": "message_start keeps an empty content list",
+      "input": {
+        "type": "message_start",
+        "message": {
+          "id": "msg_1",
+          "type": "message",
+          "role": "assistant",
+          "content": [],
+          "model": "m",
+          "usage": {
+            "input_tokens": 5,
+            "output_tokens": 0
+          }
+        }
+      },
+      "canonical": "{\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"m\",\"usage\":{\"input_tokens\":5,\"output_tokens\":0}}}"
+    },
+    {
+      "type": "AnthropicStreamEvent",
+      "name": "content_block_delta with a text delta at index 0",
+      "input": {
+        "type": "content_block_delta",
+        "index": 0,
+        "delta": {
+          "type": "text_delta",
+          "text": "hi"
+        }
+      },
+      "canonical": "{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}"
+    },
+    {
+      "type": "AnthropicStreamEvent",
+      "name": "content_block_start with a tool_use block",
+      "input": {
+        "type": "content_block_start",
+        "index": 1,
+        "content_block": {
+          "type": "tool_use",
+          "id": "toolu_1",
+          "name": "f",
+          "input": {}
+        }
+      },
+      "canonical": "{\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"f\",\"input\":{}}}"
+    },
+    {
+      "type": "AnthropicStreamEvent",
+      "name": "message_delta carries the stop reason and usage; message_stop is bare",
+      "input": {
+        "type": "message_delta",
+        "delta": {
+          "stop_reason": "end_turn"
+        },
+        "usage": {
+          "output_tokens": 3
+        }
+      },
+      "canonical": "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}"
+    },
+    {
+      "type": "AnthropicStreamEvent",
+      "name": "message_stop",
+      "input": {
+        "type": "message_stop"
+      },
+      "canonical": "{\"type\":\"message_stop\"}"
+    },
+    {
+      "type": "AnthropicStreamEvent",
+      "name": "error event",
+      "input": {
+        "type": "error",
+        "error": {
+          "type": "api_error",
+          "message": "boom"
+        }
+      },
+      "canonical": "{\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"boom\"}}"
+    },
+    {
+      "type": "AnthropicErrorResponse",
+      "name": "the HTTP envelope",
+      "input": {
+        "type": "error",
+        "error": {
+          "type": "invalid_request_error",
+          "message": "max_tokens must be positive"
+        }
+      },
+      "canonical": "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"max_tokens must be positive\"}}"
+    },
+    {
+      "type": "AnthropicCountTokensRequest",
+      "name": "count_tokens accepts the messages fields it shares",
+      "input": {
+        "model": "m",
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi"
+          }
+        ],
+        "tools": [
+          {
+            "name": "f",
+            "input_schema": {
+              "type": "object"
+            }
+          }
+        ],
+        "betas": []
+      },
+      "canonical": "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"tools\":[{\"name\":\"f\",\"input_schema\":{\"type\":\"object\"}}]}"
+    },
+    {
+      "type": "AnthropicCountTokensResponse",
+      "name": "input_tokens",
+      "input": {
+        "input_tokens": 12
+      },
+      "canonical": "{\"input_tokens\":12}"
+    },
+    {
+      "type": "OpenAiCompletionRequest",
+      "name": "defaults bake in and the prompt may be text, texts, ids, or id lists",
+      "input": {
+        "prompt": "hi",
+        "logit_bias": {
+          "42": 1.5
+        },
+        "stop": [
+          "a"
+        ],
+        "lora_path": [
+          null,
+          "x"
+        ]
+      },
+      "canonical": "{\"model\":\"default\",\"prompt\":\"hi\",\"echo\":false,\"frequency_penalty\":0.0,\"logit_bias\":{\"42\":1.5},\"max_tokens\":16,\"n\":1,\"presence_penalty\":0.0,\"stop\":[\"a\"],\"stream\":false,\"temperature\":1.0,\"top_p\":1.0,\"return_routed_experts\":false,\"routed_experts_start_len\":0,\"return_cached_tokens_details\":false,\"return_spec_tokens_details\":false,\"return_token_ids\":false,\"top_k\":-1,\"min_p\":0.0,\"min_tokens\":0,\"repetition_penalty\":1.0,\"no_stop_trim\":false,\"ignore_eos\":false,\"skip_special_tokens\":true,\"lora_path\":[null,\"x\"]}"
+    },
+    {
+      "type": "OpenAiCompletionRequest",
+      "name": "an id-list prompt and the structural-tag response format",
+      "input": {
+        "model": "m",
+        "prompt": [
+          [
+            1,
+            2
+          ],
+          [
+            3
+          ]
+        ],
+        "response_format": {
+          "type": "structural_tag",
+          "structures": [
+            {
+              "begin": "<f>",
+              "schema": {
+                "type": "object"
+              },
+              "end": "</f>"
+            }
+          ],
+          "triggers": [
+            "<f>"
+          ]
+        },
+        "return_hidden_states": "last"
+      },
+      "canonical": "{\"model\":\"m\",\"prompt\":[[1,2],[3]],\"echo\":false,\"frequency_penalty\":0.0,\"max_tokens\":16,\"n\":1,\"presence_penalty\":0.0,\"stream\":false,\"temperature\":1.0,\"top_p\":1.0,\"return_hidden_states\":\"last\",\"return_routed_experts\":false,\"routed_experts_start_len\":0,\"return_cached_tokens_details\":false,\"return_spec_tokens_details\":false,\"return_token_ids\":false,\"top_k\":-1,\"min_p\":0.0,\"min_tokens\":0,\"repetition_penalty\":1.0,\"no_stop_trim\":false,\"ignore_eos\":false,\"skip_special_tokens\":true,\"response_format\":{\"type\":\"structural_tag\",\"structures\":[{\"begin\":\"<f>\",\"schema\":{\"type\":\"object\"},\"end\":\"</f>\"}],\"triggers\":[\"<f>\"]}}"
+    },
+    {
+      "type": "OpenAiCompletionResponse",
+      "name": "a choice with its null columns and the usage block",
+      "input": {
+        "id": "cmpl-1",
+        "object": "text_completion",
+        "created": 1,
+        "model": "m",
+        "choices": [
+          {
+            "index": 0,
+            "text": "ok",
+            "logprobs": null,
+            "finish_reason": "stop",
+            "matched_stop": 2
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 3,
+          "total_tokens": 4,
+          "completion_tokens": 1,
+          "prompt_tokens_details": {
+            "cached_tokens": 2
+          }
+        },
+        "metadata": null
+      },
+      "canonical": "{\"id\":\"cmpl-1\",\"object\":\"text_completion\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"text\":\"ok\",\"logprobs\":null,\"finish_reason\":\"stop\",\"matched_stop\":2}],\"usage\":{\"prompt_tokens\":3,\"total_tokens\":4,\"completion_tokens\":1,\"prompt_tokens_details\":{\"cached_tokens\":2},\"reasoning_tokens\":0,\"completion_tokens_details\":null},\"metadata\":null}"
+    },
+    {
+      "type": "OpenAiChatCompletionRequest",
+      "name": "messages with string and part content, tools, a named tool choice, and a float reasoning effort",
+      "input": {
+        "messages": [
+          {
+            "role": "system",
+            "content": "s"
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "hi"
+              },
+              {
+                "type": "image_url",
+                "image_url": {
+                  "url": "data:x"
+                }
+              }
+            ]
+          },
+          {
+            "role": "assistant",
+            "tool_calls": [
+              {
+                "id": "c1",
+                "type": "function",
+                "function": {
+                  "name": "f",
+                  "arguments": "{\"x\":1}"
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "c1",
+            "content": "42"
+          }
+        ],
+        "model": "m",
+        "max_completion_tokens": 8,
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "f",
+              "parameters": {
+                "type": "object"
+              }
+            }
+          }
+        ],
+        "tool_choice": {
+          "type": "function",
+          "function": {
+            "name": "f"
+          }
+        },
+        "reasoning_effort": 0.5,
+        "chat_template_kwargs": {
+          "enable_thinking": true
+        },
+        "stream_options": {
+          "include_usage": true
+        }
+      },
+      "canonical": "{\"messages\":[{\"role\":\"system\",\"content\":\"s\"},{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"hi\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:x\",\"detail\":\"auto\"},\"modalities\":\"image\"}]},{\"role\":\"assistant\",\"tool_calls\":[{\"id\":\"c1\",\"index\":null,\"type\":\"function\",\"function\":{\"name\":\"f\",\"arguments\":\"{\\\"x\\\":1}\"}}]},{\"role\":\"tool\",\"content\":\"42\",\"tool_call_id\":\"c1\"}],\"model\":\"m\",\"frequency_penalty\":0.0,\"logprobs\":false,\"max_completion_tokens\":8,\"n\":1,\"presence_penalty\":0.0,\"stream\":false,\"stream_options\":{\"include_usage\":true,\"continuous_usage_stats\":false},\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"f\",\"parameters\":{\"type\":\"object\"}}}],\"tool_choice\":{\"function\":{\"name\":\"f\"},\"type\":\"function\"},\"parallel_tool_calls\":true,\"return_routed_experts\":false,\"routed_experts_start_len\":0,\"return_cached_tokens_details\":false,\"return_spec_tokens_details\":false,\"return_prompt_token_ids\":false,\"return_token_ids\":false,\"return_meta_info\":false,\"return_input_ids_in_sglext\":false,\"return_output_ids_in_sglext\":false,\"return_sampling_mask\":false,\"return_flat_raw_output_top_logprobs\":false,\"return_flat_raw_top_logprobs_b64\":true,\"reasoning_effort\":0.5,\"min_tokens\":0,\"no_stop_trim\":false,\"ignore_eos\":false,\"continue_final_message\":false,\"skip_special_tokens\":true,\"separate_reasoning\":true,\"stream_reasoning\":true,\"chat_template_kwargs\":{\"enable_thinking\":true},\"use_audio_in_video\":false}"
+    },
+    {
+      "type": "OpenAiChatCompletionResponse",
+      "name": "the unary reply with reasoning, a tool call, and sglext",
+      "input": {
+        "id": "chatcmpl-1",
+        "object": "chat.completion",
+        "created": 1,
+        "model": "m",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": null,
+              "reasoning_content": "r",
+              "tool_calls": [
+                {
+                  "id": "c1",
+                  "type": "function",
+                  "function": {
+                    "name": "f",
+                    "arguments": "{}"
+                  }
+                }
+              ]
+            },
+            "logprobs": null,
+            "finish_reason": "tool_calls",
+            "matched_stop": null
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 3,
+          "total_tokens": 5,
+          "completion_tokens": 2
+        },
+        "sglext": {
+          "cached_tokens_details": {
+            "device": 1,
+            "host": 0
+          }
+        }
+      },
+      "canonical": "{\"id\":\"chatcmpl-1\",\"object\":\"chat.completion\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":null,\"reasoning_content\":\"r\",\"tool_calls\":[{\"id\":\"c1\",\"index\":null,\"type\":\"function\",\"function\":{\"name\":\"f\",\"arguments\":\"{}\"}}]},\"logprobs\":null,\"finish_reason\":\"tool_calls\",\"matched_stop\":null}],\"usage\":{\"prompt_tokens\":3,\"total_tokens\":5,\"completion_tokens\":2,\"prompt_tokens_details\":null,\"reasoning_tokens\":0,\"completion_tokens_details\":null},\"metadata\":null,\"sglext\":{\"cached_tokens_details\":{\"device\":1,\"host\":0}}}"
+    },
+    {
+      "type": "OpenAiChatCompletionStreamResponse",
+      "name": "a delta frame with its null columns",
+      "input": {
+        "id": "chatcmpl-1",
+        "object": "chat.completion.chunk",
+        "created": 1,
+        "model": "m",
+        "choices": [
+          {
+            "index": 0,
+            "delta": {
+              "role": null,
+              "content": "hi",
+              "reasoning_content": null
+            },
+            "logprobs": null,
+            "finish_reason": null,
+            "matched_stop": null
+          }
+        ],
+        "usage": null
+      },
+      "canonical": "{\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"role\":null,\"content\":\"hi\",\"reasoning_content\":null},\"logprobs\":null,\"finish_reason\":null,\"matched_stop\":null}],\"usage\":null}"
+    },
+    {
+      "type": "OpenAiEmbeddingRequest",
+      "name": "multimodal items as input",
+      "input": {
+        "input": [
+          {
+            "text": "a",
+            "image": "data:x"
+          }
+        ],
+        "model": "m"
+      },
+      "canonical": "{\"input\":[{\"text\":\"a\",\"image\":\"data:x\"}],\"model\":\"m\",\"encoding_format\":\"float\"}"
+    },
+    {
+      "type": "OpenAiEmbeddingRequest",
+      "name": "token-id input",
+      "input": {
+        "input": [
+          1,
+          2,
+          3
+        ]
+      },
+      "canonical": "{\"input\":[1,2,3],\"model\":\"default\",\"encoding_format\":\"float\"}"
+    },
+    {
+      "type": "OpenAiEmbeddingResponse",
+      "name": "float vectors and a usage block",
+      "input": {
+        "data": [
+          {
+            "embedding": [
+              0.5,
+              1.0
+            ],
+            "index": 0,
+            "object": "embedding"
+          }
+        ],
+        "model": "m",
+        "object": "list",
+        "usage": {
+          "prompt_tokens": 2,
+          "total_tokens": 2,
+          "completion_tokens": 0
+        }
+      },
+      "canonical": "{\"data\":[{\"embedding\":[0.5,1.0],\"index\":0,\"object\":\"embedding\"}],\"model\":\"m\",\"object\":\"list\",\"usage\":{\"prompt_tokens\":2,\"total_tokens\":2,\"completion_tokens\":0,\"prompt_tokens_details\":null,\"reasoning_tokens\":0,\"completion_tokens_details\":null}}"
+    },
+    {
+      "type": "OpenAiScoreRequest",
+      "name": "shared label candidates and per-item embed overrides",
+      "input": {
+        "query": "q",
+        "items": [
+          "a",
+          "b"
+        ],
+        "label_token_ids": [
+          1,
+          2
+        ],
+        "item_embed_overrides": [
+          null,
+          [
+            [
+              0.5
+            ]
+          ]
+        ],
+        "apply_softmax": true
+      },
+      "canonical": "{\"query\":\"q\",\"items\":[\"a\",\"b\"],\"item_embed_overrides\":[null,[[0.5]]],\"label_token_ids\":[1,2],\"apply_softmax\":true,\"temperature\":1.0,\"return_token_logprobs\":false,\"item_first\":false,\"return_pooled_hidden_states\":false,\"model\":\"default\"}"
+    },
+    {
+      "type": "OpenAiScoreResponse",
+      "name": "pointwise scores",
+      "input": {
+        "scores": [
+          [
+            0.1,
+            0.9
+          ]
+        ],
+        "model": "m",
+        "object": "scoring"
+      },
+      "canonical": "{\"scores\":[[0.1,0.9]],\"pooled_hidden_states\":null,\"model\":\"m\",\"usage\":null,\"object\":\"scoring\"}"
+    },
+    {
+      "type": "OpenAiScoreResponse",
+      "name": "setwise scores, one matrix per item",
+      "input": {
+        "scores": [
+          [
+            [
+              0.1,
+              0.9
+            ],
+            [
+              0.2,
+              0.8
+            ]
+          ],
+          [
+            [
+              0.5,
+              0.5
+            ]
+          ]
+        ],
+        "model": "m",
+        "object": "scoring"
+      },
+      "canonical": "{\"scores\":[[[0.1,0.9],[0.2,0.8]],[[0.5,0.5]]],\"pooled_hidden_states\":null,\"model\":\"m\",\"usage\":null,\"object\":\"scoring\"}"
+    },
+    {
+      "type": "OpenAiRerankRequest",
+      "name": "text and multimodal documents",
+      "input": {
+        "query": "q",
+        "documents": [
+          "d1",
+          [
+            {
+              "type": "text",
+              "text": "d2"
+            }
+          ]
+        ],
+        "top_n": 1
+      },
+      "canonical": "{\"query\":\"q\",\"documents\":[\"d1\",[{\"type\":\"text\",\"text\":\"d2\"}]],\"top_n\":1,\"return_documents\":true}"
+    },
+    {
+      "type": "OpenAiRerankResponse",
+      "name": "a ranked list; absent documents are left out",
+      "input": [
+        {
+          "score": 0.9,
+          "document": "d1",
+          "index": 0,
+          "meta_info": null
+        },
+        {
+          "score": 0.1,
+          "index": 1,
+          "meta_info": null
+        }
+      ],
+      "canonical": "[{\"score\":0.9,\"document\":\"d1\",\"index\":0,\"meta_info\":null},{\"score\":0.1,\"index\":1,\"meta_info\":null}]"
+    },
+    {
+      "type": "OpenAiTokenizeRequest",
+      "name": "the chat form with tools",
+      "input": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi"
+          }
+        ],
+        "tools": [
+          {
+            "function": {
+              "name": "f"
+            }
+          }
+        ],
+        "tool_choice": "auto",
+        "add_special_tokens": false
+      },
+      "canonical": "{\"model\":\"default\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"f\"}}],\"tool_choice\":\"auto\",\"continue_final_message\":false,\"add_special_tokens\":false}"
+    },
+    {
+      "type": "OpenAiTokenizeResponse",
+      "name": "batched counts",
+      "input": {
+        "tokens": [
+          [
+            1,
+            2
+          ],
+          [
+            3
+          ]
+        ],
+        "count": [
+          2,
+          1
+        ],
+        "max_model_len": 4096
+      },
+      "canonical": "{\"tokens\":[[1,2],[3]],\"count\":[2,1],\"max_model_len\":4096}"
+    },
+    {
+      "type": "OpenAiResponsesRequest",
+      "name": "the envelope with SDK items carried as JSON",
+      "input": {
+        "input": [
+          {
+            "role": "user",
+            "content": "hi"
+          }
+        ],
+        "model": "m",
+        "tools": [
+          {
+            "type": "function",
+            "name": "f",
+            "parameters": {
+              "type": "object"
+            }
+          }
+        ],
+        "text": {
+          "format": {
+            "type": "text"
+          }
+        },
+        "reasoning": {
+          "effort": "high"
+        }
+      },
+      "canonical": "{\"background\":false,\"input\":[{\"role\":\"user\",\"content\":\"hi\"}],\"model\":\"m\",\"parallel_tool_calls\":true,\"reasoning\":{\"effort\":\"high\"},\"service_tier\":\"auto\",\"store\":true,\"stream\":false,\"text\":{\"format\":{\"type\":\"text\"}},\"tools\":[{\"type\":\"function\",\"name\":\"f\",\"parameters\":{\"type\":\"object\"},\"strict\":false}],\"top_logprobs\":0,\"truncation\":\"disabled\",\"priority\":0,\"frequency_penalty\":0.0,\"presence_penalty\":0.0}"
+    },
+    {
+      "type": "OpenAiModelList",
+      "name": "the OpenAI model list",
+      "input": {
+        "object": "list",
+        "data": [
+          {
+            "id": "m",
+            "object": "model",
+            "created": 1,
+            "owned_by": "sglang",
+            "root": "m",
+            "max_model_len": 4096
+          }
+        ]
+      },
+      "canonical": "{\"object\":\"list\",\"data\":[{\"id\":\"m\",\"object\":\"model\",\"created\":1,\"owned_by\":\"sglang\",\"root\":\"m\",\"parent\":null,\"max_model_len\":4096}]}"
+    },
+    {
+      "type": "OpenAiErrorResponse",
+      "name": "the OpenAI error body",
+      "input": {
+        "object": "error",
+        "message": "bad",
+        "type": "BadRequestError",
+        "code": 400
+      },
+      "canonical": "{\"object\":\"error\",\"message\":\"bad\",\"type\":\"BadRequestError\",\"param\":null,\"code\":400}"
     }
   ]
 }

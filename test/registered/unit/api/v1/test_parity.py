@@ -108,6 +108,18 @@ def load_fixtures():
         return json.load(f)["cases"]
 
 
+def codec(type_name):
+    """The (decode, encode) pair of a generated type: methods on a struct
+    class, module functions for a union alias (tagged, untagged, list)."""
+    generated = getattr(api_types, type_name)
+    if hasattr(generated, "from_json_value"):
+        return generated.from_json_value, lambda value: value.to_json_value()
+    return (
+        getattr(api_types, f"decode_{type_name}"),
+        getattr(api_types, f"encode_{type_name}"),
+    )
+
+
 # Schema-only sampling inputs the Rust server lowers before the scheduler
 # (choice -> regex); Python's SamplingParams never receives them.
 SCHEMA_ONLY_SAMPLING_FIELDS = frozenset({"choice"})
@@ -122,11 +134,11 @@ class TestCrossLanguageFixtures(CustomTestCase):
         self.assertTrue(cases)
         for case in cases:
             with self.subTest(case=f"{case['type']}: {case['name']}"):
-                cls = getattr(api_types, case["type"])
-                decoded = cls.from_json_value(case["input"])
-                self.assertEqual(compact(decoded.to_json_value()), case["canonical"])
-                again = cls.from_json_value(json.loads(case["canonical"]))
-                self.assertEqual(compact(again.to_json_value()), case["canonical"])
+                decode, encode = codec(case["type"])
+                decoded = decode(case["input"])
+                self.assertEqual(compact(encode(decoded)), case["canonical"])
+                again = decode(json.loads(case["canonical"]))
+                self.assertEqual(compact(encode(again)), case["canonical"])
 
     def test_every_fixture_type_is_a_generated_struct(self):
         """A fixture naming a type the Python module lacks would be skipped

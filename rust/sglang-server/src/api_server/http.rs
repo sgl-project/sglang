@@ -1,3 +1,4 @@
+mod anthropic;
 pub(crate) mod app;
 mod corpus;
 mod hicache;
@@ -5,7 +6,8 @@ mod info;
 mod loads;
 mod metrics;
 mod native_api;
-mod openai;
+mod ollama;
+pub(crate) mod openai;
 mod parsers;
 mod request_headers;
 mod weights;

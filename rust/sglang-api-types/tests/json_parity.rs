@@ -82,6 +82,65 @@ fn fixtures_decode_to_their_canonical_bytes() {
             "SendWeightsToRemoteInstanceRequest" => {
                 check::<api::SendWeightsToRemoteInstanceRequest>(&name, input, canonical)
             }
+            "AnthropicMessagesRequest" => {
+                check::<api::AnthropicMessagesRequest>(&name, input, canonical)
+            }
+            "AnthropicMessagesResponse" => {
+                check::<api::AnthropicMessagesResponse>(&name, input, canonical)
+            }
+            "AnthropicStreamEvent" => check::<api::AnthropicStreamEvent>(&name, input, canonical),
+            "AnthropicErrorResponse" => {
+                check::<api::AnthropicErrorResponse>(&name, input, canonical)
+            }
+            "AnthropicCountTokensRequest" => {
+                check::<api::AnthropicCountTokensRequest>(&name, input, canonical)
+            }
+            "AnthropicCountTokensResponse" => {
+                check::<api::AnthropicCountTokensResponse>(&name, input, canonical)
+            }
+            "OpenAiCompletionRequest" => {
+                check::<api::OpenAiCompletionRequest>(&name, input, canonical)
+            }
+            "OpenAiCompletionResponse" => {
+                check::<api::OpenAiCompletionResponse>(&name, input, canonical)
+            }
+            "OpenAiChatCompletionRequest" => {
+                check::<api::OpenAiChatCompletionRequest>(&name, input, canonical)
+            }
+            "OpenAiChatCompletionResponse" => {
+                check::<api::OpenAiChatCompletionResponse>(&name, input, canonical)
+            }
+            "OpenAiChatCompletionStreamResponse" => {
+                check::<api::OpenAiChatCompletionStreamResponse>(&name, input, canonical)
+            }
+            "OpenAiEmbeddingRequest" => {
+                check::<api::OpenAiEmbeddingRequest>(&name, input, canonical)
+            }
+            "OpenAiEmbeddingResponse" => {
+                check::<api::OpenAiEmbeddingResponse>(&name, input, canonical)
+            }
+            "OpenAiScoreRequest" => check::<api::OpenAiScoreRequest>(&name, input, canonical),
+            "OpenAiScoreResponse" => check::<api::OpenAiScoreResponse>(&name, input, canonical),
+            "OpenAiRerankRequest" => check::<api::OpenAiRerankRequest>(&name, input, canonical),
+            "OpenAiRerankResponse" => check::<api::OpenAiRerankResponse>(&name, input, canonical),
+            "OpenAiTokenizeRequest" => check::<api::OpenAiTokenizeRequest>(&name, input, canonical),
+            "OpenAiTokenizeResponse" => {
+                check::<api::OpenAiTokenizeResponse>(&name, input, canonical)
+            }
+            "OpenAiResponsesRequest" => {
+                check::<api::OpenAiResponsesRequest>(&name, input, canonical)
+            }
+            "OpenAiModelList" => check::<api::OpenAiModelList>(&name, input, canonical),
+            "OpenAiErrorResponse" => check::<api::OpenAiErrorResponse>(&name, input, canonical),
+            "OllamaChatRequest" => check::<api::OllamaChatRequest>(&name, input, canonical),
+            "OllamaChatResponse" => check::<api::OllamaChatResponse>(&name, input, canonical),
+            "OllamaGenerateRequest" => check::<api::OllamaGenerateRequest>(&name, input, canonical),
+            "OllamaGenerateResponse" => {
+                check::<api::OllamaGenerateResponse>(&name, input, canonical)
+            }
+            "OllamaTagsResponse" => check::<api::OllamaTagsResponse>(&name, input, canonical),
+            "OllamaShowRequest" => check::<api::OllamaShowRequest>(&name, input, canonical),
+            "OllamaShowResponse" => check::<api::OllamaShowResponse>(&name, input, canonical),
             "ParseFunctionCallRequest" => {
                 check::<api::ParseFunctionCallRequest>(&name, input, canonical)
             }

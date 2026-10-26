@@ -338,7 +338,7 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
         let grpc_server = grpc_listener.map(|listener| {
             let service = api_server::grpc::service::GrpcService::new(
                 core.clone(),
-                &cfg.server_args,
+                cfg.server_args.clone(),
                 hicache_manager.clone(),
             );
             (listener, service)

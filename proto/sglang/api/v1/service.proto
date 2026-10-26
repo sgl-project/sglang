@@ -8,10 +8,13 @@ syntax = "proto3";
 
 package sglang.api.v1;
 
+import "sglang/api/v1/anthropic.proto";
 import "sglang/api/v1/control.proto";
 import "sglang/api/v1/corpus.proto";
 import "sglang/api/v1/generate.proto";
 import "sglang/api/v1/hicache.proto";
+import "sglang/api/v1/ollama.proto";
+import "sglang/api/v1/openai.proto";
 import "sglang/api/v1/parsers.proto";
 import "sglang/api/v1/weights.proto";
 import "sglang/json/v1/options.proto";
@@ -103,6 +106,38 @@ service SglangService {
   rpc ContinueGeneration(ContinueGenerationRequest) returns (GenerationPauseResponse);
   rpc PdRoleSwitch(PdRoleSwitchRequest) returns (PdRoleSwitchResponse);
   rpc UpdateWeightVersion(UpdateWeightVersionRequest) returns (UpdateWeightVersionResponse);
+
+  // Ollama data plane. Chat and generate are server-streaming like Generate:
+  // a unary request is a one-frame stream, and the final frame carries the
+  // counters. Chat renders the messages with the served chat template.
+  rpc OllamaChat(OllamaChatRequest) returns (stream OllamaChatResponse);
+  rpc OllamaGenerate(OllamaGenerateRequest) returns (stream OllamaGenerateResponse);
+  rpc OllamaTags(OllamaTagsRequest) returns (OllamaTagsResponse);
+  rpc OllamaShow(OllamaShowRequest) returns (OllamaShowResponse);
+
+  // Anthropic Messages data plane. The unary and streamed replies have
+  // different wire shapes, so they are two RPCs; `stream` in the request is
+  // ignored here (the RPC decides).
+  rpc AnthropicMessages(AnthropicMessagesRequest) returns (AnthropicMessagesResponse);
+  rpc AnthropicStreamMessages(AnthropicMessagesRequest) returns (stream AnthropicStreamEvent);
+  rpc AnthropicCountTokens(AnthropicCountTokensRequest) returns (AnthropicCountTokensResponse);
+
+  // OpenAI data plane. The schema is the interface the OpenAI adapter is
+  // being refactored onto; until then these answer UNIMPLEMENTED. Streamed
+  // routes are separate RPCs whose frame is the SSE frame.
+  rpc OpenAiCompletions(OpenAiCompletionRequest) returns (OpenAiCompletionResponse);
+  rpc OpenAiStreamCompletions(OpenAiCompletionRequest) returns (stream OpenAiCompletionStreamResponse);
+  rpc OpenAiChatCompletions(OpenAiChatCompletionRequest) returns (OpenAiChatCompletionResponse);
+  rpc OpenAiStreamChatCompletions(OpenAiChatCompletionRequest) returns (stream OpenAiChatCompletionStreamResponse);
+  rpc OpenAiEmbeddings(OpenAiEmbeddingRequest) returns (OpenAiEmbeddingResponse);
+  rpc OpenAiClassify(OpenAiClassifyRequest) returns (OpenAiClassifyResponse);
+  rpc OpenAiScore(OpenAiScoreRequest) returns (OpenAiScoreResponse);
+  rpc OpenAiRerank(OpenAiRerankRequest) returns (OpenAiRerankResponse);
+  rpc OpenAiTokenize(OpenAiTokenizeRequest) returns (OpenAiTokenizeResponse);
+  rpc OpenAiDetokenize(OpenAiDetokenizeRequest) returns (OpenAiDetokenizeResponse);
+  rpc OpenAiResponses(OpenAiResponsesRequest) returns (OpenAiResponsesResponse);
+  rpc OpenAiListModels(OpenAiListModelsRequest) returns (OpenAiModelList);
+  rpc OpenAiRetrieveModel(OpenAiRetrieveModelRequest) returns (OpenAiModelCard);
 }
 
 message ListModelsRequest {}
