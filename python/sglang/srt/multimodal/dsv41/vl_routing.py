@@ -9,7 +9,6 @@ from sglang.srt.layers.moe.topk import (
     _mask_topk_ids_padded_region,
     _post_process_topk_ids,
     _zero_topk_weights_padded_region,
-    capture_routed_experts_if_allowed,
 )
 from sglang.srt.layers.moe.utils import (
     get_moe_a2a_backend,
@@ -161,10 +160,6 @@ def _finish_vision_topk(
                 topk_ids=recorder_ids
             )
     else:
-        capture_routed_experts_if_allowed(
-            config, moe.layer_id, indices, num_token_non_padded
-        )
-        get_global_expert_distribution_recorder().on_select_experts(topk_ids=indices)
         weights = _scale_fused_shared_weights(
             weights,
             config.num_fused_shared_experts,
