@@ -52,7 +52,9 @@ logger = logging.getLogger(__name__)
 # gfx942 (MI300X) it produces an accuracy regression, so gate the flag on the
 # arch -- a user who sets the env on gfx942 keeps the safe bf16 head matmul
 # (the flag stays inert) rather than silently hitting the accuracy issue.
-_DSPARK_FP8_LM_HEAD = envs.SGLANG_ROCM_OPT_DSPARK_FP8_LM_HEAD.get() and is_gfx95_supported()
+_DSPARK_FP8_LM_HEAD = (
+    envs.SGLANG_ROCM_OPT_DSPARK_FP8_LM_HEAD.get() and is_gfx95_supported()
+)
 if envs.SGLANG_ROCM_OPT_DSPARK_FP8_LM_HEAD.get() and not _DSPARK_FP8_LM_HEAD:
     logger.warning(
         "SGLANG_ROCM_OPT_DSPARK_FP8_LM_HEAD is set but the fp8 lm_head path is only "
