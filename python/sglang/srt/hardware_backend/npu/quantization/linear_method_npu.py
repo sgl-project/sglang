@@ -514,7 +514,11 @@ class NPUMXFP4W4A8LinearMethod(_NPULinearMethodBase):
         # npu_dynamic_mx_quant returns the scale as [out, in//64, 2] (3D); older
         # builds may return [out, in//32] (2D) — handle both before the transpose.
         qw, w_scale = torch.ops.npu.npu_dynamic_mx_quant(
-            weight_fp, dst_type=fp4_dtype, round_mode="round"
+            weight_fp,
+            dst_type=fp4_dtype,
+            round_mode="rint",
+            scale_alg=2,
+            dst_type_max=7.25,
         )
 
         # weight: packed FP4 -> FRACTAL_NZ (float8_e4m3fn view) -> transpose

@@ -318,7 +318,11 @@ class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
         if not weight.is_npu:
             weight = weight.to(f"npu:{torch.npu.current_device()}")
         return torch.ops.npu.npu_dynamic_mx_quant(
-            weight, dst_type=fp4_dtype, round_mode="round"
+            weight,
+            dst_type=fp4_dtype,
+            round_mode="rint",
+            scale_alg=2,
+            dst_type_max=7.25,
         )
 
     def process_weights_after_loading(
