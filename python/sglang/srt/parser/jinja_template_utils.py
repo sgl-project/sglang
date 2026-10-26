@@ -261,6 +261,7 @@ def process_content_for_template_format(
                             detail=image_obj.get("detail") or "auto",
                             max_dynamic_patch=mdp,
                             content_hash=image_obj.get("content_hash"),
+                            max_long_side_pixel=image_obj.get("max_long_side_pixel"),
                         )
                     )
 
@@ -278,7 +279,8 @@ def process_content_for_template_format(
                     }
                     if mdp is not None:
                         preprocess_kwargs["max_dynamic_patch"] = mdp
-                    if not preprocess_kwargs:
+                    max_long_side_pixel = video_obj.get("max_long_side_pixel")
+                    if not preprocess_kwargs and max_long_side_pixel is None:
                         video_data.append(chunk["video_url"]["url"])
                     else:
                         # VideoData survives load_video on every processor; a
@@ -286,7 +288,8 @@ def process_content_for_template_format(
                         video_data.append(
                             VideoData(
                                 url=video_obj["url"],
-                                preprocess_kwargs=preprocess_kwargs,
+                                preprocess_kwargs=preprocess_kwargs or None,
+                                max_long_side_pixel=max_long_side_pixel,
                             )
                         )
                     if chunk.get("modalities"):

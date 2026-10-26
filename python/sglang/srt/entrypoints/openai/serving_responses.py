@@ -1504,7 +1504,11 @@ class OpenAIServingResponses(OpenAIServingChat):
                 image_url_obj = {"url": image_url}
             if not image_url_obj.get("detail"):
                 image_url_obj["detail"] = content_part.get("detail") or "auto"
-            for key in ("min_dynamic_patch", "max_dynamic_patch"):
+            for key in (
+                "min_dynamic_patch",
+                "max_dynamic_patch",
+                "max_long_side_pixel",
+            ):
                 if key in content_part and key not in image_url_obj:
                     image_url_obj[key] = content_part[key]
             return {"type": "image_url", "image_url": image_url_obj}

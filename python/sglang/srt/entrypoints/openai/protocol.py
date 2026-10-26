@@ -606,6 +606,7 @@ class ChatCompletionMessageContentImageURL(BaseModel):
     detail: Optional[Literal["auto", "low", "high"]] = "auto"
     max_dynamic_patch: Optional[int] = None
     min_dynamic_patch: Optional[int] = None
+    max_long_side_pixel: Optional[int] = None
     content_hash: Optional[str] = None
 
     @field_validator("detail", mode="before")
@@ -629,6 +630,7 @@ class ChatCompletionMessageContentVideoURL(BaseModel):
     max_frames: Optional[int] = Field(default=None, gt=0)
     max_tokens_per_frame: Optional[int] = Field(default=None, gt=0)
     max_image_tokens: Optional[int] = Field(default=None, gt=0)
+    max_long_side_pixel: Optional[int] = None
 
 
 class ChatCompletionMessageContentAudioURL(BaseModel):
