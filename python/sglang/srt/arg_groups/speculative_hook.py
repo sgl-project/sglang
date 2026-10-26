@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from typing import TYPE_CHECKING, Optional
 
 from sglang.srt.arg_groups.choices import DRAFT_ATTENTION_BACKEND_CHOICES
@@ -618,6 +619,50 @@ def _target_checkpoint_bundles_dspark_draft(server_args: ServerArgs) -> bool:
     return checkpoint_bundles_dspark_draft(model_config_of(server_args).hf_config)
 
 
+_DSPARK_DRAFT_SUBFOLDER = "dspark"
+
+
+def _target_checkpoint_dspark_subfolder(
+    model_path: str, revision: Optional[str], cache_dir: Optional[str]
+) -> Optional[str]:
+    """Local path of a DSpark draft shipped as a `dspark/` subfolder of the
+    target checkpoint, with its own config.json and weights; None if absent.
+
+    A Hub repo id fetches only that subfolder here: the draft is loaded by
+    path, and the target loader downloads the rest into the same snapshot.
+    """
+    if os.path.isdir(model_path):
+        draft_dir = os.path.join(model_path, _DSPARK_DRAFT_SUBFOLDER)
+        if os.path.isfile(os.path.join(draft_dir, "config.json")):
+            return draft_dir
+        return None
+
+    from huggingface_hub import hf_hub_download, snapshot_download
+    from huggingface_hub.errors import (
+        EntryNotFoundError,
+        RepositoryNotFoundError,
+        RevisionNotFoundError,
+    )
+
+    try:
+        # EntryNotFoundError also covers an offline cache that lacks the file.
+        hf_hub_download(
+            model_path,
+            f"{_DSPARK_DRAFT_SUBFOLDER}/config.json",
+            revision=revision,
+            cache_dir=cache_dir,
+        )
+    except (EntryNotFoundError, RepositoryNotFoundError, RevisionNotFoundError):
+        return None
+    snapshot = snapshot_download(
+        model_path,
+        revision=revision,
+        cache_dir=cache_dir,
+        allow_patterns=[f"{_DSPARK_DRAFT_SUBFOLDER}/*"],
+    )
+    return os.path.join(snapshot, _DSPARK_DRAFT_SUBFOLDER)
+
+
 def _handle_dspark(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
     _is_npu = cfg.device.startswith("npu")
@@ -688,6 +733,20 @@ def _handle_dspark(server_args: ServerArgs) -> None:
                 "DSpark draft weights are bundled in the target checkpoint; "
                 "defaulting --speculative-draft-model-path to --model-path (%s).",
                 cfg.model_path,
+            )
+        elif draft_dir := _target_checkpoint_dspark_subfolder(
+            cfg.model_path, cfg.revision, cfg.download_dir
+        ):
+            declare_resolution(
+                server_args,
+                "_handle_dspark",
+                speculative_draft_model_path=draft_dir,
+            )
+            logger.info(
+                "DSpark draft found in the target checkpoint's %s/ subfolder; "
+                "defaulting --speculative-draft-model-path to %s.",
+                _DSPARK_DRAFT_SUBFOLDER,
+                draft_dir,
             )
         else:
             raise ValueError(
