@@ -58,6 +58,9 @@ from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     get_rotary_pos_embed,
 )
 from sglang.multimodal_gen.runtime.layers.visual_embedding import PatchEmbed
+from sglang.multimodal_gen.runtime.managers.forward_context import (
+    get_forward_context_or_none,
+)
 from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
 from sglang.multimodal_gen.runtime.models.dits.wanvideo import (
     WanT2VCrossAttention,
@@ -98,7 +101,6 @@ class CausalWanSelfAttention(nn.Module):
         self.sink_size = sink_size
         self.qk_norm = qk_norm
         self.eps = eps
-        self.parallel_attention = parallel_attention
 
         # Scaled dot product attention
         self.attn = LocalAttention(
@@ -295,8 +297,7 @@ class CausalWanTransformerBlock(nn.Module):
             self.norm_q = RMSNorm(dim, eps=eps)
             self.norm_k = RMSNorm(dim, eps=eps)
         else:
-            print("QK Norm type not supported")
-            raise Exception
+            raise ValueError(f"QK Norm type not supported: {qk_norm}")
         self.tp_rmsnorm = (
             use_megatron_tp and qk_norm == "rms_norm_across_heads" and tp_size > 1
         )
@@ -329,6 +330,42 @@ class CausalWanTransformerBlock(nn.Module):
         self.mlp_residual = MulAdd()
 
         self.scale_shift_table = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
+
+    def _cross_attn_with_cache(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        crossattn_cache: CrossAttentionKVCache | None,
+    ) -> torch.Tensor:
+        attn2 = self.attn2
+        q, _ = attn2.to_q(hidden_states)
+        if attn2.tp_rmsnorm:
+            q = tensor_parallel_rms_norm(q, attn2.norm_q)
+        else:
+            q = attn2.norm_q(q)
+        q = q.unflatten(2, (attn2.local_num_heads, attn2.head_dim))
+
+        if crossattn_cache is not None and crossattn_cache.is_init:
+            k = crossattn_cache.k
+            v = crossattn_cache.v
+        else:
+            k, _ = attn2.to_k(encoder_hidden_states)
+            if attn2.tp_rmsnorm:
+                k = tensor_parallel_rms_norm(k, attn2.norm_k)
+            else:
+                k = attn2.norm_k(k)
+            k = k.unflatten(2, (attn2.local_num_heads, attn2.head_dim))
+
+            v, _ = attn2.to_v(encoder_hidden_states)
+            v = v.unflatten(2, (attn2.local_num_heads, attn2.head_dim))
+
+            if crossattn_cache is not None:
+                crossattn_cache.store(k, v)
+
+        hidden_states = attn2.attn(q, k, v)
+        hidden_states = hidden_states.flatten(2)
+        hidden_states, _ = attn2.to_out(hidden_states)
+        return hidden_states
 
     def forward(
         self,
@@ -568,31 +605,51 @@ class CausalWanTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         post_patch_height = height // p_h
         post_patch_width = width // p_w
 
-        # Get rotary embeddings
-        d = self.hidden_size // self.num_attention_heads
-        rope_dim_list = [d - 4 * (d // 6), 2 * (d // 6), 2 * (d // 6)]
-        freqs_cos, freqs_sin = get_rotary_pos_embed(
-            (
-                post_patch_num_frames * get_sp_world_size(),
-                post_patch_height,
-                post_patch_width,
-            ),
-            self.hidden_size,
-            self.num_attention_heads,
-            rope_dim_list,
-            dtype=(
-                torch.float64
-                if current_platform.is_float64_supported()
-                else torch.float32
-            ),
-            rope_theta=10000,
-            start_frame=start_frame,  # Assume that start_frame is 0 when kv_cache is None
+        # Get rotary embeddings, uploaded once per request and chunk position
+        forward_context = get_forward_context_or_none()
+        forward_batch = (
+            None if forward_context is None else forward_context.forward_batch
         )
-        freqs_cos = freqs_cos.to(hidden_states.device)
-        freqs_sin = freqs_sin.to(hidden_states.device)
-        freqs_cis = (
-            (freqs_cos.float(), freqs_sin.float()) if freqs_cos is not None else None
+        rope_cache = (
+            None
+            if forward_batch is None
+            else forward_batch.extra.setdefault("_causal_wan_rope", {})
         )
+        rope_key = (
+            post_patch_num_frames,
+            post_patch_height,
+            post_patch_width,
+            start_frame,
+            hidden_states.device,
+        )
+        freqs_cis = None if rope_cache is None else rope_cache.get(rope_key)
+        if freqs_cis is None:
+            d = self.hidden_size // self.num_attention_heads
+            rope_dim_list = [d - 4 * (d // 6), 2 * (d // 6), 2 * (d // 6)]
+            freqs_cos, freqs_sin = get_rotary_pos_embed(
+                (
+                    post_patch_num_frames * get_sp_world_size(),
+                    post_patch_height,
+                    post_patch_width,
+                ),
+                self.hidden_size,
+                self.num_attention_heads,
+                rope_dim_list,
+                dtype=(
+                    torch.float64
+                    if current_platform.is_float64_supported()
+                    else torch.float32
+                ),
+                rope_theta=10000,
+                start_frame=start_frame,  # Assume that start_frame is 0 when kv_cache is None
+            )
+            freqs_cis = (
+                freqs_cos.to(hidden_states.device).float(),
+                freqs_sin.to(hidden_states.device).float(),
+            )
+            if rope_cache is not None:
+                rope_cache.clear()
+                rope_cache[rope_key] = freqs_cis
 
         hidden_states = self.patch_embedding(hidden_states)
         hidden_states = hidden_states.flatten(2).transpose(1, 2)
@@ -605,8 +662,11 @@ class CausalWanTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         ) = self.condition_embedder(
             timestep.flatten(), encoder_hidden_states, encoder_hidden_states_image
         )
-        timestep_proj = timestep_proj.unflatten(1, (6, self.hidden_size)).unflatten(
-            dim=0, sizes=timestep.shape
+        # each block adds the modulation to its table in fp32: cast it once here
+        timestep_proj = (
+            timestep_proj.unflatten(1, (6, self.hidden_size))
+            .unflatten(dim=0, sizes=timestep.shape)
+            .float()
         )
 
         if encoder_hidden_states_image is not None:

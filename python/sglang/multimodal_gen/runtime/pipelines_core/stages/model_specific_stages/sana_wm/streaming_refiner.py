@@ -19,7 +19,6 @@ import torch
 from torch import nn
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
-from sglang.multimodal_gen.runtime.models.dits import sana_wm_parity as parity_probe
 from sglang.multimodal_gen.runtime.models.dits.sana_wm_refiner_transformer import (
     pack_latents,
     unpack_latents,
@@ -31,6 +30,7 @@ from .refiner import (
     STAGE_2_DISTILLED_SIGMA_VALUES,
     SanaWMLTX2RefinerStage,
     _as_additive_attention_mask,
+    _forward_diffusers_video_block,
     _unwrap_diffusers_ltx2_refiner,
     log_sana_wm_tensor_stats,
     sana_wm_skip_refiner_enabled,
@@ -84,32 +84,38 @@ def collect_captured_kv_from_blocks(transformer: nn.Module, mode: str):
 # Absolute-position RoPE (port of refiner.py:721-750)
 # --------------------------------------------------------------------------- #
 def build_rotary_emb_for_absolute_positions(
-    *, transformer, batch_size, frame_positions, height, width, device, fps
+    *, transformer, batch_size, frame_positions: range, height, width, device, fps
 ):
+    # built on the device with scalar ops: a host upload would block every call
     rope = transformer.rope
     patch_size_t = int(rope.patch_size_t)
     patch_size = int(rope.patch_size)
-    f_positions = torch.tensor(frame_positions, dtype=torch.float32, device=device)
+    f_positions = torch.arange(
+        frame_positions.start,
+        frame_positions.stop,
+        frame_positions.step,
+        dtype=torch.float32,
+        device=device,
+    )
     if patch_size_t > 1:
         f_positions = f_positions[::patch_size_t]
     grid_h = torch.arange(0, height, patch_size, dtype=torch.float32, device=device)
     grid_w = torch.arange(0, width, patch_size, dtype=torch.float32, device=device)
     grid = torch.meshgrid(f_positions, grid_h, grid_w, indexing="ij")
     grid = torch.stack(grid, dim=0)
-    patch_delta = torch.tensor(
-        (patch_size_t, patch_size, patch_size), dtype=grid.dtype, device=device
+    patch_ends = torch.stack(
+        [grid[0] + patch_size_t, grid[1] + patch_size, grid[2] + patch_size]
     )
-    patch_ends = grid + patch_delta.view(3, 1, 1, 1)
     latent_coords = (
         torch.stack([grid, patch_ends], dim=-1)
         .flatten(1, 3)
         .unsqueeze(0)
         .repeat(batch_size, 1, 1, 1)
     )
-    scale = torch.tensor(rope.scale_factors, device=device)
-    broadcast_shape = [1] * latent_coords.ndim
-    broadcast_shape[1] = -1
-    pixel_coords = latent_coords * scale.view(*broadcast_shape)
+    pixel_coords = torch.stack(
+        [latent_coords[:, i] * scale for i, scale in enumerate(rope.scale_factors)],
+        dim=1,
+    )
     pixel_coords[:, 0, ...] = (
         pixel_coords[:, 0, ...] + rope.causal_offset - rope.scale_factors[0]
     ).clamp(min=0)
@@ -240,45 +246,6 @@ def streaming_self_attention(
     return attn.to_out[1](hidden_states)
 
 
-def forward_video_block(
-    *,
-    block,
-    hidden_states,
-    encoder_hidden_states,
-    temb,
-    video_rotary_emb,
-    encoder_attention_mask,
-    n_context_tokens,
-):
-    batch = hidden_states.size(0)
-    norm_hidden_states = block.norm1(hidden_states)
-    num_ada_params = block.scale_shift_table.shape[0]
-    ada_values = block.scale_shift_table[None, None].to(temb.device) + temb.reshape(
-        batch, temb.size(1), num_ada_params, -1
-    )
-    shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = ada_values.unbind(
-        dim=2
-    )
-    norm_hidden_states = norm_hidden_states * (1 + scale_msa) + shift_msa
-    attn_hidden_states = streaming_self_attention(
-        attn=block.attn1,
-        hidden_states=norm_hidden_states,
-        query_rotary_emb=video_rotary_emb,
-        n_context_tokens=n_context_tokens,
-    )
-    hidden_states = hidden_states + attn_hidden_states * gate_msa
-    norm_hidden_states = block.norm2(hidden_states)
-    attn_hidden_states = block.attn2(
-        norm_hidden_states,
-        encoder_hidden_states=encoder_hidden_states,
-        query_rotary_emb=None,
-        attention_mask=encoder_attention_mask,
-    )
-    hidden_states = hidden_states + attn_hidden_states
-    norm_hidden_states = block.norm3(hidden_states) * (1 + scale_mlp) + shift_mlp
-    return hidden_states + block.ff(norm_hidden_states) * gate_mlp
-
-
 class _RefinerCore:
     """Adapts the unwrapped diffusers refiner transformer to the
     DiffusersLTX2Refiner interface RefinerChunkRunner expects."""
@@ -289,6 +256,24 @@ class _RefinerCore:
         self.transformer = transformer
         self.device = device
         self.dtype = dtype
+        # memo of _block_rotary_emb: a block's levels and capture share positions
+        self._block_rope_key = None
+        self._block_rope = None
+
+    def _block_rotary_emb(self, *, batch_size, frame_positions, height, width, fps):
+        key = (batch_size, frame_positions, height, width, fps)
+        if key != self._block_rope_key:
+            self._block_rope = build_rotary_emb_for_absolute_positions(
+                transformer=self.transformer,
+                batch_size=batch_size,
+                frame_positions=frame_positions,
+                height=height,
+                width=width,
+                device=self.device,
+                fps=fps,
+            )
+            self._block_rope_key = key
+        return self._block_rope
 
     def _forward_video_only_with_rope(
         self,
@@ -321,8 +306,9 @@ class _RefinerCore:
             batch, -1, hidden_states.size(-1)
         )
         for block in transformer.transformer_blocks:
-            hidden_states = forward_video_block(
+            hidden_states = _forward_diffusers_video_block(
                 block=block,
+                self_attention=streaming_self_attention,
                 hidden_states=hidden_states,
                 encoder_hidden_states=encoder_hidden_states,
                 temb=temb,
@@ -359,13 +345,11 @@ class _RefinerCore:
             dtype=torch.float32,
             device=self.device,
         )
-        video_rotary_emb = build_rotary_emb_for_absolute_positions(
-            transformer=self.transformer,
+        video_rotary_emb = self._block_rotary_emb(
             batch_size=batch,
             frame_positions=active_positions,
             height=int(active.shape[3]),
             width=int(active.shape[4]),
-            device=self.device,
             fps=float(fps),
         )
         set_kv_prefix_on_blocks(self.transformer, kv_prefix_per_layer)
@@ -412,13 +396,11 @@ class _RefinerCore:
         latent_tokens = pack_latents(clean_block, ps, pst)
         batch, seq_len, _ = latent_tokens.shape
         timestep = torch.zeros(batch, seq_len, dtype=torch.float32, device=self.device)
-        video_rotary_emb = build_rotary_emb_for_absolute_positions(
-            transformer=self.transformer,
+        video_rotary_emb = self._block_rotary_emb(
             batch_size=batch,
             frame_positions=frame_positions,
             height=int(clean_block.shape[3]),
             width=int(clean_block.shape[4]),
-            device=self.device,
             fps=float(fps),
         )
         set_kv_prefix_on_blocks(self.transformer, kv_prefix_per_layer)
@@ -459,7 +441,8 @@ class RefinerChunkRunner:
         self.prompt_embeds = prompt_embeds
         self.prompt_attention_mask = prompt_attention_mask
         self.fps = float(fps)
-        self.sigmas = sigmas
+        # host copy of the schedule: per-level device reads would sync every block
+        self.sigma_values = sigmas.cpu().tolist()
         self.source_sink_frames = int(source_sink_frames)
         self.block_size = int(block_size)
         self.kv_max_frames = int(kv_max_frames)
@@ -482,32 +465,6 @@ class RefinerChunkRunner:
     def refine_block(
         self, *, block_idx, clean_block, block_start, block_end, sink_seed_frames=None
     ):
-        # parity harness (env-gated, no-op in prod): per-block input/config/output
-        # checksums; both the batch stage and the realtime stage run through here.
-        _probe_dir = parity_probe.probe_dir(
-            parity_probe.ENV_RT_DUMP, parity_probe.ENV_FORK_DUMP
-        )
-        _probe = None
-        if _probe_dir:
-            _ck = parity_probe.checksum
-            _probe = {
-                "block_idx": int(block_idx),
-                "block_start": int(block_start),
-                "block_end": int(block_end),
-                "clean_block": _ck(clean_block),
-                "sink_seed_frames": _ck(sink_seed_frames),
-                "prompt_embeds": _ck(self.prompt_embeds),
-                "prompt_attention_mask": _ck(self.prompt_attention_mask),
-                "fps": self.fps,
-                "sigmas": [float(s) for s in self.sigmas],
-                "source_sink_frames": self.source_sink_frames,
-                "block_size": self.block_size,
-                "kv_max_frames": self.kv_max_frames,
-                "history_frames": self.history_frames,
-                "generator_state": float(
-                    self.generator.get_state().double().sum().item()
-                ),
-            }
         del block_idx
         refiner = self.refiner
         if block_start < self.source_sink_frames:
@@ -520,7 +477,7 @@ class RefinerChunkRunner:
             else:
                 self.sink_kv_pre = refiner._capture_block_kv(
                     clean_block=sink_seed_frames.contiguous(),
-                    frame_positions=list(range(self.source_sink_frames)),
+                    frame_positions=range(self.source_sink_frames),
                     prompt_embeds=self.prompt_embeds,
                     prompt_attention_mask=self.prompt_attention_mask,
                     fps=self.fps,
@@ -534,8 +491,8 @@ class RefinerChunkRunner:
             sink_pe = build_rotary_emb_for_absolute_positions(
                 transformer=refiner.transformer,
                 batch_size=batch,
-                frame_positions=list(
-                    range(sink_rope_offset, sink_rope_offset + self.source_sink_frames)
+                frame_positions=range(
+                    sink_rope_offset, sink_rope_offset + self.source_sink_frames
                 ),
                 height=self.height,
                 width=self.width,
@@ -555,7 +512,7 @@ class RefinerChunkRunner:
                     "history_v": history[1] if history is not None else None,
                 }
             )
-        sigma0 = float(self.sigmas[0].item())
+        sigma0 = self.sigma_values[0]
         eps = torch.randn(
             clean_block.shape,
             generator=self.generator,
@@ -565,10 +522,10 @@ class RefinerChunkRunner:
         x_t = ((1.0 - sigma0) * clean_block.float() + sigma0 * eps.float()).to(
             self.dtype
         )
-        active_positions = list(range(int(block_start), int(block_end)))
-        for level in range(int(self.sigmas.numel()) - 1):
-            sigma_cur = float(self.sigmas[level].item())
-            sigma_next = float(self.sigmas[level + 1].item())
+        active_positions = range(int(block_start), int(block_end))
+        for level in range(len(self.sigma_values) - 1):
+            sigma_cur = self.sigma_values[level]
+            sigma_next = self.sigma_values[level + 1]
             pred_x0 = refiner._predict_x0_active_block(
                 active=x_t,
                 active_positions=active_positions,
@@ -617,11 +574,6 @@ class RefinerChunkRunner:
                         old[1][:, -keep_tokens:],
                     )
             self.history_frames = self.max_history_frames
-        if _probe is not None:
-            _probe["refined"] = parity_probe.checksum(x_t)
-            parity_probe.dump_obj(
-                _probe_dir, f"refiner_probe_{_probe['block_idx']:03d}", _probe
-            )
         return x_t
 
 
@@ -671,8 +623,6 @@ class SanaWMStreamingRefinerStage(SanaWMLTX2RefinerStage):
             )
             return batch
         n_blocks = math.ceil(n_active / self.block_size)
-        total_iterations = n_blocks * (len(STAGE_2_DISTILLED_SIGMA_VALUES) - 1)
-        batch.record_stage_iterations(total_iterations, total_iterations)
         self.log_info(
             "SANA-WM streaming refiner: latent=%s, sink=%d, block=%d, blocks=%d, kv_max=%d, seed=%d",
             tuple(latents.shape),
