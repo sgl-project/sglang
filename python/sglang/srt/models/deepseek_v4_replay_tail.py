@@ -220,7 +220,6 @@ class DecoderReplayTail:
             tail_in_graph
             or get_is_capture_mode()
             or is_unified_kv_triton()
-            or get_global_expert_distribution_recorder().recording
             or (tail is not None and tail.cp_metadata is not None)
         ):
             return False, None
@@ -241,7 +240,8 @@ class DecoderReplayTail:
         """Whether a tail graph can run a step whose largest tail, over every DP
         rank, has ``num_rows`` rows."""
         return (
-            self.runner.warm
+            not get_global_expert_distribution_recorder().recording
+            and self.runner.warm
             and self._can_capture_moe_bound(forward_batch)
             and self.runner.bucket_rows(num_rows) is not None
         )

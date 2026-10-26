@@ -303,6 +303,24 @@ class TestLateLayerRowsUnderDpAttention(CustomTestCase):
         )
 
 
+class TestTailGraphGate(CustomTestCase):
+    def test_prefill_graph_break_runs_eagerly_while_recording_experts(self):
+        fb = SimpleNamespace(input_ids=torch.arange(8))
+        for recording in (False, True):
+            with (
+                self.subTest(recording=recording),
+                get_parallel().override(attn_dp_size=1, attn_cp_size=1),
+                patch.object(
+                    replay_tail,
+                    "get_global_expert_distribution_recorder",
+                    return_value=SimpleNamespace(recording=recording),
+                ),
+            ):
+                tail_layers = _run_prefill_graph_break(fb, rows=3, dp=False)
+            self.assertEqual(tail_layers.run.called, not recording)
+            self.assertEqual(tail_layers._run_layers_eagerly.called, recording)
+
+
 def _run_prefill_graph_break(fb, *, rows, dp):
     """Runs the prefill-graph break over ``fb`` with a warm runner whose buckets fit
     any step; returns the tail layers, whose run and eager run are mocks."""
