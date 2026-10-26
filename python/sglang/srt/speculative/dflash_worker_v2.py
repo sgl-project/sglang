@@ -122,6 +122,15 @@ logger = logging.getLogger(__name__)
 _FusedKVMaterializeHelper = None
 
 
+def _inherit_draft_graph_sync_metadata(
+    forward_batch: ForwardBatch, batch: ScheduleBatch, device: torch.device
+) -> None:
+    forward_batch.can_run_decode_cuda_graph = batch.can_run_decode_cuda_graph
+    forward_batch.can_run_dp_draft_cuda_graph = batch.can_run_dp_draft_cuda_graph
+    forward_batch.is_extend_in_batch = batch.is_extend_in_batch
+    forward_batch.init_mlp_sync_metadata(batch, device, is_draft_worker=True)
+
+
 def _get_fused_kv_materialize_helper():
     global _FusedKVMaterializeHelper
     if _FusedKVMaterializeHelper is None:
@@ -2679,6 +2688,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             global_num_token_non_padded_cpu=bs * block_size,
             can_run_decode_cuda_graph=batch.can_run_decode_cuda_graph,
         )
+        _inherit_draft_graph_sync_metadata(forward_batch, batch, device)
         # The draft block writes the whole window. A compact draft reads its
         # own `req_to_token` rows over its own lengths.
         draft_translator = self.draft_model_runner.runner_ids
