@@ -249,6 +249,24 @@ def fused_qknorm_rope_out_of_place(
     if not rope_dim:
         cache_width = cos_sin_cache.size(-1)
         rope_dim = cache_width // 2 if cache_has_full_width else cache_width
+    if _is_xpu:
+        # no out-of-place SYCL kernel exists yet: copy then run the in-place
+        # kernel on the copy, which is the same arithmetic and leaves q/k untouched
+        q_out.copy_(q)
+        k_out.copy_(k)
+        fused_inplace_qknorm_rope_xpu(
+            q=q_out,
+            k=k_out,
+            q_weight=q_weight,
+            k_weight=k_weight,
+            cos_sin_cache=cos_sin_cache,
+            positions=positions,
+            is_neox=is_neox,
+            eps=eps,
+            head_dim=head_dim,
+            rope_dim=rope_dim,
+        )
+        return
     module = _jit_qknorm_rope_module(
         head_dim,
         rope_dim,
