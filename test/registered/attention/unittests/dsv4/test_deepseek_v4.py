@@ -379,12 +379,6 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         metadata.c128_topk_lengths_clamp1 = torch.tensor(
             [base + 39, base + 40], dtype=torch.int32
         )
-        metadata.trtllm_seq_lens_req = torch.tensor(
-            [base + 41, base + 42], dtype=torch.int32
-        )
-        metadata.trtllm_cum_seq_lens_q = torch.tensor(
-            [0, base + 1, base + 2], dtype=torch.int32
-        )
         metadata.c0_flashmla_metadata = object()
         metadata.c4_flashmla_metadata = object()
         metadata.c128_flashmla_metadata = object()
@@ -601,8 +595,6 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             "c4_topk_lengths_raw",
             "c4_topk_lengths_clamp1",
             "c4_sparse_topk_lengths",
-            "trtllm_seq_lens_req",
-            "trtllm_cum_seq_lens_q",
         ]
         reference_assign_fields = [
             "page_table",
@@ -1014,17 +1006,6 @@ class TestTrtllmSparseTablePool(CustomTestCase):
         self.assertIsNone(_tail_refresh_layers([0, 4, 128, 4], ()))  # V4: every layer
         with self.assertRaisesRegex(AssertionError, "across ratios"):
             _tail_refresh_layers(ratios, [2, 8, 14, 24])  # ratio-1 block starts at 20
-
-    def test_uniform_qmeta_floors_padded_requests_at_q_len(self):
-        from sglang.srt.layers.attention.deepseek_v4_backend import DSV4AttnMetadata
-
-        core = object.__new__(DSV4AttnMetadata)
-        core.cuda_int32_kwargs = self.kw
-        # Request 0: 100 committed + 4 new tokens; request 1: graph-padded (all 1s).
-        core.seq_lens_casual = torch.tensor([101, 102, 103, 104, 1, 1, 1, 1], **self.kw)
-        core.init_trtllm_uniform_qmeta(4)
-        self.assertEqual(core.trtllm_seq_lens_req.tolist(), [104, 4])
-        self.assertEqual(core.trtllm_cum_seq_lens_q.tolist(), [0, 4, 8])
 
 
 if __name__ == "__main__":

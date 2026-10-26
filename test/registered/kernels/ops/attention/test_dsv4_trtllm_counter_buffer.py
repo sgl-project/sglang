@@ -196,8 +196,6 @@ class TestDSV4TrtllmCounterBuffer(CustomTestCase):
             swa_page_indices=table[:ROWS, :SWA],
             trtllm_c4_indices=table[:ROWS],
             trtllm_c4_lens=lens[:ROWS],
-            trtllm_seq_lens_req=None,
-            trtllm_cum_seq_lens_q=None,
             _c4_topk_writes_table=lambda: False,
             sparse_topk_lengths=lambda compress_ratio: tail_lens,
         )

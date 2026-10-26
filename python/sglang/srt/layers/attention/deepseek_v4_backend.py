@@ -435,9 +435,6 @@ class DSV4AttnMetadata:
     trtllm_prefill_c4_indices: Optional[torch.Tensor] = None
     trtllm_prefill_c4_lens: Optional[torch.Tensor] = None
     trtllm_prefill_c128: Optional[tuple] = None
-    # Uniform verify / draft-extend query metadata; tensors so replay copies in place.
-    trtllm_seq_lens_req: Optional[torch.Tensor] = None
-    trtllm_cum_seq_lens_q: Optional[torch.Tensor] = None
     # Backend-owned TrtllmSparseTablePool (duck-typed: import cycle); shared, never copied.
     trtllm_table_pool: Optional[object] = None
     # trtllm topk_v2 path: c4_sparse_page_indices aliases the combined table's tail.
@@ -710,28 +707,6 @@ class DSV4AttnMetadata:
             torch.add(self.c128_topk_lengths_clamp1[:num_tokens], SWA_WINDOW, out=lens)
             self.trtllm_prefill_c128 = (table, lens)
 
-    def init_trtllm_uniform_qmeta(self, q_len: int) -> None:
-        """Build uniform multi-token query metadata once per forward step."""
-
-        assert q_len > 1
-        num_tokens = self.seq_lens_casual.shape[0]
-        assert num_tokens > 0 and num_tokens % q_len == 0, (
-            f"uniform trtllm query layout requires whole request groups: "
-            f"{num_tokens=} {q_len=}"
-        )
-        num_reqs = num_tokens // q_len
-        # Per-request KV length is its last token's causal length;
-        # floored at q_len, as the kernel requires (padded outputs are discarded).
-        self.trtllm_seq_lens_req = (
-            self.seq_lens_casual[q_len - 1 :: q_len].clamp(min=q_len).contiguous()
-        )
-        self.trtllm_cum_seq_lens_q = torch.arange(
-            0,
-            (num_reqs + 1) * q_len,
-            q_len,
-            **self.cuda_int32_kwargs,
-        )
-
     def copy_(self, other: DSV4AttnMetadata) -> None:
         copy_metadata(
             src=other,
@@ -775,8 +750,6 @@ class DSV4AttnMetadata:
                 "trtllm_c4_lens",
                 "trtllm_c128_indices",
                 "trtllm_c128_lens",
-                "trtllm_seq_lens_req",
-                "trtllm_cum_seq_lens_q",
             ],
             assign_fields=[
                 # Recomputed by the recorded init_forward_metadata_in_graph op
@@ -831,8 +804,6 @@ class DSV4AttnMetadata:
             "trtllm_c4_lens",
             "trtllm_c128_indices",
             "trtllm_c128_lens",
-            "trtllm_seq_lens_req",
-            "trtllm_cum_seq_lens_q",
         ]
         reference_assign_fields = [
             "page_table",
@@ -2414,8 +2385,6 @@ class DeepseekV4AttnBackend(
             need_compress=True,
             num_groups=bs,
         )
-        if self.trtllm_attn and not is_ragged:
-            core_attn_metadata.init_trtllm_uniform_qmeta(num_draft_tokens)
         indexer_metadata = (
             self.init_forward_metadata_indexer(
                 core_attn_metadata, use_prefill_cuda_graph=graph_backed
@@ -2569,8 +2538,6 @@ class DeepseekV4AttnBackend(
             is_prefill=True,
             num_groups=batch_size,
         )
-        if self.trtllm_attn:
-            core_attn_metadata.init_trtllm_uniform_qmeta(num_tokens_per_req)
         if swa_out_cache_loc is not None:
             # Captures store_cache's cached path instead of a per-layer
             # in-graph mapping translate.

@@ -457,7 +457,7 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
         attn_sink: torch.Tensor,
         extra_indices: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        """Sparse MLA decode; uniform multi-token metadata runs VarSeq."""
+        """Sparse MLA decode, one query token per row with per-token causal seq_lens."""
 
         bs, num_heads, head_dim = q.shape
         assert head_dim == 512
@@ -521,25 +521,24 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
         if seq_lens.shape[0] != bs:
             assert seq_lens.shape[0] > bs, f"{seq_lens.shape=} {bs=}"
             seq_lens = seq_lens[:bs]
-        # Uniform verify/draft-extend metadata uses VarSeq; ragged verify uses dense per-token.
-        seq_lens_req = core_attn_metadata.trtllm_seq_lens_req
         if core_attn_metadata.swa_page_indices.shape[1] > SWA_WINDOW:
             # DSpark attends noncausally to its window plus the whole draft block;
             # dense rows bounded by the block's visible length, all from SWA storage.
-            assert seq_lens_req is None, "DSpark draft blocks use dense rows"
             compressed_kv_cache = swa_kv_cache
             seq_lens = core_attn_metadata.swa_topk_lengths[:bs]
         assert attn_sink.dtype == torch.float32
         assert self.trtllm_workspace_buffer is not None
 
-        cum_seq_lens_q = core_attn_metadata.trtllm_cum_seq_lens_q
-        common = dict(
+        out = trtllm_batch_decode_sparse_mla_dsv4(
+            query=q_fp8.view(bs, 1, num_heads, 512),
             swa_kv_cache=swa_kv_cache,
             workspace_buffer=self.trtllm_workspace_buffer,
             multi_ctas_kv_counter_buffer=self.trtllm_counter_buffer,
             sparse_indices=sparse_indices,
             compressed_kv_cache=compressed_kv_cache,
             sparse_topk_lens=sparse_topk_lens,
+            seq_lens=seq_lens,
+            out=None if out_pad_tail is None else out_pad_tail[:bs, None],
             bmm1_scale=bmm1_scale,
             bmm2_scale=bmm2_scale,
             sinks=attn_sink,
@@ -549,34 +548,6 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
             # it must not overlap the tail refresh that just wrote them.
             enable_pdl=False if refreshed else None,
         )
-        out_arg = None if out_pad_tail is None else out_pad_tail[:bs]
-        if seq_lens_req is not None:
-            # Builders use a fixed num_tokens_per_req, so ragged rows cannot reach here.
-            n_req = seq_lens_req.shape[0]
-            assert n_req > 0 and bs % n_req == 0, (
-                f"non-uniform multi-token batch reached the trtllm decode "
-                f"path: {bs=} {n_req=}"
-            )
-            q_len = bs // n_req
-            assert cum_seq_lens_q is not None
-            assert cum_seq_lens_q.shape == (n_req + 1,), (
-                f"{cum_seq_lens_q.shape=} {n_req=}"
-            )
-            out = trtllm_batch_decode_sparse_mla_dsv4(
-                query=q_fp8,
-                seq_lens=seq_lens_req,
-                out=out_arg,
-                cum_seq_lens_q=cum_seq_lens_q,
-                max_q_len=q_len,
-                **common,
-            )
-        else:
-            out = trtllm_batch_decode_sparse_mla_dsv4(
-                query=q_fp8.view(bs, 1, num_heads, 512),
-                seq_lens=seq_lens,
-                out=None if out_arg is None else out_arg.view(bs, 1, num_heads, 512),
-                **common,
-            )
         if out_pad_tail is not None:
             return out_pad_tail
         return out.view(bs, num_heads, 512)
