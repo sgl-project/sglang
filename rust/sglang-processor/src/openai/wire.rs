@@ -89,6 +89,8 @@ pub(super) fn usage(prompt: u64, completion: u64, reasoning: u64, cached: Option
         "completion_tokens": completion,
         "prompt_tokens_details": cached.map(|n| json!({"cached_tokens": n})),
         "reasoning_tokens": reasoning,
+        // OpenAI's place for the reasoning count, set only when there is some.
+        "completion_tokens_details": (reasoning > 0).then(|| json!({"reasoning_tokens": reasoning})),
     })
 }
 

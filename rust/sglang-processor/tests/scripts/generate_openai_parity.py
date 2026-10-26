@@ -266,12 +266,17 @@ def run_case(case, settings, model, engine_url, defaults, sampling_defaults):
     return recorded
 
 
-def load_template_manager(path, tokenizer):
+def load_template_manager(path, tokenizer, hf_config):
     """The server's `TemplateManager` for a checkpoint with a Jinja template."""
     if not tokenizer.chat_template:
         return None
     manager = TemplateManager()
-    owner = SimpleNamespace(tokenizer=tokenizer, processor=None)
+    # `load_chat_template` reads the config to pick a Python chat template.
+    owner = SimpleNamespace(
+        tokenizer=tokenizer,
+        processor=None,
+        model_config=SimpleNamespace(hf_config=hf_config),
+    )
     manager.load_chat_template(owner, None, path)
     return manager
 
@@ -284,11 +289,12 @@ def load_model(path):
     )
     keys = ("repetition_penalty", "temperature", "top_k", "top_p", "min_p")
     tokenizer = get_tokenizer(path, trust_remote_code=True)
+    hf_config = SimpleNamespace(**config, to_dict=lambda: config)
     return SimpleNamespace(
         path=path,
         tokenizer=tokenizer,
-        template_manager=load_template_manager(path, tokenizer),
-        hf_config=SimpleNamespace(**config, to_dict=lambda: config),
+        template_manager=load_template_manager(path, tokenizer, hf_config),
+        hf_config=hf_config,
         text_config=SimpleNamespace(**config.get("text_config", config)),
         sampling_defaults={
             k: generation[k] for k in keys if generation.get(k) is not None
