@@ -1462,6 +1462,9 @@ class Envs:
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS = EnvInt(2)
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_FUSE_SHARED_EXPERTS = EnvBool(True)
     SGLANG_OPT_DEEPGEMM_MEGA_GATE = EnvBool(False)
+    # Raise DeepGEMM's BLOCK_M (16/32 -> 64, 64 -> 96) for FP8xFP4 calls in
+    # decode and target-verify CUDA graphs.
+    SGLANG_OPT_DEEPGEMM_MEGA_MOE_RAISE_DECODE_BLOCK_M = EnvBool(True)
 
     # ===================================================================
     # Top-k kernels
