@@ -23,6 +23,7 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=30, stage="base-b", runner_config="4-gpu-b200")
+# backend-specific: the gfx950 block-fp8 ctx-KV writer and fused markov step bias.
 register_amd_ci(est_time=30, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 
