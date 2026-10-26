@@ -8,6 +8,7 @@ import numpy as np
 
 from sglang.srt.disaggregation.mori import conn as mori_conn
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_amd_ci
 
 register_amd_ci(est_time=5, suite="stage-a-test-1-gpu-small-amd")
@@ -183,6 +184,34 @@ class TestMoriDsaStateElision(unittest.TestCase):
         # Decode elided layer 4. Writing to it would use a None descriptor.
         calls = self._send([4, 5], [3, 4, 5], [132, 132], [132, 0, 132])
         self.assertEqual(calls, [call("s5", "d5", "plan")])
+
+
+class TestMoriBackendSelection(unittest.TestCase):
+    def _init_engine(self, backend):
+        manager = object.__new__(mori_conn.MoriKVManager)
+        manager.kv_args = SimpleNamespace(ib_device=None)
+        manager.disaggregation_mode = DisaggregationMode.PREFILL
+        manager.system_dp_rank = manager.attn_tp_rank = 0
+        engine = Mock()
+        engine.get_engine_desc.return_value = SimpleNamespace(port=0)
+        with (
+            patch.object(mori_conn, "IOEngine", return_value=engine),
+            patch.object(mori_conn, "get_local_ip_auto", return_value="127.0.0.1"),
+            envs.SGLANG_MORI_BACKEND.override(backend),
+        ):
+            manager._init_engine()
+        return engine
+
+    def test_xgmi_creates_the_xgmi_backend_without_a_port(self):
+        from mori.io import XgmiBackendConfig
+
+        (backend_type, config), _ = self._init_engine("xgmi").create_backend.call_args
+        self.assertEqual(backend_type, mori_conn.BackendType.XGMI)
+        self.assertIsInstance(config, XgmiBackendConfig)
+
+    def test_unknown_backend_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "SGLANG_MORI_BACKEND"):
+            self._init_engine("tcp")
 
 
 if __name__ == "__main__":

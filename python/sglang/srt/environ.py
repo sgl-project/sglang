@@ -900,6 +900,10 @@ class Envs:
     # MoRI transport and expert dispatch
     # ===================================================================
     SGLANG_DEEPEP_V2_FORCE_MAX_LEN = EnvBool(False)
+    # Data plane of the MoRI PD connector: "rdma" or "xgmi" (one node, no NICs).
+    # xgmi: both roles see the same HIP_VISIBLE_DEVICES and pick GPUs with
+    # --base-gpu-id; AUX always goes over TCP.
+    SGLANG_MORI_BACKEND = EnvStr("rdma")
     # Send CPU-resident AUX data via RDMA instead of ZMQ TCP (default: TCP).
     SGLANG_MORI_SEND_AUX_RDMA = EnvBool(False)
     # Number of RDMA Queue Pairs (QPs) used per transfer operation. Higher

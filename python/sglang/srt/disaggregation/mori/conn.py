@@ -401,7 +401,9 @@ class MoriKVManager(CommonKVManager):
         # Set by teardown() to make worker threads exit (PoC: P<->D role switch).
         self._stopped = False
         self._worker_threads: List[threading.Thread] = []
-        self._send_aux_rdma = envs.SGLANG_MORI_SEND_AUX_RDMA.get()
+        self._send_aux_rdma = (
+            envs.SGLANG_MORI_SEND_AUX_RDMA.get() and self._mori_backend == "rdma"
+        )
         self._register_local_buffers()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self._num_shards = max(1, envs.SGLANG_MORI_TRANSFER_SHARDS.get())
@@ -447,6 +449,11 @@ class MoriKVManager(CommonKVManager):
             self._start_heartbeat_checker_thread()
 
     def _init_engine(self) -> IOEngine:
+        self._mori_backend = envs.SGLANG_MORI_BACKEND.get()
+        if self._mori_backend not in ("rdma", "xgmi"):
+            raise ValueError(
+                f"SGLANG_MORI_BACKEND must be rdma or xgmi, got {self._mori_backend!r}"
+            )
         if self.kv_args.ib_device:
             os.environ["MORI_RDMA_DEVICES"] = self.kv_args.ib_device
 
@@ -465,6 +472,14 @@ class MoriKVManager(CommonKVManager):
             timeout_s=envs.SGLANG_DISAGGREGATION_ENGINE_INIT_TIMEOUT.get(),
             what=f"Mori IOEngine({engine_key!r}, host={self.local_ip!r})",
         )
+
+        if self._mori_backend == "xgmi":
+            from mori.io import XgmiBackendConfig
+
+            # XGMI binds no port, so the RDMA port check below does not apply.
+            engine.create_backend(BackendType.XGMI, XgmiBackendConfig())
+            return engine
+
         poll_mode = PollCqMode.POLLING
 
         qp_per_transfer = envs.SGLANG_MORI_QP_PER_TRANSFER.get()
