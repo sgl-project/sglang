@@ -119,8 +119,7 @@ do
         --enable-multimodal \
         --mm-attention-backend ascend_attn \
         --sampling-backend ascend \
-        --enable-dp-attention \
-        --dp-size 32 \
+        --attn-dp-size 32 \
         --moe-a2a-backend deepep \
         --deepep-mode auto \
         --cuda-graph-bs-decode 1 \
@@ -277,7 +276,6 @@ do
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=64
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-        export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_NPU_USE_MLAPO=1
         export SGLANG_NPU_USE_MULTI_STREAM=1
 
@@ -296,8 +294,6 @@ do
         --tp-size 16 \
         --mem-fraction-static 0.82 \
         --max-running-requests 2 \
-        --enable-dp-attention \
-        --dp-size 1 \
         --enable-dp-lm-head \
         --disable-radix-cache \
         --enable-multimodal \
@@ -476,7 +472,6 @@ do
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=64
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-        export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_NPU_USE_MLAPO=1
         export SGLANG_NPU_USE_MULTI_STREAM=1
 
@@ -495,8 +490,6 @@ do
         --tp-size 16 \
         --mem-fraction-static 0.82 \
         --max-running-requests 2 \
-        --enable-dp-attention \
-        --dp-size 1 \
         --enable-dp-lm-head \
         --disable-radix-cache \
         --enable-multimodal \
@@ -674,7 +667,6 @@ do
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=64
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-        export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_NPU_USE_MLAPO=1
         export SGLANG_NPU_USE_MULTI_STREAM=1
 
@@ -693,8 +685,6 @@ do
         --tp-size 16 \
         --mem-fraction-static 0.82 \
         --max-running-requests 16 \
-        --enable-dp-attention \
-        --dp-size 1 \
         --enable-dp-lm-head \
         --disable-radix-cache \
         --enable-multimodal \
@@ -868,7 +858,6 @@ do
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=64
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-        export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_NPU_USE_MLAPO=1
         export SGLANG_NPU_USE_MULTI_STREAM=1
 
@@ -887,8 +876,7 @@ do
         --tp-size 16 \
         --mem-fraction-static 0.82 \
         --max-running-requests 2 \
-        --enable-dp-attention \
-        --dp-size 2 \
+        --attn-dp-size 2 \
         --enable-dp-lm-head \
         --disable-radix-cache \
         --enable-multimodal \
@@ -1001,7 +989,6 @@ export HCCL_OP_EXPANSION_MODE=AIV
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=112
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_NPU_USE_MULTI_STREAM=1
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
@@ -1024,8 +1011,7 @@ python3 -m sglang.launch_server \
     --enable-multimodal \
     --mm-attention-backend ascend_attn \
     --sampling-backend ascend \
-    --enable-dp-attention \
-    --dp-size 16 \
+    --attn-dp-size 16 \
     --moe-a2a-backend deepep \
     --deepep-mode auto \
     --cuda-graph-bs-decode 1 2 4 8 9 10 11 \
@@ -1112,7 +1098,6 @@ export HCCL_OP_EXPANSION_MODE=AIV
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=32
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_NPU_USE_MULTI_STREAM=1
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
@@ -1135,8 +1120,7 @@ python3 -m sglang.launch_server \
     --enable-multimodal \
     --mm-attention-backend ascend_attn \
     --sampling-backend ascend \
-    --enable-dp-attention \
-    --dp-size 16 \
+    --attn-dp-size 16 \
     --moe-a2a-backend deepep \
     --deepep-mode auto \
     --cuda-graph-bs-decode 1 2 3 4 \
@@ -1228,7 +1212,6 @@ export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=96
 export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_NPU_USE_MLAPO=1
 export SGLANG_NPU_USE_MULTI_STREAM=1
 export SGLANG_SET_CPU_AFFINITY=1
@@ -1251,8 +1234,7 @@ python3 -m sglang.launch_server \
     --enable-multimodal \
     --mm-attention-backend ascend_attn \
     --sampling-backend ascend \
-    --enable-dp-attention \
-    --dp-size 16 \
+    --attn-dp-size 16 \
     --moe-a2a-backend deepep \
     --deepep-mode auto \
     --cuda-graph-bs-decode 1 2 3 4 5 \
@@ -1344,7 +1326,6 @@ export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=96
 export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 
@@ -1365,8 +1346,7 @@ python3 -m sglang.launch_server \
     --enable-multimodal \
     --mm-attention-backend ascend_attn \
     --sampling-backend ascend \
-    --enable-dp-attention \
-    --dp-size 16 \
+    --attn-dp-size 16 \
     --moe-a2a-backend deepep \
     --deepep-mode auto \
     --cuda-graph-bs-decode 1 2 4 8 11 12 13 \

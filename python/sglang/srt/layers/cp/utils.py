@@ -166,7 +166,12 @@ def prepare_cp_forward(forward_batch) -> None:
         )
         pad_logical_token_to_physical(forward_batch.attn_cp_metadata)
 
-    if getattr(forward_batch, "global_num_tokens_cpu", None) is not None:
+    # Under CP-TP group sharing the model owns the CP row layout and gathers
+    # full rows for its MLPs, so their buffers keep the full-batch length.
+    if (
+        not get_parallel().enable_cp_tp_group_sharing
+        and getattr(forward_batch, "global_num_tokens_cpu", None) is not None
+    ):
         from sglang.srt.layers.dp_attention import set_local_dp_buffer_len
 
         set_local_dp_buffer_len(
@@ -273,8 +278,10 @@ def cp_shard_model_inputs(
 ):
     """Restore the shared batch so logits processing keeps full-batch metadata."""
     assert is_cp_active(forward_batch)
-    sharded_hidden_states = cp_shard_hidden_states(
-        complete_hidden_states, forward_batch
+    sharded_hidden_states = (
+        cp_shard_hidden_states(complete_hidden_states, forward_batch)
+        if complete_hidden_states is not None
+        else None
     )
     sharded_positions = cp_shard_position_ids(complete_position_ids, forward_batch)
     model_input_ids = (
@@ -295,6 +302,7 @@ def cp_shard_model_inputs(
     spec_hidden_states_backup = None
     if (
         spec_hidden_states is not None
+        and complete_hidden_states is not None
         and spec_hidden_states.shape[0] == complete_hidden_states.shape[0]
     ):
         spec_hidden_states_backup = spec_hidden_states

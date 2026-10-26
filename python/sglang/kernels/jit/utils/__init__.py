@@ -7,7 +7,9 @@ from sglang.kernels.jit.utils.arch import (
     override_jit_cuda_arch,
 )
 from sglang.kernels.jit.utils.common import (
+    aligned_new_empty,
     cache_once,
+    device_guard,
     empty_sentinel,
     get_ci_test_range,
     is_hip_runtime,
@@ -20,18 +22,22 @@ from sglang.kernels.jit.utils.compile import (
     cuda_stubs_dir,
     load_jit,
     make_cpp_args,
+    parallel_compile,
 )
 
 __all__ = [
+    "aligned_new_empty",
     "empty_sentinel",
     "should_run_full_tests",
     "get_ci_test_range",
     "cache_once",
+    "device_guard",
     "lazy_register_class",
     "is_hip_runtime",
     "is_musa_runtime",
     "make_cpp_args",
     "load_jit",
+    "parallel_compile",
     "cuda_stubs_dir",
     "override_jit_cuda_arch",
     "get_activation_cuda_cflags",

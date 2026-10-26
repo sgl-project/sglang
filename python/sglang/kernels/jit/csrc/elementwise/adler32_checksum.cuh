@@ -1,9 +1,7 @@
 // Adler-32 checksum CUDA kernels for tensor verification.
 //
-// Two modes:
-//   1. Whole-tensor: checksum all bytes of a contiguous tensor
-//   2. Strided: checksum selected items across multiple tensors,
-//      given precomputed byte pointers and per-item lengths
+// Checksums selected items across multiple tensors, given precomputed byte
+// pointers and per-item lengths.
 //
 // Adler-32:
 //   A = 1 + sum(bytes)              (mod 65521)
@@ -164,75 +162,7 @@ __device__ Adler32State adler32_block_reduce(Adler32State state, Adler32State* s
   return state;
 }
 
-// --- Kernel 1: Whole tensor ---
-
-__global__ void adler32_whole_kernel(
-    const uint8_t* __restrict__ data,
-    uint32_t* __restrict__ out_a,
-    uint32_t* __restrict__ out_b,
-    uint64_t* __restrict__ out_len,
-    uint64_t num_bytes,
-    uint64_t chunk_size) {
-  extern __shared__ Adler32State smem[];
-
-  uint64_t global_tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-  uint64_t start = global_tid * chunk_size;
-
-  Adler32State state;
-  if (start < num_bytes) {
-    uint64_t end = start + chunk_size;
-    if (end > num_bytes) end = num_bytes;
-    state = adler32_compute(data + start, end - start);
-  } else {
-    state = adler32_identity();
-  }
-
-  uint32_t threads_in_block = blockDim.x;
-  uint64_t block_start = (uint64_t)blockIdx.x * blockDim.x;
-  uint64_t total_threads = (num_bytes + chunk_size - 1) / chunk_size;
-  if (block_start + threads_in_block > total_threads) {
-    threads_in_block = (uint32_t)(total_threads - block_start);
-  }
-
-  Adler32State result = adler32_block_reduce(state, smem, threads_in_block);
-
-  if (threadIdx.x == 0) {
-    out_a[blockIdx.x] = result.a;
-    out_b[blockIdx.x] = result.b;
-    out_len[blockIdx.x] = result.len;
-  }
-}
-
-struct Adler32WholeKernel {
-  static void run(tvm::ffi::TensorView data, tvm::ffi::TensorView states, int64_t num_bytes, int64_t chunk_size) {
-    using namespace host;
-
-    const uint8_t* data_ptr = static_cast<const uint8_t*>(data.data_ptr());
-
-    int64_t total_threads = (num_bytes + chunk_size - 1) / chunk_size;
-    int64_t num_blocks = (total_threads + kBlockSize - 1) / kBlockSize;
-
-    uint32_t* out_a = static_cast<uint32_t*>(states.data_ptr());
-    uint32_t* out_b = out_a + num_blocks;
-    uint64_t* out_len = reinterpret_cast<uint64_t*>(out_b + num_blocks);
-
-    DLDevice device;
-    device.device_type = kDLCUDA;
-    device.device_id = data.device().device_id;
-
-    size_t smem_bytes = (kBlockSize / 32) * sizeof(Adler32State);
-    LaunchKernel(num_blocks, kBlockSize, device, smem_bytes)(
-        adler32_whole_kernel,
-        data_ptr,
-        out_a,
-        out_b,
-        out_len,
-        static_cast<uint64_t>(num_bytes),
-        static_cast<uint64_t>(chunk_size));
-  }
-};
-
-// --- Kernel 2: Strided items ---
+// --- Kernel 1: Strided items ---
 
 __global__ void adler32_strided_kernel(
     const int64_t* __restrict__ ptrs,
@@ -293,7 +223,7 @@ struct Adler32StridedKernel {
   }
 };
 
-// --- Kernel 3: Final reduction ---
+// --- Kernel 2: Final reduction ---
 
 __global__ void adler32_reduce_kernel(
     const uint32_t* __restrict__ in_a,

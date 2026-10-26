@@ -24,15 +24,9 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.attention.decode_attention import _extract_kv_strides
-from sglang.kernels.ops.attention.prefill_attention import context_attention_fwd
 from sglang.kernels.ops.attention.score_mod import unpack_aux_tensors
 from sglang.srt.environ import envs
-from sglang.srt.utils import (
-    is_cuda,
-    is_gfx95_supported,
-    is_gfx1250_supported,
-    is_hip,
-)
+from sglang.srt.utils import is_cuda, is_gfx95_supported, is_gfx1250_supported, is_hip
 
 _is_cuda = is_cuda()
 if _is_cuda:
@@ -87,12 +81,11 @@ def _get_block_sizes_for_extend_attention(Lq: int, Lv: int):
             # late-prefill kernel from ~12.57 ms to ~5.24 ms.
             BLOCK_M, BLOCK_N = (64, 32)
             num_warps = 4
-        elif _is_gfx95 and 128 < Lq <= 256:
-            # gfx950 (CDNA4), 128 < head_dim <= 256: a larger query tile halves KV bytes
-            # streamed per call (each workgroup reads the whole prefix); 8 warps
-            # hide the loads. Measured on MI350X head_dim 256: -36% kernel time,
-            # 28% -> 44% MFU, numerically equivalent (BLOCK_N reduction order
-            # unchanged). Other AMD archs / head dims keep the default below.
+        elif _is_gfx95 and Lq <= 256:
+            # gfx950 (CDNA4), head_dim <= 256: every workgroup streams the whole
+            # prefix, so a larger query tile halves the KV bytes read per call;
+            # BLOCK_M / num_warps = 16 rows per warp is exactly one MFMA tile at
+            # matrix_instr_nonkdim=16. Measured on MI350X at head_dim 64, 128, 256.
             BLOCK_M, BLOCK_N = (128, 64)
             num_warps = 8
         else:
@@ -273,6 +266,61 @@ def _copy_unified_indices_kernel(
 
         vals = tl.load(extend_kv_indices + src_idx, mask=mask, other=0)
         tl.store(unified_kv_indices + dst_idx, vals, mask=mask)
+
+
+@triton.jit
+def _align_window_kv_kernel(
+    window_kv_indptr,
+    window_kv_indices,
+    aligned_kv_indptr,
+    pad,
+    aligned_kv_indices,
+    BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    src_start = tl.load(window_kv_indptr + pid)
+    num_keys = tl.load(window_kv_indptr + pid + 1) - src_start
+    dst_start = tl.load(aligned_kv_indptr + pid)
+    cur_pad = tl.load(pad + pid)
+    for off in range(0, num_keys + cur_pad, BLOCK):
+        j = off + tl.arange(0, BLOCK)
+        mask = j < num_keys + cur_pad
+        val = tl.load(
+            window_kv_indices + src_start + tl.maximum(j - cur_pad, 0), mask=mask
+        )
+        tl.store(aligned_kv_indices + dst_start + j, val, mask=mask)
+
+
+def align_window_kv_to_tiles(
+    window_kv_indptr: torch.Tensor,
+    window_kv_indices: torch.Tensor,
+    window_start_pos: torch.Tensor,
+    bs: int,
+    tile: int = 128,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pad each request's window KV list with copies of its first key so the list
+    starts on an absolute multiple of ``tile`` (a multiple of every BLOCK_N). The
+    unified kernel then sums a chunked prefill's keys in the same tiles as an
+    unchunked one; the copies sit before the window and are masked out."""
+    pad = window_start_pos[:bs] % tile
+    lens = window_kv_indptr[1 : bs + 1] - window_kv_indptr[:bs] + pad
+    aligned_kv_indptr = torch.zeros_like(window_kv_indptr[: bs + 1])
+    aligned_kv_indptr[1:] = torch.cumsum(lens, dim=0)
+    # Upper bound on the padded length, so no device-to-host sync is needed.
+    aligned_kv_indices = torch.empty(
+        window_kv_indices.numel() + bs * (tile - 1),
+        dtype=window_kv_indices.dtype,
+        device=window_kv_indices.device,
+    )
+    _align_window_kv_kernel[(bs,)](
+        window_kv_indptr,
+        window_kv_indices,
+        aligned_kv_indptr,
+        pad,
+        aligned_kv_indices,
+        BLOCK=128,
+    )
+    return aligned_kv_indptr, aligned_kv_indices
 
 
 def build_unified_kv_indices(
@@ -509,7 +557,9 @@ def _fwd_kernel(
                 mask=(mask_m[:, None] & mask_n[None, :]),
                 other=0,
             )
-            final_mask &= custom_mask
+            # The mask buffer is int8; narrow it to i1, since a score_mod hands
+            # final_mask to tl.load, which rejects an i8 mask.
+            final_mask &= custom_mask != 0
         if SLIDING_WINDOW_SIZE > 0:
             # Add mask where q_id <= kv_id + sliding_window_size
             # q_id = prefix_len + cur_m, kv_id = cur_n
@@ -672,7 +722,16 @@ def _fwd_kernel(
         else tl.minimum(cur_seq_len_extend, (cur_block_m + 1) * BLOCK_M)
     )
     extend_end = 0 if SKIP_EXTEND else cur_block_m_end
-    for start_n in range(0, extend_end, BLOCK_N):
+    # Causal or not, the mask below keeps (q, kv) only if q <= kv + SLIDING_WINDOW_SIZE,
+    # so no tile under this floor holds an unmasked element -- tight for any
+    # BLOCK_M/BLOCK_N. SKIP_TILE already zeroes them; bounding the loop also drops
+    # their cross-wave tl.max.
+    extend_start = 0
+    if SLIDING_WINDOW_SIZE > 0:
+        extend_start = (
+            tl.maximum(cur_block_m * BLOCK_M - SLIDING_WINDOW_SIZE, 0) // BLOCK_N
+        ) * BLOCK_N
+    for start_n in range(extend_start, extend_end, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         mask_n = (start_n + offs_n) < cur_block_m_end
 
@@ -690,7 +749,8 @@ def _fwd_kernel(
                 mask=(mask_m[:, None] & mask_n[None, :]),
                 other=0,
             )
-            custom_mask &= mask_m[:, None] & mask_n[None, :]
+            # int8 -> i1 before the &=; see the prefix loop above.
+            custom_mask = (custom_mask != 0) & mask_m[:, None] & mask_n[None, :]
             final_mask &= custom_mask
         elif IS_CAUSAL:
             mask_causual = (cur_block_m * BLOCK_M + offs_m[:, None]) >= (
@@ -703,10 +763,18 @@ def _fwd_kernel(
             final_mask &= mask_non_causal
 
         if SLIDING_WINDOW_SIZE > 0:
-            # Add mask where q_id <= kv_id + sliding_window_size
-            window_mask = (cur_block_m * BLOCK_M + offs_m[:, None]) <= (
-                start_n + offs_n[None, :] + SLIDING_WINDOW_SIZE
-            )
+            if not IS_CAUSAL:
+                window_mask = (
+                    (cur_block_m * BLOCK_M + offs_m[:, None])
+                    <= (start_n + offs_n[None, :] + SLIDING_WINDOW_SIZE)
+                ) & (
+                    (start_n + offs_n[None, :])
+                    <= (cur_block_m * BLOCK_M + offs_m[:, None] + SLIDING_WINDOW_SIZE)
+                )
+            else:
+                window_mask = (cur_block_m * BLOCK_M + offs_m[:, None]) <= (
+                    start_n + offs_n[None, :] + SLIDING_WINDOW_SIZE
+                )
             final_mask &= window_mask
 
         SKIP_TILE = False
@@ -1100,43 +1168,6 @@ def extend_attention_fwd(
     )
 
 
-def redundant_attention(
-    q_extend,
-    o_extend,
-    k_buffer,
-    v_buffer,
-    b_req_idx,
-    b_start_loc,
-    b_seq_len,
-    b_seq_len_prefix,
-    max_len_in_batch,
-):
-    total_token_num = k_buffer.shape[0]
-    B, H_Q, D = b_req_idx.shape[0], q_extend.shape[-2], q_extend.shape[-1]
-    q_buffer = torch.empty(
-        (total_token_num, H_Q, D), dtype=q_extend.dtype, device=q_extend.device
-    )
-
-    pt = 0
-    for i in range(B):
-        cur_seq_len_extend = b_seq_len[i] - b_seq_len_prefix[i]
-        pl, pr = b_start_loc[i] + b_seq_len_prefix[i], b_start_loc[i] + b_seq_len[i]
-        q_buffer[pl:pr] = q_extend[pt : pt + cur_seq_len_extend]
-        pt += cur_seq_len_extend
-
-    o_buffer = torch.empty_like(q_buffer)
-    context_attention_fwd(
-        q_buffer, k_buffer, v_buffer, o_buffer, b_start_loc, b_seq_len, max_len_in_batch
-    )
-
-    pt = 0
-    for i in range(B):
-        cur_seq_len_extend = b_seq_len[i] - b_seq_len_prefix[i]
-        pl, pr = b_start_loc[i] + b_seq_len_prefix[i], b_start_loc[i] + b_seq_len[i]
-        o_extend[pt : pt + cur_seq_len_extend] = o_buffer[pl:pr]
-        pt += cur_seq_len_extend
-
-
 @triton.jit
 def _fwd_kernel_unified(
     Q,
@@ -1257,8 +1288,14 @@ def _fwd_kernel_unified(
     deno = tl.zeros([BLOCK_M], dtype=tl.float32)
     e_max = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
 
-    # Unified loop: process all KV tokens (prefix + extend)
-    for start_n in range(0, cur_seq_kv_len, BLOCK_N):
+    start_k, end_k = 0, cur_seq_kv_len
+    if IS_CAUSAL and SLIDING_WINDOW_SIZE > 0 and not USE_CUSTOM_MASK:
+        first_query = cur_block_m * BLOCK_M
+        last_query = tl.minimum(first_query + BLOCK_M, cur_seq_q_len)
+        start_k = tl.maximum(0, cur_seq_prefix_len + first_query - SLIDING_WINDOW_SIZE)
+        start_k = start_k // BLOCK_N * BLOCK_N
+        end_k = tl.minimum(cur_seq_kv_len, cur_seq_prefix_len + last_query)
+    for start_n in range(start_k, end_k, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         mask_n = (start_n + offs_n) < cur_seq_kv_len
 
@@ -1276,7 +1313,8 @@ def _fwd_kernel_unified(
                 mask=(mask_m[:, None] & mask_n[None, :]),
                 other=0,
             )
-            final_mask &= custom_mask
+            # int8 -> i1 before the &=; see `_fwd_kernel`'s prefix loop.
+            final_mask &= custom_mask != 0
 
         # Apply causal mask for extend part
         if IS_CAUSAL and not USE_CUSTOM_MASK:
@@ -1311,6 +1349,8 @@ def _fwd_kernel_unified(
 
             # Sliding window: query can attend to keys within window_size
             window_mask = q_abs_pos <= (k_abs_pos + SLIDING_WINDOW_SIZE)
+            if not IS_CAUSAL:
+                window_mask &= k_abs_pos <= (q_abs_pos + SLIDING_WINDOW_SIZE)
             final_mask &= window_mask
 
         # Check if we can skip this tile
@@ -1520,6 +1560,12 @@ def extend_attention_fwd_unified(
     BLOCK_DMODEL, BLOCK_DPE, BLOCK_DV, BLOCK_M, BLOCK_N, num_warps = (
         _get_block_sizes_for_extend_attention(Lq, Lv)
     )
+    if _is_gfx95 and Lq <= 128 and Lv <= 128 and BLOCK_N == 64:
+        # gfx950, head_dim <= 128: each workgroup streams the whole prefix, so a 256-row query tile
+        # cuts the KV bytes read per query row 4x. BLOCK_N, and so the reduction order, is unchanged:
+        # outputs are bitwise identical. Measured on MI350X (head_dim 128 and 64, 8k-token chunks after
+        # 0-56k-token prefixes): 2.0-2.6x kernel speed.
+        BLOCK_M, num_warps = 256, 8
 
     sm_scale = sm_scale or 1.0 / (Lq**0.5)
     batch_size, head_num = qo_indptr.shape[0] - 1, q.shape[1]

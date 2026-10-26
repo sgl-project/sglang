@@ -51,15 +51,7 @@ def _causal_block_count(batch: Req, server_args: ServerArgs) -> int:
 
 
 class LongLive2TextEncodingStage(TextEncodingStage):
-    def build_dedup_fingerprint(self, batch: Req, server_args: ServerArgs):
-        base = super().build_dedup_fingerprint(batch, server_args)
-        return (
-            base,
-            self.freeze_for_dedup(getattr(batch, "shot_prompts", None)),
-            self.freeze_for_dedup(getattr(batch, "shot_durations", None)),
-            int(getattr(batch, "chunks_per_shot", 0) or 0),
-            getattr(batch, "scene_cut_prefix", None),
-        )
+    deduplicated_output_fields = ()
 
     def _block_prompts(self, batch: Req, server_args: ServerArgs) -> list[str] | None:
         shot_prompts = getattr(batch, "shot_prompts", None)
@@ -404,16 +396,15 @@ class LongLive2CausalDenoisingStage(CausalDMDDenoisingStage):
             num_blocks = (t - 1) // self.num_frames_per_block
             block_sizes = [1] + [self.num_frames_per_block] * num_blocks
 
-        total_iterations = len(block_sizes) * len(timesteps)
-        batch.record_stage_iterations(total_iterations, total_iterations)
-
         start_index = 0
         self._validate_block_prompt_count(batch, block_sizes)
 
         def prepare_context_input(current_latents):
             return current_latents
 
-        with self.progress_bar(total=len(block_sizes) * len(timesteps)) as progress_bar:
+        with self.progress_bar(
+            total=len(block_sizes) * len(timesteps), batch=batch
+        ) as progress_bar:
             for block_index, current_num_frames in enumerate(block_sizes):
                 self._set_rope_temporal_offset(
                     batch, self._shot_index(batch, block_index)

@@ -19,6 +19,8 @@ from pydantic import (
     model_validator,
 )
 
+from sglang.srt.entrypoints.openai.protocol import PDRoutingFields
+
 
 class AnthropicError(BaseModel):
     """Error structure for Anthropic API."""
@@ -357,7 +359,7 @@ class AnthropicCountTokensResponse(BaseModel):
     input_tokens: int
 
 
-class AnthropicMessagesRequest(BaseModel):
+class AnthropicMessagesRequest(PDRoutingFields):
     """Anthropic Messages API request."""
 
     model: str

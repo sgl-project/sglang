@@ -46,7 +46,9 @@ def _pool_bytes(pool) -> int:
         return _pool_bytes(pool.full_kv_pool) + _pool_bytes(pool.swa_kv_pool)
     if isinstance(pool, HybridLinearKVPool):
         return _pool_bytes(pool.full_kv_pool)
-    sizes = pool.get_kv_size_bytes()
+    sizes = getattr(pool, "host_capacity_bytes", None)
+    if sizes is None:
+        sizes = pool.get_kv_size_bytes()
     return sum(sizes) if isinstance(sizes, tuple) else sizes
 
 
@@ -91,7 +93,7 @@ def auto_size_hicache(
         return
     requested = get_memory().hicache_ratio
     device_bytes = _estimate_hicache_bytes(params, draft_plan)
-    budget = int(host_memory_budget_bytes() * fraction)
+    budget = int(host_memory_budget_bytes(auto_size=True) * fraction)
     ratio = min(requested, budget * (1 - _ALLOCATION_SLACK_FRACTION) / device_bytes)
     # One collective before any pool is built: PP stages own different pool
     # counts, so a per-pool collective could deadlock.
