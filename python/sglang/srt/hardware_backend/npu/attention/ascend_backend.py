@@ -712,12 +712,6 @@ class AscendAttnBackend(AttentionBackend):
                 )
             )
             metadata.seq_lens_cpu_list = local_seq_lens_cpu.tolist()
-            if metadata.block_tables.shape[1] == 0:
-                # FIA rejects zero-column tables when queries are nonempty.
-                metadata.block_tables = (
-                    self.req_to_token[forward_batch.req_pool_indices, :1]
-                    // (self.page_size * self.dcp_size)
-                ).to(torch.int32)
             if forward_batch.forward_mode.is_target_verify():
                 query_len = int(forward_batch.spec_info.draft_token_num)
                 metadata.dcp_spec_seq_lens = get_dcp_chain_spec_lens(
@@ -2894,6 +2888,23 @@ class AscendAttnBackend(AttentionBackend):
                 )
 
             if dense_mla_dcp_verify:
+                if (
+                    not self.graph_mode
+                    and forward_batch.global_num_token_non_padded_cpu == 0
+                ):
+                    # Idle DP participants still need padded O/LSE rows for the
+                    # DCP merge, but have no real queries to run through FIA.
+                    num_tokens = q.shape[0]
+                    num_heads = layer.tp_q_head_num
+                    attn_output = q.new_zeros(
+                        (num_tokens, num_heads * self.kv_lora_rank)
+                    )
+                    softmax_lse = q.new_full(
+                        (num_tokens, num_heads),
+                        -float("inf"),
+                        dtype=torch.float32,
+                    )
+                    return attn_output, softmax_lse
                 # BSND keeps Q queries per request, including padding rows, so O/LSE
                 # retain the token shape consumed by the DCP merge. The explicit
                 # mask supplies each query's rank-local KV visibility.
