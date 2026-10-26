@@ -60,11 +60,15 @@ from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     QuantizationConfig,
 )
+from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+    CompressedTensorsFusedMoEMethod,
+)
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMxInt4MoE,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
 from sglang.srt.layers.quantization.fp8_utils import quantize_block_fp8_weight_to_mxfp4
+from sglang.srt.layers.quantization.minimax_m3_nvfp4 import MiniMaxM3Nvfp4MoE
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptNvFp4FusedMoEMethod
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
@@ -414,6 +418,7 @@ class FusedMoE(torch.nn.Module):
         # Set by the quant method when it repacks experts for MegaMoE.
         self._mega_moe_weights_built = False
         self._mega_moe_nvfp4 = False
+        self._mega_moe_trtllm_layout = False
         # Read at construction: draft_model_build_scope applies the draft's own value.
         self._mega_moe_w4a4 = get_exec().moe.enable_w4a4_mxfp4_megamoe
         self._pending_fp8_shared_weights: dict[tuple[int, str], torch.Tensor] = {}
@@ -537,6 +542,13 @@ class FusedMoE(torch.nn.Module):
             and isinstance(self.quant_method, Fp8MoEMethod)
             and self.quant_method.block_quant
         )
+        # Packed NVFP4 experts on the routed TRT-LLM runner also return the
+        # do_finalize=False triple; their compressed-tensors method holds the scheme.
+        packed_nvfp4_routed_deferred = (
+            isinstance(self.quant_method, CompressedTensorsFusedMoEMethod)
+            and isinstance(self.scheme, MiniMaxM3Nvfp4MoE)
+            and self.scheme.use_flashinfer_trtllm
+        )
         qwen4_bf16_deferred = (
             isinstance(self.quant_method, UnquantizedFusedMoEMethod)
             and params_dtype == torch.bfloat16
@@ -569,7 +581,7 @@ class FusedMoE(torch.nn.Module):
             self.runner_backend is not None
             and self.runner_backend.is_flashinfer_trtllm()
             and (nvfp4_deferred or qwen35_fp8_deferred or qwen4_bf16_deferred)
-        )
+        ) or packed_nvfp4_routed_deferred
         global _deferred_finalize_info_logged
         if not _deferred_finalize_info_logged:
             _deferred_finalize_info_logged = True
@@ -604,7 +616,10 @@ class FusedMoE(torch.nn.Module):
             _fuses_routed_scaling_factor_in_topk(self.quant_method, self.runner_backend)
         )
 
-        self.routing_method_type = routing_method_type
+        self.routing_method_type = self.quant_method.get_moe_routing_method_type(
+            self, routing_method_type
+        )
+        self.moe_runner_config.routing_method_type = self.routing_method_type
 
         # overlap args
         self.down_gemm_overlap_args: Optional[DownGemmOverlapArgs] = None
@@ -944,6 +959,78 @@ class FusedMoE(torch.nn.Module):
             expert_data.narrow(shard_dim, 0, loaded_size).copy_(loaded_weight)
         else:
             expert_data.copy_(loaded_weight)
+
+    def _maybe_load_bf16_shared_expert_as_fp4(
+        self,
+        param: torch.nn.Parameter,
+        loaded_weight: torch.Tensor,
+        shard_id: str,
+        expert_id: int,
+        shard_dim: int,
+    ) -> bool:
+        """Quantize an unquantized fused shared expert into its FP4 slot.
+
+        Some FP4 checkpoints exclude the shared expert body from quantization,
+        so it arrives in the model dtype while the routed experts it is fused
+        with are already packed FP4.  It is quantized here, after the expert id
+        has been mapped to a local slot, so that the TP sharding and padding
+        below stay shared with the routed experts.
+
+        A rank only sees its own shard, but it still reproduces what an
+        offline-quantized checkpoint would carry: the tensor is quantized whole
+        and sharded afterwards, and MX blocks run along K, which TP either
+        leaves intact (gate/up) or splits at a multiple of the block size
+        (down).
+        """
+        scheme = getattr(self, "scheme", None)
+        if (
+            not self._has_fused_shared
+            or expert_id < self._num_local_routed
+            or not getattr(scheme, "quantize_shared_expert_online", False)
+            or loaded_weight.dtype not in (torch.bfloat16, torch.float16, torch.float32)
+        ):
+            return False
+
+        weight_param = self.w2_weight if shard_id == "w2" else self.w13_weight
+        if param is not weight_param:
+            return False
+
+        if shard_id not in ("w1", "w2", "w3"):
+            # make_expert_params_mapping_fused emits "w13" for a checkpoint that
+            # ships gate and up already concatenated, which this cannot convert:
+            # the helpers below place one half of w13 at a time.  Returning False
+            # would hand the unquantized tensor to the normal loader, which
+            # copies it into the packed FP4 buffer and serves garbage with
+            # nothing raised, so refuse loudly instead.  Unreachable from the
+            # Qwen3.5/Qwen3.8 checkpoints the gate admits today, which use the
+            # unfused mapping; it is here for the next model that does not.
+            raise ValueError(
+                f"Quantizing the shared expert at load time supports the w1, w2 "
+                f"and w3 shards, not the pre-fused {shard_id!r}. Drop "
+                f"--enforce-shared-experts-fusion to serve this checkpoint with "
+                f"a standalone shared expert."
+            )
+
+        scale_param = (
+            self.w2_weight_scale if shard_id == "w2" else self.w13_weight_scale
+        )
+
+        fp4_weight, fp4_scale = scheme.quantize_shared_expert(
+            loaded_weight, self._load_device
+        )
+        self._load_model_weight_or_group_weight_scale(
+            shard_dim=shard_dim,
+            expert_data=weight_param.data[expert_id],
+            shard_id=shard_id,
+            loaded_weight=fp4_weight,
+        )
+        self._load_model_weight_or_group_weight_scale(
+            shard_dim=shard_dim,
+            expert_data=scale_param.data[expert_id],
+            shard_id=shard_id,
+            loaded_weight=fp4_scale,
+        )
+        return True
 
     def _maybe_load_fp8_shared_expert_as_fp4(
         self,
@@ -1302,6 +1389,15 @@ class FusedMoE(torch.nn.Module):
         if is_transposed:
             shard_dim = int(not shard_dim)
 
+        if self._maybe_load_bf16_shared_expert_as_fp4(
+            param=param,
+            loaded_weight=loaded_weight,
+            shard_id=shard_id,
+            expert_id=expert_id,
+            shard_dim=shard_dim,
+        ):
+            return
+
         if self._maybe_load_fp8_shared_expert_as_fp4(
             param=param,
             loaded_weight=loaded_weight,
@@ -1564,11 +1660,11 @@ class FusedMoE(torch.nn.Module):
 
             return forward_fuseep(self, hidden_states, topk_output)
         if is_in_tc_piecewise_cuda_graph():
-            if (
-                TopKOutputChecker.format_is_bypassed(topk_output)
-                and topk_output.expert_location_dispatch_info is not None
+            if TopKOutputChecker.format_is_bypassed(topk_output) and (
+                topk_output.expert_location_dispatch_info is not None
+                or topk_output.num_token_non_padded is not None
             ):
-                # The opaque logits-only op cannot carry placement metadata.
+                # The opaque logits-only op cannot carry padding or placement metadata.
                 return self.forward_impl(
                     hidden_states, topk_output, pre_quant_input=pre_quant_input
                 )

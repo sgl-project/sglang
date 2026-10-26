@@ -294,6 +294,17 @@ class MooncakeBaseStore:
                 "to run SGLang with MooncakeConnector."
             ) from e
 
+    def _replicate_config_supports(self, field: str) -> bool:
+        cls = getattr(self, "_replicate_config_cls", None)
+        if cls is None:
+            return False
+        if hasattr(cls, field):
+            return True
+        try:
+            return hasattr(cls(), field)
+        except Exception:
+            return False
+
     def _import_mooncake_group_semantics(self):
         try:
             from mooncake.store import ReplicateConfig
@@ -397,10 +408,14 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         self, storage_config: HiCacheStorageConfig = None, mem_pool: HostKVCache = None
     ):
         MooncakeBaseStore.__init__(self)
+        self.dcp_size = storage_config.dcp_size if storage_config is not None else 1
         MooncakeDistributedStore = self._import_mooncake_store()
         self._replicate_config_cls, self._supports_group_ids = (
             self._import_mooncake_group_semantics()
         )
+        # Mooncake builds with ReplicateConfig.session_ids publish the writing
+        # session on their stored KV events.
+        self._supports_session_ids = self._replicate_config_supports("session_ids")
         try:
             self.store = MooncakeDistributedStore()
 
@@ -445,6 +460,13 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             if storage_config is not None and storage_config.model_name:
                 model_name = "-".join(storage_config.model_name.split("/"))
                 config_prefix_parts.append(model_name)
+            if self.dcp_size > 1:
+                # DCP reuse is limited to matching topologies and logical pages.
+                config_prefix_parts.append(
+                    f"tp{storage_config.tp_size}_dcp{self.dcp_size}"
+                    f"_page{storage_config.logical_page_size}"
+                    f"_pp{storage_config.pp_size}_cp{storage_config.attn_cp_size}"
+                )
             if config_prefix_parts:
                 self.config_prefix = "_".join(config_prefix_parts)
                 logger.info(f"Using Mooncake config prefix: {self.config_prefix}")
@@ -610,6 +632,14 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             else:
                 self.mha_suffix = f"{self.local_rank}"
                 self.mla_suffix = ""
+
+            if self.dcp_size > 1:
+                # Equivalent MLA replicas share one object per DCP/CP shard.
+                # Keep PP last for cross-stage queries in _batch_exist().
+                self.mla_suffix = (
+                    f"dcp{storage_config.dcp_rank}_cp{self.attn_cp_rank}"
+                    + (f"_{self.pp_rank}" if self.enable_pp else "")
+                )
 
             self.storage_config = storage_config
             self.should_split_heads = storage_config.should_split_heads
@@ -951,7 +981,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         final_pages = restorable[-1] if restorable else 0
         return PoolTransferResult(final_pages, hit_count, restorable)
 
-    def _batch_io_v2(self, transfers: List[PoolTransfer], is_set: bool):
+    def _batch_io_v2(
+        self,
+        transfers: List[PoolTransfer],
+        is_set: bool,
+        session_id: Optional[str] = None,
+    ):
         # Expand every pool first so one logical operation becomes one Mooncake
         # RPC rather than one RPC per hybrid-cache component.
         prepared = []
@@ -1025,6 +1060,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     [all_sizes[i] for i in missing_idx],
                     self._filter_group_ids(
                         all_group_ids if all_group_ids else None, missing_idx
+                    ),
+                    session_ids=(
+                        [session_id] * len(missing_idx)
+                        if session_id and self._supports_session_ids
+                        else None
                     ),
                 )
                 for i, res in zip(missing_idx, put_results):
@@ -1106,7 +1146,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         transfers: List[PoolTransfer],
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> dict:
-        return self._batch_io_v2(transfers, is_set=True)
+        # ``extra_info.extra_info["session_id"]`` names the session that wrote the
+        # pages; Mooncake publishes it on the stored KV events.
+        session_id = (
+            (extra_info.extra_info or {}).get("session_id") if extra_info else None
+        )
+        return self._batch_io_v2(transfers, is_set=True, session_id=session_id)
 
     def _get_mha_split_heads_buffer_meta(self, keys, indices):
         ptr_list, element_size_list = (
@@ -1171,7 +1216,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
     def _batch_preprocess(self, keys, host_indices):
         assert len(keys) > 0
-        assert len(keys) == len(host_indices) // self.mem_pool_host.page_size
+        page_size = (
+            self.storage_config.logical_page_size
+            if self.dcp_size > 1
+            else self.mem_pool_host.page_size
+        )
+        assert len(keys) == len(host_indices) // page_size
         if self.is_mla_backend:
             return self._get_mla_buffer_meta(keys, host_indices)
         else:
@@ -1464,6 +1514,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         buffer_ptrs: List[Any],
         buffer_sizes: List[Any],
         group_ids: Optional[List[str]] = None,
+        session_ids: Optional[List[str]] = None,
     ) -> List[int]:
         config = None
         if self._can_use_group_semantics() and group_ids is not None:
@@ -1474,6 +1525,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 )
             config = self._replicate_config_cls()
             config.group_ids = group_ids
+        if session_ids is not None:
+            config = config or self._replicate_config_cls()
+            config.session_ids = session_ids
 
         if self._uses_multi_buffer(buffer_ptrs):
             config = config or self._replicate_config_cls()
