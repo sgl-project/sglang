@@ -33,6 +33,8 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
     supports_prefill_cuda_graph: bool = False
     # Supporting backends must handle both eager execution and decode CUDA graphs.
     supports_dp_attention: bool = False
+    # Supporting backends implement grouped_sgemm_batch_infos().
+    supports_grouped_lora: bool = False
 
     def __init__(self, max_loras_per_batch: int, device: torch.device):
         self.max_loras_per_batch = max_loras_per_batch

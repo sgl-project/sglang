@@ -208,6 +208,7 @@ class TritonLoRABackend(BaseLoRABackend):
     name = "triton"
     supports_dp_attention = True
     supports_prefill_cuda_graph = True
+    supports_grouped_lora = True
 
     def __init__(
         self,

@@ -4775,6 +4775,9 @@ class DeepseekV4ForCausalLM(nn.Module):
             )
         return len(seen)
 
+    # wo_a multiplies each head group by its own row block (apply_grouped_lora)
+    grouped_lora_modules = frozenset({"wo_a"})
+
     # the indexer, compressor and engram reuse the leaves wq_b/wkv and are not adapted
     _lora_module_pattern = re.compile(
         r"^model\.layers\.\d+\.(?:self_attn\.(?:wq_a|wq_b|wkv|wo_a|wo_b)"

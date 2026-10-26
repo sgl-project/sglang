@@ -1193,6 +1193,10 @@ class LoRAManager:
         self.lm_head_module: Optional[BaseLayerWithLoRA] = None
         # One MoE layer's worth of warning is enough; the condition is model-wide.
         warned_one_sided_moe_targets = False
+        # only models with grouped projections declare it
+        grouped_lora_modules = getattr(
+            self.base_model, "grouped_lora_modules", frozenset()
+        )
 
         # When tie_word_embeddings=True, lm_head is the same Python object as
         # embed_tokens. PyTorch's named_modules() deduplicates by object identity,
@@ -1298,6 +1302,14 @@ class LoRAManager:
                 layer_id = get_layer_id(module_name)
                 if layer_id is None:
                     continue
+                if (
+                    parts[-1] in grouped_lora_modules
+                    and not self.lora_backend.supports_grouped_lora
+                ):
+                    raise ValueError(
+                        f"{module_name} is a grouped projection; its LoRA needs "
+                        f"--lora-backend triton, not {type(self.lora_backend).__name__}"
+                    )
                 self.lora_modules[layer_id][module_name] = self.set_lora_module(
                     module_name, module
                 )
