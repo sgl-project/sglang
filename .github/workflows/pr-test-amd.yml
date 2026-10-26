@@ -160,7 +160,7 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     outputs:
-      main_package: ${{ steps.amd-relevance.outputs.main_package || steps.filter.outputs.main_package || steps.run-mode.outputs.run_all_tests }}
+      main_package: ${{ steps.filter.outputs.main_package || steps.run-mode.outputs.run_all_tests }}
       sgl_kernel: ${{ steps.filter.outputs.sgl_kernel || steps.run-mode.outputs.run_all_tests }}
       jit_kernel: ${{ steps.filter.outputs.jit_kernel || steps.run-mode.outputs.run_all_tests }}
       multimodal_gen: ${{ steps.filter.outputs.multimodal_gen || steps.run-mode.outputs.run_all_tests }}
@@ -219,7 +219,6 @@ jobs:
         uses: dorny/paths-filter@v3
         if: steps.run-mode.outputs.run_all_tests != 'true'
         with:
-          list-files: json
           filters: |
             main_package:
               - "python/sglang/!(multimodal_gen|kernels)/**/!(*.md)"
@@ -248,16 +247,6 @@ jobs:
               - "test/registered/kernels/benchmark/diffusion/**"
               - "python/pyproject_rocm.toml"
               - "python/pyproject_other.toml"
-
-      # main_package matches every file under test/, so a PR that only edits
-      # tests for other hardware used to run every AMD GPU stage. Clear it when
-      # no changed file can reach an AMD suite (see amd_test_relevance.py).
-      - name: Check whether main_package changes reach an AMD suite
-        id: amd-relevance
-        if: github.event_name == 'pull_request' && steps.filter.outputs.main_package == 'true'
-        env:
-          CHANGED_FILES: ${{ steps.filter.outputs.main_package_files }}
-        run: echo "main_package=$(python3 scripts/ci/amd/amd_test_relevance.py)" >> "$GITHUB_OUTPUT"
 
   # =============================================== extra (scheduled) ====================================================
   # Chain the label-gated AMD extra tier into the scheduled run, mirroring
