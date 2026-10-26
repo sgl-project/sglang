@@ -895,7 +895,6 @@ class HiSparseCoordinator:
             # Short sequences (seq_len <= device_buffer_size): the kernel fast path
             # returns device_buffer_locs directly without any host loading, so we
             # must preload all tokens from host pool into the device buffer
-            # TODO(hzh0425): Optimize this.
             self._preload_to_device_buffer(req)
         else:
             # Long sequence: reset device_buffer_tokens to -1 so the kernel
