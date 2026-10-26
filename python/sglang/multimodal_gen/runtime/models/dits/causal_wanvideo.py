@@ -55,7 +55,6 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
 )
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     RotaryEmbedding,
-    _apply_rotary_emb,
     get_rotary_pos_embed,
 )
 from sglang.multimodal_gen.runtime.layers.visual_embedding import PatchEmbed
@@ -75,8 +74,6 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.utils import add_prefix
 
 logger = init_logger(__name__)
-
-_is_cuda = current_platform.is_cuda()
 
 
 class CausalWanSelfAttention(nn.Module):
@@ -119,11 +116,14 @@ class CausalWanSelfAttention(nn.Module):
             ),
         )
 
+        # CUDA stays on the triton kernel: flashinfer would rebuild the cos/sin
+        # cache in every block, since no table is hoisted for it here.
         self.rotary_emb = RotaryEmbedding(
             head_size=self.head_dim,
             rotary_dim=self.head_dim,
             is_neox_style=False,
             use_precomputed_cache=False,
+            use_flashinfer=False,
         )
 
     def forward(
@@ -148,19 +148,13 @@ class CausalWanSelfAttention(nn.Module):
             complex_freqs(Tensor): Rope complex freqs, shape [L, 1, C / num_heads / 2]
         """
         cos, sin = freqs_cis
-        # CUDA stays on the triton kernel; the class's forward_cuda would switch it
-        # to flashinfer and rebuild the cos/sin cache in every block.
-        if _is_cuda:
-            query = _apply_rotary_emb(q, cos, sin, is_neox_style=False)
-            key = _apply_rotary_emb(k, cos, sin, is_neox_style=False)
-        else:
-            query, key = self.rotary_emb(
-                query=q,
-                key=k,
-                complex_freqs=complex_freqs,
-                cos=cos,
-                sin=sin,
-            )
+        query, key = self.rotary_emb(
+            query=q,
+            key=k,
+            complex_freqs=complex_freqs,
+            cos=cos,
+            sin=sin,
+        )
 
         roped_query = query.type_as(v)
         roped_key = key.type_as(v)
