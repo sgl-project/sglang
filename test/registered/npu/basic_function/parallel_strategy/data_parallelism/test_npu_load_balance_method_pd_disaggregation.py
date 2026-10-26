@@ -23,7 +23,7 @@ from sglang.test.test_utils import (
     popen_launch_pd_server,
 )
 
-register_npu_ci(est_time=3600, suite="nightly-16-npu-a3", nightly=True)
+register_npu_ci(est_time=3600, suite="nightly-4-npu-a3", nightly=True)
 
 load_balance_method_options = [
     "auto",
@@ -83,8 +83,11 @@ class BaseTestNPULoadBalanceMethodDPDisaggregation(TestDisaggregationBase):
             0.8,
             "--dist-init-addr",
             "127.0.0.1:10100",
+            # Start at card 0 so prefill uses cards 0-1 and decode (base-gpu-id 2)
+            # uses cards 2-3, i.e. the test fits a 4-card runner. It used to be 4
+            # (prefill on cards 4-5), which required >= 6 visible cards.
             "--base-gpu-id",
-            4,
+            0,
         ]
 
         cls.process_prefill = popen_launch_pd_server(
