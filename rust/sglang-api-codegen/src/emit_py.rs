@@ -81,15 +81,18 @@ def _expect_bool(v: Any, expected: str) -> bool:
     raise _invalid_type(v, expected=expected)
 
 
-def _expect_int(v: Any, expected: str) -> int:
+def _expect_int(v: Any, expected: str, *, bits: int) -> int:
     if _is_int(v):
+        limit = 1 << (bits - 1)
+        if v < -limit or v >= limit:
+            raise JsonContractError(f"invalid value: integer `{v}`, expected {expected}")
         return v
     raise _invalid_type(v, expected=expected)
 
 
-def _expect_uint(v: Any, expected: str) -> int:
+def _expect_uint(v: Any, expected: str, *, bits: int) -> int:
     if _is_int(v):
-        if v < 0:
+        if v < 0 or v >= (1 << bits):
             raise JsonContractError(f"invalid value: integer `{v}`, expected {expected}")
         return v
     raise _invalid_type(v, expected=expected)
@@ -345,17 +348,17 @@ fn field_default(kind: &FieldKind) -> String {
 /// `_expect_*(var, "expected")` validating one scalar; `expected` defaults to
 /// serde's own type name for that scalar.
 fn expect_call(ty: &ScalarTy, var: &str, expected: Option<&str>) -> String {
-    let (func, default_expected) = match ty {
-        ScalarTy::F64 => ("_expect_float", "f64"),
-        ScalarTy::I32 => ("_expect_int", "i32"),
-        ScalarTy::I64 => ("_expect_int", "i64"),
-        ScalarTy::U32 => ("_expect_uint", "u32"),
-        ScalarTy::U64 => ("_expect_uint", "u64"),
-        ScalarTy::Bool => ("_expect_bool", "a boolean"),
-        ScalarTy::Str => ("_expect_str", "a string"),
+    let (func, default_expected, width_arg) = match ty {
+        ScalarTy::F64 => ("_expect_float", "f64", ""),
+        ScalarTy::I32 => ("_expect_int", "i32", ", bits=32"),
+        ScalarTy::I64 => ("_expect_int", "i64", ", bits=64"),
+        ScalarTy::U32 => ("_expect_uint", "u32", ", bits=32"),
+        ScalarTy::U64 => ("_expect_uint", "u64", ", bits=64"),
+        ScalarTy::Bool => ("_expect_bool", "a boolean", ""),
+        ScalarTy::Str => ("_expect_str", "a string", ""),
     };
     format!(
-        "{func}({var}, expected={:?})",
+        "{func}({var}, expected={:?}{width_arg})",
         expected.unwrap_or(default_expected)
     )
 }
@@ -964,7 +967,9 @@ fn emit_untagged_codec(out: &mut String, ctx: &Ctx, m: &MessageModel, variants: 
         })
         .collect();
     let decode_expr = |a: &Arm| match &a.v.kind {
-        FieldKind::Scalar { .. } | FieldKind::OptScalar { .. } => "value".to_string(),
+        FieldKind::Scalar { ty, .. } | FieldKind::OptScalar { ty, .. } => {
+            expect_call(ty, "value", None)
+        }
         FieldKind::Message { rust_path, .. } => format!("decode_{rust_path}(value)"),
         other => panic!("{name}: untagged variant kind {other:?} unsupported"),
     };
@@ -1169,4 +1174,43 @@ fn emit_tagged_codec(
     ));
     out.push_str(&de);
     out.push_str(&en);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn integer_expect_calls_include_bit_width() {
+        for (ty, func, bits) in [
+            (ScalarTy::I32, "_expect_int", 32),
+            (ScalarTy::I64, "_expect_int", 64),
+            (ScalarTy::U32, "_expect_uint", 32),
+            (ScalarTy::U64, "_expect_uint", 64),
+        ] {
+            for expected in [None, Some("a value or an array of values")] {
+                assert_eq!(
+                    expect_call(&ty, "value", expected),
+                    format!(
+                        "{func}(value, expected={:?}, bits={bits})",
+                        expected.unwrap_or(ty.rust())
+                    ),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn other_scalar_expect_calls_have_no_bit_width() {
+        for (ty, func, expected) in [
+            (ScalarTy::F64, "_expect_float", "f64"),
+            (ScalarTy::Bool, "_expect_bool", "a boolean"),
+            (ScalarTy::Str, "_expect_str", "a string"),
+        ] {
+            assert_eq!(
+                expect_call(&ty, "value", None),
+                format!("{func}(value, expected={expected:?})"),
+            );
+        }
+    }
 }
