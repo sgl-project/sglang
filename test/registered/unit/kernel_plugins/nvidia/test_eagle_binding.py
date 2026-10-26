@@ -13,14 +13,14 @@ from unittest.mock import MagicMock, call, patch
 import msgspec
 import torch
 
+from sglang.srt.kernel_plugins.nvidia import binding as runtime
+from sglang.srt.kernel_plugins.nvidia import eagle_binding as eb
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
 )
 from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
 from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.kernel_plugins.nvidia import binding as runtime
-from sglang.srt.kernel_plugins.nvidia import eagle_binding as eb
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,

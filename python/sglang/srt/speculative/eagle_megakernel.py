@@ -10,6 +10,11 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 
 import torch
 
+from sglang.srt.kernel_plugins.nvidia.binding import (
+    megakernel_agree,
+    megakernel_enabled,
+    megakernel_entry,
+)
 from sglang.srt.kernel_plugins.nvidia.eagle_binding import (
     EagleDraftExtendIO,
     EagleDraftLoopIO,
@@ -17,11 +22,6 @@ from sglang.srt.kernel_plugins.nvidia.eagle_binding import (
     attn_step_metadata,
     kv_pool_buffers,
     split_backend,
-)
-from sglang.srt.kernel_plugins.nvidia.binding import (
-    megakernel_agree,
-    megakernel_enabled,
-    megakernel_entry,
 )
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.runtime_context import get_parallel, get_spec
