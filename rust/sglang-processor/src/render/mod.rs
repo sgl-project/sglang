@@ -55,6 +55,8 @@ pub enum ChatFormatter {
         thinking: ThinkingTemplates,
         /// SGLang hands the template content parts lists rather than strings.
         content_parts: bool,
+        /// The template renders a list's text parts back to back (Qwen-VL, Qwen3.5).
+        concatenates_text_parts: bool,
     },
     KimiK25 {
         formatter: PromptFormatter,
