@@ -2,6 +2,8 @@
 
 import functools
 
+import triton
+import triton.language as tl
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
@@ -166,7 +168,76 @@ def partial_gluon(
     gl.store(SUM + (b * NT + t) * H + hs, denom)
 
 
-# the SM100 host path (sink, combine, inverse RoPE) on the gfx950 split-KV kernel above
+@triton.jit
+def rope_tables(
+    d, FREQS, pos, freq_stride, HEAD_DIM: tl.constexpr, ROPE_DIM: tl.constexpr
+):
+    is_rope = d >= HEAD_DIM - ROPE_DIM
+    freq_index = ((d - (HEAD_DIM - ROPE_DIM)) // 2) * 2
+    cos = tl.load(FREQS + pos * freq_stride + freq_index, is_rope, 0)
+    sin = tl.load(FREQS + pos * freq_stride + freq_index + 1, is_rope, 0)
+    return cos, sin
+
+
+@triton.jit
+def inverse_rope_apply(
+    out, d, cos, sin, HEAD_DIM: tl.constexpr, ROPE_DIM: tl.constexpr
+):
+    """Rotates the rounded values, as the model's standalone RoPE kernel reads them."""
+    x = out.to(tl.float32)
+    is_rope = d >= HEAD_DIM - ROPE_DIM
+    signed = tl.where(d % 2 == 0, -x * sin, x * sin)
+    swapped = tl.reshape(tl.flip(tl.reshape(signed, (d.shape[0] // 2, 2)), 1), d.shape)
+    rotated = tl.fma(x, cos, swapped)
+    return tl.where(is_rope, rotated.to(out.dtype), out)
+
+
+@triton.jit
+def combine_gfx950(
+    PART,
+    MAX,
+    SUM,
+    SINK,
+    OUT,
+    FREQS,
+    POSITIONS,
+    FREQ_STRIDE: tl.constexpr,
+    ROPE_DIM: tl.constexpr,
+    NT: tl.constexpr,
+    ST: tl.constexpr,
+    H: tl.constexpr,
+    BD: tl.constexpr,
+):
+    b, h, tile = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    t, d = tl.arange(0, ST), tile * BD + tl.arange(0, BD)
+    # issued before the tl.max reduce: Triton does not hoist loads across it
+    sink = tl.load(SINK + h)
+    if ROPE_DIM > 0:
+        pos = tl.load(POSITIONS + b)
+        cos, sin = rope_tables(d, FREQS, pos, FREQ_STRIDE, 512, ROPE_DIM)
+    den = tl.load(SUM + (b * NT + t) * H + h, t < NT, 0)
+    mx = tl.load(MAX + (b * NT + t) * H + h, t < NT, 0)
+    mx = tl.where(den > 0, mx, -float("inf"))
+    m = tl.maximum(tl.max(mx, 0), sink)
+    m = tl.where(tl.abs(m) == float("inf"), 0.0, m)
+    factor = tl.exp(mx - m)
+    denominator = tl.sum(den * factor, 0) + tl.exp(sink - m)
+    vals = tl.load(
+        PART + ((b * NT + t[:, None]) * H + h) * 512 + d[None, :],
+        t[:, None] < NT,
+        0,
+    )
+    out = tl.sum(vals * factor[:, None], 0) / denominator
+    out = tl.where((denominator > 0) & (sink != float("inf")), out, 0.0)
+    out = out.to(OUT.dtype.element_ty)
+    if ROPE_DIM > 0:
+        out = inverse_rope_apply(out, d, cos, sin, 512, ROPE_DIM)
+    tl.store(OUT + (b * H + h) * 512 + d, out)
+
+
 swapab_attention = functools.partial(
-    _swapab_attention, partial_gluon=partial_gluon, block=32
+    _swapab_attention,
+    partial_gluon=partial_gluon,
+    combine=combine_gfx950,
+    block=32,
 )
