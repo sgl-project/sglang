@@ -108,6 +108,8 @@ class NpuExpertDistributionGatherer(distribution._SelectExpertsSinglePassGathere
 
     def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor) -> None:
         count = topk_ids.numel()
+        if count == 0:
+            return
         start = self._route_offsets[layer_idx]
         end = start + count
         if end > self._batched_routes.shape[1]:
@@ -115,8 +117,7 @@ class NpuExpertDistributionGatherer(distribution._SelectExpertsSinglePassGathere
             return super().on_select_experts(layer_idx, topk_ids)
         self._batched_routes[layer_idx, start:end].copy_(topk_ids.flatten())
         self._route_offsets[layer_idx] = end
-        if count:
-            self._has_batched_routes = True
+        self._has_batched_routes = True
 
     def collect(self):
         if self._has_batched_routes and not self._batch_collected:

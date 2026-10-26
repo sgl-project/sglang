@@ -14,6 +14,8 @@ Before migrating a chunk, NPU validates corresponding tensor counts, shapes,
 dtypes, devices, and staging requirements. Ordinary tensors bypass ND staging;
 unchanged local placements still participate in sends but skip ND writeback.
 Workspaces are reused within a chunk and are not cached between rebalances.
+NPU target forwards skip the draft guard's device lookup, and empty route
+tensors return before creating a buffer view or issuing a copy.
 
 Six production files differ from the base: three NPU files and the shared
 recorder factory, weight updater, and ModelRunner entry points. The shared
