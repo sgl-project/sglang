@@ -14,7 +14,7 @@ if TYPE_CHECKING:
 
 import logging
 
-from sglang.srt.hardware_backend.npu.moe import dispatch as ascend_dispatch
+from sglang.srt.hardware_backend.npu.moe import standard_dispatch as ascend_dispatch
 from sglang.srt.hardware_backend.npu.moe.matmul import (
     GroupedMatmul,
     GroupedMatmulSwigluQuant,
