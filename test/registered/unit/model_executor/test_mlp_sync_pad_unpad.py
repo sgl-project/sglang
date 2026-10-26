@@ -238,6 +238,30 @@ class TestMlpSyncPadUnpad(CustomTestCase):
         # Seeded sampling asserts positions rows == sampled (real) rows.
         self.assertEqual(fb.positions.shape[0], fb.batch_size)
 
+    def test_tbo_decode_child_pads_its_requests_with_its_tokens(self):
+        """An extend child keeps its requests."""
+        for mode, bs in ((ForwardMode.DECODE, 2), (ForwardMode.EXTEND, 1)):
+            with self.subTest(mode=mode):
+                fb = ForwardBatch(
+                    forward_mode=mode,
+                    batch_size=1,
+                    input_ids=torch.tensor([11]),
+                    req_pool_indices=torch.tensor([5]),
+                    seq_lens=torch.tensor([7]),
+                    out_cache_loc=torch.tensor([3]),
+                    seq_lens_sum=7,
+                    positions=torch.tensor([6]),
+                    seq_lens_cpu=torch.tensor([7]),
+                )
+                fb.tbo_padded_len = 2
+                fb._pad_tbo_child_inputs(_mock_model_runner())
+
+                self.assertEqual(fb.input_ids.shape[0], 2)
+                self.assertEqual(fb.out_cache_loc.shape[0], 2)
+                self.assertEqual(fb.batch_size, bs)
+                self.assertEqual(fb.req_pool_indices.shape[0], bs)
+                self.assertEqual(fb.seq_lens.shape[0], bs)
+
     def test_extend_post_forward_unpads_positions(self):
         fb = ForwardBatch(
             forward_mode=ForwardMode.EXTEND,
