@@ -43,6 +43,7 @@ from sglang.srt.mem_cache.kv.layout.base import (
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
+from sglang.srt.mem_cache.kv.state_storage import StateStorage
 from sglang.srt.mem_cache.kv_vmm_backing import KvVmmBufferOwner
 from sglang.srt.mem_cache.layout.fused_draft import (
     DraftStateRegion,
@@ -1144,6 +1145,7 @@ class UnifiedHybridReqToTokenPool(HybridReqToTokenPool):
             )
         from sglang.srt.mem_cache.ple_state_pool import NGramPool, ShortConvPool
 
+        self.state = StateStorage.empty(self.state_sub_pool)
         self.short_conv_pool = ShortConvPool(
             size=0,
             state_shape=None,
@@ -1206,6 +1208,12 @@ class UnifiedHybridReqToTokenPool(HybridReqToTokenPool):
         from sglang.srt.mem_cache.unified_draft_pool import UnifiedDraftMambaPool
 
         clone = copy.copy(self)
+        # The clone's own storage: assigning through the shared one would
+        # rebind the target's.
+        clone.state = StateStorage.empty(self.state_sub_pool)
+        clone.mamba_allocator = self.mamba_allocator
+        clone.short_conv_pool = self.short_conv_pool
+        clone.ngram_pool = self.ngram_pool
         clone.mamba_pool = UnifiedDraftMambaPool(
             unified_buffer=self._unified_buffer,
             sub_pool_name=self.state_sub_pool,

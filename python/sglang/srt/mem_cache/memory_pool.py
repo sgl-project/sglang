@@ -68,7 +68,8 @@ from sglang.srt.mem_cache.allocation_sizing import get_mamba_tracking_slots
 from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
 from sglang.srt.mem_cache.index_key_cache import IndexKeyCache
 from sglang.srt.mem_cache.kv.memory.views import MHAKVView, MLAKVView
-from sglang.srt.mem_cache.kv.router import STATE_PART, KVLayerRouter, PlainPoolRouter
+from sglang.srt.mem_cache.kv.router import KVLayerRouter, PlainPoolRouter
+from sglang.srt.mem_cache.kv.state_storage import StateStorage
 from sglang.srt.mem_cache.kv_loc_plan import IdSpace, IdSpaceKind
 from sglang.srt.mem_cache.kv_vmm_backing import KvVmmBufferOwner
 from sglang.srt.mem_cache.layout.token_major import (
@@ -99,7 +100,6 @@ from sglang.srt.utils import (
 from sglang.srt.utils.async_probe import (
     maybe_detect_oob,
 )
-from sglang.srt.utils.common import async_h2d
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if TYPE_CHECKING:
@@ -1452,6 +1452,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         ngram_context_len: int = 0,
         ngram_eos_token_id: int = 0,
     ):
+        self.state = StateStorage.empty(self.state_sub_pool)
         self.mamba_pool = self.mamba_pool_cls(
             size=mamba_size,
             spec_state_size=mamba_spec_state_size,
@@ -1574,37 +1575,58 @@ class HybridReqToTokenPool(ReqToTokenPool):
             )
         return clone
 
-    def bind_state_routes(self, router: KVLayerRouter) -> None:
-        """Routes this table's state layers through the KV pool's router, which
-        owns the layer-wise load-back wait: the recurrent state, and the PLE
-        side states when the model has them. The N-gram context is read once
-        before the layer loop and restored with the first state layer, so it
-        is routed there."""
-        from sglang.srt.mem_cache.ple_state_pool import NGRAM_PART, SHORT_CONV_PART
+    # The state storage, under the names its callers still read through the
+    # table.
+    @property
+    def mamba_pool(self):
+        return self.state.pool
 
-        router.bind_part(
-            sub_pool=self.state_sub_pool,
-            part=STATE_PART,
-            view=self.mamba_pool,
-            indices=self.mamba_map,
-        )
-        if self.short_conv_pool.enabled:
-            router.bind_part(
-                sub_pool=self.state_sub_pool,
-                part=SHORT_CONV_PART,
-                view=self.short_conv_pool,
-                indices=self.short_conv_pool.layer_map,
-                view_layer_ids={
-                    layer_id: layer_id for layer_id in self.short_conv_pool.layer_map
-                },
-            )
-        if self.ngram_pool.enabled:
-            router.bind_part(
-                sub_pool=self.state_sub_pool,
-                part=NGRAM_PART,
-                view=self.ngram_pool,
-                indices={min(self.mamba_map): 0} if self.mamba_map else {},
-            )
+    @mamba_pool.setter
+    def mamba_pool(self, value) -> None:
+        self.state.pool = value
+
+    @property
+    def mamba_allocator(self):
+        return self.state.slots
+
+    @mamba_allocator.setter
+    def mamba_allocator(self, value) -> None:
+        self.state.slots = value
+
+    @property
+    def mamba_map(self) -> Dict[int, int]:
+        return self.state.layer_map
+
+    @mamba_map.setter
+    def mamba_map(self, value: Dict[int, int]) -> None:
+        self.state.layer_map = value
+
+    @property
+    def short_conv_pool(self):
+        return self.state.short_conv_pool
+
+    @short_conv_pool.setter
+    def short_conv_pool(self, value) -> None:
+        self.state.short_conv_pool = value
+
+    @property
+    def ngram_pool(self):
+        return self.state.ngram_pool
+
+    @ngram_pool.setter
+    def ngram_pool(self, value) -> None:
+        self.state.ngram_pool = value
+
+    @property
+    def mamba_ckpt_pool(self):
+        return self.state.ckpt_pool
+
+    @mamba_ckpt_pool.setter
+    def mamba_ckpt_pool(self, value) -> None:
+        self.state.ckpt_pool = value
+
+    def bind_state_routes(self, router: KVLayerRouter) -> None:
+        self.state.bind_routes(router)
 
     # For chunk prefill req, we do not need to allocate mamba cache,
     # We could use allocated mamba cache instead.
@@ -1614,60 +1636,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         if select_index is None:
             return None
 
-        spec_write_pos = self.mamba_pool.replayssm_spec_write_pos
-        if spec_write_pos is not None:
-            fresh_indices = [
-                idx for idx, fresh in zip(select_index, fresh_req_rows) if fresh
-            ]
-            if fresh_indices:
-                fresh_rows = async_h2d(
-                    fresh_indices, dtype=torch.int64, device=self.device
-                )
-                spec_write_pos.index_fill_(0, fresh_rows, 0)
-                self.mamba_pool.replayssm_cache_base.index_fill_(0, fresh_rows, 0)
-                self.mamba_pool.replayssm_is_flush.index_fill_(0, fresh_rows, 0)
-
-        mamba_indices: list[torch.Tensor] = []
-        mamba_ping_pong_track_buffers: list[torch.Tensor] = []
-        for req in reqs:
-            if req.kv.holds_mamba:  # for radix cache / continuing chunked
-                pass
-            else:
-                mid = self.mamba_allocator.alloc(1)
-                assert mid is not None, (
-                    f"Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size. {mid=}, {self.mamba_pool.size=}, {self.mamba_allocator.available_size()=}, {len(reqs)=}"
-                )
-                req.kv.mamba_pool_idx = mid[0]
-                req.kv.mamba_needs_clear = True
-                # GDN ReplaySSM: a freshly (re)assigned slot starts an empty
-                # ring. write_pos=0 means "ring empty", so the decode kernel
-                # ignores ring contents and reads only the checkpoint state
-                # (the post-prefill state that prefill wrote into this slot).
-                if self.mamba_pool.replayssm_write_pos is not None:
-                    self.mamba_pool.replayssm_write_pos[req.kv.mamba_pool_idx] = 0
-            mamba_indices.append(req.kv.mamba_pool_idx)
-            if self.enable_mamba_extra_buffer:
-                if req.kv.mamba_ping_pong_track_buffer is None:
-                    self._alloc_ping_pong_buffer(req)
-                mamba_ping_pong_track_buffers.append(
-                    req.kv.mamba_ping_pong_track_buffer
-                )
-        assert len(select_index) == len(mamba_indices), (
-            "Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size."
-        )
-        if self.enable_mamba_extra_buffer:
-            assert len(select_index) == len(mamba_ping_pong_track_buffers), (
-                "Not enough space for mamba ping pong idx, try to increase --mamba-full-memory-ratio."
-            )
-        # Device rows: indexing a device tensor with a Python list syncs the host.
-        rows = async_h2d(select_index, dtype=torch.int64, device=self.device)
-        mamba_index_tensor = torch.stack(mamba_indices).to(dtype=torch.int32)
-        self.req_index_to_mamba_index_mapping[rows] = mamba_index_tensor
-        if self.enable_mamba_extra_buffer:
-            ping_pong_tensor = torch.stack(mamba_ping_pong_track_buffers)
-            self.req_index_to_mamba_ping_pong_track_buffer_mapping[rows] = (
-                ping_pong_tensor
-            )
+        self.state.acquire(self, reqs, select_index, fresh_req_rows)
         return select_index
 
     def get_mamba_indices(self, req_indices: torch.Tensor) -> torch.Tensor:
@@ -1693,9 +1662,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
     def copy_mamba_state(
         self, src_index: torch.Tensor, dst_index: torch.Tensor
     ) -> None:
-        if src_index.numel() == 0:
-            return
-        self.mamba_pool.copy_from(src_index, dst_index)
+        self.state.copy(src_index, dst_index)
 
     def get_speculative_mamba2_params_all_layers(self) -> MambaPool.SpeculativeState:
         return self.mamba_pool.get_speculative_mamba2_params_all_layers()
@@ -1723,35 +1690,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         return req.kv.mamba_last_track_idx
 
     def _alloc_ping_pong_buffer(self, req: Req):
-        """Allocate the ping-pong track buffer for a new request.
-
-        Lazy mode allocates 1 slot with the second set to -1 (allocated
-        on demand at track boundaries). Normal mode allocates all slots upfront.
-        """
-        n = self.mamba_initial_tracking_slots
-        slots = self.mamba_allocator.alloc(n)
-        assert slots is not None, (
-            "Not enough space for mamba ping pong idx, "
-            "try to increase --mamba-full-memory-ratio."
-        )
-        buf = torch.full(
-            (self.mamba_ping_pong_track_buffer_size,),
-            -1,
-            dtype=slots.dtype,
-            device=slots.device,
-        )
-        buf[:n] = slots
-        req.kv.mamba_ping_pong_track_buffer = buf
-        req.kv.mamba_ping_pong_empty = [False] * n + [True] * (
-            self.mamba_ping_pong_track_buffer_size - n
-        )
-        req.kv.mamba_prev_track_seqlen = None
-        req.kv.mamba_next_track_idx = 0
-        req.kv.mamba_last_track_idx = (
-            0
-            if self.enable_mamba_extra_buffer_lazy
-            else self.get_mamba_ping_pong_other_idx(0)
-        )
+        self.state.alloc_ping_pong_buffer(self, req)
 
     def set_mamba_ping_pong_slot(self, req: Req, idx: int, value):
         """Update a ping-pong slot value and sync the device-side mapping.
@@ -1798,52 +1737,12 @@ class HybridReqToTokenPool(ReqToTokenPool):
     def free_mamba_cache(
         self, req: Req, mamba_ping_pong_track_buffer_to_keep: Optional[int] = None
     ):
-        mamba_index = req.kv.mamba_pool_idx
-        assert mamba_index is not None, "double free? mamba_index is None"
-        self.mamba_allocator.free(mamba_index.unsqueeze(0))
-        req.kv.mamba_pool_idx = None
-
-        if self.enable_mamba_extra_buffer:
-            size = self.mamba_ping_pong_track_buffer_size
-            keep = mamba_ping_pong_track_buffer_to_keep
-            assert keep in (None, 0, 1) and (keep != 1 or size == 2), (
-                f"cannot keep ping-pong entry {keep} of {size}"
-            )
-            empty = req.kv.mamba_ping_pong_empty
-            positions = [p for p in range(size) if p != keep and not empty[p]]
-            row = self.req_index_to_mamba_ping_pong_track_buffer_mapping[
-                req.kv.req_pool_idx
-            ]
-            if len(positions) == size:
-                self.mamba_allocator.free(row)
-            else:
-                for p in positions:
-                    self.mamba_allocator.free(row[p : p + 1])
-            # Match the req.kv.mamba_pool_idx=None clear above so the next
-            # alloc() doesn't see a stale ping-pong reference on the req
-            # and skip allocation (which would silently reuse a freed
-            # tensor on the req side while the new pool slot leaks).
-            req.kv.mamba_ping_pong_track_buffer = None
-            req.kv.mamba_ping_pong_empty = None
-            req.kv.mamba_next_track_idx = None
-            req.kv.mamba_last_track_idx = None
-            req.kv.mamba_last_track_seqlen = None
-            req.kv.mamba_prev_track_seqlen = None
-            req.kv.mamba_cow_src_index = None
-            req.kv.mamba_needs_clear = False
+        self.state.release(self, req, mamba_ping_pong_track_buffer_to_keep)
 
     def clear(self):
         logger.info("Reset HybridReqToTokenPool")
         super().clear()
-        self.mamba_allocator.clear()
-        self.short_conv_pool.clear()
-        self.ngram_pool.clear()
-        # The int8 checkpoint pool holds radix-cached states in its own slots; a
-        # flush/reset drops the radix tree, so its slots must be released too,
-        # otherwise the (now unreferenced) slots leak and break the int8-pool
-        # invariant (int8_available + radix_cached != int8_total).
-        if self.mamba_ckpt_pool is not None:
-            self.mamba_ckpt_pool.clear()
+        self.state.clear()
         self.req_index_to_mamba_index_mapping.zero_()
         if self.enable_mamba_extra_buffer:
             self.req_index_to_mamba_ping_pong_track_buffer_mapping.zero_()

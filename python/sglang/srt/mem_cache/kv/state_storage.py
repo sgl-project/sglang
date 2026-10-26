@@ -1,0 +1,243 @@
+"""A request's recurrent state: the state sub-pool's storage and its slots.
+
+The storage (the state pool, the PLE side states, the int8 checkpoint pool),
+the slot allocator and the layer map live here; the request table holds only
+the slot ids, in its mapping columns. The slot operations of a request's
+lifecycle (take slots for new rows, the ping-pong tracking slots, give them
+back) take the table whose columns they write.
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Dict, List, Optional
+
+import torch
+
+from sglang.srt.mem_cache.kv.router import STATE_PART, KVLayerRouter
+from sglang.srt.utils.common import async_h2d
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import Req
+
+
+class StateStorage:
+    """The state sub-pool's storage, its slot allocator and its layer map."""
+
+    def __init__(
+        self,
+        *,
+        sub_pool: str,
+        pool,
+        slots,
+        layer_map: Dict[int, int],
+        short_conv_pool,
+        ngram_pool,
+        ckpt_pool=None,
+    ):
+        self.sub_pool = sub_pool
+        self.pool = pool
+        # The slot allocator: alloc/free and capacity of the state slots. The
+        # unified builder installs it once the chain allocator exists.
+        self.slots = slots
+        self.layer_map = layer_map
+        self.short_conv_pool = short_conv_pool
+        self.ngram_pool = ngram_pool
+        self.ckpt_pool = ckpt_pool
+
+    @classmethod
+    def empty(cls, sub_pool: str) -> StateStorage:
+        """Storage whose parts are filled in as they are built."""
+        return cls(
+            sub_pool=sub_pool,
+            pool=None,
+            slots=None,
+            layer_map={},
+            short_conv_pool=None,
+            ngram_pool=None,
+        )
+
+    # -- routes --
+
+    def bind_routes(self, router: KVLayerRouter) -> None:
+        """Routes the state layers through the KV pool's router, which owns the
+        layer-wise load-back wait: the recurrent state, and the PLE side states
+        when the model has them. The N-gram context is read once before the
+        layer loop and restored with the first state layer, so it is routed
+        there."""
+        from sglang.srt.mem_cache.ple_state_pool import NGRAM_PART, SHORT_CONV_PART
+
+        router.bind_part(
+            sub_pool=self.sub_pool,
+            part=STATE_PART,
+            view=self.pool,
+            indices=self.layer_map,
+        )
+        if self.short_conv_pool.enabled:
+            router.bind_part(
+                sub_pool=self.sub_pool,
+                part=SHORT_CONV_PART,
+                view=self.short_conv_pool,
+                indices=self.short_conv_pool.layer_map,
+                view_layer_ids={
+                    layer_id: layer_id for layer_id in self.short_conv_pool.layer_map
+                },
+            )
+        if self.ngram_pool.enabled:
+            router.bind_part(
+                sub_pool=self.sub_pool,
+                part=NGRAM_PART,
+                view=self.ngram_pool,
+                indices={min(self.layer_map): 0} if self.layer_map else {},
+            )
+
+    # -- slot lifecycle --
+
+    def acquire(
+        self, table, reqs: List[Req], rows: List[int], fresh_rows: List[bool]
+    ) -> None:
+        """Gives each request of newly bound ``rows`` its state slot and, with
+        the extra buffer, its ping-pong tracking slots, and writes them into
+        the table's columns. A request that already holds a slot (a radix hit,
+        a continuing chunk) keeps it. ``fresh_rows`` marks rows the requests
+        did not hold before: their speculative ReplaySSM cursors restart."""
+        spec_write_pos = self.pool.replayssm_spec_write_pos
+        if spec_write_pos is not None:
+            fresh_indices = [idx for idx, fresh in zip(rows, fresh_rows) if fresh]
+            if fresh_indices:
+                fresh = async_h2d(fresh_indices, dtype=torch.int64, device=table.device)
+                spec_write_pos.index_fill_(0, fresh, 0)
+                self.pool.replayssm_cache_base.index_fill_(0, fresh, 0)
+                self.pool.replayssm_is_flush.index_fill_(0, fresh, 0)
+
+        mamba_indices: list[torch.Tensor] = []
+        mamba_ping_pong_track_buffers: list[torch.Tensor] = []
+        for req in reqs:
+            if req.kv.holds_mamba:  # for radix cache / continuing chunked
+                pass
+            else:
+                mid = self.slots.alloc(1)
+                assert mid is not None, (
+                    f"Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size. {mid=}, {self.pool.size=}, {self.slots.available_size()=}, {len(reqs)=}"
+                )
+                req.kv.mamba_pool_idx = mid[0]
+                req.kv.mamba_needs_clear = True
+                # GDN ReplaySSM: a freshly (re)assigned slot starts an empty
+                # ring. write_pos=0 means "ring empty", so the decode kernel
+                # ignores ring contents and reads only the checkpoint state
+                # (the post-prefill state that prefill wrote into this slot).
+                if self.pool.replayssm_write_pos is not None:
+                    self.pool.replayssm_write_pos[req.kv.mamba_pool_idx] = 0
+            mamba_indices.append(req.kv.mamba_pool_idx)
+            if table.enable_mamba_extra_buffer:
+                if req.kv.mamba_ping_pong_track_buffer is None:
+                    self.alloc_ping_pong_buffer(table, req)
+                mamba_ping_pong_track_buffers.append(
+                    req.kv.mamba_ping_pong_track_buffer
+                )
+        assert len(rows) == len(mamba_indices), (
+            "Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size."
+        )
+        if table.enable_mamba_extra_buffer:
+            assert len(rows) == len(mamba_ping_pong_track_buffers), (
+                "Not enough space for mamba ping pong idx, try to increase --mamba-full-memory-ratio."
+            )
+        # Device rows: indexing a device tensor with a Python list syncs the host.
+        row_ids = async_h2d(rows, dtype=torch.int64, device=table.device)
+        mamba_index_tensor = torch.stack(mamba_indices).to(dtype=torch.int32)
+        table.req_index_to_mamba_index_mapping[row_ids] = mamba_index_tensor
+        if table.enable_mamba_extra_buffer:
+            ping_pong_tensor = torch.stack(mamba_ping_pong_track_buffers)
+            table.req_index_to_mamba_ping_pong_track_buffer_mapping[row_ids] = (
+                ping_pong_tensor
+            )
+
+    def alloc_ping_pong_buffer(self, table, req: Req) -> None:
+        """Allocate the ping-pong track buffer for a new request.
+
+        Lazy mode allocates 1 slot with the second set to -1 (allocated
+        on demand at track boundaries). Normal mode allocates all slots upfront.
+        """
+        n = table.mamba_initial_tracking_slots
+        slots = self.slots.alloc(n)
+        assert slots is not None, (
+            "Not enough space for mamba ping pong idx, "
+            "try to increase --mamba-full-memory-ratio."
+        )
+        buf = torch.full(
+            (table.mamba_ping_pong_track_buffer_size,),
+            -1,
+            dtype=slots.dtype,
+            device=slots.device,
+        )
+        buf[:n] = slots
+        req.kv.mamba_ping_pong_track_buffer = buf
+        req.kv.mamba_ping_pong_empty = [False] * n + [True] * (
+            table.mamba_ping_pong_track_buffer_size - n
+        )
+        req.kv.mamba_prev_track_seqlen = None
+        req.kv.mamba_next_track_idx = 0
+        req.kv.mamba_last_track_idx = (
+            0
+            if table.enable_mamba_extra_buffer_lazy
+            else table.get_mamba_ping_pong_other_idx(0)
+        )
+
+    def release(
+        self,
+        table,
+        req: Req,
+        mamba_ping_pong_track_buffer_to_keep: Optional[int] = None,
+    ) -> None:
+        """Gives back the request's state slot and its ping-pong slots, except
+        the one kept for the radix cache."""
+        mamba_index = req.kv.mamba_pool_idx
+        assert mamba_index is not None, "double free? mamba_index is None"
+        self.slots.free(mamba_index.unsqueeze(0))
+        req.kv.mamba_pool_idx = None
+
+        if table.enable_mamba_extra_buffer:
+            size = table.mamba_ping_pong_track_buffer_size
+            keep = mamba_ping_pong_track_buffer_to_keep
+            assert keep in (None, 0, 1) and (keep != 1 or size == 2), (
+                f"cannot keep ping-pong entry {keep} of {size}"
+            )
+            empty = req.kv.mamba_ping_pong_empty
+            positions = [p for p in range(size) if p != keep and not empty[p]]
+            row = table.req_index_to_mamba_ping_pong_track_buffer_mapping[
+                req.kv.req_pool_idx
+            ]
+            if len(positions) == size:
+                self.slots.free(row)
+            else:
+                for p in positions:
+                    self.slots.free(row[p : p + 1])
+            # Match the req.kv.mamba_pool_idx=None clear above so the next
+            # acquire doesn't see a stale ping-pong reference on the req
+            # and skip allocation (which would silently reuse a freed
+            # tensor on the req side while the new pool slot leaks).
+            req.kv.mamba_ping_pong_track_buffer = None
+            req.kv.mamba_ping_pong_empty = None
+            req.kv.mamba_next_track_idx = None
+            req.kv.mamba_last_track_idx = None
+            req.kv.mamba_last_track_seqlen = None
+            req.kv.mamba_prev_track_seqlen = None
+            req.kv.mamba_cow_src_index = None
+            req.kv.mamba_needs_clear = False
+
+    def clear(self) -> None:
+        self.slots.clear()
+        self.short_conv_pool.clear()
+        self.ngram_pool.clear()
+        # The int8 checkpoint pool holds radix-cached states in its own slots; a
+        # flush/reset drops the radix tree, so its slots must be released too,
+        # otherwise the (now unreferenced) slots leak and break the int8-pool
+        # invariant (int8_available + radix_cached != int8_total).
+        if self.ckpt_pool is not None:
+            self.ckpt_pool.clear()
+
+    # -- state operations --
+
+    def copy(self, src_index: torch.Tensor, dst_index: torch.Tensor) -> None:
+        if src_index.numel() == 0:
+            return
+        self.pool.copy_from(src_index, dst_index)
