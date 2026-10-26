@@ -75,7 +75,9 @@ class TestHiCacheAutoSize(CustomTestCase):
         params = CacheInitParams(
             disable=False,
             req_to_token_pool=None,
-            token_to_kv_pool_allocator=Mock(get_kvcache=Mock(return_value=target)),
+            token_to_kv_pool_allocator=Mock(
+                get_kvcache=Mock(return_value=target), storage=None
+            ),
             page_size=2,
         )
         for draft, expected_sidecar_bytes in (
@@ -129,7 +131,9 @@ class TestHiCacheAutoSize(CustomTestCase):
         params = CacheInitParams(
             disable=False,
             req_to_token_pool=None,
-            token_to_kv_pool_allocator=Mock(get_kvcache=Mock(return_value=target)),
+            token_to_kv_pool_allocator=Mock(
+                get_kvcache=Mock(return_value=target), storage=None
+            ),
             page_size=2,
         )
         self.assertEqual(sizing._estimate_hicache_bytes(params, None), 4096 + 1024)
@@ -150,7 +154,9 @@ class TestHiCacheAutoSize(CustomTestCase):
         params = CacheInitParams(
             disable=False,
             req_to_token_pool=None,
-            token_to_kv_pool_allocator=Mock(get_kvcache=Mock(return_value=pool)),
+            token_to_kv_pool_allocator=Mock(
+                get_kvcache=Mock(return_value=pool), storage=None
+            ),
             page_size=2,
         )
         rank_budget = 10_000

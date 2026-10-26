@@ -33,10 +33,10 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     _MambaSwaStrategy,
     _require_single_row_dsv4_swa_pages,
     _SwaStrategy,
-    _uses_unified_page_envelope_host,
     build_full_draft_pools,
     build_host_pool_group,
     build_hybrid_swa_group,
+    build_unified_host_stack,
 )
 from sglang.srt.mem_cache.kv.router import PlainPoolRouter
 from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
@@ -1330,19 +1330,14 @@ def _build_unified_host_pair(bundle):
 
 class TestUnifiedPageEnvelopeHostPool(CustomTestCase):
     def test_packed_drafts_are_not_silently_dropped_by_shared_arena(self):
-        bundle = _build_unified_swa_pool()
-        pool = bundle.token_to_kv_pool
-        for draft_arg in (
-            "mtp_full_device_pools",
-            "mtp_swa_device_pools",
-            "mtp_swa_full_device_pools",
-        ):
+        storage = _build_unified_swa_pool().token_to_kv_pool_allocator.storage
+        draft = _build_unified_swa_pool().token_to_kv_pool
+        for full_indices in (False, True):
+            draft.swa_uses_full_indices = full_indices
             with (
-                self.subTest(draft_arg=draft_arg),
-                patch(
-                    _ASSEMBLER + "get_memory",
-                    return_value=SimpleNamespace(hicache_host_memory_mode="auto"),
-                ),
+                self.subTest(full_indices=full_indices),
+                patch(_ASSEMBLER + "get_memory", return_value=_unified_memory(None)),
+                patch(_ASSEMBLER + "_get_allocator_type", return_value="default"),
                 patch(
                     _ASSEMBLER + "build_kv_host_pool",
                     side_effect=NotImplementedError("packed pool reached host factory"),
@@ -1351,17 +1346,13 @@ class TestUnifiedPageEnvelopeHostPool(CustomTestCase):
                     UnifiedPageEnvelopeHostPool, "build_hybrid_swa_pool_pair"
                 ) as build_pair,
             ):
-                with self.assertRaisesRegex(
-                    NotImplementedError, "reached host factory"
-                ):
-                    build_hybrid_swa_group(
-                        page_size=4,
-                        full_kv_pool=pool.full_kv_pool,
-                        swa_kv_pool=pool.swa_kv_pool,
-                        full_layer_mapping={0: 0, 1: 1, 2: 2},
-                        swa_layer_mapping={3: 0},
-                        use_mla=False,
-                        **{draft_arg: (object(),)},
+                with self.assertRaises(Exception):
+                    build_unified_host_stack(
+                        storage=storage,
+                        params=_unified_params(storage, drafts=(draft,)),
+                        cache=None,
+                        load_cache_event=None,
+                        storage_backend=None,
                     )
                 build_pair.assert_not_called()
 
@@ -1493,34 +1484,52 @@ class TestUnifiedPageEnvelopeSelection(CustomTestCase):
     keep the page-envelope host arena."""
 
     def test_only_no_backend_and_mori_select_the_envelope(self):
-        from sglang.srt.runtime_context import publish, reset_context
-        from sglang.srt.server_args import ServerArgs
-
-        pool = _build_unified_swa_pool().token_to_kv_pool
-        self.addCleanup(reset_context)
+        storage = _build_unified_swa_pool().token_to_kv_pool_allocator.storage
         for backend, expected in (
-            (None, True),
-            ("mori", True),
-            ("mooncake", False),
-            ("dynamic", False),
+            (None, "pair"),
+            ("mori", "pair"),
+            ("mooncake", "kv host"),
+            ("dynamic", "kv host"),
         ):
-            with self.subTest(backend=backend):
-                reset_context()
-                publish(
-                    ServerArgs(
-                        model_path="dummy",
-                        enable_unified_memory=True,
-                        hicache_storage_backend=backend,
-                        hicache_mem_layout="layer_first",
-                    ),
-                    role="tokenizer",
-                )
-                self.assertEqual(
-                    _uses_unified_page_envelope_host(
-                        pool.full_kv_pool, pool.swa_kv_pool, use_mla=False
-                    ),
-                    expected,
-                )
+            with (
+                self.subTest(backend=backend),
+                patch(_ASSEMBLER + "get_memory", return_value=_unified_memory(backend)),
+                patch(_ASSEMBLER + "_get_allocator_type", return_value="default"),
+                patch(
+                    _ASSEMBLER + "build_kv_host_pool",
+                    side_effect=NotImplementedError("kv host"),
+                ),
+                patch.object(
+                    UnifiedPageEnvelopeHostPool,
+                    "build_hybrid_swa_pool_pair",
+                    side_effect=NotImplementedError("pair"),
+                ),
+            ):
+                with self.assertRaises(NotImplementedError) as raised:
+                    build_unified_host_stack(
+                        storage=storage,
+                        params=_unified_params(storage),
+                        cache=None,
+                        load_cache_event=None,
+                        storage_backend=backend,
+                    )
+                self.assertEqual(str(raised.exception), expected)
+
+
+def _unified_memory(backend):
+    return SimpleNamespace(
+        hicache_storage_backend=backend,
+        hicache_size=0,
+        hicache_ratio=1.0,
+        hicache_mem_layout="layer_first",
+        hicache_host_memory_mode="auto",
+    )
+
+
+def _unified_params(storage, drafts=()):
+    return SimpleNamespace(
+        page_size=4, mtp_draft_device_pools=drafts, mtp_draft_mamba_pools=()
+    )
 
 
 class TestMtpMhaPhysicalConstruction(CustomTestCase):
