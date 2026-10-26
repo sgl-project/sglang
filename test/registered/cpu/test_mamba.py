@@ -404,15 +404,10 @@ def test_chunk_gated_delta_rule(B, T_PER_SEQ, HK, HV, K, V, POOL_SIZE):
 )
 def test_chunk_kda(dtype, dim, lower_bound):
     tokens, heads, value_heads = 146, 2, 4
-    q, k = [
-        torch.randn(1, tokens, heads, dim).to(dtype)
-        for _ in range(2)
-    ]
+    q, k = [torch.randn(1, tokens, heads, dim).to(dtype) for _ in range(2)]
     v = torch.randn(1, tokens, value_heads, dim).to(dtype) * 0.1
     raw_gate = torch.randn(v.shape).to(dtype) * 0.35
-    beta = torch.randn(1, tokens, value_heads + 3).to(dtype)[
-        ..., :value_heads
-    ]
+    beta = torch.randn(1, tokens, value_heads + 3).to(dtype)[..., :value_heads]
     a_log = torch.randn(value_heads) * 0.2 - 1.2
     bias = torch.randn(value_heads * dim) * 0.1
     backing = torch.full((5, value_heads, dim, dim + 8), float("nan"))
