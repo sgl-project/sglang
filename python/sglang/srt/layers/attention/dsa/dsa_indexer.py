@@ -1903,6 +1903,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             x, q_lora, positions, forward_batch, layer_id, return_indices
         )
 
+    @property
+    def topk_output_width(self):
+        return self.index_topk
+
     def forward_cuda(
         self,
         x: torch.Tensor,
@@ -1911,6 +1915,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         forward_batch: ForwardBatch,
         layer_id: int,
         return_indices: bool = True,
+        use_cuda_graph: bool = True,
     ) -> Optional[torch.Tensor]:
         # A padded eager IDLE rank has no real requests and therefore no valid
         # DSA page-table rows to index. Return invalid rows with the physical DP
@@ -1936,7 +1941,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
 
         in_piecewise_or_breakable_cuda_graph = (
-            _is_in_piecewise_or_breakable_cuda_graph()
+            use_cuda_graph and _is_in_piecewise_or_breakable_cuda_graph()
         )
 
         # In piecewise/breakable CUDA graph mode, metadata is fetched inside
