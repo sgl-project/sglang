@@ -335,6 +335,32 @@ class TestBuildResponse(unittest.TestCase):
         self.assertEqual(g1.shape, (1, 8, 8))
         self.assertFalse(torch.equal(g0, g1))
 
+    def test_each_sample_carries_its_own_audio(self):
+        """Pipelines that decode audio ship sample i's waveform with sample i's video; others ship none."""
+        audio = torch.randn(2, 2, 480)
+        batch = OutputBatch(
+            output=torch.randn(2, 3, 1, 8, 8), audio=audio, audio_sample_rate=48000
+        )
+        batch.metrics = None
+        for rollout in (False, True):
+            if rollout:
+                batch.rollout_trajectory_data = RolloutTrajectoryData(
+                    rollout_log_probs=torch.randn(2, 3)
+                )
+            resps = _build_response("ra", "p", 0, rollout, batch)
+            for index, resp in enumerate(resps):
+                self.assertTrue(
+                    torch.equal(
+                        bytes_to_tensor(resp.generated_audio["data"]), audio[index]
+                    )
+                )
+                self.assertEqual(resp.audio_sample_rate, 48000)
+        silent = OutputBatch(output=torch.randn(1, 3, 1, 8, 8))
+        silent.metrics = None
+        resp = _build_response("rs", "p", 0, False, silent)[0]
+        self.assertIsNone(resp.generated_audio)
+        self.assertIsNone(resp.audio_sample_rate)
+
     def test_batch_dit_timesteps_on_each_row_one_serialize(self):
         B, T, D = 2, 4, 3
         batch = OutputBatch(
