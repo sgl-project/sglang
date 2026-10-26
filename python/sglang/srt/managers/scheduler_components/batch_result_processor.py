@@ -1921,3 +1921,25 @@ class SchedulerBatchResultProcessor:
                 release_positions=(1 - track_idx,),
             ),
         )
+
+
+class NoDecodeTrackingResultProcessor(SchedulerBatchResultProcessor):
+    """Preserve the prompt checkpoint while processing decode results."""
+
+    __slots__ = ()
+
+    def _mamba_prefix_cache_update(
+        self,
+        req: Req,
+        batch: ScheduleBatch,
+        result: GenerationBatchResult,
+        i: int,
+        known_boundary: bool = False,
+    ) -> None:
+        pass
+
+
+def get_batch_result_processor_class() -> type[SchedulerBatchResultProcessor]:
+    if get_exec().mamba.disable_mamba_decode_tracking:
+        return NoDecodeTrackingResultProcessor
+    return SchedulerBatchResultProcessor

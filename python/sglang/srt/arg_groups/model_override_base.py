@@ -292,6 +292,16 @@ def mamba_extra_buffer_of(cfg: Any) -> bool:
     )
 
 
+def mamba_decode_tracking_of(cfg: Any) -> bool:
+    if cfg.disable_mamba_decode_tracking:
+        if cfg.speculative_algorithm is not None:
+            raise ValueError(
+                "Disabling Mamba decode tracking does not support speculative decoding"
+            )
+        return False
+    return mamba_extra_buffer_of(cfg)
+
+
 def _forces_eagle_topk_one(speculative_algorithm: str) -> bool:
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 

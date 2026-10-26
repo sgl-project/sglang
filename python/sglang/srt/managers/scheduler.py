@@ -257,7 +257,7 @@ from sglang.srt.managers.schedule_policy import (
     mamba_prefill_chunk_grid,
 )
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
-    SchedulerBatchResultProcessor,
+    get_batch_result_processor_class,
 )
 from sglang.srt.managers.scheduler_components.deferred_responses import (
     DeferredResponses,
@@ -3051,7 +3051,8 @@ class Scheduler(
             )
 
     def init_batch_result_processor(self) -> None:
-        self.batch_result_processor = SchedulerBatchResultProcessor(
+        processor_class = get_batch_result_processor_class()
+        self.batch_result_processor = processor_class(
             is_generation=self.is_generation,
             disaggregation_mode=self.disaggregation_mode,
             model_config=self.model_config,
