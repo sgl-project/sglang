@@ -801,8 +801,9 @@ class UnifiedSWAAllocatorBase(SWATokenToKVPoolAllocator):
     def _ask_float_for_room(self, need_tokens: int) -> None: ...
 
     def set_hicache_transfer_done_event(self, transfer_key: Hashable, event) -> None:
-        self.full_attn_allocator.set_hicache_transfer_done_event(transfer_key, event)
-        self.swa_attn_allocator.set_hicache_transfer_done_event(transfer_key, event)
+        # Every member a move gate covers must also order its moves after the copy.
+        for member in self._move_gate_targets():
+            member.set_hicache_transfer_done_event(transfer_key, event)
 
 
 class UnifiedSWATokenToKVPoolAllocator(UnifiedSWAAllocatorBase):
