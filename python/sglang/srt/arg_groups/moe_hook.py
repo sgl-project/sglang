@@ -28,8 +28,8 @@ from sglang.srt.configs.moe_model_registry import (
 )
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
-from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.layers.moe.utils import AscendOpsConfig
+from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
 from sglang.srt.utils.common import (
     get_bool_env_var,
@@ -293,8 +293,7 @@ def handle_a2a_moe(server_args: Any):
     # hide an explicitly incompatible ascend_ops selection.
     if cfg.enable_waterfill and cfg.moe_a2a_backend == "ascend_ops":
         raise ValueError(
-            "--enable-waterfill is incompatible with "
-            "--moe-a2a-backend ascend_ops."
+            "--enable-waterfill is incompatible with --moe-a2a-backend ascend_ops."
         )
 
     run_post_process_pass(server_args, _a2a_backend_overrides)
@@ -330,8 +329,7 @@ def handle_a2a_moe(server_args: Any):
             )
         except ValueError as exc:
             raise ValueError(
-                "Invalid --moe-ascend-ops-config for ascend_ops MoE backend: "
-                f"{exc}"
+                f"Invalid --moe-ascend-ops-config for ascend_ops MoE backend: {exc}"
             ) from exc
         logger.info(
             "ascend_ops MoE backend enabled for main=%s, draft=%s with "

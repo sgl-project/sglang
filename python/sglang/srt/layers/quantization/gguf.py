@@ -953,7 +953,9 @@ class GGUFMoEAscendMethod(FusedMoEMethodBase):
 
         # GGUF keeps full (non-intermediate-sharded) expert weights, so the
         # Ascend finalize has to all-gather the hidden dim on its own.
-        from sglang.srt.hardware_backend.npu.moe import standard_dispatch as ascend_dispatch
+        from sglang.srt.hardware_backend.npu.moe import (
+            standard_dispatch as ascend_dispatch,
+        )
 
         ascend_dispatch.set_finalize_all_gather(layer)
 

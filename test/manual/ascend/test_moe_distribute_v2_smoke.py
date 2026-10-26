@@ -27,9 +27,8 @@ import os
 
 import torch
 import torch.distributed as dist
-from torch.distributed import distributed_c10d
-
 import torch_npu  # noqa: F401
+from torch.distributed import distributed_c10d
 
 
 def _log(rank: int, msg: str) -> None:
@@ -75,9 +74,7 @@ def _build_batch(seed, bs, pad_bs, hidden, num_experts, top_k, weight_sum, devic
     return x, topk_ids, topk_weights, mask
 
 
-def _run_case(
-    args, rank, world, comm, device, quant_mode, weight_sum, pad_bs
-):
+def _run_case(args, rank, world, comm, device, quant_mode, weight_sum, pad_bs):
     x, topk_ids, topk_weights, mask = _build_batch(
         1234 + rank,
         args.bs,

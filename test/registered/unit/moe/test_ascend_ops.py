@@ -73,12 +73,15 @@ class TestAscendOpsDispatcherContracts(CustomTestCase):
             outputs[0].copy_(local_rows)
             outputs[1].fill_(3)
 
-        with patch(
-            "sglang.srt.layers.moe.token_dispatcher.ascend_ops.dist.get_world_size",
-            return_value=2,
-        ), patch(
-            "sglang.srt.layers.moe.token_dispatcher.ascend_ops.dist.all_gather",
-            side_effect=fake_all_gather,
+        with (
+            patch(
+                "sglang.srt.layers.moe.token_dispatcher.ascend_ops.dist.get_world_size",
+                return_value=2,
+            ),
+            patch(
+                "sglang.srt.layers.moe.token_dispatcher.ascend_ops.dist.all_gather",
+                side_effect=fake_all_gather,
+            )
         ):
             row_sizes = AscendOpsDispatcher._allgather_row_sizes(
                 2, group=None, device=torch.device("cpu")
