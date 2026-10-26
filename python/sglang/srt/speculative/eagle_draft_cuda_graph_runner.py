@@ -14,7 +14,7 @@ from sglang.srt.layers.dp_attention import (
     set_dp_buffer_len,
     set_is_extend_in_batch,
 )
-from sglang.srt.megakernels.runtime import megakernel_graph_variants
+from sglang.srt.kernel_plugins.nvidia.binding import megakernel_graph_variants
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,

@@ -726,6 +726,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # shape from the live batch. None preserves eager/default graph behavior.
     max_seq_len_override: Optional[int] = None
 
+    # Host-side max of the allocated seq lens (spec decode, mirrorless
+    # opt-out); NPU attention metadata prep sizes the graph block-table
+    # gather from it without a device sync.
+    max_seq_len_host: Optional[int] = None
+
     # For logits and logprobs post processing
     next_token_logits_buffer: torch.Tensor = None
     temperature: torch.Tensor = None
@@ -1045,6 +1050,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             seq_lens_sum=batch.seq_lens_sum,
             # Inputs aliased by reference from ScheduleBatch
             seq_lens_cpu=seq_lens_cpu,
+            max_seq_len_host=getattr(batch, "max_seq_len_host", None),
             req_pool_indices_cpu=(
                 getattr(batch, "req_pool_indices_cpu", None)
                 if batch.forward_mode.is_extend_without_speculative()
@@ -1175,6 +1181,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         if ret.forward_mode.is_idle():
             ret.positions = torch.empty((0,), dtype=torch.int64, device=device)
+            if model_runner.model_config.model_is_mrope:
+                # DP padding can turn an idle rank into a target verify batch.
+                ret.mrope_positions = ret.positions.unsqueeze(0).expand(3, -1)
             if model_runner.lora_manager is not None:
                 model_runner.lora_manager.reset_lora_batch()
             return ret
@@ -1798,6 +1807,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             and not prefill_graph_tolerates_sum_len()
         ):
             dp_padding_mode = DpPaddingMode.MAX_LEN
+            # Keep every DP rank on the same captured token bucket. The raw
+            # global maximum can sit between buckets, while the BCG replay
+            # requires a common padded shape for MoE collectives and attention.
+            bucket = min(
+                size for size in prefill_cg.bs if size >= max(global_num_tokens)
+            )
+            global_num_tokens = [bucket] * sync_group_size
         if self.dp_spec_prefill_coordination_applied:
             # Preserve each rank's forward mode on coordinated steps.
             dp_padding_mode = DpPaddingMode.SUM_LEN
@@ -2312,6 +2328,8 @@ def build_inner_fb_view(
         kv_loc_cols=getattr(forward_batch, "kv_loc_cols", None),
         origin_out_cache_loc=getattr(forward_batch, "origin_out_cache_loc", None),
         out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
+        # A caller may hand in another view that does not carry this field.
+        max_seq_len_host=getattr(forward_batch, "max_seq_len_host", None),
         spec_info=forward_batch.spec_info,
     )
 

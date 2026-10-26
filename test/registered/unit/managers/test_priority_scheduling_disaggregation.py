@@ -67,6 +67,7 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
         scheduler.disagg_prefill_bootstrap_queue = MagicMock()
         scheduler.disagg_decode_prealloc_queue = MagicMock()
         scheduler.ipc_channels = MagicMock()
+        scheduler.rust_server = None
         return scheduler
 
     def _new_req(self, priority=None):
@@ -435,6 +436,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         scheduler.beam_coordinator = MagicMock()
         scheduler.enable_hicache_storage = False
         scheduler.ipc_channels = MagicMock()
+        scheduler.rust_server = None
         scheduler.disaggregation_mode = DisaggregationMode.PREFILL
         scheduler.release_aborted_prefill_waiting_req = MagicMock()
         scheduler.dllm_config = None

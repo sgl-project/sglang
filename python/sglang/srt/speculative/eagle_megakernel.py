@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """SGLang's side of a megakernel's EAGLE entries (spec.ENTRIES) at the EAGLE workers'
-and their graph runners' call sites; megakernels/eagle_binding.py documents the
-entries and their structs."""
+and their graph runners' call sites; kernel_plugins/nvidia/eagle_binding.py documents
+the entries and their structs."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 
 import torch
 
-from sglang.srt.megakernels.eagle_binding import (
+from sglang.srt.kernel_plugins.nvidia.eagle_binding import (
     EagleDraftExtendIO,
     EagleDraftLoopIO,
     EagleDraftRoundIO,
@@ -18,7 +18,7 @@ from sglang.srt.megakernels.eagle_binding import (
     kv_pool_buffers,
     split_backend,
 )
-from sglang.srt.megakernels.runtime import (
+from sglang.srt.kernel_plugins.nvidia.binding import (
     megakernel_agree,
     megakernel_enabled,
     megakernel_entry,

@@ -131,7 +131,14 @@ class LayerWiseLoadCounter:
 
 
 class UnifiedCacheLinker(ABC):
-    """External KV store reached directly from the device pools."""
+    """External KV store reached directly from the device pools.
+
+    Out-of-tree linkers are constructed per worker as
+    ``Linker(server_args, params, components=..., extra_config=..., forward_stream=...)``.
+    Store ``forward_stream`` and use ``record_offload_ready()`` to gate offloads.
+    ``layer_done_counter`` provides ``set_consumer(index)`` and
+    ``wait_until(layer)``. Report completion only after device copies finish.
+    """
 
     layer_done_counter: object
     pools: dict[PoolName, object]
@@ -191,8 +198,14 @@ class UnifiedCacheLinker(ABC):
         """Cancel a load that has not started yet."""
 
     @abstractmethod
-    def offload(self, transfers: list[PoolTransfer]) -> bool:
-        """Queue every transfer for atomic persistence."""
+    def offload(
+        self, transfers: list[PoolTransfer], session_id: Optional[str] = None
+    ) -> bool:
+        """Queue every transfer for atomic persistence.
+
+        ``session_id`` names the session whose insert produced the transfers,
+        when known; backends may attribute the stored objects to it.
+        """
 
     @abstractmethod
     def num_completed_offloads(self) -> int:
@@ -500,7 +513,9 @@ class UnifiedCacheLinkerWrapper:
         cache = self.cache
         lock_params = cache.inc_lock_ref(node_id).to_dec_params()
         try:
-            queued = self.cache_linker.offload(transfers)
+            queued = self.cache_linker.offload(
+                transfers, session_id=getattr(cache, "insert_session_id", None)
+            )
         except BaseException:
             cache.dec_lock_ref(node_id, lock_params)
             raise
