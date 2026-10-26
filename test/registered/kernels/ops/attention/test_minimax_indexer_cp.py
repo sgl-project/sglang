@@ -103,3 +103,62 @@ def test_sharded_selection_matches_paged_native_selector(world, dtype):
         assert torch.equal(sharded, native), (
             f"rank {rank}: {(sharded != native).any(-1).sum()} rows differ"
         )
+
+
+@pytest.mark.parametrize("world", [4, 8])
+def test_chain_verify_rows_match_paged_native_selector(world):
+    """Verify rows straddle a block boundary; W=4 scores them packed, W=8 row by row."""
+    reqs, draft_tokens = 4, 4
+    prefix = 255 * BLOCK + 126  # rows end at 32767..32770, across block 256
+    max_len = (prefix + draft_tokens + PAGE - 1) // PAGE * PAGE
+    q, cache, table, slots, _ = _inputs(reqs * draft_tokens, max_len, torch.bfloat16)
+    slots = slots[:reqs].repeat_interleave(draft_tokens)
+    lengths = (prefix + torch.arange(1, draft_tokens + 1, device="cuda")).repeat(reqs)
+    head_of_rank = [rank * HEADS // world for rank in range(world)]
+    gathered_q = q[:, head_of_rank].permute(1, 0, 2).contiguous()
+    keys = torch.stack(
+        [
+            select_local_candidates(
+                score_local_blocks(
+                    gathered_q,
+                    cache,
+                    table,
+                    slots,
+                    lengths,
+                    max_len,
+                    rank,
+                    INIT_BLOCKS,
+                    LOCAL_BLOCKS,
+                    DIM**-0.5,
+                    1.0,
+                    packed_queries=draft_tokens,
+                ),
+                lengths,
+                rank,
+                max_len,
+                TOPK,
+            )
+            for rank in range(world)
+        ]
+    )
+    for rank, head in enumerate(head_of_rank):
+        native = flash_decode_with_topk_idx(
+            q=q[:, head : head + 1].contiguous(),
+            sink=None,
+            k_cache=cache,
+            v_cache=None,
+            req_to_token=table,
+            seq_lens=lengths,
+            max_seqlen=max_len,
+            slot_ids=slots,
+            block_size=BLOCK,
+            topk=TOPK,
+            init_blocks=INIT_BLOCKS,
+            local_blocks=LOCAL_BLOCKS,
+            disable_index_value=True,
+            page_size=PAGE,
+        )[1]
+        sharded = merge_candidates(keys, rank)
+        assert torch.equal(sharded, native), (
+            f"rank {rank}: {(sharded != native).any(-1).sum()} rows differ"
+        )
