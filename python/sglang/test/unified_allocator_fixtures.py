@@ -29,9 +29,6 @@ from sglang.srt.mem_cache.unified_memory_pool import (
     UnifiedMHATokenToKVPool,
     UnifiedPoolBundle,
     UnifiedSWAKVPool,
-    init_unified_mamba_pools,
-    init_unified_mamba_swa_pools,
-    init_unified_swa_pools,
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import publish, reset_context
@@ -49,7 +46,7 @@ def setup_allocator_context():
 def build_swa_pool(*, page_size=1, lazy=True, ratio=(1, 1), total_bytes=None):
     """Full + SWA composite over real CPU pools, 100 pages per side."""
     full_layers, swa_layers = ratio
-    bundle = init_unified_swa_pools(
+    bundle = build_test_unified_pools(
         device="cpu",
         kv_cache_dtype=torch.float16,
         head_num=1,
@@ -82,7 +79,7 @@ def build_tri_pool(*, page_size=1, lazy=True, ratio=(1, 1), temporal=(1, 4, 8)):
         dtype=SimpleNamespace(conv=torch.bfloat16, temporal=torch.float32),
         layers=[0],
     )
-    bundle = init_unified_mamba_swa_pools(
+    bundle = build_test_unified_pools(
         device="cpu",
         kv_cache_dtype=torch.float16,
         head_num=1,
@@ -254,12 +251,12 @@ def build_tri_cache(
 
 
 class UnifiedGeometry(msgspec.Struct, frozen=True, kw_only=True):
-    """A small test model for the unified pool factories.
+    """A small test model for the unified pool builder.
 
-    ``chain`` picks the factory: "swa" (full + window), "mamba" (full + state)
-    or "tri" (full + window + state). ``byte_budget`` is the factory's byte
-    budget: the whole buffer for "swa", the token side for the state chains
-    (their state slots ride on top); without it the token capacities size it.
+    ``chain`` names its kinds: "swa" (full + window), "mamba" (full + state) or
+    "tri" (full + window + state); the layer ids given per kind must match.
+    ``byte_budget`` is the token side's byte budget (state slots ride on top);
+    without it the token capacities size the buffer.
     """
 
     chain: str
@@ -315,81 +312,132 @@ def _state_cache_params(geometry: UnifiedGeometry) -> SimpleNamespace:
     )
 
 
-def build_unified_bundle(geometry: UnifiedGeometry):
-    """Build the unified pool stack a geometry describes, through the factory
-    production uses for that chain."""
-    g = geometry
-    layer_ids = g.full_layer_ids + g.swa_layer_ids + g.state_layer_ids
-    common = dict(
-        device=g.device,
-        kv_cache_dtype=g.kv_cache_dtype,
-        page_size=g.page_size,
-        start_layer=g.start_layer,
-        end_layer=g.end_layer if g.end_layer is not None else max(layer_ids) + 1,
-        full_attention_layer_ids=list(g.full_layer_ids),
-        enable_memory_saver=False,
-        need_sort=False,
-        lazy_compaction=g.lazy,
-        fused_draft=g.fused_draft,
-        head_num=g.head_num,
-        head_dim=g.head_dim,
-        v_head_dim=g.v_head_dim if g.v_head_dim is not None else g.head_dim,
-    )
-    swa_kwargs = dict(
-        swa_head_num=g.swa_head_num,
-        swa_head_dim=g.swa_head_dim,
-        swa_v_head_dim=(
-            g.swa_v_head_dim if g.swa_v_head_dim is not None else g.swa_head_dim
+def build_test_unified_pools(
+    *,
+    device,
+    kv_cache_dtype,
+    page_size,
+    start_layer,
+    end_layer,
+    full_attention_layer_ids,
+    head_num,
+    head_dim,
+    v_head_dim=None,
+    use_mla_backend=False,
+    kv_lora_rank=None,
+    qk_rope_head_dim=None,
+    swa_attention_layer_ids=(),
+    swa_head_num=None,
+    swa_head_dim=None,
+    swa_v_head_dim=None,
+    sliding_window_size=None,
+    mamba_layer_ids=(),
+    mamba2_cache_params=None,
+    max_mamba_cache_size=0,
+    full_max_total_num_tokens=None,
+    max_total_num_tokens=None,
+    swa_max_total_num_tokens=None,
+    total_bytes=None,
+    unified_total_bytes=None,
+    model_context_len=None,
+    extra_max_context_len=0,
+    max_num_reqs=0,
+    enable_memory_saver=False,
+    post_capture_active=False,
+    need_sort=False,
+    forward_stream=None,
+    lazy_compaction=False,
+    is_draft_worker=False,
+    enable_mamba_extra_buffer=False,
+    enable_mamba_extra_buffer_lazy=False,
+    speculative_num_draft_tokens=None,
+    disable_overlap_schedule=True,
+    decode_pre_alloc_size=0,
+    mamba_full_memory_ratio=None,
+    fused_draft=None,
+):
+    """Build a unified pool stack from flat model arguments: the layer ids given
+    for each kind (full, sliding-window, state) decide the sub-pools."""
+    if use_mla_backend:
+        full_geometry = MLAGeometry(
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            kv_cache_dtype=kv_cache_dtype,
+        )
+    else:
+        full_geometry = MHAGeometry(
+            head_num=head_num,
+            head_dim=head_dim,
+            v_head_dim=v_head_dim if v_head_dim is not None else head_dim,
+            kv_cache_dtype=kv_cache_dtype,
+        )
+    window_geometry = None
+    if swa_attention_layer_ids:
+        window_geometry = MHAGeometry(
+            head_num=swa_head_num,
+            head_dim=swa_head_dim,
+            v_head_dim=swa_v_head_dim if swa_v_head_dim is not None else swa_head_dim,
+            kv_cache_dtype=kv_cache_dtype,
+        )
+    decls = kv_layer_decls(
+        full_layer_ids=full_attention_layer_ids,
+        full_geometry=full_geometry,
+        window_layer_ids=swa_attention_layer_ids,
+        window_geometry=window_geometry,
+        window=sliding_window_size,
+        state_layer_ids=mamba_layer_ids,
+        state_geometry=(
+            StateGeometry.of(mamba2_cache_params) if mamba_layer_ids else None
         ),
-        swa_attention_layer_ids=list(g.swa_layer_ids),
-        sliding_window_size=g.window,
     )
-    state_kwargs = dict(
-        mamba_layer_ids=list(g.state_layer_ids),
-        mamba2_cache_params=_state_cache_params(g),
-        max_mamba_cache_size=g.state_slots,
-        model_context_len=g.context_len,
-        extra_max_context_len=1,
-        max_num_reqs=g.max_num_reqs,
-        enable_mamba_extra_buffer=False,
-        enable_mamba_extra_buffer_lazy=False,
-        disable_overlap_schedule=True,
-        speculative_num_draft_tokens=None,
-        unified_total_bytes=g.byte_budget,
+    sizing = KVSizingInputs(
+        token_budget_bytes=total_bytes
+        if total_bytes is not None
+        else unified_total_bytes,
+        full_tokens=(
+            full_max_total_num_tokens
+            if full_max_total_num_tokens is not None
+            else max_total_num_tokens
+        ),
+        window_tokens=swa_max_total_num_tokens,
+        state_slots=max_mamba_cache_size,
+        context_len=model_context_len,
     )
-    if g.chain == "swa":
-        by_tokens = g.byte_budget is None
-        return init_unified_swa_pools(
-            **common,
-            **swa_kwargs,
-            full_max_total_num_tokens=g.full_tokens if by_tokens else None,
-            swa_max_total_num_tokens=g.swa_tokens if by_tokens else None,
-            total_bytes=g.byte_budget,
-            model_context_len=g.context_len,
-        )
-    if g.chain == "mamba":
-        return init_unified_mamba_pools(
-            **common,
-            **state_kwargs,
-            is_draft_worker=False,
-            use_mla_backend=g.mla,
-            kv_lora_rank=g.kv_lora_rank if g.mla else None,
-            qk_rope_head_dim=g.qk_rope_head_dim if g.mla else None,
-            max_total_num_tokens=g.full_tokens,
-        )
-    assert g.chain == "tri", f"unknown chain {g.chain!r}"
-    return init_unified_mamba_swa_pools(
-        **common,
-        **swa_kwargs,
-        **state_kwargs,
-        full_max_total_num_tokens=g.full_tokens,
-        swa_max_total_num_tokens=g.swa_tokens,
+    ctx = UnifiedBuildContext(
+        device=device,
+        start_layer=start_layer,
+        end_layer=end_layer,
+        enable_memory_saver=enable_memory_saver,
+        need_sort=need_sort,
+        lazy_compaction=lazy_compaction,
+        forward_stream=forward_stream,
+        post_capture_active=post_capture_active,
+        is_draft_worker=is_draft_worker,
+        head_num=head_num,
+        head_dim=head_dim,
+        max_num_reqs=max_num_reqs,
+        model_context_len=model_context_len or 0,
+        extra_max_context_len=extra_max_context_len,
+        state_cache_params=mamba2_cache_params,
+        enable_mamba_extra_buffer=enable_mamba_extra_buffer,
+        enable_mamba_extra_buffer_lazy=enable_mamba_extra_buffer_lazy,
+        speculative_num_draft_tokens=speculative_num_draft_tokens,
+        disable_overlap_schedule=disable_overlap_schedule,
+        decode_pre_alloc_size=decode_pre_alloc_size,
+        mamba_full_memory_ratio=mamba_full_memory_ratio,
+    )
+    return build_unified_pools(
+        decls=decls,
+        page_size=page_size,
+        sizing=sizing,
+        ctx=ctx,
+        fused_draft=fused_draft,
     )
 
 
-def build_unified_bundle_from_declarations(geometry: UnifiedGeometry):
-    """Build the stack a geometry describes through declarations, plan, sizing
-    and the builder."""
+def build_unified_bundle(geometry: UnifiedGeometry):
+    """Build the unified pool stack a geometry describes, through the
+    declarations, plan, sizing and builder production uses."""
     g = geometry
     layer_ids = g.full_layer_ids + g.swa_layer_ids + g.state_layer_ids
     if g.mla:

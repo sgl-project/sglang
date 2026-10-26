@@ -34,11 +34,11 @@ from sglang.srt.mem_cache.prefill_budget import (
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
-from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
 from sglang.srt.runtime_context import get_context
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.unified_allocator_fixtures import build_test_unified_pools
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
@@ -174,7 +174,7 @@ class TestPrefillAdder(CustomTestCase):
         self.mock_tree_cache.supports_mamba.return_value = False
         self.mock_tree_cache.sliding_window_size = 8
         self.mock_tree_cache.supports_prefix_sharing.return_value = False
-        allocator = init_unified_swa_pools(
+        allocator = build_test_unified_pools(
             device="cpu",
             kv_cache_dtype=torch.float16,
             head_num=1,

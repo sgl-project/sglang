@@ -18,11 +18,11 @@ from sglang.srt.mem_cache.pool_host.common import (
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
-from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.unified_allocator_fixtures import build_test_unified_pools
 
 register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=12, stage="jit-kernel-unit", runner_config="amd")
@@ -50,7 +50,7 @@ STAGED_WRITE_BACK_PAGE_COUNTS = [1, 63, 64, 65, 67, 128, 129]
 @pytest.mark.skipif(not is_cuda(), reason="Uses a delayed CUDA producer stream")
 def test_unified_l2_waits_for_index_producer(direction, backend):
     publish(ServerArgs(model_path="dummy"), role="tokenizer")
-    bundle = init_unified_swa_pools(
+    bundle = build_test_unified_pools(
         device=DEVICE,
         kv_cache_dtype=torch.float16,
         head_num=1,

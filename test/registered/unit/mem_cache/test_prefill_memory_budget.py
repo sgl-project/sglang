@@ -24,11 +24,11 @@ from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
 from sglang.srt.mem_cache.common import evict_from_tree_cache
 from sglang.srt.mem_cache.prefill_budget import SWAPrefillBudget
 from sglang.srt.mem_cache.radix_cache import RadixCache
-from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, published_topology
+from sglang.test.unified_allocator_fixtures import build_test_unified_pools
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -43,7 +43,7 @@ def _shared_allocator(*, page_size=4, total_bytes=2048, pool_tokens=None):
         if pool_tokens is not None
         else dict(total_bytes=total_bytes)
     )
-    return init_unified_swa_pools(
+    return build_test_unified_pools(
         device="cpu",
         kv_cache_dtype=torch.float16,
         head_num=1,

@@ -66,8 +66,19 @@ class TestMambaSlotWiringIsShared(CustomTestCase):
         import inspect
 
         from sglang.srt.mem_cache import unified_memory_pool
+        from sglang.srt.mem_cache.kv import build
 
-        tree = ast.parse(inspect.getsource(unified_memory_pool))
+        found = []
+        for module in (unified_memory_pool, build):
+            found += TestMambaSlotWiringIsShared._assignments_in(
+                ast.parse(inspect.getsource(module)), attr
+            )
+        return found
+
+    @staticmethod
+    def _assignments_in(tree, attr: str):
+        import ast
+
         found = []
         for fn in ast.walk(tree):
             if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -90,15 +101,19 @@ class TestMambaSlotWiringIsShared(CustomTestCase):
             "host_transfer_translate exactly as the tri-pool factory did",
         )
 
-    def test_every_unified_mamba_factory_calls_the_shared_hook(self):
+    def test_every_unified_state_builder_calls_the_shared_hook(self):
         import ast
         import inspect
 
-        from sglang.srt.mem_cache import unified_memory_pool
+        from sglang.srt.mem_cache.kv import build
 
-        tree = ast.parse(inspect.getsource(unified_memory_pool))
-        # Factories whose composite holds a mamba end.
-        expected = {"init_unified_mamba_pools", "init_unified_mamba_swa_pools"}
+        tree = ast.parse(inspect.getsource(build))
+        # Builders whose composite holds a mamba end.
+        expected = {
+            build._BUILDERS[key].__name__
+            for key in build._BUILDERS
+            if any(lifetime.__name__ == "StateLifetime" for lifetime in key)
+        }
         callers = {
             fn.name
             for fn in ast.walk(tree)

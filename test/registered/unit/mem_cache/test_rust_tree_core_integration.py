@@ -4859,9 +4859,9 @@ def test_write_through_threshold_assignment_reaches_the_core():
 
 @pytest.mark.parametrize("backup_nodes", ["leaf", "parent_and_leaf", "parent"])
 def test_unified_swa_backup_when_full_already_has_a_host_copy(backup_nodes):
-    from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
+    from sglang.test.unified_allocator_fixtures import build_test_unified_pools
 
-    bundle = init_unified_swa_pools(
+    bundle = build_test_unified_pools(
         device="cpu",
         kv_cache_dtype=torch.float16,
         head_num=1,

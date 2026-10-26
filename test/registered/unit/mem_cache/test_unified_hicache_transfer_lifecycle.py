@@ -51,12 +51,14 @@ from sglang.srt.mem_cache.pool_host import common as host_memory
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components.base import ComponentType
 from sglang.srt.mem_cache.unified_cache.tree_core_registry import _TREE_CORE_REGISTRY
-from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.unified_allocator_fixtures import build_tri_pool
+from sglang.test.unified_allocator_fixtures import (
+    build_test_unified_pools,
+    build_tri_pool,
+)
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -83,7 +85,7 @@ def _rust_inspector(params, _components):
 
 
 def _unified_swa_bundle(*, tokens: int = 64):
-    return init_unified_swa_pools(
+    return build_test_unified_pools(
         device="cpu",
         kv_cache_dtype=torch.float16,
         head_num=1,
