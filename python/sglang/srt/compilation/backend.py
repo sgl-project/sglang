@@ -26,6 +26,7 @@ from sglang.srt.compilation.pass_manager import PostGradPassManager
 from sglang.srt.compilation.xpu_piecewise_backend import XPUPiecewiseBackend
 from sglang.srt.environ import envs
 from sglang.srt.platforms import current_platform
+from sglang.srt.platforms.interface import require_out_of_tree_impl
 from sglang.srt.utils.common import is_npu, is_xpu
 
 logger = logging.getLogger(__name__)
@@ -52,14 +53,19 @@ def make_backend(
     sglang_backend,
 ):
 
-    if current_platform.is_out_of_tree():
-        backend_cls = current_platform.get_piecewise_backend_cls()
-    elif is_xpu():
-        backend_cls = XPUPiecewiseBackend
-    elif is_npu():
-        backend_cls = NPUPiecewiseBackend
-    else:
-        backend_cls = CUDAPiecewiseBackend
+    backend_cls = current_platform.get_piecewise_backend_cls()
+    if backend_cls is None:
+        require_out_of_tree_impl(
+            current_platform,
+            hook="get_piecewise_backend_cls()",
+            subsystem="piecewise compilation backend",
+        )
+        if is_xpu():
+            backend_cls = XPUPiecewiseBackend
+        elif is_npu():
+            backend_cls = NPUPiecewiseBackend
+        else:
+            backend_cls = CUDAPiecewiseBackend
     return backend_cls(
         graph,
         compile_config,
@@ -121,15 +127,14 @@ class CompilerManager:
         )
         if runtime_shape is None:
             logger.debug(
-                "Directly load the %s-th graph for dynamic shape from %s via "
-                "handle %s",
+                "Directly load the %s-th graph for dynamic shape from %s via handle %s",
                 graph_index,
                 self.compiler.name,
                 handle,
             )
         else:
             logger.debug(
-                "Directly load the %s-th graph for shape %s from %s via " "handle %s",
+                "Directly load the %s-th graph for shape %s from %s via handle %s",
                 graph_index,
                 str(runtime_shape),
                 self.compiler.name,
@@ -184,7 +189,7 @@ class CompilerManager:
                     )
             if runtime_shape is None:
                 logger.debug(
-                    "Store the %s-th graph for dynamic shape from %s via " "handle %s",
+                    "Store the %s-th graph for dynamic shape from %s via handle %s",
                     graph_index,
                     self.compiler.name,
                     handle,
@@ -352,9 +357,9 @@ model_tag: str = "backbone"
 def set_model_tag(tag: str):
     """Context manager to set the model tag."""
     global model_tag
-    assert (
-        tag != model_tag
-    ), f"Model tag {tag} is the same as the current tag {model_tag}."
+    assert tag != model_tag, (
+        f"Model tag {tag} is the same as the current tag {model_tag}."
+    )
     old_tag = model_tag
     model_tag = tag
     try:
@@ -364,7 +369,6 @@ def set_model_tag(tag: str):
 
 
 class SGLangBackend:
-
     graph_pool: Any
     _called: bool = False
     # the graph we compiled
@@ -398,7 +402,6 @@ class SGLangBackend:
         self.compile_config = config
 
     def configure_post_pass(self):
-        self.post_grad_pass_manager.configure()
         self.inductor_config["post_grad_custom_post_pass"] = self.post_grad_pass_manager
 
     def __call__(self, graph: fx.GraphModule, example_inputs) -> Callable:

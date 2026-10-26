@@ -29,9 +29,11 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=50, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-large")
+# Backend-specific: streaming tool-argument assembly is rebuilt from
+# incremental decode output, so ROCm chunk-boundary divergence surfaces here.
 register_amd_ci(est_time=140, suite="stage-b-test-1-gpu-small-amd")
-register_cpu_ci(est_time=54, suite="base-c-test-cpu")
+register_cpu_ci(est_time=54, suite="stage-b-test-cpu-intel")
 
 # System message to guide Llama3.2 to produce proper tool call format
 SYSTEM_MESSAGE = (

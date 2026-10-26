@@ -48,9 +48,9 @@ class MinimaxM2Detector(BaseFormatDetector):
         # Streaming state variables
         self._current_function_name: str = ""
         self._current_parameters: Dict[str, Any] = {}
-        self._streamed_parameters: Dict[str, str] = (
-            {}
-        )  # Track what parameter content we've streamed
+        self._streamed_parameters: Dict[
+            str, str
+        ] = {}  # Track what parameter content we've streamed
         self._in_tool_call: bool = False
         self._function_name_sent: bool = False
 

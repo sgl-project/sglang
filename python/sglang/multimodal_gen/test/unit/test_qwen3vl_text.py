@@ -51,7 +51,7 @@ class _FakePlatform:
     @staticmethod
     def get_attn_backend_cls_str(selected_backend, _head_size, _dtype):
         if selected_backend not in (None, AttentionBackendEnum.FA):
-            raise AssertionError(f"Unexpected backend: {selected_backend}")
+            return None
         return "fake.FABackend"
 
 
@@ -110,9 +110,7 @@ def test_qwen3vl_auxiliary_component_falls_back_from_global_backend(monkeypatch)
     monkeypatch.setattr(
         "sglang.multimodal_gen.runtime.platforms.current_platform", _FakePlatform
     )
-    monkeypatch.setattr(
-        f"{_SELECTOR}.resolve_obj_by_qualname", lambda _name: _FakeFABackend
-    )
+    monkeypatch.setattr(f"{_SELECTOR}.resolve_name", lambda _name: _FakeFABackend)
     _cached_get_attn_backend.cache_clear()
     config = SimpleNamespace(
         head_dim=8,

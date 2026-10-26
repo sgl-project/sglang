@@ -33,6 +33,14 @@ class MiniMaxH3VideoVAEConfig(VAEConfig):
     load_decoder: bool = True
     use_tiling: bool = True
     use_parallel_tiling: bool = True
+    # Decoder tiles and temporal windows that share one decoder forward while a
+    # request's quality tier enables the VAE fast path ("lossless" and "high");
+    # "exact" keeps the released recipe of one tile and one window per forward.
+    # 0 means all of them. Batching changes which cuBLAS/cuDNN algorithms run,
+    # so it moves rounding, not the math. --performance-mode memory resets both
+    # to 1 (MiniMaxH3PipelineConfig.validate_server_args).
+    decoder_tile_batch: int = 64
+    window_batch: int = 1
     # The released checkpoint's quality contract uses overlapping latent
     # tiles. Parallel tiling distributes whole tiles without changing that
     # recipe. Spatial-shard decode is rejected because validation found output
@@ -56,8 +64,34 @@ class MiniMaxH3VideoVAEConfig(VAEConfig):
             f"{self.parallel_decode_mode!r}"
         )
 
+    def update_model_arch(self, source_model_dict: dict) -> None:
+        # Native-Diffusers AutoencoderKLMiniMaxH3 config field names.
+        aliases = {
+            "clip_length": "vae_clip_length",
+            "token_drop": "vae_token_drop",
+        }
+        model_dict = {
+            aliases.get(key, key): value for key, value in source_model_dict.items()
+        }
+        super().update_model_arch(model_dict)
+
     def post_init(self) -> None:
         self.resolved_parallel_decode_mode()
+        for name, value in (
+            ("decoder_tile_batch", self.decoder_tile_batch),
+            ("window_batch", self.window_batch),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(
+                    f"MiniMax H3 vae_config.{name} must be an integer >= 0 "
+                    f"(0 = all), got {value!r}"
+                )
+        if (
+            self.arch_config.latents_mean is None
+            and self.arch_config.latents_std is None
+        ):
+            # ComfyUI DiT-forward never loads this VAE; stats stay unset.
+            return
         validate_minimax_h3_vae_latent_stats(
             self.arch_config,
             component_name="video_vae",

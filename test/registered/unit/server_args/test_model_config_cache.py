@@ -28,7 +28,7 @@ from sglang.srt.utils import runai_utils
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 _MINI_CONFIG = {
     "architectures": ["LlamaForCausalLM"],
@@ -148,16 +148,19 @@ class TestTheModelConfigCache(CustomTestCase):
         second_checkpoint = self._checkpoint()
 
         server_args = self._resolved(model_path=first_checkpoint)
-        copy_ = server_args.replace_resolved(
+        self.assertEqual(model_config_of(server_args).model_path, first_checkpoint)
+
+        # Declaring a new `model_path` moves what the memo is keyed on, so the
+        # next read rebuilds rather than handing back a configuration that
+        # describes the previous checkpoint.
+        declare_resolution(
+            server_args,
             "test_the_cache_refills_on_a_resolved_record",
             model_path=second_checkpoint,
         )
-
-        rebuilt = model_config_of(copy_)
+        rebuilt = model_config_of(server_args)
         self.assertEqual(rebuilt.model_path, second_checkpoint)
-        self.assertIs(model_config_of(copy_), rebuilt)
-        # The parent keeps the configuration it resolved with.
-        self.assertEqual(model_config_of(server_args).model_path, first_checkpoint)
+        self.assertIs(model_config_of(server_args), rebuilt)
 
     def test_a_supplied_configuration_is_handed_back(self):
         """A configuration nothing in here built carries no key, so nothing

@@ -27,11 +27,16 @@ if not is_hip():
 if not torch.cuda.is_available():
     pytest.skip("Requires a GPU.", allow_module_level=True)
 
-from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (  # noqa: E402
+from sglang.kernels.ops.gemm.mxfp8_amd_gfx95 import (  # noqa: E402
     _mxfp8_dot_scaled_linear,
+)
+from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (  # noqa: E402
     _mxfp8_e4m3_quantize_torch,
     _mxfp8_e4m3_quantize_triton,
     dequant_mxfp8_to_bf16,
+)
+from sglang.srt.layers.quantization.fp8_utils import (  # noqa: E402
+    mxfp8_group_quantize,
 )
 from sglang.test.ci.ci_register import register_amd_ci
 
@@ -81,6 +86,24 @@ def test_mxfp8_quant_triton_matches_torch(shape, dtype):
     assert _relerr(deq_k, deq_t) < 1e-2
 
 
+@requires_gfx950
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@torch.inference_mode()
+def test_mxfp8_group_quantize_uses_gfx950_quantizer(dtype):
+    torch.manual_seed(0)
+    x = torch.randn(64, 128, device=DEVICE, dtype=dtype)
+
+    q, scale = mxfp8_group_quantize(x)
+    expected_q, expected_scale = _mxfp8_e4m3_quantize_triton(x)
+
+    assert q.dtype == torch.float8_e4m3fn
+    assert scale.dtype == torch.uint8
+    assert q.shape == x.shape
+    assert scale.shape == (64, 4)
+    torch.testing.assert_close(q.float(), expected_q.float(), rtol=0, atol=0)
+    torch.testing.assert_close(scale, expected_scale, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("m,inter", [(8, 512), (65, 2048)])
 @torch.inference_mode()
 def test_minimax_swiglu_mxfp8_quant_matches_unfused_fp32(m, inter):
@@ -89,7 +112,7 @@ def test_minimax_swiglu_mxfp8_quant_matches_unfused_fp32(m, inter):
     # the reference is the unfused fp32 swiglu followed by MXFP8 quant. Not
     # bit-identical because the reference quant runs in torch vs the fused triton
     # path, but numerically equivalent (tight relerr, scales agree within 1 ulp).
-    from sglang.kernels.ops.moe.minimax_m3_swiglu import (
+    from sglang.kernels.ops.activation.minimax_m3_swiglu import (
         swiglu_oai_mxfp8_quant,
         swiglu_oai_split,
     )

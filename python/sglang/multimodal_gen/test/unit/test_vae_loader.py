@@ -7,6 +7,11 @@ import torch
 import torch.nn as nn
 from safetensors.torch import save_file as safetensors_save_file
 
+from sglang.multimodal_gen.configs.models.vaes.minimax_h3_audio import (
+    MiniMaxH3AudioVAEConfig,
+)
+from sglang.multimodal_gen.configs.models.vaes.sana import SanaVAEConfig
+from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import Cosmos3Config
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImagePipelineConfig,
@@ -16,29 +21,37 @@ from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     Wan2_2_I2V_A14B_Config,
     WanT2V480PConfig,
 )
-from sglang.multimodal_gen.runtime.loader.component_loaders import vae_loader
+from sglang.multimodal_gen.runtime.loader.component_loaders import (
+    component_loader,
+    vae_loader,
+)
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentCheckpointUnsupportedError,
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders.vae_loader import (
     _assign_direct_gpu_vae_state,
     _backfill_ltx2_audio_vae_latent_stats,
+    _channels_last_3d_prefix,
+    _consume_vae_checkpoint_arch_metadata,
+    _convert_conv3d_weights_to_channels_last_3d,
     _direct_gpu_vae_state_slots,
-    _match_checkpoint_dtypes,
     _require_native_loader_for_quantized_vae,
     _should_use_channels_last_3d,
 )
 from sglang.multimodal_gen.runtime.loader.utils import (
     checkpoint_bytes,
     keep_checkpoint_mapped,
+    load_model_state_dict,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers import (
     host_memory_budget,
 )
 from sglang.multimodal_gen.runtime.models.vaes import wanvae
+from sglang.multimodal_gen.runtime.models.vaes.autoencoder_dc import AutoencoderDC
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ltx_2.decoding_av import (
     LTX2AVDecodingStage,
 )
+from sglang.test.test_utils import CustomTestCase
 
 
 class _FakeServerArgs:
@@ -49,6 +62,7 @@ class _FakeServerArgs:
         self.revision = "test-revision"
         self.trust_remote_code = True
         self.layerwise_components = set()
+        self.component_weights_paths = {}
         self.component_quantizations = {}
         self.component_precisions = {}
         self.component_direct_gpu_weight_loading = {}
@@ -56,10 +70,13 @@ class _FakeServerArgs:
     def resolve_component_attention_backend(self, _component_name):
         return None, None
 
-    def should_start_component_on_cpu(self, _component_name):
-        return False
+    def resolve_component_backend_by_role(self, *_component_names):
+        return {}
 
-    def should_use_fsdp_for_component(self, _component_name):
+    def requested_component_attention_backend(self, _component_name):
+        return None
+
+    def should_start_component_on_cpu(self, _component_name):
         return False
 
     def should_configure_layerwise_offload_for_lazy_component(self, component_name):
@@ -119,25 +136,94 @@ class TestKeepCheckpointMapped(unittest.TestCase):
             )
 
 
-class TestMatchCheckpointDtypes(unittest.TestCase):
+class TestMatchCheckpointDtypes(CustomTestCase):
     """Assignment replaces a parameter, so only matching dtypes may stay mapped."""
 
-    def test_a_matching_tensor_is_left_alone(self):
-        loaded = {"w": torch.zeros(4, dtype=torch.float32)}
-        before = loaded["w"]
-        _match_checkpoint_dtypes(loaded, {"w": torch.zeros(4, dtype=torch.float32)})
-        self.assertIs(loaded["w"], before)
+    def test_assignment_preserves_mixed_dtypes_and_matching_storage(self):
+        model = nn.Linear(4, 4, bias=False, dtype=torch.bfloat16)
+        model.register_buffer("scale", torch.zeros(4, dtype=torch.float32))
+        weights = {
+            "weight": torch.ones(4, 4, dtype=torch.float32),
+            "scale": torch.ones(4, dtype=torch.float32),
+        }
+        checkpoint_weight = weights["weight"]
+        load_model_state_dict(model, weights, assign=True)
+        self.assertEqual(model.weight.dtype, torch.bfloat16)
+        self.assertEqual(model.scale.dtype, torch.float32)
+        self.assertEqual(model.scale.data_ptr(), weights["scale"].data_ptr())
+        self.assertNotEqual(model.weight.data_ptr(), checkpoint_weight.data_ptr())
+        self.assertTrue(torch.equal(model.weight.float(), checkpoint_weight))
 
-    def test_a_mismatched_tensor_is_converted(self):
-        loaded = {"w": torch.zeros(4, dtype=torch.float32)}
-        _match_checkpoint_dtypes(loaded, {"w": torch.zeros(4, dtype=torch.bfloat16)})
-        self.assertEqual(loaded["w"].dtype, torch.bfloat16)
 
-    def test_a_tensor_the_module_does_not_want_is_left_alone(self):
-        loaded = {"extra": torch.zeros(4, dtype=torch.float32)}
-        before = loaded["extra"]
-        _match_checkpoint_dtypes(loaded, {})
-        self.assertIs(loaded["extra"], before)
+class TestPlainWeightNormCheckpoint(CustomTestCase):
+    def test_adopts_a_folded_weight_without_reconstructing_it(self):
+        module = nn.Sequential(
+            torch.nn.utils.parametrizations.weight_norm(
+                nn.Conv1d(2, 3, kernel_size=3, bias=False)
+            )
+        )
+        expected = torch.arange(18, dtype=torch.float32).reshape(3, 2, 3) / 19
+        loaded = {"0.weight": expected}
+
+        load_model_state_dict(module, loaded)
+
+        self.assertEqual(set(module.state_dict()), {"0.weight"})
+        self.assertTrue(torch.equal(module[0].weight, expected))
+
+    def test_keeps_legacy_weight_norm_state_parameterized(self):
+        module = nn.Sequential(
+            torch.nn.utils.parametrizations.weight_norm(
+                nn.Conv1d(2, 3, kernel_size=3, bias=False)
+            )
+        )
+        original_state = module.state_dict()
+        loaded = {
+            "0.weight_g": original_state["0.parametrizations.weight.original0"].clone(),
+            "0.weight_v": original_state["0.parametrizations.weight.original1"].clone(),
+        }
+
+        load_model_state_dict(module, loaded)
+
+        self.assertIn("0.parametrizations.weight.original0", module.state_dict())
+
+    def test_lazy_dc_ae_keeps_the_checkpoint_after_state_dict_builds_it(self):
+        """SANA's DC-AE must load its checkpoint even though the loader reads
+        ``state_dict()`` (which builds the lazy inner model) first."""
+        config = SanaVAEConfig()
+        for key, value in dict(
+            latent_channels=4,
+            attention_head_dim=4,
+            encoder_block_types=("ResBlock", "EfficientViTBlock"),
+            decoder_block_types=("ResBlock", "EfficientViTBlock"),
+            encoder_block_out_channels=(8, 16),
+            decoder_block_out_channels=(8, 16),
+            encoder_layers_per_block=(1, 1),
+            decoder_layers_per_block=(1, 1),
+            encoder_qkv_multiscales=((), (5,)),
+            decoder_qkv_multiscales=((), (5,)),
+        ).items():
+            setattr(config.arch_config, key, value)
+        vae = AutoencoderDC(config)
+        checkpoint = {k: torch.randn_like(v) for k, v in vae.state_dict().items()}
+
+        load_model_state_dict(vae, dict(checkpoint), strict=False)
+
+        state = vae.state_dict()
+        self.assertTrue(all(torch.equal(state[k], v) for k, v in checkpoint.items()))
+
+    def test_moves_checkpoint_latent_stats_into_arch_config(self):
+        config = MiniMaxH3AudioVAEConfig()
+        loaded = {
+            "latents_mean": torch.arange(32, dtype=torch.float32),
+            "latents_std": torch.arange(1, 33, dtype=torch.float32),
+        }
+
+        consumed = _consume_vae_checkpoint_arch_metadata(loaded, config, {})
+
+        self.assertEqual(consumed, ("latents_mean", "latents_std"))
+        self.assertEqual(config.arch_config.latents_mean, list(range(32)))
+        self.assertEqual(config.arch_config.latents_std, list(range(1, 33)))
+        self.assertEqual(loaded, {})
 
 
 class TestDirectGPUVAEState(unittest.TestCase):
@@ -162,11 +248,48 @@ class TestDirectGPUVAEState(unittest.TestCase):
                 [str(checkpoint)],
                 component_name="vae",
                 device=torch.device("cpu"),
+                vae_config=QwenImagePipelineConfig().vae_config,
             )
 
         self.assertTrue(torch.equal(vae.proj.weight, expected_weight))
         self.assertTrue(torch.equal(vae.scale, expected_scale))
         self.assertFalse(any(tensor.is_meta for tensor in vae.state_dict().values()))
+
+    def test_direct_load_adopts_folded_weight_norm_and_checkpoint_metadata(self):
+        class _WeightNormVAE(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.proj = torch.nn.utils.parametrizations.weight_norm(
+                    nn.Conv1d(2, 3, kernel_size=3, bias=False)
+                )
+
+        expected = torch.arange(18, dtype=torch.float32).reshape(3, 2, 3) / 19
+        config = MiniMaxH3AudioVAEConfig()
+        with TemporaryDirectory() as root:
+            checkpoint = pathlib.Path(root) / "model.safetensors"
+            safetensors_save_file(
+                {
+                    "proj.weight": expected,
+                    "latents_mean": torch.arange(32, dtype=torch.float32),
+                    "latents_std": torch.arange(1, 33, dtype=torch.float32),
+                },
+                checkpoint,
+            )
+            with torch.device("meta"):
+                vae = _WeightNormVAE()
+            adaptations = _assign_direct_gpu_vae_state(
+                vae,
+                [str(checkpoint)],
+                component_name="audio_vae",
+                device=torch.device("cpu"),
+                vae_config=config,
+            )
+
+        self.assertEqual(adaptations, (1, ("latents_mean", "latents_std")))
+        self.assertEqual(set(vae.state_dict()), {"proj.weight"})
+        self.assertTrue(torch.equal(vae.proj.weight, expected))
+        self.assertEqual(config.arch_config.latents_mean, list(range(32)))
+        self.assertEqual(config.arch_config.latents_std, list(range(1, 33)))
 
     def test_rejects_nonstandard_state_lifecycle(self):
         class _CustomVAE(self._StandardVAE):
@@ -224,7 +347,7 @@ class TestDirectGPUVAEState(unittest.TestCase):
                 "optimize_vae",
                 side_effect=lambda vae: vae,
             ),
-            patch.object(vae_loader, "safetensors_load_file") as legacy_load,
+            patch("safetensors.torch.load_file") as legacy_load,
         ):
             safetensors_save_file(
                 {"proj.weight": expected_weight, "scale": expected_scale},
@@ -235,6 +358,59 @@ class TestDirectGPUVAEState(unittest.TestCase):
         legacy_load.assert_not_called()
         self.assertTrue(torch.equal(loaded.proj.weight, expected_weight))
         self.assertTrue(torch.equal(loaded.scale, expected_scale))
+
+    def test_native_vae_ignores_diffusers_auto_map_for_weight_override(self):
+        loader = vae_loader.VAELoader()
+        expected_weight = torch.arange(4, dtype=torch.bfloat16).reshape(2, 2)
+        expected_scale = torch.tensor([3.0], dtype=torch.bfloat16)
+
+        with TemporaryDirectory() as root:
+            checkpoint = pathlib.Path(root) / "override.safetensors"
+            safetensors_save_file(
+                {"proj.weight": expected_weight, "scale": expected_scale}, checkpoint
+            )
+
+            for direct_gpu_loading in (False, True):
+                with self.subTest(direct_gpu_loading=direct_gpu_loading):
+                    pipeline_config = QwenImagePipelineConfig()
+                    pipeline_config.native_only_components = ("vae",)
+                    server_args = _FakeServerArgs(pipeline_config)
+                    server_args.component_direct_gpu_weight_loading = {
+                        "vae": direct_gpu_loading
+                    }
+
+                    with (
+                        patch.object(
+                            vae_loader,
+                            "get_diffusers_component_config",
+                            return_value={
+                                "_class_name": "TestVAE",
+                                "auto_map": {"AutoModel": "custom.TestVAE"},
+                            },
+                        ),
+                        patch.object(
+                            loader,
+                            "resolve_component_weights_path",
+                            return_value=str(checkpoint),
+                        ),
+                        patch.object(
+                            vae_loader.ModelRegistry,
+                            "resolve_model_cls",
+                            return_value=(self._StandardVAE, None),
+                        ),
+                        patch.object(
+                            loader, "target_device", return_value=torch.device("cpu")
+                        ),
+                        patch.object(
+                            vae_loader.current_platform,
+                            "optimize_vae",
+                            side_effect=lambda vae: vae,
+                        ),
+                    ):
+                        loaded = loader.load_customized(root, server_args, "vae")
+
+                    self.assertTrue(torch.equal(loaded.proj.weight, expected_weight))
+                    self.assertTrue(torch.equal(loaded.scale, expected_scale))
 
     def test_quantized_checkpoint_does_not_fall_back_from_direct_loading(self):
         loader = vae_loader.VAELoader()
@@ -324,15 +500,15 @@ class TestVAELoader(unittest.TestCase):
         }
 
         with (
-            patch.object(vae_loader, "resolve_weight", return_value="resolved"),
+            patch.object(component_loader, "resolve_weight", return_value="resolved"),
             patch.object(
-                vae_loader,
+                component_loader,
                 "materialize_weight",
                 return_value="/cache/audio.safetensors",
             ),
         ):
             self.assertEqual(
-                loader.resolve_model_weights_path(
+                loader.resolve_component_weights_path(
                     "/base/audio_vae", server_args, "audio_vae"
                 ),
                 "/cache/audio.safetensors",
@@ -469,12 +645,6 @@ class TestVAELoader(unittest.TestCase):
 
         native_load.assert_not_called()
 
-    def test_pipeline_config_declares_an_empty_native_only_default(self):
-        loader = vae_loader.VAELoader()
-        server_args = _FakeServerArgs(QwenImagePipelineConfig())
-
-        self.assertFalse(loader.should_raise_customized_load_error(server_args, "vae"))
-
     def test_backfill_ltx2_audio_vae_latent_stats_maps_official_keys(self):
         loaded = {
             "per_channel_statistics.mean-of-means": torch.tensor([1.0, 2.0]),
@@ -510,59 +680,72 @@ class TestVAELoader(unittest.TestCase):
         self.assertNotIn("latents_mean", loaded)
         self.assertNotIn("latents_std", loaded)
 
-    def test_channels_last_3d_defaults_true_for_qwen_image_on_cuda(self):
+    def test_channels_last_3d_cuda_model_defaults(self):
+        cases = [
+            (QwenImagePipelineConfig, 1, "vae", True),
+            (WanT2V480PConfig, 1, "video_vae", True),
+            (FastWan2_2_TI2V_5B_Config, 1, "video_vae", True),
+            # Wan's spatial-parallel decode runs channels_last too
+            (Wan2_2_I2V_A14B_Config, 2, "video_vae", True),
+            (WanT2V480PConfig, 4, "video_vae", True),
+            (LTX2PipelineConfig, 1, "video_vae", True),
+            (LTX2PipelineConfig, 2, "video_vae", False),
+            (Cosmos3Config, 1, "vae", True),
+            (Cosmos3Config, 1, "video_vae", True),
+            (Cosmos3Config, 2, "video_vae", True),
+            (Cosmos3Config, 4, "vae", True),
+        ]
         with (
             patch.dict("os.environ", {}, clear=True),
             patch.object(vae_loader.current_platform, "is_cuda", return_value=True),
             patch.object(vae_loader.current_platform, "is_rocm", return_value=False),
         ):
-            server_args = _FakeServerArgs(QwenImagePipelineConfig())
-            self.assertTrue(_should_use_channels_last_3d(server_args, "vae"))
+            for config_cls, num_gpus, component, expected in cases:
+                with self.subTest(config=config_cls.__name__, num_gpus=num_gpus):
+                    server_args = _FakeServerArgs(config_cls(), num_gpus=num_gpus)
+                    self.assertEqual(
+                        _should_use_channels_last_3d(server_args, component), expected
+                    )
 
-    def test_channels_last_3d_defaults_true_for_single_gpu_wan_on_cuda(self):
-        with (
-            patch.dict("os.environ", {}, clear=True),
-            patch.object(vae_loader.current_platform, "is_cuda", return_value=True),
-            patch.object(vae_loader.current_platform, "is_rocm", return_value=False),
-        ):
-            server_args = _FakeServerArgs(WanT2V480PConfig(), num_gpus=1)
-            self.assertTrue(_should_use_channels_last_3d(server_args, "video_vae"))
+    @unittest.skipUnless(
+        hasattr(torch, "channels_last_3d"), "channels_last_3d is unavailable"
+    )
+    def test_channels_last_3d_multi_gpu_wan_keeps_encoder_layout(self):
+        cases = [
+            (WanT2V480PConfig, 1, {"encoder", "quant_conv", "decoder.0"}),
+            (Wan2_2_I2V_A14B_Config, 2, {"decoder.0"}),
+            (Cosmos3Config, 4, {"decoder.0"}),
+            (QwenImagePipelineConfig, 2, {"encoder", "quant_conv", "decoder.0"}),
+        ]
+        for config_cls, num_gpus, expected in cases:
+            with (
+                self.subTest(config=config_cls.__name__, num_gpus=num_gpus),
+                patch.dict("os.environ", {}, clear=True),
+            ):
+                vae = nn.Module()
+                vae.encoder = nn.Conv3d(2, 2, 3)
+                vae.quant_conv = nn.Conv3d(2, 2, 3)
+                vae.decoder = nn.Sequential(nn.Conv3d(2, 2, 3))
+                prefix = _channels_last_3d_prefix(
+                    _FakeServerArgs(config_cls(), num_gpus=num_gpus)
+                )
+                _convert_conv3d_weights_to_channels_last_3d(vae, prefix)
+                converted = {
+                    name
+                    for name, m in vae.named_modules()
+                    if isinstance(m, nn.Conv3d)
+                    and m.weight.is_contiguous(memory_format=torch.channels_last_3d)
+                }
+                self.assertEqual(converted, expected)
 
-    def test_channels_last_3d_defaults_true_for_single_gpu_fast_wan_on_cuda(self):
-        with (
-            patch.dict("os.environ", {}, clear=True),
-            patch.object(vae_loader.current_platform, "is_cuda", return_value=True),
-            patch.object(vae_loader.current_platform, "is_rocm", return_value=False),
+    def test_channels_last_3d_env_override_converts_whole_multi_gpu_wan_vae(self):
+        server_args = _FakeServerArgs(Wan2_2_I2V_A14B_Config(), num_gpus=2)
+        with patch.dict("os.environ", {"SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D": "1"}):
+            self.assertEqual(_channels_last_3d_prefix(server_args), "")
+        with patch.dict(
+            "os.environ", {"SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D": "auto"}
         ):
-            server_args = _FakeServerArgs(FastWan2_2_TI2V_5B_Config(), num_gpus=1)
-            self.assertTrue(_should_use_channels_last_3d(server_args, "video_vae"))
-
-    def test_channels_last_3d_defaults_false_for_multi_gpu_wan_on_cuda(self):
-        with (
-            patch.dict("os.environ", {}, clear=True),
-            patch.object(vae_loader.current_platform, "is_cuda", return_value=True),
-            patch.object(vae_loader.current_platform, "is_rocm", return_value=False),
-        ):
-            server_args = _FakeServerArgs(Wan2_2_I2V_A14B_Config(), num_gpus=2)
-            self.assertFalse(_should_use_channels_last_3d(server_args, "video_vae"))
-
-    def test_channels_last_3d_defaults_true_for_single_gpu_ltx_on_cuda(self):
-        with (
-            patch.dict("os.environ", {}, clear=True),
-            patch.object(vae_loader.current_platform, "is_cuda", return_value=True),
-            patch.object(vae_loader.current_platform, "is_rocm", return_value=False),
-        ):
-            server_args = _FakeServerArgs(LTX2PipelineConfig(), num_gpus=1)
-            self.assertTrue(_should_use_channels_last_3d(server_args, "video_vae"))
-
-    def test_channels_last_3d_defaults_false_for_multi_gpu_ltx_on_cuda(self):
-        with (
-            patch.dict("os.environ", {}, clear=True),
-            patch.object(vae_loader.current_platform, "is_cuda", return_value=True),
-            patch.object(vae_loader.current_platform, "is_rocm", return_value=False),
-        ):
-            server_args = _FakeServerArgs(LTX2PipelineConfig(), num_gpus=2)
-            self.assertFalse(_should_use_channels_last_3d(server_args, "video_vae"))
+            self.assertEqual(_channels_last_3d_prefix(server_args), "decoder.")
 
     def test_channels_last_3d_can_be_disabled_by_env(self):
         with (
@@ -610,9 +793,20 @@ class TestVAELoader(unittest.TestCase):
             patch.dict("os.environ", {}, clear=True),
             patch.object(vae_loader.current_platform, "is_cuda", return_value=False),
             patch.object(vae_loader.current_platform, "is_rocm", return_value=False),
+            patch.object(vae_loader.current_platform, "is_xpu", return_value=False),
         ):
             server_args = _FakeServerArgs(QwenImagePipelineConfig())
             self.assertFalse(_should_use_channels_last_3d(server_args, "vae"))
+
+    def test_channels_last_3d_selected_on_xpu(self):
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            patch.object(vae_loader.current_platform, "is_cuda", return_value=False),
+            patch.object(vae_loader.current_platform, "is_rocm", return_value=False),
+            patch.object(vae_loader.current_platform, "is_xpu", return_value=True),
+        ):
+            server_args = _FakeServerArgs(QwenImagePipelineConfig())
+            self.assertTrue(_should_use_channels_last_3d(server_args, "vae"))
 
     @unittest.skipUnless(
         hasattr(torch, "channels_last_3d"), "channels_last_3d is unavailable"
@@ -626,10 +820,29 @@ class TestVAELoader(unittest.TestCase):
         with (
             patch.object(wanvae.current_platform, "is_cuda", return_value=False),
             patch.object(wanvae.current_platform, "is_rocm", return_value=False),
+            patch.object(wanvae.current_platform, "is_xpu", return_value=False),
         ):
             out = wanvae.match_conv3d_input_format(x, weight)
 
         self.assertIs(out, x)
+
+    @unittest.skipUnless(
+        hasattr(torch, "channels_last_3d"), "channels_last_3d is unavailable"
+    )
+    def test_match_conv3d_input_format_uses_channels_last_3d_on_xpu(self):
+        x = torch.randn(1, 3, 2, 4, 4)
+        weight = torch.randn(3, 3, 1, 1, 1).contiguous(
+            memory_format=torch.channels_last_3d
+        )
+
+        with (
+            patch.object(wanvae.current_platform, "is_cuda", return_value=False),
+            patch.object(wanvae.current_platform, "is_rocm", return_value=False),
+            patch.object(wanvae.current_platform, "is_xpu", return_value=True),
+        ):
+            out = wanvae.match_conv3d_input_format(x, weight)
+
+        self.assertTrue(out.is_contiguous(memory_format=torch.channels_last_3d))
 
     @unittest.skipUnless(
         hasattr(torch, "channels_last_3d"), "channels_last_3d is unavailable"

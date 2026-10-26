@@ -4,6 +4,7 @@ import argparse
 import logging
 import os
 
+from sglang.cli.main import COOKBOOK_EPILOG
 from sglang.cli.serve_backends import (
     SERVE_BACKEND_API_VERSION,
     ServeBackend,
@@ -11,7 +12,13 @@ from sglang.cli.serve_backends import (
     ServeBackendRegistry,
     ServeRequest,
 )
-from sglang.cli.utils import get_is_diffusion_model, get_model_path, try_get_model_path
+from sglang.cli.utils import (
+    get_is_diffusion_model,
+    get_model_path,
+    get_pipeline_class_name,
+    is_registered_native_pipeline,
+    try_get_model_path,
+)
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.common import suppress_noisy_warnings
 
@@ -104,6 +111,10 @@ def _detect_diffusion(request: ServeRequest) -> ServeBackendDetection:
         return ServeBackendDetection.UNKNOWN
     if get_is_diffusion_model(request.model_path):
         return ServeBackendDetection.MATCH
+    # A native diffusion pipeline selected by name (e.g. FLUX.3's package
+    # directory, which has no model_index.json) is a diffusion request too.
+    if is_registered_native_pipeline(get_pipeline_class_name(list(request.argv))):
+        return ServeBackendDetection.MATCH
     return ServeBackendDetection.NO_MATCH
 
 
@@ -111,6 +122,10 @@ def _run_diffusion(request: ServeRequest) -> None:
     if any(arg in request.argv for arg in ("-h", "--help")):
         _print_diffusion_help(request)
         return
+
+    from sglang.multimodal_gen.runtime.platforms.plugins import apply_plugin_hooks
+
+    apply_plugin_hooks()
 
     from sglang.multimodal_gen.runtime.entrypoints.cli.serve import (
         add_multimodal_gen_serve_args,
@@ -182,6 +197,9 @@ def serve(args, extra_argv):
             _print_general_help(registry)
         else:
             registry.get(backend_name).backend.run(request)
+        # Printed here rather than as a backend parser's epilog so it appears
+        # exactly once, after whichever backend help ran.
+        print(f"\n{COOKBOOK_EPILOG}")
         return
 
     from sglang.srt.plugins import load_plugins
@@ -195,7 +213,7 @@ def serve(args, extra_argv):
         else:
             registered = registry.get(backend_name)
             logger.info(
-                "Dispatch override enabled: --model-type=%s " "(skip auto detection)",
+                "Dispatch override enabled: --model-type=%s (skip auto detection)",
                 backend_name,
             )
 

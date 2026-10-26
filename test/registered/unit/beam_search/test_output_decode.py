@@ -19,13 +19,15 @@ from sglang.srt.managers.detokenizer_manager import DetokenizerManager
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 STOP_ID = 99
 
 
 def _trim(output, finished_reason, no_stop_trim):
-    stub = SimpleNamespace(is_tool_call_parser_gpt_oss=False)
+    stub = SimpleNamespace(
+        is_tool_call_parser_gpt_oss=False, tool_close_token_ids=frozenset()
+    )
     return DetokenizerManager.trim_matched_stop(
         stub, output, finished_reason, no_stop_trim
     )

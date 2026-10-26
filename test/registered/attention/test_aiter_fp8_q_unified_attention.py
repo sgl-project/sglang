@@ -59,6 +59,7 @@ class TestAiterFP8QUnifiedAttention(CustomTestCase):
         backend.use_mla = branch == "mla"
         backend.kv_cache_is_vectorized_5d = branch == "vectorized"
         backend.use_triton_unified_attention = branch != "legacy"
+        backend.dcp_world_size = 1
         backend.kv_cache_dtype = kv_cache_dtype
         backend.input_dtype = torch.bfloat16
         backend.page_size = 1
@@ -199,6 +200,19 @@ class TestAiterFP8QUnifiedAttention(CustomTestCase):
             observed_q.reshape(q.shape[0], -1),
             original_q,
         )
+
+    def test_decode_applies_the_layer_softcap(self):
+        backend, layer, forward_batch, q = self._make_backend_case(
+            "unified", torch.bfloat16
+        )
+        layer.logit_cap = 50.0
+
+        with mock.patch.object(aiter_backend, "unified_attention") as unified:
+            backend.forward_decode(
+                q, None, None, layer, forward_batch, save_kv_cache=False
+            )
+
+        self.assertEqual(unified.call_args.kwargs["softcap"], 50.0)
 
     def test_fp8_q_kv_matches_bf16_reference_at_decode_shape(self):
         # This is the per-TP-rank production shape used by the full trace.

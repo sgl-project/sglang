@@ -17,7 +17,6 @@ if TYPE_CHECKING:
 
 
 class DeepseekMLACpuForwardMixin:
-
     def init_mla_fused_rope_cpu_forward(self: DeepseekV2AttentionMLA):
         assert hasattr(self, "has_fused_proj") and hasattr(self, "is_packed_weight")
 
@@ -61,9 +60,7 @@ class DeepseekMLACpuForwardMixin:
                     self.fused_qkv_a_proj_with_mqa.quant_method.quant_config.weight_block_size
                     == self.q_b_proj.quant_method.quant_config.weight_block_size
                 )
-                self.weight_block_size = (
-                    self.fused_qkv_a_proj_with_mqa.quant_method.quant_config.weight_block_size
-                )
+                self.weight_block_size = self.fused_qkv_a_proj_with_mqa.quant_method.quant_config.weight_block_size
 
     def forward_absorb_fused_mla_rope_cpu_prepare(
         self: DeepseekV2AttentionMLA,
@@ -72,9 +69,9 @@ class DeepseekMLACpuForwardMixin:
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
     ):
-        assert self.q_lora_rank is not None and use_intel_amx_backend(
-            self
-        ), "forward_absorb_fused_mla_rope_cpu_prepare requires q_lora_rank is not None and use_intel_amx_backend"
+        assert self.q_lora_rank is not None and use_intel_amx_backend(self), (
+            "forward_absorb_fused_mla_rope_cpu_prepare requires q_lora_rank is not None and use_intel_amx_backend"
+        )
 
         q_input, k_input, v_input = (
             torch.ops.sgl_kernel.qkv_proj_with_rope_fused_weight(
@@ -126,9 +123,9 @@ class DeepseekMLACpuForwardMixin:
         zero_allocator,
         gate=None,
     ):
-        assert self.q_lora_rank is not None and use_intel_amx_backend(
-            self
-        ), "forward_absorb_fused_mla_rope_cpu_core requires q_lora_rank is not None and use_intel_amx_backend"
+        assert self.q_lora_rank is not None and use_intel_amx_backend(self), (
+            "forward_absorb_fused_mla_rope_cpu_core requires q_lora_rank is not None and use_intel_amx_backend"
+        )
 
         attn_output = self.attn_mqa(q_input, k_input, v_input, forward_batch)
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)

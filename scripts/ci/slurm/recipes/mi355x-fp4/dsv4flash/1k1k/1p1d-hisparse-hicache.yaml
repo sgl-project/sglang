@@ -76,13 +76,13 @@ runtime:
     # absolute --hicache-size (GB per rank) as the dsr1 leg does.
     # At ratio 2 the pool leaves 3.67 GB for the c4 indexer pool and prefill dies.
     # --hicache-size is not an alternative: the DSV4 path rejects it.
-    prefill_extra_flags: "--enable-hierarchical-cache --hicache-ratio 1.2 --hicache-io-backend kernel --hicache-mem-layout layer_first"
+    prefill_extra_flags: "--context-length 9217 --max-total-tokens 262144 --enable-hierarchical-cache --hicache-ratio 1.2 --hicache-io-backend kernel --hicache-mem-layout layer_first"
     # DECODE: HiSparse. device_buffer_size 2048 sizes the device C4 pool so
     # requests admit (hisparse_req_budget > 0).
     # Host pool = token budget / 4. Flash budgets 26.2M against Pro's 12.3M, so an
     # uncapped decode wants 174 GB per rank, 1.4 TB over eight -- past the
     # reservation. At Pro's budget the pool is 65 GB per rank and fits.
-    decode_extra_flags: "--max-total-tokens 12253440 --disable-overlap-schedule --enable-hisparse --hisparse-config '{\"top_k\":1024,\"device_buffer_size\":2048,\"host_to_device_ratio\":2}'"
+    decode_extra_flags: "--max-total-tokens 1000000 --disable-overlap-schedule --enable-hisparse --hisparse-config '{\"top_k\":1024,\"device_buffer_size\":2048,\"host_to_device_ratio\":2}'"
     # At 0.85 Flash prefill is left with ~0.5 GiB of VRAM and the first lazily
     # loaded Triton kernel has no room; hipModuleLoadData then reports
     # hipErrorNoBinaryForGpu, which is about space, not the arch. Decode is fine

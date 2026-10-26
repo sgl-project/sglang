@@ -7,13 +7,27 @@ import logging
 from typing import Any
 
 from sglang.srt.arg_groups.overrides import (
-    declare_late_resolution,
+    declare_resolution,
     resolving_view,
 )
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef
+from sglang.srt.runtime_context import get_platform
 
 logger = logging.getLogger(__name__)
+
+
+def _check_v2_lora_modes(cfg: Any, option: str):
+    for unsupported, mode in (
+        (cfg.attn_dp_size > 1, "DP-attention with --attn-dp-size > 1"),
+        (cfg.enable_pdmux, "PD-multiplexing"),
+        (cfg.enable_two_batch_overlap, "two-batch overlap"),
+        # Both reach the legacy kv_b correction kernels with V2 batch metadata.
+        (envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get(), "SGLANG_EXPERIMENTAL_LORA_OPTI"),
+        (get_platform().is_hip, "ROCm"),
+    ):
+        if unsupported:
+            raise ValueError(f"{option} does not yet support {mode}")
 
 
 def check_lora_server_args(server_args: Any):
@@ -24,9 +38,7 @@ def check_lora_server_args(server_args: Any):
     # Enable LoRA if any LoRA paths are provided for backward compatibility.
     if cfg.lora_paths:
         if cfg.enable_lora is None:
-            declare_late_resolution(
-                server_args, "check_lora_server_args", enable_lora=True
-            )
+            declare_resolution(server_args, "check_lora_server_args", enable_lora=True)
             logger.warning(
                 "--enable-lora is set to True because --lora-paths is provided."
             )
@@ -36,8 +48,13 @@ def check_lora_server_args(server_args: Any):
             )
 
     if cfg.enable_lora:
+        if cfg.lora_backend == "triton_v2" and not cfg.moe_runner_backend.startswith(
+            "lora"
+        ):
+            _check_v2_lora_modes(cfg, "--lora-backend triton_v2")
+
         if cfg.enable_lora_overlap_loading is None:
-            declare_late_resolution(
+            declare_resolution(
                 server_args, "check_lora_server_args", enable_lora_overlap_loading=False
             )
 
@@ -76,9 +93,9 @@ def check_lora_server_args(server_args: Any):
                             pinned=False,
                         )
                 elif isinstance(lora_path, dict):
-                    assert (
-                        "lora_name" in lora_path and "lora_path" in lora_path
-                    ), f"When providing LoRA paths as a list of dict, each dict should contain 'lora_name' and 'lora_path' keys. Got: {lora_path}"
+                    assert "lora_name" in lora_path and "lora_path" in lora_path, (
+                        f"When providing LoRA paths as a list of dict, each dict should contain 'lora_name' and 'lora_path' keys. Got: {lora_path}"
+                    )
                     lora_ref = LoRARef(
                         lora_id=LoRARef.deterministic_id(
                             lora_path["lora_name"], lora_path["lora_path"]
@@ -93,11 +110,11 @@ def check_lora_server_args(server_args: Any):
                         "Expected a string or a dictionary."
                     )
                 parsed_lora_paths.append(lora_ref)
-            declare_late_resolution(
+            declare_resolution(
                 server_args, "check_lora_server_args", lora_paths=parsed_lora_paths
             )
         elif isinstance(cfg.lora_paths, dict):
-            declare_late_resolution(
+            declare_resolution(
                 server_args,
                 "check_lora_server_args",
                 lora_paths=[
@@ -111,9 +128,7 @@ def check_lora_server_args(server_args: Any):
                 ],
             )
         elif cfg.lora_paths is None:
-            declare_late_resolution(
-                server_args, "check_lora_server_args", lora_paths=[]
-            )
+            declare_resolution(server_args, "check_lora_server_args", lora_paths=[])
         else:
             raise ValueError(
                 f"Invalid type for --lora-paths: {type(cfg.lora_paths)}. "
@@ -123,20 +138,20 @@ def check_lora_server_args(server_args: Any):
         # Normalize target modules to a set; keep {"all"} as a sentinel
         # that gets resolved model-awarely in lora_manager.init_lora_shapes().
         if cfg.lora_target_modules:
-            declare_late_resolution(
+            declare_resolution(
                 server_args,
                 "check_lora_server_args",
                 lora_target_modules=set(cfg.lora_target_modules),
             )
             if "all" in cfg.lora_target_modules:
-                assert (
-                    len(cfg.lora_target_modules) == 1
-                ), "If 'all' is specified in --lora-target-modules, it should be the only module specified."
+                assert len(cfg.lora_target_modules) == 1, (
+                    "If 'all' is specified in --lora-target-modules, it should be the only module specified."
+                )
 
         # Ensure sufficient information is provided for LoRA initialization.
-        assert cfg.lora_paths or (
-            cfg.max_lora_rank and cfg.lora_target_modules
-        ), "When no initial --lora-paths is provided, you need to specify both --max-lora-rank and --lora-target-modules for LoRA initialization."
+        assert cfg.lora_paths or (cfg.max_lora_rank and cfg.lora_target_modules), (
+            "When no initial --lora-paths is provided, you need to specify both --max-lora-rank and --lora-target-modules for LoRA initialization."
+        )
 
         # Validate max_loaded_loras
         if cfg.max_loaded_loras is not None:
@@ -158,9 +173,68 @@ def check_lora_server_args(server_args: Any):
         if cfg.lora_use_virtual_experts:
             logger.info("Virtual expert computation enabled.")
 
-        assert (
-            cfg.lora_drain_wait_threshold >= 0.0
-        ), "--lora-drain-wait-threshold must be non-negative."
+        assert cfg.lora_drain_wait_threshold >= 0.0, (
+            "--lora-drain-wait-threshold must be non-negative."
+        )
+
+    check_lora_moe_runner_args(server_args)
+
+
+def check_lora_moe_runner_args(server_args: Any):
+    """Reject unsupported LoRA MoE configurations before layer attachment."""
+    cfg = resolving_view(server_args)
+    if (
+        cfg.speculative_algorithm is not None
+        and cfg.speculative_moe_runner_backend is not None
+        and cfg.speculative_moe_runner_backend.startswith("lora")
+    ):
+        # Draft models have no LoRA adapters.
+        raise ValueError(
+            f"--speculative-moe-runner-backend {cfg.speculative_moe_runner_backend} "
+            "is not supported: the LoRA MoE runner serves adapter traffic on the "
+            "target model"
+        )
+    backend = cfg.moe_runner_backend
+    if not backend.startswith("lora"):
+        return
+    if not cfg.enable_lora:
+        raise ValueError(
+            f"--moe-runner-backend {backend} requires --enable-lora (or --lora-paths)"
+        )
+    if cfg.lora_backend != "triton_v2":
+        raise ValueError(
+            f"--moe-runner-backend {backend} requires --lora-backend triton_v2"
+        )
+    _check_v2_lora_modes(cfg, f"--moe-runner-backend {backend}")
+    # Layer attachment checks the specific weight layout within each scheme.
+    if cfg.quantization not in (None, "fp8", "modelopt_fp4"):
+        raise ValueError(
+            f"--moe-runner-backend {backend} supports unquantized BF16, 128-block "
+            f"FP8 and ModelOpt NVFP4 MoE, got --quantization {cfg.quantization}"
+        )
+    if cfg.quantization == "modelopt_fp4" and backend != "lora_marlin":
+        raise ValueError(
+            f"--moe-runner-backend {backend} cannot run ModelOpt NVFP4 MoE; "
+            "use --moe-runner-backend lora_marlin"
+        )
+    if cfg.moe_a2a_backend != "none":
+        raise ValueError(
+            f"--moe-runner-backend {backend} requires Standard dispatch, "
+            f"got --moe-a2a-backend {cfg.moe_a2a_backend}"
+        )
+    if cfg.ep_join_mode is not None:
+        raise ValueError(
+            f"--moe-runner-backend {backend} does not yet support elastic EP"
+        )
+    if (
+        cfg.enable_eplb
+        or cfg.init_expert_location != "trivial"
+        or cfg.ep_num_redundant_experts > 0
+    ):
+        raise ValueError(
+            f"--moe-runner-backend {backend} currently requires trivial expert placement "
+            "without EPLB or redundant experts"
+        )
 
 
 def check_lora_speculative_compatibility(server_args: Any):

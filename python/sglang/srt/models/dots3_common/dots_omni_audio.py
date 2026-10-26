@@ -918,8 +918,7 @@ class DotsEncoderWithMask(nn.Module):
         while time_step * SAMPLE_RATE < audio_waveform.shape[0]:
             segments.append(
                 audio_waveform[
-                    time_step
-                    * SAMPLE_RATE : (time_step + self.chunk_seconds)
+                    time_step * SAMPLE_RATE : (time_step + self.chunk_seconds)
                     * SAMPLE_RATE
                 ]
             )

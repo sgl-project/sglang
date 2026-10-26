@@ -49,6 +49,15 @@ def _ring_pair_via_impl(impl, q, k_shard, v_shard):
 class RingReplicatedBase(unittest.TestCase):
     B, S_SHARD, REP, H, D = 1, 6, 3, 2, 8
 
+    def setUp(self):
+        # start() + addCleanup rather than enterContext, which is 3.11+.
+        patcher = patch(
+            f"{_LAYER}._usp_input_all_to_all_qkv",
+            side_effect=lambda q, k, v: (q, k, v),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def _attn(self):
         obj = USPAttention.__new__(USPAttention)
         obj.skip_sequence_parallel = False
@@ -77,8 +86,8 @@ class RingReplicatedBase(unittest.TestCase):
             ),
             patch(
                 f"{_LAYER}.ring_attn",
-                side_effect=lambda q, k, v, impl, return_softmax_lse: _ring_pair_via_impl(
-                    impl, q, k, v
+                side_effect=lambda q, k, v, impl, return_softmax_lse: (
+                    _ring_pair_via_impl(impl, q, k, v)
                 ),
             ),
         )
@@ -142,14 +151,19 @@ class TestRingReplicatedSuffix(RingReplicatedBase):
                 o.copy_(t)
 
         ps = self._patches(ring_ws=1)
-        with ps[0], ps[4], ps[5], ps[6], patch(
-            f"{_LAYER}.get_ring_parallel_world_size", return_value=1
-        ), patch(f"{_LAYER}.get_sequence_parallel_world_size", return_value=2), patch(
-            f"{_LAYER}.get_ulysses_parallel_world_size", return_value=2
-        ), patch(
-            f"{_LAYER}.get_sp_group", return_value=SimpleNamespace(ulysses_group=None)
-        ), patch(
-            "torch.distributed.all_gather", side_effect=_fake_gather
+        with (
+            ps[0],
+            ps[4],
+            ps[5],
+            ps[6],
+            patch(f"{_LAYER}.get_ring_parallel_world_size", return_value=1),
+            patch(f"{_LAYER}.get_sequence_parallel_world_size", return_value=2),
+            patch(f"{_LAYER}.get_ulysses_parallel_world_size", return_value=2),
+            patch(
+                f"{_LAYER}.get_sp_group",
+                return_value=SimpleNamespace(ulysses_group=None),
+            ),
+            patch("torch.distributed.all_gather", side_effect=_fake_gather),
         ):
             # Identity-mocked collectives don't reproduce head-shard shapes,
             # so the final concat may fail — the kernel K order is recorded

@@ -112,7 +112,7 @@ export const config = {
     // GSM8K is the required accuracy sanity on every verified cell (cookbook_guide §3), via sgl-eval.
     accuracy: {
       gsm8k_pct:
-`# pip install git+https://github.com/sgl-project/sgl-eval
+`# pip install sgl-eval
 sgl-eval run gsm8k \\
   --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1 \\
   --num-threads 128`,
@@ -121,7 +121,7 @@ sgl-eval run gsm8k \\
       // AIME25 with thinking, serve with a copy of the model's chat template whose
       // enable_thinking default is flipped to true, passed via --chat-template.
       aime25_pct:
-`# pip install git+https://github.com/sgl-project/sgl-eval
+`# pip install sgl-eval
 # Serve with an enable_thinking=true chat template (see Configuration Tips: Thinking).
 sgl-eval run aime25 \\
   --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1 \\

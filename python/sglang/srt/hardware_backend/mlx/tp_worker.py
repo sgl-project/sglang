@@ -29,7 +29,7 @@ from sglang.srt.hardware_backend.mlx.sampling import (
     MlxStepLogprobs,
     lazy_logprob_arrays,
 )
-from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import (
@@ -82,7 +82,7 @@ class MlxTpModelWorker(TpModelWorker):
             MlxModelRunnerStub,
         )
 
-        MlxModelRunnerStub.validate_startup_weight_load_mode(self.server_args)
+        MlxModelRunnerStub.validate_startup_weight_load_mode()
 
         from sglang.srt.hardware_backend.mlx.model_runner import MlxModelRunner
 
@@ -108,7 +108,6 @@ class MlxTpModelWorker(TpModelWorker):
             model_config=self.model_config,
             mem_fraction_static=get_schedule().mem_fraction_static,
             gpu_id=self.gpu_id,
-            ps=self.ps,
             nccl_port=self.nccl_port,
             server_args=self.server_args,
             is_draft_worker=self.is_draft_worker,
@@ -119,6 +118,8 @@ class MlxTpModelWorker(TpModelWorker):
         )
 
         self._mlx_active_rids: set[str] = set()
+        # rid -> req.retraction_count when its MLX state was created.
+        self._req_retraction_count: dict[str, int] = {}
         self._mlx_pool_initialized = False
 
     def get_pad_input_ids_func(self):
@@ -162,17 +163,33 @@ class MlxTpModelWorker(TpModelWorker):
             stale_rids = self._mlx_active_rids - current_rids
             for rid in stale_rids:
                 self._mlx_runner.remove_request(rid)
+                self._req_retraction_count.pop(rid, None)
             self._mlx_active_rids = current_rids
         else:
             self._mlx_active_rids |= current_rids
 
     def prepare_for_kv_cache_release(self, req) -> None:
-        """Snapshot MLX auxiliary state at the scheduler's radix insert point."""
+        """Write the request's MLX state to the pool at the scheduler's radix
+        insert point, while the request still owns its req_to_token row."""
         if self._mlx_runner.has_request(req.rid):
             self._mlx_runner.store_auxiliary_state_for_request(req.rid)
             # Prefer the just-snapshotted live auxiliary state for the final
             # insert. Any older tracked slot is released during component cleanup.
             req.kv.mamba_last_track_seqlen = None
+            self._mlx_runner.release_request_row(req.rid, req.owned_kv_len())
+
+    def _drop_state_if_retracted(self, req: Req) -> None:
+        """Drop the MLX state of a request retracted since its state was made.
+
+        The scheduler freed that KV without a tree insert, so nothing is synced
+        to the pool. Kept state would make the re-prefill route as a
+        continuation and extend the old KV a second time.
+        """
+        made_at = self._req_retraction_count.get(req.rid)
+        if made_at is not None and made_at != req.retraction_count:
+            del self._req_retraction_count[req.rid]
+            self._mlx_runner.remove_request(req.rid)
+            self._mlx_active_rids.discard(req.rid)
 
     def _route_extend_request(self, rid: str, decoding_rids: set[str]) -> str:
         """Classify a request within an extend / mixed batch.
@@ -206,9 +223,9 @@ class MlxTpModelWorker(TpModelWorker):
         discarded (the runner pops it as the stale intermediate token), so
         the runner may skip the logit head for it.
         """
-        if req.extend_range is None:
+        if req.extend_end is None:
             return True
-        return req.extend_range.end >= len(req.full_untruncated_fill_ids)
+        return req.extend_end >= len(req.full_untruncated_fill_ids)
 
     @staticmethod
     def _sampling_active(batch: ScheduleBatch) -> bool:
@@ -443,10 +460,6 @@ class MlxTpModelWorker(TpModelWorker):
             )
 
         if forward_mode.is_extend():
-            # TODO (changminbark): Implement per-batch flushing using prefix_slot_ids
-            # Ensure the pool is up-to-date before pool-backed attention
-            # reads it for prefix-cached prefills. Mirror the sync path.
-            self._mlx_runner.flush_all_decode_kv()
             return self._async_extend_batch(batch)
 
         raise ValueError(
@@ -478,7 +491,10 @@ class MlxTpModelWorker(TpModelWorker):
             offset += seq_len
             slot_offset += seq_len
 
+            self._drop_state_if_retracted(req)
             route = self._route_extend_request(req.rid, decoding_rids)
+            if route == "prefill":
+                self._req_retraction_count[req.rid] = req.retraction_count
             if route == "continuation":
                 pending_extends.append(
                     self._mlx_runner.extend_start(
@@ -493,7 +509,14 @@ class MlxTpModelWorker(TpModelWorker):
             elif route == "decode":
                 mixed_decode_rids.append(req.rid)
             else:  # "prefill"
-                prefix_slot_ids = req.prefix_indices.tolist()
+                # The allocation wrote the matched prefix into the request's row.
+                prefix_slot_ids = (
+                    self._model_runner.req_to_token_pool.req_to_token[
+                        req.kv.req_pool_idx, : req.prefix_len
+                    ].tolist()
+                    if req.prefix_len
+                    else []
+                )
                 full_token_ids = list(req.get_fill_ids())
                 pending_prefills.append(
                     self._mlx_runner.prefill_start(

@@ -149,7 +149,7 @@ def test_main(
                 for with_topk in (False, True):
                     if local_rank == 0:
                         print(
-                            f'[testing] Running with {"FP8" if isinstance(current_x, tuple) else "BF16"}, {"with" if with_topk else "without"} top-k (async={async_mode}, previous={previous_mode}) ...',
+                            f"[testing] Running with {'FP8' if isinstance(current_x, tuple) else 'BF16'}, {'with' if with_topk else 'without'} top-k (async={async_mode}, previous={previous_mode}) ...",
                             flush=True,
                             end="",
                         )
@@ -192,9 +192,9 @@ def test_main(
 
                     # Checks
                     recv_gbl_rank_prefix_sum = handle[-4]
-                    assert gbl_num_tokens_per_rank[rank].item() == recv_x.size(
-                        0
-                    ), f"{gbl_num_tokens_per_rank[rank].item()} != {recv_x.size(0)}"
+                    assert gbl_num_tokens_per_rank[rank].item() == recv_x.size(0), (
+                        f"{gbl_num_tokens_per_rank[rank].item()} != {recv_x.size(0)}"
+                    )
                     assert (
                         gbl_num_tokens_per_expert.view(num_ranks, -1)[rank].tolist()
                         == recv_num_tokens_per_expert_list
@@ -316,10 +316,13 @@ def test_main(
                 tune_args = {"x": current_x, "handle": handle, "config": config}
                 t = bench(lambda: buffer.dispatch(**tune_args))[0]
                 if t < best_time:
-                    best_time, best_results = t, (
-                        num_sms,
-                        nvl_chunk_size,
-                        rdma_chunk_size,
+                    best_time, best_results = (
+                        t,
+                        (
+                            num_sms,
+                            nvl_chunk_size,
+                            rdma_chunk_size,
+                        ),
                     )
                 if local_rank == 0:
                     print(
@@ -328,7 +331,7 @@ def test_main(
                     )
         if local_rank == 0:
             print(
-                f'[tuning] Best dispatch ({"FP8" if isinstance(current_x, tuple) else "BF16"}): SMs {best_results[0]}, NVL chunk {best_results[1]}, RDMA chunk {best_results[2]}: {rdma_send_bytes / 1e9 / best_time:.2f} GB/s (RDMA), {nvl_recv_bytes / 1e9 / best_time:.2f} GB/s (NVL)',
+                f"[tuning] Best dispatch ({'FP8' if isinstance(current_x, tuple) else 'BF16'}): SMs {best_results[0]}, NVL chunk {best_results[1]}, RDMA chunk {best_results[2]}: {rdma_send_bytes / 1e9 / best_time:.2f} GB/s (RDMA), {nvl_recv_bytes / 1e9 / best_time:.2f} GB/s (NVL)",
                 flush=True,
             )
             print("", flush=True)
@@ -385,10 +388,13 @@ def test_main(
                     flush=True,
                 )
                 if t < best_time:
-                    best_time, best_results = t, (
-                        num_sms,
-                        nvl_chunk_size,
-                        rdma_chunk_size,
+                    best_time, best_results = (
+                        t,
+                        (
+                            num_sms,
+                            nvl_chunk_size,
+                            rdma_chunk_size,
+                        ),
                     )
 
     if local_rank == 0:

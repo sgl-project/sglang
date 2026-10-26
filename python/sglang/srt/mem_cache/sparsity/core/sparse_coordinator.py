@@ -142,7 +142,7 @@ class SparseCoordinator:
 
         Registers the request in the state tracker to enable sparse attention processing.
         """
-        if req.kv.req_pool_idx is not None:
+        if req.kv.holds_kv:
             self.states.register(req.kv.req_pool_idx, len(req.origin_input_ids))
 
     def on_request_end(self, req: "Req") -> None:
@@ -150,7 +150,7 @@ class SparseCoordinator:
         Handle request end event. Called when a request is completed or aborted.
         Cleans up request-specific state and releases resources.
         """
-        if req.kv.req_pool_idx is None:
+        if not req.kv.holds_kv:
             return
 
         self.states.clear(req.kv.req_pool_idx)

@@ -468,7 +468,6 @@ class AWQLinearMethod(LinearMethodBase):
 
 
 class AWQMoEMethod(FusedMoEMethodBase):
-
     def __init__(self, quant_config: AWQMarlinConfig):
         self.quant_config = quant_config
         self.quant_type = scalar_types.uint4
@@ -500,6 +499,9 @@ class AWQMoEMethod(FusedMoEMethodBase):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         layer.scheme.create_moe_runner(layer, moe_runner_config)
+
+    def get_moe_runner_backend(self, layer):
+        return layer.scheme.get_moe_runner_backend(layer)
 
     def apply(
         self,

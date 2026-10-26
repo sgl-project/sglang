@@ -137,19 +137,21 @@ def main():
                 # b32 x 128K on the 8-KV-head config exceeds the microbench's single
                 # contiguous KV tensor (faults the GPU); real serving uses a paged pool.
                 if H_KV == 8 and B == 32 and S == 131072:
-                    print(f"{B:>5} {S//1024:>5}K {'skipped (contiguous-KV limit)':>30}")
+                    print(
+                        f"{B:>5} {S // 1024:>5}K {'skipped (contiguous-KV limit)':>30}"
+                    )
                     rows.append(f"{name},{H_Q},{H_KV},{B},{S},,,,skip,")
                     continue
                 try:
                     std, lean, cos, gate = run(H_Q, H_KV, B, S)
                 except torch.cuda.OutOfMemoryError:
                     torch.cuda.empty_cache()
-                    print(f"{B:>5} {S//1024:>5}K {'OOM':>9}")
+                    print(f"{B:>5} {S // 1024:>5}K {'OOM':>9}")
                     rows.append(f"{name},{H_Q},{H_KV},{B},{S},,,,OOM,")
                     continue
                 sp = std / lean
                 print(
-                    f"{B:>5} {S//1024:>5}K {std:>9.3f} {lean:>9.3f} {sp:>7.2f}x {('ON' if gate else 'OFF'):>5} {cos:>7.4f}"
+                    f"{B:>5} {S // 1024:>5}K {std:>9.3f} {lean:>9.3f} {sp:>7.2f}x {('ON' if gate else 'OFF'):>5} {cos:>7.4f}"
                 )
                 rows.append(
                     f"{name},{H_Q},{H_KV},{B},{S},{std:.4f},{lean:.4f},{sp:.4f},{cos:.4f},{int(gate)}"

@@ -15,9 +15,9 @@ on:
         default: 'all'
         options:
           - 'all'
+          - rocm10
           - rocm724
           - rocm720
-          - rocm700
 
 jobs:
   publish:
@@ -29,7 +29,7 @@ jobs:
       # others mid-push and leave the release tag with a partial image set.
       fail-fast: false
       matrix:
-        rocm_version: ${{ fromJson((github.event_name == 'workflow_dispatch' && inputs.rocm_version != 'all' && inputs.rocm_version != '') && format('["{0}"]', inputs.rocm_version) || '["rocm700", "rocm720", "rocm724"]') }}
+        rocm_version: ${{ fromJson((github.event_name == 'workflow_dispatch' && inputs.rocm_version != 'all' && inputs.rocm_version != '') && format('["{0}"]', inputs.rocm_version) || '["rocm10", "rocm720", "rocm724"]') }}
         gpu_arch: ['gfx942', 'gfx950']
         build_type: ['all']
     steps:
@@ -70,21 +70,25 @@ jobs:
           echo "Version: ${version}"
 
           gpu_arch_suffix=""
-          if [ "${{ matrix.rocm_version }}" = "rocm700" ]; then
-            if [ "${{ matrix.gpu_arch }}" = "gfx942" ]; then
-              rocm_tag="rocm700-mi30x"
-            elif [ "${{ matrix.gpu_arch }}" = "gfx950" ]; then
-              rocm_tag="rocm700-mi35x"
-            else
-              echo "Unsupported gfx arch"
-              exit 1
-            fi
-          elif [ "${{ matrix.rocm_version }}" = "rocm720" ] || [ "${{ matrix.rocm_version }}" = "rocm724" ]; then
+          if [ "${{ matrix.rocm_version }}" = "rocm720" ] || [ "${{ matrix.rocm_version }}" = "rocm724" ]; then
             gpu_arch_suffix="-${{ matrix.rocm_version }}"
             if [ "${{ matrix.gpu_arch }}" = "gfx942" ]; then
               rocm_tag="${{ matrix.rocm_version }}-mi30x"
             elif [ "${{ matrix.gpu_arch }}" = "gfx950" ]; then
               rocm_tag="${{ matrix.rocm_version }}-mi35x"
+            else
+              echo "Unsupported gfx arch"
+              exit 1
+            fi
+          elif [ "${{ matrix.rocm_version }}" = "rocm10" ]; then
+            # The Dockerfile stages carry the full SDK version (gfx942-rocm1000)
+            # while the published tag keeps the rocm10 flavor name that CI and
+            # the nightly images already use.
+            gpu_arch_suffix="-rocm1000"
+            if [ "${{ matrix.gpu_arch }}" = "gfx942" ]; then
+              rocm_tag="rocm10-mi30x"
+            elif [ "${{ matrix.gpu_arch }}" = "gfx950" ]; then
+              rocm_tag="rocm10-mi35x"
             else
               echo "Unsupported gfx arch"
               exit 1

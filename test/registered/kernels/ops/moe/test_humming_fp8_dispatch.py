@@ -6,13 +6,10 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.kernels.ops.attention.dsv4.moe import (
-    silu_and_mul_masked_post_quant,
-)
+from sglang.kernels.ops.moe.dsv4 import silu_and_mul_masked_post_quant
 from sglang.kernels.ops.moe.ep_moe_kernels import moe_permute_with_scale
 from sglang.srt.layers.moe.moe_runner import humming as humming_runner
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
-from sglang.srt.layers.quantization import humming_utils
 from sglang.srt.utils import get_device_sm
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -39,6 +36,8 @@ class TestHummingFp8Dispatch(CustomTestCase):
             raise unittest.SkipTest("Humming FP8 dispatch requires SM90")
 
     def test_fp8_dispatch_preserves_group_scales(self):
+        from sglang.srt.layers.quantization import humming_utils
+
         generator = torch.Generator(device="cuda").manual_seed(0)
         hidden_states = torch.randn(
             5,
@@ -196,8 +195,7 @@ class TestHummingFp8Dispatch(CustomTestCase):
                         side_effect=AssertionError("SiLU fused path was not selected"),
                     ) as fallback_activation,
                     patch(
-                        "sglang.kernels.ops.attention.dsv4.moe."
-                        "silu_and_mul_masked_post_quant",
+                        "sglang.kernels.ops.moe.dsv4.silu_and_mul_masked_post_quant",
                         side_effect=run_poisoned_kernel,
                     ) as fused_silu,
                 ):
@@ -259,6 +257,107 @@ class TestHummingFp8Dispatch(CustomTestCase):
                         self.assertTrue(
                             bool(actual_scale[expert, valid:].isnan().all())
                         )
+
+
+class TestHummingInactiveRoutes(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        if not torch.cuda.is_available():
+            raise unittest.SkipTest("CUDA is not available")
+
+    def test_indexed_finalize_skips_poisoned_routes_without_ep(self):
+        from sglang.kernels.ops.moe.moe_fused_mul_sum import moe_fused_mul_sum
+
+        ids = torch.tensor(
+            [[0, 1], [1, -1], [-1, -1], [1, 0]], device="cuda", dtype=torch.int32
+        )
+        weights = torch.tensor(
+            [[0.25, 0.75], [0.6, 0.4], [0.3, 0.7], [0.8, 0.2]], device="cuda"
+        )
+        # A legal leading storage record makes a negative map lookup observable
+        # without making the test depend on an out-of-allocation device read.
+        map_storage = torch.tensor([0, 0, -1], device="cuda", dtype=torch.int32)
+        for dtype in (torch.bfloat16, torch.float16):
+            for expert_map in (None, map_storage[1:]):
+                for poison_weights in (False, True):
+                    with self.subTest(
+                        dtype=dtype,
+                        mapped=expert_map is not None,
+                        poison_weights=poison_weights,
+                    ):
+                        valid = ids >= 0
+                        if expert_map is not None:
+                            valid &= expert_map[ids.clamp_min(0)] >= 0
+                        values = (
+                            torch.arange(4 * 2 * 128, device="cuda")
+                            .reshape(4, 2, 128)
+                            .remainder(11)
+                            .to(dtype)
+                        )
+                        values[~valid] = float("nan")
+                        route_weights = weights.clone()
+                        if poison_weights:
+                            route_weights[~valid] = float("nan")
+                        expected = (
+                            (
+                                torch.where(valid.unsqueeze(-1), values.float(), 0)
+                                * torch.where(valid, route_weights, 0).unsqueeze(-1)
+                            )
+                            .sum(dim=1)
+                            .to(dtype)
+                        )
+                        actual = moe_fused_mul_sum(
+                            values,
+                            route_weights,
+                            topk_ids=ids,
+                            expert_map=expert_map,
+                            is_ep=False,
+                        )
+                        self.assertTrue(torch.isfinite(actual).all().item())
+                        torch.testing.assert_close(actual, expected)
+                        self.assertEqual(torch.count_nonzero(actual[2]).item(), 0)
+
+    def test_grouped_permutation_skips_inactive_routes_without_ep(self):
+        from sglang.kernels.ops.moe.ep_moe_kernels import moe_permute, moe_unpermute
+
+        ids = torch.tensor(
+            [[0, 1], [1, -1], [-1, -1], [1, 0]], device="cuda", dtype=torch.int32
+        )
+        weights = torch.tensor(
+            [[0.25, 0.75], [0.6, 0.4], [0.3, 0.7], [0.8, 0.2]], device="cuda"
+        )
+        inputs = (
+            torch.arange(4 * 128, device="cuda")
+            .reshape(4, 128)
+            .remainder(7)
+            .to(torch.bfloat16)
+        )
+        output = torch.full(
+            (ids.numel(), 128), float("nan"), device="cuda", dtype=inputs.dtype
+        )
+        permuted, src2dst, offsets = moe_permute(
+            inputs, ids, num_experts=2, is_ep=False, outputs=output
+        )
+        self.assertTrue((src2dst.view_as(ids)[ids < 0] < 0).all().item())
+        torch.testing.assert_close(
+            offsets, torch.tensor([0, 2, 5], device="cuda", dtype=torch.int32)
+        )
+        down = torch.full_like(permuted, float("nan"))
+        reference = torch.zeros_like(inputs)
+        for expert in range(2):
+            start, end = int(offsets[expert]), int(offsets[expert + 1])
+            down[start:end] = permuted[start:end] * (expert + 1)
+        for token in range(ids.shape[0]):
+            for slot in range(ids.shape[1]):
+                expert = int(ids[token, slot])
+                if expert >= 0:
+                    reference[token] += (
+                        inputs[token] * (expert + 1) * weights[token, slot]
+                    )
+        actual = moe_unpermute(down, src2dst, ids, weights)
+        self.assertTrue(torch.isfinite(actual).all().item())
+        torch.testing.assert_close(actual, reference, rtol=1e-2, atol=1e-2)
+        self.assertEqual(torch.count_nonzero(actual[2]).item(), 0)
 
 
 if __name__ == "__main__":

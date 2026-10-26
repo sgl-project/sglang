@@ -24,7 +24,7 @@ Usage:
 from sglang.test.ci.ci_register import register_cpu_ci
 
 # CPU-only unit test; no CUDA/distributed dependencies.
-register_cpu_ci(est_time=9, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 import types
 import unittest
@@ -74,7 +74,7 @@ class FusedMoEWithLoRAInplaceTest(unittest.TestCase):
         from sglang.srt.lora.layers import FusedMoEWithLoRA
 
         base_layer = _make_base_layer(quant_method)
-        lora_backend = types.SimpleNamespace()
+        lora_backend = types.SimpleNamespace(name="triton")
         self.assertTrue(base_layer.moe_runner_config.inplace)
         layer = FusedMoEWithLoRA(base_layer, lora_backend)
         return layer, base_layer

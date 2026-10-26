@@ -33,7 +33,7 @@ _EXPERT_WEIGHT_NAMES = (
 
 class DwdpManager:
     def __init__(self, server_args: ServerArgs):
-        self.dwdp_size = server_args.dwdp_size
+        self.dwdp_size = get_parallel().dwdp_size
         self.dwdp_rank = get_parallel().tp_rank
         self.device_id = torch.cuda.current_device()
         self.layout: Optional[DwdpExpertLayout] = None

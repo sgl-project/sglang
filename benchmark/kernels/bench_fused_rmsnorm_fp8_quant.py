@@ -149,9 +149,9 @@ def _check_correctness():
             cos = torch.nn.functional.cosine_similarity(
                 (q.float() * scale).flatten(), ref_deq.flatten(), dim=0
             ).item()
-            assert (
-                cos > 0.99
-            ), f"{provider} h={hidden_size} residual={add_residual} cos={cos:.4f}"
+            assert cos > 0.99, (
+                f"{provider} h={hidden_size} residual={add_residual} cos={cos:.4f}"
+            )
     print("correctness check passed (all fused providers vs unfused within FP8)")
 
 

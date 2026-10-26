@@ -6,6 +6,7 @@ from typing import Any, Callable, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.parameter import (
     GroupQuantScaleParameter,
     ModelWeightParameter,
@@ -22,13 +23,146 @@ from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
 from sglang.srt.layers.quantization.online_quantization import CopyNumelCounter
 from sglang.srt.layers.quantization.quark.schemes import QuarkLinearScheme
 from sglang.srt.layers.quantization.quark.utils import Nvfp4SourceConfig
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import get_bool_env_var, is_hip
 from sglang.srt.utils.common import direct_register_custom_op, is_gfx95_supported
 
 NVFP4_BLOCK_SIZE = 16
 
 _is_hip = is_hip()
+
+_ASM_FP4_SCALE_ROW_MULTIPLE = 32
+_ASM_FP4_SCALE_COL_MULTIPLE = 8
+# Workaround: gemm_a4w4's untuned ASM heuristic returns wrong rows 1..M-1 for
+# N <= 128 at 2 <= M <= 64 (measured on ROCm/aiter@e7d2453f2, MI355X).
+# TODO(vorapolsiloai): link the AITER issue; drop once the heuristic is fixed.
+_ASM_FP4_UNSAFE_MAX_N = 128
+
+# Keep this path opt-in while the AITER ASM integration is validated across the
+# Quark model matrix. Unlike the Triton fallback, it consumes AITER's
+# a4w4_blockscale_tuned_gemm CSVs.
+_use_aiter_asm_fp4_gemm = _is_hip and envs.SGLANG_ROCM_USE_AITER_FP4_ASM_GEMM.get()
+
+
+def _asm_fp4_scale_swizzle_supported(weight_scale: torch.Tensor) -> bool:
+    if weight_scale.ndim != 2:
+        return False
+    rows, cols = weight_scale.shape
+    return (
+        rows % _ASM_FP4_SCALE_ROW_MULTIPLE == 0
+        and cols % _ASM_FP4_SCALE_COL_MULTIPLE == 0
+    )
+
+
+def _swizzle_asm_fp4_scale(scale: torch.Tensor) -> torch.Tensor:
+    """Convert a (rows, K/32) E8M0 scale tensor to AITER ASM tile order."""
+    rows, cols = scale.shape
+    return (
+        scale.view(rows // 32, 2, 16, cols // 8, 2, 4, 1)
+        .permute(0, 3, 5, 2, 4, 1, 6)
+        .contiguous()
+        .view(rows, cols)
+    )
+
+
+# Padding of AITER's per_1x32_f4_quant(shuffle=True) activation scales.
+_ASM_FP4_ACT_SCALE_ROW_MULTIPLE = 256
+_E8M0_ONE = 0x7F
+
+
+def _shuffle_asm_fp4_act_scale(x_scales: torch.Tensor) -> torch.Tensor:
+    """Pad and swizzle row-major (M, K/32) E8M0 activation scales for gemm_a4w4."""
+    rows, cols = x_scales.shape
+    row_tile, col_tile = _ASM_FP4_ACT_SCALE_ROW_MULTIPLE, _ASM_FP4_SCALE_COL_MULTIPLE
+    # Pad with E8M0 1.0, not garbage: the kernel reads whole tiles, and 0xFF is NaN.
+    padded = torch.full(
+        (
+            (rows + row_tile - 1) // row_tile * row_tile,
+            (cols + col_tile - 1) // col_tile * col_tile,
+        ),
+        _E8M0_ONE,
+        dtype=torch.uint8,
+        device=x_scales.device,
+    )
+    padded[:rows, :cols] = x_scales.view(torch.uint8)
+    return _swizzle_asm_fp4_scale(padded).view(torch.float8_e8m0fnu)
+
+
+def _asm_fp4_prequantized_input(
+    x: tuple[torch.Tensor, ...],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Adapt an already-quantized ``(x_fp4, x_scales)`` activation for gemm_a4w4."""
+    # The 3- and 5-tuples request Triton-only fused epilogues (atomic pre-quant,
+    # split + cat); weights are already preshuffled, so there is no fallback.
+    if len(x) != 2:
+        raise NotImplementedError(
+            "AITER ASM FP4 GEMM only supports the (x_fp4, x_scales) tuple input; "
+            f"got a {len(x)}-tuple. Disable SGLANG_ROCM_USE_AITER_FP4_ASM_GEMM "
+            "for models that use this projection."
+        )
+    x_q, x_scales = x
+    # Only B is preshuffled (bpreshuffle=True), so the packed FP4 activation is
+    # consumed as-is. The scales come from the Triton fused-quant kernels in
+    # row-major (M, K/32) order, which gemm_a4w4 cannot read directly.
+    return x_q.view(torch.float4_e2m1fn_x2), _shuffle_asm_fp4_act_scale(x_scales)
+
+
+# On GPUs that lack the fp4-activation WMMA scale instruction
+# (V_WMMA_SCALE_F32_32X16X128_F4, e.g. gfx1250) the a4w4 (fp4 x fp4) linear GEMM
+# cannot run. The MoE path is switched to a8w4 via AITER_FORCE_A8W4=1 (handled
+# inside aiter.fused_moe); there is currently no working dense a8w4 GEMM for
+# plain nn.Linear on this arch, so under the same flag the (few) MXFP4-quantized
+# linear layers dequantize their FP4 weights to bf16 once at load and run a
+# plain bf16 GEMM. This trades a little memory for correctness on hardware that
+# cannot execute the fp4 kernel at all.
+_dequant_linear_to_bf16 = _is_hip and get_bool_env_var("AITER_FORCE_A8W4", "false")
+
+# MXFP4 (OCP MX FP4 / e2m1) decode table, indexed by the 4-bit code.
+_MXFP4_VALUES = [
+    0.0,
+    0.5,
+    1.0,
+    1.5,
+    2.0,
+    3.0,
+    4.0,
+    6.0,
+    -0.0,
+    -0.5,
+    -1.0,
+    -1.5,
+    -2.0,
+    -3.0,
+    -4.0,
+    -6.0,
+]
+
+
+def _dequant_mxfp4_to_bf16(
+    weight: torch.Tensor, weight_scale: torch.Tensor
+) -> torch.Tensor:
+    """Dequantize a packed MXFP4 weight ``(N, K//2)`` uint8 + e8m0 group scale
+    ``(N, K//32)`` uint8 into a dense bf16 weight ``(N, K)``."""
+    N, k_packed = weight.shape
+    K = k_packed * 2
+    lut = torch.tensor(_MXFP4_VALUES, device=weight.device, dtype=torch.float32)
+    lo = (weight & 0xF).long()
+    hi = (weight >> 4).long()
+    vals = torch.empty(N, K, device=weight.device, dtype=torch.float32)
+    vals[:, 0::2] = lut[lo]
+    vals[:, 1::2] = lut[hi]
+    # e8m0 byte b decodes to 2^(b-127); 255 is the NaN/Inf sentinel (unused by
+    # real weights) -> map to 0 so it can't poison the matmul.
+    scale = torch.exp2(weight_scale.to(torch.float32) - 127.0)
+    scale = torch.where(weight_scale == 255, torch.zeros_like(scale), scale)
+    scale = scale.view(N, K // 32, 1)
+    w = (vals.view(N, K // 32, 32) * scale).view(N, K)
+    return w.to(torch.bfloat16)
+
+
 if _is_hip:
+    from aiter import gemm_a4w4 as _gemm_a4w4_orig
+    from aiter import per_1x32_f4_quant_hip as _per_1x32_f4_quant_hip_orig
+    from aiter.ops.shuffle import shuffle_weight
     from aiter.ops.triton.gemm.fused.fused_gemm_afp4wfp4_split_cat import (
         fused_gemm_afp4wfp4_split_cat as _fused_gemm_afp4wfp4_split_cat_orig,
     )
@@ -117,6 +251,73 @@ if _is_hip:
     def dynamic_mxfp4_quant(x):
         return torch.ops.sglang.aiter_dynamic_mxfp4_quant(x)
 
+    def _aiter_per_1x32_f4_quant(
+        x: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return _per_1x32_f4_quant_hip_orig(x, shuffle=True)
+
+    def _aiter_per_1x32_f4_quant_fake(
+        x: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        rows, cols = x.shape
+        x_fp4 = torch.empty((rows, cols // 2), dtype=torch.uint8, device=x.device)
+        scales = torch.empty(
+            (rows, (cols + 31) // 32), dtype=torch.uint8, device=x.device
+        )
+        return x_fp4, scales
+
+    direct_register_custom_op(
+        op_name="aiter_per_1x32_f4_quant",
+        op_func=_aiter_per_1x32_f4_quant,
+        mutates_args=[],
+        fake_impl=_aiter_per_1x32_f4_quant_fake,
+    )
+
+    def per_1x32_f4_quant(x):
+        return torch.ops.sglang.aiter_per_1x32_f4_quant(x)
+
+    def _aiter_gemm_a4w4(
+        x: torch.Tensor,
+        w: torch.Tensor,
+        x_scales: torch.Tensor,
+        w_scales: torch.Tensor,
+        output_dtype_ref: torch.Tensor,
+    ) -> torch.Tensor:
+        return _gemm_a4w4_orig(
+            x,
+            w.view(x.dtype),
+            x_scales,
+            w_scales.view(x_scales.dtype),
+            dtype=output_dtype_ref.dtype,
+            bpreshuffle=True,
+        )
+
+    def _aiter_gemm_a4w4_fake(
+        x: torch.Tensor,
+        w: torch.Tensor,
+        x_scales: torch.Tensor,
+        w_scales: torch.Tensor,
+        output_dtype_ref: torch.Tensor,
+    ) -> torch.Tensor:
+        del x_scales, w_scales
+        return torch.empty(
+            (x.shape[0], w.shape[0]),
+            dtype=output_dtype_ref.dtype,
+            device=x.device,
+        )
+
+    direct_register_custom_op(
+        op_name="aiter_gemm_a4w4",
+        op_func=_aiter_gemm_a4w4,
+        mutates_args=[],
+        fake_impl=_aiter_gemm_a4w4_fake,
+    )
+
+    def gemm_a4w4(x, w, x_scales, w_scales, output_dtype_ref):
+        return torch.ops.sglang.aiter_gemm_a4w4(
+            x, w, x_scales, w_scales, output_dtype_ref
+        )
+
     def _aiter_fused_gemm_split_cat(
         x: torch.Tensor,
         w: torch.Tensor,
@@ -173,7 +374,6 @@ OCP_MX_BLOCK_SIZE = 32
 
 
 class QuarkW4A4MXFP4(QuarkLinearScheme):
-
     # PackedvLLMParameter / ModelWeightParameter (online and NVFP4->MXFP4
     # paths) only implement the v2 loader API.
     requires_weight_loader_v2 = True
@@ -210,6 +410,48 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
         if not self.is_checkpoint_mxfp4_serialized:
             assert layer.weight.dtype == torch.uint8
             assert layer.weight_scale.dtype == torch.uint8
+
+        if _dequant_linear_to_bf16:
+            w_bf16 = _dequant_mxfp4_to_bf16(layer.weight.data, layer.weight_scale.data)
+            layer.weight = torch.nn.Parameter(w_bf16, requires_grad=False)
+            # FP4 block scales are folded into the bf16 weight; drop them.
+            layer.weight_scale = None
+            layer.dequantized_bf16 = True
+            return
+
+        layer.use_aiter_asm_fp4_gemm = False
+        if not _use_aiter_asm_fp4_gemm or not is_gfx95_supported():
+            return
+
+        if not _asm_fp4_scale_swizzle_supported(layer.weight_scale.data):
+            logger.warning_once(
+                "AITER ASM FP4 GEMM requires weight-scale dimensions divisible "
+                "by (%d, %d), but this layer has shape %s. Falling back to the "
+                "AITER Triton FP4 GEMM for this layer.",
+                _ASM_FP4_SCALE_ROW_MULTIPLE,
+                _ASM_FP4_SCALE_COL_MULTIPLE,
+                tuple(layer.weight_scale.shape),
+            )
+            return
+
+        if layer.weight.shape[0] <= _ASM_FP4_UNSAFE_MAX_N:
+            logger.warning_once(
+                "AITER ASM FP4 GEMM is unreliable for N <= %d; keeping the AITER "
+                "Triton FP4 GEMM for a layer with N=%d.",
+                _ASM_FP4_UNSAFE_MAX_N,
+                layer.weight.shape[0],
+            )
+            return
+
+        layer.weight_scale = torch.nn.Parameter(
+            _swizzle_asm_fp4_scale(layer.weight_scale.data),
+            requires_grad=False,
+        )
+        layer.weight = torch.nn.Parameter(
+            shuffle_weight(layer.weight.data, layout=(16, 16)),
+            requires_grad=False,
+        )
+        layer.use_aiter_asm_fp4_gemm = True
 
     def create_weights(
         self,
@@ -534,7 +776,6 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
                 # Materialize FP8 parameters on first load on device (there may be several shards for a single layer parameter, e.g. q_proj, k_proj, v_proj).
 
                 if is_weight_or_weight_scale and not layer._fp8_weight_materialized:
-
                     # Sanity check.
                     assert layer.weight.device.type == "meta"
 
@@ -620,6 +861,38 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        # bf16 fallback: FP4 weights were dequantized to bf16 at load time
+        # because this HW cannot run the fp4 GEMM. Run a plain bf16 linear.
+        # (The fused tuple-input paths below are only used by MLA attention
+        # projections, which are excluded from quantization for this checkpoint,
+        # so a plain-tensor activation is what reaches here.)
+        if getattr(layer, "dequantized_bf16", False):
+            if isinstance(x, tuple):
+                x = x[0]
+            return torch.nn.functional.linear(x, layer.weight, bias)
+
+        if getattr(layer, "use_aiter_asm_fp4_gemm", False):
+            output_shape = None
+            if isinstance(x, tuple):
+                x_q, x_scales = _asm_fp4_prequantized_input(x)
+            else:
+                if x.dim() == 3:
+                    output_shape = [*x.shape[:-1], layer.weight.shape[0]]
+                    x = x.view(-1, x.shape[-1])
+                x_q, x_scales = per_1x32_f4_quant(x)
+
+            output_dtype_ref = torch.empty(0, dtype=self.out_dtype, device=x_q.device)
+            y = gemm_a4w4(
+                x_q,
+                layer.weight,
+                x_scales,
+                layer.weight_scale,
+                output_dtype_ref,
+            )
+            if bias is not None:
+                y = y + bias
+            return y.view(*output_shape) if output_shape is not None else y
+
         # Bias will be added after the GEMM if provided
         three_d = False
         fused_gemm_split_cat = False
@@ -631,7 +904,9 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
                 2,
                 3,
                 5,
-            ], "For tuple input, only (x, x_s), (x, x_s, y), or (x, y, S1, S2, out_dtype) formats are accepted"
+            ], (
+                "For tuple input, only (x, x_s), (x, x_s, y), or (x, y, S1, S2, out_dtype) formats are accepted"
+            )
             if len(x) == 2:
                 x, x_s = x
             elif len(x) == 3:

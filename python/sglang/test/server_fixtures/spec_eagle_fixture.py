@@ -70,6 +70,10 @@ class SpecEagleServerBase(CustomTestCase):
     dtype = "bfloat16"
     cuda_graph_max_bs_decode = None
     trust_remote_code = True
+    # Seconds to wait for the spec server to report healthy. Overridable per
+    # subclass: EAGLE3 + full CUDA-graph decode capture on XPU can exceed the
+    # 600s default, so the XPU parity test bumps this.
+    server_launch_timeout = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
     # Launch with --enable-return-hidden-states so SpecHiddenStatesKit can probe
     # per-request hidden states; per-request gated, so other requests don't pay.
     enable_return_hidden_states = False
@@ -144,7 +148,7 @@ class SpecEagleServerBase(CustomTestCase):
             cls.process = popen_launch_server(
                 cls.model,
                 cls.base_url,
-                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                timeout=cls.server_launch_timeout,
                 other_args=cls._launch_args(),
             )
 

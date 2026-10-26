@@ -25,6 +25,12 @@ done
 
 OPTIONAL_DEPS="${1:-}"
 
+if [[ ",${OPTIONAL_DEPS}," == *,diffusion,* ]]; then
+  # MiniMax H3 uses ffprobe for input admission and output audio validation.
+  docker exec ci_sglang apt-get update
+  docker exec -e DEBIAN_FRONTEND=noninteractive ci_sglang apt-get install -y --no-install-recommends ffmpeg
+fi
+
 # Build python extras
 EXTRAS="dev_hip,tracing"
 if [ -n "$OPTIONAL_DEPS" ]; then
@@ -50,7 +56,7 @@ fi
 IMAGE_TORCH_VERSION=$(docker exec ci_sglang python3 -c 'import torch; print(torch.__version__)')
 IMAGE_HIP_VERSION=$(docker exec ci_sglang python3 -c 'import torch; print(torch.version.hip or "")')
 IMAGE_GPU_ARCH=$(docker exec ci_sglang printenv GPU_ARCH 2>/dev/null || true)
-if [[ "${IMAGE_GPU_ARCH}" =~ ^(gfx942|gfx950)(-rocm720|-rocm724|-rocm1000)?$ ]]; then
+if [[ "${IMAGE_GPU_ARCH}" =~ ^(gfx942|gfx950|gfx1250)(-rocm720|-rocm724|-rocm1000)?$ ]]; then
     echo "[CI-IMAGE] Image GPU_ARCH=${IMAGE_GPU_ARCH}"
     case "${IMAGE_GPU_ARCH}" in
         *-rocm724) IMAGE_BASE_ARG_SUFFIX="_ROCM724"; IMAGE_STAGE_SUFFIX="-rocm724" ;;
@@ -90,8 +96,10 @@ if [[ "${IMAGE_STAGE_SUFFIX}" == "-rocm724" || "${IMAGE_STAGE_SUFFIX}" == "-rocm
 fi
 echo "Image torch ${IMAGE_TORCH_VERSION}, HIP ${IMAGE_HIP_VERSION}; installing python extras: [${EXTRAS}]"
 
-# Fix permissions on pip cache, ignore errors from concurrent access or missing temp files
-docker exec ci_sglang chown -R root:root /sgl-data/pip-cache 2>/dev/null || true
+# Fix permissions on pip cache, ignore errors from concurrent access or missing temp files.
+# pip running as root disables the cache unless the cache dir itself is owned by root; it
+# never checks the entries beneath it. Simply changing folder permissions reduces chown runtime.
+docker exec ci_sglang chown root:root /sgl-data/pip-cache 2>/dev/null || true
 docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache --upgrade pip
 
 # Helper function to install with retries and fallback PyPI mirror
@@ -135,38 +143,8 @@ ensure_httpx() {
   install_with_retry docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache --upgrade 'httpx>=0.25.0'
 }
 
-# Helper function to git clone with retries
-git_clone_with_retry() {
-  local repo_url="$1"
-  local dest_dir="${2:-}"
-  local branch_args="${3:-}"
-  local max_attempts=3
-
-  for attempt in $(seq 1 $max_attempts); do
-    echo "Git clone attempt $attempt/$max_attempts: $repo_url"
-
-    # prevent from partial clone
-    if [ -n "$dest_dir" ] && [ -d "$dest_dir" ]; then
-      rm -rf "$dest_dir"
-    fi
-
-    if git \
-      -c http.lowSpeedLimit=1000 \
-      -c http.lowSpeedTime=30 \
-      clone --depth 1 ${branch_args:+$branch_args} "$repo_url" "$dest_dir"; then
-      echo "Git clone succeeded."
-      return 0
-    fi
-
-    if [ $attempt -lt $max_attempts ]; then
-      echo "Git clone failed, retrying in 5 seconds..."
-      sleep 5
-    fi
-  done
-
-  echo "Git clone failed after $max_attempts attempts: $repo_url"
-  return 1
-}
+# shellcheck source=scripts/ci/utils/git_clone_with_retry.sh
+source "$(dirname "${BASH_SOURCE[0]}")/../utils/git_clone_with_retry.sh"
 
 # Install checkout sglang
 if [ -n "$SKIP_SGLANG_BUILD" ]; then
@@ -187,10 +165,6 @@ else
   install_with_retry docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e "python[${EXTRAS}]"
 fi
 
-# shellcheck source=scripts/ci/utils/sgl_eval_ref.sh
-source "$(dirname "${BASH_SOURCE[0]}")/../utils/sgl_eval_ref.sh"
-install_with_retry docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache "$SGL_EVAL_SPEC"
-
 if [[ -n "${SKIP_TT_DEPS}" ]]; then
   echo "Didn't build lmms_eval, human-eval, and others"
 else
@@ -201,7 +175,9 @@ else
   git_clone_with_retry https://github.com/EvolvingLMMs-Lab/lmms-eval.git lmms-eval "--branch v0.4.1"
   docker cp lmms-eval ci_sglang:/
   docker exec ci_sglang git config --global --add safe.directory /lmms-eval
-  install_with_retry docker exec -w /lmms-eval ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e .
+  # pyarrow 26 needs NumPy 2 at import, but lmms-eval pins numpy 1.26.4;
+  # drop the cap once lmms-eval allows NumPy 2.
+  install_with_retry docker exec -w /lmms-eval ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e . "pyarrow<26"
 
   # lmms-eval v0.4.1 pulls latex2sympy2, which pins antlr4-python3-runtime==4.7.2
   # and uninstalls the 4.9.3 that sgl-eval's latex2sympy2_extended requires, so
@@ -255,9 +231,18 @@ fi
 # The CI image bakes MORI at the docker/rocm.Dockerfile-pinned commit; when a PR
 # bumps MORI_COMMIT the image is not rebuilt, so reinstall MORI here the same way
 # the Dockerfile does. Only ENABLE_MORI=1 images ship /sgl-workspace/mori.
-if docker exec ci_sglang test -d /sgl-workspace/mori; then
+# When the image's checkout is already at the pin the reinstall is redundant.
+MORI_COMMIT=$(grep -E '^[[:space:]]*ARG[[:space:]]+MORI_COMMIT=' docker/rocm.Dockerfile | head -n1 | sed 's/.*MORI_COMMIT="\([^"]*\)".*/\1/' || true)
+IMAGE_MORI_COMMIT=$(docker exec ci_sglang git -C /sgl-workspace/mori rev-parse HEAD 2>/dev/null || true)
+if [[ -n "${MORI_COMMIT}" && "${IMAGE_MORI_COMMIT}" == "${MORI_COMMIT}" ]]; then
+  echo "[MORI] Image already has MORI ${MORI_COMMIT}; skipping reinstall"
+elif docker exec ci_sglang test -d /sgl-workspace/mori; then
   MORI_REPO=$(grep -E '^[[:space:]]*ARG[[:space:]]+MORI_REPO=' docker/rocm.Dockerfile | head -n1 | sed 's/.*MORI_REPO="\([^"]*\)".*/\1/')
-  MORI_COMMIT=$(grep -E '^[[:space:]]*ARG[[:space:]]+MORI_COMMIT=' docker/rocm.Dockerfile | head -n1 | sed 's/.*MORI_COMMIT="\([^"]*\)".*/\1/')
+
+  if [[ -z "${MORI_COMMIT}" ]]; then
+    echo "[MORI] ERROR: Failed to extract MORI_COMMIT from Dockerfile"
+    exit 1
+  fi
 
   if [[ "${GPU_ARCH}" == "mi35x" ]]; then
     MORI_GPU_ARCHS="gfx950"
@@ -290,8 +275,18 @@ if docker exec ci_sglang test -d /sgl-workspace/mori; then
     fi
     # The pip ROCm SDK vendors NUMA and libdrm under rocm_sysdeps, outside the
     # default compiler, CMake, and linker search paths used by MORI.
+    # gfx1250 additionally needs the SDK's own cmake trees on the prefix path:
+    # that is what lets hsakmt-config.cmake resolve find_dependency(NUMA)
+    # without patching MORI's CMakeLists. Same split as docker/rocm.Dockerfile.
     ROCM_SYSDEPS="\${ROCM_HOME:-/opt/rocm}/lib/rocm_sysdeps"
-    if [ '${IMAGE_STAGE_SUFFIX}' = '-rocm1000' ] && [ -d "\${ROCM_SYSDEPS}" ]; then
+    if [ '${IMAGE_GFX}' = 'gfx1250' ] && [ -d "\${ROCM_SYSDEPS}" ]; then
+      export PATH="\${ROCM_HOME}/bin:\${PATH}"
+      export CMAKE_PREFIX_PATH="\${ROCM_SYSDEPS}/lib/cmake:\${ROCM_SYSDEPS}:\${ROCM_HOME}/lib/cmake:\${ROCM_HOME}\${CMAKE_PREFIX_PATH:+:\${CMAKE_PREFIX_PATH}}"
+      export CPATH="\${ROCM_SYSDEPS}/include\${CPATH:+:\${CPATH}}"
+      export LIBRARY_PATH="\${ROCM_SYSDEPS}/lib\${LIBRARY_PATH:+:\${LIBRARY_PATH}}"
+      echo "\${ROCM_SYSDEPS}/lib" > /etc/ld.so.conf.d/rocm-sysdeps.conf
+      ldconfig
+    elif [ '${IMAGE_STAGE_SUFFIX}' = '-rocm1000' ] && [ -d "\${ROCM_SYSDEPS}" ]; then
       export CMAKE_PREFIX_PATH="\${ROCM_SYSDEPS}\${CMAKE_PREFIX_PATH:+:\${CMAKE_PREFIX_PATH}}"
       export CPATH="\${ROCM_SYSDEPS}/include\${CPATH:+:\${CPATH}}"
       export LIBRARY_PATH="\${ROCM_SYSDEPS}/lib\${LIBRARY_PATH:+:\${LIBRARY_PATH}}"
@@ -331,11 +326,11 @@ echo "[CI-AITER-CHECK] Runner GPU_ARCH=${GPU_ARCH}"
 # 1. Extract AITER_COMMIT from the Dockerfile stage that built this image, as
 # identified near the top of this script.
 #############################################
-if [[ "${IMAGE_GFX}" == "gfx950" ]]; then
-    _from_line="FROM \$BASE_IMAGE_950${IMAGE_BASE_ARG_SUFFIX} AS gfx950${IMAGE_STAGE_SUFFIX}"
-else
-    _from_line="FROM \$BASE_IMAGE_942${IMAGE_BASE_ARG_SUFFIX} AS gfx942${IMAGE_STAGE_SUFFIX}"
-fi
+case "${IMAGE_GFX}" in
+    gfx950)  _from_line="FROM \$BASE_IMAGE_950${IMAGE_BASE_ARG_SUFFIX} AS gfx950${IMAGE_STAGE_SUFFIX}" ;;
+    gfx1250) _from_line="FROM \$BASE_IMAGE_1250${IMAGE_BASE_ARG_SUFFIX} AS gfx1250${IMAGE_STAGE_SUFFIX}" ;;
+    *)       _from_line="FROM \$BASE_IMAGE_942${IMAGE_BASE_ARG_SUFFIX} AS gfx942${IMAGE_STAGE_SUFFIX}" ;;
+esac
 echo "[CI-AITER-CHECK] Using ${_from_line} from Dockerfile..."
 REPO_AITER_COMMIT=$(grep -F -A20 "${_from_line}" docker/rocm.Dockerfile \
                     | grep 'AITER_COMMIT_DEFAULT=' \

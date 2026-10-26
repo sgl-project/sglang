@@ -1,6 +1,9 @@
-import argparse
 import os
 
+from sglang.multimodal_gen.apps.webui.minimax_h3 import (
+    is_minimax_h3,
+    run_minimax_h3_webui,
+)
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     DataType,
     SamplingParams,
@@ -17,14 +20,10 @@ from sglang.srt.environ import envs
 logger = init_logger(__name__)
 
 
-def add_webui_args(parser: argparse.ArgumentParser):
-    """Add the arguments for the generate command."""
-    parser = ServerArgs.add_cli_args(parser)
-    parser = SamplingParams.add_cli_args(parser)
-    return parser
-
-
 def run_sgl_diffusion_webui(server_args: ServerArgs):
+    if is_minimax_h3(server_args):
+        return run_minimax_h3_webui(server_args)
+
     # import gradio in function to avoid CI crash
 
     import gradio as gr

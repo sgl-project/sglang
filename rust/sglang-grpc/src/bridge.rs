@@ -77,6 +77,20 @@ pub enum ChunkSendStatus {
     Closed,
 }
 
+#[pyclass]
+struct EngineStateChangedCallback {
+    sender: Sender<()>,
+}
+
+#[pymethods]
+impl EngineStateChangedCallback {
+    fn __call__(&self) {
+        // A full snapshot is built after the notification is received, so one
+        // pending signal is enough to represent any number of quick changes.
+        let _ = self.sender.try_send(());
+    }
+}
+
 fn lock_or_recover<'a, T>(mutex: &'a Mutex<T>, name: &'static str) -> MutexGuard<'a, T> {
     mutex.lock().unwrap_or_else(|poisoned| {
         tracing::warn!(mutex = name, "Recovering from poisoned gRPC bridge mutex");
@@ -220,7 +234,7 @@ impl PyBridge {
             ));
         }
 
-        let should_call_python = if abort_all {
+        if abort_all {
             let mut state = lock_or_recover(self.state.as_ref(), "state");
             let rids = state
                 .channels
@@ -238,24 +252,17 @@ impl PyBridge {
                 );
             }
             tracing::debug!(affected, "gRPC abort_all cleared active response channels");
-            true
         } else {
             let mut state = lock_or_recover(self.state.as_ref(), "state");
-            let was_active = remove_channel_refs_locked(&mut state, rid);
-            if was_active {
+            if remove_channel_refs_locked(&mut state, rid) {
                 state
                     .terminal_errors
                     .insert(rid.to_string(), TerminalError::Aborted { rid: rid.into() });
-            } else {
-                tracing::debug!(rid, "Ignoring abort for inactive gRPC request id");
             }
-            was_active
-        };
-
-        if !should_call_python {
-            return Ok(());
         }
 
+        // Abort by engine rid even when no gRPC stream here carries it, as HTTP
+        // /abort_request does: an OpenAI RPC's request runs under its body's rid.
         Python::attach(|py| {
             self.runtime_handle
                 .call_method1(py, "abort", (rid, abort_all))?;
@@ -285,6 +292,25 @@ impl PyBridge {
         Python::attach(|py| {
             let result = self.runtime_handle.call_method0(py, "health_check")?;
             result.extract::<bool>(py)
+        })
+    }
+
+    pub fn is_pause(&self) -> PyResult<bool> {
+        Python::attach(|py| {
+            let result = self.runtime_handle.call_method0(py, "is_pause")?;
+            result.extract::<bool>(py)
+        })
+    }
+
+    pub fn set_engine_state_changed_callback(&self, sender: Sender<()>) -> PyResult<()> {
+        Python::attach(|py| {
+            let callback = Py::new(py, EngineStateChangedCallback { sender })?;
+            self.runtime_handle.call_method1(
+                py,
+                "set_engine_state_changed_callback",
+                (callback,),
+            )?;
+            Ok(())
         })
     }
 

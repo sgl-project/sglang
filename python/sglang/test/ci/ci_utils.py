@@ -219,6 +219,7 @@ def run_unittest_files(
     max_attempts: int = 2,
     retry_wait_seconds: int = 60,
     fork_worker_batch_size: int = 1,
+    timeout_overrides: Optional[Dict[str, float]] = None,
 ):
     """
     Run a list of test files.
@@ -236,6 +237,7 @@ def run_unittest_files(
         fork_worker_batch_size: Number of files served by one preloaded fork
                                 worker. Each file still runs in a fresh child
                                 process. One keeps the existing exec behavior.
+        timeout_overrides: First-attempt timeouts keyed by path suffix; retries use the above.
     """
     coredump_enabled = cuda_coredump.is_enabled()
     if coredump_enabled:
@@ -259,11 +261,16 @@ def run_unittest_files(
             # FIXME: remove this branch after migrating all tests to use CIRegistry
             filename, estimated_time = file.name, file.estimated_time
 
-        file_timeout = (
+        base_timeout = (
             timeout_per_file
             if timeout_per_file is not None
             else derive_timeout_per_file(estimated_time)
         )
+        # An override caps only the first attempt; retries get the full budget.
+        first_timeout = base_timeout
+        for suffix, override in (timeout_overrides or {}).items():
+            if filename == suffix or filename.endswith("/" + suffix):
+                first_timeout = min(base_timeout, override)
 
         process = None
         output_lines = []
@@ -336,6 +343,7 @@ def run_unittest_files(
         was_retried = False
 
         while attempt <= (max_attempts if enable_retry else 1):
+            file_timeout = first_timeout if attempt == 1 else base_timeout
             if attempt > 1:
                 logger.info(
                     f"\n[CI Retry] Attempt {attempt}/{max_attempts} for {filename}\n"
@@ -417,8 +425,28 @@ def run_unittest_files(
 
         if not file_passed:
             success = False
-            if not continue_on_error:
-                break
+
+        # Flush per-file so a SIGKILL mid-suite still surfaces completed files.
+        metrics_path = os.environ.get("SGLANG_TEST_METRICS_FILE")
+        if metrics_path and filename in file_elapsed:
+            try:
+                incremental_record = {
+                    "kind": "file",
+                    "test_file": os.path.basename(filename),
+                    "status": "pass" if file_passed else "fail",
+                    "duration": round(file_elapsed[filename], 2),
+                }
+                if not file_passed:
+                    reason = next((r for f, r in failed_tests if f == filename), None)
+                    if reason:
+                        incremental_record["error"] = reason
+                with open(metrics_path, "a") as f:
+                    f.write(json.dumps(incremental_record) + "\n")
+            except OSError:
+                pass
+
+        if not file_passed and not continue_on_error:
+            break
 
     if fork_worker is not None:
         fork_worker.close()
@@ -434,11 +462,11 @@ def run_unittest_files(
         logger.info(f"Fail. Time elapsed: {elapsed_total:.2f}s")
 
     # Print summary
-    logger.info(f"\n{'='*60}")
+    logger.info(f"\n{'=' * 60}")
     logger.info(f"Test Summary: {len(passed_tests)}/{len(files)} passed")
     if enable_retry and retried_tests:
         logger.info(f"Retries: {len(retried_tests)} test(s) were retried")
-    logger.info(f"{'='*60}")
+    logger.info(f"{'=' * 60}")
     if passed_tests:
         logger.info("✓ PASSED:")
         for test in passed_tests:
@@ -451,7 +479,7 @@ def run_unittest_files(
         logger.info("\n↻ RETRIED:")
         for test, attempts, result in retried_tests:
             logger.info(f"  {test} ({attempts} attempts, {result})")
-    logger.info(f"{'='*60}\n")
+    logger.info(f"{'=' * 60}\n")
 
     # Machine-readable timings block for downstream scrapers/dashboards.
     # One JSON object per executed file (post-retry: only the latest

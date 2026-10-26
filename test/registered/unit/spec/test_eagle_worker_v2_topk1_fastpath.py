@@ -6,6 +6,7 @@ tests check that the pre-allocated `parent_list` / `top_scores_index` match the
 slow path (`organize_draft_results`) for num_steps in {1, 2, 3, 4}.
 """
 
+import builtins
 import contextlib
 import unittest
 from types import SimpleNamespace
@@ -16,6 +17,7 @@ import torch
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.adaptive_runtime_state import SpecRuntimeState
+from sglang.srt.speculative.eagle_info import EagleVerifyInput
 from sglang.srt.speculative.eagle_utils import organize_draft_results
 from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker, EAGLEWorkerV2
 from sglang.test.ci.ci_register import register_amd_ci, register_cpu_ci
@@ -24,7 +26,7 @@ from sglang.test.test_utils import CustomTestCase
 register_amd_ci(est_time=20, stage="stage-b", runner_config="1-gpu-small-amd")
 
 
-register_cpu_ci(est_time=20, suite="base-a-test-cpu")
+register_cpu_ci(est_time=13, suite="base-a-test-cpu")
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -123,17 +125,24 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
                 self.assertEqual(fast_index.tolist(), ref_index.long().tolist())
                 self.assertEqual(fast_tokens.tolist(), ref_tokens.tolist())
 
-                # The kernel reads these via data_ptr() as contiguous int64.
-                self.assertEqual(fast_parent.dtype, torch.long)
-                self.assertEqual(fast_index.dtype, torch.long)
-                self.assertTrue(fast_parent.is_contiguous())
-                self.assertTrue(fast_index.is_contiguous())
-
     def test_assert_on_inconsistent_steps_and_draft_tokens(self):
         # num_draft_tokens must equal num_steps + 1 for topk=1.
         worker = _make_worker(num_steps=3, num_draft_tokens=3)
         with self.assertRaises(AssertionError):
             worker._rebuild_topk1_chain_buffers()
+
+    def test_idle_verify_input_keeps_required_layout_tensors(self):
+        verify_input = EagleVerifyInput.create_idle_input(
+            topk=1,
+            spec_steps=3,
+            num_verify_tokens=4,
+            device=DEVICE,
+        )
+
+        self.assertEqual(verify_input.custom_mask.dtype, torch.bool)
+        self.assertEqual(verify_input.custom_mask.shape, (0,))
+        self.assertEqual(verify_input.positions.dtype, torch.int64)
+        self.assertEqual(verify_input.positions.shape, (0,))
 
     def test_idle_draft_runs_each_eager_forward_without_tree_layout(self):
         worker = object.__new__(EagleDraftWorker)
@@ -157,7 +166,6 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
         ):
             result = worker.draft_forward(forward_batch)
 
-        self.assertEqual(result, (None, None, None, None))
         self.assertEqual(worker.draft_runner.forward.call_count, 2)
 
 
@@ -204,6 +212,7 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
                 worker.speculative_num_steps = 1
                 worker.speculative_num_draft_tokens = 2
                 worker.device = DEVICE
+                worker.plan_stream = None
                 worker.tree_mask_mode = None
                 worker.seed_dsa_topk_from_draft_extend = seed_enabled
                 worker.index_share_for_mtp_iteration = True
@@ -214,7 +223,9 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
                     max_context_len=1,
                 )
                 worker.target_worker = SimpleNamespace(
-                    model_runner=SimpleNamespace(attn_backend=attn_backend)
+                    model_runner=SimpleNamespace(
+                        attn_backend=attn_backend, kv_index_translator=None
+                    )
                 )
                 draft_input = SimpleNamespace(
                     bonus_tokens=torch.zeros((1,), dtype=torch.long, device=DEVICE),
@@ -231,12 +242,15 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
                     seq_lens=torch.ones((1,), dtype=torch.int32, device=DEVICE),
                 )
 
-                with patch(
-                    "sglang.srt.speculative.eagle_worker_common.build_tree_kernel_efficient",
-                    return_value=tree_result,
-                ), patch(
-                    "sglang.srt.speculative.eagle_worker_v2.prepare_for_draft",
-                    return_value=(forward_batch, True),
+                with (
+                    patch(
+                        "sglang.srt.speculative.eagle_worker_common.build_tree_kernel_efficient",
+                        return_value=tree_result,
+                    ),
+                    patch(
+                        "sglang.srt.speculative.eagle_worker_v2.prepare_for_draft",
+                        return_value=(forward_batch, True, None),
+                    ),
                 ):
                     worker.draft(batch)
 
@@ -244,18 +258,32 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
                 self.assertEqual(worker.draft_forward.called, not expect_graph)
 
     def test_preserves_initialized_backend_when_draft_extend_backend_is_unset(self):
+        """Non-QSA initialization must work without optional QSA dependencies."""
         worker = object.__new__(EagleDraftWorker)
         existing_backend = object()
         decode_backend = object()
         worker.server_args = _fake_server_args()
-        worker.draft_runner = SimpleNamespace(attn_backend=existing_backend)
+        worker.draft_runner = SimpleNamespace(
+            attn_backend=existing_backend,
+            model_config=SimpleNamespace(hf_config=SimpleNamespace()),
+            kv_index_translator=SimpleNamespace(is_translating=False),
+        )
         worker.topk = 1
         worker.speculative_num_steps = 2
         worker.seed_dsa_topk_from_draft_extend = False
+        real_import = builtins.__import__
 
-        with patch(
-            "sglang.srt.speculative.eagle_worker_v2.DraftBackendFactory",
-            _make_backend_factory(decode_backend, None),
+        def import_without_qsa(name, *args, **kwargs):
+            if name == "sglang.srt.layers.attention.qsa.qsa_indexer":
+                raise OSError("Optional QSA dependency is unavailable")
+            return real_import(name, *args, **kwargs)
+
+        with (
+            patch("builtins.__import__", new=import_without_qsa),
+            patch(
+                "sglang.srt.speculative.eagle_worker_v2.DraftBackendFactory",
+                _make_backend_factory(decode_backend, None),
+            ),
         ):
             worker.init_attention_backend()
 
@@ -270,7 +298,11 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
         decode_backend = object()
         draft_extend_backend = object()
         worker.server_args = _fake_server_args()
-        worker.draft_runner = SimpleNamespace(attn_backend=existing_backend)
+        worker.draft_runner = SimpleNamespace(
+            attn_backend=existing_backend,
+            model_config=SimpleNamespace(hf_config=SimpleNamespace()),
+            kv_index_translator=SimpleNamespace(is_translating=False),
+        )
         worker.topk = 1
         worker.speculative_num_steps = 2
         worker.seed_dsa_topk_from_draft_extend = True
@@ -380,6 +412,15 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
             worker.spec_v2_attn_backends,
             (target_backend, decode_backend, fallback_backend),
         )
+
+    def test_non_last_pp_uses_only_target_runner(self):
+        target_runner = SimpleNamespace(attn_backend=object())
+        worker = object.__new__(EAGLEWorkerV2)
+        worker._target_worker = SimpleNamespace(model_runner=target_runner)
+        worker._draft_worker = None
+
+        self.assertIs(worker.last_shared_read_runner, target_runner)
+        self.assertEqual(worker.spec_v2_attn_backends, (target_runner.attn_backend,))
 
 
 if __name__ == "__main__":

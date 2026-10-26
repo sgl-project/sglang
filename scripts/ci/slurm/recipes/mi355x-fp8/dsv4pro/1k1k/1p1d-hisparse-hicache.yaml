@@ -70,10 +70,10 @@ runtime:
     # PREFILL: HiCache. hicache-ratio 2 matched validation; if the PD device pool
     # makes the host budget too large ("Not enough host memory"), switch to an
     # absolute --hicache-size (GB per rank) as the dsr1 leg does.
-    prefill_extra_flags: "--enable-hierarchical-cache --hicache-ratio 2 --hicache-io-backend kernel --hicache-mem-layout layer_first"
+    prefill_extra_flags: "--context-length 9217 --max-total-tokens 262144 --enable-hierarchical-cache --hicache-ratio 2 --hicache-io-backend kernel --hicache-mem-layout layer_first"
     # DECODE: HiSparse. device_buffer_size 2048 sizes the device C4 pool so
     # requests admit (hisparse_req_budget > 0).
-    decode_extra_flags: "--disable-overlap-schedule --enable-hisparse --hisparse-config '{\"top_k\":1024,\"device_buffer_size\":2048,\"host_to_device_ratio\":2}'"
+    decode_extra_flags: "--max-total-tokens 1000000 --disable-overlap-schedule --enable-hisparse --hisparse-config '{\"top_k\":1024,\"device_buffer_size\":2048,\"host_to_device_ratio\":2}'"
     prefill_extra_env:
       SGLANG_HACK_FLASHMLA_BACKEND: unified_kv_triton
       MORI_RDMA_TC: 104

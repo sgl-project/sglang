@@ -30,14 +30,29 @@ import triton.language as tl
 
 from sglang.kernels.ops.attention.score_mod import unpack_aux_tensors
 from sglang.srt.environ import envs
-from sglang.srt.utils import get_device_core_count, is_gfx95_supported, is_hip
+from sglang.srt.utils import (
+    get_device_core_count,
+    is_gfx95_supported,
+    is_gfx1250_supported,
+    is_hip,
+)
 
 _is_hip = is_hip()
+_is_gfx1250 = _is_hip and is_gfx1250_supported()
 
 logger = logging.getLogger(__name__)
 
 
 _MIN_BLOCK_KV = 32
+
+
+def _rotate_batch(batch: int, uneven_batch: Optional[torch.Tensor]) -> bool:
+    # HIP hands workgroups to XCDs round-robin. With batch as the fastest grid axis,
+    # an even batch keeps each request on a subset of XCDs, so a long request or
+    # CUDA-graph padding rows leave the other XCDs idle. A balanced batch is already
+    # spread evenly, so the kernels only rotate while uneven_batch holds 1.
+    return _is_hip and batch % 2 == 0 and uneven_batch is not None
+
 
 # heads per stage-1 tile, shared so the budget's head_tiles cannot drift from the launch
 _GROUPED_BLOCK_H = 16
@@ -71,8 +86,8 @@ _MLA_BUCKETS = (
 )
 
 # For the paths that must not depend on the batch; the mid bucket sits between the
-# other two geometries. Retuning it moves what deterministic inference produces, which
-# test_batch_free_geometry_is_pinned guards. max_splits goes unused there.
+# other two geometries. Retuning it moves what deterministic inference produces;
+# max_splits goes unused there.
 _MLA_BUCKET_BATCH_FREE = _MLA_BUCKETS[1]
 
 _KEEP_SCHEDULER_SPLITS = None
@@ -258,12 +273,18 @@ def _fwd_kernel_stage1(
     aux0_stride_t=0,
     aux0_stride_h=0,
     aux0_len=0,
+    uneven_batch=None,
+    ROTATE_BATCH: tl.constexpr = False,
 ):
-    # int64 to avoid overflow of flat offsets into Mid_O when
-    # batch * num_head * max_kv_splits * head_dim exceeds 2**31.
-    cur_batch = tl.program_id(0).to(tl.int64)
+    cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
     split_kv_id = tl.program_id(2)
+    if ROTATE_BATCH:
+        if tl.load(uneven_batch) != 0:
+            cur_batch = (cur_batch + cur_head + split_kv_id) % tl.num_programs(0)
+    # int64 to avoid overflow of flat offsets into Mid_O when
+    # batch * num_head * max_kv_splits * head_dim exceeds 2**31.
+    cur_batch = cur_batch.to(tl.int64)
 
     cur_kv_head = cur_head // kv_group_num
 
@@ -326,7 +347,9 @@ def _fwd_kernel_stage1(
                 mask=(offs_n[:, None] < split_kv_end) & (mask_d[None, :]),
                 other=0.0,
             )
-            qk = tl.sum(q[None, :] * k, 1)
+            # Reduce in fp32; a bf16 tl.sum rounds each partial sum in compiler order.
+            # Cast the product, not q and k, to avoid a fp32 [BLOCK_N, D] tile.
+            qk = tl.sum((q[None, :] * k).to(tl.float32), 1)
             qk *= sm_scale_withk
 
             if logit_cap > 0:
@@ -420,6 +443,7 @@ def _decode_att_m_fwd(
     page_size: int = 1,
     score_mod=None,
     aux_tensors=None,
+    uneven_batch=None,
 ):
     BLOCK = 64
     # [TODO] work around SGPR limit on MI3xx
@@ -497,6 +521,8 @@ def _decode_att_m_fwd(
         aux0_stride_t=aux0_stride_t,
         aux0_stride_h=aux0_stride_h,
         aux0_len=aux0_len,
+        uneven_batch=uneven_batch,
+        ROTATE_BATCH=_rotate_batch(batch, uneven_batch),
     )
 
 
@@ -539,6 +565,7 @@ def _fwd_grouped_kernel_stage1(
     Lv: tl.constexpr,
     HAS_MLA: tl.constexpr = False,
     USE_PDL: tl.constexpr = False,
+    IS_GFX1250: tl.constexpr = False,
     PAGE_SIZE: tl.constexpr = 1,
     SCORE_MOD: tl.constexpr = None,
     Aux0=None,
@@ -547,13 +574,21 @@ def _fwd_grouped_kernel_stage1(
     aux0_len=0,
     forced_kv_splits=0,
     USE_FORCED: tl.constexpr = False,
+    uneven_batch=None,
+    ROTATE_BATCH: tl.constexpr = False,
 ):
+    cur_batch = tl.program_id(0)
+    cur_head_id = tl.program_id(1)
+    split_kv_id = tl.program_id(2)
+    if ROTATE_BATCH:
+        # Only the split rotates: the head tiles of one (request, split) read the same
+        # kv_indices (and the same latent KV under MLA), so they stay on one XCD.
+        if tl.load(uneven_batch) != 0:
+            cur_batch = (cur_batch + split_kv_id) % tl.num_programs(0)
     # int64 to avoid overflow of flat offsets into Mid_O when
     # batch * num_head * max_kv_splits * head_dim exceeds 2**31.
-    cur_batch = tl.program_id(0).to(tl.int64)
-    cur_head_id = tl.program_id(1)
+    cur_batch = cur_batch.to(tl.int64)
     cur_kv_head = cur_head_id // tl.cdiv(kv_group_num, BLOCK_H)
-    split_kv_id = tl.program_id(2)
 
     if BLOCK_H < kv_group_num:
         VALID_BLOCK_H: tl.constexpr = BLOCK_H
@@ -613,7 +648,17 @@ def _fwd_grouped_kernel_stage1(
 
     if split_kv_end > split_kv_start:
         q = tl.load(Q + offs_q, mask=(mask_h[:, None]) & (mask_d[None, :]), other=0.0)
-        q_k = q.to(K_Buffer.dtype.element_ty)
+        # gfx1250: triton tl.dot(fp8, fp8) returns garbage (~1e34+) for contraction
+        # dim K>=128 (verified K=64 ok, K>=128 broken; bf16 fine at all K). The MLA
+        # nope QK dot has K=512, so an fp8 KV cache MUST NOT be consumed as an fp8 dot
+        # here: keep q in bf16 and upcast the fp8 K to bf16 for the dot. No-op for a
+        # bf16 cache. (Do NOT "optimize" this back to q.to(fp8) on gfx1250.)
+        # On all other platforms keep the original downcast of q to the KV dtype.
+        # TODO: remove this branch once the gfx1250 fp8 tl.dot issue is resolved.
+        if IS_GFX1250:
+            q_k = q
+        else:
+            q_k = q.to(K_Buffer.dtype.element_ty)
         if BLOCK_DPE > 0:
             qpe = tl.load(
                 Q + off_qpe, mask=(mask_h[:, None]) & (mask_dpe[None, :]), other=0.0
@@ -641,7 +686,10 @@ def _fwd_grouped_kernel_stage1(
                 mask=(offs_n[None, :] < split_kv_end) & (mask_d[:, None]),
                 other=0.0,
             )
-            qk = tl.dot(q_k, k)
+            if IS_GFX1250:
+                qk = tl.dot(q_k, k.to(q_k.dtype))
+            else:
+                qk = tl.dot(q_k, k)
             if BLOCK_DPE > 0:
                 if PAGE_SIZE == 1:
                     offs_buf_kpe = kv_loc[None, :] * stride_buf_kbs + base_offs_kpe
@@ -703,7 +751,15 @@ def _fwd_grouped_kernel_stage1(
             re_scale = tl.exp(e_max - n_e_max)
             p = tl.exp(qk - n_e_max[:, None])
             acc *= re_scale[:, None]
-            acc += tl.dot(p.to(v.dtype), v)
+            # Keep the softmax weights p in fp32 for the P·V dot (do NOT downcast p to
+            # bf16) on gfx1250. The bf16 downcast of p was the accuracy loss vs a torch
+            # fp32 SDPA reference (recovers gfx1250 R1 GSM8K ~0.82 -> ~0.92 with
+            # attention idealized). On other platforms restore the p.to(v.dtype) cast.
+            # TODO: remove this branch once the gfx1250 bf16 P·V issue is resolved.
+            if IS_GFX1250:
+                acc += tl.dot(p, v.to(tl.float32), out_dtype=tl.float32)
+            else:
+                acc += tl.dot(p.to(v.dtype), v)
 
             e_sum = e_sum * re_scale + tl.sum(p, 1)
             e_max = n_e_max
@@ -757,6 +813,7 @@ def _decode_grouped_att_m_fwd(
     aux_tensors=None,
     tune_mla: bool = False,
     forced_kv_splits: int = 0,
+    uneven_batch=None,
 ):
     BLOCK = 32
     Lk = k_buffer.shape[-1]
@@ -859,6 +916,7 @@ def _decode_grouped_att_m_fwd(
         Lv=Lv,
         HAS_MLA=has_mla,
         USE_PDL=use_pdl,
+        IS_GFX1250=_is_gfx1250,
         PAGE_SIZE=page_size,
         SCORE_MOD=score_mod,
         Aux0=aux0,
@@ -867,6 +925,8 @@ def _decode_grouped_att_m_fwd(
         aux0_len=aux0_len,
         forced_kv_splits=forced_kv_splits,
         USE_FORCED=forced_kv_splits > 0,
+        uneven_batch=uneven_batch,
+        ROTATE_BATCH=_rotate_batch(batch, uneven_batch),
         **extra_kargs,
     )
 
@@ -1032,6 +1092,7 @@ def decode_attention_fwd_normal(
     page_size: int = 1,
     score_mod=None,
     aux_tensors=None,
+    uneven_batch=None,
 ):
     _decode_att_m_fwd(
         q,
@@ -1049,6 +1110,7 @@ def decode_attention_fwd_normal(
         page_size=page_size,
         score_mod=score_mod,
         aux_tensors=aux_tensors,
+        uneven_batch=uneven_batch,
     )
     _decode_softmax_reducev_fwd(
         attn_logits,
@@ -1085,6 +1147,7 @@ def decode_attention_fwd_grouped(
     page_size: int = 1,
     score_mod=None,
     aux_tensors=None,
+    uneven_batch=None,
 ):
     tune_mla, forced_kv_splits = _mla_launch_plan(q, k_buffer, max_kv_splits, has_mla)
     _decode_grouped_att_m_fwd(
@@ -1107,6 +1170,7 @@ def decode_attention_fwd_grouped(
         aux_tensors=aux_tensors,
         tune_mla=tune_mla,
         forced_kv_splits=forced_kv_splits,
+        uneven_batch=uneven_batch,
     )
     _decode_softmax_reducev_fwd(
         attn_logits,
@@ -1151,6 +1215,7 @@ def decode_attention_fwd(
     lean_Lp=None,
     lean_Op=None,
     lean_locks=None,
+    uneven_batch=None,
 ):
     assert max_kv_splits == attn_logits.shape[2]
     assert q.shape[0] <= kv_indptr.shape[0] - 1
@@ -1174,6 +1239,7 @@ def decode_attention_fwd(
         and _should_use_lean_decode(
             enable_lean, logit_cap, sinks, xai_temperature_len, score_mod
         )
+        and lean_locks is not None
     ):
         total_programs, XCD_REMAP, NUM_XCDS = _lean_decode_launch_params(
             v_buffer.shape[-2], kv_group_num
@@ -1221,6 +1287,7 @@ def decode_attention_fwd(
             page_size=page_size,
             score_mod=score_mod,
             aux_tensors=aux_tensors,
+            uneven_batch=uneven_batch,
         )
     else:
         # GQA/MQA/MLA
@@ -1245,6 +1312,7 @@ def decode_attention_fwd(
             page_size=page_size,
             score_mod=score_mod,
             aux_tensors=aux_tensors,
+            uneven_batch=uneven_batch,
         )
 
 
@@ -1454,7 +1522,6 @@ def _lean_attention_decode_kernel(
     # Use a regular while loop instead of tl.static_range with a dynamic bound to avoid
     # Triton compiler crashes in the Coalesce pass (max_output_tile_cnt is runtime-computed).
     while iter < cta_end_tile_gid:
-
         tile_row_idx = iter // tiles_per_khead
         tile_idx = tile_row_idx * batch_size
         tile_iter = tile_row_idx * tiles_per_khead
