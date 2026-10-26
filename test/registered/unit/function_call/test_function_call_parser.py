@@ -3308,6 +3308,30 @@ class TestGlm4MoeDetector(unittest.TestCase):
         self.assertIsInstance(value, dict)
         self.assertEqual(value, {"pattern": "\\d+"})
 
+    def test_streaming_in_value_chunk_fast_path(self):
+        """Chunks inside <arg_value> without '<' should serialize as a single JSON increment."""
+        from unittest.mock import patch
+
+        payload = 'line1\n"quoted"\tvalue_' * 100
+        chunks = [
+            "<tool_call>get_weather\n<arg_key>city</arg_key>\n<arg_value>",
+            *[payload[i : i + 64] for i in range(0, len(payload), 64)],
+            "</arg_value>\n<arg_key>date</arg_key>\n<arg_value>2024-06-27</arg_value>\n</tool_call>",
+        ]
+        value_chunks = [c for c in chunks[1:-1]]
+        real_dumps = json.dumps
+        parameters = ""
+        with patch(
+            "sglang.srt.function_call.glm4_moe_detector.json.dumps",
+            wraps=real_dumps,
+        ) as mock_dumps:
+            for chunk in chunks:
+                result = self.detector.parse_streaming_increment(chunk, self.tools)
+                parameters += "".join(call.parameters for call in result.calls)
+        self.assertEqual(json.loads(parameters), {"city": payload, "date": "2024-06-27"})
+        # Fast path calls json.dumps once per chunk rather than once per character
+        self.assertLessEqual(mock_dumps.call_count, len(value_chunks) + 15)
+
 
 class TestGlm47MoeDetector(unittest.TestCase):
     def setUp(self):
@@ -3617,6 +3641,29 @@ class TestGlm47MoeDetector(unittest.TestCase):
         self.assertTrue(is_good)
         self.assertIsInstance(value, dict)
         self.assertEqual(value, {"pattern": "\\d+"})
+
+    def test_streaming_in_value_chunk_fast_path(self):
+        """Chunks inside <arg_value> without '<' should serialize as a single JSON increment."""
+        from unittest.mock import patch
+
+        payload = 'line1\n"quoted"\tvalue_' * 100
+        chunks = [
+            "<tool_call>get_weather<arg_key>city</arg_key><arg_value>",
+            *[payload[i : i + 64] for i in range(0, len(payload), 64)],
+            "</arg_value><arg_key>date</arg_key><arg_value>2024-06-27</arg_value></tool_call>",
+        ]
+        value_chunks = [c for c in chunks[1:-1]]
+        real_dumps = json.dumps
+        parameters = ""
+        with patch(
+            "sglang.srt.function_call.glm47_moe_detector.json.dumps",
+            wraps=real_dumps,
+        ) as mock_dumps:
+            for chunk in chunks:
+                result = self.detector.parse_streaming_increment(chunk, self.tools)
+                parameters += "".join(call.parameters for call in result.calls)
+        self.assertEqual(json.loads(parameters), {"city": payload, "date": "2024-06-27"})
+        self.assertLessEqual(mock_dumps.call_count, len(value_chunks) + 15)
 
     def test_get_model_structural_tag(self):
         """GLM-4.7/GLM-5 use xgrammar's native "glm_4_7" structural tag."""
