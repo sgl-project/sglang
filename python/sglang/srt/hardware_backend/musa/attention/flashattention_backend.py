@@ -37,9 +37,6 @@ _MATE_MLA_WORKSPACE_SIZE_BYTES = 128 * 1024 * 1024
 _MATE_NO_MLA_SCHEDULER_METADATA_DICT: dict = {}
 _MATE_NO_MLA_SCHEDULER_METADATA_LOCK = threading.Lock()
 
-# Global reference to the current backend instance (set during __init__)
-_CURRENT_BACKEND: Optional[MusaFlashAttentionBackend] = None
-
 
 def _compute_scheduler_metadata(
     backend: MusaFlashAttentionBackend,
@@ -154,27 +151,27 @@ def flash_attn_with_kvcache(
     score_mod=None,
     aux_tensors=None,
     ver=3,
+    *,
+    backend: MusaFlashAttentionBackend,
 ):
-    """MUSA flash_attn_with_kvcache wrapper that auto-injects scheduler_metadata."""
+    """MUSA flash_attn_with_kvcache wrapper that auto-injects scheduler_metadata
+    computed from the calling backend's current state."""
     if ver != 3:
         raise ValueError("Only ver=3 is supported for MUSA FA3.")
 
-    if scheduler_metadata is None and _CURRENT_BACKEND is not None:
-        backend = _CURRENT_BACKEND
-        # Ensure backend has been properly set up for this call
-        if backend._current_layer is not None:
-            page_size = k_cache.shape[1] if k_cache is not None else 1
-            scheduler_metadata = _compute_scheduler_metadata(
-                backend=backend,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k_new=cu_seqlens_k_new,
-                cache_seqlens=cache_seqlens,
-                max_seqlen_q=max_seqlen_q,
-                page_size=page_size,
-                causal=causal,
-                window_size=window_size,
-                num_splits=num_splits,
-            )
+    if scheduler_metadata is None and backend._current_layer is not None:
+        page_size = k_cache.shape[1] if k_cache is not None else 1
+        scheduler_metadata = _compute_scheduler_metadata(
+            backend=backend,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k_new=cu_seqlens_k_new,
+            cache_seqlens=cache_seqlens,
+            max_seqlen_q=max_seqlen_q,
+            page_size=page_size,
+            causal=causal,
+            window_size=window_size,
+            num_splits=num_splits,
+        )
 
     return mate_flash_attn_with_kvcache(
         q=q,
@@ -226,10 +223,6 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
 
         # Disable default scheduler metadata for fa3
         self._get_scheduler_metadata = None
-
-        # Register this backend as the global current instance for the wrapper
-        global _CURRENT_BACKEND
-        _CURRENT_BACKEND = self
 
     def _set_current_state(
         self, layer: RadixAttention, prefix: str, max_seqlen_k: int, can_run_tbo: bool
@@ -399,6 +392,7 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
                     q_chunk, cu_seqlens_q_cp, cache_seqlens_cp, max_seqlen_q_cp
                 ):
                     return flash_attn_with_kvcache(
+                        backend=self,
                         q=q_chunk,
                         k_cache=key_cache,
                         v_cache=value_cache,
@@ -430,6 +424,7 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
                 and any(forward_batch.extend_prefix_lens_cpu)
             ) or forward_batch.forward_mode.is_target_verify():
                 result = flash_attn_with_kvcache(
+                    backend=self,
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     k_cache=key_cache,
                     v_cache=value_cache,
@@ -480,6 +475,7 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
 
                 o, softmax_lse, *rest = result
                 o_expand, softmax_lse_expand, *rest_expand = flash_attn_with_kvcache(
+                    backend=self,
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     k_cache=key_cache.view(-1, 1, layer.tp_k_head_num, layer.head_dim),
                     v_cache=value_cache.view(
@@ -592,6 +588,7 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
                     q_rope = q_all[:, :, layer.v_head_dim :]
 
                 result = flash_attn_with_kvcache(
+                    backend=self,
                     q=q_rope,
                     k_cache=k_rope_cache,
                     v_cache=c_kv_cache,
@@ -618,6 +615,7 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
                     o, softmax_lse, *rest = result
                     o_expand, softmax_lse_expand, *rest_expand = (
                         flash_attn_with_kvcache(
+                            backend=self,
                             q=q_rope,
                             k_cache=k_rope_cache,
                             v_cache=c_kv_cache,
@@ -737,6 +735,7 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
 
             if layer.is_cross_attention:
                 o = flash_attn_with_kvcache(
+                    backend=self,
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     k_cache=key_cache,
                     v_cache=value_cache,
@@ -756,6 +755,7 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
                 )
             elif use_local_attn:
                 o = flash_attn_with_kvcache(
+                    backend=self,
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     k_cache=key_cache,
                     v_cache=value_cache,
@@ -792,6 +792,7 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
                 )
 
                 result = flash_attn_with_kvcache(
+                    backend=self,
                     q=q_reshaped,
                     k_cache=key_cache,
                     v_cache=value_cache,
@@ -818,6 +819,7 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
                     o, softmax_lse, *rest = result
                     o_expand, softmax_lse_expand, *rest_expand = (
                         flash_attn_with_kvcache(
+                            backend=self,
                             q=q_reshaped,
                             k_cache=key_cache,
                             v_cache=value_cache,
@@ -871,6 +873,7 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
             max_seqlen_q = metadata.max_seq_len_q
 
             result = flash_attn_with_kvcache(
+                backend=self,
                 q=q_rope,
                 k_cache=k_rope_cache,
                 v_cache=c_kv_cache,
@@ -896,6 +899,7 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
 
                 o, softmax_lse, *rest = result
                 o_expand, softmax_lse_expand, *rest_expand = flash_attn_with_kvcache(
+                    backend=self,
                     q=q_rope,
                     k_cache=k_rope_cache,
                     v_cache=c_kv_cache,
