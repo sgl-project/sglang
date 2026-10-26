@@ -3,6 +3,7 @@ request's decode step (fused_recurrent_kda_packed_decode) must give the same bit
 and inside larger batches, although both pick their kernels by batch size otherwise."""
 
 import random
+import sys
 from unittest.mock import patch
 
 import pytest
@@ -122,3 +123,7 @@ def test_kda_packed_decode_batch_invariant():
         out, s = run(n)
         assert torch.equal(out[:1], ref_out), f"output, batch of {n}"
         assert torch.equal(s[:1], ref_state), f"state, batch of {n}"
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
