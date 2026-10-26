@@ -4,7 +4,7 @@ import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+from sglang.srt.hardware_backend.npu.utils import is_npu_a3, is_npu_arch35
 from sglang.srt.layers.dcp.layout import localize_dcp_indices
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKOnlyPool,
@@ -715,7 +715,9 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         parallel = get_parallel()
         self.dcp_size = parallel.attn_dcp_size
         self.dcp_rank = parallel.attn_dcp_rank
-        self.use_flash_mla = envs.SGLANG_NPU_USE_FLASH_MLA.get() and is_npu_arch35()
+        self.use_flash_mla = envs.SGLANG_NPU_USE_FLASH_MLA.get() and (
+            is_npu_arch35() or is_npu_a3()
+        )
         if self.use_flash_mla and (
             dtype != torch.bfloat16
             or index_head_dim is not None

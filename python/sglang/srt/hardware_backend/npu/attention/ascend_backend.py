@@ -28,7 +28,7 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     get_sparsity_driven_kv_offload_sparse_context_len,
     is_sparsity_driven_kv_offload_enabled,
 )
-from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+from sglang.srt.hardware_backend.npu.utils import is_npu_a3, is_npu_arch35
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.cp.base import CPAttentionBackendKind, get_cp_strategy
@@ -402,10 +402,10 @@ class AscendAttnBackend(AttentionBackend):
             and model_runner.spec_algorithm.is_dspark()
         )
         flash_mla_requested = self.use_mla and envs.SGLANG_NPU_USE_FLASH_MLA.get()
-        self.use_flash_mla = flash_mla_requested and is_npu_arch35()
+        self.use_flash_mla = flash_mla_requested and (is_npu_arch35() or is_npu_a3())
         if flash_mla_requested and not self.use_flash_mla:
             logger.warning(
-                "NPU FlashMLA requires Ascend A5 (arch35); using the original "
+                "NPU FlashMLA requires Ascend A3 or A5; using the original "
                 "MLA attention and KV cache on this device."
             )
         if self.use_flash_mla:
@@ -429,10 +429,17 @@ class AscendAttnBackend(AttentionBackend):
                     "NPU FlashMLA supports ordinary BF16 MLA (latent 512, RoPE 64), "
                     "decode and static DSpark verify, without CP or mixed chunks."
                 )
-            from cann_ops_transformer.ops.attention.flash_mla import (
-                flash_mla,
-                flash_mla_metadata,
-            )
+            if is_npu_arch35():
+                from cann_ops_transformer.ops.attention.flash_mla import (
+                    flash_mla,
+                    flash_mla_metadata,
+                )
+            else:
+                from sgl_kernel_npu.attention.flash_mla import (
+                    flash_mla,
+                    flash_mla_metadata,
+                )
+            logger.info("NPU FlashMLA provider: %s", flash_mla.__module__)
 
             self.flash_mla = flash_mla
             self.flash_mla_metadata = flash_mla_metadata
@@ -543,6 +550,13 @@ class AscendAttnBackend(AttentionBackend):
         # The scheduler ORs target and draft capabilities. Only fully supported
         # device-length paths can skip its per-round CPU mirror.
         self.needs_cpu_seq_lens = not (_env_opt_out and not _host_bound)
+        logger.info(
+            "NPU attention configuration: draft=%s flash_mla=%s mojo_mtp=%s cpu_seq_lens=%s",
+            self.is_draft_worker,
+            self.use_flash_mla,
+            self.use_mojo_mtp,
+            self.needs_cpu_seq_lens,
+        )
         if _env_opt_out and _host_bound:
             logger.warning(
                 "SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS=0 is ignored: "

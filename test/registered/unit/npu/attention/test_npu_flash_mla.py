@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 import torch
+
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
@@ -196,28 +197,38 @@ def test_ragged_verify_is_rejected(backend):
 
 
 @pytest.mark.parametrize(
-    "enabled,arch35,dspark,is_draft,force_cpu,mojo,needs_cpu",
+    "enabled,arch35,a3,dspark,is_draft,force_cpu,mojo,needs_cpu",
     [
-        (False, False, False, False, False, False, True),
-        (False, True, False, False, False, False, True),
-        (True, False, False, False, False, False, True),
-        (True, False, True, False, False, False, True),
-        (True, True, False, False, False, False, False),
-        (True, True, True, False, False, False, False),
-        (True, True, True, True, False, False, True),
-        (False, True, True, True, False, False, True),
-        (True, True, False, False, True, False, True),
-        (True, True, True, False, True, False, True),
-        (True, True, True, True, False, True, False),
-        (False, False, True, True, False, True, False),
-        (True, True, True, True, True, True, True),
-        (True, True, True, False, False, True, False),
+        (False, False, False, False, False, False, False, True),
+        (False, True, False, False, False, False, False, True),
+        (True, False, False, False, False, False, False, True),
+        (True, False, False, True, False, False, False, True),
+        (True, True, False, False, False, False, False, False),
+        (True, True, False, True, False, False, False, False),
+        (True, True, False, True, True, False, False, True),
+        (False, True, False, True, True, False, False, True),
+        (True, True, False, False, False, True, False, True),
+        (True, True, False, True, False, True, False, True),
+        (True, True, False, True, True, False, True, False),
+        (False, False, False, True, True, False, True, False),
+        (True, True, False, True, True, True, True, True),
+        (True, True, False, True, False, False, True, False),
+        (False, False, True, False, False, False, False, True),
+        (True, False, True, False, False, False, False, False),
+        (True, False, True, True, False, False, False, False),
+        (True, False, True, True, False, True, False, True),
+        (True, False, True, True, True, False, False, True),
+        (True, False, True, True, True, False, True, False),
+        (True, False, True, True, True, True, True, True),
+        (False, False, True, True, True, False, True, False),
+        (True, True, True, False, False, False, False, False),
+        (True, False, True, True, False, False, True, False),
     ],
 )
 def test_cpu_length_gate_respects_backend_capability_and_explicit_override(
-    enabled, arch35, dspark, is_draft, force_cpu, mojo, needs_cpu
+    enabled, arch35, a3, dspark, is_draft, force_cpu, mojo, needs_cpu
 ):
-    uses_flash_mla = enabled and arch35 and not is_draft
+    uses_flash_mla = enabled and (arch35 or a3) and not is_draft
     uses_mojo = mojo and is_draft and dspark
     spec = SimpleNamespace(
         is_dspark=lambda: dspark,
@@ -263,16 +274,21 @@ def test_cpu_length_gate_respects_backend_capability_and_explicit_override(
         return original_tensor(*args, **kwargs)
 
     cann_module = SimpleNamespace(flash_mla=Mock(), flash_mla_metadata=Mock())
+    a3_module = SimpleNamespace(flash_mla=Mock(), flash_mla_metadata=Mock())
     with (
         patch.dict(
             sys.modules,
             {
                 "cann_ops_transformer.ops.attention.flash_mla": (
-                    cann_module if uses_flash_mla else None
-                )
+                    cann_module if uses_flash_mla and arch35 else None
+                ),
+                "sgl_kernel_npu.attention.flash_mla": (
+                    a3_module if uses_flash_mla and not arch35 else None
+                ),
             },
         ),
         patch.object(mod, "is_npu_arch35", return_value=arch35),
+        patch.object(mod, "is_npu_a3", return_value=a3),
         patch.object(mod.torch, "tensor", side_effect=tensor_on_cpu),
         patch.object(mod, "is_deepseek_dsa", return_value=False),
         patch.object(mod, "is_sparsity_driven_kv_offload_enabled", return_value=False),
@@ -314,6 +330,10 @@ def test_cpu_length_gate_respects_backend_capability_and_explicit_override(
     assert obj.use_mojo_mtp is uses_mojo
     assert obj.needs_cpu_seq_lens is needs_cpu
     assert obj.requires_host_seq_lens_update is not (uses_flash_mla or uses_mojo)
+    if uses_flash_mla:
+        provider = cann_module if arch35 else a3_module
+        assert obj.flash_mla is provider.flash_mla
+        assert obj.flash_mla_metadata is provider.flash_mla_metadata
 
 
 @pytest.mark.parametrize("draft_needs_cpu", [True, False])
@@ -358,7 +378,9 @@ def pool_factory():
         self.layer_transfer_counter = None
         self.memory_saver_adapter = SimpleNamespace(region=lambda _: nullcontext())
 
-    def make_pool(enabled=True, arch35=True, fia_nz=False, dcp_size=1, **overrides):
+    def make_pool(
+        enabled=True, arch35=True, a3=False, fia_nz=False, dcp_size=1, **overrides
+    ):
         arguments = dict(
             size=256,
             page_size=128,
@@ -374,6 +396,7 @@ def pool_factory():
             patch.object(KVCache, "__init__", init_cache),
             patch.object(pool_mod.NPUMLATokenToKVPool, "_finalize_allocation_log"),
             patch.object(pool_mod, "is_npu_arch35", return_value=arch35),
+            patch.object(pool_mod, "is_npu_a3", return_value=a3),
             patch.object(
                 pool_mod.envs.SGLANG_NPU_USE_FLASH_MLA, "get", return_value=enabled
             ),
@@ -394,8 +417,11 @@ def pool_factory():
     return make_pool
 
 
-def test_merged_cache_preserves_split_views_and_page_boundary_writes(pool_factory):
-    pool = pool_factory()
+@pytest.mark.parametrize("arch35,a3", [(True, False), (False, True)])
+def test_merged_cache_preserves_split_views_and_page_boundary_writes(
+    pool_factory, arch35, a3
+):
+    pool = pool_factory(arch35=arch35, a3=a3)
     locations = torch.tensor([127, 128, 255])
     key = torch.arange(3 * 512, dtype=torch.float32).view(3, 1, 512).to(torch.bfloat16)
     rope = torch.arange(3 * 64, dtype=torch.float32).view(3, 1, 64).to(torch.bfloat16)
@@ -438,13 +464,19 @@ def test_merged_cache_preserves_split_views_and_page_boundary_writes(pool_factor
 
 
 @pytest.mark.parametrize(
-    "enabled,arch35", [(False, False), (False, True), (True, False)]
+    "enabled,arch35,a3",
+    [
+        (False, False, False),
+        (False, True, False),
+        (False, False, True),
+        (True, False, False),
+    ],
 )
 @pytest.mark.parametrize("fia_nz", [False, True])
 def test_fallback_keeps_separate_cache_allocations(
-    pool_factory, enabled, arch35, fia_nz
+    pool_factory, enabled, arch35, a3, fia_nz
 ):
-    pool = pool_factory(enabled=enabled, arch35=arch35, fia_nz=fia_nz)
+    pool = pool_factory(enabled=enabled, arch35=arch35, a3=a3, fia_nz=fia_nz)
     assert pool.use_flash_mla is False
     key, rope = pool.get_kv_buffer(0)
     assert key.is_contiguous() and rope.is_contiguous()
@@ -453,8 +485,9 @@ def test_fallback_keeps_separate_cache_allocations(
     assert pool.get_kv_layer_ids() == [0, 1, 0, 1]
 
 
-def test_k3_hybrid_pool_maps_model_layer_to_flash_mla_cache(pool_factory):
-    pool = pool_factory()
+@pytest.mark.parametrize("arch35,a3", [(True, False), (False, True)])
+def test_k3_hybrid_pool_maps_model_layer_to_flash_mla_cache(pool_factory, arch35, a3):
+    pool = pool_factory(arch35=arch35, a3=a3)
     hybrid = HybridLinearKVPool.__new__(HybridLinearKVPool)
     hybrid.full_kv_pool = pool
     hybrid.full_attention_layer_id_mapping = {3: 0, 7: 1}
@@ -474,11 +507,12 @@ def test_k3_hybrid_pool_maps_model_layer_to_flash_mla_cache(pool_factory):
         {"dcp_size": 2},
     ],
 )
+@pytest.mark.parametrize("arch35,a3", [(True, False), (False, True)])
 def test_unsupported_cache_configurations_fail_before_allocation(
-    pool_factory, overrides
+    pool_factory, overrides, arch35, a3
 ):
     with pytest.raises(ValueError, match="ordinary BF16 MLA"):
-        pool_factory(**overrides)
+        pool_factory(arch35=arch35, a3=a3, **overrides)
 
 
 def test_verify_mask_broadcasts_across_query_block(backend):
