@@ -76,6 +76,9 @@ class ModelTaskType(Enum):
             or self == ModelTaskType.TI2V
             or self == ModelTaskType.V2V
             or self == ModelTaskType.F2V
+            # Omitting S2V skipped _adjust_visual_fields when served, costing the
+            # output extension, sequence-shard resolution and resolution checks.
+            or self == ModelTaskType.S2V
         )
 
     def is_visual_gen(self) -> bool:

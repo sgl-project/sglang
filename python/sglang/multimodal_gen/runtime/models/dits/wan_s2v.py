@@ -47,6 +47,7 @@ from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_c
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
+from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -63,7 +64,6 @@ def sinusoidal_embedding_1d(dim, position):
     return torch.cat([torch.cos(sinusoid), torch.sin(sinusoid)], dim=1)
 
 
-@torch.amp.autocast("cuda", enabled=False)
 def rope_params(max_seq_len, dim, theta=10000):
     assert dim % 2 == 0
     freqs = torch.outer(
@@ -73,7 +73,6 @@ def rope_params(max_seq_len, dim, theta=10000):
     return torch.polar(torch.ones_like(freqs), freqs)
 
 
-@torch.amp.autocast("cuda", enabled=False)
 def rope_apply(x, grid_sizes, freqs):
     n = x.size(2)
     output = []
@@ -89,7 +88,6 @@ def rope_apply(x, grid_sizes, freqs):
     return torch.stack(output).to(dtype=x.dtype)
 
 
-@torch.amp.autocast("cuda", enabled=False)
 def rope_precompute(x, grid_sizes, freqs, start=None):
     b, s, n, c = x.size(0), x.size(1), x.size(2), x.size(3) // 2
     if isinstance(freqs, list):
@@ -168,6 +166,7 @@ class WanSelfAttention(nn.Module):
         eps=1e-6,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
         skip_sequence_parallel: bool = False,
+        is_cross_attention: bool = False,
     ):
         super().__init__()
         assert dim % num_heads == 0
@@ -190,6 +189,7 @@ class WanSelfAttention(nn.Module):
             causal=False,
             supported_attention_backends=supported_attention_backends,
             skip_sequence_parallel=skip_sequence_parallel,
+            is_cross_attention=is_cross_attention,
         )
         self.ulysses_attn = UlyssesAttention(
             num_heads=self.local_num_heads,
@@ -272,6 +272,9 @@ class WanCrossAttention(WanSelfAttention):
             eps,
             supported_attention_backends=supported_attention_backends,
             skip_sequence_parallel=True,
+            # Lets the selector fall back to a dense backend when a sparse one is
+            # requested; the audio injector inherits it.
+            is_cross_attention=True,
         )
 
     def forward(self, x, context, context_lens):
@@ -833,6 +836,8 @@ class WanModelS2V(ModelMixin, ConfigMixin):
         "window_size",
     ]
     _no_split_modules = ["WanS2VAttentionBlock"]
+    # Not a BaseDiT, so take the default set the other Wan DiTs inherit.
+    _supported_attention_backends = BaseDiT._supported_attention_backends
 
     @register_to_config
     def __init__(
@@ -899,10 +904,6 @@ class WanModelS2V(ModelMixin, ConfigMixin):
             nn.Linear(freq_dim, dim), nn.SiLU(), nn.Linear(dim, dim)
         )
         self.time_projection = nn.Sequential(nn.SiLU(), nn.Linear(dim, dim * 6))
-        self._supported_attention_backends = {
-            AttentionBackendEnum.FA,
-            AttentionBackendEnum.TORCH_SDPA,
-        }
         self.blocks = nn.ModuleList(
             [
                 WanS2VAttentionBlock(
@@ -1261,9 +1262,10 @@ class WanModelS2V(ModelMixin, ConfigMixin):
         x = x + self.trainable_cond_mask(mask_input).to(x.dtype)
         if self.zero_timestep:
             t = torch.cat([t, torch.zeros([1], dtype=t.dtype, device=t.device)])
-        with torch.amp.autocast("cuda", dtype=torch.float32):
-            e = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, t).float())
-            e0 = self.time_projection(e).unflatten(1, (6, self.dim))
+        # As wanvideo's TimestepEmbedder: the sinusoid in fp32, the projections in the weight
+        sinusoid = sinusoidal_embedding_1d(self.freq_dim, t).float()
+        e = self.time_embedding(sinusoid.to(self.time_embedding[0].weight.dtype))
+        e0 = self.time_projection(e).unflatten(1, (6, self.dim))
         if self.zero_timestep:
             e = e[:-1]
             zero_e0 = e0[-1:]
@@ -1344,10 +1346,6 @@ class WanS2VTransformer3DModel(WanModelS2V, LayerwiseOffloadableModuleMixin):
     _fsdp_shard_conditions = [is_block]
     _compile_conditions = [is_block]
     _fsdp_forward_methods: tuple[str, ...] = ()
-    _supported_attention_backends = {
-        AttentionBackendEnum.FA,
-        AttentionBackendEnum.TORCH_SDPA,
-    }
     param_names_mapping = WanS2VConfig().param_names_mapping
     reverse_param_names_mapping = WanS2VConfig().reverse_param_names_mapping
     lora_param_names_mapping = WanS2VConfig().lora_param_names_mapping

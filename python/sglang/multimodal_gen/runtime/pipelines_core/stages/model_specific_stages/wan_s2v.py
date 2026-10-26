@@ -40,6 +40,9 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 V = StageValidators
 
+# Per blocking socket operation, as urlopen applies it; matches vision.py's video download.
+_REMOTE_INPUT_TIMEOUT_S = 60
+
 
 class WanS2VBeforeDenoisingStage(PipelineStage):
     """Prepare Wan S2V conditions for the standard denoising loop."""
@@ -84,8 +87,15 @@ class WanS2VBeforeDenoisingStage(PipelineStage):
         )
         if os.path.exists(target_path):
             return target_path
-        with urlopen(url) as response, open(target_path, "wb") as fout:
+        # Renamed in only when complete, so a failed download never leaves a truncated
+        # file for the cache check above to return.
+        partial_path = f"{target_path}.partial"
+        with (
+            urlopen(url, timeout=_REMOTE_INPUT_TIMEOUT_S) as response,
+            open(partial_path, "wb") as fout,
+        ):
             fout.write(response.read())
+        os.replace(partial_path, target_path)
         return target_path
 
     def _generate_seed_and_generator(self, batch: Req) -> None:
@@ -196,6 +206,18 @@ class WanS2VBeforeDenoisingStage(PipelineStage):
                 latents = latents * scaling_factor
         return latents
 
+    def _encode_audio(self, audio_path: str, infer_frames: int):
+        # Runs on the device either way; --audio-encoder-cpu-offload only parks it on the
+        # host between requests, as the VAE does.
+        self.audio_encoder = self.audio_encoder.to(get_local_torch_device())
+        return self.audio_encoder.encode_audio(
+            audio_path,
+            infer_frames=infer_frames,
+            fps=self.transformer.fps,
+            dtype=self.transformer.param_dtype,
+            m=self.transformer.audio_sample_m,
+        )
+
     def _load_pose_cond(
         self,
         pose_video: str | None,
@@ -204,45 +226,54 @@ class WanS2VBeforeDenoisingStage(PipelineStage):
         size: tuple[int, int],
         server_args: ServerArgs,
     ) -> torch.Tensor:
+        height, width = size
+        if pose_video is None:
+            # No pose: zero latents of the encoded shape, without VAE-encoding a blank video.
+            vae_arch = server_args.pipeline_config.vae_config.arch_config
+            return torch.zeros(
+                1,
+                vae_arch.z_dim,
+                infer_frames // vae_arch.scale_factor_temporal,
+                height // vae_arch.scale_factor_spatial,
+                width // vae_arch.scale_factor_spatial,
+                device=get_local_torch_device(),
+                dtype=self.transformer.param_dtype,
+            )
+
+        # decord is only needed to read a pose video, and is not a dependency on x86
+        # (pyproject declares decord2 for aarch64 only), so import it on this path.
         from decord import VideoReader
 
-        height, width = size
-        if pose_video is not None:
-            vr = VideoReader(pose_video)
-            original_fps = vr.get_avg_fps()
-            total_frames = len(vr)
-            interval = max(1, round(original_fps / self.transformer.fps))
-            required_span = (infer_frames - 1) * interval
-            start_frame = 0
-            sampled_indices = []
-            for i in range(infer_frames):
-                idx = start_frame + i * interval
-                if idx >= total_frames:
-                    break
-                sampled_indices.append(idx)
-            pose_seq = vr.get_batch(sampled_indices).asnumpy()
-            resize = transforms.Resize(min(height, width))
-            crop = transforms.CenterCrop((height, width))
-            cond_tensor = torch.from_numpy(pose_seq).permute(0, 3, 1, 2) / 255.0
-            cond_tensor = cond_tensor * 2 - 1
-            cond_tensor = crop(resize(cond_tensor)).permute(1, 0, 2, 3).unsqueeze(0)
-            padding_frames = infer_frames - cond_tensor.shape[2]
-            if padding_frames > 0:
-                cond_tensor = torch.cat(
-                    [
-                        cond_tensor,
-                        -torch.ones([1, 3, padding_frames, height, width]),
-                    ],
-                    dim=2,
-                )
-        else:
-            cond_tensor = -torch.ones([1, 3, infer_frames, height, width])
+        vr = VideoReader(pose_video)
+        original_fps = vr.get_avg_fps()
+        total_frames = len(vr)
+        interval = max(1, round(original_fps / self.transformer.fps))
+        required_span = (infer_frames - 1) * interval
+        start_frame = 0
+        sampled_indices = []
+        for i in range(infer_frames):
+            idx = start_frame + i * interval
+            if idx >= total_frames:
+                break
+            sampled_indices.append(idx)
+        pose_seq = vr.get_batch(sampled_indices).asnumpy()
+        resize = transforms.Resize(min(height, width))
+        crop = transforms.CenterCrop((height, width))
+        cond_tensor = torch.from_numpy(pose_seq).permute(0, 3, 1, 2) / 255.0
+        cond_tensor = cond_tensor * 2 - 1
+        cond_tensor = crop(resize(cond_tensor)).permute(1, 0, 2, 3).unsqueeze(0)
+        padding_frames = infer_frames - cond_tensor.shape[2]
+        if padding_frames > 0:
+            cond_tensor = torch.cat(
+                [
+                    cond_tensor,
+                    -torch.ones([1, 3, padding_frames, height, width]),
+                ],
+                dim=2,
+            )
 
         cond_tensor = torch.cat([cond_tensor[:, :, :1], cond_tensor], dim=2)
-        cond_latents = self._encode_video_to_latents(cond_tensor, server_args)[:, :, 1:]
-        if pose_video is None:
-            cond_latents = cond_latents * 0
-        return cond_latents
+        return self._encode_video_to_latents(cond_tensor, server_args)[:, :, 1:]
 
     def _decode_source_audio(
         self, audio_path: str
@@ -303,13 +334,7 @@ class WanS2VBeforeDenoisingStage(PipelineStage):
         motion_latents = self._encode_video_to_latents(motion_pixels, server_args)
         lat_motion_frames = (motion_frames + 3) // 4
 
-        audio_input, max_num_repeat = self.audio_encoder.encode_audio(
-            audio_path,
-            infer_frames=infer_frames,
-            fps=self.transformer.fps,
-            dtype=self.transformer.param_dtype,
-            m=self.transformer.audio_sample_m,
-        )
+        audio_input, max_num_repeat = self._encode_audio(audio_path, infer_frames)
         if max_num_repeat < 1:
             raise ValueError(f"Audio path produced no valid clips: {audio_path}")
 
@@ -366,6 +391,6 @@ class WanS2VBeforeDenoisingStage(PipelineStage):
         }
         if server_args.vae_cpu_offload:
             self.vae = self.vae.to("cpu")
-        if getattr(server_args, "audio_encoder_cpu_offload", False):
+        if server_args.audio_encoder_cpu_offload:
             self.audio_encoder = self.audio_encoder.to("cpu")
         return batch
