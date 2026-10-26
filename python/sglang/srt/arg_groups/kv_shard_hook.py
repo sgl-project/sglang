@@ -32,26 +32,35 @@ def validate_kv_shard_attention_backend(server_args: Any, cfg: Any = None) -> No
     prefill_backend, _ = attention_backends_of(resolved_view(server_args))
     if prefill_backend == "dsa":
         hf_config = model_config_of(server_args).hf_config
-        if not (
-            cfg.device == "cuda"
-            and cfg.enable_prefill_cp
-            and cfg.attn_cp_size > 1
-            and cfg.pp_size == 1
-            and cfg.cp_strategy == "interleave"
-            and cfg.dsa_prefill_backend == "trtllm"
-            and cfg.dsa_decode_backend == "trtllm"
-            and cfg.kv_cache_dtype == "fp8_e4m3"
-            and cfg.page_size == 64
-            and cfg.disaggregation_transfer_backend == "mooncake"
-            and not cfg.enable_dsa_cache_layer_split
-            and get_dsa_index_kpool(hf_config) == 1
-            and not get_dsa_index_kpool_compress(hf_config)
+        if (
+            cfg.device != "cuda"
+            or not cfg.enable_prefill_cp
+            or cfg.attn_cp_size <= 1
+            or cfg.cp_strategy != "interleave"
+            or cfg.pp_size != 1
         ):
             raise ValueError(
-                "DSA KV sharding requires CUDA interleave prefill CP > 1, "
-                "TRTLLM prefill/decode, pp_size=1, fp8_e4m3 KV, page size 64, "
-                "uncompressed index_kpool=1 and Mooncake; DSA cache layer "
-                "splitting must be disabled."
+                "DSA KV sharding requires CUDA interleave prefill CP > 1 and PP1."
+            )
+        if (
+            cfg.dsa_prefill_backend != "trtllm"
+            or cfg.dsa_decode_backend != "trtllm"
+            or cfg.kv_cache_dtype != "fp8_e4m3"
+            or cfg.page_size != 64
+        ):
+            raise ValueError(
+                "DSA KV sharding requires TRTLLM prefill/decode with fp8_e4m3 "
+                "KV and page size 64."
+            )
+        if (
+            cfg.disaggregation_transfer_backend != "mooncake"
+            or cfg.enable_dsa_cache_layer_split
+            or get_dsa_index_kpool(hf_config) != 1
+            or get_dsa_index_kpool_compress(hf_config)
+        ):
+            raise ValueError(
+                "DSA KV sharding requires Mooncake, uncompressed index_kpool=1 "
+                "and no DSA cache layer splitting."
             )
         return
     if is_deepseek_dsa(model_config_of(server_args).hf_config):
@@ -95,18 +104,17 @@ def handle_kv_cache_sharding(server_args: Any, gpu_mem: Optional[float] = None) 
         )
     if cfg.speculative_algorithm is not None:
         model_config = model_config_of(server_args)
-        if not (
-            cfg.speculative_algorithm == "EAGLE"
-            and "GlmMoeDsaForCausalLM"
-            in getattr(model_config.hf_config, "architectures", [])
-            and (model_config.num_nextn_predict_layers or 0) == 1
-            and cfg.speculative_eagle_topk == 1
-            and not cfg.enable_multi_layer_eagle
-            and cfg.pp_size == 1
+        # PP1 is checked once by the DSA backend gate below.
+        if (
+            cfg.speculative_algorithm != "EAGLE"
+            or model_config.hf_config.architectures[0] != "GlmMoeDsaForCausalLM"
+            or model_config.num_nextn_predict_layers != 1
+            or cfg.speculative_eagle_topk != 1
+            or cfg.enable_multi_layer_eagle
         ):
             raise ValueError(
                 "KV sharding supports speculative decoding only for GLM DSA "
-                "single-layer NextN MTP with EAGLE, topk=1 and pp_size=1."
+                "single-layer NextN MTP with EAGLE and topk=1."
             )
     if cfg.dllm_algorithm is not None:
         raise ValueError(
