@@ -1346,6 +1346,11 @@ SGLang supports various environment variables that can be used to configure its 
   </thead>
   <tbody>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_GRAMMAR_COMPILE_MAX_WORKERS</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Maximum workers in each grammar backend's compilation pool. A positive value overrides automatic sizing; zero or negative values use <code>max(1, min(cpu_count // 2, 8))</code>, with a CPU-count fallback of 1. Automatic sizing does not detect container CPU quotas or limit backend-internal threads. Lower values reduce concurrent compilation and may increase schema-burst latency.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>0</code> (automatic)</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_GRAMMAR_POLL_INTERVAL</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Poll interval (seconds) for asynchronous grammar compilation.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>0.005</code></td>
