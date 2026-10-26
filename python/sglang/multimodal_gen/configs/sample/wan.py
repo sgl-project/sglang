@@ -297,6 +297,15 @@ class Wan2_2_S2V_14B_SamplingParam(Wan2_2_Base_SamplingParams):
         ]
     )
 
+    def __post_init__(self) -> None:
+        # The S2V DiT is not a CachableDiT, so the denoising stage would accept both
+        # flags and never consult them.
+        if self.enable_teacache or self.enable_spectrum:
+            raise ValueError(
+                "Wan2.2-S2V does not support enable_teacache or enable_spectrum."
+            )
+        super().__post_init__()
+
 
 @dataclass
 class Wan_Animate_2_14B_SamplingParam(Wan2_2_Base_SamplingParams):

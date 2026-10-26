@@ -170,41 +170,27 @@ class WanS2VAudioEncoder(AudioEncoder):
             num_sample=bucket_num,
             fixed_start=0,
         )
-        batch_audio_embeds = []
         audio_sample_stride = int(self.video_rate / fps)
-        for bi in batch_idx:
-            if bi < audio_frame_num:
-                chosen_idx = list(
-                    range(
-                        bi - m * audio_sample_stride,
-                        bi + (m + 1) * audio_sample_stride,
-                        audio_sample_stride,
-                    )
-                )
-                chosen_idx = [0 if c < 0 else c for c in chosen_idx]
-                chosen_idx = [
-                    audio_frame_num - 1 if c >= audio_frame_num else c
-                    for c in chosen_idx
-                ]
-                if return_all_layers:
-                    frame_audio_embed = audio_embed[:, chosen_idx].flatten(
-                        start_dim=-2, end_dim=-1
-                    )
-                else:
-                    frame_audio_embed = audio_embed[0][chosen_idx].flatten()
-            else:
-                shape = (
-                    [num_layers, audio_dim * (2 * m + 1)]
-                    if return_all_layers
-                    else [audio_dim * (2 * m + 1)]
-                )
-                frame_audio_embed = torch.zeros(
-                    shape,
-                    device=audio_embed.device,
-                    dtype=audio_embed.dtype,
-                )
-            batch_audio_embeds.append(frame_audio_embed.unsqueeze(0))
-        return torch.cat(batch_audio_embeds, dim=0), min_batch_num
+        if audio_sample_stride < 1:
+            raise ValueError(
+                f"fps={fps} exceeds the audio feature rate {self.video_rate}"
+            )
+        # One gather for every output frame: a frame's 2m+1 taps are clamped into the
+        # audio, and frames past its end point at an appended zero row.
+        device = audio_embed.device
+        frame_idx = torch.as_tensor(batch_idx, device=device)
+        taps = torch.arange(-m, m + 1, device=device) * audio_sample_stride
+        idx = (frame_idx[:, None] + taps).clamp_(0, audio_frame_num - 1)
+        idx[frame_idx >= audio_frame_num] = audio_frame_num
+        padded = torch.cat(
+            [audio_embed, audio_embed.new_zeros(num_layers, 1, audio_dim)], dim=1
+        )
+        gathered = padded[:, idx]  # [layers, frames, 2m+1, dim]
+        if return_all_layers:
+            batch_audio_embeds = gathered.transpose(0, 1).flatten(start_dim=-2)
+        else:
+            batch_audio_embeds = gathered[0].flatten(start_dim=-2)
+        return batch_audio_embeds.contiguous(), min_batch_num
 
     def encode_audio(
         self,

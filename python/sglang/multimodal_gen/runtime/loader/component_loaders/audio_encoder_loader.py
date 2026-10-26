@@ -14,7 +14,7 @@ class AudioEncoderLoader(ComponentLoader):
     expected_library = "transformers"
 
     def should_offload(self, server_args, model_config=None):
-        return bool(getattr(server_args, "audio_encoder_cpu_offload", False))
+        return bool(server_args.audio_encoder_cpu_offload)
 
     def load_customized(
         self, component_model_path: str, server_args: ServerArgs, component_name: str
