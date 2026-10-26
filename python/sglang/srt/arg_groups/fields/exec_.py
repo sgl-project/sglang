@@ -151,9 +151,9 @@ class ExecFeatures(msgspec.Struct):
     ] = None
     return_aux_hidden_state_layer_ids: A[
         Optional[List[int]],
-        "Target layer ids captured by --enable-return-aux-hidden-states, in the "
-        "convention of a draft config's target layer ids. Required for DFLASH "
-        "and DSPARK; EAGLE3 defaults to the model's EAGLE3 layers.",
+        "Target-model layer ids for the selected capture convention. These may "
+        "differ from draft-checkpoint layer ids. Required for DFLASH and DSPARK; "
+        "EAGLE3 defaults to the model's EAGLE3 layers.",
     ] = None
     enable_return_routed_experts: A[
         bool, "Enable returning routed experts of each layer with responses."

@@ -2849,7 +2849,7 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--return-aux-hidden-state-layer-ids`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Target layer ids captured by `--enable-return-aux-hidden-states`, in the convention of a draft config's target layer ids. Required for DFLASH and DSPARK; EAGLE3 defaults to the model's EAGLE3 layers.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Target-model layer ids for the selected capture convention. Required for DFLASH and DSPARK; EAGLE3 defaults to the model's EAGLE3 layers. Draft-checkpoint ids can differ: DFLASH uses zero-based layer-output ids for Llama and Qwen3, but layer-input ids for Muse Glimmer. For a Muse `DFlash2DraftModel` or `MuseGlimmerAssistantModel` draft, output-layer id 4 becomes capture id 5; this conversion is not automatic.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>List[int]</td>
     </tr>
