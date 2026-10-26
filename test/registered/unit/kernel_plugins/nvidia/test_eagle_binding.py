@@ -392,9 +392,12 @@ class TestEagleEntries(CustomTestCase):
             draft_owns_attention=False,
             draft_worker=order.draft_worker,
             init_attention_backend=order.init_attention_backend,
+            parallel_layout=None,
         )
-        # the PP and MoE contexts read process groups and runtime flags a CPU test lacks
+        # The parallel and MoE contexts read process groups and runtime flags this
+        # CPU test lacks.
         with (
+            patch.object(eagle_worker_v2, "draft_tp_context", contextlib.nullcontext),
             patch.object(eagle_worker_v2, "draft_pp_context", contextlib.nullcontext),
             patch.object(
                 eagle_worker_v2,

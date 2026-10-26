@@ -114,7 +114,7 @@ class TestMegakernelRuntime(CustomTestCase):
         self.assertIs(binding.megakernel_draft_sampler(lm), print)
 
     def test_each_architecture_gets_its_registered_binding(self):
-        with patch.dict(runtime._BINDINGS, {ARCH: OtherBinding}):
+        with patch.dict(binding._BINDINGS, {ARCH: OtherBinding}):
             lm = install(tokens=1)
         self.assertIsInstance(lm.context.binding, OtherBinding)
         self.assertIs(lm.context.binding.model, lm)
@@ -122,9 +122,9 @@ class TestMegakernelRuntime(CustomTestCase):
     def test_offered_entries_reach_sglang_only_when_every_rank_offers_them(self):
         registry.register(architecture="EagleDraft", path="_fakes:EAGLE_DRAFT")
         lm = install(archs=["EagleDraft"], is_draft=True)
-        self.assertIs(runtime.megakernel_entry(lm, "draft_loop"), print)
-        self.assertIsNone(runtime.megakernel_entry(lm, "draft_extend"))
-        self.assertIsNone(runtime.megakernel_entry(Lm(), "draft_loop"))
+        self.assertIs(binding.megakernel_entry(lm, "draft_loop"), print)
+        self.assertIsNone(binding.megakernel_entry(lm, "draft_extend"))
+        self.assertIsNone(binding.megakernel_entry(Lm(), "draft_loop"))
 
         def fewer_entries_on_rank_1(value, group=None):
             entries = value == ("draft_loop", "begin_draft_round")
@@ -154,7 +154,7 @@ class TestMegakernelRuntime(CustomTestCase):
             )
 
         lm = self._install_spec(offering({"draft_loop": labels}))
-        served = runtime.megakernel_graph_variants(lm, "draft_loop", batch_sizes={1})
+        served = binding.megakernel_graph_variants(lm, "draft_loop", batch_sizes={1})
         self.assertIs(served, labels)
         # one graph per batch size: another runner, no batch size the megakernel
         # serves, a built object offering none, no megakernel
@@ -166,7 +166,7 @@ class TestMegakernelRuntime(CustomTestCase):
         ):
             with self.subTest(runner=runner, sizes=sizes):
                 self.assertIsNone(
-                    runtime.megakernel_graph_variants(model, runner, batch_sizes=sizes)
+                    binding.megakernel_graph_variants(model, runner, batch_sizes=sizes)
                 )
 
         def fewer_labels_on_rank_1(value, group=None):
@@ -189,7 +189,7 @@ class TestMegakernelRuntime(CustomTestCase):
             widths=(7, 14), graph_variants={"target_verify": labels}
         )
         self.assertEqual(
-            runtime.megakernel_verify_variants(
+            binding.megakernel_verify_variants(
                 lm, capture_bs=[1, 2, 4, 8], tokens_per_request=7
             ),
             (labels, frozenset({1, 2})),
