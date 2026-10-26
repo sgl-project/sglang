@@ -34,7 +34,8 @@ Connect to a standalone SGLang Diffusion server.
 2. **Connect to Server**: Use the `SGLDiffusion Server Model` node to connect (default: `http://localhost:3000/v1`).
 3. **Generate Content**:
    - `SGLDiffusion Generate Image`: For text-to-image and image editing. Set `num_images` (1 to 10) to get several images from one request as one `IMAGE` batch, in order. Image `i` uses `seed + i`, so the same settings and seed reproduce the same batch; a seed of `-1` lets the server pick a random seed.
-   - `SGLDiffusion Generate Video`: For text-to-video and image-to-video.
+   - `SGLDiffusion Generate Video`: For text-to-video, image-to-video, and video-to-video (connect a `VIDEO`).
+   - Both nodes have an `enhance_prompt` toggle (the server needs `--prompt-enhancer-config`); the rewritten prompt comes out as `revised_prompt`.
    - `SGLDiffusion Generate MiniMax-H3`: For joint video-and-audio on a standalone server.
 4. **LoRA Support**: Use `SGLDiffusion Server Set LoRA` and `SGLDiffusion Server Unset LoRA`.
 
