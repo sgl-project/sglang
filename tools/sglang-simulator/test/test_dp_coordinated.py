@@ -227,6 +227,44 @@ def receive(owners):
     )
 
 
+def test_bootstrap_reports_reply_before_first_ready(owners):
+    # A preparing client has no Ready yet; the healthy internal exchange still
+    # has a finite deadline, independent of the external admission timeout.
+    owners.local[0].bridge._socket.setsockopt(zmq.RCVTIMEO, 500)
+    try:
+        for _ in range(3):
+            assert receive(owners) == [[], []]
+            assert both(owners, lambda run: run.bridge.on_idle()) == [None, None]
+            assert owners.owner.clock.run_id is None
+            assert owners.owner.clock.now_ns == 0
+            assert owners.events == []
+            assert all(run.bridge.clock.now_ns == 0 for run in owners.local)
+        owners.control.send(encode_message(Ready("run", 0, [Submit("first")])))
+        request = TokenizedGenerateReqInput("first", 1)
+        owners.incoming.put(request)
+        assert receive(owners) == [[], [request]]
+        assert owners.owner.clock.run_id == "run"
+        assert owners.owner._delivered == {"first": 1}
+        assert not owners.failures
+    finally:
+        if owners.owner.clock.run_id is None:
+            # Release the old blocking implementation when this regression is
+            # run against it, so a failing assertion cannot strand its thread.
+            owners.control.send(encode_message(Ready("cleanup", 0, [], finished=True)))
+
+
+def test_first_ready_missing_payload_retains_active_timeout(owners):
+    owners.owner.timeout_s = 0.02
+    owners.control.send(encode_message(Ready("run", 0, [Submit("missing")])))
+    results = receive(owners)
+    assert all(isinstance(result, ProtocolError) for result in results)
+    assert all("driver/payload timeout" in str(result) for result in results)
+    assert owners.owner.clock.run_id == "run"
+    assert owners.owner.clock.now_ns == 0
+    assert decode_grant(owners.control.recv()).status == "ERROR"
+    assert all("driver/payload timeout" in run.bridge._failure for run in owners.local)
+
+
 @pytest.mark.parametrize(
     "kind", ["GetInternalStateReq", "ConfigureLoggingReq", "FreezeGCReq", "ShutdownReq"]
 )

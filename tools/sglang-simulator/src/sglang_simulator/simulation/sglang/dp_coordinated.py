@@ -13,6 +13,7 @@ from functools import wraps
 from pathlib import Path
 
 import zmq
+
 from sglang_simulator.hook import BaseHook
 from sglang_simulator.hook.utils import get_obj_from_args
 from sglang_simulator.simulation.coordinator import ProtocolError
@@ -121,6 +122,14 @@ class DPCoordinatedController(CoordinatedScheduler):
         if hasattr(self, "_peer_socket"):
             self._peer_socket.close(linger=0)
         super().close()
+
+    def _settle(self):
+        if self.clock.run_id is None and not self._socket.poll(0):
+            # Client preparation has no external deadline before the first
+            # Ready; do not hold the finite internal peer exchange meanwhile.
+            self._pump()
+            return
+        return super()._settle()
 
     def _has_native_work(self):
         return bool(

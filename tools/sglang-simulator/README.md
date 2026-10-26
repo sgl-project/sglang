@@ -1062,7 +1062,10 @@ explicit routed-DP requests, native load snapshots and budget algorithm, with
 its 20ms refresh cadence evaluated in virtual time. A dispatch generation is
 released only after both schedulers acknowledge actual receipt. Bootstrap
 administration reaches both native handlers before waiting for the first Ready,
-so a client can query server state before starting coordinated admission. One complete
+so a client can query server state before starting coordinated admission. Before
+the first Ready, empty paired reports return without advancing virtual time while
+the client prepares its dataset. Internal transport deadlines remain finite, and
+the existing driver/payload deadline applies once the first Ready is accepted. One complete
 joint whole-worker result advances time once, and both native callbacks and
 accounting consumption precede global terminal delivery. Profile boundaries
 require both drained owners, combine request statistics using the existing
