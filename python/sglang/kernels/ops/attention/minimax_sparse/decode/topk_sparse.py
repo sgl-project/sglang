@@ -1,6 +1,6 @@
 # Copyright 2025 XunhaoLai. All rights reserved.
 
-from typing import Optional
+from typing import Optional, Tuple, Union
 
 import torch
 import triton
@@ -8,6 +8,7 @@ import triton.language as tl
 
 from sglang.srt.runtime_context import get_platform
 
+from ..common.nvfp4 import Nvfp4Cache
 from ..common.tile_ptr import tile_ptrs_1d, tile_ptrs_2d
 from ..common.utils import (
     check_sparse_kv_fp8,
@@ -395,7 +396,30 @@ def flash_decode_with_gqa_share_sparse(
     k_scale: Optional[float] = None,
     v_scale: Optional[float] = None,
     hisparse_slots: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
+    out_quant: str = "",
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    # out_quant only reaches the NVFP4 cache's kernels; the others return bf16 O.
+    if isinstance(k_cache, Nvfp4Cache):
+        from .nvfp4_decode import flash_decode_with_gqa_share_sparse_nvfp4
+
+        assert sink is None and hisparse_slots is None, (
+            "NVFP4 sparse decode supports neither attention sinks nor HiSparse"
+        )
+        return flash_decode_with_gqa_share_sparse_nvfp4(
+            q,
+            k_cache,
+            v_cache,
+            req_to_token,
+            seq_lens,
+            slot_ids,
+            block_size,
+            topk_idx,
+            sm_scale=sm_scale,
+            q_scale=q_scale,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            out_quant=out_quant,
+        )
     triton.set_allocator(robust_allocator)
     is_fp8 = check_sparse_kv_fp8(q, k_cache, v_cache, label="decode")
     k_scale = unit_scale(k_scale)

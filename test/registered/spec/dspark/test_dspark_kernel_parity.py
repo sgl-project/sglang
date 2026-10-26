@@ -25,11 +25,12 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
     DSparkScheduleConfig,
 )
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kernels import dspark as dspark_kernels
 from sglang.test.test_utils import CustomTestCase, get_device
 
 register_cuda_ci(est_time=14, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=15, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 DEVICE = get_device()
 VOCAB = 129280
@@ -73,6 +74,77 @@ def _case_accept_greedy(tc):
     table, idx = _ri(0, VOCAB, (64, t)), _ri(0, t, (64,), torch.int32)
     ref = table[torch.arange(64, device=DEVICE), idx.long()]
     tc._eq(dspark_accept.gather_row_bonus_triton(table=table, idx=idx), ref)
+
+
+def _case_tp_shard_row_argmax(tc):
+    # Vocab-sharded verify logits (bf16, as the TP lm_head leaves them): each rank's
+    # argmax over its shard, combined across ranks, is the gathered fp32 argmax.
+    from sglang.kernels.ops.speculative.dspark.dspark_gfx950 import (
+        tp_shard_row_argmax,
+    )
+
+    g = torch.Generator(device=DEVICE).manual_seed(0)
+    world, shard = 4, 50016
+    for rows, vocab in ((8, world * shard), (384, world * shard - 77)):
+        full = (torch.randn(rows, world * shard, device=DEVICE, generator=g) * 4).to(
+            torch.bfloat16
+        )
+        full[:, 1234] = full[:, 3 * shard + 5] = 50.0
+        full[::3, shard + 7] = 50.0
+        full[0, 2 * shard] = float("nan")
+        full[1, 17] = full[1, shard + 18] = float("nan")
+        full[2] = float("-inf")
+        shards = [full[:, r * shard : (r + 1) * shard] for r in range(world)]
+        valid = [max(0, min(shard, vocab - r * shard)) for r in range(world)]
+        partials = []
+
+        def keep(out, inp):
+            partials.append(inp.clone())
+
+        for r in range(world):
+            tp_shard_row_argmax(
+                shards[r],
+                col_start=r * shard,
+                num_valid=valid[r],
+                world_size=world,
+                all_gather_into_tensor=keep,
+            )
+        gathered = torch.cat(partials)
+        ref = torch.argmax(full[:, :vocab].float(), dim=-1)
+        for r in range(world):
+            got = tp_shard_row_argmax(
+                shards[r],
+                col_start=r * shard,
+                num_valid=valid[r],
+                world_size=world,
+                all_gather_into_tensor=lambda out, inp: out.copy_(gathered),
+            )
+            tc._eq(got, ref)
+
+
+def _case_accept_greedy_target_predict(tc):
+    # A precomputed target argmax stands in for the logits.
+    torch.manual_seed(0)
+    bs, t = 8, 6
+    candidates = _ri(0, 200, (bs, t))
+    target_logits = torch.randn(bs * t, 200, device=DEVICE)
+    predict = torch.argmax(target_logits, dim=-1)
+    for cutoff in (None, _ri(1, t + 1, (bs,), torch.int32)):
+        for impl in ("torch", "triton"):
+            ref = getattr(dspark_accept.AcceptGreedy, impl)(
+                candidates=candidates,
+                target_logits=target_logits,
+                verify_num_draft_tokens=t,
+                cutoff_verify_lens=cutoff,
+            )
+            got = getattr(dspark_accept.AcceptGreedy, impl)(
+                candidates=candidates,
+                target_logits=None,
+                verify_num_draft_tokens=t,
+                cutoff_verify_lens=cutoff,
+                target_predict=predict,
+            )
+            tc._eq(got, ref)
 
 
 def _case_accept_sampling(tc):
@@ -411,6 +483,31 @@ def _case_qo_indptr(tc):
     tc.assertEqual(got.qo_indptr[:2].tolist(), [0, 3])
 
 
+def _case_markov_step_bias(tc):
+    # One kernel for the w1 gather and the w2 GEMV: within bf16 rounding of the
+    # embedding + F.linear pair, for row counts across its row blocks, a vocab
+    # with a ragged last tile, and a [bs, gamma] token block keeping its shape.
+    g = torch.Generator(device=DEVICE).manual_seed(21)
+    vocab, rank = 5003, 256
+    w1 = (torch.randn(vocab, rank, device=DEVICE, generator=g) * 0.5).to(torch.bfloat16)
+    w2 = (torch.randn(vocab, rank, device=DEVICE, generator=g) * 0.02).to(
+        torch.bfloat16
+    )
+    from sglang.kernels.ops.speculative.dspark.dspark_gfx950 import MarkovStepBias
+
+    cls = MarkovStepBias
+    for shape in ((1,), (5,), (48,), (130,), (3, 7)):
+        tokens = _ri(0, vocab, shape, g=g)
+        got = cls.triton(token_ids=tokens, w1_weight=w1, w2_weight=w2)
+        ref = cls.torch(token_ids=tokens, w1_weight=w1, w2_weight=w2)
+        tc.assertEqual(got.shape, (*shape, vocab))
+        exact = (w1[tokens].double() @ w2.double().t()).to(torch.bfloat16)
+        for other in (ref, exact):
+            torch.testing.assert_close(
+                got.float(), other.float(), rtol=2**-7, atol=1e-6
+            )
+
+
 def _case_scatter_compact_to_strided(tc):
     torch.manual_seed(19)
     t, bs, dim = 6, 8, 4096
@@ -471,6 +568,7 @@ def _case_softmax_temp(tc):
 _CASES = [
     ("accept_greedy", _case_accept_greedy),
     ("accept_sampling", _case_accept_sampling),
+    ("accept_greedy_target_predict", _case_accept_greedy_target_predict),
     ("build_block_seq_lens_causal", _case_build_block_seq_lens_causal),
     ("build_out_tokens", _case_build_out_tokens),
     ("build_ragged_verify_window", _case_build_ragged_verify_window),
@@ -486,6 +584,15 @@ _CASES = [
     ("padded_to_bucket", _case_padded_to_bucket),
     ("page_table_positions", _case_page_table_positions),
     ("qo_indptr", _case_qo_indptr),
+    # gfx950's step-bias kernel; CUDA never runs it
+    *(
+        [
+            ("markov_step_bias", _case_markov_step_bias),
+            ("tp_shard_row_argmax", _case_tp_shard_row_argmax),
+        ]
+        if torch.version.hip
+        else []
+    ),
     ("scatter_compact_to_strided", _case_scatter_compact_to_strided),
     ("schedule_verify_lens_topk", _case_schedule_verify_lens_topk),
     ("softmax_temp", _case_softmax_temp),
