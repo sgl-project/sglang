@@ -8,10 +8,10 @@ import unittest
 import warnings
 from contextlib import ExitStack
 
-from sglang.srt.environ import _DeprecatedEnv, envs
+from sglang.srt.environ import EnvField, Envs, _DeprecatedEnv, envs
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=6, suite="base-a-test-cpu")
+register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
 
 class TestEnvField(unittest.TestCase):
@@ -136,6 +136,64 @@ class TestDeprecatedEnvRegistry(unittest.TestCase):
 
         self._apply(old_name, _DeprecatedEnv(replacement=new_name, transform=str.upper))
         self.assertEqual(os.environ[new_name], "ABC")
+
+
+class TestEnvsRegistryComplete(unittest.TestCase):
+    """Every envs.<NAME> read in the tree must be a registered field.
+
+    Envs has no __getattr__, so an unregistered name raises AttributeError at
+    the call site instead of reading the environment. This test walks the
+    sources and collects the attribute reads made through bindings of
+    ``sglang.srt.environ.envs`` (plain or aliased), so a reference like the
+    MSA-v1 kill switch that lands without its registration fails here instead
+    of at backend construction.
+    """
+
+    def test_every_envs_reference_resolves(self):
+        import ast
+        from pathlib import Path
+
+        repo_src = Path(__file__).resolve().parents[3] / "python" / "sglang"
+        registered = {
+            name for name, value in vars(Envs).items() if isinstance(value, EnvField)
+        }
+
+        referenced = set()
+        for path in repo_src.rglob("*.py"):
+            try:
+                tree = ast.parse(path.read_text(encoding="utf-8"))
+            except (SyntaxError, UnicodeDecodeError):
+                continue
+            # Local names this file binds to sglang.srt.environ.envs
+            # (plain or aliased). Other `envs` modules (multimodal_gen,
+            # trtllm_lora_temp) bind from their own imports and are excluded.
+            tracked = set()
+            for node in ast.walk(tree):
+                if (
+                    isinstance(node, ast.ImportFrom)
+                    and node.module == "sglang.srt.environ"
+                ):
+                    for alias in node.names:
+                        if alias.name == "envs":
+                            tracked.add(alias.asname or "envs")
+            if not tracked:
+                continue
+            for node in ast.walk(tree):
+                if (
+                    isinstance(node, ast.Attribute)
+                    and isinstance(node.value, ast.Name)
+                    and node.value.id in tracked
+                ):
+                    referenced.add(node.attr)
+
+        unregistered = sorted(
+            name for name in referenced - registered if name.isupper()
+        )
+        self.assertEqual(
+            unregistered,
+            [],
+            f"envs.<name> reads with no registration in sglang/srt/environ.py: {unregistered}",
+        )
 
 
 if __name__ == "__main__":
