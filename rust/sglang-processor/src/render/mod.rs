@@ -148,9 +148,11 @@ impl ChatFormatter {
         match self {
             // recipe renders a continued final message itself, so no prefix follows.
             ChatFormatter::DeepSeekV4(_) => render_deepseek_v4(false, request, default_kwargs)
-                .map(|prompt| (prompt, String::new())),
+                .map(|prompt| (prompt, String::new()))
+                .map_err(RenderError::Failed),
             ChatFormatter::DeepSeekV41(_) => render_deepseek_v4(true, request, default_kwargs)
-                .map(|prompt| (prompt, String::new())),
+                .map(|prompt| (prompt, String::new()))
+                .map_err(RenderError::Failed),
             ChatFormatter::Glm53(formatter) => {
                 render_glm53(formatter, request, default_kwargs).map(text)
             }
@@ -160,16 +162,11 @@ impl ChatFormatter {
                 content_parts,
                 ..
             } => render_qwen38(formatter, *content_parts, request, default_kwargs).map(text),
-            _ => Err(format!(
-                "this formatter's requests render {RENDER_FALLBACK_SUFFIX}"
-            )),
+            _ => Err(RenderError::Declined("this formatter's requests".into())),
         }
-        .map_err(|message| {
-            if message.ends_with(RENDER_FALLBACK_SUFFIX) {
-                TemplateError::NeedsRenderFallback { message }
-            } else {
-                TemplateError::Renderer { message }
-            }
+        .map_err(|error| match error {
+            RenderError::Declined(message) => TemplateError::NeedsRenderFallback { message },
+            RenderError::Failed(message) => TemplateError::Renderer { message },
         })
     }
 
@@ -354,9 +351,28 @@ impl OAIChatLikeRequest for TemplateArgsRequest<'_> {
     }
 }
 
-/// How a parity renderer ends the message refusing a valid request, which
-/// [`ChatFormatter::render_request`] maps to [`TemplateError::NeedsRenderFallback`].
-const RENDER_FALLBACK_SUFFIX: &str = "on the engine";
+/// Why a parity renderer did not render a request.
+#[derive(Debug)]
+pub(crate) enum RenderError {
+    /// A valid request it cannot render exactly as SGLang does, named by what
+    /// it declines; [`ChatFormatter::render_request`] maps it to
+    /// [`TemplateError::NeedsRenderFallback`].
+    Declined(String),
+    /// An invalid request, or one the template rejects.
+    Failed(String),
+}
+
+impl From<String> for RenderError {
+    fn from(message: String) -> Self {
+        Self::Failed(message)
+    }
+}
+
+impl From<&str> for RenderError {
+    fn from(message: &str) -> Self {
+        Self::Failed(message.to_owned())
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum TemplateError {
@@ -402,7 +418,7 @@ pub enum TemplateError {
 
     /// A valid request [`ChatFormatter::render_request`] cannot render exactly as
     /// SGLang does; the host should render it another way, not reject it.
-    #[error("{message}")]
+    #[error("the parity renderer declines {message}")]
     NeedsRenderFallback { message: String },
 
     #[error("legacy chat template `{path}` must be a JSON object")]
