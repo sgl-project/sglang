@@ -69,7 +69,7 @@ def test_unified_l2_waits_for_index_producer(direction, backend):
         need_sort=False,
         lazy_compaction=True,
     )
-    device_pool = bundle.token_to_kv_pool.full_kv_pool
+    device_pool = bundle.token_to_kv_pool.layer_router.view("full")
     host_pool = UnifiedPageEnvelopeHostPool(
         device_pool,
         1.0,

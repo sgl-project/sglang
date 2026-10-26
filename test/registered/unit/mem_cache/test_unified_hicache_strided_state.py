@@ -108,12 +108,8 @@ class TestMambaSlotWiringIsShared(CustomTestCase):
         from sglang.srt.mem_cache.kv import build
 
         tree = ast.parse(inspect.getsource(build))
-        # Builders whose composite holds a mamba end.
-        expected = {
-            build._BUILDERS[key].__name__
-            for key in build._BUILDERS
-            if any(lifetime.__name__ == "StateLifetime" for lifetime in key)
-        }
+        # The builder wires the state end of every plan with state.
+        expected = {"build_kv_storage"}
         callers = {
             fn.name
             for fn in ast.walk(tree)

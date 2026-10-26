@@ -22,7 +22,11 @@ from types import SimpleNamespace
 
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang.test.unified_allocator_fixtures import chain_snapshot, token_ends
+from sglang.test.unified_allocator_fixtures import (
+    chain_snapshot,
+    stand_in_views,
+    token_ends,
+)
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 register_cuda_ci(est_time=14, stage="base-b", runner_config="1-gpu-small")
@@ -569,8 +573,8 @@ class TestMultiEndedAllocator(unittest.TestCase):
 
 
 class _FakeUnifiedSWAKVPool:
-    """Minimal stand-in for `UnifiedSWAKVPool`: a real one would construct
-    `UnifiedMHATokenToKVPool`, which is heavier than these tests need."""
+    """Minimal stand-in for a full + window unified pool: a real one would
+    construct `UnifiedMHATokenToKVPool` views, heavier than these tests need."""
 
     class _SubKV(_FakeKVCache):
         def __init__(self, max_slots):
@@ -643,6 +647,7 @@ class TestWindowChainAllocator(unittest.TestCase):
             roles=ChainRoles(owner="full", window="swa"),
             unified_buffer=pool,
             kvcache=kvcache,
+            views=stand_in_views(ChainRoles(owner="full", window="swa"), kvcache),
             device=_DEV,
             full_max_total_num_tokens=n_full_slots,
             swa_max_total_num_tokens=n_swa_slots,
@@ -1427,6 +1432,7 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
             roles=ChainRoles(owner="full", window="swa"),
             unified_buffer=pool,
             kvcache=kvcache,
+            views=stand_in_views(ChainRoles(owner="full", window="swa"), kvcache),
             device=_DEV,
             full_max_total_num_tokens=n_full_pages * self.PAGE_SIZE,
             swa_max_total_num_tokens=n_swa_pages * self.PAGE_SIZE,
@@ -1777,6 +1783,7 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
             roles=ChainRoles(owner="full", window="swa"),
             unified_buffer=pool,
             kvcache=kvcache,
+            views=stand_in_views(ChainRoles(owner="full", window="swa"), kvcache),
             device=_DEV,
             full_max_total_num_tokens=full_max,
             swa_max_total_num_tokens=swa_max,
@@ -1863,9 +1870,13 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
 
         allocator = ChainAllocator(
             roles=ChainRoles(owner="full", state="mamba"),
-            state_kvcache=(_FakeHybridLinearKVPool()).mamba_pool,
             unified_buffer=pool,
             kvcache=_FakeHybridLinearKVPool(),
+            views=stand_in_views(
+                ChainRoles(owner="full", state="mamba"),
+                _FakeHybridLinearKVPool(),
+                (_FakeHybridLinearKVPool()).mamba_pool,
+            ),
             device=_DEV,
             page_size=PS,
             need_sort=False,
@@ -1895,13 +1906,12 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
         # And .size matches this conserved sum.
         self.assertEqual(allocator.size, full_avail_before)
 
-    # 16. Regression: `_virt_tokens_to_phys_tokens` must do the page math --
-    # indexing the page-granular v2p with token ids gives OOB kernel inputs.
-    # A real `UnifiedSWAKVPool` cannot be built in this CPU shim, so the
-    # production instance methods are covered through the static helper.
+    # 16. Regression: the retraction copy's virtual -> physical token map must
+    # do the page math -- indexing the page-granular v2p with token ids gives
+    # OOB kernel inputs.
     def test_paged_pool_translate_helper_returns_physical_tokens(self):
         from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
-        from sglang.srt.mem_cache.unified_memory_pool import UnifiedSWAKVPool
+        from sglang.srt.mem_cache.kv.alloc.interim import _virtual_tokens_to_physical
 
         full_spec = MHASubPoolSpec(
             name="full",
@@ -1936,6 +1946,7 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
             roles=ChainRoles(owner="full", window="swa"),
             unified_buffer=pool,
             kvcache=kvcache,
+            views=stand_in_views(ChainRoles(owner="full", window="swa"), kvcache),
             device=_DEV,
             full_max_total_num_tokens=n_pages * PS,
             swa_max_total_num_tokens=n_pages * PS,
@@ -1947,10 +1958,7 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
         v_tokens = allocator.alloc(2 * PS)
         self.assertIsNotNone(v_tokens)
 
-        # The static helper does the page math: same as the instance methods.
-        swa_phys = UnifiedSWAKVPool._virt_tokens_to_phys_tokens(
-            v_tokens, allocator.swa_attn_allocator
-        )
+        swa_phys = _virtual_tokens_to_physical(v_tokens, allocator.swa_attn_allocator)
 
         self.assertTrue(
             bool((swa_phys >= 0).all().item()),
@@ -2410,6 +2418,7 @@ class TestWindowChainKernelIdSurface(unittest.TestCase):
             roles=ChainRoles(owner="full", window="swa"),
             unified_buffer=pool,
             kvcache=kvcache,
+            views=stand_in_views(ChainRoles(owner="full", window="swa"), kvcache),
             device=_DEV,
             full_max_total_num_tokens=n_full,
             swa_max_total_num_tokens=n_swa,
@@ -2554,9 +2563,13 @@ class TestPs64MLAChainFeasibility(unittest.TestCase):
 
         return ChainAllocator(
             roles=ChainRoles(owner="full", state="mamba"),
-            state_kvcache=(_FakeHybridLinearKVPool()).mamba_pool,
             unified_buffer=pool,
             kvcache=_FakeHybridLinearKVPool(),
+            views=stand_in_views(
+                ChainRoles(owner="full", state="mamba"),
+                _FakeHybridLinearKVPool(),
+                (_FakeHybridLinearKVPool()).mamba_pool,
+            ),
             device=_DEV,
             page_size=self.PS,
             need_sort=False,
@@ -3257,9 +3270,13 @@ class TestDcpWidening(unittest.TestCase):
 
         return ChainAllocator(
             roles=ChainRoles(owner="full", state="mamba"),
-            state_kvcache=(_FakeHybridLinearKVPool()).mamba_pool,
             unified_buffer=pool,
             kvcache=_FakeHybridLinearKVPool(),
+            views=stand_in_views(
+                ChainRoles(owner="full", state="mamba"),
+                _FakeHybridLinearKVPool(),
+                (_FakeHybridLinearKVPool()).mamba_pool,
+            ),
             device=_DEV,
             page_size=page_size,
             need_sort=False,

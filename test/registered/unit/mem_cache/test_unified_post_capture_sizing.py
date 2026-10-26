@@ -73,15 +73,14 @@ def _capacities(bundle) -> dict:
         "active_allocation_bytes": shared.active_allocation_bytes,
         "buf_lens": kvcache.get_contiguous_buf_infos()[1],
         "kvcache.size": kvcache.size,
-        "kvcache.size_swa": kvcache.size_swa,
         "allocator.size": allocator.size,
         "allocator.available_size": allocator.available_size(),
         "allocator.full_available_size": allocator.full_available_size(),
         "allocator.swa_available_size": allocator.swa_available_size(),
     }
     for name, sub, pool in (
-        ("full", allocator.full_attn_allocator, kvcache.full_kv_pool),
-        ("swa", allocator.swa_attn_allocator, kvcache.swa_kv_pool),
+        ("full", allocator.full_attn_allocator, kvcache.layer_router.view("full")),
+        ("swa", allocator.swa_attn_allocator, kvcache.layer_router.view("swa")),
     ):
         out[f"{name}.max_slots"] = shared.max_slots(name)
         out[f"{name}.sub.max_slots"] = sub.max_slots

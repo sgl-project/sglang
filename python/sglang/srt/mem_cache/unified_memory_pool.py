@@ -53,18 +53,13 @@ from sglang.srt.mem_cache.layout.token_major import (
     build_mamba_entry_views,
 )
 from sglang.srt.mem_cache.memory_pool import (
-    HybridLinearKVPool,
     HybridReqToTokenPool,
     KvBufferDesc,
-    KVWriteLoc,
     MambaPool,
     MHATokenToKVPool,
     MLATokenToKVPool,
     ReqToTokenPool,
-    unwrap_write_loc,
-    write_loc_is_physical,
 )
-from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = logging.getLogger(__name__)
@@ -1168,17 +1163,6 @@ class UnifiedHybridReqToTokenPool(HybridReqToTokenPool):
             self.req_index_to_mamba_ping_pong_track_buffer_mapping.zero_()
 
 
-class UnifiedHybridLinearKVPool(HybridLinearKVPool):
-    """`HybridLinearKVPool` over unified sub-pools (full = Unified{MLA,MHA},
-    mamba = UnifiedMambaPool)."""
-
-    def get_kv_layer_ids(self):
-        # Empty: the KV component is one whole-envelope entry, so there are no
-        # per-layer entries to pair by layer id (the sender falls back to
-        # positional pairing).
-        return []
-
-
 # ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
@@ -1186,9 +1170,10 @@ class UnifiedHybridLinearKVPool(HybridLinearKVPool):
 
 class UnifiedPoolBundle(NamedTuple):
     unified_memory_pool: UnifiedKVPool
-    token_to_kv_pool: object  # HybridLinearKVPool
+    token_to_kv_pool: object  # RoutedKVCache
     token_to_kv_pool_allocator: object  # ChainAllocator
-    req_to_token_pool: object  # UnifiedHybridReqToTokenPool
+    # A plan with state has its own request table; None for the caller to build.
+    req_to_token_pool: object  # Optional[UnifiedHybridReqToTokenPool]
 
 
 def _check_bs1_feasibility_floor(
@@ -1238,285 +1223,3 @@ def _wire_mamba_slot_allocator(
         state_pool.host_capacity_tokens * mamba_end.entry_bytes
     )
     return slot_allocator
-
-
-# ---------------------------------------------------------------------------
-# UnifiedSWAKVPool — hybrid SWA on the shared byte buffer
-# ---------------------------------------------------------------------------
-
-
-class UnifiedSWAKVPool(SWAKVPool):
-    """Shared-buffer replacement for `SWAKVPool`.
-
-    Composes two `UnifiedMHATokenToKVPool` instances (full + swa) aliasing the same
-    byte buffer. Inherits from `SWAKVPool` only for `isinstance`; does NOT call the
-    parent `__init__` (it would build static-partition pools). The per-sub-pool v2p
-    table IS the full->swa mapping, so `register_mapping` is a no-op.
-    """
-
-    def __init__(
-        self,
-        *,
-        unified_buffer: UnifiedKVPool,
-        swa_attention_layer_ids: List[int],
-        full_attention_layer_ids: List[int],
-        page_size: int = 1,
-        start_layer: Optional[int] = None,
-        end_layer: Optional[int] = None,
-        enable_memory_saver: bool = False,
-    ):
-        # Do NOT call super().__init__ — it would allocate static-partition pools.
-        self.unified_buffer = unified_buffer
-        self.swa_layer_nums = len(swa_attention_layer_ids)
-        self.full_layer_nums = len(full_attention_layer_ids)
-        self.layer_num = self.full_layer_nums + self.swa_layer_nums
-        self.start_layer = start_layer if start_layer is not None else 0
-        self.page_size = page_size
-        self.layer_transfer_counter = None
-
-        self.size = unified_buffer.max_slots("full") - 1
-        self.size_swa = unified_buffer.max_slots("swa") - 1
-
-        full_spec = unified_buffer.mha_spec("full")
-        swa_spec = unified_buffer.mha_spec("swa")
-        assert full_spec.store_dtype == swa_spec.store_dtype, (
-            "UnifiedSWAKVPool: full and swa sub-pools must share store_dtype; got "
-            f"full={full_spec.store_dtype}, swa={swa_spec.store_dtype}"
-        )
-        assert full_spec.kv_cache_dtype == swa_spec.kv_cache_dtype, (
-            "UnifiedSWAKVPool: full and swa sub-pools must share kv_cache_dtype; got "
-            f"full={full_spec.kv_cache_dtype}, swa={swa_spec.kv_cache_dtype}"
-        )
-        self.dtype = full_spec.kv_cache_dtype
-        self.head_num = full_spec.head_num
-        self.head_dim = full_spec.head_dim
-        self.device = unified_buffer.device
-
-        self.full_kv_pool = UnifiedMHATokenToKVPool(
-            unified_buffer=unified_buffer,
-            sub_pool_name="full",
-            page_size=page_size,
-            start_layer=start_layer,
-            end_layer=end_layer,
-        )
-        self.swa_kv_pool = UnifiedMHATokenToKVPool(
-            unified_buffer=unified_buffer,
-            sub_pool_name="swa",
-            page_size=page_size,
-            start_layer=start_layer,
-            end_layer=end_layer,
-        )
-
-        self.full_kv_pool.model_layer_ids = tuple(full_attention_layer_ids)
-        self.swa_kv_pool.model_layer_ids = tuple(swa_attention_layer_ids)
-
-        # disagg/nvlink disabled; keep attrs present to avoid AttributeError.
-        self.enable_custom_mem_pool = False
-        self.custom_mem_pool = None
-
-        # {global_layer_id: (per-pool index, is_swa_layer)}
-        self.layers_mapping: Dict[int, Tuple[int, bool]] = {}
-        for idx, gid in enumerate(full_attention_layer_ids):
-            self.layers_mapping[gid] = (idx, False)
-        for idx, gid in enumerate(swa_attention_layer_ids):
-            self.layers_mapping[gid] = (idx, True)
-
-        # None so dispatch routes through our v2p-table overrides, not a registered mapping.
-        self.full_to_swa_index_mapping: Optional[torch.Tensor] = None
-
-        self.mem_usage = 0.0  # cosmetic; UnifiedKVPool logs the real size
-
-        # Wired in via attach_allocators.
-        self._full_allocator = None
-        self._swa_allocator = None
-
-        logger.info(
-            "[unified-memory-pool] UnifiedSWAKVPool wrapped unified buffer: "
-            "full_layers=%d (max_slots=%d), swa_layers=%d (max_slots=%d), "
-            "head_num=%d, head_dim=%d",
-            self.full_layer_nums,
-            unified_buffer.max_slots("full"),
-            self.swa_layer_nums,
-            unified_buffer.max_slots("swa"),
-            self.head_num,
-            self.head_dim,
-        )
-
-    # -- allocator wiring --
-
-    def attach_allocators(self, *, full_allocator, swa_allocator) -> None:
-        """Wire the two `MultiEndedAllocator`s whose v2p tables translate slot ids."""
-        self._full_allocator = full_allocator
-        self._swa_allocator = swa_allocator
-
-    # -- BaseSWAKVPool ABC surface --
-
-    def register_mapping(self, full_to_swa_index_mapping: torch.Tensor) -> None:
-        return  # no-op in shared mode (the swa-side v2p IS the mapping)
-
-    def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
-        """Virtual token ids -> swa-physical token ids (int64)."""
-        assert self._swa_allocator is not None, (
-            "UnifiedSWAKVPool.translate_loc_from_full_to_swa called before "
-            "attach_allocators"
-        )
-        return self._swa_allocator.translate_kv_loc(kv_indices)
-
-    def get_state_buf_infos(self):
-        return self.swa_kv_pool.get_contiguous_buf_infos()
-
-    # -- size/info --
-
-    def get_kv_size_bytes(self):
-        return 0, 0  # UnifiedKVPool logs the total; per-side would double-count
-
-    @property
-    def post_capture_active(self) -> bool:
-        return self.unified_buffer.post_capture_active
-
-    @property
-    def post_capture_backed_bytes(self) -> int:
-        return self.unified_buffer.post_capture_backed_bytes
-
-    def finalize_backing(self, config) -> None:
-        self.unified_buffer.finalize_backing(config)
-
-    def get_contiguous_buf_infos(self):
-        return self.full_kv_pool.get_contiguous_buf_infos()
-
-    # -- buffer accessors --
-
-    def get_key_buffer(self, layer_id: int):
-        self._wait_for_layer(layer_id)
-        pool_layer_id, is_swa = self.layers_mapping[layer_id]
-        pool = self.swa_kv_pool if is_swa else self.full_kv_pool
-        return pool.get_key_buffer(pool_layer_id)
-
-    def get_value_buffer(self, layer_id: int):
-        self._wait_for_layer(layer_id)
-        pool_layer_id, is_swa = self.layers_mapping[layer_id]
-        pool = self.swa_kv_pool if is_swa else self.full_kv_pool
-        return pool.get_value_buffer(pool_layer_id)
-
-    def get_kv_buffer(self, layer_id: int):
-        self._wait_for_layer(layer_id)
-        pool_layer_id, is_swa = self.layers_mapping[layer_id]
-        pool = self.swa_kv_pool if is_swa else self.full_kv_pool
-        return pool.get_kv_buffer(pool_layer_id)
-
-    # -- kv writing --
-
-    def set_kv_buffer(
-        self,
-        layer,
-        loc_info,
-        cache_k: torch.Tensor,
-        cache_v: torch.Tensor,
-        k_scale: float = 1.0,
-        v_scale: float = 1.0,
-    ):
-        """Route to the right sub-pool. Both `swa_loc` and `full_loc` are PHYSICAL
-        (pre-translated once per forward by the attention backend); never translates here.
-        """
-        loc, swa_loc, full_loc = unwrap_write_loc(loc_info)
-        physical = write_loc_is_physical(loc_info)
-        layer_id = layer.layer_id
-        pool_layer_id, is_swa = self.layers_mapping[layer_id]
-        if is_swa:
-            # swa_loc is ALREADY swa-physical. Routed through the UnifiedMHATokenToKVPool
-            # override (its 4-D layer-major view can't take the parent's view(-1, row_dim)).
-            assert swa_loc is not None, (
-                "UnifiedSWAKVPool.set_kv_buffer: SWA layer received no swa_loc; the "
-                "attention backend must bundle forward_metadata.swa_out_cache_loc."
-            )
-            self.swa_kv_pool.set_kv_buffer(
-                None,
-                KVWriteLoc(swa_loc, physical=physical),
-                cache_k,
-                cache_v,
-                k_scale,
-                v_scale,
-                layer_id_override=pool_layer_id,
-            )
-            return
-        # Full layer: `loc` is already the full-side physical id, so an
-        # explicit full_loc is a same-space alias -- only triton's captured path
-        # passes one (its capture-stable buffer).
-        if full_loc is None:
-            full_loc = loc
-        self.full_kv_pool.set_kv_buffer(
-            None,
-            KVWriteLoc(full_loc, physical=physical),
-            cache_k,
-            cache_v,
-            k_scale,
-            v_scale,
-            layer_id_override=pool_layer_id,
-        )
-
-    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
-        # Never called on the composite — compaction runs per-sub-pool via
-        # UnifiedMHATokenToKVPool.move_kv_cache.
-        raise NotImplementedError(
-            "UnifiedSWAKVPool.move_kv_cache should not be called; compaction "
-            "operates per-sub-pool via UnifiedMHATokenToKVPool.move_kv_cache."
-        )
-
-    # -- HiCache shims (translate virtual->physical, then delegate) --
-
-    @staticmethod
-    def _virt_tokens_to_phys_tokens(
-        virt_tokens: torch.Tensor, allocator
-    ) -> torch.Tensor:
-        """Virtual TOKEN ids -> physical TOKEN ids (page-aware). Unbound pages yield
-        negatives; callers filter via `swa_phys >= 0`."""
-        ps = allocator.page_size
-        if ps == 1:
-            return allocator.virtual_to_physical[virt_tokens]
-        virt_pages = virt_tokens // ps
-        offsets = virt_tokens % ps
-        phys_pages = allocator.virtual_to_physical[virt_pages]
-        return phys_pages * ps + offsets
-
-    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
-        assert self._full_allocator is not None
-        assert self._swa_allocator is not None
-        # `indices` are virtual TOKEN ids; translate per sub-pool.
-        full_phys = self._virt_tokens_to_phys_tokens(indices, self._full_allocator)
-        swa_phys = self._virt_tokens_to_phys_tokens(indices, self._swa_allocator)
-        full_cpu = self.full_kv_pool.get_cpu_copy(
-            full_phys, req_pool_index=req_pool_index
-        )
-        valid = swa_phys >= 0
-        swa_cpu = None
-        if bool(valid.any().item()):
-            swa_cpu = self.swa_kv_pool.get_cpu_copy(swa_phys[valid])
-        return {"full": full_cpu, "swa": swa_cpu, "swa_mask": valid.cpu()}
-
-    def load_cpu_copy(
-        self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
-    ):
-        assert self._full_allocator is not None
-        full_phys = self._virt_tokens_to_phys_tokens(indices, self._full_allocator)
-        self.full_kv_pool.load_cpu_copy(
-            kv_cache_cpu["full"], full_phys, req_pool_index=req_pool_index
-        )
-        if kv_cache_cpu.get("swa") is not None:
-            assert self._swa_allocator is not None
-            swa_phys = self._virt_tokens_to_phys_tokens(indices, self._swa_allocator)
-            old_swa_mask = kv_cache_cpu["swa_mask"].to(indices.device)
-            assert old_swa_mask.shape == indices.shape
-            row_mask = (swa_phys >= 0)[old_swa_mask].cpu()
-            swa_phys = swa_phys[old_swa_mask][row_mask.to(indices.device)]
-            if swa_phys.numel() == 0:
-                return
-            swa_cpu = self._filter_swa_cpu_copy(
-                swa_kv_cpu=kv_cache_cpu["swa"], row_mask=row_mask
-            )
-            self.swa_kv_pool.load_cpu_copy(swa_cpu, swa_phys)
-
-
-class UnifiedSWAPoolBundle(NamedTuple):
-    unified_memory_pool: UnifiedKVPool
-    token_to_kv_pool: object  # UnifiedSWAKVPool
-    token_to_kv_pool_allocator: object  # ChainAllocator

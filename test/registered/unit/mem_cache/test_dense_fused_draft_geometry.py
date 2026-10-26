@@ -42,6 +42,7 @@ from sglang.srt.mem_cache.unified_memory_pool import (
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.unified_allocator_fixtures import stand_in_views
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -523,9 +524,11 @@ class TestFusedMLAHost(unittest.TestCase):
         kvcache = SimpleNamespace(full_kv_pool=_FakeKV(), mamba_pool=_FakeKV())
         alloc = ChainAllocator(
             roles=ChainRoles(owner="full", state="mamba"),
-            state_kvcache=kvcache.mamba_pool,
             unified_buffer=pool,
             kvcache=kvcache,
+            views=stand_in_views(
+                ChainRoles(owner="full", state="mamba"), kvcache, kvcache.mamba_pool
+            ),
             device=_DEV,
             page_size=self.PS,
             need_sort=False,

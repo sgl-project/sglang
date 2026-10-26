@@ -1318,7 +1318,7 @@ def _build_unified_swa_pool(page_size: int = 4):
 def _build_unified_host_pair(bundle):
     pool = bundle.token_to_kv_pool
     return UnifiedPageEnvelopeHostPool.build_hybrid_swa_pool_pair(
-        device_pools=(pool.full_kv_pool, pool.swa_kv_pool),
+        device_pools=tuple(map(pool.layer_router.view, ("full", "swa"))),
         host_to_device_ratio=1.0,
         host_size=0,
         page_size=pool.page_size,

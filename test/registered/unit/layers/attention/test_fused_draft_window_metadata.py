@@ -15,6 +15,7 @@ from sglang.srt.layers.attention import triton_backend as tb
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
+from sglang.srt.mem_cache.kv.routed_cache import RoutedKVCache
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
 from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
 from sglang.srt.mem_cache.layout.fused_draft import (
@@ -28,7 +29,7 @@ from sglang.srt.mem_cache.layout.fused_draft import (
 from sglang.srt.mem_cache.unified_draft_pool import bind_fused_draft
 from sglang.srt.mem_cache.unified_memory_pool import (
     UnifiedKVPool,
-    UnifiedSWAKVPool,
+    UnifiedMHATokenToKVPool,
 )
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
@@ -91,15 +92,26 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
             page_size=1,
             fused_draft=placement,
         )
-        target_pool = UnifiedSWAKVPool(
+        views = {
+            name: UnifiedMHATokenToKVPool(unified_buffer=buffer, sub_pool_name=name)
+            for name in ("full", "swa")
+        }
+        target_pool = RoutedKVCache(
             unified_buffer=buffer,
-            full_attention_layer_ids=[0],
-            swa_attention_layer_ids=[1],
+            owner="full",
+            layer_maps=[("full", views["full"], {0: 0}), ("swa", views["swa"], {1: 0})],
+            page_size=1,
+            start_layer=0,
+            end_layer=None,
+            size=buffer.max_slots("full") - 1,
+            head_num=views["full"].head_num,
+            head_dim=views["full"].head_dim,
         )
         allocator = ChainAllocator(
             roles=ChainRoles(owner="full", window="swa"),
             unified_buffer=buffer,
             kvcache=target_pool,
+            views=views,
             device="cuda",
             full_max_total_num_tokens=1024,
             swa_max_total_num_tokens=1024,

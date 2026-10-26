@@ -11,7 +11,7 @@ What still differs between chain shapes is the interim capacity policy in
 from __future__ import annotations
 
 import logging
-from typing import Callable, Dict, Hashable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Hashable, List, Optional, Sequence, Tuple
 
 import msgspec
 import torch
@@ -104,8 +104,8 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         unified_buffer: UnifiedKVPool,
         roles: ChainRoles,
         kvcache,
+        views: Dict[str, Any],
         device: str,
-        state_kvcache=None,
         page_size: int = 1,
         need_sort: bool = False,
         forward_stream: Optional[torch.cuda.Stream] = None,
@@ -128,6 +128,9 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         )
         self.unified_buffer = unified_buffer
         self.roles = roles
+        # Each sub-pool's view, by sub-pool name: what its band moves, zeroes
+        # and copies.
+        self.views = dict(views)
         self.lazy_compaction = lazy_compaction
         band = dict(
             unified_buffer=unified_buffer,
@@ -136,7 +139,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             forward_stream=forward_stream,
         )
         self.full_attn_allocator = MultiEndedAllocator(
-            kvcache=kvcache.full_kv_pool,
+            kvcache=self.views[roles.owner],
             sub_pool_name=roles.owner,
             is_id_owner=True,
             page_size=page_size,
@@ -152,7 +155,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             self.swa_attn_allocator = (
                 FloatMultiEndedAllocator if floats else MultiEndedAllocator
             )(
-                kvcache=kvcache.swa_kv_pool,
+                kvcache=self.views[roles.window],
                 sub_pool_name=roles.window,
                 is_id_owner=False,  # binds the virtual pages the owner mints
                 page_size=page_size,
@@ -163,7 +166,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         self.mamba_allocator: Optional[MultiEndedAllocator] = None
         if roles.state is not None:
             self.mamba_allocator = MultiEndedAllocator(
-                kvcache=state_kvcache,
+                kvcache=self.views[roles.state],
                 sub_pool_name=roles.state,
                 is_id_owner=True,
                 page_size=1,  # state is per request, orthogonal to KV paging
@@ -192,11 +195,11 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         )
 
         if self.swa_attn_allocator is not None:
-            self._wire_window_pools(kvcache)
+            self._size_window_host_pools()
         # HiCache indexes the owner's per-layer views with physical ids.
-        kvcache.full_kv_pool.host_transfer_translate = (
-            self.full_attn_allocator.translate_kv_loc
-        )
+        self.views[
+            roles.owner
+        ].host_transfer_translate = self.full_attn_allocator.translate_kv_loc
         # Translated before the pool when the pool indexes host copies physically.
         self.free_page_reps_group: Optional[List[torch.Tensor]] = None
         self.full_page_reps_group: List[torch.Tensor] = []
@@ -217,17 +220,13 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             self.available_size(),
         )
 
-    def _wire_window_pools(self, kvcache) -> None:
-        """A window chain's facade resolves reads through the band allocators,
-        and its host pools are sized in tokens."""
-        kvcache.attach_allocators(
-            full_allocator=self.full_attn_allocator,
-            swa_allocator=self.swa_attn_allocator,
-        )
-        for band, pool, tokens in (
-            (self.full_attn_allocator, kvcache.full_kv_pool, self.size_full),
-            (self.swa_attn_allocator, kvcache.swa_kv_pool, self.size_swa),
+    def _size_window_host_pools(self) -> None:
+        """A window chain's host pools are sized in tokens."""
+        for band, tokens in (
+            (self.full_attn_allocator, self.size_full),
+            (self.swa_attn_allocator, self.size_swa),
         ):
+            pool = self.views[band.sub_pool_name]
             pool.host_capacity_tokens = tokens
             pool.host_capacity_bytes = (
                 tokens * self.unified_buffer.spec(band.sub_pool_name).entry_bytes()
@@ -526,21 +525,25 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         engine: the window read translate, on int64 ids."""
         return self.swa_attn_allocator.translate_kv_loc(kv_indices.to(torch.int64))
 
+    @property
+    def cpu_copy_carries_mamba(self) -> bool:
+        return self._policy.cpu_copy_carries_state
+
     def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
         """Retraction backup: `Req.offload_kv_cache` hands over `req_to_token`
-        rows, which hold VIRTUAL ids here."""
-        return self._kvcache.get_cpu_copy(
-            self._policy.cpu_copy_ids(self, indices),
-            mamba_indices=mamba_indices,
-            req_pool_index=req_pool_index,
+        rows, which hold VIRTUAL ids here; each sub-pool's view copies its
+        physical ones."""
+        return self._policy.get_cpu_copy(
+            self, indices, mamba_indices=mamba_indices, req_pool_index=req_pool_index
         )
 
     def load_cpu_copy(
         self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
     ):
-        return self._kvcache.load_cpu_copy(
+        self._policy.load_cpu_copy(
+            self,
             kv_cache_cpu,
-            self._policy.cpu_copy_ids(self, indices),
+            indices,
             mamba_indices=mamba_indices,
             req_pool_index=req_pool_index,
         )

@@ -1,4 +1,5 @@
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.unified_allocator_fixtures import stand_in_views
 
 register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-small")
 # Backend-specific: AMD lowers unified page zeroing through ROCm Triton,
@@ -169,7 +170,11 @@ def _build_tri(device, page_size=4):
         roles=ChainRoles(owner="full", window="swa", state="mamba"),
         unified_buffer=buf,
         kvcache=kvcache,
-        state_kvcache=SimpleNamespace(move_kv_cache=lambda dst, src: None),
+        views=stand_in_views(
+            ChainRoles(owner="full", window="swa", state="mamba"),
+            kvcache,
+            SimpleNamespace(move_kv_cache=lambda dst, src: None),
+        ),
         device=device,
         full_max_total_num_tokens=n_full,
         swa_max_total_num_tokens=n_swa,
@@ -324,7 +329,7 @@ class TestPoisonSparesTheSlotZeroSink(unittest.TestCase):
             out=table,
         )
         self.assertEqual(table[0, :2].tolist(), [0, 0])  # freed: the sink
-        v = bundle.token_to_kv_pool.swa_kv_pool.v_buffer[0]
+        v = bundle.token_to_kv_pool.layer_router.view("swa").v_buffer[0]
         self.assertFalse(torch.isnan(v[:ps].float()).any().item())
 
 

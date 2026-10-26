@@ -119,8 +119,8 @@ class _Rows:
 
     def __init__(self, bundle):
         self.allocator = bundle.token_to_kv_pool_allocator
-        self.full = bundle.token_to_kv_pool.full_kv_pool.get_key_buffer(0)
-        self.swa = bundle.token_to_kv_pool.swa_kv_pool.get_key_buffer(0)
+        self.full = bundle.token_to_kv_pool.layer_router.view("full").get_key_buffer(0)
+        self.swa = bundle.token_to_kv_pool.layer_router.view("swa").get_key_buffer(0)
 
     def full_rows(self, ids: torch.Tensor) -> torch.Tensor:
         return self.allocator.full_attn_allocator.translate_kv_loc(ids.to(torch.int64))
