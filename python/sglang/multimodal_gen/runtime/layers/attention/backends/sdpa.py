@@ -7,6 +7,8 @@ from contextlib import nullcontext
 import torch
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
+import sglang.multimodal_gen.envs as envs
+
 try:
     from torch.nn.attention.varlen import varlen_attn as torch_varlen_attn
 except ImportError:
@@ -32,6 +34,22 @@ _PYTORCH_DEFAULT_CUDA_SDP_BACKENDS = [
 ]
 
 _MPS_VARLEN_QUERY_CHUNK_SIZE = 128
+
+# Dense Triton prefill path (ROCm). The kernel tiles the query length and the
+# key/value length by 64 and keeps head_dim as the tile width.
+_DENSE_ATTN_HEAD_DIM = 128
+_DENSE_ATTN_BLOCK = 64
+_dense_attn_kernel = None
+
+
+def triton_dense_attn_kernel():
+    """The kernel module, imported on first use so non-ROCm runs never pay for it."""
+    global _dense_attn_kernel
+    if _dense_attn_kernel is None:
+        from sglang.kernels.ops.diffusion.attention import flash_attn_dense_triton
+
+        _dense_attn_kernel = flash_attn_dense_triton
+    return _dense_attn_kernel
 
 
 def torch_default_sdpa_backends():
@@ -86,6 +104,45 @@ class SDPAImpl(AttentionImpl):
             return sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS, set_priority=True)
         return nullcontext()
 
+    def _triton_dense_output(
+        self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor
+    ):
+        """Run the dense Triton prefill kernel, or return None to fall back to SDPA.
+
+        Gated on ``SGLANG_USE_ROCM_TRITON_DENSE_ATTN``. At the shapes diffusion
+        prefill hits on gfx1151 (128 head dim, 16K tokens) AOTriton reaches
+        18 TF where the Triton kernel reaches 30 TF; the kernel needs head-major
+        dense operands, which this backend otherwise only has as strided views,
+        so they are materialised here. Everything the kernel does not model --
+        causality, dropout, GQA, other dtypes, other head dims -- returns None.
+        """
+        if not envs.SGLANG_USE_ROCM_TRITON_DENSE_ATTN:
+            return None
+        if torch.version.hip is None or torch.compiler.is_compiling():
+            return None
+        if self.causal or self.dropout != 0.0:
+            return None
+        if query.dtype is not torch.bfloat16:
+            return None
+        if query.shape != key.shape or key.shape != value.shape:
+            return None
+        batch, seq_len, _, head_dim = query.shape
+        if (
+            batch != 1
+            or head_dim != _DENSE_ATTN_HEAD_DIM
+            or seq_len % _DENSE_ATTN_BLOCK
+        ):
+            return None
+
+        kernel = triton_dense_attn_kernel()
+        q = query.transpose(1, 2).contiguous()
+        k = key.transpose(1, 2).contiguous()
+        v = value.transpose(1, 2).contiguous()
+        operands = (q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2))
+        if not kernel.can_use_flash_attn_dense(*operands):
+            return None
+        return kernel.flash_attn_dense(*operands, scale=self.softmax_scale)
+
     def forward(
         self,
         query: torch.Tensor,
@@ -93,6 +150,10 @@ class SDPAImpl(AttentionImpl):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
+        dense_output = self._triton_dense_output(query, key, value)
+        if dense_output is not None:
+            return dense_output
+
         # transpose to bs, heads, seq_len, head_dim
         query = query.transpose(1, 2)
         key = key.transpose(1, 2)

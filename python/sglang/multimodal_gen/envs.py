@@ -129,6 +129,7 @@ if TYPE_CHECKING:
     SGLANG_USE_ROCM_VAE_CONV2D: bool = False
     SGLANG_USE_ROCM_VAE_CONV2D_BF16: bool = False
     SGLANG_USE_ROCM_AITER_TGEMM: bool = False
+    SGLANG_USE_ROCM_TRITON_DENSE_ATTN: bool = False
 
 
 def get_default_cache_root() -> str:
@@ -519,6 +520,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ROCm: route unquantized bf16/fp16 linears through aiter tgemm, which picks
     # the backend per (M, N, K) from aiter's bf16_tuned_gemm CSVs
     "SGLANG_USE_ROCM_AITER_TGEMM": _lazy_bool("SGLANG_USE_ROCM_AITER_TGEMM"),
+    # ROCm: non-causal dense attention on bf16 [B, S, H, D] runs through the
+    # Triton prefill kernel instead of SDPA/AOTriton (gfx1151: 1.6x the TFLOPs)
+    "SGLANG_USE_ROCM_TRITON_DENSE_ATTN": _lazy_bool(
+        "SGLANG_USE_ROCM_TRITON_DENSE_ATTN"
+    ),
 }
 
 # Add cache-dit Secondary Transformer Env Vars via programmatic generation to reduce duplication
