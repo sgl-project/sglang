@@ -10,8 +10,9 @@ straight into MFMA operands, which fixes how the MFMA indices map to head dims:
     the conversion pairs two tokens per register (cvt + pack + scale mul).
   * P: S column 16n + 4b + i is PV K-index 8b + 4n + i, so the S result registers are
     the PV A operand as is.
-The values are those of `nvfp4_kv_dequantize` (e2m1 times E4M3 is exact in fp16), as in
-the Triton kernel; outputs agree with it up to fp32 rounding.
+The values are those of `nvfp4_kv_dequantize` (e2m1 times E4M3 is exact in fp16), so
+outputs agree with the bf16 Triton decode kernel on the dequantized cache up to fp32
+rounding.
 """
 
 from typing import Tuple, Union
