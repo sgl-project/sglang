@@ -1271,7 +1271,12 @@ completion, native timing qualification or accuracy.
 
 Early compatibility reads only that selection intent. It retains physical CPU
 TP2/native-DP1/attention-DP2 (singleton attention), PP1/CP1/EP1 on one node,
-original overlap scheduling and disabled physical CUDA graphs. CPU DSPark
+original overlap scheduling and disabled physical CUDA graphs. For this explicit
+mi355x joint domain, native model-feature validation uses a function-local HIP
+feature view so the source's explicit decoder SWA bounded replay remains enabled
+on the CPU simulator. The native validator code and other restrictions are
+retained; the physical runtime platform and raw/resolved cache flags are unchanged.
+Full source attestation still belongs to the provider constructor. CPU DSPark
 resolution additionally requires DP LM head, native attention-DP local control
 broadcast, built-in TP MoE (`none`), static draft Q5/target Q6, no two-batch overlap
 and no DP speculative prefill coordination. The native prefill/idle versus decode serialization, routing and

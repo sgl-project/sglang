@@ -196,6 +196,11 @@ def resolve_simulator_server_args(server_args) -> None:
         raise SGLangCompatibilityError(
             "SGLang Simulator requires native ServerArgs.resolve_once"
         )
+    from sglang_simulator.simulation.sglang.dspark_args import (
+        install_cpu_joint_model_features,
+    )
+
+    install_cpu_joint_model_features(server_args)
     resolve()
 
 

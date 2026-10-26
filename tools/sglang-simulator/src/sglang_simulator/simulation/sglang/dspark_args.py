@@ -2,9 +2,11 @@
 
 import functools
 import importlib
+import json
 import os
 import re
 from collections.abc import Mapping
+from types import FunctionType, SimpleNamespace
 
 
 def _enabled():
@@ -21,6 +23,68 @@ def _require(condition, message):
 
 def _field(value, name):
     return value.get(name) if isinstance(value, Mapping) else getattr(value, name, None)
+
+
+def install_cpu_joint_model_features(server_args):
+    """Use modeled HIP features only inside the native joint model validator.
+
+    This does not change the physical runtime platform or the bounded-replay
+    flag. The original function code retains every model/cache restriction;
+    the provider constructor still attests all original joint source assets.
+    """
+    from sglang_simulator.compat import native_joint_reference_requested
+
+    if not _enabled() or not native_joint_reference_requested(server_args):
+        return False
+    native = importlib.import_module("sglang.srt.arg_groups.deepseek_v4_hook")
+    original = native.validate_deepseek_v41_features
+    if getattr(original, "_sglang_simulator_joint_model_features", False):
+        return True
+    features = SimpleNamespace(is_hip=True, is_cuda=False)
+    modeled = FunctionType(
+        original.__code__,
+        {**original.__globals__, "get_platform": lambda: features},
+        original.__name__,
+        original.__defaults__,
+        original.__closure__,
+    )
+    modeled.__kwdefaults__ = original.__kwdefaults__
+
+    @functools.wraps(original)
+    def validate(args):
+        if not _enabled() or not native_joint_reference_requested(args):
+            return original(args)
+        cfg = native.resolving_view(args)
+        if cfg.device != "cpu" or cfg.enable_decoder_swa_bounded_replay is not True:
+            return original(args)
+        # Selection intent is not attestation. The later provider constructor
+        # validates the immutable runtime/capture/source before any forward.
+        with open(os.environ["SGLANG_SIMULATOR_CONFIG_PATH"], encoding="utf-8") as f:
+            accelerator = json.load(f).get("platform", {}).get("accelerator", {})
+        sizes = dict(tp_size=2, dp_size=1, attn_dp_size=2)
+        sizes.update(
+            dict.fromkeys(
+                ("ep_size", "pp_size", "attn_cp_size", "dcp_size", "nnodes"), 1
+            )
+        )
+        if (
+            accelerator.get("name") != "mi355x"
+            or any(
+                type(getattr(cfg, k, None)) is not int or getattr(cfg, k) != v
+                for k, v in sizes.items()
+            )
+            or cfg.moe_a2a_backend != "none"
+            or cfg.speculative_algorithm != "DSPARK"
+            or cfg.enable_dp_lm_head is not True
+            or cfg.enable_dp_attention_local_control_broadcast is not True
+            or cfg.enable_encoder_swa_bounded_replay
+        ):
+            return original(args)
+        return modeled(args)
+
+    validate._sglang_simulator_joint_model_features = True
+    native.validate_deepseek_v41_features = validate
+    return True
 
 
 def _validate(native, server_args, cfg):
