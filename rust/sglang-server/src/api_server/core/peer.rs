@@ -241,14 +241,7 @@ mod tests {
         );
         let peers = peer_endpoints(&info, 1).unwrap();
         assert_eq!(peers.len(), 2);
-        let replies = fan_out(
-            1,
-            async { Ok(status_bytes(true, "local")) },
-            &peers,
-            &build,
-            None,
-        )
-        .await;
+        let replies = fan_out(1, async { Ok(status_bytes(true, "local")) }, &peers, &build).await;
         let messages: Vec<String> = replies
             .decode::<Status>("status")
             .unwrap()

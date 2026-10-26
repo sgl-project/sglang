@@ -74,7 +74,6 @@ impl CoreHandle {
             self.submit_control_req(build()),
             &self.inner.peer_endpoints,
             build,
-            None,
         )
         .await
     }

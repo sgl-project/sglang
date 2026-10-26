@@ -2,7 +2,6 @@
 
 use std::future::Future;
 use std::sync::Arc;
-use std::time::Duration;
 
 use bytes::Bytes;
 use futures::future::BoxFuture;
@@ -50,22 +49,16 @@ pub(crate) async fn fan_out(
     local_call: impl Future<Output = Result<Bytes, CoreError>>,
     targets: &[Arc<dyn ControlTarget>],
     build: &RequestBuilder<'_>,
-    deadline: Option<Duration>,
 ) -> Replies {
-    let local_ranks = [local];
-    let local_call = within(
-        deadline,
-        async move {
-            vec![RankReply {
-                rank: local,
-                outcome: local_call.await,
-            }]
-        },
-        &local_ranks,
-    );
+    let local_call = async move {
+        vec![RankReply {
+            rank: local,
+            outcome: local_call.await,
+        }]
+    };
     let target_calls = futures::future::join_all(targets.iter().map(|target| async move {
         let expected = target.ranks();
-        let mut replies = within(deadline, target.control(build), expected).await;
+        let mut replies = target.control(build).await;
         // A target that answers for fewer ranks than it claims would otherwise
         // make the operation look like it reached fewer ranks than exist.
         for &rank in expected {
@@ -87,28 +80,6 @@ pub(crate) async fn fan_out(
     // as two adjacent entries rather than hidden.
     replies.sort_by_key(|reply| reply.rank);
     Replies { replies }
-}
-
-async fn within(
-    deadline: Option<Duration>,
-    call: impl Future<Output = Vec<RankReply>>,
-    ranks: &[RankId],
-) -> Vec<RankReply> {
-    let Some(deadline) = deadline else {
-        return call.await;
-    };
-    match tokio::time::timeout(deadline, call).await {
-        Ok(replies) => replies,
-        Err(_) => ranks
-            .iter()
-            .map(|&rank| RankReply {
-                rank,
-                outcome: Err(CoreError::DeadlineExceeded(format!(
-                    "dp rank {rank}: no reply within {deadline:?}"
-                ))),
-            })
-            .collect(),
-    }
 }
 
 impl Replies {
@@ -223,6 +194,7 @@ pub(crate) fn merge_status<'a>(
 #[cfg(test)]
 pub(crate) mod testing {
     use super::*;
+    use std::time::Duration;
 
     /// A target that answers from a closure, after an optional delay.
     pub(crate) struct DummyTarget {
@@ -287,6 +259,7 @@ pub(crate) mod testing {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     use super::testing::{DummyTarget, status_bytes};
     use super::*;
@@ -330,14 +303,7 @@ mod tests {
                 Ok(status_bytes(true, "rank 0"))
             }),
         ];
-        let replies = fan_out(
-            1,
-            async { Ok(status_bytes(true, "local")) },
-            &peers,
-            &build,
-            None,
-        )
-        .await;
+        let replies = fan_out(1, async { Ok(status_bytes(true, "local")) }, &peers, &build).await;
         assert_eq!(ranks_of(&replies), [0, 1, 2]);
         assert_eq!(messages(replies), ["rank 0", "local", "rank 2"]);
     }
@@ -368,7 +334,7 @@ mod tests {
         ];
         let replies = tokio::time::timeout(
             Duration::from_secs(5),
-            fan_out(0, async { Ok(Bytes::new()) }, &peers, &build, None),
+            fan_out(0, async { Ok(Bytes::new()) }, &peers, &build),
         )
         .await
         .expect("concurrent targets must not deadlock");
@@ -397,53 +363,9 @@ mod tests {
             },
             &peers,
             &build,
-            None,
         )
         .await;
         assert_eq!(built.load(Ordering::Relaxed), 1 + peers.len());
-    }
-
-    /// A deadline fails only the ranks of the target that missed it; the
-    /// ranks that answered keep their replies.
-    #[tokio::test]
-    async fn a_missed_deadline_fails_only_that_target() {
-        struct Silent([RankId; 2]);
-        impl ControlTarget for Silent {
-            fn ranks(&self) -> &[RankId] {
-                &self.0
-            }
-            fn control<'a>(&'a self, _: &'a RequestBuilder<'a>) -> BoxFuture<'a, Vec<RankReply>> {
-                Box::pin(std::future::pending())
-            }
-        }
-        let peers: Vec<Arc<dyn ControlTarget>> = vec![
-            Arc::new(Silent([1, 2])),
-            DummyTarget::replying(&[3], |_| Ok(status_bytes(true, ""))),
-        ];
-        let replies = fan_out(
-            0,
-            async { Ok(status_bytes(true, "")) },
-            &peers,
-            &build,
-            Some(Duration::from_millis(50)),
-        )
-        .await;
-        assert_eq!(ranks_of(&replies), [0, 1, 2, 3]);
-        assert!(replies.replies[0].outcome.is_ok());
-        assert!(replies.replies[3].outcome.is_ok());
-        for reply in &replies.replies[1..3] {
-            let error = reply.outcome.as_ref().unwrap_err();
-            assert_eq!(error.kind(), CoreErrorKind::DeadlineExceeded);
-            assert!(
-                error
-                    .to_string()
-                    .starts_with(&format!("dp rank {}:", reply.rank)),
-                "{error}"
-            );
-        }
-        let error = replies.decode::<Status>("status").unwrap_err();
-        assert_eq!(error.kind(), CoreErrorKind::DeadlineExceeded);
-        assert!(error.to_string().contains("2 of 4 dp ranks"), "{error}");
     }
 
     /// A target that claims a rank but returns nothing for it is reported for
@@ -465,14 +387,7 @@ mod tests {
             }
         }
         let peers: Vec<Arc<dyn ControlTarget>> = vec![Arc::new(Partial([1, 2]))];
-        let replies = fan_out(
-            0,
-            async { Ok(status_bytes(true, "")) },
-            &peers,
-            &build,
-            None,
-        )
-        .await;
+        let replies = fan_out(0, async { Ok(status_bytes(true, "")) }, &peers, &build).await;
         assert_eq!(ranks_of(&replies), [0, 1, 2]);
         let error = replies.decode::<Status>("status").unwrap_err();
         assert_eq!(error.kind(), CoreErrorKind::Internal);
@@ -486,14 +401,7 @@ mod tests {
         let peers: Vec<Arc<dyn ControlTarget>> = vec![DummyTarget::replying(&[1], |_| {
             Ok(Bytes::from_static(b"\xc1"))
         })];
-        let replies = fan_out(
-            0,
-            async { Ok(status_bytes(true, "")) },
-            &peers,
-            &build,
-            None,
-        )
-        .await;
+        let replies = fan_out(0, async { Ok(status_bytes(true, "")) }, &peers, &build).await;
         let error = replies.decode::<Status>("flush-cache").unwrap_err();
         assert_eq!(error.kind(), CoreErrorKind::Internal);
         let text = error.to_string();
