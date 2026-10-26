@@ -419,6 +419,7 @@ class Envs:
     SGLANG_TEST_CRASH_AFTER_STREAM_OUTPUTS = EnvInt(0)
     SGLANG_TEST_REQUEST_TIME_STATS = EnvBool(False)
     SGLANG_TEST_DISAGG_FAILURE_PROB = EnvFloat(0.0)
+    SGLANG_TEST_DISAGG_KV_CHECKSUM_MISMATCH_PROB = EnvFloat(0.0)
     SGLANG_TEST_RETRACT = EnvBool(False)
     SGLANG_TEST_RETRACT_INTERVAL = EnvInt(3)
     SGLANG_TEST_RETRACT_NO_PREFILL_BS = EnvInt(2**31)
@@ -612,6 +613,11 @@ class Envs:
     # HND KV layout folds (page, head) into one paged index for per-kv-head sparse
     # page tables (DP attn); paged backends like trtllm_mha consume it directly.
     SGLANG_USE_HND_KVCACHE = EnvBool(False)
+    # --enable-kv-cache-sharding: register single-node prefix gather scratch
+    # as NCCL symmetric memory and request copy engines on its dedicated
+    # communicator. Leave NCCL_CTA_POLICY unset to preserve per-comm policies.
+    # The engine defaults NCCL cuMem on for eligible single-node deployments.
+    SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER = EnvBool(True)
 
     # Attention (aiter, ROCm): route NEXTN spec draft_extend (EAGLE-v2 KV
     # catch-up) through aiter unified_attention (GQA-packed + split-KV) instead
@@ -977,6 +983,13 @@ class Envs:
     # (matches `gate_mode="separated"`, the layout used by gptoss_fp4 tuned
     # configs and by Mxfp4MoEMethod's post-fix weight shuffle).
     SGLANG_USE_AITER_MOE_GU_ITLV = EnvBool(True)
+    # gfx1250 GPT-OSS W4A8 MoE (aiter moe_gemm_a8w4): backend of both expert
+    # GEMMs. "" lets aiter choose (gluon on gfx1250); "triton" or "gluon" forces one.
+    SGLANG_GFX1250_W4A8_BACKEND = EnvStr("")
+    # gfx1250 GPT-OSS W4A8 MoE: GEMM 1 gathers its fp8 activation rows in-kernel
+    # instead of a torch gather of num_tokens * topk bf16 rows. Needs
+    # SGLANG_GFX1250_W4A8_BACKEND=triton; expert parallelism keeps the torch gather.
+    SGLANG_GFX1250_W4A8_KERNEL_GATHER = EnvBool(False)
     # aiter opus moe_sorting dispatch policy (0 auto, 1 oneshot, 2 multi-phase). Auto picks
     # oneshot below ~24 tokens, which on gfx950 costs 11-16 us vs 6-7 us for multi-phase at
     # E=385 / 129; outputs are identical and multi-phase is never slower up to 16384 tokens.
@@ -1574,7 +1587,7 @@ class Envs:
     # set False to fall back to the per-image loop.
     SGLANG_VIT_ENABLE_VECTORIZED_POS_EMBED = EnvBool(True)
     SGLANG_MM_SKIP_COMPUTE_HASH = EnvBool(False)
-    # Supported by Kimi-K2.5 image and Cosmos3 V2V frame preprocessing.
+    # Supported by Kimi-K2.5 and native diffusion RGB input preprocessing.
     SGLANG_FORCE_CPU_IMAGE_PREPROCESSING = EnvBool(False)
     # For pre-tokenized (list[int]) multimodal prompts,
     # preserve the user's original tokens to avoid retokenization drift.
@@ -1699,10 +1712,12 @@ class Envs:
     SGLANG_DSV4_FP4_EXPERTS = EnvBool(True)
     # Set True to dequantize the FP4 experts to FP8 at runtime
     SGLANG_DSV4_FP4_DEQUANT = EnvBool(False)
-    # Flash-0731 also accepts "low"; the active profile is checkpoint-resolved.
+    # DeepSeek-V4 default when a request carries no reasoning_effort: a
+    # deepseek-recipe tier name; unset -> deepseek-recipe's default.
     SGLANG_DSV4_REASONING_EFFORT = EnvStr("")
     # DeepSeek-V4.1 default when a request carries no reasoning_effort: one of
-    # low/high/xhigh/max or an integer budget in [1, 100]; unset -> the encoder default.
+    # a deepseek-recipe tier name or an integer budget in [1, 100]; unset ->
+    # deepseek-recipe's default.
     SGLANG_DSV41_REASONING_EFFORT = EnvStr(None)
     # Quantize the SWA fp8 KV cache from bf16-rounded values (matches
     # trainer-side QAT and the DSA-CP path) instead of fp32 registers.
@@ -1775,6 +1790,11 @@ class Envs:
     # Scheduler-side staging of shared host-table rows on GPUs without ATS
     # (engram_staging.py); pays off for large prefill batches.
     SGLANG_OPT_DSV41_ENGRAM_HOST_STAGING = EnvBool(False)
+    # Keep each rank's engram row shard in exportable device memory (CUDA VMM,
+    # FABRIC handles across an NVLink domain) mapped by every rank of the TP group:
+    # a rank reads its own tokens' rows from the owning shard, with no id gather
+    # and no reduce-scatter. Takes precedence over the host table.
+    SGLANG_OPT_DSV41_ENGRAM_PEER_SHARDS = EnvBool(False)
 
     # Kernels and indexer
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)

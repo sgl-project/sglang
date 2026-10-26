@@ -358,6 +358,7 @@ class TestDisaggregationWire(unittest.TestCase):
             state_data_ptrs=[[0x1000]],
             state_item_lens=[[32]],
             state_layer_ids=[[]],
+            aux_data_ptrs=[],
         )
         manager.is_mla_backend = True
         manager.is_hybrid_mla_backend = False
@@ -380,6 +381,7 @@ class TestDisaggregationWire(unittest.TestCase):
                 dst_state_data_ptrs=[[0x2000]],
                 dst_state_item_lens=[[dst_item_len]],
                 dst_state_layer_ids=[[]],
+                dst_aux_ptrs=[],
             )
             with get_context().override_server_args(enable_unified_memory=False):
                 return info, manager._publish_peer_registration("decode", info)
@@ -597,6 +599,7 @@ class TestDisaggregationWire(unittest.TestCase):
         manager = object.__new__(MooncakeKVManager)
         sender = object.__new__(MooncakeKVSender)
         sender.kv_mgr, sender.bootstrap_room = manager, 42
+        sender.conclude_state = None
         target = AckTarget("127.0.0.1", 1234, 7)
         for outstanding in (0, 1):
             with self.subTest(outstanding=outstanding):
@@ -1137,7 +1140,7 @@ class _MemcpyNixlAgent:
     def get_xfer_descs(self, reqs, mem_type):
         return reqs
 
-    def initialize_xfer(self, op, src_descs, dst_descs, peer_name, notif):
+    def initialize_xfer(self, op, src_descs, dst_descs, peer_name, notif=b""):
         return src_descs, dst_descs
 
     def transfer(self, handle):
@@ -1217,7 +1220,6 @@ class TestHeteroTpSwaStateTransfer(CustomTestCase):
                 [dst_ptrs],
                 [self.DST_PAGES],
                 0,
-                "7_state_0",
                 decode_tp,
                 decode_tp_rank=dst_rank,
                 dst_state_item_lens=[[item_len] * len(dst_ptrs)],
