@@ -161,7 +161,7 @@ def _use_fused_verify_topk(
 def verify_topk_idx(
     *,
     q: torch.Tensor,  # [rows, num_heads, head_dim], rows = num_reqs * num_draft
-    k_cache: torch.Tensor,  # [max_slots, num_kv_heads, head_dim] (paged)
+    k_cache: torch.Tensor | Nvfp4Cache,  # [max_slots, num_kv_heads, head_dim] or NVFP4
     req_to_token: torch.Tensor,  # [max_reqs, max_kv_len]
     seq_lens: torch.Tensor,  # [rows]
     max_seqlen: int,
