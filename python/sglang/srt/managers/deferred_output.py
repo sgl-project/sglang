@@ -1,20 +1,13 @@
 """Completion contract for ``Scheduler.defer_response(req, completion)``.
 
-An auxiliary-output consumer can defer a finished request's response until
-its asynchronous work completes. The scheduler owns the request and polls the
-completion while busy, idle or paused. It calls ``result`` before streaming,
-on the scheduler thread, so a plugin can finalize response metadata there.
-An unhandled exception aborts the response instead of terminating the server.
+One completion holds each response; ``concurrent.futures.Future[None]`` works.
+The scheduler polls it while busy, idle or paused, then calls ``result`` before
+streaming; errors abort the response. Cancellation retires responses even if
+work continues; completions must not cancel work needed by sibling requests.
 
-Only one completion may hold a request; consumers must combine their work
-before deferring. A ``concurrent.futures.Future[None]`` satisfies this contract.
-Cancellation retires the response immediately even if the work is already
-running. A completion sharing a batch's work must not cancel its siblings.
-
-Held requests have released their KV cache, so the completion must own its
-payload. They do not affect ``Scheduler.is_fully_idle``: only the output rank
-holds responses under TP, and idle-gated collective operations must agree on
-all ranks. PD disaggregation is unsupported.
+Completions own payloads after KV release. Held responses do not affect
+``Scheduler.is_fully_idle``: only the output rank holds them, so TP ranks must
+agree on idle-gated operations. PD disaggregation is unsupported.
 """
 
 from typing import Protocol

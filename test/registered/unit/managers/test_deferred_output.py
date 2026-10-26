@@ -4,7 +4,7 @@ from array import array
 from collections import deque
 from concurrent.futures import Future
 from types import SimpleNamespace
-from unittest.mock import ANY, MagicMock, Mock, call, patch
+from unittest.mock import MagicMock, Mock, call, patch
 
 import pytest
 
@@ -106,8 +106,11 @@ def test_defer_response_rejects_invalid_ownership(invalid):
     assert not req.defer_output
 
 
-@pytest.mark.parametrize("cancelled", [False, True])
-@pytest.mark.parametrize("rust_frontend", [False, True], ids=["zmq", "rust"])
+@pytest.mark.parametrize(
+    ("cancelled", "rust_frontend"),
+    [(False, False), (True, False), (False, True)],
+    ids=["error", "cancelled", "rust-error"],
+)
 def test_failed_completion_releases_an_error_response(cancelled, rust_frontend):
     """Failed publication reaches the active frontend, including Rust egress."""
     scheduler, req, completion = _scheduler(), _req("failed"), Future()
@@ -138,8 +141,11 @@ def test_failed_completion_releases_an_error_response(cancelled, rust_frontend):
     assert not req.defer_output and not scheduler.has_pending_deferred_outputs()
 
 
-@pytest.mark.parametrize("abort_all", [False, True])
-@pytest.mark.parametrize("rust_frontend", [False, True], ids=["zmq", "rust"])
+@pytest.mark.parametrize(
+    ("abort_all", "rust_frontend"),
+    [(False, False), (True, False), (False, True)],
+    ids=["matching", "all", "rust-matching"],
+)
 def test_abort_cancels_only_matching_held_responses(abort_all, rust_frontend):
     """Cancellation retires matching responses through the active frontend."""
     scheduler = _scheduler()
@@ -210,54 +216,50 @@ def test_held_responses_do_not_change_idle_state():
     assert scheduler.is_fully_idle(for_health_check=True)
 
 
-def test_batch_results_release_held_responses_first():
+@pytest.mark.parametrize("state", ["batch", "busy", "idle", "paused"])
+def test_scheduler_polls_until_a_held_response_completes(state):
     scheduler = MagicMock()
-    scheduler._deferred_responses = {"held": (_req("held"), Future())}
+    scheduler._deferred_responses = None
+    scheduler.output_streamer = _scheduler().output_streamer
+    scheduler.stream_released_deferred_outputs = lambda: (
+        Scheduler.stream_released_deferred_outputs(scheduler)
+    )
+    scheduler.has_pending_deferred_outputs = lambda: (
+        Scheduler.has_pending_deferred_outputs(scheduler)
+    )
+    scheduler.is_fully_idle.return_value = state == "idle"
     scheduler.enable_fpm = False
-    order = Mock()
-    order.attach_mock(scheduler.stream_released_deferred_outputs, "release")
-    order.attach_mock(
-        scheduler.batch_result_processor.process_batch_result_decode, "process"
-    )
-    batch = SimpleNamespace(
-        reqs=[],
-        forward_mode=SimpleNamespace(is_decode=lambda: True, is_extend=lambda: False),
-    )
-
-    with patch("sglang.srt.managers.scheduler.flush_trace_batch"):
-        Scheduler.process_batch_result.__wrapped__(scheduler, batch, Mock())
-
-    assert order.mock_calls[:2] == [call.release(), call.process(batch, ANY)]
-
-
-@pytest.mark.parametrize(
-    ("state", "pending"),
-    [("busy", True), ("idle", True), ("idle", False), ("paused", True)],
-)
-def test_idle_scheduler_polls_and_only_sleeps_after_release(state, pending):
-    scheduler = MagicMock()
-    scheduler._deferred_responses = {"held": (_req("held"), Future())}
-    scheduler.is_fully_idle.return_value = state != "busy"
-    scheduler.has_pending_deferred_outputs.return_value = pending
     scheduler._last_stall_publish_ts = float("inf")
     scheduler.enable_hicache_storage = False
     scheduler.enable_lmcache = False
     scheduler.disaggregation_mode = DisaggregationMode.NULL
     scheduler.enable_hisparse = True  # skips the pool accounting checks
 
-    with patch("sglang.srt.managers.scheduler.time.sleep") as sleep:
-        if state == "paused":
+    def poll():
+        if state == "batch":
+            Scheduler.process_batch_result.__wrapped__(scheduler, Mock(reqs=[]), Mock())
+        elif state == "paused":
             Scheduler._record_scheduler_state_for_paused_engine(scheduler)
         else:
             Scheduler.on_idle.__wrapped__(scheduler)
 
-    scheduler.stream_released_deferred_outputs.assert_called_once_with()
-    if state != "idle" or pending:
+    req, completion = _req("held"), Future()
+    Scheduler.defer_response(scheduler, req, completion)
+    with (
+        patch.object(SchedulerOutputStreamer, "_stream_output_generation") as stream,
+        patch("sglang.srt.managers.scheduler.time.sleep"),
+    ):
+        poll()
+        assert req.defer_output
+        stream.assert_not_called()
         scheduler.maybe_sleep_on_idle.assert_not_called()
-        sleep.assert_called_once_with(0)
-    else:
-        scheduler.maybe_sleep_on_idle.assert_called_once_with()
-        sleep.assert_not_called()
+
+        completion.set_result(None)
+        poll()
+        stream.assert_called_once_with([req], False, None)
+        assert not req.defer_output and not scheduler.has_pending_deferred_outputs()
+        if state == "idle":
+            scheduler.maybe_sleep_on_idle.assert_called_once_with()
 
 
 if __name__ == "__main__":

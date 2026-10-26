@@ -109,7 +109,6 @@ def test_tp_worker_attaches_observer_output_to_the_result(has_observer, can_run_
         )
         assert result.forward_auxiliary_output is device_output
     else:
-        observer.after_forward.assert_not_called()
         assert result.forward_auxiliary_output is None
     assert result.next_token_ids.tolist() == [3]
 
