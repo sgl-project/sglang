@@ -65,9 +65,11 @@ def pool_hidden_states(
         lengths = forward_batch.extend_seq_lens
         padding = (hidden_states.shape[0] - lengths.sum()).to(lengths.dtype)
         lengths = torch.cat([lengths, padding.reshape(1)])
-        return torch.segment_reduce(hidden_states.float(), "mean", lengths=lengths)[
-            :-1
-        ].to(hidden_states.dtype)
+        # unsafe=True: the default validates lengths.sum() with .item(), which
+        # syncs twice per forward and fails under CUDA graph capture.
+        return torch.segment_reduce(
+            hidden_states.float(), "mean", lengths=lengths, unsafe=True
+        )[:-1].to(hidden_states.dtype)
     else:
         raise ValueError(f"Unsupported pooling type: {pooling_type}")
 

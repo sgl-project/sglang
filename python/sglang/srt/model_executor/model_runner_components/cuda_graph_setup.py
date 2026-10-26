@@ -567,7 +567,7 @@ def capture_prefill_graph(
             "Disable prefill CUDA graph because the model has no compatible language graph boundary: %s",
             error,
         )
-        return result(eager_runner)
+        return result(None if model_runner.is_draft_worker else eager_runner)
 
     # Disable prefill CUDA graph for non capture size
     if not get_exec().graph.cuda_graph_config.prefill.bs:

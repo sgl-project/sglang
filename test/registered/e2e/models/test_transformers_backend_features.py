@@ -6,7 +6,6 @@ import os
 import unittest
 from unittest.mock import patch
 
-import pytest
 import torch
 
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -48,46 +47,51 @@ def _assert_logprobs_close(
     )
 
 
-def test_logprob_criterion_rejects_corrupted_outputs():
-    from sglang.test.runners import ModelOutput
+class TestLogprobCriterion(unittest.TestCase):
+    def test_rejects_corrupted_outputs(self):
+        from sglang.test.runners import ModelOutput
 
-    torch.manual_seed(0)
-    inputs = [torch.randn(12, 5) for _ in range(6)]
-    outputs = [torch.randn(4, 5).tolist() for _ in range(6)]
-    strs = ["x"] * 6
-    reference = ModelOutput(
-        output_strs=strs,
-        top_input_logprobs=[x.tolist() for x in inputs],
-        top_output_logprobs=outputs,
-    )
-
-    def candidate(edit=None):
-        noisy = [x + 0.05 * torch.randn(12, 5) for x in inputs]
-        if edit is not None:
-            edit(noisy)
-        return ModelOutput(
+        torch.manual_seed(0)
+        inputs = [torch.randn(12, 5) for _ in range(6)]
+        outputs = [torch.randn(4, 5).tolist() for _ in range(6)]
+        strs = ["x"] * 6
+        reference = ModelOutput(
             output_strs=strs,
-            top_input_logprobs=[x.tolist() for x in noisy],
+            top_input_logprobs=[x.tolist() for x in inputs],
             top_output_logprobs=outputs,
         )
 
-    def shift_prompt(noisy):
-        noisy[1] += 0.5
+        def candidate(edit=None):
+            noisy = [x + 0.05 * torch.randn(12, 5) for x in inputs]
+            if edit is not None:
+                edit(noisy)
+            return ModelOutput(
+                output_strs=strs,
+                top_input_logprobs=[x.tolist() for x in noisy],
+                top_output_logprobs=outputs,
+            )
 
-    def corrupt_entry(noisy):
-        noisy[2][3, 1] += 3.0
+        def shift_prompt(noisy):
+            noisy[1] += 0.5
 
-    def shift_all(noisy):
-        for x in noisy:
-            x -= 1.0
+        def corrupt_entry(noisy):
+            noisy[2][3, 1] += 3.0
 
-    _assert_logprobs_close(reference, candidate(), 0.15, "noise only")
-    with pytest.raises(AssertionError, match="a prompt has mean"):
-        _assert_logprobs_close(reference, candidate(shift_prompt), 0.15, "one prompt")
-    with pytest.raises(AssertionError, match="max abs logprob diff"):
-        _assert_logprobs_close(reference, candidate(corrupt_entry), 0.15, "one entry")
-    with pytest.raises(AssertionError, match="mean abs logprob diff"):
-        _assert_logprobs_close(reference, candidate(shift_all), 0.15, "all shifted")
+        def shift_all(noisy):
+            for x in noisy:
+                x -= 1.0
+
+        _assert_logprobs_close(reference, candidate(), 0.15, "noise only")
+        with self.assertRaisesRegex(AssertionError, "a prompt has mean"):
+            _assert_logprobs_close(
+                reference, candidate(shift_prompt), 0.15, "one prompt"
+            )
+        with self.assertRaisesRegex(AssertionError, "max abs logprob diff"):
+            _assert_logprobs_close(
+                reference, candidate(corrupt_entry), 0.15, "one entry"
+            )
+        with self.assertRaisesRegex(AssertionError, "mean abs logprob diff"):
+            _assert_logprobs_close(reference, candidate(shift_all), 0.15, "all shifted")
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "Requires a CUDA GPU")
