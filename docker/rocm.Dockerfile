@@ -65,7 +65,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="2bb549102ba2d9e51da8ef21107361827075d8b6"
+ENV AITER_COMMIT_DEFAULT="285579b6211b0da30f35b91a890c29c823597cd1"
 
 # ===============================
 # Base image 942 with rocm720 and args
@@ -75,7 +75,7 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="2bb549102ba2d9e51da8ef21107361827075d8b6"
+ENV AITER_COMMIT_DEFAULT="285579b6211b0da30f35b91a890c29c823597cd1"
 ENV TRITON_COMMIT_DEFAULT="42270451990532c67e69d753fbd026f28fcc4840"
 
 # ===============================
@@ -86,7 +86,7 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="2bb549102ba2d9e51da8ef21107361827075d8b6"
+ENV AITER_COMMIT_DEFAULT="285579b6211b0da30f35b91a890c29c823597cd1"
 # Pin the ROCm torch stack for every pip invocation in this flavor. The file is
 # filled in after the torch 2.11 upgrade below; it must already exist (empty is
 # valid) because pip reads PIP_CONSTRAINT from the first pip call onwards.
@@ -110,7 +110,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="2bb549102ba2d9e51da8ef21107361827075d8b6"
+ENV AITER_COMMIT_DEFAULT="285579b6211b0da30f35b91a890c29c823597cd1"
 
 # ===============================
 # Base image 950 with rocm720 and args
@@ -120,7 +120,7 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="2bb549102ba2d9e51da8ef21107361827075d8b6"
+ENV AITER_COMMIT_DEFAULT="285579b6211b0da30f35b91a890c29c823597cd1"
 ENV TRITON_COMMIT_DEFAULT="42270451990532c67e69d753fbd026f28fcc4840"
 
 # ===============================
@@ -131,7 +131,7 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="2bb549102ba2d9e51da8ef21107361827075d8b6"
+ENV AITER_COMMIT_DEFAULT="285579b6211b0da30f35b91a890c29c823597cd1"
 # Pin the ROCm torch stack for every pip invocation in this flavor. The file is
 # filled in after the torch 2.11 upgrade below; it must already exist (empty is
 # valid) because pip reads PIP_CONSTRAINT from the first pip call onwards.
@@ -308,7 +308,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="2bb549102ba2d9e51da8ef21107361827075d8b6"
+ENV AITER_COMMIT_DEFAULT="285579b6211b0da30f35b91a890c29c823597cd1"
 # Same reasoning as the rocm724 stages: keep pip from resolving the image's
 # ROCm torch away to a PyPI CUDA build. Populated after the stack is in place.
 ENV PIP_CONSTRAINT="/etc/sglang/constraints/torch-rocm.txt"
@@ -322,7 +322,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="2bb549102ba2d9e51da8ef21107361827075d8b6"
+ENV AITER_COMMIT_DEFAULT="285579b6211b0da30f35b91a890c29c823597cd1"
 ENV PIP_CONSTRAINT="/etc/sglang/constraints/torch-rocm.txt"
 RUN mkdir -p /etc/sglang/constraints && : > /etc/sglang/constraints/torch-rocm.txt
 
@@ -356,11 +356,16 @@ ENV BUILD_VLLM="0"
 # Keep the Triton that comes with the SDK. The rocm1000 flavor builds a newer
 # Triton from source, and that one no longer has block pointers or
 # triton_kernels (triton-lang/triton#10833), which sglang still uses.
-ENV BUILD_TRITON="0"
+ENV BUILD_TRITON="1"
+ENV TRITON_COMMIT_DEFAULT="76940ad348795521b3dc9f6c79acd7309ff924e3"
+# triton-lang/triton#10833 removed block pointers, which sglang's FLA kernels
+# (fla/, used by Qwen3-Next, MiniMax and Kimi Linear) still call. The revert is
+# pure Python: #9668 had already moved block pointers out of C++/MLIR.
+ENV TRITON_REVERT_COMMITS_DEFAULT="9debefe44117a44c274b05033cfe9e4858883b86"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="a6d2b564fd671724a3720b8edf70e8d674e4d694"
+ENV AITER_COMMIT_DEFAULT="2bb549102ba2d9e51da8ef21107361827075d8b6"
 # hipBLASLt 10.1 looks for TensileLibrary_lazy_gfx1250.dat directly under
 # library/, not library/<arch>/, and every GEMM fails without this.
 ENV HIPBLASLT_TENSILE_LIBPATH="/opt/venv/lib/python3.12/site-packages/_rocm_sdk_libraries/lib/hipblaslt/library/gfx1250"
@@ -399,6 +404,8 @@ ARG SETUPTOOLS_SCM_PRETEND_VERSION=""
 
 ARG TRITON_REPO="https://github.com/triton-lang/triton.git"
 ENV TRITON_COMMIT="${TRITON_COMMIT:-${TRITON_COMMIT_DEFAULT}}"
+ARG TRITON_REVERT_COMMITS=""
+ENV TRITON_REVERT_COMMITS="${TRITON_REVERT_COMMITS:-${TRITON_REVERT_COMMITS_DEFAULT}}"
 
 # ROCm 7.2 Triton (BUILD_TRITON=1 stages only). Both wheels are the same
 # upstream revision, triton-lang/triton@89002410. AITER only requires
@@ -425,7 +432,7 @@ ARG LLVM_BRANCH="MainOpSelV2"
 ARG LLVM_COMMIT="6520ace8227ffe2728148d5f3b9872a870b0a560"
 
 ARG MOONCAKE_REPO="https://github.com/kvcache-ai/Mooncake.git"
-ARG MOONCAKE_COMMIT="01d1eb2a7ec37fd5e20a88573e9b4956e7846e9a"
+ARG MOONCAKE_COMMIT="78566d459c140956fd15606e102132b1acc83eec"
 
 ARG TILELANG_REPO="https://github.com/tile-ai/tilelang.git"
 ARG TILELANG_COMMIT="a55a82302bf7f3c5af635b5c9146f728185cc900"
@@ -433,6 +440,15 @@ ARG TILELANG_COMMIT="a55a82302bf7f3c5af635b5c9146f728185cc900"
 ARG FHT_REPO="https://github.com/jeffdaily/fast-hadamard-transform.git"
 ARG FHT_BRANCH="rocm"
 ARG FHT_COMMIT="46efb7d776d38638fc39f3c803eaee3dd7016bd1"
+
+# sgl-amd-mono: the AMD monokernel plugin (--enable-amd-monokernel). Pure Python
+# on top of AITER / FlyDSL; it registers its specs lazily, so it is inert unless a
+# server selects the backend. Installed on gfx950 images only (its kernels are
+# gfx950); disable with --build-arg ENABLE_SGL_AMD_MONO=0.
+ARG ENABLE_SGL_AMD_MONO=1
+ARG SGL_AMD_MONO_REPO="https://github.com/sgl-project/sgl-amd-mono.git"
+# empty: the commit pip installed through the monokernels_hip extra
+ARG SGL_AMD_MONO_COMMIT=""
 
 ARG ENABLE_MORI=0
 ARG NIC_BACKEND=none
@@ -622,32 +638,14 @@ RUN pip uninstall -y aiter
 # block AITER_COMMIT overrides that predate that rule. The working tree was just
 # produced by a fresh `git clone` above, so there are no real user changes to
 # preserve.
-# cherry pick ROCm/aiter#6042 to unpeel the 64-bit sparse MLA loop below Triton 3.8, may be removed in next aiter upgrade
-# apply the DSV4.1 TP2 fp8/fp4 FMoE tuning CSVs from ROCm/aiter#5967, may be removed in next aiter upgrade
 # apply fix for v4 fp4 indexer, may be removed in next aiter upgrade
-# backport ROCm/aiter#6007 (masked E8M0 scales default to 0) to the group32 GEMM: with other=127 the
-# packed small-M kernel reads stale LDS as the masked K-tail scale, and a 0xFF byte turns the tile into NaN;
-# may be removed in next aiter upgrade
-# The #6042, #5967 and #6007 patches are written against the gfx942/gfx950 AITER pin and
-# do not apply to the older gfx1250 one (a conflict in pa_decode_sparse.py, and
-# the dsv41 CSVs and the group32 GEMM do not exist there yet), so gfx1250 skips them.
 RUN git clone ${AITER_REPO} \
  && cd aiter \
  && git checkout -f ${AITER_COMMIT} \
- && if [ "${GPU_ARCH_LIST}" != "gfx1250" ]; then \
-    git fetch origin pull/6042/head \
-    && git cherry-pick --no-commit 042a289183e5b47e193df6c10160915a6e8b69f5 \
-    && git fetch origin pull/5967/head \
-    && git diff -U0 89a47b84ac4b576339a50047e290c383c2377389 2bd147293d887c91fd10da10b1dbbf4690844270 -- \
-         aiter/configs/model_configs/dsv41_fp4_tuned_fmoe.csv \
-         aiter/configs/model_configs/dsv41_fp4_untuned_fmoe.csv \
-       | git apply --unidiff-zero \
-    && sed -i 's/other=127/other=0/' aiter/ops/triton/_triton_kernels/gemm/basic/gemm_a8w8_blockscale_group32.py; \
- fi \
  && sed -i 's/from functools import lru_cache/from functools import cache/' aiter/ops/flydsl/kernels/mqa_logits/pa_mqa_logits_fp4_prefill.py \
  && sed -i 's/@lru_cache(maxsize=32)/@cache/' aiter/ops/flydsl/kernels/mqa_logits/pa_mqa_logits_fp4_prefill.py \
  && git submodule update --init --recursive \
- && pip install -r requirements.txt \
+ && pip install -r requirements.txt
 
 # ROCm/aiter#5195's .co with a mask assembled in between the q rows sharing a
 # tile, which the grouped dsv4 decode needs; bit-identical at max_seqlen_q=1.
@@ -899,6 +897,20 @@ RUN /bin/bash -lc 'set -euo pipefail; \
     cd fast-hadamard-transform; \
     git checkout -f "${FHT_COMMIT}"; \
     PYTORCH_ROCM_ARCH=${GPU_ARCH_LIST} python setup.py install'
+
+# -----------------------
+# sgl-amd-mono (monokernel plugin; needs the sglang install above)
+RUN /bin/bash -lc 'set -euo pipefail; \
+    [ "${ENABLE_SGL_AMD_MONO}" = "1" ] || { echo "[sgl-amd-mono] skip (ENABLE_SGL_AMD_MONO=${ENABLE_SGL_AMD_MONO})"; exit 0; }; \
+    case "${GPU_ARCH}" in gfx950*) ;; *) echo "[sgl-amd-mono] skip (GPU_ARCH=${GPU_ARCH})"; exit 0 ;; esac; \
+    python3 -m pip show sgl-amd-mono > /dev/null || { echo "[sgl-amd-mono] skip (this SGLang does not install it)"; exit 0; }; \
+    commit="${SGL_AMD_MONO_COMMIT:-$(python3 -c "import json, importlib.metadata as md; print(json.loads(md.distribution(\"sgl-amd-mono\").read_text(\"direct_url.json\"))[\"vcs_info\"][\"commit_id\"])")}"; \
+    git clone "${SGL_AMD_MONO_REPO}" /sgl-workspace/sgl-amd-mono; \
+    cd /sgl-workspace/sgl-amd-mono; \
+    git checkout -f "${commit}"; \
+    python3 -m pip install --no-cache-dir --no-deps -e .; \
+    python3 -c "from importlib.metadata import entry_points; \
+assert any(e.name == \"sgl_amd_mono\" for e in entry_points(group=\"sglang.srt.plugins\")), \"sgl-amd-mono plugin not registered\""'
 
 # -----------------------
 # Python tools
@@ -1163,13 +1175,21 @@ RUN cd /tmp/whl \
 # torch 2.11 names this `triton-rocm`; uninstall it so the pin is the only Triton.
 RUN if [ "$BUILD_TRITON" = "1" ]; then \
         case "${GPU_ARCH}" in \
-          gfx1250-rocm1000) \
+          gfx1250-rocm1000|gfx1250-rocm1010) \
             echo "[Triton] gfx1250: building ${TRITON_COMMIT} from source"; \
             pip uninstall -y triton triton-rocm || true \
             && apt-get update && apt-get install -y --no-install-recommends cmake && rm -rf /var/lib/apt/lists/* \
             && git clone ${TRITON_REPO} triton-custom \
             && cd triton-custom \
             && git checkout ${TRITON_COMMIT} \
+            && for rev in ${TRITON_REVERT_COMMITS}; do \
+                 echo "[Triton] reverting $rev"; \
+                 git -c user.email=build@sglang -c user.name=sglang-build \
+                     revert --no-commit "$rev" \
+                 || git checkout --ours -- Makefile; \
+                 git -c user.email=build@sglang -c user.name=sglang-build \
+                     commit -q -am "Revert $rev" || exit 1; \
+               done \
             && pip install -r python/requirements.txt \
             && pip install -e . \
             && if [ -d python/triton_kernels ]; then pip install -e python/triton_kernels --no-deps; fi; \
@@ -1185,7 +1205,7 @@ RUN if [ "$BUILD_TRITON" = "1" ]; then \
     fi
 
 # torch 2.11 still Requires-Dist: triton-rocm after the swap above.
-RUN case "${GPU_ARCH}" in *-rocm724) python3 -c "import pathlib,re,importlib.metadata as m; p=pathlib.Path(m.distribution('torch')._path)/'METADATA'; v=m.version('triton'); t,n=re.subn(r'^Requires-Dist: (?:triton|triton-rocm)==[^ ;]+', 'Requires-Dist: triton=='+v, p.read_text(), count=1, flags=re.M); assert n==1, n; p.write_text(t)" ;; esac
+RUN case "${GPU_ARCH}" in *-rocm724|gfx1250-rocm1010) python3 -c "import pathlib,re,importlib.metadata as m; p=pathlib.Path(m.distribution('torch')._path)/'METADATA'; v=m.version('triton'); t,n=re.subn(r'^Requires-Dist: (?:triton|triton-rocm)==[^\s;]+', 'Requires-Dist: triton=='+v, p.read_text(), count=1, flags=re.M); assert n==1, n; p.write_text(t)" ;; esac
 
 # -----------------------
 # Performance environment variable.

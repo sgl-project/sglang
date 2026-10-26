@@ -61,17 +61,57 @@ parse_prior_digest(py::object prior_digest_obj, bool *has_prior_digest) {
 
 inline void hash_page(const unsigned char *data, std::size_t len,
                       bool &has_prior_digest,
-                      std::array<unsigned char, kDigestLen> &prior_digest) {
+                      std::array<unsigned char, kDigestLen> &prior_digest,
+                      bool wide = false) {
   SHA256_CTX ctx;
   SHA256_Init(&ctx);
   if (has_prior_digest) {
     SHA256_Update(&ctx, prior_digest.data(), prior_digest.size());
+  }
+  if (wide) {
+    // an odd byte count separates wide encoding from legacy u32 pages
+    const unsigned char tag = 0xff;
+    SHA256_Update(&ctx, &tag, sizeof(tag));
   }
   if (len > 0) {
     SHA256_Update(&ctx, data, len);
   }
   SHA256_Final(prior_digest.data(), &ctx);
   has_prior_digest = true;
+}
+
+template <typename RawToken>
+bool has_wide_tokens(const RawToken *raw, std::size_t count) {
+  if constexpr (sizeof(RawToken) == 4) {
+    return false;
+  }
+  bool wide = false;
+  for (std::size_t i = 0; i < count; ++i) {
+    if (raw[i] > INT64_MAX) {
+      throw std::out_of_range("token id must be a non-negative int64");
+    }
+    wide |= raw[i] > UINT32_MAX;
+  }
+  return wide;
+}
+
+template <typename RawToken>
+void hash_wide_page(const RawToken *raw, std::size_t count, bool is_bigram,
+                    bool &has_prior_digest,
+                    std::array<unsigned char, kDigestLen> &prior_digest) {
+  std::vector<std::uint64_t> words;
+  if (is_bigram) {
+    words.reserve(count * 2);
+    for (std::size_t i = 0; i < count; ++i) {
+      words.push_back(raw[i]);
+      words.push_back(raw[i + 1]);
+    }
+  } else {
+    words.assign(raw, raw + count);
+  }
+  hash_page(reinterpret_cast<const unsigned char *>(words.data()),
+            words.size() * sizeof(std::uint64_t), has_prior_digest,
+            prior_digest, true);
 }
 
 template <typename RawToken>
@@ -203,6 +243,16 @@ void hash_pages_to_hex_blob(const RawToken *raw, std::size_t logical_len,
   for (std::size_t start = 0, page_idx = 0; start < logical_len;
        start += page_size, ++page_idx) {
     const std::size_t page_units = std::min(page_size, logical_len - start);
+    const auto *page_start = raw + (is_bigram ? start : start * unit_width);
+    const std::size_t raw_count =
+        is_bigram ? page_units + 1 : page_units * unit_width;
+    if (has_wide_tokens(page_start, raw_count)) {
+      hash_wide_page(page_start, is_bigram ? page_units : raw_count, is_bigram,
+                     has_prior_digest, prior_digest);
+      digest_to_hex_chars(prior_digest.data(),
+                          hex_blob.data() + page_idx * kHexLen);
+      continue;
+    }
     const std::size_t page_bytes =
         page_units * unit_width * sizeof(std::uint32_t);
     const unsigned char *bytes = nullptr;
@@ -232,6 +282,13 @@ std::string hash_all(const RawToken *raw, std::size_t logical_len,
                      std::array<unsigned char, kDigestLen> prior_digest) {
   if (is_bigram) {
     unit_width = 2;
+  }
+  const std::size_t raw_count =
+      is_bigram && logical_len > 0 ? logical_len + 1 : logical_len * unit_width;
+  if (has_wide_tokens(raw, raw_count)) {
+    hash_wide_page(raw, is_bigram ? logical_len : raw_count, is_bigram,
+                   has_prior_digest, prior_digest);
+    return digest_to_hex_string(prior_digest.data());
   }
   const bool can_hash_raw_bytes =
       std::is_same_v<RawToken, std::uint32_t> && !is_bigram;
