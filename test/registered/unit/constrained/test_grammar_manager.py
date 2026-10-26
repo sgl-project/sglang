@@ -50,6 +50,10 @@ from sglang.srt.runtime_context import (
     publish,
     reset_context,
 )
+from sglang.srt.sampling.custom_logit_processor import (
+    DisallowedTokensLogitsProcessor,
+    Qwen3ThinkingBudgetLogitProcessor,
+)
 from sglang.srt.sampling.sampling_params import (
     REQUEST_REASONING_END_TOKEN_IDS_KEY,
 )
@@ -113,6 +117,7 @@ def _make_req(
     req.sampling_params.ebnf_full_assistant = False
     req.sampling_params.structural_tag = structural_tag
     req.sampling_params.custom_params = custom_params
+    req.custom_logit_processor = None
     req.require_reasoning = False
     req.grammar = None
     req.grammar_key = None
@@ -124,7 +129,7 @@ def _make_req(
 _INKLING_VOCAB_SIZE = max(INKLING_SPECIAL_TOKEN_IDS.values()) + 1
 
 
-def _make_strict_inkling_backend(max_think_tokens):
+def _make_inkling_backend(max_think_tokens, strict=True):
     vocab = [""] * _INKLING_VOCAB_SIZE
     for token_id in range(128):
         vocab[token_id] = chr(token_id)
@@ -139,8 +144,24 @@ def _make_strict_inkling_backend(max_think_tokens):
             XGrammarGrammarBackend(tokenizer, _INKLING_VOCAB_SIZE),
             SimpleNamespace(detector=InklingDetector()),
             tokenizer,
-            enable_strict_thinking=True,
+            enable_strict_thinking=strict,
         )
+
+
+class _FramelessInklingInnerBackend(BaseGrammarBackend):
+    """Compiles a placeholder object but cannot embed it in an answer frame."""
+
+    def _init_value_dispatch(self, key, require_reasoning):
+        return BaseGrammarObject()
+
+
+def _make_frameless_inkling_backend():
+    return ReasonerGrammarBackend(
+        _FramelessInklingInnerBackend(),
+        SimpleNamespace(detector=InklingDetector()),
+        SimpleNamespace(),
+        enable_strict_thinking=False,
+    )
 
 
 def _token_allowed(grammar, token_id):
@@ -160,6 +181,13 @@ class TestGrammarManagerInit(unittest.TestCase):
         scheduler = _make_scheduler(skip_tokenizer=True)
         mgr = GrammarManager(scheduler)
         self.assertIsNone(mgr.grammar_backend)
+
+    def test_env_thinking_budget_with_skip_tokenizer_raises(self):
+        """No grammar backend exists to enforce a server-wide cap; fail startup."""
+        scheduler = _make_scheduler(skip_tokenizer=True)
+        with patch.dict(os.environ, {"SGLANG_MAX_THINK_TOKENS": "0"}):
+            with self.assertRaisesRegex(ValueError, "SGLANG_MAX_THINK_TOKENS"):
+                GrammarManager(scheduler)
 
     @patch("sglang.srt.constrained.grammar_manager.create_grammar_backend")
     def test_len_and_has_waiting(self, mock_create):
@@ -306,6 +334,7 @@ class TestProcessReqWithGrammar(unittest.TestCase):
         self.assertFalse(result)
         self.assertEqual(len(mgr.grammar_queue), 0)
         self.assertIs(req.grammar, grammar_obj)
+        req.set_finish_with_abort.assert_not_called()
 
     def test_cache_hit_invalid_grammar_aborts(self):
         """Cache hit with InvalidGrammarObject should abort the request."""
@@ -377,7 +406,10 @@ class TestProcessReqWithGrammar(unittest.TestCase):
     def test_cache_hit_applies_request_thinking_budget(self):
         mgr = self._make_mgr()
         grammar_obj = ReasonerGrammarObject(
-            grammar=None, think_end_ids=[0], max_think_tokens=99
+            grammar=None,
+            think_end_ids=[0],
+            max_think_tokens=99,
+            token_filter_fn=MagicMock(),
         )
         mgr.grammar_backend.get_cached_or_future_value.return_value = (
             grammar_obj,
@@ -425,20 +457,187 @@ class TestProcessReqWithGrammar(unittest.TestCase):
             req.grammar.accept_token(token_id)
         self.assertTrue(req.grammar._is_generation())
 
-    def test_strict_reasoning_grammar_applies_request_thinking_budget(self):
-        mgr = self._make_mgr()
-        mgr._enable_strict_thinking = True
-        grammar_obj = ReasonerGrammarObject(
-            grammar=None, think_end_ids=[0], max_think_tokens=99
+    def test_request_budget_aborts_when_backend_offers_no_filter_grammar(self):
+        """A budget the backend cannot enforce must abort, not be silently ignored."""
+        with self.subTest("backend_returns_none"):
+            mgr = self._make_mgr()
+            mgr.grammar_backend.init_strict_reasoning_grammar.return_value = None
+
+            req = _make_req(custom_params={"thinking_budget": 3})
+            req.require_reasoning = True
+            result = mgr.process_req_with_grammar(req)
+
+            self.assertFalse(result)
+            self.assertIsNone(req.grammar)
+            req.set_finish_with_abort.assert_called_once()
+            self.assertIn("thinking_budget", req.set_finish_with_abort.call_args[0][0])
+
+        with self.subTest("no_backend"):
+            scheduler = _make_scheduler()
+            enter_override(
+                self, get_context().override_server_args(skip_tokenizer_init=True)
+            )
+            mgr = GrammarManager(scheduler)
+            mgr.grammar_backend = None
+
+            req = _make_req(custom_params={"thinking_budget": 3})
+            result = mgr.process_req_with_grammar(req)
+
+            self.assertFalse(result)
+            req.set_finish_with_abort.assert_called_once()
+
+    def test_constrained_cache_hit_aborts_when_grammar_cannot_filter(self):
+        """A constrained budget must abort when the cached grammar has no token filter."""
+        cases = {
+            "plain_grammar": MagicMock(spec=BaseGrammarObject),
+            "reasoner_without_filter": ReasonerGrammarObject(
+                grammar=None, think_end_ids=[0]
+            ),
+        }
+        for name, grammar_obj in cases.items():
+            with self.subTest(name):
+                mgr = self._make_mgr()
+                mgr.grammar_backend.get_cached_or_future_value.return_value = (
+                    grammar_obj,
+                    True,
+                )
+                req = _make_req(
+                    json_schema="schema", custom_params={"thinking_budget": 0}
+                )
+                mgr.process_req_with_grammar(req)
+
+                req.set_finish_with_abort.assert_called_once()
+                self.assertIn(
+                    "thinking_budget", req.set_finish_with_abort.call_args[0][0]
+                )
+
+    def test_custom_logit_processor_owns_thinking_budget(self):
+        """The processor route enforces thinking_budget itself; the grammar path must not."""
+        with self.subTest("unconstrained"):
+            mgr = self._make_mgr()
+            strict_grammar = ReasonerGrammarObject(
+                grammar=None,
+                think_end_ids=[0],
+                max_think_tokens=99,
+                token_filter_fn=MagicMock(),
+            )
+            mgr.grammar_backend.init_strict_reasoning_grammar.return_value = (
+                strict_grammar
+            )
+            req = _make_req(custom_params={"thinking_budget": 3})
+            req.custom_logit_processor = Qwen3ThinkingBudgetLogitProcessor.to_str()
+            req.require_reasoning = True
+            mgr.process_req_with_grammar(req)
+
+            mgr.grammar_backend.init_strict_reasoning_grammar.assert_called_once_with(
+                True, request_thinking_budget=None
+            )
+            self.assertEqual(req.grammar.max_think_tokens, 99)
+            req.set_finish_with_abort.assert_not_called()
+
+        with self.subTest("constrained_without_filter"):
+            mgr = self._make_mgr()
+            mgr.grammar_backend.get_cached_or_future_value.return_value = (
+                MagicMock(spec=BaseGrammarObject),
+                True,
+            )
+            req = _make_req(json_schema="schema", custom_params={"thinking_budget": 3})
+            req.custom_logit_processor = Qwen3ThinkingBudgetLogitProcessor.to_str()
+            mgr.process_req_with_grammar(req)
+
+            req.set_finish_with_abort.assert_not_called()
+
+    def test_non_budget_processor_leaves_thinking_budget_to_grammar(self):
+        """Only a ThinkingBudgetLogitProcessor may take over the budget from the grammar."""
+        processors = {
+            "disallowed_tokens": DisallowedTokensLogitsProcessor.to_str(),
+            "empty_string": "",
+        }
+        for name, processor in processors.items():
+            with self.subTest(name):
+                mgr = self._make_mgr()
+                grammar_obj = ReasonerGrammarObject(
+                    grammar=None,
+                    think_end_ids=[0],
+                    max_think_tokens=99,
+                    token_filter_fn=MagicMock(),
+                )
+                mgr.grammar_backend.init_strict_reasoning_grammar.return_value = (
+                    grammar_obj
+                )
+                req = _make_req(custom_params={"thinking_budget": 0, "token_ids": [3]})
+                req.custom_logit_processor = processor
+                req.require_reasoning = True
+                mgr.process_req_with_grammar(req)
+
+                mgr.grammar_backend.init_strict_reasoning_grammar.assert_called_once_with(
+                    True, request_thinking_budget=0
+                )
+                self.assertEqual(req.grammar.max_think_tokens, 0)
+
+    def test_env_cap_on_constrained_grammar(self):
+        """A full-turn grammar bypasses the reasoner wrapper, so the env cap cannot apply."""
+        with self.subTest("full_turn_grammar_aborts"):
+            mgr = self._make_mgr()
+            mgr.grammar_backend = MagicMock(spec=ReasonerGrammarBackend)
+            mgr.grammar_backend.max_think_tokens = 0
+            mgr.grammar_backend.framed_grammar_enforces_budget.return_value = False
+            mgr.grammar_backend.get_cached_or_future_value.return_value = (
+                MagicMock(spec=BaseGrammarObject),
+                True,
+            )
+
+            req = _make_req(ebnf='root ::= "hello"')
+            req.sampling_params.ebnf_full_assistant = True
+            mgr.process_req_with_grammar(req)
+
+            req.set_finish_with_abort.assert_called_once()
+            self.assertIn(
+                "SGLANG_MAX_THINK_TOKENS", req.set_finish_with_abort.call_args[0][0]
+            )
+
+        with self.subTest("wrapped_grammar_is_kept"):
+            mgr = self._make_mgr()
+            mgr.grammar_backend = MagicMock(spec=ReasonerGrammarBackend)
+            mgr.grammar_backend.max_think_tokens = 0
+            grammar_obj = ReasonerGrammarObject(
+                grammar=None,
+                think_end_ids=[0],
+                max_think_tokens=0,
+                token_filter_fn=MagicMock(),
+            )
+            mgr.grammar_backend.get_cached_or_future_value.return_value = (
+                grammar_obj,
+                True,
+            )
+
+            req = _make_req(json_schema="schema")
+            mgr.process_req_with_grammar(req)
+
+            req.set_finish_with_abort.assert_not_called()
+            self.assertIs(req.grammar, grammar_obj)
+            self.assertEqual(req.grammar.max_think_tokens, 0)
+
+    def test_uno_rejects_request_thinking_budget(self):
+        """UNO cannot run grammars; attaching a budget grammar would crash its worker."""
+        scheduler = _make_scheduler()
+        enter_override(
+            self,
+            get_context().override_server_args(
+                skip_tokenizer_init=True, speculative_algorithm="UNO"
+            ),
         )
-        mgr.grammar_backend.init_strict_reasoning_grammar.return_value = grammar_obj
+        mgr = GrammarManager(scheduler)
+        mgr.grammar_backend = MagicMock(spec=BaseGrammarBackend)
 
-        req = _make_req(custom_params={"thinking_budget": 3})
+        req = _make_req(custom_params={"thinking_budget": 0})
         req.require_reasoning = True
-        mgr.process_req_with_grammar(req)
+        result = mgr.process_req_with_grammar(req)
 
-        self.assertIs(req.grammar, grammar_obj)
-        self.assertEqual(req.grammar.max_think_tokens, 3)
+        self.assertFalse(result)
+        mgr.grammar_backend.init_strict_reasoning_grammar.assert_not_called()
+        req.set_finish_with_abort.assert_called_once()
+        self.assertIn("UNO", req.set_finish_with_abort.call_args[0][0])
 
 
 class TestAbortRequests(unittest.TestCase):
@@ -694,7 +893,10 @@ class TestGetReadyGrammarRequests(unittest.TestCase):
         mgr = self._make_mgr()
 
         grammar_obj = ReasonerGrammarObject(
-            grammar=None, think_end_ids=[0], max_think_tokens=99
+            grammar=None,
+            think_end_ids=[0],
+            max_think_tokens=99,
+            token_filter_fn=MagicMock(),
         )
         future = Future()
         future.set_result(grammar_obj)
@@ -711,6 +913,25 @@ class TestGetReadyGrammarRequests(unittest.TestCase):
         cached_key, cached_value = mgr.grammar_backend.set_cache.call_args[0]
         self.assertEqual(cached_key, ("json", "schema"))
         self.assertEqual(cached_value.max_think_tokens, 99)
+
+    def test_ready_future_aborts_budget_when_grammar_cannot_filter(self):
+        mgr = self._make_mgr()
+
+        grammar_obj = ReasonerGrammarObject(grammar=None, think_end_ids=[0])
+        future = Future()
+        future.set_result(grammar_obj)
+
+        req = _make_req(json_schema="schema", custom_params={"thinking_budget": 0})
+        req.grammar = future
+        req.grammar_key = ("json", "schema")
+        mgr.grammar_queue.append(req)
+
+        result = mgr.get_ready_grammar_requests()
+
+        self.assertEqual(len(result), 1)
+        req.set_finish_with_abort.assert_called_once()
+        self.assertIn("thinking_budget", req.set_finish_with_abort.call_args[0][0])
+        mgr.grammar_backend.set_cache.assert_called_once()
 
     @patch("sglang.srt.constrained.grammar_manager.torch.distributed.all_gather_object")
     def test_multi_rank_sync_intersects_ready_unions_failed(self, mock_all_gather):
@@ -874,12 +1095,12 @@ class TestGrammarManagerPPSync(unittest.TestCase):
         self.assertTrue(work.waited)
 
 
-class TestStrictReasoningPaths(unittest.TestCase):
+class TestUnconstrainedThinkingFilterPaths(unittest.TestCase):
     def setUp(self):
         reset_context()
         self.addCleanup(reset_context)
 
-    """Test _enable_strict_thinking code paths in GrammarManager."""
+    """Unconstrained requests: the backend decides whether a thinking filter applies."""
 
     def _make_mgr(self):
         scheduler = _make_scheduler()
@@ -888,7 +1109,6 @@ class TestStrictReasoningPaths(unittest.TestCase):
         )
         mgr = GrammarManager(scheduler)
         mgr.grammar_backend = MagicMock(spec=BaseGrammarBackend)
-        mgr._enable_strict_thinking = True
         return mgr
 
     def test_strict_unconstrained_request_gets_strict_grammar(self):
@@ -903,7 +1123,9 @@ class TestStrictReasoningPaths(unittest.TestCase):
 
         self.assertFalse(result)  # Not added to grammar queue
         self.assertIs(req.grammar, grammar_obj)
-        mgr.grammar_backend.init_strict_reasoning_grammar.assert_called_once_with(True)
+        mgr.grammar_backend.init_strict_reasoning_grammar.assert_called_once_with(
+            True, request_thinking_budget=None
+        )
 
     def test_strict_unconstrained_no_reasoning_flag(self):
         """Unconstrained request with require_reasoning=False still gets strict grammar."""
@@ -916,7 +1138,9 @@ class TestStrictReasoningPaths(unittest.TestCase):
         mgr.process_req_with_grammar(req)
 
         self.assertIs(req.grammar, grammar_obj)
-        mgr.grammar_backend.init_strict_reasoning_grammar.assert_called_once_with(False)
+        mgr.grammar_backend.init_strict_reasoning_grammar.assert_called_once_with(
+            False, request_thinking_budget=None
+        )
 
     def test_strict_unconstrained_none_grammar_is_fine(self):
         """If init_strict_reasoning_grammar returns None, req.grammar stays None."""
@@ -937,7 +1161,7 @@ class TestStrictReasoningPaths(unittest.TestCase):
         compiled = mgr.process_req_with_grammar(req)
         if compiled:
             mgr.get_ready_grammar_requests()
-        return compiled, req.grammar
+        return compiled, req.grammar, req
 
     def _thinking_tokens_allowed(self, grammar, limit=16):
         ids = INKLING_SPECIAL_TOKEN_IDS
@@ -955,33 +1179,84 @@ class TestStrictReasoningPaths(unittest.TestCase):
         wrapper; the request's thinking budget must still cap its thinking message,
         both when compiled for the request and when served from the cache."""
         mgr = self._make_mgr()
-        mgr.grammar_backend = _make_strict_inkling_backend(max_think_tokens=10)
+        mgr.grammar_backend = _make_inkling_backend(max_think_tokens=10)
         mgr.SGLANG_GRAMMAR_POLL_INTERVAL = 5
         served = [self._serve_inkling_regex(mgr, budget) for budget in (3, 3, 12)]
-        self.assertEqual([compiled for compiled, _ in served], [True, False, True])
+        self.assertEqual([compiled for compiled, _, _ in served], [True, False, True])
         self.assertEqual(
-            [self._thinking_tokens_allowed(grammar) for _, grammar in served],
+            [self._thinking_tokens_allowed(grammar) for _, grammar, _ in served],
             [3, 3, 12],
         )
+        for _, _, req in served:
+            req.set_finish_with_abort.assert_not_called()
 
     def test_inkling_budget_variants_stay_bounded(self):
         """Equivalent budgets share one cached frame and only recent budget variants
         stay cached; an evicted budget recompiles with its exact cap."""
         mgr = self._make_mgr()
-        mgr.grammar_backend = _make_strict_inkling_backend(max_think_tokens=10)
+        mgr.grammar_backend = _make_inkling_backend(max_think_tokens=10)
         mgr.SGLANG_GRAMMAR_POLL_INTERVAL = 5
         budgets = [0, 1, 2, 3, 4, 5, 6, 12, None, 10, -1, -2, 0]
         with patch.object(reasoner_grammar_backend, "_BUDGET_VARIANT_CACHE_SIZE", 4):
             served = [self._serve_inkling_regex(mgr, budget) for budget in budgets]
         self.assertEqual(
-            [compiled for compiled, _ in served],
+            [compiled for compiled, _, _ in served],
             [True] * 9 + [False, True, False, True],
         )
         self.assertEqual(
-            [self._thinking_tokens_allowed(grammar) for _, grammar in served],
+            [self._thinking_tokens_allowed(grammar) for _, grammar, _ in served],
             [0, 1, 2, 3, 4, 5, 6, 12, 10, 10, 16, 16, 0],
         )
         self.assertEqual(len(mgr.grammar_backend.cache), 1 + 4)
+
+    def test_inkling_env_cap_enforced_without_strict_thinking(self):
+        """With strict thinking off, the server-wide cap and request budgets are
+        baked into the framed grammar instead of aborting the request."""
+        mgr = self._make_mgr()
+        mgr.grammar_backend = _make_inkling_backend(max_think_tokens=10, strict=False)
+        mgr.SGLANG_GRAMMAR_POLL_INTERVAL = 5
+        served = [self._serve_inkling_regex(mgr, budget) for budget in (None, 3, 3)]
+        self.assertEqual([compiled for compiled, _, _ in served], [True, True, False])
+        self.assertEqual(
+            [self._thinking_tokens_allowed(grammar) for _, grammar, _ in served],
+            [10, 3, 3],
+        )
+        for _, _, req in served:
+            req.set_finish_with_abort.assert_not_called()
+
+    def test_inkling_request_budget_enforced_without_strict_or_env_cap(self):
+        """With neither strict thinking nor a server cap, a request budget compiles
+        to its own framed variant and is served from cache on repeat; -1 asks for
+        no cap, so it is served uncapped rather than aborted."""
+        mgr = self._make_mgr()
+        mgr.grammar_backend = _make_inkling_backend(max_think_tokens=-1, strict=False)
+        mgr.SGLANG_GRAMMAR_POLL_INTERVAL = 5
+        served = [self._serve_inkling_regex(mgr, budget) for budget in (4, 4, None, -1)]
+        self.assertEqual(
+            [compiled for compiled, _, _ in served],
+            [True, False, True, False],
+        )
+        self.assertEqual(
+            [self._thinking_tokens_allowed(grammar) for _, grammar, _ in served],
+            [4, 4, 16, 16],
+        )
+        for _, _, req in served:
+            req.set_finish_with_abort.assert_not_called()
+
+    def test_inkling_budget_variant_without_framing_support_aborts(self):
+        """A backend that cannot embed the constraint in an answer frame rejects a
+        request thinking budget instead of silently dropping it."""
+        mgr = self._make_mgr()
+        mgr.grammar_backend = _make_frameless_inkling_backend()
+        mgr.SGLANG_GRAMMAR_POLL_INTERVAL = 5
+        compiled, grammar, req = self._serve_inkling_regex(mgr, 4)
+        self.assertTrue(compiled)
+        self.assertIsInstance(grammar, InvalidGrammarObject)
+        req.set_finish_with_abort.assert_called_once()
+        self.assertIn(
+            "cannot enforce the thinking budget",
+            req.set_finish_with_abort.call_args.args[0],
+        )
 
     def test_strict_constrained_request_uses_normal_dispatch(self):
         """Request with json_schema should go through normal dispatch, not strict path."""
@@ -994,18 +1269,6 @@ class TestStrictReasoningPaths(unittest.TestCase):
         result = mgr.process_req_with_grammar(req)
 
         self.assertTrue(result)  # Added to grammar queue
-        mgr.grammar_backend.init_strict_reasoning_grammar.assert_not_called()
-
-    def test_strict_not_set_skips_strict_path(self):
-        """When _enable_strict_thinking=False, unconstrained requests get no grammar."""
-        mgr = self._make_mgr()
-        mgr._enable_strict_thinking = False
-
-        req = _make_req()
-        req.require_reasoning = True
-        mgr.process_req_with_grammar(req)
-
-        self.assertIsNone(req.grammar)
         mgr.grammar_backend.init_strict_reasoning_grammar.assert_not_called()
 
     def test_future_exception_creates_invalid_grammar(self):

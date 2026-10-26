@@ -1,5 +1,6 @@
 """Startup validation for UNO configuration."""
 
+import os
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -33,6 +34,27 @@ class TestUnoTreeConfig(CustomTestCase):
             ),
             patch("sglang.srt.arg_groups.speculative_hook.declare_resolution"),
             self.assertRaisesRegex(ValueError, "parent-list ABI"),
+        ):
+            _handle_uno(server_args)
+
+    def test_env_thinking_budget_is_rejected_at_startup(self):
+        """A server-wide budget attaches grammars that crash the UNO worker."""
+
+        server_args = SimpleNamespace(
+            device="cuda",
+            enable_deterministic_inference=False,
+            enable_strict_thinking=False,
+            speculative_draft_model_path=None,
+            uno_lora_path="/tmp/uno-lora",
+        )
+
+        with (
+            patch(
+                "sglang.srt.arg_groups.speculative_hook.resolving_view",
+                side_effect=lambda args: args,
+            ),
+            patch.dict(os.environ, {"SGLANG_MAX_THINK_TOKENS": "0"}),
+            self.assertRaisesRegex(ValueError, "SGLANG_MAX_THINK_TOKENS"),
         ):
             _handle_uno(server_args)
 

@@ -48,7 +48,6 @@ class ReasonerGrammarObject(BaseGrammarObject):
         think_end_ids: Sequence[int],
         think_excluded_token_ids: Optional[List[int]] = None,
         max_think_tokens: int = -1,
-        enable_token_filter: bool = False,
         token_filter_fn=None,
         allocate_vocab_mask_fn=None,
         move_vocab_mask_fn=None,
@@ -60,7 +59,6 @@ class ReasonerGrammarObject(BaseGrammarObject):
         self._think_end_matcher = TokenSequenceMatcher(self.think_end_ids)
         self.think_excluded_token_ids = think_excluded_token_ids
         self.max_think_tokens = max_think_tokens
-        self.enable_token_filter = enable_token_filter
         self.token_filter_fn = token_filter_fn
         self.allocate_vocab_mask_fn = allocate_vocab_mask_fn
         self.move_vocab_mask_fn = move_vocab_mask_fn
@@ -100,6 +98,12 @@ class ReasonerGrammarObject(BaseGrammarObject):
         self.think_end_ids = token_ids
         self._think_end_matcher = TokenSequenceMatcher(token_ids)
         self._matched_think_end_tokens = 0
+
+    @property
+    def enable_token_filter(self):
+        return self.token_filter_fn is not None and (
+            self.think_excluded_token_ids is not None or self.max_think_tokens >= 0
+        )
 
     def _is_thinking(self):
         return self.tokens_in_think >= 0 and self.tokens_after_end == -1
@@ -223,7 +227,6 @@ class ReasonerGrammarObject(BaseGrammarObject):
             think_end_ids=self.think_end_ids,
             think_excluded_token_ids=self.think_excluded_token_ids,
             max_think_tokens=self.max_think_tokens,
-            enable_token_filter=self.enable_token_filter,
             token_filter_fn=self.token_filter_fn,
             allocate_vocab_mask_fn=self.allocate_vocab_mask_fn,
             move_vocab_mask_fn=self.move_vocab_mask_fn,
@@ -295,7 +298,7 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
             reasoning_parser, tokenizer
         )
         self.max_think_tokens = envs.SGLANG_MAX_THINK_TOKENS.get()
-        self.enable_token_filter = self.enable_strict_thinking and (
+        self.enable_token_filter = (
             self.think_excluded_token_ids is not None or self.max_think_tokens >= 0
         )
         if (
@@ -303,12 +306,14 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
             and not self.grammar_backend.is_support_token_filter
         ):
             raise ValueError(
-                "Strict reasoning format requested but the grammar backend does not "
-                "support token filtering. Use a grammar backend that supports token "
-                "filtering (e.g., xgrammar) or disable strict reasoning mode."
+                "Strict thinking / a thinking budget was requested but the grammar "
+                "backend does not support token filtering. Use a grammar backend "
+                "that supports token filtering (e.g., xgrammar)."
             )
         self._token_filter_fn = (
-            self.grammar_backend.set_token_filter if self.enable_token_filter else None
+            self.grammar_backend.set_token_filter
+            if self.grammar_backend.is_support_token_filter
+            else None
         )
 
     def _get_think_excluded_token_ids(
@@ -340,7 +345,6 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
             think_end_ids=self.think_end_ids,
             think_excluded_token_ids=self.think_excluded_token_ids,
             max_think_tokens=self.max_think_tokens,
-            enable_token_filter=self.enable_token_filter,
             token_filter_fn=self._token_filter_fn,
             allocate_vocab_mask_fn=self.grammar_backend.allocate_vocab_mask,
             move_vocab_mask_fn=self.grammar_backend.move_vocab_mask,
@@ -350,12 +354,23 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
         return obj
 
     def init_strict_reasoning_grammar(
-        self, reasoning: bool
+        self, reasoning: bool, request_thinking_budget: Optional[int] = None
     ) -> Optional[BaseGrammarObject]:
-        """Create a grammar object for strict token filtering only (no inner grammar)."""
-        if not self.enable_strict_thinking:
+        """Create a grammar object for thinking-phase token filtering only (no inner grammar)."""
+        if not (
+            self.enable_strict_thinking
+            or self.max_think_tokens >= 0
+            or request_thinking_budget is not None
+        ):
             return None
-        return self._make_grammar_object(None, reasoning)
+        if request_thinking_budget is not None and self._token_filter_fn is None:
+            # No object -> the caller rejects the request; an inert object
+            # would silently ignore the cap.
+            return None
+        obj = self._make_grammar_object(None, reasoning)
+        if request_thinking_budget is not None:
+            obj.max_think_tokens = request_thinking_budget
+        return obj
 
     def get_request_grammar_key(
         self,
@@ -369,8 +384,7 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
             return key
         if self._answer_frame.ends_in_open_answer_block(input_ids):
             return (f"{key_type}:{_OPEN_ANSWER_VARIANT}", key_string)
-        # Mirrors the strict wrapper, which applies a request budget only while filtering.
-        if not self.enable_token_filter or thinking_budget is None:
+        if thinking_budget is None:
             return key
         budget = max(thinking_budget, -1)
         if budget == max(self.max_think_tokens, -1):
@@ -420,6 +434,11 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
             framed = self._frame_answer(ret, variant)
             if framed is not None:
                 return framed
+            if variant.startswith(_THINK_BUDGET_VARIANT):
+                return InvalidGrammarObject(
+                    f"{key[0]} grammar cannot enforce the thinking budget: this "
+                    f"grammar backend cannot frame constrained output"
+                )
         if (
             not self.enable_strict_thinking
             and key[0] == "structural_tag"
@@ -429,16 +448,22 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
             return ret
         return self._make_grammar_object(ret, reasoning)
 
+    def framed_grammar_enforces_budget(self, key_type: str) -> bool:
+        """Whether a grammar dispatched under this (variant-suffixed) key type caps
+        thinking through the answer frame instead of a token filter."""
+        base, _, variant = key_type.partition(":")
+        if not self._is_framed(base):
+            return False
+        return bool(variant) or self.max_think_tokens >= 0
+
     def _frame_answer(
         self, grammar: BaseGrammarObject, variant: str
     ) -> Optional[BaseGrammarObject]:
         in_answer_block = variant == _OPEN_ANSWER_VARIANT
         if variant.startswith(_THINK_BUDGET_VARIANT):
             max_think_tokens = int(variant.removeprefix(_THINK_BUDGET_VARIANT))
-        elif self.enable_strict_thinking:
-            max_think_tokens = self.max_think_tokens
         else:
-            max_think_tokens = -1
+            max_think_tokens = self.max_think_tokens
         return self.grammar_backend.compile_framed_grammar(
             grammar,
             lambda content: self._answer_frame.structural_tag(
