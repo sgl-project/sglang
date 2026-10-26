@@ -174,7 +174,9 @@ class TestRowwiseFp8Config(unittest.TestCase):
 
 
 def _fp8_capable():
-    if not torch.cuda.is_available():
+    # ROCm only takes FP8 weights through the loader, which converts them to
+    # the platform's FP8 layout; this test feeds raw OCP e4m3fn weights.
+    if not torch.cuda.is_available() or torch.version.hip:
         return False
     major, minor = torch.cuda.get_device_capability()
     return major >= 9 or (major == 8 and minor >= 9)

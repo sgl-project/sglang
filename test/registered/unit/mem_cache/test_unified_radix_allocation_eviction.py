@@ -18,7 +18,7 @@ from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestUnifiedRadixAllocationEviction(CustomTestCase):
@@ -88,6 +88,7 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
         allocator.free_group = None
         allocator.free_page_reps_group = None
         if tri_pool:
+            allocator.full_page_reps_group = []
             allocator.full_free_group = []
         allocator.full_attn_allocator = MagicMock()
         allocator.full_attn_allocator.schedulable_available_size.return_value = 100
