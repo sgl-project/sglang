@@ -150,9 +150,6 @@ def _update_expert_weights_raw(
 ):
     log_metrics = get_bool_env_var("SGLANG_EXPERT_LOCATION_UPDATER_LOG_METRICS")
 
-    if not update_layer_ids:
-        return {}
-
     if _is_npu:
         update_layer_ids, temp_buffers, update_layer = prepare_expert_weight_update(
             weights_by_layer=routed_experts_weights_of_layer,
@@ -216,7 +213,6 @@ def update_expert_weights_single_layer(
     log_metrics: bool = False,
     group: Optional[torch.distributed.ProcessGroup] = None,
 ):
-    # The NPU entry point prepares slot-copy-compatible weights before calling here.
     assert all(
         tensor.shape[0] == num_local_physical_experts
         for tensor in routed_experts_weights

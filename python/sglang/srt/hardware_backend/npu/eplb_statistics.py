@@ -42,6 +42,26 @@ class NpuEplbCommunication:
 class NpuExpertDistributionRecorder(distribution._ExpertDistributionRecorderReal):
     """Reuse upstream recording while isolating NPU draft forward lifecycles."""
 
+    def _create_accumulator(self, expert_location_metadata, rank):
+        return distribution._Accumulator.get_class()(
+            expert_location_metadata, rank, communication=NpuEplbCommunication()
+        )
+
+    def _create_gatherer(self, expert_location_metadata, rank):
+        moe = distribution.get_exec().moe
+        # Preserve the upstream per-token and approximate recording modes.
+        if (
+            moe.moe_a2a_backend == "deepep"
+            and moe.expert_distribution_recorder_mode
+            not in (
+                "per_token",
+                "stat_approx",
+            )
+        ):
+            # Ascend receiver counts include graph padding; count valid routes.
+            return NpuExpertDistributionGatherer(expert_location_metadata, rank)
+        return super()._create_gatherer(expert_location_metadata, rank)
+
     @contextmanager
     def with_forward_pass(
         self, forward_pass_id, forward_batch, *, is_draft_worker=False

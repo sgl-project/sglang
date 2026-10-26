@@ -135,11 +135,7 @@ class ExpertDistributionMetrics:
 
 
 class ExpertDistributionRecorder(ABC):
-    """Coordinate recording around each forward pass.
-
-    A gatherer produces per-layer counts for one pass; an accumulator retains
-    those counts across passes for reporting and EPLB placement decisions.
-    """
+    """Global expert distribution recording"""
 
     @staticmethod
     def init_new(
@@ -241,9 +237,9 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         self._current_forward_pass_id = Withable()
         self._current_layer_idx = Withable()
         self._current_debug_name = Withable()
-        self._accumulator = _Accumulator.init_new(expert_location_metadata, rank)
+        self._accumulator = self._create_accumulator(expert_location_metadata, rank)
         self._single_pass_gatherers = {
-            k: _SinglePassGatherer.init_new(expert_location_metadata, rank)
+            k: self._create_gatherer(expert_location_metadata, rank)
             for k in self._accumulator.get_single_pass_gatherer_keys()
         }
 
@@ -253,6 +249,12 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
                 f"expert_balancedness_report_mode={get_exec().moe.expert_balancedness_report_mode}"
             )
             self.start_record()
+
+    def _create_accumulator(self, expert_location_metadata, rank):
+        return _Accumulator.init_new(expert_location_metadata, rank)
+
+    def _create_gatherer(self, expert_location_metadata, rank):
+        return _SinglePassGatherer.init_new(expert_location_metadata, rank)
 
     def with_current_layer(self, layer_idx):
         return self._current_layer_idx.with_value(layer_idx)
@@ -434,14 +436,6 @@ class _SinglePassGatherer(ABC):
                 raise NotImplementedError
 
         if get_exec().moe.moe_a2a_backend == "deepep":
-            if _is_npu:
-                from sglang.srt.hardware_backend.npu.eplb_statistics import (
-                    NpuExpertDistributionGatherer,
-                )
-
-                # Ascend receiver counts include graph padding; count valid
-                # sender routes instead.
-                return NpuExpertDistributionGatherer(expert_location_metadata, rank)
             if get_exec().moe.deepep_mode == "normal":
                 return _SelectExpertsSinglePassGatherer(expert_location_metadata, rank)
             elif get_exec().moe.deepep_mode == "low_latency":
@@ -772,17 +766,7 @@ class _Accumulator(ABC):
         expert_location_metadata: ExpertLocationMetadata,
         rank: int,
     ) -> _Accumulator:
-        if _is_npu:
-            from sglang.srt.hardware_backend.npu.eplb_statistics import (
-                NpuEplbCommunication,
-            )
-
-            communication = NpuEplbCommunication()
-        else:
-            communication = _EplbCommunication()
-        return _Accumulator.get_class()(
-            expert_location_metadata, rank, communication=communication
-        )
+        return _Accumulator.get_class()(expert_location_metadata, rank)
 
     @staticmethod
     def get_class() -> Type[_Accumulator]:
