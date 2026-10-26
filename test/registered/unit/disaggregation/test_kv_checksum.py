@@ -72,10 +72,16 @@ class TestDeepSeekStateIndices(unittest.TestCase):
             [v.tolist() for v in result], [[15, 16, 17], [15, 16, 17], [5, 6]]
         )
         pool.request_state_transfer_indices.assert_called_once_with(1, 7)
+        # Decode retains cached prefix pages; only transferred SWA pages are hashed.
+        result = state_indices_for_request(scheduler, req, 7, start_idx=6)
+        self.assertEqual([v.tolist() for v in result], [[17], [17], [5, 6]])
         pool.request_window = SimpleNamespace(page_indices=Mock(return_value=[4, 7, 9]))
         result = state_indices_for_request(scheduler, req, 7)
         self.assertEqual([v.tolist() for v in result], [[4, 7, 9], [4, 7, 9], [5, 6]])
         pool.request_window.page_indices.assert_called_once_with(1, 2, 7)
+        pool.request_window.page_indices.reset_mock()
+        state_indices_for_request(scheduler, req, 7, start_idx=6)
+        pool.request_window.page_indices.assert_called_once_with(1, 6, 7)
 
     def test_unified_ring_wrap_and_empty_pending_state(self):
         from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
@@ -94,7 +100,10 @@ class TestDeepSeekStateIndices(unittest.TestCase):
             req_to_token_pool=SimpleNamespace(req_to_token=torch.arange(32).view(4, 8)),
         )
         result = state_indices_for_request(
-            scheduler, SimpleNamespace(kv=SimpleNamespace(req_pool_idx=2)), 6
+            scheduler,
+            SimpleNamespace(kv=SimpleNamespace(req_pool_idx=2)),
+            6,
+            start_idx=4,
         )
         self.assertEqual([v.tolist() for v in result], [[11, 8, 9], [11, 8, 9], []])
         self.assertTrue(

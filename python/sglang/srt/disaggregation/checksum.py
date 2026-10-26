@@ -85,7 +85,7 @@ def state_indices_for_request(
         page_size = scheduler.token_to_kv_pool_allocator.page_size
         result = []
         if pool.get_state_buf_infos()[0]:
-            window_start = max(0, seq_len - pool.sliding_window)
+            window_start = max(start_idx, seq_len - pool.sliding_window)
             window_start = (window_start // page_size) * page_size
             if pool.request_window is not None:
                 swa = torch.as_tensor(
