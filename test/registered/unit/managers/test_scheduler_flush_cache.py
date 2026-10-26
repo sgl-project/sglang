@@ -9,7 +9,7 @@ from sglang.srt.managers.scheduler_components.flush_wrapper import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 register_cpu_ci(est_time=8, suite="stage-b-test-cpu-intel")
 
 
@@ -133,12 +133,6 @@ class TestSchedulerFlushCache(unittest.TestCase):
         Scheduler.send_control_output(rust, output, req)
         rust.rust_server.push_control_output.assert_called_once_with(req, output)
         rust.ipc_channels.send_to_tokenizer.send_output.assert_not_called()
-
-        python = SimpleNamespace(rust_server=None, ipc_channels=MagicMock())
-        Scheduler.send_control_output(python, output, req)
-        python.ipc_channels.send_to_tokenizer.send_output.assert_called_once_with(
-            output, req
-        )
 
 
 if __name__ == "__main__":

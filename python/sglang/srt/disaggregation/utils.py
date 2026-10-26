@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import random
 from collections import deque
 from contextlib import nullcontext
@@ -259,14 +260,46 @@ def _apply_metadata_gate(polls, decode_reqs, metadata_buffers) -> None:
                 polls[i] = int(KVPoll.Transferring)
 
 
+def kv_layout_signature(kv_args: KVArgs) -> int:
+    """Identify the KV layout a checksum digests.
+
+    Two sides can compare digests only if they cover the same bytes. A prefill
+    with another TP width has other per-page item lengths; a PP or
+    layer-sharded prefill owns fewer buffers; the same byte sizes under another
+    dtype or page layout (fp16 vs bf16, two V4 layouts) hold other bytes.
+    Shipped beside the digest, so those become one logged skip instead of a
+    mismatch on every request. Positive int64 and never 0, which marks "no
+    digest" in the metadata row.
+    """
+    layout = (
+        kv_args.page_size,
+        kv_args.kv_cache_dtype_str,
+        kv_args.kv_layout,
+        kv_args.swa_kv_cache_layout,
+        [state_type.value for state_type in kv_args.state_types],
+        list(kv_args.kv_item_lens),
+        [list(lens) for lens in kv_args.state_item_lens],
+    )
+    raw = hashlib.blake2b(repr(layout).encode(), digest_size=8).digest()
+    return int.from_bytes(raw, "big") >> 1 | 1
+
+
+def all_reduce_flags(
+    flags: List[int], group: dist.ProcessGroup, op: dist.ReduceOp
+) -> List[int]:
+    """Reduce one small int per entry across `group`; every rank must pass the
+    same number of entries in the same order. Empty or single-rank: unchanged."""
+    if not flags or dist.get_world_size(group) == 1:
+        return flags
+
+    tensor_to_reduce = torch.tensor(flags, dtype=torch.int32, device="cpu")
+    dist.all_reduce(tensor_to_reduce, op=op, group=group)
+    return tensor_to_reduce.tolist()
+
+
 def _all_reduce_polls(polls: List[int], group: dist.ProcessGroup) -> List[int]:
     """MIN-reduce poll states so no rank commits ahead of its peers."""
-    if dist.get_world_size(group) == 1:
-        return polls
-
-    tensor_to_reduce = torch.tensor(polls, dtype=torch.uint8, device="cpu")
-    dist.all_reduce(tensor_to_reduce, op=dist.ReduceOp.MIN, group=group)
-    return tensor_to_reduce.tolist()
+    return all_reduce_flags(flags=polls, group=group, op=dist.ReduceOp.MIN)
 
 
 def poll_and_all_reduce(
@@ -469,11 +502,24 @@ class MetadataBuffers:
                     device=self.bootstrap_room.device,
                 )
 
-    def set_kv_checksum(self, req: Req, value: int) -> None:
-        self.kv_checksum[req.metadata_buffer_index, 0] = value
+    def set_kv_checksum(self, req: Req, digest: int, signature: int) -> None:
+        # Slot 0 the digest, slot 1 the layout signature it was taken under;
+        # the row is 8 wide for the 64 B RDMA minimum anyway.
+        row = self.kv_checksum[req.metadata_buffer_index]
+        row[0] = digest
+        row[1] = signature
 
-    def get_kv_checksum(self, idx: int) -> int:
-        return int(self.kv_checksum[idx, 0].item())
+    def get_kv_checksum(self, idx: int) -> Tuple[int, int]:
+        """Return ``(digest, signature)``; ``(0, 0)`` means no digest was written."""
+        digest, signature = self.kv_checksum[idx, :2].tolist()
+        return int(digest), int(signature)
+
+    def clear_slot(self, idx: int) -> None:
+        """Reset the fields the next owner reads before its prefill writes
+        them, so it sees "not yet written" instead of the previous owner's."""
+        self.bootstrap_room[idx] = 0
+        if self.kv_checksum is not None:
+            self.kv_checksum[idx] = 0
 
     def get_buf_infos(self):
         bufs = [
@@ -1085,8 +1131,9 @@ def build_kv_layer_ids(
     pairing.
     """
     from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+    from sglang.srt.mem_cache.minimax_m3_nvfp4_pool import MiniMaxM3Nvfp4KVPool
 
-    if not isinstance(token_to_kv_pool, HybridLinearKVPool):
+    if not isinstance(token_to_kv_pool, (HybridLinearKVPool, MiniMaxM3Nvfp4KVPool)):
         return []
     layer_ids = token_to_kv_pool.get_kv_layer_ids()
     if draft_token_to_kv_pool is None:
@@ -1479,11 +1526,19 @@ def setup_state_kv_args(
         if token_to_kv_pool.index_k_pool is not None:
             dp, dl, il = token_to_kv_pool.get_index_k_state_buf_infos()
             append_state_component(kv_args, StateType.MINIMAX_INDEX_K, dp, dl, il)
-        append_state_component(
-            kv_args,
-            StateType.MINIMAX_DENSE_KV,
-            *token_to_kv_pool.get_dense_kv_state_buf_infos(),
+        dense_ptrs, dense_lens, dense_item_lens = (
+            token_to_kv_pool.get_dense_kv_state_buf_infos()
         )
+        # An all-sparse pool has no dense layers; registering an empty component
+        # would make every transfer carry a state with nothing to move.
+        if dense_ptrs:
+            append_state_component(
+                kv_args,
+                StateType.MINIMAX_DENSE_KV,
+                dense_ptrs,
+                dense_lens,
+                dense_item_lens,
+            )
     elif hasattr(token_to_kv_pool, "get_state_buf_infos"):
         data_ptrs, data_lens, item_lens = token_to_kv_pool.get_state_buf_infos()
 

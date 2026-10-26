@@ -495,7 +495,10 @@ def embed_mm_inputs(
             embedder = getattr(multimodal_model, f"get_{modality_id}_feature", None)
         if len(items) != 0:
             assert embedder is not None, f"no embedding method found for {modality}"
-            pad_values = [value for item in items for value in item.padding_values()]
+            # Sorted for the searchsorted lookup in _get_multimodal_mask.
+            pad_values = sorted(
+                value for item in items for value in item.padding_values()
+            )
             if input_ids.device.type == "cuda":
                 # Pinned staging keeps the placeholder copy asynchronous on CUDA.
                 placeholder_cpu = torch.tensor(

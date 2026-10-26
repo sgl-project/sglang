@@ -28,6 +28,7 @@ from sglang.srt.configs.model_config import (
     is_deepseek_dsa,
     is_deepseek_v4,
     is_minimax_sparse,
+    uses_minimax_m3_nvfp4_native_stack,
 )
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_len_per_decode
@@ -109,7 +110,7 @@ def _dflash_draft_cell_size(kvc: KVCacheConfigurator) -> int:
     ranks because the draft pool spans the widened virtual location space."""
     if kvc.is_draft_worker or not kvc.spec_algorithm.is_dflash_family():
         return 0
-    cell_size = kvc.spec_aux_config.dflash_draft_cell_size_per_token
+    cell_size = kvc.dflash_draft_cell_size_per_token
     if cell_size is None or int(cell_size) <= 0:
         return 0
     return int(cell_size) * get_parallel().attn_dcp_size
@@ -394,6 +395,8 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
             # Add indexer KV cache overhead for DSA models (DeepSeek V3.2)
             if is_deepseek_dsa(model_config.hf_config):
+                # The index-K buffer is replicated under DCP while the latent KV
+                # shards, so this term is short by dcp_size without the scale.
                 indexer_cell_size = self._compute_dsa_indexer_cell_size(
                     kvc=kvc,
                     num_layers=num_layers,
@@ -447,6 +450,25 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
                 full_pool_ratio = parse_hisparse_config().host_to_device_ratio
+
+            # Must match the pool class picked in _build_minimax_sparse_kv_pool;
+            # the packed layout is about four times smaller per token.
+            if uses_minimax_m3_nvfp4_native_stack(model_config.quantization):
+                from sglang.srt.mem_cache.minimax_m3_nvfp4_pool import (
+                    MSA_V1_PAGE_SIZE,
+                    msa_v1_page_row_bytes,
+                )
+
+                # Each sparse layer stores one aligned main row and one index row per page.
+                return (
+                    num_sparse
+                    * sum(
+                        msa_v1_page_row_bytes(
+                            kv_heads, head_dim, indexer_head_dim, MSA_V1_PAGE_SIZE
+                        )
+                    )
+                    // MSA_V1_PAGE_SIZE
+                )
 
             main_pool_bytes = (
                 (num_dense * full_pool_ratio + num_sparse)
@@ -991,6 +1013,7 @@ class SWARequestCapPoolConfigurator(HybridSWAPoolConfigurator):
             full_cell_size = (
                 self._full_cell_bytes()
                 + self._swa_per_token * self._draft_swa_full_layers_num
+                + self._draft_cell_size
             )
             full_tokens = (
                 int((available_bytes - fixed_swa_bytes) // full_cell_size) // page_size

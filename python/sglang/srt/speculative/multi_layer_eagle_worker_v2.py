@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.configs.draft_parallel import DraftParallelSpec, DraftTPExecution
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.multi_layer_eagle_draft_extend_npu_graph_runner import (
     MultiLayerEagleMultiStepDraftExtendNpuGraphRunner,
@@ -51,6 +52,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWorkerBase
+from sglang.srt.speculative.draft_parallel import resolve_draft_parallel_layout
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
 from sglang.srt.speculative.eagle_info import (
     EagleDraftExtendInput,
@@ -161,8 +163,14 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             self.speculative_num_steps * self.topk, self.speculative_num_draft_tokens
         )
 
+        # Retain the target's attention topology when swapping TP groups.
+        self.parallel_layout = resolve_draft_parallel_layout(
+            DraftParallelSpec(tp_execution=DraftTPExecution.TARGET_LAYOUT)
+        )
+
         # Load draft model weights only.
         with (
+            draft_tp_context(self.parallel_layout),
             draft_pp_context(),
             speculative_moe_backend_context(),
             draft_model_build_scope(),
@@ -190,8 +198,6 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             "InklingForConditionalGenerationMTP",
             "GigaChat35ForCausalLMNextN",
         ]
-        # Retain the target's attention topology when swapping TP groups.
-        self.draft_owns_attention = False
         self.tree_mask_mode = default_tree_mask_mode()
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
 
@@ -220,7 +226,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
     def init_attention_backends(self):
         with (
             draft_pp_context(),
-            draft_tp_context(self.draft_owns_attention),
+            draft_tp_context(self.parallel_layout),
             speculative_moe_backend_context(),
         ):
             super().init_attention_backends()
@@ -228,7 +234,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
     def init_cuda_graphs(self):
         with (
             draft_pp_context(),
-            draft_tp_context(self.draft_owns_attention),
+            draft_tp_context(self.parallel_layout),
             speculative_moe_backend_context(),
         ):
             super().init_cuda_graphs()
@@ -705,6 +711,9 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                 probs, topk_p, topk_index = sample_draft_proposal(
                     output.logits_output.next_token_logits,
                     forward_batch.sampling_info.temperatures,
+                    sampling_seed=forward_batch.sampling_info.sampling_seed,
+                    positions=forward_batch.seq_lens,
+                    draft_step=step,
                 )
                 draft_probs_list.append(probs)
             else:
@@ -912,6 +921,9 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                         probs, ret_topk_p, ret_topk_index = sample_draft_proposal(
                             step_logits,
                             forward_batch.sampling_info.temperatures,
+                            sampling_seed=forward_batch.sampling_info.sampling_seed,
+                            positions=forward_batch.seq_lens,
+                            draft_step=step,
                         )
                         ret_draft_probs_list.append(probs)
                     if rotates_in_graph:
@@ -985,7 +997,11 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                     ]
                 if self.use_rejection_sampling and self.topk == 1:
                     probs, ret_topk_p, ret_topk_index = sample_draft_proposal(
-                        logits_sel, forward_batch.sampling_info.temperatures
+                        logits_sel,
+                        forward_batch.sampling_info.temperatures,
+                        sampling_seed=forward_batch.sampling_info.sampling_seed,
+                        positions=forward_batch.seq_lens,
+                        draft_step=step,
                     )
                     ret_draft_probs_list.append(probs)
                 else:
@@ -1070,6 +1086,8 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             nccl_port,
             target_worker,
         )
+
+        self.draft_parallel_layout = self._draft_worker.parallel_layout
 
         # Some dummy tensors
         self.num_new_pages_per_topk = torch.empty(

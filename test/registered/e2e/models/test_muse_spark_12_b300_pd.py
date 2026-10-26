@@ -11,6 +11,7 @@ import requests
 
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.spec_decoding_kit import SpecDecodingMixin
+from sglang.test.muse_spark_utils import try_cached_muse_spark_model
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
@@ -18,7 +19,6 @@ from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     _wait_for_gpu_idle_in_ci,
     is_in_ci,
-    try_cached_model,
     write_github_step_summary,
 )
 
@@ -53,12 +53,12 @@ class TestMuseSpark12B300PD(SpecDecodingMixin, PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        # Use the gated-model credential only in this test and its server children.
-        if token := os.environ.get("HF_MUSE_SPARK_TOKEN"):
+        cls.model = try_cached_muse_spark_model(MODEL_PATH)
+        # A complete local checkpoint needs no gated-model credential.
+        if cls.model == MODEL_PATH and (token := os.environ.get("HF_MUSE_SPARK_TOKEN")):
             token_env = patch.dict(os.environ, {"HF_TOKEN": token})
             token_env.start()
             cls.addClassCleanup(token_env.stop)
-        cls.model = try_cached_model(MODEL_PATH)
         cls.transfer_backend = ["--disaggregation-transfer-backend", "mooncake"]
         common_args = [
             "--quantization",
@@ -80,7 +80,7 @@ class TestMuseSpark12B300PD(SpecDecodingMixin, PDDisaggregationServerBase):
             "--speculative-algorithm",
             "DFLASH",
             "--speculative-draft-model-path",
-            try_cached_model(DRAFT_MODEL_PATH),
+            try_cached_muse_spark_model(DRAFT_MODEL_PATH, draft=True),
             "--speculative-draft-attention-backend",
             "fa4",
             "--speculative-num-draft-tokens",
