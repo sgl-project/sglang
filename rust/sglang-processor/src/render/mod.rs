@@ -28,6 +28,7 @@ use self::models::{
 pub use self::reasoning::{requested_effort, requested_thinking};
 pub use self::selection::{ChatFormatterOptions, select_chat_formatter};
 pub use self::template::TemplateArgs;
+use self::thinking::ThinkingPolicy;
 pub use self::thinking::ThinkingTemplates;
 
 /// Legacy stop strings: a single separator-style stop or a list of stops.
@@ -228,15 +229,34 @@ impl ChatFormatter {
     }
 
     /// Whether the template always reasons, as `template_detection` resolves
-    /// GLM-5.3's (`glm53_always_think`).
+    /// GLM-5.3's (`glm53_always_think`) and the Jinja templates it detects.
     pub fn always_thinks(&self) -> bool {
-        matches!(self, ChatFormatter::Glm53(_))
+        match self {
+            ChatFormatter::Glm53(_) => true,
+            ChatFormatter::HuggingFace { thinking, .. }
+            | ChatFormatter::KimiK25 { thinking, .. } => {
+                thinking.default_policy() == ThinkingPolicy::Always
+            }
+            _ => false,
+        }
     }
 
     /// The template's reasoning toggle kwarg and its default, as
-    /// `template_detection` resolves Qwen3.8's (`enable_thinking_default_true`).
+    /// `template_detection` resolves Qwen3.8's (`enable_thinking_default_true`)
+    /// and the Jinja templates it detects.
     pub fn reasoning_toggle(&self) -> Option<(&'static str, bool)> {
-        matches!(self, ChatFormatter::Qwen38 { .. }).then_some(("enable_thinking", true))
+        match self {
+            ChatFormatter::Qwen38 { .. } => Some(("enable_thinking", true)),
+            ChatFormatter::HuggingFace { thinking, .. }
+            | ChatFormatter::KimiK25 { thinking, .. } => match thinking.default_policy() {
+                ThinkingPolicy::TemplateToggle {
+                    key,
+                    default_enabled,
+                } => Some((key, default_enabled)),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     /// Resolve the template's effective thinking mode and materialize its

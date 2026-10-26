@@ -397,6 +397,30 @@ mod tests {
         );
     }
 
+    /// A template's detected toggle decides reasoning before the parser's
+    /// default: one off by default answers in `content`.
+    #[tokio::test]
+    async fn detected_template_toggle_decides_reasoning() {
+        let template = "{%- set enable_thinking = enable_thinking | default(false) -%}\
+            {% for m in messages %}{{ m.content }}{% endfor %}";
+        let formatter = checkpoint_formatter(&json!({}), template);
+        let args = ServerArgs {
+            served_model_name: "model".into(),
+            reasoning_parser: Some("qwen3".into()),
+            ..Default::default()
+        };
+        let state =
+            answering_app_state_with_item(Arc::new(args), formatter, Some(tokenizer()), |rid| {
+                chunk(rid, "Hello!", true)
+            });
+        let app = super::super::routes().with_state(state);
+        let body = json!({"model": "model", "messages": [{"role": "user", "content": "hi"}]});
+        let value = body_json(post_json(app, "/v1/chat/completions", body).await).await;
+        let message = &value["choices"][0]["message"];
+        assert_eq!(message["content"], "Hello!");
+        assert!(message["reasoning_content"].is_null(), "{value}");
+    }
+
     /// A template without a detected reasoning toggle reasons by the parser's
     /// default: Qwen3's thinks unless `enable_thinking` is false.
     #[tokio::test]
