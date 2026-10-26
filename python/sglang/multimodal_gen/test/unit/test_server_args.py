@@ -3099,6 +3099,29 @@ class TestOffloadDefaults(_CudaPlatformTestCase):
         self.assertFalse(args.vae_cpu_offload)
         self.assertEqual(args.residency_mode("vae"), LAYERWISE_OFFLOAD)
 
+    def test_minimax_h3_memory_mode_keeps_one_vae_tile_per_forward(self):
+        for pipeline_cls, mode, expected in (
+            (MiniMaxH3PipelineConfig, "speed", (64, 1)),
+            (MiniMaxH3PipelineConfig, "memory", (1, 1)),
+            (FastH3PipelineConfig, "speed", (0, 1)),
+            (FastH3PipelineConfig, "memory", (1, 1)),
+        ):
+            config = pipeline_cls()
+            self._from_dict_with_pipeline_config(
+                config,
+                kwargs={
+                    "model_path": "MiniMaxAI/MiniMax-H3",
+                    "num_gpus": 4,
+                    "ulysses_degree": 4,
+                    "performance_mode": mode,
+                },
+            )
+            self.assertEqual(
+                (config.vae_config.decoder_tile_batch, config.vae_config.window_batch),
+                expected,
+                (pipeline_cls.__name__, mode),
+            )
+
     def test_minimax_h3_rejects_explicit_cfg_parallel(self):
         with self.assertRaisesRegex(
             ValueError, "MiniMaxH3PipelineConfig does not support CFG parallelism"
@@ -3365,6 +3388,12 @@ class TestBreakableCudaGraphDefault(_CudaPlatformTestCase):
             model_path="Lightricks/LTX-2.3", ltx2_two_stage_device_mode="original"
         )
         self.assertFalse(original.enable_breakable_cuda_graph)
+
+    def test_ltx25_distilled_two_stage_serving_turns_bcg_on(self):
+        args = self._resolve(
+            model_path="Lightricks/LTX-2.5-Diffusers", enable_cfg_parallel=False
+        )
+        self.assertTrue(args.enable_breakable_cuda_graph)
 
     def test_gates_keep_unset_bcg_off(self):
         cases = {

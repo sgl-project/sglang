@@ -35,7 +35,7 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 CPU = torch.device("cpu")
 
@@ -290,6 +290,7 @@ def _prefill_graph_replay(*, ratios, seq_len):
     backend.has_c4 = 4 in ratios
     backend.has_c128 = 128 in ratios
     backend._build_forward_metadata = build_full
+    backend._prefill_graph_translates_swa_loc = lambda metadata: False
     backend._prefill_graph_tail_metadata = build_tail
     backend._activate_request_window = lambda: None
     capture = object.__new__(DSV4Metadata)
