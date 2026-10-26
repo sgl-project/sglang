@@ -84,6 +84,7 @@ _is_npu = is_npu()
 _is_cpu = is_cpu()
 _is_xpu = is_xpu()
 _is_musa = is_musa()
+
 # Under CUDA-graph capture, stage aiter custom all-gather / reduce-scatter inputs
 # through the pre-registered IPC pool instead of registering graph-pool tensors:
 # the registered path makes peers read stale data over IPC on replay (garbage
@@ -302,7 +303,6 @@ class GroupCoordinator:
         use_torch_symm_mem_all_reduce: bool,
         use_hpu_communicator: bool,
         use_xpu_communicator: bool,
-        use_npu_communicator: bool,
         use_message_queue_broadcaster: bool = False,
         group_name: Optional[str] = None,
         gloo_timeout: timedelta = timedelta(seconds=120 * 60),
@@ -331,19 +331,7 @@ class GroupCoordinator:
         # Scale cohorts create these groups without the serving ranks.
         use_local_synchronization = rank_offset > 0 and not recovered_rank
 
-        if is_cuda_alike():
-            device_id = (
-                0 if envs.SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS.get() else local_rank
-            )
-            self.device = torch.device(f"cuda:{device_id}")
-        elif _is_npu:
-            self.device = torch.device(f"npu:{local_rank}")
-        elif _is_xpu:
-            self.device = torch.device(f"xpu:{local_rank}")
-        elif _is_musa:
-            self.device = torch.device(f"musa:{local_rank}")
-        else:
-            self.device = torch.device("cpu")
+        self.device = _group_coordinator_device(local_rank)
         self.device_module = torch.get_device_module(self.device)
 
         for ranks in group_ranks:
@@ -439,7 +427,6 @@ class GroupCoordinator:
         self.use_torch_symm_mem_all_reduce = use_torch_symm_mem_all_reduce
         self.use_hpu_communicator = use_hpu_communicator
         self.use_xpu_communicator = use_xpu_communicator
-        self.use_npu_communicator = use_npu_communicator
         self.use_message_queue_broadcaster = use_message_queue_broadcaster
 
         # Lazy import to avoid documentation build error
@@ -555,9 +542,6 @@ class GroupCoordinator:
         from sglang.srt.distributed.device_communicators.hpu_communicator import (
             HpuCommunicator,
         )
-        from sglang.srt.distributed.device_communicators.npu_communicator import (
-            NpuCommunicator,
-        )
         from sglang.srt.distributed.device_communicators.xpu_communicator import (
             XpuCommunicator,
         )
@@ -569,10 +553,6 @@ class GroupCoordinator:
         self.xpu_communicator: Optional[XpuCommunicator] = None
         if use_xpu_communicator and self.world_size > 1:
             self.xpu_communicator = XpuCommunicator(group=self.device_group)
-
-        self.npu_communicator: Optional[NpuCommunicator] = None
-        if use_npu_communicator and self.world_size > 1:
-            self.npu_communicator = NpuCommunicator(group=self.device_group)
 
         # Create message queue
         from sglang.srt.distributed.device_communicators.shm_broadcast import (
@@ -733,9 +713,6 @@ class GroupCoordinator:
             inplace_all_reduce(input_, group_name=self.unique_name)
             return input_
 
-        if self.npu_communicator is not None and not self.npu_communicator.disabled:
-            return self.npu_communicator.all_reduce(input_)
-
         if torch.compiler.is_compiling():
             if self._can_use_flashinfer_allreduce(input_):
                 return flashinfer_allreduce(input_, group_name=self.unique_name)
@@ -804,17 +781,32 @@ class GroupCoordinator:
 
     def quant_all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
         """
-        User-facing quant-all-reduce function similar to all-reduce. (NPU support only)
+        User-facing quant-all-reduce function similar to all-reduce. (called when enable_quant_communications on, which NPU support only)
         """
-        # Bypass the function if we are using only 1 GPU.
         if self.world_size == 1:
             return input_
 
-        if self.npu_communicator is not None and not self.npu_communicator.disabled:
-            return self.npu_communicator.quant_all_reduce(input_)
-        else:
+        try:
+            from torch_npu import npu_dynamic_quant
+        except ImportError:
             inplace_all_reduce(input_, group_name=self.unique_name)
             return input_
+
+        # All gather is performed in low precision, but reduce in full precision.
+        input_size = input_.size()
+        x_q, scale = npu_dynamic_quant(input_, dst_type=torch.int8)
+        output_size = (input_size[0] * self.world_size,) + input_size[1:]
+        output_tensor = torch.empty(output_size, dtype=x_q.dtype, device=input_.device)
+        output_scale = torch.empty(
+            output_size[:1], dtype=scale.dtype, device=scale.device
+        )
+        all_gather_single(output_tensor, x_q, group=self.device_group)
+        all_gather_single(output_scale, scale, group=self.device_group)
+
+        output_tensor = output_tensor.to(input_.dtype) * output_scale.unsqueeze(-1).to(
+            input_.dtype
+        )
+        return output_tensor.reshape((self.world_size,) + input_size).sum(dim=0)
 
     def fused_allreduce_rmsnorm(
         self,
@@ -1150,7 +1142,7 @@ class GroupCoordinator:
                 .narrow(0, self.rank_in_group * output.numel(), output.numel())
                 .view_as(output)
             )
-        elif _is_npu or _is_cpu:
+        elif _is_cpu:
             # TODO: add optimized reduce_scatter_tensor kernel for cpu
             self._reduce_scatter_tensor(output, input)
         elif self._maybe_aiter_reduce_scatter(output, input):
@@ -1369,12 +1361,12 @@ class GroupCoordinator:
         return envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
 
     def all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
-        if _is_npu or _is_cpu:
+        if _is_cpu:
             # TODO: add optimized all_gather_into_tensor kernel for cpu
             self._all_gather_into_tensor(output, input)
         else:
-            # XPU and CUDA both go through reg_all_gather_into_tensor (custom_op) to
-            # stay opaque to Dynamo. Calling torch.distributed.all_gather_into_tensor
+            # NPU, XPU, and CUDA all go through reg_all_gather_into_tensor (custom_op)
+            # to stay opaque to Dynamo. Calling torch.distributed.all_gather_into_tensor
             # directly causes Dynamo to rewrite it as _c10d_functional.all_gather_into_tensor
             # + wait_tensor, which invokes sycl_event.wait() and breaks XPU graph capture.
             reg_all_gather_into_tensor(output, input, group_name=self.unique_name)
@@ -1412,11 +1404,6 @@ class GroupCoordinator:
         hpu_comm = self.hpu_communicator
         if hpu_comm is not None and not hpu_comm.disabled:
             return hpu_comm.all_gather(input_, dim)
-
-        # For NPUs, use NPU communicator.
-        npu_comm = self.npu_communicator
-        if npu_comm is not None and not npu_comm.disabled:
-            return npu_comm.all_gather(input_, dim)
 
         if dim < 0:
             # Convert negative dim to positive.
@@ -2122,6 +2109,24 @@ class GroupCoordinator:
             self.mq_broadcaster = None
 
 
+def _group_coordinator_device(local_rank: int) -> torch.device:
+    if is_cuda_alike():
+        device_id = (
+            0 if envs.SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS.get() else local_rank
+        )
+        return torch.device(f"cuda:{device_id}")
+    if _is_npu:
+        return torch.device(f"npu:{local_rank}")
+    if _is_xpu:
+        return torch.device(f"xpu:{local_rank}")
+    if _is_musa:
+        return torch.device(f"musa:{local_rank}")
+    platform = platforms.current_platform
+    if platform.is_out_of_tree():
+        return platform.get_group_coordinator_device(local_rank)
+    return torch.device("cpu")
+
+
 _WORLD: Optional[GroupCoordinator] = None
 
 
@@ -2146,7 +2151,6 @@ def init_world_group(
         use_torch_symm_mem_all_reduce=False,
         use_hpu_communicator=False,
         use_xpu_communicator=False,
-        use_npu_communicator=False,
         group_name="world",
         recovered_rank=recovered_rank,
         max_world_size=max_world_size,
@@ -2173,21 +2177,22 @@ def init_model_parallel_group(
         use_mscclpp = _ENABLE_MSCCLPP
     if use_torch_symm_mem_allreduce is None:
         use_torch_symm_mem_allreduce = _ENABLE_TORCH_SYMM_MEM_ALL_REDUCE
+    if use_pynccl is None:
+        platform = platforms.current_platform
+        if platform.is_out_of_tree() and not platform.capabilities.supports_pynccl:
+            use_pynccl = False
+        else:
+            use_pynccl = not (_is_npu or _is_xpu or backend == "mooncake")
     return GroupCoordinator(
         group_ranks=group_ranks,
         local_rank=local_rank,
         torch_distributed_backend=backend,
-        use_pynccl=(
-            not (_is_npu or _is_xpu or backend == "mooncake")
-            if use_pynccl is None
-            else use_pynccl
-        ),
+        use_pynccl=use_pynccl,
         use_mscclpp=use_mscclpp,
         use_custom_allreduce=use_custom_allreduce,
         use_torch_symm_mem_all_reduce=use_torch_symm_mem_allreduce,
         use_hpu_communicator=True,
         use_xpu_communicator=True,
-        use_npu_communicator=True,
         use_message_queue_broadcaster=use_message_queue_broadcaster,
         group_name=group_name,
         recovered_rank=recovered_rank,

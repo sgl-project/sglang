@@ -103,6 +103,7 @@ def run_encoder_swa_replay(worker, batch):
     rows = _reset_windows_and_collect_hits(batch=batch, window=window)
     if not rows:
         return
+    assert batch.engram_staged_rows is None, "staged engram rows need a folded replay"
     # One forward replays every hitting request; each request's window is
     # floored at its own start, so the result matches per-request replays.
     replay = _build_replay_batch(batch=batch, runner=runner, rows=rows)

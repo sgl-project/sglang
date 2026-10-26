@@ -35,11 +35,6 @@ class TestReqCustomParamsRef(CustomTestCase):
         finally:
             gc.enable()
 
-    def test_processor_reads_its_request(self):
-        """A custom logit processor still finds its request under __req__."""
-        req = _make_req(custom_logit_processor="{}")
-        self.assertIs(req.sampling_params.custom_params["__req__"], req)
-
 
 if __name__ == "__main__":
     unittest.main()

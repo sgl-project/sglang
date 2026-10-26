@@ -488,6 +488,23 @@ def linear_attn_tp_size() -> int:
     return getattr(get_parallel(), f"{linear_attn_parallel_group()}_size")
 
 
+def draft_attn_parallel_group() -> str:
+    """The group an attention-owning draft uses, resolved in the target scope.
+
+    With CP and no attention DP, the draft runs on full TP without CP.
+    Otherwise it stays within attention TP, preserving independent DP drafts.
+    """
+    parallel = get_parallel()
+    return (
+        "tp" if parallel.attn_cp_size > 1 and parallel.attn_dp_size == 1 else "attn_tp"
+    )
+
+
+def draft_attn_tp_size() -> int:
+    """The width of ``draft_attn_parallel_group()`` in the target scope."""
+    return getattr(get_parallel(), f"{draft_attn_parallel_group()}_size")
+
+
 class _FlagGroupBase(msgspec.Struct):
     """Shared flag-group behavior: typo-safe writes + transactional ``override()``.
 
@@ -582,6 +599,9 @@ class DpFlags(_FlagGroupBase):
     # gather/scatter helpers, whose captured geometry needs one shared bucket.
     capturing_prefill_graph: bool = False
     prefill_graph_has_dp_gather: bool = False
+    # Set during prefill-graph capture by breaks that capture graphs of their own
+    # behind TP-group barriers; every DP rank must then take the same path.
+    prefill_graph_has_rank_barrier: bool = False
     # This process's slot in the target's DP sync while a draft scope narrows
     # attention; dp_gather_width() also reads it as the in-scope marker.
     scoped_gather_slot: Optional[int] = None

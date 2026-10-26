@@ -11,7 +11,10 @@ from typing import Optional, Tuple
 import msgspec
 import torch
 
-from sglang.srt.layers.attention.qsa.kernel import qsa_fast_topk
+from sglang.srt.layers.attention.qsa.kernel import (
+    gather_qsa_compressed_keys,
+    qsa_fast_topk,
+)
 from sglang.srt.mem_cache.qsa_kv_pool import (
     QSACompressedBlockSharding,
     assert_qsa_indices_in_bounds,
@@ -152,7 +155,7 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
     extend_rope_matrix: Optional[torch.Tensor] = None
     graph_ring_group_locs: Optional[torch.Tensor] = None
     defer_block_expansion: bool = False
-    # Scheduler lengths for the breakable prefill indexer.
+    # Host copy of the extend sequence_lengths; lets prefill MQA skip a device sync.
     prefill_sequence_lengths_cpu: Optional[Tuple[int, ...]] = None
 
     def get_seqlens_int32(self) -> torch.Tensor:
@@ -212,28 +215,11 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
                 0, self.prefill_cache_indices
             )
         else:
-            parts: list[torch.Tensor] = []
             sequence_lengths_list = self.prefill_sequence_lengths_cpu
             if sequence_lengths_list is None:
                 sequence_lengths_list = sequence_lengths.tolist()
-            for sequence_id in range(len(sequence_lengths_list)):
-                complete_blocks = int(sequence_lengths_list[sequence_id]) // ratio
-                if complete_blocks == 0:
-                    continue
-                compressed_locs = (
-                    self.token_slot_table[
-                        sequence_id, : complete_blocks * ratio : ratio
-                    ].long()
-                    // ratio
-                )
-                parts.append(compressed_buffer.index_select(0, compressed_locs))
-            compressed_keys = (
-                torch.cat(parts, dim=0)
-                if parts
-                else compressed_buffer.new_empty(
-                    (0, pool.qsa_index_kv_heads, pool.qsa_index_head_dim)
-                )
-            )
+            complete_blocks = [int(length) // ratio for length in sequence_lengths_list]
+            compressed_keys = None
         if query_sequence_ids is None:
             query_sequence_ids = self.token_to_batch_idx
         num_valid_tokens = query_sequence_ids.numel()
@@ -244,13 +230,24 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
             )
         positions = positions[:num_valid_tokens]
         if self.prefill_lengths is None:
-            row_starts, row_ends, _ = build_qsa_row_ranges(
+            row_starts, row_ends, compressed_cu_seqlens = build_qsa_row_ranges(
                 sequence_lengths,
                 positions.to(sequence_lengths.device),
                 query_sequence_ids.to(sequence_lengths.device),
                 self.compress_ratio,
             )
+            if compressed_keys is None:
+                compressed_keys = gather_qsa_compressed_keys(
+                    compressed_buffer,
+                    self.token_slot_table,
+                    compressed_cu_seqlens,
+                    sum(complete_blocks),
+                    max(complete_blocks, default=0),
+                    ratio,
+                )
         else:
+            if compressed_keys is None:
+                raise RuntimeError("QSA local prefill cache indices are missing")
             cumulative = torch.nn.functional.pad(
                 self.prefill_lengths.to(torch.int32).cumsum(0), (1, 0)
             ).to(torch.int32)

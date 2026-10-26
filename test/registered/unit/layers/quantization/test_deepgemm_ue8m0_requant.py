@@ -202,12 +202,11 @@ class TestDeepGemmUE8M0Requant(CustomTestCase):
         requant.assert_called_once()
 
     def test_fp8_moe_requants_standard_layer_for_deepgemm(self):
-        method = fp8_quant.Fp8MoEMethod.__new__(fp8_quant.Fp8MoEMethod)
-        method.convert_mxfp8_to_block = False
-        method.use_mxfp8 = False
-        method.is_fp4_expert = False
-        method.dequant_fp4_to_fp8 = False
-        method.quant_config = unittest.mock.Mock(weight_block_size=BLOCK_SIZE)
+        method = fp8_quant.Fp8MoEMethod(
+            fp8_quant.Fp8Config(
+                is_checkpoint_fp8_serialized=True, weight_block_size=BLOCK_SIZE
+            )
+        )
 
         layer = torch.nn.Module()
         layer.w13_weight, layer.w13_weight_scale_inv = _make_params()
