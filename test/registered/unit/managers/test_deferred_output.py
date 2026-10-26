@@ -48,6 +48,7 @@ def _scheduler():
     scheduler.hisparse_coordinator = None
     scheduler.collect_inflight_reqs = lambda: set()
     scheduler.ipc_channels = Mock()
+    scheduler.rust_server = None
     streamer = object.__new__(SchedulerOutputStreamer)
     streamer.is_generation = True
     streamer.defer_outputs = False
@@ -106,8 +107,12 @@ def test_defer_response_rejects_invalid_ownership(invalid):
 
 
 @pytest.mark.parametrize("cancelled", [False, True])
-def test_failed_completion_releases_an_error_response(cancelled):
+@pytest.mark.parametrize("rust_frontend", [False, True], ids=["zmq", "rust"])
+def test_failed_completion_releases_an_error_response(cancelled, rust_frontend):
+    """Failed publication reaches the active frontend, including Rust egress."""
     scheduler, req, completion = _scheduler(), _req("failed"), Future()
+    if rust_frontend:
+        scheduler.rust_server = Mock()
     scheduler.defer_response(req, completion)
     if cancelled:
         completion.cancel()
@@ -119,7 +124,11 @@ def test_failed_completion_releases_an_error_response(cancelled):
         scheduler.stream_released_deferred_outputs()
 
     stream.assert_not_called()
-    send = scheduler.ipc_channels.send_to_tokenizer.send_output
+    send = (
+        scheduler.rust_server.push_abort
+        if rust_frontend
+        else scheduler.ipc_channels.send_to_tokenizer.send_output
+    )
     send.assert_called_once()
     abort, sent_req = send.call_args.args
     assert sent_req is req and abort.rid == req.rid
@@ -130,8 +139,12 @@ def test_failed_completion_releases_an_error_response(cancelled):
 
 
 @pytest.mark.parametrize("abort_all", [False, True])
-def test_abort_cancels_only_matching_held_responses(abort_all):
+@pytest.mark.parametrize("rust_frontend", [False, True], ids=["zmq", "rust"])
+def test_abort_cancels_only_matching_held_responses(abort_all, rust_frontend):
+    """Cancellation retires matching responses through the active frontend."""
     scheduler = _scheduler()
+    if rust_frontend:
+        scheduler.rust_server = Mock()
     scheduler.mm_receiver = None
     scheduler.dllm_config = None
     scheduler.grammar_manager = Mock()
@@ -149,7 +162,12 @@ def test_abort_cancels_only_matching_held_responses(abort_all):
     ]
     assert [req.defer_output for req in reqs] == [False, not abort_all]
     assert scheduler.has_pending_deferred_outputs() is (not abort_all)
-    sent = scheduler.ipc_channels.send_to_tokenizer.send_output.call_args_list
+    send = (
+        scheduler.rust_server.push_abort
+        if rust_frontend
+        else scheduler.ipc_channels.send_to_tokenizer.send_output
+    )
+    sent = send.call_args_list
     assert [args[0].rid for args, _ in sent] == [
         req.rid for req in reqs[: 2 if abort_all else 1]
     ]

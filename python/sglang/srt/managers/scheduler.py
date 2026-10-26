@@ -2693,7 +2693,7 @@ class Scheduler(
     ) -> None:
         req.defer_output = False
         req.finished_output = True
-        self.ipc_channels.send_to_tokenizer.send_output(
+        self.send_abort_output(
             _make_abort_req(req, finished_reason=finished_reason), req
         )
 
