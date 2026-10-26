@@ -1032,29 +1032,27 @@ class VisionIntelXPUAttention(nn.Module):
         cu_seqlens_source = cu_seqlens
         cu_seqlens = resolve_seqlens(cu_seqlens_source, bsz, seq_len, device=q.device)
         cu_seqlens = cu_seqlens.to(dtype=torch.int32).to(q.device)
-        max_seqlen = resolve_max_seqlen(cu_seqlens_source, cu_seqlens)
+        seqused = None
+        if bsz > 1 and cu_seqlens.numel() == bsz + 1:
+            # rows are padded per image to seq_len while cu_seqlens holds the real lengths
+            seqused = cu_seqlens[1:] - cu_seqlens[:-1]
+            cu_seqlens = _get_cu_seqlens_for_shape(bsz, seq_len, device=q.device)
+            max_seqlen = seq_len
+        else:
+            max_seqlen = resolve_max_seqlen(cu_seqlens_source, cu_seqlens)
 
         fa_kwargs = dict(
             cu_seqlens_q=cu_seqlens,
             cu_seqlens_k=cu_seqlens,
             max_seqlen_q=max_seqlen,
             max_seqlen_k=max_seqlen,
+            seqused_q=seqused,
+            seqused_k=seqused,
             softmax_scale=softmax_scale,
             window_size=window_size,
         )
         if s_aux is not None:
             fa_kwargs["sinks"] = s_aux
-        if bsz > 1 and q.shape[0] != int(cu_seqlens[-1]):
-            # rows are padded per image to seq_len while cu_seqlens holds the real lengths
-            seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-            valid = (
-                torch.arange(seq_len, device=q.device)[None] < seq_lens[:, None]
-            ).flatten()
-            output = q.new_zeros(q.shape[0], q.shape[1], v.shape[-1])
-            output[valid] = flash_attn_varlen_func(
-                q[valid], k[valid], v[valid], **fa_kwargs
-            )
-            return output
         output = flash_attn_varlen_func(q, k, v, **fa_kwargs)
 
         return output
