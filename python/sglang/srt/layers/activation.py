@@ -163,6 +163,11 @@ class SiluAndMul(BaseFusedOp):
         else:
             return self.forward_native(x)
 
+    def forward_mlu(self, x: torch.Tensor) -> torch.Tensor:
+        import torch_mlu_ops
+
+        return torch_mlu_ops.active(input=x, act_mode="silu", is_gated=True)
+
     def forward_npu(self, x: torch.Tensor) -> torch.Tensor:
         out = torch_npu.npu_swiglu(x)
         return out

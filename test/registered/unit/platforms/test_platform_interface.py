@@ -21,6 +21,7 @@ from sglang.srt.platforms.device_mixin import (
     PlatformEnum,
 )
 from sglang.srt.platforms.interface import SRTPlatform
+from sglang.srt.platforms.mlu import MluSRTPlatform
 from sglang.srt.platforms.mps import MpsSRTPlatform
 from sglang.srt.platforms.npu import NPUSRTPlatform
 from sglang.srt.platforms.rocm import RocmSRTPlatform
@@ -95,6 +96,7 @@ _PLATFORM_IDENTITY = [
     (PlatformEnum.XPU, "xpu", "xpu", "is_xpu"),
     (PlatformEnum.MUSA, "musa", "musa", "is_musa"),
     (PlatformEnum.NPU, "npu", "npu", "is_npu"),
+    (PlatformEnum.MLU, "mlu", "mlu", "is_mlu"),
     (PlatformEnum.TPU, "tpu", "tpu", "is_tpu"),
     (PlatformEnum.MPS, "mps", "mps", "is_mps"),
 ]
@@ -104,6 +106,7 @@ _CUDA_ALIKE = [
     (PlatformEnum.CUDA, "cuda", "cuda", True),
     (PlatformEnum.ROCM, "rocm", "hip", True),
     (PlatformEnum.MUSA, "musa", "musa", True),
+    (PlatformEnum.MLU, "mlu", "mlu", False),
     (PlatformEnum.CPU, "cpu", "cpu", False),
     (PlatformEnum.NPU, "npu", "npu", False),
 ]
@@ -530,6 +533,7 @@ class TestMpsDeviceMixin(CustomTestCase):
 
         with (
             patch.object(common, "is_mps", return_value=True),
+            patch.object(common, "is_mlu", return_value=False),
             patch.object(common, "is_cuda", return_value=False),
             patch.object(common, "is_hip", return_value=False),
             patch.object(common, "is_cpu", return_value=False),
@@ -609,6 +613,63 @@ class TestMusaAvailableMemory(CustomTestCase):
                             clear_cache.assert_called_once_with(musa)
                         else:
                             clear_cache.assert_not_called()
+
+
+class TestMluSRTPlatform(CustomTestCase):
+    """Tests for MLU platform defaults that do not require MLU hardware."""
+
+    def test_mlu_platform_backend_defaults(self):
+        base = MluSRTPlatform()
+        self.assertEqual(base.get_dispatch_key_name(), "mlu")
+        self.assertEqual(base.get_torch_distributed_backend_str(), "cncl")
+
+    def test_mlu_pin_memory_available_for_mlu_targets(self):
+        base = MluSRTPlatform()
+        self.assertTrue(base.is_pin_memory_available())
+        self.assertTrue(base.is_pin_memory_available(device="mlu"))
+        self.assertFalse(base.is_pin_memory_available(device="cpu"))
+
+    def test_runtime_defaults_are_resolution_declarations(self):
+        from sglang.srt.arg_groups.overrides import (
+            record_foreign_defaults,
+            resolved_view,
+        )
+        from sglang.srt.server_args import ServerArgs
+
+        args = ServerArgs(model_path="unused", device="mlu")
+        record_foreign_defaults(
+            args, "platform:mlu", MluSRTPlatform().apply_server_args_defaults
+        )
+        effective = resolved_view(args)
+        self.assertEqual(effective.attention_backend, "mlu")
+        self.assertEqual(effective.prefill_attention_backend, "mlu")
+        self.assertEqual(effective.decode_attention_backend, "mlu")
+        self.assertEqual(effective.sampling_backend, "pytorch")
+        self.assertEqual(effective.page_size, 16)
+        self.assertTrue(effective.disable_custom_all_reduce)
+        # The startup record continues to describe the operator's raw input.
+        self.assertIsNone(args.attention_backend)
+        self.assertIsNone(args.page_size)
+        self.assertFalse(args.disable_custom_all_reduce)
+
+    def test_unsupported_runtime_settings_fail_during_resolution(self):
+        from sglang.srt.arg_groups.overrides import record_foreign_defaults
+        from sglang.srt.server_args import ServerArgs
+
+        for fields in (
+            {"attention_backend": "triton"},
+            {"sampling_backend": "flashinfer"},
+            {"quantization": "awq"},
+            {"speculative_algorithm": "EAGLE"},
+        ):
+            with self.subTest(fields=fields):
+                args = ServerArgs(model_path="unused", device="mlu", **fields)
+                with self.assertRaisesRegex(ValueError, "MLU"):
+                    record_foreign_defaults(
+                        args,
+                        "platform:mlu",
+                        MluSRTPlatform().apply_server_args_defaults,
+                    )
 
 
 class TestPinMemoryAvailability(CustomTestCase):

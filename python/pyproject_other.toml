@@ -170,6 +170,14 @@ srt_sail = [
   "triton-for-sail",
 ]
 
+# Keep vendor pins in sync with scripts/ci/mlu/component_versions.properties.
+srt_mlu = [
+  "sglang[runtime_common]",
+  "torch-mlu==1.34.1+torch2.13.0",
+  "torch-mlu-ops==1.13.0+torch2.13.0",
+  "triton==3.4.0+mlu2.1.3",
+]
+
 # https://docs.sglang.io/platforms/mthreads_gpu.md
 srt_musa = [
   "apache-tvm-ffi==0.1.11.post1+musa.1",
@@ -245,6 +253,7 @@ all_hip_rocm724 = ["sglang[diffusion_hip]", "sglang[srt_hip_rocm724]", "sglang[t
 all_hip_rocm101 = ["sglang[diffusion_hip]", "sglang[srt_hip_rocm101]", "sglang[tracing]"]
 all_hpu = ["sglang[srt_hpu]"]
 all_sail = ["sglang[srt_sail]"]
+all_mlu = ["sglang[srt_mlu]", "sglang[tracing]"]
 all_musa = ["sglang[diffusion_musa]", "sglang[srt_musa]"]
 all_mps = ["sglang[diffusion_mps]", "sglang[srt_mps]"]
 
@@ -253,6 +262,7 @@ dev_hip_rocm724 = ["sglang[all_hip_rocm724]", "sglang[test]"]
 dev_hip_rocm101 = ["sglang[all_hip_rocm101]", "sglang[test]"]
 dev_hpu = ["sglang[all_hpu]", "sglang[test]"]
 dev_sail = ["sglang[all_sail]", "sglang[test]"]
+dev_mlu = ["sglang[all_mlu]", "sglang[test]"]
 dev_musa = ["sglang[all_musa]", "sglang[test]"]
 dev_mps = ["sglang[all_mps]", "sglang[test]"]
 
