@@ -1,33 +1,21 @@
-"""Tree-aware ``sparse_indices`` construction for DSA attention on Ascend.
+"""Tree-aware sparse_indices for DSA attention on Ascend.
 
-GLM-5.2 runs DeepSeek Sparse Attention on every attention layer: instead of a
-mask, ``npu_sparse_flash_attention`` receives ``sparse_indices[T, K]`` — an
-explicit list of KV positions each query token may read. Tree verify therefore
-encodes the topology *in the index list*:
+GLM-5.2 runs DeepSeek Sparse Attention on every layer: instead of a mask,
+npu_sparse_flash_attention takes sparse_indices[T, K], an explicit list of KV
+positions each query may read. A tree is therefore expressed in that list:
 
-    row_r = [ ancestors(r) | prefix top-* (score order) | -1 padding ]
+    row = [ ancestors | prefix top-* (score order) | -1 padding ]
 
-Why this shape
---------------
-* **Ancestors first.** ``sparse_mode=3`` bounds the row by
-  ``j <= (L_kv - L_q) + i`` and the kernel stops scanning after
-  ``min(K, L_kv - L_q + i + 1)`` entries; a short context therefore truncates
-  the tail. Putting ancestors first keeps them.
-* **No sorting.** SFA does not require ascending indices (its own tests feed
-  ``randperm``); sorting would push ancestors (larger positions) into the
-  truncated tail.
-* **No duplicate positions.** The kernel scans the list verbatim — there is no
-  uniqueness check (``sparse_flash_attention_kernel_mla.h`` only stops at
-  ``-1``), and ``sparse_block_size`` is 1, so a repeated position is read twice
-  and double-counts in the softmax *and* eats the causal budget. Every row is
-  therefore built by shifting the prefix block left by the row's own ancestor
-  count instead of padding the ancestor block with the node itself.
-* **``-1`` only in the tail.** The kernel stops at the first ``-1``; valid
-  values must all precede the padding. The prefix block keeps its own (already
-  tail-aligned) ``-1`` padding, and the slack after it is ``-1`` too, so the
-  whole row stays "valid... valid, -1... -1".
+Four properties the SFA kernel forces:
 
-Pure torch, no ``torch_npu`` import: unit-testable on CPU.
+* ancestors first, because sparse_mode=3 truncates the row tail when the causal
+  budget is short;
+* no sorting, for the same reason: sorting pushes large positions into the tail;
+* no repeated position: the kernel has no uniqueness check and reads the list
+  verbatim, so a repeat double-counts in the softmax and eats the budget;
+* -1 only in the tail, since the scan stops at the first one.
+
+Pure torch (no torch_npu), so the geometry stays unit-testable on CPU.
 """
 
 from __future__ import annotations
@@ -42,11 +30,15 @@ __all__ = [
     "draft_ancestors",
     "draft_step_ancestor_positions",
     "merge_tree_sparse_indices",
-    "parent_slots_from_parents_list",
     "DraftTreeSparseState",
     "DRAFT_TREE_ANCESTORS_ATTR",
     "DRAFT_TREE_PREFIX_ATTR",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Verify tree: one row per query token of the draft block.
+# ---------------------------------------------------------------------------
 
 
 def ancestor_width_for(num_steps: int, num_verify_tokens: Optional[int] = None) -> int:
@@ -264,6 +256,11 @@ def merge_tree_sparse_indices(
     return merged.to(torch.int32)
 
 
+# ---------------------------------------------------------------------------
+# Draft tree: one row per candidate of a single draft step.
+# ---------------------------------------------------------------------------
+
+
 def draft_step_ancestor_positions(
     paths: Optional[torch.Tensor],
     parent_slot: Optional[torch.Tensor],
@@ -373,7 +370,7 @@ DRAFT_TREE_ANCESTORS_ATTR = "npu_draft_tree_ancestors"
 DRAFT_TREE_PREFIX_ATTR = "npu_draft_tree_prefix_len"
 
 
-def parent_slots_from_parents_list(
+def _parent_slots_from_parents_list(
     parents: torch.Tensor,
     step: int,
     topk: int,
@@ -485,7 +482,7 @@ class DraftTreeSparseState:
         if step == 0:
             parent_slot = None
         else:
-            parent_slot = parent_slots_from_parents_list(
+            parent_slot = _parent_slots_from_parents_list(
                 parents_list[step], step, self.topk, check=validate
             )
 

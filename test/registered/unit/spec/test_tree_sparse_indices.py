@@ -37,7 +37,6 @@ try:  # normal path (Linux CI, sglang installed / PYTHONPATH=python)
         draft_step_ancestor_positions,
         gather_tree_blocks,
         merge_tree_sparse_indices,
-        parent_slots_from_parents_list,
     )
 except Exception:  # Windows dev boxes cannot import sglang (stdlib `resource`)
     _MODULE = (
@@ -56,7 +55,6 @@ except Exception:  # Windows dev boxes cannot import sglang (stdlib `resource`)
     ancestor_width_for = _mod.ancestor_width_for
     draft_ancestors = _mod.draft_ancestors
     draft_step_ancestor_positions = _mod.draft_step_ancestor_positions
-    parent_slots_from_parents_list = _mod.parent_slots_from_parents_list
     DraftTreeSparseState = _mod.DraftTreeSparseState
     DRAFT_TREE_ANCESTORS_ATTR = _mod.DRAFT_TREE_ANCESTORS_ATTR
     DRAFT_TREE_PREFIX_ATTR = _mod.DRAFT_TREE_PREFIX_ATTR
@@ -522,38 +520,6 @@ class TestDraftStepAncestorPositions(unittest.TestCase):
             )
 
 
-class TestParentSlotsFromParentsList(unittest.TestCase):
-    def test_recovers_parent_slots_from_the_offset_row(self):
-        topk, step = 3, 2
-        offset = topk * topk * (step - 1) + topk  # 12
-        flat = torch.tensor([[0, 4, 2], [7, 1, 3]])
-
-        got = parent_slots_from_parents_list(flat + offset, step, topk)
-
-        self.assertEqual(got.tolist(), [[0, 1, 0], [2, 0, 1]])
-        self.assertEqual(got.dtype, torch.int32)
-
-    def test_step1_offset(self):
-        # step 1 -> offset = topk * topk * 0 + topk = 2
-        got = parent_slots_from_parents_list(torch.tensor([[2, 3]]), 1, 2)
-        self.assertEqual(got.tolist(), [[0, 0]])
-        got = parent_slots_from_parents_list(torch.tensor([[3, 2]]), 1, 2)
-        self.assertEqual(got.tolist(), [[0, 0]])
-
-    def test_rejects_out_of_range(self):
-        # step 2, topk 2 -> offset 6, so an unshifted row goes negative.
-        with self.assertRaises(ValueError):
-            parent_slots_from_parents_list(torch.tensor([[0, 1]]), 2, 2)
-
-    def test_rejects_bad_step_and_shape(self):
-        with self.assertRaises(ValueError):
-            parent_slots_from_parents_list(torch.zeros((1, 2)), 0, 2)
-        with self.assertRaises(ValueError):
-            parent_slots_from_parents_list(torch.zeros((1, 3)), 1, 2)
-        with self.assertRaises(ValueError):
-            parent_slots_from_parents_list(torch.zeros(4), 1, 2)
-
-
 class TestDraftTreeSparseState(unittest.TestCase):
     def _batch(self, prefix=10):
         import types
@@ -599,6 +565,13 @@ class TestDraftTreeSparseState(unittest.TestCase):
         parents = [torch.zeros((2, 3), dtype=torch.long)]
         pos = state.begin_step(0, fb, parents)
         self.assertEqual(pos.tolist(), [[[10], [11]], [[20], [21]]])
+
+    def test_rejects_a_parent_row_without_the_step_offset(self):
+        # Step 1 shifts the flat score index by 	opk; a raw index decodes negative.
+        state = DraftTreeSparseState(2, 2)
+        parents = [torch.zeros((1, 3)), torch.tensor([[0, 1]])]
+        with self.assertRaises(ValueError):
+            state.begin_step(1, self._batch(), parents)
 
     def test_rejects_bad_step(self):
         state = DraftTreeSparseState(2, 2)
