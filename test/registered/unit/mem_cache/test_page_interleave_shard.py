@@ -2158,6 +2158,36 @@ class TestRotationPhase(_TreeCoreBackendCase):
         _insert(tree, list(range(8)))
         self.assertIsNone(self._phase(tree, list(range(8))))
 
+    def test_backup_passes_owner_only_for_sharded_nodes(self):
+        for owner, kwargs in (
+            (None, {}),
+            (0, {"start_owner": 0}),
+            (2, {"start_owner": 2}),
+        ):
+            with self.subTest(owner=owner):
+                tree = _unified_tree()
+                tokens = list(range(PS))
+                _insert(tree, tokens, rotation_base=owner)
+                node = tree.match_prefix(
+                    MatchPrefixParams(key=RadixKey(array("q", tokens)))
+                ).last_device_node
+                value = torch.arange(PS)
+                write = unittest.mock.Mock(return_value=value)
+                tree.cache_controller = SimpleNamespace(
+                    write=write,
+                    mem_pool_host=SimpleNamespace(
+                        anchor_entry=SimpleNamespace(
+                            host_pool=SimpleNamespace(shared_allocation_domain=None),
+                            host_evict_fn=None,
+                        ),
+                        available_size=lambda: PS,
+                    ),
+                )
+                tree._execute_kv_backup(node, value, {}, [])
+                write.assert_called_once_with(
+                    value, node_id=node, extra_pools=None, flush=False, **kwargs
+                )
+
 
 class TestGatherWaitsForLayerLoad(CustomTestCase):
     """A HiCache load-back writes pool rows on its own stream; the gather

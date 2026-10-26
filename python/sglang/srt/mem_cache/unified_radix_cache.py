@@ -1749,14 +1749,16 @@ class UnifiedRadixCache(BasePrefixCache):
                     return None
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
+        # Preserve the ordinary controller API when no shard owner is present.
+        start_owner = self.tree_core.rotation_phase_of(node_id)
+        shard_kwargs = {} if start_owner is None else {"start_owner": start_owner}
         # Defer submission so the next flush can merge pending node backups.
         return self.cache_controller.write(
             device_value,
             node_id=node_id,
             extra_pools=aux_xfers or None,
             flush=False,
-            # KV sharding: host slots follow the owners of the device pages.
-            start_owner=self.tree_core.rotation_phase_of(node_id),
+            **shard_kwargs,
         )
 
     def _track_write_through_node(
