@@ -44,6 +44,7 @@ class DSparkReferenceDriver:
         self.processing = None
         self.failure = None
         self.owner = None
+        self._native_dp_rank = None
         self.retired_request_ids = set()
         self.callback_wall_seconds = 0.0
 
@@ -103,18 +104,26 @@ class DSparkReferenceDriver:
         """Bind the actual local group even before the first nonempty selection."""
         _require(type(rank) is int and rank in (0, 1), "invalid local DP rank")
         ledger = self.adapter.ledger
-        if ledger.local_attention_dp_rank != rank:
+        _require(
+            self._native_dp_rank is None
+            or self._native_dp_rank == rank == ledger.local_attention_dp_rank,
+            "reference local DP owner changed during its run",
+        )
+        if self._native_dp_rank is None:
             _require(
-                self.owner is None
+                self.selection is None
+                and self.processing is None
                 and not ledger.requests
                 and not ledger.pending
                 and ledger.prepared is None
                 and ledger.last_forward_id == -1,
                 "reference local DP owner changed during its run",
             )
-            self.adapter = replace(
-                self.adapter, ledger=replace(ledger, local_attention_dp_rank=rank)
-            )
+            if ledger.local_attention_dp_rank != rank:
+                self.adapter = replace(
+                    self.adapter, ledger=replace(ledger, local_attention_dp_rank=rank)
+                )
+            self._native_dp_rank = rank
 
     def _selection(
         self, scheduler, batch, *, prior_requests=(), before=None, peer_context=None

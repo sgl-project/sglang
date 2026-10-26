@@ -18,21 +18,18 @@ from sglang_simulator.simulation.sglang.dspark import STEP_ATTRIBUTE
 from sglang_simulator.time_predictor.base import PredictorError
 from sglang_simulator.time_predictor.infercast_dspark import _native_joint_runtime
 from test_dspark_hybrid import joint_case as joint_case
-from test_dspark_joint_execution import (  # noqa: F401 - pytest fixture
-    case as joint_geometry,
-)
+from test_dspark_joint_execution import case as _joint_geometry
 from test_dspark_native_peer_transactions import (
     both,
     native_batch,
-)
-from test_dspark_native_peer_transactions import owners as owners
-from test_dspark_native_peer_transactions import (
     passed,
     process,
 )
+from test_dspark_native_peer_transactions import owners as owners
 from test_dspark_reference import native_page_sizing
 
 _sampling_snapshot = adapter.sampling_snapshot
+joint_geometry = _joint_geometry
 pytestmark = pytest.mark.usefixtures(native_page_sizing.__name__)
 
 
@@ -210,7 +207,12 @@ def test_selected_then_worker_entry_uses_one_joint_umd_and_local_results(
     routed, counts
 ):
     runs, call = routed
-    # A first empty poll must bind DP1 before installing its scheduler owner.
+    # The real overlap loop binds its scheduler before the first selection.
+    # Attention TP rank is singleton zero on BOTH schedulers, but DP1 owns its
+    # actual local group1 rather than the new ledger's unbound default group0.
+    for run in runs:
+        run.driver.bind(run.scheduler)
+        assert run.parallel.attn_tp_rank == 0
     passed(call(lambda run: run.driver.selected(run.scheduler, None)))
     assert [r.driver.adapter.ledger.local_attention_dp_rank for r in runs] == [0, 1]
     first = batches_for(runs, counts)

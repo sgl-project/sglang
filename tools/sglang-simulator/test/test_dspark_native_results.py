@@ -151,7 +151,7 @@ from sglang.srt.managers.scheduler_components.batch_result_processor import Sche
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.runtime_context import publish
+from sglang.srt.runtime_context import get_parallel, publish
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
@@ -163,6 +163,7 @@ from sglang_simulator.simulation.sglang.dspark import (
     DSparkStepTiming, DSparkTopology,
 )
 from sglang_simulator.simulation.sglang.dspark_reference import ReferenceCPUView
+from sglang_simulator.simulation.sglang.dspark_reference_driver import DSparkReferenceDriver
 from sglang_simulator.simulation.sglang.dspark_runtime import DSparkNativeRuntime
 from sglang_simulator.simulation.sglang.req_stats_manager import request_stats_manager
 from sglang_simulator.simulation.sglang.scheduler import C_SchedulerHook as Hook
@@ -279,6 +280,27 @@ for name, value in dict(
 ).items():
     setattr(scheduler, name, value)
 scheduler.future_map = FutureMap(torch.device('cpu'), algo, pool, needs_cpu_seq_lens=True)
+# Use the real native parallel context and Scheduler object, without creating a
+# process group or claiming peer communication. Both local attention groups are
+# singleton TP0; their independently supplied attention-DP ranks remain0/1.
+for rank in (0, 1):
+    with get_parallel().override(tp_size=2, attn_dp_size=2, attn_tp_size=1,
+                                 attn_cp_size=1, attn_cp_rank=0, moe_ep_size=1,
+                                 moe_dp_size=1, moe_tp_size=2, tp_rank=rank,
+                                 attn_dp_rank=rank, attn_tp_rank=0):
+        local_driver = DSparkReferenceDriver(runtime)
+        local_driver.bind(scheduler)
+        assert get_parallel().attn_tp_rank == 0
+        local_driver.bind_native_dp_rank(get_parallel().attn_dp_rank)
+        assert local_driver.owner is scheduler
+        assert local_driver.adapter.ledger.local_attention_dp_rank == rank
+        local_driver.drained_reset()
+        try:
+            local_driver.bind_native_dp_rank(1 - rank)
+        except PredictorError:
+            pass
+        else:
+            raise AssertionError('native local rank changed after binding/reset')
 worker = DSparkWorkerV2.__new__(DSparkWorkerV2)
 worker.query_token_num, worker.verify_num_draft_tokens = 5, 6
 # Native __getattr__ delegates optional resource hooks to this owning target.

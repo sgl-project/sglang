@@ -130,6 +130,57 @@ def process(run, current, result, *, finish=False):
     run.driver.after_result()
 
 
+@pytest.mark.parametrize("rank", [0, 1])
+def test_native_rank_binds_after_scheduler_before_work(run, hooked_scheduler, rank):
+    # The overlap-loop hook owns the Scheduler before its first empty poll.
+    hooked_scheduler.predictor.dspark_runtime = run.runtime
+    run.scheduler = hooked_scheduler.target
+    run.scheduler.enable_overlap = True
+    assert run.scheduler.event_loop_overlap() == "native overlap"
+    run.driver.bind_native_dp_rank(rank)
+    bound = run.driver.adapter
+    assert run.driver.owner is run.scheduler
+    assert bound.ledger.local_attention_dp_rank == rank
+    run.driver.bind_native_dp_rank(rank)
+    assert run.driver.adapter is bound
+    run.driver.drained_reset()
+    run.driver.bind_native_dp_rank(rank)
+    with pytest.raises(PredictorError, match="local DP owner changed"):
+        run.driver.bind_native_dp_rank(1 - rank)
+    with pytest.raises(PredictorError, match="scheduler owner"):
+        run.driver.bind(NS(enable_overlap=True))
+    assert run.driver.owner is run.scheduler
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_first_explicit_native_rank_is_sealed_even_before_scheduler_bind(run, rank):
+    run.driver.bind_native_dp_rank(rank)
+    assert run.driver.owner is None
+    with pytest.raises(PredictorError, match="local DP owner changed"):
+        run.driver.bind_native_dp_rank(1 - rank)
+    assert run.driver.adapter.ledger.local_attention_dp_rank == rank
+
+
+@pytest.mark.parametrize("state", ["selected", "published", "processing", "drained"])
+@pytest.mark.parametrize("rank", [0, 1])
+def test_late_native_binding_cannot_reinterpret_existing_reference_work(
+    run, state, rank
+):
+    current = selected(run)
+    if state != "selected":
+        result = launch(run, current)
+        if state == "processing":
+            run.driver.before_result(current, result)
+        elif state == "drained":
+            process(run, current, result, finish=True)
+            assert run.driver.adapter.ledger.requests == ()
+            assert run.driver.adapter.ledger.last_forward_id == 0
+    original = run.driver.adapter
+    with pytest.raises(PredictorError, match="local DP owner changed"):
+        run.driver.bind_native_dp_rank(rank)
+    assert run.driver.adapter is original
+
+
 @pytest.mark.parametrize("sync", [False, True])
 def test_real_event_activation_keeps_allocation_and_worker_output_snapshots(run, sync):
     prefill = selected(run, prefix=1024, extend=64)

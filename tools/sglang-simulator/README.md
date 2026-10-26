@@ -262,6 +262,9 @@ construction. The existing worker forward entry uses that same group, scheduler
 counter and source context for the peer transaction. Rank-local validation errors
 rendezvous before costs. Both-empty polling binds the local reference owner
 without inventing a forward; paired drained reset needs no fabricated native FID.
+The overlap loop may bind its scheduler before that first poll. The first actual
+attention-DP rank seals a pristine local ledger independently of the scheduler
+owner; subsequent polls and resets cannot change either established owner.
 Retirements synchronize at the next selection, outside local result callbacks.
 
 Rank 0 alone predicts the global cost and progress. Each owner binds that shared
