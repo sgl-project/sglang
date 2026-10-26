@@ -71,6 +71,11 @@ Router:
   --retry-max-attempts 2 --request-timeout-secs 540 --stream-idle-timeout-secs 300
 ```
 
+`--model-id` must match the engines' served model name. The router fetches the
+tokenizer, `config.json` and chat template from the Hub under that id. For a local
+snapshot, pass `--tokenizer-path /path/to/snapshot/tokenizer.json`: the file, not the
+directory. The router reads the other files from the file's directory.
+
 The router renders GLM-5.3-Flash chats itself and forwards `input_ids`. Chats without
 tools are served over `/generate`, with the router's `glm45` reasoning parser. Chats
 with tools keep the engine's route (the cookbook's `glm47` tool parser), still with
@@ -190,6 +195,10 @@ sgl-eval run gsm8k --base-url http://127.0.0.1:30000/v1 --num-examples 200 \
   already hold, so prefixes cached before a router restart are invisible until they
   are evicted. For a clean test, run `curl -X POST localhost:30000/flush_cache`. In
   Kubernetes, use [peer bootstrap](REFERENCE.md#peer-bootstrap-kubernetes).
+- **Shutdown drain warning at startup.** `--shutdown-drain-secs` (default 30) plus
+  in-flight requests must fit in the pod's grace period. Outside Kubernetes, ignore
+  the warning or pass `--shutdown-drain-secs 0`. In Kubernetes, set
+  `--termination-grace-secs` to the pod's `terminationGracePeriodSeconds`.
 - **Load reports lag.** Balanced mode and `--max-waiting-requests` read engine reports,
   so a burst that arrives within one report interval behaves like prefer mode.
   `--max-inflight-requests` does not lag.
