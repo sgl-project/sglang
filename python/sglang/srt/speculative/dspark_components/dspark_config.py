@@ -155,12 +155,6 @@ def read_draft_checkpoint_config(*, server_args: ServerArgs) -> DSparkDraftConfi
     return parse_dspark_draft_config(draft_hf_config=draft_hf_config)
 
 
-def read_draft_checkpoint_gamma(*, server_args: ServerArgs) -> Optional[int]:
-    return read_draft_checkpoint_config(server_args=server_args).resolve_gamma(
-        default=None
-    )
-
-
 def checkpoint_bundles_dspark_draft(hf_config: Any) -> bool:
     """The checkpoint carries a bundled DSpark draft head, marked by the
     prefixed dspark_* keys on the target hf config. Single source of truth
@@ -193,8 +187,8 @@ def _get_text_config(config: Any) -> Any:
     return config
 
 
-def _get_dspark_config(config: Any) -> dict:
-    cfg = _cfg_get(config, "dspark_config", None)
+def _get_nested_config(config: Any, key: str) -> dict:
+    cfg = _cfg_get(config, key, None)
     if cfg is None:
         return {}
     if isinstance(cfg, dict):
@@ -203,6 +197,14 @@ def _get_dspark_config(config: Any) -> dict:
         return dict(cfg)
     except Exception:
         return {}
+
+
+def _get_dspark_config(config: Any) -> dict:
+    # Published DSpark drafts nest their fields under dflash_config.
+    return {
+        **_get_nested_config(config, "dflash_config"),
+        **_get_nested_config(config, "dspark_config"),
+    }
 
 
 def parse_dspark_draft_config(*, draft_hf_config: Any) -> DSparkDraftConfig:

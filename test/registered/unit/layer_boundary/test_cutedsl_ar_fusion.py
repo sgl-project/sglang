@@ -30,10 +30,10 @@ from sglang.srt.layers.layer_boundary.fusions.allreduce import (
 )
 from sglang.srt.layers.layer_boundary.fusions.cutedsl import (
     CuteDSLFusion,
-    MoeDeferredFinalize,
     install_cutedsl_fusion,
     prepare_cutedsl_fusion,
 )
+from sglang.srt.layers.layer_boundary.fusions.moe_finalize import MoeDeferredFinalize
 from sglang.srt.layers.layer_boundary.prepare import _run_entry, _update_read
 from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
 from sglang.srt.layers.layernorm import RMSNorm
@@ -415,7 +415,7 @@ def test_a_handoff_the_kernel_does_not_take_is_completed_then_normed():
     finish = MagicMock(return_value=torch.ones(2, 8))
     with (
         # A norm the kernel could fold in, on a batch it does not take.
-        patch(f"{_MODULE}._fused_norm_gamma", return_value=torch.ones(8)),
+        patch(f"{_MODULE}.fused_norm_gamma", return_value=torch.ones(8)),
         patch.object(CuteDSLFusion, "_finalize_eligible", return_value=False),
         patch.object(CuteDSLFusion, "_eligible", return_value=False),
     ):
@@ -575,9 +575,6 @@ class TestDeferredLoraAllReduce(unittest.TestCase):
             with (
                 patch.object(exits, "_ffn_has_tokens", return_value=True),
                 patch.object(
-                    exits, "post_experts_sum_is_one_all_reduce", return_value=False
-                ),
-                patch.object(
                     exits, "get_lora", return_value=SimpleNamespace(enable_lora=True)
                 ),
                 patch.object(
@@ -602,8 +599,11 @@ class TestDeferredLoraAllReduce(unittest.TestCase):
                 ) as gate,
             ):
                 # Avoid platform-specific Aiter details: no residual cannot fuse.
+                facts = exits.ExitFacts(
+                    single_sum=False, fused_consumer_sum=exits._fused_consumer_sum()
+                )
                 with patch.object(exits, "_use_aiter", False, create=True):
-                    result = exits._batch_allows_deferred_sum(fb, boundary)
+                    result = exits._batch_allows_deferred_sum(fb, facts, boundary)
                 self.assertEqual(result, eligible and not a2a)
                 if a2a:
                     gate.assert_not_called()

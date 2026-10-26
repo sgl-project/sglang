@@ -1,9 +1,14 @@
+import datetime
+import socket
+import time
 import unittest
 from types import SimpleNamespace
 from typing import Optional
 from unittest.mock import Mock, patch
 
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
@@ -18,17 +23,10 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E4
 from sglang.srt.observability.metrics_collector import DPBalanceStats  # noqa: E402
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm  # noqa: E402
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=45, suite="base-a-test-cpu")
 
 
 class TestDPAttnSchedulerMetadata(CustomTestCase):
-    def test_skip_all_gather_policy(self):
-        with envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.override(False):
-            self.assertTrue(dp_attn.should_skip_scheduler_all_gather(num_dp_ranks=1))
-            self.assertFalse(dp_attn.should_skip_scheduler_all_gather(num_dp_ranks=2))
-        with envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.override(True):
-            self.assertTrue(dp_attn.should_skip_scheduler_all_gather(num_dp_ranks=2))
-
     def test_dp1_skip_preserves_local_tbo_metadata(self):
         batch = SimpleNamespace(
             forward_mode=ForwardMode.DECODE,
@@ -164,7 +162,7 @@ class TestDPBalanceStats(CustomTestCase):
             ),
             patch.object(dp_attn, "check_cuda_graph_backend", return_value=False),
             patch.object(
-                dp_attn, "all_gather_single", side_effect=fake_all_gather_single
+                dp_attn, "exchange_sync_rows", side_effect=fake_all_gather_single
             ),
         ):
             return dp_attn.prepare_mlp_sync_batch_raw(
@@ -405,6 +403,7 @@ class TestDecodeToExtendConversionVote(CustomTestCase):
         runner = Mock(spec=dp_attn.PrefillCudaGraphRunner)
         runner.enable_lora = False
         runner.max_context_size = None
+        runner.max_seq_len = None
         runner.can_replay_locally.return_value = True
         batch = SimpleNamespace(
             forward_mode=ForwardMode.DECODE,
@@ -438,6 +437,7 @@ class TestDecodeToExtendConversionVote(CustomTestCase):
         ):
             return dp_attn._local_prefill_cuda_graph_vote(
                 local_batch=batch,
+                num_tokens=2,
                 prefill_graph_runner=runner,
                 coordinated_prefill=True,
                 breakable_prefill=True,
@@ -458,7 +458,9 @@ class TestPrefillCudaGraphVote(CustomTestCase):
         runner = Mock(spec=runner_cls)
         runner.enable_lora = False
         runner.max_context_size = None
+        runner.max_seq_len = None
         runner._qwen_bcg_hc_sidechannel = True
+        runner._backend_vote_prefill_cuda_graph = None
         runner.can_replay_locally.side_effect = lambda **kwargs: (
             not kwargs["contains_mm_inputs"]
             or runner_cls.can_replay_locally(self=runner, **kwargs)
@@ -475,6 +477,7 @@ class TestPrefillCudaGraphVote(CustomTestCase):
         )
         vote = dp_attn._local_prefill_cuda_graph_vote(
             local_batch=batch,
+            num_tokens=4,
             prefill_graph_runner=runner,
             coordinated_prefill=True,
             breakable_prefill=True,
@@ -505,7 +508,9 @@ class TestPrefillCudaGraphVote(CustomTestCase):
         runner = Mock(spec=runner_cls)
         runner.enable_lora = False
         runner.max_context_size = None
+        runner.max_seq_len = None
         runner._qwen_bcg_hc_sidechannel = False
+        runner._backend_vote_prefill_cuda_graph = None
         runner._is_full_backend = False
         runner._captured_attn_metadata_max_bs = 2
         runner.prefer_eager_mixed_prefill = False
@@ -532,6 +537,7 @@ class TestPrefillCudaGraphVote(CustomTestCase):
             )
             return dp_attn._local_prefill_cuda_graph_vote(
                 local_batch=batch,
+                num_tokens=48,
                 prefill_graph_runner=runner,
                 coordinated_prefill=True,
                 breakable_prefill=True,
@@ -546,7 +552,7 @@ class TestPrefillCudaGraphVote(CustomTestCase):
                 self.assertFalse(vote(mode, batch_size=3))
 
     @patch.object(dp_attn, "get_parallel")
-    @patch.object(dp_attn, "all_gather_single")
+    @patch.object(dp_attn, "exchange_sync_rows")
     def test_multimodal_ranks_vote_eager(self, gather, parallel):
         infos = [
             dp_attn.MLPSyncBatchInfo(
@@ -570,6 +576,135 @@ class TestPrefillCudaGraphVote(CustomTestCase):
         for info in infos:
             info.all_gather(device="cpu", group=None)
             self.assertFalse(info.can_run_prefill_cuda_graph)
+
+
+# The ring path (2), primes, an even non-power-of-two, and two powers of two
+# with different gather / broadcast tree depths. The hosted CPU runner's
+# memory caps the largest world.
+_EXCHANGE_WORLDS = (2, 3, 4, 5, 6, 8)
+_EXCHANGE_ROUNDS = 4
+
+
+def _exchange_worker(rank, world, port, out_q):
+    """One gloo rank: every sub-world below runs the one-hop exchange and the
+    real `MLPSyncBatchInfo.all_gather` for several rounds, each rank arriving
+    after a random delay and a random amount of preceding CPU work."""
+    import random
+
+    dist.init_process_group(
+        "gloo",
+        init_method=f"tcp://127.0.0.1:{port}",
+        rank=rank,
+        world_size=world,
+        timeout=datetime.timedelta(seconds=60),
+    )
+    try:
+        for sub in _EXCHANGE_WORLDS:
+            group = dist.new_group(list(range(sub)))
+            if rank >= sub:
+                continue
+            rng = random.Random(1000 * sub + rank)
+            for round_idx in range(_EXCHANGE_ROUNDS):
+                info = dp_attn.MLPSyncBatchInfo(
+                    num_dp_ranks=sub,
+                    tp_size=1,
+                    cp_size=1,
+                    num_tokens=3 + rank + 100 * round_idx,
+                    num_tokens_for_logprob=3 + rank,
+                    can_run_decode_cuda_graph=rank != round_idx % sub,
+                    can_run_draft_cuda_graph=True,
+                    can_run_prefill_cuda_graph=True,
+                    is_extend_in_batch=False,
+                    local_can_run_tbo=False,
+                    local_forward_mode=ForwardMode.DECODE.value,
+                    attention_pairs=1000 * (rank + 1) + round_idx,
+                )
+                local = info._get_local_tensor(device="cpu")
+                reference = torch.zeros(sub * local.numel(), dtype=torch.int64)
+                dp_attn.all_gather_single(reference, local, group=group)
+                # Skewed arrival: a random sleep plus preceding work of a
+                # random length (tens of microseconds to ~100 ms).
+                time.sleep(rng.uniform(0.0, 0.05))
+                busy_until = time.perf_counter() + rng.uniform(0.0, 0.05)
+                while time.perf_counter() < busy_until:
+                    pass
+                exchanged = torch.zeros_like(reference)
+                dp_attn.exchange_sync_rows(exchanged, local, group=group)
+                parallel = SimpleNamespace(
+                    tp_group=SimpleNamespace(
+                        active_ranks_cpu=torch.ones(sub, dtype=torch.int64)
+                    )
+                )
+                with patch.object(dp_attn, "get_parallel", return_value=parallel):
+                    info.all_gather(device="cpu", group=group)
+                out_q.put(
+                    (
+                        sub,
+                        round_idx,
+                        rank,
+                        torch.equal(exchanged, reference),
+                        info.global_num_tokens,
+                        info.global_attention_pairs,
+                        info.can_run_decode_cuda_graph,
+                    )
+                )
+    finally:
+        dist.destroy_process_group()
+
+
+class TestSyncRowExchangeGloo(CustomTestCase):
+    def test_one_hop_exchange_matches_all_gather_on_every_rank(self):
+        """The gloo exchange agrees bitwise with the ring all-gather on every
+        rank of worlds 2..8 (primes, an even non-power-of-two, powers of two),
+        over several rounds with random per-rank arrival skew."""
+        world = max(_EXCHANGE_WORLDS)
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        sock.close()
+        # Every rank would otherwise be a fresh interpreter importing the whole
+        # package before it exchanges a single row; forking the ranks from one
+        # preloaded server keeps the test cheap on a small CPU runner.
+        ctx = mp.get_context("forkserver")
+        ctx.set_forkserver_preload([__name__])
+        out_q = ctx.Queue()
+        procs = [
+            ctx.Process(target=_exchange_worker, args=(r, world, port, out_q))
+            for r in range(world)
+        ]
+        results = {}
+        try:
+            for proc in procs:
+                proc.start()
+            for _ in range(sum(_EXCHANGE_WORLDS) * _EXCHANGE_ROUNDS):
+                sub, round_idx, rank, same, tokens, pairs, graph = out_q.get(
+                    timeout=240
+                )
+                results[(sub, round_idx, rank)] = (same, tokens, pairs, graph)
+            for proc in procs:
+                proc.join(timeout=60)
+                self.assertEqual(proc.exitcode, 0)
+        finally:
+            # An init-phase death must not park the shard on the gloo timeout.
+            for proc in procs:
+                if proc.is_alive():
+                    proc.kill()
+                    proc.join(timeout=10)
+        for sub in _EXCHANGE_WORLDS:
+            for round_idx in range(_EXCHANGE_ROUNDS):
+                for rank in range(sub):
+                    same, tokens, pairs, graph = results[(sub, round_idx, rank)]
+                    self.assertTrue(
+                        same, f"world {sub} round {round_idx} rank {rank} differs"
+                    )
+                    self.assertEqual(
+                        tokens, [3 + r + 100 * round_idx for r in range(sub)]
+                    )
+                    self.assertEqual(
+                        pairs, [1000 * (r + 1) + round_idx for r in range(sub)]
+                    )
+                    # One rank votes eager each round; the min reaches every rank.
+                    self.assertFalse(graph)
 
 
 if __name__ == "__main__":

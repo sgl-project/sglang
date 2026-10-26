@@ -85,12 +85,13 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
         if cfg.disaggregation_transfer_backend not in (
             "mooncake",
             "nixl",
+            "mori",
             "ascend",
             "fake",
         ):
             raise ValueError(
                 "PD decode DCP requires --disaggregation-transfer-backend "
-                "mooncake, nixl, ascend, or fake for synthetic benchmarking, got "
+                "mooncake, nixl, mori, ascend, or fake for synthetic benchmarking, got "
                 f"{cfg.disaggregation_transfer_backend!r}."
             )
 
@@ -106,13 +107,6 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                     "--disaggregation-decode-enable-radix-cache is incompatible "
                     "with --disaggregation-transfer-backend fake"
                 )
-            if cfg.speculative_algorithm not in (None, "DSPARK"):
-                raise ValueError(
-                    "--disaggregation-decode-enable-radix-cache is incompatible "
-                    "with speculative decoding "
-                    f"(--speculative-algorithm {cfg.speculative_algorithm})"
-                )
-
             if attn_dp_enabled_of(resolved_view(server_args)):
                 logger.warning(
                     "EXPERIMENTAL: Decode radix cache with DP attention. "
@@ -139,7 +133,7 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
         if cfg.disaggregation_decode_extra_slots is None:
             extra_slots = 0
             if cfg.max_running_requests is not None:
-                per_worker = cfg.max_running_requests // num_dp_ranks_of(cfg)
+                per_worker = max(1, cfg.max_running_requests // num_dp_ranks_of(cfg))
                 if per_worker <= 32:
                     extra_slots = per_worker * 2
             declare_resolution(
@@ -171,8 +165,6 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
         if cfg.enable_pd_role_switch:
             view = resolved_view(server_args)
             unsupported = []
-            if attn_dp_enabled_of(view):
-                unsupported.append(f"attention DP (--attn-dp-size {view.attn_dp_size})")
             if view.ep_size > 1:
                 unsupported.append(f"expert parallelism (--ep-size {view.ep_size})")
             if view.moe_a2a_backend != "none":
@@ -181,8 +173,11 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                 )
             if view.pp_size > 1:
                 unsupported.append(f"pipeline parallelism (--pp-size {view.pp_size})")
-            if view.dp_size > 1:
-                unsupported.append(f"data parallelism (--dp-size {view.dp_size})")
+            if (
+                attn_dp_enabled_of(view)
+                and view.enable_dp_attention_local_control_broadcast
+            ):
+                unsupported.append("DP attention local control broadcast")
             if view.dcp_size > 1:
                 unsupported.append(
                     f"decode context parallelism (--dcp-size {view.dcp_size})"
@@ -253,8 +248,23 @@ def _alias_bootstrap_port_to_api_port(server_args: ServerArgs) -> None:
     consumer (KVManager registration, PrefillBootstrapQueue) reads the resolved
     field and agrees automatically. Decode is untouched: there the field names
     the PREFILL side's bootstrap port and must stay as the operator set it.
+    A transfer backend that brings its own bootstrap server keeps the port as
+    configured: that server, not the Rust registry, listens there.
     """
+    # Lazy: disagg_service pulls in the disaggregation package. Its helper calls
+    # disagg_service.get_kv_class, which a transfer backend registered at
+    # runtime may rebind.
+    from sglang.srt.managers.disagg_service import rust_server_serves_kv_bootstrap
+
     cfg = resolving_view(server_args)
+    if not rust_server_serves_kv_bootstrap(cfg.disaggregation_transfer_backend):
+        logger.info(
+            "SGLANG_RUST_SERVER: transfer backend %s runs its own KV bootstrap "
+            "server; keeping disaggregation_bootstrap_port %d",
+            cfg.disaggregation_transfer_backend,
+            cfg.disaggregation_bootstrap_port,
+        )
+        return
     default_port = next(
         f.default
         for f in record_fields(type(server_args))
@@ -356,9 +366,20 @@ def handle_encoder_disaggregation(server_args: Any):
         "KimiK3ForConditionalGeneration",
         "MiMoV2ForCausalLM",
         "Glm5NextForConditionalGeneration",
+        "MuseSparkForConditionalGeneration",
     ]:
         raise ValueError(
             f"Model type {model_arch} is not supported for encoder disaggregation. "
             f"Supported architectures: Qwen2VL, Qwen3VL, Qwen3.5, InternS2, "
-            f"Qwen2Audio, Qwen2.5Omni, Dots3-Note, Kimi, MiMoV2, GLM5Next."
+            f"Qwen2Audio, Qwen2.5Omni, Dots3-Note, Kimi, MiMoV2, GLM5Next, MuseSpark."
+        )
+
+    if (
+        model_arch == "MuseSparkForConditionalGeneration"
+        and cfg.language_only
+        and cfg.enable_adaptive_dispatch_to_encoder
+    ):
+        raise ValueError(
+            "Muse language-only servers do not load local encoders; "
+            "--enable-adaptive-dispatch-to-encoder is not supported."
         )

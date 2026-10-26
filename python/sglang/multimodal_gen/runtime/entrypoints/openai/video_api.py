@@ -8,7 +8,7 @@ import tempfile
 import time
 from collections.abc import Coroutine
 from contextlib import suppress
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Literal, Optional
 
 from fastapi import (
     APIRouter,
@@ -52,6 +52,9 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     resolve_sampling_params_cls,
     sanitize_upload_filename,
     save_image_to_path,
+)
+from sglang.multimodal_gen.runtime.entrypoints.openai.video_progress import (
+    VIDEO_PROGRESS,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
@@ -360,6 +363,18 @@ async def _save_first_input_image(
     )
 
 
+async def _upload_and_cleanup_videos(paths: list[str]) -> list[str | None]:
+    results = await asyncio.gather(
+        *(cloud_storage.upload_and_cleanup(path) for path in paths),
+        return_exceptions=True,
+    )
+    # join every upload before a cancellation or failure permits directory cleanup
+    for result in results:
+        if isinstance(result, BaseException):
+            raise result
+    return results
+
+
 async def _dispatch_job_async(
     job_id: str,
     batch: Req,
@@ -397,19 +412,31 @@ async def _dispatch_job_async(
                     )
             raise
 
-        cloud_url = await cloud_storage.upload_and_cleanup(save_file_path)
+        cloud_urls = await _upload_and_cleanup_videos(save_file_path_list)
+        if not output_persistent and not all(cloud_urls):
+            # The temp output dir is removed in `finally`, so an output that was
+            # not uploaded would be unretrievable once the job reports completed.
+            raise RuntimeError(
+                "Video output could not be published: no output_path is configured "
+                "and cloud storage upload is disabled or failed."
+            )
 
-        persistent_path = (
-            save_file_path if not cloud_url and output_persistent else None
-        )
         update_fields = {
             "status": "completed",
             "progress": 100,
             "completed_at": int(time.time()),
-            "url": cloud_url,
-            "file_path": persistent_path,
+            "url": cloud_urls[0],
+            "urls": cloud_urls,
+            "file_path": (
+                os.path.abspath(save_file_path)
+                if not cloud_urls[0] and output_persistent
+                else None
+            ),
             "file_paths": (
-                [os.path.abspath(path) for path in save_file_path_list]
+                [
+                    None if url else os.path.abspath(path)
+                    for path, url in zip(save_file_path_list, cloud_urls)
+                ]
                 if output_persistent
                 else None
             ),
@@ -428,12 +455,14 @@ async def _dispatch_job_async(
                 "status": "failed",
                 "error": {"message": str(e)},
                 "url": None,
+                "urls": None,
                 "file_path": None,
                 "file_paths": None,
                 "num_outputs": None,
             },
         )
     finally:
+        VIDEO_PROGRESS.unregister(job_id)
         try:
             await asyncio.to_thread(
                 batch.sampling_params.cleanup_video_request,
@@ -745,6 +774,7 @@ async def create_video(
             sampling_params=sampling_params,
             external_trace_header=trace_headers,
         )
+        batch.report_progress = True
         # Add diffusers_kwargs if provided.
         if req.diffusers_kwargs:
             batch.extra["diffusers_kwargs"] = req.diffusers_kwargs
@@ -785,6 +815,11 @@ async def create_video(
         raise
 
     assert batch is not None
+    # the outputs may run as "{job}:{i}" requests, queued here or expanded later
+    VIDEO_PROGRESS.register(
+        request_id,
+        num_outputs=max(len(scheduler_batches or ()), batch.num_outputs_per_prompt),
+    )
     # Enqueue the job asynchronously and return immediately
     _start_video_job(
         request_id,
@@ -802,12 +837,12 @@ async def create_video(
 @router.get("", response_model=VideoListResponse)
 async def list_videos(
     after: Optional[str] = Query(None),
-    limit: Optional[int] = Query(None, ge=1, le=100),
-    order: Optional[str] = Query("desc"),
+    limit: int = Query(20, ge=1, le=100),
+    order: Literal["asc", "desc"] = Query("desc"),
 ):
-    jobs = await VIDEO_STORE.list_page(after=after, limit=limit, order=order)
-    items = [VideoResponse(**job) for job in jobs]
-    return VideoListResponse(data=items)
+    return VideoListResponse(
+        **await VIDEO_STORE.list_page(after=after, limit=limit, order=order)
+    )
 
 
 @router.get("/{video_id}", response_model=VideoResponse)
@@ -829,17 +864,48 @@ async def delete_video(video_id: str = Path(...)):
     return VideoResponse(**job)
 
 
+def _parse_video_variant_index(variant: str | None) -> int | None:
+    try:
+        return 0 if variant is None else int(variant)
+    except (TypeError, ValueError):
+        return None
+
+
+def _select_video_variant_url(job: dict, variant: str | None) -> str | None:
+    urls = job.get("urls")
+    if urls:
+        variant_index = _parse_video_variant_index(variant)
+        if variant_index is not None and 0 <= variant_index < len(urls):
+            return urls[variant_index]
+        return None
+    if _parse_video_variant_index(variant) != 0:
+        return None
+    return job.get("url")
+
+
+_ARTIFACT_MEDIA_TYPES = {
+    ".mp4": "video/mp4",
+    ".safetensors": "application/octet-stream",
+}
+
+
+def _select_lidar_artifact_path(job: dict, variant: str | None) -> str | None:
+    """A joint camera/LiDAR job's extra artifact, addressed by its ``lidar.files`` key."""
+    lidar = job.get("lidar")
+    if not variant or not isinstance(lidar, dict):
+        return None
+    files = lidar.get("files")
+    return files.get(variant) if isinstance(files, dict) else None
+
+
 def _select_video_variant_path(job: dict, variant: str | None) -> str | None:
     file_paths = job.get("file_paths")
     if file_paths:
-        try:
-            variant_index = 0 if variant is None else int(variant)
-        except (TypeError, ValueError):
-            return None
-        if 0 <= variant_index < len(file_paths):
+        variant_index = _parse_video_variant_index(variant)
+        if variant_index is not None and 0 <= variant_index < len(file_paths):
             return file_paths[variant_index]
         return None
-    if variant not in (None, "0", 0):
+    if _parse_video_variant_index(variant) != 0:
         return None
     return job.get("file_path")
 
@@ -852,13 +918,16 @@ async def download_video_content(
     if not job:
         raise HTTPException(status_code=404, detail="Video not found")
 
-    if job.get("url"):
+    cloud_url = _select_video_variant_url(job, variant)
+    if cloud_url:
         raise HTTPException(
             status_code=400,
-            detail=f"Video has been uploaded to cloud storage. Please use the cloud URL: {job.get('url')}",
+            detail=f"Video has been uploaded to cloud storage. Please use the cloud URL: {cloud_url}",
         )
 
-    file_path = _select_video_variant_path(job, variant)
+    file_path = _select_lidar_artifact_path(job, variant) or _select_video_variant_path(
+        job, variant
+    )
     if job.get("status") not in {"completed", "failed"}:
         raise HTTPException(status_code=404, detail="Generation is still in-progress")
     if not file_path or not os.path.exists(file_path):
@@ -866,7 +935,9 @@ async def download_video_content(
             status_code=404, detail=f"Video variant {variant} not found"
         )
 
-    media_type = "video/mp4"  # default variant
+    media_type = _ARTIFACT_MEDIA_TYPES.get(
+        os.path.splitext(file_path)[1].lower(), "video/mp4"
+    )
     return FileResponse(
         path=file_path, media_type=media_type, filename=os.path.basename(file_path)
     )

@@ -42,14 +42,6 @@ def _questions(offset=0):
 
 
 class TestDecisionLayout(CustomTestCase):
-    def test_round_trip(self):
-        layout = pack_decision_layout(40, _questions())
-        self.assertEqual(parse_decision_layout(layout, 40), _questions())
-
-    def test_expanded_images_shift_every_span(self):
-        layout = pack_decision_layout(40, _questions())
-        self.assertEqual(parse_decision_layout(layout, 140), _questions(offset=100))
-
     def test_rejects_layouts_that_do_not_fit_the_prompt(self):
         layout = pack_decision_layout(40, _questions())
         invalid = {

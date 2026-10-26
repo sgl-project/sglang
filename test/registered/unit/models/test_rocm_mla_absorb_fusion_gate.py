@@ -33,21 +33,13 @@ def _attn(**overrides):
         rotary_emb=object(),
         current_attention_backend="dsa",
         use_deep_gemm_bmm=False,
+        dcp_size=1,
         kv_b_proj=SimpleNamespace(set_lora=False),
         _skip_rope_for_dsa_tilelang_fused=lambda: True,
     )
     for k, v in overrides.items():
         setattr(attn, k, v)
     return attn
-
-
-def _patch_dcp(case, *, dcp_enabled: bool):
-    """Give the gate a parallel context; the real one needs an initialized runtime."""
-    parallel = SimpleNamespace(dcp_enabled=dcp_enabled)
-    saved = forward_mla_rocm.get_parallel
-    forward_mla_rocm.get_parallel = lambda: parallel
-    case.addCleanup(setattr, forward_mla_rocm, "get_parallel", saved)
-    return parallel
 
 
 class TestFusedAbsorbGate(CustomTestCase):
@@ -57,7 +49,6 @@ class TestFusedAbsorbGate(CustomTestCase):
         self._saved = forward_mla_rocm._use_aiter_gfx95
         forward_mla_rocm._use_aiter_gfx95 = True
         self.addCleanup(setattr, forward_mla_rocm, "_use_aiter_gfx95", self._saved)
-        self._parallel = _patch_dcp(self, dcp_enabled=False)
 
     def test_dcp_turns_it_off(self):
         """DCP decode all-gathers q_nope_out, which this path never produces.
@@ -65,8 +56,7 @@ class TestFusedAbsorbGate(CustomTestCase):
         Without this term the fused branch sets q_nope_out to None and
         all_gather_q_for_mla_decode dereferences it.
         """
-        self._parallel.dcp_enabled = True
-        self.assertFalse(_CAN_FUSE(_attn()))
+        self.assertFalse(_CAN_FUSE(_attn(dcp_size=2)))
 
     def test_takes_the_fused_path_when_every_term_holds(self):
         self.assertTrue(_CAN_FUSE(_attn()))

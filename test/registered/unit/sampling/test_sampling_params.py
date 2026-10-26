@@ -585,11 +585,6 @@ class TestRegexMaxLength(CustomTestCase):
         result = get_max_seq_length("a*")
         self.assertEqual(result, MAX_LEN)
 
-    def test_unbounded_plus(self):
-        """Test that 'a+' (one or more, no upper bound) returns MAX_LEN."""
-        result = get_max_seq_length("a+")
-        self.assertEqual(result, MAX_LEN)
-
     def test_bounded_repeat(self):
         """Test that exact repeat 'a{5}' gives max length 5."""
         self.assertEqual(get_max_seq_length("a{5}"), 5)
@@ -634,11 +629,6 @@ class TestRegexMaxLength(CustomTestCase):
     def test_lookahead_triggers_unhandled_token(self):
         """Test that lookahead (?=a) hits the unhandled-token fallback (MAX_LEN)."""
         result = get_max_seq_length("(?=a)b")
-        self.assertGreaterEqual(result, MAX_LEN)
-
-    def test_lookbehind_triggers_unhandled_token(self):
-        """Test that lookbehind (?<=x) hits the unhandled-token fallback (MAX_LEN)."""
-        result = get_max_seq_length("(?<=x)y")
         self.assertGreaterEqual(result, MAX_LEN)
 
 

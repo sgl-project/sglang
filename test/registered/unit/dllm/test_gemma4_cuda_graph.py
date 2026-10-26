@@ -18,11 +18,12 @@ from sglang.srt.models.gemma4_diffusion import DiffusionGemmaTextEmbedding
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, published_topology
 
-register_cpu_ci(est_time=3, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class _ReadStream:
     reads_are_translated = False
+    window_kv_kind = IdSpaceKind.FULL
 
     def __init__(self):
         self.tokens = torch.arange(64).view(4, 16)
@@ -165,6 +166,7 @@ class TestGemma4GraphInputEmbeddings(unittest.TestCase):
             input_ids=torch.zeros(16, dtype=torch.long),
             positions=torch.zeros(16, dtype=torch.long),
             input_embeds=torch.full((16, 7), -1.0),
+            num_token_non_padded=None,
         )
         batch = SimpleNamespace(
             needs_forward_metadata_init=lambda: False,

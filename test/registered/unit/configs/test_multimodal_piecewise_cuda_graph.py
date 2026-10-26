@@ -2,7 +2,7 @@
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from sglang.srt.arg_groups.cuda_graph_hook import apply_cuda_graph_compatibility
 from sglang.srt.arg_groups.model_hook import handle_model_capability_adjustments
@@ -10,8 +10,8 @@ from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.configs.embedding_model_spec import resolve_embedding_model_spec
 from sglang.srt.configs.model_config import (
     AttentionArch,
-    is_multimodal_piecewise_cuda_graph_supported,
 )
+from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     CudaGraphConfig,
@@ -45,7 +45,9 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
         runner.capture_hidden_mode = CaptureHiddenMode.NULL
         runner.capture_num_tokens = [4, 16]
         runner.max_context_size = None
+        runner.max_seq_len = None
         runner.max_num_tokens = 16
+        runner.model_runner = SimpleNamespace(attn_backend=MagicMock())
         return runner
 
     def _make_multimodal_forward_batch(self):
@@ -61,20 +63,6 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
             return_logprob=False,
             input_ids=[1, 2, 3, 4],
             extend_prefix_lens_cpu=[0],
-        )
-
-    def test_kimi_k25_lm_prefill_is_opted_in(self):
-        self.assertTrue(
-            is_multimodal_piecewise_cuda_graph_supported(
-                ["KimiK25ForConditionalGeneration"]
-            )
-        )
-
-    def test_unknown_multimodal_arch_is_not_opted_in(self):
-        self.assertFalse(
-            is_multimodal_piecewise_cuda_graph_supported(
-                ["UnknownVisionForConditionalGeneration"]
-            )
         )
 
     def test_trtllm_mla_stays_on_breakable(self):
@@ -118,11 +106,22 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
         with patch(target, return_value=False):
             self.assertFalse(runner.can_run_graph(forward_batch))
 
+    def test_breakable_prefill_takes_nonzero_prefix_off_cuda_for_dsa(self):
+        runner = self._make_prefill_runner(Backend.BREAKABLE)
+        runner.model_runner.attn_backend = MagicMock(spec=DeepseekSparseAttnBackend)
+        forward_batch = self._make_multimodal_forward_batch()
+        forward_batch.extend_prefix_lens_cpu = [1]
+
+        target = "sglang.srt.model_executor.runner.prefill_cuda_graph_runner.is_cuda"
+        with patch(target, return_value=False):
+            self.assertTrue(runner.can_run_graph(forward_batch))
+
     def test_embedding_gemma_forces_breakable_prefill(self):
         args = ServerArgs(model_path="dummy")
         args._model_config = SimpleNamespace(
             is_embedding_gemma=True,
             joint_head_config=None,
+            pointer_head=None,
             is_multimodal=False,
             context_len=2048,
             hf_config=SimpleNamespace(architectures=["Gemma3TextModel"]),
@@ -160,6 +159,7 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
                 is_embedding_gemma=False,
             ),
             joint_head_config=None,
+            pointer_head=None,
             is_multimodal=False,
             hf_config=SimpleNamespace(architectures=["BertModel"]),
         )

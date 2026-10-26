@@ -39,15 +39,18 @@ class TestQwen4ExpPleRows(CustomTestCase):
         # An all-to-all MoE with attention TP keeps the residual on this
         # rank's slice of the rows between layers; the PLE embedding is
         # computed for every row, so its layer must read the full rows.
-        config = SimpleNamespace(num_hidden_layers=4, ple_layer_ids=[3])
+        config = SimpleNamespace(
+            model_type="qwen4_exp_text", num_hidden_layers=4, ple_layer_ids=[3]
+        )
         with (
             fixture.planning(fixture.parallel_of(attn_dp=1, attn_tp=2), a2a=True),
             layer_stack(),
         ):
             layers = [
                 _build_qwen4_exp_stages(
+                    config,
+                    layer_id,
                     _residual_ops(attn_reads_every_row=_has_ple(layer_id, config)),
-                    sparse=True,
                 )
                 for layer_id in range(config.num_hidden_layers)
             ]

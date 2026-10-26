@@ -310,12 +310,20 @@ class SchedulerBatchResultProcessor:
                     and not req.is_retracted
                     and req.inflight_middle_chunks <= 0
                 )
-                sampling_mask_finish_reason = None
-                if should_commit_output and req.return_sampling_mask:
+                # A reason here finishes the request without committing this
+                # forward's output: a failed KV load or an unusable sampling mask.
+                discard_finish_reason = (
+                    req.discard_output_reason if should_commit_output else None
+                )
+                if (
+                    should_commit_output
+                    and discard_finish_reason is None
+                    and req.return_sampling_mask
+                ):
                     assert logits_output is not None
                     statuses = logits_output.next_token_sampling_mask_status
                     status = None if statuses is None else statuses[i]
-                    sampling_mask_finish_reason = self.get_sampling_mask_finish_reason(
+                    discard_finish_reason = self.get_sampling_mask_finish_reason(
                         status=status
                     )
                 if (
@@ -329,9 +337,7 @@ class SchedulerBatchResultProcessor:
                         hidden_state_offset=hidden_state_offset,
                         capture_hidden_mode=prefill_hidden_capture_mode,
                         extend_input_len=extend_input_len_per_req[i],
-                        store=(
-                            should_commit_output and sampling_mask_finish_reason is None
-                        ),
+                        store=(should_commit_output and discard_finish_reason is None),
                     )
 
                 if (
@@ -345,8 +351,8 @@ class SchedulerBatchResultProcessor:
                 if req.inflight_middle_chunks <= 0:
                     req.time_stats.set_prefill_finished_time()
 
-                    if sampling_mask_finish_reason is not None:
-                        req.to_finish = sampling_mask_finish_reason
+                    if discard_finish_reason is not None:
+                        req.to_finish = discard_finish_reason
                         req.update_finish_state(0)
                     elif req.beam_group is not None:
                         # The relay point already replaced the sampled-token
@@ -371,15 +377,17 @@ class SchedulerBatchResultProcessor:
                     ):
                         req.kv.kv_committed_len += 1
                     if req.finished():
-                        if sampling_mask_finish_reason is None:
+                        if discard_finish_reason is None:
                             self._maybe_collect_routed_experts(req)
                             self._maybe_collect_indexer_topk(req)
+                        if get_memory().enable_hisparse:
+                            self.hisparse_coordinator.request_finished(req)
                         if batch.decoding_reqs and req in batch.decoding_reqs:
                             self._prepare_kv_cache_release(req)
                         release_kv_cache(
                             req,
                             self.tree_cache,
-                            checkpoint=sampling_mask_finish_reason is None,
+                            checkpoint=discard_finish_reason is None,
                         )
                         req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
@@ -387,7 +395,7 @@ class SchedulerBatchResultProcessor:
                         if get_memory().enable_hisparse:
                             self.hisparse_coordinator.admit_request_into_staging(req)
 
-                    if sampling_mask_finish_reason is None:
+                    if discard_finish_reason is None:
                         self._maybe_collect_customized_info(i, req, logits_output)
 
                     if batch.return_logprob:
@@ -399,10 +407,10 @@ class SchedulerBatchResultProcessor:
                             extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
                             next_token_ids=next_token_ids,
                             logprob_pt=logprob_pt,
-                            store=sampling_mask_finish_reason is None,
+                            store=discard_finish_reason is None,
                         )
 
-                    if sampling_mask_finish_reason is not None:
+                    if discard_finish_reason is not None:
                         continue
 
                     if req.return_sampling_mask:
@@ -459,6 +467,16 @@ class SchedulerBatchResultProcessor:
             # Check finish conditions
             for i, req in enumerate(batch.reqs):
                 if req.is_retracted:
+                    continue
+
+                if (
+                    req.discard_output_reason is not None
+                    and req.inflight_middle_chunks <= 0
+                ):
+                    req.to_finish = req.discard_output_reason
+                    req.update_finish_state(0)
+                    release_kv_cache(req, self.tree_cache, checkpoint=False)
+                    req.time_stats.set_completion_time()
                     continue
 
                 req.embedding = embeddings[i]
@@ -753,6 +771,8 @@ class SchedulerBatchResultProcessor:
         """Resolve the padded next token ids for spec-v2 (overlap and non-overlap)."""
         assert result.next_token_ids.is_cpu
         assert result.accept_lens.is_cpu
+
+        self.metrics_reporter.snapshot_spec_decode_metrics(batch, result)
 
         next_token_ids = result.next_token_ids.tolist()
         accept_lens = result.accept_lens.tolist()
@@ -1382,6 +1402,7 @@ class SchedulerBatchResultProcessor:
                 and lookahead == 1
                 and known_mamba_boundary
                 and req.kv.mamba_next_track_idx == req.kv.mamba_last_track_idx
+                and req.kv.mamba_untracked_decode_batch_idx != req.decode_batch_idx
             ):
                 req.mamba_lazy_checkpoint = False
 
@@ -1404,6 +1425,9 @@ class SchedulerBatchResultProcessor:
             self.decode_offload_manager.offload_kv_cache(req)
 
         if req.finished():
+            if not self._mamba_can_cache_finished_req(req, result, i):
+                req.skip_radix_cache_insert = True
+
             # isinstance narrowing: create_worker may also return plain
             # TpModelWorker-based drafts, which carry no spec-worker hooks.
             if isinstance(self.draft_worker, BaseSpecWorker):
@@ -1437,12 +1461,41 @@ class SchedulerBatchResultProcessor:
 
         self._maybe_collect_customized_info(i, req, logits_output)
 
+    def _mamba_can_cache_finished_req(
+        self, req: Req, result: GenerationBatchResult, i: int
+    ) -> bool:
+        if (
+            result.num_correct_drafts_per_req_cpu is None
+            or req.kv.mamba_ping_pong_track_buffer is not None
+            or not self.tree_cache.supports_mamba()
+        ):
+            return True
+
+        # no_buffer donates the live state, which cannot be shortened with the key.
+        if req.owned_kv_len() != req.kv.kv_committed_len:
+            return False
+
+        retained = result.grammar_retained_tokens
+        if retained is None or retained[i] is None:
+            return True
+
+        num_verified = (
+            result.num_correct_drafts_per_req_cpu[i]
+            + result.num_non_draft_tokens_per_req
+        )
+        return len(retained[i]) == num_verified
+
     def _maybe_update_reasoning_tokens(
         self,
         req: Req,
         next_token_id: Union[int, List[int]],
     ):
         if not req.require_reasoning:
+            think_start_ids = self.model_config.self_opened_think_start_ids
+            if think_start_ids:
+                req.update_self_opened_reasoning_tokens(
+                    next_token_id, think_start_ids, self.model_config.think_end_ids
+                )
             return
         think_end_ids = self.model_config.think_end_ids
         if req._think_end_matcher is None:
@@ -1542,9 +1595,9 @@ class SchedulerBatchResultProcessor:
             other_idx = 1 - req.kv.mamba_next_track_idx
             # Recompute the in-flight verify's plan (kv_committed_len is
             # frozen since its prepare, so the recompute is exact).
-            keep_may_be_written_in_flight = req.kv.mamba_ping_pong_track_buffer[
+            keep_may_be_written_in_flight = req.kv.mamba_ping_pong_empty[
                 other_idx
-            ].item() == -1 and mamba_lazy_spec_in_window(
+            ] and mamba_lazy_spec_in_window(
                 req,
                 mamba_track_grid(self.tree_cache.page_size),
                 max_speculative_num_draft_tokens(),
@@ -1608,7 +1661,15 @@ class SchedulerBatchResultProcessor:
                 return True, committed_len
         elif result.num_correct_drafts_per_req_cpu is not None:
             cur = req.seqlen - 1
-            prev = cur - result.num_correct_drafts_per_req_cpu[i] - 1
+            num_non_draft = result.num_non_draft_tokens_per_req
+            retained = result.grammar_retained_tokens
+            if retained is not None and retained[i] is not None:
+                # NOTE(kpham-sgl): grammar-truncated run, minus non-draft
+                # tokens ahead of the tracked verify window (UNO's root).
+                num_committed = max(len(retained[i]) - (num_non_draft - 1), 0)
+            else:
+                num_committed = result.num_correct_drafts_per_req_cpu[i] + 1
+            prev = cur - num_committed
             if cur // interval != prev // interval:
                 return True, cur // interval * interval
 
@@ -1621,9 +1682,8 @@ class SchedulerBatchResultProcessor:
         req.kv.mamba_last_track_idx = track_idx
         req.kv.mamba_next_track_idx = track_idx
         other_idx = 1 - track_idx
-        other_val = req.kv.mamba_ping_pong_track_buffer[other_idx].item()
-        if other_val != -1:
-            pool = batch.req_to_token_pool
+        pool = batch.req_to_token_pool
+        if not req.kv.mamba_ping_pong_empty[other_idx]:
             pool.mamba_allocator.free(
                 req.kv.mamba_ping_pong_track_buffer[other_idx].unsqueeze(0)
             )

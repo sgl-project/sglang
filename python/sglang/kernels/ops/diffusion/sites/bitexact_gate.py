@@ -79,9 +79,9 @@ class BitExactFusionGate:
 
     The first-sight check runs the eager reference chain plus a host sync, so
     it must never happen inside ``torch.compile`` tracing or CUDA graph
-    capture. Once-for-all callers get both guards from
-    :meth:`can_attempt_once`; per-signature callers must keep their own
-    compile/capture checks next to the signature lookup (see FLUX / Sana).
+    capture. :meth:`run` applies both guards in either mode; hand-written
+    sites get them from :meth:`can_attempt_once` (once-for-all) or keep their
+    own compile/capture checks next to the signature lookup (FLUX / Sana).
     """
 
     __slots__ = ("name", "disabled", "verified", "verified_sigs")
@@ -114,14 +114,49 @@ class BitExactFusionGate:
             return False
         if self.verified:
             return True
-        # First-sight verify runs the eager reference chain and a host sync:
-        # attempt neither inside compile tracing nor CUDA graph capture (the
-        # sync would abort the capture; BCG then blocks the signature). Once
-        # verified, the fused kernel runs alone and is compile/capture-safe.
-        if torch.compiler.is_compiling():
-            return False
-        return not (
-            torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+        return _can_verify_now()
+
+    def run(
+        self,
+        fused: Callable[[], T],
+        reference: Callable[[], T],
+        *,
+        sig: Any = None,
+        equal: EqualFn | None = None,
+        logger: logging.Logger | None = None,
+        diagnostic_hint: DiagnosticHintFn | None = None,
+        reraise: tuple[type[Exception], ...] = (),
+    ) -> T:
+        """Return ``fused()`` once it has matched ``reference()`` bit-for-bit.
+
+        The caller has already checked that the fast path applies. An
+        unverified ``sig`` is verified on this call unless it is inside compile
+        tracing or CUDA graph capture, where ``reference()`` runs instead. A
+        launch failure (other than ``reraise``) or a mismatch disables the
+        gate and returns ``reference()``.
+        """
+        if self.disabled:
+            return reference()
+        sigs = self.verified_sigs
+        verified = self.verified if sigs is None else sig in sigs
+        if not verified and not _can_verify_now():
+            return reference()
+        try:
+            out = fused()
+        except reraise:
+            raise
+        except Exception as exc:
+            self.on_exception(exc, logger=logger)
+            return reference()
+        if verified:
+            return out
+        return self.accept_or_fallback(
+            out,
+            reference(),
+            sig=sig,
+            equal=equal,
+            logger=logger,
+            diagnostic_hint=diagnostic_hint,
         )
 
     def on_exception(
@@ -145,7 +180,6 @@ class BitExactFusionGate:
         sig: Any = None,
         equal: EqualFn | None = None,
         logger: logging.Logger | None = None,
-        mismatch_msg: str | None = None,
         diagnostic_hint: DiagnosticHintFn | None = None,
     ) -> T:
         """Return ``out`` when bit-exact; otherwise disable and return ``ref``."""
@@ -156,10 +190,6 @@ class BitExactFusionGate:
             self.mark_verified(sig)
             return out
         if logger is not None:
-            message = mismatch_msg or (
-                f"{self.name} fast path is not bit-exact against this "
-                "platform's reference dispatch; falling back to eager"
-            )
             details = (
                 "Correctness is preserved because the eager reference output "
                 "is used. A platform-specific reference kernel or reduction-order "
@@ -172,9 +202,22 @@ class BitExactFusionGate:
                     diagnostic_details = None
                 if diagnostic_details:
                     details = f"{details}. {diagnostic_details.rstrip('.')}"
-            logger.warning_once(f"{message.rstrip('.')}. {details}.")
+            logger.warning_once(
+                f"{self.name} fast path is not bit-exact against this platform's "
+                f"reference dispatch; falling back to eager. {details}."
+            )
         self.disable()
         return ref
+
+
+def _can_verify_now() -> bool:
+    # First-sight verify runs the eager reference chain and a host sync:
+    # attempt neither inside compile tracing nor CUDA graph capture (the
+    # sync would abort the capture; BCG then blocks the signature). Once
+    # verified, the fused kernel runs alone and is compile/capture-safe.
+    if torch.compiler.is_compiling():
+        return False
+    return not (torch.cuda.is_available() and torch.cuda.is_current_stream_capturing())
 
 
 def tensors_equal(a: Any, b: Any) -> bool:

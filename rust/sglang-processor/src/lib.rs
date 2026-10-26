@@ -6,12 +6,15 @@
 //! request types, sampling, validation, transport, and runtime.
 
 mod error;
+#[cfg(any(feature = "parser", feature = "openai"))]
+mod kimi_k3_format;
 mod model_files;
 #[cfg(feature = "openai")]
 pub mod openai;
 #[cfg(feature = "parser")]
 mod parser;
-#[cfg(any(feature = "parser", feature = "openai"))]
+#[cfg(any(feature = "parser", feature = "openai", feature = "render"))]
+#[cfg_attr(not(any(feature = "parser", feature = "openai")), allow(dead_code))]
 mod py;
 #[cfg(feature = "render")]
 mod render;
@@ -32,7 +35,7 @@ pub use parser::{
 };
 #[cfg(feature = "render")]
 pub use render::{
-    ChatFormatter, ChatFormatterOptions, DeepSeekV4Profile, OneOrMany, TemplateError,
+    ChatFormatter, ChatFormatterOptions, DeepSeekTokenizer, OneOrMany, TemplateError,
     ThinkingTemplates, load_chat_formatter, requested_effort, requested_thinking,
     select_chat_formatter,
 };

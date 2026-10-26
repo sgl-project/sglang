@@ -5,7 +5,6 @@ The frame hand-off itself is covered in
 python/sglang/multimodal_gen/test/unit/test_wan_vae_on_frames.py.
 """
 
-import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -14,13 +13,21 @@ from unittest import mock
 
 import torch
 
+from sglang.multimodal_gen.configs.models.vaes.hunyuanvae import (
+    HunyuanVAEArchConfig,
+    HunyuanVAEConfig,
+)
 from sglang.multimodal_gen.configs.models.vaes.wanvae import (
     WanVAEArchConfig,
     WanVAEConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.hunyuan import HunyuanConfig
 from sglang.multimodal_gen.configs.pipeline_configs.wan import WanT2V480PConfig
 from sglang.multimodal_gen.configs.sample.sampling_params import DataType
 from sglang.multimodal_gen.runtime.entrypoints.utils import _try_save_cuda_video_direct
+from sglang.multimodal_gen.runtime.models.vaes.hunyuanvae import (
+    AutoencoderKLHunyuanVideo,
+)
 from sglang.multimodal_gen.runtime.models.vaes.wanvae import AutoencoderKLWan
 from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import DecodingStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.encode_while_decoding import (
@@ -95,11 +102,46 @@ def _video_request(**overrides) -> SimpleNamespace:
     return SimpleNamespace(**fields)
 
 
-@unittest.skipUnless(
-    torch.cuda.is_available() and hasattr(os, "memfd_create"),
-    "needs CUDA and memfd",
-)
+@unittest.skipUnless(condition=torch.cuda.is_available(), reason="needs CUDA")
 class TestStreamedEncode(CustomTestCase):
+    @torch.no_grad()
+    def test_hunyuan_without_callback_matches_one_shot_mp4(self):
+        config = HunyuanVAEConfig(
+            arch_config=HunyuanVAEArchConfig(
+                latent_channels=4,
+                block_out_channels=(8, 8, 8),
+                down_block_types=("HunyuanVideoDownBlock3D",) * 3,
+                up_block_types=("HunyuanVideoUpBlock3D",) * 3,
+                layers_per_block=1,
+                norm_num_groups=4,
+                temporal_compression_ratio=4,
+                mid_block_add_attention=False,
+            ),
+            load_encoder=False,
+        )
+        server_args = _server_args(HunyuanConfig(vae_config=config))
+        stage = _stage(AutoencoderKLHunyuanVideo(config).cuda().eval(), server_args)
+        with tempfile.TemporaryDirectory() as tmp:
+            streamed, one_shot = Path(tmp, "stream.mp4"), Path(tmp, "normal.mp4")
+            stream = EncodeWhileDecoding(str(streamed), _video_request())
+            frames = stage.decode(
+                torch.randn(1, 4, 2, 10, 12, device="cuda"),
+                server_args,
+                vae_dtype=torch.float32,
+                on_frames=stream,
+            )
+            self.assertEqual(stream.finish(), [str(streamed)])
+            self.assertTrue(
+                _try_save_cuda_video_direct(
+                    save_file_path=str(one_shot),
+                    sample=frames[0],
+                    fps=FPS,
+                    audio_sample_rate=None,
+                    output_compression=None,
+                )
+            )
+            self.assertEqual(one_shot.read_bytes(), streamed.read_bytes())
+
     @torch.no_grad()
     def test_streamed_mp4_matches_the_one_shot_save(self):
         generator = torch.Generator(device="cuda").manual_seed(0)
@@ -182,12 +224,38 @@ class TestStreamedEncode(CustomTestCase):
                 SimpleNamespace(**{**vars(server_args), "enable_torch_compile": True}),
             ),
             ("stage_decode", _stage(stage.vae, server_args, OwnDecode), server_args),
-            ("vae", _stage(torch.nn.Identity(), server_args), server_args),
         ):
             with self.subTest(name=name):
                 self.assertIsNone(
                     candidate._encode_while_decoding(_video_request(), args)
                 )
+
+    @torch.no_grad()
+    def test_decoder_without_callback_hands_over_the_complete_clip(self):
+        config = _vae_config(wan22=False)
+        server_args = _server_args(WanT2V480PConfig(vae_config=config))
+        stage = _stage(_vae(config, "cuda"), server_args)
+        # The shared stage must not inject a keyword into an ordinary decoder.
+        stage.vae.supports_decode_on_frames = False
+        self.assertIsNone(stage._encode_while_decoding(_video_request(), server_args))
+        expected = torch.randn(1, 3, 5, 40, 48, device="cuda")
+        decode = mock.Mock(side_effect=lambda latents: expected)
+        for output in (expected, expected[:, :, 0]):
+            with self.subTest(shape=output.shape):
+                decode.side_effect = lambda latents: output
+                received = []
+                with mock.patch.object(
+                    stage, "_get_vae_decode_fn", return_value=decode
+                ):
+                    actual = stage.decode(
+                        torch.zeros(1, Z_DIM, 2, 2, 2, device="cuda"),
+                        server_args,
+                        vae_dtype=torch.float32,
+                        on_frames=received.append,
+                    )
+                self.assertEqual(len(received), int(output.ndim == 5))
+                if received:
+                    torch.testing.assert_close(received[0], actual, rtol=0, atol=0)
 
 
 if __name__ == "__main__":

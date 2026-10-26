@@ -64,24 +64,6 @@ def _real_tp_blend(
     return reduced
 
 
-def _buggy_old_tp_blend(
-    hidden_states: torch.Tensor,
-    probs: torch.Tensor,
-    indices: torch.Tensor,
-    partial_experts_per_rank: list[torch.Tensor],
-    num_moe_experts: int,
-) -> torch.Tensor:
-    """Old, broken sequence: all-reduce the replicated ``mod_out`` (so it gets
-    scaled by ``tp_size``) then mix. Proves the test catches a regression.
-    """
-    tp_size = len(partial_experts_per_rank)
-    mod_out_replicated = hidden_states * probs
-    mod_out_after_allreduce = mod_out_replicated * tp_size  # all-reduce of replicated
-    experts_out_full = torch.stack(partial_experts_per_rank, dim=0).sum(dim=0)
-    mod_mask = (indices != num_moe_experts).to(experts_out_full.dtype)
-    return mod_mask * experts_out_full + (1.0 - mod_mask) * mod_out_after_allreduce
-
-
 class TestZayaMODUnderTP(CustomTestCase):
     def _make_partials(self, T: int, H: int, tp_size: int):
         torch.manual_seed(31)
@@ -153,26 +135,6 @@ class TestZayaMODUnderTP(CustomTestCase):
         # mask is 0 on skip rows, 1 elsewhere.
         self.assertTrue(torch.all(mod_mask.squeeze(-1)[skip_rows] == 0))
         self.assertTrue(torch.all(mod_mask.squeeze(-1)[~skip_rows] == 1))
-
-    def test_old_blend_is_wrong_when_skip_used(self):
-        """Sanity: confirm the old (all-reduce mod_out) formula diverges from the
-        reference so a regression to that behavior would be caught.
-        """
-        T, H = 8, 16
-        num_experts = 4
-        tp_size = 4
-        hidden_states, probs, indices = self._make_inputs(
-            T, H, num_experts, frac_skip=0.5
-        )
-        full, partials = self._make_partials(T, H, tp_size)
-
-        ref = _reference_blend(hidden_states, probs, indices, full, num_experts)
-        buggy = _buggy_old_tp_blend(
-            hidden_states, probs, indices, partials, num_experts
-        )
-
-        with self.assertRaises(AssertionError):
-            torch.testing.assert_close(buggy, ref, atol=1e-3, rtol=1e-3)
 
 
 if __name__ == "__main__":

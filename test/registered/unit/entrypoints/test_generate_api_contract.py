@@ -53,6 +53,29 @@ class TestGenerateContract(CustomTestCase):
         self.assertIsNotNone(error)
         self.assertIn("unknown field", error)
 
+    def test_glm_external_ar_grid_payload_is_accepted(self):
+        """GLM external AR sends grid metadata with pre-tokenized inputs."""
+        for image_data in (
+            # generate_prior_tokens: one request, one grid list
+            [{"image_grid_thw": [[1, 32, 32], [1, 64, 64]]}],
+            # generate_prior_tokens_batch: one grid list per batch entry
+            [
+                [{"image_grid_thw": [[1, 32, 32], [1, 64, 64]]}],
+                [{"image_grid_thw": [[1, 32, 32], [1, 16, 16]]}],
+            ],
+        ):
+            with self.subTest(image_data=image_data):
+                self.assertIsNone(
+                    generate_contract_error(
+                        {"input_ids": [1, 2, 3], "image_data": image_data}
+                    )
+                )
+        # A grid row of the wrong scalar type is still a contract error.
+        error = generate_contract_error(
+            {"input_ids": [1], "image_data": [{"image_grid_thw": [[1, "h", 32]]}]}
+        )
+        self.assertIsNotNone(error)
+
     def test_preprocessed_inputs_are_not_an_http_shape(self):
         """processor_output / precomputed_embedding carry tensors: Engine-only."""
         error = generate_contract_error(

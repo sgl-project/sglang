@@ -11,12 +11,12 @@ import torch
 from torch import nn
 
 from sglang.kernels.ops.layernorm.mhc_boundary_hip import rmsnorm_with_sinkhorn
+from sglang.kernels.ops.layernorm.rmsnorm_fake_quant_amd_gfx95 import (
+    rmsnorm_fake_quant_fp8,
+)
 from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
     Fp8GridActivation,
     Mxfp8Activation,
-)
-from sglang.kernels.ops.quantization.rmsnorm_fake_quant_amd_gfx95 import (
-    rmsnorm_fake_quant_fp8,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.base_config import QuantizationConfig

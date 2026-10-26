@@ -23,13 +23,11 @@ import torch
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather_into_tensor,
     get_local_dp_buffer,
-    is_dp_attention_enabled,
 )
 from sglang.srt.layers.layer_boundary.layout import (
     batches_are_unpadded,
-    is_dense_ffn_fully_dp,
+    input_scattered_configured,
 )
-from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -55,7 +53,6 @@ class AttentionInputs:
         self.hidden_states_local = hidden_states
         self.forward_batch = forward_batch
         self.qkv_latent_func = qkv_latent_func
-        self.hidden_states_ = None
         self.qkv_latent_ = None
         # When True, hidden_states_local is already attn_tp-gathered upstream
         # (e.g. by the input-scattered attention input step for DSA). fetch_* must NOT gather again.
@@ -72,14 +69,6 @@ class AttentionInputs:
             self.qkv_latent_ = tp_gather(self.qkv_latent_, self.forward_batch)
         return self.qkv_latent_
 
-    def fetch_hidden_states(self):
-        if self.hidden_states_ is not None:
-            return self.hidden_states_
-        self.hidden_states_ = self.hidden_states_local
-        if get_attn_tp_context().input_scattered and not self.is_pre_gathered:
-            self.hidden_states_ = tp_gather(self.hidden_states_, self.forward_batch)
-        return self.hidden_states_
-
 
 class AttnTpContext:
     def __init__(self):
@@ -90,15 +79,13 @@ class AttnTpContext:
         # Only MHC pre-gathers hidden states before DSA attention, so non-MHC DSA
         # cannot use scattered inputs.
         self.is_dsa = is_dsa
+        # Only narrows input_scattered_configured(), for which stages bind
+        # the input-scattered variant.
         self.allow_input_scattered = (
-            get_parallel().enable_attn_tp_input_scattered
+            input_scattered_configured()
             and (_is_cuda or _is_npu)
             and q_lora_rank is not None
             and (is_mhc or not is_dsa)
-            and get_parallel().tp_size > 1
-            and not is_dp_attention_enabled()
-            and get_moe_a2a_backend().is_none()
-            and not is_dense_ffn_fully_dp()
             and not check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
             and get_spec().speculative_algorithm != "EAGLE3"
         )
@@ -130,11 +117,6 @@ class AttnTpContext:
         attn_inputs = get_forward().attn_inputs
         assert attn_inputs is not None
         return attn_inputs.fetch_qkv_latent()
-
-    def fetch_hidden_states(self):
-        attn_inputs = get_forward().attn_inputs
-        assert attn_inputs is not None
-        return attn_inputs.fetch_hidden_states()
 
     def clear_attn_inputs(self) -> None:
         get_forward().set("attn_inputs", None)

@@ -1,6 +1,7 @@
 import time
 import unittest
 from array import array
+from unittest.mock import patch
 
 import torch
 
@@ -33,7 +34,7 @@ class TestFcfsWaitingPrefixRefresh(CustomTestCase):
         self.addCleanup(reset_context)
         torch.set_default_device(None)
 
-    def _run_and_evict_one_prefix(self, eviction_policy):
+    def _run_and_evict_one_prefix(self, eviction_policy, second_refresh_time=None):
         kv_cache = MHATokenToKVPool(
             size=16,
             page_size=1,
@@ -82,7 +83,15 @@ class TestFcfsWaitingPrefixRefresh(CustomTestCase):
             ServerArgs(model_path="dummy", radix_eviction_policy=eviction_policy),
             role="test",
         )
-        SchedulePolicy("fcfs", cache, False, False, False).calc_priority(queue)
+        policy = SchedulePolicy("fcfs", cache, False, False, False)
+        # Isolate the scheduler clock from the radix cache's recency timestamps.
+        with patch("sglang.srt.managers.schedule_policy.time", create=True) as clock:
+            clock.monotonic.return_value = 100.0
+            policy.calc_priority(queue)
+            if second_refresh_time is not None:
+                cache.touch_prefix(RadixKey(array("q", NEWER_PREFIX)))
+                clock.monotonic.return_value = second_refresh_time
+                policy.calc_priority(queue)
         cache.evict(EvictParams(num_tokens=len(OLDER_PREFIX)))
         return [
             cache.match_prefix(
@@ -93,6 +102,12 @@ class TestFcfsWaitingPrefixRefresh(CustomTestCase):
 
     def test_lru_evicts_the_prefix_furthest_from_admission(self):
         self.assertEqual(self._run_and_evict_one_prefix("lru"), [4, 0])
+
+    def test_rank_local_clock_does_not_change_eviction(self):
+        before_interval = self._run_and_evict_one_prefix("lru", 100.49)
+        after_interval = self._run_and_evict_one_prefix("lru", 100.51)
+        self.assertEqual(before_interval, [0, 4])
+        self.assertEqual(after_interval, before_interval)
 
     def test_mru_keeps_plain_order(self):
         # MRU evicts the most recent first, so a refresh would invert its intent.

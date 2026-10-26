@@ -6,23 +6,26 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
-from sglang.srt.layers.moe.utils import MoeRunnerBackend
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.layers.moe.utils import MoeA2ABackend, MoeRunnerBackend
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptNvFp4FusedMoEMethod,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.models.llada2 import (
+    LLaDA2MoeGate,
     LLaDA2MoeSparseMoeBlock,
-    _get_effective_moe_runner_backend,
     _make_block_routing_triton_output,
+    _prepare_llada2_language_weights,
     _require_block_routing_ep1,
     _require_block_routing_runner_compatibility,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_context, get_flags, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -30,6 +33,39 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestLLaDA2BlockRoutingValidation(CustomTestCase):
+    def setUp(self):
+        self.enterContext(
+            get_context().override_server_args(model_path="dummy", device="cpu")
+        )
+        self.enterContext(
+            get_flags().moe.override(
+                runner_backend=MoeRunnerBackend.TRITON, a2a_backend=MoeA2ABackend.NONE
+            )
+        )
+        self.enterContext(
+            get_parallel().override(
+                tp_size=1,
+                tp_rank=0,
+                attn_tp_size=1,
+                attn_tp_rank=0,
+                moe_tp_size=1,
+                moe_tp_rank=0,
+                moe_ep_size=1,
+                moe_ep_rank=0,
+            )
+        )
+
+    def _build_experts(self, method):
+        with patch.object(method, "create_weights"):
+            return FusedMoE(
+                num_experts=4,
+                top_k=2,
+                hidden_size=8,
+                intermediate_size=256,
+                layer_id=0,
+                quant_method=method,
+            )
+
     def test_block_routing_accepts_ep1(self):
         _require_block_routing_ep1(1)
 
@@ -42,7 +78,7 @@ class TestLLaDA2BlockRoutingValidation(CustomTestCase):
             expert_capacity=48,
         )
 
-        with get_parallel().override(tp_size=4, moe_ep_size=4):
+        with get_parallel().override(tp_size=4, attn_tp_size=4, moe_ep_size=4):
             with self.assertRaisesRegex(
                 ValueError,
                 r"does not support expert parallelism.*moe_ep_size=4",
@@ -76,38 +112,24 @@ class TestLLaDA2BlockRoutingValidation(CustomTestCase):
         return_value=(10, 0),
     )
     @patch("sglang.srt.layers.quantization.modelopt_quant.is_cuda", return_value=True)
-    @patch("sglang.srt.layers.quantization.modelopt_quant.get_moe_runner_backend")
     def test_block_routing_rejects_auto_selected_plain_flashinfer(
         self,
-        backend,
         _is_cuda,
         _capability,
         runner,
     ):
-        backend.return_value = MoeRunnerBackend.AUTO
         quant_method = ModelOptNvFp4FusedMoEMethod.__new__(ModelOptNvFp4FusedMoEMethod)
-        quant_method.create_moe_runner(
-            SimpleNamespace(),
-            SimpleNamespace(),
-        )
-        experts = SimpleNamespace(quant_method=quant_method)
-
-        self.assertIs(
-            _get_effective_moe_runner_backend(experts),
-            MoeRunnerBackend.FLASHINFER_TRTLLM,
-        )
+        with get_flags().moe.override(runner_backend=MoeRunnerBackend.AUTO):
+            experts = self._build_experts(quant_method)
+        self.assertIs(experts.runner_backend, MoeRunnerBackend.FLASHINFER_TRTLLM)
         runner.assert_called_once_with(
             MoeRunnerBackend.FLASHINFER_TRTLLM,
             quant_method.moe_runner_config,
         )
         with self.assertRaisesRegex(ValueError, r"does not support.*flashinfer_trtllm"):
-            _require_block_routing_runner_compatibility(experts)
+            _require_block_routing_runner_compatibility(experts, top_k=2)
 
-    @patch("sglang.srt.models.llada2.get_moe_runner_backend")
-    def test_fused_scaling_contract_applies_scale_once(self, backend):
-        backend.return_value.is_triton_kernels.return_value = False
-        backend.return_value.is_aiter.return_value = False
-
+    def test_fused_scaling_contract_applies_scale_once(self):
         block = LLaDA2MoeSparseMoeBlock.__new__(LLaDA2MoeSparseMoeBlock)
         nn.Module.__init__(block)
         block.layer_id = 0
@@ -115,7 +137,9 @@ class TestLLaDA2BlockRoutingValidation(CustomTestCase):
         block.topk = SimpleNamespace(
             topk_config=SimpleNamespace(allow_routed_experts_capture=False)
         )
-        block.experts = SimpleNamespace(should_fuse_routed_scaling_factor_in_topk=True)
+        block.experts = SimpleNamespace(
+            runner_backend=None, should_fuse_routed_scaling_factor_in_topk=True
+        )
 
         router_logits = torch.zeros((1, 4), dtype=torch.float32)
         topk_weights = torch.tensor([[0.25, 0.75]], dtype=torch.float32)
@@ -141,13 +165,7 @@ class TestLLaDA2BlockRoutingValidation(CustomTestCase):
                 "sglang.srt.layers.quantization.unquant._use_aiter",
                 True,
             ),
-            patch(
-                "sglang.srt.layers.quantization.unquant.get_moe_runner_backend",
-                return_value=MoeRunnerBackend.AUTO,
-            ),
-            patch(
-                "sglang.srt.layers.quantization.unquant.get_moe_a2a_backend"
-            ) as get_a2a_backend,
+            get_flags().moe.override(runner_backend=MoeRunnerBackend.AUTO),
             patch(
                 "sglang.srt.layers.quantization.unquant.MoeRunner",
                 side_effect=lambda backend, config: SimpleNamespace(
@@ -155,12 +173,8 @@ class TestLLaDA2BlockRoutingValidation(CustomTestCase):
                 ),
             ),
         ):
-            get_a2a_backend.return_value.supports_aiter.return_value = True
             quant_method = UnquantizedFusedMoEMethod()
-            quant_method.create_moe_runner(
-                SimpleNamespace(intermediate_size_per_partition=256),
-                SimpleNamespace(),
-            )
+            experts = self._build_experts(quant_method)
 
         self.assertIs(
             quant_method.runner.runner_backend,
@@ -178,16 +192,8 @@ class TestLLaDA2BlockRoutingValidation(CustomTestCase):
         block.topk = SimpleNamespace(
             topk_config=SimpleNamespace(allow_routed_experts_capture=False)
         )
-        block.experts = SimpleNamespace(
-            quant_method=quant_method,
-            runner=quant_method.runner,
-            should_fuse_routed_scaling_factor_in_topk=False,
-        )
-
-        self.assertIs(
-            _get_effective_moe_runner_backend(block.experts),
-            MoeRunnerBackend.AITER,
-        )
+        block.experts = experts
+        self.assertIs(block.experts.runner_backend, MoeRunnerBackend.AITER)
 
         router_logits = torch.zeros((1, 4), dtype=torch.float32)
         topk_weights = torch.tensor([[0.25, 0.75]], dtype=torch.float32)
@@ -207,24 +213,21 @@ class TestLLaDA2BlockRoutingValidation(CustomTestCase):
         self.assertIs(result.topk_ids, topk_ids)
         self.assertIs(result.router_logits, router_logits)
 
-    @patch("sglang.srt.models.llada2.get_moe_runner_backend")
     @patch("sglang.srt.models.llada2.get_global_expert_distribution_recorder")
     @patch("sglang.srt.models.llada2.capture_routed_experts_if_allowed")
     def test_block_routing_runs_precomputed_route_hooks(
         self,
         capture_routed_experts,
         get_recorder,
-        backend,
     ):
-        backend.return_value.is_triton_kernels.return_value = False
-        backend.return_value.is_aiter.return_value = False
-
         block = LLaDA2MoeSparseMoeBlock.__new__(LLaDA2MoeSparseMoeBlock)
         nn.Module.__init__(block)
         block.layer_id = 7
         block.routed_scaling_factor = 1.0
         block.topk = SimpleNamespace(topk_config=object())
-        block.experts = SimpleNamespace(should_fuse_routed_scaling_factor_in_topk=False)
+        block.experts = SimpleNamespace(
+            runner_backend=None, should_fuse_routed_scaling_factor_in_topk=False
+        )
         topk_ids = torch.tensor([[1, 3]], dtype=torch.int32)
 
         block._make_block_topk_output(
@@ -239,6 +242,46 @@ class TestLLaDA2BlockRoutingValidation(CustomTestCase):
         get_recorder.return_value.on_select_experts.assert_called_once_with(
             topk_ids=topk_ids
         )
+
+    def test_direct_standard_contract_does_not_fall_back_to_global_backend(self):
+        block = LLaDA2MoeSparseMoeBlock.__new__(LLaDA2MoeSparseMoeBlock)
+        nn.Module.__init__(block)
+        block.layer_id = 0
+        block.routed_scaling_factor = 2.5
+        block.topk = SimpleNamespace(
+            topk_config=SimpleNamespace(allow_routed_experts_capture=False)
+        )
+        block.experts = SimpleNamespace(
+            runner_backend=None, should_fuse_routed_scaling_factor_in_topk=False
+        )
+        weights = torch.tensor([[0.25, 0.75]])
+        ids = torch.tensor([[0, 1]], dtype=torch.int32)
+        for requested in (MoeRunnerBackend.FLASHINFER_TRTLLM, MoeRunnerBackend.AITER):
+            with (
+                self.subTest(requested=requested),
+                get_flags().moe.override(runner_backend=requested),
+            ):
+                _require_block_routing_runner_compatibility(block.experts, top_k=3)
+                result = block._make_block_topk_output(
+                    torch.zeros((1, 4)), weights, ids
+                )
+                torch.testing.assert_close(result.topk_weights, weights, rtol=0, atol=0)
+                self.assertIs(result.topk_ids, ids)
+
+    def test_block_shape_guard_follows_the_layer_backend(self):
+        with get_flags().moe.override(runner_backend=MoeRunnerBackend.TRITON):
+            with self.assertRaisesRegex(ValueError, "power of two"):
+                _require_block_routing_runner_compatibility(
+                    SimpleNamespace(runner_backend=MoeRunnerBackend.TRITON_KERNELS),
+                    top_k=3,
+                )
+            _require_block_routing_runner_compatibility(
+                SimpleNamespace(runner_backend=MoeRunnerBackend.TRITON_KERNELS), top_k=2
+            )
+        with get_flags().moe.override(runner_backend=MoeRunnerBackend.TRITON_KERNELS):
+            _require_block_routing_runner_compatibility(
+                SimpleNamespace(runner_backend=MoeRunnerBackend.TRITON), top_k=3
+            )
 
     def test_block_routing_rejects_uniform_expert_simulation(self):
         with (
@@ -342,6 +385,58 @@ class TestLLaDA2DllmBlockSizeValidation(CustomTestCase):
                 r"requires the dLLM block size to match.*\(32\), got 16",
             ):
                 DllmConfig.from_server_args(self._server_args(config_path))
+
+
+class TestLLaDA2LanguageModel(CustomTestCase):
+    def test_fp32_router_logits_are_not_rounded_to_the_activation_dtype(self):
+        """An fp32 router must score bf16 activations in fp32, as the reference does."""
+        config = SimpleNamespace(
+            num_experts=4, hidden_size=8, moe_router_enable_expert_bias=True
+        )
+        gate = LLaDA2MoeGate(config, params_dtype=torch.float32)
+        with torch.no_grad():
+            gate.weight.copy_(torch.arange(32).reshape(4, 8) / 37)
+        hidden = (torch.arange(24).reshape(3, 8) / 19).to(torch.bfloat16)
+
+        logits = gate(hidden)
+
+        self.assertEqual(logits.dtype, torch.float32)
+        expected = F.linear(hidden.float(), gate.weight)
+        torch.testing.assert_close(logits, expected, rtol=0, atol=0)
+
+    def test_language_checkpoint_layout_is_normalized(self):
+        """Prefixed names and fused expert tensors load as the native layout."""
+        fused = torch.arange(24).reshape(2, 3, 4)
+        lm_head = torch.randn(4, 3)
+
+        expanded = list(
+            _prepare_llada2_language_weights(
+                [
+                    ("model.language_model.layers.1.mlp.experts.gate_proj", fused),
+                    ("model.lm_head.weight", lm_head),
+                ],
+                num_experts=2,
+            )
+        )
+
+        self.assertEqual(
+            [name for name, _ in expanded],
+            [
+                "model.layers.1.mlp.experts.0.gate_proj.weight",
+                "model.layers.1.mlp.experts.1.gate_proj.weight",
+                "lm_head.weight",
+            ],
+        )
+        torch.testing.assert_close(expanded[0][1], fused[0])
+        torch.testing.assert_close(expanded[1][1], fused[1])
+        torch.testing.assert_close(expanded[2][1], lm_head)
+        with self.assertRaisesRegex(ValueError, "expected first dimension 2"):
+            list(
+                _prepare_llada2_language_weights(
+                    [("model.layers.1.mlp.experts.down_proj", torch.empty(3, 4, 5))],
+                    num_experts=2,
+                )
+            )
 
 
 if __name__ == "__main__":

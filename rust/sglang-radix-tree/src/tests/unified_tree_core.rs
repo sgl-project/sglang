@@ -1,3 +1,6 @@
+use crate::cache_action::{
+    BackupKV, FreeDeviceKV, RecoverSwaWithLockedFull, UpdatePendingBackupOnNodeSplit,
+};
 use std::sync::Mutex;
 
 use tch::Tensor;
@@ -5,10 +8,270 @@ use tch::Tensor;
 use super::*;
 use crate::components::{ComponentSet, FULL, MAMBA, SWA};
 use crate::node::{NodeAccessError, ValueSlotIdx};
-use crate::test_utils::{accumulate_step, action_kinds, matched_device_indices};
+use crate::test_utils::{accumulate_step, action_kinds, expect_action, matched_device_indices};
 
 fn core() -> UnifiedTreeCore<Vec<i64>> {
     UnifiedTreeCore::new(CacheInitParams::default(), vec![FULL])
+}
+
+fn add_leaf<K: ChildKeyType>(core: &mut UnifiedTreeCore<K>, parent: NodeIdx_, key: K) -> NodeIdx_ {
+    let values = Tensor::arange(key.atom_len() as i64, (Kind::Int64, Device::Cpu));
+    core.add_new_node_(parent, key, &values, 0, None)
+}
+
+#[test]
+fn component_size_adjustment_tracks_changed_backing_through_locks_and_eviction() {
+    let mut core = core();
+    let root = core.arena.root();
+    let node = add_leaf(&mut core, root, vec![1, 2, 3, 4]);
+    let id = core.arena.node(node).id;
+    // Resize key and backing together, keeping the same child edge.
+    let _ = core.arena.take_device_value(node, FULL);
+    core.arena.node_mut(node).key = vec![1, 2, 3, 4, 5];
+    core.arena
+        .set_device_value(node, FULL, Tensor::from_slice(&[10i64, 11, 12, 13, 14]));
+    core.adjust_component_size(id, FULL, 1).unwrap();
+    assert_eq!(core.evictable_size_(FULL), 5);
+    assert_eq!(core.protected_size_(FULL), 0);
+    core.sanity_check(&[], &[]);
+
+    let receipt = core.inc_lock_ref(id, ComponentSet::EMPTY).unwrap();
+    assert_eq!(core.evictable_size_(FULL), 0);
+    assert_eq!(core.protected_size_(FULL), 5);
+
+    let _ = core.arena.take_device_value(node, FULL);
+    core.arena.node_mut(node).key = vec![1, 2, 3, 4];
+    core.arena
+        .set_device_value(node, FULL, Tensor::from_slice(&[20i64, 21, 22, 23]));
+    core.adjust_component_size(id, FULL, -1).unwrap();
+    assert_eq!(core.protected_size_(FULL), 4);
+    core.sanity_check(&[], &[]);
+
+    core.dec_lock_ref(id, &receipt.to_dec_params(), false)
+        .unwrap();
+    assert_eq!(core.evictable_size_(FULL), 4);
+    assert_eq!(core.protected_size_(FULL), 0);
+    let (_, evicted) = core.evict_device_leaf(id, false).unwrap();
+    assert_eq!(evicted.tracker[&FULL], 4);
+    assert!(evicted.device_frees[&FULL][0].equal(&Tensor::from_slice(&[20i64, 21, 22, 23])));
+    assert_eq!(core.evictable_size_(FULL), 0);
+    core.sanity_check(&[], &[]);
+}
+
+#[test]
+fn component_size_adjustment_errors_preserve_both_ledgers() {
+    let mut core = core();
+    let root = core.arena.root();
+    let node = add_leaf(&mut core, root, vec![1, 2, 3, 4]);
+    let id = core.arena.node(node).id;
+    for protected in [false, true] {
+        let receipt = protected.then(|| core.inc_lock_ref(id, ComponentSet::EMPTY).unwrap());
+        let before = (core.evictable_size_(FULL), core.protected_size_(FULL));
+        for delta in [-5, i64::MIN] {
+            assert!(matches!(
+                core.adjust_component_size(id, FULL, delta),
+                Err(TreeCoreRuntimeError::InvalidComponentSizeDelta {
+                    current: 4,
+                    protected: actual,
+                    ..
+                }) if actual == protected
+            ));
+            assert_eq!(
+                (core.evictable_size_(FULL), core.protected_size_(FULL)),
+                before
+            );
+        }
+        let state = core.component_state_mut(FULL);
+        if protected {
+            state.protected_size = usize::MAX;
+        } else {
+            state.evictable_size = usize::MAX;
+        }
+        assert!(matches!(
+            core.adjust_component_size(id, FULL, 1),
+            Err(TreeCoreRuntimeError::InvalidComponentSizeDelta { .. })
+        ));
+        assert_eq!(
+            (core.evictable_size_(FULL), core.protected_size_(FULL)),
+            if protected {
+                (0, usize::MAX)
+            } else {
+                (usize::MAX, 0)
+            }
+        );
+        let state = core.component_state_mut(FULL);
+        state.evictable_size = before.0;
+        state.protected_size = before.1;
+        if let Some(receipt) = receipt {
+            core.dec_lock_ref(id, &receipt.to_dec_params(), false)
+                .unwrap();
+        }
+    }
+    assert!(matches!(
+        core.adjust_component_size(id, SWA, 0),
+        Err(TreeCoreRuntimeError::ComponentNotEnabled {
+            component_type: SWA
+        })
+    ));
+    assert!(matches!(
+        core.adjust_component_size(usize::MAX, FULL, 0),
+        Err(TreeCoreRuntimeError::NodeAccess(_))
+    ));
+    assert_eq!(
+        (core.evictable_size_(FULL), core.protected_size_(FULL)),
+        (4, 0)
+    );
+    core.sanity_check(&[], &[]);
+
+    core.evict_device_leaf(id, false).unwrap();
+    assert!(matches!(
+        core.adjust_component_size(id, FULL, 0),
+        Err(TreeCoreRuntimeError::NodeAccess(_))
+    ));
+}
+
+#[test]
+fn component_size_adjustment_ignores_valid_roots_and_device_tombstones() {
+    let mut core = core();
+    core.set_hicache_enabled();
+    let root = core.arena.root();
+    let root_id = core.arena.node(root).id;
+    let node = add_leaf(&mut core, root, vec![1, 2]);
+    let id = core.arena.node(node).id;
+    core.commit_backup(id, Tensor::from_slice(&[20i64, 21]), HashMap::new())
+        .unwrap();
+    core.demote(id).unwrap();
+    for id in [root_id, id] {
+        for delta in [i64::MIN, 0, i64::MAX] {
+            core.adjust_component_size(id, FULL, delta).unwrap();
+        }
+        assert!(matches!(
+            core.adjust_component_size(id, SWA, 0),
+            Err(TreeCoreRuntimeError::ComponentNotEnabled { .. })
+        ));
+    }
+    assert_eq!(
+        (core.evictable_size_(FULL), core.protected_size_(FULL)),
+        (0, 0)
+    );
+    core.sanity_check(&[], &[]);
+}
+
+fn assert_path_info<K: ChildKeyType>() {
+    let mut core = UnifiedTreeCore::<K>::new(CacheInitParams::default(), vec![FULL]);
+    core.set_hicache_enabled();
+    let root = core.arena.root();
+    let root_id = core.arena.node(root).id;
+    let key = K::key_from(std::borrow::Cow::Owned(vec![1, 2, 3, 4, 5, 6, 7])).into_owned();
+    let total = key.atom_len();
+    let tail = add_leaf(&mut core, root, key);
+    let (head, action) = core.split_node_(tail, 2);
+    assert!(action.is_none());
+    let other_key = K::key_from(std::borrow::Cow::Owned(vec![20, 21, 22])).into_owned();
+    let other_len = other_key.atom_len();
+    let other = add_leaf(&mut core, root, other_key);
+    let head_id = core.arena.node(head).id;
+    let tail_id = core.arena.node(tail).id;
+    let other_id = core.arena.node(other).id;
+    let full_path = vec![
+        TreePathNodeInfo {
+            node_id: head_id,
+            parent_id: root_id,
+            path_start: 0,
+            path_end: 2,
+            full_value_len: Some(2),
+            num_children: 1,
+        },
+        TreePathNodeInfo {
+            node_id: tail_id,
+            parent_id: head_id,
+            path_start: 2,
+            path_end: total,
+            full_value_len: Some(total - 2),
+            num_children: 0,
+        },
+    ];
+    let snapshot = core
+        .collect_path_info(&[tail_id, root_id, other_id, tail_id])
+        .unwrap();
+    assert_eq!(
+        snapshot,
+        vec![
+            full_path.clone(),
+            vec![],
+            vec![TreePathNodeInfo {
+                node_id: other_id,
+                parent_id: root_id,
+                path_start: 0,
+                path_end: other_len,
+                full_value_len: Some(other_len),
+                num_children: 0,
+            }],
+            full_path.clone(),
+        ]
+    );
+    assert!(core.collect_path_info(&[]).unwrap().is_empty());
+
+    let branch_key = K::key_from(std::borrow::Cow::Owned(vec![40, 41, 42])).into_owned();
+    let branch = add_leaf(&mut core, head, branch_key);
+    let branch_id = core.arena.node(branch).id;
+    let branched = core.collect_path_info(&[tail_id, branch_id]).unwrap();
+    for path in &branched {
+        assert_eq!(path[0].num_children, 2);
+        assert_eq!(path[1].num_children, 0);
+    }
+    assert_eq!(snapshot[0], full_path); // Child counts are snapshots too.
+    core.evict_device_leaf(branch_id, false).unwrap();
+    assert_eq!(core.collect_path_info(&[tail_id]).unwrap()[0], full_path);
+
+    core.commit_backup(head_id, Tensor::from_slice(&[30i64, 31]), HashMap::new())
+        .unwrap();
+    core.commit_backup(
+        tail_id,
+        Tensor::arange((total - 2) as i64, (Kind::Int64, Device::Cpu)),
+        HashMap::new(),
+    )
+    .unwrap();
+    core.demote(tail_id).unwrap();
+    core.demote(head_id).unwrap();
+    let tombstone_path = core.collect_path_info(&[tail_id]).unwrap();
+    assert_eq!(
+        tombstone_path[0][0],
+        TreePathNodeInfo {
+            full_value_len: None,
+            ..full_path[0]
+        }
+    );
+    assert_eq!(
+        tombstone_path[0][1],
+        TreePathNodeInfo {
+            full_value_len: None,
+            ..full_path[1]
+        }
+    );
+    assert_eq!(snapshot[0], full_path); // Earlier snapshot stays unchanged.
+    assert!(matches!(
+        core.collect_path_info(&[tail_id, usize::MAX, other_id]),
+        Err(TreeCoreRuntimeError::NodeAccess(_))
+    ));
+    core.sanity_check(&[], &[]);
+
+    core.reset();
+    assert!(matches!(
+        core.collect_path_info(&[tail_id]),
+        Err(TreeCoreRuntimeError::NodeAccess(_))
+    ));
+    assert_eq!(snapshot[0], full_path);
+}
+
+#[test]
+fn path_info_plain_keys() {
+    assert_path_info::<Vec<i64>>();
+}
+
+#[test]
+fn path_info_bigram_keys_use_normalized_atoms() {
+    assert_path_info::<Vec<(i64, i64)>>();
 }
 
 // Records every refresh_lru dispatch; unrelated hooks stay unimplemented.
@@ -54,6 +317,7 @@ impl TreeComponent<Vec<i64>> for RecordingComponentForTest {
         _node_id: NodeIdx_,
         _device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         _host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        _cache_actions: &mut CacheActions,
         _target: EvictLayer,
     ) -> (usize, usize) {
         unimplemented!()
@@ -69,6 +333,7 @@ impl TreeComponent<Vec<i64>> for RecordingComponentForTest {
         _tracker: &mut HashMap<ComponentType, usize>,
         _device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         _host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        _cache_actions: &mut CacheActions,
     ) -> Option<NodeIdx_> {
         unimplemented!()
     }
@@ -104,6 +369,7 @@ impl TreeComponent<Vec<i64>> for RecordingComponentForTest {
         tracker: &mut HashMap<ComponentType, usize>,
         _device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         _host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        _cache_actions: &mut CacheActions,
     ) {
         let tracked = tracker[&SWA];
         self.host_eviction_calls
@@ -120,6 +386,7 @@ impl TreeComponent<Vec<i64>> for RecordingComponentForTest {
         tracker: &mut HashMap<ComponentType, usize>,
         _device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         _host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        _cache_actions: &mut CacheActions,
     ) {
         let tracked = tracker[&SWA];
         self.host_eviction_calls
@@ -176,6 +443,7 @@ impl TreeComponent<Vec<i64>> for CountingComponentForTest {
         _node_id: NodeIdx_,
         _device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         _host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        _cache_actions: &mut CacheActions,
         _target: EvictLayer,
     ) -> (usize, usize) {
         unimplemented!()
@@ -191,6 +459,7 @@ impl TreeComponent<Vec<i64>> for CountingComponentForTest {
         _tracker: &mut HashMap<ComponentType, usize>,
         _device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         _host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        _cache_actions: &mut CacheActions,
     ) -> Option<NodeIdx_> {
         unimplemented!()
     }
@@ -256,6 +525,7 @@ impl TreeComponent<Vec<i64>> for LowPriorityComponentForTest {
         _node_id: NodeIdx_,
         _device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         _host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        _cache_actions: &mut CacheActions,
         _target: EvictLayer,
     ) -> (usize, usize) {
         unimplemented!()
@@ -271,6 +541,7 @@ impl TreeComponent<Vec<i64>> for LowPriorityComponentForTest {
         _tracker: &mut HashMap<ComponentType, usize>,
         _device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         _host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        _cache_actions: &mut CacheActions,
     ) -> Option<NodeIdx_> {
         unimplemented!()
     }
@@ -331,6 +602,7 @@ impl TreeComponent<Vec<i64>> for SwaComponentForTest {
         _node_id: NodeIdx_,
         _device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         _host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        _cache_actions: &mut CacheActions,
         _target: EvictLayer,
     ) -> (usize, usize) {
         unimplemented!()
@@ -346,6 +618,7 @@ impl TreeComponent<Vec<i64>> for SwaComponentForTest {
         _tracker: &mut HashMap<ComponentType, usize>,
         _device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         _host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        _cache_actions: &mut CacheActions,
     ) -> Option<NodeIdx_> {
         unimplemented!()
     }
@@ -412,6 +685,7 @@ impl TreeComponent<Vec<i64>> for SwaEvictionComponentForTest {
         node_id: NodeIdx_,
         device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        _cache_actions: &mut CacheActions,
         target: EvictLayer,
     ) -> (usize, usize) {
         self.evictions.lock().unwrap().push((node_id, target));
@@ -459,6 +733,7 @@ impl TreeComponent<Vec<i64>> for SwaEvictionComponentForTest {
         _tracker: &mut HashMap<ComponentType, usize>,
         _device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         _host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        _cache_actions: &mut CacheActions,
     ) -> Option<NodeIdx_> {
         unimplemented!()
     }
@@ -518,6 +793,7 @@ fn dec_lock_ref_skip_swa_skips_the_swa_component() {
         tc.arena.node(n1).id,
         /* params = */
         &DecLockRefParams {
+            node_id: Some(tc.arena.node(n1).id),
             skipped_lock_components: ComponentSet::EMPTY,
             ..Default::default()
         },
@@ -558,6 +834,7 @@ fn dec_lock_ref_without_skip_swa_reaches_every_component() {
         tc.arena.node(n1).id,
         /* params = */
         &DecLockRefParams {
+            node_id: Some(tc.arena.node(n1).id),
             skipped_lock_components: ComponentSet::EMPTY,
             ..Default::default()
         },
@@ -639,12 +916,14 @@ fn dec_swa_lock_only_dispatches_lower_priority_releases() {
     let _ = tc.dec_swa_lock_only(
         tc.arena.node(root).id,
         &DecLockRefParams {
+            node_id: Some(tc.arena.node(root).id),
             component_lock_uuids: HashMap::from([(SWA.idx() as u8, Some(7))]),
             skipped_lock_components: ComponentSet::EMPTY,
             ..Default::default()
         },
         &mut device_frees,
         &mut host_frees,
+        &mut Vec::new(),
     );
 }
 
@@ -673,10 +952,14 @@ fn dec_swa_lock_only_returns_device_frees_in_the_device_dict() {
         swa_sliding_window_size: Some(2),
         ..Default::default()
     });
+    let a_id = tc.arena.node(a).id;
     let result = swa.acquire_component_lock(
         &mut tc,
         a,
-        IncLockRefResult::default(),
+        IncLockRefResult {
+            node_id: Some(a_id),
+            ..Default::default()
+        },
         /* lock_host = */ false,
     );
     let mut device_frees = HashMap::new();
@@ -686,6 +969,7 @@ fn dec_swa_lock_only_returns_device_frees_in_the_device_dict() {
         &result.to_dec_params(),
         &mut device_frees,
         &mut host_frees,
+        &mut Vec::new(),
     )
     .expect("live test node");
     // The fully unlocked D-leaf's SWA value is device-evicted on release;
@@ -1242,6 +1526,7 @@ fn match_prefix_returns_the_full_hit() {
     assert_eq!(result.best_match_node_id, tc.arena.node(b).id);
     assert_eq!(result.host_hit_length, 0);
     assert!(result.cache_actions.is_empty());
+    assert_eq!(result.last_visited_node_id, Some(tc.arena.node(b).id));
 }
 
 #[test]
@@ -1251,6 +1536,7 @@ fn match_prefix_stops_at_the_matched_depth() {
     let result = tc.match_prefix(&match_params(&vec![1, 2, 9]));
     assert!(matched_device_indices(&tc, &result).equal(&Tensor::from_slice(&[10i64, 11])));
     assert_eq!(result.best_match_node_id, tc.arena.node(a).id);
+    assert_eq!(result.last_visited_node_id, Some(tc.arena.node(a).id));
 }
 
 #[test]
@@ -1262,6 +1548,7 @@ fn match_prefix_miss_anchors_at_the_root() {
     assert_eq!(result.device_prefix_len, 0);
     assert_eq!(result.best_match_node_id, tc.arena.node(root).id);
     assert_eq!(result.last_device_node_id, tc.arena.node(root).id);
+    assert_eq!(result.last_visited_node_id, None);
 }
 
 #[test]
@@ -1284,6 +1571,7 @@ fn match_prefix_splits_on_a_partial_match() {
         tc.arena.node(a).parent(),
         tc.arena.resolve(prefix_node).expect("live test node")
     );
+    assert_eq!(result.last_visited_node_id, Some(prefix_node));
 }
 
 #[test]
@@ -1323,6 +1611,7 @@ fn match_prefix_stops_at_a_dead_node() {
     let result = tc.match_prefix(&match_params(&vec![1, 2]));
     assert_eq!(result.device_prefix_len, 0);
     assert_eq!(result.best_match_node_id, tc.arena.node(root).id);
+    assert_eq!(result.last_visited_node_id, None);
 }
 
 #[test]
@@ -1389,6 +1678,8 @@ fn match_prefix_empty_query_anchors_at_the_root() {
             key: &vec![],
             namespace: KeyNamespaceRef::new(extra_key, None),
         });
+        assert_eq!(result.last_visited_node_id, None);
+        assert_eq!(result.full_device_match_len, None);
         assert_eq!(result.best_match_node_id, root_handle);
         assert_eq!(result.last_device_node_id, root_handle);
         assert_eq!(result.last_host_node_id, root_handle);
@@ -1409,6 +1700,7 @@ fn match_prefix_skips_host_only_nodes_without_hicache() {
     assert!(matched_device_indices(&tc, &result).equal(&Tensor::from_slice(&[10i64, 11])));
     assert_eq!(result.best_match_node_id, tc.arena.node(a).id);
     assert_eq!(result.last_device_node_id, tc.arena.node(a).id);
+    assert_eq!(result.last_visited_node_id, Some(tc.arena.node(b).id));
 }
 
 #[test]
@@ -1427,6 +1719,7 @@ fn match_prefix_with_hicache_advances_best_match_onto_host_nodes() {
     assert_eq!(result.last_host_node_id, tc.arena.node(b).id);
     assert_eq!(result.host_hit_length, 1);
     assert!(result.cache_actions.is_empty());
+    assert_eq!(result.last_visited_node_id, Some(tc.arena.node(b).id));
 }
 
 #[test]
@@ -1609,6 +1902,8 @@ fn match_prefix_swa_tombstone_holds_the_best_match_below_the_window() {
     let result = tc.match_prefix(&match_params(&vec![1, 2, 3, 4]));
     assert_eq!(result.best_match_node_id, tc.arena.node(a).id);
     assert!(matched_device_indices(&tc, &result).equal(&Tensor::from_slice(&[10i64, 11])));
+    assert_eq!(result.last_visited_node_id, Some(tc.arena.node(c).id));
+    assert_eq!(result.full_device_match_len, None);
 }
 
 #[test]
@@ -2152,12 +2447,13 @@ fn insert_full_overlap_frees_the_duplicates() {
     let result = tc.insert(&insert_params(&vec![1, 2, 3], &[20, 21, 22]));
     assert_eq!(result.prefix_len, 3);
     // Nothing was consumed by any component: the whole overlap is duplicate.
-    let [CacheAction::FreeDeviceKV(freed)] = result.cache_actions.as_slice() else {
+    let [action] = result.cache_actions.as_slice() else {
         panic!(
             "expected one FreeDeviceKV action, got {:?}",
             action_kinds(&result.cache_actions)
         );
     };
+    let FreeDeviceKV { indices: freed } = expect_action::<FreeDeviceKV>(action.as_ref());
     assert_eq!(freed.len(), 1);
     assert!(freed[0].equal(&Tensor::from_slice(&[20i64, 21, 22])));
 }
@@ -2171,12 +2467,13 @@ fn insert_prev_prefix_len_narrows_the_dup_window() {
         prev_prefix_len: 2,
         ..insert_params(&vec![1, 2, 3], &[20, 21, 22])
     });
-    let [CacheAction::FreeDeviceKV(freed)] = result.cache_actions.as_slice() else {
+    let [action] = result.cache_actions.as_slice() else {
         panic!(
             "expected one FreeDeviceKV action, got {:?}",
             action_kinds(&result.cache_actions)
         );
     };
+    let FreeDeviceKV { indices: freed } = expect_action::<FreeDeviceKV>(action.as_ref());
     assert!(freed[0].equal(&Tensor::from_slice(&[22i64])));
 }
 
@@ -2187,12 +2484,13 @@ fn insert_extends_an_existing_prefix() {
     let result = tc.insert(&insert_params(&vec![1, 2, 3, 4, 5], &[20, 21, 22, 13, 14]));
     assert_eq!(result.prefix_len, 3);
     // The existing node's overlap is duplicate; the new suffix is kept.
-    let [CacheAction::FreeDeviceKV(freed)] = result.cache_actions.as_slice() else {
+    let [action] = result.cache_actions.as_slice() else {
         panic!(
             "expected one FreeDeviceKV action, got {:?}",
             action_kinds(&result.cache_actions)
         );
     };
+    let FreeDeviceKV { indices: freed } = expect_action::<FreeDeviceKV>(action.as_ref());
     assert_eq!(freed.len(), 1);
     assert!(freed[0].equal(&Tensor::from_slice(&[20i64, 21, 22])));
     let matched = tc.match_prefix(&match_params(&vec![1, 2, 3, 4, 5]));
@@ -2214,12 +2512,13 @@ fn insert_prev_prefix_len_spans_a_multi_node_walk() {
         ..insert_params(&vec![1, 2, 3, 4, 5], &[30, 31, 32, 33, 34])
     });
     assert_eq!(result.prefix_len, 5);
-    let [CacheAction::FreeDeviceKV(freed)] = result.cache_actions.as_slice() else {
+    let [action] = result.cache_actions.as_slice() else {
         panic!(
             "expected one FreeDeviceKV action, got {:?}",
             action_kinds(&result.cache_actions)
         );
     };
+    let FreeDeviceKV { indices: freed } = expect_action::<FreeDeviceKV>(action.as_ref());
     assert_eq!(freed.len(), 1);
     assert!(freed[0].equal(&Tensor::from_slice(&[33i64, 34])));
 }
@@ -2236,12 +2535,13 @@ fn insert_prev_prefix_len_narrows_mid_node_on_a_multi_node_walk() {
         ..insert_params(&vec![1, 2, 3, 4, 5], &[30, 31, 32, 33, 34])
     });
     assert_eq!(result.prefix_len, 5);
-    let [CacheAction::FreeDeviceKV(freed)] = result.cache_actions.as_slice() else {
+    let [action] = result.cache_actions.as_slice() else {
         panic!(
             "expected one FreeDeviceKV action, got {:?}",
             action_kinds(&result.cache_actions)
         );
     };
+    let FreeDeviceKV { indices: freed } = expect_action::<FreeDeviceKV>(action.as_ref());
     assert_eq!(freed.len(), 1);
     assert!(freed[0].equal(&Tensor::from_slice(&[34i64])));
 }
@@ -2388,9 +2688,11 @@ fn insert_threshold_crossing_emits_the_backup_kv_action() {
     let backups: Vec<_> = result
         .cache_actions
         .iter()
-        .filter_map(|action| match action {
-            CacheAction::BackupKV(backup) => Some(backup.node_ids.clone()),
-            _ => None,
+        .filter_map(|action| {
+            action
+                .as_any()
+                .downcast_ref::<BackupKV>()
+                .map(|backup| backup.node_ids.clone())
         })
         .collect();
     assert_eq!(backups, vec![vec![leaf]]);
@@ -2409,7 +2711,7 @@ fn external_linker_hashes_new_nodes_and_triggers_offload_action() {
     let result = tc.insert(&insert_params(&vec![1, 2], &[10, 11]));
     let leaf = result.last_device_node_id.unwrap();
     assert!(result.cache_actions.iter().any(|action| {
-        matches!(action, CacheAction::BackupKV(backup) if backup.node_ids == vec![leaf])
+        matches!(action.as_any().downcast_ref::<BackupKV>(), Some(backup) if backup.node_ids == vec![leaf])
     }));
 
     let transfers = tc
@@ -2474,24 +2776,6 @@ fn external_linker_swa_offload_uses_complete_trailing_pages() {
         transfers[1].keys.as_ref().unwrap(),
         &tc.arena.node(node).hash_value.as_ref().unwrap()[1..]
     );
-}
-
-#[test]
-fn external_linker_rejects_mamba_trees() {
-    let params = CacheInitParams {
-        mamba_cache_chunk_size: Some(1),
-        ..Default::default()
-    };
-    let mut tc: UnifiedTreeCore<Vec<i64>> = UnifiedTreeCore::new(params, vec![FULL, MAMBA]);
-    let error = tc.set_enable_external_cache_linker(true).unwrap_err();
-    assert!(matches!(
-        &error,
-        TreeCoreRuntimeError::ExternalCacheLinkerUnsupportedComponent {
-            component_type
-        } if *component_type == MAMBA
-    ));
-    assert!(error.to_string().contains("Mamba"));
-    assert!(!tc.enable_external_cache_linker);
 }
 
 #[test]
@@ -2744,50 +3028,34 @@ fn backup_kv_action_chains_unbacked_ancestors_first() {
     let c = tc
         .match_prefix(&match_params(&vec![1, 2, 3]))
         .best_match_node_id;
+    assert_eq!(
+        tc.build_backup_kv_action(c).unwrap().node_ids,
+        vec![a, b, c]
+    );
+    let root_id = tc.arena.node(tc.arena.root()).id;
+    assert_eq!(
+        tc.build_backup_kv_action(root_id).unwrap().node_ids,
+        vec![root_id]
+    );
     // a is backuped: the chain stops there and orders ancestors first.
     tc.arena.set_host_value(
         tc.arena.resolve(a).expect("live test node"),
         FULL,
         Tensor::from_slice(&[20i64]),
     );
-    let action = tc.build_backup_kv_action_(
-        tc.arena.node(tc.arena.resolve(c).expect("live test node")),
-        /* write_back = */ false,
-    );
+    let action = tc.build_backup_kv_action(c).unwrap();
     assert_eq!(action.node_ids, vec![b, c]);
     let action = tc.build_backup_kv_action_(
         tc.arena.node(tc.arena.resolve(c).expect("live test node")),
         /* write_back = */ true,
     );
     assert_eq!(action.node_ids, vec![c]);
-}
-
-// Mirrors UnifiedRadixCache._execute_and_commit_kv_backup: back up each chain
-// node and stamp every node its transfers cover with that node's ack.
-// It skips the inc_lock_ref the Python side takes; the asserts do not depend on it.
-fn execute_backup_kv_for_test(tc: &mut UnifiedTreeCore<Vec<i64>>, backup: &BackupKV) {
-    for &node_id in &backup.node_ids {
-        let (device_value, mut comp_xfers) = tc.build_backup_spec(node_id).expect("backup spec");
-        if device_value.numel() == 0 && comp_xfers.is_empty() {
-            continue;
-        }
-        let mut publish_node_ids = Vec::new();
-        for transfer in comp_xfers.values_mut().flatten() {
-            transfer.host_indices = transfer.device_indices.as_ref().map(Tensor::copy);
-            publish_node_ids.extend(transfer.nodes_to_load.iter().flatten().copied());
-        }
-        if !publish_node_ids.contains(&node_id) {
-            publish_node_ids.push(node_id);
-        }
-        tc.commit_backup(node_id, device_value.copy(), comp_xfers)
-            .expect("live test node");
-        tc.mark_write_through_pending(publish_node_ids, /* ack_id = */ node_id)
-            .expect("live test nodes");
-    }
+    tc.reset();
+    assert!(tc.build_backup_kv_action(c).is_err());
 }
 
 #[test]
-fn write_back_swa_publish_leaves_an_ancestor_pending_under_another_ack_alone() {
+fn write_back_defers_swa_window_backup_until_eviction() {
     // c(Full unbacked) -> b(Full backed) -> t1(Full backed)
     //                  -> d(Full unbacked) -> t2(Full backed)
     // Every node holds a device-only SWA value inside the window.
@@ -2827,19 +3095,14 @@ fn write_back_swa_publish_leaves_an_ancestor_pending_under_another_ack_alone() {
     }
 
     // Two requests in one batch finish at t1 and t2; neither ack drains.
-    for (key, target) in [(&key_t1, t1), (&key_t2, t2)] {
+    for key in [&key_t1, &key_t2] {
         let result = tc.insert(&insert_params(key, &[20, 21, 22, 23]));
         let backups: Vec<&BackupKV> = result
             .cache_actions
             .iter()
-            .filter_map(|action| match action {
-                CacheAction::BackupKV(backup) => Some(backup),
-                _ => None,
-            })
+            .filter_map(|action| action.as_any().downcast_ref::<BackupKV>())
             .collect();
-        assert_eq!(backups.len(), 1);
-        assert_eq!(backups[0].node_ids, vec![target]);
-        execute_backup_kv_for_test(&mut tc, backups[0]);
+        assert!(backups.is_empty());
     }
 
     let pending = |node_id| {
@@ -2847,8 +3110,11 @@ fn write_back_swa_publish_leaves_an_ancestor_pending_under_another_ack_alone() {
             .node(tc.arena.resolve(node_id).expect("live test node"))
             .write_through_pending_id
     };
-    for (node_id, ack_id) in [(c, t1), (b, t1), (t1, t1), (d, t2), (t2, t2)] {
-        assert_eq!(pending(node_id), Some(ack_id));
+    for node_id in [c, b, t1, d, t2] {
+        assert_eq!(pending(node_id), None);
+    }
+    for idx in [c_idx, b_idx, t1_idx, d_idx, t2_idx] {
+        assert!(!tc.arena.node(idx).has_host_value(SWA));
     }
     // Write-back defers the unbacked Full prefix to eviction.
     assert!(
@@ -2880,54 +3146,55 @@ fn backup_kv_action_stops_at_an_externally_stored_or_pending_ancestor() {
     let a_idx = tc.arena.resolve(a).expect("live test node");
     tc.arena.node_mut(a_idx).external_cache_stored = true;
 
-    let action = tc.build_backup_kv_action_(
-        tc.arena.node(tc.arena.resolve(c).expect("live test node")),
-        /* write_back = */ false,
-    );
+    let action = tc.build_backup_kv_action(c).unwrap();
     assert_eq!(action.node_ids, vec![b, c]);
 
     tc.arena.node_mut(a_idx).external_cache_stored = false;
     tc.mark_external_linker_offload_pending(a).unwrap();
-    let action = tc.build_backup_kv_action_(
-        tc.arena.node(tc.arena.resolve(c).expect("live test node")),
-        /* write_back = */ false,
-    );
+    let action = tc.build_backup_kv_action(c).unwrap();
     assert_eq!(action.node_ids, vec![b, c]);
 }
 
 #[test]
-fn split_of_a_pending_node_transfers_the_ack_and_emits_the_replace_action() {
-    let mut tc = core();
-    tc.insert(&insert_params(&vec![1, 2, 3], &[10, 11, 12]));
-    let node = tc
-        .match_prefix(&match_params(&vec![1, 2, 3]))
-        .best_match_node_id;
-    tc.mark_write_through_pending(vec![node], /* ack_id = */ node)
-        .expect("live test node");
-    let (new_node, action) = tc.split_node_(
-        tc.arena.resolve(node).expect("live test node"),
-        /* split_len = */ 1,
-    );
-    assert_eq!(tc.arena.node(new_node).write_through_pending_id, Some(node));
-    assert_eq!(
-        tc.arena
-            .node(tc.arena.resolve(node).expect("live test node"))
-            .write_through_pending_id,
-        Some(node)
-    );
-    match action {
-        Some(CacheAction::ReplaceWriteThroughOnNodeSplit {
-            ack_id,
-            old_node_id,
-            new_node_id,
-            new_child_node_id,
-        }) => {
-            assert_eq!(ack_id, node);
-            assert_eq!(old_node_id, node);
-            assert_eq!(new_node_id, tc.arena.node(new_node).id);
-            assert_eq!(new_child_node_id, node);
+fn split_updates_pending_backup_with_or_without_a_tree_ack() {
+    for buffer_only in [false, true] {
+        for pending in [false, true] {
+            let mut tc = core();
+            if buffer_only {
+                tc.set_host_memory_buffer_only();
+            }
+            tc.insert(&insert_params(&vec![1, 2, 3], &[10, 11, 12]));
+            let tail_id = tc
+                .match_prefix(&match_params(&vec![1, 2, 3]))
+                .best_match_node_id;
+            if pending {
+                tc.mark_write_through_pending(vec![tail_id], tail_id)
+                    .unwrap();
+            }
+            let result = tc.match_prefix(&match_params(&vec![1]));
+            let prefix_id = result.best_match_node_id;
+            assert_ne!(prefix_id, tail_id);
+            if pending || buffer_only {
+                assert!(
+                    matches!(result.cache_actions.as_slice(), [action] if matches!(action.as_any().downcast_ref::<UpdatePendingBackupOnNodeSplit>(), Some(UpdatePendingBackupOnNodeSplit {
+                        ack_id,
+                        old_node_id,
+                        new_node_id,
+                        new_child_node_id,
+                    }) if *ack_id == pending.then_some(tail_id) && *old_node_id == tail_id
+                        && *new_node_id == prefix_id && *new_child_node_id == tail_id))
+                );
+            } else {
+                assert!(result.cache_actions.is_empty());
+            }
+            for node_id in [prefix_id, tail_id] {
+                let node = tc.arena.node(tc.arena.resolve(node_id).unwrap());
+                assert_eq!(node.write_through_pending_id, pending.then_some(tail_id));
+            }
+            if !pending {
+                tc.sanity_check(&[], &[]);
+            }
         }
-        other => panic!("expected the replace action, got {:?}", other.is_some()),
     }
 }
 
@@ -3039,6 +3306,7 @@ fn insert_coalesces_parent_linked_block_stores() {
             medium: StorageMedium::Gpu,
             cache_salt: None,
             session_id: None,
+            extra_key: None,
         }]
     );
     // Events hash lazily even though the storage tier is off.
@@ -3076,6 +3344,7 @@ fn insert_attributes_stored_blocks_to_session_without_changing_hashes() {
             medium: StorageMedium::Gpu,
             cache_salt: None,
             session_id: Some(Arc::from("session-a")),
+            extra_key: None,
         }]
     );
 }
@@ -3128,7 +3397,8 @@ fn namespaced_event_hashes_are_sparse_and_removed_with_the_node() {
 
 #[test]
 fn extra_key_nodes_publish_token_only_event_hashes() {
-    // Events omit extra_key; storage includes it.
+    // Event hashes omit extra_key; storage includes it. The event carries it
+    // so Python can apply the LoRA namespace.
     let mut tc = events_core(2);
     let key = vec![1, 2, 7, 8];
     tc.insert(&insert_params_in_namespace(
@@ -3151,6 +3421,7 @@ fn extra_key_nodes_publish_token_only_event_hashes() {
             medium: StorageMedium::Gpu,
             cache_salt: None,
             session_id: None,
+            extra_key: Some(Arc::from("lora-a")),
         }]
     );
 
@@ -3244,6 +3515,7 @@ fn event_coalescing_respects_store_remove_and_clear_boundaries() {
         medium: StorageMedium::Gpu,
         cache_salt: None,
         session_id: None,
+        extra_key: None,
     });
     assert_eq!(tc.kv_event_queue.len(), 1);
     // A different block size must not join the parent-linked store tail.
@@ -3255,6 +3527,7 @@ fn event_coalescing_respects_store_remove_and_clear_boundaries() {
         medium: StorageMedium::Gpu,
         cache_salt: None,
         session_id: None,
+        extra_key: None,
     });
     assert_eq!(tc.kv_event_queue.len(), 2);
     // Matching size and parent are still separated across media.
@@ -3266,6 +3539,7 @@ fn event_coalescing_respects_store_remove_and_clear_boundaries() {
         medium: StorageMedium::Cpu,
         cache_salt: None,
         session_id: None,
+        extra_key: None,
     });
     assert_eq!(tc.kv_event_queue.len(), 3);
     // Matching size and medium are still separated without the parent link.
@@ -3277,16 +3551,19 @@ fn event_coalescing_respects_store_remove_and_clear_boundaries() {
         medium: StorageMedium::Cpu,
         cache_salt: None,
         session_id: None,
+        extra_key: None,
     });
     assert_eq!(tc.kv_event_queue.len(), 4);
     tc.enqueue_kv_event_(KvCacheEvent::BlockRemoved {
         block_hashes: vec![1],
         medium: StorageMedium::Gpu,
+        extra_key: None,
     });
     assert_eq!(tc.kv_event_queue.len(), 5);
     tc.enqueue_kv_event_(KvCacheEvent::BlockRemoved {
         block_hashes: vec![2, 3],
         medium: StorageMedium::Gpu,
+        extra_key: None,
     });
     assert_eq!(tc.kv_event_queue.len(), 5);
     assert!(matches!(
@@ -3297,6 +3574,7 @@ fn event_coalescing_respects_store_remove_and_clear_boundaries() {
     tc.enqueue_kv_event_(KvCacheEvent::BlockRemoved {
         block_hashes: vec![4],
         medium: StorageMedium::Cpu,
+        extra_key: None,
     });
     assert_eq!(tc.kv_event_queue.len(), 6);
     tc.record_all_cleared_event();
@@ -3304,6 +3582,7 @@ fn event_coalescing_respects_store_remove_and_clear_boundaries() {
     tc.enqueue_kv_event_(KvCacheEvent::BlockRemoved {
         block_hashes: vec![5],
         medium: StorageMedium::Cpu,
+        extra_key: None,
     });
     assert_eq!(tc.kv_event_queue.len(), 8);
     assert!(matches!(
@@ -3320,6 +3599,7 @@ fn event_coalescing_respects_store_remove_and_clear_boundaries() {
         medium: StorageMedium::Gpu,
         cache_salt: Some(Arc::from("tenant-a")),
         session_id: None,
+        extra_key: None,
     });
     tc.enqueue_kv_event_(KvCacheEvent::BlockStored {
         block_hashes: vec![2],
@@ -3329,8 +3609,44 @@ fn event_coalescing_respects_store_remove_and_clear_boundaries() {
         medium: StorageMedium::Gpu,
         cache_salt: Some(Arc::from("tenant-b")),
         session_id: None,
+        extra_key: None,
     });
     assert_eq!(tc.kv_event_queue.len(), 2);
+
+    // Different extra_keys map to different LoRA namespaces in Python.
+    tc.kv_event_queue.clear();
+    tc.enqueue_kv_event_(KvCacheEvent::BlockStored {
+        block_hashes: vec![1],
+        parent_block_hash: None,
+        token_ids: vec![10, 11],
+        block_size: 2,
+        medium: StorageMedium::Gpu,
+        cache_salt: None,
+        session_id: None,
+        extra_key: None,
+    });
+    tc.enqueue_kv_event_(KvCacheEvent::BlockStored {
+        block_hashes: vec![2],
+        parent_block_hash: Some(1),
+        token_ids: vec![12, 13],
+        block_size: 2,
+        medium: StorageMedium::Gpu,
+        cache_salt: None,
+        session_id: None,
+        extra_key: Some(Arc::from("lora-a")),
+    });
+    assert_eq!(tc.kv_event_queue.len(), 2);
+    tc.enqueue_kv_event_(KvCacheEvent::BlockRemoved {
+        block_hashes: vec![1],
+        medium: StorageMedium::Gpu,
+        extra_key: None,
+    });
+    tc.enqueue_kv_event_(KvCacheEvent::BlockRemoved {
+        block_hashes: vec![2],
+        medium: StorageMedium::Gpu,
+        extra_key: Some(Arc::from("lora-a")),
+    });
+    assert_eq!(tc.kv_event_queue.len(), 4);
 }
 
 #[test]
@@ -3360,8 +3676,124 @@ fn eviction_emits_block_removed_with_all_page_hashes() {
                 .map(|h| crate::node::hash_str_to_int64(h))
                 .collect(),
             medium: StorageMedium::Gpu,
+            extra_key: None,
         }]
     );
+}
+
+fn dynamo_events_core(page_size: usize) -> UnifiedTreeCore<Vec<i64>> {
+    UnifiedTreeCore::new(
+        CacheInitParams {
+            page_size,
+            enable_kv_cache_events: true,
+            dynamo_kv_event_format: true,
+            ..CacheInitParams::default()
+        },
+        vec![FULL],
+    )
+}
+
+fn evict_all_device(tc: &mut UnifiedTreeCore<Vec<i64>>) {
+    let mut tracker = HashMap::from([(FULL, 0)]);
+    let (mut device_frees, mut host_frees) = (HashMap::new(), HashMap::new());
+    tc.evict_device_start(FULL, 100);
+    loop {
+        let (node, step) = tc.evict_device_next_node(FULL, &tracker);
+        accumulate_step(step, &mut tracker, &mut device_frees, &mut host_frees);
+        let Some(node) = node else { break };
+        let (_, step) = tc
+            .evict_device_leaf(node, /* is_write_back = */ false)
+            .expect("live test node");
+        accumulate_step(step, &mut tracker, &mut device_frees, &mut host_frees);
+    }
+    tc.evict_device_end(FULL);
+}
+
+fn stored_block_hashes(events: &[KvCacheEvent<i64>]) -> Vec<Vec<i64>> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            KvCacheEvent::BlockStored { block_hashes, .. } => Some(block_hashes.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn dynamo_format_separates_namespaces_that_share_block_hashes() {
+    // A router that keys blocks by hash uses these hashes to keep adapter
+    // blocks and base blocks apart. This is also necessary for removals.
+    let mut tc = dynamo_events_core(2);
+    let key = vec![1, 2, 7, 8];
+    tc.insert(&insert_params(&key, &[10, 11, 12, 13]));
+    tc.insert(&insert_params_in_namespace(
+        &key,
+        &[20, 21, 22, 23],
+        Some("lora-a"),
+        None,
+    ));
+    let stored = stored_block_hashes(&tc.take_events());
+    let [base, lora] = stored.as_slice() else {
+        panic!("expected one store per namespace, got {stored:?}");
+    };
+    assert_ne!(lora, base);
+
+    evict_all_device(&mut tc);
+    let mut removed: Vec<i64> = tc
+        .take_events()
+        .into_iter()
+        .flat_map(|event| match event {
+            KvCacheEvent::BlockRemoved { block_hashes, .. } => block_hashes,
+            other => panic!("unexpected event {other:?}"),
+        })
+        .collect();
+    let mut expected: Vec<i64> = base.iter().chain(lora).copied().collect();
+    removed.sort_unstable();
+    expected.sort_unstable();
+    assert_eq!(removed, expected);
+}
+
+#[test]
+fn namespaced_block_hash_is_pinned() {
+    // Python has its own copy of this function, and its test uses the same values.
+    // Thus the two copies must give the same hashes, and the hashes must not change.
+    let seed = kv_event_namespace_seed(&KeyNamespace::new(Some("lora-a"), None));
+    assert_eq!(
+        namespaced_block_hash(seed.as_ref(), 123),
+        9220659119954863560
+    );
+    assert_eq!(
+        namespaced_block_hash(seed.as_ref(), -5),
+        -1810974732006142875
+    );
+}
+
+#[test]
+fn dynamo_format_parent_link_survives_node_split() {
+    let mut tc = dynamo_events_core(2);
+    tc.insert(&insert_params_in_namespace(
+        &vec![1, 2, 7, 8],
+        &[10, 11, 12, 13],
+        Some("lora-a"),
+        None,
+    ));
+    let first = stored_block_hashes(&tc.take_events());
+    tc.insert(&insert_params_in_namespace(
+        &vec![1, 2, 9, 10],
+        &[10, 11, 14, 15],
+        Some("lora-a"),
+        None,
+    ));
+    let events = tc.take_events();
+    let [
+        KvCacheEvent::BlockStored {
+            parent_block_hash, ..
+        },
+    ] = events.as_slice()
+    else {
+        panic!("expected one store for the new branch, got {events:?}");
+    };
+    assert_eq!(*parent_block_hash, Some(first[0][0]));
 }
 
 #[test]
@@ -3402,6 +3834,7 @@ fn bigram_insert_events_carry_pair_token_payloads() {
             medium: StorageMedium::Gpu,
             cache_salt: None,
             session_id: None,
+            extra_key: None,
         }]
     );
 }
@@ -3426,6 +3859,7 @@ fn finish_write_through_emits_cpu_stored_events() {
             medium: StorageMedium::Cpu,
             cache_salt: None,
             session_id: None,
+            extra_key: None,
         }]
     );
 }
@@ -3453,6 +3887,7 @@ fn host_eviction_emits_a_cpu_block_removed() {
         vec![KvCacheEvent::BlockRemoved {
             block_hashes: vec![crate::node::hash_str_to_int64(&hashes[0])],
             medium: StorageMedium::Cpu,
+            extra_key: None,
         }]
     );
 }
@@ -3482,6 +3917,7 @@ fn load_back_commit_emits_gpu_stored_events() {
             medium: StorageMedium::Gpu,
             cache_salt: None,
             session_id: None,
+            extra_key: None,
         }]
     );
 }
@@ -3502,6 +3938,7 @@ fn unevict_on_insert_emits_a_gpu_stored_event() {
             medium: StorageMedium::Gpu,
             cache_salt: None,
             session_id: None,
+            extra_key: None,
         }]
     );
 }
@@ -3551,6 +3988,7 @@ fn drop_subtree_emits_removals_for_host_descendants_then_the_leaf() {
                     .map(|h| crate::node::hash_str_to_int64(h))
                     .collect(),
                 medium: StorageMedium::Cpu,
+                extra_key: None,
             },
             KvCacheEvent::BlockRemoved {
                 block_hashes: leaf_hashes
@@ -3558,6 +3996,7 @@ fn drop_subtree_emits_removals_for_host_descendants_then_the_leaf() {
                     .map(|h| crate::node::hash_str_to_int64(h))
                     .collect(),
                 medium: StorageMedium::Gpu,
+                extra_key: None,
             },
         ]
     );
@@ -3591,6 +4030,7 @@ fn split_insert_stores_only_the_new_block_chained_to_the_split_parent() {
             medium: StorageMedium::Gpu,
             cache_salt: None,
             session_id: None,
+            extra_key: None,
         }]
     );
     // The split divided the page hashes between the two fragments.
@@ -3629,16 +4069,21 @@ fn finish_write_through_after_a_split_publishes_both_fragments() {
     let new_node_id = result
         .cache_actions
         .iter()
-        .find_map(|action| match action {
-            CacheAction::ReplaceWriteThroughOnNodeSplit {
-                ack_id,
-                new_node_id,
-                ..
-            } => {
-                assert_eq!(*ack_id, leaf);
-                Some(*new_node_id)
+        .find_map(|action| {
+            match action
+                .as_any()
+                .downcast_ref::<UpdatePendingBackupOnNodeSplit>()
+            {
+                Some(UpdatePendingBackupOnNodeSplit {
+                    ack_id,
+                    new_node_id,
+                    ..
+                }) => {
+                    assert_eq!(*ack_id, Some(leaf));
+                    Some(*new_node_id)
+                }
+                _ => None,
             }
-            _ => None,
         })
         .expect("the split relocates the pending write-through");
     // Nothing reaches the host tier before the ack.
@@ -3673,6 +4118,7 @@ fn finish_write_through_after_a_split_publishes_both_fragments() {
             medium: StorageMedium::Cpu,
             cache_salt: None,
             session_id: None,
+            extra_key: None,
         }]
     );
     // The matching ack cleared the pending mark on both fragments.
@@ -4004,6 +4450,7 @@ fn insert_host_publishes_a_host_store_event() {
             medium: StorageMedium::Cpu,
             cache_salt: None,
             session_id: None,
+            extra_key: None,
         }]
     );
 }
@@ -4095,10 +4542,9 @@ fn insert_host_refill_preserves_split_actions_and_lengths() {
     assert_eq!(result.total_len, 2);
     assert!(result.inserted_host_node.is_some());
     assert!(!result.host_insert_dropped);
-    assert!(matches!(
-        result.cache_actions.as_slice(),
-        [CacheAction::ReplaceWriteThroughOnNodeSplit { ack_id, .. }] if *ack_id == leaf
-    ));
+    assert!(
+        matches!(result.cache_actions.as_slice(), [action] if matches!(action.as_any().downcast_ref::<UpdatePendingBackupOnNodeSplit>(), Some(UpdatePendingBackupOnNodeSplit { ack_id, .. }) if *ack_id == Some(leaf)))
+    );
 }
 
 #[test]
@@ -4474,6 +4920,7 @@ fn commit_load_back_reattaches_device_slices_and_restores_the_match() {
         tc.arena.node(child).id,
         /* params = */
         &DecLockRefParams {
+            node_id: Some(tc.arena.node(child).id),
             skipped_lock_components: ComponentSet::EMPTY,
             ..Default::default()
         },
@@ -5177,12 +5624,13 @@ fn insert_page_size_two_splits_mid_page_divergence_at_the_page_boundary() {
     // The keys share 3 atoms but pages quantize the overlap down to 2.
     let result = tc.insert(&insert_params(&vec![1, 2, 3, 9], &[20, 21, 22, 29]));
     assert_eq!(result.prefix_len, 2);
-    let [CacheAction::FreeDeviceKV(freed)] = result.cache_actions.as_slice() else {
+    let [action] = result.cache_actions.as_slice() else {
         panic!(
             "expected one FreeDeviceKV action, got {:?}",
             action_kinds(&result.cache_actions)
         );
     };
+    let FreeDeviceKV { indices: freed } = expect_action::<FreeDeviceKV>(action.as_ref());
     assert_eq!(freed.len(), 1);
     assert!(freed[0].equal(&Tensor::from_slice(&[20i64, 21])));
     let prefix = tc
@@ -5280,6 +5728,7 @@ fn evict_and_detach_frees_the_device_value_and_tracks() {
         FULL,
         &mut df,
         &mut hf,
+        &mut Vec::new(),
         EvictLayer::Device,
         Some(&mut tracker),
     );
@@ -5311,6 +5760,7 @@ fn evict_and_detach_host_targets_the_host_tier() {
         FULL,
         &mut df,
         &mut hf,
+        &mut Vec::new(),
         EvictLayer::Host,
         Some(&mut tracker),
     );
@@ -5392,7 +5842,7 @@ fn tombstone_chain(tc: &mut UnifiedTreeCore<Vec<i64>>) -> NodeIdx_ {
 fn delete_walk(tc: &mut UnifiedTreeCore<Vec<i64>>, from: NodeIdx_) {
     let mut tracker = HashMap::from([(FULL, 0)]);
     let (mut df, mut hf) = (HashMap::new(), HashMap::new());
-    tc.iteratively_delete_tombstone_leaf_(from, &mut tracker, &mut df, &mut hf);
+    tc.iteratively_delete_tombstone_leaf_(from, &mut tracker, &mut df, &mut hf, &mut Vec::new());
 }
 
 #[test]
@@ -5499,7 +5949,7 @@ fn tombstone_walk_sweeps_orphaned_aux_device_data() {
     tc.device_lru_list_mut(SWA).insert_mru(a);
     let mut tracker = HashMap::new();
     let (mut df, mut hf) = (HashMap::new(), HashMap::new());
-    tc.iteratively_delete_tombstone_leaf_(a, &mut tracker, &mut df, &mut hf);
+    tc.iteratively_delete_tombstone_leaf_(a, &mut tracker, &mut df, &mut hf, &mut Vec::new());
     // The orphaned Swa device data is evicted before the node is deleted.
     assert_eq!(tc.arena.len(), 1);
     assert_eq!(
@@ -5527,7 +5977,7 @@ fn tombstone_walk_sweeps_orphaned_aux_host_data() {
     tc.host_lru_list_mut(SWA).insert_mru(a);
     let mut tracker = HashMap::new();
     let (mut df, mut hf) = (HashMap::new(), HashMap::new());
-    tc.iteratively_delete_tombstone_leaf_(a, &mut tracker, &mut df, &mut hf);
+    tc.iteratively_delete_tombstone_leaf_(a, &mut tracker, &mut df, &mut hf, &mut Vec::new());
     // The orphaned Swa host data is evicted before the node is deleted.
     assert_eq!(tc.arena.len(), 1);
     assert_eq!(
@@ -5561,6 +6011,7 @@ fn cascade_tombstones_full_after_the_component_sweep() {
         &mut tracker,
         &mut df,
         &mut hf,
+        &mut Vec::new(),
         EvictLayer::Device,
     );
     assert!(!tc.arena.has_device_value(a, FULL));
@@ -5590,6 +6041,7 @@ fn cascade_rejects_the_all_layer() {
         &mut tracker,
         &mut df,
         &mut hf,
+        &mut Vec::new(),
         EvictLayer::All,
     );
 }
@@ -5615,6 +6067,7 @@ fn cascade_host_target_keeps_the_device_value() {
         &mut tracker,
         &mut df,
         &mut hf,
+        &mut Vec::new(),
         EvictLayer::Host,
     );
     // No tombstone on a host-target cascade; the D-leaf survives.
@@ -5643,6 +6096,7 @@ fn cascade_moves_a_host_backed_node_into_the_h_leaf_set() {
         &mut tracker,
         &mut df,
         &mut hf,
+        &mut Vec::new(),
         EvictLayer::Device,
     );
     // Evicted but backuped: the node leaves the D-set and joins the H-set.
@@ -5681,6 +6135,7 @@ fn cascade_sweeps_an_equal_priority_aux_component() {
         &mut tracker,
         &mut df,
         &mut hf,
+        &mut Vec::new(),
         EvictLayer::Device,
     );
     assert_eq!(
@@ -5709,6 +6164,7 @@ fn cascade_sweeps_a_lower_priority_aux_component() {
         &mut tracker,
         &mut df,
         &mut hf,
+        &mut Vec::new(),
         EvictLayer::Device,
     );
     assert_eq!(
@@ -5735,6 +6191,7 @@ fn cascade_spares_a_higher_priority_aux_component() {
         &mut tracker,
         &mut df,
         &mut hf,
+        &mut Vec::new(),
         EvictLayer::Device,
     );
     assert!(recorder.evictions.lock().unwrap().is_empty());
@@ -5762,6 +6219,7 @@ fn cascade_spares_a_locked_component_of_equal_internal_priority() {
         &mut tracker,
         &mut df,
         &mut hf,
+        &mut Vec::new(),
         EvictLayer::Device,
     );
     assert!(recorder.evictions.lock().unwrap().is_empty());
@@ -5787,6 +6245,7 @@ fn cascade_panics_on_a_locked_lower_internal_priority_component() {
         &mut tracker,
         &mut df,
         &mut hf,
+        &mut Vec::new(),
         EvictLayer::Device,
     );
 }
@@ -5828,6 +6287,7 @@ fn cascade_host_spares_a_locked_component_of_equal_internal_priority() {
         &mut tracker,
         &mut df,
         &mut hf,
+        &mut Vec::new(),
         EvictLayer::Host,
     );
     assert!(recorder.evictions.lock().unwrap().is_empty());
@@ -5855,6 +6315,7 @@ fn cascade_host_panics_on_a_locked_lower_internal_priority_component() {
         &mut tracker,
         &mut df,
         &mut hf,
+        &mut Vec::new(),
         EvictLayer::Host,
     );
 }
@@ -5935,6 +6396,7 @@ fn release_all_component_layers_scrubs_a_host_leaf_from_both_leaf_sets() {
         &mut tracker,
         &mut device_frees,
         &mut host_frees,
+        &mut Vec::new(),
     );
     assert!(!tc.evictable_host_leaves.contains(b));
     assert!(!tc.evictable_device_leaves.contains(b));
@@ -6715,7 +7177,7 @@ fn evict_host_leaf_frees_host_values_and_credits_the_tracker() {
     tc.evictable_host_leaves.add(n1);
     let mut tr = HashMap::from([(FULL, 0)]);
     let (mut df, mut hf) = (HashMap::new(), HashMap::new());
-    tc.evict_host_leaf_(n1, &mut tr, &mut df, &mut hf);
+    tc.evict_host_leaf_(n1, &mut tr, &mut df, &mut hf, &mut Vec::new());
     assert_eq!(tr[&FULL], 2);
     assert_eq!(hf[&FULL].len(), 1);
     assert!(df.is_empty());
@@ -6742,7 +7204,7 @@ fn evict_host_leaf_panics_on_a_device_valued_node() {
         .set_device_value(n1, FULL, Tensor::from_slice(&[10i64]));
     let mut tr = HashMap::new();
     let (mut df, mut hf) = (HashMap::new(), HashMap::new());
-    tc.evict_host_leaf_(n1, &mut tr, &mut df, &mut hf);
+    tc.evict_host_leaf_(n1, &mut tr, &mut df, &mut hf, &mut Vec::new());
 }
 
 #[test]
@@ -6772,7 +7234,7 @@ fn evict_host_leaf_cascades_tombstone_ancestors() {
     tc.evictable_host_leaves.add(h);
     let mut tr = HashMap::from([(FULL, 0)]);
     let (mut df, mut hf) = (HashMap::new(), HashMap::new());
-    tc.evict_host_leaf_(h, &mut tr, &mut df, &mut hf);
+    tc.evict_host_leaf_(h, &mut tr, &mut df, &mut hf, &mut Vec::new());
     // The valueless ancestor t is deleted by the tombstone walk.
     assert_eq!(tc.arena.len(), 1);
     assert_eq!(tr[&FULL], 1);
@@ -7399,6 +7861,11 @@ fn sanity_check_passes_on_a_healthy_tree() {
             .id,
         /* params = */
         &DecLockRefParams {
+            node_id: Some(
+                tc.arena
+                    .node(tc.arena.resolve(leaf).expect("live test node"))
+                    .id,
+            ),
             skipped_lock_components: ComponentSet::EMPTY,
             ..Default::default()
         },
@@ -8185,12 +8652,13 @@ fn insert_unevicts_a_tombstoned_deep_node() {
             .device_value(tc.arena.resolve(leaf).expect("live test node"), FULL)
             .equal(&Tensor::from_slice(&[33i64, 34]))
     );
-    let [CacheAction::FreeDeviceKV(freed)] = result.cache_actions.as_slice() else {
+    let [action] = result.cache_actions.as_slice() else {
         panic!(
             "expected one FreeDeviceKV action, got {:?}",
             action_kinds(&result.cache_actions)
         );
     };
+    let FreeDeviceKV { indices: freed } = expect_action::<FreeDeviceKV>(action.as_ref());
     assert!(freed[0].equal(&Tensor::from_slice(&[30i64, 31, 32])));
 }
 
@@ -8202,12 +8670,13 @@ fn insert_ragged_key_onto_an_existing_prefix_page_size_two() {
     assert_eq!(result.prefix_len, 2);
     // The ragged tail never enters: no new leaf, the aligned span is duplicate.
     assert_eq!(tc.arena.len(), 2);
-    let [CacheAction::FreeDeviceKV(freed)] = result.cache_actions.as_slice() else {
+    let [action] = result.cache_actions.as_slice() else {
         panic!(
             "expected one FreeDeviceKV action, got {:?}",
             action_kinds(&result.cache_actions)
         );
     };
+    let FreeDeviceKV { indices: freed } = expect_action::<FreeDeviceKV>(action.as_ref());
     assert!(freed[0].equal(&Tensor::from_slice(&[20i64, 21])));
 }
 
@@ -8219,16 +8688,18 @@ fn insert_ragged_key_traverses_a_node_before_the_tail_page_size_two() {
     let result = tc.insert(&insert_params(&vec![1, 2, 3, 4, 5], &[30, 31, 32, 33, 34]));
     assert_eq!(result.prefix_len, 4);
     assert_eq!(tc.arena.len(), 3);
-    let [
-        CacheAction::FreeDeviceKV(freed_head),
-        CacheAction::FreeDeviceKV(freed_tail),
-    ] = result.cache_actions.as_slice()
-    else {
+    let [action0, action1] = result.cache_actions.as_slice() else {
         panic!(
             "expected one FreeDeviceKV per walked node, got {:?}",
             action_kinds(&result.cache_actions)
         );
     };
+    let FreeDeviceKV {
+        indices: freed_head,
+    } = expect_action::<FreeDeviceKV>(action0.as_ref());
+    let FreeDeviceKV {
+        indices: freed_tail,
+    } = expect_action::<FreeDeviceKV>(action1.as_ref());
     assert!(freed_head[0].equal(&Tensor::from_slice(&[30i64, 31])));
     assert!(freed_tail[0].equal(&Tensor::from_slice(&[32i64, 33])));
 }
@@ -8258,7 +8729,7 @@ fn deferrable_dup_frees_ride_the_final_step_without_suspension() {
     let mut tc = core();
     tc.insert(&insert_params(&vec![1, 2, 3], &[10, 11, 12]));
     let step = tc.begin_insert(&insert_params(&vec![1, 2, 3, 4], &[20, 21, 22, 13]));
-    assert_eq!(action_kinds(&step.actions), vec!["FreeDeviceKV"]);
+    assert_eq!(action_kinds(&step.actions), vec!["free_device_kv"]);
     let result = step
         .result
         .expect("a deferrable-only walk completes in one step");
@@ -8293,11 +8764,9 @@ fn walk_backup_crossing_suspends_then_resume_completes() {
     assert!(tc.has_ongoing_insert());
     assert_eq!(
         action_kinds(&step.actions),
-        vec!["FreeDeviceKV", "BackupKV"]
+        vec!["free_device_kv", "backup_kv"]
     );
-    let CacheAction::BackupKV(backup) = &step.actions[1] else {
-        unreachable!();
-    };
+    let backup = expect_action::<BackupKV>(step.actions[1].as_ref());
     assert_eq!(backup.node_ids, vec![tc.arena.node(a).id]);
 
     let done = tc.resume_insert();
@@ -8385,7 +8854,7 @@ fn resume_insert_completes_after_an_on_path_host_leaf_is_evicted() {
     assert!(step.result.is_none());
     assert_eq!(
         action_kinds(&step.actions),
-        vec!["FreeDeviceKV", "BackupKV"]
+        vec!["free_device_kv", "backup_kv"]
     );
     // The barrier's backup host-evicts the on-path H-leaf before committing.
     let mut tracker = HashMap::from([(FULL, 0)]);
@@ -8395,6 +8864,7 @@ fn resume_insert_completes_after_an_on_path_host_leaf_is_evicted() {
         &mut tracker,
         &mut df,
         &mut hf,
+        &mut Vec::new(),
     );
     assert_eq!(tracker[&FULL], 4);
     tc.commit_backup(
@@ -8432,9 +8902,11 @@ fn aborted_barrier_crossing_refires_on_the_next_insert() {
     let backups: Vec<_> = step
         .actions
         .iter()
-        .filter_map(|action| match action {
-            CacheAction::BackupKV(backup) => Some(backup.node_ids.clone()),
-            _ => None,
+        .filter_map(|action| {
+            action
+                .as_any()
+                .downcast_ref::<BackupKV>()
+                .map(|backup| backup.node_ids.clone())
         })
         .collect();
     assert_eq!(backups, vec![vec![tc.arena.node(a).id]]);
@@ -8502,9 +8974,11 @@ fn one_insert_walk_fires_two_crossings_around_a_backuped_middle() {
     let backups: Vec<_> = result
         .cache_actions
         .iter()
-        .filter_map(|action| match action {
-            CacheAction::BackupKV(backup) => Some(backup.node_ids.clone()),
-            _ => None,
+        .filter_map(|action| {
+            action
+                .as_any()
+                .downcast_ref::<BackupKV>()
+                .map(|backup| backup.node_ids.clone())
         })
         .collect();
     assert_eq!(backups, vec![vec![top], vec![deep]]);
@@ -8974,19 +9448,265 @@ fn a_zero_length_match_anchors_at_the_root() {
         .best_match_node_id;
     assert_eq!(anchor, tc.root_node_handle(Some("salted")));
     // The root handle stays valid across a full namespace eviction.
-    tc.inc_lock_ref(anchor, ComponentSet::EMPTY)
+    let lock = tc
+        .inc_lock_ref(anchor, ComponentSet::EMPTY)
         .expect("live root");
     drain_full_device(&mut tc);
     tc.dec_lock_ref(
         anchor,
-        /* params = */
-        &DecLockRefParams {
-            skipped_lock_components: ComponentSet::EMPTY,
-            ..Default::default()
-        },
+        /* params = */ &lock.to_dec_params(),
         /* skip_swa = */ false,
     )
     .expect("live root");
     assert!(tc.arena.resolve(anchor).is_ok());
+    tc.sanity_check(&[], &[]);
+}
+
+#[test]
+fn match_with_borrowed_validators_retains_walk_state_and_common_postprocessing() {
+    for enable_hicache in [false, true] {
+        let mut tc = UnifiedTreeCore::new(
+            CacheInitParams {
+                enable_hicache,
+                ..Default::default()
+            },
+            vec![FULL],
+        );
+        let root = tc.arena.root();
+        let head = add_leaf(&mut tc, root, vec![1, 2]);
+        let tail = add_leaf(&mut tc, head, vec![3, 4]);
+        let head_id = tc.arena.node(head).id;
+        let tail_id = tc.arena.node(tail).id;
+        let key = vec![1, 2, 3, 4];
+        let mut visited = Vec::new();
+        let result = {
+            let (mut validators, mut device_validators) = tc.create_match_validators_();
+            let validator: MatchValidator<'_, Vec<i64>> = Box::new(|tree, node_id| {
+                visited.push(tree.arena.node(node_id).id);
+                visited.len() == 1
+            });
+            if enable_hicache {
+                device_validators[0] = validator;
+            } else {
+                validators[0] = validator;
+            }
+            tc.match_prefix_with_validators_(
+                &match_params(&key),
+                &mut validators,
+                &mut device_validators,
+            )
+        };
+        assert_eq!(visited, vec![head_id, tail_id]);
+        assert_eq!(result.last_device_node_id, head_id);
+        assert_eq!(
+            result.best_match_node_id,
+            if enable_hicache { tail_id } else { head_id }
+        );
+        assert_eq!(result.last_visited_node_id, Some(tail_id));
+        assert_eq!(result.full_kv_hit_length, 4);
+        assert_eq!(result.device_prefix_len, 2);
+        assert!(result.full_device_match_len.is_none());
+        tc.sanity_check(&[], &[]);
+    }
+}
+
+#[test]
+fn caller_owned_overlap_drains_split_and_backup_before_duplicate_frees() {
+    let mut tc = core();
+    tc.is_host_memory_buffer_only = true;
+    let original = tc.insert(&insert_params(&vec![1, 2, 3, 4], &[10, 11, 12, 13]));
+    let tail_id = original.last_device_node_id.unwrap();
+    let key = vec![1, 2];
+    let params = insert_params(&key, &[20, 21]);
+    let InsertWalkStart::Walk(mut walk) = tc.start_insert_walk_(&params) else {
+        panic!("nonempty insert needs a walk");
+    };
+    assert!(matches!(
+        tc.advance_insert_walk_(&mut walk, true),
+        InsertWalkProgress::Overlap
+    ));
+    assert_eq!(walk.total_prefix_length, 0);
+    assert_eq!(walk.overlap_prefix_len, 2);
+    let head = walk.overlap_node_id.unwrap();
+    let node = tc.arena.node(head);
+    assert!(
+        node.device_value(FULL)
+            .equal(&Tensor::from_slice(&[10i64, 11]))
+    );
+    assert_eq!(
+        action_kinds(&walk.pending_actions),
+        vec!["update_pending_backup_on_node_split"]
+    );
+    assert!(!walk.has_barrier_actions_since(0));
+    walk.pending_actions.push(Box::new(BackupKV {
+        node_ids: vec![node.id],
+    }));
+    assert!(walk.has_barrier_actions_since(0));
+    let actions = std::mem::take(&mut walk.pending_actions);
+    assert_eq!(
+        action_kinds(&actions),
+        vec!["update_pending_backup_on_node_split", "backup_kv"]
+    );
+    assert_eq!(tc.arena.node(head).parent(), tc.arena.root());
+    assert_eq!(
+        tc.arena.node(tc.arena.resolve(tail_id).unwrap()).parent(),
+        head
+    );
+    // Advancing cannot claim the donor until the caller executes overlap.
+    assert!(matches!(
+        tc.advance_insert_walk_(&mut walk, true),
+        InsertWalkProgress::Overlap
+    ));
+    assert_eq!(walk.total_prefix_length, 0);
+    assert!(walk.pending_actions.is_empty());
+    tc.insert_overlap_step_(&mut walk, InsertOverlapContext::default());
+    assert!(!walk.has_barrier_actions_since(0));
+    assert!(matches!(
+        tc.advance_insert_walk_(&mut walk, true),
+        InsertWalkProgress::Complete
+    ));
+    let step = walk.finish();
+    assert_eq!(step.result.unwrap().prefix_len, 2);
+    assert_eq!(action_kinds(&step.actions), vec!["free_device_kv"]);
+    let FreeDeviceKV { indices: frees } = expect_action::<FreeDeviceKV>(step.actions[0].as_ref());
+    assert!(frees[0].equal(&Tensor::from_slice(&[20i64, 21])));
+    assert!(!tc.has_ongoing_insert());
+    tc.sanity_check(&[], &[]);
+}
+
+#[test]
+fn caller_owned_walk_can_abort_after_split_without_claiming_donor() {
+    let mut tc = core();
+    tc.is_host_memory_buffer_only = true;
+    let original = tc.insert(&insert_params(&vec![1, 2, 3, 4], &[10, 11, 12, 13]));
+    let key = vec![1, 2];
+    let params = insert_params(&key, &[20, 21]);
+    let InsertWalkStart::Walk(mut walk) = tc.start_insert_walk_(&params) else {
+        panic!("nonempty insert needs a walk");
+    };
+    assert!(matches!(
+        tc.advance_insert_walk_(&mut walk, true),
+        InsertWalkProgress::Overlap
+    ));
+    let actions = std::mem::take(&mut walk.pending_actions);
+    drop(walk);
+    assert_eq!(
+        action_kinds(&actions),
+        vec!["update_pending_backup_on_node_split"]
+    );
+    assert!(!tc.has_ongoing_insert());
+    assert!(tc.end_insert().is_empty());
+    assert_eq!(tc.evictable_size_(FULL), 4);
+    let matched = tc.match_prefix(&match_params(&vec![1, 2, 3, 4]));
+    assert_eq!(
+        Some(matched.last_device_node_id),
+        original.last_device_node_id
+    );
+    assert!(matched_device_indices(&tc, &matched).equal(&Tensor::from_slice(&[10i64, 11, 12, 13])));
+    let result = tc.insert(&params);
+    assert_eq!(result.prefix_len, 2);
+    assert_eq!(action_kinds(&result.cache_actions), vec!["free_device_kv"]);
+    tc.sanity_check(&[], &[]);
+}
+
+#[test]
+fn fixed_components_and_caller_owned_overlap_match_the_stock_insert() {
+    let params = CacheInitParams::default();
+    let mut custom = UnifiedTreeCore::new_with_components_(params, vec![Arc::new(FullComponent)]);
+    let mut stock = core();
+    for key in [vec![1, 2, 3, 4], vec![1, 2, 5, 6], vec![1, 2, 3, 4]] {
+        let params = insert_params(&key, &[10, 11, 12, 13]);
+        let expected = stock.insert(&params);
+        let InsertWalkStart::Walk(mut walk) = custom.start_insert_walk_(&params) else {
+            panic!("nonempty insert needs a walk");
+        };
+        let mut visited = 0;
+        let mut actions = Vec::new();
+        let final_step = loop {
+            match custom.advance_insert_walk_(&mut walk, true) {
+                InsertWalkProgress::Overlap => {
+                    visited += 1;
+                    let start = walk.pending_actions.len();
+                    custom.insert_overlap_step_(&mut walk, InsertOverlapContext::default());
+                    if walk.has_barrier_actions_since(start) {
+                        actions.append(&mut walk.pending_actions);
+                    }
+                }
+                InsertWalkProgress::Actions => actions.append(&mut walk.pending_actions),
+                InsertWalkProgress::Complete => break walk.finish(),
+            }
+        };
+        actions.extend(final_step.actions);
+        let result = final_step.result.unwrap();
+        assert_eq!(result.prefix_len, expected.prefix_len);
+        assert_eq!(result.total_len, expected.total_len);
+        assert_eq!(
+            action_kinds(&actions),
+            action_kinds(&expected.cache_actions)
+        );
+        assert_eq!(visited > 0, result.prefix_len > 0);
+        let stock_match = stock.match_prefix(&match_params(&key));
+        let custom_match = custom.match_prefix(&match_params(&key));
+        assert_eq!(
+            stock_match.device_prefix_len,
+            custom_match.device_prefix_len
+        );
+        assert!(
+            matched_device_indices(&stock, &stock_match)
+                .equal(&matched_device_indices(&custom, &custom_match))
+        );
+        custom.sanity_check(&[], &[]);
+    }
+}
+
+#[test]
+fn overlap_context_reaches_swa_before_it_replaces_unlocked_full_ids() {
+    let mut tc = UnifiedTreeCore::new(
+        CacheInitParams {
+            swa_sliding_window_size: Some(2),
+            ..Default::default()
+        },
+        vec![FULL, SWA],
+    );
+    let root = tc.arena.root();
+    let node = add_leaf(&mut tc, root, vec![1, 2]);
+    let node_id = tc.arena.node(node).id;
+    let kept = tc.arena.node(node).device_value(FULL).shallow_clone();
+    let key = vec![1, 2];
+    let InsertWalkStart::Walk(mut walk) = tc.start_insert_walk_(&insert_params(&key, &[20, 21]))
+    else {
+        panic!("nonempty insert needs a walk");
+    };
+    assert!(matches!(
+        tc.advance_insert_walk_(&mut walk, true),
+        InsertWalkProgress::Overlap
+    ));
+    let start = walk.pending_actions.len();
+    tc.insert_overlap_step_(
+        &mut walk,
+        InsertOverlapContext {
+            preserve_full_ids: true,
+        },
+    );
+    assert!(walk.has_barrier_actions_since(start));
+    let actions = std::mem::take(&mut walk.pending_actions);
+    assert_eq!(action_kinds(&actions), vec!["recover_swa_with_locked_full"]);
+    let RecoverSwaWithLockedFull {
+        node_id: actual_node_id,
+        kept_full,
+        incoming_full,
+    } = expect_action::<RecoverSwaWithLockedFull>(actions[0].as_ref());
+    assert_eq!(*actual_node_id, node_id);
+    assert!(kept_full.equal(&kept));
+    assert!(incoming_full.equal(&Tensor::from_slice(&[20i64, 21])));
+    assert!(tc.arena.node(node).device_value(FULL).equal(&kept));
+    assert_eq!(tc.arena.node(node).device_lock_ref(FULL), 0);
+    assert!(matches!(
+        tc.advance_insert_walk_(&mut walk, true),
+        InsertWalkProgress::Complete
+    ));
+    let step = walk.finish();
+    assert_eq!(step.result.unwrap().prefix_len, 2);
+    assert!(step.actions.is_empty());
     tc.sanity_check(&[], &[]);
 }

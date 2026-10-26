@@ -5,9 +5,14 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.batch_overlap.two_batch_overlap import TboForwardBatchPreparer
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     Mamba2AttnBackend,
     MambaAttnBackendBase,
+)
+from sglang.srt.layers.attention.mamba.mamba2_metadata import (
+    ForwardMetadata,
+    Mamba2Metadata,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import (
@@ -72,6 +77,35 @@ def make_metadata_backend():
         translate_mamba_indices=lambda slots: slots,
     )
     return backend
+
+
+def make_relabeled_decode_batch(seq_lens, num_tokens, track_mask=None):
+    """A decoding DP rank after MAX_LEN padding: EXTEND, one token per decode row.
+
+    ``num_tokens`` pads the token-indexed inputs to the cross-rank max, as
+    ``_pad_inputs_to_size`` does; the per-row extend lists stay at one token.
+    """
+    bs = len(seq_lens)
+    batch = ForwardBatch(
+        forward_mode=ForwardMode.EXTEND,
+        batch_size=bs,
+        input_ids=torch.zeros(num_tokens, dtype=torch.int64),
+        req_pool_indices=torch.arange(bs),
+        seq_lens=torch.tensor(seq_lens),
+        seq_lens_sum=sum(seq_lens),
+        out_cache_loc=torch.zeros(num_tokens, dtype=torch.int64),
+        extend_num_tokens=bs,
+        extend_start_loc=torch.arange(bs, dtype=torch.int32),
+        extend_seq_lens=torch.ones(bs, dtype=torch.int32),
+        extend_prefix_lens=torch.tensor(seq_lens) - 1,
+        extend_seq_lens_cpu=[1] * bs,
+        extend_prefix_lens_cpu=[n - 1 for n in seq_lens],
+        # Decode sets the mask on track boundaries but never mamba_track_seqlens.
+        mamba_track_mask=None if track_mask is None else torch.tensor(track_mask),
+        mamba_track_indices=None if track_mask is None else torch.arange(bs) + 10,
+    )
+    batch._original_forward_mode = ForwardMode.DECODE
+    return batch
 
 
 class TestMambaPrefillTrackMetadata(unittest.TestCase):
@@ -202,7 +236,15 @@ class TestMambaPrefillTrackMetadata(unittest.TestCase):
         override.install()
         self.addCleanup(override.restore)
         batch = ScheduleBatch(
-            reqs=[SimpleNamespace(rid="one", lora_id=None, token_type_ids=None)],
+            reqs=[
+                SimpleNamespace(
+                    rid="one",
+                    lora_id=None,
+                    token_type_ids=None,
+                    extend_end=65,
+                    full_untruncated_fill_ids=[3] * 65,
+                )
+            ],
             device="cpu",
             forward_mode=ForwardMode.EXTEND,
             input_ids=torch.tensor([3]),
@@ -301,6 +343,75 @@ class TestMambaPrefillTrackMetadata(unittest.TestCase):
                 self.assertEqual(snapshot.mamba_prefill_track_mask_cpu, [True])
                 self.assertEqual(snapshot.mamba_track_seqlens_cpu, [65])
                 self.assertIsNone(snapshot.mamba_track_mask_cpu)
+
+
+class TestDpDecodeRelabel(unittest.TestCase):
+    """Decode rows relabeled as 1-token extends for DP MAX_LEN padding must keep
+    decode semantics on the mamba side."""
+
+    def test_forward_metadata_on_a_track_boundary_stays_decode(self):
+        backend = make_metadata_backend()
+        backend.conv_states_shape = (1, 8, 4)
+        # A peer's prefill pads the 2 decode rows to 697 tokens; the metadata
+        # must still cover only the real rows.
+        batch = make_relabeled_decode_batch(
+            [256, 9], num_tokens=697, track_mask=[True, False]
+        )
+        metadata = backend._forward_metadata(batch)
+        torch.testing.assert_close(
+            metadata.query_start_loc, torch.arange(3, dtype=torch.int32)
+        )
+        self.assertIsNone(metadata.logical_num_tokens)
+        self.assertIsNone(metadata.track_conv_indices)
+
+    def test_prepare_mixed_builds_decode_metadata(self):
+        metadata = Mamba2Metadata.prepare_mixed(
+            ForwardMetadata(
+                query_start_loc=torch.arange(4, dtype=torch.int32),
+                mamba_cache_indices=torch.arange(3, dtype=torch.int32),
+            ),
+            64,
+            make_relabeled_decode_batch([8, 8, 8], num_tokens=64),
+        )
+        self.assertEqual(metadata.num_decodes, 3)
+        self.assertEqual(metadata.num_prefills, 0)
+        self.assertIsNone(metadata.mixed_metadata)
+
+    def test_two_batch_overlap_rejects_relabeled_batches(self):
+        with self.assertRaisesRegex(AssertionError, "Two-batch overlap"):
+            TboForwardBatchPreparer.filter_batch(
+                make_relabeled_decode_batch([8, 8], num_tokens=4),
+                start_token_index=0,
+                end_token_index=1,
+                start_seq_index=0,
+                end_seq_index=1,
+                out_num_token_non_padded=torch.zeros(1, dtype=torch.int32),
+            )
+
+    def test_prepare_mixed_keeps_real_extends_as_prefills(self):
+        batch = make_forward_batch([4, 3], [0, 4], [4, 3])
+        batch.extend_num_tokens = 7
+        batch.extend_prefix_lens = torch.zeros(2, dtype=torch.int64)
+        metadata = Mamba2Metadata.prepare_mixed(
+            ForwardMetadata(
+                query_start_loc=torch.tensor([0, 4, 7], dtype=torch.int32),
+                mamba_cache_indices=torch.arange(2, dtype=torch.int32),
+            ),
+            64,
+            batch,
+        )
+        self.assertEqual(metadata.num_prefills, 2)
+        self.assertEqual(metadata.num_decodes, 0)
+        self.assertIsNotNone(metadata.mixed_metadata)
+
+    def test_logical_mode_ignores_idle_relabels(self):
+        # Idle ranks also set _original_forward_mode; their fabricated rows stay
+        # in the relabeled mode.
+        for mode in (ForwardMode.EXTEND, ForwardMode.TARGET_VERIFY):
+            with self.subTest(mode=mode):
+                batch = make_forward_batch([1], [0], [1], mode)
+                batch._original_forward_mode = ForwardMode.IDLE
+                self.assertEqual(batch.logical_forward_mode, mode)
 
 
 if __name__ == "__main__":

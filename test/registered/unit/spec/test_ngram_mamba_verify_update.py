@@ -160,22 +160,22 @@ class TestPPReplaySSMVerifySourceRows(CustomTestCase):
         return spec_state
 
     def test_fold_helpers_read_pp_request_rows(self):
-        from sglang.kernels.ops.attention.fla.gdn_replayssm_spec_fold import (
+        from sglang.kernels.ops.attention.linear.gdn_replayssm_spec_fold import (
             commit_gdn_replayssm_fold_after_verify,
         )
-        from sglang.kernels.ops.attention.fla.kda_replayssm_spec_decode import (
+        from sglang.kernels.ops.attention.linear.kda_replayssm_spec_decode import (
             commit_kda_replayssm_after_verify,
         )
 
         cases = (
             (
                 commit_gdn_replayssm_fold_after_verify,
-                "sglang.kernels.ops.attention.fla.gdn_replayssm_spec_fold",
+                "sglang.kernels.ops.attention.linear.gdn_replayssm_spec_fold",
                 "commit_gdn_replayssm_fold_all_layers",
             ),
             (
                 commit_kda_replayssm_after_verify,
-                "sglang.kernels.ops.attention.fla.kda_replayssm_spec_decode",
+                "sglang.kernels.ops.attention.linear.kda_replayssm_spec_decode",
                 "commit_kda_replayssm_spec_all_layers",
             ),
         )
@@ -232,11 +232,11 @@ class TestPPReplaySSMVerifySourceRows(CustomTestCase):
                 return_value=True,
             ),
             patch(
-                "sglang.kernels.ops.attention.fla.gdn_replayssm_spec_decode."
+                "sglang.kernels.ops.attention.linear.gdn_replayssm_spec_decode."
                 "commit_gdn_replayssm_spec"
             ),
             patch(
-                "sglang.kernels.ops.attention.fla.gdn_replayssm_spec_decode."
+                "sglang.kernels.ops.attention.linear.gdn_replayssm_spec_decode."
                 "commit_gdn_replayssm_circular"
             ),
             patch(

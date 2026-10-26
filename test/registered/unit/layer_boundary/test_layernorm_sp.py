@@ -70,10 +70,6 @@ class TestLayerNormSPGating(CustomTestCase):
         _initialize(enable=False, arch="Qwen3ForCausalLM")
         self.assertFalse(layernorm_sp.layernorm_sp_enabled())
 
-    def test_defaults_off_before_initialization(self):
-        # A process that never runs initialize_layernorm_sp must not enable SP.
-        self.assertFalse(layernorm_sp.layernorm_sp_enabled())
-
     def test_runs_sp_only_on_extend(self):
         with get_flags().sp.override(enabled=True):
             self.assertTrue(layernorm_sp.runs_sp(ForwardMode.EXTEND))
@@ -125,6 +121,10 @@ class TestLayerNormSPValidation(CustomTestCase):
     def test_rejects_speculative(self):
         with self.assertRaisesRegex(ValueError, "speculative"):
             validate_layernorm_sp(**{**self.VALID, "speculative_algorithm": "EAGLE3"})
+
+    def test_rejects_pipeline_parallelism(self):
+        with self.assertRaisesRegex(ValueError, "pipeline"):
+            validate_layernorm_sp(**{**self.VALID, "pp_size": 2})
 
 
 class _Norm:

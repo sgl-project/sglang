@@ -23,6 +23,7 @@ from sglang.kernels.ops.activation.activation import (
     silu_and_mul_with_activation_rounding_,
 )
 from sglang.kernels.ops.diffusion import (
+    MINIMAX_H3_NORM_MODULATE,
     can_use_fused_inplace_qknorm_rope,
     can_use_mxfp8_swizzled,
     can_use_rmsnorm_indexed_scale_shift,
@@ -31,10 +32,11 @@ from sglang.kernels.ops.diffusion import (
     fused_qknorm_rope_out_of_place,
     indexed_gate_bf16,
     indexed_gate_bf16_,
+    indexed_gate_fp32,
+    indexed_gate_fp32_,
     indexed_scale_shift_bf16_,
+    indexed_scale_shift_fp32_,
     indexed_scale_shift_mxfp8_,
-    mark_minimax_h3_norm_modulate_site,
-    minimax_h3_norm_modulate_active,
     rmsnorm_indexed_scale_shift,
     silu_mul_mxfp8,
 )
@@ -132,6 +134,9 @@ def _reject_non_lora_delta_tensors(adapter: dict[str, torch.Tensor]) -> None:
         )
 
 
+# DO NOT CHANGE, MILES-D IS USING: miles_diffusion keeps a clone in
+# miles/backends/fsdp_utils/models/diffusers/h3/weight_bridge.py; change both together.
+# TODO(rockdu): load weights and update weights in one format so the clone can go.
 def _diffusers_h3_checkpoint(
     iterator: Iterable[tuple[str, torch.Tensor]],
 ) -> Iterator[tuple[str, torch.Tensor]]:
@@ -437,11 +442,15 @@ def _modulate_scale_shift(
         x.is_cuda
         and x.dtype == _BF16_DTYPE
         and dtype == _BF16_DTYPE
-        and shift.dtype == _BF16_DTYPE
-        and scale.dtype == _BF16_DTYPE
+        and shift.dtype == scale.dtype
         and x.is_contiguous()
+        and shift.stride(-1) == scale.stride(-1) == 1
     ):
-        return indexed_scale_shift_bf16_(x, shift, scale, indices)
+        # Serialized INT8 checkpoints keep the AdaLN tables in FP32.
+        if shift.dtype == _BF16_DTYPE:
+            return indexed_scale_shift_bf16_(x, shift, scale, indices)
+        if shift.dtype == _FP32_DTYPE:
+            return indexed_scale_shift_fp32_(x, shift, scale, indices)
     return (
         x * (1.0 + scale.index_select(0, indices)) + shift.index_select(0, indices)
     ).to(dtype)
@@ -462,14 +471,19 @@ def _modulate_gate(
         x.is_cuda
         and x.dtype == _BF16_DTYPE
         and dtype == _BF16_DTYPE
-        and gate.dtype == _BF16_DTYPE
         and other.dtype == _BF16_DTYPE
         and x.is_contiguous()
         and other.is_contiguous()
+        and gate.stride(-1) == 1
     ):
-        if allow_inplace:
-            return indexed_gate_bf16_(x, gate, other, indices)
-        return indexed_gate_bf16(x, gate, other, indices)
+        if gate.dtype == _BF16_DTYPE:
+            if allow_inplace:
+                return indexed_gate_bf16_(x, gate, other, indices)
+            return indexed_gate_bf16(x, gate, other, indices)
+        if gate.dtype == _FP32_DTYPE:
+            if allow_inplace:
+                return indexed_gate_fp32_(x, gate, other, indices)
+            return indexed_gate_fp32(x, gate, other, indices)
     return (x + gate.index_select(0, indices) * other).to(dtype)
 
 
@@ -1007,6 +1021,8 @@ class MiniMaxH3Attention(nn.Module):
         self.k_norm = _norm(arch.attention_head_dim, eps=arch.qk_norm_eps)
         # cache width covers cos/sin for temporal, height, and width frequencies
         rope_dim = 6 * arch.rope_inv_freq_len
+        # Not apply_qk_norm_rope: Q/K are [tokens, heads, head_dim] and the norms
+        # are torch nn.RMSNorm, so the fused kernel is called directly.
         self._use_fused_qknorm_rope = (
             current_platform.is_cuda()
             and can_use_fused_inplace_qknorm_rope(
@@ -1296,6 +1312,43 @@ class MiniMaxH3Attention(nn.Module):
                 ulysses_active=ulysses_active,
                 ring_active=ring_active,
             )
+        # The fused qk-norm/RoPE, pipelined Ulysses exchange and attention kernels
+        # are untraceable, and the traceable fallback is slower than eager, so a
+        # compiled DiT runs this section eager and compiles around it.
+        attend = self._attend_eager if torch.compiler.is_compiling() else self._attend
+        out = attend(
+            x,
+            q,
+            k,
+            v,
+            rope_cache=rope_cache,
+            cu_seqlens=cu_seqlens,
+            cu_seqlens_host=cu_seqlens_host,
+            max_seqlen=max_seqlen,
+            subblock_sparse_query_block_mask=subblock_sparse_query_block_mask,
+            ulysses_active=ulysses_active,
+            ring_active=ring_active,
+        )
+        out, _ = self.out_proj(out)
+        return out
+
+    def _attend(
+        self,
+        x: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        rope_cache: tuple[torch.Tensor, torch.Tensor] | None,
+        cu_seqlens: torch.Tensor,
+        cu_seqlens_host: tuple[int, ...] | None,
+        max_seqlen: int,
+        subblock_sparse_query_block_mask: torch.Tensor | None,
+        ulysses_active: bool,
+        ring_active: bool,
+    ) -> torch.Tensor:
+        """q/k/v [T, heads, head_dim] -> attention output [T, heads * head_dim]."""
+        total = x.shape[0]
         if rope_cache is None:
             q, k = _apply_qk_norm(
                 q,
@@ -1306,7 +1359,7 @@ class MiniMaxH3Attention(nn.Module):
             )
         else:
             cos_sin_cache, positions = rope_cache
-            if self._use_fused_qknorm_rope and not torch.compiler.is_compiling():
+            if self._use_fused_qknorm_rope:
                 if ulysses_active and not ring_active:
                     out = _minimax_h3_qknorm_rope_pipelined_attention(
                         self,
@@ -1319,10 +1372,7 @@ class MiniMaxH3Attention(nn.Module):
                         max_seqlen=max_seqlen,
                     )
                     if out is not None:
-                        out, _ = self.out_proj(
-                            out.reshape(total, self.num_heads * self.head_dim)
-                        )
-                        return out
+                        return out.reshape(total, self.num_heads * self.head_dim)
                 fused_inplace_qknorm_rope(
                     q,
                     k,
@@ -1372,9 +1422,9 @@ class MiniMaxH3Attention(nn.Module):
             ring_active=ring_active,
             gate_compress=gate_compress,
         )
-        out = out.reshape(total, self.num_heads * self.head_dim)
-        out, _ = self.out_proj(out)
-        return out
+        return out.reshape(total, self.num_heads * self.head_dim)
+
+    _attend_eager = torch.compiler.disable(_attend)
 
 
 class MiniMaxH3MLP(nn.Module):
@@ -1588,7 +1638,7 @@ class MiniMaxH3DiTBlock(nn.Module):
         super().__init__()
         self.norm1 = _norm(arch.hidden_size, eps=arch.norm_eps)
         self.norm2 = _norm(arch.hidden_size, eps=arch.norm_eps)
-        mark_minimax_h3_norm_modulate_site(self)
+        MINIMAX_H3_NORM_MODULATE.mark(self)
         self.attn = MiniMaxH3Attention(
             arch,
             quant_config,
@@ -1661,7 +1711,7 @@ class MiniMaxH3DiTBlock(nn.Module):
                 scale_msa,
                 combined_indices,
                 dtype=_BF16_DTYPE,
-                fused=minimax_h3_norm_modulate_active(self),
+                fused=MINIMAX_H3_NORM_MODULATE.is_enabled(self),
             )
         h = self.attn(
             h,
@@ -1704,7 +1754,7 @@ class MiniMaxH3DiTBlock(nn.Module):
                 scale_mlp,
                 combined_indices,
                 dtype=_BF16_DTYPE,
-                fused=minimax_h3_norm_modulate_active(self),
+                fused=MINIMAX_H3_NORM_MODULATE.is_enabled(self),
             )
             h = self.mlp(h)
         # `residual` is block-local here (see above), so this stays in-place
@@ -1768,6 +1818,8 @@ class MiniMaxH3FinalLayer(nn.Module):
         # Parallel Decoding Distillation heads, one per denoise step, loaded by
         # `load_pdd_fused_heads`. None on every ordinary run.
         self._pdd_heads: dict[str, torch.Tensor] | None = None
+        # (name, device, dtype) -> that head's stacked (weight, bias), uploaded once
+        self._pdd_device_heads: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
 
     def load_pdd_fused_heads(self, path: str) -> None:
         """Swap the two output heads for a per-step stack (PDD).
@@ -1795,6 +1847,7 @@ class MiniMaxH3FinalLayer(nn.Module):
                 width = projection.output_size_per_partition
                 heads[key] = heads[key].narrow(1, projection.tp_rank * width, width)
         self._pdd_heads = heads
+        self._pdd_device_heads = {}
         logger.info("MiniMax-H3 PDD: %d fused output heads loaded from %s", steps, path)
 
     def _pdd_project(self, h: torch.Tensor, name: str) -> torch.Tensor:
@@ -1807,9 +1860,14 @@ class MiniMaxH3FinalLayer(nn.Module):
                 f"step {step}; run with --num-inference-steps {stack.shape[0]} "
                 "(num_inference_steps counts denoise transitions)."
             )
-        weight = stack[step].to(device=h.device, dtype=h.dtype)
-        bias = heads[f"{name}.bias"][step].to(device=h.device, dtype=h.dtype)
-        return torch.nn.functional.linear(h, weight, bias)
+        key = (name, h.device, h.dtype)
+        if key not in self._pdd_device_heads:
+            self._pdd_device_heads[key] = (
+                stack.to(device=h.device, dtype=h.dtype),
+                heads[f"{name}.bias"].to(device=h.device, dtype=h.dtype),
+            )
+        weight, bias = self._pdd_device_heads[key]
+        return torch.nn.functional.linear(h, weight[step], bias[step])
 
     def _project(self, h: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if self._pdd_heads is not None:

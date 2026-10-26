@@ -15,6 +15,25 @@ from sglang.srt.runtime_context import get_platform
 logger = logging.getLogger(__name__)
 
 
+def _dsa_dcp_overrides(cfg: Any) -> dict:
+    if cfg.dcp_size <= 1:
+        return {}
+    if cfg.enable_hisparse or cfg.enable_hierarchical_cache:
+        raise ValueError("DSA DCP does not support HiSparse or HiCache.")
+    if cfg.disaggregation_mode != "null":
+        raise ValueError("DSA DCP does not support PD disaggregation.")
+    if cfg.speculative_eagle_topk not in (None, 1):
+        raise ValueError("DSA DCP requires --speculative-eagle-topk 1.")
+    overrides = {
+        name: "trtllm"
+        for name in ("dsa_prefill_backend", "dsa_decode_backend")
+        if getattr(cfg, name) is None
+    }
+    if cfg.dcp_replicate_q_proj is None and cfg.dcp_comm_backend in ("a2a", "fi_a2a"):
+        overrides["dcp_replicate_q_proj"] = True
+    return overrides
+
+
 @_register_for(
     "DeepseekV3ForCausalLM",
     "DeepseekV32ForCausalLM",
@@ -78,6 +97,7 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                     )
 
     if is_deepseek_dsa(hf_config):  # DeepSeek 3.2/GLM 5
+        overrides.update(_dsa_dcp_overrides(cfg))
         # Set attention backend for DeepSeek
         if is_attention_backend_not_set(cfg):
             overrides["attention_backend"] = "dsa"
@@ -119,8 +139,7 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                     f"ep_size={overrides.get('ep_size', cfg.ep_size)}, tp_size={cfg.tp_size}, "
                     f"attn_cp_size={attn_cp_size}, "
                     f"kv_cache_dtype={cfg.kv_cache_dtype}, "
-                    f"moe_a2a_backend={overrides.get('moe_a2a_backend', cfg.moe_a2a_backend)}, "
-                    f"cuda_graph_config[prefill].backend=disabled"
+                    f"moe_a2a_backend={overrides.get('moe_a2a_backend', cfg.moe_a2a_backend)}"
                 )
 
             # Deferred import to avoid a circular import at module-load

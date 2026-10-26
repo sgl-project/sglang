@@ -131,8 +131,7 @@ class TestGenerateRequest(CustomTestCase):
             {
                 "text": "hi",
                 "priority": 3,
-                "session_id": "s",
-                "custom_logit_processor": "x",
+                "conversation_id": "ignored",
             }
         )
         self.assertEqual(req.text, "hi")
@@ -295,7 +294,7 @@ class TestFrames(CustomTestCase):
         )
         self.assertEqual(
             compact(frame.to_json_value()),
-            '{"text":"ok","meta_info":{"id":"client-rid","prompt_tokens":5,"completion_tokens":2,"finish_reason":null},"output_ids":[7,8]}',
+            '{"text":"ok","meta_info":{"id":"client-rid","prompt_tokens":5,"completion_tokens":2,"finish_reason":null,"cached_tokens":0,"reasoning_tokens":0},"output_ids":[7,8]}',
         )
 
     def test_frame_round_trip_with_logprobs(self):
@@ -310,6 +309,8 @@ class TestFrames(CustomTestCase):
                 "output_top_logprobs": [None, [[-0.2, 6, None]]],
                 "hidden_states": [[0.5, 0.25]],
                 "e2e_latency": 0.01,
+                "cached_tokens": 1,
+                "reasoning_tokens": 0,
             },
             "output_ids": [5],
             "index": 0,
