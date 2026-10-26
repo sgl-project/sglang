@@ -11,11 +11,12 @@ from sglang.srt.distributed.device_communicators.quick_all_reduce import (
     QuickAllReduce,
     qr_rocm_arch_available,
 )
+from sglang.srt.utils import is_gfx95_supported
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_amd_ci(est_time=30, suite="stage-c-test-4-gpu-amd")
-register_amd_ci(est_time=30, suite="stage-c-test-large-8-gpu-amd-mi35x")
+register_amd_ci(est_time=120, suite="stage-c-test-large-8-gpu-amd-mi35x")
 
 
 def _get_open_port() -> int:
@@ -80,41 +81,178 @@ def _run_bf16_range_test(rank: int, world_size: int, port: int) -> None:
         dist.destroy_process_group()
 
 
+def _run_jit_bitwise_test(rank: int, world_size: int, port: int) -> None:
+    import sgl_kernel.allreduce as aot
+
+    from sglang.kernels.ops.communication import quick_all_reduce_hip as jit
+
+    os.environ["ROCM_QUICK_REDUCE_QUANTIZATION"] = "INT4"
+    os.environ["ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16"] = "1"
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+    dist.init_process_group(
+        backend="gloo",
+        init_method=f"tcp://127.0.0.1:{port}",
+        rank=rank,
+        world_size=world_size,
+    )
+
+    def open_comm(init, get_handle, open_handles):
+        handle = init(rank, world_size, 128 << 20)
+        handles = [None] * world_size
+        dist.all_gather_object(handles, get_handle(handle))
+        open_handles(handle, handles)
+        return handle
+
+    try:
+        # sgl_kernel.allreduce takes (world_size, rank), the JIT module the reverse.
+        aot_comm = open_comm(
+            lambda r, w, m: aot.init_custom_qr(w, r, m),
+            aot.qr_get_handle,
+            aot.qr_open_handles,
+        )
+        jit_comm = open_comm(jit.init_custom_qr, jit.qr_get_handle, jit.qr_open_handles)
+        generator = torch.Generator(device=device).manual_seed(rank)
+        int8, int6, int4 = 1, 2, 3
+        # (requested level, level it runs): asked for INT4, the JIT build runs INT8 below 64 MiB;
+        # a 32 KB tile per block, more tiles than blocks (grid-stride loop)
+        for numel, level, runs in (
+            (384 * 6144, int4, int8),
+            (4096 * 6144, int4, int8),
+            (6144 * 6144, int4, int4),
+            (6144 * 6144, int8, int8),
+        ):
+            inp = torch.randn(numel, device=device, generator=generator).bfloat16()
+            inp[::4099] *= 64
+            expected, out = torch.empty_like(inp), torch.empty_like(inp)
+            for _ in range(2):
+                aot.qr_all_reduce(aot_comm, inp, expected, runs, True)
+                jit.qr_all_reduce(jit_comm, inp, out, level, True)
+            torch.cuda.synchronize()
+            assert torch.equal(out.view(torch.int16), expected.view(torch.int16)), (
+                f"{numel=} {level=}: JIT quick all-reduce differs from sgl-kernel's"
+            )
+        try:
+            jit.qr_all_reduce(jit_comm, inp, out, int6, True)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("the INT4 / INT8 JIT build ran INT6")
+        jit.qr_destroy(jit_comm)
+        aot.qr_destroy(aot_comm)
+    finally:
+        dist.destroy_process_group()
+
+
+def _run_jit_fallback_test(rank: int, world_size: int, port: int) -> None:
+    import sgl_kernel.allreduce as aot
+
+    from sglang.kernels.ops.communication import quick_all_reduce_hip as jit
+
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+    dist.init_process_group(
+        backend="gloo",
+        init_method=f"tcp://127.0.0.1:{port}",
+        rank=rank,
+        world_size=world_size,
+    )
+
+    def open_comm(init, get_handle, open_handles):
+        handle = init(rank, world_size, 128 << 20)
+        handles = [None] * world_size
+        dist.all_gather_object(handles, get_handle(handle))
+        open_handles(handle, handles)
+        return handle
+
+    try:
+        int6 = 2
+        generator = torch.Generator(device=device).manual_seed(rank)
+        inp = torch.randn(384 * 6144, device=device, generator=generator).bfloat16()
+        # (level, cast): INT6 at any world size, and no cast at TP4, are not the JIT build's
+        cases = [("INT6", "1", int6, True)]
+        if world_size == 4:
+            cases.append(("INT8", "0", 1, False))
+        else:
+            cases.append(("INT4", "1", 3, True))
+        for level_name, cast, level, cast_bf2half in cases:
+            os.environ["ROCM_QUICK_REDUCE_QUANTIZATION"] = level_name
+            os.environ["ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16"] = cast
+            aot_comm = open_comm(
+                lambda r, w, m: aot.init_custom_qr(w, r, m),
+                aot.qr_get_handle,
+                aot.qr_open_handles,
+            )
+            jit_comm = open_comm(
+                jit.init_custom_qr, jit.qr_get_handle, jit.qr_open_handles
+            )
+            expected, out = torch.empty_like(inp), torch.empty_like(inp)
+            aot.qr_all_reduce(aot_comm, inp, expected, level, cast_bf2half)
+            jit.qr_all_reduce(jit_comm, inp, out, level, cast_bf2half)
+            torch.cuda.synchronize()
+            assert torch.equal(out.view(torch.int16), expected.view(torch.int16)), (
+                f"{world_size=} {level_name=} {cast=}: the fallback is not sgl-kernel's"
+            )
+            jit.qr_destroy(jit_comm)
+            aot.qr_destroy(aot_comm)
+    finally:
+        dist.destroy_process_group()
+
+
+def _spawn(test_case, target, world_size, name):
+    port = _get_open_port()
+    context = multiprocessing.get_context("spawn")
+    processes = [
+        context.Process(target=target, args=(rank, world_size, port))
+        for rank in range(world_size)
+    ]
+    for process in processes:
+        process.start()
+    deadline = time.monotonic() + 300
+    for process in processes:
+        process.join(max(0, deadline - time.monotonic()))
+    if any(process.is_alive() for process in processes):
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+                process.join()
+        test_case.fail(f"{name} timed out")
+    for rank, process in enumerate(processes):
+        test_case.assertEqual(process.exitcode, 0, f"{name} failed on rank {rank}")
+
+
 class TestQuickAllReduceBf16Range(CustomTestCase):
     @unittest.skipUnless(
         qr_rocm_arch_available() and torch.cuda.device_count() >= 4,
         "QuickReduce range test requires at least four supported ROCm GPUs",
     )
     def test_bf16_range(self):
-        world_size = 4
-        port = _get_open_port()
-        context = multiprocessing.get_context("spawn")
-        processes = [
-            context.Process(
-                target=_run_bf16_range_test,
-                args=(rank, world_size, port),
-            )
-            for rank in range(world_size)
-        ]
-        for process in processes:
-            process.start()
+        _spawn(self, _run_bf16_range_test, 4, "QuickReduce bf16 range test")
 
-        deadline = time.monotonic() + 120
-        for process in processes:
-            process.join(max(0, deadline - time.monotonic()))
+    @unittest.skipUnless(
+        is_gfx95_supported() and torch.cuda.device_count() >= 4,
+        "the JIT quick all-reduce is built and validated on four or more gfx950 GPUs",
+    )
+    def test_jit_matches_sgl_kernel(self):
+        """The JIT copy restructures the two-shot for latency; on bf16 cast to fp16 it must
+        reduce bit-identically to sgl-kernel's at the level it runs (INT8 below 64 MiB when
+        asked for INT4) and refuse any level but INT4 and INT8."""
+        _spawn(self, _run_jit_bitwise_test, 4, "QuickReduce JIT bitwise test")
 
-        if any(process.is_alive() for process in processes):
-            for process in processes:
-                if process.is_alive():
-                    process.terminate()
-                    process.join()
-            self.fail("QuickReduce bf16 range test timed out")
-
-        for rank, process in enumerate(processes):
-            self.assertEqual(
-                process.exitcode,
-                0,
-                f"QuickReduce bf16 range test failed on rank {rank}",
+    @unittest.skipUnless(
+        is_gfx95_supported() and torch.cuda.device_count() >= 4,
+        "the JIT quick all-reduce is built and validated on four or more gfx950 GPUs",
+    )
+    def test_jit_falls_back_to_sgl_kernel(self):
+        """SGLANG_ROCM_QUICK_ALL_REDUCE_JIT replaces every group's quick all-reduce; a group
+        the JIT build does not serve (TP2, INT6, no bf16 -> fp16 cast) must run sgl-kernel's
+        instead of raising at its first all-reduce."""
+        for world_size in (2, 4):
+            _spawn(
+                self,
+                _run_jit_fallback_test,
+                world_size,
+                f"QuickReduce JIT fallback test (TP{world_size})",
             )
 
 
