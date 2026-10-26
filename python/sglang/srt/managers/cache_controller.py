@@ -658,6 +658,7 @@ class HiCacheController:
                     "mori",
                     "tensorcast",
                     "seaweedfs",
+                    "radixshmem",
                 ]
             ) or (
                 self.storage_backend_type == "dynamic"
@@ -743,6 +744,10 @@ class HiCacheController:
 
     @property
     def backup_skip(self) -> bool:
+        # A shard-collective backend writes over the attention TP group: every rank backs up.
+        backend = getattr(self, "storage_backend", None)
+        if getattr(backend, "shard_collective", False) is True:
+            return False
         return not self.storage_config.is_storage_writer
 
     def _generate_storage_config(
