@@ -150,9 +150,11 @@ def on_graph_capture_forward_start(recorder=None):
 
 
 def get_graph_capture_state(recorder=None) -> dict[str, bool]:
+    # False flags are replay no-ops; omit them so direct-counting graphs skip the hook.
     return {
-        key: gatherer.get_graph_capture_state()
+        key: True
         for key, gatherer in _get_npu_gatherers(recorder).items()
+        if gatherer.get_graph_capture_state()
     }
 
 

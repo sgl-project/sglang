@@ -16,6 +16,8 @@ unchanged local placements still participate in sends but skip ND writeback.
 Workspaces are reused within a chunk and are not cached between rebalances.
 NPU target forwards skip the draft guard's device lookup, and empty route
 tensors return before creating a buffer view or issuing a copy.
+Graphs without buffered routes omit inactive capture flags, letting replay skip
+the statistics-state restoration hook.
 
 Six production files differ from the base: three NPU files and the shared
 recorder factory, weight updater, and ModelRunner entry points. The shared
