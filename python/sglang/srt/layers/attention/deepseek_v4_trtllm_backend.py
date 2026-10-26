@@ -268,8 +268,9 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
 
         # Preallocate every role at its maximum so nothing is allocated while serving.
         self.trtllm_table_pool = TrtllmSparseTablePool(self.cuda_int32_kwargs)
+        # Adaptive spec may widen the draft later; capture cannot grow the pool.
         max_decode_rows = self.req_to_token.shape[0] * (
-            self.speculative_num_draft_tokens or 1
+            max_speculative_num_draft_tokens() or 1
         )
         max_prefill_rows = _trtllm_query_row_capacity(model_runner)
         w4 = ceil_align(self.index_topk, PAGE_INDEX_ALIGNED_SIZE)
