@@ -40,6 +40,7 @@ from sglang.multimodal_gen.runtime.models.dits.minimax_h3_vdn import (
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
+    is_in_breakable_cuda_graph,
 )
 
 if TYPE_CHECKING:
@@ -147,7 +148,7 @@ class MiniMaxH3VDNHybridAttention(nn.Module):
             max_seqlen=max_seqlen,
             ulysses_active=ulysses_active,
         )
-        if attention.bcg_breakpoint:
+        if attention.bcg_breakpoint and is_in_breakable_cuda_graph():
             softmax_out, linear_out = _new_hybrid_core_outputs(q, total, ulysses_active)
             _hybrid_attention_core_bcg(
                 *core_args,

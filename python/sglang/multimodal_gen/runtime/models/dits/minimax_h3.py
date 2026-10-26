@@ -115,6 +115,7 @@ from sglang.multimodal_gen.runtime.platforms import (
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
+    is_in_breakable_cuda_graph,
 )
 
 logger = init_logger(__name__)
@@ -1420,7 +1421,7 @@ class MiniMaxH3Attention(nn.Module):
             ring_active=ring_active,
             gate_compress=gate_compress,
         )
-        if self.bcg_breakpoint:
+        if self.bcg_breakpoint and is_in_breakable_cuda_graph():
             out = q.new_empty(q.shape)
             _minimax_h3_attention_core_bcg(self, q, k, v, out=out, **core_kwargs)
         else:
