@@ -95,6 +95,9 @@ from sglang.srt.environ import envs
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
+from sglang.srt.function_call.kimik3_structural_tag import (
+    get_kimik3_no_tool_call_structural_tag,
+)
 from sglang.srt.function_call.utils import (
     get_json_schema_constraint,
     normalize_json_schema_types,
@@ -1588,6 +1591,17 @@ class OpenAIServingChat(OpenAIServingBase):
                     parallel_tool_calls=request.parallel_tool_calls,
                 )
                 tool_call_constraint = ("json_schema", json_schema)
+        elif (
+            effective_tools
+            and self.chat_encoding_spec == "kimi_k3"
+            and self.tool_call_parser == "kimi_k3"
+        ):
+            tool_call_constraint = (
+                "structural_tag",
+                get_kimik3_no_tool_call_structural_tag(
+                    thinking_mode=xgrammar_reasoning
+                ),
+            )
 
         # When input_ids are provided, skip template tokenization entirely;
         # only stop tokens and tool_call_constraint are needed.
