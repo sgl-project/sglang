@@ -3299,7 +3299,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 self.req_pool_indices_cpu,
             )
 
-        if get_exec().mamba.enable_mamba_extra_buffer:
+        if get_exec().mamba.enable_mamba_decode_tracking:
             mamba_track_interval = mamba_track_grid(self.tree_cache.page_size)
             track_remainders_cpu = self.seq_lens_cpu % mamba_track_interval
             track_mask_cpu = track_remainders_cpu == 0
@@ -3332,6 +3332,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.mamba_track_mask = track_mask_cpu.pin_memory().to(
                 device=self.device, non_blocking=True
             )
+        elif self.mamba_track_mask is not None or self.mamba_track_mask_cpu is not None:
+            # An intact prefill batch can still point at its prompt checkpoint.
+            self.mamba_track_mask = None
+            self.mamba_track_indices = None
+            self.mamba_track_seqlens = None
+            self.mamba_track_buffer_indices = None
+            self.mamba_track_mask_cpu = None
+            self.mamba_track_mask_next_cpu = None
+            self.mamba_decode_batch_idx_cpu = None
 
     def filter_batch(
         self,

@@ -1565,7 +1565,8 @@ class SchedulerBatchResultProcessor:
         logits_output: LogitsProcessorOutput,
         num_new_tokens: int = 1,
     ):
-        lazy = get_exec().mamba.enable_mamba_extra_buffer_lazy
+        mamba = get_exec().mamba
+        lazy = mamba.enable_mamba_extra_buffer_lazy
         known_mamba_boundary = None
         completed_mamba_boundary = None
         lookahead = 0
@@ -1596,7 +1597,9 @@ class SchedulerBatchResultProcessor:
         # Called here (after update_finish_state) so req.finished() is valid
         # for mamba_lazy_post_decode_at_boundary inside.
         should_update = completed_mamba_boundary if lazy else known_mamba_boundary
-        if should_update is None or should_update:
+        if should_update or (
+            should_update is None and not mamba.disable_mamba_decode_tracking
+        ):
             self._mamba_prefix_cache_update(
                 req,
                 batch,

@@ -522,7 +522,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
 
         enable_mamba_track = (
-            get_exec().mamba.enable_mamba_extra_buffer
+            get_exec().mamba.enable_mamba_decode_tracking
             and self.model_runner.spec_algorithm.is_none()
         )
         # A verify's commit writes checkpoint slots that have no graph input;
