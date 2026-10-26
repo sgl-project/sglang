@@ -35,24 +35,26 @@ pub(super) fn stream_error_event(message: &str, err_type: &str, code: u16) -> St
     format!("data: {}\n\n", python_json(&error, true))
 }
 
-/// A native `/generate` error's message, unary and streamed OpenAI types, and
-/// status. Python's `/generate` errors are 400s; another status a host names
-/// stays, as Python's `HTTPException` keeps it.
-fn engine_error_parts(error: GenerateStreamError) -> (String, String, &'static str, u16) {
+/// A native `/generate` error's message, OpenAI type and status. Python's
+/// `/generate` sends no code (a ValueError, so a 400); an engine that sends one
+/// keeps its status, typed as `create_error_response` types it.
+fn engine_error_parts(error: GenerateStreamError) -> (String, String, u16) {
     let error = error.error.unwrap_or_default();
-    let status = Some(u64::from(error.code))
-        .filter(|&code| code != 400)
-        .and_then(|code| Some((code as u16, http_status_name(code)?)));
-    match status {
-        Some((code, name)) => (error.message, code.to_string(), name, code),
-        None => (error.message, "BadRequestError".to_owned(), "BadRequestError", 400),
-    }
+    let code = u16::try_from(error.code)
+        .ok()
+        .filter(|code| (400..600).contains(code))
+        .unwrap_or(400);
+    let err_type = match code {
+        400 => "BadRequestError".to_owned(),
+        _ => code.to_string(),
+    };
+    (error.message, err_type, code)
 }
 
 /// The OpenAI reply for a native `/generate` error.
 pub(super) fn engine_error_reply(error: GenerateStreamError) -> Reply {
-    let (message, unary_type, _, code) = engine_error_parts(error);
-    error_reply(&message, &unary_type, code)
+    let (message, err_type, code) = engine_error_parts(error);
+    error_reply(&message, &err_type, code)
 }
 
 /// Python's answer when the engine output lacks what the OpenAI layer reads.
@@ -159,7 +161,7 @@ pub(super) struct StreamState {
 impl StreamState {
     /// An engine error replaces the reply until the first chunk has been sent.
     pub(super) fn error(&mut self, error: GenerateStreamError) -> Result<Vec<String>, Reply> {
-        let (message, unary_type, event_type, code) = engine_error_parts(error);
+        let (message, err_type, code) = engine_error_parts(error);
         if !self.started {
             // Python's `/generate` streams a scheduler abort as a frame and
             // sends only 400 error frames, so a 500 is a host's own failure:
@@ -168,10 +170,19 @@ impl StreamState {
                 let message = format!("Internal server error: {message}");
                 return Err(error_reply(&message, "InternalServerError", code));
             }
-            return Err(error_reply(&message, &unary_type, code));
+            return Err(error_reply(&message, &err_type, code));
         }
         self.failed = true;
-        Ok(vec![stream_error_event(&message, event_type, code)])
+        // Mid-stream, Python's abort event is typed by the status's name.
+        let event_type = match code {
+            400 => None,
+            _ => http_status_name(code.into()),
+        };
+        Ok(vec![stream_error_event(
+            &message,
+            event_type.unwrap_or(&err_type),
+            code,
+        )])
     }
 
     /// An abort or error just ended the stream; Python stops there, without

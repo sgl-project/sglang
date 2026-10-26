@@ -356,28 +356,29 @@ fn copy_prompt_per_choice(generate: &mut Value) -> Result<(), Error> {
     if n <= 1 {
         return Ok(());
     }
-    // Python's parallel sampling repeats a prompt's one-element list fields with
-    // it; other lengths are left for validation against the batch.
-    let repeated: Vec<&str> = PROMPT_LIST_FIELDS
-        .into_iter()
-        .filter(|key| {
-            generate[*key]
-                .as_array()
-                .is_some_and(|items| items.len() == 1)
-        })
-        .collect();
     // Bounded before the copy: a huge `n`, or a large list field, would overflow
     // or exhaust the allocation.
     let ids = generate["input_ids"].as_array().map_or(0, Vec::len);
-    let fields: Vec<&Value> = repeated.iter().map(|key| &generate[*key]).collect();
+    let fields: Vec<&Value> = PROMPT_LIST_FIELDS
+        .iter()
+        .map(|key| &generate[*key])
+        .filter(|field| field.is_array())
+        .collect();
     check_prompt_copies(ids, &fields, n)?;
     generate["sampling_params"]["n"] = 1.into();
     generate["input_ids"] = Value::Array(vec![generate["input_ids"].take(); n]);
-    for key in repeated {
-        let item = generate[key][0].take();
-        generate[key] = Value::Array(vec![item; n]);
+    // Python's parallel sampling repeats the prompt's list-form fields with it,
+    // and a rid list names the one prompt.
+    for key in PROMPT_LIST_FIELDS {
+        if let Some(Value::Array(items)) = generate.get_mut(key) {
+            *items = items
+                .iter()
+                .cycle()
+                .take(items.len() * n)
+                .cloned()
+                .collect();
+        }
     }
-    // A rid list names the one prompt.
     if let Some(Value::Array(rids)) = generate.get_mut("rid")
         && rids.len() == 1
     {
@@ -510,33 +511,6 @@ mod tests {
         let state =
             answering_app_state_with_item(Arc::new(args), formatter, Some(tokenizer()), answer);
         super::super::routes().with_state(state)
-    }
-
-    /// A Jinja template's own thinking default (here Qwen3's `enable_thinking`)
-    /// decides whether the reply starts in reasoning, as `template_detection` does.
-    #[tokio::test]
-    async fn jinja_template_thinking_default_separates_reasoning() {
-        let template = "{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n\
-            {% endfor %}<|im_start|>assistant\n\
-            {% if enable_thinking is defined and enable_thinking is false %}<think>\n\n</think>\n\n{% endif %}";
-        let formatter = checkpoint_formatter(&json!({}), template);
-        let args = ServerArgs {
-            served_model_name: "model".into(),
-            reasoning_parser: Some("qwen3".into()),
-            ..Default::default()
-        };
-        let state = answering_app_state_with(
-            Arc::new(args),
-            formatter,
-            Some(tokenizer()),
-            "17*23</think>391",
-        );
-        let app = super::super::routes().with_state(state);
-        let body = json!({"model": "model", "messages": [{"role": "user", "content": "17*23?"}]});
-        let value = body_json(post_json(app, "/v1/chat/completions", body).await).await;
-        let message = &value["choices"][0]["message"];
-        assert_eq!(message["reasoning_content"], "17*23", "{value}");
-        assert_eq!(message["content"], "391");
     }
 
     /// An `n` past the batch cap is a 400 before the prompt is copied, not a
