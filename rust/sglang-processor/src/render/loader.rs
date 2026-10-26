@@ -142,6 +142,9 @@ impl ChatFormatter {
             || config["chat_template"].as_str().is_some_and(is_minimax_m3),
             |model_type| model_type == "minimax_m3_vl",
         );
+        let content_parts = config["chat_template"]
+            .as_str()
+            .is_some_and(takes_content_parts);
         let qwen38 = config["chat_template"].as_str().filter(|t| is_qwen38(t));
         let thinking = ThinkingTemplates::from_config(config);
         let mut render_config = config.clone();
@@ -186,6 +189,7 @@ impl ChatFormatter {
             Self::HuggingFace {
                 formatter,
                 thinking,
+                content_parts,
             }
         })
     }
