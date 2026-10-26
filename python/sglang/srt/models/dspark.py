@@ -41,7 +41,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # fp8 target lm_head GEMM for the DSPARK verify logits, opt-in via
-# SGLANG_OPT_DSPARK_FP8_LM_HEAD. The bf16 head matmul
+# SGLANG_ROCM_OPT_DSPARK_FP8_LM_HEAD. The bf16 head matmul
 # [num_verify_tokens, hidden] x [hidden, vocab_slice] is a per-decode-step cost
 # that grows with the verify batch; running it in fp8 (per-token activation
 # scale + per-output-channel weight scale) roughly halves that GEMM. The weight
@@ -52,10 +52,10 @@ logger = logging.getLogger(__name__)
 # gfx942 (MI300X) it produces an accuracy regression, so gate the flag on the
 # arch -- a user who sets the env on gfx942 keeps the safe bf16 head matmul
 # (the flag stays inert) rather than silently hitting the accuracy issue.
-_DSPARK_FP8_LM_HEAD = envs.SGLANG_OPT_DSPARK_FP8_LM_HEAD.get() and is_gfx95_supported()
-if envs.SGLANG_OPT_DSPARK_FP8_LM_HEAD.get() and not _DSPARK_FP8_LM_HEAD:
+_DSPARK_FP8_LM_HEAD = envs.SGLANG_ROCM_OPT_DSPARK_FP8_LM_HEAD.get() and is_gfx95_supported()
+if envs.SGLANG_ROCM_OPT_DSPARK_FP8_LM_HEAD.get() and not _DSPARK_FP8_LM_HEAD:
     logger.warning(
-        "SGLANG_OPT_DSPARK_FP8_LM_HEAD is set but the fp8 lm_head path is only "
+        "SGLANG_ROCM_OPT_DSPARK_FP8_LM_HEAD is set but the fp8 lm_head path is only "
         "supported on gfx95x; keeping the bf16 head matmul on this device."
     )
 _FP8_DTYPE = torch.float8_e4m3fn

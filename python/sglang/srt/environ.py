@@ -1094,7 +1094,7 @@ class Envs:
     # torch._scaled_mm (per-token activation scale + per-output-channel weight
     # scale, weight quantized once and cached). Halves the per-step head GEMM;
     # off by default. Only engages for a floating-point (non-quantized) head.
-    SGLANG_OPT_DSPARK_FP8_LM_HEAD = EnvBool(False)
+    SGLANG_ROCM_OPT_DSPARK_FP8_LM_HEAD = EnvBool(False)
     # Pooled prefill-logits budget of the HIP FP4 indexer, in MiB.
     SGLANG_DSV4_FP4_LOGITS_BUDGET_MB = EnvInt(2048)
     # Split-K for HCA streams in the HIP unified-KV paged decode; 0 keeps the heuristic.
