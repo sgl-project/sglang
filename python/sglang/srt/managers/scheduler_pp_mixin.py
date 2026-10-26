@@ -1492,7 +1492,7 @@ class SchedulerPPMixin:
                 return
             with torch.profiler.record_function("recv_res_dict_from_prev_stage"):
                 # Gate the recv on our forward: the last stage sends only after its own,
-                # and an early recv spins on SMs and stalls flashinfer's all-SM MLA.
+                # and an early recv spins on an SM, stalling kernels that need every SM.
                 if (
                     get_parallel().pp_async_batch_depth == 0
                     and self.pp_group.is_first_rank
