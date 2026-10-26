@@ -524,29 +524,49 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
 
     # -- alloc --
 
+    def _allocate(
+        self,
+        *,
+        full_tokens: int,
+        swa_tokens: int,
+        num_owner_pages: int,
+        owner_take: Callable[[], Optional[torch.Tensor]],
+        window_pages: Callable[
+            [torch.Tensor, torch.Tensor], torch.Tensor
+        ] = lambda out, new_pages: new_pages,
+    ) -> Optional[torch.Tensor]:
+        """The one path that takes token ids: price the demand on a snapshot and
+        realize what the price needs (`ensure_capacity`), then take on the owner
+        and bind the window for the owner's new virtual pages."""
+        owner = self.full_attn_allocator
+        if not self._policy.prices_before_take:
+            # The owner prices and relieves its own shortfall.
+            return owner_take()
+        if not self.ensure_capacity(full_tokens, swa_tokens):
+            return None
+        # free_virtual_ids is rebound (slice/cat), never mutated in place, so
+        # this prefix view still names the pages the owner is about to consume.
+        new_virtual_pages = owner.free_virtual_ids[:num_owner_pages]
+        out = owner_take()
+        assert out is not None, (
+            "ChainAllocator: the owner refused after the joint pre-check "
+            "passed -- internal-state inconsistency"
+        )
+        bind = window_pages(out, new_virtual_pages)
+        for window in self._windows:
+            window.alloc_with_virtual(bind)
+        return out
+
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
         with record_function("ChainAllocator.alloc"):
-            owner = self.full_attn_allocator
-            if not self._policy.prices_before_take:
-                return owner.alloc(need_size)
-            if not self.ensure_capacity(need_size, need_size):
-                return None
-            # Snapshot the virtual PAGES the owner will consume, to bind them on
-            # every window too.
-            new_virtual_pages = owner.free_virtual_ids[
-                : need_size // self.page_size
-            ].clone()
-            v_tokens = owner.alloc(need_size)
-            # Post-pre-check failure can only be internal-state inconsistency.
-            assert v_tokens is not None, (
-                "ChainAllocator.alloc: the owner refused after the joint "
-                "pre-check passed -- internal-state inconsistency"
+            return self._allocate(
+                full_tokens=need_size,
+                swa_tokens=need_size,
+                num_owner_pages=need_size // self.page_size,
+                owner_take=lambda: self.full_attn_allocator.alloc(need_size),
             )
-            for window in self._windows:
-                window.alloc_with_virtual(new_virtual_pages)
-            return v_tokens
 
-    def _extend_in_virtual_space(
+    def _paged_take(
         self,
         prefix_lens: torch.Tensor,
         prefix_lens_cpu: torch.Tensor,
@@ -554,30 +574,9 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         seq_lens_cpu: torch.Tensor,
         last_loc: torch.Tensor,
         extend_num_tokens: int,
-        *,
-        num_swa_pages: Optional[int] = None,
-    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-        """Run the owner's paged extend and report which virtual PAGES it newly
-        took: (virtual TOKEN ids, new virtual PAGE ids), or None when the joint
-        capacity check cannot fund the allocation."""
-        num_new_pages = get_num_new_pages(
-            seq_lens=seq_lens_cpu,
-            page_size=self.page_size,
-            prefix_lens=prefix_lens_cpu,
-        )
-        need_tokens = num_new_pages * self.page_size
-        swa_tokens = (
-            need_tokens if num_swa_pages is None else num_swa_pages * self.page_size
-        )
-        if not self.ensure_capacity(need_tokens, swa_tokens):
-            return None
-
-        # free_virtual_ids is rebound (slice/cat), never mutated in place,
-        # so this prefix view stays valid for the window after the owner consumes it.
-        owner = self.full_attn_allocator
-        new_virtual_pages = owner.free_virtual_ids[:num_new_pages]
-
-        out_indices = owner.alloc_extend(
+        num_new_pages: int,
+    ) -> Callable[[], Optional[torch.Tensor]]:
+        return lambda: self.full_attn_allocator.alloc_extend(
             prefix_lens,
             prefix_lens_cpu,
             seq_lens,
@@ -586,11 +585,6 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             extend_num_tokens,
             num_new_pages=num_new_pages,
         )
-        assert out_indices is not None, (
-            "ChainAllocator: the owner's alloc_extend refused after the joint "
-            "pre-check passed -- internal-state inconsistency"
-        )
-        return out_indices, new_virtual_pages
 
     def alloc_extend(
         self,
@@ -613,20 +607,26 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                     last_loc,
                     extend_num_tokens,
                 )
-            extended = self._extend_in_virtual_space(
-                prefix_lens,
-                prefix_lens_cpu,
-                seq_lens,
-                seq_lens_cpu,
-                last_loc,
-                extend_num_tokens,
+            num_new_pages = get_num_new_pages(
+                seq_lens=seq_lens_cpu,
+                page_size=self.page_size,
+                prefix_lens=prefix_lens_cpu,
             )
-            if extended is None:
-                return None
-            out_indices, new_virtual_pages = extended
-            for window in self._windows:
-                window.alloc_with_virtual(new_virtual_pages)
-            return out_indices
+            need_tokens = num_new_pages * self.page_size
+            return self._allocate(
+                full_tokens=need_tokens,
+                swa_tokens=need_tokens,
+                num_owner_pages=num_new_pages,
+                owner_take=self._paged_take(
+                    prefix_lens,
+                    prefix_lens_cpu,
+                    seq_lens,
+                    seq_lens_cpu,
+                    last_loc,
+                    extend_num_tokens,
+                    num_new_pages,
+                ),
+            )
 
     def alloc_extend_swa_tail(
         self,
@@ -663,27 +663,35 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                 if swa_tail_len
                 else 0
             )
-            extended = self._extend_in_virtual_space(
-                prefix_lens,
-                prefix_lens_cpu,
-                seq_lens,
-                seq_lens_cpu,
-                last_loc,
-                extend_num_tokens,
-                num_swa_pages=num_swa_pages,
+            num_new_pages = get_num_new_pages(
+                seq_lens=seq_lens_cpu,
+                page_size=self.page_size,
+                prefix_lens=prefix_lens_cpu,
             )
-            if extended is None:
-                return None
-            out_indices, new_virtual_pages = extended
-            if swa_tail_len > 0 and new_virtual_pages.numel() > 0:
-                tail_pages = torch.unique(out_indices[-swa_tail_len:] // self.page_size)
+
+            def tail_pages(out: torch.Tensor, new_pages: torch.Tensor) -> torch.Tensor:
+                if swa_tail_len == 0 or new_pages.numel() == 0:
+                    return new_pages[:0]
+                tail = torch.unique(out[-swa_tail_len:] // self.page_size)
                 # Only NEW pages need binding; a tail page carried in from the
                 # prefix is already bound on the window.
-                to_bind = new_virtual_pages[torch.isin(new_virtual_pages, tail_pages)]
-                if to_bind.numel() > 0:
-                    for window in self._windows:
-                        window.alloc_with_virtual(to_bind)
-            return out_indices
+                return new_pages[torch.isin(new_pages, tail)]
+
+            return self._allocate(
+                full_tokens=num_new_pages * self.page_size,
+                swa_tokens=num_swa_pages * self.page_size,
+                num_owner_pages=num_new_pages,
+                owner_take=self._paged_take(
+                    prefix_lens,
+                    prefix_lens_cpu,
+                    seq_lens,
+                    seq_lens_cpu,
+                    last_loc,
+                    extend_num_tokens,
+                    num_new_pages,
+                ),
+                window_pages=tail_pages,
+            )
 
     def alloc_decode(
         self,
@@ -694,29 +702,28 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         """Paged decode: one new token per request, consuming a page only when the
         decode wraps."""
         with record_function("ChainAllocator.alloc_decode"):
-            owner = self.full_attn_allocator
             if not self._policy.prices_before_take:
-                return owner.alloc_decode(seq_lens, seq_lens_cpu, last_loc)
+                # The owner counts, prices and relieves its own decode pages.
+                return self.full_attn_allocator.alloc_decode(
+                    seq_lens, seq_lens_cpu, last_loc
+                )
             num_new_pages = get_num_new_pages(
                 seq_lens=seq_lens_cpu, page_size=self.page_size, decode=True
             )
             need_tokens = num_new_pages * self.page_size
-            if not self.ensure_capacity(need_tokens, need_tokens):
-                return None
-
-            new_virtual_pages = owner.free_virtual_ids[:num_new_pages].clone()
-
-            out_indices = owner.alloc_decode(seq_lens, seq_lens_cpu, last_loc)
-            assert out_indices is not None, (
-                "ChainAllocator.alloc_decode: the owner refused after the joint "
-                "pre-check passed -- internal-state inconsistency"
+            return self._allocate(
+                full_tokens=need_tokens,
+                swa_tokens=need_tokens,
+                num_owner_pages=num_new_pages,
+                owner_take=lambda: self.full_attn_allocator.alloc_decode(
+                    seq_lens, seq_lens_cpu, last_loc
+                ),
             )
 
-            if new_virtual_pages.numel() > 0:
-                for window in self._windows:
-                    window.alloc_with_virtual(new_virtual_pages)
-
-            return out_indices
+    def alloc_state_slots(self, need_size: int) -> Optional[torch.Tensor]:
+        """Per-request state slots: the state band prices and relieves its own
+        shortfall (VIRTUAL slot ids)."""
+        return self.mamba_allocator.alloc(need_size)
 
     def is_slot_allocated(self, slot: int) -> bool:
         """Token-slot surface = the owner (which owns the virtual ids)."""

@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import copy
 import logging
-from typing import Dict, List, NamedTuple, Optional, Tuple
+from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
 
 import torch
 from torch.profiler import record_function
@@ -966,8 +966,16 @@ class UnifiedMambaSlotAllocator:
     NOT clear state — clearing is deferred to ``UnifiedMambaPool.clear_slots``.
     """
 
-    def __init__(self, mea, max_size: int, device: str):
+    def __init__(
+        self,
+        mea,
+        max_size: int,
+        device: str,
+        take: Optional[Callable[[int], Optional[torch.Tensor]]] = None,
+    ):
         self._multi_ended_allocator = mea
+        # Slots are taken through the chain allocator when one owns the band.
+        self._take = mea.alloc if take is None else take
         self._max_size = max_size  # excludes reserved slot 0
         self._device = device
         self._alloc_iter = None  # active alloc_group batch iterator
@@ -1022,7 +1030,7 @@ class UnifiedMambaSlotAllocator:
             slot = next(self._alloc_iter, None)
             if slot is not None:
                 return slot
-        return self._multi_ended_allocator.alloc(need_size)  # VIRTUAL ids
+        return self._take(need_size)  # VIRTUAL ids
 
     def free(self, free_index: torch.Tensor):
         return self._multi_ended_allocator.free(free_index)
@@ -1035,7 +1043,7 @@ class UnifiedMambaSlotAllocator:
         """Pre-allocate a batch that ``alloc(1)`` then draws from."""
         self._alloc_iter = None
         if num_reqs > 0:
-            result = self._multi_ended_allocator.alloc(num_reqs)
+            result = self._take(num_reqs)
             if result is not None:
                 self._alloc_iter = iter(result.split(1))
 
@@ -1271,6 +1279,7 @@ def _check_bs1_feasibility_floor(
 def _wire_mamba_slot_allocator(
     *,
     mamba_end,
+    take: Callable[[int], Optional[torch.Tensor]],
     req_to_token_pool,
     device,
 ) -> UnifiedMambaSlotAllocator:
@@ -1279,6 +1288,7 @@ def _wire_mamba_slot_allocator(
         mamba_end,
         max_size=req_to_token_pool._shared_mamba_size,
         device=device,
+        take=take,
     )
     req_to_token_pool.mamba_allocator = slot_allocator
     state_pool = req_to_token_pool.mamba_pool

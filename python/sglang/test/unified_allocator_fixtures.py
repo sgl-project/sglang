@@ -9,6 +9,12 @@ import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import InsertParams
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.kv.alloc.pricing import (
+    ChainSnapshot,
+    FloatChain,
+    TokenEnds,
+    snapshot_chain,
+)
 from sglang.srt.mem_cache.kv.build import UnifiedBuildContext, build_unified_pools
 from sglang.srt.mem_cache.kv.decl import (
     MHAGeometry,
@@ -33,6 +39,26 @@ from sglang.srt.mem_cache.unified_memory_pool import (
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
+
+
+def chain_snapshot(allocator) -> ChainSnapshot:
+    """A unified chain allocator's band snapshot, as its pricing reads it."""
+    return snapshot_chain(
+        allocator.bands,
+        page_size=allocator.page_size,
+        total_bytes=allocator.unified_buffer.total_bytes,
+    )
+
+
+def token_ends(allocator) -> TokenEnds:
+    """The pricing constants of a chain of two token ends."""
+    return allocator._policy._ends(allocator)
+
+
+def float_chain(allocator) -> FloatChain:
+    """The roles of a chain whose window floats between two ends."""
+    roles = allocator.roles
+    return FloatChain(owner=roles.owner, window=roles.window, state=roles.state)
 
 
 def setup_allocator_context():

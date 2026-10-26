@@ -20,6 +20,7 @@ suite runs on CPU apart from the cases that skip themselves without CUDA.
 
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.unified_allocator_fixtures import chain_snapshot, token_ends
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 register_cuda_ci(est_time=14, stage="base-b", runner_config="1-gpu-small")
@@ -38,6 +39,7 @@ from sglang.srt.mem_cache.allocator.unified_sub_pool import (
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.mem_cache.common import kv_to_page_indices
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
+from sglang.srt.mem_cache.kv.alloc.pricing import ends_fit
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
@@ -673,8 +675,9 @@ class TestWindowChainAllocator(unittest.TestCase):
                             (full * page_size, swa * page_size)
                             for swa in range(max_swa + 1)
                             for full in range(max_full + 1)
-                            if allocator._policy._fits_page_demand(
-                                allocator,
+                            if ends_fit(
+                                chain_snapshot(allocator),
+                                token_ends(allocator),
                                 full_pages,
                                 swa_pages,
                                 full_reclaim_pages=full,

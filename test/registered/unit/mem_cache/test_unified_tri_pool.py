@@ -33,6 +33,7 @@ from sglang.srt.mem_cache.allocator.unified_sub_pool import (
 )
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
+from sglang.srt.mem_cache.kv.alloc.pricing import float_fit
 from sglang.srt.mem_cache.layout.fused_draft import (
     DenseDraftRegion,
     DraftStateGeometry,
@@ -50,6 +51,8 @@ from sglang.test.unified_allocator_fixtures import (
     FakeKVCache,
     FakeUnifiedSWAKVPool,
     build_test_unified_pools,
+    chain_snapshot,
+    float_chain,
     tri_sub_pool_specs,
 )
 
@@ -1734,8 +1737,9 @@ class TestPreallocIsPricedOnTheSharedGrid(unittest.TestCase):
         self.assertLessEqual(swa_demand, allocator.swa_available_size())
         # ... yet the two draw on the same bytes, so the grid refuses the pair.
         self.assertFalse(
-            allocator._policy._fits_page_demand(
-                allocator,
+            float_fit(
+                chain_snapshot(allocator),
+                float_chain(allocator),
                 -(-full_demand // allocator.page_size),
                 -(-swa_demand // allocator.page_size),
             )
