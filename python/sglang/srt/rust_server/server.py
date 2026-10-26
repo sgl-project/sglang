@@ -741,24 +741,7 @@ class RustServer:
     def _build_mm_spec(cls, spec: RustMmSpec) -> MmSpec:
         """The typed MM configuration for ``Server.start_mm_workers``: the
         :class:`RustMmSpec` fields the Rust pipeline consumes, as the Rust
-        extension's own ``MmSpec`` class (same required-keyword contract as
-        :func:`_build_server_args`; ``family`` / ``resample`` become the
-        extension's ``MmFamily`` / ``MmResample`` enums)."""
-        ext = cls._load_extension()
-        family = {"qwen_vl": ext.MmFamily.QwenVl}[spec.family]
-        resample = {"aten_u8": ext.MmResample.AtenU8, "pil": ext.MmResample.Pil}[
-            spec.resample
-        ]
-        return ext.MmSpec(
-            family=family,
-            feature_shm=spec.feature_shm,
-            image_token_id=spec.image_token_id,
-            patch_size=spec.patch_size,
-            merge_size=spec.merge_size,
-            temporal_patch_size=spec.temporal_patch_size,
-            min_pixels=spec.min_pixels,
-            max_pixels=spec.max_pixels,
-            image_mean=spec.image_mean,
-            image_std=spec.image_std,
-            resample=resample,
+        extension's own ``MmSpec`` class."""
+        return cls._load_extension().MmSpec(
+            feature_shm=spec.feature_shm, pipeline=spec.rust_json()
         )

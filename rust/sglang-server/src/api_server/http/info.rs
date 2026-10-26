@@ -460,6 +460,7 @@ mod tests {
                 chat_formatter: None,
                 generate_hook: None,
                 openai_chat: None,
+                chat_encodes: Default::default(),
             }),
             intake_rx,
             abort_rx,

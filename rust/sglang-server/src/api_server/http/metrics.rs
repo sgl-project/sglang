@@ -99,6 +99,7 @@ mod tests {
             chat_formatter: None,
             generate_hook: None,
             openai_chat: None,
+            chat_encodes: Default::default(),
         });
         routes().with_state(state)
     }

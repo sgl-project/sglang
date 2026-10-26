@@ -46,6 +46,11 @@ class TestRustMmGate(CustomTestCase):
         family = rust_mm_family_for(cls, "qwen2_5_vl")
         self.assertEqual(family and family.name, "qwen_vl")
 
+    def test_deepseek_v41_resolves_its_family(self):
+        cls = processor_cls_for("DeepseekV4ForCausalLM", "deepseek_v41")
+        family = rust_mm_family_for(cls, "deepseek_v41")
+        self.assertEqual(family and family.name, "deepseek_v41")
+
     def test_inkling_keeps_its_python_processor(self):
         from sglang.srt.multimodal.processors.inkling import InklingMultimodalProcessor
 

@@ -235,9 +235,7 @@ class PythonPath:
         host.server_args = server_args
         spec = host.resolve_spec()
         assert spec is not None, "SGLang's Rust MM gate rejects this checkpoint"
-        spec = json.loads(spec.rust_json())
-        del spec["feature_shm"]
-        return spec
+        return json.loads(spec.rust_json())
 
     def close(self):
         self.processor.io_executor.shutdown()

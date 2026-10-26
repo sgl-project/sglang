@@ -4,10 +4,12 @@ use dynamo_multimodal::image::decode::{DecodeLimits, decode_rgb};
 use dynamo_multimodal::processor::{
     DecodedMedia, MmFamilyProcessor, NamedTensors, PositionOutput, ProcessedItem, Tensor,
 };
-use dynamo_multimodal::registry::{ProcessorSpec, build_processor};
+use dynamo_multimodal::registry::ProcessorSpec;
 use dynamo_multimodal::{MmError, content_hash_bytes, token_layout};
 
 use crate::ProcessorError;
+
+mod models;
 
 /// PIL raises `DecompressionBombError` above twice its default `MAX_IMAGE_PIXELS`.
 const PIL_DECOMPRESSION_BOMB_PIXELS: usize = 2 * 89_478_485;
@@ -46,7 +48,7 @@ impl MmProcessor {
             ..DecodeLimits::default()
         };
         Ok(Self {
-            family: build_processor(spec).map_err(mm_error)?,
+            family: models::build(spec).map_err(mm_error)?,
             limits,
         })
     }

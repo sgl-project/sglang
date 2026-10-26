@@ -82,12 +82,22 @@ under a new one.
 - **Dynamo**, upstream: the family's `process_item`, `layout`, `positions`,
   its `ProcessorSpec` arm, and its `spec_from_hf_configs` branch. Anything HF
   ships belongs there: class defaults, kernels, layout.
+- **`src/mm/models/<family>.rs`**, until Dynamo's family processes pixels: a
+  Dynamo `MmFamilyProcessor` built from Dynamo's planners and kernels.
+  `models::build` is the only match on the family; delete the file once Dynamo
+  ships the same code.
 - **`src/mm/mod.rs` never branches on a family.** It runs Dynamo's stages in
   order.
 - **Python `rust_server/multimodal.py`**: one `RUST_MM_FAMILIES` entry, which
-  checks that the processor class is SGLang's own, and the family's spec in
-  `resolve_spec`, read from the loaded HF processor. The server's `MmSpec`
-  (`sglang-server/src/message/config.rs`) gets the matching `MmFamily` arm.
+  checks that the processor class is SGLang's own, and its `resolve`, which
+  reads the family's `ProcessorSpec` fields from the loaded HF processor. The
+  server takes that spec as JSON.
+
+**DeepSeek-V4.1 is the exception to "Python is the reference".** The Rust
+server resizes its images with deepseek-recipe-image (OpenCV, re-encoded as
+WebP; `sglang-server` feature `deepseek-image`), which Python does not, so its
+pixels differ from Python's. Token layout and model kwargs still match; it has
+no `mm_parity` fixture, and accuracy (MMMU, MMMU-Pro) is its end-to-end gate.
 
 ## Method
 

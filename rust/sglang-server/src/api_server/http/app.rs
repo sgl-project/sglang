@@ -33,6 +33,8 @@ pub(super) struct AppState {
     pub(super) generate_hook: Option<Arc<dyn GenerateHook>>,
     /// The processor's chat layer, tried before the Dynamo-typed chat handler.
     pub(super) openai_chat: Option<openai::OpenAiChat>,
+    /// Bounds the chat prompts encoded off the HTTP executor.
+    pub(super) chat_encodes: openai::ChatEncodes,
 }
 
 /// Every listener warms its own rank; health stays 503 until it succeeds,
@@ -94,6 +96,7 @@ pub async fn serve(
         chat_formatter,
         generate_hook,
         openai_chat,
+        chat_encodes: openai::ChatEncodes::new(server_args.tokenizer_worker_num),
     });
     // Cancelled with the api runtime on shutdown.
     tokio::spawn(startup_warmup(state.core.clone(), server_args.clone()));

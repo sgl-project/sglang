@@ -140,6 +140,7 @@ pub(super) fn app_state(core: CoreHandle) -> Arc<super::AppState> {
         chat_formatter: None,
         generate_hook: None,
         openai_chat: None,
+        chat_encodes: Default::default(),
     })
 }
 
@@ -229,6 +230,7 @@ pub(super) fn answering_app_state_with_item(
         core,
         generation_policy: crate::message::request::GenerationPolicy::from(server_args.as_ref()),
         openai_chat: tokenizer.map(|t| super::OpenAiChat::new(&server_args, &formatter, t)),
+        chat_encodes: Default::default(),
         server_args,
         chat_formatter: Some(formatter),
         generate_hook: None,

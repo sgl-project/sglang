@@ -38,7 +38,7 @@ use sglang_processor::{
 use super::completions::completion_usage;
 use super::lowered;
 use super::pd_routing::PDRoutingFields;
-use super::template::{RenderedChat, render_chat};
+use super::template::{RenderedChat, render_chat_off_executor};
 use super::tools::{apply_tool_constraint, chat_delta, chat_finish_reason, parse_chat_tool_calls};
 use super::{
     AppState, ChatFormatter, ChatTemplateKwargs, collect_output, contains_media,
@@ -232,9 +232,15 @@ async fn chat_completions(
             return openai_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string(), false);
         }
     };
-    let (request, rendered) = match prepare_chat_request(&state, raw, request).await {
+    let (request, rendered, recipe_images) = match prepare_chat_request(&state, raw, request).await
+    {
         Ok(prepared) => prepared,
         Err(response) => return response,
+    };
+    // A formatter that places its images itself (DeepSeek) orders them its own way.
+    let images: Vec<MmItem> = match recipe_images {
+        Some(urls) => urls.into_iter().map(MmItem::Source).collect(),
+        None => images,
     };
 
     let mut sampling = match chat_sampling(
@@ -395,12 +401,20 @@ fn chat_images<T: serde::Serialize>(
 }
 
 /// Render the chat template for an OpenAI request, mapping a missing
-/// formatter or a render failure to the standard 400.
+/// formatter or a render failure to the standard 400. Also returns the image
+/// sources in placeholder order when the formatter places them itself.
 pub(super) async fn prepare_chat_request(
     state: &AppState,
     body: Value,
     mut request: CreateChatCompletionRequest,
-) -> Result<(CreateChatCompletionRequest, RenderedChat), Response> {
+) -> Result<
+    (
+        CreateChatCompletionRequest,
+        RenderedChat,
+        Option<Vec<String>>,
+    ),
+    Response,
+> {
     let Some(formatter) = state.chat_formatter.clone() else {
         return Err(openai_error(
             StatusCode::BAD_REQUEST,
@@ -413,12 +427,14 @@ pub(super) async fn prepare_chat_request(
     // token-id stop cannot be merged into the string list (Python has no such
     // field), so it is kept alone.
     merge_template_stops(&mut request, &formatter);
-    let rendered = render_chat(
+    let (rendered, images) = render_chat_off_executor(
+        &state.chat_encodes,
         &formatter,
         body,
         &request,
         &state.server_args.default_chat_template_kwargs,
     )
+    .await
     .map_err(|error| {
         openai_error(
             StatusCode::BAD_REQUEST,
@@ -426,7 +442,7 @@ pub(super) async fn prepare_chat_request(
             false,
         )
     })?;
-    Ok((request, rendered))
+    Ok((request, rendered, images))
 }
 
 /// Full sampling resolution for an OpenAI request, mirroring the Python
@@ -1755,6 +1771,7 @@ mod tests {
                 chat_formatter: Some(super::super::ChatFormatter::KimiK3),
                 generate_hook: None,
                 openai_chat: None,
+                chat_encodes: Default::default(),
             });
             let responder = tokio::spawn(async move {
                 let TmEvent::Intake { request, admission } = intake_rx.recv_async().await.unwrap()

@@ -7,7 +7,9 @@ use std::sync::Arc;
 use sglang_mm::pipeline::{Tensor, TensorData};
 use sglang_processor::MmOutput;
 use sglang_processor::dynamo_multimodal::processor::{self as dynamo, PositionOutput};
+use sglang_processor::dynamo_multimodal::registry::ProcessorSpec;
 
+use super::deepseek_image::RecipeImages;
 use super::encoded::{MRope, MmEncodedEntry, MmEncodedItem, MmMeta, MmMetaValue, MmModality};
 use crate::message::buffers::{Buffer, BufferData, BufferStore};
 use crate::message::config::MmSpec;
@@ -134,6 +136,8 @@ pub trait MmProcessor: Send + Sync {
 /// request's resolved media bytes.
 struct ImageMmProcessor {
     pipeline: sglang_processor::MmProcessor,
+    /// DeepSeek-V4.1 only: deepseek-recipe-image resizes before the pipeline.
+    recipe: Option<RecipeImages>,
 }
 
 impl MmProcessor for ImageMmProcessor {
@@ -150,7 +154,16 @@ impl MmProcessor for ImageMmProcessor {
                     .map_err(|_| MediaError::Server(format!("mm: token id {id} out of range")))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let images: Vec<&[u8]> = media.images.iter().map(|image| image.as_ref()).collect();
+        // DeepSeek-V4.1: deepseek-recipe-image resizes first; a failure there is
+        // the image's, like a decode failure.
+        let recipe_images = (self.recipe.as_ref())
+            .map(|recipe| recipe.preprocess(&media.images))
+            .transpose()
+            .map_err(MediaError::Client)?;
+        let images: Vec<&[u8]> = match &recipe_images {
+            Some(images) => images.iter().map(Vec::as_slice).collect(),
+            None => media.images.iter().map(|image| image.as_ref()).collect(),
+        };
         // The pipeline fails on the request's images and prompt layout.
         let output = (self.pipeline)
             .process(&input_ids, &images)
@@ -251,10 +264,13 @@ pub struct MmContext {
 
 impl MmContext {
     pub fn new(spec: MmSpec) -> Result<Self, String> {
+        let recipe = matches!(spec.pipeline, ProcessorSpec::DeepseekV41(_))
+            .then(RecipeImages::new)
+            .transpose()?;
         let pipeline =
             sglang_processor::MmProcessor::from_spec(spec.pipeline).map_err(|e| e.to_string())?;
         Ok(Self {
-            processor: Arc::new(ImageMmProcessor { pipeline }),
+            processor: Arc::new(ImageMmProcessor { pipeline, recipe }),
             feature_shm: spec.feature_shm,
             limits: None,
         })

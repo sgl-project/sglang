@@ -965,6 +965,7 @@ mod tests {
             chat_formatter: None,
             generate_hook: None,
             openai_chat: None,
+            chat_encodes: Default::default(),
         });
 
         let response = health_generate(State(state), Duration::ZERO, true).await;
@@ -1012,6 +1013,7 @@ mod tests {
             chat_formatter: None,
             generate_hook: None,
             openai_chat: None,
+            chat_encodes: Default::default(),
         });
 
         let response = health_without_generation(State(state.clone())).await;
@@ -1058,6 +1060,7 @@ mod tests {
             chat_formatter: None,
             generate_hook: None,
             openai_chat: None,
+            chat_encodes: Default::default(),
         });
         // Each probe that reaches intake counts as scheduler output.
         tokio::spawn(async move {
@@ -1102,6 +1105,7 @@ mod tests {
             chat_formatter: None,
             generate_hook: None,
             openai_chat: None,
+            chat_encodes: Default::default(),
         });
 
         let responder = tokio::spawn(async move {
@@ -1185,6 +1189,7 @@ mod tests {
             chat_formatter: None,
             generate_hook: None,
             openai_chat: None,
+            chat_encodes: Default::default(),
         });
         let responder = tokio::spawn(async move {
             let mut submitted = Vec::new();
@@ -1415,6 +1420,7 @@ mod tests {
                 chat_formatter: None,
                 generate_hook: hook.then(|| Arc::new(TopPHook) as Arc<dyn crate::GenerateHook>),
                 openai_chat: None,
+                chat_encodes: Default::default(),
             });
             // Both items' delta, then both terminals: an incremental stream
             // emits two frames per item.

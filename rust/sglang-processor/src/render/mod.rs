@@ -39,6 +39,14 @@ pub use self::template::TemplateArgs;
 use self::thinking::ThinkingPolicy;
 pub use self::thinking::ThinkingTemplates;
 
+/// A prompt encoded by its formatter, with the images its placeholders refer to.
+#[derive(Debug)]
+pub struct EncodedPrompt {
+    pub text: String,
+    pub ids: Vec<u32>,
+    pub images: Vec<String>,
+}
+
 /// Legacy stop strings: a single separator-style stop or a list of stops.
 #[derive(Debug, Clone, PartialEq)]
 pub enum OneOrMany<T> {
@@ -163,12 +171,18 @@ impl ChatFormatter {
         let text = |(prompt, prefix)| (RenderedPrompt::text(prompt), prefix);
         match self {
             // recipe renders a continued final message itself, so no prefix follows.
-            ChatFormatter::DeepSeekV4(_) => render_deepseek_v4(false, request, default_kwargs)
-                .map(|prompt| (prompt, String::new()))
-                .map_err(RenderError::Failed),
-            ChatFormatter::DeepSeekV41(_) => render_deepseek_v4(true, request, default_kwargs)
-                .map(|prompt| (prompt, String::new()))
-                .map_err(RenderError::Failed),
+            ChatFormatter::DeepSeekV4(_) | ChatFormatter::DeepSeekV41(_) => {
+                let v41 = matches!(self, ChatFormatter::DeepSeekV41(_));
+                // SGLang rejects images on a text-only server.
+                render_deepseek_v4(v41, request, default_kwargs)
+                    .and_then(|(prompt, images)| {
+                        if !images.is_empty() {
+                            return Err("image input is not supported for this model".into());
+                        }
+                        Ok((prompt, String::new()))
+                    })
+                    .map_err(RenderError::Failed)
+            }
             ChatFormatter::Glm53(formatter) => {
                 render_glm53(formatter, request, default_kwargs).map(text)
             }
@@ -222,6 +236,29 @@ impl ChatFormatter {
                         .map_err(|message| TemplateError::Renderer { message })
                 }),
         )
+    }
+
+    /// [`Self::encode_request`] on a multimodal server: the prompt, its ids, and
+    /// its image sources in recipe's placeholder order. `None` unless DeepSeek.
+    pub fn encode_multimodal_request(
+        &self,
+        request: Value,
+        default_kwargs: &HashMap<String, Value>,
+    ) -> Option<Result<EncodedPrompt, TemplateError>> {
+        let (v41, tokenizer) = match self {
+            ChatFormatter::DeepSeekV4(tokenizer) => (false, tokenizer.as_ref()?),
+            ChatFormatter::DeepSeekV41(tokenizer) => (true, tokenizer.as_ref()?),
+            _ => return None,
+        };
+        let encoded =
+            render_deepseek_v4(v41, request, default_kwargs).and_then(|(prompt, images)| {
+                Ok(EncodedPrompt {
+                    ids: tokenizer.encode(&prompt)?,
+                    text: prompt.into_text(),
+                    images,
+                })
+            });
+        Some(encoded.map_err(|message| TemplateError::Renderer { message }))
     }
 
     /// The template's stop strings — Python `Conversation.stop_str`
