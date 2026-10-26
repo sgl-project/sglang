@@ -415,6 +415,7 @@ def build_kv_cache(
         decoder_swa_bounded_replay=get_exec().features.enable_decoder_swa_bounded_replay,
         pp_rank=parallel.pp_rank,
         pp_size=parallel.pp_size,
+        pp_async_batch_depth=parallel.pp_async_batch_depth,
         attn_cp_rank=parallel.attn_cp_rank,
         attn_cp_size=parallel.attn_cp_size,
         chunked_prefill_size=effective_chunked_prefill_size,
