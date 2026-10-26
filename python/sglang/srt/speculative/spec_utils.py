@@ -7,6 +7,7 @@ import time
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Callable, List, Literal, Optional, Tuple
 
+import numpy as np
 import torch
 from huggingface_hub import snapshot_download
 
@@ -31,6 +32,7 @@ from sglang.srt.distributed.parallel_state import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
 from sglang.srt.layers.cp.base import disable_cp_strategy
+from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.managers.schedule_batch import set_mamba_track_indices_from_reqs
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.decl import STATE_PART
@@ -62,10 +64,12 @@ _is_xpu = is_xpu()
 
 if TYPE_CHECKING:
     from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
+    from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+    from sglang.srt.sampling.watermarking.core import WatermarkState
 
 
 if _is_cuda:
@@ -801,6 +805,34 @@ def generate_token_bitmask(
     return allocate_token_bitmask, grammar
 
 
+def derive_tree_links(
+    mask: np.ndarray, bs: int, draft_token_num: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Host-side (retrive_next_token, retrive_next_sibling), matching what
+    reconstruct_indices_from_tree_mask produces on device.
+
+    ``mask[b, i, j]`` marks node j as an ancestor of node i, so i's immediate parent
+    is the largest such j < i, and both links follow from the parents alone.
+    """
+    tree = mask.reshape(bs, draft_token_num, draft_token_num)
+    node_order = np.arange(draft_token_num)
+    ancestors = tree & (node_order < node_order[:, None])
+    parents = np.where(ancestors.any(-1), (ancestors * node_order).argmax(-1), -1)
+
+    next_token = np.full((bs, draft_token_num), -1, dtype=np.int64)
+    next_sibling = np.full((bs, draft_token_num), -1, dtype=np.int64)
+    for b in range(bs):
+        # Descending scan, so every k > i is already recorded when i is reached.
+        earliest_child_of = {}
+        for i in reversed(range(draft_token_num)):
+            next_token[b, i] = earliest_child_of.get(i, -1)
+            parent = int(parents[b, i])
+            if parent >= 0:
+                next_sibling[b, i] = earliest_child_of.get(parent, -1)
+                earliest_child_of[parent] = i
+    return torch.from_numpy(next_token), torch.from_numpy(next_sibling)
+
+
 class GrammarTree:
     """The verify tree the grammar bitmask is built over, on the host.
 
@@ -1430,6 +1462,110 @@ def commit_mamba_states_after_verify(
                 model=model_runner.model,
                 req_pool_indices=batch.req_pool_indices[:bs],
             )
+
+
+def alloc_verify_tree_buffers(
+    *, max_batch_size: int, draft_token_num: int, device: str
+) -> tuple[list[torch.Tensor], ...]:
+    """Preallocated verify-tree buffers as views indexed by batch size: (draft_tokens,
+    tree_mask, retrieve_indexes, retrieve_next_token, retrieve_next_sibling, positions).
+    """
+    max_total_drafts = max_batch_size * draft_token_num
+    max_total_mask_size = max_batch_size * draft_token_num * draft_token_num
+
+    draft_tokens = torch.empty((max_total_drafts,), dtype=torch.int64, device=device)
+    retrieve_indexes = torch.empty(
+        (max_batch_size, draft_token_num),
+        dtype=torch.int64,
+        device=device,
+    )
+    retrieve_next_token = torch.empty(
+        (max_batch_size, draft_token_num),
+        dtype=torch.int64,
+        device=device,
+    )
+    retrieve_next_sibling = torch.empty(
+        (max_batch_size, draft_token_num),
+        dtype=torch.int64,
+        device=device,
+    )
+    positions = torch.empty((max_total_drafts,), dtype=torch.int64, device=device)
+    tree_mask = torch.empty((max_total_mask_size,), dtype=torch.bool, device=device)
+
+    draft_tokens_batch = []
+    tree_mask_batch = []
+    retrieve_indexes_batch = []
+    retrieve_next_token_batch = []
+    retrieve_next_sibling_batch = []
+    positions_batch = []
+
+    for bs in range(0, max_batch_size + 1):
+        retrieve_indexes_batch.append(retrieve_indexes[:bs, :])
+        retrieve_next_token_batch.append(retrieve_next_token[:bs, :])
+        retrieve_next_sibling_batch.append(retrieve_next_sibling[:bs, :])
+        positions_batch.append(positions[: bs * draft_token_num])
+        draft_tokens_batch.append(draft_tokens[: bs * draft_token_num])
+        tree_mask_batch.append(tree_mask[: bs * draft_token_num * draft_token_num])
+
+    return (
+        draft_tokens_batch,
+        tree_mask_batch,
+        retrieve_indexes_batch,
+        retrieve_next_token_batch,
+        retrieve_next_sibling_batch,
+        positions_batch,
+    )
+
+
+def commit_verify(
+    *,
+    batch: ScheduleBatch,
+    logits_output: LogitsProcessorOutput,
+    predict: torch.Tensor,
+    accept_lens: torch.Tensor,
+    accept_index: torch.Tensor,
+    watermark_state: Optional[WatermarkState],
+    target_worker: TpModelWorker,
+    draft_token_num: int,
+    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Commit a sampled mask-driven verify: the accepted tokens' mamba state,
+    watermark, KV and logprobs. Returns (accept_tokens, new_seq_lens).
+    """
+    new_seq_lens = batch.seq_lens + accept_lens
+    commit_mamba_states_after_verify(
+        target_worker,
+        batch,
+        accept_lens,
+        accept_index,
+        draft_token_num,
+    )
+    accept_tokens = predict[accept_index]
+    if watermark_state is not None and batch.sampling_info.has_watermark_candidates:
+        watermark_state.append_speculative(
+            batch.req_pool_indices,
+            accept_tokens,
+            accept_lens,
+        )
+    accept_tokens = accept_tokens.flatten()
+
+    # The KV mover expects drafts-only counts; accept_lens includes the bonus
+    # token, matching scheduler output.
+    num_correct_drafts_per_req = accept_lens - 1
+    move_accept_tokens_to_target_kvcache(
+        batch,
+        accept_index,
+        num_correct_drafts_per_req,
+        token_to_kv_pool_allocator,
+    )
+    if batch.return_logprob:
+        compute_spec_logprobs(
+            batch,
+            logits_output,
+            predict,
+            accept_index=accept_index,
+        )
+    return accept_tokens, new_seq_lens
 
 
 def spec_prepare_for_decode(batch: ScheduleBatch) -> None:

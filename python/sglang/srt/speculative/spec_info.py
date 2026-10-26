@@ -41,6 +41,7 @@ class SpeculativeAlgorithm(Enum):
     EAGLE = auto()
     EAGLE3 = auto()
     FROZEN_KV_MTP = auto()
+    EXTERNAL = auto()
     STANDALONE = auto()
     NGRAM = auto()
     NONE = auto()
@@ -128,6 +129,9 @@ class SpeculativeAlgorithm(Enum):
     def is_standalone(self) -> bool:
         return self == SpeculativeAlgorithm.STANDALONE
 
+    def is_external(self) -> bool:
+        return self == SpeculativeAlgorithm.EXTERNAL
+
     def is_ngram(self) -> bool:
         return self == SpeculativeAlgorithm.NGRAM
 
@@ -171,10 +175,10 @@ class SpeculativeAlgorithm(Enum):
         return self.is_eagle() or self.is_standalone() or self.is_dflash_family()
 
     def has_draft_kv(self) -> bool:
-        """Whether the draft phase writes KV chains. NGRAM does not (its tree
-        lives only in the verify mask), so per-decode KV sizing needs no
-        per-topk page rounding; see get_alloc_len_per_decode."""
-        return not self.is_ngram()
+        """Whether the draft phase writes KV chains. NGRAM and EXTERNAL do not
+        (their trees live only in the verify mask), so per-decode KV sizing
+        needs no per-topk page rounding; see get_alloc_len_per_decode."""
+        return not (self.is_ngram() or self.is_external())
 
     def carries_draft_hidden_states(self) -> bool:
         """Whether the disagg prefill->decode transfer carries draft hidden
@@ -240,6 +244,7 @@ class SpeculativeAlgorithm(Enum):
             _handle_dflash,
             _handle_dspark,
             _handle_eagle_family,
+            _handle_external,
             _handle_frozen_kv_mtp,
             _handle_ngram,
             _handle_uno,
@@ -261,6 +266,8 @@ class SpeculativeAlgorithm(Enum):
             _handle_frozen_kv_mtp(server_args)
         elif self.is_eagle() or self.is_standalone():
             _handle_eagle_family(server_args)
+        elif self.is_external():
+            _handle_external(server_args)
         elif self.is_ngram():
             _handle_ngram(server_args)
 
@@ -365,6 +372,10 @@ class SpeculativeAlgorithm(Enum):
             from sglang.srt.speculative.standalone_worker_v2 import StandaloneWorkerV2
 
             return StandaloneWorkerV2
+        elif self.is_external():
+            from sglang.srt.speculative.external_worker import ExternalWorker
+
+            return ExternalWorker
         elif self.is_ngram():
             from sglang.srt.speculative.ngram_worker import NGRAMWorker
 
@@ -522,7 +533,7 @@ def create_dummy_verify_input(
             ),
         )
 
-    elif spec_algorithm.is_ngram():
+    elif spec_algorithm.is_ngram() or spec_algorithm.is_external():
         from sglang.srt.speculative.ngram_info import NgramVerifyInput
 
         spec_info = NgramVerifyInput(

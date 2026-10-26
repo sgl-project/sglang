@@ -129,6 +129,17 @@ def _record_token_values(
     values.extend(row if num_visible == len(row) else row[:num_visible])
 
 
+def note_spec_request_finished(draft_worker: Optional[BaseTpWorker], req: Req) -> None:
+    """Tell the speculative worker that a request finished, in prefill or decode."""
+    # isinstance narrowing: create_worker may also return plain
+    # TpModelWorker-based drafts, which carry no spec-worker hooks.
+    if isinstance(draft_worker, BaseSpecWorker):
+        draft_worker.note_request_finished(
+            rid=req.rid,
+            natural_stop=isinstance(req.finished_reason, FINISH_MATCHED_TOKEN),
+        )
+
+
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerBatchResultProcessor:
     is_generation: bool
@@ -507,6 +518,7 @@ class SchedulerBatchResultProcessor:
                             )
                         )
                         req.time_stats.set_completion_time()
+                        note_spec_request_finished(self.draft_worker, req)
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         kv_ops.append(
                             partial(checkpoint_kv_cache, req, self.tree_cache)
@@ -1588,13 +1600,7 @@ class SchedulerBatchResultProcessor:
             if not self._mamba_can_cache_finished_req(req, result, i):
                 req.skip_radix_cache_insert = True
 
-            # isinstance narrowing: create_worker may also return plain
-            # TpModelWorker-based drafts, which carry no spec-worker hooks.
-            if isinstance(self.draft_worker, BaseSpecWorker):
-                self.draft_worker.note_request_finished(
-                    rid=req.rid,
-                    natural_stop=isinstance(req.finished_reason, FINISH_MATCHED_TOKEN),
-                )
+            note_spec_request_finished(self.draft_worker, req)
 
             # delete feature to save memory
             if req.multimodal_inputs is not None and req.session is None:

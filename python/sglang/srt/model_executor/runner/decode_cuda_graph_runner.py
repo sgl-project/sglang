@@ -1023,7 +1023,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 forward_batch.batch_size * self.captured_req_width
                 == forward_batch.input_ids.numel()
             )
-            if self.model_runner.spec_algorithm.is_ngram()
+            if (
+                self.model_runner.spec_algorithm.is_ngram()
+                or self.model_runner.spec_algorithm.is_external()
+            )
             else True
         )
 
@@ -2214,7 +2217,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 ragged_verify_layout=ragged_verify_layout,
             )
 
-        elif self.model_runner.spec_algorithm.is_ngram():
+        elif (
+            self.model_runner.spec_algorithm.is_ngram()
+            or self.model_runner.spec_algorithm.is_external()
+        ):
             from sglang.srt.speculative.ngram_info import NgramVerifyInput
 
             spec_info = NgramVerifyInput(

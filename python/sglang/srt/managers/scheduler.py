@@ -255,6 +255,7 @@ from sglang.srt.managers.schedule_policy import (
 )
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
+    note_spec_request_finished,
 )
 from sglang.srt.managers.scheduler_components.deferred_responses import (
     DeferredResponses,
@@ -4109,6 +4110,7 @@ class Scheduler(
         self.request_retirer.abort(
             req, finished_reason=req.discard_output_reason and reason.to_json()
         )
+        note_spec_request_finished(self.draft_worker, req)
 
         self.chunked_req = None
         self._pending_chunked_abort_req = None
@@ -5500,7 +5502,7 @@ class Scheduler(
         batch_result: GenerationBatchResult,
     ) -> None:
         """Stash this iter's relay payload for next iter's resolve_forward_inputs."""
-        if self.spec_algorithm.is_ngram():
+        if self.spec_algorithm.is_ngram() or self.spec_algorithm.is_external():
             if batch_result.next_draft_input is not None:
                 payload = RelayPayload.from_ngram(batch_result.next_draft_input)
                 self.future_map.stash(future_indices, payload)

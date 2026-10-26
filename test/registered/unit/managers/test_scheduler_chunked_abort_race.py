@@ -82,6 +82,7 @@ def _make_scheduler(pending_req, *, chunked_req, running_reqs) -> Scheduler:
     sched.hisparse_coordinator = None
     sched.uocr_runtime = None
     sched.ipc_channels = Mock()
+    sched.draft_worker = None
     sched.init_request_retirer()
     return sched
 

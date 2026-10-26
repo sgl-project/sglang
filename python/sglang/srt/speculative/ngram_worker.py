@@ -11,7 +11,6 @@ from sglang.kernels.ops.speculative.reconstruct_tree import (
     reconstruct_indices_from_tree_mask_func,
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.utils import GenerationBatchResult
@@ -34,9 +33,10 @@ from sglang.srt.speculative.eagle_worker_common import (
 from sglang.srt.speculative.ngram_info import NgramVerifyInput
 from sglang.srt.speculative.spec_utils import (
     GrammarTree,
+    alloc_verify_tree_buffers,
     build_grammar_vocab_mask,
-    commit_mamba_states_after_verify,
-    move_accept_tokens_to_target_kvcache,
+    commit_verify,
+    derive_tree_links,
     prepare_mamba_track_for_verify,
     record_stream_for_v2_verify,
 )
@@ -49,34 +49,6 @@ logger = logging.getLogger(__name__)
 
 
 USE_FULL_MASK = True
-
-
-def _derive_tree_links(
-    mask: np.ndarray, bs: int, draft_token_num: int
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Host-side (retrive_next_token, retrive_next_sibling), matching what
-    reconstruct_indices_from_tree_mask produces on device.
-
-    ``mask[b, i, j]`` marks node j as an ancestor of node i, so i's immediate parent
-    is the largest such j < i, and both links follow from the parents alone.
-    """
-    tree = mask.reshape(bs, draft_token_num, draft_token_num)
-    node_order = np.arange(draft_token_num)
-    ancestors = tree & (node_order < node_order[:, None])
-    parents = np.where(ancestors.any(-1), (ancestors * node_order).argmax(-1), -1)
-
-    next_token = np.full((bs, draft_token_num), -1, dtype=np.int64)
-    next_sibling = np.full((bs, draft_token_num), -1, dtype=np.int64)
-    for b in range(bs):
-        # Descending scan, so every k > i is already recorded when i is reached.
-        earliest_child_of = {}
-        for i in reversed(range(draft_token_num)):
-            next_token[b, i] = earliest_child_of.get(i, -1)
-            parent = int(parents[b, i])
-            if parent >= 0:
-                next_sibling[b, i] = earliest_child_of.get(parent, -1)
-                earliest_child_of[parent] = i
-    return torch.from_numpy(next_token), torch.from_numpy(next_sibling)
 
 
 class NGRAMWorker(BaseSpecWorker):
@@ -185,54 +157,18 @@ class NGRAMWorker(BaseSpecWorker):
         return seq1[-need_from_seq1:] + seq2
 
     def _init_preallocated_tensors(self):
-        max_total_drafts = self.max_batch_size * self.draft_token_num
-        max_total_mask_size = (
-            self.max_batch_size * self.draft_token_num * self.draft_token_num
-        )
-
-        self.draft_tokens = torch.empty(
-            (max_total_drafts,), dtype=torch.int64, device=self.device
-        )
-        self.retrieve_indexes = torch.empty(
-            (self.max_batch_size, self.draft_token_num),
-            dtype=torch.int64,
+        (
+            self.draft_tokens_batch,
+            self.tree_mask_batch,
+            self.retrieve_indexes_batch,
+            self.retrieve_next_token_batch,
+            self.retrieve_next_sibling_batch,
+            self.positions_batch,
+        ) = alloc_verify_tree_buffers(
+            max_batch_size=self.max_batch_size,
+            draft_token_num=self.draft_token_num,
             device=self.device,
         )
-        self.retrieve_next_token = torch.empty(
-            (self.max_batch_size, self.draft_token_num),
-            dtype=torch.int64,
-            device=self.device,
-        )
-        self.retrieve_next_sibling = torch.empty(
-            (self.max_batch_size, self.draft_token_num),
-            dtype=torch.int64,
-            device=self.device,
-        )
-        self.positions = torch.empty(
-            (max_total_drafts,), dtype=torch.int64, device=self.device
-        )
-        self.tree_mask = torch.empty(
-            (max_total_mask_size,), dtype=torch.bool, device=self.device
-        )
-
-        self.draft_tokens_batch = []
-        self.tree_mask_batch = []
-        self.retrieve_indexes_batch = []
-        self.retrieve_next_token_batch = []
-        self.retrieve_next_sibling_batch = []
-        self.positions_batch = []
-
-        for bs in range(0, self.max_batch_size + 1):
-            self.retrieve_indexes_batch.append(self.retrieve_indexes[:bs, :])
-            self.retrieve_next_token_batch.append(self.retrieve_next_token[:bs, :])
-            self.retrieve_next_sibling_batch.append(self.retrieve_next_sibling[:bs, :])
-            self.positions_batch.append(self.positions[: bs * self.draft_token_num])
-            self.draft_tokens_batch.append(
-                self.draft_tokens[: bs * self.draft_token_num]
-            )
-            self.tree_mask_batch.append(
-                self.tree_mask[: bs * self.draft_token_num * self.draft_token_num]
-            )
 
     def on_verify_complete_cpu(
         self, num_correct_drafts_per_req: list[int], batch_size: int = 0
@@ -454,7 +390,7 @@ class NGRAMWorker(BaseSpecWorker):
                 # From the host tree rather than the device output: no readback to
                 # wait on, and deriving here keeps it under the verify forward.
                 mask, req_drafts = self.grammar_tree_host
-                retrieve_next_token_cpu, retrieve_next_sibling_cpu = _derive_tree_links(
+                retrieve_next_token_cpu, retrieve_next_sibling_cpu = derive_tree_links(
                     mask, bs, self.draft_token_num
                 )
                 grammar_mask = build_grammar_vocab_mask(
@@ -509,43 +445,18 @@ class NGRAMWorker(BaseSpecWorker):
                     grammar_mask,
                     watermark_state=self.model_runner.watermark_state,
                 )
-            new_seq_lens = batch.seq_lens + accept_lens
-            commit_mamba_states_after_verify(
-                self.target_worker,
-                batch,
-                accept_lens,
-                accept_index,
-                self.draft_token_num,
+            accept_tokens, new_seq_lens = commit_verify(
+                batch=batch,
+                logits_output=logits_output,
+                predict=predict,
+                accept_lens=accept_lens,
+                accept_index=accept_index,
+                watermark_state=self.model_runner.watermark_state,
+                target_worker=self.target_worker,
+                draft_token_num=self.draft_token_num,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             )
-            accept_tokens = predict[accept_index]
-            if (
-                self.model_runner.watermark_state is not None
-                and batch.sampling_info.has_watermark_candidates
-            ):
-                self.model_runner.watermark_state.append_speculative(
-                    batch.req_pool_indices,
-                    accept_tokens,
-                    accept_lens,
-                )
-            accept_tokens = accept_tokens.flatten()
             next_token_ids = accept_tokens
-
-            # The KV mover expects drafts-only counts. NGRAM's
-            # accept_lens includes the bonus token, matching scheduler output.
-            num_correct_drafts_per_req = accept_lens - 1
-            move_accept_tokens_to_target_kvcache(
-                batch,
-                accept_index,
-                num_correct_drafts_per_req,
-                self.token_to_kv_pool_allocator,
-            )
-            if batch.return_logprob:
-                compute_spec_logprobs(
-                    batch,
-                    logits_output,
-                    predict,
-                    accept_index=accept_index,
-                )
 
             if on_publish is not None:
                 on_publish(new_seq_lens)

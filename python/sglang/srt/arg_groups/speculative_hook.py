@@ -1385,6 +1385,80 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
         )
 
 
+def _handle_external(server_args: ServerArgs) -> None:
+    cfg = resolving_view(server_args)
+
+    if cfg.speculative_external_endpoint is None:
+        raise ValueError(
+            "EXTERNAL speculative decoding requires "
+            "--speculative-external-endpoint to be set."
+        )
+    if resolved_view(server_args).enable_dp_attention:
+        raise ValueError("EXTERNAL speculative decoding does not support DP attention.")
+    if cfg.pp_size > 1:
+        raise ValueError(
+            "EXTERNAL speculative decoding does not support pipeline parallelism."
+        )
+    # Each DP replica would open its own drafter connection and number requests
+    # from 0, so request ids would collide at the drafter.
+    if cfg.dp_size > 1:
+        raise ValueError(
+            "EXTERNAL speculative decoding does not support data parallelism."
+        )
+    # Under PD the decode server, which drafts, never runs the prefill that sends
+    # the drafter a request's context.
+    if cfg.disaggregation_mode != "null":
+        raise ValueError(
+            "EXTERNAL speculative decoding does not support PD disaggregation."
+        )
+
+    if cfg.max_running_requests is None:
+        declare_resolution(
+            server_args,
+            "_handle_external",
+            max_running_requests=48,
+        )
+        logger.warning(
+            "Max running requests is reset to 48 for speculative decoding. "
+            "You can override this by explicitly setting --max-running-requests."
+        )
+
+    declare_resolution(
+        server_args,
+        "_handle_external",
+        enable_mixed_chunk=False,
+        speculative_eagle_topk=1,
+    )
+
+    if cfg.speculative_num_draft_tokens is None:
+        declare_resolution(
+            server_args,
+            "_handle_external",
+            speculative_num_draft_tokens=8,
+        )
+        logger.warning(
+            "speculative_num_draft_tokens is set to 8 by default for "
+            "external speculative decoding. You can override this by "
+            "explicitly setting --speculative-num-draft-tokens."
+        )
+    if cfg.speculative_num_draft_tokens < 2:
+        raise ValueError(
+            "EXTERNAL speculative decoding requires "
+            "--speculative-num-draft-tokens >= 2 (the last accepted token plus "
+            f"at least one draft), got {cfg.speculative_num_draft_tokens}."
+        )
+
+    declare_resolution(
+        server_args,
+        "_handle_external",
+        speculative_num_steps=cfg.speculative_num_draft_tokens - 1,
+    )
+
+    logger.warning(
+        "Mixed chunked prefill is disabled for external speculative decoding."
+    )
+
+
 def _handle_ngram(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
     if cfg.device not in ("cuda", "cpu", "xpu"):

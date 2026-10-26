@@ -30,7 +30,7 @@ class Spec(msgspec.Struct):
     # -------------------------------------------------------------------------
     speculative_algorithm: A[
         Optional[str],
-        "Speculative algorithm. Builtins: EAGLE, EAGLE3, NEXTN, STANDALONE, NGRAM, DFLASH, DSPARK, UNO. Or any name registered via `SpeculativeAlgorithm.register`.",
+        "Speculative algorithm. Builtins: EAGLE, EAGLE3, NEXTN, STANDALONE, NGRAM, DFLASH, DSPARK, UNO, EXTERNAL. Or any name registered via `SpeculativeAlgorithm.register`.",
     ] = None
     uno_lora_path: A[Optional[str], "Path to the UNO draft LoRA checkpoint."] = None
     speculative_draft_model_path: A[
@@ -241,6 +241,20 @@ class Spec(msgspec.Struct):
     ] = None
     spec_trace_dir: A[
         Optional[str], "Directory to write decoupled speculative decoding trace files."
+    ] = None
+
+    # -------------------------------------------------------------------------
+    # Speculative decoding (external)
+    # -------------------------------------------------------------------------
+    speculative_external_endpoint: A[
+        Optional[str],
+        Arg(
+            help=(
+                "ZMQ endpoint of the external drafter process "
+                "(e.g. 'tcp://127.0.0.1:5580'). Required when "
+                "--speculative-algorithm is EXTERNAL."
+            ),
+        ),
     ] = None
 
     # -------------------------------------------------------------------------

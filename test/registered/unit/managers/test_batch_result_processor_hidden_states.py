@@ -19,6 +19,7 @@ from sglang.srt.managers.scheduler_components.batch_result_processor import (
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
 from sglang.srt.runtime_context import get_context
+from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.scheduler_test_utils import FakeReq, release_only_retirer
 from sglang.test.test_utils import CustomTestCase
@@ -574,6 +575,79 @@ class TestMixedBatchKvRelease(CustomTestCase):
         self.assertEqual(release.call_count, 2)
         processor.model_worker.prepare_for_kv_cache_release.assert_called_once_with(
             decode_req
+        )
+
+
+class TestPrefillFinishNotifiesSpecWorker(CustomTestCase):
+    def test_req_finishing_in_prefill_is_reported_to_spec_worker(self):
+        """A req that finishes on its first token (e.g. a /health check) is
+        reported to the speculative worker by the prefill result itself, so an
+        external drafter frees its state now rather than at a later step."""
+        done = _PrefillReq(rid="done", return_hidden_states=False)
+        running = _PrefillReq(rid="running", return_hidden_states=False)
+        done.finished = lambda: bool(done.output_ids)
+        for req in (done, running):
+            req.kv = SimpleNamespace(
+                kv_committed_len=0,
+                holds_kv=True,
+                holds_mamba=False,
+                retraction_backup=None,
+            )
+        batch = SimpleNamespace(
+            reqs=[done, running],
+            chunked_req=None,
+            decoding_reqs=[],
+            return_logprob=False,
+            return_hidden_states=False,
+            return_hidden_states_mode=CaptureHiddenMode.NULL,
+            spec_info=None,
+            spec_algorithm=SimpleNamespace(is_none=lambda: True),
+            prefill_stats=None,
+            dp_cooperation_info=None,
+        )
+        result = SimpleNamespace(
+            copy_done=None,
+            auxiliary_host_output=None,
+            routed_experts_output=None,
+            indexer_topk_output=None,
+            kv_weight_version_record=None,
+            logits_output=SimpleNamespace(
+                hidden_states=None, customized_info=None, sampling_mask_output=None
+            ),
+            next_token_ids=torch.tensor([5, 6]),
+            extend_input_len_per_req=None,
+            extend_logprob_start_len_per_req=None,
+            grammar_advanced=False,
+            can_run_cuda_graph=False,
+            skipped_output_comm=False,
+        )
+        processor = replace(
+            _make_processor(self), draft_worker=Mock(spec=BaseSpecWorker)
+        )
+
+        with (
+            patch(
+                "sglang.srt.managers.scheduler_components."
+                "request_retirer.release_kv_cache"
+            ),
+            patch(
+                "sglang.srt.managers.scheduler_components."
+                "batch_result_processor.checkpoint_kv_cache"
+            ),
+            patch(
+                "sglang.srt.managers.scheduler_components."
+                "batch_result_processor.get_memory",
+                return_value=SimpleNamespace(enable_hisparse=False),
+            ),
+            patch.object(
+                SchedulerBatchResultProcessor, "_maybe_collect_routed_experts"
+            ),
+            patch.object(SchedulerBatchResultProcessor, "_maybe_collect_indexer_topk"),
+        ):
+            processor.process_batch_result_prefill(batch, result)
+
+        processor.draft_worker.note_request_finished.assert_called_once_with(
+            rid="done", natural_stop=False
         )
 
 

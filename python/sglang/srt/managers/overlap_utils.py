@@ -40,8 +40,8 @@ def decide_needs_cpu_seq_lens(
         # FIXME: support TBO without seq lens cpu value
         return True
     algo = SpeculativeAlgorithm.from_string(get_spec().speculative_algorithm)
-    if algo.is_ngram():
-        # ngram's USE_FULL_MASK verify path reads seq_lens_cpu per req to size
+    if algo.is_ngram() or algo.is_external():
+        # ngram/external's full-mask verify path reads seq_lens_cpu per req to size
         # the tree mask, regardless of the attn backend (e.g. Triton opts out).
         return True
     # Skip unset slots (e.g. draft_extend_attn_backend on some spec configs);
@@ -556,7 +556,7 @@ class FutureMap:
         )
 
     def _resolve_spec_extras(self, batch: ScheduleBatch) -> None:
-        if self.spec_algo.is_ngram():
+        if self.spec_algo.is_ngram() or self.spec_algo.is_external():
             draft_input = batch.spec_info
             if draft_input is None or draft_input.future_indices is None:
                 return
@@ -781,7 +781,7 @@ class FutureMap:
         if indices.shape[0] == 0:
             # DP idle: payload is empty stub; lazy-init shape peek would IndexError.
             return
-        if self.spec_algo.is_ngram():
+        if self.spec_algo.is_ngram() or self.spec_algo.is_external():
             self._maybe_init_ngram_bufs(payload)
             self.accept_tokens_buf[indices] = payload.accept_tokens
             self.accept_lens_buf[indices] = payload.accept_lens

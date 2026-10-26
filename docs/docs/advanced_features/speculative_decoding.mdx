@@ -21,6 +21,7 @@ SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3,
 - [Standalone Speculative Decoding (Small Draft Model)](#standalone-speculative-decoding-small-draft-model)
 - [Speculative Decoding V2 (Overlap Scheduler)](#speculative-decoding-v2-overlap-scheduler)
 - [Ngram Speculative Decoding](#ngram-speculative-decoding)
+- [External Speculative Decoding](#external-speculative-decoding)
 - [Full Parameter Reference](#full-parameter-reference)
 - [OOM Troubleshooting](#oom-troubleshooting)
 - [References](#references)
@@ -908,6 +909,31 @@ print(response.choices[0].message.content)
 
 ---
 
+## External Speculative Decoding
+
+With **external speculative decoding**, the draft model runs in a separate process that SGLang does not manage. This process can be on the same or a different host, allowing disaggregated serving of target and draft models. SGLang sends each request's token ids when it is prefilled and, every decode step, its sequence length and last token; the drafter replies with draft token ids, which SGLang verifies with the target model as a chain.
+
+Enable it with:
+- `--speculative-algorithm EXTERNAL`
+- `--speculative-external-endpoint tcp://<drafter-host>:<port>`
+
+The drafter must be listening before SGLang starts. The messages are [msgpack](https://msgpack.org/) arrays over a ZeroMQ DEALER/ROUTER socket; their layout is specified in `python/sglang/srt/speculative/external_components/contract.py`, so a drafter can be written in any language.
+
+- `--speculative-num-draft-tokens` counts the verified tokens per step including the last accepted token, so the drafter is asked for one fewer draft per step. Defaults to `8`; must be at least `2`.
+- Works with tensor parallelism and the overlap scheduler. It does not support pipeline parallelism, data parallelism, DP attention, or PD disaggregation, and it disables mixed chunked prefill.
+- If the drafter reports an error for a request (an empty reply), that request is aborted; other requests continue.
+- A retracted request (under KV cache pressure, or when generation is paused with `retract`) is cancelled and prefilled again under a new request id, with the output generated so far appended to its token ids.
+
+```bash Command
+python3 -m sglang.launch_server \
+    --model Qwen/Qwen3-8B \
+    --speculative-algorithm EXTERNAL \
+    --speculative-external-endpoint tcp://127.0.0.1:5580 \
+    --speculative-num-draft-tokens 8
+```
+
+---
+
 ## Full Parameter Reference
 
 Below is a comprehensive list of all speculative decoding parameters available in SGLang:
@@ -934,7 +960,7 @@ Below is a comprehensive list of all speculative decoding parameters available i
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--speculative-algorithm</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>str</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>None</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Algorithm to use: <code>UNO</code>, <code>DFLASH</code>, <code>EAGLE</code>, <code>EAGLE3</code>, <code>STANDALONE</code>, <code>NGRAM</code>, <code>NEXTN</code> (alias of <code>EAGLE</code>)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Algorithm to use: <code>UNO</code>, <code>DFLASH</code>, <code>EAGLE</code>, <code>EAGLE3</code>, <code>STANDALONE</code>, <code>NGRAM</code>, <code>EXTERNAL</code>, <code>NEXTN</code> (alias of <code>EAGLE</code>)</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--speculative-draft-model-path</code></td>
@@ -1094,6 +1120,33 @@ Below is a comprehensive list of all speculative decoding parameters available i
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>int</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>10,000,000</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Cache capacity</td>
+    </tr>
+  </tbody>
+</table>
+
+### External-specific parameters
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "24%"}} />
+    <col style={{width: "16%"}} />
+    <col style={{width: "16%"}} />
+    <col style={{width: "44%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Parameter</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Type</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Default</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--speculative-external-endpoint</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>str</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>None</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>ZMQ endpoint of the external drafter process (e.g. <code>tcp://127.0.0.1:5580</code>); required for <code>EXTERNAL</code></td>
     </tr>
   </tbody>
 </table>
