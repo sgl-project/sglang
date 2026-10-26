@@ -49,6 +49,7 @@ from sglang.multimodal_gen.runtime.utils.external_model_package import (
     load_external_model_package,
 )
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
+    load_dict,
     maybe_download_model_index,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -473,10 +474,22 @@ def _get_config_info(
         config = maybe_download_model_index(model_path)
         pipeline_name = config.get("_class_name", "")
     pipeline_name = pipeline_name.lower()
+    # A local checkpoint that ships modular_model_index.json next to model_index.json
+    # may name a finer-grained pipeline there (the Wan-Animate-2 variants);
+    # maybe_download_model_index reads the modular file only when model_index.json is
+    # absent, so probe the detectors with its class as well.
+    modular_pipeline_name = (
+        load_dict(os.path.join(model_path, "modular_model_index.json"))
+        .get("_class_name", "")
+        .lower()
+    )
+    probes = [model_path.lower(), pipeline_name]
+    if modular_pipeline_name and modular_pipeline_name != pipeline_name:
+        probes.append(modular_pipeline_name)
 
     matched_model_names = []
     for model_id, detector in _MODEL_NAME_DETECTORS:
-        if detector(model_path.lower()) or detector(pipeline_name):
+        if any(detector(probe) for probe in probes):
             logger.debug(
                 f"Matched model name '{model_id}' using a registered detector."
             )

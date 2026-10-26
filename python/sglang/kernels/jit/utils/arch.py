@@ -119,6 +119,11 @@ def _init_jit_cuda_arch_once():
         suffix = _sail_arch_suffix(major, minor)
     else:
         suffix = _cuda_arch_suffix(major, minor)
+        if (major, minor) == (10, 7):
+            from flashinfer.compilation_context import cutlass_supports_sm107
+
+            if not cutlass_supports_sm107():
+                major, minor, suffix = 10, 0, "f"
 
     _CUDA_ARCH = ArchInfo(major, minor, suffix)
 
