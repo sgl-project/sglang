@@ -106,7 +106,7 @@ metatags:
   <Card
     title="MiniMax"
     mode="card"
-    href="/cookbook/autoregressive/MiniMax/MiniMax-M3"
+    href="/cookbook/autoregressive/MiniMax/MiniMax-M3.1"
     img="/cards/logos/minimax.png"
   />
   <Card
