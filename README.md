@@ -1,120 +1,32 @@
-# SGLang: Fast inference for LLMs and multimodal models
+# Week 44
 
-<p align="center" id="sglangtop">
-<img src="https://raw.githubusercontent.com/sgl-project/sglang/main/assets/logo.png" alt="SGLang" width="400">
-</p>
+Base image: `lmsysorg/sglang:v0.5.22-rocm10-mi35x`
 
-<p align="center">
-  <a href="https://pypi.org/project/sglang/"><img src="https://img.shields.io/pypi/v/sglang?style=flat&amp;label=PyPI&amp;labelColor=555555&amp;color=orange" alt="PyPI version"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache%202.0-green?style=flat&amp;labelColor=555555" alt="License: Apache 2.0"></a>
-  <a href="https://pypistats.org/packages/sglang"><img src="https://img.shields.io/pypi/dm/sglang?style=flat&amp;label=Downloads&amp;labelColor=555555&amp;color=blue" alt="PyPI downloads per month"></a>
-</p>
+Branch `collector_26_10_qwen_3.8`, cut from SGLang main at `e1c4b273af` (26 Oct 2026). AITER is `ROCm/aiter` main at `9059673612`.
 
-<p align="center">
-  <a href="https://docs.sglang.io/">Docs</a> |
-  <a href="https://cookbook.sglang.io/">Cookbook</a> |
-  <a href="https://www.sglang.io/">Website</a> |
-  <a href="https://lmsys.org/blog/">Blog</a> |
-  <a href="https://slack.sglang.io/">Slack</a>
-</p>
+Pull requests already merged into SGLang main are in this collector because the branch starts from that main. They were not applied again.
 
-SGLang is an open-source inference framework for large language, vision-language, and diffusion models, optimized for agentic workloads, large-scale serving, and RL rollouts. [SGLang Diffusion](https://docs.sglang.io/docs/sglang-diffusion) is its built-in image and video generation engine, included in this repository and the `sglang` Python package.
+## SGLang
 
-👋 Get started below, or meet the community at [SGLang Events](https://www.sglang.io/events), including meetups, developer meetings, workshops, and office hours.
+| Pull request | Change | In this collector | In stock v0.5.22 | On SGLang main |
+| --- | --- | --- | --- | --- |
+| [#39069](https://github.com/sgl-project/sglang/pull/39069) | Infer the draft path for bundled MTP | Yes, added on this branch | No | No, still open |
+| [#40708](https://github.com/sgl-project/sglang/pull/40708) | 512-expert softmax MoE through AITER topk_gating | Yes, added on this branch | No | No, still open |
+| [#40771](https://github.com/sgl-project/sglang/pull/40771) | Prefer QuickReduce before custom all-reduce | Yes, added on this branch | No | No, still open |
+| [#41899](https://github.com/sgl-project/sglang/pull/41899) | Quantize the Quark MXFP4 shared expert while loading | Yes, through the main base | No | Yes, merged 26 Oct 2026 |
+| [#43516](https://github.com/sgl-project/sglang/pull/43516) | Qwen3.8 decode layer as two FlyDSL launches | Yes, added on this branch | No | No, still open |
+| [#43839](https://github.com/sgl-project/sglang/pull/43839) | Quantize the BF16 GDN projections to MXFP4 online | Yes, added on this branch | No | No, still open |
+| [`flydsl_reduce_int4` @ `8cb39392`](https://github.com/amd-oshkarav/sglang/commit/8cb39392b6dbcce24dbfae6d6a3315c2f98aa6e7) | FlyDSL INT4 QuickReduce for eligible bf16 payloads | Yes, added on this branch | No | No |
 
-> **[SGLang Summit 2026: Meet the builders of open AI](https://www.sglang.io/summit)**<br>
-> **Our flagship annual gathering · November 12–13 · San Francisco**
->
-> Go deep on inference, training, and AI hardware through technical talks, live demos, and hands-on workshops. Bring your deployment challenges and meet the engineers and researchers building the stack.
+## AITER
 
-## Get Started
+The collector reinstalls AITER main `9059673612`. The stock v0.5.22 image pins AITER `e7d2453` (25 Sep 2026). Every pull request below is on that AITER main, so it is in this collector through the checkout.
 
-Pull the Docker image, which includes SGLang and its dependencies:
-
-```bash
-docker pull lmsysorg/sglang:latest
-```
-
-Alternatively, install SGLang in an activated Python environment with uv:
-
-```bash
-uv pip install --prerelease=allow sglang
-```
-
-Next, launch your model:
-
-- [Quickstart](https://docs.sglang.io/docs/get-started/quickstart): Run your first model and send a request.
-- [Cookbook](https://cookbook.sglang.io/): Choose your model and hardware to get a ready-to-run launch command.
-
-## Supported Hardware
-
-SGLang supports a wide range of GPUs, TPUs, NPUs, CPUs, and Apple Silicon platforms.
-
-| Platform | Representative hardware |
-| --- | --- |
-| [NVIDIA](https://docs.sglang.io/docs/hardware-platforms/nvidia-gpus) | B200/B300/GB200/GB300; H100/H200/H800/H20; A100; RTX 30/40/50 series, RTX 6000 Ada / PRO 6000; DGX Spark, Jetson Orin |
-| [AMD](https://docs.sglang.io/docs/hardware-platforms/amd_gpu) | Instinct MI300X, MI325X, MI350X, MI355X |
-| [Google TPU](https://docs.sglang.io/docs/hardware-platforms/tpu) | v6e, v7; [SGLang-TorchTPU](https://github.com/sgl-project/sglang-torchtpu) / [SGL-JAX](https://github.com/sgl-project/sglang-jax) |
-| Intel ([GPU](https://docs.sglang.io/docs/hardware-platforms/xpu) / [CPU](https://docs.sglang.io/docs/hardware-platforms/cpu_server)) | Arc / Arc Pro B-Series GPUs, Xeon CPUs |
-| [Apple Silicon](https://docs.sglang.io/docs/hardware-platforms/apple_metal) | Macs via Metal / MLX |
-| [Huawei Ascend](https://docs.sglang.io/docs/hardware-platforms/ascend-npus/getting-started/installation) | A2, A3, 950PR/DT NPUs |
-| [Moore Threads](https://docs.sglang.io/docs/hardware-platforms/mthreads_gpu) | MTT S5000 GPUs |
-
-Integrations in progress: AWS Trainium, [Alibaba T-Head PPU](https://github.com/sgl-project/sglang/issues/37519), [Cambricon MLU](https://github.com/sgl-project/sglang/pull/26898), Qualcomm QAIC, MetaX, Hygon HCU/DCU, Iluvatar CoreX, and more.
-
-SGLang-TorchTPU brings the SGLang serving engine to Google TPUs through PyTorch, torch_tpu, and Pallas kernels. It supports LLM and vision-language serving on TPU7x (Ironwood), including tensor and expert parallelism across hosts. SGL-JAX provides the JAX-based TPU serving path.
-
-See the [Cookbook](https://cookbook.sglang.io/) and platform guides for model compatibility and setup.
-
-## SGL Ecosystem
-
-| Area | Projects | Purpose |
-| --- | --- | --- |
-| Diffusion | [SGLang Diffusion](https://docs.sglang.io/docs/sglang-diffusion/installation) | Built into SGLang for image and video generation with diffusion models. |
-| Audio | [SGLang Omni](https://github.com/sgl-project/sglang-omni) | Audio model serving for text-to-speech (TTS) and automatic speech recognition (ASR). |
-| Speculative Decoding | [SpecForge](https://github.com/sgl-project/SpecForge) | Train draft models for speculative decoding and deploy them with SGLang. |
-| RL and Post-Training | [Miles](https://github.com/radixark/miles), [slime](https://github.com/THUDM/slime), [AReaL](https://github.com/inclusionAI/AReaL), [Tunix](https://github.com/google/tunix), [verl](https://github.com/volcengine/verl) | Training frameworks that integrate SGLang for rollout generation. |
-| Deployment and Orchestration | [SMG](https://github.com/smg-project/smg), [RBG](https://github.com/sgl-project/rbg), [llm-d](https://llm-d.ai/docs/dev/operations/disaggregation/sglang), [Ray Serve](https://docs.ray.io/en/latest/serve/llm/user-guides/sglang.html), [NVIDIA Dynamo](https://docs.nvidia.com/dynamo/backends/sg-lang/reference-guide) | Deploy and scale SGLang inference services with routing, load balancing, and cluster orchestration. |
-| Education | [Mini-SGLang](https://github.com/sgl-project/mini-sglang), [zero-to-sglang](https://github.com/datawhalechina/zero-to-sglang), [DeepLearning.AI course](https://www.deeplearning.ai/short-courses/efficient-inference-with-sglang-text-and-image-generation/) | Learn inference engine design and efficient text and image generation through code and hands-on courses. |
-
-## Development and Contributing
-
-Contributions are welcome, from bug fixes and documentation to model support and performance improvements.
-
-### Development setup
-
-Start from the `lmsysorg/sglang:dev` Docker image, which provides development tools and most dependencies. Clone or mount your SGLang checkout inside the container, then install it in editable mode from the repository root so tests use your local Python changes:
-
-```bash
-pip install -e "python"
-```
-
-In an activated virtual environment, you can use `uv pip install --prerelease=allow -e "python"` instead. See the [development guide](https://docs.sglang.io/docs/developer_guide/development_guide_using_docker) for container setup and testing.
-
-### Contribute
-
-1. Fork the repository and create a branch for your changes. For larger changes, discuss your proposal in a [GitHub issue](https://github.com/sgl-project/sglang/issues) or on [Slack](https://slack.sglang.io/).
-2. Make your changes, run the relevant tests, and add regression coverage for fixes or new behavior. Run `pre-commit run --all-files` before submitting.
-3. Open a pull request describing the change and how you tested it. Include benchmarks or accuracy evaluations when relevant.
-
-See the [contributor guide](https://docs.sglang.io/docs/developer_guide/contribution_guide) for formatting, testing, and pull request instructions. Documentation contributors can start with the [docs guide](docs/README.md).
-
-## Community and Sponsorship
-
-SGLang is hosted by [LMSYS](https://lmsys.org/about/), a non-profit open-source organization.
-
-- **Community discussions:** Join [Slack](https://slack.sglang.io/) for technical questions and development discussions.
-- **Events:** Find meetups, workshops, and office hours on [SGLang Events](https://www.sglang.io/events).
-- **Updates:** Follow [X](https://x.com/lmsysorg) and [LinkedIn](https://www.linkedin.com/company/sgl-project/) for project updates, and the [LMSYS Blog](https://lmsys.org/blog/) for release announcements and technical articles.
-- **Project resources:** Explore the [documentation](https://docs.sglang.io/), [Cookbook](https://cookbook.sglang.io/), [roadmap](https://roadmap.sglang.io/), [release notes](https://github.com/sgl-project/sglang/releases), [issue tracker](https://github.com/sgl-project/sglang/issues), and [contributor guide](https://docs.sglang.io/docs/developer_guide/contribution_guide).
-- **Contact Us:** For enterprise adoption and deployment, technical consulting, sponsorship, or partnership inquiries, please contact [sglang@lmsys.org](mailto:sglang@lmsys.org).
-- **Contributor sponsorship:** Long-term active SGLang contributors are eligible for coding agent sponsorship, including Cursor, Claude Code, or OpenAI Codex. To apply, email [sglang@lmsys.org](mailto:sglang@lmsys.org) with links to your key commits or pull requests.
-
-## Trusted by Industry and Research
-
-SGLang serves production workloads across AI labs, cloud platforms, enterprises, and universities.
-
-<img src="https://raw.githubusercontent.com/sgl-project/sgl-learning-materials/refs/heads/main/slides/adoption.png" alt="Organizations adopting SGLang" width="800">
-
-## Acknowledgment
-We learned the design and reused code from the following projects: [Guidance](https://github.com/guidance-ai/guidance), [vLLM](https://github.com/vllm-project/vllm), [LightLLM](https://github.com/ModelTC/lightllm), [FlashInfer](https://github.com/flashinfer-ai/flashinfer), [Outlines](https://github.com/outlines-dev/outlines), and [LMQL](https://github.com/eth-sri/lmql).
+| Pull request | Change | In stock v0.5.22 | On AITER main |
+| --- | --- | --- | --- |
+| [#4383](https://github.com/ROCm/aiter/pull/4383) | Gluon MXFP4 and MXFP8 quant on gfx950 | No | Yes, merged 5 Oct 2026 |
+| [#5334](https://github.com/ROCm/aiter/pull/5334) | E=512 softmax topk_gating prefill dispatch | Yes | Yes, merged 20 Sep 2026 |
+| [#5835](https://github.com/ROCm/aiter/pull/5835) | Tuned bf16 GEMM configs for Qwen3.8 on gfx950 | No | Yes, merged 26 Sep 2026 |
+| [#5998](https://github.com/ROCm/aiter/pull/5998) | Preshuffled AFP4WFP4 GEMM config, N=4608 K=8192 | No | Yes, merged 1 Oct 2026 |
+| [#6145](https://github.com/ROCm/aiter/pull/6145) | Row-group FP4 paged MQA logits | No | Yes, merged 6 Oct 2026 |
+| [#6398](https://github.com/ROCm/aiter/pull/6398) | Bind load_hip_runtime to the HIP library already loaded | No | Yes, merged 22 Oct 2026 |
