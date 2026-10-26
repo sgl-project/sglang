@@ -67,12 +67,17 @@ class DFlashDraftInputV2(SpecInput):
         self, bs: int, device: torch.device | str
     ) -> None:
         pin_memory = is_pin_memory_available(device)
+        device = torch.device(device)
+        if device.type == "cuda" and device.index is None:
+            # Tensors report cuda:N even when allocated with bare "cuda".
+            # Resolve the current index so reuse also respects device changes.
+            device = torch.device("cuda", torch.cuda.current_device())
 
         def needs_cpu_alloc(buf: Optional[torch.Tensor]) -> bool:
             return buf is None or buf.numel() < bs
 
         def needs_gpu_alloc(buf: Optional[torch.Tensor]) -> bool:
-            return buf is None or buf.numel() < bs or str(buf.device) != str(device)
+            return buf is None or buf.numel() < bs or buf.device != device
 
         def grown_capacity(buf: Optional[torch.Tensor]) -> int:
             current = 0 if buf is None else int(buf.numel())
