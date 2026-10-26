@@ -2,6 +2,7 @@
 
 import pytest
 import torch
+import triton
 
 from sglang.kernels.ops.moe.trtllm_prepared_fp4 import prepared_routing_sm_supported
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -104,6 +105,7 @@ def _check_metadata(actual, packed):
         *[expected[i] for i in (0, 1, 2, 3, 6, 7, 8)],
         TILE=8,
         ROUTES=m * K,
+        BLOCK=triton.next_power_of_2(m * K),
         TOP_K=K,
         PACKED=True,
         num_warps=4,
