@@ -13,8 +13,8 @@ from sglang.srt.mem_cache.unified_memory_pool import UnifiedMambaPool
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
-register_cuda_ci(est_time=45, stage="extra-a", runner_config="1-gpu-small")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cuda_ci(est_time=18, stage="extra-a", runner_config="1-gpu-small")
 
 
 class TestMambaCompaction(CustomTestCase):
