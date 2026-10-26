@@ -239,9 +239,7 @@ class TestMlpSyncPadUnpad(CustomTestCase):
         self.assertEqual(fb.positions.shape[0], fb.batch_size)
 
     def test_tbo_decode_child_pads_its_requests_with_its_tokens(self):
-        """A two-batch-overlap child is padded to a multiple of attention TP. A
-        decode child with fewer requests gets dummy requests for the padded
-        tokens, as the whole batch does; an extend child keeps its requests."""
+        """An extend child keeps its requests."""
         for mode, bs in ((ForwardMode.DECODE, 2), (ForwardMode.EXTEND, 1)):
             with self.subTest(mode=mode):
                 fb = ForwardBatch(

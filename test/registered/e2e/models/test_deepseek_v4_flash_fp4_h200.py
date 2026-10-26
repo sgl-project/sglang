@@ -137,8 +137,6 @@ class TestDSV4FlashFP4DequantTP8H200(
 
 
 class TestDSV4FlashFP4TboH200(GSM8KMixin, CustomTestCase):
-    """Non-EP TBO with TP8/DP2 exercises attention TP4."""
-
     gsm8k_accuracy_thres = 0.93
 
     @classmethod

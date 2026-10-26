@@ -306,7 +306,7 @@ def _tbo_gather_moe_input(moe, local, batch, sub, do_shared_local):
     with torch.cuda.stream(comm):
         comm.wait_stream(compute)
         if parallel.attn_tp_size == 1:
-            # Preserve the optional FP8 wire format of the existing DP gather.
+            # Keeps the DP gather's optional FP8 wire format.
             dp_gather_replicate(global_hidden, local, batch)
         else:
             parallel.tp_group.all_gatherv(
@@ -442,9 +442,8 @@ class OverlappedMoeTransport(ComputeTransport):
 
 def _tbo_run_moe(layer, hidden, batch, do_shared_local):
     if hidden.shape[0] == 0:
-        # Every DP rank gathers the same rows, so a micro-batch empty here is
-        # empty everywhere: no rank runs the experts, and no kernel is launched
-        # on zero rows.
+        # Every rank gathers the same rows, so all ranks skip an empty
+        # micro-batch together and no kernel launches on zero rows.
         return hidden
     global_ids = batch._tbo_global_input_ids
     with get_forward().scoped(mlp_reduce_scatter=True):

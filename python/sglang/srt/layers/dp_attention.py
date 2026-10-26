@@ -1248,11 +1248,7 @@ def dp_reduce_scatterv_async(
     event_key=("combine", 0),
 ) -> torch.cuda.Event:
     """Launch the TBO variable-length combine on the shared comm stream.
-
-    ``sizes`` describes one shard per full-TP rank. For attention TP > 1,
-    reduce-scatter first returns that rank's shard, then an attention-TP
-    all-gather reconstructs the replicated DP-local output.
-    """
+    ``sizes`` has one entry per full-TP rank: a shard of its DP-local rows."""
     comm = get_dp_tbo_comm_stream()
     compute = torch.cuda.current_stream()
     ev = _tbo_event(event_key)
@@ -1276,10 +1272,8 @@ def dp_reduce_scatterv_async(
             global_tokens, output=output_shard, sizes=sizes
         )
         if attn_tp_size > 1:
-            # Through the device group, not the group's custom all-gather: the
-            # other micro-batch's attention runs the attention-TP group's custom
-            # collectives on the compute stream meanwhile, and their shared
-            # buffers cannot serve both streams at once.
+            # Not the group's custom all-gather: the other micro-batch's
+            # attention uses its buffers on the compute stream meanwhile.
             all_gather_single(
                 output_local, output_shard, group=parallel.attn_tp_group.device_group
             )

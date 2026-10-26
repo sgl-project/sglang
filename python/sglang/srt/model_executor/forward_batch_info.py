@@ -1980,10 +1980,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 child._pad_tbo_child_inputs(model_runner)
 
     def _pad_tbo_child_inputs(self, model_runner: ModelRunner):
-        """Pad a two-batch-overlap child to its ``tbo_padded_len`` tokens. A
-        decode child adds a dummy request per padded token, as the decode arm of
-        ``prepare_mlp_sync_batch`` does for the whole batch, so that its requests
-        still match its token rows."""
+        """A decode child pads its requests with its tokens, as the decode arm of
+        ``prepare_mlp_sync_batch`` does for the whole batch."""
         bs = self.batch_size
         if self.forward_mode.is_decode() and self.spec_info is None:
             bs = self.batch_size = self.tbo_padded_len
