@@ -554,6 +554,10 @@ def _cco_lsa_size(comm) -> int:
     try:
         return handle.lsa_size
     finally:
+        # With MORI_ENABLE_SDMA the ranks trade SDMA queue IPC handles while
+        # creating the device comm; a rank that destroys its comm while a peer
+        # is still receiving leaves that peer blocked in the exchange forever.
+        comm.barrier()
         handle.close()
 
 
