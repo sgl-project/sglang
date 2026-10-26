@@ -231,3 +231,85 @@ def preprocess_video_sync(
         f"total_time: {(torchvision_resize_time - entry_time) * 1000:.2f} ms"
     )
     return video, video_metadata
+
+
+# qwen-vl-utils 0.0.14 token budgets for the Qwen3-VL video processor family.
+_QWEN3_VL_VIDEO_MIN_TOKENS = 128
+_QWEN3_VL_VIDEO_MAX_TOKENS = 768
+_QWEN3_VL_MODEL_SEQ_LEN = 128000
+# Bounds for an explicit resized_height/width: its smart_resize defaults, named IMAGE_* there.
+_QWEN3_VL_RESIZED_MIN_TOKENS = 4
+_QWEN3_VL_RESIZED_MAX_TOKENS = 16384
+
+
+def qwen3_vl_video_pixel_limits(image_factor: int) -> dict[str, float]:
+    """The default max_pixels and total_pixels of qwen-vl-utils 0.0.14 for this factor."""
+    factor_area = image_factor * image_factor
+    total_pixels = _QWEN3_VL_MODEL_SEQ_LEN * factor_area * 0.9
+    # VIDEO_MAX_PIXELS still caps the budget, as on the legacy route.
+    if "VIDEO_MAX_PIXELS" in os.environ:
+        total_pixels = min(total_pixels, VIDEO_TOTAL_PIXELS)
+    return {
+        "max_pixels": _QWEN3_VL_VIDEO_MAX_TOKENS * factor_area,
+        "total_pixels": total_pixels,
+    }
+
+
+# Adapted from qwen-vl-utils 0.0.14 vision_process.fetch_video (Apache-2.0),
+# decoding with the given VideoDecoderWrapper.
+def preprocess_qwen3_vl_video_sync(
+    vr: VideoDecoderWrapper, image_factor: int, video_config: dict
+) -> tuple[torch.Tensor, dict]:
+    """Sampled, resized TCHW float frames and their metadata for the Qwen3-VL family.
+
+    These models take frames that qwen-vl-utils already sampled and resized;
+    ``image_factor`` is the patch size times the spatial merge size.
+    """
+    total_frames, video_fps = len(vr), vr.avg_fps
+    nframes = smart_nframes(
+        video_config, total_frames=total_frames, video_fps=video_fps
+    )
+    indices = torch.linspace(0, total_frames - 1, nframes).round().long().tolist()
+    video = torch.as_tensor(vr.get_frames_at(indices)).permute(0, 3, 1, 2)
+
+    nframes, _, height, width = video.shape
+    factor_area = image_factor * image_factor
+    limits = qwen3_vl_video_pixel_limits(image_factor)
+    min_pixels = video_config.get(
+        "min_pixels", _QWEN3_VL_VIDEO_MIN_TOKENS * factor_area
+    )
+    total_pixels = video_config.get("total_pixels", limits["total_pixels"])
+    max_pixels = max(
+        min(limits["max_pixels"], total_pixels / nframes * FRAME_FACTOR),
+        int(min_pixels * 1.05),
+    )
+    max_pixels = min(video_config.get("max_pixels", max_pixels), max_pixels)
+    if "resized_height" in video_config and "resized_width" in video_config:
+        resized_height, resized_width = smart_resize(
+            video_config["resized_height"],
+            video_config["resized_width"],
+            factor=image_factor,
+            min_pixels=_QWEN3_VL_RESIZED_MIN_TOKENS * factor_area,
+            max_pixels=_QWEN3_VL_RESIZED_MAX_TOKENS * factor_area,
+        )
+    else:
+        resized_height, resized_width = smart_resize(
+            height,
+            width,
+            factor=image_factor,
+            min_pixels=min_pixels,
+            max_pixels=max_pixels,
+        )
+    video = torchvision.transforms.functional.resize(
+        video,
+        [resized_height, resized_width],
+        interpolation=InterpolationMode.BICUBIC,
+        antialias=True,
+    ).float()
+    video_metadata = {
+        "fps": video_fps,
+        "frames_indices": indices,
+        "total_num_frames": total_frames,
+        "video_backend": "torchcodec",
+    }
+    return video, video_metadata
