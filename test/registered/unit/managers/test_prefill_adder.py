@@ -209,9 +209,12 @@ class TestPrefillAdder(CustomTestCase):
         req.full_untruncated_fill_ids = list(range(12))
         return req
 
-    def create_shortest_prefill_adder(self, *, chunk_tokens=4096):
+    def create_shortest_prefill_adder(
+        self, *, chunk_tokens=4096, encoder_replay=False, page_size=256
+    ):
         override = get_context().override_server_args(
-            schedule_policy="shortest-prefill-first"
+            schedule_policy="shortest-prefill-first",
+            enable_encoder_swa_bounded_replay=encoder_replay,
         )
         override.install()
         self.addCleanup(override.restore)
@@ -219,7 +222,9 @@ class TestPrefillAdder(CustomTestCase):
         self.mock_tree_cache.supports_prefix_sharing.return_value = False
         self.mock_token_allocator.available_size.return_value = 32768
         return self.create_adder(
-            self.create_running_batch(), page_size=256, rem_chunk_tokens=chunk_tokens
+            self.create_running_batch(),
+            page_size=page_size,
+            rem_chunk_tokens=chunk_tokens,
         )
 
     def test_shortest_prefill_reserves_space_for_complete_waiting_requests(self):
@@ -249,6 +254,88 @@ class TestPrefillAdder(CustomTestCase):
         self.assertIsNone(adder.new_chunked_req)
         self.assertEqual(adder.rem_chunk_tokens, 0)
         self.assertGreaterEqual(adder.rem_total_tokens, 0)
+
+    def test_shortest_prefill_reserves_encoder_replay_rows_of_hits(self):
+        # Admission charges a hit's replay rows to the chunk. A reservation
+        # without them leaves the last hit unable to fit whole, so it waits
+        # and the room reserved for it goes unused.
+        # Expected values are hand-derived: hits a and b have 512 and 1024
+        # uncached tokens, and a resetting hit replays min(prefix, 128).
+        for (
+            encoder_replay,
+            page_size,
+            chunk,
+            cached,
+            rematched,
+            keeps_slot,
+            retracted,
+            continuation_len,
+            admitted,
+            left,
+        ) in (
+            (False, 256, 4096, 4096, 0, False, False, 2560, ("a", "b"), 0),
+            (True, 256, 4096, 0, 0, False, False, 2560, ("a", "b"), 0),
+            (True, 256, 4096, 4096, 0, False, False, 2304, ("a", "b"), 0),
+            # A hit that keeps its slot keeps its SWA window: nothing to replay.
+            (True, 256, 4096, 4096, 0, True, False, 2560, ("a", "b"), 0),
+            # A retracted request starts its window again even with a slot.
+            (True, 256, 4096, 4096, 0, True, True, 2304, ("a", "b"), 0),
+            # A prefix under 128 tokens is replayed whole.
+            (True, 64, 4096, 64, 0, False, False, 2432, ("a", "b"), 0),
+            # Admission's re-match finds one more page than the reservation saw.
+            (True, 64, 4096, 4096, 64, False, False, 2304, ("a", "b"), 128),
+            # Same with a 64-token prefix: admission replays 64 more rows and
+            # extends 64 fewer, so the reservation from the shorter match is exact.
+            (True, 64, 4096, 64, 64, False, False, 2432, ("a", "b"), 0),
+            # One-token pages round nothing away. Only b's 128 replay rows push it
+            # past the room left after a, so b waits for the next chunk.
+            (True, 1, 1792, 4096, 0, False, False, 1152, ("a",), 0),
+        ):
+            with self.subTest(
+                encoder_replay=encoder_replay,
+                page_size=page_size,
+                chunk=chunk,
+                cached=cached,
+                rematched=rematched,
+                keeps_slot=keeps_slot,
+                retracted=retracted,
+            ):
+                adder = self.create_shortest_prefill_adder(
+                    chunk_tokens=chunk,
+                    encoder_replay=encoder_replay,
+                    page_size=page_size,
+                )
+                policy = SchedulePolicy(
+                    policy="shortest-prefill-first",
+                    tree_cache=RadixCache.create_simulated(),
+                    enable_hierarchical_cache=True,
+                    enable_priority_scheduling=False,
+                    schedule_low_priority_values_first=False,
+                )
+                continuation = self.create_shared_req("continuation")
+                continuation.full_untruncated_fill_ids = list(range(16384))
+                waiting = [self.create_shared_req("a"), self.create_shared_req("b")]
+                for req, uncached in zip(waiting, [512, 1024]):
+                    req.origin_input_ids = list(range(cached + uncached))
+                    req.full_untruncated_fill_ids = req.origin_input_ids
+                    req.num_matched_prefix_tokens = cached
+                    req.prefix_len = cached + rematched
+                    req.kv.req_pool_idx = 0 if keeps_slot else None
+                    req.is_retracted = retracted
+                adder.chunked_req_limit = policy.shortest_prefill_chunk_limit(
+                    continuation, waiting, adder.rem_chunk_tokens, adder.page_size
+                )
+                adder.add_chunked_req(continuation)
+                for req in waiting:
+                    adder.add_one_req(
+                        req, has_chunked_req=True, truncation_align_size=None
+                    )
+                self.assertEqual(
+                    [req.rid for req in adder.can_run_list],
+                    ["continuation", *admitted],
+                )
+                self.assertEqual(adder.rem_chunk_tokens, left)
+                self.assertEqual(continuation.extend_len, continuation_len)
 
     def test_shortest_prefill_rejects_second_unfinished_chunk(self):
         adder = self.create_shortest_prefill_adder(chunk_tokens=512)
