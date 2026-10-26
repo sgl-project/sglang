@@ -1,122 +1,74 @@
 # Ascend dynamic EPLB: validation scope
 
-Status as of 2026-10-26, after NPU migration validation and copy refinements.
-Community base: `de7055f59645ebe03784b0980e1f222789f468a3`.
+Status as of 2026-10-27. Production changes reviewed through `7d5854b5`;
+comparison base: `de7055f59645ebe03784b0980e1f222789f468a3`.
 
-## Implementation scope
+## Implementation
 
-The PR adapts EPLB to Ascend sender-route statistics, a dedicated HCCL
-communication group, and ND staging for internal-format expert weights.
-It preserves upstream rebalance scheduling; the earlier automatic 64-step
-initial learning policy is not included.
+This PR enables Ascend EPLB with valid sender-route statistics, a dedicated
+WORLD-membership HCCL group, and ND staging for internal-format expert weights.
+It retains upstream rebalance scheduling and thresholds; the earlier automatic
+64-step initial learning policy is excluded.
 
-Before migrating a chunk, NPU validates corresponding tensor counts, shapes,
-dtypes, devices, and staging requirements. Ordinary tensors bypass format conversion;
-unchanged local placements still participate in sends but skip ND writeback.
-Outside Elastic EP, a rank also skips staging and migration when its local
-placement is unchanged and no changed destination requests a local expert.
-Communication group initialization still precedes this per-rank early return.
-Receive buffers are reused within a chunk and are not cached between rebalances.
-ND staging retains each layer's conversion results directly. Writeback converts
-them to the destination format before copying into the original model storage.
-Outside Elastic EP, small BF16/FP32 auxiliary matrices (up to 64 KiB per expert
-row) are grouped by dtype once per layer. Large weights retain separate buffers;
-the original auxiliary tensors are updated in place after migration. Grouping
-depends on shape/dtype, allowing corresponding ranks to use different formats.
-NPU target forwards skip the draft guard's device lookup, and empty route
-tensors return before creating a buffer view or issuing a copy.
-Graphs without buffered routes omit inactive capture flags, letting replay skip
-the statistics-state restoration hook.
+- NPU statistics buffer small forwards across layers and count overflow directly.
+  Decode capture/replay restores the matching batching state. Prefill capture
+  uses direct counts, including warmups, and restores the previous policy on exit.
+  Draft forwards/capture are isolated from target counts.
+- Migration validates each local chunk before allocating workspaces. Unchanged
+  layers are skipped outside Elastic EP. Unchanged local placements still send
+  when needed, but skip writeback; ranks with provably no work skip migration.
+  Receive buffers are reused within a chunk.
+- Load retains the NZ-to-ND conversion result. Store converts to the original
+  format and copies into original model storage, preserving graph addresses.
+  Only the current layer's conversion results are retained.
+- Outside Elastic EP, small two-dimensional BF16/FP32 auxiliary matrices, up to
+  64 KiB per expert row, are grouped by dtype per layer. Large weights remain
+  separate. Group membership depends on shape/dtype, not rank-local NPU format.
+- Non-elastic target recorder initialization prewarms statistics and all-peer
+  P2P communication, then synchronizes before releasing the tiny buffers. Reuse
+  is cached by group identity. This moves channel setup to startup; it does not
+  remove its cost.
+- CPU static-dispatch construction converts candidates once and stores only the
+  current rank's result. Replica choice order and random-state consumption are
+  preserved; this adds no GPU forward work.
 
-Nine production files differ from the base: four NPU files and the shared
-recorder, placement metadata, weight updater, ModelRunner, and prefill backend factory. The shared
-EPLB manager and decode graph runner are unchanged from the base.
+Nine production files differ from the comparison base: four NPU files, plus
+shared recorder construction/signatures, placement metadata, the weight updater,
+ModelRunner's worker-identity argument, and the prefill-backend factory. Shared
+EPLBManager and the decode graph runner are unchanged. GPU retains its original
+recorder and device migration path; no NPU forward wrapper is installed on GPU.
 
-Static dispatch builds its CPU candidate lists once, retains only the current
-rank's result, and directly handles experts with one physical copy. Replicated
-experts retain the upstream choice order and random-number sequence. This adds
-no work to the GPU forward path.
+## Validation
 
-Non-elastic NPU EPLB warms the dedicated statistics and all-peer P2P channels
-during target recorder initialization. Tiny temporary buffers are synchronized
-before release. Completed warmups are cached by process-group identity; Elastic
-EP keeps its existing collective initialization order. This moves channel setup
-to startup rather than removing its cost, and does not change expert placement,
-rebalance intervals, or layer chunk defaults.
+These checks validate specific components, not the current full-model service.
+Source-extracted checks do not establish full-package import compatibility.
 
-NPU prefill capture temporarily uses direct route counting, so target graphs
-record count updates without depending on replay-time Python batching flags.
-The scope includes warmups and restores the previous policy on exceptions;
-decode retains buffered counting. Draft prefill capture remains isolated.
-
-## Validation status
-
-| Check | Status after migration refinements |
+| Evidence | Scope and result |
 | --- | --- |
-| Source and call-chain review | Completed; this is not execution validation. |
-| Formatting and static checks during cleanup | Completed; no functional result is implied. |
-| CPU unit suite and GPU regression after migration refinements | Not run. |
-| NPU full decode graph regression after cleanup | Not run. |
-| HCCL migration with the new staging paths | Latest source-extracted 16-rank checks passed with real NZ weights, auxiliary coalescing, sparse moves, and rank-dependent auxiliary formats; values, addresses, and formats checked. This is not full-package integration. |
-| Full-model correctness, PD acceptance, and performance after cleanup | Not run. |
+| Latest source review | Reviewed initialization order, WORLD group caching, sender participation, auxiliary wire grouping, and in-place writeback. Static review only. |
+| CPU static-dispatch equivalence | 3,936 real PyTorch CPU cases and 36 output/random-state comparisons passed. Synthetic 43-layer layouts: median function time 116.1 -> 14.1 ms and 109.2 -> 10.1 ms. |
+| Communication warmup | Standalone 16-rank Ascend 910C check, torch_npu 2.10.0.post6: payloads and cached reuse passed. Warmup cost 2,736.9 ms; first transfer 2.30 ms versus 2,175.0 ms in an independent cold group. |
+| Latest auxiliary coalescing | Source-extracted 16-rank weight update with real NZ weights, sparse moves and rank-dependent auxiliary formats passed value/address/format checks. Per-rank median one-layer time 24.99 -> 23.61 ms; slowest-rank median 26.45 -> 25.02 ms. |
+| Staging copy refinement | Earlier isolated 30-round check at INT8 shapes `[17,4096,4096]` and `[17,2048,4096]`: load Event median 2.083 -> 1.457 ms; store 3.383 -> 2.201 ms. Values and addresses checked. |
+| Other external checks | Idle-rank guard checked across 18,370 mocked CPU rank cases. Twelve auxiliary-staging CPU cases and a two-rank Gloo call-chain check passed. Prefill counting/draft/exception scopes passed a simulated-graph production-method probe. |
+| Formatting | Pinned Ruff 0.15.1 and isort 7.0.0 checks passed for the production revisions above. |
 
-The idle-rank guard passed an external CPU check against the unchanged shared
-migration planner across 18,370 rank cases. Values, addresses, and send/receive
-lists matched, including unchanged local senders and bypassing the guard for
-Elastic EP. Transport and group creation were mocked; this is not NPU/HCCL or
-service validation of the guard.
+No new test files are included. New prefill regression-test source and diagnostic
+probes are kept outside this PR. The existing graph-backend fixture retains only
+the required model-runner identity and empty EPLB capture state. The normal CPU
+unit suite was not run locally because the local Python has no PyTorch installation.
 
-An isolated 30-round paired check on Ascend 910C with torch_npu 2.10.0.post6
-used the observed INT8 shapes `[17,4096,4096]` and `[17,2048,4096]` (408 MiB).
-Median device Event time was 2.083 -> 1.457 ms for load and 3.383 -> 2.201 ms
-for store. These are staging microbenchmark results, not serving throughput.
-Full-size values and destination addresses were checked. A direct preallocated
-format-cast overload was slower at these shapes and was not adopted.
-Debug workspace bytes describe planned logical tensor storage, excluding
-allocator padding/caching and transient format-conversion allocations. Graph-statistics hooks
-are wired to the NPU full decode backend; other graph modes are not validated.
-
-CPU regression tests now cover direct prefill counts, restoration of decode
-batching, nested/exception scopes, and disabled draft recorders. The existing
-NPU backend fixture supplies the model-runner identity and an empty EPLB state.
-These tests require the normal SGLang CPU test environment; they were not run
-locally because the local Python has no PyTorch installation. A separate
-production-method extraction probe with simulated graph operations passed
-prefill replay counting, draft isolation, and policy restoration. This is not
-an actual NPU graph or full-package integration test.
-
-The static-dispatch optimization passed 3,936 real CPU PyTorch equivalence
-cases and 36 output/random-state comparisons. At synthetic 43-layer, 256-expert,
-272-slot layouts, median CPU function time changed from 116.1 to 14.1 ms and
-109.2 to 10.1 ms. This is not a serving throughput result.
-
-A standalone 16-rank Ascend 910C check with torch_npu 2.10.0.post6 validated
-communication warmup, payloads, and cached reuse: warmup took 2736.9 ms, and the
-first all-peer INT8 transfer in the prewarmed group took 2.30 ms versus 2175.0 ms
-in an independent cold group. No model was loaded or restarted for this check.
-An earlier all-tensor packing prototype was slower including pack/unpack and was
-not adopted. Full-model startup integration and serving performance remain untested.
-
-Per-layer auxiliary coalescing passed a separate 16-rank check using the actual
-16 MiB/8 MiB INT8 weights and 48 KiB BF16/FP32 auxiliary data per expert.
-The latest production-method check included NZ conversion, shared migration,
-and in-place writeback. Median per-rank one-layer time changed from 24.99 to
-23.61 ms; taking the slowest rank per iteration gave 26.45 to 25.02 ms.
-These are synthetic weight-update results, not serving throughput. Twelve
-external CPU cases covered mixed widths/dtypes, strided tensors, and disabling
-coalescing. Full-model graph replay and 43-layer service behavior were not rerun.
-
-Earlier migration tests and manual probes remain available in the
-[historical test tree](https://github.com/AkiYangDev/sglang/tree/46393a1ce8359fc226704702b14a157dfa77c7ee/test).
-The copy probes and 16-rank checks ran outside the PR.
+The current production revision has **not** passed full-model startup with the
+new warmup, migration followed by NPU graph replay, GPU regression, or matched
+PD throughput/accuracy testing. Explicit prefill graph modes also need device
+validation. No serving-throughput or model-accuracy improvement is claimed.
+Load/store helper timings now include auxiliary packing/unpacking, so their
+envelopes must not be reported as pure format-conversion time. Debug workspace
+bytes exclude allocator padding/caching and transient conversion allocations.
 
 ## Historical evidence
 
-The [archived report and its linked data](https://github.com/AkiYangDev/sglang/blob/4fa073523c5f1113375fac08242cbe99571f1cf8/test/manual/ep/reports/ascend_dynamic_eplb_upstream_20261024.md)
-retain earlier source identities, CPU/NPU results, performance tables,
-screenshots, and failure records. The report's references to "current source"
-describe those historical revisions, not this PR head.
-
-Those runs preceded subsequent cleanup, adapter consolidation, and removal of the
-initial learning policy. They are not validation of this implementation, and
-no throughput gain or full-model accuracy result is claimed for it.
+The [archived report](https://github.com/AkiYangDev/sglang/blob/4fa073523c5f1113375fac08242cbe99571f1cf8/test/manual/ep/reports/ascend_dynamic_eplb_upstream_20261024.md)
+and [historical test tree](https://github.com/AkiYangDev/sglang/tree/46393a1ce8359fc226704702b14a157dfa77c7ee/test)
+retain older runs and probes. They precede subsequent cleanup and do not validate
+this production revision. Full-model acceptance remains pending.
