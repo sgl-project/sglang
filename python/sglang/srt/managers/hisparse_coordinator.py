@@ -1238,12 +1238,19 @@ class HiSparseCoordinator:
             self.decode_backup_stream.wait_stream(schedule_stream)
             if self.decode_producer_stream is not None:
                 self.decode_backup_stream.wait_stream(self.decode_producer_stream)
-            self.mem_pool_host.backup_from_device_all_layer(
-                self.mem_pool_device,
-                host_locs,
-                device_locs,
-                io_backend="kernel",
-            )
+            if self.is_dsv4_hisparse:
+                # One scattered token per request: a multiple of the page size
+                # must not be mistaken for whole pages.
+                self.mem_pool_host.backup_tokens_from_device_all_layer(
+                    host_locs, device_locs
+                )
+            else:
+                self.mem_pool_host.backup_from_device_all_layer(
+                    self.mem_pool_device,
+                    host_locs,
+                    device_locs,
+                    io_backend="kernel",
+                )
             self._backup_done_event.record()
             if host_locs.is_cuda:
                 host_locs.record_stream(self.decode_backup_stream)
