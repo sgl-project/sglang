@@ -36,8 +36,10 @@ class TestNPURadixEvictionPolicyConfig(CustomTestCase):
     _PROTECTED_THRESHOLD = 4
     _SHARED_PROMPT = "What is the capital of France? " * 36
     # Distinct first token from _SHARED_PROMPT so the two prefixes never share
-    # radix-cache nodes, keeping their hit counts independent.
-    _VICTIM_PROMPT = "Explain the theory of general relativity in detail " * 14
+    # radix-cache nodes, keeping their hit counts independent. Repeats are
+    # chosen long enough to survive page-aligned prefix matching (a too-short
+    # prompt is floored to a 0-length key and never cached).
+    _VICTIM_PROMPT = "Explain the theory of general relativity in detail " * 36
 
     @classmethod
     def setUpClass(cls):
