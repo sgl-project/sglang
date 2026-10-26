@@ -1154,6 +1154,9 @@ class Envs:
     # Experimental Kimi K3 NVFP4 optimizations; each path checks its coverage.
     SGLANG_K3_NVFP4_ROUTE_QUANT = EnvBool(True)
     SGLANG_K3_NVFP4_CAKE = EnvBool(False)
+    # Run the routed experts on Cake over its measured win ranges, padding the
+    # token count up to the next qualified Cake shape (k3_nvfp4_cake).
+    SGLANG_K3_NVFP4_CAKE_PAD = EnvBool(False)
     SGLANG_K3_NVFP4_TP_SHARED_OVERLAP = EnvBool(False)
     SGLANG_K3_FP8_DENSE_SHAPE_DISPATCH = EnvBool(True)
     SGLANG_K3_EARLY_SHARED_FORK = EnvBool(True)

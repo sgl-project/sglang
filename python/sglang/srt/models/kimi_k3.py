@@ -1319,10 +1319,38 @@ class KimiK3MoE(nn.Module):
             )
         )
 
+    def _cake_tokens(self, num_tokens: int) -> Optional[int]:
+        """Token count the routed experts run at on Cake, or None for trtllm-gen."""
+        if envs.SGLANG_K3_NVFP4_CAKE.get():
+            return num_tokens
+        if envs.SGLANG_K3_NVFP4_CAKE_PAD.get():
+            from sglang.srt.layers.moe.k3_nvfp4_cake import padded_tokens
+
+            return padded_tokens(num_tokens)
+        return None
+
+    def _use_cake(self, num_tokens: int) -> bool:
+        return self._cake_tokens(num_tokens) is not None
+
+    def _dense_routed_input(self, routed_input: torch.Tensor, dtype) -> torch.Tensor:
+        """Dense copy of routed_input; padded underneath when Cake runs at a
+        larger token count, so the cast fills Cake's input buffer directly."""
+        num_tokens = routed_input.shape[0]
+        cake_tokens = self._cake_tokens(num_tokens)
+        if cake_tokens is None or cake_tokens == num_tokens:
+            return routed_input.to(dtype).contiguous()
+        padded = routed_input.new_empty(
+            (cake_tokens, routed_input.shape[1]), dtype=dtype
+        )
+        padded[num_tokens:].zero_()
+        padded[:num_tokens].copy_(routed_input)
+        return padded[:num_tokens]
+
     def _nvfp4_route_quant_shape(self, x: torch.Tensor) -> bool:
         return (
             self._nvfp4_route_quant_eligible
             and x.ndim == 2
+            and not self._use_cake(x.shape[0])
             and 0 < x.shape[0] <= 64
             and x.shape[1] == 3584
             and x.dtype in (torch.bfloat16, torch.float32)
@@ -1369,10 +1397,17 @@ class KimiK3MoE(nn.Module):
         try:
             topk_output = self.topk(hidden_states, router_logits)
             routed_input = self._repair_nvfp4_prep_miss(routed_input, nv_attempt)
-            if envs.SGLANG_K3_NVFP4_CAKE.get():
+            cake_tokens = self._cake_tokens(routed_input.shape[0])
+            if cake_tokens is not None:
                 from sglang.srt.layers.moe.k3_nvfp4_cake import try_cake_situ
 
-                if try_cake_situ(self.experts, routed_input, topk_output, latent):
+                if try_cake_situ(
+                    self.experts,
+                    routed_input,
+                    topk_output,
+                    latent,
+                    cake_tokens=cake_tokens,
+                ):
                     return
             with zero_copy_context.set_moe_output(latent):
                 expert_output = self.experts(routed_input, topk_output)
@@ -1488,7 +1523,9 @@ class KimiK3MoE(nn.Module):
             if self._moe_front_needs_dense_bf16 and not self._nvfp4_route_quant_shape(
                 routed_input
             ):
-                routed_input = routed_input.to(hidden_states.dtype).contiguous()
+                routed_input = self._dense_routed_input(
+                    routed_input, hidden_states.dtype
+                )
         else:
             fused = _k3_bf16_gemm(
                 hidden_states,
@@ -1505,7 +1542,9 @@ class KimiK3MoE(nn.Module):
             ):
                 # off an fp32 front the cast allocates the dense buffer, so the
                 # contiguous() behind it is free; off a bf16 front it is the copy
-                routed_input = routed_input.to(hidden_states.dtype).contiguous()
+                routed_input = self._dense_routed_input(
+                    routed_input, hidden_states.dtype
+                )
         fused_norm = False
         if self.alt_stream is not None and k3_ar_fusion.enabled():
             defer_finalize = (
@@ -1578,7 +1617,7 @@ class KimiK3MoE(nn.Module):
                     False,
                 )
                 and self.experts.moe_ep_size == 1
-                and not envs.SGLANG_K3_NVFP4_CAKE.get()
+                and not self._use_cake(num_tokens)
             )
             if overlap_shared:
                 # Both branches read the merged front and write disjoint slices

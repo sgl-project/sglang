@@ -16,6 +16,19 @@ _workspaces = {}
 # Qualified on actual layer-12 TP0 weights; M112 regresses against TRTLLM.
 _QUALIFIED_TOKENS = (1, 8, 16, 32, 64, 128)
 
+# Token counts that run Cake padded up to the next qualified count. Layer-12
+# TP0 shard, uniform top-16 routing, every M in 1..64 and 72..128 by 8, net of
+# the radix top-k + bf16 latent cast Cake needs and the fused route+quant it
+# gives up (SGLANG_K3_NVFP4_ROUTE_QUANT): M <= 4 and 33..40 favor trtllm-gen.
+_PAD_RANGES = ((5, 32), (41, 128))
+
+
+def padded_tokens(num_tokens: int):
+    """Cake token count for ``num_tokens`` routed tokens, or None for trtllm-gen."""
+    if not any(lo <= num_tokens <= hi for lo, hi in _PAD_RANGES):
+        return None
+    return next(t for t in _QUALIFIED_TOKENS if t >= num_tokens)
+
 
 @triton.jit
 def _finalize_fp32(expert, weights, mapping, out, H: tl.constexpr, B: tl.constexpr):
@@ -39,9 +52,9 @@ def _prepare_prefix(workspace, num_tokens):
     prepared = _prepared(workspace, num_tokens)
     assert prepared["stages"][-1] == "finalize"
     fc2_args = MODULES[prepared["modules"]["fc2"]]["arg_plan"]
-    assert all(name != "partial_scale" for _, name in fc2_args), (
-        "Q8 partials need a different finalizer"
-    )
+    assert all(
+        name != "partial_scale" for _, name in fc2_args
+    ), "Q8 partials need a different finalizer"
     submit, full_plan, full_slots = prepared["submit"]
     finalizer_header = (
         len(cake_situ_stage_entries(prepared["modules"]["finalize"], prepared["arch"]))
@@ -77,7 +90,7 @@ def _run_fp32_prefix(state, layer, x, ids, weights, out):
         plan[index] = call[name]
     with tvm_ffi.use_torch_stream():
         submit(*plan)
-    _finalize_fp32[(x.shape[0], triton.cdiv(x.shape[1], 256))](
+    _finalize_fp32[(out.shape[0], triton.cdiv(x.shape[1], 256))](
         expert_output,
         weights,
         mapping,
@@ -88,13 +101,30 @@ def _run_fp32_prefix(state, layer, x, ids, weights, out):
     )
 
 
-def try_cake_situ(layer, x, routing, out, *, max_tokens=128):
+def try_cake_situ(layer, x, routing, out, *, max_tokens=128, cake_tokens=None):
     """Write the rank-local expert result, or return False for unsupported input.
 
     The model remains responsible for shared experts, all-reduce and latent
     normalization. This path intentionally does not handle deferred finalize.
+
+    ``cake_tokens`` > ``x.shape[0]`` runs Cake at that padded count: ``x`` must
+    then be the leading rows of a contiguous ``[cake_tokens, hidden]`` buffer
+    whose tail rows are finite. Padded rows reuse row 0's experts, so they read
+    no extra expert weights, and the finalize only writes the real rows.
     """
     global _logged_enabled
+
+    num_tokens = x.shape[0]
+    cake_tokens = cake_tokens or num_tokens
+    if cake_tokens > num_tokens:
+        if not (
+            x.is_contiguous()
+            and x.untyped_storage().nbytes()
+            >= x.storage_offset() * x.element_size()
+            + cake_tokens * x.shape[1] * x.element_size()
+        ):
+            return False
+        x = torch.as_strided(x, (cake_tokens, x.shape[1]), (x.shape[1], 1))
 
     config = layer.moe_runner_config
     method = layer.quant_method
@@ -115,7 +145,7 @@ def try_cake_situ(layer, x, routing, out, *, max_tokens=128):
         and x.dtype == torch.bfloat16
         and x.is_cuda
         and x.is_contiguous()
-        and out.shape == x.shape
+        and out.shape == (num_tokens, x.shape[1])
         and out.device == x.device
         and out.dtype == x.dtype
         and out.is_contiguous()
@@ -147,7 +177,7 @@ def try_cake_situ(layer, x, routing, out, *, max_tokens=128):
         routing = routing.to_standard()
     if not TopKOutputChecker.format_is_standard(routing):
         return False
-    if routing.topk_ids.shape != (x.shape[0], 16):
+    if routing.topk_ids.shape != (num_tokens, 16):
         return False
 
     stream = torch.cuda.current_stream(x.device)
@@ -181,11 +211,14 @@ def try_cake_situ(layer, x, routing, out, *, max_tokens=128):
         )
         _logged_enabled = True
 
+    ids = routing.topk_ids.to(torch.int32)
+    if cake_tokens > num_tokens:
+        ids = torch.cat([ids, ids[:1].expand(cake_tokens - num_tokens, -1)])
     _run_fp32_prefix(
         prefix,
         layer,
         x,
-        routing.topk_ids.to(torch.int32).contiguous(),
+        ids.contiguous(),
         routing.topk_weights.contiguous(),
         out,
     )
