@@ -363,7 +363,17 @@ def prefill_requests(
     ratio = inputs.compress_ratio
     indexer = inputs.indexer
     req, pos = inputs.req_rows, inputs.positions
-    assert req is not None, "the torch indexer needs the batch's rows"
+    if req is None:
+        # CP query rows are rank-local and remain grouped by request.
+        assert inputs.rows_per_request is not None
+        repeats = inputs.rows_per_request_device
+        if repeats is None:
+            repeats = async_h2d(
+                inputs.rows_per_request, dtype=torch.int32, device=pos.device
+            )
+        req = torch.repeat_interleave(
+            inputs.req_pool_indices, repeats, output_size=pos.numel()
+        )
     assert inputs.seq_lens_cpu is not None
     # First flattened-K column of each request row, as inputs.k_slots lays them out.
     k_starts = dict(
@@ -388,6 +398,12 @@ def prefill_requests(
         slots = inputs.k_slots[k_starts[r] : k_starts[r] + lc]
         # Dequantize only this request's visible K rows; the table is pool-sized.
         index_k = pool.get_low_ratio_index_k_dequant(inputs.layer_id, slots)
+        # Keep BF16 GEMM output rows aligned for Hopper tensor-core kernels.
+        # Pad K once per request; padded positions never enter selection.
+        if index_k.is_cuda and index_k.dtype == torch.bfloat16 and lc >= 1024:
+            score_width = (lc + 63) // 64 * 64
+            if score_width != lc:
+                index_k = torch.nn.functional.pad(index_k, (0, 0, 0, score_width - lc))
         request = RequestScores(
             lc=lc, k=min(topk, lc), columns=j, tok=tok, lens=lens, slots=slots
         )
@@ -409,11 +425,13 @@ def _score_chunks(
 ) -> Iterator[ChunkScores]:
     lc, j = request.lc, request.columns
     # Chunk rows so the [rows, heads, lc] bf16 scores stay under the budget.
-    rows_per_chunk = max(1, _TORCH_SCORE_BUDGET_BYTES // (q.shape[1] * lc * 2))
+    rows_per_chunk = max(
+        1, _TORCH_SCORE_BUDGET_BYTES // (q.shape[1] * index_k.shape[0] * 2)
+    )
     for start in range(0, request.tok.numel(), rows_per_chunk):
         rows = slice(start, start + rows_per_chunk)
         tok_c, lens_c = request.tok[rows], request.lens[rows]
-        s = indexer.scores(q[tok_c], index_k, weights[tok_c])
+        s = indexer.scores(q[tok_c], index_k, weights[tok_c])[:, :lc]
         s = s.masked_fill(j[None, :] >= lens_c[:, None], -torch.inf)
         yield ChunkScores(rows=rows, tok=tok_c, lens=lens_c, scores=s)
 

@@ -212,6 +212,7 @@ def build_replay_fb_view(
         seq_lens_cpu=(
             None if forward_batch.seq_lens_cpu is None else buffers.seq_lens_cpu[:bs]
         ),
+        max_seq_len_host=forward_batch.max_seq_len_host,
         num_padding=bs - raw_bs,
         encoder_lens=buffers.encoder_lens[:bs] if is_encoder_decoder else None,
         out_cache_loc=getattr(forward_batch, "out_cache_loc", None),

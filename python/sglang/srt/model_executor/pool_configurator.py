@@ -29,6 +29,7 @@ from sglang.srt.configs.model_config import (
     is_deepseek_dsa,
     is_deepseek_v4,
     is_minimax_sparse,
+    uses_minimax_m3_nvfp4_native_stack,
 )
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_len_per_decode
@@ -504,6 +505,25 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
                 full_pool_ratio = parse_hisparse_config().host_to_device_ratio
+
+            # Must match the pool class picked in _build_minimax_sparse_kv_pool;
+            # the packed layout is about four times smaller per token.
+            if uses_minimax_m3_nvfp4_native_stack(model_config.quantization):
+                from sglang.srt.mem_cache.minimax_m3_nvfp4_pool import (
+                    MSA_V1_PAGE_SIZE,
+                    msa_v1_page_row_bytes,
+                )
+
+                # Each sparse layer stores one aligned main row and one index row per page.
+                return (
+                    num_sparse
+                    * sum(
+                        msa_v1_page_row_bytes(
+                            kv_heads, head_dim, indexer_head_dim, MSA_V1_PAGE_SIZE
+                        )
+                    )
+                    // MSA_V1_PAGE_SIZE
+                )
 
             main_pool_bytes = (
                 (num_dense * full_pool_ratio + num_sparse)
