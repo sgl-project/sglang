@@ -54,6 +54,10 @@ from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 from sglang.multimodal_gen.runtime.managers.pi05_segment_scheduler import (
     Pi05SegmentSchedulerMixin,
 )
+from sglang.multimodal_gen.runtime.managers.progress_reporter import (
+    get_progress_reporter,
+    init_progress_reporter,
+)
 from sglang.multimodal_gen.runtime.observability.metrics import DiffusionMetrics
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.request_utils import (
@@ -162,6 +166,10 @@ class Scheduler(
                 f"Scheduler (dp replica {self.dp_replica}) bind at endpoint: "
                 f"{actual_endpoint}"
             )
+            if server_args.progress_endpoint is not None:
+                init_progress_reporter(
+                    context=self.context, endpoint=server_args.progress_endpoint
+                )
         else:
             self.receiver = None
         from sglang.multimodal_gen.runtime.platforms import current_platform
@@ -346,6 +354,11 @@ class Scheduler(
         warmup_reqs = [req for req in reqs if req.is_warmup]
         if warmup_reqs:
             self._ensure_warmup_progress_bar(warmup_reqs[0])
+        progress_reporter = get_progress_reporter()
+        if progress_reporter is not None:
+            for req in reqs:
+                if req.report_progress and not req.is_warmup:
+                    progress_reporter.start(request_ids=req.client_request_ids())
 
         # Use the head request trace context for scheduler-side dispatch work.
         req = reqs[0]
@@ -1074,6 +1087,12 @@ class Scheduler(
                         req.output_file_path(req.num_outputs_per_prompt, output_idx)
                     )
             merged_req.extra["dynamic_batch_output_paths"] = dynamic_output_paths
+        merged_req.merged_request_ids = [
+            req.request_id
+            for req in reqs
+            if req.report_progress and req.request_id is not None
+        ]
+        merged_req.report_progress = bool(merged_req.merged_request_ids)
         merged_req.request_id = f"dynamic_batch::{merged_req.request_id}"
 
         return merged_req
