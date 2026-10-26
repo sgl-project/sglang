@@ -42,12 +42,10 @@ from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.mem_cache import kv_cache_configurator as kcc
 from sglang.srt.mem_cache import unified_draft_pool
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
-from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
-    UnifiedSWATokenToKVPoolAllocator,
-)
 from sglang.srt.mem_cache.base_prefix_cache import DecLockRefParams
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import checkpoint_kv_cache
+from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
 from sglang.srt.mem_cache.kv.layout.base import _store_dtype_for
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
 from sglang.srt.mem_cache.layout.fused_draft import (
@@ -209,7 +207,8 @@ class TestDraftBindingDispatch(CustomTestCase):
                 else None
             ),
         )
-        return UnifiedSWATokenToKVPoolAllocator(
+        return ChainAllocator(
+            roles=ChainRoles(owner="full", window="swa"),
             unified_buffer=pool,
             kvcache=_FakeUnifiedSWAKVPool(pool),
             device="cpu",

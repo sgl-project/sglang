@@ -23,7 +23,7 @@ class TestDynamicGateCapacity(CustomTestCase):
         setup_allocator_context()
 
     def assert_dynamic_views(self, allocator, state):
-        members = allocator._move_gate_targets()
+        members = allocator.members
         immediate = [x.available_size() for x in members]
         epochs = [x._chain_capacity_epoch() for x in members]
         observed = []

@@ -12,10 +12,8 @@ import torch
 
 from sglang.kernels.ops.kvcache.kv_read_table import build_kv_read_table
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
-    UnifiedMambaSWATokenToKVPoolAllocator,
-)
 from sglang.srt.mem_cache.allocator.unified_sub_pool import MultiEndedAllocator
+from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
@@ -167,10 +165,11 @@ def _build_tri(device, page_size=4):
         ),
         attach_allocators=lambda **_: None,
     )
-    allocator = UnifiedMambaSWATokenToKVPoolAllocator(
+    allocator = ChainAllocator(
+        roles=ChainRoles(owner="full", window="swa", state="mamba"),
         unified_buffer=buf,
         kvcache=kvcache,
-        mamba_kvcache=SimpleNamespace(move_kv_cache=lambda dst, src: None),
+        state_kvcache=SimpleNamespace(move_kv_cache=lambda dst, src: None),
         device=device,
         full_max_total_num_tokens=n_full,
         swa_max_total_num_tokens=n_swa,

@@ -30,9 +30,7 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
-    UnifiedSWATokenToKVPoolAllocator,
-)
+from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
 from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
@@ -114,7 +112,8 @@ def _build(n_full=32, n_swa=16, *, swa_region=None):
         fused_draft=FusedDraftPlacement.from_counts(counts=counts, regions=regions),
     )
     kvcache = _FakeUnifiedSWAKVPool(pool)
-    allocator = UnifiedSWATokenToKVPoolAllocator(
+    allocator = ChainAllocator(
+        roles=ChainRoles(owner="full", window="swa"),
         unified_buffer=pool,
         kvcache=kvcache,
         device=_DEV,

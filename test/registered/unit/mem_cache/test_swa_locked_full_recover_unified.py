@@ -32,9 +32,7 @@ import unittest
 import torch
 from test_multi_ended_allocator import _FakeUnifiedSWAKVPool  # sibling fixture
 
-from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
-    UnifiedSWATokenToKVPoolAllocator,
-)
+from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     RecoverEvictedSWA,
@@ -76,7 +74,8 @@ def _build_swa_composite(n_full=64, n_swa=64):
         enable_memory_saver=False,
     )
     kvcache = _FakeUnifiedSWAKVPool(pool)
-    allocator = UnifiedSWATokenToKVPoolAllocator(
+    allocator = ChainAllocator(
+        roles=ChainRoles(owner="full", window="swa"),
         unified_buffer=pool,
         kvcache=kvcache,
         device=_DEV,
@@ -155,7 +154,7 @@ class _StaticAllocRecorder:
 class _RecoverTestBase(unittest.TestCase):
     def _probe(self):
         allocator = _build_swa_composite()
-        self.assertIsInstance(allocator, UnifiedSWATokenToKVPoolAllocator)
+        self.assertIsInstance(allocator, ChainAllocator)
         return _Probe(allocator), allocator
 
     def _two_ranges(self, allocator, n=4):
