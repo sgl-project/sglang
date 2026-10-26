@@ -5,6 +5,8 @@
 import importlib
 import logging
 import pkgutil
+import re
+import warnings
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import AbstractSet, Dict, List, Optional, Tuple, Type, Union
@@ -114,6 +116,22 @@ class _ModelRegistry:
         return self._raise_for_unsupported(architectures)
 
 
+def _import_model_module(name: str):
+    # Discovery imports TorchScript decorators from unused models and timm.
+    with warnings.catch_warnings():
+        for message in (
+            "`torch.jit.script` is deprecated. Please switch to `torch.compile` or `torch.export`.",
+            "`torch.jit.interface` is deprecated. Please use `torch.compile` instead.",
+        ):
+            warnings.filterwarnings(
+                "ignore",
+                message=re.escape(message) + "$",
+                category=FutureWarning,
+                module=r"torch\.jit\._script$",
+            )
+        return importlib.import_module(name)
+
+
 @lru_cache()
 def import_model_classes(package_name: str, strict: bool = False):
     model_arch_name_to_cls = {}
@@ -125,7 +143,7 @@ def import_model_classes(package_name: str, strict: bool = False):
                 continue
 
             try:
-                module = importlib.import_module(name)
+                module = _import_model_module(name)
             except Exception as e:
                 if strict:
                     raise
