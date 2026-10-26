@@ -3,7 +3,7 @@
 import contextlib
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -80,6 +80,80 @@ class TestDraftDistributionIsolation(unittest.TestCase):
             with self.recorder.with_current_layer(0):
                 self.count(2)
         self.assertEqual(self.total().sum().item(), 2)
+
+    def test_nextn_direct_model_forward_keeps_model_level_isolation(self):
+        # Draft-extend graphs call model.forward directly, bypassing ModelRunner.
+        # Exercise NextN's own guard; this is not an NPU graph execution test.
+        from sglang.srt.models import deepseek_nextn as nextn
+
+        hidden = torch.ones(1, 2)
+        batch = SimpleNamespace(
+            spec_info=SimpleNamespace(hidden_states=hidden),
+            forward_mode=SimpleNamespace(is_idle=lambda: False),
+        )
+        model = SimpleNamespace(
+            quant_config=None,
+            rot_weight=None,
+            enorm=torch.nn.Identity(),
+            hnorm=torch.nn.Identity(),
+            eh_proj=lambda value: value[:, :2],
+            shared_head=SimpleNamespace(norm=torch.nn.Identity()),
+        )
+        residual = Mock(
+            complete_output=lambda value, batch: value,
+            final_norm=lambda value, batch, norm: norm(value),
+        )
+        with (
+            patch.object(nextn, "_is_npu", True),
+            patch.object(nextn, "_is_cuda", False),
+            patch.object(
+                nextn, "get_model", return_value=SimpleNamespace(quantization=None)
+            ),
+            patch.object(nextn, "BumpAllocator", return_value=object()),
+            patch.object(nextn, "residual_batch", residual),
+            patch.object(
+                nextn.IndexTopKShareState,
+                "from_mtp_carry",
+                return_value=Mock(topk_indices=None),
+            ),
+            patch.object(
+                nextn,
+                "get_global_expert_distribution_recorder",
+                return_value=self.recorder,
+            ),
+        ):
+            for step, fail in enumerate((False, True), 1):
+
+                def decoder(positions, value, *args, **kwargs):
+                    self.assertTrue(self.recorder._disable_all)
+                    self.count(99)
+                    if fail:
+                        raise RuntimeError("draft failed")
+                    return value, None
+
+                model.decoder = decoder
+                with (
+                    self.subTest(fail=fail),
+                    self.recorder.with_forward_pass(step, batch),
+                ):
+                    with self.recorder.with_current_layer(0):
+                        self.count(3)
+                        expectation = (
+                            self.assertRaisesRegex(RuntimeError, "draft failed")
+                            if fail
+                            else contextlib.nullcontext()
+                        )
+                        with expectation:
+                            nextn.DeepseekModelNextN.forward(
+                                model,
+                                torch.tensor([0]),
+                                torch.tensor([0]),
+                                batch,
+                                input_embeds=hidden,
+                            )
+                        self.assertFalse(self.recorder._disable_all)
+                        self.count(1)
+                self.assertEqual(self.total().sum().item(), step * 4)
 
     def runner(self, is_draft):
         from sglang.srt.model_executor import model_runner as module

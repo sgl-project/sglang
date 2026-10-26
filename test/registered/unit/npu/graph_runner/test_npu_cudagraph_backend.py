@@ -1,15 +1,18 @@
 """CPU unit tests for the NPU CUDA-graph backend's Python orchestration."""
 
 import unittest
-from types import SimpleNamespace
+from contextlib import nullcontext
+from types import ModuleType, SimpleNamespace
 from unittest import mock
 
 import torch
 
+from sglang.srt.eplb import expert_distribution as distribution
 from sglang.srt.hardware_backend.npu import eplb_statistics
 from sglang.srt.hardware_backend.npu.graph_runner import npu_cudagraph_backend as mod
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, publish
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
@@ -31,6 +34,67 @@ def _make_backend():
 
 
 class TestNPUCudaGraphBackend(unittest.TestCase):
+    def test_capture_one_resets_offsets_and_first_forward_discards_warmups(self):
+        publish(
+            ServerArgs(
+                model_path="dummy",
+                device="cpu",
+                expert_distribution_recorder_mode="stat",
+                expert_distribution_recorder_buffer_size=4,
+            ),
+            role="test",
+        )
+        metadata = SimpleNamespace(
+            num_layers=2, num_physical_experts=8, num_local_physical_experts=4
+        )
+        with mock.patch.object(distribution, "get_device", return_value="cpu"):
+            gatherer = eplb_statistics.NpuExpertDistributionGatherer(metadata, 0)
+        with mock.patch.object(
+            distribution._SinglePassGatherer, "init_new", return_value=gatherer
+        ):
+            recorder = eplb_statistics.NpuExpertDistributionRecorder(metadata, 0)
+        recorder.start_record()
+        backend, _ = _make_backend()
+        self.addCleanup(backend.cleanup)
+        fake_npu = SimpleNamespace(
+            NPUGraph=mock.Mock(), graph=lambda *args, **kwargs: nullcontext()
+        )
+        warmup_hook = mock.Mock()
+        with (
+            mock.patch.dict("sys.modules", {"torch_npu": ModuleType("torch_npu")}),
+            mock.patch.object(torch, "npu", fake_npu, create=True),
+            mock.patch.object(
+                distribution,
+                "get_global_expert_distribution_recorder",
+                return_value=recorder,
+            ),
+        ):
+            for count in (3, 1):
+                calls = []
+
+                def forward():
+                    # Missing any warmup/capture reset leaves a nonzero offset.
+                    self.assertEqual(gatherer._route_offsets, [0, 0])
+                    with recorder.with_current_layer(0):
+                        recorder.on_select_experts(torch.full((count,), 2))
+                    calls.append(True)
+                    return count
+
+                key = ShapeKey(size=count)
+                backend.capture_one(key, forward, post_warmup_hook=warmup_hook)
+                self.assertEqual(len(calls), 3)
+                self.assertTrue(any(backend._eplb_capture_states[key].values()))
+                self.assertEqual(backend._outputs[key], count)
+        self.assertEqual(warmup_hook.call_count, 4)
+        with recorder.with_forward_pass(1, SimpleNamespace()):
+            with recorder.with_current_layer(1):
+                recorder.on_select_experts(torch.tensor([7]))
+        counts = recorder._accumulator._global_physical_count_of_buffered_step.get_all()
+        total = counts.sum(0)
+        expected = torch.zeros_like(total)
+        expected[1, 7] = 1
+        torch.testing.assert_close(total, expected)
+
     def test_replay_update_converts_legacy_sequence_lengths_to_int32_tensor(self):
         backend, runner = _make_backend()
         graph = mock.Mock()

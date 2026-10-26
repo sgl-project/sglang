@@ -24,7 +24,14 @@ class TestNpuExpertDistribution(unittest.TestCase):
             num_layers=2, num_physical_experts=8, num_local_physical_experts=4
         )
         self.configure()
+        buffer_factory = distribution._Buffer.init_new
+
+        def cpu_buffer(item_shape, buffer_size, dtype, device):
+            # Keep the NPU factory decision, but allocate the real history on CPU.
+            return buffer_factory(item_shape, buffer_size, dtype, device="cpu")
+
         for item in (
+            patch.object(distribution._Buffer, "init_new", side_effect=cpu_buffer),
             patch.object(distribution, "get_device", return_value="cpu"),
             patch.object(
                 distribution,
@@ -54,6 +61,10 @@ class TestNpuExpertDistribution(unittest.TestCase):
     def recorder(self):
         result = distribution.ExpertDistributionRecorder.init_new(self.metadata, rank=1)
         self.assertIs(type(result), NpuExpertDistributionRecorder)
+        self.assertEqual(
+            result._accumulator._global_physical_count_of_buffered_step.get_all().device.type,
+            "cpu",
+        )
         result.start_record()
         return result
 

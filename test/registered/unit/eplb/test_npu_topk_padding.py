@@ -36,6 +36,17 @@ class TestNpuTopKPadding(unittest.TestCase):
             role="test",
         )
         initialize_moe_config()
+        buffer_factory = distribution._Buffer.init_new
+
+        def cpu_buffer(item_shape, buffer_size, dtype, device):
+            # Only the allocation device is replaced; window behavior stays real.
+            return buffer_factory(item_shape, buffer_size, dtype, device="cpu")
+
+        buffer_patch = patch.object(
+            distribution._Buffer, "init_new", side_effect=cpu_buffer
+        )
+        buffer_patch.start()
+        self.addCleanup(buffer_patch.stop)
         for module, attr, value in (
             (topk, "_is_npu", True),
             (topk, "_is_cuda", False),
@@ -78,6 +89,10 @@ class TestNpuTopKPadding(unittest.TestCase):
             rank=0,
         )
         distribution.set_global_expert_distribution_recorder(result)
+        self.assertEqual(
+            result._accumulator._global_physical_count_of_buffered_step.get_all().device.type,
+            "cpu",
+        )
         result.start_record()
         return result
 
