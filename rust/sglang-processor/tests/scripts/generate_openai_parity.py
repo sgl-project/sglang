@@ -267,6 +267,28 @@ def run_case(case, settings, model, engine_url, defaults, sampling_defaults):
     return recorded
 
 
+def keep_volatile(new, old):
+    """`new`, with the `created` times and `call_` ids of `old`, its previous
+    recording, where they line up, so a rerun changes only what Python changed.
+    """
+    if isinstance(new, dict) and isinstance(old, dict):
+        kept = {}
+        for key, value in new.items():
+            previous = old.get(key)
+            volatile = key == "created" or (
+                key == "id"
+                and str(value).startswith("call_")
+                and str(previous).startswith("call_")
+            )
+            kept[key] = (
+                previous if volatile and key in old else keep_volatile(value, previous)
+            )
+        return kept
+    if isinstance(new, list) and isinstance(old, list):
+        return [keep_volatile(n, o) for n, o in zip(new, old)] + new[len(old) :]
+    return new
+
+
 def load_template_manager(path, tokenizer, hf_config):
     """The server's `TemplateManager` for a checkpoint with a Jinja template."""
     if not tokenizer.chat_template:
@@ -343,9 +365,12 @@ def generate(path, model, engine_url):
         if case.get("unsupported"):
             continue
         sampling_defaults = fixture["sampling_defaults"][case["endpoint"]]
-        case.update(
-            run_case(case, settings, model, engine_url, defaults, sampling_defaults)
+        recorded = run_case(
+            case, settings, model, engine_url, defaults, sampling_defaults
         )
+        if "openai" in recorded:
+            recorded["openai"] = keep_volatile(recorded["openai"], case.get("openai"))
+        case.update(recorded)
         print(f"{path.name}: {case['name']}", file=sys.stderr)
     path.write_text(dump(fixture))
 
