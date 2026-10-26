@@ -51,9 +51,7 @@ class TestSDPAOperandLayout(unittest.TestCase):
             self.assertTrue(torch.equal(out, src.transpose(1, 2)))
 
     def test_guard_matches_the_platform(self):
-        self.assertEqual(
-            sdpa_backend._DENSE_SDPA_OPERANDS, current_platform.is_hip()
-        )
+        self.assertEqual(sdpa_backend._DENSE_SDPA_OPERANDS, current_platform.is_hip())
 
 
 if __name__ == "__main__":
