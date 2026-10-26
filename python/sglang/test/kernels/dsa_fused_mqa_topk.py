@@ -122,8 +122,8 @@ def assert_topk_matches_reference(
 
     Each row holds exactly ``min(topk, visible keys)`` distinct in-window keys,
     pads the rest with ``-1``, and every selected key scores at least the exact
-    k-th score up to a relative 2e-4 tolerance, so key sets may differ only
-    among (near-)ties at the boundary.
+    k-th score up to a 2e-4 relative plus 1e-4 absolute tolerance, so key sets
+    may differ only among (near-)ties at the boundary.
     """
     topk = indices.shape[1]
     starts, ends = batch["starts"].long(), batch["ends"].long()

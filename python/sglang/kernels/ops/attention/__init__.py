@@ -338,10 +338,9 @@ register_kernel(
         op="attention.fused_mqa_topk_prefill",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.attention.dsa.fused_mqa_topk:fused_mqa_topk_prefill",
-        # tcgen05 + TMEM: the SM100 and SM103 targets the vendored kernel is built for.
+        # tcgen05 + TMEM; gates and dispatch tuned and validated on SM100 (B200) only.
         capabilities=frozenset(
-            CapabilityRequirement.cuda(min_sm=sm, max_sm=sm)
-            for sm in ((10, 0), (10, 3))
+            {CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 0))}
         ),
     )
 )
