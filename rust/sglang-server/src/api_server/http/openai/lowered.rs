@@ -200,7 +200,10 @@ pub(super) async fn chat(
         .expect("api.v1 types serialize to JSON");
         return Some(match responder.unary(&body) {
             Some(reply) => reply_response(reply),
-            None => (StatusCode::OK, body).into_response(),
+            None => error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "unreadable /generate response",
+            ),
         });
     }
 
