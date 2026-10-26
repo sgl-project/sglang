@@ -7,7 +7,7 @@ is checked here is that
 
 - the path stays out unless ``SGLANG_USE_ROCM_TRITON_DENSE_ATTN`` asks for it,
   and out on non-ROCm builds, while compiling, with dropout, causality, GQA,
-  other dtypes, other head dims and unaligned sequence lengths;
+  other dtypes, other head dims, short or unaligned sequence lengths;
 - the operands handed to the kernel are head-major dense copies of the
   token-major inputs, with the softmax scale forwarded;
 - a kernel refusal falls back to SDPA instead of failing.
@@ -27,7 +27,12 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
-_SEQ = 128
+# Must clear the dense path's minimum sequence length, otherwise the positive
+# cases below would all take the short-sequence fallback.
+_SEQ = 4096
+# Fallback cases never reach the kernel, so they use a cheap length instead of
+# paying for a 4096-token CPU SDPA call each.
+_SMALL = 128
 _HEADS = 2
 _HEAD_DIM = 128
 
@@ -73,7 +78,7 @@ def _impl(causal=False, dropout=0.0):
 class TestDenseAttnGate(CustomTestCase):
     def _forward(self, fake, impl=None, tensors=None):
         impl = impl or _impl()
-        tensors = tensors or _qkv()
+        tensors = tensors or _qkv(seq=_SMALL)
         with mock.patch.object(
             sdpa_module, "triton_dense_attn_kernel", return_value=fake
         ):
@@ -84,7 +89,7 @@ class TestDenseAttnGate(CustomTestCase):
         with mock.patch.dict(os.environ, {"SGLANG_USE_ROCM_TRITON_DENSE_ATTN": "0"}):
             out, calls = self._forward(fake)
         self.assertEqual(calls, [])
-        self.assertEqual(out.shape, (1, _SEQ, _HEADS, _HEAD_DIM))
+        self.assertEqual(out.shape, (1, _SMALL, _HEADS, _HEAD_DIM))
 
     def test_non_rocm_build_falls_back(self):
         fake = _FakeKernel()
@@ -95,7 +100,7 @@ class TestDenseAttnGate(CustomTestCase):
     def test_kernel_gets_head_major_dense_operands_and_scale(self):
         fake = _FakeKernel()
         impl = _impl()
-        out, calls = self._forward(fake, impl=impl)
+        out, calls = self._forward(fake, impl=impl, tensors=_qkv())
         self.assertIs(out, fake.output)
         self.assertEqual(len(calls), 1)
         call = calls[0]
@@ -112,7 +117,7 @@ class TestDenseAttnGate(CustomTestCase):
         fake = _FakeKernel(can_use=False)
         out, calls = self._forward(fake)
         self.assertEqual(calls, [])
-        self.assertEqual(out.shape, (1, _SEQ, _HEADS, _HEAD_DIM))
+        self.assertEqual(out.shape, (1, _SMALL, _HEADS, _HEAD_DIM))
 
     def test_causal_and_dropout_fall_back(self):
         for impl in (_impl(causal=True), _impl(dropout=0.1)):
@@ -137,9 +142,16 @@ class TestDenseAttnGate(CustomTestCase):
 
     def test_mismatched_lengths_fall_back(self):
         fake = _FakeKernel()
-        q, k, v = _qkv()
+        q, k, v = _qkv(seq=_SMALL)
         _, calls = self._forward(fake, tensors=(q, k[:, :-64], v[:, :-64]))
         self.assertEqual(calls, [])
+
+    def test_short_sequence_falls_back(self):
+        fake = _FakeKernel()
+        seq = _SEQ // 2
+        out, calls = self._forward(fake, tensors=_qkv(seq=seq))
+        self.assertEqual(calls, [])
+        self.assertEqual(out.shape, (1, seq, _HEADS, _HEAD_DIM))
 
     def test_compiling_falls_back(self):
         fake = _FakeKernel()

@@ -39,6 +39,10 @@ _MPS_VARLEN_QUERY_CHUNK_SIZE = 128
 # key/value length by 64 and keeps head_dim as the tile width.
 _DENSE_ATTN_HEAD_DIM = 128
 _DENSE_ATTN_BLOCK = 64
+# Below this length the three head-major copies cost more than the kernel saves:
+# at S=1024 the copies are 69% of the call and the path is 0.65x of AOTriton,
+# at S=2048 it is break-even, at S=4096 it is 1.29x and at S=16384 it is 11.9x.
+_DENSE_ATTN_MIN_SEQ = 4096
 _dense_attn_kernel = None
 
 
@@ -111,10 +115,11 @@ class SDPAImpl(AttentionImpl):
 
         Gated on ``SGLANG_USE_ROCM_TRITON_DENSE_ATTN``. At the shapes diffusion
         prefill hits on gfx1151 (128 head dim, 16K tokens) AOTriton reaches
-        18 TF where the Triton kernel reaches 30 TF; the kernel needs head-major
+        18 TF where the Triton kernel reaches 31.8 TF; the kernel needs head-major
         dense operands, which this backend otherwise only has as strided views,
         so they are materialised here. Everything the kernel does not model --
-        causality, dropout, GQA, other dtypes, other head dims -- returns None.
+        causality, dropout, GQA, other dtypes, other head dims, short sequences
+        -- returns None.
         """
         if not envs.SGLANG_USE_ROCM_TRITON_DENSE_ATTN:
             return None
@@ -130,6 +135,7 @@ class SDPAImpl(AttentionImpl):
         if (
             batch != 1
             or head_dim != _DENSE_ATTN_HEAD_DIM
+            or seq_len < _DENSE_ATTN_MIN_SEQ
             or seq_len % _DENSE_ATTN_BLOCK
         ):
             return None
