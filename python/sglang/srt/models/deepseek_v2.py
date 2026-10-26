@@ -596,6 +596,31 @@ class MoEGate(nn.Module):
         return logits
 
 
+def _merge_tp_output(
+    routed,
+    shared: Optional[torch.Tensor],
+    experts: nn.Module,
+    routed_scaling_factor: float,
+    shared_is_replicated: bool,
+) -> torch.Tensor:
+    """Merge TP-local pieces, keeping replicated shared output outside the sum."""
+    from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+        FlashInferTrtllmDeferredFinalizeOutput,
+        finalize_flashinfer_trtllm_deferred_output,
+    )
+
+    # NOTE: normal TP-sharded shared expert out
+    shared = None if shared_is_replicated else shared
+    if isinstance(routed, FlashInferTrtllmDeferredFinalizeOutput):
+        return finalize_flashinfer_trtllm_deferred_output(routed, shared)
+    return maybe_fuse_routed_scale_and_shared_add(
+        experts,
+        routed,
+        shared,
+        routed_scaling_factor,
+    )
+
+
 class MoEOutput(NamedTuple):
     """A MoE block's pieces, before anything merges or reduces them. ``routed`` is
     a deferred finalize handle or the raw routed rows."""
@@ -608,20 +633,12 @@ class MoEOutput(NamedTuple):
 
     def get_merged(self) -> torch.Tensor:
         """Merge the pieces, leaving the reduction to the caller."""
-        from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
-            FlashInferTrtllmDeferredFinalizeOutput,
-            finalize_flashinfer_trtllm_deferred_output,
-        )
-
-        # NOTE: normal TP-sharded shared expert out
-        shared = None if self.shared_is_replicated else self.shared
-        if isinstance(self.routed, FlashInferTrtllmDeferredFinalizeOutput):
-            return finalize_flashinfer_trtllm_deferred_output(self.routed, shared)
-        return maybe_fuse_routed_scale_and_shared_add(
-            self.experts,
+        return _merge_tp_output(
             self.routed,
-            shared,
+            self.shared,
+            self.experts,
             self.routed_scaling_factor,
+            self.shared_is_replicated,
         )
 
 
@@ -1443,18 +1460,27 @@ class DeepseekV2MoE(nn.Module):
                 reduce=sum_post_experts_output,
             )
 
-        output_type = MergedMoEOutput if already_merged else MoEOutput
-        pieces = output_type(
-            routed=routed,
-            shared=shared,
-            experts=self.experts,
-            routed_scaling_factor=self.routed_scaling_factor,
-            shared_is_replicated=self._shared_expert_tp1,
-        )
         if return_moe_output or leave_output_sum:
-            return pieces
+            output_type = MergedMoEOutput if already_merged else MoEOutput
+            return output_type(
+                routed=routed,
+                shared=shared,
+                experts=self.experts,
+                routed_scaling_factor=self.routed_scaling_factor,
+                shared_is_replicated=self._shared_expert_tp1,
+            )
 
-        output = pieces.get_merged()
+        output = (
+            routed
+            if already_merged
+            else _merge_tp_output(
+                routed,
+                shared,
+                self.experts,
+                self.routed_scaling_factor,
+                self._shared_expert_tp1,
+            )
+        )
         if self.reduce_results:
             output = post_experts_all_reduce(output)
         # A replicated shared expert contributes on rank zero while the TP sum is owed.

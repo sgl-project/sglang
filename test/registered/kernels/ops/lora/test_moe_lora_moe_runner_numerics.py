@@ -332,6 +332,15 @@ def test_selected_pipeline_matches_reference_in_eager_and_cuda_graph(
             router_logits=gpu["router_logits"],
         ),
     )
+    input_ptr = gpu["hidden_states"].untyped_storage().data_ptr()
+
+    def check_input_preserved(output):
+        assert gpu["hidden_states"].untyped_storage().data_ptr() == input_ptr
+        assert output.untyped_storage().data_ptr() != input_ptr
+        torch.testing.assert_close(
+            gpu["hidden_states"].cpu(), cpu["hidden_states"], atol=0, rtol=0
+        )
+
     references: dict[str, torch.Tensor] = {}
     for traffic in ("active", "mixed", "base_only"):
         cpu_slots = _token_lora_mapping(traffic, num_tokens)
@@ -346,6 +355,7 @@ def test_selected_pipeline_matches_reference_in_eager_and_cuda_graph(
             is_prefill=mode is Phase.PREFILL,
         )
         actual = runner.run(dispatch, batch)
+        check_input_preserved(actual.hidden_states)
         torch.testing.assert_close(
             actual.hidden_states.detach().float().cpu(),
             references[traffic],
@@ -378,6 +388,7 @@ def test_selected_pipeline_matches_reference_in_eager_and_cuda_graph(
 
     graph.replay()
     torch.cuda.synchronize(device)
+    check_input_preserved(output)
     torch.testing.assert_close(
         output.detach().float().cpu(),
         _reference(cpu, _token_lora_mapping("active", num_tokens), plan=reference_plan),
@@ -389,6 +400,7 @@ def test_selected_pipeline_matches_reference_in_eager_and_cuda_graph(
     token_lora_mapping.fill_(-1)
     graph.replay()
     torch.cuda.synchronize(device)
+    check_input_preserved(output)
     assert output.data_ptr() == output_ptr
     torch.testing.assert_close(
         output.detach().float().cpu(),
@@ -407,6 +419,7 @@ def test_selected_pipeline_matches_reference_in_eager_and_cuda_graph(
     token_lora_mapping.copy_(_token_lora_mapping("mixed", num_tokens).to(device))
     graph.replay()
     torch.cuda.synchronize(device)
+    check_input_preserved(output)
     assert output.data_ptr() == output_ptr
     torch.testing.assert_close(
         output.detach().float().cpu(),
