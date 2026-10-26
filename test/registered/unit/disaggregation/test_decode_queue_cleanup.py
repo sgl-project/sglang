@@ -167,6 +167,9 @@ class TestDecodeHiCacheRestoreGate(CustomTestCase):
             queue.tp_rank = 0
             queue.tree_cache = MagicMock()
             queue.metadata_buffers = SimpleNamespace(bootstrap_room=[None] * 4)
+            queue.metadata_buffers.clear_slot = lambda idx: (
+                queue.metadata_buffers.bootstrap_room.__setitem__(idx, 0)
+            )
             queue._clean_hicache_prefetch_resources = MagicMock()
             queue._commit_transfer_to_req = MagicMock()
             queue._record_transfer_failure = MagicMock()

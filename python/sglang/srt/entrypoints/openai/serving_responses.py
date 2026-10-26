@@ -1073,6 +1073,8 @@ class OpenAIServingResponses(OpenAIServingChat):
         if encoding_output is not None:
             required_json = self._uses_required_tool_json(request, chat_tools)
             reasoning_content, content, calls = encoding_output.parse_responses_output(
+                request=request,
+                require_reasoning=require_reasoning,
                 output_ids=output_ids or [],
                 finish_reason=finish_reason,
                 separate_reasoning=bool(self.reasoning_parser),
@@ -2224,6 +2226,8 @@ class OpenAIServingResponses(OpenAIServingChat):
         encoding_output = self._encoding_output()
         token_stream = (
             encoding_output.new_responses_stream(
+                request=request,
+                require_reasoning=require_reasoning,
                 separate_reasoning=bool(self.reasoning_parser),
                 parse_tool_calls=(
                     self._tool_call_parsing_enabled(request, chat_tools)

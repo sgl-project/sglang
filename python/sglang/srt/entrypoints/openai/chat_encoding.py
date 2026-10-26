@@ -108,10 +108,10 @@ def encode_simple_chat(
         return render_inkling_messages(messages)
 
     if spec in ("dsv4", "dsv41"):
-        from sglang.srt.parser.deepseek_recipe_renderer import RecipeEncoder
+        from sglang.srt.parser.deepseek_recipe_renderer import DeepSeekRecipe
 
-        encoder = RecipeEncoder.from_hf_tokenizer(spec, tokenizer)
-        return encoder.encode(
+        deepseek_recipe = DeepSeekRecipe.from_hf_tokenizer(spec, tokenizer)
+        return deepseek_recipe.encode(
             {"messages": list(messages), "thinking": thinking_mode == "thinking"}
         )
 
@@ -131,5 +131,5 @@ def encode_simple_chat(
             f"cannot encode chat messages with {getattr(tokenizer, 'name_or_path', tokenizer)!r}."
         )
     return tokenizer.apply_chat_template(
-        messages, add_generation_prompt=True, tokenize=True
+        messages, add_generation_prompt=True, tokenize=True, return_dict=False
     )
