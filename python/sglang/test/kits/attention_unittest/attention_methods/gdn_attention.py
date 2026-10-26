@@ -58,6 +58,7 @@ class GDNAttentionCase:
     linear_attn_prefill_backend: str | None = None
     mis_delimiter_indices: tuple[tuple[int, ...], ...] = ()
     conv_history_weight: float = 0.0
+    enable_deterministic_inference: bool = False
 
     @property
     def batch_size(self) -> int:
@@ -254,7 +255,7 @@ class MockGDNModelRunner(ModelRunner):
             ),
             dllm_algorithm=None,
             dllm_algorithm_config=None,
-            enable_deterministic_inference=False,
+            enable_deterministic_inference=case.enable_deterministic_inference,
             enable_mis=bool(case.mis_delimiter_indices),
             linear_attn_backend="triton",
             linear_attn_decode_backend=None,
@@ -1213,3 +1214,62 @@ def run_gdn_attention_case(
             atol=GDN_ATOL,
             rtol=GDN_RTOL,
         )
+
+
+def run_gdn_mixed_decode_tail_case(
+    testcase,
+    case: GDNAttentionCase,
+    *,
+    num_decode: int,
+    max_context_len: int = DEFAULT_MAX_CONTEXT_LEN,
+    device: str = DEFAULT_DEVICE,
+):
+    """Run `case` as a mixed batch whose last `num_decode` rows are decode
+    tails, and check those rows against the same requests in a decode batch."""
+    fixture = build_gdn_attention_fixture(
+        testcase, case, max_context_len=max_context_len, device=device
+    )
+    fixture.forward_batch.num_mixed_decode_reqs = num_decode
+    initial_cache = _clone_gdn_cache(fixture)
+    mixed_output = run_gdn_fixture_eager(fixture)
+    expected = _pure_torch_gdn_reference(fixture, initial_cache[1])
+    torch.testing.assert_close(
+        mixed_output, expected.output, atol=GDN_ATOL, rtol=GDN_RTOL
+    )
+    tail_slots = _cache_indices(fixture)[-num_decode:]
+    mixed_conv = _conv_states(fixture)[tail_slots].clone()
+    mixed_ssm = _ssm_states(fixture)[tail_slots].clone()
+
+    # The same requests as one decode step, fed the tail rows' inputs.
+    _restore_gdn_cache(fixture, initial_cache)
+    decode_case = GDNAttentionCase(
+        name=case.name,
+        backend=case.backend,
+        forward_mode=ForwardMode.DECODE,
+        num_k_heads=case.num_k_heads,
+        num_v_heads=case.num_v_heads,
+        page_size=case.page_size,
+        prefix_lens=case.prefix_lens,
+        enable_deterministic_inference=case.enable_deterministic_inference,
+    )
+    decode_batch = _make_forward_batch(
+        decode_case, fixture.runner, max_context_len=max_context_len, device=device
+    )
+    last_rows = torch.tensor(case.extend_lens, device=device).cumsum(0) - 1
+    with torch.no_grad(), forward_context(ForwardContext(attn_backend=fixture.backend)):
+        fixture.backend.init_forward_metadata(decode_batch)
+        decode_output = fixture.actual_module(
+            decode_batch,
+            fixture.mixed_qkv[last_rows],
+            fixture.a[last_rows],
+            fixture.b[last_rows],
+        )
+
+    testcase.assertTrue(
+        torch.equal(
+            mixed_output.reshape(case.num_input_tokens, -1)[-num_decode:],
+            decode_output.reshape(case.batch_size, -1)[-num_decode:],
+        )
+    )
+    testcase.assertTrue(torch.equal(_conv_states(fixture)[tail_slots], mixed_conv))
+    testcase.assertTrue(torch.equal(_ssm_states(fixture)[tail_slots], mixed_ssm))

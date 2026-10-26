@@ -1,3 +1,5 @@
+import copy
+import dataclasses
 from typing import Optional, Tuple, Union
 
 import msgspec
@@ -20,6 +22,7 @@ from sglang.srt.layers.attention.linear.utils import (
     pp_spec_stable_rows_enabled,
     select_verify_intermediate_state_indices,
 )
+from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -150,6 +153,77 @@ def build_gdn_mis_metadata(forward_batch: ForwardBatch) -> GDNMISMetadata:
         item_seq_lens_cpu=item_seq_lens_cpu,
         item_request_indices=_indices(item_request_indices, torch.int64),
     )
+
+
+class GDNMixedDecodeSplit(msgspec.Struct, frozen=True):
+    """A mixed batch cut into its prefill rows and its decode tail."""
+
+    num_prefill_tokens: int
+    prefill_batch: ForwardBatch
+    prefill_metadata: ForwardMetadata
+    decode_batch: ForwardBatch
+    decode_metadata: ForwardMetadata
+
+
+def build_gdn_mixed_decode_split(
+    forward_batch: ForwardBatch, metadata: ForwardMetadata
+) -> Optional[GDNMixedDecodeSplit]:
+    """Cut off the decode tail of a mixed batch, or None if there is none."""
+    num_decode = forward_batch.num_mixed_decode_reqs
+    seq_lens = forward_batch.extend_seq_lens_cpu
+    prefix_lens = forward_batch.extend_prefix_lens_cpu
+    if not num_decode or seq_lens is None or prefix_lens is None:
+        return None
+    num_prefill = len(seq_lens) - num_decode
+    # Only cut a batch whose rows still end in the 1-token tails.
+    if num_prefill <= 0 or any(n != 1 for n in seq_lens[num_prefill:]):
+        return None
+
+    prefill_batch = copy.copy(forward_batch)
+    prefill_batch.num_mixed_decode_reqs = None
+    prefill_batch.extend_seq_lens = forward_batch.extend_seq_lens[:num_prefill]
+    prefill_batch.extend_prefix_lens = forward_batch.extend_prefix_lens[:num_prefill]
+    prefill_batch.extend_seq_lens_cpu = seq_lens[:num_prefill]
+    prefill_batch.extend_prefix_lens_cpu = prefix_lens[:num_prefill]
+    # Rows are listed in sequence order and each tail fills one block.
+    block_table = metadata.conv_block_table
+    prefill_metadata = dataclasses.replace(
+        metadata,
+        query_start_loc=metadata.query_start_loc[: num_prefill + 1],
+        mamba_cache_indices=metadata.mamba_cache_indices[:num_prefill],
+        conv_block_table=None if block_table is None else block_table[:-num_decode],
+    )
+
+    decode_batch = copy.copy(forward_batch)
+    decode_batch.forward_mode = ForwardMode.DECODE
+    decode_batch.batch_size = num_decode
+    decode_batch.num_mixed_decode_reqs = None
+    # mix_with_running leaves the tails untracked in a mixed step.
+    decode_batch.mamba_track_mask = None
+    decode_metadata = dataclasses.replace(
+        metadata,
+        query_start_loc=torch.arange(
+            num_decode + 1,
+            dtype=metadata.query_start_loc.dtype,
+            device=metadata.query_start_loc.device,
+        ),
+        mamba_cache_indices=metadata.mamba_cache_indices[
+            num_prefill : num_prefill + num_decode
+        ],
+        has_mamba_track_mask=False,
+        mamba_track_indices=None,
+    )
+    return GDNMixedDecodeSplit(
+        num_prefill_tokens=sum(seq_lens[:num_prefill]),
+        prefill_batch=prefill_batch,
+        prefill_metadata=prefill_metadata,
+        decode_batch=decode_batch,
+        decode_metadata=decode_metadata,
+    )
+
+
+def _narrow_tokens(x: torch.Tensor, start: int, length: int) -> torch.Tensor:
+    return x.narrow(0 if x.ndim == 2 else 1, start, length)
 
 
 def validate_gdn_mis_backend(prefill_backend: LinearAttnKernelBackend) -> None:
@@ -524,6 +598,15 @@ class GDNAttnBackend(MambaAttnBackendBase):
         super().__init__(model_runner)
         self.enable_mis = get_exec().features.enable_mis
         self.mis_metadata: Optional[GDNMISMetadata] = None
+        # The chunked prefill kernel matches the decode kernel only up to
+        # rounding, so deterministic runs keep a mixed batch's tail on decode.
+        # ReplaySSM decode needs per-row ring metadata a mixed batch lacks.
+        self.split_mixed_decode_tail = (
+            get_exec().deterministic.enable_deterministic_inference
+            and model_runner.req_to_token_pool.mamba_pool.mamba_cache.replayssm_d
+            is None
+        )
+        self.mixed_decode_split: Optional[GDNMixedDecodeSplit] = None
         self.conv_states_shape = (
             model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape
         )
@@ -554,6 +637,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
     ):
         super().init_forward_metadata_out_graph(forward_batch, in_capture=in_capture)
         self._init_target_verify_qkv_routing(forward_batch)
+        self.mixed_decode_split = None
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
@@ -582,6 +666,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     forward_batch, self.forward_metadata, self.device
                 )
         self._init_prefill_conv_block_table(forward_batch)
+        self.mixed_decode_split = (
+            build_gdn_mixed_decode_split(forward_batch, self.forward_metadata)
+            if self.split_mixed_decode_tail and self.mis_metadata is None
+            else None
+        )
 
     def _init_prefill_conv_block_table(self, forward_batch: ForwardBatch) -> None:
         metadata = self.forward_metadata
@@ -960,6 +1049,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
         if _is_hip and seq_len == 0:
             return mixed_qkv.new_zeros((1, 0, layer.num_v_heads, layer.head_v_dim))
 
+        if (
+            self.mixed_decode_split is not None
+            and forward_batch.num_mixed_decode_reqs is not None
+        ):
+            return self._forward_extend_with_decode_tail(
+                layer=layer, mixed_qkv=mixed_qkv, a=a, b=b
+            )
+
         is_target_verify = forward_batch.forward_mode.is_target_verify()
         forward_metadata = self.forward_metadata
 
@@ -1226,6 +1323,45 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 )
 
         return core_attn_out
+
+    def _forward_extend_with_decode_tail(
+        self,
+        *,
+        layer: RadixLinearAttention,
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run the prefill rows on extend and the mixed-in tail on decode."""
+        split = self.mixed_decode_split
+        num_prefill_tokens = split.num_prefill_tokens
+        num_decode = split.decode_batch.batch_size
+        metadata = self.forward_metadata
+        try:
+            self.mixed_decode_split = None
+            self.forward_metadata = split.prefill_metadata
+            prefill_out = self.forward_extend(
+                layer,
+                split.prefill_batch,
+                mixed_qkv[:num_prefill_tokens],
+                _narrow_tokens(a, 0, num_prefill_tokens),
+                _narrow_tokens(b, 0, num_prefill_tokens),
+            )
+            self.forward_metadata = split.decode_metadata
+            decode_out = self.forward_decode(
+                layer,
+                split.decode_batch,
+                mixed_qkv[num_prefill_tokens:],
+                _narrow_tokens(a, num_prefill_tokens, num_decode),
+                _narrow_tokens(b, num_prefill_tokens, num_decode),
+            )
+        finally:
+            self.forward_metadata = metadata
+            self.mixed_decode_split = split
+        decode_out = decode_out.reshape(
+            *prefill_out.shape[:-3], num_decode, *prefill_out.shape[-2:]
+        )
+        return torch.cat([prefill_out, decode_out], dim=-3)
 
     def _forward_extend_mis(
         self,

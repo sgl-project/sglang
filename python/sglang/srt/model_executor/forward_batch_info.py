@@ -670,6 +670,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     extend_seq_lens_cpu: Optional[List[int]] = None
     extend_logprob_start_lens_cpu: Optional[List[int]] = None
     extend_input_logprob_token_ids_gpu: Optional[torch.Tensor] = None
+    # Running requests that mix_with_running appended to a MIXED batch as
+    # 1-token extends, at the end of the batch. The eager runner relabels a
+    # MIXED batch as EXTEND, so backends read the decode tail from here.
+    num_mixed_decode_reqs: Optional[int] = None
 
     # For DP attention (MLP sync sizes)
     original_global_num_tokens_cpu: Optional[List[int]] = None
@@ -1088,6 +1092,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             global_forward_mode=batch.global_forward_mode,
             is_prefill_only=batch.is_prefill_only,
             contains_last_prefill_chunk=contains_last_prefill_chunk,
+            num_mixed_decode_reqs=(
+                len(batch.mix_running_indices_cpu)
+                if batch.forward_mode.is_mixed()
+                and batch.mix_running_indices_cpu is not None
+                else None
+            ),
             spec_algorithm=batch.spec_algorithm,
             capture_hidden_mode=capture_hidden_mode,
             return_hidden_states_before_norm=return_hidden_states_before_norm,
