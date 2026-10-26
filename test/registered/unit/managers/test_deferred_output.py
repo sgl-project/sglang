@@ -258,3 +258,9 @@ def test_idle_scheduler_polls_and_only_sleeps_after_release(state, pending):
     else:
         scheduler.maybe_sleep_on_idle.assert_called_once_with()
         sleep.assert_not_called()
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__]))

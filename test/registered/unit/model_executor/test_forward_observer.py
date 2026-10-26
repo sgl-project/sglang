@@ -169,3 +169,9 @@ def test_scheduler_copies_forward_output_for_non_overlap_results(has_forward_out
     else:
         assert result.copy_done is None
         result.copy_to_cpu.assert_not_called()
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__]))
