@@ -1,5 +1,8 @@
 from unittest.mock import Mock, patch
 
+import pytest
+
+from sglang.multimodal_gen.runtime.managers.memory_managers import initial_residency
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
     COMPONENT_OFFLOAD,
     LAYERWISE_OFFLOAD,
@@ -13,6 +16,17 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.initial_residency im
     choose_initial_resident_components,
     maybe_seed_initial_residency,
 )
+
+
+@pytest.fixture(autouse=True)
+def _discrete_host(monkeypatch):
+    # These cases describe a discrete GPU with its own VRAM. A shared
+    # host/device pool skips the seed entirely; see test_shared_memory_pool.
+    monkeypatch.setattr(
+        type(initial_residency.current_platform),
+        "device_shares_host_memory",
+        classmethod(lambda cls: False),
+    )
 
 
 def _weight(component_name: str, gib: int) -> ComponentWeightEstimate:
@@ -197,6 +211,7 @@ def test_initial_seed_applies_one_reversible_override():
         ) as platform,
     ):
         platform.is_cuda.return_value = True
+        platform.device_shares_host_memory.return_value = False
         platform.get_available_gpu_memory.return_value = 40
         maybe_seed_initial_residency(args, inventory)
 
@@ -222,6 +237,7 @@ def test_initial_seed_preserves_fixed_quantized_dit_loading():
         ) as platform,
     ):
         platform.is_cuda.return_value = True
+        platform.device_shares_host_memory.return_value = False
         platform.get_available_gpu_memory.return_value = 40
         maybe_seed_initial_residency(args, [_weight("transformer", 8)])
 
@@ -255,6 +271,7 @@ def test_initial_seed_preserves_unselected_layerwise_setup():
         ) as platform,
     ):
         platform.is_cuda.return_value = True
+        platform.device_shares_host_memory.return_value = False
         platform.get_available_gpu_memory.return_value = 75
         maybe_seed_initial_residency(args, inventory)
 
@@ -284,6 +301,7 @@ def test_initial_seed_honors_the_test_allocator_cap():
         ),
     ):
         platform.is_cuda.return_value = True
+        platform.device_shares_host_memory.return_value = False
         platform.get_available_gpu_memory.return_value = 140
         maybe_seed_initial_residency(args, inventory)
 
@@ -324,6 +342,7 @@ def test_initial_seed_uses_inventory_budget_below_legacy_threshold():
         ) as platform,
     ):
         platform.is_cuda.return_value = True
+        platform.device_shares_host_memory.return_value = False
         platform.get_available_gpu_memory.return_value = 29.8
         maybe_seed_initial_residency(args, [_weight("transformer", 8)])
 
