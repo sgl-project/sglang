@@ -1,6 +1,7 @@
 """The asm split-K block-scale GEMM into a norm-zeroed output equals aiter's memset-then-launch."""
 
 import unittest
+from unittest import mock
 
 import torch
 
@@ -90,6 +91,81 @@ class TestAsmBlockscalePrezeroed(CustomTestCase):
                 bias=get_zero_bias_buf(wq),
             )
             self.assertTrue(torch.equal(out, ref))
+
+    def test_norm_hands_zeroed_output_to_linear(self):
+        """A norm bound to the GEMM zero-fills its output; the linear launches into it
+        once, in eager and in graph replay."""
+        from sglang.srt.layers.layer_boundary.residual import add_norm_hip
+        from sglang.srt.layers.layernorm import GemmaRMSNorm
+        from sglang.srt.layers.quantization import fp8_utils, fp8_utils_hip
+
+        m, kernel = 256, _kernel("48x128")
+        norm = GemmaRMSNorm(K).cuda()
+        norm.weight.data.copy_(self.norm_w)
+        norm.fp8_out_gemm_shape = (N, K)
+        x, res = self._rows(m), self._rows(m)
+        ref = self._aiter_ref(x, res, m, kernel)
+
+        def run():
+            (q, scale), _ = add_norm_hip.gemma_norm_fp8(norm, x, res, None, "fp8")
+            self.assertEqual(q.zeroed_gemm_out.shape, (m, N))
+            out = fp8_utils.aiter_w8a8_block_fp8_linear(
+                input=q,
+                weight=self.wq,
+                block_size=[128, 128],
+                weight_scale=self.ws,
+                input_scale=scale,
+            )
+            self.assertFalse(hasattr(q, "zeroed_gemm_out"))
+            return out
+
+        def pick(m, n, k):
+            return kernel, 2
+
+        with (
+            mock.patch.object(add_norm_hip, "asm_split_k_kernel", pick),
+            mock.patch.object(fp8_utils_hip, "asm_split_k_kernel", pick),
+        ):
+            self.assertTrue(torch.equal(run(), ref))
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                out = run()
+            out.fill_(7.0)
+            graph.replay()
+            torch.cuda.synchronize()
+            self.assertTrue(torch.equal(out, ref))
+
+    def test_zeroed_output_is_bf16_only(self):
+        """The asm kernel accumulates bf16: an fp16 norm hands no zeroed output, and a
+        linear asked for another dtype keeps aiter's own launch."""
+        from sglang.srt.layers.layer_boundary.residual import add_norm_hip
+        from sglang.srt.layers.layernorm import GemmaRMSNorm
+        from sglang.srt.layers.quantization import fp8_utils_hip
+
+        m, kernel = 256, _kernel("48x128")
+        norm = GemmaRMSNorm(K).cuda()
+        norm.fp8_out_gemm_shape = (N, K)
+        x, res = self._rows(m).half(), self._rows(m).half()
+
+        def pick(m, n, k):
+            return kernel, 2
+
+        launched = []
+
+        def gemm(xq, wq, x_scale, w_scale, dtype):
+            launched.append(dtype)
+
+        with (
+            mock.patch.object(add_norm_hip, "asm_split_k_kernel", pick),
+            mock.patch.object(fp8_utils_hip, "asm_split_k_kernel", pick),
+        ):
+            (q, scale), _ = add_norm_hip.gemma_norm_fp8(norm, x, res, None, "fp8")
+            self.assertFalse(hasattr(q, "zeroed_gemm_out"))
+            zeroed = torch.zeros(m, N, device="cuda", dtype=torch.bfloat16)
+            fp8_utils_hip._gemm_into_zeroed(
+                q, self.wq, scale, self.ws, torch.float32, gemm=gemm, out=zeroed
+            )
+        self.assertEqual(launched, [torch.float32])
 
 
 if __name__ == "__main__":

@@ -1,0 +1,254 @@
+"""ROCm part of the minimax_m3 override declarations: the gfx950 defaults of the M3.1
+NVFP4 and Quark checkpoints, aiter's tuned tables for them, the NVFP4 KV format and the
+TP guards. minimax_m3 calls it on HIP; it is pure Python and never imports aiter."""
+
+import importlib.util
+import logging
+import os
+from pathlib import Path
+from typing import Any, Optional
+
+from sglang.srt.arg_groups.model_override_base import is_attention_backend_not_set
+from sglang.srt.environ import envs
+from sglang.srt.runtime_context import derive_attn_tp_size, get_platform
+
+_AITER_TUNED_CONFIGS = (
+    Path(__file__).resolve().parents[2]
+    / "layers"
+    / "quantization"
+    / "aiter_tuned_configs"
+)
+# aiter GEMM tables tuned for MiniMax-M3.1 at TP4 on gfx950 / ROCm 7.2 as
+# (aiter variable, aiter's default table, ours); the a8w8 ones cover the 7 dense
+# (N, K) pairs of the MXFP8 projections and the DSpark ctx-KV GEMM (1280, 6144).
+_M31_TUNED_GEMM_TABLES = (
+    # block-fp8 copy (M > MXFP8_DENSE_PTPC_DECODE_MAX_M), rows up to M = 32768; aiter
+    # ships none for these shapes
+    (
+        "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE",
+        "a8w8_blockscale_bpreshuffle_tuned_gemm.csv",
+        _AITER_TUNED_CONFIGS
+        / "minimax_m31_tp4_a8w8_blockscale_bpreshuffle_tuned_gemm.csv",
+    ),
+    # rowwise-fp8 copy (M <= MXFP8_DENSE_PTPC_DECODE_MAX_M): aiter's minimax_m3 rows,
+    # swapped for (split-K) FlyDSL where >= 3% faster with cold weights
+    (
+        "AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE",
+        "a8w8_bpreshuffle_tuned_gemm.csv",
+        _AITER_TUNED_CONFIGS / "minimax_m31_tp4_a8w8_bpreshuffle_tuned_gemm.csv",
+    ),
+    # bf16 GEMMs outside the layers, M <= 1024 (lm_head 50016 x 6144, DSpark fc
+    # 1536 x 30720): hipBLASLt / FlyDSL where >= 3% faster than F.linear with cold
+    # weights. The hipBLASLt indices fit this image only.
+    (
+        "AITER_CONFIG_GEMM_BF16",
+        "bf16_tuned_gemm.csv",
+        _AITER_TUNED_CONFIGS / "minimax_m31_tp4_bf16_tuned_gemm.csv",
+    ),
+)
+# aiter fused-MoE rows for the M3.1 TP4 routed experts on gfx950 (128 x top-4, hidden 6144,
+# intermediate 768, MXFP4, SwiGLU-OAI; aiter has none); their _tag keeps a row aiter may add
+# for the same shape first in the merge instead of failing it.
+_M31_TUNED_FMOE_CSV = _AITER_TUNED_CONFIGS / "minimax_m31_tp4_mxfp4_tuned_fmoe.csv"
+
+logger = logging.getLogger(__name__)
+
+
+def uses_nvfp4_kv(
+    quantization: Optional[str], *, speculative_algorithm: Optional[str]
+) -> bool:
+    """Whether gfx950 keeps the M3.1 KV cache in the packed NVFP4 (MSA-v1) pool."""
+    platform = get_platform()
+    if not (
+        quantization == "minimax_m3_nvfp4" and platform.is_hip and platform.is_gfx95
+    ):
+        return False
+    kv_format = envs.SGLANG_MINIMAX_M3_AMD_KV_FORMAT.get().strip().lower()
+    if kv_format not in ("auto", "fp8"):
+        raise ValueError(
+            f"SGLANG_MINIMAX_M3_AMD_KV_FORMAT must be auto or fp8, got {kv_format!r}"
+        )
+    # only the DSPARK verify indexer reads an NVFP4 index K
+    return kv_format == "auto" and speculative_algorithm == "DSPARK"
+
+
+def validate_nvfp4(cfg: Any) -> None:
+    """The M3.1 NVFP4 checks of ROCm."""
+    algorithm = cfg.speculative_algorithm
+    if algorithm == "DFLASH" or (algorithm == "DSPARK" and not get_platform().is_gfx95):
+        supported = "Blackwell or AMD gfx950" if algorithm == "DSPARK" else "Blackwell"
+        raise ValueError(f"M3.1 NVFP4 {algorithm} requires {supported}")
+    # TP8 with attention DP ran away on whitespace in 12% of GSM8K answers on MI350X
+    if cfg.tp_size > 4:
+        raise ValueError("M3.1 NVFP4 on ROCm is validated at --tp-size 4 or less")
+
+
+def nvfp4_overrides(cfg: Any, overrides: dict) -> dict:
+    """The gfx950 serving stack of M3.1 NVFP4: aiter MXFP4 experts, the Triton attention
+    and DSpark draft backends, and aiter's tuned tables."""
+    if (
+        cfg.speculative_algorithm == "DSPARK"
+        and cfg.speculative_draft_attention_backend is None
+    ):
+        # trtllm_mha is CUDA-only; triton serves the dense MHA draft here
+        overrides["speculative_draft_attention_backend"] = "triton"
+    overrides.update(page_size=128)
+    if cfg.moe_runner_backend == "auto":
+        # name the runner MiniMaxM3Nvfp4MoE builds: the dispatcher keeps global
+        # expert ids (EP) only for aiter
+        overrides["moe_runner_backend"] = "aiter"
+    if is_attention_backend_not_set(cfg):
+        overrides["attention_backend"] = "triton"
+    # the DSpark draft's plain Fp8Config converts its MXFP8 projections to block-FP8 like
+    # the target's MiniMaxM3Nvfp4Config, instead of running Triton dot_scaled
+    if not envs.SGLANG_FORCE_MXFP8_BLOCK_CONVERT_DENSE.is_set():
+        envs.SGLANG_FORCE_MXFP8_BLOCK_CONVERT_DENSE.set(True)
+    _register_minimax_aiter_tuned_gemm(m31=True)
+    _m31_gfx950_moe_and_all_reduce(cfg)
+    return overrides
+
+
+def rocm_overrides(
+    cfg: Any, hf_config: Any, quantization: Optional[str], overrides: dict
+) -> bool:
+    """The other MiniMax-M3 checkpoints on ROCm: gfx950's tuned tables and the M3.1 Quark
+    export's defaults. Returns whether custom all-reduce stays on: quark_mxfp4 and the
+    M3.1 Quark export are measured faster with it at equal accuracy; MXFP8 is not."""
+    m31_quark = (
+        get_platform().is_gfx95
+        and quantization == "quark"
+        and _is_m31_quark_export(hf_config)
+    )
+    if m31_quark:
+        _register_minimax_aiter_tuned_gemm(m31=True)
+        _m31_quark_gfx950_overrides(cfg, overrides)
+    elif get_platform().is_gfx95 and quantization == "quark_mxfp4":
+        # the MXFP8-base source shares the M3.1 checkpoint's dense projections
+        _register_minimax_aiter_tuned_gemm(m31=False)
+    keeps_custom_all_reduce = quantization == "quark_mxfp4" or m31_quark
+    if keeps_custom_all_reduce:
+        _require_attention_tp_within_kv_heads(cfg, hf_config)
+    return keeps_custom_all_reduce
+
+
+def _is_m31_quark_export(hf_config: Any) -> bool:
+    """A Quark export of M3.1: its attention, dense and shared-expert linears stay
+    MXFP8 (fp8 per_block [1, 32], e8m0 scales) next to the MXFP4 routed experts,
+    byte-identical to the NVFP4 checkpoint's. The M3 Quark export keeps those
+    linears bf16 and lists no per-layer config."""
+    quant_config = getattr(hf_config, "quantization_config", None)
+    if quant_config is None:
+        text_config = getattr(hf_config, "text_config", None)
+        quant_config = getattr(text_config, "quantization_config", None)
+    if not isinstance(quant_config, dict):
+        return False
+    if str(quant_config.get("quant_method", "")).lower() != "quark":
+        return False
+    for layer in (quant_config.get("layer_quant_config") or {}).values():
+        weight = (layer or {}).get("weight") or {}
+        if (
+            weight.get("dtype") in ("fp8_e4m3", "fp8_e4m3fn")
+            and weight.get("block_size") == [1, 32]
+            and "e8m0" in str(weight.get("scale_type") or "")
+        ):
+            return True
+    return False
+
+
+def _m31_quark_gfx950_overrides(cfg: Any, overrides: dict) -> None:
+    """The gfx950 defaults minimax_m3_nvfp4 resolves, for an M3.1 Quark export: same
+    MXFP8 linears, same MXFP4 aiter experts. At TP4 on MI355X the Triton MXFP8
+    GEMMs alone halve batch-1 decode (94 vs 206 tok/s at 8K input)."""
+    # the aiter block-scale GEMMs (tuned rows registered by the caller) instead of
+    # the Triton MXFP8 linear kernel
+    if not envs.SGLANG_FORCE_MXFP8_BLOCK_CONVERT_DENSE.is_set():
+        envs.SGLANG_FORCE_MXFP8_BLOCK_CONVERT_DENSE.set(True)
+    if cfg.kv_cache_dtype == "auto":
+        overrides["kv_cache_dtype"] = "fp8_e4m3"
+    draft_kv = cfg.speculative_draft_kv_cache_dtype
+    if cfg.speculative_algorithm == "DSPARK" and draft_kv in (None, "auto"):
+        overrides["speculative_draft_kv_cache_dtype"] = "bf16"
+    _m31_gfx950_moe_and_all_reduce(cfg)
+
+
+def _m31_gfx950_moe_and_all_reduce(cfg: Any) -> None:
+    """The tuned MXFP4 MoE rows and the quick all-reduce both M3.1 checkpoints take."""
+    _register_aiter_table("AITER_CONFIG_FMOE", "tuned_fmoe.csv", _M31_TUNED_FMOE_CSV)
+    # INT4 halves the long-prefill all-reduce at TP4 with GSM8K unchanged; ROCm images
+    # export INT8 for every model, so only another level the user set stays
+    level = "ROCM_QUICK_REDUCE_QUANTIZATION"
+    if (
+        os.environ.get(level, "INT8") == "INT8"
+        and envs.SGLANG_ENABLE_MINIMAX_M3_AMD_QUICK_REDUCE_INT4.get()
+    ):
+        os.environ[level] = "INT4"
+        logger.info(
+            "MiniMax-M3.1: quick all-reduce INT4 (from INT8 or unset); "
+            "SGLANG_ENABLE_MINIMAX_M3_AMD_QUICK_REDUCE_INT4=0 keeps INT8"
+        )
+    if (
+        cfg.tp_size != 4
+        or os.environ.get(level) != "INT4"
+        # the JIT build reduces bf16 cast to fp16 only, as QuickAllReduce sets it up
+        or cfg.dtype not in ("auto", "bfloat16")
+        or int(os.environ.get("ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16", 1)) == 0
+    ):
+        return
+    # the JIT build is bit-identical to sgl-kernel's, and faster at TP4
+    if not envs.SGLANG_ROCM_QUICK_ALL_REDUCE_JIT.is_set():
+        envs.SGLANG_ROCM_QUICK_ALL_REDUCE_JIT.set(True)
+    if envs.SGLANG_ROCM_QUICK_ALL_REDUCE_JIT.get():
+        # its INT8 beats aiter's custom AR from about 2 MiB, so custom AR stops at 2.4 MiB
+        # (decode at 26+ requests, extends of 205+ tokens) instead of 64 MiB
+        os.environ.setdefault("AITER_CUSTOM_AR_MAX_SIZE", "2516582")
+
+
+def _require_attention_tp_within_kv_heads(cfg: Any, hf_config: Any) -> None:
+    # on ROCm, past one KV / index head per rank the server returns NUL bytes
+    kv_heads = getattr(hf_config, "text_config", hf_config).num_key_value_heads
+    # the deprecated --dp-size/--enable-dp-attention spelling is already attn_dp_size here
+    attn_tp = derive_attn_tp_size(
+        tp_size=cfg.tp_size,
+        attn_cp_size=cfg.attn_cp_size,
+        attn_dp_size=cfg.attn_dp_size,
+    )
+    if attn_tp > kv_heads:
+        raise ValueError(
+            f"M3.1 attention TP is {attn_tp} but the model has {kv_heads} KV "
+            "heads, which are not replicated: every request would return "
+            f"garbage. Use --tp-size {kv_heads} or fewer, or divide the attention "
+            f"TP with --attn-dp-size {cfg.tp_size // kv_heads}."
+        )
+
+
+def _register_aiter_table(env: str, default_name: str, table: Path) -> None:
+    """Point aiter's `env` at its own default table followed by `table`.
+
+    aiter reads these variables (a ':'-separated list it merges) in the TP
+    workers; this runs in the launcher before they spawn, so the environment
+    carries it over. An explicit setting of the variable wins. find_spec
+    locates aiter without importing it (importing aiter here would initialise
+    HIP in the launcher).
+    """
+    if os.environ.get(env) or not table.is_file():
+        return
+    spec = importlib.util.find_spec("aiter")
+    origin = getattr(spec, "origin", None) if spec is not None else None
+    if not origin:
+        return
+    default = Path(origin).resolve().parent / "configs" / default_name
+    # aiter's per-model tables under model_configs/ are left out on purpose:
+    # aiter refuses a merge that holds the same shape twice (other models share
+    # these TP4 shapes, and ours replaces its minimax_m3 rowwise table), and ours
+    # already covers every shape MiniMax serves.
+    files = [p for p in (default,) if p.is_file()] + [table]
+    os.environ[env] = ":".join(str(p) for p in files)
+    logger.info("MiniMax-M3: aiter %s tables %s", env, os.environ[env])
+
+
+def _register_minimax_aiter_tuned_gemm(*, m31: bool) -> None:
+    # the quark_mxfp4 source gets only the block-scale table (the first); the rest were
+    # measured on the M3.1 checkpoints alone
+    tables = _M31_TUNED_GEMM_TABLES if m31 else _M31_TUNED_GEMM_TABLES[:1]
+    for env, default_name, ours in tables:
+        _register_aiter_table(env, default_name, ours)

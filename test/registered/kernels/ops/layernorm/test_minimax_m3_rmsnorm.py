@@ -206,6 +206,46 @@ def test_four_rows_without_bf16_write_the_same_fp8_and_zero_fill():
     assert not zeros.any()
 
 
+@_GFX95_ONLY
+@pytest.mark.parametrize(
+    "quant_format, num_tokens", [("fp8_per_token", 64), ("fp8", 256)]
+)
+@torch.inference_mode()
+def test_fp8_reads_of_a_gemma_norm_apply_one_plus_weight(quant_format, num_tokens):
+    """The attention and FFN reads that quantize for a dense fp8 GEMM must normalize
+    as GemmaRMSNorm does (1 + weight), not with the raw weight that aiter's
+    plain-RMSNorm kernels take."""
+    from sglang.srt.layers.layer_boundary.residual.add_norm import (
+        NORM_QUANT_READOUT,
+        PLAIN_ADD,
+    )
+    from sglang.srt.layers.layernorm import GemmaRMSNorm
+    from sglang.srt.models.minimax_common.amd.minimax_m3_hip import NormFp8Readout
+
+    x, residual, weight = _decode_inputs(num_tokens)
+    norm = GemmaRMSNorm(6144, eps=EPS).to(DEVICE, torch.bfloat16)
+    norm.weight.data.copy_(weight)
+    q_ref, scale_ref, normed_ref, residual_ref = _norm_then_quant(
+        x, residual, weight, quant_format
+    )
+
+    attn_input, attn_residual = NORM_QUANT_READOUT.update_and_read(
+        PLAIN_ADD, x, residual, norm, quant_format=quant_format
+    )
+    ffn_input, ffn_residual = NormFp8Readout(
+        quant_format_for=lambda num_tokens: quant_format
+    ).update_and_read(PLAIN_ADD, x, residual, norm)
+
+    for quantized, residual_out in (
+        (attn_input, attn_residual),
+        (ffn_input, ffn_residual),
+    ):
+        assert torch.equal(_bits(quantized[0]), _bits(q_ref))
+        assert torch.equal(_bits(quantized[1]), _bits(scale_ref))
+        assert torch.equal(_bits(residual_out), _bits(residual_ref))
+    assert torch.equal(_bits(ffn_input[2]), _bits(normed_ref))
+
+
 if __name__ == "__main__":
     import sys
 

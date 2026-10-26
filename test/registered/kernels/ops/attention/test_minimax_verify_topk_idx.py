@@ -17,6 +17,9 @@ from sglang.kernels.ops.attention.minimax_sparse.decode.verify_topk_idx import (
 )
 from sglang.kernels.ops.quantization.nvfp4_kv_triton import nvfp4_kv_quantize
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.minimax_sparse_ops.minimax_sparse import (
+    minimax_sparse_decode,
+)
 from sglang.srt.utils import get_device, is_gfx95_supported
 from sglang.test.ci.ci_register import register_amd_ci
 
@@ -120,6 +123,42 @@ def _assert_matches_per_row(inputs, *, num_draft, local_blocks=1, radix_topk=Tru
     assert mismatched == [], "(head, row) pairs with a different top-k set"
 
 
+def _sparse_decode_args(inputs, *, seed, extra_rows=0):
+    """`minimax_sparse_decode` arguments over `inputs`; `extra_rows` appends rows
+    that repeat the first rows' lengths and slots."""
+    gen = torch.Generator(device=DEVICE).manual_seed(seed)
+
+    def randn(*shape):
+        return torch.randn(*shape, device=DEVICE, generator=gen).to(torch.bfloat16)
+
+    rows = inputs["q"].shape[0] + extra_rows
+    num_slots = inputs["k_cache"].shape[0]
+    idx_q = torch.cat([inputs["q"], randn(extra_rows, 1, HEAD_DIM)])
+    args = (
+        randn(rows, 16, HEAD_DIM),
+        None,
+        randn(num_slots, 1, HEAD_DIM),
+        randn(num_slots, 1, HEAD_DIM),
+        idx_q,
+        None,
+        inputs["k_cache"],
+        None,
+    )
+    kwargs = dict(
+        req_to_token=inputs["req_to_token"],
+        slot_ids=torch.cat([inputs["slot_ids"], inputs["slot_ids"][:extra_rows]]),
+        seq_lens=torch.cat([inputs["seq_lens"], inputs["seq_lens"][:extra_rows]]),
+        max_seqlen=inputs["max_seqlen"],
+        block_size_q=1,
+        block_size_k=BLOCK_SIZE,
+        topk=TOPK,
+        init_blocks=0,
+        local_blocks=1,
+        disable_index_value=True,
+    )
+    return args, kwargs
+
+
 @NUM_DRAFTS
 @pytest.mark.parametrize("radix_topk", [True, False])
 def test_rows_straddling_block_boundaries(num_draft, radix_topk):
@@ -198,6 +237,40 @@ def test_no_local_blocks_keeps_rows_causal(num_draft):
         draft_keys="toward",
     )
     _assert_matches_per_row(inputs, num_draft=num_draft, local_blocks=0)
+
+
+@NUM_DRAFTS
+@pytest.mark.parametrize(
+    "extra_rows,score_type", [(1, "max"), (0, "lse")], ids=["ragged", "lse"]
+)
+def test_unsupported_verify_batches_fall_back_to_per_row(
+    num_draft, extra_rows, score_type
+):
+    """A batch the grouped indexer cannot score (rows not a multiple of num_draft,
+    or the lse score) must run the per-row decode indexer instead."""
+    inputs = _build([BLOCK_SIZE * 20 - 2, 3000], req_slots=[2, 1], num_draft=num_draft)
+    args, kwargs = _sparse_decode_args(inputs, seed=3, extra_rows=extra_rows)
+    kwargs["score_type"] = score_type
+    _, ref_o = minimax_sparse_decode(*args, **kwargs)
+    _, verify_o = minimax_sparse_decode(*args, **kwargs, verify_num_draft=num_draft)
+    torch.testing.assert_close(verify_o, ref_o, rtol=0, atol=0)
+
+
+@NUM_DRAFTS
+@pytest.mark.parametrize("grouped", [False, True], ids=["per_row", "grouped"])
+def test_source_layer_publishes_topk_for_reuse_layers(num_draft, grouped):
+    """A top-k sharing source layer writes its selection straight into the shared
+    buffer; the reuse layers must read exactly that selection."""
+    inputs = _build([BLOCK_SIZE * 30 - 2, 6000], req_slots=[2, 1], num_draft=num_draft)
+    args, kwargs = _sparse_decode_args(inputs, seed=0)
+    kwargs["verify_num_draft"] = num_draft if grouped else None
+    _, ref_o = minimax_sparse_decode(*args, **kwargs)
+    rows = inputs["q"].shape[0]
+    shared = torch.full((1, rows, TOPK), -7, dtype=torch.int32, device=DEVICE)
+    _, source_o = minimax_sparse_decode(*args, **kwargs, topk_out=shared)
+    _, reuse_o = minimax_sparse_decode(*args, **kwargs, cached_topk_idx=shared)
+    torch.testing.assert_close(source_o, ref_o, rtol=0, atol=0)
+    torch.testing.assert_close(reuse_o, ref_o, rtol=0, atol=0)
 
 
 def _build_paged(prefixes, *, num_draft, k_dtype, seed, tied_pages=False):

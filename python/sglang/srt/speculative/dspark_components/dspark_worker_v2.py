@@ -100,6 +100,7 @@ from sglang.srt.speculative.spec_utils import (
 from sglang.srt.utils import (
     is_cuda,
     is_cuda_alike,
+    is_hip,
     is_npu,
 )
 from sglang.srt.utils.common import async_h2d
@@ -109,7 +110,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_is_hip = is_hip()
 _is_npu = is_npu()
+
+if _is_hip:
+    from sglang.srt.speculative.dspark_components import dspark_hip as _hip
 
 
 @runtime_checkable
@@ -512,6 +517,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             device=self.device,
             simulate_acc_len=self._simulate_acc_len,
         )
+        if _is_hip:
+            _hip.defer_verify_logits_gather(self)
 
         if self._is_pd_prefill and not self._draft_is_moe:
             self.draft_model.prune_to_ctx_kv_injection()
@@ -751,6 +758,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         grammar_barrier=None,
         *,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        pull_seq_lens_cpu: Optional[Callable[[], None]] = None,
     ) -> GenerationBatchResult:
         if not self._hosts_draft:
             batch_output = self.target_worker.forward_batch_generation(
@@ -777,7 +785,9 @@ class DSparkWorkerV2(BaseSpecWorker):
             self._observers.note_prefill_step()
             return self._forward_prefill(batch, on_publish, pp_proxy_tensors)
 
-        return self._forward_decode(batch, on_publish, grammar_barrier)
+        return self._forward_decode(
+            batch, on_publish, grammar_barrier, pull_seq_lens_cpu=pull_seq_lens_cpu
+        )
 
     def _forward_dp_spec_prefill_coordination(
         self, batch, plan, on_publish, grammar_barrier, pp_proxy_tensors
@@ -964,6 +974,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         on_publish,
         grammar_barrier=None,
         coordination_plan=None,
+        pull_seq_lens_cpu: Optional[Callable[[], None]] = None,
     ) -> GenerationBatchResult:
         if batch.spec_info is None:
             batch.spec_info = DFlashDraftInputV2.create_idle_input(device=self.device)
@@ -1019,9 +1030,10 @@ class DSparkWorkerV2(BaseSpecWorker):
             if self._prepare_inputs_once
             else None
         )
+        # A deferred pull (HIP) has not filled batch.seq_lens_cpu yet.
         window_seq_lens_cpu = (
             batch.seq_lens_cpu
-            if batch.seq_lens_cpu is not None
+            if batch.seq_lens_cpu is not None and pull_seq_lens_cpu is None
             else draft_input.nxt_kv_lens_cpu
         )
         verify_window = alloc_verify_window(
@@ -1076,6 +1088,10 @@ class DSparkWorkerV2(BaseSpecWorker):
                 verify_window=verify_window,
                 seq_lens_cpu=window_seq_lens_cpu,
             )
+        if pull_seq_lens_cpu is not None:
+            # the host waits here for the previous step's publish, with the draft
+            # already queued behind it
+            pull_seq_lens_cpu()
         draft_block_ids = proposal.draft_block_ids
         draft_block = proposal.draft_block
         draft_tokens = draft_block.draft_tokens
@@ -1172,10 +1188,17 @@ class DSparkWorkerV2(BaseSpecWorker):
                     verify_ids_2d=verify_ids_2d,
                     verify_window=verify_window,
                     sampling_info=sampling_info,
+                    needs_logits=not _is_hip
+                    or _hip.verify_needs_logits(
+                        self, batch, sampling_info, simulate_bonus_sampling_info
+                    ),
                 )
                 hidden_strided = None
         logits_output = target_verify.logits_output
         can_run_cuda_graph = target_verify.can_run_cuda_graph
+        target_argmax = (
+            _hip.take_target_argmax(logits_output, verify_ids_2d) if _is_hip else None
+        )
         if batch.has_grammar:
             # run_compact scatters its rows back to (bs * chain_len), so the mask
             # lines up with the logits on both verify paths.
@@ -1229,6 +1252,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 prefix_lens=prefix_lens,
                 draft_tokens=draft_tokens,
                 simulate_bonus_sampling_info=simulate_bonus_sampling_info,
+                target_argmax=target_argmax,
             )
         engram_in_graph = (
             folded_accept and not run_compact and epilogue.folds_engram_commit
