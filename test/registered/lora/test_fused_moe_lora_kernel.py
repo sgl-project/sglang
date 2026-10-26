@@ -5,12 +5,12 @@ import sys
 import pytest
 import torch
 
-from sglang.kernels.ops.moe.fused_moe_lora_kernel import fused_moe_lora
+from sglang.kernels.ops.lora.moe.fused_moe_lora_kernel import fused_moe_lora
 
 # ==============================================================================
 # IMPORT PREBUILT KERNEL
 # ==============================================================================
-from sglang.kernels.ops.moe.moe_lora_align import moe_lora_align_block_size
+from sglang.kernels.ops.lora.moe.moe_lora_align import moe_lora_align_block_size
 from sglang.srt.lora.lora_moe_runners import _naive_moe_lora_align_block_size
 from sglang.srt.utils import get_device, is_xpu, set_random_seed
 from sglang.test.ci.ci_register import register_cuda_ci

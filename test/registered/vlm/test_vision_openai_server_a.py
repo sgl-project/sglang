@@ -229,8 +229,8 @@ class TestKimiVLServer(ImageOpenAITestMixin):
         "--mem-fraction-static=0.42",
     ]
 
+    @unittest.skip("model context length exceeded")
     def test_video_images_chat_completion(self):
-        # model context length exceeded
         pass
 
 

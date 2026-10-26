@@ -1,3 +1,72 @@
+from types import SimpleNamespace
+
+import pytest
+import torch
+import torch.nn as nn
+
+from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
+from sglang.multimodal_gen.configs.pipeline_configs.longlive2 import LongLive2T2VConfig
+from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency import (
+    ACTIVATION_EXTRAPOLATION_MARGIN,
+    GIB_BYTES,
+    MAX_LAYERWISE_COMPONENT_TARGETS,
+    MAX_LAYERWISE_PIN_TARGETS,
+    MAX_LAYERWISE_POLICY_TARGETS,
+    MAX_LAYERWISE_RESIDENT_TARGETS,
+    MIN_VRAM_RESERVE_BYTES,
+    PAGEABLE_H2D_COST_MULTIPLIER,
+    AppliedResidencyChange,
+    AutoResidencyPlan,
+    AutoResidencyRollbackError,
+    DefaultWorkload,
+    RankResidencyReport,
+    ResidencyTarget,
+    WarmupMemoryRecord,
+    _layerwise_pin_targets,
+    _layerwise_policy_targets,
+    _layerwise_resident_targets,
+    apply_residency_changes,
+    collect_residency_targets,
+    commit_residency_changes,
+    component_resident_size_bytes,
+    component_runtime_weight_bytes,
+    current_placement_reserve_shortfall_bytes,
+    estimate_allocator_headroom_bytes,
+    estimate_candidate_latency_savings_ns,
+    estimate_default_workload_peak_bytes,
+    estimate_default_workload_timing,
+    estimate_layerwise_layer_uses,
+    estimate_workload_phase_peaks,
+    format_applied_changes,
+    measured_failed_workload_phase_peaks,
+    plan_auto_residency,
+    rank_candidates_by_h2d_savings,
+    resolve_measured_default_workload,
+    rollback_residency_changes,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
+    COMPONENT_OFFLOAD,
+    LAYERWISE_OFFLOAD,
+    RESIDENT,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget import (
+    HostPinBudget,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
+    RESIDENCY_POLICY_LEADING,
+    RESIDENCY_POLICY_STRIDED,
+)
+from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.warmup_request_builder import (
+    SERVER_WARMUP_MAX_VIDEO_FRAMES,
+    _resolve_auto_residency_warmup_shape,
+    _resolve_warmup_num_frames,
+)
+
 # SPDX-License-Identifier: Apache-2.0
 """Unit tests for warmup-calibrated auto residency adjustment."""
 
@@ -41,8 +110,6 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency impor
     estimate_allocator_headroom_bytes,
     estimate_candidate_latency_savings_ns,
     estimate_default_workload_peak_bytes,
-    estimate_default_workload_timing,
-    estimate_layerwise_layer_uses,
     estimate_workload_phase_peaks,
     format_applied_changes,
     measured_failed_workload_phase_peaks,
@@ -947,6 +1014,8 @@ def _report(
     estimated_gib: float | None = 50,
     planning_headroom_correction_gib: int = 0,
     observed_reserved_gib: float = 0,
+    peak_allocation_limit_gib: float | None = None,
+    phase_allocation_limits_gib: dict[str, float] | None = None,
     candidates: list[ResidencyTarget] | None = None,
     skip_reason: str | None = None,
     phase_peaks_gib: dict[str, float] | None = None,
@@ -979,6 +1048,15 @@ def _report(
         ),
         target_workload_measured=target_workload_measured,
         observed_reserved_bytes=observed_reserved_gib * GIB_BYTES,
+        peak_allocation_limit_bytes=(
+            None
+            if peak_allocation_limit_gib is None
+            else int(peak_allocation_limit_gib * GIB_BYTES)
+        ),
+        phase_allocation_limit_bytes={
+            name: int(value * GIB_BYTES)
+            for name, value in (phase_allocation_limits_gib or {}).items()
+        },
         estimated_peak_bytes_by_phase={
             name: int(value * GIB_BYTES)
             for name, value in (phase_peaks_gib or {}).items()
@@ -1071,6 +1149,131 @@ class TestResolveMeasuredDefaultWorkload:
 
 
 class TestPlanAutoResidency:
+    def test_smaller_phase_with_tighter_frozen_limit_remains_binding(self):
+        plan = plan_auto_residency(
+            reports=[
+                _report(
+                    budget_gib=180,
+                    estimated_gib=50,
+                    peak_allocation_limit_gib=50,
+                    phase_allocation_limits_gib={"encode": 50, "wide": 30, "tight": 20},
+                    phase_peaks_gib={"encode": 50, "wide": 29, "tight": 20},
+                    phase_components={
+                        "encode": ("encoder",),
+                        "wide": ("transformer",),
+                        "tight": ("transformer",),
+                    },
+                    candidates=[_candidate("encoder", weight_gib=1)],
+                )
+            ]
+        )
+        assert not plan.changes
+        assert plan.resource_budget_bytes["gpu:rank0:tight"] == 0
+
+    @pytest.mark.parametrize("suffix", ["", ":layout:0"])
+    def test_encoding_headroom_cannot_increase_a_cached_denoising_request(self, suffix):
+        plan = plan_auto_residency(
+            reports=[
+                _report(
+                    budget_gib=180,
+                    estimated_gib=30,
+                    peak_allocation_limit_gib=30,
+                    phase_allocation_limits_gib={"denoise": 20, "encode": 30},
+                    phase_peaks_gib={f"denoise{suffix}": 20, "encode": 30},
+                    phase_components={
+                        f"denoise{suffix}": ("transformer",),
+                        "encode": ("encoder",),
+                    },
+                    candidates=[_candidate("encoder", weight_gib=5)],
+                )
+            ]
+        )
+        assert not plan.changes
+
+    @pytest.mark.parametrize("suffix", ["", ":layout:0"])
+    def test_validation_enforces_phase_limits_below_the_global_peak(self, suffix):
+        report = _report(
+            budget_gib=180,
+            estimated_gib=30,
+            peak_allocation_limit_gib=30,
+            phase_allocation_limits_gib={"denoise": 20},
+            phase_peaks_gib={f"denoise{suffix}": 25},
+        )
+        assert current_placement_reserve_shortfall_bytes([report]) == 5 * GIB_BYTES
+
+    @pytest.mark.parametrize(
+        "peak_gib,limit_gib,expected", [(30, 30, False), (20, 30, True)]
+    )
+    def test_allocated_peak_budget_limits_resident_promotions(
+        self, peak_gib, limit_gib, expected
+    ):
+        plan = plan_auto_residency(
+            reports=[
+                _report(
+                    budget_gib=180,
+                    estimated_gib=limit_gib,
+                    peak_allocation_limit_gib=limit_gib,
+                    phase_peaks_gib={"denoise": peak_gib, "encode": limit_gib},
+                    phase_components={
+                        "denoise": ("transformer",),
+                        "encode": ("encoder",),
+                    },
+                    candidates=[_candidate("encoder", weight_gib=5)],
+                )
+            ]
+        )
+        assert bool(plan.changes) is expected
+
+    def test_allocated_peak_budget_must_fit_every_rank(self):
+        plan = plan_auto_residency(
+            reports=[
+                _report(
+                    rank=rank,
+                    budget_gib=180,
+                    estimated_gib=peak,
+                    peak_allocation_limit_gib=30,
+                    candidates=[_candidate("encoder", weight_gib=5)],
+                )
+                for rank, peak in [(0, 10), (1, 30)]
+            ]
+        )
+        assert not plan.changes
+
+    def test_allocated_peak_budget_also_limits_materialization(self):
+        candidate = ResidencyTarget(
+            component_name="encoder",
+            residency_mode=COMPONENT_OFFLOAD,
+            target_residency_mode=RESIDENT,
+            target_resident_weight_bytes=5 * GIB_BYTES,
+            h2d_bytes_per_request=5 * GIB_BYTES,
+            device_transition_delta_bytes=5 * GIB_BYTES,
+        )
+        plan = plan_auto_residency(
+            reports=[
+                _report(
+                    budget_gib=180,
+                    estimated_gib=10,
+                    peak_allocation_limit_gib=20,
+                    device_transition_allocated_gib=19,
+                    candidates=[candidate],
+                )
+            ]
+        )
+        assert not plan.changes
+
+    @pytest.mark.parametrize("allocated_gib,expected", [(20, 0), (21, GIB_BYTES)])
+    def test_validation_checks_allocated_budget_separately_from_reserved_pool(
+        self, allocated_gib, expected
+    ):
+        report = _report(
+            budget_gib=180,
+            estimated_gib=allocated_gib,
+            peak_allocation_limit_gib=20,
+            observed_reserved_gib=30,
+            target_workload_measured=True,
+        )
+        assert current_placement_reserve_shortfall_bytes([report]) == expected
+
     def test_rank_skip_reason_propagates(self):
         plan = plan_auto_residency(
             reports=[_report(), _report(rank=1, skip_reason="no measurements")]
@@ -3119,6 +3322,48 @@ class TestSizeAccounting:
 
 
 class TestCollectResidencyTargets:
+    @pytest.mark.parametrize("lifetime", ["forward", "permanent"])
+    @pytest.mark.parametrize("policy", ["leading", "strided"])
+    def test_lazy_frontier_uses_real_server_args_tuning(self, lifetime, policy):
+        args = ServerArgs.__new__(ServerArgs)
+        args.layerwise_prefetch_size = {"transformer": "1"}
+        args.layerwise_resident_layers = None
+        args.layerwise_residency_policy = {"transformer": policy}
+        args.layerwise_residency_lifetime = {"transformer": lifetime}
+        args.dit_offload_prefetch_size = 0.0
+        args.dit_layerwise_resident_layers = 0.0
+        args.dit_layerwise_residency_policy = "leading"
+        args.dit_layerwise_residency_lifetime = "forward"
+        module = _FakeLazyLayerwiseDit()
+
+        candidates = collect_residency_targets(
+            modules={"transformer": module},
+            residency_mode_of=lambda _name: COMPONENT_OFFLOAD,
+            explicit_residency_mode_of=lambda _name: None,
+            custom_strategy_names=(),
+            num_inference_steps=4,
+            layerwise_tuning_of=lambda name, dit_group: args.layerwise_tuning_for(
+                name, dit_group=dit_group
+            ),
+            layerwise_policy_is_explicit=lambda _name, _dit_group: True,
+        )
+        layerwise = [
+            candidate
+            for candidate in candidates
+            if candidate.target_mode() == LAYERWISE_OFFLOAD
+        ]
+        assert layerwise
+        assert all(
+            candidate.target_layerwise_residency_policies is None
+            for candidate in layerwise
+        )
+        assert args.layerwise_tuning_for("transformer", dit_group=True) == (
+            1.0,
+            0.0,
+            policy,
+            lifetime,
+        )
+
     def _modes(self, mapping):
         return lambda name: mapping.get(name, RESIDENT)
 
@@ -3546,7 +3791,12 @@ class TestCollectResidencyTargets:
             explicit_residency_mode_of=lambda _name: None,
             custom_strategy_names=(),
             num_inference_steps=10,
-            layerwise_tuning_of=lambda _name, _dit_group: (0.0, 0.0, "leading"),
+            layerwise_tuning_of=lambda _name, _dit_group: (
+                0.0,
+                0.0,
+                "leading",
+                "forward",
+            ),
         )
 
         assert any(
@@ -3580,7 +3830,12 @@ class TestCollectResidencyTargets:
             explicit_residency_mode_of=lambda _name: None,
             custom_strategy_names=(),
             num_inference_steps=10,
-            layerwise_tuning_of=lambda _name, _dit_group: (0.0, 0.0, "leading"),
+            layerwise_tuning_of=lambda _name, _dit_group: (
+                0.0,
+                0.0,
+                "leading",
+                "forward",
+            ),
         )
 
         component = next(
@@ -3624,7 +3879,12 @@ class TestCollectResidencyTargets:
             explicit_residency_mode_of=lambda _name: None,
             custom_strategy_names=(),
             num_inference_steps=4,
-            layerwise_tuning_of=lambda _name, _dit_group: (1.0, 0.0, "leading"),
+            layerwise_tuning_of=lambda _name, _dit_group: (
+                1.0,
+                0.0,
+                "leading",
+                "forward",
+            ),
         )
 
         streamed = next(
@@ -3649,7 +3909,12 @@ class TestCollectResidencyTargets:
             explicit_residency_mode_of=lambda _name: None,
             custom_strategy_names=(),
             num_inference_steps=10,
-            layerwise_tuning_of=lambda _name, _dit_group: (0.0, 0.0, "leading"),
+            layerwise_tuning_of=lambda _name, _dit_group: (
+                0.0,
+                0.0,
+                "leading",
+                "forward",
+            ),
         )
 
         full_stage = next(
@@ -3860,7 +4125,12 @@ class TestCollectResidencyTargets:
             explicit_residency_mode_of=lambda _name: None,
             custom_strategy_names=(),
             num_inference_steps=4,
-            layerwise_tuning_of=lambda _name, _dit_group: (1.0, 0.0, "leading"),
+            layerwise_tuning_of=lambda _name, _dit_group: (
+                1.0,
+                0.0,
+                "leading",
+                "forward",
+            ),
         )
 
         assert {candidate.target_mode() for candidate in candidates} == {
@@ -3937,6 +4207,7 @@ class TestCollectResidencyTargets:
                 0.0,
                 0.0,
                 "leading",
+                "forward",
             ),
         )
 
@@ -4045,6 +4316,7 @@ class TestCollectResidencyTargets:
                 1.0,
                 0.0,
                 "leading",
+                "forward",
             ),
         )
 
@@ -4103,7 +4375,12 @@ class TestCollectResidencyTargets:
             explicit_residency_mode_of=lambda _name: None,
             custom_strategy_names=(),
             num_inference_steps=1,
-            layerwise_tuning_of=lambda _name, _dit_group: (1.0, 0.0, "leading"),
+            layerwise_tuning_of=lambda _name, _dit_group: (
+                1.0,
+                0.0,
+                "leading",
+                "forward",
+            ),
         )
 
         assert {candidate.target_mode() for candidate in candidates} == {
@@ -4124,7 +4401,12 @@ class TestCollectResidencyTargets:
             explicit_residency_mode_of=lambda _name: None,
             custom_strategy_names=(),
             num_inference_steps=4,
-            layerwise_tuning_of=lambda _name, _dit_group: (1.0, 0.0, "leading"),
+            layerwise_tuning_of=lambda _name, _dit_group: (
+                1.0,
+                0.0,
+                "leading",
+                "forward",
+            ),
         )
 
         streamed = [
@@ -4157,7 +4439,12 @@ class TestCollectResidencyTargets:
             explicit_residency_mode_of=lambda _name: None,
             custom_strategy_names=(),
             num_inference_steps=4,
-            layerwise_tuning_of=lambda _name, _dit_group: (1.0, 0.0, "leading"),
+            layerwise_tuning_of=lambda _name, _dit_group: (
+                1.0,
+                0.0,
+                "leading",
+                "forward",
+            ),
         )
 
         streamed = next(
@@ -4188,7 +4475,12 @@ class TestApplyAndRollback:
             explicit_residency_mode_of=lambda _name: None,
             custom_strategy_names=(),
             num_inference_steps=10,
-            layerwise_tuning_of=lambda _name, _dit_group: (0.0, 0.0, "leading"),
+            layerwise_tuning_of=lambda _name, _dit_group: (
+                0.0,
+                0.0,
+                "leading",
+                "forward",
+            ),
         )
         target = next(
             candidate
@@ -5155,8 +5447,9 @@ class TestAutoResidencySkipReason:
     ):
         monkeypatch.delenv("SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY", raising=False)
         monkeypatch.delenv("SGLANG_CACHE_DIT_ENABLED", raising=False)
+        monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
         reason = self._skip_reason(self._base_args(**overrides))
-        assert reason is None or reason == "requires CUDA"
+        assert reason is None
 
     def test_fixed_loading_components_are_excluded_individually(self):
         from sglang.multimodal_gen.runtime.server_args.auto_tune import (
@@ -5204,15 +5497,17 @@ class TestAutoResidencySkipReason:
             {"use_fsdp_inference": True},
         ],
     )
-    def test_parallel_paths_reach_platform_gate(self, monkeypatch, overrides):
+    def test_parallel_paths_reach_planner_gate(self, monkeypatch, overrides):
         monkeypatch.delenv("SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY", raising=False)
         monkeypatch.delenv("SGLANG_CACHE_DIT_ENABLED", raising=False)
+        monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
         reason = self._skip_reason(self._base_args(**overrides))
-        assert reason is None or reason == "requires CUDA"
+        assert reason is None
 
-    def test_eligible_path_reaches_platform_gate(self, monkeypatch):
+    def test_eligible_path_reaches_planner_gate(self, monkeypatch):
         monkeypatch.delenv("SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY", raising=False)
         monkeypatch.delenv("SGLANG_CACHE_DIT_ENABLED", raising=False)
+        monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
         reason = self._skip_reason(self._base_args())
         # on a CUDA host everything passes; CPU CI stops at the platform gate
         assert reason is None or reason == "requires CUDA"

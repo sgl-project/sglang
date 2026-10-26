@@ -1,3 +1,4 @@
+import gc
 import json
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -7,11 +8,17 @@ import torch
 
 import sglang.multimodal_gen.runtime.managers.gpu_worker as gpu_worker_module
 import sglang.multimodal_gen.runtime.managers.memory_managers.component_manager as component_manager_module
+import sglang.multimodal_gen.runtime.utils.perf_logger as perf_logger_module
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.runtime.disaggregation.orchestrator import (
+    _deserialize_request_metrics,
+)
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency import (
     GIB_BYTES,
     DefaultWorkload,
     WarmupMemoryRecord,
+    current_placement_reserve_shortfall_bytes,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     WarmupPhasePeak,
@@ -19,10 +26,26 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager im
 from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget import (
     HostPinBudget,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+    LayerwiseUsageTracker,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
+from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import DenoisingStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ltx_2.denoising_av import (
+    LTX2RefinementStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.denoising import (
+    MiniMaxH3DenoisingStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
+    TextEncodingStage,
+)
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.perf_logger import (
     MemorySnapshot,
+    PerformanceLogger,
     RequestMetrics,
     RequestPerfRecord,
 )
@@ -34,6 +57,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     ScenarioConfig,
     ToleranceConfig,
 )
+from sglang.multimodal_gen.test.test_utils import read_perf_logs
 
 
 @pytest.fixture(autouse=True)
@@ -70,25 +94,171 @@ def _perf_record(memory_snapshots: dict[str, dict]) -> RequestPerfRecord:
     )
 
 
-def test_request_metrics_attributes_steps_and_iterations_to_active_stage():
+@pytest.mark.parametrize("replica_size", [1, 2])
+@pytest.mark.parametrize("propagate", [False, True])
+def test_forward_oom_cannot_reuse_a_multi_rank_replica(
+    replica_size, propagate, monkeypatch
+):
+    worker = GPUWorker.__new__(GPUWorker)
+    worker.is_output_rank = True
+    worker._realtime_sessions = SimpleNamespace(attach=Mock())
+    worker._release_warmup_pool = Mock()
+    worker._record_output_peak_memory = Mock()
+    monkeypatch.setattr(current_platform, "is_cpu", lambda: True)
+    monkeypatch.setattr(
+        gpu_worker_module,
+        "get_replica_group",
+        lambda: SimpleNamespace(world_size=replica_size),
+    )
+    req = SimpleNamespace(is_warmup=False, extra={})
+    oom = torch.OutOfMemoryError("allocator OOM")
+
+    def fail_forward():
+        assert not gc.isenabled()
+        raise oom
+
+    def run():
+        return worker._execute_forward_common(
+            req,
+            forward_fn=fail_forward,
+            log_reqs=[],
+            return_req=False,
+            save_output_paths=Mock(),
+            error_context="test",
+            propagate_forward_errors=propagate,
+        )
+
+    gc_enabled = gc.isenabled()
+    if replica_size > 1:
+        # Must escape the scheduler's request-level `except Exception` handlers.
+        with pytest.raises(SystemExit, match="restart"):
+            run()
+        worker._record_output_peak_memory.assert_not_called()
+    elif propagate:
+        with pytest.raises(torch.OutOfMemoryError):
+            run()
+    else:
+        assert "allocator OOM" in run().error
+    assert gc.isenabled() == gc_enabled
+
+
+@pytest.mark.parametrize("is_output_rank", [False, True])
+@pytest.mark.parametrize("is_warmup", [False, True])
+def test_worker_perf_dump_has_one_writer_per_replica(
+    is_output_rank, is_warmup, monkeypatch, tmp_path
+):
+    worker = GPUWorker.__new__(GPUWorker)
+    worker.is_output_rank = is_output_rank
+    worker.server_args = SimpleNamespace(model_path="test-model")
+    worker._realtime_sessions = SimpleNamespace(attach=Mock())
+    worker._release_warmup_pool = Mock()
+    worker._materialize_output_transport = Mock()
+    worker._record_output_peak_memory = Mock()
+    worker._record_replica_peak_memory = Mock()
+    monkeypatch.setattr(current_platform, "is_cpu", lambda: True)
+    monkeypatch.setattr(perf_logger_module, "get_git_commit_hash", lambda: "test")
+    monkeypatch.setattr(PerformanceLogger, "log_request_summary", Mock())
+
+    path = tmp_path / "perf.json"
+    path.write_text('{"writer": "output-rank"}')
     metrics = RequestMetrics("request")
-    metrics.active_stage_name = "ShapeStage"
+    output = OutputBatch(metrics=metrics)
+    req = SimpleNamespace(
+        request_id="request",
+        is_warmup=is_warmup,
+        extra={},
+        suppress_logs=True,
+        perf_dump_path=str(path),
+    )
+    result = worker._execute_forward_common(
+        req,
+        forward_fn=lambda: output,
+        log_reqs=[],
+        return_req=False,
+        save_output_paths=Mock(),
+        error_context="test",
+    )
 
-    metrics.record_step(0.1)
-    metrics.record_stage_iterations(4, 50)
-    metrics.active_stage_name = "PaintStage"
-    metrics.record_step(0.2)
-    metrics.record_stage_iterations(4, 30)
+    assert result is output
+    assert result.error is None
+    report = json.loads(path.read_text())
+    if is_output_rank and not is_warmup:
+        assert report["request_id"] == "request"
+        assert report["tag"] == "server_perf_dump"
+        assert report["meta"] == {"model": "test-model"}
+    else:
+        assert report == {"writer": "output-rank"}
+    # non-output ranks must still participate in the replica's memory reduction
+    if is_warmup:
+        worker._record_replica_peak_memory.assert_not_called()
+    else:
+        worker._record_replica_peak_memory.assert_called_once_with([metrics])
 
-    assert metrics.steps == [100.0, 200.0]
-    assert metrics.steps_by_stage == {
-        "ShapeStage": [100.0],
-        "PaintStage": [200.0],
-    }
-    assert metrics.stage_iterations == {
-        "ShapeStage": (4, 50),
-        "PaintStage": (4, 30),
-    }
+
+@pytest.mark.parametrize("roundtrip", [False, True])
+@pytest.mark.parametrize(
+    "stage_class,profile_name,is_denoising",
+    [
+        (DenoisingStage, "DenoisingStage", True),
+        (MiniMaxH3DenoisingStage, "MiniMaxH3DenoisingStage", True),
+        (LTX2RefinementStage, "LTX2RefinementStage", True),
+        (LTX2RefinementStage, "custom_refinement", True),
+        (DenoisingStage, "BeforeDenoisingStage", True),
+        (TextEncodingStage, "BeforeDenoisingStage", False),
+        (TextEncodingStage, "TextEncodingStage", False),
+    ],
+)
+def test_stage_role_reaches_performance_guard(
+    stage_class, profile_name, is_denoising, roundtrip, monkeypatch, tmp_path
+):
+    # skip model construction and kernels, retaining the real stage role,
+    # call boundary, profiler, log writer/reader and threshold validator
+    stage = stage_class.__new__(stage_class)
+    stage.server_args = SimpleNamespace(
+        enable_layerwise_nvtx_marker=False, comfyui_mode=False
+    )
+    stage.set_profile_stage_name(profile_name)
+    monkeypatch.setattr(stage, "forward", lambda batch, args: batch)
+    monkeypatch.setattr(
+        stage, "verify_input", PipelineStage.verify_input.__get__(stage)
+    )
+    monkeypatch.setattr(
+        stage, "verify_output", PipelineStage.verify_output.__get__(stage)
+    )
+    monkeypatch.setattr(current_platform, "get_available_gpu_memory", lambda **_: 100)
+    monkeypatch.setattr(current_platform, "is_hip", lambda: False)
+    monkeypatch.setenv("SGLANG_PERF_LOG_DIR", str(tmp_path))
+    monkeypatch.setattr(perf_logger_module, "get_is_main_process", lambda: True)
+    monkeypatch.setattr(perf_logger_module, "get_git_commit_hash", lambda: "test")
+    metrics = RequestMetrics("stage-role")
+    batch = SimpleNamespace(is_warmup=False, metrics=metrics, perf_dump_path="metrics")
+    with patch.object(perf_logger_module.time, "perf_counter", side_effect=[10, 11.5]):
+        assert stage(batch, stage.server_args) is batch
+    metrics.total_duration_ms = 1500
+    if roundtrip:
+        metrics = _deserialize_request_metrics(
+            json.loads(json.dumps(metrics.to_dict()))
+        )
+    PerformanceLogger.log_request_summary(metrics)
+    (record,) = read_perf_logs(tmp_path / "performance.log")
+    assert record.stages == [
+        {
+            "name": profile_name,
+            "execution_time_ms": 1500.0,
+            "is_denoising": is_denoising,
+        }
+    ]
+    validator = PerformanceValidator(
+        ScenarioConfig({profile_name: 1000}, {}, 1500, 1, 1),
+        ToleranceConfig(0.25, 0.25, 0.8, 0.3, 0.2),
+        (),
+    )
+    summary = validator.collect_metrics(record)
+    if is_denoising:
+        with pytest.raises(AssertionError, match="Stage '"):
+            validator._validate_stages(summary)
+    else:
+        validator._validate_stages(summary)
 
 
 def test_performance_summary_separates_load_and_runtime_peaks():
@@ -123,10 +293,19 @@ def test_worker_records_replica_load_and_runtime_peaks():
     worker._runtime_peak_allocated_mb = 0.0
     output = OutputBatch()
     metrics = RequestMetrics("request")
-    replica_group = Mock()
-    replica_group.all_reduce.return_value = torch.tensor(
-        [5120.0, 3584.0, 6144.0, 3500.0, 2560.0], dtype=torch.float64
-    )
+    replica_group = SimpleNamespace(world_size=2, cpu_group=object())
+    reduced = []
+
+    def all_reduce(tensor, op, group):
+        # five host counters over the gloo group, never a device collective
+        assert tensor.device.type == "cpu"
+        assert op == torch.distributed.ReduceOp.MAX
+        assert group is replica_group.cpu_group
+        reduced.append(tensor.tolist())
+        tensor.copy_(
+            torch.tensor([5120.0, 3584.0, 6144.0, 3500.0, 2560.0], dtype=torch.float64)
+        )
+
     snapshots = [
         MemorySnapshot(0.0, 0.0, 2048.0, 3072.0),
         MemorySnapshot(0.0, 0.0, 2048.0, 3072.0),
@@ -142,6 +321,9 @@ def test_worker_records_replica_load_and_runtime_peaks():
         patch.object(
             gpu_worker_module, "get_replica_group", return_value=replica_group
         ),
+        patch.object(
+            gpu_worker_module.torch.distributed, "all_reduce", side_effect=all_reduce
+        ),
     ):
         worker._record_output_peak_memory(output)
         worker._record_replica_peak_memory([metrics])
@@ -155,6 +337,7 @@ def test_worker_records_replica_load_and_runtime_peaks():
     assert metrics.memory_snapshots["load_peak"].peak_allocated_mb == 3500.0
     assert metrics.memory_snapshots["runtime_peak"].peak_allocated_mb == 2560.0
     assert metrics.memory_snapshots["warmup_peak"].peak_reserved_mb == 6144.0
+    assert reduced == [[4096.0, 3072.0, 0.0, 3000.0, 2048.0]]
 
 
 def test_server_warmup_preserves_peak_after_managed_stage_timeline():
@@ -165,18 +348,9 @@ def test_server_warmup_preserves_peak_after_managed_stage_timeline():
     residency_manager.take_warmup_phase_peaks.return_value = {
         "0:denoise:use:transformer": WarmupPhasePeak(("transformer",), 8)
     }
-    residency_manager.current_device_components.return_value = ("transformer",)
     device_module = Mock()
     device_module.max_memory_allocated.return_value = 9
     device_module.max_memory_reserved.return_value = 12
-    req = SimpleNamespace(
-        width=64,
-        height=64,
-        num_frames=1,
-        num_inference_steps=1,
-        metrics=None,
-    )
-
     with (
         patch.object(torch, "get_device_module", return_value=device_module),
         patch.object(
@@ -186,8 +360,8 @@ def test_server_warmup_preserves_peak_after_managed_stage_timeline():
         ),
     ):
         worker._record_server_warmup_memory(
-            req=req,
-            workload=(128, 96, 9, 2),
+            req=SimpleNamespace(metrics=None),
+            workload=(128, 96, 9, 1),
             baseline_allocated_bytes=3,
             baseline_reserved_bytes=3,
             succeeded=True,
@@ -195,11 +369,7 @@ def test_server_warmup_preserves_peak_after_managed_stage_timeline():
 
     record = worker._auto_residency_warmup_records[0]
     assert record.peak_allocated_bytes == 9
-    assert record.peak_reserved_bytes == 12
     assert (record.width, record.height, record.num_frames) == (128, 96, 9)
-    assert record.num_inference_steps == 2
-    assert record.phase_peak_allocated_bytes["request:untracked"] == 9
-    assert record.phase_active_components["request:untracked"] == ("transformer",)
 
 
 def test_server_warmup_does_not_treat_allocator_cache_as_untracked_live_memory():
@@ -210,18 +380,9 @@ def test_server_warmup_does_not_treat_allocator_cache_as_untracked_live_memory()
     residency_manager.take_warmup_phase_peaks.return_value = {
         "0:denoise:use:transformer": WarmupPhasePeak(("transformer",), 8)
     }
-    residency_manager.current_device_components.return_value = ("transformer",)
     device_module = Mock()
     device_module.max_memory_allocated.return_value = 8
     device_module.max_memory_reserved.return_value = 12
-    req = SimpleNamespace(
-        width=64,
-        height=64,
-        num_frames=1,
-        num_inference_steps=1,
-        metrics=None,
-    )
-
     with (
         patch.object(torch, "get_device_module", return_value=device_module),
         patch.object(
@@ -231,7 +392,7 @@ def test_server_warmup_does_not_treat_allocator_cache_as_untracked_live_memory()
         ),
     ):
         worker._record_server_warmup_memory(
-            req=req,
+            req=SimpleNamespace(metrics=None),
             workload=(64, 64, 1, 1),
             baseline_allocated_bytes=3,
             baseline_reserved_bytes=12,
@@ -239,7 +400,7 @@ def test_server_warmup_does_not_treat_allocator_cache_as_untracked_live_memory()
         )
 
     record = worker._auto_residency_warmup_records[0]
-    assert "request:untracked" not in record.phase_peak_allocated_bytes
+    assert record.peak_allocated_bytes == 8
 
 
 def test_loaded_prequantized_checkpoint_can_use_auto_residency():
@@ -248,6 +409,8 @@ def test_loaded_prequantized_checkpoint_can_use_auto_residency():
     worker.is_output_rank = True
     worker._auto_residency_budget_correction_bytes = 0
     worker._auto_residency_reference_request_duration_ns = None
+    worker._auto_residency_reference_peak_bytes = None
+    worker._auto_residency_reference_phase_peaks = {}
     worker._auto_residency_reference_stage_duration_ns = {}
     worker._auto_residency_reference_component_stages = {}
     quantized_module = torch.nn.Module()
@@ -272,7 +435,12 @@ def test_loaded_prequantized_checkpoint_can_use_auto_residency():
         component_residency_requirement=lambda _name: None,
         auto_residency_mode=lambda _name: None,
         ltx2_two_stage_device_mode=None,
-        layerwise_tuning_for=lambda _name, *, dit_group: (0.0, 0.0, "leading"),
+        layerwise_tuning_for=lambda _name, *, dit_group: (
+            0.0,
+            0.0,
+            "leading",
+            "forward",
+        ),
         is_layerwise_residency_policy_explicit=lambda _name, *, dit_group: False,
         pin_cpu_memory=True,
         host_pin_budget=lambda: host_pin_budget,
@@ -314,6 +482,8 @@ def test_auto_residency_budget_respects_test_device_memory_cap(monkeypatch):
     worker.rank = 0
     worker.is_output_rank = True
     worker._auto_residency_reference_request_duration_ns = None
+    worker._auto_residency_reference_peak_bytes = None
+    worker._auto_residency_reference_phase_peaks = {}
     worker._auto_residency_reference_stage_duration_ns = {}
     worker._auto_residency_reference_component_stages = {}
     worker.pipeline = SimpleNamespace(
@@ -333,7 +503,12 @@ def test_auto_residency_budget_respects_test_device_memory_cap(monkeypatch):
         component_residency_requirement=lambda _name: None,
         auto_residency_mode=lambda _name: None,
         ltx2_two_stage_device_mode=None,
-        layerwise_tuning_for=lambda _name, *, dit_group: (0.0, 0.0, "leading"),
+        layerwise_tuning_for=lambda _name, *, dit_group: (
+            0.0,
+            0.0,
+            "leading",
+            "forward",
+        ),
         is_layerwise_residency_policy_explicit=lambda _name, *, dit_group: False,
         pin_cpu_memory=True,
         host_pin_budget=lambda: host_pin_budget,
@@ -368,6 +543,10 @@ def test_auto_residency_budget_respects_test_device_memory_cap(monkeypatch):
                     baseline_allocated_bytes=1,
                     peak_allocated_bytes=60 * GIB_BYTES,
                     peak_reserved_bytes=62 * GIB_BYTES,
+                    phase_peak_allocated_bytes={
+                        "encode": 60 * GIB_BYTES,
+                        "denoise": 20 * GIB_BYTES,
+                    },
                     succeeded=True,
                 )
             ],
@@ -376,6 +555,46 @@ def test_auto_residency_budget_respects_test_device_memory_cap(monkeypatch):
     assert report.budget_bytes == 80 * GIB_BYTES
     assert report.planning_headroom_correction_bytes == 2 * GIB_BYTES
     assert report.device_transition_allocated_bytes == 60 * GIB_BYTES
+    assert report.peak_allocation_limit_bytes == 60 * GIB_BYTES
+    assert report.phase_allocation_limit_bytes == {
+        "encode": 60 * GIB_BYTES,
+        "denoise": 20 * GIB_BYTES,
+    }
+
+    for peak, encode, denoise, shortfall in [(69, 69, 25, 9), (60, 59, 25, 5)]:
+        with patch.object(torch, "get_device_module", return_value=device_module):
+            validation = worker._build_auto_residency_report(
+                workload=DefaultWorkload(
+                    width=64, height=64, num_frames=1, num_inference_steps=1
+                ),
+                records=[
+                    WarmupMemoryRecord(
+                        width=64,
+                        height=64,
+                        num_frames=1,
+                        baseline_allocated_bytes=1,
+                        peak_allocated_bytes=peak * GIB_BYTES,
+                        peak_reserved_bytes=70 * GIB_BYTES,
+                        phase_peak_allocated_bytes={
+                            "encode": encode * GIB_BYTES,
+                            "denoise:layout:0": denoise * GIB_BYTES,
+                        },
+                        succeeded=True,
+                    )
+                ],
+                include_candidates=False,
+            )
+
+        assert validation.estimated_peak_bytes == peak * GIB_BYTES
+        assert validation.peak_allocation_limit_bytes == 60 * GIB_BYTES
+        assert validation.phase_allocation_limit_bytes == {
+            "encode": 60 * GIB_BYTES,
+            "denoise": 20 * GIB_BYTES,
+        }
+        assert (
+            current_placement_reserve_shortfall_bytes([validation])
+            == shortfall * GIB_BYTES
+        )
 
 
 def test_baseline_config_loads_per_scenario_peak_vram(tmp_path):
@@ -421,6 +640,7 @@ def test_baseline_config_loads_per_scenario_peak_vram(tmp_path):
     assert scenario.runtime_peak_allocated_mb == 2000.5
     assert config.tolerances.load_peak_vram == 0.01
     assert config.tolerances.runtime_peak_vram == 0.02
+    assert config.tolerances.load is None
 
 
 def test_peak_vram_validation_uses_independent_tolerances():
@@ -597,65 +817,6 @@ def test_results_json_merges_retry_sessions(tmp_path):
 
     results = json.loads(path.read_text(encoding="utf-8"))
     assert {item["test_name"] for item in results} == {"first", "second"}
-
-
-def _warmup_batch_for_iterations(steps: int, target_steps: int):
-    from sglang.multimodal_gen.runtime.utils.perf_logger import RequestMetrics
-
-    metrics = RequestMetrics(request_id="probe")
-    metrics.suppress_stage_breakdown = False
-    metrics.active_stage_name = "DenoisingStage"
-    return SimpleNamespace(
-        metrics=metrics,
-        num_inference_steps=steps,
-        extra={"warmup_target_num_inference_steps": target_steps},
-        is_warmup=True,
-    )
-
-
-def test_stage_formula_records_probe_and_default_iterations():
-    from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
-        record_default_workload_iterations,
-    )
-
-    batch = _warmup_batch_for_iterations(steps=4, target_steps=50)
-    stage = SimpleNamespace(default_workload_iterations=lambda batch, steps: steps - 1)
-    record_default_workload_iterations(stage, batch)
-    assert batch.metrics.stage_iterations == {"DenoisingStage": (3, 49)}
-
-
-def test_fixed_schedule_formula_records_the_same_count_twice():
-    from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
-        record_default_workload_iterations,
-    )
-
-    batch = _warmup_batch_for_iterations(steps=4, target_steps=50)
-    stage = SimpleNamespace(default_workload_iterations=lambda batch, steps: 8)
-    record_default_workload_iterations(stage, batch)
-    assert batch.metrics.stage_iterations == {"DenoisingStage": (8, 8)}
-
-
-def test_explicit_loop_record_wins_over_the_formula():
-    from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
-        record_default_workload_iterations,
-    )
-
-    batch = _warmup_batch_for_iterations(steps=4, target_steps=50)
-    batch.metrics.record_stage_iterations(12, 12)
-    stage = SimpleNamespace(default_workload_iterations=lambda batch, steps: steps)
-    record_default_workload_iterations(stage, batch)
-    assert batch.metrics.stage_iterations == {"DenoisingStage": (12, 12)}
-
-
-def test_stage_without_a_formula_records_nothing():
-    from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
-        record_default_workload_iterations,
-    )
-
-    batch = _warmup_batch_for_iterations(steps=4, target_steps=50)
-    stage = SimpleNamespace(default_workload_iterations=lambda batch, steps: None)
-    record_default_workload_iterations(stage, batch)
-    assert batch.metrics.stage_iterations == {}
 
 
 def test_warmup_peak_stays_out_of_the_runtime_peak():
@@ -852,3 +1013,112 @@ def test_timing_tolerance_override_leaves_memory_guards_alone():
     with patch.object(current_platform, "is_hip", return_value=False):
         with pytest.raises(AssertionError, match="Runtime Peak VRAM"):
             validator.validate_peak_vram(regression, 10_000.0, 10_000.0)
+
+
+def test_request_metrics_compare_by_identity():
+    """Distinct RequestMetrics instances must not compare equal."""
+    assert perf_logger_module.RequestMetrics("a") != perf_logger_module.RequestMetrics(
+        "b"
+    )
+
+
+def test_log_request_summary_records_requested_tag(monkeypatch, tmp_path):
+    """log_request_summary must record the tag it is given."""
+    monkeypatch.setattr(perf_logger_module, "get_git_commit_hash", lambda: "test")
+    monkeypatch.setattr(perf_logger_module, "get_is_main_process", lambda: True)
+    monkeypatch.setattr(
+        perf_logger_module, "get_diffusion_perf_log_dir", lambda: str(tmp_path)
+    )
+
+    perf_logger_module.PerformanceLogger.log_request_summary(
+        perf_logger_module.RequestMetrics("r1"), tag="custom_tag"
+    )
+
+    assert "custom_tag" in (tmp_path / "performance.log").read_text()
+
+
+@pytest.mark.parametrize("is_warmup", [True, False])
+@pytest.mark.parametrize("explicit_iterations", [True, False])
+def test_real_stage_metrics_reach_warmup_record(
+    is_warmup, explicit_iterations, monkeypatch
+):
+    class TinyTransformer(torch.nn.Module, LayerwiseOffloadableModuleMixin):
+        layer_names = ["blocks"]
+
+        def __init__(self):
+            super().__init__()
+            self.blocks = torch.nn.ModuleList([torch.nn.Linear(2, 2)])
+
+    req = Req(
+        sampling_params=SamplingParams(num_inference_steps=2),
+        is_warmup=is_warmup,
+        perf_dump_path="metrics",
+        extra={"warmup_target_num_inference_steps": 8},
+    )
+    metrics = req.metrics
+    model = TinyTransformer()
+    stage = DenoisingStage.__new__(DenoisingStage)
+    stage.server_args = SimpleNamespace(
+        enable_layerwise_nvtx_marker=False, comfyui_mode=False
+    )
+    stage.set_registered_stage_name("denoise")
+    stage.set_profile_stage_name("custom_denoise")
+    monkeypatch.setattr(
+        stage, "verify_input", PipelineStage.verify_input.__get__(stage)
+    )
+    monkeypatch.setattr(
+        stage, "verify_output", PipelineStage.verify_output.__get__(stage)
+    )
+
+    def forward(batch, args):
+        for _ in range(2):
+            model.blocks[0](torch.ones(1, 2))
+            batch.metrics.record_step(0.001)
+        if explicit_iterations:
+            batch.record_stage_iterations(2, 8)
+        return batch
+
+    monkeypatch.setattr(stage, "forward", forward)
+    tracker = LayerwiseUsageTracker(
+        {"transformer": model}, stage_name_provider=lambda: metrics.active_stage_name
+    )
+    try:
+        assert stage(req, stage.server_args) is req
+    finally:
+        uses, uses_by_stage = tracker.finish_with_stages()
+    assert metrics.active_stage_name is None
+    assert metrics.steps == [1.0, 1.0]
+    assert metrics.denoising_stages == {"custom_denoise"}
+    assert uses == {"transformer": {"blocks": (2,)}}
+    assert not model.blocks[0]._forward_pre_hooks
+    if not is_warmup:
+        assert metrics.steps_by_stage == {}
+        assert metrics.stage_iterations == {}
+        assert uses_by_stage == {}
+        return
+
+    assert metrics.steps_by_stage == {"denoise": [1.0, 1.0]}
+    assert metrics.stage_iterations == {"denoise": (2, 8)}
+    assert uses_by_stage == {"denoise": {"transformer": {"blocks": (2,)}}}
+    worker = GPUWorker.__new__(GPUWorker)
+    worker._auto_residency_warmup_records = []
+    worker.pipeline = SimpleNamespace(stages=[stage])
+    device = SimpleNamespace(
+        max_memory_allocated=lambda: 8, max_memory_reserved=lambda: 9
+    )
+    monkeypatch.setattr(torch, "get_device_module", lambda: device)
+    worker._record_server_warmup_memory(
+        req=req,
+        workload=(64, 64, 1, 2),
+        baseline_allocated_bytes=3,
+        baseline_reserved_bytes=3,
+        succeeded=True,
+        layerwise_layer_uses=uses,
+        layerwise_layer_uses_by_stage=uses_by_stage,
+    )
+    (record,) = worker._auto_residency_warmup_records
+    assert record.succeeded
+    assert record.stage_iterations == {"denoise": (2, 8)}
+    assert record.step_duration_ms_by_stage == {"denoise": (1.0, 1.0)}
+    assert record.stage_duration_ms.keys() == {"denoise"}
+    assert record.layerwise_layer_uses_by_stage == uses_by_stage

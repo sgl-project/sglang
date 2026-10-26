@@ -91,7 +91,22 @@ limitations under the License.
 namespace sgl {
 namespace dsa_topk {
 
+// Only device code may depend on this: the host pass always sees 64. RDNA targets
+// built wave64 define the same macros as wave32, so they are rejected by
+// check_wave_size rather than told apart here.
+#if defined(__GFX10__) || defined(__GFX11__) || defined(__GFX12__)
+constexpr uint32_t kWaveSize = 32;  // RDNA and gfx1250 run 32-lane waves
+#else
 constexpr uint32_t kWaveSize = 64;
+#endif
+
+// Folds to nothing when kWaveSize matches the target; otherwise every scan and
+// ballot below is wrong and the kernel would emit out-of-range indices.
+__device__ __forceinline__ void check_wave_size() {
+  if (__builtin_amdgcn_wavefrontsize() != kWaveSize) {
+    __builtin_trap();
+  }
+}
 
 // Ordered 32-bit key: flips the sign bit for positives and inverts negatives, so an
 // unsigned compare on the result matches a float compare on the input.
@@ -771,6 +786,7 @@ __device__ void coop_topk_select(const CoopParams<TopK>& params, CoopSmem<TopK, 
 
 template <uint32_t TopK, uint32_t kHistBits, uint32_t TieCap, uint32_t BlockSize>
 __global__ __launch_bounds__(BlockSize) void coop_topk_kernel(CoopParams<TopK> params) {
+  check_wave_size();
   __shared__ CoopSmem<TopK, kHistBits, TieCap, BlockSize> s;
   coop_topk_select<TopK, kHistBits, TieCap, BlockSize>(params, s);
 
@@ -900,6 +916,7 @@ row_bounds(const CoopMbParams<TopK>& p, uint32_t row, int32_t& row_start, uint32
 // atomics per block follow it.
 template <uint32_t TopK, uint32_t kHistBits, uint32_t TieCap, uint32_t BlockSize>
 __global__ __launch_bounds__(BlockSize) void coop_mb_hist0(CoopMbParams<TopK> p, uint32_t G) {
+  check_wave_size();
   constexpr uint32_t kHistBins = 1u << kHistBits;
   constexpr uint32_t kLowBits = 16 - kHistBits;
   __shared__ uint32_t hist[kHistBins];
@@ -952,6 +969,7 @@ __global__ __launch_bounds__(BlockSize) void coop_mb_hist0(CoopMbParams<TopK> p,
 // the diffuse path.
 template <uint32_t TopK, uint32_t kHistBits, uint32_t TieCap, uint32_t BlockSize>
 __global__ __launch_bounds__(BlockSize) void coop_mb_hist1(CoopMbParams<TopK> p, uint32_t G) {
+  check_wave_size();
   constexpr uint32_t kLowBits = 16 - kHistBits;
   constexpr uint32_t kLowBins = 1u << kLowBits;
   __shared__ uint32_t scratch[BlockSize / kWaveSize];
@@ -1025,6 +1043,7 @@ __global__ __launch_bounds__(BlockSize) void coop_mb_hist1(CoopMbParams<TopK> p,
 // bandwidth-bound and measured about 4 us at G=4.
 template <uint32_t TopK, uint32_t kHistBits, uint32_t TieCap, uint32_t BlockSize>
 __global__ __launch_bounds__(BlockSize) void coop_mb_scatter(CoopMbParams<TopK> p, uint32_t G) {
+  check_wave_size();
   constexpr uint32_t kLowBits = 16 - kHistBits;
   constexpr uint32_t kLowBins = 1u << kLowBits;
   constexpr uint32_t kNumWaves = BlockSize / kWaveSize;
@@ -1163,6 +1182,7 @@ __device__ void coop_mb_refine_row(const CoopMbParams<TopK>& p, CoopSmem<TopK, k
 // already handled in coop_mb_hist0, which is the last kernel that touches them.
 template <uint32_t TopK, uint32_t kHistBits, uint32_t TieCap, uint32_t BlockSize>
 __global__ __launch_bounds__(BlockSize) void coop_mb_refine(CoopMbParams<TopK> p) {
+  check_wave_size();
   __shared__ CoopSmem<TopK, kHistBits, TieCap, BlockSize> s;
   coop_mb_refine_row<TopK, kHistBits, TieCap, BlockSize>(p, s);
 

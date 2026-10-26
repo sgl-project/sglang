@@ -17,6 +17,15 @@ from sglang.test.ci.ci_register import register_cuda_ci
 register_cuda_ci(est_time=14, stage="base-b", runner_config="1-gpu-small")
 
 
+@pytest.fixture
+def stated_tp_group():
+    """Provide a TP-group placeholder for kernels with mocked symmetric memory."""
+    from sglang.srt.runtime_context import get_parallel
+
+    with get_parallel().override(tp_group=None):
+        yield
+
+
 def _random_weights(num_experts: int, hidden: int, intermediate: int):
     generator = torch.Generator(device="cuda").manual_seed(0)
     w13 = torch.randint(
@@ -110,7 +119,7 @@ def test_dsv4_sm120_load_contract(monkeypatch, request):
     assert captured["fp4_scale_dtype"] == torch.float8_e8m0fnu
 
 
-def test_dsv4_sm120_matches_direct_flashinfer(monkeypatch):
+def test_dsv4_sm120_matches_direct_flashinfer(monkeypatch, stated_tp_group):
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     if torch.cuda.get_device_capability()[0] != 12:
@@ -134,7 +143,6 @@ def test_dsv4_sm120_matches_direct_flashinfer(monkeypatch):
         runner_module, "use_symmetric_memory", lambda *args, **kwargs: nullcontext()
     )
     monkeypatch.setattr(runner_module, "is_allocation_symmetric", lambda: False)
-    monkeypatch.setattr(runner_module, "get_tp_group", lambda: None)
 
     num_experts, hidden, intermediate = 4, 256, 256
     w13, w2, w13_scale, w2_scale = _random_weights(num_experts, hidden, intermediate)
@@ -216,7 +224,8 @@ def test_dsv4_sm120_matches_direct_flashinfer(monkeypatch):
     topk = StandardTopKOutput(topk_weights, topk_ids.to(torch.int32), logits)
     dispatch_output = StandardDispatchOutput(x, None, topk)
 
-    actual = method.apply(layer, dispatch_output).hidden_states
+    with get_context().override_server_args():
+        actual = method.apply(layer, dispatch_output).hidden_states
 
     x_quant, x_scale = mxfp8_quantize(
         x,
@@ -254,7 +263,7 @@ def test_dsv4_sm120_matches_direct_flashinfer(monkeypatch):
     assert torch.equal(actual, expected)
 
 
-def test_gpt_oss_sm120_padding_layout_and_kernel(monkeypatch):
+def test_gpt_oss_sm120_padding_layout_and_kernel(monkeypatch, stated_tp_group):
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     if torch.cuda.get_device_capability() != (12, 0):
@@ -272,12 +281,12 @@ def test_gpt_oss_sm120_padding_layout_and_kernel(monkeypatch):
     from sglang.srt.layers.moe.topk import StandardTopKOutput
     from sglang.srt.layers.moe.utils import MoeRunnerBackend
     from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod
+    from sglang.srt.runtime_context import get_context
 
     monkeypatch.setattr(
         runner_module, "use_symmetric_memory", lambda *args, **kwargs: nullcontext()
     )
     monkeypatch.setattr(runner_module, "is_allocation_symmetric", lambda: False)
-    monkeypatch.setattr(runner_module, "get_tp_group", lambda: None)
 
     num_experts, hidden, intermediate = 4, 160, 160
     padded_hidden = padded_intermediate = 256
@@ -335,6 +344,8 @@ def test_gpt_oss_sm120_padding_layout_and_kernel(monkeypatch):
         gemm1_alpha=1.702,
         gemm1_clamp_limit=7.0,
     )
+    # The fused func reads the layer's MoE placement off the config.
+    config.layer = layer
     method.moe_runner_config = config
     method.runner = MoeRunner(MoeRunnerBackend.FLASHINFER_MXFP4, config)
     method._process_weights_for_sm120_cutlass(layer)
@@ -403,7 +414,8 @@ def test_gpt_oss_sm120_padding_layout_and_kernel(monkeypatch):
         None,
         StandardTopKOutput(topk_weights, topk_ids.to(torch.int32), logits),
     )
-    actual = method._apply_sm120_cutlass(layer, dispatch_output).hidden_states
+    with get_context().override_server_args():
+        actual = method._apply_sm120_cutlass(layer, dispatch_output).hidden_states
 
     x_padded = torch.nn.functional.pad(x, (0, padded_hidden - hidden))
     x_quant, x_scale = mxfp8_quantize(

@@ -8,6 +8,17 @@ from sglang.srt.runtime_context import (
 )
 
 
+def get_mamba_tracking_slots(
+    *, extra_buffer: bool, overlap: bool, lazy: bool = False
+) -> int:
+    """Tracking slots allocated initially; lazy mode defers the second slot."""
+    if not extra_buffer:
+        return 0
+    if lazy:
+        return 1
+    return 2 if overlap else 1
+
+
 def get_alloc_page_size() -> int:
     # Mirrors _build_token_to_kv_pool_allocator's DCP branch; the platform
     # allocators that skip it page smaller, so this is an upper bound for them.

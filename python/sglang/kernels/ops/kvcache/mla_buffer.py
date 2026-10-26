@@ -117,11 +117,46 @@ def set_mla_kv_buffer_kernel_norope(
         tl.extra.cuda.gdc_launch_dependents()
 
 
-# Above this loc count the TMA bulk-store path overtakes the single-CTA-per-loc
-# Triton kernel. Below it, Triton with BLOCK = next_pow2(total_dim) (one CTA
-# does the whole row in one tile, no boundary fan-out) is the winning fallback.
-# Tuned on GB300 with DSv4 row widths.
-_TMA_BULK_STORE_MIN_LOCS = 768
+def set_mla_kv_buffer_naive(
+    kv_buffer: torch.Tensor,
+    loc: torch.Tensor,
+    cache_k_nope: torch.Tensor,
+    cache_k_rope: Optional[torch.Tensor],
+    *,
+    reserved_skip_index: int,
+    dcp_world_size: int,
+    dcp_rank: int,
+) -> None:
+    """Torch-native scatter for platforms that cannot launch Triton.
+
+    Mirrors ``set_mla_kv_buffer_kernel``: rows land at
+    ``kv_buffer[loc // dcp_world_size]`` as nope then rope, a loc equal to
+    ``reserved_skip_index`` is dropped, and under DCP a rank keeps only the
+    locs it owns. Duplicate locs race here exactly as they do in the kernel.
+    """
+    # view, not reshape: the destination must alias kv_buffer, and a layout
+    # reshape would have to copy is one this write cannot serve. The sources
+    # are read-only, so a copy there is harmless.
+    rows = kv_buffer.view(kv_buffer.shape[0], -1)
+    nope = cache_k_nope.reshape(cache_k_nope.shape[0], -1)
+    nope_dim = nope.shape[-1]
+    has_rope = cache_k_rope is not None and cache_k_rope.numel() > 0
+
+    loc = loc.to(torch.int64)
+    if has_rope:
+        is_valid = loc != reserved_skip_index
+    else:
+        # set_mla_kv_buffer_kernel_norope takes no skip index and writes every
+        # loc; keep the two paths bit-identical rather than fixing it here.
+        is_valid = torch.ones_like(loc, dtype=torch.bool)
+    if dcp_world_size > 1:
+        is_valid &= loc % dcp_world_size == dcp_rank
+    dst = loc[is_valid] // dcp_world_size
+
+    rows[dst, :nope_dim] = nope[is_valid]
+    if has_rope:
+        rope = cache_k_rope.reshape(cache_k_rope.shape[0], -1)
+        rows[dst, nope_dim : nope_dim + rope.shape[-1]] = rope[is_valid]
 
 
 def _set_mla_kv_buffer_impl(
@@ -136,19 +171,18 @@ def _set_mla_kv_buffer_impl(
 ):
     """Dispatch MLA paged-KV scatter writes to the fastest available path.
 
-    Two paths, chosen on ``n_loc``:
+    Two paths:
 
-    - ``n_loc >= 768`` (and SM90+ with TMA-compatible row widths): JIT CUDA
-      kernel where each warp loads one (nope, rope) row into shared memory and
-      issues a single ``cp.async.bulk.global.shared::cta`` store to scatter the
-      row at ``kv_buffer[loc[item]]``. Wins at large bs because it packs 4-8
-      items per CTA, drastically reducing the CTA count vs single-CTA-per-loc.
+    - SM90+ with TMA-compatible row widths: JIT CUDA kernel where each warp
+      loads one (nope, rope) row into shared memory and issues a single
+      ``cp.async.bulk.global.shared::cta`` store to scatter the row at
+      ``kv_buffer[loc[item]]``. It packs 4-8 items per CTA, so the CTA count
+      falls well below single-CTA-per-loc.
     - Otherwise: Triton kernel with ``BLOCK = next_pow2(nope_dim + rope_dim)``,
-      i.e. one CTA per loc covering the entire row in one tile. Wins at small
-      bs because there's no per-loc CTA fan-out (5x fewer CTAs than the old
-      BLOCK=128 dispatch) and the row-spanning block makes the boundary branch
-      a one-shot per CTA. This is also the path for SM<90 and for shapes that
-      violate the TMA 16-byte alignment.
+      i.e. one CTA per loc covering the entire row in one tile. This is the
+      path for SM<90 and for shapes that violate the TMA 16-byte alignment.
+    - Platforms declaring ``capabilities.supports_triton=False``: the
+      torch-native scatter, which no device-specific kernel backs.
 
     Speedup vs the legacy BLOCK=128 Triton kernel on GB300 (BF16, nope=512,
     rope=64): ~1.05x at bs=8, ~1.5x at bs=128, 3.5x at bs=512, **11.7x at
@@ -163,6 +197,23 @@ def _set_mla_kv_buffer_impl(
     Shared body of the two entry points below; the owner rule reaches it as
     ``1, 0`` (nothing to select) or as the live topology.
     """
+    # Imported here, not at module scope: `current_platform` is a lazy module
+    # attribute, so a top-level `from ... import` resolves the platform during
+    # this module's import.
+    from sglang.srt.platforms import current_platform
+
+    if not current_platform.capabilities.supports_triton:
+        set_mla_kv_buffer_naive(
+            kv_buffer,
+            loc,
+            cache_k_nope,
+            cache_k_rope,
+            reserved_skip_index=reserved_skip_index,
+            dcp_world_size=dcp_world_size,
+            dcp_rank=dcp_rank,
+        )
+        return
+
     has_rope = cache_k_rope is not None and cache_k_rope.numel() > 0
     n_loc = loc.numel()
     nope_dim = cache_k_nope.shape[-1]
@@ -195,8 +246,7 @@ def _set_mla_kv_buffer_impl(
     nope_bytes = cache_k_nope.shape[-1] * cache_k_nope.element_size()
     rope_bytes = cache_k_rope.shape[-1] * cache_k_rope.element_size()
     if (
-        n_loc >= _TMA_BULK_STORE_MIN_LOCS
-        and is_arch_support_pdl()
+        is_arch_support_pdl()
         and can_use_set_mla_kv_buffer(nope_bytes, rope_bytes)
         and dcp_world_size == 1
     ):

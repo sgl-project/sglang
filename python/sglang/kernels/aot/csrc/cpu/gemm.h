@@ -324,6 +324,7 @@ void tinygemm_kernel(
     scalar_t* __restrict__ C,
     scalar_t* __restrict__ Btmp,
     float* __restrict__ Ctmp,
+    const float* __restrict__ Bbias,
     float scale,
     int64_t M,
     int64_t N,
@@ -331,7 +332,8 @@ void tinygemm_kernel(
     int64_t lda,
     int64_t ldb,
     int64_t ldc,
-    bool brg);
+    bool brg,
+    bool do_unpack = true);
 
 // mxfp4
 template <typename scalar_t>

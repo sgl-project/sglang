@@ -12,6 +12,7 @@ register_amd_ci(est_time=50, stage="extra-a", runner_config="1-gpu-small-amd")
 
 
 class TestPerturbRaiseMha(CanaryE2EBase):
+    expect_server_exit = True
     model_mode = "mha"
     kv_canary_mode = CanaryMode.RAISE
     extra_server_args = ("--kv-canary-real-data", "partial", "--skip-server-warmup")

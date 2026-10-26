@@ -3,6 +3,8 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+import torch
+
 from sglang.kernels.jit.utils import (
     cache_once,
     is_hip_runtime,
@@ -10,15 +12,23 @@ from sglang.kernels.jit.utils import (
     make_cpp_args,
 )
 from sglang.kernels.kernel_api_logging import debug_kernel_api
+from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
-    import torch
     from tvm_ffi.module import Module
 
 _is_hip = is_hip_runtime()
 
 # ROCm needs a wider grid to saturate mapped-host transfers; CUDA keeps the legacy quota.
 DEFAULT_BLOCK_QUOTA = 32 if _is_hip else 2
+
+# Logical copy-group width; this is not the hardware warp/wavefront size.
+COPY_GROUP_THREADS = 32
+
+# Copy-round widths, widest first. The narrow rounds admit element sizes 128
+# does not divide, such as MLA's 576 B fp8 row, but only pay off against the
+# ROCm quota above, so CUDA keeps the original 128 B requirement.
+GROUP_BYTES = (128, 64, 32, 16) if _is_hip else (128,)
 
 
 @cache_once
@@ -73,18 +83,86 @@ def _jit_hicache_staged_module(
     )
 
 
+# TMA staging ring per CTA: 32 KB stages x 6 keeps the host loads in flight
+# under a 4-block launch; smaller stages make the loader's per-chunk cost the
+# limit. 4 store warps drain a strided-destination stage faster than it fills.
+TMA_STAGE_BYTES = 32 * 1024
+TMA_NUM_STAGES = 6
+TMA_STORE_WARPS = 4
+# Each CTA is capped by its SM's write port, so the host link needs four of
+# them; the register kernel keeps DEFAULT_BLOCK_QUOTA.
+TMA_BLOCK_QUOTA = 4
+
+
+@cache_once
+def _jit_hicache_tma_module(*, block_quota: int) -> Module:
+    args = make_cpp_args(TMA_STAGE_BYTES, TMA_NUM_STAGES, TMA_STORE_WARPS, block_quota)
+    return load_jit(
+        "hicache_tma",
+        *args,
+        cuda_files=["kvcacheio/hicache_tma.cuh"],
+        cuda_wrappers=[
+            ("launch_one", f"&HiCacheTmaKernel<{args}>::run_one"),
+            ("launch_all", f"&HiCacheTmaKernel<{args}>::run_all"),
+            ("launch_one_mla", f"&HiCacheTmaKernel<{args}>::run_one_mla"),
+            ("launch_all_mla", f"&HiCacheTmaKernel<{args}>::run_all_mla"),
+            ("fits_device", f"&HiCacheTmaKernel<{args}>::fits_device"),
+        ],
+    )
+
+
+def hicache_tma_rows_per_chunk(element_size: int) -> int:
+    """Rows the TMA kernel moves per stage (mirrors hicache_tma_rows_per_chunk)."""
+    rows = 1
+    while rows * 2 <= TMA_STAGE_BYTES // element_size and rows * 2 <= 128:
+        rows *= 2
+    return rows
+
+
+@cache_once
+def use_hicache_tma_kernel(
+    *, element_size: int, block_quota: int, page_size: int | None = None
+) -> bool:
+    """Whether transfers of `element_size`-byte rows go through the TMA kernel.
+
+    A chunk that straddles pages degrades to one bulk op per row, so pages must
+    tile the chunk; `page_size=None` (caller unaware of paging) trusts the indices.
+    """
+    if _is_hip or not envs.SGLANG_HICACHE_TMA_TRANSFER.get():
+        return False
+    if element_size % 16 != 0 or torch.cuda.get_device_capability()[0] < 9:
+        return False
+    if page_size is not None and page_size % hicache_tma_rows_per_chunk(element_size):
+        return False
+    try:
+        module = _jit_hicache_tma_module(block_quota=block_quota)
+    except Exception as e:
+        logging.getLogger(__name__).warning(
+            f"Failed to load the TMA HiCache kernel, using the register kernel: {e}"
+        )
+        return False
+    return bool(module.fits_device(torch.cuda.current_device()))
+
+
 def can_use_hicache_jit_kernel(
     *,
     element_size: int,
     unroll: int | None = None,  # can be tuned for performance
     block_quota: int | None = None,  # can be tuned for less interference
+    page_size: int | None = None,
 ) -> bool:
     logger = logging.getLogger(__name__)
-    if element_size % 128 != 0:
+    if use_hicache_tma_kernel(
+        element_size=element_size,
+        block_quota=block_quota or TMA_BLOCK_QUOTA,
+        page_size=page_size,
+    ):
+        return True
+    unroll = unroll or _default_unroll(element_size)
+    if not _tiles_across_lanes(element_size, unroll):
         logger.warning(f"Unsupported {element_size = } for JIT HiCache kernel")
         return False
     try:
-        unroll = unroll or _default_unroll(element_size)
         block_quota = block_quota or DEFAULT_BLOCK_QUOTA
         _jit_hicache_module(
             element_size=element_size,
@@ -121,6 +199,20 @@ def can_use_write_back_jit_kernel(
         return False
 
 
+def _tiles_across_lanes(element_size: int, unroll: int) -> bool:
+    """Mirror of pick_group_bytes() in kvcacheio/hicache.cuh."""
+    if unroll <= 0 or unroll > COPY_GROUP_THREADS or COPY_GROUP_THREADS % unroll != 0:
+        return False
+
+    lanes_per_worker = COPY_GROUP_THREADS // unroll
+    return any(
+        group % lanes_per_worker == 0
+        and element_size % group == 0
+        and group // lanes_per_worker in (4, 8, 16)
+        for group in GROUP_BYTES
+    )
+
+
 def _default_unroll(element_size: int) -> int:
     if element_size <= 512:
         return 4
@@ -144,6 +236,7 @@ def transfer_hicache_one_layer(
     element_dim: int | None = None,
     unroll: int | None = None,  # can be tuned for performance
     block_quota: int | None = None,  # can be tuned for less interference
+    page_size: int | None = None,
 ) -> None:
     element_dim = element_dim or k_cache_dst.size(-1)
     k_cache_src = k_cache_src.view(-1, element_dim)
@@ -151,13 +244,19 @@ def transfer_hicache_one_layer(
     k_cache_dst = k_cache_dst.view(-1, element_dim)
     v_cache_dst = v_cache_dst.view(-1, element_dim)
     element_size = element_dim * k_cache_dst.element_size()
-    block_quota = block_quota or DEFAULT_BLOCK_QUOTA
-    unroll = unroll or _default_unroll(element_size)
-    module = _jit_hicache_module(
-        element_size=element_size,
-        unroll=unroll,
-        block_quota=block_quota,
-    )
+    tma_quota = block_quota or TMA_BLOCK_QUOTA
+    if use_hicache_tma_kernel(
+        element_size=element_size, block_quota=tma_quota, page_size=page_size
+    ):
+        module = _jit_hicache_tma_module(block_quota=tma_quota)
+    else:
+        block_quota = block_quota or DEFAULT_BLOCK_QUOTA
+        unroll = unroll or _default_unroll(element_size)
+        module = _jit_hicache_module(
+            element_size=element_size,
+            unroll=unroll,
+            block_quota=block_quota,
+        )
     module.launch_one(
         k_cache_dst,
         v_cache_dst,
@@ -182,11 +281,28 @@ def transfer_hicache_all_layer(
     element_size: int | None = None,
     unroll: int | None = None,  # can be tuned for performance
     block_quota: int | None = None,  # can be tuned for less interference
+    page_size: int | None = None,
 ) -> None:
     if element_size is None:  # assume both contiguous
         assert kv_cache_dst_stride_bytes == kv_cache_src_stride_bytes
         element_size = kv_cache_dst_stride_bytes
 
+    tma_quota = block_quota or TMA_BLOCK_QUOTA
+    if use_hicache_tma_kernel(
+        element_size=element_size, block_quota=tma_quota, page_size=page_size
+    ):
+        _jit_hicache_tma_module(block_quota=tma_quota).launch_all(
+            k_ptr_dst,
+            v_ptr_dst,
+            indices_dst,
+            k_ptr_src,
+            v_ptr_src,
+            indices_src,
+            kv_cache_src_stride_bytes,
+            kv_cache_dst_stride_bytes,
+            element_size,
+        )
+        return
     block_quota = block_quota or DEFAULT_BLOCK_QUOTA
     unroll = unroll or _default_unroll(element_size)
     module = _jit_hicache_module(
@@ -215,18 +331,25 @@ def transfer_hicache_one_layer_mla(
     element_dim: int | None = None,
     unroll: int | None = None,
     block_quota: int | None = None,
+    page_size: int | None = None,
 ) -> None:
     element_dim = element_dim or cache_dst.size(-1)
     cache_src = cache_src.view(-1, element_dim)
     cache_dst = cache_dst.view(-1, element_dim)
     element_size = element_dim * cache_dst.element_size()
-    block_quota = block_quota or DEFAULT_BLOCK_QUOTA
-    unroll = unroll or _default_unroll(element_size)
-    module = _jit_hicache_module(
-        element_size=element_size,
-        unroll=unroll,
-        block_quota=block_quota,
-    )
+    tma_quota = block_quota or TMA_BLOCK_QUOTA
+    if use_hicache_tma_kernel(
+        element_size=element_size, block_quota=tma_quota, page_size=page_size
+    ):
+        module = _jit_hicache_tma_module(block_quota=tma_quota)
+    else:
+        block_quota = block_quota or DEFAULT_BLOCK_QUOTA
+        unroll = unroll or _default_unroll(element_size)
+        module = _jit_hicache_module(
+            element_size=element_size,
+            unroll=unroll,
+            block_quota=block_quota,
+        )
     module.launch_one_mla(
         cache_dst,
         indices_dst,
@@ -246,11 +369,26 @@ def transfer_hicache_all_layer_mla(
     element_size: int | None = None,
     unroll: int | None = None,
     block_quota: int | None = None,
+    page_size: int | None = None,
 ) -> None:
     if element_size is None:
         assert cache_dst_stride_bytes == cache_src_stride_bytes
         element_size = cache_dst_stride_bytes
 
+    tma_quota = block_quota or TMA_BLOCK_QUOTA
+    if use_hicache_tma_kernel(
+        element_size=element_size, block_quota=tma_quota, page_size=page_size
+    ):
+        _jit_hicache_tma_module(block_quota=tma_quota).launch_all_mla(
+            ptr_dst,
+            indices_dst,
+            ptr_src,
+            indices_src,
+            cache_src_stride_bytes,
+            cache_dst_stride_bytes,
+            element_size,
+        )
+        return
     block_quota = block_quota or DEFAULT_BLOCK_QUOTA
     unroll = unroll or _default_unroll(element_size)
     module = _jit_hicache_module(
@@ -354,5 +492,336 @@ def transfer_hicache_all_layer_mla_staged_lf_pf(
             staging[:chunk_tokens],
             src_page_indices[page_begin : page_begin + chunk_pages],
             ptr_src,
+            page_size,
+        )
+
+
+# A separate module from `_jit_hicache_module`: this one instantiates
+# HiCacheKernel with `kElementSize` set to one head group's token row rather than
+# the whole row, which is often not the 128-byte multiple `run_one` / `run_all`
+# need. Only the exported entry points are instantiated, so those never compile
+# here.
+@cache_once
+def _jit_hicache_page_unified_module(*, element_size: int, block_quota: int) -> Module:
+    args = make_cpp_args(
+        element_size,
+        1,  # kUnroll: unread by this entry point, which always moves 16B per thread
+        block_quota,
+        1024,  # num_threads, can be tuned for performance
+    )
+    return load_jit(
+        "hicache_page_unified",
+        *args,
+        cuda_files=[
+            "kvcacheio/hicache.cuh",
+        ],
+        cuda_wrappers=[
+            (
+                "launch_one_page_unified",
+                f"&HiCacheKernel<{args}>::run_one_page_unified<false>",
+            ),
+            (
+                "launch_one_mla_page_unified",
+                f"&HiCacheKernel<{args}>::run_one_page_unified<true>",
+            ),
+        ],
+    )
+
+
+def can_use_page_unified_load_back_jit_kernel(
+    *,
+    group_bytes: int,
+    block_quota: int | None = None,  # can be tuned for less interference
+) -> bool:
+    logger = logging.getLogger(__name__)
+    if group_bytes <= 0 or group_bytes % 16 != 0:
+        logger.warning(f"Unsupported {group_bytes = } for page-unified JIT load-back")
+        return False
+    try:
+        _jit_hicache_page_unified_module(
+            element_size=group_bytes,
+            block_quota=block_quota or DEFAULT_BLOCK_QUOTA,
+        )
+        return True
+    except Exception as e:
+        logger.warning(f"Failed to load page-unified JIT load-back kernel: {e}")
+        return False
+
+
+@debug_kernel_api
+def transfer_hicache_one_layer_page_unified_lf(
+    k_cache_dst: torch.Tensor,
+    v_cache_dst: torch.Tensor,
+    src: torch.Tensor,
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+    layer_id: int,
+    *,
+    block_quota: int | None = None,  # can be tuned for less interference
+) -> None:
+    """Load one layer of page_unified host pages into the device KV pool.
+
+    ``src`` is a contiguous host tensor with layout
+    (page, head_group, layer, 2, page_size, head_in_group, dim); K=0, V=1 --
+    the order the page-unified write-back produces. It must be pinned or
+    CUDA-registered, because the kernel reads it in place over its device
+    mapping; no staging buffer is allocated.
+
+    ``k_cache_dst`` / ``v_cache_dst`` are one layer of the device pool, shaped
+    (token, head, dim) with the pool's full head count. ``src_indices`` holds
+    host-pool TOKEN indices (the page is ``index // page_size``) and
+    ``dst_indices`` the device-pool token indices they land on, in matching
+    order; both are CUDA int32/int64 vectors on the destination device.
+    One head group's token row must be a positive multiple of 16 bytes.
+
+    Runs on the current CUDA stream. Keep ``src`` alive and unwritten until
+    that stream completes.
+    """
+    if src.ndim != 7:
+        raise ValueError(
+            "Expected (page, head_group, layer, 2, page_size, head_in_group, dim)"
+        )
+    if src.shape[3] != 2 or any(d <= 0 for d in src.shape[1:]):
+        raise ValueError(
+            "Page dimensions must be positive and the K/V dimension must be 2"
+        )
+    _transfer_hicache_one_layer_page_unified(
+        k_cache_dst,
+        v_cache_dst,
+        src,
+        src_indices,
+        dst_indices,
+        layer_id=layer_id,
+        group_bytes=src.shape[5] * src.shape[6] * src.element_size(),
+        num_layers=src.shape[2],
+        num_groups=src.shape[1],
+        page_size=src.shape[4],
+        is_mla=False,
+        block_quota=block_quota,
+    )
+
+
+@debug_kernel_api
+def transfer_hicache_one_layer_mla_page_unified_lf(
+    cache_dst: torch.Tensor,
+    src: torch.Tensor,
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+    layer_id: int,
+    *,
+    block_quota: int | None = None,
+) -> None:
+    """Load one layer of compressed MLA pages in (page, layer, page_size, dim) order.
+
+    MLA has one latent cache per layer, with no head-group or separate K/V
+    axes; ``dim`` covers all stored latent and positional components.
+    ``cache_dst`` is one layer of the device pool, shaped (token, 1, dim).
+    Host memory, index and stream requirements match the MHA entry point.
+    """
+    if src.ndim != 4:
+        raise ValueError("Expected MLA (page, layer, page_size, dim)")
+    if any(d <= 0 for d in src.shape[1:]):
+        raise ValueError("MLA page dimensions must be positive")
+    _transfer_hicache_one_layer_page_unified(
+        cache_dst,
+        cache_dst,
+        src,
+        src_indices,
+        dst_indices,
+        layer_id=layer_id,
+        group_bytes=src.shape[3] * src.element_size(),
+        num_layers=src.shape[1],
+        num_groups=1,
+        page_size=src.shape[2],
+        is_mla=True,
+        block_quota=block_quota,
+    )
+
+
+def _transfer_hicache_one_layer_page_unified(
+    k_cache_dst: torch.Tensor,
+    v_cache_dst: torch.Tensor,
+    src: torch.Tensor,
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+    *,
+    layer_id: int,
+    group_bytes: int,
+    num_layers: int,
+    num_groups: int,
+    page_size: int,
+    is_mla: bool,
+    block_quota: int | None,
+) -> None:
+    if not src.is_contiguous():
+        raise ValueError("The host pool must be contiguous")
+    if src.device.type != "cpu" and not src.is_cuda:
+        raise ValueError("Expected a CPU or CUDA-registered host pool")
+    if group_bytes % 16:
+        raise ValueError("Each copied token row must be 16-byte aligned")
+    module = _jit_hicache_page_unified_module(
+        element_size=group_bytes,
+        block_quota=block_quota or DEFAULT_BLOCK_QUOTA,
+    )
+    launch = (
+        module.launch_one_mla_page_unified if is_mla else module.launch_one_page_unified
+    )
+    launch(
+        k_cache_dst.view(k_cache_dst.shape[0], -1),
+        v_cache_dst.view(v_cache_dst.shape[0], -1),
+        src.view(src.shape[0], -1),
+        src_indices,
+        dst_indices,
+        layer_id,
+        num_layers,
+        num_groups,
+        page_size,
+    )
+
+
+@cache_once
+def _jit_page_unified_write_back(group_bytes: int, *, is_mla: bool = False) -> Module:
+    args = make_cpp_args(group_bytes, is_mla)
+    return load_jit(
+        "hicache_page_unified_write_back",
+        *args,
+        cuda_files=["kvcacheio/staged_write_back.cuh"],
+        cuda_wrappers=[("launch", f"&HiCachePageUnifiedWriteBackKernel<{args}>::run")],
+    )
+
+
+@debug_kernel_api
+def transfer_hicache_all_layer_staged_lf_page_unified(
+    k_ptr_src: torch.Tensor,
+    v_ptr_src: torch.Tensor,
+    src_pages: torch.Tensor,
+    dst_pages: torch.Tensor,
+    staging: torch.Tensor,
+    dst: torch.Tensor,
+) -> None:
+    """Write full GPU KV pages to pinned host memory in page_unified layout.
+
+    ``staging`` and ``dst`` are contiguous tensors with layout
+    (page, head_group, layer, 2, page_size, head_in_group, dim); K=0, V=1.
+    Only their page capacities may differ. Each source pointer addresses a
+    contiguous (token, head_group * head_in_group, dim) GPU tensor of the same
+    dtype as ``dst``, with a 16-byte-aligned base. Pointer tables are contiguous
+    CUDA uint64 tensors, one pointer per layer, on the staging device.
+
+    ``src_pages`` contains CUDA int32/int64 physical PAGE IDs, not token offsets.
+    ``dst_pages`` contains CPU int64 physical page IDs, in matching order.
+    Source IDs must be in bounds; destination IDs must be unique. The caller
+    owns the source allocations, which cannot be validated via pointer tables.
+    One group's token data must be a positive multiple of 16 bytes.
+
+    Reuses caller-provided staging in chunks on the current CUDA stream.
+    Keep all inputs alive and staging exclusive until that stream completes;
+    wait for completion before reading the host output. No GPU buffer is allocated.
+    """
+    if dst.ndim != 7 or staging.ndim != 7:
+        raise ValueError(
+            "Expected (page, head_group, layer, 2, page_size, head_in_group, dim)"
+        )
+    if dst.shape[3] != 2 or any(d <= 0 for d in dst.shape[1:]):
+        raise ValueError(
+            "Page dimensions must be positive and the K/V dimension must be 2"
+        )
+    _transfer_hicache_all_layer_staged_page_unified(
+        k_ptr_src,
+        v_ptr_src,
+        src_pages,
+        dst_pages,
+        staging,
+        dst,
+        group_bytes=dst.shape[5] * dst.shape[6] * dst.element_size(),
+        num_groups=dst.shape[1],
+        page_size=dst.shape[4],
+        is_mla=False,
+    )
+
+
+@debug_kernel_api
+def transfer_hicache_all_layer_mla_staged_lf_page_unified(
+    ptr_src: torch.Tensor,
+    src_pages: torch.Tensor,
+    dst_pages: torch.Tensor,
+    staging: torch.Tensor,
+    dst: torch.Tensor,
+) -> None:
+    """Write compressed MLA KV pages in (page, layer, page_size, dim) order.
+
+    MLA has one latent cache per layer, with no head-group or separate K/V
+    axes. Source pointers address contiguous (token, dim) tensors; ``dim``
+    includes all stored latent and positional components. No dtype conversion
+    is performed. Each token row must be a positive multiple of 16 bytes.
+
+    Pointer tables, page IDs, pinned destination memory, staging reuse and
+    stream lifetime requirements match the MHA page_unified entry point.
+    ``src_pages`` and ``dst_pages`` contain physical page IDs, not token offsets.
+    """
+    if dst.ndim != 4 or staging.ndim != 4:
+        raise ValueError("Expected MLA (page, layer, page_size, dim)")
+    if any(d <= 0 for d in dst.shape[1:]):
+        raise ValueError("MLA page dimensions must be positive")
+    _transfer_hicache_all_layer_staged_page_unified(
+        ptr_src,
+        ptr_src,
+        src_pages,
+        dst_pages,
+        staging,
+        dst,
+        group_bytes=dst.shape[3] * dst.element_size(),
+        num_groups=1,
+        page_size=dst.shape[2],
+        is_mla=True,
+    )
+
+
+def _transfer_hicache_all_layer_staged_page_unified(
+    k_ptr_src: torch.Tensor,
+    v_ptr_src: torch.Tensor,
+    src_pages: torch.Tensor,
+    dst_pages: torch.Tensor,
+    staging: torch.Tensor,
+    dst: torch.Tensor,
+    *,
+    group_bytes: int,
+    num_groups: int,
+    page_size: int,
+    is_mla: bool,
+) -> None:
+    if staging.shape[1:] != dst.shape[1:] or staging.dtype != dst.dtype:
+        raise ValueError(
+            "Staging and destination must have matching page shapes and dtype"
+        )
+    if not staging.is_contiguous() or not dst.is_contiguous():
+        raise ValueError("Staging and destination must be contiguous")
+    if not staging.is_cuda or dst.device.type != "cpu" or not dst.is_pinned():
+        raise ValueError("Expected CUDA staging and a pinned CPU destination")
+    if staging.shape[0] == 0:
+        raise ValueError("Staging must hold at least one page")
+    if (
+        src_pages.ndim != 1
+        or dst_pages.ndim != 1
+        or src_pages.numel() != dst_pages.numel()
+    ):
+        raise ValueError("Source and destination page IDs must be equal-length vectors")
+    if group_bytes % 16:
+        raise ValueError("Each copied token row must be 16-byte aligned")
+    module = _jit_page_unified_write_back(group_bytes, is_mla=is_mla)
+    capacity = staging.shape[0]
+    page_elements = staging[0].numel()
+    staging_flat = staging.view(capacity, page_elements)
+    dst_flat = dst.view(dst.shape[0], page_elements)
+    for begin in range(0, src_pages.numel(), capacity):
+        end = min(begin + capacity, src_pages.numel())
+        module.launch(
+            dst_flat,
+            staging_flat[: end - begin],
+            k_ptr_src,
+            v_ptr_src,
+            src_pages[begin:end],
+            dst_pages[begin:end],
+            num_groups,
             page_size,
         )

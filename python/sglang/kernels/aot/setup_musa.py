@@ -70,6 +70,9 @@ include_dirs = [
     root / "include",
     root / "include" / "impl",
     root / "csrc",
+    # Speculative device kernels are shared with the JIT launchers, which own
+    # the header tree they live in.
+    root.parent / "jit" / "include",
     root / _FLASHINFER_REPO.source_dir / "include",
     root / _FLASHINFER_REPO.source_dir / "csrc",
     root / _MUTLASS_REPO.source_dir / "include",

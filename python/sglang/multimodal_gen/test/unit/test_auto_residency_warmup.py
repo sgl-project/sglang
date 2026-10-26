@@ -623,7 +623,7 @@ class TestAutoResidencyWarmup(unittest.TestCase):
 
         self.assertIs(response, expected)
         worker._rollback_everywhere.assert_called_once_with(
-            cause="VRAM reserve exceeded by 1.0 GiB",
+            cause="VRAM budget exceeded by 1.0 GiB",
             already_failed=False,
             latest_round_only=True,
         )

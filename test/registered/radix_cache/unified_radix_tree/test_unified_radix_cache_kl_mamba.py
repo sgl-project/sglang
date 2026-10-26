@@ -63,7 +63,9 @@ class TestUnifiedMambaRadixCache(UnifiedRadixTreeTestMixin, CustomTestCase):
                 "--mamba-max-states-per-path",
                 "3",
             ],
-            env={"SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"},
+            env={
+                "SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1",
+            },
         )
         cls.input_ids = get_input_ids(cls.model, num_samples=18)
 
@@ -83,7 +85,12 @@ class TestUnifiedMambaHiCache(UnifiedRadixTreeTestMixin, CustomTestCase):
         make_mamba_prefill_assert(chunk_size=MAMBA_CHUNK_SIZE)
     )
     decode_cache_assert = staticmethod(
-        make_mamba_decode_assert(track_interval=MAMBA_TRACK_INTERVAL)
+        # The small KV pool can trigger retraction and retain a prefix-relative
+        # prefill checkpoint instead of the last absolute decode checkpoint.
+        make_mamba_decode_assert(
+            track_interval=MAMBA_TRACK_INTERVAL,
+            max_checkpoint_lag=MAMBA_CHUNK_SIZE - 1,
+        )
     )
 
     @classmethod
@@ -122,7 +129,9 @@ class TestUnifiedMambaHiCache(UnifiedRadixTreeTestMixin, CustomTestCase):
                 "4",
                 "--weight-loader-prefetch-checkpoints",
             ],
-            env={"SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"},
+            env={
+                "SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1",
+            },
         )
         cls.input_ids = get_input_ids(cls.model, num_samples=18)
 
@@ -190,7 +199,7 @@ class TestUnifiedMambaHiCacheL3(AccuracyTwoPassMixin, CustomTestCase):
                 "4",
             ],
             env={
-                "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",
+                "SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1",
                 "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.hicache_dir,
             },
         )

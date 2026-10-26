@@ -1,26 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Warmup-calibrated automatic component residency placement.
+"""Warmup memory estimates for the default workload.
 
-Under ``--performance-mode auto`` with server warmup, each rank measures the
-peak GPU memory of bounded synthetic warmup requests and a low-step probe at
-the complete default serving shape, then selects a complete serving placement
-for every eligible component under the measured memory constraints.
-
-When no full-shape measurement is available, the fallback estimate splits the
-measured peak into persistent weights and workload-scaled activations. Scaling
-the whole peak would multiply resident weights by the video frame/area cap
-ratio (~16x for Wan-class defaults) and residency adjustment would never trigger.
-
-The planner targets the model default workload only (default resolution,
-default frames, batch=1). Larger shapes, batches, or multi-image inputs need
-explicit ``--component-residency``.
-
-Loading and serving are deliberately separate placement states. The existing
-auto policy provides the initial state. This module then optimizes the
-long-lived serving state and validates the transition with a post-placement
-warmup. A failed default-workload probe can demote that initial state and retry;
-successful probes may promote or rebalance it. It does not force a single
-placement to serve two different lifecycle objectives.
+Peak-memory extrapolation separates persistent weights from workload-scaled
+activations.
 """
 
 from __future__ import annotations
@@ -291,6 +273,9 @@ class RankResidencyReport(msgspec.Struct, frozen=True):
     rank: int
     budget_bytes: int
     estimated_peak_bytes: int | None
+    # fixed by the first successful calibration, separate from card capacity
+    peak_allocation_limit_bytes: int | None = None
+    phase_allocation_limit_bytes: dict[str, int] = {}
     # Conservative margin learned from a failed candidate. It constrains only
     # future growth: the current placement was measured against the physical
     # budget and must not become retroactively infeasible after a rollback.
@@ -2361,7 +2346,8 @@ def collect_residency_targets(
     allow_host_pin_reallocation: bool = True,
     mixed_dtype_components: Iterable[str] = (),
     required_resident_components: Iterable[str] = (),
-    layerwise_tuning_of: Callable[[str, bool], tuple[float, float, str]] | None = None,
+    layerwise_tuning_of: Callable[[str, bool], tuple[float, float, str, str]]
+    | None = None,
     layerwise_policy_is_explicit: Callable[[str, bool], bool] | None = None,
     pin_cpu_memory: bool = True,
     used_components: Iterable[str] | None = None,
@@ -2510,7 +2496,7 @@ def collect_residency_targets(
                 and layerwise_tuning_of is not None
                 and name not in mixed_dtype_names
             ):
-                prefetch_value, _, residency_policy = layerwise_tuning_of(
+                prefetch_value, _, residency_policy, _ = layerwise_tuning_of(
                     name, dit_group
                 )
                 virtual_targets, maximum_transfer_work = (
@@ -3038,7 +3024,7 @@ def _vram_reserve_bytes(budget_bytes: int, *, target_workload_measured: bool) ->
 def current_placement_reserve_shortfall_bytes(
     reports: Iterable[RankResidencyReport],
 ) -> int:
-    """Return the largest reserve deficit of the measured placement.
+    """Return the largest allocation or reserve deficit of the measured placement.
 
     This checks the placement that just executed without regenerating a
     candidate frontier or running the optimizer. It is therefore suitable for
@@ -3070,12 +3056,22 @@ def current_placement_reserve_shortfall_bytes(
         # must still leave the same reserve for the next request.
         realized_footprint = max(measured_peak, report.observed_reserved_bytes)
         shortfalls.append(realized_footprint + reserve - report.budget_bytes)
+        if report.peak_allocation_limit_bytes is not None:
+            shortfalls.append(measured_peak - report.peak_allocation_limit_bytes)
+        for phase_name, phase_peak in report.estimated_peak_bytes_by_phase.items():
+            phase_limit = report.phase_allocation_limit_bytes.get(
+                phase_name.split(":layout:", 1)[0]
+            )
+            if phase_limit is not None:
+                shortfalls.append(phase_peak - phase_limit)
     return max(0, max(shortfalls, default=0))
 
 
 def _binding_phase_constraints(
     report: RankResidencyReport,
     candidate_component_names: set[str],
+    *,
+    reserve_bytes: int,
 ) -> list[
     tuple[
         str,
@@ -3090,9 +3086,9 @@ def _binding_phase_constraints(
     """Keep the binding measured and conservative unobserved phases.
 
     Every candidate has the same device delta in phases with the same active
-    component set. The lower peaks are therefore provably redundant; removing
-    them reduces the exact optimizer's resource dimension without changing
-    its feasible placements. A short calibration may not reach a later
+    component set. Keep the phase with the least remaining budget, including
+    its frozen allocation limit; a smaller peak can have a tighter limit.
+    A short calibration may not reach a later
     timestep-routed component (for example the second DiT in a two-stage
     denoiser), so give each unobserved candidate a synthetic phase at the
     measured request peak. This prevents permanent residents from being
@@ -3112,6 +3108,16 @@ def _binding_phase_constraints(
     )
     current_device_bytes = dict(report.current_device_weight_bytes_by_component)
     current_active_bytes = dict(report.current_active_weight_bytes_by_component)
+
+    def phase_headroom(phase_name: str, peak: int) -> int:
+        limit = report.budget_bytes - reserve_bytes
+        allocation_limit = report.phase_allocation_limit_bytes.get(
+            phase_name.split(":layout:", 1)[0], report.peak_allocation_limit_bytes
+        )
+        if allocation_limit is not None:
+            limit = min(limit, allocation_limit)
+        return limit - peak
+
     for candidate in report.candidates:
         if (
             candidate.current_placement
@@ -3199,7 +3205,9 @@ def _binding_phase_constraints(
         measured = tuple(sorted(measured_components & candidate_component_names))
         layout = (present, measured, used, prefetched, full_weight_transitions)
         current = binding.get(layout)
-        if current is None or (phase_peak, phase_name) > (current[1], current[0]):
+        if current is None or phase_headroom(phase_name, phase_peak) < phase_headroom(
+            *current
+        ):
             binding[layout] = (phase_name, phase_peak)
     observed_components = {
         component_name
@@ -3243,7 +3251,7 @@ def _binding_phase_constraints(
             ),
         )
         current = binding.get(layout)
-        if current is None or synthetic[1] > current[1]:
+        if current is None or phase_headroom(*synthetic) < phase_headroom(*current):
             binding[layout] = synthetic
     return [
         (
@@ -3439,7 +3447,11 @@ def plan_auto_residency(*, reports: list[RankResidencyReport]) -> AutoResidencyP
 
     candidate_component_names = {candidate.component_name for candidate in candidates}
     phase_constraints = {
-        report.rank: _binding_phase_constraints(report, candidate_component_names)
+        report.rank: _binding_phase_constraints(
+            report,
+            candidate_component_names,
+            reserve_bytes=reserves_by_rank[report.rank],
+        )
         for report in reports
     }
     current_placement_reserve_shortfall = max(
@@ -3462,6 +3474,10 @@ def plan_auto_residency(*, reports: list[RankResidencyReport]) -> AutoResidencyP
     current_placement_reserve_shortfall = max(0, current_placement_reserve_shortfall)
     resource_budgets: dict[str, int] = {}
     for report in reports:
+        phase_limits = {
+            f"gpu:rank{report.rank}:{phase_name}": limit
+            for phase_name, limit in report.phase_allocation_limit_bytes.items()
+        }
         for resource_name, phase_peak, _, _, _, _, _ in phase_constraints[report.rank]:
             # The measured placement has already completed warmup. A negative
             # reserve headroom therefore means "do not grow this phase", not
@@ -3472,6 +3488,17 @@ def plan_auto_residency(*, reports: list[RankResidencyReport]) -> AutoResidencyP
                 - reserves_by_rank[report.rank]
                 - report.planning_headroom_correction_bytes
             )
+            allocation_limit = phase_limits.get(
+                resource_name.split(":layout:", 1)[0],
+                report.peak_allocation_limit_bytes,
+            )
+            if allocation_limit is not None:
+                available = min(
+                    available,
+                    allocation_limit
+                    - phase_peak
+                    - report.planning_headroom_correction_bytes,
+                )
             # A successful measured placement remains a feasible zero-delta
             # baseline even when it consumed the reserve. An OOM placement is
             # different: preserving the negative shortfall forces the complete
@@ -3487,11 +3514,19 @@ def plan_auto_residency(*, reports: list[RankResidencyReport]) -> AutoResidencyP
     )
     if has_device_transition_options:
         for report in reports:
-            resource_budgets[f"gpu:rank{report.rank}:placement-transition"] = max(
-                0,
+            transition_headroom = (
                 report.budget_bytes
                 - report.device_transition_allocated_bytes
-                - reserves_by_rank[report.rank],
+                - reserves_by_rank[report.rank]
+            )
+            if report.peak_allocation_limit_bytes is not None:
+                transition_headroom = min(
+                    transition_headroom,
+                    report.peak_allocation_limit_bytes
+                    - report.device_transition_allocated_bytes,
+                )
+            resource_budgets[f"gpu:rank{report.rank}:placement-transition"] = max(
+                0, transition_headroom
             )
     has_host_resources = any(
         candidate.pinned_host_delta_bytes != 0

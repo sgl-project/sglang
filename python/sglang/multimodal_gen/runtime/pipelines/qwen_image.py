@@ -5,6 +5,12 @@ from diffusers.image_processor import VaeImageProcessor
 
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImageEditPlus_2511_PipelineConfig,
+    QwenImageEditPlusPipelineConfig,
+    QwenImagePipelineConfig,
+)
+from sglang.multimodal_gen.configs.sample.qwenimage import (
+    QwenImageEditPlusSamplingParams,
+    QwenImageSamplingParams,
 )
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.pipelines_core import LoRAPipeline
@@ -41,6 +47,11 @@ def prepare_mu(batch: Req, server_args: ServerArgs):
 
 class QwenImagePipeline(LoRAPipeline, ComposedPipelineBase):
     pipeline_name = "QwenImagePipeline"
+
+    # Used when the checkpoint is a single safetensors file with no
+    # model_index.json to derive these from.
+    pipeline_config_cls = QwenImagePipelineConfig
+    sampling_params_cls = QwenImageSamplingParams
 
     _required_config_modules = [
         "text_encoder",
@@ -99,6 +110,11 @@ class QwenImageEditPlusPipeline(QwenImageEditPipeline):
         ):
             return frozenset(("transformer",))
         return frozenset()
+
+    # Used when the checkpoint is a single safetensors file with no
+    # model_index.json to derive these from.
+    pipeline_config_cls = QwenImageEditPlusPipelineConfig
+    sampling_params_cls = QwenImageEditPlusSamplingParams
 
 
 def prepare_mu_layered(batch: Req, server_args: ServerArgs):

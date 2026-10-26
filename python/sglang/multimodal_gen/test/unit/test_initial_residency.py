@@ -45,6 +45,7 @@ class _Args:
     model_id = None
     num_gpus = 1
     use_fsdp_inference = False
+    comfyui_mode = False
 
     def __init__(self, modes=None, explicit=()):
         self.modes = modes or {}
