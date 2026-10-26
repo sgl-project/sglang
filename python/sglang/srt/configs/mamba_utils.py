@@ -368,18 +368,8 @@ class KimiLinearStateShape:
         )
 
 
-def kimi_linear_state_dtype() -> Mamba2StateDType:
-    dtype = mamba2_state_dtype()
-    # KDA convolution history follows the SSM precision by default.
-    # Its independent override does not change the replay record dtype.
-    if not envs.SGLANG_MAMBA_CONV_DTYPE.is_set():
-        return Mamba2StateDType(conv=dtype.temporal, temporal=dtype.temporal)
-    return dtype
-
-
 @dataclass(kw_only=True, frozen=True)
 class KimiLinearCacheParams(BaseLinearStateParams):
-    dtype: Mamba2StateDType = field(default_factory=kimi_linear_state_dtype)
     shape: KimiLinearStateShape
 
     @property

@@ -21,7 +21,6 @@ from sglang.srt.configs.mamba_utils import (
     Mamba2CacheParams,
     Mamba2StateDType,
     Mamba2StateShape,
-    kimi_linear_state_dtype,
     mamba2_state_dtype,
 )
 from sglang.srt.mem_cache.kv_cache_configurator import (  # noqa: F401
@@ -97,21 +96,26 @@ class TestReplaySSMRingAccounting(CustomTestCase):
         self.assertEqual(_kda_params().replayssm_ring_bytes_per_req(record_len=0), 0)
 
     def test_state_precision_and_override(self):
-        for name, dtype in [("float32", torch.float32), ("bfloat16", torch.bfloat16)]:
+        dtypes = [
+            ("float32", torch.float32),
+            ("bfloat16", torch.bfloat16),
+            ("float16", torch.float16),
+        ]
+        for name, dtype in dtypes:
             with self.subTest(dtype=name), patch.dict(os.environ, clear=False):
                 os.environ["SGLANG_MAMBA_SSM_DTYPE"] = name
                 os.environ.pop("SGLANG_MAMBA_CONV_DTYPE", None)
-                expected = Mamba2StateDType(conv=dtype, temporal=dtype)
-                self.assertEqual(kimi_linear_state_dtype(), expected)
+                expected = Mamba2StateDType(conv=torch.bfloat16, temporal=dtype)
                 params = KimiLinearCacheParams(shape=None, layers=[])
                 self.assertEqual(params.dtype, expected)
-                # Other Mamba model families keep their convolution default.
-                self.assertEqual(mamba2_state_dtype().conv, torch.bfloat16)
-                os.environ["SGLANG_MAMBA_CONV_DTYPE"] = "bfloat16"
-                self.assertEqual(
-                    kimi_linear_state_dtype(),
-                    Mamba2StateDType(conv=torch.bfloat16, temporal=dtype),
-                )
+                self.assertEqual(mamba2_state_dtype(), expected)
+                for conv_name, conv_dtype in dtypes:
+                    with self.subTest(conv=conv_name):
+                        os.environ["SGLANG_MAMBA_CONV_DTYPE"] = conv_name
+                        self.assertEqual(
+                            KimiLinearCacheParams(shape=None, layers=[]).dtype,
+                            Mamba2StateDType(conv=conv_dtype, temporal=dtype),
+                        )
 
     def test_explicit_dtype_is_preserved(self):
         dtype = Mamba2StateDType(conv=torch.bfloat16, temporal=torch.float32)
