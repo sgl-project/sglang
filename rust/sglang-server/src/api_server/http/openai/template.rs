@@ -109,6 +109,28 @@ mod tests {
     use super::super::test_utils::checkpoint_formatter;
     use super::*;
 
+    /// A DeepSeek encode runs off the HTTP executor: on a current-thread
+    /// runtime, the handler awaiting it yields, so the encode cannot finish
+    /// before the executor next polls it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn deepseek_encode_leaves_the_executor_free() {
+        let formatter = super::super::test_utils::deepseek_formatter();
+        let body = serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "Explain and"}],
+        });
+        let request: CreateChatCompletionRequest = serde_json::from_value(body.clone()).unwrap();
+        let encode = tokio::spawn(async move {
+            let encodes = ChatEncodes::default();
+            render_chat_off_executor(&encodes, &formatter, body, &request, &HashMap::new()).await
+        });
+        tokio::task::yield_now().await;
+        assert!(!encode.is_finished(), "the encode ran on the executor");
+        let (chat, images) = encode.await.unwrap().unwrap();
+        assert!(chat.ids.is_some_and(|ids| !ids.is_empty()));
+        assert_eq!(images, Some(vec![]));
+    }
+
     /// Floats Qwen3.8's renderer declines (serde_json prints them unlike Python)
     /// render through the template instead of failing the request.
     #[test]

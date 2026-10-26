@@ -264,9 +264,10 @@ pub struct MmContext {
 
 impl MmContext {
     pub fn new(spec: MmSpec) -> Result<Self, String> {
-        let recipe = matches!(spec.pipeline, ProcessorSpec::DeepseekV41(_))
-            .then(RecipeImages::new)
-            .transpose()?;
+        let recipe = match &spec.pipeline {
+            ProcessorSpec::DeepseekV41(spec) => Some(RecipeImages::new(&spec.geometry)?),
+            _ => None,
+        };
         let pipeline =
             sglang_processor::MmProcessor::from_spec(spec.pipeline).map_err(|e| e.to_string())?;
         Ok(Self {

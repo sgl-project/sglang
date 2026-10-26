@@ -152,6 +152,7 @@ class RustServer:
             raise RuntimeError(
                 "SGLANG_RUST_SERVER=1: no Rust MM pipeline for "
                 f"model_type={scheduler.model_config.hf_config.model_type!r} "
+                "with these processor settings "
                 f"(supported: {', '.join(supported)}; "
                 "images only). Unset SGLANG_RUST_SERVER to serve this model."
             )

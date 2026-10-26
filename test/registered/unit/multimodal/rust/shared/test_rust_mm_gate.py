@@ -51,6 +51,34 @@ class TestRustMmGate(CustomTestCase):
         family = rust_mm_family_for(cls, "deepseek_v41")
         self.assertEqual(family and family.name, "deepseek_v41")
 
+    def test_deepseek_v41_serves_only_recipe_geometry(self):
+        cls = processor_cls_for("DeepseekV4ForCausalLM", "deepseek_v41")
+        family = rust_mm_family_for(cls, "deepseek_v41")
+        default = dict(
+            image_token_id=7,
+            vision_patch_size=14,
+            vision_downsample_ratio=3,
+            vision_min_pixels=544 * 544,
+            vision_max_n_token=1024,
+            vision_max_wh_ratio=None,
+        )
+
+        def resolve(**config):
+            hf_config = SimpleNamespace(**config)
+            return family.resolve(
+                processor=None, hf_config=hf_config, feature_shm=False
+            )
+
+        spec = resolve(**default)
+        self.assertEqual(spec.pipeline["vision_max_n_token"], 1024)
+        # deepseek-recipe-image cannot resize to any other geometry.
+        for name, value in [
+            ("vision_max_n_token", 128),
+            ("vision_min_pixels", 0),
+            ("vision_max_wh_ratio", 4),
+        ]:
+            self.assertIsNone(resolve(**{**default, name: value}), name)
+
     def test_inkling_keeps_its_python_processor(self):
         from sglang.srt.multimodal.processors.inkling import InklingMultimodalProcessor
 

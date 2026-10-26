@@ -45,6 +45,15 @@ impl MmFamilyProcessor for DeepseekV41 {
             )));
         }
         let (vit_h, vit_w) = (height / p, width / p);
+        let (llm_h, llm_w) = (vit_h.div_ceil(ratio), vit_w.div_ceil(ratio));
+        // `image_token_types`: start, each row plus its separator, end.
+        let feature_token_count = llm_h * (llm_w + 1) + 2;
+        let max_tokens = self.spec.geometry.vision_max_n_token as usize;
+        if feature_token_count > max_tokens {
+            return Err(MmError::invalid_input(format!(
+                "deepseek_v41: {width}x{height} takes {feature_token_count} tokens, over the {max_tokens}-token budget"
+            )));
+        }
         // [vit_h * vit_w, 3, p, p], patches in reading order.
         let mut feature = Vec::with_capacity(rgb.len());
         for (row, col) in (0..vit_h).flat_map(|row| (0..vit_w).map(move |col| (row, col))) {
@@ -58,15 +67,13 @@ impl MmFamilyProcessor for DeepseekV41 {
                 }
             }
         }
-        let (llm_h, llm_w) = (vit_h.div_ceil(ratio), vit_w.div_ceil(ratio));
         let scalar = |value: usize| Tensor {
             shape: Vec::new(),
             data: TensorData::I64(vec![value as i64]),
         };
         Ok(ProcessedItem {
             modality: Modality::Image,
-            // `image_token_types`: start, each row plus its separator, end.
-            feature_token_count: llm_h * (llm_w + 1) + 2,
+            feature_token_count,
             feature: Tensor {
                 shape: vec![vit_h * vit_w, 3, p, p],
                 data: TensorData::F32(feature),
@@ -121,5 +128,22 @@ mod tests {
             family.layout(&[1, 9, 2], &[item]).unwrap().segments.len(),
             3
         );
+    }
+
+    #[test]
+    fn rejects_an_image_over_the_token_budget() {
+        let spec = serde_json::from_value(serde_json::json!({
+            "image_token_id": 9, "vision_patch_size": 2, "vision_downsample_ratio": 3,
+            "vision_min_pixels": 0, "vision_max_n_token": 4,
+        }))
+        .unwrap();
+        let family = DeepseekV41::new(spec).unwrap();
+        // A 1 x 2 token grid takes 5 tokens.
+        let image = DecodedMedia::Image {
+            rgb: vec![0; 2 * 8 * 3],
+            height: 2,
+            width: 8,
+        };
+        assert!(family.process_item(&image).is_err());
     }
 }

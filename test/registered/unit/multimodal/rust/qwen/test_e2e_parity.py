@@ -104,12 +104,15 @@ class TestQwenE2eParity(CustomTestCase):
             "mm.mrope": mrope.reshape(3, -1),
             "mm.meta": np.frombuffer(msgspec.msgpack.encode(meta), dtype=np.uint8),
         }
+        dim = (
+            3 * spec.pipeline["temporal_patch_size"] * spec.pipeline["patch_size"] ** 2
+        )
         row = 0
         for index, (t, h, w) in enumerate(grids):
             n = t * h * w
             buffers[f"mm.feature.{index}"] = features[
-                row * spec.feature_dim : (row + n) * spec.feature_dim
-            ].reshape(n, spec.feature_dim)
+                row * dim : (row + n) * dim
+            ].reshape(n, dim)
             row += n
         return snapshot(ids, RustMmProcessor.wrap_encoded(spec, buffers))
 

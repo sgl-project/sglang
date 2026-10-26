@@ -124,6 +124,37 @@ pub(super) fn chat_submitted(
     )
 }
 
+/// DeepSeek's checkpoint specials over a word-level vocabulary, in which
+/// any other word is `[UNK]` (0).
+pub(super) fn deepseek_formatter() -> super::ChatFormatter {
+    let specials = [
+        "<｜begin▁of▁sentence｜>",
+        "<｜User｜>",
+        "<｜Assistant｜>",
+        "<think>",
+        "</think>",
+        "<｜deepseek_image｜>",
+    ];
+    let added_tokens: Vec<_> = (specials.iter().enumerate())
+        .map(|(index, content)| {
+            json!({
+                "id": 100 + index, "content": content, "special": true,
+                "single_word": false, "lstrip": false, "rstrip": false, "normalized": false,
+            })
+        })
+        .collect();
+    let tokenizer = json!({
+        "version": "1.0", "truncation": null, "padding": null,
+        "added_tokens": added_tokens, "normalizer": null,
+        "pre_tokenizer": {"type": "Whitespace"}, "post_processor": null, "decoder": null,
+        "model": {
+            "type": "WordLevel", "vocab": {"[UNK]": 0, "Explain": 1, "and": 2},
+            "unk_token": "[UNK]",
+        },
+    });
+    super::ChatFormatter::deepseek_v4(true, Some(&tokenizer.to_string())).unwrap()
+}
+
 pub(super) fn server_args() -> Arc<ServerArgs> {
     Arc::new(ServerArgs {
         served_model_name: "model".into(),

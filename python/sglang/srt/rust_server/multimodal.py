@@ -133,22 +133,25 @@ def _resolve_qwen_vl(*, processor, hf_config, feature_shm) -> Optional[RustMmSpe
     )
 
 
+# deepseek-recipe-image resizes to `ImageTokenSpec::v41()` only, so Rust serves
+# no other geometry; `deepseek_image.rs` checks the same values.
+_RECIPE_V41_GEOMETRY = {
+    "vision_patch_size": 14,
+    "vision_downsample_ratio": 3,
+    "vision_min_pixels": 544 * 544,
+    "vision_max_n_token": 1024,
+    "vision_max_wh_ratio": None,
+}
+
+
 def _resolve_deepseek_v41(*, processor, hf_config, feature_shm) -> Optional[RustMmSpec]:
-    # Rust resizes with deepseek-recipe-image, whose V4.1 grid is fixed: 14-pixel
-    # patches under a 3x3 downsample.
-    if (hf_config.vision_patch_size, hf_config.vision_downsample_ratio) != (14, 3):
+    geometry = {name: getattr(hf_config, name, None) for name in _RECIPE_V41_GEOMETRY}
+    if geometry != _RECIPE_V41_GEOMETRY:
         return None
     return RustMmSpec(
         family="deepseek_v41",
         feature_shm=feature_shm,
-        pipeline={
-            "image_token_id": hf_config.image_token_id,
-            "vision_patch_size": hf_config.vision_patch_size,
-            "vision_downsample_ratio": hf_config.vision_downsample_ratio,
-            "vision_min_pixels": hf_config.vision_min_pixels,
-            "vision_max_n_token": hf_config.vision_max_n_token,
-            "vision_max_wh_ratio": hf_config.vision_max_wh_ratio,
-        },
+        pipeline={"image_token_id": hf_config.image_token_id, **geometry},
         image_token_id=hf_config.image_token_id,
     )
 
