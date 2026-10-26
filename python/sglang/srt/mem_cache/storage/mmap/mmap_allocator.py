@@ -31,6 +31,8 @@ try:
     ]
     _libc.munmap.restype = ctypes.c_int
     _libc.munmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+    _libc.madvise.restype = ctypes.c_int
+    _libc.madvise.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
 except OSError:
     _libc = None
 
@@ -42,7 +44,39 @@ _MAP_HUGE_2MB = 21 << 26  # 0x1400000
 _MAP_HUGE_1GB = 30 << 26  # 0x78000000
 _MAP_FAILED = ctypes.c_void_p(-1).value
 _MADV_POPULATE_WRITE = getattr(mmap, "MADV_POPULATE_WRITE", 23)
+_MADV_HUGEPAGE = getattr(mmap, "MADV_HUGEPAGE", 14)
 _PROT_RW = mmap.PROT_READ | mmap.PROT_WRITE
+
+
+@functools.cache
+def _thp_page_size() -> int:
+    """The PMD-backed page size transparent hugepages use, or 0 if unavailable.
+
+    THP is a property of the running kernel, not of a reservation, so unlike
+    MAP_HUGETLB it needs no root and no nr_hugepages. It applies only to
+    MAP_PRIVATE anonymous memory: shared anon is shmem, governed by the separate
+    shmem_enabled knob, which is [never] on stock Ubuntu.
+    """
+    try:
+        with open("/sys/kernel/mm/transparent_hugepage/enabled") as f:
+            if "[never]" in f.read():
+                return 0
+        with open("/sys/kernel/mm/transparent_hugepage/hpage_pmd_size") as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return 0
+
+
+def _thp_fault_fallbacks() -> int:
+    """System-wide count of THP faults that fell back to 4K pages, or -1 if unknown."""
+    try:
+        with open("/proc/vmstat") as f:
+            for line in f:
+                if line.startswith("thp_fault_fallback "):
+                    return int(line.split()[1])
+    except (OSError, ValueError):
+        pass
+    return -1
 
 
 @functools.cache
@@ -109,6 +143,51 @@ def _alloc_hugepage(n_bytes: int, alloc_bytes: int, extra_flags: int) -> ctypes.
     return array
 
 
+def _alloc_thp(n_bytes: int, page_size: int) -> ctypes.Array:
+    """mmap `n_bytes` of MAP_PRIVATE anon memory backed by transparent hugepages.
+
+    Over-allocates by one hugepage so the range can start on a hugepage
+    boundary; the kernel only collapses an aligned range. MADV_HUGEPAGE marks
+    it, and the write-populate below faults it in, which is when the collapse
+    actually happens -- an unfaulted range stays 4K-backed.
+    """
+    alloc_bytes = n_bytes + page_size
+    ptr = _libc.mmap(
+        None,
+        alloc_bytes,
+        _PROT_RW,
+        mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS,
+        -1,
+        0,
+    )
+    if ptr is None or ptr == _MAP_FAILED:
+        errno = ctypes.get_errno()
+        raise OSError(errno, os.strerror(errno))
+    aligned = (ptr + page_size - 1) & ~(page_size - 1)
+    if _libc.madvise(ctypes.c_void_p(aligned), n_bytes, _MADV_HUGEPAGE) != 0:
+        errno = ctypes.get_errno()
+        _libc.munmap(ctypes.c_void_p(ptr), alloc_bytes)
+        raise OSError(errno, os.strerror(errno))
+    fallbacks_before = _thp_fault_fallbacks()
+    ctypes.memset(ctypes.c_void_p(aligned), 0, n_bytes)
+    fell_back = _thp_fault_fallbacks() - fallbacks_before
+    if fallbacks_before >= 0 and fell_back > 0:
+        # THP is best effort: with no free 2MiB blocks the kernel serves the
+        # fault with 4K pages and reports nothing else. The counter is
+        # system-wide, so it can also include other processes.
+        logger.warning(
+            "%d transparent hugepage faults fell back to 4K pages while "
+            "populating %d bytes; the NIC may still see more page-table "
+            "entries than a hugepage-backed pool would give.",
+            fell_back,
+            n_bytes,
+        )
+    array = (ctypes.c_uint8 * n_bytes).from_address(aligned)
+    # Unmap from the raw base, not the aligned one, or the alignment slack leaks.
+    weakref.finalize(array, _libc.munmap, ctypes.c_void_p(ptr), alloc_bytes)
+    return array
+
+
 def alloc_mmap(dims: tuple, dtype: torch.dtype) -> torch.Tensor:
     """Allocate a host tensor via anonymous mmap. Set SGLANG_HUGEPAGE_SIZE=2MB or 1GB for hugepages.
 
@@ -153,12 +232,43 @@ def alloc_mmap(dims: tuple, dtype: torch.dtype) -> torch.Tensor:
                     array, dtype=dtype, count=math.prod(dims)
                 ).reshape(dims)
             except OSError as e:
-                logger.error(
-                    "Hugepage mmap via libc failed (%s); falling back to plain mmap. "
-                    "SGLANG_HUGEPAGE_SIZE=%s will be ignored.",
-                    e,
-                    hugepage_size,
-                )
+                # MAP_HUGETLB needs pages reserved through nr_hugepages, i.e.
+                # root. Transparent hugepages need neither, and for the RDMA
+                # case the two are interchangeable: what matters is that the
+                # NIC sees 2MB PTEs, not which mechanism produced them. Some
+                # adapters (ionic) cap a registration at ~1M page-table entries,
+                # so a 4K-backed host pool stops at ~4 GiB with EINVAL.
+                thp_page_size = _thp_page_size()
+                if thp_page_size:
+                    try:
+                        array = _alloc_thp(n_bytes, thp_page_size)
+                    except OSError as thp_error:
+                        logger.error(
+                            "Hugepage mmap via libc failed (%s) and the transparent "
+                            "hugepage fallback also failed (%s); falling back to "
+                            "plain mmap. SGLANG_HUGEPAGE_SIZE=%s will be ignored.",
+                            e,
+                            thp_error,
+                            hugepage_size,
+                        )
+                    else:
+                        logger.info(
+                            "Hugepage mmap via libc failed (%s); using transparent "
+                            "hugepages (%d bytes) instead, which need no reservation.",
+                            e,
+                            thp_page_size,
+                        )
+                        return torch.frombuffer(
+                            array, dtype=dtype, count=math.prod(dims)
+                        ).reshape(dims)
+                else:
+                    logger.error(
+                        "Hugepage mmap via libc failed (%s) and transparent hugepages "
+                        "are disabled; falling back to plain mmap. "
+                        "SGLANG_HUGEPAGE_SIZE=%s will be ignored.",
+                        e,
+                        hugepage_size,
+                    )
         alloc_bytes = math.ceil(n_bytes / mmap.PAGESIZE) * mmap.PAGESIZE
 
     # Plain mmap path -- used directly when no hugepages requested, or as fallback.
