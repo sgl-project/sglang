@@ -11,7 +11,7 @@ It preserves upstream rebalance scheduling; the earlier automatic 64-step
 initial learning policy is not included.
 
 Before migrating a chunk, NPU validates corresponding tensor counts, shapes,
-dtypes, devices, and staging requirements. Ordinary tensors bypass ND staging;
+dtypes, devices, and staging requirements. Ordinary tensors bypass format conversion;
 unchanged local placements still participate in sends but skip ND writeback.
 Outside Elastic EP, a rank also skips staging and migration when its local
 placement is unchanged and no changed destination requests a local expert.
@@ -19,6 +19,10 @@ Communication group initialization still precedes this per-rank early return.
 Receive buffers are reused within a chunk and are not cached between rebalances.
 ND staging retains each layer's conversion results directly. Writeback converts
 them to the destination format before copying into the original model storage.
+Outside Elastic EP, small BF16/FP32 auxiliary matrices (up to 64 KiB per expert
+row) are grouped by dtype once per layer. Large weights retain separate buffers;
+the original auxiliary tensors are updated in place after migration. Grouping
+depends on shape/dtype, allowing corresponding ranks to use different formats.
 NPU target forwards skip the draft guard's device lookup, and empty route
 tensors return before creating a buffer view or issuing a copy.
 Graphs without buffered routes omit inactive capture flags, letting replay skip
@@ -53,7 +57,7 @@ decode retains buffered counting. Draft prefill capture remains isolated.
 | Formatting and static checks during cleanup | Completed; no functional result is implied. |
 | CPU unit suite and GPU regression after migration refinements | Not run. |
 | NPU full decode graph regression after cleanup | Not run. |
-| HCCL migration with the new staging paths | Passed a 16-rank synthetic migration and reverse migration before the idle-rank guard; values, addresses, formats, ND scales, and unchanged local layouts checked. |
+| HCCL migration with the new staging paths | Latest source-extracted 16-rank checks passed with real NZ weights, auxiliary coalescing, sparse moves, and rank-dependent auxiliary formats; values, addresses, and formats checked. This is not full-package integration. |
 | Full-model correctness, PD acceptance, and performance after cleanup | Not run. |
 
 The idle-rank guard passed an external CPU check against the unchanged shared
@@ -90,8 +94,17 @@ A standalone 16-rank Ascend 910C check with torch_npu 2.10.0.post6 validated
 communication warmup, payloads, and cached reuse: warmup took 2736.9 ms, and the
 first all-peer INT8 transfer in the prewarmed group took 2.30 ms versus 2175.0 ms
 in an independent cold group. No model was loaded or restarted for this check.
-An external packing prototype was slower including pack/unpack, so it was not
-adopted. Full-model startup integration and serving performance remain untested.
+An earlier all-tensor packing prototype was slower including pack/unpack and was
+not adopted. Full-model startup integration and serving performance remain untested.
+
+Per-layer auxiliary coalescing passed a separate 16-rank check using the actual
+16 MiB/8 MiB INT8 weights and 48 KiB BF16/FP32 auxiliary data per expert.
+The latest production-method check included NZ conversion, shared migration,
+and in-place writeback. Median per-rank one-layer time changed from 24.99 to
+23.61 ms; taking the slowest rank per iteration gave 26.45 to 25.02 ms.
+These are synthetic weight-update results, not serving throughput. Twelve
+external CPU cases covered mixed widths/dtypes, strided tensors, and disabling
+coalescing. Full-model graph replay and 43-layer service behavior were not rerun.
 
 Earlier migration tests and manual probes remain available in the
 [historical test tree](https://github.com/AkiYangDev/sglang/tree/46393a1ce8359fc226704702b14a157dfa77c7ee/test).

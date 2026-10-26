@@ -127,15 +127,17 @@ def prepare_expert_weight_update(
     rank = dist.get_rank()
     _validate_migration_weights(weights_by_layer, layer_ids, rank)
     sample = weights_by_layer[layer_ids[0]]
-    temp_buffers = create_temp_buffers(sample)
-    staging = ExpertWeightStaging(sample)
+    staging = ExpertWeightStaging(sample, coalesce_aux=not elastic_ep_enabled)
+    temp_buffers = staging.create_temp_buffers(sample)
     group = get_eplb_device_group()
     if logger.isEnabledFor(logging.DEBUG):
         # Planned logical bytes include lazy staging, not allocator padding/cache.
         workspace_bytes = sum(t.numel() * t.element_size() for t in temp_buffers) + sum(
             t.numel() * t.element_size()
-            for t, needed in zip(sample, staging._needs_staging, strict=True)
-            if needed
+            for indices in staging._groups
+            for index in indices
+            for t in (sample[index],)
+            if len(indices) > 1 or staging._needs_staging[index]
         )
         logger.debug(
             "[NPU EPLB] rank=%d layers=%d workspace_logical_bytes=%d",
@@ -230,36 +232,73 @@ class ExpertWeightStaging:
 
     load() prepares the tensors that the updater mutates; store() copies the
     result into model storage without changing addresses held by captured graphs.
-    Ordinary tensors pass through directly, even in mixed-format weight lists.
+    Small auxiliary matrices share per-layer buffers by dtype, reducing
+    P2P operations without packing the large expert weights.
     """
 
-    def __init__(self, sample_tensors: list[torch.Tensor]):
+    def __init__(self, sample_tensors: list[torch.Tensor], *, coalesce_aux=True):
         # Per-expert NZ conversion can copy the whole backing tensor.
         self._needs_staging = [needs_nd_staging(tensor) for tensor in sample_tensors]
-        self.buffers: list[torch.Tensor | None] = []
+        groups = {}
+        for index, tensor in enumerate(sample_tensors):
+            # Shape/dtype alone determine groups so ranks may use different formats.
+            small_aux = (
+                coalesce_aux
+                and tensor.ndim == 2
+                and tensor.dtype in (torch.bfloat16, torch.float32)
+                and 0 < tensor.shape[1] * tensor.element_size() <= 65536
+            )
+            groups.setdefault(tensor.dtype if small_aux else index, []).append(index)
+        self._groups = list(groups.values())
+        self.buffers: list[torch.Tensor] = []
+
+    def create_temp_buffers(self, weights: list[torch.Tensor]) -> list[torch.Tensor]:
+        return [
+            torch.empty(
+                (
+                    weights[indices[0]].shape[0],
+                    sum(weights[i].shape[1] for i in indices),
+                ),
+                dtype=weights[indices[0]].dtype,
+                device=weights[indices[0]].device,
+            )
+            if len(indices) > 1
+            else create_temp_buffers([weights[indices[0]]])[0]
+            for indices in self._groups
+        ]
 
     def load(self, weights: list[torch.Tensor]) -> list[torch.Tensor]:
         # Keep the conversion result; copy_ would add another ND-to-ND copy.
         self.buffers.clear()
-        for weight, needed in zip(weights, self._needs_staging, strict=True):
-            self.buffers.append(
-                torch.ops.npu.npu_format_cast(weight, 2) if needed else None
-            )
-        return [
-            buffer if buffer is not None else weight
-            for buffer, weight in zip(self.buffers, weights, strict=True)
+        converted = [
+            torch.ops.npu.npu_format_cast(weight, 2) if needed else weight
+            for weight, needed in zip(weights, self._needs_staging, strict=True)
         ]
+        self.buffers = [
+            torch.cat([converted[i] for i in indices], dim=1)
+            if len(indices) > 1
+            else converted[indices[0]]
+            for indices in self._groups
+        ]
+        return self.buffers
 
     def store(self, weights: list[torch.Tensor]) -> None:
-        for weight, buffer in zip(weights, self.buffers, strict=True):
-            if buffer is not None:
-                # A same-format copy preserves model storage without first
-                # converting the destination to ND and back.
-                weight.copy_(
-                    torch.ops.npu.npu_format_cast(
-                        buffer, torch.ops.npu.get_npu_format(weight)
+        for indices, buffer in zip(self._groups, self.buffers, strict=True):
+            if len(indices) == 1 and not self._needs_staging[indices[0]]:
+                continue
+            pieces = (
+                buffer.split([weights[i].shape[1] for i in indices], dim=1)
+                if len(indices) > 1
+                else [buffer]
+            )
+            for index, piece in zip(indices, pieces, strict=True):
+                weight = weights[index]
+                if self._needs_staging[index]:
+                    piece = torch.ops.npu.npu_format_cast(
+                        piece, torch.ops.npu.get_npu_format(weight)
                     )
-                )
+                # Keep the storage addresses referenced by captured graphs.
+                weight.copy_(piece)
 
 
 def isolate_npu_draft_recording(forward):
