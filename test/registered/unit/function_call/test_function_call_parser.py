@@ -24,7 +24,12 @@ from sglang.srt.function_call.gemma4_detector import (
     _parse_gemma4_value,
 )
 from sglang.srt.function_call.gigachat3_detector import GigaChat3Detector
-from sglang.srt.function_call.glm4_moe_detector import Glm4MoeDetector
+from sglang.srt.function_call.glm4_moe_detector import (
+    GLM_REQUIRED_TEXT_PREAMBLE_MAX_CHARS,
+    Glm4MoeDetector,
+    GlmSpecialTokenConfig,
+    generate_glm_grammar,
+)
 from sglang.srt.function_call.glm47_moe_detector import Glm47MoeDetector
 from sglang.srt.function_call.gpt_oss_detector import GptOssDetector
 from sglang.srt.function_call.inkling_detector import InklingDetector
@@ -3613,6 +3618,58 @@ class TestGlm47FullAssistantGrammar(unittest.TestCase):
                             self._accepts(grammar, prefix + alpha * 2),
                             parallel and choice != "none",
                         )
+
+    def test_required_selection_bounds_text_preamble(self):
+        alpha = "<tool_call>alpha</tool_call>"
+        named = ToolChoice(function=ToolChoiceFuncName(name="alpha"))
+        short_preamble = "Setting the lamp now. "
+        max_preamble = "x" * GLM_REQUIRED_TEXT_PREAMBLE_MAX_CHARS
+        too_long_preamble = max_preamble + "x"
+        for thinking in (False, True):
+            prefix = "analysis</think>" if thinking else ""
+            for choice in ("required", named):
+                with self.subTest(thinking=thinking, choice=choice):
+                    grammar = self._compile(choice=choice, thinking=thinking)
+                    # The usual short lead-in before the call stays legal.
+                    self.assertTrue(
+                        self._accepts(grammar, prefix + short_preamble + alpha)
+                    )
+                    self.assertTrue(
+                        self._accepts(grammar, prefix + max_preamble + alpha)
+                    )
+                    # ... but the call must arrive within the budget.
+                    self.assertFalse(
+                        self._accepts(grammar, prefix + too_long_preamble + alpha)
+                    )
+                    # Text alone never completes a mandated-call turn.
+                    self.assertFalse(self._accepts(grammar, prefix + short_preamble))
+            with self.subTest(thinking=thinking, choice="auto"):
+                # Automatic selection keeps the unbounded text block.
+                grammar = self._compile(choice="auto", thinking=thinking)
+                self.assertTrue(
+                    self._accepts(grammar, prefix + too_long_preamble + alpha)
+                )
+                self.assertTrue(self._accepts(grammar, prefix + too_long_preamble))
+
+    def test_required_selection_bounds_text_preamble_glm45(self):
+        functions = [Function(name="alpha", parameters=None)]
+        call = "\n<tool_call>alpha\n</tool_call>"
+        for required in (False, True):
+            with self.subTest(required=required):
+                ebnf = generate_glm_grammar(
+                    enable_thinking=False,
+                    functions=functions,
+                    special_tokens=GlmSpecialTokenConfig(),
+                    chat_template_version="glm45",
+                    accommodate_chat_template=True,
+                    allow_multiple_assistant_turns=False,
+                    required=required,
+                )
+                grammar = self.compiler.compile_grammar(xgr.Grammar.from_ebnf(ebnf))
+                within = "\n" + "x" * GLM_REQUIRED_TEXT_PREAMBLE_MAX_CHARS + call
+                beyond = "\n" + "x" * (GLM_REQUIRED_TEXT_PREAMBLE_MAX_CHARS + 1) + call
+                self.assertTrue(self._accepts(grammar, within))
+                self.assertEqual(self._accepts(grammar, beyond), not required)
 
     def test_enum_json_types_and_boolean_schemas(self):
         cases = [
