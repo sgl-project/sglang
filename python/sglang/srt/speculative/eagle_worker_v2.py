@@ -11,9 +11,6 @@ from sglang.kernels.ops.speculative.topk1 import (
 )
 from sglang.srt.configs.model_config import get_dsa_mtp_topk_width
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_runner import (
-    EAGLEDraftExtendNpuGraphRunner,
-)
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_npu_graph_runner import (
     EAGLEDraftNpuGraphRunner,
 )
@@ -505,7 +502,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         Device2ExtendCudaGraphRunner = {
             "xpu": EAGLEDraftExtendCudaGraphRunner,
-            "npu": EAGLEDraftExtendNpuGraphRunner,
+            "npu": EAGLEDraftExtendCudaGraphRunner,
             "cuda": EAGLEDraftExtendCudaGraphRunner,
             "musa": EAGLEDraftCudaGraphRunner,
         }

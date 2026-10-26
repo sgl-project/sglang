@@ -53,6 +53,13 @@ class BaseCudaGraphBackend(ABC):
         backend must retain when its graph records their tensor addresses.
     """
 
+    @property
+    def cache_loc_dtype(self) -> torch.dtype:
+        return torch.int64
+
+    def bind_decode_runner(self, runner) -> None:
+        pass
+
     @abstractmethod
     def capture_session(self, stream: torch.cuda.Stream) -> Iterator[None]: ...
 

@@ -24,6 +24,7 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
@@ -50,6 +51,7 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         *,
         enable_memory_saver: bool = False,
     ) -> None:
+        self._decode_runner = None
         self._graphs: Dict[Any, Any] = {}
         self._outputs: Dict[Any, Any] = {}
         self._pool = None
@@ -74,6 +76,60 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         # Event of the last replay; the next rebind waits on it so the device is
         # done reading the host-side seq_lens array before we rewrite it.
         self._rebind_fence = None
+
+    @property
+    def cache_loc_dtype(self):
+        return torch.int32
+
+    def bind_decode_runner(self, runner):
+        self._decode_runner = runner
+
+    def _decode_update_attr_name(self):
+        runner = self._decode_runner
+        architectures = runner.model_runner.model_config.hf_config.architectures or []
+        use_v2 = any(
+            arch
+            in ("MiMoV2ForCausalLM", "MiMoV2FlashForCausalLM", "Step3p5ForCausalLM")
+            for arch in architectures
+        ) or (
+            envs.SGLANG_NPU_USE_FIAS_V2_BSND.get()
+            and runner.model_runner.spec_algorithm.is_dspark()
+            and runner.capture_forward_mode.is_target_verify()
+        )
+        return "actual_seq_kvlen" if use_v2 else "actual_seq_lengths_kv"
+
+    def _decode_update_lengths(self, forward_batch):
+        runner = self._decode_runner
+        if forward_batch.forward_mode.is_target_verify():
+            if runner.model_runner.spec_algorithm.is_dflash():
+                attn_backend = runner._replay_attn_backend()
+                metadata = getattr(attn_backend, "forward_metadata", None)
+                metadata_lengths = getattr(metadata, "seq_lens_cpu_list", None)
+            else:
+                metadata_lengths = None
+            if metadata_lengths is not None:
+                seq_lens = list(metadata_lengths)
+            else:
+                if forward_batch.seq_lens_cpu is not None:
+                    seq_lens_cpu = (
+                        forward_batch.seq_lens_cpu[: runner.raw_bs]
+                        + runner.captured_req_width
+                    )
+                else:
+                    seq_lens_cpu = (
+                        forward_batch.seq_lens.cpu() + runner.captured_req_width
+                    )
+                seq_lens = seq_lens_cpu.tolist() + [0] * (runner.bs - runner.raw_bs)
+        else:
+            if forward_batch.seq_lens_cpu is not None:
+                seq_lens = forward_batch.seq_lens_cpu[: runner.raw_bs].tolist() + [
+                    0
+                ] * (runner.bs - runner.raw_bs)
+            else:
+                seq_lens = forward_batch.seq_lens.cpu().tolist() + [0] * (
+                    runner.bs - runner.raw_bs
+                )
+        return seq_lens
 
     @contextmanager
     def capture_session(self, stream):
@@ -150,8 +206,39 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         static_forward_batch: ForwardBatch,
         **kwargs,
     ) -> Any:
+        runner = self._decode_runner
+        if runner is not None:
+            from sglang.srt.configs.model_config import is_deepseek_dsa, is_deepseek_v4
+            from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
+                EAGLEDraftExtendCudaGraphRunner,
+            )
+
+            hf_config = runner.model_runner.model_config.hf_config
+            if not (is_deepseek_dsa(hf_config) or is_deepseek_v4(hf_config)):
+                if isinstance(runner, EAGLEDraftExtendCudaGraphRunner):
+                    cpu_update_input = self._eagle_draft_extend_update_lengths(
+                        runner, static_forward_batch
+                    )
+                else:
+                    cpu_update_input = [
+                        {
+                            self._decode_update_attr_name(): self._decode_update_lengths(
+                                static_forward_batch
+                            )
+                        }
+                    ]
+                return self.replay_with_input_update(
+                    shape_key, seq_lens=None, cpu_update_input=cpu_update_input
+                )
         self._graphs[shape_key].replay()
         return self._outputs[shape_key]
+
+    @staticmethod
+    def _eagle_draft_extend_update_lengths(runner, forward_batch):
+        seq_lens = forward_batch.seq_lens_cpu.tolist() + [0] * (
+            runner.bs - runner.raw_bs
+        )
+        return [{"actual_seq_lengths_kv": seq_lens}]
 
     def replay_with_input_update(
         self,
@@ -198,3 +285,4 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         self._graphs.clear()
         self._outputs.clear()
         self._pool = None
+        self._decode_runner = None
