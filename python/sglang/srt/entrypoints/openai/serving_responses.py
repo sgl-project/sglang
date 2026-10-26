@@ -868,6 +868,12 @@ class OpenAIServingResponses(OpenAIServingChat):
                 num_cached_tokens = 0
                 num_reasoning_tokens = 0
 
+            num_prompt_tokens = self._reported_prompt_tokens(
+                {"prompt_tokens": num_prompt_tokens}
+            )
+            if self.chat_encoding_spec == "kimi_k3":
+                num_cached_tokens = min(num_cached_tokens, num_prompt_tokens)
+
         usage = UsageInfo(
             prompt_tokens=num_prompt_tokens,
             completion_tokens=num_generated_tokens,
@@ -2545,7 +2551,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                 if not isinstance(chunk, dict):
                     continue
                 meta = chunk.get("meta_info") or {}
-                prompt_tokens = meta.get("prompt_tokens", prompt_tokens)
+                if "prompt_tokens" in meta:
+                    prompt_tokens = self._reported_prompt_tokens(meta)
                 completion_tokens = meta.get("completion_tokens", completion_tokens)
                 cached_tokens = meta.get("cached_tokens", cached_tokens)
                 total_tokens_meta = meta.get("total_tokens", total_tokens_meta)
@@ -2910,11 +2917,17 @@ class OpenAIServingResponses(OpenAIServingChat):
                 yield ev
 
         final_output_items = list(emitted_items)
+        if self.chat_encoding_spec == "kimi_k3":
+            cached_tokens = min(cached_tokens, prompt_tokens)
 
         usage = UsageInfo(
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
-            total_tokens=total_tokens_meta or (prompt_tokens + completion_tokens),
+            total_tokens=(
+                prompt_tokens + completion_tokens
+                if self.chat_encoding_spec == "kimi_k3"
+                else total_tokens_meta or (prompt_tokens + completion_tokens)
+            ),
             reasoning_tokens=reasoning_tokens_meta,
         )
         if self.enable_prompt_tokens_details and cached_tokens:

@@ -934,6 +934,79 @@ class FullResponseUsageTestCase(CustomTestCase):
         self.assertEqual(response.usage.reasoning_tokens, 2)
         self.assertEqual(metadata.final_usage_info, response.usage)
 
+    def test_prompt_usage_uses_chat_reporting_boundary_for_all_sources(self):
+        class AttributeOutput(dict):
+            prompt_token_ids = list(range(11))
+            outputs = [SimpleNamespace(token_ids=list(range(7)))]
+            num_cached_tokens = 3
+
+        for encoding, raw_prompt, stub, expected_prompt, cached, expected_cached in (
+            ("kimi_k3", 11, 3, 8, 3, 3),
+            ("kimi_k3", 11, 3, 8, 10, 8),
+            ("kimi_k3", 2, 3, 0, 2, 0),
+            ("kimi_k3", 11, 5, 6, 10, 6),
+            (None, 11, 3, 11, 10, 10),
+        ):
+            for source in ("meta", "dict_ids", "attribute_ids"):
+                with self.subTest(
+                    encoding=encoding, source=source, stub=stub, cached=cached
+                ):
+                    serving = make_serving()
+                    serving.chat_encoding_spec = encoding
+                    serving._KIMI_K3_GENERATION_STUB_TOKENS = stub
+                    serving.enable_prompt_tokens_details = True
+                    context = SimpleContext()
+                    if source == "meta":
+                        context.last_output = {
+                            "text": "done",
+                            "meta_info": {
+                                "prompt_tokens": raw_prompt,
+                                "completion_tokens": 7,
+                                "cached_tokens": cached,
+                                "reasoning_tokens": 2,
+                            },
+                        }
+                    elif source == "dict_ids":
+                        context.last_output = {
+                            "text": "done",
+                            "prompt_token_ids": list(range(raw_prompt)),
+                            "output_ids": list(range(7)),
+                            "num_cached_tokens": cached,
+                        }
+                    else:
+                        context.last_output = AttributeOutput(text="done")
+                        context.last_output.prompt_token_ids = list(range(raw_prompt))
+                        context.last_output.num_cached_tokens = cached
+                    request = ResponsesRequest(model="x", input="hi", store=False)
+                    metadata = RequestResponseMetadata(request_id=request.request_id)
+
+                    async def empty_generator():
+                        if False:
+                            yield
+
+                    response = asyncio.run(
+                        serving.responses_full_generator(
+                            request,
+                            {},
+                            empty_generator(),
+                            context,
+                            "x",
+                            serving.tokenizer_manager.tokenizer,
+                            metadata,
+                            require_reasoning=False,
+                        )
+                    )
+                    self.assertEqual(response.usage.prompt_tokens, expected_prompt)
+                    self.assertEqual(response.usage.completion_tokens, 7)
+                    self.assertEqual(
+                        response.usage.prompt_tokens_details.cached_tokens
+                        if response.usage.prompt_tokens_details
+                        else 0,
+                        expected_cached,
+                    )
+                    self.assertEqual(response.usage.total_tokens, expected_prompt + 7)
+                    self.assertEqual(metadata.final_usage_info, response.usage)
+
 
 class MultimodalRequestTestCase(CustomTestCase):
     def test_text_only_create_responses_rejects_media_before_generation(self):
