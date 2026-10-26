@@ -20,7 +20,10 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.int8_utils import apply_w8a8_block_int8_linear
-from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+from sglang.srt.layers.quantization.unquant import (
+    UnquantizedFusedMoEMethod,
+    UnquantizedLinearMethod,
+)
 from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.utils import set_weight_attrs
 
@@ -112,6 +115,10 @@ class BlockInt8Config(QuantizationConfig):
                 return UnquantizedLinearMethod()
             return BlockInt8LinearMethod(self)
         elif isinstance(layer, FusedMoE):
+            if is_layer_skipped(prefix, self.ignored_layers):
+                return UnquantizedFusedMoEMethod(
+                    layer.use_triton_kernels, layer.use_flashinfer_trtllm_moe
+                )
             return BlockInt8MoEMethod(self)
         return None
 
