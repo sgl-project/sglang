@@ -856,6 +856,7 @@ class DeepseekV2MoE(nn.Module):
         self.shared_experts_is_int8 = False
         self.shared_experts_is_fp8 = False
         self.shared_experts_weight_block_size = None
+        self.shared_experts: Optional[DeepseekV2MLP] = None
         self._shared_expert_tp1 = False
         self.mega_shared_l1_weights = None
         self.mega_shared_l2_weights = None
@@ -1032,7 +1033,7 @@ class DeepseekV2MoE(nn.Module):
             and self.alt_stream is not None
             and self.num_fused_shared_experts == 0
             and hidden_states.shape[0] > 0
-            and hasattr(self, "shared_experts")
+            and self.shared_experts is not None
             and getattr(self.experts, "use_flashinfer_trtllm_moe", False)
             and self.topk.topk_config.output_format == TopKOutputFormat.BYPASSED
             and not self._enable_a2a_moe
@@ -1253,7 +1254,7 @@ class DeepseekV2MoE(nn.Module):
         if deferred_finalize and get_forward().defer_moe_finalize:
             # deferred_finalize excludes _shared_expert_tp1, so the shared add folds in.
             assert shared_output is not None
-            from sglang.srt.layers.layer_boundary.fusions.cutedsl import (
+            from sglang.srt.layers.layer_boundary.fusions.moe_finalize import (
                 MoeDeferredFinalize,
             )
 
@@ -1308,7 +1309,7 @@ class DeepseekV2MoE(nn.Module):
         return_moe_output: bool = False,
         leave_output_sum: bool = False,
     ) -> Union[torch.Tensor, MoEOutput]:
-        if hasattr(self, "shared_experts") and use_intel_amx_backend(
+        if self.shared_experts is not None and use_intel_amx_backend(
             self.shared_experts.gate_up_proj
         ):
             return self.forward_cpu(hidden_states)
@@ -1796,7 +1797,7 @@ class DeepseekV2MoE(nn.Module):
         # Shared-expert side: fp8 block-128 weights served by a w8a8 linear
         # backend taught to accept a pre-quantized (q, scale) tuple: cutlass
         # or deepgemm (fp32 scales only, i.e. not UE8M0/Blackwell).
-        if self.num_fused_shared_experts != 0 or not hasattr(self, "shared_experts"):
+        if self.num_fused_shared_experts != 0 or self.shared_experts is None:
             return False, "no separate shared experts"
         if not self.shared_experts_is_fp8:
             return False, "shared experts not fp8"
@@ -1869,6 +1870,12 @@ class DeepseekV2MoE(nn.Module):
     @cached_property
     def _routed_mxfp8_prequant_static_enabled(self) -> bool:
         return self._compute_routed_mxfp8_prequant_enabled()[0]
+
+    @cached_property
+    def mega_gate_supported(self) -> bool:
+        from sglang.srt.layers.moe.mega_gate import mega_gate_supported
+
+        return mega_gate_supported(self)
 
     def _compute_routed_mxfp8_prequant_enabled(self) -> Tuple[bool, str]:
         from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatcher
@@ -2219,6 +2226,7 @@ class DeepseekV2AttentionMLA(
         # pre-CUDA-graph-capture by the model runner; None unless replicate is on.
         self.w_kc_qrep = None
         self.q_b_proj_qrep_weight = None
+        self.q_b_proj_qrep = None
 
         self.w_scale_k = None
         self.w_scale_v = None
@@ -2541,6 +2549,13 @@ class DeepseekV2AttentionMLA(
                 backend=self.fused_a_gemm_backend,
             )
         return self.fused_qkv_a_proj_with_mqa(hidden_states)[0]
+
+    def q_b_proj_replicated_forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.q_b_proj_qrep is not None:
+            q = self.q_b_proj_qrep.quant_method.apply(self.q_b_proj_qrep, x)
+        else:
+            q = torch.nn.functional.linear(x, self.q_b_proj_qrep_weight)
+        return q.view(-1, self.num_local_heads * self.dcp_size, self.qk_head_dim)
 
     def q_b_proj_forward(self, q_lora: torch.Tensor) -> torch.Tensor:
         if self._use_min_latency_q_b_gemm is None:

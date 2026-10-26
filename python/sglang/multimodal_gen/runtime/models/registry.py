@@ -7,6 +7,7 @@ import ast
 import importlib
 import os
 from abc import ABC, abstractmethod
+from collections import deque
 from collections.abc import Set
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -67,6 +68,8 @@ def _discover_and_register_models() -> dict[str, tuple[str, str, str]]:
             try:
                 with open(filepath, "r", encoding="utf-8") as f:
                     source = f.read()
+                if "EntryClass" not in source:
+                    continue
                 tree = ast.parse(source, filename=filename)
 
                 entry_class_node = None
@@ -74,64 +77,59 @@ def _discover_and_register_models() -> dict[str, tuple[str, str, str]]:
 
                 # Collect all class definitions and their _aliases
                 file_class_aliases: dict[str, list[str]] = {}
-                for node in ast.walk(tree):
+                # expressions cannot contain class/assignment statements; skip
+                # tensor computations while preserving breadth-first discovery
+                nodes = deque([tree])
+                while nodes:
+                    node = nodes.popleft()
+                    if isinstance(node, ast.expr):
+                        continue
+                    nodes.extend(ast.iter_child_nodes(node))
                     if isinstance(node, ast.ClassDef):
                         if first_class_def is None:
                             first_class_def = node
                         # Look for _aliases in the class body
                         for class_body_node in node.body:
-                            if isinstance(class_body_node, ast.Assign):
-                                for target in class_body_node.targets:
-                                    if (
-                                        isinstance(target, ast.Name)
-                                        and target.id == "_aliases"
-                                    ):
-                                        aliases = _parse_aliases_from_ast(
-                                            class_body_node.value
-                                        )
-                                        if aliases:
-                                            file_class_aliases[node.name] = aliases
-                    if isinstance(node, ast.Assign):
-                        for target in node.targets:
-                            if (
-                                isinstance(target, ast.Name)
-                                and target.id == "EntryClass"
+                            if isinstance(class_body_node, ast.Assign) and any(
+                                isinstance(target, ast.Name) and target.id == "_aliases"
+                                for target in class_body_node.targets
                             ):
-                                entry_class_node = node
-                                break
+                                aliases = _parse_aliases_from_ast(class_body_node.value)
+                                if aliases:
+                                    file_class_aliases[node.name] = aliases
+                    elif isinstance(node, ast.Assign) and any(
+                        isinstance(target, ast.Name) and target.id == "EntryClass"
+                        for target in node.targets
+                    ):
+                        entry_class_node = node
 
-                if entry_class_node and first_class_def:
-                    model_cls_name_list = []
-                    value_node = entry_class_node.value
+                if entry_class_node is None or first_class_def is None:
+                    continue
+                value_node = entry_class_node.value
+                if isinstance(value_node, ast.Name):
+                    entries = [value_node]
+                elif isinstance(value_node, (ast.List, ast.Tuple)):
+                    entries = value_node.elts
+                else:
+                    continue
 
-                    # EntryClass = ClassName
-                    if isinstance(value_node, ast.Name):
-                        model_cls_name_list.append(value_node.id)
-                    # EntryClass = ["...", ClassName, ...]
-                    elif isinstance(value_node, (ast.List, ast.Tuple)):
-                        for elt in value_node.elts:
-                            if isinstance(elt, ast.Constant):
-                                model_cls_name_list.append(elt.value)
-                            elif isinstance(elt, ast.Name):
-                                model_cls_name_list.append(elt.id)
-
-                    if model_cls_name_list:
-                        for model_cls_str in model_cls_name_list:
-                            if model_cls_str in discovered_models:
-                                logger.warning(
-                                    f"Duplicate architecture found: {model_cls_str}. It will be overwritten."
-                                )
-                            model_arch = model_cls_str
-                            discovered_models[model_arch] = (
-                                component,
-                                mod_relname,
-                                model_cls_str,
-                            )
-                            # Collect aliases for this class
-                            if model_cls_str in file_class_aliases:
-                                class_aliases[model_cls_str] = file_class_aliases[
-                                    model_cls_str
-                                ]
+                for entry in entries:
+                    if not isinstance(entry, (ast.Name, ast.Constant)):
+                        continue
+                    model_arch = (
+                        entry.id if isinstance(entry, ast.Name) else entry.value
+                    )
+                    if model_arch in discovered_models:
+                        logger.warning(
+                            f"Duplicate architecture found: {model_arch}. It will be overwritten."
+                        )
+                    discovered_models[model_arch] = (
+                        component,
+                        mod_relname,
+                        model_arch,
+                    )
+                    if model_arch in file_class_aliases:
+                        class_aliases[model_arch] = file_class_aliases[model_arch]
 
             except Exception as e:
                 logger.warning(f"Could not parse {filepath} to find models: {e}")
