@@ -3,7 +3,7 @@
 Every sub-pool is a band allocator, an end or a float of the chain. The owner
 band mints the virtual token ids; a window band binds the owner's virtual
 pages; a state band hands out per-request slots. Every lifecycle call (frees,
-groups, events, move gates, flushes, verification) is one loop over the bands.
+groups, events, pins, flushes, verification) is one loop over the bands.
 What still differs between chain shapes is the interim capacity policy in
 `interim.py`, chosen from the band geometry.
 """
@@ -29,7 +29,6 @@ from sglang.srt.mem_cache.allocator.unified_sub_pool import (
     _chain_byte_accounting_violations,
     _flush_deferred_free_group,
     _full_tokens_before_mamba_recheck,
-    install_move_gate,
 )
 from sglang.srt.mem_cache.kv.alloc.interim import (
     ChainAdmissionRules,
@@ -244,22 +243,19 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
 
     def _snapshot_key_now(self) -> int:
         """The chain's capacity epoch and, per band, its compaction mode and
-        whether a move gate is closed: neither is a capacity field. A band's
-        blocked bit is its pending host loads, a capacity field, or a closed
-        gate; the gates are callables, so the epoch alone misses a flip."""
+        whether a pin source is busy: neither is a capacity field. A band's
+        blocked bit is its load pin, a capacity field, or a busy pin source;
+        sources are callables, so the epoch alone misses a flip."""
         epoch = bits = 0
         for band in self.bands:
             epoch += band._capacity_epoch
-            disagg, host = band.disagg_move_gate, band.host_transfer_move_gate
-            closed = (disagg is not None and not disagg()) or (
-                host is not None and not host()
-            )
-            bits = (bits << 2) | (2 if band.lazy_compaction else 0) | closed
+            pinned = band.pinned_by_source()
+            bits = (bits << 2) | (2 if band.lazy_compaction else 0) | pinned
         return (epoch << (2 * len(self.bands))) | bits
 
     def pricing_snapshot(self) -> ChainSnapshot:
         """The bands' snapshot every capacity decision prices on, kept until
-        the epoch moves or a gate's answer changes."""
+        the epoch moves or a pin source's answer changes."""
         key = self._snapshot_key_now()
         if key != self._snapshot_key:
             self._snapshot_memo = snapshot_chain(
@@ -550,27 +546,23 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
 
     # -- ordering with transfers and forwards --
 
-    def set_disagg_move_gate(self, gate: Callable[[], bool]) -> None:
-        install_move_gate(
-            self.members,
-            slot="disagg_move_gate",
-            gate=gate,
-            feature="PD disaggregation",
-            lazy_compaction=self.lazy_compaction,
+    def add_pin_source(
+        self, sub_pools: Sequence[str], busy: Callable[[], bool]
+    ) -> None:
+        """Keep the named sub-pools' pages in place whenever ``busy()`` holds:
+        a DMA initiator whose queues outlive an iteration, registered once. A
+        transfer that reaches every sub-pool names every one: a band it leaves
+        out would relocate its own pages under the same in-flight copy."""
+        assert self.lazy_compaction, (
+            "Pin sources (PD disaggregation, HiCache) with the unified memory "
+            "pool require lazy compaction (eager free-path compaction moves "
+            "pages under in-flight transfers)."
         )
-
-    def set_host_transfer_move_gate(self, gate: Callable[[], bool]) -> None:
-        """Block page relocation while host transfers use resolved device indices."""
-        install_move_gate(
-            self.members,
-            slot="host_transfer_move_gate",
-            gate=gate,
-            feature="HiCache",
-            lazy_compaction=self.lazy_compaction,
-        )
+        for name in sub_pools:
+            self.bands[self._band_positions[name]].add_pin_source(busy)
 
     def set_hicache_transfer_done_event(self, transfer_key: Hashable, event) -> None:
-        # Every member a move gate covers must also order its moves after the copy.
+        # Every member a pin covers must also order its moves after the copy.
         for member in self.members:
             member.set_hicache_transfer_done_event(transfer_key, event)
 

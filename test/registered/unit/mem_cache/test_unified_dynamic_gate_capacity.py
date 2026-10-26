@@ -10,6 +10,7 @@ from sglang.test.test_utils import CustomTestCase
 from sglang.test.unified_allocator_fixtures import (
     build_swa_pool,
     build_tri_pool,
+    pin_every_band,
     reset_context,
     setup_allocator_context,
 )
@@ -63,17 +64,17 @@ class TestDynamicGateCapacity(CustomTestCase):
                     a = build_swa_pool(page_size=ps)
                     slots = a.alloc(96 * ps)
                     a.free_swa(slots[: 40 * ps])
-                    # Prime ungated memo, then install the public gate.
+                    # Prime the unpinned memo, then register a pin source.
                     a.full_attn_allocator.schedulable_available_size()
                     state = {"open": initially_open}
-                    a.set_disagg_move_gate(lambda: state["open"])
+                    pin_every_band(a, lambda: not state["open"])
                     x = a.full_attn_allocator
                     self.assertEqual(
                         x.schedulable_available_size(),
                         x._available_tokens(x._peer_drainable_hole_bytes()),
                     )
                     self.assert_dynamic_views(a, state)
-                    a.set_disagg_move_gate(lambda: False)
+                    pin_every_band(a, lambda: True)
                     self.assertEqual(
                         x.schedulable_available_size(), x._available_tokens()
                     )
@@ -91,13 +92,13 @@ class TestDynamicGateCapacity(CustomTestCase):
                     else:
                         a.free(slots[10 * ps : 11 * ps])
                     state = {"open": True}
-                    a.set_disagg_move_gate(lambda: state["open"])
+                    pin_every_band(a, lambda: not state["open"])
                     self.assert_dynamic_views(a, state)
 
     def test_real_prefill_queue_gate(self):
         from sglang.srt.disaggregation.utils import (
             DisaggregationMode,
-            unified_memory_disagg_move_gate,
+            disagg_transfers_in_flight,
         )
 
         a = build_swa_pool()
@@ -108,7 +109,7 @@ class TestDynamicGateCapacity(CustomTestCase):
             disagg_prefill_inflight_queue=[],
             disagg_prefill_pending_chunk_rids=set(),
         )
-        a.set_disagg_move_gate(unified_memory_disagg_move_gate(scheduler))
+        pin_every_band(a, disagg_transfers_in_flight(scheduler))
         x = a.full_attn_allocator
         opened = x.schedulable_available_size()
         scheduler.disagg_prefill_pending_chunk_rids.add("request")
@@ -128,8 +129,8 @@ class TestDynamicGateCapacity(CustomTestCase):
         a.free_full(slots[10:11])
         state = {"low": True, "high": True}
         x = a.swa_attn_allocator
-        x.low_peer.disagg_move_gate = lambda: state["low"]
-        x.high_peer.disagg_move_gate = lambda: state["high"]
+        x.low_peer.pin_sources = (lambda: not state["low"],)
+        x.high_peer.pin_sources = (lambda: not state["high"],)
         epoch = x._chain_capacity_epoch()
         observed = {}
         for low, high in ((False, True), (True, False), (False, False), (True, True)):
@@ -147,7 +148,7 @@ class TestDynamicGateCapacity(CustomTestCase):
         states = a.mamba_allocator.alloc(8)
         slots = a.alloc(80)
         a.mamba_allocator.free(states[1:4])
-        a.set_disagg_move_gate(lambda: True)
+        pin_every_band(a, lambda: False)
         x = a.full_attn_allocator
         self.assertIs(x._growth_side_neighbor(), a.swa_attn_allocator)
         x.schedulable_available_size()
@@ -166,8 +167,8 @@ class TestDynamicGateCapacity(CustomTestCase):
                 slots = a.alloc(96 * ps)
                 a.free_swa(slots[: 40 * ps])
                 state = {"pd": True, "host": True}
-                a.set_disagg_move_gate(lambda: state["pd"])
-                a.set_host_transfer_move_gate(lambda: state["host"])
+                pin_every_band(a, lambda: not state["pd"])
+                pin_every_band(a, lambda: not state["host"])
                 x = a.full_attn_allocator
                 epoch = x._chain_capacity_epoch()
                 opened = x.schedulable_available_size()
@@ -198,8 +199,8 @@ class TestDynamicGateCapacity(CustomTestCase):
         a.free_full(slots[10:11])
         x = a.swa_attn_allocator
         state = {"low": True, "high": True}
-        x.low_peer.host_transfer_move_gate = lambda: state["low"]
-        x.high_peer.disagg_move_gate = lambda: state["high"]
+        x.low_peer.pin_sources = (lambda: not state["low"],)
+        x.high_peer.pin_sources = (lambda: not state["high"],)
         epoch = x._chain_capacity_epoch()
         observed = {}
         for low, high in ((False, True), (True, False), (False, False), (True, True)):

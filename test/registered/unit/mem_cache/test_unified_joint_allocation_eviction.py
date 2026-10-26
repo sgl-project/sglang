@@ -383,12 +383,12 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
         before = snapshot()
         for gate in (False, True):
             for member in allocator._flush_targets():
-                member.disagg_move_gate = lambda: gate
+                member.pin_sources = (lambda: not gate,)
             for _ in range(20):
                 allocator.reclaim_plan(4, 4)
             self.assertEqual(snapshot(), before)
         for member in allocator._flush_targets():
-            member.disagg_move_gate = None
+            member.pin_sources = ()
         self.assertTrue(evict_from_tree_cache(cache, 4))
         self.assertIsNotNone(allocator.alloc(4))
         self.assertEqual(cache.full_evictable_size(), 94)

@@ -9,7 +9,7 @@ code outside the KV package loops over them instead of naming a combination.
 
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Sequence, Tuple
 
 import msgspec
 
@@ -95,6 +95,11 @@ class KVStorage:
         """Every sub-pool, owner first."""
         return self._sub_pools
 
+    def sub_pool_names(self) -> Tuple[str, ...]:
+        """Every sub-pool's name, owner first: what a transfer that reaches
+        every sub-pool pins."""
+        return tuple(s.name for s in self._sub_pools)
+
     def view(self, sub_pool: str) -> Any:
         return self._views[sub_pool]
 
@@ -135,6 +140,15 @@ class KVStorage:
             return self._allocator.swa_available_size()
         assert sub_pool == self._allocator.roles.state, sub_pool
         return self._allocator.state_slots.schedulable_available_size()
+
+    def add_pin_source(
+        self, sub_pools: Sequence[str], busy: Callable[[], bool]
+    ) -> None:
+        """Keep the named sub-pools' device rows where they are whenever
+        ``busy()`` holds: a DMA engine (a PD transfer, a HiCache copy) reads
+        or writes the addresses it was handed. Register each initiator once,
+        over the queues that live across iterations; tree locks are not pins."""
+        self._allocator.add_pin_source(sub_pools, busy)
 
     def host_load_alloc(
         self, sub_pool: str

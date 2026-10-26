@@ -356,7 +356,7 @@ class TestTriJointReclaim(CustomTestCase):
         self.check_payload(b, a, slots[1:], states[1:], states)
         self.assertFalse(a.verify_byte_accounting())
 
-    def test_ready_allocation_preserves_payload_with_closed_move_gates(self):
+    def test_ready_allocation_preserves_payload_with_pinned_bands(self):
         for page_size, lazy, grouped in itertools.product(
             (1, 4), (False, True), (False, True)
         ):
@@ -377,7 +377,7 @@ class TestTriJointReclaim(CustomTestCase):
                     c.insert(InsertParams(key=key, value=slots))
                     records = [(key, slots.clone())]
                 for member in a._flush_targets():
-                    member.disagg_move_gate = lambda: False
+                    member.pin_sources = (lambda: True,)
                 if grouped:
                     a.free_group_begin()
                 self.assertGreaterEqual(a.available_size(), page_size)
@@ -417,7 +417,7 @@ class TestTriJointReclaim(CustomTestCase):
         # Close every movement gate. The finite request quotas may still reclaim
         # cache bytes; actual allocation and each phase remain separately visible.
         for member in a._flush_targets():
-            member.disagg_move_gate = lambda: False
+            member.pin_sources = (lambda: True,)
         with (
             patch.object(a, "ensure_capacity", wraps=a.ensure_capacity) as prep,
             patch.object(c, "evict_for_alloc", wraps=c.evict_for_alloc) as walks,
@@ -776,11 +776,9 @@ class TestTriJointReclaim(CustomTestCase):
                 self.check_payload(b, a, slots[1:], states[1:], states)
                 self.assertFalse(a.verify_byte_accounting())
 
-    def test_float_plan_rechecks_gate_changes_during_preparation(self):
-        for owner, gate_attr in itertools.product(
-            ("full", "mamba", "swa"), ("disagg_move_gate", "host_transfer_move_gate")
-        ):
-            with self.subTest(owner=owner, gate=gate_attr):
+    def test_float_plan_rechecks_pins_taken_during_preparation(self):
+        for owner in ("full", "mamba", "swa"):
+            with self.subTest(owner=owner):
                 b, a, c = self.build(lazy=True, temporal=(1, 4, 8))
                 states = b.token_to_kv_pool_allocator.state_slots.alloc(8)
                 slots = a.alloc(96)
@@ -800,7 +798,7 @@ class TestTriJointReclaim(CustomTestCase):
                 full_flush = a.full_attn_allocator.flush_for_allocation
 
                 def close_during_prepare():
-                    setattr(member, gate_attr, lambda: False)
+                    member.add_pin_source(lambda: True)
                     return full_flush()
 
                 sa = a.swa_attn_allocator
@@ -830,7 +828,7 @@ class TestTriJointReclaim(CustomTestCase):
                         )
                     )
                 self.check_payload(b, a, slots[1:], states[1:], states)
-                setattr(member, gate_attr, None)
+                member.pin_sources = ()
                 self.assertTrue(a.ensure_capacity(4, 4))
                 self.assertIsNotNone(a.alloc(4))
                 self.check_payload(b, a, slots[1:], states[1:], states)
@@ -1080,8 +1078,7 @@ class TestTriGeometry(CustomTestCase):
                 )
                 saved = payload(a, kv, mk)
                 for member in a._flush_targets():
-                    member.disagg_move_gate = lambda: pd_open
-                    member.host_transfer_move_gate = lambda: host_open
+                    member.pin_sources = (lambda: not pd_open, lambda: not host_open)
                 before = snapshot(a)
                 self.assertFalse(
                     float_reclaim_satisfied(chain_snapshot(a), float_chain(a), 5)
@@ -1096,8 +1093,7 @@ class TestTriGeometry(CustomTestCase):
                 # Zero-copy FLOAT boundary absorption is legal even with movement gated.
                 self.check_saved(a, saved)
                 for member in a._flush_targets():
-                    member.disagg_move_gate = None
-                    member.host_transfer_move_gate = None
+                    member.pin_sources = ()
                 self.assertTrue(a.ensure_capacity(5, 5))
                 self.assertIsNotNone(a.alloc(5))
                 self.check_saved(a, saved)
@@ -1131,7 +1127,7 @@ class TestTriGeometry(CustomTestCase):
                 self.assertGreater(len(fa._pending_reuse_pages_cpu), 0)
                 saved = payload(a, kv, mk)
                 for member in a._flush_targets():
-                    member.disagg_move_gate = lambda: False
+                    member.pin_sources = (lambda: True,)
                 before = snapshot(a)
                 predictions = [
                     float_reclaim_satisfied(chain_snapshot(a), float_chain(a), n * ps)
@@ -1149,7 +1145,7 @@ class TestTriGeometry(CustomTestCase):
                     )
                 self.assertEqual(snapshot(a), before)
                 for member in a._flush_targets():
-                    member.disagg_move_gate = None
+                    member.pin_sources = ()
                 if not urgent:
                     event.fired = True
                     fa.set_latest_forward_done_event(None)

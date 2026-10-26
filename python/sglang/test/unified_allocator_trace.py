@@ -32,6 +32,7 @@ from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.unified_allocator_fixtures import (
     UnifiedGeometry,
     build_unified_bundle,
+    pin_every_band,
     setup_allocator_context,
 )
 
@@ -126,7 +127,7 @@ class BuilderAdapter:
         self.events: List[FakeEvent] = []
         self.tree = self._build_tree() if config.chain == "swa" else None
         if config.lazy:
-            self.allocator.set_disagg_move_gate(lambda: self.gate_open)
+            pin_every_band(self.allocator, lambda: not self.gate_open)
 
     def _build_tree(self) -> UnifiedRadixCache:
         return UnifiedRadixCache(
