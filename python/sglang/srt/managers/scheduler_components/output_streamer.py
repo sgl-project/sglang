@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
@@ -38,6 +39,7 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.weight_versions import compute_weight_version_spans
 
 if TYPE_CHECKING:
+    from sglang.srt.observability.req_time_stats import SchedulerReqTimeStats
     from sglang.srt.rust_server.server import RustServer
 
 
@@ -45,6 +47,20 @@ logger = logging.getLogger(__name__)
 
 
 DEFAULT_FORCE_STREAM_INTERVAL = envs.SGLANG_FORCE_STREAM_INTERVAL.get()
+
+
+def _scheduler_decode_latency(time_stats: SchedulerReqTimeStats) -> Optional[float]:
+    """A finished non-streaming request's decode latency as Python's
+    TokenizerManager measures it: from the scheduler's prefill-finished stamp
+    (`_get_scheduler_first_token_time`, which has the stamp only when metrics
+    are on) to now, its terminal output (`get_decode_latency`). None where it
+    falls back to its own first-output time, which the Rust frontend
+    measures the same way."""
+    stamp = time_stats.prefill_finished_time
+    now = time.perf_counter()
+    if time_stats.enable_metrics and 0.0 < stamp <= now:
+        return now - stamp
+    return None
 
 
 @dataclass(kw_only=True, slots=True)
@@ -214,7 +230,7 @@ class SchedulerOutputStreamer:
         )
         if payload is not None:
             if self.rust_server is not None:
-                self.rust_server.push_generation(payload)
+                self.rust_server.push_generation(payload, acc.decode_latencies)
             else:
                 self.send_to_detokenizer.send_output(payload)
 
@@ -390,6 +406,9 @@ class _GenerationStreamAccumulator:
     # output tokens itself and never consumes the scheduler's incremental-detok
     # offsets (decode_ids / read_offset), so that per-step bookkeeping is skipped.
     rust_server_mode: bool = False
+    # Rust server mode: by row, the decode latency of a finished non-streaming
+    # request, whose first token the Rust frontend does not see.
+    decode_latencies: dict = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.return_hidden_states:
@@ -472,6 +491,8 @@ class _GenerationStreamAccumulator:
         self.output_ids.append(output_ids_[send_token_offset:])
         req.send_token_offset = len(output_ids_)
         self.prompt_tokens.append(len(req.origin_input_ids))
+        self.reasoning_tokens.append(req.reasoning_tokens)
+        self.cached_tokens.append(req.cached_tokens)
         # Index-aligned with the batch items so mixed batches resolve per-item
         # on the tokenizer side; None for non-beam items and aborted groups.
         beam_output = (
@@ -498,13 +519,11 @@ class _GenerationStreamAccumulator:
                 req.sampling_params.spaces_between_special_tokens
             )
             self.no_stop_trim.append(req.sampling_params.no_stop_trim)
-            self.reasoning_tokens.append(req.reasoning_tokens)
             self.completion_tokens.append(
                 beam_completion_tokens(beam_output)
                 if beam_output is not None
                 else len(output_ids_)
             )
-            self.cached_tokens.append(req.cached_tokens)
 
             # Collect detailed cache breakdown if available
             self.cached_tokens_details.append(self.get_cached_tokens_details(req))
@@ -513,14 +532,7 @@ class _GenerationStreamAccumulator:
         # already computed these and transferred them via the metadata buffer
         # (req.mm_*), so prefer the pre-stored values; otherwise compute them
         # from the request's multimodal items.
-        if req.mm_image_tokens or req.mm_audio_tokens or req.mm_video_tokens:
-            image_t = req.mm_image_tokens
-            audio_t = req.mm_audio_tokens
-            video_t = req.mm_video_tokens
-        elif req.multimodal_inputs:
-            image_t, audio_t, video_t = req.multimodal_inputs.compute_mm_token_counts()
-        else:
-            image_t = audio_t = video_t = 0
+        image_t, audio_t, video_t = req.get_mm_token_counts()
         self.image_tokens.append(image_t)
         self.audio_tokens.append(audio_t)
         self.video_tokens.append(video_t)
@@ -534,6 +546,10 @@ class _GenerationStreamAccumulator:
                     num_output_tokens=len(output_ids_),
                 )
             )
+            if self.rust_server_mode and not req.stream:
+                latency = _scheduler_decode_latency(req.time_stats)
+                if latency is not None:
+                    self.decode_latencies[len(self.rids) - 1] = latency
         else:
             self.weight_versions.append(None)
 

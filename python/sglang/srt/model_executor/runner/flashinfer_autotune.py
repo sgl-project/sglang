@@ -56,6 +56,24 @@ def get_flashinfer_autotune_skip_ops(model_runner: ModelRunner) -> set[str]:
     return skip_ops
 
 
+def _serves_block_fp8_as_mxfp8_on_flashinfer(model_runner: ModelRunner) -> bool:
+    from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+
+    for module in model_runner.model.modules():
+        method = getattr(module, "quant_method", None)
+        if (
+            isinstance(method, Fp8LinearMethod)
+            and method.block_fp8_as_mxfp8
+            and module.block_fp8_mxfp8_ready
+            and (
+                method.mxfp8_dense_backend.is_flashinfer_cutedsl()
+                or method.mxfp8_dense_backend.is_flashinfer_cutlass()
+            )
+        ):
+            return True
+    return False
+
+
 def should_run_flashinfer_autotune(
     model_runner: ModelRunner, *, for_speculative_draft: bool = False
 ) -> bool:
@@ -119,12 +137,12 @@ def should_run_flashinfer_autotune(
         resolve_mxfp8_dense_gemm_backend,
     )
 
-    if model_quantization == "mxfp8":
+    if model_quantization == "mxfp8" or model_quantization == "minimax_m3_nvfp4":
         fp8_gemm_needs_autotune = resolve_mxfp8_dense_gemm_backend().is_flashinfer()
     elif model_quantization in ("modelopt", "modelopt_fp8", "modelopt_mixed"):
         fp8_gemm_needs_autotune = flashinfer_per_tensor_fp8_supported()
     else:
-        fp8_gemm_needs_autotune = False
+        fp8_gemm_needs_autotune = _serves_block_fp8_as_mxfp8_on_flashinfer(mr)
 
     if not (moe_needs_autotune or fp4_gemm_needs_autotune or fp8_gemm_needs_autotune):
         return False
@@ -157,6 +175,8 @@ def flashinfer_autotune_cache_path(model_runner: ModelRunner) -> Path:
         str(get_parallel().moe_ep_size),
         str(mr.model_config.hf_config.__class__.__name__),
     ]
+    # Retune caches created before FlashInfer's default tactic joined the race.
+    model_key_parts.append("candidate_selection=v2_default")
     # A different skip policy must not reuse previously tuned tactics.
     skip_ops = get_flashinfer_autotune_skip_ops(mr)
     model_key_parts.append("skip_ops=" + ",".join(sorted(skip_ops)))
@@ -263,6 +283,8 @@ def _drop_diverged_autotune_cache(
 
 @contextlib.contextmanager
 def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool):
+    from flashinfer import autotune_v2
+
     # The gate below decides on the same inputs load_configs does.
     from flashinfer.autotuner import AutoTuner, _collect_metadata, autotune
 
@@ -331,6 +353,7 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool)
                 cache=None if reuse_cache else str(autotune_cache),
                 skip_ops=skip_ops,
             ),
+            autotune_v2(mode="tune", persistent_cache=False),
             mega_context,
             autotune_dummy_run_mode(run_lm_head=run_lm_head),
         ):

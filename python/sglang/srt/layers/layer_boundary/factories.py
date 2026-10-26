@@ -9,6 +9,8 @@ from dataclasses import dataclass, fields, is_dataclass, replace
 from types import MappingProxyType
 from typing import Callable, Mapping, NamedTuple, Optional
 
+import msgspec
+
 from sglang.srt.environ import envs
 from sglang.srt.layers import layernorm_sp
 from sglang.srt.layers.layer_boundary.adapters.overlap import (
@@ -42,16 +44,18 @@ from sglang.srt.layers.layer_boundary.layout import (
     moe_gathers_over_moe_cp,
     token_axis_sizes,
 )
-from sglang.srt.layers.layer_boundary.output import OutputTransform
+from sglang.srt.layers.layer_boundary.output import OutputTransform, SumImplementation
 from sglang.srt.layers.layer_boundary.residual import (
     ResidualReadout,
     ResidualUpdate,
+    takes_pending_update,
 )
 from sglang.srt.layers.layer_boundary.residual.add_norm import (
     NORM_QUANT_READOUT,
     NORM_READOUT,
     PLAIN_ADD,
 )
+from sglang.srt.layers.layer_boundary.row_transport import RowTransport
 from sglang.srt.layers.layer_boundary.stage import StageBoundary
 from sglang.srt.layers.moe import is_moe_input_scattered_across_dp_ranks
 from sglang.srt.runtime_context import get_exec, get_parallel
@@ -137,6 +141,7 @@ def _resolve_ffn(
     update=PLAIN_ADD,
     dense_tp_size=None,
     output_complete=False,
+    terminal_accepts_update=False,
 ):
     parallel = get_parallel()
     if dense_tp_size not in (None, 1, parallel.attn_tp_size, parallel.tp_size):
@@ -244,7 +249,7 @@ def _resolve_ffn(
             rows,
             group=group,
             may_defer_to_next=may_leave
-            and not terminal
+            and (not terminal or terminal_accepts_update)
             and not update.applied_at_exit
             and update.outlives_layer
             and output_transform is None,
@@ -298,6 +303,12 @@ class StageDeclaration:
         output_complete: Whether the FFN's compute completes its own output
             sum, so the exit owes none. For an FFN whose output sum is fused
             with a reduction its computation needs anyway.
+        sum_impl: Optional implementation of the declared output sum using
+            the model's custom collective. Its batch predicate, when supplied,
+            preserves eligibility for carrying that sum to the consumer.
+        row_transport: Explicit source, compute and return rows for a stage
+            whose operand moves independently of its residual. The bound
+            invocation owns output completion and inverse transport.
         attn_tp_gather: Optional implementation of the gather over attention
             TP that brings rows into this stage: at its own entry, or at its
             producer's exit, which runs its consumer's gather. Given this rank's
@@ -332,6 +343,8 @@ class StageDeclaration:
     writes_at_handoff: bool = False
     output_complete: bool = False
     attn_tp_gather: Optional[Callable] = None
+    sum_impl: Optional[SumImplementation] = None
+    row_transport: Optional[RowTransport] = None
     # Only declarations participate in construction, never executable stages.
     previous: Optional[StageDeclaration] = None
     prepared_from: Optional[StageDeclaration] = None
@@ -372,7 +385,9 @@ def _require(protocol, implementation, facts):
 
 
 def _check_update(update):
-    _require("ResidualUpdate", update, _UPDATE_FACTS)
+    _require("ResidualUpdate", update, _UPDATE_FACTS + ("bind", "replay_update"))
+    if update.bind is not None and not callable(update.bind):
+        raise TypeError("ResidualUpdate.bind must be callable or None")
     name = type(update).__name__
     if update.writes_stream and (update.is_plain_add or not update.applied_at_exit):
         raise ValueError(
@@ -386,7 +401,9 @@ def _check_update(update):
 
 
 def _check_read(read):
-    _require("ResidualReadout", read, _READ_FACTS + _READ_KERNELS)
+    _require("ResidualReadout", read, _READ_FACTS + _READ_KERNELS + ("bind",))
+    if read.bind is not None and not callable(read.bind):
+        raise TypeError("ResidualReadout.bind must be callable or None")
 
 
 @dataclass(frozen=True)
@@ -423,6 +440,8 @@ def declare_attn(
     tp_group=SumGroup.ATTN_TP,
     attn_tp_gather=None,
     in_token_order=False,
+    sum_impl=None,
+    row_transport=None,
 ):
     """Declare attention or a mixer; construct its executable boundary later.
 
@@ -443,6 +462,8 @@ def declare_attn(
             CP extend its input is gathered into that order, and the next
             stage's input completes the sum and takes this rank's shard back.
             Requires ALWAYS_PARTIAL.
+        sum_impl: Model-specific implementation of the declared output sum.
+
 
     Returns:
         A StageDeclaration with no norm, tensors or execution plan.
@@ -463,6 +484,8 @@ def declare_attn(
         tp_group=tp_group,
         attn_tp_gather=attn_tp_gather,
         in_token_order=in_token_order,
+        sum_impl=sum_impl,
+        row_transport=row_transport,
     )
 
 
@@ -476,6 +499,8 @@ def declare_ffn(
     dense_tp_size=None,
     exit_rows=None,
     output_complete=False,
+    sum_impl=None,
+    row_transport=None,
 ):
     """Declare a dense or MoE FFN independently of its compute module.
 
@@ -492,6 +517,9 @@ def declare_ffn(
             the adjacent FFN kinds and TBO configuration.
         output_complete: Whether the compute completes its own output sum,
             fused with a reduction it needs anyway; the exit then owes none.
+        sum_impl: Model-specific implementation and deferral eligibility of
+            the output sum. Cannot be combined with output_complete.
+
 
     Returns:
         A StageDeclaration with no norm, tensors or execution plan.
@@ -505,6 +533,8 @@ def declare_ffn(
         dense_tp_size=dense_tp_size,
         exit_rows=exit_rows or tbo_exit_rows(sparse, next_layer_sparse),
         output_complete=output_complete,
+        sum_impl=sum_impl,
+        row_transport=row_transport,
     )
 
 
@@ -576,11 +606,62 @@ def _stack_arrival(variant):
     )
 
 
-def _resolve_stage(stage, variant, arrival, following=None):
+def _custom_sum(stage, variant, group):
+    if stage.sum_impl is None:
+        return None
+    if (
+        variant is not BatchVariant.ORDINARY
+        or get_parallel().attn_dp_size > 1
+        or (
+            stage.kind is StageKind.ATTENTION
+            and stage.reduction is ProducerReduction.EXIT_SCOPED
+        )
+    ):
+        raise NotImplementedError(
+            "custom output sums require ordinary rows without attention DP "
+            "and an always-partial attention or an FFN"
+        )
+    return stage.sum_impl if group is not None and get_parallel().tp_size > 1 else None
+
+
+def _resolve_stage(stage, variant, arrival, following=None, *, final_read=None):
     """``stage``'s data flow for ``variant``, given what arrives at its entry
     and the stage after it (None when it ends the stack or a branch)."""
     axes, attention, local, full = _row_layouts(variant)
     _reject_unsupported(stage)
+    if stage.row_transport is not None:
+        if (
+            stage.sum_impl is not None
+            or stage.output_transform is not None
+            or stage.output_complete
+            or stage.in_token_order
+        ):
+            raise NotImplementedError(
+                "operand transport cannot bypass another output contract"
+            )
+        if stage.exit_rows not in (None, ExitRows.ATTENTION):
+            raise NotImplementedError(
+                "operand transport declares its return rows explicitly"
+            )
+        try:
+            rows = stage.row_transport.rows[variant]
+        except KeyError:
+            raise NotImplementedError(
+                "operand transport does not support this batch variant"
+            ) from None
+        if rows.group is not None and not isinstance(rows.group, SumGroup):
+            raise TypeError("operand transport requires a declared SumGroup")
+        if rows.decode_group is not None and not isinstance(
+            rows.decode_group, SumGroup
+        ):
+            raise TypeError("operand transport requires a declared decode SumGroup")
+        if rows.source != arrival.produced.layout or rows.returned != rows.source:
+            raise NotImplementedError("compute transport must return its source rows")
+        declaration = StageContract(
+            InputContract(rows.source, read=stage.read),
+            OutputContract(rows.returned, group=rows.group, update=stage.update),
+        )
+        return _Flow(declaration, arrival, arrival.residual, rows.returned)
     if stage.kind is StageKind.FFN:
         declaration, residual, returned = _resolve_ffn(
             variant,
@@ -591,6 +672,15 @@ def _resolve_stage(stage, variant, arrival, following=None):
             update=stage.update,
             dense_tp_size=stage.dense_tp_size,
             output_complete=stage.output_complete,
+            terminal_accepts_update=stage.terminal
+            and takes_pending_update(final_read, stage.update),
+        )
+        declaration = msgspec.structs.replace(
+            declaration,
+            output=msgspec.structs.replace(
+                declaration.output,
+                sum_impl=_custom_sum(stage, variant, declaration.output.group),
+            ),
         )
         exit_rows = resolve_exit_rows(stage.exit_rows)
         if exit_rows is ExitRows.ATTENTION or (
@@ -657,6 +747,7 @@ def _resolve_stage(stage, variant, arrival, following=None):
             update=stage.update,
             transform=stage.output_transform,
             in_token_order=in_token_order,
+            sum_impl=_custom_sum(stage, variant, group if owes else None),
         ),
     )
     # An attention moves no residual: it keeps the rows it arrives on, except
@@ -745,7 +836,9 @@ def _exit_edge(stage, flow, entry):
     )
 
 
-def _connect_line(line, origins, *, before=None, after=None, arrivals=None):
+def _connect_line(
+    line, origins, *, before=None, after=None, arrivals=None, final_read=None
+):
     """The connections along a chain of stages, each resolved once per batch
     variant: into ``line[0]``, between each two, and out of ``line[-1]`` to
     ``after`` (a stage on the next rank, or None at the end of the stack or a
@@ -754,12 +847,38 @@ def _connect_line(line, origins, *, before=None, after=None, arrivals=None):
     rank's own entry is taken as the stack input's. An error resolving a stage
     names the append at ``origins[i]`` that declared ``line[i]``, or the one
     next to the neighbouring rank's stage."""
-    variants = tuple(_active_variants())
+    # The global dense-TP default may be overridden by every FFN declaration.
+    # Odd row counts need a separate path only when some connected FFN would
+    # otherwise slice them over attention TP. Keep neighbours in this decision:
+    # their row choices still determine what crosses the pipeline boundary.
+    needs_unpadded = any(
+        stage is not None
+        and (
+            stage.row_transport is not None
+            or (
+                stage.kind is StageKind.FFN
+                and _ffn_on_rank_rows(stage.sparse, stage.dense_tp_size)
+            )
+        )
+        for stage in (before, *line, after)
+    )
+    variants = tuple(
+        variant
+        for variant in _active_variants()
+        if variant is not BatchVariant.UNPADDED or needs_unpadded
+    )
 
     def resolve(position, stage, arrivals, following=None):
         try:
             return {
-                v: _resolve_stage(stage, v, arrivals[v], following) for v in variants
+                v: _resolve_stage(
+                    stage,
+                    v,
+                    arrivals[v],
+                    following,
+                    final_read=final_read if stage.terminal else None,
+                )
+                for v in variants
             }
         except Exception as error:
             _note_origin(error, origins[position])
@@ -1002,8 +1121,9 @@ def _handed_off(declaration):
     return replace(
         declaration,
         exit_rows=ExitRows.ATTENTION,
-        writes_at_handoff=_ffn_on_rank_rows(
-            declaration.sparse, declaration.dense_tp_size
+        writes_at_handoff=(
+            declaration.row_transport is not None
+            or _ffn_on_rank_rows(declaration.sparse, declaration.dense_tp_size)
         ),
     )
 
@@ -1072,6 +1192,7 @@ def _bind_stack(appends, *, previous, following, final_read=None):
         [append.origin for append, _ in stages],
         before=chained[0].previous,
         after=following,
+        final_read=final_read if following is None else None,
     )
     _bind_line(
         stages,
@@ -1145,6 +1266,8 @@ def _bind_line(stages, chained, connections, bound, sources, *, final_read=None)
                 connections[position],
                 connections[position + 1],
                 final_read=final_read if position == last else None,
+                pipeline_handoff=position == last
+                and connections[position + 1].consumer is not None,
                 capture_preserves_residual=(
                     _preserves_residual(boundaries[position + 1])
                     if consumer is not None

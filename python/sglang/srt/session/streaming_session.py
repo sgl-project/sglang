@@ -86,6 +86,14 @@ class StreamingSession:
             return None
         return slot
 
+    def will_lend_record(self, req: Optional[Req]) -> bool:
+        """Whether req has a slot record to borrow. Unlike find_active_slot, it
+        leaves a pre-aborted req attached."""
+        if not _is_streaming(req) or req.to_finish is not None:
+            return False
+        slot = self.slots.get(req.session.session_id)
+        return slot is not None and slot.kv.holds_kv
+
     def try_match_prefix(self, params: MatchPrefixParams) -> Optional[MatchResult]:
         """Returns a MatchResult iff the request hits an active session slot;
         otherwise None (caller falls back to its raw match)."""
@@ -247,9 +255,12 @@ class StreamingSession:
             mamba_allocator.free(slot.kv.mamba_pool_idx.unsqueeze(0))
             slot.kv.mamba_pool_idx = None
         if slot.kv.mamba_ping_pong_track_buffer is not None:
-            indices = slot.kv.mamba_ping_pong_track_buffer
-            mamba_allocator.free(indices[indices != -1])
+            buffer = slot.kv.mamba_ping_pong_track_buffer
+            for position, empty in enumerate(slot.kv.mamba_ping_pong_empty):
+                if not empty:
+                    mamba_allocator.free(buffer[position : position + 1])
             slot.kv.mamba_ping_pong_track_buffer = None
+            slot.kv.mamba_ping_pong_empty = None
 
     # -- Internal helpers (streaming body bits) --
 

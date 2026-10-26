@@ -10,8 +10,9 @@ from torch.nn.parameter import Parameter
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
-from sglang.srt.layers.moe.utils import RoutingMethodType
+from sglang.srt.layers.moe.utils import MoeRunnerBackend, RoutingMethodType
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
@@ -126,7 +127,7 @@ class Mxfp4FlashinferTrtllmMoEMethod:
             and config.scoring_func == "sigmoid"
             and config.correction_bias is not None
             and config.custom_routing_function is None
-            and config.num_fused_shared_experts == 0
+            and config.num_shared_topk_slots == 0
             and not config.torch_native
         )
         self._bypassed_routing_method = (
@@ -163,6 +164,14 @@ class Mxfp4FlashinferTrtllmMoEMethod:
             if swiglu_limit is not None
             else None
         )
+
+    def get_moe_runner_backend(self, layer):
+        return MoeRunnerBackend.FLASHINFER_MXFP4
+
+    def get_moe_routing_method_type(
+        self, layer: Module, requested_method: RoutingMethodType | None
+    ) -> RoutingMethodType | None:
+        return requested_method
 
     def create_weights(
         self,
@@ -460,11 +469,14 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         # Deferred finalize returns the permuted GEMM2 output plus the routing
         # triple instead of the finalized [T, hidden] tensor.
         defer_finalize = is_deferred_finalize_enabled()
+        # FlashInfer keys its tactic cache on the output shape. At <= 32 rows the tuned
+        # tactic measured slower on real routing, so those keep the (M, 0) key.
+        if envs.SGLANG_OPT_MXFP4_DEFERRED_FINALIZED_SHAPE.get():
+            deferred_output_shape = num_tokens > 32
+        else:
+            deferred_output_shape = 96 < num_tokens <= 384
         symm_output = None
-        # Preserve the ordinary output shape in the medium-batch autotuner
-        # cache key. The deferred ABI ignores this allocation and returns the
-        # expanded GEMM output for the separate fused finalize epilogue.
-        if not defer_finalize or 96 < num_tokens <= 384:
+        if not defer_finalize or deferred_output_shape:
             with use_symmetric_memory(
                 get_parallel().tp_group, disabled=not is_allocation_symmetric()
             ):
@@ -559,21 +571,47 @@ def maybe_fuse_routed_scale_and_shared_add(
     return routed
 
 
-# Fused finalize + shared add + TP all-reduce, staged through the TP group's own
-# CustomAllReduceV2 push plane (tiny batches only; no dedicated workspace).
+# Fused finalize + shared add + TP all-reduce, staged through a CustomAllReduceV2
+# push plane: the TP group's own, or a dedicated push-only one.
+
+_fused_all_reduce_comm = None
 
 
-def register_fused_all_reduce_comm() -> None:
-    """Hand the TP group's push plane to the fusion kernels, once per process.
-    Must run before graph capture; unregistered means everything runs unfused."""
+def register_fused_all_reduce_comm(
+    *, max_push_size: Optional[int] = None, max_push_blocks: Optional[int] = None
+) -> None:
+    """Hand a push plane to the fusion kernels, once per process: the TP group's
+    own, or with ``max_push_size`` a dedicated push-only plane of that slot size
+    and ``max_push_blocks`` row counters. Must run before graph capture;
+    unregistered means everything runs unfused."""
+    global _fused_all_reduce_comm
+    if _fused_all_reduce_comm is not None:
+        return
     from sglang.kernels.ops.communication import all_reduce_fusion
     from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
         CustomAllReduceV2,
     )
 
-    ca_comm = get_parallel().tp_group.ca_comm
-    if isinstance(ca_comm, CustomAllReduceV2) and not ca_comm.disabled:
-        all_reduce_fusion.register_comm(ca_comm.obj)
+    comm = get_parallel().tp_group.ca_comm
+    if (
+        isinstance(comm, CustomAllReduceV2)
+        and not comm.disabled
+        and max_push_size is not None
+    ):
+        from sglang.srt.distributed.comm_cleanup import register_comm_cleanup
+
+        comm = CustomAllReduceV2(
+            comm.group,
+            comm.device,
+            max_pull_size=0,
+            max_pull_blocks=0,
+            max_push_size=max_push_size,
+            max_push_blocks=max_push_blocks,
+        )
+        register_comm_cleanup(comm)
+    if isinstance(comm, CustomAllReduceV2) and not comm.disabled:
+        all_reduce_fusion.register_comm(comm.obj)
+        _fused_all_reduce_comm = comm
     else:
         log_info_on_rank0(
             logger,
@@ -591,9 +629,9 @@ def can_fuse_all_reduce(num_tokens: int, hidden_dim: int) -> bool:
     producer folds the routed scaling; no consumer rescales)."""
     from sglang.kernels.ops.communication import all_reduce_fusion
 
-    if all_reduce_fusion.get_registered_comm(get_parallel().tp_size) is None:
+    comm = _fused_all_reduce_comm
+    if comm is None or comm.world_size != get_parallel().tp_size:
         return False
-    comm = get_parallel().tp_group.ca_comm
     return (
         num_tokens <= 384
         and num_tokens <= comm.config.num_push_blocks

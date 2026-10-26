@@ -42,6 +42,7 @@ from typing import (
     Iterable,
     List,
     Optional,
+    Set,
     Tuple,
     Union,
 )
@@ -136,6 +137,7 @@ from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_TOKENIZER,
     TokenizerMetricsCollector,
     resolve_collector_class,
+    tokenizer_metric_labels,
 )
 from sglang.srt.observability.req_time_stats import (
     APIServerReqTimeStats,
@@ -159,6 +161,7 @@ from sglang.srt.runtime_context import (
     get_model,
     get_observability,
     get_parallel,
+    get_platform,
     get_schedule,
     get_serving,
     get_spec,
@@ -350,6 +353,9 @@ class ReqState:
     customized_info_accumulated: Dict[str, List[Any]] = dataclasses.field(
         default_factory=dict
     )
+    # Accumulated keys written to meta_info. Cumulative streams re-report only
+    # these, so a subclass can accumulate values it keeps out of responses.
+    customized_info_reported_keys: Set[str] = dataclasses.field(default_factory=set)
 
     # For return_prompt_token_ids: stores prompt token IDs captured after tokenization
     prompt_token_ids: Optional[List[int]] = None
@@ -452,6 +458,9 @@ _SCHEDULER_EXIT_TIMEOUT_SECS = 15
 
 class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     """TokenizerManager is a process that tokenizes the text."""
+
+    tokenized_generate_req_type = TokenizedGenerateReqInput
+    batch_tokenized_generate_req_type = BatchTokenizedGenerateReqInput
 
     # Set by whoever owns the event loop, and left None for Engine and grpc,
     # which own no server. Class-level to leave the frozen __init__ alone.
@@ -826,23 +835,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def init_metric_collector_watchdog(self):
         # Metrics
         if self.enable_metrics:
-            engine_type = DisaggregationMode.to_engine_type(
-                get_disagg().disaggregation_mode
-            )
-
-            labels = {
-                "model_name": get_serving().served_model_name,
-                "engine_type": engine_type,
-            }
-            if self.enable_priority_scheduling:
-                labels["priority"] = ""
-            if get_observability().tokenizer_metrics_allowed_custom_labels:
-                for (
-                    label
-                ) in get_observability().tokenizer_metrics_allowed_custom_labels:
-                    labels[label] = ""
-            if get_observability().extra_metric_labels:
-                labels.update(get_observability().extra_metric_labels)
+            labels = tokenizer_metric_labels()
             tokenizer_collector_cls = resolve_collector_class(
                 STAT_LOGGER_ROLE_TOKENIZER,
                 TokenizerMetricsCollector,
@@ -1317,10 +1310,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         """Validates that the input token count and the requested token count doesn't exceed the model's context length."""
         # FIXME: unify the length validation logic with the one in the scheduler.
         if get_exec().features.enable_encoder_swa_bounded_replay:
+            if obj.image_data is not None and not get_platform().is_cuda:
+                raise ValueError(
+                    "encoder SWA replay supports image requests only on CUDA"
+                )
             if any(
                 value is not None
                 for value in (
-                    obj.image_data,
                     obj.video_data,
                     obj.audio_data,
                     obj.input_embeds,
@@ -1328,15 +1324,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
             ):
                 raise ValueError(
-                    "encoder SWA replay currently supports token-only text requests"
-                )
-            if (
-                isinstance(obj, GenerateReqInput)
-                and obj.return_logprob
-                and obj.logprob_start_len not in (None, -1, len(input_ids))
-            ):
-                raise ValueError(
-                    "encoder SWA replay cannot return cached prompt logprobs"
+                    "encoder SWA replay does not support video, audio, input_embeds, "
+                    "or positional_embed_overrides"
                 )
         # A decision layout indexes the whole prompt, so it is checked before any
         # truncation below could cut the prompt.
@@ -1448,8 +1437,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def _validate_joint_schema_request(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput], input_ids: List[int]
     ) -> None:
-        """A Clef checkpoint scores the spans of a decision layout, and nothing else."""
-        if self.model_config.joint_head_config is None:
+        """A Clef or Kev checkpoint scores the spans of a decision layout, and nothing else."""
+        if (
+            self.model_config.joint_head_config is None
+            and self.model_config.pointer_head is None
+        ):
             return
         if isinstance(obj, GenerateReqInput) or obj.decision_layout is None:
             # Health checks only need a response, which is an empty embedding.
@@ -1589,7 +1581,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 bootstrap_room = self.fake_bootstrap_room_counter
                 self.fake_bootstrap_room_counter += 1
 
-            tokenized_obj = TokenizedGenerateReqInput(
+            tokenized_obj = self.tokenized_generate_req_type(
                 input_text=input_text,
                 input_ids=input_ids_arr,
                 mm_inputs=mm_inputs,
@@ -1843,7 +1835,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 tokenized_obj.wrap_pickle_fields()
 
             if isinstance(tokenized_objs[0], TokenizedGenerateReqInput):
-                batch_req = BatchTokenizedGenerateReqInput(batch=tokenized_objs)
+                batch_req = self.batch_tokenized_generate_req_type(batch=tokenized_objs)
             else:
                 batch_req = BatchTokenizedEmbeddingReqInput(batch=tokenized_objs)
 
@@ -1907,10 +1899,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         finish_reason = out["meta_info"]["finish_reason"]
 
         status_code = finish_reason.get("status_code")
-        if finish_reason.get("type") != "abort" or status_code not in (
-            HTTPStatus.BAD_REQUEST,
-            HTTPStatus.SERVICE_UNAVAILABLE,
-            HTTPStatus.INTERNAL_SERVER_ERROR,
+        if (
+            finish_reason.get("type") != "abort"
+            or status_code is None
+            or not HTTPStatus.BAD_REQUEST <= status_code < 600
         ):
             return None
 
@@ -2002,12 +1994,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 if (
                     is_stream
                     and not incremental_stream
-                    and state.customized_info_accumulated
+                    and state.customized_info_reported_keys
                 ):
                     meta_info = out.get("meta_info")
                     if meta_info is not None:
                         for key, values in state.customized_info_accumulated.items():
-                            meta_info.setdefault(key, list(values))
+                            if key in state.customized_info_reported_keys:
+                                meta_info.setdefault(key, list(values))
 
             # Resolve deferred text for non-incremental streaming.
             # _handle_batch_output sets "text": None on intermediate chunks
@@ -2426,8 +2419,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
     async def freeze_gc(self):
         """Send a freeze_gc message to the scheduler first, then freeze locally."""
-        self._dispatch_to_scheduler(FreezeGCReq())
-        freeze_gc("Tokenizer Manager")
+        gc_threshold = get_device().gc_threshold
+        self._dispatch_to_scheduler(FreezeGCReq(gc_threshold=gc_threshold))
+        freeze_gc("Tokenizer Manager", gc_threshold)
         return None
 
     def create_abort_task(self, obj: GenerateReqInput):
@@ -2824,6 +2818,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         accumulated = state.customized_info_accumulated.setdefault(key, [])
         accumulated.extend(values)
         meta_info[key] = accumulated
+        state.customized_info_reported_keys.add(key)
 
     def update_request_meta_info(
         self,

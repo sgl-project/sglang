@@ -28,7 +28,7 @@ from sglang.srt.runtime_context import get_context, get_flags, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class _LayerModel:
@@ -386,6 +386,7 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
                 with self.subTest(first_rank=first_rank, positional=positional):
                     runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
                     runner._is_full_backend = False
+                    runner.is_dsv41_model = False
                     runner._qwen_bcg_hc_sidechannel = False
                     runner._qwen_bcg_mtp_draft = False
                     runner._input_embeds_arg_idx = 3
@@ -505,6 +506,7 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
 
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner._is_full_backend = False
+        runner.is_dsv41_model = False
         runner._qwen_bcg_hc_sidechannel = False
         runner._qwen_bcg_mtp_draft = True
         runner._input_embeds_arg_idx = None
@@ -531,6 +533,7 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
     def test_bcg_mtp_draft_replay_fills_hc_width_input_embeds_slot(self):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner._is_full_backend = False
+        runner.is_dsv41_model = False
         runner._qwen_bcg_hc_sidechannel = False
         runner._qwen_bcg_mtp_draft = True
         runner._input_embeds_arg_idx = 3

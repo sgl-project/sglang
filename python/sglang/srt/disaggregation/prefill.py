@@ -43,6 +43,7 @@ from sglang.srt.disaggregation.common.staging_buffer import (
     compute_grid_segments,
     staging_grid_tokens,
 )
+from sglang.srt.disaggregation.minimax import minimax_index_transfer_pages
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
     DisaggregationMode,
@@ -55,10 +56,12 @@ from sglang.srt.disaggregation.utils import (
     get_dsa_tail_state_indices,
     get_kv_class,
     get_kv_transfer_buf_infos,
+    get_pd_kv_layout,
     get_qsa_pending_state_indices,
     is_aborted,
     is_mla_backend,
     is_unadmitted_reject,
+    kv_layout_signature,
     poll_and_all_reduce_attn_cp_tp_group,
     poll_and_all_reduce_prefill_pp,
     prepare_abort,
@@ -78,6 +81,7 @@ from sglang.srt.mem_cache.common import (
     kv_to_page_indices,
     kv_to_page_num,
     release_kv_cache,
+    suffix_page_indices,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
@@ -141,6 +145,15 @@ def _transfer_start_layer(*, pool, hf_text_config) -> int:
     )
 
 
+def max_bootstrap_input_len(*, capacity: int, page_size: int, shard_size: int) -> int:
+    """Bootstrap prompt limit; sharded admission never fits a longer prompt."""
+    if shard_size == 1:
+        return capacity
+    # Strictest path, add_one_req_ignore_eos: page-rounded prompt, one page per
+    # shard, 1 new token and 1 spare token must stay below capacity.
+    return (capacity - shard_size * page_size - 3) // page_size * page_size
+
+
 def maybe_release_metadata_buffer(
     req: Req, allocator: ReqToMetadataIdxAllocator
 ) -> None:
@@ -190,8 +203,15 @@ class PrefillBootstrapQueue:
         self.queue: List[Req] = []
         self.scheduler = scheduler
         self.scheduler_stage_metrics = scheduler_stage_metrics
+        # Each rank owns a subset of logical KV pages, so capacity widens by N.
         self.max_total_num_tokens = (
             self.scheduler.tp_worker.model_runner.effective_logical_max_total_num_tokens
+            * self.scheduler.kv_shard_widening
+        )
+        self.max_input_len = max_bootstrap_input_len(
+            capacity=self.max_total_num_tokens,
+            page_size=self.scheduler.token_to_kv_pool_allocator.page_size,
+            shard_size=self.scheduler.kv_shard_widening,
         )
         self.transfer_backend = transfer_backend
         self.pp_poll_sync_work_list: List = []
@@ -220,8 +240,10 @@ class PrefillBootstrapQueue:
                     "supported by Mooncake."
                 )
         self.kv_manager = self._init_kv_manager()
+        self.kv_checksum_signature = 0
         if get_disagg().disaggregation_enable_kv_checksum:
             kv_args = self.kv_manager.kv_args
+            self.kv_checksum_signature = kv_layout_signature(kv_args)
             self.scheduler.kv_checksum_computer = KvChecksumComputer(
                 device=torch.device(f"cuda:{get_device().gpu_id}"),
                 kv_data_ptrs=kv_args.kv_data_ptrs,
@@ -246,6 +268,7 @@ class PrefillBootstrapQueue:
         kv_args.kv_cache_dtype_str = (
             self.scheduler.tp_worker.model_runner.kv_cache_dtype_str
         )
+        kv_args.kv_layout = get_pd_kv_layout(self.token_to_kv_pool)
         layer_shard_enabled = getattr(
             self.token_to_kv_pool, "layer_shard_enabled", False
         )
@@ -443,8 +466,8 @@ class PrefillBootstrapQueue:
             self.add(req, num_kv_heads)
 
     def _check_if_req_exceed_kv_capacity(self, req: Req) -> bool:
-        if len(req.origin_input_ids) > self.max_total_num_tokens:
-            message = f"Request {req.rid} exceeds the maximum number of tokens: {len(req.origin_input_ids)} > {self.max_total_num_tokens}"
+        if len(req.origin_input_ids) > self.max_input_len:
+            message = f"Request {req.rid} exceeds the maximum number of tokens: {len(req.origin_input_ids)} > {self.max_input_len}"
             logger.error(message)
             req.time_stats.trace_ctx.abort(abort_info={"reason": message})
             prepare_abort(req, message, status_code=HTTPStatus.BAD_REQUEST)
@@ -457,6 +480,18 @@ class PrefillBootstrapQueue:
         Set max_new_tokens = 1, so PrefillAdder memory estimation is accurate
         """
         req.sampling_params.max_new_tokens = 1
+
+    def can_prefill_before_bootstrap(self, req: Req) -> bool:
+        """Check eligibility; pause and metadata admission stay in the shared queue."""
+        return (
+            req.prefill_attempt_count < get_disagg().optimistic_prefill_attempts
+            or get_disagg().disaggregation_decode_allocation_policy
+            == "prefill_complete"
+        ) and not (
+            _uses_write_through_cache(self.scheduler.tree_cache)
+            and req.swa_branching_seqlen is not None
+            and req.swa_branching_seqlen > req.kv.cache_protected_len
+        )
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
     def pop_bootstrapped(self) -> List[Req]:
@@ -490,20 +525,7 @@ class PrefillBootstrapQueue:
                 self.scheduler.handle_bootstrap_failure(req)
                 indices_to_remove.add(i)
             elif poll == KVPoll.Bootstrapping:
-                if (
-                    (
-                        req.prefill_attempt_count
-                        < get_disagg().optimistic_prefill_attempts
-                        or get_disagg().disaggregation_decode_allocation_policy
-                        == "prefill_complete"
-                    )
-                    and not req.is_retracted  # engine paused
-                    and not (
-                        _uses_write_through_cache(self.scheduler.tree_cache)
-                        and req.swa_branching_seqlen is not None
-                        and req.swa_branching_seqlen > req.kv.cache_protected_len
-                    )
-                ):
+                if not req.is_retracted and self.can_prefill_before_bootstrap(req):
                     if not self.ensure_metadata_buffer(req):
                         continue  # no more metadata buffer
                     req.prefill_attempt_count += 1
@@ -719,6 +741,13 @@ class SchedulerDisaggregationPrefillMixin:
             )
         return enabled
 
+    def _war_barrier_is_coarse(self: Scheduler) -> bool:
+        # Same condition as Scheduler._apply_war_barrier's whole-forward fallback.
+        if not self._war_barrier_enabled:
+            return False
+        ev = self.model_worker.last_shared_read_runner.shared_read_done_event
+        return ev is None or envs.SGLANG_FORCE_COARSE_WAR_BARRIER.get()
+
     def _yield_gil_if_needed(self: Scheduler) -> None:
         if self.tp_size == 1:
             # No collective parks this thread at TP=1. A bounded sleep lets
@@ -746,6 +775,7 @@ class SchedulerDisaggregationPrefillMixin:
         # Keep the newer forward's sampling context across unfinished-result passes.
         batch = None
         batch_result = None
+        war_barrier_pending = False
 
         while True:
             if self.gracefully_exit:
@@ -793,7 +823,13 @@ class SchedulerDisaggregationPrefillMixin:
                     if self.enable_staging:
                         self.maybe_prefetch_staging_for_batch(batch)
                     batch_result = self.run_batch(batch)
-                    self._apply_war_barrier()
+                    if self._war_barrier_is_coarse():
+                        # Defer a whole-forward barrier past result processing: it and
+                        # the inflight queue mutate no request in this forward (a
+                        # continuing chunked one is only read).
+                        war_barrier_pending = True
+                    else:
+                        self._apply_war_barrier()
                     self.result_queue.append((batch.copy(), batch_result))
                 else:
                     batch_result = None
@@ -809,6 +845,9 @@ class SchedulerDisaggregationPrefillMixin:
                         )
                     ):
                         waiting_for_batch_result = True
+                        if war_barrier_pending:
+                            self._apply_war_barrier()
+                            war_barrier_pending = False
                         self._yield_gil_if_needed()
                         continue
                 # Process the oldest batch result.
@@ -819,6 +858,10 @@ class SchedulerDisaggregationPrefillMixin:
                 self.on_idle()
 
             self.process_disagg_prefill_inflight_queue()
+
+            if war_barrier_pending:
+                self._apply_war_barrier()
+                war_barrier_pending = False
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
@@ -1460,14 +1503,22 @@ class SchedulerDisaggregationPrefillMixin:
         computer: Optional[KvChecksumComputer] = self.kv_checksum_computer
         if last_chunk and computer is not None:
             if is_health_check_req(req):
-                value = 0
+                digest = signature = 0
             else:
                 if end_idx is None:
                     end_idx = min(req.extend_end, len(req.origin_input_ids))
-                page_indices_gpu = page_indices_for_request(self, req, end_idx)
-                state_indices = state_indices_for_request(self, req, end_idx)
-                value = computer.compute(page_indices_gpu, state_indices)
-            self.disagg_metadata_buffers.set_kv_checksum(req, value)
+                # Only the pages this prefill sends; decode digests the same
+                # range of its row, past the prefix it promised at bootstrap.
+                start_idx = req.disagg_decode_prefix_len
+                page_indices_gpu = page_indices_for_request(
+                    self, req, end_idx, start_idx=start_idx
+                )
+                state_indices = state_indices_for_request(
+                    self, req, end_idx, start_idx=start_idx
+                )
+                digest = computer.compute(page_indices_gpu, state_indices)
+                signature = self.disagg_prefill_bootstrap_queue.kv_checksum_signature
+            self.disagg_metadata_buffers.set_kv_checksum(req, digest, signature)
         self._send_kv_chunk(req, last_chunk=last_chunk, end_idx=end_idx)
 
     def _send_kv_chunk(
@@ -1531,9 +1582,21 @@ class SchedulerDisaggregationPrefillMixin:
                 ]
 
             def _swa_payload():
-                window_size = self.sliding_window_size
+                kvcache = self.token_to_kv_pool_allocator.get_kvcache()
+                request_window = kvcache.request_window
+                # Under encoder replay the scheduler is not hybrid SWA and keeps no
+                # window size; the pool holds it.
+                window_size = (
+                    self.sliding_window_size
+                    if request_window is None
+                    else kvcache.sliding_window
+                )
                 window_start = max(req.disagg_decode_prefix_len, seq_len - window_size)
                 window_start = (window_start // page_size) * page_size
+                if request_window is not None:
+                    return request_window.page_indices(
+                        int(req.kv.req_pool_idx), window_start, seq_len
+                    )
                 window_kv_indices_full = self.req_to_token_pool.req_to_token[
                     req.kv.req_pool_idx, window_start:seq_len
                 ]
@@ -1549,6 +1612,26 @@ class SchedulerDisaggregationPrefillMixin:
                     req.kv.req_pool_idx, :seq_len
                 ]
                 return kv_to_page_indices(kv_indices_full, page_size)
+
+            def _minimax_payload():
+                return minimax_index_transfer_pages(
+                    self.req_to_token_pool.req_to_token[req.kv.req_pool_idx, :seq_len],
+                    page_size=page_size,
+                    prefix_len=req.disagg_decode_prefix_len,
+                )
+
+            def _dsa_pages_payload():
+                # Decode already holds the indexer rows of the prefix it cached
+                # (decode_prefix_len, page-aligned), and its rows for a prefix
+                # still being restored point at no page yet: send only the
+                # suffix, positionally matching decode's _dsa_pages_payload.
+                return suffix_page_indices(
+                    self.req_to_token_pool.req_to_token,
+                    req.kv.req_pool_idx,
+                    req.disagg_decode_prefix_len,
+                    seq_len,
+                    page_size,
+                )
 
             def _dsa_tail_payload():
                 return get_dsa_tail_state_indices(
@@ -1581,6 +1664,9 @@ class SchedulerDisaggregationPrefillMixin:
                     int(req.kv.req_pool_idx), c128_seq_len
                 )
 
+            def _request_row_payload():
+                return np.array([req.kv.req_pool_idx], dtype=np.int32)
+
             state_types = (
                 self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types
             )
@@ -1589,12 +1675,13 @@ class SchedulerDisaggregationPrefillMixin:
                 StateType.QSA_PENDING: _qsa_pending_payload,
                 StateType.QSA_COMPRESSED: _full_kv_pages_payload,
                 StateType.SWA: _swa_payload,
-                StateType.DSA: _full_kv_pages_payload,
+                StateType.DSA: _dsa_pages_payload,
                 StateType.DSA_TAIL: _dsa_tail_payload,
-                StateType.MINIMAX_INDEX_K: _full_kv_pages_payload,
+                StateType.MINIMAX_INDEX_K: _minimax_payload,
                 StateType.MINIMAX_DENSE_KV: _full_kv_pages_payload,
                 StateType.SWA_RING: _swa_ring_payload,
                 StateType.DSV4_REQUEST_STATE: _request_state_payload,
+                StateType.REQUEST_ROW: _request_row_payload,
                 StateType.BLOCK_SCALE: _full_kv_pages_payload,
                 StateType.BLOCK_SCALE_SWA: _swa_payload,
             }
@@ -1650,18 +1737,43 @@ class SchedulerDisaggregationPrefillMixin:
                     raw_kv_indices
                 )
             )
-            page_indices = kv_to_page_indices(kv_indices, page_size)
-            segment_is_last = last_chunk and is_final_segment
-            if not req.disagg_kv_sender.should_send_kv_chunk(
-                len(page_indices), segment_is_last
+            sender = req.disagg_kv_sender
+            indices_event = None
+            if getattr(sender, "supports_host_tensor_indices", False) and not (
+                sender.kv_mgr.enable_all_cp_ranks_for_transfer
+                and not get_parallel().enable_dsa_cache_layer_split
             ):
+                # The schedule stream may wait on the in-flight forward; move the
+                # D2H wait to the transfer worker so scheduling can continue.
+                page_indices_dev = kv_indices[::page_size] // page_size
+                page_indices = torch.empty(
+                    page_indices_dev.shape,
+                    dtype=page_indices_dev.dtype,
+                    device="cpu",
+                    pin_memory=True,
+                )
+                page_indices.copy_(page_indices_dev, non_blocking=True)
+                indices_event = torch.cuda.Event()
+                indices_event.record(torch.cuda.current_stream())
+            else:
+                page_indices = kv_to_page_indices(kv_indices, page_size)
+            segment_is_last = last_chunk and is_final_segment
+            if not sender.should_send_kv_chunk(len(page_indices), segment_is_last):
                 continue
             send_state_indices = state_indices if segment_is_last else None
-            req.disagg_kv_sender.send(
-                page_indices,
-                send_state_indices,
-                num_kv_tokens=seg_end - seg_start,
-            )
+            if indices_event is not None:
+                sender.send(
+                    page_indices,
+                    send_state_indices,
+                    num_kv_tokens=seg_end - seg_start,
+                    indices_event=indices_event,
+                )
+            else:
+                sender.send(
+                    page_indices,
+                    send_state_indices,
+                    num_kv_tokens=seg_end - seg_start,
+                )
         req.start_send_idx = end_idx
         # A last chunk needs no entry: every `last_chunk=True` call site has
         # already put the request on `disagg_prefill_inflight_queue`.
@@ -1687,7 +1799,9 @@ class SchedulerDisaggregationPrefillMixin:
                 req._compute_max_prefix_len(len(req.full_untruncated_fill_ids)),
             )
         )
-        self._release_aborted_request(req)
+        # The request is requeued, not aborted: keep its multimodal inputs (the
+        # re-prefill embeds its image tokens again) and its streaming session.
+        self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
         # The checkpoint above already handed the prefill KV to the tree; the
         # request is not finished, so the release only frees the rest.
         release_kv_cache(req, self.tree_cache, checkpoint=False)

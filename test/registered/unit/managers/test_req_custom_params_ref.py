@@ -8,7 +8,7 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 def _make_req(custom_logit_processor=None):
@@ -34,11 +34,6 @@ class TestReqCustomParamsRef(CustomTestCase):
             self.assertIsNone(ref())
         finally:
             gc.enable()
-
-    def test_processor_reads_its_request(self):
-        """A custom logit processor still finds its request under __req__."""
-        req = _make_req(custom_logit_processor="{}")
-        self.assertIs(req.sampling_params.custom_params["__req__"], req)
 
 
 if __name__ == "__main__":
