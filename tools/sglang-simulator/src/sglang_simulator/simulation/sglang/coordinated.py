@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from functools import wraps
 
 import zmq
+
 from sglang_simulator.compat import validate_coordinator_endpoint
 from sglang_simulator.simulation.coordinator import (
     Cancel,
@@ -106,6 +107,26 @@ def _validate_prefill_cadence_runtime(scheduler) -> None:
         raise ValueError("prefill_decode_interval requires a valid native counter")
 
 
+def _watchdog_activation_owner(watchdog):
+    """Resolve the native raw callback without activating a disabled watchdog."""
+    missing = object()
+    active = getattr(watchdog, "is_active", missing)
+    if active is not missing:
+        owner = watchdog
+    else:
+        owner = getattr(watchdog, "_raw", missing)
+        if owner is missing:
+            from sglang.srt.utils.watchdog import _WatchdogNoop
+
+            if type(watchdog) is _WatchdogNoop:
+                return None
+            raise ValueError("unsupported native watchdog activation interface")
+        active = getattr(owner, "is_active", missing)
+    if not callable(active):
+        raise TypeError("native watchdog activation must be callable")
+    return owner, active
+
+
 class CoordinatedScheduler:
     """Receive payloads while time is stopped; commit results at their due time.
 
@@ -159,14 +180,20 @@ class CoordinatedScheduler:
         self._in_scheduler_pass = False
         self._cadence_deferred = False
         self._cadence_only_pass = False
-        for name in ("watchdog", "soft_watchdog"):
-            watchdog = getattr(scheduler, name, None)
-            if watchdog is not None:
-                active = watchdog.is_active
-                self._watchdogs.append((watchdog, active))
-                watchdog.is_active = lambda active=active: (
-                    not self._waiting and active()
-                )
+        try:
+            for name in ("watchdog", "soft_watchdog"):
+                watchdog = getattr(scheduler, name, None)
+                if watchdog is not None:
+                    activation = _watchdog_activation_owner(watchdog)
+                    if activation is not None:
+                        owner, active = activation
+                        self._watchdogs.append((owner, active))
+                        owner.is_active = lambda active=active: (
+                            not self._waiting and active()
+                        )
+        except Exception:
+            self.close()
+            raise
 
     def close(self) -> None:
         """Release control resources without resetting native scheduler state."""

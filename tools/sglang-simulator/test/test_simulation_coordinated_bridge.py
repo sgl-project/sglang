@@ -1,12 +1,15 @@
 """Exercise the real coordination bridge with a small scheduler and loopback I/O."""
 
+import importlib.util
 import json
 import queue
 import socket
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import zmq
@@ -639,6 +642,133 @@ def test_close_restores_watchdogs_and_releases_endpoint(harness):
     assert bridge._context.closed
     replacement = CoordinatedScheduler(scheduler=scheduler, endpoint=harness.endpoint)
     replacement.close()
+
+
+@pytest.fixture
+def native_watchdog_module(monkeypatch):
+    """Load real watchdogs without parent diagnostics or background monitoring."""
+    name = "sglang.srt.utils.watchdog"
+    diagnostics = ModuleType("sglang.srt.utils.cudacore_pyspy_dump_utils")
+    diagnostics.pyspy_dump_schedulers = Mock()
+    monkeypatch.setitem(sys.modules, diagnostics.__name__, diagnostics)
+    process_inspection = ModuleType("psutil")
+    process_inspection.Process = Mock()
+    monkeypatch.setitem(sys.modules, process_inspection.__name__, process_inspection)
+    path = Path(__file__).resolve().parents[3] / "python/sglang/srt/utils/watchdog.py"
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, name, module)
+    spec.loader.exec_module(module)
+    monkeypatch.setattr(module, "threading", SimpleNamespace(Thread=Mock()))
+    return module
+
+
+def test_native_noop_and_wrapped_watchdog_activation_owner(
+    harness, native_watchdog_module
+):
+    harness.close()
+    native = native_watchdog_module
+    noop = native.Watchdog.create("disabled", None)
+    wrapped = native.Watchdog.create("soft", 60, soft=True)
+    original = wrapped._raw.is_active
+    scheduler = FakeScheduler()
+    scheduler.watchdog, scheduler.soft_watchdog = noop, wrapped
+    bridge = CoordinatedScheduler(scheduler=scheduler, endpoint=harness.endpoint)
+    try:
+        assert not hasattr(noop, "is_active")
+        assert not hasattr(wrapped, "is_active")
+        assert wrapped._raw.is_active()
+        wrapped.feed()
+        assert wrapped._counter == 1
+        with wrapped.disable():
+            assert not wrapped._raw.is_active()
+        bridge._waiting = True
+        assert not wrapped._raw.is_active()
+        assert wrapped._active is True
+        bridge._waiting = False
+        assert wrapped._raw.is_active()
+    finally:
+        bridge.close()
+    assert wrapped._raw.is_active is original
+    assert not hasattr(noop, "is_active")
+    assert not hasattr(wrapped, "is_active")
+
+
+def test_native_raw_watchdog_wait_and_close(harness, native_watchdog_module):
+    harness.close()
+    active = lambda: True
+    raw = native_watchdog_module.WatchdogRaw("raw", lambda: 0, active, 60)
+    scheduler = FakeScheduler()
+    scheduler.watchdog = raw
+    bridge = CoordinatedScheduler(scheduler=scheduler, endpoint=harness.endpoint)
+    try:
+        assert raw.is_active()
+        bridge._waiting = True
+        assert not raw.is_active()
+    finally:
+        bridge.close()
+    assert raw.is_active is active
+
+
+@pytest.mark.parametrize(
+    "unsupported",
+    [
+        SimpleNamespace(),
+        SimpleNamespace(is_active=False),
+        SimpleNamespace(_raw=None),
+        SimpleNamespace(_raw=SimpleNamespace(is_active=None)),
+        SimpleNamespace(is_active=False, _raw=SimpleNamespace(is_active=lambda: True)),
+    ],
+)
+def test_invalid_watchdog_restores_prior_owner_and_control_resources(
+    harness, native_watchdog_module, monkeypatch, unsupported
+):
+    harness.close()
+    active = lambda: True
+    scheduler = FakeScheduler()
+    scheduler.watchdog = native_watchdog_module.WatchdogRaw(
+        "raw", lambda: 0, active, 60
+    )
+    scheduler.soft_watchdog = unsupported
+    contexts = []
+    factory = coordinated.zmq.Context
+
+    def context():
+        value = factory()
+        contexts.append(value)
+        return value
+
+    monkeypatch.setattr(coordinated.zmq, "Context", context)
+    with pytest.raises((TypeError, ValueError), match="watchdog activation"):
+        CoordinatedScheduler(scheduler=scheduler, endpoint=harness.endpoint)
+    assert scheduler.watchdog.is_active is active
+    assert len(contexts) == 1 and contexts[0].closed
+    scheduler.soft_watchdog = None
+    replacement = CoordinatedScheduler(scheduler=scheduler, endpoint=harness.endpoint)
+    replacement.close()
+
+
+def test_native_watchdog_callback_error_is_preserved(harness, native_watchdog_module):
+    harness.close()
+    error = RuntimeError("native activation failed")
+
+    def active():
+        raise error
+
+    scheduler = FakeScheduler()
+    scheduler.watchdog = native_watchdog_module.WatchdogRaw(
+        "raw", lambda: 0, active, 60
+    )
+    bridge = CoordinatedScheduler(scheduler=scheduler, endpoint=harness.endpoint)
+    try:
+        with pytest.raises(RuntimeError) as caught:
+            scheduler.watchdog.is_active()
+        assert caught.value is error
+        bridge._waiting = True
+        assert not scheduler.watchdog.is_active()
+    finally:
+        bridge.close()
+    assert scheduler.watchdog.is_active is active
 
 
 def test_bind_failure_releases_context(harness, monkeypatch):
