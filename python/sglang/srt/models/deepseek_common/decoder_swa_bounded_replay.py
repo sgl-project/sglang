@@ -17,14 +17,19 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
-def late_layer_dp_counts(
+def _early_dp_counts(forward_batch: ForwardBatch) -> Optional[List[int]]:
+    early = forward_batch.global_num_tokens_padded_cpu
+    if early is None:
+        early = forward_batch.global_num_tokens_cpu
+    return early
+
+
+def late_layer_dp_rows(
     forward_batch: ForwardBatch, local_late_rows: int, *, in_graph: bool
 ) -> Optional[List[int]]:
     # The TP-MoE gather / combine in the late layers spans every DP rank, so each
     # rank needs all ranks' tail row counts.
-    early = forward_batch.global_num_tokens_padded_cpu
-    if early is None:
-        early = forward_batch.global_num_tokens_cpu
+    early = _early_dp_counts(forward_batch)
     if early is None:
         return None
     if len(early) == 1:
@@ -43,8 +48,8 @@ def late_layer_dp_counts(
             local_late_rows,
         )
     else:
-        # Without the exchange (no extend in the batch) every rank takes this
-        # path; the CPU group avoids a device sync.
+        # Without the exchange (no extend in the batch, or while the prefill graphs
+        # capture) every rank takes this path; the CPU group avoids a device sync.
         counts = torch.empty(len(early), dtype=torch.int64)
         all_gather_single(
             counts,
@@ -52,7 +57,16 @@ def late_layer_dp_counts(
             group=get_parallel().tp_group.cpu_group,
         )
         counts = counts.tolist()
-    return None if counts == list(early) else counts
+    return counts
+
+
+def late_layer_dp_counts(
+    forward_batch: ForwardBatch, dp_rows: Optional[List[int]]
+) -> Optional[List[int]]:
+    """``dp_rows``, or None when the late layers keep the early layers' layout."""
+    if dp_rows is None or dp_rows == list(_early_dp_counts(forward_batch)):
+        return None
+    return dp_rows
 
 
 def enter_late_layer_dp(forward_batch: ForwardBatch, counts: List[int]) -> tuple:

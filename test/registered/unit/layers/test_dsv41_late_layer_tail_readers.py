@@ -25,12 +25,14 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
+from sglang.srt.models import deepseek_v4_replay_tail as replay_tail
 from sglang.srt.models.deepseek_common import decoder_swa_bounded_replay
 from sglang.srt.models.deepseek_common.decoder_swa_bounded_replay import (
-    late_layer_dp_counts,
+    late_layer_dp_rows,
 )
 from sglang.srt.models.deepseek_v4 import DeepseekV4Model
-from sglang.srt.runtime_context import get_context, get_parallel
+from sglang.srt.models.deepseek_v4_mhc import HcState
+from sglang.srt.runtime_context import get_context, get_flags, get_parallel
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -269,8 +271,80 @@ class TestLateLayerRowsUnderDpAttention(CustomTestCase):
                     side_effect=AssertionError("a collective inside the forward"),
                 ),
             ):
-                counts = late_layer_dp_counts(fb, local_rows, in_graph=False)
+                counts = late_layer_dp_rows(fb, local_rows, in_graph=False)
             self.assertEqual(counts, [SWA_WINDOW, 0])
+
+    def test_prefill_graph_break_runs_local_rows_eagerly(self):
+        # With only local counts (an a2a MoE under a DP LM head) the ranks cannot
+        # share a tail-graph bucket, so the break runs the tail layers eagerly.
+        fb = SimpleNamespace(
+            input_ids=torch.arange(8),
+            global_num_tokens_cpu=[8],
+            global_num_tokens_padded_cpu=None,
+            global_late_layer_num_tokens_cpu=None,
+        )
+        with (
+            self._dp_rank(0),
+            patch.object(
+                decoder_swa_bounded_replay,
+                "all_gather_single",
+                side_effect=AssertionError("a collective inside the break"),
+            ),
+            patch.object(
+                replay_tail,
+                "get_moe_a2a_backend",
+                return_value=SimpleNamespace(is_none=lambda: False),
+            ),
+        ):
+            tail_layers = _run_prefill_graph_break(fb, rows=3, dp=True)
+        tail_layers.run.assert_not_called()
+        self.assertEqual(
+            tail_layers._run_layers_eagerly.call_args.kwargs["dp_rows"], [3]
+        )
+
+
+def _run_prefill_graph_break(fb, *, rows, dp):
+    """Runs the prefill-graph break over ``fb`` with a warm runner whose buckets fit
+    any step; returns the tail layers, whose run and eager run are mocks."""
+    tail = SimpleNamespace(positions=torch.arange(rows), rows=lambda t: t[:rows])
+    tail_layers = object.__new__(replay_tail.DecoderReplayTail)
+    tail_layers.runner = SimpleNamespace(warm=True, bucket_rows=lambda n: SWA_WINDOW)
+    tail_layers._can_capture_moe_bound = lambda batch: True
+    output = (torch.zeros(rows, 1), None, [])
+    tail_layers.run = MagicMock(return_value=output)
+    tail_layers._run_layers_eagerly = MagicMock(return_value=output)
+    tail_layers._write_bridge = lambda key, block_rows, bridge, outputs: None
+    backend = SimpleNamespace(
+        forward_metadata=SimpleNamespace(late_layer_tail=tail),
+        exit_late_layer_tail=lambda saved, batch: None,
+    )
+    num_tokens = fb.input_ids.shape[0]
+    with (
+        patch.object(replay_tail, "get_attn_backend", return_value=backend),
+        patch.object(
+            replay_tail,
+            "get_tc_piecewise_forward_context",
+            return_value=SimpleNamespace(forward_batch=fb),
+        ),
+        patch.object(
+            replay_tail, "_enter_eager_tail_in_prefill_graph", return_value=(None, fb)
+        ),
+        get_flags().dp.override(capturing_prefill_graph=False),
+    ):
+        replay_tail._tail_layers_in_prefill_graph(
+            tail_layers,
+            lambda tensors: HcState(tensors[0]),
+            False,
+            num_tokens,
+            None,
+            dp,
+            (False, False),
+            None,
+            [torch.zeros(num_tokens, 1)],
+            fb.input_ids,
+            fb.input_ids,
+        )
+    return tail_layers
 
 
 def _prefill_graph_replay(*, ratios, seq_len):

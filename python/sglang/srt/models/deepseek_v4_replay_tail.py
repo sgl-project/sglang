@@ -61,6 +61,7 @@ from sglang.srt.models.deepseek_common.decoder_swa_bounded_replay import (
     enter_late_layer_dp,
     exit_late_layer_dp,
     gather_late_layer_ids,
+    late_layer_dp_rows,
 )
 from sglang.srt.models.deepseek_v4_mhc import HcState
 from sglang.srt.runtime_context import get_flags, get_parallel
@@ -193,7 +194,7 @@ class DecoderReplayTail:
         forward_batch: ForwardBatch,
         num_tokens: int,
         tail_in_graph: bool,
-        late_dp_counts: Optional[List[int]],
+        late_dp_rows: Optional[List[int]],
     ) -> Tuple[bool, Optional[List[int]]]:
         """Whether this step uses a tail graph and, under DP attention, every rank's
         tail rows; also feeds the warm gate."""
@@ -230,8 +231,8 @@ class DecoderReplayTail:
                 None,
             )
         dp_rows = scattered[1] if scattered is not None else None
-        if dp_rows is None:
-            dp_rows = self._gathered_dp_rows(late_dp_counts, forward_batch)
+        if dp_rows is None and get_moe_a2a_backend().is_none():
+            dp_rows = late_dp_rows
         if dp_rows is None or not self._can_use_graph(forward_batch, max(dp_rows)):
             return False, None
         return True, dp_rows
@@ -268,26 +269,6 @@ class DecoderReplayTail:
         return scattered_dp_counts(
             num_tokens, 0 if tail is None else tail.positions.shape[0]
         )
-
-    @staticmethod
-    def _gathered_dp_rows(
-        late_dp_counts: Optional[List[int]], forward_batch: ForwardBatch
-    ) -> Optional[List[int]]:
-        """Every rank's tail rows for a TP MoE, or None without a uniform layout."""
-        if not get_moe_a2a_backend().is_none() or not forward_batch.is_extend_in_batch:
-            return None
-        # Exchanged before the forward (ForwardBatch.prepare_mlp_sync_batch).
-        if forward_batch.global_late_layer_num_tokens_cpu is not None:
-            return list(forward_batch.global_late_layer_num_tokens_cpu)
-        if late_dp_counts is not None:
-            return late_dp_counts
-        # No re-layout was needed: every rank's tail is its whole extend.
-        early = forward_batch.global_num_tokens_padded_cpu
-        if early is None:
-            early = forward_batch.global_num_tokens_cpu
-        if early is None or len(early) != get_parallel().attn_dp_size:
-            return None
-        return list(early)
 
     def breaks_out_of_prefill_graph(
         self, tail: LateLayerTail, *, num_tokens: int
@@ -738,24 +719,17 @@ def _tail_layers_in_prefill_graph(
         num_rows = tail.positions.shape[0]
         dp_rows = None
         if dp:
-            # Exchanged before the forward, except while the prefill graphs capture
-            # (every rank together), when it gathers here.
-            dp_rows = forward_batch.global_late_layer_num_tokens_cpu
-            if dp_rows is None:
-                counts = torch.empty(get_parallel().tp_size, dtype=torch.int64)
-                all_gather_single(
-                    counts,
-                    torch.tensor([num_rows], dtype=torch.int64),
-                    group=get_parallel().tp_group.cpu_group,
-                )
-                dp_rows = counts.tolist()
-            assert dp_rows[get_parallel().attn_dp_rank] == num_rows, (
-                dp_rows,
-                num_rows,
-            )
+            dp_rows = late_layer_dp_rows(forward_batch, num_rows, in_graph=False)
+        # Under DP every rank must replay one bucket (its first use captures behind
+        # TP-group barriers), which local rows alone cannot pick.
+        shared_bucket = not dp or (dp_rows is not None and len(dp_rows) > 1)
         # Capture stream and pool are busy while the prefill graphs capture.
-        use_graph = not get_flags().dp.capturing_prefill_graph and (
-            tail_layers._can_use_graph(forward_batch, max(dp_rows) if dp else num_rows)
+        use_graph = (
+            shared_bucket
+            and not get_flags().dp.capturing_prefill_graph
+            and tail_layers._can_use_graph(
+                forward_batch, max(dp_rows) if dp else num_rows
+            )
         )
         residual, pre, aux = tail_layers.run_on_batch(
             tail,

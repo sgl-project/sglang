@@ -157,6 +157,7 @@ from sglang.srt.models.deepseek_common.decoder_swa_bounded_replay import (
     exit_late_layer_dp,
     gather_late_layer_ids,
     late_layer_dp_counts,
+    late_layer_dp_rows,
 )
 from sglang.srt.models.deepseek_common.moe_transport import (
     OverlappedMoeTransport,
@@ -3982,7 +3983,7 @@ class DeepseekV4Model(nn.Module):
             and tail.scatter_indices is not None
             and is_in_breakable_cuda_graph()
         )
-        late_dp_counts = None
+        late_dp_rows = None
         saved_dp = None
         if (
             self.late_layer_start is not None
@@ -3990,7 +3991,7 @@ class DeepseekV4Model(nn.Module):
             # The prefill graph's capture batch leaves is_extend_in_batch unset.
             and (forward_batch.is_extend_in_batch or tail_in_graph or _is_hip)
         ):
-            late_dp_counts = late_layer_dp_counts(
+            late_dp_rows = late_layer_dp_rows(
                 forward_batch,
                 (
                     tail.token_indices.shape[0]
@@ -3999,6 +4000,7 @@ class DeepseekV4Model(nn.Module):
                 ),
                 in_graph=tail_in_graph,
             )
+        late_dp_counts = late_layer_dp_counts(forward_batch, late_dp_rows)
         use_tail_graph, tail_graph_dp_rows = False, None
         if self.decoder_replay_tail is not None:
             use_tail_graph, tail_graph_dp_rows = self.decoder_replay_tail.plan(
@@ -4006,7 +4008,7 @@ class DeepseekV4Model(nn.Module):
                 forward_batch=forward_batch,
                 num_tokens=input_ids.shape[0],
                 tail_in_graph=tail_in_graph,
-                late_dp_counts=late_dp_counts,
+                late_dp_rows=late_dp_rows,
             )
         tail_sentinel = positions.new_zeros((1,)) if tail_in_graph else None
         saved_full = None
