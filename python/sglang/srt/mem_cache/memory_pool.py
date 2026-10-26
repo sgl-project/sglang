@@ -2109,15 +2109,25 @@ def _set_mha_kv_buffer_prefix_valid(
             f"head_dim={pool.head_dim} v_head_dim={pool.v_head_dim}."
         )
 
-    fused_k_scale = _resolve_fused_scale(
-        k_scale,
-        getattr(layer, "k_scale", None),
-        getattr(layer, "k_scale_float", None),
+    # No scale: the eager fallback below is a plain saturating cast, which the fused kernel does bit-exactly
+    # at scale 1.0 (one launch instead of five per layer).
+    fused_k_scale = (
+        1.0
+        if k_scale is None
+        else _resolve_fused_scale(
+            k_scale,
+            getattr(layer, "k_scale", None),
+            getattr(layer, "k_scale_float", None),
+        )
     )
-    fused_v_scale = _resolve_fused_scale(
-        v_scale,
-        getattr(layer, "v_scale", None),
-        getattr(layer, "v_scale_float", None),
+    fused_v_scale = (
+        1.0
+        if v_scale is None
+        else _resolve_fused_scale(
+            v_scale,
+            getattr(layer, "v_scale", None),
+            getattr(layer, "v_scale_float", None),
+        )
     )
     # fuse quantization and writing into the same kernel
     if (

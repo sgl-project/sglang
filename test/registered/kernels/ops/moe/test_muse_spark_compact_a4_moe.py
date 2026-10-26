@@ -91,3 +91,25 @@ def test_compact_a4_reads_a4w4_preshuffled_weights(experts, m):
     flat = ids.flatten()
     rows = ((flat >= start) & (flat < start + e)).nonzero().flatten()
     assert torch.equal(got[rows], ref[rows])
+
+
+@pytest.mark.parametrize("m", [8, 64, 512])
+def test_compact_a4_prequantized_input(m):
+    """An input quantized by the caller (the routing epilogue) gives the same expert rows."""
+    from sglang.kernels.ops.moe.mxfp4_compact_a4_moe import (
+        _prepare_a4,
+        compact_a4_experts,
+    )
+
+    start = 64
+    x, ids, w13, w2, s13, s2 = _inputs(m, start, 64)
+    quant = [torch.empty(m, n, device="cuda", dtype=torch.uint8) for n in (2048, 128)]
+    _prepare_a4[(m * 4,)](x, *quant, num_warps=4)
+    ref = compact_a4_experts(x, ids, w13, w2, s13, s2, local_start=start)
+    got = compact_a4_experts(
+        None, ids, w13, w2, s13, s2, local_start=start, quantized=tuple(quant)
+    )
+    flat = ids.flatten()
+    rows = ((flat >= start) & (flat < start + 64)).nonzero().flatten()
+    assert torch.equal(got[rows], ref[rows])
+

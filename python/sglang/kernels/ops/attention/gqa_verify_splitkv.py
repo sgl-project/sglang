@@ -188,6 +188,7 @@ def gqa_verify_splitkv(
     bn=64,
     num_warps=4,
     num_stages=2,
+    defer_reduce=False,
 ):
     """Verify attention, 8 tokens x GQA 8 per (request, KV head) program; ``window`` 0 = full attention."""
     num_seqs = seqused_k.numel()
@@ -225,6 +226,9 @@ def gqa_verify_splitkv(
         num_warps=num_warps,
         num_stages=num_stages,
     )
+    if defer_reduce:
+        # the caller merges the partials itself (verify_reduce_norm_gate)
+        return partial, maximum, denom
     _verify_reduce[(q.shape[0], heads)](
         partial,
         maximum,

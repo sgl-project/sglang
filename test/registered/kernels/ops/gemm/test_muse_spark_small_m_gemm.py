@@ -1,4 +1,5 @@
-"""Muse Spark small-M GEMM kernels (gfx950): tiled GEMM, split-K partials, FP32 router GEMMs, unpool + boundary."""
+"""Muse Spark small-M GEMM kernels (gfx950): tiled, row-major and FP8-weight GEMMs, split-K partials, FP32 router
+GEMMs, unpool + boundary."""
 
 import pytest
 import torch
@@ -18,9 +19,7 @@ def _close(a, b, rtol, atol):
     torch.testing.assert_close(a.float(), b.float(), rtol=rtol, atol=atol)
 
 
-@pytest.mark.parametrize(
-    "n,k", [(4096, 8192), (8192, 1024), (7168, 8192), (8192, 3584)]
-)
+@pytest.mark.parametrize("n,k", [(8192, 1024), (7168, 8192), (8192, 3584)])
 @pytest.mark.parametrize("m", [17, 24, 32, 48, 64])
 def test_tiled_gemm(n, k, m):
     from sglang.kernels.ops.gemm.bf16_tiled_small_m_gemm import (
@@ -37,6 +36,60 @@ def test_tiled_gemm(n, k, m):
         pytest.skip("no tuned launch at this width")
     ref = x.float() @ w.float().T
     _close(tiled_gemm(x, tiled, n, k), ref, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.parametrize(
+    "n,k",
+    [
+        (4096, 8192),
+        (8192, 4096),
+        (8192, 2048),
+        (2048, 8192),
+        (2560, 8192),
+        (8192, 7168),
+        (14336, 8192),
+    ],
+)
+@pytest.mark.parametrize("m", [1, 8, 16, 17, 24, 32, 48, 64, 72, 96, 128])
+def test_rowmajor_gemm(n, k, m):
+    from sglang.kernels.ops.gemm.bf16_tiled_small_m_gemm import (
+        rowmajor_gemm,
+        rowmajor_gemm_applies,
+    )
+
+    torch.manual_seed(m)
+    w = (torch.randn(n, k, device="cuda") * 0.02).to(torch.bfloat16)
+    x = torch.randn(m, k, device="cuda").to(torch.bfloat16)
+    if not rowmajor_gemm_applies(x, w):
+        pytest.skip("no tuned launch at this width")
+    ref = x.float() @ w.float().T
+    _close(rowmajor_gemm(x, w), ref, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.parametrize("n,k", [(4608, 8192), (8192, 2048), (4096, 8192), (8192, 4096)])
+@pytest.mark.parametrize("m", [17, 64, 96, 128])
+def test_fp8_gemm(n, k, m):
+    from sglang.kernels.ops.gemm.fp8w_small_m_gemm import (
+        fp8_gemm,
+        fp8_gemm_applies,
+        quantize_rows,
+        quantize_weight,
+    )
+
+    torch.manual_seed(m)
+    w = (torch.randn(n, k, device="cuda") * 0.02).to(torch.bfloat16)
+    x = torch.randn(m, k, device="cuda").to(torch.bfloat16)
+    x[:, ::97] *= 20  # outlier channels, as residual-stream activations have
+    fp8w = quantize_weight(w)
+    xq, xs = quantize_rows(x)
+    if not fp8_gemm_applies(xq, fp8w):
+        pytest.skip("no tuned launch at this width")
+    ref = x.float() @ w.float().T
+    got = fp8_gemm(xq, xs, fp8w).float()
+    # per-channel FP8 weights x per-row FP8 activations: a few percent of relative L2 error
+    assert (got - ref).norm() / ref.norm() < 0.06
+    exact = (xq.float() * xs[:, None]) @ (fp8w[0].float() * fp8w[1][:, None]).T
+    assert (got - exact).norm() / exact.norm() < 4e-3
 
 
 @pytest.mark.parametrize("m", [1, 16, 32])

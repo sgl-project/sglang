@@ -14,6 +14,9 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.attention.verify_reduce_norm_gate import (
+    verify_reduce_norm_gate,
+)
 from sglang.srt.rocm_muse_spark import fused_op_tuning
 from sglang.srt.rocm_muse_spark.base_fused_op import BaseFusedOp, FusedOpBackend
 
@@ -167,6 +170,22 @@ class FusedRMSNormGate(BaseFusedOp):
                 FusedOpBackend.TORCH_COMPILE,
             )
         )
+
+    def merges_verify_partials(self) -> bool:
+        """Whether ``forward_verify_partials`` serves this op (norm always on, head dim 64)."""
+        return self._use_o_norm and self._head_dim == 64
+
+    def forward_verify_partials(
+        self, state, x: torch.Tensor, g: torch.Tensor = None
+    ) -> torch.Tensor:
+        """Norm-gate of the attention output whose split-KV merge the verify kernels deferred (``state``);
+        ``x`` is that unwritten output, used for its shape and dtype."""
+        if g is not None:
+            g = _as_grouped_gate_view(x, g, self._head_dim)
+        return verify_reduce_norm_gate(
+            state, x.shape, x.dtype, g if self._use_o_gate else None,
+            self._eps, self._effective_weight,
+        )  # fmt: skip
 
     def forward_native(
         self,

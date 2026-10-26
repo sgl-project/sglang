@@ -177,6 +177,7 @@ def swa_verify_splitkv(
     *,
     num_splits=8,
     num_stages=2,
+    defer_reduce=False,
 ):
     assert q.dtype == torch.bfloat16 and k.dtype == v.dtype == torch.float8_e4m3fn
     assert (
@@ -219,6 +220,9 @@ def swa_verify_splitkv(
         num_warps=2,
         num_stages=num_stages,
     )
+    if defer_reduce:
+        # the caller merges the partials itself (verify_reduce_norm_gate)
+        return partial, maximum, denom
     _swa_verify_reduce[(q.shape[0], q.shape[1])](
         partial,
         maximum,

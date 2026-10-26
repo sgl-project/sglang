@@ -8,8 +8,8 @@ cache; the row scale, the K descale, softmax scale and log2(e) fold into one per
 PV in BF16 (V upcast) by default, FP8 PV (P biased by 2^8) as a variant.
 Interior tiles run without any mask (causal/verify mask and kv length only matter on the last 1-2 tiles).
 Partials use the layout [T, H, S, 64] fp32 + max/denom [T, H, S] of gqa_verify_splitkv; the reduce is the same
-math. Only the exact mode (BF16 QK and PV, QF8 = PVF8 = False) is served: bitwise equal to the GQA-folded and
-unified 3D paths.
+math. The exact mode (BF16 QK and PV) is bitwise equal to the GQA-folded and unified 3D paths; the ``fp8`` mode
+(QF8 + PVF8 + page-id prefetch) is the FP8 numerics of the prefill FP8 path, ~15-20% faster at 4 KV heads.
 """
 
 import torch
@@ -330,8 +330,11 @@ def gqa_verify_splitkv_2kv(
     bn=64,
     num_warps=4,
     num_stages=2,
+    defer_reduce=False,
+    fp8=False,
 ):
-    """Full-attention verify, 8 tokens x 16 Q heads x 2 KV heads per (request, split, pair) program, BF16 QK / PV."""
+    """Full-attention verify, 8 tokens x 16 Q heads x 2 KV heads per (request, split, pair) program, BF16 QK / PV;
+    ``fp8`` = per-row FP8 Q on the FP8 K straight from the cache and FP8 P for P.V (TP4 n8: 150 vs 178 us)."""
     num_seqs = seqused_k.numel()
     heads, kv_heads = q.shape[1], k.shape[2]
     pairs = kv_heads // 2
@@ -369,15 +372,18 @@ def gqa_verify_splitkv_2kv(
         splits,
         float(softmax_scale),
         bn,
-        False,
-        False,
+        fp8,
+        fp8,
         8,
         False,
-        False,
+        fp8,
         num_warps=num_warps,
         num_stages=num_stages,
         matrix_instr_nonkdim=16,
     )
+    if defer_reduce:
+        # the caller merges the partials itself (verify_reduce_norm_gate)
+        return partial, maximum, denom
     _vv2_reduce[(q.shape[0], heads)](
         partial,
         maximum,

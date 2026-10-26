@@ -54,6 +54,8 @@ def _fused_norm_residual_triton_kernel(
     OUTPUT,
     NEW_STREAM_OUT,
     ROUTER_OUT,
+    OUT_FP8,
+    OUT_SCALE,
     POST_WEIGHT,
     PRE_WEIGHT,
     ALPHA,
@@ -70,6 +72,7 @@ def _fused_norm_residual_triton_kernel(
     HAS_ROUTER: tl.constexpr,
     PRE_NORM_BF16: tl.constexpr,
     M_BUCKET: tl.constexpr,
+    HAS_FP8: tl.constexpr,
 ):
     row = tl.program_id(0)
     offs = tl.arange(0, BLOCK_H)
@@ -132,6 +135,11 @@ def _fused_norm_residual_triton_kernel(
     tl.store(OUTPUT + row * H + offs, normed, mask=mask)
     if HAS_ROUTER:
         tl.store(ROUTER_OUT + row * H + offs, normed, mask=mask)
+    if HAS_FP8:
+        # per-row FP8 e4m3 copy for the next layer's FP8 QKV GEMM (448 = e4m3 max)
+        scale = tl.maximum(tl.max(tl.where(mask, tl.abs(normed), 0.0)), 1e-20) / 448.0
+        tl.store(OUT_FP8 + row * H + offs, (normed / scale).to(tl.float8e4nv), mask=mask)
+        tl.store(OUT_SCALE + row, scale)
 
 
 # ---------------------------------------------------------------------------
@@ -275,31 +283,27 @@ class FusedPostNormResidualPreNorm(BaseFusedOp):
         branch_dtype: torch.dtype = torch.bfloat16,
         router_dtype: torch.dtype | None = None,
         pre_norm_dtype: torch.dtype | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-        """Fused Triton implementation for the BF16/FP32 path."""
-        if branch.numel() == 0:
-            return self.forward_native(
-                stream,
-                branch,
-                branch_dtype,
-                router_dtype,
-                pre_norm_dtype=pre_norm_dtype,
-            )
-
-        if not self._triton_supported(
-            stream,
-            branch,
-            branch_dtype,
-            router_dtype,
-            pre_norm_dtype,
+        fp8_out: bool = False,
+    ):
+        """Fused Triton implementation for the BF16/FP32 path. With ``fp8_out`` the pre-norm output also comes as
+        a per-row FP8 e4m3 copy + FP32 scales (two extra returns)."""
+        if branch.numel() == 0 or not self._triton_supported(
+            stream, branch, branch_dtype, router_dtype, pre_norm_dtype
         ):
-            return self._fallback_triton_to_native(
-                stream,
-                branch,
-                branch_dtype,
-                router_dtype,
-                pre_norm_dtype=pre_norm_dtype,
-            )
+            res = (
+                self.forward_native(
+                    stream, branch, branch_dtype, router_dtype, pre_norm_dtype=pre_norm_dtype
+                )
+                if branch.numel() == 0
+                else self._fallback_triton_to_native(
+                    stream, branch, branch_dtype, router_dtype, pre_norm_dtype=pre_norm_dtype
+                )
+            )  # fmt: skip
+            if not fp8_out:
+                return res
+            from sglang.kernels.ops.gemm.fp8w_small_m_gemm import quantize_rows
+
+            return (*res, *quantize_rows(res[0]))
 
         M, H = branch.shape
 
@@ -307,6 +311,16 @@ class FusedPostNormResidualPreNorm(BaseFusedOp):
 
         output = torch.empty(M, H, dtype=branch_dtype, device=branch.device)
         new_stream_out = torch.empty(M, H, dtype=torch.float32, device=branch.device)
+        out_fp8 = (
+            torch.empty(M, H, dtype=torch.float8_e4m3fn, device=branch.device)
+            if fp8_out
+            else self._cc_empty_fp32
+        )
+        out_scale = (
+            torch.empty(M, dtype=torch.float32, device=branch.device)
+            if fp8_out
+            else self._cc_empty_fp32
+        )
         router_out = (
             torch.empty(M, H, dtype=torch.float32, device=branch.device)
             if router_dtype is not None
@@ -329,6 +343,8 @@ class FusedPostNormResidualPreNorm(BaseFusedOp):
             output,
             new_stream_out,
             router_out,
+            out_fp8,
+            out_scale,
             self._cc_post_weight,
             self._cc_pre_weight,
             self._cc_alpha,
@@ -345,13 +361,22 @@ class FusedPostNormResidualPreNorm(BaseFusedOp):
             router_dtype is not None,
             pre_norm_dtype is torch.bfloat16,
             m_bucket,
+            fp8_out,
             num_warps=num_warps,
             num_stages=num_stages,
             **extra,
         )
+        res = (output, new_stream_out, (router_out if router_dtype is not None else None))
+        return (*res, out_fp8, out_scale) if fp8_out else res
 
-        return (
-            output,
-            new_stream_out,
-            (router_out if router_dtype is not None else None),
+    def forward_fp8(
+        self,
+        stream: torch.Tensor,
+        branch: torch.Tensor,
+        branch_dtype: torch.dtype = torch.bfloat16,
+        pre_norm_dtype: torch.dtype | None = None,
+    ):
+        """``forward`` plus the pre-norm output's per-row FP8 copy and scales: (output, stream, None, fp8, scale)."""
+        return self.forward_triton(
+            stream, branch, branch_dtype, None, pre_norm_dtype, fp8_out=True
         )
