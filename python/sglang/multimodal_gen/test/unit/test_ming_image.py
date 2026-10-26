@@ -203,6 +203,45 @@ def test_ming_norm_and_swiglu_preserve_reference_rounding():
     torch.testing.assert_close(MingSiluAndMul()(x), F.silu(gate) * up, rtol=0, atol=0)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("dim", [128, 3840])
+def test_ming_norm_fusion_replay_and_native_fallback(dim, monkeypatch):
+    from sglang.kernels.ops.diffusion import BitExactFusionGate
+    from sglang.multimodal_gen.runtime.models.dits import ming_image
+    from sglang.srt.layers.layernorm import RMSNorm
+
+    gate = BitExactFusionGate("test Ming norm", per_signature=True)
+    monkeypatch.setattr(ming_image, "_MING_RMSNORM_FUSION", gate)
+    norm = MingRMSNorm(dim).to(device="cuda", dtype=torch.bfloat16)
+    x = torch.randn(1, 17, dim, device="cuda", dtype=torch.bfloat16)
+    with torch.no_grad():
+        norm.weight.copy_(torch.randn_like(norm.weight))
+    calls = []
+    kernel = ming_image.rmsnorm_cast_before_weight_bitexact
+
+    def counted(*args):
+        calls.append(True)
+        return kernel(*args)
+
+    monkeypatch.setattr(ming_image, "rmsnorm_cast_before_weight_bitexact", counted)
+    assert torch.equal(norm(x), RMSNorm.forward_native(norm, x))
+    assert len(calls) == 1 and gate.verified and not gate.disabled
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = norm(x)
+    x.copy_(torch.randn_like(x))
+    graph.replay()
+    assert torch.equal(output, RMSNorm.forward_native(norm, x))
+    fused_calls = len(calls)
+    for inputs in (x[:, ::2], x.float()):
+        assert torch.equal(norm(inputs), RMSNorm.forward_native(norm, inputs))
+    residual = torch.randn_like(x)
+    actual = norm(x, residual)
+    expected = RMSNorm.forward_native(norm, x, residual)
+    assert all(torch.equal(a, b) for a, b in zip(actual, expected))
+    assert len(calls) == fused_calls
+
+
 def test_padding_replacement_keeps_valid_rows_and_registers():
     x = torch.randn(2, 5, 8)
     token = torch.randn(1, 8)
