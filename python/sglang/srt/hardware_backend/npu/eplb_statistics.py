@@ -16,7 +16,7 @@
 
 import logging
 import os
-from contextlib import contextmanager
+from contextlib import nullcontext
 
 import torch
 
@@ -28,15 +28,12 @@ logger = logging.getLogger(__name__)
 class NpuExpertDistributionRecorder(distribution._ExpertDistributionRecorderReal):
     """Reuse upstream recording while isolating NPU draft forward lifecycles."""
 
-    @contextmanager
     def with_forward_pass(self, forward_pass_id, forward_batch):
         # Draft runners share target statistics. Disabling hooks alone still
         # lets the base lifecycle reset counts and append an empty draft pass.
         if self._disable_all:
-            yield {}
-            return
-        with super().with_forward_pass(forward_pass_id, forward_batch) as outputs:
-            yield outputs
+            return nullcontext({})
+        return super().with_forward_pass(forward_pass_id, forward_batch)
 
 
 class NpuExpertDistributionGatherer(distribution._SelectExpertsSinglePassGatherer):
@@ -53,12 +50,12 @@ class NpuExpertDistributionGatherer(distribution._SelectExpertsSinglePassGathere
         raw_capacity = os.environ.get(capacity_env, "96")
         try:
             capacity = int(raw_capacity)
+            if not 1 <= capacity <= 65536:
+                raise ValueError
         except ValueError as error:
             raise ValueError(
                 f"{capacity_env} must be an integer in [1, 65536], got {raw_capacity!r}"
             ) from error
-        if not 1 <= capacity <= 65536:
-            raise ValueError(f"{capacity_env} must be in [1, 65536], got {capacity}")
         # Capacity counts routes, not tokens: 96 holds 16 tokens at top-k 6.
         # It only selects the batching path; overflow still counts every route.
         # All captured graphs write to this shared buffer.
