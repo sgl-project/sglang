@@ -196,7 +196,7 @@ def _float_open_short_side(flt, demand) -> None:
 
 def _relieve_for_alloc(short_pool, need_tokens: int) -> bool:
     """THE shortfall ladder: every allocation shortfall in the unified pool runs
-    exactly this, whether a single band's own alloc or a composite's coupled
+    exactly this, whether a single band's own alloc or the chain allocator's coupled
     multi-band alloc. The urgent flush is called unconditionally -- an eager END no-ops
     and a FLOAT always has boundary absorption to do -- so the ladder never
     branches on lazy mode, member kind, or layout.
@@ -259,13 +259,13 @@ def install_move_gate(
     feature: str,
     lazy_compaction: bool,
 ) -> None:
-    """Point every member of a composite at one compaction gate.
+    """Point every member of a chain allocator at one compaction gate.
 
     A gate that reaches only some members is not a weaker gate, it is no gate:
     the ungated end relocates its own pages under the same in-flight transfer.
-    So the member list is stated once per composite (`_move_gate_targets`) and
-    every gate installs over it, rather than each setter naming the members it
-    happens to remember.
+    So the member list is stated once (`ChainAllocator.members`) and every gate
+    installs over it, rather than each setter naming the members it happens to
+    remember.
     """
     assert lazy_compaction, (
         f"{feature} with the unified memory pool requires lazy compaction "
@@ -1175,7 +1175,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
     def alloc_with_virtual(self, virtual_pages: torch.Tensor) -> None:
         """Take physical PAGES for caller-supplied virtual PAGE ids (not token
         ids), for a physical-holding non-owner such as the SWA `swa` sub-allocator.
-        The composite snapshots the virtual pages before the id-owner consumes them.
+        The chain allocator snapshots the virtual pages before the id-owner consumes them.
         """
         with record_function("MultiEndedAlloc.alloc_with_virtual"):
             if virtual_pages.numel() == 0:
@@ -1185,7 +1185,8 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             )
             assert phys_pages is not None, (
                 f"MultiEndedAllocator({self.sub_pool_name!r}).alloc_with_virtual: out of "
-                "physical room (the composite's byte-budget check should have caught this)"
+                "physical room (the chain allocator's byte-budget check should have "
+                "caught this)"
             )
 
     # -- paged alloc surface --
@@ -2463,7 +2464,7 @@ class FloatMultiEndedAllocator(MultiEndedAllocator):
             # Page-derivation ladder, as `_free_lazy`: caller ids, the ps==1
             # identity, then dedup. No stale-slot assert -- callers must not
             # double-free (a tombstoned page would join the hole list); the
-            # composite's filters uphold it and the byte verifier catches a miss.
+            # chain allocator's filters uphold it and the byte verifier catches a miss.
             free_v_pages_raw = free_index.detach().to(torch.int64)
             if _pages is not None:
                 free_v_pages = _pages

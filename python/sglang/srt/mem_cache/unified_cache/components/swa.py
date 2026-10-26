@@ -1575,7 +1575,7 @@ class SWAComponent(TreeComponent):
             swa_value = self._set_swa(action.kept_full, action.incoming_full)
             unified = self._unified_allocator()
             if unified is not None:
-                # The composite skips the detached SWA side and releases Full.
+                # The chain allocator skips the detached SWA side and releases Full.
                 unified.free(action.incoming_full)
             else:
                 alloc.free_full_segment(action.incoming_full, start_pos=0)

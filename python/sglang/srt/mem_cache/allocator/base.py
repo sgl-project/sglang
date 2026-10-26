@@ -77,7 +77,8 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
 
     # -- scheduler-facing capacity hooks --
     # The scheduler calls these unconditionally, with no allocator-type branches
-    # on its side; byte-accounted composites override the token-count defaults.
+    # on its side; the byte-accounted chain allocator overrides the token-count
+    # defaults.
 
     def create_prefill_budget(self, tree_cache, *, num_mixed_decode_tokens=0):
         from sglang.srt.mem_cache.prefill_budget import PrefillBudget

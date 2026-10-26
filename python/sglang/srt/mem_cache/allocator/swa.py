@@ -233,8 +233,8 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return self.swa_attn_allocator.available_size()
 
     # Slot-conservation views for the leak invariant. On the non-shared allocator
-    # the static budget IS physical (conserve == physical); the shared composite
-    # overrides these with the static-cap view.
+    # the static budget IS physical (conserve == physical); the unified chain
+    # allocator keeps a static-cap view instead.
     def _conserve_full_available_size(self):
         return self.full_available_size()
 

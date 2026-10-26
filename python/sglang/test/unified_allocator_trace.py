@@ -18,16 +18,13 @@ import hashlib
 import json
 import random
 from array import array
-from contextlib import ExitStack
 from typing import Callable, Dict, List, Optional, Tuple
-from unittest import mock
 
 import msgspec
 import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import InsertParams
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
@@ -108,20 +105,17 @@ class HostModel(msgspec.Struct, kw_only=True):
     cached: int = 0
 
 
-class CompositeAdapter:
-    """The adapter for the composite allocators the unified pool builder builds."""
+class BuilderAdapter:
+    """The adapter for the allocator the unified pool builder builds."""
 
-    name = "composite"
-
-    def _build_bundle(self, config: TraceConfig):
-        return build_unified_bundle(trace_geometry(config))
+    name = "builder"
 
     def __init__(self, config: TraceConfig):
         setup_allocator_context()
         self.config = config
         self.device = config.device
         self.page_size = config.page_size
-        self.bundle = self._build_bundle(config)
+        self.bundle = build_unified_bundle(trace_geometry(config))
         self.allocator = self.bundle.token_to_kv_pool_allocator
         self.state_allocator = (
             self.bundle.req_to_token_pool.mamba_allocator
@@ -305,53 +299,8 @@ class CompositeAdapter:
         return out
 
 
-def _chain_for_window(**kwargs) -> ChainAllocator:
-    return ChainAllocator(roles=ChainRoles(owner="full", window="swa"), **kwargs)
-
-
-def _chain_for_state(**kwargs) -> ChainAllocator:
-    return ChainAllocator(
-        roles=ChainRoles(owner="full", state="mamba"),
-        state_kvcache=kwargs["kvcache"].mamba_pool,
-        **kwargs,
-    )
-
-
-def _chain_for_window_state(*, mamba_kvcache, **kwargs) -> ChainAllocator:
-    return ChainAllocator(
-        roles=ChainRoles(owner="full", window="swa", state="mamba"),
-        state_kvcache=mamba_kvcache,
-        **kwargs,
-    )
-
-
-# The composite each chain shape was built with, and the same arguments handed
-# to `ChainAllocator` instead.
-_CHAIN_IN_PLACE_OF = {
-    "sglang.srt.mem_cache.allocator.unified_hybrid_swa."
-    "UnifiedSWATokenToKVPoolAllocator": _chain_for_window,
-    "sglang.srt.mem_cache.allocator.unified_mamba."
-    "UnifiedMambaTokenToKVPoolAllocator": _chain_for_state,
-    "sglang.srt.mem_cache.allocator.unified_hybrid_swa."
-    "UnifiedMambaSWATokenToKVPoolAllocator": _chain_for_window_state,
-}
-
-
-class ChainAdapter(CompositeAdapter):
-    """The same builder run with `ChainAllocator` in place of each composite."""
-
-    name = "chain"
-
-    def _build_bundle(self, config: TraceConfig):
-        with ExitStack() as stack:
-            for target, build in _CHAIN_IN_PLACE_OF.items():
-                stack.enter_context(mock.patch(target, build))
-            return build_unified_bundle(trace_geometry(config))
-
-
 ADAPTERS: Dict[str, Callable[[TraceConfig], object]] = {
-    CompositeAdapter.name: CompositeAdapter,
-    ChainAdapter.name: ChainAdapter,
+    BuilderAdapter.name: BuilderAdapter
 }
 
 
@@ -559,7 +508,7 @@ def record_run(
     seed: Optional[int] = None,
     ops: Optional[List[dict]] = None,
     steps: int = 200,
-    adapter_name: str = CompositeAdapter.name,
+    adapter_name: str = BuilderAdapter.name,
     full: bool = False,
     coverage: Optional[collections.Counter] = None,
 ) -> List[dict]:
@@ -612,7 +561,7 @@ def replay_run(
     config: TraceConfig,
     records: List[dict],
     *,
-    adapter_name: str = CompositeAdapter.name,
+    adapter_name: str = BuilderAdapter.name,
     full: bool = False,
 ) -> Optional[Divergence]:
     """Replay recorded operations on an adapter; the first step whose outcome
