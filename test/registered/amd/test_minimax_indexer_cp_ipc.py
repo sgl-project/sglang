@@ -2,7 +2,6 @@
 on four ranks, across call counters, row-count changes and CUDA-graph replay."""
 
 import multiprocessing
-import socket
 import types
 import unittest
 
@@ -10,6 +9,7 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.utils import is_gfx95_supported, is_hip
+from sglang.srt.utils.network import get_open_port
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -19,12 +19,6 @@ register_amd_ci(est_time=60, suite="stage-c-test-large-8-gpu-amd-mi35x")
 WORLD = 4
 NUM_DRAFT, SM_SCALE, K_SCALE = 8, 0.07, 0.5
 CALLS = 5
-
-
-def _open_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("", 0))
-        return sock.getsockname()[1]
 
 
 def _run_exchange(rank: int, port: int) -> None:
@@ -129,7 +123,7 @@ class TestMiniMaxIndexerCPExchange(CustomTestCase):
         if torch.cuda.device_count() < WORLD:
             self.skipTest(f"needs {WORLD} GPUs")
         context = multiprocessing.get_context("spawn")
-        port = _open_port()
+        port = get_open_port()
         procs = [
             context.Process(target=_run_exchange, args=(rank, port))
             for rank in range(WORLD)
