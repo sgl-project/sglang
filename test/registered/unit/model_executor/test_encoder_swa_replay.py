@@ -261,6 +261,17 @@ class TestFoldedExtendRows(CustomTestCase):
             out.hidden_states, fx.batch.input_ids[:, None].float()
         )
 
+    def test_encoder_only_prefill_returns_no_logits_to_trim(self):
+        """--dsv41-encoder-only-prefill returns no logits_output. The fold still
+        prepends every hit's replay rows, so the forward rebuilds the encoder SWA
+        window that is handed to decode; only the hidden-row trim has nothing to do
+        (it raised AttributeError on the first prefix hit before)."""
+        fx = _Fixture()
+        folded = fx.folded
+        self.assertEqual(folded.replay_lens, [0, 128, 64])
+        self.assertEqual(folded.num_rows, fx.extend_num_tokens + REPLAY_ROWS)
+        self.assertIsNone(drop_folded_rows(logits_output=None, folded=folded))
+
     def test_replay_rows_follow_window_resets_only(self):
         """A request that keeps its window (a later chunk) adds no replay rows."""
         fx = _Fixture()

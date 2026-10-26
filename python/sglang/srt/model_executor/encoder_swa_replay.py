@@ -61,6 +61,11 @@ def drop_folded_rows(
     *, logits_output, folded: FoldedExtend, tail_lens: Optional[list[int]] = None
 ) -> None:
     """Hand downstream consumers (the DSpark draft) only the original extend rows."""
+    if logits_output is None:
+        # DeepSeek-V4.1 encoder-only PD prefill stops at the last KV source and
+        # returns no logits: the folded forward already rebuilt each hit's
+        # encoder SWA window from its replay rows, and no draft reads hidden rows.
+        return
     hidden = logits_output.hidden_states
     token_indices = logits_output.hidden_states_token_indices
     if token_indices is not None:
