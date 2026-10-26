@@ -40,6 +40,7 @@ from sglang.srt.model_executor.runner_backend_utils import (
 from sglang.srt.runtime_context import (
     get_exec,
     get_flags,
+    get_forward,
     get_parallel,
     get_spec,
 )
@@ -471,11 +472,14 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             output_cache_loc_backup = forward_batch.out_cache_loc
             hidden_states_backup = forward_batch.spec_info.hidden_states
 
-            ret = self.model_runner.model.forward(
-                forward_batch.input_ids,
-                forward_batch.positions,
-                forward_batch,
-            )
+            with get_forward().scoped(
+                draft_argmax_only=self.eagle_worker.draft_extend_argmax_only
+            ):
+                ret = self.model_runner.model.forward(
+                    forward_batch.input_ids,
+                    forward_batch.positions,
+                    forward_batch,
+                )
 
             forward_batch.out_cache_loc = output_cache_loc_backup
             forward_batch.spec_info.hidden_states = hidden_states_backup
@@ -682,7 +686,16 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             self._publish_read_done(in_graph=False)
 
         out = LogitsProcessorOutput(
-            next_token_logits=out.next_token_logits[:raw_bs],
+            next_token_logits=(
+                out.next_token_logits[:raw_bs]
+                if out.next_token_logits is not None
+                else None
+            ),
+            next_token_argmax_partials=(
+                out.next_token_argmax_partials[:raw_bs]
+                if out.next_token_argmax_partials is not None
+                else None
+            ),
             # CUDA graph replay reuses its captured output storage. These states
             # survive into the next draft step, so detach them from that buffer.
             hidden_states=out.hidden_states[:raw_bs].clone(),

@@ -1574,6 +1574,12 @@ class Envs:
     # than the graph saves (e.g. DeepEP MoE workspace captured at full dispatch
     # capacity).
     SGLANG_DISABLE_DRAFT_EXTEND_CUDA_GRAPH = EnvBool(False)
+    # Greedy topk=1 EAGLE drafts (decode steps and draft extend) take the token
+    # from per-rank vocab-shard argmax candidates exchanged by a small all-reduce
+    # instead of all-gathering the full logits. Bit-identical tokens; falls back
+    # to the gather when the TP all-reduce would go to NCCL or the LM head layout
+    # is not plain vocab-parallel.
+    SGLANG_SPEC_DRAFT_ARGMAX_EXCHANGE = EnvBool(True)
     # Use the split-KV (flash-decode) kernel for EAGLE target-verify on the
     # Triton backend (ROCm). Only active at speculative topk == 1; falls back to
     # extend_attention_fwd for unsupported cases or when set false (e.g. for
@@ -1967,6 +1973,13 @@ class Envs:
     SGLANG_DSA_FUSE_TOPK = EnvBool(True)
     # Enabled for supported CUDA KPool geometry; set to 0 to use ordinary metadata.
     SGLANG_EXPERIMENTAL_DSA_KPOOL_METADATA_FUSION = EnvBool(True)
+    # Bound the per-replay DSA metadata kernels (decode, target verify, draft
+    # extend) by a program budget that strides over each row's live kv blocks,
+    # instead of one program per 128 columns of the --context-length-wide table
+    # (CUDA, kpool 1, no KPool metadata fusion). Outputs are bit-identical.
+    # It also writes the MTP draft-decode metadata of every step backend in one
+    # launch (DeepseekSparseAttnMultiStepBackend).
+    SGLANG_DSA_BOUNDED_REPLAY_METADATA = EnvBool(True)
     SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC = EnvBool(False)
     SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK = EnvStr(None)
     SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvInt(2048)

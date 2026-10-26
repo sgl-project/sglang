@@ -704,6 +704,11 @@ class ForwardFlags:
         # ForwardBatch.attn_tp_sequence_sharded decision, stamped by the model
         # that slices); read by the benchmark routing override.
         "attn_tp_sequence_sharded": False,
+        # Set by speculative workers around draft forwards whose only consumer
+        # is a greedy top-1 pick: an opted-in LogitsProcessor may then return
+        # vocab-shard argmax partials instead of logits. Eager-only: the
+        # processor never reads it under torch.compile.
+        "draft_argmax_only": False,
     }
 
     # Read/written inside compiled graphs (vocab embedding, layer boundaries,

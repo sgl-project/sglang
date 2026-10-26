@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import logging
 from functools import partial
 from typing import TYPE_CHECKING
@@ -10,6 +11,13 @@ from sglang.kernels.ops.attention.dsa.metadata import (
     fused_dsa_decode_metadata,
     fused_dsa_draft_extend_metadata,
     fused_dsa_target_verify_metadata,
+)
+from sglang.kernels.ops.attention.dsa_metadata_bounded import (
+    DEFAULT_MAX_SPLITS_PER_ROW,
+    DEFAULT_PROGRAM_BUDGET,
+    fused_dsa_decode_metadata_bounded,
+    fused_dsa_draft_extend_metadata_bounded,
+    fused_dsa_target_verify_metadata_bounded,
 )
 from sglang.srt.environ import envs
 from sglang.srt.utils import is_cuda, is_hip
@@ -29,6 +37,16 @@ _is_hip = is_hip()
 logger = logging.getLogger(__name__)
 
 
+@functools.cache
+def _log_bounded_metadata_once(program_budget: int, max_splits: int) -> None:
+    logger.info(
+        "DSA replay metadata: live-length-bounded grids, %d programs, at most %s "
+        "per request (SGLANG_DSA_BOUNDED_REPLAY_METADATA)",
+        program_budget,
+        max_splits if max_splits > 0 else "all",
+    )
+
+
 def kpool_metadata_fusion_supported(kpool, page_size, topk):
     return (
         kpool > 1 and page_size == 64 and page_size % kpool == 0 and topk % kpool == 0
@@ -37,6 +55,9 @@ def kpool_metadata_fusion_supported(kpool, page_size, topk):
 
 class DSAMetadataManagementMixin:
     experimental_kpool_metadata_fusion = False
+    dsa_meta_bounded = False
+    dsa_meta_program_budget = DEFAULT_PROGRAM_BUDGET
+    dsa_meta_max_splits = DEFAULT_MAX_SPLITS_PER_ROW
 
     def _init_kpool_metadata_fusion(self):
         requested = envs.SGLANG_EXPERIMENTAL_DSA_KPOOL_METADATA_FUSION.get()
@@ -76,6 +97,37 @@ class DSAMetadataManagementMixin:
             logger.warning(
                 "DSA KPool metadata fusion unsupported for this platform/geometry; retaining ordinary metadata"
             )
+        self._init_bounded_metadata()
+
+    def _init_bounded_metadata(self):
+        self.dsa_meta_bounded = (
+            envs.SGLANG_DSA_BOUNDED_REPLAY_METADATA.get()
+            and is_cuda()
+            and not _is_hip
+            and self.dsa_index_kpool <= 1
+            and not self.experimental_kpool_metadata_fusion
+        )
+        # One wave of programs on GB300, at most 256 per request (32K tokens a pass).
+        self.dsa_meta_program_budget = DEFAULT_PROGRAM_BUDGET
+        self.dsa_meta_max_splits = DEFAULT_MAX_SPLITS_PER_ROW
+        if not self.dsa_meta_bounded:
+            return
+        _log_bounded_metadata_once(
+            self.dsa_meta_program_budget, self.dsa_meta_max_splits
+        )
+        budget = {
+            "program_budget": self.dsa_meta_program_budget,
+            "max_splits_per_row": self.dsa_meta_max_splits,
+        }
+        self._fused_decode_metadata = partial(
+            fused_dsa_decode_metadata_bounded, **budget
+        )
+        self._fused_verify_metadata = partial(
+            fused_dsa_target_verify_metadata_bounded, **budget
+        )
+        self._fused_draft_extend_metadata = partial(
+            fused_dsa_draft_extend_metadata_bounded, **budget
+        )
 
     def _copy_base_replay_buffers(self, bs, metadata, precomputed, forward_mode):
         # Track whether fused kernel succeeded

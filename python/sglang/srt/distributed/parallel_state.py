@@ -992,6 +992,41 @@ class GroupCoordinator:
             return "pynccl"
         return None
 
+    def device_all_reduce_method(self, input_: torch.Tensor) -> Optional[str]:
+        """The device kernel of this group that ``all_reduce(input_)`` on CUDA
+        dispatches to ("flashinfer", "ca", "pcie_ipc", "qr", "pymscclpp",
+        "torch_symm_mem"), or None when it would run on NCCL.
+
+        Mirrors the eager CUDA dispatch in ``all_reduce``; like it, the answer
+        depends only on group state and tensor metadata, so it is identical on
+        every rank of the group.
+        """
+        if self.world_size == 1 or input_.is_cpu or torch.compiler.is_compiling():
+            return None
+        should_use_pymscclpp_allreduce = (
+            self.pymscclpp_comm is not None
+            and self.pymscclpp_comm.should_mscclpp_allreduce(input_)
+        )
+        should_use_custom_allreduce = (
+            self.ca_comm is not None
+            and not self.ca_comm.disabled
+            and self.ca_comm.should_custom_ar(input_)
+        )
+        if (
+            self.pynccl_comm is not None
+            and self.is_symmetric_memory_enabled()
+            and not should_use_pymscclpp_allreduce
+            and not should_use_custom_allreduce
+        ):
+            return None
+        if self._can_use_flashinfer_allreduce(input_):
+            return "flashinfer"
+        method = self._resolve_outplace_all_reduce_method(
+            input_=input_,
+            should_use_pymscclpp_allreduce=should_use_pymscclpp_allreduce,
+        )
+        return None if method == "pynccl" else method
+
     def _can_use_flashinfer_allreduce(self, input_: torch.Tensor) -> bool:
         if self._fi_workspace_hint is None:
             return False
