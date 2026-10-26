@@ -9,6 +9,7 @@ import torch.distributed as dist
 
 from sglang.srt.distributed.device_communicators.quick_all_reduce import (
     QuickAllReduce,
+    QuickReduceRegime,
     qr_rocm_arch_available,
 )
 from sglang.srt.utils import is_gfx95_supported
@@ -81,6 +82,33 @@ def _run_bf16_range_test(rank: int, world_size: int, port: int) -> None:
         dist.destroy_process_group()
 
 
+_INT8 = QuickReduceRegime.INT8.value
+_INT6 = QuickReduceRegime.INT6.value
+_INT4 = QuickReduceRegime.INT4.value
+
+
+def _open_comms(rank: int, world_size: int) -> tuple[int, int]:
+    import sgl_kernel.allreduce as aot
+
+    from sglang.kernels.ops.communication import quick_all_reduce_hip as jit
+
+    def open_comm(init, get_handle, open_handles):
+        handle = init(rank, world_size, 128 << 20)
+        handles = [None] * world_size
+        dist.all_gather_object(handles, get_handle(handle))
+        open_handles(handle, handles)
+        return handle
+
+    # sgl_kernel.allreduce takes (world_size, rank), the JIT module the reverse.
+    aot_comm = open_comm(
+        lambda r, w, m: aot.init_custom_qr(w, r, m),
+        aot.qr_get_handle,
+        aot.qr_open_handles,
+    )
+    jit_comm = open_comm(jit.init_custom_qr, jit.qr_get_handle, jit.qr_open_handles)
+    return aot_comm, jit_comm
+
+
 def _run_jit_bitwise_test(rank: int, world_size: int, port: int) -> None:
     import sgl_kernel.allreduce as aot
 
@@ -97,30 +125,16 @@ def _run_jit_bitwise_test(rank: int, world_size: int, port: int) -> None:
         world_size=world_size,
     )
 
-    def open_comm(init, get_handle, open_handles):
-        handle = init(rank, world_size, 128 << 20)
-        handles = [None] * world_size
-        dist.all_gather_object(handles, get_handle(handle))
-        open_handles(handle, handles)
-        return handle
-
     try:
-        # sgl_kernel.allreduce takes (world_size, rank), the JIT module the reverse.
-        aot_comm = open_comm(
-            lambda r, w, m: aot.init_custom_qr(w, r, m),
-            aot.qr_get_handle,
-            aot.qr_open_handles,
-        )
-        jit_comm = open_comm(jit.init_custom_qr, jit.qr_get_handle, jit.qr_open_handles)
+        aot_comm, jit_comm = _open_comms(rank, world_size)
         generator = torch.Generator(device=device).manual_seed(rank)
-        int8, int6, int4 = 1, 2, 3
         # (requested level, level it runs): asked for INT4, the JIT build runs INT8 below 64 MiB;
         # at 32 KB a tile, the sizes past the first have more tiles than blocks (grid-stride loop)
         for numel, level, runs in (
-            (384 * 6144, int4, int8),
-            (4096 * 6144, int4, int8),
-            (6144 * 6144, int4, int4),
-            (6144 * 6144, int8, int8),
+            (384 * 6144, _INT4, _INT8),
+            (4096 * 6144, _INT4, _INT8),
+            (6144 * 6144, _INT4, _INT4),
+            (6144 * 6144, _INT8, _INT8),
         ):
             inp = torch.randn(numel, device=device, generator=generator).bfloat16()
             inp[::4099] *= 64
@@ -133,7 +147,7 @@ def _run_jit_bitwise_test(rank: int, world_size: int, port: int) -> None:
                 f"{numel=} {level=}: JIT quick all-reduce differs from sgl-kernel's"
             )
         try:
-            jit.qr_all_reduce(jit_comm, inp, out, int6, True)
+            jit.qr_all_reduce(jit_comm, inp, out, _INT6, True)
         except RuntimeError:
             pass
         else:
@@ -158,34 +172,19 @@ def _run_jit_fallback_test(rank: int, world_size: int, port: int) -> None:
         world_size=world_size,
     )
 
-    def open_comm(init, get_handle, open_handles):
-        handle = init(rank, world_size, 128 << 20)
-        handles = [None] * world_size
-        dist.all_gather_object(handles, get_handle(handle))
-        open_handles(handle, handles)
-        return handle
-
     try:
-        int6 = 2
         generator = torch.Generator(device=device).manual_seed(rank)
         inp = torch.randn(384 * 6144, device=device, generator=generator).bfloat16()
         # (level, cast) the JIT build does not serve: INT6, INT4 at TP2, no cast at TP4
-        cases = [("INT6", "1", int6, True)]
+        cases = [("INT6", "1", _INT6, True)]
         if world_size == 4:
-            cases.append(("INT8", "0", 1, False))
+            cases.append(("INT8", "0", _INT8, False))
         else:
-            cases.append(("INT4", "1", 3, True))
+            cases.append(("INT4", "1", _INT4, True))
         for level_name, cast, level, cast_bf2half in cases:
             os.environ["ROCM_QUICK_REDUCE_QUANTIZATION"] = level_name
             os.environ["ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16"] = cast
-            aot_comm = open_comm(
-                lambda r, w, m: aot.init_custom_qr(w, r, m),
-                aot.qr_get_handle,
-                aot.qr_open_handles,
-            )
-            jit_comm = open_comm(
-                jit.init_custom_qr, jit.qr_get_handle, jit.qr_open_handles
-            )
+            aot_comm, jit_comm = _open_comms(rank, world_size)
             expected, out = torch.empty_like(inp), torch.empty_like(inp)
             aot.qr_all_reduce(aot_comm, inp, expected, level, cast_bf2half)
             jit.qr_all_reduce(jit_comm, inp, out, level, cast_bf2half)
