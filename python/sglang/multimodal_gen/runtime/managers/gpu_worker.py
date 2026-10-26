@@ -71,6 +71,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
 from sglang.multimodal_gen.runtime.managers.memory_managers.memory_occupation_controller import (
     MemoryOccupationController,
 )
+from sglang.multimodal_gen.runtime.managers.request_gc import request_gc
 from sglang.multimodal_gen.runtime.observability.metrics import (
     DiffusionMetrics,
     init_metrics,
@@ -82,6 +83,7 @@ from sglang.multimodal_gen.runtime.pipelines_core import (
     build_pipeline,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
+from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import DenoisingStage
 from sglang.multimodal_gen.runtime.platforms import (
     current_platform,
     initialize_current_platform,
@@ -259,6 +261,10 @@ def _probe_workload_units(req: Req) -> int:
     )
 
 
+class _FatalDistributedForward(SystemExit):
+    """Escape request-level recovery when ranks can no longer run in lockstep."""
+
+
 class GPUWorker(GPUWorkerPostTrainingMixin):
     """
     A worker that executes the model on a single GPU.
@@ -325,6 +331,10 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         # the auto-residency placement decision before the server turns ready
         self._auto_residency_warmup_records: list[WarmupMemoryRecord] = []
         self._update_lora_metrics()
+
+        # settle the import/model-loading GC debt before serving requests, rather
+        # than letting the first denoise step trigger a full-heap collection
+        gc.collect()
 
     def release_realtime_session(self, session_id: str) -> OutputBatch:
         """release the session of a realtime connection"""
@@ -547,9 +557,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
 
         residency_hint = (
             f" Components that can remain on GPU: {can_stay_resident}. "
-            "Make it explicit with --component-residency <name>=resident; "
-            "--performance-mode auto with server warmup applies safe "
-            "adjustments automatically."
+            "Make it explicit with --component-residency <name>=resident."
             if can_stay_resident
             else ""
         )
@@ -583,6 +591,11 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         # inside a graph capture and too costly per exchange
         IPC_A2A.check_timeout()
         IPC_A2A_MULTI.check_timeout()
+        if not any(
+            req.is_warmup or req.extra.get("server_internal_prewarm") for req in batch
+        ):
+            # also handles a failed/skipped final warmup before real execution
+            request_gc.collect_after_warmup()
         if len(batch) > 1:
             if return_req:
                 raise ValueError(
@@ -593,9 +606,12 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             return self._execute_forward_batch(batch)
 
         req = batch[0]
+        warming_up = req.is_warmup or bool(req.extra.get("server_internal_prewarm"))
+        if warming_up:
+            request_gc.mark_warmup()
         if req.is_warmup and req.extra.get("auto_residency_full_shape_probe"):
             self._fit_auto_residency_probe(req)
-        return self._execute_forward_common(
+        result = self._execute_forward_common(
             req,
             forward_fn=lambda: self.pipeline.forward(req, self.server_args),
             log_reqs=[req],
@@ -606,15 +622,31 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             error_context=f"request {req.request_id}",
             defer_finalize=defer_finalize,
         )
+        if warming_up and (
+            req.extra.get("warmup_last")
+            or (isinstance(result, OutputBatch) and result.error is not None)
+        ):
+            request_gc.collect_after_warmup()
+        return result
 
     def execute_forward_sequentially(self, batch: list[Req]) -> Iterator[OutputBatch]:
         """Yield grouped results after each request finishes its terminal stage."""
         assert self.pipeline is not None
+        if not any(
+            req.is_warmup or req.extra.get("server_internal_prewarm") for req in batch
+        ):
+            request_gc.collect_after_warmup()
         results = self.pipeline.forward_batch_sequentially(batch, self.server_args)
         group_start_time = time.monotonic()
+        failed = False
 
         try:
             for req in batch:
+                warming_up = req.is_warmup or bool(
+                    req.extra.get("server_internal_prewarm")
+                )
+                if warming_up:
+                    request_gc.mark_warmup()
                 output_count = (
                     max(1, int(req.num_outputs_per_prompt or 1))
                     if self.server_args.pipeline_config.supports_sequential_multi_output_inference()
@@ -635,12 +667,21 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                     propagate_forward_errors=True,
                 )
                 assert isinstance(output_batch, OutputBatch)
+                if warming_up and (
+                    req.extra.get("warmup_last") or output_batch.error is not None
+                ):
+                    request_gc.collect_after_warmup()
                 yield output_batch
                 del output_batch
+        except Exception:
+            failed = True
+            raise
         finally:
             close = getattr(results, "close", None)
             if close is not None:
                 close()
+            if failed:
+                request_gc.collect_after_warmup()
 
     def _collect_sequential_outputs(
         self,
@@ -671,6 +712,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             error_context=f"grouped request {req.request_id}",
         )
 
+    @request_gc.defer()
     def _execute_forward_common(
         self,
         req: Req,
@@ -796,6 +838,18 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                     deferred=False,
                 )
         except Exception as e:
+            if (
+                forward_failed
+                and isinstance(e, _oom_exceptions())
+                and get_replica_group().world_size > 1
+            ):
+                # Other ranks may still be inside this forward's collectives.
+                # Returning a request error would enter the next dispatch on
+                # only this rank, permanently desynchronizing the replica.
+                measure_server_warmup = False
+                raise _FatalDistributedForward(
+                    "Multi-rank forward ran out of memory; restart the server."
+                ) from e
             if propagate_forward_errors and forward_failed:
                 if isinstance(e, StopIteration):
                     raise RuntimeError(
@@ -838,20 +892,22 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         deferred: bool,
     ) -> None:
         req_label = req.request_id[:8] if req.request_id else "unnamed"
-        with maybe_record_function(f"SAVE_OUTPUTS {req_label}"):
-            self._materialize_output_transport(output_batch, req, save_output_paths)
-        if req.is_warmup and not current_platform.is_cpu():
-            # A warmup saves no output, so nothing waits for its device work;
-            # drain it here or the next request's first blocking op pays for it.
-            torch.get_device_module().synchronize()
-
-        self._record_output_peak_memory(output_batch, is_warmup=req.is_warmup)
-
-        collect_perf = (
-            req.perf_dump_path is not None or envs.SGLANG_DIFFUSION_STAGE_LOGGING
-        )
-        if collect_perf and not req.is_warmup:
-            self._record_replica_peak_memory(output_metrics)
+        try:
+            with maybe_record_function(f"SAVE_OUTPUTS {req_label}"):
+                self._materialize_output_transport(output_batch, req, save_output_paths)
+            if req.is_warmup and not current_platform.is_cpu():
+                # A warmup saves no output, so nothing waits for its device work;
+                # drain it here or the next request's first blocking op pays for it.
+                torch.get_device_module().synchronize()
+        finally:
+            self._record_output_peak_memory(output_batch, is_warmup=req.is_warmup)
+            # saving can fail only on the output rank; it must still join the
+            # metrics collective, or its peers cannot serve the next request
+            collect_perf = (
+                req.perf_dump_path is not None or envs.SGLANG_DIFFUSION_STAGE_LOGGING
+            )
+            if collect_perf and not req.is_warmup:
+                self._record_replica_peak_memory(output_metrics)
 
         if (
             self.is_output_rank
@@ -888,12 +944,14 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         return (
             self._async_output_save
             and not req.is_warmup
+            and not req.extra.get("server_internal_prewarm")
             and not req.return_raw_frames
-            and bool(req.save_output and req.return_file_paths_only)
+            and self._encodes_on_output_rank(req)
             and req.perf_dump_path is None
             and not envs.SGLANG_DIFFUSION_STAGE_LOGGING
         )
 
+    @request_gc.defer()
     def _finalize_deferred(
         self,
         *,
@@ -925,17 +983,22 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 )
             stream.synchronize()
 
-    def release_cache_if_idle(self) -> None:
+    def release_cache_if_idle(self) -> float | None:
         """Release the allocator cache once no request has finished for a while.
 
-        The scheduler calls this only with nothing queued or in flight.
+        The scheduler calls this only with nothing queued or in flight. Returns
+        the seconds until a pending release is due, or None when none is pending.
         """
         due = self._cache_release_due
-        if due is None or time.monotonic() < due:
-            return
+        if due is None:
+            return None
+        wait_s = due - time.monotonic()
+        if wait_s > 0:
+            return wait_s
         self._cache_release_due = None
         with maybe_record_function("EMPTY_CACHE"):
             torch.get_device_module().empty_cache()
+        return None
 
     def take_deferred_finalize(self) -> Callable[[], None] | None:
         deferred = self._deferred_finalize
@@ -981,10 +1044,17 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
     ) -> None:
         if req.return_raw_frames:
             self._materialize_raw_frame_transport(output_batch, req)
-        elif req.save_output and req.return_file_paths_only:
+        elif self._encodes_on_output_rank(req):
             self._materialize_file_path_transport(output_batch, save_output_paths)
         elif getattr(req, "return_frames", False):
             self._materialize_frame_outputs_for_return(output_batch, req)
+
+    @staticmethod
+    def _encodes_on_output_rank(req: Req) -> bool:
+        # the output rank encodes the outputs to save them or to return the image bytes
+        return req.return_file_paths_only and (
+            req.save_output or req.return_image_bytes
+        )
 
     def _materialize_raw_frame_transport(
         self, output_batch: OutputBatch, req: Req
@@ -1291,14 +1361,16 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             def build_output_path(idx: int) -> str:
                 return req.output_file_path(num_outputs, idx)
 
+        image_bytes = [] if req.return_image_bytes else None
         output_batch.output_file_paths = save_outputs(
             output_batch.output,
             req.data_type,
             req.fps,
-            True,
+            req.save_output,
             build_output_path,
             audio=output_batch.audio,
             audio_sample_rate=output_batch.audio_sample_rate,
+            image_bytes_out=image_bytes,
             output_compression=req.output_compression,
             x264_preset=req.x264_preset,
             enable_frame_interpolation=req.enable_frame_interpolation,
@@ -1309,6 +1381,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             upscaling_model_path=req.upscaling_model_path,
             upscaling_scale=req.upscaling_scale,
         )
+        output_batch.output_image_bytes = image_bytes
 
     def _save_group_output_paths(
         self,
@@ -1324,14 +1397,16 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             )
 
         first_req = reqs[0]
+        image_bytes = [] if first_req.return_image_bytes else None
         output_batch.output_file_paths = save_outputs(
             output_batch.output,
             first_req.data_type,
             first_req.fps,
-            True,
+            first_req.save_output,
             lambda idx: output_requests[idx].output_file_path(),
             audio=output_batch.audio,
             audio_sample_rate=output_batch.audio_sample_rate,
+            image_bytes_out=image_bytes,
             output_compression=first_req.output_compression,
             x264_preset=first_req.x264_preset,
             enable_frame_interpolation=first_req.enable_frame_interpolation,
@@ -1342,6 +1417,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             upscaling_model_path=first_req.upscaling_model_path,
             upscaling_scale=first_req.upscaling_scale,
         )
+        output_batch.output_image_bytes = image_bytes
 
     @staticmethod
     def _validate_group_forward_reqs(reqs: list[Req]) -> None:
@@ -1351,6 +1427,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             "save_output",
             "return_frames",
             "return_file_paths_only",
+            "return_image_bytes",
             "data_type",
             "fps",
             "output_compression",
@@ -1594,6 +1671,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             )
         finally:
             self._update_lora_metrics()
+            self._drop_breakable_cuda_graphs("LoRA changed")
         return OutputBatch()
 
     def merge_lora_weights(
@@ -1612,6 +1690,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             self.pipeline.merge_lora_weights(target, strength)
         finally:
             self._update_lora_metrics()
+            self._drop_breakable_cuda_graphs("LoRA changed")
         return OutputBatch()
 
     def unmerge_lora_weights(self, target: str = "all") -> OutputBatch:
@@ -1627,7 +1706,14 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             self.pipeline.unmerge_lora_weights(target)
         finally:
             self._update_lora_metrics()
+            self._drop_breakable_cuda_graphs("LoRA changed")
         return OutputBatch()
+
+    def _drop_breakable_cuda_graphs(self, reason: str) -> None:
+        # captured graphs replay the weights and LoRA branches of capture time
+        for stage in self.pipeline.stages:
+            if isinstance(stage, DenoisingStage):
+                stage.drop_breakable_cuda_graphs(reason)
 
     def _update_lora_metrics(self) -> None:
         if self.metrics is not None and isinstance(self.pipeline, LoRAPipeline):
@@ -1656,7 +1742,9 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 "sleeping": False,
                 "message": "already awake",
             }
-        return self.memory_occupation.resume_memory_occupation()
+        result = self.memory_occupation.resume_memory_occupation()
+        self._drop_breakable_cuda_graphs("weights moved by resume_memory_occupation")
+        return result
 
 
 OOM_MSG = """
@@ -1729,6 +1817,13 @@ def run_scheduler_process(
             }
         )
         scheduler.event_loop()
+    except _FatalDistributedForward:
+        logger.exception(
+            "Worker %d cannot safely continue after a multi-rank OOM", rank
+        )
+        # CUDA/NCCL teardown can wait forever on a peer's outstanding collective.
+        # Exit at the process boundary; the HTTP worker monitor rejects new work.
+        os._exit(1)
     except _oom_exceptions() as _e:
         logger.warning(OOM_MSG)
         raise

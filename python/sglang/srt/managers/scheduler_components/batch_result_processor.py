@@ -727,7 +727,11 @@ class SchedulerBatchResultProcessor:
                 logger.error(
                     f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
                 )
-                req.to_finish = FINISH_ABORT()
+                req.to_finish = FINISH_ABORT(
+                    f"Grammar accept_token failed: {e}",
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    "InternalServerError",
+                )
         req.grammar.finished = req.finished()
 
     def _apply_chunked_prefill_logprobs(
@@ -869,7 +873,11 @@ class SchedulerBatchResultProcessor:
                 f"Grammar accept_token failed for req {req.rid} with token "
                 f"{tokens}: {e}"
             )
-            req.to_finish = FINISH_ABORT()
+            req.to_finish = FINISH_ABORT(
+                f"Grammar accept_token failed: {e}",
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                "InternalServerError",
+            )
         return retained
 
     def advance_grammar_fsm(
@@ -1491,6 +1499,11 @@ class SchedulerBatchResultProcessor:
         next_token_id: Union[int, List[int]],
     ):
         if not req.require_reasoning:
+            think_start_ids = self.model_config.self_opened_think_start_ids
+            if think_start_ids:
+                req.update_self_opened_reasoning_tokens(
+                    next_token_id, think_start_ids, self.model_config.think_end_ids
+                )
             return
         think_end_ids = self.model_config.think_end_ids
         if req._think_end_matcher is None:
