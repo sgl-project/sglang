@@ -2100,6 +2100,18 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>triton</code>, <code>cutedsl</code>, <code>flashinfer</code></td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-linear-bole-spec`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Bole spec-verify for GDN hybrid linear-attn models: speculative target verify keeps per-step low-rank factors instead of per-draft full SSM snapshots (<code>intermediate_ssm</code>) and rebuilds the accepted state on commit, so the snapshot memory goes to the KV pool. Linear draft chains (<code>--speculative-eagle-topk</code> in {None, 1}) with the triton verify backend only; not combinable with <code>--enable-linear-replayssm-spec</code>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--linear-bole-workspace-mb`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>GPU memory (MiB) held back from the KV pool for Bole factor workspaces (one per CUDA graph batch size). Raise it for large <code>--max-running-requests</code>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`384`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: int</td>
+    </tr>
 </tbody>
 </table>
 

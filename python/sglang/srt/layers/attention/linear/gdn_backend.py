@@ -1007,6 +1007,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 and getattr(mamba_pool, "replayssm_cache_base", None) is not None
                 and not getattr(mamba_pool, "replayssm_is_kda", False)
             )
+            bole_verifier = getattr(mamba_pool, "bole_verifier", None)
 
         # Page-major envelope: the prefill kernels (CUDA causal_conv1d_fwd,
         # chunk_gated_delta_rule) write state back in place assuming a contiguous
@@ -1133,6 +1134,25 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     replay_indices=forward_batch.req_pool_indices,
                     query_start_loc=query_start_loc,
                     draft_token_num=forward_batch.spec_info.draft_token_num,
+                )
+            elif bole_verifier is not None:
+                # Bole: per-step low-rank factors instead of per-draft
+                # snapshots; the commit rebuilds the accepted state.
+                assert retrieve_parent_token is None, (
+                    "Bole spec-verify supports linear draft chains only"
+                )
+                core_attn_out = bole_verifier.target_verify(
+                    self.req_to_token_pool.mamba2_layer_index(layer.layer_id),
+                    A_log=layer.A_log,
+                    dt_bias=layer.dt_bias,
+                    q=query,
+                    k=key,
+                    v=value,
+                    a=a,
+                    b=b,
+                    ssm_states=ssm_states,
+                    cache_indices=cache_indices,
+                    query_start_loc=query_start_loc,
                 )
             else:
                 # The recurrent fallback needs the per-draft snapshots, which

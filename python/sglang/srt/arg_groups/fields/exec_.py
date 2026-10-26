@@ -593,6 +593,17 @@ class ExecMamba(msgspec.Struct):
         bool,
         "Enable the ReplaySSM spec-verify: fold-every-commit -- a per-slot raw-input window replaces the recurrent verify's per-draft full-state snapshots. GDN or KDA hybrid linear-attn models, linear-chain (--speculative-eagle-topk in {None, 1}) only.",
     ] = False
+    # Bole spec-verify: GDN target verify keeps only the per-step low-rank
+    # factors (p, k, u) instead of per-draft full-state snapshots and rebuilds
+    # the accepted state on commit. Linear-chain (topk <= 1) only.
+    enable_linear_bole_spec: A[
+        bool,
+        "Enable Bole spec-verify for GDN hybrid linear-attn models: target verify stores per-step low-rank factors instead of per-draft full SSM snapshots (intermediate_ssm), and the accepted state is rebuilt on commit, so the freed memory goes to the KV pool. Linear-chain (--speculative-eagle-topk in {None, 1}) with the triton verify backend only.",
+    ] = False
+    linear_bole_workspace_mb: A[
+        int,
+        "GPU memory (MiB) held back from the KV pool for Bole factor workspaces (one per CUDA graph batch size). Raise it for large --max-running-requests (e.g. 1024 at 24, 3328 at 32).",
+    ] = 384
 
 
 class ExecGraph(msgspec.Struct):

@@ -1598,6 +1598,47 @@ class HybridLinearAttnBackend(AttentionBackend):
             )
             return
 
+        # Bole: rebuild the accepted SSM state from the verify factors; the
+        # conv windows are still rolled back from their intermediate copies.
+        bole_verifier = getattr(mamba_pool, "bole_verifier", None)
+        if bole_verifier is not None:
+            assert src_indices_raw is None, "Bole commit does not support PP rows"
+            track_steps = None
+            if mamba_track_indices is not None:
+                mamba_track_indices = mamba_track_indices[:request_number]
+                track_steps = mamba_steps_to_track[:request_number]
+            bole_verifier.commit(
+                self.linear_attn_backend.forward_metadata.query_start_loc.shape[0] - 1,
+                state_indices_tensor,
+                last_correct_step_indices,
+                mamba_track_indices,
+                track_steps,
+            )
+            for conv_states, intermediate_conv_window in zip(
+                mamba_caches.conv, mamba_caches.intermediate_conv_window
+            ):
+                fused_conv_window_scatter_with_mask(
+                    conv_states,
+                    intermediate_conv_window,
+                    state_indices_tensor,
+                    last_correct_step_indices,
+                )
+                if mamba_track_indices is not None:
+                    fused_conv_window_scatter_with_mask(
+                        conv_states,
+                        intermediate_conv_window,
+                        mamba_track_indices,
+                        track_steps,
+                    )
+            self._update_ple_state_after_mtp_verify(
+                state_indices_tensor,
+                last_correct_step_indices,
+                mamba_track_indices,
+                track_steps,
+                None,
+            )
+            return
+
         scatter_mamba_states_after_mtp_verify(
             mamba_caches,
             state_indices_tensor,
