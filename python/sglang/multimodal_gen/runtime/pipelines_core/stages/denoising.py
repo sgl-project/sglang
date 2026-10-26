@@ -2022,8 +2022,25 @@ class DenoisingStage(PipelineStage):
         batch: Req,
         server_args: ServerArgs,
     ) -> Req:
-        with self._offload_for_torch_compile_warmup(batch):
-            return self._denoise(batch, server_args)
+        events = []
+
+        def record_gc(phase, info):
+            events.append((phase, info["generation"], time.perf_counter()))
+
+        before = gc.get_stats()
+        gc.callbacks.append(record_gc)
+        try:
+            with self._offload_for_torch_compile_warmup(batch):
+                return self._denoise(batch, server_args)
+        finally:
+            gc.callbacks.remove(record_gc)
+            logger.warning(
+                "GC_DIAG warmup=%s before=%s after=%s events=%s",
+                batch.is_warmup,
+                before,
+                gc.get_stats(),
+                events,
+            )
 
     @torch.no_grad()
     def _denoise(
