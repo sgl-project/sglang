@@ -9,9 +9,17 @@ import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import InsertParams
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.kv.build import UnifiedBuildContext, build_unified_pools
+from sglang.srt.mem_cache.kv.decl import (
+    MHAGeometry,
+    MLAGeometry,
+    StateGeometry,
+    kv_layer_decls,
+)
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
+from sglang.srt.mem_cache.kv.sizing import KVSizingInputs
 from sglang.srt.mem_cache.layout.fused_draft import FusedDraftPlacement
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
@@ -376,6 +384,75 @@ def build_unified_bundle(geometry: UnifiedGeometry):
         **state_kwargs,
         full_max_total_num_tokens=g.full_tokens,
         swa_max_total_num_tokens=g.swa_tokens,
+    )
+
+
+def build_unified_bundle_from_declarations(geometry: UnifiedGeometry):
+    """Build the stack a geometry describes through declarations, plan, sizing
+    and the builder."""
+    g = geometry
+    layer_ids = g.full_layer_ids + g.swa_layer_ids + g.state_layer_ids
+    if g.mla:
+        full_geometry = MLAGeometry(
+            kv_lora_rank=g.kv_lora_rank,
+            qk_rope_head_dim=g.qk_rope_head_dim,
+            kv_cache_dtype=g.kv_cache_dtype,
+        )
+    else:
+        full_geometry = MHAGeometry(
+            head_num=g.head_num,
+            head_dim=g.head_dim,
+            v_head_dim=g.v_head_dim if g.v_head_dim is not None else g.head_dim,
+            kv_cache_dtype=g.kv_cache_dtype,
+        )
+    cache_params = _state_cache_params(g) if g.state_layer_ids else None
+    decls = kv_layer_decls(
+        full_layer_ids=g.full_layer_ids,
+        full_geometry=full_geometry,
+        window_layer_ids=g.swa_layer_ids,
+        window_geometry=MHAGeometry(
+            head_num=g.swa_head_num,
+            head_dim=g.swa_head_dim,
+            v_head_dim=(
+                g.swa_v_head_dim if g.swa_v_head_dim is not None else g.swa_head_dim
+            ),
+            kv_cache_dtype=g.kv_cache_dtype,
+        ),
+        window=g.window,
+        state_layer_ids=g.state_layer_ids,
+        state_geometry=(
+            StateGeometry.of(cache_params) if cache_params is not None else None
+        ),
+    )
+    by_tokens = g.byte_budget is None or bool(g.state_layer_ids)
+    sizing = KVSizingInputs(
+        token_budget_bytes=g.byte_budget,
+        full_tokens=g.full_tokens if by_tokens else None,
+        window_tokens=g.swa_tokens if by_tokens and g.swa_layer_ids else None,
+        state_slots=g.state_slots if g.state_layer_ids else 0,
+        context_len=g.context_len,
+    )
+    ctx = UnifiedBuildContext(
+        device=g.device,
+        start_layer=g.start_layer,
+        end_layer=g.end_layer if g.end_layer is not None else max(layer_ids) + 1,
+        enable_memory_saver=False,
+        need_sort=False,
+        lazy_compaction=g.lazy,
+        head_num=g.head_num,
+        head_dim=g.head_dim,
+        max_num_reqs=g.max_num_reqs,
+        model_context_len=g.context_len,
+        extra_max_context_len=1,
+        state_cache_params=cache_params,
+        disable_overlap_schedule=True,
+    )
+    return build_unified_pools(
+        decls=decls,
+        page_size=g.page_size,
+        sizing=sizing,
+        ctx=ctx,
+        fused_draft=g.fused_draft,
     )
 
 

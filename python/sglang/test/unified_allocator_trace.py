@@ -32,6 +32,7 @@ from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.unified_allocator_fixtures import (
     UnifiedGeometry,
     build_unified_bundle,
+    build_unified_bundle_from_declarations,
     setup_allocator_context,
 )
 
@@ -110,12 +111,15 @@ class CompositeAdapter:
 
     name = "composite"
 
+    def _build_bundle(self, config: TraceConfig):
+        return build_unified_bundle(trace_geometry(config))
+
     def __init__(self, config: TraceConfig):
         setup_allocator_context()
         self.config = config
         self.device = config.device
         self.page_size = config.page_size
-        self.bundle = build_unified_bundle(trace_geometry(config))
+        self.bundle = self._build_bundle(config)
         self.allocator = self.bundle.token_to_kv_pool_allocator
         self.state_allocator = (
             self.bundle.req_to_token_pool.mamba_allocator
@@ -299,8 +303,18 @@ class CompositeAdapter:
         return out
 
 
+class BuilderAdapter(CompositeAdapter):
+    """The composite allocators, built from declarations through the builder."""
+
+    name = "builder"
+
+    def _build_bundle(self, config: TraceConfig):
+        return build_unified_bundle_from_declarations(trace_geometry(config))
+
+
 ADAPTERS: Dict[str, Callable[[TraceConfig], object]] = {
-    CompositeAdapter.name: CompositeAdapter
+    CompositeAdapter.name: CompositeAdapter,
+    BuilderAdapter.name: BuilderAdapter,
 }
 
 
