@@ -23,7 +23,13 @@ register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 
 
 def _mock_kvcache(cls):
-    return MagicMock(spec=cls)
+    kvcache = MagicMock(spec=cls)
+    kvcache.start_layer, kvcache.layer_num = 0, 1
+    kvcache.full_kv_pool, kvcache.swa_kv_pool = MagicMock(), MagicMock()
+    kvcache.layers_mapping, kvcache.full_attention_layer_id_mapping = {}, {}
+    # Routed as the class routes its own pools: its sub-pools and views.
+    kvcache.layer_router = cls._build_layer_router(kvcache)
+    return kvcache
 
 
 FULL = ComponentType.FULL

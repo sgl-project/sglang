@@ -84,7 +84,7 @@ from sglang.srt.mem_cache.common import (
     suffix_page_indices,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
-from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
 from sglang.srt.observability.scheduler_stage_metrics import (
@@ -136,9 +136,10 @@ def _uses_write_through_cache(cache: object) -> bool:
 
 
 def _transfer_start_layer(*, pool, hf_text_config) -> int:
-    # Hybrid pools count all layers in start_layer, but peer KV lists contain only
-    # full-attention layers, so translate to a full-attention-relative offset.
-    if not isinstance(pool, HybridLinearKVPool):
+    # A pool wrapping one token KV view (its other layers hold state) counts all
+    # layers in start_layer, but peer KV lists contain only full-attention
+    # layers, so translate to a full-attention-relative offset.
+    if pool.layer_router.wrapped_view() is None:
         return pool.start_layer
     return sum(
         1 for lid in hf_text_config.full_attention_layer_ids if lid < pool.start_layer
@@ -374,9 +375,7 @@ class PrefillBootstrapQueue:
             and hasattr(kv_manager, "set_kv_buffer_tensors")
             and not self.is_mla_backend
         ):
-            kv_pool = self.token_to_kv_pool
-            if hasattr(kv_pool, "full_kv_pool"):
-                kv_pool = kv_pool.full_kv_pool
+            kv_pool = self.token_to_kv_pool.layer_router.view(IdSpaceKind.FULL)
             staging_slots = build_staging_slot_metadata(
                 kv_layer_ids=kv_args.kv_layer_ids,
                 num_draft_entries=num_draft_entries,

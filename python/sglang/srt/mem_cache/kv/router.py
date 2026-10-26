@@ -183,6 +183,16 @@ class KVLayerRouter:
     def view(self, sub_pool: str) -> Any:
         return self._views[sub_pool]
 
+    def wrapped_view(self) -> Optional[Any]:
+        """The one token KV view the pool wraps, when all its token KV lives in
+        a single sub-pool view other than the pool itself (its other layers
+        hold none); None for a pool that is its own view or spreads its layers
+        over several sub-pools."""
+        if len(self.sub_pools()) != 1:
+            return None
+        view = self.view(self.sub_pools()[0].name)
+        return None if view is self._pool else view
+
     def layer_ids(self) -> Tuple[int, ...]:
         """Every routed model layer id, ascending."""
         return tuple(sorted(lid for sp in self.sub_pools() for lid in sp.layer_ids))

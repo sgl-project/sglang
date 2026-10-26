@@ -1634,13 +1634,14 @@ def build_full_draft_pools(
     tree_cache: Any,
 ) -> tuple[list[SidecarPoolSpec], list[PoolEntry]]:
     """Build draft KV/DSA sidecars whose indices follow target full KV."""
-    from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, HybridLinearKVPool
+    from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
     from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
 
     pool = draft_kv_pool
-    if isinstance(pool, HybridLinearKVPool):
+    inner = pool.layer_router.wrapped_view()
+    if inner is not None:
         # Hybrid draft runners keep their sole attention layer in this sub-pool.
-        pool = pool.full_kv_pool
+        pool = inner
     if pool.layer_num == 0:
         return [], []
 
@@ -1841,13 +1842,15 @@ def build_hicache_draft_sidecars(
     tree_cache: Any,
 ) -> tuple[list[SidecarPoolSpec], list[PoolEntry]]:
     """Compose the full and SWA draft-sidecar paths."""
-    from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+    from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
 
     assert len(draft_device_pools) == 1
     draft_kv_pool = draft_device_pools[0]
     builder = (
         build_swa_draft_pools
-        if isinstance(draft_kv_pool, BaseSWAKVPool)
+        if draft_kv_pool.layer_router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is not None
+        or isinstance(draft_kv_pool, DeepSeekV4TokenToKVPool)
         else build_full_draft_pools
     )
     return builder(
@@ -2033,9 +2036,7 @@ class _DeepSeekV4Strategy(StackStrategy):
 
 class _MambaStrategy(StackStrategy):
     def matches(self, kvcache, components):
-        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
-
-        return isinstance(kvcache, HybridLinearKVPool) and components == {
+        return kvcache.layer_router.wrapped_view() is not None and components == {
             ComponentType.FULL,
             ComponentType.MAMBA,
         }
@@ -2125,14 +2126,11 @@ def _swa_layer_mappings(kvcache) -> tuple[dict[int, int], dict[int, int]]:
 
 class _SwaStrategy(StackStrategy):
     def matches(self, kvcache, components):
-        from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
-        from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+        from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
 
-        return (
-            isinstance(kvcache, SWAKVPool)
-            and not isinstance(kvcache, DeepSeekV4TokenToKVPool)
-            and components == {ComponentType.FULL, ComponentType.SWA}
-        )
+        return kvcache.layer_router.sub_pool(
+            IdSpaceKind.SLIDING_WINDOW
+        ) is not None and components == {ComponentType.FULL, ComponentType.SWA}
 
     def build(
         self,
@@ -2180,15 +2178,15 @@ class _SwaStrategy(StackStrategy):
 
 class _MambaSwaStrategy(StackStrategy):
     def matches(self, kvcache, components):
-        from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
-        from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+        from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
 
-        return (
-            isinstance(kvcache, SWAKVPool)
-            and not isinstance(kvcache, DeepSeekV4TokenToKVPool)
-            and components
-            == {ComponentType.FULL, ComponentType.SWA, ComponentType.MAMBA}
-        )
+        return kvcache.layer_router.sub_pool(
+            IdSpaceKind.SLIDING_WINDOW
+        ) is not None and components == {
+            ComponentType.FULL,
+            ComponentType.SWA,
+            ComponentType.MAMBA,
+        }
 
     def build_direct_linker_pool_group(self, *, kvcache, params, page_size):
         from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
@@ -2310,20 +2308,16 @@ class _PlainKvStrategy(StackStrategy):
         from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
         from sglang.srt.mem_cache.memory_pool import (
             DSATokenToKVPool,
-            HybridLinearKVPool,
             MiniMaxSparseKVPool,
         )
-        from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
+        # A pool wrapping sub-pool views has a strategy of its own.
+        router = kvcache.layer_router
+        if len(router.sub_pools()) > 1 or router.wrapped_view() is not None:
+            return False
         if isinstance(
             kvcache,
-            (
-                SWAKVPool,
-                HybridLinearKVPool,
-                DSATokenToKVPool,
-                MiniMaxSparseKVPool,
-                DeepSeekV4TokenToKVPool,
-            ),
+            (DSATokenToKVPool, MiniMaxSparseKVPool, DeepSeekV4TokenToKVPool),
         ):
             return False
         return components == {ComponentType.FULL}

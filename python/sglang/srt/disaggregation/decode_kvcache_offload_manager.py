@@ -30,7 +30,6 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
     ReqToTokenPool,
 )
-from sglang.srt.mem_cache.unified_memory_pool import UnifiedSWAKVPool
 from sglang.srt.mem_cache.utils import storage_namespace_seed
 from sglang.srt.runtime_context import (
     get_memory,
@@ -81,8 +80,13 @@ class DecodeKVCacheOffloadManager:
                 )
 
         self.kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
-        if isinstance(self.kv_cache, UnifiedSWAKVPool):
-            router = self.kv_cache.layer_router
+        router = self.kv_cache.layer_router
+        # A unified pool's window sub-pool: its pages are bound per virtual page.
+        self._unified_window = (
+            self.token_to_kv_pool_allocator.hands_out_virtual_ids
+            and router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is not None
+        )
+        if self._unified_window:
             full_mapping, swa_mapping = (
                 {
                     layer_id: router.route(layer_id).index
@@ -165,7 +169,7 @@ class DecodeKVCacheOffloadManager:
         self, virtual_indices: torch.Tensor
     ) -> tuple[torch.Tensor, list[PoolTransfer]]:
         full_indices = virtual_indices
-        if not isinstance(self.kv_cache, UnifiedSWAKVPool):
+        if not self._unified_window:
             return full_indices, []
 
         swa_indices = self.token_to_kv_pool_allocator.id_spaces()[

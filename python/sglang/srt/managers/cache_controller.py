@@ -327,10 +327,10 @@ class HiCacheController:
         self.prefetch_completion_sync_groups: List[torch.distributed.ProcessGroup] = []
         self.mem_pool_device_allocator = token_to_kv_pool_allocator
         mem_pool_device = token_to_kv_pool_allocator.get_kvcache()
-        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
-
-        if isinstance(mem_pool_device, HybridLinearKVPool):
-            mem_pool_device = mem_pool_device.full_kv_pool
+        # A pool wrapping one token KV view transfers that view's KV.
+        inner = mem_pool_device.layer_router.wrapped_view()
+        if inner is not None:
+            mem_pool_device = inner
         self.mem_pool_device = mem_pool_device
         self.mem_pool_host = mem_pool_host
         self.storage_host_pool = mem_pool_host

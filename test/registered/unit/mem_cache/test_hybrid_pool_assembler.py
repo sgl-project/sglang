@@ -38,6 +38,8 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     build_host_pool_group,
     build_hybrid_swa_group,
 )
+from sglang.srt.mem_cache.kv.router import PlainPoolRouter
+from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
     HybridLinearKVPool,
@@ -348,6 +350,7 @@ class TestDraftSidecarPoolDispatch(CustomTestCase):
         full = SimpleNamespace(layer_num=0)
         full.host_pool_decls = lambda: (make_kv_pool_decl(full),)
         draft_kv_pool.full_kv_pool = full
+        draft_kv_pool.full_attention_layer_id_mapping = {}
 
         specs, entries = build_full_draft_pools(
             draft_kv_pool=draft_kv_pool,
@@ -358,7 +361,8 @@ class TestDraftSidecarPoolDispatch(CustomTestCase):
         self.assertEqual(entries, [])
 
     def test_full_builder_sizes_sidecar_for_anchor_logical_space(self):
-        draft_kv_pool = SimpleNamespace(layer_num=1, size=800)
+        draft_kv_pool = SimpleNamespace(layer_num=1, size=800, start_layer=0)
+        draft_kv_pool.layer_router = PlainPoolRouter(draft_kv_pool, IdSpaceKind.FULL)
         draft_kv_pool.host_pool_decls = lambda: (make_kv_pool_decl(draft_kv_pool),)
         draft_host_pool = SimpleNamespace(layer_num=1)
         tree_cache = SimpleNamespace(
@@ -403,6 +407,7 @@ class TestDraftSidecarPoolDispatch(CustomTestCase):
         breaks only here, not on the target path."""
         draft_kv_pool = object.__new__(DSATokenToKVPool)
         draft_kv_pool.layer_num = 1
+        draft_kv_pool.start_layer = 0
         draft_kv_pool.size = 800
         draft_kv_pool.index_head_dim = 128
         draft_kv_pool.page_size = 64

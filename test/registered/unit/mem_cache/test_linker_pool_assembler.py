@@ -627,6 +627,7 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
             pool = DSATokenToKVPool.__new__(DSATokenToKVPool)
             pool.page_size = 2
             pool.layer_num = 1
+            pool.start_layer = 0
             pool.kv_buffer = [torch.zeros((8, kv_width), dtype=torch.uint8)]
             pool.index_key_cache = SimpleNamespace(
                 buffer=[torch.zeros((4, index_width), dtype=torch.uint8)]
@@ -817,6 +818,8 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
         kvcache = SWAKVPool.__new__(SWAKVPool)
+        kvcache.full_kv_pool, kvcache.swa_kv_pool = object(), object()
+        kvcache.layers_mapping = {}
         with self.assertRaisesRegex(
             ValueError,
             "does not support the direct external linker: _SwaStrategy",

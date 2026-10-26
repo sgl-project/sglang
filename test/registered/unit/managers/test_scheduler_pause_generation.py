@@ -186,8 +186,9 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         controller.write.side_effect = write
 
         manager = object.__new__(DecodeKVCacheOffloadManager)
-        # Not a UnifiedSWAKVPool, so offloads carry no extra SWA pool transfers.
+        # No unified window sub-pool, so offloads carry no extra SWA pool transfers.
         manager.kv_cache = None
+        manager._unified_window = False
         manager.req_to_token_pool = SimpleNamespace(
             req_to_token=torch.arange(8).unsqueeze(0)
         )
