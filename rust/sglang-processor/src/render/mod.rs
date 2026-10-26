@@ -20,7 +20,7 @@ mod thinking;
 
 use self::legacy::LegacyFormatter;
 pub use self::loader::load_chat_formatter;
-pub use self::models::DeepSeekTokenizer;
+pub use self::models::{DeepSeekTokenizer, continues_final_message};
 use self::models::{
     deep_sort, deepseek_v4_thinking, encode_tools_to_typescript, is_glm53, is_qwen38,
     render_deepseek_v4, render_glm53, render_kimi_k3, render_qwen38, takes_content_parts,
@@ -101,7 +101,15 @@ impl ChatFormatter {
                     }
                     args.insert("tools".into(), tools);
                 }
-                render_oai(formatter, &TemplateArgsRequest { request, args })
+                render_oai(
+                    formatter,
+                    &TemplateArgsRequest {
+                        request,
+                        args,
+                        messages: None,
+                        tools: None,
+                    },
+                )
             }
             ChatFormatter::KimiK3 => {
                 KimiK3Formatter::new(true)
@@ -303,10 +311,12 @@ fn render_oai(
 
 /// Formatter-facing request view over adapted template arguments.
 /// Native effort access and template arguments share the adapted value without
-/// changing the original request.
+/// changing the original request; `messages` and `tools` replace its own when set.
 struct TemplateArgsRequest<'a> {
     request: &'a dyn OAIChatLikeRequest,
     args: HashMap<String, Value>,
+    messages: Option<minijinja::Value>,
+    tools: Option<Option<Value>>,
 }
 
 impl OAIChatLikeRequest for TemplateArgsRequest<'_> {
@@ -315,15 +325,24 @@ impl OAIChatLikeRequest for TemplateArgsRequest<'_> {
     }
 
     fn messages(&self) -> minijinja::Value {
-        self.request.messages()
+        match &self.messages {
+            Some(messages) => messages.clone(),
+            None => self.request.messages(),
+        }
     }
 
     fn typed_messages(&self) -> Option<&[ChatCompletionRequestMessage]> {
-        self.request.typed_messages()
+        match self.messages {
+            Some(_) => None,
+            None => self.request.typed_messages(),
+        }
     }
 
     fn tools(&self) -> Option<minijinja::Value> {
-        self.request.tools()
+        match &self.tools {
+            Some(tools) => tools.as_ref().map(minijinja::Value::from_serialize),
+            None => self.request.tools(),
+        }
     }
 
     fn tool_choice(&self) -> Option<minijinja::Value> {
