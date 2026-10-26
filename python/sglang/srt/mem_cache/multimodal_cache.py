@@ -91,7 +91,8 @@ class MultiModalStaticCache(MultimodalCache):
     def get(
         self, mm_hashes: List[int], combined_hash: Optional[int] = None
     ) -> Optional[EmbeddingResult]:
-        combined_hash = self.combine_hashes(mm_hashes)
+        if combined_hash is None:
+            combined_hash = self.combine_hashes(mm_hashes)
         # MultiModalStaticCache does not fallback to individual item lookup
 
         embedding = self.mm_cache.get(combined_hash)

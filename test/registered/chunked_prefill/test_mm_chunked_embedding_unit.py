@@ -340,6 +340,36 @@ def test_full_mismatched_cache_entry_is_reencoded(caplog):
     assert "cached_tokens=1" in caplog.text
 
 
+def test_multimodal_static_cache_reuses_precomputed_combined_hash(monkeypatch):
+    mm_schedule.init_mm_embedding_cache(1 << 30)
+    items = _make_items()
+    item_hashes = [item.hash for item in items]
+    combined_hash = mm_schedule.MultiModalStaticCache.combine_hashes(item_hashes)
+    expected = torch.ones((sum(_num_tokens(item) for item in items), HIDDEN))
+    mm_schedule.embedding_cache.set(
+        combined_hash,
+        mm_schedule.EmbeddingResult(embedding=expected),
+    )
+
+    combine_spy = Mock(wraps=mm_schedule.MultiModalStaticCache.combine_hashes)
+    monkeypatch.setattr(
+        mm_schedule.MultiModalStaticCache, "combine_hashes", combine_spy
+    )
+
+    cached = mm_schedule.embedding_cache.get(item_hashes, combined_hash=combined_hash)
+    assert cached is not None
+    assert torch.equal(cached.embedding, expected)
+    combine_spy.assert_not_called()
+
+    input_ids = torch.zeros(TOTAL_LEN, dtype=torch.long)
+    encoder = Mock(side_effect=AssertionError("cache hit should not call encoder"))
+    chunk, _ = mm_schedule._get_chunked_embedding_full(
+        encoder, items, ITEM_OFFSETS, 0, TOTAL_LEN, input_ids, _CPU
+    )
+    assert torch.equal(chunk, expected)
+    assert combine_spy.call_count == 1
+
+
 @pytest.mark.parametrize("per_request", [False, True])
 def test_multi_offset_audio_item_is_chunked_and_cached_per_item(
     monkeypatch, per_request
