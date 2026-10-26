@@ -245,6 +245,25 @@ Printed after each run:
 
 The script also retokenizes generated text with the configured tokenizer and reports "retokenized" counts.
 
+### Goodput
+
+Throughput counts every completed request, including the ones that came back too late to be useful. Pass service level objectives with `--goodput` to count only the requests that met them:
+
+```bash Command
+python3 -m sglang.bench_serving \
+  --backend sglang --host 127.0.0.1 --port 30000 \
+  --num-prompts 1000 --request-rate 16 \
+  --goodput ttft:500 tpot:50 e2el:20000
+```
+
+Each entry is `KEY:VALUE` in milliseconds, with `KEY` one of `ttft`, `tpot`, `e2el` (end-to-end latency). A request is good if it succeeded and met every listed SLO; a single-token response has a TPOT of 0. The run then also prints:
+
+- Request goodput (req/s): good requests per second
+- SLO attainment (%): good requests over all requests sent, so failed requests count as misses
+- One attainment line per listed SLO, which shows which SLO is the binding one
+
+Sweeping `--request-rate` and reading goodput gives the highest rate the deployment sustains within its SLOs: throughput keeps rising or flattens under overload, goodput peaks and then falls.
+
 ### JSONL output format
 
 When `--output-file` is set, one JSON object is appended per run. Base fields:
@@ -253,6 +272,7 @@ When `--output-file` is set, one JSON object is appended per run. Base fields:
 - Duration and totals: completed, total_input_tokens, total_output_tokens, retokenized totals
 - Throughputs and latency statistics as printed in the console
 - `accept_length` when available (sglang)
+- `goodput_slos_ms`, `request_goodput`, `slo_attainment`, `slo_attainment_by_metric` when `--goodput` is given
 
 With `--output-details`, an extended object also includes arrays:
 

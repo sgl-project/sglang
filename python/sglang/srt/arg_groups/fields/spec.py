@@ -159,6 +159,7 @@ class Spec(msgspec.Struct):
             "--mem-fraction-static to convert it into KV capacity. Default follows "
             "--kv-cache-dtype.",
             choices=["auto", "fp8_e5m2", "fp8_e4m3", "bf16", "bfloat16"],
+            resolvable=True,
         ),
     ] = None
     speculative_draft_window_size: A[
@@ -226,10 +227,6 @@ class Spec(msgspec.Struct):
         Optional[bool],
         Arg(no_cli=True),
     ] = None
-    speculative_skip_dp_mlp_sync: A[
-        bool,
-        "Skip the extra MLP sync that the scheduler performs before merging a new batch when speculative decoding + DP attention are both enabled.",
-    ] = False
     enable_multi_layer_eagle: A[
         bool,
         Arg(
