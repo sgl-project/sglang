@@ -39,7 +39,11 @@ from cutlass.cute.nvgpu import tcgen05
 from cutlass.cute.runtime import from_dlpack, make_fake_stream
 
 from sglang.kernels.kernel_api_logging import debug_kernel_api
-from sglang.srt.utils import get_device_core_count, is_sm100_supported
+from sglang.srt.utils import (
+    get_device_core_count,
+    get_device_sm,
+    is_sm100_supported,
+)
 from sglang.srt.utils.common import direct_register_custom_op
 
 # Tuple format: (cta_m, cta_n, num_ab_stage, use_2cta); cta_k is fixed at
@@ -1341,8 +1345,17 @@ _K3_TGV_WIN_SHAPES = frozenset(
         (3584, 7168),  # MoE latent down (unfused fallback)
         (7168, 3584),  # MoE latent up
         (7168, 768),  # shared down
+        (7168, 1792),  # DSpark draft down
+        (7168, 512),  # DSpark draft o_proj
+        (8448, 7168),  # dense MLP gate_up
     }
 )
+
+_K3_FRONT_WARP_SPLITK = {
+    8: (8, 11),
+    16: (16, 9),
+    32: (32, 6),
+}
 
 
 # MuseSpark TP4/TP8 projections using TGV on GB300; other M use cuBLAS.
@@ -1374,6 +1387,16 @@ def use_cutedsl_bf16_gemm(m: int, n: int, k: int) -> bool:
     m_range = _MUSE_SPARK_TGV_M_RANGES.get((n, k))
     if m_range is not None:
         return m_range[0] <= m <= m_range[1]
+    if (
+        get_device_sm() == 107
+        and m in _K3_FRONT_WARP_SPLITK
+        and (n, k)
+        == (
+            6016,
+            7168,
+        )
+    ):
+        return True
     if m <= 8 and (n, k) in _K3_TGV_WIN_SHAPES:
         return True
     if n < 1024 or k < 2048 or k > 6144:
@@ -1438,6 +1461,36 @@ def _tgv_bf16_gemm_out_run(
     assert weight.stride(-1) == 1, "weight must be K-major [N, K]"
     assert out.is_contiguous() and out.shape == (x.shape[0], weight.shape[0])
     if x.shape[0] == 0:
+        return None
+    if (
+        get_device_sm() == 107
+        and x.shape[0] in _K3_FRONT_WARP_SPLITK
+        and x.shape[1] == 7168
+        and weight.shape == (6016, 7168)
+        and out.dtype == torch.float32
+        and bias is None
+    ):
+        # Temporary vendored copy of FlashInfer's warp split-K kernel with an
+        # FP32 output path; switch to flashinfer.gemm once it accepts FP32 out.
+        from sglang.kernels.ops.gemm.dense_bf16_gemm_warp_splitk import (
+            WarpSplitKTactic,
+            run_warp_splitk_dense,
+        )
+
+        token_tile, stages = _K3_FRONT_WARP_SPLITK[x.shape[0]]
+        run_warp_splitk_dense(
+            x,
+            weight.t(),
+            out,
+            pdl=True,
+            tactic=WarpSplitKTactic(
+                output_tile=32,
+                token_tile=token_tile,
+                k_tile=256,
+                stages=stages,
+                b_loader_warps=2,
+            ),
+        )
         return None
     _run_tgv(
         x,

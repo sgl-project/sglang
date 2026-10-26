@@ -19,7 +19,7 @@ from sglang.srt.layers.cp.base import ContextParallelStrategyKind
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=13, suite="base-a-test-cpu")
 
 
 @pytest.mark.parametrize(
@@ -131,7 +131,7 @@ def test_qsa_model_forward_prefetches_exact_kv_before_indexer(
         is_qsa=True,
         layer_id=7,
         alt_stream=None,
-        _qsa_prefill_topk_bridge=None,
+        _qsa_prefill_topk_bridges=[],
         _prepare_attn_stage=lambda value, *args: value,
         _prepare_qkv_gate=prepare,
         indexer=indexer,
