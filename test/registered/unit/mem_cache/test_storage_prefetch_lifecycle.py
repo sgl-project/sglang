@@ -319,15 +319,17 @@ class TestStoragePrefetchTimeout(unittest.TestCase):
         cache.tree_core.build_hicache_transfers = lambda ct, node, phase, **kw: (
             cache.components[ct].build_hicache_transfers(None, phase, **kw)
         )
-        req.full_untruncated_fill_ids = array("q", range(9))
-        req._compute_max_prefix_len = lambda n: n - 1
+        operation = SimpleNamespace(
+            handle=req.cache_request_handle,
+            token_ids=RadixKey(array("q", range(2, 8))),
+        )
         cache.cache_controller.register_cache_query = Mock()
-        cache.register_pp_prefetch_query(req)
-        handle, key, transfers, attempt = (
+        cache._submit_pp_cache_query(operation, [0, 1], 0)
+        bound_operation, key, transfers, attempt = (
             cache.cache_controller.register_cache_query.call_args.args
         )
         self.assertEqual(attempt, 0)
-        self.assertEqual(handle, req.cache_request_handle)
+        self.assertIs(bound_operation, operation)
         self.assertEqual(len(key), 8)
         self.assertEqual(
             [(t.name, len(t.keys), t.hit_policy, t.host_indices) for t in transfers],

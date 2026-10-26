@@ -2032,35 +2032,29 @@ class UnifiedRadixCache(BasePrefixCache):
         storage_hit_count -= storage_hit_count % self.page_size
         return storage_hit_count
 
-    def register_pp_prefetch_query(self, req):
-        # One common root span: local L1/L2 matches can differ across stages.
-        # Query MIN sees only L3, not max(local_match, L3) or a local suffix.
-        # Register even when this stage needs no GET; peers may still need one.
-        end = req._compute_max_prefix_len(len(req.full_untruncated_fill_ids))
+    def _submit_pp_cache_query(self, operation, matched_prefix_tokens, attempt):
+        # Preserve native submission order and skip decisions. Query only after
+        # a local operation exists, using the shared root span for storage MIN.
+        suffix = operation.token_ids
         key = RadixKey(
-            req.full_untruncated_fill_ids[:end],
-            extra_key=req.extra_key,
-            cache_salt=req.cache_salt,
-            is_bigram=self.tree_core.is_eagle,
-        ).page_aligned(self.page_size)
-        if len(key) >= self.prefetch_threshold:
-            comp_xfers = self._build_prefetch_component_transfers(
-                self.root_node_handle(req.extra_key), key, last_hash=None
+            array("q", matched_prefix_tokens or ())
+            + array("q", suffix.raw_token_ids()),
+            extra_key=suffix.extra_key,
+            cache_salt=suffix.cache_salt,
+            is_bigram=suffix.is_bigram,
+        )
+        comp_xfers = self._build_prefetch_component_transfers(
+            self.root_node_handle(key.extra_key), key, last_hash=None
+        )
+        transfers = [x for xfers in comp_xfers.values() for x in xfers]
+        transfers.extend(
+            self._build_sidecar_transfers(
+                CacheTransferPhase.PREFETCH,
+                PoolTransfer(name=PoolName.KV, host_indices=None),
+                comp_xfers,
             )
-            transfers = [x for xfers in comp_xfers.values() for x in xfers]
-            transfers.extend(
-                self._build_sidecar_transfers(
-                    CacheTransferPhase.PREFETCH,
-                    PoolTransfer(name=PoolName.KV, host_indices=None),
-                    comp_xfers,
-                )
-            )
-            self.cache_controller.register_cache_query(
-                req.cache_request_handle,
-                key,
-                transfers,
-                req.storage_prefetch_retry_attempts,
-            )
+        )
+        self.cache_controller.register_cache_query(operation, key, transfers, attempt)
 
     def _build_prefetch_component_transfers(self, node_id, key, last_hash):
         """Native component query descriptors; no staging allocation or I/O.
@@ -2102,6 +2096,7 @@ class UnifiedRadixCache(BasePrefixCache):
         extra_key: Optional[str] = None,
         cache_salt: Optional[str] = None,
         storage_hit_end: Optional[int] = None,
+        storage_attempt: int = 0,
     ) -> Optional[bool]:
         if not self.enable_storage or self.cache_controller is None:
             return
@@ -2249,6 +2244,10 @@ class UnifiedRadixCache(BasePrefixCache):
             # Cache mode reserves the requested span up front; buffer mode
             # grants occupancy later at hit-alloc time, sized to the hit.
             self.cache_controller.prefetch_tokens_occupied += len(prefetch_key)
+            if self.cache_controller.pp_prefetch_command_group is not None:
+                self._submit_pp_cache_query(
+                    operation, matched_prefix_tokens, storage_attempt
+                )
 
     def _start_storage_prefetch_wait(self, operation: PrefetchOperation) -> None:
         if (
@@ -3157,15 +3156,14 @@ class UnifiedRadixCache(BasePrefixCache):
                     operation = cc.resolve_cache_query(operation)
                     if operation is None:
                         continue
+                    info = self.ongoing_prefetch.get(operation.handle)
+                    if info is not None and info.operation is not operation:
+                        # A shared query can arrive after its local retry.
+                        continue
                 self._invalidate_absent_from_hit_query(operation)
                 request = operation.handle
                 hit_tokens = operation.storage_hit_count
                 info = self.ongoing_prefetch.get(request)
-                if info is not None and info.operation is not operation:
-                    # Reject late old queries once, before accounting/allocation.
-                    # The cache-mode allocator below is called synchronously in
-                    # this scheduler thread; only native buffer mode parks hits.
-                    continue
                 if info is None:
                     if hit_tokens > 0:
                         self.discard_storage_prefetch_accounting(request)

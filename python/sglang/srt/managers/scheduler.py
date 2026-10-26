@@ -3254,8 +3254,12 @@ class Scheduler(
                 self._add_request_to_queue(req)
                 return
 
-        if get_parallel().pp_rank == 0 and getattr(
-            self.tree_cache.cache_controller, "pp_prefetch_command_group", None
+        if (
+            get_memory().hicache_host_memory_mode == "buffer_only"
+            and get_parallel().pp_rank == 0
+            and getattr(
+                self.tree_cache.cache_controller, "pp_prefetch_command_group", None
+            )
         ):
             recv_req.pp_prefetch_ticketed = bool(self._prefetch_kvcache(req))
             self.tree_cache.bind_prefetch_ticket(req.rid, recv_req.pp_prefetch_ticketed)
@@ -3280,12 +3284,6 @@ class Scheduler(
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
             tree_cache = self.tree_cache
             buffer_mode = get_memory().hicache_host_memory_mode == "buffer_only"
-            if (
-                self.enable_hicache_storage
-                and not buffer_mode
-                and tree_cache.cache_controller.pp_prefetch_command_group is not None
-            ):
-                tree_cache.register_pp_prefetch_query(req)
             last_host_node = req.last_host_node
             # Buffer mode host-backups nothing, so match_prefix anchors at
             # root; re-anchor on the deepest device node. The anchor is only
@@ -3330,6 +3328,7 @@ class Scheduler(
                     extra_key=req.extra_key,
                     cache_salt=req.cache_salt,
                     storage_hit_end=storage_hit_end,
+                    storage_attempt=req.storage_prefetch_retry_attempts,
                 )
 
     def _process_storage_prefetch_retries(self):

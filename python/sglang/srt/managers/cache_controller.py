@@ -686,7 +686,7 @@ class HiCacheController:
         try:
             self._stop_storage_threads()
             if self.pp_prefetch_consensus is not None:
-                self.pp_prefetch_consensus.reset(publish_finished=True)
+                self.pp_prefetch_consensus.reset()
         except Exception as e:
             # Do not proceed tearing down backend/process group if threads are not
             # fully stopped; otherwise still-alive threads may touch released state.

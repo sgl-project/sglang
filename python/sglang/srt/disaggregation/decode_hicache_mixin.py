@@ -137,8 +137,10 @@ class DecodeHiCachePreallocMixin:
                 suffix,
                 last_hash,
                 prefix_keys,
+                matched_prefix_tokens=req.origin_input_ids[:matched_len],
                 extra_key=req.extra_key,
                 cache_salt=req.cache_salt,
+                storage_attempt=req.storage_prefetch_retry_attempts,
             )
             prefix_match.prefetch_registered = self.tree_cache.has_ongoing_prefetch(
                 req.cache_request_handle

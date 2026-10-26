@@ -242,7 +242,6 @@ class HybridCacheController(BaseHiCacheController):
         self.pp_prefetch_states: dict[
             str | tuple[CacheRequestHandle, int], PPPrefetchState
         ] = {}
-        self.pp_cache_query: Optional[PPPrefetchState] = None
         self.pp_prefetch_decisions: dict[str, PPPrefetchDecision] = {}
         super().__init__(
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
@@ -370,7 +369,6 @@ class HybridCacheController(BaseHiCacheController):
         with self.pp_prefetch_state_lock:
             self.pp_prefetch_states.clear()
             self.pp_prefetch_decisions.clear()
-            self.pp_cache_query = None
 
     def register_host_pool_entry(self, entry: PoolEntry) -> None:
         if not isinstance(self.mem_pool_host, HostPoolGroup):
@@ -508,7 +506,6 @@ class HybridCacheController(BaseHiCacheController):
         with self.pp_prefetch_state_lock:
             self.pp_prefetch_states.clear()
             self.pp_prefetch_decisions.clear()
-            self.pp_cache_query = None
         if self.enable_storage and self.pp_prefetch_command_group is not None:
             self.pp_prefetch_command_queue = Queue()
             self.pp_prefetch_command_thread = threading.Thread(
@@ -1094,10 +1091,6 @@ class HybridCacheController(BaseHiCacheController):
                 assume_stored=False,
             )
             operation.storage_start = len(matched_prefix_tokens or [])
-            with self.pp_prefetch_state_lock:
-                # register_cache_query and submit_prefetch run synchronously in
-                # one native scheduler call. The worker never changes this binding.
-                self.pp_cache_query.cache_operation = operation
             return PrefetchSubmission(operation=operation)
         if self.pp_prefetch_command_group is None:
             return PrefetchSubmission(
@@ -1152,10 +1145,10 @@ class HybridCacheController(BaseHiCacheController):
         self.pp_prefetch_command_queue.put(ticket)
         return PrefetchSubmission(operation=operation, decision=True)
 
-    def register_cache_query(self, handle, key, pool_transfers, attempt):
-        """Register on every stage; PP0 alone submits an ordered root-span query."""
+    def register_cache_query(self, operation, key, pool_transfers, attempt):
+        """Bind the submitted operation; PP0 enqueues the shared root query."""
         ticket = PPPrefetchTicket(
-            handle,
+            operation.handle,
             key,
             None,
             None,
@@ -1170,7 +1163,7 @@ class HybridCacheController(BaseHiCacheController):
                 self.pp_prefetch_states[ticket.key] = state
                 if self.storage_config.pp_rank == 0:
                     self.pp_prefetch_command_queue.put(ticket)
-            self.pp_cache_query = state
+            state.cache_operation = operation
 
     def _new_pp_prefetch_state(self, ticket):
         operation = PrefetchOperation(
@@ -1195,15 +1188,13 @@ class HybridCacheController(BaseHiCacheController):
     def resolve_cache_query(self, state):
         """Bind an ordered query result to its native operation at scheduler drain.
 
-        Every shared query contributes one queue item, even after cancellation
-        or without a local GET. Do not drop entries in the worker: native PP
-        drains the same FIFO counts on every stage.
+        Every submitted query contributes one queue item, even after cancellation.
+        Do not drop entries in the worker: native PP drains the same FIFO counts
+        on every stage.
         """
         operation = state.cache_operation
         with self.pp_prefetch_state_lock:
             self.pp_prefetch_states.pop(state.ticket.key, None)
-            if self.pp_cache_query is state:
-                self.pp_cache_query = None
         if operation is None:
             return None
         query = state.operation

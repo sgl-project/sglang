@@ -9,12 +9,16 @@
 
 ## Execution path
 
-1. PP0 enqueues a shared query ticket. Each stage queries its storage namespace;
+1. Cache-mode requests reach native prefetch submission after grammar and skip
+   checks (anchor, threshold, rate limit, ongoing work and deadline). Submission
+   binds its operation directly to a shared query ticket; the early PP0-only
+   request-ingress path remains exclusive to buffer mode. PP0 enqueues the ticket.
+   Each stage queries its storage namespace;
    the existing query collective agrees the storage-only root endpoint
    `S_min = MIN(S_i)` and component query results. Local L1/L2 coverage is not
    part of this MIN.
-2. Every query produces one ordered native hit-queue item, including cancellation
-   and no-local-GET cases. The scheduler binds it to the local suffix operation,
+2. Every submitted query produces one ordered native hit-queue item, including
+   cancellation. The scheduler resolves it to the bound local suffix operation,
    then uses native host allocation and GET. Tickets use the native request handle
    and retry counter, so a new query cannot overwrite an unconsumed peer result.
 3. The background completion worker keeps TP/CP reduction, but no PP collective.
@@ -28,8 +32,11 @@
 The ring reuses the native P2P helpers and WORLD group with a distinct message
 tag. Returns and send-buffer retirement are delayed by `pp_loop_size`, so the
 current fold does not become a cross-stage rendezvous before the current forward.
-The same hook is installed in unified PP, PD Prefill and PD Decode loops. L2-only
-loops send no completion traffic. Native reset/detach retire the added ACK
+The same transport hook is installed in unified PP, PD Prefill and PD Decode
+loops. This does not qualify PD Decode + PP + L3: the native PP decode loop
+does not drain HiCache events. Its direct prefetch entry now binds the query
+and passes the local prefix offset, but full Decode support remains separate.
+L2-only loops send no completion traffic. Native reset/detach retire the added ACK
 ownership after stopping I/O and fence already-sent results with a storage
 generation. Transport cadence is preserved across reset; late packets are
 received but not applied to the new cache. Native administrative eligibility
@@ -39,6 +46,8 @@ checks are unchanged (local ACK availability must not make ranks disagree).
 
 - Keep native PP0-led L2/cache-event progression and native request ownership.
   This is **not** the earlier independent-L2/full-prefix admission protocol.
+  Query submission order and local suffix boundaries retain that native contract;
+  query tests do not claim to support divergent local L2 trees.
 - Keep native ACK order/kinds and operation identity. Only numeric results cross
   PP; each rank retains its operation and buffers. A terminal ACK is published
   only after the corresponding local terminal ACK exists on every stage.
@@ -62,6 +71,16 @@ Final CPU run: 145 tests and 179 subtests passed across ten suites, using the
 existing v0.5.21-cu130 container with this checkout mounted read-only (Python
 3.12.3 / Torch 2.13.0). Ruff and diff checks passed. The native stop-policy,
 hybrid-result, selector and H2D implementations were also compared to the base.
+
+2026-10-26 review follow-up: restricted early ingress prefetch to buffer mode,
+bound shared queries at actual cache submission, and removed the transient
+query pointer and ineffective detach ACK publication. Late-query identity checks
+apply only to the added shared-query path. The affected CPU/Gloo suites passed
+62 tests and 70 subtests, including the existing SWA/Mamba descriptor test. The
+new grammar regression fails against the previous scheduler (PP0 submits the
+grammar-pending request) and passes on all three simulated PP stages after the
+fix. Query/ACK transport still has real Gloo coverage; grammar ingress uses CPU
+doubles. These checks are not GPU end-to-end qualification.
 
 GPU model accuracy, deployment and performance have not been run for this
 replacement. Earlier opt-in Gate benchmark results are not acceptance evidence

@@ -5,6 +5,7 @@ import tempfile
 import threading
 import unittest
 from array import array
+from collections import defaultdict
 from contextlib import nullcontext
 from dataclasses import replace
 from datetime import timedelta
@@ -64,40 +65,32 @@ def _cache_query_ranks(rank, rendezvous):
         c._all_reduce.side_effect = lambda tensor, op, groups: (
             torch.distributed.all_reduce(tensor, op=op, group=groups[0])
         )
-        # S_min=12, not MIN(max(A, S))=20: local reuse is not a query vote.
-        local_start = (24, 8, 16)[rank]
+        # Native L2 progression keeps the local start equal across PP stages.
+        local_start = 8
         c._storage_hit_query.side_effect = lambda op: case.query_hits(
             op, 0 if op.request_id == "miss" and rank == 1 else (12, 32, 20)[rank]
         )
         if rank == 0:
-            case.register_cache_query("hit")
-            local = case.bind_cache_query("hit", start=local_start)
-            case.register_cache_query("miss")
-            # PP0 submits "miss" even without a local prefetch operation.
+            local = case.submit_cache_query("hit", start=local_start)
+            missed = case.submit_cache_query("miss")
             c.pp_prefetch_command_queue.put(None)
         c.pp_prefetch_command_thread_func()
         if rank != 0:
             # The shared query arrived before this stage's native request.
-            case.register_cache_query("hit")
-            local = case.bind_cache_query("hit", start=local_start)
-            case.register_cache_query("miss")
-            if rank != 2:
-                missed = case.bind_cache_query("miss")
+            local = case.submit_cache_query("hit", start=local_start)
+            missed = case.submit_cache_query("miss")
         hit = c.prefetch_hit_queue.get_nowait()
         assert hit.operation.storage_hit_count == 12
         assert c.resolve_cache_query(hit) is local
-        expected_suffix = (0, 4, 0)[rank]
+        expected_suffix = 4
         assert local.storage_hit_count == expected_suffix
         assert (
             local.all_hash_values == hit.operation.all_hash_values[local_start // 4 :]
         )
         assert local.hash_value == local.all_hash_values[: expected_suffix // 4]
-        if rank == 1:
-            assert c.resolve_cache_query(c.prefetch_hit_queue.get_nowait()) is missed
-            assert missed.storage_hit_count == 0
-        else:
-            assert c.resolve_cache_query(c.prefetch_hit_queue.get_nowait()) is None
-        # PP0 and PP2 joined the second query without a local GET.
+        assert c.resolve_cache_query(c.prefetch_hit_queue.get_nowait()) is missed
+        # S_min=0 even though the local L1/L2 prefix is still present.
+        assert missed.storage_hit_count == 0
         assert c.prefetch_hit_queue.empty()
         assert not c.pp_prefetch_states
         c.mem_pool_host.alloc.assert_not_called()
@@ -173,6 +166,8 @@ class TestPPPrefetchTicket(unittest.TestCase):
         cache.root_node_handle = Mock(return_value=0)
         cache.buffer_pipeline = Mock(spec=BufferModePipeline)
         cache._handle_prefetch_result = Mock()
+        cache.tree_components = []
+        cache._build_sidecar_transfers = Mock(return_value=[])
 
     def query_hits(self, operation, hit=8):
         hashes = get_storage_hash_str(
@@ -232,14 +227,8 @@ class TestPPPrefetchTicket(unittest.TestCase):
             acks.append(self.c.prefetch_sync_queue.get_nowait())
         return acks
 
-    def register_cache_query(self, rid="hit", attempt=0):
-        self.c.register_cache_query(
-            CacheRequestHandle(rid, 0), RadixKey(array("q", range(32))), [], attempt
-        )
-        return self.c.pp_cache_query.ticket
-
-    def bind_cache_query(self, rid="hit", *, start=8):
-        return self.c.submit_prefetch(
+    def submit_cache_query(self, rid="hit", *, start=8, attempt=0):
+        operation = self.c.submit_prefetch(
             CacheRequestHandle(rid, 0),
             RadixKey(array("q", range(start, 32))),
             "anchor",
@@ -248,6 +237,8 @@ class TestPPPrefetchTicket(unittest.TestCase):
             [],
             assume_stored=True,
         ).operation
+        self.cache._submit_pp_cache_query(operation, list(range(start)), attempt)
+        return operation
 
     def test_cache_query_binding_in_either_arrival_order(self):
         c = self.c
@@ -257,15 +248,13 @@ class TestPPPrefetchTicket(unittest.TestCase):
             with self.subTest(query_first=query_first):
                 rid = str(query_first)
                 c.storage_config.pp_rank = 0
-                ticket = self.register_cache_query(rid)
-                self.register_cache_query(rid)
-                self.assertIs(c.pp_prefetch_command_queue.get_nowait(), ticket)
+                self.submit_cache_query(rid)
+                ticket = c.pp_prefetch_command_queue.get_nowait()
                 self.assertTrue(c.pp_prefetch_command_queue.empty())
                 c.storage_config.pp_rank = 1
                 if query_first:
                     self.run_commands(ticket)
-                self.register_cache_query(rid)
-                local = self.bind_cache_query(rid)
+                local = self.submit_cache_query(rid)
                 if not query_first:
                     self.run_commands(ticket)
                 result = c.prefetch_hit_queue.get_nowait()
@@ -286,8 +275,7 @@ class TestPPPrefetchTicket(unittest.TestCase):
         c.host_memory_mode = "cache"
         operations = []
         for rid in ("cancelled", "failed", "next"):
-            self.register_cache_query(rid)
-            operations.append(self.bind_cache_query(rid))
+            operations.append(self.submit_cache_query(rid))
         cancelled, failed, following = operations
         c.terminate_prefetch(cancelled)
         self.assertFalse(c.release_pp_prefetch("cancelled"))
@@ -316,15 +304,14 @@ class TestPPPrefetchTicket(unittest.TestCase):
     def test_cache_retry_does_not_overwrite_unconsumed_peer_query(self):
         c = self.c
         c.host_memory_mode = "cache"
+        old = self.submit_cache_query(attempt=0)
+        first = c.pp_prefetch_command_queue.get_nowait()
         c.storage_config.pp_rank = 1
-        first = self.register_cache_query(attempt=0)
-        old = self.bind_cache_query()
         hits = iter((0, 20))
         c._storage_hit_query.side_effect = lambda op: self.query_hits(op, next(hits))
         # PP0 can retry before the peer's scheduler consumes the first result.
         self.run_commands(first, replace(first, cache_attempt=1))
-        self.register_cache_query(attempt=1)
-        new = self.bind_cache_query()
+        new = self.submit_cache_query(attempt=1)
         for operation, expected in ((old, 0), (new, 12)):
             self.assertIs(
                 c.resolve_cache_query(c.prefetch_hit_queue.get_nowait()), operation
@@ -340,6 +327,51 @@ class TestPPPrefetchTicket(unittest.TestCase):
                 args=(str(Path(directory) / "query"),),
                 nprocs=3,
             )
+
+    def test_cache_query_is_bound_only_after_native_submission(self):
+        c, cache = self.c, self.cache
+        c.host_memory_mode = cache.host_memory_mode = "cache"
+        cache.buffer_pipeline = None
+        cache.tree_core.page_size = cache.prefetch_threshold = 4
+        cache.tree_core.prefetch_anchor_info.return_value = (None, None)
+        cache._prefetch_outcome_stats = defaultdict(int)
+        cache.inc_host_lock_ref = Mock()
+        for bigram in (False, True):
+            cache.tree_core.is_eagle = bigram
+            for length, limited in ((2, False), (8, True), (8, False)):
+                with self.subTest(bigram=bigram, length=length, limited=limited):
+                    handle = CacheRequestHandle(str((bigram, length, limited)), 0)
+                    c.prefetch_rate_limited = lambda: limited
+                    tokens = list(range(4, 4 + length + int(bigram)))
+                    cache.inc_host_lock_ref.reset_mock()
+                    cache.prefetch_from_storage(
+                        handle,
+                        0,
+                        tokens,
+                        matched_prefix_tokens=[0, 1, 2, 3],
+                        extra_key="adapter",
+                        cache_salt="tenant",
+                        storage_attempt=2,
+                    )
+                    if length < 4 or limited:
+                        self.assertTrue(c.pp_prefetch_command_queue.empty())
+                        cache.inc_host_lock_ref.assert_not_called()
+                        continue
+                    ticket = c.pp_prefetch_command_queue.get_nowait()
+                    operation = cache.ongoing_prefetch[handle].operation
+                    self.assertIs(
+                        c.pp_prefetch_states[ticket.key].cache_operation, operation
+                    )
+                    self.assertEqual(ticket.cache_attempt, 2)
+                    self.assertEqual(
+                        list(ticket.prefetch_key.raw_token_ids()),
+                        list(range(12 + int(bigram))),
+                    )
+                    self.assertEqual(ticket.prefetch_key.cache_salt, "tenant")
+                    self.assertEqual(operation.storage_start, 4)
+                    # The already-ongoing operation must not issue another query.
+                    cache.prefetch_from_storage(handle, 0, tokens)
+                    self.assertTrue(c.pp_prefetch_command_queue.empty())
 
     def test_query_and_completion_sync_scopes(self):
         c = self.c

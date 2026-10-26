@@ -224,7 +224,7 @@ class TestPrefetchConsensus(unittest.TestCase):
                 nprocs=6,
             )
 
-    def test_reset_ignores_old_wire_results_and_detach_returns_terminal_ownership(self):
+    def test_reset_and_detach_discard_unpublished_results(self):
         controllers = [_controller(i, 3) for i in range(3)]
         inboxes = [deque() for _ in controllers]
         old, new = object(), object()
@@ -249,13 +249,12 @@ class TestPrefetchConsensus(unittest.TestCase):
             self.assertIs(result.operation, new)
             self.assertEqual(result.completed_tokens, 64)
             self.assertTrue(cc.ack_prefetch_queue.empty())
-            # Detach must not publish a newer, unagreed progress ACK; only the
-            # terminal marker returns outstanding tails to native cleanup.
+            # Native detach cleans up operations directly, without ACK drain.
             cc.pp_prefetch_ack_queue.put(PrefetchAck("r", new, completed_tokens=128))
-            terminal = PrefetchAck("r", new, completed_req=True)
-            cc.pp_prefetch_ack_queue.put(terminal)
-            cc.pp_prefetch_consensus.reset(publish_finished=True)
-            self.assertIs(cc.ack_prefetch_queue.get_nowait(), terminal)
+            cc.pp_prefetch_ack_queue.put(PrefetchAck("r", new, completed_req=True))
+            cc.pp_prefetch_consensus.reset()
+            self.assertFalse(cc.pp_prefetch_consensus.pending)
+            self.assertTrue(cc.pp_prefetch_ack_queue.empty())
             self.assertTrue(cc.ack_prefetch_queue.empty())
 
 

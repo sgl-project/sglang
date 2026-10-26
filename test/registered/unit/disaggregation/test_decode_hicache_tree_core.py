@@ -44,6 +44,7 @@ class TestDecodeHiCacheTreeCore(CustomTestCase):
         req = SimpleNamespace(
             rid="req-0",
             cache_request_handle=CacheRequestHandle("req-0", 0),
+            storage_prefetch_retry_attempts=0,
             origin_input_ids=[0, 1, 2, 3, 4, 5, 6, 7],
             extra_key="model",
             cache_salt="tenant-a",
@@ -78,8 +79,10 @@ class TestDecodeHiCacheTreeCore(CustomTestCase):
             [4, 5],
             "h2",
             ["h0", "h1"],
+            matched_prefix_tokens=[0, 1, 2, 3],
             extra_key="model",
             cache_salt="tenant-a",
+            storage_attempt=0,
         )
 
     def test_stale_prefetch_anchor_degrades_to_l2(self):

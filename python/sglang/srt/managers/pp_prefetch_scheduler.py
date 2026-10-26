@@ -61,20 +61,16 @@ class PPPrefetchConsensus:
         self.send_work = deque()
         self.generation = 0
 
-    def reset(self, *, publish_finished=False):
+    def reset(self):
         """Called only after native storage workers have stopped.
 
-        Reset discards the host arena. Detach retains it, so return terminal
-        ACKs to native cleanup, using only the already-agreed operation progress.
+        Native reset/detach owns operation and buffer cleanup. Discard pending
+        ACKs here; detach does not consume the native prefetch ACK queue.
         Keep transport cadence: old packets still need receiving, not applying.
         """
         cc = self.controller
         while not cc.pp_prefetch_ack_queue.empty():
-            self.pending.append(cc.pp_prefetch_ack_queue.get_nowait())
-        if publish_finished:
-            for ack in self.pending:
-                if ack.completed_req:
-                    cc._publish_prefetch_ack(ack)
+            cc.pp_prefetch_ack_queue.get_nowait()
         self.pending.clear()
         self.inflight = False
         self.generation += 1
