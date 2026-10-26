@@ -27,9 +27,9 @@ import unittest
 import torch
 
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
+from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec
 from sglang.srt.mem_cache.unified_memory_pool import (
     MambaSubPoolSpec,
-    MLASubPoolSpec,
     UnifiedKVPool,
 )
 from sglang.test.ci.ci_register import register_cpu_ci

@@ -19,6 +19,7 @@ import torch
 
 from sglang.srt.mem_cache import memory_pool as mem_pool
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
+from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec
 from sglang.srt.mem_cache.layout.fused_draft import (
     DenseDraftRegion,
     DraftStateGeometry,
@@ -34,7 +35,6 @@ from sglang.srt.mem_cache.unified_draft_pool import (
 )
 from sglang.srt.mem_cache.unified_memory_pool import (
     MambaSubPoolSpec,
-    MLASubPoolSpec,
     UnifiedKVPool,
     UnifiedMambaPool,
     UnifiedMHATokenToKVPool,

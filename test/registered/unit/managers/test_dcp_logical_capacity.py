@@ -11,11 +11,11 @@ from sglang.srt.mem_cache.allocator.page_interleave import PageInterleavePoolAll
 from sglang.srt.mem_cache.allocator.unified_mamba import (
     UnifiedMambaTokenToKVPoolAllocator,
 )
+from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec
 from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.unified_memory_pool import (
     MambaSubPoolSpec,
-    MLASubPoolSpec,
     UnifiedKVPool,
 )
 from sglang.srt.model_executor.model_runner import ModelRunner
