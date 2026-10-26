@@ -185,7 +185,9 @@ sglang serve                         \
 | Parallelism | Expert parallelism over the TP ranks of one node (`--ep-size` equal to `--tp`). DP attention, two- and single-batch overlap, elastic EP and multiple nodes are rejected at startup |
 | MoE weights | BF16 only; quantized MoE is rejected |
 | Dispatch mode | Low latency; `--deepep-mode auto` resolves to it |
-| GPUs | Validated on Intel Arc Pro B60 (Xe2 / BMG). The GPUs need peer-to-peer access, and the ranks must share a host and PID namespace |
+| Batch size | Prefill chunks and running requests are capped at `SGLANG_MOONCAKE_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK` (default 128) times `--tp`, i.e. 512 at TP4. Raise the variable (up to 1024) for larger batches, at the cost of a larger EP buffer |
+| XPU graphs | Not validated with Mooncake EP; they are off by default on XPU |
+| GPUs | Validated on 4x Intel Arc Pro B60 (Xe2 / BMG) with Qwen/Qwen3-30B-A3B. The GPUs need peer-to-peer access, and the ranks must share a host and PID namespace |
 
 ## Benchmarking with Requests
 
