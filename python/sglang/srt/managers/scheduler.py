@@ -1403,7 +1403,13 @@ class Scheduler(
 
         # A small running batch admits prefill every round so it can grow;
         # the interval only protects decode once the batch is large enough.
-        if running_batch.batch_size() < self.prefill_decode_interval_min_bs:
+        # With nothing decoding there is no decode to protect, and waiting only
+        # idles the GPU between chunks. DP attention keeps the synchronized
+        # cadence because peer ranks may still be decoding.
+        nothing_decodes = running_batch.is_empty() or running_batch.is_prefill_only
+        if running_batch.batch_size() < self.prefill_decode_interval_min_bs or (
+            nothing_decodes and not self.require_mlp_sync
+        ):
             self._prefill_decode_interval_remaining = 0
             return False
 
