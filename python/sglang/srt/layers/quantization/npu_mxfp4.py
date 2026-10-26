@@ -2,8 +2,8 @@
 
 Triggered by ``--quantization mxfp_w4a8``.
 
-Online mode: FP16/BF16 weights are quantised to MXFP4 in
-``process_weights_after_loading``; activations are dynamically quantised to
+Online mode: FP16/BF16 weights allocate lazily and are quantised to MXFP4
+as soon as each logical weight finishes loading; activations are dynamically quantised to
 MXFP8 (``float8_e4m3fn`` + UE8M0 block scale) at inference time. Linear layers
 run through ``npu_quant_matmul`` with FP4 weights, MoE experts through the
 grouped matmuls in ``NPUW4A8MXFP4MoEMethod``.

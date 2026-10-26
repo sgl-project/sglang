@@ -18,6 +18,9 @@ from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
     NPUMXFP8MoEMethod,
     NPUW4A8MXFP4MoEMethod,
 )
+from sglang.srt.hardware_backend.npu.quantization.online_weight_loader import (
+    NPUOnlineMoEWeightLoader,
+)
 from sglang.srt.layers.moe.moe_runner import MoeRunner
 from sglang.srt.layers.moe.utils import MoeRunnerBackend, get_moe_runner_backend
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
@@ -71,15 +74,55 @@ class NPUMXFP8OnlineMoEMethod(UnquantizedFusedMoEMethod):
 class NPUW4A8MXFP4OnlineMoEMethod(UnquantizedFusedMoEMethod):
     """Online W4A8 MXFP FusedMoE entry point (``--quantization mxfp_w4a8``).
 
-    Same shape as ``NPUMXFP8OnlineMoEMethod``: weight creation, post-load
-    orchestration and the forward pass are the unquantized Ascend path, and only
-    the per-gmm kernel differs. ``NPUW4A8MXFP4MoEMethod`` then quantizes the BF16
-    expert weights to packed MXFP4 in ``process_weights_after_loading``.
+    W13 and W2 allocate lazily and convert independently as soon as all local
+    shards arrive. The final pass only validates completion; inference keeps
+    using the existing packed MXFP4 kernels and unquantized MoE orchestration.
     """
 
     def __init__(self, quant_config: Optional["QuantizationConfig"] = None):
         super().__init__()
         self.quant_config = quant_config
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        with_bias: bool = False,
+        **extra_weight_attrs,
+    ):
+        load_device = torch.get_default_device()
+        original_loader = extra_weight_attrs["weight_loader"]
+        loader = NPUOnlineMoEWeightLoader(layer, params_dtype, original_loader)
+        # Reuse the unquantized shapes/attributes without allocating the entire
+        # local floating-point model. Ignored layers never enter this subclass.
+        with torch.device("meta"):
+            super().create_weights(
+                layer,
+                num_experts,
+                hidden_size,
+                intermediate_size_per_partition,
+                params_dtype,
+                with_bias=with_bias,
+                **{**extra_weight_attrs, "weight_loader": loader.weight_loader},
+            )
+        if with_bias:
+            for prefix in ("w13", "w2"):
+                name = f"{prefix}_weight_bias"
+                bias = getattr(layer, name)
+                materialized = torch.nn.Parameter(
+                    torch.empty_like(bias, device=load_device), requires_grad=False
+                )
+                materialized.__dict__.update(bias.__dict__)
+                materialized.weight_loader = original_loader
+                setattr(layer, name, materialized)
+        loader.register_sources()
+        layer._npu_online_moe_loader = loader
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        layer._npu_online_moe_loader.finish_post_load()
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"

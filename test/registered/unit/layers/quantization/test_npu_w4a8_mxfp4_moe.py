@@ -85,7 +85,11 @@ class TestNPUW4A8MXFP4MoE(CustomTestCase):
                 runner.assert_called_once_with(MoeRunnerBackend.ASCEND, config)
                 self.assertIsNone(method._aiter_runner)
                 layer.moe_runner_config = config
-                method.create_weights(layer, 2, 128, 64, torch.bfloat16)
+                method.create_weights(
+                    layer, 2, 128, 64, torch.bfloat16, weight_loader=Mock()
+                )
+                self.assertTrue(layer.w13_weight.is_meta)
+                self.assertTrue(layer.w2_weight.is_meta)
                 self.assertEqual(layer.w13_weight.shape, (2, 128, 128))
                 self.assertEqual(layer.w2_weight.shape, (2, 128, 64))
                 self.assertEqual(layer.w13_weight.dtype, torch.bfloat16)

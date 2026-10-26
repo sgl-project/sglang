@@ -460,15 +460,10 @@ class NPUMXFP4W4A8LinearMethod(_NPULinearMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        """Register an unquantized (``params_dtype``) weight placeholder.
-
-        Online quantization needs its own ``create_weights`` because the
-        checkpoint still holds full-precision BF16/FP16 weights: the loader
-        fills this buffer, then ``process_weights_after_loading`` quantizes it to
-        MXFP4 in place. This differs from the offline/int8 methods, whose weights
-        are created by the scheme's own ``create_weights`` to match the
-        already-quantized (FP8 / uint8-packed) layout the checkpoint provides.
-        """
+        """Allocate lazily and convert as soon as the logical weight is loaded."""
+        from sglang.srt.hardware_backend.npu.quantization.online_weight_loader import (
+            NPUOnlineDenseWeightLoader,
+        )
         from sglang.srt.layers.parameter import ModelWeightParameter
 
         output_size_per_partition = sum(output_partition_sizes)
@@ -479,21 +474,30 @@ class NPUMXFP4W4A8LinearMethod(_NPULinearMethodBase):
         layer.output_size_per_partition = output_size_per_partition
         layer.orig_dtype = params_dtype
 
-        # Load weights in original dtype; quantise to MXFP4 in
-        # process_weights_after_loading.
+        loader = NPUOnlineDenseWeightLoader(
+            layer, params_dtype, weight_loader, lambda: self._quantize_weights(layer)
+        )
         weight = ModelWeightParameter(
             data=torch.empty(
                 output_size_per_partition,
                 input_size_per_partition,
                 dtype=params_dtype,
+                device="meta",
             ),
             input_dim=1,
             output_dim=0,
-            weight_loader=weight_loader,
+            weight_loader=loader.weight_loader,
         )
         layer.register_parameter("weight", weight)
+        loader.register_source(weight)
+        layer._npu_online_dense_loader = loader
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        # Conversion already happened during loading; never repack a prepared
+        # weight or accept a partially loaded/reloaded floating-point source.
+        layer._npu_online_dense_loader.finish_post_load()
+
+    def _quantize_weights(self, layer: torch.nn.Module) -> None:
         # Online single-level MXFP4 weight quant, then lay the weight out exactly
         # like the offline W4A8 path so the same npu_quant_matmul(x2_dtype=fp4)
         # kernel accepts it. All NPU ops go through torch.ops.npu.* (no torch_npu).
