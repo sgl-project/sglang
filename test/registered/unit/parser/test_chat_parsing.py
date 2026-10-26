@@ -29,7 +29,7 @@ from sglang.srt.parser.chat_parsing.response_templates import load_response_temp
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=8, suite="base-a-test-cpu")
+register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 
 cohere_template = {
@@ -1583,6 +1583,14 @@ class ToolArgCoercionTest(unittest.TestCase):
 
     def test_coerce_falls_back_to_raw_on_failure(self):
         self.assertEqual(_coerce("not-a-number", ("integer",)), "not-a-number")
+
+    def test_coerce_integer_accepts_whole_number_floats(self):
+        self.assertEqual(_coerce("3.0", ("integer",)), 3)
+        self.assertIsInstance(_coerce("3.0", ("integer",)), int)
+        self.assertEqual(_coerce("3.5", ("integer",)), "3.5")
+        self.assertEqual(_coerce("3.5", ("integer", "number")), 3.5)
+        self.assertEqual(_coerce("inf", ("integer",)), "inf")
+        self.assertEqual(_coerce("NaN", ("integer",)), "NaN")
 
     def test_coerce_handles_any_of_and_null(self):
         self.assertEqual(_coerce("5", ("integer", "null")), 5)

@@ -57,11 +57,8 @@ def _jit_hopper_bf16_gemv_module(n: int, k: int) -> Module:
 
 def use_hopper_bf16_gemv(m: int, n: int, k: int) -> bool:
     if _is_sm12x():
-        # SM120 (GDDR7): kUnroll==1 needs only 16B-aligned K (128 kept for
-        # vector-alignment margin). cuBLAS M=1 bf16 trails the streaming GEMV
-        # on small/odd N and very wide N; the 12288..32768 window (e.g. the
-        # 18560-row bf16 in_proj) already runs at the DRAM ceiling under
-        # cuBLAS, so leave it there.
+        # SM12x: kUnroll==1 needs only 16B-aligned K (128 for margin);
+        # 12288 <= N < 32768 stays on cuBLAS, which already saturates DRAM there.
         if not (
             m == 1
             and k % 128 == 0
@@ -79,6 +76,10 @@ def use_hopper_bf16_gemv(m: int, n: int, k: int) -> bool:
         and 64 <= n <= _MAX_N
     ):
         return False
+    # At K=5120, N=64..512 ran 7-10% slower than cuBLAS on H200;
+    # 64x512, 2048x4096 and 2048x17408 ran faster, 1024x4096 tied.
+    if k == 5120 and n <= 512:
+        return False
     # cuBLAS already runs at ~3.9 TB/s for mid-large N around 16K; the wins
     # concentrate where its tiling underutilizes DRAM (small/odd N) and very
     # wide N. Measured on H200 against cuBLAS 12.x.
@@ -86,7 +87,10 @@ def use_hopper_bf16_gemv(m: int, n: int, k: int) -> bool:
 
 
 def hopper_bf16_gemv(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
-    """y[1, N] = x[1, K] @ w[N, K]^T, all bf16, fp32 accumulation."""
+    """y[1, N] = x[1, K] @ w[N, K]^T, all bf16, fp32 accumulation.
+
+    x and w must be contiguous with 16-byte-aligned data pointers.
+    """
     out = torch.empty((1, w.shape[0]), dtype=x.dtype, device=x.device)
     module = _jit_hopper_bf16_gemv_module(w.shape[0], w.shape[1])
     module.run(x, w, out)
