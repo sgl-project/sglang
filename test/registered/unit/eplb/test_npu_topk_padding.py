@@ -42,7 +42,7 @@ class TestNpuTopKPadding(unittest.TestCase):
             (hash_topk, "_is_npu", True),
             (hash_topk, "_is_xpu", False),
             (distribution, "get_device", "cpu"),
-            (distribution, "_use_npu_sender_statistics", True),
+            (distribution, "get_device_namespace", SimpleNamespace(device="npu")),
         ):
             item = (
                 patch.object(module, attr, return_value=value)

@@ -39,10 +39,7 @@ import torch
 import torch.distributed
 
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.npu.eplb import (
-    BatchedTopKStatisticsMixin,
-    get_eplb_device_group,
-)
+from sglang.srt.hardware_backend.npu.eplb import get_eplb_device_group
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_EXPERT_DISPATCH,
@@ -119,10 +116,6 @@ def _is_model_capture_mode() -> bool:
 
 _OutputMode = Literal["file", "object"]
 EPLB_BALANCEDNESS_WINDOW_SIZES = (10, 100, 1000)
-
-
-def _use_npu_sender_statistics():
-    return get_device_namespace().device == "npu"
 
 
 @dataclass
@@ -454,12 +447,14 @@ class _SinglePassGatherer(ABC):
                 raise NotImplementedError
 
         if get_exec().moe.moe_a2a_backend == "deepep":
-            if _use_npu_sender_statistics():
+            if get_device_namespace().device == "npu":
+                from sglang.srt.hardware_backend.npu.eplb_statistics import (
+                    NpuExpertDistributionGatherer,
+                )
+
                 # Ascend receiver counts include graph padding; count valid
                 # sender routes instead.
-                return _NpuBatchedSelectExpertsSinglePassGatherer(
-                    expert_location_metadata, rank
-                )
+                return NpuExpertDistributionGatherer(expert_location_metadata, rank)
             if get_exec().moe.deepep_mode == "normal":
                 return _SelectExpertsSinglePassGatherer(expert_location_metadata, rank)
             elif get_exec().moe.deepep_mode == "low_latency":
@@ -683,12 +678,6 @@ class _SelectExpertsSinglePassGatherer(_LayerBasedGpuSinglePassGatherer):
         self._data[layer_idx, :].scatter_add_(
             dim=0, index=topk_ids.masked_fill(~mask, 0).long(), src=mask.int()
         )
-
-
-class _NpuBatchedSelectExpertsSinglePassGatherer(
-    BatchedTopKStatisticsMixin, _SelectExpertsSinglePassGatherer
-):
-    pass
 
 
 class _DeepepNormalSinglePassGatherer(_LayerBasedCpuSinglePassGatherer):

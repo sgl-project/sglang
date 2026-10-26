@@ -7,6 +7,9 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.eplb import expert_distribution as distribution
+from sglang.srt.hardware_backend.npu.eplb_statistics import (
+    NpuExpertDistributionGatherer,
+)
 from sglang.srt.runtime_context import publish
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -22,7 +25,11 @@ class TestNpuExpertDistribution(unittest.TestCase):
         self.configure()
         for item in (
             patch.object(distribution, "get_device", return_value="cpu"),
-            patch.object(distribution, "_use_npu_sender_statistics", return_value=True),
+            patch.object(
+                distribution,
+                "get_device_namespace",
+                return_value=SimpleNamespace(device="npu"),
+            ),
         ):
             item.start()
             self.addCleanup(item.stop)
@@ -54,7 +61,7 @@ class TestNpuExpertDistribution(unittest.TestCase):
                 self.configure(mode)
                 self.assertIs(
                     type(self.gatherer()),
-                    distribution._NpuBatchedSelectExpertsSinglePassGatherer,
+                    NpuExpertDistributionGatherer,
                 )
 
     def test_padding_and_invalid_routes_are_ignored(self):
@@ -127,7 +134,9 @@ class TestNpuExpertDistribution(unittest.TestCase):
 
     def test_other_devices_keep_existing_factory_behavior(self):
         with patch.object(
-            distribution, "_use_npu_sender_statistics", return_value=False
+            distribution,
+            "get_device_namespace",
+            return_value=SimpleNamespace(device="cpu"),
         ):
             for mode, cls in (
                 ("normal", distribution._SelectExpertsSinglePassGatherer),

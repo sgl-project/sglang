@@ -12,10 +12,9 @@
 # limitations under the License.
 # ==============================================================================
 
-"""Ascend EPLB statistics and communication helpers. Safe to import on CPU."""
+"""Ascend EPLB communication, weight staging and initial scheduling helpers."""
 
 import logging
-import os
 
 import torch
 import torch.distributed as dist
@@ -26,65 +25,6 @@ from sglang.srt.runtime_context import get_device, get_exec, get_parallel
 logger = logging.getLogger(__name__)
 _group_world = None
 _device_group = None
-
-
-class BatchedTopKStatisticsMixin:
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        capacity = int(os.environ.get("SGLANG_NPU_EPLB_STATS_MAX_ROUTES", "96"))
-        if not 1 <= capacity <= 65536:
-            raise ValueError("Invalid batched statistics route capacity")
-        # All captured graphs write to this shared buffer.
-        self._batched_routes = torch.full(
-            (self._data.shape[0], capacity),
-            -1,
-            dtype=torch.int32,
-            device=self._data.device,
-        )
-        self._route_offsets = [0] * self._data.shape[0]
-        self._batch_collected = False
-        self._has_batched_routes = False
-        logger.info("[NPU EPLB batch statistics] capacity=%d routes/layer", capacity)
-
-    def on_graph_capture_forward_start(self):
-        # Capture warmups bypass the normal reset. Reset offsets without
-        # recording a buffer clear into the graph.
-        self._route_offsets = [0] * len(self._route_offsets)
-
-    def get_graph_capture_state(self):
-        return any(self._route_offsets)
-
-    def on_graph_replay_forward_start(self, has_batched_routes):
-        # Graph replay does not call the Python on_select_experts hook.
-        self._has_batched_routes |= has_batched_routes
-
-    def reset(self):
-        super().reset()
-        if self._has_batched_routes:
-            self._batched_routes.fill_(-1)
-        self._route_offsets = [0] * self._data.shape[0]
-        self._batch_collected = False
-        self._has_batched_routes = False
-
-    def on_select_experts(self, layer_idx, topk_ids):
-        count = topk_ids.numel()
-        start = self._route_offsets[layer_idx]
-        end = start + count
-        if end > self._batched_routes.shape[1]:
-            # Count overflow directly; collect() adds any earlier buffered calls.
-            return super().on_select_experts(layer_idx, topk_ids)
-        self._batched_routes[layer_idx, start:end].copy_(topk_ids.flatten())
-        self._route_offsets[layer_idx] = end
-        if count:
-            self._has_batched_routes = True
-
-    def collect(self):
-        if self._has_batched_routes and not self._batch_collected:
-            ids = self._batched_routes
-            mask = (ids >= 0) & (ids < self._data.shape[1])
-            self._data.scatter_add_(1, ids.masked_fill(~mask, 0).long(), mask.int())
-            self._batch_collected = True
-        return super().collect()
 
 
 def get_eplb_device_group():
@@ -153,3 +93,45 @@ def get_initial_rebalance_iterations(steady_iterations):
     ):
         return 64
     return None
+
+
+def filter_unchanged_layers(layer_ids, old_map, new_map, *, elastic_enabled):
+    if get_device().device != "npu" or elastic_enabled:
+        return layer_ids
+    # Check global maps: an unchanged local rank may still be a sender.
+    return [
+        layer for layer in layer_ids if not torch.equal(old_map[layer], new_map[layer])
+    ]
+
+
+def create_temp_buffers(sample_tensors):
+    return [
+        torch.empty(tensor.shape, dtype=tensor.dtype, device=tensor.device)
+        if needs_nd_staging(tensor)
+        else torch.empty_like(tensor)
+        for tensor in sample_tensors
+    ]
+
+
+class ExpertWeightStaging:
+    """Reuse one ND layer workspace and write back into original model storage."""
+
+    def __init__(self, sample_tensors):
+        # Per-expert NZ conversion can copy the whole backing tensor.
+        self.buffers = (
+            create_temp_buffers(sample_tensors)
+            if any(needs_nd_staging(tensor) for tensor in sample_tensors)
+            else None
+        )
+
+    def load(self, weights):
+        if self.buffers is None:
+            return weights
+        for buffer, weight in zip(self.buffers, weights, strict=True):
+            buffer.copy_(weight)
+        return self.buffers
+
+    def store(self, weights):
+        if self.buffers is not None:
+            for weight, buffer in zip(weights, self.buffers, strict=True):
+                weight.copy_(buffer)

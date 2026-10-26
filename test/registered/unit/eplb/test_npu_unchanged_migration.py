@@ -7,6 +7,7 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.eplb import expert_location_updater as updater
+from sglang.srt.hardware_backend.npu import eplb as npu_eplb
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
@@ -21,7 +22,7 @@ class TestNpuUnchangedMigration(unittest.TestCase):
         weights = {layer: [torch.full((4, 2), layer)] for layer in range(len(old))}
         with (
             patch.object(
-                updater, "get_device", return_value=SimpleNamespace(device=device)
+                npu_eplb, "get_device", return_value=SimpleNamespace(device=device)
             ),
             patch.object(
                 updater.ElasticEPStateManager, "instance", return_value=elastic

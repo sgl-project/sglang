@@ -8,6 +8,9 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.eplb import expert_distribution as distribution
+from sglang.srt.hardware_backend.npu.eplb_statistics import (
+    NpuExpertDistributionGatherer,
+)
 from sglang.srt.hardware_backend.npu.graph_runner.npu_cudagraph_backend import (
     NPUCudaGraphBackend,
 )
@@ -29,9 +32,7 @@ class TestNpuBatchedStatistics(unittest.TestCase):
         with patch.dict(
             os.environ, {"SGLANG_NPU_EPLB_STATS_MAX_ROUTES": str(capacity)}
         ):
-            return distribution._NpuBatchedSelectExpertsSinglePassGatherer(
-                self.metadata, 0
-            )
+            return NpuExpertDistributionGatherer(self.metadata, 0)
 
     def oracle(self, calls):
         expected = torch.zeros(2, 8, dtype=torch.int32)

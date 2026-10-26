@@ -27,8 +27,10 @@ from sglang.srt.eplb.expert_location import (
     get_global_expert_location_metadata,
 )
 from sglang.srt.hardware_backend.npu.eplb import (
+    ExpertWeightStaging,
+    create_temp_buffers,
+    filter_unchanged_layers,
     get_eplb_device_group,
-    needs_nd_staging,
     stage_p2p_ops,
 )
 from sglang.srt.runtime_context import get_device
@@ -150,26 +152,18 @@ def _update_expert_weights_raw(
 ):
     log_metrics = get_bool_env_var("SGLANG_EXPERT_LOCATION_UPDATER_LOG_METRICS")
 
-    if get_device().device == "npu" and ElasticEPStateManager.instance() is None:
-        # Compare full maps: an unchanged local rank may still be a sender.
-        update_layer_ids = [
-            layer_id
-            for layer_id in update_layer_ids
-            if not torch.equal(
-                old_expert_location_metadata.physical_to_logical_map_cpu[layer_id],
-                new_expert_location_metadata.physical_to_logical_map_cpu[layer_id],
-            )
-        ]
-        if not update_layer_ids:
-            return {}
+    update_layer_ids = filter_unchanged_layers(
+        update_layer_ids,
+        old_expert_location_metadata.physical_to_logical_map_cpu,
+        new_expert_location_metadata.physical_to_logical_map_cpu,
+        elastic_enabled=ElasticEPStateManager.instance() is not None,
+    )
+    if not update_layer_ids:
+        return {}
 
     sample_tensors = routed_experts_weights_of_layer[update_layer_ids[0]]
     temp_buffers = create_temp_buffers(sample_tensors)
-    layer_buffers = None
-    if any(needs_nd_staging(tensor) for tensor in sample_tensors):
-        # Per-expert NZ conversion can copy the whole backing tensor.
-        # Stage one layer at a time and reuse ordinary buffers.
-        layer_buffers = create_temp_buffers(sample_tensors)
+    weight_staging = ExpertWeightStaging(sample_tensors)
 
     world_size = torch.distributed.get_world_size()
     num_local_physical_experts = old_expert_location_metadata.num_local_physical_experts
@@ -180,13 +174,8 @@ def _update_expert_weights_raw(
     for layer_id in update_layer_ids:
         missing_logical_experts_info: List[int] = []
         model_weights = routed_experts_weights_of_layer[layer_id]
-        if layer_buffers is not None:
-            for buffer, weight in zip(layer_buffers, model_weights, strict=True):
-                buffer.copy_(weight)
         update_expert_weights_single_layer(
-            routed_experts_weights=(
-                layer_buffers if layer_buffers is not None else model_weights
-            ),
+            routed_experts_weights=weight_staging.load(model_weights),
             temp_buffers=temp_buffers,
             old_physical_to_logical_map=old_expert_location_metadata.physical_to_logical_map_cpu[
                 layer_id
@@ -201,21 +190,10 @@ def _update_expert_weights_raw(
             missing_logical_experts_info=missing_logical_experts_info,
             log_metrics=log_metrics,
         )
-        if layer_buffers is not None:
-            for weight, buffer in zip(model_weights, layer_buffers, strict=True):
-                weight.copy_(buffer)
+        weight_staging.store(model_weights)
         if len(missing_logical_experts_info) > 0:
             missing_logical_experts_by_layers[layer_id] = missing_logical_experts_info
     return missing_logical_experts_by_layers
-
-
-def create_temp_buffers(sample_tensors):
-    return [
-        torch.empty(tensor.shape, dtype=tensor.dtype, device=tensor.device)
-        if needs_nd_staging(tensor)
-        else torch.empty_like(tensor)
-        for tensor in sample_tensors
-    ]
 
 
 def update_expert_weights_single_layer(
