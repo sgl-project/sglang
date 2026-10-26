@@ -87,6 +87,8 @@ class PoolName(str, Enum):
 
     KV = "kv"
     MAMBA = "mamba"
+    # Per-slot states registered beside the Mamba state (e.g. Qwen4-Exp PLE).
+    MAMBA_SLOT_STATE = "mamba_slot_state"
     SWA = "swa"
     AUXILIARY_SWA = "auxiliary_swa"
     INDEXER = "indexer"
