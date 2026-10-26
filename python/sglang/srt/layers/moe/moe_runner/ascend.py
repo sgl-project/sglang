@@ -9,7 +9,7 @@ import torch
 
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.npu.moe import dispatch as ascend_dispatch
+from sglang.srt.hardware_backend.npu.moe import standard_dispatch as ascend_dispatch
 from sglang.srt.hardware_backend.npu.moe.activation import (
     AllGatherActivationWrapper,
     NPUGeluAndMul,
