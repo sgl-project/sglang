@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Single-launch MoE sorting (+ stage1 mxfp8 activation quant) for decode-sized
 batches on the aiter MoE runner, installed as runtime patches on ``aiter.fused_moe``.
-Sorts this module's kernels do not cover go to moe_sort_quant's one-launch sort (+ stage1
-MXFP4 activation quant) when it supports them, larger ones that come with that quant to
-moe_sort_quant_large, else to aiter.
+A sort these kernels do not cover goes to moe_sort_quant (one launch, + stage1 MXFP4
+activation quant) when that supports it, to moe_sort_quant_large when it is larger and
+carries the MXFP4 quant, and otherwise to aiter.
 
 Output layouts match the aiter kernels bit-for-bit:
   sorted_ids[i]        = (topk_slot << 24) | token   (padding: (topk << 24) | M)
@@ -556,8 +556,9 @@ _presorted: ContextVar[tuple | None] = ContextVar(
 def presorted_moe_sort(
     topk_ids: torch.Tensor, sorted_bufs: tuple, *, num_experts: int, block_size: int
 ):
-    """Hand `sorted_bufs` = (sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf), aiter's
-    moe_sorting of `topk_ids` with moe_buf unfilled, to the next matching aiter sort in the block."""
+    """Hand `sorted_bufs`, aiter's moe_sorting of `topk_ids` with moe_buf unfilled, to the
+    next matching aiter sort in the block: (sorted_ids, sorted_weights, sorted_expert_ids,
+    num_valid_ids, moe_buf)."""
     token = _presorted.set((topk_ids, num_experts, block_size, sorted_bufs))
     try:
         yield

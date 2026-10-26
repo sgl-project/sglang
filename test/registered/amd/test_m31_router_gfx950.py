@@ -190,8 +190,8 @@ class TestM31Router(CustomTestCase):
             self._assert_matches_chain(out, self._chain(x))
 
     def test_build_is_cached_across_loads(self):
-        """Every rank of every start loaded a fresh hipcc build from its own temp dir; one
-        build per source must serve them all and leave nothing else behind."""
+        """One hipcc build per source serves every later load (restarts, other ranks) and
+        leaves nothing else in the cache."""
         import subprocess
         import tempfile
         from unittest.mock import patch
