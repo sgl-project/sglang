@@ -42,12 +42,34 @@ _fp8_quant_import_error: Optional[BaseException] = None
 sglang_per_token_group_quant_fp8 = None
 
 
+def _import_deepep_v25():
+    # sgl-deep-ep-v25 ships DeepEP 2.5 as `deep_ep_v25`, next to sgl-deep-ep
+    # (`deep_ep`: V1 + DeepEP 2.1). Returns None when it is not installed.
+    try:
+        from deep_ep_v25 import EPBuffer
+    except ModuleNotFoundError as exc:
+        if exc.name == "deep_ep_v25":
+            return None
+        raise
+    return EPBuffer
+
+
 try:
     try:
-        # DeepEP >= 2.5 renamed ElasticBuffer to EPBuffer; dispatch/combine are unchanged.
-        from deep_ep import EPBuffer as ElasticBuffer
-    except ImportError:
-        from deep_ep import ElasticBuffer
+        ElasticBuffer = _import_deepep_v25()
+    except Exception as exc:  # deep_ep_v25's import-time host checks
+        logger.warning(
+            "sgl-deep-ep-v25 is installed but failed to import; falling back to "
+            "deep_ep: %s",
+            exc,
+        )
+        ElasticBuffer = None
+    if ElasticBuffer is None:
+        try:
+            # DeepEP >= 2.5 renamed ElasticBuffer to EPBuffer; dispatch/combine are unchanged.
+            from deep_ep import EPBuffer as ElasticBuffer
+        except ImportError:
+            from deep_ep import ElasticBuffer
 
     use_deepep_v2 = True
 except Exception as exc:  # deep_ep's import-time host checks; see deepep.py
@@ -103,8 +125,8 @@ def _raise_deepep_v2_import_error() -> None:
         else ""
     )
     raise ImportError(
-        "DeepEP v2 (ElasticBuffer) is not available. Install DeepEP v2 from "
-        "https://github.com/deepseek-ai/DeepEP." + detail
+        "DeepEP v2 (ElasticBuffer) is not available. Install sgl-deep-ep-v25 "
+        "(DeepEP 2.5) or sgl-deep-ep (DeepEP 2.1)." + detail
     )
 
 

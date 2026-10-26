@@ -118,16 +118,24 @@ class TestDeepEPv2BufferLifecycle(CustomTestCase):
             self.assertEqual(deepep_v2.DeepEPv2Buffer.num_sms(), 0)
 
     def test_deepep_2_5_epbuffer_is_preferred(self):
-        """DeepEP 2.5 renamed ElasticBuffer to EPBuffer; 2.1 only has ElasticBuffer."""
+        """deep_ep_v25 (sgl-deep-ep-v25) wins, then deep_ep's EPBuffer, then 2.1's ElasticBuffer."""
         import importlib
         import sys
         import types
 
-        def _reload_with(**names):
-            fake = types.ModuleType("deep_ep")
-            fake.__dict__.update(names)
-            with patch.dict(sys.modules, {"deep_ep": fake}):
-                return importlib.reload(deepep_v2).ElasticBuffer
+        def _module(name, **names):
+            module = types.ModuleType(name)
+            module.__dict__.update(names)
+            return module
+
+        def _reload_with(v25, **names):
+            # None in sys.modules makes `import deep_ep_v25` raise ModuleNotFoundError.
+            modules = {"deep_ep_v25": v25, "deep_ep": _module("deep_ep", **names)}
+            with patch.dict(sys.modules, modules):
+                return importlib.reload(deepep_v2)
+
+        class _V25:
+            pass
 
         class _EP25:
             pass
@@ -136,8 +144,17 @@ class TestDeepEPv2BufferLifecycle(CustomTestCase):
             pass
 
         try:
-            self.assertIs(_reload_with(EPBuffer=_EP25, ElasticBuffer=_Elastic21), _EP25)
-            self.assertIs(_reload_with(ElasticBuffer=_Elastic21), _Elastic21)
+            v25 = _module("deep_ep_v25", EPBuffer=_V25)
+            module = _reload_with(v25, ElasticBuffer=_Elastic21)
+            self.assertIs(module.ElasticBuffer, _V25)
+            module = _reload_with(None, EPBuffer=_EP25, ElasticBuffer=_Elastic21)
+            self.assertIs(module.ElasticBuffer, _EP25)
+            module = _reload_with(None, ElasticBuffer=_Elastic21)
+            self.assertIs(module.ElasticBuffer, _Elastic21)
+            # An installed deep_ep_v25 without EPBuffer falls back to deep_ep.
+            module = _reload_with(_module("deep_ep_v25"), ElasticBuffer=_Elastic21)
+            self.assertIs(module.ElasticBuffer, _Elastic21)
+            self.assertTrue(module.use_deepep_v2)
         finally:
             importlib.reload(deepep_v2)
 
@@ -229,7 +246,7 @@ class TestDeepEPv2BufferLifecycle(CustomTestCase):
 
     def test_unavailable_deepep_fails_before_state_creation(self):
         with patch.object(deepep_v2, "use_deepep_v2", False):
-            with self.assertRaisesRegex(ImportError, "github.com/deepseek-ai/DeepEP"):
+            with self.assertRaisesRegex(ImportError, "Install sgl-deep-ep-v25"):
                 self._get()
         self.assertNotIn(
             deepep_v2.DeepEPv2Buffer._STATE_KEY,
