@@ -25,6 +25,7 @@ from __future__ import annotations
 import copy
 import logging
 import pickle
+import time
 import uuid
 from array import array
 from collections import Counter
@@ -2743,6 +2744,54 @@ def sock_recv(socket: zmq.Socket, flags: int = 0) -> Any:
 
     data = socket.recv(flags=flags)
     return msgpack_decode(data)
+
+
+_IPC_TIMESTAMP_FRAME_BYTES = 8
+
+
+def sock_send_with_timestamp(socket: zmq.Socket, obj: Any, flags: int = 0) -> None:
+    """Send an IPC payload with a pre-serialization monotonic timestamp.
+
+    The timestamp follows the payload only for the metrics-enabled
+    scheduler-to-detokenizer-router path. Encoding completes before the
+    atomic multipart send starts.
+    """
+    send_time_ns = time.monotonic_ns()
+    if _USE_PICKLE_IPC:
+        payload = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
+    else:
+        payload = msgpack_encode(obj)
+    socket.send_multipart(
+        [
+            payload,
+            send_time_ns.to_bytes(_IPC_TIMESTAMP_FRAME_BYTES, byteorder="big"),
+        ],
+        flags=flags,
+    )
+
+
+def sock_recv_with_timestamp(
+    socket: zmq.Socket, flags: int = 0
+) -> Tuple[Optional[int], Any]:
+    """Receive a timestamped payload, accepting legacy single-frame IPC.
+
+    A legacy sender is decoded normally and returns ``None`` for the send
+    timestamp, so the delivery histogram simply omits that observation.
+    """
+    # Keep payload decoding in the existing IPC codec; metadata is only bytes.
+    obj = sock_recv(socket, flags=flags)
+    if not socket.getsockopt(zmq.RCVMORE):
+        return None, obj
+
+    timestamp_frame = socket.recv(flags=flags)
+    if socket.getsockopt(zmq.RCVMORE):
+        raise ValueError("Expected at most two frames in a timestamped IPC message")
+    if len(timestamp_frame) != _IPC_TIMESTAMP_FRAME_BYTES:
+        raise ValueError(
+            "Invalid timestamp frame length: "
+            f"{len(timestamp_frame)} (expected {_IPC_TIMESTAMP_FRAME_BYTES})"
+        )
+    return int.from_bytes(timestamp_frame, byteorder="big"), obj
 
 
 async def async_sock_send(socket: zmq.asyncio.Socket, obj: Any, flags: int = 0) -> None:

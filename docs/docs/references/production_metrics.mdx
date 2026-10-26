@@ -7,6 +7,14 @@ SGLang exposes the following metrics via Prometheus. You can enable it by adding
 
 An example of the monitoring dashboard is available in [examples/monitoring/grafana.json](https://github.com/sgl-project/sglang/blob/main/examples/monitoring/grafana/dashboards/json/sglang-dashboard.json).
 
+## Scheduler-to-detokenizer-router delivery time
+
+With `--enable-metrics` and more than one detokenizer worker, `sglang:detokenizer_router_delivery_seconds` measures the time from the scheduler's monotonic timestamp taken immediately before payload serialization to the router's monotonic timestamp taken after payload deserialization. It includes serialization, ZMQ send work, IPC queueing, and deserialization.
+
+The router records at most one observation for each scheduler message, before routing, grouping, or control/empty-batch fan-out. It has no request labels. A legacy single-frame message is still routed but has no delivery observation. Metrics-off, single-detokenizer, and `--skip-tokenizer-init` paths retain the original single-frame codec path and do not read a new clock or add a wire frame.
+
+When this metric is enabled, the scheduler and router must run on the same host and use the same SGLang wire version: the normal payload is followed by a timestamp frame in an atomic multipart message for both pickle and msgpack IPC. Monotonic timestamps are not comparable across hosts. This metric is intended to expose scheduler-to-router backlog, not router processing time or downstream detokenizer work.
+
 ## Language model metrics
 
 `sglang:time_to_first_token_seconds` measures the time from request creation in the API server to the first token. For streaming requests it ends when the first output arrives after detokenization, which may contain no printable text. Non-streaming clients only see the final response, so for them it ends when the scheduler produced the first token.

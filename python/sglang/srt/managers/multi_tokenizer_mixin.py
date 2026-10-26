@@ -30,6 +30,7 @@ import threading
 import zlib
 from functools import lru_cache
 from multiprocessing import shared_memory
+from time import monotonic_ns
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Type
 
 import msgspec
@@ -56,6 +57,7 @@ from sglang.srt.managers.io_struct import (
     async_sock_recv,
     async_sock_send,
     sock_recv,
+    sock_recv_with_timestamp,
     sock_send,
     unwrap_from_pickle,
     wrap_as_pickle,
@@ -736,9 +738,39 @@ class MultiDetokenizerRouter:
     ``rid`` is hashed instead.
     """
 
-    def __init__(self, ipc_name_list: List[str], port_args: PortArgs):
+    def __init__(
+        self,
+        ipc_name_list: List[str],
+        port_args: PortArgs,
+        *,
+        enable_metrics: bool = False,
+    ):
         self.ipc_name_list = ipc_name_list
         self.num_workers = len(ipc_name_list)
+        self.delivery_seconds = None
+        if enable_metrics:
+            from prometheus_client import Histogram
+
+            self.delivery_seconds = Histogram(
+                "sglang:detokenizer_router_delivery_seconds",
+                "Time from scheduler send before serialization to router receive after deserialization",
+                buckets=(
+                    0.0001,
+                    0.0005,
+                    0.001,
+                    0.005,
+                    0.01,
+                    0.05,
+                    0.1,
+                    0.5,
+                    1.0,
+                    5.0,
+                    10.0,
+                    30.0,
+                    60.0,
+                    120.0,
+                ),
+            )
         self.socket_mapping = SocketMapping()
         context = zmq.Context(2)
         self.recv_from_scheduler = get_zmq_socket(
@@ -776,7 +808,14 @@ class MultiDetokenizerRouter:
 
     def event_loop(self):
         while True:
-            recv_obj = sock_recv(self.recv_from_scheduler)
+            if self.delivery_seconds is None:
+                recv_obj = sock_recv(self.recv_from_scheduler)
+            else:
+                send_time_ns, recv_obj = sock_recv_with_timestamp(
+                    self.recv_from_scheduler
+                )
+                if send_time_ns is not None:
+                    self.delivery_seconds.observe((monotonic_ns() - send_time_ns) / 1e9)
 
             # Control messages must reach every detokenizer process.
             if isinstance(recv_obj, (FreezeGCReq, ConfigureLoggingReq)):
@@ -826,7 +865,9 @@ def run_multi_detokenizer_router_process(
     try:
         if enable_metrics:
             start_cpu_monitor_thread("detokenizer_router")
-        router = MultiDetokenizerRouter(ipc_name_list, port_args)
+        router = MultiDetokenizerRouter(
+            ipc_name_list, port_args, enable_metrics=enable_metrics
+        )
         router.event_loop()
     except Exception:
         traceback = get_exception_traceback()

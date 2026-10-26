@@ -30,6 +30,7 @@ class SchedulerIpcChannels:
         skip_tokenizer_init: bool,
         metrics_enabled: bool,
         enable_scripted_runtime: bool,
+        detokenizer_router_metrics_enabled: bool = False,
     ) -> "SchedulerIpcChannels":
         context = zmq.Context(2)
 
@@ -65,7 +66,11 @@ class SchedulerIpcChannels:
                 )
 
             send_to_tokenizer = SenderWrapper(send_to_tokenizer_raw)
-            send_to_detokenizer = SenderWrapper(send_to_detokenizer_raw)
+            send_to_detokenizer = SenderWrapper(
+                send_to_detokenizer_raw,
+                timestamped=detokenizer_router_metrics_enabled
+                and not skip_tokenizer_init,
+            )
         else:
             recv_from_tokenizer = None
             recv_from_rpc = None

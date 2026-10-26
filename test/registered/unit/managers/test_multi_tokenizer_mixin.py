@@ -171,6 +171,7 @@ def _make_router() -> MultiDetokenizerRouter:
     router = MultiDetokenizerRouter.__new__(MultiDetokenizerRouter)
     router.ipc_name_list = ["detok-a", "detok-b"]
     router.num_workers = 2
+    router.delivery_seconds = None
     router._pick = lambda key: {
         "worker-a": "detok-a",
         "worker-b": "detok-b",
