@@ -920,6 +920,25 @@ class TestDeepseekMoeEpilogue(CustomTestCase):
                     self.assertEqual(base.preserves_input, stock_runner.preserves_input)
                     torch.testing.assert_close(actual, x * 5.5)
 
+    def test_awq_amx_preserves_input_without_a_runner(self):
+        """The direct AMX path must answer the layer query without a runner."""
+        from sglang.srt.layers.quantization.awq.awq import AWQConfig, AWQMoEMethod
+        from sglang.srt.layers.quantization.awq.schemes.awq_cpu import (
+            AWQIntelAMXMoEScheme,
+        )
+
+        config = AWQConfig(weight_bits=4, group_size=128, zero_point=True)
+        for inplace in (False, True):
+            with self.subTest(inplace=inplace):
+                experts = self._moe(inplace=inplace, backend=None).experts
+                del experts.quant_method
+                experts.quant_method = AWQMoEMethod(config)
+                experts.scheme = AWQIntelAMXMoEScheme(config)
+                experts.quant_method.create_moe_runner(
+                    experts, experts.moe_runner_config
+                )
+                self.assertTrue(experts.preserves_input)
+
     def test_direct_quant_methods_preserve_capture_overlap(self):
         """Direct kernels need their own input contract even without a named runner."""
         from sglang.srt.layers.quantization.bitsandbytes import BitsAndBytesMoEMethod

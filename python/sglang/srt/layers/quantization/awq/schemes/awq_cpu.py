@@ -39,5 +39,9 @@ class AWQIntelAMXMoEScheme(AWQMoEScheme):
         self.moe_runner_config = moe_runner_config
         self.kernel.create_moe_runner(layer, moe_runner_config)
 
+    def preserves_input(self, layer: torch.nn.Module) -> bool:
+        # The native kernel always runs with inplace=False.
+        return True
+
     def get_moe_runner_backend(self, layer):
         return None
