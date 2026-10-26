@@ -17,6 +17,7 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.step_span_utils import (
+    build_step_shape_log,
     detailed_annotations_enabled,
     set_detailed_annotations_enabled,
 )
@@ -223,6 +224,36 @@ class TestStepSpanDetailedAnnotations(CustomTestCase):
         self.assertEqual(
             build_step_span_name(fb, detailed_annotations=True, forward_id=42),
             "step[VERIFY bs=2 forward_id=42]",
+        )
+
+    def test_step_shape_summary_includes_kv_distribution(self):
+        fb = _fb(
+            ForwardMode.TARGET_VERIFY,
+            batch_size=3,
+            seq_lens_cpu=[10, 20, 100],
+            num_tokens_per_req=4,
+        )
+        self.assertEqual(
+            build_step_shape_log(fb, forward_id=7),
+            "stage=TARGET_VERIFY bs=3 forward_id=7 "
+            "g_sq=12 g_sqsq=48 g_sqsk=520 g_sk=130 "
+            "g_qmin=4 g_qmed=4 g_qmax=4 "
+            "g_kmin=10 g_kmed=20 g_kmax=100",
+        )
+
+    def test_step_shape_vector_preserves_request_lengths(self):
+        fb = _fb(
+            ForwardMode.EXTEND,
+            batch_size=2,
+            extend_seq_lens_cpu=[8, 4],
+            extend_prefix_lens_cpu=[2, 6],
+        )
+        self.assertEqual(
+            build_step_shape_log(fb, include_vectors=True),
+            "stage=EXTEND bs=2 "
+            "c_sq=12 c_sqsq=80 c_sqsk=120 c_sk=20 "
+            "c_qmin=4 c_qmed=6 c_qmax=8 "
+            "c_kmin=10 c_kmed=10 c_kmax=10 c_q=[8,4] c_k=[10,10]",
         )
 
 

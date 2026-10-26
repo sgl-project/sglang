@@ -22,6 +22,7 @@ that forward.
 
 from __future__ import annotations
 
+import statistics
 from typing import TYPE_CHECKING, List, Tuple
 
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -137,3 +138,108 @@ def build_detailed_annotation_suffix(forward_batch: ForwardBatch) -> str:
         )
 
     return ""
+
+
+def _format_step_shape_stats(
+    prefix: str, nqs: List[int], nkvs: List[int], include_vectors: bool
+) -> str:
+    """Return sums plus a compact per-request shape summary for an opt-in log."""
+    sq, sk, sqsq, sqsk = _agg(nqs, nkvs)
+    if not nkvs:
+        return f"{prefix}_sq={sq} {prefix}_sqsq={sqsq} {prefix}_sqsk={sqsk} {prefix}_sk={sk}"
+
+    fields = [
+        f"{prefix}_sq={sq}",
+        f"{prefix}_sqsq={sqsq}",
+        f"{prefix}_sqsk={sqsk}",
+        f"{prefix}_sk={sk}",
+        f"{prefix}_qmin={min(nqs)}",
+        f"{prefix}_qmed={statistics.median(nqs):g}",
+        f"{prefix}_qmax={max(nqs)}",
+        f"{prefix}_kmin={min(nkvs)}",
+        f"{prefix}_kmed={statistics.median(nkvs):g}",
+        f"{prefix}_kmax={max(nkvs)}",
+    ]
+    if include_vectors:
+        fields.extend(
+            (
+                f"{prefix}_q=[{','.join(map(str, nqs))}]",
+                f"{prefix}_k=[{','.join(map(str, nkvs))}]",
+            )
+        )
+    return " ".join(fields)
+
+
+def build_step_shape_log(
+    forward_batch: ForwardBatch,
+    *,
+    is_draft_worker: bool = False,
+    forward_id: int | None = None,
+    include_vectors: bool = False,
+) -> str:
+    """Build one compact, parseable description of an execution step.
+
+    This is intentionally separate from the profiler span. It is designed for
+    opt-in server logging over a full workload: summary mode exposes the
+    min/median/max needed to bucket ragged batches, while vector mode keeps the
+    exact per-request N_Q and KV lengths for offline analysis.
+    """
+    mode = forward_batch.forward_mode
+    stage = "DRAFT" if is_draft_worker else mode.name
+    fields = [f"stage={stage}", f"bs={forward_batch.batch_size}"]
+    if forward_id is not None:
+        fields.append(f"forward_id={forward_id}")
+
+    if mode == ForwardMode.DECODE or mode == ForwardMode.TARGET_VERIFY:
+        if forward_batch.seq_lens_cpu is None:
+            fields.append("shape=unavailable")
+        else:
+            nq = _decode_query_width(forward_batch)
+            nkvs = [int(x) for x in forward_batch.seq_lens_cpu.tolist()]
+            fields.append(
+                _format_step_shape_stats("g", [nq] * len(nkvs), nkvs, include_vectors)
+            )
+    elif mode == ForwardMode.EXTEND or mode == ForwardMode.DRAFT_EXTEND_V2:
+        if (
+            forward_batch.extend_seq_lens_cpu is None
+            or forward_batch.extend_prefix_lens_cpu is None
+        ):
+            fields.append("shape=unavailable")
+        else:
+            nqs = [int(x) for x in forward_batch.extend_seq_lens_cpu]
+            nkvs = [
+                int(prefix) + int(query)
+                for prefix, query in zip(
+                    forward_batch.extend_prefix_lens_cpu, nqs, strict=True
+                )
+            ]
+            fields.append(_format_step_shape_stats("c", nqs, nkvs, include_vectors))
+    elif mode == ForwardMode.MIXED:
+        if (
+            forward_batch.extend_seq_lens_cpu is None
+            or forward_batch.extend_prefix_lens_cpu is None
+        ):
+            fields.append("shape=unavailable")
+        else:
+            c_nqs, c_nkvs, g_nqs, g_nkvs = [], [], [], []
+            for prefix, query in zip(
+                forward_batch.extend_prefix_lens_cpu,
+                forward_batch.extend_seq_lens_cpu,
+                strict=True,
+            ):
+                nq, nkv = int(query), int(prefix) + int(query)
+                if nq == 1:
+                    g_nqs.append(nq)
+                    g_nkvs.append(nkv)
+                else:
+                    c_nqs.append(nq)
+                    c_nkvs.append(nkv)
+            fields.extend(
+                (
+                    f"c={len(c_nqs)}",
+                    f"g={len(g_nqs)}",
+                    _format_step_shape_stats("c", c_nqs, c_nkvs, include_vectors),
+                    _format_step_shape_stats("g", g_nqs, g_nkvs, include_vectors),
+                )
+            )
+    return " ".join(fields)

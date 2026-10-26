@@ -193,6 +193,7 @@ from sglang.srt.model_executor.runner import (
     EagerRunner,
     get_batch_sizes_to_capture,
 )
+from sglang.srt.model_executor.step_span_utils import build_step_shape_log
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     assert_published,
@@ -1822,6 +1823,20 @@ class ModelRunner:
         forward_batch.apply_deprecated_skip_attn_backend_init(skip_attn_backend_init)
 
         self.forward_pass_id += 1
+
+        step_shape_log = envs.SGLANG_LOG_STEP_SHAPES.get().lower()
+        if step_shape_log in ("summary", "vector"):
+            parallel = get_parallel()
+            if parallel.tp_rank == 0 and parallel.attn_cp_rank == 0:
+                logger.info(
+                    "STEP_SHAPE %s",
+                    build_step_shape_log(
+                        forward_batch,
+                        is_draft_worker=self.is_draft_worker,
+                        forward_id=self.forward_pass_id,
+                        include_vectors=step_shape_log == "vector",
+                    ),
+                )
 
         # Try msprob debugger
         if self.msprobe_debugger is not None:
