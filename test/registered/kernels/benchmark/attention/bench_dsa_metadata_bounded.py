@@ -2,8 +2,11 @@
 
 Shapes: a 1M-token page table (the DSA models' default --context-length), live KV
 1k / 8k / 64k per request, decode rows = bs, target verify and draft extend with
-next_n = 5 (EAGLE 4/1/5). Times are CUDA-graph replays with a cold L2: every call
-follows an L2 flush, and the flush-only graph's time is subtracted.
+next_n = 5 (EAGLE 4/1/5). The MTP draft-decode replay of 3 / 4 step backends
+(EAGLE 4/1/5 / 5/1/6) compares precompute + full-width copies (+ the DeepGEMM
+schedule refresh of step 3 at 5/1/6) with one bounded launch. Times are
+CUDA-graph replays with a cold L2: every call follows an L2 flush, and the
+flush-only graph's time is subtracted.
 
 Usage::
 
@@ -22,6 +25,8 @@ from sglang.test.kits.dsa_bounded_metadata_kit import (
     WIDTH_1M,
     MetadataWorld,
     decode_bufs,
+    draft_decode_one_launch,
+    draft_decode_precompute_copy,
     run_decode,
     run_draft_extend,
     run_verify,
@@ -140,5 +145,63 @@ def benchmark_replay_metadata(op: str, kv: str, bs: int, provider: str) -> float
     return cold_l2_graph_us(make_op(op, provider, bs, KV_LENS[kv]))
 
 
+def _schedule_refresh(bs):
+    """The copy replay's DeepGEMM schedule refresh of one step, or None."""
+    try:
+        from sglang.srt.layers.attention.dsa.utils import (
+            resolve_num_sms,
+            resolve_paged_mqa_logits_metadata_fn,
+        )
+
+        fn, sms = resolve_paged_mqa_logits_metadata_fn(), resolve_num_sms()
+        ctx = torch.ones((bs, 1), dtype=torch.int32, device="cuda")
+        out = fn(ctx, 64, sms).clone()
+    except Exception:  # noqa: BLE001
+        return None
+
+    def refresh(cache_seqlens):
+        ctx.copy_(cache_seqlens.view(-1, 1))
+        out.copy_(fn(ctx, 64, sms))
+
+    return refresh
+
+
+@triton.testing.perf_report(
+    triton.testing.Benchmark(
+        x_names=["step_backends", "kv", "bs"],
+        x_vals=[(n, kv, bs) for n in (3, 4) for kv in KV_NAMES for bs in BATCH_SIZES],
+        line_arg="provider",
+        line_vals=["precompute_copy", "one_launch"],
+        line_names=["Precompute + copies", "One bounded launch"],
+        styles=[("orange", "--"), ("blue", "-")],
+        ylabel="us",
+        plot_name="dsa-mtp-draft-decode-metadata-1m-context",
+        args={},
+    )
+)
+def benchmark_draft_decode_metadata(
+    step_backends: int, kv: str, bs: int, provider: str
+) -> float:
+    w = world()
+    g = torch.Generator().manual_seed(bs * 104729 + KV_LENS[kv])
+    kv_len = KV_LENS[kv]
+    seq, req = w.batch(
+        torch.randint(kv_len, kv_len + kv_len // 8 + 1, (bs,), generator=g).tolist()
+    )
+    dsts = [decode_bufs(w, bs) for _ in range(step_backends)]
+    if provider == "one_launch":
+        return cold_l2_graph_us(lambda: draft_decode_one_launch(w, seq, req, bs, dsts))
+    # Steps refreshed by the copy replay: all but the three-way-copy ones.
+    refresh = _schedule_refresh(bs) if step_backends > 3 else None
+
+    def copy_replay():
+        draft_decode_precompute_copy(w, seq, req, bs, dsts, sentinel_scratch=False)
+        if refresh is not None:
+            refresh(dsts[3]["cache_seqlens"])
+
+    return cold_l2_graph_us(copy_replay)
+
+
 if __name__ == "__main__":
     benchmark_replay_metadata.run(print_data=True)
+    benchmark_draft_decode_metadata.run(print_data=True)

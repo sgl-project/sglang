@@ -65,6 +65,10 @@ from sglang.srt.layers.attention.dsa.dsa_dcp import (
     dcp_trtllm_sparse_attention,
     localize_dcp_page_table,
 )
+from sglang.srt.layers.attention.dsa.dsa_draft_metadata import (
+    draft_decode_metadata_writable,
+    write_draft_decode_metadata,
+)
 from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import DSAIndexerMetadata
 from sglang.srt.layers.attention.dsa.dsa_metadata_manager import (
     DSAMetadataManagementMixin,
@@ -4172,6 +4176,7 @@ class DeepseekSparseAttnBackend(
 
 
 class DeepseekSparseAttnMultiStepBackend:
+    _draft_decode_logged = False  # one log line per process
     # Per-step draft decode replays from precomputed GPU metadata; opt out so
     # decide_needs_cpu_seq_lens' OR over the backends stays False.
     needs_cpu_seq_lens: bool = False
@@ -4197,6 +4202,22 @@ class DeepseekSparseAttnMultiStepBackend:
                     seed_dsa_topk_from_draft_extend=seed_dsa_topk_from_draft_extend,
                 )
             )
+        self.draft_schedule_refresh_steps = self._draft_schedule_refresh_steps(
+            seed_dsa_topk_from_draft_extend
+        )
+        # bs -> draft_decode_metadata_writable; reset when that bs is captured.
+        self._draft_decode_writable: dict[int, bool] = {}
+
+    def _draft_schedule_refresh_steps(
+        self, seed_dsa_topk_from_draft_extend: bool
+    ) -> range:
+        # Steps that reuse the draft-extend indexer top-k never run the indexer,
+        # so their DeepGEMM paged-MQA schedule is never read.
+        if seed_dsa_topk_from_draft_extend:
+            return range(0)
+        # The precompute replay refreshes every step but the 3-way-copy ones.
+        first = 3 if self.speculative_num_steps > 3 else 0
+        return range(first, len(self.attn_backends))
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         for i in range(self.speculative_num_steps - 1):
@@ -4223,9 +4244,33 @@ class DeepseekSparseAttnMultiStepBackend:
                 self.attn_backends[i].init_forward_metadata_out_graph(
                     inner_fb, in_capture=True
                 )
+            self._draft_decode_writable.pop(forward_batch.batch_size, None)
             return
 
         bs = forward_batch.batch_size
+        writable = self._draft_decode_writable.get(bs)
+        if writable is None:
+            writable = draft_decode_metadata_writable(self.attn_backends, bs)
+            self._draft_decode_writable[bs] = writable
+            if not type(self)._draft_decode_logged:
+                type(self)._draft_decode_logged = True
+                logger.info(
+                    "DSA draft-decode replay metadata: %s (first decision at bs %d, "
+                    "%d step backends)",
+                    "one bounded launch" if writable else "precompute + copies",
+                    bs,
+                    len(self.attn_backends),
+                )
+        if writable:
+            write_draft_decode_metadata(
+                backends=self.attn_backends,
+                seq_lens=forward_batch.seq_lens,
+                req_pool_indices=forward_batch.req_pool_indices,
+                bs=bs,
+                schedule_refresh_steps=self.draft_schedule_refresh_steps,
+            )
+            return
+
         # Precompute metadata once (shared across all backends)
         precomputed = self.attn_backends[0]._precompute_replay_metadata(
             bs=bs,

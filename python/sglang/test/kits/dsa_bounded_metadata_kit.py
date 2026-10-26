@@ -171,3 +171,103 @@ def live_columns(kv_len: int, width: int):
     of ``kv_len`` tokens: whole 128-column blocks below kv_len, within width."""
     live = min(-(-kv_len // BLOCK_N) * BLOCK_N, width)
     return live, -(-live // PAGE)
+
+
+DECODE_KEYS = (
+    "cache_seqlens",
+    "cu_seqlens_k",
+    "page_table_1",
+    "dsa_cache_seqlens",
+    "dsa_cu_seqlens_k",
+    "real_page_table",
+)
+
+
+def draft_decode_precompute_copy(
+    world, seq, req, bs, dsts, *, sentinel_scratch: bool = True
+) -> None:
+    """The multi-step backend's precompute + copy replay (DECODE, kpool 1):
+    decode metadata into scratch tables as wide as the context, then full-width
+    copies into every step's buffers (a three-way copy for steps 0-2 when there
+    are three or more steps, single copies for the rest)."""
+    from sglang.kernels.ops.attention.dsa.fused_metadata_copy import (
+        fused_metadata_copy_cuda,
+        fused_metadata_copy_multi_cuda,
+    )
+    from sglang.kernels.ops.attention.dsa.metadata import fused_dsa_decode_metadata
+
+    d = world.device
+
+    def scratch(cols):
+        if sentinel_scratch:
+            return table(bs, cols, d)
+        return torch.empty((bs, cols), dtype=torch.int32, device=d)
+
+    src = dict(
+        cache_seqlens=torch.empty(bs, dtype=torch.int32, device=d),
+        cu_seqlens_k=torch.empty(bs + 1, dtype=torch.int32, device=d),
+        page_table_1=scratch(world.width),
+        dsa_cache_seqlens=torch.empty(bs, dtype=torch.int32, device=d),
+        dsa_cu_seqlens_k=torch.empty(bs + 1, dtype=torch.int32, device=d),
+        real_page_table=scratch(world.real_cols),
+    )
+    run_decode(fused_dsa_decode_metadata, world, seq, req, bs, src)
+    rest = dsts
+    if len(dsts) >= 3:
+        args = []
+        for dst in dsts[:3]:
+            args += [dst[k] for k in DECODE_KEYS] + [None, None]
+        fused_metadata_copy_multi_cuda(
+            *[src[k] for k in DECODE_KEYS], None, None, *args, bs, world.width, bs
+        )
+        rest = dsts[3:]
+    for dst in rest:
+        fused_metadata_copy_cuda(
+            src["cache_seqlens"],
+            src["cu_seqlens_k"],
+            src["page_table_1"],
+            src["dsa_cache_seqlens"],
+            src["cache_seqlens"],
+            src["dsa_cu_seqlens_k"],
+            src["real_page_table"],
+            None,
+            None,
+            dst["cache_seqlens"],
+            dst["cu_seqlens_k"],
+            dst["page_table_1"],
+            dst["dsa_cache_seqlens"],
+            dst["cache_seqlens"],
+            dst["dsa_cu_seqlens_k"],
+            dst["real_page_table"],
+            None,
+            None,
+            0,
+            bs,
+            world.width,
+            world.width,
+            bs,
+        )
+
+
+def draft_decode_one_launch(world, seq, req, bs, dsts, **budget) -> None:
+    """fused_dsa_decode_metadata_multi into every step's buffers, four per launch."""
+    from sglang.kernels.ops.attention.dsa_metadata_bounded import (
+        MAX_MULTI_DSTS,
+        fused_dsa_decode_metadata_multi,
+    )
+
+    for start in range(0, len(dsts), MAX_MULTI_DSTS):
+        fused_dsa_decode_metadata_multi(
+            seq_lens=seq,
+            req_pool_indices=req,
+            req_to_token=world.req_to_token,
+            dsts=[
+                tuple(d[k] for k in DECODE_KEYS)
+                for d in dsts[start : start + MAX_MULTI_DSTS]
+            ],
+            bs=bs,
+            max_len=world.width,
+            dsa_index_topk=TOPK,
+            physical_page_size=PAGE,
+            **budget,
+        )

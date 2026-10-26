@@ -1963,6 +1963,8 @@ class Envs:
     # extend) by a program budget that strides over each row's live kv blocks,
     # instead of one program per 128 columns of the --context-length-wide table
     # (CUDA, kpool 1, no KPool metadata fusion). Outputs are bit-identical.
+    # It also writes the MTP draft-decode metadata of every step backend in one
+    # launch (DeepseekSparseAttnMultiStepBackend).
     SGLANG_DSA_BOUNDED_REPLAY_METADATA = EnvBool(True)
     SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC = EnvBool(False)
     SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK = EnvStr(None)
