@@ -8,6 +8,7 @@ import msgspec.msgpack
 import numpy as np
 import pytest
 import torch
+from fastapi import WebSocket
 
 from sglang.multimodal_gen.configs.pipeline_configs.lingbot_world import (
     LingBotWorldCausalDMDConfig,
@@ -461,7 +462,8 @@ def test_generate_session_respects_max_chunks():
     assert session.reached_max_chunks()
 
 
-def test_generate_loop_overlaps_send_with_next_generation(monkeypatch):
+@pytest.mark.parametrize("fail_next_chunk", [False, True])
+def test_generate_loop_overlaps_send_with_next_generation(monkeypatch, fail_next_chunk):
     events = []
 
     class _Adapter:
@@ -490,6 +492,8 @@ def test_generate_loop_overlaps_send_with_next_generation(monkeypatch):
     async def fake_process_generation_batch(client, batch):
         del client
         events.append(f"generate_start_{batch.block_idx}")
+        if fail_next_chunk and batch.block_idx == 1:
+            raise RuntimeError("next chunk failed")
         await asyncio.sleep(0.01)
         events.append(f"generate_end_{batch.block_idx}")
         return None, SimpleNamespace()
@@ -517,13 +521,17 @@ def test_generate_loop_overlaps_send_with_next_generation(monkeypatch):
 
     class _Ws:
         async def send_bytes(self, _message):
-            pass
+            if msgspec.msgpack.decode(_message)["type"] == "error":
+                events.append("error")
 
     asyncio.run(realtime_video_api._generate_loop(_Ws(), session))
 
     assert events.index("generate_start_1") < events.index("send_end_0")
-    assert events.index("send_end_0") < events.index("send_start_1")
-    assert events[-1] == "send_end_1"
+    if fail_next_chunk:
+        assert events.index("send_end_0") < events.index("error")
+    else:
+        assert events.index("send_end_0") < events.index("send_start_1")
+        assert events[-1] == "send_end_1"
 
 
 def test_send_output_emits_chunk_stats_message():
@@ -604,6 +612,80 @@ def test_listen_generate_request_propagates_disconnect_without_error_write():
         raise AssertionError("expected websocket disconnect to propagate")
 
     assert sent_messages == []
+
+
+def test_invalid_event_does_not_split_frame_header_and_payload():
+    """an invalid event under send backpressure must not corrupt frame transport"""
+
+    async def run():
+        header_sent = asyncio.Event()
+        event_read = asyncio.Event()
+        resume_send = asyncio.Event()
+        messages = []
+        incoming = asyncio.Queue()
+        await incoming.put({"type": "websocket.connect"})
+
+        async def receive():
+            message = await incoming.get()
+            if message["type"] == "websocket.receive":
+                event_read.set()
+            return message
+
+        async def send(message):
+            if message["type"] == "websocket.send":
+                messages.append(message["bytes"])
+                if len(messages) == 1:
+                    header_sent.set()
+                    await resume_send.wait()
+
+        ws = WebSocket({"type": "websocket"}, receive, send)
+        await ws.accept()
+        session = GenerateSession()
+        session.set_adapter(sana_wm_realtime.SanaWMRealtimeAdapter())
+        chunk = session.new_chunk()
+        batch = SimpleNamespace(
+            block_idx=0,
+            request_id=chunk.request_id,
+            width=256,
+            height=256,
+            enable_upscaling=False,
+            realtime_output_format="raw",
+            realtime_event_id=None,
+            condition_inputs={},
+        )
+        frame = bytes([1, 2, 3]) * (256 * 256)
+        result = OutputBatch(
+            raw_frame_batches=[[frame]],
+            raw_frame_content_type=RAW_RGB_CONTENT_TYPE,
+        )
+        output_task = asyncio.create_task(
+            realtime_video_api._send_output_and_log(
+                ws, session, chunk, batch, result, 0.0, 0.0, time.perf_counter()
+            )
+        )
+        listen_task = asyncio.create_task(
+            realtime_video_api._listen_events(ws, session)
+        )
+        await header_sent.wait()
+        await incoming.put(
+            {"type": "websocket.receive", "bytes": msgspec.msgpack.encode([])}
+        )
+        await event_read.wait()
+        await asyncio.sleep(0)
+        resume_send.set()
+        await incoming.put({"type": "websocket.disconnect", "code": 1000})
+        await asyncio.gather(output_task, listen_task)
+
+        assert msgspec.msgpack.decode(messages[0])["type"] == "frame_batch_header"
+        assert messages[1] == frame
+        assert sorted(
+            msgspec.msgpack.decode(item)["type"] for item in messages[2:]
+        ) == [
+            "chunk_stats",
+            "error",
+        ]
+
+    asyncio.run(asyncio.wait_for(run(), timeout=5))
 
 
 def test_wait_for_active_session_slot_observes_release(monkeypatch):

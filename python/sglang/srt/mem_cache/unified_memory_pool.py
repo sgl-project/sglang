@@ -1115,6 +1115,7 @@ class UnifiedMambaPool(MambaPool):
         self.replayssm_is_kda = False
         self.enable_linear_replayssm_spec = False
         self.replayssm_spec_fold = False
+        self.replayssm_spec_write_pos = None
         self.replayssm_cache_base = None
         self.replayssm_is_flush = None
         self.debug_memory_pool = False

@@ -203,7 +203,7 @@ def flash_mla_with_kvcache_entrypoint(backend: str, **kwargs):
             backend if backend in _HIP_BACKENDS else None
         )
     else:
-        import sgl_kernel.flash_mla as flash_mla
+        from sglang.kernels.ops.attention import flash_mla_interface
 
     if backend == "comparison":
         pack_ref, pack_fast_via_tester = flash_mla_with_kvcache_entrypoint(
@@ -238,7 +238,7 @@ def flash_mla_with_kvcache_entrypoint(backend: str, **kwargs):
         return aiter_sparse_decode_fwd(**kwargs)
 
     if backend == "kernel":
-        return flash_mla.flash_mla_with_kvcache(**kwargs)
+        return flash_mla_interface.flash_mla_with_kvcache(**kwargs)
 
     raise NotImplementedError(f"unknown backend: {backend!r}")
 

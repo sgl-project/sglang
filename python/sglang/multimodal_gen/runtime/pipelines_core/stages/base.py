@@ -25,6 +25,10 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
 )
+from sglang.multimodal_gen.runtime.managers.progress_reporter import (
+    ReportingTqdm,
+    get_progress_reporter,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.dedup import StageDedupMixin
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
@@ -47,6 +51,9 @@ class StageParallelismType(Enum):
     CFG_PARALLEL = auto()
     # executed on main rank only and send result to other ranks
     MAIN_RANK_ONLY_AND_SEND_TO_OTHERS = auto()
+    # a stage without CFG runs on every CFG rank, sequence-sharded over them
+    # as one Ulysses group; its inputs must already match across CFG ranks
+    SEQUENCE_PARALLEL_OVER_CFG_RANKS = auto()
 
 
 class StageVerificationError(Exception):
@@ -71,6 +78,7 @@ class PipelineStage(StageDedupMixin, ABC):
     _component_residency_manager = None
     _registered_stage_name: str | None = None
     _profile_stage_name: str | None = None
+    _progress_range: tuple[float, float] = (0.0, 1.0)
 
     def __init__(self):
         self.server_args = get_global_server_args()
@@ -107,12 +115,28 @@ class PipelineStage(StageDedupMixin, ABC):
     ) -> tqdm:
         is_main_rank = not world_group_is_initialized() or get_world_rank() == 0
         disable = disable or (batch is not None and batch.is_warmup)
-        return tqdm(
-            iterable=iterable,
-            total=total,
-            disable=disable or not is_main_rank,
-            **kwargs,
-        )
+        disable = disable or not is_main_rank
+        # report even when the bar is hidden: the first rank of replica N>0 is
+        # not world rank 0
+        reporter = get_progress_reporter()
+        if (
+            reporter is not None
+            and batch is not None
+            and batch.report_progress
+            and not batch.is_warmup
+        ):
+            request_ids = batch.client_request_ids()
+            if request_ids:
+                return ReportingTqdm(
+                    iterable=iterable,
+                    total=total,
+                    disable=disable,
+                    reporter=reporter,
+                    request_ids=request_ids,
+                    progress_range=self._progress_range,
+                    **kwargs,
+                )
+        return tqdm(iterable=iterable, total=total, disable=disable, **kwargs)
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         """
@@ -288,6 +312,11 @@ class PipelineStage(StageDedupMixin, ABC):
         # if get_global_server_args().enable_cfg_parallel:
         #     return StageParallelismType.MAIN_RANK_ONLY
         return StageParallelismType.REPLICATED
+
+    def parallelism_type_for(self, batch: Req | list[Req]) -> StageParallelismType:
+        """The parallelism the executor runs ``batch`` with; every rank must
+        resolve the same type."""
+        return self.parallelism_type
 
     def cfg_parallel_local_batch_fields(
         self, batch: Req, server_args: ServerArgs
