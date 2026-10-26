@@ -36,7 +36,7 @@ def _default_dsv4_attention_backend(server_args: ServerArgs) -> str:
         or cfg.device != "cuda"
         or not is_sm100_supported()
         or cfg.kv_cache_dtype != "fp8_e4m3"
-        or (layout.is_set() and layout.get().lower() not in ("auto", "v41"))
+        or (layout.is_set() and layout.get().lower() not in ("auto", "v41", "v41_new"))
     ):
         return "flashmla"
     return "flashmla_mega"

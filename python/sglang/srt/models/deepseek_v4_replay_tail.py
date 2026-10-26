@@ -20,7 +20,10 @@ import torch
 from sglang.srt.distributed.utils import all_gather_single
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
-from sglang.srt.layers.dp_attention import dp_gather_replicate
+from sglang.srt.layers.dp_attention import (
+    dp_gather_replicate,
+    note_rank_barrier_in_prefill_graph,
+)
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.model_executor.cuda_graph_config import (
@@ -171,11 +174,15 @@ class DecoderReplayTail:
 
     @staticmethod
     def _can_capture_moe_bound(forward_batch: ForwardBatch) -> bool:
-        # The row runner replaces only the local count with a graph-owned buffer.
+        # Only these two count domains have graph-owned replay buffers.
         bound = forward_batch.moe_num_token_non_padded()
-        return bound is None or (
-            bound is forward_batch.num_token_non_padded
-            and bound is not forward_batch.global_num_token_non_padded
+        return (
+            bound is None
+            or bound is forward_batch.num_token_non_padded
+            or (
+                forward_batch.attn_tp_sequence_sharded
+                and bound is forward_batch.global_num_token_non_padded
+            )
         )
 
     def plan(
@@ -373,6 +380,16 @@ class DecoderReplayTail:
             batch_scope=dp_layout,
             bucket_from=None if dp_rows is None else max(dp_rows),
             out_rows=out_rows,
+            # mHC tail inputs contain the whole attention-DP sequence before
+            # any MoE transport, including when attention TP shards its inputs.
+            global_num_rows=(
+                positions.shape[0]
+                if forward_batch.attn_tp_sequence_sharded
+                and forward_batch.global_num_token_non_padded is not None
+                and forward_batch.moe_num_token_non_padded()
+                is forward_batch.global_num_token_non_padded
+                else None
+            ),
         )
         return residual, pre, aux
 
@@ -480,7 +497,9 @@ class DecoderReplayTail:
     def _bridge_outputs(
         self, block_rows: int, outputs: List[Optional[torch.Tensor]]
     ) -> Tuple[Optional[torch.Tensor], ...]:
-        """Block-sized bridge views of the tail rows; rows past the tail are zero."""
+        """Block-sized bridge views of the tail rows. Rows past the tail hold stale
+        values, which reach only rows that _scatter_tail_rows and the
+        real_rows_count cut drop."""
         key = tuple(None if t is None else (t.dtype, t.shape[1:]) for t in outputs)
         sets = self._bridge_buffers.setdefault(key, [])
         if not sets or sets[0][0].shape[0] < block_rows:
@@ -498,7 +517,6 @@ class DecoderReplayTail:
                 continue
             view = buf[:block_rows]
             view[: t.shape[0]].copy_(t)
-            view[t.shape[0] :].zero_()
             views.append(view)
         return tuple(views)
 
@@ -570,8 +588,10 @@ class DecoderReplayTail:
                     hidden_states = state = hc_boundary.materialize(
                         hidden_states, forward_batch, next=next_boundary
                     )
+                    from sglang.kernels.ops.layernorm.mhc import mhc_stream_mean
+
                     # The draft head reads the attention input of its target layers.
-                    aux.append(state.residual.mean(dim=1))
+                    aux.append(mhc_stream_mean(state.residual))
                 ctx = (
                     nullcontext()
                     if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
@@ -650,6 +670,8 @@ def _tail_layers_in_prefill_graph(
     input_ids: torch.Tensor,
     input_ids_global: torch.Tensor,
 ) -> Tuple[Optional[torch.Tensor], ...]:
+    # The tail captures its row-bucket graphs on first use.
+    note_rank_barrier_in_prefill_graph()
     backend = get_attn_backend()
     saved, forward_batch = _enter_eager_tail_in_prefill_graph(
         backend, get_tc_piecewise_forward_context().forward_batch, source_kv_layer_id
