@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""The multi-step draft's sliding-window rails on the Triton backend.
+"""The multi-step draft's sliding-window rails on the Triton and FA backends.
 
 Every cuda-graph forward mode must fill the sliding-window READ rail, and each
 draft step must write its window layers through its OWN columns of the
@@ -35,6 +35,7 @@ mode branch that forgets the rail fails here rather than on a GPU.
 """
 
 import ast
+import importlib.util
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -170,6 +171,53 @@ class TestDraftStepWriteColumns(CustomTestCase):
 
     def test_a_chain_draft_inside_the_verify_window(self):
         self._check(bs=3, topk=1, num_steps=3, window_cols=5)
+
+
+def _plan_table_kind(call):
+    for kw in call.keywords:
+        if kw.arg == "kind":
+            return kw.value.attr if isinstance(kw.value, ast.Attribute) else None
+    return "FULL"
+
+
+class TestFlashAttentionWindowTableFills(CustomTestCase):
+    """The FA backend's window layers read the plan's sliding-window table. A
+    function that fills the plan's full-attention table but not the window one
+    (a graph refill above all) leaves a fused draft's window layers reading an
+    earlier forward's rows: wrong drafts, no error. The fused window-draft gate
+    admits fa3 and fa4 on this. A source scan, since the module needs sgl_kernel."""
+
+    def test_every_plan_table_fill_also_fills_the_window_table(self):
+        spec = importlib.util.find_spec(
+            "sglang.srt.layers.attention.flashattention_backend"
+        )
+        tree = ast.parse(Path(spec.origin).read_text(encoding="utf-8"))
+        fills = {}
+        for fn in ast.walk(tree):
+            if not isinstance(fn, ast.FunctionDef):
+                continue
+            kinds = {
+                _plan_table_kind(call)
+                for call in ast.walk(fn)
+                if isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Attribute)
+                and call.func.attr in ("copy_page_table", "read_table")
+            }
+            if kinds:
+                fills[fn.name] = kinds
+        # A scan that finds nothing would pass vacuously forever.
+        self.assertGreaterEqual(len(fills), 3, fills)
+        missing = sorted(
+            name
+            for name, kinds in fills.items()
+            if "FULL" in kinds and "SLIDING_WINDOW" not in kinds
+        )
+        self.assertEqual(
+            missing,
+            [],
+            f"{missing} fill the plan's full-attention table without the "
+            "sliding-window one; pass kind=IdSpaceKind.SLIDING_WINDOW too.",
+        )
 
 
 if __name__ == "__main__":

@@ -530,17 +530,53 @@ class FlashAttentionBackend(AttentionBackend):
 
     @property
     def supports_draft_extend_metadata_staging(self) -> bool:
-        return (
-            self.topk == 1
-            and not self.kv_index_translator.is_translating
-            and self.draft_extend_metadata_captured_in_graph()
-        )
+        if self.topk != 1:
+            return False
+        translator = self.kv_index_translator
+        if translator.is_translating:
+            # Staged from the cycle's plan; DCP reads stay virtual and keep
+            # the eager rebuild.
+            return translator.reads_are_translated
+        return self.draft_extend_metadata_captured_in_graph()
 
     def stage_draft_extend_metadata(self, forward_batch: ForwardBatch):
         self.forward_metadata = self.draft_extend_metadata[forward_batch.batch_size]
         self.forward_metadata.max_seq_len_k = self.max_context_len
         self.forward_metadata_spec_decode_expand = None
-        self.init_forward_metadata_in_graph(forward_batch)
+        if self.kv_index_translator.is_translating:
+            self._stage_translated_draft_extend_metadata(forward_batch)
+        else:
+            self.init_forward_metadata_in_graph(forward_batch)
+
+    def _stage_translated_draft_extend_metadata(self, forward_batch: ForwardBatch):
+        """The tables a translating backend's draft-extend graphs read, from the
+        cycle's plan. Every step of a draft chain extends the same window, so
+        one staging serves all of the cycle's replays."""
+        bs = forward_batch.batch_size
+        metadata = self.forward_metadata
+        # Lengths and prefix sums only: the zero-width table skips the kernel's
+        # untranslated page gather, and the plan supplies the pages.
+        draft_extend_set_metadata(
+            cache_seqlens_int32=metadata.cache_seqlens_int32,
+            cu_seqlens_k=metadata.cu_seqlens_k,
+            cu_seqlens_q=metadata.cu_seqlens_q,
+            page_table=metadata.page_table[:, :0],
+            req_to_token=self.req_to_token,
+            req_pool_indices=forward_batch.req_pool_indices[:bs],
+            seq_lens=forward_batch.seq_lens[:bs],
+            extend_seq_lens=forward_batch.extend_seq_lens[:bs],
+            page_size=self.page_size,
+        )
+        translator = self.kv_index_translator
+        plan = forward_batch.kv_loc_plan
+        translator.copy_page_table(plan, out=metadata.page_table)
+        if not self.use_sliding_window_kv_pool:
+            return
+        if metadata.swa_page_table is not None:
+            translator.copy_page_table(
+                plan, out=metadata.swa_page_table, kind=IdSpaceKind.SLIDING_WINDOW
+            )
+        self._refill_swa_write_locations(forward_batch, in_capture=False)
 
     def _in_graph_full_to_swa_index_mapping(self) -> Optional[torch.Tensor]:
         # The in-graph SWA translation needs the raw mapping tensor; v2p-table
@@ -597,6 +633,24 @@ class FlashAttentionBackend(AttentionBackend):
             )[self.speculative_step_id]
         return locations
 
+    def _refill_swa_write_locations(
+        self, forward_batch: ForwardBatch, *, in_capture: bool
+    ) -> None:
+        """Refill the SWA write-target buffer (bound as a metadata view in
+        _bind_metadata_buffers) from the live out_cache_loc before replay."""
+        swa_out_cache_loc = self._get_swa_write_locations(forward_batch)
+        n = swa_out_cache_loc.shape[0]
+        assert_buffer_fits(
+            n,
+            self.cuda_graph_swa_out_cache_loc.shape[0],
+            "full decode SWA write locations",
+        )
+        self.cuda_graph_swa_out_cache_loc[n:].zero_()
+        if in_capture:
+            self.cuda_graph_swa_out_cache_loc[:n].zero_()
+        else:
+            self.cuda_graph_swa_out_cache_loc[:n].copy_(swa_out_cache_loc)
+
     def _init_full_cg_decode_metadata(
         self, forward_batch: ForwardBatch, in_capture: bool
     ):
@@ -610,21 +664,8 @@ class FlashAttentionBackend(AttentionBackend):
         spec_info = forward_batch.spec_info
         out_cache_loc = getattr(forward_batch, "out_cache_loc", None)
 
-        # Refill the SWA write-target buffer (bound as a metadata view in
-        # _bind_metadata_buffers) from the live out_cache_loc before replay.
         if self.use_sliding_window_kv_pool and out_cache_loc is not None:
-            swa_out_cache_loc = self._get_swa_write_locations(forward_batch)
-            n = swa_out_cache_loc.shape[0]
-            assert_buffer_fits(
-                n,
-                self.cuda_graph_swa_out_cache_loc.shape[0],
-                "full decode SWA write locations",
-            )
-            self.cuda_graph_swa_out_cache_loc[n:].zero_()
-            if in_capture:
-                self.cuda_graph_swa_out_cache_loc[:n].zero_()
-            else:
-                self.cuda_graph_swa_out_cache_loc[:n].copy_(swa_out_cache_loc)
+            self._refill_swa_write_locations(forward_batch, in_capture=in_capture)
 
         if self._capture_unified_verify_metadata(forward_batch):
             if in_capture:

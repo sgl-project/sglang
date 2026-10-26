@@ -231,18 +231,28 @@ class TestPlaceFusedDraft(CustomTestCase):
         self.assertIn("cannot share", decision.declined)
 
     def test_a_window_draft_needs_a_rail_carrying_draft_backend(self):
-        """Only the Triton multi-step draft backend builds the per-step window
-        rails; any other draft backend would sink-write the window layers."""
+        """Only the Triton and FA (fa3/fa4) draft backends give each draft step
+        its own window reads and writes; any other could write the window
+        layers into other steps' slots."""
+        for backend in ("triton", "fa3", "fa4"):
+            decision = _place(
+                _profile(window_layer_ids=(0,), window=128),
+                target_window=128,
+                draft_backends=(backend,),
+            )
+            self.assertIsNotNone(decision.placement, backend)
         decision = _place(
             _profile(window_layer_ids=(0,), window=128),
             target_window=128,
-            draft_backends=("fa3",),
+            draft_backends=("flashinfer",),
         )
         self.assertIsNone(decision.placement)
-        self.assertIn("['fa3']", decision.declined)
+        self.assertIn("['flashinfer']", decision.declined)
         self.assertIn("triton", decision.declined)
         # A full-only draft never consults the rail rule.
-        self.assertIsNotNone(_place(_profile(), draft_backends=("fa3",)).placement)
+        self.assertIsNotNone(
+            _place(_profile(), draft_backends=("flashinfer",)).placement
+        )
 
     def test_per_depth_head_needs_one_runner_per_depth(self):
         self.assertIsNone(_place(_profile(num_layers=8, num_depths=8), 1).placement)

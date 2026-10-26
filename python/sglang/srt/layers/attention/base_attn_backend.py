@@ -152,6 +152,14 @@ class AttentionBackend(ABC):
 
     supports_draft_extend_metadata_staging: bool = False
 
+    def stage_draft_extend_metadata(self, forward_batch: ForwardBatch):
+        """Fill the DRAFT_EXTEND_V2 metadata a draft chain's captured steps read,
+        once before the chain's first replay. Called only when
+        ``supports_draft_extend_metadata_staging`` holds."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not stage draft-extend metadata"
+        )
+
     def draft_extend_metadata_captured_in_graph(self) -> bool:
         """True when :py:meth:`init_forward_metadata_in_graph` fully rebuilds
         this backend's DRAFT_EXTEND_V2 replay metadata inside the captured

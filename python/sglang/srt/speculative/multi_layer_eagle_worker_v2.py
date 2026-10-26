@@ -774,6 +774,9 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                 and not b.draft_extend_metadata_captured_in_graph()
                 for b in self.draft_extend_attn_backend_list
             )
+            # Staging here moves the fence to the target's read end; a translating
+            # pool still translates after verify, so its chain keeps the draft's.
+            or self.draft_runner_list[0].kv_index_translator.is_translating
             or runner.require_mlp_tp_gather
             or len(batch.seq_lens) > runner.max_bs
             or (runner.disable_padding and len(batch.seq_lens) not in runner.capture_bs)
