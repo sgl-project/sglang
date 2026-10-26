@@ -1,8 +1,13 @@
+import tempfile
 import unittest
+from datetime import timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 
 from sglang.multimodal_gen.configs.models.vaes.base import (
     VAEConfig,
@@ -30,6 +35,7 @@ from sglang.multimodal_gen.runtime.layers.parallel_conv import (
     SpatialParallelConv2d,
     SpatialParallelConv3d,
     chunk_height_by_sizes,
+    gather_height_sizes,
     split_for_parallel_decode,
 )
 from sglang.multimodal_gen.runtime.models.vaes.autoencoder import AutoencoderKL
@@ -45,6 +51,7 @@ from sglang.multimodal_gen.runtime.models.vaes.hunyuanvae import (
     _enable_hunyuan_decoder_spatial_parallel,
 )
 from sglang.multimodal_gen.runtime.models.vaes.ltx_2_vae import (
+    AutoencoderKLLTX2Video,
     LTX2VideoCausalConv3d,
     LTX2VideoDecoder3d,
     _enable_ltx_decoder_spatial_parallel,
@@ -74,6 +81,25 @@ class _DispatchProbeVAE(ParallelTiledVAE):
         raise AssertionError(
             "spatial_shard decode should not use parallel_tiled_decode"
         )
+
+
+def _gather_heights_on_two_ranks(rank: int, rendezvous: str) -> None:
+    dist.init_process_group(
+        "gloo",
+        init_method=rendezvous,
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=60),
+    )
+    try:
+        # meta tensors carry no data: any device collective on them would fail
+        group = SimpleNamespace(
+            world_size=2, cpu_group=dist.group.WORLD, device_group=None
+        )
+        x = torch.empty(1, 2, (3, 2)[rank], 4, device="meta")
+        assert gather_height_sizes(x, parallel_group=group) == [3, 2]
+    finally:
+        dist.destroy_process_group()
 
 
 class TestVAESpatialParallelDecode(unittest.TestCase):
@@ -266,6 +292,11 @@ class TestVAESpatialParallelDecode(unittest.TestCase):
         self.assertEqual(rank1.shape[-2], 2)
         torch.testing.assert_close(torch.cat([rank0, rank1], dim=-2), x)
 
+    def test_height_sizes_are_gathered_on_the_host(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rendezvous = (Path(tmp) / "rendezvous").as_uri()
+            mp.spawn(_gather_heights_on_two_ranks, args=(rendezvous,), nprocs=2)
+
     def test_chunk_height_by_sizes_keeps_original_partition(self):
         x = torch.arange(10).view(1, 1, 10, 1)
 
@@ -455,6 +486,31 @@ class TestVAESpatialParallelDecode(unittest.TestCase):
         self.assertTrue(
             all(isinstance(m.conv, SpatialParallelConv3d) for m in causal_convs)
         )
+
+    def test_ltx_tile_shards_gather_back_in_tile_order(self):
+        # 3 x 5 tiles with partial last row and column, as 1088x1920 decodes
+        sizes = [(h, w) for h in (16, 16, 6) for w in (16, 16, 16, 16, 4)]
+        tiles = [
+            torch.full((1, 3, 9, h, w), float(idx)) for idx, (h, w) in enumerate(sizes)
+        ]
+        world_size = 2
+        sends = []
+
+        class _Coordinator:
+            def all_gather(self, send, dim=0):
+                sends.append(send)
+                return torch.cat(sends if len(sends) == world_size else [send] * 2)
+
+        target = "sglang.multimodal_gen.runtime.models.vaes.ltx_2_vae.get_decode_parallel_group_coordinator"
+        with patch(target, return_value=_Coordinator()):
+            for rank in range(world_size):
+                gathered = AutoencoderKLLTX2Video._gather_tiles(
+                    tiles[rank::world_size], sizes, world_size
+                )
+
+        self.assertEqual(len(gathered), len(tiles))
+        for got, want in zip(gathered, tiles):
+            self.assertTrue(torch.equal(got, want))
 
     def test_hunyuan_decoder_uses_spatial_parallel_components(self):
         with (
