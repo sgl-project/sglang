@@ -280,6 +280,26 @@ def validate_flashinfer_megamoe_model(server_args: Any) -> None:
         )
 
 
+def _check_mooncake_xpu_scope(cfg: Any) -> None:
+    # Mooncake EP on Intel XPU covers expert parallelism over the TP ranks of
+    # one node; reject what it does not support before it fails mid-forward.
+    unsupported = []
+    if cfg.nnodes > 1:
+        unsupported.append("more than one node (--nnodes)")
+    if attn_dp_enabled_of(cfg):
+        unsupported.append("DP attention (--attn-dp-size)")
+    if cfg.enable_two_batch_overlap or cfg.enable_single_batch_overlap:
+        unsupported.append("two- or single-batch overlap")
+    if cfg.elastic_ep_backend is not None:
+        unsupported.append("elastic EP (--elastic-ep-backend)")
+    if unsupported:
+        raise ValueError(
+            "moe_a2a_backend='mooncake' on XPU supports expert parallelism over "
+            "the TP ranks of one node, e.g. --device xpu --tp 4 --ep-size 4. "
+            "Not supported yet: " + ", ".join(unsupported) + "."
+        )
+
+
 def handle_a2a_moe(server_args: Any):
     # The backend overrides and the ep_size=tp_size adjustments moved to
     # the resolution pipeline (arg_groups/overrides.py:
@@ -572,6 +592,8 @@ def handle_a2a_moe(server_args: Any):
             )
 
     if a2a_backend == "mooncake":
+        if cfg.device == "xpu":
+            _check_mooncake_xpu_scope(cfg)
         if cfg.deepep_mode == "normal":
             raise ValueError(
                 "moe_a2a_backend='mooncake' only supports low-latency mode; "
