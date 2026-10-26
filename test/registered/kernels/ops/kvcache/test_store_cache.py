@@ -398,22 +398,6 @@ def test_store_k_slots_accepts_strided_loc() -> None:
     torch.testing.assert_close(k_buffer, expected, rtol=0.0, atol=0.0)
 
 
-def test_store_k_slots_rejects_non_dense_rows() -> None:
-    head_num, head_dim = 4, 128
-    k_buffer = torch.randn(
-        (SMALL_CACHE, head_num, head_dim), dtype=DTYPE, device=DEVICE
-    )
-    # Sliced along head_dim: the trailing block is no longer a flat run, which the
-    # kernel cannot express. set_k_buffer makes such a source contiguous first.
-    src = torch.randn((8, head_num, head_dim * 2), dtype=DTYPE, device=DEVICE)[
-        :, :, :head_dim
-    ]
-    loc = torch.arange(8, device=DEVICE)
-
-    with pytest.raises(AssertionError):
-        store_k_slots(k_buffer, src, loc)
-
-
 @pytest.mark.parametrize(
     "dtype", [torch.float16, torch.bfloat16, torch.float32, torch.uint8]
 )
@@ -430,14 +414,24 @@ def test_store_k_slots_dtypes(dtype: torch.dtype) -> None:
     torch.testing.assert_close(k_buffer, expected, rtol=0.0, atol=0.0)
 
 
-@pytest.mark.parametrize("layout", ["two_dimensional", "float"])
-def test_store_k_slots_rejects_unsupported_loc(layout: str) -> None:
-    if layout == "two_dimensional":
-        loc = torch.arange(8, device=DEVICE).view(2, 4)
+@pytest.mark.parametrize("case", ["non_dense_rows", "two_dimensional_loc", "float_loc"])
+def test_store_k_slots_rejects_unsupported_inputs(case: str) -> None:
+    head_num, head_dim = 4, 128
+    k_buffer = torch.randn(
+        (SMALL_CACHE, head_num, head_dim), dtype=DTYPE, device=DEVICE
+    )
+    src = torch.randn((8, head_num, head_dim), dtype=DTYPE, device=DEVICE)
+    loc = torch.arange(8, device=DEVICE)
+    if case == "non_dense_rows":
+        # Sliced along head_dim: the trailing block is no longer a flat run, which
+        # the kernel cannot express. set_k_buffer makes such a source contiguous first.
+        src = torch.randn((8, head_num, 2 * head_dim), dtype=DTYPE, device=DEVICE)[
+            ..., :head_dim
+        ]
+    elif case == "two_dimensional_loc":
+        loc = loc.view(2, 4)
     else:
-        loc = torch.arange(8, device=DEVICE, dtype=torch.float32)
-    src = torch.randn((8, 1, 64), dtype=DTYPE, device=DEVICE)
-    k_buffer = torch.randn((SMALL_CACHE, 1, 64), dtype=DTYPE, device=DEVICE)
+        loc = loc.float()
 
     with pytest.raises(AssertionError):
         store_k_slots(k_buffer, src, loc)
@@ -464,54 +458,47 @@ def _dense(t: torch.Tensor, num_tokens: int) -> bool:
     return _has_dense_kv_rows(t, GUARD_HEAD_NUM, GUARD_HEAD_DIM, num_tokens)
 
 
-def test_dense_kv_rows_accepts_qkv_column_slice() -> None:
-    k = _qkv_k_slice(8)
-    assert not k.is_contiguous()
-    assert k.stride() == (QKV_WIDTH, 1)
-    assert _dense(k, 8)
-
-
-def test_dense_kv_rows_accepts_contiguous_and_token_strided() -> None:
-    flat = torch.zeros((8, GUARD_ROW), dtype=DTYPE, device=DEVICE)
-    split = torch.zeros((8, GUARD_HEAD_NUM, GUARD_HEAD_DIM), dtype=DTYPE, device=DEVICE)
-    # Dense (head, dim) block with gaps between tokens: in contract.
-    strided = torch.zeros(
-        (16, GUARD_HEAD_NUM, GUARD_HEAD_DIM), dtype=DTYPE, device=DEVICE
-    )[::2]
-    assert not strided.is_contiguous()
-    assert _dense(flat, 8) and _dense(split, 8) and _dense(strided, 8)
-
-
-@pytest.mark.parametrize("layout", ["qkv_slice", "flat", "split"])
-def test_dense_kv_rows_rejects_wrong_token_count(layout: str) -> None:
-    # Right row layout, more tokens than loc. reshape_and_cache_flash sizes its
-    # grid from shape[0] and reads the slot index unmasked, so this overruns loc.
+def _kv_rows(layout: str) -> torch.Tensor:
+    """Eight tokens of K in a layout a store can be handed."""
+    n, h, d = 8, GUARD_HEAD_NUM, GUARD_HEAD_DIM
     if layout == "qkv_slice":
-        t = _qkv_k_slice(8)
-    elif layout == "flat":
-        t = torch.zeros((8, GUARD_ROW), dtype=DTYPE, device=DEVICE)
-    else:
-        t = torch.zeros((8, GUARD_HEAD_NUM, GUARD_HEAD_DIM), dtype=DTYPE, device=DEVICE)
-    assert _dense(t, 8)
-    assert not _dense(t, 4)
+        return _qkv_k_slice(n)
+    if layout == "flat":
+        return torch.zeros((n, h * d), dtype=DTYPE, device=DEVICE)
+    if layout == "split":
+        return torch.zeros((n, h, d), dtype=DTYPE, device=DEVICE)
+    if layout == "token_strided":
+        return torch.zeros((2 * n, h, d), dtype=DTYPE, device=DEVICE)[::2]
+    if layout == "head_dim_sliced":
+        return torch.zeros((n, h, 2 * d), dtype=DTYPE, device=DEVICE)[..., :d]
+    if layout == "transposed":
+        return torch.zeros((n, d, h), dtype=DTYPE, device=DEVICE).transpose(1, 2)
+    return torch.zeros((2, n, h, d), dtype=DTYPE, device=DEVICE)[:, ::2]
 
 
-def test_dense_kv_rows_rejects_non_dense_trailing_block() -> None:
-    # Sliced along head_dim: the trailing block is no longer a flat run.
-    sliced = torch.zeros(
-        (8, GUARD_HEAD_NUM, 2 * GUARD_HEAD_DIM), dtype=DTYPE, device=DEVICE
-    )[:, :, :GUARD_HEAD_DIM]
-    transposed = torch.zeros(
-        (8, GUARD_HEAD_DIM, GUARD_HEAD_NUM), dtype=DTYPE, device=DEVICE
-    ).transpose(1, 2)
-    assert tuple(transposed.shape) == (8, GUARD_HEAD_NUM, GUARD_HEAD_DIM)
-    assert not _dense(sliced, 8)
-    assert not _dense(transposed, 8)
-
-
-def test_dense_kv_rows_rejects_unsupported_rank() -> None:
-    t4 = torch.zeros((2, 4, GUARD_HEAD_NUM, GUARD_HEAD_DIM), dtype=DTYPE, device=DEVICE)
-    assert not _dense(t4[:, ::2], 4)
+# (layout, tokens checked, contiguous, dense). Holding more rows than loc is rejected:
+# reshape_and_cache_flash sizes its grid from shape[0] and would read loc past its end.
+@pytest.mark.parametrize(
+    "layout,num_tokens,contiguous,dense",
+    [
+        ("qkv_slice", 8, False, True),
+        ("flat", 8, True, True),
+        ("split", 8, True, True),
+        ("token_strided", 8, False, True),
+        ("qkv_slice", 4, False, False),
+        ("flat", 4, True, False),
+        ("split", 4, True, False),
+        ("head_dim_sliced", 8, False, False),
+        ("transposed", 8, False, False),
+        ("rank_4", 8, False, False),
+    ],
+)
+def test_dense_kv_rows(
+    layout: str, num_tokens: int, contiguous: bool, dense: bool
+) -> None:
+    t = _kv_rows(layout)
+    assert t.numel() == 8 * GUARD_ROW and t.is_contiguous() == contiguous
+    assert _dense(t, num_tokens) == dense
 
 
 def test_as_token_head_dim_does_not_copy() -> None:
@@ -566,12 +553,6 @@ def _can_store(pool: _PoolStub, num_tokens: int = 8, **kwargs) -> bool:
 def test_can_store_kv_fused_cast_accepts_flat_slot_indexed_buffer() -> None:
     assert _can_store(_PoolStub())
     assert _can_store(_PoolStub(), k_scale=1.0, v_scale=1.0)
-
-
-def test_can_store_kv_fused_cast_rejects_paged_per_layer_buffer() -> None:
-    # store_kv_fused_cast presents the buffer as page-size 1 via unsqueeze(1),
-    # which mis-indexes a buffer that is already paged.
-    assert not _can_store(_PoolStub(buffer_dims=4))
 
 
 def test_can_store_kv_fused_cast_rejects_scales_that_divide() -> None:
@@ -639,24 +620,27 @@ def test_set_kv_buffer_divides_unless_scale_is_host_one(scale_kind: str) -> None
         assert (cache_k._version, cache_v._version) == versions
 
 
-def test_can_store_kv_fused_cast_rejects_e5m2() -> None:
-    assert not _can_store(_PoolStub(dtype=torch.float8_e5m2))
-
-
 @pytest.mark.parametrize(
-    "attr,value",
+    "buffer_dims,attr,value",
     [
-        ("dtype", DTYPE),  # source already in cache dtype
-        ("v_head_dim", GUARD_HEAD_DIM // 2),
-        ("kv_cache_layout", "hnd"),
-        ("use_hnd", True),
-        ("is_quantized_kv_cache", True),
-        ("store_dtype", DTYPE),
+        # store_kv_fused_cast presents the buffer as page-size 1 via unsqueeze(1),
+        # which mis-indexes a buffer that is already paged.
+        (4, None, None),
+        (3, "dtype", torch.float8_e5m2),
+        (3, "dtype", DTYPE),  # source already in cache dtype
+        (3, "v_head_dim", GUARD_HEAD_DIM // 2),
+        (3, "kv_cache_layout", "hnd"),
+        (3, "use_hnd", True),
+        (3, "is_quantized_kv_cache", True),
+        (3, "store_dtype", DTYPE),
     ],
 )
-def test_can_store_kv_fused_cast_rejects_unsupported_pool(attr: str, value) -> None:
-    pool = _PoolStub()
-    setattr(pool, attr, value)
+def test_can_store_kv_fused_cast_rejects_unsupported_pool(
+    buffer_dims: int, attr, value
+) -> None:
+    pool = _PoolStub(buffer_dims=buffer_dims)
+    if attr is not None:
+        setattr(pool, attr, value)
     assert not _can_store(pool)
 
 
@@ -795,41 +779,6 @@ def test_store_kv_fused_cast_skips_out_of_range_slots(async_assert_off) -> None:
     torch.testing.assert_close(v_backing, expected_v, rtol=0.0, atol=0.0)
 
 
-def test_reshape_and_cache_flash_writes_slot_zero_by_default() -> None:
-    # The AITER backend's fused KV write relies on the default skipping no slot.
-    key = torch.randn((2, GUARD_HEAD_NUM, GUARD_HEAD_DIM), dtype=DTYPE, device=DEVICE)
-    key_cache = torch.zeros(
-        (SMALL_CACHE, 1, GUARD_HEAD_NUM, GUARD_HEAD_DIM), dtype=DTYPE, device=DEVICE
-    )
-    value_cache = torch.zeros_like(key_cache)
-    loc = torch.tensor([0, 5], dtype=torch.int64, device=DEVICE)
-
-    launch_reshape_and_cache_flash(key, key, key_cache, value_cache, loc)
-
-    torch.testing.assert_close(key_cache[[0, 5], 0], key, rtol=0.0, atol=0.0)
-
-
-def test_reshape_and_cache_flash_accepts_strided_slot_mapping() -> None:
-    key = torch.randn((3, GUARD_HEAD_NUM, GUARD_HEAD_DIM), dtype=DTYPE, device=DEVICE)
-    key_cache = torch.zeros(
-        (SMALL_CACHE, 1, GUARD_HEAD_NUM, GUARD_HEAD_DIM), dtype=DTYPE, device=DEVICE
-    )
-    value_cache = torch.zeros_like(key_cache)
-    loc = torch.tensor(
-        [2, 101, 5, 102, SMALL_CACHE - 1, 103],
-        dtype=torch.int64,
-        device=DEVICE,
-    )[::2]
-    assert not loc.is_contiguous()
-    expected = torch.zeros_like(key_cache)
-    expected[loc, 0] = key
-
-    launch_reshape_and_cache_flash(key, key, key_cache, value_cache, loc)
-
-    torch.testing.assert_close(key_cache, expected, rtol=0.0, atol=0.0)
-    torch.testing.assert_close(value_cache, expected, rtol=0.0, atol=0.0)
-
-
 def test_reshape_and_cache_flash_kernel_launches_with_original_arguments() -> None:
     # The raw kernel is public: the slot-skip and bound parameters must stay
     # optional and off by default.
@@ -865,99 +814,64 @@ def test_reshape_and_cache_flash_kernel_launches_with_original_arguments() -> No
     torch.testing.assert_close(value_cache[loc, 0], key, rtol=0.0, atol=0.0)
 
 
-@pytest.mark.parametrize("size_limit", [None, SMALL_CACHE])
-def test_reshape_and_cache_flash_writes_every_in_range_slot(size_limit) -> None:
-    # Neither the default (no bound) nor a bound at the cache's slot count may skip
-    # the first or last slot.
-    key = torch.randn((3, GUARD_HEAD_NUM, GUARD_HEAD_DIM), dtype=DTYPE, device=DEVICE)
-    key_cache = torch.zeros(
-        (SMALL_CACHE, 1, GUARD_HEAD_NUM, GUARD_HEAD_DIM), dtype=DTYPE, device=DEVICE
-    )
-    value_cache = torch.zeros_like(key_cache)
-    loc = torch.tensor([0, 5, SMALL_CACHE - 1], dtype=torch.int64, device=DEVICE)
-
-    launch_reshape_and_cache_flash(
-        key, key, key_cache, value_cache, loc, size_limit=size_limit
-    )
-
-    torch.testing.assert_close(key_cache[loc, 0], key, rtol=0.0, atol=0.0)
-    torch.testing.assert_close(value_cache[loc, 0], key, rtol=0.0, atol=0.0)
-
-
-def test_reshape_and_cache_flash_size_limit_skips_out_of_range_slots() -> None:
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        pytest.param({}, id="default"),
+        pytest.param({"size_limit": SMALL_CACHE}, id="size_limit"),
+        pytest.param({"skip_slot_zero": True}, id="skip_slot_zero"),
+        pytest.param(
+            {"skip_slot_zero": True, "size_limit": SMALL_CACHE},
+            id="skip_slot_zero_and_size_limit",
+        ),
+    ],
+)
+def test_reshape_and_cache_flash_writes_only_allowed_slots(kwargs: dict) -> None:
+    # The default writes slot 0, which the AITER backend's KV write relies on; a
+    # bound at the slot count still writes the last slot and skips any past it.
     shape = (SMALL_CACHE, 1, GUARD_HEAD_NUM, GUARD_HEAD_DIM)
     k_backing, key_cache = _guarded(shape, DTYPE)
     v_backing, value_cache = _guarded(shape, DTYPE)
-    in_range = [0, SMALL_CACHE - 1]
-    loc = torch.tensor(in_range + OUT_OF_RANGE_SLOTS, device=DEVICE)
+    in_range = [0, 5, SMALL_CACHE - 1]
+    out_of_range = OUT_OF_RANGE_SLOTS if "size_limit" in kwargs else []
+    loc = torch.tensor(in_range + out_of_range, dtype=torch.int64, device=DEVICE)
     key = torch.randn((loc.numel(), *shape[2:]), dtype=DTYPE, device=DEVICE)
     key[len(in_range) :] = torch.nan
+    skip_zero = kwargs.get("skip_slot_zero", False)
+    written = [i for i, slot in enumerate(in_range) if slot != 0 or not skip_zero]
     expected_k, expected_v = k_backing.clone(), v_backing.clone()
     for expected in (expected_k, expected_v):
-        expected[[GUARD + slot for slot in in_range], 0] = key[: len(in_range)]
+        expected[[GUARD + in_range[i] for i in written], 0] = key[written]
 
-    launch_reshape_and_cache_flash(
-        key, key, key_cache, value_cache, loc, size_limit=SMALL_CACHE
-    )
+    launch_reshape_and_cache_flash(key, key, key_cache, value_cache, loc, **kwargs)
 
     torch.testing.assert_close(k_backing, expected_k, rtol=0.0, atol=0.0)
     torch.testing.assert_close(v_backing, expected_v, rtol=0.0, atol=0.0)
 
 
-@pytest.mark.parametrize("size_limit", [None, SMALL_CACHE])
-def test_reshape_and_cache_flash_skips_reserved_slot(size_limit) -> None:
-    key = torch.randn((3, GUARD_HEAD_NUM, GUARD_HEAD_DIM), dtype=DTYPE, device=DEVICE)
+@pytest.mark.parametrize(
+    "case", ["size_limit_past_cache", "size_limit_with_swa", "strided_slot_mapping"]
+)
+def test_reshape_and_cache_flash_rejects_unsupported_arguments(case: str) -> None:
+    key = torch.randn((2, GUARD_HEAD_NUM, GUARD_HEAD_DIM), dtype=DTYPE, device=DEVICE)
     key_cache = torch.zeros(
         (SMALL_CACHE, 1, GUARD_HEAD_NUM, GUARD_HEAD_DIM), dtype=DTYPE, device=DEVICE
     )
-    value_cache = torch.zeros_like(key_cache)
-    loc = torch.tensor([0, 5, SMALL_CACHE - 1], dtype=torch.int64, device=DEVICE)
-
-    launch_reshape_and_cache_flash(
-        key,
-        key,
-        key_cache,
-        value_cache,
-        loc,
-        reserved_skip_index=0,
-        size_limit=size_limit,
-    )
-
-    for cache in (key_cache, value_cache):
-        assert torch.all(cache[0] == 0)
-        torch.testing.assert_close(cache[loc[1:], 0], key[1:], rtol=0.0, atol=0.0)
-
-
-def test_reshape_and_cache_flash_rejects_size_limit_past_cache() -> None:
-    key = torch.randn((1, GUARD_HEAD_NUM, GUARD_HEAD_DIM), dtype=DTYPE, device=DEVICE)
-    key_cache = torch.zeros(
-        (SMALL_CACHE, 1, GUARD_HEAD_NUM, GUARD_HEAD_DIM), dtype=DTYPE, device=DEVICE
-    )
-    loc = torch.zeros(1, dtype=torch.int64, device=DEVICE)
-
-    with pytest.raises(AssertionError):
-        launch_reshape_and_cache_flash(
-            key, key, key_cache, key_cache.clone(), loc, size_limit=SMALL_CACHE + 1
+    loc = torch.zeros(2, dtype=torch.int64, device=DEVICE)
+    kwargs = {}
+    if case == "size_limit_past_cache":
+        kwargs["size_limit"] = SMALL_CACHE + 1
+    elif case == "size_limit_with_swa":
+        kwargs["swa_slot_mapping"] = torch.zeros(
+            SMALL_CACHE, dtype=torch.int64, device=DEVICE
         )
-
-
-def test_reshape_and_cache_flash_rejects_size_limit_with_swa() -> None:
-    key = torch.randn((1, GUARD_HEAD_NUM, GUARD_HEAD_DIM), dtype=DTYPE, device=DEVICE)
-    key_cache = torch.zeros(
-        (SMALL_CACHE, 1, GUARD_HEAD_NUM, GUARD_HEAD_DIM), dtype=DTYPE, device=DEVICE
-    )
-    loc = torch.zeros(1, dtype=torch.int64, device=DEVICE)
-    swa_slot_mapping = torch.zeros(SMALL_CACHE, dtype=torch.int64, device=DEVICE)
+        kwargs["size_limit"] = SMALL_CACHE
+    else:
+        loc = torch.zeros(4, dtype=torch.int64, device=DEVICE)[::2]
 
     with pytest.raises(AssertionError):
         launch_reshape_and_cache_flash(
-            key,
-            key,
-            key_cache,
-            key_cache.clone(),
-            loc,
-            swa_slot_mapping,
-            size_limit=SMALL_CACHE,
+            key, key, key_cache, key_cache.clone(), loc, **kwargs
         )
 
 

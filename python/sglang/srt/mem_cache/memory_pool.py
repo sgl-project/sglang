@@ -32,7 +32,7 @@ import time
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, fields
 from functools import cached_property
-from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, TypeGuard, Union
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -150,9 +150,7 @@ def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
     return np.prod(t.shape) * t.dtype.itemsize
 
 
-def _kv_scale_divides(
-    scale: Optional[Union[float, torch.Tensor]],
-) -> TypeGuard[Union[float, torch.Tensor]]:
+def _kv_scale_divides(scale: Optional[Union[float, torch.Tensor]]) -> bool:
     """Host scalars only: reading a device tensor would sync, illegal under graph
     capture, so a tensor scale always divides."""
     if scale is None:
@@ -2896,7 +2894,7 @@ class MHATokenToKVPool(KVCache):
             loc,
             # Slot 0 is the padding slot: store_cache skips it too, the naive fallback
             # writes it. An out-of-range slot is skipped, where store_cache asserts.
-            reserved_skip_index=0,
+            skip_slot_zero=True,
             size_limit=self.size + self.page_size,
         )
 

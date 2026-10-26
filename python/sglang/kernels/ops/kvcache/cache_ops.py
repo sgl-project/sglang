@@ -172,11 +172,9 @@ def reshape_and_cache_flash(
     BLOCK_D: tl.constexpr,
     HAS_SWA: tl.constexpr,
     USE_SCALE: tl.constexpr,
-    reserved_skip_index=-1,
     size_limit=0,
-    HAS_RESERVED_SKIP: tl.constexpr = False,
+    SKIP_SLOT_ZERO: tl.constexpr = False,
     HAS_SIZE_LIMIT: tl.constexpr = False,
-    slot_mapping_stride=1,
 ):
     """
     Triton kernel for reshaping per-token K/V tensors into paged KV cache layout.
@@ -194,7 +192,7 @@ def reshape_and_cache_flash(
     Features:
         - optional SWA slot remapping
         - optional FP8 scale dequantization before cache write
-        - optional reserved-slot skip and slot upper bound
+        - optional slot-0 skip and slot upper bound
 
     Args:
         key_ptr: Pointer to source key tensor.
@@ -215,14 +213,11 @@ def reshape_and_cache_flash(
         BLOCK_D: Vectorized dimension size (power-of-2 padded).
         HAS_SWA: Enable SWA remapping.
         USE_SCALE: Enable scale division before storing.
-        reserved_skip_index: Slot whose writes are skipped; read only when
-            HAS_RESERVED_SKIP.
         size_limit: Writes to slots >= size_limit are skipped; read only when
             HAS_SIZE_LIMIT. Checked after the SWA remap, so it does not bound the
             swa_slot_mapping lookup.
-        HAS_RESERVED_SKIP: Enable the reserved_skip_index skip.
+        SKIP_SLOT_ZERO: Skip writes to slot 0, the reserved padding slot.
         HAS_SIZE_LIMIT: Enable the size_limit bound.
-        slot_mapping_stride: Element stride between token slot mappings.
     """
 
     # ----------------------------------
@@ -236,7 +231,7 @@ def reshape_and_cache_flash(
     # ----------------------------------
     # slot mapping
     # ----------------------------------
-    slot_idx = tl.load(slot_mapping_ptr + token_idx * slot_mapping_stride)
+    slot_idx = tl.load(slot_mapping_ptr + token_idx)
 
     if HAS_SWA:
         slot_idx = tl.load(swa_slot_mapping_ptr + slot_idx)
@@ -245,8 +240,8 @@ def reshape_and_cache_flash(
     # multiplied by the cache row stride.
     slot_idx = slot_idx.to(tl.int64)
     skip = slot_idx < 0
-    if HAS_RESERVED_SKIP:
-        skip = skip | (slot_idx == reserved_skip_index)
+    if SKIP_SLOT_ZERO:
+        skip = skip | (slot_idx == 0)
     if HAS_SIZE_LIMIT:
         skip = skip | (slot_idx >= size_limit)
     if skip:
@@ -307,7 +302,7 @@ def launch_reshape_and_cache_flash(
     swa_slot_mapping=None,
     k_scale=None,
     v_scale=None,
-    reserved_skip_index=-1,
+    skip_slot_zero=False,
     size_limit=None,
 ):
     """
@@ -325,9 +320,8 @@ def launch_reshape_and_cache_flash(
         swa_slot_mapping: Optional SWA remapping table
         k_scale: Optional key scaling factor
         v_scale: Optional value scaling factor
-        reserved_skip_index: Slot whose writes are skipped, e.g. the reserved
-            padding slot 0 that store_cache skips; a negative value (default -1)
-            skips none.
+        skip_slot_zero: Skip writes to slot 0, the reserved padding slot that
+            store_cache skips. False (default) skips none.
         size_limit: If set, writes to slots >= size_limit are skipped; must not
             exceed the caches' slot count. Not supported with swa_slot_mapping,
             whose lookup it would not bound. None (default) checks no upper bound.
@@ -337,6 +331,7 @@ def launch_reshape_and_cache_flash(
     num_heads = key.shape[1]
     head_size = key.shape[2]
 
+    assert slot_mapping.is_contiguous(), "slot_mapping must be contiguous"
     if size_limit is not None:
         assert swa_slot_mapping is None, (
             "size_limit does not bound the swa_slot_mapping lookup"
@@ -377,11 +372,9 @@ def launch_reshape_and_cache_flash(
         BLOCK_D=BLOCK_D,
         HAS_SWA=(swa_slot_mapping is not None),
         USE_SCALE=(k_scale is not None),
-        reserved_skip_index=reserved_skip_index,
         size_limit=size_limit if size_limit is not None else 0,
-        HAS_RESERVED_SKIP=(reserved_skip_index >= 0),
+        SKIP_SLOT_ZERO=skip_slot_zero,
         HAS_SIZE_LIMIT=(size_limit is not None),
-        slot_mapping_stride=slot_mapping.stride(0),
     )
 
 
