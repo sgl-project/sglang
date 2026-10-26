@@ -719,7 +719,7 @@ class ModelConfig:
         # Config draft model
         self._config_draft_model()
 
-        # Mixed FP8/MXFP4 ckpts mark mxfp4 routed experts via this key.
+        # Mixed FP8/MXFP4 ckpts usually mark mxfp4 routed experts via this key.
         quantization_config = (
             _quant_config_to_dict(getattr(self.hf_config, "quantization_config", None))
             or {}
@@ -731,6 +731,24 @@ class ModelConfig:
         self.is_fp4_experts: bool = routed_experts_quant_method == "mxfp4"
         if self.is_fp4_experts:
             logger.info("Detected mixed checkpoint layout: routed experts are MXFP4.")
+
+        # MiniMax-M3.1-Flash Quark MXFP4 uses the global FP4 specification for
+        # routed experts and per-layer block-FP8 specifications for shared
+        # experts, but does not set routed_experts_quant_method. Mark this as
+        # mixed so FusedMoE requantizes an FP8 shared expert before fusing it
+        # into the packed MXFP4 routed-expert buffer.
+        global_weight_config = (
+            (quantization_config.get("global_quant_config") or {}).get("weight") or {}
+        )
+        if (
+            not self.is_fp4_experts
+            and getattr(self.hf_config, "model_type", None) == "minimax_m3_vl"
+            and str(global_weight_config.get("dtype", "")).lower() == "fp4"
+        ):
+            self.is_fp4_experts = True
+            logger.info(
+                "Detected MiniMax-M3 Quark mixed layout: routed experts are MXFP4."
+            )
 
         # MiMo-V2 mxfp4 ckpts declare the routed-expert layout via store_dtype.
         if (
