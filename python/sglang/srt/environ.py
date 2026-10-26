@@ -1566,6 +1566,12 @@ class Envs:
     # than the graph saves (e.g. DeepEP MoE workspace captured at full dispatch
     # capacity).
     SGLANG_DISABLE_DRAFT_EXTEND_CUDA_GRAPH = EnvBool(False)
+    # Greedy topk=1 EAGLE drafts (decode steps and draft extend) take the token
+    # from per-rank vocab-shard argmax candidates exchanged by a small all-reduce
+    # instead of all-gathering the full logits. Bit-identical tokens; falls back
+    # to the gather when the TP all-reduce would go to NCCL or the LM head layout
+    # is not plain vocab-parallel.
+    SGLANG_SPEC_DRAFT_ARGMAX_EXCHANGE = EnvBool(True)
     # Use the split-KV (flash-decode) kernel for EAGLE target-verify on the
     # Triton backend (ROCm). Only active at speculative topk == 1; falls back to
     # extend_attention_fwd for unsupported cases or when set false (e.g. for

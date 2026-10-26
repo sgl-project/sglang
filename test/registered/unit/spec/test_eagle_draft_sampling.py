@@ -26,7 +26,9 @@ class TestEagleDraftSamplingPosition(CustomTestCase):
         worker.device = torch.device("cpu")
 
         logits_output = SimpleNamespace(
-            next_token_logits=torch.zeros(8, 16), hidden_states=None
+            next_token_logits=torch.zeros(8, 16),
+            next_token_argmax_partials=None,
+            hidden_states=None,
         )
         worker.draft_runner = SimpleNamespace(
             canary_manager=None,
