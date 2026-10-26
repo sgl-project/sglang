@@ -78,7 +78,7 @@ from sglang.multimodal_gen.runtime.platforms import (
 from sglang.multimodal_gen.runtime.platforms.aiter import USE_AITER
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, is_device_stream_capturing
 
 if current_platform.is_xpu():
     # CuTe DSL (cutlass) is unavailable on XPU; use the unfused q/k norm path.
@@ -1443,7 +1443,7 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             or not isinstance(source, torch.Tensor)
             or self.layerwise_offload_managers
             or torch.compiler.is_compiling()
-            or torch.cuda.is_current_stream_capturing()
+            or is_device_stream_capturing(context.device)
             or not self._plain_blocks()
             or not all(
                 type(block.attn2) is WanT2VCrossAttention
