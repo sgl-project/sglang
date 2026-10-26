@@ -227,15 +227,10 @@ class FlashAttentionBackend(AttentionBackend):
             self.speculative_num_draft_tokens is not None
             and model_runner.is_draft_worker
         ):
-            # Static verify width; NOTE: overwrites the config-named attr in place.
-            self.speculative_num_draft_tokens = resolve_num_tokens_per_req(
-                phase="target_verify",
-                spec_algorithm=SpeculativeAlgorithm.from_string(
-                    get_spec().speculative_algorithm
-                ),
-                is_draft_worker=True,
-                num_draft_tokens=int(self.speculative_num_draft_tokens),
-            )
+            # Static verify width; use model_runner.decode_num_tokens_per_req()
+            # as the source of truth, which correctly handles DSpark's
+            # sample_from_anchor=False case (gamma+1 rows per request).
+            self.speculative_num_draft_tokens = model_runner.decode_num_tokens_per_req()
         self.speculative_step_id = speculative_step_id
 
         self.local_attn_builder = self._maybe_init_local_attn_builder(model_runner)
