@@ -3299,7 +3299,7 @@ class TestDcpWidening(unittest.TestCase):
         return cache, walk
 
     def test_mamba_slot_cost_is_in_the_same_units_as_available_size(self):
-        """The planner charges `mamba_slot_full_token_cost()` against a budget
+        """Admission charges the state-slot cost against a budget
         fed by `available_size()`. Both are bytes/entry_bytes conversions, so
         both carry `dcp_size`; if only the budget widens, every Mamba state is
         under-reserved by that factor and a batch is admitted whose later
@@ -3307,7 +3307,7 @@ class TestDcpWidening(unittest.TestCase):
         for page_size in (1, 8):
             with self._dcp(1):
                 base = self._build_composite(page_size=page_size)
-                base_cost = base.mamba_slot_full_token_cost()
+                base_cost = base.admission_rules().state_slot_cost
                 base_avail = base.available_size()
                 self.assertGreater(base_cost, 0)
             for dcp_size in (2, 4):
@@ -3316,7 +3316,7 @@ class TestDcpWidening(unittest.TestCase):
                     self.assertEqual(a.available_size(), base_avail * dcp_size)
                     mamba_bytes = a.mamba_allocator.entry_bytes_per_page
                     full_entry = a.full_attn_allocator.entry_bytes
-                    cost = a.mamba_slot_full_token_cost()
+                    cost = a.admission_rules().state_slot_cost
                     # A widened token is `full_entry / dcp_size` bytes, so the
                     # reservation covers the slot...
                     self.assertGreaterEqual(cost * full_entry, mamba_bytes * dcp_size)
@@ -3343,7 +3343,7 @@ class TestDcpWidening(unittest.TestCase):
                 self.assertEqual(bound, expected)
                 self.assertLessEqual(
                     bound,
-                    missing_slots * allocator.mamba_slot_full_token_cost(),
+                    missing_slots * allocator.admission_rules().state_slot_cost,
                 )
 
     def test_allocation_flush_public_wrapper_is_urgent(self):

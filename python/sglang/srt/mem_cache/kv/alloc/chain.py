@@ -31,7 +31,10 @@ from sglang.srt.mem_cache.allocator.unified_sub_pool import (
     _full_tokens_before_mamba_recheck,
     install_move_gate,
 )
-from sglang.srt.mem_cache.kv.alloc.interim import interim_policy_for
+from sglang.srt.mem_cache.kv.alloc.interim import (
+    ChainAdmissionRules,
+    interim_policy_for,
+)
 from sglang.srt.mem_cache.kv.alloc.pricing import ChainSnapshot, snapshot_chain
 from sglang.srt.mem_cache.unified_memory_pool import UnifiedKVPool
 from sglang.srt.runtime_context import get_parallel
@@ -339,9 +342,17 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             self, tree_cache, full_tokens, swa_tokens
         )
 
+    def admission_rules(self) -> ChainAdmissionRules:
+        return self._policy.admission_rules(self)
+
     def create_prefill_budget(self, tree_cache, *, num_mixed_decode_tokens=0):
-        return self._policy.create_prefill_budget(
-            self, tree_cache, num_mixed_decode_tokens=num_mixed_decode_tokens
+        from sglang.srt.mem_cache.prefill_budget import ChainPrefillBudget
+
+        return ChainPrefillBudget(
+            self,
+            tree_cache,
+            rules=self.admission_rules(),
+            num_mixed_decode_tokens=num_mixed_decode_tokens,
         )
 
     def swa_capacity_and_available(self, *, full_capacity, swa_capacity):
@@ -395,9 +406,6 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
 
     def prepare_mamba_allocation(self, target_size: int) -> None:
         self._policy.prepare_mamba_allocation(self, target_size)
-
-    def mamba_slot_full_token_cost(self) -> int:
-        return self._policy.mamba_slot_full_token_cost(self)
 
     # -- translation --
 

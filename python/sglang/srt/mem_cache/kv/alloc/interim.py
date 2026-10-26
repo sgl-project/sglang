@@ -10,8 +10,9 @@ admission, reclaim and compaction outcomes.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Literal, Optional, Tuple
 
+import msgspec
 import torch
 
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -47,6 +48,19 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator
 
 
+class ChainAdmissionRules(msgspec.Struct, frozen=True, kw_only=True):
+    """Which admission rule a unified chain uses.
+
+    `window` says how window tokens are admitted: "none" (no window sub-pool),
+    "split" (checked apart from the owner's tokens) or "joint" (owner and window
+    tokens in one reservation over the shared bytes).
+    """
+
+    window: Literal["none", "split", "joint"]
+    # Full-token equivalents one new state slot takes from the shared bytes; 0: no state.
+    state_slot_cost: int = 0
+
+
 def _snapshot(c: ChainAllocator) -> ChainSnapshot:
     return c.pricing_snapshot()
 
@@ -77,12 +91,8 @@ class _InterimPolicy:
     def prealloc_fits(self, c: ChainAllocator, tree_cache, *args, **kwargs) -> bool:
         return BaseTokenToKVPoolAllocator.prealloc_fits(c, tree_cache, *args, **kwargs)
 
-    def create_prefill_budget(
-        self, c: ChainAllocator, tree_cache, *, num_mixed_decode_tokens=0
-    ):
-        return BaseTokenToKVPoolAllocator.create_prefill_budget(
-            c, tree_cache, num_mixed_decode_tokens=num_mixed_decode_tokens
-        )
+    def admission_rules(self, c: ChainAllocator) -> ChainAdmissionRules:
+        raise NotImplementedError
 
     def max_new_tokens_for_memory(self, c: ChainAllocator, *args, **kwargs):
         return BaseTokenToKVPoolAllocator.max_new_tokens_for_memory(c, *args, **kwargs)
@@ -99,9 +109,6 @@ class _InterimPolicy:
 
     def mamba_full_cache_donor(self, c: ChainAllocator):
         return None
-
-    def mamba_slot_full_token_cost(self, c: ChainAllocator) -> int:
-        return 0
 
     def resize(self, c: ChainAllocator, config) -> None:
         raise NotImplementedError(
@@ -155,7 +162,12 @@ class _TokenAndSlotEndsPolicy(_InterimPolicy):
         if target_size > c.mamba_allocator.available_size():
             _relieve_for_alloc(c.mamba_allocator, target_size)
 
-    def mamba_slot_full_token_cost(self, c: ChainAllocator) -> int:
+    def admission_rules(self, c: ChainAllocator) -> ChainAdmissionRules:
+        return ChainAdmissionRules(
+            window="none", state_slot_cost=self._state_slot_cost(c)
+        )
+
+    def _state_slot_cost(self, c: ChainAllocator) -> int:
         """Full-token-equivalents of shared-gap bytes ONE mamba state consumes; the
         prefill planner reserves this so admission stays inside the JOINT budget,
         rounded UP. The `dcp_size` factor is there because that budget is in widened
@@ -461,14 +473,8 @@ class _TokenEndsPolicy(_WindowPolicy):
             _snapshot(c), ends, num_full_pages, num_swa_pages, compacted=False
         )
 
-    def create_prefill_budget(
-        self, c: ChainAllocator, tree_cache, *, num_mixed_decode_tokens=0
-    ):
-        from sglang.srt.mem_cache.prefill_budget import SharedSWAPrefillBudget
-
-        return SharedSWAPrefillBudget(
-            c, tree_cache, num_mixed_decode_tokens=num_mixed_decode_tokens
-        )
+    def admission_rules(self, c: ChainAllocator) -> ChainAdmissionRules:
+        return ChainAdmissionRules(window="joint")
 
     def swa_capacity_and_available(
         self, c: ChainAllocator, *, full_capacity, swa_capacity
@@ -826,21 +832,17 @@ class _FloatChainPolicy(_WindowPolicy):
         c.full_attn_allocator.flush_for_allocation()
         _relieve_for_alloc(c.mamba_allocator, target_size)
 
-    def mamba_slot_full_token_cost(self, c: ChainAllocator) -> int:
+    def _state_slot_cost(self, c: ChainAllocator) -> int:
         """Full-token-equivalents one mamba/conv slot removes from the shared buffer:
         a tri-pool token costs e_f + e_s bytes, and the quotient is rounded UP."""
         e_tok = c.full_attn_allocator.entry_bytes + c.swa_attn_allocator.entry_bytes
         return -(-c.mamba_allocator.entry_bytes_per_page // e_tok)
 
-    def create_prefill_budget(
-        self, c: ChainAllocator, tree_cache, *, num_mixed_decode_tokens=0
-    ):
-        # Mamba competes for the shared gap too; retain the tri-pool's existing
-        # token and state-slot admission until it has a three-way reservation.
-        from sglang.srt.mem_cache.prefill_budget import SWAPrefillBudget
-
-        return SWAPrefillBudget(
-            c, tree_cache, num_mixed_decode_tokens=num_mixed_decode_tokens
+    def admission_rules(self, c: ChainAllocator) -> ChainAdmissionRules:
+        # State competes for the shared gap too; keep the split token admission
+        # plus the state-slot gate until one reservation prices all three.
+        return ChainAdmissionRules(
+            window="split", state_slot_cost=self._state_slot_cost(c)
         )
 
     def swa_capacity_and_available(

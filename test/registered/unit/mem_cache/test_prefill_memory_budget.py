@@ -21,7 +21,7 @@ from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.common import evict_from_tree_cache
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator
 from sglang.srt.mem_cache.kv.alloc.interim import _FloatChainPolicy
-from sglang.srt.mem_cache.prefill_budget import SWAPrefillBudget
+from sglang.srt.mem_cache.prefill_budget import ChainPrefillBudget
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -334,8 +334,16 @@ class TestFixedPrefillMemoryBudget(unittest.TestCase):
         allocator.can_reserve = MagicMock(
             side_effect=AssertionError("two-pool reservation")
         )
-        budget = allocator.create_prefill_budget(_cache())
-        self.assertIs(type(budget), SWAPrefillBudget)
+        allocator.full_attn_allocator = SimpleNamespace(entry_bytes=64)
+        allocator.swa_attn_allocator = SimpleNamespace(entry_bytes=64)
+        allocator.mamba_allocator = SimpleNamespace(
+            entry_bytes_per_page=256, schedulable_available_size=lambda: 8
+        )
+        cache = _cache()
+        cache.supports_mamba = lambda: False
+        budget = allocator.create_prefill_budget(cache)
+        self.assertIs(type(budget), ChainPrefillBudget)
+        self.assertEqual(budget.rules.window, "split")
         self.assertTrue(budget.has_capacity())
         self.assertEqual(
             allocator.max_new_tokens_for_memory(
