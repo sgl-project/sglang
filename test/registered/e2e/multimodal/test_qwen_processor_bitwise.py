@@ -16,6 +16,8 @@ The same Python environment and checkpoint processor files serve both captures.
 Every turn supplies its full ordered media URL lists without session recipes.
 All output fields are compared unchanged, including item grouping, offsets and
 mRoPE; cache identity (item hash / pad value, padded IDs) only when both set it.
+Legacy resizes Qwen3-VL family videos with the Qwen2-VL factor, so its capture
+preprocesses them as the token-space route does (pinned to qwen-vl-utils elsewhere).
 No model weights or generation are needed. CUDA CI runs a small pinned matrix
 through both real routes: Qwen3.5 and Qwen2.5-VL with two images, Qwen3-VL with
 an image then a video, Qwen3-Omni with an image then one audio clip; one backend
@@ -27,6 +29,7 @@ startup strategy.
 
 import argparse
 import asyncio
+import contextlib
 import hashlib
 import importlib.metadata
 import json
@@ -38,6 +41,7 @@ import subprocess
 import sys
 from enum import Enum
 from pathlib import Path
+from unittest import mock
 
 import msgspec
 import numpy as np
@@ -126,6 +130,41 @@ def _assert_identical(reference, candidate, field="output"):
         assert reference == candidate, f"{field}: {reference!r} != {candidate!r}"
 
 
+@contextlib.contextmanager
+def _qwen3_vl_legacy_videos(video_processor):
+    """Preprocess the legacy route's videos as the token-space route does for this family.
+
+    preprocess_qwen3_vl_video_sync is pinned against qwen-vl-utils in
+    test_qwen3_vl_video.py; the HF processor then neither samples nor resizes again.
+    """
+    from sglang.srt.multimodal.processors import qwen_vl
+    from sglang.srt.multimodal.qwen_vl_media_processing import (
+        QWEN_VIDEO_PREPROCESS_CONFIG_KEYS,
+        preprocess_qwen3_vl_video_sync,
+    )
+
+    async def preprocess_video(video, video_config):
+        return preprocess_qwen3_vl_video_sync(
+            video,
+            image_factor=video_processor.patch_size * video_processor.merge_size,
+            video_config={
+                key: value
+                for key, value in video_config.items()
+                if key in QWEN_VIDEO_PREPROCESS_CONFIG_KEYS
+            },
+        )
+
+    with (
+        mock.patch.object(qwen_vl, "preprocess_video", preprocess_video),
+        mock.patch.object(
+            qwen_vl,
+            "_get_processor_video_config",
+            lambda video_config, video_metadata: {"do_resize": False},
+        ),
+    ):
+        yield
+
+
 def _sha256(path):
     with Path(path).open("rb") as stream:
         return hashlib.file_digest(stream, "sha256").hexdigest()
@@ -155,6 +194,8 @@ def _checkout_identity(checkout):
 
 
 async def _capture(checkout, manifest_path, route):
+    from transformers import Qwen3VLVideoProcessor
+
     import sglang
     from sglang.srt.managers.io_struct import GenerateReqInput
     from sglang.srt.multimodal.processors.qwen_vl import QwenVLImageProcessor
@@ -220,6 +261,13 @@ async def _capture(checkout, manifest_path, route):
             hf_config, server_args, hf_processor, None, skip_mm_pool=True
         )
     captures = {}
+    reference_videos = contextlib.ExitStack()
+    if route == "legacy" and isinstance(
+        hf_processor.video_processor, Qwen3VLVideoProcessor
+    ):
+        reference_videos.enter_context(
+            _qwen3_vl_legacy_videos(hf_processor.video_processor)
+        )
     try:
         for sample in manifest["samples"]:
             previous_ids, previous_expanded_ids = [], []
@@ -289,6 +337,7 @@ async def _capture(checkout, manifest_path, route):
                 previous_expanded_ids = list(output.input_ids)
                 previous_media = turn["media"]
     finally:
+        reference_videos.close()
         processor.shutdown()
         reset_context()
     return {
