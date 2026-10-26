@@ -19,6 +19,9 @@ ARG DEEPGEMM_REF=v0.2.3.post2
 ARG SGL_DEEP_GEMM_VERSION=0.2.3.post2
 ARG DEEPEP_SOURCE_REF=sgl-deepep
 ARG SGL_DEEP_EP_VERSION=0.1.2.post1
+# MSA has no versioned release yet; pin a commit with the multi-head q8kv4 indexer,
+# strided cache views, and the SGLang monokernel plugin.
+ARG MSA_COMMIT=1e7bf76f26a5f53cfc2d4d297e1ec2e40955e431
 
 ARG CUDA_VERSION=13.4.1
 FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu24.04 AS base
@@ -936,6 +939,36 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         && python3 -m pip install --no-deps -e . \
         && cd / \
         && python3 -c "from importlib.metadata import entry_points; assert any(e.name == 'nvidia_megakernel' for e in entry_points(group='sglang.srt.plugins')), 'sgl-nvidia-mega plugin not registered'"; \
+    fi
+
+# MiniMax MSA (https://github.com/MiniMax-AI/MSA, MIT), editable because prefill compiles
+# against its CUTLASS submodule; installed last so nothing overwrites its top-level packages.
+# Its MSA-v1 monokernel plugin (integrations/sglang) registers --monokernel-backend msa, inert
+# unless a server passes the flag; commits that predate the plugin skip it.
+ARG MSA_COMMIT
+RUN --mount=type=cache,target=/root/.cache/pip \
+    set -eu; \
+    if [ -z "${MSA_COMMIT}" ]; then \
+        echo 'WARNING: MSA_COMMIT is empty; the MSA kernels are not installed' >&2; \
+    else \
+        printf '%s\n' "${MSA_COMMIT}" | grep -Eq '^[0-9a-f]{40}$'; \
+        git init /sgl-workspace/minimax-msa; \
+        git -C /sgl-workspace/minimax-msa remote add origin https://github.com/MiniMax-AI/MSA.git; \
+        git -C /sgl-workspace/minimax-msa fetch --depth 1 origin "${MSA_COMMIT}"; \
+        git -C /sgl-workspace/minimax-msa checkout --detach FETCH_HEAD; \
+        git -C /sgl-workspace/minimax-msa submodule update --init --recursive; \
+        python3 -m pip install --no-deps -e /sgl-workspace/minimax-msa; \
+        test -f /sgl-workspace/minimax-msa/third_party/cutlass/include/cutlass/cutlass.h; \
+        python3 -c "import importlib.metadata as m; d = m.packages_distributions(); \
+bad = {k: d.get(k) for k in ('inference', 'datas', 'msa_v1') if d.get(k) != ['minimax-msa']}; \
+assert not bad, f'MSA top-level packages are shadowed or missing: {bad}'"; \
+        if [ -f /sgl-workspace/minimax-msa/integrations/sglang/pyproject.toml ]; then \
+            python3 -m pip install --no-deps -e /sgl-workspace/minimax-msa/integrations/sglang; \
+            python3 -c "from importlib.metadata import entry_points; \
+assert any(e.name == 'msa' for e in entry_points(group='sglang.srt.plugins')), 'MSA monokernel plugin not registered'"; \
+        else \
+            echo "MSA ${MSA_COMMIT} has no SGLang monokernel plugin; --monokernel-backend msa is unavailable" >&2; \
+        fi; \
     fi
 
 # Set workspace directory
