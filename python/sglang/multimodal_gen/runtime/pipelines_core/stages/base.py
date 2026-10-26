@@ -25,6 +25,10 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
 )
+from sglang.multimodal_gen.runtime.managers.progress_reporter import (
+    ReportingTqdm,
+    get_progress_reporter,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.dedup import StageDedupMixin
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
@@ -47,37 +51,15 @@ class StageParallelismType(Enum):
     CFG_PARALLEL = auto()
     # executed on main rank only and send result to other ranks
     MAIN_RANK_ONLY_AND_SEND_TO_OTHERS = auto()
+    # a stage without CFG runs on every CFG rank, sequence-sharded over them
+    # as one Ulysses group; its inputs must already match across CFG ranks
+    SEQUENCE_PARALLEL_OVER_CFG_RANKS = auto()
 
 
 class StageVerificationError(Exception):
     """Exception raised when stage verification fails."""
 
     pass
-
-
-def record_default_workload_iterations(stage, batch) -> None:
-    """Record how often a stage's repeated unit ran, once per warmup request.
-
-    A stage whose loop length is a formula of the request's step count
-    declares it in ``default_workload_iterations``; the same formula at the
-    default workload's step count is the target. A stage that recorded
-    explicitly inside its loop (a count only known there) is left alone.
-    """
-    metrics = batch.metrics
-    if metrics is None or metrics.active_stage_name is None:
-        return
-    if metrics.active_stage_name in metrics.stage_iterations:
-        return
-    measured = stage.default_workload_iterations(batch, int(batch.num_inference_steps))
-    if measured is None:
-        return
-    target_steps = int(
-        batch.extra.get("warmup_target_num_inference_steps", batch.num_inference_steps)
-    )
-    target = stage.default_workload_iterations(batch, target_steps)
-    metrics.record_stage_iterations(
-        max(1, int(measured)), max(1, int(measured if target is None else target))
-    )
 
 
 class PipelineStage(StageDedupMixin, ABC):
@@ -96,6 +78,7 @@ class PipelineStage(StageDedupMixin, ABC):
     _component_residency_manager = None
     _registered_stage_name: str | None = None
     _profile_stage_name: str | None = None
+    _progress_range: tuple[float, float] = (0.0, 1.0)
 
     def __init__(self):
         self.server_args = get_global_server_args()
@@ -132,12 +115,28 @@ class PipelineStage(StageDedupMixin, ABC):
     ) -> tqdm:
         is_main_rank = not world_group_is_initialized() or get_world_rank() == 0
         disable = disable or (batch is not None and batch.is_warmup)
-        return tqdm(
-            iterable=iterable,
-            total=total,
-            disable=disable or not is_main_rank,
-            **kwargs,
-        )
+        disable = disable or not is_main_rank
+        # report even when the bar is hidden: the first rank of replica N>0 is
+        # not world rank 0
+        reporter = get_progress_reporter()
+        if (
+            reporter is not None
+            and batch is not None
+            and batch.report_progress
+            and not batch.is_warmup
+        ):
+            request_ids = batch.client_request_ids()
+            if request_ids:
+                return ReportingTqdm(
+                    iterable=iterable,
+                    total=total,
+                    disable=disable,
+                    reporter=reporter,
+                    request_ids=request_ids,
+                    progress_range=self._progress_range,
+                    **kwargs,
+                )
+        return tqdm(iterable=iterable, total=total, disable=disable, **kwargs)
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         """
@@ -157,18 +156,9 @@ class PipelineStage(StageDedupMixin, ABC):
         # Default implementation - no verification
         return VerificationResult()
 
-    def maybe_free_model_hooks(self):
-        pass
-
     def load_model(self):
         """
         Load the model for the stage.
-        """
-        pass
-
-    def offload_model(self):
-        """
-        Offload the model for the stage.
         """
         pass
 
@@ -187,14 +177,6 @@ class PipelineStage(StageDedupMixin, ABC):
 
     def set_profile_stage_name(self, stage_name: str) -> None:
         self._profile_stage_name = stage_name
-
-    def default_workload_iterations(
-        self, batch: Req, num_inference_steps: int
-    ) -> int | None:
-        """How many times this stage's repeated unit runs for a request with
-        ``num_inference_steps`` steps; ``None`` means the stage is not repeated
-        (or records its count itself with ``batch.record_stage_iterations``)."""
-        return None
 
     def _component_stage_name(self, stage_name: str | None = None) -> str:
         return stage_name or self._registered_stage_name or self.__class__.__name__
@@ -287,6 +269,12 @@ class PipelineStage(StageDedupMixin, ABC):
         )
         self._component_residency_manager.begin_use(use, module=module)
 
+    def finish_unused_declared_component(self, *, component_name: str, module=None):
+        if self._component_residency_manager is None:
+            return
+        use = self._declared_component_use(component_name=component_name)
+        self._component_residency_manager.finish_unused_component(use, module=module)
+
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
     ) -> list[ComponentUse]:
@@ -324,6 +312,11 @@ class PipelineStage(StageDedupMixin, ABC):
         # if get_global_server_args().enable_cfg_parallel:
         #     return StageParallelismType.MAIN_RANK_ONLY
         return StageParallelismType.REPLICATED
+
+    def parallelism_type_for(self, batch: Req | list[Req]) -> StageParallelismType:
+        """The parallelism the executor runs ``batch`` with; every rank must
+        resolve the same type."""
+        return self.parallelism_type
 
     def cfg_parallel_local_batch_fields(
         self, batch: Req, server_args: ServerArgs
@@ -378,15 +371,6 @@ class PipelineStage(StageDedupMixin, ABC):
             current_platform.device_type,
         )
 
-    def set_logging(self, enable: bool):
-        """
-        Enable or disable logging for this stage.
-
-        Args:
-            enable: Whether to enable logging.
-        """
-        self._enable_logging = enable
-
     def __call__(
         self,
         batch: Req,
@@ -419,13 +403,7 @@ class PipelineStage(StageDedupMixin, ABC):
         metrics = batch.metrics
         if metrics is not None and self.role_affinity == RoleType.DENOISER:
             metrics.denoising_stages.add(stage_name)
-        warmup_metrics = metrics if batch.is_warmup else None
-        previous_active_stage = (
-            warmup_metrics.active_stage_name if warmup_metrics is not None else None
-        )
         self._current_batch_is_warmup = batch.is_warmup
-        if warmup_metrics is not None:
-            warmup_metrics.active_stage_name = self._component_stage_name()
         try:
             with StageProfiler(
                 stage_name,
@@ -436,11 +414,7 @@ class PipelineStage(StageDedupMixin, ABC):
                 perf_dump_path_provided=batch.perf_dump_path is not None,
             ):
                 result = self.forward(batch, server_args)
-                if warmup_metrics is not None:
-                    record_default_workload_iterations(self, batch)
         finally:
-            if warmup_metrics is not None:
-                warmup_metrics.active_stage_name = previous_active_stage
             self._current_batch_is_warmup = previous_batch_is_warmup
             self._current_use_nvtx = False
 

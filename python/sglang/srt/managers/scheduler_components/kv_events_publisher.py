@@ -45,10 +45,6 @@ hook_custom_types(KvMetrics)
 @dataclass(kw_only=True, slots=True)
 class SchedulerKvEventsPublisher:
     kv_events_config: Optional[str]
-    attn_tp_rank: int
-    attn_cp_rank: int
-    attn_dp_rank: int
-    dp_rank: Optional[int]
     tree_cache: BasePrefixCache
     send_metrics_from_scheduler: Optional[zmq.Socket]
     max_running_requests: int
@@ -92,6 +88,12 @@ class SchedulerKvEventsPublisher:
 
         if not self.send_metrics_from_scheduler.closed:
             sock_send(self.send_metrics_from_scheduler, kv_metrics)
+
+    def local_kv_event_sources(self, block_size: int) -> list[dict[str, Any]]:
+        if self.kv_event_publisher is None:
+            return []
+        source = self.kv_event_publisher.describe_local_source(block_size)
+        return [source] if source is not None else []
 
     def publish_kv_events(self):
         if not self.enable_kv_cache_events:

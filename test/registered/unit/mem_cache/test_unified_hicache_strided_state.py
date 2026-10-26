@@ -8,7 +8,7 @@ from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=20, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestStridedStateDetection(CustomTestCase):
@@ -51,10 +51,6 @@ class TestStridedStateDetection(CustomTestCase):
         # A partial transfer must leave unselected slots untouched.
         for slot in set(range(num_slots)) - set(indices.tolist()):
             self.assertTrue(torch.all(dst_view[slot] == 0))
-
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 class TestMambaSlotWiringIsShared(CustomTestCase):
@@ -113,3 +109,7 @@ class TestMambaSlotWiringIsShared(CustomTestCase):
             and node.func.id == "_wire_mamba_slot_allocator"
         }
         self.assertEqual(expected, expected & callers, f"missing: {expected - callers}")
+
+
+if __name__ == "__main__":
+    unittest.main()

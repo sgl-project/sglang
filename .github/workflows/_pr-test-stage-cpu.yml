@@ -13,11 +13,11 @@ on:
         type: string
         required: true
       check_changes:
-        description: 'toJson(needs.check-changes.outputs). Read via fromJson(...).main_package / rust_workspace / continue_on_error / partition_model_sha.'
+        description: 'toJson(needs.check-changes.outputs). Read via fromJson(...).main_package / processor / server_args_docs / continue_on_error / partition_model_sha.'
         type: string
         required: true
       caller_inputs:
-        description: 'toJson(inputs) from pr-test.yml. Read via fromJson(...).git_ref / skip_pr_test_health_check / test_parallel_dispatch / run_all_tests.'
+        description: 'toJson(inputs) from pr-test.yml. Read via fromJson(...).git_ref / skip_pr_test_health_check / test_parallel_dispatch / run_all_tests / skip_cache_save.'
         type: string
         required: true
       partitions:
@@ -49,7 +49,7 @@ jobs:
     # emits a skipped entry for wait-for-jobs to match. The schedule /
     # parallel-dispatch / !failure() half stays on the caller, where the
     # `needs` context it guards actually lives.
-    if: fromJson(inputs.check_changes).main_package == 'true'
+    if: fromJson(inputs.check_changes).main_package == 'true' || fromJson(inputs.check_changes).processor == 'true' || fromJson(inputs.check_changes).server_args_docs == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 240
     env:
@@ -82,14 +82,14 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: '3.12'
 
       - name: Install uv
         uses: astral-sh/setup-uv@v5
 
       # This stage compiled the workspace too - 7+ minutes per partition on
       # billable hosted minutes. rust-ext-build's modules need an older glibc than
-      # this runner has, which is the safe direction, and both pin Python 3.10.
+      # this runner has, which is the safe direction, and both pin Python 3.12.
       - uses: ./.github/actions/download-rust-ext
         id: rust_ext
         with:
@@ -110,7 +110,7 @@ jobs:
         with:
           workspaces: rust
           shared-key: "sglang-grpc-cpu"
-          save-if: ${{ matrix.partition == 0 }}
+          save-if: ${{ matrix.partition == 0 && !fromJson(inputs.caller_inputs).skip_cache_save }}
 
       # uv pip targets a venv by default; setup-python has no venv — install into that interpreter (see UV_SYSTEM_PYTHON in https://docs.astral.sh/uv/guides/integration/github/)
       - name: Install dependencies
@@ -151,17 +151,17 @@ jobs:
         timeout-minutes: ${{ fromJson(inputs.run_timeout_minutes) }}
         env:
           CONTINUE_ON_ERROR_FLAG: ${{ fromJson(inputs.check_changes).continue_on_error == 'true' && '--continue-on-error' || '' }}
-          # Normalized to a literal true/false: EnvBool rejects an empty string,
-          # which is what a missing check-changes output would expand to.
-          SGLANG_SKIP_RUST_TESTS: ${{ fromJson(inputs.check_changes).rust_workspace == 'true' && 'false' || 'true' }}
         run: |
           cd test/
           python3 run_suite.py --hw cpu --suite ${{ inputs.self_name }} --auto-partition-id ${{ matrix.partition }} --auto-partition-size ${{ fromJson(inputs.partitions)[inputs.self_name].size }} --partition-model-file /tmp/partition-model.json --fork-worker-batch-size 20 $CONTINUE_ON_ERROR_FLAG
 
       # PRs save only what the base lacks; the implicit if: success() keeps a
-      # half-downloaded cache unpublished.
+      # half-downloaded cache unpublished. skip_cache_save is for callers that
+      # dispatch on main but test PR code (run-cpu-ci.yml): a save there would
+      # publish PR-written files under main's cache scope.
       - name: Decide whether to save the HF cache
         id: hf_cache_save
+        if: ${{ !fromJson(inputs.caller_inputs).skip_cache_save }}
         run: |
           size=$(du -sb "$HF_HOME" 2>/dev/null | cut -f1)
           after=${size:-0}

@@ -7,10 +7,10 @@ from typing import TYPE_CHECKING, Optional
 import torch
 import triton
 
-from sglang.kernels.ops.attention.metadata import get_num_kv_splits_triton
-from sglang.kernels.ops.kvcache.kv_indices import (
+from sglang.kernels.ops.attention.kv_indices import (
     create_flashinfer_kv_indices_triton,
 )
+from sglang.kernels.ops.attention.metadata import get_num_kv_splits_triton
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import (
@@ -66,7 +66,7 @@ class WaveAttnBackend(AttentionBackend):
         import wave_lang.kernel.wave.cache as cache
 
         base_cache_dir = cache.CACHE_BASE_DIR
-        new_dir = base_cache_dir / f"worker_{model_runner.tp_rank}"
+        new_dir = base_cache_dir / f"worker_{get_parallel().tp_rank}"
         logger.info(f"Setting Wave cache dir: {new_dir}")
         cache.CACHE_BASE_DIR = new_dir
 

@@ -34,6 +34,9 @@ from sglang.srt.managers.io_struct import (
     msgpack_decode,
     msgpack_encode,
 )
+from sglang.srt.managers.scheduler_components.weight_updater import (
+    _merge_checksum_payloads,
+)
 from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.weight_checker import ChecksumInfo as PydanticChecksumInfo
@@ -65,9 +68,17 @@ def _contains_dataclass(obj) -> bool:
     return False
 
 
-def _parallelism_info() -> ParallelismInfo:
+def _parallelism_info(role: str = "target") -> ParallelismInfo:
     return ParallelismInfo(
-        tp_rank=0, tp_size=2, dp_rank=0, dp_size=1, pp_rank=0, pp_size=1, rank=0, size=2
+        role=role,
+        tp_rank=0,
+        tp_size=2,
+        dp_rank=0,
+        dp_size=1,
+        pp_rank=0,
+        pp_size=1,
+        rank=0,
+        size=2,
     )
 
 
@@ -75,7 +86,7 @@ def _checksum_info(tag: str) -> ChecksumInfo:
     return ChecksumInfo(
         checksums={f"model.layers.{tag}": "deadbeef"},
         per_gpu_checksum="cafef00d",
-        parallelism_info=_parallelism_info(),
+        parallelism_info=[_parallelism_info("target"), _parallelism_info("draft")],
     )
 
 
@@ -194,29 +205,41 @@ class TestMsgpackIpcRoundtrip(CustomTestCase):
         self.assertEqual(len(decoded.payload), 2)
         as_dict = msgspec_to_builtins(decoded.payload[0])
         self.assertEqual(as_dict["per_gpu_checksum"], "cafef00d")
-        self.assertIn("tp_rank", as_dict["parallelism_info"])
+        self.assertEqual(
+            [pi["role"] for pi in as_dict["parallelism_info"]], ["target", "draft"]
+        )
+        self.assertIn("tp_rank", as_dict["parallelism_info"][0])
 
     def test_check_weights_producer_conversion(self):
-        # Mirrors weight_updater.check_weights: WeightChecker returns
-        # ChecksumInfo.model_dump() (a dict), converted to the msgspec struct via
-        # msgspec.convert, and the result round-trips as the payload.
-        pydantic_checksum = PydanticChecksumInfo(
-            checksums={"model.layers.0": "deadbeef"},
-            per_gpu_checksum="cafef00d",
-            parallelism_info=PydanticParallelismInfo(
-                tp_rank=0,
-                tp_size=2,
-                dp_rank=0,
-                dp_size=1,
-                pp_rank=0,
-                pp_size=1,
-                rank=0,
-                size=2,
-            ),
+        # the merged per-role payload is what msgspec.convert has to accept
+        def _dump(role):
+            return PydanticChecksumInfo(
+                checksums={"model.layers.0": "deadbeef"},
+                per_gpu_checksum="cafef00d",
+                parallelism_info=PydanticParallelismInfo(
+                    role=role,
+                    tp_rank=0,
+                    tp_size=2,
+                    dp_rank=0,
+                    dp_size=1,
+                    pp_rank=0,
+                    pp_size=1,
+                    rank=0,
+                    size=2,
+                ),
+            ).model_dump()
+
+        merged = _merge_checksum_payloads(
+            [("target", _dump("target")), ("draft", _dump("draft"))]
         )
-        converted = msgspec.convert(pydantic_checksum.model_dump(), ChecksumInfo)
-        self.assertEqual(converted.per_gpu_checksum, "cafef00d")
-        self.assertEqual(converted.parallelism_info.tp_rank, 0)
+        converted = msgspec.convert(merged, ChecksumInfo)
+        self.assertEqual(
+            sorted(converted.checksums), ["draft.model.layers.0", "model.layers.0"]
+        )
+        self.assertEqual(
+            [pi.role for pi in converted.parallelism_info], ["target", "draft"]
+        )
+        self.assertEqual(converted.parallelism_info[0].tp_rank, 0)
         output = CheckWeightsReqOutput(success=True, message="ok", payload=[converted])
         self.assertEqual(_round_trip(output), output)
 

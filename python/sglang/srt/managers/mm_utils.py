@@ -9,9 +9,10 @@ import os
 import pickle
 import sys
 from abc import abstractmethod
+from array import array
 from collections import defaultdict
 from multiprocessing import shared_memory
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -19,6 +20,7 @@ from torch import nn
 
 from sglang.kernels.ops.memory.gpu_tensor_hash import gpu_tensor_hash
 from sglang.srt.environ import envs
+from sglang.srt.managers import mm_schedule
 from sglang.srt.managers.io_struct import (
     BaseBatchReq,
     TokenizedEmbeddingReqInput,
@@ -49,7 +51,11 @@ from sglang.srt.runtime_context import (
     get_server_args,
     get_serving,
 )
-from sglang.srt.utils import flatten_nested_list, print_warning_once
+from sglang.srt.utils import (
+    assert_int64_array,
+    flatten_nested_list,
+    print_warning_once,
+)
 from sglang.srt.utils.stale_shm_cleanup import make_shm_name
 from sglang.utils import logger
 
@@ -232,6 +238,116 @@ class TransportProxyTensor(torch.Tensor):
         return self._metadata.get("transport_mode", "default")
 
 
+def duplicate_pad_mm_input_ids(
+    input_ids: array,
+    mm_inputs: MultimodalInputs,
+    pad_input_ids_func: Callable[[array, MultimodalInputs], array],
+) -> array:
+    """Validate and duplicate model-padded tokens for scheduler ownership."""
+    padded_ids = pad_input_ids_func(input_ids, mm_inputs)
+    assert_int64_array(padded_ids, "pad_input_ids result")
+    # Preserve scheduler ownership: no-op models return the unpadded input,
+    # and other models can retain the result in multimodal metadata.
+    return padded_ids[:]
+
+
+def pad_mm_token_pairs(
+    input_ids: array,
+    mm_inputs: MultimodalInputs,
+    *,
+    data_token_pairs: Optional[List[Tuple[int, int]]],
+    data_start_token_ids: Optional[List[int]] = None,
+) -> array:
+    """Pad enclosed tokens without mutating input_ids; record item start offsets.
+
+    data_start_token_ids identifies new items, so slices can reuse an item's pad value.
+    By default, every start token begins a new item.
+    """
+    if data_start_token_ids is None:
+        data_start_token_ids = [s for s, _e in data_token_pairs]
+    assert_int64_array(input_ids, "input_ids")
+    pad_items = mm_inputs.mm_items
+    mm_inputs.data_offsets = []
+    if data_token_pairs is None:
+        data_token_pairs = [mm_inputs.im_start_id, mm_inputs.im_end_id]
+    if data_token_pairs is None:
+        print_warning_once(
+            "No data_token_pairs provided, RadixAttention might be influenced."
+        )
+        return input_ids
+    start_token_ids = {s for s, _e in data_token_pairs}
+    end_tokens_ids = {e for _s, e in data_token_pairs}
+
+    padded_ids = array("q")
+    last_idx = 0
+    data_idx = -1
+
+    start_indices = [i for i, x in enumerate(input_ids) if x in start_token_ids]
+    end_indices = [i for i, x in enumerate(input_ids) if x in end_tokens_ids]
+
+    if len(start_indices) != len(end_indices):
+        return input_ids
+
+    for start_idx, end_idx in zip(start_indices, end_indices):
+        padded_ids.extend(input_ids[last_idx : start_idx + 1])
+
+        if input_ids[start_idx] in data_start_token_ids:
+            data_idx += 1
+            mm_inputs.data_offsets += [start_idx]
+
+        if data_idx >= len(pad_items):
+            data_idx = len(pad_items) - 1
+
+        num_tokens = end_idx - start_idx - 1
+        if num_tokens > 0:
+            padded_ids.extend(pad_items[data_idx].padding_sequence(num_tokens))
+
+        last_idx = end_idx
+
+    padded_ids.extend(input_ids[last_idx:])
+
+    assert len(input_ids) == len(padded_ids), "Length validation fails"
+    return padded_ids
+
+
+def pad_mm_tokens(input_ids: array, mm_inputs: MultimodalInputs) -> array:
+    """Pad inclusive per-item offsets without mutating the input token array."""
+    assert_int64_array(input_ids, "input_ids")
+    if not input_ids or not mm_inputs.mm_items:
+        return input_ids
+
+    # as_tensor(array) walks and boxes every token. View a bulk copy instead,
+    # keeping the original request's unpadded token buffer unchanged.
+    padded_input_ids = input_ids[:]
+    input_ids_tensor = torch.frombuffer(padded_input_ids, dtype=torch.int64)
+
+    # Replace multimodal tokens using per-item offsets
+    items_by_modality = defaultdict(list)
+    for item in mm_inputs.mm_items:
+        items_by_modality[item.modality].append(item)
+
+    token_id_map = {
+        Modality.IMAGE: mm_inputs.im_token_id,
+        Modality.AUDIO: mm_inputs.audio_token_id,
+        Modality.VIDEO: mm_inputs.video_token_id,
+    }
+
+    for modality, items in items_by_modality.items():
+        token_id = token_id_map.get(modality)
+
+        if not items or token_id is None:
+            continue
+
+        for i, item in enumerate(items):
+            for offset in items[i].offsets:
+                input_ids_tensor[offset[0] : offset[1] + 1] = torch.as_tensor(
+                    item.padding_sequence(offset[1] - offset[0] + 1),
+                    dtype=input_ids_tensor.dtype,
+                )
+
+    return padded_input_ids
+
+
 class MultiModalityDataPaddingPattern:
     """
     Data tokens (like image tokens) often need special handling during padding
@@ -240,11 +356,10 @@ class MultiModalityDataPaddingPattern:
     """
 
     @abstractmethod
-    def pad_input_tokens(
-        self, input_ids: List[int], mm_inputs: MultimodalInputs
-    ) -> List[int]:
+    def pad_input_tokens(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         """
-        Pad the input ids sequence containing data tokens, and replace them with pad_values
+        Replace data tokens with pad_values using native int64 arrays.
+        Implementations must not mutate the original input.
         """
         pass
 
@@ -255,6 +370,8 @@ class MultiModalityDataPaddingPatternTokenPairs(MultiModalityDataPaddingPattern)
     The padded value in a region enclosed by a token pair with be the same one, as the MultimodalDataItem's pad value
 
     This strategy should be applied when data content is marked by start/end token pairs in the input sequence.
+
+    Kept for compatibility; new callers should use pad_mm_token_pairs.
     """
 
     def __init__(
@@ -273,97 +390,33 @@ class MultiModalityDataPaddingPatternTokenPairs(MultiModalityDataPaddingPattern)
             s for s, _e in data_token_pairs
         ]
 
-    def pad_input_tokens(
-        self, input_ids: List[int], mm_inputs: MultimodalInputs
-    ) -> List[int]:
+    def pad_input_tokens(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         """
         This function will replace the data-tokens in between with pad_values accordingly
         """
-        pad_values = [item.pad_value for item in mm_inputs.mm_items]
         data_token_pairs = self.data_token_id_pairs
-        mm_inputs.data_offsets = []
-        if data_token_pairs is None:
-            data_token_pairs = [mm_inputs.im_start_id, mm_inputs.im_end_id]
-        if data_token_pairs is None:
-            print_warning_once(
-                "No data_token_pairs provided, RadixAttention might be influenced."
-            )
-            return input_ids
-        start_token_ids = {s for s, _e in data_token_pairs}
-        end_tokens_ids = {e for _s, e in data_token_pairs}
-
-        padded_ids = []
-        last_idx = 0
-        data_idx = -1
-
-        start_indices = [i for i, x in enumerate(input_ids) if x in start_token_ids]
-        end_indices = [i for i, x in enumerate(input_ids) if x in end_tokens_ids]
-
-        if len(start_indices) != len(end_indices):
-            return input_ids
-
-        for start_idx, end_idx in zip(start_indices, end_indices):
-            padded_ids.extend(input_ids[last_idx : start_idx + 1])
-
-            if input_ids[start_idx] in self.data_start_token_ids:
-                data_idx += 1
-                mm_inputs.data_offsets += [start_idx]
-
-            if data_idx >= len(pad_values):
-                data_idx = len(pad_values) - 1
-
-            num_tokens = end_idx - start_idx - 1
-            pad_value = pad_values[data_idx]
-            padded_ids.extend([pad_value] * num_tokens)
-
-            last_idx = end_idx
-
-        padded_ids.extend(input_ids[last_idx:])
-
-        assert len(input_ids) == len(padded_ids), "Length validation fails"
-        return padded_ids
+        data_start_token_ids = self.data_start_token_ids
+        return pad_mm_token_pairs(
+            input_ids,
+            mm_inputs,
+            data_token_pairs=data_token_pairs,
+            data_start_token_ids=data_start_token_ids,
+        )
 
 
 class MultiModalityDataPaddingPatternMultimodalTokens(MultiModalityDataPaddingPattern):
     """In this pattern, data tokens should be represented as repetitions of a single token
     e.g. <image><image>....<image>, or <audio><audio>...<audio>
+
+    Kept for compatibility; new callers should use pad_mm_tokens.
     """
 
-    def pad_input_tokens(
-        self, input_ids: List[int], mm_inputs: MultimodalInputs
-    ) -> List[int]:
+    def pad_input_tokens(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         """
         Replaces multimodal tokens in input_ids with corresponding pad_values from mm_items.
         Each modality (image, audio, video) is handled separately based on its token_id.
         """
-        if not input_ids or not mm_inputs.mm_items:
-            return input_ids
-
-        input_ids_tensor = torch.as_tensor(input_ids)
-
-        # Replace multimodal tokens using per-item offsets
-        items_by_modality = defaultdict(list)
-        for item in mm_inputs.mm_items:
-            items_by_modality[item.modality].append(item)
-
-        token_id_map = {
-            Modality.IMAGE: mm_inputs.im_token_id,
-            Modality.AUDIO: mm_inputs.audio_token_id,
-            Modality.VIDEO: mm_inputs.video_token_id,
-        }
-
-        for modality, items in items_by_modality.items():
-            token_id = token_id_map.get(modality)
-
-            if not items or token_id is None:
-                continue
-
-            for i, item in enumerate(items):
-                for offset in items[i].offsets:
-                    input_ids_tensor[offset[0] : offset[1] + 1] = item.pad_value
-
-        ret_input_ids = input_ids_tensor.tolist()
-        return ret_input_ids
+        return pad_mm_tokens(input_ids, mm_inputs)
 
 
 # masked_scatter_ materializes the expanded [num_tokens, hidden] bool mask plus
@@ -442,7 +495,10 @@ def embed_mm_inputs(
             embedder = getattr(multimodal_model, f"get_{modality_id}_feature", None)
         if len(items) != 0:
             assert embedder is not None, f"no embedding method found for {modality}"
-            pad_values = [item.pad_value for item in items]
+            # Sorted for the searchsorted lookup in _get_multimodal_mask.
+            pad_values = sorted(
+                value for item in items for value in item.padding_values()
+            )
             if input_ids.device.type == "cuda":
                 # Pinned staging keeps the placeholder copy asynchronous on CUDA.
                 placeholder_cpu = torch.tensor(
@@ -635,30 +691,22 @@ def _embed_mm_inputs_with_split(
     return input_embeds, other_info
 
 
-def general_mm_embed_routine(
+def prepare_mm_inputs(
     input_ids: torch.Tensor,
     forward_batch: ForwardBatch,
     language_model: nn.Module,
+    kwargs: dict,
     multimodal_model: Optional[nn.Module] = None,
     data_embedding_funcs: Dict[Modality, DataEmbeddingFunc] = None,
     placeholder_tokens: Optional[dict[Modality, List[int]]] = None,
     use_deepstack: Dict[Modality, bool] = {},
-    **kwargs,
-) -> torch.Tensor:
-    """
-    Process multimodal inputs and forward through language model.
+    feature_dtypes: Optional[Dict[Modality, torch.dtype]] = None,
+) -> Optional[torch.Tensor]:
+    """Prepare full-sequence embeddings without running the language model.
 
-    Args:
-        input_ids: Input token IDs tensor
-        forward_batch: Batch information for model forward pass
-        language_model: Base language model to use
-        data_embedding_funcs: A dictionary mapping from modality type to the corresponding embedding function.
-        placeholder_tokens: Token IDs for multimodal placeholders
-        use_deepstack: Whether to use deepstack embeddings for each modality, default False
-        **kwargs: Additional arguments passed to language model
-
-    Returns:
-        Hidden states from language model forward pass
+    Preserve multimodal cache/offload bookkeeping and the MTP embedding copy.
+    Additional language-model inputs, such as DeepStack features, update kwargs.
+    Non-first pipeline ranks consume proxy tensors and return no embeddings.
     """
     assert hasattr(language_model, "get_input_embeddings")
     embed_tokens = language_model.get_input_embeddings()
@@ -671,6 +719,23 @@ def general_mm_embed_routine(
             mm_inputs_list = [
                 mm_input for mm_input in forward_batch.mm_inputs if mm_input is not None
             ]
+            if feature_dtypes:
+                for mm_input in mm_inputs_list:
+                    for item in mm_input.mm_items:
+                        dtype = feature_dtypes.get(item.modality)
+                        feature = item.feature
+                        if (
+                            dtype is not None
+                            and isinstance(feature, torch.Tensor)
+                            and feature.is_cuda
+                            and feature.dtype != dtype
+                        ):
+                            # The cast may still read the source after replacing it.
+                            feature.record_stream(
+                                torch.cuda.current_stream(feature.device)
+                            )
+                            item.feature = feature.to(dtype=dtype)
+                        del feature
             extend_prefix_lens = [
                 prefix_len
                 for i, prefix_len in enumerate(forward_batch.extend_prefix_lens_cpu)
@@ -724,27 +789,37 @@ def general_mm_embed_routine(
             # best-effort, offloading to CPU ensures we have a reliable fallback
             # if a cache miss occurs in subsequent chunks, while still freeing up
             # critical GPU memory.
-            if mm_inputs_list:
+            if mm_inputs_list and input_embeds.is_cuda:
+                language_only = get_disagg().language_only
+                stream = torch.cuda.current_stream(input_embeds.device)
+                offloaded = False
                 for mm_input_obj in mm_inputs_list:
-                    if mm_input_obj and hasattr(mm_input_obj, "mm_items"):
-                        for mm_item in mm_input_obj.mm_items:
-                            feature = getattr(mm_item, "feature", None)
-                            if isinstance(feature, torch.Tensor) and feature.is_cuda:
-                                mm_item.feature = feature.to("cpu", non_blocking=True)
-                            if get_disagg().language_only:
-                                precomputed_embeddings = getattr(
-                                    mm_item, "precomputed_embeddings", None
+                    for mm_item in mm_input_obj.mm_items:
+                        feature = mm_item.feature
+                        if isinstance(feature, torch.Tensor) and feature.is_cuda:
+                            # The transport reconstructed this block on the scheduler stream
+                            # and nothing else pins it to ours: without record_stream the
+                            # allocator recycles it into the next scheduler allocation while
+                            # the encoder read and this copy are still queued here.
+                            feature.record_stream(stream)
+                            mm_item.feature = feature.to("cpu", non_blocking=True)
+                            offloaded = True
+                        if language_only:
+                            precomputed = mm_item.precomputed_embeddings
+                            if (
+                                isinstance(precomputed, torch.Tensor)
+                                and precomputed.is_cuda
+                                and not mm_item.keep_device_embedding
+                            ):
+                                precomputed.record_stream(stream)
+                                mm_item.precomputed_embeddings = precomputed.to(
+                                    "cpu", non_blocking=True
                                 )
-                                if (
-                                    isinstance(precomputed_embeddings, torch.Tensor)
-                                    and precomputed_embeddings.is_cuda
-                                    and not mm_item.keep_device_embedding
-                                ):
-                                    mm_item.precomputed_embeddings = (
-                                        precomputed_embeddings.to(
-                                            "cpu", non_blocking=True
-                                        )
-                                    )
+                                offloaded = True
+                if offloaded:
+                    if mm_schedule.host_offload_event is None:
+                        mm_schedule.host_offload_event = torch.cuda.Event()
+                    mm_schedule.host_offload_event.record(stream)
             forward_batch.mm_inputs = None
             forward_batch.mm_input_embeds = (
                 input_embeds.clone()
@@ -760,6 +835,47 @@ def general_mm_embed_routine(
             input_embeds = forward_batch.input_embeds
     else:
         input_embeds = None
+    return input_embeds
+
+
+def general_mm_embed_routine(
+    input_ids: torch.Tensor,
+    forward_batch: ForwardBatch,
+    language_model: nn.Module,
+    multimodal_model: Optional[nn.Module] = None,
+    data_embedding_funcs: Dict[Modality, DataEmbeddingFunc] = None,
+    placeholder_tokens: Optional[dict[Modality, List[int]]] = None,
+    use_deepstack: Dict[Modality, bool] = {},
+    feature_dtypes: Optional[Dict[Modality, torch.dtype]] = None,
+    **kwargs,
+) -> torch.Tensor:
+    """
+    Process multimodal inputs and forward through language model.
+
+    Args:
+        input_ids: Input token IDs tensor
+        forward_batch: Batch information for model forward pass
+        language_model: Base language model to use
+        data_embedding_funcs: A dictionary mapping from modality type to the corresponding embedding function.
+        placeholder_tokens: Token IDs for multimodal placeholders
+        use_deepstack: Whether to use deepstack embeddings for each modality, default False
+        feature_dtypes: Optional per-modality dtypes for preparing CUDA features before cache lookup.
+        **kwargs: Additional arguments passed to language model
+
+    Returns:
+        Hidden states from language model forward pass
+    """
+    input_embeds = prepare_mm_inputs(
+        input_ids,
+        forward_batch,
+        language_model,
+        kwargs,
+        multimodal_model,
+        data_embedding_funcs,
+        placeholder_tokens,
+        use_deepstack,
+        feature_dtypes,
+    )
 
     with torch.profiler.record_function("sglang.vlm.language_model_prefill"):
         hidden_states = language_model(
@@ -1078,6 +1194,8 @@ def get_new_expanded_mm_items(original_mm_items):
                 # explicit None check, not `a or b`: the value is a multi-element
                 # tensor whose truthiness is ambiguous.)
                 image_grid_thw = item.model_specific_data.get("image_grid_thw")
+                if image_grid_thw is None:
+                    image_grid_thw = item.model_specific_data.get("grid_thws")
                 if image_grid_thw is None:
                     image_grid_thw = item.model_specific_data.get("image_grid_hws")
                 grid_len = _get_length(image_grid_thw)

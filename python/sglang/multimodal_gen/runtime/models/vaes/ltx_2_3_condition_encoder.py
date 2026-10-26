@@ -3,6 +3,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+from sglang.multimodal_gen.runtime.cache.conditioning import ConditioningEncoderMixin
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
@@ -113,7 +114,9 @@ def _make_ltx23_encoder_block(
     )
 
 
-class LTX23VideoConditionEncoder(nn.Module, LayerwiseOffloadableModuleMixin):
+class LTX23VideoConditionEncoder(
+    ConditioningEncoderMixin, nn.Module, LayerwiseOffloadableModuleMixin
+):
     layerwise_offload_dit_group_enabled = False
     layer_names = ["down_blocks"]
 
@@ -128,7 +131,6 @@ class LTX23VideoConditionEncoder(nn.Module, LayerwiseOffloadableModuleMixin):
         latent_log_var = str(vae_config.get("latent_log_var", "uniform"))
 
         self.patch_size = patch_size
-        self.latency_channels = latent_channels
         self.latent_log_var = latent_log_var
         self.per_channel_statistics = LTX23PerChannelStatistics(latent_channels)
 
