@@ -3,6 +3,7 @@
 import unittest
 
 import torch
+
 from sglang.kernels.ops.attention.sparse_decode_reduce_hip import (
     gfx_sparse_split_reduce,
 )
