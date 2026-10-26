@@ -13,15 +13,15 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.dp_attention import get_is_extend_in_batch
 from sglang.srt.hardware_backend.npu.moe.routing import (
     INT8_QUANT_MODE,
     MXFP8_QUANT_MODE,
     ROUTING_QUANT_MODES,
-    npu_moe_init_routing,
-    npu_moe_finalize_routing,
     normalize_mxfp_scale,
+    npu_moe_finalize_routing,
+    npu_moe_init_routing,
 )
+from sglang.srt.layers.dp_attention import get_is_extend_in_batch
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
@@ -185,9 +185,7 @@ class AscendOpsDispatcher(BaseDispatcher):
                 hidden_states, topk_weights, topk_ids, self.tp_group
             )
 
-        return self._dispatch_low_latency(
-            hidden_states, topk_weights, topk_ids
-        )
+        return self._dispatch_low_latency(hidden_states, topk_weights, topk_ids)
 
     def combine(self, combine_input: CombineInput) -> torch.Tensor:
         if combine_input.format != CombineInputFormat.ASCEND_OPS:
@@ -423,12 +421,8 @@ class AscendOpsDispatcher(BaseDispatcher):
         """Exchange the actual token rows contributed by every TP rank."""
 
         world_size = dist.get_world_size(group)
-        local_rows_tensor = torch.tensor(
-            [local_rows], dtype=torch.int64, device=device
-        )
-        gathered_rows = [
-            torch.empty_like(local_rows_tensor) for _ in range(world_size)
-        ]
+        local_rows_tensor = torch.tensor([local_rows], dtype=torch.int64, device=device)
+        gathered_rows = [torch.empty_like(local_rows_tensor) for _ in range(world_size)]
         dist.all_gather(gathered_rows, local_rows_tensor, group=group)
         return [int(rows.item()) for rows in gathered_rows]
 

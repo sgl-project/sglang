@@ -135,7 +135,10 @@ def npu_moe_init_routing(
         if quant_mode in (MXFP8_QUANT_MODE, MXFP4_QUANT_MODE):
             pertoken_scale = normalize_mxfp_scale(pertoken_scale)
         return RoutedTokens(
-            hidden_states, expanded_row_idx, expert_tokens.to(torch.int64), pertoken_scale
+            hidden_states,
+            expanded_row_idx,
+            expert_tokens.to(torch.int64),
+            pertoken_scale,
         )
 
     op_kwargs = dict(

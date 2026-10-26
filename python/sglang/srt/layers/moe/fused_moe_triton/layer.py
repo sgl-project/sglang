@@ -24,9 +24,9 @@ from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import (
     MoeRunnerConfig,
-    get_moe_ascend_ops_config,
     get_deepep_mode,
     get_moe_a2a_backend,
+    get_moe_ascend_ops_config,
     get_moe_runner_backend,
 )
 from sglang.srt.layers.moe.kt_ep_wrapper import (

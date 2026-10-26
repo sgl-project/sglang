@@ -283,9 +283,9 @@ def run_resolution_pipeline(server_args: Any) -> None:
     from sglang.srt.arg_groups.moe_hook import (
         handle_a2a_moe,
         handle_moe_kernel_config,
+        validate_ascend_ops_speculative_draft,
         validate_deepep_v2_dispatch_token_budget,
         validate_deepep_v2_speculative_draft,
-        validate_ascend_ops_speculative_draft,
         validate_flashinfer_a2a_token_budget,
     )
 

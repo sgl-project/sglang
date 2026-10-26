@@ -150,7 +150,7 @@ class AscendOpsConfig:
             )
 
     @classmethod
-    def from_json_str(cls, s: Optional[str]) -> "AscendOpsConfig":
+    def from_json_str(cls, s: Optional[str]) -> AscendOpsConfig:
         """Parse ``--moe-ascend-ops-config`` JSON into a validated config.
 
         ``None`` or an empty string returns the defaults. Unknown keys or an

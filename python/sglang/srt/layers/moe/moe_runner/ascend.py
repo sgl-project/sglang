@@ -24,8 +24,8 @@ from sglang.srt.hardware_backend.npu.moe.activation import (
 )
 from sglang.srt.hardware_backend.npu.moe.routing import (
     INT8_QUANT_MODE,
-    npu_moe_init_routing,
     npu_moe_finalize_routing,
+    npu_moe_init_routing,
     quant_mode_dtype,
 )
 from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
@@ -322,9 +322,7 @@ def _routing_layer(runner_config: MoeRunnerConfig):
     """
     layer = getattr(runner_config, "layer", None)
     if layer is None:
-        raise RuntimeError(
-            "Ascend MoE routing requires runner_config.layer to be set."
-        )
+        raise RuntimeError("Ascend MoE routing requires runner_config.layer to be set.")
     return layer
 
 
@@ -430,9 +428,7 @@ def _pre_permute_alltoallv(
 
     local_counts = recv_counts.reshape(-1)
     local_ids = (
-        torch.arange(
-            num_local_experts, dtype=torch.int32, device=received.device
-        )
+        torch.arange(num_local_experts, dtype=torch.int32, device=received.device)
         .repeat(recv_counts.shape[0], 1)
         .reshape(-1)
     )
@@ -636,9 +632,7 @@ def post_permute_ascend_to_ascend_ops(
                 hidden_states, local_expanded_row_idx
             )
     elif isinstance(state, _AllGatherState):
-        hidden_states = _allgather_weighted_sum(
-            runner_output, runner_config, state
-        )
+        hidden_states = _allgather_weighted_sum(runner_output, runner_config, state)
     else:
         # MC2 / decode: the combine op applies the top-k weights itself.
         hidden_states = runner_output.hidden_states
