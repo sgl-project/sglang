@@ -23,6 +23,7 @@ from sglang.srt.layers.quantization.mxfp4 import (
 from sglang.srt.layers.quantization.online_quantization import CopyNumelCounter
 from sglang.srt.layers.quantization.quark.schemes import QuarkMoEScheme
 from sglang.srt.layers.quantization.quark.utils import Nvfp4SourceConfig
+from sglang.srt.layers.utils.common import copy_or_rebind_param
 from sglang.srt.utils import (
     get_bool_env_var,
     is_gfx95_supported,
@@ -1010,12 +1011,16 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             s0, s1, _ = layer.w13_weight_scale.shape
             w13_weight_scale = layer.w13_weight_scale.view(s0 * s1, -1)
             w13_weight_scale = e8m0_shuffle(w13_weight_scale)
-            layer.w13_weight_scale.data = w13_weight_scale.view(s0, s1, -1)
+            copy_or_rebind_param(
+                layer, "w13_weight_scale", w13_weight_scale.view(s0, s1, -1)
+            )
 
             s0, s1, _ = layer.w2_weight_scale.shape
             w2_weight_scale = layer.w2_weight_scale.view(s0 * s1, -1)
             w2_weight_scale = e8m0_shuffle(w2_weight_scale)
-            layer.w2_weight_scale.data = w2_weight_scale.view(s0, s1, -1)
+            copy_or_rebind_param(
+                layer, "w2_weight_scale", w2_weight_scale.view(s0, s1, -1)
+            )
         # Pre-shuffle weight
         if _is_gfx1250:
             # gfx1250 grouped kernel expects GUGU (gate/up row-interleaved) layout.
@@ -1028,11 +1033,15 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             layer.w13_weight.is_shuffled = True
             layer.w2_weight.is_shuffled = True
         elif _is_shuffle_moe_mxfp4:
-            layer.w13_weight.data = shuffle_weight(
-                layer.w13_weight.contiguous(), (16, 16)
+            copy_or_rebind_param(
+                layer,
+                "w13_weight",
+                shuffle_weight(layer.w13_weight.contiguous(), (16, 16)),
             )
-            layer.w2_weight.data = shuffle_weight(
-                layer.w2_weight.contiguous(), (16, 16)
+            copy_or_rebind_param(
+                layer,
+                "w2_weight",
+                shuffle_weight(layer.w2_weight.contiguous(), (16, 16)),
             )
             layer.w13_weight.is_shuffled = True
             layer.w2_weight.is_shuffled = True
