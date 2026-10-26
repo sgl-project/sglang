@@ -2653,10 +2653,19 @@ class KVCacheConfigurator:
                     "--enable-kv-cache-sharding supports hybrid linear-attention "
                     "models only with compressed QSA (Qwen4-Exp)."
                 )
-            assert full_pool_class is MHATokenToKVPool and quant_method is None, (
-                "--enable-kv-cache-sharding needs the plain MHA pool for the "
-                f"full-attention layers, got {full_pool_class.__name__}"
-            )
+            # The striped pool replaces the full-attention pool class below, so
+            # reject what it cannot carry rather than silently dropping it
+            # (same rules as _build_mha_kv_pool).
+            if full_pool_class is not MHATokenToKVPool:
+                raise ValueError(
+                    "--enable-kv-cache-sharding is incompatible with the "
+                    f"{full_pool_class.__name__} pool for the full-attention layers."
+                )
+            if quant_method is not None:
+                raise ValueError(
+                    "--enable-kv-cache-sharding does not support specialized KV-cache "
+                    "quantization methods (e.g. FP4); ordinary CUDA FP8 is supported."
+                )
             full_pool_class = functools.partial(
                 PageInterleaveMHATokenToKVPool,
                 shard_spec=self.kv_shard_spec,
