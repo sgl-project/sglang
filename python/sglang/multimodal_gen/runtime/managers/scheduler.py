@@ -6,7 +6,7 @@ import pickle
 import threading
 import time
 from collections import deque
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import contextmanager
 from copy import deepcopy
 from enum import Enum
@@ -54,6 +54,10 @@ from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 from sglang.multimodal_gen.runtime.managers.pi05_segment_scheduler import (
     Pi05SegmentSchedulerMixin,
 )
+from sglang.multimodal_gen.runtime.managers.progress_reporter import (
+    get_progress_reporter,
+    init_progress_reporter,
+)
 from sglang.multimodal_gen.runtime.observability.metrics import DiffusionMetrics
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.request_utils import (
@@ -89,6 +93,8 @@ _BATCH_METRICS_LOG_INTERVAL = 5
 # Each pending finalize pins one request's output tensor on the GPU; arbitrary,
 # picked to bound that memory while still hiding one save behind one forward.
 _MAX_INFLIGHT_FINALIZES = 2
+# Longest an idle loop with a finalize in flight goes without checking for requests.
+_FINALIZE_IDLE_WAIT_S = 0.001
 
 
 class _DeferredOutput(msgspec.Struct):
@@ -160,6 +166,10 @@ class Scheduler(
                 f"Scheduler (dp replica {self.dp_replica}) bind at endpoint: "
                 f"{actual_endpoint}"
             )
+            if server_args.progress_endpoint is not None:
+                init_progress_reporter(
+                    context=self.context, endpoint=server_args.progress_endpoint
+                )
         else:
             self.receiver = None
         from sglang.multimodal_gen.runtime.platforms import current_platform
@@ -344,6 +354,11 @@ class Scheduler(
         warmup_reqs = [req for req in reqs if req.is_warmup]
         if warmup_reqs:
             self._ensure_warmup_progress_bar(warmup_reqs[0])
+        progress_reporter = get_progress_reporter()
+        if progress_reporter is not None:
+            for req in reqs:
+                if req.report_progress and not req.is_warmup:
+                    progress_reporter.start(request_ids=req.client_request_ids())
 
         # Use the head request trace context for scheduler-side dispatch work.
         req = reqs[0]
@@ -837,7 +852,7 @@ class Scheduler(
                         output_batch, "Scheduler.return_result.spill_arrays"
                     ):
                         output_batch.output = spill_large_arrays_to_file_refs(
-                            output_batch.output
+                            output_batch.output, identity
                         )
 
                 with self._record_return_stage(
@@ -940,6 +955,23 @@ class Scheduler(
             logger.error(f"ZMQ error sending deferred reply: {e}")
         except Exception as e:
             logger.error("Deferred reply failed: %s", e, exc_info=True)
+
+    def _wait_idle(self, timeout_s: float) -> None:
+        """Wait up to timeout_s for a new request or an in-flight finalize."""
+        if self._inflight_finalizes:
+            # Never wait holding _socket_lock: the finalize thread needs it to
+            # reply, and threading.Lock is not fair, so polling under it and
+            # re-taking it right after starves the reply.
+            wait(
+                self._inflight_finalizes,
+                timeout=min(timeout_s, _FINALIZE_IDLE_WAIT_S),
+                return_when=FIRST_COMPLETED,
+            )
+        elif self.receiver is not None:
+            with self._socket_lock:
+                self._poller.poll(timeout=timeout_s * 1000.0)
+        else:
+            time.sleep(timeout_s)
 
     def _reap_finalizes(self) -> None:
         while self._inflight_finalizes and self._inflight_finalizes[0].done():
@@ -1055,6 +1087,12 @@ class Scheduler(
                         req.output_file_path(req.num_outputs_per_prompt, output_idx)
                     )
             merged_req.extra["dynamic_batch_output_paths"] = dynamic_output_paths
+        merged_req.merged_request_ids = [
+            req.request_id
+            for req in reqs
+            if req.report_progress and req.request_id is not None
+        ]
+        merged_req.report_progress = bool(merged_req.merged_request_ids)
         merged_req.request_id = f"dynamic_batch::{merged_req.request_id}"
 
         return merged_req
@@ -1479,20 +1517,13 @@ class Scheduler(
                     oldest_ts = self.waiting_queue[0][2]
                     elapsed_ms = (time.monotonic() - oldest_ts) * 1000.0
                     remaining_ms = max(0, self._batching_delay_s * 1000.0 - elapsed_ms)
-                    if remaining_ms > 0 and self.receiver is not None:
-                        with self._socket_lock:
-                            self._poller.poll(timeout=remaining_ms)
-                    elif remaining_ms > 0:
-                        time.sleep(remaining_ms / 1000.0)
+                    if remaining_ms > 0:
+                        self._wait_idle(remaining_ms / 1000.0)
                 elif self._inflight_finalizes:
                     # An idle hot spin convoys the finalize thread: each of its
                     # short GIL-holding ops waits a full switch interval, which
                     # turns a sub-second save into minutes. Yield instead.
-                    if self.receiver is not None:
-                        with self._socket_lock:
-                            self._poller.poll(timeout=1)
-                    else:
-                        time.sleep(0.001)
+                    self._wait_idle(_FINALIZE_IDLE_WAIT_S)
                 elif (
                     not self.waiting_queue
                     and self.receiver is not None

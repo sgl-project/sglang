@@ -353,6 +353,18 @@ class DynamicCudnnSDPAImpl(SDPAImpl):
             return False
         return query.shape[-1] == 64 and query.shape[1] == 1024 and query.shape[0] >= 4
 
+    def forward_into(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        out: torch.Tensor | None,
+        attn_metadata: AttentionMetadata,
+    ) -> bool:
+        if self._use_cudnn_sdpa(query, key, value):
+            return False
+        return self.fa_impl.forward_into(query, key, value, out, attn_metadata)
+
     def forward(
         self,
         query: torch.Tensor,

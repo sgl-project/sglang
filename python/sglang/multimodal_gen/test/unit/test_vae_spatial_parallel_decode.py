@@ -1,8 +1,13 @@
+import tempfile
 import unittest
+from datetime import timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 
 from sglang.multimodal_gen.configs.models.vaes.base import (
     VAEConfig,
@@ -30,6 +35,7 @@ from sglang.multimodal_gen.runtime.layers.parallel_conv import (
     SpatialParallelConv2d,
     SpatialParallelConv3d,
     chunk_height_by_sizes,
+    gather_height_sizes,
     split_for_parallel_decode,
 )
 from sglang.multimodal_gen.runtime.models.vaes.autoencoder import AutoencoderKL
@@ -75,6 +81,25 @@ class _DispatchProbeVAE(ParallelTiledVAE):
         raise AssertionError(
             "spatial_shard decode should not use parallel_tiled_decode"
         )
+
+
+def _gather_heights_on_two_ranks(rank: int, rendezvous: str) -> None:
+    dist.init_process_group(
+        "gloo",
+        init_method=rendezvous,
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=60),
+    )
+    try:
+        # meta tensors carry no data: any device collective on them would fail
+        group = SimpleNamespace(
+            world_size=2, cpu_group=dist.group.WORLD, device_group=None
+        )
+        x = torch.empty(1, 2, (3, 2)[rank], 4, device="meta")
+        assert gather_height_sizes(x, parallel_group=group) == [3, 2]
+    finally:
+        dist.destroy_process_group()
 
 
 class TestVAESpatialParallelDecode(unittest.TestCase):
@@ -266,6 +291,11 @@ class TestVAESpatialParallelDecode(unittest.TestCase):
         self.assertEqual(rank0.shape[-2], 3)
         self.assertEqual(rank1.shape[-2], 2)
         torch.testing.assert_close(torch.cat([rank0, rank1], dim=-2), x)
+
+    def test_height_sizes_are_gathered_on_the_host(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rendezvous = (Path(tmp) / "rendezvous").as_uri()
+            mp.spawn(_gather_heights_on_two_ranks, args=(rendezvous,), nprocs=2)
 
     def test_chunk_height_by_sizes_keeps_original_partition(self):
         x = torch.arange(10).view(1, 1, 10, 1)
