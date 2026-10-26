@@ -403,6 +403,8 @@ class SamplingParams:
     return_trajectory_decoded: bool = False  # returns decoded latents for each timestep
     rollout_return_denoising_env: bool = False  # populate ``denoising_env`` (image/pos/neg kwargs, guidance) for RL replay
     rollout_return_dit_trajectory: bool = False  # per-step noisy latents + final latent + timesteps (RolloutDitTrajectory)
+    # False skips the VAE decode; only the rollout trajectory is returned.
+    rollout_return_generated_output: bool = True
     # 0-indexed denoising-loop step filters; None = all steps.
     rollout_sde_step_indices: list[int] | None = None
     rollout_return_step_indices: list[int] | None = None
