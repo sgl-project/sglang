@@ -2703,15 +2703,6 @@ class KVCacheConfigurator:
         )
 
         slack_gb = pre_model_load_memory * (1 - get_schedule().mem_fraction_static)
-        reserve_override_gb = envs.SGLANG_KV_NON_STATIC_RESERVE_GB.get()
-        if reserve_override_gb is not None:
-            logger.info(
-                "KV sizing: non-static reserve %.2f GB from "
-                "SGLANG_KV_NON_STATIC_RESERVE_GB (fraction-based %.2f GB ignored)",
-                reserve_override_gb,
-                slack_gb,
-            )
-            slack_gb = float(reserve_override_gb)
         # Every prefill batch fits a captured bucket when batches are capped at the
         # request slots; the exemption also needs an explicit Mamba size: a larger
         # rest_memory would otherwise auto-size a bigger physical Mamba pool below.

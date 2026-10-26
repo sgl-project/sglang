@@ -602,10 +602,6 @@ class Envs:
     SGLANG_AITER_PAGED_PREFILL_ASM = EnvBool(True)
     # size the KV pool after CUDA-graph capture
     SGLANG_ENABLE_POST_CAPTURE_KV_SIZING = EnvBool(False)
-    # GiB of free GPU memory the pre-capture KV sizing leaves for graphs and
-    # activations, replacing pre_model_load * (1 - mem_fraction_static) (and the
-    # aiter long-context 0.85 scale folded into it). Unset keeps the fraction.
-    SGLANG_KV_NON_STATIC_RESERVE_GB = EnvFloat(None)
     # Index a compact-window DFLASH draft KV pool by the hybrid-SWA target's
     # sliding-window slots (pool and HiCache host pool sized like the target's
     # SWA pool) instead of its full-attention slots. Needs draft window <= the
