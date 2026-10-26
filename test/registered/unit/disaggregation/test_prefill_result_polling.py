@@ -161,6 +161,8 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         self.waiting_queue = []
         self.cur_batch_for_debug = None
         self._engine_paused = False
+        self._pause_started_at = None
+        self._pause_intervals = deque()
         self.gracefully_exit = False
         self.enable_staging = False
         self.enable_overlap = True
@@ -299,8 +301,13 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
             result.delay_sample_func = sample
         return result
 
+    war_barrier_is_coarse = True
+
+    def _war_barrier_is_coarse(self):
+        return self.war_barrier_is_coarse
+
     def _apply_war_barrier(self):
-        pass
+        self.actions.append((self.iteration, "barrier", None))
 
     def process_batch_result(self, batch, result):
         assert all(pending is not result for _, pending in self.result_queue)
@@ -621,6 +628,32 @@ class TestPrefillResultPolling(CustomTestCase):
                 run_loop.assert_called_once_with()
                 check_support.assert_not_called()
                 self.assertFalse(scheduler.enable_continuous_input_polling)
+
+    def test_coarse_war_barrier_follows_previous_result_processing(self):
+        steps = ("launch", "process_result", "inflight", "barrier")
+        for coarse, polling, ready_at, expected in (
+            # A whole-forward barrier waits until the previous result is processed.
+            (True, False, 1, ["launch", "process_result", "inflight", "barrier"]),
+            (True, True, 1, ["launch", "process_result", "inflight", "barrier"]),
+            # Polling for an unfinished result still applies it before intake.
+            (True, True, 2, ["launch", "barrier"]),
+            # A read-done barrier keeps its place right after the launch.
+            (False, False, 1, ["launch", "barrier", "process_result", "inflight"]),
+            (False, True, 2, ["launch", "barrier"]),
+        ):
+            with self.subTest(coarse=coarse, polling=polling, ready_at=ready_at):
+                scheduler = _Scheduler(
+                    [_batch(1), _batch(2)] + [None] * 4,
+                    {name: _result() for name in (1, 2)},
+                    {1: ready_at, 2: ready_at + 1},
+                )
+                scheduler.war_barrier_is_coarse = coarse
+                _run_loop(scheduler, enabled=polling)
+                # Step 1 launches batch 2 while batch 1's result is pending.
+                self.assertEqual(
+                    [a[1] for a in scheduler.actions if a[0] == 1 and a[1] in steps],
+                    expected,
+                )
 
     def test_chunk_handoffs_across_polling_and_retract_pause(self):
         for enabled, pause_at, blocking_ends in (

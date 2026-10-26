@@ -1,6 +1,8 @@
 """Image responses carry the bytes encoded on the output rank instead of reading a file back."""
 
+import asyncio
 import base64
+import copy
 import os
 from io import BytesIO
 from types import SimpleNamespace
@@ -10,6 +12,7 @@ import imageio
 import numpy as np
 import pytest
 import torch
+import zmq
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from PIL import Image
@@ -18,7 +21,9 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
     DataType,
     SamplingParams,
 )
+from sglang.multimodal_gen.runtime.disaggregation.transport.codec import unpack_tensors
 from sglang.multimodal_gen.runtime.entrypoints.openai import image_api
+from sglang.multimodal_gen.runtime.entrypoints.openai import utils as openai_utils
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
     MaterializedOutput,
     save_materialized_output,
@@ -30,6 +35,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
     OutputBatch,
     Req,
 )
+from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 
 
 def _frame(channels: int) -> np.ndarray:
@@ -198,10 +204,80 @@ def test_dynamic_batch_split_keeps_each_requests_image_bytes():
     assert [output.output_image_bytes for output in outputs] == [[b"a"], [b"b"]]
 
 
+@pytest.mark.parametrize("sequential", [False, True])
+@pytest.mark.parametrize("output_count", [1, 2])
+@pytest.mark.parametrize("persistent", [False, True])
+def test_disagg_returns_pixels_for_head_encoding(
+    monkeypatch, tmp_path, sequential, output_count, persistent
+):
+    req = _image_req(tmp_path, save_output=persistent, return_image_bytes=True)
+    req.num_outputs_per_prompt = output_count
+    req.prior_token_id = torch.arange(output_count).reshape(-1, 1)
+    head_req = copy.deepcopy(req)
+    pixels = torch.rand(output_count, 3, 8, 8)
+    worker = object.__new__(GPUWorker)
+    worker.is_output_rank = True
+
+    def compute(reqs):
+        (request,) = reqs
+        output = OutputBatch(output=pixels[request.prior_token_id.flatten()])
+        worker._materialize_output_transport(
+            output, request, lambda batch: worker._save_output_paths(request, batch)
+        )
+        return output
+
+    # Stub only the model computation, not materialization or the wire format.
+    monkeypatch.setattr(worker, "execute_forward", compute)
+    monkeypatch.setattr(
+        worker,
+        "execute_forward_sequentially",
+        lambda reqs: (compute([r]) for r in reqs),
+    )
+    scheduler = object.__new__(Scheduler)
+    scheduler.worker = worker
+    scheduler._disagg_metrics = None
+    scheduler.server_args = SimpleNamespace(
+        pipeline_config=SimpleNamespace(
+            supports_sequential_multi_output_inference=lambda: sequential
+        )
+    )
+    with zmq.Context() as context:
+        with context.socket(zmq.PAIR) as sender, context.socket(zmq.PAIR) as receiver:
+            sender.bind("inproc://image-result")
+            receiver.connect("inproc://image-result")
+            receiver.setsockopt(zmq.RCVTIMEO, 1000)
+            scheduler._pool_result_push = sender
+            scheduler._execute_glm_distributed_denoiser_request(req, "image-request")
+            tensors, scalars = unpack_tensors(receiver.recv_multipart(), device="cpu")
+
+    assert scalars["request_id"] == "image-request"
+    assert "error" not in scalars
+    torch.testing.assert_close(tensors["output"], pixels, rtol=0, atol=0)
+    assert list(tmp_path.iterdir()) == []
+
+    monkeypatch.setattr(
+        openai_utils,
+        "get_global_server_args",
+        lambda: SimpleNamespace(batching_max_size=1),
+    )
+    client = SimpleNamespace(forward=AsyncMock(return_value=OutputBatch(**tensors)))
+    paths, result = asyncio.run(openai_utils.process_generation_batch(client, head_req))
+    assert len(paths) == len(result.output_image_bytes) == output_count
+    for path, data, output in zip(
+        paths, result.output_image_bytes, pixels, strict=True
+    ):
+        np.testing.assert_array_equal(_decode(data), _uint8_hwc(output))
+        assert os.path.exists(path) == persistent
+        if persistent:
+            with open(path, "rb") as file:
+                assert file.read() == data
+
+
 @pytest.mark.parametrize("endpoint", ["generations", "edits"])
 @pytest.mark.parametrize("persistent", [False, True])
-def test_b64_response_is_the_returned_bytes(
-    monkeypatch, tmp_path, endpoint, persistent
+@pytest.mark.parametrize("error", [None, "output save failed"])
+def test_b64_response_publishes_only_successful_outputs(
+    monkeypatch, tmp_path, endpoint, persistent, error
 ):
     output_path = str(tmp_path / "outputs") if persistent else None
     monkeypatch.setattr(
@@ -222,21 +298,28 @@ def test_b64_response_is_the_returned_bytes(
 
     monkeypatch.setattr(image_api, "_build_request_sampling_params", build)
     monkeypatch.setattr(
-        image_api, "prepare_request", lambda **_: SimpleNamespace(extra={})
+        image_api, "prepare_request", lambda **_: Req(sampling_params=SamplingParams())
+    )
+    monkeypatch.setattr(
+        openai_utils,
+        "get_global_server_args",
+        lambda: SimpleNamespace(batching_max_size=1),
     )
     png = BytesIO()
     Image.fromarray(_frame(3)).save(png, format="PNG")
     png = png.getvalue()
 
-    async def generate(_client, _batch):
+    async def generate(_batches):
         # no file exists at the returned path; the response must not need one
         path = os.path.join(captured["output_path"], captured["output_file_name"])
-        return [path], OutputBatch(output_image_bytes=[png])
+        return OutputBatch(
+            output_file_paths=[path], output_image_bytes=[png], error=error
+        )
 
-    monkeypatch.setattr(image_api, "process_generation_batch", generate)
+    monkeypatch.setattr(async_scheduler_client, "forward", generate)
     app = FastAPI()
     app.include_router(image_api.router)
-    with TestClient(app) as client:
+    with TestClient(app, raise_server_exceptions=False) as client:
         if endpoint == "generations":
             response = client.post(
                 "/v1/images/generations",
@@ -249,6 +332,10 @@ def test_b64_response_is_the_returned_bytes(
                 files={"image": ("reference.png", png, "image/png")},
             )
 
+    if error:
+        assert response.status_code == 500, response.text
+        assert "b64_json" not in response.text
+        return
     assert response.status_code == 200, response.text
     (item,) = response.json()["data"]
     assert base64.b64decode(item["b64_json"]) == png
