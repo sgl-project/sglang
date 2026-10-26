@@ -4,7 +4,10 @@ import math
 import torch
 from PIL import Image
 
-from sglang.multimodal_gen.runtime.cache.conditioning import cached_encoder_call
+from sglang.multimodal_gen.runtime.cache.conditioning import (
+    cached_encoder_call,
+    use_gpu_conditioning_hash,
+)
 from sglang.multimodal_gen.runtime.distributed import (
     get_local_torch_device,
     get_sp_group,
@@ -142,9 +145,12 @@ class QwenImage21EncodingStage(PipelineStage):
                 vision_images.append(image)
             kwargs["images"] = vision_images
         inputs = self.processor(**kwargs).to(device)
-        with self.use_declared_component(
-            component_name="text_encoder", module=self.text_encoder
-        ) as encoder:
+        with (
+            self.use_declared_component(
+                component_name="text_encoder", module=self.text_encoder
+            ) as encoder,
+            use_gpu_conditioning_hash(enabled=len(images) > 1),
+        ):
             outputs = encoder(
                 **inputs, output_hidden_states=True, use_cache=False, logits_to_keep=1
             )
@@ -197,7 +203,8 @@ class QwenImage21EncodingStage(PipelineStage):
                         pixels[None].permute(0, 3, 1, 2).unsqueeze(2).float() / 255.0
                     )
                     pixels = (2 * pixels - 1).to(device=device, dtype=torch.bfloat16)
-                    latent = vae.encode(pixels).mode()
+                    with use_gpu_conditioning_hash(enabled=len(resized) > 1):
+                        latent = vae.encode(pixels).mode()
                     stats_key = (latent.dtype, latent.device)
                     if stats_key not in self.latent_stats:
                         self.latent_stats[stats_key] = tuple(

@@ -20,6 +20,7 @@ from sglang.multimodal_gen.runtime.cache.conditioning import (
     cached_vae_encode,
     invalidate_conditioning_caches,
     prefer_conditioning_cache,
+    use_gpu_conditioning_hash,
 )
 from sglang.multimodal_gen.runtime.models.encoders.base import (
     EncoderTensorParallelMixin,
@@ -67,21 +68,37 @@ class VisionLanguageEncoder(Encoder):
         return self.image_features(pixels) + text
 
 
+@pytest.mark.parametrize(
+    "device,gpu_hash",
+    [
+        ("cpu", False),
+        pytest.param(
+            "cuda",
+            True,
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="requires CUDA hashing"
+            ),
+        ),
+    ],
+)
 @torch.no_grad()
-def test_changed_instruction_reuses_vision_but_not_joint_embedding():
+def test_changed_instruction_reuses_vision_but_not_joint_embedding(device, gpu_hash):
     cache = ConditioningCache(4096)
-    model = VisionLanguageEncoder().eval()
-    pixels = torch.ones(4)
-    with cache.scope():
-        first = model(torch.ones(4), pixels)
-        changed = model(torch.full((4,), 2.0), pixels)
+    model = VisionLanguageEncoder().eval().to(device)
+    pixels = torch.ones(4, device=device)
+    with cache.scope(), use_gpu_conditioning_hash(enabled=gpu_hash):
+        first = model(torch.ones(4, device=device), pixels)
+        changed = model(torch.full((4,), 2.0, device=device), pixels)
         assert not torch.equal(first, changed)
         assert model.calls == 2 and model.vision_calls == 1
         torch.testing.assert_close(
-            model(torch.full((4,), 2.0), pixels), changed, rtol=0, atol=0
+            model(torch.full((4,), 2.0, device=device), pixels.clone()),
+            changed,
+            rtol=0,
+            atol=0,
         )
         assert model.calls == 2
-        model(torch.ones(4), pixels + 1)
+        model(torch.ones(4, device=device), pixels + 1)
         assert model.vision_calls == 2
 
 
@@ -221,12 +238,13 @@ def test_bypass(bypass):
     assert cache.hits == 0
 
 
+@pytest.mark.parametrize("gpu_hash", [False, True])
 @torch.no_grad()
-def test_posterior_cache_preserves_rng_and_sampling():
+def test_posterior_cache_preserves_rng_and_sampling(gpu_hash):
     cache = ConditioningCache(1024 * 1024)
     vae = VAE().eval()
     x = torch.linspace(-1, 1, 64).reshape(1, 4, 4, 4)
-    with cache.scope():
+    with cache.scope(), use_gpu_conditioning_hash(enabled=gpu_hash):
         posterior = vae.encode(x).latent_dist
         cold = posterior.sample(generator=torch.Generator().manual_seed(42))
         posterior.mean.add_(100)  # downstream normalization must not poison storage
@@ -332,8 +350,9 @@ def test_cuda_snapshot_waits_for_producing_stream_before_restore():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA transfers")
+@pytest.mark.parametrize("gpu_hash", [False, True])
 @torch.no_grad()
-def test_cuda_video_condition_key_covers_every_byte():
+def test_cuda_video_condition_key_covers_every_byte(gpu_hash):
     cache = ConditioningCache(256 * 1024 * 1024)
     vae = VAE().eval()
     # image followed by zero frames, large enough for the sparse block digest
@@ -344,7 +363,7 @@ def test_cuda_video_condition_key_covers_every_byte():
     last_byte = video.clone()
     last_byte.view(-1)[-1] = 1
     shifted = torch.roll(video, shifts=1, dims=2)
-    with cache.scope():
+    with cache.scope(), use_gpu_conditioning_hash(enabled=gpu_hash):
         expected = vae.encode(video).latent_dist.mean
         hit = vae.encode(video.clone()).latent_dist.mean
         for changed in (negative_zero, last_byte, shifted):
@@ -652,6 +671,34 @@ def test_group_cache_waits_for_producing_cuda_stream():
             output.last_hidden_state, torch.ones_like(output.last_hidden_state)
         )
     assert model.calls == 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA hashing")
+@torch.no_grad()
+def test_gpu_conditioning_hash_scope_restores_after_exception():
+    cache = ConditioningCache(4096)
+    vae = VAE().eval()
+    x = torch.arange(64, device="cuda", dtype=torch.float32).reshape(1, 4, 4, 4)
+    with cache.scope():
+        expected = vae.encode(x).latent_dist.mean
+        with pytest.raises(RuntimeError, match="leave dense branch"):
+            with use_gpu_conditioning_hash():
+                actual = vae.encode(x).latent_dist.mean
+                with use_gpu_conditioning_hash():
+                    with use_gpu_conditioning_hash(enabled=False):
+                        changed = vae.encode(x + 1).latent_dist.mean
+                nested = vae.encode(x + 1).latent_dist.mean
+                assert vae.calls == 3
+                raise RuntimeError("leave dense branch")
+        with use_gpu_conditioning_hash(enabled=False):
+            disabled = vae.encode(x + 1).latent_dist.mean
+        restored = vae.encode(x).latent_dist.mean
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(restored, expected, rtol=0, atol=0)
+    torch.testing.assert_close(nested, changed, rtol=0, atol=0)
+    torch.testing.assert_close(disabled, changed, rtol=0, atol=0)
+    assert vae.calls == 4
+    assert cache.hits == 2
 
 
 if __name__ == "__main__":

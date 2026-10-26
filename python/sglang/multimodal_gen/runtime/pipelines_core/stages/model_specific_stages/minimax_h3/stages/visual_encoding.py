@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import torch
 
+from sglang.multimodal_gen.runtime.cache.conditioning import use_gpu_conditioning_hash
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
@@ -274,6 +275,7 @@ class MiniMaxH3VisualEncodingStage(ConditionEncodingStage):
             "frame_count": prepared.get("frame_count"),
         }
 
+    @use_gpu_conditioning_hash()
     def _encode_reference_video(self, batch: Req, plan) -> None:
         """ref2va video/video_audio encode from shared transformed frames."""
         from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.constants import (
@@ -322,6 +324,7 @@ class MiniMaxH3VisualEncodingStage(ConditionEncodingStage):
         payload["videos"] = entries
         batch.extra[MINIMAX_H3_REFERENCE_VIDEO_ROWS_EXTRA_KEY] = payload
 
+    @use_gpu_conditioning_hash()
     def _encode_reference_image(self, batch: Req, plan) -> None:
         """ref2va reference image encode: cap_resize (intrinsic
         geometry) + the verified keyframe recipe; rows use the image's OWN

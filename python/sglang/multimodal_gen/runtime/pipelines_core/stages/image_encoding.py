@@ -19,6 +19,7 @@ from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 from diffusers.models.modeling_outputs import AutoencoderKLOutput
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import TextConditioningOutput
+from sglang.multimodal_gen.runtime.cache.conditioning import use_gpu_conditioning_hash
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
@@ -985,9 +986,14 @@ class ImageVAEEncodingStage(PipelineStage):
                     video_condition = server_args.pipeline_config.preprocess_vae_encode(
                         video_condition, self.vae
                     )
-                    with temporary_module_dtype(
-                        self.vae, vae_dtype, enabled=should_cast_vae
-                    ) as vae:
+                    with (
+                        temporary_module_dtype(
+                            self.vae, vae_dtype, enabled=should_cast_vae
+                        ) as vae,
+                        use_gpu_conditioning_hash(
+                            enabled=num_frames == 1 and len(images) > 1
+                        ),
+                    ):
                         latent_dist: DiagonalGaussianDistribution = vae.encode(
                             video_condition
                         )
