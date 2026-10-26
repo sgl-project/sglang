@@ -18,6 +18,7 @@ import asyncio
 import hashlib
 import io
 import json
+import struct
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -112,6 +113,24 @@ def raw_profile_exif_rgba_png():
     )
 
 
+def bitfields_alpha_bmp():
+    # Pillow saves RGBA as 32-bit BI_RGB and reads that back as RGB; only an
+    # alpha bitmask opens as RGBA, so write the BITMAPV4HEADER by hand.
+    pixels = gradient(56, 56, 20, channels=4)
+    pixels[..., 3] = 255
+    pixels[8:40, 12:44, 3] = np.arange(0, 256, 8, dtype=np.uint8)
+    height, width = pixels.shape[:2]
+    data = pixels[::-1, :, [2, 1, 0, 3]].tobytes()  # bottom-up BGRA
+    # Size, width, height, planes, bits, BI_BITFIELDS, image size, resolution,
+    # palette sizes, then the R, G, B and A bitmasks.
+    fields = (108, width, height, 1, 32, 3, len(data), 2835, 2835, 0, 0)
+    masks = (0xFF0000, 0xFF00, 0xFF, 0xFF000000)
+    header = struct.pack("<IiiHHIIiiII4I", *fields, *masks).ljust(108, b"\0")
+    offset = 14 + len(header)
+    file_header = b"BM" + struct.pack("<IHHI", offset + len(data), 0, 0, offset)
+    return file_header + header + data
+
+
 # name -> encoded bytes. Small, deterministic, and each exercising one decode path.
 CORPUS = {
     "rgb_96x80.png": lambda: encode(Image.fromarray(gradient(96, 80)), "PNG"),
@@ -150,6 +169,7 @@ CORPUS = {
     "transparent_56x56.gif": transparent_gif,
     "rgba_raw_exif6_56x48.png": raw_profile_exif_rgba_png,
     "rgb_50x40.bmp": lambda: encode(Image.fromarray(gradient(50, 40, 14)), "BMP"),
+    "rgba_bitfields_56x56.bmp": bitfields_alpha_bmp,
     "tiny_10x10.png": lambda: encode(Image.fromarray(gradient(10, 10, 15)), "PNG"),
     "large_800x600.jpg": lambda: encode(
         Image.fromarray(gradient(800, 600, 16, noise=0)), "JPEG", quality=80

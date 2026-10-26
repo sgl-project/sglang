@@ -212,12 +212,13 @@ pub(super) fn decode(
 }
 
 /// The alpha of PIL's `convert("RGBA")` for an image `smart_to_rgb` composites
-/// (RGBA, LA, or `transparency`), oriented as Dynamo orients the RGB.
+/// (RGBA, LA, or `transparency`), oriented as Dynamo orients the RGB. A BMP
+/// has alpha, in PIL and in `image` alike, only with an alpha bitmask.
 fn alpha(data: &[u8]) -> Result<Option<Vec<u8>>, MmError> {
     let invalid = |error: image::ImageError| MmError::invalid_input(error.to_string());
     let format = match image::guess_format(data) {
         Ok(ImageFormat::Gif) => return gif_alpha(data),
-        Ok(format @ (ImageFormat::Png | ImageFormat::WebP)) => format,
+        Ok(format @ (ImageFormat::Png | ImageFormat::WebP | ImageFormat::Bmp)) => format,
         _ => return Ok(None),
     };
     let decoder = ImageReader::with_format(Cursor::new(data), format)

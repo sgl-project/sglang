@@ -42,7 +42,7 @@ tokenizers = { version = "0.23.2", default-features = false, optional = true }
 dynamo-multimodal = { version = "=0.2.3", default-features = false, optional = true }
 # GLM-5.3-Flash alpha compositing; the decoders `dynamo-multimodal` uses.
 gif = { version = "0.14", optional = true }
-image = { version = "0.25", default-features = false, features = ["png", "webp"], optional = true }
+image = { version = "0.25", default-features = false, features = ["bmp", "png", "webp"], optional = true }
 png = { version = "0.18", optional = true }
 dynamo-parsers = { version = "=9.2.8", optional = true }
 dynamo-protocols = { version = "7.0.0", optional = true }
