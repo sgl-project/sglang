@@ -1215,39 +1215,12 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             return None, None, None
 
         cos, sin = freqs_cis
-        if not (cos.is_cuda and sin.is_cuda):
-            return None, None
-
         # matched by the live source tensors: a data_ptr key hit a freed table's address
         cached = self._rope_caches.get(stream)
         if cached is not None and cached[0][0] is cos and cached[0][1] is sin:
             return self._pin_for_active_capture(cached[1])
 
-        if cos.dim() == 3:
-            batch_size, seq_len = cos.shape[:2]
-            cos_sin_cache = torch.cat(
-                [
-                    cos.to(dtype=torch.float32).contiguous(),
-                    sin.to(dtype=torch.float32).contiguous(),
-                ],
-                dim=-1,
-            ).reshape(batch_size * seq_len, -1)
-            positions = torch.arange(
-                batch_size * seq_len, device=cos.device, dtype=torch.long
-            )
-        elif cos.dim() == 2:
-            cos_sin_cache = torch.cat(
-                [
-                    cos.to(dtype=torch.float32).contiguous(),
-                    sin.to(dtype=torch.float32).contiguous(),
-                ],
-                dim=-1,
-            )
-            positions = None
-        else:
-            return None, None
-
-        rope_cache = (cos_sin_cache, positions)
+        rope_cache = self._build_rope_cache(freqs_cis)
         self._rope_caches[stream] = ((cos, sin), rope_cache)
         return self._pin_for_active_capture(rope_cache)
 

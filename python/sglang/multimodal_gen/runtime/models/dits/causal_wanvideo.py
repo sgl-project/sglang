@@ -671,11 +671,7 @@ class CausalWanTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             if rope_cache is not None:
                 rope_cache.clear()
                 rope_cache[rope_key] = freqs_cis
-        complex_freqs = (
-            torch.complex(freqs_cos.float(), freqs_sin.float()).unsqueeze(-2)
-            if freqs_cos is not None
-            else None
-        )
+        complex_freqs = torch.complex(*freqs_cis).unsqueeze(-2)
 
         hidden_states = self.patch_embedding(hidden_states)
         hidden_states = hidden_states.flatten(2).transpose(1, 2)
