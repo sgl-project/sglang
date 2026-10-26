@@ -96,36 +96,37 @@ def test_indexed_alignment_matches_each_gemm(runner_module, monkeypatch, down_bl
 
 
 @pytest.mark.parametrize(
-    "mode_name",
+    "mode_name,static_scale_name,first_scale_name,second_scale_name",
     [
-        "DynamicToken",
-        "DynamicGroup",
-        "StaticTensor",
-        "StaticTensorDynamicGroup",
-        "DynamicGroupToken",
+        ("DynamicToken", None, "token", None),
+        ("DynamicGroup", None, "group", None),
+        ("StaticTensor", "w2_input_scale", "token", None),
+        ("StaticTensorDynamicGroup", "w2_input_scale_2", "group", "token"),
+        ("DynamicGroupToken", None, "group", "token"),
     ],
 )
-def test_input_scale_levels_are_preserved(runner_module, mode_name):
+def test_input_scale_levels_are_preserved(
+    runner_module, mode_name, static_scale_name, first_scale_name, second_scale_name
+):
     runner = make_runner(runner_module)
-    mode = getattr(runner_module.InputQuantizationMode, mode_name)
-    runner.layer.humming_metas["w2"].input_quant_mode = mode
-    static_scale = torch.tensor([0.25])
-    runner.layer.w2_input_scale = static_scale
-    runner.layer.w2_input_scale_2 = static_scale
+    runner.layer.humming_metas["w2"].input_quant_mode = getattr(
+        runner_module.InputQuantizationMode, mode_name
+    )
+    runner.layer.w2_input_scale = torch.tensor([0.25])
+    runner.layer.w2_input_scale_2 = torch.tensor([0.5])
     inputs = torch.ones(3, 128, dtype=torch.bfloat16)
     quantized = torch.ones(3, 128, dtype=torch.int8)
-    group_scales = torch.ones(3, 1) if mode.has_group_scale else None
-    token_scales = static_scale if mode.has_tensor_scale else torch.ones(3, 1)
+    scales = {None: None, "group": torch.ones(3, 1), "token": torch.full((3, 1), 2.0)}
     process_input = runner_module.HummingMethod.may_process_input
-    process_input.return_value = quantized, group_scales, token_scales
+    process_input.return_value = quantized, scales["group"], scales["token"]
 
     result, first_scale, second_scale = runner._prepare_input(inputs, "w2", quantized)
     assert result is quantized
-    assert first_scale is (group_scales if mode.has_group_scale else token_scales)
-    assert second_scale is (token_scales if mode.has_secondary_scale else None)
+    assert first_scale is scales[first_scale_name]
+    assert second_scale is scales[second_scale_name]
     assert process_input.call_args.kwargs["m_major_scale"] is False
     assert process_input.call_args.kwargs["token_scales"] is (
-        static_scale if mode.has_tensor_scale else None
+        getattr(runner.layer, static_scale_name) if static_scale_name else None
     )
 
 
@@ -141,14 +142,16 @@ def test_deepep_input_is_not_requantized(runner_module):
 
 
 @pytest.mark.parametrize(
-    "gate_up_dtype,down_dtype",
+    "gate_up_dtype,down_dtype,gate_up_buffer,down_buffer",
     [
-        ("bfloat16", "float4e2m1"),
-        ("float8e5m2", "bfloat16"),
-        ("float4e0m3", "float8e4m3"),
+        ("bfloat16", "float4e2m1", None, (64, torch.uint8)),
+        ("float8e5m2", "bfloat16", (256, torch.float8_e5m2), None),
+        ("float4e0m3", "float8e4m3", (128, torch.uint8), (128, torch.float8_e4m3fn)),
     ],
 )
-def test_workspace_uses_each_sublayers_dtype(runner_module, gate_up_dtype, down_dtype):
+def test_workspace_uses_each_sublayers_dtype(
+    runner_module, gate_up_dtype, down_dtype, gate_up_buffer, down_buffer
+):
     runner = make_runner(runner_module)
     for sublayer, dtype in (("w13", gate_up_dtype), ("w2", down_dtype)):
         meta = runner.layer.humming_metas[sublayer]
@@ -160,18 +163,16 @@ def test_workspace_uses_each_sublayers_dtype(runner_module, gate_up_dtype, down_
     buffers = runner.prepare_buffers(
         inputs, routes, runner_module.HummingGemmType.INDEXED
     )
-    for name, dtype, width in (
-        ("quanted_gate_up_input", gate_up_dtype, 256),
-        ("quanted_down_input", down_dtype, 128),
+    for name, expected in (
+        ("quanted_gate_up_input", gate_up_buffer),
+        ("quanted_down_input", down_buffer),
     ):
-        if dtype == "bfloat16":
+        if expected is None:
             assert name not in buffers
             continue
-        data_type = getattr(runner_module.dtypes, dtype)
-        assert buffers[name].shape[-1] == width // max(8 // data_type.num_bits, 1)
-        assert buffers[name].dtype == runner_module.dtypes.torch_dtype_map.get(
-            data_type, torch.uint8
-        )
+        width, dtype = expected
+        assert buffers[name].shape[-1] == width
+        assert buffers[name].dtype == dtype
     assert (
         buffers["activation_output"].data_ptr() != buffers["gate_up_output"].data_ptr()
     )

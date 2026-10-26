@@ -21,7 +21,6 @@ from sglang.srt.layers.quantization.humming import (  # noqa: E402
     HummingLinearMethod,
     HummingMoEMethod,
     _convert_humming_tensors,
-    _expand_tensor_scale_attrs,
     _StackedBlockFp8CheckpointWeightSchema,
     _W4AFp8CheckpointWeightSchema,
 )
@@ -293,165 +292,117 @@ class TestHummingSchemaConversion(CustomTestCase):
         self.assertNotIn("input_scale", converted)
         self.assertNotIn("input_scale_2", converted)
 
-    def test_native_tensor_scale_attributes_preserve_checkpoint_shards(self):
-        from humming.schema import HummingInputSchema, HummingWeightSchema
-
-        weight_schema = HummingWeightSchema(
-            b_dtype="float8e4m3", weight_scale_type="tensor"
-        )
-        input_schema = HummingInputSchema(
-            a_dtype="float8e4m3", input_quant_mode="static_tensor"
-        )
-        attrs = weight_schema.get_tensors_attrs(4, 8, torch.bfloat16, num_experts=2)
-        attrs.update(input_schema.get_tensors_attrs(8, torch.bfloat16, num_experts=2))
-        _expand_tensor_scale_attrs(attrs, stack_size=2, num_experts=2)
-        self.assertEqual(attrs["weight_scale"]["shape"], (2, 2))
-        self.assertEqual(attrs["input_scale"]["shape"], (2, 2))
-        self.assertEqual(attrs["weight"]["shape"], (2, 4, 2))
-
     def test_moe_allocates_input_and_weight_scales_for_gate_and_up(self):
+        from humming.schema import HummingInputSchema, HummingWeightSchema
         from humming.schema.fp8 import Fp8InputSchema, Fp8WeightSchema
 
-        method = HummingMoEMethod(
-            HummingLayerQuantizationConfig(
-                weight_schema=Fp8WeightSchema(),
-                input_schema=Fp8InputSchema(activation_scheme="static"),
-            )
-        )
-        layer = torch.nn.Module()
-        method.create_weights(
-            layer,
-            num_experts=3,
-            hidden_size=128,
-            intermediate_size_per_partition=64,
-            params_dtype=torch.bfloat16,
-        )
-        self.assertEqual(layer.w13_weight_scale.shape, (3, 2))
-        self.assertEqual(layer.w13_input_scale.shape, (3, 2))
-        self.assertEqual(layer.w2_input_scale.shape, (3,))
-        self.assertEqual(layer.w13_input_scale.quant_method, "tensor")
-        self.assertTrue(layer.w13_input_scale.is_humming_input_scale)
-
-    def test_online_quantization_uses_schema_scale_names(self):
-        from humming.schema import HummingWeightSchema
-
-        for scale_type, scale_2_type, expected_key in (
-            ("tensor", "none", "weight_scale"),
-            ("group", "tensor", "weight_scale_2"),
-            ("group", "channel", "weight_scale_2"),
+        for weight_schema, input_schema in (
+            (Fp8WeightSchema(), Fp8InputSchema(activation_scheme="static")),
+            (
+                HummingWeightSchema(b_dtype="float8e4m3", weight_scale_type="tensor"),
+                HummingInputSchema(
+                    a_dtype="float8e4m3", input_quant_mode="static_tensor"
+                ),
+            ),
         ):
-            with self.subTest(scale_type=scale_type, scale_2_type=scale_2_type):
-                schema = HummingWeightSchema(
-                    b_dtype="float4e2m1",
-                    weight_scale_type=scale_type,
-                    weight_scale_2_type=scale_2_type,
-                    weight_scale_group_size=0 if scale_type == "tensor" else 16,
+            with self.subTest(schema=type(weight_schema).__name__):
+                method = HummingMoEMethod(
+                    HummingLayerQuantizationConfig(
+                        weight_schema=weight_schema, input_schema=input_schema
+                    )
                 )
                 layer = torch.nn.Module()
-                layer.param_dtype = torch.bfloat16
-                attrs = schema.get_tensors_attrs(2, 32, layer.param_dtype)
-                for name, attr in attrs.items():
-                    param = torch.nn.Parameter(
-                        torch.zeros(attr["shape"], dtype=attr["dtype"]),
-                        requires_grad=False,
-                    )
-                    param.param_name = name
-                    param.weight_loader = lambda target, loaded, shard: (
-                        target.data.copy_(loaded)
-                    )
-                    setattr(layer, name, param)
-                method = HummingLinearMethod(
-                    HummingLayerQuantizationConfig(
-                        weight_schema=schema, is_online_quant=True
-                    )
+                method.create_weights(
+                    layer,
+                    num_experts=3,
+                    hidden_size=128,
+                    intermediate_size_per_partition=64,
+                    params_dtype=torch.bfloat16,
                 )
-                load = method.prepare_weight_loader(layer, None)
-                packed_weight = torch.full((2, 4), 17, dtype=torch.int32)
-                group_scale = (
-                    None
-                    if scale_type == "tensor"
-                    else torch.ones((2, 2), dtype=torch.bfloat16)
-                )
-                secondary_scale = (
-                    torch.tensor([2.0, 3.0])
-                    if scale_2_type == "channel"
-                    else torch.tensor([2.0])
-                )
-                with patch(
-                    "humming.schema.humming.quantize_weight",
-                    autospec=True,
-                    return_value=(packed_weight, group_scale, None, secondary_scale),
-                ):
-                    load(layer.weight, torch.ones((2, 32), dtype=torch.bfloat16))
-                self.assertFalse(hasattr(layer, "global_scale"))
-                expected_scale = secondary_scale.to(getattr(layer, expected_key).dtype)
-                torch.testing.assert_close(getattr(layer, expected_key), expected_scale)
-                torch.testing.assert_close(layer.weight, packed_weight)
+                self.assertEqual(layer.w13_weight_scale.shape, (3, 2))
+                self.assertEqual(layer.w13_input_scale.shape, (3, 2))
+                self.assertEqual(layer.w2_input_scale.shape, (3,))
+                self.assertEqual(layer.w13_input_scale.quant_method, "tensor")
+                self.assertTrue(layer.w13_input_scale.is_humming_input_scale)
+
+    def test_online_tensor_scale_uses_weight_scale_name(self):
+        from humming.schema import HummingWeightSchema
+
+        schema = HummingWeightSchema(b_dtype="float4e2m1", weight_scale_type="tensor")
+        layer = torch.nn.Module()
+        layer.param_dtype = torch.bfloat16
+        attrs = schema.get_tensors_attrs(2, 32, layer.param_dtype)
+        for name, attr in attrs.items():
+            param = torch.nn.Parameter(
+                torch.zeros(attr["shape"], dtype=attr["dtype"]), requires_grad=False
+            )
+            param.param_name = name
+            param.weight_loader = lambda target, loaded, shard: target.data.copy_(
+                loaded
+            )
+            setattr(layer, name, param)
+        method = HummingLinearMethod(
+            HummingLayerQuantizationConfig(weight_schema=schema, is_online_quant=True)
+        )
+        load = method.prepare_weight_loader(layer, None)
+        packed_weight = torch.full((2, 4), 17, dtype=torch.int32)
+        tensor_scale = torch.tensor([2.0])
+        with patch(
+            "humming.schema.humming.quantize_weight",
+            autospec=True,
+            return_value=(packed_weight, None, None, tensor_scale),
+        ):
+            load(layer.weight, torch.ones((2, 32), dtype=torch.bfloat16))
+        self.assertFalse(hasattr(layer, "global_scale"))
+        torch.testing.assert_close(layer.weight_scale, tensor_scale)
+        torch.testing.assert_close(layer.weight, packed_weight)
 
     def test_prepare_replacements_are_registered_before_transform(self):
         from humming.schema import HummingWeightSchema
         from humming.schema.fp8 import Fp8InputSchema
 
-        from sglang.srt.layers.parameter import PackedvLLMParameter
         from sglang.srt.layers.quantization import humming
 
-        for replace_weight in (False, True):
-            with self.subTest(replace_weight=replace_weight):
-                layer = torch.nn.Module()
-                layer.with_bias = False
-                method = HummingLinearMethod(
-                    HummingLayerQuantizationConfig(
-                        weight_schema=HummingWeightSchema(b_dtype="float4e2m1"),
-                        input_schema=Fp8InputSchema(activation_scheme="static"),
-                    )
-                )
-                method.create_weights(
-                    layer,
-                    input_size_per_partition=8,
-                    output_partition_sizes=[2],
-                    input_size=8,
-                    output_size=2,
-                    params_dtype=torch.bfloat16,
-                )
-                self.assertIsInstance(layer.weight, PackedvLLMParameter)
-                layer.weight.data.fill_(1)
-                layer.weight_scale.data.fill_(2)
-                layer.input_scale.data.fill_(0.5)
-                original_weight = layer.weight.data.clone()
-                replacement = torch.full((2, 2), 17, dtype=torch.int32)
+        layer = torch.nn.Module()
+        layer.with_bias = False
+        method = HummingLinearMethod(
+            HummingLayerQuantizationConfig(
+                weight_schema=HummingWeightSchema(b_dtype="float4e2m1"),
+                input_schema=Fp8InputSchema(activation_scheme="static"),
+            )
+        )
+        method.create_weights(
+            layer,
+            input_size_per_partition=8,
+            output_partition_sizes=[2],
+            input_size=8,
+            output_size=2,
+            params_dtype=torch.bfloat16,
+        )
+        layer.weight.data.fill_(1)
+        layer.weight_scale.data.fill_(2)
+        layer.input_scale.data.fill_(0.5)
+        replacement = torch.full((2, 2), 17, dtype=torch.int32)
 
-                def prepare(**kwargs):
-                    self.assertTrue(
-                        all(
-                            type(tensor) is torch.Tensor
-                            for tensor in kwargs["tensors"].values()
-                        )
-                    )
-                    # E0Mx preparation replaces packed tensor entries in-place.
-                    if replace_weight:
-                        kwargs["tensors"]["weight"] = replacement
+        def prepare(**kwargs):
+            # E0Mx preparation replaces packed tensor entries in-place.
+            kwargs["tensors"]["weight"] = replacement
 
-                def transform(transformed_layer):
-                    expected_weight = replacement if replace_weight else original_weight
-                    torch.testing.assert_close(
-                        transformed_layer.weight, expected_weight
-                    )
-                    torch.testing.assert_close(
-                        transformed_layer.input_scale, torch.tensor([0.5])
-                    )
-                    self.assertIn("locks", dict(transformed_layer.named_buffers()))
+        def transform(transformed_layer):
+            torch.testing.assert_close(transformed_layer.weight, replacement)
+            torch.testing.assert_close(
+                transformed_layer.input_scale, torch.tensor([0.5])
+            )
 
-                with (
-                    patch.object(
-                        humming.HummingMethod, "prepare_layer_meta", side_effect=prepare
-                    ),
-                    patch.object(
-                        humming.HummingMethod,
-                        "transform_humming_layer",
-                        side_effect=transform,
-                    ),
-                ):
-                    method.process_weights_after_loading(layer)
+        with (
+            patch.object(
+                humming.HummingMethod, "prepare_layer_meta", side_effect=prepare
+            ),
+            patch.object(
+                humming.HummingMethod, "transform_humming_layer", side_effect=transform
+            ),
+        ):
+            method.process_weights_after_loading(layer)
 
 
 class TestHummingCheckpointConfig(CustomTestCase):

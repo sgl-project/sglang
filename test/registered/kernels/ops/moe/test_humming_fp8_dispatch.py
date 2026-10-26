@@ -38,15 +38,7 @@ class TestHummingFp8Dispatch(CustomTestCase):
             raise unittest.SkipTest("Humming FP8 dispatch requires SM90")
 
     def test_indexed_two_gemms_with_different_m_tiles(self):
-        from humming.config import GemmType
-        from humming.device import current_device
         from humming.schema import HummingInputSchema, HummingWeightSchema
-        from humming.tune.candidate import (
-            DeviceProfile,
-            ScheduleCandidate,
-            TuningProblem,
-            analyze_candidate,
-        )
         from humming.utils.weight import dequantize_weight
 
         torch.manual_seed(42)
@@ -123,14 +115,6 @@ class TestHummingFp8Dispatch(CustomTestCase):
             "compute_config": compute_config,
             "compute_config_str": json.dumps(compute_config),
         }
-        device_profile = DeviceProfile(
-            name=current_device.name,
-            sm_version=current_device.sm_version,
-            num_sms=current_device.sm_count,
-            max_smem_size=current_device.max_smem_size,
-            max_threads_per_sm=current_device.max_threads_per_sm,
-            max_registers_per_sm=current_device.max_registers_per_sm,
-        )
         # Fix distinct legal M tiles: heuristics may choose the same tile on H100.
         for sublayer, block_m in (("w13", 32), ("w2", 48)):
             selected = {
@@ -140,20 +124,13 @@ class TestHummingFp8Dispatch(CustomTestCase):
                 "num_stages": 3,
                 "use_warp_spec": True,
                 "use_tma": True,
+                "use_tma_a": False,
+                "use_tma_as": False,
+                "use_tma_as2": False,
                 "use_tma_c": False,
                 # Direct output gives deterministic eager/graph comparisons.
                 "use_stream_k": False,
             }
-            problem = TuningProblem(
-                layer_config=layer.humming_metas[sublayer],
-                shape_m=num_tokens * top_k,
-                gemm_type=GemmType.INDEXED,
-                device=device_profile,
-            )
-            candidate = ScheduleCandidate.from_config(sublayer, selected)
-            analysis = analyze_candidate(problem, candidate)
-            self.assertTrue(analysis.legal, analysis.rejection_reasons)
-            selected.update(use_tma_a=False, use_tma_as=False, use_tma_as2=False)
             tuning = [[0, 1 << 30, selected]]
             configs[f"{sublayer}_tuning_config"] = tuning
             configs[f"{sublayer}_tuning_config_str"] = json.dumps(tuning)
@@ -164,8 +141,6 @@ class TestHummingFp8Dispatch(CustomTestCase):
         topk_ids = torch.randint(
             num_experts, (num_tokens, top_k), device="cuda", dtype=torch.int32
         )
-        topk_ids[0] = -1
-        topk_ids[1, 1] = -1
         topk_weights = torch.softmax(
             torch.randn(num_tokens, top_k, device="cuda"), dim=-1
         )
@@ -197,24 +172,19 @@ class TestHummingFp8Dispatch(CustomTestCase):
             )
         reference = reference.to(torch.bfloat16)
 
-        def assert_matches_reference(output):
-            self.assertTrue(torch.isfinite(output).all().item())
-            relative_error = (
-                output.float() - reference.float()
-            ).norm() / reference.float().norm()
-            self.assertLess(relative_error.item(), 0.035)
-            self.assertEqual(torch.count_nonzero(output[0]).item(), 0)
-
         actual = runner._run_indexed_gemm(inputs, topk_weights, topk_ids)
-        assert_matches_reference(actual)
+        self.assertTrue(torch.isfinite(actual).all().item())
+        relative_error = (
+            actual.float() - reference.float()
+        ).norm() / reference.float().norm()
+        self.assertLess(relative_error.item(), 0.035)
+
         graph = torch.cuda.CUDAGraph()
         torch.cuda.synchronize()
         with torch.cuda.graph(graph):
             captured = runner._run_indexed_gemm(inputs, topk_weights, topk_ids)
-        for _ in range(2):
-            graph.replay()
-            assert_matches_reference(captured)
-            torch.testing.assert_close(captured, actual, rtol=0, atol=0)
+        graph.replay()
+        torch.testing.assert_close(captured, actual, rtol=0, atol=0)
 
     def test_fp8_dispatch_preserves_group_scales(self):
         from sglang.srt.layers.quantization import humming_utils

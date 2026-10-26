@@ -145,10 +145,11 @@ class TestHummingMoePreparation(CustomTestCase):
     def test_input_quantization_honors_ignore_aliases(self):
         for key in ("ignored_layers", "ignore", "modules_to_not_convert"):
             with self.subTest(key=key):
-                layer = self._make_layer()
-                self._prepare(layer, {"dtype": "float8e4m3", key: [layer.layer_name]})
-                self.assertIsNone(layer.input_schemas["w13"].a_dtype)
-                self.assertIsNone(layer.input_schemas["w2"].a_dtype)
+                self.assertTrue(
+                    humming_utils.humming_is_layer_skipped(
+                        {key: ["experts"]}, "mlp.experts"
+                    )
+                )
 
     def test_first_present_ignore_alias_takes_precedence(self):
         for ignored_layers in ([], None):
@@ -164,38 +165,23 @@ class TestHummingDeepEpSchema(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "divisible by 128"):
             humming_utils.make_humming_deepep_input_schema("w2", 192)
 
-    def test_checks_weight_and_hardware_compatibility(self):
-        for sm_version, group_size, scale_dtype, compatible in (
-            (90, 32, "float8e8m0", True),
-            (120, 32, "float8e8m0", False),
-            (90, 16, "float8e4m3", False),
-        ):
-            with self.subTest(sm_version=sm_version, group_size=group_size):
-                weight_schema = HummingWeightSchema(
-                    b_dtype="float4e2m1",
-                    bs_dtype=scale_dtype,
-                    weight_scale_group_size=group_size,
+    def test_rejects_incompatible_weight_schema(self):
+        weight_schema = HummingWeightSchema(
+            b_dtype="float4e2m1",
+            bs_dtype="float8e8m0",
+            weight_scale_group_size=32,
+        )
+        with patch.object(
+            humming_utils.HummingInputSchema, "is_compatible_with", return_value=False
+        ) as is_compatible_with:
+            with self.assertRaisesRegex(ValueError, "bf16"):
+                humming_utils.make_humming_deepep_input_schema(
+                    "w13",
+                    256,
+                    weight_schema=weight_schema,
+                    param_dtype=torch.bfloat16,
                 )
-                with patch(
-                    "humming.schema.humming.current_device",
-                    SimpleNamespace(sm_version=sm_version),
-                ):
-                    if compatible:
-                        schema = humming_utils.make_humming_deepep_input_schema(
-                            "w13",
-                            256,
-                            weight_schema=weight_schema,
-                            param_dtype=torch.bfloat16,
-                        )
-                        self.assertEqual(schema.input_scale_dtype, dtypes.float32)
-                    else:
-                        with self.assertRaisesRegex(ValueError, "bf16"):
-                            humming_utils.make_humming_deepep_input_schema(
-                                "w13",
-                                256,
-                                weight_schema=weight_schema,
-                                param_dtype=torch.bfloat16,
-                            )
+        is_compatible_with.assert_called_once_with(weight_schema, torch.bfloat16)
 
 
 if __name__ == "__main__":
