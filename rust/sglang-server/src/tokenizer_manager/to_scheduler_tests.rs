@@ -240,6 +240,43 @@ fn total_tokens_over_context_is_rejected() {
     assert_eq!(g.sampling_params.max_new_tokens, Some(7), "left alone");
 }
 
+/// A launcher whose default for an omitted `max_new_tokens` is `None` (no
+/// limit) under `--context-length` lets a prompt near the window through
+/// untouched; the scheduler clamps the output to the room the window leaves.
+/// A client-sent 128 or context-length value is a 400; the same values marked
+/// defaulted are left to the scheduler's clamp.
+#[test]
+fn omitted_max_new_tokens_under_a_context_length_passes_a_near_limit_prompt() {
+    let limits = Limits {
+        context_len: 1000,
+        ..test_limits()
+    };
+    let request = |max_new_tokens| GenerateRequest {
+        input_ids: Some(vec![1; 990]),
+        sampling_params: SamplingParams {
+            max_new_tokens,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut g = request(None);
+    assert!(check_total_tokens(&mut g, &limits).is_ok());
+    assert_eq!(
+        g.sampling_params.max_new_tokens, None,
+        "left to the scheduler"
+    );
+    for max_new_tokens in [Some(128), Some(1000)] {
+        let err = check_total_tokens(&mut request(max_new_tokens), &limits).unwrap_err();
+        assert!(matches!(err, Error::Validation(_)), "{max_new_tokens:?}");
+        let mut g = GenerateRequest {
+            max_new_tokens_defaulted: true,
+            ..request(max_new_tokens)
+        };
+        assert!(check_total_tokens(&mut g, &limits).is_ok());
+        assert_eq!(g.sampling_params.max_new_tokens, max_new_tokens);
+    }
+}
+
 /// The reserved slots (eagle draft tokens) count as input, so a request can be
 /// rejected for them even when the prompt alone would fit.
 #[test]
@@ -295,6 +332,43 @@ fn auto_truncate_clamps_and_unknowns_skip() {
         ..test_limits()
     };
     assert!(check_total_tokens(&mut g, &roomy).is_ok());
+}
+
+/// A `max_new_tokens` the client did not send (a preferred value or the schema
+/// default) is neither rejected nor clamped here, whatever its size: it reaches
+/// the scheduler as is, which clamps it. The input alone is still checked.
+#[test]
+fn defaulted_max_new_tokens_is_left_to_the_scheduler() {
+    for allow_auto_truncate in [false, true] {
+        let limits = Limits {
+            context_len: 10,
+            allow_auto_truncate,
+            ..test_limits()
+        };
+        let mut g = GenerateRequest {
+            input_ids: Some(vec![1, 2, 3]),
+            sampling_params: SamplingParams {
+                max_new_tokens: Some(10), // the whole window
+                ..Default::default()
+            },
+            max_new_tokens_defaulted: true,
+            ..Default::default()
+        };
+        assert!(check_total_tokens(&mut g, &limits).is_ok());
+        assert_eq!(g.sampling_params.max_new_tokens, Some(10), "untouched");
+    }
+
+    let mut g = GenerateRequest {
+        input_ids: Some(vec![1; 10]),
+        max_new_tokens_defaulted: true,
+        ..Default::default()
+    };
+    let limits = Limits {
+        context_len: 10,
+        ..test_limits()
+    };
+    let err = check_total_tokens(&mut g, &limits).unwrap_err();
+    assert!(err.to_string().contains("longer than the model's context"));
 }
 
 /// `max_new_tokens: null` means "no cap", NOT "skip the checks" — the input
@@ -408,19 +482,18 @@ fn hidden_states_gated_on_server_support() {
 
 /// End-to-end through `drive`: an over-context request is rejected on the way
 /// to the channel, after registration -- so it must be deregistered, not leaked.
+/// The same `max_new_tokens` as a default reaches the scheduler unchanged.
 #[test]
-fn over_context_request_deregisters_and_never_reaches_the_channel() {
+fn over_context_request_deregisters_unless_its_cap_is_defaulted() {
     let (mut intake, detok_rx, consumer, _tm_tx, _mm_rx) = make_intake_with(Limits {
         context_len: 4,
         ..test_limits()
     });
-    intake.drive(generate_req(
-        33,
-        SamplingParams {
-            max_new_tokens: Some(64),
-            ..Default::default()
-        },
-    ));
+    let sampling_params = SamplingParams {
+        max_new_tokens: Some(64),
+        ..Default::default()
+    };
+    intake.drive(generate_req(33, sampling_params.clone()));
     assert!(
         matches!(detok_rx.try_recv(), Ok(DetokMsg::Register { rid, .. }) if rid.as_str() == "33"),
         "registered before the check",
@@ -433,6 +506,18 @@ fn over_context_request_deregisters_and_never_reaches_the_channel() {
         consumer.drain(16).is_empty(),
         "must not reach the scheduler"
     );
+
+    let mut req = generate_req(34, sampling_params);
+    let RequestKind::Generate(g) = &mut req.kind else {
+        unreachable!()
+    };
+    g.max_new_tokens_defaulted = true;
+    intake.drive(req);
+    let pushed = consumer.drain(16);
+    assert_eq!(pushed.len(), 1, "must reach the scheduler");
+    let header = rmpv::decode::read_value(&mut &pushed[0].header[..]).unwrap();
+    let sampling_params = header.as_array().unwrap()[8].as_array().unwrap();
+    assert_eq!(sampling_params[0].as_i64(), Some(64), "max_new_tokens");
 }
 
 /// A `Detokenize` request terminates at the detok stage, and the shard must

@@ -58,6 +58,16 @@ def _filter(batch: ForwardBatch, *, lo: int, hi: int) -> ForwardBatch:
 
 
 class TestTboFilterBatchMarker(CustomTestCase):
+    def test_filter_batch_inherits_prefill_completion(self):
+        for completing in (False, True):
+            with self.subTest(completing=completing):
+                parent = _make_target_verify_batch(8)
+                # Isolate the existing, unrelated capture-flag omission.
+                parent.full_prefill_cuda_graph_capture = None
+                parent.contains_last_prefill_chunk = completing
+                child = _filter(parent, lo=0, hi=4)
+                self.assertEqual(child.contains_last_prefill_chunk, completing)
+
     def test_filter_batch_clears_mlp_sync_unpad_fields_on_children(self):
         # MLP-sync padding records _original_batch_size/_original_num_tokens
         # before TBO splits the batch (prepare_mlp_sync_batch pads first, then

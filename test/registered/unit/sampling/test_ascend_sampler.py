@@ -11,7 +11,7 @@ from sglang.srt.layers import sampler as sampler_module
 from sglang.srt.layers.sampler import Sampler
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestAscendSamplerDispatch(unittest.TestCase):

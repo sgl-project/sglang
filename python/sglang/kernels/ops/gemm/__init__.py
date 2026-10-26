@@ -166,9 +166,20 @@ register_kernel(
 )
 register_kernel(
     KernelSpec(
+        op="gemm.nvfp4_gemm_swiglu_nvfp4_quant",
+        backend=KernelBackend.CUTE_DSL,
+        target=(
+            "sglang.kernels.ops.gemm.nvfp4_gemm_swiglu_nvfp4_quant"
+            ":nvfp4_gemm_swiglu_nvfp4_quant"
+        ),
+        capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(10, 0))}),
+    )
+)
+register_kernel(
+    KernelSpec(
         op="gemm.bmm_fp8",
         backend=KernelBackend.FLASHINFER,
-        target="sglang.srt.layers.quantization.fp8_utils:bmm_fp8",
+        target="sglang.kernels.ops.gemm.flashinfer_bmm_fp8:bmm_fp8",
         capabilities=CUDA_ONLY,
     )
 )
@@ -376,9 +387,7 @@ register_kernel(
         op="gemm.hopper_bf16_gemv",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.gemm.hopper_bf16_gemv:hopper_bf16_gemv",
-        capabilities=frozenset(
-            {CapabilityRequirement.cuda(min_sm=(9, 0), max_sm=(9, 0))}
-        ),
+        capabilities=_SM90 | _SM12X,
     )
 )
 register_kernel(
@@ -428,6 +437,22 @@ register_kernel(
         capabilities=frozenset(
             {CapabilityRequirement.cuda(min_sm=(12, 0), max_sm=(12, 9))}
         ),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.nvfp4_moe_mtp_mma",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.gemm.sm120_nvfp4_moe:nvfp4_moe_mtp_mma",
+        capabilities=_SM120,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.sm120_nvfp4_moe",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.gemm.sm120_nvfp4_moe:try_nvfp4_moe",
+        capabilities=_SM120,
     )
 )
 register_kernel(
@@ -490,5 +515,21 @@ register_kernel(
         op="gemm.w8a8_block_int8_matmul",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.gemm.int8_kernel:w8a8_block_int8_matmul",
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.muse_spark_router_gemm",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.gemm.muse_spark_router_gemm:router_gemm",
+        capabilities=CUDA_ONLY,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.muse_spark_router_gemv",
+        backend=KernelBackend.CUTE_DSL,
+        target="sglang.kernels.ops.gemm.muse_spark_router_gemv_cutedsl:router_gemv_cute",
+        capabilities=_SM10X,
     )
 )
