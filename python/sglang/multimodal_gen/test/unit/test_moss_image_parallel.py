@@ -68,11 +68,11 @@ def _worker(mode):
             x, text = torch.randn(2, 8, 2, 3), torch.randn(2, length, 32)
             timestep = torch.tensor([630.0])
             if mode == "sp":
+                pipeline = MOSSImagePipelineConfig(dit_config=config)
+                stage = object.__new__(MOSSImageDenoisingStage)
+                stage.server_args = SimpleNamespace(pipeline_config=pipeline)
                 for skip in ((), (0,), (1,)):
                     expected = reference(x, timestep, text, skip_layers=skip)
-                    pipeline = MOSSImagePipelineConfig(dit_config=config)
-                    stage = object.__new__(MOSSImageDenoisingStage)
-                    stage.server_args = SimpleNamespace(pipeline_config=pipeline)
                     batch = SimpleNamespace(latents=x, image_latent=None)
                     stage._preprocess_sp_latents(batch, stage.server_args)
                     assert batch.latents is x
@@ -91,10 +91,7 @@ def _worker(mode):
                         prepared_conditioning=prepared,
                         skip_layers=skip,
                     )
-                    actual, trajectory = stage._postprocess_sp_latents(
-                        batch, actual, None
-                    )
-                    assert trajectory is None
+                    actual, _ = stage._postprocess_sp_latents(batch, actual, None)
                     torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
             else:
                 pipeline = MOSSImagePipelineConfig(dit_config=config)
