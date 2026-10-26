@@ -261,9 +261,7 @@ class MLPSyncBatchInfo:
             if 0 <= rank < flat_info.shape[0]:
                 flat_info[rank] = local_info_tensor
             # No retry here: one rank retrying deadlocks against peers that completed.
-            from sglang.srt.elastic_ep.elastic_ep import mooncake_all_reduce_strict
-
-            mooncake_all_reduce_strict(
+            torch.distributed.all_reduce(
                 global_info_tensor,
                 op=torch.distributed.ReduceOp.SUM,
                 group=group,

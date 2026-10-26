@@ -978,25 +978,9 @@ def _maybe_create_message_queue(group) -> None:
     )
 
 
-def _is_mooncake_inactive_transient(exc: BaseException) -> bool:
-    """Mooncake's "my bitmap has not caught up with active_ranks yet" rejection."""
-    msg = str(exc)
-    return "invalid state" in msg and "rank is not active" in msg
-
-
-def mooncake_all_reduce_strict(tensor, *, op, group) -> None:
-    """One all_reduce, no retry: a rank retrying a collective its peers completed
-    deadlocks the cohort, and ``mooncake_world_settle_probe`` already converged."""
-    try:
-        torch.distributed.all_reduce(tensor, op=op, group=group)
-    except RuntimeError as exc:
-        if not _is_mooncake_inactive_transient(exc):
-            raise
-        raise RuntimeError(
-            "[Elastic EP] Mooncake rejected a hot-path all_reduce as inactive after "
-            "the post-scale settle probe should have converged its bitmap. Retrying "
-            "here would deadlock the cohort, so this is fatal by design."
-        ) from exc
+# Mooncake raises refusals as plain RuntimeError. Reading its view instead would race:
+# the view can change between the refusal and the read, and a CUDA mirror lags it.
+_MOONCAKE_INACTIVE_REFUSAL = "invalid state: rank is not active in this group"
 
 
 # Well under --watchdog-timeout, so a view that never settles fails loudly before it.
@@ -1020,7 +1004,7 @@ def mooncake_all_gather_settling(output, input_, *, group, gather) -> None:
                 )
             return
         except RuntimeError as exc:
-            if not _is_mooncake_inactive_transient(exc):
+            if _MOONCAKE_INACTIVE_REFUSAL not in str(exc):
                 raise
             if waited_from is None:
                 waited_from = time.monotonic()
@@ -1038,44 +1022,42 @@ def mooncake_all_gather_settling(output, input_, *, group, gather) -> None:
             time.sleep(_GATHER_SETTLE_POLL_S)
 
 
-# Sleep before round i (~15s total). No wall-clock bound: every rank must run the same
-# number of rounds; ranks reading a deadline either side would leave one voting alone.
-_SETTLE_BACKOFF_S = (0.0, 0.05, 0.1, 0.2, 0.4, 0.8, 1.6, 2.0, 2.0, 2.0, 2.0, 2.0)
+# Local deadline is fine: each rank polls only its own view and votes exactly once.
+_SETTLE_BUDGET_S = 15.0
 
 
 def mooncake_world_settle_probe(*, cohort_size: int) -> None:
-    """Converge Mooncake's bitmap off the hot path; retries are store-voted, so ranks
-    that succeeded re-attempt with the rest. Warn-only: aborting strands the width, and
-    a cohort that cannot converge fails loudly on the next hot-path tick."""
-    if not torch.distributed.is_initialized():
+    """Wait off the hot path until Mooncake's WORLD view marks this rank active, which is
+    what it checks before accepting a collective, then vote so all ranks know. Warn-only:
+    aborting strands the width; a cohort that cannot converge fails on the next tick."""
+    world = torch.distributed.group.WORLD
+    if not torch.distributed.is_initialized() or not is_mooncake_pg(world):
         return
-    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-    last = None
-    for backoff_s in _SETTLE_BACKOFF_S:
-        if backoff_s:
-            time.sleep(backoff_s)
-        probe = torch.zeros(1, dtype=torch.int64, device=device)
-        ok = True
-        try:
-            torch.distributed.all_reduce(probe, op=torch.distributed.ReduceOp.SUM)
-        except RuntimeError as exc:
-            if not _is_mooncake_inactive_transient(exc):
-                raise
-            ok, last = False, exc
-        # A vote timeout means a peer stopped voting: treat it as non-convergence.
-        try:
-            if cohort_vote_via_store(
-                ok, cohort_size, tag="mooncake_settle", timeout_s=30.0
-            ):
-                return
-        except RuntimeError as exc:
-            logger.warning("[Elastic EP] settle vote failed: %s", exc)
+    from mooncake.pg import get_active_ranks
+
+    rank = torch.distributed.get_rank()
+    deadline = time.monotonic() + _SETTLE_BUDGET_S
+    while not (active := bool(get_active_ranks(world)[rank])):
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(_GATHER_SETTLE_POLL_S)
+    # A vote timeout means a peer stopped voting: treat it as non-convergence.
+    try:
+        if cohort_vote_via_store(
+            active,
+            cohort_size,
+            tag="mooncake_settle",
+            timeout_s=30.0 + _SETTLE_BUDGET_S,
+        ):
             return
+    except RuntimeError as exc:
+        logger.warning("[Elastic EP] settle vote failed: %s", exc)
+        return
     logger.warning(
-        "[Elastic EP] settle probe did not converge in %d rounds (cohort=%d); last=%s",
-        len(_SETTLE_BACKOFF_S),
+        "[Elastic EP] settle probe: Mooncake did not mark every rank active in %.0fs "
+        "(cohort=%d)",
+        _SETTLE_BUDGET_S,
         cohort_size,
-        last,
     )
 
 
