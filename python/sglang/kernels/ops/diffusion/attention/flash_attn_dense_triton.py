@@ -2,8 +2,8 @@
 """Non-causal MHA prefill forward for dense ``[B, H, S, D]`` q/k/v.
 
 AOTriton's dense path runs this model's shape (B=1, H=32, S=16384, D=128, bf16)
-at 18.4 TF; the kernel below reaches 30.2 TF (145 ms vs 239 ms per layer), which
-is 1.65x. The three things that mattered, all measured against the earlier
+at 18.4 TF; the kernel below reaches 31.8 TF (138 ms vs 239 ms per layer), which
+is 1.73x. The three things that mattered, all measured against the earlier
 pure-Triton attempt (p7, 9.6 TF):
 
 * no predicates in the main loop: the query length is a multiple of the block
@@ -11,8 +11,10 @@ pure-Triton attempt (p7, 9.6 TF):
   the pipeline slots that hide the next tile's load;
 * K is loaded already transposed through its strides (a ``[D, BN]`` tile) instead
   of ``tl.trans`` on a register tile, which on RDNA goes through LDS;
-* ``BLOCK_M = BLOCK_N = 64`` with 4 warps: 8192 CTAs and four per CU, versus
-  ``128x64`` with 8 warps at roughly half the throughput.
+* ``BLOCK_M = BLOCK_N = 64`` with 4 warps and a single pipeline stage: 8192
+  CTAs, four resident per CU (16 KiB LDS). A second stage doubles LDS to
+  32 KiB, halves residency to two CTAs per CU, and measured 5.6% slower
+  (146 ms vs 138 ms at S=16384).
 
 The key/value length is *not* assumed to match the query length: the model hands
 this kernel the K/V buffers that already carry the cached prefix in front of
@@ -32,7 +34,10 @@ _LOG2E = 1.4426950408889634
 _BM = 64
 _BN = 64
 _WARPS = 4
-_STAGES = 2
+# One stage keeps LDS at 16 KiB, so four CTAs stay resident per CU. A second
+# stage doubles LDS to 32 KiB, halves residency and measured 5.6% slower at
+# S=16384, because the extra occupancy is worth more than the pipeline overlap.
+_STAGES = 1
 _HEAD_DIM = 128
 
 
