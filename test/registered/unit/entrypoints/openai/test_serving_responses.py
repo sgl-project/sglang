@@ -36,6 +36,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ResponsesRequest,
     ResponsesResponse,
 )
+from sglang.srt.entrypoints.openai.responses_adapters import DEVELOPER_BLOCK_LABEL
 from sglang.srt.entrypoints.openai.serving_responses import (
     OpenAIServingResponses,
     _build_output_text_logprobs,
@@ -49,7 +50,7 @@ from sglang.srt.sampling.sampling_params import (
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, is_in_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -2122,13 +2123,131 @@ def test_inline_instruction_keeps_history_prefix(
             model="x", instructions="Stable instructions", input=history + appended
         )
     )
-    if preserve:
-        assert after[: len(before)] == before
-        assert after[len(before)]["role"] == "system"
-        assert "New instruction" in after[len(before)]["content"]
-    else:
+    assert after[: len(before)] == before
+    assert after[len(before)]["role"] == ("system" if preserve else "user")
+    assert "New instruction" in after[len(before)]["content"]
+    if not preserve:
         assert [m["role"] for m in after].count("system") == 1
-        assert "New instruction" in after[0]["content"]
+
+
+def _merge_path_serving() -> OpenAIServingResponses:
+    publish(ServerArgs(model_path="dummy"), role="tokenizer")
+    with patch.object(
+        OpenAIServingResponses, "_resolve_chat_encoding_spec", return_value="dsv32"
+    ):
+        serving = OpenAIServingResponses(MockTokenizerManager(), MockTemplateManager())
+    assert not serving.supports_inline_system
+    return serving
+
+
+def test_merge_path_sends_later_instructions_as_user_turns():
+    """Only instructions before the first turn are coalesced; later system and
+    developer messages stay in place (the developer label survives)."""
+    serving = _merge_path_serving()
+    request = ResponsesRequest(
+        model="x",
+        instructions="Stable instructions",
+        input=[
+            {"role": "developer", "content": "Leading"},
+            {"role": "user", "content": "Run it"},
+            {
+                "type": "function_call",
+                "call_id": "c1",
+                "name": "run",
+                "arguments": "{}",
+            },
+            {"type": "function_call_output", "call_id": "c1", "output": "done"},
+            {"role": "system", "content": "<total_tokens>9</total_tokens>"},
+            {"role": "developer", "content": "Later"},
+        ],
+        store=False,
+    )
+    messages = serving._construct_input_messages(request)
+    assert [m["role"] for m in messages] == [
+        "system",
+        "user",
+        "assistant",
+        "tool",
+        "user",
+        "user",
+    ]
+    assert "Stable instructions" in messages[0]["content"]
+    assert "Leading" in messages[0]["content"]
+    assert messages[4]["content"] == "<total_tokens>9</total_tokens>"
+    assert messages[5]["content"] == f"{DEVELOPER_BLOCK_LABEL}\nLater"
+
+
+def test_merge_path_keeps_stored_history_prefix():
+    """With ``previous_response_id`` the stored turns come first, so an instruction
+    at the start of the new ``input`` is already mid-conversation."""
+    serving = _merge_path_serving()
+    serving.msg_store["resp_1"] = [
+        {"role": "user", "content": "Existing conversation"},
+        {"role": "assistant", "content": "Previous answer"},
+    ]
+    request = ResponsesRequest(
+        model="x",
+        previous_response_id="resp_1",
+        input=[{"role": "developer", "content": "New instruction"}],
+    )
+    messages = serving._construct_input_messages(request)
+    assert [m["role"] for m in messages] == ["user", "assistant", "user"]
+    assert "New instruction" in messages[2]["content"]
+
+
+def _dsv4_recipe():
+    """deepseek-recipe's DeepSeek-V4 renderer; only outside CI does an unreachable
+    Hub skip the test."""
+    from huggingface_hub import hf_hub_download
+    from tokenizers import Tokenizer
+
+    from sglang.srt.parser.deepseek_recipe_renderer import DeepSeekRecipe
+
+    try:
+        path = hf_hub_download(
+            "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+            "tokenizer.json",
+            revision="1bae0e1088993b9b82de08f59de5be5a34e42170",
+        )
+    except Exception as error:  # noqa: BLE001
+        if is_in_ci():
+            raise
+        pytest.skip(f"the tokenizer is not available: {error}")
+    return DeepSeekRecipe("dsv4", Tokenizer.from_file(path))
+
+
+def test_dsv4_prompt_is_extended_not_rewritten_each_turn():
+    """Render an agent loop that appends a system reminder after every tool result
+    through deepseek-recipe, which itself moves inline system messages to the top:
+    each turn's prompt ids must be a prefix of the next, and the reminder must
+    stay in the last user turn."""
+    serving = _merge_path_serving()
+    recipe = _dsv4_recipe()
+    items = [{"role": "user", "content": "Fix the bug"}]
+    prompts = []
+    for turn in range(4):
+        reminder = f"<total_tokens>{1000 - turn}</total_tokens>"
+        items = items + [{"role": "system", "content": reminder}]
+        messages = serving._construct_input_messages(
+            ResponsesRequest(
+                model="x", instructions="Stable instructions", input=items, store=False
+            )
+        )
+        prompt = recipe.encode({"messages": messages, "thinking": False})
+        text = recipe.hf_tokenizer.decode(prompt, skip_special_tokens=False)
+        assert reminder in text.rsplit("<｜User｜>", 1)[1]
+        prompts.append(prompt)
+        items = items + [
+            {
+                "type": "function_call",
+                "call_id": f"c{turn}",
+                "name": "run",
+                "arguments": "{}",
+            },
+            {"type": "function_call_output", "call_id": f"c{turn}", "output": "ok"},
+        ]
+    for before, after in zip(prompts, prompts[1:]):
+        assert after[: len(before)] == before
 
 
 @pytest.mark.parametrize("stream", [False, True])
