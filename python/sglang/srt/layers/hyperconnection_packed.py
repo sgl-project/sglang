@@ -181,7 +181,6 @@ class PackedGatedResidual(GatedResidual):
     def _install_weight_loaders(self):
         for parameter in self.parameters():
             parameter.weight_loader = self._load_sum_source_weight
-        self.input_mix_weight_down.weight.hc_merged_down_inject = True
 
     @torch.no_grad()
     def _load_sum_source_weight(self, parameter, loaded_weight, *, copy_value=True):

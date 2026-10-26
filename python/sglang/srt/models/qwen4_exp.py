@@ -46,6 +46,7 @@ from sglang.srt.layers.hyperconnection import (
     HyperConnectionConfig,
 )
 from sglang.srt.layers.hyperconnection_packed import (
+    PackedGatedResidual,
     check_packed_hc_initial_load,
     prepare_packed_hc_weights,
 )
@@ -2468,6 +2469,11 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         buffers = dict(self.named_buffers())
+        packed_hc_prefixes = {
+            name
+            for name, module in self.named_modules(remove_duplicate=False)
+            if isinstance(module, PackedGatedResidual)
+        }
 
         ple_modules = {
             mod_name: mod
@@ -2500,14 +2506,9 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
             if ".self_attn." in name:
                 name = name.replace(".self_attn", "")
             if name.endswith(".block_inject_weight.weight"):
-                merged_name = (
-                    name[: -len("block_inject_weight.weight")]
-                    + "input_mix_weight_down.weight"
-                )
-                if getattr(
-                    params_dict.get(merged_name), "hc_merged_down_inject", False
-                ):
-                    name = merged_name
+                hc_prefix = name[: -len(".block_inject_weight.weight")]
+                if hc_prefix in packed_hc_prefixes:
+                    name = f"{hc_prefix}.input_mix_weight_down.weight"
             if name.endswith(".k_proj.k_scale"):
                 name = name.replace(".k_proj.k_scale", ".attn.k_scale")
             elif name.endswith(".v_proj.v_scale"):

@@ -12,6 +12,7 @@ from transformers import PretrainedConfig
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.hyperconnection_packed import (
+    PackedGatedResidual,
     check_packed_hc_initial_load,
     prepare_packed_hc_weights,
 )
@@ -31,7 +32,7 @@ logger = logging.getLogger(__name__)
 class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
     def load_weights(self, weights, is_mtp=False):
         check_packed_hc_initial_load(self)
-        if any(getattr(p, "hc_merged_down_inject", False) for p in self.parameters()):
+        if any(isinstance(module, PackedGatedResidual) for module in self.modules()):
             weights = (
                 (
                     name.replace(

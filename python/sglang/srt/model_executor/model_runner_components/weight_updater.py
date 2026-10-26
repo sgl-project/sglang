@@ -312,9 +312,7 @@ class WeightUpdater:
         # sessions when a module explicitly requires immutable runtime weights.
         for module in self.get_model().modules():
             if getattr(module, "_reject_weight_update_sessions", False):
-                error = getattr(module, "_derived_weight_cache_error", None)
-                if error is not None:
-                    raise ValueError(error)
+                raise ValueError(module._derived_weight_cache_error)
 
     def begin_weight_update(self: WeightUpdater) -> None:
         self.check_weight_update_session_supported()

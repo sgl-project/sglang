@@ -64,6 +64,91 @@ class TestTensorUpdateRank(unittest.TestCase):
 
 
 class TestHCInitialLoadAndUpdateGuard(CustomTestCase):
+    @torch.no_grad()
+    def test_checkpoint_inject_names_follow_hc_storage(self):
+        """Inject aliases must select packed storage without renaming legacy HC."""
+        from sglang.srt.models.qwen4_exp import Qwen4ExpForConditionalGeneration
+        from sglang.srt.models.qwen4_exp_mtp import Qwen4ExpForCausalLMMTP
+
+        config = HyperConnectionConfig(
+            hidden_size=512,
+            hc_lowrank=64,
+            hc_per_branch_norm=True,
+            params_dtype=torch.bfloat16,
+        )
+        checkpoint = {
+            "input_mix_weight_down.weight": torch.ones(64, 2048),
+            "block_inject_weight.weight": torch.full((4, 2048), 2.0),
+            "hc_norm.weight": torch.zeros(2048),
+            "input_mix_weight_up.weight": torch.full((2048, 64), 3.0),
+        }
+        for model_type, prefix in (
+            (Qwen4ExpForConditionalGeneration, "model.language_model"),
+            (Qwen4ExpForCausalLMMTP, "mtp"),
+        ):
+            for packed in (False, True):
+                with self.subTest(model=model_type.__name__, packed=packed):
+                    model = model_type.__new__(model_type)
+                    torch.nn.Module.__init__(model)
+                    model.config = SimpleNamespace(tie_word_embeddings=False)
+                    model.pp_group = SimpleNamespace(is_last_rank=True)
+                    model.model = torch.nn.Module()
+                    model.model.start_layer, model.model.end_layer = 0, 1
+                    model.model.layers = torch.nn.ModuleList([torch.nn.Module()])
+                    layer = model.model.layers[0]
+                    with patch("torch.cuda.is_available", return_value=False):
+                        hc_type = PackedGatedResidual if packed else GatedResidual
+                        layer.hc = hc_type(config)
+                        if prefix != "mtp":
+                            layer.legacy = GatedResidual(config)
+                            layer.alias = layer.hc
+                    weights = [
+                        (f"{prefix}.layers.0.self_attn.hc.{name}", value)
+                        for name, value in checkpoint.items()
+                    ]
+                    if prefix != "mtp":
+                        weights.extend(
+                            (
+                                (
+                                    "model.layers.0.legacy.block_inject_weight.weight",
+                                    checkpoint["block_inject_weight.weight"],
+                                ),
+                                (
+                                    "model.layers.0.alias.block_inject_weight.weight",
+                                    checkpoint["block_inject_weight.weight"],
+                                ),
+                            )
+                        )
+                    loaded = model.load_weights(weights)
+                    if packed:
+                        down = layer.hc.input_mix_weight_down.weight
+                        torch.testing.assert_close(
+                            down[:, :64], torch.ones_like(down[:, :64])
+                        )
+                        torch.testing.assert_close(
+                            down[:, 64:68], torch.full_like(down[:, 64:68], 2)
+                        )
+                    else:
+                        torch.testing.assert_close(
+                            layer.hc.block_inject_weight.weight,
+                            checkpoint["block_inject_weight.weight"].to(
+                                config.params_dtype
+                            ),
+                        )
+                    if prefix != "mtp":
+                        alias_weight = (
+                            "input_mix_weight_down" if packed else "block_inject_weight"
+                        )
+                        self.assertIn(
+                            f"model.layers.0.alias.{alias_weight}.weight", loaded
+                        )
+                        torch.testing.assert_close(
+                            layer.legacy.block_inject_weight.weight,
+                            checkpoint["block_inject_weight.weight"].to(
+                                config.params_dtype
+                            ),
+                        )
+
     def test_packed_lowrank_selection(self):
         with (
             patch("torch.cuda.is_available", return_value=True),
