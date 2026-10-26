@@ -1276,7 +1276,13 @@ def dp_reduce_scatterv_async(
             global_tokens, output=output_shard, sizes=sizes
         )
         if attn_tp_size > 1:
-            parallel.attn_tp_group.all_gather_into_tensor(output_local, output_shard)
+            # Through the device group, not the group's custom all-gather: the
+            # other micro-batch's attention runs the attention-TP group's custom
+            # collectives on the compute stream meanwhile, and their shared
+            # buffers cannot serve both streams at once.
+            all_gather_single(
+                output_local, output_shard, group=parallel.attn_tp_group.device_group
+            )
         ev.record(comm)
     return ev
 
