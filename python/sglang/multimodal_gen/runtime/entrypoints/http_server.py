@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager, suppress
 from typing import TYPE_CHECKING
 
 import httpx
+import psutil
 import torch
 from fastapi import APIRouter, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -27,6 +28,9 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.realtime import (
     realtime_video_api,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import build_sampling_params
+from sglang.multimodal_gen.runtime.entrypoints.openai.video_progress import (
+    run_progress_listener,
+)
 from sglang.multimodal_gen.runtime.entrypoints.post_training import (
     rollout_api,
     weights_api,
@@ -36,7 +40,10 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
     save_outputs,
 )
 from sglang.multimodal_gen.runtime.observability.metrics import configure_metrics
-from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
+from sglang.multimodal_gen.runtime.scheduler_client import (
+    async_scheduler_client,
+    run_zeromq_broker,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, get_global_server_args
 from sglang.multimodal_gen.runtime.server_warmup import (
     maybe_apply_auto_residency,
@@ -58,6 +65,9 @@ from sglang.srt.utils.json_response import orjson_response
 from sglang.version import __version__
 
 if TYPE_CHECKING:
+    from sglang.multimodal_gen.runtime.disaggregation.orchestrator import (
+        DiffusionServer,
+    )
     from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 
 logger = init_logger(__name__)
@@ -130,14 +140,6 @@ def build_route_request_models(app: FastAPI) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    from sglang.multimodal_gen.runtime.entrypoints.openai.video_api import (
-        shutdown_video_jobs,
-    )
-    from sglang.multimodal_gen.runtime.scheduler_client import (
-        async_scheduler_client,
-        run_zeromq_broker,
-    )
-
     # 1. Initialize the singleton client that connects to the backend Scheduler
     server_args = app.state.server_args
     build_route_request_models(app)
@@ -147,6 +149,14 @@ async def lifespan(app: FastAPI):
 
     # 2. Start the ZMQ Broker in the background to handle offline requests
     broker_task = asyncio.create_task(run_zeromq_broker(server_args))
+    app.state.broker_task = broker_task
+    backend_monitor = asyncio.create_task(_monitor_backend(app))
+    # 3. Receive per-step progress of video jobs from the replica drivers
+    progress_task = None
+    if server_args.progress_endpoint is not None:
+        progress_task = asyncio.create_task(
+            run_progress_listener(server_args.progress_endpoint)
+        )
     warmup_task = None
     if server_args.warmup_mode == "server":
         warmup_task = asyncio.create_task(
@@ -163,6 +173,9 @@ async def lifespan(app: FastAPI):
         )
         yield
     finally:
+        backend_monitor.cancel()
+        with suppress(asyncio.CancelledError):
+            await backend_monitor
         if warmup_task is not None and not warmup_task.done():
             warmup_task.cancel()
             with suppress(asyncio.CancelledError):
@@ -170,12 +183,20 @@ async def lifespan(app: FastAPI):
 
         # On shutdown
         logger.info("FastAPI app is shutting down...")
-        await shutdown_video_jobs()
+        await video_api.shutdown_video_jobs()
         if app.state.prompt_enhancer is not None:
             await app.state.prompt_enhancer.close()
         broker_task.cancel()
-        with suppress(asyncio.CancelledError):
+        try:
             await broker_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception("Offline request broker failed")
+        if progress_task is not None:
+            progress_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await progress_task
         async_scheduler_client.close()
 
 
@@ -189,9 +210,40 @@ async def liveness():
     return {"status": "ok"}
 
 
+def _backend_failure(app: FastAPI) -> str | None:
+    if app.state.disagg_server is not None and not app.state.disagg_server.is_alive:
+        return "Disaggregation router exited; restart the server."
+    if app.state.broker_task is not None and app.state.broker_task.done():
+        return "Offline request broker exited; restart the server."
+    for worker in app.state.worker_processes:
+        try:
+            # is_running also detects PID reuse; an unreaped child is still a zombie
+            if worker.is_running() and worker.status() != psutil.STATUS_ZOMBIE:
+                continue
+        except psutil.NoSuchProcess:
+            pass
+        return "Scheduler worker exited; restart the server."
+    return None
+
+
+async def _monitor_backend(app: FastAPI) -> None:
+    # Do not probe through the scheduler: a dead non-output rank can leave
+    # its peers blocked in collectives, unable to answer even a health RPC.
+    while True:
+        error = _backend_failure(app)
+        if error is not None:
+            logger.error(error)
+            async_scheduler_client.mark_failed(error)
+            return
+        await asyncio.sleep(1)
+
+
 @health_router.get("/health")
 async def health(request: Request):
     """Report readiness for normal inference traffic."""
+    error = async_scheduler_client.failure_reason or _backend_failure(request.app)
+    if error is not None:
+        return orjson_response({"status": "unhealthy", "error": error}, status_code=503)
     if not request.app.state.server_warmup_done.is_set():
         return Response(status_code=503)
     return {"status": "ok"}
@@ -432,12 +484,20 @@ async def vertex_generate(vertex_req: VertexGenerateReqInput):
     return orjson_response({"predictions": results})
 
 
-def create_app(server_args: ServerArgs):
+def create_app(
+    server_args: ServerArgs,
+    *,
+    worker_pids: tuple[int, ...] = (),
+    disagg_server: "DiffusionServer | None" = None,
+):
     """
     Create and configure the FastAPI application instance.
     """
     globally_suppress_loggers()
     app = FastAPI(lifespan=lifespan, **fastapi_telemetry_disabled_kwargs())
+    app.state.worker_processes = [psutil.Process(pid) for pid in worker_pids]
+    app.state.disagg_server = disagg_server
+    app.state.broker_task = None
     if server_args.enable_metrics:
         configure_metrics()
         add_prometheus_middleware(app)
@@ -453,6 +513,11 @@ def create_app(server_args: ServerArgs):
 
     @app.middleware("http")
     async def wait_for_server_warmup(request: Request, call_next):
+        # Keep GETs available for completed results and failure diagnostics.
+        if request.method == "POST" and async_scheduler_client.failure_reason:
+            return orjson_response(
+                {"error": async_scheduler_client.failure_reason}, status_code=503
+            )
         warmup_done = getattr(request.app.state, "server_warmup_done", None)
         if (
             warmup_done is not None
