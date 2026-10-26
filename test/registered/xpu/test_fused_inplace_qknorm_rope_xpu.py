@@ -41,7 +41,7 @@ YARN_SCALING = {
 
 @pytest.mark.parametrize("rope_scaling", [None, YARN_SCALING], ids=["default", "yarn"])
 # head_dim >= 128: below that, RotaryEmbedding.forward_xpu takes the bf16-cache fallback.
-@pytest.mark.parametrize("head_dim,rotary_dim", [(128, 128), (128, 64)])
+@pytest.mark.parametrize("head_dim,rotary_dim", [(96, 128, 128), (128, 64)])
 @pytest.mark.parametrize("is_neox", [False, True])
 @pytest.mark.parametrize("num_tokens", [1, 257])
 def test_qknorm_rope_matches_model_unfused_path(
