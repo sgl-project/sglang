@@ -16,6 +16,7 @@ from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.model_executor.model_runner_components.load_model_utils import (
     maybe_precompile_model_kernels_after_loading,
 )
+from sglang.srt.models.glm5_next import Glm5NextForConditionalGeneration
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.multimodal.mm_utils import hip_dp_encoder_batches_vit
 from sglang.srt.runtime_context import (
@@ -192,6 +193,30 @@ class TestQwen3VLVisionWarmUp(_RuntimeCase):
     def test_language_model_only_skips_warm_up(self):
         with self._runtime(platform="hip", dp_encoder=True, attn_tp_size=2):
             maybe_precompile_model_kernels_after_loading(self._model(None), "cpu")
+
+
+class TestGlm5NextVisionWarmUp(TestQwen3VLVisionWarmUp):
+    @staticmethod
+    def _model(visual):
+        model = Glm5NextForConditionalGeneration.__new__(
+            Glm5NextForConditionalGeneration
+        )
+        torch.nn.Module.__init__(model)
+        model.visual = visual
+        return model
+
+    def test_post_load_hook_warms_the_tower_once_under_gate(self):
+        tower = _RecordingVisionTower()
+        with self._runtime(platform="hip", dp_encoder=True, attn_tp_size=2):
+            maybe_precompile_model_kernels_after_loading(self._model(tower), "cpu")
+
+        self.assertEqual(
+            tower.calls,
+            [
+                (32 * 32, [[1, 32, 32]], False),
+                (48 * 64, [[1, 48, 64]], False),
+            ],
+        )
 
 
 if __name__ == "__main__":

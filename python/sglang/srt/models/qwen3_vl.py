@@ -80,6 +80,7 @@ from sglang.srt.multimodal.mm_utils import (
     hip_dp_encoder_batches_vit,
     materialize_multimodal_features,
     run_dp_sharded_mrope_vision_model,
+    warm_up_vision_tower,
 )
 from sglang.srt.multimodal.transport.cuda_ipc import (
     BORROW_CUDA_IPC_FEATURE_KEY,
@@ -1453,26 +1454,14 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         sizes cover the static and the dynamic-shape compile; the last call has
         enough images to take the vectorized position-embedding path.
         """
-        patch_embed = self.visual.patch_embed
-        patch_dim = (
-            patch_embed.in_channels
-            * patch_embed.temporal_patch_size
-            * patch_embed.patch_size**2
+        warm_up_vision_tower(
+            self.visual,
+            (
+                [[1, 32, 32]],
+                [[1, 48, 64]],
+                [[1, 32, 32]] * _VECTORIZED_VL_POS_EMBED_MIN_IMAGES,
+            ),
         )
-        grids = (
-            [[1, 32, 32]],
-            [[1, 48, 64]],
-            [[1, 32, 32]] * _VECTORIZED_VL_POS_EMBED_MIN_IMAGES,
-        )
-        with torch.no_grad():
-            for grid in grids:
-                pixel_values = torch.zeros(
-                    sum(t * h * w for t, h, w in grid),
-                    patch_dim,
-                    device=self.visual.device,
-                    dtype=self.visual.dtype,
-                )
-                self.visual(pixel_values, grid_thw=torch.tensor(grid))
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         _require_vision(self)

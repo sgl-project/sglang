@@ -434,6 +434,32 @@ def hip_dp_encoder_batches_vit() -> bool:
     )
 
 
+def warm_up_vision_tower(
+    visual: torch.nn.Module, grids: Sequence[list[list[int]]]
+) -> None:
+    """Run the vision tower on zero images of each grid on this rank, without grad.
+
+    Under ``hip_dp_encoder_batches_vit``, a non-zero rank otherwise runs its first
+    ViT call inside the first served image burst and pays its torch.compile
+    compiles there. ``grids`` holds one ``grid_thw`` list per call.
+    """
+    patch_embed = visual.patch_embed
+    patch_dim = (
+        patch_embed.in_channels
+        * patch_embed.temporal_patch_size
+        * patch_embed.patch_size**2
+    )
+    with torch.no_grad():
+        for grid in grids:
+            pixel_values = torch.zeros(
+                sum(t * h * w for t, h, w in grid),
+                patch_dim,
+                device=visual.device,
+                dtype=visual.dtype,
+            )
+            visual(pixel_values, grid_thw=torch.tensor(grid))
+
+
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/vision.py
 def get_dp_encoder_lb_assignment(
     sizes: list[int],
