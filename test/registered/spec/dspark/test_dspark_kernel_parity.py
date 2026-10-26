@@ -29,7 +29,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels import dspark as dspark_kernels
 from sglang.test.test_utils import CustomTestCase, get_device
 
-register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=14, stage="base-b", runner_config="1-gpu-small")
 
 DEVICE = get_device()
 VOCAB = 129280
