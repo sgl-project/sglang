@@ -27,6 +27,8 @@ jobs:
        contains(github.event.comment.body, '/run-extra-ci') ||
        contains(github.event.comment.body, '/rerun-full-ci') ||
        contains(github.event.comment.body, '/rerun-extra-ci') ||
+       contains(github.event.comment.body, '/run-cpu-ci') ||
+       contains(github.event.comment.body, '/rerun-cpu-ci') ||
        contains(github.event.comment.body, '/rerun-group') ||
        contains(github.event.comment.body, '/rerun-test') ||
        startsWith(github.event.comment.body, '/tag-') ||

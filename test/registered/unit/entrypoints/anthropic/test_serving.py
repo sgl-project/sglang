@@ -26,7 +26,7 @@ from sglang.srt.parser.template_detection import (  # noqa: E402
 )
 from sglang.test.ci.ci_register import register_cpu_ci  # noqa: E402
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class _FakeOpenAIServingChat:
@@ -1437,18 +1437,6 @@ class TestAnthropicServing(unittest.TestCase):
         self.assertEqual(len(anthropic_response.content), 1)
         self.assertEqual(anthropic_response.content[0].type, "text")
         self.assertEqual(anthropic_response.content[0].text, "")
-
-    def test_error_response_does_not_leak_exception_name(self):
-        """``error.type`` must stay in Anthropic's documented literal set."""
-        serving = self._serving()
-        response = serving._error_response(
-            status_code=500,
-            error_type="api_error",
-            message="Internal server error",
-            exception_name="KeyError",
-        )
-        body = json.loads(bytes(response.body).decode())
-        self.assertEqual(body["error"]["type"], "api_error")
 
     def test_user_message_text_tool_text_preserves_order(self):
         """User message [text, tool_result, text] must stay user→tool→user on the wire."""

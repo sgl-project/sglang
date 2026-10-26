@@ -18,6 +18,25 @@ The docs use "output-preserving" instead of promising bit-exact "lossless" becau
 4. Use [Inference Batching](/docs/sglang-diffusion/dynamic_batching) for concurrent compatible requests during serving.
 5. Use [Profiling](/docs/sglang-diffusion/profiling) before changing several levers at once.
 
+## Image and Video Input Processing
+
+Eligible RGB inputs on NVIDIA CUDA use GPU Lanczos resize, crop, and normalization before
+encoding. This path retains Pillow's uint8 rounding, model-specific crop
+geometry, and the encoder input layout.
+It covers Cosmos3 image/video conditioning, Wan TI2V, FLUX.2/Klein reference
+images, Qwen-Image-Edit 2509/2511 VAE inputs, and RGB conversion in the shared
+image-VAE stage. Small images and unsupported image modes keep the CPU path.
+GPU preprocessing uses temporary device buffers and compiles its kernels on first
+use. Measure warmed-up end-to-end requests as well as peak memory; faster input
+processing does not imply the same speedup for the full generation pipeline.
+
+Set `SGLANG_FORCE_CPU_IMAGE_PREPROCESSING=1` before starting the process to
+compare against CPU preprocessing or troubleshoot a numerical issue. This does
+not move the learned encoder to CPU. File/image decoding, tokenization, and
+model-specific preprocessing outside these paths are unchanged; video readers
+stop early where only a prefix is required. GPU hardware codecs are not enabled
+by this setting.
+
 ## Choose a request quality tier
 
 `--quality` is cumulative: a broader tier never drops an optimization from a
@@ -172,10 +191,11 @@ saving.
 
 ### Scope and tradeoffs
 
-- Only the output rank performs asynchronous saving, and only for requests that
-  save files and return their paths (`save_output=true` and
-  `return_file_paths_only=true` in the sampling parameters).
-- Warmup requests, raw-frame responses, requests with `save_output=false`, and
+- Only the output rank performs asynchronous saving, and only for requests whose
+  outputs it encodes: `return_file_paths_only=true` together with
+  `save_output=true` or `return_image_bytes=true` (set by `/v1/images`) in the
+  sampling parameters.
+- Warmup requests, raw-frame responses, other requests with `save_output=false`, and
   requests with `perf_dump_path` set or `SGLANG_DIFFUSION_STAGE_LOGGING=1` keep the
   synchronous path. This includes the frame-return path used by `/rollout/generate`.
 - Each reply is sent from the saving thread as soon as its output is saved,
@@ -270,6 +290,20 @@ These techniques can change the denoising path, numerical representation, or gen
 5. Tune attention backend and batching for the deployment pattern.
 6. Profile if the bottleneck is unclear.
 7. Add `quality=high`, caching, progressive resolution, or quantization only after comparing output quality against your acceptance target.
+
+## Python garbage collection
+
+Workers collect startup garbage after loading and again after the final warmup,
+including compile prewarms. Automatic cyclic GC is deferred during model forward
+and output materialization/reply, then restored with its original thresholds.
+Reference counting and explicit, memory-critical collections still work;
+model objects are not frozen and CUDA allocator caches are not flushed by GC.
+
+With `--async-output-save`, continuous forward/save overlap is drained at a request
+boundary after 30 seconds without a GC opportunity. This bounds deferral, not an
+individual request's duration. Cyclic garbage can remain alive until execution
+finishes, so benchmark sustained traffic and host/device memory as well as P99
+latency. GC may still run between protected regions or through an explicit call.
 
 ## Per-model tuning starting points
 
