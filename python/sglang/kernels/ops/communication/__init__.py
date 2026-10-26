@@ -50,6 +50,15 @@ for _mod, _fn in [
     )
 del _mod, _fn
 
+register_kernel(
+    KernelSpec(
+        op="communication.beam_all_reduce_norm",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.communication.beam_all_reduce:beam_all_reduce_norm",
+        capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(9, 0))}),
+    )
+)
+
 # Muse Spark collectives. The MoE finalize op (with its optional fused TP
 # all-reduce) is built per layer: inventoried through its class methods.
 register_kernel(
