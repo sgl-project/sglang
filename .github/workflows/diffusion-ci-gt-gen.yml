@@ -412,6 +412,23 @@ jobs:
           CUSTOM_BUILD_SGL_KERNEL="${{ inputs.kernel_artifact_run_id != '' && 'true' || 'false' }}" \
             bash scripts/ci/cuda/ci_install_dependency.sh diffusion
 
+      - name: Verify worker startup and repeated Klein cold starts
+        env:
+          RUNAI_STREAMER_MEMORY_LIMIT: 0
+          NCCL_NVLS_ENABLE: "0"
+          SGLANG_DIFFUSION_STAGE_LOGGING: "1"
+        run: |
+          cd python
+          python3 -m pytest -v \
+            sglang/multimodal_gen/test/unit/test_gpu_worker_cpu_threads.py \
+            sglang/multimodal_gen/test/unit/test_process.py
+          for attempt in 1 2 3; do
+            echo "Klein cold start ${attempt}/3, performance and consistency enabled"
+            SGLANG_PERF_LOG_DIR="/tmp/klein-startup-perf/${attempt}" \
+              python3 -m pytest -s -v \
+              'sglang/multimodal_gen/test/server/test_server_1_gpu.py::TestDiffusionServerOneGpu::test_diffusion_generation[flux_2_klein_image_t2i]'
+          done
+
       - name: Generate outputs
         env:
           RUNAI_STREAMER_MEMORY_LIMIT: 0
