@@ -260,7 +260,12 @@ class ConfigManager:
 
     @classmethod
     def get_inference_time_predictor(
-        cls, model: ModelInfo, hw: AcceleratorInfo, sched_config: SchedulerConfig
+        cls,
+        model: ModelInfo,
+        hw: AcceleratorInfo,
+        sched_config: SchedulerConfig,
+        *,
+        attention_dp_rank=None,
     ) -> InferTimePredictor:
         config = cls._get_raw_config()
         predictor_config = config.get("predictor", {})
@@ -395,10 +400,30 @@ class ConfigManager:
                         else ref
                         for mode, ref in models.items()
                     }
-            if type(options.get("native_cost_evidence_path")) is str:
-                options["native_cost_evidence_path"] = cls.resolve_infercast_path(
-                    options["native_cost_evidence_path"]
+            joint_ledger = (
+                options.get("native_joint_source_binding") is not None
+                and options.get("native_cost_evidence_path") is not None
+            )
+            if joint_ledger and (
+                type(attention_dp_rank) is not int or attention_dp_rank not in (0, 1)
+            ):
+                raise ValueError(
+                    "joint cost evidence requires attention-DP rank 0 or 1"
                 )
+            if type(options.get("native_cost_evidence_path")) is str:
+                explicit_path = options["native_cost_evidence_path"]
+                options["native_cost_evidence_path"] = cls.resolve_infercast_path(
+                    explicit_path
+                )
+                if joint_ledger and explicit_path.strip():
+                    path = Path(options["native_cost_evidence_path"])
+                    # Leave directory inputs to the existing writer's rejection.
+                    if not path.is_dir():
+                        options["native_cost_evidence_path"] = str(
+                            path.with_name(
+                                f"{path.stem}.dp{attention_dp_rank}{path.suffix}"
+                            )
+                        )
             for name in ("native_source_binding", "native_joint_source_binding"):
                 binding = options.get(name)
                 if (

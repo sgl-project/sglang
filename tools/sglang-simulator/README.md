@@ -116,6 +116,16 @@ predicted query, not a committed native forward; a partial run or output
 failure must not be reported as a completed simulation. Theory never creates or
 qualifies PerfDB measurement rows and does not establish native timing accuracy.
 
+For the explicit native joint attention-DP2 entry, the scheduler passes its
+actual attention-DP rank to the existing predictor factory. An enabled
+`native_cost_evidence_path` is resolved relative to the configuration, then
+`.dp0` or `.dp1` is inserted before its final extension: `costs.jsonl` creates
+`costs.dp0.jsonl` and `costs.dp1.jsonl` (`costs` creates `costs.dp0`/`costs.dp1`).
+Both files use exclusive creation, so reusing a run path still fails. Only the
+leader evaluates the joint whole-worker price; the follower's ledger can remain
+empty. This filename rule does not alter ADP1 paths, disabled-ledger behavior,
+query identities, cost accounting or metrics.
+
 The library-only `UMDDSparkCostModel.for_native_joint` selects one complete
 TP2/attention-DP2 worker cost. It accepts a typed `NativeDPProgressPolicy`, the
 immutable canonical `runtime_profile_json`, `profiles` keyed by `EXTEND` and

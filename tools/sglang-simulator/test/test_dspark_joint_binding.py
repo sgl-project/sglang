@@ -123,6 +123,74 @@ def create(factory, **changes):
     )
 
 
+def test_joint_shared_ledger_constructor_remains_exclusive(factory, tmp_path):
+    """The original direct constructor reproduces the actual xb conflict."""
+    path = tmp_path / "shared.jsonl"
+    first = create(factory, native_cost_evidence_path=str(path))
+    try:
+        with pytest.raises(
+            PredictorError, match="cannot create native cost evidence"
+        ) as caught:
+            create(factory, native_cost_evidence_path=str(path))
+        assert isinstance(caught.value.__cause__, FileExistsError)
+        assert path.read_bytes() == b""
+    finally:
+        first.dspark_runtime.session.cost_model._cost_sink.close()
+
+
+def test_joint_config_creates_two_real_exclusive_writers(
+    factory, tmp_path, monkeypatch
+):
+    """Real predictor/SDK/UMD constructors, declared source, zero timing rows."""
+    raw = {
+        "platform": {"accelerator": {"name": "mi355x"}},
+        "predictor": {
+            "name": "infercast_dspark",
+            **{key: value for key, value in factory.options.items() if key != "system"},
+            "native_cost_evidence_path": str(tmp_path / "costs.jsonl"),
+        },
+    }
+    original = copy.deepcopy(raw)
+    config_path = tmp_path / "sim.json"
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    monkeypatch.setenv("SGLANG_SIMULATOR_CONFIG_PATH", str(config_path))
+    monkeypatch.setattr(ConfigManager, "_raw_config", raw)
+    predictors = []
+    try:
+        for rank in (0, 1):
+            predictors.append(
+                ConfigManager.get_inference_time_predictor(
+                    factory.model,
+                    NS(name="mi355x"),
+                    factory.config,
+                    attention_dp_rank=rank,
+                )
+            )
+        for rank, predictor in enumerate(predictors):
+            path = tmp_path / f"costs.dp{rank}.jsonl"
+            metrics = predictor.get_metrics()["infercast_dspark"]
+            assert path.read_bytes() == b""
+            assert metrics["cost_grain"] == "whole_worker"
+            assert metrics["hybrid_cost_queries"]["by_source"] == {}
+            assert metrics["hybrid_cost_queries"]["ledger"]["path"] == str(path)
+            assert metrics["hybrid_cost_queries"]["ledger"]["bytes"] == 0
+            with pytest.raises(
+                PredictorError, match="cannot create native cost evidence"
+            ) as caught:
+                ConfigManager.get_inference_time_predictor(
+                    factory.model,
+                    NS(name="mi355x"),
+                    factory.config,
+                    attention_dp_rank=rank,
+                )
+            assert isinstance(caught.value.__cause__, FileExistsError)
+        assert not (tmp_path / "costs.jsonl").exists()
+        assert raw == original
+    finally:
+        for predictor in predictors:
+            predictor.dspark_runtime.session.cost_model._cost_sink.close()
+
+
 @pytest.mark.parametrize("mode", ["EXTEND", "DECODE"])
 def test_joint_constructor_reaches_real_umd_typed_miss_sol(factory, mode):
     predictor = create(factory)

@@ -174,6 +174,46 @@ def make_batch(rid="request"):
     )
 
 
+@pytest.mark.parametrize("native_dp", [None, False, True])
+@pytest.mark.parametrize("rank", [0, 1])
+def test_initialized_scheduler_passes_native_rank_only_to_paired_predictor(
+    hooked_scheduler, monkeypatch, native_dp, rank
+):
+    from sglang_simulator.simulation.manager.config import ConfigManager
+    from sglang_simulator.simulation.sglang import coordinated, dp_coordinated
+
+    target = hooked_scheduler.target
+    target.tp_group = SimpleNamespace(rank_in_group=rank)
+    native_args = SimpleNamespace(disable_overlap_schedule=False)
+    calls = []
+    monkeypatch.setattr(scheduler, "get_obj_from_args", lambda *a, **kw: native_args)
+    monkeypatch.setattr(scheduler, "validate_simulator_server_args", lambda *a: None)
+    monkeypatch.setattr(scheduler, "validate_required_class_hooks", lambda: None)
+    monkeypatch.setattr(
+        scheduler.Envs,
+        "coordinator_endpoint",
+        lambda: None if native_dp is None else "tcp://127.0.0.1:12345",
+    )
+    monkeypatch.setattr(dp_coordinated, "native_dp_clock_enabled", lambda: native_dp)
+    monkeypatch.setattr(dp_coordinated, "internal_endpoint", lambda *a: "ipc://unused")
+    monkeypatch.setattr(dp_coordinated, "DPCoordinatedScheduler", lambda **kw: object())
+    monkeypatch.setattr(coordinated, "CoordinatedScheduler", lambda **kw: object())
+    model, hw, config = object(), object(), object()
+    monkeypatch.setattr(ConfigManager, "get_model_info", lambda: model)
+    monkeypatch.setattr(ConfigManager, "get_accelerator_info", lambda: hw)
+    monkeypatch.setattr(ConfigManager, "get_scheduler_config", lambda: config)
+
+    def create(*args, **kwargs):
+        calls.append((args, kwargs))
+        return hooked_scheduler.predictor
+
+    monkeypatch.setattr(ConfigManager, "get_inference_time_predictor", create)
+    type(target).__init__(target)
+    assert calls == [
+        ((model, hw, config), {"attention_dp_rank": rank} if native_dp else {})
+    ]
+
+
 @pytest.mark.parametrize("interval", [0, 1, 192])
 @pytest.mark.parametrize("reference", [False, True])
 def test_cadence_and_reference_hooks_compose_without_replacing_native_selection(

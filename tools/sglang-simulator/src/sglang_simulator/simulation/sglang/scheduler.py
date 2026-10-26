@@ -39,12 +39,10 @@ from sglang_simulator.simulation.utils import (
 from sglang_simulator.time_predictor.base import (
     InferTimePredictor,
     PredictorError,
+    ScheduleRequest,
 )
 from sglang_simulator.time_predictor.base import (
     ScheduleBatch as SimulationScheduleBatch,
-)
-from sglang_simulator.time_predictor.base import (
-    ScheduleRequest,
 )
 from sglang_simulator.utils import get_logger
 from sglang_simulator.utils.json import CustomJsonEncoder
@@ -534,8 +532,22 @@ class C_SchedulerHook(BaseHook):
                     ConfigManager.set_scheduler_config(sched_config)
                 sched_config = ConfigManager.get_scheduler_config()
 
+                predictor_options = {}
+                native_dp_clock = False
+                if Envs.coordinator_endpoint():
+                    from sglang_simulator.simulation.sglang.dp_coordinated import (
+                        native_dp_clock_enabled,
+                    )
+
+                    native_dp_clock = native_dp_clock_enabled()
+                    if native_dp_clock:
+                        predictor_options["attention_dp_rank"] = (
+                            self.tp_group.rank_in_group
+                        )
                 C_SchedulerHook.INFERENCE_PREDICTOR = (
-                    ConfigManager.get_inference_time_predictor(model, hw, sched_config)
+                    ConfigManager.get_inference_time_predictor(
+                        model, hw, sched_config, **predictor_options
+                    )
                 )
                 if Envs.coordinator_endpoint():
                     from sglang_simulator.simulation.sglang.coordinated import (
@@ -544,7 +556,6 @@ class C_SchedulerHook(BaseHook):
                     from sglang_simulator.simulation.sglang.dp_coordinated import (
                         DPCoordinatedScheduler,
                         internal_endpoint,
-                        native_dp_clock_enabled,
                     )
 
                     def pending():
@@ -552,7 +563,7 @@ class C_SchedulerHook(BaseHook):
                             self, C_SchedulerHook.INFERENCE_PREDICTOR
                         )
 
-                    if native_dp_clock_enabled():
+                    if native_dp_clock:
                         ports = get_obj_from_args(
                             "sglang.srt.server_args.PortArgs", *args, **kwargs
                         )

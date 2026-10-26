@@ -167,6 +167,74 @@ def test_explicit_hybrid_model_and_output_resolve_from_config(factory):
     assert raw == original
 
 
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("filename", ["costs.jsonl", "costs", "costs.jsonl.gz"])
+def test_joint_ledger_path_uses_explicit_attention_rank(factory, rank, filename):
+    _, raw, folder = factory
+    raw["predictor"].update(
+        native_joint_source_binding={"root": "source"},
+        native_cost_evidence_path=filename,
+    )
+    original = copy.deepcopy(raw)
+    result = ConfigManager.get_inference_time_predictor(
+        None, None, None, attention_dp_rank=rank
+    )
+    path = folder / filename
+    assert result.native_cost_evidence_path == str(
+        path.with_name(f"{path.stem}.dp{rank}{path.suffix}").resolve()
+    )
+    assert not hasattr(result, "attention_dp_rank")
+    assert raw == original
+
+
+@pytest.mark.parametrize("rank", [None, False, True, -1, 2, "1", 1.0])
+def test_joint_ledger_rejects_unknown_or_invalid_rank_before_constructor(factory, rank):
+    calls, raw, _ = factory
+    raw["predictor"].update(
+        native_joint_source_binding={"root": "source"},
+        native_cost_evidence_path="costs.jsonl",
+    )
+    with pytest.raises(ValueError, match="attention-DP rank 0 or 1"):
+        ConfigManager.get_inference_time_predictor(
+            None, None, None, attention_dp_rank=rank
+        )
+    assert not calls
+
+
+def test_rank_does_not_change_adp1_path_or_ledger_disabled_joint(factory):
+    _, raw, folder = factory
+    raw["predictor"]["native_cost_evidence_path"] = "costs.jsonl"
+    for rank in (None, 0, 1):
+        result = ConfigManager.get_inference_time_predictor(
+            None, None, None, attention_dp_rank=rank
+        )
+        assert result.native_cost_evidence_path == str(
+            (folder / "costs.jsonl").resolve()
+        )
+    raw["predictor"]["native_joint_source_binding"] = {"root": "source"}
+    raw["predictor"]["native_cost_evidence_path"] = None
+    original = copy.deepcopy(raw)
+    result = ConfigManager.get_inference_time_predictor(None, None, None)
+    assert result.native_cost_evidence_path is None
+    assert raw == original
+
+
+@pytest.mark.parametrize("value", ["", " ", "."])
+def test_joint_does_not_turn_blank_or_directory_path_into_fresh_file(factory, value):
+    _, raw, folder = factory
+    raw["predictor"].update(
+        native_joint_source_binding={"root": "source"},
+        native_cost_evidence_path=value,
+    )
+    result = ConfigManager.get_inference_time_predictor(
+        None, None, None, attention_dp_rank=0
+    )
+    assert result.native_cost_evidence_path == ConfigManager.resolve_infercast_path(
+        value
+    )
+    assert not list(folder.glob("*.dp0*"))
+
+
 def test_explicit_native_source_root_resolves_without_rewriting_descriptors(factory):
     _, raw, folder = factory
     binding = {
