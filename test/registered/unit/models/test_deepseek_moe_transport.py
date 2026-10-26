@@ -117,6 +117,29 @@ class TestOverlappedTransport(unittest.TestCase):
         )
         self.assertIsNot(buffers[("gh", 0)], buffers[("gh", 1)])
 
+    def test_shared_expert_locality_follows_its_switch(self):
+        moe = SimpleNamespace(shared_experts=object(), _shared_expert_tp1=True)
+        rows = TransportRows(
+            Layout(frozenset()),
+            Layout(frozenset()),
+            Layout(frozenset()),
+            SumGroup.MOE_OUTPUT,
+        )
+        for local in (False, True):
+            with (
+                self.subTest(local=local),
+                patch.object(moe_transport, "SHARED_EXPERT_LOCAL", local),
+                patch.object(
+                    moe_transport,
+                    "get_moe_a2a_backend",
+                    return_value=SimpleNamespace(is_none=lambda: True),
+                ),
+            ):
+                call = moe_transport.OverlappedMoeTransport(
+                    moe, torch.ones(2, 3), SimpleNamespace(), 0, rows
+                )
+                self.assertEqual(call.do_shared_local, local)
+
     def test_a_micro_batch_empty_on_every_rank_runs_no_experts(self):
         def experts(*args, **kwargs):
             raise AssertionError("the experts ran on an empty micro-batch")

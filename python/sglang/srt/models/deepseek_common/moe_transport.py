@@ -39,8 +39,8 @@ def shared_expert_runs_locally(moe):
     """Whether the replicated shared expert can run before the DP gather."""
     return (
         SHARED_EXPERT_LOCAL
-        and getattr(moe, "shared_experts", None) is not None
-        and getattr(moe, "_shared_expert_tp1", False)
+        and moe.shared_experts is not None
+        and moe._shared_expert_tp1
     )
 
 
@@ -375,9 +375,7 @@ class OverlappedMoeTransport(ComputeTransport):
         self.moe, self.input, self.batch = moe, hidden_states, batch
         self.ep = not get_moe_a2a_backend().is_none()
         self.sub = subbatch_index
-        self.do_shared_local = (
-            not self.ep and moe.shared_experts is not None and moe._shared_expert_tp1
-        )
+        self.do_shared_local = not self.ep and shared_expert_runs_locally(moe)
         self.shared_local = None
         self.gather_event = self.combine_event = None
         self.gather_keepalive = self.combine_keepalive = None

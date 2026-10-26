@@ -34,6 +34,7 @@ from sglang.srt.models.deepseek_common.moe_transport import (
     _tbo_gather_moe_input,
     _tbo_run_moe,
     _tbo_wait_moe_output,
+    shared_expert_runs_locally,
 )
 from sglang.srt.models.deepseek_v2 import MoEOutput
 from sglang.srt.models.deepseek_v4_mhc import MHC_POST_MULT_VALUE, AttnOutput
@@ -459,9 +460,7 @@ class NonCudaDecoderMixin:
 
     def op_gather_a(self, state):
         local = state.pop("hidden_states_mlp_input")
-        state.do_shared_local = (
-            self.mlp.shared_experts is not None and self.mlp._shared_expert_tp1
-        )
+        state.do_shared_local = shared_expert_runs_locally(self.mlp)
         (
             state.global_hidden,
             state.gather_event,
