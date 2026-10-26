@@ -238,9 +238,26 @@ both local execution candidates. It must return one agreed full step changing
 execution JSON only. This is where the existing named joint whole-forward cost
 adapter can receive its exact SDK query/runtime binding. The retained-native
 `native_joint_group_execution` witness reader is not a projector for future
-dynamic simulator work. That source-led dynamic planner/graph/buffer resolver
-remains a separate missing integration; no ADP1 projection or invented native
-frame fills it here.
+dynamic simulator work. `NativeJointExecutionResolver` instead derives prospective
+coordinates from the local reference views, original request metadata and the
+complete physical graph inventory. It never invents a completed native frame.
+
+The existing predictor owner's internal `_native_joint_runtime` assembles this
+typed resolver, both phase-specific profiles and uncalibrated HYBRID models,
+the source progress policy and the existing whole-forward UMD adapter. It requires
+the canonical model digest and an observed reference CPU-mirror boolean; missing
+mirror evidence stays unknown and fails before opening a cost ledger. The caller
+must independently retain the runtime/capture/allocated-source custody: the
+acceptance policy does not attest that physical context. This entry does not open
+the public JSON factory or its topology guards.
+
+With this explicit resolver attached, the existing reference driver's `selected`
+entry joins the actual native TP group after native MLP synchronization and idle
+construction. The existing worker forward entry uses that same group, scheduler
+counter and source context for the peer transaction. Rank-local validation errors
+rendezvous before costs. Both-empty polling binds the local reference owner
+without inventing a forward; paired drained reset needs no fabricated native FID.
+Retirements synchronize at the next selection, outside local result callbacks.
 
 Rank 0 alone predicts the global cost and progress. Each owner binds that shared
 result to its own reference transaction and builds its native result. Both local

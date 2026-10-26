@@ -82,6 +82,92 @@ def _runtime_json(raw):
         ) from error
 
 
+def _native_joint_runtime(
+    database,
+    *,
+    source_policy,
+    runtime_profile_json,
+    profiles,
+    analytic_models,
+    model_config_sha256,
+    model_seed,
+    output_token_id=1,
+    cost_evidence_path=None,
+):
+    """Assemble the typed joint library route under the existing predictor owner.
+
+    The caller retains the independent runtime/capture/allocated-source custody.
+    A progress policy attests the local law and mirror observations, not that
+    physical context. Public JSON construction remains closed for ADP2.
+    """
+    from sglang_simulator.simulation.sglang.dspark import DSparkSession, DSparkTopology
+    from sglang_simulator.simulation.sglang.dspark_joint_execution import (
+        NativeJointExecutionResolver,
+    )
+    from sglang_simulator.simulation.sglang.dspark_runtime import DSparkNativeRuntime
+    from sglang_simulator.time_predictor.dspark_golden_progress import (
+        SourceGoldenDPProgress,
+    )
+    from sglang_simulator.time_predictor.dspark_umd import UMDDSparkCostModel
+
+    # All preconditions precede any cost-ledger creation. Never default a
+    # missing physical mirror observation to the CPU engine's backend choice.
+    _require(
+        type(output_token_id) is int and output_token_id >= 0,
+        "joint output_token_id must be a nonnegative integer",
+    )
+    _require(
+        type(getattr(source_policy, "reference_needs_cpu_seq_lens", None)) is bool,
+        "joint runtime requires original reference CPU mirror observations",
+        code="data_unavailable",
+        missing_source_facts=["reference_backend_cpu_mirror_policy"],
+    )
+    _require(
+        type(model_config_sha256) is str
+        and re.fullmatch("[0-9a-f]{64}", model_config_sha256) is not None
+        and type(analytic_models) is dict
+        and set(analytic_models) == {"EXTEND", "DECODE"},
+        "joint runtime requires both explicit canonical-model analytic assets",
+    )
+    from infercast.sdk.native_segment_analytic import NativeSegmentAnalyticModel
+
+    _require(
+        all(
+            type(model) is NativeSegmentAnalyticModel
+            and model.model_config_sha256 == model_config_sha256
+            for model in analytic_models.values()
+        ),
+        "joint analytic assets differ from the canonical model",
+        code="incompatible_runtime",
+    )
+    resolver = NativeJointExecutionResolver(
+        source_policy=source_policy,
+        runtime_profile_json=runtime_profile_json,
+        profiles=profiles,
+    )
+    progress = SourceGoldenDPProgress(
+        source_policy,
+        runtime_profile_json=runtime_profile_json,
+        model_seed=model_seed,
+    )
+    costs = UMDDSparkCostModel.for_native_joint(
+        database,
+        source_policy=source_policy,
+        runtime_profile_json=runtime_profile_json,
+        profiles=profiles,
+        analytic_models=analytic_models,
+        cost_evidence_path=cost_evidence_path,
+    )
+    return DSparkNativeRuntime(
+        session=DSparkSession(costs, progress),
+        topology=DSparkTopology(2, 2),
+        runtime_profile_json=runtime_profile_json,
+        output_token_id=output_token_id,
+        reference_events=True,
+        joint_execution_resolver=resolver,
+    )
+
+
 def _native_source_binding_assets(binding):
     """Use the SDK's existing bounded original reader, not numerical metadata."""
     from infercast.sdk.native_windows import MAX_NATIVE_WINDOW_BYTES

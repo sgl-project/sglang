@@ -187,6 +187,7 @@ def prepare_cpu_decode(draft_input, batch):
     uses ReqToTokenPool.write for the same table update.
     """
     import torch
+
     from sglang.srt.mem_cache.allocation import (
         alloc_paged_token_slots_extend,
         alloc_token_slots,
@@ -284,6 +285,7 @@ class NativeDSparkResults:
 
     def build(self, *, batch, prediction):
         import torch
+
         from sglang.srt.layers.logits_processor import LogitsProcessorOutput
         from sglang.srt.managers.utils import GenerationBatchResult
         from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
@@ -352,6 +354,7 @@ class DSparkNativeRuntime:
         result_factory=None,
         reference_events=False,
         initial_draft_buffer_capacity=0,
+        joint_execution_resolver=None,
     ):
         if (
             type(initial_draft_buffer_capacity) is not int
@@ -387,6 +390,155 @@ class DSparkNativeRuntime:
             )
 
             self.reference_driver = DSparkReferenceDriver(self)
+        self._joint_execution_resolver = joint_execution_resolver
+        self._native_dp_scheduler = None
+        if joint_execution_resolver is not None:
+            from infercast.sdk.native_dp_progress import NativeDPProgressPolicy
+            from sglang_simulator.simulation.sglang.dspark_joint_execution import (
+                NativeJointExecutionResolver,
+            )
+            from sglang_simulator.time_predictor.dspark_golden_progress import (
+                SourceGoldenDPProgress,
+            )
+
+            policy = getattr(session.cost_model, "native_source_policy", None)
+            if not (
+                topology == DSparkTopology(2, 2)
+                and reference_events is True
+                and type(joint_execution_resolver) is NativeJointExecutionResolver
+                and type(policy) is NativeDPProgressPolicy
+                and joint_execution_resolver.source_policy is policy
+                and joint_execution_resolver.runtime_profile_json
+                == runtime_profile_json
+                and type(session.progress_model) is SourceGoldenDPProgress
+                and session.progress_model.identity["source_identity_sha256"]
+                == policy.source_identity_sha256
+                and session.progress_model.runtime_profile_json == runtime_profile_json
+            ):
+                raise PredictorError(
+                    "invalid_execution_profile",
+                    "native DP routing requires matching typed joint source/cost/progress owners",
+                )
+            if type(getattr(policy, "reference_needs_cpu_seq_lens", None)) is not bool:
+                raise PredictorError(
+                    "data_unavailable",
+                    "native DP routing requires original reference CPU mirror observations",
+                    missing_source_facts=["reference_backend_cpu_mirror_policy"],
+                )
+            self.execution_resolver = joint_execution_resolver.execution_for
+            self._native_dp_identity = self._joint_identity()
+
+    def _joint_identity(self):
+        resolver = self._joint_execution_resolver
+        return (
+            resolver.source_policy.source_identity_sha256,
+            resolver.source_policy.reference_needs_cpu_seq_lens,
+            tuple(
+                (mode, resolver.profiles[mode].profile_id)
+                for mode in ("EXTEND", "DECODE")
+            ),
+            resolver.runtime_profile_json,
+            self.runtime_profile_json,
+            self.session.progress_model.model_ref,
+        )
+
+    def _native_dp_route(self, scheduler, batch, *, selecting, reset=False):
+        """Read actual native group/ranks and rendezvous local validation errors."""
+        from sglang_simulator.simulation.sglang.dspark_native_peers import (
+            _exchange,
+            _native_group,
+            _require,
+        )
+
+        from sglang.srt.runtime_context import get_parallel
+
+        parallel = get_parallel()
+        group = parallel.tp_group
+        _native_group(group)  # A real usable group is the rendezvous prerequisite.
+
+        def local():
+            rank = parallel.attn_dp_rank
+            # A drained reset can precede the first native selection. Its
+            # lifecycle has no native forward and must not invent a counter.
+            count = None if reset else scheduler.forward_ct
+            _require(
+                self._joint_execution_resolver is not None
+                and self._native_dp_identity == self._joint_identity()
+                and type(rank) is int
+                and rank == parallel.tp_rank == group.rank_in_group
+                and all(
+                    type(getattr(parallel, name)) is int
+                    for name in (
+                        "tp_size",
+                        "attn_dp_size",
+                        "attn_tp_size",
+                        "pp_size",
+                        "attn_cp_size",
+                        "nnodes",
+                        "attn_tp_rank",
+                    )
+                )
+                and parallel.tp_size == parallel.attn_dp_size == 2
+                and parallel.attn_tp_size
+                == parallel.pp_size
+                == parallel.attn_cp_size
+                == parallel.nnodes
+                == 1
+                and parallel.attn_tp_rank == 0
+                and parallel.attn_dp_enabled is True
+                and (reset or type(count) is int and count >= 0)
+                and (
+                    self._native_dp_scheduler is None
+                    or self._native_dp_scheduler is scheduler
+                )
+                and (reset or selecting or self._native_dp_scheduler is scheduler),
+                "native DP route differs from its actual scheduler/group/source owner",
+            )
+            return dict(
+                rank=rank,
+                forward_ct=count,
+                has_batch=batch is not None,
+                source=self._native_dp_identity,
+                progress=self.session.progress_model.model_ref,
+                reset=reset,
+            )
+
+        peers = _exchange(
+            group,
+            "native scheduler route" if selecting else "native worker route",
+            local,
+        )
+        _require(
+            peers[0]["forward_ct"] == peers[1]["forward_ct"]
+            and peers[0]["has_batch"] == peers[1]["has_batch"]
+            and peers[0]["source"] == peers[1]["source"]
+            and peers[0]["progress"] == peers[1]["progress"]
+            and peers[0]["reset"] == peers[1]["reset"],
+            "native DP routes require matching FID/source and actual active/idle batches",
+        )
+        return group, parallel.attn_dp_rank, peers[group.rank_in_group]["forward_ct"]
+
+    def selected_native_dp(self, scheduler, batch, *, prior_requests=()):
+        """Existing native selection entry after its MLP-sync/idle adapter."""
+        group, rank, count = self._native_dp_route(scheduler, batch, selecting=True)
+        self.reference_driver.bind_native_dp_rank(rank)
+        self.synchronize_native_dp_peer_lifecycle(
+            tp_group=group, attention_dp_rank=rank
+        )
+        self._native_dp_scheduler = scheduler
+        if batch is None:
+            self.reference_driver.selection = self.reference_driver._selection(
+                scheduler, batch, prior_requests=prior_requests
+            )
+            return
+        return self.select_native_dp_peer_batch(
+            scheduler,
+            batch,
+            tp_group=group,
+            attention_dp_rank=rank,
+            native_forward_ct=count + 1,
+            prior_requests=prior_requests,
+        )
 
     def select_native_dp_peer_batch(self, scheduler, batch, **kwargs):
         """Explicit library route; public native ADP2 capture stays closed."""
@@ -588,6 +740,20 @@ class DSparkNativeRuntime:
         return group
 
     def forward_batch_generation(self, *, worker, batch, on_publish=None):
+        if self._joint_execution_resolver is not None:
+            scheduler = self._native_dp_scheduler
+            group, rank, count = self._native_dp_route(
+                scheduler, batch, selecting=False
+            )
+            return self.forward_native_dp_peer(
+                worker=worker,
+                batch=batch,
+                tp_group=group,
+                attention_dp_rank=rank,
+                native_forward_ct=count,
+                joint_execution_resolver=self._joint_execution_resolver,
+                on_publish=on_publish,
+            )
         started = time.perf_counter()
         if worker.query_token_num != 5 or worker.verify_num_draft_tokens != 6:
             raise PredictorError(
@@ -662,6 +828,14 @@ class DSparkNativeRuntime:
                 )
 
     def clear_cache_pool(self):
+        if self._joint_execution_resolver is not None:
+            scheduler = self._native_dp_scheduler
+            group, rank, _ = self._native_dp_route(
+                scheduler, None, selecting=False, reset=True
+            )
+            return self.synchronize_native_dp_peer_lifecycle(
+                tp_group=group, attention_dp_rank=rank, reset=True
+            )
         if self.topology.attention_dp_size == 2:
             raise PredictorError(
                 "invalid_reference_state",

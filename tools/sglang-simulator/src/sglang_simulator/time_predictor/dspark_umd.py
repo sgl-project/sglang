@@ -300,6 +300,9 @@ class UMDDSparkCostModel:
             dict(profiles),
             None if analytic_models is None else dict(analytic_models),
         )
+        # The reference relay consumes the source-derived CPU mirror fact.
+        # Keep its typed DP policy separate from the regional constructor.
+        model.native_source_policy = source_policy
         if cost_evidence_path is not None:
             if (
                 analytic_models is None
@@ -499,6 +502,11 @@ class UMDDSparkCostModel:
         and matching request metadata. The legacy proposal path resolves only
         its own capture and does not reinterpret reference planning inputs.
         """
+        if hasattr(self, "_native_joint"):
+            raise PredictorError(
+                "data_unavailable",
+                "joint costs require the complete peer execution resolver",
+            )
         if self.native_source_policy is not None:
             return self._native_execution(
                 group=group,
@@ -949,7 +957,6 @@ class UMDDSparkCostModel:
         from infercast.sdk.native_joint_forward import NativeJointForwardQuery
         from infercast.sdk.perf_database.database import PerfDataNotAvailableError
         from infercast.sdk.perf_database.dsv41_native_forward import MODEL, OP
-
         from sglang_simulator.simulation.sglang.dspark import DSparkStep, DSparkTopology
 
         policy, runtime, profiles, models = self._native_joint

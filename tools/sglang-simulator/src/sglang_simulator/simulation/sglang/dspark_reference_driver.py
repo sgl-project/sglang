@@ -77,6 +77,10 @@ class DSparkReferenceDriver:
         self.owner = scheduler
 
     def selected(self, scheduler, batch, *, prior_requests=()):
+        if getattr(self.runtime, "_joint_execution_resolver", None) is not None:
+            return self.runtime.selected_native_dp(
+                scheduler, batch, prior_requests=prior_requests
+            )
         self.selection = self._selection(
             scheduler, batch, prior_requests=prior_requests
         )
@@ -86,6 +90,18 @@ class DSparkReferenceDriver:
     ):
         """Prepare a candidate from both real partitions; caller rendezvous installs it."""
         _, rank, _ = peer_context
+        self.bind_native_dp_rank(rank)
+        return self._selection(
+            scheduler,
+            batch,
+            prior_requests=prior_requests,
+            before=step,
+            peer_context=peer_context,
+        )
+
+    def bind_native_dp_rank(self, rank):
+        """Bind the actual local group even before the first nonempty selection."""
+        _require(type(rank) is int and rank in (0, 1), "invalid local DP rank")
         ledger = self.adapter.ledger
         if ledger.local_attention_dp_rank != rank:
             _require(
@@ -99,13 +115,6 @@ class DSparkReferenceDriver:
             self.adapter = replace(
                 self.adapter, ledger=replace(ledger, local_attention_dp_rank=rank)
             )
-        return self._selection(
-            scheduler,
-            batch,
-            prior_requests=prior_requests,
-            before=step,
-            peer_context=peer_context,
-        )
 
     def _selection(
         self, scheduler, batch, *, prior_requests=(), before=None, peer_context=None
