@@ -119,8 +119,8 @@ async fn tokenize(
             let chat = chat_body(messages, body.rest);
             // The ids chat would send, from the lowered path where chat takes it.
             let bytes = serde_json::to_vec(&chat).expect("JSON values serialize");
-            if let Some(ids) = lowered::prompt_ids(&state, bytes).await {
-                return Json(one(ids.into_iter().map(i64::from).collect())).into_response();
+            if let Some(ids) = lowered::prompt_ids(&state, bytes.into()).await {
+                return Json(one(ids)).into_response();
             }
             let rendered = match render_chat_prompt(&state, chat) {
                 Ok(rendered) => rendered,

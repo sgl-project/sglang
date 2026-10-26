@@ -186,7 +186,8 @@ async fn chat_completions(
         &state.server_args.default_chat_template_kwargs,
     );
     // `ReasoningParser`: a continued assistant turn's text is its previous content.
-    let previous_content = (raw["continue_final_message"] == true)
+    let previous_content = sglang_processor::continues_final_message(&raw)
+        .unwrap_or(false)
         .then(|| raw["messages"].as_array()?.last())
         .flatten()
         // Roles are compared lowercased, as Pydantic normalizes them.

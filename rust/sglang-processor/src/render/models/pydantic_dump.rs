@@ -5,27 +5,29 @@ use serde_json::{Map, Value, json};
 
 use super::schema_types::normalize_json_schema_types;
 
-/// The `continue_final_message` prefix, taken off a final assistant turn with
-/// text content; without the flag that turn renders as a user turn.
-pub(super) fn split_continuation(
-    messages: &mut Vec<Value>,
-    request: &Value,
-) -> Result<String, String> {
+/// The request's `continue_final_message`, coerced as pydantic's `bool`.
+pub fn continues_final_message(request: &Value) -> Result<bool, String> {
+    request
+        .get("continue_final_message")
+        .map_or(Ok(false), pydantic_bool)
+}
+
+/// `_handle_last_assistant_message`: the `continue_final_message` prefix, taken
+/// off a final assistant turn with text content; without the flag that turn
+/// renders as a user turn.
+pub(crate) fn split_continuation(messages: &mut Vec<Value>, continuing: bool) -> String {
     let Some(last) = messages.last_mut().filter(|m| m["role"] == "assistant") else {
-        return Ok(String::new());
+        return String::new();
     };
     let Some(content) = last["content"].as_str().map(str::to_owned) else {
-        return Ok(String::new());
+        return String::new();
     };
-    if request
-        .get("continue_final_message")
-        .map_or(Ok(false), pydantic_bool)?
-    {
+    if continuing {
         messages.pop();
-        return Ok(content);
+        return content;
     }
     *last = json!({"role": "user", "content": content});
-    Ok(String::new())
+    String::new()
 }
 
 /// The pydantic dump SGLang renders: roles lowercased, unknown and null fields

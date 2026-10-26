@@ -20,7 +20,7 @@ mod thinking;
 
 use self::legacy::LegacyFormatter;
 pub use self::loader::load_chat_formatter;
-pub use self::models::DeepSeekTokenizer;
+pub use self::models::{DeepSeekTokenizer, continues_final_message};
 use self::models::{
     deep_sort, deepseek_v4_thinking, encode_tools_to_typescript, is_glm53, is_qwen38,
     render_deepseek_v4, render_glm53, render_kimi_k3, render_qwen38, takes_content_parts,

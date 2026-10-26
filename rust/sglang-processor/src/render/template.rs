@@ -8,16 +8,16 @@ use dynamo_protocols::types::{ChatCompletionRequestMessage, CreateChatCompletion
 use dynamo_renderer::RenderedPrompt;
 use serde_json::{Value, json};
 
-use super::models::{function_dump, pydantic_bool};
+use super::models::{continues_final_message, function_dump, pydantic_bool, split_continuation};
 use super::{
     ChatFormatter, TemplateArgsRequest, TemplateError, requested_effort, requested_thinking,
 };
 
 /// What SGLang's chat layer reads off a raw chat body (not re-validated) for its template.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct TemplateArgs {
     kwargs: HashMap<String, Value>,
-    continuing: bool,
+    continuing: Result<bool, String>,
     tools: Option<Value>,
 }
 
@@ -45,7 +45,7 @@ impl TemplateArgs {
         }
         Self {
             kwargs,
-            continuing: body["continue_final_message"] == true,
+            continuing: continues_final_message(body),
             tools: jinja_tools(body),
         }
     }
@@ -59,11 +59,15 @@ impl ChatFormatter {
         request: &CreateChatCompletionRequest,
         args: &TemplateArgs,
     ) -> Result<(RenderedPrompt, String), TemplateError> {
+        let continuing = args
+            .continuing
+            .clone()
+            .map_err(|message| TemplateError::Renderer { message })?;
         let (messages, continuation) = match self {
             ChatFormatter::Legacy(_) => None,
             // SGLang's K3 encoder splits a trailing assistant turn off only to continue it.
-            ChatFormatter::KimiK3 if !args.continuing => None,
-            _ => last_assistant_message(request, args.continuing),
+            ChatFormatter::KimiK3 if !continuing => None,
+            _ => last_assistant_message(request, continuing)?,
         }
         .unzip();
         let jinja = matches!(
@@ -113,33 +117,34 @@ fn tool_model_dump(tool: &Value) -> Option<Value> {
     Some(json!({"type": kind, "function": function_dump(tool).ok()?, "defer_loading": defer}))
 }
 
-/// Python's `_handle_last_assistant_message`: a trailing assistant message's text
-/// is the continuation under `continue_final_message`, else a user turn.
+/// [`split_continuation`] over the request's messages when the last is an
+/// assistant turn, its null content first set to "" as `_process_messages` does.
 fn last_assistant_message(
     request: &CreateChatCompletionRequest,
     continuing: bool,
-) -> Option<(minijinja::Value, String)> {
+) -> Result<Option<(minijinja::Value, String)>, TemplateError> {
     if !matches!(
         request.messages.last(),
         Some(ChatCompletionRequestMessage::Assistant(_))
     ) {
-        return None;
+        return Ok(None);
     }
-    let mut messages = serde_json::to_value(&request.messages).ok()?;
-    let list = messages.as_array_mut()?;
-    // `_process_messages` first sets a null content to "".
-    let content = match &list.last()?["content"] {
-        Value::Null => String::new(),
-        content => content.as_str()?.to_owned(),
+    let Ok(Value::Array(mut messages)) = serde_json::to_value(&request.messages) else {
+        return Ok(None);
     };
-    let prefix = if continuing {
-        list.pop();
-        content
-    } else {
-        *list.last_mut()? = serde_json::json!({"role": "user", "content": content});
-        String::new()
-    };
-    Some((minijinja::Value::from_serialize(&messages), prefix))
+    if let Some(content) = messages.last_mut().map(|last| &mut last["content"])
+        && content.is_null()
+    {
+        *content = "".into();
+    }
+    let prefix = split_continuation(&mut messages, continuing);
+    // `apply_chat_template` fails on an empty conversation.
+    if messages.is_empty() {
+        return Err(TemplateError::Renderer {
+            message: "no messages to render".into(),
+        });
+    }
+    Ok(Some((minijinja::Value::from_serialize(&messages), prefix)))
 }
 
 #[cfg(test)]
@@ -178,9 +183,12 @@ mod tests {
              {% if add_generation_prompt %}<assistant>{% endif %}",
         );
         let none = HashMap::new();
-        let body = json!({"messages": trailing("Hel".into()), "continue_final_message": true});
-        let expected = ("<user>Hi<assistant>".into(), "Hel".into());
-        assert_eq!(render(&formatter, body, &none), expected);
+        // pydantic's lax `bool`, as Python's request model reads the flag.
+        for flag in [json!(true), json!(1), json!("true")] {
+            let body = json!({"messages": trailing("Hel".into()), "continue_final_message": flag});
+            let expected = ("<user>Hi<assistant>".into(), "Hel".into());
+            assert_eq!(render(&formatter, body, &none), expected);
+        }
         let body = json!({"messages": trailing("Hel".into())});
         let expected = ("<user>Hi<user>Hel<assistant>".into(), String::new());
         assert_eq!(render(&formatter, body, &none), expected);
@@ -191,6 +199,16 @@ mod tests {
             json!([{"id": "c", "type": "function", "function": {"name": "f", "arguments": "{}"}}]);
         let (prompt, _) = render(&formatter, json!({"messages": messages}), &none);
         assert_eq!(prompt, "<user>Hi<user><assistant>");
+
+        // Continuing the only turn leaves nothing for `apply_chat_template`.
+        let body = json!({
+            "model": "m",
+            "messages": [{"role": "assistant", "content": "Hel"}],
+            "continue_final_message": true,
+        });
+        let request = serde_json::from_value(body.clone()).unwrap();
+        let args = TemplateArgs::new(&body, &none);
+        assert!(formatter.render_template(&request, &args).is_err());
     }
 
     /// A Jinja template sees the tools as Python's `Tool.model_dump()`, not as sent.

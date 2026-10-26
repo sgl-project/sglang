@@ -163,31 +163,7 @@ pub(super) async fn chat(
     let sglext_ids = ["x-sglext-return-input-ids", "x-sglext-return-output-ids"]
         .into_iter()
         .any(|name| header(name).as_deref() == Some("1"));
-    let (lowering, body) = (state.clone(), body.clone());
-    // Rendering and tokenizing are CPU work, kept off the async workers.
-    let (generate, mut responder) = tokio::task::spawn_blocking(move || {
-        let openai = lowering.openai_chat.as_ref()?;
-        let formatter = lowering.chat_formatter.as_ref()?;
-        let headers = OpenAiHeaders {
-            routing_key: routing_key.as_deref(),
-            custom_labels: None,
-            sglext_ids,
-        };
-        let defaults = &lowering.server_args.default_chat_template_kwargs;
-        let render = |request: &Value| openai.render(formatter, request, defaults);
-        lower_chat(
-            &body,
-            &headers,
-            &openai.settings,
-            &openai.model,
-            render,
-            Some(openai.pieces.clone()),
-        )
-        .ok()
-    })
-    .await
-    .ok()??;
-    let mut generate = serde_json::to_value(generate).expect("api.v1 types serialize to JSON");
+    let (mut generate, mut responder) = lower(state, body.clone(), routing_key, sglext_ids).await?;
 
     let stream = generate["stream"] == true;
     if let Err(error) = copy_prompt_per_choice(&mut generate) {
@@ -311,18 +287,35 @@ fn stream_data(responder: &mut ChatResponder, data: &str) -> Result<Vec<String>,
 
 /// The prompt ids lowered chat would send for a chat `body`, or `None` where
 /// chat leaves the request to the typed handler.
-pub(super) async fn prompt_ids(state: &Arc<AppState>, body: Vec<u8>) -> Option<Vec<u32>> {
+pub(super) async fn prompt_ids(state: &Arc<AppState>, body: Bytes) -> Option<Vec<i64>> {
+    let (generate, _) = lower(state, body, None, false).await?;
+    generate["input_ids"]
+        .as_array()?
+        .iter()
+        .map(Value::as_i64)
+        .collect()
+}
+
+/// [`lower_chat`] with this server's processor, as JSON, under the request's
+/// routing key and sglext-ids header.
+async fn lower(
+    state: &Arc<AppState>,
+    body: Bytes,
+    routing_key: Option<String>,
+    sglext_ids: bool,
+) -> Option<(Value, ChatResponder)> {
     let state = state.clone();
-    tokio::task::spawn_blocking(move || {
+    // Rendering and tokenizing are CPU work, kept off the async workers.
+    let (generate, responder) = tokio::task::spawn_blocking(move || {
         let openai = state.openai_chat.as_ref()?;
         let formatter = state.chat_formatter.as_ref()?;
-        let defaults = &state.server_args.default_chat_template_kwargs;
-        let mut ids = None;
-        let render = |request: &Value| {
-            ids = openai.render(formatter, request, defaults);
-            ids.clone()
+        let headers = OpenAiHeaders {
+            routing_key: routing_key.as_deref(),
+            custom_labels: None,
+            sglext_ids,
         };
-        let headers = OpenAiHeaders::default();
+        let defaults = &state.server_args.default_chat_template_kwargs;
+        let render = |request: &Value| openai.render(formatter, request, defaults);
         lower_chat(
             &body,
             &headers,
@@ -331,11 +324,12 @@ pub(super) async fn prompt_ids(state: &Arc<AppState>, body: Vec<u8>) -> Option<V
             render,
             Some(openai.pieces.clone()),
         )
-        .ok()?;
-        ids
+        .ok()
     })
     .await
-    .ok()?
+    .ok()??;
+    let generate = serde_json::to_value(generate).expect("api.v1 types serialize to JSON");
+    Some((generate, responder))
 }
 
 /// A prompt's fields whose list form is repeated with it across `n` choices.
@@ -574,7 +568,11 @@ mod tests {
     /// event under that status, then the stream's end, not a unary 400.
     #[tokio::test]
     async fn streamed_abort_keeps_its_status() {
-        for (status, name) in [(503, "SERVICE_UNAVAILABLE"), (400, "BAD_REQUEST")] {
+        for (status, name) in [
+            (503, "SERVICE_UNAVAILABLE"),
+            (400, "BAD_REQUEST"),
+            (412, "PRECONDITION_FAILED"),
+        ] {
             let app = lowered_state(move |rid| {
                 let mut item = chunk(rid, "", true);
                 let ResponseItem::Done(output) = &mut item else {
@@ -690,7 +688,13 @@ mod tests {
         let app = lowered_state(|_| ResponseItem::Error(Error::Internal("boom".into())));
         let response = post_json(app, "/v1/chat/completions", body).await;
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(body_json(response).await["type"], "InternalServerError");
+        let value = body_json(response).await;
+        assert_eq!(
+            (value["type"].as_str(), value["code"].as_u64()),
+            (Some("InternalServerError"), Some(500))
+        );
+        let message = value["message"].as_str().unwrap();
+        assert!(message.starts_with("Internal server error: "), "{value}");
     }
 
     /// A template's detected toggle decides reasoning before the parser's
@@ -782,29 +786,6 @@ mod tests {
             let text = String::from_utf8(bytes.to_vec()).unwrap();
             assert!(text.contains(r#""logprob":-0.5"#), "{text}");
         }
-    }
-
-    /// A stream's own failure before its first frame answers as Python's generic
-    /// exception does.
-    #[tokio::test]
-    async fn streamed_internal_error_keeps_its_status() {
-        let app = lowered_state(|_| ResponseItem::Error(Error::Internal("boom".into())));
-        let messages = json!([{"role": "user", "content": "hi"}]);
-        let body = json!({"model": "model", "messages": messages, "stream": true});
-        let response = post_json(app, "/v1/chat/completions", body).await;
-        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        let value = body_json(response).await;
-        assert_eq!(
-            (value["type"].as_str(), value["code"].as_u64()),
-            (Some("InternalServerError"), Some(500))
-        );
-        assert!(
-            value["message"]
-                .as_str()
-                .unwrap()
-                .starts_with("Internal server error: "),
-            "{value}"
-        );
     }
 
     /// A served name with a colon, requested exactly, is not a LoRA adapter.
