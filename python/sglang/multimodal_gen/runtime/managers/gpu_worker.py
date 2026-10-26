@@ -327,6 +327,10 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         self._auto_residency_warmup_records: list[WarmupMemoryRecord] = []
         self._update_lora_metrics()
 
+        # settle the import/model-loading GC debt before serving requests, rather
+        # than letting the first denoise step trigger a full-heap collection
+        gc.collect()
+
     def release_realtime_session(self, session_id: str) -> OutputBatch:
         """release the session of a realtime connection"""
         if not session_id:
