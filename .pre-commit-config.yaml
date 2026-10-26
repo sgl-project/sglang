@@ -70,6 +70,12 @@ repos:
           - '--extra-keys=metadata.kernelspec metadata.language_info.version'
   - repo: local
     hooks:
+      - id: forbid-test-srt-path
+        name: forbid test/srt/ (use test/registered/ or test/manual/)
+        entry: >-
+          test/srt/ is retired. Move these tests under test/registered/ or test/manual/ instead.
+        language: fail
+        files: ^test/srt/
       - id: forbid-docs-new-path
         name: forbid docs_new/ (renamed to docs/)
         # docs_new/ was renamed to docs/ in #32123. `language: fail` fires only

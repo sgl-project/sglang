@@ -172,7 +172,7 @@ def _count_active_replicated_modes(
     )
 
 
-def _prepare_sdpa_mask(
+def prepare_sdpa_mask(
     mask: torch.Tensor, *, dtype: torch.dtype, device: torch.device
 ) -> torch.Tensor:
     mask = mask.to(device=device)
@@ -757,20 +757,7 @@ class LocalAttention(nn.Module):
             q_ = q.transpose(1, 2)
             k_ = k.transpose(1, 2)
             v_ = v.transpose(1, 2)
-
-            if torch.is_floating_point(attn_mask):
-                mask = attn_mask.to(dtype=q_.dtype, device=q_.device)
-                if mask.dim() == 2:
-                    mask = mask[:, None, None, :]
-                elif mask.dim() == 3:
-                    mask = mask[:, None, :, :]
-            else:
-                mask = attn_mask.to(dtype=q_.dtype, device=q_.device)
-                if mask.dim() == 2:
-                    mask = mask[:, None, None, :]
-                elif mask.dim() == 3:
-                    mask = mask[:, None, :, :]
-                mask = (mask - 1.0) * torch.finfo(q_.dtype).max
+            mask = prepare_sdpa_mask(attn_mask, dtype=q_.dtype, device=q_.device)
 
             if q_.shape[1] != k_.shape[1]:
                 repeat_factor = q_.shape[1] // k_.shape[1]
@@ -798,15 +785,6 @@ class LocalAttention(nn.Module):
 
         output = self.attn_impl.forward(q, k, v, attn_metadata=ctx_attn_metadata)
         return output
-
-
-@functools.lru_cache(maxsize=64)
-def _cu_seqlens_on_device(
-    bounds: tuple[int, ...], device: torch.device
-) -> torch.Tensor:
-    # Bounds repeat for every block and step; a fresh pageable H2D copy per call
-    # blocks the host until the stream drains. Callers must not mutate the result.
-    return torch.tensor(bounds, dtype=torch.int32, device=device)
 
 
 class USPAttention(nn.Module):
@@ -1003,7 +981,7 @@ class USPAttention(nn.Module):
                 bounds = [0]
                 for length in seq_lens:
                     bounds.append(bounds[-1] + int(length))
-                cu_seqlens = _cu_seqlens_on_device(tuple(bounds), q.device)
+                cu_seqlens = _fa_backend.cu_seqlens_on_device(tuple(bounds), q.device)
                 out = self.attn_impl.forward_varlen(
                     q[0],
                     k[0],
@@ -1269,7 +1247,7 @@ class USPAttention(nn.Module):
                 q_ = q.transpose(1, 2)
                 k_ = k.transpose(1, 2)
                 v_ = v.transpose(1, 2)
-                mask = _prepare_sdpa_mask(attn_mask, dtype=q_.dtype, device=q_.device)
+                mask = prepare_sdpa_mask(attn_mask, dtype=q_.dtype, device=q_.device)
                 sdpa_context = (
                     sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS, set_priority=True)
                     if self.allow_cudnn_sdp and q_.device.type == "cuda"
@@ -1448,7 +1426,7 @@ class USPAttention(nn.Module):
                 q_ = q.transpose(1, 2)
                 k_ = k.transpose(1, 2)
                 v_ = v.transpose(1, 2)
-                mask = _prepare_sdpa_mask(
+                mask = prepare_sdpa_mask(
                     gathered_mask, dtype=q_.dtype, device=q_.device
                 )
                 sdpa_context = (
@@ -1537,7 +1515,19 @@ class USPAttention(nn.Module):
                 out = self.attn_impl.forward(qs, ks, vs, ctx_attn_metadata)
                 return _usp_output_all_to_all(out, head_dim=2)
 
-            out = self._pipelined_ulysses(q, k, v, attend, sequential, layout="dense")
+            out = self._pipelined_ulysses(
+                q,
+                k,
+                v,
+                attend,
+                sequential,
+                layout="dense",
+                attend_into=lambda q_group, k_group, v_group, out: (
+                    self.attn_impl.forward_into(
+                        q_group, k_group, v_group, out, ctx_attn_metadata
+                    )
+                ),
+            )
             if out is not None:
                 return out
 
@@ -1596,6 +1586,8 @@ class USPAttention(nn.Module):
         layout: str,
         replicated=(None, None, None),
         replicated_first: bool = True,
+        attend_into=None,
+        fill_all=None,
     ) -> torch.Tensor | None:
         """Ulysses attention with the exchange pipelined over head groups.
 
@@ -1656,7 +1648,7 @@ class USPAttention(nn.Module):
             v,
             attend,
             groups,
-            sequential=reference,
+            sequential=None if sequential is None else reference,
             signature=(
                 type(self.attn_impl).__name__,
                 self.causal,
@@ -1665,10 +1657,51 @@ class USPAttention(nn.Module):
             ),
             replicated=replicated,
             replicated_first=replicated_first,
+            attend_into=attend_into,
+            fill_all=fill_all,
         )
         if out is None:
             self._pipeline_declined.add(key)
         return out
+
+    def forward_qk_filled(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, fill_all
+    ) -> torch.Tensor | None:
+        """Dense Ulysses attention whose q/k exchange blocks ``fill_all`` writes.
+
+        ``q``/``k`` are the caller's raw projections: ``fill_all`` (see
+        ``ulysses_pipelined_attention``) writes what ``forward`` would read into
+        every exchange block, this rank's own slot rows included, so no own-row
+        copy runs. Returns None, having written nothing, when the call would not
+        take the pipelined dense path; the caller then runs ``forward`` itself.
+        """
+        if (
+            self.skip_sequence_parallel
+            or get_sequence_parallel_world_size() == 1
+            or get_ring_parallel_world_size() > 1
+            or self.enable_packed_qkv_input_a2a
+            or get_request_skip_softmax_params() is not None
+        ):
+            return None
+        ctx_attn_metadata = get_forward_context().attn_metadata
+        return self._pipelined_ulysses(
+            q,
+            k,
+            v,
+            lambda q_group, k_group, v_group: self.attn_impl.forward(
+                q_group, k_group, v_group, ctx_attn_metadata
+            ),
+            # no first-sight reference: the pipelined backends attend a head group
+            # exactly as inside the full call (PIPELINED_ATTENTION_BACKENDS)
+            None,
+            layout="dense-filled",
+            attend_into=lambda q_group, k_group, v_group, out: (
+                self.attn_impl.forward_into(
+                    q_group, k_group, v_group, out, ctx_attn_metadata
+                )
+            ),
+            fill_all=fill_all,
+        )
 
     def _forward_ring_tail_pad(
         self,
@@ -2114,7 +2147,7 @@ class USPAttention(nn.Module):
         q_ = q.transpose(1, 2)
         k_ = k.transpose(1, 2)
         v_ = v.transpose(1, 2)
-        mask = _prepare_sdpa_mask(attn_mask, dtype=q_.dtype, device=q_.device)
+        mask = prepare_sdpa_mask(attn_mask, dtype=q_.dtype, device=q_.device)
         sdpa_context = (
             sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS, set_priority=True)
             if self.allow_cudnn_sdp and q_.device.type == "cuda"

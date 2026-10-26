@@ -19,7 +19,7 @@ from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 def _make_processor(case, server_mode: str = "full") -> SchedulerBatchResultProcessor:
@@ -38,7 +38,9 @@ def _make_processor(case, server_mode: str = "full") -> SchedulerBatchResultProc
         disaggregation_mode=None,
         enable_overlap=False,
         enable_overlap_mlx=False,
-        model_config=SimpleNamespace(think_end_ids=None),
+        model_config=SimpleNamespace(
+            think_end_ids=None, self_opened_think_start_ids=None
+        ),
         token_to_kv_pool_allocator=Mock(),
         tree_cache=None,
         hisparse_coordinator=None,
