@@ -1210,6 +1210,26 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
 
+    def get_hybrid_pool_buffer(self):
+        """Every physical host buffer one logical storage page spans.
+
+        ``get_page_buffer_meta`` emits one pointer per physical buffer and
+        Mooncake packs them into a single object per page, so each of them has
+        to be registered with the transfer engine.  Registering only
+        ``kv_buffer`` leaves the RoPE mirror and the DSA indexer buffers
+        unregistered, which forces those segments onto a copy fallback (and
+        fails outright on URAN/memfabric transfers).
+        """
+        buffers = [self.kv_buffer]
+        if self.layout == "page_first_kv_split":
+            # FP8 DSA packs V into K; the host V mirror holds no valid data.
+            if not getattr(self, "dsa_kv_cache_store_fp8", False):
+                buffers.append(getattr(self, "v_buffer", None))
+            # Indexer buffers exist only for physical Indexer layers.
+            buffers.append(getattr(self, "index_k_buffer", None))
+            buffers.append(getattr(self, "index_k_scale_buffer", None))
+        return [buf for buf in buffers if buf is not None and buf.numel() > 0]
+
     def get_page_buffer_meta(self, indices):
         """Return local buffer pointers and byte sizes for logical storage pages."""
         if self.dcp_size > 1 and self.layout == "page_first_kv_split":
