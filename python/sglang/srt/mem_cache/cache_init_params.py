@@ -10,6 +10,7 @@ from sglang.srt.mem_cache.events import KvEventLoraNames
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+    from sglang.srt.mem_cache.prefill_cost_model import PrefillCostModel
     from sglang.srt.mem_cache.unified_cache.components import ComponentType
     from sglang.srt.mem_cache.unified_cache.components.base import (
         TreeComponent,
@@ -32,6 +33,10 @@ class CacheInitParams:
     # Keyword arguments for the eviction policy's constructor; see the strategy
     # classes in evict_policy.py for what each policy accepts.
     eviction_policy_config: Optional[dict[str, Any]] = None
+
+    # Prefill FLOPs per recurrent-state checkpoint, read by the marconi policy;
+    # see sglang.srt.mem_cache.prefill_cost_model.
+    prefill_cost_model: Optional[PrefillCostModel] = None
 
     enable_metrics: bool = False
     enable_kv_cache_events: bool = False

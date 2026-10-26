@@ -32,7 +32,9 @@ class Memory(msgspec.Struct):
                 "lower-priority requests first, and 'tlru' stands for "
                 "Tail-Optimized LRU (arXiv:2510.15152), which evicts the part of "
                 "a conversation that cannot affect tail TTFT before falling back "
-                "to LRU. See "
+                "to LRU, and 'marconi' (arXiv:2411.19379) evicts the recurrent "
+                "state checkpoints of hybrid Mamba/GDN/KDA models by recency and "
+                "prefill FLOPs saved per state byte. See "
                 "https://docs.sglang.io/docs/advanced_features/radix_eviction_policy "
                 "for what each policy optimizes for."
             ),
@@ -52,7 +54,9 @@ class Memory(msgspec.Struct):
                 "protected_threshold (int, default 2), e.g. "
                 "'{\"protected_threshold\": 4}'; 'tlru' takes threshold and "
                 "next_prompt_estimate (ints, tokens), e.g. "
-                '\'{"threshold": 4096, "next_prompt_estimate": 512}\'. An '
+                '\'{"threshold": 4096, "next_prompt_estimate": 512}\'; '
+                "'marconi' takes alpha (float, default 1.0), the weight of FLOP "
+                "efficiency against recency. An "
                 "unrecognized key fails at startup, naming the key and the "
                 "policy. See "
                 "https://docs.sglang.io/docs/advanced_features/radix_eviction_policy#policy-parameters "

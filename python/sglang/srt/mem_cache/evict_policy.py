@@ -81,6 +81,24 @@ class TLRUStrategy(EvictionStrategy):
         return (-1 if tel_safe else 0, node.last_access_time)
 
 
+class MarconiStrategy(EvictionStrategy):
+    """Marconi eviction for hybrid recurrent models (Pan et al., arXiv:2411.19379).
+
+    Recurrent-state checkpoints of the MAMBA component are ranked by
+    recency + alpha * (prefill FLOPs saved per state byte), both min-max
+    normalized over the candidates; see MambaComponent for the walk and
+    sglang.srt.mem_cache.prefill_cost_model for the FLOPs. alpha = 0 keeps
+    the recency order. The priority below is what every other component
+    (Full KV, SWA) sees, so they keep plain LRU.
+    """
+
+    def __init__(self, alpha: float = 1.0):
+        self.alpha = alpha
+
+    def get_priority(self, node: TreeNode) -> float:
+        return node.last_access_time
+
+
 class SLRUStrategy(EvictionStrategy):
     def __init__(self, protected_threshold: int = 2):
         self.protected_threshold = protected_threshold

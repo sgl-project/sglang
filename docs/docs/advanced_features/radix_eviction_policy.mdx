@@ -25,6 +25,7 @@ Select one with `--radix-eviction-policy`. All of them fall back to least-recent
 | `slru` | Prefixes still in the probationary segment, then the least recent within a segment. | Like `lfu`, but you want a hard floor on how much a one-off prefix can displace a proven one. See [`slru` parameters](#slru-parameters). |
 | `priority` | The prefix belonging to the lowest-priority request, then the least recent. | You run [priority scheduling](/docs/advanced_features/server_arguments) and want cache retention to follow the same ranking as admission. |
 | `tlru` | The tail of a conversation beyond what its next prefill needs to meet the TTFT budget ("TEL-safe" tokens), then the least recent. | Agentic / multi-turn workloads where tail TTFT matters more than raw hit rate. See [`tlru` parameters](#tlru-parameters). Requires the unified radix cache (the default tree). |
+| `marconi` | For the recurrent-state checkpoints of a hybrid model: the checkpoint with the lowest recency plus `alpha` × prefill FLOPs saved per state byte. KV follows `lru`. | Hybrid Mamba2 / GDN / KDA models whose state pool, not KV, limits the cache, e.g. agentic or multi-turn traffic on long contexts. See [`marconi` parameters](#marconi-parameters). |
 
 Notes on the scoring inputs:
 
@@ -52,7 +53,7 @@ TypeError: SLRUStrategy.__init__() got an unexpected keyword argument 'protected
 
 ### Policy parameters
 
-`slru` and `tlru` take parameters. `lru`, `lfu`, and `priority` take none, so `--radix-eviction-policy-config` has no effect with them and any key is an error.
+`slru`, `tlru`, and `marconi` take parameters. `lru`, `lfu`, and `priority` take none, so `--radix-eviction-policy-config` has no effect with them and any key is an error.
 
 #### `slru` parameters
 
@@ -81,6 +82,30 @@ python3 -m sglang.launch_server \
   --radix-eviction-policy tlru \
   --radix-eviction-policy-config '{"threshold": 4096, "next_prompt_estimate": 512}'
 ```
+
+#### `marconi` parameters
+
+`marconi` ([Marconi, arXiv:2411.19379](https://arxiv.org/abs/2411.19379)) applies to hybrid recurrent models (Mamba2/SSD such as Nemotron-H and Falcon-H1, Gated DeltaNet such as Qwen3-Next and Qwen3.5, KDA such as Kimi Linear), whose cache holds one fixed-size recurrent state per checkpoint next to the KV of the full-attention layers. A state checkpoint can only resume a request at exactly its depth, and every checkpoint costs the same bytes, so a short one shared by few requests and a long one that skips most of a 100k-token prefill compete for the same slot. `marconi` scores each checkpoint as
+
+```
+utility = norm(last access time) + alpha * norm(prefill FLOPs saved / state bytes)
+```
+
+with both terms min-max normalized over the candidates, and evicts the lowest first. The saving is measured against the nearest shallower checkpoint that still holds a state, since that is where a later hit would resume; the FLOPs come from the model (2 per active parameter, the recurrence and short convolution of each recurrent layer, and a quadratic term for the full-attention layers). Checkpoints with two or more children are branch points and go last. Full-attention KV is still evicted in `lru` order.
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `alpha` | float | `1.0` | Weight of FLOP efficiency against recency. `0` keeps the recency order. |
+
+```bash Command
+python3 -m sglang.launch_server \
+  --model-path Qwen/Qwen3.5-9B \
+  --mamba-radix-cache-strategy extra_buffer \
+  --radix-eviction-policy marconi \
+  --radix-eviction-policy-config '{"alpha": 1.0}'
+```
+
+`marconi` runs on the Python tree core (it is selected automatically) and is not yet supported with `--enable-session-radix-cache` or `--enable-hierarchical-cache`.
 
 ## Which policy to pick
 
