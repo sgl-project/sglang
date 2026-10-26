@@ -826,10 +826,8 @@ def _cp_merge_kernel(
 
 def _cp_split_config(num_reqs: int) -> tuple[int, int, int, bool]:
     """`_split_config` for a rank's quarter of the blocks with every head's rows in
-    one tile. The 32-row tile fits one program per CU, so up to 96 requests one wave of
-    256 short splits; past that 256 programs leave CUs idle and two waves of longer
-    splits win (measured on MI355X at 8-128 requests and 110K context, over index-K
-    pools larger than the MALL)."""
+    one tile: one wave of short splits up to 96 requests, then two waves of longer
+    splits, which leave fewer CUs idle (measured on MI350X)."""
     if num_reqs <= 96:
         return 256, 16, 4, num_reqs <= 64
     return max(512, 2 * num_reqs), 8, 16, False
