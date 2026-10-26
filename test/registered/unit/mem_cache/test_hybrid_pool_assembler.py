@@ -369,6 +369,7 @@ class TestDraftSidecarPoolDispatch(CustomTestCase):
             cache_controller=SimpleNamespace(
                 mem_pool_host=SimpleNamespace(size=100, logical_size=800),
                 page_size=512,
+                transfer_layer_id_max=1,
             )
         )
         # The layout comes from the published configuration.
@@ -417,6 +418,7 @@ class TestDraftSidecarPoolDispatch(CustomTestCase):
             cache_controller=SimpleNamespace(
                 mem_pool_host=SimpleNamespace(size=100, logical_size=800),
                 page_size=512,
+                transfer_layer_id_max=1,
             )
         )
         from sglang.srt.runtime_context import publish, reset_context
