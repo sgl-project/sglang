@@ -509,6 +509,7 @@ class QSAIndexer(MultiPlatformOp):
         query_positions: torch.Tensor,
         sequence_lengths: torch.Tensor,
         defer_expansion: bool = False,
+        rows_per_request: int = 1,
     ) -> torch.Tensor:
         # fast_topk (k = 512) writes 0..length-1 for rows that fit k without reading
         # their scores, and never reads past a row's length.
@@ -524,6 +525,8 @@ class QSAIndexer(MultiPlatformOp):
             compressed_lengths,
             max_model_len,
             min_scored_len=self.block_topk if use_fast_topk else 0,
+            rows_per_request=rows_per_request,
+            num_query_heads=self.index_n_heads,
         )
         if use_fast_topk:
             # Decode rows start at zero, so compressed lengths double as row lengths;
@@ -746,6 +749,11 @@ class QSAIndexer(MultiPlatformOp):
                 logical_positions,
                 indexer_metadata.get_seqlens_int32(),
                 defer_expansion=q.is_cuda and indexer_metadata.defer_block_expansion,
+                rows_per_request=(
+                    int(forward_batch.spec_info.draft_token_num)
+                    if is_target_verify and indexer_metadata.is_cuda_graph
+                    else 1
+                ),
             )
 
         compressed_keys, row_starts, row_ends, sequence_lengths = (
