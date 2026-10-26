@@ -112,6 +112,7 @@ class NpuExpertDistributionGatherer(distribution._SelectExpertsSinglePassGathere
         self._route_offsets = [0] * self._data.shape[0]
         self._batch_collected = False
         self._has_batched_routes = False
+        self._direct_counting = False
         logger.info("[NPU EPLB batch statistics] capacity=%d routes/layer", capacity)
 
     def on_graph_capture_forward_start(self) -> None:
@@ -138,6 +139,8 @@ class NpuExpertDistributionGatherer(distribution._SelectExpertsSinglePassGathere
         count = topk_ids.numel()
         if count == 0:
             return
+        if self._direct_counting:
+            return super().on_select_experts(layer_idx, topk_ids)
         start = self._route_offsets[layer_idx]
         end = start + count
         if end > self._batched_routes.shape[1]:
@@ -192,3 +195,17 @@ def on_graph_replay_forward_start(state, recorder=None):
         return
     for key, gatherer_state in state.items():
         gatherers[key].on_graph_replay_forward_start(gatherer_state)
+
+
+@contextmanager
+def direct_route_counting():
+    """Capture prefill counts directly, without replay-time Python flags."""
+    gatherers = _get_npu_gatherers().values()
+    previous = [(gatherer, gatherer._direct_counting) for gatherer in gatherers]
+    try:
+        for gatherer, _ in previous:
+            gatherer._direct_counting = True
+        yield
+    finally:
+        for gatherer, enabled in previous:
+            gatherer._direct_counting = enabled

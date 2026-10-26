@@ -24,9 +24,14 @@ tensors return before creating a buffer view or issuing a copy.
 Graphs without buffered routes omit inactive capture flags, letting replay skip
 the statistics-state restoration hook.
 
-Six production files differ from the base: three NPU files and the shared
-recorder factory, weight updater, and ModelRunner entry points. The shared
+Eight production files differ from the base: four NPU files and the shared
+recorder, weight updater, ModelRunner, and prefill backend factory. The shared
 EPLB manager and decode graph runner are unchanged from the base.
+
+NPU prefill capture temporarily uses direct route counting, so target graphs
+record count updates without depending on replay-time Python batching flags.
+The scope includes warmups and restores the previous policy on exceptions;
+decode retains buffered counting. Draft prefill capture remains isolated.
 
 ## Validation status
 
@@ -55,12 +60,18 @@ Debug workspace bytes describe planned logical tensor storage, excluding
 allocator padding/caching and transient format-conversion allocations. Graph-statistics hooks
 are wired to the NPU full decode backend; other graph modes are not validated.
 
-The added unit tests and manual probes have been moved out of this PR and
-remain available in the [historical test tree](https://github.com/AkiYangDev/sglang/tree/46393a1ce8359fc226704702b14a157dfa77c7ee/test).
-Only a one-line fixture adjustment remains in the existing NPU graph-backend
-test: its manually registered graph also receives an empty EPLB state.
-No new test files are included; the copy probes and 16-rank checks ran outside
-the PR. Earlier cleanup steps did not execute their archived tests.
+CPU regression tests now cover direct prefill counts, restoration of decode
+batching, nested/exception scopes, and disabled draft recorders. The existing
+NPU backend fixture supplies the model-runner identity and an empty EPLB state.
+These tests require the normal SGLang CPU test environment; they were not run
+locally because the local Python has no PyTorch installation. A separate
+production-method extraction probe with simulated graph operations passed
+prefill replay counting, draft isolation, and policy restoration. This is not
+an actual NPU graph or full-package integration test.
+
+Earlier migration tests and manual probes remain available in the
+[historical test tree](https://github.com/AkiYangDev/sglang/tree/46393a1ce8359fc226704702b14a157dfa77c7ee/test).
+The copy probes and 16-rank checks ran outside the PR.
 
 ## Historical evidence
 

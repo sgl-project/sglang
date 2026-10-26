@@ -1,10 +1,10 @@
-"""Keep draft prefill capture out of target EPLB statistics on NPU.
+"""Use direct target counts and isolate draft capture in NPU prefill graphs.
 
-Preserve the existing Full/Breakable implementations and their configuration;
-this adapter only scopes recording during capture, not prefill graph support.
+Preserve the existing Full/Breakable implementations and their configuration.
 """
 
 from sglang.srt.hardware_backend.npu.eplb import isolate_npu_draft_recording
+from sglang.srt.hardware_backend.npu.eplb_statistics import direct_route_counting
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
     BreakableCudaGraphBackend,
@@ -15,21 +15,22 @@ from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
 from sglang.srt.runtime_context import get_exec
 
 
-class _DraftCaptureIsolation:
+class _PrefillRecording:
     @property
     def is_draft_worker(self):
         return self._cuda_graph_runner.model_runner.is_draft_worker
 
     @isolate_npu_draft_recording
     def capture_one(self, *args, **kwargs):
-        return super().capture_one(*args, **kwargs)
+        with direct_route_counting():
+            return super().capture_one(*args, **kwargs)
 
 
-class _NpuFullPrefillBackend(_DraftCaptureIsolation, FullCudaGraphBackend):
+class _NpuFullPrefillBackend(_PrefillRecording, FullCudaGraphBackend):
     pass
 
 
-class _NpuBreakablePrefillBackend(_DraftCaptureIsolation, BreakableCudaGraphBackend):
+class _NpuBreakablePrefillBackend(_PrefillRecording, BreakableCudaGraphBackend):
     pass
 
 
