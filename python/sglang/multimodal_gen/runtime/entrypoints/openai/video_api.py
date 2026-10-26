@@ -52,6 +52,9 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     save_image_to_path,
     temp_dir_if_disabled,
 )
+from sglang.multimodal_gen.runtime.entrypoints.openai.video_progress import (
+    VIDEO_PROGRESS,
+)
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
@@ -469,6 +472,7 @@ async def _dispatch_job_async(
             },
         )
     finally:
+        VIDEO_PROGRESS.unregister(job_id)
         await resources.aclose()
 
 
@@ -755,6 +759,7 @@ async def create_video(
                 sampling_params=sampling_params,
                 external_trace_header=trace_headers,
             )
+            batch.report_progress = True
             resources.push_async_callback(_cleanup_video_request, batch)
             # Add diffusers_kwargs if provided.
             if req.diffusers_kwargs:
@@ -797,6 +802,10 @@ async def create_video(
         except (TypeError, ValueError) as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
 
+        VIDEO_PROGRESS.register(
+            request_id,
+            num_outputs=max(len(scheduler_batches or ()), batch.num_outputs_per_prompt),
+        )
         # the background job owns cleanup only after request preparation succeeds
         _start_video_job(
             request_id,
