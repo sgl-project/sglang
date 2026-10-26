@@ -34,6 +34,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.ernie4 import Ernie4_5_ForCausalLM, Ernie4DecoderLayer
 from sglang.srt.models.utils import keeps_no_quant_config
+from sglang.srt.platforms import current_platform
 
 
 class Ernie4ModelMTP(nn.Module):
@@ -199,8 +200,8 @@ class Ernie4_5_MoeForCausalLMMTP(nn.Module):
         else:
             del self.lm_head.weight
             self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        current_platform.empty_cache()
+        current_platform.synchronize()
 
 
 EntryClass = [Ernie4_5_MoeForCausalLMMTP]
