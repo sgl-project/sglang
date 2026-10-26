@@ -73,6 +73,21 @@
     "registered/unit/mem_cache/test_minimax_sparse_pool_pd_unit.py",
     "registered/unit/model_executor/test_hisparse_pool_configurator.py"
   ],
+  "mooncake": [
+    "registered/disaggregation/test_disaggregation_basic.py",
+    "registered/hicache/test_hicache_spec_mooncake_storage.py",
+    "registered/hicache/test_hicache_storage_mooncake_backend.py",
+    "registered/unit/disaggregation/test_mooncake_deferred_kv_release.py",
+    "registered/unit/disaggregation/test_mooncake_efa_allocator.py",
+    "registered/unit/disaggregation/test_mooncake_failed_session_probe.py",
+    "registered/unit/disaggregation/test_mooncake_transfer_batching.py",
+    "registered/unit/mem_cache/test_mooncake_group_semantics.py",
+    "registered/unit/mem_cache/test_mooncake_host_allocator.py",
+    "registered/unit/mem_cache/test_mooncake_ssd_offload_path.py",
+    "registered/unit/mem_cache/test_mooncake_standalone_dummy_mamba.py",
+    "registered/unit/mem_cache/test_mooncake_store_config.py",
+    "registered/unit/mem_cache/test_mooncake_tenant_config.py"
+  ],
   "rust-server": [
     "registered/core/test_srt_endpoint.py",
     "registered/vlm/test_rust_native_mm_e2e.py",
