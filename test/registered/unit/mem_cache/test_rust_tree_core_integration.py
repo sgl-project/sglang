@@ -40,6 +40,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
     TreeLock,
+    zero_match_result,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import release_kv_cache
@@ -161,10 +162,16 @@ def _accumulate_step(result, tracker, device_frees, host_frees):
     result.host_frees.clear()
 
 
-def test_match_on_the_empty_tree_returns_no_indices():
-    core = _tree_core()
-    result = core.match_prefix(MatchPrefixParams(key=_key([1, 2, 3])))
-    assert result.device_prefix_len == 0
+@pytest.mark.parametrize("backend", ["python", "rust"])
+def test_match_on_the_empty_tree_returns_no_indices(backend):
+    core = _tree_core(backend, page_size=2)
+    for key in ([], [1], [1, 2, 3]):
+        result = core.match_prefix(MatchPrefixParams(key=_key(key)))
+        assert result.device_prefix_len == 0
+        assert result.last_visited_node_id is None
+        assert result.full_device_match_len is None
+    assert core.empty_match_result.last_visited_node_id is None
+    assert core.empty_match_result.full_device_match_len is None
 
 
 @pytest.mark.parametrize("backend", ["rust", "python"])
@@ -232,14 +239,61 @@ def test_default_backend_constructs_real_rust_cpu_cache(monkeypatch, instance_ba
     cache.tree_core.sanity_check([], [])
 
 
-def test_insert_then_match_back_returns_the_exact_indices():
-    core = _tree_core()
+@pytest.mark.parametrize("backend", ["python", "rust"])
+def test_insert_then_match_back_returns_the_exact_indices(backend):
+    core = _tree_core(backend)
     result = _insert(core, [1, 2, 3], [10, 11, 12])
     assert result.prefix_len == 0
     assert result.cache_actions == []
     matched = core.match_prefix(MatchPrefixParams(key=_key([1, 2, 3])))
     assert result.last_device_node == matched.last_device_node
     assert _path_indices(core, matched.last_device_node).tolist() == [10, 11, 12]
+    assert matched.last_visited_node_id == result.last_device_node
+    assert matched.full_device_match_len is None
+
+
+@pytest.mark.parametrize("backend", ["python", "rust"])
+def test_match_reports_split_prefix_and_zero_match_clears_walk_facts(backend):
+    core = _tree_core(backend)
+    leaf = _insert(core, [1, 2, 3], [10, 11, 12]).last_device_node
+    matched = core.match_prefix(MatchPrefixParams(key=_key([1, 2, 9])))
+    assert matched.last_visited_node_id == matched.best_match_node
+    assert matched.last_visited_node_id != leaf
+    assert matched.device_prefix_len == 2
+    assert _path_indices(core, matched.last_device_node).tolist() == [10, 11]
+    path = core.collect_path_info([leaf])[0]
+    assert path[0].node_id == matched.last_visited_node_id
+    assert path[0].path_end == 2
+
+    cache = SimpleNamespace(
+        supports_prefix_sharing=lambda: True,
+        root_node_handle=core.root_node_handle,
+    )
+    zeroed = zero_match_result(cache, matched._replace(full_device_match_len=2))
+    assert zeroed.last_device_node == core.root_node_handle()
+    assert zeroed.last_visited_node_id is None
+    assert zeroed.full_device_match_len is None
+    core.sanity_check([], [])
+
+
+@pytest.mark.parametrize("backend", ["python", "rust"])
+@pytest.mark.parametrize("hicache", [False, True])
+def test_match_reports_host_only_node_independent_of_device_acceptance(
+    backend, hicache
+):
+    core = _tree_core(backend)
+    if hicache:
+        core.set_hicache_enabled()
+    host = core.insert_host(
+        core.root_node_handle(), _key([1, 2]), torch.tensor([100, 101]), ["h0", "h1"]
+    ).inserted_host_node
+    matched = core.match_prefix(MatchPrefixParams(key=_key([1, 2])))
+    assert matched.last_visited_node_id == host
+    assert matched.last_device_node == core.root_node_handle()
+    assert matched.best_match_node == (host if hicache else core.root_node_handle())
+    assert matched.device_prefix_len == 0
+    assert matched.full_device_match_len is None
+    core.sanity_check([], [])
 
 
 def test_root_node_handle_is_namespace_independent():
@@ -784,11 +838,14 @@ def test_stale_match_finalizer_handles_raise_key_error_without_poisoning_the_cor
     stale_root = core.root_node_handle()
     core.reset()
     live_root = core.root_node_handle()
+    visited = _insert(core, [1], [10]).last_device_node
     result = MatchResult(
         device_prefix_len=0,
         last_device_node=live_root,
         last_host_node=live_root,
         best_match_node=live_root,
+        last_visited_node_id=visited,
+        full_device_match_len=0,
     )
     params = MatchPrefixParams(key=_key([]))
 
@@ -812,6 +869,8 @@ def test_stale_match_finalizer_handles_raise_key_error_without_poisoning_the_cor
         best_value_len=0,
     )
     assert finalized.best_match_node == live_root
+    assert finalized.last_visited_node_id == visited
+    assert finalized.full_device_match_len == 0
 
 
 def test_stale_handle_operations_raise_key_error_without_poisoning_the_core():
@@ -3934,6 +3993,17 @@ def test_swa_match_uses_allocator_layout(backend, ring, hicache, has_swa_host_po
     assert cache.path_device_indices(matched.last_device_node).tolist() == (
         indices[:8].tolist() if ring else []
     )
+    assert matched.last_visited_node_id != cache.tree_core.root_node_handle()
+    assert matched.last_visited_node_id is not None
+    if not ring:
+        assert matched.last_visited_node_id != matched.last_device_node
+    assert (
+        cache.tree_core.collect_path_info([matched.last_visited_node_id])[0][
+            -1
+        ].path_end
+        == 8
+    )
+    assert matched.full_device_match_len is None
 
 
 @pytest.mark.parametrize("backend", ["python", "rust"])
@@ -5541,3 +5611,72 @@ def test_finished_request_prompt_priority_saturates_at_int64_max(priority):
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))
+
+
+def test_load_back_action_tuple_preserves_chunk_order_and_tensor_ownership():
+    binding = mem_cache.RustUnifiedTreeCoreBinding(
+        mem_cache.TreeCoreInitParamsBinding(
+            page_size=1, swa_sliding_window_size=8, enable_hicache=True
+        ),
+        [0, 1],
+    )
+    binding.set_has_swa_host_pool()
+    key = array("q", range(5))
+    prefix = binding.insert(
+        mem_cache.InsertParamsBinding(key=key[:2], value=torch.tensor([10, 11]))
+    ).last_device_node
+    binding.set_component_device_value(prefix, 1, torch.tensor([110, 111]))
+    tail = binding.insert(
+        mem_cache.InsertParamsBinding(
+            key=key, value=torch.arange(10, 15), prev_prefix_len=2
+        )
+    ).last_device_node
+    binding.set_component_device_value(tail, 1, torch.tensor([112, 113, 114]))
+    for node, host in (
+        (prefix, torch.arange(310, 312)),
+        (tail, torch.arange(312, 315)),
+    ):
+        _, transfers = binding.build_backup_spec(node)
+        transfer = transfers[1][0]
+        transfers[1][0] = (transfer[0], transfer[2] + 100, *transfer[2:])
+        binding.mark_write_through_pending([node], node)
+        binding.commit_backup(node, host, transfers)
+        binding.finish_write_through([node], node)
+    binding.demote(tail)
+    binding.demote(prefix)
+
+    kv_transfer, transfers = binding.build_load_back_spec(tail)
+    transfer = transfers[1][0]
+    transfers[1][0] = (*transfer[:2], torch.arange(50, 55), *transfer[3:])
+    actions = binding.commit_load_back(
+        tail, torch.arange(40, 45), kv_transfer, transfers
+    )
+    receipt = binding.inc_lock_ref(tail)
+    assert isinstance(actions, list) and len(actions) == 1
+    action = actions[0]
+    assert isinstance(action, tuple) and len(action) == 3
+    assert action[0] == "rebuild_full_to_swa_mapping"
+    assert isinstance(action[1], list) and isinstance(action[2], list)
+    assert [value.tolist() for value in action[1]] == [[40, 41], [42, 43, 44]]
+    assert [value.tolist() for value in action[2]] == [[50, 51], [52, 53, 54]]
+    binding.dec_lock_ref(
+        tail,
+        mem_cache.DecLockRefParamsBinding(
+            node_id=receipt.node_id,
+            skipped_lock_components=receipt.skipped_lock_components,
+            component_lock_uuids=receipt.component_lock_uuids,
+            component_host_lock_uuids=receipt.component_host_lock_uuids,
+        ),
+    )
+    binding.finish_load_back(tail)
+    binding.sanity_check([], [])
+
+    chunk = action[2][1]
+    storage_ref = chunk.untyped_storage()._weak_ref()
+    try:
+        binding.reset()
+        assert chunk.tolist() == [52, 53, 54]
+        del chunk, action, actions
+        assert torch.UntypedStorage._expired(storage_ref)
+    finally:
+        torch.UntypedStorage._free_weak_ref(storage_ref)

@@ -579,6 +579,25 @@ def test_latent_pack_decode_contract():
     )
 
 
+def test_decode_latent_stats_are_uploaded_once():
+    # decode normalizes with the first request's device tensors: a per-request
+    # upload would stall the host until the denoising loop drains
+    config = QwenImage21PipelineConfig()
+    ac = config.vae_config.arch_config
+    device = torch.device("cpu")
+    first = config.get_decode_scale_and_shift(device, torch.bfloat16, None)
+    second = config.get_decode_scale_and_shift(device, torch.bfloat16, None)
+    mean = torch.tensor(ac.latents_mean, dtype=torch.bfloat16)
+    std = torch.tensor(ac.latents_std, dtype=torch.bfloat16)
+    torch.testing.assert_close(
+        first[0], std.view(1, ac.z_dim, 1, 1, 1).reciprocal(), atol=0, rtol=0
+    )
+    torch.testing.assert_close(
+        first[1], mean.view(1, ac.z_dim, 1, 1, 1), atol=0, rtol=0
+    )
+    assert first[0] is second[0] and first[1] is second[1]
+
+
 @pytest.mark.parametrize("gfx1151", [False, True])
 @pytest.mark.parametrize("override", [None, False, True])
 def test_vae_tiling_platform_default_and_python_override(
@@ -776,6 +795,48 @@ def test_condition_pixels_match_reference_preprocessing(monkeypatch, tiling):
     actual = vae.encode.call_args.args[0]
     torch.testing.assert_close(actual, expected.bfloat16(), atol=0, rtol=0)
     assert actual.stride() == expected.stride()
+
+
+def test_condition_latents_reuse_uploaded_latent_stats(monkeypatch):
+    module = "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.qwen_image21"
+    monkeypatch.setattr(f"{module}.get_local_torch_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(f"{module}.set_forward_context", lambda **kwargs: nullcontext())
+    image = Image.frombytes("RGBA", (32, 32), bytes(range(256)) * 16)
+    latent = torch.randn(
+        1, 64, 1, 2, 2, generator=torch.Generator().manual_seed(0)
+    ).bfloat16()
+    vae = Mock()
+    vae.encode.return_value.mode.return_value = latent
+    processor = Mock()
+    processor.apply_chat_template.return_value = [[1]]
+    stage = QwenImage21EncodingStage(Mock(), processor, vae, SimpleNamespace(config={}))
+    stage.use_declared_component = Mock(return_value=nullcontext(vae))
+    stage.encode_prompt = Mock(
+        return_value=(torch.zeros(3, 8), torch.tensor([False, True, False]))
+    )
+    server_args = SimpleNamespace(pipeline_config=QwenImage21PipelineConfig())
+    ac = server_args.pipeline_config.vae_config.arch_config
+    mean = latent.new_tensor(ac.latents_mean).view(1, ac.z_dim, 1, 1, 1)
+    std = latent.new_tensor(ac.latents_std).view(1, ac.z_dim, 1, 1, 1)
+    expected = ((latent - mean) / std).flatten(2).transpose(1, 2)
+    stats = []
+    for _ in range(2):
+        batch = SimpleNamespace(
+            height=32,
+            width=32,
+            condition_image=image,
+            prompt="edit",
+            negative_prompt=None,
+            num_outputs_per_prompt=1,
+            do_classifier_free_guidance=False,
+            extra={},
+        )
+        stage.forward(batch, server_args)
+        actual = batch.extra["qwen21_positive"]["condition_latents"]
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        stats.append(stage.latent_stats[(latent.dtype, latent.device)])
+    # the second request normalizes with the first request's device tensors
+    assert stats[0] is stats[1]
 
 
 def test_condition_image_loading_preserves_alpha(tmp_path):
