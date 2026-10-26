@@ -20,6 +20,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.hicache_storage import (
+    HiCacheStorageExtraInfo,
     PoolHitPolicy,
     PoolName,
     PoolTransfer,
@@ -59,8 +60,8 @@ from sglang.test.kits.unified_radix_cache.fixtures import (
 from sglang.test.kits.unified_radix_cache.mixins import UnifiedRadixCacheFixtures
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
-register_cuda_ci(est_time=100, stage="base-b", runner_config="1-gpu-small")
+register_cpu_ci(est_time=18, suite="base-a-test-cpu")
+register_cuda_ci(est_time=18, stage="base-b", runner_config="1-gpu-small")
 
 
 class _FakeLinker(UnifiedCacheLinker):
@@ -69,6 +70,7 @@ class _FakeLinker(UnifiedCacheLinker):
         self.restorable = []
         self.queued_loads = {}
         self.queued_offloads = []
+        self.offload_sessions = []
         self.load_landed = True
         self.completed_offloads = []
         self.reset_count = 0
@@ -94,8 +96,9 @@ class _FakeLinker(UnifiedCacheLinker):
     def finish_layer_wise_loading(self, counter_index):
         return self.load_landed
 
-    def offload(self, transfers):
+    def offload(self, transfers, session_id=None):
         self.queued_offloads.append(list(transfers))
+        self.offload_sessions.append(session_id)
         return True
 
     def num_completed_offloads(self):
@@ -286,7 +289,7 @@ class _InMemoryUnifiedCacheLinker(UnifiedCacheLinker):
             self.queued_loads.pop(rid, None)
         return self.load_landed
 
-    def offload(self, transfers):
+    def offload(self, transfers, session_id=None):
         transfers = self._clone_transfers(transfers)
         self.offload_calls.append(transfers)
         self.pending_offloads.append(transfers)
@@ -1064,6 +1067,28 @@ def test_async_offload_pins_node_until_completion():
     assert unlocks == [(node_id, lock_params)]
 
 
+def test_offload_carries_the_inserting_session():
+    linker = _FakeLinker()
+    nodes = {
+        node_id: SimpleNamespace(
+            id=node_id, external_cache_stored=False, write_through_pending_id=None
+        )
+        for node_id in (7, 8)
+    }
+    cache = _cache_for_wrapper(
+        tree_core=_FakeExternalTreeCore(nodes),
+        inc_lock_ref=lambda node_id: SimpleNamespace(to_dec_params=lambda: None),
+        insert_session_id="session-a",
+    )
+    wrapper = UnifiedCacheLinkerWrapper(cache, linker)
+
+    wrapper.offload_nodes([7])
+    cache.insert_session_id = None
+    wrapper.offload_nodes([8])
+
+    assert linker.offload_sessions == ["session-a", None]
+
+
 def test_offload_skips_node_already_stored_by_tree_core():
     linker = _FakeLinker()
     node = SimpleNamespace(
@@ -1637,7 +1662,7 @@ class TestOffloadReadyEvents(CustomTestCase):
         linker.offload_results = queue.Queue()
         linker.offload_queue = queue.Queue()
         linker.offload_queue.put(
-            (["transfer"], 1, [order.indices_ready, order.kv_written])
+            (["transfer"], 1, [order.indices_ready, order.kv_written], "session-a")
         )
         linker.offload_queue.put(None)
         linker.offload_thread_func()
@@ -1646,7 +1671,10 @@ class TestOffloadReadyEvents(CustomTestCase):
             [
                 call.indices_ready.synchronize(),
                 call.kv_written.synchronize(),
-                call.storage.batch_set_v2(["transfer"]),
+                call.storage.batch_set_v2(
+                    ["transfer"],
+                    HiCacheStorageExtraInfo(extra_info={"session_id": "session-a"}),
+                ),
             ],
         )
         self.assertTrue(linker.offload_results.get_nowait())
