@@ -1147,6 +1147,42 @@ class AscendAttnBackend(AttentionBackend):
                     attention_kv_lens_cpu + self.speculative_step_id + 1
                 )
             max_len = attention_kv_lens_cpu.max().item()
+            max_seq_pages = (max_len + self.page_size - 1) // self.page_size
+
+            if self.is_hybrid_swa:
+                full_page_locs = self.req_to_token[
+                    req_pool_indices[:bs],
+                    0 : max_len : self.page_size,
+                ]
+                swa_page_table = (
+                    self.full_to_swa_index_mapping[full_page_locs] // self.page_size
+                )
+
+                metadata.block_tables_swa[:bs, :max_seq_pages].copy_(swa_page_table)
+                metadata.block_tables_swa[:bs, max_seq_pages:].fill_(0)
+                metadata.block_tables_swa[bs:, :].fill_(0)
+
+                # Update SWA mask: True = masked out (don't attend), False = attend.
+                # DFlash verify seq_lens is prefix-only, so use seq_lens_cpu
+                # (= prefix + block_size) to keep draft KV inside the mask window.
+                if (
+                    forward_mode.is_target_verify()
+                    and _is_dflash_verify(spec_info)
+                    and seq_lens_cpu is not None
+                ):
+                    # seq_lens_cpu may be a CPU tensor; swa_indices is on-device.
+                    seq_lens_int = seq_lens_cpu[:bs].int().to(self.device)
+                else:
+                    seq_lens_int = seq_lens[:bs].int()
+                starts = torch.clamp(seq_lens_int - self.sliding_window_size, min=0)
+                indices = self.graph_metadata["swa_indices"]
+                start_exp = starts.unsqueeze(1)
+                seq_exp = seq_lens_int.unsqueeze(1)
+                mask = (indices.unsqueeze(0) < start_exp) | (
+                    indices.unsqueeze(0) >= seq_exp
+                )
+                metadata.swa_mask[:bs, 0, :].copy_(mask)
+                metadata.swa_mask[bs:, :, :].fill_(True)
         elif max_seq_len_host is not None:
             # Mirrorless DSA replay: the scheduler publishes the max of the
             # page-aligned kv_allocated_len (>= committed + alloc reserve,
@@ -1162,7 +1198,6 @@ class AscendAttnBackend(AttentionBackend):
                 max_len = max_seq_len_host
                 if spec_info is not None:
                     max_len += self.speculative_num_draft_tokens
-        if max_len is not None:
             max_seq_pages = (max_len + self.page_size - 1) // self.page_size
         else:
             # No mirror and no bound: static full capture width. Device
@@ -1170,40 +1205,6 @@ class AscendAttnBackend(AttentionBackend):
             # stale tail entries are never read.
             max_seq_pages = metadata.block_tables.shape[1]
 
-        if self.is_hybrid_swa:
-            full_page_locs = self.req_to_token[
-                req_pool_indices[:bs],
-                0 : max_len : self.page_size,
-            ]
-            swa_page_table = (
-                self.full_to_swa_index_mapping[full_page_locs] // self.page_size
-            )
-
-            metadata.block_tables_swa[:bs, :max_seq_pages].copy_(swa_page_table)
-            metadata.block_tables_swa[:bs, max_seq_pages:].fill_(0)
-            metadata.block_tables_swa[bs:, :].fill_(0)
-
-            # Update SWA mask: True = masked out (don't attend), False = attend.
-            # DFlash verify seq_lens is prefix-only, so use seq_lens_cpu
-            # (= prefix + block_size) to keep draft KV inside the mask window.
-            if (
-                forward_mode.is_target_verify()
-                and _is_dflash_verify(spec_info)
-                and seq_lens_cpu is not None
-            ):
-                # seq_lens_cpu may be a CPU tensor; swa_indices is on-device.
-                seq_lens_int = seq_lens_cpu[:bs].int().to(self.device)
-            else:
-                seq_lens_int = seq_lens[:bs].int()
-            starts = torch.clamp(seq_lens_int - self.sliding_window_size, min=0)
-            indices = self.graph_metadata["swa_indices"]
-            start_exp = starts.unsqueeze(1)
-            seq_exp = seq_lens_int.unsqueeze(1)
-            mask = (indices.unsqueeze(0) < start_exp) | (
-                indices.unsqueeze(0) >= seq_exp
-            )
-            metadata.swa_mask[:bs, 0, :].copy_(mask)
-            metadata.swa_mask[bs:, :, :].fill_(True)
         if max_len is not None:
             # Dynamic-width gather: copy the reachable page range, zero the tail.
             metadata.block_tables[:bs, :max_seq_pages].copy_(
