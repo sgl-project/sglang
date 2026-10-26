@@ -1403,7 +1403,10 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         """Reserved main/indexer pages beyond the token-scaled low-ratio bytes."""
         if self._unified or _is_npu or get_exec().kernel.dsv4_attn_backend == "trtllm":
             return 0
-        from sglang.srt.mem_cache.deepseek_v4_memory_pool import DSV41_INDEX_PAGE_SIZE
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+            DSV41_INDEX_PAGE_SIZE,
+            _num_dsv4_physical_kv_pages,
+        )
 
         padding_bytes = 0
         for ratio in (1, 2):
@@ -1411,12 +1414,14 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             if not num_layers:
                 continue
             # Main KV reserves a full logical page of compressed slots. Indexer
-            # size includes the compressed logical page, then its own padding page.
+            # size includes the compressed logical page, then the indexer pool
+            # reserves its own page on top (same page count as the pool).
             main_padding = self.page_size * self._get_paged_kv_bytes_per_token(ratio)
             index_size = (full_tokens + self.page_size) // ratio
             index_slots = (
-                (index_size + DSV41_INDEX_PAGE_SIZE + 1)
-                // DSV41_INDEX_PAGE_SIZE
+                _num_dsv4_physical_kv_pages(
+                    index_size, DSV41_INDEX_PAGE_SIZE, DSV41_INDEX_PAGE_SIZE
+                )
                 * DSV41_INDEX_PAGE_SIZE
             )
             index_padding = (
