@@ -2957,6 +2957,11 @@ class OpenAIServingChat(OpenAIServingBase):
             return
 
         if self.reasoning_parser == "flint":
+            if not enabled:
+                raise ValueError(
+                    "Reasoning parser 'flint' has no thinking toggle and cannot "
+                    "be disabled via Anthropic thinking"
+                )
             return
 
         if self.reasoning_parser == "iquest_q1":
