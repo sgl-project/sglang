@@ -98,7 +98,8 @@ def _get_trtllm_counter_buffer(
     resets its counters at the end of each launch, and launches run in order on
     the forward stream, as the shared workspace already assumes. Decode passes
     one query row per FlashInfer request, so the size bound is in query rows;
-    heads cover the native per-rank count and FlashMLA's 64-head pad.
+    the model's head count bounds the per-rank query heads, floored at the
+    64-head query pad.
     """
     if _flashinfer_import_error is not None:
         raise ImportError(
@@ -147,7 +148,6 @@ def _refresh_indexed_tail(
     lens: torch.Tensor,
 ) -> None:
     """Write this layer's top-k into the shared indexed table and its lens."""
-    assert extra_indices is not None
     rows = table.shape[0]
     extra_indices = extra_indices[:rows]
     width = extra_indices.shape[-1]
@@ -174,10 +174,6 @@ class TrtllmSparseTablePool:
         self._kwargs = int32_kwargs
         self._bufs: dict = {}
 
-    @staticmethod
-    def _pad_rows(rows: int) -> int:
-        return ceil_align(rows, 64)
-
     def _parent(self, role: str, numel: int, fill: int) -> torch.Tensor:
         buf = self._bufs.get(role)
         if buf is None or buf.numel() < numel:
@@ -190,7 +186,7 @@ class TrtllmSparseTablePool:
         return buf
 
     def preallocate(self, role: str, rows: int, fill: int, width: int = 0) -> None:
-        self._parent(role, self._pad_rows(rows) * max(width, 1), fill)
+        self._parent(role, ceil_align(rows, 64) * max(width, 1), fill)
 
     def view(
         self,
@@ -205,7 +201,7 @@ class TrtllmSparseTablePool:
         """Rows [:rows] come from ``src``, from the caller (who then writes every
         column the kernel can read), or are re-inerted; rows [rows, rows_pad)
         are always re-inerted."""
-        rows_pad = self._pad_rows(rows)
+        rows_pad = ceil_align(rows, 64)
         numel = rows_pad * max(width, 1)
         padded = self._parent(role, numel, fill)[:numel]
         if width:
@@ -478,8 +474,6 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
             )
             q = q[:n_meta_rows]
             bs = n_meta_rows
-        if extra_indices is not None:
-            extra_indices = extra_indices[:bs]
 
         # Only indexed tails and lens vary by layer; other table data is prebuilt.
         if compress_ratio == 0:
@@ -629,7 +623,6 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
 
         # Layer-invariant tables were built before the indexer ran.
         swa_indices = core.trtllm_prefill_swa_indices
-        assert swa_indices is not None
         assert swa_indices.shape == (sum_q, SWA_WINDOW), f"{swa_indices.shape=}"
         refreshed = False
         if extra_indices is None:

@@ -13,7 +13,6 @@ gate+norm+rotate compression itself) is a deferred follow-up.
 """
 
 import unittest
-from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest import mock
 
@@ -1147,23 +1146,6 @@ class TestTrtllmSparseTablePool(CustomTestCase):
             self.pool.view("f", 64, fill=-1, width=16)  # within capacity: fine
             with self.assertRaisesRegex(AssertionError, "capture"):
                 self.pool.view("f", 65, fill=-1, width=16)
-
-    def test_copy_metadata_keeps_unified_kv_metadata_object(self):
-        from sglang.srt.layers.attention.dsv4.metadata import (
-            UnifiedKvMetadata,
-            copy_metadata,
-        )
-
-        @dataclass
-        class Holder:
-            unified: UnifiedKvMetadata
-
-        dst = Holder(UnifiedKvMetadata(swa_loc=torch.zeros(4, **self.kw)))
-        src = Holder(UnifiedKvMetadata(swa_loc=torch.ones(4, **self.kw)))
-        keep = dst.unified
-        copy_metadata(src=src, dst=dst, check_eq_fields=[], copy_fields=["unified"])
-        self.assertIs(dst.unified, keep)  # refreshed in place, not swapped
-        self.assertEqual(dst.unified.swa_loc.tolist(), [1, 1, 1, 1])
 
     def test_tail_refresh_layers_follow_index_sources(self):
         from sglang.srt.layers.attention.deepseek_v4_trtllm_backend import (

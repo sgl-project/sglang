@@ -1004,16 +1004,11 @@ class DSV4AttnMetadata:
             )
 
     def init_flashmla_related(
-        self,
-        is_prefill: bool = False,
-        low_ratio_buffers=None,
-        create_flashmla_metadata: bool = True,
-        alloc_c4_raw_indices: Optional[bool] = None,
+        self, is_prefill: bool = False, low_ratio_buffers=None, trtllm: bool = False
     ):
         # trtllm never launches FlashMLA: no schedule metadata, no raw c4 indices.
-        _mk = _create_flashmla_metadata if create_flashmla_metadata else (lambda: None)
-        if alloc_c4_raw_indices is None:
-            alloc_c4_raw_indices = is_prefill
+        _mk = (lambda: None) if trtllm else _create_flashmla_metadata
+        alloc_c4_raw_indices = is_prefill and not trtllm
         assert self.index_topk in (512, 1024), (
             f"unexpected index_topk={self.index_topk}; "
             "supported: 512 (small) or 1024 (large)"
@@ -4993,8 +4988,7 @@ class DeepseekV4AttnBackend(
             core_attn_metadata.init_flashmla_related(
                 is_prefill=is_prefill,
                 low_ratio_buffers=low_ratio_buffers,
-                create_flashmla_metadata=not self.trtllm_attn,
-                alloc_c4_raw_indices=is_prefill and not self.trtllm_attn,
+                trtllm=self.trtllm_attn,
             )
         else:
             core_attn_metadata.c4_sparse_topk_lengths = None
