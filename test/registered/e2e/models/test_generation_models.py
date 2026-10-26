@@ -1,7 +1,7 @@
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 # Generation model tests (CUDA only)
-register_cuda_ci(est_time=144, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=133, stage="extra-a", runner_config="1-gpu-large")
 register_amd_ci(est_time=106, suite="extra-a-test-1-gpu-large-amd")
 
 # Copyright 2023-2024 SGLang Team
