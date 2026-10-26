@@ -374,6 +374,9 @@ class GenerateMetaInfo(msgspec.Struct, kw_only=True, frozen=True):
     output_token_logprobs_length: Optional[int] = None
     weight_version: Optional[str] = None
     weight_versions: List[WeightVersionSpan] = []
+    image_tokens: Optional[int] = None
+    audio_tokens: Optional[int] = None
+    video_tokens: Optional[int] = None
 
     @classmethod
     def from_json_value(cls, value: Any) -> "GenerateMetaInfo":
@@ -1776,6 +1779,12 @@ def decode_GenerateMetaInfo(value: Any) -> GenerateMetaInfo:
             kw["weight_version"] = None if x is None else _expect_str(x, expected="a string")
         elif key == "weight_versions":
             kw["weight_versions"] = [] if x is None else [decode_WeightVersionSpan(e) for e in _expect_seq(x, expected="a sequence")]
+        elif key == "image_tokens":
+            kw["image_tokens"] = None if x is None else _expect_uint(x, expected="u32")
+        elif key == "audio_tokens":
+            kw["audio_tokens"] = None if x is None else _expect_uint(x, expected="u32")
+        elif key == "video_tokens":
+            kw["video_tokens"] = None if x is None else _expect_uint(x, expected="u32")
     return GenerateMetaInfo(**kw)
 
 
@@ -1809,6 +1818,12 @@ def encode_GenerateMetaInfo(v: GenerateMetaInfo) -> Dict[str, Any]:
         d["weight_version"] = v.weight_version
     if v.weight_versions:
         d["weight_versions"] = [encode_WeightVersionSpan(e) for e in v.weight_versions]
+    if v.image_tokens is not None:
+        d["image_tokens"] = v.image_tokens
+    if v.audio_tokens is not None:
+        d["audio_tokens"] = v.audio_tokens
+    if v.video_tokens is not None:
+        d["video_tokens"] = v.video_tokens
     return d
 
 

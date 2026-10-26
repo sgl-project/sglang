@@ -221,6 +221,7 @@ from sglang.srt.managers.schedule_policy import (
     AddReqResult,
     PrefillAdder,
     SchedulePolicy,
+    mamba_prefill_chunk_grid,
 )
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
@@ -694,6 +695,7 @@ class Scheduler(
         # Init prefill kv split size when deterministic inference is enabled with various attention backends
         self.init_deterministic_inference_config()
         self.init_dsa_kpool_truncation_align()
+        self.init_mamba_truncation_align()
         self.check_truncation_align_fits_chunk()
 
         self.init_weight_updater()
@@ -1083,7 +1085,13 @@ class Scheduler(
         if self.draft_worker is not None:
             preloaded_weights_bytes += self.draft_worker.preloaded_weights_bytes
         self.tp_worker.model_runner.account_preloaded_weights(preloaded_weights_bytes)
-        self.tp_worker.alloc_memory_pool()
+        self.tp_worker.alloc_memory_pool(
+            draft_parallel_layout=(
+                self.draft_worker.draft_parallel_layout
+                if self.draft_worker is not None
+                else None
+            )
+        )
 
     def init_memory_pools(self):
         """Allocate KV cache pools for target and draft workers."""
@@ -1769,6 +1777,24 @@ class Scheduler(
         else:
             self.truncation_align_size = math.lcm(
                 self.truncation_align_size, dsa_index_kpool
+            )
+
+    def init_mamba_truncation_align(self):
+        """Under DCP a mamba checkpoint may only be donated where the cached
+        prefix sits on the kernel chunk grid, so a chunk that stops anywhere
+        else costs the request every donation it would have made after that.
+        Without DCP the prefix-relative rule already donates, so leave the
+        existing alignment alone. Use the LCM to preserve any alignment that
+        is already set."""
+        chunk_size = mamba_prefill_chunk_grid()
+        if chunk_size <= 1:
+            return
+
+        if self.truncation_align_size is None:
+            self.truncation_align_size = chunk_size
+        else:
+            self.truncation_align_size = math.lcm(
+                self.truncation_align_size, chunk_size
             )
 
     def check_truncation_align_fits_chunk(self):
