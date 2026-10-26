@@ -175,6 +175,8 @@ class KdaStateView(msgspec.Struct, frozen=True):
 
     conv: tuple[torch.Tensor, ...]
     temporal: torch.Tensor
+    intermediate_conv_window: tuple[torch.Tensor, ...] = ()
+    intermediate_ssm: Optional[torch.Tensor] = None
 
 
 class MlaPoolView:
@@ -243,6 +245,7 @@ class MlaStepView(msgspec.Struct, frozen=True):
     block_table: torch.Tensor
     sequence_lengths: torch.Tensor
     write_slots: torch.Tensor
+    tokens_per_request: int = 1
 
 
 class KdaStepView:
@@ -253,9 +256,11 @@ class KdaStepView:
         *,
         state_indices: torch.Tensor,
         track_decode_state: Callable[[int], None],
+        verify_scratch_indices: Optional[torch.Tensor] = None,
     ):
         self.state_indices = state_indices
         self._track_decode_state = track_decode_state
+        self.verify_scratch_indices = verify_scratch_indices
 
     def track_decode_state(self, layer_id: int) -> None:
         """Track one completed layer; SGLang coalesces this at the last layer."""
@@ -265,6 +270,7 @@ class KdaStepView:
 class HybridStepView(msgspec.Struct, frozen=True):
     mla: MlaStepView
     kda: KdaStepView
+    aux_hidden_states: Optional[torch.Tensor] = None
 
 
 class ForwardView:
@@ -349,6 +355,8 @@ class MegakernelBinding:
         self._sealed: dict[str, _SealedSource] = {}
         self._preparation: Optional[PreparationView] = None
         self._hybrid_sources: Optional[_HybridSources] = None
+        self._verify_aux_width = 0
+        self._capture_aux_buffers: dict[str, torch.Tensor] = {}
 
     def preparation_view(self, model_runner: ModelRunner) -> PreparationView:
         """The post-pool, pre-capture resources for an optional build hook."""
@@ -395,7 +403,7 @@ class MegakernelBinding:
         kda_metadata = sources.linear_backend.forward_metadata
         # Keep each graph's metadata owners when the backend selects another
         # batch-size bucket, while still detecting replacement of their fields.
-        tensors = (
+        tensors = [
             (
                 "mla.block_table",
                 mla.block_table,
@@ -412,13 +420,54 @@ class MegakernelBinding:
                 kda.state_indices,
                 lambda: kda_metadata.mamba_cache_indices,
             ),
-        )
+        ]
+        if kda.verify_scratch_indices is not None:
+            num_requests = int(forward_batch.batch_size)
+            tensors.append(
+                (
+                    "kda.verify_scratch_indices",
+                    kda.verify_scratch_indices,
+                    lambda: sources.linear_backend.verify_intermediate_state_indices[
+                        :num_requests
+                    ],
+                )
+            )
+        if view.hybrid.aux_hidden_states is not None:
+            tensors.append(
+                (
+                    "aux_hidden_states",
+                    view.hybrid.aux_hidden_states,
+                    lambda: forward_batch.aux_hidden_states_buffer,
+                )
+            )
         for name, tensor, getter in tensors:
             if _identity(getter()) != _identity(tensor):
                 raise RuntimeError(
                     f"megakernel binding: capture[{key}].{name} changed before seal"
                 )
             self._seal(f"capture[{key}].{name}", tensor, getter)
+        if view.hybrid.aux_hidden_states is not None:
+            self._capture_aux_buffers[key] = view.hybrid.aux_hidden_states
+
+    def seal_capture_buffers(self, runner: DecodeCudaGraphRunner) -> None:
+        """Seal the owning auxiliary allocation once the runner finishes capture."""
+        if not self._capture_aux_buffers:
+            return
+        buffers = runner.buffers
+        aux = buffers.aux_hidden_states
+        if aux is None or any(
+            _identity(aux[: tensor.shape[0]]) != _identity(tensor)
+            for tensor in self._capture_aux_buffers.values()
+        ):
+            raise RuntimeError(
+                "megakernel binding: captured auxiliary slices differ from runner buffer"
+            )
+        self._seal("decode_graph_buffers", buffers, lambda: runner.buffers)
+        self._seal(
+            "decode_graph_aux_hidden_states",
+            aux,
+            lambda: runner.buffers.aux_hidden_states,
+        )
 
     def engram_history(self) -> Optional[torch.Tensor]:
         """The model's Engram hash history ``[slots + 1, width]`` int32, or None."""
@@ -484,6 +533,7 @@ class MegakernelBinding:
         from sglang.srt.mem_cache.memory_pool import (
             HybridLinearKVPool,
             HybridReqToTokenPool,
+            MambaPool,
         )
 
         full_backend = backend.full_attn_backend
@@ -556,7 +606,7 @@ class MegakernelBinding:
         states: dict[int, KdaStateView] = {}
         for layer_id in mamba_map:
             state = request_pool.mamba2_layer_cache(layer_id)
-            if state.replayssm_d is not None:
+            if state.replayssm_d is not None or state.replayssm_rawv is not None:
                 raise ValueError(
                     f"megakernel binding: KDA layer {layer_id} has ReplaySSM state; "
                     "the hybrid state view requires --enable-linear-replayssm "
@@ -568,7 +618,40 @@ class MegakernelBinding:
                     f"megakernel binding: KDA layer {layer_id} has {len(conv)} "
                     "convolution states, expected one"
                 )
-            states[layer_id] = KdaStateView(conv=conv, temporal=state.temporal)
+            intermediate_conv_window = ()
+            intermediate_ssm = None
+            if isinstance(state, MambaPool.SpeculativeState):
+                intermediate_conv_window = tuple(state.intermediate_conv_window)
+                intermediate_ssm = state.intermediate_ssm
+                if len(intermediate_conv_window) != 1 or intermediate_ssm is None:
+                    raise ValueError(
+                        f"megakernel binding: KDA layer {layer_id} requires "
+                        "one verify convolution window and intermediate SSM state"
+                    )
+                self._seal(
+                    f"kda_intermediate_conv_window[{layer_id}]",
+                    intermediate_conv_window[0],
+                    lambda layer_id=layer_id: (
+                        self._current_hybrid_sources()
+                        .request_pool.mamba2_layer_cache(layer_id)
+                        .intermediate_conv_window[0]
+                    ),
+                )
+                self._seal(
+                    f"kda_intermediate_ssm[{layer_id}]",
+                    intermediate_ssm,
+                    lambda layer_id=layer_id: (
+                        self._current_hybrid_sources()
+                        .request_pool.mamba2_layer_cache(layer_id)
+                        .intermediate_ssm
+                    ),
+                )
+            states[layer_id] = KdaStateView(
+                conv=conv,
+                temporal=state.temporal,
+                intermediate_conv_window=intermediate_conv_window,
+                intermediate_ssm=intermediate_ssm,
+            )
             self._seal(
                 f"kda_conv[{layer_id}]",
                 conv[0],
@@ -590,6 +673,10 @@ class MegakernelBinding:
 
         if reserved_capacity is None or not states:
             raise ValueError("megakernel binding: hybrid MLA/KDA mappings are empty")
+        if any(state.intermediate_ssm is not None for state in states.values()):
+            if any(state.intermediate_ssm is None for state in states.values()):
+                raise ValueError("megakernel binding: KDA verify state is incomplete")
+            self._prepare_verify_resources(sources)
         return HybridPoolView(
             mla=MlaPoolView(
                 reserved_capacity=reserved_capacity,
@@ -607,6 +694,44 @@ class MegakernelBinding:
                 states=states,
             ),
         )
+
+    def _prepare_verify_resources(self, sources: _HybridSources) -> None:
+        self._check_verify_ownership(sources)
+        self._verify_aux_width = int(sources.model_runner.get_aux_hidden_states_width())
+        if self._verify_aux_width <= 0:
+            raise ValueError(
+                "megakernel binding: verify auxiliary width is unavailable"
+            )
+        indices = sources.linear_backend.verify_intermediate_state_indices
+        if indices is None or indices.dtype != torch.int32 or indices.ndim != 1:
+            raise ValueError("megakernel binding: verify scratch indices must be int32")
+        self._seal(
+            "kda_verify_scratch_indices",
+            indices,
+            lambda: (
+                self._current_hybrid_sources().linear_backend.verify_intermediate_state_indices
+            ),
+        )
+        self._seal(
+            "kda_accept_lens_pool",
+            sources.linear_backend.accept_lens_pool,
+            lambda: self._current_hybrid_sources().linear_backend.accept_lens_pool,
+        )
+
+    @staticmethod
+    def _check_verify_ownership(sources: _HybridSources) -> None:
+        from sglang.srt.layers.attention.linear.utils import (
+            pp_spec_stable_rows_enabled,
+        )
+
+        if pp_spec_stable_rows_enabled():
+            raise ValueError(
+                "megakernel binding: PP-stable verify scratch is unsupported"
+            )
+        if sources.linear_backend.accept_lens_pool is not None:
+            raise ValueError(
+                "megakernel binding: fused verify acceptance is unsupported"
+            )
 
     def _seal_hybrid_sources(self, sources: _HybridSources) -> None:
         runner = sources.model_runner
@@ -691,8 +816,23 @@ class MegakernelBinding:
         assert self._preparation is not None
         pool_view = self._preparation.hybrid
         assert pool_view is not None
+        verifying = forward_batch.forward_mode.is_target_verify()
+        tokens_per_request = 1
+        scratch_indices = aux_hidden_states = None
+        if verifying:
+            tokens_per_request, scratch_indices, aux_hidden_states = self._verify_step(
+                sources=sources,
+                forward_batch=forward_batch,
+                mla_metadata=mla_metadata,
+                kda_metadata=kda_metadata,
+            )
 
         def track_decode_state(layer_id: int) -> None:
+            if verifying:
+                raise RuntimeError(
+                    "megakernel binding: target_verify state is committed by SGLang; "
+                    "decode tracking is forbidden"
+                )
             state = pool_view.kda.state(layer_id)
             sources.linear_backend._track_mamba_state_decode(
                 forward_batch,
@@ -707,11 +847,88 @@ class MegakernelBinding:
                 block_table=block_table,
                 sequence_lengths=sequence_lengths,
                 write_slots=write_slots,
+                tokens_per_request=tokens_per_request,
             ),
             kda=KdaStepView(
-                state_indices=state_indices, track_decode_state=track_decode_state
+                state_indices=state_indices,
+                track_decode_state=track_decode_state,
+                verify_scratch_indices=scratch_indices,
             ),
+            aux_hidden_states=aux_hidden_states,
         )
+
+    def _verify_step(
+        self,
+        *,
+        sources: _HybridSources,
+        forward_batch: ForwardBatch,
+        mla_metadata: TRTLLMMLADecodeMetadata,
+        kda_metadata: KdaForwardMetadata,
+    ) -> tuple[int, torch.Tensor, torch.Tensor]:
+        from sglang.srt.layers.attention.linear.utils import (
+            select_verify_intermediate_state_indices,
+        )
+
+        self._check_verify_ownership(sources)
+        spec = forward_batch.spec_info
+        if (
+            self._verify_aux_width <= 0
+            or spec is None
+            or spec.draft_token_num not in (4, 5, 6, 7, 8)
+            or spec.ragged_verify_layout is not None
+            or kda_metadata.retrieve_parent_token is not None
+        ):
+            raise ValueError(
+                "megakernel binding: verify requires prepared uniform q4-8 state"
+            )
+        tokens_per_request = int(spec.draft_token_num)
+        num_requests = int(forward_batch.batch_size)
+        num_tokens = num_requests * tokens_per_request
+        # TRTLLM target verification derives q from spec_info and the token rows;
+        # max_seq_len_q belongs to draft-extend metadata and remains unset here.
+        if (
+            tuple(forward_batch.input_ids.shape) != (num_tokens,)
+            or tuple(forward_batch.out_cache_loc.shape) != (num_tokens,)
+            or tuple(kda_metadata.mamba_cache_indices.shape) != (num_requests,)
+            or tuple(mla_metadata.seq_lens_k.shape) != (num_requests,)
+            or mla_metadata.block_kv_indices.shape[0] != num_requests
+            or kda_metadata.query_start_loc is None
+            or kda_metadata.query_start_loc.shape[0] != num_requests + 1
+        ):
+            raise ValueError(
+                "megakernel binding: verify request/token metadata differs"
+            )
+        # PP-stable rows are refused above; the stock selector returns the
+        # positional table without using valid or allocating a device tensor.
+        scratch_indices = select_verify_intermediate_state_indices(
+            sources.linear_backend.verify_intermediate_state_indices,
+            forward_batch.req_pool_indices,
+            None,
+            sources.request_pool.size,
+        )[:num_requests]
+        if tuple(scratch_indices.shape) != (num_requests,):
+            raise ValueError("megakernel binding: verify scratch table is too small")
+        aux = forward_batch.aux_hidden_states_buffer
+        shape = (num_tokens, self._verify_aux_width)
+        dtype = sources.model_runner.dtype
+        device = forward_batch.input_ids.device
+        if aux is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "megakernel binding: capture requires the runner auxiliary buffer"
+                )
+            aux = torch.empty(shape, dtype=dtype, device=device)
+            forward_batch.aux_hidden_states_buffer = aux
+        if (
+            tuple(aux.shape) != shape
+            or aux.dtype != dtype
+            or aux.device != device
+            or not aux.is_contiguous()
+        ):
+            raise ValueError(
+                "megakernel binding: verify auxiliary buffer layout differs"
+            )
+        return tokens_per_request, scratch_indices, aux
 
     def _mla_metadata(self, sources: _HybridSources) -> TRTLLMMLADecodeMetadata:
         metadata = sources.full_backend.forward_decode_metadata
@@ -1295,6 +1512,7 @@ class _CaptureCheck:
         if self.is_done or not set(runner.capture_bs) <= set(captured):
             return
         self.is_done = True
+        self.dispatch.binding.seal_capture_buffers(runner)
         self.dispatch.binding.assert_live()
         routed = sorted(bs for bs, step in captured.items() if step is not None)
         if not routed:
