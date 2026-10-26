@@ -534,6 +534,10 @@ def _apply_wo_a_bf16_matmul(
     ):
         if is_decode and o.shape[0] == 1:
             return wo_a_bf16_gemv(o, wo_a)
+        # 2-8 rows stay on the small-batch kernel (bitwise today's sums); above 128 rows
+        # the bmm plus wo_b's own quant is faster with TRITON_HIP_USE_ASYNC_COPY=0
+        if emit_fp8 and hip_decode_verify and 8 < o.shape[0] <= 128:
+            return _hip.wo_a_fp8_grid_matmul(o, wo_a, fp8_grid, emit_fp8=True)
         if 2 <= o.shape[0] <= 8:
             if fuse_mxfp8_quant:
                 return Mxfp8SwizzledInput(*wo_a_bf16_small_batch_mxfp8(o, wo_a))

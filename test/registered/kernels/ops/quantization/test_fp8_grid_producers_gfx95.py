@@ -165,13 +165,13 @@ class TestBatchedGemmBf16Fp8Grid(CustomTestCase):
         bit (plain and fp8 grid), at each bucket edge."""
         from sglang.kernels.ops.gemm import gfx95_batched_gemm_bf16_fp8_grid as mod
 
-        only_16_row_tile = ((None, mod._TILE_BY_MAX_M[0][1]),)
+        only_16_row_tile = lambda T, G: mod._TILE_BY_MAX_M[0][1]
         w = _weights(11)
         for t in (65, 128, 129, 256, 257, 384):
             x = torch.randn(t, G, D, device="cuda").bfloat16()
             for fp8_grid in (False, True):
                 out = batched_gemm_bf16_fp8_grid(x, w, fp8_grid=fp8_grid, split_k=False)
-                with mock.patch.object(mod, "_TILE_BY_MAX_M", only_16_row_tile):
+                with mock.patch.object(mod, "_tile_config", only_16_row_tile):
                     ref = batched_gemm_bf16_fp8_grid(
                         x, w, fp8_grid=fp8_grid, split_k=False
                     )
