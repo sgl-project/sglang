@@ -248,6 +248,10 @@ class MarkovSampleStep:
 
     @classmethod
     def execute(cls, **kwargs) -> torch.Tensor:
+        if kwargs["base_logits"].device.type == "npu":
+            from sgl_kernel_npu.sample import markov_sample_step
+
+            return markov_sample_step(**kwargs)
         if inputs_on_cuda(**kwargs):
             return cls.triton(**kwargs)
         return cls.torch(**kwargs)
