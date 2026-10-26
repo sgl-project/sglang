@@ -190,6 +190,10 @@ class TestDFlashMLA(CustomTestCase):
     def setUp(self):
         reset_context()
         self.addCleanup(reset_context)
+        # CPU CI does not enable the CPU engine; keep RoPE on the native path.
+        self.enterContext(
+            patch("sglang.srt.layers.rotary_embedding.base._is_cpu", True)
+        )
         # The CPU RoPE factory serves only DeepSeek YaRN; the tensors stay on CPU.
         publish(ServerArgs(model_path="dummy", device="cuda", tp_size=1), role="test")
 
