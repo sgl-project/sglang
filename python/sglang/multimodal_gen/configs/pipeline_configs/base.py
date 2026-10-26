@@ -168,6 +168,9 @@ class PipelineConfig:
     generator_device: str | None = None
     flow_shift: float | None = None
     scheduler_class_override: str | None = None
+    # Registered DiT class to load instead of the checkpoint's ``_class_name``,
+    # for pipelines that drive shared weights with a different forward.
+    transformer_class_override: str | None = None
     disable_autocast: bool = False
 
     # Model configuration
@@ -1195,10 +1198,6 @@ class PipelineConfig:
     def check_pipeline_config(self) -> None:
         self.task_type = ModelTaskType.parse(self.task_type)
         self.get_supported_task_types()
-        if self.vae_sp and not self.vae_tiling:
-            raise ValueError(
-                "Currently enabling vae_sp requires enabling vae_tiling, please set --vae-tiling to True."
-            )
 
         if len(self.text_encoder_configs) != len(self.text_encoder_precisions):
             raise ValueError(
@@ -1345,24 +1344,6 @@ class SpatialImagePipelineConfig(ImagePipelineConfig):
             return super().gather_latents_for_sp(latents, batch=batch)
         # Gather along dim=2 (H') to match shard_latents_for_sp
         return self._gather_sp_tensor(latents, dim=2)
-
-
-@dataclass
-class SlidingTileAttnConfig(PipelineConfig):
-    """Configuration for sliding tile attention."""
-
-    # Override any BaseConfig defaults as needed
-    # Add sliding tile specific parameters
-    window_size: int = 16
-    stride: int = 8
-
-    # You can provide custom defaults for inherited fields
-    height: int = 576
-    width: int = 1024
-
-    # Additional configuration specific to sliding tile attention
-    pad_to_square: bool = False
-    use_overlap_optimization: bool = True
 
 
 def parse_int_list(value: str) -> list[int]:

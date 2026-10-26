@@ -30,7 +30,7 @@ class TestEagleAdaptiveContext(CustomTestCase):
             "worker_state"
         )
         worker._draft_worker = SimpleNamespace(
-            draft_owns_attention=True,
+            parallel_layout=SimpleNamespace(tp_group=object()),
             init_attention_backend=Mock(
                 side_effect=lambda: self.record("draft_backend")
             ),
@@ -73,6 +73,15 @@ class TestEagleAdaptiveContext(CustomTestCase):
 
     @contextlib.contextmanager
     def mocked_runtime(self):
+        platform = SimpleNamespace(
+            is_out_of_tree=Mock(return_value=False),
+            capabilities=SimpleNamespace(graph_capture=True),
+            get_graph_runner_cls=Mock(
+                return_value=Mock(
+                    side_effect=lambda *args, **kwargs: self.record("oot_target_graph")
+                )
+            ),
+        )
         with (
             get_context().override_server_args(
                 cuda_graph_bs_decode=[16, 32, 48, 64], disable_cuda_graph=False
@@ -96,6 +105,7 @@ class TestEagleAdaptiveContext(CustomTestCase):
             patch.object(eagle, "get_available_gpu_memory", return_value=10.0),
             patch.object(eagle, "check_cuda_graph_backend", return_value=False),
             patch.object(eagle, "_is_npu", False),
+            patch.object(eagle, "current_platform", platform),
             patch.object(
                 eagle,
                 "DecodeCudaGraphRunner",
@@ -103,22 +113,28 @@ class TestEagleAdaptiveContext(CustomTestCase):
             ),
             patch.object(eagle, "log_info_on_rank0"),
         ):
-            yield
+            yield platform
 
-    def draft_tp_scope(self, owns_attention):
-        self.assertEqual(owns_attention, self.worker._draft_worker.draft_owns_attention)
-        return self.scope("draft_tp") if owns_attention else contextlib.nullcontext()
+    def draft_tp_scope(self, layout):
+        self.assertIs(layout, self.worker._draft_worker.parallel_layout)
+        return (
+            self.scope("draft_tp")
+            if layout.tp_group is not None
+            else contextlib.nullcontext()
+        )
 
     def test_only_draft_resources_use_draft_context(self):
-        for owns_attention in (True, False):
-            with self.subTest(owns_attention=owns_attention):
+        for separate_tp in (True, False):
+            with self.subTest(separate_tp=separate_tp):
                 self.observed.clear()
-                self.worker._draft_worker.draft_owns_attention = owns_attention
+                self.worker._draft_worker.parallel_layout = SimpleNamespace(
+                    tp_group=object() if separate_tp else None
+                )
                 with self.mocked_runtime():
                     self.worker.init_cuda_graphs()
                 draft_context = (
                     ("worker_state",)
-                    + (("draft_tp",) if owns_attention else ())
+                    + (("draft_tp",) if separate_tp else ())
                     + ("draft_moe", "draft_a2a")
                 )
                 self.assertEqual(
@@ -131,6 +147,36 @@ class TestEagleAdaptiveContext(CustomTestCase):
                         ("target_graph", ("worker_state",)),
                     ],
                 )
+                self.assertEqual(self.active, [])
+
+    def test_oot_target_runner_keeps_platform_selection_outside_draft_context(self):
+        for graph_capture in (True, False):
+            with self.subTest(graph_capture=graph_capture):
+                self.observed.clear()
+                with self.mocked_runtime() as platform:
+                    platform.is_out_of_tree.return_value = True
+                    platform.capabilities.graph_capture = graph_capture
+                    state = self.worker.build_adaptive_runtime_state(0, 1)
+                    self.assertEqual(
+                        platform.get_graph_runner_cls.call_count, int(graph_capture)
+                    )
+                expected = [
+                    (
+                        "draft_backend",
+                        ("worker_state", "draft_tp", "draft_moe", "draft_a2a"),
+                    ),
+                    (
+                        "draft_graph",
+                        ("worker_state", "draft_tp", "draft_moe", "draft_a2a"),
+                    ),
+                    ("target_backend", ("worker_state",)),
+                ]
+                if graph_capture:
+                    expected.append(("oot_target_graph", ("worker_state",)))
+                    self.assertIsNotNone(state.target_graph_runner)
+                else:
+                    self.assertIsNone(state.target_graph_runner)
+                self.assertEqual(self.observed, expected)
                 self.assertEqual(self.active, [])
 
     def test_failed_draft_capture_restores_context(self):

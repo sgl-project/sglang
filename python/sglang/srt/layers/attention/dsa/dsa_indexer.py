@@ -14,7 +14,7 @@ from sglang.kernels.ops.attention.dsa.fp8_fused_writer_hip import (
     fused_fp8_writer_geometry_supported,
     prepare_aiter_rope_caches,
 )
-from sglang.kernels.ops.attention.fused_store_index_cache import (
+from sglang.kernels.ops.kvcache.dsa_fused_store_index_cache import (
     can_use_dsa_fused_store,
     fused_store_index_k_cache,
 )
@@ -152,6 +152,7 @@ if _use_aiter:
     from aiter.ops.cache import indexer_k_quant_and_cache
 
 from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.layers.attention.kv_shard_hooks import get_kv_shard_pool
 from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.linear import ReplicatedLinear
@@ -183,7 +184,9 @@ if _is_cuda:
         fused_k_indexer_norm_rope,
         fused_k_indexer_norm_rope_store,
     )
-    from sglang.kernels.ops.attention.dsv4 import fused_q_indexer_rope_first_quant
+    from sglang.kernels.ops.attention.dsa.indexer_q import (
+        fused_q_indexer_rope_first_quant,
+    )
 
     @register_custom_op(mutates_args=["topk_indices"])
     @register_split_op()
@@ -236,6 +239,14 @@ def _make_eager_idle_topk_result(
         dtype=torch.int32,
         device=x.device,
     )
+
+
+def _index_k_write_targets(pool, layer_id: int, loc: torch.Tensor):
+    """(index-K buffer, token slots, selected token rows or None) to write."""
+    shard_pool = get_kv_shard_pool(pool)
+    if shard_pool is None:
+        return ((pool.get_index_k_with_scale_buffer(layer_id=layer_id), loc, None),)
+    return shard_pool.index_key_cache.write_targets(layer_id, loc)
 
 
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
@@ -484,7 +495,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             # Off rather than fatal: without the fused path both phases share a format.
             self.use_gfx950_fused_indexer = hadamard_preserved(self)
         if self.use_gfx950_fused_indexer:
-            from sglang.kernels.ops.attention.dsa.hip_gfx950 import (
+            from sglang.srt.layers.attention.dsa.gfx950_fused_indexer import (
                 Gfx950FusedIndexer,
                 prealloc_workspace,
             )
@@ -703,7 +714,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         """Per-call half of the gate plus the four launches. Returns the (rows,
         index_topk) physical-slot tensor, or None to mean this call is not served
         here -- forward_cuda then continues into the standard path unchanged."""
-        from sglang.kernels.ops.attention.dsa.hip_gfx950 import (
+        from sglang.srt.layers.attention.dsa.gfx950_fused_indexer import (
             CACHE_TOK_STRIDE,
             MAX_ROWS,
             PAGE_SIZE,
@@ -1024,17 +1035,18 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             and out_cache_loc is not None
             and can_use_dsa_fused_store(torch.bfloat16, out_cache_loc.dtype, page_size)
         ):
-            fused_k_indexer_norm_rope_store(
-                key_raw,
-                pool.get_index_k_with_scale_buffer(layer_id=layer_id),
-                out_cache_loc,
-                self.k_norm.weight,
-                self.k_norm.bias,
-                self.k_norm.variance_epsilon,
-                self._indexer_cos_sin_cache,
-                positions,
-                page_size,
-            )
+            for buf, loc, rows in _index_k_write_targets(pool, layer_id, out_cache_loc):
+                fused_k_indexer_norm_rope_store(
+                    key_raw if rows is None else key_raw.index_select(0, rows),
+                    buf,
+                    loc,
+                    self.k_norm.weight,
+                    self.k_norm.bias,
+                    self.k_norm.variance_epsilon,
+                    self._indexer_cos_sin_cache,
+                    positions if rows is None else positions.index_select(0, rows),
+                    page_size,
+                )
             return
 
         # Fallback: separate K kernel + store kernel.
@@ -1105,16 +1117,18 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         # on the GEMMs it consumes, not on the other side's fused kernel.
         current_stream = torch.cuda.current_stream()
         self.alt_stream.wait_stream(current_stream)
-        with torch.cuda.stream(self.alt_stream):
-            q = self.wq_b(q_lora)[0].view(-1, self.n_heads, self.head_dim)
-            if num_tokens is not None:
-                q = q[:num_tokens]
 
         kw, _ = self.wk_weights_proj(x)
         key, weights_raw = kw.split([self.head_dim, self.n_heads], dim=-1)
         if num_tokens is not None:
             key = key[:num_tokens]
             weights_raw = weights_raw[:num_tokens]
+
+        # Issued after the main GEMM so the join stays on the main lane at graph replay.
+        with torch.cuda.stream(self.alt_stream):
+            q = self.wq_b(q_lora)[0].view(-1, self.n_heads, self.head_dim)
+            if num_tokens is not None:
+                q = q[:num_tokens]
 
         current_stream.wait_stream(self.alt_stream)
         self.alt_stream.wait_stream(current_stream)
@@ -1506,7 +1520,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if _is_hip and not _use_aiter_preshuffle:
             block_tables = metadata.get_page_table_1()
         else:
-            block_tables = metadata.get_page_table_64()
+            block_tables = metadata.get_logical_page_table()
 
         assert (
             forward_batch.seq_lens_cpu is not None
@@ -1826,13 +1840,13 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             )
         ):
             # NOTE: wrapper already normalizes shape/contiguity and asserts dtypes.
-            buf = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
-            fused_store_index_k_cache(
-                key,
-                buf,
-                out_cache_loc,
-                pool.index_page_size,
-            )
+            for buf, loc, rows in _index_k_write_targets(pool, layer_id, out_cache_loc):
+                fused_store_index_k_cache(
+                    key if rows is None else key.index_select(0, rows),
+                    buf,
+                    loc,
+                    pool.index_page_size,
+                )
             return
 
         # Fast path: AITER fused quant + cache store
@@ -1889,6 +1903,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             x, q_lora, positions, forward_batch, layer_id, return_indices
         )
 
+    @property
+    def topk_output_width(self):
+        return self.index_topk
+
     def forward_cuda(
         self,
         x: torch.Tensor,
@@ -1897,6 +1915,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         forward_batch: ForwardBatch,
         layer_id: int,
         return_indices: bool = True,
+        use_cuda_graph: bool = True,
     ) -> Optional[torch.Tensor]:
         # A padded eager IDLE rank has no real requests and therefore no valid
         # DSA page-table rows to index. Return invalid rows with the physical DP
@@ -1914,15 +1933,15 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             return maybe_capture_indexer_topk(layer_id, topk_result)
 
         if _is_hip and not _is_gfx1250_supported:
-            from sglang.kernels.ops.attention.dsa.tilelang_kernel import act_quant
+            from sglang.kernels.ops.quantization.act_quant_tilelang import act_quant
         elif not _is_npu:
-            from sglang.kernels.ops.attention.dsa.triton_kernel import act_quant
+            from sglang.kernels.ops.quantization.act_quant_triton import act_quant
 
         if TYPE_CHECKING:
             assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
 
         in_piecewise_or_breakable_cuda_graph = (
-            _is_in_piecewise_or_breakable_cuda_graph()
+            use_cuda_graph and _is_in_piecewise_or_breakable_cuda_graph()
         )
 
         # In piecewise/breakable CUDA graph mode, metadata is fetched inside
