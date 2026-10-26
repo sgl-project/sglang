@@ -59,7 +59,8 @@ select_chat_formatter(&ChatFormatterOptions) -> (Option<ChatFormatter>, Option<S
 load_chat_formatter(tokenizer_config, model_path, model_type, chat_template) -> Result<ChatFormatter, TemplateError>
 ChatFormatter::render_prompt(&dyn OAIChatLikeRequest) -> Result<RenderedPrompt, TemplateError>
 ChatFormatter::render_request(serde_json::Value, &default_kwargs) -> Result<(RenderedPrompt, String), TemplateError>  // DeepSeek-V4, V4.1, GLM-5.3, Kimi K3, Qwen3.8
-DeepSeekV4Profile::from_checkpoint(profile_override, encoder_source) -> Result<DeepSeekV4Profile, String>
+ChatFormatter::deepseek_v4(v41, tokenizer_json) -> Result<ChatFormatter, String>
+ChatFormatter::encode_request(serde_json::Value, &default_kwargs) -> Option<Result<Vec<u32>, TemplateError>>  // DeepSeek-V4, V4.1
 ChatFormatter::resolve_thinking(&mut kwargs, tools_enabled, named_tool_choice) -> Option<bool>
 ChatFormatter::stop_strs() -> Option<OneOrMany<String>>
 requested_effort(&body) -> Option<&Value>
@@ -72,8 +73,7 @@ native formatters.
 
 | Model | Formatter |
 |---|---|
-| DeepSeek V4 | `models/deepseek_v4.rs` on Dynamo's V4 encoder |
-| DeepSeek V4.1 | `models/deepseek_v41.rs` on Dynamo's V4.1 encoder |
+| DeepSeek V4, V4.1 | `models/deepseek_v4.rs` on deepseek-recipe |
 | GLM-5.3, GLM-5.3-Flash | `models/glm53.rs` on the checkpoint's Jinja template, picked by the template |
 | Kimi K3 | `models/kimi_k3.rs` on Dynamo's K3 formatter |
 | Qwen3.8 (Max, 27B, Flash-Next) | `models/qwen38.rs` on the checkpoint's Jinja template, picked by the template |
@@ -97,8 +97,11 @@ SGLang tokenizes it on its own. `default_kwargs` are the server's
 `--default-chat-template-kwargs`, which apply after the request's own values.
 On a DeepSeek formatter, `render_prompt` rebuilds the body from the trait; on
 Kimi K3 it keeps Dynamo's request semantics, which typed hosts rely on.
-`from_checkpoint` lets a host that fetches model files itself, such as
-sgl-router, build `ChatFormatter::DeepSeekV4` directly. `requested_effort` and
+DeepSeek prompts are segmented at their special tokens, and `encode_request`
+encodes them with the checkpoint's `tokenizer.json`, plain text without the
+added vocabulary, as SGLang's recipe path does; `deepseek_v4` lets a host that
+fetches model files itself, such as sgl-router, build the formatter with that
+file. `requested_effort` and
 `requested_thinking` (`reasoning.rs`) port `protocol.py`'s `reasoning` handling
 once, for the renderer and DeepSeek-V4 and V4.1 alike. The SGLang additions hook in as follows:
 
@@ -106,8 +109,8 @@ once, for the renderer and DeepSeek-V4 and V4.1 alike. The SGLang additions hook
 |---|---|---|
 | `thinking.rs` | `parser/template_detection.py` | Reads the Jinja template's thinking toggle and its default; `resolve_thinking` writes that default into the kwargs before rendering. |
 | `legacy/` | `parser/conversation.py` | Replaces Dynamo: a native port of `Conversation.get_prompt()`, the built-in templates, and model-path inference. |
-| `models/deepseek_v4.rs` | `entrypoints/openai/serving_chat.py`, `encoding_dsv4.py`, `chat_encoding.py` | Replaces the OAI formatter. It normalises the request the way SGLang does (message dump, part flattening, tool field order, final assistant turn, `task`, thinking and effort, the checkpoint's effort profile), then calls `deepseek::v4::encode_messages_with_options`. |
-| `models/deepseek_v41.rs` | the same, `encoding_dsv41.py` | Replaces the OAI formatter. On top of the V4 dump it keeps text parts lists, sends only the request tool fields the client set, and maps effort to the encoder's 1-100 budget, then calls `deepseek::v41::encode_messages`. Developer turns and media are left to the engine. |
+| `models/deepseek_v4.rs` | `entrypoints/openai/serving_deepseek_recipe.py`, `parser/deepseek_recipe_renderer.py` | Replaces the OAI formatter. It applies SGLang's request semantics (thinking, request and default effort, the env effort, V4.1 numeric budgets, the final assistant turn, `task`, the handler's tool dumps) around deepseek-recipe's Chat Completions conversion and V4 / V4.1 encodings. Media is left to the engine. |
+| `models/pydantic_dump.rs` | `protocol.py` | The message, tool-call and tool dumps that GLM-5.3, Kimi K3 and Qwen3.8 render from. |
 | `models/glm53.rs` | `serving_chat.py` (`_process_messages`, `_apply_jinja_template`), `template_detection.py` | Picked by the template (`_is_glm53`). Builds the template context SGLang builds (message and tool dumps, parsed tool arguments, kwargs over the effort, server defaults), then renders it with Dynamo's Jinja formatter, text parts concatenated as the template does. Media, a `chat_template` kwarg, `-0` and U+001C..U+001F in assistant content are left to the engine. |
 | `models/kimi_k25.rs` | the Kimi K2.5 checkpoint's tool encoder | Adds `tools_ts_str` (TypeScript tool declarations) to the kwargs before the Jinja render. |
 | `models/kimi_k3.rs` | `serving_chat.py` (`_prepare_kimi_k3_messages`, `_encode_messages`), the checkpoint's `encoding_k3.py` | Replaces the OAI formatter's request handling. It prepares the messages, tools, thinking effort, `tool_choice` and `response_format` as SGLang does, then calls Dynamo's `KimiK3Formatter`. Shapes Dynamo renders differently are left to the engine. |
@@ -174,14 +177,15 @@ SGLang additions:
 ## openai
 
 ```rust
-lower_completion(body, &headers, &settings, tokenizer) -> Result<(generate_body, CompletionResponder), Unsupported>
-lower_chat(body, &headers, &settings, &chat_model, render, tokenizer) -> Result<(generate_body, ChatResponder), Unsupported>
+lower_completion(body, &headers, &settings, tokenizer) -> Result<(GenerateRequest, CompletionResponder), Unsupported>
+lower_chat(body, &headers, &settings, &chat_model, render, tokenizer) -> Result<(GenerateRequest, ChatResponder), Unsupported>
 Responder::unary(status, body) / responder.stream_data(frame) -> OpenAI JSON or SSE events
 ```
 
 SGLang-only: Python's OpenAI layer (`entrypoints/openai/`) over the engine's
-`/generate`, for hosts that send generation there. Lowering builds the
-`GenerateReqInput` SGLang's handler would, and the responder turns `/generate`
+`/generate`, for hosts that send generation there. Lowering returns the shared `sglang_api_types::api::v1::GenerateRequest`,
+which hosts serialize to JSON at the transport boundary. It represents the
+`GenerateReqInput` SGLang's handler would build. The responder turns `/generate`
 output into the response SGLang's handler would return. Anything not reproduced
 exactly is `Unsupported`, and the host sends it to the engine's own route.
 `tests/openai_parity.rs` replays fixtures recorded by

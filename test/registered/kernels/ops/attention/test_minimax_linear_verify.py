@@ -16,9 +16,11 @@ from sglang.srt.layers.attention.minimax_sparse_ops.minimax_sparse import (
     minimax_sparse_decode,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.runtime_context import get_platform
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 # One TP4 rank of MiniMax-M3: 16 query heads, 1 KV head, 1 index head.
 NQH, NKH, NIH, HD = 16, 1, 1, 128
@@ -259,8 +261,9 @@ def test_eager_verify_matches_causal_rows(monkeypatch, with_value):
         case.idx_k,
         case.idx_v,
     )
-    # Score-only layers score a request's draft rows in one pass over its index K.
-    assert packed.count == (0 if with_value else 1)
+    # Score-only layers score a request's draft rows in one pass over its index K;
+    # SM90 scores each row of these whole-block pages with its paged kernel.
+    assert packed.count == (0 if with_value or get_platform().is_sm90 else 1)
     _assert_same(got, case.reference(), exact=True)
     # Verify leaves the batch's per-request metadata to the dense layers.
     assert batch.seq_lens.tolist() == [1000, 5118]

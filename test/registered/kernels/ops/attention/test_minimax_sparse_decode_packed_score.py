@@ -12,10 +12,15 @@ from sglang.kernels.ops.attention.minimax_sparse.decode import (
     flash_with_topk_idx as fwti,
 )
 from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_platform
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
+
+# SM90 scores pages that hold whole blocks, as every case here, with its paged kernel.
+pytestmark = pytest.mark.skipif(
+    get_platform().is_sm90, reason="SM90 keeps the paged per-row kernel"
+)
 
 HD, TOPK, PAGE, NDT, BLK = 128, 16, 128, 4, 128
 MAX_CONTEXT = 256 * 1024

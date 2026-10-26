@@ -18,10 +18,10 @@ use crate::node::{KeyNamespaceRef, NodeAccessError, NodeId, TreeCoreRuntimeError
 use crate::unified_lru_list::{TlruFloatConfig, TlruPromptEstimate};
 use crate::unified_tree_core::KvCacheEvent;
 use crate::unified_tree_core::{
-    BufferBackupSnapshot, BufferBackupState, CacheAction, CacheInitParams, CacheTransferPhase,
-    DecLockRefParams, EvictLayer, EvictionStepResult, InsertParams, InsertResult, InsertStepResult,
-    MatchPrefixParams, MatchResult, PoolHitPolicy, PoolName, PoolTransfer, PoolTransferResult, Req,
-    UnifiedTreeCore,
+    BufferBackupSnapshot, BufferBackupState, CacheAction, CacheActions, CacheInitParams,
+    CacheTransferPhase, DecLockRefParams, EvictLayer, EvictionStepResult, InsertParams,
+    InsertResult, InsertStepResult, MatchPrefixParams, MatchResult, PoolHitPolicy, PoolName,
+    PoolTransfer, PoolTransferResult, Req, UnifiedTreeCore,
 };
 
 /// Translate only Rust panics; ordinary Python errors pass through unchanged.
@@ -173,83 +173,13 @@ fn py_array_to_vec_i64(py: Python<'_>, key: &Bound<'_, PyAny>) -> PyResult<Vec<i
     buffer.to_vec(py)
 }
 
-/// The tagged-tuple tag of a cache action.
-fn cache_action_tag(action: &CacheAction) -> &'static str {
-    match action {
-        CacheAction::FreeDeviceKV(_) => "free_device_kv",
-        CacheAction::FreeDeviceKVFullOnly(_) => "free_device_kv_full_only",
-        CacheAction::BackupKV(_) => "backup_kv",
-        CacheAction::UpdatePendingBackupOnNodeSplit { .. } => "update_pending_backup_on_node_split",
-        CacheAction::MambaEvictExcessPathStates { .. } => "mamba_evict_excess_path_states",
-        CacheAction::FreeComponentDeviceSlot { .. } => "free_component_device_slot",
-        CacheAction::FreeComponentHostSlot { .. } => "free_component_host_slot",
-        CacheAction::RebuildFullToSwaMapping { .. } => "rebuild_full_to_swa_mapping",
-        CacheAction::RecoverSwaWithLockedFull { .. } => "recover_swa_with_locked_full",
-        CacheAction::SwaRebuild { .. } => "swa_rebuild",
-    }
-}
-
-/// Convert a cache action into its Python tagged tuple.
-fn cache_action_to_py(py: Python<'_>, action: CacheAction) -> PyResult<Py<PyAny>> {
-    let tag = cache_action_tag(&action);
-    match action {
-        CacheAction::FreeDeviceKV(tensors) => {
-            let tensors = PyList::new(py, tensors.into_iter().map(PyTensor))?;
-            (tag, tensors).into_py_any(py)
-        }
-        CacheAction::FreeDeviceKVFullOnly(tensors) => {
-            let tensors = PyList::new(py, tensors.into_iter().map(PyTensor))?;
-            (tag, tensors).into_py_any(py)
-        }
-        CacheAction::BackupKV(backup) => (tag, backup.node_ids).into_py_any(py),
-        CacheAction::UpdatePendingBackupOnNodeSplit {
-            ack_id,
-            old_node_id,
-            new_node_id,
-            new_child_node_id,
-        } => (tag, ack_id, old_node_id, new_node_id, new_child_node_id).into_py_any(py),
-        CacheAction::MambaEvictExcessPathStates { tail_node_id } => {
-            (tag, tail_node_id).into_py_any(py)
-        }
-        CacheAction::FreeComponentDeviceSlot {
-            component_type,
-            indices,
-        } => {
-            let indices = PyList::new(py, indices.into_iter().map(PyTensor))?;
-            (tag, component_type_to_u8(component_type), indices).into_py_any(py)
-        }
-        CacheAction::FreeComponentHostSlot {
-            component_type,
-            host_indices,
-        } => {
-            let host_indices = PyList::new(py, host_indices.into_iter().map(PyTensor))?;
-            (tag, component_type_to_u8(component_type), host_indices).into_py_any(py)
-        }
-        CacheAction::RebuildFullToSwaMapping {
-            full_indices,
-            swa_indices,
-        } => {
-            let full_indices = PyList::new(py, full_indices.into_iter().map(PyTensor))?;
-            let swa_indices = PyList::new(py, swa_indices.into_iter().map(PyTensor))?;
-            (tag, full_indices, swa_indices).into_py_any(py)
-        }
-        CacheAction::RecoverSwaWithLockedFull {
-            node_id,
-            kept_full,
-            incoming_full,
-        } => (tag, node_id, PyTensor(kept_full), PyTensor(incoming_full)).into_py_any(py),
-        CacheAction::SwaRebuild {
-            node_id,
-            source_value,
-        } => (tag, node_id, PyTensor(source_value)).into_py_any(py),
-    }
-}
+mod cache_action;
 
 /// Convert cache actions into a Python list of tagged tuples.
-fn cache_actions_to_py(py: Python<'_>, actions: Vec<CacheAction>) -> PyResult<Py<PyList>> {
+fn cache_actions_to_py(py: Python<'_>, actions: CacheActions) -> PyResult<Py<PyList>> {
     let list = PyList::empty(py);
     for action in actions {
-        list.append(cache_action_to_py(py, action)?)?;
+        list.append(action.into_py_tagged(py)?)?;
     }
     Ok(list.unbind())
 }
@@ -338,6 +268,10 @@ struct InspectionMatchResultInput {
     last_host_node: NodeId,
     #[pyo3(attribute)]
     best_match_node: NodeId,
+    #[pyo3(attribute)]
+    last_visited_node_id: Option<NodeId>,
+    #[pyo3(attribute)]
+    full_device_match_len: Option<usize>,
     #[pyo3(attribute)]
     host_hit_length: usize,
     #[pyo3(attribute)]
@@ -665,6 +599,8 @@ pub struct MatchResultBinding {
     last_device_node_id: NodeId,
     last_host_node_id: NodeId,
     best_match_node_id: NodeId,
+    last_visited_node_id: Option<NodeId>,
+    full_device_match_len: Option<usize>,
     host_hit_length: usize,
     swa_host_hit_length: usize,
     swa_branching_seqlen: Option<usize>,
@@ -682,6 +618,8 @@ impl MatchResultBinding {
             last_device_node_id: result.last_device_node_id,
             last_host_node_id: result.last_host_node_id,
             best_match_node_id: result.best_match_node_id,
+            last_visited_node_id: result.last_visited_node_id,
+            full_device_match_len: result.full_device_match_len,
             host_hit_length: result.host_hit_length,
             swa_host_hit_length: result.swa_host_hit_length,
             swa_branching_seqlen: result.swa_branching_seqlen,
@@ -1579,7 +1517,7 @@ macro_rules! tree_core_methods {
                 Ok(EvictDeviceLeafResultBinding {
                     unbacked_tokens: result.unbacked_tokens,
                     backup_kv: backup
-                        .map(|backup| cache_action_to_py(py, CacheAction::BackupKV(backup)))
+                        .map(|backup| backup.into_py_tagged(py))
                         .transpose()?,
                     tracker: tracker_to_py(result.tracker),
                     new_device_frees: frees_to_py(py, result.device_frees)?,
@@ -1766,7 +1704,7 @@ macro_rules! tree_core_methods {
                 let backup = py
                     .detach(|| self.core().build_backup_kv_action(node_id))
                     .map_err(node_access_error)?;
-                cache_action_to_py(py, CacheAction::BackupKV(backup))
+                backup.into_py_tagged(py)
             }
 
             /// Gather a node's device value plus per-component BACKUP_HOST transfers.
@@ -2709,6 +2647,8 @@ macro_rules! tree_core_methods {
                     last_device_node: last_device_node_id,
                     last_host_node: last_host_node_id,
                     best_match_node: best_match_node_id,
+                    last_visited_node_id,
+                    full_device_match_len,
                     host_hit_length,
                     swa_host_hit_length,
                     swa_branching_seqlen,
@@ -2721,6 +2661,8 @@ macro_rules! tree_core_methods {
                     last_device_node_id,
                     last_host_node_id,
                     best_match_node_id,
+                    last_visited_node_id,
+                    full_device_match_len,
                     host_hit_length,
                     swa_host_hit_length,
                     swa_branching_seqlen,

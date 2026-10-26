@@ -323,6 +323,8 @@ class Ideogram4ProgressiveDenoisingStage(
                 "ideogram4_neg_attn_mask": neg_attn_mask,
                 "ideogram4_neg_attn_mask_meta": build_varlen_mask_meta(neg_attn_mask),
                 "ideogram4_neg_llm_features": neg_llm_features,
+                # the LLM conditioning follows the new sequence length
+                "ideogram4_llm_cond": {},
             }
         )
 

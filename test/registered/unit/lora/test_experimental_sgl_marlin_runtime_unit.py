@@ -97,6 +97,14 @@ def test_cuda_only_kernel_imports_resolve():
     )
 
     imports: list[tuple[str, str]] = []
+    # The staged virtual helper is imported inside the entry, outside _is_cuda.
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.ImportFrom)
+            and node.module
+            == "sglang.kernels.ops.lora.moe.trtllm_lora_temp.virtual_experts"
+        ):
+            imports.extend((node.module, alias.name) for alias in node.names)
     for node in ast.walk(guarded[0]):
         assert not isinstance(node, ast.Import), (
             "plain `import X` inside the `if _is_cuda:` block is not covered by "
@@ -180,17 +188,24 @@ def _run_marlin_flow(
     ep: bool = False,
     slots: int = 1,
     rank: int = 1,
+    paired_prewarm: bool = True,
 ):
     """Run the real runner against recording fakes and return what it did
     (scheduling, stream ownership, buffer identity -- never kernel numerics)."""
 
     calls = SimpleNamespace(
         merged=[],
+        paired_prewarm=[],
         fused_tails=0,
         marlin_is_ep=[],
+        marlin_sorted=[],
+        marlin_inactive_prefix=[],
         marlin_output_ids=[],
         marlin_output_initialized=[],
+        marlin_zero_inactive_output=[],
         align_num_experts=[],
+        align_inactive_prefix=[],
+        align_maps_invalid=[],
         schedule=[],
         zeroed=[],
         event_records=[],
@@ -258,6 +273,46 @@ def _run_marlin_flow(
         return result
 
     monkeypatch.setattr(torch, "empty", poisoned_empty)
+    original_new_empty = torch.Tensor.new_empty
+
+    def tracked_new_empty(tensor, size, *args, **kwargs):
+        result = original_new_empty(tensor, size, *args, **kwargs)
+        calls.schedule.append(
+            ("allocate", stream_state["current"].name, tuple(size), id(result))
+        )
+        return result
+
+    monkeypatch.setattr(torch.Tensor, "new_empty", tracked_new_empty)
+
+    def prewarm_per_expert_lora_routes(
+        hidden,
+        shrink_a,
+        expand_b,
+        ids,
+        mapping,
+        routing_cache,
+        *,
+        shrink_lora_b,
+        adapter_enabled,
+        include_inactive_routes,
+        local_expert_offset,
+        local_num_experts,
+    ):
+        assert hidden is hidden_states
+        assert shrink_a is lora_info.down_lora_a_weights
+        assert expand_b is lora_info.gate_up_lora_b_weights
+        assert shrink_lora_b is lora_info.down_lora_b_weights
+        assert ids is topk_ids
+        assert mapping is lora_info.token_lora_mapping
+        assert isinstance(routing_cache, dict)
+        assert adapter_enabled is lora_info.adapter_enabled
+        assert include_inactive_routes is True
+        assert local_expert_offset == 0
+        assert local_num_experts == num_experts
+        assert stream_state["current"] is main_stream
+        calls.paired_prewarm.append(paired_prewarm)
+        calls.schedule.append(("paired_prewarm", "main", paired_prewarm))
+        return paired_prewarm
 
     def merged_experts_fused_moe_lora_add(**kwargs):
         intermediate = kwargs.get("intermediate_buffer")
@@ -272,8 +327,11 @@ def _run_marlin_flow(
                 "intermediate_id": buffer_id,
                 "shared_b": kwargs["experts_shared_outer_loras_b"],
                 "zero_intermediate": kwargs.get("zero_intermediate", False),
+                "include_inactive_routes": kwargs["include_inactive_routes"],
             }
         )
+        assert kwargs["adapter_enabled"] is lora_info.adapter_enabled
+        assert kwargs["include_inactive_routes"] is True
 
     _stub_module(
         monkeypatch,
@@ -285,6 +343,7 @@ def _run_marlin_flow(
         monkeypatch,
         "sglang.kernels.ops.lora.moe.trtllm_lora_temp.virtual_experts",
         merged_experts_fused_moe_lora_add=merged_experts_fused_moe_lora_add,
+        _prewarm_per_expert_lora_routes=prewarm_per_expert_lora_routes,
     )
     _stub_module(
         monkeypatch,
@@ -299,6 +358,12 @@ def _run_marlin_flow(
 
     def fake_align(_topk_ids, _block_size, num_experts, **_kwargs):
         calls.align_num_experts.append(num_experts)
+        calls.align_inactive_prefix.append(
+            _kwargs.get("return_inactive_prefix_count", False)
+        )
+        calls.align_maps_invalid.append(
+            _kwargs.get("map_invalid_experts_to_sentinel", True)
+        )
         return (
             torch.zeros(1, dtype=torch.int32),
             torch.zeros(1, dtype=torch.int32),
@@ -307,6 +372,13 @@ def _run_marlin_flow(
 
     def fake_marlin_gemm(_x, output, *_args, **kwargs):
         calls.marlin_is_ep.append(kwargs["is_ep"])
+        calls.marlin_sorted.append(kwargs.get("expert_ids_are_sorted", False))
+        calls.marlin_inactive_prefix.append(
+            kwargs.get("has_inactive_prefix_count", False)
+        )
+        calls.marlin_zero_inactive_output.append(
+            kwargs.get("zero_inactive_output", False)
+        )
         calls.marlin_output_ids.append(id(output))
         calls.marlin_output_initialized.append(
             bool(torch.isfinite(output).all() and torch.count_nonzero(output) == 0)
@@ -318,7 +390,8 @@ def _run_marlin_flow(
         output.fill_(0)
         return output
 
-    def fake_silu_and_mul_add_delta(_x, _delta, output):
+    def fake_silu_and_mul_add_delta(_x, _delta, output, **kwargs):
+        assert not kwargs, "Completed private projections use the original activation"
         calls.schedule.append(("activation", stream_state["current"].name))
         output.fill_(0)
 
@@ -332,7 +405,9 @@ def _run_marlin_flow(
         *,
         block_m,
         block_k,
+        topk_ids,
     ):
+        assert topk_ids is dispatch_output.topk_output.topk_ids
         calls.fused_tails += 1
         calls.schedule.append(
             ("fused_tail", stream_state["current"].name, block_m, block_k)
@@ -402,6 +477,7 @@ def _run_marlin_flow(
             else torch.arange(tokens, dtype=torch.int32).remainder(slots)
         ),
         experts_shared_outer_loras=True,
+        adapter_enabled=torch.full((slots,), active_lora, dtype=torch.int32),
     )
     runner_config = SimpleNamespace(
         activation="silu",
@@ -422,20 +498,64 @@ def _run_marlin_flow(
 
 
 def test_ep_uses_local_alignment_and_skips_nonlocal_marlin_blocks(monkeypatch):
-    """EP alignment stays local and the down accumulator starts finite and zero."""
+    """EP stays local and delegates inactive output writes to the down GEMM."""
 
     calls = _run_marlin_flow(monkeypatch, tokens=16, ep=True, slots=2, rank=128)
 
     assert calls.align_num_experts == [1]
     assert calls.marlin_is_ep == [True, True]
+    assert calls.marlin_sorted == [False, False]
+    assert calls.align_inactive_prefix == [False]
+    assert calls.align_maps_invalid == [False]
+    assert calls.marlin_inactive_prefix == [False, False]
 
-    assert calls.marlin_output_initialized[1]
+    assert calls.marlin_zero_inactive_output == [True, True]
+    assert not any(calls.marlin_output_initialized)
 
     down_stage = [
         call for call in calls.merged if call["stage"] == "all" and call["shared_b"]
     ]
     assert len(down_stage) == 1
     assert down_stage[0]["zero_intermediate"] is True
+
+
+@pytest.mark.parametrize("paired_prewarm", [False, True])
+def test_factored_prewarm_runs_on_main_before_rank_buffers_and_side_fork(
+    monkeypatch, paired_prewarm
+):
+    calls = _run_marlin_flow(
+        monkeypatch,
+        tokens=16,
+        two_stream=True,
+        capture=True,
+        paired_prewarm=paired_prewarm,
+    )
+    assert calls.paired_prewarm == [paired_prewarm]
+    paired_index = calls.schedule.index(("paired_prewarm", "main", paired_prewarm))
+    first_side_wait = next(
+        index
+        for index, item in enumerate(calls.schedule)
+        if item[:2] == ("wait_stream", "side")
+    )
+    activation_index = next(
+        index for index, item in enumerate(calls.schedule) if item[0] == "activation"
+    )
+    rank_allocations = [
+        (index, item)
+        for index, item in enumerate(calls.schedule)
+        if item[0] == "allocate" and item[2] in ((16, 2), (16, 2, 1))
+    ]
+    assert len(rank_allocations) == 2
+    assert all(item[1] == "main" for _, item in rank_allocations)
+    assert paired_index < min(index for index, _ in rank_allocations)
+    assert paired_index < first_side_wait < activation_index
+    routing = [call for call in calls.merged if call["stage"] == "routing"]
+    assert len(routing) == (0 if paired_prewarm else 2)
+    assert all(call["stream"] == "main" for call in routing)
+    assert [call["stage"] for call in calls.merged if call["stage"] != "routing"] == [
+        "expand",
+        "shrink",
+    ]
 
 
 def test_factored_decode_captured_two_stream_schedule_ownership_and_event_lifetime(
@@ -453,6 +573,11 @@ def test_factored_decode_captured_two_stream_schedule_ownership_and_event_lifeti
         active_lora=False,
         base_mapping=True,
     )
+
+    assert calls.marlin_sorted == [True, True]
+    assert calls.align_inactive_prefix == [True]
+    assert calls.align_maps_invalid == [False]
+    assert calls.marlin_inactive_prefix == [True, True]
 
     # Capture records the LoRA stages even with no live adapter.
     shrinks = [call for call in calls.merged if call["stage"] == "shrink"]
