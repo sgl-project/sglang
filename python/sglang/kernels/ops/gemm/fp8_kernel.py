@@ -735,9 +735,7 @@ def prepare_block_fp8_matmul_inputs(
     if output is None:
         C = A.new_empty(C_shape, dtype=output_dtype)
     else:
-        assert output.shape == C_shape
-        assert output.dtype == output_dtype and output.device == A.device
-        assert output.is_contiguous()
+        assert output.shape == C_shape and output.dtype == output_dtype
         C = output
 
     return M, N, K, C

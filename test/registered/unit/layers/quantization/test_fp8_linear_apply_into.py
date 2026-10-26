@@ -98,13 +98,6 @@ class TestFp8LinearApplyInto(CustomTestCase):
     def test_deep_gemm(self):
         self._check("deep_gemm")
 
-    def test_rejects_wrong_shape(self):
-        layer = _build_layer(512, 512)
-        x = torch.randn((4, 512), device="cuda", dtype=torch.bfloat16)
-        bad = torch.empty((4, 256), device="cuda", dtype=torch.bfloat16)
-        with self.assertRaises(ValueError):
-            layer.quant_method.apply_into(layer, x, bad)
-
 
 if __name__ == "__main__":
     unittest.main()

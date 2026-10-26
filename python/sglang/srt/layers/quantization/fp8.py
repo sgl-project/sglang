@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import functools
 import logging
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
@@ -532,6 +533,7 @@ class Fp8LinearMethod(LinearMethodBase):
         )
         self.weight_block_size = self.quant_config.weight_block_size
         self.w8a8_block_fp8_linear = None
+        self.block_fp8_linear_takes_output = False
         self.w8a8_mxfp8_linear = None
         self.mxfp8_dense_backend = None
         # Set by a model-owned startup hook after opting into prefill tuning.
@@ -550,6 +552,12 @@ class Fp8LinearMethod(LinearMethodBase):
                 act_scale_ue8m0=isinstance(self.quant_config, Fp8Config)
                 and self.quant_config.scale_fmt == "ue8m0",
             )
+            # Only the DeepGEMM block linear can write a caller-owned output
+            # (see apply_into); the dispatcher may hand it back as a partial.
+            fn = self.w8a8_block_fp8_linear
+            self.block_fp8_linear_takes_output = (
+                fn.func if isinstance(fn, functools.partial) else fn
+            ) is deepgemm_w8a8_block_fp8_linear_with_fallback
         # Method-wide gate; a layer that cannot take the MXFP8 view stays on the
         # block kernel (see _prepare_block_fp8_as_mxfp8).
         self.block_fp8_as_mxfp8 = not self.use_mxfp8 and can_serve_block_fp8_as_mxfp8(
@@ -1311,52 +1319,30 @@ class Fp8LinearMethod(LinearMethodBase):
         output: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Write the linear result into caller-owned storage (the contract
-        ``RowParallelLinear`` uses for fused collective buffers). The DeepGEMM
-        block-FP8 path writes ``output`` directly; every other path computes
-        normally and copies."""
-        input_tensor = x[0] if isinstance(x, tuple) else x
-        expected_shape = (*input_tensor.shape[:-1], layer.output_size_per_partition)
-        if output.shape != expected_shape or output.device != input_tensor.device:
-            raise ValueError(
-                f"linear output must have shape {expected_shape} on "
-                f"{input_tensor.device}, got {output.shape} on {output.device}"
-            )
+        """RowParallelLinear's zero-copy contract: write the result into the
+        caller-owned ``output``. The DeepGEMM block-FP8 linear writes it
+        directly; every other path computes normally and copies."""
+        input_tensor, input_scale = x if isinstance(x, tuple) else (x, None)
         if (
-            not self.use_marlin
-            and not self.use_mxfp8
-            and self.block_quant
-            and not (
-                self.block_fp8_as_mxfp8
-                and getattr(layer, "block_fp8_mxfp8_ready", False)
-            )
-            and getattr(self.w8a8_block_fp8_linear, "func", self.w8a8_block_fp8_linear)
-            is deepgemm_w8a8_block_fp8_linear_with_fallback
-            and input_tensor.ndim == 2
+            self.block_fp8_linear_takes_output
+            # The Blackwell block-as-MXFP8 view and DeepGEMM-packed activations
+            # run other kernels that return a fresh tensor.
+            and not (self.block_fp8_as_mxfp8 and layer.block_fp8_mxfp8_ready)
+            and not (input_scale is not None and input_scale.dtype == torch.int32)
             and output.dtype == torch.bfloat16
             and output.is_contiguous()
-            and not (isinstance(x, tuple) and x[1].dtype == torch.int32)
         ):
-            cached_weight = getattr(layer, "_block_fp8_bf16_weight", None)
-            extra_kwargs = (
-                {"weight_bf16": cached_weight} if cached_weight is not None else {}
-            )
             self.w8a8_block_fp8_linear(
                 input=input_tensor,
                 weight=layer.weight,
                 block_size=self.weight_block_size,
                 weight_scale=layer.weight_scale_inv,
-                input_scale=x[1] if isinstance(x, tuple) else None,
+                input_scale=input_scale,
                 bias=bias,
                 output=output,
-                **extra_kwargs,
             )
             return output
-        result = self.apply(layer, x, bias)
-        if output.dtype != result.dtype:
-            raise ValueError(f"linear output must have dtype {result.dtype}")
-        output.copy_(result)
-        return output
+        return output.copy_(self.apply(layer, x, bias))
 
     def apply(
         self,

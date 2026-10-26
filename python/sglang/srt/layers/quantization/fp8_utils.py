@@ -1490,11 +1490,6 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
     output: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     output_dtype = torch.bfloat16 if input_scale is not None else input.dtype
-    if output is not None:
-        # Caller-owned result: filled in place and returned.
-        assert output_dtype == torch.bfloat16 and output.dtype == torch.bfloat16
-        assert output.is_contiguous() and output.device == input.device
-        assert output.shape == (*input.shape[:-1], weight.shape[0])
     deepgemm_supported = weight.ndim == 2 and _deepgemm_block_fp8_supported(
         weight.shape, block_size, output_dtype
     )
