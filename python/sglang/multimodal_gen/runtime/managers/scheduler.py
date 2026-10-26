@@ -54,6 +54,11 @@ from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 from sglang.multimodal_gen.runtime.managers.pi05_segment_scheduler import (
     Pi05SegmentSchedulerMixin,
 )
+from sglang.multimodal_gen.runtime.managers.progress_reporter import (
+    get_progress_reporter,
+    init_progress_reporter,
+)
+from sglang.multimodal_gen.runtime.managers.request_gc import request_gc
 from sglang.multimodal_gen.runtime.observability.metrics import DiffusionMetrics
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.request_utils import (
@@ -162,6 +167,10 @@ class Scheduler(
                 f"Scheduler (dp replica {self.dp_replica}) bind at endpoint: "
                 f"{actual_endpoint}"
             )
+            if server_args.progress_endpoint is not None:
+                init_progress_reporter(
+                    context=self.context, endpoint=server_args.progress_endpoint
+                )
         else:
             self.receiver = None
         from sglang.multimodal_gen.runtime.platforms import current_platform
@@ -334,6 +343,13 @@ class Scheduler(
         """Dispatch generation requests, merging compatible requests when allowed."""
         reqs = self._normalize_generation_reqs(reqs)
         if self._async_output_save:
+            # continuous forward/save overlap must occasionally leave GC enabled
+            if request_gc.needs_collection_window() or any(
+                req.is_warmup or req.extra.get("server_internal_prewarm")
+                for req in reqs
+            ):
+                while self._inflight_finalizes:
+                    self._inflight_finalizes.popleft().result()
             # Reserve capacity before any forward allocates another output.
             # The single finalize worker completes futures in FIFO order.
             while len(self._inflight_finalizes) >= _MAX_INFLIGHT_FINALIZES:
@@ -346,6 +362,11 @@ class Scheduler(
         warmup_reqs = [req for req in reqs if req.is_warmup]
         if warmup_reqs:
             self._ensure_warmup_progress_bar(warmup_reqs[0])
+        progress_reporter = get_progress_reporter()
+        if progress_reporter is not None:
+            for req in reqs:
+                if req.report_progress and not req.is_warmup:
+                    progress_reporter.start(request_ids=req.client_request_ids())
 
         # Use the head request trace context for scheduler-side dispatch work.
         req = reqs[0]
@@ -821,6 +842,7 @@ class Scheduler(
             is_warmup_req(processed_req) and should_return_warmup_result(processed_req)
         )
 
+    @request_gc.defer()
     def return_result(
         self,
         output_batch: OutputBatch,
@@ -839,7 +861,7 @@ class Scheduler(
                         output_batch, "Scheduler.return_result.spill_arrays"
                     ):
                         output_batch.output = spill_large_arrays_to_file_refs(
-                            output_batch.output
+                            output_batch.output, identity
                         )
 
                 with self._record_return_stage(
@@ -917,6 +939,7 @@ class Scheduler(
         )
         self._inflight_finalizes.append(future)
 
+    @request_gc.defer()
     def _finalize_and_reply(
         self,
         *,
@@ -1074,6 +1097,12 @@ class Scheduler(
                         req.output_file_path(req.num_outputs_per_prompt, output_idx)
                     )
             merged_req.extra["dynamic_batch_output_paths"] = dynamic_output_paths
+        merged_req.merged_request_ids = [
+            req.request_id
+            for req in reqs
+            if req.report_progress and req.request_id is not None
+        ]
+        merged_req.report_progress = bool(merged_req.merged_request_ids)
         merged_req.request_id = f"dynamic_batch::{merged_req.request_id}"
 
         return merged_req
