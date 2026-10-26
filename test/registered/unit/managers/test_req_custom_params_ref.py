@@ -41,8 +41,7 @@ class TestReqCustomParamsRef(CustomTestCase):
             gc.enable()
 
     def test_req_with_a_processor_is_freed_by_refcount(self):
-        """The "__req__" entry a custom logit processor reads must not keep
-        the request alive either."""
+        """A custom logit processor's "__req__" entry must not keep the request alive."""
         gc.disable()
         try:
             req = _make_req(

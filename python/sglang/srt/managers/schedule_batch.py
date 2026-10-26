@@ -1168,9 +1168,8 @@ class Req(ReqDllmMixin):
         self._think_end_matcher: Optional[TokenSequenceMatcher] = None
         self._think_end_match_len = 0
 
-        # Only custom logit processors read "__req__". The reference is weak:
-        # a strong one would make the request cyclic garbage, kept with
-        # everything it holds until the cyclic collector runs.
+        # Only custom logit processors read "__req__", and the reference is weak
+        # so the request still dies by refcount.
         if custom_logit_processor is not None and isinstance(
             sampling_params.custom_params, dict
         ):
