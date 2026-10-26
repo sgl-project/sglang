@@ -3540,12 +3540,28 @@ class AscendAttnMultiStepDraftBackend:
         # ancestors, not its siblings. Installed only here, so the shared draft
         # loop's hook stays inert on every other platform and algorithm.
         self.tree_sparse_state = None
-        if topk > 1 and is_deepseek_dsa(model_runner.model_config.hf_config):
-            from sglang.srt.hardware_backend.npu.attention.tree_sparse_indices import (
-                DraftTreeSparseState,
-            )
+        if topk > 1:
+            if is_deepseek_dsa(model_runner.model_config.hf_config):
+                from sglang.srt.hardware_backend.npu.attention.tree_sparse_indices import (
+                    DraftTreeSparseState,
+                )
 
-            self.tree_sparse_state = DraftTreeSparseState(topk, speculative_num_steps)
+                self.tree_sparse_state = DraftTreeSparseState(
+                    topk, speculative_num_steps
+                )
+            else:
+                # Never let a wider tree silently fall back to a linear causal
+                # draft view: the accept-rate work would look "done" and do
+                # nothing.
+                logger.warning(
+                    "Draft tree sparse indices are only implemented for DSA "
+                    "models, but the draft config is %s; running topk=%d with a "
+                    "linear causal view (candidates see their siblings).",
+                    getattr(
+                        model_runner.model_config.hf_config, "architectures", None
+                    ),
+                    topk,
+                )
 
         self.attn_backends = []
         for step_id in range(self.speculative_num_steps):
