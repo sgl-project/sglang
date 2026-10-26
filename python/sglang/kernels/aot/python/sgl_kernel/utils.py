@@ -42,10 +42,6 @@ def cache_once(fn):
     return wrapper
 
 
-def is_sail() -> bool:
-    return torch.cuda.is_available() and "ZW" in torch.cuda.get_device_name()
-
-
 @cache_once
 def is_arch_support_pdl() -> bool:
     if getattr(torch.version, "hip", None) or getattr(torch.version, "musa", None):

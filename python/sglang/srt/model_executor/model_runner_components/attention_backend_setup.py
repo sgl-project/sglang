@@ -11,7 +11,7 @@ from sglang.srt.layers.attention.attention_registry import (
     attn_backend_wrapper,
 )
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_platform
 from sglang.srt.utils import init_cublas
 
 if TYPE_CHECKING:
@@ -211,9 +211,14 @@ def _build_resolved_backend(
             init_new_workspace=init_new_workspace,
         )
     elif resolved.decode != resolved.prefill:
-        from sglang.srt.layers.attention.hybrid_attn_backend import (
-            HybridAttnBackend,
-        )
+        if get_platform().is_sail:
+            from sglang.srt.hardware_backend.sail.attention.hybrid_attn_backend import (
+                SailHybridAttnBackend as HybridAttnBackend,
+            )
+        else:
+            from sglang.srt.layers.attention.hybrid_attn_backend import (
+                HybridAttnBackend,
+            )
 
         # Compose the two full-attention backends first, then apply model-level
         # wrappers once.  Wrapping each child independently duplicates the

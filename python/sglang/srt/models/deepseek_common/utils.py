@@ -74,8 +74,10 @@ FORWARD_ABSORB_CORE_ATTENTION_BACKENDS = [
     "cutedsl_mla",
     "ascend",
     "intel_xpu",
-    "flashmla",
 ]
+if _is_sail:
+    # SailFlashMLABackend takes the absorbed q/k split into nope and rope parts.
+    FORWARD_ABSORB_CORE_ATTENTION_BACKENDS.append("flashmla")
 
 
 def _is_block_scale_fp8(proj: torch.nn.Module) -> bool:

@@ -10,6 +10,8 @@ flash_mla_with_kvcache
 flash_mla_sparse_fwd
 """
 
+from __future__ import annotations
+
 from typing import Optional, Tuple
 
 import torch

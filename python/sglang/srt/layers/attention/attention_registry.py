@@ -150,6 +150,13 @@ def create_ascend_backend(runner):
 
 @register_attention_backend("dsa")
 def create_dsa_backend(runner):
+    if _is_sail:
+        from sglang.srt.hardware_backend.sail.attention.dsa_backend import (
+            SailDeepseekSparseAttnBackend,
+        )
+
+        return SailDeepseekSparseAttnBackend(runner)
+
     from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
 
     return DeepseekSparseAttnBackend(runner)
@@ -231,6 +238,13 @@ def create_flex_attention_backend(runner):
 
 @register_attention_backend("flashmla")
 def create_flashmla_backend(runner):
+    if _is_sail:
+        from sglang.srt.hardware_backend.sail.attention.flashmla_backend import (
+            SailFlashMLABackend,
+        )
+
+        return SailFlashMLABackend(runner)
+
     from sglang.srt.layers.attention.flashmla_backend import FlashMLABackend
 
     return FlashMLABackend(runner)
@@ -247,6 +261,13 @@ def create_flashattention_v3_backend(runner):
             "FlashAttention v3 Backend requires SM>=80 and SM<=90. "
             "Please use `--attention-backend flashinfer`."
         )
+        if _is_sail:
+            from sglang.srt.hardware_backend.sail.attention.flashattention_backend import (
+                SailFlashAttentionBackend,
+            )
+
+            return SailFlashAttentionBackend(runner)
+
         from sglang.srt.layers.attention.flashattention_backend import (
             FlashAttentionBackend,
         )

@@ -8,12 +8,17 @@ import os
 from typing import Any
 
 from sglang.srt.arg_groups.overrides import (
+    attention_backends_of,
     declare_resolution,
     model_config_of,
     record_foreign_defaults,
+    register_post_process,
+    resolved_view,
     resolving_view,
+    run_post_process_pass,
     use_mla_backend,
 )
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.runtime_context import get_platform
@@ -176,6 +181,86 @@ def handle_sail_backends(server_args: Any):
                 cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
             ),
         )
+
+
+@register_post_process
+def _sail_fa3_flashmla_qv_fallback(view: Any) -> dict:
+    if not get_platform().is_sail or attention_backends_of(view) != (
+        "fa3",
+        "flashmla",
+    ):
+        return {}
+
+    mtp_wo_decode_sam = (
+        view.speculative_algorithm is not None
+        and view.speculative_attention_mode != "decode"
+    )
+    prefill_cg_enabled = (
+        view.cuda_graph_config is not None
+        and view.cuda_graph_config.prefill.backend != Backend.DISABLED
+    )
+    chunked_prefix_disabled = view.disable_chunked_prefix_cache
+    if not (mtp_wo_decode_sam or prefill_cg_enabled or chunked_prefix_disabled):
+        return {}
+
+    reasons = []
+    if mtp_wo_decode_sam:
+        reasons.append("MTP enabled without --speculative-attention-mode decode")
+    if prefill_cg_enabled:
+        reasons.append("prefill-phase CUDA graph is not disabled")
+    if chunked_prefix_disabled:
+        reasons.append("--disable-chunked-prefix-cache is set")
+    logger.warning(
+        "Unsafe SAIL attention backend combo fa3 prefill + flashmla decode: %s. "
+        "Falling back to a unified flashmla backend to avoid 'q_v not support'. "
+        "To keep fa3 prefill, use --speculative-attention-mode decode, disable "
+        "the prefill CUDA graph, and do not set --disable-chunked-prefix-cache.",
+        "; ".join(reasons),
+    )
+    return {"prefill_attention_backend": "flashmla"}
+
+
+@register_post_process
+def _sail_flashmla_fp8_kv_cache_fallback(view: Any) -> dict:
+    if not get_platform().is_sail or view.kv_cache_dtype not in (
+        "fp8_e4m3",
+        "fp8_e5m2",
+    ):
+        return {}
+
+    prefill_backend, decode_backend = attention_backends_of(view)
+    incompatible = []
+    if "flashmla" in (prefill_backend, decode_backend):
+        incompatible.append("flashmla")
+    if view.speculative_draft_attention_backend == "flashmla":
+        incompatible.append("draft flashmla")
+    if view.dsa_prefill_backend == "flashmla_sparse":
+        incompatible.append("flashmla_sparse")
+    if not incompatible:
+        return {}
+
+    logger.warning(
+        "On SAIL, %s does not support --kv-cache-dtype %s. "
+        "Falling back to --kv-cache-dtype auto.",
+        " and ".join(incompatible),
+        view.kv_cache_dtype,
+    )
+    return {"kv_cache_dtype": "auto"}
+
+
+def handle_sail_attention_backend_compatibility(server_args: Any):
+    if not get_platform().is_sail:
+        return
+
+    run_post_process_pass(server_args, _sail_fa3_flashmla_qv_fallback)
+    run_post_process_pass(server_args, _sail_flashmla_fp8_kv_cache_fallback)
+    cfg = resolved_view(server_args)
+    if "fa3" in (
+        cfg.attention_backend,
+        *attention_backends_of(cfg),
+        cfg.speculative_draft_attention_backend,
+    ):
+        envs.SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD.set(0)
 
 
 def handle_cpu_backends(server_args: Any):
