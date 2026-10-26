@@ -16,6 +16,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 # One TP4 rank of MiniMax-M3: 16 query heads, 1 KV head, 1 index head.
 NQH, NKH, NIH, HD = 16, 1, 1, 128

@@ -279,9 +279,16 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
 
         spec = get_spec()
         self.speculative_num_draft_tokens = spec.speculative_num_draft_tokens
-        # GPU verify runs each draft token as one causal sparse-decode row.
+        # GPU verify runs each draft token as one causal sparse-decode row. ROCm
+        # accepts any draft with top-k 1; CUDA takes the chain-layout allowlist.
         self._linear_verify = not self.is_npu
-        if self._linear_verify and not draft_is_chain_layout(
+        if is_hip() and spec.speculative_algorithm is not None:
+            if spec.speculative_eagle_topk != 1:
+                raise NotImplementedError(
+                    "MiniMax-M3 ROCm speculative attention requires a linear "
+                    "draft chain (--speculative-eagle-topk 1)."
+                )
+        elif self._linear_verify and not draft_is_chain_layout(
             spec.speculative_algorithm, spec.speculative_eagle_topk
         ):
             raise NotImplementedError(
