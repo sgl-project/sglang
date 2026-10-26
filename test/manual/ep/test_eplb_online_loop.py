@@ -26,10 +26,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", choices=["cpu", "npu"], default="cpu")
     parser.add_argument("--rebalance-threshold", type=float, default=1.0)
-    parser.add_argument("--reuse-tp-group", action="store_true")
     args = parser.parse_args()
-    if args.reuse_tp_group and args.device != "npu":
-        parser.error("--reuse-tp-group requires --device npu")
     if not 0 <= args.rebalance_threshold <= 1:
         parser.error("--rebalance-threshold must be in [0, 1]")
     if int(os.environ.get("WORLD_SIZE", "1")) != 2:
@@ -79,11 +76,6 @@ def main():
         backend="hccl" if args.device == "npu" else "gloo",
         timeout=datetime.timedelta(seconds=60),
     )
-    tp_device_group = None
-    if args.reuse_tp_group:
-        tp_device_group = dist.new_group(ranks=[0, 1], backend="hccl")
-        # Model TP collectives initialize this communicator before EPLB runs.
-        dist.all_reduce(torch.zeros(1, device="npu"), group=tp_device_group)
     reports = []
     try:
         # Only model metadata and the hardware selection are substituted.
@@ -99,16 +91,6 @@ def main():
                     "sglang.srt.eplb.expert_distribution.get_device", return_value="cpu"
                 )
                 if args.device == "cpu"
-                else nullcontext()
-            ),
-            (
-                patch(
-                    "sglang.srt.eplb.comm_utils.get_tp_group",
-                    return_value=SimpleNamespace(
-                        ranks=[0, 1], device_group=tp_device_group
-                    ),
-                )
-                if args.reuse_tp_group
                 else nullcontext()
             ),
         ):
@@ -294,7 +276,6 @@ def main():
                     {
                         "status": "passed",
                         "scope": f"synthetic routing / real {args.device} EPLB loop",
-                        "reuse_tp_group": args.reuse_tp_group,
                         "reports": reports,
                     }
                 )

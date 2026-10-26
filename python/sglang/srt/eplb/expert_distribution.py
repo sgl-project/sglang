@@ -39,8 +39,10 @@ import torch
 import torch.distributed
 
 from sglang.srt.environ import envs
-from sglang.srt.eplb.comm_utils import get_eplb_device_group
-from sglang.srt.eplb.npu_statistics import BatchedTopKStatisticsMixin
+from sglang.srt.hardware_backend.npu.eplb import (
+    BatchedTopKStatisticsMixin,
+    get_eplb_device_group,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_EXPERT_DISPATCH,
@@ -258,25 +260,23 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         if self._disable_all:
             return
         for gatherer in self._single_pass_gatherers.values():
-            prepare = getattr(gatherer, "on_graph_capture_forward_start", None)
-            if prepare is not None:
-                prepare()
+            gatherer.on_graph_capture_forward_start()
 
     def get_graph_capture_state(self):
         if self._disable_all:
             return {}
         return {
-            key: gatherer.get_graph_capture_state()
+            key: state
             for key, gatherer in self._single_pass_gatherers.items()
-            if hasattr(gatherer, "get_graph_capture_state")
+            if (state := gatherer.get_graph_capture_state()) is not None
         }
 
     def on_graph_replay_forward_start(self, state):
         if self._disable_all:
             return
-        for key, has_batched_routes in state.items():
+        for key, gatherer_state in state.items():
             self._single_pass_gatherers[key].on_graph_replay_forward_start(
-                has_batched_routes
+                gatherer_state
             )
 
     def with_current_layer(self, layer_idx):
@@ -310,8 +310,6 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             self._disable_all = previous_disable_all
 
     def _on_forward_pass_start(self, forward_batch: ForwardBatch):
-        if self._disable_all:
-            return
         if not self._recording:
             self._record_current_pass = False
             return
@@ -323,7 +321,7 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             gatherer.on_forward_pass_start(forward_batch)
 
     def _on_forward_pass_end(self, forward_pass_id: int, outputs: Dict[str, Any]):
-        if self._disable_all or not self._recording or not self._record_current_pass:
+        if not self._recording or not self._record_current_pass:
             return
         for gatherer_key, gatherer in self._single_pass_gatherers.items():
             single_pass_data = gatherer.collect()
@@ -332,12 +330,6 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             )
 
     def on_select_experts(self, topk_ids: torch.Tensor):
-        if self._disable_all or not (
-            self._recording or torch.get_device_module().is_current_stream_capturing()
-        ):
-            return
-        if megamoe_prefill_only_recorder_enabled() and not self._record_current_pass:
-            return
         self._on_hook("on_select_experts", topk_ids=topk_ids)
 
     def get_current_pass_count_buffer(self, layer_idx: int):
@@ -494,6 +486,15 @@ class _SinglePassGatherer(ABC):
     def __init__(self, expert_location_metadata: ExpertLocationMetadata, rank: int):
         self._expert_location_metadata = expert_location_metadata
         self._rank = rank
+
+    def on_graph_capture_forward_start(self):
+        pass
+
+    def get_graph_capture_state(self):
+        return None
+
+    def on_graph_replay_forward_start(self, state):
+        pass
 
     def on_forward_pass_start(self, forward_batch: ForwardBatch):
         pass

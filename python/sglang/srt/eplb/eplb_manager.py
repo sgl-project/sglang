@@ -18,7 +18,8 @@ from sglang.srt.eplb.expert_location import (
     get_global_expert_location_metadata,
 )
 from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
-from sglang.srt.runtime_context import get_device, get_exec, get_model, get_parallel
+from sglang.srt.hardware_backend.npu.eplb import get_initial_rebalance_iterations
+from sglang.srt.runtime_context import get_exec, get_model, get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -69,15 +70,8 @@ class EPLBManager:
 
         # The first window starts empty and uses one layout, so it can be shorter.
         # Later intervals must cover the full recorder window.
-        self._initial_rebalance_iterations = (
-            64
-            if get_device().device == "npu"
-            and get_parallel().nnodes == 1
-            and get_exec().moe.ep_dispatch_algorithm == "static"
-            and get_exec().moe.init_expert_location == "trivial"
-            and get_exec().moe.elastic_ep_backend is None
-            and self._rebalance_num_iterations > 64
-            else None
+        self._initial_rebalance_iterations = get_initial_rebalance_iterations(
+            self._rebalance_num_iterations
         )
         if self._initial_rebalance_iterations is not None:
             logger.info(

@@ -22,10 +22,14 @@ from torch.distributed import P2POp
 
 from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 from sglang.srt.environ import envs
-from sglang.srt.eplb.comm_utils import get_eplb_device_group
 from sglang.srt.eplb.expert_location import (
     ExpertLocationMetadata,
     get_global_expert_location_metadata,
+)
+from sglang.srt.hardware_backend.npu.eplb import (
+    get_eplb_device_group,
+    needs_nd_staging,
+    stage_p2p_ops,
 )
 from sglang.srt.runtime_context import get_device
 from sglang.srt.utils import get_bool_env_var
@@ -164,15 +168,10 @@ def _update_expert_weights_raw(
     )
     sample_tensors = routed_experts_weights_of_layer[update_layer_ids[0]]
     layer_buffers = None
-    if any(tensor.device.type == "npu" for tensor in sample_tensors):
-        import torch_npu
-
-        if any(
-            torch_npu.get_npu_format(tensor) not in (0, 2) for tensor in sample_tensors
-        ):
-            # Converting each NZ expert view can copy the whole backing tensor.
-            # Stage one layer at a time and reuse the ND buffers.
-            layer_buffers = create_temp_buffers(sample_tensors)
+    if any(needs_nd_staging(tensor) for tensor in sample_tensors):
+        # Per-expert NZ conversion can copy the whole backing tensor.
+        # Stage one layer at a time and reuse ordinary buffers.
+        layer_buffers = create_temp_buffers(sample_tensors)
 
     world_size = torch.distributed.get_world_size()
     num_local_physical_experts = old_expert_location_metadata.num_local_physical_experts
@@ -213,44 +212,12 @@ def _update_expert_weights_raw(
 
 
 def create_temp_buffers(sample_tensors):
-    buffers = []
-    for tensor in sample_tensors:
-        if tensor.device.type == "npu":
-            import torch_npu
-
-            if torch_npu.get_npu_format(tensor) not in (0, 2):
-                # An NZ view copy can overwrite unchanged slots in its backing
-                # tensor. Use ND buffers for slot copies and HCCL receives.
-                buffers.append(
-                    torch.empty(tensor.shape, dtype=tensor.dtype, device=tensor.device)
-                )
-                continue
-        buffers.append(torch.empty_like(tensor))
-    return buffers
-
-
-def _stage_npu_p2p_ops(ops):
-    """Stage internal-format views through ND buffers for HCCL.
-
-    Received values are copied back into the original views after completion.
-    """
-    staged_ops, receive_copies = [], []
-    for op in ops:
-        tensor = op.tensor
-        if tensor.device.type == "npu":
-            import torch_npu
-
-            if torch_npu.get_npu_format(tensor) not in (0, 2):
-                buffer = torch.empty(
-                    tensor.shape, dtype=tensor.dtype, device=tensor.device
-                )
-                if op.op == torch.distributed.isend:
-                    buffer.copy_(tensor)
-                else:
-                    receive_copies.append((tensor, buffer))
-                op = P2POp(op.op, buffer, op.peer, op.group, op.tag)
-        staged_ops.append(op)
-    return staged_ops, receive_copies
+    return [
+        torch.empty(tensor.shape, dtype=tensor.dtype, device=tensor.device)
+        if needs_nd_staging(tensor)
+        else torch.empty_like(tensor)
+        for tensor in sample_tensors
+    ]
 
 
 def update_expert_weights_single_layer(
@@ -574,7 +541,7 @@ def update_expert_weights_single_layer(
                 if eid in ops_by_expert:
                     batch_ops.extend(ops_by_expert[eid])
             if batch_ops:
-                batch_ops, receive_copies = _stage_npu_p2p_ops(batch_ops)
+                batch_ops, receive_copies = stage_p2p_ops(batch_ops)
                 reqs = torch.distributed.batch_isend_irecv(batch_ops)
                 for req in reqs:
                     req.wait()

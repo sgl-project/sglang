@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from sglang.srt.eplb import eplb_manager
+from sglang.srt.hardware_backend.npu import eplb as npu_eplb
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -31,6 +32,11 @@ class TestNpuInitialRebalance(unittest.TestCase):
             elastic_ep_backend=elastic,
         )
         with ExitStack() as stack:
+            stack.enter_context(
+                patch.object(
+                    eplb_manager, "get_exec", return_value=SimpleNamespace(moe=moe)
+                )
+            )
             for name, value in (
                 ("get_exec", SimpleNamespace(moe=moe)),
                 ("get_device", SimpleNamespace(device=device)),
@@ -38,7 +44,13 @@ class TestNpuInitialRebalance(unittest.TestCase):
                 ("get_global_expert_distribution_recorder", Mock(recording=True)),
             ):
                 stack.enter_context(
-                    patch.object(eplb_manager, name, return_value=value)
+                    patch.object(
+                        eplb_manager
+                        if name == "get_global_expert_distribution_recorder"
+                        else npu_eplb,
+                        name,
+                        return_value=value,
+                    )
                 )
             return eplb_manager.EPLBManager(
                 model_config=SimpleNamespace(),
