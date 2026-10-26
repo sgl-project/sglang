@@ -8,6 +8,7 @@ commit instead of inside a forward on an eight-rank run.
 
 import inspect
 import unittest
+from types import SimpleNamespace
 
 import torch
 
@@ -144,7 +145,7 @@ class TestOperandConversions(CustomTestCase):
         """
         from mori.ops.gemm_ar import preshuffle_b
 
-        from sglang.kernels.ops.quantization.mxfp8_native_amd_gfx95 import (
+        from sglang.kernels.ops.gemm.mxfp8_native_amd_gfx95 import (
             prepare_mxfp8_native_weight,
         )
 
@@ -161,6 +162,7 @@ class TestOperandConversions(CustomTestCase):
         )
 
     def test_aiter_route_weight_is_preshuffle_b(self):
+        from aiter.ops.shuffle import shuffle_weight
         from mori.ops.gemm_ar import preshuffle_b
 
         plain = torch.randint(0, 255, (N, K), dtype=torch.uint8, device="cuda").view(
@@ -169,11 +171,60 @@ class TestOperandConversions(CustomTestCase):
         ue8m0 = torch.randint(
             120, 135, (N // 32, K // 32), dtype=torch.uint8, device="cuda"
         )
-        layer = _layer(plain, ue8m0, "aiter")
-        b, _ = mg.mori_weight(layer)
-        self.assertTrue(
-            torch.equal(b.view(torch.uint8), preshuffle_b(plain).view(torch.uint8))
+        expected_b = preshuffle_b(plain).view(torch.uint8)
+        expected_scale = ue8m0.t().contiguous().to(torch.int32).reshape(-1)
+        for preshuffled in (None, False, True):
+            with self.subTest(preshuffled=preshuffled):
+                weight = shuffle_weight(plain, (16, 16)) if preshuffled else plain
+                layer = _layer(weight, ue8m0, "aiter")
+                if preshuffled is not None:
+                    layer.mxfp8_aiter_preshuffled = preshuffled
+                b, b_scale = mg.mori_weight(layer)
+                self.assertTrue(torch.equal(b.view(torch.uint8), expected_b))
+                self.assertEqual(b_scale.dtype, torch.int32)
+                self.assertTrue(torch.equal(b_scale, expected_scale))
+
+    def test_processed_aiter_route_weight_matches_preshuffle_b(self):
+        """Follow the production loader so changes to its layout are covered."""
+        from mori.ops.gemm_ar import preshuffle_b
+
+        from sglang.srt.environ import envs
+        from sglang.srt.layers.quantization import fp8_hip
+        from sglang.srt.layers.quantization.fp8_utils import Mxfp8DenseGemmBackend
+
+        plain = torch.randint(0, 255, (N, K), dtype=torch.uint8, device="cuda").view(
+            torch.float8_e4m3fn
         )
+        ue8m0 = torch.randint(
+            120, 135, (N // 32, K // 32), dtype=torch.uint8, device="cuda"
+        )
+        scale = torch.exp2(ue8m0.to(torch.float32) - 127)
+        expected_b = preshuffle_b(plain).view(torch.uint8)
+        expected_scale = ue8m0.t().contiguous().to(torch.int32).reshape(-1)
+        method = SimpleNamespace(
+            mxfp8_dense_backend=Mxfp8DenseGemmBackend.GFX95_MXFP8_AITER,
+            weight_block_size=[32, 32],
+        )
+        for preshuffled in (False, True):
+            with (
+                self.subTest(preshuffled=preshuffled),
+                envs.SGLANG_ROCM_MXFP8_AITER_PRESHUFFLE.override(preshuffled),
+                envs.SGLANG_OPT_HIP_FLYDSL_MXFP8.override(False),
+            ):
+                layer = torch.nn.Module()
+                layer.weight = torch.nn.Parameter(plain.clone(), requires_grad=False)
+                layer.weight_scale_inv = torch.nn.Parameter(
+                    scale.clone(), requires_grad=False
+                )
+                fp8_hip.process_dense_weights(method, layer, None)
+
+                self.assertTrue(layer.mxfp8_aiter_ready)
+                self.assertEqual(layer.mxfp8_aiter_preshuffled, preshuffled)
+                self.assertTrue(torch.equal(layer.weight_scale_mx_e8m0, ue8m0))
+                b, b_scale = mg.mori_weight(layer)
+                self.assertTrue(torch.equal(b.view(torch.uint8), expected_b))
+                self.assertEqual(b_scale.dtype, torch.int32)
+                self.assertTrue(torch.equal(b_scale, expected_scale))
 
     def test_b_scale_is_k_major(self):
         """The op reads the B scale transposed and flat; the shapes agree."""

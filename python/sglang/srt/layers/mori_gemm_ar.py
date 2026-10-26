@@ -76,10 +76,11 @@ def mxfp8_route(layer) -> str | None:
     """Which gfx950 mxfp8 route prepared this layer, or None if neither did.
 
     Both leave the ``[N/32, K/32]`` exponent bytes on
-    ``layer.weight_scale_mx_e8m0`` and differ only in the weight: ``native``
-    rebinds it to the shuffled ``[N/16, K/128, 2048]``, ``aiter`` leaves plain
-    ``[N, K]``. Reading one as the other returns an uncorrelated result rather
-    than failing, so `mori_weight` branches on this instead of guessing.
+    ``layer.weight_scale_mx_e8m0``. ``native`` rebinds the weight to its shuffled
+    ``[N/16, K/128, 2048]``. ``aiter`` keeps the ``[N, K]`` shape, with either
+    checkpoint order or the (16, 16) shuffle recorded by
+    ``mxfp8_aiter_preshuffled``. Reading one layout as another returns an
+    uncorrelated result rather than failing, so `mori_weight` uses these markers.
     """
     if not hasattr(layer, "weight_scale_mx_e8m0"):
         return None
@@ -108,8 +109,8 @@ def mxfp8_ready(layer) -> bool:
 #: the weight layout.
 _UPDATE_UNSUPPORTED = (
     "Online weight updates are not supported while the fused wo_b all-reduce "
-    "is active: it keeps a re-laid-out copy of each wo_b weight that in-place "
-    "loader writes do not refresh. Restart with "
+    "is active: it caches derived wo_b operands that in-place loader writes "
+    "do not fully refresh. Restart with "
     "SGLANG_OPT_FUSED_WO_B_AR=0 to use online weight updates."
 )
 
@@ -135,9 +136,10 @@ def release_all_prepared() -> None:
 def mori_weight(layer):
     """The layer's B operand and B scale in mori's layouts, cached on the layer.
 
-    sglang and mori differ only in how a lane's two 64-wide K sub-blocks sit:
-    sglang interleaves them inside its 32 bytes, mori keeps them as two 16-byte
-    blocks. Cached because the permutation copies the whole weight.
+    The native route interleaves a lane's two 64-wide K sub-blocks inside its
+    32 bytes; mori keeps them as two 16-byte blocks. AITER's optional (16, 16)
+    shuffle already has mori's byte order and can be reused. Cached because
+    the other layouts require a weight copy and the scales are converted too.
 
     Building it publishes ``_derived_weight_cache_error`` on the layer, which
     is how a model-owned cache tells the weight updater it cannot survive an
@@ -151,12 +153,14 @@ def mori_weight(layer):
     n, k = mxfp8_shape(layer)
     w = layer.weight.data.contiguous().view(torch.uint8)
     if mxfp8_route(layer) == "aiter":
-        # That route leaves the weight in its checkpoint [N, K] order, which is
-        # what preshuffle_b is defined on, so mori emits its own layout from the
-        # source rather than permuting sglang's.
-        from mori.ops.gemm_ar import preshuffle_b
+        b = w.reshape(n, k).view(layer.weight.dtype)
+        # AITER's (16, 16) FP8 shuffle and mori's preshuffle_b both flatten to
+        # [N/16, K/16, 16, 16]. Re-shuffling an already prepared weight would
+        # silently change the matrix. Older/plain AITER layers have no marker.
+        if not getattr(layer, "mxfp8_aiter_preshuffled", False):
+            from mori.ops.gemm_ar import preshuffle_b
 
-        b = preshuffle_b(w.reshape(n, k).view(layer.weight.dtype))
+            b = preshuffle_b(b)
     else:
         # [N/16, K/128, 64 lanes, 2 sub-blocks, 16B] -> the two sub-blocks split out
         b = (
