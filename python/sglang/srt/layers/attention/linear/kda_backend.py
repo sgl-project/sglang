@@ -1100,7 +1100,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
             # (GDN needs a transpose here; KDA does not).
             mamba_cache_params.conv[0][
                 self.forward_metadata.conv_states_mask_indices
-            ] = mixed_qkv[self.forward_metadata.track_conv_indices]
+            ] = mixed_qkv[self.forward_metadata.track_conv_indices].to(
+                mamba_cache_params.conv[0].dtype
+            )
 
         qkv = self._convolve_prefill(
             layer, forward_batch, mixed_qkv, conv_states, cache_indices
@@ -1668,7 +1670,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         """Whether the per-layer ReplaySSM rings fit the fused ring-write.
 
         Layouts follow memory_pool.py's KDA spec rings: rawv [slots, HV, L, V]
-        and rawk [slots, H, L, K] in the activation dtype, g [slots, HV, L, K]
+        and rawk [slots, H, L, K] in the convolution state dtype, g [slots, HV, L, K]
         fp32 (per-K KDA gate), beta [slots, HV, L] fp32. The kernel uses
         stride(0) as the slot pitch and assumes packed inner dims; anything
         else falls back to the unfused path, which handles it.
@@ -1695,8 +1697,8 @@ class KDAAttnBackend(MambaAttnBackendBase):
         ):
             return False
         if (
-            replayssm_rawv.dtype != mixed_qkv.dtype
-            or replayssm_rawk.dtype != mixed_qkv.dtype
+            replayssm_rawv.dtype not in (torch.float32, torch.bfloat16)
+            or replayssm_rawk.dtype != replayssm_rawv.dtype
             or replayssm_g.dtype != torch.float32
             or replayssm_beta.dtype != torch.float32
         ):

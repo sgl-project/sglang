@@ -469,7 +469,9 @@ def kda_decode_mtp_kernel(
                     if cutlass.const_expr(CACHE_RING):
                         for i in range(VEC_SIZE):
                             k_idx = i * WARP_SIZE + in_warp_tid
-                            ring_rawk[slot, i_hv, i_t, k_idx] = cutlass.BFloat16(r_k[i])
+                            ring_rawk[slot, i_hv, i_t, k_idx] = ring_rawk.element_type(
+                                r_k[i]
+                            )
                     sum_k = 0.0
                     for i in range(VEC_SIZE):
                         sum_k += r_k[i] * r_k[i]
@@ -529,14 +531,16 @@ def kda_decode_mtp_kernel(
                         for w in range(KERNEL_WIDTH - 1):
                             intermediate_conv_q[
                                 scratch_row, i_t, head_off + k_idx, w
-                            ] = cutlass.BFloat16(r_state[w * VEC_SIZE + i])
+                            ] = intermediate_conv_q.element_type(
+                                r_state[w * VEC_SIZE + i]
+                            )
                 elif p1_job == 1:
                     for i in range(VEC_SIZE):
                         k_idx = i * 32 + in_warp_tid
                         for w in range(KERNEL_WIDTH - 1):
                             intermediate_conv_k[
                                 scratch_row, i_t, head_off + k_idx, w
-                            ] = cutlass.BFloat16(
+                            ] = intermediate_conv_k.element_type(
                                 r_state[
                                     (KERNEL_WIDTH - 1) * VEC_SIZE + w * VEC_SIZE + i
                                 ]
@@ -610,10 +614,10 @@ def kda_decode_mtp_kernel(
                         cutlass.Float32(1.0) + cute.math.exp(-gate_raw, fastmath=True)
                     )
                 if cutlass.const_expr(CACHE_RING):
-                    ring_rawv[slot, i_hv, _t, _v_idx] = cutlass.BFloat16(_vconv)
+                    ring_rawv[slot, i_hv, _t, _v_idx] = ring_rawv.element_type(_vconv)
                 for _w in cutlass.range_constexpr(KERNEL_WIDTH - 1):
                     intermediate_conv_v[scratch_row, _t, head_off + _v_idx, _w] = (
-                        cutlass.BFloat16(_win[_t + 1 + _w])
+                        intermediate_conv_v.element_type(_win[_t + 1 + _w])
                     )
 
     k_grp = in_warp_tid % P2_LANES_K
@@ -1092,13 +1096,15 @@ def fused_kda_decode_mtp_dspark(
                 f"{TILE_K}] / [slots, H, L]"
             )
         if (
-            replayssm_rawv.dtype != torch.bfloat16
-            or replayssm_rawk.dtype != torch.bfloat16
+            replayssm_rawv.dtype not in (torch.float32, torch.bfloat16)
+            or replayssm_rawk.dtype not in (torch.float32, torch.bfloat16)
+            or replayssm_rawv.dtype != cs_v.dtype
+            or replayssm_rawk.dtype != cs_k.dtype
             or replayssm_g.dtype != torch.float32
             or replayssm_beta.dtype != torch.float32
         ):
             raise ValueError(
-                "expected ReplaySSM ring dtypes rawv/rawk=bf16, g/beta=fp32"
+                "expected rawv/rawk to match fp32/bf16 conv states, g/beta=fp32"
             )
         if intermediate_ssm is None:
             # Dead-branch placeholder: CACHE_RING skips every ht snapshot

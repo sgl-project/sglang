@@ -458,7 +458,7 @@ class ExecMamba(msgspec.Struct):
     mamba_ssm_dtype: A[
         Optional[str],
         Arg(
-            help="The data type of the SSM states in mamba cache. If not set, will be read from model config (mamba_ssm_dtype).",
+            help="The data type of the SSM states in mamba cache. For KDA, convolution states and replay records also follow this dtype unless SGLANG_MAMBA_CONV_DTYPE is set. If not set, will be read from model config (mamba_ssm_dtype).",
             choices=["float32", "bfloat16", "float16"],
         ),
     ] = None

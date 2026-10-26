@@ -10,9 +10,8 @@ the folded checkpoint against the baseline arm's last-step snapshot. A wrong
 head/step/slot offset in the fused ring store shows up as a mismatch; the
 output tensor must be untouched by the mode (bitwise equal).
 
-Tolerance is bf16-bound: production rings store rawk/rawv in conv dtype
-(bf16), so the fold re-quantizes k/v while the baseline snapshot keeps them
-in fp32 registers.
+BF16 rings re-quantize k/v, while FP32 rings retain the register precision.
+Exercise both storage formats with dtype-specific fold tolerances.
 """
 
 import pytest
@@ -44,7 +43,17 @@ K = 128
 W = 4  # KERNEL_WIDTH
 
 
-def _run(arm, *, N, H, num_spec, seed, onorm=False, pad_last=False):
+def _run(
+    arm,
+    *,
+    N,
+    H,
+    num_spec,
+    seed,
+    onorm=False,
+    pad_last=False,
+    state_dtype=torch.bfloat16,
+):
     torch.manual_seed(seed)
     T = N * (1 + num_spec)
     num_slots = N + 2
@@ -59,9 +68,9 @@ def _run(arm, *, N, H, num_spec, seed, onorm=False, pad_last=False):
     w_q = torch.randn(H * K, W, device=DEV, dtype=torch.float32) * 0.1
     w_k = torch.randn(H * K, W, device=DEV, dtype=torch.float32) * 0.1
     w_v = torch.randn(H * K, W, device=DEV, dtype=torch.float32) * 0.1
-    cs_q = torch.randn(num_slots, H * K, W - 1, device=DEV, dtype=torch.bfloat16)
-    cs_k = torch.randn(num_slots, H * K, W - 1, device=DEV, dtype=torch.bfloat16)
-    cs_v = torch.randn(num_slots, H * K, W - 1, device=DEV, dtype=torch.bfloat16)
+    cs_q = torch.randn(num_slots, H * K, W - 1, device=DEV, dtype=state_dtype)
+    cs_k = torch.randn(num_slots, H * K, W - 1, device=DEV, dtype=state_dtype)
+    cs_v = torch.randn(num_slots, H * K, W - 1, device=DEV, dtype=state_dtype)
     A_log = torch.randn(H, device=DEV, dtype=torch.float32)
     dt_bias = torch.randn(H * K, device=DEV, dtype=torch.float32)
     h0 = torch.randn(num_slots, H, K, K, device=DEV, dtype=torch.float32)
@@ -72,7 +81,7 @@ def _run(arm, *, N, H, num_spec, seed, onorm=False, pad_last=False):
     scratch = torch.arange(N, device=DEV, dtype=torch.int32)
     cu_seqlens = torch.arange(0, T + 1, 1 + num_spec, device=DEV, dtype=torch.int32)
 
-    ic_q = torch.zeros(N, 1 + num_spec, H * K, W - 1, device=DEV, dtype=torch.bfloat16)
+    ic_q = torch.zeros(N, 1 + num_spec, H * K, W - 1, device=DEV, dtype=state_dtype)
     ic_k = torch.zeros_like(ic_q)
     ic_v = torch.zeros_like(ic_q)
 
@@ -115,7 +124,7 @@ def _run(arm, *, N, H, num_spec, seed, onorm=False, pad_last=False):
         inter = torch.zeros(N, 1 + num_spec, H, K, K, device=DEV, dtype=torch.float32)
         out = fused_kda_decode_mtp_dspark(intermediate_ssm=inter, **kwargs)
         return out, dict(inter=inter, slots=slots, scratch=scratch, **norm)
-    rawv = torch.zeros(num_slots, H, L, K, device=DEV, dtype=torch.bfloat16)
+    rawv = torch.zeros(num_slots, H, L, K, device=DEV, dtype=state_dtype)
     rawk = torch.zeros_like(rawv)
     gring = torch.zeros(num_slots, H, L, K, device=DEV, dtype=torch.float32)
     betar = torch.zeros(num_slots, H, L, device=DEV, dtype=torch.float32)
@@ -133,10 +142,15 @@ def _run(arm, *, N, H, num_spec, seed, onorm=False, pad_last=False):
 @pytest.mark.parametrize(
     "N,H,num_spec", [(4, 2, 4), (1, 12, 5), (16, 2, 8)], ids=["small", "k3ish", "wide"]
 )
-def test_cutedsl_ring_fold_parity(N, H, num_spec):
+@pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
+def test_cutedsl_ring_fold_parity(N, H, num_spec, state_dtype):
     seed = 0
-    out_base, base = _run("baseline", N=N, H=H, num_spec=num_spec, seed=seed)
-    out_ring, ring = _run("ring", N=N, H=H, num_spec=num_spec, seed=seed)
+    out_base, base = _run(
+        "baseline", N=N, H=H, num_spec=num_spec, seed=seed, state_dtype=state_dtype
+    )
+    out_ring, ring = _run(
+        "ring", N=N, H=H, num_spec=num_spec, seed=seed, state_dtype=state_dtype
+    )
 
     torch.testing.assert_close(out_ring, out_base, rtol=0, atol=0)
 
@@ -162,7 +176,9 @@ def test_cutedsl_ring_fold_parity(N, H, num_spec):
         rel = (
             (fold - base_state).abs().max() / base_state.abs().max().clamp_min(1e-6)
         ).item()
-        assert rel < 2e-2, f"req={j}: rel={rel:.3e}"
+        assert rel < (1e-5 if state_dtype == torch.float32 else 2e-2), (
+            f"req={j}: rel={rel:.3e}"
+        )
 
 
 @pytest.mark.parametrize("N", [4, 32], ids=["small-grid", "large-grid"])

@@ -208,7 +208,9 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
                 & (idx_feats < dim)[None, :]
             )  # token-index  # token-index  # feature-index
             loaded_x = tl.load(x_ptrs, mask_x, 0.0)
-            new_conv_state = tl.load(x_ptrs, mask_x, 0.0)
+            new_conv_state = tl.load(x_ptrs, mask_x, 0.0).to(
+                conv_states_ptr.dtype.element_ty
+            )
             idx_tokens_conv = tl.arange(0, NP2_STATELEN)  # [BLOCK_M]
             conv_states_ptrs_target = (
                 conv_states_base[None, :]
@@ -280,7 +282,9 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
                     & (idx_tokens_conv - VAL < seqlen)[:, None]
                     & (idx_feats < dim)[None, :]
                 )  # token-index  # token-index  # feature-index
-                new_conv_state = tl.load(x_ptrs, mask_x, 0.0)
+                new_conv_state = tl.load(x_ptrs, mask_x, 0.0).to(
+                    conv_states_ptr.dtype.element_ty
+                )
 
                 conv_states_ptrs_target = (
                     conv_states_base
