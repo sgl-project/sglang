@@ -108,7 +108,7 @@ class E2ESelectionTest(unittest.TestCase):
             {e["source"]["revision"] for e in imported},
             {"107913533169e97ff4139664110bed4e523c68b2"},
         )
-        self.assertEqual(sum(bool(e["blocked"]) for e in imported), 1)
+        self.assertEqual(sum(bool(e["blocked"]) for e in imported), 0)
         for entry in self.catalog["entries"]:
             self.assertGreaterEqual(
                 entry["worker_minutes"] * 60 - entry["timeout_seconds"], 600
@@ -208,14 +208,17 @@ class E2ESelectionTest(unittest.TestCase):
         self.assertTrue(any(e["category"] == "pd" for e in pd))
         self.assertFalse(any(e["category"] == "perf" for e in pd))
 
-    def test_unsupported_or_blocked_requests_fail_closed(self):
+    def test_deepseek_and_full_selection_include_pro_answer(self):
+        case = "dsv4-pro-0813-mxfp4-answer-144g"
+        self.assertIn(case, self.selected("test-deepseek"))
+        self.assertIn(case, self.selected("test-mxfp4"))
+        self.assertIn(case, self.selected("test-all"))
+
+    def test_unsupported_requests_fail_closed(self):
         for labels in (
             ["test-perf"],
             ["test-functional"],
-            ["test-deepseek"],
             ["test-bf16", "test-pd"],
-            ["test-deepseek", "test-pd"],
-            ["test-all"],
         ):
             with self.subTest(labels=labels):
                 _, errors = selector.select(self.catalog, labels)

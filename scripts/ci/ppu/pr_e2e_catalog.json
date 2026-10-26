@@ -247,7 +247,7 @@
       "category": "answer",
       "mode": "answer",
       "suite": "nightly-answer-8-dsv4pro-ppu",
-      "config": "scripts/ci/ppu/blocked_configs/dsv4-pro-answer.json",
+      "config": "test/registered/ppu/answer_eval/configs/dsv4-pro/mxfp4-fp8-144g.json",
       "files": [
         "test/registered/ppu/answer_eval/test_ppu_dsv4_pro_answer.py"
       ],
@@ -259,7 +259,7 @@
       "job_minutes": 300,
       "environment": {},
       "dependencies": [],
-      "blocked": "PR #70 Pro-0813 Answer model.path is not absolute; maintainer must supply the staged checkpoint path.",
+      "blocked": "",
       "source": {
         "revision": "107913533169e97ff4139664110bed4e523c68b2",
         "workflow": ".github/workflows/test-ppu-answer.yml",

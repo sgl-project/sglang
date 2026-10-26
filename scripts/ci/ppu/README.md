@@ -97,12 +97,9 @@ python3 scripts/ci/ppu/select_pr_e2e.py preview --selectors test-qwen test-perf 
 `preview` prints `selected` execution IDs and `errors`; a nonzero exit status
 means the selection is blocked or invalid. This is only a local preview, not a
 submission to CI. Inspect [pr_e2e_catalog.json](pr_e2e_catalog.json) for each ID's
-suite, test files, config, topology, time budget, and source provenance.
-
-Currently, `dsv4-pro-0813-mxfp4-answer-144g` is blocked pending an absolute staged
-checkpoint path. Consequently, selectors including it, such as `test-deepseek`,
-`test-mxfp4`, and `test-all`, fail selection. Preview before requesting broad or
-expensive coverage; do not treat blocked entries as skipped successes.
+suite, test files, config, topology, time budget, and source provenance. Preview
+before requesting broad or expensive coverage; do not treat blocked entries as
+skipped successes.
 
 ## Persistence, reruns, and results
 

@@ -59,16 +59,9 @@ register_ppu_ci(est_time=7200, suite="nightly-answer-8-dsv4pro-ppu", nightly=Tru
 
 
 class TestPPUDsv4ProAnswer(AnswerSuiteMixin, unittest.TestCase):
-    """Imported source is blocked: its checkpoint path is not absolute.
-
-    The source module description above predates this validation finding. Direct
-    invocation deliberately fails schema validation until a staged path is reviewed.
-    """
-
     data_root = DATA_ROOT
     default_test_config_path = (
-        Path(__file__).resolve().parents[4]
-        / "scripts/ci/ppu/blocked_configs/dsv4-pro-answer.json"
+        DATA_ROOT / "configs" / "dsv4-pro" / "mxfp4-fp8-144g.json"
     )
 
 

@@ -26,9 +26,7 @@ def validate_configs(entries):
             accuracy_eval_kit.AccuracyEvalError,
             perf_eval_kit.PerfEvalError,
         ) as error:
-            expected = {
-                "scripts/ci/ppu/blocked_configs/dsv4-pro-answer.json": "model.path must be an absolute path",
-            }
+            expected = {}
             if not entry["blocked"] or str(error) != expected.get(entry["config"]):
                 raise
         else:

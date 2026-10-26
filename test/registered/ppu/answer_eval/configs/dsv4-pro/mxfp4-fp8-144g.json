@@ -12,7 +12,7 @@
     "memory_gib_per_device": 144
   },
   "model": {
-    "path": "modelscope.cn/organization/T-HEAD/v4/DeepSeek-V4-Pro-0813-MoE-Quant-W-MXFP4-A-MXFP4-Dense-Quant-W-FP8-PerChannel-A-FP8-PerToken",
+    "path": "/nas_aisw/datasets/checkpoints/LLM/T\u002dHEAD/v4/DeepSeek-V4-Pro-0813-MoE-Quant-W-MXFP4-A-MXFP4-Dense-Quant-W-FP8-PerChannel-A-FP8-PerToken",
     "checkpoint_name": "DeepSeek-V4-Pro-0813-MoE-Quant-W-MXFP4-A-MXFP4-Dense-Quant-W-FP8-PerChannel-A-FP8-PerToken",
     "served_model_name": "DeepSeek-V4-Pro-0813",
     "accepted_model_types": ["deepseek_v4"]
