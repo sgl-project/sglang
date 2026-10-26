@@ -39,6 +39,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_flashinfer_available,
+    is_gfx95_supported,
     is_gfx1250_supported,
     is_hip,
     is_musa,
@@ -274,6 +275,75 @@ def _forward_with_allreduce_fusion(
     return norm_module.forward(x, residual, post_residual_addition)
 
 
+# Same attribute GroupCoordinator.graph_capture looks for.
+_GLUON_TP_AR_STATE_ATTR = "_gluon_tp_ar_state"
+
+
+def _try_gluon_tp_ar_norm_quant(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    world_size: int,
+    group_size: int,
+    keep_bf16: bool,
+):
+    """Run the in-tree Gluon TP all-reduce+norm+quant kernel, or return None.
+
+    The rendezvous state (IPC staging buffer, synchronization rows, peer pointer
+    tables) is created once per TP group and cached on the group object, the same
+    way ``ca_comm`` is. Returns the same tuple shapes as the aiter path so the
+    caller is agnostic to which backend ran.
+    """
+    # Gate before importing: this runs on every backend that reaches the fused
+    # quant path, and only gfx950 with aiter can serve it. Probing first would
+    # load the backend and query the device on CUDA and on other AMD parts.
+    if not (_use_aiter and is_gfx95_supported()):
+        return None
+    try:
+        from sglang.srt.distributed.device_communicators import (
+            gluon_tp_ar_norm_quant as _gluon_ar,
+        )
+    except Exception:
+        return None
+
+    if not _gluon_ar.is_supported(x, residual, weight, eps, world_size, group_size):
+        return None
+
+    from sglang.srt.runtime_context import get_parallel
+
+    tp_group = get_parallel().tp_group
+    state = getattr(tp_group, _GLUON_TP_AR_STATE_ATTR, None)
+    if state is None:
+        try:
+            state = _gluon_ar.GluonTpArNormQuantState(
+                group=tp_group.device_group,
+                device=x.device,
+                max_rows=max(_gluon_ar.SUPPORTED_M),
+            )
+        except Exception as exc:
+            # Rendezvous is collective: every rank must reach the same verdict,
+            # so a failure here permanently disables the path on all ranks
+            # rather than leaving them out of step.
+            logger.warning(
+                "Gluon TP AR+norm+quant rendezvous failed, disabling: %s", exc
+            )
+            setattr(tp_group, _GLUON_TP_AR_STATE_ATTR, False)
+            return None
+        setattr(tp_group, _GLUON_TP_AR_STATE_ATTR, state)
+    if state is False:
+        return None
+
+    fp8_out, scale_out, residual_out, bf16_out = (
+        _gluon_ar.fused_tp_ar_add_gemma_rmsnorm_group_fp8_quant(
+            state, x, residual, weight
+        )
+    )
+    if keep_bf16:
+        return (bf16_out, fp8_out, scale_out), residual_out
+    return (fp8_out, scale_out), residual_out
+
+
 def _forward_with_allreduce_fusion_quant_per_group(
     norm_module,
     x: torch.Tensor,
@@ -331,6 +401,23 @@ def _forward_with_allreduce_fusion_quant_per_group(
             world_size = get_parallel().moe_tp_size
     if world_size <= 1:
         return None
+
+    # Preferred backend on gfx950/TP4: a single Gluon kernel that performs the
+    # all-reduce itself over HIP IPC, so there is no separate collective launch.
+    # is_supported() is strict (arch, TP size, hidden size, M and eps);
+    # anything else drops through to the aiter chain. ROCm >= 7.2 is
+    # supported: the scale is relaid out for the bpreshuffle GEMM.
+    fused = _try_gluon_tp_ar_norm_quant(
+        x,
+        residual,
+        weight,
+        norm_module.variance_epsilon,
+        world_size,
+        group_size,
+        keep_bf16,
+    )
+    if fused is not None:
+        return fused
 
     # ``transpose_scale=use_bpreshuffle`` asks the fused kernel to emit the
     # per-group scale directly in the column-major layout the gfx95 bpreshuffle
