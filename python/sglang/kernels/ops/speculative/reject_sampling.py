@@ -446,7 +446,9 @@ def chain_speculative_sampling_target_only_triton(
         threshold_acc,
         NUM_SPEC_STEPS=num_spec_steps,
         VOCAB_SIZE=vocab_size,
-        BLOCK_V=4096,
+        # 8192 halves the two vocab passes to 19 blocks each at vocab 152064;
+        # 16384 and above spill registers and lose badly (0.30x).
+        BLOCK_V=8192,
         num_warps=4,
     )
 
