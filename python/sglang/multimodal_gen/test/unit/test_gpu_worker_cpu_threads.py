@@ -1,14 +1,62 @@
 # SPDX-License-Identifier: Apache-2.0
 """Contracts for per-worker host CPU setup: intra-op threads and NUMA binding."""
 
+import gc
 import unittest
+import weakref
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from sglang.multimodal_gen.runtime.managers import gpu_worker
 from sglang.multimodal_gen.runtime.managers.gpu_worker import (
     _bind_worker_to_gpu_numa_node,
     _worker_cpu_intra_op_threads,
 )
+from sglang.test.test_utils import CustomTestCase
+
+
+class TestWorkerStartup(CustomTestCase):
+    def test_reclaims_loading_cycles_before_first_request(self):
+        class LoadingObject:
+            pass
+
+        garbage_refs = []
+
+        def load_model(worker):
+            garbage = LoadingObject()
+            garbage.cycle = garbage
+            garbage_refs.append(weakref.ref(garbage))
+            worker.pipeline = LoadingObject()
+            # survive a young collection like objects retained during imports
+            gc.collect(1)
+
+        # prevent an automatic collection from making the unfixed code pass
+        self.addCleanup(gc.enable if gc.isenabled() else gc.disable)
+        thresholds = gc.get_threshold()
+        gc.disable()
+        group = SimpleNamespace(cpu_group=None)
+        with (
+            patch.object(gpu_worker, "init_metrics", return_value=None),
+            patch.object(gpu_worker.current_platform, "is_cpu", return_value=True),
+            patch.object(gpu_worker, "get_sp_group", return_value=group),
+            patch.object(gpu_worker, "get_tp_group", return_value=group),
+            patch.object(gpu_worker, "get_cfg_group", return_value=group),
+            patch.object(gpu_worker.GPUWorker, "init_device_and_model", load_model),
+            patch.object(gpu_worker.GPUWorker, "_update_lora_metrics"),
+        ):
+            worker = gpu_worker.GPUWorker(
+                local_rank=0,
+                rank=0,
+                master_port=30005,
+                server_args=SimpleNamespace(
+                    num_gpus=1, dp_size=1, async_output_save=False
+                ),
+            )
+
+        self.assertIsNone(garbage_refs[0]())
+        self.assertIsInstance(worker.pipeline, LoadingObject)
+        self.assertEqual(gc.get_threshold(), thresholds)
+        self.assertFalse(gc.isenabled())
 
 
 class TestWorkerCpuIntraOpThreads(unittest.TestCase):
