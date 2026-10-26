@@ -80,14 +80,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.rocm_muse_spark import (
-    expert_placement,
-    expert_replicas,
-    expert_stats,
-    finalize_allreduce,
-    mxfp4_moe,
-    router_pooler,
-)
+from sglang.srt.rocm_muse_spark import finalize_allreduce, mxfp4_moe, router_pooler
 from sglang.srt.rocm_muse_spark.attention_kv_write import (
     FUSED_QKV_CACHE,
     QK_ROPE_CACHE,
@@ -107,8 +100,6 @@ from sglang.srt.rocm_muse_spark.layers import (
 from sglang.srt.rocm_muse_spark.muse_qk_norm import fused_qk_norm, qk_norm_supported
 from sglang.srt.rocm_muse_spark.sequence_parallel import (
     SPShape,
-    moe_overlap_applies,
-    overlapped_expert_shard,
     prepare_ulysses,
     sp_gather,
     sp_reduce_scatter,
@@ -962,10 +953,6 @@ class MuseSpark1xMoE(nn.Module):
             raise ValueError("num_experts must be divisible by expert parallel size")
         self.layer_idx = layer_idx
         self._compact_a4_reported = False
-        # The routing recorder (TP rank 0, SGLANG_MUSE_EXPERT_STATS_PATH), set after loading.
-        self.expert_stats: expert_stats.ExpertStatsRecorder | None = None
-        # Redundant expert replicas of compact A4 verify (SGLANG_MUSE_EXPERT_REPLICAS), set after loading.
-        self.replicas: expert_replicas.LayerReplicas | None = None
         self.tp_size = parallel.tp_size
         self.ep_size = parallel.moe_ep_size
         self.ep_rank = parallel.moe_ep_rank
@@ -1101,41 +1088,8 @@ class MuseSpark1xMoE(nn.Module):
         topk_scores, topk_ids, expert_input, quantized = self.route(
             hidden_states, quantize_a4=quantize_a4, x_fp8=x_fp8, prefill_fp8=prefill_fp8
         )
-        if self.expert_stats is not None and sp is None:
-            self.expert_stats.record(
-                self.layer_idx,
-                topk_ids,
-                hidden_states,
-                self.router.weight,
-                self.expert_bias,
-                self.router_multiplier,
-            )
-            self.expert_stats.record_extend(self.layer_idx, topk_ids)
         rows = topk_ids.shape[0] if sp is None else sp.padded
         use_a4w4 = self.uses_a4w4(rows, target_verify)
-        if sp is not None and use_a4w4 and moe_overlap_applies(topk_ids.shape[0]):
-            a1, a1s = mxfp4_moe.quantize_rows(expert_input)
-            unpool_fp8 = (
-                None
-                if skip_post_expert_proj or self.post_expert_proj is None
-                else self.post_expert_proj.small_m_fp8_weight
-            )
-            # Per-pass unpooling only on the route ``unpool`` takes for the whole shard (expert_input has the
-            # unpooler input's shape): the row quant + CK FP8 GEMM, both row-local.
-            if not (prefill_fp8 and fp8_prefill_gemm_applies(expert_input, unpool_fp8)):
-                unpool_fp8 = None
-            output = overlapped_expert_shard(
-                (a1, a1s, topk_ids, topk_scores),
-                lambda a, s, ids, scores: self.run_experts(
-                    None, scores, ids, target_verify, True, (a, s)
-                ),
-                finish=None
-                if unpool_fp8 is None
-                else lambda y: fp8_prefill_gemm(*quantize_rows_fp8(y), unpool_fp8),
-            )
-            if skip_post_expert_proj or unpool_fp8 is not None:
-                return output
-            return self.unpool(output, prefill_fp8=prefill_fp8)
         if sp is not None:
             if use_a4w4:
                 # Row-local MXFP4: gather the shards' FP4 data and scales, not BF16 rows.
@@ -1149,8 +1103,6 @@ class MuseSpark1xMoE(nn.Module):
                 expert_input = sp_gather(expert_input, rows)
             topk_ids = sp_gather(topk_ids, rows)
             topk_scores = sp_gather(topk_scores, rows)
-            if self.expert_stats is not None:
-                self.expert_stats.record_extend(self.layer_idx, topk_ids)
         if (
             sp is None
             and self._finalize_ar is not None
@@ -1170,7 +1122,6 @@ class MuseSpark1xMoE(nn.Module):
                 self.post_expert_norm.eps,
                 gain,
                 quantized=quantized,
-                replicas=self.replicas,
             )
             if skip_post_expert_proj:
                 return output
@@ -1321,7 +1272,6 @@ class MuseSpark1xMoE(nn.Module):
                 self.post_expert_norm.eps,
                 gain,
                 quantized=quantized,
-                replicas=self.replicas,
             )
         if self.nvfp4_checkpoint:
             return self.experts(
@@ -1333,19 +1283,6 @@ class MuseSpark1xMoE(nn.Module):
             topk_ids,
             self.local_expert_start,
             self.post_expert_norm,
-        )
-
-    def supports_replicas(self) -> bool:
-        """TP4 / EP4 compact A4 verify on the a4w4 preshuffled weights (the only copy kept at TP4)."""
-        return (
-            mxfp4_moe.COMPACT_A4_ENABLED
-            and self.mxfp4_checkpoint
-            and self.tp_size == self.ep_size == 4
-            and self.num_local_experts == 64
-            and self.num_experts == 256
-            and self.top_k == 8
-            and self.expert_hidden_size == 4096
-            and self.experts.native_dropped
         )
 
     def unpool(self, output: torch.Tensor, prefill_fp8: bool = False) -> torch.Tensor:
@@ -1642,7 +1579,6 @@ class MuseSpark1xModel(nn.Module):
         # Layer indices whose output residual stream feeds the DFLASH draft
         # context (set through MuseSparkTextForCausalLM.set_dflash_layers_to_capture).
         self.layers_to_capture: list[int] = []
-        self.expert_stats: expert_stats.ExpertStatsRecorder | None = None
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
@@ -1699,8 +1635,6 @@ class MuseSpark1xModel(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if self.expert_stats is not None:
-            self.expert_stats.begin_forward(forward_batch)
         hidden_states = (
             self.embed_tokens(input_ids) if input_embeds is None else input_embeds
         )
@@ -1746,8 +1680,6 @@ class MuseSpark1xModel(nn.Module):
                     aux_hidden_states.append(stream.to(torch.bfloat16))
             norm_input = stream.to(torch.bfloat16)
             hidden_states = self.norm(norm_input).to(torch.bfloat16)
-        if self.expert_stats is not None:
-            self.expert_stats.end_forward()
         if self.layers_to_capture:
             return hidden_states, aux_hidden_states
         return hidden_states
@@ -1885,16 +1817,6 @@ class MuseSparkTextForCausalLM(nn.Module):
             quant_config
         )
         self._nvfp4_pending: dict[tuple[str, str], dict[str, torch.Tensor]] = {}
-        placement_path = envs.SGLANG_MUSE_EXPERT_PLACEMENT.get()
-        self.expert_placement = (
-            expert_placement.ExpertPlacement.from_json(
-                placement_path,
-                num_experts=config.num_local_experts,
-                ep_size=get_parallel().moe_ep_size,
-            )
-            if placement_path
-            else None
-        )
         self.model = MuseSparkModel(config, quant_config, add_prefix("model", prefix))
         self.lm_head = ParallelLMHead(
             config.vocab_size,
@@ -2019,15 +1941,9 @@ class MuseSparkTextForCausalLM(nn.Module):
         if suffix == "_input_scale":
             return True
         if loaded_weight.shape[0] == self.config.num_local_experts:
-            experts = self._local_checkpoint_experts(name)
-            if experts is not None:
-                loaded_weight = loaded_weight.index_select(0, experts)
-            else:
-                parallel = get_parallel()
-                local = loaded_weight.shape[0] // parallel.moe_ep_size
-                loaded_weight = loaded_weight.narrow(
-                    0, parallel.moe_ep_rank * local, local
-                )
+            parallel = get_parallel()
+            local = loaded_weight.shape[0] // parallel.moe_ep_size
+            loaded_weight = loaded_weight.narrow(0, parallel.moe_ep_rank * local, local)
         key = (prefix, proj)
         pieces = self._nvfp4_pending.setdefault(key, {})
         pieces["weight" if suffix is None else suffix.lstrip("_")] = (
@@ -2092,45 +2008,9 @@ class MuseSparkTextForCausalLM(nn.Module):
             weight.data[expert].copy_(q_weight)
             scale.data[expert].copy_(q_scale.to(scale.dtype))
 
-    def _local_checkpoint_experts(self, name: str) -> torch.Tensor | None:
-        """Checkpoint ids of this rank's expert slots when the parameter's layer is permuted, else None."""
-        placement = self.expert_placement
-        layer = None if placement is None else placement.param_layer(name)
-        if layer is None:
-            return None
-        parallel = get_parallel()
-        local = self.config.num_local_experts // parallel.moe_ep_size
-        return placement.perm(layer).narrow(0, parallel.moe_ep_rank * local, local)
-
-    def _place_routing_tensor(
-        self, name: str, loaded_weight: torch.Tensor
-    ) -> torch.Tensor:
-        """The router weight / expert bias in slot order when the layer is permuted."""
-        placement = self.expert_placement
-        layer = None if placement is None else placement.param_layer(name)
-        if layer is None:
-            return loaded_weight
-        if name.endswith(".mlp.router.weight"):
-            assert loaded_weight.shape[1] == self.config.num_local_experts
-            return expert_placement.permute_router_weight(
-                loaded_weight, placement.perm(layer)
-            )
-        if name.endswith(".mlp.expert_bias"):
-            return expert_placement.permute_expert_vector(
-                loaded_weight, placement.perm(layer)
-            )
-        return loaded_weight
-
     def _copy_expert_stack(
         self, param: torch.Tensor, loaded_weight: torch.Tensor, name: str
     ) -> None:
-        experts = self._local_checkpoint_experts(name)
-        if (
-            experts is not None
-            and loaded_weight.shape[0] == self.config.num_local_experts
-        ):
-            expert_placement.copy_expert_slots(param.data, loaded_weight, experts)
-            return
         if param.shape == loaded_weight.shape:
             param.data.copy_(loaded_weight)
             return
@@ -2163,14 +2043,6 @@ class MuseSparkTextForCausalLM(nn.Module):
         if suffix == "input_scale":
             return True
         expert_id = int(expert_raw)
-        layer = (
-            None
-            if self.expert_placement is None
-            else self.expert_placement.param_layer(name)
-        )
-        if layer is not None:
-            # From here on the expert is named by its slot.
-            expert_id = self.expert_placement.slot_of(layer, expert_id)
         parallel = get_parallel()
         local_count = self.config.num_local_experts // parallel.moe_ep_size
         start = parallel.moe_ep_rank * local_count
@@ -2287,7 +2159,6 @@ class MuseSparkTextForCausalLM(nn.Module):
                 )
             if "router.weight" in name and param.shape != loaded_weight.shape:
                 loaded_weight = loaded_weight.t().contiguous()
-            loaded_weight = self._place_routing_tensor(name, loaded_weight)
             if ".experts.w" in name:
                 self._copy_expert_stack(param, loaded_weight, name)
             else:
@@ -2302,54 +2173,6 @@ class MuseSparkTextForCausalLM(nn.Module):
             )
         self.post_load_weights()
 
-    def _install_expert_stats(self, moe_layers: list) -> None:
-        """Allocates the recorder's device ring before warmup and graph capture, once."""
-        decoder = self.model.language_model
-        if decoder.expert_stats is not None or not moe_layers:
-            return
-        recorder = expert_stats.make_recorder(
-            envs.SGLANG_MUSE_EXPERT_STATS_PATH.get(),
-            tp_rank=get_tp_group().rank_in_group,
-            num_layers=self.config.num_hidden_layers,
-            num_experts=self.config.num_local_experts,
-            device=torch.device("cuda", torch.cuda.current_device()),
-            header=_expert_stats_header(moe_layers, self.expert_placement),
-        )
-        decoder.expert_stats = recorder
-        for moe in moe_layers:
-            moe.expert_stats = recorder
-
-    def _attach_expert_replicas(self, moe_layers: list) -> None:
-        """Copies each eligible layer's planned replica experts from their home ranks (collective over TP)."""
-        count = envs.SGLANG_MUSE_EXPERT_REPLICAS.get()
-        path = envs.SGLANG_MUSE_EXPERT_REPLICA_PLAN.get()
-        if not path:
-            raise ValueError(
-                "SGLANG_MUSE_EXPERT_REPLICAS needs SGLANG_MUSE_EXPERT_REPLICA_PLAN"
-            )
-        parallel = get_parallel()
-        plan = expert_replicas.load_plan(
-            path, self.config.num_local_experts, parallel.moe_ep_size, count
-        )
-        group = get_tp_group()
-        extra = 0
-        attached = []
-        for moe in moe_layers:
-            entries = plan.get(moe.layer_idx)
-            if not entries or not moe.supports_replicas():
-                continue
-            moe.replicas = _replicate_layer(moe, entries, group)
-            attached.append(moe.layer_idx)
-            extra += sum(t[0].numel() * count for t in moe.replicas.operands)
-            torch.cuda.empty_cache()
-        logger.info(
-            "Muse expert replicas: %d per rank on %d MoE layers (%s), %.2f GB extra per rank",
-            count,
-            len(attached),
-            ",".join(map(str, attached)),
-            extra / 1e9,
-        )
-
     @torch.no_grad()
     def post_load_weights(self) -> None:
         moe_layers = [
@@ -2357,7 +2180,6 @@ class MuseSparkTextForCausalLM(nn.Module):
             for layer in self.model.layers
             if isinstance(layer.mlp, MuseSpark1xMoE)
         ]
-        self._install_expert_stats(moe_layers)
         if router_pooler.JOINT_ROUTER_POOLER:
             for moe in moe_layers:
                 router_pooler.prepare_joint_router_pooler(moe)
@@ -2370,8 +2192,6 @@ class MuseSparkTextForCausalLM(nn.Module):
             keep_native = bool(experts) and _a4w4_keeps_native(experts)
             for module in experts:
                 mxfp4_moe.prepare_a4w4_weights(module, keep_native=keep_native)
-        if envs.SGLANG_MUSE_EXPERT_REPLICAS.get():
-            self._attach_expert_replicas(moe_layers)
         if _DENSE_TILED:
             for moe in moe_layers:
                 for proj in (moe.pre_expert_proj, moe.post_expert_proj):
@@ -2401,60 +2221,6 @@ class MuseSparkTextForCausalLM(nn.Module):
             ensure = getattr(op, "_ensure_cached_weights", None)
             if ensure is not None:
                 ensure(torch.bfloat16)
-
-
-def _replicate_layer(
-    moe: MuseSpark1xMoE, entries, group
-) -> expert_replicas.LayerReplicas:
-    """The layer's replicas; its a4w4 weights become views of the home slots of the new [64 + R] tensors."""
-    experts = moe.experts
-    home = moe.num_local_experts
-    full = expert_replicas.replicate_expert_blocks(
-        mxfp4_moe._compact_a4_operands(experts),
-        entries,
-        rank=moe.ep_rank,
-        ep_size=moe.ep_size,
-        home=home,
-        group=group,
-    )
-    experts.a4w4_weights = tuple(
-        f[:home].view(old.dtype).view(old.shape)
-        for f, old in zip(full, experts.a4w4_weights)
-    )
-    local = full[0].shape[0]
-    h, i = experts.expert_hidden_size, experts.intermediate_size
-    operands = tuple(
-        f.view(local, n, k)
-        for f, (n, k) in zip(
-            full, ((2 * i, h // 2), (h, i // 2), (2 * i, h // 32), (h, i // 32))
-        )
-    )
-    return expert_replicas.LayerReplicas(
-        table=expert_replicas.build_table(
-            entries, moe.ep_size, home, moe.ep_rank, moe.num_experts
-        ).to(full[0].device),
-        num_entries=len(entries),
-        num_local=local,
-        operands=operands,
-    )
-
-
-def _expert_stats_header(
-    moe_layers: list, placement: expert_placement.ExpertPlacement | None
-) -> dict:
-    """What the recorded slot ids mean: the EP split and, when permuted, each layer's slot -> checkpoint order."""
-    parallel = get_parallel()
-    return {
-        "tp_size": parallel.tp_size,
-        "ep_size": parallel.moe_ep_size,
-        "moe_layers": [moe.layer_idx for moe in moe_layers],
-        "placement_path": envs.SGLANG_MUSE_EXPERT_PLACEMENT.get(),
-        "placement": (
-            {}
-            if placement is None
-            else {str(l): placement.perm(l).tolist() for l in placement.layers()}
-        ),
-    }
 
 
 __all__ = [

@@ -34,14 +34,6 @@ from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 
 SP_MIN_TOKENS = 2048
-# Overlapped SP experts: the second of the two expert passes takes 1 - MOE_OVERLAP_FIRST_SHARE of the shard
-# rows (at least MOE_OVERLAP_MIN_PASS_ROWS). Its reduce-scatter is the exposed tail, and the first pass's must fit
-# under the second pass's experts. Measured 32K extend over a 100K prefix (4096-row shards), TP0 GPU window:
-# share 0.5 / 0.6 / 0.7 / 0.75 -> 1167.7 / 1162.3 / 1156.3 / 1149.8 ms, serialized experts 1184.0 ms.
-MOE_OVERLAP_FIRST_SHARE = 0.75
-# aiter's CK FP8 GEMM runs one kernel config for every M >= 1024, so the per-pass unpooler matches the
-# whole-shard one bit for bit.
-MOE_OVERLAP_MIN_PASS_ROWS = 1024
 # Pipelined Ulysses row chunks, measured on MI355X per layer (check_ulysses_pipeline.py): shards from
 # ULYSSES_PIPELINE_MIN_ROWS (2048-row shards in two chunks run 7 % slower, 3072-row ones 9 % faster) are cut into
 # 2..ULYSSES_MAX_CHUNKS near-equal chunks of about ULYSSES_CHUNK_ROWS (whole waves of the [8192, 8192] O GEMM).
@@ -57,7 +49,6 @@ _PREFILL_SP = envs.SGLANG_MUSE_PREFILL_SP.get()
 _PREFILL_ULYSSES = envs.SGLANG_MUSE_PREFILL_ULYSSES.get()
 _ULYSSES_LOCAL_GATE = envs.SGLANG_MUSE_ULYSSES_LOCAL_GATE.get()
 _ULYSSES_PIPELINE = envs.SGLANG_MUSE_ULYSSES_PIPELINE.get()
-_MOE_OVERLAP = envs.SGLANG_MUSE_PREFILL_MOE_OVERLAP.get()
 _comm_stream = None
 
 
@@ -112,17 +103,6 @@ def sp_reduce_scatter(full: torch.Tensor, padded: int) -> torch.Tensor:
     return out
 
 
-def _moe_first_pass_rows(shard_rows: int) -> int:
-    second = round(shard_rows * (1 - MOE_OVERLAP_FIRST_SHARE))
-    return shard_rows - max(MOE_OVERLAP_MIN_PASS_ROWS, second)
-
-
-def moe_overlap_applies(shard_rows: int) -> bool:
-    return (
-        _MOE_OVERLAP and _moe_first_pass_rows(shard_rows) >= MOE_OVERLAP_MIN_PASS_ROWS
-    )
-
-
 def _sp_comm_stream() -> torch.cuda.Stream:
     global _comm_stream
     if _comm_stream is None:
@@ -130,83 +110,6 @@ def _sp_comm_stream() -> torch.cuda.Stream:
         # deadlock on ROCm (measured 10-23; the same sequence completes at priority 0).
         _comm_stream = torch.cuda.Stream()
     return _comm_stream
-
-
-def _rccl_gather(shard: torch.Tensor, rows: int) -> torch.Tensor:
-    group = get_tp_group()
-    src = shard.contiguous()
-    # FP8 / E8M0 / FP4-packed rows travel as bytes (RCCL has no fp8 types here); a gather copies bytes exactly.
-    if src.element_size() == 1:
-        src = src.view(torch.uint8)
-    out = src.new_empty((src.shape[0] * group.world_size, *src.shape[1:]))
-    dist.all_gather_into_tensor(out, src, group=group.device_group)
-    return out[:rows].view(shard.dtype)
-
-
-def _rccl_reduce_scatter(full: torch.Tensor) -> torch.Tensor:
-    group = get_tp_group()
-    out = full.new_empty((full.shape[0] // group.world_size, *full.shape[1:]))
-    dist.reduce_scatter_tensor(out, full.contiguous(), group=group.device_group)
-    return out
-
-
-def _group_gather(shard: torch.Tensor, rows: int) -> torch.Tensor:
-    """``sp_gather`` of a row tensor of any dtype; 1-byte rows travel as uint8, which it moves as bf16 words."""
-    if shard.element_size() == 1 and shard.dtype != torch.uint8:
-        return sp_gather(shard.view(torch.uint8), rows).view(shard.dtype)
-    return sp_gather(shard, rows)
-
-
-def _side_reduce_scatter(full: torch.Tensor, main, comm):
-    """RCCL reduce-scatter of ``full`` on the side stream once the main stream has produced it; returns the shard
-    and its ready event."""
-    done = main.record_event()
-    with torch.cuda.stream(comm):
-        comm.wait_event(done)
-        full.record_stream(comm)
-        return _rccl_reduce_scatter(full), comm.record_event()
-
-
-def overlapped_expert_shard(inputs, run_experts, finish=None) -> torch.Tensor:
-    """This rank's token shard of the expert output summed over ranks, mapped by ``finish`` (row-local, e.g. the
-    unpooler; None keeps it), with the shard cut into a larger first and a smaller second expert pass.
-
-    The first pass's ``inputs`` (row-aligned [shard, ...] tensors) are all-gathered up front on the main stream,
-    where nothing could hide them and aiter's custom all-gather is the fastest route; a side stream gathers the
-    second pass's under the first pass's experts, reduce-scatters the first pass's ``run_experts`` output under
-    the second pass's experts, then the second pass's under ``finish`` of the first pass's rows. Experts and
-    ``finish`` are row-local, so the result equals the two passes run back to back; against one whole-shard
-    gather / experts / reduce-scatter it differs only by RCCL rounding the four ranks' bf16 partial sums in a
-    message-size-dependent order (max |d| 0.016 on the reduced rows, check_moe_overlap.py).
-
-    The side-stream collectives call RCCL directly: pass-sized messages fit aiter's custom all-gather /
-    reduce-scatter, whose CU-resident kernels slowed the concurrent experts by more than they hid (32K extend
-    1615 vs 1566 ms serialized); RCCL concurrent with a GEMM hides 70-85% of its time."""
-    world = get_tp_group().world_size
-    main, comm = torch.cuda.current_stream(), _sp_comm_stream()
-    shard = inputs[0].shape[0]
-    split = _moe_first_pass_rows(shard)
-    first = [_group_gather(t[:split], split * world) for t in inputs]
-    comm.wait_stream(main)
-    with torch.cuda.stream(comm):
-        for t in inputs:
-            t.record_stream(comm)
-        second = [_rccl_gather(t[split:], (shard - split) * world) for t in inputs]
-        second_ready = comm.record_event()
-    out1, ready1 = _side_reduce_scatter(run_experts(*first), main, comm)
-    main.wait_event(second_ready)
-    for t in second:
-        t.record_stream(main)
-    out2, ready2 = _side_reduce_scatter(run_experts(*second), main, comm)
-    main.wait_event(ready1)
-    out1.record_stream(main)
-    out1 = out1 if finish is None else finish(out1)
-    result = out1.new_empty((shard, out1.shape[1]))
-    result[:split].copy_(out1)
-    main.wait_event(ready2)
-    out2.record_stream(main)
-    result[split:].copy_(out2 if finish is None else finish(out2))
-    return result
 
 
 def ulysses_enabled() -> bool:

@@ -16,10 +16,7 @@ from __future__ import annotations
 import torch
 
 from sglang.kernels.ops.moe.mxfp4_compact_a4_moe import MAX_ROWS as COMPACT_A4_MAX_ROWS
-from sglang.kernels.ops.moe.mxfp4_compact_a4_moe import (
-    compact_a4_experts,
-    compact_a4_experts_replicated,
-)
+from sglang.kernels.ops.moe.mxfp4_compact_a4_moe import compact_a4_experts
 from sglang.kernels.ops.quantization.mxfp4_quant_rows import mxfp4_quant_rows
 from sglang.srt.environ import envs
 from sglang.srt.rocm_muse_spark import muse_moe_flydsl
@@ -69,32 +66,10 @@ def _finalize_per_slot(
     return out
 
 
-def compact_a4_with_replicas(x, ids, experts, replicas, quantized):
-    """(per-slot rows, local expert index per route) of this rank's step share of home + replica experts."""
-    return compact_a4_experts_replicated(
-        x, ids, *replicas.operands, table=replicas.table, num_entries=replicas.num_entries,
-        shuffled=experts.native_dropped, quantized=quantized,
-    )  # fmt: skip
-
-
 def run_compact_a4(
-    x,
-    scores,
-    ids,
-    experts,
-    local_start,
-    norm_weight,
-    eps,
-    gain,
-    quantized=None,
-    replicas=None,
+    x, scores, ids, experts, local_start, norm_weight, eps, gain, quantized=None
 ):
     """Compact A4 target-verify experts of this rank, finalized; partial sums before the TP reduction."""
-    if replicas is not None:
-        y, lids = compact_a4_with_replicas(x, ids, experts, replicas, quantized)
-        return _finalize_per_slot(
-            y, norm_weight, scores, lids, 0, replicas.num_local, eps, gain
-        )
     y = compact_a4_experts(
         x, ids, *_compact_a4_operands(experts), local_start=local_start,
         shuffled=experts.native_dropped, quantized=quantized,
