@@ -70,6 +70,8 @@ class TestSchedulerPauseGeneration(CustomTestCase):
     def _new_scheduler(self) -> Scheduler:
         scheduler = Scheduler.__new__(Scheduler)
         scheduler._engine_paused = False
+        scheduler._pause_started_at = None
+        scheduler._pause_intervals = deque()
         scheduler.enable_overlap = False
         scheduler.enable_skip_finishing_decode = False
         scheduler.enable_overlap_mlx = False
@@ -243,6 +245,35 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.rust_server = None
         scheduler.beam_coordinator = MagicMock()
         scheduler.update_running_batch(batch)
+
+    def drain_with_pause_start_seen(self, scheduler, mode, now):
+        # Records the pause start that busy accounting sees while the held result drains.
+        seen = []
+        scheduler.enable_overlap = True
+        scheduler.last_batch = MagicMock()
+        scheduler.result_queue = deque([(MagicMock(), MagicMock())])
+        scheduler.process_batch_result = lambda batch, result: seen.append(
+            scheduler._pause_started_at
+        )
+        with patch("sglang.srt.managers.scheduler.time.monotonic", return_value=now):
+            scheduler.pause_generation(PauseGenerationReqInput(mode=mode))
+        return seen
+
+    def test_first_retract_starts_the_pause_after_draining(self):
+        scheduler = self._new_scheduler()
+        self.assertEqual(
+            self.drain_with_pause_start_seen(scheduler, "retract", 3.5), [None]
+        )
+        self.assertEqual(scheduler._pause_started_at, 3.5)
+
+    def test_retract_after_in_place_keeps_the_first_pause_start(self):
+        scheduler = self._new_scheduler()
+        with patch("sglang.srt.managers.scheduler.time.monotonic", return_value=0.125):
+            scheduler.pause_generation(PauseGenerationReqInput(mode="in_place"))
+        self.assertEqual(
+            self.drain_with_pause_start_seen(scheduler, "retract", 10.125), [0.125]
+        )
+        self.assertEqual(scheduler._pause_started_at, 0.125)
 
     def test_inplace_only_sets_flag(self):
         """in_place pause should only set _engine_paused and return."""

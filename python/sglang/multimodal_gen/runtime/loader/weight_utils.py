@@ -168,7 +168,7 @@ def _scan_safetensors_files(
     hf_weights_files: list[str],
 ) -> tuple[list[str], dict[str, set[str]]]:
     """Validate headers and detect cross-file duplicate keys in one pass."""
-    corrupted_files: list[str] = []
+    unreadable_files: list[str] = []
     key_to_file: dict[str, str] = {}
     duplicate_files_by_key: dict[str, set[str]] = defaultdict(set)
 
@@ -183,14 +183,14 @@ def _scan_safetensors_files(
                         duplicate_files_by_key[name].update((previous_file, st_file))
         except Exception as e:
             logger.error(
-                "Corrupted safetensors file detected: %s - %s: %s",
+                "Failed to read safetensors file: %s - %s: %s",
                 st_file,
                 type(e).__name__,
                 str(e),
             )
-            corrupted_files.append(st_file)
+            unreadable_files.append(st_file)
 
-    return corrupted_files, duplicate_files_by_key
+    return unreadable_files, duplicate_files_by_key
 
 
 def _raise_if_duplicate_safetensors_keys(
@@ -257,36 +257,14 @@ def safetensors_weights_iterator(
         requested=requested, needs_key_filter=key_filter is not None
     )
 
-    # Validate files before loading
-    corrupted_files, duplicate_files_by_key = _scan_safetensors_files(hf_weights_files)
-
-    if corrupted_files:
-        # Delete corrupted files (both symlink and blob if applicable)
-        for file_path in corrupted_files:
-            try:
-                if os.path.islink(file_path):
-                    blob_path = os.path.realpath(file_path)
-                    os.remove(file_path)
-                    logger.info(
-                        "Removed corrupted symlink: %s", os.path.basename(file_path)
-                    )
-                    if os.path.exists(blob_path):
-                        os.remove(blob_path)
-                        logger.info(
-                            "Removed corrupted blob: %s", os.path.basename(blob_path)
-                        )
-                elif os.path.isfile(file_path):
-                    os.remove(file_path)
-                    logger.info(
-                        "Removed corrupted file: %s", os.path.basename(file_path)
-                    )
-            except Exception as e:
-                logger.warning("Failed to remove corrupted file %s: %s", file_path, e)
-
+    # validation must not modify checkpoints or shared cache blobs
+    unreadable_files, duplicate_files_by_key = _scan_safetensors_files(hf_weights_files)
+    if unreadable_files:
         raise RuntimeError(
-            f"Found {len(corrupted_files)} corrupted safetensors file(s). "
-            f"Files have been removed: {[os.path.basename(f) for f in corrupted_files]}. "
-            "Please retry - the files will be re-downloaded automatically."
+            f"Cannot read {len(unreadable_files)} safetensors file(s): "
+            f"{[os.path.basename(f) for f in unreadable_files]}. "
+            "Files were not modified. Check permissions and checkpoint integrity; "
+            "repair or re-download the checkpoint if needed."
         )
 
     _raise_if_duplicate_safetensors_keys(duplicate_files_by_key)
