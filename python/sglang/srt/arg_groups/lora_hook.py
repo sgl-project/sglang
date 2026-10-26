@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, List
 
 from sglang.srt.arg_groups.overrides import (
     declare_resolution,
@@ -14,6 +14,64 @@ from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef
 
 logger = logging.getLogger(__name__)
+
+
+def parse_lora_paths(lora_paths: Any) -> List[LoRARef]:
+    """Normalize configured adapter paths to LoRARef records."""
+    if lora_paths is None:
+        return []
+    if isinstance(lora_paths, dict):
+        return [
+            LoRARef(
+                lora_id=LoRARef.deterministic_id(k, v),
+                lora_name=k,
+                lora_path=v,
+                pinned=False,
+            )
+            for k, v in lora_paths.items()
+        ]
+    if not isinstance(lora_paths, list):
+        raise ValueError(
+            f"Invalid type for --lora-paths: {type(lora_paths)}. "
+            "Expected a list or a dictionary."
+        )
+    parsed_lora_paths = []
+    for lora_path in lora_paths:
+        if isinstance(lora_path, str):
+            if "=" in lora_path:
+                name, path = lora_path.split("=", 1)
+                lora_ref = LoRARef(
+                    lora_id=LoRARef.deterministic_id(name, path),
+                    lora_name=name,
+                    lora_path=path,
+                    pinned=False,
+                )
+            else:
+                lora_ref = LoRARef(
+                    lora_id=LoRARef.deterministic_id(lora_path, lora_path),
+                    lora_name=lora_path,
+                    lora_path=lora_path,
+                    pinned=False,
+                )
+        elif isinstance(lora_path, dict):
+            assert "lora_name" in lora_path and "lora_path" in lora_path, (
+                f"When providing LoRA paths as a list of dict, each dict should contain 'lora_name' and 'lora_path' keys. Got: {lora_path}"
+            )
+            lora_ref = LoRARef(
+                lora_id=LoRARef.deterministic_id(
+                    lora_path["lora_name"], lora_path["lora_path"]
+                ),
+                lora_name=lora_path["lora_name"],
+                lora_path=lora_path["lora_path"],
+                pinned=lora_path.get("pinned", False),
+            )
+        else:
+            raise ValueError(
+                f"Invalid type for item in --lora-paths list: {type(lora_path)}. "
+                "Expected a string or a dictionary."
+            )
+        parsed_lora_paths.append(lora_ref)
+    return parsed_lora_paths
 
 
 def check_lora_server_args(server_args: Any):
@@ -53,68 +111,11 @@ def check_lora_server_args(server_args: Any):
         # Validate compatibility with speculative decoding
         check_lora_speculative_compatibility(server_args)
 
-        # Parse lora_paths
-        if isinstance(cfg.lora_paths, list):
-            parsed_lora_paths = []
-            for lora_path in cfg.lora_paths:
-                if isinstance(lora_path, str):
-                    if "=" in lora_path:
-                        name, path = lora_path.split("=", 1)
-                        lora_ref = LoRARef(
-                            lora_id=LoRARef.deterministic_id(name, path),
-                            lora_name=name,
-                            lora_path=path,
-                            pinned=False,
-                        )
-                    else:
-                        lora_ref = LoRARef(
-                            lora_id=LoRARef.deterministic_id(lora_path, lora_path),
-                            lora_name=lora_path,
-                            lora_path=lora_path,
-                            pinned=False,
-                        )
-                elif isinstance(lora_path, dict):
-                    assert "lora_name" in lora_path and "lora_path" in lora_path, (
-                        f"When providing LoRA paths as a list of dict, each dict should contain 'lora_name' and 'lora_path' keys. Got: {lora_path}"
-                    )
-                    lora_ref = LoRARef(
-                        lora_id=LoRARef.deterministic_id(
-                            lora_path["lora_name"], lora_path["lora_path"]
-                        ),
-                        lora_name=lora_path["lora_name"],
-                        lora_path=lora_path["lora_path"],
-                        pinned=lora_path.get("pinned", False),
-                    )
-                else:
-                    raise ValueError(
-                        f"Invalid type for item in --lora-paths list: {type(lora_path)}. "
-                        "Expected a string or a dictionary."
-                    )
-                parsed_lora_paths.append(lora_ref)
-            declare_resolution(
-                server_args, "check_lora_server_args", lora_paths=parsed_lora_paths
-            )
-        elif isinstance(cfg.lora_paths, dict):
-            declare_resolution(
-                server_args,
-                "check_lora_server_args",
-                lora_paths=[
-                    LoRARef(
-                        lora_id=LoRARef.deterministic_id(k, v),
-                        lora_name=k,
-                        lora_path=v,
-                        pinned=False,
-                    )
-                    for k, v in cfg.lora_paths.items()
-                ],
-            )
-        elif cfg.lora_paths is None:
-            declare_resolution(server_args, "check_lora_server_args", lora_paths=[])
-        else:
-            raise ValueError(
-                f"Invalid type for --lora-paths: {type(cfg.lora_paths)}. "
-                "Expected a list or a dictionary."
-            )
+        declare_resolution(
+            server_args,
+            "check_lora_server_args",
+            lora_paths=parse_lora_paths(cfg.lora_paths),
+        )
 
         # Normalize target modules to a set; keep {"all"} as a sentinel
         # that gets resolved model-awarely in lora_manager.init_lora_shapes().

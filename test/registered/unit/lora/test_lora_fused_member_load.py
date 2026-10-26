@@ -29,23 +29,22 @@ _RANK = 2
 _PREFIX = "base_model.model.model.layers.0."
 
 
-# --- the previous loader's fused-B slicing, the oracle for complete adapters ---------------------
-# copied from sglang-miles@4076a68579 (QKVParallelLinearWithLoRA / InklingQKVRLinearWithLoRA /
-# MergedColumnParallelLinearWithLoRA.slice_lora_b_weights)
+# Reference fused-B slicing, including independent Q/K and V head widths.
+# The Inkling and merged references follow the previous concatenate-then-slice loader.
 
 
 def _reference_qkv_slice(bl, B):
-    q_start = bl.q_proj_shard_size * bl.tp_rank
     kv_shard_id = bl.tp_rank // bl.num_kv_head_replicas
-    kv_start = bl.kv_proj_shard_size * kv_shard_id
-    kv_end = kv_start + bl.kv_proj_shard_size
-    q_size = bl.output_sizes[0]
-    k_size = bl.output_sizes[1] // bl.num_kv_head_replicas
+    q_size = bl.total_num_heads * bl.head_size
+    k_size = bl.total_num_kv_heads * bl.head_size
+    q_start = bl.tp_rank * bl.q_proj_shard_size
+    k_start = q_size + kv_shard_id * bl.kv_proj_shard_size
+    v_start = q_size + k_size + kv_shard_id * bl.v_proj_shard_size
     return torch.concat(
         (
             B[q_start : q_start + bl.q_proj_shard_size],
-            B[q_size + kv_start : q_size + kv_end],
-            B[q_size + k_size + kv_start : q_size + k_size + kv_end],
+            B[k_start : k_start + bl.kv_proj_shard_size],
+            B[v_start : v_start + bl.v_proj_shard_size],
         )
     )
 
@@ -99,9 +98,7 @@ def _group(tp_rank, tp_size):
     return SimpleNamespace(rank_in_group=tp_rank, world_size=tp_size)
 
 
-def _qkv(tp_rank, tp_size=4):
-    # 4 q heads, 2 kv heads, head_dim 2: at TP4 each kv head is replicated on two ranks
-    replicas = tp_size // 2
+def _qkv(tp_rank, tp_size=4, head_size=2, v_head_size=2):
     group = _group(tp_rank, tp_size)
     bl = SimpleNamespace(
         tp_rank=tp_rank,
@@ -109,16 +106,17 @@ def _qkv(tp_rank, tp_size=4):
         kv_tp_group=group,
         total_num_heads=4,
         total_num_kv_heads=2,
-        head_size=2,
-        q_proj_shard_size=8 // tp_size,
-        kv_proj_shard_size=2,
-        num_kv_head_replicas=replicas,
-        output_sizes=[8, 2 * tp_size, 2 * tp_size],
+        head_size=head_size,
+        v_head_size=v_head_size,
+        q_proj_shard_size=4 * head_size // tp_size,
+        kv_proj_shard_size=max(1, 2 // tp_size) * head_size,
+        v_proj_shard_size=max(1, 2 // tp_size) * v_head_size,
+        num_kv_head_replicas=max(1, tp_size // 2),
     )
     return (
         "self_attn.qkv_proj",
         ("q_proj", "k_proj", "v_proj"),
-        (8, 4, 4),
+        (4 * head_size, 2 * head_size, 2 * v_head_size),
         _wrap(QKVParallelLinearWithLoRA, bl),
         lambda B: _reference_qkv_slice(bl, B),
     )
@@ -175,6 +173,7 @@ def _mla_qkv_a(tp_rank, tp_size=1):
 
 _LAYERS = {
     "qkv": (_qkv, 4),
+    "narrow_v_qkv": (lambda tp_rank: _qkv(tp_rank, head_size=3, v_head_size=2), 4),
     "gate_up": (_gate_up, 2),
     "qkvr": (_qkvr, 4),
     "mla_qkv_a": (_mla_qkv_a, 1),
@@ -330,9 +329,12 @@ def test_zero_element_placeholders_load_as_absent_members():
     assert torch.equal(b_buffer[:, :_RANK], expected_b)
 
 
+@pytest.mark.parametrize("kind", ["qkv", "narrow_v_qkv"])
 @pytest.mark.parametrize("stacked_a", [False, True], ids=["shared-A", "stacked-A"])
-def test_an_already_fused_qkv_adapter_matches_its_members(stacked_a):
-    module_path, members, full_rows, wrapper, reference_slice = _qkv(tp_rank=3)
+def test_an_already_fused_qkv_adapter_matches_its_members(kind, stacked_a):
+    module_path, members, full_rows, wrapper, reference_slice = _LAYERS[kind][0](
+        tp_rank=3
+    )
     torch.manual_seed(1)
     fused_a = torch.randn(_RANK * (3 if stacked_a else 1), _HIDDEN)
     fused_b = torch.randn(sum(full_rows), _RANK)

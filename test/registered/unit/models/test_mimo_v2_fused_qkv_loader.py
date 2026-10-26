@@ -12,6 +12,7 @@ from unittest.mock import patch
 import torch
 
 import sglang.srt.models.mimo_v2 as mimo_v2
+from sglang.srt.models.mimo_v2_nextn import MiMoV2MTP
 from sglang.test.test_utils import CustomTestCase
 
 SHARDS = 4
@@ -79,6 +80,52 @@ def _param(rows, dtype):
     )
 
 
+def _fp8_checkpoint(layer):
+    """(codes, scales, q, k, v): fused block-FP8 qkv and the q, k, v rows it decodes to."""
+    # every shard fits one 128x128 block, so each carries its own scale row
+    q, k, v = _qkv(layer)
+    shards = _interleave(q, k, v).chunk(SHARDS)
+    scales = torch.stack([s.abs().amax() / FP8_MAX for s in shards]).view(-1, 1)
+    codes = torch.cat(
+        [(s / scale).to(torch.float8_e4m3fn) for s, scale in zip(shards, scales)]
+    )
+    decoded = torch.cat(
+        [c.float() * scale for c, scale in zip(codes.chunk(SHARDS), scales)]
+    )
+    sizes = [t.shape[0] // SHARDS for t in (q, k, v)]
+    parts = [torch.split(shard, sizes) for shard in decoded.chunk(SHARDS)]
+    return (codes, scales, *(torch.cat(group) for group in zip(*parts)))
+
+
+def _assert_fp8_rows(test, weight, scale_inv, want, msg):
+    got = weight.data.float() * scale_inv.data
+    # the resolver re-quantizes the rank's rows as one block
+    tolerance = 0.07 * want.abs().max()
+    test.assertLessEqual((got - want).abs().max().item(), tolerance.item(), msg)
+
+
+def _mtp_model(rows):
+    """A MiMoV2MTP holding only its MTP layer's qkv projection, as block-FP8."""
+    model = MiMoV2MTP.__new__(MiMoV2MTP)
+    torch.nn.Module.__init__(model)
+    model.config = SimpleNamespace(
+        **vars(CONFIG),
+        attention_projection_layout="fused_qkv",
+        tie_word_embeddings=False,
+    )
+    projection = torch.nn.Module()
+    projection.tp_group = None
+    projection.weight = _param(rows, torch.float8_e4m3fn)
+    projection.weight_scale_inv = torch.nn.Parameter(
+        torch.empty(1, 1), requires_grad=False
+    )
+    model.model = torch.nn.Module()
+    model.model.mtp_block = torch.nn.Module()
+    model.model.mtp_block.self_attn = torch.nn.Module()
+    model.model.mtp_block.self_attn.qkv_proj = projection
+    return model, projection
+
+
 class TestMiMoV2FusedQKVLoader(CustomTestCase):
     def test_bf16_rank_holds_its_q_k_v_heads_at_every_tp(self):
         for layer in (0, 1):
@@ -104,23 +151,8 @@ class TestMiMoV2FusedQKVLoader(CustomTestCase):
                     )
 
     def test_block_fp8_regroups_with_its_deferred_scales(self):
-        # every shard fits one 128x128 block, so each carries its own scale row
         for layer in (0, 1):
-            q, k, v = _qkv(layer)
-            shards = _interleave(q, k, v).chunk(SHARDS)
-            scales = torch.stack([s.abs().amax() / FP8_MAX for s in shards]).view(-1, 1)
-            codes = torch.cat(
-                [
-                    (s / scale).to(torch.float8_e4m3fn)
-                    for s, scale in zip(shards, scales)
-                ]
-            )
-            decoded = torch.cat(
-                [c.float() * scale for c, scale in zip(codes.chunk(SHARDS), scales)]
-            )
-            sizes = [t.shape[0] // SHARDS for t in (q, k, v)]
-            parts = [torch.split(shard, sizes) for shard in decoded.chunk(SHARDS)]
-            dq, dk, dv = (torch.cat(group) for group in zip(*parts))
+            codes, scales, dq, dk, dv = _fp8_checkpoint(layer)
             for tp_size in (1, 2):
                 for tp_rank in range(tp_size):
                     name = f"model.layers.{layer}.self_attn.qkv_proj.weight"
@@ -152,33 +184,51 @@ class TestMiMoV2FusedQKVLoader(CustomTestCase):
                             config=CONFIG,
                             model=_MODEL,
                         )
-                    got = params[name].data.float() * params[name + "_scale_inv"].data
-                    want = _rank_rows(dq, dk, dv, tp_size, tp_rank)
-                    # the resolver re-quantizes the rank's rows as one block
-                    tolerance = 0.07 * want.abs().max()
-                    self.assertLessEqual(
-                        (got - want).abs().max().item(),
-                        tolerance.item(),
+                    _assert_fp8_rows(
+                        self,
+                        params[name],
+                        params[name + "_scale_inv"],
+                        _rank_rows(dq, dk, dv, tp_size, tp_rank),
                         f"layer {layer} tp {tp_size} rank {tp_rank}",
                     )
+
+    def test_mtp_layer_block_fp8_loads_below_fused_tp(self):
+        """The MTP draft's block-FP8 qkv once failed to load below the fused shard count
+        (scale shape mismatch), so EAGLE drafting from the MTP layers could not start at
+        attention TP 1 or 2. The MTP layer has sliding-window attention dimensions."""
+        codes, scales, dq, dk, dv = _fp8_checkpoint(1)
+        prefix = "model.mtp.layers.0.self_attn.qkv_proj."
+        for tp_size in (1, 2):
+            for tp_rank in range(tp_size):
+                model, projection = _mtp_model(codes.shape[0] // tp_size)
+                with _parallel(tp_size, tp_rank):
+                    model.load_weights(
+                        [
+                            (prefix + "weight", codes),
+                            (prefix + "weight_scale_inv", scales),
+                        ]
+                    )
+                _assert_fp8_rows(
+                    self,
+                    projection.weight,
+                    projection.weight_scale_inv,
+                    _rank_rows(dq, dk, dv, tp_size, tp_rank),
+                    f"tp {tp_size} rank {tp_rank}",
+                )
 
     def test_bf16_without_layer_sizes_raises(self):
         q, k, v = _qkv(1)
         fused = _interleave(q, k, v).to(torch.bfloat16)
-        for name, config in (
-            ("model.layers.1.self_attn.qkv_proj.weight", None),
-            ("model.mtp_block.self_attn.qkv_proj.weight", CONFIG),
-        ):
-            with _parallel(2, 0), self.assertRaises(ValueError):
-                mimo_v2.load_mimo_v2_qkv_proj_weight(
-                    name,
-                    _param(fused.shape[0] // 2, torch.bfloat16),
-                    fused,
-                    expected_fused_tp_size=SHARDS,
-                    deferred_scale_inv={},
-                    qkv_proj=_QKV_PROJ,
-                    config=config,
-                )
+        with _parallel(2, 0), self.assertRaises(ValueError):
+            mimo_v2.load_mimo_v2_qkv_proj_weight(
+                "model.layers.1.self_attn.qkv_proj.weight",
+                _param(fused.shape[0] // 2, torch.bfloat16),
+                fused,
+                expected_fused_tp_size=SHARDS,
+                deferred_scale_inv={},
+                qkv_proj=_QKV_PROJ,
+                config=None,
+            )
 
 
 if __name__ == "__main__":
