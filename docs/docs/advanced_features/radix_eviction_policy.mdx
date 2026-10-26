@@ -95,7 +95,7 @@ with both terms min-max normalized over the candidates, and evicts the lowest fi
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `alpha` | float | `1.0` | Weight of FLOP efficiency against recency. `0` keeps the recency order. |
+| `alpha` | float | `1.0` | Weight of FLOP efficiency against recency. `0` ranks by recency alone, but branch points still go last, so it is not the same as `lru`. |
 
 ```bash Command
 python3 -m sglang.launch_server \

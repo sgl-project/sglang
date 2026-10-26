@@ -87,8 +87,9 @@ class MarconiStrategy(EvictionStrategy):
     Recurrent-state checkpoints of the MAMBA component are ranked by
     recency + alpha * (prefill FLOPs saved per state byte), both min-max
     normalized over the candidates; see MambaComponent for the walk and
-    sglang.srt.mem_cache.prefill_cost_model for the FLOPs. alpha = 0 keeps
-    the recency order. The priority below is what every other component
+    sglang.srt.mem_cache.prefill_cost_model for the FLOPs. alpha = 0 ranks by
+    recency alone, but branch points (two or more children) still go last,
+    so it differs from LRU. The priority below is what every other component
     (Full KV, SWA) sees, so they keep plain LRU.
     """
 

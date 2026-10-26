@@ -56,7 +56,8 @@ class Memory(msgspec.Struct):
                 "next_prompt_estimate (ints, tokens), e.g. "
                 '\'{"threshold": 4096, "next_prompt_estimate": 512}\'; '
                 "'marconi' takes alpha (float, default 1.0), the weight of FLOP "
-                "efficiency against recency. An "
+                "efficiency against recency (0 ranks by recency alone, with "
+                "branch points still last). An "
                 "unrecognized key fails at startup, naming the key and the "
                 "policy. See "
                 "https://docs.sglang.io/docs/advanced_features/radix_eviction_policy#policy-parameters "
