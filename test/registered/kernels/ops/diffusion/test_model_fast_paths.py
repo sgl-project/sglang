@@ -19,11 +19,13 @@ Each section also asserts the gate ended up ``verified`` / not ``disabled``:
 without it a test still passes when the fast path never engaged at all.
 """
 
+import gc
 import sys
 import unittest
+import weakref
 from contextlib import ExitStack, contextmanager
 from copy import deepcopy
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -63,6 +65,7 @@ from sglang.multimodal_gen.configs.models.vaes.qwenimage21 import (
 from sglang.multimodal_gen.configs.models.vaes.stablediffusion3 import (
     StableDiffusion3VAEConfig,
 )
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     maybe_init_distributed_environment_and_model_parallel,
     model_parallel_is_initialized,
@@ -78,7 +81,10 @@ from sglang.multimodal_gen.runtime.layers.linear import MergedColumnParallelLine
 from sglang.multimodal_gen.runtime.layers.rotary_embedding.utils import (
     _apply_rotary_emb,
 )
-from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.managers.forward_context import (
+    DENOISING_LOOP_STATE,
+    set_forward_context,
+)
 from sglang.multimodal_gen.runtime.models.dits.ernie_image import (
     _ernie_gated_norm_scale_shift,
     _ernie_norm_scale_shift,
@@ -122,7 +128,11 @@ from sglang.multimodal_gen.runtime.models.dits.sana import (
 from sglang.multimodal_gen.runtime.models.dits.sana import (
     sana_ln_modulate,
 )
-from sglang.multimodal_gen.runtime.models.dits.wanvideo import WanTransformerBlock
+from sglang.multimodal_gen.runtime.models.dits.wanvideo import (
+    _TEXT_KV_STATE,
+    WanTransformer3DModel,
+    WanTransformerBlock,
+)
 from sglang.multimodal_gen.runtime.models.vaes import (
     autoencoder_kl_qwenimage as qwen_vae,
 )
@@ -149,6 +159,8 @@ from sglang.multimodal_gen.runtime.models.vaes.wan_vae_cuda_opt import (
     VaeFastPathGate,
 )
 from sglang.multimodal_gen.runtime.models.vaes.wanvae import WanRMS_norm
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import DenoisingStage
 from sglang.multimodal_gen.runtime.platforms.interface import DeviceCapability
 from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import (
     ensure_distributed_env_defaults,
@@ -2544,6 +2556,91 @@ def test_wan_chained_blocks_match_blocks_one_by_one():
             )
         out = blocks[-1](hidden, *args, rope_cos_sin_cache=cache, ffn_residual=residual)
     assert torch.equal(_bits(out), _bits(ref))
+
+
+@requires_inline_ptx
+@torch.no_grad()
+def test_wan_projected_text_kv_keeps_bits():
+    """A block given the cross-attention K/V projected ahead of the step gives the
+    bits of the block projecting them itself."""
+    with _wan_block_env():
+        block = _wan_block()
+        x, args, cache = _wan_block_inputs()
+        kv = block.attn2.project_context_kv(args[0])
+        out = block(x, *args, rope_cos_sin_cache=cache, text_kv=kv)
+        ref = block(x, *args, rope_cos_sin_cache=cache)
+    assert torch.equal(_bits(out), _bits(ref))
+
+
+class _WanTextKVModel(nn.Module):
+    """Two blocks and the model methods that project and keep their text K/V"""
+
+    _text_kvs = WanTransformer3DModel._text_kvs
+    _plain_blocks = WanTransformer3DModel._plain_blocks
+
+    def __init__(self):
+        super().__init__()
+        self.blocks = nn.ModuleList(_wan_block(1024, 8) for _ in range(2))
+        self.layerwise_offload_managers = []
+
+
+@requires_inline_ptx
+@torch.no_grad()
+def test_wan_text_kv_lives_for_one_loop_of_one_request():
+    """The text K/V projected once per loop live in the request for that loop only:
+    the next expert, the end of the loop and the end of the request free them."""
+    with _wan_block_env():
+        expert, expert_2 = _WanTextKVModel(), _WanTextKVModel()
+        context = torch.randn(1, 64, 1024, device="cuda", dtype=torch.bfloat16)
+        positive, negative = torch.randn(2, 1, 64, 4096, device="cuda")
+        new_req = lambda: Req(sampling_params=SamplingParams(prompt="test"))
+
+        def text_kvs(model, source, req):
+            with set_forward_context(0, None, req):
+                return model._text_kvs(source, context)
+
+        def first_k(model, source, req):
+            return weakref.ref(text_kvs(model, source, req)[0][0])
+
+        # every step of the loop reads the K/V projected on its first, per CFG branch
+        req = new_req()
+        kvs = text_kvs(expert, positive, req)
+        neg_kvs = text_kvs(expert, negative, req)
+        assert text_kvs(expert, positive, req) is kvs
+        assert text_kvs(expert, negative, req) is neg_kvs
+        for (k, v), block in zip(kvs, expert.blocks):
+            ref_k, ref_v = block.attn2.project_context_kv(context)
+            assert torch.equal(k, ref_k) and torch.equal(v, ref_v)
+
+        # another request projects its own; K/V left on another device are projected again
+        assert text_kvs(expert, positive, new_req()) is not kvs
+        req.extra[DENOISING_LOOP_STATE][_TEXT_KV_STATE][(id(expert), id(positive))] = (
+            positive,
+            [(k.cpu(), v.cpu()) for k, v in kvs],
+        )
+        moved = text_kvs(expert, positive, req)
+        assert moved[0][0].is_cuda and torch.equal(moved[0][0], kvs[0][0])
+
+        # the second expert's first step frees the first expert's K/V
+        gone = [weakref.ref(t) for t in (moved[0][0], neg_kvs[0][0])]
+        del kvs, neg_kvs, moved, ref_k, ref_v, k, v
+        text_kvs(expert_2, positive, req)
+        assert all(ref() is None for ref in gone)
+
+        # the end of the loop frees the rest, before decode
+        gone = first_k(expert_2, positive, req)
+        stage = MagicMock()
+        stage._postprocess_sp_latents.return_value = (None, None)
+        stage._sp_world_size.return_value = 1
+        DenoisingStage._post_denoising_loop(stage, req, None, [], [], MagicMock(), True)
+        assert gone() is None and DENOISING_LOOP_STATE not in req.extra
+
+        # a request that ends mid-loop takes its K/V with it: the model holds none
+        req = new_req()
+        gone = first_k(expert, positive, req)
+        del req
+        gc.collect()
+        assert gone() is None
 
 
 if __name__ == "__main__":

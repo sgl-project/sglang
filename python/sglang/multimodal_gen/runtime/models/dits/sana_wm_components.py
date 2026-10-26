@@ -718,11 +718,10 @@ def process_camera_conditions_ucpe(
     raymats[..., :3, :3] = R_w_to_ray
     raymats[..., :3, 3] = t_w_to_ray
     raymats[..., 3, 3] = 1.0
+    # torch.where, not `if invalid.any(): raymats[invalid] = eye`: both sync the host
     invalid = torch.isnan(d_world).any(dim=-1)
-    if bool(invalid.any()):
-        eye = torch.eye(4, device=device, dtype=dtype)
-        raymats[invalid] = eye
-    return raymats
+    eye = torch.eye(4, device=device, dtype=dtype)
+    return torch.where(invalid[..., None, None], eye, raymats)
 
 
 def compute_chunk_plucker(
@@ -778,21 +777,15 @@ def compute_chunk_plucker(
     moment = torch.cross(o_exp, d_world, dim=-1)
     plucker = torch.cat([d_world, moment], dim=-1)  # (B, F_orig, H, W, 6)
 
-    time_indices = torch.arange(
-        0, F_orig, vae_temporal_stride, device=device, dtype=torch.long
-    )
-    if time_indices.numel() < T:
-        pad = T - int(time_indices.numel())
-        last = (
-            time_indices[-1:]
-            if time_indices.numel()
-            else torch.zeros(1, device=device, dtype=torch.long)
-        )
-        time_indices = torch.cat([time_indices, last.repeat(pad)], dim=0)
+    # host indices: only Python slicing reads them, a device copy needs a sync
+    time_indices = list(range(0, F_orig, vae_temporal_stride))
+    if len(time_indices) < T:
+        last = time_indices[-1] if time_indices else 0
+        time_indices += [last] * (T - len(time_indices))
     time_indices = time_indices[:T]
 
     chunks = []
-    for time_index in time_indices.tolist():
+    for time_index in time_indices:
         start = max(0, int(time_index) - vae_temporal_stride + 1)
         end = min(start + vae_temporal_stride, F_orig)
         chunk = plucker[:, start:end]
@@ -2903,9 +2896,8 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         if save_kv_cache:
             kv_cache[_SLOT_K] = state_kv.detach().clone()
             kv_cache[_SLOT_V] = state_z.detach().clone()
-            kv_cache[_SLOT_TYPE_FLAG] = torch.tensor(
-                [_CACHE_TYPE_STATE], device=x.device
-            )
+            # a host flag: it only steers Python control flow
+            kv_cache[_SLOT_TYPE_FLAG] = torch.tensor([_CACHE_TYPE_STATE])
 
         out = out.permute(0, 3, 1, 2).reshape(B, N, C)
         return out, beta, decay
@@ -2953,9 +2945,7 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         if save_kv_cache:
             kv_cache[_SLOT_K] = k_in.detach().clone()
             kv_cache[_SLOT_V] = v_in.detach().clone()
-            kv_cache[_SLOT_TYPE_FLAG] = torch.tensor(
-                [_CACHE_TYPE_CONCAT], device=x.device
-            )
+            kv_cache[_SLOT_TYPE_FLAG] = torch.tensor([_CACHE_TYPE_CONCAT])
         if cached_k is not None:
             k_in = torch.cat([cached_k.to(k_in.dtype), k_in], dim=1)
             v_in = torch.cat([cached_v.to(v_in.dtype), v_in], dim=1)
