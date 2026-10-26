@@ -255,6 +255,30 @@ fn copy_prompt_per_choice(generate: &mut Value) -> Result<(), Error> {
     check_prompt_copies(per_clone, n)?;
     generate["sampling_params"]["n"] = 1.into();
     generate["input_ids"] = Value::Array(vec![generate["input_ids"].take(); n]);
+    // Python's parallel sampling repeats the prompt's list-form fields with it,
+    // and a rid list names the one prompt.
+    for key in [
+        "bootstrap_host",
+        "bootstrap_port",
+        "bootstrap_room",
+        "extra_key",
+        "cache_salt",
+        "lora_path",
+    ] {
+        if let Some(Value::Array(items)) = generate.get_mut(key) {
+            *items = items
+                .iter()
+                .cycle()
+                .take(items.len() * n)
+                .cloned()
+                .collect();
+        }
+    }
+    if let Some(Value::Array(rids)) = generate.get_mut("rid")
+        && rids.len() == 1
+    {
+        generate["rid"] = rids.remove(0);
+    }
     Ok(())
 }
 
@@ -358,6 +382,25 @@ mod tests {
         assert_eq!(value["type"], "BadRequestError");
         let message = value["message"].as_str().unwrap();
         assert!(message.contains("exceeds the maximum"), "{message}");
+    }
+
+    /// With `n` choices, a prompt's one-element lists cover every choice, as
+    /// Python's parallel sampling repeats them.
+    #[tokio::test]
+    async fn n_choices_repeat_the_prompts_list_fields() {
+        let app = lowered_state(|rid| chunk(rid, "ok", true));
+        let body = json!({
+            "model": "model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "n": 2,
+            "rid": ["x"],
+            "bootstrap_host": ["h"],
+            "bootstrap_room": [5],
+        });
+        let response = post_json(app, "/v1/chat/completions", body).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let value = body_json(response).await;
+        assert_eq!(value["choices"].as_array().unwrap().len(), 2);
     }
 
     /// A failed choice answers at once, without waiting on an unfinished sibling.
