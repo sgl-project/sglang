@@ -1,4 +1,4 @@
-"""Optimized LiteTopK fused indexer top-k for DSA prefill (SM100 family).
+"""Optimized LiteTopK fused indexer top-k for DSA prefill (SM100).
 
 One persistent kernel scores every visible key of each query row with the DSA
 indexer (GLM-5.2's geometry: 32 index heads x 128, FP8 index K) and selects the
@@ -17,16 +17,25 @@ from typing import TYPE_CHECKING, Dict, NamedTuple, Optional, Tuple
 
 import torch
 
-from sglang.kernels.jit.utils import KERNEL_PATH, cache_once, load_jit
+from sglang.kernels.jit.utils import (
+    KERNEL_PATH,
+    cache_once,
+    load_jit,
+    override_jit_cuda_arch,
+)
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
-SUPPORTED_CUDA_ARCHS = ((10, 0), (10, 3))
+# Gates and dispatch are tuned and validated on B200 only.
+SUPPORTED_CUDA_ARCHS = ((10, 0),)
 FUSED_MQA_TOPK_NUM_HEADS = 32
 FUSED_MQA_TOPK_HEAD_DIM = 128
 # The only top-k the vendored kernel is instantiated for.
 FUSED_MQA_TOPK_TOPK = 2048
+# Fewest keys (rows of k_fp8) the kernel takes, fused_persist::kMinKeys: only
+# its global-slab path is vendored, tuned above 20480 keys.
+FUSED_MQA_TOPK_MIN_KEYS = 20481
 FUSED_MQA_TOPK_MAX_KEYS = 1 << 20
 # rows * 32 is the int32 outer extent of the kernel's Q tensor map.
 FUSED_MQA_TOPK_MAX_ROWS = (2**31 - 1) // 32
@@ -64,17 +73,20 @@ def is_fused_mqa_topk_supported() -> bool:
 @cache_once
 def _jit_fused_mqa_topk_module() -> Module:
     if not is_fused_mqa_topk_supported():
-        raise RuntimeError("fused_mqa_topk_prefill requires CUDA SM100 or SM103")
+        raise RuntimeError("fused_mqa_topk_prefill requires CUDA SM100")
     vendor = (KERNEL_PATH / "csrc" / "fused_mqa_topk" / "vendor").resolve()
-    return load_jit(
-        "fused_mqa_topk",
-        cuda_files=["fused_mqa_topk/entry.cuh"],
-        cuda_wrappers=[("fused_mqa_topk_prefill", "fused_mqa_topk_prefill")],
-        extra_include_paths=[str(vendor)],
-        # CUTLASS, and <deep_gemm/...> from the installed sgl-deep-gemm.
-        extra_dependencies=["cutlass"],
-        extra_cuda_cflags=["--expt-extended-lambda"],
-    )
+    # sm_100f, not the default sm_100a: ~1% faster on B200 for long single-request
+    # prefills (> 192K keys), slower below; see the README.
+    with override_jit_cuda_arch(10, 0, suffix="f"):
+        return load_jit(
+            "fused_mqa_topk",
+            cuda_files=["fused_mqa_topk/entry.cuh"],
+            cuda_wrappers=[("fused_mqa_topk_prefill", "fused_mqa_topk_prefill")],
+            extra_include_paths=[str(vendor)],
+            # CUTLASS, and <deep_gemm/...> from the installed sgl-deep-gemm.
+            extra_dependencies=["cutlass"],
+            extra_cuda_cflags=["--expt-extended-lambda"],
+        )
 
 
 def can_use_fused_mqa_topk_prefill(
@@ -97,7 +109,7 @@ def can_use_fused_mqa_topk_prefill(
         and k_fp8.dim() == 2
         and k_fp8.shape[1] == FUSED_MQA_TOPK_HEAD_DIM
         and 0 < q_fp8.shape[0] <= FUSED_MQA_TOPK_MAX_ROWS
-        and 0 < k_fp8.shape[0] <= FUSED_MQA_TOPK_MAX_KEYS
+        and FUSED_MQA_TOPK_MIN_KEYS <= k_fp8.shape[0] <= FUSED_MQA_TOPK_MAX_KEYS
         and k_scale.shape == (k_fp8.shape[0],)
         and weights.shape == (q_fp8.shape[0], FUSED_MQA_TOPK_NUM_HEADS)
         # TMA descriptors need 16-byte aligned contiguous operands.
@@ -179,7 +191,8 @@ def fused_mqa_topk_prefill(
     ``page_table[row_batch[r], j - starts[r]]``, the DSA PAGED transform.
 
     Operands: ``q_fp8`` ``[rows, 32, 128]`` and ``k_fp8`` ``[keys, 128]``
-    float8_e4m3fn, ``k_scale`` ``[keys]`` and ``weights`` ``[rows, 32]`` float32,
+    float8_e4m3fn with ``FUSED_MQA_TOPK_MIN_KEYS`` to ``FUSED_MQA_TOPK_MAX_KEYS``
+    keys, ``k_scale`` ``[keys]`` and ``weights`` ``[rows, 32]`` float32,
     ``starts`` / ``ends`` / ``out_offsets`` / ``row_batch`` ``[rows]`` int32,
     ``page_table`` ``[requests, width]`` int32 with unit column stride and
     ``width`` at least the keys any row of the request sees, ``out``

@@ -16,6 +16,7 @@ from sglang.kernels.ops.attention.dsa.fp8_fused_writer_hip import (
 )
 from sglang.kernels.ops.attention.dsa.fused_mqa_topk import (
     FUSED_MQA_TOPK_HEAD_DIM,
+    FUSED_MQA_TOPK_MIN_KEYS,
     FUSED_MQA_TOPK_NUM_HEADS,
     FUSED_MQA_TOPK_TOPK,
     can_use_fused_mqa_topk_prefill,
@@ -261,15 +262,22 @@ def _index_k_write_targets(pool, layer_id: int, loc: torch.Tensor):
     return shard_pool.index_key_cache.write_targets(layer_id, loc)
 
 
-# Below either bound the dense logits + top-k path is faster: keys the longest
-# row sees, and query rows (one CTA scans 8 rows, so fewer rows idle SMs).
-# Measured on B200 against the dense path at its static logits budget, worst of
-# the GLM-5.2 layers measured; the dense PAGED transform costs more than the
-# RAGGED one, which the unfused top-k matches. Re-measure when the kernel changes.
-_FUSED_MQA_TOPK_MIN_KEYS_RAGGED = 65536
+# Lowest bounds at which the fused path was not slower than the dense one on
+# any measured GLM-5.2 layer (B200, dense at its static logits budget): keys
+# the longest row sees, and query rows (one CTA scans 8 rows, so fewer rows
+# idle SMs). Below 24576 keys PAGED still wins on layer 0 but is unmeasured on
+# other layers; the dense PAGED transform costs more than the RAGGED one,
+# which the unfused top-k matches. Re-measure when the kernel changes.
+_FUSED_MQA_TOPK_MIN_KEYS_RAGGED = 32768
 _FUSED_MQA_TOPK_MIN_ROWS_RAGGED = 1024
-_FUSED_MQA_TOPK_MIN_KEYS_PAGED = 32768
+_FUSED_MQA_TOPK_MIN_KEYS_PAGED = 24576
 _FUSED_MQA_TOPK_MIN_ROWS_PAGED = 1024
+# A chunk past either keys bound is never too small for the op: K holds at least
+# the longest row's keys.
+assert (
+    min(_FUSED_MQA_TOPK_MIN_KEYS_RAGGED, _FUSED_MQA_TOPK_MIN_KEYS_PAGED)
+    >= FUSED_MQA_TOPK_MIN_KEYS
+)
 
 
 _FUSED_MQA_TOPK_LOGGED = False
@@ -285,7 +293,7 @@ def _log_fused_mqa_topk_once(enabled: bool) -> None:
     else:
         logger.warning(
             "SGLANG_ENABLE_DSA_FUSED_MQA_TOPK is set but the DSA indexer cannot use "
-            "it: it needs CUDA SM100/SM103, 32 index heads of dim 128, index_topk "
+            "it: it needs CUDA SM100, 32 index heads of dim 128, index_topk "
             "2048, no index init/local tokens, no prefill context parallelism and "
             "no deterministic inference"
         )

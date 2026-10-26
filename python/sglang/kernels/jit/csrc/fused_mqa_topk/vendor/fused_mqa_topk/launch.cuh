@@ -5,10 +5,9 @@
 // top-k prefill kernel (SM100 family). Callers (a libtorch-stable binding, a
 // TVM-FFI entry) validate their tensors and fill FusedMqaTopkParams with raw
 // device pointers; nothing here allocates or synchronizes, so a launch can be
-// captured in a CUDA graph.
-//   <= 4K keys: resident_kernel.cuh (all scores of a block in shared memory).
-//   >  4K keys: persistent_kernel.cuh (one CTA per SM; sampled gate, candidate
-//               emission and selection; exact rescan of out-of-range blocks).
+// captured in a CUDA graph. The kernel is persistent_kernel.cuh (one CTA per
+// SM; sampled gate, candidate emission and selection; exact rescan of
+// out-of-range blocks), for fused_persist::kMinKeys to kMaxKeys keys.
 #pragma once
 
 #include <cuda.h>
@@ -20,7 +19,6 @@
 #include <cstdint>
 
 #include "persistent_kernel.cuh"
-#include "resident_kernel.cuh"
 
 namespace fused_mqa_topk {
 
@@ -148,8 +146,8 @@ inline bool params_supported(const FusedMqaTopkParams& p) {
     return reinterpret_cast<uintptr_t>(ptr) % a == 0;
   };
   // rows * 32 is the int32 outer dimension / coordinate of the Q tensor map.
-  return p.rows > 0 && p.rows * kHeads <= INT32_MAX && p.keys > 0 &&
-         p.keys <= kMaxKeys &&
+  return p.rows > 0 && p.rows * kHeads <= INT32_MAX &&
+         p.keys >= fused_persist::kMinKeys && p.keys <= kMaxKeys &&
          p.topk == fused_persist::kTopK &&
          (p.out_offsets == nullptr || p.relative) &&
          (p.page_table == nullptr ||
@@ -165,8 +163,7 @@ inline cudaError_t launch(const FusedMqaTopkParams& p) {
   if (!params_supported(p)) return cudaErrorInvalidValue;
   const unsigned urows = static_cast<unsigned>(p.rows),
                  ukeys = static_cast<unsigned>(p.keys),
-                 ublocks = static_cast<unsigned>((p.rows + 7) / 8),
-                 topk = static_cast<unsigned>(p.topk);
+                 ublocks = static_cast<unsigned>((p.rows + 7) / 8);
   const auto* starts_p = reinterpret_cast<const unsigned*>(p.starts);
   const auto* ends_p = reinterpret_cast<const unsigned*>(p.ends);
   const PageTable paged{p.page_table, p.page_table_stride, p.row_batch};
@@ -181,39 +178,26 @@ inline cudaError_t launch(const FusedMqaTopkParams& p) {
                       int(p.rows), 32, 8, 32, 0) != CUDA_SUCCESS)
     return cudaErrorInvalidValue;
 
-  if (ukeys <= fused_mqa_resident::kResidentKeys) {
-    // Every score of a block fits in shared memory: no workspace.
-    constexpr int smem = int(fused_mqa_resident::kSmemBytes);
-    if (const cudaError_t e = fused_persist::opt_in_smem(
-            reinterpret_cast<const void*>(fused_mqa_topk_fp8_resident_kernel),
-            smem);
-        e != cudaSuccess)
-      return e;
-    fused_mqa_topk_fp8_resident_kernel<<<ublocks, 384, smem, p.stream>>>(
-        urows, ukeys, starts_p, ends_p, p.out, topk, p.relative, p.out_offsets,
-        tq, ts, tk, tw, paged);
-  } else {
-    if (p.slots < 2 || p.slots % 2 != 0) return cudaErrorInvalidValue;
-    // One persistent CTA per SM (capped by the blocks and the workspace
-    // slots); CTA c owns candidate slots 2c and 2c + 1.
-    const unsigned grid = static_cast<unsigned>(
-        std::min<int64_t>({int64_t(p.num_sms), int64_t(ublocks), p.slots / 2}));
-    fused_persist::LaunchConfig c;
-    if (const cudaError_t e = fused_persist::launch_config(ukeys, c);
-        e != cudaSuccess)
-      return e;
-    CUtensorMap tks;
-    if (detail::make_strided_kv(&tks, p.k, c.sample_groups, c.sample_stride) !=
-        CUDA_SUCCESS)
-      return cudaErrorInvalidValue;
-    const FallbackBuffers fallback{p.retained, p.retained_indices, p.out};
-    c.kernel<<<grid, 384, c.smem, p.stream>>>(
-        urows, ukeys, starts_p, ends_p, p.values, p.indices, p.counts, fallback,
-        c.phase_bytes, c.sample_target, c.sample_stride, c.sample_groups,
-        c.sample_tiles, p.scales, tks, tq, ts, tk, tw, p.relative,
-        p.out_offsets, ublocks, reinterpret_cast<unsigned*>(p.counter), p.defer,
-        paged);
-  }
+  if (p.slots < 2 || p.slots % 2 != 0) return cudaErrorInvalidValue;
+  // One persistent CTA per SM (capped by the blocks and the workspace
+  // slots); CTA c owns candidate slots 2c and 2c + 1.
+  const unsigned grid = static_cast<unsigned>(
+      std::min<int64_t>({int64_t(p.num_sms), int64_t(ublocks), p.slots / 2}));
+  fused_persist::LaunchConfig c;
+  if (const cudaError_t e = fused_persist::launch_config(ukeys, c);
+      e != cudaSuccess)
+    return e;
+  CUtensorMap tks;
+  if (detail::make_strided_kv(&tks, p.k, c.sample_groups, c.sample_stride) !=
+      CUDA_SUCCESS)
+    return cudaErrorInvalidValue;
+  const FallbackBuffers fallback{p.retained, p.retained_indices, p.out};
+  c.kernel<<<grid, 384, c.smem, p.stream>>>(
+      urows, ukeys, starts_p, ends_p, p.values, p.indices, p.counts, fallback,
+      c.phase_bytes, c.sample_target, c.sample_stride, c.sample_groups,
+      c.sample_tiles, p.scales, tks, tq, ts, tk, tw, p.relative,
+      p.out_offsets, ublocks, reinterpret_cast<unsigned*>(p.counter), p.defer,
+      paged);
   return cudaGetLastError();
 }
 

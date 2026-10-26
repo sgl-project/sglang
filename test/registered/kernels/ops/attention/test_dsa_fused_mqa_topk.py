@@ -15,6 +15,7 @@ import torch
 
 from sglang.kernels.ops.attention.dsa.fused_mqa_topk import (
     FUSED_MQA_TOPK_MAX_KEYS,
+    FUSED_MQA_TOPK_MIN_KEYS,
     can_use_fused_mqa_topk_prefill,
     fused_mqa_topk_prefill,
     is_fused_mqa_topk_supported,
@@ -32,7 +33,7 @@ from sglang.test.kernels.dsa_fused_mqa_topk import (
 register_cuda_ci(est_time=200, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 pytestmark = pytest.mark.skipif(
-    not is_fused_mqa_topk_supported(), reason="requires CUDA SM100 or SM103"
+    not is_fused_mqa_topk_supported(), reason="requires CUDA SM100"
 )
 
 TOPK = 2048
@@ -43,12 +44,17 @@ def _fused(batch, **kwargs):
     return fused_mqa_topk_prefill(*(batch[n] for n in OPERANDS), TOPK, **kwargs)
 
 
-# The key count picks the kernel: <= 4K keys score in shared memory, <= 20K keep
-# candidates in shared memory, longer rows stream them to the global slab with
-# a gate sample that changes above 128K keys; 2^20 keys is the cap.
+# The ends of the op's key range, a mid-length gate, and both sides of the switch
+# from the streaming to the staged selection at 196608 keys.
 @pytest.mark.parametrize(
     "keys,rows",
-    [(4096, 40), (16384, 40), (65536, 24), (262145, 9), (FUSED_MQA_TOPK_MAX_KEYS, 8)],
+    [
+        (FUSED_MQA_TOPK_MIN_KEYS, 40),
+        (65536, 24),
+        (196608, 9),
+        (196609, 9),
+        (FUSED_MQA_TOPK_MAX_KEYS, 8),
+    ],
 )
 def test_single_request_is_exact_on_every_kernel_path(keys, rows):
     batch = make_ragged_batch([keys], [rows], seed=keys)
@@ -94,9 +100,10 @@ def test_graph_replays_reuse_the_stream_workspace():
 
 
 def test_uncovered_operands_are_declined():
-    batch = make_ragged_batch([8192], [16], seed=0)
+    batch = make_ragged_batch([FUSED_MQA_TOPK_MIN_KEYS + 1], [16], seed=0)
     q, k, k_scale, w = (batch[n] for n in OPERANDS[:4])
     assert can_use_fused_mqa_topk_prefill(q, k, k_scale, w, TOPK)
+    few = FUSED_MQA_TOPK_MIN_KEYS - 1
     too_many = torch.zeros(
         FUSED_MQA_TOPK_MAX_KEYS + 1, 128, dtype=k.dtype, device="cuda"
     )
@@ -112,26 +119,32 @@ def test_uncovered_operands_are_declined():
         "k_dtype": (q, k.view(torch.uint8), k_scale, w, TOPK),
         # The kernel is instantiated for top-2048 only.
         "topk": (q, k, k_scale, w, 512),
+        # The vendored kernel has no path for fewer keys.
+        "few_keys": (q, k[:few], k_scale[:few], w, TOPK),
         "keys": (q, too_many, k_scale.new_ones(too_many.shape[0]), w, TOPK),
         "misaligned": (q, k[1:], k_scale[1:], w, TOPK),
         "strided": (q[::2], k, k_scale, w[::2], TOPK),
     }
     for case, operands in cases.items():
         assert not can_use_fused_mqa_topk_prefill(*operands), case
+    # Called anyway, the op rejects too few keys instead of launching.
+    with pytest.raises(RuntimeError, match="keys must be in"):
+        _fused(dict(batch, k_fp8=k[:few], k_scale=k_scale[:few]))
 
 
 def test_more_rows_than_one_scheduler_stride_are_exact():
-    """Past 4096 8-row blocks (32768 rows) the block walk wraps its grid stride;
-    every row must still get its own top-k, on the resident and the persistent path."""
-    for keys in (4096, 65536):
-        batch = make_ragged_batch([keys], [4096], seed=keys)
-        tiled = dict(batch)
-        for name in ("q_fp8", "weights", "starts", "ends"):
-            tiled[name] = batch[name].repeat(9, *[1] * (batch[name].dim() - 1))
-        out = _fused(tiled)
-        scores = reference_scores(batch)
-        for part in out.split(4096):
-            assert_topk_matches_reference(part, batch, scores)
+    """Past 4096 8-row blocks (32768 rows) a grid-stride block walk wraps; every row
+    must still get its own top-k, also from the exact rescan of an early block."""
+    batch = make_ragged_batch([65536], [4096], seed=65536)
+    # A subnormal head weight sends the row's block to the exact rescan.
+    batch["weights"][0, 0] = 1e-39
+    tiled = dict(batch)
+    for name in ("q_fp8", "weights", "starts", "ends"):
+        tiled[name] = batch[name].repeat(9, *[1] * (batch[name].dim() - 1))
+    out = _fused(tiled)
+    scores = reference_scores(batch)
+    for part in out.split(4096):
+        assert_topk_matches_reference(part, batch, scores)
 
 
 if __name__ == "__main__":

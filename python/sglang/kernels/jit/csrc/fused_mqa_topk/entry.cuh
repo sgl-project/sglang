@@ -17,7 +17,7 @@
 namespace sglang {
 
 /**
- * \brief Fused FP8 MQA-logits + per-row top-k of the DSA indexer (SM100 family).
+ * \brief Fused FP8 MQA-logits + per-row top-k of the DSA indexer (SM100).
  *
  * Row `r` scores every key `j` in `[starts[r], ends[r])` as
  * `k_scale[j] * sum_h weights[r, h] * relu(q[r, h] . k[j])` and writes the
@@ -29,7 +29,7 @@ namespace sglang {
  * may run concurrently.
  *
  * \param q                [rows, 32, 128] fp8 e4m3
- * \param k                [keys, 128] fp8 e4m3, keys in (0, 2^20]
+ * \param k                [keys, 128] fp8 e4m3, keys in [20481, 2^20]
  * \param k_scale          [keys] fp32 per-key dequant scale
  * \param weights          [rows, 32] fp32 per-head gate, q scale folded in
  * \param starts           [rows] int32, first visible key of each row
@@ -136,7 +136,8 @@ inline void fused_mqa_topk_prefill(
   // rows * 32 is the int32 outer extent of the Q tensor map.
   CHECK_HOST(rows > 0 && rows <= INT32_MAX / kernel::kHeads)
       << "rows must be in [1, " << INT32_MAX / kernel::kHeads << "]";
-  CHECK_HOST(keys > 0 && keys <= kernel::kMaxKeys) << "keys must be in [1, " << kernel::kMaxKeys << "]";
+  CHECK_HOST(keys >= ::fused_persist::kMinKeys && keys <= kernel::kMaxKeys)
+      << "keys must be in [" << ::fused_persist::kMinKeys << ", " << kernel::kMaxKeys << "]";
   CHECK_HOST(topk == ::fused_persist::kTopK) << "topk must be " << ::fused_persist::kTopK << ", got " << topk;
   CHECK_HOST(SLOT_ROWS.unwrap() > 0 && SLOT_ROWS.unwrap() % 16 == 0)
       << "candidate slabs must hold an even number of 8-row slots";
