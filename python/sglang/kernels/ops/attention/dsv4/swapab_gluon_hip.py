@@ -117,7 +117,7 @@ def partial_gluon(
     qd = gl.arange(0, 512, gl.SliceLayout(0, kv_layout))
     q = gl.load(Q + b * QS + qh[:, None] * QH + qd[None, :])
     mf: gl.constexpr = gl.amd.AMDMFMALayout(
-        version=4, instr_shape=[16, 16, 16], transposed=True, warps_per_cta=[4, 1]
+        version=4, instr_shape=[16, 16, 32], transposed=True, warps_per_cta=[4, 1]
     )
     kv_smem = gl.allocate_shared_memory(
         gl.bfloat16,
@@ -141,27 +141,29 @@ def partial_gluon(
     denom = gl.sum(prob, 0)
     hi = prob.to(gl.bfloat16)
     kv_t = kv_smem.permute((1, 0))
+    # not transposed: a lane holds 4 consecutive d of one head, so O stores to
+    # PART [h, d] without an LDS relayout
+    pv: gl.constexpr = gl.amd.AMDMFMALayout(
+        version=4, instr_shape=[16, 16, 32], transposed=False, warps_per_cta=[4, 1]
+    )
     value = gl.amd.cdna4.mfma(
-        kv_t.load(gl.DotOperandLayout(0, mf, 8)),
-        gl.convert_layout(hi, gl.DotOperandLayout(1, mf, 8)),
-        gl.zeros((512, H), gl.float32, mf),
+        kv_t.load(gl.DotOperandLayout(0, pv, 8)),
+        gl.convert_layout(hi, gl.DotOperandLayout(1, pv, 8)),
+        gl.zeros((512, H), gl.float32, pv),
     )
     if COMPENSATE:
         lo = (prob - hi.to(gl.float32)).to(gl.bfloat16)
         value = gl.amd.cdna4.mfma(
-            kv_t.load(gl.DotOperandLayout(0, mf, 8)),
-            gl.convert_layout(lo, gl.DotOperandLayout(1, mf, 8)),
+            kv_t.load(gl.DotOperandLayout(0, pv, 8)),
+            gl.convert_layout(lo, gl.DotOperandLayout(1, pv, 8)),
             value,
         )
-    hd: gl.constexpr = gl.BlockedLayout([1, 8], [8, 8], [1, 4], [1, 0])
-    value = gl.convert_layout(value.permute((1, 0)), hd)
-    h = gl.arange(0, H, gl.SliceLayout(1, hd))
-    d = gl.arange(0, 512, gl.SliceLayout(0, hd))
-    gl.store(PART + ((b * NT + t) * H + h[:, None]) * 512 + d[None, :], value)
-    stat: gl.constexpr = gl.BlockedLayout([1], [64], [4], [0])
-    hs = gl.arange(0, H, stat)
-    gl.store(MAX + (b * NT + t) * H + hs, gl.convert_layout(mx, stat))
-    gl.store(SUM + (b * NT + t) * H + hs, gl.convert_layout(denom, stat))
+    d = gl.arange(0, 512, gl.SliceLayout(1, pv))
+    h = gl.arange(0, H, gl.SliceLayout(0, pv))
+    gl.store(PART + ((b * NT + t) * H + h[None, :]) * 512 + d[:, None], value)
+    hs = gl.arange(0, H, gl.SliceLayout(0, mf))
+    gl.store(MAX + (b * NT + t) * H + hs, mx)
+    gl.store(SUM + (b * NT + t) * H + hs, denom)
 
 
 # the SM100 host path (sink, combine, inverse RoPE) on the gfx950 split-KV kernel above

@@ -77,13 +77,13 @@ def reference(q, values, ids, lengths, sink, extra=None):
     "requires Blackwell SM100/SM103 or AMD gfx950",
 )
 class TestSwapABAttention(CustomTestCase):
-    def check_case(self, b, page, nk, ne, graph=False, heads=16):
+    def check_case(self, b, page, nk, ne, graph=False, heads=16, q_scale=0.5):
         torch.manual_seed(20260915 + b + nk + ne)
         storage = torch.full(
             (b, 1, 64, 512), float("nan"), device="cuda", dtype=torch.bfloat16
         )
         q = storage[:, :, :heads]
-        q.copy_(torch.randn_like(q) * 0.5)
+        q.copy_(torch.randn_like(q) * q_scale)
         raw, kv, values = make_cache(page)
         extra_raw, extra_kv, extra_values = make_cache(16)
         # Strided rows exercise source views made by metadata alignment.
@@ -221,6 +221,18 @@ class TestSwapABAttention(CustomTestCase):
         ):
             with self.subTest(case=case):
                 self.check_case(*case)
+
+    @unittest.skipUnless(is_hip(), "not run on SM100 yet")
+    def test_ragged_lengths_and_tile_tails(self):
+        for case in ((4, 64, 100, 333), (3, 64, 129, 1000), (8, 64, 33, 65)):
+            with self.subTest(case=case):
+                self.check_case(*case)
+
+    @unittest.skipUnless(is_hip(), "not run on SM100 yet")
+    def test_sharp_softmax(self):
+        for q_scale in (2.0, 6.0):
+            with self.subTest(q_scale=q_scale):
+                self.check_case(4, 64, 256, 512, q_scale=q_scale)
 
     def test_dynamic_graph_replay(self):
         self.check_case(6, 64, 192, 512, graph=True)
