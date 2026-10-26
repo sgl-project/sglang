@@ -37,9 +37,9 @@ _TILES = {
     16: ((16, 16, 512, 8, 4), "m31_router_t16", 64),
 }
 _MAX_SPLIT = 12
+SHARED_N = 1536
 # the fused kernel per router tile: name, router CTAs, the shared expert gate_up's smallm_fp8_gemm config
 # (n-tiles, k steps, waves, LDS-staged x) it runs on the remaining CTAs
-SHARED_N = 1536
 _SHARED = {
     8: ("m31_shared_router_t8", 48, (1, 12, 8, 1)),
     16: ("m31_shared_router_t16", 64, (1, 8, 12, 1)),
