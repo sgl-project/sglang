@@ -89,6 +89,9 @@ class TestMoeSortingSmall(CustomTestCase):
             [(513, 11, m) for m in (1, 2, 4, 5)]
             + [(129, 5, m) for m in (13, 25, 51)]
             + [(385, 7, m) for m in (4, 5, 10, 36)]
+            # past 256 pairs, up to the 1024-pair limit
+            + [(129, 5, m) for m in (52, 103, 204)]
+            + [(385, 7, m) for m in (37, 74, 146)]
         )
         for bs in (32, 64):
             for E, topk, m in cases:
@@ -113,6 +116,9 @@ class TestMoeSortingSmall(CustomTestCase):
             (385, 7, 5120, 10),
             (385, 7, 5120, 36),
             (129, 5, 5120, 16),
+            (385, 7, 5120, 37),
+            (385, 7, 5120, 146),
+            (129, 5, 4096, 204),
         ):
             ids, w = self._routing(m, m, E, topk)
             x = torch.randn(m, dim, dtype=torch.bfloat16, device=self.dev)
@@ -152,9 +158,10 @@ class TestMoeSortingSmall(CustomTestCase):
         self.assertFalse(self.S._small_sort_supported(ids, 32, None, None, self.E))
 
     def test_sorted_path_past_compact_at_385_experts(self):
-        ids, _ = self._routing(36, 36, 385, 7)
+        # 146 rows = 1022 pairs; 147 rows = 1029 pairs, past the limit
+        ids, _ = self._routing(146, 146, 385, 7)
         self.assertTrue(self.S._small_sort_supported(ids, 32, None, None, 385))
-        ids, _ = self._routing(37, 37, 385, 7)
+        ids, _ = self._routing(147, 147, 385, 7)
         self.assertFalse(self.S._small_sort_supported(ids, 32, None, None, 385))
 
     def _mxfp4_experts(self, E):
@@ -224,8 +231,8 @@ class TestMoeSortingSmall(CustomTestCase):
 
     def test_fused_moe_a8w4_stage1_matches_aiter(self):
         # DeepSeek-V4.1 TP4 decode MoE and its DSpark draft MoE (E=129 / top-3 + shared):
-        # compact sort at 1 row, sorted kernel above 32 pairs
-        for E, topk, rows in ((385, 7, (1, 16, 36)), (129, 4, (1, 16))):
+        # compact sort at 1 row, sorted kernel above 32 pairs, up to the 1024-pair limit
+        for E, topk, rows in ((385, 7, (1, 16, 36, 37, 146)), (129, 4, (1, 16, 256))):
             experts = self._mxfp4_experts(E)
             for m in rows:
                 ids, w = self._routing(m, m, E, topk)
@@ -299,7 +306,7 @@ class TestMoeSortingSmallExpertMask(CustomTestCase):
     def test_masked_sort_matches_aiter(self):
         E, topk = self.EP_E, self.EP_TOPK
         for bs in (16, 32, 64):
-            for m in (1, 2, 3, 4, 5, 8, 12, 16, 24, 32):
+            for m in (1, 2, 3, 4, 5, 8, 12, 16, 24, 32, 33, 64, 96, 128):
                 ids, w = self._plain_routing(m, 100 + m, E, topk)
                 for name, mask in self._masks(E):
                     self.assertTrue(
@@ -318,7 +325,7 @@ class TestMoeSortingSmallExpertMask(CustomTestCase):
     def test_masked_sort_matches_aiter_with_shared_expert(self):
         # DeepSeek-V4.1 shape: 385 = 384 routed + fused shared, every rank owns the shared slot
         E, topk, bs = 385, 7, 32
-        for m in (2, 4, 5, 10, 36):
+        for m in (2, 4, 5, 10, 36, 37, 146):
             ids, w = self._routing(m, m, E, topk)
             for r in (0, 5):
                 mask = self._ep_mask(E - 1, r, self.EP_SIZE)
@@ -335,7 +342,7 @@ class TestMoeSortingSmallExpertMask(CustomTestCase):
     def test_masked_fused_mxfp8_quant_matches_aiter(self):
         E, topk, dim, bs = self.EP_E, self.EP_TOPK, self.EP_DIM, 32
         S = self.S
-        for m in (1, 2, 4, 8, 16, 32):
+        for m in (1, 2, 4, 8, 16, 32, 33, 64, 128):
             ids, w = self._plain_routing(m, 200 + m, E, topk)
             x = torch.randn(m, dim, dtype=torch.bfloat16, device=self.dev)
             for name, mask in self._masks(E):
@@ -407,7 +414,9 @@ class TestMoeSortingSmallExpertMask(CustomTestCase):
         for m in (1, 4, 8, 16, 32):
             ids, _ = self._plain_routing(m, m, E, self.EP_TOPK)
             self.assertTrue(self.S._small_sort_supported(ids, 32, mask, None, E), m)
-        ids, _ = self._plain_routing(33, 33, E, self.EP_TOPK)
+        ids, _ = self._plain_routing(128, 128, E, self.EP_TOPK)
+        self.assertTrue(self.S._small_sort_supported(ids, 32, mask, None, E))
+        ids, _ = self._plain_routing(129, 129, E, self.EP_TOPK)
         self.assertFalse(self.S._small_sort_supported(ids, 32, mask, None, E))
         # a mask that does not cover every expert id goes back to aiter
         ids, _ = self._plain_routing(4, 4, E, self.EP_TOPK)
@@ -422,7 +431,7 @@ class TestMoeSortingSmallExpertMask(CustomTestCase):
 @unittest.skipUnless(torch.cuda.is_available() and torch.version.hip, "ROCm only")
 class TestMoeSortingSmallNoQuant(CustomTestCase):
     """No-quant path of _run_small_sort (incl. the histogram + bitonic kernel for
-    32 < P <= 256) vs a torch reference of the aiter moe_sorting layout."""
+    32 < P <= 1024) vs a torch reference of the aiter moe_sorting layout."""
 
     def _check(self, m, topk, num_experts, block_size, hot):
         from sglang.kernels.ops.moe.moe_sorting_small import _run_small_sort
@@ -453,7 +462,12 @@ class TestMoeSortingSmallNoQuant(CustomTestCase):
 
     def test_no_quant(self):
         for num_experts, topk, block_size in ((385, 7, 32), (257, 9, 32), (129, 8, 16)):
-            for m in range(1, 256 // topk + 1):
+            # every row count up to 256 pairs, then every 7th up to 1024
+            rows = [
+                *range(1, 256 // topk + 1),
+                *range(256 // topk + 1, 1024 // topk + 1, 7),
+            ]
+            for m in rows + [1024 // topk]:
                 for hot in (num_experts, 12):  # uniform and skewed routing
                     with self.subTest(e=num_experts, topk=topk, m=m, hot=hot):
                         self._check(m, topk, num_experts, block_size, hot)

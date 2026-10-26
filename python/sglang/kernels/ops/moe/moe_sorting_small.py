@@ -476,6 +476,9 @@ def _moe_sorting_small_kernel_sorted(
 
 # pairs above which the sorted kernel runs (below 512 experts when the quant is fused)
 _SORTED_MIN_PAIRS = 32
+# only the sorted kernel takes more than 64 pairs. Its one-CTA sort rounds the pair count
+# up to a power of two, and past 1024 pairs (2048 lanes) it is slower than aiter's sort.
+_MAX_PAIRS = 1024
 
 
 def _small_sort_supported(
@@ -499,7 +502,7 @@ def _small_sort_supported(
         (compact_fits or sorted_fits or distributed_fits)
         and mask_ok
         and num_local_tokens is None
-        and p <= 256
+        and p <= _MAX_PAIRS
         and topk < 128
         and topk_ids.dtype == torch.int32
         and topk_ids.is_contiguous()
@@ -693,7 +696,7 @@ def apply_aiter_small_moe_sort_patch() -> None:
             and hidden_states.dtype in (torch.bfloat16, torch.float16)
             and hidden_states.is_contiguous()
             and hidden_states.shape[-1] % 1024 == 0
-            and topk_ids.numel() <= 256
+            and topk_ids.numel() <= _MAX_PAIRS
         )
         input_token = _pending_quant_input.set(hidden_states if emit else None)
         emitted_token = _emitted_quant.set(None)
