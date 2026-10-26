@@ -23,6 +23,10 @@ def _mxfp8_quant_store_qkv_kernel(
     skh,
     svt,
     svh,
+    skct,
+    skch,
+    svct,
+    svch,
     NQ: tl.constexpr,
     NKV: tl.constexpr,
     D: tl.constexpr,
@@ -61,11 +65,13 @@ def _mxfp8_quant_store_qkv_kernel(
             h = r - NQ
             cache = kc_ptr
             sfb = sfk_ptr
+            cache_offset = myloc * skct + h * skch
         else:
             h = r - NQ - NKV
             cache = vc_ptr
             sfb = sfv_ptr
-        tl.store(cache + (myloc * NKV + h) * D + off2, xq)
+            cache_offset = myloc * svct + h * svch
+        tl.store(cache + cache_offset + off2, xq)
         # BlockScaledBasicChunk byte layout (see mxfp8_interleave_sf.py):
         # a page block is (NKV, 32, PAGE//32, SF) bytes.
         po = myloc % PAGE
@@ -88,11 +94,13 @@ def quant_store_kv_mxfp8(
     page_size: int = 128,
 ) -> None:
     """One kernel quantizes bf16 K/V rows, scatters the fp8 payload into the paged
-    cache at `loc`, and writes UE8M0 scales in the interleaved FA4 layout."""
+    cache at `loc`, and writes UE8M0 scales in the interleaved FA4 layout.
+    Payload caches may have strided token/head axes, as in the unified pool.
+    """
     T, NKV, D = k.shape
     assert D % 32 == 0 and page_size % 32 == 0
     assert k.stride(2) == 1 and v.stride(2) == 1
-    assert k_cache.is_contiguous() and v_cache.is_contiguous()
+    assert k_cache.stride(2) == 1 and v_cache.stride(2) == 1
     if T == 0:
         return
     _mxfp8_quant_store_qkv_kernel[(T, 2 * NKV)](
@@ -112,6 +120,10 @@ def quant_store_kv_mxfp8(
         k.stride(1),
         v.stride(0),
         v.stride(1),
+        k_cache.stride(0),
+        k_cache.stride(1),
+        v_cache.stride(0),
+        v_cache.stride(1),
         NQ=0,
         NKV=NKV,
         D=D,

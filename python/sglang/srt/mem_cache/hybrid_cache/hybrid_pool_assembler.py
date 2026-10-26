@@ -339,13 +339,19 @@ def _uses_unified_page_envelope_host(
     use_mla: bool,
     mtp_device_pools: tuple[Any, ...] = (),
 ) -> bool:
-    from sglang.srt.mem_cache.unified_memory_pool import UnifiedMHATokenToKVPool
+    from sglang.srt.mem_cache.unified_memory_pool import (
+        UnifiedMHATokenToKVPool,
+        UnifiedMHATokenToKVPoolMXFP8,
+    )
 
+    # The envelope copies only the shared payload bytes; MXFP8 scales live
+    # outside it and need the per-pool MXFP8 host.
     return (
         not use_mla
         and not mtp_device_pools
         and all(
             isinstance(pool, UnifiedMHATokenToKVPool)
+            and not isinstance(pool, UnifiedMHATokenToKVPoolMXFP8)
             for pool in (full_kv_pool, swa_kv_pool)
         )
         and {full_kv_pool.grow_direction, swa_kv_pool.grow_direction} == {"up", "down"}

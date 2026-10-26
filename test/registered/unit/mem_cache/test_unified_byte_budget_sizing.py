@@ -27,6 +27,8 @@ LIVELOCK at runtime, not a perf bug.
 """
 
 import unittest
+from dataclasses import replace
+from types import SimpleNamespace
 
 import torch
 
@@ -34,10 +36,13 @@ from sglang.srt.mem_cache.unified_memory_pool import (
     MambaSubPoolSpec,
     MHASubPoolSpec,
     UnifiedKVPool,
+    UnifiedMHATokenToKVPoolMXFP8,
     _check_bs1_feasibility_floor,
     _reserved_floor_bytes,
+    init_unified_mamba_pools,
     init_unified_swa_pools,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -194,6 +199,75 @@ class TestBs1FeasibilityFloor(unittest.TestCase):
         """Boundary: total == floor must NOT raise (>= is the contract)."""
         _check_bs1_feasibility_floor(
             total_bytes=16, floor_terms=[("a", 8), ("b", 8)], factory="test"
+        )
+
+
+class TestBlockScaledPool(unittest.TestCase):
+    def _pool(self, page_size, **over):
+        full = MHASubPoolSpec(
+            name="full",
+            layer_num=1,
+            head_num=1,
+            head_dim=32,
+            store_dtype=torch.uint8,
+            kv_cache_dtype=torch.float8_e4m3fn,
+            scale_block_size=32,
+            grow_direction="down",
+        )
+        return UnifiedKVPool(
+            total_bytes=8 * 128 * full.entry_bytes(),
+            sub_pool_specs=[full, replace(full, name="swa", grow_direction="up")],
+            device=_DEV,
+            enable_memory_saver=False,
+            page_size=page_size,
+            **over,
+        )
+
+    def test_post_capture_backing_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "block-scaled"):
+            self._pool(128, post_capture_active=True)
+
+    def test_page_size_must_match_the_interleaved_layout(self):
+        self._pool(128)
+        with self.assertRaisesRegex(ValueError, "page_size 128"):
+            self._pool(64)
+
+    def test_mamba_factory_builds_a_scaled_full_pool(self):
+        params = SimpleNamespace(
+            shape=SimpleNamespace(conv=[(3, 8)], temporal=(0, 0, 0)),
+            dtype=SimpleNamespace(conv=torch.bfloat16, temporal=torch.float32),
+            layers=[1],
+        )
+        with get_parallel().override(attn_dcp_size=1, attn_tp_size=1):
+            bundle = init_unified_mamba_pools(
+                device=_DEV,
+                kv_cache_dtype=torch.float8_e4m3fn,
+                scale_block_size=32,
+                head_num=1,
+                head_dim=32,
+                v_head_dim=32,
+                page_size=128,
+                start_layer=0,
+                end_layer=2,
+                is_draft_worker=False,
+                use_mla_backend=False,
+                mamba_layer_ids=[1],
+                full_attention_layer_ids=[0],
+                mamba2_cache_params=params,
+                model_context_len=256,
+                extra_max_context_len=4,
+                max_total_num_tokens=1024,
+                max_mamba_cache_size=4,
+                max_num_reqs=4,
+                enable_memory_saver=False,
+                enable_mamba_extra_buffer=False,
+                enable_mamba_extra_buffer_lazy=False,
+                speculative_num_draft_tokens=None,
+                disable_overlap_schedule=True,
+                need_sort=False,
+            )
+        self.assertIsInstance(
+            bundle.token_to_kv_pool.full_kv_pool, UnifiedMHATokenToKVPoolMXFP8
         )
 
 
