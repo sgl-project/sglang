@@ -1609,34 +1609,6 @@ inline float sigmoid_fp32(float x) {
   return z / (1.f + z);
 }
 
-inline float softplus_fp32(float x) {
-  if (x > 20.f) {
-    return x;
-  }
-  if (x < -20.f) {
-    return std::exp(x);
-  }
-  return std::log1p(std::exp(x));
-}
-
-template <int D>
-inline float dot_product_fp32(const float* a, const float* b) {
-  using Vec = at::vec::Vectorized<float>;
-  constexpr int kVecSize = Vec::size();
-  static_assert(D % kVecSize == 0);
-  Vec sum(0.f);
-  for (int d = 0; d < D; d += kVecSize) {
-    sum = sum + Vec::loadu(a + d) * Vec::loadu(b + d);
-  }
-  alignas(64) float tmp[kVecSize];
-  sum.store(tmp);
-  float out = 0.f;
-  for (int i = 0; i < kVecSize; ++i) {
-    out += tmp[i];
-  }
-  return out;
-}
-
 template <int D>
 inline void scale_state_columns(float* state_ptr, const float* decay, int64_t num_rows, int64_t row_stride) {
   using Vec = at::vec::Vectorized<float>;
@@ -1652,34 +1624,10 @@ inline void scale_state_columns(float* state_ptr, const float* decay, int64_t nu
   }
 }
 
-template <int D>
-inline void matvec_fp32(const float* state_ptr, int64_t num_rows, int64_t row_stride, const float* vec, float* out) {
-  for (int64_t row = 0; row < num_rows; ++row) {
-    out[row] = dot_product_fp32<D>(state_ptr + row * row_stride, vec);
-  }
-}
-
-template <int D>
-inline void
-rank1_update_fp32(float* state_ptr, int64_t num_rows, int64_t row_stride, const float* residual, const float* key) {
-  using Vec = at::vec::Vectorized<float>;
-  constexpr int kVecSize = Vec::size();
-  static_assert(D % kVecSize == 0);
-  for (int64_t row = 0; row < num_rows; ++row) {
-    float* row_ptr = state_ptr + row * row_stride;
-    Vec residual_vec(residual[row]);
-    for (int d = 0; d < D; d += kVecSize) {
-      auto state_vec = Vec::loadu(row_ptr + d);
-      auto key_vec = Vec::loadu(key + d);
-      (state_vec + residual_vec * key_vec).store(row_ptr + d);
-    }
-  }
-}
-
 template <typename scalar_t, int D>
 void prepare_qk_tensors(
-    float* q_out,
-    float* k_out,
+    scalar_t* q_out,
+    scalar_t* k_out,
     const scalar_t* query,
     const scalar_t* key,
     int64_t T,
@@ -1689,7 +1637,6 @@ void prepare_qk_tensors(
     int64_t k_strideT,
     int64_t k_strideH,
     bool use_qk_l2norm_in_kernel,
-    float scale,
     float eps) {
   at::parallel_for(0, T * H, 0, [&](int64_t begin, int64_t end) {
     int64_t t{0}, h{0};
@@ -1697,8 +1644,8 @@ void prepare_qk_tensors(
     for (int64_t idx = begin; idx < end; ++idx) {
       const scalar_t* q_ptr = query + t * q_strideT + h * q_strideH;
       const scalar_t* k_ptr = key + t * k_strideT + h * k_strideH;
-      float* q_dst = q_out + idx * D;
-      float* k_dst = k_out + idx * D;
+      scalar_t* q_dst = q_out + idx * D;
+      scalar_t* k_dst = k_out + idx * D;
       float q_norm = 0.f;
       float k_norm = 0.f;
       if (use_qk_l2norm_in_kernel) {
@@ -1714,7 +1661,7 @@ void prepare_qk_tensors(
       for (int d = 0; d < D; ++d) {
         float qv = static_cast<float>(q_ptr[d]);
         float kv = static_cast<float>(k_ptr[d]);
-        q_dst[d] = use_qk_l2norm_in_kernel ? qv * q_norm * scale : qv * scale;
+        q_dst[d] = use_qk_l2norm_in_kernel ? qv * q_norm : qv;
         k_dst[d] = use_qk_l2norm_in_kernel ? kv * k_norm : kv;
       }
       data_index_step(t, T, h, H);
@@ -1722,31 +1669,20 @@ void prepare_qk_tensors(
   });
 }
 
-template <typename scalar_t, int D>
-void prepare_value_tensor(
-    float* v_out, const scalar_t* value, int64_t T, int64_t Hv, int64_t v_strideT, int64_t v_strideH) {
-  at::parallel_for(0, T * Hv, 0, [&](int64_t begin, int64_t end) {
-    int64_t t{0}, hv{0};
-    data_index_init(begin, t, T, hv, Hv);
-    for (int64_t idx = begin; idx < end; ++idx) {
-      const scalar_t* src = value + t * v_strideT + hv * v_strideH;
-      float* dst = v_out + idx * D;
-      for (int d = 0; d < D; ++d) {
-        dst[d] = static_cast<float>(src[d]);
-      }
-      data_index_step(t, T, hv, Hv);
-    }
-  });
-}
-
 template <typename scalar_t>
 void prepare_beta_tensor(
-    float* beta_out, const scalar_t* beta, int64_t T, int64_t Hv, int64_t beta_strideT, bool beta_is_raw) {
+    float* beta_out,
+    const scalar_t* beta,
+    int64_t T,
+    int64_t Hv,
+    int64_t beta_strideT,
+    int64_t beta_strideH,
+    bool beta_is_raw) {
   at::parallel_for(0, T * Hv, 0, [&](int64_t begin, int64_t end) {
     int64_t t{0}, hv{0};
     data_index_init(begin, t, T, hv, Hv);
     for (int64_t idx = begin; idx < end; ++idx) {
-      float val = static_cast<float>(beta[t * beta_strideT + hv]);
+      float val = static_cast<float>(beta[t * beta_strideT + hv * beta_strideH]);
       beta_out[idx] = beta_is_raw ? sigmoid_fp32(val) : val;
       data_index_step(t, T, hv, Hv);
     }
@@ -1754,39 +1690,54 @@ void prepare_beta_tensor(
 }
 
 template <typename scalar_t, int D>
-void prepare_gate_tensor(
+void prepare_kda_gate(
     float* gate_out,
     const scalar_t* gate,
-    int64_t T,
+    const int32_t* cu_seqlens,
+    const int32_t* chunk_indices,
+    int64_t NT,
     int64_t Hv,
     int64_t g_strideT,
     int64_t g_strideH,
     const float* A_log,
     const float* dt_bias,
     std::optional<double> lower_bound) {
-  const bool has_activation = A_log != nullptr;
-  const bool use_safe_gate = lower_bound.has_value();
-  at::parallel_for(0, T * Hv, 0, [&](int64_t begin, int64_t end) {
-    int64_t t{0}, hv{0};
-    data_index_init(begin, t, T, hv, Hv);
+  using Vec = at::vec::Vectorized<float>;
+  constexpr int width = Vec::size();
+  constexpr float rcp_ln2 = 1.4426950216293335f;
+  at::parallel_for(0, NT * Hv, 0, [&](int64_t begin, int64_t end) {
+    alignas(64) float cumulative[D];
     for (int64_t idx = begin; idx < end; ++idx) {
-      const scalar_t* src = gate + t * g_strideT + hv * g_strideH;
-      float* dst = gate_out + idx * D;
-      float a = has_activation ? std::exp(A_log[hv]) : 0.f;
-      const float* bias_ptr = has_activation ? (dt_bias + hv * D) : nullptr;
-      for (int d = 0; d < D; ++d) {
-        float val = static_cast<float>(src[d]);
-        if (has_activation) {
-          val += bias_ptr[d];
-          if (use_safe_gate) {
-            val = static_cast<float>(lower_bound.value()) * sigmoid_fp32(a * val);
-          } else {
-            val = -a * softplus_fp32(val);
+      const int64_t nt = idx / Hv, hv = idx % Hv;
+      const int32_t seq = chunk_indices[nt * 2];
+      const int32_t start = cu_seqlens[seq] + chunk_indices[nt * 2 + 1] * KDA_CHUNK_SIZE;
+      const int32_t stop = std::min(cu_seqlens[seq + 1], start + KDA_CHUNK_SIZE);
+      const Vec a(A_log != nullptr ? std::exp(A_log[hv]) : 1.f);
+      std::fill_n(cumulative, D, 0.f);
+      for (int32_t t = start; t < stop; ++t) {
+        alignas(64) float activated[D];
+        const scalar_t* src = gate + t * g_strideT + hv * g_strideH;
+        for (int d = 0; d < D; ++d) {
+          float val = static_cast<float>(src[d]);
+          if (A_log != nullptr) {
+            val += dt_bias != nullptr ? dt_bias[hv * D + d] : 0.f;
           }
+          activated[d] = val;
         }
-        dst[d] = val;
+        for (int d = 0; d < D; d += width) {
+          Vec val = Vec::loadu(activated + d);
+          if (A_log != nullptr) {
+            if (lower_bound.has_value()) {
+              val = Vec(static_cast<float>(*lower_bound)) / (Vec(1.f) + (Vec(0.f) - a * val).exp());
+            } else {
+              val = (at::vec::maximum(val, Vec(0.f)) + (Vec(0.f) - val.abs()).exp().log1p()) * (Vec(0.f) - a);
+            }
+          }
+          val = val + Vec::loadu(cumulative + d);
+          val.store(cumulative + d);
+          (val * Vec(rcp_ln2)).store(gate_out + (t * Hv + hv) * D + d);
+        }
       }
-      data_index_step(t, T, hv, Hv);
     }
   });
 }
@@ -1811,26 +1762,234 @@ void copy_state_to_tensor(
   }
 }
 
+template <typename scalar_t>
+inline void kda_convert(scalar_t* dst, const float* src, int size) {
+  using Vec = at::vec::Vectorized<float>;
+  constexpr int width = Vec::size();
+  for (int i = 0; i < size; i += 2 * width) {
+    at::vec::convert_from_float<scalar_t>(Vec::loadu(src + i), Vec::loadu(src + i + width)).store(dst + i);
+  }
+}
+
+template <typename scalar_t>
+inline void kda_to_float(float* dst, const scalar_t* src, int size) {
+  constexpr int width = at::vec::Vectorized<float>::size();
+  for (int i = 0; i < size; i += 2 * width) {
+    auto [first, second] = at::vec::convert_to_float<scalar_t>(at::vec::Vectorized<scalar_t>::loadu(src + i));
+    first.store(dst + i);
+    second.store(dst + i + width);
+  }
+}
+
+inline float kda_reduce_sum(at::vec::Vectorized<float> value) {
+  alignas(64) float values[at::vec::Vectorized<float>::size()];
+  value.store(values);
+  float sum = 0.f;
+  for (float element : values) {
+    sum += element;
+  }
+  return sum;
+}
+
+inline void kda_solve_tril(float* matrix, int tokens) {
+  using Vec = at::vec::Vectorized<float>;
+  constexpr int width = Vec::size();
+  for (int row = 0; row < tokens; ++row) {
+    float* current = matrix + row * KDA_CHUNK_SIZE;
+    for (int col = 0; col < row; ++col) {
+      current[col] = -current[col];
+    }
+    for (int previous = 1; previous < row; ++previous) {
+      const float coefficient = current[previous];
+      const float* inverse_row = matrix + previous * KDA_CHUNK_SIZE;
+      int col = 0;
+      for (; col + width <= previous; col += width) {
+        (Vec::loadu(current + col) + Vec(coefficient) * Vec::loadu(inverse_row + col)).store(current + col);
+      }
+      for (; col < previous; ++col) {
+        current[col] += coefficient * inverse_row[col];
+      }
+    }
+    current[row] = 1.f;
+  }
+}
+
+template <typename scalar_t>
+void kda_brgemm(
+    int M,
+    int N,
+    int K,
+    int64_t lda,
+    int64_t ldb,
+    int64_t ldc,
+    bool add,
+    const scalar_t* a,
+    const scalar_t* packed_b,
+    float* c) {
+  if (at::native::cpublas::could_pack(c10::CppTypeToScalarType<scalar_t>::value)) {
+    at::native::cpublas::brgemm(M, N, K, lda, ldb, ldc, add, a, packed_b, c);
+  } else {
+    // FP16 VNNI BRGEMM requires AMX-FP16; preserve the chunk path on other CPUs.
+    std::vector<scalar_t> b(K * N);
+    for (int k = 0; k < K; ++k) {
+      for (int n = 0; n < N; ++n) {
+        b[k * N + n] = packed_b[(k / 2) * ldb * 2 + n * 2 + k % 2];
+      }
+    }
+    at::native::cpublas::brgemm(M, N, K, lda, N, ldc, add, a, b.data(), c, false);
+  }
+}
+
 template <typename scalar_t, int D>
-void chunk_kda_cpu_kernel(
+void chunk_kda_cpu_intra(
+    scalar_t* w,
+    scalar_t* u,
+    scalar_t* kg,
+    scalar_t* aqk,
+    const scalar_t* q,
+    const scalar_t* k,
+    const scalar_t* value,
+    const float* gate,
+    const float* beta,
+    const int32_t* cu_seqlens,
+    const int32_t* chunk_indices,
+    int64_t H,
+    int64_t Hv,
+    int64_t NT,
+    int64_t value_strideT,
+    int64_t value_strideH,
+    float scale) {
+  using Vec = at::vec::Vectorized<float>;
+  constexpr int C = KDA_CHUNK_SIZE;
+  constexpr int BC = 16;
+  constexpr int width = Vec::size();
+  at::parallel_for(0, NT * Hv, 0, [&](int64_t begin, int64_t end) {
+    alignas(64) float qf[C * D], kf[C * D], lower[C * C], scaled[2 * BC * D], scores[2 * BC * BC];
+    alignas(64) at::BFloat16 left[2 * BC * D], right[BC * D], right_packed[BC * D];
+    alignas(64) scalar_t inverse[C * C], rhs[C * 2 * D], rhs_packed[C * 2 * D];
+    alignas(64) float result[C * 2 * D];
+    for (int64_t idx = begin; idx < end; ++idx) {
+      const int64_t nt = idx / Hv, hv = idx % Hv, h = hv / (Hv / H);
+      const int32_t seq = chunk_indices[nt * 2];
+      const int32_t start = cu_seqlens[seq] + chunk_indices[nt * 2 + 1] * C;
+      const int tokens = std::min<int32_t>(C, cu_seqlens[seq + 1] - start);
+      const float* gates = gate + (start * Hv + hv) * D;
+      const float* betas = beta + start * Hv + hv;
+      if (tokens > 1) {
+        std::fill_n(lower, C * C, 0.f);
+        std::fill_n(rhs, C * 2 * D, scalar_t(0));
+      }
+      for (int i = 0; i < tokens; ++i) {
+        std::fill_n(aqk + ((start + i) * Hv + hv) * C, C, scalar_t(0));
+        for (int d = 0; d < D; ++d) {
+          qf[i * D + d] = static_cast<float>(q[((start + i) * H + h) * D + d]);
+          kf[i * D + d] = static_cast<float>(k[((start + i) * H + h) * D + d]);
+        }
+      }
+      for (int row = 0; row < tokens; row += BC) {
+        const int rows = std::min(BC, tokens - row);
+        for (int i = row; i < row + rows; ++i) {
+          for (int j = row; j <= i; ++j) {
+            Vec qsum(0.f), ksum(0.f);
+            for (int d = 0; d < D; d += width) {
+              const Vec decay = (Vec::loadu(gates + i * Hv * D + d) - Vec::loadu(gates + j * Hv * D + d)).exp2();
+              const Vec key = Vec::loadu(kf + j * D + d) * decay;
+              qsum = qsum + Vec::loadu(qf + i * D + d) * key;
+              ksum = ksum + Vec::loadu(kf + i * D + d) * key;
+            }
+            aqk[((start + i) * Hv + hv) * C + j] = scalar_t(kda_reduce_sum(qsum) * scale);
+            if (j < i) {
+              lower[i * C + j] = kda_reduce_sum(ksum) * betas[i * Hv];
+            }
+          }
+        }
+        if (row == 0) {
+          continue;
+        }
+        std::fill_n(scaled, 2 * BC * D, 0.f);
+        for (int i = 0; i < rows; ++i) {
+          for (int d = 0; d < D; d += width) {
+            const Vec decay =
+                (Vec::loadu(gates + (row + i) * Hv * D + d) - Vec::loadu(gates + row * Hv * D + d)).exp2();
+            (Vec::loadu(qf + (row + i) * D + d) * decay).store(scaled + i * D + d);
+            (Vec::loadu(kf + (row + i) * D + d) * decay).store(scaled + (BC + i) * D + d);
+          }
+        }
+        // CUDA's off-diagonal score dot explicitly rounds both operands to BF16.
+        kda_convert(left, scaled, 2 * BC * D);
+        for (int col = 0; col < row; col += BC) {
+          for (int j = 0; j < BC; ++j) {
+            for (int d = 0; d < D; d += width) {
+              const Vec decay =
+                  (Vec::loadu(gates + row * Hv * D + d) - Vec::loadu(gates + (col + j) * Hv * D + d)).exp2();
+              (Vec::loadu(kf + (col + j) * D + d) * decay).store(scaled + j * D + d);
+            }
+          }
+          kda_convert(right, scaled, BC * D);
+          pack_vnni(right_packed, right, BC, D, D, BC);
+          kda_brgemm(2 * BC, BC, D, D, BC, BC, false, left, right_packed, scores);
+          for (int i = 0; i < rows; ++i) {
+            for (int j = 0; j < BC; ++j) {
+              aqk[((start + row + i) * Hv + hv) * C + col + j] = scalar_t(scores[i * BC + j] * scale);
+              lower[(row + i) * C + col + j] = scores[(BC + i) * BC + j] * betas[(row + i) * Hv];
+            }
+          }
+        }
+      }
+      if (tokens > 1) {
+        kda_solve_tril(lower, tokens);
+        kda_convert(inverse, lower, C * C);
+      }
+      for (int i = 0; i < tokens; ++i) {
+        alignas(64) float row[2 * D], adjusted[D];
+        for (int d = 0; d < D; d += width) {
+          const Vec g = Vec::loadu(gates + i * Hv * D + d);
+          (Vec::loadu(kf + i * D + d) * Vec(betas[i * Hv]) * g.exp2()).store(row + d);
+          (Vec::loadu(kf + i * D + d) * (Vec::loadu(gates + (tokens - 1) * Hv * D + d) - g).exp2()).store(adjusted + d);
+        }
+        const scalar_t* v = value + (start + i) * value_strideT + hv * value_strideH;
+        for (int d = 0; d < D; ++d) {
+          row[D + d] = static_cast<float>(v[d]) * betas[i * Hv];
+        }
+        kda_convert(rhs + i * 2 * D, row, 2 * D);
+        kda_convert(kg + ((start + i) * Hv + hv) * D, adjusted, D);
+      }
+      if (tokens == 1) {
+        // The unit triangular system is the identity for a one-token chunk.
+        std::copy_n(rhs, D, w + (start * Hv + hv) * D);
+        std::copy_n(rhs + D, D, u + (start * Hv + hv) * D);
+      } else {
+        pack_vnni2(rhs_packed, rhs, C, 2 * D, 2 * D, 2 * D);
+        kda_brgemm(tokens, 2 * D, C, C, 2 * D, 2 * D, false, inverse, rhs_packed, result);
+        for (int i = 0; i < tokens; ++i) {
+          kda_convert(w + ((start + i) * Hv + hv) * D, result + i * 2 * D, D);
+          kda_convert(u + ((start + i) * Hv + hv) * D, result + i * 2 * D + D, D);
+        }
+      }
+    }
+    at::native::cpublas::brgemm_release();
+  });
+}
+
+template <typename scalar_t, int D>
+void chunk_kda_cpu_inter(
     scalar_t* output,
     scalar_t* intermediate_states,
     float* track_state,
     float* initial_state,
-    const float* q,
-    const float* k,
-    const float* v,
+    const scalar_t* q,
+    const scalar_t* w,
+    const scalar_t* u,
+    const scalar_t* kg,
+    const scalar_t* aqk,
     const float* gate,
-    const float* beta,
     const int32_t* cu_seqlens,
     const int32_t* chunk_offsets,
     const int32_t* initial_state_indices,
     const int32_t* track_chunk_idx,
     int64_t num_seqs,
-    int64_t T,
     int64_t H,
     int64_t Hv,
-    int64_t NT,
     int64_t state_stride0,
     int64_t state_stride1,
     int64_t state_stride2,
@@ -1841,10 +2000,16 @@ void chunk_kda_cpu_kernel(
     int64_t intermediate_strideV,
     int64_t track_stride0,
     int64_t track_stride1,
-    int64_t track_stride2) {
-  UNUSED(NT);
+    int64_t track_stride2,
+    float scale) {
   const int64_t HG = Hv / H;
+  using Vec = at::vec::Vectorized<float>;
+  constexpr int C = KDA_CHUNK_SIZE;
+  constexpr int width = Vec::size();
   at::parallel_for(0, num_seqs * Hv, 0, [&](int64_t begin, int64_t end) {
+    alignas(64) scalar_t state_low[D * D], state_packed[D * D], wq[2 * C * D];
+    alignas(64) scalar_t residual[C * D], residual_packed[C * D], residual_transposed[D * C], kg_packed[C * D];
+    alignas(64) float products[2 * C * D], row[D], decay[D];
     int64_t seq_idx{0}, hv{0};
     data_index_init(begin, seq_idx, num_seqs, hv, Hv);
     for (int64_t linear_idx = begin; linear_idx < end; ++linear_idx) {
@@ -1858,10 +2023,6 @@ void chunk_kda_cpu_kernel(
       const int32_t seq_end = cu_seqlens[seq_idx + 1];
       const int32_t seqlen = seq_end - seq_start;
       float* state_ptr = initial_state + state_index * state_stride0 + hv * state_stride1;
-      alignas(64) float decay[D];
-      alignas(64) float residual[D];
-      alignas(64) float out_buf[D];
-
       for (int32_t chunk_idx = 0; chunk_idx < div_up(seqlen, KDA_CHUNK_SIZE); ++chunk_idx) {
         const int64_t global_chunk = chunk_offsets[seq_idx] + chunk_idx;
         if (intermediate_states != nullptr) {
@@ -1875,31 +2036,193 @@ void chunk_kda_cpu_kernel(
 
         const int32_t chunk_start = seq_start + chunk_idx * KDA_CHUNK_SIZE;
         const int32_t chunk_end = std::min(seq_end, chunk_start + KDA_CHUNK_SIZE);
-        for (int32_t token = chunk_start; token < chunk_end; ++token) {
-          const float* q_ptr = q + (token * H + q_head) * D;
-          const float* k_ptr = k + (token * H + q_head) * D;
-          const float* v_ptr = v + (token * Hv + hv) * D;
-          const float* g_ptr = gate + (token * Hv + hv) * D;
-          const float beta_val = beta[token * Hv + hv];
+        const int tokens = chunk_end - chunk_start;
+        for (int v = 0; v < D; ++v) {
+          kda_convert(state_low + v * D, state_ptr + v * state_stride2, D);
+        }
+        for (int i = 0; i < tokens; ++i) {
+          const int64_t token = chunk_start + i;
+          std::copy_n(w + (token * Hv + hv) * D, D, wq + i * D);
           for (int d = 0; d < D; ++d) {
-            decay[d] = std::exp(g_ptr[d]);
+            row[d] = static_cast<float>(scalar_t(static_cast<float>(q[(token * H + q_head) * D + d]) * scale));
           }
-          scale_state_columns<D>(state_ptr, decay, D, state_stride2);
-          matvec_fp32<D>(state_ptr, D, state_stride2, k_ptr, residual);
-          for (int d = 0; d < D; ++d) {
-            residual[d] = (v_ptr[d] - residual[d]) * beta_val;
+          for (int d = 0; d < D; d += width) {
+            (Vec::loadu(row + d) * Vec::loadu(gate + (token * Hv + hv) * D + d).exp2()).store(row + d);
           }
-          rank1_update_fp32<D>(state_ptr, D, state_stride2, residual, k_ptr);
-          matvec_fp32<D>(state_ptr, D, state_stride2, q_ptr, out_buf);
-          scalar_t* out_ptr = output + token * output_strideT + hv * output_strideH;
+          kda_convert(wq + (tokens + i) * D, row, D);
+        }
+        if (tokens == 1) {
+          alignas(64) float wf[D], qgf[D], kgf[D];
+          kda_to_float(wf, wq, D);
+          kda_to_float(qgf, wq + D, D);
+          kda_to_float(kgf, kg + (chunk_start * Hv + hv) * D, D);
+          for (int d = 0; d < D; d += width) {
+            Vec::loadu(gate + (chunk_start * Hv + hv) * D + d).exp2().store(decay + d);
+          }
+          for (int v = 0; v < D; ++v) {
+            kda_to_float(row, state_low + v * D, D);
+            Vec predicted(0.f), history(0.f);
+            for (int d = 0; d < D; d += width) {
+              const Vec s = Vec::loadu(row + d);
+              predicted = predicted + s * Vec::loadu(wf + d);
+              history = history + s * Vec::loadu(qgf + d);
+            }
+            const float x = static_cast<float>(
+                scalar_t(static_cast<float>(u[(chunk_start * Hv + hv) * D + v]) - kda_reduce_sum(predicted)));
+            output[chunk_start * output_strideT + hv * output_strideH + v] =
+                scalar_t(kda_reduce_sum(history) + static_cast<float>(aqk[(chunk_start * Hv + hv) * C]) * x);
+            for (int d = 0; d < D; d += width) {
+              (Vec::loadu(state_ptr + v * state_stride2 + d) * Vec::loadu(decay + d) + Vec(x) * Vec::loadu(kgf + d))
+                  .store(state_ptr + v * state_stride2 + d);
+            }
+          }
+          continue;
+        }
+        pack_vnni(state_packed, state_low, D, D, D, D);
+        kda_brgemm(2 * tokens, D, D, D, D, D, false, wq, state_packed, products);
+        std::fill_n(residual, C * D, scalar_t(0));
+        for (int i = 0; i < tokens; ++i) {
+          const scalar_t* u_ptr = u + ((chunk_start + i) * Hv + hv) * D;
           for (int d = 0; d < D; ++d) {
-            out_ptr[d] = static_cast<scalar_t>(out_buf[d]);
+            row[d] = static_cast<float>(u_ptr[d]) - products[i * D + d];
+          }
+          kda_convert(residual + i * D, row, D);
+        }
+        pack_vnni2(residual_packed, residual, C, D, D, D);
+        float* out = products + tokens * D;
+        kda_brgemm(tokens, D, C, Hv * C, D, D, true, aqk + (chunk_start * Hv + hv) * C, residual_packed, out);
+        for (int i = 0; i < tokens; ++i) {
+          kda_convert(output + (chunk_start + i) * output_strideT + hv * output_strideH, out + i * D, D);
+        }
+        for (int d = 0; d < D; d += width) {
+          Vec::loadu(gate + ((chunk_end - 1) * Hv + hv) * D + d).exp2().store(decay + d);
+        }
+        scale_state_columns<D>(state_ptr, decay, D, state_stride2);
+        for (int v = 0; v < D; ++v) {
+          for (int i = 0; i < C; ++i) {
+            residual_transposed[v * C + i] = residual[i * D + v];
           }
         }
+        std::fill_n(kg_packed, C * D, scalar_t(0));
+        pack_vnni2(kg_packed, kg + (chunk_start * Hv + hv) * D, tokens, D, Hv * D, D);
+        kda_brgemm(D, D, C, C, D, state_stride2, true, residual_transposed, kg_packed, state_ptr);
       }
       data_index_step(seq_idx, num_seqs, hv, Hv);
     }
+    at::native::cpublas::brgemm_release();
   });
+}
+
+template <typename scalar_t, int D>
+void run_chunk_kda_cpu(
+    at::Tensor& output,
+    at::Tensor& intermediate,
+    const at::Tensor& query,
+    const at::Tensor& key,
+    const at::Tensor& value,
+    const at::Tensor& gate,
+    const at::Tensor& beta,
+    at::Tensor& state,
+    const at::Tensor& cu_seqlens,
+    const at::Tensor& state_indices,
+    const at::Tensor& chunk_indices,
+    const at::Tensor& chunk_offsets,
+    const at::Tensor& track_state,
+    const at::Tensor& track_chunk_idx,
+    const float* A_log,
+    const float* dt_bias,
+    std::optional<double> lower_bound,
+    bool beta_is_raw,
+    bool normalize_qk,
+    float eps,
+    float scale) {
+  const int64_t T = query.size(1), H = query.size(2), Hv = value.size(2);
+  const int64_t NT = chunk_indices.size(0);
+  const int64_t qk_size = T * H * D, value_size = T * Hv * D;
+  auto workspace = at::empty({2 * qk_size + 3 * value_size + T * Hv * KDA_CHUNK_SIZE}, query.options());
+  auto gate_beta = at::empty({value_size + T * Hv}, query.options().dtype(at::kFloat));
+  scalar_t* q = workspace.data_ptr<scalar_t>();
+  scalar_t* k = q + qk_size;
+  scalar_t* w = k + qk_size;
+  scalar_t* u = w + value_size;
+  scalar_t* kg = u + value_size;
+  scalar_t* aqk = kg + value_size;
+  float* g = gate_beta.data_ptr<float>();
+  float* b = g + value_size;
+  prepare_qk_tensors<scalar_t, D>(
+      q,
+      k,
+      query.data_ptr<scalar_t>(),
+      key.data_ptr<scalar_t>(),
+      T,
+      H,
+      query.stride(1),
+      query.stride(2),
+      key.stride(1),
+      key.stride(2),
+      normalize_qk,
+      eps);
+  prepare_beta_tensor(b, beta.data_ptr<scalar_t>(), T, Hv, beta.stride(1), beta.stride(2), beta_is_raw);
+  prepare_kda_gate<scalar_t, D>(
+      g,
+      gate.data_ptr<scalar_t>(),
+      cu_seqlens.data_ptr<int32_t>(),
+      chunk_indices.data_ptr<int32_t>(),
+      NT,
+      Hv,
+      gate.stride(1),
+      gate.stride(2),
+      A_log,
+      dt_bias,
+      lower_bound);
+  chunk_kda_cpu_intra<scalar_t, D>(
+      w,
+      u,
+      kg,
+      aqk,
+      q,
+      k,
+      value.data_ptr<scalar_t>(),
+      g,
+      b,
+      cu_seqlens.data_ptr<int32_t>(),
+      chunk_indices.data_ptr<int32_t>(),
+      H,
+      Hv,
+      NT,
+      value.stride(1),
+      value.stride(2),
+      scale);
+  chunk_kda_cpu_inter<scalar_t, D>(
+      output.data_ptr<scalar_t>(),
+      intermediate.defined() ? intermediate.data_ptr<scalar_t>() : nullptr,
+      track_state.defined() ? track_state.data_ptr<float>() : nullptr,
+      state.data_ptr<float>(),
+      q,
+      w,
+      u,
+      kg,
+      aqk,
+      g,
+      cu_seqlens.data_ptr<int32_t>(),
+      chunk_offsets.data_ptr<int32_t>(),
+      state_indices.data_ptr<int32_t>(),
+      track_chunk_idx.defined() ? track_chunk_idx.data_ptr<int32_t>() : nullptr,
+      state_indices.numel(),
+      H,
+      Hv,
+      state.stride(0),
+      state.stride(1),
+      state.stride(2),
+      output.stride(1),
+      output.stride(2),
+      intermediate.defined() ? intermediate.stride(1) : 0,
+      intermediate.defined() ? intermediate.stride(2) : 0,
+      intermediate.defined() ? intermediate.stride(3) : 0,
+      track_state.defined() ? track_state.stride(0) : 0,
+      track_state.defined() ? track_state.stride(1) : 0,
+      track_state.defined() ? track_state.stride(2) : 0,
+      scale);
 }
 
 }  // anonymous namespace
@@ -1947,7 +2270,7 @@ std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>> chunk_kda_cpu(
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(key);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(value);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(g);
-  CHECK_INPUT(beta);
+  CHECK_CPU(beta);
   CHECK_INPUT(cu_seqlens);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(initial_state);
   CHECK_INPUT(initial_state_indices);
@@ -1961,7 +2284,7 @@ std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>> chunk_kda_cpu(
   const int64_t num_seqs = initial_state_indices.size(0);
 
   TORCH_CHECK(B == 1, __func__, ": expect batch size 1");
-  TORCH_CHECK(Hv % H == 0, __func__, ": expect num value heads to be a multiple of key heads");
+  TORCH_CHECK(H > 0 && Hv > 0 && Hv % H == 0, __func__, ": expect positive value heads to be a multiple of key heads");
   TORCH_CHECK(D == Dv, __func__, ": head_k_dim and head_v_dim must match");
   TORCH_CHECK(D == 64 || D == 128, __func__, ": only head dims 64 and 128 are supported");
   TORCH_CHECK(cu_seqlens.scalar_type() == at::kInt, __func__, ": cu_seqlens must be int32");
@@ -1973,6 +2296,15 @@ std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>> chunk_kda_cpu(
       ": initial_state shape mismatch");
   TORCH_CHECK(initial_state_indices.scalar_type() == at::kInt, __func__, ": initial_state_indices must be int32");
   TORCH_CHECK(cu_seqlens.size(0) == num_seqs + 1, __func__, ": cu_seqlens shape mismatch");
+  TORCH_CHECK(g.size(2) == Hv && g.size(3) == D, __func__, ": gate head shape mismatch");
+  TORCH_CHECK(beta.size(2) == Hv, __func__, ": beta head shape mismatch");
+  const auto* seq_offsets = cu_seqlens.data_ptr<int32_t>();
+  TORCH_CHECK(seq_offsets[0] == 0, __func__, ": cu_seqlens must start at zero");
+  for (int64_t seq = 0; seq < num_seqs; ++seq) {
+    TORCH_CHECK(seq_offsets[seq] <= seq_offsets[seq + 1], __func__, ": cu_seqlens must be nondecreasing");
+    TORCH_CHECK(
+        initial_state_indices.data_ptr<int32_t>()[seq] < initial_state.size(0), __func__, ": state index out of range");
+  }
   TORCH_CHECK(
       cu_seqlens.data_ptr<int32_t>()[num_seqs] == T,
       __func__,
@@ -2009,15 +2341,13 @@ std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>> chunk_kda_cpu(
   auto [chunk_indices, chunk_offsets] = prepare_chunk_indices<KDA_CHUNK_SIZE>(cu_seqlens);
   const int64_t NT = chunk_indices.size(0);
 
-  at::Tensor q_prepared = at::empty({T, H, D}, query.options().dtype(at::kFloat));
-  at::Tensor k_prepared = at::empty({T, H, D}, key.options().dtype(at::kFloat));
-  at::Tensor v_prepared = at::empty({T, Hv, D}, value.options().dtype(at::kFloat));
-  at::Tensor gate_prepared = at::empty({T, Hv, D}, query.options().dtype(at::kFloat));
-  at::Tensor beta_prepared = at::empty({T, Hv}, query.options().dtype(at::kFloat));
   at::Tensor output = at::empty({1, T, Hv, Dv}, query.options());
   std::optional<at::Tensor> intermediate_states = std::nullopt;
   if (output_intermediate_states) {
     intermediate_states = at::empty({1, NT, Hv, Dv, D}, query.options());
+  }
+  if (T == 0) {
+    return std::make_tuple(output, initial_state, intermediate_states);
   }
 
   at::Tensor A_log_f;
@@ -2032,126 +2362,54 @@ std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>> chunk_kda_cpu(
   }
 
   const float q_scale = scale.has_value() ? static_cast<float>(scale.value()) : 1.f / std::sqrt(static_cast<float>(D));
+  at::Tensor intermediate = intermediate_states.has_value() ? *intermediate_states : at::Tensor();
   AT_DISPATCH_REDUCED_FLOATING_TYPES(query.scalar_type(), "chunk_kda_cpu_prepare", [&] {
     if (D == 64) {
-      prepare_qk_tensors<scalar_t, 64>(
-          q_prepared.data_ptr<float>(),
-          k_prepared.data_ptr<float>(),
-          query.data_ptr<scalar_t>(),
-          key.data_ptr<scalar_t>(),
-          T,
-          H,
-          query.stride(1),
-          query.stride(2),
-          key.stride(1),
-          key.stride(2),
-          use_qk_l2norm_in_kernel,
-          q_scale,
-          static_cast<float>(eps));
-      prepare_value_tensor<scalar_t, 64>(
-          v_prepared.data_ptr<float>(), value.data_ptr<scalar_t>(), T, Hv, value.stride(1), value.stride(2));
-      prepare_gate_tensor<scalar_t, 64>(
-          gate_prepared.data_ptr<float>(),
-          g.data_ptr<scalar_t>(),
-          T,
-          Hv,
-          g.stride(1),
-          g.stride(2),
+      run_chunk_kda_cpu<scalar_t, 64>(
+          output,
+          intermediate,
+          query,
+          key,
+          value,
+          g,
+          beta,
+          initial_state,
+          cu_seqlens,
+          initial_state_indices,
+          chunk_indices,
+          chunk_offsets,
+          track_state_tensor,
+          track_chunk_idx_tensor,
           A_log_ptr,
           dt_bias_ptr,
-          lower_bound);
-    } else {
-      prepare_qk_tensors<scalar_t, 128>(
-          q_prepared.data_ptr<float>(),
-          k_prepared.data_ptr<float>(),
-          query.data_ptr<scalar_t>(),
-          key.data_ptr<scalar_t>(),
-          T,
-          H,
-          query.stride(1),
-          query.stride(2),
-          key.stride(1),
-          key.stride(2),
+          lower_bound,
+          beta_is_raw,
           use_qk_l2norm_in_kernel,
-          q_scale,
-          static_cast<float>(eps));
-      prepare_value_tensor<scalar_t, 128>(
-          v_prepared.data_ptr<float>(), value.data_ptr<scalar_t>(), T, Hv, value.stride(1), value.stride(2));
-      prepare_gate_tensor<scalar_t, 128>(
-          gate_prepared.data_ptr<float>(),
-          g.data_ptr<scalar_t>(),
-          T,
-          Hv,
-          g.stride(1),
-          g.stride(2),
+          static_cast<float>(eps),
+          q_scale);
+    } else {
+      run_chunk_kda_cpu<scalar_t, 128>(
+          output,
+          intermediate,
+          query,
+          key,
+          value,
+          g,
+          beta,
+          initial_state,
+          cu_seqlens,
+          initial_state_indices,
+          chunk_indices,
+          chunk_offsets,
+          track_state_tensor,
+          track_chunk_idx_tensor,
           A_log_ptr,
           dt_bias_ptr,
-          lower_bound);
-    }
-    prepare_beta_tensor<scalar_t>(
-        beta_prepared.data_ptr<float>(), beta.data_ptr<scalar_t>(), T, Hv, beta.stride(1), beta_is_raw);
-    if (D == 64) {
-      chunk_kda_cpu_kernel<scalar_t, 64>(
-          output.data_ptr<scalar_t>(),
-          intermediate_states.has_value() ? intermediate_states->data_ptr<scalar_t>() : nullptr,
-          track_state_tensor.defined() ? track_state_tensor.data_ptr<float>() : nullptr,
-          initial_state.data_ptr<float>(),
-          q_prepared.data_ptr<float>(),
-          k_prepared.data_ptr<float>(),
-          v_prepared.data_ptr<float>(),
-          gate_prepared.data_ptr<float>(),
-          beta_prepared.data_ptr<float>(),
-          cu_seqlens.data_ptr<int32_t>(),
-          chunk_offsets.data_ptr<int32_t>(),
-          initial_state_indices.data_ptr<int32_t>(),
-          track_chunk_idx_tensor.defined() ? track_chunk_idx_tensor.data_ptr<int32_t>() : nullptr,
-          num_seqs,
-          T,
-          H,
-          Hv,
-          NT,
-          initial_state.stride(0),
-          initial_state.stride(1),
-          initial_state.stride(2),
-          output.stride(1),
-          output.stride(2),
-          intermediate_states.has_value() ? intermediate_states->stride(1) : 0,
-          intermediate_states.has_value() ? intermediate_states->stride(2) : 0,
-          intermediate_states.has_value() ? intermediate_states->stride(3) : 0,
-          track_state_tensor.defined() ? track_state_tensor.stride(0) : 0,
-          track_state_tensor.defined() ? track_state_tensor.stride(1) : 0,
-          track_state_tensor.defined() ? track_state_tensor.stride(2) : 0);
-    } else {
-      chunk_kda_cpu_kernel<scalar_t, 128>(
-          output.data_ptr<scalar_t>(),
-          intermediate_states.has_value() ? intermediate_states->data_ptr<scalar_t>() : nullptr,
-          track_state_tensor.defined() ? track_state_tensor.data_ptr<float>() : nullptr,
-          initial_state.data_ptr<float>(),
-          q_prepared.data_ptr<float>(),
-          k_prepared.data_ptr<float>(),
-          v_prepared.data_ptr<float>(),
-          gate_prepared.data_ptr<float>(),
-          beta_prepared.data_ptr<float>(),
-          cu_seqlens.data_ptr<int32_t>(),
-          chunk_offsets.data_ptr<int32_t>(),
-          initial_state_indices.data_ptr<int32_t>(),
-          track_chunk_idx_tensor.defined() ? track_chunk_idx_tensor.data_ptr<int32_t>() : nullptr,
-          num_seqs,
-          T,
-          H,
-          Hv,
-          NT,
-          initial_state.stride(0),
-          initial_state.stride(1),
-          initial_state.stride(2),
-          output.stride(1),
-          output.stride(2),
-          intermediate_states.has_value() ? intermediate_states->stride(1) : 0,
-          intermediate_states.has_value() ? intermediate_states->stride(2) : 0,
-          intermediate_states.has_value() ? intermediate_states->stride(3) : 0,
-          track_state_tensor.defined() ? track_state_tensor.stride(0) : 0,
-          track_state_tensor.defined() ? track_state_tensor.stride(1) : 0,
-          track_state_tensor.defined() ? track_state_tensor.stride(2) : 0);
+          lower_bound,
+          beta_is_raw,
+          use_qk_l2norm_in_kernel,
+          static_cast<float>(eps),
+          q_scale);
     }
   });
 
