@@ -1024,7 +1024,10 @@ class DeepseekV4HipRadixBackend(
         # output mode of the fp8 verify: deepseek_v4 fuses the fp8 wo_a quant into it
         self._fp8_verify_epi = (
             "invrope_mxfp8"
-            if any(getattr(m, "wo_a_fp8", False) for m in model_runner.model.modules())
+            if any(
+                getattr(m, "wo_a_fp8_block128", False)
+                for m in model_runner.model.modules()
+            )
             else "bf16"
         )
         self._fp8_split_kv_hint: Dict[int, int] = {}

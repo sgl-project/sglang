@@ -277,11 +277,13 @@ _FP8_WO_A_UE8M0 = _FP8_WO_A_GEMM and DEEPGEMM_SCALE_UE8M0
 
 def wo_a_fp8_gemm_enabled(quant_config: Optional[QuantizationConfig]) -> bool:
     """The fp8 wo_a absorb GEMM (DeepGEMM fp8_einsum, aiter mxscale) takes 128x128
-    block scales only; any other layout dequantizes wo_a to bf16 at load."""
-    return (
-        _FP8_WO_A_GEMM
-        and isinstance(quant_config, Fp8Config)
-        and quant_config.weight_block_size == [128, 128]
+    block scales, and on ROCm V4.1's 32x32 where _hip allows it; any other layout
+    dequantizes wo_a to bf16 at load."""
+    if not (_FP8_WO_A_GEMM and isinstance(quant_config, Fp8Config)):
+        return False
+    block = quant_config.weight_block_size
+    return block == [128, 128] or (
+        block == [32, 32] and _is_hip and _hip.wo_a_fp8_block32_enabled()
     )
 
 
@@ -1153,7 +1155,7 @@ class MqaAttentionBase(nn.Module):
 
             fused = (
                 _wo_a_fp8_mxscale_prequant is not None
-                and self.wo_a_fp8
+                and self.wo_a_fp8_block128
                 and runtime.flydsl_decode_supported(q_rope.shape[1])
             )
             self._wo_a_freqs = (
