@@ -62,14 +62,14 @@ def add_bria_fibo2_stages(
     from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
         DenoisingStage,
     )
-    from sglang.multimodal_gen.runtime.pipelines_core.stages.image_encoding import (
-        ImageEncodingStage,
-    )
     from sglang.multimodal_gen.runtime.pipelines_core.stages.input_validation import (
         InputValidationStage,
     )
     from sglang.multimodal_gen.runtime.pipelines_core.stages.latent_preparation import (
         LatentPreparationStage,
+    )
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.bria_fibo2.condition_encoding import (
+        BriaFibo2ConditionEncodingStage,
     )
     from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.bria_fibo2.source import (
         BriaFibo2SourceLatentsStage,
@@ -90,11 +90,13 @@ def add_bria_fibo2_stages(
         "input_validation_stage",
     )
     # Qwen3-VL reads the prompt, with a vision marker and the images to edit when
-    # the request has them; without images this is plain text encoding.
+    # the request has them; without images this is plain text encoding, because
+    # one checkpoint serves both paths and the pipeline class is fixed.
     pipeline.add_stage(
-        ImageEncodingStage(
+        BriaFibo2ConditionEncodingStage(
             image_processor=pipeline.get_module("processor"),
             text_encoder=pipeline.get_module("text_encoder"),
+            tokenizer=pipeline.get_module("tokenizer"),
         ),
         "image_encoding_stage",
     )
