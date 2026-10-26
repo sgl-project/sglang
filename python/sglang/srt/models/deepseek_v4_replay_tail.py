@@ -482,6 +482,10 @@ class DecoderReplayTail:
         leaves, has_pre, rebuild = _flatten_state(state)
         bridge_key = (capture_dspark, has_pre)
         bridge = self._bridge(bridge_key, block_rows)
+        # A capture records the bridge it is given; the warmup before it allocates one.
+        assert bridge is not None or bcg_module._current_capture_var.get() is None, (
+            "tail bridge not allocated before capture"
+        )
         bcg_tail_layers_in_prefill_graph(
             self,
             rebuild,
