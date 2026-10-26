@@ -4424,6 +4424,12 @@ class DeepseekV4Model(nn.Module):
                 )
         finally:
             residual_batch.clear(forward_batch)
+            # Drop this forward's MegaAttention packed-query buffer unless a CUDA
+            # graph captured it; a graph's warmup leaves it for the capture after.
+            if not get_is_capture_mode():
+                release = getattr(get_attn_backend(), "release_q_mega_pad_buffer", None)
+                if release is not None:
+                    release()
 
     @torch.no_grad()
     def _forward_impl(

@@ -21,7 +21,9 @@ from sglang.srt.layers.attention.deepseek_v4_mega_backend import (
     quantize_wo_a,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.runner_utils.capture_mode import model_capture_mode
 from sglang.srt.models.deepseek_v4 import (
+    DeepseekV4Model,
     MqaAttentionBase,
     MQALayer,
     _fp8_wo_a_einsum,
@@ -94,6 +96,17 @@ def new_tail_metadata():
     )
 
 
+def prefill_forward_batch():
+    return SimpleNamespace(
+        forward_mode=ForwardMode.EXTEND,
+        attn_cp_metadata=None,
+        global_num_token_non_padded_cpu=None,
+        global_num_token_non_padded=None,
+        num_token_non_padded=None,
+        residual_stream=None,
+    )
+
+
 class _KeptMetadataBackend:
     """The state DeepseekV4AttnBackend reads to share the packed query buffer
     between metadata that captured graphs keep, and to switch the late layers
@@ -102,6 +115,7 @@ class _KeptMetadataBackend:
     _share_q_mega_pad_buffer = DeepseekV4AttnBackend._share_q_mega_pad_buffer
     enter_late_layer_tail = DeepseekV4AttnBackend.enter_late_layer_tail
     exit_late_layer_tail = DeepseekV4AttnBackend.exit_late_layer_tail
+    release_q_mega_pad_buffer = DeepseekV4AttnBackend.release_q_mega_pad_buffer
 
     def __init__(self):
         self.forward_metadata = None
@@ -284,6 +298,104 @@ class TestMegaPackedQueryBuffer(CustomTestCase):
             torch.cuda.synchronize()
             for q, p in zip(queries, packed, strict=True):
                 self.assertTrue(torch.equal(p, pack_query_reference(q, 64)))
+
+    def _model_forward(self, backend, forward_batch, run_layers):
+        # DeepseekV4Model.forward around stand-in layers: what it does once they
+        # return is under test.
+        model = SimpleNamespace(_forward_impl=lambda *args: run_layers())
+        with patch(
+            "sglang.srt.models.deepseek_v4.get_attn_backend", return_value=backend
+        ):
+            DeepseekV4Model.forward(model, None, None, forward_batch, None)
+
+    def test_eager_forward_drops_buffer_when_it_ends(self):
+        # An eager forward builds its metadata anew and the backend keeps that
+        # metadata until the next forward, so the forward's buffer (tokens x 64
+        # padded heads x 512 bf16, shared by the late-layer tail) must be dropped
+        # when the forward ends rather than held between forwards.
+        torch.manual_seed(4)
+        layer, backend = _MegaQueryLayer(), _KeptMetadataBackend()
+        forward_batch = prefill_forward_batch()
+        for tokens in (1024, 256):
+            queries = [
+                torch.randn(rows, 16, 512, device="cuda", dtype=torch.bfloat16)
+                for rows in (tokens, tokens, tokens // 4, tokens // 4)
+            ]
+            backend.forward_metadata = new_metadata()
+            backend.tail_forward_metadata = new_tail_metadata()
+            allocated = []
+
+            def run_layers():
+                self._prefill_forward(layer, backend, forward_batch, queries)
+                allocated.append(backend.forward_metadata.q_mega_pad_buffer.nbytes)
+
+            torch.cuda.synchronize()
+            before = torch.cuda.memory_allocated()
+            self._model_forward(backend, forward_batch, run_layers)
+            torch.cuda.synchronize()
+            self.assertTrue(
+                all(
+                    torch.equal(p, pack_query_reference(q, 64))
+                    for q, p in zip(queries, layer.packed, strict=True)
+                )
+            )
+            # The recorded copies count toward memory_allocated; nothing here may
+            # keep one.
+            layer.packed.clear()
+            self.assertEqual(allocated, [tokens * 64 * 512 * 2])
+            self.assertEqual(torch.cuda.memory_allocated() - before, 0)
+
+    def test_forward_end_keeps_warmup_and_captured_buffers(self):
+        # A graph's warmup allocates the buffer its capture records, and every
+        # replay writes and reads a captured buffer. The end of a forward keeps
+        # both, also an eager (idle) forward's end while the backend still holds
+        # the graph's metadata.
+        torch.manual_seed(5)
+        layer, backend = _MegaQueryLayer(), _KeptMetadataBackend()
+        forward_batch = prefill_forward_batch()
+        meta, tail = new_metadata(), new_tail_metadata()
+        backend._share_q_mega_pad_buffer(meta)
+        backend.forward_metadata, backend.tail_forward_metadata = meta, tail
+        queries = [
+            torch.randn(rows, 16, 512, device="cuda", dtype=torch.bfloat16)
+            for rows in (512, 512, 128, 128)
+        ]
+
+        def run_layers():
+            self._prefill_forward(layer, backend, forward_batch, queries)
+
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with model_capture_mode(), torch.cuda.stream(stream):
+            self._model_forward(backend, forward_batch, run_layers)
+        torch.cuda.current_stream().wait_stream(stream)
+        self.assertIsNotNone(meta.q_mega_pad_buffer)
+        warm_ptr = meta.q_mega_pad_buffer.data_ptr()
+        layer.packed.clear()
+        graph = torch.cuda.CUDAGraph()
+        with model_capture_mode(), torch.cuda.graph(graph):
+            self._model_forward(backend, forward_batch, run_layers)
+        packed = list(layer.packed)
+        layer.packed.clear()
+        self.assertTrue(meta.q_mega_pad_captured and tail.q_mega_pad_captured)
+
+        self._model_forward(backend, forward_batch, lambda: None)
+        # A dropped buffer's memory would go back to the warmup stream's pool,
+        # and from there to this tensor.
+        with torch.cuda.stream(stream):
+            _poison = torch.full(
+                (512, 64, 512), float("nan"), device="cuda", dtype=torch.bfloat16
+            )
+        torch.cuda.current_stream().wait_stream(stream)
+        for _ in range(2):
+            for q in queries:
+                q.copy_(torch.randn_like(q))
+            graph.replay()
+            torch.cuda.synchronize()
+            for q, p in zip(queries, packed, strict=True):
+                self.assertTrue(torch.equal(p, pack_query_reference(q, 64)))
+        self.assertEqual(meta.q_mega_pad_buffer.data_ptr(), warm_ptr)
+        self.assertIs(tail.q_mega_pad_buffer, meta.q_mega_pad_buffer)
 
 
 @unittest.skipUnless(

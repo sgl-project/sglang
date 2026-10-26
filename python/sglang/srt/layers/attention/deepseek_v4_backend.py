@@ -3265,6 +3265,16 @@ class DeepseekV4AttnBackend(
             metadata.q_mega_pad_buffer = self._last_kept_metadata.q_mega_pad_buffer
         self._last_kept_metadata = metadata
 
+    def release_q_mega_pad_buffer(self) -> None:
+        # An eager forward builds its metadata, and with it the MegaAttention
+        # packed-query buffer, anew; the backend keeps that metadata until the
+        # next forward, so the model drops the buffer when its forward ends
+        # instead of holding it between forwards. A buffer a CUDA graph captured
+        # stays: the graph writes and reads it on every replay.
+        for metadata in (self.forward_metadata, self.tail_forward_metadata):
+            if isinstance(metadata, DSV4Metadata) and not metadata.q_mega_pad_captured:
+                metadata.q_mega_pad_buffer = None
+
     def _source_projection_buffers(self, num_tokens: int, ratio: int) -> dict:
         cfg = self.model_runner.model_config.hf_text_config
         heads, dim = int(cfg.index_n_heads), int(cfg.index_head_dim)
