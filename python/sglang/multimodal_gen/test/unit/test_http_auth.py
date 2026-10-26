@@ -3,13 +3,20 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from fastapi import APIRouter, FastAPI
 from fastapi.testclient import TestClient
 
 from sglang.multimodal_gen.runtime.entrypoints.http_server import create_app
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.utils import FlexibleArgumentParser
-from sglang.srt.utils.auth import AuthLevel, _iter_effective_routes
+from sglang.srt.utils.auth import (
+    AuthLevel,
+    _iter_effective_routes,
+    add_api_key_middleware,
+    app_has_admin_force_endpoints,
+    auth_level,
+)
 
 
 def _server_args(api_key=None, admin_api_key=None):
@@ -32,6 +39,50 @@ def _route_auth_level(app, path):
         if getattr(route, "path", None) == path
     )
     return getattr(route.endpoint, "_auth_level", AuthLevel.NORMAL)
+
+
+@pytest.mark.parametrize(
+    "level,api_key,admin_api_key,statuses",
+    [
+        (AuthLevel.ADMIN_OPTIONAL, None, None, [200, 200, 200, 200]),
+        (AuthLevel.ADMIN_OPTIONAL, "user-secret", None, [401, 401, 200, 401]),
+        (AuthLevel.ADMIN_OPTIONAL, None, "admin-secret", [401, 401, 401, 200]),
+        (
+            AuthLevel.ADMIN_OPTIONAL,
+            "user-secret",
+            "admin-secret",
+            [401, 401, 401, 200],
+        ),
+        (AuthLevel.ADMIN_FORCE, None, None, [403, 403, 403, 403]),
+        (AuthLevel.ADMIN_FORCE, "user-secret", None, [403, 403, 403, 403]),
+        (AuthLevel.ADMIN_FORCE, None, "admin-secret", [401, 401, 401, 200]),
+        (AuthLevel.ADMIN_FORCE, "user-secret", "admin-secret", [401, 401, 401, 200]),
+    ],
+)
+def test_nested_routes_preserve_management_auth_level(
+    level, api_key, admin_api_key, statuses
+):
+    router = APIRouter()
+
+    @router.post("/management")
+    @auth_level(level)
+    async def management():
+        return {"success": True}
+
+    outer = APIRouter()
+    outer.include_router(router, prefix="/v1")
+    app = FastAPI()
+    app.include_router(outer, prefix="/api")
+
+    assert _route_auth_level(app, "/api/v1/management") == level
+    assert app_has_admin_force_endpoints(app) == (level == AuthLevel.ADMIN_FORCE)
+    add_api_key_middleware(app, api_key=api_key, admin_api_key=admin_api_key)
+    client = TestClient(app)
+    for token, status in zip(
+        (None, "wrong-secret", "user-secret", "admin-secret"), statuses
+    ):
+        headers = {} if token is None else {"Authorization": f"Bearer {token}"}
+        assert client.post("/api/v1/management", headers=headers).status_code == status
 
 
 def test_cli_parser_accepts_api_keys_without_exposing_them_in_repr():

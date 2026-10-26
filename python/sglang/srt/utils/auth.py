@@ -43,8 +43,15 @@ def _iter_effective_routes(app: Any):
     try:
         from fastapi.routing import iter_route_contexts
     except ImportError:
-        return iter(routes)
-    return iter_route_contexts(routes)
+        # FastAPI 0.137 preserves included routers without iter_route_contexts.
+        for route in routes:
+            contexts = getattr(route, "effective_route_contexts", None)
+            if contexts is not None:
+                yield from contexts()
+            else:
+                yield route
+    else:
+        yield from iter_route_contexts(routes)
 
 
 def _get_auth_level_from_app_and_scope(app: Any, scope: dict) -> AuthLevel:
