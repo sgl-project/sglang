@@ -365,11 +365,16 @@ def _slice_streaming_output_meta_info(
     meta_info: Dict[Any, Any],
     last_output_offset: int,
     customized_info_keys: Optional[Iterable[str]] = None,
+    flat_output_top_logprobs: bool = False,
 ) -> None:
     """Align output-side metadata with the current incremental streaming chunk."""
     streaming_meta_info_keys = set(_INCREMENTAL_STREAMING_META_INFO_KEYS)
     if customized_info_keys is not None:
         streaming_meta_info_keys.update(customized_info_keys)
+    if flat_output_top_logprobs:
+        # Only the final chunk carries output top logprobs, so a nested
+        # fallback there covers every position.
+        streaming_meta_info_keys.discard("output_top_logprobs")
     for key in meta_info.keys() & streaming_meta_info_keys:
         meta_info[key] = meta_info[key][last_output_offset:]
 
@@ -2640,6 +2645,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                             meta_info,
                             output_offset,
                             state.customized_info_accumulated.keys(),
+                            state.obj.return_flat_raw_output_top_logprobs,
                         )
                         state.last_output_offset = len(state.output_ids)
                         out_dict = {
@@ -2686,6 +2692,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                             meta_info,
                             output_offset,
                             state.customized_info_accumulated.keys(),
+                            state.obj.return_flat_raw_output_top_logprobs,
                         )
                         state.last_output_offset = len(state.output_ids)
                         out_dict = {
@@ -2937,8 +2944,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     )
                 meta_info["input_top_logprobs"] = state.input_top_logprobs
             use_flat_output = state.obj.return_flat_raw_output_top_logprobs
-            # Built once on the finished response; streaming is rejected and
-            # only that response reaches a non-streaming client.
+            # Built once on the finished response; earlier streaming chunks
+            # carry no output top logprobs.
             if use_flat_output and finished:
                 try:
                     meta_info.update(

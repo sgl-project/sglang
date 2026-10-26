@@ -462,11 +462,6 @@ class GenerateReqInput:
                 "scoring: delimiter-sparse top logprob rows have no contiguous "
                 "position mapping."
             )
-        if self.return_flat_raw_output_top_logprobs and self.stream:
-            raise ValueError(
-                "return_flat_raw_output_top_logprobs is only set on the finished "
-                "response and does not support stream=True."
-            )
         if self.return_flat_raw_top_logprobs_b64 and not (
             self.return_flat_raw_top_logprobs
             or self.return_flat_raw_output_top_logprobs
