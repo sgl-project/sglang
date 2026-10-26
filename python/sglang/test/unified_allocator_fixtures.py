@@ -662,7 +662,7 @@ def _kv_pools(bundle) -> Dict[str, object]:
     if isinstance(kv, UnifiedSWAKVPool):
         pools["swa"] = kv.swa_kv_pool
     if isinstance(bundle, UnifiedPoolBundle):
-        pools["mamba"] = bundle.req_to_token_pool.mamba_pool
+        pools["mamba"] = bundle.token_to_kv_pool_allocator.state.pool
     return pools
 
 
@@ -692,7 +692,8 @@ def _layer_maps(bundle) -> dict:
         kv_map = tuple(sorted(kv.full_attention_layer_id_mapping.items()))
     out = {"kv": kv_map}
     if isinstance(bundle, UnifiedPoolBundle):
-        out["state"] = tuple(sorted(bundle.req_to_token_pool.mamba_map.items()))
+        state = bundle.token_to_kv_pool_allocator.state
+        out["state"] = tuple(sorted(state.layer_map.items()))
     return out
 
 
@@ -706,7 +707,7 @@ def _capacity_summary(bundle) -> dict:
     if isinstance(bundle.token_to_kv_pool, UnifiedSWAKVPool):
         out["size_swa"] = allocator.size_swa
     if isinstance(bundle, UnifiedPoolBundle):
-        out["state_slots"] = bundle.req_to_token_pool.mamba_allocator.size
+        out["state_slots"] = allocator.state_slots.size
     return out
 
 

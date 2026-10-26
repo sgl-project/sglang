@@ -420,6 +420,7 @@ def _commit_ple_batch(batch: Optional[_PLEBatch], forward_batch: ForwardBatch) -
         return
 
     pool = get_req_to_token_pool()
+    ngram = get_token_to_kv_pool().layer_router.part_view(NGRAM_PART)
     context = batch.ngram_context
     context_len = context.shape[1] - batch.row_width
     if batch.mode.is_target_verify():
@@ -433,7 +434,7 @@ def _commit_ple_batch(batch: Optional[_PLEBatch], forward_batch: ForwardBatch) -
             batch.lengths.ne(0),
             pool.size,
         )
-        pool.set_ngram_intermediate_context(
+        ngram.set_intermediate_context(
             torch.where(
                 valid_steps.unsqueeze(-1),
                 step_contexts,
@@ -447,23 +448,23 @@ def _commit_ple_batch(batch: Optional[_PLEBatch], forward_batch: ForwardBatch) -
         # Decode advances every two-token history by exactly one column.  Slicing
         # preserves the int64 values while avoiding arange + gather launches.
         next_context = context[:, batch.row_width :]
-        pool.set_ngram_context(batch.state_indices, next_context)
+        ngram.set_context(batch.state_indices, next_context)
         track = _ple_track_targets(forward_batch, batch)
         if track is not None:
             track_indices, _ = track
-            pool.set_ngram_context(track_indices, next_context)
+            ngram.set_context(track_indices, next_context)
         return
 
     context_cols = torch.arange(context_len, device=context.device, dtype=torch.long)
     next_context = context.gather(
         1, batch.lengths.unsqueeze(1) + context_cols.unsqueeze(0)
     )
-    pool.set_ngram_context(batch.state_indices, next_context)
+    ngram.set_context(batch.state_indices, next_context)
 
     track = _ple_track_targets(forward_batch, batch)
     if track is not None:
         track_indices, track_offsets = track
-        pool.set_ngram_context(
+        ngram.set_context(
             track_indices,
             context.gather(1, track_offsets.unsqueeze(1) + context_cols.unsqueeze(0)),
         )

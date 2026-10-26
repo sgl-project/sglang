@@ -152,15 +152,15 @@ class TestKVLayerRouterParts(CustomTestCase):
         )
         stage = _StageWithoutStateLayers()
         stage.layer_transfer_counter = _RecordingCounter()
-        table.bind_state_routes(stage.router)
+        table.state.bind_routes(stage.router)
         stage.router.load_parts_layer_wise()
 
         stage.router.wait_for_part(STATE_PART)
-        table.mamba_pool.copy_from(torch.tensor([1]), torch.tensor([2]))
+        table.state.copy(torch.tensor([1]), torch.tensor([2]))
         stage.router.wait_for_part(NGRAM_PART)
         self.assertEqual(stage.layer_transfer_counter.waits, [])
-        self.assertIs(stage.router.part_view(STATE_PART), table.mamba_pool)
-        self.assertIs(stage.router.part_view(NGRAM_PART), table.ngram_pool)
+        self.assertIs(stage.router.part_view(STATE_PART), table.state.pool)
+        self.assertIs(stage.router.part_view(NGRAM_PART), table.state.ngram_pool)
 
     def test_parts_stay_out_of_the_token_sub_pools(self):
         """Callers that pick "the first layer holding KV" or iterate the token

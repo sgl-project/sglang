@@ -1153,7 +1153,7 @@ def commit_mamba_states_after_verify(
             commit_gdn_replayssm_fold_after_verify,
         )
 
-        spec_state = req_pool.get_speculative_mamba2_params_all_layers()
+        spec_state = mamba_pool.get_speculative_mamba2_params_all_layers()
         state_batch_indices = req_pool.get_mamba_indices(batch.req_pool_indices)
         if prepared_step_indices is None:
             last_correct_step_indices, mamba_steps_to_track = (
@@ -1193,7 +1193,7 @@ def commit_mamba_states_after_verify(
             fused_conv_window_scatter_with_mask,
         )
 
-        spec_state = req_pool.get_speculative_mamba2_params_all_layers()
+        spec_state = mamba_pool.get_speculative_mamba2_params_all_layers()
         state_batch_indices = req_pool.get_mamba_indices(batch.req_pool_indices)
         replay_indices = batch.req_pool_indices
         if prepared_step_indices is None:
@@ -1274,7 +1274,7 @@ def commit_mamba_states_after_verify(
             commit_kda_replayssm_after_verify,
         )
 
-        spec_state = req_pool.get_speculative_mamba2_params_all_layers()
+        spec_state = mamba_pool.get_speculative_mamba2_params_all_layers()
         state_batch_indices = req_pool.get_mamba_indices(batch.req_pool_indices)
         accept_indices_offset = torch.arange(
             0,

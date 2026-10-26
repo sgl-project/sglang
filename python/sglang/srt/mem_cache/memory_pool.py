@@ -1626,9 +1626,6 @@ class HybridReqToTokenPool(ReqToTokenPool):
     def mamba_ckpt_pool(self, value) -> None:
         self.state.ckpt_pool = value
 
-    def bind_state_routes(self, router: KVLayerRouter) -> None:
-        self.state.bind_routes(router)
-
     def get_mamba_indices(self, req_indices: torch.Tensor) -> torch.Tensor:
         return self.req_index_to_mamba_index_mapping[req_indices]
 
@@ -1639,36 +1636,6 @@ class HybridReqToTokenPool(ReqToTokenPool):
         integrations outside sglang that call it (LMCache's sglang adapter)."""
         return mamba_indices
 
-    def set_ngram_context(
-        self, ngram_indices: torch.Tensor, context: torch.Tensor
-    ) -> None:
-        self.ngram_pool.set_context(ngram_indices, context)
-
-    def set_ngram_intermediate_context(
-        self, context: torch.Tensor, indices: Optional[torch.Tensor] = None
-    ) -> None:
-        self.ngram_pool.set_intermediate_context(context, indices)
-
-    def copy_mamba_state(
-        self, src_index: torch.Tensor, dst_index: torch.Tensor
-    ) -> None:
-        self.state.copy(src_index, dst_index)
-
-    def get_speculative_mamba2_params_all_layers(self) -> MambaPool.SpeculativeState:
-        return self.mamba_pool.get_speculative_mamba2_params_all_layers()
-
-    def get_state_buf_infos(self):
-        return self.mamba_pool.get_contiguous_buf_infos()
-
-    def get_state_dim_per_tensor(self):
-        return self.mamba_pool.get_state_dim_per_tensor()
-
-    def get_state_slice_outer_counts(self):
-        return self.mamba_pool.get_state_slice_outer_counts()
-
-    def get_state_conv_shard_groups(self):
-        return self.mamba_pool.get_state_conv_shard_groups()
-
     def get_mamba_ping_pong_other_idx(self, mamba_next_track_idx: int) -> int:
         if self.mamba_ping_pong_track_buffer_size == 2:
             return 1 - mamba_next_track_idx
@@ -1678,12 +1645,6 @@ class HybridReqToTokenPool(ReqToTokenPool):
     def get_mamba_ping_pong_keep_idx(self, req: Req) -> int:
         """Return the ping-pong index holding the most recent tracked state."""
         return req.kv.mamba_last_track_idx
-
-    def _alloc_ping_pong_buffer(self, req: Req):
-        assert self.state.alloc_ping_pong_buffer(self, req), (
-            "Not enough space for mamba ping pong idx, "
-            "try to increase --mamba-full-memory-ratio."
-        )
 
     def set_mamba_ping_pong_slot(self, req: Req, idx: int, value):
         """Update a ping-pong slot value and sync the device-side mapping.
@@ -1726,11 +1687,6 @@ class HybridReqToTokenPool(ReqToTokenPool):
             )
         self.set_mamba_ping_pong_slot(req, donate_idx, new_slot[0])
         return mamba_value_donated
-
-    def free_mamba_cache(
-        self, req: Req, mamba_ping_pong_track_buffer_to_keep: Optional[int] = None
-    ):
-        self.state.release(self, req, mamba_ping_pong_track_buffer_to_keep)
 
     def clear(self):
         logger.info("Reset HybridReqToTokenPool")
@@ -4359,8 +4315,9 @@ class HybridLinearKVPool(KVCache):
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
     def _build_layer_router(self) -> KVLayerRouter:
-        # Only the full-attention layers hold KV here; the request table binds
-        # its state layers to this router (`bind_state_routes`).
+        # Only the full-attention layers hold KV here; the KV cache
+        # configurator binds the state layers to this router
+        # (`StateStorage.bind_routes`).
         return KVLayerRouter.from_layer_maps(
             self,
             [

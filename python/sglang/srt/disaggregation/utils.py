@@ -1464,7 +1464,7 @@ def setup_state_kv_args(
     token_to_kv_pool,
     draft_token_to_kv_pool=None,
     total_kv_layers: int = None,
-    req_to_token_pool=None,
+    state_pool=None,
 ) -> None:
     from sglang.srt.disaggregation.base.conn import StateType
     from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
@@ -1857,28 +1857,14 @@ def setup_state_kv_args(
                 kv_args, StateType.REQUEST_ROW, row_ptrs, row_lens, row_item_lens
             )
 
-    if (
-        StateType.MAMBA not in kv_args.state_types
-        and req_to_token_pool is not None
-        and hasattr(req_to_token_pool, "get_state_buf_infos")
-    ):
-        data_ptrs, data_lens, item_lens = req_to_token_pool.get_state_buf_infos()
+    # The recurrent state pool, when the KV pool does not describe it (a
+    # window KV pool beside a state sub-pool).
+    if StateType.MAMBA not in kv_args.state_types and state_pool is not None:
+        data_ptrs, data_lens, item_lens = state_pool.get_contiguous_buf_infos()
         if data_ptrs:
-            dim = (
-                req_to_token_pool.get_state_dim_per_tensor()
-                if hasattr(req_to_token_pool, "get_state_dim_per_tensor")
-                else None
-            )
-            conv_shard_groups = (
-                req_to_token_pool.get_state_conv_shard_groups()
-                if hasattr(req_to_token_pool, "get_state_conv_shard_groups")
-                else None
-            )
-            slice_outer_counts = (
-                req_to_token_pool.get_state_slice_outer_counts()
-                if hasattr(req_to_token_pool, "get_state_slice_outer_counts")
-                else None
-            )
+            dim = state_pool.get_state_dim_per_tensor()
+            conv_shard_groups = state_pool.get_state_conv_shard_groups()
+            slice_outer_counts = state_pool.get_state_slice_outer_counts()
             append_state_component(
                 kv_args,
                 StateType.MAMBA,

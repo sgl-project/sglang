@@ -9,6 +9,7 @@ import logging
 from typing import Any, Optional, Sequence
 
 import msgspec
+import torch
 
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
 from sglang.srt.mem_cache.kv.decl import (
@@ -24,12 +25,15 @@ from sglang.srt.mem_cache.kv.sizing import (
     SizedKVStorage,
     size_kv_storage,
 )
+from sglang.srt.mem_cache.kv.state_storage import StateStorage
 from sglang.srt.mem_cache.layout.fused_draft import FusedDraftPlacement
+from sglang.srt.mem_cache.ple_state_pool import NGramPool, ShortConvPool
 from sglang.srt.mem_cache.unified_memory_pool import (
     GB,
     UnifiedHybridLinearKVPool,
     UnifiedHybridReqToTokenPool,
     UnifiedKVPool,
+    UnifiedMambaPool,
     UnifiedMHATokenToKVPool,
     UnifiedMLATokenToKVPool,
     UnifiedPoolBundle,
@@ -57,7 +61,7 @@ class UnifiedBuildContext(msgspec.Struct, frozen=True, kw_only=True):
     # full+state facade even when its full side is an MLA latent.
     head_num: Optional[int] = None
     head_dim: Optional[int] = None
-    # The request table of a plan with state.
+    # The request table and the state storage of a plan with state.
     max_num_reqs: int = 0
     model_context_len: int = 0
     extra_max_context_len: int = 0
@@ -149,24 +153,54 @@ def _build_full_window(
 
 
 def _build_state_request_table(
-    plan: KVStoragePlan, shared_pool: UnifiedKVPool, ctx: UnifiedBuildContext
+    plan: KVStoragePlan, ctx: UnifiedBuildContext
 ) -> UnifiedHybridReqToTokenPool:
     return UnifiedHybridReqToTokenPool(
-        unified_buffer=shared_pool,
         mamba_sub_pool_name=plan.of_lifetime(StateLifetime).name,
         size=ctx.max_num_reqs,
-        mamba_spec_state_size=ctx.max_num_reqs,  # outer dim of spec-decode intermediates
         max_context_len=ctx.model_context_len + ctx.extra_max_context_len,
         device=ctx.device,
         enable_memory_saver=ctx.enable_memory_saver,
-        cache_params=ctx.state_cache_params,
-        mamba_layer_ids=list(plan.of_lifetime(StateLifetime).layer_ids),
         enable_mamba_extra_buffer=ctx.enable_mamba_extra_buffer,
         enable_mamba_extra_buffer_lazy=ctx.enable_mamba_extra_buffer_lazy,
-        speculative_num_draft_tokens=ctx.speculative_num_draft_tokens,
         enable_overlap_schedule=not ctx.disable_overlap_schedule,
         start_layer=ctx.start_layer,
         pre_alloc_size=ctx.decode_pre_alloc_size,
+    )
+
+
+def _build_state_storage(
+    plan: KVStoragePlan, shared_pool: UnifiedKVPool, ctx: UnifiedBuildContext
+) -> StateStorage:
+    """The state sub-pool's storage, without its slots: those come from the
+    chain allocator's state band (`_wire_mamba_slot_allocator`). The PLE side
+    states are built disabled; unified memory refuses them."""
+    state = plan.of_lifetime(StateLifetime)
+    layer_ids = list(state.layer_ids)
+    assert len(ctx.state_cache_params.layers) >= len(layer_ids), (
+        f"cache_params.layers ({len(ctx.state_cache_params.layers)}) cannot supply "
+        f"{len(layer_ids)} mamba layer ids"
+    )
+    return StateStorage(
+        sub_pool=state.name,
+        pool=UnifiedMambaPool(
+            unified_buffer=shared_pool,
+            sub_pool_name=state.name,
+            spec_state_size=ctx.max_num_reqs,  # outer dim of spec-decode intermediates
+            mamba_layer_ids=layer_ids,
+            enable_memory_saver=ctx.enable_memory_saver,
+            speculative_num_draft_tokens=ctx.speculative_num_draft_tokens,
+        ),
+        slots=None,
+        layer_map={layer_id: i for i, layer_id in enumerate(layer_ids)},
+        short_conv_pool=ShortConvPool(
+            size=0,
+            state_shape=None,
+            layer_ids=[],
+            dtype=torch.bfloat16,
+            device=ctx.device,
+        ),
+        ngram_pool=NGramPool(size=0, context_len=0, eos_token_id=0, device=ctx.device),
     )
 
 
@@ -195,7 +229,8 @@ def _build_full_state(
         page_size=plan.page_size,
         fused_draft=plan.fused_draft,
     )
-    req_to_token_pool = _build_state_request_table(plan, shared_pool, ctx)
+    req_to_token_pool = _build_state_request_table(plan, ctx)
+    state_storage = _build_state_storage(plan, shared_pool, ctx)
     if use_mla:
         # start_layer stays 0: HybridLinearKVPool addresses this view by the
         # contiguous 0..N-1 index of its full-attention layers.
@@ -221,7 +256,7 @@ def _build_full_state(
         head_dim=ctx.head_dim,
         full_attention_layer_ids=[0] if ctx.is_draft_worker else list(full.layer_ids),
         device=ctx.device,
-        mamba_pool=req_to_token_pool.mamba_pool,
+        mamba_pool=state_storage.pool,
         enable_memory_saver=ctx.enable_memory_saver,
         use_mla=use_mla,
         start_layer=ctx.start_layer,
@@ -231,7 +266,7 @@ def _build_full_state(
         unified_buffer=shared_pool,
         roles=ChainRoles(owner=full.name, state=state.name),
         kvcache=token_to_kv_pool,
-        state_kvcache=req_to_token_pool.mamba_pool,
+        state_kvcache=state_storage.pool,
         device=ctx.device,
         page_size=plan.page_size,
         need_sort=ctx.need_sort,
@@ -247,14 +282,12 @@ def _build_full_state(
     _wire_mamba_slot_allocator(
         mamba_end=allocator.mamba_allocator,
         take=allocator.alloc_state_slots,
-        req_to_token_pool=req_to_token_pool,
+        state=state_storage,
         device=ctx.device,
     )
-    allocator.state = req_to_token_pool.state
+    allocator.state = state_storage
     # Only HybridLinearKVPool's retraction CPU-copy path uses this hook.
-    token_to_kv_pool._mamba_translate = allocator.state_ids(
-        req_to_token_pool.state_sub_pool
-    ).ids
+    token_to_kv_pool._mamba_translate = allocator.state_ids(state.name).ids
     _log_banner(
         "UNIFIED MEMORY POOL ENABLED -- path=Mamba hybrid (%s full side)"
         % ("MLA" if use_mla else "MHA"),
@@ -320,12 +353,13 @@ def _build_full_window_state(
         end_layer=ctx.end_layer,
         enable_memory_saver=ctx.enable_memory_saver,
     )
-    req_to_token_pool = _build_state_request_table(plan, shared_pool, ctx)
+    req_to_token_pool = _build_state_request_table(plan, ctx)
+    state_storage = _build_state_storage(plan, shared_pool, ctx)
     allocator = ChainAllocator(
         unified_buffer=shared_pool,
         roles=ChainRoles(owner=full.name, window=window.name, state=state.name),
         kvcache=token_to_kv_pool,
-        state_kvcache=req_to_token_pool.mamba_pool,
+        state_kvcache=state_storage.pool,
         device=ctx.device,
         full_max_total_num_tokens=sizing.full_tokens,
         swa_max_total_num_tokens=sizing.window_tokens,
@@ -337,10 +371,10 @@ def _build_full_window_state(
     _wire_mamba_slot_allocator(
         mamba_end=allocator.mamba_allocator,
         take=allocator.alloc_state_slots,
-        req_to_token_pool=req_to_token_pool,
+        state=state_storage,
         device=ctx.device,
     )
-    allocator.state = req_to_token_pool.state
+    allocator.state = state_storage
     _log_banner(
         "UNIFIED MEMORY POOL ENABLED -- path=SWA+Mamba tri-pool",
         "  full_layers=%d, swa_layers=%d, state_layers=%d, page_size=%d"

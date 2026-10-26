@@ -452,7 +452,7 @@ class MockMamba2ModelRunner(ModelRunner):
             enable_memory_saver=False,
             enable_alt_stream=False,
         )
-        self.req_to_token_pool.bind_state_routes(self.token_to_kv_pool.layer_router)
+        self.req_to_token_pool.state.bind_routes(self.token_to_kv_pool.layer_router)
         # A static allocator: ids index the pools as they are.
         self.token_to_kv_pool_allocator = SimpleNamespace(
             page_size=case.page_size,

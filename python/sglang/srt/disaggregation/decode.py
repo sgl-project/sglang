@@ -186,7 +186,8 @@ class DecodeReqToTokenPool:
 
     # Mirrors ReqToTokenPool.register_on_alloc_rows.
     _on_alloc_rows: Optional[Callable[[List[int]], None]] = None
-    # No recurrent state (`ReqToTokenPool.mamba_pool`).
+    # No recurrent state (`ReqToTokenPool.mamba_pool`, `ReqToTokenPool.state`).
+    state = None
     mamba_pool = None
     mamba_allocator = None
     mamba_ckpt_pool = None
@@ -680,12 +681,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.metadata_buffers.get_buf_infos()
         )
 
+        state = self.token_to_kv_pool_allocator.state
         setup_state_kv_args(
             kv_args,
             self.token_to_kv_pool,
             self.draft_token_to_kv_pool,
             total_kv_layers=self.scheduler.model_config.num_hidden_layers,
-            req_to_token_pool=getattr(self, "req_to_token_pool", None),
+            state_pool=None if state is None else state.pool,
         )
         if get_disagg().disaggregation_decode_host_receive_threshold < 1:
             pool = self.token_to_kv_pool

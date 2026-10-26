@@ -217,7 +217,7 @@ class TestPPReplaySSMVerifySourceRows(CustomTestCase):
         req_pool.get_mamba_indices.return_value = torch.tensor(
             [5, 7], dtype=torch.int32
         )
-        req_pool.get_speculative_mamba2_params_all_layers.return_value = (
+        mamba_pool.get_speculative_mamba2_params_all_layers.return_value = (
             self._spec_state()
         )
         batch = MagicMock()

@@ -1003,6 +1003,9 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
     def clear(self) -> None:
         for member in self.members:
             member.clear()
+        if self.state is not None:
+            # The state slots and the side states; the request table keeps ids.
+            self.state.clear()
         self.free_group = None
         self.free_page_reps_group = None
         self.full_page_reps_group = []

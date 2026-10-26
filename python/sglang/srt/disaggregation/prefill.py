@@ -346,13 +346,13 @@ class PrefillBootstrapQueue:
         kv_args.ib_device = get_disagg().disaggregation_ib_device
         kv_args.gpu_id = get_device().gpu_id
 
-        req_to_token_pool = getattr(self.scheduler, "req_to_token_pool", None)
+        state = self.scheduler.token_to_kv_pool_allocator.state
         setup_state_kv_args(
             kv_args,
             self.token_to_kv_pool,
             self.draft_token_to_kv_pool if transfer_draft_cache else None,
             self.scheduler.model_config.num_hidden_layers,
-            req_to_token_pool=req_to_token_pool,
+            state_pool=None if state is None else state.pool,
         )
 
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)

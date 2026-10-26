@@ -150,7 +150,7 @@ class TestMamba(unittest.TestCase):
         )
 
         # free req
-        req_to_token_pool.free_mamba_cache(req)
+        req_to_token_pool.state.release(req_to_token_pool, req)
         req_to_token_pool.free(req)
         assert req_to_token_pool.available_size() == max_num_reqs
         assert req_to_token_pool.mamba_allocator.available_size() == mamba_cache_size

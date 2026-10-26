@@ -25,7 +25,6 @@ compaction only mutates those (no reference rewriting).
 
 from __future__ import annotations
 
-import copy
 import logging
 from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
 
@@ -61,6 +60,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MambaPool,
     MHATokenToKVPool,
     MLATokenToKVPool,
+    ReqToTokenPool,
     unwrap_write_loc,
     write_loc_is_physical,
 )
@@ -1066,49 +1066,43 @@ class UnifiedMambaSlotAllocator:
 
 
 class UnifiedHybridReqToTokenPool(HybridReqToTokenPool):
-    """`HybridReqToTokenPool` whose `mamba_pool` is a `UnifiedMambaPool`. The inherited
-    mamba-id state now holds VIRTUAL ids, which the allocator's id space for
-    `state_sub_pool` maps to physical slots."""
+    """The request table of a unified pool with a state sub-pool: request rows
+    and their slot-id columns only. The slot ids are VIRTUAL, which the
+    allocator's id space for `state_sub_pool` maps to physical slots; the
+    state itself (pool, slot allocator, layer map) is the allocator's
+    `state`, which the unified pool builder constructs."""
 
     def __init__(
         self,
         *,
-        unified_buffer: UnifiedKVPool,
         mamba_sub_pool_name: str,
         size: int,
-        mamba_spec_state_size: int,
         max_context_len: int,
         device: str,
         enable_memory_saver: bool,
-        cache_params,
-        mamba_layer_ids: List[int],
         enable_mamba_extra_buffer: bool,
         enable_mamba_extra_buffer_lazy: bool,
-        speculative_num_draft_tokens: Optional[int] = None,
         enable_overlap_schedule: bool = True,
         start_layer: Optional[int] = None,
         pre_alloc_size: int = 0,
     ):
-        self._unified_buffer = unified_buffer
         self.state_sub_pool = mamba_sub_pool_name
-        self._shared_mamba_size = (
-            unified_buffer.max_slots(mamba_sub_pool_name) - 1
-        )  # reserve slot 0
         super().__init__(
             # `DecodeReqToTokenPool` semantics: rows cover the preallocated
             # requests too, while `self.size` (rebound below) stays the
             # running-request cap the scheduler and leak invariant expect.
             size=size + pre_alloc_size,
-            mamba_size=self._shared_mamba_size,
-            mamba_spec_state_size=mamba_spec_state_size,
+            # The state storage is not built here; `_init_mamba_pool` takes
+            # only what the id columns need.
+            mamba_size=0,
+            mamba_spec_state_size=0,
             max_context_len=max_context_len,
             device=device,
             enable_memory_saver=enable_memory_saver,
-            cache_params=cache_params,
-            mamba_layer_ids=mamba_layer_ids,
+            cache_params=None,
+            mamba_layer_ids=[],
             enable_mamba_extra_buffer=enable_mamba_extra_buffer,
             enable_mamba_extra_buffer_lazy=enable_mamba_extra_buffer_lazy,
-            speculative_num_draft_tokens=speculative_num_draft_tokens,
             enable_overlap_schedule=enable_overlap_schedule,
             start_layer=start_layer,
         )
@@ -1134,52 +1128,13 @@ class UnifiedHybridReqToTokenPool(HybridReqToTokenPool):
         ngram_context_len: int = 0,
         ngram_eos_token_id: int = 0,
     ):
-        # mamba_envelope_layout / speculative_eagle_topk / enable_linear_replayssm /
-        # linear_replayssm_cache_len / enable_linear_replayssm_spec: accepted to match
-        # the parent signature but NOT forwarded — the shared pool's conv/temporal
-        # state are fixed-shape views (replayssm/spec are gated off under unified).
+        # Only the slot-id columns; the storage arguments match the parent
+        # signature and are not read.
         if short_conv_layer_ids or ngram_context_len:
             raise ValueError(
                 "Qwen4-Exp PLE side states are not supported with "
                 "--enable-unified-memory"
             )
-        from sglang.srt.mem_cache.ple_state_pool import NGramPool, ShortConvPool
-
-        self.state = StateStorage.empty(self.state_sub_pool)
-        self.short_conv_pool = ShortConvPool(
-            size=0,
-            state_shape=None,
-            layer_ids=[],
-            dtype=torch.bfloat16,
-            device=device,
-        )
-        self.ngram_pool = NGramPool(
-            size=0,
-            context_len=0,
-            eos_token_id=0,
-            device=device,
-        )
-        assert mamba_size == self._shared_mamba_size, (
-            f"UnifiedHybridReqToTokenPool._init_mamba_pool: mamba_size={mamba_size} "
-            f"!= unified_buffer.max_slots({self.state_sub_pool!r}) - 1 "
-            f"= {self._shared_mamba_size}"
-        )
-        assert len(cache_params.layers) >= len(mamba_layer_ids), (
-            f"cache_params.layers ({len(cache_params.layers)}) cannot supply "
-            f"{len(mamba_layer_ids)} mamba layer ids"
-        )
-        self.mamba_pool = UnifiedMambaPool(
-            unified_buffer=self._unified_buffer,
-            sub_pool_name=self.state_sub_pool,
-            spec_state_size=mamba_spec_state_size,
-            mamba_layer_ids=mamba_layer_ids,
-            enable_memory_saver=self.enable_memory_saver,
-            speculative_num_draft_tokens=speculative_num_draft_tokens,
-        )
-        # Wired in by the unified pool builder once the mamba allocator exists.
-        self.mamba_allocator = None
-        self.mamba_map = {layer_id: i for i, layer_id in enumerate(mamba_layer_ids)}
-        self.mamba_ckpt_pool = None  # int8 ckpt pool unused; None = feature off
         self.device = device
         # Sized by req_to_token's first dim (size + 1; row 0 is padding); self.size
         # would under-size by one row.
@@ -1198,32 +1153,19 @@ class UnifiedHybridReqToTokenPool(HybridReqToTokenPool):
                 )
             )
 
-    def clone_for_fused_draft(
-        self, *, layer_lanes: Dict[int, int]
-    ) -> UnifiedHybridReqToTokenPool:
-        """Shallow copy for a draft runner whose recurrent state is fused into
-        this pool's state entries: it shares the request->slot mappings and
-        the slot allocator, and its `mamba_pool` is a view of the draft block
-        keyed by the runner's own layer ids."""
-        from sglang.srt.mem_cache.unified_draft_pool import UnifiedDraftMambaPool
-
-        clone = copy.copy(self)
-        # The clone's own storage: assigning through the shared one would
-        # rebind the target's.
-        clone.state = StateStorage.empty(self.state_sub_pool)
-        clone.state.slots = self.state.slots
-        clone.state.short_conv_pool = self.state.short_conv_pool
-        clone.state.ngram_pool = self.state.ngram_pool
-        clone.mamba_pool = UnifiedDraftMambaPool(
-            unified_buffer=self._unified_buffer,
-            sub_pool_name=self.state_sub_pool,
-            layer_lanes=layer_lanes,
+    def clone_with_new_mamba(self, **kwargs) -> HybridReqToTokenPool:
+        raise ValueError(
+            "--enable-unified-memory: a draft head with its own recurrent state "
+            "binds it through the target's fused draft placement"
         )
-        clone.mamba_map = {
-            layer_id: idx for idx, layer_id in enumerate(sorted(layer_lanes))
-        }
-        clone.mamba_ckpt_pool = None
-        return clone
+
+    def clear(self):
+        logger.info("Reset HybridReqToTokenPool")
+        # The state slots are the allocator's: `ChainAllocator.clear` resets them.
+        ReqToTokenPool.clear(self)
+        self.req_index_to_mamba_index_mapping.zero_()
+        if self.enable_mamba_extra_buffer:
+            self.req_index_to_mamba_ping_pong_track_buffer_mapping.zero_()
 
 
 class UnifiedHybridLinearKVPool(HybridLinearKVPool):
@@ -1278,20 +1220,20 @@ def _wire_mamba_slot_allocator(
     *,
     mamba_end,
     take: Callable[[int], Optional[torch.Tensor]],
-    req_to_token_pool,
+    state: StateStorage,
     device,
 ) -> UnifiedMambaSlotAllocator:
     """Install Mamba slot allocation, host capacities, and transfer translation."""
+    state_pool = state.pool
     slot_allocator = UnifiedMambaSlotAllocator(
         mamba_end,
-        max_size=req_to_token_pool._shared_mamba_size,
+        max_size=state_pool.size,
         device=device,
         take=take,
     )
-    req_to_token_pool.mamba_allocator = slot_allocator
-    state_pool = req_to_token_pool.mamba_pool
+    state.slots = slot_allocator
     state_pool.host_transfer_translate = slot_allocator.translate
-    state_pool.host_capacity_tokens = req_to_token_pool._shared_mamba_size
+    state_pool.host_capacity_tokens = state_pool.size
     state_pool.host_capacity_bytes = (
         state_pool.host_capacity_tokens * mamba_end.entry_bytes
     )

@@ -1015,12 +1015,12 @@ class TestTriFactorySizing(unittest.TestCase):
                         lazy_compaction=lazy_compaction,
                     )
                     with get_parallel().override(attn_dcp_size=1):
-                        pool = build_test_unified_pools(**kw).req_to_token_pool
+                        bundle = build_test_unified_pools(**kw)
+                    pool = bundle.req_to_token_pool
+                    allocator = bundle.token_to_kv_pool_allocator.state_slots
                     if lazy_compaction is None:
-                        pool = SimpleNamespace(
-                            mamba_allocator=MambaSlotAllocator(16, "cpu")
-                        )
-                    allocator = pool.mamba_allocator
+                        pool = SimpleNamespace()
+                        allocator = MambaSlotAllocator(16, "cpu")
                     available = allocator.available_size()
                     count = sum(i != -1 for i in ids)
                     live = allocator.alloc(count + 1)
@@ -1166,14 +1166,15 @@ class TestTriFactorySizing(unittest.TestCase):
                             )
                             pool = bundle.req_to_token_pool
                         self.assertEqual(pool.enable_mamba_extra_buffer_lazy, lazy)
-                        allocator = pool.mamba_allocator
+                        state = bundle.token_to_kv_pool_allocator.state
+                        allocator = state.slots
                         initial_available = allocator.available_size()
                         req = SimpleNamespace(
                             kv=SimpleNamespace(
                                 req_pool_idx=0, mamba_pool_idx=allocator.alloc(1)[0]
                             )
                         )
-                        pool._alloc_ping_pong_buffer(req)
+                        self.assertTrue(state.alloc_ping_pong_buffer(pool, req))
                         buf = req.kv.mamba_ping_pong_track_buffer
                         self.assertEqual(int((buf != -1).sum()), 1 if lazy else 2)
                         if lazy:
@@ -1189,7 +1190,7 @@ class TestTriFactorySizing(unittest.TestCase):
                         with patch.object(
                             allocator, "free", wraps=allocator.free
                         ) as free:
-                            pool.free_mamba_cache(req, 1 if keep_checkpoint else None)
+                            state.release(pool, req, 1 if keep_checkpoint else None)
                             for call in free.call_args_list:
                                 self.assertTrue(bool((call.args[0] >= 0).all()))
                         self.assertEqual(
@@ -1222,11 +1223,13 @@ class TestTriFactorySizing(unittest.TestCase):
                     max_mamba_cache_size=16,
                 )
                 with get_parallel().override(attn_dcp_size=1):
-                    pool = build_test_unified_pools(**kw).req_to_token_pool
+                    bundle = build_test_unified_pools(**kw)
+                pool = bundle.req_to_token_pool
+                state = bundle.token_to_kv_pool_allocator.state
                 mapping = pool.req_index_to_mamba_ping_pong_track_buffer_mapping
-                allocator = pool.mamba_allocator
+                allocator = state.slots
                 reqs = [SimpleNamespace(kv=ReqKvInfo()) for _ in range(3)]
-                rows = acquire(pool, pool.state, reqs)
+                rows = acquire(pool, state, reqs)
 
                 def buffers():
                     return [
@@ -1316,24 +1319,26 @@ class TestTriFactorySizing(unittest.TestCase):
             counts={"mamba": [1, 1]}, regions={"mamba": region}
         )
 
-    def test_fused_draft_state_clone_shares_the_request_slot_space(self):
-        """A draft runner's req pool over the fused state block keeps the
-        target's request->slot mappings and slot allocator (the draft's slot
-        ids ARE the target's), and views only its own block."""
+    def test_fused_draft_state_shares_the_target_slots(self):
+        """A draft runner's state over the fused state block keeps the
+        target's slot allocator (the draft's slot ids ARE the target's), and
+        views only its own block, keyed by the runner's layer ids."""
+        from sglang.srt.mem_cache.unified_draft_pool import fused_draft_state
+
         bundle = build_test_unified_pools(
             **self._factory_kwargs(fused_draft=self._state_placement())
         )
-        target = bundle.req_to_token_pool
-        clone = target.clone_for_fused_draft(layer_lanes={1: 1})
-        self.assertIs(
-            clone.req_index_to_mamba_index_mapping,
-            target.req_index_to_mamba_index_mapping,
+        target = bundle.token_to_kv_pool_allocator.state
+        draft = fused_draft_state(
+            target=target,
+            unified_buffer=bundle.unified_memory_pool,
+            layer_lanes={1: 1},
         )
-        self.assertIs(clone.mamba_allocator, target.mamba_allocator)
-        self.assertIs(clone.req_to_token, target.req_to_token)
-        self.assertEqual(clone.mamba_map, {1: 0})
-        conv = clone.mamba_pool.mamba2_layer_cache(clone.mamba_map[1]).conv[0]
-        self.assertEqual(tuple(conv.shape), (target.mamba_pool.size + 1, 3, 8))
+        self.assertEqual(draft.sub_pool, target.sub_pool)
+        self.assertIs(draft.slots, target.slots)
+        self.assertEqual(draft.layer_map, {1: 0})
+        conv = draft.pool.mamba2_layer_cache(draft.layer_map[1]).conv[0]
+        self.assertEqual(tuple(conv.shape), (target.pool.size + 1, 3, 8))
         draft_conv, _ = bundle.unified_memory_pool.build_draft_state_views("mamba")
         self.assertEqual(conv.data_ptr(), draft_conv[0][1].data_ptr())
 

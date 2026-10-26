@@ -370,7 +370,7 @@ class TestFixedPrefillMemoryBudget(unittest.TestCase):
         setup_allocator_context()
         self.addCleanup(reset_context)
         bundle, allocator, cache = build_tri_cache(state_cache=False)
-        states = bundle.req_to_token_pool.mamba_allocator.alloc(8)
+        states = allocator.state_slots.alloc(8)
         slots = allocator.alloc(96)
         self.assertIsNotNone(states)
         self.assertIsNotNone(slots)

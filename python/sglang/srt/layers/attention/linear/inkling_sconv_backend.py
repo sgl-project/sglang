@@ -570,7 +570,7 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
         if mamba_track_indices is not None:
             mamba_track_indices = self._translate_mamba_indices(mamba_track_indices)
         scatter_mamba_states_after_mtp_verify(
-            pool.get_speculative_mamba2_params_all_layers(),
+            self.state_pool.get_speculative_mamba2_params_all_layers(),
             slot_ids,
             last_correct_step_indices,
             mamba_track_indices,

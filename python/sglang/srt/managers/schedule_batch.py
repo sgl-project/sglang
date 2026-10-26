@@ -2337,7 +2337,7 @@ def set_mamba_track_indices_from_reqs(
     mapping = batch.req_to_token_pool.req_index_to_mamba_ping_pong_track_buffer_mapping
     if track_positions is None:
         # Guard: mamba_next_track_idx may be None for requests that haven't
-        # gone through _alloc_ping_pong_buffer yet (e.g., spec v2 verify path).
+        # been given a ping-pong buffer yet (e.g., spec v2 verify path).
         # Keep the gather in bounds for those requests. Freed rows are
         # invalidated below so they cannot scatter into a recycled slot.
         track_positions = [

@@ -101,7 +101,7 @@ class TestMambaCapacity(unittest.TestCase):
                 # Consume the live slot, then allocate tracking buffers using production code.
                 pool.mamba_allocator.alloc(1)
                 if extra_buffer:
-                    pool._alloc_ping_pong_buffer(req)
+                    self.assertTrue(pool.state.alloc_ping_pong_buffer(pool, req))
                     buf = req.kv.mamba_ping_pong_track_buffer
                     self.assertEqual(int((buf >= 0).sum()), expected)
                     if lazy:
