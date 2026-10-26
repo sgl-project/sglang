@@ -344,6 +344,7 @@ mod tests {
                 is_disaggregation: false,
                 mm_limits: Default::default(),
                 metadata: CoreMetadata::from(server_args.as_ref()),
+                metrics: None,
             },
         );
         (
@@ -354,6 +355,7 @@ mod tests {
                 ),
                 server_args,
                 chat_formatter: None,
+                generate_hook: None,
             }),
             intake_rx,
             abort_rx,

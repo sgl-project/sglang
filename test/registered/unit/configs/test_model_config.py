@@ -216,6 +216,25 @@ class TestExternalModelConfig(CustomTestCase):
         self.assertTrue(external.is_multimodal_breakable_cuda_graph_supported)
 
 
+class TestReasoningTokenFields(CustomTestCase):
+    def test_present_without_a_reasoning_parser(self):
+        """Every generated token reads these; only a configured reasoning parser fills
+        them, so a server without one must still find them defined."""
+        with TemporaryDirectory() as checkpoint:
+            LlamaConfig(
+                architectures=["LlamaForCausalLM"],
+                hidden_size=64,
+                intermediate_size=128,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                num_key_value_heads=2,
+                vocab_size=128,
+            ).save_pretrained(checkpoint)
+            config = ModelConfig(model_path=checkpoint)
+        self.assertIsNone(config.think_end_ids)
+        self.assertIsNone(config.self_opened_think_start_ids)
+
+
 class TestDecisionCheckpointConfig(CustomTestCase):
     def _checkpoint(self, directory, **decision):
         Qwen3_5Config(architectures=["Qwen3_5Model"]).save_pretrained(directory)

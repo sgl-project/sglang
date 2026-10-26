@@ -217,10 +217,12 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
         "joyai-echo",
         "lightricks/ltx-2",
         "lightricks/ltx-2.3",
+        "lightricks/ltx-2.5-diffusers",
         "meituan-longcat/longcat-image",
         "meituan-longcat/longcat-image-edit-turbo",
         "ltx-2",
         "ltx-2.3",
+        "ltx-2.5-diffusers",
         "minimax-h3",
         "minimaxai/minimax-h3",
         "inclusionai/ming-image-0.1-design",
@@ -663,6 +665,13 @@ class ServerArgs(DisaggServerArgsMixin):
     @property
     def broker_port(self) -> int:
         return self.port + 1
+
+    @property
+    def progress_endpoint(self) -> str | None:
+        # replica drivers send video progress here; ipc only reaches this node
+        if self.port is None or self.disagg_role != RoleType.MONOLITHIC:
+            return None
+        return f"ipc://{tempfile.gettempdir()}/sglang-diffusion-progress-{self.port}"
 
     def _adjust_path(self):
         expand_path_fields(self)
