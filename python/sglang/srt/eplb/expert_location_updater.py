@@ -29,9 +29,9 @@ from sglang.srt.eplb.expert_location import (
 from sglang.srt.hardware_backend.npu.eplb import (
     ExpertWeightStaging,
     create_temp_buffers,
+    execute_p2p_ops,
     filter_unchanged_layers,
     get_eplb_device_group,
-    stage_p2p_ops,
 )
 from sglang.srt.runtime_context import get_device
 from sglang.srt.utils import get_bool_env_var
@@ -517,12 +517,7 @@ def update_expert_weights_single_layer(
                 if eid in ops_by_expert:
                     batch_ops.extend(ops_by_expert[eid])
             if batch_ops:
-                batch_ops, receive_copies = stage_p2p_ops(batch_ops)
-                reqs = torch.distributed.batch_isend_irecv(batch_ops)
-                for req in reqs:
-                    req.wait()
-                for target, buffer in receive_copies:
-                    target.copy_(buffer)
+                execute_p2p_ops(batch_ops)
 
     def _execute_buffer2weight_copies(buffer2weight_copy_infos):
         for (

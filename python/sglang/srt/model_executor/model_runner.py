@@ -76,7 +76,7 @@ from sglang.srt.eplb.expert_location import (
     set_global_expert_location_metadata,
 )
 from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
-from sglang.srt.hardware_backend.npu.eplb import expert_distribution_recording_context
+from sglang.srt.hardware_backend.npu.eplb import isolate_npu_draft_recording
 from sglang.srt.kv_canary.api import install_canary
 from sglang.srt.kv_canary.runner.canary_manager import context_tuple
 from sglang.srt.kv_canary.token_oracle.install import install_token_oracle_from_env
@@ -1170,6 +1170,7 @@ class ModelRunner:
         self.sampling_prewarm_result = SamplingPrewarmResult()
         return self.sampling_prewarm_result
 
+    @isolate_npu_draft_recording
     def init_cuda_graphs(self, capture_decode_cuda_graph: bool = True):
         # from sglang.srt.layers.moe.utils import get_moe_runner_backend
 
@@ -1192,15 +1193,14 @@ class ModelRunner:
         )
         if is_scale_joiner:
             self._validate_elastic_cuda_graph_recapture()
-        with expert_distribution_recording_context(self.is_draft_worker):
-            capture = capture_cuda_graphs(
-                model_runner=self,
-                capture_decode_cuda_graph=(
-                    capture_decode_cuda_graph and not defer_decode_capture
-                ),
-                finalize=not defer_decode_capture,
-                defer_distributed_setup=defer_decode_capture,
-            )
+        capture = capture_cuda_graphs(
+            model_runner=self,
+            capture_decode_cuda_graph=(
+                capture_decode_cuda_graph and not defer_decode_capture
+            ),
+            finalize=not defer_decode_capture,
+            defer_distributed_setup=defer_decode_capture,
+        )
         self.eager_runner = capture.eager_runner
         self.prefill_cuda_graph_runner = capture.prefill.runner
         self.decode_cuda_graph_runner = capture.decode.runner
@@ -1606,10 +1606,10 @@ class ModelRunner:
         """Return the model layers used by prefill CUDA graph execution."""
         return compute_attention_and_moe_layers(layer_model)
 
+    @isolate_npu_draft_recording
     def init_decode_cuda_graph(self):
         self.decode_cuda_graph_runner = None
-        with expert_distribution_recording_context(self.is_draft_worker):
-            capture = capture_decode_graph(model_runner=self)
+        capture = capture_decode_graph(model_runner=self)
         self.decode_cuda_graph_runner = capture.runner
         self.graph_memory_usage = replace_graph_memory_usage(
             self.graph_memory_usage,
@@ -1680,14 +1680,14 @@ class ModelRunner:
 
         self.init_decode_cuda_graph()
 
+    @isolate_npu_draft_recording
     def init_prefill_cuda_graph(self, force_for_draft_worker: bool = False):
         self.prefill_cuda_graph_runner = None
-        with expert_distribution_recording_context(self.is_draft_worker):
-            capture = capture_prefill_graph(
-                model_runner=self,
-                eager_runner=self.eager_runner,
-                force_for_draft_worker=force_for_draft_worker,
-            )
+        capture = capture_prefill_graph(
+            model_runner=self,
+            eager_runner=self.eager_runner,
+            force_for_draft_worker=force_for_draft_worker,
+        )
         self.prefill_cuda_graph_runner = capture.runner
         self.graph_memory_usage = replace_graph_memory_usage(
             self.graph_memory_usage,
@@ -1816,6 +1816,7 @@ class ModelRunner:
         forward_batch.split_index = next_split_index
         return ret
 
+    @isolate_npu_draft_recording
     def forward(
         self,
         forward_batch: ForwardBatch,
@@ -1858,7 +1859,6 @@ class ModelRunner:
         with (
             canary_ctx,
             step_span_ctx,
-            expert_distribution_recording_context(self.is_draft_worker),
             get_global_expert_distribution_recorder().with_forward_pass(
                 self.forward_pass_id,
                 forward_batch,

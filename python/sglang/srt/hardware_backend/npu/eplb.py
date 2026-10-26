@@ -14,8 +14,8 @@
 
 """Ascend EPLB communication, weight staging and draft-recording helpers."""
 
-import contextlib
 import logging
+from functools import wraps
 
 import torch
 import torch.distributed as dist
@@ -53,11 +53,8 @@ def get_eplb_device_group():
     return _device_group
 
 
-def stage_p2p_ops(ops):
-    """Stage internal-format views through ND buffers for HCCL.
-
-    Received values are copied back into the original views after completion.
-    """
+def execute_p2p_ops(ops):
+    """Complete one P2P batch, staging internal NPU views through ND buffers."""
     staged_ops, receive_copies = [], []
     for op in ops:
         tensor = op.tensor
@@ -69,7 +66,10 @@ def stage_p2p_ops(ops):
                 receive_copies.append((tensor, buffer))
             op = P2POp(op.op, buffer, op.peer, op.group, op.tag)
         staged_ops.append(op)
-    return staged_ops, receive_copies
+    for request in dist.batch_isend_irecv(staged_ops):
+        request.wait()
+    for target, buffer in receive_copies:
+        target.copy_(buffer)
 
 
 def needs_nd_staging(tensor):
@@ -123,12 +123,18 @@ class ExpertWeightStaging:
                 weight.copy_(buffer)
 
 
-def expert_distribution_recording_context(is_draft_worker):
-    """Only NPU draft forwards/captures must disable the target EPLB recorder."""
-    if is_draft_worker and get_device().device == "npu":
-        from sglang.srt.eplb.expert_distribution import (
-            get_global_expert_distribution_recorder,
-        )
+def isolate_npu_draft_recording(forward):
+    """Keep target EPLB statistics untouched throughout an NPU draft operation."""
 
-        return get_global_expert_distribution_recorder().disable_this_region()
-    return contextlib.nullcontext()
+    @wraps(forward)
+    def wrapped(runner, *args, **kwargs):
+        if runner.is_draft_worker and get_device().device == "npu":
+            from sglang.srt.eplb.expert_distribution import (
+                get_global_expert_distribution_recorder,
+            )
+
+            with get_global_expert_distribution_recorder().disable_this_region():
+                return forward(runner, *args, **kwargs)
+        return forward(runner, *args, **kwargs)
+
+    return wrapped
