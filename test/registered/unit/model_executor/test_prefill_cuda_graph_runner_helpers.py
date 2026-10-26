@@ -221,10 +221,10 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
                 if lengths == [8]:
                     holder = qwen4_exp._BreakablePLEBatch()
                     qwen4_exp._breakable_prepare_ple_batch(
-                        holder,
                         input_ids=torch.arange(8),
                         ngram_size=None,
                         ngram_eos_token_id=None,
+                        holder=holder,
                     )
                 else:
                     for replay in capture.cuda_graph._break_fns:

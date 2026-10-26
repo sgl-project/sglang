@@ -197,7 +197,7 @@ class _BreakablePLEBatch:
 
 @eager_on_graph(True)
 def _breakable_prepare_ple_batch(
-    holder: _BreakablePLEBatch, input_ids, *, ngram_size, ngram_eos_token_id
+    input_ids, *, ngram_size, ngram_eos_token_id, holder: _BreakablePLEBatch
 ):
     holder.batch = _prepare_ple_batch(
         input_ids=input_ids,
@@ -2089,10 +2089,10 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         if breakable_ple:
             ple_batch = _BreakablePLEBatch()
             _breakable_prepare_ple_batch(
-                ple_batch,
                 input_ids=input_ids,
                 ngram_size=self.ple_ngram_size,
                 ngram_eos_token_id=self.ple_ngram_eos_token_id,
+                holder=ple_batch,
             )
         elif self.has_ple:
             ple_batch = _prepare_ple_batch(

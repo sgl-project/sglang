@@ -58,7 +58,7 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
         from sglang.srt.models import qwen4_exp
 
         context = SimpleNamespace(forward_batch=SimpleNamespace(rows=8))
-        layer = SimpleNamespace(_qsa_prefill_topk_bridges=[])
+        layer = SimpleNamespace()
         layer._compute_qsa_topk_indices_eager = (
             lambda hidden_states, forward_batch, **kw: hidden_states[
                 : forward_batch.rows
