@@ -14,9 +14,9 @@ class ModelDeploymentConfig:
     dit_layerwise_offload_modes: tuple[Literal["auto", "memory"], ...] = ()
     auto_dit_offload_prefetch_size: float | None = None
     keep_resident_min_available_gb: float | None = None
-    # Per-model resident defaults. Auto mode additionally keeps an image DiT
-    # resident above the image workload memory threshold; video DiT placement
-    # stays with the model's FSDP/layerwise policy.
+    # Fallback residency for offline/no-warmup deployments. Eligible server
+    # warmup paths start load-safe and replace these coarse thresholds with a
+    # measured per-phase placement plan before reporting ready.
     keep_resident_components: tuple[OffloadComponentName, ...] = ("vae",)
     fsdp_auto_min_available_memory_gb: float | None = None
     fsdp_auto_requires_cfg: bool = True
