@@ -107,6 +107,9 @@ class RolloutResponse(BaseModel):
     seed: int
 
     generated_output: Any = None
+    # This sample's waveform, for pipelines that also decode audio.
+    generated_audio: Any = None
+    audio_sample_rate: Optional[int] = None
 
     rollout_log_probs: Optional[dict[str, Any]] = None
     rollout_debug_tensors: Optional[dict[str, Any]] = None
