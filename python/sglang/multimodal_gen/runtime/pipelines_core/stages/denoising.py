@@ -2564,6 +2564,19 @@ class DenoisingStage(PipelineStage):
             return padder(call_kwargs, current_model, buckets)
         return bcg_utils.pad_masked_prompt_kwargs(call_kwargs, buckets)
 
+    def drop_breakable_cuda_graphs(self, reason: str) -> None:
+        """Disable graphs whose weights changed after capture; serving never re-captures."""
+        dropped = sum(len(runner.entries) for runner in self._bcg_runners.values())
+        for runner in self._bcg_runners.values():
+            runner.reset(disabled_reason=reason)
+        if dropped:
+            logger.warning(
+                "[Diffusion BCG] %s after capture: dropped %d graph(s); "
+                "requests run eager until restart.",
+                reason,
+                dropped,
+            )
+
     def _maybe_get_bcg_runner(self, current_model):
         """Return (lazily creating) the breakable CUDA graph runner for
         ``current_model``, or ``None`` if BCG is disabled / inapplicable.

@@ -4,8 +4,8 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.layers.moe.paged_experts import PagedExpertsMoEMethod
-from sglang.srt.layers.moe.paged_experts.formats import ExpertFormat, UnquantizedFormat
+from sglang.srt.layers.moe.paged_experts import PagedExpertsMoEMethod, formats
+from sglang.srt.layers.moe.paged_experts.formats import UnquantizedFormat, after_loading
 from sglang.srt.layers.moe.paged_experts.method import (
     _cap_decode_capture_batch_sizes,
     check_paged_experts_compat,
@@ -15,10 +15,19 @@ from sglang.srt.layers.moe.paged_experts.residency import (
     LRUPolicy,
     plan_waves,
 )
-from sglang.srt.layers.moe.paged_experts.runners import MarlinContract, TritonContract
+from sglang.srt.layers.moe.paged_experts.runners import (
+    MARLIN,
+    TRITON,
+    MarlinContract,
+    TritonContract,
+    contract_for,
+)
 from sglang.srt.layers.moe.paged_experts.store import HostExpertStore
 from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
 from sglang.srt.layers.moe.topk import StandardTopKOutput
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    breakable_cuda_graph,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -48,6 +57,9 @@ class _LinearMoE:
         )
         y = torch.einsum("tji,tjio->tjo", y, layer.w2_weight[ids])
         return SimpleNamespace(hidden_states=(w * valid).unsqueeze(-1) * y)
+
+    def create_moe_runner(self, layer, moe_runner_config):
+        pass
 
     def process_weights_after_loading(self, layer):
         pass
@@ -93,29 +105,17 @@ def _step(num_tokens, padded=False):
     )
 
 
-def _paged_layer(contract=CONTRACTS[0], extra_params=(), load=True):
-    """A paged method over random experts, its layer created through the base method on a CPU
-    store; ``load`` fills the store with the experts and runs the post-load step."""
-    torch.manual_seed(0)
-    full = {name: torch.randn(E, H, H) for name in ("w13_weight", "w2_weight")}
+_METHOD = "sglang.srt.layers.moe.paged_experts.method."
 
-    class _Base(_LinearMoE):
-        def create_weights(self, layer, num_experts, **kwargs):
-            for name in ("w13_weight", "w2_weight", *extra_params):
-                param = torch.nn.Parameter(
-                    torch.zeros(num_experts, H, H), requires_grad=False
-                )
-                param.quant_method = "block"
-                layer.register_parameter(name, param)
 
-    expert_format = UnquantizedFormat()
-    expert_format.contract = contract
-    method = PagedExpertsMoEMethod(
-        base_method=_Base(), expert_format=expert_format, num_experts=E, num_resident=K
-    )
-    layer = torch.nn.Module()
-    layer.weight_load_method = None
-    with patch("sglang.srt.layers.moe.paged_experts.method.HostExpertStore", _CpuStore):
+def _create(method, layer, contract):
+    """Create the base method's expert tensors and runner as FusedMoE does, on a CPU store,
+    with ``contract`` for the runner."""
+    with (
+        patch(_METHOD + "HostExpertStore", _CpuStore),
+        patch(_METHOD + "runner_config", side_effect=lambda config, num_slots: config),
+        patch(_METHOD + "contract_for", return_value=contract),
+    ):
         method.create_weights(
             layer=layer,
             num_experts=E,
@@ -123,10 +123,48 @@ def _paged_layer(contract=CONTRACTS[0], extra_params=(), load=True):
             intermediate_size_per_partition=H,
             params_dtype=torch.float32,
         )
+        method.create_moe_runner(layer, SimpleNamespace(routed_scaling_factor=None))
+
+
+def _load(method, layer):
+    with patch.object(formats, "HostExpertStore", _CpuStore):
+        method.process_weights_after_loading(layer)
+
+
+def _paged_layer(
+    contract=CONTRACTS[0], extra_params=(), global_params=(), freed=(), load=True
+):
+    """A paged method over random experts, its layer created through the base method on a CPU
+    store; ``load`` fills the store with the experts and runs the post-load step."""
+    torch.manual_seed(0)
+    full = {
+        name: torch.randn(E, H, H)
+        for name in ("w13_weight", "w2_weight", *extra_params)
+    }
+
+    class _Base(_LinearMoE):
+        def create_weights(self, layer, num_experts, **kwargs):
+            for name in ("w13_weight", "w2_weight", *extra_params, *global_params):
+                param = torch.nn.Parameter(
+                    torch.full((num_experts, H, H), 0.5), requires_grad=False
+                )
+                param.quant_method = "block"
+                if name in global_params:
+                    param._sglang_require_global_experts = True
+                layer.register_parameter(name, param)
+
+    expert_format = UnquantizedFormat()
+    expert_format.freed = freed
+    method = PagedExpertsMoEMethod(
+        base_method=_Base(), expert_format=expert_format, num_experts=E, num_resident=K
+    )
+    layer = torch.nn.Module()
+    layer.weight_load_method = None
+    _create(method, layer, contract)
     if load:
         for name, t in full.items():
             method.store.host[name].copy_(t)
-        method.process_weights_after_loading(layer)
+        _load(method, layer)
     return method, layer, SimpleNamespace(**full)
 
 
@@ -134,8 +172,9 @@ class TestPagedForward(CustomTestCase):
     def test_matches_unpaged(self):
         """Consecutive steps (which reuse and evict residents), in one wave (1, 2 tokens) or
         several (64 tokens), with and without padded entries: each output equals the unpaged
-        layer, the slots hold the resident experts, and no wave computes the entries of
-        another (without compaction, every wave would compute all of them)."""
+        layer, the slots hold the resident experts in every per-expert tensor (here also a
+        bias the kernel ignores), and no wave computes the entries of another (without
+        compaction, every wave would compute all of them)."""
         for contract in CONTRACTS:
             for num_tokens, padded in ((1, False), (2, False), (64, False), (3, True)):
                 with self.subTest(
@@ -143,30 +182,100 @@ class TestPagedForward(CustomTestCase):
                     num_tokens=num_tokens,
                     padded=padded,
                 ):
-                    method, layer, full = _paged_layer(contract)
+                    method, layer, full = _paged_layer(
+                        contract, extra_params=("w2_weight_bias",)
+                    )
                     for _ in range(8):
                         d = _step(num_tokens, padded=padded)
                         method.base_method.rows = 0
                         out = method.apply(layer=layer, dispatch_output=d).hidden_states
                         torch.testing.assert_close(out, _reference(full, d))
-                        for expert, slot in method.policy.resident.items():
-                            torch.testing.assert_close(
-                                layer.w2_weight[slot],
-                                method.store.host["w2_weight"][expert],
-                            )
+                        for name, host in method.store.host.items():
+                            for expert, slot in method.policy.resident.items():
+                                torch.testing.assert_close(
+                                    getattr(layer, name)[slot], host[expert]
+                                )
                         self.assertLess(
                             method.base_method.rows, 2 * d.topk_output.topk_ids.numel()
                         )
 
+    def test_trims_a_runner_padded_hidden_dimension(self):
+        """A runner that pads the hidden dimension (e.g. MXFP4 Marlin) returns wider entries;
+        the output keeps the input's width, in one wave (1 token) or several (64)."""
+        for contract in CONTRACTS:
+            method, layer, full = _paged_layer(contract)
+            apply = method.base_method.apply
+            method.base_method.apply = lambda layer, dispatch_output: SimpleNamespace(
+                hidden_states=torch.nn.functional.pad(
+                    apply(layer, dispatch_output).hidden_states, (0, 3), value=7.0
+                )
+            )
+            for num_tokens in (1, 64):
+                d = _step(num_tokens)
+                out = method.apply(layer=layer, dispatch_output=d).hidden_states
+                torch.testing.assert_close(out, _reference(full, d))
+
+    def test_triton_waves_find_a_runner_the_scheme_owns(self):
+        """A method that delegates to a per-layer scheme (e.g. compressed-tensors FP8)
+        keeps its triton runner on the scheme, not on itself."""
+        method, layer, full = _paged_layer(CONTRACTS[1])
+        layer.scheme = SimpleNamespace(runner=method.base_method.runner)
+        method.base_method.runner = None
+        for num_tokens in (1, 64):
+            d = _step(num_tokens)
+            out = method.apply(layer=layer, dispatch_output=d).hidden_states
+            torch.testing.assert_close(out, _reference(full, d))
+
+    def test_capture_skips_the_waves_and_replay_runs_them(self):
+        """Breakable capture runs the break once, before any captured kernel has run, on
+        routing ids nothing has computed: the waves are skipped then, and replay runs them
+        on the ids the graph produced."""
+        method, layer, full = _paged_layer()
+        d = _step(4)
+        ids = torch.full_like(d.topk_output.topk_ids, 2**31 - 1)  # not computed yet
+        out = torch.empty_like(d.hidden_states)
+        resident = dict(method.policy.resident)
+        capture = SimpleNamespace(
+            _end_current_segment=lambda: None,
+            _barrier_fn=None,
+            cuda_graph=SimpleNamespace(_break_fns=[]),
+            _begin_new_segment=lambda: None,
+        )
+        device = SimpleNamespace(current_stream=lambda: SimpleNamespace(stream_id=0))
+        token = breakable_cuda_graph._current_capture_var.set(capture)
+        try:
+            with patch.object(
+                breakable_cuda_graph, "get_device_module", return_value=device
+            ):
+                method._run_eager_into(
+                    layer,
+                    d.hidden_states,
+                    d.topk_output.topk_weights,
+                    ids,
+                    None,
+                    out,
+                )
+        finally:
+            breakable_cuda_graph._current_capture_var.reset(token)
+        self.assertEqual(method.base_method.rows, 0)
+        self.assertEqual(dict(method.policy.resident), resident)
+
+        ids.copy_(d.topk_output.topk_ids)
+        (replay,) = capture.cuda_graph._break_fns
+        replay()
+        torch.testing.assert_close(out, _reference(full, d))
+
 
 class TestLoading(CustomTestCase):
     def test_rejects_post_load_weight_transform(self):
-        method, layer, _ = _paged_layer()
+        """Without a repack, host rows are paged verbatim: the post-load step must leave the
+        expert tensors as loaded."""
+        method, layer, _ = _paged_layer(TritonContract(), load=False)
         method.base_method.process_weights_after_loading = lambda layer: (
             layer.w2_weight.data.mul_(2)
         )
         with self.assertRaisesRegex(RuntimeError, "transforms w2_weight"):
-            method.process_weights_after_loading(layer)
+            _load(method, layer)
 
     def test_host_loader_follows_base_method_and_param_tags(self):
         """Host rows are loaded as natively: the layer's loader follows the wrapped method's
@@ -193,6 +302,37 @@ class TestLoading(CustomTestCase):
         )
         self.assertFalse(method.store.host["w2_weight"][8].any())
 
+    def test_host_store_starts_from_the_created_values(self):
+        """What a loader leaves unwritten (e.g. padding a kernel adds) holds the values the
+        base method created, as on the GPU, not uninitialized memory."""
+        method, _, _ = _paged_layer(load=False)
+        for host in method.store.host.values():
+            self.assertTrue((host == 0.5).all())
+
+    def test_stacked_checkpoint_goes_to_the_native_loader_as_called(self):
+        """A checkpoint tensor holding every expert (e.g. gpt-oss) goes, as called, to the
+        layer's native loader (fused for bf16, padded for MXFP4) on the whole host store; the
+        padding it leaves keeps the value the base method created."""
+        method, layer, _ = _paged_layer(load=False)
+        calls = []
+
+        def native(param, loaded_weight, weight_name, shard_id, *rest, **kwargs):
+            calls.append((tuple(param.shape), rest, kwargs))
+            param.data[..., : loaded_weight.shape[-1]].copy_(loaded_weight)
+
+        method.native_loader = native
+        stacked = torch.randn(E, H, H - 1)  # narrower, as into a padded parameter
+        loader = layer.w2_weight.weight_loader
+        loader(layer.w2_weight, stacked, "experts.w2_weight", "w2")
+        loader(
+            layer.w2_weight, stacked, weight_name="w2", shard_id=None, expert_id=None
+        )
+        self.assertEqual(
+            calls, [((E, H, H), (), {}), ((E, H, H), (), {"expert_id": None})]
+        )
+        self.assertTrue(torch.equal(method.store.host["w2_weight"][..., :-1], stacked))
+        self.assertTrue((method.store.host["w2_weight"][..., -1] == 0.5).all())
+
     def test_rejects_online_weight_updates(self):
         from sglang.srt.model_executor.model_runner_components.weight_updater import (
             _unsupported_derived_weight_cache_error,
@@ -204,55 +344,133 @@ class TestLoading(CustomTestCase):
             "--enable-paged-experts", _unsupported_derived_weight_cache_error(model)
         )
 
-    def test_rejects_undeclared_expert_params(self):
-        """A per-expert tensor the format does not declare would never reach the slots."""
-        with self.assertRaisesRegex(RuntimeError, "w13_weight_scale"):
-            _paged_layer(extra_params=("w13_weight_scale",), load=False)
+    def test_finds_the_per_expert_tensors_as_eplb_does(self):
+        """Every tensor with one row per expert is loaded into the host store, except those
+        sized for all experts, which stay whole on the GPU, and those the format frees."""
+        method, layer, _ = _paged_layer(
+            extra_params=("w13_weight_scale", "w13_blockscale_swizzled"),
+            global_params=("w13_input_scale",),
+            freed=("w13_blockscale_swizzled",),
+            load=False,
+        )
+        self.assertEqual(
+            method.checkpoint_params, ("w13_weight", "w2_weight", "w13_weight_scale")
+        )
+        self.assertEqual(set(method.store.host), set(method.checkpoint_params))
+        self.assertIsNone(layer.w13_blockscale_swizzled)
+
+    def _staged(self, layer, num_experts):
+        staged = _CpuStore(
+            layer=layer, names=("w13_weight",), num_experts=num_experts, pin=False
+        )
+        staged.host["w13_weight"].copy_(
+            torch.arange(num_experts * 6.0).reshape(num_experts, 6)
+        )
+        return staged
 
     def test_repack_runs_per_chunk_and_keeps_its_output(self):
-        """A post-load step that repacks each expert (new shape, new name) is applied to every
-        expert of the host store, K at a time; the slots then hold experts 0..K-1 repacked."""
+        """A post-load step that repacks each expert into a new tensor runs over every expert
+        of the host store, K at a time, each chunk from the layer's state before the first (a
+        step that skips once it has run still repacks every chunk); the tensors it leaves per
+        expert are paged, and the slots hold experts 0..K-1 repacked."""
 
         class _Repacking:
             def process_weights_after_loading(self, layer):
-                raw = layer.raw_weight.data
-                packed = (raw * 10 + 1).reshape(raw.shape[0], 2, -1)  # per expert
+                if getattr(layer, "converted", False):  # e.g. is_marlin_converted
+                    return
+                layer.converted = True
+                raw = layer.w13_weight.data
+                packed = (raw * 10 + 1).reshape(raw.shape[0], 2, -1)
+                del layer.w13_weight
                 layer.register_parameter(
-                    "packed_weight", torch.nn.Parameter(packed, requires_grad=False)
+                    "w13_qweight", torch.nn.Parameter(packed, requires_grad=False)
                 )
-
-        class _RepackFormat(ExpertFormat):
-            checkpoint_params = ("raw_weight",)
-            paged_params = ("packed_weight",)
-            repacks_after_loading = True
-
-            @classmethod
-            def supports(cls, base_method):
-                return True
 
         layer = torch.nn.Module()
         layer.register_parameter(
-            "raw_weight", torch.nn.Parameter(torch.zeros(K, 6), requires_grad=False)
+            "w13_weight", torch.nn.Parameter(torch.zeros(K, 6), requires_grad=False)
         )
-        fmt = _RepackFormat()
-        staged = _CpuStore(
-            layer=layer,
-            names=fmt.checkpoint_params,
-            num_experts=E + 1,  # a partial last chunk
-            pin=False,
-        )
-        staged.host["raw_weight"].copy_(torch.arange((E + 1) * 6.0).reshape(E + 1, 6))
-
-        with patch(
-            "sglang.srt.layers.moe.paged_experts.formats.HostExpertStore", _CpuStore
-        ):
-            packed = fmt.after_loading(
-                layer=layer, base_method=_Repacking(), store=staged, num_slots=K
+        staged = self._staged(layer, E + 1)  # a partial last chunk
+        with patch.object(formats, "HostExpertStore", _CpuStore):
+            packed = after_loading(
+                layer, _Repacking(), staged, num_slots=K, repacks=True, unpaged=()
             )
 
-        expected = (staged.host["raw_weight"] * 10 + 1).reshape(E + 1, 2, 3)
-        self.assertTrue(torch.equal(packed.host["packed_weight"], expected))
-        self.assertTrue(torch.equal(layer.packed_weight.data, expected[:K]))
+        expected = (staged.host["w13_weight"] * 10 + 1).reshape(E + 1, 2, 3)
+        self.assertEqual(
+            list(packed.host), ["w13_qweight"]
+        )  # not the deleted w13_weight
+        self.assertTrue(torch.equal(packed.host["w13_qweight"], expected))
+        self.assertTrue(torch.equal(layer.w13_qweight.data, expected[:K]))
+
+    def test_a_short_last_chunk_is_padded_with_experts(self):
+        """With E % K != 0, the rows past the last chunk hold a real expert's weights and scales,
+        not what the base method created (torch.empty): NVFP4A16's post-load step checks that
+        every row's gate and up share one global scale, and passes on a valid checkpoint."""
+        from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_w4a16_nvfp4_moe import (
+            CompressedTensorsW4A16Nvfp4MoE,
+        )
+
+        scheme = CompressedTensorsW4A16Nvfp4MoE()
+        layer = torch.nn.Module()
+        layer.moe_runner_config = SimpleNamespace(is_gated=True)
+        scheme.create_weights(
+            layer,
+            num_experts=K,
+            hidden_size=128,
+            intermediate_size_per_partition=64,
+            params_dtype=torch.bfloat16,
+        )
+        for param in layer.parameters():
+            if param.is_floating_point():
+                param.data.fill_(float("nan"))  # what torch.empty may hold
+        names = [name for name, _ in layer.named_parameters()]
+        staged = _CpuStore(layer=layer, names=names, num_experts=E + 1, pin=False)
+        for host in staged.host.values():  # a last chunk of 1 expert
+            if host.is_floating_point():
+                host.copy_(torch.rand(host.shape).add(0.5).to(host.dtype))
+            else:
+                host.copy_(torch.randint(0, 256, host.shape, dtype=host.dtype))
+        global_scale = staged.host["w13_weight_global_scale"]
+        global_scale[:, 1] = global_scale[:, 0]  # gate and up share it, as exported
+        with (
+            patch.object(formats, "HostExpertStore", _CpuStore),
+            patch(
+                "sglang.srt.layers.quantization.marlin_utils_fp4."
+                "prepare_moe_nvfp4_layer_for_marlin"
+            ),
+        ):
+            packed = after_loading(
+                layer, scheme, staged, num_slots=K, repacks=True, unpaged=()
+            )
+        self.assertTrue(
+            torch.equal(packed.host["w13_weight_scale_2"], 1 / global_scale[:, 0])
+        )
+        self.assertTrue(
+            torch.equal(packed.host["w13_weight"], staged.host["w13_weight_packed"])
+        )
+
+    def test_rejects_a_repack_that_mixes_experts(self):
+        """A post-load step that depends on the other experts of its chunk (here, their
+        mean) cannot run K at a time."""
+
+        class _Mixing:
+            def process_weights_after_loading(self, layer):
+                raw = layer.w13_weight.data
+                raw.sub_(raw.mean(0))
+
+        layer = torch.nn.Module()
+        layer.register_parameter(
+            "w13_weight", torch.nn.Parameter(torch.zeros(K, 6), requires_grad=False)
+        )
+        staged = self._staged(layer, E)
+        with (
+            patch.object(formats, "HostExpertStore", _CpuStore),
+            self.assertRaisesRegex(RuntimeError, "each expert on its own"),
+        ):
+            after_loading(
+                layer, _Mixing(), staged, num_slots=K, repacks=True, unpaged=()
+            )
 
 
 class TestResidency(CustomTestCase):
@@ -321,6 +539,33 @@ class TestDecodeCaptureCap(CustomTestCase):
     def test_only_shrinks_the_configured_sizes(self):
         self.assertEqual(self._capped([1, 2, 4], 16), ([1, 2, 4], 4))
         self.assertEqual(self._capped([1, 2, 4, 8], 3), ([1, 2, 3], 3))
+
+
+class TestFormats(CustomTestCase):
+    def test_every_format_resolves_its_method(self):
+        """Each format imports the method it handles (a moved class fails here, not at a
+        user's startup) and claims no other."""
+        for fmt in formats.FORMATS:
+            with self.subTest(fmt.__name__):
+                self.assertFalse(fmt.supports(object(), None))
+
+    def test_contract_follows_the_runner(self):
+        from sglang.srt.layers.moe.utils import MoeRunnerBackend
+
+        def runner(backend):
+            return SimpleNamespace(runner_backend=backend)
+
+        self.assertIs(contract_for(runner(MoeRunnerBackend.TRITON)), TRITON)
+        self.assertIs(contract_for(runner(MoeRunnerBackend.MARLIN)), MARLIN)
+        # These sum the top-k outputs inside the kernel, so waves cannot be exact.
+        for backend in (
+            MoeRunnerBackend.FLASHINFER_CUTLASS,
+            MoeRunnerBackend.TRITON_KERNELS,
+        ):
+            with self.assertRaisesRegex(RuntimeError, backend.value):
+                contract_for(runner(backend))
+        with self.assertRaisesRegex(RuntimeError, "triton or Marlin"):
+            contract_for(None)
 
 
 class TestCompat(CustomTestCase):
