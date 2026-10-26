@@ -18,6 +18,7 @@ from sglang.srt.layers import linear
 from sglang.srt.layers.moe.fused_moe_triton import layer as moe_layer
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.layers.quantization.npu_mxfp4 import Mxfp4W4A8Config
+from sglang.srt.model_loader.post_load import stage_module_for_post_load
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -322,6 +323,41 @@ class TestOnlineMXFP4Loading(unittest.TestCase):
         self.assertNotIn("w13_weight", self.snapshots)
         with self.assertRaisesRegex(RuntimeError, "not completely loaded"):
             method.process_weights_after_loading(layer)
+
+    def test_prepared_weights_survive_post_load_device_staging_without_copy(self):
+        for is_moe in (False, True):
+            with self.subTest(is_moe=is_moe):
+                if is_moe:
+                    layer, method = self.moe(fused=True)
+                    for prefix, shape in (
+                        ("w13", (2, 256, 64)),
+                        ("w2", (2, 64, 128)),
+                    ):
+                        param = getattr(layer, f"{prefix}_weight")
+                        param.weight_loader(
+                            param,
+                            torch.ones(shape, dtype=torch.bfloat16),
+                            f"{prefix}_weight",
+                            prefix,
+                        )
+                else:
+                    layer, method = self.dense()
+                    layer.weight.weight_loader(
+                        layer.weight, torch.ones(8, 64, dtype=torch.bfloat16)
+                    )
+                prepared = {
+                    name: param.data_ptr() for name, param in layer.named_parameters()
+                }
+                with patch.object(
+                    torch.Tensor,
+                    "copy_",
+                    side_effect=AssertionError("unexpected copy_"),
+                ):
+                    with stage_module_for_post_load(layer, torch.device("cpu:0")):
+                        method.process_weights_after_loading(layer)
+                for name, param in layer.named_parameters():
+                    self.assertEqual(param.dtype, torch.uint8)
+                    self.assertEqual(param.data_ptr(), prepared[name])
 
     def test_moe_fused_loader_and_bias_allocation(self):
         layer, method = self.moe(fused=True, with_bias=True)
