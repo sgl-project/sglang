@@ -6,7 +6,8 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from sglang.srt.eplb import eplb_manager
-from sglang.srt.hardware_backend.npu import eplb as npu_eplb
+from sglang.srt.hardware_backend.npu import eplb_manager as npu_eplb
+from sglang.srt.hardware_backend.npu.eplb_manager import NpuEPLBManager
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -52,7 +53,7 @@ class TestNpuInitialRebalance(unittest.TestCase):
                         return_value=value,
                     )
                 )
-            return eplb_manager.EPLBManager(
+            return NpuEPLBManager(
                 model_config=SimpleNamespace(),
                 get_model=lambda: None,
                 get_expert_location_updater=lambda: None,

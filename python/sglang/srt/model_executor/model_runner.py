@@ -779,8 +779,13 @@ class ModelRunner:
             init_lplb_solvers(model_config=self.model_config)
 
     def maybe_init_eplb_manager(self):
+        manager_cls = EPLBManager
+        if self.device == "npu":
+            from sglang.srt.hardware_backend.npu.eplb_manager import NpuEPLBManager
+
+            manager_cls = NpuEPLBManager
         self.eplb_manager = (
-            EPLBManager(
+            manager_cls(
                 model_config=self.model_config,
                 get_model=lambda: self.model,
                 get_expert_location_updater=lambda: self.expert_location_updater,

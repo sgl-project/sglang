@@ -12,7 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 
-"""Ascend EPLB communication, weight staging and initial scheduling helpers."""
+"""Ascend EPLB communication, weight staging and draft-recording helpers."""
 
 import contextlib
 import logging
@@ -21,7 +21,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed import P2POp
 
-from sglang.srt.runtime_context import get_device, get_exec, get_parallel
+from sglang.srt.runtime_context import get_device
 
 logger = logging.getLogger(__name__)
 _group_world = None
@@ -79,26 +79,6 @@ def needs_nd_staging(tensor):
     import torch_npu
 
     return torch_npu.get_npu_format(tensor) not in (0, 2)
-
-
-def get_initial_rebalance_iterations(steady_iterations):
-    """Use a short first window only for single-node trivial NPU placement."""
-    moe = get_exec().moe
-    if (
-        get_device().device == "npu"
-        and get_parallel().nnodes == 1
-        and moe.ep_dispatch_algorithm == "static"
-        and moe.init_expert_location == "trivial"
-        and moe.elastic_ep_backend is None
-        and steady_iterations > 64
-    ):
-        logger.info(
-            "[NPU EPLB initial learning] first=64 steady=%d window=%d",
-            steady_iterations,
-            moe.expert_distribution_recorder_buffer_size,
-        )
-        return 64
-    return None
 
 
 def filter_unchanged_layers(layer_ids, old_map, new_map, *, elastic_enabled):
