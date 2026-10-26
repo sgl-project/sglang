@@ -131,7 +131,7 @@ def test_qsa_model_forward_prefetches_exact_kv_before_indexer(
         is_qsa=True,
         layer_id=7,
         alt_stream=None,
-        _qsa_prefill_topk_bridge=None,
+        _qsa_prefill_topk_bridges=[],
         _prepare_attn_stage=lambda value, *args: value,
         _prepare_qkv_gate=prepare,
         indexer=indexer,
