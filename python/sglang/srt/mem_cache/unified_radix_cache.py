@@ -8,8 +8,17 @@ from array import array
 from dataclasses import replace
 from http import HTTPStatus
 from queue import Queue
-from typing import TYPE_CHECKING, Iterator, NamedTuple, Optional, Sequence, TypeVar
+from typing import (
+    TYPE_CHECKING,
+    Callable,
+    Iterator,
+    NamedTuple,
+    Optional,
+    Sequence,
+    TypeVar,
+)
 
+import msgspec
 import torch
 
 from sglang.srt.distributed.communication_tags import P2PTag
@@ -65,7 +74,7 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeComponentDeviceSlot,
     FreeDeviceKV,
     FreeDeviceKVFullOnly,
-    ReplaceWriteThroughOnNodeSplit,
+    UpdatePendingBackupOnNodeSplit,
 )
 
 # UnifiedTreeNode / UnifiedLRUList live on the tree core; re-exported here
@@ -102,14 +111,23 @@ from sglang.srt.observability.metrics_collector import (
     StorageMetrics,
     StorageMetricsCollector,
 )
-from sglang.srt.runtime_context import get_memory, get_model, get_observability
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_memory,
+    get_model,
+    get_observability,
+)
 from sglang.srt.session.streaming_session import StreamingSession, is_virtual_node
 from sglang.srt.utils.common import ceil_align
+from sglang.srt.utils.poll_timer import PollTimer
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import HiCacheAck
     from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+    from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
+        BaseEvictionResult,
+    )
     from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
         PrefetchOperation,
     )
@@ -159,6 +177,12 @@ class _OngoingLoadBack(NamedTuple):
     node_id: NodeId
     lock_params: DecLockRefParams
     host_lock_params: DecLockRefParams
+
+
+class _StoragePrefetchWait(msgspec.Struct):
+    timer: PollTimer = msgspec.field(default_factory=PollTimer)
+    timeout_s: float = 0.0
+    expired: bool = False
 
 
 class _OngoingPrefetch(NamedTuple):
@@ -211,11 +235,12 @@ class UnifiedRadixCache(BasePrefixCache):
         self.enable_mamba_extra_buffer = (
             params.enable_mamba_extra_buffer if self.is_mamba_enabled else False
         )
-        # SWA window size (None when SWA is not enabled).
+        # Required cache history, shared by retention, budgeting and transfers.
         self._sliding_window_size = (
-            params.sliding_window_size if self.is_swa_enabled else None
+            params.swa_retain_window if self.is_swa_enabled else None
         )
         self.decoder_swa_bounded_replay = params.decoder_swa_bounded_replay
+        self.draft_swa_window = params.draft_swa_window
         # The TreeCore owns the tree member-var state (structure, LRUs, sizes,
         # evictable leaves) and drives the components' tree-level hooks.
         self._tree_core_backend = select_tree_core_backend(params)
@@ -297,6 +322,8 @@ class UnifiedRadixCache(BasePrefixCache):
         # constructs the pipeline collaborator (None = cache mode).
         self.host_memory_mode = "cache"
         self.buffer_pipeline: Optional[BufferModePipeline] = None
+        # Session of the insert whose actions are being applied (see ``insert``).
+        self.insert_session_id: Optional[str] = None
         # Write-side dedupe: beliefs about what storage already holds, so
         # re-inserts of hot prefixes skip the redundant backup.
         self.storage_existence_cache = StorageExistenceCache()
@@ -404,6 +431,7 @@ class UnifiedRadixCache(BasePrefixCache):
         self.prefetch_loaded_tokens_by_reqid: dict[CacheRequestHandle, int] = {}
         self.prefetch_loaded_storage_start_by_reqid: dict[CacheRequestHandle, int] = {}
         self.ongoing_prefetch: dict[CacheRequestHandle, _OngoingPrefetch] = {}
+        self._storage_prefetch_wait: dict[CacheRequestHandle, _StoragePrefetchWait] = {}
         # Rank-agreed L3-hit tokens not yet resolved as usable or unfulfilled.
         # Cache-mode entries survive L3->L2 until H2D succeeds or admission
         # fails; buffer-mode entries survive staging until the H2D ack.
@@ -595,11 +623,21 @@ class UnifiedRadixCache(BasePrefixCache):
         # Apply the walk's actions (e.g. a pending write-through relocation on
         # a split) before the finalizers, which can evict or raise.
         self._apply_cache_actions(result.cache_actions)
+        return self._finalize_match_result(params, result)
+
+    def _finalize_match_result(
+        self, params: MatchPrefixParams, result: MatchResult
+    ) -> MatchResult:
         for component in self._components_tuple:
             result = component.finalize_match_result_in_cache(params, result)
         # Finalizers must not emit actions; the walk's were applied above.
         assert not result.cache_actions
-        if self.linker is not None and params.req is not None:
+        # PD decode has no linker load-back path, so it only offloads.
+        if (
+            self.linker is not None
+            and params.req is not None
+            and get_disagg().disaggregation_mode != "decode"
+        ):
             result = self.linker.match(params.key, params.req, result)
         return result
 
@@ -627,6 +665,8 @@ class UnifiedRadixCache(BasePrefixCache):
         assert not self.tree_core.has_ongoing_insert(), "re-entrant insert"
         if self.buffer_pipeline is not None:
             self.buffer_pipeline.begin_insert_walk()
+        # External linker offloads (BackupKV) issued by this insert carry its session.
+        self.insert_session_id = params.session_id
         # Pump the resumable insert, applying each step's actions at its barrier.
         try:
             step = self.tree_core.begin_insert(params)
@@ -639,7 +679,10 @@ class UnifiedRadixCache(BasePrefixCache):
                 step = self.tree_core.resume_insert()
         finally:
             # Drain still-pending actions so frees reach the allocator on abort.
-            self._apply_cache_actions(self.tree_core.end_insert())
+            try:
+                self._apply_cache_actions(self.tree_core.end_insert())
+            finally:
+                self.insert_session_id = None
             if self.buffer_pipeline is not None:
                 self.buffer_pipeline.end_insert_walk()
 
@@ -647,17 +690,33 @@ class UnifiedRadixCache(BasePrefixCache):
     def evict(self, params: EvictParams) -> EvictResult:
         return self._evict(params)
 
-    @rank_consensus(same_params=True, same_results=True)
-    def evict_for_alloc(self, params: EvictParams) -> EvictResult:
-        """Evict until the requested component allocations become feasible.
+    @rank_consensus(
+        same_params=["params", "allocation_reclaim_satisfied is not None"],
+        same_results=True,
+    )
+    def evict_for_alloc(
+        self,
+        params: EvictParams,
+        *,
+        allocation_reclaim_satisfied: Optional[Callable[[], bool]] = None,
+    ) -> EvictResult:
+        """Evict using component shortfalls or cumulative joint-reclaim quotas.
 
-        ``params`` contains allocator shortfalls, not absolute eviction quotas.
-        A component eviction can cascade to its peers; with a shared memory pool,
-        those collateral frees can satisfy the original allocation before the
-        triggering component's requested count is reached.
+        Without ``allocation_reclaim_satisfied``, ``params`` contains component
+        shortfalls. These become availability targets, allowing collateral frees
+        to satisfy an allocation before its requested eviction count is reached.
+
+        With ``allocation_reclaim_satisfied``, ``params`` instead contains
+        cumulative reclaim quotas and component-local targets are bypassed.
+        The pure predicate may stop the walk before those quotas are reached;
+        the allocator must prepare and recheck actual capacity after the walk.
         """
         if self.disable:
             return EvictResult()
+        if allocation_reclaim_satisfied is not None:
+            return self._evict(
+                params, allocation_reclaim_satisfied=allocation_reclaim_satisfied
+            )
 
         request_by_type = self._evict_request_by_type(params)
         available_size_targets = {
@@ -749,6 +808,8 @@ class UnifiedRadixCache(BasePrefixCache):
         available_size_targets: Optional[
             dict[ComponentType, tuple[ComponentType, int]]
         ] = None,
+        *,
+        allocation_reclaim_satisfied: Optional[Callable[[], bool]] = None,
     ) -> EvictResult:
         if self.disable:
             return EvictResult()
@@ -760,6 +821,7 @@ class UnifiedRadixCache(BasePrefixCache):
             request_by_type,
             tracker,
             available_size_targets=available_size_targets,
+            allocation_reclaim_satisfied=allocation_reclaim_satisfied,
         )
 
         if (
@@ -788,6 +850,13 @@ class UnifiedRadixCache(BasePrefixCache):
         finally:
             self._drain_host_frees(host_frees)
 
+    def _apply_eviction_result(self, result: BaseEvictionResult) -> None:
+        """Drain a tree step before the next allocator-dependent decision."""
+        try:
+            self._free_values(result.device_frees, result.host_frees)
+        finally:
+            self._apply_cache_actions(result.cache_actions)
+
     def _accumulate_tracker(
         self,
         tracker: dict[ComponentType, int],
@@ -805,7 +874,10 @@ class UnifiedRadixCache(BasePrefixCache):
         if result.mamba_backup_node_id is not None:
             assert component_type == ComponentType.MAMBA and result.node_id is None
             assert (
-                not result.device_frees and not result.host_frees and not result.tracker
+                not result.device_frees
+                and not result.host_frees
+                and not result.tracker
+                and not result.cache_actions
             )
             # Reserve a host state slot and wait for the backup acknowledgment
             # before freeing device state. If allocation fails, eviction still
@@ -819,7 +891,10 @@ class UnifiedRadixCache(BasePrefixCache):
         elif result.swa_backup_node_id is not None:
             assert component_type == ComponentType.SWA and result.node_id is None
             assert (
-                not result.device_frees and not result.host_frees and not result.tracker
+                not result.device_frees
+                and not result.host_frees
+                and not result.tracker
+                and not result.cache_actions
             )
             # The backup can cover several unbacked SWA segments. Reserve host
             # space for the whole window before copying it, then resume eviction
@@ -831,7 +906,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.evict_host(needed, ComponentType.SWA)
             self.backup_node_for_write_back(node_id)
             result = self.tree_core.finish_swa_state_eviction(node_id)
-        self._free_values(result.device_frees, result.host_frees)
+        self._apply_eviction_result(result)
         if self._tracks_write_through_unbacked_evictions():
             self._record_dropped_tokens(
                 result.unbacked_tokens,
@@ -846,7 +921,7 @@ class UnifiedRadixCache(BasePrefixCache):
         """Evict one device leaf, consuming its step result; returns the
         deferred write-back BackupKV when one must run before the demote."""
         result = self.tree_core.evict_device_leaf(node_id, self.is_write_back)
-        self._free_values(result.device_frees, result.host_frees)
+        self._apply_eviction_result(result)
         if self._tracks_write_through_unbacked_evictions():
             self._record_dropped_tokens(
                 result.unbacked_tokens,
@@ -858,7 +933,7 @@ class UnifiedRadixCache(BasePrefixCache):
     def _demote(self, node_id: NodeId, tracker: dict[ComponentType, int]) -> None:
         """Demote a backed-up node, consuming its step result."""
         result = self.tree_core.demote(node_id)
-        self._free_values(result.device_frees, result.host_frees)
+        self._apply_eviction_result(result)
         self._accumulate_tracker(tracker, result.tracker)
 
     def _drop_subtree_no_host(
@@ -866,7 +941,7 @@ class UnifiedRadixCache(BasePrefixCache):
     ) -> bool:
         """Run the write-back drop fallback, consuming its step result."""
         result = self.tree_core.drop_subtree_no_host(node_id)
-        self._free_values(result.device_frees, result.host_frees)
+        self._apply_eviction_result(result)
         if result.is_dropped:
             self._record_dropped_tokens(
                 result.tracker.get(BASE_COMPONENT_TYPE, 0), reason="host_pressure"
@@ -881,6 +956,8 @@ class UnifiedRadixCache(BasePrefixCache):
         available_size_targets: Optional[
             dict[ComponentType, tuple[ComponentType, int]]
         ] = None,
+        *,
+        allocation_reclaim_satisfied: Optional[Callable[[], bool]] = None,
     ) -> None:
         # Buffer mode: eviction always wins over queued backup intents — a
         # destroyed victim's intent is stale-swept and the content rewrites
@@ -890,6 +967,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
         def target_reached(component_type: ComponentType) -> bool:
             nonlocal last_mamba_donor_check, mamba_donor_prepared
+            if allocation_reclaim_satisfied is not None:
+                return allocation_reclaim_satisfied()
             if available_size_targets is None:
                 return False
             target = available_size_targets.get(component_type)
@@ -1031,7 +1110,7 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.disable or lock is None or lock.swa_released:
             return
         result = self.tree_core.dec_swa_lock_only(lock.node, lock.receipt)
-        self._free_values(result.device_frees, result.host_frees)
+        self._apply_eviction_result(result)
         lock.swa_released = True
 
     def release_swa_prefix_lock(self, req: Req) -> None:
@@ -1307,19 +1386,19 @@ class UnifiedRadixCache(BasePrefixCache):
         # Component actions route to their component class; the rest are
         # cache-owned and handled here by type.
         if isinstance(action, ComponentAction):
-            self.components[action.component_type].apply_component_action(action)
-        elif isinstance(action, ReplaceWriteThroughOnNodeSplit):
-            self._replace_pending_write_through_node(
-                action.ack_id,
-                action.old_node_id,
-                [action.new_node_id, action.new_child_node_id],
-            )
-            if self.linker is not None:
-                self.linker.replace_pending_offload_node(
-                    action.ack_id,
-                    action.old_node_id,
-                    [action.new_node_id, action.new_child_node_id],
+            if (
+                isinstance(action, UpdatePendingBackupOnNodeSplit)
+                and action.ack_id is not None
+            ):
+                node_ids = [action.new_node_id, action.new_child_node_id]
+                self._replace_pending_write_through_node(
+                    action.ack_id, action.old_node_id, node_ids
                 )
+                if self.linker is not None:
+                    self.linker.replace_pending_offload_node(
+                        action.ack_id, action.old_node_id, node_ids
+                    )
+            self.components[action.component_type].apply_component_action(action)
         elif isinstance(action, FreeDeviceKV):
             # tree values are page-aligned copies of a kv row: page-exact segments
             for indices in action.indices:
@@ -1360,7 +1439,7 @@ class UnifiedRadixCache(BasePrefixCache):
             # is operation-owned (freed at each ack): nothing is evictable.
             return 0
         result = self.tree_core.drive_host_eviction(component_type, num_tokens)
-        self._free_values(result.device_frees, result.host_frees)
+        self._apply_eviction_result(result)
         return result.tracker.get(component_type, 0)
 
     # ---- Decode retraction ----
@@ -2009,6 +2088,9 @@ class UnifiedRadixCache(BasePrefixCache):
 
         req_id = request.rid
         self.storage_prefetch_retries.cancel(req_id)
+        wait = self._storage_prefetch_wait.get(request)
+        if wait is not None and wait.expired:
+            return
         submission = self.cache_controller.get_prefetch_submission(req_id)
         if submission is not None:
             return submission.decision
@@ -2138,8 +2220,8 @@ class UnifiedRadixCache(BasePrefixCache):
         stats["issued"] += 1
         if operation.assume_stored:
             stats["issued_assumed_stored"] += 1
-        # Snapshot the requested span for L3 miss-token accounting at the
-        # rank-synchronized query outcome.
+        # Keep the requested span stable for the wait budget and miss accounting;
+        # the hit hash chain can shrink as device coverage changes.
         operation.stats_requested_tokens = prefetch_length
         operation.storage_start = storage_start
         if submission.decision is not None:
@@ -2167,12 +2249,40 @@ class UnifiedRadixCache(BasePrefixCache):
             # grants occupancy later at hit-alloc time, sized to the hit.
             self.cache_controller.prefetch_tokens_occupied += len(prefetch_key)
 
-    def _prefetch_timeout_check_linear_func(self, operation: PrefetchOperation) -> bool:
-        return (
-            time.monotonic() - operation.start_time
-            > self.prefetch_timeout_base
-            + len(operation.hash_value) * self.prefetch_timeout_per_page
+    def _start_storage_prefetch_wait(self, operation: PrefetchOperation) -> None:
+        if (
+            self.prefetch_stop_policy == "timeout"
+            and operation.handle not in self._storage_prefetch_wait
+        ):
+            # Start at the first blocked admission poll; refetches keep this budget.
+            pages = operation.stats_requested_tokens // self.page_size
+            wait = _StoragePrefetchWait(
+                timeout_s=self.prefetch_timeout_base
+                + pages * self.prefetch_timeout_per_page,
+            )
+            wait.timer.observe(ready=False)
+            self._storage_prefetch_wait[operation.handle] = wait
+
+    def _prefetch_deadline_expired(self, operation: PrefetchOperation) -> bool:
+        if operation.host_indices is not None and (
+            operation.completed_tokens >= len(operation.hash_value) * self.page_size
+        ):
+            # KV landed: cutting the pending sidecar read would salvage nothing.
+            return False
+        wait = self._storage_prefetch_wait.get(operation.handle)
+        return wait is not None and (
+            wait.expired
+            or (wait.timer.running and wait.timer.elapsed() > wait.timeout_s)
         )
+
+    def _mark_prefetch_deadline_expired(self, operation: PrefetchOperation) -> None:
+        operation.deadline_expired = True
+        self.storage_prefetch_retries.cancel(operation.handle.rid)
+        # Only a rank-agreed verdict can suppress retries, including on peers
+        # that have not reached their conditional admission poll yet.
+        self._storage_prefetch_wait.setdefault(
+            operation.handle, _StoragePrefetchWait()
+        ).expired = True
 
     @rank_consensus(same_results=True)
     def _can_terminate_prefetch(self, operation: PrefetchOperation) -> bool:
@@ -2187,7 +2297,7 @@ class UnifiedRadixCache(BasePrefixCache):
             # rank timed out) and _all_reduce broadcasts the verdict along PP.
             should_terminate = False
             if self.pp_rank == 0:
-                should_terminate = self._prefetch_timeout_check_linear_func(operation)
+                should_terminate = self._prefetch_deadline_expired(operation)
             should_terminate_tensor = torch.tensor(
                 int(should_terminate), dtype=torch.int, device="cpu"
             )
@@ -2253,6 +2363,23 @@ class UnifiedRadixCache(BasePrefixCache):
         self._handle_prefetch_result(operation)
         return True
 
+    def waiting_storage_span(
+        self, request: CacheRequestHandle
+    ) -> Optional[tuple[int, int]]:
+        if self.buffer_pipeline is None:
+            return None
+        info = self.ongoing_prefetch.get(request)
+        if info is not None:
+            if info.host_indices is None:
+                return None
+            # Scheduler-accepted logical span; worker progress can count pool rows.
+            op = info.operation
+            return op.storage_start, op.storage_start + op.storage_hit_count
+        staged = self.buffer_pipeline.staged_prefetches.get(request)
+        if staged is not None:
+            return staged.matched_len, staged.matched_len + staged.num_tokens
+        return None
+
     @rank_consensus(same_params=True, same_results=True)
     def check_prefetch_progress(self, request: CacheRequestHandle) -> bool:
         if (
@@ -2267,17 +2394,19 @@ class UnifiedRadixCache(BasePrefixCache):
 
         operation = self.ongoing_prefetch[request].operation
 
-        # Determine whether or not we should terminate this prefetch request.
-        should_terminate = operation.is_terminated() or self._can_terminate_prefetch(
-            operation
-        )
-
-        if not should_terminate:
-            return False
+        if not operation.is_terminated():
+            if not self._can_terminate_prefetch(operation):
+                self._start_storage_prefetch_wait(operation)
+                return False
+            if self.prefetch_stop_policy == "timeout":
+                self._mark_prefetch_deadline_expired(operation)
 
         self.cache_controller.terminate_prefetch(operation)
         if operation.host_indices is None:
-            self.storage_prefetch_retries.poll_miss(request.rid)
+            if operation.deadline_expired:
+                self._finish_storage_prefetch(request, 0, reason="deadline")
+            else:
+                self.storage_prefetch_retries.poll_miss(request.rid)
             self.revoke_pending_prefetch(request)
         else:
             self._handle_prefetch_result(operation)
@@ -2317,7 +2446,7 @@ class UnifiedRadixCache(BasePrefixCache):
             self._resolve_storage_prefetch_tokens(
                 request,
                 allocated_tokens - completed_tokens,
-                reason="storage_transfer",
+                reason="deadline" if operation.deadline_expired else "storage_transfer",
             )
         if (
             completed_tokens > 0
@@ -2445,7 +2574,7 @@ class UnifiedRadixCache(BasePrefixCache):
         if pool_transfers and not all_succeeded:
             # Drop each pool's beliefs beyond what it served (KV and its
             # sidecars beyond the completed span); the next insert re-writes
-            # only the missing pools.
+            # only the missing pools. A deadline is not evidence of absent data.
             invalidation_hashes = (
                 operation.sidecar_hash_values
                 if operation.sidecar_hash_values is not None
@@ -2454,7 +2583,7 @@ class UnifiedRadixCache(BasePrefixCache):
             trimmed_pages = len(invalidation_hashes) - len(hash_value)
             keep_pages = trimmed_pages + completed_tokens // self.page_size
             beliefs = self.storage_existence_cache
-            if keep_pages < len(invalidation_hashes):
+            if not operation.deadline_expired and keep_pages < len(invalidation_hashes):
                 self._belief_policy(
                     PoolName.KV, PoolHitPolicy.ALL_PAGES
                 ).heal_from_transfer(
@@ -2470,15 +2599,18 @@ class UnifiedRadixCache(BasePrefixCache):
                             keep_pages,
                         )
             for transfer, count in zip(pool_transfers, pool_hit_pages):
-                if transfer.keys is not None and count < len(transfer.keys):
+                if (
+                    not operation.deadline_expired
+                    and transfer.keys is not None
+                    and count < len(transfer.keys)
+                ):
                     self._belief_policy(
                         transfer.name, transfer.hit_policy
                     ).heal_from_transfer(
                         beliefs.pool(transfer.name), transfer.keys, count
                     )
-            self._finish_storage_prefetch(
-                request, fulfilled_tokens=0, reason="storage_transfer"
-            )
+            reason = "deadline" if operation.deadline_expired else "storage_transfer"
+            self._finish_storage_prefetch(request, fulfilled_tokens=0, reason=reason)
             # The controller's prefetch IO thread already releases the untransferred
             # tail (host_indices[completed_tokens:])
             self._retire_ongoing_prefetch(
@@ -2489,12 +2621,13 @@ class UnifiedRadixCache(BasePrefixCache):
             self.prefetch_loaded_tokens_by_reqid[request] = 0
             self.prefetch_loaded_storage_start_by_reqid.pop(request, None)
             logger.warning(
-                "HiCache hybrid prefetch discarded req=%s completed=%d requested=%d "
-                "kv_beliefs_kept_pages=%d aux_pool_hit_pages=%s",
+                "HiCache hybrid prefetch discarded req=%s reason=%s completed=%d "
+                "requested=%d kv_beliefs_kept_pages=%s aux_pool_hit_pages=%s",
                 request.rid,
+                reason,
                 completed_tokens,
                 expected_tokens,
-                keep_pages,
+                None if operation.deadline_expired else keep_pages,
                 {
                     getattr(transfer.name, "value", transfer.name): count
                     for transfer, count in zip(pool_transfers, pool_hit_pages)
@@ -2586,11 +2719,12 @@ class UnifiedRadixCache(BasePrefixCache):
     def finish_storage_prefetch_admission(
         self, request: CacheRequestHandle, fulfilled_tokens: int, reason: Optional[str]
     ) -> None:
-        """Resolve a cache-mode L3 hit after request admission.
+        """Close the admission wait budget and resolve a cache-mode L3 hit.
 
         Buffer mode resolves at the H2D completion ack instead, because its
         host allocation is transport staging rather than a resident L2 hit.
         """
+        self._storage_prefetch_wait.pop(request, None)
         if self.host_memory_mode == "cache":
             self._finish_storage_prefetch(request, fulfilled_tokens, reason)
 
@@ -2627,6 +2761,7 @@ class UnifiedRadixCache(BasePrefixCache):
     @rank_consensus(same_params=True)
     def release_aborted_request(self, request: CacheRequestHandle) -> None:
         rid = request.rid
+        self._storage_prefetch_wait.pop(request, None)
         if self.linker is not None:
             self.linker.release_request(rid)
         self.prefetch_loaded_tokens_by_reqid.pop(request, None)
@@ -2702,7 +2837,8 @@ class UnifiedRadixCache(BasePrefixCache):
         """Heal each pool's beliefs beyond its rank-agreed boundary (a
         chain-page pool also learns presence up to it); a pool without a
         verdict heals from the folded cut."""
-        if self.host_memory_mode != "buffer_only":
+        if self.host_memory_mode != "buffer_only" or operation.deadline_expired:
+            # A cut query's agreed hit may be a MIN over skipped lookups, not a verdict.
             return
         chain = operation.all_hash_values
         if chain is None:
@@ -2736,7 +2872,7 @@ class UnifiedRadixCache(BasePrefixCache):
         """Feed the cumulative prefetch-outcome counters at the (rank-synced)
         query outcome: T = prompt tokens, L = requested, m = L3-miss."""
         requested = operation.stats_requested_tokens
-        if requested <= 0:
+        if requested <= 0 or operation.deadline_expired:
             return
         stats = self._prefetch_outcome_stats
         hit = max(0, min(operation.storage_hit_count, requested))
@@ -3027,22 +3163,21 @@ class UnifiedRadixCache(BasePrefixCache):
                 if hit_tokens > 0:
                     self._record_storage_prefetch_hit(request, hit_tokens)
                 if operation.is_terminated():
-                    # Controller-side miss termination (retryable) or an abort
-                    # race (abort cleanup discards the marker).
+                    # A storage miss can retry; a policy deadline cannot.
                     if hit_tokens > 0:
+                        reason = None
+                        if operation.deadline_expired:
+                            reason = "deadline"
+                        elif hit_tokens < self.prefetch_threshold:
+                            reason = "below_threshold"
                         self._finish_storage_prefetch(
-                            request,
-                            fulfilled_tokens=0,
-                            reason=(
-                                "below_threshold"
-                                if hit_tokens < self.prefetch_threshold
-                                else None
-                            ),
+                            request, fulfilled_tokens=0, reason=reason
                         )
                     # The published (rank-agreed) hit count is the L3 verdict;
                     # without this, store misses never reach l3_miss_tokens.
                     self._account_prefetch_outcome(operation, revoked=True)
-                    self.storage_prefetch_retries.poll_miss(request.rid)
+                    if not operation.deadline_expired:
+                        self.storage_prefetch_retries.poll_miss(request.rid)
                     self.revoke_pending_prefetch(request)
                     continue
                 if hit_tokens < self.prefetch_threshold:
@@ -3611,7 +3746,7 @@ class UnifiedRadixCache(BasePrefixCache):
         writes late-layer window KV only for an extend's tail rows, so a matched
         prefix may lack it; a streaming turn borrowing its own record has it.
         """
-        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+        from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
             is_unified_kv_triton,
         )
 

@@ -1110,6 +1110,9 @@ impl ::serde::Serialize for SamplingParams {
         if let Some(v) = &self.watermark {
             ::serde::ser::SerializeMap::serialize_entry(&mut map, "watermark", v)?;
         }
+        if !self.choice.is_empty() {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "choice", &self.choice)?;
+        }
         ::serde::ser::SerializeMap::end(map)
     }
 }
@@ -1144,6 +1147,7 @@ impl<'de> ::serde::Deserialize<'de> for SamplingParams {
             "custom_params",
             "beam_width",
             "watermark",
+            "choice",
         ];
         struct V;
         impl<'de> ::serde::de::Visitor<'de> for V {
@@ -1182,6 +1186,7 @@ impl<'de> ::serde::Deserialize<'de> for SamplingParams {
                 let mut f_custom_params = None;
                 let mut f_beam_width = None;
                 let mut f_watermark = None;
+                let mut f_choice = None;
                 while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
                     match key.as_ref() {
                         "max_new_tokens" => {
@@ -1394,6 +1399,15 @@ impl<'de> ::serde::Deserialize<'de> for SamplingParams {
                             }
                             f_watermark = Some(map.next_value::<Option<WatermarkRequestConfig>>()?);
                         }
+                        "choice" => {
+                            if f_choice.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("choice"));
+                            }
+                            f_choice = Some(
+                                map.next_value::<Option<Vec<::prost::alloc::string::String>>>()?
+                                    .unwrap_or_default(),
+                            );
+                        }
                         other => {
                             return Err(::serde::de::Error::unknown_field(other, FIELDS));
                         }
@@ -1428,6 +1442,7 @@ impl<'de> ::serde::Deserialize<'de> for SamplingParams {
                     custom_params: f_custom_params.flatten(),
                     beam_width: f_beam_width.flatten(),
                     watermark: f_watermark.flatten(),
+                    choice: f_choice.unwrap_or_default(),
                 })
             }
         }
@@ -1596,6 +1611,64 @@ impl ::serde::Serialize for GenerateRequest {
         if let Some(v) = &self.priority {
             ::serde::ser::SerializeMap::serialize_entry(&mut map, "priority", v)?;
         }
+        if let Some(v) = &self.cache_salt {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "cache_salt", v)?;
+        }
+        if let Some(v) = &self.require_reasoning {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "require_reasoning", v)?;
+        }
+        if let Some(v) = &self.lora_path {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "lora_path", v)?;
+        }
+        if let Some(v) = &self.session_params {
+            ::serde::ser::SerializeMap::serialize_entry(
+                &mut map,
+                "session_params",
+                &::serde_json::from_str::<::serde_json::Value>(v)
+                    .unwrap_or(::serde_json::Value::Null),
+            )?;
+        }
+        if let Some(v) = &self.kv_hints {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "kv_hints", v)?;
+        }
+        if let Some(v) = &self.routing_key {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "routing_key", v)?;
+        }
+        if let Some(v) = &self.max_thinking_tokens {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "max_thinking_tokens", v)?;
+        }
+        if let Some(v) = &self.session_id {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "session_id", v)?;
+        }
+        if let Some(v) = &self.custom_logit_processor {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "custom_logit_processor", v)?;
+        }
+        if !self.custom_labels.is_empty() {
+            ::serde::ser::SerializeMap::serialize_entry(
+                &mut map,
+                "custom_labels",
+                &self.custom_labels,
+            )?;
+        }
+        if let Some(v) = &self.images_config {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "images_config", v)?;
+        }
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "return_prompt_token_ids",
+            &self.return_prompt_token_ids,
+        )?;
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "routed_experts_start_len",
+            &self.routed_experts_start_len,
+        )?;
+        if let Some(v) = &self.return_sampling_mask {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "return_sampling_mask", v)?;
+        }
+        if let Some(v) = &self.modalities {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "modalities", v)?;
+        }
         ::serde::ser::SerializeMap::end(map)
     }
 }
@@ -1636,6 +1709,21 @@ impl<'de> ::serde::Deserialize<'de> for GenerateRequest {
                 let mut f_audio_data = None;
                 let mut f_extra_key = None;
                 let mut f_priority = None;
+                let mut f_cache_salt = None;
+                let mut f_require_reasoning = None;
+                let mut f_lora_path = None;
+                let mut f_session_params = None;
+                let mut f_kv_hints = None;
+                let mut f_routing_key = None;
+                let mut f_max_thinking_tokens = None;
+                let mut f_session_id = None;
+                let mut f_custom_logit_processor = None;
+                let mut f_custom_labels = None;
+                let mut f_images_config = None;
+                let mut f_return_prompt_token_ids = None;
+                let mut f_routed_experts_start_len = None;
+                let mut f_return_sampling_mask = None;
+                let mut f_modalities = None;
                 while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
                     match key.as_ref() {
                         "rid" => {
@@ -1804,6 +1892,122 @@ impl<'de> ::serde::Deserialize<'de> for GenerateRequest {
                             }
                             f_priority = Some(map.next_value::<Option<i64>>()?);
                         }
+                        "cache_salt" => {
+                            if f_cache_salt.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("cache_salt"));
+                            }
+                            f_cache_salt = Some(map.next_value::<Option<StringOrList>>()?);
+                        }
+                        "require_reasoning" => {
+                            if f_require_reasoning.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "require_reasoning",
+                                ));
+                            }
+                            f_require_reasoning = Some(map.next_value::<Option<bool>>()?);
+                        }
+                        "lora_path" => {
+                            if f_lora_path.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("lora_path"));
+                            }
+                            f_lora_path = Some(map.next_value::<Option<OptionalStringOrList>>()?);
+                        }
+                        "session_params" => {
+                            if f_session_params.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("session_params"));
+                            }
+                            f_session_params = Some(
+                                map.next_value::<Option<::serde_json::Value>>()?
+                                    .map(|v| v.to_string()),
+                            );
+                        }
+                        "kv_hints" => {
+                            if f_kv_hints.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("kv_hints"));
+                            }
+                            f_kv_hints = Some(map.next_value::<Option<KvHintsEnvelopeOrList>>()?);
+                        }
+                        "routing_key" => {
+                            if f_routing_key.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("routing_key"));
+                            }
+                            f_routing_key =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "max_thinking_tokens" => {
+                            if f_max_thinking_tokens.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "max_thinking_tokens",
+                                ));
+                            }
+                            f_max_thinking_tokens = Some(map.next_value::<Option<u64>>()?);
+                        }
+                        "session_id" => {
+                            if f_session_id.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("session_id"));
+                            }
+                            f_session_id =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "custom_logit_processor" => {
+                            if f_custom_logit_processor.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "custom_logit_processor",
+                                ));
+                            }
+                            f_custom_logit_processor =
+                                Some(map.next_value::<Option<OptionalStringOrList>>()?);
+                        }
+                        "custom_labels" => {
+                            if f_custom_labels.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("custom_labels"));
+                            }
+                            f_custom_labels = Some(
+                                map.next_value::<Option<
+                                    ::std::collections::HashMap<
+                                        String,
+                                        ::prost::alloc::string::String,
+                                    >,
+                                >>()?
+                                .unwrap_or_default(),
+                            );
+                        }
+                        "images_config" => {
+                            if f_images_config.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("images_config"));
+                            }
+                            f_images_config = Some(map.next_value::<Option<ImagesConfig>>()?);
+                        }
+                        "return_prompt_token_ids" => {
+                            if f_return_prompt_token_ids.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "return_prompt_token_ids",
+                                ));
+                            }
+                            f_return_prompt_token_ids = Some(map.next_value::<bool>()?);
+                        }
+                        "routed_experts_start_len" => {
+                            if f_routed_experts_start_len.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "routed_experts_start_len",
+                                ));
+                            }
+                            f_routed_experts_start_len = Some(map.next_value::<i64>()?);
+                        }
+                        "return_sampling_mask" => {
+                            if f_return_sampling_mask.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "return_sampling_mask",
+                                ));
+                            }
+                            f_return_sampling_mask = Some(map.next_value::<Option<BoolOrList>>()?);
+                        }
+                        "modalities" => {
+                            if f_modalities.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("modalities"));
+                            }
+                            f_modalities = Some(map.next_value::<Option<OptionalStringList>>()?);
+                        }
                         _ => {
                             map.next_value::<::serde::de::IgnoredAny>()?;
                         }
@@ -1834,6 +2038,309 @@ impl<'de> ::serde::Deserialize<'de> for GenerateRequest {
                     audio_data: f_audio_data.flatten(),
                     extra_key: f_extra_key.flatten(),
                     priority: f_priority.flatten(),
+                    cache_salt: f_cache_salt.flatten(),
+                    require_reasoning: f_require_reasoning.flatten(),
+                    lora_path: f_lora_path.flatten(),
+                    session_params: f_session_params.flatten(),
+                    kv_hints: f_kv_hints.flatten(),
+                    routing_key: f_routing_key.flatten(),
+                    max_thinking_tokens: f_max_thinking_tokens.flatten(),
+                    session_id: f_session_id.flatten(),
+                    custom_logit_processor: f_custom_logit_processor.flatten(),
+                    custom_labels: f_custom_labels.unwrap_or_default(),
+                    images_config: f_images_config.flatten(),
+                    return_prompt_token_ids: f_return_prompt_token_ids.unwrap_or_default(),
+                    routed_experts_start_len: f_routed_experts_start_len.unwrap_or_default(),
+                    return_sampling_mask: f_return_sampling_mask.flatten(),
+                    modalities: f_modalities.flatten(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for ImagesConfig {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        if let Some(v) = &self.image_mode {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "image_mode", v)?;
+        }
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "prefix", &self.prefix)?;
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for ImagesConfig {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = ImagesConfig;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct ImagesConfig")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_image_mode = None;
+                let mut f_prefix = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "image_mode" => {
+                            if f_image_mode.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("image_mode"));
+                            }
+                            f_image_mode =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "prefix" => {
+                            if f_prefix.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("prefix"));
+                            }
+                            f_prefix = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(ImagesConfig {
+                    image_mode: f_image_mode.flatten(),
+                    prefix: f_prefix.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for KvHintsEnvelopeOrList {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match &self.value {
+            Some(kv_hints_envelope_or_list::Value::One(v)) => v.serialize(serializer),
+            Some(kv_hints_envelope_or_list::Value::Many(v)) => v.serialize(serializer),
+            None => serializer.serialize_none(),
+        }
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for KvHintsEnvelopeOrList {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = KvHintsEnvelopeOrList;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("a value or an array of values for KvHintsEnvelopeOrList")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let one = <KvHintsEnvelope as ::serde::Deserialize>::deserialize(
+                    ::serde::de::value::MapAccessDeserializer::new(map),
+                )?;
+                Ok(KvHintsEnvelopeOrList {
+                    value: Some(kv_hints_envelope_or_list::Value::One(one)),
+                })
+            }
+            fn visit_seq<A: ::serde::de::SeqAccess<'de>>(
+                self,
+                seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let many = <KvHintsEnvelopeList as ::serde::Deserialize>::deserialize(
+                    ::serde::de::value::SeqAccessDeserializer::new(seq),
+                )?;
+                Ok(KvHintsEnvelopeOrList {
+                    value: Some(kv_hints_envelope_or_list::Value::Many(many)),
+                })
+            }
+        }
+        deserializer.deserialize_any(V)
+    }
+}
+
+impl ::serde::Serialize for KvHintsEnvelopeList {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.items.iter())
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for KvHintsEnvelopeList {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(KvHintsEnvelopeList {
+            items: <::prost::alloc::vec::Vec<OptionalKvHintsEnvelope> as ::serde::Deserialize>::deserialize(deserializer)?,
+        })
+    }
+}
+
+impl ::serde::Serialize for OptionalKvHintsEnvelope {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.envelope.serialize(serializer)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for OptionalKvHintsEnvelope {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(OptionalKvHintsEnvelope {
+            envelope: <Option<KvHintsEnvelope> as ::serde::Deserialize>::deserialize(deserializer)?,
+        })
+    }
+}
+
+impl ::serde::Serialize for KvHintsEnvelope {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "protocol_version",
+            &self.protocol_version,
+        )?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "message_id", &self.message_id)?;
+        if !self.actions.is_empty() {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "actions", &self.actions)?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for KvHintsEnvelope {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = KvHintsEnvelope;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct KvHintsEnvelope")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_protocol_version = None;
+                let mut f_message_id = None;
+                let mut f_actions = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "protocol_version" => {
+                            if f_protocol_version.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "protocol_version",
+                                ));
+                            }
+                            f_protocol_version =
+                                Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "message_id" => {
+                            if f_message_id.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("message_id"));
+                            }
+                            f_message_id =
+                                Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "actions" => {
+                            if f_actions.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("actions"));
+                            }
+                            f_actions = Some(
+                                map.next_value::<Option<Vec<KvHintAction>>>()?
+                                    .unwrap_or_default(),
+                            );
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(KvHintsEnvelope {
+                    protocol_version: f_protocol_version.unwrap_or_default(),
+                    message_id: f_message_id.unwrap_or_default(),
+                    actions: f_actions.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for KvHintAction {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "action_id", &self.action_id)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "action_type", &self.action_type)?;
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "action_version",
+            &self.action_version,
+        )?;
+        if let Some(v) = &self.payload {
+            ::serde::ser::SerializeMap::serialize_entry(
+                &mut map,
+                "payload",
+                &::serde_json::from_str::<::serde_json::Value>(v)
+                    .unwrap_or(::serde_json::Value::Null),
+            )?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for KvHintAction {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = KvHintAction;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct KvHintAction")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_action_id = None;
+                let mut f_action_type = None;
+                let mut f_action_version = None;
+                let mut f_payload = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "action_id" => {
+                            if f_action_id.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("action_id"));
+                            }
+                            f_action_id = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "action_type" => {
+                            if f_action_type.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("action_type"));
+                            }
+                            f_action_type =
+                                Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "action_version" => {
+                            if f_action_version.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("action_version"));
+                            }
+                            f_action_version =
+                                Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "payload" => {
+                            if f_payload.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("payload"));
+                            }
+                            f_payload = Some(
+                                map.next_value::<Option<::serde_json::Value>>()?
+                                    .map(|v| v.to_string()),
+                            );
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(KvHintAction {
+                    action_id: f_action_id.unwrap_or_default(),
+                    action_type: f_action_type.unwrap_or_default(),
+                    action_version: f_action_version.unwrap_or_default(),
+                    payload: f_payload.flatten(),
                 })
             }
         }
@@ -2094,6 +2601,32 @@ impl ::serde::Serialize for GenerateMetaInfo {
             "reasoning_tokens",
             &self.reasoning_tokens,
         )?;
+        if let Some(v) = &self.output_token_logprobs_length {
+            ::serde::ser::SerializeMap::serialize_entry(
+                &mut map,
+                "output_token_logprobs_length",
+                v,
+            )?;
+        }
+        if let Some(v) = &self.weight_version {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "weight_version", v)?;
+        }
+        if !self.weight_versions.is_empty() {
+            ::serde::ser::SerializeMap::serialize_entry(
+                &mut map,
+                "weight_versions",
+                &self.weight_versions,
+            )?;
+        }
+        if let Some(v) = &self.image_tokens {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "image_tokens", v)?;
+        }
+        if let Some(v) = &self.audio_tokens {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "audio_tokens", v)?;
+        }
+        if let Some(v) = &self.video_tokens {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "video_tokens", v)?;
+        }
         ::serde::ser::SerializeMap::end(map)
     }
 }
@@ -2124,6 +2657,12 @@ impl<'de> ::serde::Deserialize<'de> for GenerateMetaInfo {
                 let mut f_e2e_latency = None;
                 let mut f_cached_tokens = None;
                 let mut f_reasoning_tokens = None;
+                let mut f_output_token_logprobs_length = None;
+                let mut f_weight_version = None;
+                let mut f_weight_versions = None;
+                let mut f_image_tokens = None;
+                let mut f_audio_tokens = None;
+                let mut f_video_tokens = None;
                 while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
                     match key.as_ref() {
                         "id" => {
@@ -2243,6 +2782,48 @@ impl<'de> ::serde::Deserialize<'de> for GenerateMetaInfo {
                             }
                             f_reasoning_tokens = Some(map.next_value::<u64>()?);
                         }
+                        "output_token_logprobs_length" => {
+                            if f_output_token_logprobs_length.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "output_token_logprobs_length",
+                                ));
+                            }
+                            f_output_token_logprobs_length = Some(map.next_value::<Option<u64>>()?);
+                        }
+                        "weight_version" => {
+                            if f_weight_version.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("weight_version"));
+                            }
+                            f_weight_version =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "weight_versions" => {
+                            if f_weight_versions.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("weight_versions"));
+                            }
+                            f_weight_versions = Some(
+                                map.next_value::<Option<Vec<WeightVersionSpan>>>()?
+                                    .unwrap_or_default(),
+                            );
+                        }
+                        "image_tokens" => {
+                            if f_image_tokens.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("image_tokens"));
+                            }
+                            f_image_tokens = Some(map.next_value::<Option<u32>>()?);
+                        }
+                        "audio_tokens" => {
+                            if f_audio_tokens.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("audio_tokens"));
+                            }
+                            f_audio_tokens = Some(map.next_value::<Option<u32>>()?);
+                        }
+                        "video_tokens" => {
+                            if f_video_tokens.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("video_tokens"));
+                            }
+                            f_video_tokens = Some(map.next_value::<Option<u32>>()?);
+                        }
                         _ => {
                             map.next_value::<::serde::de::IgnoredAny>()?;
                         }
@@ -2263,6 +2844,73 @@ impl<'de> ::serde::Deserialize<'de> for GenerateMetaInfo {
                     e2e_latency: f_e2e_latency.flatten(),
                     cached_tokens: f_cached_tokens.unwrap_or_default(),
                     reasoning_tokens: f_reasoning_tokens.unwrap_or_default(),
+                    output_token_logprobs_length: f_output_token_logprobs_length.flatten(),
+                    weight_version: f_weight_version.flatten(),
+                    weight_versions: f_weight_versions.unwrap_or_default(),
+                    image_tokens: f_image_tokens.flatten(),
+                    audio_tokens: f_audio_tokens.flatten(),
+                    video_tokens: f_video_tokens.flatten(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for WeightVersionSpan {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "version", &self.version)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "start", &self.start)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "end", &self.end)?;
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for WeightVersionSpan {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = WeightVersionSpan;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct WeightVersionSpan")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_version = None;
+                let mut f_start = None;
+                let mut f_end = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "version" => {
+                            if f_version.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("version"));
+                            }
+                            f_version = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "start" => {
+                            if f_start.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("start"));
+                            }
+                            f_start = Some(map.next_value::<i64>()?);
+                        }
+                        "end" => {
+                            if f_end.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("end"));
+                            }
+                            f_end = Some(map.next_value::<i64>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(WeightVersionSpan {
+                    version: f_version.unwrap_or_default(),
+                    start: f_start.unwrap_or_default(),
+                    end: f_end.unwrap_or_default(),
                 })
             }
         }
@@ -2282,6 +2930,9 @@ impl ::serde::Serialize for GenerateResponse {
         }
         if let Some(v) = &self.index {
             ::serde::ser::SerializeMap::serialize_entry(&mut map, "index", v)?;
+        }
+        if let Some(v) = &self.prompt_token_ids {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "prompt_token_ids", v)?;
         }
         ::serde::ser::SerializeMap::end(map)
     }
@@ -2303,6 +2954,7 @@ impl<'de> ::serde::Deserialize<'de> for GenerateResponse {
                 let mut f_meta_info = None;
                 let mut f_output_ids = None;
                 let mut f_index = None;
+                let mut f_prompt_token_ids = None;
                 while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
                     match key.as_ref() {
                         "text" => {
@@ -2329,6 +2981,14 @@ impl<'de> ::serde::Deserialize<'de> for GenerateResponse {
                             }
                             f_index = Some(map.next_value::<Option<u32>>()?);
                         }
+                        "prompt_token_ids" => {
+                            if f_prompt_token_ids.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "prompt_token_ids",
+                                ));
+                            }
+                            f_prompt_token_ids = Some(map.next_value::<Option<TokenIds>>()?);
+                        }
                         _ => {
                             map.next_value::<::serde::de::IgnoredAny>()?;
                         }
@@ -2339,6 +2999,7 @@ impl<'de> ::serde::Deserialize<'de> for GenerateResponse {
                     meta_info: f_meta_info.flatten(),
                     output_ids: f_output_ids.flatten(),
                     index: f_index.flatten(),
+                    prompt_token_ids: f_prompt_token_ids.flatten(),
                 })
             }
         }
@@ -2825,6 +3486,697 @@ impl<'de> ::serde::Deserialize<'de> for MediaInput {
     }
 }
 
+impl ::serde::Serialize for GetHiCacheStorageRequest {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for GetHiCacheStorageRequest {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = GetHiCacheStorageRequest;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct GetHiCacheStorageRequest")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(GetHiCacheStorageRequest {})
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for AttachHiCacheStorageRequest {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        if let Some(v) = &self.hicache_storage_backend {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "hicache_storage_backend", v)?;
+        }
+        if let Some(v) = &self.hicache_storage_backend_extra_config_json {
+            ::serde::ser::SerializeMap::serialize_entry(
+                &mut map,
+                "hicache_storage_backend_extra_config_json",
+                v,
+            )?;
+        }
+        if let Some(v) = &self.hicache_storage_prefetch_policy {
+            ::serde::ser::SerializeMap::serialize_entry(
+                &mut map,
+                "hicache_storage_prefetch_policy",
+                v,
+            )?;
+        }
+        if let Some(v) = &self.hicache_write_policy {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "hicache_write_policy", v)?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for AttachHiCacheStorageRequest {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = AttachHiCacheStorageRequest;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct AttachHiCacheStorageRequest")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_hicache_storage_backend = None;
+                let mut f_hicache_storage_backend_extra_config_json = None;
+                let mut f_hicache_storage_prefetch_policy = None;
+                let mut f_hicache_write_policy = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "hicache_storage_backend" => {
+                            if f_hicache_storage_backend.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "hicache_storage_backend",
+                                ));
+                            }
+                            f_hicache_storage_backend =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "hicache_storage_backend_extra_config_json" => {
+                            if f_hicache_storage_backend_extra_config_json.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "hicache_storage_backend_extra_config_json",
+                                ));
+                            }
+                            f_hicache_storage_backend_extra_config_json =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "hicache_storage_prefetch_policy" => {
+                            if f_hicache_storage_prefetch_policy.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "hicache_storage_prefetch_policy",
+                                ));
+                            }
+                            f_hicache_storage_prefetch_policy =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "hicache_write_policy" => {
+                            if f_hicache_write_policy.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "hicache_write_policy",
+                                ));
+                            }
+                            f_hicache_write_policy =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(AttachHiCacheStorageRequest {
+                    hicache_storage_backend: f_hicache_storage_backend.flatten(),
+                    hicache_storage_backend_extra_config_json:
+                        f_hicache_storage_backend_extra_config_json.flatten(),
+                    hicache_storage_prefetch_policy: f_hicache_storage_prefetch_policy.flatten(),
+                    hicache_write_policy: f_hicache_write_policy.flatten(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for DetachHiCacheStorageRequest {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for DetachHiCacheStorageRequest {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = DetachHiCacheStorageRequest;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct DetachHiCacheStorageRequest")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(DetachHiCacheStorageRequest {})
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for ClearHiCacheStorageRequest {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for ClearHiCacheStorageRequest {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = ClearHiCacheStorageRequest;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct ClearHiCacheStorageRequest")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(ClearHiCacheStorageRequest {})
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for HiCacheStatus {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "hicache_storage_backend",
+            &self.hicache_storage_backend,
+        )?;
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "hicache_storage_backend_extra_config",
+            &self.hicache_storage_backend_extra_config,
+        )?;
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "hicache_storage_prefetch_policy",
+            &self.hicache_storage_prefetch_policy,
+        )?;
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "hicache_write_policy",
+            &self.hicache_write_policy,
+        )?;
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for HiCacheStatus {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = HiCacheStatus;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct HiCacheStatus")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_hicache_storage_backend = None;
+                let mut f_hicache_storage_backend_extra_config = None;
+                let mut f_hicache_storage_prefetch_policy = None;
+                let mut f_hicache_write_policy = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "hicache_storage_backend" => {
+                            if f_hicache_storage_backend.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "hicache_storage_backend",
+                                ));
+                            }
+                            f_hicache_storage_backend =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "hicache_storage_backend_extra_config" => {
+                            if f_hicache_storage_backend_extra_config.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "hicache_storage_backend_extra_config",
+                                ));
+                            }
+                            f_hicache_storage_backend_extra_config =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "hicache_storage_prefetch_policy" => {
+                            if f_hicache_storage_prefetch_policy.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "hicache_storage_prefetch_policy",
+                                ));
+                            }
+                            f_hicache_storage_prefetch_policy =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "hicache_write_policy" => {
+                            if f_hicache_write_policy.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "hicache_write_policy",
+                                ));
+                            }
+                            f_hicache_write_policy =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(HiCacheStatus {
+                    hicache_storage_backend: f_hicache_storage_backend.flatten(),
+                    hicache_storage_backend_extra_config: f_hicache_storage_backend_extra_config
+                        .flatten(),
+                    hicache_storage_prefetch_policy: f_hicache_storage_prefetch_policy.flatten(),
+                    hicache_write_policy: f_hicache_write_policy.flatten(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for HiCacheStorageResponse {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "success", &self.success)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "message", &self.message)?;
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for HiCacheStorageResponse {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = HiCacheStorageResponse;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct HiCacheStorageResponse")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_success = None;
+                let mut f_message = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "success" => {
+                            if f_success.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("success"));
+                            }
+                            f_success = Some(map.next_value::<bool>()?);
+                        }
+                        "message" => {
+                            if f_message.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("message"));
+                            }
+                            f_message = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(HiCacheStorageResponse {
+                    success: f_success.unwrap_or_default(),
+                    message: f_message.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for ListModelsRequest {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for ListModelsRequest {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = ListModelsRequest;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct ListModelsRequest")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(ListModelsRequest {})
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for ListModelsResponse {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        if !self.models.is_empty() {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "models", &self.models)?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for ListModelsResponse {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = ListModelsResponse;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct ListModelsResponse")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_models = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "models" => {
+                            if f_models.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("models"));
+                            }
+                            f_models = Some(
+                                map.next_value::<Option<Vec<ModelCard>>>()?
+                                    .unwrap_or_default(),
+                            );
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(ListModelsResponse {
+                    models: f_models.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for ModelCard {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "id", &self.id)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "root", &self.root)?;
+        if let Some(v) = &self.parent {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "parent", v)?;
+        }
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "max_model_len",
+            &self.max_model_len,
+        )?;
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for ModelCard {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = ModelCard;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct ModelCard")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_id = None;
+                let mut f_root = None;
+                let mut f_parent = None;
+                let mut f_max_model_len = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "id" => {
+                            if f_id.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("id"));
+                            }
+                            f_id = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "root" => {
+                            if f_root.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("root"));
+                            }
+                            f_root = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "parent" => {
+                            if f_parent.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("parent"));
+                            }
+                            f_parent =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "max_model_len" => {
+                            if f_max_model_len.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("max_model_len"));
+                            }
+                            f_max_model_len = Some(map.next_value::<u64>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(ModelCard {
+                    id: f_id.unwrap_or_default(),
+                    root: f_root.unwrap_or_default(),
+                    parent: f_parent.flatten(),
+                    max_model_len: f_max_model_len.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for DetokenizeRequest {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        if !self.tokens.is_empty() {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "tokens", &self.tokens)?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for DetokenizeRequest {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = DetokenizeRequest;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct DetokenizeRequest")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_tokens = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "tokens" => {
+                            if f_tokens.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("tokens"));
+                            }
+                            f_tokens =
+                                Some(map.next_value::<Option<Vec<i64>>>()?.unwrap_or_default());
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(DetokenizeRequest {
+                    tokens: f_tokens.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for DetokenizeResponse {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "text", &self.text)?;
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for DetokenizeResponse {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = DetokenizeResponse;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct DetokenizeResponse")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_text = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "text" => {
+                            if f_text.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("text"));
+                            }
+                            f_text = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(DetokenizeResponse {
+                    text: f_text.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for AbortRequest {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "rid", &self.rid)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "abort_all", &self.abort_all)?;
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for AbortRequest {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = AbortRequest;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct AbortRequest")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_rid = None;
+                let mut f_abort_all = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "rid" => {
+                            if f_rid.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("rid"));
+                            }
+                            f_rid = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "abort_all" => {
+                            if f_abort_all.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("abort_all"));
+                            }
+                            f_abort_all = Some(map.next_value::<bool>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(AbortRequest {
+                    rid: f_rid.unwrap_or_default(),
+                    abort_all: f_abort_all.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for AbortResponse {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "success", &self.success)?;
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for AbortResponse {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = AbortResponse;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct AbortResponse")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_success = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "success" => {
+                            if f_success.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("success"));
+                            }
+                            f_success = Some(map.next_value::<bool>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(AbortResponse {
+                    success: f_success.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
 impl ::serde::Serialize for HealthCheckRequest {
     fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let map = serializer.serialize_map(None)?;
@@ -3171,6 +4523,21 @@ impl ::serde::Serialize for GetServerInfoResponse {
                 .collect();
             ::serde::ser::SerializeMap::serialize_entry(&mut map, "internal_states", &rows)?;
         }
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "host", &self.host)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "port", &self.port)?;
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "incremental_streaming_output",
+            &self.incremental_streaming_output,
+        )?;
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "disaggregation_mode",
+            &self.disaggregation_mode,
+        )?;
+        if let Some(v) = &self.deployment_info {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "deployment_info", v)?;
+        }
         ::serde::ser::SerializeMap::end(map)
     }
 }
@@ -3194,6 +4561,11 @@ impl<'de> ::serde::Deserialize<'de> for GetServerInfoResponse {
                 let mut f_max_total_num_tokens = None;
                 let mut f_version = None;
                 let mut f_internal_states = None;
+                let mut f_host = None;
+                let mut f_port = None;
+                let mut f_incremental_streaming_output = None;
+                let mut f_disaggregation_mode = None;
+                let mut f_deployment_info = None;
                 while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
                     match key.as_ref() {
                         "model_path" => {
@@ -3253,6 +4625,41 @@ impl<'de> ::serde::Deserialize<'de> for GetServerInfoResponse {
                                     .collect(),
                             );
                         }
+                        "host" => {
+                            if f_host.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("host"));
+                            }
+                            f_host = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "port" => {
+                            if f_port.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("port"));
+                            }
+                            f_port = Some(map.next_value::<u32>()?);
+                        }
+                        "incremental_streaming_output" => {
+                            if f_incremental_streaming_output.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "incremental_streaming_output",
+                                ));
+                            }
+                            f_incremental_streaming_output = Some(map.next_value::<bool>()?);
+                        }
+                        "disaggregation_mode" => {
+                            if f_disaggregation_mode.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "disaggregation_mode",
+                                ));
+                            }
+                            f_disaggregation_mode =
+                                Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "deployment_info" => {
+                            if f_deployment_info.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("deployment_info"));
+                            }
+                            f_deployment_info = Some(map.next_value::<Option<DeploymentInfo>>()?);
+                        }
                         _ => {
                             map.next_value::<::serde::de::IgnoredAny>()?;
                         }
@@ -3266,6 +4673,352 @@ impl<'de> ::serde::Deserialize<'de> for GetServerInfoResponse {
                     max_total_num_tokens: f_max_total_num_tokens.flatten(),
                     version: f_version.unwrap_or_default(),
                     internal_states: f_internal_states.unwrap_or_default(),
+                    host: f_host.unwrap_or_default(),
+                    port: f_port.unwrap_or_default(),
+                    incremental_streaming_output: f_incremental_streaming_output
+                        .unwrap_or_default(),
+                    disaggregation_mode: f_disaggregation_mode.unwrap_or_default(),
+                    deployment_info: f_deployment_info.flatten(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for DeploymentInfo {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        if let Some(v) = &self.disaggregation_bootstrap_port {
+            ::serde::ser::SerializeMap::serialize_entry(
+                &mut map,
+                "disaggregation_bootstrap_port",
+                v,
+            )?;
+        }
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "node_rank", &self.node_rank)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "nnodes", &self.nnodes)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "dp_size", &self.dp_size)?;
+        if let Some(v) = &self.dp_rank {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "dp_rank", v)?;
+        }
+        if let Some(v) = &self.dist_init_addr {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "dist_init_addr", v)?;
+        }
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "base_gpu_id", &self.base_gpu_id)?;
+        if let Some(v) = &self.page_size {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "page_size", v)?;
+        }
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "dcp_size", &self.dcp_size)?;
+        if let Some(v) = &self.max_running_requests {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "max_running_requests", v)?;
+        }
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "max_prefill_tokens",
+            &self.max_prefill_tokens,
+        )?;
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "enable_dp_attention",
+            &self.enable_dp_attention,
+        )?;
+        if let Some(v) = &self.speculative_algorithm {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "speculative_algorithm", v)?;
+        }
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "enable_hierarchical_cache",
+            &self.enable_hierarchical_cache,
+        )?;
+        if let Some(v) = &self.hicache_ratio {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "hicache_ratio", v)?;
+        }
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "hicache_size", &self.hicache_size)?;
+        if let Some(v) = &self.hicache_write_policy {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "hicache_write_policy", v)?;
+        }
+        if let Some(v) = &self.hicache_host_total_tokens {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "hicache_host_total_tokens", v)?;
+        }
+        if !self.kv_event_sources.is_empty() {
+            ::serde::ser::SerializeMap::serialize_entry(
+                &mut map,
+                "kv_event_sources",
+                &self.kv_event_sources,
+            )?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for DeploymentInfo {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = DeploymentInfo;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct DeploymentInfo")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_disaggregation_bootstrap_port = None;
+                let mut f_node_rank = None;
+                let mut f_nnodes = None;
+                let mut f_dp_size = None;
+                let mut f_dp_rank = None;
+                let mut f_dist_init_addr = None;
+                let mut f_base_gpu_id = None;
+                let mut f_page_size = None;
+                let mut f_dcp_size = None;
+                let mut f_max_running_requests = None;
+                let mut f_max_prefill_tokens = None;
+                let mut f_enable_dp_attention = None;
+                let mut f_speculative_algorithm = None;
+                let mut f_enable_hierarchical_cache = None;
+                let mut f_hicache_ratio = None;
+                let mut f_hicache_size = None;
+                let mut f_hicache_write_policy = None;
+                let mut f_hicache_host_total_tokens = None;
+                let mut f_kv_event_sources = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "disaggregation_bootstrap_port" => {
+                            if f_disaggregation_bootstrap_port.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "disaggregation_bootstrap_port",
+                                ));
+                            }
+                            f_disaggregation_bootstrap_port =
+                                Some(map.next_value::<Option<u32>>()?);
+                        }
+                        "node_rank" => {
+                            if f_node_rank.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("node_rank"));
+                            }
+                            f_node_rank = Some(map.next_value::<u32>()?);
+                        }
+                        "nnodes" => {
+                            if f_nnodes.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("nnodes"));
+                            }
+                            f_nnodes = Some(map.next_value::<u32>()?);
+                        }
+                        "dp_size" => {
+                            if f_dp_size.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("dp_size"));
+                            }
+                            f_dp_size = Some(map.next_value::<u32>()?);
+                        }
+                        "dp_rank" => {
+                            if f_dp_rank.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("dp_rank"));
+                            }
+                            f_dp_rank = Some(map.next_value::<Option<u32>>()?);
+                        }
+                        "dist_init_addr" => {
+                            if f_dist_init_addr.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("dist_init_addr"));
+                            }
+                            f_dist_init_addr =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "base_gpu_id" => {
+                            if f_base_gpu_id.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("base_gpu_id"));
+                            }
+                            f_base_gpu_id = Some(map.next_value::<u32>()?);
+                        }
+                        "page_size" => {
+                            if f_page_size.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("page_size"));
+                            }
+                            f_page_size = Some(map.next_value::<Option<u32>>()?);
+                        }
+                        "dcp_size" => {
+                            if f_dcp_size.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("dcp_size"));
+                            }
+                            f_dcp_size = Some(map.next_value::<u32>()?);
+                        }
+                        "max_running_requests" => {
+                            if f_max_running_requests.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "max_running_requests",
+                                ));
+                            }
+                            f_max_running_requests = Some(map.next_value::<Option<u64>>()?);
+                        }
+                        "max_prefill_tokens" => {
+                            if f_max_prefill_tokens.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "max_prefill_tokens",
+                                ));
+                            }
+                            f_max_prefill_tokens = Some(map.next_value::<u64>()?);
+                        }
+                        "enable_dp_attention" => {
+                            if f_enable_dp_attention.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "enable_dp_attention",
+                                ));
+                            }
+                            f_enable_dp_attention = Some(map.next_value::<bool>()?);
+                        }
+                        "speculative_algorithm" => {
+                            if f_speculative_algorithm.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "speculative_algorithm",
+                                ));
+                            }
+                            f_speculative_algorithm =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "enable_hierarchical_cache" => {
+                            if f_enable_hierarchical_cache.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "enable_hierarchical_cache",
+                                ));
+                            }
+                            f_enable_hierarchical_cache = Some(map.next_value::<bool>()?);
+                        }
+                        "hicache_ratio" => {
+                            if f_hicache_ratio.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("hicache_ratio"));
+                            }
+                            f_hicache_ratio = Some(map.next_value::<Option<f64>>()?);
+                        }
+                        "hicache_size" => {
+                            if f_hicache_size.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("hicache_size"));
+                            }
+                            f_hicache_size = Some(map.next_value::<u64>()?);
+                        }
+                        "hicache_write_policy" => {
+                            if f_hicache_write_policy.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "hicache_write_policy",
+                                ));
+                            }
+                            f_hicache_write_policy =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "hicache_host_total_tokens" => {
+                            if f_hicache_host_total_tokens.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "hicache_host_total_tokens",
+                                ));
+                            }
+                            f_hicache_host_total_tokens = Some(map.next_value::<Option<u64>>()?);
+                        }
+                        "kv_event_sources" => {
+                            if f_kv_event_sources.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "kv_event_sources",
+                                ));
+                            }
+                            f_kv_event_sources = Some(
+                                map.next_value::<Option<Vec<KvEventSource>>>()?
+                                    .unwrap_or_default(),
+                            );
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(DeploymentInfo {
+                    disaggregation_bootstrap_port: f_disaggregation_bootstrap_port.flatten(),
+                    node_rank: f_node_rank.unwrap_or_default(),
+                    nnodes: f_nnodes.unwrap_or_default(),
+                    dp_size: f_dp_size.unwrap_or_default(),
+                    dp_rank: f_dp_rank.flatten(),
+                    dist_init_addr: f_dist_init_addr.flatten(),
+                    base_gpu_id: f_base_gpu_id.unwrap_or_default(),
+                    page_size: f_page_size.flatten(),
+                    dcp_size: f_dcp_size.unwrap_or_default(),
+                    max_running_requests: f_max_running_requests.flatten(),
+                    max_prefill_tokens: f_max_prefill_tokens.unwrap_or_default(),
+                    enable_dp_attention: f_enable_dp_attention.unwrap_or_default(),
+                    speculative_algorithm: f_speculative_algorithm.flatten(),
+                    enable_hierarchical_cache: f_enable_hierarchical_cache.unwrap_or_default(),
+                    hicache_ratio: f_hicache_ratio.flatten(),
+                    hicache_size: f_hicache_size.unwrap_or_default(),
+                    hicache_write_policy: f_hicache_write_policy.flatten(),
+                    hicache_host_total_tokens: f_hicache_host_total_tokens.flatten(),
+                    kv_event_sources: f_kv_event_sources.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for KvEventSource {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "dp_rank", &self.dp_rank)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "endpoint", &self.endpoint)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "topic", &self.topic)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "block_size", &self.block_size)?;
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for KvEventSource {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = KvEventSource;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct KvEventSource")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_dp_rank = None;
+                let mut f_endpoint = None;
+                let mut f_topic = None;
+                let mut f_block_size = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "dp_rank" => {
+                            if f_dp_rank.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("dp_rank"));
+                            }
+                            f_dp_rank = Some(map.next_value::<u32>()?);
+                        }
+                        "endpoint" => {
+                            if f_endpoint.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("endpoint"));
+                            }
+                            f_endpoint = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "topic" => {
+                            if f_topic.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("topic"));
+                            }
+                            f_topic = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "block_size" => {
+                            if f_block_size.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("block_size"));
+                            }
+                            f_block_size = Some(map.next_value::<u32>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(KvEventSource {
+                    dp_rank: f_dp_rank.unwrap_or_default(),
+                    endpoint: f_endpoint.unwrap_or_default(),
+                    topic: f_topic.unwrap_or_default(),
+                    block_size: f_block_size.unwrap_or_default(),
                 })
             }
         }
