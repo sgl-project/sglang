@@ -1337,9 +1337,9 @@ class AscendAttnBackend(AttentionBackend):
         metadata.seq_lens_cpu_int = metadata.seq_lens_cpu_list = None
 
     def _forward_mojo_mtp(self, q, layer, forward_batch, sinks):
-        from sglang.srt.hardware_backend.npu.attention.mojo_mtp import (
-            mojo_paged_mtp_decode,
-        )
+        # The kernel ships in sgl-kernel-npu; see
+        # sgl_kernel_npu.attention.mojo_mtp.
+        from sgl_kernel_npu.attention.mojo_mtp import mojo_paged_mtp_decode
 
         if layer.sliding_window_size != -1 or sinks is not None:
             raise ValueError(

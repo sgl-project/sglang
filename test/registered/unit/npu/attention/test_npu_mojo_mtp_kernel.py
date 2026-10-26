@@ -5,7 +5,6 @@ The child process sets TRITON_INTERPRET before importing Triton, leaving other
 tests' compiler settings untouched. This does not replace NPU hardware tests.
 """
 
-import importlib.util
 import os
 import subprocess
 import sys
@@ -41,12 +40,8 @@ def run_numeric_cases():
 
     import torch
 
-    root = Path(__file__).resolve().parents[5]
-    source = root / "python/sglang/srt/hardware_backend/npu/attention/mojo_mtp.py"
-    spec = importlib.util.spec_from_file_location("mojo_kernel_under_test", source)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
+    # The kernel ships in sgl-kernel-npu, not in this tree.
+    from sgl_kernel_npu.attention import mojo_mtp as module
     torch.set_num_threads(1)
     generator = torch.Generator().manual_seed(24)
     cases = 0

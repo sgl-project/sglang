@@ -157,7 +157,7 @@ def test_forward_uses_device_lengths_without_host_attention_and_restores_dp_padd
         else mod.AttentionType.ENCODER_ONLY,
     )
     kernel = Mock(side_effect=lambda **kw: torch.ones_like(kw["query"]))
-    module_name = "sglang.srt.hardware_backend.npu.attention.mojo_mtp"
+    module_name = "sgl_kernel_npu.attention.mojo_mtp"
     with (
         patch.dict(
             sys.modules, {module_name: SimpleNamespace(mojo_paged_mtp_decode=kernel)}
