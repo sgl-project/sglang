@@ -25,11 +25,11 @@ PAGE_SIZE = 64
 PREFILL_POOL_TOKENS = 4096  # Per rank: CP2 has 8192 logical GPU slots.
 PRESSURE_TOKENS = 6144
 FILLER = "The grass is green. The sky is blue. Here we go, there and back again. "
-# Both workers run on one host. Use CUDA IPC for ordinary CUDA allocations;
-# fabric NVLink cannot import them on GB300 runners without a visible HCA.
+# Match test_disaggregation_aarch64.py on this GB300 runner: fabric NVLink
+# requires exportable KV buffers from Mooncake's NVLink allocator.
 MOONCAKE_ENV = {
-    "MC_INTRANODE_NVLINK": "true",
-    "SGLANG_MOONCAKE_CUSTOM_MEM_POOL": "INTRA_NODE_NVLINK",
+    "MC_FORCE_MNNVL": "true",
+    "SGLANG_MOONCAKE_CUSTOM_MEM_POOL": "NVLINK",
     "SGLANG_DISAGG_STAGING_BUFFER": "0",
 }
 COMMON_ARGS = [
