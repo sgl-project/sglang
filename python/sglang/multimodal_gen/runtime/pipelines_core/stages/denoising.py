@@ -304,6 +304,11 @@ class DenoisingStage(PipelineStage):
     the initial noise into the final output.
     """
 
+    def default_workload_iterations(
+        self, batch: Req, num_inference_steps: int
+    ) -> int | None:
+        return num_inference_steps
+
     @property
     def role_affinity(self):
         return RoleType.DENOISER

@@ -25,6 +25,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.flux import (
     Flux2PipelineConfig,
     FluxPipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.helios import (
+    HeliosDistilledConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.hunyuan import FastHunyuanConfig
 from sglang.multimodal_gen.configs.pipeline_configs.lingbot_world import (
     LingBotWorldCausalDMDConfig,
@@ -1899,6 +1902,49 @@ class TestOffloadDefaults(_CudaPlatformTestCase):
         self.assertTrue(args.dit_cpu_offload)
         self.assertEqual(args.layerwise_offload_components, ["dit"])
         self.assertEqual(args.residency_mode("transformer"), LAYERWISE_OFFLOAD)
+
+    def test_server_warmup_keeps_high_memory_residency_defaults(self):
+        # Calibration refines the threshold placement; it never starts below
+        # it, otherwise a declined promotion serves slower than main.
+        args = self._from_dict_with_pipeline_config(
+            Cosmos3Config(),
+            memory_gb=140,
+            kwargs={"performance_mode": "auto", "warmup_mode": "server"},
+        )
+
+        self.assertEqual(args.residency_mode("transformer"), RESIDENT)
+        self.assertEqual(args.residency_mode("vae"), RESIDENT)
+
+    def test_no_warmup_keeps_model_residency_fallback(self):
+        args = self._from_dict_with_pipeline_config(
+            Cosmos3Config(),
+            memory_gb=140,
+            kwargs={"performance_mode": "auto", "warmup_mode": "off"},
+        )
+
+        self.assertEqual(args.residency_mode("transformer"), RESIDENT)
+        self.assertEqual(args.residency_mode("vae"), RESIDENT)
+
+    def test_sana_wm_and_helios_declare_model_residency_hints(self):
+        sana_wm_deployment = SanaWMPipelineConfig().get_model_deployment_config()
+        self.assertEqual(sana_wm_deployment.fsdp_auto_min_available_memory_gb, 60)
+        self.assertEqual(sana_wm_deployment.dit_layerwise_offload_modes, ("memory",))
+        self.assertEqual(sana_wm_deployment.keep_resident_min_available_gb, 120)
+        self.assertEqual(sana_wm_deployment.keep_resident_components, ("dit", "vae"))
+
+        helios_deployment = HeliosDistilledConfig().get_model_deployment_config()
+        self.assertEqual(helios_deployment.keep_resident_min_available_gb, 120)
+        self.assertEqual(helios_deployment.keep_resident_components, ("dit", "vae"))
+        self.assertEqual(helios_deployment.dit_layerwise_offload_modes, ("memory",))
+
+    def test_realtime_server_keeps_model_residency_fallback(self):
+        args = self._from_dict_with_pipeline_config(
+            SanaWMRealtimeConfig(),
+            memory_gb=140,
+            kwargs={"performance_mode": "auto", "warmup_mode": "server"},
+        )
+
+        self.assertEqual(args.residency_mode("transformer"), RESIDENT)
 
     def test_cosmos3_resident_threshold_follows_checkpoint_size(self):
         def threshold(**kwargs):
@@ -3964,7 +4010,7 @@ class TestDirectGpuWeightLoading(_CudaPlatformTestCase):
         args.use_fsdp_inference = False
         args.tp_size = 1
         args._explicit_arg_names = set()
-        args._required_resident_components = set()
+        args._required_resident_components = {}
         args._component_layerwise_capabilities = {}
         return args
 

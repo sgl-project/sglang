@@ -1218,6 +1218,11 @@ class Cosmos3DenoisingStage(PipelineStage):
 
     parallelism_type = StageParallelismType.REPLICATED
 
+    def default_workload_iterations(
+        self, batch: Req, num_inference_steps: int
+    ) -> int | None:
+        return num_inference_steps
+
     def __init__(
         self,
         transformer,
