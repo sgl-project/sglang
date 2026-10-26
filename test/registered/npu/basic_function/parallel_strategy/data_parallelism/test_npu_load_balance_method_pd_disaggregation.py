@@ -83,9 +83,7 @@ class BaseTestNPULoadBalanceMethodDPDisaggregation(TestDisaggregationBase):
             0.8,
             "--dist-init-addr",
             "127.0.0.1:10100",
-            # Start at card 0 so prefill uses cards 0-1 and decode (base-gpu-id 2)
-            # uses cards 2-3, i.e. the test fits a 4-card runner. It used to be 4
-            # (prefill on cards 4-5), which required >= 6 visible cards.
+            # Use cards 0-1 here and 2-3 for decode, so the test fits 4 cards.
             "--base-gpu-id",
             0,
         ]
