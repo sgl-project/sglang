@@ -22,6 +22,10 @@ from sglang.srt.entrypoints.openai.protocol import (  # noqa: E402
     ChatCompletionRequest,
     ChatCompletionResponse,
 )
+from sglang.srt.parser.jinja_template_utils import (  # noqa: E402
+    detect_jinja_template_content_format,
+    process_content_for_template_format,
+)
 from sglang.srt.parser.template_detection import (  # noqa: E402
     detect_inline_system_support,
 )
@@ -114,6 +118,99 @@ def _choice(delta, finish_reason=None):
         "delta": delta,
         "finish_reason": finish_reason,
     }
+
+
+_CLAUDE_CODE_SYSTEM = (
+    "You are a coding agent. Follow repository conventions and run tests "
+    "before finishing. "
+) * 20
+_CLAUDE_CODE_ENV = "<env>cwd: /repo\nplatform: linux\ndate: 2026-10-09</env>"
+_CLAUDE_CODE_TASKS = [
+    "Find why test_cache fails.",
+    "Fix it without changing the API.",
+    "Run the full test suite.",
+    "Add a regression test.",
+    "Write a changelog line.",
+]
+
+
+def _claude_code_requests():
+    """Message lists in the order Claude Code sends them (#42272).
+
+    Every turn adds a user message, an inline system env block, a tool_use,
+    a tool_result, an inline ``<total_tokens>`` reminder and an assistant
+    reply. The model is called twice per turn (to pick the tool, then to
+    answer after its result), and every request resends the full history.
+    """
+    messages, requests, budget = [], [], 200000
+    for i, task in enumerate(_CLAUDE_CODE_TASKS):
+        messages.append({"role": "user", "content": task})
+        messages.append({"role": "system", "content": _CLAUDE_CODE_ENV})
+        requests.append(list(messages))
+        messages.append(
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": f"call_{i}",
+                        "name": "read_file",
+                        "input": {"path": f"src/mod_{i}.py"},
+                    }
+                ],
+            }
+        )
+        messages.append(
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": f"call_{i}",
+                        "content": f"def f_{i}():\n    return {i}\n" * 8,
+                    }
+                ],
+            }
+        )
+        budget -= 1500
+        messages.append(
+            {
+                "role": "system",
+                "content": f"<total_tokens>{budget} tokens left</total_tokens>",
+            }
+        )
+        requests.append(list(messages))
+        messages.append({"role": "assistant", "content": f"Done with step {i + 1}."})
+    return requests
+
+
+def _render_prompt(tokenizer, chat_request):
+    """Prompt text and token ids the Jinja path would prefill for ``chat_request``.
+
+    Follows ``OpenAIServingChat._apply_jinja_template`` for a text-only
+    template: tool-call arguments go back to objects, list content is
+    flattened for the template's content format, and the rendered prompt is
+    encoded without extra special tokens.
+    """
+    content_format = detect_jinja_template_content_format(tokenizer.chat_template)
+    messages = []
+    for message in chat_request.messages:
+        msg_dict = message.model_dump()
+        for tool_call in msg_dict.get("tool_calls") or []:
+            function = tool_call.get("function") or {}
+            if isinstance(function.get("arguments"), str):
+                function["arguments"] = json.loads(function["arguments"])
+        if msg_dict.get("content") is None:
+            msg_dict["content"] = ""
+        messages.append(
+            process_content_for_template_format(
+                msg_dict, content_format, [], [], [], []
+            )
+        )
+    prompt = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+    return prompt, tokenizer.encode(prompt, add_special_tokens=False)
 
 
 async def _collect_anthropic_events(serving, anthropic_request):
@@ -1627,10 +1724,9 @@ class TestAnthropicServing(unittest.TestCase):
 
     def test_in_messages_system_merged_when_template_requires_first(self):
         """When the chat template rejects mid-conversation ``role: "system"``
-        (e.g. Qwen's system-first guard), the converter folds the inline
-        system turn into the leading system block so the template doesn't
-        400. The request object itself is no longer mutated — detection runs
-        in the serving layer on conversion."""
+        (e.g. Qwen's system-first guard), the converter attaches the inline
+        system turn in place to the preceding user message so the template
+        doesn't 400 and earlier prompt prefixes remain stable for prefix caching."""
         serving = self._serving()
         request = self._anthropic_request(
             stream=False,
@@ -1643,15 +1739,17 @@ class TestAnthropicServing(unittest.TestCase):
         self.assertIsNone(request.system)
         self.assertEqual([m.role for m in request.messages], ["user", "system", "user"])
         chat_request = serving._convert_to_chat_completion_request(request)
+        self.assertEqual([m.role for m in chat_request.messages], ["user", "user"])
         self.assertEqual(
-            [m.role for m in chat_request.messages], ["system", "user", "user"]
+            chat_request.messages[0].content,
+            "hi\n\n<system>\nReply with exactly: OK\n</system>",
         )
-        self.assertEqual(chat_request.messages[0].content, "Reply with exactly: OK")
+        self.assertEqual(chat_request.messages[1].content, "go")
 
     def test_in_messages_system_merged_with_top_level_when_merge(self):
-        """On the merge path, a top-level ``system`` field and a mid-conversation
-        system turn are joined into the leading system block; top-level text
-        comes first."""
+        """On the merge path, a top-level ``system`` field is kept in the leading
+        system block while mid-conversation system turns attach in place, preserving
+        the prefix cache across turns."""
         serving = self._serving()
         request = self._anthropic_request(
             stream=False,
@@ -1668,9 +1766,12 @@ class TestAnthropicServing(unittest.TestCase):
         self.assertEqual(
             [m.role for m in chat_request.messages], ["system", "user", "user"]
         )
+        self.assertEqual(chat_request.messages[0].content, "You are terse.")
         self.assertEqual(
-            chat_request.messages[0].content, "You are terse.\nOne word only."
+            chat_request.messages[1].content,
+            "hi\n\n<system>\nOne word only.\n</system>",
         )
+        self.assertEqual(chat_request.messages[2].content, "go")
 
     def test_in_messages_system_passed_through_when_template_allows_inline(self):
         """When the chat template renders ``role: "system"`` at any position
@@ -1748,8 +1849,8 @@ class TestAnthropicServing(unittest.TestCase):
 
     def test_constructed_message_objects_merged_on_merge_path(self):
         """Requests built programmatically with ``AnthropicMessage`` objects
-        (e.g. ``handle_count_tokens``) also get inline system folded into the
-        leading block on the merge path."""
+        (e.g. ``handle_count_tokens``) also get inline system attached in place
+        on the merge path."""
         serving = self._serving()
         request = AnthropicMessagesRequest(
             model="m",
@@ -1762,10 +1863,12 @@ class TestAnthropicServing(unittest.TestCase):
         )
         self.assertEqual([m.role for m in request.messages], ["user", "system", "user"])
         chat_request = serving._convert_to_chat_completion_request(request)
+        self.assertEqual([m.role for m in chat_request.messages], ["user", "user"])
         self.assertEqual(
-            [m.role for m in chat_request.messages], ["system", "user", "user"]
+            chat_request.messages[0].content,
+            "hi\n\n<system>\nbe terse\n</system>",
         )
-        self.assertEqual(chat_request.messages[0].content, "be terse")
+        self.assertEqual(chat_request.messages[1].content, "go")
 
     def test_thinking_history_drop_on_missing_detector(self):
         """Replaying a thinking block on a non-reasoning model should not 400."""
@@ -1834,6 +1937,183 @@ class TestAnthropicServing(unittest.TestCase):
             any("content_filter" in rec for rec in log.output),
             f"expected a warning mentioning the unmapped finish_reason: {log.output}",
         )
+
+    def test_in_messages_leading_inline_system_emitted_as_user(self):
+        """When an inline system message is leading (no preceding user or tool message),
+        it is emitted as a user message wrapped in <system> tags on the merge path."""
+        serving = self._serving()
+        request = self._anthropic_request(
+            stream=False,
+            messages=[
+                {"role": "system", "content": "Initial instruction"},
+                {"role": "user", "content": "hello"},
+            ],
+        )
+        chat_request = serving._convert_to_chat_completion_request(request)
+        self.assertEqual([m.role for m in chat_request.messages], ["user", "user"])
+        self.assertEqual(
+            chat_request.messages[0].content,
+            "<system>\nInitial instruction\n</system>",
+        )
+        self.assertEqual(chat_request.messages[1].content, "hello")
+
+    def test_in_messages_system_attached_to_preceding_tool_result(self):
+        """Mid-conversation system messages following a tool result are attached in place
+        to the preceding tool message on the merge path."""
+        serving = self._serving()
+        request = self._anthropic_request(
+            stream=False,
+            messages=[
+                {"role": "user", "content": "lookup sglang"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "call_1",
+                            "name": "search",
+                            "input": {"q": "sglang"},
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "call_1",
+                            "content": "found repository",
+                        }
+                    ],
+                },
+                {"role": "system", "content": "<total_tokens>150</total_tokens>"},
+            ],
+        )
+        chat_request = serving._convert_to_chat_completion_request(request)
+        self.assertEqual(
+            [m.role for m in chat_request.messages],
+            ["user", "assistant", "tool"],
+        )
+        self.assertEqual(
+            chat_request.messages[2].content,
+            "found repository\n\n<system>\n<total_tokens>150</total_tokens>\n</system>",
+        )
+
+    def test_in_messages_system_attached_to_multipart_user_content(self):
+        """When preceding user message has structured list content, inline system
+        is appended as a text block on the merge path."""
+        serving = self._serving()
+        request = self._anthropic_request(
+            stream=False,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "task 1"},
+                        {"type": "text", "text": "details"},
+                    ],
+                },
+                {"role": "system", "content": "env: v1"},
+            ],
+        )
+        chat_request = serving._convert_to_chat_completion_request(request)
+        self.assertEqual([m.role for m in chat_request.messages], ["user"])
+        self.assertEqual(
+            [p.text for p in chat_request.messages[0].content],
+            ["task 1", "details", "<system>\nenv: v1\n</system>"],
+        )
+
+    def test_in_messages_system_prefix_cache_multi_turn_invariant(self):
+        """Multi-turn verification: Turn 2's converted messages must strictly contain
+        Turn 1's converted messages as an identical prefix, preventing prefix cache churn
+        under RadixAttention."""
+        serving = self._serving()
+        turn1_messages = [
+            {"role": "user", "content": "task 1"},
+            {"role": "system", "content": "env: v1"},
+        ]
+        turn2_messages = turn1_messages + [
+            {"role": "assistant", "content": [{"type": "text", "text": "done"}]},
+            {"role": "user", "content": "task 2"},
+            {"role": "system", "content": "token_budget: 1000"},
+        ]
+
+        req1 = self._anthropic_request(
+            stream=False, system="base system", messages=turn1_messages
+        )
+        req2 = self._anthropic_request(
+            stream=False, system="base system", messages=turn2_messages
+        )
+
+        chat_req1 = serving._convert_to_chat_completion_request(req1)
+        chat_req2 = serving._convert_to_chat_completion_request(req2)
+
+        # Prefix equality: Turn 2's first 2 messages must match Turn 1's messages exactly
+        self.assertEqual(len(chat_req1.messages), 2)
+        self.assertEqual(len(chat_req2.messages), 4)
+
+        for i in range(len(chat_req1.messages)):
+            self.assertEqual(chat_req1.messages[i].role, chat_req2.messages[i].role)
+            self.assertEqual(
+                chat_req1.messages[i].content, chat_req2.messages[i].content
+            )
+
+    def test_claude_code_turns_share_rendered_prefix(self):
+        """Each request's rendered prompt is a token prefix of the next request's.
+
+        ``test_in_messages_system_prefix_cache_multi_turn_invariant`` compares
+        converted messages. This compares rendered tokens, because the radix
+        cache matches token ids after the chat template runs and a template
+        can render an earlier turn differently once a later one exists. The
+        #42272 conversation is converted on the merge path and every request
+        is rendered with the Qwen3 chat template.
+
+        Measured with this fixture: with inline system messages hoisted into
+        the leading block, the share of request k that request k+1 repeats
+        falls from 95% to 47% by the ninth request and the nine follow-ups
+        prefill 3,689 new tokens; attached in place, every request is a full
+        prefix of the next and the follow-ups prefill 914 tokens, each
+        equal to its appended turn.
+        """
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B")
+        serving = self._serving()
+        self.assertTrue(serving._merge_inline_system)
+
+        prompts = []
+        for messages in _claude_code_requests():
+            request = self._anthropic_request(
+                stream=False, system=_CLAUDE_CODE_SYSTEM, messages=messages
+            )
+            prompts.append(
+                _render_prompt(
+                    tokenizer, serving._convert_to_chat_completion_request(request)
+                )
+            )
+        self.assertEqual(len(prompts), 10)
+
+        for k, ((prev_text, prev_ids), (text, ids)) in enumerate(
+            zip(prompts, prompts[1:]), start=1
+        ):
+            shared = 0
+            for prev_id, token_id in zip(prev_ids, ids):
+                if prev_id != token_id:
+                    break
+                shared += 1
+            self.assertEqual(
+                shared,
+                len(prev_ids),
+                f"request {k + 1} repeats only {shared} of request {k}'s "
+                f"{len(prev_ids)} prompt tokens ({shared / len(prev_ids):.0%}) "
+                "as a prefix",
+            )
+            # The new prefill is the appended turn's tokens and nothing else.
+            self.assertEqual(text[: len(prev_text)], prev_text)
+            self.assertEqual(
+                ids[len(prev_ids) :],
+                tokenizer.encode(text[len(prev_text) :], add_special_tokens=False),
+            )
 
 
 class TestDetectInlineSystemSupport(unittest.TestCase):
