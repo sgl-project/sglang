@@ -294,6 +294,17 @@ class MooncakeBaseStore:
                 "to run SGLang with MooncakeConnector."
             ) from e
 
+    def _replicate_config_supports(self, field: str) -> bool:
+        cls = getattr(self, "_replicate_config_cls", None)
+        if cls is None:
+            return False
+        if hasattr(cls, field):
+            return True
+        try:
+            return hasattr(cls(), field)
+        except Exception:
+            return False
+
     def _import_mooncake_group_semantics(self):
         try:
             from mooncake.store import ReplicateConfig
@@ -402,6 +413,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         self._replicate_config_cls, self._supports_group_ids = (
             self._import_mooncake_group_semantics()
         )
+        # Mooncake builds with ReplicateConfig.session_ids publish the writing
+        # session on their stored KV events.
+        self._supports_session_ids = self._replicate_config_supports("session_ids")
         try:
             self.store = MooncakeDistributedStore()
 
@@ -967,7 +981,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         final_pages = restorable[-1] if restorable else 0
         return PoolTransferResult(final_pages, hit_count, restorable)
 
-    def _batch_io_v2(self, transfers: List[PoolTransfer], is_set: bool):
+    def _batch_io_v2(
+        self,
+        transfers: List[PoolTransfer],
+        is_set: bool,
+        session_id: Optional[str] = None,
+    ):
         # Expand every pool first so one logical operation becomes one Mooncake
         # RPC rather than one RPC per hybrid-cache component.
         prepared = []
@@ -1041,6 +1060,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     [all_sizes[i] for i in missing_idx],
                     self._filter_group_ids(
                         all_group_ids if all_group_ids else None, missing_idx
+                    ),
+                    session_ids=(
+                        [session_id] * len(missing_idx)
+                        if session_id and self._supports_session_ids
+                        else None
                     ),
                 )
                 for i, res in zip(missing_idx, put_results):
@@ -1122,7 +1146,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         transfers: List[PoolTransfer],
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> dict:
-        return self._batch_io_v2(transfers, is_set=True)
+        # ``extra_info.extra_info["session_id"]`` names the session that wrote the
+        # pages; Mooncake publishes it on the stored KV events.
+        session_id = (
+            (extra_info.extra_info or {}).get("session_id") if extra_info else None
+        )
+        return self._batch_io_v2(transfers, is_set=True, session_id=session_id)
 
     def _get_mha_split_heads_buffer_meta(self, keys, indices):
         ptr_list, element_size_list = (
@@ -1485,6 +1514,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         buffer_ptrs: List[Any],
         buffer_sizes: List[Any],
         group_ids: Optional[List[str]] = None,
+        session_ids: Optional[List[str]] = None,
     ) -> List[int]:
         config = None
         if self._can_use_group_semantics() and group_ids is not None:
@@ -1495,6 +1525,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 )
             config = self._replicate_config_cls()
             config.group_ids = group_ids
+        if session_ids is not None:
+            config = config or self._replicate_config_cls()
+            config.session_ids = session_ids
 
         if self._uses_multi_buffer(buffer_ptrs):
             config = config or self._replicate_config_cls()

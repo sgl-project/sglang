@@ -2127,6 +2127,24 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
     </tr>
         <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-unified-cache-external-linker`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Link UnifiedRadixCache directly to an external KV store, with no host cache tier.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
+    </tr>
+        <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--unified-cache-external-linker-backend`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Select the external linker backend. Use <code>dynamic</code> for an installed out-of-tree linker and specify its class and module in <code>--unified-cache-external-linker-config</code>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`mooncake`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>mooncake</code>, <code>mori</code>, <code>dynamic</code></td>
+    </tr>
+        <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--unified-cache-external-linker-config`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>JSON object configuring the selected backend. For <code>dynamic</code>, provide <code>linker</code> (class name), <code>linker_module_path</code> (Python module), and optional <code>linker_extra_config</code> (object). Built-in backends accept storage options directly; when supplied, this config replaces <code>--hicache-storage-backend-extra-config</code>, even when empty. You can supply config while the linker is disabled.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: JSON object</td>
+    </tr>
+        <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--hicache-ratio`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The ratio of the size of host KV cache memory pool to the size of device pool.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`2.0`</td>
@@ -2260,7 +2278,7 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
   <tbody>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-paged-experts`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Keep only `--paged-experts-num-resident` routed experts per MoE layer on the GPU and page the rest from pinned host memory on demand. Unquantized, block-FP8 or GPTQ experts, single GPU. Decode CUDA graphs (full backend) are captured up to K // top_k requests; prefill graphs must be breakable or disabled.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Keep only `--paged-experts-num-resident` routed experts per MoE layer on the GPU and page the rest from pinned host memory on demand. Single GPU; the experts must run on the triton or Marlin MoE runner (supported quantizations: see the Paged Experts docs). Decode CUDA graphs (full backend) are captured up to K // top_k requests; prefill graphs must be breakable or disabled.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
     </tr>
@@ -2933,7 +2951,7 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enforce-shared-experts-fusion`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enforce shared experts fusion even when it would normally be disabled (e.g. under DeepEP). Mutually exclusive with --disable-shared-experts-fusion.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enforce shared experts fusion even when it would normally be disabled (e.g. under DeepEP). On a Quark MXFP4 Qwen3.5/Qwen3.8 checkpoint that excludes its shared expert from quantization, this also quantizes that shared expert to MXFP4 while loading so it can be fused, which runs its weights and its input activations at MXFP4 where the standalone path ran in BF16 - validate accuracy before using it. Mutually exclusive with --disable-shared-experts-fusion.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
     </tr>
