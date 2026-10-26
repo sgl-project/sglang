@@ -125,6 +125,7 @@ def _write_checkpoint(path, config, weights):
 @pytest.mark.parametrize("role,class_name,config_cls,raw_config", CASES)
 @pytest.mark.parametrize("residency", ["component-offload", "resident"])
 @pytest.mark.parametrize("precision", ["fp32", "bf16"])
+@pytest.mark.usefixtures("single_process_model_parallel")
 def test_real_components_restore_weights_and_exact_policy(
     tmp_path, role, class_name, config_cls, raw_config, residency, precision
 ):

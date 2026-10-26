@@ -46,7 +46,7 @@ from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 _BUILDER = "_build_cuda_graph_forward_metadata"
 _RAIL = "window_kv_indices"

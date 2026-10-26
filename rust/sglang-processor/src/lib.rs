@@ -35,7 +35,7 @@ pub use parser::{
 };
 #[cfg(feature = "render")]
 pub use render::{
-    ChatFormatter, ChatFormatterOptions, DeepSeekTokenizer, OneOrMany, TemplateError,
+    ChatFormatter, ChatFormatterOptions, DeepSeekTokenizer, OneOrMany, TemplateArgs, TemplateError,
     ThinkingTemplates, load_chat_formatter, requested_effort, requested_thinking,
     select_chat_formatter,
 };
@@ -46,6 +46,8 @@ pub use tokenizer::{DynamoTokenizer, TextTokenizer, load_tokenizer};
 
 // Dynamo crates whose types appear in this crate's public API. Hosts use these
 // re-exports so their Dynamo versions always match the processor's.
+#[cfg(feature = "parser")]
+pub use dynamo_parsers;
 #[cfg(any(feature = "parser", feature = "render"))]
 pub use dynamo_protocols;
 #[cfg(feature = "render")]

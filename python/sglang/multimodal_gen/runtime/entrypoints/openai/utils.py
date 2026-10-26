@@ -8,7 +8,7 @@ import re
 import shutil
 import tempfile
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from functools import cache
 from typing import Any, Generator, List, Literal, Optional, Union
 
@@ -38,6 +38,7 @@ from sglang.multimodal_gen.runtime.utils.common import parse_size
 from sglang.multimodal_gen.runtime.utils.image_io import (
     ensure_path_within_root,
     save_base64_image_to_path,
+    save_image_bytes_to_path,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     init_logger,
@@ -384,7 +385,6 @@ async def save_image_to_path(
 async def _save_upload_to_path(
     upload: Union[UploadFile, bytes], target_path: str
 ) -> str:
-    os.makedirs(os.path.dirname(target_path), exist_ok=True)
     if isinstance(upload, bytes):
         content = upload
     elif isinstance(upload, (bytearray, memoryview)):
@@ -402,9 +402,7 @@ async def _save_upload_to_path(
             raise TypeError(
                 f"Image upload read() returned {type(content).__name__}, expected bytes"
             )
-    with open(target_path, "wb") as f:
-        f.write(content)
-    return target_path
+    return save_image_bytes_to_path(content, target_path)
 
 
 async def _maybe_url_image(
@@ -443,12 +441,14 @@ async def _maybe_url_image(
 _MAX_IMAGE_DOWNLOAD_BYTES = 50 * 1024 * 1024
 
 
-async def _download_capped_to_temp_file(response: httpx.Response) -> str:
+async def _download_capped_to_temp_file(
+    response: httpx.Response, directory: str
+) -> str:
     too_large = f"Image exceeds the {_MAX_IMAGE_DOWNLOAD_BYTES} byte download limit"
     declared = response.headers.get("content-length")
     if declared and declared.isdigit() and int(declared) > _MAX_IMAGE_DOWNLOAD_BYTES:
         raise ValueError(too_large)
-    fd, part_path = tempfile.mkstemp()
+    fd, part_path = tempfile.mkstemp(dir=directory)
     try:
         with os.fdopen(fd, "wb") as f:
             total = 0
@@ -487,7 +487,6 @@ async def _save_url_image_to_path(
 
     max_attempts = 3
     backoff_seconds = 0.2
-    last_error: Exception | None = None
 
     try:
         async with httpx.AsyncClient(follow_redirects=True) as client:
@@ -498,7 +497,9 @@ async def _save_url_image_to_path(
                         "GET", image_url, timeout=10.0
                     ) as response:
                         response.raise_for_status()
-                        part_path = await _download_capped_to_temp_file(response)
+                        part_path = await _download_capped_to_temp_file(
+                            response, os.path.dirname(target_path)
+                        )
 
                     # Determine file extension from content type or URL after downloading
                     if not os.path.splitext(target_path)[1]:
@@ -537,13 +538,11 @@ async def _save_url_image_to_path(
 
                     if uploads_root is not None:
                         target_path = ensure_path_within_root(target_path, uploads_root)
-                    await asyncio.to_thread(shutil.move, part_path, target_path)
+                    # same-filesystem rename publishes only a complete download
+                    os.replace(part_path, target_path)
 
                     return target_path
                 except Exception as e:
-                    if part_path is not None and os.path.exists(part_path):
-                        os.remove(part_path)
-                    last_error = e
                     if attempt == max_attempts or not _is_retryable_download_error(e):
                         raise
                     wait_s = backoff_seconds * (2 ** (attempt - 1))
@@ -556,11 +555,12 @@ async def _save_url_image_to_path(
                         e,
                     )
                     await asyncio.sleep(wait_s)
+                finally:
+                    if part_path is not None:
+                        with suppress(FileNotFoundError):
+                            os.remove(part_path)
     except Exception as e:
-        final_error = last_error or e
-        raise Exception(
-            f"Failed to download image from URL {image_url}: {str(final_error)}"
-        )
+        raise Exception(f"Failed to download image from URL {image_url}: {e}")
 
 
 async def process_generation_batch(

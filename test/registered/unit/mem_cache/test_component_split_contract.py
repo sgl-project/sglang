@@ -16,7 +16,7 @@ from sglang.srt.mem_cache.unified_cache.components.base import (
 from sglang.srt.mem_cache.unified_radix_cache import COMPONENT_REGISTRY, UnifiedTreeNode
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class TestComponentSplitFieldCoverage(unittest.TestCase):

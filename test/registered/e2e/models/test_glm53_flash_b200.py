@@ -19,7 +19,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=2400, stage="base-c", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=1068, stage="base-c", runner_config="4-gpu-b200")
 
 MODEL_PATH = "zai-org/GLM-5.3-Flash"
 SERVER_LAUNCH_TIMEOUT = 3600

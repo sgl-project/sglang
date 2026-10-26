@@ -8,7 +8,7 @@ import torch
 from sglang.kernels.jit.utils import device_guard
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=5, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=8, stage="base-b", runner_config="1-gpu-small")
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 

@@ -4,7 +4,7 @@ from sglang.srt.configs.shared_experts import SharedExpertsConfig
 from sglang.srt.runtime_context import get_model
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=15, suite="base-a-test-cpu")
+register_cpu_ci(est_time=24, suite="base-a-test-cpu")
 
 import unittest
 from contextlib import nullcontext

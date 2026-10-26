@@ -71,6 +71,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
 from sglang.multimodal_gen.runtime.managers.memory_managers.memory_occupation_controller import (
     MemoryOccupationController,
 )
+from sglang.multimodal_gen.runtime.managers.request_gc import request_gc
 from sglang.multimodal_gen.runtime.observability.metrics import (
     DiffusionMetrics,
     init_metrics,
@@ -331,6 +332,10 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         self._auto_residency_warmup_records: list[WarmupMemoryRecord] = []
         self._update_lora_metrics()
 
+        # settle the import/model-loading GC debt before serving requests, rather
+        # than letting the first denoise step trigger a full-heap collection
+        gc.collect()
+
     def release_realtime_session(self, session_id: str) -> OutputBatch:
         """release the session of a realtime connection"""
         if not session_id:
@@ -586,6 +591,11 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         # inside a graph capture and too costly per exchange
         IPC_A2A.check_timeout()
         IPC_A2A_MULTI.check_timeout()
+        if not any(
+            req.is_warmup or req.extra.get("server_internal_prewarm") for req in batch
+        ):
+            # also handles a failed/skipped final warmup before real execution
+            request_gc.collect_after_warmup()
         if len(batch) > 1:
             if return_req:
                 raise ValueError(
@@ -596,9 +606,12 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             return self._execute_forward_batch(batch)
 
         req = batch[0]
+        warming_up = req.is_warmup or bool(req.extra.get("server_internal_prewarm"))
+        if warming_up:
+            request_gc.mark_warmup()
         if req.is_warmup and req.extra.get("auto_residency_full_shape_probe"):
             self._fit_auto_residency_probe(req)
-        return self._execute_forward_common(
+        result = self._execute_forward_common(
             req,
             forward_fn=lambda: self.pipeline.forward(req, self.server_args),
             log_reqs=[req],
@@ -609,15 +622,31 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             error_context=f"request {req.request_id}",
             defer_finalize=defer_finalize,
         )
+        if warming_up and (
+            req.extra.get("warmup_last")
+            or (isinstance(result, OutputBatch) and result.error is not None)
+        ):
+            request_gc.collect_after_warmup()
+        return result
 
     def execute_forward_sequentially(self, batch: list[Req]) -> Iterator[OutputBatch]:
         """Yield grouped results after each request finishes its terminal stage."""
         assert self.pipeline is not None
+        if not any(
+            req.is_warmup or req.extra.get("server_internal_prewarm") for req in batch
+        ):
+            request_gc.collect_after_warmup()
         results = self.pipeline.forward_batch_sequentially(batch, self.server_args)
         group_start_time = time.monotonic()
+        failed = False
 
         try:
             for req in batch:
+                warming_up = req.is_warmup or bool(
+                    req.extra.get("server_internal_prewarm")
+                )
+                if warming_up:
+                    request_gc.mark_warmup()
                 output_count = (
                     max(1, int(req.num_outputs_per_prompt or 1))
                     if self.server_args.pipeline_config.supports_sequential_multi_output_inference()
@@ -638,12 +667,21 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                     propagate_forward_errors=True,
                 )
                 assert isinstance(output_batch, OutputBatch)
+                if warming_up and (
+                    req.extra.get("warmup_last") or output_batch.error is not None
+                ):
+                    request_gc.collect_after_warmup()
                 yield output_batch
                 del output_batch
+        except Exception:
+            failed = True
+            raise
         finally:
             close = getattr(results, "close", None)
             if close is not None:
                 close()
+            if failed:
+                request_gc.collect_after_warmup()
 
     def _collect_sequential_outputs(
         self,
@@ -674,6 +712,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             error_context=f"grouped request {req.request_id}",
         )
 
+    @request_gc.defer()
     def _execute_forward_common(
         self,
         req: Req,
@@ -905,12 +944,14 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         return (
             self._async_output_save
             and not req.is_warmup
+            and not req.extra.get("server_internal_prewarm")
             and not req.return_raw_frames
             and self._encodes_on_output_rank(req)
             and req.perf_dump_path is None
             and not envs.SGLANG_DIFFUSION_STAGE_LOGGING
         )
 
+    @request_gc.defer()
     def _finalize_deferred(
         self,
         *,

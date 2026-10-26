@@ -16,6 +16,7 @@ from sglang.multimodal_gen.runtime.distributed.ipc_cuda import (
 from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
     ListLorasReq,
     MergeLoraWeightsReq,
+    ReleaseRealtimeSessionReq,
     SetLoraReq,
     ShutdownReq,
     UnmergeLoraWeightsReq,
@@ -118,6 +119,8 @@ def _session_key(batch: Any) -> str | None:
     session must land on the same one."""
     reqs = batch if isinstance(batch, list) else [batch]
     for req in reqs:
+        if isinstance(req, ReleaseRealtimeSessionReq):
+            return req.session_id
         if isinstance(req, Req) and req.realtime_session_id:
             return req.realtime_session_id
     return None

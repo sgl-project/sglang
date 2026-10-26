@@ -18,7 +18,7 @@ from sglang.test.kits.unified_radix_cache.unified_tree_core_inspection_interface
     UnifiedTreeCoreInspectionInterface,
 )
 
-register_cpu_ci(est_time=17, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 def _tree_core():

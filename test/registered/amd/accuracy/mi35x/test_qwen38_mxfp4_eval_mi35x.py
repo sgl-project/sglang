@@ -18,12 +18,13 @@ the MoE gate and ``lm_head`` stay at source precision, which is why AMD
 measures the same 97.49 GSM8K as the FP8 baseline (100% recovery) and why this
 test gates the FP8 checkpoint's quality even though it serves the MXFP4 one.
 
-Both phases launch from one ``SERVER_ARGS``, which reproduces the recipe
-published on the AMD model card. That is the reason accuracy and perf share a
-file rather than splitting into an accuracy suite and a perf suite: the
-throughput numbers then describe the exact configuration the accuracy gate
-covers, and a flag change cannot drift one out from under the other. Two of
-those flags are load-bearing rather than restatements of a default:
+The accuracy and perf phases launch from one ``SERVER_ARGS``, which reproduces
+the recipe published on the AMD model card. That is the reason accuracy and
+perf share a file rather than splitting into an accuracy suite and a perf
+suite: the throughput numbers then describe the exact configuration the
+accuracy gate covers, and a flag change cannot drift one out from under the
+other. Two of those flags are load-bearing rather than restatements of a
+default:
 
   * ``--page-size 1`` -- ``_page_size_default`` bumps the default to 64 on HIP
     when the container sets SGLANG_AITER_KV_CACHE_LAYOUT=vectorized_5d, so the
@@ -34,6 +35,9 @@ those flags are load-bearing rather than restatements of a default:
 Perf runs only once accuracy has passed (see ``accuracy_passed``): a server
 that decodes garbage still benchmarks fine, so publishing its throughput would
 be worse than publishing nothing.
+
+A third phase, skipped for now, repeats the accuracy eval with
+``--enforce-shared-experts-fusion`` added.
 
 The scorer extracts the last number in the reply and the server runs with no
 ``--reasoning-parser``, so a ``<think>`` block still scores: the reasoning
@@ -46,6 +50,7 @@ register on gfx942 (MI300/MI325).
 Registry: nightly-amd-8-gpu-mi35x-qwen38-mxfp4 suite
 """
 
+import io
 import os
 import unittest
 from types import SimpleNamespace
@@ -105,6 +110,10 @@ SERVER_ARGS = [
 # it; a bare-pip host does not. popen_launch_server merges this over os.environ.
 SERVER_ENV = {"SGLANG_USE_AITER": "1"}
 
+FUSED_SHARED_EXPERT_ARGS = SERVER_ARGS + ["--enforce-shared-experts-fusion"]
+FUSION_ENGAGED_MARKER = "Quantizing the BF16 shared expert to MXFP4 while loading"
+FUSION_REFUSED_MARKER = "will not be quantized or fused because"
+
 
 class TestQwen38Mxfp4MI35x(CustomTestCase):
     """Qwen3.8-2.4T-A95B MXFP4 accuracy + serving perf for AMD MI35x."""
@@ -112,6 +121,7 @@ class TestQwen38Mxfp4MI35x(CustomTestCase):
     # Set by the accuracy phase and read by the perf phase. unittest orders
     # methods alphabetically, so test_a_* lands before test_b_*.
     accuracy_passed = False
+    baseline_accuracy = None
 
     @classmethod
     def setUpClass(cls):
@@ -159,6 +169,7 @@ class TestQwen38Mxfp4MI35x(CustomTestCase):
                 write_github_step_summary(summary)
 
             type(self).accuracy_passed = passed
+            type(self).baseline_accuracy = acc
             self.assertGreaterEqual(
                 acc,
                 ACCURACY_THRESHOLD,
@@ -208,6 +219,92 @@ class TestQwen38Mxfp4MI35x(CustomTestCase):
             )
         finally:
             runner.write_final_report()
+
+    @unittest.skip(
+        "Costs a third 1.2 TB checkpoint load, which puts this file at the "
+        "nightly's --timeout-per-file. Measured out of tree meanwhile; re-enable "
+        "once the reviewer agrees the nightly should carry it."
+    )
+    def test_c_gsm8k_accuracy_with_fused_shared_expert(self):
+        """GSM8K once the shared expert is quantized online and fused."""
+        stdout, stderr = io.StringIO(), io.StringIO()
+        process = popen_launch_server(
+            QWEN38_MXFP4_MODEL_PATH,
+            self.base_url,
+            timeout=SERVER_LAUNCH_TIMEOUT,
+            other_args=FUSED_SHARED_EXPERT_ARGS,
+            env=SERVER_ENV,
+            return_stdout_stderr=(stdout, stderr),
+        )
+
+        try:
+            requests.get(self.base_url + "/flush_cache")
+
+            args = SimpleNamespace(
+                base_url=self.base_url,
+                model=QWEN38_MXFP4_MODEL_PATH,
+                eval_name="gsm8k",
+                num_examples=self.num_examples,
+                num_threads=512,
+                max_tokens=self.max_tokens,
+                chat_template_kwargs={"enable_thinking": False},
+            )
+            metrics = run_eval(args)
+            acc = metrics["score"]
+
+            server_log = stdout.getvalue() + stderr.getvalue()
+            engaged = FUSION_ENGAGED_MARKER in server_log
+            refused = FUSION_REFUSED_MARKER in server_log
+
+            passed = acc >= ACCURACY_THRESHOLD
+            status = "✅ PASS" if passed else "❌ FAIL"
+            baseline = type(self).baseline_accuracy
+            delta = f"{acc - baseline:+.3f}" if baseline is not None else "n/a"
+            print(
+                f"  accuracy={acc:.3f} threshold={ACCURACY_THRESHOLD} "
+                f"delta_vs_baseline={delta} fused={engaged} {status}"
+            )
+
+            if is_in_ci():
+                summary = (
+                    "### Qwen3.8-2.4T-A95B MXFP4 GSM8K, fused shared expert (MI35x)\n\n"
+                )
+                summary += (
+                    "| Model | TP | Accuracy | vs baseline | Threshold | "
+                    "Fused | Status |\n"
+                )
+                summary += (
+                    "| ----- | -- | -------- | ----------- | --------- | "
+                    "----- | ------ |\n"
+                )
+                summary += (
+                    f"| {QWEN38_MXFP4_MODEL_PATH} | {TP_SIZE} | {acc:.3f} | "
+                    f"{delta} | {ACCURACY_THRESHOLD} | {engaged} | {status} |\n"
+                )
+                write_github_step_summary(summary)
+
+            self.assertFalse(
+                refused,
+                "--enforce-shared-experts-fusion was refused, so this phase "
+                "re-measured the baseline configuration; see the server log "
+                "for the reason the conversion could not run",
+            )
+            self.assertTrue(
+                engaged,
+                "The shared expert was neither quantized online nor refused "
+                f"with a reason, so {FUSION_ENGAGED_MARKER!r} is missing from "
+                "the server log: the loader hook did not see this checkpoint's "
+                "BF16 shared expert at all",
+            )
+            self.assertGreaterEqual(
+                acc,
+                ACCURACY_THRESHOLD,
+                f"Qwen3.8 MXFP4 accuracy {acc:.3f} with the shared expert "
+                f"quantized online and fused is below threshold "
+                f"{ACCURACY_THRESHOLD} (baseline this run: {baseline})",
+            )
+        finally:
+            kill_process_tree(process.pid)
 
 
 if __name__ == "__main__":

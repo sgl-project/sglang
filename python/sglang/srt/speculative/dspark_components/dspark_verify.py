@@ -74,6 +74,20 @@ _is_npu = is_npu()
 # in-kernel NaN-q guard in reject_sampling.py, so this is signal-only.
 _VERIFY_DRAFT_PROBS = Invariant("dspark.verify.draft_probs", Bucket.GUARD, NotNaN())
 
+# Targets whose greedy accept reads the split-vocab row argmax; it does not
+# reproduce torch.argmax's NaN choice, so it stays opt-in per target.
+_FUSED_ARGMAX_TARGETS = frozenset({"deepseek_v41", "minimax_m3_vl"})
+
+
+def target_model_type(target_worker) -> Optional[str]:
+    return getattr(
+        target_worker.model_runner.model_config.hf_text_config, "model_type", None
+    )
+
+
+def target_uses_fused_argmax(target_worker) -> bool:
+    return target_model_type(target_worker) in _FUSED_ARGMAX_TARGETS
+
 
 def verify_logits_adjustments_are_noop(sampling_info) -> bool:
     if sampling_info is None:
@@ -141,14 +155,8 @@ class TargetVerifyExecutor:
     ) -> None:
         self.target_worker = target_worker
         # candidate_max_seq_len_upper_bound only feeds the V4.1 candidate graphs.
-        self._target_is_dsv41 = (
-            getattr(
-                target_worker.model_runner.model_config.hf_text_config,
-                "model_type",
-                None,
-            )
-            == "deepseek_v41"
-        )
+        self._target_is_dsv41 = target_model_type(target_worker) == "deepseek_v41"
+        self._fused_argmax = target_uses_fused_argmax(target_worker)
         self.gamma = int(gamma)
         self.verify_num_draft_tokens = verify_num_draft_tokens
         self.model_runner = model_runner
@@ -201,7 +209,7 @@ class TargetVerifyExecutor:
             gamma=self.gamma,
             verify_num_draft_tokens=self.verify_num_draft_tokens,
             cutoff_layout=layout,
-            fused_argmax=self._target_is_dsv41,
+            fused_argmax=self._fused_argmax,
             block_verification=self._block_verification,
             rejection_noise=self._rejection_noise,
         )

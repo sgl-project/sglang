@@ -587,7 +587,10 @@ class DraftBlockProposer:
             noise_embedding = embed_module(draft_block_ids)
             draft_input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
 
-        if batch.seq_lens_cpu is not None:
+        if not self.draft_model_runner.attn_backend.needs_cpu_seq_lens:
+            draft_seq_lens_cpu = None
+            draft_seq_lens_sum = None
+        elif batch.seq_lens_cpu is not None:
             draft_seq_lens_cpu = batch.seq_lens_cpu + query_token_num
             draft_seq_lens_sum = int(draft_seq_lens_cpu.sum())
         elif draft_input.nxt_kv_lens_cpu is not None:

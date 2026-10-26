@@ -1,5 +1,6 @@
-"""Tests for the CuTe DSL TGV BF16 GEMM kernel."""
+"""Tests for the CuTe DSL BF16 GEMM kernels."""
 
+import math
 import sys
 
 import pytest
@@ -20,6 +21,7 @@ if not torch.cuda.is_available():
 from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import (  # noqa: E402
     _K3_TGV_WIN_SHAPES,
     cutedsl_bf16_gemm,
+    cutedsl_bf16_gemm_out,
     use_cutedsl_bf16_gemm,
 )
 
@@ -77,6 +79,35 @@ def test_cutedsl_bf16_gemm_empty_batch(has_bias):
     torch.cuda.synchronize()
     assert out.shape == (0, n)
     assert out.dtype == torch.bfloat16
+
+
+@pytest.mark.parametrize("m", [8, 16, 32])
+def test_k3_front_fp32_router_sm107(m):
+    if is_hip_runtime() or torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("SM107 required")
+
+    n, k = 6016, 7168
+    assert use_cutedsl_bf16_gemm(m, n, k)
+    torch.manual_seed(42028 + m)
+    x = torch.randn(m, k, dtype=torch.bfloat16, device="cuda")
+    weight = (torch.randn(n, k, dtype=torch.float32, device="cuda") / math.sqrt(k)).to(
+        torch.bfloat16
+    )
+    out = torch.empty(m, n, dtype=torch.float32, device="cuda")
+    cutedsl_bf16_gemm_out(x, weight, out)
+    ref = torch.mm(x, weight.T, out_dtype=torch.float32)
+    torch.testing.assert_close(out, ref, rtol=0, atol=0.005)
+
+    correction_bias = torch.randn(896, device="cuda") * 0.05
+    selected = torch.topk(
+        torch.sigmoid(out[:, 1536:2432]) + correction_bias, 16, dim=-1
+    ).indices
+    selected_ref = torch.topk(
+        torch.sigmoid(ref[:, 1536:2432]) + correction_bias, 16, dim=-1
+    ).indices
+    torch.testing.assert_close(
+        selected.sort(dim=-1).values, selected_ref.sort(dim=-1).values
+    )
 
 
 if __name__ == "__main__":

@@ -38,7 +38,7 @@ from sglang.srt.utils.hf_transformers_patches import normalize_rope_scaling_comp
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=7, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 # ---------------------------------------------------------------------------
@@ -112,6 +112,36 @@ class TestGetProcessor(CustomTestCase):
                     backend="pil",
                 )
                 self.assertIs(processor.image_processor, pil_processor)
+
+    def test_minimax_m3_vl_does_not_load_bundled_processor(self):
+        """MiniMax-M3.1-Flash bundles a MiniMaxVLProcessor that lacks the replace hooks
+        and breaks on video; its bundled code must not load, also on backend reload."""
+        config = SimpleNamespace(model_type="minimax_m3_vl", auto_map={})
+        loaded_processor = MagicMock()
+        loaded_processor.image_processor.backend = "torchvision"
+        loaded_processor.tokenizer.chat_template = "template"
+        auto_config = MagicMock()
+        auto_config.from_pretrained.return_value = config
+        auto_processor = MagicMock()
+        auto_image_processor = MagicMock()
+        m31_processor = MagicMock(return_value=loaded_processor)
+
+        with patch.multiple(
+            processor_utils,
+            AutoConfig=auto_config,
+            AutoProcessor=auto_processor,
+            AutoImageProcessor=auto_image_processor,
+            _get_minimax_m31_processor=m31_processor,
+        ):
+            processor_utils.get_processor(
+                "test-model", trust_remote_code=True, image_processor_backend="pil"
+            )
+
+        m31_processor.assert_called_once()
+        auto_processor.from_pretrained.assert_not_called()
+        auto_image_processor.from_pretrained.assert_called_once_with(
+            "test-model", trust_remote_code=False, revision=None, backend="pil"
+        )
 
     def test_resolves_model_name_before_loading_config(self):
         remote_model = "s3://bucket/model"

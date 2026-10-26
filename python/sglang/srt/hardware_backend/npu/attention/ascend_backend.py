@@ -417,10 +417,15 @@ class AscendAttnBackend(AttentionBackend):
         )
 
         if not envs.SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS.get():
-            assert not self.is_hybrid_swa, (
-                "Hybrid swa is not supply with `needs_cpu_seq_lens=False`."
-            )
-            self.needs_cpu_seq_lens = False
+            # FIA host IntArrays consume the CPU mirror; keep it on instead of
+            # crashing later. Hybrid SWA is allowed through for dsv4 experiments.
+            if self.use_fia:
+                logger.warning(
+                    "SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS=0 is ignored: "
+                    "host-bound attention paths present; keeping the mirror."
+                )
+            else:
+                self.needs_cpu_seq_lens = False
 
         # head num padding
         self.padding_size_list = [1, 2, 4, 8, 16, 32, 64, 128]
@@ -523,12 +528,16 @@ class AscendAttnBackend(AttentionBackend):
             spec_info=forward_batch.spec_info,
             out_cache_loc=forward_batch.out_cache_loc,
             origin_out_cache_loc=getattr(forward_batch, "origin_out_cache_loc", None),
+            max_seq_len_host=getattr(forward_batch, "max_seq_len_host", None),
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
         self.forward_metadata = ForwardMetadata()
-        if self.needs_cpu_seq_lens:
+        # Data-driven branch: take the CPU-mirror path whenever the mirror is
+        # present, instead of statically gating on needs_cpu_seq_lens. When the
+        # mirror is absent (true mirrorless), fall through to the else branch.
+        if forward_batch.seq_lens_cpu is not None:
             seq_lens_max = forward_batch.seq_lens.max()
             if forward_batch.forward_mode.is_target_verify():
                 if (
@@ -594,7 +603,7 @@ class AscendAttnBackend(AttentionBackend):
                 self.device
             ).int()
 
-        if self.needs_cpu_seq_lens:
+        if forward_batch.seq_lens_cpu is not None:
             self.forward_metadata.seq_lens_cpu_int = forward_batch.seq_lens_cpu.int()
         # In graph mode (see _init_cuda_graph_metadata) seq_lens_cpu_int stays
         # None so forward_mtp binds seq_lens_cpu_list instead: graph.update can
@@ -609,7 +618,9 @@ class AscendAttnBackend(AttentionBackend):
 
         if forward_batch.forward_mode.is_target_verify():
             spec_algorithm = forward_batch.spec_algorithm
-            if spec_algorithm is None or not spec_algorithm.is_dflash_family():
+            if (
+                spec_algorithm is None or not spec_algorithm.is_dflash_family()
+            ) and self.forward_metadata.seq_lens_cpu_int is not None:
                 self.forward_metadata.seq_lens_cpu_int += int(
                     forward_batch.spec_info.draft_token_num
                 )
@@ -617,7 +628,14 @@ class AscendAttnBackend(AttentionBackend):
             forward_batch.forward_mode.is_decode_or_idle()
             and forward_batch.spec_info is not None
         ):
-            self.forward_metadata.seq_lens_cpu_int += self.speculative_step_id + 1
+            if self.forward_metadata.seq_lens_cpu_int is not None:
+                self.forward_metadata.seq_lens_cpu_int += self.speculative_step_id + 1
+            else:
+                # Mirrorless decode: apply the draft offset to the device
+                # lengths consumed by _npu_paged_attention instead.
+                self.forward_metadata.seq_lens = (
+                    self.forward_metadata.seq_lens + self.speculative_step_id + 1
+                )
 
         # Set actual_seq_lengths_q from the pre-pad batch size so that the DSA
         # indexer reads a value consistent with actual_seq_lengths_kv /
@@ -912,6 +930,7 @@ class AscendAttnBackend(AttentionBackend):
         spec_info: Optional[SpecInput],
         out_cache_loc: Optional[torch.Tensor] = None,
         origin_out_cache_loc: Optional[torch.Tensor] = None,
+        max_seq_len_host: Optional[int] = None,
     ):
         """Shared capture+replay body for the cuda-graph init path.
 
@@ -926,7 +945,7 @@ class AscendAttnBackend(AttentionBackend):
             self.cuda_graph_swa_out_cache_loc[:n].copy_(
                 self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc)
             )
-        if self.needs_cpu_seq_lens:
+        if seq_lens_cpu is not None:
             # Compute the host-side KV lengths visible to this attention step. Target
             # verify adds the draft block except for DFlash, whose seq_lens_cpu already
             # includes it; speculative decode adds tokens through the current draft step.
@@ -981,6 +1000,24 @@ class AscendAttnBackend(AttentionBackend):
                 // self.page_size
             )
 
+            metadata.block_tables[:bs, max_seq_pages:].fill_(0)
+        elif max_seq_len_host is not None:
+            # Mirrorless replay (e.g. DSA models): the scheduler publishes the
+            # host-side max of the page-aligned allocated seq lens (>= committed
+            # + alloc reserve, so it upper-bounds every readable length). Apply
+            # the same speculative offsets as the mirror branch above.
+            if forward_mode.is_target_verify() and not _is_dflash_verify(spec_info):
+                max_len = max_seq_len_host + self.speculative_num_draft_tokens
+            elif forward_mode.is_decode_or_idle() and spec_info is not None:
+                max_len = max_seq_len_host + self.speculative_step_id + 1
+            else:
+                # draft-extend (and any other spec mode) sees base + draft block
+                max_len = max_seq_len_host + self.speculative_num_draft_tokens
+            max_seq_pages = (max_len + self.page_size - 1) // self.page_size
+            metadata.block_tables[:bs, :max_seq_pages].copy_(
+                self.req_to_token[req_pool_indices[:bs], 0 : max_len : self.page_size]
+                // self.page_size
+            )
             metadata.block_tables[:bs, max_seq_pages:].fill_(0)
         else:
             total_pages = min(
@@ -3278,7 +3315,13 @@ class AscendAttnBackend(AttentionBackend):
                         num_kv_heads=layer.tp_k_head_num,
                         scale_value=layer.scaling,
                         block_table=self.forward_metadata.block_tables,
-                        context_lens=self.forward_metadata.seq_lens_cpu_int,
+                        context_lens=(
+                            self.forward_metadata.seq_lens_cpu_int
+                            if self.forward_metadata.seq_lens_cpu_int is not None
+                            # Mirrorless decode: device lengths (draft offset
+                            # applied in init_forward_metadata).
+                            else self.forward_metadata.seq_lens
+                        ),
                         out=attn_output,
                     )
                 else:

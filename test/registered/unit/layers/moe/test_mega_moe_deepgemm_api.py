@@ -35,7 +35,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
 )
 
-register_cpu_ci(est_time=8, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestDeepGemmMegaMoeApi(CustomTestCase):

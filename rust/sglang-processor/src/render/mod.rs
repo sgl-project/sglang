@@ -15,6 +15,7 @@ mod loader;
 mod models;
 mod reasoning;
 mod selection;
+mod template;
 mod thinking;
 
 use self::legacy::LegacyFormatter;
@@ -26,6 +27,8 @@ use self::models::{
 };
 pub use self::reasoning::{requested_effort, requested_thinking};
 pub use self::selection::{ChatFormatterOptions, select_chat_formatter};
+pub use self::template::TemplateArgs;
+use self::thinking::ThinkingPolicy;
 pub use self::thinking::ThinkingTemplates;
 
 /// Legacy stop strings: a single separator-style stop or a list of stops.
@@ -145,9 +148,11 @@ impl ChatFormatter {
         match self {
             // recipe renders a continued final message itself, so no prefix follows.
             ChatFormatter::DeepSeekV4(_) => render_deepseek_v4(false, request, default_kwargs)
-                .map(|prompt| (prompt, String::new())),
+                .map(|prompt| (prompt, String::new()))
+                .map_err(RenderError::Failed),
             ChatFormatter::DeepSeekV41(_) => render_deepseek_v4(true, request, default_kwargs)
-                .map(|prompt| (prompt, String::new())),
+                .map(|prompt| (prompt, String::new()))
+                .map_err(RenderError::Failed),
             ChatFormatter::Glm53(formatter) => {
                 render_glm53(formatter, request, default_kwargs).map(text)
             }
@@ -157,9 +162,12 @@ impl ChatFormatter {
                 content_parts,
                 ..
             } => render_qwen38(formatter, *content_parts, request, default_kwargs).map(text),
-            _ => Err("this formatter renders through render_prompt".into()),
+            _ => Err(RenderError::Declined("this formatter's requests".into())),
         }
-        .map_err(|message| TemplateError::Renderer { message })
+        .map_err(|error| match error {
+            RenderError::Declined(message) => TemplateError::NeedsRenderFallback { message },
+            RenderError::Failed(message) => TemplateError::Renderer { message },
+        })
     }
 
     /// DeepSeek-V4 or V4.1 through deepseek-recipe; `tokenizer_json`, the
@@ -218,15 +226,34 @@ impl ChatFormatter {
     }
 
     /// Whether the template always reasons, as `template_detection` resolves
-    /// GLM-5.3's (`glm53_always_think`).
+    /// GLM-5.3's (`glm53_always_think`) and the Jinja templates it detects.
     pub fn always_thinks(&self) -> bool {
-        matches!(self, ChatFormatter::Glm53(_))
+        match self {
+            ChatFormatter::Glm53(_) => true,
+            ChatFormatter::HuggingFace { thinking, .. }
+            | ChatFormatter::KimiK25 { thinking, .. } => {
+                thinking.default_policy() == ThinkingPolicy::Always
+            }
+            _ => false,
+        }
     }
 
     /// The template's reasoning toggle kwarg and its default, as
-    /// `template_detection` resolves Qwen3.8's (`enable_thinking_default_true`).
+    /// `template_detection` resolves Qwen3.8's (`enable_thinking_default_true`)
+    /// and the Jinja templates it detects.
     pub fn reasoning_toggle(&self) -> Option<(&'static str, bool)> {
-        matches!(self, ChatFormatter::Qwen38 { .. }).then_some(("enable_thinking", true))
+        match self {
+            ChatFormatter::Qwen38 { .. } => Some(("enable_thinking", true)),
+            ChatFormatter::HuggingFace { thinking, .. }
+            | ChatFormatter::KimiK25 { thinking, .. } => match thinking.default_policy() {
+                ThinkingPolicy::TemplateToggle {
+                    key,
+                    default_enabled,
+                } => Some((key, default_enabled)),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     /// Resolve the template's effective thinking mode and materialize its
@@ -324,6 +351,29 @@ impl OAIChatLikeRequest for TemplateArgsRequest<'_> {
     }
 }
 
+/// Why a parity renderer did not render a request.
+#[derive(Debug)]
+pub(crate) enum RenderError {
+    /// A valid request it cannot render exactly as SGLang does, named by what
+    /// it declines; [`ChatFormatter::render_request`] maps it to
+    /// [`TemplateError::NeedsRenderFallback`].
+    Declined(String),
+    /// An invalid request, or one the template rejects.
+    Failed(String),
+}
+
+impl From<String> for RenderError {
+    fn from(message: String) -> Self {
+        Self::Failed(message)
+    }
+}
+
+impl From<&str> for RenderError {
+    fn from(message: &str) -> Self {
+        Self::Failed(message.to_owned())
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum TemplateError {
     #[error("failed to read {kind} `{path}`: {source}")]
@@ -365,6 +415,11 @@ pub enum TemplateError {
 
     #[error("invalid chat template: {message}")]
     Renderer { message: String },
+
+    /// A valid request [`ChatFormatter::render_request`] cannot render exactly as
+    /// SGLang does; the host should render it another way, not reject it.
+    #[error("the parity renderer declines {message}")]
+    NeedsRenderFallback { message: String },
 
     #[error("legacy chat template `{path}` must be a JSON object")]
     LegacyNotObject { path: PathBuf },

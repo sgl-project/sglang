@@ -44,6 +44,7 @@ from sglang.srt.models.minimax_vl_common import (
     merge_vit_qkv_weights,
 )
 from sglang.srt.models.utils import WeightsMapper
+from sglang.srt.multimodal.encoder_preprocessing import EncoderMediaProcessorConfig
 from sglang.srt.runtime_context import get_mm, get_parallel
 from sglang.srt.utils import (
     add_prefix,
@@ -74,6 +75,9 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
         "index_qkv_proj": ["index_q_proj", "index_k_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
+    encoder_media_processor_config = EncoderMediaProcessorConfig(
+        preserve_media_metadata=True, preprocess_off_event_loop=True
+    )
 
     def __init__(
         self,
@@ -120,6 +124,16 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
             patch_merge_bias=getattr(config, "patch_merge_bias", True),
         )
 
+        self.encoder_processor = None
+        if config.encoder_only:
+            from sglang.srt.managers.tokenizer_manager import get_processor_wrapper
+
+            self.encoder_processor = get_processor_wrapper()
+            self.model = None
+            self.lm_head = None
+            self.logits_processor = None
+            return
+
         text_config = config.text_config
         self.model = MiniMaxM3Model(
             config=text_config,
@@ -156,10 +170,13 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
         text_config = getattr(hf_config, "text_config", hf_config)
         if not getattr(text_config, "n_shared_experts", None):
             return "No shared experts are defined in the config."
-        if quant_config is not None and quant_config.get_name() == "modelopt_mixed":
+        if quant_config is not None and quant_config.get_name() in (
+            "modelopt_mixed",
+            "minimax_m3_nvfp4",
+        ):
             return (
                 "Shared and routed experts may use different quantization formats "
-                "in ModelOpt mixed-precision checkpoints."
+                "in mixed-precision checkpoints."
             )
         if not (_is_cuda or _is_hip):
             return "Shared experts fusion currently requires CUDA or ROCm devices."
@@ -195,8 +212,23 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
             text_config
         )
 
+    def precompile_kernels_after_loading(self) -> None:
+        MiniMaxM3SparseForCausalLM.precompile_kernels_after_loading(self)
+
     def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         return pad_mm_tokens(input_ids, mm_inputs)
+
+    def preprocess_mm_for_encoder(self, mm_data, modality, config):
+        from sglang.srt.multimodal.processors.minimax_m3_vl import (
+            preprocess_for_encoder,
+        )
+
+        return preprocess_for_encoder(
+            mm_data,
+            modality,
+            processor=self.encoder_processor,
+            mm_process_config=get_mm().mm_process_config,
+        )
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         return get_image_feature(self.vision_tower, items, self.use_data_parallel)
@@ -236,6 +268,22 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
         for layer_id in self.model.layers_to_capture:
             if 0 <= layer_id < len(self.model.layers):
                 setattr(self.model.layers[layer_id], "_is_layer_to_capture", True)
+
+    def set_dspark_layers_to_capture(self, layer_ids: list[int]):
+        if not self.pp_group.is_last_rank:
+            return
+        depth = len(self.model.layers)
+        if not layer_ids or any(i < 0 or i >= depth for i in layer_ids):
+            raise ValueError("DSpark capture IDs must select existing target layers")
+        self.capture_aux_hidden_states = True
+        self.model.layers_to_capture = [i + 1 for i in layer_ids]
+        for i, layer in enumerate(self.model.layers):
+            layer._is_layer_to_capture = i in self.model.layers_to_capture
+
+    def set_dflash_layers_to_capture(self, layer_ids: list[int]):
+        if list(layer_ids) != sorted(set(layer_ids)):
+            raise ValueError("MiniMax DFlash capture taps must be unique and sorted")
+        self.set_dspark_layers_to_capture(layer_ids)
 
     def forward(
         self,
@@ -326,6 +374,8 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
                 continue
 
             if name.startswith("language_model."):
+                if self.config.encoder_only:
+                    continue
                 self._load_llm_weight(
                     name[len("language_model.") :],
                     loaded_weight,

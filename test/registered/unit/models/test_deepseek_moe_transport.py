@@ -12,7 +12,7 @@ from sglang.srt.layers.layer_boundary.row_transport import TransportRows
 from sglang.srt.models.deepseek_common import moe_transport
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 
 
 class TestOverlappedTransport(unittest.TestCase):
@@ -43,9 +43,14 @@ class TestOverlappedTransport(unittest.TestCase):
             out.copy_(value[: out.shape[0]] * 2)
             return event(event_key)
 
-        layer = SimpleNamespace(mlp=SimpleNamespace())
+        layer = SimpleNamespace(
+            mlp=SimpleNamespace(shared_experts=None, _shared_expert_tp1=False)
+        )
         inputs = (torch.arange(6.0).view(2, 3), torch.tensor([[7.0, 11.0, 13.0]]))
-        batches = [SimpleNamespace(sub=i) for i in range(2)]
+        batches = [
+            SimpleNamespace(sub=i, _tbo_tp_sizes=[rows, rows])
+            for i, rows in enumerate((2, 1))
+        ]
         lengths = [4, 2]
         with (
             patch(
@@ -53,8 +58,11 @@ class TestOverlappedTransport(unittest.TestCase):
                 return_value=SimpleNamespace(is_none=lambda: True),
             ),
             patch(
-                "sglang.srt.models.deepseek_common.moe_transport.SHARED_EXPERT_LOCAL",
-                False,
+                "sglang.srt.models.deepseek_common.moe_transport.get_parallel",
+                return_value=SimpleNamespace(
+                    attn_tp_size=1,
+                    tp_group=SimpleNamespace(rank_in_group=0),
+                ),
             ),
             patch.object(torch.cuda, "current_stream", return_value=compute),
             patch.object(
@@ -68,10 +76,7 @@ class TestOverlappedTransport(unittest.TestCase):
                 moe_transport, "get_global_dp_buffer_len", side_effect=lengths
             ),
             patch.object(moe_transport, "get_local_dp_buffer_len", side_effect=[2, 1]),
-            patch.object(
-                moe_transport, "get_dp_global_num_tokens", side_effect=[[2, 2], [1, 1]]
-            ),
-            patch.object(moe_transport, "dp_gather_partial", side_effect=gather),
+            patch.object(moe_transport, "dp_gather_replicate", side_effect=gather),
             patch.object(moe_transport, "_tbo_event", side_effect=event),
             patch.object(
                 moe_transport, "dp_reduce_scatterv_async", side_effect=combine
@@ -111,6 +116,38 @@ class TestOverlappedTransport(unittest.TestCase):
             [x for x in trace if x[0] == "gather"], [("gather", 0), ("gather", 1)]
         )
         self.assertIsNot(buffers[("gh", 0)], buffers[("gh", 1)])
+
+    def test_shared_expert_locality_follows_its_switch(self):
+        moe = SimpleNamespace(shared_experts=object(), _shared_expert_tp1=True)
+        rows = TransportRows(
+            Layout(frozenset()),
+            Layout(frozenset()),
+            Layout(frozenset()),
+            SumGroup.MOE_OUTPUT,
+        )
+        for local in (False, True):
+            with (
+                self.subTest(local=local),
+                patch.object(moe_transport, "SHARED_EXPERT_LOCAL", local),
+                patch.object(
+                    moe_transport,
+                    "get_moe_a2a_backend",
+                    return_value=SimpleNamespace(is_none=lambda: True),
+                ),
+            ):
+                call = moe_transport.OverlappedMoeTransport(
+                    moe, torch.ones(2, 3), SimpleNamespace(), 0, rows
+                )
+                self.assertEqual(call.do_shared_local, local)
+
+    def test_a_micro_batch_empty_on_every_rank_runs_no_experts(self):
+        def experts(*args, **kwargs):
+            raise AssertionError("the experts ran on an empty micro-batch")
+
+        layer = SimpleNamespace(mlp=experts)
+        batch = SimpleNamespace(_tbo_global_input_ids=torch.empty(0, dtype=torch.long))
+        output = moe_transport._tbo_run_moe(layer, torch.empty(0, 3), batch, False)
+        self.assertEqual(tuple(output.shape), (0, 3))
 
 
 if __name__ == "__main__":

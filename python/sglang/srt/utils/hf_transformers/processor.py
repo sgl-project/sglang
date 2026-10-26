@@ -23,6 +23,7 @@ from transformers import (
     AutoTokenizer,
     PreTrainedTokenizerBase,
 )
+from transformers.utils import cached_file
 
 from sglang.srt.multimodal.customized_mm_processor_utils import _CUSTOMIZED_MM_PROCESSOR
 from sglang.srt.utils import logger
@@ -209,6 +210,38 @@ def _build_processor_manually(
     return proc_cls(**init_kwargs)
 
 
+def _get_minimax_m31_processor(model_path, config, revision):
+    from transformers import MiniMaxM3VLProcessor
+
+    from sglang.srt.multimodal.processors.minimax_m31_media import (
+        MiniMaxM31ImageProcessor,
+        MiniMaxM31VideoProcessor,
+    )
+
+    filename = cached_file(model_path, "preprocessor_config.json", revision=revision)
+    with open(filename) as f:
+        raw = json.load(f)
+    compression = raw.get("img_token_compression_config", {})
+    common = {
+        "patch_size": raw.get("patch_size", 14),
+        "merge_size": compression.get("spatial_merge_size", 2),
+        "temporal_patch_size": compression.get("temporal_patch_size", 2),
+        "image_mean": raw.get("image_mean", [0.48145466, 0.4578275, 0.40821073]),
+        "image_std": raw.get("image_std", [0.26862954, 0.26130258, 0.27577711]),
+    }
+    size = raw.get("size", [672, 672])
+    max_size = (
+        size if isinstance(size, (list, tuple)) else (size["height"], size["width"])
+    )
+    tokenizer = get_tokenizer(model_path, trust_remote_code=False, revision=revision)
+    return MiniMaxM3VLProcessor(
+        image_processor=MiniMaxM31ImageProcessor(max_size=max_size, **common),
+        video_processor=MiniMaxM31VideoProcessor(max_size=max_size, **common),
+        tokenizer=tokenizer,
+        chat_template=getattr(tokenizer, "chat_template", None),
+    )
+
+
 def get_processor(
     tokenizer_name: str,
     *args,
@@ -280,8 +313,13 @@ def get_processor(
         if "size" not in kwargs:
             kwargs["size"] = {"shortest_edge": 3136, "longest_edge": 1003520}
 
+    if config.model_type == "minimax_m3_vl":
+        trust_remote_code = False
+
     try:
-        if "InternVL3_5" in tokenizer_name:
+        if config.model_type == "minimax_m3_vl":
+            processor = _get_minimax_m31_processor(tokenizer_name, config, revision)
+        elif "InternVL3_5" in tokenizer_name:
             processor = AutoTokenizer.from_pretrained(
                 tokenizer_name,
                 *args,

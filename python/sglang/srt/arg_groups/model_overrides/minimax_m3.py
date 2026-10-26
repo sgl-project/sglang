@@ -1,7 +1,7 @@
 """Config-time override declarations for minimax_m3."""
 
 import logging
-from typing import Any, Dict
+from typing import Any
 
 from sglang.srt.arg_groups.model_override_base import (
     _register_for,
@@ -15,13 +15,35 @@ from sglang.srt.utils.common import get_quantization_config
 logger = logging.getLogger(__name__)
 
 
-@_register_for("MiniMaxM3SparseForCausalLM", "MiniMaxM3SparseForConditionalGeneration")
+def _resolve_quant_method(hf_config: Any) -> str | None:
+    quant_method = get_quantization_config(hf_config)
+    if quant_method != "mxfp8":
+        return quant_method
+    quant_config = hf_config.quantization_config
+    # Declared mxfp8 is only the projection format;
+    # the NVFP4 packed experts are named in the MoE fields, which plain MXFP8 lacks.
+    if (
+        str(quant_config.get("moe_quant_algo", "")).upper() != "NVFP4"
+        or quant_config.get("moe_quant_format") != "nvfp4-pack-quantized"
+    ):
+        return quant_method
+    logger.info(
+        "Checkpoint declares mxfp8 with NVFP4 packed experts; "
+        "serving as minimax_m3_nvfp4."
+    )
+    return "minimax_m3_nvfp4"
+
+
+@_register_for(
+    "MiniMaxM3SparseForCausalLM",
+    "MiniMaxM3SparseForConditionalGeneration",
+)
 def _minimax_m3_overrides(server_args: Any, hf_config: Any) -> dict:
 
     cfg = resolving_view(server_args)
-    overrides: Dict[str, Any] = {}
+    overrides: dict[str, Any] = {}
 
-    quant_method = get_quantization_config(hf_config)
+    quant_method = _resolve_quant_method(hf_config)
     quant_resolved = cfg.quantization
     if (
         quant_resolved is None
@@ -30,6 +52,74 @@ def _minimax_m3_overrides(server_args: Any, hf_config: Any) -> dict:
     ):
         overrides["quantization"] = quant_method
         quant_resolved = quant_method
+
+    if quant_resolved == "minimax_m3_nvfp4":
+        if cfg.speculative_algorithm not in (None, "DSPARK", "DFLASH"):
+            raise ValueError("M3.1 NVFP4 only supports DSPARK or DFLASH speculation")
+        if cfg.speculative_algorithm in ("DSPARK", "DFLASH"):
+            algorithm = cfg.speculative_algorithm
+            # Only the vision-language wrapper exposes the draft's hidden-state capture.
+            if hf_config.architectures[0] != "MiniMaxM3SparseForConditionalGeneration":
+                raise ValueError(
+                    f"M3.1 NVFP4 {algorithm} requires MiniMaxM3SparseForConditionalGeneration, "
+                    f"got {hf_config.architectures[0]}"
+                )
+            if not get_platform().is_blackwell:
+                raise ValueError(f"M3.1 NVFP4 {algorithm} requires Blackwell")
+            if envs.SGLANG_RAGGED_VERIFY_MODE.get() != "static":
+                raise ValueError(
+                    f"M3.1 NVFP4 {algorithm} requires SGLANG_RAGGED_VERIFY_MODE=static"
+                )
+            if cfg.pp_size != 1:
+                raise ValueError(f"M3.1 NVFP4 {algorithm} requires PP=1")
+            if algorithm == "DFLASH" and cfg.disaggregation_mode != "null":
+                raise ValueError(
+                    "M3.1 NVFP4 DFLASH currently requires colocated serving"
+                )
+            if cfg.speculative_draft_kv_cache_dtype in (None, "auto"):
+                overrides["speculative_draft_kv_cache_dtype"] = "bf16"
+            # DFLASH resolves its backend against the draft's attention layout.
+            if (
+                algorithm == "DSPARK"
+                and cfg.speculative_draft_attention_backend is None
+            ):
+                overrides["speculative_draft_attention_backend"] = "trtllm_mha"
+            # Draft tokens come from a cross-rank candidate gather and the greedy
+            # accept from gathered target logits, so the ranks agree without
+            # rank 0's broadcasts; keep only the RNG-dependent sites.
+            if algorithm == "DSPARK" and not envs.SGLANG_SPEC_TP_SYNC.is_set():
+                envs.SGLANG_SPEC_TP_SYNC.set("rng")
+        if cfg.page_size not in (None, 128):
+            raise ValueError("M3.1 NVFP4 requires --page-size 128")
+        if not get_platform().is_blackwell:
+            # MegaMoE and the packed NVFP4 KV cache are SM100-only; neither is
+            # selected here, and the KV dtype stays at the model dtype.
+            overrides.update(page_size=128)
+            if cfg.moe_runner_backend == "auto":
+                overrides["moe_runner_backend"] = "marlin"
+            if is_attention_backend_not_set(cfg):
+                overrides["attention_backend"] = "fa3"
+            return overrides
+        if cfg.moe_runner_backend == "flashinfer_trtllm_routed":
+            if cfg.moe_a2a_backend not in ("none", "megamoe"):
+                raise ValueError(
+                    "M3.1 NVFP4 flashinfer_trtllm_routed requires "
+                    "--moe-a2a-backend none or megamoe"
+                )
+        else:
+            if cfg.moe_a2a_backend not in ("none", "megamoe"):
+                raise ValueError("M3.1 NVFP4 requires --moe-a2a-backend megamoe")
+            overrides.update(moe_a2a_backend="megamoe")
+            if cfg.moe_runner_backend == "auto":
+                overrides["moe_runner_backend"] = "deep_gemm"
+        overrides.update(page_size=128)
+        if cfg.kv_cache_dtype == "auto":
+            overrides["kv_cache_dtype"] = "fp8_e4m3"
+        elif cfg.kv_cache_dtype != "fp8_e4m3":
+            raise ValueError("M3.1 NVFP4 requires --kv-cache-dtype fp8_e4m3")
+        if is_attention_backend_not_set(cfg):
+            overrides["attention_backend"] = "trtllm_mha"
+        return overrides
 
     if get_platform().is_hip:
         if is_attention_backend_not_set(cfg):

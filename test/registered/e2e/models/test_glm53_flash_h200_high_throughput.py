@@ -6,7 +6,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.glm53_flash_common import COMMON_SERVER_ARGS, _GLM53FlashH200Base
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 
-register_cuda_ci(est_time=1200, stage="extra-b", runner_config="8-gpu-h200")
+register_cuda_ci(est_time=629, stage="extra-b", runner_config="8-gpu-h200")
 
 
 class TestGLM53FlashH200HighThroughput(

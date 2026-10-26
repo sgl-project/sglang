@@ -49,10 +49,10 @@ Use a Linux host with the Ascend driver and a compatible CANN / TorchNPU environ
 <Tab title="A3">
 
 ```bash Command
-docker pull quay.io/ascend/sglang:cann9.0.0-a3-v0.5.16
+docker pull quay.io/ascend/sglang:v0.5.22-cann9.1.0-a3
 ```
 
-Run the following setup before copying the generated command (CANN 9.0.0). CPU tuning requires host privileges.
+Run the following setup before copying the generated command (CANN 9.1.0). CPU tuning requires host privileges.
 
 ```bash Command
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY ASCEND_LAUNCH_BLOCKING
@@ -187,6 +187,19 @@ import { agentx } from "/src/snippets/agentx/zai-org/glm-5.2.jsx";
 </Note>
 
 - **MTP / EAGLE speculative decoding on AMD.** Five-step MTP is validated for `amd/GLM-5.2-MXFP4` on MI355X with `lmsysorg/sglang-rocm:v0.5.20-rocm720-mi35x-20260930`. Choose **Low-Latency** for TP8/EP1, or **High-Throughput** for TP4/EP4 with HiCache (`--enable-hierarchical-cache --hicache-ratio 1.0`). HiCache uses the default `kernel`, `page_first`, and `write_through` settings. MTP remains unvalidated for GLM-5.2 on MI300X/MI325X and for the other MI355X checkpoint precisions.
+
+- **Ascend NPU (A3 Series) topology.** One A3 node is 8 cards x 2 dies = **16 devices**, so every A3 recipe runs `--tp-size 16` per node. **Single Node** is PD mixed on one node; the **Prefill role** / **Decode role** on the PD Disagg card are one node each, so a 1P1D pair spans two nodes and is fronted by the router command the panel emits below the recipe. Send client traffic to the router, not to either role.
+- **Ascend weights and the MTP head.** The msModelSlim W8A8 build is ~774 GB and fits one node's 16 x 64 GB; the BF16 checkpoint (~1.5 TB) needs two. Quantization covers the main model only: in the shard that holds layer 78 the tensors are BF16 and F32 with no INT8, while ordinary layers in the same shard are INT8 plus F32 scales. That is why every A3 recipe passes `--speculative-draft-model-quantization unquant` -- the nextn head is served unquantized.
+- **Prepare the Ascend host.** The tutorial's recipes assume the CPUs are in performance mode with the NUMA balancer out of the way. Run this on the host before starting the server:
+
+  ```bash Command
+  echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+  sysctl -w vm.swappiness=0
+  sysctl -w kernel.numa_balancing=0
+  sysctl -w kernel.sched_migration_cost_ns=50000
+  ```
+
+- **Wire up the two nodes (A3 PD only).** Set `HCCL_SOCKET_IFNAME` and `GLOO_SOCKET_IFNAME` to the interface that carries **that node's own** IP, and give both roles the **same** `ASCEND_MF_STORE_URL`, pointing at the prefill node -- it is the rendezvous for the KV transfer. Start the prefill role first, then the decode role.
 
 ## 3. Advanced Usage
 

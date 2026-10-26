@@ -47,7 +47,7 @@ from sglang.srt.observability.req_time_stats import (  # noqa: E402
 )
 from sglang.srt.runtime_context import get_context
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 _NOT_FINISHED = object()  # Sentinel: request has not finished yet
@@ -334,6 +334,25 @@ class TestEngineResponseWait(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn(state.obj.rid, self.tm.rid_to_state)
                 with self.assertRaises(StopAsyncIteration):
                     await anext(stream)
+
+    async def test_non_stream_abort_with_gateway_error_is_raised(self):
+        """A non-stream abort carrying a gateway status such as 502 must become an HTTP error, not an empty 200."""
+        state = _make_req_state("gateway_abort")
+        state.obj.stream = False
+        self.tm.rid_to_state[state.obj.rid] = state
+        out = {
+            "meta_info": {
+                "finish_reason": {
+                    "type": "abort",
+                    "status_code": 502,
+                    "message": "encoder dispatch failed",
+                }
+            }
+        }
+        with self.assertRaises(HTTPException) as ctx:
+            await self.tm._handle_abort_finish_reason(out, state, is_stream=False)
+        self.assertEqual(ctx.exception.status_code, 502)
+        self.assertNotIn(state.obj.rid, self.tm.rid_to_state)
 
     async def test_http_timeout_still_checks_disconnection(self):
         request = Mock()

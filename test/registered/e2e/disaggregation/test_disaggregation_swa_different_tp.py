@@ -13,7 +13,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=300, stage="extra-b", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=178, stage="extra-b", runner_config="4-gpu-h100")
 
 SWA_SERVER_ARGS = ["--page-size", "64", "--attention-backend", "triton"]
 

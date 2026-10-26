@@ -13,8 +13,9 @@ from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestOutcome,
     InitLoadBackParams,
+    MatchPrefixParams,
 )
-from sglang.srt.mem_cache.common import match_kv_cache
+from sglang.srt.mem_cache.common import _req_radix_key
 
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.decode import DecodeRequest
@@ -80,7 +81,7 @@ class DecodeHiCachePreallocMixin:
 
         l3_storage_hit_length = 0
         last_host_node = None
-        if self.scheduler.enable_decode_hicache:
+        if self.scheduler.enable_decode_hicache and self.tree_cache.enable_storage:
             last_host_node = result.last_host_node
             if self.tree_cache.is_backuped(last_host_node) or self.tree_cache.is_root(
                 last_host_node
@@ -205,12 +206,12 @@ class DecodeHiCacheTransferMixin:
         decode_req.hicache_restore_lock = None
 
     def _try_hicache_queue_load_back(self, dr: DecodeRequest) -> bool:
-        """Queue one L2->L1 load_back op for ``dr``; True iff a DMA was queued.
+        """Prepare the promised prefix and hold its lock until commit/abort.
 
         On success, ``dr.hicache_restore_lock`` and ``hicache_restored_kv_indices``
-        are populated; the lock is held until commit/abort.
-        Trivial cases (all-on-device / no needed coverage) auto-flip to READY.
-        Failback paths flip to FAILED.
+        are populated; the lock is held until commit/abort. Device-visible indices
+        can still have DMA in flight, so readiness is decided by the load-back
+        event even when this request queues no copy.
         """
         pm = dr.prefix_match
 
@@ -220,27 +221,35 @@ class DecodeHiCacheTransferMixin:
                 return False
             self.tree_cache.pop_prefetch_loaded_tokens(dr.req.cache_request_handle)
 
-        # Re-match: req.last_node / prefix_len updated to current device state.
+        # The transfer suffix is already allocated: rematch only promised tokens,
+        # without overwriting the request's preallocation state or lock receipt.
         rematch_token_len = pm.decode_prefix_len + _bigram_boundary_tokens(
             self.tree_cache
         )
-        rematch = match_kv_cache(
-            dr.req,
-            self.tree_cache,
-            dr.req.origin_input_ids,
-            cow_mamba=False,
-            max_prefix_len=rematch_token_len,
-        )
-        loaded_len, restored_node = self.tree_cache.init_load_back(
-            InitLoadBackParams(
-                best_match_node=rematch.best_match_node,
-                host_hit_length=rematch.host_hit_length,
+        rematch = self.tree_cache.match_prefix(
+            MatchPrefixParams(
+                key=_req_radix_key(
+                    self.tree_cache,
+                    dr.req,
+                    dr.req.origin_input_ids,
+                    rematch_token_len,
+                ),
+                cow_mamba=False,
                 req=dr.req,
             )
         )
-        # The rematch repointed req.last_node to feed init_load_back's device
-        # boundary; point it back at the prefix the prealloc matched and locked.
-        dr.req.last_node = pm.last_device_node
+        owned_node = dr.req.last_node
+        try:
+            dr.req.last_node = rematch.last_device_node
+            loaded_len, restored_node = self.tree_cache.init_load_back(
+                InitLoadBackParams(
+                    best_match_node=rematch.best_match_node,
+                    host_hit_length=rematch.host_hit_length,
+                    req=dr.req,
+                )
+            )
+        finally:
+            dr.req.last_node = owned_node
         # Failback: total coverage < required prefix means device alloc likely failed.
         if rematch.device_prefix_len + loaded_len < pm.decode_prefix_len:
             logger.warning(
@@ -263,33 +272,29 @@ class DecodeHiCacheTransferMixin:
         )[pm.l1_prefix_len : pm.decode_prefix_len]
         dr.hicache_restore_lock = self.tree_cache.lock(restored_node)
 
-        if loaded_len == 0:
-            # Whole prefix already on device; no DMA needed.
-            dr.hicache_restore_status = HiCacheRestoreResult.READY
-            return False
         return True
 
     def _process_hicache_local_restores(self, decode_reqs: List[DecodeRequest]) -> None:
-        # Filter once: keep only PENDING reqs that still need restore work;
-        # trivially-done reqs (no prefix_match / nothing to restore) flip to READY.
-        active: List[DecodeRequest] = []
-        for dr in decode_reqs:
-            if dr.hicache_restore_status != HiCacheRestoreResult.PENDING:
-                continue
-            pm = dr.prefix_match
-            if pm is None or not pm.needs_local_restore:
-                dr.hicache_restore_status = HiCacheRestoreResult.READY
-                continue
-            active.append(dr)
+        if not hasattr(self.tree_cache, "is_load_back_event_done"):
+            return
 
-        # Phase A: advance in-flight DMAs to READY.
+        # L1 followers can see indices published before the restoring DMA ends.
+        active = [
+            dr
+            for dr in decode_reqs
+            if dr.hicache_restore_status == HiCacheRestoreResult.PENDING
+        ]
+        if not active:
+            return
+
+        # Poll each local event once; transfer polling synchronizes request readiness.
+        done = {
+            index: self.tree_cache.is_load_back_event_done(index)
+            for index in sorted({dr.hicache_load_consumer_index for dr in active})
+            if index >= 0
+        }
         for dr in active:
-            if (
-                dr.hicache_restore_lock is not None
-                and self.tree_cache.is_load_back_event_done(
-                    dr.hicache_load_consumer_index
-                )
-            ):
+            if done.get(dr.hicache_load_consumer_index, False):
                 dr.hicache_restore_status = HiCacheRestoreResult.READY
 
         # Phase B: queue new load_back ops if the next slot is free on every rank.
@@ -298,19 +303,27 @@ class DecodeHiCacheTransferMixin:
         queued = [
             dr
             for dr in active
-            if dr.hicache_restore_lock is None and self._try_hicache_queue_load_back(dr)
+            if dr.hicache_restore_status == HiCacheRestoreResult.PENDING
+            and dr.hicache_load_consumer_index < 0
+            and (
+                dr.prefix_match is None
+                or not dr.prefix_match.needs_local_restore
+                or self._try_hicache_queue_load_back(dr)
+            )
         ]
         if not queued:
             return
 
-        # Phase C: kick off merged DMA, bind consumer_index for Phase A polling next tick.
+        counter = self.tree_cache.cache_controller.layer_done_counter
         consumer_index = self.tree_cache.ready_to_load_host_cache()
         if consumer_index < 0:
-            for dr in queued:
-                dr.hicache_restore_status = HiCacheRestoreResult.READY
-            return
+            # No new copy: earlier copies on the load stream still protect L1 hits.
+            consumer_index = counter.producer_index
+        ready = self.tree_cache.is_load_back_event_done(consumer_index)
         for dr in queued:
             dr.hicache_load_consumer_index = consumer_index
+            if ready:
+                dr.hicache_restore_status = HiCacheRestoreResult.READY
 
     def _commit_hicache_local_restore_to_req(self, decode_req: DecodeRequest) -> None:
         prefix_match = decode_req.prefix_match

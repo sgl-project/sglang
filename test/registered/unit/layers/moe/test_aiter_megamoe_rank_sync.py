@@ -10,7 +10,7 @@ from sglang.srt.managers.scheduler_components.dp_attn import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 def test_mlp_sync_retains_full_vector_without_tp_gather():

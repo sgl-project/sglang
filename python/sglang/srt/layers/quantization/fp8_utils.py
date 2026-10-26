@@ -743,7 +743,7 @@ def dispatch_w8a8_block_fp8_linear(
         linear = _dispatch_explicit_backend(backend)
     else:
         # Auto mode: Select based purely on hardware/backend availability
-        linear = _dispatch_auto_backend()
+        linear = _dispatch_auto_backend(act_scale_ue8m0=act_scale_ue8m0)
     # Preserve the unwrapped callable when no activation policy needs binding.
     if act_scale_ue8m0 and linear is deepgemm_w8a8_block_fp8_linear_with_fallback:
         return partial(linear, act_scale_ue8m0=True)
@@ -1167,7 +1167,7 @@ def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
         raise ValueError(f"Unknown FP8 GEMM backend: {backend}")
 
 
-def _dispatch_auto_backend() -> Callable:
+def _dispatch_auto_backend(act_scale_ue8m0: bool = False) -> Callable:
     """Auto-select the best backend based on hardware capabilities."""
     # Priority order for auto selection:
     # 1. DeepGEMM (if enabled and available)
@@ -1186,7 +1186,13 @@ def _dispatch_auto_backend() -> Callable:
         return cutlass_w8a8_block_fp8_linear_with_fallback
     elif _use_aiter:
         return aiter_w8a8_block_fp8_linear
-    elif is_npu_arch35():
+    elif is_npu_arch35() and (
+        # UE8M0 checkpoints are served in the MXFP8 layout losslessly; plain
+        # block-FP8 ones (fp32 scales) only join them when load-time
+        # requantization is explicitly enabled (lossy, see
+        # process_npu_arch35_mxfp8_linear_weights), else Triton emulates.
+        act_scale_ue8m0 or envs.SGLANG_NPU_ARCH35_REQUANT_BLOCK_FP8.get()
+    ):
         from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
             npu_w8a8_mxfp8_linear,
         )

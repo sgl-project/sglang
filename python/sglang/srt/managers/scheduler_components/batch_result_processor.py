@@ -727,7 +727,11 @@ class SchedulerBatchResultProcessor:
                 logger.error(
                     f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
                 )
-                req.to_finish = FINISH_ABORT()
+                req.to_finish = FINISH_ABORT(
+                    f"Grammar accept_token failed: {e}",
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    "InternalServerError",
+                )
         req.grammar.finished = req.finished()
 
     def _apply_chunked_prefill_logprobs(
@@ -869,7 +873,11 @@ class SchedulerBatchResultProcessor:
                 f"Grammar accept_token failed for req {req.rid} with token "
                 f"{tokens}: {e}"
             )
-            req.to_finish = FINISH_ABORT()
+            req.to_finish = FINISH_ABORT(
+                f"Grammar accept_token failed: {e}",
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                "InternalServerError",
+            )
         return retained
 
     def advance_grammar_fsm(

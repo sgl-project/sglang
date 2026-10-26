@@ -228,6 +228,7 @@ def _moe_stub(rank, *, dual, shared_tp1):
         tp_size=4,
         reduce_results=True,
         is_deepseek_v4=True,
+        shared_experts=None,
         _shared_expert_tp1=shared_tp1,
         layer_id=0,
         is_nextn=False,

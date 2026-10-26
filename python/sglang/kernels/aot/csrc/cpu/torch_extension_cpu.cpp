@@ -76,6 +76,9 @@ at::Tensor fused_rmsnorm_gated_cpu(at::Tensor& input, at::Tensor& weight, at::Te
 void fused_add_rmsnorm_cpu(at::Tensor& input, at::Tensor& residual, at::Tensor& weight, double eps);
 void gemma_fused_add_rmsnorm_cpu(at::Tensor& input, at::Tensor& residual, at::Tensor& weight, double eps);
 
+std::tuple<at::Tensor, at::Tensor> fused_dual_residual_rmsnorm_cpu(
+    const at::Tensor& x, const at::Tensor& residual, const at::Tensor& weight1, const at::Tensor& weight2, double eps);
+
 // fused_add_layernorm
 at::Tensor fused_add_layernorm_cpu(
     const at::Tensor& input,
@@ -216,6 +219,13 @@ std::tuple<at::Tensor, at::Tensor> topk_sigmoid_cpu(
     bool renormalize,
     const std::optional<at::Tensor>& correction_bias);
 std::tuple<at::Tensor, at::Tensor> topk_softmax_cpu(
+    at::Tensor& hidden_states,
+    at::Tensor& gating_output,
+    int64_t topk,
+    bool renormalize,
+    const std::optional<at::Tensor>& correction_bias);
+std::tuple<at::Tensor, at::Tensor> fused_moe_router_cpu(
+    double moe_softcapping,
     at::Tensor& hidden_states,
     at::Tensor& gating_output,
     int64_t topk,
@@ -662,6 +672,10 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("gemma_fused_add_rmsnorm_cpu(Tensor(a!) input, Tensor(a!) residual, Tensor weight, float eps) -> ()");
   m.impl("gemma_fused_add_rmsnorm_cpu", torch::kCPU, &gemma_fused_add_rmsnorm_cpu);
   m.def(
+      "fused_dual_residual_rmsnorm_cpu(Tensor x, Tensor residual, Tensor w1, Tensor w2, float eps) -> "
+      "(Tensor, Tensor)");
+  m.impl("fused_dual_residual_rmsnorm_cpu", torch::kCPU, &fused_dual_residual_rmsnorm_cpu);
+  m.def(
       "fused_add_layernorm_cpu(Tensor input, Tensor residual, Tensor weight, Tensor? bias, float eps) -> "
       "Tensor");
   m.impl("fused_add_layernorm_cpu", torch::kCPU, &fused_add_layernorm_cpu);
@@ -786,6 +800,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "topk_softmax_cpu(Tensor hidden_states, Tensor gating_output, int topk, bool renormalize, "
       "Tensor? correction_bias=None) -> (Tensor, Tensor)");
   m.impl("topk_softmax_cpu", torch::kCPU, &topk_softmax_cpu);
+  m.def(
+      "fused_moe_router_cpu(float moe_softcapping, Tensor hidden_states, Tensor gating_output, int topk, bool "
+      "renormalize, "
+      "Tensor? correction_bias=None) -> (Tensor, Tensor)");
+  m.impl("fused_moe_router_cpu", torch::kCPU, &fused_moe_router_cpu);
   m.def(
       "grouped_topk_cpu(Tensor hidden_states, Tensor gating_output, int topk, bool renormalize, int num_expert_group, "
       "int topk_group, int num_fused_shared_experts, float? routed_scaling_factor, Tensor? num_token_non_padded) -> "

@@ -16,7 +16,8 @@ use futures::future::try_join_all;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
-use super::chat::ChatRequest;
+use super::chat::{ChatBody, ChatRequest};
+use super::template::{RenderedChat, render_chat};
 use super::{AppState, contains_media};
 use crate::api_server::core::CoreError;
 use crate::message::types::{OneOrMany, TokenIds};
@@ -103,26 +104,34 @@ async fn tokenize(
         Ok(body) => body,
         Err(error) => return invalid_body(error.to_string()),
     };
+    let max_model_len = state.server_args.tokenizer_model_max_length;
+    let one = |tokens: TokenIds| {
+        json!({
+            "tokens": tokens,
+            "count": tokens.len(),
+            "max_model_len": max_model_len,
+        })
+    };
     let (texts, add_special_tokens) = match (body.prompt, body.messages) {
         (Some(prompt), None) => (prompt, body.add_special_tokens),
-        // The rendered template owns its special tokens, as on the chat path
-        // (Python encodes it with `add_special_tokens=False`).
-        (None, Some(messages)) => match render_chat_prompt(&state, messages, body.rest) {
-            Ok(prompt) => (OneOrMany::One(prompt), false /* add_special_tokens */),
-            Err((error_type, message)) => {
-                return error_body(StatusCode::BAD_REQUEST, error_type, message);
-            }
-        },
+        // Encoded as on the chat path (Python's `add_special_tokens=False`).
+        (None, Some(messages)) => {
+            let rendered = match render_chat_prompt(&state, messages, body.rest) {
+                Ok(rendered) => rendered,
+                Err((error_type, message)) => {
+                    return error_body(StatusCode::BAD_REQUEST, error_type, message);
+                }
+            };
+            return match state.core.tokenize_chat(rendered).await {
+                Ok(tokens) => Json(one(tokens)).into_response(),
+                Err(error) => core_error(error, "tokenization"),
+            };
+        }
         _ => return invalid_body("Exactly one of 'prompt' or 'messages' must be provided."),
     };
-    let max_model_len = state.server_args.tokenizer_model_max_length;
     let response = match texts {
         OneOrMany::One(text) => match state.core.tokenize(text, add_special_tokens).await {
-            Ok(tokens) => json!({
-                "tokens": tokens,
-                "count": tokens.len(),
-                "max_model_len": max_model_len,
-            }),
+            Ok(tokens) => one(tokens),
             Err(error) => return core_error(error, "tokenization"),
         },
         OneOrMany::Many(texts) => {
@@ -149,7 +158,7 @@ fn render_chat_prompt(
     state: &AppState,
     messages: Value,
     mut fields: Map<String, Value>,
-) -> Result<String, (&'static str, String)> {
+) -> Result<RenderedChat, (&'static str, String)> {
     const INVALID_BODY: &str = "Bad Request";
     const BAD_REQUEST: &str = "BadRequestError";
     fields.insert("messages".into(), messages);
@@ -157,11 +166,10 @@ fn render_chat_prompt(
     fields
         .entry("model")
         .or_insert_with(|| Value::from("default"));
-    let ChatRequest {
-        request,
-        chat_template_kwargs,
-        ..
-    } = serde_json::from_value(Value::Object(fields))
+    let ChatBody {
+        request: ChatRequest { request, .. },
+        raw: body,
+    } = ChatBody::deserialize(Value::Object(fields))
         .map_err(|error| (INVALID_BODY, error.to_string()))?;
     if request.messages.is_empty() {
         return Err((BAD_REQUEST, "messages cannot be empty".into()));
@@ -175,9 +183,13 @@ fn render_chat_prompt(
     let Some(formatter) = &state.chat_formatter else {
         return Err((BAD_REQUEST, "this model has no usable chat template".into()));
     };
-    formatter
-        .render(&request, chat_template_kwargs.as_ref())
-        .map_err(|error| (BAD_REQUEST, format!("chat template render failed: {error}")))
+    render_chat(
+        formatter,
+        body,
+        &request,
+        &state.server_args.default_chat_template_kwargs,
+    )
+    .map_err(|error| (BAD_REQUEST, format!("chat template render failed: {error}")))
 }
 
 async fn detokenize(
@@ -221,12 +233,11 @@ mod tests {
     use axum::http::StatusCode;
     use serde_json::json;
 
-    use super::super::template_loader::load_chat_formatter;
     use super::super::test_utils::{body_json, post_json};
     use super::*;
     use crate::api_server::core::{CoreConfig, CoreHandle, CoreMetadata};
     use crate::message::config::ServerArgs;
-    use crate::message::request::RequestKind;
+    use crate::message::request::{RequestKind, TokenizeInput};
     use crate::message::response::ResponseItem;
     use crate::tokenizer_manager::wiring::TmEvent;
 
@@ -239,13 +250,19 @@ mod tests {
             while let Ok(TmEvent::Intake { request, admission }) = intake_rx.recv_async().await {
                 assert!(admission.try_accept());
                 let item = match &request.kind {
-                    RequestKind::Tokenize {
+                    RequestKind::Tokenize(TokenizeInput::Text {
                         text,
                         add_special_tokens,
-                    } => {
+                    }) => {
                         let bos = add_special_tokens.then_some(0);
                         let words = text.split_whitespace().map(|w| w.len() as i64);
                         ResponseItem::TokenIds(bos.into_iter().chain(words).collect())
+                    }
+                    RequestKind::Tokenize(TokenizeInput::Chat(chat)) => {
+                        let text = chat.as_ref().clone().into_text();
+                        ResponseItem::TokenIds(
+                            text.split_whitespace().map(|w| w.len() as i64).collect(),
+                        )
                     }
                     RequestKind::Detokenize {
                         token_ids,
@@ -279,7 +296,7 @@ mod tests {
             ),
             server_args,
             chat_formatter: Some(
-                load_chat_formatter(
+                sglang_processor::load_chat_formatter(
                     None,           /* config_file */
                     None,           /* model_path */
                     None,           /* model_type */
@@ -288,6 +305,7 @@ mod tests {
                 .unwrap(),
             ),
             generate_hook: None,
+            openai_chat: None,
         })
     }
 

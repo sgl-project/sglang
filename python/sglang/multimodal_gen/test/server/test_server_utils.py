@@ -1140,10 +1140,28 @@ def get_generate_fn(
         else:
             timeout = 1200.0
         deadline = time.time() + timeout
+        last_progress = 0
+        was_running = False
         while True:
             page = client.videos.list()  # type: ignore[attr-defined]
             item = next((v for v in page.data if v.id == video_id), None)
             status = getattr(item, "status", None) if item is not None else None
+            if item is not None:
+                progress = item.progress
+                assert isinstance(progress, int) and last_progress <= progress <= 100, (
+                    f"{case_id}: invalid video progress {last_progress} -> {progress}"
+                )
+                assert not (was_running and status == "queued"), (
+                    f"{case_id}: running video job returned to queued"
+                )
+                assert status != "completed" or progress == 100, (
+                    f"{case_id}: completed video job has progress={progress}"
+                )
+                assert status not in {"queued", "in_progress"} or progress < 100, (
+                    f"{case_id}: unfinished video job has progress={progress}"
+                )
+                last_progress = progress
+                was_running = was_running or status == "in_progress"
 
             if status == "completed":
                 job_completed = True

@@ -176,6 +176,14 @@ When a backend is attached, HiCache hands it the host memory pools in a fixed or
 
 Specifically, **LMCache**, an efficient KV cache layer for enterprise-scale LLM inference, provides an alternative solution to HiCache. Try LMCache [here](https://github.com/sgl-project/sglang/tree/main/python/sglang/srt/mem_cache/storage/lmcache).
 
+### External KV Router Integration
+
+HiCache is not only consumed inside SGLang. An external KV-aware router placed in front of the engines can also query the same L3 data to route requests to the instance that can reuse the most KV cache. Such a router must rebuild the exact object keys the backend uses, which for Mooncake is `{key_prefix}_{page_hash}{suffix}`. The suffix depends on the model's pool layout, the parallelism layout, and the resolved `--page-size`, so the engine exposes its layout instead of letting each router derive the naming itself.
+
+The Mooncake backend describes the physical KV primary, SWA/Mamba components, and registered sidecars; it excludes logical KV anchors with no buffer. Suffixes come from the write-path key builders. KV uses `all_pages`; SWA uses `trailing_pages` with its component's `full_window_pages`, and Mamba uses one trailing page. Sidecars retain their own hit policy and derive a trailing window from their index-source component.
+
+The startup handshake and `GET /get_hicache_l3_cache_layout` use the same layout generator. In `/server_info`, the outer `hicache_object_layout` field contains `{enabled, backend, page_size, hicache_object_layout: {pools, key_prefix, is_mla_backend, pp_rank, pp_size}}`; pool entries contain `pool`, `suffixes`, `hit_policy`, and optionally `trailing_pages`. External lookup is enabled only for rank-replicated/MLA pools, including DeepSeek V4 compressed MLA. With pipeline parallelism each stage stores objects under its own `pp_rank` suffix, so the layout lists the pools of every stage and reports `pp_rank: null`; a layout that cannot cover all `pp_size` stages (for example when some stages run on other nodes) is unavailable. MHA or rank-sharded auxiliary pools, missing window metadata, unavailable Mooncake, and inconsistent scheduler replies also return `enabled: false` with a `reason`. Consumers must not register L3 in that case; an absent outer field indicates an older engine and permits legacy fallback. Ordinary DP and Ray startup retain and check scheduler replies rather than selecting the first layout.
+
 ## Related Parameters
 
 - **`--enable-hierarchical-cache`**: Enable hierarchical cache functionality. This is required to use HiCache.

@@ -486,6 +486,7 @@ mod tests {
             server_args: Arc::new(server_args),
             chat_formatter: None,
             generate_hook: None,
+            openai_chat: None,
         });
         let query = Query::try_from_uri(&format!("/v1/loads?{query}").parse().unwrap()).unwrap();
         let response = loads(State(state), query).await;

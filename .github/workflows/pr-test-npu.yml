@@ -4,10 +4,10 @@ on:
   schedule:
     - cron: '0 12 * * *'  # Run daily at 12:00 UTC
   pull_request:
-   branches:
-     - main
-     - 'npu/**'
-     - 'npu-*'
+    branches:
+      - main
+      - 'npu/**'
+      - 'npu-*'
   workflow_dispatch:
     inputs:
       coverage_mode:

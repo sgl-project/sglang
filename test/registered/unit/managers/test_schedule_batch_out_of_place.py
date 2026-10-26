@@ -30,7 +30,7 @@ from sglang.srt.runtime_context import get_context  # noqa: E402
 from sglang.srt.sampling.sampling_params import SamplingParams  # noqa: E402
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm  # noqa: E402
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 AUTO_FILL_EXCLUDED_FIELDS = ["reqs"]
 
