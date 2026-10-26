@@ -15,7 +15,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
-E, H, I, K = 896, 3584, 384, 16
+E, H, INTER, K = 896, 3584, 384, 16
 
 
 def _moe_kwargs(m, do_finalize):
@@ -34,14 +34,14 @@ def _moe_kwargs(m, do_finalize):
         routing_bias=None,
         hidden_states=u8((m, H // 2)),
         hidden_states_scale=fp8_scales((m, H // 16)),
-        gemm1_weights=u8((E, 2 * I, H // 2)),
-        gemm1_weights_scale=fp8_scales((E, 2 * I, H // 16)),
+        gemm1_weights=u8((E, 2 * INTER, H // 2)),
+        gemm1_weights_scale=fp8_scales((E, 2 * INTER, H // 16)),
         gemm1_bias=None,
         gemm1_alpha=torch.full((E,), 4.0, device="cuda"),
         gemm1_beta=torch.full((E,), 25.0, device="cuda"),
         gemm1_clamp_limit=None,
-        gemm2_weights=u8((E, H, I // 2)),
-        gemm2_weights_scale=fp8_scales((E, H, I // 16)),
+        gemm2_weights=u8((E, H, INTER // 2)),
+        gemm2_weights_scale=fp8_scales((E, H, INTER // 16)),
         gemm2_bias=None,
         output1_scale_scalar=torch.full((E,), 0.5, device="cuda"),
         output1_scale_gate_scalar=torch.full((E,), 0.25, device="cuda"),
@@ -51,7 +51,7 @@ def _moe_kwargs(m, do_finalize):
         top_k=K,
         n_group=0,
         topk_group=0,
-        intermediate_size=I,
+        intermediate_size=INTER,
         local_expert_offset=0,
         local_num_experts=E,
         routed_scaling_factor=None,
