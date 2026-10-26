@@ -243,29 +243,40 @@ class MiniMaxIndexerCP:
         q_heads = gathered_q.view(4, batch, 128)
         sm_scale = 128**-0.5 if sm_scale is None else sm_scale
         nvfp4 = isinstance(k_cache, Nvfp4Cache)
-        if nvfp4 and self.exchange is not None:
-            # candidates delivered straight to each head's owner; no collective
-            return cp_verify_exchange(
-                q_heads, k_cache, req_to_token, seq_lens, max_seqlen, slot_ids,
-                packed_queries, 128, 16, init_blocks, local_blocks,
-                sm_scale * unit_scale(q_scale) * unit_scale(k_scale), self.exchange,
-            )  # fmt: skip
         if nvfp4:
             # verify_topk_idx's NVFP4 scale folding, so scores match it exactly
+            nvfp4_sm_scale = sm_scale * unit_scale(q_scale) * unit_scale(k_scale)
+            if self.exchange is not None:
+                # candidates delivered straight to each head's owner; no collective
+                return cp_verify_exchange(
+                    q_heads=q_heads,
+                    k_cache=k_cache,
+                    req_to_token=req_to_token,
+                    seq_lens=seq_lens,
+                    max_seqlen=max_seqlen,
+                    slot_ids=slot_ids,
+                    num_draft=packed_queries,
+                    block_size=128,
+                    topk=16,
+                    init_blocks=init_blocks,
+                    local_blocks=local_blocks,
+                    sm_scale=nvfp4_sm_scale,
+                    exchange=self.exchange,
+                )
             keys = cp_verify_local_keys(
-                q_heads,
-                k_cache,
-                req_to_token,
-                seq_lens,
-                max_seqlen,
-                slot_ids,
-                packed_queries,
-                128,
-                init_blocks,
-                local_blocks,
-                sm_scale * unit_scale(q_scale) * unit_scale(k_scale),
-                4,
-                self.rank,
+                q_heads=q_heads,
+                k_cache=k_cache,
+                req_to_token=req_to_token,
+                seq_lens=seq_lens,
+                max_seqlen=max_seqlen,
+                slot_ids=slot_ids,
+                num_draft=packed_queries,
+                block_size=128,
+                init_blocks=init_blocks,
+                local_blocks=local_blocks,
+                sm_scale=nvfp4_sm_scale,
+                world=4,
+                rank=self.rank,
             )
         else:
             sm_scale *= 1.0 if q_scale is None else q_scale
@@ -293,7 +304,14 @@ class MiniMaxIndexerCP:
         )
         if nvfp4:
             return cp_verify_merge(
-                received, self.rank, seq_lens, max_seqlen, req_to_token, 128, 16,
-                init_blocks, local_blocks,
-            )  # fmt: skip
+                gathered_keys=received,
+                head=self.rank,
+                seq_lens=seq_lens,
+                max_seqlen=max_seqlen,
+                req_to_token=req_to_token,
+                block_size=128,
+                topk=16,
+                init_blocks=init_blocks,
+                local_blocks=local_blocks,
+            )
         return merge_candidates(received, self.rank)
