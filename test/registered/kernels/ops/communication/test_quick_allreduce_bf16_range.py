@@ -115,7 +115,7 @@ def _run_jit_bitwise_test(rank: int, world_size: int, port: int) -> None:
         generator = torch.Generator(device=device).manual_seed(rank)
         int8, int6, int4 = 1, 2, 3
         # (requested level, level it runs): asked for INT4, the JIT build runs INT8 below 64 MiB;
-        # a 32 KB tile per block, more tiles than blocks (grid-stride loop)
+        # at 32 KB a tile, the sizes past the first have more tiles than blocks (grid-stride loop)
         for numel, level, runs in (
             (384 * 6144, int4, int8),
             (4096 * 6144, int4, int8),
@@ -169,7 +169,7 @@ def _run_jit_fallback_test(rank: int, world_size: int, port: int) -> None:
         int6 = 2
         generator = torch.Generator(device=device).manual_seed(rank)
         inp = torch.randn(384 * 6144, device=device, generator=generator).bfloat16()
-        # (level, cast): INT6 at any world size, and no cast at TP4, are not the JIT build's
+        # (level, cast) the JIT build does not serve: INT6, INT4 at TP2, no cast at TP4
         cases = [("INT6", "1", int6, True)]
         if world_size == 4:
             cases.append(("INT8", "0", 1, False))
