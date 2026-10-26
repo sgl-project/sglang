@@ -1058,8 +1058,7 @@ class FusedMoE(torch.nn.Module):
         ):
             return False
 
-        # Quark stores these scales as uint8. Other methods already pass
-        # float8 or float32, so leave those tensors alone.
+        # Quark scales are raw uint8 E8M0 bytes.
         is_quark = self.quant_config.get_name() == "quark"
         if (
             is_quark
@@ -1072,20 +1071,15 @@ class FusedMoE(torch.nn.Module):
             and "scale" not in weight_name
             and loaded_weight.dtype == torch.float8_e4m3fn
         )
-        # Quark names the shared-expert scale weight_scale. Other FP8 formats
-        # use weight_scale_inv.
+        # Quark names this weight_scale. Other formats use weight_scale_inv.
         is_scale = (
-            (
-                "weight_scale_inv" in weight_name
-                or (is_quark and "weight_scale" in weight_name)
-            )
-            and loaded_weight.dtype in (torch.float8_e8m0fnu, torch.float32)
-        )
+            "weight_scale_inv" in weight_name
+            or (is_quark and "weight_scale" in weight_name)
+        ) and loaded_weight.dtype in (torch.float8_e8m0fnu, torch.float32)
         if not is_weight and not is_scale:
             return False
 
-        # FP8 and ModelOpt use *_weight_scale_inv. Quark uses *_weight_scale
-        # only when the inv name is absent.
+        # Fall back to Quark's weight_scale name when weight_scale_inv is absent.
         prefix = "w2" if shard_id == "w2" else "w13"
         weight_param = getattr(self, f"{prefix}_weight")
         scale_name = f"{prefix}_weight_scale_inv"
@@ -1118,7 +1112,7 @@ class FusedMoE(torch.nn.Module):
 
         weight_block_size = getattr(self.quant_config, "weight_block_size", None)
         if weight_block_size is None:
-            # MXFP4 uses groups of 32. Quark does not store that size.
+            # Quark omits this. MXFP4 groups are 32.
             if is_quark:
                 weight_block_size = [1, 32]
             else:
@@ -1129,7 +1123,7 @@ class FusedMoE(torch.nn.Module):
         fp4_weight, fp4_scale = quantize_block_fp8_weight_to_mxfp4(
             fp8_weight, fp8_scale, weight_block_size
         )
-        # Quark buffers are uint8. Keep the bits instead of casting them.
+        # Packed Quark buffers are uint8.
         if is_quark and weight_param.dtype == torch.uint8:
             fp4_weight = fp4_weight.view(torch.uint8)
         if is_quark and scale_param.dtype == torch.uint8:
