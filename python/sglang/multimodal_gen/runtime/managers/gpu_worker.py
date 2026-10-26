@@ -66,7 +66,6 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager im
     peek_global_component_residency_manager,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
-    LayerwiseUsageTracker,
     configure_layerwise_offload_modules,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.memory_occupation_controller import (
@@ -83,6 +82,7 @@ from sglang.multimodal_gen.runtime.pipelines_core import (
     build_pipeline,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
+from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import DenoisingStage
 from sglang.multimodal_gen.runtime.platforms import (
     current_platform,
     initialize_current_platform,
@@ -258,6 +258,10 @@ def _probe_workload_units(req: Req) -> int:
         * max(1, int(req.height or 1))
         * max(1, int(req.num_frames or 1))
     )
+
+
+class _FatalDistributedForward(SystemExit):
+    """Escape request-level recovery when ranks can no longer run in lockstep."""
 
 
 class GPUWorker(GPUWorkerPostTrainingMixin):
@@ -548,9 +552,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
 
         residency_hint = (
             f" Components that can remain on GPU: {can_stay_resident}. "
-            "Make it explicit with --component-residency <name>=resident; "
-            "--performance-mode auto with server warmup applies safe "
-            "adjustments automatically."
+            "Make it explicit with --component-residency <name>=resident."
             if can_stay_resident
             else ""
         )
@@ -708,16 +710,11 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 int(req.width or 0),
                 int(req.height or 0),
                 int(req.num_frames or 1),
-                max(1, int(req.num_inference_steps or 1)),
             )
             if measure_server_warmup
             else None
         )
         warmup_baseline_allocated_bytes = 0
-        layerwise_usage_tracker: LayerwiseUsageTracker | None = None
-        layerwise_layer_uses_by_stage: dict[
-            str, dict[str, dict[str, tuple[int, ...]]]
-        ] = {}
         try:
             if measure_server_warmup:
                 # Drop the previous request's allocator pool so each probe
@@ -731,20 +728,6 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 warmup_baseline_allocated_bytes = (
                     torch.get_device_module().memory_allocated()
                 )
-                if (
-                    self.server_args.performance_mode == "auto"
-                    and self.pipeline is not None
-                ):
-                    layerwise_usage_tracker = LayerwiseUsageTracker(
-                        self.pipeline.modules,
-                        stage_name_provider=(
-                            lambda: (
-                                req.metrics.active_stage_name
-                                if req.metrics is not None
-                                else None
-                            )
-                        ),
-                    )
 
             start_time = (
                 execution_start_time
@@ -816,6 +799,18 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                     deferred=False,
                 )
         except Exception as e:
+            if (
+                forward_failed
+                and isinstance(e, _oom_exceptions())
+                and get_replica_group().world_size > 1
+            ):
+                # Other ranks may still be inside this forward's collectives.
+                # Returning a request error would enter the next dispatch on
+                # only this rank, permanently desynchronizing the replica.
+                measure_server_warmup = False
+                raise _FatalDistributedForward(
+                    "Multi-rank forward ran out of memory; restart the server."
+                ) from e
             if propagate_forward_errors and forward_failed:
                 if isinstance(e, StopIteration):
                     raise RuntimeError(
@@ -841,20 +836,10 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             # or the estimator would plan from the remaining partial data
             if measure_server_warmup:
                 assert warmup_workload is not None
-                if layerwise_usage_tracker is not None:
-                    (
-                        layerwise_layer_uses,
-                        layerwise_layer_uses_by_stage,
-                    ) = layerwise_usage_tracker.finish_with_stages()
-                else:
-                    layerwise_layer_uses = {}
                 self._record_server_warmup_memory(
-                    req=req,
                     workload=warmup_workload,
                     baseline_allocated_bytes=warmup_baseline_allocated_bytes,
                     succeeded=output_batch is not None and output_batch.error is None,
-                    layerwise_layer_uses=layerwise_layer_uses,
-                    layerwise_layer_uses_by_stage=layerwise_layer_uses_by_stage,
                 )
         return output_batch
 
@@ -868,15 +853,22 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         deferred: bool,
     ) -> None:
         req_label = req.request_id[:8] if req.request_id else "unnamed"
-        with maybe_record_function(f"SAVE_OUTPUTS {req_label}"):
-            self._materialize_output_transport(output_batch, req, save_output_paths)
-        self._record_output_peak_memory(output_batch, is_warmup=req.is_warmup)
-
-        collect_perf = (
-            req.perf_dump_path is not None or envs.SGLANG_DIFFUSION_STAGE_LOGGING
-        )
-        if collect_perf and not req.is_warmup:
-            self._record_replica_peak_memory(output_metrics)
+        try:
+            with maybe_record_function(f"SAVE_OUTPUTS {req_label}"):
+                self._materialize_output_transport(output_batch, req, save_output_paths)
+            if req.is_warmup and not current_platform.is_cpu():
+                # A warmup saves no output, so nothing waits for its device work;
+                # drain it here or the next request's first blocking op pays for it.
+                torch.get_device_module().synchronize()
+        finally:
+            self._record_output_peak_memory(output_batch, is_warmup=req.is_warmup)
+            # saving can fail only on the output rank; it must still join the
+            # metrics collective, or its peers cannot serve the next request
+            collect_perf = (
+                req.perf_dump_path is not None or envs.SGLANG_DIFFUSION_STAGE_LOGGING
+            )
+            if collect_perf and not req.is_warmup:
+                self._record_replica_peak_memory(output_metrics)
 
         if (
             self.is_output_rank
@@ -914,7 +906,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             self._async_output_save
             and not req.is_warmup
             and not req.return_raw_frames
-            and bool(req.save_output and req.return_file_paths_only)
+            and self._encodes_on_output_rank(req)
             and req.perf_dump_path is None
             and not envs.SGLANG_DIFFUSION_STAGE_LOGGING
         )
@@ -950,17 +942,22 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 )
             stream.synchronize()
 
-    def release_cache_if_idle(self) -> None:
+    def release_cache_if_idle(self) -> float | None:
         """Release the allocator cache once no request has finished for a while.
 
-        The scheduler calls this only with nothing queued or in flight.
+        The scheduler calls this only with nothing queued or in flight. Returns
+        the seconds until a pending release is due, or None when none is pending.
         """
         due = self._cache_release_due
-        if due is None or time.monotonic() < due:
-            return
+        if due is None:
+            return None
+        wait_s = due - time.monotonic()
+        if wait_s > 0:
+            return wait_s
         self._cache_release_due = None
         with maybe_record_function("EMPTY_CACHE"):
             torch.get_device_module().empty_cache()
+        return None
 
     def take_deferred_finalize(self) -> Callable[[], None] | None:
         deferred = self._deferred_finalize
@@ -970,46 +967,23 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
     def _record_server_warmup_memory(
         self,
         *,
-        req: Req,
-        workload: tuple[int, int, int, int],
+        workload: tuple[int, int, int],
         baseline_allocated_bytes: int,
         succeeded: bool,
-        layerwise_layer_uses: dict[str, dict[str, tuple[int, ...]]] | None = None,
-        layerwise_layer_uses_by_stage: (
-            dict[str, dict[str, dict[str, tuple[int, ...]]]] | None
-        ) = None,
     ) -> None:
-        phase_allocated_peaks: dict[str, int] = {}
-        phase_components: dict[str, tuple[str, ...]] = {}
-        phase_used_components: dict[str, tuple[str, ...]] = {}
-        phase_full_weight_transition_components: dict[str, tuple[str, ...]] = {}
-        untracked_active_components: tuple[str, ...] = ()
+        # Warmup phases reset the device peak at every boundary, so the request
+        # peak is the largest per-phase peak or what ran after the last phase.
         residency_manager = peek_global_component_residency_manager()
-        if residency_manager is not None:
-            for phase_name, peak in residency_manager.take_warmup_phase_peaks().items():
-                phase_allocated_peaks[phase_name] = peak.allocated_bytes
-                phase_components[phase_name] = peak.active_components
-                phase_used_components[phase_name] = peak.used_components
-                phase_full_weight_transition_components[phase_name] = (
-                    peak.full_weight_transition_components
-                )
-            untracked_active_components = residency_manager.current_device_components()
+        phase_allocated_peaks = (
+            residency_manager.take_warmup_phase_peaks()
+            if residency_manager is not None
+            else {}
+        )
         request_allocated_peak = max(
             int(torch.get_device_module().max_memory_allocated()),
             max(phase_allocated_peaks.values(), default=0),
         )
-        if request_allocated_peak > max(phase_allocated_peaks.values(), default=0):
-            # Work after the residency-managed stage timeline (for example,
-            # output materialization) must remain a placement constraint.
-            # A reserved-only increase is not a second live placement. Record
-            # it separately so post-placement validation can still require
-            # allocator headroom without charging cache to candidate deltas.
-            phase_allocated_peaks["request:untracked"] = request_allocated_peak
-            phase_components["request:untracked"] = untracked_active_components
-            phase_used_components["request:untracked"] = ()
-            phase_full_weight_transition_components["request:untracked"] = ()
-        metrics = req.metrics
-        width, height, num_frames, num_inference_steps = workload
+        width, height, num_frames = workload
         self._auto_residency_warmup_records.append(
             WarmupMemoryRecord(
                 width=width,
@@ -1018,34 +992,6 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 baseline_allocated_bytes=int(baseline_allocated_bytes),
                 peak_allocated_bytes=request_allocated_peak,
                 succeeded=succeeded,
-                peak_reserved_bytes=int(
-                    torch.get_device_module().max_memory_reserved()
-                ),
-                phase_peak_allocated_bytes=phase_allocated_peaks,
-                phase_active_components=phase_components,
-                phase_used_components=phase_used_components,
-                phase_full_weight_transition_components=(
-                    phase_full_weight_transition_components
-                ),
-                layerwise_layer_uses=layerwise_layer_uses or {},
-                layerwise_layer_uses_by_stage=layerwise_layer_uses_by_stage or {},
-                num_inference_steps=num_inference_steps,
-                total_duration_ms=(
-                    float(metrics.total_duration_ms) if metrics is not None else 0.0
-                ),
-                stage_duration_ms=(dict(metrics.stages) if metrics is not None else {}),
-                step_duration_ms=(tuple(metrics.steps) if metrics is not None else ()),
-                step_duration_ms_by_stage=(
-                    {
-                        stage_name: tuple(durations)
-                        for stage_name, durations in metrics.steps_by_stage.items()
-                    }
-                    if metrics is not None
-                    else {}
-                ),
-                stage_iterations=(
-                    dict(metrics.stage_iterations) if metrics is not None else {}
-                ),
             )
         )
 
@@ -1057,10 +1003,17 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
     ) -> None:
         if req.return_raw_frames:
             self._materialize_raw_frame_transport(output_batch, req)
-        elif req.save_output and req.return_file_paths_only:
+        elif self._encodes_on_output_rank(req):
             self._materialize_file_path_transport(output_batch, save_output_paths)
         elif getattr(req, "return_frames", False):
             self._materialize_frame_outputs_for_return(output_batch, req)
+
+    @staticmethod
+    def _encodes_on_output_rank(req: Req) -> bool:
+        # the output rank encodes the outputs to save them or to return the image bytes
+        return req.return_file_paths_only and (
+            req.save_output or req.return_image_bytes
+        )
 
     def _materialize_raw_frame_transport(
         self, output_batch: OutputBatch, req: Req
@@ -1367,14 +1320,16 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             def build_output_path(idx: int) -> str:
                 return req.output_file_path(num_outputs, idx)
 
+        image_bytes = [] if req.return_image_bytes else None
         output_batch.output_file_paths = save_outputs(
             output_batch.output,
             req.data_type,
             req.fps,
-            True,
+            req.save_output,
             build_output_path,
             audio=output_batch.audio,
             audio_sample_rate=output_batch.audio_sample_rate,
+            image_bytes_out=image_bytes,
             output_compression=req.output_compression,
             x264_preset=req.x264_preset,
             enable_frame_interpolation=req.enable_frame_interpolation,
@@ -1385,6 +1340,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             upscaling_model_path=req.upscaling_model_path,
             upscaling_scale=req.upscaling_scale,
         )
+        output_batch.output_image_bytes = image_bytes
 
     def _save_group_output_paths(
         self,
@@ -1400,14 +1356,16 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             )
 
         first_req = reqs[0]
+        image_bytes = [] if first_req.return_image_bytes else None
         output_batch.output_file_paths = save_outputs(
             output_batch.output,
             first_req.data_type,
             first_req.fps,
-            True,
+            first_req.save_output,
             lambda idx: output_requests[idx].output_file_path(),
             audio=output_batch.audio,
             audio_sample_rate=output_batch.audio_sample_rate,
+            image_bytes_out=image_bytes,
             output_compression=first_req.output_compression,
             x264_preset=first_req.x264_preset,
             enable_frame_interpolation=first_req.enable_frame_interpolation,
@@ -1418,6 +1376,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             upscaling_model_path=first_req.upscaling_model_path,
             upscaling_scale=first_req.upscaling_scale,
         )
+        output_batch.output_image_bytes = image_bytes
 
     @staticmethod
     def _validate_group_forward_reqs(reqs: list[Req]) -> None:
@@ -1427,6 +1386,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             "save_output",
             "return_frames",
             "return_file_paths_only",
+            "return_image_bytes",
             "data_type",
             "fps",
             "output_compression",
@@ -1670,6 +1630,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             )
         finally:
             self._update_lora_metrics()
+            self._drop_breakable_cuda_graphs("LoRA changed")
         return OutputBatch()
 
     def merge_lora_weights(
@@ -1688,6 +1649,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             self.pipeline.merge_lora_weights(target, strength)
         finally:
             self._update_lora_metrics()
+            self._drop_breakable_cuda_graphs("LoRA changed")
         return OutputBatch()
 
     def unmerge_lora_weights(self, target: str = "all") -> OutputBatch:
@@ -1703,7 +1665,14 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             self.pipeline.unmerge_lora_weights(target)
         finally:
             self._update_lora_metrics()
+            self._drop_breakable_cuda_graphs("LoRA changed")
         return OutputBatch()
+
+    def _drop_breakable_cuda_graphs(self, reason: str) -> None:
+        # captured graphs replay the weights and LoRA branches of capture time
+        for stage in self.pipeline.stages:
+            if isinstance(stage, DenoisingStage):
+                stage.drop_breakable_cuda_graphs(reason)
 
     def _update_lora_metrics(self) -> None:
         if self.metrics is not None and isinstance(self.pipeline, LoRAPipeline):
@@ -1732,7 +1701,9 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 "sleeping": False,
                 "message": "already awake",
             }
-        return self.memory_occupation.resume_memory_occupation()
+        result = self.memory_occupation.resume_memory_occupation()
+        self._drop_breakable_cuda_graphs("weights moved by resume_memory_occupation")
+        return result
 
 
 OOM_MSG = """
@@ -1805,6 +1776,13 @@ def run_scheduler_process(
             }
         )
         scheduler.event_loop()
+    except _FatalDistributedForward:
+        logger.exception(
+            "Worker %d cannot safely continue after a multi-rank OOM", rank
+        )
+        # CUDA/NCCL teardown can wait forever on a peer's outstanding collective.
+        # Exit at the process boundary; the HTTP worker monitor rejects new work.
+        os._exit(1)
     except _oom_exceptions() as _e:
         logger.warning(OOM_MSG)
         raise

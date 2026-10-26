@@ -67,7 +67,7 @@ if _is_npu:
         )
 
 if _is_hip:
-    from sglang.kernels.ops.attention.utils import (
+    from sglang.kernels.ops.attention.fused_qk_rope_reshape_and_cache import (
         fused_qk_rope_reshape_and_cache,
     )
 
@@ -85,6 +85,9 @@ if _is_xpu:
 
 class RotaryEmbedding(BaseFusedOp):
     """Original rotary positional embedding."""
+
+    # (source cos_sin_cache, cast copy) memo for cos_sin_cache_as().
+    _cos_sin_cache_cast: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
 
     def __init__(
         self,
@@ -213,6 +216,19 @@ class RotaryEmbedding(BaseFusedOp):
                 self.cos_sin_cache = self.cos_sin_cache.to(
                     query.device, dtype=query.dtype
                 )
+
+    def cos_sin_cache_as(self, dtype: torch.dtype) -> torch.Tensor:
+        """cos_sin_cache in ``dtype``, for kernels that read it in the activation
+        dtype. The cast copy is reused until cos_sin_cache is replaced (growth or
+        device move), so steady-state calls launch no cast kernel."""
+        cache = self.cos_sin_cache
+        if cache.dtype == dtype:
+            return cache
+        memo = self._cos_sin_cache_cast
+        if memo is None or memo[0] is not cache or memo[1].dtype != dtype:
+            memo = (cache, cache.to(dtype))
+            self._cos_sin_cache_cast = memo
+        return memo[1]
 
     def _compute_inv_freq(self, base: Union[int, float]) -> torch.Tensor:
         """Compute the inverse frequency."""
@@ -418,6 +434,9 @@ class RotaryEmbedding(BaseFusedOp):
 
         positions = torch.add(positions, offsets) if offsets is not None else positions
         if _is_cpu_amx_available:
+            # rotary_embedding_cpu requires query and the cache to share a dtype;
+            # forward_cuda/forward_xpu already align them, forward_cpu did not.
+            self._match_cos_sin_cache_dtype(query)
             return torch.ops.sgl_kernel.rotary_embedding_cpu(
                 positions,
                 query,
@@ -491,17 +510,22 @@ class RotaryEmbedding(BaseFusedOp):
                     "save kv cache is not supported for fallback_rotary_embedding."
                 )
                 if _is_hip:
-                    self.cos_sin_cache = self.cos_sin_cache.to(query.device)
+                    # HIP keeps the buffer fp32 for the fused QSA indexer, but
+                    # this kernel reads it in the query dtype.
+                    if self.cos_sin_cache.device != query.device:
+                        self.cos_sin_cache = self.cos_sin_cache.to(query.device)
+                    cos_sin_cache = self.cos_sin_cache_as(query.dtype)
                 else:
                     self.cos_sin_cache = self.cos_sin_cache.to(
                         query.device, dtype=query.dtype
                     )
+                    cos_sin_cache = self.cos_sin_cache
                 self.fallback_rotary_embedding(
                     positions,
                     query,
                     key,
                     self.head_size,
-                    self.cos_sin_cache,
+                    cos_sin_cache,
                     self.is_neox_style,
                 )
         return query, key
@@ -546,6 +570,8 @@ class RotaryEmbedding(BaseFusedOp):
                 self.is_neox_style,
             )
             return query, key
+        elif self.head_size != self.rotary_dim:
+            return self.forward_native(positions, query, key)
         else:
             self._match_cos_sin_cache_dtype(query)
             # Use fallback kernel of 'rotary_embedding'.

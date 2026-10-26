@@ -16,12 +16,12 @@ import unittest
 
 import torch
 
-from sglang.kernels.ops.attention.deepseek_v4_rope import precompute_freqs_cis
 from sglang.kernels.ops.attention.dsv4 import (
     CompressorDecodePlan,
     CompressorPrefillPlan,
     compress_norm_rope_store,
 )
+from sglang.kernels.ops.attention.dsv4.rope import precompute_freqs_cis
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     DSV4_FP8_NOPE_ROW_BYTES,
     DSV4_FP8_QUANT_TILE,
