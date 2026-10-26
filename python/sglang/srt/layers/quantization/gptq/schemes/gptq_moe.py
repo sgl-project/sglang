@@ -325,6 +325,9 @@ class GPTQMarlinMoEScheme(GPTQMoESchemeBase):
     ):
         self.kernel.create_moe_runner(layer, moe_runner_config)
 
+    def preserves_input(self, layer):
+        return self.kernel.runner.preserves_input
+
     def get_moe_runner_backend(self, layer):
         return self.kernel.runner.runner_backend
 

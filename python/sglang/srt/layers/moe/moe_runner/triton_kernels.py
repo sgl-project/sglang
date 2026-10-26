@@ -81,6 +81,10 @@ class TritonKernelsQuantInfo(MoeQuantInfo):
 class TritonKernelsRunnerCore(MoeRunnerCore):
     """Execute MoE experts via the external triton_kernels package."""
 
+    @property
+    def preserves_input(self) -> bool:
+        return True
+
     def run(
         self,
         runner_input: TritonKernelsRunnerInput,

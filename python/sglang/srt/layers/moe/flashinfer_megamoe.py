@@ -648,7 +648,7 @@ def prepare_mxfp8_moe_weights_for_flashinfer_megamoe(
     )
 
 
-@register_fused_func("flashinfer_megamoe", "flashinfer_megamoe")
+@register_fused_func("flashinfer_megamoe", "flashinfer_megamoe", preserves_input=True)
 def run_flashinfer_megamoe(
     dispatch_output: DispatchOutput,
     quant_info: MoeQuantInfo,

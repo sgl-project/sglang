@@ -45,6 +45,7 @@ def init_experimental_sgl_marlin_lora(layer, base_layer) -> None:
     )
 
     layer._lora_runner = None
+    layer._direct_lora_preserves_input = True
     layer._quant_info = quant_info
 
 

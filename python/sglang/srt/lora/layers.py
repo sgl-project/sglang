@@ -34,7 +34,6 @@ from sglang.srt.lora.utils import (
 )
 from sglang.srt.runtime_context import (
     LoRABatchLayout,
-    get_flags,
     get_forward,
     get_parallel,
 )
@@ -1091,6 +1090,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
                 runner_backend = MoeRunnerBackend.TRITON
 
         self._lora_runner_backend = runner_backend
+        self._direct_lora_preserves_input = False
         if (lora_backend.name == "triton_v2") != runner_backend.is_lora():
             raise ValueError(
                 "Routed MoE LoRA must pair --lora-backend triton_v2 with "
@@ -1178,9 +1178,11 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         # runner from the LoRA path, including one that disposes its input.
         if self.lora_backend.get_batch_info(LoRABatchLayout.TP_GLOBAL) is None:
             return self.base_layer.preserves_input
-        if self._lora_runner_backend.is_deep_gemm():
-            return get_flags().capture.disable_dispose_tensor
-        return not self.moe_runner_config.inplace
+        if self._lora_runner_backend.is_lora():
+            return self._moe_lora_runner.preserves_input
+        if self._lora_runner is not None:
+            return self._lora_runner.preserves_input
+        return self._direct_lora_preserves_input
 
     def _get_lora_info(self):
         """Build the legacy engine's batch payload."""

@@ -133,6 +133,11 @@ class AWQMoEScheme(AWQMoESchemeBase):
         self.moe_runner_config = moe_runner_config
         self.kernel.runner = MoeRunner(MoeRunnerBackend.MARLIN, moe_runner_config)
 
+    def preserves_input(self, layer):
+        if self.runner is not None:
+            return self.runner.preserves_input
+        return self.kernel.runner.preserves_input
+
     def get_moe_runner_backend(self, layer):
         return self.kernel.runner.runner_backend
 

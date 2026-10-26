@@ -134,6 +134,11 @@ class MoeRunnerCore(ABC):
     def __init__(self, config: MoeRunnerConfig):
         self.config = config
 
+    @property
+    def preserves_input(self) -> bool:
+        """Whether the full pre/core/post path leaves dispatch input live and unchanged."""
+        return False
+
     @abstractmethod
     def run(
         self,
@@ -159,6 +164,11 @@ class DispatchMoeRunnerCore(ABC):
         self.config = config
 
     @property
+    def preserves_input(self) -> bool:
+        """Whether run_from_dispatch leaves input storage live and unchanged."""
+        return False
+
+    @property
     @abstractmethod
     def runner_backend(self) -> MoeRunnerBackendLike: ...
 
@@ -174,10 +184,16 @@ class DispatchMoeRunnerCore(ABC):
 
 class FusedOpPool:
     _fused_funcs: dict[str, Callable] = {}
+    _input_preservation: dict[Callable, bool | Callable[[MoeRunnerConfig], bool]] = {}
 
     @classmethod
     def register_fused_func(
-        cls, a2a_backend_name: str, runner_backend_name: str, fused_func: Callable
+        cls,
+        a2a_backend_name: str,
+        runner_backend_name: str,
+        fused_func: Callable,
+        *,
+        preserves_input: bool | Callable[[MoeRunnerConfig], bool] = False,
     ):
         key = (a2a_backend_name, runner_backend_name)
         if key in cls._fused_funcs:
@@ -191,6 +207,12 @@ class FusedOpPool:
             f"Invalid runner name: {runner_backend_name}"
         )
         cls._fused_funcs[key] = fused_func
+        cls._input_preservation[fused_func] = preserves_input
+
+    @classmethod
+    def preserves_input(cls, fused_func: Callable, config: MoeRunnerConfig) -> bool:
+        guarantee = cls._input_preservation.get(fused_func, False)
+        return guarantee(config) if callable(guarantee) else guarantee
 
     @classmethod
     def get_fused_func(cls, dispatch_name: str, runner_name: str) -> Optional[Callable]:
@@ -295,9 +317,14 @@ class PermuteMethodPool:
 def register_fused_func(
     a2a_backend_name: str,
     runner_backend_name: str,
+    *,
+    preserves_input: bool | Callable[[MoeRunnerConfig], bool] = False,
 ) -> Callable:
     """
     Decorator to register a fused function for the given DispatchOutputFormat and MoeRunnerBackend.
+
+    Input preservation covers both contents and storage lifetime for the complete
+    call. A callable guarantee is evaluated with the effective config on each query.
 
     :param a2a_backend_name: The A2A backend name.
     :param runner_backend_name: The MoeRunnerBackend name.
@@ -306,7 +333,10 @@ def register_fused_func(
 
     def decorator(fused_func: Callable):
         FusedOpPool.register_fused_func(
-            a2a_backend_name, runner_backend_name, fused_func
+            a2a_backend_name,
+            runner_backend_name,
+            fused_func,
+            preserves_input=preserves_input,
         )
         return fused_func
 

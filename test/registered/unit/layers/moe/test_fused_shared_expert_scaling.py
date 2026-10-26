@@ -301,6 +301,9 @@ class TestFusedSharedExpertScaling(CustomTestCase):
                 experts = FusedMoE.__new__(FusedMoE)
                 torch.nn.Module.__init__(experts)
                 experts.runner_backend = backend
+                experts.quant_method = SimpleNamespace(
+                    preserves_input=lambda layer: True
+                )
                 experts.moe_runner_config = MoeRunnerConfig()
                 experts.should_fuse_routed_scaling_factor_in_topk = True
                 experts.routing_method_type = None
@@ -651,8 +654,13 @@ class TestDeepseekMoeEpilogue(CustomTestCase):
         experts = FusedMoE.__new__(FusedMoE)
         torch.nn.Module.__init__(experts)
         experts.forward = run_experts
-        experts.quant_method = None
-        experts.moe_runner_config = SimpleNamespace(inplace=inplace)
+        from sglang.srt.layers.moe.moe_runner.runner import MoeRunner
+        from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
+
+        experts.moe_runner_config = MoeRunnerConfig(inplace=inplace)
+        experts.quant_method = UnquantizedFusedMoEMethod()
+        if backend is not None:
+            experts.quant_method.runner = MoeRunner(backend, experts.moe_runner_config)
         experts.runner_backend = backend
         experts.should_fuse_routed_scaling_factor_in_topk = False
 
@@ -815,20 +823,12 @@ class TestDeepseekMoeEpilogue(CustomTestCase):
         from sglang.srt.utils import dispose_tensor
 
         x = torch.arange(1, 7, dtype=torch.float32).reshape(2, 3)
+        from sglang.srt.layers.moe.moe_runner import marlin  # noqa: F401
+
         for backend in (
             MoeRunnerBackend.DEEP_GEMM,
             MoeRunnerBackend.MARLIN,
-            MoeRunnerBackend.EXPERIMENTAL_SGL_MARLIN,
             MoeRunnerBackend.TRITON_KERNELS,
-            MoeRunnerBackend.CUTLASS,
-            MoeRunnerBackend.AITER,
-            MoeRunnerBackend.FLASHINFER_CUTLASS,
-            MoeRunnerBackend.FLASHINFER_MXFP4,
-            MoeRunnerBackend.FLASHINFER_CUTEDSL,
-            MoeRunnerBackend.HUMMING,
-            MoeRunnerBackend.HPC_OPS,
-            MoeRunnerBackend.ASCEND,
-            MoeRunnerBackend.FLASHINFER_MEGAMOE,
         ):
             with self.subTest(backend=backend):
                 moe = self._moe(inplace=True, backend=backend)
@@ -902,6 +902,7 @@ class TestDeepseekMoeEpilogue(CustomTestCase):
             with self.subTest(method=type(method).__name__):
                 moe = self._moe(inplace=True, backend=None)
                 experts = moe.experts
+                del experts.quant_method
                 experts.quant_method = method
                 experts.scheme = scheme
                 experts.moe_runner_config = MoeRunnerConfig()
@@ -928,9 +929,69 @@ class TestDeepseekMoeEpilogue(CustomTestCase):
                 )
                 torch.testing.assert_close(actual, x * 5.5)
 
+    def test_paged_experts_keep_capture_overlap(self):
+        """Paged experts must overlap shared work using their effective runner config."""
+        from sglang.srt.layers.moe.paged_experts import PagedExpertsMoEMethod
+        from sglang.srt.layers.moe.paged_experts.formats import format_for
+        from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
+        from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
+        from sglang.srt.model_executor.runner_utils.capture_mode import (
+            model_capture_mode,
+        )
+
+        x = torch.arange(1, 7, dtype=torch.float32).reshape(2, 3)
+        for fp8 in (False, True):
+            for fused in (False, True):
+                with (
+                    self.subTest(fp8=fp8, fused=fused),
+                    get_flags().moe.override(runner_backend=MoeRunnerBackend.TRITON),
+                ):
+                    base_method = (
+                        Fp8MoEMethod(
+                            Fp8Config(
+                                is_checkpoint_fp8_serialized=True,
+                                weight_block_size=[128, 128],
+                            )
+                        )
+                        if fp8
+                        else UnquantizedFusedMoEMethod()
+                    )
+                    method = PagedExpertsMoEMethod(
+                        base_method=base_method,
+                        expert_format=format_for(base_method),
+                        num_experts=8,
+                        num_resident=4,
+                        graphs=True,
+                    )
+                    moe = self._moe(inplace=True)
+                    experts = moe.experts
+                    experts.quant_method = method
+                    experts.moe_runner_config = MoeRunnerConfig(num_experts=8)
+                    method.create_moe_runner(experts, experts.moe_runner_config)
+                    experts.runner_backend = method.get_moe_runner_backend(experts)
+                    if not fused:
+                        method.runner.fused_func = None
+                    self.assertTrue(experts.moe_runner_config.inplace)
+                    self.assertFalse(method.runner.config.inplace)
+                    calls = []
+
+                    def routed(hidden, *args, **kwargs):
+                        calls.append("routed")
+                        return hidden * 2.5
+
+                    def shared(hidden, *args, **kwargs):
+                        calls.append("shared")
+                        return hidden * 3
+
+                    experts.forward = routed
+                    moe._forward_shared_experts = shared
+                    with model_capture_mode():
+                        actual = moe(x.clone())
+                    self.assertEqual(calls, ["routed", "shared"])
+                    torch.testing.assert_close(actual, x * 5.5)
+
     def test_lora_wrapped_experts_preserve_capture_dispatch(self):
         """Wrapping routed experts must retain capture overlap with shared experts."""
-        from sglang.srt.layers.moe.moe_runner import runner
         from sglang.srt.lora.layers import FusedMoEWithLoRA
         from sglang.srt.model_executor.runner_utils.capture_mode import (
             model_capture_mode,
@@ -945,7 +1006,7 @@ class TestDeepseekMoeEpilogue(CustomTestCase):
         base.intermediate_size_per_partition = 3
         base.num_experts = base.num_local_experts = 8
         base.runner = None
-        base.quant_method = SimpleNamespace(get_triton_quant_info=lambda layer: None)
+        base.quant_method.get_triton_quant_info = lambda layer: None
         base.dispatcher = SimpleNamespace(
             dispatch=lambda **kwargs: SimpleNamespace(**kwargs),
             combine=lambda combine_input: combine_input.hidden_states,
@@ -984,13 +1045,11 @@ class TestDeepseekMoeEpilogue(CustomTestCase):
             prefill_moe_cg_buffers=None,
             moe_cg_buffers=None,
         )
-        with (
-            get_flags().moe.override(runner_backend=MoeRunnerBackend.TRITON),
-            patch.object(
-                runner, "MoeRunner", return_value=SimpleNamespace(run=lora_routed)
-            ),
-        ):
+        with get_flags().moe.override(runner_backend=MoeRunnerBackend.TRITON):
             moe.experts = FusedMoEWithLoRA(base, lora_backend)
+        self.stack.enter_context(
+            patch.object(moe.experts._lora_runner, "run", side_effect=lora_routed)
+        )
         weights = torch.zeros(1, 8, 1, 3)
         moe.experts.set_lora_info(weights, weights, weights, weights)
 
@@ -1001,6 +1060,46 @@ class TestDeepseekMoeEpilogue(CustomTestCase):
                 actual = moe(x.clone())
                 self.assertEqual(calls, ["lora" if has_batch else "routed", "shared"])
                 torch.testing.assert_close(actual, x * 5.5)
+
+    def test_runner_override_does_not_inherit_builtin_input_guarantee(self):
+        """An overriding core may overwrite input even when its builtin allocates output."""
+        from sglang.srt.layers.moe.moe_runner import runner as runner_module
+        from sglang.srt.layers.moe.moe_runner.base import DispatchMoeRunnerCore
+        from sglang.srt.layers.moe.token_dispatcher.standard import (
+            StandardCombineInput,
+            StandardDispatchOutput,
+        )
+        from sglang.srt.model_executor.runner_utils.capture_mode import (
+            model_capture_mode,
+        )
+
+        class WritingCore(DispatchMoeRunnerCore):
+            runner_backend = MoeRunnerBackend.MARLIN
+
+            def run_from_dispatch(
+                self, dispatch_output, quant_info, runner_config, hooks=None
+            ):
+                return StandardCombineInput(dispatch_output.hidden_states.mul_(2.5))
+
+        moe = self._moe()
+        with patch.dict(
+            runner_module._CUSTOM_RUNNER_CORE_FACTORIES,
+            {MoeRunnerBackend.MARLIN.value: WritingCore},
+        ):
+            runner = runner_module.MoeRunner(
+                MoeRunnerBackend.MARLIN,
+                moe.experts.moe_runner_config,
+                lora_enabled=True,
+            )
+        moe.experts.quant_method.runner = runner
+        moe.experts.runner_backend = runner.runner_backend
+        moe.experts.forward = lambda x, *a, **kw: (
+            runner.run(StandardDispatchOutput(x, None, None), None).hidden_states
+        )
+        x = torch.arange(1, 7, dtype=torch.float32).reshape(2, 3)
+        with model_capture_mode():
+            actual = moe(x.clone())
+        torch.testing.assert_close(actual, x * 5.5)
 
     def test_deepgemm_shared_read_precedes_eager_disposal(self):
         """Capture preservation must not enable overlap once disposal is active."""

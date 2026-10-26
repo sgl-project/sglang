@@ -1813,7 +1813,7 @@ def fused_experts_none_to_flashinfer_trtllm_bf16(
     return StandardCombineInput(hidden_states=final_hidden_states)
 
 
-@register_fused_func("none", "flashinfer_trtllm")
+@register_fused_func("none", "flashinfer_trtllm", preserves_input=True)
 def fused_experts_none_to_flashinfer_trtllm(
     dispatch_output: StandardDispatchOutput,
     quant_info: MoeQuantInfo,
@@ -1837,7 +1837,7 @@ def fused_experts_none_to_flashinfer_trtllm(
     )
 
 
-@register_fused_func("none", "flashinfer_trtllm_routed")
+@register_fused_func("none", "flashinfer_trtllm_routed", preserves_input=True)
 def fused_experts_none_to_flashinfer_trtllm_routed(
     dispatch_output: StandardDispatchOutput,
     quant_info: MoeQuantInfo,
@@ -1869,8 +1869,8 @@ def fused_experts_none_to_flashinfer_trtllm_routed(
     )
 
 
-@register_fused_func("flashinfer", "flashinfer_trtllm")
-@register_fused_func("flashinfer", "flashinfer_trtllm_routed")
+@register_fused_func("flashinfer", "flashinfer_trtllm", preserves_input=True)
+@register_fused_func("flashinfer", "flashinfer_trtllm_routed", preserves_input=True)
 def fused_experts_flashinfer_to_flashinfer_trtllm(
     dispatch_output: FlashinferDispatchOutput | StandardDispatchOutput,
     quant_info: MoeQuantInfo,

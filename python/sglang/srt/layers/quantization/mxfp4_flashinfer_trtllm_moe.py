@@ -165,6 +165,9 @@ class Mxfp4FlashinferTrtllmMoEMethod:
             else None
         )
 
+    def preserves_input(self, layer):
+        return True
+
     def get_moe_runner_backend(self, layer):
         return MoeRunnerBackend.FLASHINFER_MXFP4
 

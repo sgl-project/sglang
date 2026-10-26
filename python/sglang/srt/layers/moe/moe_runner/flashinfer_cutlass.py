@@ -396,7 +396,7 @@ def _run_flashinfer_cutlass(
     return output
 
 
-@register_fused_func("none", "flashinfer_cutlass")
+@register_fused_func("none", "flashinfer_cutlass", preserves_input=True)
 def fused_experts_none_to_flashinfer_cutlass(
     dispatch_output: StandardDispatchOutput,
     quant_info: MoeQuantInfo,
@@ -416,7 +416,7 @@ def fused_experts_none_to_flashinfer_cutlass(
     return StandardCombineInput(hidden_states=output)
 
 
-@register_fused_func("flashinfer", "flashinfer_cutlass")
+@register_fused_func("flashinfer", "flashinfer_cutlass", preserves_input=True)
 def fused_experts_flashinfer_to_flashinfer_cutlass(
     dispatch_output: FlashinferDispatchOutput | StandardDispatchOutput,
     quant_info: MoeQuantInfo,
@@ -448,7 +448,7 @@ def fused_experts_flashinfer_to_flashinfer_cutlass(
     return FlashinferCombineInput(hidden_states=output)
 
 
-@register_fused_func("none", "flashinfer_mxfp4")
+@register_fused_func("none", "flashinfer_mxfp4", preserves_input=True)
 def fused_experts_none_to_flashinfer_mxfp4(
     dispatch_output: StandardDispatchOutput,
     quant_info: MoeQuantInfo,

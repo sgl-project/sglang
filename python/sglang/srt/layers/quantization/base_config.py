@@ -124,12 +124,12 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         return self.runner.runner_backend if self.runner is not None else None
 
     def preserves_input(self, layer: torch.nn.Module) -> bool:
-        """Whether direct apply keeps its input live and unchanged even with inplace=True.
+        """Whether apply keeps the caller's input storage live and unchanged.
 
-        Direct kernels that ignore the inplace suggestion may opt in. Named
-        runners use their backend contract in FusedMoE instead.
+        Override when apply bypasses the owned runner or delegates to a wrapper.
+        Unknown direct implementations cannot overlap another input reader.
         """
-        return False
+        return self.runner is not None and self.runner.preserves_input
 
     def get_moe_routing_method_type(
         self, layer: torch.nn.Module, requested_method: RoutingMethodType | None

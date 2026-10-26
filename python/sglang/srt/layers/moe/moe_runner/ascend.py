@@ -117,6 +117,10 @@ class AscendRunnerOutput(RunnerOutput):
 class AscendRunnerCore(MoeRunnerCore):
     runner_backend = MoeRunnerBackend.ASCEND
 
+    @property
+    def preserves_input(self) -> bool:
+        return True
+
     def __init__(self, config: MoeRunnerConfig):
         super().__init__(config)
 

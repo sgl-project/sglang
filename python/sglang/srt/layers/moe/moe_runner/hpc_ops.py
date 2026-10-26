@@ -123,7 +123,7 @@ def _check_runner_config_supported(runner_config: MoeRunnerConfig) -> None:
         )
 
 
-@register_fused_func("none", "hpc_ops")
+@register_fused_func("none", "hpc_ops", preserves_input=True)
 def fused_experts_none_to_hpc_ops(
     dispatch_output: StandardDispatchOutput,
     quant_info: HpcOpsMoeQuantInfo,

@@ -71,6 +71,10 @@ class MoeLoraBatch(msgspec.Struct, kw_only=True):
 
 
 class MoeLoraRunner:
+    @property
+    def preserves_input(self) -> bool:
+        return True
+
     def __init__(
         self,
         *,

@@ -121,6 +121,9 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
 
         return weight_loader
 
+    def preserves_input(self, layer):
+        return self.base_method.preserves_input(layer)
+
     def create_moe_runner(self, layer, moe_runner_config):
         self.base_method.create_moe_runner(
             layer=layer,

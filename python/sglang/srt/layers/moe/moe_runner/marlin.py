@@ -112,7 +112,7 @@ class MarlinMoeQuantInfo(MoeQuantInfo):
     w2_bias: Optional[torch.Tensor] = None
 
 
-@register_fused_func("none", "marlin")
+@register_fused_func("none", "marlin", preserves_input=True)
 def fused_experts_none_to_marlin(
     dispatch_output: StandardDispatchOutput,
     quant_info: MarlinMoeQuantInfo,

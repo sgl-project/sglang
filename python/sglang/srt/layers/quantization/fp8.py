@@ -2973,6 +2973,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             # Direct kernels declare the layout they consume.
             self._moe_runner_backend = moe_runner_backend
 
+    def preserves_input(self, layer):
+        if self.runner is not None:
+            return self.runner.preserves_input
+        # The direct CUTLASS path supplies a separate output allocation.
+        return self._moe_runner_backend.is_cutlass()
+
     def get_moe_runner_backend(self, layer):
         if self.runner is not None:
             return self.runner.runner_backend

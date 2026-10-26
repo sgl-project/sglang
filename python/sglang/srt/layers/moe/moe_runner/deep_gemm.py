@@ -337,6 +337,11 @@ class DeepGemmMoeQuantInfo(MoeQuantInfo):
 
 
 class DeepGemmRunnerCore(MoeRunnerCore):
+    @property
+    def preserves_input(self) -> bool:
+        # SM120 can dispose the original input even with inplace=False.
+        return get_flags().capture.disable_dispose_tensor
+
     def __init__(self, config: MoeRunnerConfig):
         super().__init__(config)
         if config.silu_mul_keep_fp32 and (

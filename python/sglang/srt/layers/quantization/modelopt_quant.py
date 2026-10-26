@@ -1363,6 +1363,11 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
             else self.runner.runner_backend
         )
 
+    def preserves_input(self, layer):
+        if self._moe_runner_backend.is_flashinfer_trtllm():
+            return True
+        return self.runner.preserves_input
+
     def get_moe_runner_backend(self, layer):
         return self._moe_runner_backend
 

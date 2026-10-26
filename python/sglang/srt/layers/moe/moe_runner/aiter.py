@@ -166,6 +166,10 @@ def _aiter_fused_moe_supports_output() -> bool:
 
 
 class AiterRunnerCore(MoeRunnerCore):
+    @property
+    def preserves_input(self) -> bool:
+        return True
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         from sglang.kernels.ops.moe.moe_sorting_small import (

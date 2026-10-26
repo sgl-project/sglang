@@ -57,6 +57,9 @@ class Mxfp4MarlinMoEMethod:
 
         self.runner = MoeRunner(MoeRunnerBackend.MARLIN, moe_runner_config)
 
+    def preserves_input(self, layer):
+        return self.runner.preserves_input
+
     def get_moe_runner_backend(self, layer):
         return self.runner.runner_backend
 

@@ -469,6 +469,9 @@ class BitsAndBytesMoEMethod(FusedMoEMethodBase):
             **extra_weight_attrs,
         )
 
+    def preserves_input(self, layer):
+        return not self.moe_runner_config.inplace
+
     def create_moe_runner(self, layer: torch.nn.Module, moe_runner_config):
         self.moe_runner_config = moe_runner_config
 

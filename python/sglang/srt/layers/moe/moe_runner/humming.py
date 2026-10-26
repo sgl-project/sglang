@@ -145,6 +145,10 @@ def humming_moe_runner_core_run(
 class HummingRunnerCore(MoeRunnerCore):
     runner_cores: WeakValueDictionary = WeakValueDictionary()
 
+    @property
+    def preserves_input(self) -> bool:
+        return True
+
     def __init__(self, config: MoeRunnerConfig):
         super().__init__(config)
         assert config.num_local_experts is not None
@@ -775,7 +779,7 @@ class HummingRunnerCore(MoeRunnerCore):
         return buffers["down_output"]
 
 
-@register_fused_func("none", "humming")
+@register_fused_func("none", "humming", preserves_input=True)
 def fused_experts_none_to_humming(
     dispatch_output: StandardDispatchOutput,
     quant_info: HummingMoeQuantInfo,

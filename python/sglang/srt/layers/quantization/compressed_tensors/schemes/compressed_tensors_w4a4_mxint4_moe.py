@@ -296,6 +296,9 @@ class CompressedTensorsMxInt4MoE(CompressedTensorsMoEScheme):
     ):
         self.moe_runner_config = moe_runner_config
 
+    def preserves_input(self, layer):
+        return True
+
     def get_moe_runner_backend(self, layer):
         return MoeRunnerBackend.FLASHINFER_TRTLLM
 

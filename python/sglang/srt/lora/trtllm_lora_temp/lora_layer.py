@@ -62,6 +62,7 @@ def init_experimental_sgl_trtllm_lora(layer, base_layer) -> None:
     from sglang.srt.layers.moe.utils import RoutingMethodType
 
     _warm_sgl_trtllm_moe_module()
+    layer._direct_lora_preserves_input = True
 
     # ---- NVFP4 (modelopt) path ----
     # The fp4 weight loader sets ``g1_scale_c`` on the FusedMoE layer (see

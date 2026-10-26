@@ -1297,7 +1297,9 @@ class DeepseekV2MoE(nn.Module):
             and not self._shared_expert_tp1
         ):
             return self.forward_cpu(hidden_states)
-        defer_shared = not self.experts.moe_runner_config.inplace
+        defer_shared = (
+            not self.experts.moe_runner_config.inplace and self.experts.preserves_input
+        )
         # PoC (SGLANG_DP_SHARED_EXPERT_LOCAL): shared expert is computed on the LOCAL
         # hidden in the decoder layer (before the dp gather) and added after the
         # reduce_scatterv. When set, never compute/add it here (on the global buffer).

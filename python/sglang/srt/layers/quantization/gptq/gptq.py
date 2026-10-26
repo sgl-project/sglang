@@ -562,6 +562,9 @@ class GPTQMoEMethod(FusedMoEMethodBase):
     def get_moe_runner_backend(self, layer):
         return layer.scheme.get_moe_runner_backend(layer)
 
+    def preserves_input(self, layer):
+        return layer.scheme.preserves_input(layer)
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         layer.scheme.process_weights_after_loading(layer)
 
@@ -656,6 +659,9 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
 
     def get_moe_runner_backend(self, layer):
         return layer.scheme.get_moe_runner_backend(layer)
+
+    def preserves_input(self, layer):
+        return layer.scheme.preserves_input(layer)
 
     def apply(
         self,

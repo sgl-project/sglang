@@ -257,6 +257,9 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             )
             self.wrapper.load_weights(physical_to_logical_map_cpu)
 
+    def preserves_input(self, layer):
+        return self.gpu_method.preserves_input(layer)
+
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
     ):

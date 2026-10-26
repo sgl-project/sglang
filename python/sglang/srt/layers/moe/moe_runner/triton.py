@@ -78,6 +78,10 @@ def _topk_ids_may_be_nonlocal(config: MoeRunnerConfig) -> bool:
 
 
 class TritonRunnerCore(MoeRunnerCore):
+    @property
+    def preserves_input(self) -> bool:
+        return not self.config.inplace
+
     def __init__(self, config: MoeRunnerConfig):
         super().__init__(config)
 
@@ -181,7 +185,9 @@ class TritonRunnerCore(MoeRunnerCore):
         return MoeRunnerBackend.TRITON
 
 
-@register_fused_func("none", "triton")
+@register_fused_func(
+    "none", "triton", preserves_input=lambda config: not config.inplace
+)
 def fused_experts_none_to_triton(
     dispatch_output: StandardDispatchOutput,
     quant_info: TritonMoeQuantInfo,

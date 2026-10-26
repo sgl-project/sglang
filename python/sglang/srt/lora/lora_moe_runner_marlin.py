@@ -51,6 +51,10 @@ class MarlinLoraRunnerCore(DispatchMoeRunnerCore):
       4. moe_sum_reduce
     """
 
+    @property
+    def preserves_input(self) -> bool:
+        return True
+
     def __init__(self, config: MoeRunnerConfig):
         self.config = config
 

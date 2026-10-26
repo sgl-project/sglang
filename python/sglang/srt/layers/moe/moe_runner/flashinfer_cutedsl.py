@@ -435,7 +435,7 @@ class CuteDslFp4MoeQuantInfo(MoeQuantInfo):
     down_gemm_overlap_args: Optional[DownGemmOverlapArgs] = None
 
 
-@register_fused_func("none", "flashinfer_cutedsl")
+@register_fused_func("none", "flashinfer_cutedsl", preserves_input=True)
 def fused_experts_none_to_flashinfer_cutedsl_fp4(
     dispatch_output: StandardDispatchOutput,
     quant_info: CuteDslFp4MoeQuantInfo,
@@ -512,7 +512,7 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
     return StandardCombineInput(hidden_states=output)
 
 
-@register_fused_func("flashinfer", "flashinfer_cutedsl")
+@register_fused_func("flashinfer", "flashinfer_cutedsl", preserves_input=True)
 def fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
     dispatch_output: FlashinferDispatchOutput | StandardDispatchOutput,
     quant_info: CuteDslFp4MoeQuantInfo,
@@ -621,7 +621,7 @@ def fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
     return FlashinferCombineInput(hidden_states=output)
 
 
-@register_fused_func("deepep", "flashinfer_cutedsl")
+@register_fused_func("deepep", "flashinfer_cutedsl", preserves_input=True)
 def fused_experts_deepep_to_flashinfer_cutedsl_fp4(
     dispatch_output: DeepEPLLDispatchOutput,
     quant_info: CuteDslFp4MoeQuantInfo,

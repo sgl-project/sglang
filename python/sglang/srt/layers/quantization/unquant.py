@@ -1153,6 +1153,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         runner = self._aiter_runner if self._aiter_runner is not None else self.runner
         return runner.runner_backend if runner is not None else None
 
+    def preserves_input(self, layer):
+        runner = self._aiter_runner if self._aiter_runner is not None else self.runner
+        return runner is not None and runner.preserves_input
+
     @property
     def load_up_proj_weight_first(self) -> bool:
         # FlashInfer CUTLASS kernel assumes [Up, Gate] Proj as W13

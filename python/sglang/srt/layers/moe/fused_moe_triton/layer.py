@@ -634,31 +634,8 @@ class FusedMoE(torch.nn.Module):
     @property
     def preserves_input(self) -> bool:
         """Whether the selected implementation keeps its input live and unchanged."""
-        backend = self.runner_backend
-        if backend is not None:
-            if backend.is_deep_gemm():
-                # DeepGEMM allocates its output, but may dispose the input (also
-                # with inplace=False on SM120). Capture suppresses that disposal.
-                return get_flags().capture.disable_dispose_tensor
-            if (
-                backend.is_marlin()
-                or backend.is_triton_kernels()
-                or backend.is_cutlass()
-                or backend.is_aiter()
-                or backend.is_flashinfer_cutlass()
-                or backend.is_flashinfer_mxfp4()
-                or backend.is_flashinfer_cutedsl()
-                or backend.is_humming()
-                or backend.is_hpc_ops()
-                or backend.is_ascend()
-                or backend.is_flashinfer_megamoe()
-            ):
-                # These execution paths keep the original input separate from
-                # expert output, regardless of the layer's inplace suggestion.
-                return True
-        elif self.quant_method is not None and self.quant_method.preserves_input(self):
-            return True
-        return not self.moe_runner_config.inplace
+        assert self.quant_method is not None
+        return self.quant_method.preserves_input(self)
 
     @property
     def num_global_routed_experts(self) -> int:
