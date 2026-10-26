@@ -522,10 +522,16 @@ class HunYuanSparseMoeBlock(nn.Module):
 
         router_logits, _ = self.gate(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
+
+        # Run shared MLP before experts to avoid reading in-place modified
+        # hidden_states. On CUDA, FusedMoE runs in place (inplace=True by
+        # default) and overwrites hidden_states with expert output.
+        if self.shared_mlp is not None:
+            _shared_out = self.shared_mlp(hidden_states)
+
         final_hidden_states = self.experts(hidden_states, topk_output)
 
         if self.shared_mlp is not None:
-            _shared_out = self.shared_mlp(hidden_states)
             final_hidden_states = final_hidden_states + _shared_out
 
         # NPU: AscendTPDispatcher all-gathers the FusedMoE output internally;
