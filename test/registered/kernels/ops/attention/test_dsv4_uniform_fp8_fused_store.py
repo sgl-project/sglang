@@ -23,6 +23,7 @@ HEAD_DIM = 512
 ROPE_DIM = 64
 RATIO = 4
 PAGE_SIZE = 64
+EPS = 1e-6
 
 
 def _make_freqs(max_pos: int) -> torch.Tensor:
@@ -30,9 +31,33 @@ def _make_freqs(max_pos: int) -> torch.Tensor:
     return precompute_freqs_cis(ROPE_DIM, max_pos, 0, 10000, 1, 32, 1).to("cuda")
 
 
-def _reference_rows(kv, weight, eps, freqs, positions):
+def _store(kv, plan, freqs):
+    """Run the uniform-FP8 store into a zeroed cache with 2x spare slots; return
+    the norm weight, each row's slot, and the cache viewed one row per slot."""
+    num_rows = kv.shape[0]
+    weight = torch.randn(HEAD_DIM, dtype=torch.bfloat16, device="cuda").abs() + 0.5
+    out_loc = torch.randperm(num_rows * 2, device="cuda")[:num_rows].to(torch.int64)
+    num_pages = (num_rows * 2 + PAGE_SIZE - 1) // PAGE_SIZE + 1
+    cache = torch.zeros(
+        num_pages, PAGE_SIZE * HEAD_DIM, dtype=torch.uint8, device="cuda"
+    )
+    compress_norm_rope_store(
+        kv,
+        plan,
+        norm_weight=weight,
+        norm_eps=EPS,
+        freq_cis=freqs,
+        out_loc=out_loc,
+        kvcache=cache,
+        page_size=PAGE_SIZE,
+        uniform_fp8_store=True,
+    )
+    return weight, out_loc, cache.view(-1, HEAD_DIM)
+
+
+def _reference_rows(kv, weight, freqs, positions):
     x = kv.clone()
-    fused_norm_rope_inplace_triton(x, weight, eps, freqs, positions=positions)
+    fused_norm_rope_inplace_triton(x, weight, EPS, freqs, positions=positions)
     return x.to(torch.float8_e4m3fn)
 
 
@@ -49,8 +74,6 @@ def _assert_rows_match(got_fp8, ref_fp8):
 def test_uniform_fp8_store_decode_plan(num_rows):
     torch.manual_seed(num_rows)
     kv = torch.randn(num_rows, HEAD_DIM, dtype=torch.bfloat16, device="cuda") * 2
-    weight = torch.randn(HEAD_DIM, dtype=torch.bfloat16, device="cuda").abs() + 0.5
-    eps = 1e-6
     seq = torch.randint(1, 8192, (num_rows,), device="cuda", dtype=torch.int32)
     # half the rows sit on a window boundary (stored), half not (skipped)
     seq[::2] = (seq[::2] // RATIO).clamp(min=1) * RATIO
@@ -59,28 +82,11 @@ def test_uniform_fp8_store_decode_plan(num_rows):
         RATIO, torch.arange(num_rows, device="cuda", dtype=torch.int64), seq.long()
     )
     freqs = _make_freqs(8192 + RATIO)
-    out_loc = torch.randperm(num_rows * 2, device="cuda")[:num_rows].to(torch.int64)
-
-    num_pages = (num_rows * 2 + PAGE_SIZE - 1) // PAGE_SIZE + 1
-    cache = torch.zeros(
-        num_pages, PAGE_SIZE * HEAD_DIM, dtype=torch.uint8, device="cuda"
-    )
-    compress_norm_rope_store(
-        kv,
-        plan,
-        norm_weight=weight,
-        norm_eps=eps,
-        freq_cis=freqs,
-        out_loc=out_loc,
-        kvcache=cache,
-        page_size=PAGE_SIZE,
-        uniform_fp8_store=True,
-    )
+    weight, out_loc, rows = _store(kv, plan, freqs)
 
     boundary = (seq % RATIO) == 0
     positions = (seq - RATIO).to(torch.int32)
-    ref = _reference_rows(kv, weight, eps, freqs, positions)
-    rows = cache.view(-1, HEAD_DIM)
+    ref = _reference_rows(kv, weight, freqs, positions)
     got = rows[out_loc[boundary]].view(torch.float8_e4m3fn)
     _assert_rows_match(got, ref[boundary])
     # non-boundary rows must not be written (their slots stay zero)
@@ -92,8 +98,6 @@ def test_uniform_fp8_store_decode_plan(num_rows):
 def test_uniform_fp8_store_prefill_plan_with_invalid_rows(num_rows):
     torch.manual_seed(num_rows)
     kv = torch.randn(num_rows, HEAD_DIM, dtype=torch.bfloat16, device="cuda") * 2
-    weight = torch.randn(HEAD_DIM, dtype=torch.bfloat16, device="cuda").abs() + 0.5
-    eps = 1e-6
     seq = (torch.randint(1, 2048, (num_rows,), device="cuda") * RATIO).to(torch.int32)
     ragged = torch.randperm(num_rows, device="cuda").to(torch.int32)
     valid = torch.rand(num_rows, device="cuda") > 0.25
@@ -104,27 +108,10 @@ def test_uniform_fp8_store_prefill_plan_with_invalid_rows(num_rows):
     plan_w = torch.zeros(num_rows, 8, dtype=torch.uint8, device="cuda")
     plan = CompressorPrefillPlan(RATIO, plan_c, plan_w)
     freqs = _make_freqs(2048 * RATIO + RATIO)
-    out_loc = torch.randperm(num_rows * 2, device="cuda")[:num_rows].to(torch.int64)
-
-    num_pages = (num_rows * 2 + PAGE_SIZE - 1) // PAGE_SIZE + 1
-    cache = torch.zeros(
-        num_pages, PAGE_SIZE * HEAD_DIM, dtype=torch.uint8, device="cuda"
-    )
-    compress_norm_rope_store(
-        kv,
-        plan,
-        norm_weight=weight,
-        norm_eps=eps,
-        freq_cis=freqs,
-        out_loc=out_loc,
-        kvcache=cache,
-        page_size=PAGE_SIZE,
-        uniform_fp8_store=True,
-    )
+    weight, out_loc, rows = _store(kv, plan, freqs)
 
     positions = (seq - RATIO).clamp(min=0).to(torch.int32)
-    ref = _reference_rows(kv, weight, eps, freqs, positions)
-    rows = cache.view(-1, HEAD_DIM)
+    ref = _reference_rows(kv, weight, freqs, positions)
     got = rows[out_loc[ragged[valid].long()]].view(torch.float8_e4m3fn)
     _assert_rows_match(got, ref[valid])
     # invalid rows are skipped entirely: every slot not mapped by a valid row

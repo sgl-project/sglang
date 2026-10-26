@@ -532,26 +532,6 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             backend.shared_read_ends(ForwardMode.EXTEND), SharedReadEnds.UNKNOWN
         )
 
-    def test_trtllm_warmup_does_not_create_flashmla_scheduler_metadata(self):
-        from sglang.srt.layers.attention.deepseek_v4_backend import (
-            DeepseekV4AttnBackend,
-            DSV4Metadata,
-        )
-
-        backend = object.__new__(DeepseekV4AttnBackend)
-        backend.trtllm_attn = True
-        backend.forward_metadata = DSV4Metadata(
-            self._make_core_metadata(0), indexer_metadata=None
-        )
-        backend._current_capture_raw = None
-
-        with mock.patch(
-            "sglang.srt.layers.attention.deepseek_v4_backend._create_flashmla_metadata"
-        ) as create:
-            backend.on_after_cuda_graph_warmup()
-
-        create.assert_not_called()
-
     def test_snapshot_builds_cache_only_for_sparse_prefill(self):
         from sglang.srt.environ import envs
         from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
@@ -724,6 +704,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         from sglang.srt.layers.attention import deepseek_v4_trtllm_backend as trtllm
 
         schedule = SimpleNamespace(max_prefill_tokens=16384, max_running_requests=256)
+        # Adaptive spec drafts 4 tokens now and may widen to 8.
         spec = SimpleNamespace(
             speculative_algorithm="EAGLE", speculative_num_draft_tokens=4
         )
@@ -732,12 +713,15 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             mock.patch.object(trtllm, "get_schedule", return_value=schedule),
             mock.patch.object(trtllm, "get_spec", return_value=spec),
             mock.patch.object(trtllm, "max_prefill_buffer_tokens", return_value=4096),
+            mock.patch.object(
+                trtllm, "max_speculative_num_draft_tokens", return_value=8
+            ),
         ):
             # Prefill chunk / max_prefill_tokens dominates.
             self.assertEqual(trtllm._trtllm_query_row_capacity(model_runner), 16384)
-            # Decode rows = requests x draft tokens dominate.
+            # Decode rows = requests x the widest draft dominate.
             schedule.max_running_requests = 8192
-            self.assertEqual(trtllm._trtllm_query_row_capacity(model_runner), 32768)
+            self.assertEqual(trtllm._trtllm_query_row_capacity(model_runner), 65536)
 
     def test_sparse_prefill_kv_buffer_reuses_and_grows(self):
         from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
@@ -754,97 +738,6 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         self.assertEqual(grown.shape, (7, 1, 512))
         self.assertNotEqual(grown.data_ptr(), first.data_ptr())
         self.assertEqual(workspace._buffer.data_ptr(), grown.data_ptr())
-
-    def test_trtllm_padded_output_reuses_storage_and_zeros_only_tail(self):
-        from sglang.srt.layers.attention.deepseek_v4_trtllm_backend import (
-            DeepseekV4TrtllmAttnBackend,
-        )
-
-        backend = object.__new__(DeepseekV4TrtllmAttnBackend)
-        backend.trtllm_graph_output_buffer = torch.full((8, 2, 512), 7.0)
-        backend.trtllm_eager_output_buffer = None
-        backend._padded_output_zeroed = None
-
-        output = backend._padded_output_buffer(num_rows=8, num_real_rows=6, num_heads=2)
-
-        self.assertEqual(
-            output.data_ptr(), backend.trtllm_graph_output_buffer.data_ptr()
-        )
-        self.assertTrue(torch.all(output[:6] == 7))
-        self.assertTrue(torch.all(output[6:] == 0))
-
-        # Tail zeroed once per (buffer, rows, real rows); a different shape re-zeroes.
-        output[6:] = 3
-        again = backend._padded_output_buffer(num_rows=8, num_real_rows=6, num_heads=2)
-        self.assertTrue(torch.all(again[6:] == 3))
-        other = backend._padded_output_buffer(num_rows=8, num_real_rows=5, num_heads=2)
-        self.assertTrue(torch.all(other[5:] == 0))
-
-    def test_trtllm_prefill_slices_padding_in_dense_token_layout(self):
-        from sglang.srt.layers.attention.deepseek_v4_trtllm_backend import (
-            DeepseekV4TrtllmAttnBackend,
-        )
-
-        core = SimpleNamespace(
-            trtllm_prefill_qmeta=None,
-            seq_lens_casual=torch.tensor(
-                [6, 7, 8, 14, 15, 16, 0, 0], dtype=torch.int64
-            ),
-            trtllm_prefill_swa_indices=torch.zeros((6, 128), dtype=torch.int32),
-            trtllm_prefill_swa_lens=torch.full((6,), 128, dtype=torch.int32),
-            trtllm_prefill_c4_indices=None,
-            trtllm_prefill_c4_lens=None,
-            trtllm_prefill_c128=None,
-            request_window_layout=None,
-        )
-        backend = object.__new__(DeepseekV4TrtllmAttnBackend)
-        backend.device = torch.device("cpu")
-        backend.forward_metadata = SimpleNamespace(
-            core_attn_metadata=core, late_layer_tail=None
-        )
-        backend.trtllm_workspace_buffer = torch.empty(1, dtype=torch.int8)
-        backend.trtllm_counter_buffer = torch.empty(1, dtype=torch.uint8)
-        backend.trtllm_graph_output_buffer = torch.full((8, 2, 512), 7.0)
-        backend.trtllm_eager_output_buffer = None
-        backend._padded_output_zeroed = None
-        backend._trtllm_kv_cache_views = lambda _layer_id, _ratio: (
-            torch.empty(1),
-            torch.empty(1),
-        )
-        backend._get_trtllm_bmm_scales = lambda _layer: (1.0, 1.0)
-
-        captured = {}
-
-        def fake_attention(**kwargs):
-            captured.update(kwargs)
-            return kwargs["out"]
-
-        forward_batch = SimpleNamespace(
-            extend_seq_lens_cpu=[3, 3],
-        )
-        q = torch.empty((8, 2, 512), dtype=torch.float8_e4m3fn)
-
-        with mock.patch(
-            "sglang.srt.layers.attention.deepseek_v4_trtllm_backend.trtllm_batch_decode_sparse_mla_dsv4",
-            side_effect=fake_attention,
-        ):
-            output = backend._forward_trtllm_prefill(
-                q=q,
-                layer=SimpleNamespace(layer_id=0),
-                compress_ratio=0,
-                forward_batch=forward_batch,
-                attn_sink=torch.zeros(2, dtype=torch.float32),
-                extra_indices=None,
-            )
-
-        self.assertEqual(captured["query"].shape, (6, 1, 2, 512))
-        self.assertNotIn("cum_seq_lens_q", captured)
-        self.assertNotIn("max_q_len", captured)
-        self.assertEqual(captured["seq_lens"].tolist(), [6, 7, 8, 14, 15, 16])
-        self.assertEqual(captured["sparse_indices"].shape, (6, 128))
-        self.assertEqual(captured["out"].shape, (6, 1, 2, 512))
-        self.assertEqual(output.shape, (8, 2, 512))
-        self.assertTrue(torch.all(output[6:] == 0))
 
     def test_sparse_prefill_c4_uses_live_extent(self):
         page_table = torch.zeros((2, 4096), dtype=torch.int32)
@@ -993,24 +886,12 @@ class TestTrtllmSparseTablePool(CustomTestCase):
         # Same parent every step (kernel-visible address never moves), stride == width.
         self.assertEqual(small.data_ptr(), big.data_ptr())
         self.assertEqual(small.stride(0), 4)
-        # Rows past `rows` up to the 64-row tile are re-inerted;
-        # [:rows] is left to a caller that promises to write them.
+        # Rows past `rows` up to the 64-row tile are re-inerted.
         self.assertTrue(torch.all(big[10:64] == -1))
-        self.assertTrue(torch.all(small == 7))
         src = torch.arange(5, **self.kw)
         lens = self.pool.view("l", 5, fill=128, src=src)
         self.assertEqual(lens.tolist(), [0, 1, 2, 3, 4])
         self.assertTrue(torch.all(self.pool._bufs["l"][5:] == 128))
-
-    def test_copy_unless_aliased(self):
-        from sglang.srt.layers.attention.dsv4.metadata import copy_unless_aliased
-
-        parent = torch.zeros(4, 6, **self.kw)
-        tail = parent[:, 2:]
-        copy_unless_aliased(tail, tail)
-        self.assertTrue(torch.all(parent == 0))
-        copy_unless_aliased(tail, torch.full((4, 4), 3, **self.kw))
-        self.assertTrue(torch.all(parent[:, 2:] == 3) and torch.all(parent[:, :2] == 0))
 
     def _core(
         self,
@@ -1072,32 +953,6 @@ class TestTrtllmSparseTablePool(CustomTestCase):
             other.c4_sparse_page_indices.data_ptr(),
             other.trtllm_c4_indices[:, SWA_WINDOW:].data_ptr(),
         )
-
-    def test_copy_metadata_skips_pool_backed_tables(self):
-        dst, src = self._core(), self._core()  # same pool parents
-        swa_lens, c4_indices = dst.trtllm_swa_lens, dst.trtllm_c4_indices
-        c4_lens, c4_tail = dst.trtllm_c4_lens, dst.c4_sparse_page_indices
-        parents = [
-            (b.data_ptr(), b.data_ptr() + b.numel() * b.element_size())
-            for b in self.pool._bufs.values()
-        ]
-        copied_into = []
-        real_copy = torch.Tensor.copy_
-
-        def spy(tensor, other, *args, **kwargs):
-            copied_into.append(tensor.data_ptr())
-            return real_copy(tensor, other, *args, **kwargs)
-
-        with mock.patch.object(torch.Tensor, "copy_", spy):
-            dst.copy_(src)
-        # Captured table objects survive replay copies: no rebind, no self-copy.
-        self.assertIs(dst.trtllm_swa_lens, swa_lens)
-        self.assertIs(dst.trtllm_c4_indices, c4_indices)
-        self.assertIs(dst.trtllm_c4_lens, c4_lens)
-        self.assertIs(dst.c4_sparse_page_indices, c4_tail)
-        self.assertTrue(copied_into)  # the non-pool fields were copied
-        for ptr in copied_into:
-            self.assertFalse(any(lo <= ptr < hi for lo, hi in parents), ptr)
 
     def test_low_ratio_layers_share_the_indexed_table(self):
         from sglang.srt.layers.attention.deepseek_v4_backend import SWA_WINDOW

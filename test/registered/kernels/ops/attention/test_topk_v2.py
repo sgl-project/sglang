@@ -176,9 +176,14 @@ def _plan(seq_lens):
 def _run(scores, seq_lens, page_table, inv_cpu, k):
     batch = scores.shape[0]
     metadata = _plan(seq_lens)
-    out = torch.full((batch, k), -1, dtype=torch.int32, device=scores.device)
+    # On CUDA write a column slice of a wider table (out_stride > k), as the trtllm
+    # sparse table does; the columns before it must stay untouched.
+    col = 0 if is_hip() else 128
+    table = torch.full((batch, col + k), -9, dtype=torch.int32, device=scores.device)
+    out = table[:, col:].fill_(-1)
     topk_transform_paged_v2(scores, seq_lens, page_table, out, PAGE_SIZE, metadata)
     torch.cuda.synchronize()
+    assert (table[:, :col] == -9).all(), "kernel wrote outside its column slice"
     out_cpu = out.cpu().tolist()
     return [_invert(out_cpu[i], inv_cpu[i]) for i in range(batch)]
 
