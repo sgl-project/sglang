@@ -16,7 +16,7 @@ from sglang.srt.arg_groups.overrides import (
     run_post_process_pass,
 )
 from sglang.srt.environ import envs
-from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
 from sglang.srt.utils.common import is_gfx95_supported, is_npu
 
@@ -36,8 +36,7 @@ def _default_dsv4_attention_backend(server_args: ServerArgs) -> str:
         or cfg.device != "cuda"
         or not is_sm100_supported()
         or cfg.kv_cache_dtype != "fp8_e4m3"
-        or cfg.disaggregation_mode != "null"
-        or (layout.is_set() and layout.get().lower() not in ("auto", "v41"))
+        or (layout.is_set() and layout.get().lower() not in ("auto", "v41", "v41_new"))
     ):
         return "flashmla"
     return "flashmla_mega"
@@ -101,15 +100,11 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
             "--dsv4-attn-backend trtllm does not support context parallelism "
             "(prefill CP, attention CP, or decode CP)."
         )
-        # The trtllm backend stores KV in a 512-byte uniform-FP8 layout while
-        # FlashMLA uses the 584-byte packed layout; the PD handshake only
-        # compares kv_cache_dtype, so mismatched prefill/decode backends would
-        # pass the check and transfer garbage. Reject until the handshake
-        # carries a layout identifier and the path is tested (#37838).
+        # The PD handshake rejects peers whose KV layouts differ, but the
+        # uniform-FP8 layout has not been run under PD (#37838).
         assert cfg.disaggregation_mode == "null", (
             "--dsv4-attn-backend trtllm does not support PD disaggregation yet "
-            "(uniform-FP8 KV layout is not part of the PD handshake; see "
-            "https://github.com/sgl-project/sglang/issues/37838)."
+            "(untested; see https://github.com/sgl-project/sglang/issues/37838)."
         )
         # The trtllm-gen semaphore buffer is sized from the prefill chunk
         # bound; with chunking disabled a single long request has no bound.
@@ -255,7 +250,7 @@ def validate_deepseek_v41_encoder_replay_budget(server_args: ServerArgs) -> None
 
 
 def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
-    from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+    from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
         is_unified_kv_triton,
     )
 
@@ -299,7 +294,6 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             # ROCm replays hits in a forward of their own, which only the hitting
             # attention-DP ranks would enter; CUDA folds them into the extend.
             ("DP attention on ROCm", get_platform().is_hip and attn_dp_enabled_of(cfg)),
-            ("external cache linker", cfg.enable_unified_cache_external_linker),
             ("unified memory", cfg.enable_unified_memory),
             # Decode receives the last SWA window from prefill and never replays.
             ("PD decode", cfg.disaggregation_mode == "decode"),
@@ -368,30 +362,6 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 "DP attention is supported when "
                 "both servers use the same block size and target/draft KV layout."
             )
-
-    prefill_graph = cfg.cuda_graph_config.prefill
-    cp_breakable_prefill = (
-        cfg.enable_prefill_cp
-        and cfg.cp_strategy == "interleave"
-        and cfg.tp_size > 1
-        and prefill_graph.backend == Backend.BREAKABLE
-    )
-    if (
-        prefill_graph.backend != Backend.DISABLED
-        and prefill_graph.max_seq_len is None
-        and not cp_breakable_prefill
-    ):
-        declare_resolution(
-            server_args,
-            "validate_deepseek_v41_features",
-            cuda_graph_config=with_phase(
-                cfg.cuda_graph_config, Phase.PREFILL, max_seq_len=16 * 1024
-            ),
-        )
-        logger.warning(
-            "Setting cuda_graph_config[prefill].max_seq_len to 16384 for "
-            "DeepSeek-V4.1; longer contexts run eager prefill."
-        )
 
     incompatible = (
         (

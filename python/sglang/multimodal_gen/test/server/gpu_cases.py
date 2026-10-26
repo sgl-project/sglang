@@ -39,6 +39,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     SANA_WM_TI2V_CI_sampling_params,
     T2I_sampling_params,
     T2V_sampling_params,
+    WAN_2_2_ANIMATE_2_14B_DISTILLED_sampling_params,
     WAN_2_2_ANIMATE_2_14B_sampling_params,
     _make_modelopt_ci_case,
     _with_default_num_gpus,
@@ -64,6 +65,7 @@ from sglang.multimodal_gen.test.test_utils import (
     DEFAULT_WAN_2_1_I2V_14B_720P_MODEL_NAME_FOR_TEST,
     DEFAULT_WAN_2_1_T2V_1_3B_MODEL_NAME_FOR_TEST,
     DEFAULT_WAN_2_1_T2V_14B_MODEL_NAME_FOR_TEST,
+    DEFAULT_WAN_2_2_ANIMATE_2_14B_DISTILLED_MODEL_NAME_FOR_TEST,
     DEFAULT_WAN_2_2_ANIMATE_2_14B_MODEL_NAME_FOR_TEST,
     DEFAULT_WAN_2_2_I2V_A14B_MODEL_NAME_FOR_TEST,
     DEFAULT_WAN_2_2_T2V_A14B_MODEL_NAME_FOR_TEST,
@@ -324,7 +326,8 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
     # request the stage regains that whole transfer, well past the
     # non_denoise_stage tolerance. load_peak_vram carries the placed set, so
     # it also pins that the placement happens at load, not on the first use.
-    # The encoder is already layerwise under the default component set.
+    # The encoder is pinned layerwise: on an 80 GB card auto would keep the
+    # whole 1.3B checkpoint resident.
     # No consistency check: the lifetime moves weights, not math, so the
     # output is the base case's and that case already guards it.
     DiffusionTestCase(
@@ -332,6 +335,7 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         DiffusionServerArgs(
             model_path=DEFAULT_WAN_2_1_T2V_1_3B_MODEL_NAME_FOR_TEST,
             extras=[
+                "--component-residency text_encoder=layerwise-offload "
                 "--layerwise-resident-layers text_encoder=0.8 "
                 "--layerwise-residency-lifetime text_encoder=permanent",
             ],
@@ -475,6 +479,21 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         WAN_2_2_ANIMATE_2_14B_sampling_params,
         # The DiT forward takes a per-clip conditioning container and runs forward_ref,
         # so the raw-component harness contract does not apply.
+        run_perf_check=True,
+        run_component_accuracy_check=False,
+    ),
+    # Distilled checkpoint on the same inputs and server layout: 10 steps at guidance
+    # 1.0, so the denoiser runs the single-forward path (no unconditional batch).
+    DiffusionTestCase(
+        "wan2_2_animate_2_14b_distilled_ref2v",
+        DiffusionServerArgs(
+            model_path=DEFAULT_WAN_2_2_ANIMATE_2_14B_DISTILLED_MODEL_NAME_FOR_TEST,
+            modality="video",
+            dit_layerwise_offload=True,
+            text_encoder_cpu_offload=True,
+            extras=["--layerwise-offload-components", "transformer"],
+        ),
+        WAN_2_2_ANIMATE_2_14B_DISTILLED_sampling_params,
         run_perf_check=True,
         run_component_accuracy_check=False,
     ),
@@ -628,6 +647,44 @@ if not current_platform.is_hip():
             T2V_sampling_params,
         ),
     )
+# Dynamic LoRA at the default quality: the lossless-tier fusions (the fused
+# linear-GELU epilogue among them) must keep the adapter's delta. GT-free: the
+# output must match quality="exact" and differ from the adapter off. Skipped on
+# AMD: the match/change thresholds are calibrated on NVIDIA only.
+if not current_platform.is_hip():
+    ONE_GPU_CASES.append(
+        DiffusionTestCase(
+            "wan2_1_t2v_1_3b_dynamic_lora_default_quality_1gpu",
+            DiffusionServerArgs(
+                model_path=DEFAULT_WAN_2_1_T2V_1_3B_MODEL_NAME_FOR_TEST,
+                lora_path="Cseti/Wan-LoRA-Arcane-Jinx-v1",
+                extras=[
+                    "--lora-merge-mode",
+                    "dynamic",
+                    # layerwise offload leaves placeholder weights, which keep
+                    # the fused linear-GELU path unmounted
+                    "--dit-layerwise-offload",
+                    "false",
+                ],
+            ),
+            DiffusionSamplingParams(
+                prompt="csetiarcane Nfj1nx with blue hair, a woman walking in a cyberpunk city at night",
+                output_size="480x272",
+                num_frames=9,
+                # CRF 0, so the frame comparisons measure the model, not the encoder
+                extras={
+                    "num_inference_steps": 8,
+                    "seed": 42,
+                    "output_compression": 100,
+                },
+            ),
+            run_perf_check=False,
+            perf_warmup_requests=1,
+            run_consistency_check=False,
+            reference_quality="exact",
+            run_lora_effect_check=True,
+        ),
+    )
 # Skip all ModelOpt tests on AMD: FP8 requires torch._scaled_mm (HIPBLAS_STATUS_NOT_SUPPORTED
 # on ROCm), NVFP4 requires flashinfer or sgl_kernel FP4 kernels (CUDA-only).
 # Run FP8 cases on the regular H100 1-GPU CI shard and keep only B200-only
@@ -689,6 +746,7 @@ else:
             extras=["--transformer-path", MODELOPT_FLUX1_NVFP4_TRANSFORMER],
             env_vars=MODELOPT_NVFP4_B200_ENV_VARS,
             run_consistency_check=True,
+            run_perf_check=True,
         ),
         _make_modelopt_ci_case(
             "flux2_modelopt_nvfp4_t2i",
@@ -698,6 +756,7 @@ else:
             extras=["--transformer-weights-path", MODELOPT_FLUX2_NVFP4_WEIGHTS],
             env_vars=MODELOPT_NVFP4_B200_ENV_VARS,
             run_consistency_check=True,
+            run_perf_check=True,
         ),
         _make_modelopt_ci_case(
             "ideogram4_nvfp4_t2i",
@@ -707,6 +766,7 @@ else:
             extras=[],
             env_vars=MODELOPT_NVFP4_B200_ENV_VARS,
             run_consistency_check=True,
+            run_perf_check=True,
         ),
         _make_modelopt_ci_case(
             "qwen_image_2512_modelopt_nvfp4_t2i",
@@ -716,6 +776,7 @@ else:
             extras=[],
             env_vars=MODELOPT_NVFP4_B200_ENV_VARS,
             run_consistency_check=True,
+            run_perf_check=True,
         ),
         _make_modelopt_ci_case(
             "wan22_modelopt_nvfp4_t2v",
@@ -725,6 +786,7 @@ else:
             extras=[],
             env_vars=MODELOPT_WAN22_NVFP4_B200_ENV_VARS,
             run_consistency_check=True,
+            run_perf_check=True,
         ),
     ]
 
@@ -1302,6 +1364,12 @@ TWO_GPU_CASES = [
         DiffusionServerArgs(
             model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
         ),
+        # 85x48 image tokens pad to the 1024x1024 warmup's 4096 (2048 per rank)
+        # over another grid, so RoPE tables kept from the warmup corrupt it
+        lead_sampling_params=DiffusionSamplingParams(
+            prompt=T2I_sampling_params.prompt,
+            output_size="1360x768",
+        ),
     ),
     DiffusionTestCase(
         "zimage_image_t2i_2_gpus_non_square",
@@ -1599,6 +1667,7 @@ STANDALONE_FILES = {
     ],
     "1-gpu": [
         "../single_test_file/test_generate_zimage_turbo_cli.py",
+        "../single_test_file/test_nomas_offline.py",
         "../single_test_file/test_update_weights_from_disk.py",
     ],
     "2-gpu": [
@@ -1617,6 +1686,7 @@ STANDALONE_FILES = {
         "../unit/test_async_output_save.py",
         "../unit/test_kandinsky6_sequence_parallel.py",
         "../unit/test_kandinsky6_sr_sequence_parallel.py",
+        "../unit/test_nomas_parallel.py",
         "../unit/test_qwen_image21_distributed.py",
     ],
 }
@@ -1641,43 +1711,45 @@ if current_platform.is_hip():
 # New standalone files may omit an estimate once to learn the real CI runtime.
 # CI will use a fallback estimate for sharding, run the test, then print a
 # measured value that must be copied into STANDALONE_FILE_EST_TIMES.
+# scheduling estimates use full-process H100 CI medians, rounded up to 10s
 STANDALONE_FILE_EST_TIMES = {
     "bcg-diffusion": {
         "../single_test_file/test_diffusion_bcg_zimage_turbo.py": 420.0,
     },
     "1-gpu": {
         "../single_test_file/test_generate_zimage_turbo_cli.py": 180.0,
-        "../single_test_file/test_update_weights_from_disk.py": 1200.0,
+        # Initial H200 full-process observation: 97 s; refresh on H100 CI.
+        # This is a partitioning estimate, not a performance gate.
+        "../single_test_file/test_nomas_offline.py": 100.0,
+        "../single_test_file/test_update_weights_from_disk.py": 200.0,
     },
     "2-gpu": {
-        # Two disagg clusters × (~3 min startup + ~1 min generate) ≈ 8 min.
-        # Raise if CI reports a higher measured time.
-        "../single_test_file/test_disagg_server.py": 600.0,
-        "../single_test_file/test_ar_models.py": 600.0,
+        "../single_test_file/test_disagg_server.py": 780.0,
+        "../single_test_file/test_ar_models.py": 120.0,
         # no model load; the cost is the one-time JIT build of the sync kernels
-        "../single_test_file/test_ipc_a2a_2_gpu.py": 240.0,
+        "../single_test_file/test_ipc_a2a_2_gpu.py": 30.0,
         # 2 ranks here (4 ranks skip below four GPUs); ~50 s on H200 with warm JIT
-        "../single_test_file/test_ipc_a2a_multi_gpu.py": 180.0,
+        "../single_test_file/test_ipc_a2a_multi_gpu.py": 30.0,
         # 2 ranks here (4 ranks skip below four GPUs); ~45 s on B300 with warm JIT
-        "../single_test_file/test_usp_pipelined_attention_multi_gpu.py": 120.0,
-        "../single_test_file/test_encoder_fold_srt_linear_2_gpu.py": 120.0,
-        "../single_test_file/test_encoder_fold_srt_2_gpu.py": 240.0,
-        # ~60 s locally with a warm HF cache (load + one capture + 4 steps);
-        # padded for cold-cache CI.
-        "../single_test_file/test_diffusion_bcg_tp2_zimage_turbo.py": 180.0,
+        "../single_test_file/test_usp_pipelined_attention_multi_gpu.py": 40.0,
+        "../single_test_file/test_encoder_fold_srt_linear_2_gpu.py": 30.0,
+        "../single_test_file/test_encoder_fold_srt_2_gpu.py": 100.0,
+        "../single_test_file/test_diffusion_bcg_tp2_zimage_turbo.py": 70.0,
         # zimage server startup dominates; six short requests after warmup
-        "../single_test_file/test_dp_serving_2_gpu.py": 900.0,
+        "../single_test_file/test_dp_serving_2_gpu.py": 60.0,
         # one capture plus three replays on a 32K-element exchange
-        "../single_test_file/test_pynccl_a2a_capture_2_gpu.py": 180.0,
+        "../single_test_file/test_pynccl_a2a_capture_2_gpu.py": 30.0,
         # two SDPA parity checks on 128+6 rows
-        "../single_test_file/test_usp_replicated_parity_2_gpu.py": 180.0,
+        "../single_test_file/test_usp_replicated_parity_2_gpu.py": 30.0,
         # no model load; two small all-to-alls
-        "../single_test_file/test_vdn_ulysses_exchange_2_gpu.py": 60.0,
+        "../single_test_file/test_vdn_ulysses_exchange_2_gpu.py": 30.0,
         # the unit/ suite runs on one GPU; these files carry its 2-GPU cases
-        "../unit/test_async_output_save.py": 30.0,
-        "../unit/test_kandinsky6_sequence_parallel.py": 150.0,
-        "../unit/test_kandinsky6_sr_sequence_parallel.py": 150.0,
-        "../unit/test_qwen_image21_distributed.py": 90.0,
+        "../unit/test_async_output_save.py": 20.0,
+        "../unit/test_kandinsky6_sequence_parallel.py": 90.0,
+        "../unit/test_kandinsky6_sr_sequence_parallel.py": 90.0,
+        # H200: TP/SP parity for SDPA and FA3 (55 s each), window decode (22 s)
+        "../unit/test_nomas_parallel.py": 140.0,
+        "../unit/test_qwen_image21_distributed.py": 40.0,
     },
 }
 

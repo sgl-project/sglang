@@ -1,6 +1,7 @@
 """Field order preserving the ServerArgs positional constructor signature.
 
-``collect_input_fields`` appends unlisted fields after these entries.
+Append new built-in fields to this tuple; inserting or regrouping changes existing
+calls. ``collect_input_fields`` appends unlisted extension fields after these entries.
 """
 
 # fmt: off
@@ -100,7 +101,6 @@ POSITIONAL_FIELD_ORDER = (
     "shared_experts_tp_size",
     "enable_dense_mlp_attn_tp",
     "enable_layernorm_sp",
-    "enable_megamoe_for_layernorm_sp",
     "disable_attn_tp_gather",
     "enable_p2p_check",
     "device",
@@ -521,5 +521,33 @@ POSITIONAL_FIELD_ORDER = (
     "enable_decoder_swa_bounded_replay",
     "enable_response_store",
     "disaggregation_decode_host_receive_threshold",
+    "qsa_indexer_dtype",
+    "disaggregation_decode_allocation_policy",
+    "speculative_boundary_reduction",
+    "speculative_use_block_verification",
+    "speculative_draft_sink_size",
+    "disable_aiter_allreduce_fusion_in_prefill",
+    "disable_aiter_allreduce_fusion_in_decode",
+    "enable_amd_monokernel",
+    "dsa_triton_union",
+    "enable_dsa_fused_indexer",
+    "enable_cp_tp_group_sharing",
+    "enable_watermark",
+    "watermark_config",
+    "watermark_key",
+    "watermark_key_b",
+    "watermark_context_window",
+    "watermark_mixing_probability",
+    "watermark_max_probability",
+    "watermark_default_enabled",
+    "watermark_enforce_all",
+    "grpc_response_timeout_secs",
+    "enable_paged_experts",
+    "paged_experts_num_resident",
+    "enable_nvidia_megakernel",
+    "enable_megamoe_for_layernorm_sp",
+    "enable_http_worker_reuseport",
+    "prefill_decode_interval_min_bs",
+    "unified_cache_external_linker_config",
 )
 # fmt: on

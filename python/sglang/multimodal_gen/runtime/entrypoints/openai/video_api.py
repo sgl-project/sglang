@@ -8,7 +8,7 @@ import tempfile
 import time
 from collections.abc import Coroutine
 from contextlib import suppress
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Literal, Optional
 
 from fastapi import (
     APIRouter,
@@ -52,6 +52,9 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     resolve_sampling_params_cls,
     sanitize_upload_filename,
     save_image_to_path,
+)
+from sglang.multimodal_gen.runtime.entrypoints.openai.video_progress import (
+    VIDEO_PROGRESS,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
@@ -361,11 +364,15 @@ async def _save_first_input_image(
 
 
 async def _upload_and_cleanup_videos(paths: list[str]) -> list[str | None]:
-    return list(
-        await asyncio.gather(
-            *(cloud_storage.upload_and_cleanup(path) for path in paths)
-        )
+    results = await asyncio.gather(
+        *(cloud_storage.upload_and_cleanup(path) for path in paths),
+        return_exceptions=True,
     )
+    # join every upload before a cancellation or failure permits directory cleanup
+    for result in results:
+        if isinstance(result, BaseException):
+            raise result
+    return results
 
 
 async def _dispatch_job_async(
@@ -455,6 +462,7 @@ async def _dispatch_job_async(
             },
         )
     finally:
+        VIDEO_PROGRESS.unregister(job_id)
         try:
             await asyncio.to_thread(
                 batch.sampling_params.cleanup_video_request,
@@ -766,6 +774,7 @@ async def create_video(
             sampling_params=sampling_params,
             external_trace_header=trace_headers,
         )
+        batch.report_progress = True
         # Add diffusers_kwargs if provided.
         if req.diffusers_kwargs:
             batch.extra["diffusers_kwargs"] = req.diffusers_kwargs
@@ -806,6 +815,11 @@ async def create_video(
         raise
 
     assert batch is not None
+    # the outputs may run as "{job}:{i}" requests, queued here or expanded later
+    VIDEO_PROGRESS.register(
+        request_id,
+        num_outputs=max(len(scheduler_batches or ()), batch.num_outputs_per_prompt),
+    )
     # Enqueue the job asynchronously and return immediately
     _start_video_job(
         request_id,
@@ -823,12 +837,12 @@ async def create_video(
 @router.get("", response_model=VideoListResponse)
 async def list_videos(
     after: Optional[str] = Query(None),
-    limit: Optional[int] = Query(None, ge=1, le=100),
-    order: Optional[str] = Query("desc"),
+    limit: int = Query(20, ge=1, le=100),
+    order: Literal["asc", "desc"] = Query("desc"),
 ):
-    jobs = await VIDEO_STORE.list_page(after=after, limit=limit, order=order)
-    items = [VideoResponse(**job) for job in jobs]
-    return VideoListResponse(data=items)
+    return VideoListResponse(
+        **await VIDEO_STORE.list_page(after=after, limit=limit, order=order)
+    )
 
 
 @router.get("/{video_id}", response_model=VideoResponse)

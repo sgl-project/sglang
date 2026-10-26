@@ -1,16 +1,4 @@
-"""Correctness tests for the Triton :func:`moe_fused_gate` router.
-
-For the ungrouped case (``num_expert_group == 1``) we validate it two ways:
-
-* against an explicit, definition-based torch reference (documents the math),
-  at small shapes and at model routing shapes, and
-* against the production ``biased_grouped_topk_impl`` for the sigmoid / no-shared
-  path that the kernel actually replaces in ``topk.py``.
-
-Comparisons are order-independent: weights are scattered back to a dense
-``[M, num_experts + num_shared]`` layout so the per-row column order (and any
-tie-break choice) does not matter.
-"""
+"""Triton routing must match independent math and supported production routes."""
 
 from __future__ import annotations
 
@@ -79,20 +67,24 @@ def _reference_gate(
         work.scatter_(1, winner.long().unsqueeze(1), float("-inf"))
 
     routed_sum = routed_wgt.sum(dim=1, keepdim=True)
+    if renormalize:
+        norm = torch.where(routed_sum > 0.0, routed_sum, torch.ones_like(routed_sum))
+        routed_wgt = routed_wgt / norm
+    if apply_routed_scaling_factor_on_output:
+        routed_wgt = routed_wgt * routed_scaling_factor
     weights = torch.empty(bs, topk, dtype=torch.float32, device=scores.device)
     indices = torch.empty(bs, topk, dtype=torch.int32, device=scores.device)
     weights[:, :num_routed] = routed_wgt
     indices[:, :num_routed] = routed_idx
     if num_fused_shared_experts > 0:
-        weights[:, num_routed:] = routed_sum / routed_scaling_factor
+        weights[:, num_routed:] = (
+            1.0
+            if apply_routed_scaling_factor_on_output
+            else 1.0 / routed_scaling_factor
+        )
         for j in range(num_fused_shared_experts):
             indices[:, num_routed + j] = num_experts + j
 
-    if renormalize:
-        norm = torch.where(routed_sum > 0.0, routed_sum, torch.ones_like(routed_sum))
-        weights = weights / norm
-    if apply_routed_scaling_factor_on_output:
-        weights = weights * routed_scaling_factor
     return weights, indices
 
 
@@ -203,15 +195,14 @@ def test_moe_fused_gate_matches_reference_at_model_shapes(
 
 @pytest.mark.parametrize("num_experts,topk", [(256, 6), (384, 8), (512, 8)])
 @pytest.mark.parametrize("apply_scale", [True, False])
+@pytest.mark.parametrize("renormalize", [True, False])
 def test_moe_fused_gate_matches_production_impl(
-    num_experts: int, topk: int, apply_scale: bool
+    num_experts: int, topk: int, apply_scale: bool, renormalize: bool
 ) -> None:
     """Match production ``biased_grouped_topk_impl`` on the path it replaces.
 
-    The kernel supersedes the ungrouped sigmoid CUDA path in ``topk.py``; that
-    reference hardcodes sigmoid and no fused shared expert, and the production
-    path always renormalizes (the impl only applies the scaling factor when
-    ``renormalize`` is set), so we compare on the renormalized path.
+    Compare ungrouped sigmoid routing without shared slots, with normalization
+    and explicit routed scaling enabled independently.
     """
     from sglang.srt.layers.moe.topk import biased_grouped_topk_impl
 
@@ -224,7 +215,7 @@ def test_moe_fused_gate_matches_production_impl(
         bias,
         topk=topk,
         scoring_func="sigmoid",
-        renormalize=True,
+        renormalize=renormalize,
         routed_scaling_factor=scale,
         apply_routed_scaling_factor_on_output=apply_scale,
     )
@@ -234,7 +225,7 @@ def test_moe_fused_gate_matches_production_impl(
         scores,
         bias,
         topk,
-        True,
+        renormalize,
         num_expert_group=1,
         topk_group=1,
         routed_scaling_factor=scale,

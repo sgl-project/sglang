@@ -15,16 +15,10 @@ from typing import (
 
 import torch
 
-from sglang.kernels.ops.attention.dsa import index_buf_accessor
 from sglang.kernels.ops.attention.dsv4 import (
-    clear_unaccepted_c128_draft_states,
     fused_k_norm_rope_flashmla,
     fused_store_cache,
 )
-from sglang.kernels.ops.attention.dsv4 import (
-    index_buf_accessor as dsv4_index_buf_accessor,
-)
-from sglang.kernels.ops.attention.dsv4.index_buf_accessor import NopeFp8RopeBf16Pack
 from sglang.kernels.ops.attention.dsv4.kv_layout import (
     KVLayout,
     is_valid_kv_layout_pair,
@@ -33,6 +27,11 @@ from sglang.kernels.ops.attention.dsv4.kv_norm_rope_store import (
     fused_k_norm_rope_uniform_fp8,
 )
 from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import layout
+from sglang.kernels.ops.kvcache import dsa_index_k_cache, dsv4_main_kv_store
+from sglang.kernels.ops.kvcache.dsv4_c128_cleanup import (
+    clear_unaccepted_c128_draft_states,
+)
+from sglang.kernels.ops.kvcache.dsv4_main_kv_store import NopeFp8RopeBf16Pack
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.hip_flash_mla import resolve_hip_flashmla_backend
@@ -157,7 +156,7 @@ def get_swa_ring_size(sliding_window: int, is_speculative: bool = False) -> int:
 def resolve_unified_kv_fp8(unified_fp8: Optional[bool] = None) -> bool:
     """Per-pool fp8 layout; None follows SGLANG_DSV4_UNIFIED_KV_FP8. False keeps this
     pool bf16 while target fused-Q still keys off the global switch."""
-    from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+    from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
         is_unified_kv_fp8,
     )
 
@@ -190,12 +189,10 @@ def resolve_compressed_kv_layout(
     if kv_layout is KVLayout.V4:
         assert option in (None, "fp8"), "the V4 main cache only pairs with V4 caches"
         return KVLayout.V4
-    assert kv_layout is KVLayout.V41, f"{kv_layout} is not a main-cache layout"
-    if option == "fp8":
-        return KVLayout.V41
-    if option == "fp4":
-        return KVLayout.V41_FP4
-    return KVLayout.V41_FP4 if compress_ratio in (1, 2) else KVLayout.V41
+    assert kv_layout.encoding is KVLayout.V41, f"{kv_layout} is not a main-cache layout"
+    use_fp4 = option == "fp4" or (option is None and compress_ratio in (1, 2))
+    encoding = KVLayout.V41_FP4 if use_fp4 else KVLayout.V41
+    return encoding.with_interleaved(kv_layout.is_interleaved)
 
 
 def select_dsv4_kv_layout() -> Tuple[KVLayout, Optional[str]]:
@@ -204,7 +201,7 @@ def select_dsv4_kv_layout() -> Tuple[KVLayout, Optional[str]]:
     AITER attention."""
     mode = envs.SGLANG_DSV4_KV_LAYOUT.get().lower()
     option = envs.SGLANG_DSV4_COMPRESSED_KV_LAYOUT.get().lower()
-    if get_exec().kernel.dsv4_attn_backend == "flashmla_mega":
+    if get_exec().kernel.dsv4_attn_backend == "flashmla_mega" and mode != "v41_new":
         mode = "v41"
     if get_exec().kernel.dsv4_attn_backend == "trtllm":
         assert mode in ("auto", "v4") and option in ("auto", "fp8"), (
@@ -213,7 +210,7 @@ def select_dsv4_kv_layout() -> Tuple[KVLayout, Optional[str]]:
         return KVLayout.V4, None
     if mode == "v4":
         return KVLayout.V4, None if option == "auto" else option
-    assert mode in ("v41", "auto"), f"unknown SGLANG_DSV4_KV_LAYOUT={mode!r}"
+    assert mode in ("v41", "v41_new", "auto"), f"unknown SGLANG_DSV4_KV_LAYOUT={mode!r}"
     is_sm100 = (
         torch.cuda.is_available()
         and torch.version.cuda is not None
@@ -225,15 +222,16 @@ def select_dsv4_kv_layout() -> Tuple[KVLayout, Optional[str]]:
         )
         if mode == "auto" and not supported:
             return KVLayout.V4, None
-        if not supported:
+        if not supported or mode == "v41_new":
             raise ValueError(
-                "V4.1 KV layouts on HIP require gfx950 with aiter_sparse attention"
+                "V4.1 KV layouts on HIP require gfx950 with aiter_sparse attention, "
+                "which reads the block-split v41 layout"
             )
         return KVLayout.V41, option
     if mode == "auto" and not is_sm100:
         return KVLayout.V4, None
     assert is_sm100, "the V4.1 KV cache layouts need an SM100 / SM103 GPU"
-    return KVLayout.V41, option
+    return (KVLayout.V41_NEW if mode == "v41_new" else KVLayout.V41), option
 
 
 class DeepSeekV4SingleKVPool(KVCache):
@@ -339,7 +337,7 @@ class DeepSeekV4SingleKVPool(KVCache):
             "the (fp8 nope, bf16 rope, 7 scales) pack is the V4 layout; "
             f"a {self.kv_layout.value} pool is written through set_key_buffer_fused"
         )
-        dsv4_index_buf_accessor.SetKAndS.execute(
+        dsv4_main_kv_store.SetKAndS.execute(
             pool=self,
             buf=self.kv_buffer[layer_id],
             loc=loc,
@@ -675,7 +673,7 @@ class DeepSeekV4IndexerPool(KVCache):
         max_seq_len: int,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         buf = self.index_k_with_scale_buffer[layer_id]
-        return index_buf_accessor.GetKAndS.execute(
+        return dsa_index_k_cache.GetKAndS.execute(
             self,
             buf,
             page_indices=page_indices,
@@ -692,7 +690,7 @@ class DeepSeekV4IndexerPool(KVCache):
         index_k_scale: torch.Tensor,
     ) -> None:
         buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
-        index_buf_accessor.SetKAndS.execute(
+        dsa_index_k_cache.SetKAndS.execute(
             pool=self, buf=buf, loc=loc, index_k=index_k, index_k_scale=index_k_scale
         )
 
@@ -719,7 +717,7 @@ class DeepSeekV4IndexerPool(KVCache):
         if self.uses_aiter_fp4_layout:
             # the FlyDSL kernels read the fp4 payload and the packed ue8m0 scales
             # from two buffers
-            from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
+            from sglang.kernels.ops.kvcache.dsv4_fp4_index_k_cache_hip import (
                 store_fp4_index_k_cache_split,
             )
 
@@ -732,7 +730,7 @@ class DeepSeekV4IndexerPool(KVCache):
                 rne=self.index_k_rne,
                 page8=self.index_k_page8,
             )
-        from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+        from sglang.kernels.ops.kvcache.dsv4_fp4_index_k_cache import (
             store_fp4_index_k_cache,
         )
 
@@ -752,7 +750,7 @@ class DeepSeekV4IndexerPool(KVCache):
         assert self.use_fp4_indexer, "packed readback only applies to the fp4 layout"
         buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
         if buf.is_cuda:
-            from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+            from sglang.kernels.ops.kvcache.dsv4_fp4_index_k_cache import (
                 gather_fp4_index_k,
             )
 
@@ -996,6 +994,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         assert self.kv_layout in (
             KVLayout.V4,
             KVLayout.V41,
+            KVLayout.V41_NEW,
         ), f"{self.kv_layout} is only valid for a compressed (extra) cache"
         self.compressed_kv_layout_option = compressed_kv_layout
         c4_logical_size = c128_size * 32
@@ -1008,7 +1007,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         )
         self.c4_logical_size = c4_logical_size
         self.c128_size = c128_size
-        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+        from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
             is_unified_kv_fp8,
             is_unified_kv_triton,
         )
@@ -1689,6 +1688,16 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         assert is_valid_kv_layout_pair(self.kv_layout, layout)
         return layout
 
+    def pd_kv_layout(self) -> str:
+        """The main and compressed KV layouts, which PD peers must share."""
+        if self.uniform_fp8:
+            return KVLayout.UNIFORM_FP8.value
+        compressed = [
+            f"c{ratio}:{self.compressed_kv_layout(ratio).value}"
+            for ratio in sorted(set(self.compression_ratios) - {0})
+        ]
+        return ",".join([self.kv_layout.value, *compressed])
+
     def _make_indexer_pool(
         self,
         size: int,
@@ -1977,7 +1986,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             f"a {self.kv_layout.value} pool is written through the fused setters"
         )
         if self.request_window is not None:
-            dsv4_index_buf_accessor.SetKAndS.execute(
+            dsv4_main_kv_store.SetKAndS.execute(
                 pool=self.request_window.state,
                 buf=self.get_swa_raw_buffer(layer_id),
                 loc=loc,
@@ -2232,10 +2241,12 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         """unified_kv counterpart of set_swa_key_buffer_radix_fused_norm_rope; rows
         with swa_loc < 0 (uncommitted verify tokens) are skipped by the scatter."""
         from sglang.kernels.ops.attention.dsv4 import fused_norm_rope_inplace
-        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import runtime
+        from sglang.kernels.ops.kvcache.dsv4_unified_kv_store import (
+            scatter_bf16_into_unified,
+        )
 
         fused_norm_rope_inplace(kv, kv_weight, eps, freqs_cis, positions)
-        runtime.scatter_bf16_into_unified(
+        scatter_bf16_into_unified(
             kv=kv,
             loc=swa_loc,
             unified_kv=self.get_unified_kv(layer_id),
@@ -2254,7 +2265,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         _, compress_layer_id, compress_kv_pool = self.layer_mapping[layer_id]
         assert compress_kv_pool is not None
         if freqs_cis is not None:
-            assert compress_kv_pool.kv_layout is KVLayout.V41_FP4, (
+            assert compress_kv_pool.kv_layout.is_fp4, (
                 "in-kernel RoPE is for the fp4 cache; fp8 caches take the finished value"
             )
         return compress_kv_pool.set_key_buffer_fused(

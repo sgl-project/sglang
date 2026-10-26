@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import random
 from collections import deque
 from contextlib import nullcontext
@@ -259,14 +260,46 @@ def _apply_metadata_gate(polls, decode_reqs, metadata_buffers) -> None:
                 polls[i] = int(KVPoll.Transferring)
 
 
+def kv_layout_signature(kv_args: KVArgs) -> int:
+    """Identify the KV layout a checksum digests.
+
+    Two sides can compare digests only if they cover the same bytes. A prefill
+    with another TP width has other per-page item lengths; a PP or
+    layer-sharded prefill owns fewer buffers; the same byte sizes under another
+    dtype or page layout (fp16 vs bf16, two V4 layouts) hold other bytes.
+    Shipped beside the digest, so those become one logged skip instead of a
+    mismatch on every request. Positive int64 and never 0, which marks "no
+    digest" in the metadata row.
+    """
+    layout = (
+        kv_args.page_size,
+        kv_args.kv_cache_dtype_str,
+        kv_args.kv_layout,
+        kv_args.swa_kv_cache_layout,
+        [state_type.value for state_type in kv_args.state_types],
+        list(kv_args.kv_item_lens),
+        [list(lens) for lens in kv_args.state_item_lens],
+    )
+    raw = hashlib.blake2b(repr(layout).encode(), digest_size=8).digest()
+    return int.from_bytes(raw, "big") >> 1 | 1
+
+
+def all_reduce_flags(
+    flags: List[int], group: dist.ProcessGroup, op: dist.ReduceOp
+) -> List[int]:
+    """Reduce one small int per entry across `group`; every rank must pass the
+    same number of entries in the same order. Empty or single-rank: unchanged."""
+    if not flags or dist.get_world_size(group) == 1:
+        return flags
+
+    tensor_to_reduce = torch.tensor(flags, dtype=torch.int32, device="cpu")
+    dist.all_reduce(tensor_to_reduce, op=op, group=group)
+    return tensor_to_reduce.tolist()
+
+
 def _all_reduce_polls(polls: List[int], group: dist.ProcessGroup) -> List[int]:
     """MIN-reduce poll states so no rank commits ahead of its peers."""
-    if dist.get_world_size(group) == 1:
-        return polls
-
-    tensor_to_reduce = torch.tensor(polls, dtype=torch.uint8, device="cpu")
-    dist.all_reduce(tensor_to_reduce, op=dist.ReduceOp.MIN, group=group)
-    return tensor_to_reduce.tolist()
+    return all_reduce_flags(flags=polls, group=group, op=dist.ReduceOp.MIN)
 
 
 def poll_and_all_reduce(
@@ -469,11 +502,24 @@ class MetadataBuffers:
                     device=self.bootstrap_room.device,
                 )
 
-    def set_kv_checksum(self, req: Req, value: int) -> None:
-        self.kv_checksum[req.metadata_buffer_index, 0] = value
+    def set_kv_checksum(self, req: Req, digest: int, signature: int) -> None:
+        # Slot 0 the digest, slot 1 the layout signature it was taken under;
+        # the row is 8 wide for the 64 B RDMA minimum anyway.
+        row = self.kv_checksum[req.metadata_buffer_index]
+        row[0] = digest
+        row[1] = signature
 
-    def get_kv_checksum(self, idx: int) -> int:
-        return int(self.kv_checksum[idx, 0].item())
+    def get_kv_checksum(self, idx: int) -> Tuple[int, int]:
+        """Return ``(digest, signature)``; ``(0, 0)`` means no digest was written."""
+        digest, signature = self.kv_checksum[idx, :2].tolist()
+        return int(digest), int(signature)
+
+    def clear_slot(self, idx: int) -> None:
+        """Reset the fields the next owner reads before its prefill writes
+        them, so it sees "not yet written" instead of the previous owner's."""
+        self.bootstrap_room[idx] = 0
+        if self.kv_checksum is not None:
+            self.kv_checksum[idx] = 0
 
     def get_buf_infos(self):
         bufs = [
@@ -762,6 +808,20 @@ def _get_cp_rank_page_bounds(
     local_start = cp_rank * base + min(cp_rank, rem)
     n_pages = base + (1 if cp_rank < rem else 0)
     return local_start, local_start + n_pages
+
+
+def filter_kv_indices_for_shard_rank(
+    *,
+    kv_indices: np.ndarray,
+    index_slice: slice,
+    shard_rank: int,
+    shard_size: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Logical page l lives on rank l % N as local page l // N; returns the owned
+    local ids and their send positions, which replace the contiguous index_slice."""
+    owned = kv_indices % shard_size == shard_rank
+    positions = np.arange(index_slice.start, index_slice.stop, dtype=np.int64)
+    return kv_indices[owned] // shard_size, positions[owned]
 
 
 def filter_kv_indices_for_cp_rank(
@@ -1843,6 +1903,15 @@ def get_dsv41_spec_layout(kv_args: KVArgs) -> Optional[dict]:
         "state_types": [state_type.value for state_type in kv_args.state_types],
         "state_item_lens": [list(items) for items in kv_args.state_item_lens],
     }
+
+
+def get_pd_kv_layout(token_to_kv_pool) -> Optional[str]:
+    """The KV byte layout both PD roles must share, for pools that have more than one."""
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+
+    if isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool):
+        return token_to_kv_pool.pd_kv_layout()
+    return None
 
 
 def prepare_abort(req: Req, error_message: str, status_code=None):
