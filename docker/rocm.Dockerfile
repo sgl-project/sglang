@@ -1107,13 +1107,11 @@ RUN /bin/bash -lc 'set -euo pipefail; \
   echo "export LD_LIBRARY_PATH=/opt/ucx/lib:\${LD_LIBRARY_PATH}" >> /etc/bash.bashrc'
 
 # -----------------------
-# RCCL (BUILD_RCCL=1 stages only): build projects/rccl from rocm-systems and put
-# it in place of the SDK's librccl. rocm_sdk preloads
-# _rocm_sdk_libraries/lib/librccl.so.1 by absolute path, so that file is what
-# every process maps and LD_LIBRARY_PATH cannot override it. The new library
-# takes the stock RPATH so it binds the same _rocm_sdk_core libamd_smi as torch;
-# with its own RUNPATH it loads a second copy and torch.cuda.device_count()
-# returns 0 (see the libamd_smi note in rocm1000-base).
+# RCCL (BUILD_RCCL=1 stages only): build RCCL from rocm-systems and overwrite
+# the SDK's librccl.so.1. The SDK loads that file by full path, so
+# LD_LIBRARY_PATH has no effect on it.
+# Keep the old RPATH on the new file. Without it, a second copy of libamd_smi
+# gets loaded and torch.cuda.device_count() returns 0.
 RUN if [ "${BUILD_RCCL:-0}" = "1" ]; then \
         set -eux; \
         echo "[RCCL] building ${RCCL_COMMIT} for ${GPU_ARCH_LIST}"; \
