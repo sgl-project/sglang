@@ -16,7 +16,7 @@ from sglang.kernels import KernelBackend, PlatformInfo
 from sglang.kernels.spec import CapabilityRequirement as Cap
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=24, suite="base-a-test-cpu")
+register_cpu_ci(est_time=26, suite="base-a-test-cpu")
 
 _CPU = PlatformInfo(device_type="cpu")
 _SM90 = PlatformInfo(device_type="cuda", cuda_arch_major=9, cuda_arch_minor=0)
@@ -283,17 +283,19 @@ def test_operator_and_test_groups_agree():
         assert actual <= groups, actual - groups
 
 
-def test_agent_kernels_register_their_backend():
-    """Agent-generated kernels are listed by backend, so directory and backend must agree."""
-    agent_backends = {
+def test_backend_directories_register_their_backend():
+    """Kernels in a backend directory are listed by backend, so the two must agree."""
+    directory_backends = {
         "sglang.kernels.kda_kernels.": KernelBackend.KDA,
         "sglang.kernels.cake_kernels.": KernelBackend.CAKE,
+        "sglang.kernels.plugin_kernels.": KernelBackend.PLUGIN,
     }
     for spec in K.registry.all_specs():
         expected = next(
-            (b for p, b in agent_backends.items() if spec.target.startswith(p)), None
+            (b for p, b in directory_backends.items() if spec.target.startswith(p)),
+            None,
         )
-        if expected is not None or spec.backend in agent_backends.values():
+        if expected is not None or spec.backend in directory_backends.values():
             assert spec.backend is expected, spec
 
 

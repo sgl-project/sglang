@@ -253,7 +253,7 @@ def uses_kda_attention(config) -> bool:
 
 
 def is_dspark_draft(config) -> bool:
-    return _hf_arch(config) == "DSparkDraftModel"
+    return _hf_arch(config) in ("DSparkDraftModel", "DSparkMiniMaxDraftModel")
 
 
 # The decision_config.json attention mode whose full-attention layers read the whole prompt.
@@ -429,6 +429,18 @@ def is_minimax_sparse(config: PretrainedConfig) -> bool:
         "MiniMaxM3SparseForCausalLM",
         "MiniMaxM3SparseForConditionalGeneration",
     )
+
+
+def uses_minimax_m3_nvfp4_native_stack(quantization: Optional[str]) -> bool:
+    """Whether an NVFP4 checkpoint runs its native Blackwell stack.
+
+    The attention backend, the KV pool class and the KV cell-size budget must
+    all agree on this answer; sizing the pool for one layout while allocating
+    the other runs out of memory at startup.
+    """
+    from sglang.srt.runtime_context import get_platform
+
+    return quantization == "minimax_m3_nvfp4" and get_platform().is_blackwell
 
 
 def get_minimax_sparse_attention_config(config: PretrainedConfig) -> dict:
@@ -885,6 +897,7 @@ class ModelConfig:
         self.hf_eos_token_id = self._get_hf_eos_token_id()
         # Set by scheduler when reasoning_parser is enabled
         self.think_end_ids: Optional[List[int]] = None
+        self.self_opened_think_start_ids: Optional[List[int]] = None
         self.request_selectable_think_end_id_sequences: Optional[List[List[int]]] = None
 
         # multimodal
@@ -1003,6 +1016,18 @@ class ModelConfig:
             self.hf_config.architectures[0] = (
                 self.hf_text_config.configure_draft_model()
             )
+
+        if (
+            is_draft_model
+            and self.speculative_algorithm == "DSPARK"
+            and self.hf_config.architectures[0] == "DSparkMiniMaxDraftModel"
+        ):
+            from sglang.srt.configs.minimax_vl import configure_minimax_m3_dspark
+
+            self.hf_config = configure_minimax_m3_dspark(self.hf_config)
+            self.hf_text_config = self.hf_config
+            if self.is_draft_quantization_explicit and self.quantization is None:
+                self.hf_config.quantization_config = None
 
         if is_draft_model and self.hf_config.architectures[0] in [
             "DeepseekV3ForCausalLM",
@@ -2012,6 +2037,7 @@ class ModelConfig:
             "humming",
             "quark_mxfp4",
             "auto-round",
+            "minimax_m3_nvfp4",
         ]
         compatible_quantization_methods = {
             "modelopt_fp8": ["modelopt"],
@@ -2020,6 +2046,8 @@ class ModelConfig:
             "modelopt_fp4": ["modelopt", "fp8"],
             "modelopt_mixed": ["modelopt"],
             "nvfp4_online": ["fp8", "modelopt_fp8"],
+            # Resolved by the MiniMax override from the MoE fields.
+            "minimax_m3_nvfp4": ["mxfp8"],
             "petit_nvfp4": ["modelopt"],
             "w8a8_int8": ["compressed-tensors", "compressed_tensors"],
             "w8a8_fp8": ["compressed-tensors", "compressed_tensors"],
@@ -2471,6 +2499,7 @@ multimodal_piecewise_cuda_graph_supported_model_archs = [
 # generic multimodal rule disabled prefill CG for them despite the LM prefill
 # capturing cleanly.
 multimodal_breakable_cuda_graph_supported_model_archs = [
+    "MiniMaxM3SparseForConditionalGeneration",
     "Cohere2VisionForConditionalGeneration",
     "Glm5NextForConditionalGeneration",
     "InternS2MobiusForConditionalGeneration",
