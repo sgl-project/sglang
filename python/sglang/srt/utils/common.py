@@ -161,7 +161,7 @@ def is_cuda():
 
 @lru_cache(maxsize=1)
 def is_cuda_alike():
-    return is_cuda() or is_hip()
+    return is_cuda() or is_hip() or is_sail()
 
 
 @lru_cache(maxsize=1)
@@ -237,6 +237,11 @@ def is_musa() -> bool:
 @lru_cache(maxsize=1)
 def is_mps() -> bool:
     return hasattr(torch, "mps") and torch.mps.is_available()
+
+
+@lru_cache(maxsize=1)
+def is_sail() -> bool:
+    return torch.cuda.is_available() and "ZW" in torch.cuda.get_device_name()
 
 
 def is_float4_e2m1fn_x2(dtype) -> bool:
@@ -387,18 +392,6 @@ def is_flashinfer_available():
     if not get_bool_env_var("SGLANG_IS_FLASHINFER_AVAILABLE", default="true"):
         return False
     return importlib.util.find_spec("flashinfer") is not None and is_cuda()
-
-
-@lru_cache(maxsize=1)
-def is_tokenspeed_mla_available():
-    """
-    Check whether the tokenspeed_mla CuTe DSL kernels are available.
-    Only available on NVIDIA Blackwell (SM100) at the moment.
-    """
-    return (
-        importlib.util.find_spec("tokenspeed_mla") is not None
-        and is_blackwell_supported()
-    )
 
 
 def is_nvidia_cublas_version_ge_12_9():
@@ -677,6 +670,12 @@ def is_device_stream_capturing(device: torch.device) -> bool:
     if not current_platform.capabilities.graph_capture:
         return False
     return torch.get_device_module(device).is_current_stream_capturing()
+
+
+def create_device_event(device):
+    if not isinstance(device, torch.device):
+        device = torch.device(device)
+    return torch.get_device_module(device).Event()
 
 
 def get_amdgpu_memory_capacity():
@@ -1036,14 +1035,21 @@ def get_device_name(device_id: int = 0) -> str:
 
 @lru_cache(maxsize=1)
 def is_mnnvl_fabric_device() -> bool:
-    """Whether the GPU sits on an MNNVL fabric (cross-node NVLink), keyed on
-    the device name: the GB200/GB300 superchips. Used to auto-select
-    fabric-dependent communication paths (NCCL cuMem/MNNVL, custom all-reduce
-    v2 multinode, DCP fi_a2a)."""
+    """Whether the GPU sits on an MNNVL fabric (cross-node NVLink). Used to
+    auto-select fabric-dependent communication paths (NCCL cuMem/MNNVL, custom
+    all-reduce v2 multinode, DCP fi_a2a).
+
+    The GB200/GB300 superchips are recognized by device name. Other NVLink
+    fabric parts (SM107 systems report a generic device name) are recognized
+    by NVML: the GPU has completed NVLink fabric registration."""
     if not (hasattr(torch, "cuda") and torch.cuda.is_available()):
         return False
     name = (torch.cuda.get_device_name(0) or "").upper()
-    return any(tag in name for tag in ("GB200", "GB300"))
+    if any(tag in name for tag in ("GB200", "GB300")):
+        return True
+    from sglang.srt.utils.cuda_vmm_utils import is_gpu_fabric_ready
+
+    return is_gpu_fabric_ready(torch.device("cuda", 0))
 
 
 def is_fi_a2a_supported(
@@ -2989,8 +2995,9 @@ def direct_register_custom_op(
 
     try:
         my_lib.define(op_name + schema_str)
-        if is_npu():
+        if is_npu() or current_platform.is_out_of_tree():
             # https://github.com/sgl-project/sglang/pull/12287/files#r2499583982
+            # Out-of-tree devices are torch PrivateUse1 backends too.
             my_lib.impl(op_name, op_func, "PrivateUse1")
         elif is_xpu():
             my_lib.impl(op_name, op_func, "XPU")

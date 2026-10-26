@@ -66,7 +66,6 @@ from sglang.srt.distributed import divide
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
-from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.amx_utils import PackWeightMethod
@@ -81,6 +80,7 @@ from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStatePacker,
 )
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
+from sglang.srt.layers.cp.utils import cp_gather_full_sequence_states
 from sglang.srt.layers.dcp.planner import (
     prepare_decode_context_parallel_metadata,
 )
@@ -119,10 +119,10 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     DispatchOutput,
 )
 from sglang.srt.layers.moe.topk import (
-    BypassedTopKOutput,
     TopK,
     TopKOutputFormat,
     fused_shared_expert_weight,
+    is_expert_remapping_enabled,
     is_routed_scaling_factor_fused_in_topk,
 )
 from sglang.srt.layers.moe.utils import (
@@ -826,6 +826,10 @@ class DeepseekV2MoE(nn.Module):
                     ),
                 )
             self.topk = TopK(**topk_kwargs)
+            self.topk.bind_runner_backend(
+                self.experts.runner_backend,
+                routing_method_type=self.experts.routing_method_type,
+            )
             self.routed_scaling_factor_fused_in_topk = (
                 is_routed_scaling_factor_fused_in_topk(self.topk.topk_config)
             )
@@ -1029,10 +1033,12 @@ class DeepseekV2MoE(nn.Module):
             and hidden_states.shape[0] > 0
             and hasattr(self, "shared_experts")
             and getattr(self.experts, "use_flashinfer_trtllm_moe", False)
+            and self.topk.topk_config.output_format == TopKOutputFormat.BYPASSED
             and not self._enable_a2a_moe
             and not self._fuse_shared_experts_inside_sbo
             and not getattr(self, "is_hash", False)
-            and not get_exec().moe.enable_eplb
+            and not is_expert_remapping_enabled()
+            and get_exec().moe.ep_dispatch_algorithm not in ("fake", "lp")
         )
 
     def forward(
@@ -1061,11 +1067,6 @@ class DeepseekV2MoE(nn.Module):
                 input_ids_global=input_ids_global,
             )
 
-        num_token_non_padded = (
-            forward_batch.moe_num_token_non_padded()
-            if forward_batch is not None
-            else None
-        )
         use_vision_topk = self.gate.e_score_correction_bias_vl is not None
         if use_vision_topk and _is_hip:
             use_vision_topk = _hip_moe.batch_has_images(forward_batch)
@@ -1103,7 +1104,6 @@ class DeepseekV2MoE(nn.Module):
                     gemm_output_zero_allocator,
                     input_ids,
                     input_ids_global=input_ids_global,
-                    num_token_non_padded=num_token_non_padded,
                     use_vision_topk=use_vision_topk,
                     return_moe_output=return_moe_output,
                     leave_output_sum=leave_output_sum,
@@ -1115,7 +1115,6 @@ class DeepseekV2MoE(nn.Module):
                     input_ids,
                     input_ids_global=input_ids_global,
                     skip_shared_experts=skip_shared_experts,
-                    num_token_non_padded=num_token_non_padded,
                     use_vision_topk=use_vision_topk,
                     return_moe_output=return_moe_output,
                     leave_output_sum=leave_output_sum,
@@ -1131,7 +1130,6 @@ class DeepseekV2MoE(nn.Module):
         gemm_output_zero_allocator: BumpAllocator = None,
         input_ids: Optional[torch.Tensor] = None,
         input_ids_global: Optional[torch.Tensor] = None,
-        num_token_non_padded: Optional[torch.Tensor] = None,
         use_vision_topk: bool = False,
         return_moe_output: bool = False,
         leave_output_sum: bool = False,
@@ -1161,11 +1159,6 @@ class DeepseekV2MoE(nn.Module):
         has_shared_output = (
             hidden_states.shape[0] > 0 and self.num_fused_shared_experts == 0
         )
-        dispatch_info = (
-            ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
-            if get_exec().moe.enable_eplb and not self.is_nextn
-            else None
-        )
 
         # router_logits: (num_tokens, n_experts)
         if _is_hip:
@@ -1179,11 +1172,7 @@ class DeepseekV2MoE(nn.Module):
             router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
             router_logits_partials = None
         if use_flashinfer_trtllm_bypass:
-            topk_output = BypassedTopKOutput(
-                hidden_states=hidden_states,
-                router_logits=router_logits,
-                topk_config=self.topk.topk_config,
-            )
+            topk_output = self.topk.forward_cuda(hidden_states, router_logits)
         else:
             topk_kwargs = (
                 {"input_ids": input_ids_global}
@@ -1197,14 +1186,11 @@ class DeepseekV2MoE(nn.Module):
                     self,
                     router_logits,
                     input_ids_global,
-                    num_token_non_padded=num_token_non_padded,
                 )
             else:
                 topk_output = self.topk(
                     hidden_states,
                     router_logits,
-                    num_token_non_padded=num_token_non_padded,
-                    expert_location_dispatch_info=dispatch_info,
                     **topk_kwargs,
                 )
         # Issued after the router so the main chain stays on the main stream at replay.
@@ -1266,7 +1252,7 @@ class DeepseekV2MoE(nn.Module):
         if deferred_finalize and get_forward().defer_moe_finalize:
             # deferred_finalize excludes _shared_expert_tp1, so the shared add folds in.
             assert shared_output is not None
-            from sglang.srt.layers.layer_boundary.fusions.cutedsl import (
+            from sglang.srt.layers.layer_boundary.fusions.moe_finalize import (
                 MoeDeferredFinalize,
             )
 
@@ -1317,7 +1303,6 @@ class DeepseekV2MoE(nn.Module):
         input_ids: Optional[torch.Tensor] = None,
         input_ids_global: Optional[torch.Tensor] = None,
         skip_shared_experts: bool = False,
-        num_token_non_padded: Optional[torch.Tensor] = None,
         use_vision_topk: bool = False,
         return_moe_output: bool = False,
         leave_output_sum: bool = False,
@@ -1326,11 +1311,6 @@ class DeepseekV2MoE(nn.Module):
             self.shared_experts.gate_up_proj
         ):
             return self.forward_cpu(hidden_states)
-        dispatch_info = (
-            ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
-            if get_exec().moe.enable_eplb and not self.is_nextn
-            else None
-        )
         defer_shared = not self.experts.moe_runner_config.inplace
         # PoC (SGLANG_DP_SHARED_EXPERT_LOCAL): shared expert is computed on the LOCAL
         # hidden in the decoder layer (before the dp gather) and added after the
@@ -1377,21 +1357,18 @@ class DeepseekV2MoE(nn.Module):
                     self,
                     router_logits,
                     input_ids_global,
-                    num_token_non_padded=num_token_non_padded,
                 )
             else:
                 topk_output = self.topk(
                     hidden_states,
                     router_logits,
-                    num_token_non_padded=num_token_non_padded,
-                    expert_location_dispatch_info=dispatch_info,
                     **topk_kwargs,
                 )
         else:
             pre_quant_input = None
             shared_output = None
             topk_output = self.topk.empty_topk_output(
-                hidden_states.device, layer_id=self.layer_id
+                hidden_states.device,
             )
 
         if self._fuse_shared_experts_inside_sbo and not skip_shared_experts:
@@ -1585,19 +1562,11 @@ class DeepseekV2MoE(nn.Module):
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
-                num_token_non_padded=forward_batch.moe_num_token_non_padded(),
-                expert_location_dispatch_info=(
-                    ExpertLocationDispatchInfo.init_new(
-                        layer_id=self.layer_id,
-                    )
-                    if not self.is_nextn
-                    else None
-                ),
                 **topk_kwargs,
             )
         else:
             topk_output = self.topk.empty_topk_output(
-                hidden_states.device, layer_id=self.layer_id
+                hidden_states.device,
             )
 
         if sbo_overlap_dispatch_flag:
@@ -1900,6 +1869,12 @@ class DeepseekV2MoE(nn.Module):
     def _routed_mxfp8_prequant_static_enabled(self) -> bool:
         return self._compute_routed_mxfp8_prequant_enabled()[0]
 
+    @cached_property
+    def mega_gate_supported(self) -> bool:
+        from sglang.srt.layers.moe.mega_gate import mega_gate_supported
+
+        return mega_gate_supported(self)
+
     def _compute_routed_mxfp8_prequant_enabled(self) -> Tuple[bool, str]:
         from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatcher
 
@@ -1973,19 +1948,11 @@ class DeepseekV2MoE(nn.Module):
                 state.topk_output = self.topk(
                     hidden_states=hidden_states,
                     router_logits=router_logits,
-                    num_token_non_padded=state.forward_batch.moe_num_token_non_padded(),
-                    expert_location_dispatch_info=(
-                        ExpertLocationDispatchInfo.init_new(
-                            layer_id=self.layer_id,
-                        )
-                        if not self.is_nextn
-                        else None
-                    ),
                     **topk_kwargs,
                 )
         else:
             state.topk_output = self.topk.empty_topk_output(
-                hidden_states.device, layer_id=self.layer_id
+                hidden_states.device,
             )
 
     def op_dispatch_a(self, state):
@@ -2257,6 +2224,7 @@ class DeepseekV2AttentionMLA(
         # pre-CUDA-graph-capture by the model runner; None unless replicate is on.
         self.w_kc_qrep = None
         self.q_b_proj_qrep_weight = None
+        self.q_b_proj_qrep = None
 
         self.w_scale_k = None
         self.w_scale_v = None
@@ -2365,6 +2333,20 @@ class DeepseekV2AttentionMLA(
             state.hidden_states_after_attn = result[0]
         else:
             state.hidden_states_after_attn = result
+
+    def rebuild_cp_kv_cache(self, latent_cache, forward_batch, k_nope, k_pe):
+        # CP V2: gather the rank-local latent KV into full sequence order
+        # (the Ascend sparse attention reads the full KV pool).
+        latent_cache[..., : self.kv_lora_rank] = k_nope.squeeze(1)
+        latent_cache[..., self.kv_lora_rank :] = k_pe.squeeze(1)
+        latent_cache_output = cp_gather_full_sequence_states(
+            latent_cache.contiguous(),
+            forward_batch,
+            torch.npu.current_stream(),
+        )
+        k_nope = latent_cache_output[..., : self.kv_lora_rank].unsqueeze(1)
+        k_pe = latent_cache_output[..., self.kv_lora_rank :].unsqueeze(1)
+        return k_nope, k_pe
 
     def forward(
         self,
@@ -2565,6 +2547,13 @@ class DeepseekV2AttentionMLA(
                 backend=self.fused_a_gemm_backend,
             )
         return self.fused_qkv_a_proj_with_mqa(hidden_states)[0]
+
+    def q_b_proj_replicated_forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.q_b_proj_qrep is not None:
+            q = self.q_b_proj_qrep.quant_method.apply(self.q_b_proj_qrep, x)
+        else:
+            q = torch.nn.functional.linear(x, self.q_b_proj_qrep_weight)
+        return q.view(-1, self.num_local_heads * self.dcp_size, self.qk_head_dim)
 
     def q_b_proj_forward(self, q_lora: torch.Tensor) -> torch.Tensor:
         if self._use_min_latency_q_b_gemm is None:

@@ -13,9 +13,13 @@ from sglang.kernels.ops.diffusion import (
     FUSED_LINEAR_GELU,
     NVFP4_BIAS_GELU,
     BitExactFusionGate,
+    can_use_fused_rmsnorm_interleaved_rope,
     can_use_linear_gelu,
     fused_linear_gelu_tanh,
+    fused_rmsnorm_interleaved_rope_,
+    fused_rmsnorm_interleaved_rope_into_blocks,
     fused_temb_table_slices,
+    rmsnorm_interleaved_rope_block_cols,
     tensors_equal,
 )
 from sglang.multimodal_gen.configs.models.dits import WanVideoConfig
@@ -43,6 +47,8 @@ from sglang.multimodal_gen.runtime.layers.layernorm import (
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     RowParallelLinear,
+    UnquantizedLinearMethod,
+    apply_unquantized_linear,
 )
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
@@ -61,7 +67,10 @@ from sglang.multimodal_gen.runtime.layers.visual_embedding import (
     PatchEmbed,
     TimestepEmbedder,
 )
-from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
+from sglang.multimodal_gen.runtime.managers.forward_context import (
+    DENOISING_LOOP_STATE,
+    get_forward_context,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
@@ -262,12 +271,13 @@ class WanT2VCrossAttention(WanSelfAttention):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs, is_cross_attention=True)
 
-    def forward(self, x, context, context_lens):
+    def forward(self, x, context, context_lens, context_kv=None):
         r"""
         Args:
             x(Tensor): Shape [B, L1, C]
             context(Tensor): Shape [B, L2, C]
             context_lens(Tensor): Shape [B]
+            context_kv: ``project_context_kv(context)``, when already projected
         """
         q, _ = self.to_q(x)
         if self.tp_rmsnorm:
@@ -276,15 +286,7 @@ class WanT2VCrossAttention(WanSelfAttention):
             q = self.norm_q(q)
         q = q.unflatten(2, (self.local_num_heads, self.head_dim))
 
-        k, _ = self.to_k(context)
-        if self.tp_rmsnorm:
-            k = tensor_parallel_rms_norm(k, self.norm_k)
-        else:
-            k = self.norm_k(k)
-        k = k.unflatten(2, (self.local_num_heads, self.head_dim))
-
-        v, _ = self.to_v(context)
-        v = v.unflatten(2, (self.local_num_heads, self.head_dim))
+        k, v = self.project_context_kv(context) if context_kv is None else context_kv
 
         # compute attention
         x = self.attn(q, k, v)
@@ -293,6 +295,20 @@ class WanT2VCrossAttention(WanSelfAttention):
         x = x.flatten(2)
         x, _ = self.to_out(x)
         return x
+
+    def project_context_kv(
+        self, context: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The normed K and the V of ``context``, as [B, L2, heads, head_dim]"""
+        k, _ = self.to_k(context)
+        if self.tp_rmsnorm:
+            k = tensor_parallel_rms_norm(k, self.norm_k)
+        else:
+            k = self.norm_k(k)
+        k = k.unflatten(2, (self.local_num_heads, self.head_dim))
+        v, _ = self.to_v(context)
+        v = v.unflatten(2, (self.local_num_heads, self.head_dim))
+        return k, v
 
 
 class WanI2VCrossAttention(WanSelfAttention):
@@ -416,6 +432,26 @@ def _wan_temb_table_slices(
             logger=logger,
         )
     return _eager_temb_table_slices(table, temb)
+
+
+def _rows_of_one_buffer(parts: list[torch.Tensor]) -> torch.Tensor | None:
+    """``torch.cat(parts)`` without a copy, when the parts are consecutive equal-shape
+    rows of one buffer"""
+    first = parts[0]
+    start, nbytes = first.data_ptr(), first.nbytes
+    storage = first.untyped_storage()
+    if start + len(parts) * nbytes > storage.data_ptr() + storage.nbytes():
+        return None
+    for i, part in enumerate(parts):
+        if (
+            part.data_ptr() != start + i * nbytes
+            or part.shape != first.shape
+            or not part.is_contiguous()
+        ):
+            return None
+    return first.as_strided(
+        (len(parts) * first.shape[0], *first.shape[1:]), first.stride()
+    )
 
 
 class WanTransformerBlock(nn.Module):
@@ -551,6 +587,13 @@ class WanTransformerBlock(nn.Module):
         assert cross_attn_norm is True
         self.qk_norm = qk_norm
         self.tp_rmsnorm = qk_norm == "rms_norm_across_heads" and tp_size > 1
+        # the across-heads q/k RMSNorm runs FlashInfer's kernel, which the RoPE can join
+        self.fuse_qk_norm_rope = (
+            qk_norm == "rms_norm_across_heads"
+            and not self.tp_rmsnorm
+            and not self.norm_q.cast_x_before_out_mul
+            and self.norm_q._forward_method == self.norm_q.forward_cuda
+        )
         self.self_attn_residual_norm = ScaleResidualLayerNormScaleShift(
             dim,
             eps=eps,
@@ -599,31 +642,236 @@ class WanTransformerBlock(nn.Module):
             quant_config=quant_config,
         )
         self.mlp_residual = MulAdd()
+        # norm1 that first adds the previous block's gated FFN output (its MulAdd)
+        self.ffn_residual_norm1 = ScaleResidualLayerNormScaleShift(
+            dim,
+            eps=eps,
+            elementwise_affine=False,
+            dtype=torch.float32,
+        )
 
         self.scale_shift_table = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
+        # set by fuse_qkv_weights: to_q / to_k / to_v are plain unquantized linears
+        self.qkv_fusable = False
+        # exchange-block addresses -> (q, k) destination tables of _attend_qk_filled
+        self._qk_tables: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
+
+    def fuse_qkv_weights(self) -> None:
+        """Move to_q / to_k / to_v into consecutive rows of one weight and one bias, so a
+        single GEMM projects all three (``_fused_qkv``)"""
+        layers = (self.to_q, self.to_k, self.to_v)
+        self.qkv_fusable = all(
+            type(layer) is ColumnParallelLinear
+            and isinstance(layer.quant_method, UnquantizedLinearMethod)
+            and layer.bias is not None
+            and not layer.skip_bias_add
+            and not layer.gather_output
+            for layer in layers
+        )
+        if not self.qkv_fusable:
+            return
+        with torch.no_grad():
+            weight = torch.cat([layer.weight for layer in layers])
+            bias = torch.cat([layer.bias for layer in layers])
+        rows = self.to_q.weight.shape[0]
+        for i, layer in enumerate(layers):
+            layer.weight.data = weight[i * rows : (i + 1) * rows]
+            layer.bias.data = bias[i * rows : (i + 1) * rows]
+
+    def _fused_qkv(
+        self, device: torch.device
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """The [3 * dim, dim] weight and [3 * dim] bias of ``fuse_qkv_weights``, read back
+        from the layers while they still share them on ``device``. Only the layers hold
+        the shared buffers, so moving the module or offloading or swapping a layer's
+        weight frees them."""
+        layers = (self.to_q, self.to_k, self.to_v)
+        if (
+            not self.qkv_fusable
+            or torch.compiler.is_compiling()
+            or not all(type(layer) is ColumnParallelLinear for layer in layers)
+            or self.to_q.weight.device != device
+        ):
+            return None
+        weight = _rows_of_one_buffer([layer.weight for layer in layers])
+        bias = _rows_of_one_buffer([layer.bias for layer in layers])
+        if weight is None or bias is None:
+            return None
+        return weight, bias
 
     def _qkv(
         self, norm_hidden_states: torch.Tensor, local_heads: int
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self._qkv_rope(norm_hidden_states, local_heads, None)[:3]
+
+    def _qkv_rope(
+        self,
+        norm_hidden_states: torch.Tensor,
+        local_heads: int,
+        rope_cos_sin_cache: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]:
+        """q, k, v as [B, S, heads, head_dim], and whether q and k already carry the
+        RoPE of rope_cos_sin_cache (applied in the q/k norm pass)"""
+        return self._norm_qk(
+            *self._project_qkv(norm_hidden_states), local_heads, rope_cos_sin_cache
+        )
+
+    def _project_qkv(
+        self, norm_hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        fused = self._fused_qkv(norm_hidden_states.device)
+        if fused is not None:
+            qkv = apply_unquantized_linear(norm_hidden_states, *fused)
+            return qkv.split(self.to_q.weight.shape[0], dim=-1)
         query, _ = self.to_q(norm_hidden_states)
         key, _ = self.to_k(norm_hidden_states)
         value, _ = self.to_v(norm_hidden_states)
-        if self.norm_q is not None:
-            query = (
-                tensor_parallel_rms_norm(query, self.norm_q)
-                if self.tp_rmsnorm
-                else self.norm_q(query)
+        return query, key, value
+
+    def _fuses_qk_norm_rope(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        rope_cos_sin_cache: torch.Tensor | None,
+    ) -> bool:
+        return (
+            rope_cos_sin_cache is not None
+            and self.fuse_qk_norm_rope
+            and not torch.compiler.is_compiling()
+            and all(
+                can_use_fused_rmsnorm_interleaved_rope(
+                    x.view(-1, x.shape[-1]),
+                    norm.weight,
+                    rope_cos_sin_cache,
+                    self.dim_head,
+                )
+                for x, norm in ((query, self.norm_q), (key, self.norm_k))
             )
-        if self.norm_k is not None:
-            key = (
-                tensor_parallel_rms_norm(key, self.norm_k)
-                if self.tp_rmsnorm
-                else self.norm_k(key)
+        )
+
+    def _attend_qk_filled(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        rope_cos_sin_cache: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        """Self-attention whose q/k norm-RoPE pass writes straight into the Ulysses
+        exchange blocks (this rank's own slot rows and the peers' send blocks), so no
+        own-row copy of q and k runs; None, with q/k untouched, when it cannot."""
+        if (
+            type(self.attn1) is not USPAttention
+            or self.use_offline_qk_rotation
+            or not self._fuses_qk_norm_rope(query, key, rope_cos_sin_cache)
+        ):
+            return None
+        q2d, k2d = (x.view(-1, x.shape[-1]) for x in (query, key))
+        block_cols = rmsnorm_interleaved_rope_block_cols(q2d.shape[-1])
+
+        def fill_all(blocks) -> None:
+            tables = self._qk_block_tables(blocks, block_cols, q2d.shape[-1])
+            if tables is None:
+                # blocks the kernel cannot address: norm in place, then copy them
+                for x, norm in ((q2d, self.norm_q), (k2d, self.norm_k)):
+                    fused_rmsnorm_interleaved_rope_(
+                        x,
+                        norm.weight,
+                        rope_cos_sin_cache,
+                        norm.variance_epsilon,
+                        self.dim_head,
+                    )
+                for head_start, head_count, q_dst, k_dst in blocks:
+                    cols = slice(
+                        head_start * self.dim_head,
+                        (head_start + head_count) * self.dim_head,
+                    )
+                    q_dst.copy_(q2d[:, cols].view_as(q_dst))
+                    k_dst.copy_(k2d[:, cols].view_as(k_dst))
+                return
+            for x, norm, table in zip((q2d, k2d), (self.norm_q, self.norm_k), tables):
+                fused_rmsnorm_interleaved_rope_into_blocks(
+                    x,
+                    norm.weight,
+                    rope_cos_sin_cache,
+                    norm.variance_epsilon,
+                    self.dim_head,
+                    table,
+                )
+
+        return self.attn1.forward_qk_filled(
+            *(
+                x.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
+                for x in (query, key, value)
+            ),
+            fill_all,
+        )
+
+    def _qk_block_tables(
+        self, blocks, block_cols: int, hidden: int
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        # destination address of every block_cols-wide column run, for q and for k;
+        # the exchange blocks keep their addresses, so the tables are built once
+        if (
+            any(
+                head_count * self.dim_head != block_cols
+                or (head_start * self.dim_head) % block_cols
+                or not (q_dst.is_contiguous() and k_dst.is_contiguous())
+                for head_start, head_count, q_dst, k_dst in blocks
             )
-        return tuple(
+            or len(blocks) * block_cols != hidden
+        ):
+            return None
+        ordered = sorted(blocks, key=lambda block: block[0])
+        key = tuple((q.data_ptr(), k.data_ptr()) for _, _, q, k in ordered)
+        tables = self._qk_tables.get(key)
+        if tables is None:
+            tables = self._qk_tables[key] = tuple(
+                torch.tensor(
+                    [block[i].data_ptr() for block in ordered],
+                    dtype=torch.int64,
+                    device=ordered[0][2].device,
+                )
+                for i in (2, 3)
+            )
+        return tables
+
+    def _norm_qk(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        local_heads: int,
+        rope_cos_sin_cache: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]:
+        qk_norms = ((query, self.norm_q), (key, self.norm_k))
+        roped = self._fuses_qk_norm_rope(query, key, rope_cos_sin_cache)
+        if roped:
+            for x, norm in qk_norms:
+                fused_rmsnorm_interleaved_rope_(
+                    x.view(-1, x.shape[-1]),
+                    norm.weight,
+                    rope_cos_sin_cache,
+                    norm.variance_epsilon,
+                    self.dim_head,
+                )
+        else:
+            if self.norm_q is not None:
+                query = (
+                    tensor_parallel_rms_norm(query, self.norm_q)
+                    if self.tp_rmsnorm
+                    else self.norm_q(query)
+                )
+            if self.norm_k is not None:
+                key = (
+                    tensor_parallel_rms_norm(key, self.norm_k)
+                    if self.tp_rmsnorm
+                    else self.norm_k(key)
+                )
+        query, key, value = (
             tensor.squeeze(1).unflatten(2, (local_heads, self.dim_head))
             for tensor in (query, key, value)
         )
+        return query, key, value, roped
 
     def _cross_and_ffn(
         self,
@@ -635,7 +883,9 @@ class WanTransformerBlock(nn.Module):
         c_scale_msa: torch.Tensor,
         c_gate_msa: torch.Tensor,
         orig_dtype: torch.dtype,
-    ) -> torch.Tensor:
+        defer_ffn_residual: bool = False,
+        text_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         attn_output, _ = self.to_out(attn_output)
         attn_output = attn_output.squeeze(1)
         null_shift = null_scale = torch.zeros(
@@ -646,16 +896,35 @@ class WanTransformerBlock(nn.Module):
         )
         norm_hidden_states = norm_hidden_states.to(orig_dtype)
         hidden_states = hidden_states.to(orig_dtype)
-        attn_output = self.attn2(
-            norm_hidden_states, context=encoder_hidden_states, context_lens=None
-        )
+        if text_kv is None:
+            attn_output = self.attn2(
+                norm_hidden_states, context=encoder_hidden_states, context_lens=None
+            )
+        else:
+            attn_output = self.attn2(
+                norm_hidden_states,
+                context=encoder_hidden_states,
+                context_lens=None,
+                context_kv=text_kv,
+            )
         norm_hidden_states, hidden_states = self.cross_attn_residual_norm(
             hidden_states, attn_output, 1, c_shift_msa, c_scale_msa
         )
         norm_hidden_states = norm_hidden_states.to(orig_dtype)
         hidden_states = hidden_states.to(orig_dtype)
         ff_output = self.ffn(norm_hidden_states)
+        if defer_ffn_residual:
+            return hidden_states, (ff_output, c_gate_msa)
         return self.mlp_residual(ff_output, c_gate_msa, hidden_states).to(orig_dtype)
+
+    @property
+    def chains_ffn_residual(self) -> bool:
+        """Whether the FFN residual (MulAdd) and the next norm1 run as one kernel with
+        the same bits: both sides on their CUDA kernels"""
+        return all(
+            op._forward_method == op.forward_cuda
+            for op in (self.mlp_residual, self.norm1, self.ffn_residual_norm1)
+        )
 
     def forward(
         self,
@@ -664,7 +933,13 @@ class WanTransformerBlock(nn.Module):
         temb: torch.Tensor,
         freqs_cis: tuple[torch.Tensor, torch.Tensor],
         rope_cos_sin_cache: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        ffn_residual: tuple[torch.Tensor, torch.Tensor] | None = None,
+        defer_ffn_residual: bool = False,
+        text_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        """``ffn_residual`` is the previous block's (ff_output, gate), still to be added
+        to ``hidden_states``; ``defer_ffn_residual`` hands this block's back the same way.
+        ``text_kv`` is the cross-attention's projected (K, V) of ``encoder_hidden_states``."""
         if hidden_states.dim() == 4:
             hidden_states = hidden_states.squeeze(1)
         bs, seq_length, _ = hidden_states.shape
@@ -694,12 +969,50 @@ class WanTransformerBlock(nn.Module):
         assert shift_msa.dtype == torch.float32
 
         # 1. Self-attention
-        norm_hidden_states = self.norm1(hidden_states, shift_msa, scale_msa)
-        query, key, value = self._qkv(norm_hidden_states, self.local_num_heads)
+        if ffn_residual is None:
+            norm_hidden_states = self.norm1(hidden_states, shift_msa, scale_msa)
+        else:
+            ff_output, ff_gate = ffn_residual
+            norm_hidden_states, hidden_states = self.ffn_residual_norm1(
+                hidden_states, ff_output, ff_gate, shift_msa, scale_msa
+            )
+        query, key, value = self._project_qkv(norm_hidden_states)
+        attn_output = self._attend_qk_filled(query, key, value, rope_cos_sin_cache)
+        if attn_output is None:
+            attn_output = self._self_attention(
+                query, key, value, freqs_cis, rope_cos_sin_cache
+            )
+        attn_output = attn_output.flatten(2)
+        return self._cross_and_ffn(
+            hidden_states,
+            attn_output,
+            encoder_hidden_states,
+            gate_msa,
+            c_shift_msa,
+            c_scale_msa,
+            c_gate_msa,
+            orig_dtype,
+            defer_ffn_residual,
+            text_kv,
+        )
+
+    def _self_attention(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        freqs_cis: tuple[torch.Tensor, torch.Tensor],
+        rope_cos_sin_cache: torch.Tensor | None,
+    ) -> torch.Tensor:
+        query, key, value, roped = self._norm_qk(
+            query, key, value, self.local_num_heads, rope_cos_sin_cache
+        )
 
         # Apply rotary embeddings
         cos, sin = freqs_cis
-        if _is_cuda and query.shape == key.shape:
+        if roped:
+            pass
+        elif _is_cuda and query.shape == key.shape:
             # The concatenated cache only depends on freqs_cis, which is fixed
             # for the whole forward; the transformer builds it once per call.
             cos_sin_cache = rope_cos_sin_cache
@@ -751,18 +1064,7 @@ class WanTransformerBlock(nn.Module):
             query = torch.matmul(query, self.q_rot)
             key = torch.matmul(key, self.k_rot)
 
-        attn_output = self.attn1(query, key, value)
-        attn_output = attn_output.flatten(2)
-        return self._cross_and_ffn(
-            hidden_states,
-            attn_output,
-            encoder_hidden_states,
-            gate_msa,
-            c_shift_msa,
-            c_scale_msa,
-            c_gate_msa,
-            orig_dtype,
-        )
+        return self.attn1(query, key, value)
 
 
 class WanTransformerBlock_VSA(nn.Module):
@@ -1018,6 +1320,10 @@ class WanTransformerBlock_VSA(nn.Module):
         return hidden_states
 
 
+# DENOISING_LOOP_STATE entry of the text K/V (WanTransformer3DModel._text_kvs)
+_TEXT_KV_STATE = "wan_text_kv"
+
+
 class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     _fsdp_shard_conditions = [is_block]
     _compile_conditions = [is_block]
@@ -1109,6 +1415,84 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
 
         self.layer_names = ["blocks"]
 
+    def _text_kvs(
+        self, source: torch.Tensor, context: torch.Tensor
+    ) -> list[tuple[torch.Tensor, torch.Tensor]] | None:
+        """Every block's cross-attention (K, V) of ``context``, the embedding of ``source``.
+
+        The denoising stage hands the same prompt tensor to every step of a loop, so the
+        K/V are projected once per (model, prompt tensor) and kept in the request's
+        DENOISING_LOOP_STATE, which the stage drops when the loop ends; the module holds
+        none of them. Holding the tensor keeps its id from being reused while cached.
+        Off when the projections could differ step to step (LoRA wrappers, offloaded
+        weights) or would be captured.
+        """
+        req = get_forward_context().forward_batch
+        if (
+            req is None
+            or not isinstance(source, torch.Tensor)
+            or self.layerwise_offload_managers
+            or torch.compiler.is_compiling()
+            or torch.cuda.is_current_stream_capturing()
+            or not self._plain_blocks()
+            or not all(
+                type(block.attn2) is WanT2VCrossAttention
+                and type(block.attn2.to_k) is ColumnParallelLinear
+                and type(block.attn2.to_v) is ColumnParallelLinear
+                for block in self.blocks
+            )
+        ):
+            return None
+        # (id(model), id(prompt tensor)) -> (that tensor, every block's K/V)
+        cached = req.extra.setdefault(DENOISING_LOOP_STATE, {}).setdefault(
+            _TEXT_KV_STATE, {}
+        )
+        key = (id(self), id(source))
+        entry = cached.pop(key, None)
+        if (
+            entry is not None
+            and entry[0] is source
+            and entry[1][0][0].device == context.device
+        ):
+            cached[key] = entry
+            return entry[1]
+        # the other expert is done with its K/V; keep this model's other CFG branch
+        mine = [k for k in cached if k[0] == id(self)]
+        for stale in [k for k in cached if k[0] != id(self)] + mine[:-1]:
+            del cached[stale]
+        del entry
+        kvs = [block.attn2.project_context_kv(context) for block in self.blocks]
+        cached[key] = (source, kvs)
+        return kvs
+
+    def _plain_blocks(self) -> bool:
+        # plain Wan blocks in a plain list: no cache adapter or block hook replaced them
+        return type(self.blocks) is nn.ModuleList and all(
+            type(block) is WanTransformerBlock and "forward" not in vars(block)
+            for block in self.blocks
+        )
+
+    def _chains_ffn_residuals(self) -> bool:
+        return (
+            len(self.blocks) > 1
+            and self._plain_blocks()
+            and all(block.chains_ffn_residual for block in self.blocks)
+        )
+
+    def post_load_weights(self) -> None:
+        super().post_load_weights()
+        for block in self.blocks:
+            if isinstance(block, WanTransformerBlock):
+                block.fuse_qkv_weights()
+        fused = sum(
+            isinstance(block, WanTransformerBlock)
+            and block._fused_qkv(block.to_q.weight.device) is not None
+            for block in self.blocks
+        )
+        logger.info(
+            "Fused q/k/v projection weights in %d/%d blocks", fused, len(self.blocks)
+        )
+
     def _make_block(
         self,
         *,
@@ -1161,6 +1545,7 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         guidance=None,
         **kwargs,
     ) -> torch.Tensor:
+        text_source = encoder_hidden_states
         forward_batch = get_forward_context().forward_batch
         if forward_batch is not None:
             sequence_shard_enabled = (
@@ -1211,8 +1596,8 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 else None
             )
 
-        hidden_states = self.patch_embedding(hidden_states)
-        hidden_states = hidden_states.flatten(2).transpose(1, 2).contiguous()
+        # token-major straight from the patchify GEMM, no [B, C, T, H, W] round trip
+        hidden_states = self.patch_embedding(hidden_states, tokens=True).contiguous()
 
         # shape is [B, T' * H' * W', C]
         seq_len_orig = hidden_states.shape[1]
@@ -1319,6 +1704,9 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             if self.enable_teacache:
                 original_hidden_states = hidden_states.clone()
 
+            # cast once for every block's fp32 add (the TI2V table stays bf16)
+            if timestep_proj.dim() == 3:
+                timestep_proj = timestep_proj.float()
             rope_cos_sin_cache = None
             if _is_cuda and freqs_cis is not None:
                 cos, sin = freqs_cis
@@ -1329,14 +1717,44 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                     ],
                     dim=-1,
                 )
-            for block in self.blocks:
-                hidden_states = block(
+            text_kvs = self._text_kvs(text_source, encoder_hidden_states)
+            text_kv_kwargs = [
+                {} if text_kvs is None else {"text_kv": kv}
+                for kv in (text_kvs or [None] * len(self.blocks))
+            ]
+            if self._chains_ffn_residuals():
+                # each block's FFN residual is added by the next block's norm1
+                ffn_residual = None
+                for block, kv_kwargs in zip(self.blocks[:-1], text_kv_kwargs):
+                    hidden_states, ffn_residual = block(
+                        hidden_states,
+                        encoder_hidden_states,
+                        timestep_proj,
+                        freqs_cis,
+                        rope_cos_sin_cache=rope_cos_sin_cache,
+                        ffn_residual=ffn_residual,
+                        defer_ffn_residual=True,
+                        **kv_kwargs,
+                    )
+                hidden_states = self.blocks[-1](
                     hidden_states,
                     encoder_hidden_states,
                     timestep_proj,
                     freqs_cis,
                     rope_cos_sin_cache=rope_cos_sin_cache,
+                    ffn_residual=ffn_residual,
+                    **text_kv_kwargs[-1],
                 )
+            else:
+                for block, kv_kwargs in zip(self.blocks, text_kv_kwargs):
+                    hidden_states = block(
+                        hidden_states,
+                        encoder_hidden_states,
+                        timestep_proj,
+                        freqs_cis,
+                        rope_cos_sin_cache=rope_cos_sin_cache,
+                        **kv_kwargs,
+                    )
             # if teacache is enabled, we need to cache the original hidden states
             if self.enable_teacache:
                 self.maybe_cache_states(hidden_states, original_hidden_states)
