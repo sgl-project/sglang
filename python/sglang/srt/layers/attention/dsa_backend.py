@@ -65,6 +65,11 @@ from sglang.srt.layers.attention.dsa.dsa_dcp import (
     dcp_trtllm_sparse_attention,
     localize_dcp_page_table,
 )
+from sglang.srt.layers.attention.dsa.dsa_dcp_gather import (
+    build_dcp_gather_plan,
+    gather_dcp_prefix_kv,
+    remap_slots_to_gathered_rows,
+)
 from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import DSAIndexerMetadata
 from sglang.srt.layers.attention.dsa.dsa_metadata_manager import (
     DSAMetadataManagementMixin,
@@ -548,6 +553,11 @@ class DeepseekSparseAttnBackend(
             self.dcp_rank = get_parallel().attn_dcp_rank
         self.num_dcp_q_heads = self.num_q_heads * self.dcp_size
         self._dcp_page_table_cache = DcpPageTableCache()
+        self.dsa_dcp_extend_gather_kv = (
+            self.dcp_size > 1 and envs.SGLANG_ENABLE_DSA_DCP_EXTEND_GATHER_KV.get()
+        )
+        self._dcp_gather_plan = None
+        self._dcp_slot_to_row = None
         self.kv_cache_dim = model_runner.token_to_kv_pool.kv_cache_dim
         self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim
         self.kv_lora_rank = model_runner.model_config.kv_lora_rank
@@ -1423,6 +1433,31 @@ class DeepseekSparseAttnBackend(
             kpool_inputs=kpool_inputs,
         )
         self.forward_metadata = metadata
+        self._dcp_gather_plan = None
+        if self.dsa_dcp_extend_gather_kv and self._is_plain_extend(forward_batch):
+            seq_lens_cpu = forward_batch.seq_lens_cpu
+            if seq_lens_cpu is None:
+                seq_lens_cpu = forward_batch.seq_lens.cpu()
+            if self._dcp_slot_to_row is None:
+                num_slots = (
+                    self.token_to_kv_pool.size + self.physical_page_size
+                ) * self.dcp_size
+                self._dcp_slot_to_row = torch.full(
+                    (num_slots,), -1, dtype=torch.int32, device=self.device
+                )
+            self._dcp_gather_plan = build_dcp_gather_plan(
+                page_table=metadata.page_table_1,
+                seq_lens_cpu=seq_lens_cpu,
+                dcp_size=self.dcp_size,
+                dcp_rank=self.dcp_rank,
+                physical_page_size=self.physical_page_size,
+                slot_to_row=self._dcp_slot_to_row,
+            )
+
+    @staticmethod
+    def _is_plain_extend(forward_batch: ForwardBatch) -> bool:
+        mode = forward_batch.forward_mode
+        return mode.is_extend() and not mode.is_target_verify()
 
     def _cal_indexer_k_start_end(
         self,
@@ -3877,6 +3912,17 @@ class DeepseekSparseAttnBackend(
             self.token_to_kv_pool.set_mla_kv_buffer(layer, cache_loc, k, k_rope)
 
         k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        gather_plan = None
+        if (
+            self.dsa_dcp_extend_gather_kv
+            and is_prefill
+            and self._is_plain_extend(forward_batch)
+        ):
+            gather_plan = self._dcp_gather_plan
+        if gather_plan is not None:
+            k_cache = gather_dcp_prefix_kv(
+                k_cache, gather_plan, get_parallel().dcp_group, self.kv_cache_dim
+            )
         kv_cache = k_cache.view(
             -1, self.physical_page_size, self.kv_cache_dim
         ).unsqueeze(1)
@@ -3911,9 +3957,17 @@ class DeepseekSparseAttnBackend(
 
         if self.use_fused_topk:
             page_table_1 = self._get_fused_topk_page_table(topk_indices)
+            if gather_plan is not None:
+                page_table_1 = remap_slots_to_gathered_rows(
+                    page_table_1, gather_plan.slot_to_row
+                )
         elif is_prefill:
             page_table_1 = transform_index_page_table_prefill(
-                page_table=metadata.page_table_1,
+                page_table=(
+                    gather_plan.page_table
+                    if gather_plan is not None
+                    else metadata.page_table_1
+                ),
                 topk_indices=topk_indices,
                 extend_lens_cpu=metadata.dsa_extend_seq_lens_list,
                 page_size=1,
@@ -3933,7 +3987,8 @@ class DeepseekSparseAttnBackend(
         page_table_1, sparse_mla_top_k = self._pad_trtllm_sparse_page_table(
             page_table_1
         )
-        if self.dcp_size > 1:
+        use_dcp_partials = self.dcp_size > 1 and gather_plan is None
+        if use_dcp_partials:
             page_table_1, seq_lens = localize_dcp_page_table(
                 self._dcp_page_table_cache,
                 metadata=metadata,
@@ -3983,7 +4038,7 @@ class DeepseekSparseAttnBackend(
             multi_ctas_kv_counter_buffer=multi_ctas_kv_counter_buffer,
         )
 
-        if self.dcp_size > 1:
+        if use_dcp_partials:
             out, lse = dcp_trtllm_sparse_attention(
                 query=q,
                 block_tables=block_tables,

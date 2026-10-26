@@ -127,7 +127,7 @@ class DeepseekMLAForwardMixin:
         return (
             mode.is_decode()
             or mode.is_target_verify()
-            or (self.use_dsa and mode.is_extend())
+            or (self.use_dsa and mode.is_extend() and not self.dsa_dcp_extend_gather_kv)
         )
 
     def is_dcp_q_replicate_phase(
@@ -141,6 +141,9 @@ class DeepseekMLAForwardMixin:
     def init_mla_forward(self: DeepseekV2AttentionMLA):
         self.flashinfer_mla_disable_ragged = (
             get_exec().kernel.flashinfer_mla_disable_ragged
+        )
+        self.dsa_dcp_extend_gather_kv = (
+            self.use_dsa and envs.SGLANG_ENABLE_DSA_DCP_EXTEND_GATHER_KV.get()
         )
 
     def should_run_indexer(
@@ -669,6 +672,9 @@ class DeepseekMLAForwardMixin:
                         q_nope_out=q_nope_out,
                         q_pe=q_pe,
                     )
+            elif self.use_dsa:
+                # The DSA backend gathers the striped prefix rows per layer.
+                pass
             elif forward_batch.forward_mode.is_extend():
                 # for extend, gather kv
                 all_gather_kv_cache_for_mla_extend(
