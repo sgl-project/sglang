@@ -26,6 +26,7 @@ from sglang.srt.mem_cache.kv.sizing import (
     size_kv_storage,
 )
 from sglang.srt.mem_cache.kv.state_storage import StateStorage
+from sglang.srt.mem_cache.kv.storage import KVStorage
 from sglang.srt.mem_cache.layout.fused_draft import FusedDraftPlacement
 from sglang.srt.mem_cache.ple_state_pool import NGramPool, ShortConvPool
 from sglang.srt.mem_cache.unified_memory_pool import (
@@ -73,6 +74,19 @@ class UnifiedBuildContext(msgspec.Struct, frozen=True, kw_only=True):
     decode_pre_alloc_size: int = 0
     # Logged only: the state share governs the total budget, not the split.
     mamba_full_memory_ratio: Optional[float] = None
+
+
+def _attach_storage(
+    plan: KVStoragePlan, token_to_kv_pool, allocator, ctx: UnifiedBuildContext
+) -> None:
+    """What host and peer transfers read: the plan's sub-pools through the KV
+    pool's router and the allocator's state."""
+    allocator.storage = KVStorage(
+        plan=plan,
+        router=token_to_kv_pool.layer_router,
+        allocator=allocator,
+        start_layer=ctx.start_layer,
+    )
 
 
 def _log_banner(*lines) -> None:
@@ -129,6 +143,7 @@ def _build_full_window(
         lazy_compaction=ctx.lazy_compaction,
         **legacy_allocator_capacities,
     )
+    _attach_storage(plan, token_to_kv_pool, allocator, ctx)
     _log_banner(
         "UNIFIED MEMORY POOL ENABLED -- path=SWA hybrid",
         "  token-major views, entry_bytes full=%d swa=%d B"
@@ -286,6 +301,7 @@ def _build_full_state(
         device=ctx.device,
     )
     allocator.state = state_storage
+    _attach_storage(plan, token_to_kv_pool, allocator, ctx)
     # Only HybridLinearKVPool's retraction CPU-copy path uses this hook.
     token_to_kv_pool._mamba_translate = allocator.state_ids(state.name).ids
     _log_banner(
@@ -375,6 +391,7 @@ def _build_full_window_state(
         device=ctx.device,
     )
     allocator.state = state_storage
+    _attach_storage(plan, token_to_kv_pool, allocator, ctx)
     _log_banner(
         "UNIFIED MEMORY POOL ENABLED -- path=SWA+Mamba tri-pool",
         "  full_layers=%d, swa_layers=%d, state_layers=%d, page_size=%d"
