@@ -75,6 +75,7 @@ pub fn select_chat_formatter(
                     formatter,
                     thinking: ThinkingTemplates::always(),
                     content_parts: false,
+                    concatenates_text_parts: false,
                 }),
                 None,
             );
@@ -151,6 +152,7 @@ fn native_fallback(
             formatter: PromptFormatter::OAI(Arc::new(DeepSeekV32Formatter::new_chat())),
             thinking: ThinkingTemplates::native(false, false),
             content_parts: false,
+            concatenates_text_parts: false,
         });
     }
     Some(ChatFormatter::HuggingFace {
@@ -159,6 +161,7 @@ fn native_fallback(
         // their thinking mode enabled.
         thinking: ThinkingTemplates::native(true, false),
         content_parts: false,
+        concatenates_text_parts: false,
     })
 }
 

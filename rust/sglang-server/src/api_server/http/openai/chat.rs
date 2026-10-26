@@ -382,18 +382,16 @@ async fn chat_completions(
 fn chat_images<T: serde::Serialize>(
     messages: &T,
     is_multimodal: bool,
-) -> Result<Vec<MmItem>, &'static str> {
+) -> Result<Vec<MmItem>, String> {
     let messages = serde_json::to_value(messages).unwrap_or_default();
     if !contains_media(&messages) {
         return Ok(Vec::new());
     }
     if !is_multimodal || contains_non_image_media(&messages) {
-        return Err("image, audio, video, and file message content is not supported");
+        return Err("image, audio, video, and file message content is not supported".into());
     }
-    Ok(sglang_processor::extract_images(&messages)
-        .into_iter()
-        .map(MmItem::Source)
-        .collect())
+    let images = sglang_processor::extract_images(&messages)?;
+    Ok(images.into_iter().map(MmItem::Source).collect())
 }
 
 /// Render the chat template for an OpenAI request, mapping a missing
@@ -1176,6 +1174,10 @@ mod tests {
         assert!(chat_images(&video, true).is_err());
         let text = serde_json::json!([{"role": "user", "content": "plain"}]);
         assert!(chat_images(&text, false).unwrap().is_empty());
+        let no_url = serde_json::json!([{"role": "user", "content": [
+            {"type": "image_url", "image_url": null, "uuid": "cached"}
+        ]}]);
+        assert!(chat_images(&no_url, true).is_err());
     }
 
     /// Python `to_sampling_params` priority: user value > model generation
