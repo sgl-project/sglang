@@ -74,6 +74,7 @@ pub fn select_chat_formatter(
                 Some(ChatFormatter::HuggingFace {
                     formatter,
                     thinking: ThinkingTemplates::always(),
+                    content_parts: false,
                 }),
                 None,
             );
@@ -118,6 +119,7 @@ pub fn select_chat_formatter(
                 && let ChatFormatter::HuggingFace {
                     formatter: inner,
                     thinking,
+                    ..
                 } = formatter
             {
                 formatter = ChatFormatter::KimiK25 {
@@ -148,6 +150,7 @@ fn native_fallback(
         return Some(ChatFormatter::HuggingFace {
             formatter: PromptFormatter::OAI(Arc::new(DeepSeekV32Formatter::new_chat())),
             thinking: ThinkingTemplates::native(false, false),
+            content_parts: false,
         });
     }
     Some(ChatFormatter::HuggingFace {
@@ -155,6 +158,7 @@ fn native_fallback(
         // The remaining display-name fallback formatters are constructed with
         // their thinking mode enabled.
         thinking: ThinkingTemplates::native(true, false),
+        content_parts: false,
     })
 }
 

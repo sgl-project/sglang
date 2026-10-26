@@ -53,6 +53,8 @@ pub enum ChatFormatter {
     HuggingFace {
         formatter: PromptFormatter,
         thinking: ThinkingTemplates,
+        /// SGLang hands the template content parts lists rather than strings.
+        content_parts: bool,
     },
     KimiK25 {
         formatter: PromptFormatter,

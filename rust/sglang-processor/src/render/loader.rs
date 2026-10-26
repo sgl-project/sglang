@@ -120,6 +120,9 @@ impl ChatFormatter {
     /// templates build [`ChatFormatter::Glm53`] and [`ChatFormatter::Qwen38`].
     pub fn from_tokenizer_config(config: &Value) -> Result<Self, TemplateError> {
         let glm53 = config["chat_template"].as_str().is_some_and(is_glm53);
+        let content_parts = config["chat_template"]
+            .as_str()
+            .is_some_and(takes_content_parts);
         let qwen38 = config["chat_template"].as_str().filter(|t| is_qwen38(t));
         let thinking = ThinkingTemplates::from_config(config);
         let template: ChatTemplate = serde_json::from_value(config.clone())
@@ -147,6 +150,7 @@ impl ChatFormatter {
             Self::HuggingFace {
                 formatter,
                 thinking,
+                content_parts,
             }
         })
     }
