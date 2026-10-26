@@ -179,7 +179,9 @@ SGLang additions:
 ```rust
 lower_completion(body, &headers, &settings, tokenizer) -> Result<(GenerateRequest, CompletionResponder), Unsupported>
 lower_chat(body, &headers, &settings, &chat_model, render, tokenizer) -> Result<(GenerateRequest, ChatResponder), Unsupported>
-Responder::unary(status, body) / responder.stream_data(frame) -> OpenAI JSON or SSE events
+responder.unary(items) / responder.stream_data(item) -> OpenAI JSON or SSE events
+// item is Result<GenerateResponse, GenerateStreamError>; unary accepts a Vec of items
+responder.stream_end() // after the transport receives [DONE]
 ```
 
 SGLang-only: Python's OpenAI layer (`entrypoints/openai/`) over the engine's
