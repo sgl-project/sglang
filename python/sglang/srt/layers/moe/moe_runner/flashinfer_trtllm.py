@@ -1637,7 +1637,10 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
                 top_k=_routing_top_k(routing),
             )
         else:
-            result = result[0]
+            # Both kernels wrote symm_output. The prepared body returns that
+            # tensor itself rather than a tuple, so ``result[0]`` would take
+            # row zero and broadcast it across the tokens of a verify batch.
+            result = symm_output
     else:
         assert TopKOutputChecker.format_is_bypassed(topk_output)
 
