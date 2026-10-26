@@ -35,13 +35,26 @@ pub(super) fn stream_error_event(message: &str, err_type: &str, code: u16) -> St
     format!("data: {}\n\n", python_json(&error, true))
 }
 
+/// A native `/generate` error's message, OpenAI type and status. Python's
+/// `/generate` sends no code (a ValueError, so a 400); an engine that sends one
+/// keeps its status, typed as `create_error_response` types it.
+fn engine_error_parts(error: GenerateStreamError) -> (String, String, u16) {
+    let error = error.error.unwrap_or_default();
+    let code = u16::try_from(error.code)
+        .ok()
+        .filter(|code| (400..600).contains(code))
+        .unwrap_or(400);
+    let err_type = match code {
+        400 => "BadRequestError".to_owned(),
+        _ => code.to_string(),
+    };
+    (error.message, err_type, code)
+}
+
 /// The OpenAI reply for a native `/generate` error.
 pub(super) fn engine_error_reply(error: GenerateStreamError) -> Reply {
-    error_reply(
-        &error.error.map(|error| error.message).unwrap_or_default(),
-        "BadRequestError",
-        400,
-    )
+    let (message, err_type, code) = engine_error_parts(error);
+    error_reply(&message, &err_type, code)
 }
 
 /// Python's answer when the engine output lacks what the OpenAI layer reads.
@@ -150,8 +163,8 @@ impl StreamState {
             return Err(engine_error_reply(error));
         }
         self.failed = true;
-        let message = error.error.map(|error| error.message).unwrap_or_default();
-        Ok(vec![stream_error_event(&message, "BadRequestError", 400)])
+        let (message, err_type, code) = engine_error_parts(error);
+        Ok(vec![stream_error_event(&message, &err_type, code)])
     }
 
     /// An abort or error just ended the stream; Python stops there, without

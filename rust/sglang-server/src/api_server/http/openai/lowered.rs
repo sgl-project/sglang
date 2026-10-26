@@ -397,6 +397,20 @@ mod tests {
         );
     }
 
+    /// A streamed failure before the first frame keeps its status too.
+    #[tokio::test]
+    async fn failed_stream_keeps_its_status() {
+        let body = json!({
+            "model": "model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true,
+        });
+        let app = lowered_state(|_| ResponseItem::Error(Error::Internal("boom".into())));
+        let response = post_json(app, "/v1/chat/completions", body).await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body_json(response).await["type"], "500");
+    }
+
     /// A template's detected toggle decides reasoning before the parser's
     /// default: one off by default answers in `content`.
     #[tokio::test]
