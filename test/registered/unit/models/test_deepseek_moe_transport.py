@@ -117,6 +117,15 @@ class TestOverlappedTransport(unittest.TestCase):
         )
         self.assertIsNot(buffers[("gh", 0)], buffers[("gh", 1)])
 
+    def test_a_micro_batch_empty_on_every_rank_runs_no_experts(self):
+        def experts(*args, **kwargs):
+            raise AssertionError("the experts ran on an empty micro-batch")
+
+        layer = SimpleNamespace(mlp=experts)
+        batch = SimpleNamespace(_tbo_global_input_ids=torch.empty(0, dtype=torch.long))
+        output = moe_transport._tbo_run_moe(layer, torch.empty(0, 3), batch, False)
+        self.assertEqual(tuple(output.shape), (0, 3))
+
 
 if __name__ == "__main__":
     unittest.main()

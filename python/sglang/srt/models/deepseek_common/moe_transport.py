@@ -443,6 +443,11 @@ class OverlappedMoeTransport(ComputeTransport):
 
 
 def _tbo_run_moe(layer, hidden, batch, do_shared_local):
+    if hidden.shape[0] == 0:
+        # Every DP rank gathers the same rows, so a micro-batch empty here is
+        # empty everywhere: no rank runs the experts, and no kernel is launched
+        # on zero rows.
+        return hidden
     global_ids = batch._tbo_global_input_ids
     with get_forward().scoped(mlp_reduce_scatter=True):
         return layer.mlp(
