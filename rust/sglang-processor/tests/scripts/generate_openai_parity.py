@@ -213,6 +213,7 @@ def lower(case, settings, model):
     tokenizer_manager = SimpleNamespace(
         tokenizer=model.tokenizer,
         server_args=server_args,
+        served_model_name=server_args.served_model_name,
         model_path=model.path,
         model_config=SimpleNamespace(
             hf_config=model.hf_config,
