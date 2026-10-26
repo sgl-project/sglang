@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import logging
 import os
+import socket
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import torch
@@ -143,6 +144,13 @@ class DWDPTransport:
                 dist.all_gather_object(all_fabric, fabric_handles, group=cpu_group)
             else:
                 all_fabric = None
+                hosts = [None] * layout.dwdp_size
+                dist.all_gather_object(hosts, socket.gethostname(), group=cpu_group)
+                if len(set(hosts)) > 1:
+                    raise RuntimeError(
+                        "DWDP POSIX fd exchange cannot reach ranks on other hosts; "
+                        "a multi-host DWDP group needs FABRIC handles"
+                    )
                 peer_fds = exchange_posix_fds(
                     cpu_group,
                     layout.dwdp_rank,

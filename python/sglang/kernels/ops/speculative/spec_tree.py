@@ -17,6 +17,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.platforms import current_platform
+from sglang.srt.platforms.interface import reject_out_of_tree_path
 from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_musa, is_npu, is_xpu
 
 _is_cuda = is_cuda()
@@ -422,6 +424,10 @@ def build_tree_kernel_efficient_func(
             tree_mask_mode,
         )
     else:
+        if not (_is_cuda or _is_hip or _is_musa):
+            reject_out_of_tree_path(
+                current_platform, subsystem="EAGLE tree construction"
+            )
         sgl_build_tree_kernel_efficient(
             parent_list,
             top_scores_index,
@@ -538,5 +544,9 @@ def verify_tree_greedy_func(
             retrieve_next_token=retrieve_next_token,
             retrieve_next_sibling=retrieve_next_sibling,
             target_predict=target_predict,
+        )
+    else:
+        reject_out_of_tree_path(
+            current_platform, subsystem="EAGLE greedy tree verification"
         )
     return predicts, accept_index, accept_token_num
