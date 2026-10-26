@@ -388,6 +388,47 @@ curl -sS -X GET "http://localhost:30010/v1/videos" \
   -H "Authorization: Bearer sk-proj-1234567890"
 ```
 
+**Retrieve a video**
+
+**Endpoint:** `GET /v1/videos/&#123;video_id&#125;`
+
+A job is `queued` until the scheduler starts it, then `in_progress`, then
+`completed` or `failed`. `progress` estimates denoising progress and stays below
+100 until the output is ready. Multiple denoising stages, including refinement,
+share the progress range equally. This is not an elapsed-time estimate or a
+measurement of GPU completion.
+
+Progress updates are best effort and never block generation. They currently
+support single-node, monolithic serving; other deployments may remain `queued`
+at 0 until completion. Job metadata is process-local and does not survive an
+HTTP server restart.
+
+When load balancing independent HTTP servers, route polling and content requests
+to the server that accepted the job. Scheduler DP replicas behind one HTTP server
+share its job store; independent HTTP servers do not. Restart recovery, durable
+job ownership, and queue admission limits require an external serving layer.
+
+An accepted job continues after the submitting client disconnects. For a bounded
+scheduler wait, set `--scheduler-rpc-timeout` in seconds; it includes queue time
+and generation. A timeout marks the job failed but does not cancel GPU work.
+Retrying creates another job, so clients should retain and poll the returned ID.
+Deleting a job removes its API record, but does not cancel GPU work or remove
+generated files. Manage output retention separately.
+
+**Python Example:**
+
+```python Python
+video = client.videos.retrieve(video_id)
+print(video.status, video.progress)
+```
+
+**Curl Example:**
+
+```bash curl
+curl -sS -X GET "http://localhost:30010/v1/videos/<VIDEO_ID>" \
+  -H "Authorization: Bearer sk-proj-1234567890"
+```
+
 **Download video content**
 
 **Endpoint:** `GET /v1/videos/&#123;video_id&#125;/content`
