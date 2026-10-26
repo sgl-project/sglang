@@ -60,7 +60,7 @@ TILE = {
 
 def kda_fp8_modules(value, fp8_gemm=True):
     with (
-        envs.SGLANG_OPT_GLM5_NEXT_KDA_FP8_MODULES.override(value),
+        envs.SGLANG_OPT_GLM53_KDA_PTPC_MODULES.override(value),
         patch.object(glm5_next, "cutlass_fp8_supported", return_value=fp8_gemm),
     ):
         return glm5_next._kda_fp8_modules()
@@ -258,7 +258,7 @@ class TestKdaFp8Wiring(CustomTestCase):
 
     def build(self, modules, quant_config=None):
         with (
-            envs.SGLANG_OPT_GLM5_NEXT_KDA_FP8_MODULES.override(modules),
+            envs.SGLANG_OPT_GLM53_KDA_PTPC_MODULES.override(modules),
             patch.object(glm5_next, "cutlass_fp8_supported", return_value=True),
         ):
             return glm5_next.Glm5NextLinearAttention(

@@ -166,24 +166,24 @@ _KDA_FP8_MODULES = _KDA_FP8_INPUT_MODULES | {"o_proj"}
 
 
 def _kda_fp8_modules() -> frozenset:
-    modules = frozenset(envs.SGLANG_OPT_GLM5_NEXT_KDA_FP8_MODULES.get())
+    modules = frozenset(envs.SGLANG_OPT_GLM53_KDA_PTPC_MODULES.get())
     if unknown := modules - _KDA_FP8_MODULES:
         raise ValueError(
-            f"Unknown SGLANG_OPT_GLM5_NEXT_KDA_FP8_MODULES modules {sorted(unknown)}; "
+            f"Unknown SGLANG_OPT_GLM53_KDA_PTPC_MODULES modules {sorted(unknown)}; "
             f"supported: {sorted(_KDA_FP8_MODULES)}"
         )
     if modules & _KDA_FP8_INPUT_MODULES not in (frozenset(), _KDA_FP8_INPUT_MODULES):
         raise ValueError(
-            "SGLANG_OPT_GLM5_NEXT_KDA_FP8_MODULES must select qkv_proj, f_a_proj "
+            "SGLANG_OPT_GLM53_KDA_PTPC_MODULES must select qkv_proj, f_a_proj "
             "and g_a_proj together"
         )
     if modules and not cutlass_fp8_supported():
         raise ValueError(
-            "SGLANG_OPT_GLM5_NEXT_KDA_FP8_MODULES requires a CUDA GPU with FP8 GEMMs (SM89+)"
+            "SGLANG_OPT_GLM53_KDA_PTPC_MODULES requires a CUDA GPU with FP8 GEMMs (SM89+)"
         )
     if modules and envs.SGLANG_FORCE_FP8_MARLIN.get():
         raise ValueError(
-            "SGLANG_OPT_GLM5_NEXT_KDA_FP8_MODULES runs FP8 GEMMs; unset SGLANG_FORCE_FP8_MARLIN"
+            "SGLANG_OPT_GLM53_KDA_PTPC_MODULES runs FP8 GEMMs; unset SGLANG_FORCE_FP8_MARLIN"
         )
     return modules
 
@@ -228,7 +228,7 @@ class _KdaFp8LinearMethod(Fp8LinearMethod):
         torch.cuda.empty_cache()
         layer._derived_weight_cache_error = (
             "Online weight updates are not supported with "
-            "SGLANG_OPT_GLM5_NEXT_KDA_FP8_MODULES: the KDA projections are quantized at load."
+            "SGLANG_OPT_GLM53_KDA_PTPC_MODULES: the KDA projections are quantized at load."
         )
         # The cases where apply_fp8_linear takes its dynamic per-token CUTLASS path;
         # it also needs K % 16 == 0 (N is padded above).
@@ -586,7 +586,7 @@ class Glm5NextLinearAttention(nn.Module):
         fp8_input_proj = _KDA_FP8_INPUT_MODULES <= fp8_modules
         if fp8_input_proj and not self.do_fuse_qkvbfg:
             raise ValueError(
-                "SGLANG_OPT_GLM5_NEXT_KDA_FP8_MODULES=qkv_proj,f_a_proj,g_a_proj needs "
+                "SGLANG_OPT_GLM53_KDA_PTPC_MODULES=qkv_proj,f_a_proj,g_a_proj needs "
                 "the fused [q|k|v|b|f_a|g_a] projection (BF16 checkpoint projections, no LoRA)"
             )
         if (
@@ -595,7 +595,7 @@ class Glm5NextLinearAttention(nn.Module):
             and not quant_config.is_linear_unquantized(f"{prefix}.o_proj")
         ):
             raise ValueError(
-                "SGLANG_OPT_GLM5_NEXT_KDA_FP8_MODULES=o_proj needs a BF16 o_proj in the checkpoint"
+                "SGLANG_OPT_GLM53_KDA_PTPC_MODULES=o_proj needs a BF16 o_proj in the checkpoint"
             )
         # The checkpoint keeps these projections BF16; quantize them on load.
         fp8_online_config = (

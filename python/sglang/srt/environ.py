@@ -1104,7 +1104,7 @@ class Envs:
     # GLM-5.3-Flash on CUDA: quantize the checkpoint's BF16 KDA projections to FP8
     # on load (per-channel weights, per-token activations). Any of o_proj and the
     # fused input projection qkv_proj, f_a_proj, g_a_proj (together; b_proj rides along).
-    SGLANG_OPT_GLM5_NEXT_KDA_FP8_MODULES = EnvTuple(tuple())
+    SGLANG_OPT_GLM53_KDA_PTPC_MODULES = EnvTuple(tuple())
     SGLANG_QUANT_ALLOW_DOWNCASTING = EnvBool(False)
     # HIP: convert only MXFP8 dense linears to block-fp8; fused MoE stays MX 1x32,
     # since the block-scale MoE kernel lacks SwiGLU-OAI
