@@ -34,6 +34,7 @@ from sglang.srt.layers.attention.qsa.metadata import (
     compressed_decode_view,
 )
 from sglang.srt.layers.attention.qsa.sparse_attn import (
+    _get_fp8_chunk_pack_dtype,
     pack_qsa_prefill_kv,
     qwen_sparse_fa2_cu_seqlens_triton,
     qwen_sparse_kv_extraction_compact_triton,
@@ -1540,15 +1541,27 @@ class QwenSparseAttnBackend(AttentionBackend):
             sequence_lens, dtype=torch.int32, device=q.device
         )
         cu_seqlens_k = F.pad(sequence_lens_tensor.cumsum(0), (1, 0)).contiguous()
+        k_buffer = pool.get_key_buffer(layer.layer_id)
+        v_buffer = pool.get_value_buffer(layer.layer_id)
+        pack_dtype = _get_fp8_chunk_pack_dtype(
+            torch.cuda.get_device_name(q.device),
+            q.shape[0],
+            len(sequence_lens),
+            k_buffer.dtype,
+            q.dtype,
+            q.shape[-1],
+            q.shape[1] // k_buffer.shape[1],
+            topk_indices.shape[-1],
+        )
         packed_k, packed_v = pack_qsa_prefill_kv(
-            k=pool.get_key_buffer(layer.layer_id),
-            v=pool.get_value_buffer(layer.layer_id),
+            k=k_buffer,
+            v=v_buffer,
             req_to_token=self.req_to_token_pool.req_to_token,
             req_indices=forward_batch.req_pool_indices,
             cu_k=cu_seqlens_k,
             total_k=sum(sequence_lens),
             max_k=max(sequence_lens, default=1),
-            output_dtype=q.dtype,
+            output_dtype=pack_dtype,
         )
         output = sparse_gqa_fwd_interface_triton_ck(
             q.contiguous(),

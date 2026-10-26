@@ -1,6 +1,6 @@
 """Validated sparse GQA operators migrated from the QSA reference branch."""
 
-from typing import Optional
+from typing import NamedTuple, Optional
 
 import torch
 import triton
@@ -23,11 +23,83 @@ _L20_CONFIGS = [
 ]
 
 
+class _FP8ChunkPipelineConfig(NamedTuple):
+    block_n: int
+
+
+_VALIDATED_FP8_CHUNK_PIPELINE_CONFIGS = {
+    "H20": _FP8ChunkPipelineConfig(block_n=32),
+}
+
+
 def _get_best_config(total_q: int):
     if is_batch_invariant_mode_enabled():
         return (32, 4, 2)
     table = _H20_CONFIGS if "H20" in torch.cuda.get_device_name(0) else _L20_CONFIGS
     return next(cfg for limit, cfg in table if total_q <= limit)
+
+
+def _is_fp8_chunk_pipeline_eligible(
+    total_q: int,
+    num_requests: int,
+    kv_dtype: torch.dtype,
+    head_dim: int,
+    group_size: int,
+    topk: int,
+) -> bool:
+    return (
+        num_requests > 0
+        and total_q >= 4096 * num_requests
+        and kv_dtype == torch.float8_e4m3fn
+        and head_dim == 256
+        and 1 <= group_size <= 12
+        and topk >= 1024
+    )
+
+
+def _get_fp8_chunk_pipeline_config(
+    device_name: str,
+    total_q: int,
+    num_requests: int,
+    kv_dtype: torch.dtype,
+    head_dim: int,
+    group_size: int,
+    topk: int,
+) -> _FP8ChunkPipelineConfig | None:
+    if not _is_fp8_chunk_pipeline_eligible(
+        total_q, num_requests, kv_dtype, head_dim, group_size, topk
+    ):
+        return None
+    return next(
+        (
+            config
+            for device, config in _VALIDATED_FP8_CHUNK_PIPELINE_CONFIGS.items()
+            if device in device_name
+        ),
+        None,
+    )
+
+
+def _get_fp8_chunk_pack_dtype(
+    device_name: str,
+    total_q: int,
+    num_requests: int,
+    kv_dtype: torch.dtype,
+    q_dtype: torch.dtype,
+    head_dim: int,
+    group_size: int,
+    topk: int,
+) -> torch.dtype:
+    config = _get_fp8_chunk_pipeline_config(
+        device_name,
+        total_q,
+        num_requests,
+        kv_dtype,
+        head_dim,
+        group_size,
+        topk,
+    )
+    return kv_dtype if config is not None else q_dtype
 
 
 @triton.jit
@@ -200,6 +272,7 @@ def _sparse_gqa_chunk_prefill(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     HEAD_DIM: tl.constexpr,
+    USE_FP8_PIPELINE: tl.constexpr,
 ):
     query_relative = tl.program_id(0).to(tl.int64)
     batch_group = tl.program_id(1)
@@ -226,6 +299,10 @@ def _sparse_gqa_chunk_prefill(
         other=0.0,
     )
     q_values = (q_values * scale * 1.4426950408).to(q_values.dtype)
+    if USE_FP8_PIPELINE:
+        q_absmax = tl.max(tl.abs(q_values), axis=1)
+        q_scale = tl.where(q_absmax > 0, q_absmax / 448.0, 1.0)
+        q_values_fp8 = (q_values / q_scale[:, None]).to(tl.float8e4nv)
     k_base = k + k_start * sk_n + group * sk_h
     v_base = v + k_start * sv_n + group * sv_h
     idx_row = indices + query * si_m + group * si_g
@@ -247,11 +324,21 @@ def _sparse_gqa_chunk_prefill(
             mask=valid[:, None],
             other=0.0,
         )
-        # Direct callers can pass FP8 K/V; production packing uses Q's dtype.
-        # QSA stores unscaled K/V, so a plain cast supports both callers.
-        keys = keys.to(q_values.dtype)
-        values = values.to(q_values.dtype)
-        scores = tl.where(valid[None, :], tl.dot(q_values, keys), -float("inf"))
+        # The FP8 operand path avoids explicit full-tile widening before the
+        # dot operations. Device-specific tuning policy decides whether this
+        # general kernel mechanism is enabled for a workload.
+        if USE_FP8_PIPELINE:
+            scores = tl.where(
+                valid[None, :],
+                tl.dot(q_values_fp8, keys) * q_scale[:, None],
+                -float("inf"),
+            )
+        else:
+            # Direct callers can pass FP8 K/V; production packing uses Q's
+            # dtype unless this FP8 pipeline is selected.
+            keys = keys.to(q_values.dtype)
+            values = values.to(q_values.dtype)
+            scores = tl.where(valid[None, :], tl.dot(q_values, keys), -float("inf"))
         next_max = tl.maximum(max_value, tl.max(scores, 1))
         alpha = tl.math.exp2(max_value - next_max)
         probabilities = tl.math.exp2(scores - next_max[:, None])
@@ -382,6 +469,18 @@ def sparse_gqa_fwd_interface_triton_ck(
         max_q = int((cu_q[1:] - cu_q[:-1]).max().item())
     block_m = max(16, triton.next_power_of_2(group_size))
     block_n, warps, stages = _get_best_config(total_q)
+    fp8_pipeline_config = _get_fp8_chunk_pipeline_config(
+        torch.cuda.get_device_name(q.device),
+        total_q,
+        cu_q.shape[0] - 1,
+        k.dtype,
+        head_dim,
+        group_size,
+        indices.shape[-1],
+    )
+    use_fp8_pipeline = fp8_pipeline_config is not None
+    if fp8_pipeline_config is not None:
+        block_n = fp8_pipeline_config.block_n
     out = torch.empty_like(q)
     _sparse_gqa_chunk_prefill[(max_q, (cu_q.shape[0] - 1) * num_kv_heads)](
         q,
@@ -414,6 +513,7 @@ def sparse_gqa_fwd_interface_triton_ck(
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         HEAD_DIM=head_dim,
+        USE_FP8_PIPELINE=use_fp8_pipeline,
         num_warps=warps,
         num_stages=stages,
     )
@@ -466,6 +566,7 @@ def sparse_gqa_packed_decode_triton(q, k, v, indices, cu_q, cu_k, kv_lens, scale
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         HEAD_DIM=head_dim,
+        USE_FP8_PIPELINE=False,
         num_warps=warps,
         num_stages=stages,
     )
