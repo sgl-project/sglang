@@ -36,6 +36,10 @@ from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dp_spec_prefill_coordination import (
     DPSpecPrefillCoordinationPlan,
 )
+from sglang.srt.speculative.draft_parallel import (
+    model_draft_parallel_spec,
+    resolve_draft_parallel_layout,
+)
 from sglang.srt.speculative.draft_worker_common import (
     build_block_pos_offsets,
     build_draft_tp_worker,
@@ -191,8 +195,12 @@ class DSparkWorkerV2(BaseSpecWorker):
             return
 
         self._draft_is_moe = draft_is_deepseek_v4()
-        self._draft_dp_context_enabled = (
-            get_parallel().attn_dp_enabled and not self._draft_is_moe
+        self.draft_parallel_layout = resolve_draft_parallel_layout(
+            model_draft_parallel_spec(
+                target_worker.model_runner.spec_aux_config.draft_model_config,
+                spec_algorithm=target_worker.model_runner.spec_algorithm,
+                dspark_is_moe=self._draft_is_moe,
+            )
         )
         self._is_pd_prefill = get_disagg().disaggregation_mode == "prefill"
         self._decode_graph_allowed = (
@@ -263,9 +271,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         parallel = get_parallel()
         self._tp_sync = SpecTpSync(get_dp_tp_group())
         self._draft_graph_group = (
-            parallel.attn_tp_group
-            if self._draft_dp_context_enabled
-            else parallel.tp_group
+            self.draft_parallel_layout.tp_group or parallel.tp_group
         )
 
         if get_parallel().tp_rank == 0:
@@ -539,7 +545,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         return getattr(self.target_worker, name)
 
     def _draft_context(self):
-        return draft_tp_context(self._draft_dp_context_enabled)
+        return draft_tp_context(self.draft_parallel_layout)
 
     def alloc_memory_pool(
         self,
@@ -793,7 +799,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             batch,
             "draft",
             rank,
-            local_only=target_local_only or self._draft_dp_context_enabled,
+            local_only=target_local_only or self.draft_parallel_layout.local_dp,
         )
         with self._draft_context():
             self._proposer.run_idle_participation(batch)
@@ -984,7 +990,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 batch,
                 "draft",
                 rank,
-                local_only=target_local_only or self._draft_dp_context_enabled,
+                local_only=target_local_only or self.draft_parallel_layout.local_dp,
             )
 
         if batch.forward_mode.is_idle():
