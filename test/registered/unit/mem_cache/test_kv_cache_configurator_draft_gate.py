@@ -238,7 +238,7 @@ class TestDraftBindingDispatch(CustomTestCase):
         cfg.spec_algorithm = algorithm
         cfg.page_size = _PS
         cfg.is_hybrid_swa = False
-        cfg.is_hybrid_swa_mtp_draft = False
+        cfg.draft_owns_its_depth = False
         cfg.model = object()
         cfg.model_config = SimpleNamespace(hf_config=None, is_hybrid_swa=False)
         sizes = kcc._PoolSizes(

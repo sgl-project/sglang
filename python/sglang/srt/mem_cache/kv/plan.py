@@ -27,6 +27,16 @@ from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
 from sglang.srt.mem_cache.layout.fused_draft import FusedDraftPlacement
 
+# The one chain whose builder resizes the buffer after CUDA graph capture.
+_RESIZED_AFTER_CAPTURE = frozenset({FullLifetime, WindowLifetime})
+
+
+def resized_after_capture(lifetime_types: frozenset) -> bool:
+    """Whether the unified pool of a plan with these lifetimes can resize its
+    buffer after CUDA graph capture."""
+    return lifetime_types == _RESIZED_AFTER_CAPTURE
+
+
 # Sub-pool names are external: HiCache keys, PD state types and the draft
 # placement name sub-pools by them.
 _SUB_POOL_NAMES: Dict[Type, str] = {

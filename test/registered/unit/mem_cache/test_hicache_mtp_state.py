@@ -82,7 +82,7 @@ def test_inkling_checkpoint_packs_every_draft_pool(monkeypatch, tmp_path, local_
             draft_model_idx=depth,
         )
         assert layer_info.num_effective_layers == 1
-        assert layer_info.is_hybrid_swa_mtp_draft
+        assert layer_info.draft_owns_its_depth
         assert layer_info.swa_attention_layer_ids == (
             [depth] if depth in local_drafts else []
         )

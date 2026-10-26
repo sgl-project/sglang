@@ -353,7 +353,7 @@ class KVCacheConfigurator:
     kv_shard_size: int = field(init=False)
     kv_shard_spec: Optional[PageShardSpec] = field(init=False)
     kv_shard_group: Optional[GroupCoordinator] = field(init=False)
-    is_hybrid_swa_mtp_draft: bool = field(init=False)
+    draft_owns_its_depth: bool = field(init=False)
     draft_swa_full_capacity: bool = field(init=False)
 
     @property
@@ -379,8 +379,8 @@ class KVCacheConfigurator:
         self.hybrid_gdn_config = hybrid_gdn_config(self.model_config)
         self.hybrid_kda_config = hybrid_kda_config(self.model_config)
         self._resolve_kv_shard()
-        self.is_hybrid_swa_mtp_draft = self.layer_info.is_hybrid_swa_mtp_draft
-        self.draft_swa_full_capacity = self.is_hybrid_swa_mtp_draft and bool(
+        self.draft_owns_its_depth = self.layer_info.draft_owns_its_depth
+        self.draft_swa_full_capacity = self.draft_owns_its_depth and bool(
             self.layer_info.swa_attention_layer_ids
         )
 
@@ -687,7 +687,7 @@ class KVCacheConfigurator:
                 }
                 if token_to_kv_pool_allocator.has_window_pool and self.is_hybrid_swa:
                     size_overrides["full_max_total_num_tokens"] = draft_virtual_id_space
-                    if not self.is_hybrid_swa_mtp_draft or self.draft_swa_full_capacity:
+                    if not self.draft_owns_its_depth or self.draft_swa_full_capacity:
                         size_overrides["swa_max_total_num_tokens"] = (
                             draft_virtual_id_space
                         )
@@ -716,7 +716,7 @@ class KVCacheConfigurator:
             # Each multi-layer EAGLE MTP head owns one transformer block at
             # layer_id=draft_model_idx and needs its own sconv/mamba cache while
             # sharing the target's request-to-token mapping.
-            if self.is_hybrid_swa_mtp_draft and isinstance(
+            if self.draft_owns_its_depth and isinstance(
                 req_to_token_pool, HybridReqToTokenPool
             ):
                 # speculative_num_draft_tokens=None: draft heads never run
@@ -2793,7 +2793,7 @@ class KVCacheConfigurator:
                 assert swa_allocator.has_window_pool
                 uses_unified_virtual_ids = swa_allocator.hands_out_virtual_ids
                 has_draft_swa_layers = (
-                    not self.is_hybrid_swa_mtp_draft or self.draft_swa_full_capacity
+                    not self.draft_owns_its_depth or self.draft_swa_full_capacity
                 )
                 if self.draft_swa_full_capacity or (
                     uses_unified_virtual_ids and has_draft_swa_layers
