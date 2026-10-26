@@ -36,7 +36,7 @@ class TestPPUCISuite(CustomTestCase):
             list((RUNNER.parent / "registered").rglob("test_ppu_ci_*.py")), []
         )
 
-    def test_ppu_suite_contains_both_speculative_sanity_files(self):
+    def test_ppu_suite_contains_speculative_and_mla_model_sanity_files(self):
         registered = RUNNER.parent / "registered"
         files = [
             str(path)
@@ -56,10 +56,14 @@ class TestPPUCISuite(CustomTestCase):
                 Path(test.filename).relative_to(registered).as_posix()
                 for test in ppu_tests
             ],
-            ["core/test_basic_sanity_eagle3.py", "core/test_basic_sanity_dflash.py"],
+            [
+                "core/test_basic_sanity_eagle3.py",
+                "core/test_basic_sanity_dflash.py",
+                "ppu/test_sail_mla_backends.py",
+            ],
         )
 
-    def test_runtime_requires_both_sanity_files_to_pass(self):
+    def test_runtime_requires_every_sanity_file_to_pass(self):
         source = Path(__file__).with_name("build_and_test.sh").read_text()
         marker = 'cd "$artifacts"\n'
         self.assertIn(marker, source)
@@ -80,13 +84,13 @@ class TestPPUCISuite(CustomTestCase):
                 "sys.exit(int(os.environ['FIXTURE_EXIT']))\n"
             )
             for summary, exit_code, expected in (
-                ("Test Summary: 2/2 passed", 0, 0),
+                ("Test Summary: 3/3 passed", 0, 0),
                 ("Test Summary: 0/0 passed", 0, 1),
                 ("Test Summary: 1/1 passed", 0, 1),
                 ("Test Summary: 1/2 passed", 0, 1),
-                ("Test Summary: 3/3 passed", 0, 1),
-                ("Test Summary: 2/2 passed", 7, 7),
-                ("Test Summary: 2/2 passed (incomplete)", 0, 1),
+                ("Test Summary: 4/4 passed", 0, 1),
+                ("Test Summary: 3/3 passed", 7, 7),
+                ("Test Summary: 3/3 passed (incomplete)", 0, 1),
                 ("", 0, 1),
             ):
                 with self.subTest(summary=summary, exit_code=exit_code):
