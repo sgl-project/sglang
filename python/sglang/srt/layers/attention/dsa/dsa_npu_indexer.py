@@ -234,9 +234,6 @@ class DSANPUIndexerMixin:
             )
         pool = get_token_to_kv_pool()
         use_quant_indexer = pool.index_k_scale_buffer is not None
-        # EAGLE topk>1: the tree path scores the (tiny) draft block with the
-        # pre-quantised index key, so keep a bf16 reference before quantisation.
-        k_for_tree = k
         if use_quant_indexer:
             k, k_scale = _quantize_npu_indexer_activation(
                 k, pool.indexer_hadamard_128, pool.dtype
@@ -317,7 +314,6 @@ class DSANPUIndexerMixin:
                 return self._build_tree_topk_indices(
                     q=q,
                     weights=weights,
-                    k_bf16=k_for_tree,
                     pool=pool,
                     layer_id=layer_id,
                     block_table=block_table,
@@ -435,7 +431,6 @@ class DSANPUIndexerMixin:
         *,
         q: torch.Tensor,
         weights: torch.Tensor,
-        k_bf16: torch.Tensor,
         pool,
         layer_id: int,
         block_table: torch.Tensor,
@@ -446,14 +441,15 @@ class DSANPUIndexerMixin:
     ) -> torch.Tensor:
         """Sparse indices that respect the EAGLE draft-tree topology.
 
-        ``row_r = [ ancestors(r) | prefix top-(K-A) | -1 padding ]`` — see
+        ``row_r = [ ancestors(r) | prefix top-* | -1 padding ]``: see
         ``hardware_backend/npu/attention/tree_sparse_indices.py`` for why the
         order matters (SFA truncates the tail under its causal budget, and
-        ``-1`` terminates the scan).
+        ``-1`` terminates the scan) and why no position may repeat (SFA does
+        not deduplicate, so a repeated position double-counts in the softmax).
         """
         from sglang.srt.hardware_backend.npu.attention.tree_sparse_indices import (
             ancestor_width_for,
-            draft_ancestor_ids_batched,
+            draft_ancestors,
             gather_tree_blocks,
             merge_tree_sparse_indices,
         )
@@ -469,7 +465,6 @@ class DSANPUIndexerMixin:
             raise ValueError(
                 f"tree verify geometry mismatch: total_tokens={total}, N={n}"
             )
-        bs = total // n
 
         topk = int(self.index_topk)
         steps = int(
@@ -521,32 +516,17 @@ class DSANPUIndexerMixin:
                 "(score vs position) must be settled before truncating"
             )
 
-        # (2) score the draft block only: N <= 64 nodes, so this stays tiny.
-        q_tree = q.reshape(bs, n, self.n_heads, self.head_dim).float()
-        k_tree = (
-            k_bf16.reshape(total, self.head_dim)
-            .view(bs, n, self.head_dim)
-            .float()
-        )
-        w_tree = weights.reshape(bs, n, self.n_heads).float()
-
-        scores = torch.empty((bs, n, n), dtype=torch.float32, device=q.device)
-        chunk = max(1, min(bs, 8))
-        for start in range(0, bs, chunk):
-            end = min(start + chunk, bs)
-            dots = torch.einsum(
-                "bthd,bjd->bthj", q_tree[start:end], k_tree[start:end]
-            )
-            scores[start:end] = (
-                dots.relu() * w_tree[start:end].unsqueeze(-1)
-            ).sum(dim=-2)
-            del dots
-
-        # (3) ancestors from the mask the tree kernel already produced.
+        # (2) The tree topology is already in the mask the tree kernel wrote: a
+        # row's visible set is exactly {self} | ancestors, of size depth + 1,
+        # which never exceeds A = num_steps + 1. Nothing has to be ranked, so
+        # read it and let the merge shift the prefix block per row. Ranking was
+        # both unnecessary and impossible to pad safely: padding the unused
+        # reserved slots with the node itself repeats a KV position, and SFA
+        # reads the list verbatim.
         visible_blocks = gather_tree_blocks(spec.custom_mask, prefix_lens, n)
-        ancestor_ids = draft_ancestor_ids_batched(scores, visible_blocks, a)
+        ancestor_ids = draft_ancestors(visible_blocks, a)
 
-        # (4) ancestors first, then the prefix block (no sorting).
+        # (3) ancestors first, then the prefix block shifted per row.
         return merge_tree_sparse_indices(
             prefix_idx,
             ancestor_ids.reshape(total, -1),

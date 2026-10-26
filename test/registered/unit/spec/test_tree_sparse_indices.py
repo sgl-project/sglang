@@ -4,15 +4,19 @@ On Ascend, DSA visibility is not expressed by a mask: each query row gets an
 explicit list of KV positions (`sparse_indices[T, K]`) that
 `torch_npu.npu_sparse_flash_attention` may read. For tree verify the list must be
 
-    row_r = [ ancestors(r) | prefix top-(K-A) | -1 padding ]
+    row_r = [ ancestors(r) | prefix top-* (score order) | -1 padding ]
 
 and the ORDER matters:
 
-* ancestors come first because `sparse_mode=3` only reads
-  ``min(K, Lkv - Lq + i + 1)`` slots per row (short contexts truncate the tail);
+* ancestors come first because `sparse_mode=3` bounds a row to
+  `min(K, L_kv - L_q + i + 1)` entries (short contexts truncate the tail);
 * ``-1`` terminates the scan, so it may only appear in the tail;
 * SFA does not require ascending order (its own tests feed randperm), and sorting
-  would push ancestors (larger positions) into the truncated tail.
+  would push ancestors (larger positions) into the truncated tail;
+* **no position may repeat**: the kernel has no uniqueness check
+  (`sparse_flash_attention_kernel_mla.h` only stops at ``-1``) and
+  `sparse_block_size=1`, so a duplicate is read twice and double-counts in the
+  softmax.
 
 These tests run on CPU with plain torch.
 """
@@ -26,7 +30,7 @@ import torch
 try:  # normal path (Linux CI, sglang installed / PYTHONPATH=python)
     from sglang.srt.hardware_backend.npu.attention.tree_sparse_indices import (
         ancestor_width_for,
-        draft_ancestor_ids_batched,
+        draft_ancestors,
         gather_tree_blocks,
         merge_tree_sparse_indices,
     )
@@ -45,7 +49,7 @@ except Exception:  # Windows dev boxes cannot import sglang (stdlib `resource`)
     _mod = importlib.util.module_from_spec(_spec)
     _spec.loader.exec_module(_mod)
     ancestor_width_for = _mod.ancestor_width_for
-    draft_ancestor_ids_batched = _mod.draft_ancestor_ids_batched
+    draft_ancestors = _mod.draft_ancestors
     gather_tree_blocks = _mod.gather_tree_blocks
     merge_tree_sparse_indices = _mod.merge_tree_sparse_indices
 
@@ -88,9 +92,15 @@ def _make_full_mask(blocks, prefix_lens, num_nodes):
     return torch.cat(rows).contiguous()
 
 
-def _scores_from_allowed(allowed):
-    torch.manual_seed(0)
-    return torch.rand(allowed.shape).masked_fill(~allowed, float("-inf"))
+def _ancestor_ids(allowed, ancestor_width):
+    return draft_ancestors(allowed.unsqueeze(0), ancestor_width)[0]
+
+
+def _prefix_rows(num_rows, width, prefix_len):
+    """Distinct, descending positions so ordering is observable."""
+    return (
+        torch.arange(width, dtype=torch.int32).flip(0) % max(prefix_len, 1)
+    ).repeat(num_rows, 1)
 
 
 class TestAncestorWidth(unittest.TestCase):
@@ -130,95 +140,184 @@ class TestGatherTreeBlocks(unittest.TestCase):
             gather_tree_blocks(flat, torch.tensor([4]), 7)
 
 
-class TestDraftAncestorIds(unittest.TestCase):
-    def test_only_allowed_and_self_present(self):
+class TestDraftAncestors(unittest.TestCase):
+    def test_ascending_and_padded_with_negative_one(self):
         num_nodes = 7
         allowed = _visibility_from_parents(TREE_PARENTS, num_nodes)
-        scores = _scores_from_allowed(allowed)
 
-        got = draft_ancestor_ids_batched(scores.unsqueeze(0), allowed.unsqueeze(0), 3)
+        got = _ancestor_ids(allowed, 4)
 
-        self.assertEqual(tuple(got.shape), (1, num_nodes, 3))
+        self.assertEqual(tuple(got.shape), (num_nodes, 4))
         self.assertEqual(got.dtype, torch.int32)
         for row in range(num_nodes):
-            self.assertIn(row, got[0, row].tolist(), "self must be present")
-            for col in got[0, row].tolist():
-                self.assertTrue(bool(allowed[row, col]), f"row {row} picked {col}")
+            ids = got[row].tolist()
+            valid = [v for v in ids if v >= 0]
+            self.assertEqual(valid, sorted(valid), f"row {row} must ascend")
+            self.assertIn(row, valid, "self must be present")
+            for v in valid:
+                self.assertTrue(bool(allowed[row, v]), f"row {row} picked {v}")
+            # Padding is -1 and strictly in the tail.
+            self.assertEqual(ids[: len(valid)] + [-1] * (len(ids) - len(valid)), ids)
+
+    def test_shallow_node_pads_with_negative_one_not_self(self):
+        """A shallow node must not repeat itself: a repeat is a double-count."""
+        allowed = _visibility_from_parents(TREE_PARENTS, 7)
+
+        got = _ancestor_ids(allowed, 4)
+
+        # Node 0 is the root: only itself is visible.
+        self.assertEqual(got[0].tolist(), [0, -1, -1, -1])
+        # Node 1 sits at depth 1: self + root.
+        self.assertEqual(got[1].tolist(), [0, 1, -1, -1])
+        # Node 3 is a leaf at depth 2: the whole reserved width fits.
+        self.assertEqual(got[3].tolist(), [0, 1, 3, -1])
 
     def test_width_clamped(self):
         num_nodes = 3
         allowed = _visibility_from_parents([-1, 0, 1], num_nodes)
-        scores = _scores_from_allowed(allowed)
-        got = draft_ancestor_ids_batched(scores.unsqueeze(0), allowed.unsqueeze(0), 99)
-        self.assertEqual(tuple(got.shape), (1, num_nodes, num_nodes))
+        got = _ancestor_ids(allowed, 99)
+        self.assertEqual(tuple(got.shape), (num_nodes, num_nodes))
 
-    def test_root_gets_all_self_slots(self):
+    def test_non_square_mask_raises(self):
+        with self.assertRaises(ValueError):
+            draft_ancestors(torch.zeros((1, 4, 5), dtype=torch.bool), 2)
+
+    def test_more_visible_than_reserved_raises(self):
+        """A 7-deep chain does not fit num_steps=3: fail loudly, never drop an
+        ancestor silently."""
+        allowed = _visibility_from_parents(CHAIN_PARENTS, 7)
+        with self.assertRaises(ValueError):
+            draft_ancestors(allowed.unsqueeze(0), 4)
+
+    def test_missing_self_raises_at_merge(self):
         allowed = _visibility_from_parents(TREE_PARENTS, 7)
-        scores = _scores_from_allowed(allowed)
-        got = draft_ancestor_ids_batched(scores.unsqueeze(0), allowed.unsqueeze(0), 3)
-        self.assertEqual(got[0, 0].tolist(), [0, 0, 0])
+        ids = _ancestor_ids(allowed, 4)
+        ids[2] = -1  # row without any visible draft node
+        with self.assertRaises(ValueError):
+            merge_tree_sparse_indices(
+                torch.zeros((7, 12), dtype=torch.int32),
+                ids,
+                torch.tensor([16], dtype=torch.int32),
+                7,
+                16,
+            )
 
 
 class TestMergeTreeSparseIndices(unittest.TestCase):
-    def _draft(self, num_nodes, seq_len, ancestor_width, parents=TREE_PARENTS):
+    def _merged(
+        self, num_nodes, prefix_len, topk, ancestor_width, parents=TREE_PARENTS
+    ):
         allowed = _visibility_from_parents(parents, num_nodes)
-        scores = _scores_from_allowed(allowed)
-        return draft_ancestor_ids_batched(
-            scores.unsqueeze(0), allowed.unsqueeze(0), ancestor_width
-        )[0]
+        ids = _ancestor_ids(allowed, ancestor_width)
+        prefix = _prefix_rows(num_nodes, topk - ancestor_width, prefix_len)
+        return merge_tree_sparse_indices(
+            prefix, ids, torch.tensor([prefix_len], dtype=torch.int32), num_nodes, topk
+        )
 
     def test_ancestors_lead_and_prefix_follows(self):
-        num_nodes, topk, a = 7, 16, 3
-        seq_lens = torch.tensor([4], dtype=torch.int32)
-        draft = self._draft(num_nodes, 4, a)
-        prefix = (torch.arange(topk - a, dtype=torch.int32) % 4).repeat(num_nodes, 1)
+        num_nodes, topk, a, prefix_len = 7, 16, 4, 12
+        allowed = _visibility_from_parents(TREE_PARENTS, num_nodes)
+        ids = _ancestor_ids(allowed, a)
+        prefix = _prefix_rows(num_nodes, topk - a, prefix_len)
 
-        merged = merge_tree_sparse_indices(prefix, draft, seq_lens, num_nodes, topk)
+        merged = merge_tree_sparse_indices(
+            prefix, ids, torch.tensor([prefix_len], dtype=torch.int32), num_nodes, topk
+        )
 
         self.assertEqual(tuple(merged.shape), (num_nodes, topk))
         self.assertEqual(merged.dtype, torch.int32)
-        # Ancestors occupy the leading slots, as absolute KV positions.
         for row in range(num_nodes):
-            self.assertEqual(merged[row, :a].tolist(), (draft[row] + 4).tolist())
-            # Prefix entries keep score order and are < P.
-            self.assertTrue(torch.equal(merged[row, a:], prefix[row]))
+            valid = [v for v in ids[row].tolist() if v >= 0]
+            self.assertEqual(
+                merged[row, : len(valid)].tolist(),
+                [prefix_len + v for v in valid],
+                f"row {row} ancestors",
+            )
+            # The prefix block follows intact, in score order, shifted per row.
+            self.assertTrue(
+                torch.equal(merged[row, len(valid) : len(valid) + prefix.shape[1]],
+                            prefix[row]),
+                f"row {row} prefix",
+            )
 
-    def test_no_sorting_of_prefix(self):
-        """SFA does not require ascending order; sorting would reorder ancestors."""
-        num_nodes, topk, a = 4, 8, 4
-        seq_lens = torch.tensor([9], dtype=torch.int32)
-        draft = self._draft(num_nodes, 9, a, parents=CHAIN_PARENTS[:4])
-        # Deliberately descending prefix scores -> descending indices.
-        prefix = torch.tensor([[3, 2, 1, 0]], dtype=torch.int32).repeat(num_nodes, 1)
+    def test_no_duplicate_kv_positions(self):
+        """Regression: SFA has no dedup, so a repeated position double-counts.
 
-        merged = merge_tree_sparse_indices(prefix, draft, seq_lens, num_nodes, topk)
+        The old builder padded the ancestor block with the node itself, which
+        repeated every shallow node's position up to ``A`` times.
+        """
+        num_nodes, topk, a, prefix_len = 7, 16, 4, 12
+        merged = self._merged(num_nodes, prefix_len, topk, a)
 
-        self.assertTrue(torch.equal(merged[:, a:], prefix))
-        self.assertNotEqual(merged[0].tolist(), sorted(merged[0].tolist()))
+        for row in range(num_nodes):
+            valid = [int(v) for v in merged[row] if int(v) >= 0]
+            self.assertEqual(
+                len(set(valid)), len(valid), f"row {row} repeats a position: {valid}"
+            )
+
+    def test_shallow_row_keeps_every_prefix_entry(self):
+        """Shifting (not padding) is what keeps the full prefix block reachable."""
+        num_nodes, topk, a, prefix_len = 7, 16, 4, 12
+        allowed = _visibility_from_parents(TREE_PARENTS, num_nodes)
+        ids = _ancestor_ids(allowed, a)
+        prefix = _prefix_rows(num_nodes, topk - a, prefix_len)
+
+        merged = merge_tree_sparse_indices(
+            prefix, ids, torch.tensor([prefix_len], dtype=torch.int32), num_nodes, topk
+        )
+
+        for row in range(num_nodes):
+            n_anc = int((ids[row] >= 0).sum())
+            valid = [int(v) for v in merged[row] if int(v) >= 0]
+            self.assertEqual(len(valid), n_anc + prefix.shape[1], f"row {row}")
+            # And the slack is exactly the unused reserved width.
+            self.assertEqual(list(merged[row, len(valid):]), [-1] * (topk - len(valid)))
 
     def test_negative_prefix_padding_only_in_tail(self):
         num_nodes, topk, a = 4, 8, 4
-        seq_lens = torch.tensor([2], dtype=torch.int32)
-        draft = self._draft(num_nodes, 2, a, parents=CHAIN_PARENTS[:4])
+        ids = _ancestor_ids(_visibility_from_parents(CHAIN_PARENTS[:4], num_nodes), a)
         prefix = torch.full((num_nodes, topk - a), -1, dtype=torch.int32)
         prefix[:, :2] = torch.arange(2)
 
-        merged = merge_tree_sparse_indices(prefix, draft, seq_lens, num_nodes, topk)
+        merged = merge_tree_sparse_indices(
+            prefix, ids, torch.tensor([2], dtype=torch.int32), num_nodes, topk
+        )
 
         for row in range(num_nodes):
-            tail = merged[row, a:].tolist()
-            first_neg = tail.index(-1) if -1 in tail else len(tail)
-            self.assertTrue(all(v >= 0 for v in tail[:first_neg]), f"row {row}")
-            self.assertTrue(all(v == -1 for v in tail[first_neg:]), f"row {row}")
+            valid = [int(v) for v in merged[row] if int(v) >= 0]
+            first_neg = merged[row].tolist().index(-1)
+            self.assertEqual(first_neg, len(valid), f"row {row} -1 before a value")
+            self.assertTrue(all(int(v) == -1 for v in merged[row, first_neg:]))
+
+    def test_no_sorting_of_prefix(self):
+        """SFA does not require ascending order; sorting would reorder ancestors."""
+        num_nodes, topk, a, prefix_len = 4, 8, 4, 9
+        ids = _ancestor_ids(_visibility_from_parents(CHAIN_PARENTS[:4], num_nodes), a)
+        # Deliberately descending prefix scores -> descending indices.
+        prefix = torch.tensor([[3, 2, 1, 0]], dtype=torch.int32).repeat(num_nodes, 1)
+
+        merged = merge_tree_sparse_indices(
+            prefix, ids, torch.tensor([prefix_len], dtype=torch.int32), num_nodes, topk
+        )
+
+        for row in range(num_nodes):
+            n_anc = int((ids[row] >= 0).sum())
+            self.assertTrue(
+                torch.equal(merged[row, n_anc : n_anc + prefix.shape[1]], prefix[row])
+            )
+            self.assertNotEqual(merged[row].tolist(), sorted(merged[row].tolist()))
 
     def test_ancestor_out_of_range_raises(self):
         num_nodes, topk, a = 4, 8, 4
-        seq_lens = torch.tensor([5], dtype=torch.int32)
         draft = torch.zeros((num_nodes, a), dtype=torch.int32)
+        draft[:, 0] = torch.arange(num_nodes)  # self, so no all-(-1) row
         draft[0, 0] = num_nodes + 3  # outside [0, N)
+        draft[0, 1:] = -1
         prefix = torch.zeros((num_nodes, topk - a), dtype=torch.int32)
         with self.assertRaises(ValueError):
-            merge_tree_sparse_indices(prefix, draft, seq_lens, num_nodes, topk)
+            merge_tree_sparse_indices(
+                prefix, draft, torch.tensor([5], dtype=torch.int32), num_nodes, topk
+            )
 
     def test_width_mismatch_raises(self):
         with self.assertRaises(AssertionError):
@@ -229,6 +328,80 @@ class TestMergeTreeSparseIndices(unittest.TestCase):
                 num_verify_tokens=7,
                 topk=16,
             )
+
+    def test_batched_varying_prefix_lens(self):
+        num_nodes, topk, a = 7, 16, 4
+        allowed = _visibility_from_parents(TREE_PARENTS, num_nodes)
+        ids = draft_ancestors(allowed.unsqueeze(0).expand(3, -1, -1), a)
+        prefix_lens = [4, 0, 130]
+        # P == 0 leaves nothing to pick: the indexer pads the whole block with -1.
+        blocks = []
+        for p in prefix_lens:
+            if p == 0:
+                block = torch.full((topk - a,), -1, dtype=torch.int32)
+            else:
+                block = torch.arange(topk - a, dtype=torch.int32) % p
+            blocks.extend([block] * num_nodes)
+        prefix = torch.stack(blocks)
+
+        merged = merge_tree_sparse_indices(
+            prefix, ids.reshape(-1, a), torch.tensor(prefix_lens), num_nodes, topk
+        )
+
+        self.assertEqual(tuple(merged.shape), (3 * num_nodes, topk))
+        for req, p in enumerate(prefix_lens):
+            for row in range(num_nodes):
+                flat_row = merged[req * num_nodes + row]
+                valid = [int(v) for v in flat_row if int(v) >= 0]
+                n_anc = int((ids[req, row] >= 0).sum())
+                picked = sorted(int(x) for x in ids[req, row] if int(x) >= 0)
+                self.assertEqual(
+                    sorted(valid[:n_anc]),
+                    [p + v for v in picked],
+                    f"req {req} row {row} ancestors",
+                )
+                self.assertTrue(all(v < p for v in valid[n_anc:]), "prefix must be < P")
+                # -1 only after the last valid entry.
+                as_list = flat_row.tolist()
+                first_neg = as_list.index(-1) if -1 in as_list else topk
+                self.assertEqual(first_neg, len(valid), f"req {req} row {row}")
+
+
+    def test_end_to_end_mask_to_row_matches_parent_oracle(self):
+        """parents -> FULL_MASK buffer -> gather -> ancestors -> row.
+
+        This is the exact offline pipeline: the NPU tree kernel writes the
+        FULL_MASK layout, and the indexer only reads it back.
+        """
+        num_nodes, topk, a, prefix_len = 7, 16, 4, 12
+        for parents, nodes in ((TREE_PARENTS, 7), (CHAIN_PARENTS[:4], 4)):
+            vis = _visibility_from_parents(parents, nodes)
+            flat = _make_full_mask([vis], [prefix_len], nodes)
+
+            got = gather_tree_blocks(flat, torch.tensor([prefix_len]), nodes)
+            ids = draft_ancestors(got, a)
+            prefix = _prefix_rows(nodes, topk - a, prefix_len)
+            merged = merge_tree_sparse_indices(
+                prefix, ids[0], torch.tensor([prefix_len], dtype=torch.int32),
+                nodes, topk,
+            )
+
+            for row in range(nodes):
+                # Expected: {self} | ancestors, as absolute positions.
+                expected = {
+                    prefix_len + c
+                    for c in range(nodes)
+                    if vis[row, c]
+                }
+                valid = [int(v) for v in merged[row] if int(v) >= 0]
+                anc = valid[: len(expected)]
+
+                self.assertEqual(set(anc), expected, f"{parents} row {row}")
+                self.assertEqual(len(anc), len(set(anc)), "no ancestor repeats")
+                self.assertEqual(
+                    len(valid), len(expected) + prefix.shape[1], "prefix intact"
+                )
+                self.assertTrue(all(v < prefix_len for v in valid[len(expected):]))
 
 
 if __name__ == "__main__":
