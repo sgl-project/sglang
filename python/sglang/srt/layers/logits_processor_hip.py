@@ -7,8 +7,7 @@ from __future__ import annotations
 import torch
 
 from sglang.kernels.ops.speculative.dspark.dspark_gfx950 import tp_shard_row_argmax
-from sglang.srt.distributed import get_tp_group
-from sglang.srt.runtime_context import LoRABatchLayout, get_forward
+from sglang.srt.runtime_context import LoRABatchLayout, get_forward, get_parallel
 
 
 def can_verify_argmax_only(processor) -> bool:
@@ -32,7 +31,7 @@ def deferred_verify_logits(
 
     with get_forward().scoped(lora_batch_layout=LoRABatchLayout.DP_LOCAL):
         local = processor._compute_lm_head(hidden_states, lm_head)
-    tp = get_tp_group()
+    tp = get_parallel().tp_group
     shard = local.shape[-1]
     col_start = tp.rank_in_group * shard
     argmax = tp_shard_row_argmax(

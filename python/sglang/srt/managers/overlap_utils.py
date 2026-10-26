@@ -285,6 +285,7 @@ class FutureMap:
     """
 
     _relay = None
+    seq_lens_pull = None
 
     def __init__(
         self,
