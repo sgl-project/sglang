@@ -213,7 +213,7 @@ def forward_mega_moe(
     *,
     skip_shared_experts: bool = False,
 ) -> torch.Tensor:
-    from sglang.srt.models.deepseek_v2 import _scale_routed_and_add_shared
+    from sglang.srt.layers.moe.utils import _scale_routed_and_add_shared
 
     if _use_amd_flydsl_mega_moe():
         from sglang.srt.layers.moe.mega_moe_flydsl import (

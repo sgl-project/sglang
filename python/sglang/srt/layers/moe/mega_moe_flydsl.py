@@ -258,7 +258,7 @@ def forward_mega_moe(
     *,
     skip_shared_experts: bool = False,
 ) -> torch.Tensor:
-    from sglang.srt.models.deepseek_v2 import _scale_routed_and_add_shared
+    from sglang.srt.layers.moe.utils import _scale_routed_and_add_shared
 
     num_tokens = hidden_states.shape[0]
     overlap = _should_overlap_shared_and_routed(moe, num_tokens)

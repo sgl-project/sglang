@@ -5,7 +5,7 @@ import os
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from enum import Enum, IntEnum
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 
 import torch
 
@@ -1082,3 +1082,20 @@ def get_moe_weight_sizes(inter_dim, is_concat, is_packed, is_aiter_moe):
             w13_up_dim *= 2
 
     return (w13_up_dim, w2_down_dim, False if not is_aiter_moe else is_padded)
+
+
+def _scale_routed_and_add_shared(
+    routed: torch.Tensor,
+    shared: Optional[torch.Tensor],
+    *,
+    routed_scaling_factor: float,
+    routed_scale_applied: bool,
+) -> torch.Tensor:
+    """Apply any outstanding routed scale before adding the shared output."""
+    if shared is not None:
+        if routed_scale_applied:
+            return shared.add_(routed)
+        return shared.add_(routed, alpha=routed_scaling_factor)
+    if not routed_scale_applied:
+        routed *= routed_scaling_factor
+    return routed

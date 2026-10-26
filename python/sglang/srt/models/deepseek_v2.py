@@ -127,6 +127,7 @@ from sglang.srt.layers.moe.topk import (
 )
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
+    _scale_routed_and_add_shared,
     adds_replicated_output_to_partial,
     filter_moe_weight_param_global_expert,
     get_num_fused_shared_experts,
@@ -629,23 +630,6 @@ class MergedMoEOutput(MoEOutput):
 
     def get_merged(self) -> torch.Tensor:
         return self.routed
-
-
-def _scale_routed_and_add_shared(
-    routed: torch.Tensor,
-    shared: Optional[torch.Tensor],
-    *,
-    routed_scaling_factor: float,
-    routed_scale_applied: bool,
-) -> torch.Tensor:
-    """Apply any outstanding routed scale before adding the shared output."""
-    if shared is not None:
-        if routed_scale_applied:
-            return shared.add_(routed)
-        return shared.add_(routed, alpha=routed_scaling_factor)
-    if not routed_scale_applied:
-        routed *= routed_scaling_factor
-    return routed
 
 
 class DeepseekV2MoE(nn.Module):
