@@ -1,17 +1,26 @@
 //! The tool schemas shared by output parsing and constrained generation.
 
+use std::collections::{HashMap, HashSet};
+use std::pin::Pin;
+
 use dynamo_parsers::parsers::get_tool_parser_map;
+use dynamo_parsers::tool_calling::jail::{Annotated, apply_tool_calling_jail};
 use dynamo_parsers::{
-    StructuralTagBuilder, StructuralTagSchemaMode, ToolCallFormatBuildContext, ToolChoice,
-    ToolDefinition, TriggeredTagsConfig,
+    CalledFunction, StructuralTagBuilder, StructuralTagSchemaMode, ToolCallFormatBuildContext,
+    ToolCallResponse, ToolCallType, ToolChoice, ToolDefinition, TriggeredTagsConfig,
+    try_tool_call_parse_aggregate_finalize,
 };
 use dynamo_protocols::types::{
-    ChatCompletionMessageToolCallChunk, ChatCompletionRequestMessage, ChatCompletionTool,
-    ChatCompletionToolChoiceOption, FunctionObject,
+    ChatCompletionMessageContent, ChatCompletionMessageToolCallChunk, ChatCompletionRequestMessage,
+    ChatCompletionTool, ChatCompletionToolChoiceOption, CreateChatCompletionStreamResponse,
+    FinishReason, FunctionCallStream, FunctionObject, FunctionType,
 };
+use futures::{Stream, StreamExt};
+use serde_json::Value;
 
 use super::ChatToolCallDelta;
 use crate::ProcessorError;
+use crate::tool_call::{ToolDetector, tool_call_id, tool_detector};
 
 /// Collect top-level and dynamic system-message tools without moving their
 /// declarations in the prompt. Dynamic tools accept wrapped OpenAI declarations
@@ -176,6 +185,117 @@ pub(super) fn post_tool_terminal_markers(parser: Option<&str>) -> &'static [&'st
         Some("glm47") => &["<|user|>", "<|endoftext|>", "<|observation|>"],
         _ => &[],
     }
+}
+
+type ChunkStream =
+    Pin<Box<dyn Stream<Item = Annotated<CreateChatCompletionStreamResponse>> + Send>>;
+
+/// The tools as the request lists them, which SGLang's detectors read.
+fn tool_values(tools: Option<&[ToolDefinition]>) -> Vec<Value> {
+    tools
+        .into_iter()
+        .flatten()
+        .map(|tool| {
+            serde_json::json!({
+                "type": "function",
+                "function": {"name": tool.name, "parameters": tool.parameters},
+            })
+        })
+        .collect()
+}
+
+/// Parse tool calls out of OpenAI stream chunks: SGLang's port for the names
+/// `models/` lists, else Dynamo's jail.
+pub fn tool_call_stream<S>(
+    parser: &str,
+    tool_choice: Option<ChatCompletionToolChoiceOption>,
+    tools: Option<Vec<ToolDefinition>>,
+    uses_tool_call_structural_tag: bool,
+    stream: S,
+) -> ChunkStream
+where
+    S: Stream<Item = Annotated<CreateChatCompletionStreamResponse>> + Send + 'static,
+{
+    let tool_values = tool_values(tools.as_deref());
+    let Some(_) = tool_detector(parser, &tool_values) else {
+        let parser = dynamo_tool_parser_name(parser).to_owned();
+        return Box::pin(apply_tool_calling_jail(
+            Some(parser),
+            tool_choice,
+            tools,
+            uses_tool_call_structural_tag,
+            stream,
+        ));
+    };
+    let parser = parser.to_owned();
+    Box::pin(async_stream::stream! {
+        let mut detectors: HashMap<u32, Box<dyn ToolDetector>> = HashMap::new();
+        let mut called = HashSet::new();
+        futures::pin_mut!(stream);
+        while let Some(mut item) = stream.next().await {
+            for choice in item.data.iter_mut().flat_map(|chunk| chunk.choices.iter_mut()) {
+                let detector = detectors
+                    .entry(choice.index)
+                    .or_insert_with(|| tool_detector(&parser, &tool_values).expect("checked"));
+                let text = match choice.delta.content.take() {
+                    Some(ChatCompletionMessageContent::Text(text)) => text,
+                    _ => String::new(),
+                };
+                let (normal, calls) = detector.parse_stream(&text, choice.finish_reason.is_some());
+                choice.delta.content =
+                    (!normal.is_empty()).then_some(ChatCompletionMessageContent::Text(normal));
+                if !calls.is_empty() {
+                    called.insert(choice.index);
+                    // Python streams an id and name only for a non-empty name.
+                    let calls = calls.into_iter().map(|call| {
+                        let named = !call.name.is_empty();
+                        ChatCompletionMessageToolCallChunk {
+                            index: call.tool_index as u32,
+                            id: named.then(tool_call_id),
+                            r#type: Some(FunctionType::Function),
+                            function: Some(FunctionCallStream {
+                                name: named.then_some(call.name),
+                                arguments: Some(call.parameters),
+                            }),
+                        }
+                    });
+                    choice.delta.tool_calls = Some(calls.collect());
+                }
+                if choice.finish_reason == Some(FinishReason::Stop) && called.contains(&choice.index) {
+                    choice.finish_reason = Some(FinishReason::ToolCalls);
+                }
+            }
+            yield item;
+        }
+    })
+}
+
+/// Parse a whole output's tool calls into `(calls, normal_text)`: SGLang's
+/// port for the names `models/` lists, else Dynamo's.
+pub async fn parse_tool_calls(
+    parser: &str,
+    text: &str,
+    tools: Option<&[ToolDefinition]>,
+) -> Result<(Vec<ToolCallResponse>, Option<String>), String> {
+    let Some(detector) = tool_detector(parser, &tool_values(tools)) else {
+        let parser = dynamo_tool_parser_name(parser);
+        return try_tool_call_parse_aggregate_finalize(text, Some(parser), tools)
+            .await
+            .map_err(|error| error.to_string());
+    };
+    if !detector.has_tool_call(text) {
+        return Ok((Vec::new(), Some(text.to_owned())));
+    }
+    let (normal, calls) = detector.parse_non_stream(text);
+    let calls = calls.into_iter().map(|call| ToolCallResponse {
+        id: tool_call_id(),
+        tp: ToolCallType::Function,
+        function: CalledFunction {
+            name: call.name,
+            arguments: call.parameters,
+        },
+    });
+    Ok((calls.collect(), Some(normal)))
 }
 
 pub(super) fn tool_call_delta(call: ChatCompletionMessageToolCallChunk) -> ChatToolCallDelta {

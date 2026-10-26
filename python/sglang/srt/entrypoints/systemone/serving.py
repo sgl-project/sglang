@@ -33,6 +33,7 @@ from sglang.srt.entrypoints.systemone.joint_schema import (
     encode_joint_schema,
     joint_schema_options,
 )
+from sglang.srt.entrypoints.systemone.kev import encode_kev
 from sglang.srt.entrypoints.systemone.protocol import (
     SystemOneChoiceAnswer,
     SystemOneChoiceQuestion,
@@ -68,7 +69,7 @@ _INLINE_HEADER_CHARS = 1 << 16
 
 class SystemOneServing(OpenAIServingDecisions):
     """Answers System One questions with the rendering, label checks, and scoring of
-    /v1/decisions, or, for a Clef checkpoint, with its joint schema head."""
+    /v1/decisions, or, for a Clef or Kev checkpoint, with its own head."""
 
     route = "/v1/systemone"
 
@@ -76,7 +77,7 @@ class SystemOneServing(OpenAIServingDecisions):
         return "systemone-"
 
     def _validate_request(self, request: SystemOneRequest) -> Optional[str]:
-        if self.joint_head_config is not None:
+        if self.joint_head_config is not None or self.pointer_head is not None:
             return self._validate_joint_schema_request(request)
         return (
             self._validate_server(request.model)
@@ -87,7 +88,7 @@ class SystemOneServing(OpenAIServingDecisions):
     def _validate_joint_schema_request(
         self, request: SystemOneRequest
     ) -> Optional[str]:
-        """A Clef checkpoint renders its own prompt, without the chat template."""
+        """A Clef or Kev checkpoint renders its own prompt, without the chat template."""
         route = self.route
         if self.tokenizer_manager.tokenizer is None:
             return f"{route} requires the server tokenizer"
@@ -101,8 +102,9 @@ class SystemOneServing(OpenAIServingDecisions):
             return f"{route} images require a model served with multimodal input"
         if request.chat_template_kwargs:
             return (
-                f"{route} renders the prompt this checkpoint's joint schema head "
-                "was trained with, which takes no chat_template_kwargs"
+                f"{route} renders the prompt this checkpoint's "
+                f"{'pointer' if self.pointer_head is not None else 'joint schema'} "
+                "head was trained with, which takes no chat_template_kwargs"
             )
         return None
 
@@ -117,6 +119,8 @@ class SystemOneServing(OpenAIServingDecisions):
         views = [_view(question) for question in request.questions.values()]
         if self.joint_head_config is not None:
             return self._joint_schema_request(request, views), (request, views)
+        if self.pointer_head is not None:
+            return self._pointer_request(request, views), (request, views)
         encode = (
             self._encoded_systemone_questions
             if self.decision_config is None
@@ -140,6 +144,71 @@ class SystemOneServing(OpenAIServingDecisions):
                 for image in request.images
             ]
             or None,
+        )
+
+    def _pointer_request(
+        self, request: SystemOneRequest, views: List[QuestionView]
+    ) -> EmbeddingReqInput:
+        """One prompt per question, which the pointer head scores in its own prefill."""
+        for question_id, view in zip(request.questions, views):
+            if view.kind == "score":
+                _check_legend(question_id, view)
+        tokenizer_manager = self.tokenizer_manager
+        rows = encode_kev(
+            tokenizer_manager.tokenizer,
+            request,
+            max_prompt_tokens=max_joint_prompt_tokens(
+                context_len=tokenizer_manager.context_len,
+                num_reserved_tokens=tokenizer_manager.num_reserved_tokens,
+                max_req_input_len=tokenizer_manager.max_req_input_len,
+                max_prefill_tokens=get_schedule().max_prefill_tokens,
+            ),
+        )
+        return EmbeddingReqInput(
+            input_ids=[input_ids for input_ids, _ in rows],
+            decision_layout=[layout for _, layout in rows],
+        )
+
+    async def _answer_pointer(
+        self,
+        adapted_request: EmbeddingReqInput,
+        request: SystemOneRequest,
+        views: List[QuestionView],
+        raw_request: Request,
+    ) -> ORJSONResponse:
+        rets = await self.tokenizer_manager.generate_request(
+            adapted_request, raw_request
+        ).__anext__()
+        answers = {}
+        for question_id, view, ret in zip(request.questions, views, rets):
+            logits = ret["embedding"]
+            if len(logits) != len(view.names):
+                raise RuntimeError("the pointer head did not score this request")
+            top = max(logits)
+            weights = [math.exp(logit - top) for logit in logits]
+            total = math.fsum(weights)
+            probabilities = [weight / total for weight in weights]
+            # The head scores no then yes, which the view names yes and no.
+            answers[question_id] = _answer(
+                view=view,
+                probabilities=(
+                    probabilities[::-1] if view.kind == "yes_no" else probabilities
+                ),
+                mass=1.0,
+                question_id=question_id,
+            )
+        response = SystemOneResponse(
+            model=self.tokenizer_manager.served_model_name,
+            answers=answers,
+            usage=SystemOneUsage(
+                input_tokens=sum(ret["meta_info"]["prompt_tokens"] for ret in rets)
+            ),
+        )
+        # The head scores only the allowed options, so there is no label mass.
+        return ORJSONResponse(
+            content=response.model_dump(
+                exclude={"answers": {"__all__": {"x_label_mass"}}}
+            )
         )
 
     async def _encode_joint_schema_prompt(
@@ -341,6 +410,10 @@ class SystemOneServing(OpenAIServingDecisions):
         request, views = processed
         if self.joint_head_config is not None:
             return await self._answer_joint_schema(
+                adapted_request, request, views, raw_request
+            )
+        if self.pointer_head is not None:
+            return await self._answer_pointer(
                 adapted_request, request, views, raw_request
             )
         _, _, result = await self._score(

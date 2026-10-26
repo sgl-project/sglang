@@ -396,6 +396,7 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
             .clone()
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let req_dict = build_generate_dict(&rid, &req).map_err(Status::invalid_argument)?;
+        let return_text = req.return_text.unwrap_or(false);
 
         let mut receiver = self
             .bridge
@@ -415,6 +416,7 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
                             output_ids: data.output_ids.unwrap_or_default(),
                             meta_info: data.meta_info,
                             finished: false,
+                            text: data.text.filter(|_| return_text),
                         });
                     }
                     Ok(Some(ResponseChunk::Finished(data))) => {
@@ -423,6 +425,7 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
                             output_ids: data.output_ids.unwrap_or_default(),
                             meta_info: data.meta_info,
                             finished: true,
+                            text: data.text.filter(|_| return_text),
                         });
                         break;
                     }
@@ -991,6 +994,7 @@ impl SglangServiceImpl {
                         yield Ok(proto::OpenAiStreamChunk {
                             json_chunk: data.json_bytes.unwrap_or_default(),
                             finished: false,
+                            status_code: None,
                         });
                     }
                     Ok(Some(ResponseChunk::Finished(data))) => {
@@ -999,6 +1003,10 @@ impl SglangServiceImpl {
                         yield Ok(proto::OpenAiStreamChunk {
                             json_chunk: bytes,
                             finished: true,
+                            status_code: data
+                                .meta_info
+                                .contains_key("status_code")
+                                .then(|| openai_status_code(&data.meta_info, 200)),
                         });
                         break;
                     }

@@ -16,15 +16,13 @@
 //! [`chat_finish_reason`] maps the scheduler's finish reason onto the OpenAI
 //! wire values.
 
-use dynamo_parsers::{
-    ToolChoice as DynamoToolChoice, ToolDefinition, try_tool_call_parse_aggregate_finalize,
-};
+use dynamo_parsers::{ToolChoice as DynamoToolChoice, ToolDefinition};
 use dynamo_protocols::types::{
     ChatCompletionMessageContent, ChatCompletionMessageToolCall,
     ChatCompletionMessageToolCallChunk, ChatCompletionStreamResponseDelta,
     FinishReason as OpenAIFinishReason, FunctionCall, FunctionType, Role,
 };
-use sglang_processor::{ToolConstraint, dynamo_tool_parser_name, tool_constraint};
+use sglang_processor::{ToolConstraint, parse_tool_calls, tool_constraint};
 
 use crate::api_server::core::CoreOutput;
 use crate::message::sampling::SamplingParams;
@@ -83,8 +81,7 @@ pub(super) async fn parse_chat_tool_calls(
     let Some(parser) = parser else {
         return (content, None);
     };
-    let parser = dynamo_tool_parser_name(parser);
-    match try_tool_call_parse_aggregate_finalize(&content, Some(parser), tools).await {
+    match parse_tool_calls(parser, &content, tools).await {
         Ok((mut calls, normal)) if !calls.is_empty() => {
             if !parallel_tool_calls {
                 calls.truncate(1);

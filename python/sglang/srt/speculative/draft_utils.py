@@ -106,7 +106,6 @@ class DraftBackendFactory:
             "trtllm_mha": self._create_trtllm_mha_decode_backend,
             "trtllm_mla": self._create_trtllm_mla_decode_backend,
             "cutedsl_mla": self._create_cutedsl_mla_decode_backend,
-            "tokenspeed_mla": self._create_tokenspeed_mla_decode_backend,
             "dsa": self._create_dsa_decode_backend,
             "nsa": self._create_dsa_decode_backend,  # Deprecated alias for "dsa"
             "ascend": self._create_ascend_decode_backend,
@@ -138,7 +137,6 @@ class DraftBackendFactory:
             "trtllm_mla": self._create_trtllm_mla_prefill_backend,
             # cute-dsl MLA only supports decode; draft-extend falls back to trtllm-gen.
             "cutedsl_mla": self._create_trtllm_mla_prefill_backend,
-            "tokenspeed_mla": self._create_tokenspeed_mla_prefill_backend,
             "dsa": self._create_dsa_prefill_backend,
             "nsa": self._create_dsa_prefill_backend,  # Deprecated alias for "dsa"
             "ascend": self._create_ascend_prefill_backend,
@@ -395,23 +393,6 @@ class DraftBackendFactory:
             ),
         )
 
-    def _create_tokenspeed_mla_decode_backend(self):
-        if not self.draft_model_runner.use_mla_backend:
-            raise ValueError(
-                "tokenspeed_mla backend requires MLA model (use_mla_backend=True)."
-            )
-
-        from sglang.srt.layers.attention.tokenspeed_mla_backend import (
-            TokenspeedMLAMultiStepDraftBackend,
-        )
-
-        return (
-            "tokenspeed_mla",
-            TokenspeedMLAMultiStepDraftBackend(
-                self.draft_model_runner, self.topk, self.speculative_num_steps
-            ),
-        )
-
     def _create_ascend_decode_backend(self):
         # DSA draft decode must generate indexer/KPool metadata for each step
         # and cannot use the regular backend.
@@ -545,21 +526,6 @@ class DraftBackendFactory:
         return (
             "trtllm_mla",
             TRTLLMMLABackend(self.draft_model_runner, skip_prefill=False),
-        )
-
-    def _create_tokenspeed_mla_prefill_backend(self):
-        if not self.draft_model_runner.use_mla_backend:
-            raise ValueError(
-                "tokenspeed_mla backend requires MLA model (use_mla_backend=True)."
-            )
-
-        from sglang.srt.layers.attention.tokenspeed_mla_backend import (
-            TokenspeedMLABackend,
-        )
-
-        return (
-            "tokenspeed_mla",
-            TokenspeedMLABackend(self.draft_model_runner, skip_prefill=False),
         )
 
     def _create_ascend_prefill_backend(self):

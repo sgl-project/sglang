@@ -37,12 +37,17 @@ logger = init_logger(__name__)
 # NPU/ascend) is read from sgl-project/ci-data-diffusion, where the GT-gen workflows
 # publish.
 SGL_TEST_FILES_CI_DATA_REPO = "sgl-project/ci-data-diffusion"
-SGL_TEST_FILES_CI_DATA_REVISION = "17312c8df37e65bffe75818884bc2a5c93cf3094"
+SGL_TEST_FILES_CI_DATA_REVISION = "c7258eb56e9951878c66fc0fb3673d9f4775b0b2"
 
 # The NPU pin is kept as a separate branch so ascend GT can be bumped independently
-# when it's regenerated on its own cadence.
+# when it's regenerated on its own cadence. 2173af2f re-generated the MiniMax-H3
+# frames after #38671 made num_inference_steps=50 run 50 denoising updates
+# (previously 49). The regeneration must run on a branch where
+# pin_consistency_quality=False for this case (npu_diffusion_ci_fixes_2): generating
+# on main pins quality='exact', which disables MiniMax-H3's env-selected Cache-DiT
+# and produces a golden from a different code path than the test runs.
 if current_platform.is_npu():
-    SGL_TEST_FILES_CI_DATA_REVISION = "609c4cef31864d75dbd11fe3c26b8ae09469204d"
+    SGL_TEST_FILES_CI_DATA_REVISION = "2173af2fe762e2c95e18b06d017604d520196eff"
 
 SGL_TEST_FILES_CONSISTENCY_GT_ROOT = (
     "https://raw.githubusercontent.com/"
@@ -200,6 +205,12 @@ DEFAULT_WAN_2_1_I2V_14B_720P_MODEL_NAME_FOR_TEST = (
 DEFAULT_WAN_2_2_TI2V_5B_MODEL_NAME_FOR_TEST = "Wan-AI/Wan2.2-TI2V-5B-Diffusers"
 DEFAULT_WAN_2_2_T2V_A14B_MODEL_NAME_FOR_TEST = "Wan-AI/Wan2.2-T2V-A14B-Diffusers"
 DEFAULT_WAN_2_2_I2V_A14B_MODEL_NAME_FOR_TEST = "Wan-AI/Wan2.2-I2V-A14B-Diffusers"
+DEFAULT_WAN_2_2_ANIMATE_2_14B_MODEL_NAME_FOR_TEST = (
+    "Wan-AI/Wan2.2-Animate-2-14B-Diffusers"
+)
+DEFAULT_WAN_2_2_ANIMATE_2_14B_DISTILLED_MODEL_NAME_FOR_TEST = (
+    "Wan-AI/Wan2.2-Animate-2-14B-Distilled-Diffusers"
+)
 
 # MOVA video generation models
 DEFAULT_MOVA_360P_MODEL_NAME_FOR_TEST = "OpenMOSS-Team/MOVA-360p"

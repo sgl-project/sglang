@@ -1,6 +1,13 @@
 //! Response pieces shared by the OpenAI endpoints, shaped as Python serializes them.
 
+use std::collections::HashMap;
+
 use serde_json::{Map, Value, json};
+use sglang_api_types::api::v1::{
+    FinishReason, GenerateMetaInfo, GenerateResponse, GenerateStreamError, finish_reason,
+};
+
+use crate::py::python_json;
 
 /// A complete HTTP response the host sends instead of a stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,17 +32,16 @@ pub(super) fn error_reply(message: &str, err_type: &str, code: u16) -> Reply {
 /// `OpenAIServingBase.create_streaming_error_response`, as an SSE event.
 pub(super) fn stream_error_event(message: &str, err_type: &str, code: u16) -> String {
     let error = json!({"error": error_body(message, err_type, code)});
-    format!("data: {}\n\n", python_json(&error))
+    format!("data: {}\n\n", python_json(&error, true))
 }
 
-/// The OpenAI reply for a `/generate` error response. `None` passes the
-/// engine's reply through: SGLang answers its other errors, such as an
-/// `HTTPException`, in the OpenAI error shape on every route.
-pub(super) fn engine_error_reply(body: &[u8]) -> Option<Reply> {
-    let body: Value = serde_json::from_slice(body).ok()?;
-    // A ValueError: `/generate` answers `{"error": {"message"}}`, OpenAI a 400.
-    let message = body.pointer("/error/message")?.as_str()?;
-    Some(error_reply(message, "BadRequestError", 400))
+/// The OpenAI reply for a native `/generate` error.
+pub(super) fn engine_error_reply(error: GenerateStreamError) -> Reply {
+    error_reply(
+        &error.error.map(|error| error.message).unwrap_or_default(),
+        "BadRequestError",
+        400,
+    )
 }
 
 /// Python's answer when the engine output lacks what the OpenAI layer reads.
@@ -70,9 +76,126 @@ pub(super) fn usage(prompt: u64, completion: u64, reasoning: u64, cached: Option
         "prompt_tokens": prompt,
         "total_tokens": prompt + completion,
         "completion_tokens": completion,
-        "prompt_tokens_details": cached.filter(|&n| n > 0).map(|n| json!({"cached_tokens": n})),
+        "prompt_tokens_details": cached.map(|n| json!({"cached_tokens": n})),
         "reasoning_tokens": reasoning,
     })
+}
+
+pub(super) fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// The non-streaming response over `ret`, the `/generate` items for `choices`.
+/// Prompt and cached tokens count once per prompt, i.e. every `n`-th item.
+pub(super) fn unary_reply(
+    ret: &[GenerateResponse],
+    n: usize,
+    cache_report: bool,
+    object: &str,
+    model: &str,
+    choices: Vec<Value>,
+) -> Option<Reply> {
+    let first = ret.first()?.meta_info.as_ref();
+    let sum = |stride: usize, field: fn(&GenerateMetaInfo) -> u64| -> u64 {
+        ret.iter()
+            .step_by(stride)
+            .filter_map(|r| r.meta_info.as_ref())
+            .map(field)
+            .sum()
+    };
+    let cached = cache_report.then(|| sum(n, |m| u64::from(m.cached_tokens)));
+    let mut metadata = json!({"weight_version": first.and_then(|m| m.weight_version.as_deref())});
+    if let Some(meta) = first.filter(|m| !m.weight_versions.is_empty()) {
+        metadata["weight_versions"] = json!(meta.weight_versions);
+    }
+    let response = json!({
+        "id": first.map(|m| &m.id),
+        "object": object,
+        "created": now(),
+        "model": model,
+        "choices": choices,
+        "usage": usage(sum(n, |m| u64::from(m.prompt_tokens)), sum(1, |m| m.completion_tokens), sum(1, |m| m.reasoning_tokens), cached),
+        "metadata": metadata,
+    });
+    Some(Reply {
+        status: 200,
+        body: response.to_string(),
+    })
+}
+
+/// Stream state both endpoints keep: whether it started, stopped or failed,
+/// and each choice's latest token counts.
+#[derive(Default)]
+pub(super) struct StreamState {
+    pub started: bool,
+    pub stopped: bool,
+    pub failed: bool,
+    pub done: bool,
+    pub last_id: String,
+    /// Per choice: characters of cumulative text and logprobs already sent.
+    pub text_offsets: HashMap<u64, usize>,
+    pub logprob_counts: HashMap<u64, usize>,
+    prompt: HashMap<u64, u64>,
+    completion: HashMap<u64, u64>,
+    reasoning: HashMap<u64, u64>,
+    cached: HashMap<u64, u64>,
+}
+
+impl StreamState {
+    /// An engine error replaces the reply until the first chunk has been sent.
+    pub(super) fn error(&mut self, error: GenerateStreamError) -> Result<Vec<String>, Reply> {
+        if !self.started {
+            return Err(engine_error_reply(error));
+        }
+        self.failed = true;
+        let message = error.error.map(|error| error.message).unwrap_or_default();
+        Ok(vec![stream_error_event(&message, "BadRequestError", 400)])
+    }
+
+    /// An abort or error just ended the stream; Python stops there, without
+    /// waiting for the other choices.
+    pub(super) fn ending(&self) -> bool {
+        !self.done && (self.stopped || self.failed)
+    }
+
+    /// Record the frame's id and choice `index`'s token counts.
+    pub(super) fn record(&mut self, index: u64, meta: &GenerateMetaInfo) {
+        self.last_id.clone_from(&meta.id);
+        self.prompt.insert(index, u64::from(meta.prompt_tokens));
+        self.completion.insert(index, meta.completion_tokens);
+        self.reasoning.insert(index, meta.reasoning_tokens);
+        self.cached.insert(index, u64::from(meta.cached_tokens));
+    }
+
+    /// Choice `index`'s usage, for `continuous_usage_stats`.
+    pub(super) fn choice_usage(&self, index: u64, cache_report: bool) -> Value {
+        let cached = cache_report.then(|| self.cached[&index]);
+        usage(
+            self.prompt[&index],
+            self.completion[&index],
+            self.reasoning[&index],
+            cached,
+        )
+    }
+
+    /// The final usage chunk's; prompt and cached tokens count once per prompt.
+    pub(super) fn total_usage(&self, n: usize, cache_report: bool) -> Value {
+        let per_prompt = |map: &HashMap<u64, u64>| -> u64 {
+            map.iter()
+                .filter(|(i, _)| *i % n as u64 == 0)
+                .map(|(_, v)| v)
+                .sum()
+        };
+        let cached = cache_report.then(|| per_prompt(&self.cached));
+        usage(
+            per_prompt(&self.prompt),
+            self.completion.values().sum(),
+            self.reasoning.values().sum(),
+            cached,
+        )
+    }
 }
 
 /// `model_dump_json(exclude_none=True)`: drop `null` fields, recursively.
@@ -89,129 +212,44 @@ pub(super) fn without_nulls(value: Value) -> Value {
     }
 }
 
-pub(super) fn meta_u64(meta: &Value, key: &str) -> u64 {
-    meta.get(key).and_then(Value::as_u64).unwrap_or(0)
-}
-
-/// Python's `json.dumps(value)`: `", "` and `": "` separators, ASCII only.
-pub(super) fn python_json(value: &Value) -> String {
-    let mut out = String::new();
-    write_python_json(value, &mut out);
-    out
-}
-
-fn write_python_json(value: &Value, out: &mut String) {
-    match value {
-        Value::Null => out.push_str("null"),
-        Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
-        Value::Number(n) => match n.as_f64() {
-            Some(f) if n.is_f64() => out.push_str(&python_float(f)),
-            _ => out.push_str(&n.to_string()),
-        },
-        Value::String(s) => write_python_str(s, out),
-        Value::Array(items) => {
-            out.push('[');
-            for (i, item) in items.iter().enumerate() {
-                if i > 0 {
-                    out.push_str(", ");
-                }
-                write_python_json(item, out);
-            }
-            out.push(']');
-        }
-        Value::Object(map) => {
-            out.push('{');
-            for (i, (key, item)) in map.iter().enumerate() {
-                if i > 0 {
-                    out.push_str(", ");
-                }
-                write_python_str(key, out);
-                out.push_str(": ");
-                write_python_json(item, out);
-            }
-            out.push('}');
-        }
-    }
-}
-
-fn write_python_str(s: &str, out: &mut String) {
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            '\u{8}' => out.push_str("\\b"),
-            '\u{c}' => out.push_str("\\f"),
-            ' '..='~' => out.push(c),
-            _ => {
-                let mut units = [0u16; 2];
-                for unit in c.encode_utf16(&mut units) {
-                    out.push_str(&format!("\\u{unit:04x}"));
-                }
-            }
-        }
-    }
-    out.push('"');
-}
-
-/// Python's `repr(float)`, as `json.dumps` prints it: the shortest digits that
-/// round-trip, ties to even, scientific outside 1e-4..1e16.
-fn python_float(f: f64) -> String {
-    if !f.is_finite() {
-        return match f.is_nan() {
-            true => "NaN".into(),
-            false if f > 0.0 => "Infinity".into(),
-            false => "-Infinity".into(),
-        };
-    }
-    let shortest = format!("{:e}", f.abs());
-    let len = shortest
-        .split('e')
-        .next()
-        .expect("mantissa")
-        .replace('.', "")
-        .len();
-    // Exact formatting rounds the binary value half to even, as `repr` does.
-    let sci = format!("{:.*e}", len - 1, f.abs());
-    let (mantissa, exp) = sci.split_once('e').expect("{:e} has an exponent");
-    let digits = mantissa.replace('.', "");
-    let exp: i32 = exp.parse().expect("integer exponent");
-    let sign = if f.is_sign_negative() { "-" } else { "" };
-    if !(-4..16).contains(&exp) {
-        let (first, rest) = digits.split_at(1);
-        let mantissa = match rest.is_empty() {
-            true => first.to_owned(),
-            false => format!("{first}.{rest}"),
-        };
-        let exp_sign = if exp < 0 { '-' } else { '+' };
-        return format!("{sign}{mantissa}e{exp_sign}{:02}", exp.abs());
-    }
-    let (int, frac) = match usize::try_from(exp) {
-        Err(_) => (
-            "0".to_owned(),
-            format!("{}{digits}", "0".repeat((-exp - 1) as usize)),
-        ),
-        Ok(exp) if exp + 1 < digits.len() => {
-            (digits[..=exp].to_owned(), digits[exp + 1..].to_owned())
-        }
-        Ok(exp) => (
-            format!("{digits:0<width$}", width = exp + 1),
-            "0".to_owned(),
-        ),
+pub(super) fn finish_fields(reason: Option<&FinishReason>) -> (Option<String>, Value) {
+    let Some(reason) = reason else {
+        return (None, Value::Null);
     };
-    format!("{sign}{int}.{frac}")
+    let matched = match reason.kind.as_ref() {
+        Some(finish_reason::Kind::Stop(stop)) => json!(stop.matched),
+        Some(finish_reason::Kind::Unknown(raw)) => {
+            // The shared API retains unknown finish reasons as raw JSON.
+            let value: Value = serde_json::from_str(raw).unwrap_or_default();
+            return (
+                value.get("type").and_then(Value::as_str).map(str::to_owned),
+                value.get("matched").cloned().unwrap_or(Value::Null),
+            );
+        }
+        _ => Value::Null,
+    };
+    (reason.kind_name().map(|kind| kind.into_owned()), matched)
 }
 
-/// Python's `str.isspace`, which also counts the ASCII separators U+001C..U+001F.
-fn py_space(c: char) -> bool {
-    c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c)
+pub(super) fn abort_event(reason: Option<&FinishReason>) -> Option<String> {
+    let finish_reason::Kind::Abort(abort) = reason?.kind.as_ref()? else {
+        return None;
+    };
+    let code = u64::from(abort.status_code?);
+    Some(stream_error_event(
+        abort.message.as_deref().unwrap_or("Generation aborted."),
+        http_status_name(code)?,
+        code as u16,
+    ))
 }
 
-pub(super) fn py_strip(text: &str) -> &str {
-    text.trim_matches(py_space)
+pub(super) fn logprob_slice<T>(items: &[T], prev: usize, total: usize, incremental: bool) -> &[T] {
+    if incremental {
+        items
+    } else {
+        let start = prev.min(items.len());
+        &items[start..start + total.saturating_sub(prev).min(items.len() - start)]
+    }
 }
 
 #[cfg(test)]
@@ -219,18 +257,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn python_json_matches_json_dumps() {
-        let value = json!({"a": [1, 2.5, 1e-5, 1e16, 100.0, null], "é": "x\"\n\u{1F600}"});
-        #[allow(clippy::excessive_precision)]
-        let tie = 77947932308658.125;
-        assert_eq!(python_float(tie), "77947932308658.12");
-        assert_eq!(python_float(0.5), "0.5");
-        assert_eq!(python_float(-0.0), "-0.0");
-        assert_eq!(python_float(0.0001), "0.0001");
-        assert_eq!(python_float(123456789012345680.0), "1.2345678901234568e+17");
-        assert_eq!(
-            python_json(&value),
-            "{\"a\": [1, 2.5, 1e-05, 1e+16, 100.0, null], \"\\u00e9\": \"x\\\"\\n\\ud83d\\ude00\"}"
-        );
+    fn cache_report_keeps_zero_cached_tokens() {
+        let details = |cached| usage(3, 2, 0, cached)["prompt_tokens_details"].clone();
+        assert_eq!(details(Some(0)), json!({"cached_tokens": 0}));
+        assert_eq!(details(None), Value::Null);
     }
 }

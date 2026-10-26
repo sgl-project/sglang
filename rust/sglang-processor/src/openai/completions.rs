@@ -5,11 +5,19 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
+use sglang_api_types::api::v1::{
+    GenerateMetaInfo, GenerateRequest, GenerateResponse, GenerateStreamError, ImagesConfig,
+    Int64List, LogprobEntry, NullableTopLogprobs, SamplingParams, SamplingParamsOrList, TokenIds,
+    TokenIdsList, TokenIdsOrList, WatermarkRequestConfig, sampling_params_or_list,
+    token_ids_or_list,
+};
 
-use super::pieces::byte_level_byte;
+use super::request::{
+    OneOrList, ResponseFormat, StreamOptions, custom_labels, default_model, format_json_schema,
+    lora_path, one, usage_flags, yes,
+};
 use super::wire::{
-    Reply, error_reply, http_status_name, malformed_output_reply, meta_u64, py_strip, python_json,
-    stream_error_event, usage, without_nulls,
+    Reply, StreamState, abort_event, finish_fields, logprob_slice, now, unary_reply, without_nulls,
 };
 use super::{OpenAiHeaders, OpenAiSettings, OpenAiTokenizer, Unsupported};
 
@@ -26,7 +34,7 @@ struct CompletionRequest {
     echo: bool,
     #[serde(default)]
     frequency_penalty: f64,
-    logit_bias: Option<Map<String, Value>>,
+    logit_bias: Option<HashMap<String, f64>>,
     logprobs: Option<i64>,
     #[serde(default = "default_max_tokens")]
     max_tokens: i64,
@@ -71,7 +79,7 @@ struct CompletionRequest {
     ebnf: Option<String>,
     #[serde(default = "one_f64")]
     repetition_penalty: f64,
-    stop_token_ids: Option<Vec<i64>>,
+    stop_token_ids: Option<Int64List>,
     stop_regex: Option<OneOrList<String>>,
     #[serde(default)]
     no_stop_trim: bool,
@@ -86,7 +94,8 @@ struct CompletionRequest {
     response_format: Option<ResponseFormat>,
     custom_params: Option<Map<String, Value>>,
     custom_logit_processor: Option<String>,
-    images_config: Option<Map<String, Value>>,
+    watermark: Option<WatermarkRequestConfig>,
+    images_config: Option<ImagesConfig>,
     data_parallel_rank: Option<i64>,
     rid: Option<OneOrList<String>>,
     extra_key: Option<OneOrList<String>>,
@@ -101,14 +110,8 @@ struct CompletionRequest {
     disagg_prefill_dp_rank: Option<i64>,
 }
 
-fn default_model() -> String {
-    "default".into()
-}
 fn default_max_tokens() -> i64 {
     16
-}
-fn one() -> i64 {
-    1
 }
 fn one_f64() -> f64 {
     1.0
@@ -116,18 +119,8 @@ fn one_f64() -> f64 {
 fn minus_one() -> i64 {
     -1
 }
-fn yes() -> bool {
-    true
-}
 fn false_value() -> Value {
     Value::Bool(false)
-}
-
-#[derive(Deserialize, serde::Serialize)]
-#[serde(untagged)]
-enum OneOrList<T> {
-    One(T),
-    List(Vec<T>),
 }
 
 #[derive(Deserialize)]
@@ -139,39 +132,6 @@ enum Prompt {
     TextBatch(Vec<String>),
 }
 
-#[derive(Deserialize)]
-struct StreamOptions {
-    include_usage: Option<bool>,
-    continuous_usage_stats: Option<bool>,
-}
-
-/// Python validates `json_schema` whatever the `type`.
-#[derive(Deserialize)]
-struct ResponseFormat {
-    #[serde(rename = "type")]
-    kind: FormatKind,
-    json_schema: Option<JsonSchemaFormat>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum FormatKind {
-    Text,
-    JsonObject,
-    JsonSchema,
-}
-
-#[derive(Deserialize)]
-struct JsonSchemaFormat {
-    #[allow(dead_code)]
-    name: String,
-    #[allow(dead_code)]
-    description: Option<String>,
-    schema: Option<Map<String, Value>>,
-    #[allow(dead_code)]
-    strict: Option<bool>,
-}
-
 /// Lower a completions body into a `/generate` body, as
 /// `OpenAIServingCompletion._convert_to_internal_request` does.
 pub fn lower_completion(
@@ -179,18 +139,13 @@ pub fn lower_completion(
     headers: &OpenAiHeaders<'_>,
     settings: &OpenAiSettings,
     tokenizer: Option<Arc<dyn OpenAiTokenizer>>,
-) -> Result<(Value, CompletionResponder), Unsupported> {
+) -> Result<(GenerateRequest, CompletionResponder), Unsupported> {
     let mut request: CompletionRequest =
         serde_json::from_slice(body).map_err(|_| Unsupported("unparsed_request"))?;
     if settings.completion_template.is_some() {
         return Err(Unsupported("completion_template"));
     }
-    let numeric_bias = request
-        .logit_bias
-        .as_ref()
-        .is_none_or(|bias| bias.values().all(Value::is_number));
-    if request.max_tokens <= 0 || request.n < 1 || !numeric_bias || prompt_is_empty(&request.prompt)
-    {
+    if request.max_tokens <= 0 || request.n < 1 || prompt_is_empty(&request.prompt) {
         return Err(Unsupported("invalid_request"));
     }
     if request.return_hidden_states != false
@@ -200,31 +155,12 @@ pub fn lower_completion(
     {
         return Err(Unsupported("sglext_output"));
     }
-    if !custom_labels_are_strings(&custom_labels(headers, settings)) {
-        return Err(Unsupported("invalid_request"));
-    }
+    let labels = custom_labels(headers, settings)?;
     if (request.echo || request.logprobs.is_some()) && tokenizer.is_none() {
         return Err(Unsupported("no_tokenizer"));
     }
-    // A `structural_tag` format fails to parse above, so it goes to the engine.
-    match &request.response_format {
-        Some(ResponseFormat {
-            kind: FormatKind::JsonSchema,
-            json_schema,
-        }) => {
-            let schema = json_schema
-                .as_ref()
-                .and_then(|format| format.schema.clone())
-                .ok_or(Unsupported("invalid_request"))?;
-            request.json_schema = Some(python_json(&Value::Object(schema)));
-        }
-        Some(ResponseFormat {
-            kind: FormatKind::JsonObject,
-            ..
-        }) => {
-            request.json_schema = Some(r#"{"type": "object"}"#.into());
-        }
-        Some(_) | None => {}
+    if let Some(schema) = format_json_schema(request.response_format.as_ref(), false)? {
+        request.json_schema = Some(schema);
     }
     if request.routed_dp_rank.is_none() {
         request.routed_dp_rank = request.data_parallel_rank;
@@ -235,16 +171,10 @@ pub fn lower_completion(
     } else {
         Vec::new()
     };
-    let lowered = generate_body(&request, headers, settings);
-    // `should_include_usage`.
-    let default_usage = settings.stream_response_default_include_usage;
-    let (include_usage, continuous_usage_stats) = match &request.stream_options {
-        Some(options) => (
-            options.include_usage.unwrap_or(false) || default_usage,
-            options.continuous_usage_stats.unwrap_or(false),
-        ),
-        None => (default_usage, false),
-    };
+    let mut lowered = generate_body(&request, headers);
+    lowered.custom_labels = labels;
+    let (include_usage, continuous_usage_stats) =
+        usage_flags(request.stream_options.as_ref(), settings);
     let responder = CompletionResponder {
         model: request.model,
         n: request.n as usize,
@@ -258,115 +188,99 @@ pub fn lower_completion(
         tokenizer,
         created: now(),
         stream: StreamState::default(),
+        token_id_counts: HashMap::new(),
     };
     Ok((lowered, responder))
 }
 
-fn generate_body(
-    request: &CompletionRequest,
-    headers: &OpenAiHeaders<'_>,
-    settings: &OpenAiSettings,
-) -> Value {
-    let logit_bias = request.logit_bias.as_ref().map(|bias| {
-        bias.iter()
-            .map(|(k, v)| (k.clone(), json!(v.as_f64())))
-            .collect::<Map<_, _>>()
-    });
-    let sampling = json!({
-        "temperature": request.temperature,
-        "max_new_tokens": request.max_tokens,
-        "min_new_tokens": request.min_tokens,
-        "stop": request.stop,
-        "stop_token_ids": request.stop_token_ids,
-        "stop_regex": request.stop_regex,
-        "top_p": request.top_p,
-        "top_k": request.top_k,
-        "min_p": request.min_p,
-        "presence_penalty": request.presence_penalty,
-        "frequency_penalty": request.frequency_penalty,
-        "repetition_penalty": request.repetition_penalty,
-        "regex": request.regex,
-        "json_schema": request.json_schema,
-        "ebnf": request.ebnf,
-        "n": request.n,
-        "no_stop_trim": request.no_stop_trim,
-        "ignore_eos": request.ignore_eos,
-        "skip_special_tokens": request.skip_special_tokens,
-        "logit_bias": logit_bias,
-        "custom_params": request.custom_params,
-        "sampling_seed": request.seed,
-    });
-    let (prompt_key, prompt) = match &request.prompt {
-        Prompt::Text(text) => ("text", json!(text)),
-        Prompt::TextBatch(texts) => ("text", json!(texts)),
-        Prompt::Ids(ids) => ("input_ids", json!(ids)),
-        Prompt::IdBatch(ids) => ("input_ids", json!(ids)),
+fn generate_body(request: &CompletionRequest, headers: &OpenAiHeaders<'_>) -> GenerateRequest {
+    let sampling = SamplingParams {
+        temperature: Some(request.temperature),
+        max_new_tokens: Some(request.max_tokens),
+        min_new_tokens: Some(request.min_tokens),
+        stop: request.stop.clone().map(Into::into),
+        stop_token_ids: request.stop_token_ids.clone(),
+        stop_regex: request.stop_regex.clone().map(Into::into),
+        top_p: Some(request.top_p),
+        top_k: Some(request.top_k),
+        min_p: Some(request.min_p),
+        presence_penalty: Some(request.presence_penalty),
+        frequency_penalty: Some(request.frequency_penalty),
+        repetition_penalty: Some(request.repetition_penalty),
+        regex: request.regex.clone(),
+        json_schema: request.json_schema.clone(),
+        ebnf: request.ebnf.clone(),
+        n: Some(request.n),
+        no_stop_trim: Some(request.no_stop_trim),
+        ignore_eos: Some(request.ignore_eos),
+        skip_special_tokens: Some(request.skip_special_tokens),
+        logit_bias: request.logit_bias.clone().unwrap_or_default(),
+        custom_params: request
+            .custom_params
+            .as_ref()
+            .map(|v| serde_json::to_string(v).expect("JSON object")),
+        sampling_seed: request.seed,
+        watermark: request.watermark.clone(),
+        ..Default::default()
     };
-    let lora_path = match request.model.split_once(':') {
-        Some((_, adapter)) if !py_strip(adapter).is_empty() => json!(py_strip(adapter)),
-        _ => json!(request.lora_path),
+    let logprob_start_len = if request.echo && request.logprobs.is_some_and(|n| n != 0) {
+        0
+    } else {
+        -1
     };
-    let mut body = Map::new();
-    body.insert(prompt_key.into(), prompt);
-    let fields = json!({
-        "sampling_params": sampling,
-        "return_logprob": request.logprobs.is_some(),
-        "top_logprobs_num": request.logprobs.unwrap_or(0),
-        "logprob_start_len": if request.echo && request.logprobs.is_some_and(|n| n != 0) { 0 } else { -1 },
-        "return_text_in_logprobs": true,
-        "stream": request.stream,
-        "lora_path": lora_path,
-        "bootstrap_host": request.bootstrap_host,
-        "bootstrap_port": request.bootstrap_port,
-        "bootstrap_room": request.bootstrap_room,
-        "routed_dp_rank": request.routed_dp_rank,
-        "disagg_prefill_dp_rank": request.disagg_prefill_dp_rank,
-        "return_hidden_states": false,
-        "return_routed_experts": false,
-        "routed_experts_start_len": request.routed_experts_start_len,
-        "return_prompt_token_ids": request.return_token_ids,
-        "rid": request.rid,
-        "session_id": request.session_id,
-        "extra_key": request.extra_key,
-        "cache_salt": request.cache_salt,
-        "priority": request.priority,
-        "routing_key": headers.routing_key,
-        "custom_labels": custom_labels(headers, settings),
-        "custom_logit_processor": request.custom_logit_processor,
-        "images_config": request.images_config,
-    });
-    body.extend(fields.as_object().expect("object literal").clone());
-    Value::Object(body)
-}
-
-/// `OpenAIServingBase.extract_custom_labels`.
-fn custom_labels(headers: &OpenAiHeaders<'_>, settings: &OpenAiSettings) -> Value {
-    let allowed = settings
-        .tokenizer_metrics_allowed_custom_labels
-        .as_deref()
-        .unwrap_or_default();
-    if allowed.is_empty() || settings.tokenizer_metrics_custom_labels_header.is_none() {
-        return Value::Null;
+    GenerateRequest {
+        sampling_params: Some(SamplingParamsOrList {
+            value: Some(sampling_params_or_list::Value::One(sampling)),
+        }),
+        return_logprob: Some(OneOrList::One(request.logprobs.is_some()).into()),
+        logprob_start_len: Some(OneOrList::One(logprob_start_len).into()),
+        top_logprobs_num: Some(OneOrList::One(request.logprobs.unwrap_or(0)).into()),
+        stream: Some(request.stream),
+        return_text_in_logprobs: Some(true),
+        lora_path: lora_path(&request.model, &request.lora_path),
+        bootstrap_host: request.bootstrap_host.clone().map(Into::into),
+        bootstrap_port: request.bootstrap_port.clone().map(Into::into),
+        bootstrap_room: request.bootstrap_room.clone().map(Into::into),
+        routed_dp_rank: request.routed_dp_rank,
+        disagg_prefill_dp_rank: request.disagg_prefill_dp_rank,
+        rid: request.rid.clone().map(Into::into),
+        session_id: request.session_id.clone(),
+        extra_key: request.extra_key.clone().map(Into::into),
+        cache_salt: request.cache_salt.clone().map(Into::into),
+        priority: request.priority,
+        routing_key: headers.routing_key.map(str::to_owned),
+        custom_logit_processor: request
+            .custom_logit_processor
+            .clone()
+            .map(|value| OneOrList::One(value).into()),
+        images_config: request.images_config.clone(),
+        return_prompt_token_ids: request.return_token_ids,
+        routed_experts_start_len: request.routed_experts_start_len,
+        text: match &request.prompt {
+            Prompt::Text(v) => Some(OneOrList::One(v.clone()).into()),
+            Prompt::TextBatch(v) => Some(OneOrList::List(v.clone()).into()),
+            _ => None,
+        },
+        input_ids: match &request.prompt {
+            Prompt::Ids(v) => Some(TokenIdsOrList {
+                value: Some(token_ids_or_list::Value::One(TokenIds {
+                    ids: v.iter().copied().map(i64::from).collect(),
+                })),
+            }),
+            Prompt::IdBatch(v) => Some(TokenIdsOrList {
+                value: Some(token_ids_or_list::Value::Many(TokenIdsList {
+                    items: v
+                        .iter()
+                        .map(|v| TokenIds {
+                            ids: v.iter().copied().map(i64::from).collect(),
+                        })
+                        .collect(),
+                })),
+            }),
+            _ => None,
+        },
+        ..Default::default()
     }
-    match headers
-        .custom_labels
-        .and_then(|raw| serde_json::from_str(raw).ok())
-    {
-        Some(Value::Object(labels)) => Value::Object(
-            labels
-                .into_iter()
-                .filter(|(label, _)| allowed.contains(label))
-                .collect(),
-        ),
-        _ => Value::Null,
-    }
-}
-
-/// Custom labels `/generate` accepts as its `Dict[str, str]`.
-pub(super) fn custom_labels_are_strings(labels: &Value) -> bool {
-    labels
-        .as_object()
-        .is_none_or(|labels| labels.values().all(Value::is_string))
 }
 
 fn prompt_is_empty(prompt: &Prompt) -> bool {
@@ -392,12 +306,6 @@ fn echo_prompts(prompt: &Prompt, tokenizer: Option<&dyn OpenAiTokenizer>) -> Opt
     })
 }
 
-fn now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
-}
-
 /// Builds the OpenAI response from the engine's `/generate` output.
 pub struct CompletionResponder {
     model: String,
@@ -412,106 +320,58 @@ pub struct CompletionResponder {
     tokenizer: Option<Arc<dyn OpenAiTokenizer>>,
     created: u64,
     stream: StreamState,
-}
-
-#[derive(Default)]
-struct StreamState {
-    started: bool,
-    stopped: bool,
-    failed: bool,
-    done: bool,
-    last_id: Value,
-    text_offsets: HashMap<u64, usize>,
-    logprob_counts: HashMap<u64, usize>,
     token_id_counts: HashMap<u64, usize>,
-    prompt_tokens: HashMap<u64, u64>,
-    completion_tokens: HashMap<u64, u64>,
-    reasoning_tokens: HashMap<u64, u64>,
-    cached_tokens: HashMap<u64, u64>,
 }
 
 impl CompletionResponder {
     /// `_handle_non_streaming_request` over a `/generate` response.
-    pub fn unary(self, body: &[u8]) -> Option<Reply> {
-        let ret = match serde_json::from_slice(body).ok()? {
-            Value::Array(items) => items,
-            item => vec![item],
-        };
+    pub fn unary(self, ret: Vec<GenerateResponse>) -> Option<Reply> {
         let mut choices = Vec::with_capacity(ret.len());
         for (index, item) in ret.iter().enumerate() {
-            let meta = &item["meta_info"];
-            let Some(text) = item["text"].as_str() else {
-                return Some(malformed_output_reply("text"));
-            };
-            let mut text = text.to_owned();
+            let default_meta = GenerateMetaInfo::default();
+            let meta = item.meta_info.as_ref().unwrap_or(&default_meta);
+            let mut text = item.text.clone();
             if let Some(echo) = self.echo_prompts.get(index / self.n) {
                 text.insert_str(0, echo);
             }
             let logprobs = self.logprobs.then(|| {
                 self.openai_logprobs(
                     self.echo_logprobs.then_some(meta),
-                    &meta["output_token_logprobs"],
-                    &meta["output_top_logprobs"],
+                    meta.output_token_logprobs
+                        .as_ref()
+                        .map_or(&[], |p| &p.entries),
+                    &meta.output_top_logprobs,
                 )
             });
             choices.push(self.choice(index as u64, text, logprobs, meta, item));
         }
-        let first = &ret.first()?["meta_info"];
-        let stride = |key: &str| -> u64 {
-            ret.iter()
-                .step_by(self.n)
-                .map(|r| meta_u64(&r["meta_info"], key))
-                .sum()
-        };
-        let all = |key: &str| -> u64 { ret.iter().map(|r| meta_u64(&r["meta_info"], key)).sum() };
-        let cached = self
-            .settings
-            .enable_cache_report
-            .then(|| stride("cached_tokens"));
-        let mut metadata = json!({"weight_version": first["weight_version"]});
-        if let Some(versions) = first.get("weight_versions") {
-            metadata["weight_versions"] = versions.clone();
-        }
-        let response = json!({
-            "id": first["id"],
-            "object": "text_completion",
-            "created": now(),
-            "model": self.model,
-            "choices": choices,
-            "usage": usage(stride("prompt_tokens"), all("completion_tokens"), all("reasoning_tokens"), cached),
-            "metadata": metadata,
-        });
-        Some(Reply {
-            status: 200,
-            body: response.to_string(),
-        })
+        unary_reply(
+            &ret,
+            self.n,
+            self.settings.enable_cache_report,
+            "text_completion",
+            &self.model,
+            choices,
+        )
     }
 
-    /// One `/generate` SSE `data:` payload, as `_generate_completion_stream`
+    /// One decoded `/generate` stream item, as `_generate_completion_stream`
     /// handles it. `Err` replaces the whole stream, before anything was sent.
-    pub fn stream_data(&mut self, data: &[u8]) -> Result<Vec<String>, Reply> {
+    pub fn stream_data(
+        &mut self,
+        data: Result<GenerateResponse, GenerateStreamError>,
+    ) -> Result<Vec<String>, Reply> {
         if self.stream.done {
             return Ok(Vec::new());
         }
-        if data == b"[DONE]" {
-            return Ok(self.stream_end());
-        }
-        let Ok(content) = serde_json::from_slice::<Value>(data) else {
-            return Ok(Vec::new());
-        };
-        let mut events = Vec::new();
-        if let Some(message) = content.pointer("/error/message").and_then(Value::as_str) {
-            if !self.stream.started {
-                return Err(error_reply(message, "BadRequestError", 400));
+        let mut events = match data {
+            Ok(content) => {
+                self.stream.started = true;
+                self.stream_chunk(&content).into_iter().collect()
             }
-            self.stream.failed = true;
-            events.push(stream_error_event(message, "BadRequestError", 400));
-        } else {
-            self.stream.started = true;
-            events.extend(self.stream_chunk(&content));
-        }
-        // Python ends the stream here, without waiting for the other choices.
-        if self.stream.stopped || self.stream.failed {
+            Err(error) => self.stream.error(error)?,
+        };
+        if self.stream.ending() {
             events.extend(self.stream_end());
         }
         Ok(events)
@@ -522,25 +382,14 @@ impl CompletionResponder {
         self.stream.done
     }
 
-    fn stream_chunk(&mut self, content: &Value) -> Option<String> {
+    fn stream_chunk(&mut self, content: &GenerateResponse) -> Option<String> {
         let state = &mut self.stream;
-        let index = content.get("index").and_then(Value::as_u64).unwrap_or(0);
-        let meta = &content["meta_info"];
-        state.last_id = meta["id"].clone();
-        state
-            .prompt_tokens
-            .insert(index, meta_u64(meta, "prompt_tokens"));
-        state
-            .completion_tokens
-            .insert(index, meta_u64(meta, "completion_tokens"));
-        state
-            .reasoning_tokens
-            .insert(index, meta_u64(meta, "reasoning_tokens"));
-        state
-            .cached_tokens
-            .insert(index, meta_u64(meta, "cached_tokens"));
-        let finish_reason = &meta["finish_reason"];
-        let raw_text = content["text"].as_str().unwrap_or_default();
+        let index = u64::from(content.index.unwrap_or(0));
+        let default_meta = GenerateMetaInfo::default();
+        let meta = content.meta_info.as_ref().unwrap_or(&default_meta);
+        state.record(index, meta);
+        let (finish_type, matched_stop) = finish_fields(meta.finish_reason.as_ref());
+        let raw_text = content.text.as_str();
 
         let is_first_chunk = !state.text_offsets.contains_key(&index);
         let offset = state.text_offsets.get(&index).copied().unwrap_or(0);
@@ -559,28 +408,17 @@ impl CompletionResponder {
         if self.logprobs {
             let echo_input = is_first_chunk && self.echo_logprobs;
             let prev = state.logprob_counts.get(&index).copied().unwrap_or(0);
-            let total = meta_u64(meta, "output_token_logprobs_length") as usize;
+            let total = meta.output_token_logprobs_length.unwrap_or(0) as usize;
             if prev < total || echo_input {
-                let slice = |key: &str| -> Value {
-                    let items = meta
-                        .get(key)
-                        .and_then(Value::as_array)
-                        .cloned()
-                        .unwrap_or_default();
-                    match incremental {
-                        true => Value::Array(items),
-                        false => Value::Array(
-                            items
-                                .into_iter()
-                                .skip(prev)
-                                .take(total.saturating_sub(prev))
-                                .collect(),
-                        ),
-                    }
-                };
-                let (output, output_top) =
-                    (slice("output_token_logprobs"), slice("output_top_logprobs"));
-                logprobs = self.openai_logprobs(echo_input.then_some(meta), &output, &output_top);
+                let output = meta
+                    .output_token_logprobs
+                    .as_ref()
+                    .map_or(&[][..], |p| p.entries.as_slice());
+                logprobs = self.openai_logprobs(
+                    echo_input.then_some(meta),
+                    logprob_slice(output, prev, total, incremental),
+                    logprob_slice(&meta.output_top_logprobs, prev, total, incremental),
+                );
             }
             self.stream.logprob_counts.insert(index, total);
         }
@@ -588,68 +426,47 @@ impl CompletionResponder {
         let mut token_ids = None;
         let mut prompt_token_ids = None;
         if self.return_token_ids {
-            let ids = content["output_ids"]
-                .as_array()
-                .cloned()
+            let ids = content
+                .output_ids
+                .as_ref()
+                .map(|ids| ids.ids.clone())
                 .unwrap_or_default();
             token_ids = Some(match incremental {
                 true => ids,
                 false => {
-                    let prev = self
-                        .stream
-                        .token_id_counts
-                        .insert(index, ids.len())
-                        .unwrap_or(0);
+                    let prev = self.token_id_counts.insert(index, ids.len()).unwrap_or(0);
                     ids.into_iter().skip(prev).collect()
                 }
             });
             if is_first_chunk {
-                prompt_token_ids = Some(
-                    content
-                        .get("prompt_token_ids")
-                        .cloned()
-                        .unwrap_or(Value::Null),
-                );
+                prompt_token_ids = content.prompt_token_ids.as_ref();
             }
         }
 
-        // An abort carrying a status is an error; Python checks for an
-        // `HTTPStatus`, which `/generate` serializes as its integer.
-        if finish_reason["type"] == "abort"
-            && let Some(code) = finish_reason.get("status_code").and_then(Value::as_u64)
-            && let Some(name) = http_status_name(code)
-        {
+        if let Some(event) = abort_event(meta.finish_reason.as_ref()) {
             self.stream.stopped = true;
-            let message = finish_reason["message"]
-                .as_str()
-                .unwrap_or("Generation aborted.");
-            return Some(stream_error_event(message, name, code as u16));
+            return Some(event);
         }
 
         let mut choice = json!({
             "index": index,
             "text": delta,
             "logprobs": logprobs,
-            "finish_reason": finish_reason.get("type"),
-            "matched_stop": finish_reason.get("matched"),
+            "finish_reason": finish_type,
+            "matched_stop": matched_stop,
         });
         if let Some(ids) = token_ids {
-            choice["token_ids"] = Value::Array(ids);
+            choice["token_ids"] = json!(ids);
         }
-        if let Some(Value::Array(ids)) = prompt_token_ids {
-            choice["prompt_token_ids"] = Value::Array(ids);
+        if let Some(ids) = prompt_token_ids {
+            choice["prompt_token_ids"] = json!(ids);
         }
         let usage_value = match self.continuous_usage_stats {
-            true => usage(
-                self.stream.prompt_tokens[&index],
-                self.stream.completion_tokens[&index],
-                self.stream.reasoning_tokens[&index],
-                None,
-            ),
+            true => self.stream.choice_usage(index, false),
             false => Value::Null,
         };
         let chunk = json!({
-            "id": meta["id"],
+            "id": meta.id,
             "object": "text_completion",
             "created": self.created,
             "model": self.model,
@@ -659,33 +476,21 @@ impl CompletionResponder {
         Some(format!("data: {chunk}\n\n"))
     }
 
-    fn stream_end(&mut self) -> Vec<String> {
+    pub fn stream_end(&mut self) -> Vec<String> {
+        if self.stream.done {
+            return Vec::new();
+        }
         self.stream.done = true;
         let mut events = Vec::new();
         let state = &self.stream;
         if self.include_usage && !state.failed && state.started {
-            let first_choice = |map: &HashMap<u64, u64>| -> u64 {
-                map.iter()
-                    .filter(|(i, _)| *i % self.n as u64 == 0)
-                    .map(|(_, v)| v)
-                    .sum()
-            };
-            let cached = self
-                .settings
-                .enable_cache_report
-                .then(|| first_choice(&state.cached_tokens));
             let chunk = json!({
                 "id": state.last_id,
                 "object": "text_completion",
                 "created": self.created,
                 "model": self.model,
                 "choices": [],
-                "usage": usage(
-                    first_choice(&state.prompt_tokens),
-                    state.completion_tokens.values().sum(),
-                    state.reasoning_tokens.values().sum(),
-                    cached,
-                ),
+                "usage": state.total_usage(self.n, self.settings.enable_cache_report),
             });
             events.push(format!("data: {}\n\n", without_nulls(chunk)));
         }
@@ -698,24 +503,24 @@ impl CompletionResponder {
         index: u64,
         text: String,
         logprobs: Option<Value>,
-        meta: &Value,
-        item: &Value,
+        meta: &GenerateMetaInfo,
+        item: &GenerateResponse,
     ) -> Value {
-        let finish_reason = &meta["finish_reason"];
+        let (finish_type, matched_stop) = finish_fields(meta.finish_reason.as_ref());
         let mut choice = json!({
             "index": index,
             "text": text,
             "logprobs": logprobs,
-            "finish_reason": finish_reason.get("type"),
-            "matched_stop": finish_reason.get("matched"),
+            "finish_reason": finish_type,
+            "matched_stop": matched_stop,
         });
         if self.return_token_ids {
             for (key, ids) in [
-                ("token_ids", item.get("output_ids")),
-                ("prompt_token_ids", item.get("prompt_token_ids")),
+                ("token_ids", item.output_ids.as_ref()),
+                ("prompt_token_ids", item.prompt_token_ids.as_ref()),
             ] {
-                if let Some(ids) = ids.filter(|ids| !ids.is_null()) {
-                    choice[key] = ids.clone();
+                if let Some(ids) = ids {
+                    choice[key] = json!(ids);
                 }
             }
         }
@@ -726,30 +531,32 @@ impl CompletionResponder {
     /// `echo_meta` adds the prompt's logprobs from its `meta_info`.
     fn openai_logprobs(
         &self,
-        echo_meta: Option<&Value>,
-        output: &Value,
-        output_top: &Value,
+        echo_meta: Option<&GenerateMetaInfo>,
+        output: &[LogprobEntry],
+        output_top: &[NullableTopLogprobs],
     ) -> Value {
-        let input = echo_meta.map(|meta| &meta["input_token_logprobs"]);
-        let input_top = echo_meta.map(|meta| &meta["input_top_logprobs"]);
+        let input = echo_meta
+            .and_then(|meta| meta.input_token_logprobs.as_ref())
+            .map(|p| p.entries.as_slice());
+        let input_top = echo_meta.map(|meta| meta.input_top_logprobs.as_slice());
         let mut text_offset = Vec::new();
         let mut token_logprobs = Vec::new();
         let mut tokens = Vec::new();
         let mut top_logprobs = Vec::new();
         for list in [input, Some(output)].into_iter().flatten() {
-            for triple in list.as_array().into_iter().flatten() {
+            for triple in list {
                 tokens.push(json!(self.token_text(triple)));
-                token_logprobs.push(triple[0].clone());
+                token_logprobs.push(triple.logprob);
                 text_offset.push(json!(-1));
             }
         }
         for list in [input_top, Some(output_top)].into_iter().flatten() {
-            for position in list.as_array().into_iter().flatten() {
-                top_logprobs.push(match position.as_array() {
-                    Some(triples) => Value::Object(
-                        triples
+            for position in list {
+                top_logprobs.push(match position.row.as_ref() {
+                    Some(row) => Value::Object(
+                        row.entries
                             .iter()
-                            .map(|t| (self.token_text(t), t[0].clone()))
+                            .map(|t| (self.token_text(t), json!(t.logprob)))
                             .collect(),
                     ),
                     None => Value::Null,
@@ -766,24 +573,17 @@ impl CompletionResponder {
 
     /// `_lossless_token_text`: a fragment of a multi-byte character, shown as
     /// U+FFFD by the engine, is rendered as latin-1 so its bytes round-trip.
-    fn token_text(&self, triple: &Value) -> String {
-        let text = triple[2].as_str();
+    fn token_text(&self, triple: &LogprobEntry) -> String {
+        let text = triple.text.as_deref();
         if let Some(text) = text
             && !text.contains('\u{FFFD}')
         {
             return text.to_owned();
         }
         let fallback = text.unwrap_or_default().to_owned();
-        let bytes = triple[1]
-            .as_u64()
-            .and_then(|id| self.tokenizer.as_ref()?.byte_level_piece(id as u32))
-            .and_then(|piece| {
-                piece
-                    .chars()
-                    .map(byte_level_byte)
-                    .collect::<Option<Vec<u8>>>()
-            })
-            .filter(|bytes| !bytes.is_empty());
+        let bytes = u32::try_from(triple.token_id)
+            .ok()
+            .and_then(|id| self.tokenizer.as_ref()?.byte_level_bytes(id));
         match bytes {
             Some(bytes) if std::str::from_utf8(&bytes).is_err() => {
                 bytes.into_iter().map(char::from).collect()

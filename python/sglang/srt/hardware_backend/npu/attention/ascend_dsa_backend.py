@@ -207,6 +207,9 @@ class AscendDSAAttnBackend(AscendAttnBackend):
 
     def __init__(self, model_runner: ModelRunner, speculative_step_id: int = 0):
         super().__init__(model_runner, speculative_step_id=speculative_step_id)
+        # KPool planning still consumes host sequence lengths. The base DSA
+        # backend can run mirrorless, but this subclass does not support it yet.
+        self.needs_cpu_seq_lens = True
         hf_config = model_runner.model_config.hf_config
         self.dsa_index_topk = get_dsa_index_topk(hf_config)
         self.dsa_index_kpool = get_dsa_index_kpool(hf_config)

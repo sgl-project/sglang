@@ -45,10 +45,10 @@ from sglang.multimodal_gen.runtime.layers.parallel_conv import (
     SpatialParallelConv2d,
     SpatialParallelZeroPad2d,
     causal_conv3d_cat_pad,
-    chunk_height_for_parallel_decode,
     disable_spatial_parallel_decode,
     gather_and_trim_height,
     gather_height_for_global_op,
+    spatial_parallel_decode_disabled,
     split_for_parallel_decode,
 )
 from sglang.multimodal_gen.runtime.models.vaes.common import (
@@ -62,13 +62,22 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 
 if current_platform.is_cuda() or current_platform.is_xpu():
     try:
-        from sglang.kernels.ops.diffusion import cat_pad_channels_last_3d, dup_up3d_add
+        from sglang.kernels.ops.diffusion import (
+            can_use_conv_bias_epilogue,
+            cat_pad_channels_last_3d,
+            conv_bias_epilogue,
+            dup_up3d_add,
+        )
     except ImportError:  # pragma: no cover
         cat_pad_channels_last_3d = None
         dup_up3d_add = None
+        conv_bias_epilogue = None
+        can_use_conv_bias_epilogue = None
 else:
     cat_pad_channels_last_3d = None
     dup_up3d_add = None
+    conv_bias_epilogue = None
+    can_use_conv_bias_epilogue = None
 
 CACHE_T = 2
 
@@ -123,8 +132,13 @@ def _run_cached_causal_conv(
     x: torch.Tensor,
     cache_list: list,
     idx: int,
+    residual: torch.Tensor | None = None,
+    skip_bias: bool = False,
 ) -> torch.Tensor:
     """Run one causal conv, consuming and refreshing its feature-cache slot.
+
+    ``residual`` / ``skip_bias`` are forwarded to the conv epilogue (see
+    ``WanCausalConv3d.forward``).
 
     Fast path (bit-exact with the aten chain, pure data movement plus zero
     fill): build the conv input (cache frames + hidden state + padding)
@@ -147,7 +161,7 @@ def _run_cached_causal_conv(
         pair = cat_pad_channels_last_3d(x, payload, conv._padding, keep_cache_t=CACHE_T)
         if pair is not None:
             inp, cache_list[idx] = pair
-            return nn.Conv3d.forward(conv, inp)
+            return conv._conv_with_epilogue(inp, residual, skip_bias)
     # Original aten path (bit-identical bookkeeping).
     cache_x = x[:, :, -CACHE_T:, :, :].clone()
     if cache_x.shape[2] < 2 and payload is not None:
@@ -161,7 +175,12 @@ def _run_cached_causal_conv(
             [torch.zeros_like(cache_x).to(cache_x.device), cache_x],
             dim=2,
         )
-    out = conv(x) if payload is None else conv(x, payload)
+    if isinstance(conv, WanCausalConv3d):
+        out = conv(x, payload, residual=residual, skip_bias=skip_bias)
+    else:
+        out = conv(x, payload)
+        if residual is not None:
+            out = out + residual
     cache_list[idx] = cache_x
     return out
 
@@ -170,6 +189,77 @@ class DupUp3D(DupUp3DBase):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         _first_chunk = first_chunk.get() if first_chunk is not None else None
         return super().forward(x, first_chunk=_first_chunk)
+
+    def can_fuse_add(
+        self, x_main: torch.Tensor, x: torch.Tensor, first_chunk: bool
+    ) -> bool:
+        """Return whether `add_into_` can replace `x_main + self(x)`."""
+        if x.ndim != 5 or x_main.ndim != 5:
+            return False
+        if torch.is_grad_enabled() and (x.requires_grad or x_main.requires_grad):
+            return False
+        if self.repeats <= 0 or self.factor % self.repeats != 0:
+            return False
+        if x.shape[1] != self.in_channels:
+            return False
+
+        batch, _, frames, height, width = x.shape
+        output_frames = frames * self.factor_t
+        if first_chunk:
+            output_frames -= self.factor_t - 1
+
+        return (
+            x_main.dtype == x.dtype
+            and x_main.device == x.device
+            and tuple(x_main.shape)
+            == (
+                batch,
+                self.out_channels,
+                output_frames,
+                height * self.factor_s,
+                width * self.factor_s,
+            )
+        )
+
+    def add_into_(
+        self, x_main: torch.Tensor, x: torch.Tensor, first_chunk: bool = False
+    ) -> torch.Tensor:
+        """Add the duplicated shortcut directly into `x_main`.
+
+        `forward` only copies input values into an expanded tensor. This
+        method adds those values to their strided destinations instead, avoiding
+        the expanded shortcut allocation and its layout conversion.
+        """
+        temporal_factor = self.factor_t
+        spatial_factor = self.factor_s
+        input_channel_stride = self.factor // self.repeats
+        dropped_frames = temporal_factor - 1 if first_chunk else 0
+
+        for temporal_offset in range(temporal_factor):
+            input_frame_start = 1 if temporal_offset < dropped_frames else 0
+            output_frame_start = (
+                input_frame_start * temporal_factor + temporal_offset - dropped_frames
+            )
+            for height_offset in range(spatial_factor):
+                for width_offset in range(spatial_factor):
+                    flattened_offset = (
+                        temporal_offset * spatial_factor + height_offset
+                    ) * spatial_factor + width_offset
+                    input_channel_start = flattened_offset // self.repeats
+                    x_main[
+                        :,
+                        :,
+                        output_frame_start::temporal_factor,
+                        height_offset::spatial_factor,
+                        width_offset::spatial_factor,
+                    ].add_(
+                        x[
+                            :,
+                            input_channel_start::input_channel_stride,
+                            input_frame_start:,
+                        ]
+                    )
+        return x_main
 
 
 class WanCausalConv3d(nn.Conv3d):
@@ -207,7 +297,40 @@ class WanCausalConv3d(nn.Conv3d):
         )
         self.padding = (0, 0, 0)
 
-    def forward(self, x, cache_x=None):
+    def _conv_with_epilogue(self, inp, residual=None, skip_bias=False):
+        """Convolution plus its bias epilogue.
+
+        PyTorch's cuDNN conv adds the bias as a separate broadcast ``add_``
+        kernel after ``cudnn_convolution``; on channels_last_3d outputs that
+        add is unvectorised and, in this decoder, costs about as much as the
+        residual add that usually follows. So run the conv without bias and
+        apply the bias in one fused Triton pass that reproduces aten's
+        arithmetic exactly (fp32 add, one rounding), optionally together with
+        the residual (``x.dtype(x.dtype(conv + bias) + residual)``, the two
+        roundings of the eager ``conv(x) + h`` chain). ``skip_bias`` returns
+        the raw conv output so a following fused norm can absorb the bias.
+        Falls back to the aten ops with identical arithmetic.
+        """
+        bias = self.bias
+        if skip_bias or bias is None:
+            out = self._conv_forward(inp, self.weight, None if skip_bias else bias)
+            return out if residual is None else out + residual
+        if (
+            conv_bias_epilogue is not None
+            and not torch.compiler.is_compiling()
+            and inp.is_cuda
+        ):
+            out = self._conv_forward(inp, self.weight, None)
+            if can_use_conv_bias_epilogue(out, bias, residual):
+                return conv_bias_epilogue(out, bias, residual)
+            # Same ops aten runs inside conv3d: bias cast to the activation
+            # dtype (autocast), fp32 add, one rounding.
+            out = out.add_(bias.to(out.dtype).view(1, -1, 1, 1, 1))
+        else:
+            out = self._conv_forward(inp, self.weight, bias)
+        return out if residual is None else out + residual
+
+    def forward(self, x, cache_x=None, *, residual=None, skip_bias=False):
         padding = list(self._padding)
         if (
             any(padding)
@@ -219,13 +342,13 @@ class WanCausalConv3d(nn.Conv3d):
         ):
             inp = cat_pad_channels_last_3d(x, cache_x, padding)
             if inp is not None:
-                return super().forward(inp)
+                return self._conv_with_epilogue(inp, residual, skip_bias)
         x = causal_conv3d_cat_pad(x, cache_x, padding)
         x = (
             x if current_platform.is_amp_supported() else x.to(self.weight.dtype)
         )  # casting needed if amp isn't supported
         x = match_conv3d_input_format(x, self.weight)
-        return super().forward(x)
+        return self._conv_with_epilogue(x, residual, skip_bias)
 
 
 class WanRMS_norm(nn.Module):
@@ -249,7 +372,11 @@ class WanRMS_norm(nn.Module):
         self.gamma = nn.Parameter(torch.ones(shape))
         self.bias = nn.Parameter(torch.zeros(shape)) if bias else 0.0
 
-    def forward(self, x):
+    def forward(self, x, conv_bias=None):
+        if conv_bias is not None:
+            # A preceding conv deferred its bias here (see
+            # ``WanCausalConv3d._conv_with_epilogue``); same aten add.
+            x = x + conv_bias.to(x.dtype).view(1, -1, 1, 1, 1)
         return (
             F.normalize(x, dim=(1 if self.channel_first else -1))
             * self.scale
@@ -363,40 +490,50 @@ def residual_block_forward(self, x):
     x = self.norm1(x)
     x = self.nonlinearity(x)
 
+    # conv1's bias is deferred into norm2 (fused RMSNorm+SiLU absorbs it in
+    # the same pass; the eager norm adds it first with the same arithmetic).
+    defer_bias = isinstance(self.conv1, WanCausalConv3d) and self.conv1.bias is not None
     _feat_cache = feat_cache.get()
     _feat_idx = feat_idx.get()
     if _feat_cache is not None:
         idx = _feat_idx
-        x = _run_cached_causal_conv(self.conv1, x, _feat_cache, idx)
+        x = _run_cached_causal_conv(
+            self.conv1, x, _feat_cache, idx, skip_bias=defer_bias
+        )
         _feat_idx += 1
         feat_cache.set(_feat_cache)
         feat_idx.set(_feat_idx)
     else:
-        x = self.conv1(x)
+        x = self.conv1(x, skip_bias=True) if defer_bias else self.conv1(x)
 
     # Second normalization and activation
-    x = self.norm2(x)
+    x = self.norm2(x, conv_bias=self.conv1.bias if defer_bias else None)
     x = self.nonlinearity(x)
 
     # Dropout
     x = self.dropout(x)
 
+    # conv2's bias and the residual add are one epilogue pass (bit-exact with
+    # the eager ``conv2(x) + h`` chain).
     _feat_cache = feat_cache.get()
     _feat_idx = feat_idx.get()
     if _feat_cache is not None:
         idx = _feat_idx
-        x = _run_cached_causal_conv(self.conv2, x, _feat_cache, idx)
+        x = _run_cached_causal_conv(self.conv2, x, _feat_cache, idx, residual=h)
         _feat_idx += 1
         feat_cache.set(_feat_cache)
         feat_idx.set(_feat_idx)
     else:
-        x = self.conv2(x)
+        if isinstance(self.conv2, WanCausalConv3d):
+            x = self.conv2(x, residual=h)
+        else:
+            x = self.conv2(x) + h
+    return x
 
-    # Add residual connection
-    return x + h
 
-
-def attention_block_forward(self, x):
+def attention_block_forward(self, x, rows: tuple[int, int] | None = None):
+    """``rows`` = (first, count) attends only those rows of the height as
+    queries (keys and values keep every row) and returns just them."""
     identity = x
     batch_size, channels, num_frames, height, width = x.size()
     x = x.permute(0, 2, 1, 3, 4).reshape(
@@ -409,6 +546,10 @@ def attention_block_forward(self, x):
     qkv = qkv.reshape(batch_size * num_frames, 1, channels * 3, -1)
     qkv = qkv.permute(0, 1, 3, 2).contiguous()
     q, k, v = qkv.chunk(3, dim=-1)
+    if rows is not None:
+        first, height = rows
+        q = q[:, :, first * width : (first + height) * width]
+        identity = identity[..., first : first + height, :]
 
     x = torch.nn.functional.scaled_dot_product_attention(q, k, v)
 
@@ -472,6 +613,7 @@ def residual_up_block_forward(self, x):
 
     if self.avg_shortcut is not None:
         shortcut = self.avg_shortcut
+        is_first_chunk = bool(first_chunk.get())
         if (
             dup_up3d_add is not None
             and type(shortcut) is DupUp3D
@@ -488,11 +630,14 @@ def residual_up_block_forward(self, x):
                 shortcut.factor_t,
                 shortcut.factor_s,
                 shortcut.repeats,
-                bool(first_chunk.get()),
+                is_first_chunk,
             )
             if fused is not None:
                 return fused
-        x = x + shortcut(x_copy)
+        if shortcut.can_fuse_add(x, x_copy, is_first_chunk):
+            x = shortcut.add_into_(x, x_copy, is_first_chunk)
+        else:
+            x = x + shortcut(x_copy)
 
     return x
 
@@ -699,14 +844,21 @@ class WanAttentionBlock(nn.Module):
         self.proj = nn.Conv2d(dim, dim, 1)
 
     def forward(self, x):
-        if self.world_size > 1:
-            x = gather_height_for_global_op(
-                x, parallel_group=self.parallel_group
-            ).contiguous()
-        x = attention_block_forward(self, x)
-        if self.world_size > 1:
-            x = chunk_height_for_parallel_decode(x, parallel_group=self.parallel_group)
-        return x
+        if self.world_size == 1 or spatial_parallel_decode_disabled():
+            return attention_block_forward(self, x)
+        x = gather_height_for_global_op(
+            x, parallel_group=self.parallel_group
+        ).contiguous()
+        # each rank attends only its own height shard's rows (the tensor_split
+        # chunk the full-frame output was cut to) over the whole frame
+        rank = (
+            self.parallel_group.rank_in_group
+            if self.parallel_group is not None
+            else get_decode_parallel_rank()
+        )
+        rows = torch.tensor_split(torch.arange(x.shape[-2]), self.world_size)[rank]
+        first = int(rows[0]) if rows.numel() else 0
+        return attention_block_forward(self, x, rows=(first, rows.numel())).contiguous()
 
 
 class WanMidBlock(nn.Module):

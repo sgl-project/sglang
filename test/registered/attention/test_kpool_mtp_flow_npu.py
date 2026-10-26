@@ -45,6 +45,30 @@ def _npu_is_available() -> bool:
 class TestKPoolMTPFlowNPU(CustomTestCase):
     device = "npu"
 
+    def test_kpool_keeps_host_lengths_when_base_backend_can_run_mirrorless(self):
+        # The base DSA backend can drop its CPU mirror, but KPool planning and
+        # IndexerKPool.forward_npu still consume it on decode and verify.
+        from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
+            AscendAttnBackend,
+        )
+
+        def init_base(backend, model_runner, speculative_step_id=0):
+            backend.page_size = PAGE_SIZE
+            backend.needs_cpu_seq_lens = False
+
+        module = "sglang.srt.hardware_backend.npu.attention.ascend_dsa_backend"
+        runner = SimpleNamespace(
+            model_config=SimpleNamespace(hf_config=object()),
+            kv_cache_dtype=torch.bfloat16,
+        )
+        with (
+            patch.object(AscendAttnBackend, "__init__", init_base),
+            patch(f"{module}.get_dsa_index_topk", return_value=2048),
+            patch(f"{module}.get_dsa_index_kpool", return_value=POOL_SIZE),
+        ):
+            backend = AscendDSAAttnBackend(runner)
+        self.assertTrue(backend.needs_cpu_seq_lens)
+
     def _make_backend(self):
         backend = object.__new__(AscendDSAAttnBackend)
         backend.page_size = PAGE_SIZE

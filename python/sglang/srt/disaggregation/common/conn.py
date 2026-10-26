@@ -8,7 +8,16 @@ import threading
 import time
 from collections import defaultdict
 from contextlib import nullcontext
-from typing import Dict, List, NamedTuple, Optional, Set, Tuple, Union
+from typing import (
+    Dict,
+    List,
+    Literal,
+    NamedTuple,
+    Optional,
+    Set,
+    Tuple,
+    Union,
+)
 
 import msgspec
 import numpy as np
@@ -33,17 +42,24 @@ from sglang.srt.disaggregation.common.bootstrap import (
     BootstrapNotification,
     DeferredBootstrap,
 )
+from sglang.srt.disaggregation.pp_consensus_store import PPConsensusStore
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     filter_kv_indices_for_cp_rank,
+    filter_kv_indices_for_shard_rank,
     get_dsv41_spec_layout,
 )
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.page_interleave import get_kv_shard_group
+from sglang.srt.observability.trace import TraceNullContext, TraceReqContext
 from sglang.srt.runtime_context import (
+    get_device,
     get_disagg,
+    get_observability,
     get_parallel,
     get_schedule,
     get_serving,
+    linear_attn_tp_size,
     max_prefill_buffer_tokens,
 )
 from sglang.srt.server_args import ServerArgs
@@ -112,7 +128,10 @@ class PrefillServerInfo:
     follow_bootstrap_room: bool
     enable_dsa_cache_layer_split: bool = False
     dsv41_spec_layout: Optional[dict] = None
+    kv_layout: Optional[str] = None
     decode_allocation_policy: str = "early"
+    # Each prefill shard-group rank owns a subset of logical KV pages.
+    enable_kv_cache_sharding: bool = False
 
     # PD true-retraction rebootstrap: the prefill's HTTP API port. The decode
     # already knows the prefill host (the bootstrap_addr host), so it can POST
@@ -267,6 +286,7 @@ class DeferredAbortAckState(msgspec.Struct):
 class CommonKVManager(BaseKVManager):
     defer_decode_allocation: bool = False
     deferred_bootstrap: Optional[DeferredBootstrap] = None
+    _staging_ctx = None
 
     # Wire layout of the prefill->decode terminal status message. The legacy
     # layout (mooncake, and ascend which inherits it) is three untagged frames
@@ -275,8 +295,18 @@ class CommonKVManager(BaseKVManager):
     # ``[tag, room, status, prefill_rank, reason]``.
     kv_status_msg_tag: Optional[bytes] = None
     kv_status_msg_carries_reason: bool = False
+    sender_trace_module: Optional[str] = None
+    # Sender reports transfer_latency_s (first enqueue -> Success). Otherwise
+    # the metric keeps its last-chunk fallback, so dashboards do not move.
+    reports_transfer_latency: bool = False
 
+    kv_layout: Optional[str] = None
     dsv41_spec_layout: Optional[dict] = None
+
+    # Logical-page KV sharding (PD prefill only): this rank's slot in the
+    # shard group. Each rank owns a subset of logical KV pages.
+    kv_shard_rank: int = 0
+    kv_shard_size: int = 1
 
     # Used by decode when the prefill reported Failed without a reason frame.
     DEFAULT_PREFILL_FAILURE_REASON = (
@@ -292,6 +322,7 @@ class CommonKVManager(BaseKVManager):
     ):
         self.kv_args = args
         self.kv_cache_dtype_str = args.kv_cache_dtype_str
+        self.kv_layout = args.kv_layout
         self.dsv41_spec_layout = get_dsv41_spec_layout(args)
         self.kv_item_lens_sum = sum(args.kv_item_lens)
         self.state_item_lens_sum = sum(x for comp in args.state_item_lens for x in comp)
@@ -319,6 +350,11 @@ class CommonKVManager(BaseKVManager):
         self.attn_tp_rank = parallel.attn_tp_rank
         self.attn_cp_size = parallel.attn_cp_size
         self.attn_cp_rank = parallel.attn_cp_rank
+        # The TP width the transferred state is laid out over, which decode
+        # pairs with: attention TP, or the TP group under CP-TP group sharing,
+        # where the GDN heads are partitioned over it and QSA/PLE state is whole
+        # on every rank. KV heads keep following attention TP.
+        self.state_tp_size = linear_attn_tp_size()
         self.dcp_size = parallel.attn_dcp_size
         self.dcp_rank = parallel.attn_dcp_rank
         self.attn_dp_size = parallel.attn_dp_size
@@ -330,6 +366,10 @@ class CommonKVManager(BaseKVManager):
         self.pp_size = get_parallel().pp_size
         self.pp_rank = self.kv_args.pp_rank
         self.local_ip = get_local_ip_auto()
+        if get_parallel().enable_kv_cache_sharding:
+            kv_shard_group = get_kv_shard_group(is_mla_backend)
+            self.kv_shard_rank = kv_shard_group.rank_in_group
+            self.kv_shard_size = kv_shard_group.world_size
         cp_sharded_prefill = self.attn_cp_size > 1 and (
             self.is_hybrid_mla_backend or get_parallel().enable_dsa_cache_layer_split
         )
@@ -338,10 +378,16 @@ class CommonKVManager(BaseKVManager):
             self.is_hybrid_mla_backend
             and disaggregation_mode == DisaggregationMode.DECODE
         )
-        self.enable_all_cp_ranks_for_transfer = (
+        # CP-TP group sharing: CP rank r holds every KV head, the CP-replicated
+        # state and linear-attention head shard r. It transfers as TP rank r of
+        # a CP-1 prefill (see register_to_bootstrap), not as a CP replica.
+        cp_tp_group_sharing = parallel.enable_cp_tp_group_sharing
+        self.enable_all_cp_ranks_for_transfer = not cp_tp_group_sharing and (
             envs.SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER.get()
             or cp_sharded_prefill
             or hybrid_decode_pulls_all_ranks
+            # No sharded rank holds a full page, so every CP rank sends.
+            or self.kv_shard_size > 1
         )
 
         # bind zmq socket
@@ -356,7 +402,7 @@ class CommonKVManager(BaseKVManager):
         )
         logger.debug(f"kv manager bind to {self.local_ip}:{self.rank_port}")
 
-        self.request_status: Dict[int, KVPoll] = {}
+        self.request_status: Union[Dict[int, KVPoll], PPConsensusStore] = {}
         self._socket_cache: Dict[str, zmq.Socket] = {}
         self._monitor_cache: Dict[str, zmq.Socket] = {}
         self._socket_send_locks: Dict[str, threading.Lock] = {}
@@ -388,6 +434,7 @@ class CommonKVManager(BaseKVManager):
             # participate in KV transfer; Otherwise only CP rank 0 sends.
             self.is_dummy_cp_rank = (
                 not self.enable_all_cp_ranks_for_transfer
+                and not cp_tp_group_sharing
                 and self.attn_cp_size > 1
                 and self.attn_cp_rank != 0
             )
@@ -403,6 +450,10 @@ class CommonKVManager(BaseKVManager):
             self.req_to_decode_prefix_len: Dict[int, int] = {}
             self.decode_kv_args_table = {}
             self.pp_group = get_parallel().pp_group
+            if self.pp_size > 1:
+                self.request_status = PPConsensusStore(
+                    self.pp_size, self.pp_rank, self.pp_group
+                )
             # If a timeout happens on the prefill side, it means prefill instances
             # fail to receive the KV indices from the decode instance of this request.
             # These timeout requests should be aborted to release the tree cache.
@@ -418,7 +469,7 @@ class CommonKVManager(BaseKVManager):
             self.session_pool: Dict = defaultdict(requests.Session)
             self.session_pool_lock = threading.Lock()
             self.addr_to_rooms_tracker: Dict[str, Set[int]] = defaultdict(set)
-            self.prefill_response_tracker: Dict[int, Set[int]] = defaultdict(set)
+            self.prefill_response_tracker: Dict[int, Set[int]] = {}
             # Deferred KV release: room -> current generation and ranks that
             # ACKed. The generation rejects an old request's late ACK after room
             # reuse.
@@ -454,6 +505,11 @@ class CommonKVManager(BaseKVManager):
                 f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
             )
 
+    def prepare_send_state_indices(
+        self, state_indices: Optional[List]
+    ) -> Optional[List]:
+        return state_indices
+
     def _should_skip_cp_replicated_state_transfer(self) -> bool:
         """Whether this prefill rank should omit CP-replicated state.
 
@@ -466,6 +522,7 @@ class CommonKVManager(BaseKVManager):
             self.attn_cp_size > 1
             and self.attn_cp_rank != 0
             and not get_parallel().enable_dsa_cache_layer_split
+            and not get_parallel().enable_cp_tp_group_sharing
         )
 
     def requires_dcp_relayout(self, dst_dcp_size: int, dst_dcp_rank: int) -> bool:
@@ -540,12 +597,55 @@ class CommonKVManager(BaseKVManager):
             len(self.transfer_queues),
             dcp_size,
             max_tokens,
+            device_type=get_device().device,
             include_draft=include_draft,
         )
         self._dcp_pack_max_tokens = max_tokens
 
     def check_status(self, bootstrap_room: int) -> KVPoll:
         return self.request_status[bootstrap_room]
+
+    def check_status_pp_consensus(self, bootstrap_room: int) -> KVPoll:
+        statuses = self.request_status.collect(bootstrap_room)
+        if any(status is None for status in statuses):
+            return KVPoll.Bootstrapping
+        return min(statuses)
+
+    def check_peer_aux_buffer_count(self, peer: str, num_remote: int) -> None:
+        """Aux (metadata) buffers pair up positionally, so a peer that
+        registered a different number of them gets only the leading ones, and
+        those line up only if the missing buffer is the last. Say so once per
+        registration; the senders stop at the shorter list."""
+        num_local = len(self.kv_args.aux_data_ptrs)
+        if num_remote != num_local:
+            logger.error(
+                "Decode %s registered %d metadata buffers but this prefill has %d; "
+                "only the first %d are transferred, and misaligned if the extra "
+                "buffer is not the last. An optional metadata buffer is enabled on "
+                "one engine only: --disaggregation-enable-kv-checksum, "
+                "SGLANG_ENABLE_DISAGG_SAMPLING_MASK, or the DSA top-k buffer.",
+                peer,
+                num_remote,
+                num_local,
+                min(num_remote, num_local),
+            )
+
+    def build_receiver_registration_message(self) -> List[bytes]:
+        raise NotImplementedError
+
+    def build_receiver_metadata_message(
+        self,
+        *,
+        bootstrap_room: int,
+        required_dst_info_num: int,
+        kv_indices: npt.NDArray[np.int32],
+        aux_index: Optional[int],
+        state_indices: Optional[List],
+        decode_prefix_len: Optional[int],
+        is_dummy: bool,
+        device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
+    ) -> List[bytes]:
+        raise NotImplementedError
 
     def update_status(self, bootstrap_room: int, status: KVPoll):
         current = self.request_status.get(bootstrap_room)
@@ -704,6 +804,51 @@ class CommonKVManager(BaseKVManager):
                     f"{na.to_host_port_str()}: {e}"
                 )
 
+    def send_chunk_ready(
+        self,
+        *,
+        room: int,
+        chunk_idx: int,
+        page_start: int,
+        num_pages: int,
+        writer_id: str,
+        targets: List[Tuple[str, int]],
+    ) -> None:
+        """Notify decode that a staging chunk RDMA is complete (every chunk;
+        scatter is arrival-driven)."""
+        parts = [
+            b"CHUNK_READY",
+            str(room).encode("ascii"),
+            str(chunk_idx).encode("ascii"),
+            str(page_start).encode("ascii"),
+            str(num_pages).encode("ascii"),
+            writer_id.encode("ascii"),
+            str(self._prefill_unique_rank()).encode("ascii"),
+        ]
+        for endpoint, port in targets:
+            na = NetworkAddress(endpoint, port)
+            self._send_multipart_locked(na.to_tcp(), parts, is_ipv6=na.is_ipv6)
+
+    def handle_chunk_ready(self, msg: List[bytes]) -> bool:
+        if not msg or msg[0] != b"CHUNK_READY":
+            return False
+        try:
+            room, chunk_idx, page_start, num_pages = (
+                int(part.decode("ascii")) for part in msg[1:5]
+            )
+            writer_id = msg[5].decode("ascii")
+        except (IndexError, ValueError, UnicodeDecodeError):
+            logger.warning("Dropping malformed CHUNK_READY message")
+            return True
+        if room not in self.request_status:
+            return True
+        handler = self._staging_handler
+        if handler is None:
+            logger.warning("CHUNK_READY for room %s without a staging handler", room)
+            return True
+        handler.handle_chunk_arrived(room, chunk_idx, page_start, num_pages, writer_id)
+        return True
+
     def conclude_transfer(
         self,
         *,
@@ -791,10 +936,13 @@ class CommonKVManager(BaseKVManager):
             self.update_status(bootstrap_room, KVPoll.WaitingForInput)
             return
         if status == KVPoll.Success:
-            self.prefill_response_tracker[bootstrap_room].add(prefill_rank)
+            completed_ranks = self.prefill_response_tracker.get(bootstrap_room)
+            if completed_ranks is None:
+                return
             expected_response_num = self.required_prefill_response_num_table.get(
                 bootstrap_room
             )
+            completed_ranks.add(prefill_rank)
             if expected_response_num is None:
                 logger.warning(
                     "No expected prefill response count for room %s, prefill rank %s",
@@ -802,14 +950,10 @@ class CommonKVManager(BaseKVManager):
                     prefill_rank,
                 )
                 return
-            if (
-                len(self.prefill_response_tracker[bootstrap_room])
-                < expected_response_num
-            ):
+            if len(completed_ranks) < expected_response_num:
                 return
             # Tell the staging handler no more chunks are coming, before any
-            # poller can see Success. Only mooncake gets here: NIXL arms the
-            # handler from its own notifications, mori has no staging.
+            # poller can see Success.
             if self.enable_staging and self._staging_handler is not None:
                 handler = self._staging_handler
                 if handler.is_staging_room(bootstrap_room):
@@ -898,6 +1042,10 @@ class CommonKVManager(BaseKVManager):
         """Send the deferred ack once an aborted room's chunks have drained
         (outstanding == 0). pop() makes it fire at most once."""
         if self._staging_outstanding.get(room, 0) > 0:
+            return
+        if room in self._deferred_ack_poisoned_rooms:
+            # A target registered concurrently with the poison must not fire.
+            self._deferred_ack_targets.pop(room, None)
             return
         self._send_abort_acks(room, self._deferred_ack_targets.pop(room, None))
 
@@ -1183,6 +1331,28 @@ class CommonKVManager(BaseKVManager):
                 f"Both servers must use the same --kv-cache-dtype value."
             )
 
+        if (
+            StateType.MINIMAX_INDEX_K in getattr(self.kv_args, "state_types", ())
+            and info.attn_tp_size != self.attn_tp_size
+        ):
+            # MiniMax main KV pages are head-major page rows and its index state
+            # is replicated per rank; neither can be resliced by attention head.
+            raise RuntimeError(
+                "MiniMax sparse PD requires matching attention TP sizes: "
+                f"prefill={info.attn_tp_size}, decode={self.attn_tp_size}."
+            )
+
+        if (
+            info.kv_layout is not None
+            and self.kv_layout is not None
+            and info.kv_layout != self.kv_layout
+        ):
+            raise RuntimeError(
+                f"KV layout mismatch: prefill server has kv_layout={info.kv_layout}, "
+                f"but decode server has kv_layout={self.kv_layout}. Both servers "
+                f"must use the same --dsv4-attn-backend and SGLANG_DSV4_KV_LAYOUT."
+            )
+
         local_layout = self.dsv41_spec_layout
         if local_layout is not None or info.dsv41_spec_layout is not None:
             if local_layout != info.dsv41_spec_layout:
@@ -1199,17 +1369,40 @@ class CommonKVManager(BaseKVManager):
                     "enable DSpark with the same block size and target/draft KV "
                     "layout. Upgrade both servers together."
                 )
-            if info.attn_cp_size != 1 or self.attn_cp_size != 1:
-                raise RuntimeError(
-                    "DeepSeek-V4.1 DP-only DSpark PD requires CP=1 on both servers"
-                )
-            non_cp_mla_layout = info.attn_cp_size == self.attn_cp_size == 1 and (
-                self.is_mla_backend or self.is_hybrid_mla_backend
+
+            decode_tp_size_aligns_prefill_world_size = (
+                info.attn_cp_size > 1
+                and (self.is_mla_backend or self.is_hybrid_mla_backend)
+                and self.attn_cp_size == 1
+                and info.attn_tp_size * info.attn_cp_size == self.attn_tp_size
             )
-            if info.attn_tp_size != self.attn_tp_size and not non_cp_mla_layout:
+            if (
+                info.attn_tp_size != self.attn_tp_size
+                and not decode_tp_size_aligns_prefill_world_size
+            ):
                 raise RuntimeError(
-                    "DeepSeek-V4.1 DSpark PD requires matching attention TP "
-                    "unless both servers use CP=1 with an MLA KV layout"
+                    "DeepSeek-V4.1 DSpark PD requires the same TP size on both "
+                    "servers (including prefill CP ranks for MLA)"
+                )
+
+        # Every send path rejects head-sharded MXFP8 block scales across
+        # attention TP sizes, so each request would fail at its first transfer.
+        if (
+            info.attn_tp_size != self.attn_tp_size
+            and not self.is_mla_backend
+            and not self.is_hybrid_mla_backend
+        ):
+            block_scale_states = [
+                st
+                for st in getattr(self.kv_args, "state_types", None) or []
+                if st in (StateType.BLOCK_SCALE, StateType.BLOCK_SCALE_SWA)
+            ]
+            if block_scale_states:
+                raise RuntimeError(
+                    "PD Disaggregation does NOT support different attention TP "
+                    "sizes with MXFP8 KV cache: prefill attn_tp_size="
+                    f"{info.attn_tp_size}, decode attn_tp_size={self.attn_tp_size}, "
+                    f"state types {[st.value for st in block_scale_states]}."
                 )
 
         if self.dcp_size > 1:
@@ -1222,6 +1415,11 @@ class CommonKVManager(BaseKVManager):
                     "PD decode DCP currently requires prefill attention CP=1, "
                     f"got {info.attn_cp_size}."
                 )
+            if info.enable_kv_cache_sharding:
+                raise RuntimeError(
+                    "PD decode DCP does not support a prefill with "
+                    "--enable-kv-cache-sharding."
+                )
 
         self._resolve_rank_mapping(info)
         self.prefill_info_table[bootstrap_addr] = info
@@ -1232,7 +1430,23 @@ class CommonKVManager(BaseKVManager):
         """Compute TP/CP/PP rank mapping and store on the PrefillServerInfo object.
         Deterministic for a given (bootstrap_addr, decode engine) pair."""
         # TP rank mapping
-        if self.attn_tp_size == info.attn_tp_size:
+        # Only MLA shards across attn-TP, so non-MLA never reads the sharding flag.
+        if (
+            self.is_mla_backend
+            and info.enable_kv_cache_sharding
+            and info.attn_cp_size == 1
+        ):
+            # MLA KV sharded across prefill attn-TP: every decode rank pulls
+            # from all prefill TP ranks (None marks them all as real senders).
+            assert self.attn_tp_size == info.attn_tp_size, (
+                "MLA KV cache sharding requires equal prefill/decode attn TP "
+                f"sizes, got prefill={info.attn_tp_size} decode={self.attn_tp_size}"
+            )
+            target_tp_rank = None
+            target_tp_ranks = list(range(info.attn_tp_size))
+            required_dst_info_num = self.attn_tp_size
+            required_prefill_response_num = info.attn_tp_size
+        elif self.attn_tp_size == info.attn_tp_size:
             target_tp_rank = self.kv_args.engine_rank % self.attn_tp_size
             required_dst_info_num = 1
             required_prefill_response_num = 1
@@ -1286,6 +1500,7 @@ class CommonKVManager(BaseKVManager):
             pull_from_all_cp_ranks = (
                 self.enable_all_cp_ranks_for_transfer
                 or info.enable_dsa_cache_layer_split
+                or info.enable_kv_cache_sharding
             )
             if not pull_from_all_cp_ranks:
                 # Only retrieve from prefill CP rank 0 when not using all ranks
@@ -1358,11 +1573,16 @@ class CommonKVManager(BaseKVManager):
 
         bootstrap_na = NetworkAddress(host, self.bootstrap_port)
         url = f"{bootstrap_na.to_url()}/route"
+        attn_tp = (self.attn_tp_size, self.attn_tp_rank)
+        attn_cp = (self.attn_cp_size, self.attn_cp_rank)
+        if get_parallel().enable_cp_tp_group_sharing:
+            # Decode pairs its TP rank r with this CP rank r (see __init__).
+            attn_tp, attn_cp = attn_cp, (1, 0)
         payload = {
-            "attn_tp_size": self.attn_tp_size,
-            "attn_tp_rank": self.attn_tp_rank,
-            "attn_cp_size": self.attn_cp_size,
-            "attn_cp_rank": self.attn_cp_rank,
+            "attn_tp_size": attn_tp[0],
+            "attn_tp_rank": attn_tp[1],
+            "attn_cp_size": attn_cp[0],
+            "attn_cp_rank": attn_cp[1],
             "attn_dp_size": self.attn_dp_size,
             "attn_dp_rank": self.attn_dp_rank,
             "pp_size": self.pp_size,
@@ -1373,9 +1593,11 @@ class CommonKVManager(BaseKVManager):
             "rank_port": self.rank_port,
             "page_size": self.kv_args.page_size,
             "kv_cache_dtype": self.kv_cache_dtype_str,
+            "kv_layout": self.kv_layout,
             "dsv41_spec_layout": self.dsv41_spec_layout,
             "load_balance_method": get_parallel().load_balance_method,
             "enable_dsa_cache_layer_split": get_parallel().enable_dsa_cache_layer_split,
+            "enable_kv_cache_sharding": get_parallel().enable_kv_cache_sharding,
             # Self-register the HTTP API port so the decode can derive the PD
             # retract rebootstrap /generate URL from bootstrap info instead of a
             # router-injected pd_rebootstrap_prefill_url.
@@ -1523,6 +1745,108 @@ class CommonKVManager(BaseKVManager):
         layers_current_pp_stage = len(src_k_ptrs)
         return src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage
 
+    def _get_mha_head_slice_blocks(
+        self,
+        src_ptrs: List[int],
+        src_item_lens: List[int],
+        dst_ptrs: List[int],
+        dst_item_lens: List[int],
+        src_page_indices: npt.NDArray[np.int32],
+        dst_page_indices: npt.NDArray[np.int32],
+        dst_attn_tp_size: int,
+        dst_tp_rank: int,
+    ) -> List[Tuple[npt.NDArray[np.uint64], npt.NDArray[np.uint64], int]]:
+        # SWA state has no layer ids and its pool starts every PP stage at layer
+        # 0, so a prefill stage's entries cannot be paired with the decode layers.
+        if self.pp_size > 1:
+            raise RuntimeError(
+                "PD Disaggregation does NOT support PD different TP sizes for "
+                "non-MLA SWA hybrid models with pipeline parallelism yet."
+            )
+        # The addresses below assume NHD pages [page_size, heads, head_dim]; HND
+        # and vectorized_5d pages have the same size in another element order.
+        if self.kv_args.swa_kv_cache_layout != "nhd":
+            raise RuntimeError(
+                "Head-sliced PD transfer needs the NHD KV cache layout, got "
+                f"{self.kv_args.swa_kv_cache_layout}"
+            )
+        from sglang.srt.disaggregation.common.staging_buffer import (
+            compute_head_slice_params,
+            resolve_total_kv_heads,
+        )
+
+        src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, num_layers = (
+            self.get_mha_kv_ptrs_with_pp(src_ptrs, dst_ptrs)
+        )
+        _, _, dst_k_lens, dst_v_lens, _ = self.get_mha_kv_ptrs_with_pp(
+            src_item_lens, dst_item_lens
+        )
+        entries = list(
+            zip(
+                src_k_ptrs + src_v_ptrs,
+                dst_k_ptrs + dst_v_ptrs,
+                src_item_lens,
+                dst_k_lens + dst_v_lens,
+            )
+        )
+        # A single page-envelope region (unified memory) has no per-layer K/V
+        # split to slice heads from.
+        if len(entries) != len(src_ptrs) or 2 * num_layers != len(src_ptrs):
+            raise RuntimeError(
+                "Head-sliced PD transfer needs matching per-layer K/V buffers: "
+                f"prefill has {len(src_ptrs)} entries, decode has {len(dst_ptrs)}"
+            )
+        if len(src_page_indices) != len(dst_page_indices):
+            raise RuntimeError(
+                "Head-sliced PD transfer page count mismatch: "
+                f"prefill={len(src_page_indices)}, decode={len(dst_page_indices)}"
+            )
+
+        total_kv_heads = resolve_total_kv_heads(self.kv_args, self.attn_tp_size)
+        src_head_start, num_heads, dst_head_start, _ = compute_head_slice_params(
+            src_attn_tp_size=self.attn_tp_size,
+            dst_attn_tp_size=dst_attn_tp_size,
+            src_tp_rank=self.kv_args.engine_rank,
+            dst_tp_rank=dst_tp_rank,
+            total_kv_heads=total_kv_heads,
+        )
+        src_heads = max(1, total_kv_heads // self.attn_tp_size)
+        dst_heads = max(1, total_kv_heads // dst_attn_tp_size)
+        page_size = self.kv_args.page_size
+        tokens = np.arange(page_size, dtype=np.uint64)
+        src_pages = np.asarray(src_page_indices, dtype=np.uint64)[:, None]
+        dst_pages = np.asarray(dst_page_indices, dtype=np.uint64)[:, None]
+
+        blocks = []
+        for src_ptr, dst_ptr, src_item_len, dst_item_len in entries:
+            head_len = src_item_len // (page_size * src_heads)
+            # Both peers must hold whole heads of one size, or this state is
+            # sharded differently from total_kv_head_num.
+            if (
+                head_len * page_size * src_heads != src_item_len
+                or head_len * page_size * dst_heads != dst_item_len
+            ):
+                raise RuntimeError(
+                    f"KV item lengths (prefill={src_item_len}, decode={dst_item_len}) "
+                    f"do not split into {src_heads} and {dst_heads} heads of "
+                    f"{total_kv_heads} total with page_size={page_size}"
+                )
+            # Each page item is [page_size, heads, head_dim]: one block per token.
+            src_addrs = (
+                np.uint64(src_ptr)
+                + src_pages * np.uint64(src_item_len)
+                + tokens * np.uint64(src_heads * head_len)
+                + np.uint64(src_head_start * head_len)
+            )
+            dst_addrs = (
+                np.uint64(dst_ptr)
+                + dst_pages * np.uint64(dst_item_len)
+                + tokens * np.uint64(dst_heads * head_len)
+                + np.uint64(dst_head_start * head_len)
+            )
+            blocks.append((src_addrs.ravel(), dst_addrs.ravel(), num_heads * head_len))
+        return blocks
+
     def get_mla_kv_ptrs_with_pp(
         self,
         src_kv_ptrs: List[int],
@@ -1548,8 +1872,16 @@ class CommonKVManager(BaseKVManager):
 
         # Regular MLA PP slicing
         # Decode pp size should be equal to prefill pp size or 1
-        start_layer, end_layer = self._mla_kv_entry_span_with_pp(len(src_kv_ptrs))
+        num_draft = (
+            getattr(self.kv_args, "num_draft_entries", 0) if state_type is None else 0
+        )
+        start_layer, end_layer = self._mla_kv_entry_span_with_pp(
+            len(src_kv_ptrs) - num_draft
+        )
         sliced_dst_kv_ptrs = dst_kv_ptrs[start_layer:end_layer]
+        if num_draft:
+            # Draft entries follow the target's global layer range on both peers.
+            sliced_dst_kv_ptrs += dst_kv_ptrs[-num_draft:]
         return src_kv_ptrs, sliced_dst_kv_ptrs, len(src_kv_ptrs)
 
     def _mla_kv_entry_span_with_pp(self, n_src: int) -> Tuple[int, int]:
@@ -1740,6 +2072,9 @@ class CommonKVManager(BaseKVManager):
             for k in keys_to_remove:
                 del self.connection_pool[k]
             self.prefill_info_table.pop(failed_bootstrap_addr, None)
+            # A prefill that a later request reaches again starts with no
+            # misses; a kept count would drop it at its first missed heartbeat.
+            self.heartbeat_failures.pop(failed_bootstrap_addr, None)
 
             possible_affected_rooms = list(
                 self.addr_to_rooms_tracker.get(failed_bootstrap_addr, [])
@@ -1784,6 +2119,19 @@ class CommonKVSender(BaseKVSender):
         self._transfer_metric = KVTransferMetric()
         self._transfer_num_kv_indices = 0
         self._transfer_num_state_indices = 0
+        self._transfer_start_time: Optional[float] = None
+        self._early_send_wait_event: Optional[object] = None
+        self.trace_ctx = TraceNullContext()
+        if self.kv_mgr.sender_trace_module and get_observability().enable_trace:
+            self.trace_ctx = TraceReqContext(
+                rid=str(hex(self.bootstrap_room)),
+                bootstrap_room=self.bootstrap_room,
+                role="Sender",
+                module_name=self.kv_mgr.sender_trace_module,
+            )
+            if not self.trace_ctx.tracing_enable:
+                self.trace_ctx = TraceNullContext()
+        self.trace_ctx.trace_req_start()
         # inner state
         self.curr_idx = 0
         self.init_time: Optional[float] = None
@@ -1828,6 +2176,8 @@ class CommonKVSender(BaseKVSender):
                 )
                 self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
                 return
+        # Bootstrap timeout clock starts after the registration above.
+        self.init_time = time.time()
 
     def _register_prefill_dp_rank(self):
         """Register this request's prefill dp_rank to the bootstrap server."""
@@ -1918,7 +2268,17 @@ class CommonKVSender(BaseKVSender):
         self.curr_idx += len(kv_indices)
         is_last_chunk = self.curr_idx == self.num_kv_indices
 
-        if (
+        if self.kv_mgr.kv_shard_size > 1:
+            kv_indices, index_slice = filter_kv_indices_for_shard_rank(
+                kv_indices=kv_indices,
+                index_slice=index_slice,
+                shard_rank=self.kv_mgr.kv_shard_rank,
+                shard_size=self.kv_mgr.kv_shard_size,
+            )
+            # Like the scheduler, skip a non-final chunk with nothing to send.
+            if len(kv_indices) == 0 and not is_last_chunk:
+                return kv_indices, index_slice, is_last_chunk, True
+        elif (
             self.kv_mgr.enable_all_cp_ranks_for_transfer
             and not get_parallel().enable_dsa_cache_layer_split
         ):
@@ -1942,8 +2302,82 @@ class CommonKVSender(BaseKVSender):
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List] = None,
         num_kv_tokens: Optional[int] = None,
+        indices_event: Optional[object] = None,
     ):
-        pass
+        if self.conclude_state in (KVPoll.Success, KVPoll.Failed):
+            return
+
+        kv_indices, index_slice, is_last_chunk, should_skip = (
+            self._prepare_send_indices(kv_indices, state_indices)
+        )
+        if should_skip:
+            return
+
+        state_indices = self.kv_mgr.prepare_send_state_indices(state_indices)
+        if self._transfer_start_time is None and (
+            len(kv_indices) > 0 or state_indices is not None
+        ):
+            self._transfer_start_time = time.perf_counter()
+
+        # The early-send event belongs to exactly one chunk; the Mooncake and
+        # Mori workers synchronize on it before reading source KV.
+        wait_event = self._early_send_wait_event
+        self._early_send_wait_event = None
+        self.kv_mgr.add_transfer_request(
+            self.bootstrap_room,
+            kv_indices,
+            index_slice,
+            is_last_chunk,
+            aux_index=self.aux_index if is_last_chunk else None,
+            state_indices=state_indices if is_last_chunk else None,
+            num_kv_tokens=num_kv_tokens,
+            wait_event=wait_event,
+            indices_event=indices_event,
+            trace_ctx=self.trace_ctx.copy_for_thread(),
+        )
+        self._record_transfer_indices(kv_indices, state_indices)
+
+    def poll(self) -> KVPoll:
+        return self._poll_with_status(self.kv_mgr.check_status)
+
+    def poll_pp_consensus(self) -> KVPoll:
+        return self._poll_with_status(self.kv_mgr.check_status_pp_consensus)
+
+    def _poll_with_status(self, check_status) -> KVPoll:
+        if self.conclude_state is not None:
+            return self.conclude_state
+
+        if self.bootstrap_room in self.kv_mgr.request_status:
+            status = check_status(self.bootstrap_room)
+        else:
+            status = KVPoll.Failed
+        # Hold Success until all staging chunks transferred. With deferred
+        # allocation also wait for worker cleanup (the zero entry is only
+        # removed after cleanup), before permitting the room to be reused.
+        if status == KVPoll.Success and (
+            self.kv_mgr._staging_outstanding.get(self.bootstrap_room, 0) > 0
+            or (
+                self.kv_mgr.defer_decode_allocation
+                and self.bootstrap_room in self.kv_mgr._staging_outstanding
+            )
+        ):
+            return KVPoll.Transferring
+        if status == KVPoll.Bootstrapping:
+            timeout_status = self._check_bootstrap_timeout()
+            if timeout_status is not None:
+                status = timeout_status
+        if status in (KVPoll.Success, KVPoll.Failed):
+            self.conclude_state = status
+            if (
+                status == KVPoll.Success
+                and self.kv_mgr.reports_transfer_latency
+                and self._transfer_start_time is not None
+            ):
+                self._transfer_metric.transfer_latency_s = (
+                    time.perf_counter() - self._transfer_start_time
+                )
+            self.trace_ctx.trace_req_finish()
+        return status
 
     def _check_bootstrap_timeout(self) -> Optional[KVPoll]:
         start = (
@@ -1981,12 +2415,22 @@ class CommonKVSender(BaseKVSender):
                 == KVPoll.Success,
             )
             self._owns_bootstrap_room = False
+        if self.conclude_state is None:
+            status = self.kv_mgr.request_status.get(self.bootstrap_room)
+            if status in (KVPoll.Success, KVPoll.Failed):
+                self.conclude_state = status
         self.kv_mgr.request_status.pop(self.bootstrap_room, None)
         self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, None)
         self.kv_mgr.transfer_infos.pop(self.bootstrap_room, None)
         # A sender can be cleared while a counted transfer is still writing:
         # keep the target for the worker, or ACK now if nothing is in flight.
         self.kv_mgr._maybe_ack_drained_abort(self.bootstrap_room)
+        staging_ctx = self.kv_mgr._staging_ctx
+        if staging_ctx is not None:
+            staging_ctx.prefetched_rooms.discard(self.bootstrap_room)
+            for key in list(staging_ctx.prefetch_requested):
+                if key[0] == self.bootstrap_room:
+                    staging_ctx.prefetch_requested.discard(key)
         if notification is not None:
             endpoint, failed = notification
             self.kv_mgr.send_kv_status_message(
@@ -1995,6 +2439,18 @@ class CommonKVSender(BaseKVSender):
                 status=KVPoll.Failed if failed else KVPoll.Success,
                 failure_reason="Prefill bootstrap failed" if failed else None,
             )
+
+    def failure_exception(self):
+        self.conclude_state = KVPoll.Failed
+        self.clear()
+        with self.kv_mgr.failure_lock:
+            failure_reason = self.kv_mgr.failure_records.pop(self.bootstrap_room, None)
+        self.trace_ctx.trace_req_finish()
+        raise KVTransferError(
+            self.bootstrap_room,
+            failure_reason or "Failed due to an unknown reason from another rank",
+            is_from_another_rank=failure_reason is None,
+        )
 
     def abort(self):
         if self.kv_mgr.deferred_bootstrap is not None and not self._owns_bootstrap_room:
@@ -2005,6 +2461,8 @@ class CommonKVSender(BaseKVSender):
         )
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
         self.conclude_state = KVPoll.Failed
+        self.trace_ctx.abort(abort_info={"reason": "Aborted"})
+        self.trace_ctx.trace_req_finish()
 
 
 class CommonKVReceiver(BaseKVReceiver):
@@ -2045,6 +2503,7 @@ class CommonKVReceiver(BaseKVReceiver):
             self.conclude_state = KVPoll.Failed
             return
         self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].add(self.bootstrap_room)
+        self.kv_mgr.prefill_response_tracker.setdefault(self.bootstrap_room, set())
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
 
     def init(self, prefill_dp_rank: int):
@@ -2338,17 +2797,90 @@ class CommonKVReceiver(BaseKVReceiver):
         return sock, lock
 
     def _register_kv_args(self) -> bool:
+        if self.bootstrap_infos is None:
+            return False
+        if not self.bootstrap_infos:
+            return True
+
+        message = self.kv_mgr.build_receiver_registration_message()
+        for bootstrap_info in self.bootstrap_infos:
+            if not self._send_bootstrap_message(
+                bootstrap_info=bootstrap_info,
+                message=message,
+                operation="_register_kv_args",
+            ):
+                return False
+        return True
+
+    def _send_bootstrap_message(
+        self,
+        *,
+        bootstrap_info: dict,
+        message: List[bytes],
+        operation: Literal["_register_kv_args", "send_metadata"],
+    ) -> bool:
+        try:
+            sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
+            with lock:
+                sock.send_multipart(message)
+        except zmq.ZMQError:
+            self.kv_mgr.record_failure(
+                self.bootstrap_room,
+                f"{operation} to prefill {bootstrap_info.get('rank_ip')}:{bootstrap_info.get('rank_port')} failed",
+            )
+            self.conclude_state = KVPoll.Failed
+            self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+            return False
         return True
 
     def send_metadata(
         self,
         kv_indices: npt.NDArray[np.int32],
         aux_index: Optional[int] = None,
-        state_indices: Optional[List[int]] = None,
+        state_indices: Optional[List] = None,
         decode_prefix_len: Optional[int] = None,
         destination: KVTransferDestination = KVTransferDestination.DEVICE,
+        device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
     ):
-        raise NotImplementedError
+        if self.bootstrap_infos is None:
+            self.kv_mgr.record_failure(
+                self.bootstrap_room,
+                f"Could not fetch prefill parallel info from bootstrap_addr: {self.bootstrap_addr}",
+            )
+            self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+            return
+        if destination != KVTransferDestination.DEVICE:
+            raise NotImplementedError("Host KV destinations are not supported")
+
+        self.chunk_staging_infos = []
+        if (
+            self.kv_mgr.enable_staging
+            and self.kv_mgr._staging_ctx.allocator is not None
+        ):
+            self.kv_mgr.register_staging_room_bootstrap(
+                self.bootstrap_room, self.bootstrap_infos, self
+            )
+
+        for bootstrap_info in self.bootstrap_infos:
+            message = self.kv_mgr.build_receiver_metadata_message(
+                bootstrap_room=self.bootstrap_room,
+                required_dst_info_num=self.required_dst_info_num,
+                kv_indices=kv_indices,
+                aux_index=aux_index,
+                state_indices=state_indices,
+                decode_prefix_len=decode_prefix_len,
+                is_dummy=bootstrap_info["is_dummy"],
+                device_kv_indices=device_kv_indices,
+            )
+            if not self._send_bootstrap_message(
+                bootstrap_info=bootstrap_info,
+                message=message,
+                operation="send_metadata",
+            ):
+                self.invalidate_cached_bootstrap_infos()
+                return
+
+        self.init_time = time.time()
 
     def _check_waiting_timeout(self) -> Optional[KVPoll]:
         if self.init_time is None:
@@ -2392,6 +2924,11 @@ class CommonKVReceiver(BaseKVReceiver):
             # Preserve the recorded root cause; this is cleanup, not a new abort.
             self._send_abort_notification()
             self.abort_notified = True
+        if self.conclude_state is None:
+            status = self.kv_mgr.request_status.get(self.bootstrap_room)
+            self.conclude_state = (
+                status if status in (KVPoll.Success, KVPoll.Failed) else KVPoll.Failed
+            )
         self.kv_mgr.request_status.pop(self.bootstrap_room, None)
         self.kv_mgr.required_prefill_response_num_table.pop(self.bootstrap_room, None)
         self.kv_mgr.prefill_response_tracker.pop(self.bootstrap_room, None)
@@ -2401,16 +2938,25 @@ class CommonKVReceiver(BaseKVReceiver):
         if self.kv_mgr.defer_decode_allocation:
             self._owns_bootstrap_room = False
 
+    def failure_exception(self):
+        self.conclude_state = KVPoll.Failed
+        self.clear()
+        with self.kv_mgr.failure_lock:
+            failure_reason = self.kv_mgr.failure_records.pop(self.bootstrap_room, None)
+        raise KVTransferError(
+            self.bootstrap_room,
+            failure_reason or "Failed due to an unknown reason from another rank",
+            is_from_another_rank=failure_reason is None,
+        )
+
     def abort(self):
         if not self._owns_bootstrap_room:
             self.conclude_state = KVPoll.Failed
             return
-        self.kv_mgr.record_failure(
-            self.bootstrap_room,
-            "Aborted by AbortReq.",
-        )
-        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
-        self.conclude_state = KVPoll.Failed
+        if self.conclude_state != KVPoll.Failed:
+            self.kv_mgr.record_failure(self.bootstrap_room, "Aborted by AbortReq.")
+            self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+            self.conclude_state = KVPoll.Failed
         self.ensure_abort_notified()
 
     def ensure_abort_notified(self, *, force_arm: bool = False) -> None:
@@ -2480,9 +3026,11 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.dp_size = None
         self.page_size = None
         self.kv_cache_dtype: Optional[str] = None
+        self.kv_layout: Optional[str] = None
         self.dsv41_spec_layout: Optional[dict] = None
         self.follow_bootstrap_room: Optional[bool] = None
         self.enable_dsa_cache_layer_split: Optional[bool] = None
+        self.enable_kv_cache_sharding: Optional[bool] = None
         self.prefill_http_port: Optional[int] = None
         self.decode_allocation_policy = "early"
         self.prefill_port_table: Dict[
@@ -2551,6 +3099,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         rank_port = int(data["rank_port"])
         page_size = int(data["page_size"])
         kv_cache_dtype = data["kv_cache_dtype"]
+        kv_layout = data.get("kv_layout")
         prefill_http_port = data.get("prefill_http_port")
         dsv41_spec_layout = data.get("dsv41_spec_layout")
 
@@ -2585,6 +3134,9 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         if self.kv_cache_dtype is None and kv_cache_dtype is not None:
             self.kv_cache_dtype = kv_cache_dtype
 
+        if self.kv_layout is None and kv_layout is not None:
+            self.kv_layout = kv_layout
+
         if self.prefill_http_port is None and prefill_http_port is not None:
             self.prefill_http_port = int(prefill_http_port)
 
@@ -2597,6 +3149,11 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         if self.enable_dsa_cache_layer_split is None:
             self.enable_dsa_cache_layer_split = bool(
                 data.get("enable_dsa_cache_layer_split", False)
+            )
+
+        if self.enable_kv_cache_sharding is None:
+            self.enable_kv_cache_sharding = bool(
+                data.get("enable_kv_cache_sharding", False)
             )
 
         if system_dp_size == 1:
@@ -2657,6 +3214,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 pp_size=self.pp_size,
                 page_size=self.page_size,
                 kv_cache_dtype=self.kv_cache_dtype,
+                kv_layout=self.kv_layout,
                 dsv41_spec_layout=self.dsv41_spec_layout,
                 follow_bootstrap_room=(
                     self.follow_bootstrap_room
@@ -2664,12 +3222,15 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                     else True
                 ),
                 enable_dsa_cache_layer_split=bool(self.enable_dsa_cache_layer_split),
+                enable_kv_cache_sharding=bool(self.enable_kv_cache_sharding),
                 prefill_http_port=self.prefill_http_port,
                 decode_allocation_policy=self.decode_allocation_policy,
             )
             payload = dataclasses.asdict(info)
             if info.dsv41_spec_layout is None:
                 payload.pop("dsv41_spec_layout")
+            if info.kv_layout is None:
+                payload.pop("kv_layout")
             return web.json_response(payload, status=200)
 
         if not self._is_ready():

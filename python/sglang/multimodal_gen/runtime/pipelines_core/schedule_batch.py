@@ -27,6 +27,9 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
     DataType,
     SamplingParams,
 )
+from sglang.multimodal_gen.runtime.post_training.flow_rollout_controller import (
+    FlowRolloutController,
+)
 from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
     RolloutTrajectoryData,
 )
@@ -135,6 +138,7 @@ class Req:
 
     # Latent tensors
     latents: torch.Tensor | None = None
+    source_latents: list[torch.Tensor] | None = None
     y: torch.Tensor | None = None
     # Flux-2
     latent_ids: torch.Tensor | None = None
@@ -197,6 +201,8 @@ class Req:
     trajectory_timesteps: torch.Tensor | None = None
     trajectory_latents: torch.Tensor | None = None
     rollout_trajectory_data: RolloutTrajectoryData | None = None
+    # Rollout controllers of this request, keyed by latent stream.
+    rollout_controllers: dict[str, FlowRolloutController] = field(default_factory=dict)
     trajectory_audio_latents: torch.Tensor | None = None
 
     # Extra parameters that might be needed by specific pipeline implementations (e.g., LTX2.3 DenoisingAVStage)
@@ -205,6 +211,10 @@ class Req:
     condition_inputs: dict[str, Any] = field(default_factory=dict)
 
     is_warmup: bool = False
+    report_progress: bool = False
+
+    # request ids merged into this dynamic batch
+    merged_request_ids: list[str] | None = None
 
     # STA parameters
     STA_param: list | None = None
@@ -342,13 +352,17 @@ class Req:
             return None
         return f"{int(width)}x{int(height)}"
 
+    def client_request_ids(self) -> list[str]:
+        if self.merged_request_ids:
+            return self.merged_request_ids
+        return [self.request_id] if self.request_id else []
+
     def set_as_warmup(self, warmup_steps: int = 1):
         self.is_warmup = True
         self.save_output = False
         self.suppress_logs = True
         self.metrics.suppress_stage_breakdown = True
         self.extra["cache_dit_num_inference_steps"] = self.num_inference_steps
-        self.extra["warmup_target_num_inference_steps"] = self.num_inference_steps
         floor = getattr(type(self.sampling_params), "min_num_inference_steps", 1)
         self.num_inference_steps = max(warmup_steps, floor)
 
@@ -356,34 +370,6 @@ class Req:
         req = deepcopy(self)
         req.set_as_warmup(warmup_steps)
         return req
-
-    def record_stage_iterations(
-        self,
-        measured_iterations: int,
-        target_iterations: int | None = None,
-    ) -> None:
-        """Record a stage loop against its full default-request work.
-
-        Most stages declare the count as a formula of the step count
-        (``PipelineStage.default_workload_iterations``) and never call this.
-        It is for loops whose length is only known inside them (chunked or
-        block-wise schedules); ``target_iterations`` defaults to scaling the
-        measured count from the probe's steps to the default workload's.
-        """
-        if not self.is_warmup or self.metrics is None:
-            return
-        measured = max(1, int(measured_iterations))
-        if target_iterations is None:
-            measured_request_steps = max(1, int(self.num_inference_steps))
-            target_request_steps = int(
-                self.extra.get(
-                    "warmup_target_num_inference_steps", measured_request_steps
-                )
-            )
-            target_iterations = (
-                measured * max(1, target_request_steps) + measured_request_steps - 1
-            ) // measured_request_steps
-        self.metrics.record_stage_iterations(measured, target_iterations)
 
     def validate(self):
         """Initialize dependent fields after dataclass initialization."""
@@ -394,13 +380,7 @@ class Req:
             self.metrics = RequestMetrics(request_id=self.request_id)
             return
 
-        # Prefer true_cfg_scale when it is explicitly provided.
-        cfg_scale = (
-            self.true_cfg_scale
-            if self.true_cfg_scale is not None
-            else self.guidance_scale
-        )
-        if cfg_scale > 1.0 and self.negative_prompt is not None:
+        if self.sampling_params.should_use_classifier_free_guidance():
             self.do_classifier_free_guidance = True
         if self.negative_prompt_embeds is None:
             self.negative_prompt_embeds = []
@@ -470,10 +450,17 @@ class Req:
      embedded_guidance_scale: {server_args.pipeline_config.embedded_cfg_scale}
                     n_tokens: {self.n_tokens}
                   flow_shift: {effective_flow_shift}
-                  image_path: {self.image_path}
+                  image_path: {_sanitize_for_logging(self.image_path)}
                  save_output: {self.save_output}
             output_file_path: {self.output_file_path()}
         """  # type: ignore[attr-defined]
+        # Add model-specific fields if present
+        bot_task = getattr(self, "bot_task", None)
+        system_prompt = getattr(self, "system_prompt", None)
+        if bot_task is not None:
+            debug_str += f"            bot_task: {bot_task}\n"
+        if system_prompt is not None:
+            debug_str += f"               system_prompt: {system_prompt}\n"
         logger.info(debug_str)
 
 
@@ -506,6 +493,11 @@ class OutputBatch:
     trajectory_decoded: list[torch.Tensor] | None = None
     error: str | None = None
     output_file_paths: list[str] | None = None
+    # encoded image per output when the request sets return_image_bytes
+    output_image_bytes: list[bytes | None] | None = None
+    # Decoded LiDAR of a joint camera/LiDAR request: file paths and metadata,
+    # plus range_m/intensity/validity arrays when the client asked for frames.
+    lidar: dict[str, Any] | None = None
 
     # logged metrics info, directly from Req.timings
     metrics: Optional[RequestMetrics] = None
@@ -524,5 +516,7 @@ class OutputBatch:
         self.rollout_trajectory_data = None
         self.trajectory_decoded = None
         self.output_file_paths = None
+        self.output_image_bytes = None
+        self.lidar = None
         self.raw_frame_batches = None
         self.noise_pred = None
