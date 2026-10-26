@@ -343,5 +343,23 @@ class TestHunyuanImage3MoEAndSchedule(CustomTestCase):
         )
 
 
+class TestHunyuanImage3RequestFields(CustomTestCase):
+    def test_image_api_forwards_cot_text(self):
+        """cot_text, bot_task and system_prompt sent to the image API must reach
+        the sampling params instead of being dropped."""
+        from sglang.multimodal_gen.configs.sample.hunyuan_image3 import (
+            HunyuanImage3SamplingParams,
+        )
+        from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
+            request_model_kwargs,
+        )
+
+        request = SimpleNamespace(
+            model_extra={"cot_text": "<think>a</think>", "bot_task": "think"}
+        )
+        kwargs = request_model_kwargs(request, HunyuanImage3SamplingParams, "image")
+        self.assertEqual(kwargs, {"cot_text": "<think>a</think>", "bot_task": "think"})
+
+
 if __name__ == "__main__":
     unittest.main()
