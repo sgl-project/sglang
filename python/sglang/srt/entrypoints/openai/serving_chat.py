@@ -747,6 +747,13 @@ class OpenAIServingChat(OpenAIServingBase):
             prompt_tokens = max(0, prompt_tokens - self._KIMI_K3_GENERATION_STUB_TOKENS)
         return prompt_tokens
 
+    def _set_cache_reporting_window(self, request: GenerateReqInput) -> None:
+        request._cache_write_reporting_suffix_tokens = (
+            self._KIMI_K3_GENERATION_STUB_TOKENS
+            if self.chat_encoding_spec == "kimi_k3"
+            else 0
+        )
+
     @staticmethod
     def _sort_tool_message_run(
         run: list[dict[str, Any]], tool_calls: list[dict[str, Any]]
@@ -1300,6 +1307,7 @@ class OpenAIServingChat(OpenAIServingBase):
         ):
             apply_header_overrides(adapted_request, raw_request.headers)
 
+        self._set_cache_reporting_window(adapted_request)
         return adapted_request, request
 
     def _process_messages(

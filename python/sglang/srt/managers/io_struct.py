@@ -34,6 +34,7 @@ from typing import (
     TYPE_CHECKING,
     Annotated,
     Any,
+    ClassVar,
     Dict,
     List,
     Literal,
@@ -175,6 +176,11 @@ MultimodalDataInputFormat = Union[
 
 @dataclass
 class GenerateReqInput:
+    # Server-owned reporting policy. ClassVar keeps it out of the public
+    # dataclass constructor and Pydantic input schema; adapters set an instance
+    # value only after request validation. It never changes physical input IDs.
+    _cache_write_reporting_suffix_tokens: ClassVar[int] = 0
+
     # Request ID(s). If omitted, generated during normalization. For batch
     # requests, a string is expanded to per-item IDs using it as a prefix.
     rid: Optional[Union[str, List[str]]] = field(default=None, kw_only=True)
@@ -1058,6 +1064,9 @@ class GenerateReqInput:
                 else None
             ),
         )
+        sub._cache_write_reporting_suffix_tokens = (
+            self._cache_write_reporting_suffix_tokens
+        )
         cache[i] = sub
         return sub
 
@@ -1177,6 +1186,9 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     sampling_logprobs_mode: SamplingLogprobsMode = "selected"
     # LoRA adapter name; KV events namespace this request's blocks by it.
     lora_name: Optional[str] = None
+
+    # Server-owned input reporting policy. Append-only for older Rust IPC senders.
+    cache_write_reporting_suffix_tokens: int = 0
 
     def wrap_pickle_fields(self):
         self.time_stats = wrap_as_pickle(self.time_stats)

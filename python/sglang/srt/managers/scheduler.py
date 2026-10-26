@@ -2883,6 +2883,9 @@ class Scheduler(
         self, recv_req: TokenizedGenerateReqInput, *args, **kwargs
     ) -> Req:
         """Extension point for request-local state, including session requests."""
+        kwargs["cache_write_reporting_suffix_tokens"] = getattr(
+            recv_req, "cache_write_reporting_suffix_tokens", 0
+        )
         return Req(*args, **kwargs)
 
     def handle_generate_request(

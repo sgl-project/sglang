@@ -6,12 +6,15 @@ billable-looking zero, and stream chunks carry cumulative snapshots.
 """
 
 import asyncio
+import copy
+import pickle
 import unittest
 from array import array
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import msgspec
+from pydantic import TypeAdapter
 
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
@@ -22,6 +25,8 @@ from sglang.srt.managers.detokenizer_manager import DetokenizerManager  # noqa: 
 from sglang.srt.managers.io_struct import BatchStrOutput  # noqa: E402
 from sglang.srt.managers.io_struct import (
     BatchTokenIDOutput,
+    GenerateReqInput,
+    TokenizedGenerateReqInput,
     msgpack_decode,
     msgpack_encode,
 )
@@ -35,6 +40,7 @@ from sglang.srt.managers.tokenizer_manager import ReqState  # noqa: E402
 from sglang.srt.managers.tokenizer_manager import (
     TokenizerManager,
 )
+from sglang.srt.sampling.sampling_params import SamplingParams  # noqa: E402
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm  # noqa: E402
 from sglang.test.ci.ci_register import register_cpu_ci  # noqa: E402
 
@@ -194,6 +200,185 @@ class TestCacheWriteNativeMetadata(unittest.IsolatedAsyncioTestCase, CustomTestC
                         self.assertNotIn("cache_write_tokens", meta)
                     else:
                         self.assertEqual(meta["cache_write_tokens"], value)
+
+
+class TestCacheWriteReportingWindowTransport(CustomTestCase):
+    def test_native_json_cannot_select_reporting_window(self):
+        adapter = TypeAdapter(GenerateReqInput)
+        name = "_cache_write_reporting_suffix_tokens"
+        native = adapter.validate_python({"input_ids": [1, 2, 3], name: 3})
+        self.assertEqual(native._cache_write_reporting_suffix_tokens, 0)
+        self.assertNotIn(name, adapter.json_schema()["properties"])
+        with self.assertRaises(TypeError):
+            GenerateReqInput(input_ids=[1, 2, 3], **{name: 3})
+
+    def test_batch_and_parallel_copies_keep_only_server_selected_policy(self):
+        batch = GenerateReqInput(
+            input_ids=[[1, 2, 3, 4], [5, 6, 7, 8]], sampling_params={"n": 2}
+        )
+        batch._cache_write_reporting_suffix_tokens = 3
+        batch.normalize_batch_and_arguments()
+        for i in range(len(batch.input_ids)):
+            item = batch[i]
+            self.assertIs(batch[i], item)
+            for copied in (item, copy.copy(item), pickle.loads(pickle.dumps(item))):
+                self.assertEqual(copied._cache_write_reporting_suffix_tokens, 3)
+        self.assertEqual(GenerateReqInput()._cache_write_reporting_suffix_tokens, 0)
+
+    def test_policy_crosses_tokenizer_and_append_only_ipc(self):
+        obj = GenerateReqInput(
+            input_ids=[1, 2, 3, 4],
+            sampling_params={"temperature": 0, "max_new_tokens": 1},
+        )
+        obj._cache_write_reporting_suffix_tokens = 3
+        obj.normalize_batch_and_arguments()
+        manager = TokenizerManager.__new__(TokenizerManager)
+        manager.preferred_sampling_params = None
+        manager.sampling_params_class = SamplingParams
+        manager.tokenized_generate_req_type = TokenizedGenerateReqInput
+        manager.tokenizer = None
+        manager.model_config = SimpleNamespace(vocab_size=100)
+        manager.rid_to_state = {
+            obj.rid: SimpleNamespace(
+                time_stats=SimpleNamespace(set_tokenize_finish_time=str)
+            )
+        }
+        with patch(
+            "sglang.srt.managers.tokenizer_manager.get_disagg",
+            return_value=SimpleNamespace(disaggregation_transfer_backend="none"),
+        ):
+            tokenized = manager._create_tokenized_object(obj, None, obj.input_ids)
+        self.assertEqual(tokenized.cache_write_reporting_suffix_tokens, 3)
+        tokenized.wrap_pickle_fields()
+        encoded = msgpack_encode(tokenized)
+        self.assertEqual(msgpack_decode(encoded).cache_write_reporting_suffix_tokens, 3)
+        self.assertEqual(
+            pickle.loads(pickle.dumps(tokenized)).cache_write_reporting_suffix_tokens, 3
+        )
+        self.assertEqual(
+            TokenizedGenerateReqInput.__struct_fields__[-1],
+            "cache_write_reporting_suffix_tokens",
+        )
+        legacy = msgspec.msgpack.decode(encoded)
+        legacy.pop()
+        self.assertEqual(
+            msgpack_decode(
+                msgspec.msgpack.encode(legacy)
+            ).cache_write_reporting_suffix_tokens,
+            0,
+        )
+
+    def test_responses_constructs_requests_with_the_same_reporting_policy(self):
+        from sglang.srt.entrypoints.openai.protocol import ResponsesRequest
+        from sglang.srt.entrypoints.openai.serving_responses import (
+            OpenAIServingResponses,
+        )
+
+        async def run(encoding, stream):
+            server = OpenAIServingResponses.__new__(OpenAIServingResponses)
+            server.chat_encoding_spec = encoding
+            server.tokenizer_manager = SimpleNamespace(tokenizer=None)
+            server.enable_response_store = False
+            server.use_harmony = False
+            server.tool_server = None
+            server.default_sampling_params = {}
+            server._validate_model = lambda model: None
+            server.extract_routed_dp_rank_from_header = lambda raw, rank: rank
+            processed = SimpleNamespace(
+                stop=None,
+                tool_call_constraint=None,
+                reasoning_end_token_ids=None,
+                skip_special_tokens=True,
+                image_data=None,
+                video_data=None,
+                audio_data=None,
+                modalities=None,
+                require_reasoning=False,
+            )
+
+            async def make_request(*args):
+                return [], [list(range(512))], [list(range(512))], processed
+
+            captured = []
+
+            def generate(request_id, prompt, adapted, *args, **kwargs):
+                captured.append(adapted)
+
+                async def empty():
+                    if False:
+                        yield None
+
+                return empty()
+
+            async def full(*args, **kwargs):
+                return "full"
+
+            server._make_request = make_request
+            server._generate_with_builtin_tools = generate
+            server.responses_stream_generator_non_harmony = lambda *a, **k: "stream"
+            server.responses_full_generator = full
+            result = await server.create_responses(
+                ResponsesRequest(
+                    model="test", input="hello", stream=stream, store=False
+                )
+            )
+            self.assertEqual(result, "stream" if stream else "full")
+            self.assertEqual(len(captured), 1)
+            self.assertEqual(len(captured[0].input_ids), 512)
+            self.assertEqual(
+                captured[0]._cache_write_reporting_suffix_tokens,
+                3 if encoding == "kimi_k3" else 0,
+            )
+
+        for encoding in ("kimi_k3", None):
+            for stream in (False, True):
+                with self.subTest(encoding=encoding, stream=stream):
+                    asyncio.run(run(encoding, stream))
+
+    def test_responses_tool_retry_keeps_the_server_reporting_policy(self):
+        from sglang.srt.entrypoints.openai.serving_responses import (
+            OpenAIServingResponses,
+        )
+
+        async def run(encoding):
+            server = OpenAIServingResponses.__new__(OpenAIServingResponses)
+            server.chat_encoding_spec = encoding
+            server.is_disaggregated = False
+            captured = []
+
+            async def generate(adapted, raw):
+                captured.append(adapted)
+                yield {"text": "tool turn"}
+
+            async def call_tool():
+                return {"text": "tool result"}
+
+            server.tokenizer_manager = SimpleNamespace(
+                generate_request=generate,
+                model_config=SimpleNamespace(context_len=4096),
+                num_reserved_tokens=1,
+            )
+            context = SimpleNamespace(
+                append_output=lambda output: None,
+                need_builtin_tool_call=lambda: len(captured) == 1,
+                call_tool=call_tool,
+                render_for_completion=lambda: list(range(512)),
+            )
+            initial = GenerateReqInput(input_ids=list(range(512)))
+            server._set_cache_reporting_window(initial)
+            async for _ in server._generate_with_builtin_tools(
+                "test", initial.input_ids, initial, {"max_new_tokens": 1}, context
+            ):
+                pass
+            self.assertEqual(len(captured), 2)
+            self.assertEqual(
+                [item._cache_write_reporting_suffix_tokens for item in captured],
+                [3 if encoding == "kimi_k3" else 0] * 2,
+            )
+
+        for encoding in ("kimi_k3", None):
+            with self.subTest(encoding=encoding):
+                asyncio.run(run(encoding))
 
 
 if __name__ == "__main__":

@@ -21,6 +21,7 @@ class CacheWriteUsage:
 
     __slots__ = (
         "prompt_tokens",
+        "_excluded_suffix_tokens",
         "_supported",
         "_adopted",
         "_reusable",
@@ -28,8 +29,15 @@ class CacheWriteUsage:
         "_started",
     )
 
-    def __init__(self, prompt_tokens: int):
+    def __init__(self, prompt_tokens: int, *, excluded_suffix_tokens: int = 0):
+        if (
+            not isinstance(excluded_suffix_tokens, int)
+            or isinstance(excluded_suffix_tokens, bool)
+            or excluded_suffix_tokens < 0
+        ):
+            raise ValueError("excluded_suffix_tokens must be a non-negative integer")
         self.prompt_tokens = max(0, prompt_tokens)
+        self._excluded_suffix_tokens = excluded_suffix_tokens
         self._supported: Optional[bool] = None
         self._adopted: list[tuple[int, int]] = []
         self._reusable: list[tuple[int, int]] = []
@@ -48,15 +56,24 @@ class CacheWriteUsage:
             return
         if self._started:
             self.mark_unknown()
-        else:
-            self.prompt_tokens = prompt_tokens
+        self.prompt_tokens = prompt_tokens
+
+    @property
+    def reported_prompt_tokens(self) -> int:
+        # Physical KV and checkpoint coordinates retain the complete prompt.
+        # Only the public observation excludes a server-selected input suffix.
+        return max(0, self.prompt_tokens - self._excluded_suffix_tokens)
 
     @property
     def tokens(self) -> Optional[int]:
         if self._supported is not True:
             return None
         return sum(
-            max(0, end - max(start, self._cached_prefix_len))
+            max(
+                0,
+                min(end, self.reported_prompt_tokens)
+                - max(start, self._cached_prefix_len),
+            )
             for start, end in self._reusable
         )
 

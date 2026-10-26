@@ -558,6 +558,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                         background=request.background and not request.stream,
                         require_reasoning=require_reasoning,
                     )
+                    self._set_cache_reporting_window(adapted_request)
 
                     generator = self._generate_with_builtin_tools(
                         request.request_id,
@@ -2862,6 +2863,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 background=adapted_request.background,
                 require_reasoning=adapted_request.require_reasoning,
             )
+            self._set_cache_reporting_window(adapted_request)
 
             # Update sampling params with reduced max_tokens
             if hasattr(sampling_params, "max_new_tokens") or isinstance(

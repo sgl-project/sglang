@@ -91,6 +91,64 @@ class TestCacheWriteUsage(CustomTestCase):
                 usage.mark_supported()
                 self.assertIsNone(cache_write_usage_for_req(req).tokens)
 
+    def test_reporting_window_intersects_each_reusable_range(self):
+        for adopted, cached, expected in (
+            ([(0, 512)], 0, 509),
+            ([(256, 512)], 256, 253),
+            ([(509, 512)], 0, 0),
+        ):
+            with self.subTest(adopted=adopted, cached=cached):
+                usage = CacheWriteUsage(512, excluded_suffix_tokens=3)
+                usage.mark_supported()
+                usage.record(adopted, reusable_prefix_len=512, cached_prefix_len=cached)
+                self.assertEqual(usage.tokens, expected)
+                self.assertEqual(usage.prompt_tokens, 512)
+                # Duplicate publication and retraction do not count it twice.
+                usage.record(adopted, reusable_prefix_len=512, cached_prefix_len=cached)
+                self.assertEqual(usage.tokens, expected)
+
+    def test_reporting_window_follows_final_input_coordinates(self):
+        for initial, final, expected in ((4, 8, 5), (8, 4, 1), (4, 2, 0)):
+            with self.subTest(initial=initial, final=final):
+                usage = CacheWriteUsage(initial, excluded_suffix_tokens=3)
+                usage.mark_supported()
+                usage.sync_prompt_tokens(final)
+                usage.record([(0, final + 2)], reusable_prefix_len=final + 2)
+                self.assertEqual(usage.tokens, expected)
+                usage.sync_prompt_tokens(final + 1)
+                self.assertIsNone(usage.tokens)
+                self.assertEqual(usage.reported_prompt_tokens, max(0, final - 2))
+
+    def test_reported_reads_do_not_change_physical_cache_prefix(self):
+        from sglang.srt.managers.schedule_batch import Req
+
+        for suffix, cached, expected in (
+            (0, 511, 511),
+            (3, 511, 509),
+            (0, 512, 512),
+            (3, 512, 509),
+        ):
+            with self.subTest(suffix=suffix, cached=cached):
+                req = Req.__new__(Req)
+                req.origin_input_ids = array("q", range(512))
+                req.cached_tokens = cached
+                req._cache_write_usage = CacheWriteUsage(
+                    512, excluded_suffix_tokens=suffix
+                )
+                req._cache_write_usage.mark_supported()
+                req._cache_write_usage.record(
+                    [(cached, 512)], reusable_prefix_len=512, cached_prefix_len=cached
+                )
+                self.assertEqual(req.reported_cached_tokens, expected)
+                self.assertEqual(req.cached_tokens, cached)
+                self.assertEqual(
+                    req.cache_write_tokens, 512 - cached if suffix == 0 else 0
+                )
+                req.origin_input_ids = array("q", range(256))
+                self.assertEqual(req.reported_cached_tokens, 256 - suffix)
+                self.assertIsNone(req.cache_write_tokens)
+                self.assertEqual(req.cached_tokens, cached)
+
 
 class TestUnifiedCacheWriteUsage(CustomTestCase):
     """Exercise the actual insert and canonical match on CPU, without a model."""
