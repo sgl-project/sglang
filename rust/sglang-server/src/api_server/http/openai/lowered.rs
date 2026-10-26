@@ -243,6 +243,16 @@ pub(super) async fn chat(
     )
 }
 
+/// A prompt's fields whose list form is repeated with it across `n` choices.
+const PROMPT_LIST_FIELDS: [&str; 6] = [
+    "bootstrap_host",
+    "bootstrap_port",
+    "bootstrap_room",
+    "extra_key",
+    "cache_salt",
+    "lora_path",
+];
+
 /// The core samples one sequence per request, so `n` choices are a batch of
 /// the prompt, whose indexed frames are what Python's `n` streams.
 fn copy_prompt_per_choice(generate: &mut Value) -> Result<(), Error> {
@@ -251,23 +261,20 @@ fn copy_prompt_per_choice(generate: &mut Value) -> Result<(), Error> {
     if n <= 1 {
         return Ok(());
     }
-    // Bounded before the copy: a huge `n` would overflow or exhaust the allocation.
-    let per_clone = generate["input_ids"]
-        .as_array()
-        .map_or(0, |ids| ids.len().saturating_mul(size_of::<Value>()));
-    check_prompt_copies(per_clone, n)?;
+    // Bounded before the copy: a huge `n`, or a large list field, would overflow
+    // or exhaust the allocation.
+    let ids = generate["input_ids"].as_array().map_or(0, Vec::len);
+    let fields: Vec<&Value> = PROMPT_LIST_FIELDS
+        .iter()
+        .map(|key| &generate[*key])
+        .filter(|field| field.is_array())
+        .collect();
+    check_prompt_copies(ids, &fields, n)?;
     generate["sampling_params"]["n"] = 1.into();
     generate["input_ids"] = Value::Array(vec![generate["input_ids"].take(); n]);
     // Python's parallel sampling repeats the prompt's list-form fields with it,
     // and a rid list names the one prompt.
-    for key in [
-        "bootstrap_host",
-        "bootstrap_port",
-        "bootstrap_room",
-        "extra_key",
-        "cache_salt",
-        "lora_path",
-    ] {
+    for key in PROMPT_LIST_FIELDS {
         if let Some(Value::Array(items)) = generate.get_mut(key) {
             *items = items
                 .iter()
@@ -404,6 +411,24 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let value = body_json(response).await;
         assert_eq!(value["choices"].as_array().unwrap().len(), 2);
+    }
+
+    /// A large list field counts toward the copy budget, so `n` choices cannot
+    /// clone it past the limit.
+    #[tokio::test]
+    async fn n_choices_bound_the_copied_list_fields() {
+        let app = lowered_state(|rid| chunk(rid, "ok", true));
+        let body = json!({
+            "model": "model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "n": 128,
+            "cache_salt": ["s".repeat(1 << 20)],
+        });
+        let response = post_json(app, "/v1/chat/completions", body).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let value = body_json(response).await;
+        let message = value["message"].as_str().unwrap();
+        assert!(message.contains("byte limit"), "{message}");
     }
 
     /// A failed choice answers at once, without waiting on an unfinished sibling.

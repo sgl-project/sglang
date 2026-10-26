@@ -854,15 +854,27 @@ fn flatten_column<T>(column: Vec<Option<Option<T>>>) -> Vec<Option<T>> {
 }
 
 /// Reject `n` copies of one prompt (chat's `n` choices) before they are
-/// cloned: the batch cap and clone budget a `/generate` list is held to.
-pub(crate) fn check_prompt_copies(per_clone: usize, n: usize) -> Result<(), Error> {
+/// cloned: the batch cap, and the clone budget a broadcast is held to for its
+/// `ids` plus the list `fields` copied with them.
+pub(crate) fn check_prompt_copies(
+    ids: usize,
+    fields: &[&serde_json::Value],
+    n: usize,
+) -> Result<(), Error> {
     if batch_size_exceeds_limit(n, *MAX_BATCH_REQS_PER_HTTP_REQ) {
         return Err(Error::Validation(format!(
             "batch size {n} exceeds the maximum of {}",
             *MAX_BATCH_REQS_PER_HTTP_REQ
         )));
     }
-    check_broadcast_budget(per_clone, n, "input_ids")
+    let fields: usize = fields
+        .iter()
+        .map(|field| serde_json::to_vec(field).map_or(0, |json| json.len()))
+        .sum();
+    let per_clone = ids
+        .saturating_mul(size_of::<serde_json::Value>())
+        .saturating_add(fields.saturating_mul(JSON_TO_HEAP_FACTOR));
+    check_broadcast_budget(per_clone, n, "prompt")
 }
 
 /// Reject a broadcast whose clones would exceed [`MAX_BROADCAST_CLONE_BYTES`].
