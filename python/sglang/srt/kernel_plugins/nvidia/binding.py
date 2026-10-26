@@ -16,8 +16,10 @@ from __future__ import annotations
 import functools
 import logging
 import time
+from collections.abc import Mapping
 from importlib.metadata import entry_points
-from typing import TYPE_CHECKING, Any, Callable, Collection, Mapping, Optional
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Any, Callable, Collection, Optional
 
 import msgspec
 import torch
@@ -41,6 +43,7 @@ from sglang.srt.arg_groups.model_override_base import model_config_of, resolving
 from sglang.srt.environ import envs
 from sglang.srt.kernel_plugins.amd.binding import msa_serves
 from sglang.srt.kernel_plugins.nvidia.eagle_binding import EagleBinding
+from sglang.srt.mem_cache.layout.paged_view import paged_row_view
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.plugins import GENERAL_PLUGINS_GROUP
 from sglang.srt.runtime_context import (
@@ -55,7 +58,26 @@ if TYPE_CHECKING:
     from transformers import PretrainedConfig
 
     from sglang.srt.layers.attention.graph_variants import AttentionGraphVariants
+    from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+    from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+        HybridLinearAttnBackend,
+    )
+    from sglang.srt.layers.attention.linear.kda_backend import KDAAttnBackend
+    from sglang.srt.layers.attention.mamba.mamba2_metadata import (
+        ForwardMetadata as KdaForwardMetadata,
+    )
+    from sglang.srt.layers.attention.trtllm_mla_backend import (
+        TRTLLMMLABackend,
+        TRTLLMMLADecodeMetadata,
+    )
+    from sglang.srt.mem_cache.memory_pool import (
+        HybridLinearKVPool,
+        HybridReqToTokenPool,
+        KVCache,
+        MambaPool,
+    )
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
         DecodeCudaGraphRunner,
     )
@@ -83,6 +105,7 @@ TOLERATED_CALLABLES = (
     "ForwardView.swa_out_cache_loc",
     "ForwardView.low_ratio_sources",  # compressor / indexer inputs
     "ForwardView.core_compressor",
+    "KdaStepView.track_decode_state",  # SGLang's KDA prefix-state tracking
     "KvPoolView.set_swa_key_buffer_radix_fused_norm_rope",  # the fused SWA key write
     "KvPoolView.pool",  # passed back to SGLang's own draft KV store only
     "sglang.kernels.ops",  # SGLang's kernel ops
@@ -147,42 +170,172 @@ class KvPoolView:
         return self.pool.set_swa_key_buffer_radix_fused_norm_rope
 
 
+class KdaStateView(msgspec.Struct, frozen=True):
+    """One KDA layer's SGLang-owned, non-ReplaySSM recurrent state."""
+
+    conv: tuple[torch.Tensor, ...]
+    temporal: torch.Tensor
+
+
+class MlaPoolView:
+    """The bounded MLA-cache surface prepared after SGLang allocates its pools."""
+
+    def __init__(
+        self,
+        *,
+        reserved_capacity: int,
+        serving_capacity: Callable[[], int],
+        post_capture_active: bool,
+        page_size: int,
+        logical_dtype: torch.dtype,
+        storage_dtype: torch.dtype,
+        layer_mapping: Mapping[int, int],
+        caches: Mapping[int, torch.Tensor],
+    ):
+        self.reserved_capacity = int(reserved_capacity)
+        self._serving_capacity = serving_capacity
+        self.post_capture_active = bool(post_capture_active)
+        self.page_size = int(page_size)
+        self.logical_dtype = logical_dtype
+        self.storage_dtype = storage_dtype
+        self.layer_mapping = MappingProxyType(dict(layer_mapping))
+        self._caches = MappingProxyType(dict(caches))
+
+    @property
+    def serving_capacity(self) -> int:
+        """The live scheduler capacity (it may shrink after graph capture)."""
+        return int(self._serving_capacity())
+
+    def cache(self, layer_id: int) -> torch.Tensor:
+        return self._caches[int(layer_id)]
+
+
+class KdaPoolView:
+    """The bounded KDA-state surface prepared after SGLang allocates its pools."""
+
+    def __init__(
+        self,
+        *,
+        capacity: int,
+        layer_mapping: Mapping[int, int],
+        states: Mapping[int, KdaStateView],
+    ):
+        self.capacity = int(capacity)
+        self.layer_mapping = MappingProxyType(dict(layer_mapping))
+        self._states = MappingProxyType(dict(states))
+
+    def state(self, layer_id: int) -> KdaStateView:
+        return self._states[int(layer_id)]
+
+
+class HybridPoolView(msgspec.Struct, frozen=True):
+    mla: MlaPoolView
+    kda: KdaPoolView
+
+
+class PreparationView(msgspec.Struct, frozen=True):
+    """Runtime resources offered to an optional pre-capture preparation hook."""
+
+    hybrid: Optional[HybridPoolView] = None
+
+
+class MlaStepView(msgspec.Struct, frozen=True):
+    block_table: torch.Tensor
+    sequence_lengths: torch.Tensor
+    write_slots: torch.Tensor
+
+
+class KdaStepView:
+    """One step's KDA slots and SGLang-owned state-tracking operation."""
+
+    def __init__(
+        self,
+        *,
+        state_indices: torch.Tensor,
+        track_decode_state: Callable[[int], None],
+    ):
+        self.state_indices = state_indices
+        self._track_decode_state = track_decode_state
+
+    def track_decode_state(self, layer_id: int) -> None:
+        """Track one completed layer; SGLang coalesces this at the last layer."""
+        self._track_decode_state(int(layer_id))
+
+
+class HybridStepView(msgspec.Struct, frozen=True):
+    mla: MlaStepView
+    kda: KdaStepView
+
+
 class ForwardView:
     """The running forward's attention data, read from its attention backend; built
     at capture for a graph step, so its tensors are the ones the graph replays."""
 
-    def __init__(self, backend: Any, seal_cache: Optional[Callable] = None):
-        self._backend = backend
-        self.metadata = backend.forward_metadata
-        self.kv_pool = KvPoolView(backend.token_to_kv_pool, seal_cache)
+    def __init__(
+        self,
+        backend: Any,
+        seal_cache: Optional[Callable] = None,
+        *,
+        hybrid: Optional[HybridStepView] = None,
+        legacy: bool = True,
+    ):
+        self.hybrid = hybrid
+        if legacy:
+            # Keep API-v1's nonhybrid behavior without handing the plugin the
+            # backend. Hybrid consumers get only the typed surface above.
+            self._trtllm_attn = lambda: backend.trtllm_attn
+            self._attention = lambda: backend.forward
+            self._store_cache = lambda: backend.store_cache
+            self._swa_out_cache_loc = lambda: backend.get_swa_out_cache_loc
+            self._low_ratio_sources = lambda: backend.forward_low_ratio_sources
+            self._core_compressor = lambda: backend.forward_core_compressor
+            self._use_fused_topk = lambda: bool(getattr(backend, "use_fused_topk", False))
+            self.metadata = backend.forward_metadata
+            self.kv_pool = KvPoolView(backend.token_to_kv_pool, seal_cache)
 
     @property
     def use_fused_topk(self) -> bool:
-        return bool(getattr(self._backend, "use_fused_topk", False))
+        return self._use_fused_topk()
 
     @property
     def trtllm_attn(self) -> bool:
-        return self._backend.trtllm_attn
+        return self._trtllm_attn()
 
     @property
     def attention(self) -> Callable[..., Any]:
-        return self._backend.forward
+        return self._attention()
 
     @property
     def store_cache(self) -> Callable[..., None]:
-        return self._backend.store_cache
+        return self._store_cache()
 
     @property
     def swa_out_cache_loc(self) -> Callable[[Any], torch.Tensor]:
-        return self._backend.get_swa_out_cache_loc
+        return self._swa_out_cache_loc()
 
     @property
     def low_ratio_sources(self) -> Callable[..., Any]:
-        return self._backend.forward_low_ratio_sources
+        return self._low_ratio_sources()
 
     @property
     def core_compressor(self) -> Callable[..., Any]:
-        return self._backend.forward_core_compressor
+        return self._core_compressor()
+
+
+class _SealedSource(msgspec.Struct, frozen=True):
+    identity: tuple
+    current: Callable[[], Any]
+
+
+class _HybridSources(msgspec.Struct, frozen=True):
+    model_runner: ModelRunner
+    backend: HybridLinearAttnBackend
+    full_backend: TRTLLMMLABackend
+    linear_backend: KDAAttnBackend
+    token_pool: HybridLinearKVPool
+    full_pool: KVCache
+    request_pool: HybridReqToTokenPool
+    mamba_pool: MambaPool
 
 
 class MegakernelBinding:
@@ -192,23 +345,87 @@ class MegakernelBinding:
 
     def __init__(self, *, model: torch.nn.Module):
         self._model = model
-        self._sealed: dict[str, tuple] = {}
         self._cache_sources: dict[int, tuple] = {}
+        self._sealed: dict[str, _SealedSource] = {}
+        self._preparation: Optional[PreparationView] = None
+        self._hybrid_sources: Optional[_HybridSources] = None
 
-    def forward_view(self) -> ForwardView:
+    def preparation_view(self, model_runner: ModelRunner) -> PreparationView:
+        """The post-pool, pre-capture resources for an optional build hook."""
+        self._seal("model_runner", model_runner)
+        if self._preparation is not None:
+            self.assert_live()
+            return self._preparation
+
+        hybrid = self._prepare_hybrid(model_runner)
+        self._preparation = PreparationView(hybrid=hybrid)
+        return self._preparation
+
+    def forward_view(self, forward_batch: Optional[ForwardBatch] = None) -> ForwardView:
         """The view of the forward running now (a target step or a draft step)."""
         from sglang.srt.model_executor.forward_context import get_attn_backend
 
-        view = ForwardView(get_attn_backend(), self._seal_cache)
-        self._seal("kv_pool", view.kv_pool.pool)
+        backend = get_attn_backend()
+        hybrid_family = self._hybrid_sources is not None
+        if hybrid_family:
+            if backend is not self._hybrid_sources.backend:
+                raise RuntimeError("megakernel binding: running hybrid backend changed")
+        else:
+            self._seal("kv_pool", backend.token_to_kv_pool, self._current_pool)
+        hybrid = (
+            self._hybrid_step(backend, forward_batch)
+            if forward_batch is not None and hybrid_family
+            else None
+        )
+        view = ForwardView(
+            backend, self._seal_cache, hybrid=hybrid, legacy=not hybrid_family
+        )
         return view
+
+    def seal_capture_view(self, forward_batch: ForwardBatch, view: ForwardView) -> None:
+        """Seal graph-static step tensors for this mode and batch-size bucket."""
+        if view.hybrid is None:
+            return
+        self.assert_live()
+        mode = str(forward_batch.forward_mode)
+        key = f"{mode}:{int(forward_batch.batch_size)}"
+        mla, kda = view.hybrid.mla, view.hybrid.kda
+        sources = self._current_hybrid_sources()
+        mla_metadata = self._mla_metadata(sources)
+        kda_metadata = sources.linear_backend.forward_metadata
+        # Keep each graph's metadata owners when the backend selects another
+        # batch-size bucket, while still detecting replacement of their fields.
+        tensors = (
+            (
+                "mla.block_table",
+                mla.block_table,
+                lambda: mla_metadata.block_kv_indices,
+            ),
+            (
+                "mla.sequence_lengths",
+                mla.sequence_lengths,
+                lambda: mla_metadata.seq_lens_k,
+            ),
+            ("mla.write_slots", mla.write_slots, lambda: forward_batch.out_cache_loc),
+            (
+                "kda.state_indices",
+                kda.state_indices,
+                lambda: kda_metadata.mamba_cache_indices,
+            ),
+        )
+        for name, tensor, getter in tensors:
+            if _identity(getter()) != _identity(tensor):
+                raise RuntimeError(
+                    f"megakernel binding: capture[{key}].{name} changed before seal"
+                )
+            self._seal(f"capture[{key}].{name}", tensor, getter)
 
     def engram_history(self) -> Optional[torch.Tensor]:
         """The model's Engram hash history ``[slots + 1, width]`` int32, or None."""
         history = self._history()
         if history is None or history.shape[1] == 0:
             return None
-        self._seal("engram_history", history)
+        self._seal("engram_history", history, self._history)
         return history
 
     def engram_host_table(self, engram: torch.nn.Module) -> Any:
@@ -216,9 +433,8 @@ class MegakernelBinding:
         return engram.embed.host_table
 
     def assert_live(self) -> None:
-        current = {"kv_pool": self._current_pool, "engram_history": self._history}
         for name, sealed in self._sealed.items():
-            if _identity(current[name]()) != sealed:
+            if _identity(sealed.current()) != sealed.identity:
                 raise RuntimeError(
                     f"megakernel binding: {name} was reallocated after its first read"
                 )
@@ -239,8 +455,269 @@ class MegakernelBinding:
                 "after its first read"
             )
 
-    def _seal(self, name: str, value: Any) -> None:
-        self._sealed.setdefault(name, _identity(value))
+    def _seal(
+        self, name: str, value: Any, current: Optional[Callable[[], Any]] = None
+    ) -> None:
+        identity = _identity(value)
+        sealed = self._sealed.get(name)
+        if sealed is not None:
+            if sealed.identity != identity:
+                raise RuntimeError(
+                    f"megakernel binding: {name} was reallocated after its first read"
+                )
+            return
+        self._sealed[name] = _SealedSource(
+            identity=identity, current=current or (lambda value=value: value)
+        )
+
+    def _prepare_hybrid(self, model_runner: ModelRunner) -> Optional[HybridPoolView]:
+        from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+            HybridLinearAttnBackend,
+        )
+
+        backend = model_runner.attn_backend
+        if not isinstance(backend, HybridLinearAttnBackend):
+            return None
+
+        from sglang.srt.layers.attention.linear.kda_backend import KDAAttnBackend
+        from sglang.srt.layers.attention.trtllm_mla_backend import TRTLLMMLABackend
+        from sglang.srt.mem_cache.memory_pool import (
+            HybridLinearKVPool,
+            HybridReqToTokenPool,
+        )
+
+        full_backend = backend.full_attn_backend
+        linear_backend = backend.linear_attn_backend
+        token_pool = backend.token_to_kv_pool
+        request_pool = backend.req_to_token_pool
+        # This view describes the MLA/KDA layout, not arbitrary hybrid backends.
+        if (
+            not isinstance(full_backend, TRTLLMMLABackend)
+            or not isinstance(linear_backend, KDAAttnBackend)
+            or not isinstance(token_pool, HybridLinearKVPool)
+            or not isinstance(request_pool, HybridReqToTokenPool)
+            or not token_pool.use_mla
+        ):
+            return None
+        full_pool = token_pool.full_kv_pool
+        mamba_pool = request_pool.mamba_pool
+        full_mapping = token_pool.full_attention_layer_id_mapping
+        mamba_mapping = request_pool.mamba_map
+        for role, child in (("full", full_backend), ("linear", linear_backend)):
+            if child.token_to_kv_pool is not token_pool:
+                raise ValueError(f"megakernel binding: {role} backend KV pool differs")
+            if child.req_to_token_pool is not request_pool:
+                raise ValueError(
+                    f"megakernel binding: {role} backend request pool differs"
+                )
+        if tuple(backend.attn_backend_list) != (full_backend, linear_backend):
+            raise ValueError("megakernel binding: hybrid backend children differ")
+
+        sources = _HybridSources(
+            model_runner=model_runner,
+            backend=backend,
+            full_backend=full_backend,
+            linear_backend=linear_backend,
+            token_pool=token_pool,
+            full_pool=full_pool,
+            request_pool=request_pool,
+            mamba_pool=mamba_pool,
+        )
+        self._hybrid_sources = sources
+        self._seal_hybrid_sources(sources)
+
+        full_map = {int(layer): int(index) for layer, index in full_mapping.items()}
+        mamba_map = {int(layer): int(index) for layer, index in mamba_mapping.items()}
+        page_size = int(full_pool.page_size)
+        caches: dict[int, torch.Tensor] = {}
+        reserved_capacity: Optional[int] = None
+        for layer_id in full_map:
+            cache = _mla_storage_cache(token_pool, layer_id)
+            if cache.shape[0] % page_size:
+                raise ValueError(
+                    f"megakernel binding: MLA layer {layer_id} rows "
+                    f"{cache.shape[0]} are not page aligned"
+                )
+            cache = paged_row_view(cache, page_size)
+            capacity = (int(cache.shape[0]) - 1) * page_size
+            if reserved_capacity is None:
+                reserved_capacity = capacity
+            elif capacity != reserved_capacity:
+                raise ValueError("megakernel binding: MLA layer capacities differ")
+            caches[layer_id] = cache
+            self._seal(
+                f"mla_cache[{layer_id}]",
+                cache,
+                lambda layer_id=layer_id: _paged_mla_cache(
+                    self._current_hybrid_sources().token_pool, layer_id
+                ),
+            )
+
+        states: dict[int, KdaStateView] = {}
+        for layer_id in mamba_map:
+            state = request_pool.mamba2_layer_cache(layer_id)
+            if state.replayssm_d is not None:
+                raise ValueError(
+                    f"megakernel binding: KDA layer {layer_id} has ReplaySSM state; "
+                    "the hybrid state view requires --enable-linear-replayssm "
+                    "and --enable-linear-replayssm-spec to be disabled"
+                )
+            conv = tuple(state.conv)
+            if len(conv) != 1:
+                raise ValueError(
+                    f"megakernel binding: KDA layer {layer_id} has {len(conv)} "
+                    "convolution states, expected one"
+                )
+            states[layer_id] = KdaStateView(conv=conv, temporal=state.temporal)
+            self._seal(
+                f"kda_conv[{layer_id}]",
+                conv[0],
+                lambda layer_id=layer_id: (
+                    self._current_hybrid_sources()
+                    .request_pool.mamba2_layer_cache(layer_id)
+                    .conv[0]
+                ),
+            )
+            self._seal(
+                f"kda_temporal[{layer_id}]",
+                state.temporal,
+                lambda layer_id=layer_id: (
+                    self._current_hybrid_sources()
+                    .request_pool.mamba2_layer_cache(layer_id)
+                    .temporal
+                ),
+            )
+
+        if reserved_capacity is None or not states:
+            raise ValueError("megakernel binding: hybrid MLA/KDA mappings are empty")
+        return HybridPoolView(
+            mla=MlaPoolView(
+                reserved_capacity=reserved_capacity,
+                serving_capacity=lambda: self._current_hybrid_sources().token_pool.size,
+                post_capture_active=bool(token_pool.post_capture_active),
+                page_size=page_size,
+                logical_dtype=full_pool.dtype,
+                storage_dtype=full_pool.store_dtype,
+                layer_mapping=full_map,
+                caches=caches,
+            ),
+            kda=KdaPoolView(
+                capacity=int(mamba_pool.size),
+                layer_mapping=mamba_map,
+                states=states,
+            ),
+        )
+
+    def _seal_hybrid_sources(self, sources: _HybridSources) -> None:
+        runner = sources.model_runner
+        getters = {
+            # Ordered root-to-leaf so a replaced minimal parent reports its own
+            # named invariant before a deeper path could raise AttributeError.
+            "hybrid_backend": lambda: runner.attn_backend,
+            "full_backend": lambda: runner.attn_backend.full_attn_backend,
+            "linear_backend": lambda: runner.attn_backend.linear_attn_backend,
+            "hybrid_kv_pool": lambda: runner.attn_backend.token_to_kv_pool,
+            "full_kv_pool": lambda: runner.attn_backend.token_to_kv_pool.full_kv_pool,
+            "request_pool": lambda: runner.attn_backend.req_to_token_pool,
+            "mamba_pool": lambda: runner.attn_backend.req_to_token_pool.mamba_pool,
+            "attention_backend_list": lambda: runner.attn_backend.attn_backend_list,
+            "full_backend_kv_pool": lambda: (
+                runner.attn_backend.full_attn_backend.token_to_kv_pool
+            ),
+            "full_backend_request_pool": lambda: (
+                runner.attn_backend.full_attn_backend.req_to_token_pool
+            ),
+            "linear_backend_kv_pool": lambda: (
+                runner.attn_backend.linear_attn_backend.token_to_kv_pool
+            ),
+            "linear_backend_request_pool": lambda: (
+                runner.attn_backend.linear_attn_backend.req_to_token_pool
+            ),
+            "full_layer_mapping": lambda: (
+                runner.attn_backend.token_to_kv_pool.full_attention_layer_id_mapping
+            ),
+            "mamba_layer_mapping": lambda: (
+                runner.attn_backend.req_to_token_pool.mamba_map
+            ),
+        }
+        for name, getter in getters.items():
+            self._seal(name, getter(), getter)
+
+    def _current_hybrid_sources(self) -> _HybridSources:
+        sources = self._hybrid_sources
+        if sources is None:
+            raise RuntimeError("megakernel binding: hybrid resources were not prepared")
+        backend = sources.model_runner.attn_backend
+        # Read through the live root objects so assert_live sees replacements.
+        return _HybridSources(
+            model_runner=sources.model_runner,
+            backend=backend,
+            full_backend=backend.full_attn_backend,
+            linear_backend=backend.linear_attn_backend,
+            token_pool=backend.token_to_kv_pool,
+            full_pool=backend.token_to_kv_pool.full_kv_pool,
+            request_pool=backend.req_to_token_pool,
+            mamba_pool=backend.req_to_token_pool.mamba_pool,
+        )
+
+    def _hybrid_step(
+        self, backend: AttentionBackend, forward_batch: ForwardBatch
+    ) -> HybridStepView:
+        sources = self._current_hybrid_sources()
+        if backend is not sources.backend:
+            raise RuntimeError("megakernel binding: running hybrid backend changed")
+        mla_metadata = self._mla_metadata(sources)
+        kda_metadata: Optional[KdaForwardMetadata] = (
+            sources.linear_backend.forward_metadata
+        )
+        if kda_metadata is None:
+            raise RuntimeError("megakernel binding: KDA decode metadata is unavailable")
+        block_table = mla_metadata.block_kv_indices
+        sequence_lengths = mla_metadata.seq_lens_k
+        write_slots = forward_batch.out_cache_loc
+        state_indices = kda_metadata.mamba_cache_indices
+        if any(
+            value is None
+            for value in (block_table, sequence_lengths, write_slots, state_indices)
+        ):
+            raise RuntimeError(
+                "megakernel binding: hybrid decode metadata is incomplete"
+            )
+        if not forward_batch.out_cache_loc_is_physical:
+            raise RuntimeError(
+                "megakernel binding: hybrid MLA write slots are not physical"
+            )
+
+        assert self._preparation is not None
+        pool_view = self._preparation.hybrid
+        assert pool_view is not None
+
+        def track_decode_state(layer_id: int) -> None:
+            state = pool_view.kda.state(layer_id)
+            sources.linear_backend._track_mamba_state_decode(
+                forward_batch,
+                state.conv[0],
+                state.temporal,
+                state_indices,
+                layer_id,
+            )
+
+        return HybridStepView(
+            mla=MlaStepView(
+                block_table=block_table,
+                sequence_lengths=sequence_lengths,
+                write_slots=write_slots,
+            ),
+            kda=KdaStepView(
+                state_indices=state_indices, track_decode_state=track_decode_state
+            ),
+        )
+
+    def _mla_metadata(self, sources: _HybridSources) -> TRTLLMMLADecodeMetadata:
+        metadata = sources.full_backend.forward_decode_metadata
+        if metadata is None:
+            raise RuntimeError("megakernel binding: MLA decode metadata is unavailable")
+        return metadata
 
     def _current_pool(self) -> Any:
         from sglang.srt.model_executor.forward_context import get_attn_backend
@@ -255,8 +732,47 @@ class MegakernelBinding:
 
 def _identity(value: Any) -> tuple:
     if isinstance(value, torch.Tensor):
-        return (value.data_ptr(), tuple(value.shape), value.dtype, value.stride())
+        return (
+            value.data_ptr(),
+            tuple(value.shape),
+            tuple(value.stride()),
+            value.storage_offset(),
+            value.dtype,
+            value.device,
+        )
+    if isinstance(value, Mapping):
+        return (id(value), tuple(sorted(value.items())))
+    if isinstance(value, (list, tuple)):
+        return (id(value), tuple(id(item) for item in value))
     return (id(value),)
+
+
+def _paged_mla_cache(pool: HybridLinearKVPool, layer_id: int) -> torch.Tensor:
+    cache = _mla_storage_cache(pool, layer_id)
+    page_size = int(pool.full_kv_pool.page_size)
+    return paged_row_view(cache, page_size)
+
+
+def _mla_storage_cache(pool: HybridLinearKVPool, layer_id: int) -> torch.Tensor:
+    """Return one MLA layer as a zero-copy view of its physical storage dtype.
+
+    Read through the pool's public getter first so its layer mapping and pending
+    transfer synchronization run before reinterpreting the equal-width logical
+    view as physical storage.
+    """
+    cache = pool.get_key_buffer(layer_id)
+    full_pool = pool.full_kv_pool
+    if cache.dtype != full_pool.dtype:
+        raise ValueError(
+            "megakernel binding: MLA cache logical dtype "
+            f"{cache.dtype} differs from pool dtype {full_pool.dtype}"
+        )
+    storage_dtype = full_pool.store_dtype
+    if cache.element_size() != storage_dtype.itemsize:
+        raise ValueError(
+            "megakernel binding: MLA logical and storage item sizes differ"
+        )
+    return cache if cache.dtype == storage_dtype else cache.view(storage_dtype)
 
 
 PLUGIN_URL = "https://github.com/sgl-project/sgl-nvidia-mega"
@@ -433,6 +949,12 @@ def handle_nvidia_megakernel(server_args: Any) -> None:
     logger.info("%s: %s on %s", FLAG, spec.name, device_isa())
 
 
+class _InstalledMegakernel(msgspec.Struct, frozen=True):
+    built: BuiltMegakernel
+    binding: MegakernelBinding
+    prepare: Optional[Callable[[BuiltMegakernel, PreparationView], None]]
+
+
 def megakernel_enabled() -> bool:
     """Whether this server runs with --enable-nvidia-megakernel."""
     # the model loader also runs without a server's config (tools, unit tests)
@@ -470,8 +992,10 @@ def install_megakernel(
     )
     start, free_before = time.perf_counter(), torch.cuda.mem_get_info()[0]
     built = spec.build(model, hf_config, context)
-    # not setattr: a built object that is an nn.Module must not join the state dict
-    model.__dict__["_megakernel"] = built
+    # Keep plugin resources outside the model's module/state tree.
+    model.__dict__["_megakernel"] = _InstalledMegakernel(
+        built=built, binding=binding, prepare=spec.prepare
+    )
     # Different widths would leave ranks waiting in different collectives, and
     # different entries would run different code around them.
     megakernel_agree(tuple(built.widths), what=f"widths {spec.name} built")
@@ -527,7 +1051,19 @@ def install_megakernel(
 
 def built_megakernel(model: torch.nn.Module) -> Optional[BuiltMegakernel]:
     """The object the spec built for this model, or None."""
-    return model.__dict__.get("_megakernel")
+    installed: Optional[_InstalledMegakernel] = model.__dict__.get("_megakernel")
+    return None if installed is None else installed.built
+
+
+def prepare_megakernel(model_runner: ModelRunner) -> None:
+    """Prepare installed plugin resources after model preparation, before capture."""
+    installed: Optional[_InstalledMegakernel] = model_runner.model.__dict__.get(
+        "_megakernel"
+    )
+    if installed is not None and installed.prepare is not None:
+        installed.prepare(
+            installed.built, installed.binding.preparation_view(model_runner)
+        )
 
 
 def megakernel_agree(value: Any, *, what: str, group: Any = None) -> None:
@@ -717,14 +1253,18 @@ class _Dispatch:
         @functools.wraps(self.original)
         def forward(input_ids, positions, forward_batch, *args, **kwargs):
             step = self.built.plan(input_ids, forward_batch, *args, **kwargs)
-            if torch.cuda.is_current_stream_capturing():
+            capturing = torch.cuda.is_current_stream_capturing()
+            if capturing:
                 self.captured[int(forward_batch.batch_size)] = step
             if step is None:
                 return self.original(
                     input_ids, positions, forward_batch, *args, **kwargs
                 )
+            view = self.binding.forward_view(forward_batch)
+            if capturing:
+                self.binding.seal_capture_view(forward_batch, view)
             return self.built.forward(
-                msgspec.structs.replace(step, view=self.binding.forward_view()),
+                msgspec.structs.replace(step, view=view),
                 self.original,
                 input_ids,
                 positions,
