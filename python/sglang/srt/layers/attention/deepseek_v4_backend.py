@@ -1564,7 +1564,7 @@ class DeepseekV4AttnBackend(
         max_seq_len: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        seq_lens_cpu: List[int],
+        seq_lens_cpu: Optional[List[int]],
         out_cache_loc: torch.Tensor,
         num_tokens: int,
         extend_seq_lens: torch.Tensor,
@@ -2211,10 +2211,14 @@ class DeepseekV4AttnBackend(
         block_size: int,
         dspark_swa_buffers: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> DSV4Metadata:
-        if seq_lens_cpu is None:
-            seq_lens_cpu_list = seq_lens.tolist()
-        else:
+        if seq_lens_cpu is not None:
             seq_lens_cpu_list = [int(x) for x in seq_lens_cpu.tolist()]
+        elif seq_lens.is_cuda:
+            # The CUDA expansion reads live device lengths. Keep the absent host
+            # mirror absent: tolist() would synchronize during glue-graph capture.
+            seq_lens_cpu_list = None
+        else:
+            seq_lens_cpu_list = seq_lens.tolist()
         lengths = compute_uniform_extend_lengths(
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens_cpu_list,
@@ -4683,7 +4687,7 @@ class DeepseekV4AttnBackend(
     def expand_prefill_casually(
         self,
         num_tokens: int,
-        seq_lens: List[int],
+        seq_lens: Optional[List[int]],
         extend_seq_lens: List[int],
         req_pool_indices: torch.Tensor,
         padded_num_tokens: Optional[int],

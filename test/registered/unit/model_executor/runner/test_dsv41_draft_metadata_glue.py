@@ -100,6 +100,108 @@ class TestDraftExtendLengths(CustomTestCase):
                 backend._draft_block_extend_lens([6, 6])
 
 
+class TestDraftBlockMetadata(CustomTestCase):
+    def _backend(self):
+        backend = _backend(
+            draft_metadata_glued=True,
+            page_size=256,
+            has_c4=False,
+            has_c128=False,
+            req_to_token=torch.empty((4, 2048), dtype=torch.int32),
+        )
+        # Device allocation and the page/SWA kernels are the accelerator boundary.
+        backend._move_to_device = lambda lens: torch.tensor(lens, dtype=torch.int32)
+        backend.make_core_attn_metadata = lambda **kwargs: SimpleNamespace(**kwargs)
+        return backend
+
+    @staticmethod
+    def _expand_on_cpu(**kwargs):
+        # The device-only torch reference reads the same tensors as the CUDA kernel.
+        lens = kwargs["extend_seq_lens"]
+        kwargs["extend_start_loc"] = lens.cumsum(0) - lens
+        return dsv4.ExpandPrefillCausally.torch(**kwargs)
+
+    def test_missing_host_mirror_never_reads_back_and_uses_live_lengths(self):
+        """Draft metadata capture must not read device lengths into a Python list,
+        and later steps must use the updated lengths rather than warm-up values."""
+        for prefixes, block_size in (([127], 6), ([127, 1023], 3)):
+            with self.subTest(prefixes=prefixes, block_size=block_size):
+                backend = self._backend()
+                bs = len(prefixes)
+                seq_lens = torch.tensor(prefixes, dtype=torch.int32)
+                req_pool_indices = torch.arange(bs, dtype=torch.int32).flip(0)
+                inputs = dict(
+                    max_seq_len=2048,
+                    req_pool_indices=req_pool_indices,
+                    seq_lens=seq_lens,
+                    seq_lens_cpu=None,
+                    out_cache_loc=torch.arange(bs * block_size),
+                    block_size=block_size,
+                )
+                with (
+                    mock.patch.object(
+                        torch.Tensor, "is_cuda", property(lambda _: True)
+                    ),
+                    mock.patch.object(
+                        torch.Tensor, "tolist", side_effect=AssertionError("host read")
+                    ),
+                    mock.patch.object(
+                        torch.Tensor, "item", side_effect=AssertionError("host read")
+                    ),
+                    mock.patch.object(
+                        torch.Tensor, "cpu", side_effect=AssertionError("host read")
+                    ),
+                    mock.patch.object(
+                        dsv4.ExpandPrefillCausally,
+                        "triton",
+                        side_effect=self._expand_on_cpu,
+                    ),
+                ):
+                    first = backend.init_forward_metadata_dspark_draft_block(**inputs)
+                    seq_lens.add_(11)
+                    with (
+                        mock.patch("torch.cuda.is_available", return_value=True),
+                        mock.patch(
+                            "torch.cuda.is_current_stream_capturing", return_value=True
+                        ),
+                    ):
+                        second = backend.init_forward_metadata_dspark_draft_block(
+                            **inputs
+                        )
+                expected = torch.tensor(
+                    [p + step for p in prefixes for step in range(1, block_size + 1)],
+                    dtype=torch.int32,
+                )
+                torch.testing.assert_close(
+                    first.core_metadata.seq_lens_casual, expected
+                )
+                torch.testing.assert_close(
+                    second.core_metadata.seq_lens_casual, expected + 11
+                )
+                torch.testing.assert_close(
+                    second.core_metadata.req_pool_indices_repeated,
+                    req_pool_indices.repeat_interleave(block_size),
+                )
+
+    def test_cpu_expansion_still_resolves_missing_or_provided_host_lengths(self):
+        backend = self._backend()
+        seq_lens = torch.tensor([127, 1023], dtype=torch.int32)
+        for mirror in (None, seq_lens.clone()):
+            with self.subTest(has_mirror=mirror is not None):
+                metadata = backend.init_forward_metadata_dspark_draft_block(
+                    max_seq_len=2048,
+                    req_pool_indices=torch.tensor([3, 1], dtype=torch.int32),
+                    seq_lens=seq_lens,
+                    seq_lens_cpu=mirror,
+                    out_cache_loc=torch.arange(6),
+                    block_size=3,
+                )
+                torch.testing.assert_close(
+                    metadata.core_metadata.seq_lens_casual,
+                    torch.tensor([128, 129, 130, 1024, 1025, 1026], dtype=torch.int32),
+                )
+
+
 def _runner(*, draft=True, backend=None):
     runner = mod.DecodeCudaGraphRunner.__new__(mod.DecodeCudaGraphRunner)
     runner.model_runner = SimpleNamespace(is_draft_worker=draft)
