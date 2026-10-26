@@ -406,11 +406,8 @@ class TestFusedFp8WriteGate(CustomTestCase):
     """
 
     def _gate(self, *, dcp_enabled: bool, is_translating: bool) -> bool:
-        backend = object.__new__(TRTLLMMLABackend)
-        backend.data_type = torch.float8_e4m3fn
-        backend.kv_lora_rank = 512
-        backend.qk_rope_head_dim = 64
-        backend.kv_index_translator = SimpleNamespace(is_translating=is_translating)
+        # The production gate, not a copy of its expression: a re-typed copy
+        # passed while the backend itself lacked the DCP clause.
         parallel = SimpleNamespace(
             dcp_enabled=dcp_enabled,
             attn_dcp_size=DCP_SIZE if dcp_enabled else 1,
@@ -425,16 +422,11 @@ class TestFusedFp8WriteGate(CustomTestCase):
                 backend_module.envs.SGLANG_ENABLE_ASYNC_ASSERT, "get", lambda: False
             ),
         ):
-            return bool(
-                backend.data_type == torch.float8_e4m3fn
-                and not backend_module.envs.SGLANG_ENABLE_ASYNC_ASSERT.get()
-                and backend.kv_lora_rank == 512
-                and backend.qk_rope_head_dim == 64
-                and not (
-                    backend_module.get_parallel().dcp_enabled
-                    and backend.kv_index_translator.is_translating
-                )
-                and backend_module.can_use_set_mla_kv_concat_q_fp8()
+            return backend_module._use_fused_set_kv_concat_q_fp8(
+                data_type=torch.float8_e4m3fn,
+                kv_lora_rank=512,
+                qk_rope_head_dim=64,
+                kv_index_translator=SimpleNamespace(is_translating=is_translating),
             )
 
     def test_off_for_the_unified_pool_under_dcp(self):
