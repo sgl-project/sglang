@@ -274,11 +274,10 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     or disagg.enable_pd_role_switch
                     else 0
                 )
-                budget = get_sparse_kv_budget(
+                budget_options = dict(
                     request_rows=get_schedule().max_running_requests + extra_rows + 1,
                     context_len=kvc.model_config.context_len
                     + get_req_to_token_extra_context_len(),
-                    num_layers=num_layers,
                     top_k=get_sparsity_driven_kv_offload_sparse_context_len(
                         model_config=kvc.model_config
                     ),
@@ -288,7 +287,18 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     )
                     * torch._utils._element_size(kvc.kv_cache_dtype),
                 )
+                budget = get_sparse_kv_budget(num_layers=num_layers, **budget_options)
                 reservation = budget.managed_hbm_bytes
+                num_sparse_pools = 1
+                if not kvc.is_draft_worker and kvc.spec_algorithm.is_eagle():
+                    draft_layers = kvc.spec_aux_config.eagle_draft_num_layers
+                    if draft_layers is None or draft_layers <= 0:
+                        raise ValueError("Sparse KV MTP requires the draft layer count")
+                    draft_budget = get_sparse_kv_budget(
+                        num_layers=int(draft_layers), **budget_options
+                    )
+                    reservation += draft_budget.managed_hbm_bytes
+                    num_sparse_pools += 1
                 if (
                     envs.SGLANG_NPU_SPARSE_KV_CACHE_SIZE.get() == 0
                     and envs.SGLANG_NPU_SPARSE_KV_HBM_BUDGET_MB.get() > 0
@@ -296,7 +306,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     # Final admission capacity may be smaller than the configured
                     # maximum; auto-sizing can then use more of the byte budget.
                     reservation = (
-                        envs.SGLANG_NPU_SPARSE_KV_HBM_BUDGET_MB.get() * 1024**2
+                        envs.SGLANG_NPU_SPARSE_KV_HBM_BUDGET_MB.get()
+                        * 1024**2
+                        * num_sparse_pools
                     )
                 self._fixed_overhead_bytes += reservation
                 if envs.SGLANG_NPU_SPARSE_KV_INDEXER.get() == "lim":
@@ -355,7 +367,16 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     )
                     draft_kv_size *= dcp_size
                     draft_indexer_size *= dcp_size
-                    self._cell_size += draft_kv_size + draft_indexer_size
+                    if envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get():
+                        # Both pools are index-only. Their host-KV managers were
+                        # reserved above; native LIM also needs one FP32 scale
+                        # workspace per physical draft index token.
+                        self._cell_size += draft_indexer_size
+                        if envs.SGLANG_NPU_SPARSE_KV_INDEXER.get() == "lim":
+                            self._cell_size += 4
+                            self._fixed_overhead_bytes += 4 * get_schedule().page_size
+                    else:
+                        self._cell_size += draft_kv_size + draft_indexer_size
                 else:
                     draft_kv_size = int(
                         self._cell_size * draft_num_layers / int(num_layers)

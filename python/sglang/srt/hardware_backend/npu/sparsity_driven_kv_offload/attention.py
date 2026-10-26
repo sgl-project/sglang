@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import copy
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -12,6 +13,13 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.manager import (
     _wait_stream_event,
     normalize_batch_topk_indices,
     unidex_copy_inplace,
+)
+from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.mtp import (
+    is_sparse_mtp_batch,
+    mtp_compact_topk,
+    mtp_selected_kv_view,
+    mtp_topk_rows,
+    prepare_mtp_rows,
 )
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 
@@ -66,6 +74,128 @@ def _copy_sfa_decode_eligible(backend, forward_batch, layer, q, topk_indices):
     )
 
 
+def _forward_sparse_mtp(backend, q, q_rope, layer, forward_batch, topk_indices):
+    """Consume chain queries in order, reusing the bounded Q1 KV workspace.
+
+    The native LIM planner updates residency before attention copies payloads.
+    Its Q1 plans cannot be generated for all queries up front on one request.
+    MTP uses the vendor causal indexer, then plans/copies each query in order.
+    """
+    manager = _get_sparse_kv_manager(backend)
+    batch = forward_batch.batch_size
+    num_tokens = q.shape[0]
+    requests, positions, live = prepare_mtp_rows(
+        forward_batch, q.shape[0], manager.size, manager.logical_max_context_len
+    )
+    width = positions.shape[1]
+    logical_tokens = batch * width
+    source_rows = mtp_topk_rows(normalize_batch_topk_indices(topk_indices), num_tokens)
+    sources = source_rows[:logical_tokens].view(batch, width, source_rows.shape[-1])
+    top_k = sources.shape[-1]
+    if top_k > manager.sparse_context_len:
+        raise ValueError("Sparse MTP top-k exceeds the selected KV workspace")
+    q = q[:logical_tokens].view(batch, width, -1, backend.kv_lora_rank)
+    q_rope = q_rope[:logical_tokens].view(batch, width, -1, backend.qk_rope_head_dim)
+    output = q.new_empty((batch, width, layer.tp_q_head_num * backend.kv_lora_rank))
+    # A rejected draft may already have populated a resident slot. Rewriting
+    # host KV at that absolute position must not leave a hit on the old value.
+    manager.invalidate_mtp_cache(layer, forward_batch.req_pool_indices)
+    cpu_lengths = forward_batch.seq_lens_cpu
+    use_copy_sfa = (
+        manager.copy_sfa_enabled
+        # The standalone cache planner currently implements C=K only.
+        and manager.cache_capacity == 2048
+        # Draft/verify graphs also replay short prompts. Keep their dispatch
+        # independent of capture-time CPU lengths; Q1 Copy-SFA is fixed-window.
+        and not backend.graph_mode
+        and top_k == 2048
+        and cpu_lengths is not None
+        and not any(0 < int(n) < 2048 for n in cpu_lengths.tolist())
+    )
+    manager.last_decode_path = "mtp_copy_sfa" if use_copy_sfa else "mtp_reference"
+    forward_batch.sparse_kv_decode_path = manager.last_decode_path
+    for column in range(width):
+        source = sources[:, column].contiguous()
+        # SFA expects valid sparse entries before its -1 suffix. IndexShare
+        # can put future entries anywhere; retain the vendor's valid KV order.
+        source = mtp_compact_topk(source, positions[:, column], live[:, column])
+        valid = source >= 0
+        if use_copy_sfa:
+            # copy_sfa_decode's output is shared scratch; copy it before the
+            # next query overwrites that storage. No native LIM plan is used.
+            query_batch = copy(forward_batch)
+            query_batch.seq_lens = torch.where(
+                live[:, column], positions[:, column] + 1, 0
+            )
+            query_nope = q[:, column : column + 1]
+            query_rope = q_rope[:, column : column + 1]
+            padding = manager.planner_attn_out.shape[1] - query_nope.shape[2]
+            if padding > 0:
+                query_nope = torch.nn.functional.pad(query_nope, (0, 0, 0, padding))
+                query_rope = torch.nn.functional.pad(query_rope, (0, 0, 0, padding))
+            result = manager.copy_sfa_decode(
+                layer,
+                query_batch,
+                query_nope,
+                query_rope,
+                layer.tp_q_head_num,
+                layer.scaling,
+                source,
+            )
+        else:
+            selected = mtp_selected_kv_view(manager.selected_kv_buffer, batch, top_k)
+            selected.zero_()
+            safe_requests = requests[:, column].clamp(0, manager.size - 1)
+            layer_index = layer.layer_id - manager.start_layer
+            unidex_copy_inplace(
+                manager.host_kv_buffer[layer_index],
+                selected,
+                (safe_requests[:, None] * manager.max_context_len + source)
+                .reshape(-1)
+                .contiguous(),
+                torch.arange(batch * top_k, device=q.device),
+                valid.reshape(-1).contiguous(),
+                2,
+                2,
+                block_dim=24,
+                src_ptr=manager.dev_ptr_list[layer_index],
+            )
+            compact = torch.arange(top_k, device=q.device, dtype=torch.int32)
+            indices = compact[None].expand(batch, -1).masked_fill(~valid, -1)
+            nonempty = valid.any(dim=1)
+            # The SFA ABI needs a dummy KV on empty/padded query rows.
+            indices[:, 0] = torch.where(nonempty, indices[:, 0], 0)
+            k_nope, k_rope = selected.split(
+                [backend.kv_lora_rank, backend.qk_rope_head_dim], dim=-1
+            )
+            ret = torch_npu.npu_sparse_flash_attention(
+                q[:, column : column + 1].contiguous(),
+                k_nope.contiguous(),
+                k_nope.contiguous(),
+                indices[:, None, None].contiguous(),
+                layer.scaling,
+                actual_seq_lengths_query=torch.ones(
+                    batch, dtype=torch.int32, device=q.device
+                ),
+                actual_seq_lengths_kv=valid.sum(dim=1).clamp(min=1).int(),
+                query_rope=q_rope[:, column : column + 1].contiguous(),
+                key_rope=k_rope.contiguous(),
+                sparse_block_size=1,
+                layout_query="BSND",
+                layout_kv="BSND",
+                sparse_mode=0,
+                attention_mode=2,
+                return_softmax_lse=False,
+            )
+            result = ret[0] if isinstance(ret, (tuple, list)) else ret
+            result = result[:, :, : layer.tp_q_head_num].reshape(batch, -1)
+        result = result.masked_fill(~valid.any(dim=1, keepdim=True), 0)
+        output[:, column].copy_(result)
+    return torch.nn.functional.pad(
+        output.view(logical_tokens, -1), (0, 0, 0, num_tokens - logical_tokens)
+    )
+
+
 def forward_sparsity_driven_kv_offload(
     backend: AscendAttnBackend,
     q: torch.Tensor,
@@ -95,6 +225,11 @@ def forward_sparsity_driven_kv_offload(
 
     if save_kv_cache:
         sparse_kv_manager.offload_v2(k_nope, k_pe, layer, forward_batch, stream)
+
+    if is_sparse_mtp_batch(forward_batch):
+        return _forward_sparse_mtp(
+            backend, q_nope, q_pe, layer, forward_batch, topk_indices
+        )
 
     if is_prefill:
         if backend.forward_metadata.actual_seq_lengths_q is not None:

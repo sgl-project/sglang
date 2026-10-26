@@ -370,16 +370,12 @@ class AscendAttnBackend(AttentionBackend):
             model_config=model_runner.model_config,
             use_mla_backend=model_runner.use_mla_backend,
         )
-        if (
-            envs.SGLANG_NPU_ENABLE_COPY_SFA.get()
-            and get_spec().speculative_num_draft_tokens is not None
-        ):
-            raise ValueError(
-                "SGLANG_NPU_ENABLE_COPY_SFA currently supports only non-speculative "
-                "Q1 decode; disable speculative decoding or Copy-SFA."
-            )
-        self.sparse_kv_manager = None
-        if self.enable_sparsity_driven_kv_offload:
+        # Draft-decode steps and draft-extend use different attention backends
+        # over the same KV pool. They must also share its host KV and residency.
+        self.sparse_kv_manager = getattr(
+            self.token_to_kv_pool, "sparse_kv_manager", None
+        )
+        if self.enable_sparsity_driven_kv_offload and self.sparse_kv_manager is None:
             from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.manager import (
                 SparseKVCacheManager,
                 register_sparse_kv_manager,
@@ -416,7 +412,9 @@ class AscendAttnBackend(AttentionBackend):
                     else None
                 ),
                 graph_batch_capacity=graph_batch_capacity,
+                paged_kv_cache=self.token_to_kv_pool,
             )
+            self.token_to_kv_pool.sparse_kv_manager = self.sparse_kv_manager
             register_sparse_kv_manager(self.sparse_kv_manager)
             logger.info(
                 "Sparsity-driven KV offload is enabled with manager %s.",

@@ -21,6 +21,14 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.lim import (
     LIMDecodeAdapter,
     prepare_lim_rows,
 )
+from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.mtp import (
+    mtp_compact_topk,
+    mtp_selected_kv_view,
+    mtp_topk_mask,
+    mtp_topk_rows,
+    prepare_mtp_rows,
+)
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -28,6 +36,88 @@ register_cpu_ci(est_time=3, stage="base-a")
 
 
 class TestLIMState(CustomTestCase):
+    def test_mtp_tp_padding_does_not_extend_request_windows_or_shrink_k(self):
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            req_pool_indices=torch.tensor([2, 0]),
+            seq_lens=torch.tensor([33, 0]),
+            positions=torch.tensor([33, 34, 35, 0, 0, 0, 0, 0]),
+            out_cache_loc=torch.arange(8),
+            spec_info=SimpleNamespace(num_tokens_per_req=3),
+        )
+        requests, positions, valid = prepare_mtp_rows(batch, 8, 3, 64)
+        self.assertEqual(requests.shape, (2, 3))
+        self.assertEqual(positions[valid].tolist(), [33, 34, 35])
+        batch.forward_mode = ForwardMode.DRAFT_EXTEND_V2
+        batch.spec_info.num_accept_tokens = torch.tensor([1, 0])
+        self.assertEqual(prepare_mtp_rows(batch, 8, 3, 64)[2].sum(), 1)
+        sources = torch.arange(2048).view(1, -1)
+        padded = mtp_topk_rows(sources, 8)
+        self.assertEqual(padded.shape, (8, 2048))
+        self.assertTrue(torch.equal(padded[0], sources[0]))
+        self.assertTrue((padded[1:] == -1).all())
+
+    def test_mtp_compaction_preserves_vendor_kv_order(self):
+        compact = mtp_compact_topk(
+            torch.tensor([[0, 11, 5, -1], [2, -1, 8, 1], [1, 2, 3, 4]]),
+            torch.tensor([10, 10, 10]),
+            torch.tensor([True, True, False]),
+        )
+        self.assertEqual(
+            compact.tolist(), [[0, 5, -1, -1], [2, 8, 1, -1], [-1, -1, -1, -1]]
+        )
+
+    def test_mtp_partial_topk_keeps_packed_rows_and_reuses_storage(self):
+        for top_k in (1, 3, 8):
+            with self.subTest(top_k=top_k):
+                workspace = torch.full((4, 8, 1, 3), -99, dtype=torch.int32)
+                selected = mtp_selected_kv_view(workspace, 3, top_k)
+                self.assertTrue(selected.is_contiguous())
+                self.assertEqual(selected.data_ptr(), workspace.data_ptr())
+                payload = torch.arange(3 * top_k * 3, dtype=torch.int32)
+                selected.copy_(payload.view_as(selected))
+                self.assertTrue(
+                    torch.equal(workspace.flatten()[: payload.numel()], payload)
+                )
+                self.assertTrue((workspace.flatten()[payload.numel() :] == -99).all())
+
+    def test_mtp_absolute_positions_and_draft_extend_padding(self):
+        # Prefix lengths are unchanged across draft steps. Using seq_lens-1
+        # would overwrite a committed token, and padded extend columns must
+        # not overwrite a future token with their duplicate/dummy positions.
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.DECODE,
+            req_pool_indices=torch.tensor([2, 0, 4, 1]),
+            seq_lens=torch.tensor([10, 0, 8, 20]),
+            positions=torch.tensor([12, 0, 8, 22]),
+            out_cache_loc=torch.tensor([100, 0, 102, 103]),
+            spec_info=SimpleNamespace(num_accept_tokens=torch.tensor([1, 3, 0, 2])),
+        )
+        _, positions, valid = prepare_mtp_rows(batch, 4, 4, 64)
+        self.assertEqual(positions[valid].tolist(), [12, 22])
+        batch.forward_mode = ForwardMode.TARGET_VERIFY
+        batch.positions = torch.tensor([10, 11, 12, 0, 0, 0, 8, 9, 10, 20, 21, 22])
+        batch.out_cache_loc = torch.arange(12)
+        requests, positions, valid = prepare_mtp_rows(batch, 12, 4, 64)
+        self.assertEqual(requests[valid].tolist(), [2, 2, 2, 1, 1, 1])
+        self.assertEqual(positions[valid].tolist(), [10, 11, 12, 20, 21, 22])
+        batch.forward_mode = ForwardMode.DRAFT_EXTEND_V2
+        _, positions, valid = prepare_mtp_rows(batch, 12, 4, 64)
+        self.assertEqual(positions[valid].tolist(), [10, 20, 21])
+        batch.out_cache_loc[10] = -1
+        _, positions, valid = prepare_mtp_rows(batch, 12, 4, 64)
+        self.assertEqual(positions[valid].tolist(), [10, 20])
+
+    def test_mtp_indexshare_masks_future_and_empty_rows(self):
+        # Reusing another query's TopK can include future entries in arbitrary
+        # columns; selected-KV indices must preserve holes and reject them.
+        valid = mtp_topk_mask(
+            torch.tensor([[0, 11, 5, -1], [0, 1, 2, 3]]),
+            torch.tensor([10, 20]),
+            torch.tensor([True, False]),
+        )
+        self.assertEqual(valid.tolist(), [[True, False, True, False], [False] * 4])
+
     def test_prefill_gather_shape_ignores_padding_and_checks_host_bounds(self):
         # Host row order and total must match the ragged KV payload, including
         # interior padding. Device-side nonzero would require a stream sync.

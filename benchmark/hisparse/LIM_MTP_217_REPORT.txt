@@ -1,0 +1,85 @@
+LIM / Copy-SFA chain-MTP validation on 217
+2026-10-26, Asia/Shanghai
+
+Branch: feat/hisparse-lim-copysfa-opt-217-mtp
+Base: 6e37ddf7d6a7228250b836cc1a3801ad7c876b81 (merged opt-217 including C4096/C8192 and DeepEP fixes).
+The original dirty checkout was preserved; this is a separate managed worktree.
+
+Supported scope
+EAGLE/NEXTN chain MTP (validated with spec v2), topk=1, PP=1, no DCP, Ascend DSA MLA, BF16,
+page size 128, model index_topk=2048. C2048/4096/8192 component checks pass.
+MTP uses the vendor causal indexer rather than the native Q1 LIM indexer plan.
+Long eager C2048 queries can use sequential Q1 Copy-SFA. MTP graphs and
+C4096/C8192 use selected-KV SFA. This is not a fused multi-query native kernel.
+Short/mixed decode batches retain the existing eager graph-eligibility guard.
+
+Fixes verified
+- Publish speculative KV at absolute positions; mask rejected extend columns.
+- Obtain query width from speculative metadata. TP token padding is a suffix,
+  not extra query columns: a 2x3 window padded to 8 must not overwrite position 0.
+- Pad missing indexer rows with -1 while preserving K, rather than reshaping K.
+- Pack short TopK destinations as a contiguous alias of existing KV scratch.
+- Compact invalid source IDs while preserving valid KV order and causality.
+  Exact FP32 ordinal keys avoid the reported integer ArgSort AiCPU fallback.
+- Invalidate stale residency for rewritten drafts; reset both managers on reuse.
+- Give the draft backend its own KV pool explicitly. EAGLE shares the target
+  allocator's token IDs, so allocator.get_kvcache() is not the draft's KV pool.
+  The previous two managers could alias the target host KV and misprice draft HBM.
+- Price target and draft managers, index-scale scratch, and eager TP padding
+  consistently before admitting requests. Draft backends share one draft manager.
+
+Verification
+17 registered LIM CPU cases + 17 manual cache CPU cases + 1 MTP budget case pass.
+All three NPU component capacities pass B4/Q3, rejected-position rewrite,
+draft extend, short TopK, token-padding suffix, separate pools over a shared
+allocator, bitwise KV publication, CPU attention oracle and graph replay/reuse.
+The full pool-configurator suite ran 64 cases; 3 failures and 6 errors have
+exactly the same failure labels as the previously checked unmodified base.
+
+Full model: GLM-5.2-w4a8, B105, TP16/EP16/attention-DP2, C2048, context8192,
+max-running-requests4, max-total-tokens32768, BF16 KV, modelslim quantization,
+EAGLE steps2/topk1/draft-tokens3, temperature0, seed42.
+Inputs include 2596/2599-token prompts, mixed concurrent requests and slot reuse.
+  eager: 8 requests, 133 completion tokens, verify=47, correct drafts=92, accept length=2.8297872340425534
+  graph: 9 requests, 252 completion tokens, verify=87, correct drafts=171, accept length=2.896551724137931
+  baseline: 9 requests, 252 completion tokens, verify=0, correct drafts=0, accept length=None
+  dense-eager: 8 requests, 133 completion tokens, verify=47, correct drafts=91, accept length=2.8297872340425534
+  diagnostic-eager: 8 requests, 133 completion tokens, verify=47, correct drafts=92, accept length=2.8297872340425534
+Every checked output exactly matches the non-MTP baseline output for the same input.
+Three additional mixed short/long rounds (9 requests) also match exactly.
+The graph run captured verify/decode/extend graphs at BS8 and logged actual
+NPU graph replay. The eager rerun restored the original production callbacks
+after the diagnostic check; the final graph server has no diagnostic wrapper.
+On rank0's first target/draft attention layer, the diagnostic recorded
+21 forwards with totals
+{"kv_mismatch_elements": 0, "unpublished_selected": 0, "write_loc_mismatches": 0, "duplicate_sources": 0}.
+Earlier output/position/KV failures are preserved in the dated artifact folders.
+Output comparisons use raw server responses.
+
+Limits
+This finite validation is not a GPQA accuracy result or a throughput benchmark.
+Accept length includes the bonus token. Baseline has BS8 graph configuration
+for aligned workspace capacity and disables overlap; graph MTP enables overlap.
+Exact output matches here do not establish universal numerical equivalence.
+
+Environment and evidence
+Main user container: sglwmc-105 (B105), running.
+Model service: sglwmc-105-mtp-verify-20261026, 127.0.0.1:18811, left running.
+The model is mounted read-only in that helper; it shares the user's source tree.
+Workspace: /home/wzy/hisparse-mtp-20261024 (moved from /home/y00970600/personal/).
+Kernel SHA256: 88082db67a2f53348071169c19d4cd992b9da1c1581f1b5e66184e4cdd439870
+Raw request/response receipts, source hashes, logs, comparison and KV proof:
+/home/wzy/hisparse-mtp-20261024/validation-20261026/
+GPQA precision processes and their recurring automation remain stopped/paused.
+No global kernel wheel was changed. Implementation and validation evidence are
+delivered on feat/hisparse-lim-copysfa-opt-217-mtp.
+
+Component reproduction inside B105:
+  cd /home/wzy/hisparse-mtp-20261024
+  source env.sh
+  python benchmark/hisparse/check_lim_mtp.py --capacity 2048
+Full-model reproduction scripts are saved at that workspace root:
+  launch_mtp_20261026.sh, check_full_model_20261026.py,
+  compare_full_model_20261026.py and finish_padding_validation_20261026.py.
+The final exact-source recheck is finish_fp32_sort_20261026.py; the extra
+mixed-batch repetition is repeat_mixed_20261026.py.

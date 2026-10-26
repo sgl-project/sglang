@@ -930,6 +930,100 @@ class TestAllSWAConfigurator(CustomTestCase):
 class TestEagleConfigurator(CustomTestCase):
     """EAGLE: draft KV cache must be accounted for so total allocation fits in budget."""
 
+    def test_sparse_mtp_reserves_both_managers_and_only_index_tokens(self):
+        """Target admission must leave room for the separate draft host-KV manager."""
+        import torch
+
+        from sglang.srt.environ import envs
+        from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
+            get_sparse_kv_budget,
+        )
+        from sglang.srt.mem_cache.allocation_sizing import (
+            get_req_to_token_extra_context_len,
+        )
+        from sglang.srt.model_executor.pool_configurator import DefaultPoolConfigurator
+
+        mr = _make_model_runner(
+            self,
+            num_layers=4,
+            use_mla_backend=True,
+            page_size=128,
+            max_running_requests=2,
+            speculative_algorithm="EAGLE",
+            speculative_num_steps=2,
+            speculative_num_draft_tokens=3,
+            speculative_eagle_topk=1,
+        )
+        _configure_dsa_model(mr)
+        mr.kv_cache_dtype = torch.bfloat16
+        mr.spec_algorithm.is_eagle.return_value = True
+        mr.spec_algorithm.is_none.return_value = False
+        mr.spec_aux_config.eagle_draft_num_layers = 1
+        with (
+            get_context().override_server_args(
+                attention_backend="ascend",
+                max_running_requests=2,
+                page_size=128,
+                speculative_algorithm="EAGLE",
+                speculative_num_steps=2,
+                speculative_num_draft_tokens=3,
+                speculative_eagle_topk=1,
+            ),
+            envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.override(True),
+            envs.SGLANG_NPU_ENABLE_COPY_SFA.override(True),
+            envs.SGLANG_NPU_SPARSE_KV_INDEXER.override("lim"),
+            envs.SGLANG_NPU_SPARSE_KV_CACHE_SIZE.override(2048),
+            envs.SGLANG_NPU_SPARSE_KV_HBM_BUDGET_MB.override(0),
+            # Isolate the hardware predicate; all config decisions are real.
+            patch(
+                "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config.is_npu",
+                return_value=True,
+            ),
+            patch("sglang.srt.model_executor.pool_configurator._is_npu", True),
+            patch(
+                "sglang.srt.hardware_backend.npu.utils.is_npu_arch35",
+                return_value=False,
+            ),
+            mock_cpu_env(),
+        ):
+            cfg = DefaultPoolConfigurator(mr)
+            options = dict(
+                request_rows=3,
+                context_len=8192 + get_req_to_token_extra_context_len(),
+                top_k=2048,
+                kv_bytes_per_token=576 * 2,
+            )
+            managers = sum(
+                get_sparse_kv_budget(num_layers=layers, **options).managed_hbm_bytes
+                for layers in (4, 1)
+            )
+            # Five BF16 index-K layers and one FP32 scale workspace per pool;
+            # no CKV/KPE payload is priced as a device token in either model.
+            self.assertEqual(cfg._cell_size, 5 * 128 * 2 + 2 * 4)
+            self.assertEqual(cfg._fixed_overhead_bytes, managers + 2 * 128 * 4)
+            available = managers + 2 * 128 * 4 + 10_000_000
+            sizes = cfg.calculate_pool_sizes(available, 128)
+            used = sizes.max_total_num_tokens * (5 * 128 * 2 + 2 * 4)
+            used += managers + 2 * 128 * 4
+            self.assertLessEqual(used, available)
+
+            # Eager MLP-sync can pad a one-row draft to attention TP=8 even
+            # when graphs are disabled. Admission must price that scratch too.
+            with get_parallel().override(
+                tp_size=16,
+                attn_tp_size=8,
+                attn_dp_size=2,
+                attn_cp_size=1,
+                attn_dp_enabled=True,
+                moe_ep_size=16,
+                moe_dp_size=1,
+                moe_tp_size=1,
+            ):
+                padded = get_sparse_kv_budget(
+                    num_layers=4, graph_batch_capacity=0, **options
+                )
+                self.assertEqual(padded.selected_kv_bytes, 8 * 2048 * 1152)
+
     def test_eagle_does_not_exceed_budget(self):
         """Total memory (target + draft KV cache) must not exceed available."""
         available = 10_000_000

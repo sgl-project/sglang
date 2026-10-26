@@ -330,6 +330,7 @@ class DSANPUIndexerMixin:
             manager = getattr(backend, "sparse_kv_manager", None)
             if (
                 forward_batch.forward_mode.is_decode()
+                and forward_batch.spec_info is None
                 and manager is not None
                 and manager.lim_adapter is not None
             ):

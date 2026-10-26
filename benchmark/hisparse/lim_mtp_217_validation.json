@@ -1,0 +1,251 @@
+{
+  "date": "2026-10-26",
+  "timezone": "Asia/Shanghai",
+  "branch": "feat/hisparse-lim-copysfa-opt-217-mtp",
+  "base": "6e37ddf7d6a7228250b836cc1a3801ad7c876b81",
+  "container": {
+    "container": "sglwmc-105",
+    "container_id": "4a06992131bf5120c457d8bcdf469c407122147a6c3dd8544a86b3cc4e3be33a",
+    "image": "swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-B105",
+    "workspace": "/home/wzy/hisparse-mtp-20261024",
+    "source_removed": true,
+    "running": true
+  },
+  "full_model_container": "sglwmc-105-mtp-verify-20261026",
+  "full_model_port": 18811,
+  "full_model_service_left_running": true,
+  "production_sources_sha256": {
+    "python/sglang/srt/hardware_backend/npu/attention/ascend_backend.py": "d4ed1ec3f95f4119064e184bb5d764dde95bf529420883288f8cf85a851c47e1",
+    "python/sglang/srt/hardware_backend/npu/sparsity_driven_kv_offload/attention.py": "9823e370ecc84a848a15e774d4cd589ed37f69f4284961e55e0499c8fedce0db",
+    "python/sglang/srt/hardware_backend/npu/sparsity_driven_kv_offload/config.py": "b1b0f4e6e979bb95e820de68692c9af8af42f8f611b75a5b333012fcee37afb7",
+    "python/sglang/srt/hardware_backend/npu/sparsity_driven_kv_offload/manager.py": "9088f3e974a4e809a764b71a67d26eeba1dd5aaca826ba9a4dc31aefbb5e8efc",
+    "python/sglang/srt/layers/attention/dsa/dsa_npu_indexer.py": "32fee5b3b886f53df96c367b577701b51615b68d7c523d057b0ad871ec586a4c",
+    "python/sglang/srt/model_executor/pool_configurator.py": "699d8298587c4bf4a170d34d85a048f8490f60b9764660981366a37061117253",
+    "python/sglang/srt/hardware_backend/npu/sparsity_driven_kv_offload/mtp.py": "8aaa5507729cca1e807de5888a6b21d94e05752b354af3135f82e869bccb27aa"
+  },
+  "all_validated_sources_sha256": {
+    "python/sglang/srt/hardware_backend/npu/attention/ascend_backend.py": "d4ed1ec3f95f4119064e184bb5d764dde95bf529420883288f8cf85a851c47e1",
+    "python/sglang/srt/hardware_backend/npu/sparsity_driven_kv_offload/attention.py": "9823e370ecc84a848a15e774d4cd589ed37f69f4284961e55e0499c8fedce0db",
+    "python/sglang/srt/hardware_backend/npu/sparsity_driven_kv_offload/config.py": "b1b0f4e6e979bb95e820de68692c9af8af42f8f611b75a5b333012fcee37afb7",
+    "python/sglang/srt/hardware_backend/npu/sparsity_driven_kv_offload/manager.py": "9088f3e974a4e809a764b71a67d26eeba1dd5aaca826ba9a4dc31aefbb5e8efc",
+    "python/sglang/srt/layers/attention/dsa/dsa_npu_indexer.py": "32fee5b3b886f53df96c367b577701b51615b68d7c523d057b0ad871ec586a4c",
+    "python/sglang/srt/model_executor/pool_configurator.py": "699d8298587c4bf4a170d34d85a048f8490f60b9764660981366a37061117253",
+    "python/sglang/srt/hardware_backend/npu/sparsity_driven_kv_offload/mtp.py": "8aaa5507729cca1e807de5888a6b21d94e05752b354af3135f82e869bccb27aa",
+    "benchmark/hisparse/bench_lim_framework.py": "fc395a9d119a827abfb2a4f91ac1c0446a7e0f8424b0841a2c5992e70fe20a9a",
+    "benchmark/hisparse/check_lim_mtp.py": "4ef267f4d52ddbda34a3317679501d2f8ec7d641e1e69e7e73d1b49e7bdd9c43",
+    "test/registered/unit/hardware_backend/test_npu_lim_state.py": "05ab9858548142601aea4d6e3a5e2ceff36866a3b24b158c0adb44b8674542f4",
+    "test/manual/npu/test_sparse_kv_offload_cache.py": "bf2ebafee1bc5683443520d24a3f226a3e5a4b73ffb18154894b312fd5fa98dd",
+    "test/registered/unit/model_executor/test_pool_configurator.py": "912d1a7ed64863a381bedcd8ef115dc77daccc29c5c142d0f20145c84fcebe1e"
+  },
+  "kernel_sha256": "88082db67a2f53348071169c19d4cd992b9da1c1581f1b5e66184e4cdd439870",
+  "cpu_checks": {
+    "lim_cases": 17,
+    "cache_cases": 17,
+    "mtp_budget_cases": 1,
+    "status": "passed"
+  },
+  "pool_suite_comparison": {
+    "current_failures": [
+      "ERROR: test_pd_prices_producer_layers_only (__main__.TestDSAIndexerAllocationPolicy.test_pd_prices_producer_layers_only)",
+      "ERROR: test_resolved_hicache_override_prices_producer_layers_only (__main__.TestDSAIndexerAllocationPolicy.test_resolved_hicache_override_prices_producer_layers_only)",
+      "ERROR: test_dsa_mla_cell_size_uses_backend_kv_layout (__main__.TestDefaultConfigurator.test_dsa_mla_cell_size_uses_backend_kv_layout)",
+      "ERROR: test_dsa_draft_full_indexer_cost_does_not_exceed_budget (__main__.TestEagleConfigurator.test_dsa_draft_full_indexer_cost_does_not_exceed_budget)",
+      "ERROR: test_hisparse_draft_expanded_id_space_is_budgeted (__main__.TestEagleConfigurator.test_hisparse_draft_expanded_id_space_is_budgeted)",
+      "ERROR: test_dsv4_paged_kv_budget (__main__.TestSWAPoolFloor.test_dsv4_paged_kv_budget)",
+      "FAIL: test_ascend_pd_sizing_stays_dense_like_its_allocation (__main__.TestDSAIndexerAllocationPolicy.test_ascend_pd_sizing_stays_dense_like_its_allocation) (is_npu=True, mode='prefill')",
+      "FAIL: test_ascend_pd_sizing_stays_dense_like_its_allocation (__main__.TestDSAIndexerAllocationPolicy.test_ascend_pd_sizing_stays_dense_like_its_allocation) (is_npu=True, mode='null')",
+      "FAIL: test_ascend_pd_sizing_stays_dense_like_its_allocation (__main__.TestDSAIndexerAllocationPolicy.test_ascend_pd_sizing_stays_dense_like_its_allocation) (is_npu=False, mode='prefill')"
+    ],
+    "baseline_failures": [
+      "ERROR: test_dsa_draft_full_indexer_cost_does_not_exceed_budget (__main__.TestEagleConfigurator.test_dsa_draft_full_indexer_cost_does_not_exceed_budget)",
+      "ERROR: test_dsa_mla_cell_size_uses_backend_kv_layout (__main__.TestDefaultConfigurator.test_dsa_mla_cell_size_uses_backend_kv_layout)",
+      "ERROR: test_dsv4_paged_kv_budget (__main__.TestSWAPoolFloor.test_dsv4_paged_kv_budget)",
+      "ERROR: test_hisparse_draft_expanded_id_space_is_budgeted (__main__.TestEagleConfigurator.test_hisparse_draft_expanded_id_space_is_budgeted)",
+      "ERROR: test_pd_prices_producer_layers_only (__main__.TestDSAIndexerAllocationPolicy.test_pd_prices_producer_layers_only)",
+      "ERROR: test_resolved_hicache_override_prices_producer_layers_only (__main__.TestDSAIndexerAllocationPolicy.test_resolved_hicache_override_prices_producer_layers_only)",
+      "FAIL: test_ascend_pd_sizing_stays_dense_like_its_allocation (__main__.TestDSAIndexerAllocationPolicy.test_ascend_pd_sizing_stays_dense_like_its_allocation) (is_npu=False, mode='prefill')",
+      "FAIL: test_ascend_pd_sizing_stays_dense_like_its_allocation (__main__.TestDSAIndexerAllocationPolicy.test_ascend_pd_sizing_stays_dense_like_its_allocation) (is_npu=True, mode='null')",
+      "FAIL: test_ascend_pd_sizing_stays_dense_like_its_allocation (__main__.TestDSAIndexerAllocationPolicy.test_ascend_pd_sizing_stays_dense_like_its_allocation) (is_npu=True, mode='prefill')"
+    ],
+    "same_failure_labels": true
+  },
+  "native_checks": [
+    {
+      "capacity": 2048,
+      "batch": 4,
+      "query_width": 3,
+      "eager_path": "mtp_copy_sfa",
+      "reject_rewrite": "pass",
+      "draft_extend": "pass",
+      "partial_topk": "pass",
+      "tp_token_padding": "pass",
+      "distinct_target_draft_pools": "pass",
+      "graph_replay_short_long_padding": "pass",
+      "cpu_attention": "pass",
+      "kv_bitwise": "pass"
+    },
+    {
+      "capacity": 4096,
+      "batch": 4,
+      "query_width": 3,
+      "eager_path": "mtp_reference",
+      "reject_rewrite": "pass",
+      "draft_extend": "pass",
+      "partial_topk": "pass",
+      "tp_token_padding": "pass",
+      "distinct_target_draft_pools": "pass",
+      "graph_replay_short_long_padding": "pass",
+      "cpu_attention": "pass",
+      "kv_bitwise": "pass"
+    },
+    {
+      "capacity": 8192,
+      "batch": 4,
+      "query_width": 3,
+      "eager_path": "mtp_reference",
+      "reject_rewrite": "pass",
+      "draft_extend": "pass",
+      "partial_topk": "pass",
+      "tp_token_padding": "pass",
+      "distinct_target_draft_pools": "pass",
+      "graph_replay_short_long_padding": "pass",
+      "cpu_attention": "pass",
+      "kv_bitwise": "pass"
+    }
+  ],
+  "full_model_evaluation": {
+    "eager": {
+      "mode": "eager",
+      "status": "passed",
+      "requests": 8,
+      "completion_tokens": 133,
+      "verify_ct": 47,
+      "correct_drafts": 92,
+      "aggregate_accept_length": 2.8297872340425534,
+      "checks": [
+        "short_generation",
+        "long_prefill_over_2048",
+        "mixed_concurrent_requests",
+        "request_reuse",
+        "draft_acceptance"
+      ],
+      "exact_answer_format_warnings": []
+    },
+    "graph": {
+      "mode": "graph",
+      "status": "passed",
+      "requests": 9,
+      "completion_tokens": 252,
+      "verify_ct": 87,
+      "correct_drafts": 171,
+      "aggregate_accept_length": 2.896551724137931,
+      "checks": [
+        "short_generation",
+        "long_prefill_over_2048",
+        "mixed_concurrent_requests",
+        "request_reuse",
+        "draft_acceptance"
+      ],
+      "exact_answer_format_warnings": []
+    },
+    "baseline": {
+      "mode": "baseline",
+      "status": "passed",
+      "requests": 9,
+      "completion_tokens": 252,
+      "verify_ct": 0,
+      "correct_drafts": 0,
+      "aggregate_accept_length": null,
+      "checks": [
+        "short_generation",
+        "long_prefill_over_2048",
+        "mixed_concurrent_requests",
+        "request_reuse"
+      ],
+      "exact_answer_format_warnings": []
+    },
+    "dense-eager": {
+      "mode": "dense-eager",
+      "status": "passed",
+      "requests": 8,
+      "completion_tokens": 133,
+      "verify_ct": 47,
+      "correct_drafts": 91,
+      "aggregate_accept_length": 2.8297872340425534,
+      "checks": [
+        "short_generation",
+        "long_prefill_over_2048",
+        "mixed_concurrent_requests",
+        "request_reuse",
+        "draft_acceptance"
+      ],
+      "exact_answer_format_warnings": []
+    },
+    "diagnostic-eager": {
+      "mode": "diagnostic-eager",
+      "status": "passed",
+      "requests": 8,
+      "completion_tokens": 133,
+      "verify_ct": 47,
+      "correct_drafts": 92,
+      "aggregate_accept_length": 2.8297872340425534,
+      "checks": [
+        "short_generation",
+        "long_prefill_over_2048",
+        "mixed_concurrent_requests",
+        "request_reuse",
+        "draft_acceptance"
+      ],
+      "exact_answer_format_warnings": []
+    }
+  },
+  "full_model_output_comparison": {
+    "model": "GLM-5.2-w4a8",
+    "temperature": 0,
+    "seed": 42,
+    "comparison": {
+      "eager": {
+        "requests": 8,
+        "exact_text_matches": 8,
+        "differences": []
+      },
+      "graph": {
+        "requests": 9,
+        "exact_text_matches": 9,
+        "differences": []
+      },
+      "dense-eager": {
+        "requests": 8,
+        "exact_text_matches": 8,
+        "differences": []
+      }
+    },
+    "limits": "Finite sanity cases, not GPQA accuracy or a throughput benchmark. Overlap is enabled in graph MTP and disabled in eager/baseline; baseline retains the BS8 graph configuration for aligned Q1 workspace capacity. this comparison cannot isolate graph, scheduling and MTP numerical effects."
+  },
+  "kv_diagnostic_proof": {
+    "forward_records": 21,
+    "totals": {
+      "kv_mismatch_elements": 0,
+      "unpublished_selected": 0,
+      "write_loc_mismatches": 0,
+      "duplicate_sources": 0
+    },
+    "status": "passed"
+  },
+  "sort_keys": "exact FP32 ordinals; integer ArgSort AiCPU fallback warning absent in final eager/graph logs",
+  "mixed_repeat_validation": {
+    "status": "passed",
+    "rounds": 3,
+    "requests": 9,
+    "exact_text_matches": 9
+  },
+  "gpqa_accuracy_evaluation": "not_run",
+  "throughput_benchmark": "not_run",
+  "precision_automation": "217-gpqa-lim-copy-sfa remains paused",
+  "remote_artifacts": "/home/wzy/hisparse-mtp-20261024/validation-20261026",
+  "historical_failed_checks": [
+    "before-stable-topk",
+    "before-tp-padding",
+    "before-own-pool"
+  ]
+}

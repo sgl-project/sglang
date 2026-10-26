@@ -32,6 +32,7 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.manager import (
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool, ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 
 K, PAGE, CKV, KPE = 2048, 128, 512, 64
@@ -100,7 +101,14 @@ class FixtureIndexPool(MLATokenToKVPool):
 
 class FrameworkCase:
     def __init__(
-        self, mode, fixture, args, *, request_capacity=None, graph_batch_capacity=0
+        self,
+        mode,
+        fixture,
+        args,
+        *,
+        request_capacity=None,
+        graph_batch_capacity=0,
+        allocator_kv=None,
     ):
         self.mode, self.fixture, self.args = mode, fixture, args
         self.pool = ReqToTokenPool(
@@ -108,16 +116,26 @@ class FrameworkCase:
         )
         kv = FixtureIndexPool(fixture.key, args.layers)
         with (
+            get_context().override_server_args(
+                device="npu",
+                attention_backend="ascend",
+                tp_size=1,
+                max_running_requests=request_capacity or args.batch,
+                disable_cuda_graph=True,
+            ),
             envs.SGLANG_NPU_SPARSE_KV_INDEXER.override(mode),
             envs.SGLANG_NPU_SPARSE_KV_CACHE_SIZE.override(args.capacity),
             envs.SGLANG_NPU_SPARSE_KV_HBM_BUDGET_MB.override(0),
         ):
             self.manager = SparseKVCacheManager(
                 self.pool,
-                SimpleNamespace(get_kvcache=lambda: kv),
+                SimpleNamespace(
+                    get_kvcache=lambda: allocator_kv if allocator_kv is not None else kv
+                ),
                 K,
                 copy_sfa_padded_query_heads=args.query_heads,
                 graph_batch_capacity=graph_batch_capacity,
+                paged_kv_cache=kv,
             )
         for layer in range(args.layers):
             self.manager.host_kv_buffer[layer].copy_(

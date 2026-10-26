@@ -11,7 +11,6 @@ from sgl_kernel_npu.sparsity_driven_kv_offload import (
     slot_map_lookup,
     unidex_copy_inplace,
 )
-
 from sglang.kernels.ops.attention.npu_copy_sfa import (
     fused_scatter_copy_sparse_flash_attention,
     load_copy_sfa_operator,
@@ -36,17 +35,21 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.copy_sfa_buffers
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.lru import (
     plan_sparse_lru,
 )
+from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.mtp import (
+    is_sparse_mtp_batch,
+    prepare_mtp_rows,
+)
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
     ReqToTokenPool,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.utils.common import get_eager_max_batch_size
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if TYPE_CHECKING:
     import torch.npu
-
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.managers.schedule_batch import Req
 
@@ -100,6 +103,7 @@ class SparseKVCacheManager:
         sparse_context_len: int,
         copy_sfa_padded_query_heads: Optional[int] = None,
         graph_batch_capacity: int = 0,
+        paged_kv_cache: Optional[MLATokenToKVPool] = None,
     ) -> None:
         enable_memory_saver = False
         memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -109,7 +113,10 @@ class SparseKVCacheManager:
         # Include the padding row because real request IDs can equal the
         # configured capacity when row 0 is reserved for graph padding.
         self.size = int(req_to_token_pool.req_to_token.shape[0])
-        self.batch_capacity = sparse_batch_capacity(self.size, graph_batch_capacity)
+        self.batch_capacity = sparse_batch_capacity(
+            self.size,
+            max(graph_batch_capacity, get_eager_max_batch_size(self.size - 1)),
+        )
         self.last_decode_path = "unselected"
         self.logical_max_context_len = int(req_to_token_pool.max_context_len)
         self.copy_sfa_enabled = envs.SGLANG_NPU_ENABLE_COPY_SFA.get()
@@ -123,7 +130,10 @@ class SparseKVCacheManager:
                 f"got {self.sparse_context_len}."
             )
         self.device = req_to_token_pool.device
-        paged_kv_cache = token_to_kv_pool_allocator.get_kvcache()
+        # EAGLE shares the target allocator's token IDs while owning a
+        # separate draft KV pool. The allocator's pool is not the draft pool.
+        if paged_kv_cache is None:
+            paged_kv_cache = token_to_kv_pool_allocator.get_kvcache()
         if not isinstance(paged_kv_cache, MLATokenToKVPool):
             raise TypeError(
                 "SparseKVCacheManager requires an MLATokenToKVPool, "
@@ -370,7 +380,7 @@ class SparseKVCacheManager:
                     shape=host_kv_shape,
                     dtype=self.store_dtype,
                     device_id=device_id,
-                    name=f"host_kv_layer_{layer_idx}_rank_{device_id}",
+                    name=f"host_kv_pool_{id(paged_kv_cache)}_layer_{layer_idx}_rank_{device_id}",
                 )
                 self.host_kv_buffer.append(shm_cpu_tensor)
                 self.host_ptr_list.append(host_ptr)
@@ -440,6 +450,16 @@ class SparseKVCacheManager:
                 self.lru_order[layer_idx][req_ids_tensor] = self._lru_init
         if self.lim_adapter is not None:
             self.lim_adapter.reset_requests(req_ids_tensor)
+
+    def invalidate_mtp_cache(self, layer, request_slots):
+        """Discard residency before publishing a potentially rewritten draft."""
+        layer_index = layer.layer_id - self.start_layer
+        slots = request_slots.long().clamp(0, self.size - 1)
+        self.device_slot_map[layer_index].index_fill_(0, slots, -1)
+        if self.copy_sfa_enabled:
+            self.device_slot_owner[layer_index].index_fill_(0, slots, -1)
+        if self.lim_adapter is not None:
+            self.lim_adapter.last_prefix[layer_index].index_fill_(0, slots, -1)
 
     def plan_decode_cache(
         self,
@@ -604,10 +624,8 @@ class SparseKVCacheManager:
         return attention_out[:, :query_heads].reshape(batch_size, -1)
 
     def _install_req_alloc_hook(self, req_to_token_pool: ReqToTokenPool) -> None:
-        original_alloc = getattr(
-            req_to_token_pool, "_sparse_kv_original_alloc", req_to_token_pool.alloc
-        )
-        setattr(req_to_token_pool, "_sparse_kv_original_alloc", original_alloc)
+        # Preserve the target manager's hook when adding the draft manager.
+        original_alloc = req_to_token_pool.alloc
 
         def alloc_with_sparse_reset(reqs: list[Req]) -> Optional[List[int]]:
             newly_allocated = [not req.kv.holds_kv for req in reqs]
@@ -768,7 +786,17 @@ class SparseKVCacheManager:
         src_index = torch.arange(src_tensor.shape[0], device=device, dtype=torch.long)
         num_src_rows = int(src_tensor.shape[0])
 
-        if forward_batch.forward_mode.is_decode():
+        if is_sparse_mtp_batch(forward_batch):
+            req_ids, token_pos, valid_mask = prepare_mtp_rows(
+                forward_batch, num_src_rows, self.size, self.logical_max_context_len
+            )
+            dst_index = (req_ids * self.max_context_len + token_pos).reshape(-1)
+            valid_mask = valid_mask.reshape(-1).contiguous()
+            # TP token padding is a suffix, independent of the request window.
+            padding = num_src_rows - dst_index.numel()
+            dst_index = torch.nn.functional.pad(dst_index, (0, padding), value=0)
+            valid_mask = torch.nn.functional.pad(valid_mask, (0, padding), value=False)
+        elif forward_batch.forward_mode.is_decode():
             req_ids = forward_batch.req_pool_indices.to(torch.long)
             token_pos = (forward_batch.seq_lens - 1).to(torch.long)
             cache_loc = forward_batch.out_cache_loc.to(torch.long)

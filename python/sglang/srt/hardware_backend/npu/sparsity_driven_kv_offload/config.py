@@ -22,7 +22,11 @@ from sglang.srt.runtime_context import (
     get_schedule,
     get_spec,
 )
-from sglang.srt.utils.common import get_cuda_graph_max_batch_size, is_npu
+from sglang.srt.utils.common import (
+    get_cuda_graph_max_batch_size,
+    get_eager_max_batch_size,
+    is_npu,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -92,10 +96,17 @@ def is_sparsity_driven_kv_offload_enabled(
             raise ValueError(
                 "LIM/reference integration currently requires PP=1 and DCP disabled."
             )
-        if (get_spec().speculative_algorithm or "NONE").upper() != "NONE":
-            raise ValueError(
-                "LIM/reference framework integration currently supports Q1 decode without speculation."
-            )
+    algorithm = (get_spec().speculative_algorithm or "NONE").upper()
+    if algorithm != "NONE" and (
+        algorithm not in ("EAGLE", "NEXTN")
+        or get_spec().speculative_eagle_topk != 1
+        or get_parallel().pp_size != 1
+        or get_parallel().dcp_enabled
+    ):
+        raise ValueError(
+            "Sparse KV MTP requires EAGLE/NEXTN with "
+            "--speculative-eagle-topk 1, PP=1 and DCP disabled."
+        )
     return True
 
 
@@ -190,5 +201,8 @@ def get_sparse_kv_budget(
         indexer_impl=get_sparse_kv_indexer_impl(),
         copy_sfa=envs.SGLANG_NPU_ENABLE_COPY_SFA.get(),
         copy_sfa_query_heads=copy_sfa_query_heads,
-        graph_batch_capacity=sparse_batch_capacity(request_rows, graph_batch_capacity),
+        graph_batch_capacity=sparse_batch_capacity(
+            request_rows,
+            max(graph_batch_capacity, get_eager_max_batch_size(request_rows - 1)),
+        ),
     )
