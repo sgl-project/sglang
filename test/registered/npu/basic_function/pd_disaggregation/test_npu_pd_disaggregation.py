@@ -24,6 +24,9 @@ from sglang.test.test_utils import (
 
 register_npu_ci(est_time=400, suite="base-b-test-16-npu-a3")
 register_npu_ci(est_time=400, suite="nightly-16-npu-a3", nightly=True)
+# TEMP: temporary registration for card-count validation.
+# TEMP: prefill tp2 (cards 0-1) + decode tp2 (cards 2-3) -> 4 cards in total.
+register_npu_ci(est_time=400, suite="tmp-nightly-4-npu-a3", nightly=True)
 
 
 class DisaggregationHiCacheBase(PDDisaggregationServerBase):

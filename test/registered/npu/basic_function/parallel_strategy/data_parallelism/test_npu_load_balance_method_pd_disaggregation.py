@@ -24,6 +24,10 @@ from sglang.test.test_utils import (
 )
 
 register_npu_ci(est_time=3600, suite="nightly-16-npu-a3", nightly=True)
+# TEMP: temporary registration for card-count validation.
+# TEMP: decode tp2 (cards 2-3) + prefill tp2 (cards 4-5) -> 4 cards in use,
+# TEMP: but prefill uses --base-gpu-id 4, so it needs >= 6 visible cards.
+register_npu_ci(est_time=3600, suite="tmp-nightly-8-npu-a3", nightly=True)
 
 load_balance_method_options = [
     "auto",

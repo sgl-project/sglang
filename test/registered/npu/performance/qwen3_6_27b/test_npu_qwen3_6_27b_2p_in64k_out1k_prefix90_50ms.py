@@ -12,6 +12,9 @@ register_npu_ci(
     suite="nightly-perf-4-npu-a3",
     nightly=True,
 )
+# TEMP: temporary registration for card-count validation.
+# TEMP: --tp-size 2 -> 2 cards in total.
+register_npu_ci(est_time=3600, suite="tmp-nightly-perf-2-npu-a3", nightly=True)
 
 QWEN3_6_27B_64K_PREFIX_ENVS = {
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",

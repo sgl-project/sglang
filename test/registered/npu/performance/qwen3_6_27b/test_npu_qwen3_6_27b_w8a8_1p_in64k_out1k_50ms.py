@@ -10,6 +10,9 @@ from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(est_time=3600, suite="base-c-test-perf-2-npu-a3")
 register_npu_ci(est_time=3600, suite="nightly-perf-4-npu-a3", nightly=True)
+# TEMP: temporary registration for card-count validation.
+# TEMP: --tp-size 2 -> 2 cards in total.
+register_npu_ci(est_time=3600, suite="tmp-nightly-perf-2-npu-a3", nightly=True)
 
 QWEN3_6_27B_64K_1K_ENVS = {
     "STREAMS_PER_DEVICE": "32",
