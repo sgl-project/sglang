@@ -6,6 +6,7 @@ import torch
 
 from sglang.srt.configs.mamba_utils import (
     KimiLinearCacheParams,
+    KimiLinearStateShape,
     Mamba2StateDType,
     kimi_linear_state_dtype,
     mamba2_state_dtype,
@@ -32,6 +33,20 @@ class TestKDAStateDtype(unittest.TestCase):
                     kimi_linear_state_dtype(),
                     Mamba2StateDType(conv=torch.bfloat16, temporal=dtype),
                 )
+
+    def test_replay_budget_follows_ssm_dtype(self):
+        shape = KimiLinearStateShape.create(tp_world_size=1, num_heads=2, head_dim=128)
+        for ssm in (torch.float32, torch.bfloat16):
+            budgets = []
+            for conv in (torch.float32, torch.bfloat16):
+                params = KimiLinearCacheParams(
+                    shape=shape,
+                    layers=[0],
+                    dtype=Mamba2StateDType(conv=conv, temporal=ssm),
+                )
+                budgets.append(params.replayssm_ring_bytes_per_req(16))
+            expected = 4 * 2 * 16 * 128 * ssm.itemsize + (2 * 16 * 128 + 2 * 16) * 4
+            self.assertEqual(budgets, [expected, expected])
 
     def test_explicit_dtype_is_preserved(self):
         dtype = Mamba2StateDType(conv=torch.bfloat16, temporal=torch.float32)

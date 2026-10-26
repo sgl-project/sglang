@@ -1670,7 +1670,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         """Whether the per-layer ReplaySSM rings fit the fused ring-write.
 
         Layouts follow memory_pool.py's KDA spec rings: rawv [slots, HV, L, V]
-        and rawk [slots, H, L, K] in the convolution state dtype, g [slots, HV, L, K]
+        and rawk [slots, H, L, K] in the SSM state dtype, g [slots, HV, L, K]
         fp32 (per-K KDA gate), beta [slots, HV, L] fp32. The kernel uses
         stride(0) as the slot pitch and assumes packed inner dims; anything
         else falls back to the unfused path, which handles it.

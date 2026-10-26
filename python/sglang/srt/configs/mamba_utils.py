@@ -135,13 +135,14 @@ class BaseLinearStateParams(ABC):
         conv_b = self.dtype.conv.itemsize
         fp32_b = 4
         if self.is_kda:
+            ssm_b = self.dtype.temporal.itemsize
             per_layer = (
-                hv * record_len * v_dim * conv_b  # rawv
-                + h_k * record_len * k_dim * conv_b  # rawk
+                hv * record_len * v_dim * ssm_b  # rawv
+                + h_k * record_len * k_dim * ssm_b  # rawk
                 + hv * record_len * fp32_b  # beta
                 + hv * record_len * k_dim * fp32_b  # vector g
-                + hv * record_len * v_dim * conv_b  # d
-                + h_k * record_len * k_dim * conv_b  # k
+                + hv * record_len * v_dim * ssm_b  # d
+                + h_k * record_len * k_dim * ssm_b  # k
             )
         else:
             per_layer = (
@@ -369,8 +370,8 @@ class KimiLinearStateShape:
 
 def kimi_linear_state_dtype() -> Mamba2StateDType:
     dtype = mamba2_state_dtype()
-    # KDA convolution history and replay records follow the SSM precision by
-    # default. Preserve the independent convolution dtype override.
+    # KDA convolution history follows the SSM precision by default.
+    # Its independent override does not change the replay record dtype.
     if not envs.SGLANG_MAMBA_CONV_DTYPE.is_set():
         return Mamba2StateDType(conv=dtype.temporal, temporal=dtype.temporal)
     return dtype

@@ -1098,14 +1098,11 @@ def fused_kda_decode_mtp_dspark(
         if (
             replayssm_rawv.dtype not in (torch.float32, torch.bfloat16)
             or replayssm_rawk.dtype not in (torch.float32, torch.bfloat16)
-            or replayssm_rawv.dtype != cs_v.dtype
-            or replayssm_rawk.dtype != cs_k.dtype
+            or replayssm_rawk.dtype != replayssm_rawv.dtype
             or replayssm_g.dtype != torch.float32
             or replayssm_beta.dtype != torch.float32
         ):
-            raise ValueError(
-                "expected rawv/rawk to match fp32/bf16 conv states, g/beta=fp32"
-            )
+            raise ValueError("expected matching fp32/bf16 rawv/rawk rings, g/beta=fp32")
         if intermediate_ssm is None:
             # Dead-branch placeholder: CACHE_RING skips every ht snapshot
             # write, but CuTe still type-checks the rank-5 indexing.

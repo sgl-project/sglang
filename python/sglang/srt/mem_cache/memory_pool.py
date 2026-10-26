@@ -769,9 +769,13 @@ class MambaPool:
                     if enable_linear_replayssm_spec and not cache_params.is_kda
                     else size + 1
                 )
-                # Decode records follow the SSM dtype. Spec-verify compact d/k
-                # records follow the activation dtype; g stays fp32.
-                ring_dtype = conv_dtype if enable_linear_replayssm_spec else ssm_dtype
+                # KDA replay records always follow the SSM dtype. GDN spec
+                # compact d/k records retain their activation dtype.
+                ring_dtype = (
+                    conv_dtype
+                    if enable_linear_replayssm_spec and not cache_params.is_kda
+                    else ssm_dtype
+                )
                 # Fold-every-commit: one verify window, no chunked (d, k)
                 # records. KDA is the exception on both counts: its window
                 # stays L-sized (the fused verify ring-write drops
@@ -832,12 +836,12 @@ class MambaPool:
                             )
                     replayssm_rawv = torch.zeros(
                         size=(num_mamba_layers, num_slots, hv, record_len, v_dim),
-                        dtype=conv_dtype,
+                        dtype=ssm_dtype,
                         device=device,
                     )
                     replayssm_rawk = torch.zeros(
                         size=(num_mamba_layers, num_slots, h_k, record_len, k_dim),
-                        dtype=conv_dtype,
+                        dtype=ssm_dtype,
                         device=device,
                     )
                     replayssm_beta = torch.zeros(
