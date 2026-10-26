@@ -110,18 +110,12 @@ class TestFlashAttentionDraftWidth(CustomTestCase):
             patch.object(flashattention_module, "get_spec", return_value=spec),
             patch.object(model_runner_module, "get_spec", return_value=spec),
             patch.object(spec_utils, "get_spec", return_value=spec),
-            patch.object(
-                flashattention_module, "get_parallel", return_value=parallel
-            ),
+            patch.object(flashattention_module, "get_parallel", return_value=parallel),
             patch.object(flashattention_module, "get_exec", return_value=execution),
             patch.object(flashattention_module, "get_model", return_value=model),
-            patch.object(
-                flashattention_module, "get_schedule", return_value=schedule
-            ),
+            patch.object(flashattention_module, "get_schedule", return_value=schedule),
             patch.object(flashattention_module, "get_memory", return_value=memory),
-            patch.object(
-                flashattention_module, "get_kv_shard_pool", return_value=None
-            ),
+            patch.object(flashattention_module, "get_kv_shard_pool", return_value=None),
             patch.object(
                 flashattention_module, "get_device_capability", return_value=(8, 0)
             ),

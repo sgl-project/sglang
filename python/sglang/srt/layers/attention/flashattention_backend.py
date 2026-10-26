@@ -226,10 +226,8 @@ class FlashAttentionBackend(AttentionBackend):
             self.speculative_num_draft_tokens is not None
             and model_runner.is_draft_worker
         ):
-            self.speculative_num_draft_tokens = (
-                model_runner.decode_num_tokens_per_req(
-                    num_draft_tokens=int(self.speculative_num_draft_tokens)
-                )
+            self.speculative_num_draft_tokens = model_runner.decode_num_tokens_per_req(
+                num_draft_tokens=int(self.speculative_num_draft_tokens)
             )
         self.speculative_step_id = speculative_step_id
 
