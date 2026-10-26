@@ -13,13 +13,9 @@ from sglang.kernels.ops.diffusion import (
     FUSED_LINEAR_GELU,
     NVFP4_BIAS_GELU,
     BitExactFusionGate,
-    can_use_fused_rmsnorm_interleaved_rope,
     can_use_linear_gelu,
     fused_linear_gelu_tanh,
-    fused_rmsnorm_interleaved_rope_,
-    fused_rmsnorm_interleaved_rope_into_blocks,
     fused_temb_table_slices,
-    rmsnorm_interleaved_rope_block_cols,
     tensors_equal,
 )
 from sglang.multimodal_gen.configs.models.dits import WanVideoConfig
@@ -86,6 +82,14 @@ from sglang.srt.utils import add_prefix
 
 logger = init_logger(__name__)
 _is_cuda = current_platform.is_cuda()
+
+if _is_cuda:
+    from sglang.kernels.ops.diffusion import (
+        can_use_fused_rmsnorm_interleaved_rope,
+        fused_rmsnorm_interleaved_rope_,
+        fused_rmsnorm_interleaved_rope_into_blocks,
+        rmsnorm_interleaved_rope_block_cols,
+    )
 
 if USE_AITER:
     from aiter.ops.rope import rope_cached_2c_fwd_inplace
@@ -735,7 +739,8 @@ class WanTransformerBlock(nn.Module):
         rope_cos_sin_cache: torch.Tensor | None,
     ) -> bool:
         return (
-            rope_cos_sin_cache is not None
+            _is_cuda
+            and rope_cos_sin_cache is not None
             and self.fuse_qk_norm_rope
             and not torch.compiler.is_compiling()
             and all(
