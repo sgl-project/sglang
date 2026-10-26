@@ -129,7 +129,7 @@ class TestMusaFlashAttentionSchedulerMetadata(CustomTestCase):
                 _decode(draft, _layer(layer_id=layer_id, num_heads=4, head_dim=16))
             _decode(target, _layer(layer_id=0, num_heads=8, head_dim=16))
 
-        self.assertEqual(kernel_metadata[-1], (8, 100))
+        self.assertEqual(kernel_metadata, [(4, 7), (4, 7), (8, 100)])
 
 
 if __name__ == "__main__":
