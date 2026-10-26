@@ -59,6 +59,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
 )
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     NDRotaryEmbedding,
+    RotaryEmbedding,
     _apply_rotary_emb,
     apply_flashinfer_rope_qk_inplace,
     get_rotary_pos_embed,
@@ -295,6 +296,12 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
                 AttentionBackendEnum.TORCH_SDPA,
             ),
         )
+        self.rotary_emb = RotaryEmbedding(
+            head_size=self.head_dim,
+            rotary_dim=self.head_dim,
+            use_precomputed_cache=False,
+            is_neox_style=False,
+        )
 
     def forward(
         self,
@@ -310,6 +317,13 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
     ):
         cos, sin = freqs_cis[:2]
         cos_sin_cache = freqs_cis[2] if len(freqs_cis) > 2 else None
+        roped_query, roped_key = self.rotary_emb(
+            query=q,
+            key=k,
+            cos=cos,
+            sin=sin,
+            cos_sin_cache=cos_sin_cache,
+        )
         if _is_cuda and q.dim() == 4 and q.shape == k.shape:
             if cos_sin_cache is None:
                 cos_sin_cache = torch.cat(
