@@ -11,7 +11,7 @@ import sys
 import types
 import unittest
 from contextlib import contextmanager
-from unittest.mock import patch
+from unittest.mock import mock_open, patch
 
 import torch
 
@@ -147,6 +147,214 @@ class TestEligible(CustomTestCase):
     def test_ragged_m_must_fill_its_padding(self):
         self.assertTrue(self._eligible(7000, 8192))  # 0.854
         self.assertFalse(self._eligible(6000, 8192))  # 0.732
+
+
+class TestKernelConfig(CustomTestCase):
+    """The running kernel's options decide, including a rebuilt 5.15 kernel."""
+
+    def test_move_notify_enabled_on_an_old_kernel(self):
+        config = mock_open(read_data="CONFIG_DMABUF_MOVE_NOTIFY=y\n")
+        with (
+            patch("platform.release", return_value="5.15.0-custom"),
+            patch("builtins.open", config),
+            patch("gzip.open") as compressed,
+        ):
+            self.assertIsNone(mg._kernel_config_error())
+        self.assertEqual(config.call_args.args[0], "/boot/config-5.15.0-custom")
+        compressed.assert_not_called()
+
+    def test_disabled_move_notify_reports_the_fix(self):
+        config = mock_open(read_data="# CONFIG_DMABUF_MOVE_NOTIFY is not set\n")
+        with patch("builtins.open", config):
+            error = mg._kernel_config_error()
+        self.assertIsInstance(error, RuntimeError)
+        self.assertIn("CONFIG_DMABUF_MOVE_NOTIFY", str(error))
+        self.assertIn("linux-generic-hwe-22.04", str(error))
+
+    def test_proc_config_is_used_when_boot_is_unreadable(self):
+        compressed = mock_open(read_data="CONFIG_DMABUF_MOVE_NOTIFY=y\n")
+        with (
+            patch("builtins.open", side_effect=FileNotFoundError),
+            patch("gzip.open", compressed),
+        ):
+            self.assertIsNone(mg._kernel_config_error())
+        self.assertEqual(compressed.call_args.args[0], "/proc/config.gz")
+
+    def test_disabled_proc_config_is_rejected(self):
+        with (
+            patch("builtins.open", side_effect=PermissionError),
+            patch("gzip.open", mock_open(read_data="CONFIG_OTHER=y\n")),
+        ):
+            self.assertIsInstance(mg._kernel_config_error(), RuntimeError)
+
+    def test_unreadable_config_leaves_the_placement_check_to_decide(self):
+        with (
+            patch("builtins.open", side_effect=FileNotFoundError),
+            patch("gzip.open", side_effect=FileNotFoundError),
+        ):
+            self.assertIsNone(mg._kernel_config_error())
+
+
+class TestVramCounter(CustomTestCase):
+    def test_current_logical_device_is_resolved_to_its_pci_address(self):
+        # Device 2 need not be PCI device 2, especially with HIP_VISIBLE_DEVICES.
+        props = types.SimpleNamespace(pci_domain_id=1, pci_bus_id=0xAF, pci_device_id=3)
+        counter = mock_open(read_data="123456\n")
+        with (
+            patch.object(torch.cuda, "current_device", return_value=2),
+            patch.object(
+                torch.cuda, "get_device_properties", return_value=props
+            ) as get,
+            patch("builtins.open", counter),
+        ):
+            self.assertEqual(mg._vram_used_bytes(), 123456)
+        get.assert_called_once_with(2)
+        self.assertEqual(
+            counter.call_args.args[0],
+            "/sys/bus/pci/devices/0001:af:03.0/mem_info_vram_used",
+        )
+
+    def test_missing_pci_properties_make_the_probe_unavailable(self):
+        with (
+            patch.object(torch.cuda, "current_device", return_value=0),
+            patch.object(
+                torch.cuda,
+                "get_device_properties",
+                return_value=types.SimpleNamespace(),
+            ),
+        ):
+            self.assertIsNone(mg._vram_used_bytes())
+
+    def test_unreadable_or_invalid_counter_is_unknown(self):
+        props = types.SimpleNamespace(pci_domain_id=0, pci_bus_id=1, pci_device_id=0)
+        for contents in ("not a counter\n", "-1\n", None):
+            counter = mock_open(read_data=contents or "")
+            if contents is None:
+                counter.side_effect = FileNotFoundError
+            with (
+                self.subTest(contents=contents),
+                patch.object(torch.cuda, "current_device", return_value=0),
+                patch.object(torch.cuda, "get_device_properties", return_value=props),
+                patch("builtins.open", counter),
+            ):
+                self.assertIsNone(mg._vram_used_bytes())
+
+
+class TestSettledVramCounter(CustomTestCase):
+    @contextmanager
+    def _clock(self):
+        """Advance probe time without delaying the test."""
+        elapsed = [0.0]
+
+        def sleep(seconds):
+            elapsed[0] = round(elapsed[0] + seconds, 8)
+
+        with (
+            patch("time.monotonic", side_effect=lambda: elapsed[0]),
+            patch("time.sleep", side_effect=sleep),
+        ):
+            yield elapsed
+
+    def test_deferred_frees_finish_before_the_baseline_is_accepted(self):
+        # amdgpu can account for old allocations in batches, after torch's
+        # allocator already reports them released. Two equal reads, or even
+        # 250 ms of stability, would accept one of these stale baselines.
+        def vram_used():
+            if elapsed[0] < 0.25:
+                return 20 << 30
+            if elapsed[0] < 0.50:
+                return 12 << 30
+            return 4 << 30
+
+        with (
+            self._clock() as elapsed,
+            patch.object(mg, "_vram_used_bytes", side_effect=vram_used),
+        ):
+            self.assertEqual(mg._settled_vram_used_bytes(), 4 << 30)
+        self.assertGreaterEqual(elapsed[0], 1.25)
+
+    def test_two_equal_readings_do_not_hide_a_later_large_free(self):
+        values = iter([20 << 30, 20 << 30, 2 << 30])
+        with (
+            self._clock() as elapsed,
+            patch.object(
+                mg, "_vram_used_bytes", side_effect=lambda: next(values, 2 << 30)
+            ),
+        ):
+            self.assertEqual(mg._settled_vram_used_bytes(), 2 << 30)
+        self.assertGreaterEqual(elapsed[0], 0.85)
+
+    def test_a_continuously_changing_counter_times_out_as_unknown(self):
+        with (
+            self._clock() as elapsed,
+            patch.object(
+                mg, "_vram_used_bytes", side_effect=lambda: int(elapsed[0] * 1_000_000)
+            ),
+        ):
+            self.assertIsNone(mg._settled_vram_used_bytes())
+        self.assertGreaterEqual(elapsed[0], 3.0)
+        self.assertLessEqual(elapsed[0], 3.05)
+
+    def test_unreadable_counter_is_unknown_even_after_a_valid_reading(self):
+        for values in ([None], [2 << 30, None]):
+            with (
+                self.subTest(values=values),
+                self._clock() as elapsed,
+                patch.object(mg, "_vram_used_bytes", side_effect=values),
+            ):
+                self.assertIsNone(mg._settled_vram_used_bytes())
+            self.assertLessEqual(elapsed[0], 0.05)
+
+
+class TestWindowPlacement(CustomTestCase):
+    WINDOW = 64 << 20
+
+    def _state(self, before):
+        state = mg._FusedWoB.__new__(mg._FusedWoB)
+        state.rank = 0
+        state._vram_before = before
+        state.op = types.SimpleNamespace(window_bytes=self.WINDOW)
+        return state
+
+    def test_half_a_window_or_more_in_vram_is_accepted(self):
+        before = 4 << 30
+        for growth in (self.WINDOW // 2, self.WINDOW):
+            with (
+                self.subTest(growth=growth),
+                patch.object(torch.cuda, "synchronize"),
+                patch.object(
+                    mg, "_settled_vram_used_bytes", return_value=before + growth
+                ),
+            ):
+                self._state(before).check_placement()
+
+    def test_insufficient_vram_growth_reports_without_closing_the_op(self):
+        before = 4 << 30
+        for growth in (self.WINDOW // 2 - 1, 0, -self.WINDOW):
+            state = self._state(before)
+            with (
+                self.subTest(growth=growth),
+                patch.object(torch.cuda, "synchronize"),
+                patch.object(
+                    mg, "_settled_vram_used_bytes", return_value=before + growth
+                ),
+                self.assertRaises(RuntimeError) as raised,
+            ):
+                state.check_placement()
+            self.assertIn("VRAM", str(raised.exception))
+            self.assertIn("64", str(raised.exception))
+            # Cleanup belongs to the collective caller, after every rank agrees.
+            self.assertIsNotNone(state.op)
+
+    def test_unknown_counter_warns_and_keeps_the_opt_in_path(self):
+        for before, after in ((None, 100), (100, None), (None, None)):
+            with (
+                self.subTest(before=before, after=after),
+                patch.object(torch.cuda, "synchronize"),
+                patch.object(mg, "_settled_vram_used_bytes", return_value=after),
+                self.assertLogs(mg.logger, level="WARNING"),
+            ):
+                self._state(before).check_placement()
 
 
 class _WoB(torch.nn.Module):

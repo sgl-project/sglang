@@ -74,14 +74,19 @@ class _StubWoB:
     fail_rank = -1
     fail_stage = ""
     closed = []
+    stages = []
 
     def __init__(self, m_max, n, k):
         self.m_max, self.n, self.k = m_max, n, k
         self._maybe_fail("construct")
 
     def _maybe_fail(self, stage):
+        type(self).stages.append(stage)
         if dist.get_rank() == self.fail_rank and self.fail_stage == stage:
             raise RuntimeError(f"stub failure during {stage}")
+
+    def check_placement(self):
+        self._maybe_fail("placement")
 
     def warmup(self):
         self._maybe_fail("warmup")
@@ -99,8 +104,13 @@ def _agreement_worker(rank, world, fail_rank, fail_stage):
     _setup(rank, world)
     import sglang.srt.layers.mori_gemm_ar as mg
 
-    _StubWoB.fail_rank, _StubWoB.fail_stage, _StubWoB.closed = fail_rank, fail_stage, []
-    with patch.object(mg, "_FusedWoB", _StubWoB):
+    _StubWoB.fail_rank, _StubWoB.fail_stage = fail_rank, fail_stage
+    _StubWoB.closed, _StubWoB.stages = [], []
+    layer = _prepared_layer(mg)
+    with (
+        patch.object(mg, "_kernel_config_error", return_value=None),
+        patch.object(mg, "_FusedWoB", _StubWoB),
+    ):
         built = mg._construct_collectively(16384, N, K)
 
     _assert_agreed(mg, rank, built, expect=fail_rank < 0)
@@ -111,6 +121,106 @@ def _agreement_worker(rank, world, fail_rank, fail_stage):
         assert _StubWoB.closed == ([rank] if held else []), (
             f"rank {rank} failing at {fail_stage}: closed={_StubWoB.closed}"
         )
+        if fail_stage == "placement":
+            assert _StubWoB.stages == ["construct", "placement"]
+        _assert_released(mg, layer)
+    dist.destroy_process_group()
+
+
+def _prepared_layer(mg):
+    """A copy that a collective disable must release, including its constraint."""
+    layer = torch.nn.Module()
+    layer._mori_b = (torch.ones(16, device="cuda"),)
+    layer._derived_weight_cache_error = mg._UPDATE_UNSUPPORTED
+    mg._prepared.append(layer)
+    return layer
+
+
+def _assert_released(mg, layer):
+    from sglang.srt.model_executor.model_runner_components.weight_updater import (
+        _unsupported_derived_weight_cache_error,
+    )
+
+    assert layer._mori_b is None
+    assert mg._prepared == []
+    assert _unsupported_derived_weight_cache_error(layer) is None
+    assert not mg.fused_wo_b_available()
+
+
+def _host_check_worker(rank, world, fail_stage="kernel_config"):
+    """Preflight failure stops all ranks before the constructor's broadcast."""
+    from unittest.mock import patch
+
+    _setup(rank, world)
+    import sglang.srt.layers.mori_gemm_ar as mg
+
+    layer = _prepared_layer(mg)
+    error = (
+        RuntimeError("missing CONFIG_DMABUF_MOVE_NOTIFY")
+        if rank == 1 and fail_stage == "kernel_config"
+        else None
+    )
+    original_empty_cache = torch.cuda.empty_cache
+
+    def empty_cache():
+        if rank == 1 and fail_stage == "empty_cache":
+            raise RuntimeError("injected cache flush failure")
+        original_empty_cache()
+
+    with (
+        patch.object(mg, "_kernel_config_error", return_value=error),
+        patch.object(torch.cuda, "empty_cache", side_effect=empty_cache),
+        patch.object(mg, "_FusedWoB") as construct,
+    ):
+        built = mg._construct_collectively(16384, N, K)
+    _assert_agreed(mg, rank, built, expect=False)
+    construct.assert_not_called()
+    _assert_released(mg, layer)
+    dist.destroy_process_group()
+
+
+def _placement_worker(rank, world):
+    """Keep the real communicator; only one rank's VRAM readings are injected."""
+    from unittest.mock import patch
+
+    _setup(rank, world)
+    import sglang.srt.layers.mori_gemm_ar as mg
+
+    layer = _prepared_layer(mg)
+    before = 4 << 30
+    # The healthy rank reports ample VRAM growth; rank 1 reports none. A real
+    # constructor, placement check and close run on both ranks, before any
+    # fused kernel is allowed to launch.
+    after = before if rank == 1 else before + (4 << 30)
+    closed = []
+    original_close = mg._FusedWoB.close
+
+    def close(state):
+        original_close(state)
+        closed.append(state)
+
+    with (
+        patch.object(mg, "_kernel_config_error", return_value=None),
+        patch.object(mg, "_settled_vram_used_bytes", side_effect=[before, after]),
+        patch.object(mg._FusedWoB, "close", close),
+        patch.object(mg._FusedWoB, "warmup") as warmup,
+        patch.object(mg._FusedWoB, "self_test") as self_test,
+    ):
+        built = mg._construct_collectively(M, N, K)
+
+    _assert_agreed(mg, rank, built, expect=False)
+    warmup.assert_not_called()
+    self_test.assert_not_called()
+    assert len(closed) == 1, f"rank {rank}: communicator closed {len(closed)} times"
+    assert closed[0].op is None
+    assert not closed[0].comm.is_valid
+    _assert_released(mg, layer)
+
+    # A disabled flag alone does not establish that the fallback can run: its
+    # CUDA stream and the ordinary TP collective must still be usable.
+    value = torch.tensor([rank + 1], dtype=torch.float32, device="cuda")
+    dist.all_reduce(value)
+    assert value.item() == world * (world + 1) / 2
     dist.destroy_process_group()
 
 
@@ -132,7 +242,10 @@ def _unique_id_worker(rank, world):
         raise RuntimeError("stub failure producing the unique id")
 
     ctx = patch.object(mori.cco.Communicator, "get_unique_id", boom)
-    with ctx if rank == 0 else _nullcontext():
+    with (
+        patch.object(mg, "_kernel_config_error", return_value=None),
+        ctx if rank == 0 else _nullcontext(),
+    ):
         built = mg._construct_collectively(16384, N, K)
 
     _assert_agreed(mg, rank, built, expect=False)
@@ -157,10 +270,10 @@ def _numerics_worker(rank, world, fp8_gather):
 
     # Read once, in _FusedWoB.__init__, so the override has to wrap the build.
     with envs.SGLANG_OPT_FUSED_WO_B_AR_FP8_GATHER.override(fp8_gather):
-        state = mg._FusedWoB(m_max=M, n=N, k=K)
+        built = mg._construct_collectively(M, N, K)
+        _assert_agreed(mg, rank, built, expect=True)
+        state = mg._state
         try:
-            state.warmup()
-            state.self_test()
             q, x_scale = mg.quantize_packed(x)
             out = state.run(q, x_scale, preshuffle_b(w), b_scale).clone()
         finally:
@@ -215,12 +328,13 @@ class TestFusedWoBCollective(CustomTestCase):
         except ImportError:
             raise unittest.SkipTest("this build has no mori.ops.gemm_ar")
 
-    def _spawn(self, fn, *args):
+    def _spawn(self, fn, *args, world=None):
         """Run `fn` on every rank, failing rather than hanging if one strands."""
+        world = self.world if world is None else world
         ctx = mp.start_processes(
             fn,
-            args=(self.world, *args),
-            nprocs=self.world,
+            args=(world, *args),
+            nprocs=world,
             join=False,
             start_method="spawn",
         )
@@ -241,12 +355,21 @@ class TestFusedWoBCollective(CustomTestCase):
         work to do at each: before the op exists there is nothing to release,
         after it there is a window reservation that nothing will read.
         """
-        for stage in ("construct", "warmup", "self_test"):
+        for stage in ("construct", "placement", "warmup", "self_test"):
             with self.subTest(stage=stage):
                 self._spawn(_agreement_worker, 1, stage)
 
     def test_unique_id_failure_does_not_strand_the_peers(self):
         self._spawn(_unique_id_worker)
+
+    def test_host_check_failure_prevents_construction_on_every_rank(self):
+        self._spawn(_host_check_worker, world=2)
+
+    def test_cache_flush_failure_prevents_construction_on_every_rank(self):
+        self._spawn(_host_check_worker, "empty_cache", world=2)
+
+    def test_placement_failure_releases_real_windows_and_allows_fallback(self):
+        self._spawn(_placement_worker, world=2)
 
     def test_fused_result_matches_the_split_path(self):
         """What signature conformance cannot show: that the bytes move.

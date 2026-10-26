@@ -18,6 +18,12 @@ see ``_FusedWoB.self_test``.
 Needs ``MORI_ENABLE_SDMA=1`` at process start and a layer one of the two gfx950
 mxfp8 routes prepared -- see ``mxfp8_route``.
 
+Peer-shared VMM memory must stay in VRAM. Some kernels lack
+``CONFIG_DMABUF_MOVE_NOTIFY`` and amdgpu moves the window to host memory on
+peer import: results stay correct but the fused path becomes much slower.
+Check the kernel configuration before construction and the GPU's VRAM usage
+after every rank has mapped the window, before compiling or running it.
+
 The fused epilogue pushes a whole ``BLOCK_M`` row band to one destination, so M
 must be a multiple of ``tp_size * 256``. That granule is mxfp8's, not a choice
 -- see ``_BLOCK_M``. Ragged M is zero-padded up to it, which costs GEMM rows and
@@ -423,6 +429,97 @@ def _fused_weight(layer):
     return mori_weight(layer)
 
 
+_VMM_KERNEL_FIX = (
+    "Use a kernel built with CONFIG_DMABUF_MOVE_NOTIFY=y, e.g. "
+    "linux-generic-hwe-22.04 (6.8) on Ubuntu 22.04; see Issue 1 in "
+    "https://github.com/ROCm/mori/blob/main/.claude/skills/known-issues/SKILL.md."
+)
+
+
+def _kernel_config_error() -> RuntimeError | None:
+    """Reject a running kernel whose config rules out a VRAM-backed window.
+
+    Containers often expose neither source. None then means unknown, and the
+    placement check still runs. The build option, rather than the release
+    number, controls amdgpu's dma-buf pinning behavior.
+    """
+    import gzip
+    import platform
+
+    sources = (
+        (f"/boot/config-{platform.release()}", open),
+        ("/proc/config.gz", gzip.open),
+    )
+    for path, opener in sources:
+        try:
+            with opener(path, "rt") as config:
+                enabled = any(
+                    line.strip() == "CONFIG_DMABUF_MOVE_NOTIFY=y" for line in config
+                )
+        except (OSError, EOFError, UnicodeError):
+            continue
+        if enabled:
+            return None
+        return RuntimeError(
+            "the running kernel was built without CONFIG_DMABUF_MOVE_NOTIFY "
+            f"(read {path}), so amdgpu pins mori's peer-shared VMM window in "
+            "host memory. Results stay correct but every access crosses PCIe "
+            f"and the fused path can be several times slower. {_VMM_KERNEL_FIX}"
+        )
+    return None
+
+
+def _vram_used_bytes() -> int | None:
+    """Read this rank's physical GPU counter, including memory outside torch.
+
+    Logical device IDs may be remapped by HIP_VISIBLE_DEVICES. Resolve the
+    PCI address through HIP's device properties instead of assuming cardN or
+    rank N names the same GPU. Missing properties/counters mean unknown.
+    """
+    try:
+        props = torch.cuda.get_device_properties(torch.cuda.current_device())
+        bdf = (
+            f"{props.pci_domain_id:04x}:"
+            f"{props.pci_bus_id:02x}:{props.pci_device_id:02x}.0"
+        )
+        with open(f"/sys/bus/pci/devices/{bdf}/mem_info_vram_used") as counter:
+            used = int(counter.read())
+        return used if used >= 0 else None
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+        return None
+
+
+def _settled_vram_used_bytes() -> int | None:
+    """Wait for deferred frees to stop changing the driver's VRAM counter.
+
+    Synchronizing torch does not make amdgpu's accounting settle immediately.
+    During model loading, several GiB of old allocations can disappear while
+    the much smaller window is being built, hiding its growth. ROCm can retire
+    these allocations in batches hundreds of milliseconds apart. Require
+    0.75 seconds of stable readings; a counter still changing after three
+    seconds is unknown, rather than evidence of a misplaced window.
+    """
+    import time
+
+    last = _vram_used_bytes()
+    if last is None:
+        return None
+    stable_since = time.monotonic()
+    deadline = stable_since + 3.0
+    while time.monotonic() < deadline:
+        time.sleep(0.05)
+        current = _vram_used_bytes()
+        if current is None:
+            return None
+        now = time.monotonic()
+        if current != last:
+            last = current
+            stable_since = now
+        elif now - stable_since >= 0.75:
+            return current
+    return None
+
+
 class _FusedWoB:
     """The TP communicator and mori's op, one per rank.
 
@@ -468,6 +565,7 @@ class _FusedWoB:
             block_m=_BLOCK_M,
             gather_dtype=gather_dtype,
         )
+        self._vram_before = _settled_vram_used_bytes()
         self._comm_ctx = Communicator.init(
             self.world_size,
             self.rank,
@@ -497,13 +595,57 @@ class _FusedWoB:
             self._comm_ctx.__exit__(None, None, None)
             raise
         logger.info(
-            "mori fused wo_b: window %.0f MiB, tp=%d, M<=%d, N=%d, K=%d, gather=%s",
+            "mori fused wo_b: allocated window %.0f MiB, tp=%d, "
+            "M<=%d, N=%d, K=%d, gather=%s",
             self.op.window_bytes / 2**20,
             self.world_size,
             m_max,
             n,
             k,
             gather_dtype,
+        )
+
+    def check_placement(self) -> None:
+        """Check VRAM growth after *every* rank has mapped the window.
+
+        The pinned mori backs and peer-maps the window in its constructor.
+        Its peers' imports can evict this rank's allocation, so the caller
+        must finish the construction agreement before taking this reading.
+        No device collective has launched yet; a failure can safely release
+        the window through the subsequent placement agreement.
+
+        Half the window tolerates ordinary counter noise. This is a heuristic:
+        other processes allocating or releasing VRAM can affect the delta.
+        """
+        torch.cuda.synchronize()
+        after = _settled_vram_used_bytes()
+        before = self._vram_before
+        if before is None or after is None:
+            logger.warning(
+                "mori fused wo_b: could not obtain stable VRAM counters; "
+                "window placement is unverified (before=%s, after=%s). "
+                "Continuing with the opt-in fused path.",
+                before,
+                after,
+            )
+            return
+        window_bytes = self.op.window_bytes
+        grew = after - before
+        if grew < window_bytes // 2:
+            raise RuntimeError(
+                f"VRAM grew {grew / 2**20:.0f} MiB for a "
+                f"{window_bytes / 2**20:.0f} MiB window "
+                f"(before={before}, after={after} bytes); mori's peer-shared "
+                "VMM window may be in host memory, making the fused path "
+                "slower. Concurrent GPU allocations or frees can also affect "
+                f"this measurement. {_VMM_KERNEL_FIX}"
+            )
+        logger.info(
+            "mori fused wo_b: VRAM placement check passed "
+            "(before=%d, after=%d, window=%d bytes)",
+            before,
+            after,
+            window_bytes,
         )
 
     def warmup(self) -> None:
@@ -629,6 +771,24 @@ def _construct_collectively(m_max: int, n: int, k: int) -> bool:
 
     tp = get_parallel().tp_group
 
+    # This must precede the constructor's UID broadcast on every rank. A
+    # rank-local return from an availability gate would strand its peers.
+    try:
+        err = _kernel_config_error()
+        if err is None:
+            # Weight preparation leaves temporary allocations in torch's pool.
+            # Release them before measuring the window, and let the settled
+            # counter reader wait for the driver's deferred frees afterwards.
+            # These operations can fail locally, so they belong before this
+            # agreement, not inside the collective constructor.
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+    except Exception as exc:  # noqa: BLE001 - agree before any rank constructs
+        err = exc
+    if not _agreed(tp, err is None):
+        _disable(tp, None, err, "preflight-checked")
+        return False
+
     state = None
     err = None
     try:
@@ -637,6 +797,17 @@ def _construct_collectively(m_max: int, n: int, k: int) -> bool:
         err = exc
     if not _agreed(tp, err is None):
         _disable(tp, state, err, "constructed")
+        return False
+
+    # Every peer has now finished importing this rank's window. Checking in
+    # __init__ would rely on mori's internal synchronization to avoid an early
+    # reading, before a peer import can evict the allocation from VRAM.
+    try:
+        state.check_placement()
+    except Exception as exc:  # noqa: BLE001 - safe to release before device phases
+        err = exc
+    if not _agreed(tp, err is None):
+        _disable(tp, state, err, "placement-checked")
         return False
 
     # Compiling is local. Agreeing here means a FlyDSL failure on one rank is
@@ -664,6 +835,7 @@ def _construct_collectively(m_max: int, n: int, k: int) -> bool:
         return False
 
     _state = state
+    logger.info("mori fused wo_b: enabled on all %d TP ranks", tp.world_size)
     return True
 
 
