@@ -50,10 +50,16 @@ def _scheduler(*, mbs, running_mbs, last_mbs, chunked_req=None) -> Scheduler:
 
     def exchange(next_first_rank_mb_id, next_mb_id):
         sched.exchanges.append((next_first_rank_mb_id, next_mb_id))
-        return (f"outputs-{next_mb_id}", f"result-{next_mb_id}", SimpleNamespace(synchronize=lambda: None))
+        return (
+            f"outputs-{next_mb_id}",
+            f"result-{next_mb_id}",
+            SimpleNamespace(synchronize=lambda: None),
+        )
 
     sched._pp_commit_send_output_work_and_preprocess_output_tensors = exchange
-    sched._pp_process_batch_result = lambda batch, result: sched.processed.append((batch, result))
+    sched._pp_process_batch_result = lambda batch, result: sched.processed.append(
+        (batch, result)
+    )
     sched._add_request_to_queue = sched.waiting_queue.append
     return sched
 
@@ -62,9 +68,15 @@ class TestWeightBridgePPQuiesce(CustomTestCase):
     def setUp(self):
         self.retracted = []
         patches = [
-            patch.object(scheduler_pp_mixin, "get_parallel", lambda: SimpleNamespace(pp_size=PP_SIZE)),
             patch.object(
-                scheduler_pp_mixin, "retract_all", lambda *, reqs, **_: self.retracted.extend(reqs)
+                scheduler_pp_mixin,
+                "get_parallel",
+                lambda: SimpleNamespace(pp_size=PP_SIZE),
+            ),
+            patch.object(
+                scheduler_pp_mixin,
+                "retract_all",
+                lambda *, reqs, **_: self.retracted.extend(reqs),
             ),
         ]
         for p in patches:
@@ -88,7 +100,12 @@ class TestWeightBridgePPQuiesce(CustomTestCase):
         self.assertEqual(sched.pp_outputs, "outputs-1")
 
     def test_requeues_unfinished_requests_and_resets_micro_batch_state(self):
-        running, done, prefilled, chunked = _req("run"), _req("done", True), _req("pre"), _req("chunk")
+        running, done, prefilled, chunked = (
+            _req("run"),
+            _req("done", True),
+            _req("pre"),
+            _req("chunk"),
+        )
         sched = _scheduler(
             mbs=[None, None, None],
             running_mbs=[_batch(running, done), _batch(), _batch(running)],
@@ -99,7 +116,9 @@ class TestWeightBridgePPQuiesce(CustomTestCase):
         sched.pp_retract_all_for_weight_update(mb_id=0)
 
         self.assertEqual({r.rid for r in sched.waiting_queue}, {"run", "pre", "chunk"})
-        self.assertEqual(len(sched.waiting_queue), 3)  # a request in two slots is requeued once
+        self.assertEqual(
+            len(sched.waiting_queue), 3
+        )  # a request in two slots is requeued once
         self.assertEqual(self.retracted, sched.waiting_queue)
         self.assertIsNone(sched.chunked_req)
         self.assertEqual(sched.mbs, [None] * LOOP_SIZE)
