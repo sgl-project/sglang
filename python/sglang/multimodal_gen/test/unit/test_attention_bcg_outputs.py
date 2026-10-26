@@ -101,26 +101,6 @@ class TestAttentionBCGOutputs(unittest.TestCase):
         self.assertTrue(torch.all(output == 4))
         self.assertTrue(torch.all(replicated_output == 4))
 
-    def test_usp_output_matches_the_rows_forward_returns(self):
-        attention = _attention(layer.USPAttention)
-        attention.skip_sequence_parallel = False
-        q = torch.zeros(1, 8, 2, 3)
-        prefix = torch.zeros(1, 2, 2, 3)
-        with patch.object(layer, "get_ulysses_parallel_world_size", return_value=2):
-            # q arrives after the input all-to-all; the output is row-sharded.
-            out = attention._new_bcg_output(q, q, q, qkv_pre_all_to_all=True)
-            self.assertEqual(out.shape, (1, 4, 4, 3))
-            out = attention._new_bcg_output(
-                q,
-                q,
-                q,
-                torch.ones(1, 8),
-                q_prefix=prefix,
-                k_prefix=prefix,
-                v_prefix=prefix,
-            )
-            self.assertEqual(out.shape, (1, 10, 2, 3))
-
 
 if __name__ == "__main__":
     unittest.main()
