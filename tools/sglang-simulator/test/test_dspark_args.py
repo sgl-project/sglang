@@ -51,6 +51,7 @@ def native(monkeypatch):
     )
     monkeypatch.setitem(sys.modules, module.__name__, module)
     for name in (
+        "SGLANG_SIMULATOR_CONFIG_PATH",
         "SGLANG_SIMULATOR_COORDINATOR",
         "SGLANG_RAGGED_VERIFY_MODE",
         "SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION",
@@ -100,12 +101,15 @@ class Block(importlib.abc.MetaPathFinder):
         if fullname.split('.')[0] in {'torch', 'sglang', 'sgl_kernel', 'aiter'}:
             raise AssertionError('unexpected dependency: ' + fullname)
 sys.meta_path.insert(0, Block())
+from sglang_simulator.compat import native_joint_reference_requested
 from sglang_simulator.simulation.sglang.dspark_args import install_cpu_dspark_args
+assert native_joint_reference_requested() is False
 assert install_cpu_dspark_args() is False
 """
     env = {**os.environ, "PYTHONPATH": str(src)}
     env.pop("SGLANG_SIMULATOR_BOOTSTRAP", None)
     env.pop("SGLANG_USE_CPU_ENGINE", None)
+    env.pop("SGLANG_SIMULATOR_CONFIG_PATH", None)
     result = subprocess.run(
         [sys.executable, "-c", code],
         env=env,
@@ -380,3 +384,188 @@ def test_explicit_one_step_and_disabled_phase_configuration_is_accepted(native):
     )
     native._handle_dspark(args)
     assert len(native.declarations) == 1
+
+
+@pytest.fixture
+def joint_config(native, monkeypatch, tmp_path):
+    # Selection intent only. Constructor tests own complete source attestation.
+    predictor = {
+        "name": "infercast_dspark",
+        "native_joint_source_binding": {"root": "not-an-attestation"},
+        "cost_mode": "HYBRID",
+        "progress_kind": "source_golden351",
+        "native_analytic_model": {"EXTEND": {}, "DECODE": {}},
+    }
+    path = tmp_path / "joint.json"
+    path.write_text(json.dumps({"predictor": predictor}), encoding="utf-8")
+    monkeypatch.setenv("SGLANG_SIMULATOR_CONFIG_PATH", str(path))
+    return path, predictor
+
+
+def joint_arguments(**changes):
+    return arguments(
+        **{
+            "tp_size": 2,
+            "attn_dp_size": 2,
+            "enable_dp_lm_head": True,
+            "enable_dp_attention_local_control_broadcast": True,
+            "moe_a2a_backend": "none",
+            "disable_overlap_schedule": False,
+            "max_running_requests": 64,
+            **changes,
+        }
+    )
+
+
+@pytest.mark.parametrize("coordinated", [False, True])
+@pytest.mark.parametrize("as_dict", [False, True])
+@pytest.mark.parametrize("legacy_flag", [False, True])
+def test_explicit_joint_entry_preserves_native_two_worker_topology_and_pool_input(
+    native, joint_config, monkeypatch, coordinated, as_dict, legacy_flag
+):
+    from sglang_simulator.compat import (
+        apply_simulator_server_args,
+        native_joint_reference_requested,
+        native_reference_requested,
+        validate_simulator_server_args,
+    )
+
+    path, _ = joint_config
+    monkeypatch.delenv("SGLANG_SIMULATOR_CONFIG_PATH")
+    if coordinated:
+        monkeypatch.setenv("SGLANG_SIMULATOR_COORDINATOR", "tcp://127.0.0.1:9000")
+        monkeypatch.setenv("SGLANG_SIMULATOR_OUTPUT_MODE", "OFFLINE")
+    args = joint_arguments(sim_config_path=str(path), enable_dp_attention=legacy_flag)
+    target = vars(args).copy() if as_dict else args
+    apply_simulator_server_args(target)
+    args = SimpleNamespace(**target) if as_dict else target
+    assert native_joint_reference_requested() and native_reference_requested()
+    validate_simulator_server_args(args)
+    install_cpu_dspark_args()
+    # The native resolution view owns legacy flag normalization. It does not
+    # turn native DP1 into two model replicas or divide max-running a second time.
+    args._overlay = {"enable_dp_attention": False}
+    native._handle_dspark(args)
+    resolved = native.resolving_view(args)
+    assert (resolved.tp_size, resolved.dp_size, resolved.attn_dp_size) == (2, 1, 2)
+    assert resolved.tp_size * resolved.dp_size * resolved.pp_size == 2
+    assert resolved.tp_size // resolved.attn_dp_size // resolved.attn_cp_size == 1
+    assert resolved.max_running_requests == args.max_running_requests == 64
+    assert resolved.disable_overlap_schedule is False
+    assert resolved.disable_cuda_graph is True
+    assert resolved.speculative_num_draft_tokens == 6
+    assert args.speculative_num_draft_tokens is None
+    assert len(native.declarations) == 1 and not native.calls
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"name": "other"},
+        {"native_joint_source_binding": None},
+        {"native_joint_source_binding": "untyped"},
+        {"cost_mode": "SILICON"},
+        {"progress_kind": "empirical"},
+        {"native_analytic_model": None},
+    ],
+)
+def test_joint_entry_requires_the_explicit_predictor_domain(joint_config, changes):
+    from sglang_simulator.compat import (
+        SIMULATOR_SERVER_ARG_OVERRIDES,
+        apply_simulator_server_args,
+        native_joint_reference_requested,
+        native_reference_requested,
+    )
+
+    path, predictor = joint_config
+    path.write_text(
+        json.dumps({"predictor": {**predictor, **changes}}), encoding="utf-8"
+    )
+    args = {}
+    apply_simulator_server_args(args)
+    assert not native_joint_reference_requested() and not native_reference_requested()
+    assert args == SIMULATOR_SERVER_ARG_OVERRIDES
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"tp_size": 1},
+        {"tp_size": True},
+        {"dp_size": 2},
+        {"attn_dp_size": 1},
+        {"attn_dp_size": 2.0},
+        *[
+            {name: 2}
+            for name in ("ep_size", "pp_size", "attn_cp_size", "dcp_size", "nnodes")
+        ],
+        {"enable_dp_lm_head": False},
+        {"enable_dp_lm_head": 1},
+        {"enable_dp_attention_local_control_broadcast": False},
+        {"enable_dp_attention_local_control_broadcast": 1},
+        {"moe_a2a_backend": "mori"},
+        {"speculative_moe_a2a_backend": "mori"},
+        {"enable_two_batch_overlap": True},
+        {"disable_overlap_schedule": True},
+        {"disable_cuda_graph": False},
+    ],
+)
+def test_joint_arguments_reject_unrepresented_physical_execution(
+    native, joint_config, changes
+):
+    install_cpu_dspark_args()
+    args = joint_arguments(**changes)
+    before = vars(args).copy()
+    with pytest.raises(ValueError, match="CPU DSPark simulator"):
+        native._handle_dspark(args)
+    assert vars(args) == before
+    assert not native.declarations and not native.calls
+
+
+@pytest.mark.parametrize(
+    "name,value",
+    [
+        ("SGLANG_RAGGED_VERIFY_MODE", "compact"),
+        ("SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION", "1"),
+        ("SGLANG_SIMULATE_ACC_LEN", "3.51"),
+    ],
+)
+def test_joint_selection_does_not_relax_native_sampling_or_phase_serialization(
+    native, joint_config, monkeypatch, name, value
+):
+    monkeypatch.setenv(name, value)
+    install_cpu_dspark_args()
+    with pytest.raises(ValueError, match="CPU DSPark simulator"):
+        native._handle_dspark(joint_arguments())
+    assert not native.declarations and not native.calls
+
+
+@pytest.mark.parametrize(
+    "changes,env,error",
+    [
+        ({"enable_lora": True}, {}, "enable_lora"),
+        ({"enable_hierarchical_cache": True}, {}, "enable_hierarchical_cache"),
+        ({"disaggregation_mode": "decode"}, {}, "disaggregation"),
+        ({"speculative_algorithm": "EAGLE"}, {}, "source-bound native DSPark"),
+        ({}, {"SGLANG_SIMULATOR_OUTPUT_MODE": "BLOCKING"}, "requires OFFLINE"),
+        ({}, {"SGLANG_REQ_RUNNING_TIMEOUT": "1"}, "virtual deadline"),
+    ],
+)
+def test_joint_coordinator_preserves_existing_restrictions(
+    joint_config, monkeypatch, changes, env, error
+):
+    from sglang_simulator.compat import (
+        apply_simulator_server_args,
+        validate_simulator_server_args,
+    )
+
+    monkeypatch.setenv("SGLANG_SIMULATOR_COORDINATOR", "tcp://127.0.0.1:9000")
+    monkeypatch.setenv("SGLANG_SIMULATOR_OUTPUT_MODE", "OFFLINE")
+    for name in ("SGLANG_REQ_WAITING_TIMEOUT", "SGLANG_REQ_RUNNING_TIMEOUT"):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    args = joint_arguments(**changes)
+    apply_simulator_server_args(args)
+    with pytest.raises(ValueError, match=error):
+        validate_simulator_server_args(args)

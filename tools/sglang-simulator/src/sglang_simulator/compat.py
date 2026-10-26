@@ -29,7 +29,7 @@ class SGLangCompatibilityError(RuntimeError):
     pass
 
 
-def native_reference_requested(target=None) -> bool:
+def _native_predictor_config(target=None):
     """Read the explicit predictor selection before native argument resolution.
 
     A CLI config path is established here because ServerArgs resolution invokes
@@ -46,17 +46,46 @@ def native_reference_requested(target=None) -> bool:
             path = os.path.abspath(candidate)
             os.environ["SGLANG_SIMULATOR_CONFIG_PATH"] = path
     if not path:
-        return False
+        return {}
     with open(path, encoding="utf-8") as stream:
-        predictor = json.load(stream).get("predictor", {})
+        return json.load(stream).get("predictor", {})
+
+
+def _joint_reference_requested(predictor) -> bool:
+    # This selects an entry path, not a source attestation. The existing
+    # predictor constructor validates every original asset before any forward.
+    return (
+        predictor.get("name") == "infercast_dspark"
+        and type(predictor.get("native_joint_source_binding")) is dict
+        and predictor.get("cost_mode") == "HYBRID"
+        and predictor.get("progress_kind") == "source_golden351"
+        and predictor.get("native_analytic_model") is not None
+    )
+
+
+def native_joint_reference_requested(target=None) -> bool:
+    """Select only the explicit two-singleton joint source entry domain."""
+    return _joint_reference_requested(_native_predictor_config(target))
+
+
+def native_reference_requested(target=None) -> bool:
+    predictor = _native_predictor_config(target)
     return (
         predictor.get("name") == "infercast_dspark"
         and predictor.get("native_segment_profile_id") is not None
-    )
+    ) or _joint_reference_requested(predictor)
 
 
 def _simulator_overrides(target=None):
     overrides = SIMULATOR_SERVER_ARG_OVERRIDES
+    if native_joint_reference_requested(target):
+        return {
+            **overrides,
+            "tp_size": 2,
+            "attn_dp_size": 2,
+            "nnodes": 1,
+            "disable_overlap_schedule": False,
+        }
     if native_reference_requested(target):
         overrides = {**overrides, "disable_overlap_schedule": False}
     return overrides
@@ -92,10 +121,13 @@ def _validate_coordinator_server_args(args, endpoint: str) -> None:
     for name in (
         "enable_hierarchical_cache",
         "enable_lora",
-        "enable_dp_attention",
     ):
         if getattr(args, name, None):
             raise ValueError(f"coordinator does not support {name}")
+    if getattr(
+        args, "enable_dp_attention", None
+    ) and not native_joint_reference_requested(args):
+        raise ValueError("coordinator does not support enable_dp_attention")
     algorithm = getattr(args, "speculative_algorithm", None)
     if algorithm and not (algorithm == "DSPARK" and native_reference_requested(args)):
         raise ValueError("coordinator requires source-bound native DSPark speculation")

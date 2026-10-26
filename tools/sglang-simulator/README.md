@@ -132,9 +132,9 @@ declared source facts and analytic parameters, with no measurements or timing
 qualification.
 
 Callers must supply source-resolved joint inputs; this cost adapter does not
-project native before-state or authorize a runtime. Public ADP2 factory, native
-peer execution/publication and coordinated clock guards remain closed. This
-library contract does not establish C64 serving, native timing or accuracy.
+project native before-state or authorize a runtime. The explicit joint source
+entry below supplies the separate runtime custody and compatibility boundary.
+This library contract does not establish C64 serving, native timing or accuracy.
 
 `time_predictor.dspark_progress.EmpiricalDSparkProgress` reads a hash-pinned
 artifact and sibling observation/native/causal-evidence files. It verifies raw
@@ -187,9 +187,9 @@ The typed SDK source policy and ordinary cost reader still gate ordered batch
 work, complete sampling, actual captures and independently qualified direct
 whole-batch costs. B1 measurements cannot supply missing batched work.
 The logical domain does not replace the actual pool, sampler or padded capture
-inventory. B65+ and ADP2 remain unsupported. Root client concurrency does not
-bound native B, and diagnostic request caps or memory fractions do not establish
-equivalence to the reference serving recipe.
+inventory. B65+ and ADP2 remain unsupported by this ADP1 path. Root client
+concurrency does not bound native B, and diagnostic request caps or memory
+fractions do not establish equivalence to the reference serving recipe.
 Complete newly qualified golden costs are still required for an actual run.
 
 The optional `native_source_work_policy="native_region_golden351_decode_work_v1"`
@@ -224,9 +224,8 @@ It checks the native scheduler counter and model FID independently, retains each
 DP's own buffer state and exact ordered requests, and requires explicit native
 idle participation. The returned `DSparkStep` is unresolved: the adapter calls
 no cost/progress provider, publishes no result, changes no request history and
-advances no virtual clock. Native factory/compatibility/coordinator ADP2 guards
-remain closed. This entry point does not supply a joint HYBRID cost model or
-complete native peer publication, scheduling or whole-workload support.
+advances no virtual clock. This entry point does not supply a joint HYBRID cost
+model or complete native peer publication, scheduling or whole-workload support.
 
 The explicit library route `DSparkNativeRuntime.select_native_dp_peer_batch`
 freezes each real scheduler's local reference selection after that exchange.
@@ -248,8 +247,8 @@ the source progress policy and the existing whole-forward UMD adapter. It requir
 the canonical model digest and an observed reference CPU-mirror boolean; missing
 mirror evidence stays unknown and fails before opening a cost ledger. The caller
 must independently retain the runtime/capture/allocated-source custody: the
-acceptance policy does not attest that physical context. This entry does not open
-the public JSON factory or its topology guards.
+acceptance policy does not attest that physical context. The explicit source
+entry below retains the separate original-asset attestor and topology checks.
 
 With this explicit resolver attached, the existing reference driver's `selected`
 entry joins the actual native TP group after native MLP synchronization and idle
@@ -272,11 +271,10 @@ explicit `synchronize_native_dp_peer_lifecycle` collective applies the same
 drained retirement/reset to both Sessions. Reset preserves the native worker's
 persistent draft buffer and forward sequence.
 
-This route advances no clock and leaves public factory/physical-rank/coordinator
-guards closed. The DPC child has a spawn-safe early bootstrap entry point; that
-alone does not implement a common clock or enable public ADP2. CPU transaction
-controls use the existing runtime/reference owners with a labeled transport
-double. Actual native communication and publication still require their own
+This route advances no clock. The DPC child has a spawn-safe early bootstrap
+entry point; that alone does not implement a common clock or authorize ADP2.
+CPU transaction controls use the existing runtime/reference owners with a
+labeled transport double. Actual native communication and publication still require their own
 bounded native controls.
 
 The existing `DSparkStepTiming` also recognizes one exclusive `whole_worker`
@@ -288,14 +286,15 @@ geometry, idle participation, per-DP buffers/planners/captures, source labeling
 and evidence. Cold buffers start independently; a warm peer supplies no state.
 The source policy validates neither the caller's cost-runtime JSON nor latency.
 This seam adds no performance row, theoretical formula or qualification and does
-not enable the native factory, actual peer scheduler routing or mixed phases.
-An ADP2 C64 run remains unavailable until those integrations and costs exist.
+not itself enable the native factory, actual peer scheduler routing or mixed
+phases.
+A complete ADP2 C64 workflow remains a separate validation scope.
 
 Actual multi-DP scheduling/heterogeneous coordination, complete measured worker
 costs (including allocation), independently reviewed progress data and target
 source resolution remain required for a complete V4.1 AgentX run. The native runtime
-supports homogeneous TP2/TP4 ADP1; ADP2 fails until actual peer partitions and
-publication exist. CPU fixtures and native-type checks must not be reported as
+supports homogeneous TP2/TP4 ADP1 and the explicitly source-bound TP2/ADP2 route
+below. CPU fixtures and native-type checks must not be reported as
 actual Simulator accuracy or hardware performance data.
 
 Select the minimal JSON factory with `predictor.name="infercast_dspark"`. It
@@ -969,11 +968,13 @@ the primitive native result/allocation case remains independent of the SDK.
 
 CPU DSPark argument compatibility is installed only with both explicit bootstrap
 flags above. It preserves `device=cpu` and delegates non-CPU calls to the native
-handler. The path requires physical single-rank execution, physical graphs
-disabled, static draft Q5 / target Q6, an explicit draft path
+handler. The default path requires physical single-rank execution; the explicit
+joint source entry below instead retains two native CPU workers. Both require
+physical graphs disabled, static draft Q5 / target Q6, an explicit draft path
 and full draft revision commit, and positive explicit `max_running_requests`.
 Target TP topology remains part of the cost/runtime profile. Unsupported ragged,
-adaptive, coordinated and constrained paths fail before simulator declarations.
+adaptive, DP-prefill-coordinated and constrained paths fail before simulator
+declarations.
 This removes native accelerator-only argument rejection; complete cost/progress
 assets and predictor launch wiring remain necessary for a full run.
 The native-region predictor selection enables the original overlap scheduler;
@@ -1054,8 +1055,8 @@ released only after both schedulers acknowledge actual receipt. One complete
 joint whole-worker result advances time once, and both native callbacks and
 accounting consumption precede global terminal delivery. Profile boundaries
 require both drained owners, combine request statistics using the existing
-formulas and write once. This internal integration does not open the public
-factory, physical-rank or coordinator compatibility guards. CPU transport-double
+formulas and write once. The explicit joint source entry below supplies the
+separate compatibility and asset validation boundary. CPU transport-double
 controls alone do not establish native scheduler execution or C64 support.
 
 All operations return a new ledger. Keep the original until cost lookup,
@@ -1264,9 +1265,22 @@ committed throughput.
 
 The existing `infercast_dspark` provider accepts `native_joint_source_binding`
 only with `cost_mode: HYBRID`, `progress_kind: source_golden351` and a modeled
-TP2/attention-DP2/PP1 topology. This is internal construction support; the native
-public factory and common-clock activation guards remain closed pending entry
-controls. It does not establish C64 workflow support or timing qualification.
+TP2/attention-DP2/PP1 topology. This explicit selection enables the existing
+two-worker CPU entry and paired clock; it does not establish C64 workflow
+completion, native timing qualification or accuracy.
+
+Early compatibility reads only that selection intent. It retains physical CPU
+TP2/native-DP1/attention-DP2 (singleton attention), PP1/CP1/EP1 on one node,
+original overlap scheduling and disabled physical CUDA graphs. CPU DSPark
+resolution additionally requires DP LM head, native attention-DP local control
+broadcast, built-in TP MoE (`none`), static draft Q5/target Q6, no two-batch overlap
+and no DP speculative prefill coordination. The native prefill/idle versus decode serialization, routing and
+request-pool division remain unchanged: do not divide `max_running_requests`
+again. The modeled source-law sampler does not enable native simulated
+acceptance. Coordinator use retains OFFLINE output, loopback TCP, virtual
+deadlines, disabled LoRA/HiCache/disaggregation and the original drained profile
+boundaries. Other predictor selections retain the original single-worker
+overrides and ADP1 validation.
 
 The binding has exactly `root`, `source_runtime`, `startup`, `proposal`, `windows`,
 `captures`, `allocated`, `profiles`, `container` and `supplemental_files`. Under

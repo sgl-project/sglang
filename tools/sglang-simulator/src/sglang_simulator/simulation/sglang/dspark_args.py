@@ -67,18 +67,51 @@ def _validate(native, server_args, cfg):
         and cfg.max_running_requests == max_running,
         "requires positive explicit max_running_requests",
     )
-    for name in (
-        "tp_size",
-        "ep_size",
-        "dp_size",
-        "pp_size",
-        "attn_cp_size",
-        "dcp_size",
-        "nnodes",
-    ):
+    from sglang_simulator.compat import (
+        native_joint_reference_requested,
+        native_reference_requested,
+    )
+
+    joint = native_joint_reference_requested()
+    sizes = dict.fromkeys(
+        (
+            "tp_size",
+            "ep_size",
+            "dp_size",
+            "pp_size",
+            "attn_cp_size",
+            "dcp_size",
+            "nnodes",
+        ),
+        1,
+    )
+    if joint:
+        sizes.update(tp_size=2, attn_dp_size=2)
+    for name, expected in sizes.items():
         value = getattr(cfg, name, None)
-        _require(type(value) is int and value == 1, f"requires physical {name}=1")
-    from sglang_simulator.compat import native_reference_requested
+        _require(
+            type(value) is int and value == expected,
+            f"requires physical {name}={expected}",
+        )
+    if joint:
+        # TP2 / attention-DP2 / CP1 yields singleton attention; native DP1
+        # still owns exactly two workers. Do not divide the request limit here.
+        _require(getattr(cfg, "enable_dp_lm_head", None) is True, "requires DP LM head")
+        _require(
+            getattr(cfg, "enable_dp_attention_local_control_broadcast", None) is True,
+            "requires native attention-DP local control broadcast",
+        )
+        _require(
+            getattr(cfg, "moe_a2a_backend", None) == "none", "requires built-in TP MoE"
+        )
+        _require(
+            getattr(cfg, "speculative_moe_a2a_backend", None) in (None, "none"),
+            "requires the same draft TP MoE backend",
+        )
+        _require(
+            getattr(cfg, "enable_two_batch_overlap", False) is False,
+            "does not support two-batch overlap",
+        )
 
     native_reference = native_reference_requested()
     _require(
@@ -105,8 +138,6 @@ def _validate(native, server_args, cfg):
         "does not support disaggregation",
     )
     for name in (
-        "enable_dp_attention",
-        "enable_dp_lm_head",
         "enable_torch_compile",
         "enable_multi_layer_eagle",
         "speculative_adaptive",
@@ -122,6 +153,9 @@ def _validate(native, server_args, cfg):
         "constrained_json_disable_any_whitespace",
     ):
         _require(not getattr(cfg, name, None), f"does not support {name}")
+    if not joint:
+        for name in ("enable_dp_attention", "enable_dp_lm_head"):
+            _require(not getattr(cfg, name, None), f"does not support {name}")
     for name in (
         "speculative_draft_window_size",
         "speculative_draft_sink_size",
@@ -171,7 +205,8 @@ def install_cpu_dspark_args():
 
     Only the simulator's explicit static Q5/Q6 CPU path bypasses the native
     accelerator-only handler. Target topology/cost identity stays in the
-    predictor configuration; physical scheduler execution remains single-rank.
+    predictor configuration. Physical execution is single-rank by default;
+    explicit joint source intent permits only the two-singleton TP2 domain.
     """
     if not _enabled():
         return False
