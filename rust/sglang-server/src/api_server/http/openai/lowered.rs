@@ -11,7 +11,10 @@ use axum::response::{IntoResponse, Response};
 use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::{Map, Value};
-use sglang_processor::openai::{ChatModel, OpenAiHeaders, OpenAiSettings, Reply, lower_chat};
+use sglang_api_types::api::v1::{GenerateResponse, GenerateStreamError};
+use sglang_processor::openai::{
+    ChatModel, ChatResponder, OpenAiHeaders, OpenAiSettings, Reply, lower_chat,
+};
 use sglang_processor::{DynamoTokenizer, TemplateArgs, TemplateError};
 
 use super::chat::ChatBody;
@@ -193,18 +196,23 @@ pub(super) async fn chat(
                 return Some(error_response(status, &message.unwrap_or_default()));
             }
         };
-        let body = match is_batch {
-            true => serde_json::to_vec(&items),
-            false => serde_json::to_vec(&items[0]),
-        }
-        .expect("api.v1 types serialize to JSON");
-        return Some(match responder.unary(&body) {
-            Some(reply) => reply_response(reply),
-            None => error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "unreadable /generate response",
-            ),
-        });
+        // Every item is a frame: a failed one answered above.
+        let output = items
+            .iter()
+            .map(|item| {
+                let value = serde_json::to_value(item).expect("api.v1 types serialize to JSON");
+                serde_json::from_value::<GenerateResponse>(value)
+            })
+            .collect::<Result<Vec<_>, _>>();
+        return Some(
+            match output.ok().and_then(|output| responder.unary(output)) {
+                Some(reply) => reply_response(reply),
+                None => error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "unreadable /generate response",
+                ),
+            },
+        );
     }
 
     let incremental = state.server_args.incremental_streaming_output;
@@ -216,7 +224,7 @@ pub(super) async fn chat(
         let Some(data) = frames.next().await else {
             break;
         };
-        match responder.stream_data(data.as_bytes()) {
+        match stream_data(&mut responder, &data) {
             Ok(events) => first = events,
             Err(reply) => return Some(reply_response(reply)),
         }
@@ -229,7 +237,7 @@ pub(super) async fn chat(
             let Some(data) = frames.next().await else {
                 break;
             };
-            for event in responder.stream_data(data.as_bytes()).unwrap_or_default() {
+            for event in stream_data(&mut responder, &data).unwrap_or_default() {
                 yield Ok(event);
             }
         }
@@ -241,6 +249,28 @@ pub(super) async fn chat(
         )
             .into_response(),
     )
+}
+
+/// A `/generate` item as the processor reads it: a frame, or its error body.
+fn generate_result(
+    value: Value,
+) -> serde_json::Result<Result<GenerateResponse, GenerateStreamError>> {
+    if value.get("error").is_some() {
+        serde_json::from_value(value).map(Err)
+    } else {
+        serde_json::from_value(value).map(Ok)
+    }
+}
+
+/// One `/generate` stream event, through to the `[DONE]` that ends it.
+fn stream_data(responder: &mut ChatResponder, data: &str) -> Result<Vec<String>, Reply> {
+    if data == "[DONE]" {
+        return Ok(responder.stream_end());
+    }
+    match serde_json::from_str(data).and_then(generate_result) {
+        Ok(output) => responder.stream_data(output),
+        Err(_) => Ok(Vec::new()),
+    }
 }
 
 /// A prompt's fields whose list form is repeated with it across `n` choices.
