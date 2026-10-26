@@ -368,6 +368,8 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     use_mla_backend=kvc.use_mla_backend,
                     num_layers=num_layers,
                     element_size=kv_size,
+                    start_layer=kvc.layer_info.start_layer,
+                    is_draft_worker=kvc.is_draft_worker,
                 )
                 if offload_cell_size is not None:
                     return offload_cell_size
