@@ -31,9 +31,12 @@ from sglang.kernels.ops.attention.utils import (
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import (
+    STATIC_SPEC_COMBINATIONS,
     AttentionBackend,
+    SpecMode,
     resolve_window_id_space,
     resolve_window_kv_pool,
+    spec_combinations,
 )
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     KVCacheAttentionAccessKind,
@@ -50,10 +53,12 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
+from sglang.srt.speculative.eagle_utils import draft_step_writes
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
     draft_kv_indices_used_len,
+    fill_draft_window_rail,
     generate_draft_decode_kv_indices,
     resolve_draft_decode_window,
 )
@@ -178,6 +183,8 @@ FULL_CG_PREFILL_WORKSPACE_MARGIN = 1.25
 # Use as a fast path to override the indptr in flashinfer's plan function
 # This is used to remove some host-to-device copy overhead.
 global_override_indptr_cpu = None
+# The same for a multi-step draft step's window read rail.
+global_override_window_indptr_cpu = None
 
 
 def fast_prefill_plan(
@@ -322,6 +329,26 @@ def fast_prefill_plan(
 class FlashInferAttnBackend(AttentionBackend):
     """Flashinfer attention kernels."""
 
+    # On translated storage: a multi-step draft step reads its window layers
+    # through its own window rail. A draft extend with window layers is
+    # declared eager only: a graph replay plans from the draft-extend input
+    # with window_left -1, so its kernel has no per-query window mask. Target
+    # verify is declared without window layers only: an EAGLE verify's gather
+    # starts at column 0 (`EagleVerifyInput.generate_attn_arg_prefill` takes no
+    # window start).
+    implemented_spec_combinations = (
+        STATIC_SPEC_COMBINATIONS
+        | spec_combinations(SpecMode.DRAFT_DECODE, translated=(True,))
+        | spec_combinations(SpecMode.DRAFT_EXTEND, window=(False,), translated=(True,))
+        | spec_combinations(
+            SpecMode.DRAFT_EXTEND,
+            window=(True,),
+            cuda_graph=(False,),
+            translated=(True,),
+        )
+        | spec_combinations(SpecMode.TARGET_VERIFY, window=(False,), translated=(True,))
+    )
+
     # kv_indptr/qo_indptr are preallocated at (req pool + 1); an extend batch
     # can never carry more seqs than the pool.
     extend_dummy_seqs_capped_by_req_pool: bool = True
@@ -333,6 +360,7 @@ class FlashInferAttnBackend(AttentionBackend):
         kv_indptr_buf: Optional[torch.Tensor] = None,
         kv_last_page_len_buf: Optional[torch.Tensor] = None,
         init_new_workspace: bool = False,
+        window_kv_indptr_buf: Optional[torch.Tensor] = None,
     ):
         super().__init__()
         self.prefill_backend = "fa2"
@@ -483,6 +511,12 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
                 for _ in range(self.num_wrappers)
             ]
+        elif window_kv_indptr_buf is not None:
+            # A multi-step draft step of a window model: the window wrapper
+            # plans the step's window rail, the full wrapper the draft's
+            # shared indices.
+            assert self.dispatch_reason == WrapperDispatch.SLIDING_WINDOW
+            self.kv_indptr = [window_kv_indptr_buf, kv_indptr_buf]
         else:
             assert self.num_wrappers == 1
             self.kv_indptr = [kv_indptr_buf]
@@ -492,7 +526,8 @@ class FlashInferAttnBackend(AttentionBackend):
                 (max_bs,), dtype=torch.int32, device=model_runner.device
             )
         else:
-            assert self.num_wrappers == 1
+            # One-token pages: every wrapper reads the same last-page lengths.
+            assert self.num_wrappers == 1 or window_kv_indptr_buf is not None
             self.kv_last_page_len = kv_last_page_len_buf
 
         if not self.skip_prefill:
@@ -1086,6 +1121,7 @@ class FlashInferAttnBackend(AttentionBackend):
         max_bs: int,
         max_num_tokens: int,
         kv_indices_buf: Optional[torch.Tensor] = None,
+        window_kv_indices_buf: Optional[torch.Tensor] = None,
     ):
         if kv_indices_buf is None:
             cuda_graph_kv_indices = torch.zeros(
@@ -1096,9 +1132,16 @@ class FlashInferAttnBackend(AttentionBackend):
         else:
             cuda_graph_kv_indices = kv_indices_buf
 
-        self.cuda_graph_kv_indices = [cuda_graph_kv_indices] + [
-            cuda_graph_kv_indices.clone() for _ in range(self.num_wrappers - 1)
-        ]
+        if window_kv_indices_buf is not None:
+            # A multi-step draft step: the window wrapper plans the step's
+            # window rail into its own buffer, the full wrapper the draft's
+            # shared indices.
+            assert self.dispatch_reason == WrapperDispatch.SLIDING_WINDOW
+            self.cuda_graph_kv_indices = [window_kv_indices_buf, cuda_graph_kv_indices]
+        else:
+            self.cuda_graph_kv_indices = [cuda_graph_kv_indices] + [
+                cuda_graph_kv_indices.clone() for _ in range(self.num_wrappers - 1)
+            ]
 
         # SWA write-target buffer; refilled and bound onto forward_metadata in
         # init_forward_metadata_out_graph before each replay.
@@ -1704,6 +1747,11 @@ class FlashInferIndicesUpdaterDecode:
                 disable_split_kv=disable_split_kv,
                 plan=plan,
                 req_pool_indices=req_pool_indices,
+                window_rail=(
+                    wrapper_id == 0
+                    and spec_info is not None
+                    and spec_info.window_kv_indices is not None
+                ),
             )
 
     def update_cross_attention(
@@ -1763,6 +1811,7 @@ class FlashInferIndicesUpdaterDecode:
         *,
         plan: KVLocPlan,
         req_pool_indices: torch.Tensor,
+        window_rail: bool = False,
     ):
         # Unified SWA wrapper-0: gather from the swa canonical directly -- its
         # entries are already swa-side physical ids, so the in-place
@@ -1770,7 +1819,13 @@ class FlashInferIndicesUpdaterDecode:
         translator = self.attn_backend.kv_index_translator
         use_swa_source = use_sliding_window_kv_pool and translator.reads_are_translated
         read_kind = IdSpaceKind.SLIDING_WINDOW if use_swa_source else IdSpaceKind.FULL
-        if spec_info is None or getattr(spec_info, "kv_indptr", None) is None:
+        if window_rail:
+            # A multi-step draft step's window layers read the step's
+            # window-clipped rail, already in the window storage's ids.
+            kv_indptr = spec_info.window_kv_indptr
+            kv_indices = spec_info.window_kv_indices
+            bs = kv_indptr.shape[0] - 1
+        elif spec_info is None or getattr(spec_info, "kv_indptr", None) is None:
             bs = len(paged_kernel_lens)
             kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
             kv_indptr = kv_indptr[: bs + 1]
@@ -1796,14 +1851,18 @@ class FlashInferIndicesUpdaterDecode:
             kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
             bs = kv_indptr.shape[0] - 1
 
-        if use_sliding_window_kv_pool and not use_swa_source:
+        if use_sliding_window_kv_pool and not use_swa_source and not window_rail:
             assert self._swa_kv_pool is not None
             kv_last_index = kv_indptr[-1]
             kv_indices[:kv_last_index] = self._swa_space.ids(kv_indices[:kv_last_index])
 
         global global_override_indptr_cpu
         locally_override = False
-        if seq_lens_cpu is not None and global_override_indptr_cpu is None:
+        if (
+            not window_rail
+            and seq_lens_cpu is not None
+            and global_override_indptr_cpu is None
+        ):
             locally_override = True
             global_override_indptr_cpu = torch.empty_like(kv_indptr, device="cpu")
             global_override_indptr_cpu[0] = 0
@@ -1833,7 +1892,11 @@ class FlashInferIndicesUpdaterDecode:
                 disable_split_kv=(
                     disable_split_kv if disable_split_kv is not None else False
                 ),
-                global_override_indptr_cpu=global_override_indptr_cpu,
+                global_override_indptr_cpu=(
+                    global_override_window_indptr_cpu
+                    if window_rail
+                    else global_override_indptr_cpu
+                ),
             )
         else:
             # When using original begin_forward, don't pass global_override_indptr_cpu
@@ -2250,7 +2313,13 @@ class FlashInferIndicesUpdaterPrefill:
             custom_mask = cross_attention_custom_mask
         else:
             assert isinstance(spec_info, SpecInput)
-            if spec_info.spec_input_type == SpecInputType.DFLASH_VERIFY:
+            # A window wrapper reads from the window's first token on
+            # (kv_start_idx). A draft extend replayed from a graph plans here,
+            # and needs it as the eager extend above does.
+            if spec_info.spec_input_type in (
+                SpecInputType.DFLASH_VERIFY,
+                SpecInputType.EAGLE_DRAFT_EXTEND,
+            ):
                 kv_indices, kv_indptr, qo_indptr, custom_mask = (
                     spec_info.generate_attn_arg_prefill(
                         req_pool_indices=req_pool_indices,
@@ -2417,6 +2486,21 @@ def _build_draft_indptr_host(
     )
 
 
+def _build_draft_window_indptr_host(
+    seq_lens_cpu: torch.Tensor, topk: int, num_steps: int, window: int
+) -> torch.Tensor:
+    """Mirror the draft window rail's prefix sums from resolved host lengths:
+    step i of a branch reads ``min(length + i + 1, window)`` tokens. Live
+    entries only, as `_build_draft_indptr_host`."""
+    assert seq_lens_cpu.device.type == "cpu" and seq_lens_cpu.ndim == 1
+    branch_lens = seq_lens_cpu.repeat_interleave(topk)
+    rows = []
+    for step in range(num_steps):
+        lens = torch.clamp(branch_lens + step + 1, max=window)
+        rows.append(torch.nn.functional.pad(torch.cumsum(lens, dim=0), (1, 0)))
+    return torch.stack(rows).to(torch.int32)
+
+
 class FlashInferMultiStepDraftBackend:
     """
     Wrap multiple flashinfer attention backends as one for multiple consecutive
@@ -2448,6 +2532,25 @@ class FlashInferMultiStepDraftBackend:
         self.kv_last_page_len = torch.ones(
             (max_bs,), dtype=torch.int32, device=model_runner.device
         )
+        # Window layers read a window-clipped rail of their own per step, in
+        # the ids of the storage they live in: the shared draft indices are
+        # FULL ids, and the draft's chain is not part of the committed prefix
+        # yet. They attend window + 1 tokens, as the decode window wrapper
+        # clamps them.
+        self.window_rail = model_runner.sliding_window_size is not None
+        self.window_tokens = (
+            model_runner.sliding_window_size + 1 if self.window_rail else 0
+        )
+        self.window_kv_indptr = (
+            torch.zeros(
+                (self.speculative_num_steps, max_bs + 1),
+                dtype=torch.int32,
+                device=model_runner.device,
+            )
+            if self.window_rail
+            else None
+        )
+        self.cuda_graph_window_kv_indices = None
         self.attn_backends: List[FlashInferAttnBackend] = []
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends.append(
@@ -2456,6 +2559,9 @@ class FlashInferMultiStepDraftBackend:
                     skip_prefill=True,
                     kv_indptr_buf=self.kv_indptr[i],
                     kv_last_page_len_buf=self.kv_last_page_len,
+                    window_kv_indptr_buf=(
+                        self.window_kv_indptr[i] if self.window_rail else None
+                    ),
                 )
             )
 
@@ -2469,11 +2575,21 @@ class FlashInferMultiStepDraftBackend:
         )
         self.kv_index_translator = model_runner.kv_index_translator
 
+    def _step_writes(self, forward_batch, step: int):
+        return draft_step_writes(
+            forward_batch,
+            step,
+            topk=self.topk,
+            num_steps=self.speculative_num_steps,
+            enabled=self.attn_backends[step].use_sliding_window_kv_pool,
+        )
+
     def common_template(
         self,
         forward_batch: ForwardBatch,
         kv_indices_buffer: torch.Tensor,
         call_fn: Callable,
+        window_kv_indices_buffer: Optional[torch.Tensor] = None,
     ):
         num_seqs = forward_batch.batch_size
         bs = self.topk * num_seqs
@@ -2559,6 +2675,18 @@ class FlashInferMultiStepDraftBackend:
             ),
         )
 
+        if self.window_rail:
+            fill_draft_window_rail(
+                self.kv_index_translator,
+                forward_batch,
+                window_kv_indices_buffer,
+                self.window_kv_indptr,
+                topk=self.topk,
+                num_steps=self.speculative_num_steps,
+                page_size=self.page_size,
+                window=self.window_tokens,
+            )
+
         assert forward_batch.spec_info is not None
         assert forward_batch.spec_info.is_draft_input()
 
@@ -2571,8 +2699,21 @@ class FlashInferMultiStepDraftBackend:
             if use_host_indptr
             else self.kv_indptr[:, : bs + 1].cpu()
         )
-        global global_override_indptr_cpu
+        window_indptr_cpu_whole = None
+        if self.window_rail:
+            window_indptr_cpu_whole = (
+                _build_draft_window_indptr_host(
+                    host_lengths,
+                    self.topk,
+                    self.speculative_num_steps,
+                    self.window_tokens,
+                )
+                if use_host_indptr
+                else self.window_kv_indptr[:, : bs + 1].cpu()
+            )
+        global global_override_indptr_cpu, global_override_window_indptr_cpu
         previous_override = global_override_indptr_cpu
+        previous_window_override = global_override_window_indptr_cpu
         try:
             for i in range(self.speculative_num_steps - 1):
                 forward_batch.spec_info.kv_indptr = self.kv_indptr[i, : bs + 1]
@@ -2580,9 +2721,18 @@ class FlashInferMultiStepDraftBackend:
                     : draft_kv_indices_used_len(seq_lens_sum, self.topk, bs, i + 1)
                 ]
                 global_override_indptr_cpu = indptr_cpu_whole[i]
+                if self.window_rail:
+                    forward_batch.spec_info.window_kv_indptr = self.window_kv_indptr[
+                        i, : bs + 1
+                    ]
+                    forward_batch.spec_info.window_kv_indices = (
+                        window_kv_indices_buffer[i][: bs * self.window_tokens]
+                    )
+                    global_override_window_indptr_cpu = window_indptr_cpu_whole[i]
                 call_fn(i, forward_batch)
         finally:
             global_override_indptr_cpu = previous_override
+            global_override_window_indptr_cpu = previous_window_override
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         kv_indices_width = draft_kv_indices_buffer_width(
@@ -2593,6 +2743,17 @@ class FlashInferMultiStepDraftBackend:
             dtype=torch.int32,
             device="cuda",
         )
+        window_kv_indices = None
+        if self.window_rail:
+            # zeros, not empty: a static pool translates the whole row.
+            window_kv_indices = torch.zeros(
+                (
+                    self.speculative_num_steps,
+                    forward_batch.batch_size * self.topk * self.window_tokens,
+                ),
+                dtype=torch.int32,
+                device="cuda",
+            )
 
         def call_fn(i, forward_batch):
             forward_batch.spec_info.kv_indptr = (
@@ -2601,9 +2762,22 @@ class FlashInferMultiStepDraftBackend:
             forward_batch.spec_info.kv_indices = (
                 forward_batch.spec_info.kv_indices.clone()
             )
-            self.attn_backends[i].init_forward_metadata(forward_batch)
+            if self.window_rail:
+                forward_batch.spec_info.window_kv_indptr = (
+                    forward_batch.spec_info.window_kv_indptr.clone()
+                )
+                forward_batch.spec_info.window_kv_indices = (
+                    forward_batch.spec_info.window_kv_indices.clone()
+                )
+            with self._step_writes(forward_batch, i):
+                self.attn_backends[i].init_forward_metadata(forward_batch)
 
-        self.common_template(forward_batch, kv_indices, call_fn)
+        self.common_template(
+            forward_batch,
+            kv_indices,
+            call_fn,
+            window_kv_indices_buffer=window_kv_indices,
+        )
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         # generate_draft_decode_kv_indices packs topk per-branch sequences per row,
@@ -2617,10 +2791,21 @@ class FlashInferMultiStepDraftBackend:
             dtype=torch.int32,
             device="cuda",
         )
+        if self.window_rail:
+            self.cuda_graph_window_kv_indices = torch.zeros(
+                (self.speculative_num_steps, max_bs * self.topk * self.window_tokens),
+                dtype=torch.int32,
+                device="cuda",
+            )
 
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends[i].init_cuda_graph_state(
-                max_bs, max_num_tokens, kv_indices_buf=self.cuda_graph_kv_indices[i]
+                max_bs,
+                max_num_tokens,
+                kv_indices_buf=self.cuda_graph_kv_indices[i],
+                window_kv_indices_buf=(
+                    self.cuda_graph_window_kv_indices[i] if self.window_rail else None
+                ),
             )
 
     def init_forward_metadata_out_graph(
@@ -2634,11 +2819,17 @@ class FlashInferMultiStepDraftBackend:
 
         def call_fn(i, fb):
             inner_fb = build_inner_fb_view(fb, bs=bs, forward_mode=ForwardMode.DECODE)
-            self.attn_backends[i].init_forward_metadata_out_graph(
-                inner_fb, in_capture=in_capture
-            )
+            with self._step_writes(inner_fb, i):
+                self.attn_backends[i].init_forward_metadata_out_graph(
+                    inner_fb, in_capture=in_capture
+                )
 
-        self.common_template(forward_batch, self.cuda_graph_kv_indices, call_fn)
+        self.common_template(
+            forward_batch,
+            self.cuda_graph_kv_indices,
+            call_fn,
+            window_kv_indices_buffer=self.cuda_graph_window_kv_indices,
+        )
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
         for attn_backend in self.attn_backends:

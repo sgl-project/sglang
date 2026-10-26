@@ -7,6 +7,7 @@ import torch
 from sglang.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
     SharedReadEnds,
+    SpecMode,
 )
 from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import BaseIndexerMetadata
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -62,6 +63,17 @@ class HybridAttnBackend(AttentionBackend):
         """The backend that runs target verify: the decode backend when
         speculative_attention_mode is "decode", else the prefill backend."""
         return self.decode_backend if self.spec_attn_is_decode else self.prefill_backend
+
+    def require_spec_mode(self, model_runner: ModelRunner, mode: SpecMode) -> None:
+        # The child that runs ``mode`` answers for it, as `_select_backend`
+        # routes it.
+        if mode is SpecMode.TARGET_VERIFY:
+            backend = self.target_verify_backend()
+        elif mode is SpecMode.DRAFT_DECODE:
+            backend = self.decode_backend
+        else:
+            backend = self.prefill_backend
+        backend.require_spec_mode(model_runner, mode)
 
     def _select_backend(self, forward_mode: ForwardMode) -> AttentionBackend:
         """

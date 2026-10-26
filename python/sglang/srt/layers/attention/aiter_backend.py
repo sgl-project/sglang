@@ -27,6 +27,7 @@ from sglang.kernels.ops.attention.kv_indices import (
 )
 from sglang.kernels.ops.attention.utils import assert_buffer_fits
 from sglang.srt.layers.attention.base_attn_backend import (
+    STATIC_SPEC_COMBINATIONS,
     AttentionBackend,
     resolve_window_id_space,
     resolve_window_kv_pool,
@@ -179,6 +180,36 @@ class MlaPrefillPsMetadata:
     is_causal: bool
     need_lse: bool
     num_partial_tiles: int
+
+
+def _kv_cache_is_vectorized_5d(pool) -> bool:
+    """Whether ``pool`` stores K/V in the SHUFFLE 5D layout. A pool with a
+    window sub-pool answers with its full view's layout, or its window view's
+    when it routes no full layers (a draft fused into the window sub-pool)."""
+    router = pool.layer_router
+    if router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is not None:
+        has_full = router.sub_pool(IdSpaceKind.FULL) is not None
+        pool = router.view(IdSpaceKind.FULL if has_full else IdSpaceKind.SLIDING_WINDOW)
+    return getattr(pool, "kv_cache_layout", "nhd") == "vectorized_5d"
+
+
+def _require_untranslated_storage(*pools) -> None:
+    """This backend reads a pool's K/V as dense ``(pages, page_size, H, D)``
+    caches, gathers their indices straight from the request table, and maps
+    window layers through a static full -> window slot table. A pool whose
+    views take physical write ids (the unified pool, or a draft fused into it)
+    needs translated indices and strided entry views, for full and window
+    layers alike, so the backend cannot read it."""
+    for pool in pools:
+        if pool is not None and pool.requires_physical_write_loc:
+            raise ValueError(
+                "The aiter attention backend reads KV caches as dense pages "
+                "indexed by the request table's ids, which a pool taking "
+                "physical write ids (--enable-unified-memory, or a draft fused "
+                "into its pool) does not provide. Choose another attention "
+                "backend for this runner (--attention-backend, or "
+                "--speculative-draft-attention-backend for a draft)."
+            )
 
 
 @dataclass
@@ -354,6 +385,10 @@ class AiterAttnBackend(AttentionBackend):
     # declare here to avoid CI failure in test_aiter_fp8_q_unified_attention.py
     use_mla_auto_kv_splits: bool = False
 
+    # Static storage only: it reads dense pages by the request table's ids
+    # (`_require_untranslated_storage`).
+    implemented_spec_combinations = STATIC_SPEC_COMBINATIONS
+
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -525,14 +560,10 @@ class AiterAttnBackend(AttentionBackend):
         # and (b) route the decode attention through pa_decode_gluon (see the
         # corresponding branch in forward_decode), since unified_attention's
         # 4D `.view(-1, page, H, D)` cannot be applied to a 5D pool.
-        def _pool_is_vec5d(pool):
-            # A pool with a window sub-pool reports its owner view's layout.
-            router = pool.layer_router
-            if router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is not None:
-                pool = router.view(IdSpaceKind.FULL)
-            return getattr(pool, "kv_cache_layout", "nhd") == "vectorized_5d"
-
-        self.kv_cache_is_vectorized_5d = _pool_is_vec5d(model_runner.token_to_kv_pool)
+        self.kv_cache_is_vectorized_5d = _kv_cache_is_vectorized_5d(
+            model_runner.token_to_kv_pool
+        )
+        _require_untranslated_storage(model_runner.token_to_kv_pool, self.swa_kv_pool)
 
         if self.use_sliding_window_kv_pool:
             self.use_triton_unified_attention = True

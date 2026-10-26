@@ -92,13 +92,12 @@ def _accepts(
 # The backends the layout gates admit for a unified target.
 _MLA_VERIFY = ("triton", "trtllm_mla", "cutedsl_mla", "flashmla", "flashinfer", "fa3")
 _MHA_VERIFY = ("triton", "flashinfer", "fa3", "fa4", "trtllm_mha")
-_EAGLE_DRAFT_RAILS = ("triton", "flashinfer", "fa3", "trtllm_mha")
 
 
 class TestUnifiedMemorySpecGate(CustomTestCase):
     def test_target_backend_is_not_gated(self):
         """No target backend translates ids itself, so none is refused for
-        the algorithm it verifies; an EAGLE draft keeps its own rails."""
+        the algorithm it verifies."""
         mla = dict(is_hybrid_swa=False, attention_arch=AttentionArch.MLA)
         for algorithm in ("DSPARK", "DFLASH", "EAGLE", "EAGLE3"):
             for backend in _MHA_VERIFY:
@@ -128,36 +127,30 @@ class TestUnifiedMemorySpecGate(CustomTestCase):
             )
             self.assertTrue(_accepts(algorithm, backend="flashinfer", **mla))
 
-    def test_eagle_draft_backend(self):
-        """An unset draft backend inherits the target's; an explicit one must
-        be on the EAGLE draft rails."""
-        self.assertTrue(_accepts("EAGLE", draft_backend=None))
-        for draft_backend in _EAGLE_DRAFT_RAILS:
-            self.assertTrue(_accepts("EAGLE", draft_backend=draft_backend))
-        self.assertFalse(_accepts("EAGLE", draft_backend="fa4"))
-        # Inherited from a target off the rails.
-        self.assertFalse(_accepts("EAGLE", backend="fa4", draft_backend=None))
-
-    def test_eagle_on_an_mla_host(self):
-        """An MLA mamba hybrid verifies on any backend, while its fused draft
-        is MHA-shaped: an MLA-only draft backend is refused whether named or
-        inherited."""
+    def test_draft_backend_is_not_gated(self):
+        """A fused draft is parts of the target's sub-pools read through views,
+        so no draft backend, named or inherited, is refused for it."""
         mla = dict(is_hybrid_swa=False, attention_arch=AttentionArch.MLA)
+        for draft_backend in (None, "triton", "flashinfer", "fa3", "fa4", "trtllm_mha"):
+            self.assertTrue(_accepts("EAGLE", draft_backend=draft_backend))
+        self.assertTrue(_accepts("EAGLE", backend="fa4", draft_backend=None))
         # The gate reads the lifetimes the model declares, its state from here.
         with patch.object(hybrid_arch, "mambaish_config", return_value=object()):
             for backend in _MLA_VERIFY:
-                self.assertTrue(
-                    _accepts("EAGLE", backend=backend, draft_backend="triton", **mla),
-                    backend,
-                )
-            for backend in ("trtllm_mla", "flashmla"):
-                for draft_backend in (None, backend):
-                    self.assertFalse(
+                for draft_backend in (None, "triton"):
+                    self.assertTrue(
                         _accepts(
                             "EAGLE", backend=backend, draft_backend=draft_backend, **mla
                         ),
-                        draft_backend or backend,
+                        f"{backend} {draft_backend}",
                     )
+
+    def test_eagle_needs_a_unified_target(self):
+        """EAGLE's draft fuses into the target's sub-pools, so the target must
+        declare one beside the full one."""
+        mla = dict(is_hybrid_swa=False, attention_arch=AttentionArch.MLA)
+        with patch.object(hybrid_arch, "mambaish_config", return_value=None):
+            self.assertFalse(_accepts("EAGLE", backend="triton", **mla))
 
     def test_unaudited_algorithms_and_tree_drafting_refused(self):
         """NGRAM and tree drafting relocate accepted tokens one at a time
