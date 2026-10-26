@@ -16,30 +16,36 @@ logical host capacity grows with the shard group, like the device's.
 
 from __future__ import annotations
 
-import functools
 from typing import Optional, Tuple
 
 import torch
 
 from sglang.srt.mem_cache.allocator.page_interleave import PageInterleavePoolAllocator
 from sglang.srt.mem_cache.page_interleave import PageInterleavePlacement
-from sglang.srt.mem_cache.pool_host.base import synchronized
+from sglang.srt.mem_cache.pool_host.base import HostKVCache, synchronized
 
 
-class PageInterleaveHostPoolMixin:
-    """Owner-classed host slots + the per-rank narrowing of a transfer."""
+class PageInterleaveHostPool:
+    """Compose owner-classed slots with a native host pool's buffers/transfers.
 
-    def __init__(
-        self, buffer_info, *args, placement: PageInterleavePlacement, **kwargs
-    ):
-        # Set before super().__init__: the base constructor calls clear().
+    The native pool is fully constructed before this allocation facade is
+    installed; its constructor and clear() never dispatch into sharding code.
+    """
+
+    def __init__(self, host_pool: HostKVCache, placement: PageInterleavePlacement):
+        self.host_pool = host_pool
         self.placement = placement
         self.shard_rank = placement.spec.shard_rank
         self.shard_size = placement.spec.shard_size
-        super().__init__(buffer_info, *args, **kwargs)
         assert self.page_size == self.placement.spec.page_size, (
             "the sharded host pool pages must match the device's physical page"
         )
+        self.clear()
+
+    def __getattr__(self, name: str):
+        # Layout, buffers, transfer kernels and their lifecycle remain owned by
+        # the concrete native pool. Only slot ownership is managed here.
+        return getattr(object.__getattribute__(self, "host_pool"), name)
 
     @property
     def logical_size(self) -> int:
@@ -94,13 +100,3 @@ class PageInterleaveHostPoolMixin:
             self.placement.local_index(host_indices[owned]),
             self.placement.local_index(device_owned),
         )
-
-
-@functools.cache
-def page_interleave_host_pool_cls(host_pool_cls: type) -> type:
-    """``host_pool_cls`` striped like a page-interleave device pool."""
-    return type(
-        f"PageInterleave{host_pool_cls.__name__}",
-        (PageInterleaveHostPoolMixin, host_pool_cls),
-        {},
-    )

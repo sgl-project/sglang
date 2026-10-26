@@ -76,7 +76,7 @@ class StorageAttachment:
                 "launch with --enable-hierarchical-cache to attach a backend.",
             )
         if page_interleave_shard_size(cache.token_to_kv_pool_allocator) > 1:
-            # Same gate as at launch (arg_groups/kv_shard_hook.py).
+            # Runtime attach bypasses kv_shard_hook.py's startup validation.
             return (
                 False,
                 "--enable-kv-cache-sharding does not support a HiCache storage "

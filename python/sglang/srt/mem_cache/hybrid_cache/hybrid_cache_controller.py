@@ -40,7 +40,7 @@ from sglang.srt.mem_cache.l2_transfer import L2Transfer
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.pool_host.base import uses_shared_host_layout
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
-from sglang.srt.mem_cache.pool_host.page_interleave import PageInterleaveHostPoolMixin
+from sglang.srt.mem_cache.pool_host.page_interleave import PageInterleaveHostPool
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 
@@ -841,7 +841,7 @@ class HybridCacheController(BaseHiCacheController):
         self, op: CacheOperation
     ) -> tuple[torch.Tensor, torch.Tensor, Optional[list[PoolTransfer]]]:
         if isinstance(
-            self.mem_pool_host.anchor_entry.host_pool, PageInterleaveHostPoolMixin
+            self.mem_pool_host.anchor_entry.host_pool, PageInterleaveHostPool
         ):
             # Queued loads and direct retraction transfers both resolve at the
             # L2 boundary. Keep the mirrored tree/queue indices logical until then.
@@ -852,7 +852,7 @@ class HybridCacheController(BaseHiCacheController):
         self, op: CacheOperation
     ) -> tuple[torch.Tensor, torch.Tensor, Optional[list[PoolTransfer]]]:
         host_group = self.mem_pool_host
-        if isinstance(host_group.anchor_entry.host_pool, PageInterleaveHostPoolMixin):
+        if isinstance(host_group.anchor_entry.host_pool, PageInterleaveHostPool):
             return op.host_indices, op.device_indices, op.pool_transfers
         if self.io_backend != "kernel" or host_group.layout != "page_first":
             return self.move_hybrid_indices(op)
@@ -884,7 +884,7 @@ class HybridCacheController(BaseHiCacheController):
                 )
             )
 
-        sharded = isinstance(anchor.host_pool, PageInterleaveHostPoolMixin)
+        sharded = isinstance(anchor.host_pool, PageInterleaveHostPool)
         local_indices = {}
         transfers = []
         for entry, host, device in pools:
@@ -987,7 +987,7 @@ class HybridCacheController(BaseHiCacheController):
         anchor = self.mem_pool_host.anchor_entry
 
         def transferred_tokens(indices):
-            if isinstance(anchor.host_pool, PageInterleaveHostPoolMixin):
+            if isinstance(anchor.host_pool, PageInterleaveHostPool):
                 return int(
                     anchor.host_pool.placement.local_mask(
                         indices, anchor.host_pool.shard_rank
@@ -997,7 +997,7 @@ class HybridCacheController(BaseHiCacheController):
 
         kv_tokens = (
             transferred_tokens(op.host_indices)
-            if isinstance(anchor.host_pool, PageInterleaveHostPoolMixin)
+            if isinstance(anchor.host_pool, PageInterleaveHostPool)
             else len(op.device_indices)
         )
         num_bytes = kv_tokens * anchor.host_pool.size_per_token
@@ -1542,7 +1542,7 @@ class HybridCacheController(BaseHiCacheController):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if uses_shared_host_layout(host_pool):
             return host_indices, device_indices
-        if logical_indices and isinstance(host_pool, PageInterleaveHostPoolMixin):
+        if logical_indices and isinstance(host_pool, PageInterleaveHostPool):
             # Each shard rank copies only its own pages, as local rows.
             host_indices, device_indices = host_pool.owned_rows(
                 host_indices=host_indices, device_indices=device_indices

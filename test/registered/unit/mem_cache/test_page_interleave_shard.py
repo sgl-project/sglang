@@ -110,7 +110,7 @@ from sglang.srt.mem_cache.page_interleave_pool import (
 )
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.page_interleave import (
-    page_interleave_host_pool_cls,
+    PageInterleaveHostPool,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
@@ -1921,7 +1921,7 @@ def _host_pool(shard_rank, device_pages=32):
             side_effect=lambda dims, dtype: torch.empty(dims, dtype=dtype),
         ),
     ):
-        return page_interleave_host_pool_cls(MLATokenToKVPoolHost)(
+        host_pool = MLATokenToKVPoolHost(
             device_pool.get_device_pool_infos()[0].buffer_info,
             host_to_device_ratio=2.0,
             host_size=0,
@@ -1933,8 +1933,11 @@ def _host_pool(shard_rank, device_pages=32):
             start_layer=device_pool.start_layer,
             end_layer=device_pool.end_layer,
             target_layer_num=device_pool.layer_num,
-            placement=PageInterleavePlacement(_make_spec(shard_rank=shard_rank)),
         )
+
+    return PageInterleaveHostPool(
+        host_pool, PageInterleavePlacement(_make_spec(shard_rank=shard_rank))
+    )
 
 
 def _page_classes(indices):
@@ -1959,6 +1962,24 @@ class TestShardedHostSlots(CustomTestCase):
         slots = pool.alloc(pool.available_size(), start_class=0)
         self.assertEqual(slots.numel(), N * (pool.size - PS))
         self.assertLess(int(pool.placement.local_index(slots).max()), pool.size)
+
+    def test_native_pool_owns_buffers_but_not_sharded_slots(self):
+        pool = _host_pool(shard_rank=1)
+        native = pool.host_pool
+        self.assertIs(type(pool), PageInterleaveHostPool)
+        self.assertIs(type(native), MLATokenToKVPoolHost)
+        self.assertIs(pool.kv_buffer, native.kv_buffer)
+        self.assertIs(pool.lock, native.lock)
+        native_available = native.available_size()
+        capacity = pool.available_size()
+        pool.alloc(PS, start_class=1)
+        self.assertLess(pool.available_size(), capacity)
+        self.assertEqual(native.available_size(), native_available)
+        with unittest.mock.patch.object(native, "clear", side_effect=AssertionError):
+            pool.clear()
+        self.assertEqual(pool.available_size(), capacity)
+        self.assertIs(pool.load_to_device_per_layer.__self__, native)
+        self.assertIs(pool.backup_from_device_all_layer.__self__, native)
 
     def test_alloc_without_a_start_class_fails_loud(self):
         with self.assertRaises(AssertionError):

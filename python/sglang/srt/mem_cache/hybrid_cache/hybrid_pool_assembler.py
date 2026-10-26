@@ -35,7 +35,7 @@ from sglang.srt.mem_cache.pool_host.mha import (
 )
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.page_interleave import (
-    page_interleave_host_pool_cls,
+    PageInterleaveHostPool,
 )
 from sglang.srt.mem_cache.pool_host.qsa import QSAIndexerPoolHost
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
@@ -190,11 +190,6 @@ def build_kv_host_pool(
             kv_pool=kv_pool, drafts=mtp_draft_device_pools, use_mla=use_mla
         )
     kwargs = {}
-    if isinstance(kv_pool, PageInterleaveKVPoolMixin):
-        # Transfer descriptors retain the rank's physical buffers; placement
-        # separately narrows logical transfers to that rank's owned rows.
-        kv_host_pool_cls = page_interleave_host_pool_cls(kv_host_pool_cls)
-        kwargs["placement"] = kv_pool.placement
     if override_kv_cache_dim is not None:
         kwargs["override_kv_cache_dim"] = override_kv_cache_dim
     if use_mla:
@@ -226,7 +221,7 @@ def build_kv_host_pool(
         )
         kwargs["dcp_size"] = parallel.attn_dcp_size
         kwargs["dcp_rank"] = parallel.attn_dcp_rank
-    return kv_host_pool_cls(
+    host_pool = kv_host_pool_cls(
         host_input,
         get_memory().hicache_ratio,
         get_memory().hicache_size if host_size is None else host_size,
@@ -236,6 +231,9 @@ def build_kv_host_pool(
         pool_label=pool_label,
         **kwargs,
     )
+    if isinstance(kv_pool, PageInterleaveKVPoolMixin):
+        return PageInterleaveHostPool(host_pool, kv_pool.placement)
+    return host_pool
 
 
 def _split_hicache_size(
