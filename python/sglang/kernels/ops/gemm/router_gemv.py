@@ -212,6 +212,7 @@ def _router_gemv_swiglu_kernel(
     pid = tl.program_id(0)
     num_gemv = num_n_blocks * num_m_tiles * SPLIT_K
     if pid < num_gemv:
+        # without the fixup, out_ptr, counter_ptr and stride_om are never read
         _router_gemv_tile(
             x_ptr,
             w_ptr,
@@ -372,7 +373,7 @@ def router_gemv_partials_swiglu(
     q, scale, sw_block_m, sw_block_n = swiglu_oai_fp8_outputs(
         gate_up, group_size, transpose_scale
     )
-    # the two kernels' warps, so each keeps its layouts
+    # both kernels launch with 4 warps on their own; sharing that count keeps their layouts
     assert num_warps == 4
     partials, _ = _get_scratch(x.device, n)
     m_tiles = triton.cdiv(m, block_m)

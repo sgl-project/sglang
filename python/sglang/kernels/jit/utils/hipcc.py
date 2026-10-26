@@ -55,7 +55,7 @@ class HipKernel:
         )
 
     def launch(self, grid, args, stream, block=256, shared=0):
-        # an int grid is 1-D; aiter_asm_blockscale passes (x, y)
+        # grid is an int (1-D) or an (x, y) tuple
         grid_x, grid_y = grid if isinstance(grid, tuple) else (grid, 1)
         size = ctypes.c_size_t(ctypes.sizeof(args))
         extra = (ctypes.c_void_p * 5)(
