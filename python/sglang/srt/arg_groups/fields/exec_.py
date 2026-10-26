@@ -200,6 +200,10 @@ class ExecKernel(msgspec.Struct):
         bool,
         "Enable the AMD monokernels from the sgl-amd-mono package. Supported decode and verify steps use persistent kernels; other steps use the standard forward. An unsupported startup configuration raises an error listing the reasons. Experimental feature.",
     ] = False
+    enable_megakernel: A[
+        bool,
+        "Enable the megakernel plugin for the current platform: on CUDA the same as --enable-nvidia-megakernel; an out-of-tree platform matches specs on its own device target (SRTPlatform.get_megakernel_target) and may own the dispatch. An unsupported startup configuration raises an error listing the reasons. Experimental feature.",
+    ] = False
     prefill_attention_backend: A[
         Optional[str],
         Arg(

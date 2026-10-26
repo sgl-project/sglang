@@ -49,11 +49,14 @@ class Requirements(msgspec.Struct, frozen=True):
     """Configuration a spec needs, checked on the resolved settings at startup; an
     empty field accepts any value."""
 
-    isas: frozenset[str]  # e.g. "sm_103"
+    # device targets as SRTPlatform.get_megakernel_target reports them: "sm_103" on
+    # CUDA, the platform's own name (e.g. a compiler target) out of tree
+    isas: frozenset[str]
     tp_sizes: frozenset[int]
     resident_blocks: int = 0  # SMs the persistent grids need
     dtypes: frozenset[str] = frozenset()
-    # the decode CUDA graph backends the served steps run under
+    # the decode CUDA graph backends the served steps run under; empty accepts any,
+    # e.g. for a platform whose own graph runner dispatches (install_megakernel_dispatch)
     decode_graph_backends: frozenset[str] = frozenset({"full", "disabled"})
     # a server argument -> its accepted values, as resolved for this server
     server_args: Mapping[str, frozenset] = {}
@@ -108,6 +111,11 @@ class BuiltMegakernel(Protocol):
     on every rank, since it replaces the proposal's rank-0 broadcast; write
     draft_tokens[: bs * gamma] and the sampled rows' step_logits; and advance
     noise.offset once per sampled block.
+
+    Optionally, a ``pool_layout`` attribute (absent or None: SGLang's pools). A
+    layout object is handed to SRTPlatform.activate_megakernel_pool_layout after
+    the build and before the KV cache is sized, so the platform builds the KV and
+    state pools in it; the in-tree platforms refuse one.
 
     SGLang's runtime state reaches a build as BuildContext.binding and a covered
     step as Step.view (sglang.srt.kernel_plugins.nvidia.binding, which also lists what else may be
