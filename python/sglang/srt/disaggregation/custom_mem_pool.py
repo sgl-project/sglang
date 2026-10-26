@@ -13,10 +13,30 @@
 # ==============================================================================
 """Resolve transport-specific memory pools for PD disaggregation."""
 
-from typing import Any, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_server_args
+
+PoolResult = Tuple[bool, Optional[Any], Optional[str]]
+
+
+def _mori_pool(device: str) -> PoolResult:
+    from sglang.srt.disaggregation.mori.custom_mem_pool import (
+        init_mori_custom_mem_pool,
+    )
+
+    return init_mori_custom_mem_pool(device)
+
+
+def _mooncake_pool(device: str) -> PoolResult:
+    from sglang.srt.disaggregation.mooncake.utils import init_mooncake_custom_mem_pool
+
+    return init_mooncake_custom_mem_pool(device)
+
+
+# PD transfer backends that choose the KV pool allocator themselves.
+_PD_BACKEND_POOLS: Dict[str, Callable[[str], PoolResult]] = {"mori": _mori_pool}
 
 
 def _get_server_args_or_none():
@@ -27,30 +47,20 @@ def _get_server_args_or_none():
         return None
 
 
-def maybe_init_custom_mem_pool(
-    device: str,
-) -> Tuple[bool, Optional[Any], Optional[str]]:
+def maybe_init_custom_mem_pool(device: str) -> PoolResult:
     """Initialize the custom memory pool required by the active transport."""
     server_args = _get_server_args_or_none()
-    # Scope Mori's inner backend knob to processes actually using Mori PD.
-    if (
-        server_args is not None
-        and getattr(server_args, "disaggregation_mode", "null") in ("prefill", "decode")
-        and getattr(server_args, "disaggregation_transfer_backend", None) == "mori"
-    ):
-        from sglang.srt.disaggregation.mori.custom_mem_pool import (
-            init_mori_custom_mem_pool,
+    if server_args is not None and getattr(
+        server_args, "disaggregation_mode", "null"
+    ) in ("prefill", "decode"):
+        resolve = _PD_BACKEND_POOLS.get(
+            getattr(server_args, "disaggregation_transfer_backend", None)
         )
+        if resolve is not None:
+            return resolve(device)
 
-        return init_mori_custom_mem_pool(device)
-
-    # Preserve the existing Mooncake env-driven behavior. Restricting this to
-    # the Mooncake PD backend would be a separate behavior change.
+    # Mooncake's pool stays env-driven, independent of the PD backend.
     if envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get() is not None:
-        from sglang.srt.disaggregation.mooncake.utils import (
-            init_mooncake_custom_mem_pool,
-        )
-
-        return init_mooncake_custom_mem_pool(device)
+        return _mooncake_pool(device)
 
     return False, None, None

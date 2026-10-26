@@ -13,7 +13,6 @@
 # ==============================================================================
 """Mori-specific custom memory pool management."""
 
-import os
 from typing import Any, Optional, Tuple
 
 from sglang.srt.environ import envs
@@ -44,9 +43,13 @@ def get_mori_fabric_mem_pool() -> Any:
 def init_mori_custom_mem_pool(
     device: str,
 ) -> Tuple[bool, Optional[Any], Optional[str]]:
-    """Return the process-wide Mori fabric pool when fabric is enabled."""
-    if envs.SGLANG_MORI_BACKEND.get().strip().lower() != "fabric":
-        return False, None, None
-    if os.getenv("SGLANG_MORI_FABRIC_STAGING", "0") == "1":
+    """Place KV/state pools in Fabric memory when Fabric reads them directly.
+
+    With staging on, only the staging slots need Fabric memory.
+    """
+    if (
+        envs.SGLANG_MORI_BACKEND.get().strip().lower() != "fabric"
+        or envs.SGLANG_MORI_FABRIC_STAGING.get()
+    ):
         return False, None, None
     return True, get_mori_fabric_mem_pool(), "mori_fabric"

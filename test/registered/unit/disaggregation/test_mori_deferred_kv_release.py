@@ -75,9 +75,15 @@ from sglang.srt.disaggregation.mori.conn import (
     MoriKVReceiver,
     MoriKVSender,
     StatusCode,
-    _FabricStagingRoom,
     _MoriTransferSubmissionError,
     _SubmissionLocal,
+)
+from sglang.srt.disaggregation.mori.fabric_staging import (
+    FabricSlotAcks,
+    FabricStagingRoom,
+    FabricStagingRx,
+    default_slot_tokens,
+    slot_bytes_for,
 )
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
 from sglang.srt.environ import envs
@@ -107,6 +113,8 @@ def _manager(enabled: bool = True) -> MoriKVManager:
     manager._send_abort_ack = lambda *args: manager._sent.append(args)
     manager._wait_poll_ms = 0
     manager._transfer_timeout_ms = 0
+    manager._mori_backend = "rdma"
+    manager._fabric_staging = False
     return manager
 
 
@@ -265,7 +273,7 @@ class TestMoriAbortAck(DeferredAbortNotificationScenarios, CustomTestCase):
             side_effect=(0.0, 0.002),
         ):
             with self.assertRaises(KeyboardInterrupt):
-                manager._transfer_worker(queue)
+                manager._transfer_worker(queue, 0)
 
         self.assertEqual(manager._staging_outstanding[11], 1)
         self.assertEqual(manager._drain_queue.qsize(), 1)
@@ -301,7 +309,7 @@ class TestMoriAbortAck(DeferredAbortNotificationScenarios, CustomTestCase):
 
         with patch("sglang.srt.disaggregation.mori.conn.logger.exception"):
             with self.assertRaises(KeyboardInterrupt):
-                manager._transfer_worker(queue)
+                manager._transfer_worker(queue, 0)
 
         self.assertNotIn(11, manager._staging_outstanding)
         manager.conclude_failure.assert_called_once()
@@ -382,6 +390,29 @@ class TestMoriBackendOptIn(CustomTestCase):
         self.assertTrue(MoriKVManager.supports_deferred_decode_kv_release)
 
 
+class _FakeSlots:
+    """CPU stand-in for FabricStagingSlots with a single slot."""
+
+    def __init__(self, slot_bytes, storage=None):
+        self.num_slots = 1
+        self.slot_bytes = slot_bytes
+        self.desc = object()
+        self.storage = storage
+        self.stream_mock = MagicMock()
+
+    def offset(self, slot):
+        if not 0 <= slot < self.num_slots:
+            raise RuntimeError(f"Invalid Fabric staging slot {slot}")
+        return 0
+
+    def view(self, slot):
+        self.offset(slot)
+        return self.storage
+
+    def stream(self, slot):
+        return self.stream_mock
+
+
 class TestMoriFabricStaging(CustomTestCase):
     def manager(self, local=6500, remote=5000):
         ns = types.SimpleNamespace
@@ -397,7 +428,9 @@ class TestMoriFabricStaging(CustomTestCase):
             state_data_lens=[[3 * 128, 5 * 128], [48 * 8, 16 * 8]],
         )
         manager._fabric_staging = True
-        manager._fabric_staging_buffers = [ns(get_size=lambda: local)]
+        manager._staging_slots = _FakeSlots(local)
+        manager._staging_acks = FabricSlotAcks(1)
+        manager._staging_rx = FabricStagingRx()
         manager._dcp_pack_max_tokens = None
         manager.is_dummy_cp_rank = False
         manager.enable_all_cp_ranks_for_transfer = False
@@ -413,20 +446,13 @@ class TestMoriFabricStaging(CustomTestCase):
         }
         manager.decode_kv_args_table = {
             "decode": ns(
-                dst_staging_size=remote,
-                dst_staging_mem_descs=[object()],
+                dst_staging_desc=object(),
+                dst_staging_slots=1,
+                dst_staging_slot_bytes=remote,
                 requires_dcp_relayout=False,
             )
         }
         manager._stopped = False
-        manager._fabric_staging_ack_cv = threading.Condition()
-        manager._fabric_staging_acks = set()
-        manager._fabric_staging_nacks = {}
-        manager._fabric_staging_pending = {}
-        manager._fabric_staging_rx_lock = threading.RLock()
-        manager._fabric_staging_rx_generations = {}
-        manager._fabric_staging_rx_poisoned = set()
-        manager._fabric_staging_scattering = None
         return manager
 
     def sender(self, manager, pages):
@@ -436,6 +462,26 @@ class TestMoriFabricStaging(CustomTestCase):
         sender._transfer_num_kv_indices = sender._transfer_num_state_indices = 0
         sender.init(pages, 3)
         return sender
+
+    def test_slot_size_follows_chunk_tokens(self):
+        kv_args = self.manager().kv_args
+        mib = 1 << 20
+        tokens_env = envs.SGLANG_MORI_FABRIC_STAGING_TOKENS
+        state_env = envs.SGLANG_MORI_FABRIC_STAGING_STATE_MB
+        with patch.object(state_env, "get", return_value=3):
+            # 2048 tokens span 8 pages; one more covers a mid-page start.
+            self.assertEqual(slot_bytes_for(kv_args, 2048), 3 * mib + mib)
+            kv_args.kv_item_lens = [mib, mib]
+            self.assertEqual(slot_bytes_for(kv_args, 2048), (9 * 2 + 3) * mib)
+        server_args = types.SimpleNamespace(chunked_prefill_size=2048)
+        with patch.object(tokens_env, "get", return_value=0):
+            self.assertEqual(default_slot_tokens(server_args, 256), 2048)
+            server_args.chunked_prefill_size = 1000
+            self.assertEqual(default_slot_tokens(server_args, 256), 768)
+            server_args.chunked_prefill_size = -1
+            self.assertEqual(default_slot_tokens(server_args, 256), 8192)
+        with patch.object(tokens_env, "get", return_value=512):
+            self.assertEqual(default_slot_tokens(server_args, 256), 512)
 
     def test_cached_prefix_is_bounded_and_state_is_terminal(self):
         """A cached prefix larger than three slots must retain every page and state row."""
@@ -532,6 +578,10 @@ class TestMoriFabricStaging(CustomTestCase):
                         self.manager(local, remote), 1
                     ).get_max_transfer_tokens()
         manager = self.manager()
+        manager.decode_kv_args_table["decode"].dst_staging_desc = None
+        with self.assertRaisesRegex(ValueError, "Missing decode staging slots"):
+            self.sender(manager, 1).get_max_transfer_tokens()
+        manager = self.manager()
         manager.transfer_infos[11]["decode"].dst_state_indices = []
         with self.assertRaisesRegex(ValueError, "state metadata mismatch"):
             self.sender(manager, 1).get_max_transfer_tokens()
@@ -559,36 +609,25 @@ class TestMoriFabricStaging(CustomTestCase):
                 manager = self.manager(local, remote)
                 manager.transfer_infos[11].pop("dummy")
                 storage = torch.full((local + 32,), 165, dtype=torch.uint8)
-                manager._fabric_staging_buffers[0] = types.SimpleNamespace(
-                    get_size=lambda: local,
-                    get_ptr=lambda: storage.data_ptr() + 16,
-                    buffer=storage[16:-16],
-                )
+                manager._staging_slots = _FakeSlots(local, storage[16:-16])
                 chunk = _chunk()
                 chunk.prefill_kv_indices, chunk.state_indices = rows, state
                 chunk.is_last_chunk = state is not None
                 with patch(
-                    "sglang.kernels.ops.kvcache.pd_dcp_gather.copy_mla_rows_into_pack"
-                ) as gather:
+                    "sglang.srt.disaggregation.mori.conn.pack_row_segments"
+                ) as pack:
                     with self.assertRaisesRegex((ValueError, RuntimeError), error):
                         manager._process_fabric_staging_chunk(chunk, 0)
-                    gather.assert_not_called()
+                    pack.assert_not_called()
                     self.assertTrue(torch.all(storage == 165))
 
     def ready_fixture(self):
         manager = self.manager()
         manager.attn_tp_rank = 0
         storage = torch.full((6532,), 165, dtype=torch.uint8)
-        manager._fabric_staging_buffers = [
-            types.SimpleNamespace(
-                get_size=lambda: 6500,
-                get_ptr=lambda: storage.data_ptr() + 16,
-                get_gather_stream=MagicMock(),
-                buffer=storage[16:-16],
-            )
-        ]
-        metadata = _FabricStagingRoom(np.arange(6), [], {("10.0.0.1", 6000)})
-        manager._fabric_staging_room_meta = {11: metadata}
+        manager._staging_slots = _FakeSlots(6500, storage[16:-16])
+        metadata = FabricStagingRoom(np.arange(6), [], {("10.0.0.1", 6000)})
+        manager._staging_rx.rooms = {11: metadata}
         replies = []
         manager._connect_threadsafe = lambda *a, **kw: types.SimpleNamespace(
             send_multipart=replies.append
@@ -611,6 +650,7 @@ class TestMoriFabricStaging(CustomTestCase):
         return manager, msg, replies, storage
 
     def test_ready_rejects_invalid_or_stale_identity_before_scatter(self):
+        unpack_target = "sglang.srt.disaggregation.mori.conn.unpack_row_segments"
         for field, value in (
             (2, b"-1"),
             (3, b"99"),
@@ -623,9 +663,7 @@ class TestMoriFabricStaging(CustomTestCase):
             with self.subTest(field=field, value=value):
                 manager, msg, replies, storage = self.ready_fixture()
                 msg[field] = value
-                with patch(
-                    "sglang.srt.disaggregation.common.dcp_pack.scatter_dcp_dst"
-                ) as scatter:
+                with patch(unpack_target) as unpack:
                     manager._handle_fabric_chunk_ready(msg)
                 self.assertEqual(
                     replies[0][:6],
@@ -633,15 +671,13 @@ class TestMoriFabricStaging(CustomTestCase):
                 )
                 self.assertEqual(replies[0][6], b"1")
                 self.assertTrue(torch.all(storage == 165))
-                scatter.assert_not_called()
+                unpack.assert_not_called()
 
         manager, msg, replies, _ = self.ready_fixture()
-        with patch(
-            "sglang.srt.disaggregation.common.dcp_pack.scatter_dcp_dst"
-        ) as scatter:
+        with patch(unpack_target) as unpack:
             manager._handle_fabric_chunk_ready(msg)
             manager._handle_fabric_chunk_ready(msg)
-            manager._fabric_staging_room_meta[11] = _FabricStagingRoom(
+            manager._staging_rx.rooms[11] = FabricStagingRoom(
                 np.arange(6), [], {("10.0.0.1", 6000)}
             )
             msg[11] = b"2"
@@ -650,32 +686,25 @@ class TestMoriFabricStaging(CustomTestCase):
             [reply[0] for reply in replies],
             [FABRIC_CHUNK_ACK, FABRIC_CHUNK_NACK, FABRIC_CHUNK_NACK],
         )
-        self.assertEqual(scatter.call_count, 1)
+        self.assertEqual(unpack.call_count, 1)
 
         manager, msg, replies, _ = self.ready_fixture()
-        manager._fabric_staging_buffers[
-            0
-        ].get_gather_stream.return_value.synchronize.side_effect = RuntimeError(
+        manager._staging_slots.stream_mock.synchronize.side_effect = RuntimeError(
             "stream failed"
         )
-        with patch(
-            "sglang.srt.disaggregation.common.dcp_pack.scatter_dcp_dst",
-            side_effect=RuntimeError("copy failed"),
-        ) as scatter:
+        with patch(unpack_target, side_effect=RuntimeError("copy failed")) as unpack:
             manager._handle_fabric_chunk_ready(msg)
             msg[11] = b"2"
             manager._handle_fabric_chunk_ready(msg)
-        self.assertEqual(manager._fabric_staging_rx_poisoned, {0})
+        self.assertEqual(manager._staging_rx.poisoned, {0})
         self.assertEqual([reply[6] for reply in replies], [b"0", b"0"])
-        self.assertEqual(scatter.call_count, 1)
+        self.assertEqual(unpack.call_count, 1)
 
     def test_abort_after_gather_stops_further_fabric_writes(self):
         """Cancellation must stop later writes and drain any already submitted."""
         for phase in ("gather", "between_targets"):
             with self.subTest(phase=phase):
                 manager, _, _, storage = self.ready_fixture()
-                manager._fabric_staging_generations = [0]
-                manager._fabric_staging_descs = [object()]
                 info = manager.transfer_infos[11]["decode"]
                 info.dst_staging_epoch = b"epoch"
                 manager.transfer_infos[11] = {"decode": info, "second": info}
@@ -696,23 +725,24 @@ class TestMoriFabricStaging(CustomTestCase):
                 def abort():
                     manager._handle_abort_message(_abort_message())
 
+                def pack(*args):
+                    if phase == "gather":
+                        abort()
+                    return 256
+
                 def allocate_uid():
                     if manager.engine.batch_write.call_count:
                         abort()
                     return 1
 
-                stream = manager._fabric_staging_buffers[0].get_gather_stream()
-                if phase == "gather":
-                    stream.synchronize.side_effect = abort
-                else:
+                if phase != "gather":
                     manager.engine.allocate_transfer_uid.side_effect = allocate_uid
                 chunk = _chunk()
                 manager._mark_transfer_started(chunk)
                 with (
-                    patch("torch.cuda.default_stream"),
-                    patch("torch.cuda.stream"),
                     patch(
-                        "sglang.kernels.ops.kvcache.pd_dcp_gather.copy_mla_rows_into_pack"
+                        "sglang.srt.disaggregation.mori.conn.pack_row_segments",
+                        side_effect=pack,
                     ),
                     self.assertRaisesRegex(
                         _MoriTransferSubmissionError, "cancelled"
@@ -726,14 +756,23 @@ class TestMoriFabricStaging(CustomTestCase):
                 self.assertEqual(manager._sent, [])
                 self.assertTrue(torch.all(storage == 165))
                 with self.assertRaisesRegex(RuntimeError, "quarantined"):
-                    manager._release_fabric_staging_slot(0)
+                    manager._staging_acks.acquire(0)
 
     def test_failed_wait_quarantines_slot_until_terminal_reply(self):
         manager = self.manager()
+        acks = manager._staging_acks
         key = (11, 0, 1, 2, 0)
-        manager._fabric_staging_pending[0] = {key}
+        acks.expect(0, {key})
+
+        def wait(deadline):
+            acks.wait(
+                {key},
+                deadline,
+                cancelled=lambda: manager._stopped or manager._should_skip_transfer(11),
+            )
+
         with self.assertRaisesRegex(RuntimeError, "Timed out"):
-            manager._wait_fabric_staging_acks(11, {key}, time.monotonic() - 1)
+            wait(time.monotonic() - 1)
         for state in ("timeout", "abort", "shutdown", "nack"):
             with self.subTest(state=state):
                 manager.request_status[11] = KVPoll.Transferring
@@ -756,26 +795,24 @@ class TestMoriFabricStaging(CustomTestCase):
                         ]
                     )
                 with self.assertRaisesRegex(RuntimeError, "quarantined"):
-                    manager._release_fabric_staging_slot(0)
+                    acks.acquire(0)
                 if state != "timeout":
                     with self.assertRaises(RuntimeError):
-                        manager._wait_fabric_staging_acks(
-                            11, {key}, time.monotonic() + 300
-                        )
+                        wait(time.monotonic() + 300)
         manager._handle_fabric_chunk_ack(
             [FABRIC_CHUNK_ACK, b"11", b"0", b"2", b"2", b"0"]
         )
-        self.assertFalse(manager._fabric_staging_acks)
+        with self.assertRaisesRegex(RuntimeError, "quarantined"):
+            acks.acquire(0)
         manager._handle_fabric_chunk_ack(
             [FABRIC_CHUNK_NACK, b"11", b"0", b"1", b"2", b"0", b"1", b"rejected"]
         )
-        manager._release_fabric_staging_slot(0)
-        self.assertFalse(manager._fabric_staging_pending)
-        self.assertFalse(manager._fabric_staging_nacks)
+        acks.acquire(0)
+        self.assertTrue(acks.is_idle())
         manager._handle_fabric_chunk_ack(
             [FABRIC_CHUNK_ACK, b"11", b"0", b"1", b"2", b"0"]
         )
-        self.assertFalse(manager._fabric_staging_acks)
+        self.assertTrue(acks.is_idle())
 
     def test_clear_waits_for_scatter_and_rejects_late_ready(self):
         manager, msg, replies, _ = self.ready_fixture()
@@ -789,10 +826,10 @@ class TestMoriFabricStaging(CustomTestCase):
             11,
             "peer",
         )
-        receiver._lifecycle_lock = manager._fabric_staging_rx_lock
+        receiver._lifecycle_lock = manager._staging_rx.lock
         entered, finish, clearing, cleared = (threading.Event() for _ in range(4))
 
-        def scatter(**kwargs):
+        def unpack(*args):
             entered.set()
             self.assertTrue(finish.wait(2))
 
@@ -802,8 +839,8 @@ class TestMoriFabricStaging(CustomTestCase):
             cleared.set()
 
         with patch(
-            "sglang.srt.disaggregation.common.dcp_pack.scatter_dcp_dst",
-            side_effect=scatter,
+            "sglang.srt.disaggregation.mori.conn.unpack_row_segments",
+            side_effect=unpack,
         ):
             worker = threading.Thread(
                 target=manager._handle_fabric_chunk_ready, args=(msg,)
@@ -821,7 +858,7 @@ class TestMoriFabricStaging(CustomTestCase):
                 cleanup.join(2)
             self.assertTrue(cleared.is_set())
             manager._handle_fabric_chunk_ready(msg)
-        self.assertNotIn(11, manager._fabric_staging_room_meta)
+        self.assertNotIn(11, manager._staging_rx.rooms)
         self.assertEqual(
             [reply[0] for reply in replies], [FABRIC_CHUNK_ACK, FABRIC_CHUNK_NACK]
         )
