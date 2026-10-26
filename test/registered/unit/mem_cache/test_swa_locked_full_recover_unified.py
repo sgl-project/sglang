@@ -117,6 +117,8 @@ class _StaticAllocRecorder:
     tensor and a real `set_full_to_swa_mapping`, so the handler must keep
     routing static pools through the original recipe."""
 
+    hands_out_virtual_ids = False
+
     def __init__(self, n=16):
         self.full_to_swa_index_mapping = torch.arange(n, dtype=torch.int64)
         self.mapping_calls = []

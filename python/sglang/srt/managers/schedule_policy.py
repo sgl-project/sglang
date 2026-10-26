@@ -50,19 +50,7 @@ from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
     split_cached_prefix_by_tier,
 )
-from sglang.srt.mem_cache.allocator.hisparse import (
-    DeepSeekV4HiSparseTokenToKVPoolAllocator,
-)
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
-from sglang.srt.mem_cache.allocator.swa import (
-    SWATokenToKVPoolAllocator,
-)
-from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
-    UnifiedMambaSWATokenToKVPoolAllocator,
-)
-from sglang.srt.mem_cache.allocator.unified_mamba import (
-    UnifiedMambaTokenToKVPoolAllocator,
-)
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     InitLoadBackParams,
@@ -689,27 +677,14 @@ class PrefillAdder:
                 ]
             )
 
-        # DeepSeek V4 HiSparse wraps an SWATokenToKVPoolAllocator internally and
-        # exposes the full SWA allocator interface.
-        self.is_hybrid_swa = isinstance(
-            self.token_to_kv_pool_allocator,
-            (SWATokenToKVPoolAllocator, DeepSeekV4HiSparseTokenToKVPoolAllocator),
-        )
+        self.is_hybrid_swa = self.token_to_kv_pool_allocator.has_window_pool
         self.is_hybrid_ssm_cache = self.tree_cache.supports_mamba()
         # A new state slot eats shared-gap bytes that `rem_total_tokens` counts
         # as free, so reserve per slot or admission over-commits. Gate on the
         # ALLOCATOR: the reservation holds with the radix cache disabled too.
-        self._mamba_slot_cost = 0
-        if isinstance(
-            self.token_to_kv_pool_allocator,
-            (
-                UnifiedMambaTokenToKVPoolAllocator,
-                UnifiedMambaSWATokenToKVPoolAllocator,
-            ),
-        ):
-            self._mamba_slot_cost = (
-                self.token_to_kv_pool_allocator.mamba_slot_full_token_cost()
-            )
+        self._mamba_slot_cost = (
+            self.token_to_kv_pool_allocator.mamba_slot_full_token_cost()
+        )
 
         # `mamba_gap_reserve` is charged to `rem_total_tokens`, which INCLUDES
         # `full_evictable_size()` — but `alloc_req_slots` can only recover

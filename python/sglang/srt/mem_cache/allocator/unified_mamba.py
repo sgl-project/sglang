@@ -47,6 +47,8 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     sub-allocators own independent virtual-id spaces.
     """
 
+    hands_out_virtual_ids = True
+
     def __init__(
         self,
         *,

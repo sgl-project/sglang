@@ -45,6 +45,10 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     # subclasses that bypass this __init__ read False.
     _swa_req_ring = False
 
+    @property
+    def has_window_pool(self) -> bool:
+        return True
+
     def __init__(
         self,
         size: int,

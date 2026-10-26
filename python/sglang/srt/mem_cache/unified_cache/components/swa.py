@@ -69,18 +69,10 @@ class SWAComponent(TreeComponent):
     """
 
     def __init__(self, cache: UnifiedRadixCache, params: CacheInitParams):
-        from sglang.srt.mem_cache.allocator.hisparse import (
-            DeepSeekV4HiSparseTokenToKVPoolAllocator,
-        )
-        from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
-
         # DeepSeek V4 HiSparse forces --disable-radix-cache, where this component
         # only frees through free_swa_segment / free / free_group_*, which the
         # HiSparse allocator defines.
-        assert isinstance(
-            params.token_to_kv_pool_allocator,
-            (SWATokenToKVPoolAllocator, DeepSeekV4HiSparseTokenToKVPoolAllocator),
-        ), (
+        assert params.token_to_kv_pool_allocator.has_window_pool, (
             f"SWAComponent requires an SWA allocator, got {type(params.token_to_kv_pool_allocator)}"
         )
         if params.sliding_window_size is None or params.sliding_window_size <= 0:
@@ -247,13 +239,9 @@ class SWAComponent(TreeComponent):
         return swa_indices.to(torch.int64)
 
     def _unified_allocator(self):
-        """The unified SWA composite, or None when running on the static pool."""
-        from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
-            UnifiedSWAAllocatorBase,
-        )
-
+        """The unified pool's allocator, or None when running on the static pool."""
         allocator = self.cache.token_to_kv_pool_allocator
-        if isinstance(allocator, UnifiedSWAAllocatorBase):
+        if allocator.hands_out_virtual_ids:
             return allocator
         return None
 

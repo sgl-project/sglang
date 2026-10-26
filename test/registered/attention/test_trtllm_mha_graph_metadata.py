@@ -514,7 +514,7 @@ def _make_backend_for_hook_test(speculative_num_draft_tokens=None):
     # matching the real __init__'s parent binding.
     backend.kv_index_translator = KVIndexTranslator(
         req_to_token=backend.req_to_token,
-        token_to_kv_pool_allocator=SimpleNamespace(),
+        token_to_kv_pool_allocator=SimpleNamespace(hands_out_virtual_ids=False),
         token_to_kv_pool=SimpleNamespace(),
         page_size=PAGE_SIZE,
         device="cpu",

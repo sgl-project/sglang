@@ -58,6 +58,8 @@ class UnifiedSWAAllocatorBase(SWATokenToKVPoolAllocator):
     Concrete allocators define the two-ended or Mamba/SWA/FULL capacity policy.
     """
 
+    hands_out_virtual_ids = True
+
     # Parent's `size` property has no setter but base init does `self.size = size`;
     # the no-op setter below absorbs that write.
     @property

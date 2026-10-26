@@ -313,7 +313,7 @@ class TestCopyPageTable(unittest.TestCase):
         no plan table to copy and must fail loud, not fill garbage."""
         src = KVIndexTranslator(
             req_to_token=torch.zeros((2, 4), dtype=torch.int64),
-            token_to_kv_pool_allocator=SimpleNamespace(),
+            token_to_kv_pool_allocator=SimpleNamespace(hands_out_virtual_ids=False),
             token_to_kv_pool=SimpleNamespace(),
             page_size=1,
             device=_DEV,
@@ -634,7 +634,7 @@ class TestWriteIds(CustomTestCase):
         pool.translate_loc_from_full_to_swa = lambda t: t + 100
         src = KVIndexTranslator(
             req_to_token=torch.zeros((2, 4), dtype=torch.int64),
-            token_to_kv_pool_allocator=SimpleNamespace(),
+            token_to_kv_pool_allocator=SimpleNamespace(hands_out_virtual_ids=False),
             token_to_kv_pool=pool,
             page_size=1,
             device=_DEV,
@@ -657,7 +657,7 @@ class TestWriteIds(CustomTestCase):
         # id space to derive into.
         plain = KVIndexTranslator(
             req_to_token=torch.zeros((2, 4), dtype=torch.int64),
-            token_to_kv_pool_allocator=SimpleNamespace(),
+            token_to_kv_pool_allocator=SimpleNamespace(hands_out_virtual_ids=False),
             token_to_kv_pool=SimpleNamespace(),
             page_size=1,
             device=_DEV,

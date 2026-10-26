@@ -19,9 +19,6 @@ from lmcache.integration.sglang.unified_lmcache_mp_connector import (
     UnifiedLMCacheMPConnector,
 )
 
-from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
-    UnifiedSWAAllocatorBase,
-)
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     EvictParams,
@@ -502,7 +499,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             return full_indices
 
         tail_full_indices = full_indices[-swa_tail_tokens:]
-        if isinstance(allocator, UnifiedSWAAllocatorBase):
+        if allocator.hands_out_virtual_ids:
             # Unified-memory FULL and SWA share virtual page IDs.
             virtual_pages = torch.unique(tail_full_indices // self.page_size)
             try:

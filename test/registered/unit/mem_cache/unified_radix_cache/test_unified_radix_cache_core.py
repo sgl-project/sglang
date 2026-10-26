@@ -1920,6 +1920,7 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
     def test_apply_component_action_swa_recover_on_full_locked(self):
         cache = mock.MagicMock()
         alloc = cache.token_to_kv_pool_allocator
+        alloc.hands_out_virtual_ids = False
         kept_full = torch.tensor([1, 2], dtype=torch.int64)
         incoming_full = torch.tensor([3, 4], dtype=torch.int64)
         swa_value = torch.tensor([7, 8], dtype=torch.int64)

@@ -39,6 +39,10 @@ class MambaFullCacheDonor(Protocol):
 
 
 class BaseTokenToKVPoolAllocator(abc.ABC):
+    # Ids handed out index a virtual space the allocator translates to physical
+    # rows (a unified pool's chain), not the pool's rows themselves.
+    hands_out_virtual_ids = False
+
     @abc.abstractmethod
     def __init__(
         self,
@@ -64,6 +68,12 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     @property
     def size_full(self):
         return self.size
+
+    @property
+    def has_window_pool(self) -> bool:
+        """Whether a sliding-window pool sits beside the full-attention one,
+        with the window allocation surface (`free_swa`, `swa_available_size`, ...)."""
+        return False
 
     # -- scheduler-facing capacity hooks --
     # The scheduler calls these unconditionally, with no allocator-type branches
@@ -192,6 +202,11 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     def mamba_full_cache_donor(self) -> MambaFullCacheDonor | None:
         """Return the shared-pool donor capability, if this allocator has one."""
         return None
+
+    def mamba_slot_full_token_cost(self) -> int:
+        """Full-token equivalents of the shared bytes one state slot takes;
+        0 when state slots do not share bytes with the token pool."""
+        return 0
 
     def debug_print(self) -> str:
         return ""

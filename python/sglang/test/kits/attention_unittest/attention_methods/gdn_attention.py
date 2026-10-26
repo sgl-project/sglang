@@ -318,9 +318,11 @@ class MockGDNModelRunner(ModelRunner):
             enable_memory_saver=False,
             enable_alt_stream=False,
         )
+        # A static allocator: ids index the pools as they are.
         self.token_to_kv_pool_allocator = SimpleNamespace(
             page_size=case.page_size,
             get_kvcache=lambda: self.token_to_kv_pool,
+            hands_out_virtual_ids=False,
         )
         self.is_draft_worker = False
         self.init_kv_index_translator()

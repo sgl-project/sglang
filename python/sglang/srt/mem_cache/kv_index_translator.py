@@ -76,12 +76,6 @@ from sglang.kernels.ops.kvcache.kv_read_table import (
     build_kv_read_table_packed,
 )
 from sglang.srt.layers.dcp.layout import localize_dcp_indices
-from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
-    UnifiedSWAAllocatorBase,
-)
-from sglang.srt.mem_cache.allocator.unified_mamba import (
-    UnifiedMambaTokenToKVPoolAllocator,
-)
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.kv_loc_plan import (
@@ -134,10 +128,8 @@ class KVIndexTranslator:
         self.device = device
 
         is_unified_target = (
-            isinstance(
-                token_to_kv_pool_allocator,
-                (UnifiedMambaTokenToKVPoolAllocator, UnifiedSWAAllocatorBase),
-            )
+            token_to_kv_pool_allocator is not None
+            and token_to_kv_pool_allocator.hands_out_virtual_ids
             and token_to_kv_pool_allocator.get_kvcache() is token_to_kv_pool
         )
         host_allocator = fused_draft_host_allocator(token_to_kv_pool)
@@ -167,7 +159,7 @@ class KVIndexTranslator:
             routes_window_layers = is_unified_target or isinstance(
                 token_to_kv_pool, BaseSWAKVPool
             )
-            if isinstance(alloc, UnifiedSWAAllocatorBase) and routes_window_layers:
+            if alloc.has_window_pool and routes_window_layers:
                 # Straight from the virtual ids through the sliding-window
                 # sub-pool's own table.
                 self._spaces[IdSpaceKind.SLIDING_WINDOW] = IdSpace(

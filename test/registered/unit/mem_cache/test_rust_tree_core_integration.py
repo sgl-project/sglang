@@ -2384,6 +2384,8 @@ def _swa_transfer_core(
     )
     allocator.device = torch.device("cpu")
     allocator.swa_req_ring = False
+    allocator.hands_out_virtual_ids = unified
+    allocator.has_window_pool = True
     params = CacheInitParams(
         disable=False,
         req_to_token_pool=Mock(spec=HybridReqToTokenPool) if mamba else None,

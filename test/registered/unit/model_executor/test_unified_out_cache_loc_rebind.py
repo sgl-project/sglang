@@ -62,7 +62,7 @@ def _armed_source(v2p, swa_map):
     in test_kv_index_translator.py over the real allocator)."""
     src = KVIndexTranslator(
         req_to_token=torch.zeros((1, 4), dtype=torch.int64),
-        token_to_kv_pool_allocator=SimpleNamespace(),
+        token_to_kv_pool_allocator=SimpleNamespace(hands_out_virtual_ids=False),
         token_to_kv_pool=SimpleNamespace(),
         page_size=1,
         device=_DEV,

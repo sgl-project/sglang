@@ -57,12 +57,6 @@ from sglang.srt.mem_cache.allocator.swa import (
     SWATokenToKVPoolAllocator,
     is_swa_req_ring,
 )
-from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
-    UnifiedSWAAllocatorBase,
-)
-from sglang.srt.mem_cache.allocator.unified_mamba import (
-    UnifiedMambaTokenToKVPoolAllocator,
-)
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     DeepSeekV4TokenToKVPool,
     select_dsv4_kv_layout,
@@ -623,13 +617,7 @@ class KVCacheConfigurator:
         # pool must be sized by that space.
         draft_virtual_id_space: Optional[int] = None
         if self.is_draft_worker and token_to_kv_pool_allocator is not None:
-            if isinstance(
-                token_to_kv_pool_allocator,
-                (
-                    UnifiedMambaTokenToKVPoolAllocator,
-                    UnifiedSWAAllocatorBase,
-                ),
-            ):
+            if token_to_kv_pool_allocator.hands_out_virtual_ids:
                 alloc = token_to_kv_pool_allocator
                 placement = self._fused_draft_from_target_buffer(alloc)
                 if placement is not None:
@@ -683,13 +671,7 @@ class KVCacheConfigurator:
                 size_overrides = {
                     "max_total_num_tokens": draft_virtual_id_space,
                 }
-                if (
-                    isinstance(
-                        token_to_kv_pool_allocator,
-                        UnifiedSWAAllocatorBase,
-                    )
-                    and self.is_hybrid_swa
-                ):
+                if token_to_kv_pool_allocator.has_window_pool and self.is_hybrid_swa:
                     size_overrides["full_max_total_num_tokens"] = draft_virtual_id_space
                     if not self.is_hybrid_swa_mtp_draft or self.draft_swa_full_capacity:
                         size_overrides["swa_max_total_num_tokens"] = (
@@ -2782,10 +2764,8 @@ class KVCacheConfigurator:
                     swa_allocator = token_to_kv_pool_allocator.logical_attn_allocator
                 else:
                     swa_allocator = token_to_kv_pool_allocator
-                assert isinstance(swa_allocator, SWATokenToKVPoolAllocator)
-                uses_unified_virtual_ids = isinstance(
-                    swa_allocator, UnifiedSWAAllocatorBase
-                )
+                assert swa_allocator.has_window_pool
+                uses_unified_virtual_ids = swa_allocator.hands_out_virtual_ids
                 has_draft_swa_layers = (
                     not self.is_hybrid_swa_mtp_draft or self.draft_swa_full_capacity
                 )
