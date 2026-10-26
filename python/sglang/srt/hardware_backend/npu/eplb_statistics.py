@@ -26,23 +26,17 @@ from sglang.srt.hardware_backend.npu.eplb import get_eplb_device_group
 logger = logging.getLogger(__name__)
 
 
-class _NpuAccumulatorMixin:
+class NpuEplbCommunication:
+    """Resolve NPU statistics communication without changing accumulator classes."""
+
     # Resolve lazily so distributed initialization and WORLD replacement remain valid.
     @property
-    def _eplb_group(self):
+    def group(self):
         return get_eplb_device_group()
 
     @property
-    def _utilization_device(self):
+    def device(self):
         return distribution.get_device_namespace().device
-
-
-class NpuStatAccumulator(_NpuAccumulatorMixin, distribution._StatAccumulator):
-    pass
-
-
-class NpuDetailAccumulator(_NpuAccumulatorMixin, distribution._DetailAccumulator):
-    pass
 
 
 class NpuExpertDistributionRecorder(distribution._ExpertDistributionRecorderReal):
