@@ -84,6 +84,9 @@ from sglang.multimodal_gen.runtime.layers.linear import (
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
 )
+from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
+    RotaryEmbedding,
+)
 from sglang.multimodal_gen.runtime.layers.usp import _ring_attention_varlen
 from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 from sglang.multimodal_gen.runtime.managers.forward_context import (
@@ -591,16 +594,15 @@ def _apply_rope_qk(
     k: torch.Tensor,
     cos_sin_cache: torch.Tensor,
     positions: torch.Tensor,
+    *,
+    rotary_emb: RotaryEmbedding,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if not q.is_cuda:
         half = cos_sin_cache.shape[-1] // 2
-        cos_half, sin_half = cos_sin_cache.split(half, dim=-1)
-        cos = torch.cat((cos_half, cos_half), dim=-1).unsqueeze(1)
-        sin = torch.cat((sin_half, sin_half), dim=-1).unsqueeze(1)
-        return (
-            _apply_rope_cos_sin(q, cos, sin),
-            _apply_rope_cos_sin(k, cos, sin),
-        )
+        cos, sin = cos_sin_cache.split(half, dim=-1)
+        # forward_npu sends 3D q/k to forward_native; npu_rotary_mul needs BSND.
+        q, k = rotary_emb(query=q.unsqueeze(0), key=k.unsqueeze(0), cos=cos, sin=sin)
+        return q.squeeze(0), k.squeeze(0)
 
     from sgl_kernel import rotary_embedding as apply_sgl_kernel_rotary_embedding
 
@@ -1060,6 +1062,13 @@ class MiniMaxH3Attention(nn.Module):
             arch, quant_config, prefix=prefix, local_heads=self.num_heads
         )
 
+        self.rotary_emb = RotaryEmbedding(
+            head_size=self.head_dim,
+            rotary_dim=rope_dim,
+            is_neox_style=True,
+            use_precomputed_cache=False,
+        )
+
     def _set_attention_backend(self, backend) -> None:
         if (
             backend.get_enum() is AttentionBackendEnum.CUBE_SPARSE_ATTN
@@ -1394,7 +1403,9 @@ class MiniMaxH3Attention(nn.Module):
                     self.k_norm,
                     self.head_dim,
                 )
-                q, k = _apply_rope_qk(q, k, cos_sin_cache, positions)
+                q, k = _apply_rope_qk(
+                    q, k, cos_sin_cache, positions, rotary_emb=self.rotary_emb
+                )
 
         gate_compress = None
         if (
