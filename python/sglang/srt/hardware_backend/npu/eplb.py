@@ -44,7 +44,7 @@ class BatchedTopKStatisticsMixin:
         self._route_offsets = [0] * self._data.shape[0]
         self._batch_collected = False
         self._has_batched_routes = False
-        self._routes_dirty = False
+        logger.info("[NPU EPLB batch statistics] capacity=%d routes/layer", capacity)
 
     def on_graph_capture_forward_start(self):
         # Capture warmups bypass the normal reset. Reset offsets without
@@ -57,13 +57,11 @@ class BatchedTopKStatisticsMixin:
     def on_graph_replay_forward_start(self, has_batched_routes):
         # Graph replay does not call the Python on_select_experts hook.
         self._has_batched_routes |= has_batched_routes
-        self._routes_dirty |= has_batched_routes
 
     def reset(self):
         super().reset()
-        if self._routes_dirty:
+        if self._has_batched_routes:
             self._batched_routes.fill_(-1)
-            self._routes_dirty = False
         self._route_offsets = [0] * self._data.shape[0]
         self._batch_collected = False
         self._has_batched_routes = False
@@ -79,7 +77,6 @@ class BatchedTopKStatisticsMixin:
         self._route_offsets[layer_idx] = end
         if count:
             self._has_batched_routes = True
-            self._routes_dirty = True
 
     def collect(self):
         if self._has_batched_routes and not self._batch_collected:

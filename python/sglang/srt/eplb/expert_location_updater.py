@@ -163,10 +163,8 @@ def _update_expert_weights_raw(
         if not update_layer_ids:
             return {}
 
-    temp_buffers = create_temp_buffers(
-        routed_experts_weights_of_layer[update_layer_ids[0]]
-    )
     sample_tensors = routed_experts_weights_of_layer[update_layer_ids[0]]
+    temp_buffers = create_temp_buffers(sample_tensors)
     layer_buffers = None
     if any(needs_nd_staging(tensor) for tensor in sample_tensors):
         # Per-expert NZ conversion can copy the whole backing tensor.

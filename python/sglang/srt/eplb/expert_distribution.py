@@ -122,10 +122,7 @@ EPLB_BALANCEDNESS_WINDOW_SIZES = (10, 100, 1000)
 
 
 def _use_npu_sender_statistics():
-    return (
-        get_device_namespace().device == "npu"
-        and get_exec().moe.moe_a2a_backend == "deepep"
-    )
+    return get_device_namespace().device == "npu"
 
 
 @dataclass
@@ -460,14 +457,9 @@ class _SinglePassGatherer(ABC):
             if _use_npu_sender_statistics():
                 # Ascend receiver counts include graph padding; count valid
                 # sender routes instead.
-                gatherer = _NpuBatchedSelectExpertsSinglePassGatherer(
+                return _NpuBatchedSelectExpertsSinglePassGatherer(
                     expert_location_metadata, rank
                 )
-                logger.info(
-                    "[NPU EPLB batch statistics] capacity=%d routes/layer",
-                    gatherer._batched_routes.shape[1],
-                )
-                return gatherer
             if get_exec().moe.deepep_mode == "normal":
                 return _SelectExpertsSinglePassGatherer(expert_location_metadata, rank)
             elif get_exec().moe.deepep_mode == "low_latency":
