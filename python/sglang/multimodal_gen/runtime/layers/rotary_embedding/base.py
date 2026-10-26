@@ -280,8 +280,11 @@ class RotaryEmbedding(CustomOp):
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
+        # flashinfer's cos_sin_cache layout only holds half-width cos/sin.
+        has_full_width_table = cos is not None and cos.shape[-1] == self.rotary_dim
         support_cuda_style = (
             (cos_sin_cache is not None or cos is not None and sin is not None)
+            and not has_full_width_table
             and not self.use_precomputed_cache
             and query.dim() == 4
             and key.dim() == 4
