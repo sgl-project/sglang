@@ -122,7 +122,7 @@ from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
-from sglang.srt.lora.layers import ColumnParallelLinearWithLoRA
+from sglang.srt.lora.layers import BaseLayerWithLoRA, ColumnParallelLinearWithLoRA
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     embed_mm_inputs,
@@ -1350,10 +1350,13 @@ class MQALayer(MqaAttentionBase):
         self, q: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor | Mxfp8SwizzledInput]:
         # The indexer needs the BF16 normalized row; wq_b needs the quantized one.
+        # A LoRA wrapper takes the unquantized row: its adapter reads the input too.
+        if isinstance(self.wq_b, BaseLayerWithLoRA):
+            q = self.q_norm(q)
+            return q, q
         if _is_hip:
             return _hip.q_norm_for_wq_b(self, q)
-        # a LoRA-wrapped wq_b has no quant_method and takes the unquantized row
-        method = getattr(self.wq_b, "quant_method", None)
+        method = self.wq_b.quant_method
         if (
             _is_cuda
             and self.is_dsv41
@@ -2258,12 +2261,13 @@ class MQALayer(MqaAttentionBase):
                     # Other MXFP8 backends may share mutable GEMM workspace.
                     and (
                         _is_gfx95_supported
-                        or getattr(
-                            getattr(self.wq_b, "quant_method", None),
-                            "mxfp8_dense_backend",
-                            None,
+                        or (
+                            not isinstance(self.wq_b, BaseLayerWithLoRA)
+                            and getattr(
+                                self.wq_b.quant_method, "mxfp8_dense_backend", None
+                            )
+                            == Mxfp8DenseGemmBackend.FLASHINFER_CUTEDSL
                         )
-                        == Mxfp8DenseGemmBackend.FLASHINFER_CUTEDSL
                     )
                 )
             )
