@@ -740,6 +740,13 @@ class SchedulerDisaggregationPrefillMixin:
             )
         return enabled
 
+    def _war_barrier_is_coarse(self: Scheduler) -> bool:
+        # Same condition as Scheduler._apply_war_barrier's whole-forward fallback.
+        if not self._war_barrier_enabled:
+            return False
+        ev = self.model_worker.last_shared_read_runner.shared_read_done_event
+        return ev is None or envs.SGLANG_FORCE_COARSE_WAR_BARRIER.get()
+
     def _yield_gil_if_needed(self: Scheduler) -> None:
         if self.tp_size == 1:
             # No collective parks this thread at TP=1. A bounded sleep lets

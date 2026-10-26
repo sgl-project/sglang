@@ -2009,21 +2009,13 @@ class Scheduler(
         # Clearing matters: a phase that skips the publish then falls back to coarse.
         if not self._war_barrier_enabled:
             return
-        coarse = self._war_barrier_is_coarse()
         runner = self.model_worker.last_shared_read_runner
         ev = runner.shared_read_done_event
         runner.shared_read_done_event = None
-        if coarse:
-            self.schedule_stream.wait_stream(self.forward_stream)
-        else:
+        if ev is not None and not envs.SGLANG_FORCE_COARSE_WAR_BARRIER.get():
             self.schedule_stream.wait_event(ev)
-
-    def _war_barrier_is_coarse(self) -> bool:
-        """Whether the pending WAR barrier waits for the whole forward."""
-        if not self._war_barrier_enabled:
-            return False
-        ev = self.model_worker.last_shared_read_runner.shared_read_done_event
-        return ev is None or envs.SGLANG_FORCE_COARSE_WAR_BARRIER.get()
+        else:
+            self.schedule_stream.wait_stream(self.forward_stream)
 
     @DynamicGradMode()
     def event_loop_normal(self):
