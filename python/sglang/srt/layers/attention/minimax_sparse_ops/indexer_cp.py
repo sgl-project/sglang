@@ -177,9 +177,6 @@ class MiniMaxIndexerCP:
                 can_fuse_verify_topk,
             )
 
-            # Verify rows of the packed MSA-v1 pool through the fused verify indexer,
-            # every head's rows in one tile. Below the minimum the exchange costs more
-            # than three quarters of the index-K reads save.
             min_reqs = (
                 CP_MIN_VERIFY_REQS if self.exchange is None else CP_MIN_VERIFY_REQS_IPC
             )
@@ -188,6 +185,7 @@ class MiniMaxIndexerCP:
                 and packed_queries > 1
                 and q.shape[0] % packed_queries == 0
                 and q.shape[0] // packed_queries >= min_reqs
+                # the fused verify indexer scores all four heads' rows in one 32-row tile
                 and packed_queries * 4 <= 32
                 # the exchange's receive buffers hold CP_MAX_ROWS rows per head
                 and (self.exchange is None or q.shape[0] <= CP_MAX_ROWS)
