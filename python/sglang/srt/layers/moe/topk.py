@@ -1257,6 +1257,18 @@ def fused_topk(
     topk_ids = torch.empty(M, topk, dtype=torch.int32, device=hidden_states.device)
 
     if scoring_func == "softmax":
+        if correction_bias is not None:
+            # The bias is added to the softmax probabilities for selection only
+            # (ERNIE-4.5 moe_statics); the fused softmax kernels below take no bias.
+            topk_weights, topk_ids = fused_topk_torch_native(
+                hidden_states,
+                gating_output,
+                topk,
+                renormalize,
+                correction_bias=correction_bias,
+                scoring_func=scoring_func,
+            )
+            return topk_weights, topk_ids.to(torch.int32)
         use_rocm_triton = _use_rocm_triton_softmax_topk(
             hidden_states,
             gating_output,
