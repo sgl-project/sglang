@@ -144,7 +144,7 @@ export const agentx = {
   },
   "args": [
    ["--enable-unified-cache-external-linker"],
-   ["--hicache-storage-backend-extra-config", "{\"enable_group_semantics\":true}"],
+   ["--unified-cache-external-linker-config", "{\"enable_group_semantics\":true}"],
    ["--unified-cache-external-linker-backend", "mooncake"]
   ],
   "env": {
@@ -1260,7 +1260,7 @@ export const agentx = {
         ["--expert-parallel-size", "2"],
         ["--hicache-mem-layout", "page_first_direct"],
         ["--hicache-ratio", "1.02"],
-        ["--hicache-storage-backend-extra-config", "{\"enable_group_semantics\":true}"],
+        ["--unified-cache-external-linker-config", "{\"enable_group_semantics\":true}"],
         ["--max-running-requests", "128"],
         ["--mem-fraction-static", "0.85"],
         ["--model-loader-extra-config", "{\"enable_multithread_load\":true}"],

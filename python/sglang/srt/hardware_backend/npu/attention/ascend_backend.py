@@ -1143,8 +1143,11 @@ class AscendAttnBackend(AttentionBackend):
             elif forward_mode.is_decode_or_idle() and spec_info is not None:
                 max_len = max_seq_len_host + self.speculative_step_id + 1
             else:
-                # draft-extend (and any other spec mode) sees base + draft block
-                max_len = max_seq_len_host + self.speculative_num_draft_tokens
+                # Ordinary decode has no draft block. Only speculative modes
+                # reserve the extra query width beyond the supplied host bound.
+                max_len = max_seq_len_host
+                if spec_info is not None:
+                    max_len += self.speculative_num_draft_tokens
         if max_len is not None:
             max_seq_pages = (max_len + self.page_size - 1) // self.page_size
         else:
@@ -1189,24 +1192,6 @@ class AscendAttnBackend(AttentionBackend):
             metadata.swa_mask[bs:, :, :].fill_(True)
         if max_len is not None:
             # Dynamic-width gather: copy the reachable page range, zero the tail.
-            metadata.block_tables[:bs, :max_seq_pages].copy_(
-                self.req_to_token[req_pool_indices[:bs], 0 : max_len : self.page_size]
-                // self.page_size
-            )
-            metadata.block_tables[:bs, max_seq_pages:].fill_(0)
-        elif max_seq_len_host is not None:
-            # Mirrorless replay (e.g. DSA models): the scheduler publishes the
-            # host-side max of the page-aligned allocated seq lens (>= committed
-            # + alloc reserve, so it upper-bounds every readable length). Apply
-            # the same speculative offsets as the mirror branch above.
-            if forward_mode.is_target_verify() and not _is_dflash_verify(spec_info):
-                max_len = max_seq_len_host + self.speculative_num_draft_tokens
-            elif forward_mode.is_decode_or_idle() and spec_info is not None:
-                max_len = max_seq_len_host + self.speculative_step_id + 1
-            else:
-                # draft-extend (and any other spec mode) sees base + draft block
-                max_len = max_seq_len_host + self.speculative_num_draft_tokens
-            max_seq_pages = (max_len + self.page_size - 1) // self.page_size
             metadata.block_tables[:bs, :max_seq_pages].copy_(
                 self.req_to_token[req_pool_indices[:bs], 0 : max_len : self.page_size]
                 // self.page_size

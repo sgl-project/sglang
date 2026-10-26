@@ -81,7 +81,7 @@ from sglang.srt.mem_cache.utils import (
     set_mla_kv_scale_buffer_triton,
 )
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_platform
 from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
@@ -5820,8 +5820,12 @@ def get_minimax_sparse_index_dtype(
     *, fp8_attn_gemm: bool, kv_cache_dtype: torch.dtype, model_dtype: torch.dtype
 ) -> torch.dtype:
     """Return the index-K cache dtype; the pool's cell-size estimate must match it."""
-    # fp8 attn-GEMM mode runs the indexer GEMMs in fp8 too; plain fp8 KV keeps bf16.
-    if fp8_attn_gemm:
+    # fp8 attn-GEMM mode runs the indexer GEMMs in fp8 too. On Hopper, fp8_e4m3 KV
+    # also stores the index K in fp8 for the fp16-widened Triton decode; elsewhere
+    # plain fp8 KV keeps the index K in the model dtype.
+    if fp8_attn_gemm or (
+        _is_cuda and get_platform().is_sm90 and kv_cache_dtype == torch.float8_e4m3fn
+    ):
         return kv_cache_dtype
     if _is_gfx95_supported and envs.SGLANG_OPT_MINIMAX_M3_FP8_INDEX_CACHE.get():
         return torch.float8_e4m3fn
@@ -6164,19 +6168,27 @@ class MiniMaxSparseKVPool(KVCache):
         index_pool: MHATokenToKVPool,
         cache_k: torch.Tensor,
         cache_idx_k: torch.Tensor,
+        unit_scales: bool,
     ) -> bool:
-        """Fast-path precondition: CUDA, no per-store quantization, and a uniform
-        head byte size shared by main and index caches."""
+        """Fast-path precondition: CUDA, a raw copy or an unscaled bf16 -> fp8_e4m3
+        cast, and a uniform head byte size shared by main and index caches."""
         main = self.main_pool
-        return (
-            self.use_minimax_fused_kv_index_store
-            and _is_cuda
-            # No dtype conversion / fp8 scaling on either side (the fused kernel
-            # is a raw byte copy, it does not quantize).
-            and main.store_dtype == main.dtype
+        raw_copy = (
+            main.store_dtype == main.dtype
             and index_pool.store_dtype == index_pool.dtype
             and cache_k.dtype == main.dtype
             and cache_idx_k.dtype == index_pool.dtype
+        )
+        fp8_cast = (
+            unit_scales
+            and main.dtype == torch.float8_e4m3fn
+            and cache_k.dtype == torch.bfloat16
+            and cache_idx_k.dtype == torch.bfloat16
+        )
+        return (
+            self.use_minimax_fused_kv_index_store
+            and _is_cuda
+            and (raw_copy or fp8_cast)
             # Uniform head byte size collapses head_dim + dtype into one constant.
             and main.dtype == index_pool.dtype
             and main.head_dim == index_pool.head_dim
@@ -6202,10 +6214,16 @@ class MiniMaxSparseKVPool(KVCache):
         disable_value = cache_idx_v is None
         index_pool = self.index_k_pool if disable_value else self.index_kv_pool
 
+        scales = (k_scale, v_scale, idx_k_scale)
+        if not disable_value:
+            scales += (idx_v_scale,)
+        unit_scales = all(x is None or x == 1.0 for x in scales)
         if (
             index_pool is not None
             and not self._enable_hisparse
-            and self._can_fuse_kv_index_store(index_pool, cache_k, cache_idx_k)
+            and self._can_fuse_kv_index_store(
+                index_pool, cache_k, cache_idx_k, unit_scales
+            )
         ):
             from sglang.kernels.ops.kvcache.minimax_store_kv_index import store_kv_index
 
@@ -6232,12 +6250,9 @@ class MiniMaxSparseKVPool(KVCache):
             )
             return
 
-        # Fallback: separate stores (identical semantics; quantizes for fp8
-        # pools — the fused raw-byte path is disqualified there by
-        # _can_fuse_kv_index_store's dtype-equality checks). Scales use the
-        # None-means-unit convention throughout: MHATokenToKVPool.set_kv_buffer
-        # applies any non-None scale with an IN-PLACE div_ (extra kernel +
-        # caller-tensor mutation), which must not fire for unit scale.
+        # Separate stores handle layouts, dtypes, and scales unsupported by the
+        # fused copy / unit-scale bf16-to-fp8 cast. None denotes unit scale;
+        # non-None scales may divide the caller's tensors in place.
         self.set_kv_buffer(layer, loc, cache_k, cache_v, k_scale, v_scale)
         if disable_value:
             self.set_index_k_buffer(layer, loc, cache_idx_k, idx_k_scale)

@@ -45,6 +45,7 @@ from sglang.srt.entrypoints.openai import (
     encoding_dsv32,
 )
 from sglang.srt.entrypoints.openai.parallel_prompt_encode import (
+    encode_prompt_segments,
     parallel_prompt_encode,
 )
 from sglang.srt.entrypoints.openai.protocol import (
@@ -109,6 +110,7 @@ from sglang.srt.parser.jinja_template_utils import (
     MEDIA_URL_PART_TYPES,
     process_content_for_template_format,
 )
+from sglang.srt.parser.python_chat_template import render_chat_segments
 from sglang.srt.parser.reasoning_parser import (
     IQuestQ1ReasoningDetector,
     ReasoningParser,
@@ -249,6 +251,89 @@ def neutralize_kimi_k3_image_placeholder_value(value: Any) -> Any:
     return value
 
 
+_M3_THINKING_TYPES = ("adaptive", "enabled", "disabled")
+_M3_REASONING_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+
+
+def _validate_minimax_m3_request(request: ChatCompletionRequest) -> str | None:
+    """Request rules of the M3 serving contract that the chat template cannot enforce."""
+    thinking = request.thinking
+    if thinking is not None:
+        thinking_type = thinking.get("type") if isinstance(thinking, dict) else None
+        if thinking_type not in _M3_THINKING_TYPES:
+            return (
+                "thinking.type must be 'adaptive', 'enabled' or 'disabled', "
+                f"got {thinking_type!r}."
+            )
+    root_positions = [
+        position
+        for position, message in enumerate(request.messages)
+        if message.role == "root"
+    ]
+    if root_positions not in ([], [0]):
+        return "A root message must be the first message, and at most one is allowed."
+    return _tool_call_pairing_error(request.messages)
+
+
+def _tool_call_pairing_error(messages: list) -> str | None:
+    """Every assistant tool call is answered by exactly one following tool message,
+    unless that assistant message is the last one."""
+    pending: set[str] | None = None
+    unpaired_ids = False
+    for message in messages:
+        if message.role == "tool":
+            if unpaired_ids:
+                continue
+            if pending is None:
+                return (
+                    "A tool message must follow an assistant message with tool_calls."
+                )
+            if message.tool_call_id not in pending:
+                return (
+                    f"tool_call_id {message.tool_call_id!r} does not match an "
+                    "unanswered tool call."
+                )
+            pending.discard(message.tool_call_id)
+            continue
+        if pending:
+            return f"Tool calls {sorted(pending)} have no tool message answering them."
+        pending, unpaired_ids = None, False
+        if (
+            isinstance(message, ChatCompletionMessageGenericParam)
+            and message.role == "assistant"
+            and message.tool_calls
+        ):
+            call_ids = [call.id for call in message.tool_calls]
+            # Calls without ids cannot be paired; leave their results unchecked.
+            unpaired_ids = None in call_ids
+            pending = None if unpaired_ids else set(call_ids)
+    if pending and messages[-1].role == "tool":
+        return f"Tool calls {sorted(pending)} have no tool message answering them."
+    return None
+
+
+def _normalize_minimax_m3_request(request: ChatCompletionRequest) -> None:
+    """Map the thinking config and effort aliases onto what the M3 template reads."""
+    template_kwargs = dict(request.chat_template_kwargs or {})
+    # A template-kwargs effort would override the normalized one when rendering;
+    # entry points that skip the request conversion still carry it here.
+    kwargs_effort = template_kwargs.pop("reasoning_effort", None)
+    effort = (
+        request.reasoning_effort
+        if request.reasoning_effort is not None
+        else kwargs_effort
+    )
+    if request.thinking is not None:
+        template_kwargs.setdefault("thinking_mode", request.thinking["type"])
+    if effort in ("none", "minimal"):
+        template_kwargs.setdefault("thinking_mode", "disabled")
+    if template_kwargs.get("thinking_mode") == "disabled":
+        # An effort means nothing once thinking is off.
+        effort = None
+    request.reasoning_effort = effort if effort in _M3_REASONING_EFFORTS else None
+    request.chat_template_kwargs = template_kwargs
+
+
 def _extract_video_question(request: ChatCompletionRequest) -> str | None:
     """Return text paired with a video in the last user turn."""
     for message in reversed(request.messages or []):
@@ -339,6 +424,12 @@ class OpenAIServingChat(OpenAIServingBase):
             and hasattr(self.tokenizer_manager.model_config.hf_config, "model_type")
             and self.tokenizer_manager.model_config.hf_config.model_type
             in ("gemma4", "gemma4_unified")
+        )
+        self.is_minimax_m3 = (
+            hasattr(self.tokenizer_manager.model_config, "hf_config")
+            and hasattr(self.tokenizer_manager.model_config.hf_config, "model_type")
+            and self.tokenizer_manager.model_config.hf_config.model_type
+            == "minimax_m3_vl"
         )
 
         # Which Python-based chat encoder (if any) bypasses apply_chat_template.
@@ -478,6 +569,10 @@ class OpenAIServingChat(OpenAIServingBase):
             tool_call_parser=self.tool_call_parser,
         )
 
+    @property
+    def encoding_adapter(self) -> Optional[chat_encoding_adapters.ChatEncodingAdapter]:
+        return self._encoding_adapter
+
     def _build_chat_encoding_adapter(
         self,
     ) -> Optional[chat_encoding_adapters.ChatEncodingAdapter]:
@@ -519,7 +614,7 @@ class OpenAIServingChat(OpenAIServingBase):
         for message in request.messages:
             if (
                 isinstance(message, ChatCompletionMessageGenericParam)
-                and message.role in ("system", "developer")
+                and message.role in ("root", "system", "developer")
                 and message.tools
             ):
                 tools.extend(message.tools)
@@ -726,7 +821,10 @@ class OpenAIServingChat(OpenAIServingBase):
 
     @staticmethod
     def _sort_tool_message_run(
-        run: list[dict[str, Any]], tool_calls: list[dict[str, Any]]
+        run: list[dict[str, Any]],
+        tool_calls: list[dict[str, Any]],
+        *,
+        sort_text_runs: bool = False,
     ) -> list[dict[str, Any]]:
         """Order a tool-message run by tool_call position.
 
@@ -734,7 +832,8 @@ class OpenAIServingChat(OpenAIServingBase):
         tool_calls order; sorting the run upfront keeps extraction order and
         placeholder order the same. Runs the template itself would refuse to
         associate (missing/duplicate/unknown ids) are left untouched, as are
-        text-only runs, whose order text-only templates may rely on.
+        text-only runs, whose order text-only templates may rely on, unless
+        sort_text_runs is set for a template that pairs results by position.
         """
         if len(run) < 2:
             return run
@@ -756,14 +855,14 @@ class OpenAIServingChat(OpenAIServingBase):
             )
             for message in run
         )
-        if not has_media:
+        if not has_media and not sort_text_runs:
             return run
         position = {call_id: index for index, call_id in enumerate(call_ids)}
         return sorted(run, key=lambda message: position[message["tool_call_id"]])
 
     @classmethod
     def _canonicalize_tool_message_order(
-        cls, messages: list[dict[str, Any]]
+        cls, messages: list[dict[str, Any]], *, sort_text_runs: bool = False
     ) -> list[dict[str, Any]]:
         canonical = []
         index = 0
@@ -781,7 +880,11 @@ class OpenAIServingChat(OpenAIServingBase):
             ):
                 run.append(messages[index])
                 index += 1
-            canonical.extend(cls._sort_tool_message_run(run, tool_calls))
+            canonical.extend(
+                cls._sort_tool_message_run(
+                    run, tool_calls, sort_text_runs=sort_text_runs
+                )
+            )
         return canonical
 
     async def _generate_stream_content(
@@ -953,12 +1056,13 @@ class OpenAIServingChat(OpenAIServingBase):
         The reasoning parser is told the same thing, so channel-framed formats
         keep their framing intact exactly when a tool-call parser consumes it.
         """
-        return bool(
-            request.tool_choice != "none"
-            and self._effective_tools(request)
-            and self.tool_call_parser
-            and not request._response_parser_json_response_format
-        )
+        if not self.tool_call_parser or request._response_parser_json_response_format:
+            return False
+        if not self._effective_tools(request):
+            # With no tools declared, tool_choice only holds its default and limits nothing.
+            detector = FunctionCallParser.ToolCallParserEnum[self.tool_call_parser]
+            return detector.parses_without_tools()
+        return request.tool_choice != "none"
 
     def _validate_request(self, request: ChatCompletionRequest) -> str | None:
         """Validate that the input is valid."""
@@ -978,6 +1082,10 @@ class OpenAIServingChat(OpenAIServingBase):
         if request.return_sampling_mask and not request.return_meta_info:
             return "return_sampling_mask requires return_meta_info=true."
 
+        if self.is_minimax_m3:
+            m3_error = _validate_minimax_m3_request(request)
+            if m3_error:
+                return m3_error
         if request.return_flat_raw_output_top_logprobs and not request.return_meta_info:
             return "return_flat_raw_output_top_logprobs requires return_meta_info=true."
 
@@ -988,7 +1096,7 @@ class OpenAIServingChat(OpenAIServingBase):
         effective_tools = self._effective_tools(request)
         has_message_tools = any(
             isinstance(message, ChatCompletionMessageGenericParam)
-            and message.role in ("system", "developer")
+            and message.role in ("root", "system", "developer")
             and message.tools
             for message in request.messages
         )
@@ -1363,6 +1471,10 @@ class OpenAIServingChat(OpenAIServingBase):
         self, request: ChatCompletionRequest, is_multimodal: bool
     ) -> MessageProcessingResult:
         """Process chat messages and apply chat template"""
+        if self.is_minimax_m3:
+            # Settle the request's own thinking and effort first; server defaults
+            # only fill what it left unset.
+            _normalize_minimax_m3_request(request)
         if self.default_chat_template_kwargs:
             ctk = dict(request.chat_template_kwargs or {})
             for k, v in self.default_chat_template_kwargs.items():
@@ -1371,6 +1483,9 @@ class OpenAIServingChat(OpenAIServingBase):
             effort = ctk.get("reasoning_effort")
             if effort is not None and request.reasoning_effort is None:
                 request.reasoning_effort = effort
+
+        if self.is_minimax_m3:
+            _normalize_minimax_m3_request(request)
 
         normalize_hunyuan_reasoning_effort(
             request, self.reasoning_parser, self.template_manager.reasoning_config
@@ -1650,8 +1765,14 @@ class OpenAIServingChat(OpenAIServingBase):
                     prompt_ids, assistant_prefix
                 )
         else:
-            if self.template_manager.jinja_template_may_reorder_tool_results:
-                messages = self._canonicalize_tool_message_order(messages)
+            # The M3 template renders tool results by position, not by tool_call_id.
+            if (
+                self.template_manager.jinja_template_may_reorder_tool_results
+                or self.is_minimax_m3
+            ):
+                messages = self._canonicalize_tool_message_order(
+                    messages, sort_text_runs=self.is_minimax_m3
+                )
             for msg_dict in copy.deepcopy(messages):
                 if msg_dict.get("content") is None:
                     msg_dict["content"] = ""
@@ -1812,17 +1933,32 @@ class OpenAIServingChat(OpenAIServingBase):
                 **template_kwargs,
             )
         else:
-            rendered_prompt = self.tokenizer_manager.tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True,
-                tools=tools,
-                return_dict=False,
-                **template_kwargs,
-            )
-            prompt_ids = parallel_prompt_encode(
-                self.tokenizer_manager.tokenizer, rendered_prompt, encode_kwargs
-            )
+            segments = None
+            if self.template_manager.python_chat_template is not None:
+                segments = render_chat_segments(
+                    self.tokenizer_manager.tokenizer,
+                    self.template_manager.python_chat_template,
+                    messages,
+                    tools=tools,
+                    add_generation_prompt=True,
+                    template_kwargs=template_kwargs,
+                )
+            if segments is not None:
+                prompt_ids = encode_prompt_segments(
+                    self.tokenizer_manager.tokenizer, segments, encode_kwargs
+                )
+            else:
+                rendered_prompt = self.tokenizer_manager.tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    tools=tools,
+                    return_dict=False,
+                    **template_kwargs,
+                )
+                prompt_ids = parallel_prompt_encode(
+                    self.tokenizer_manager.tokenizer, rendered_prompt, encode_kwargs
+                )
         decoded_prompt = (
             self.tokenizer_manager.tokenizer.decode(prompt_ids)
             if cache_key is not None

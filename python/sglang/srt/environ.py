@@ -419,6 +419,7 @@ class Envs:
     SGLANG_TEST_CRASH_AFTER_STREAM_OUTPUTS = EnvInt(0)
     SGLANG_TEST_REQUEST_TIME_STATS = EnvBool(False)
     SGLANG_TEST_DISAGG_FAILURE_PROB = EnvFloat(0.0)
+    SGLANG_TEST_DISAGG_KV_CHECKSUM_MISMATCH_PROB = EnvFloat(0.0)
     SGLANG_TEST_RETRACT = EnvBool(False)
     SGLANG_TEST_RETRACT_INTERVAL = EnvInt(3)
     SGLANG_TEST_RETRACT_NO_PREFILL_BS = EnvInt(2**31)
@@ -612,6 +613,11 @@ class Envs:
     # HND KV layout folds (page, head) into one paged index for per-kv-head sparse
     # page tables (DP attn); paged backends like trtllm_mha consume it directly.
     SGLANG_USE_HND_KVCACHE = EnvBool(False)
+    # --enable-kv-cache-sharding: register single-node prefix gather scratch
+    # as NCCL symmetric memory and request copy engines on its dedicated
+    # communicator. Leave NCCL_CTA_POLICY unset to preserve per-comm policies.
+    # The engine defaults NCCL cuMem on for eligible single-node deployments.
+    SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER = EnvBool(True)
 
     # Attention (aiter, ROCm): route NEXTN spec draft_extend (EAGLE-v2 KV
     # catch-up) through aiter unified_attention (GQA-packed + split-KV) instead
@@ -977,6 +983,13 @@ class Envs:
     # (matches `gate_mode="separated"`, the layout used by gptoss_fp4 tuned
     # configs and by Mxfp4MoEMethod's post-fix weight shuffle).
     SGLANG_USE_AITER_MOE_GU_ITLV = EnvBool(True)
+    # gfx1250 GPT-OSS W4A8 MoE (aiter moe_gemm_a8w4): backend of both expert
+    # GEMMs. "" lets aiter choose (gluon on gfx1250); "triton" or "gluon" forces one.
+    SGLANG_GFX1250_W4A8_BACKEND = EnvStr("")
+    # gfx1250 GPT-OSS W4A8 MoE: GEMM 1 gathers its fp8 activation rows in-kernel
+    # instead of a torch gather of num_tokens * topk bf16 rows. Needs
+    # SGLANG_GFX1250_W4A8_BACKEND=triton; expert parallelism keeps the torch gather.
+    SGLANG_GFX1250_W4A8_KERNEL_GATHER = EnvBool(False)
     # aiter opus moe_sorting dispatch policy (0 auto, 1 oneshot, 2 multi-phase). Auto picks
     # oneshot below ~24 tokens, which on gfx950 costs 11-16 us vs 6-7 us for multi-phase at
     # E=385 / 129; outputs are identical and multi-phase is never slower up to 16384 tokens.
@@ -1092,6 +1105,12 @@ class Envs:
     # Ascend NPU
     # ===================================================================
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
+    # Requantize plain block-FP8 (fp32-scale) checkpoints to MXFP8 at load
+    # time so arch35 (Atlas A5) dense linears run on the native quantized
+    # GEMM instead of the Triton emulation path. Lossy (128x128 fp32 block
+    # scales -> 1x32 UE8M0): off by default; enable explicitly for
+    # performance after validating accuracy for the workload.
+    SGLANG_NPU_ARCH35_REQUANT_BLOCK_FP8 = EnvBool(False)
     SGLANG_NPU_USE_MULTI_STREAM = EnvBool(False)
     # Kimi-K3 attention-TP shared experts: overlap AG / MLP / RS with the
     # routed front / DeepEP dispatch / routed GEMMs, respectively.
@@ -1575,7 +1594,7 @@ class Envs:
     # set False to fall back to the per-image loop.
     SGLANG_VIT_ENABLE_VECTORIZED_POS_EMBED = EnvBool(True)
     SGLANG_MM_SKIP_COMPUTE_HASH = EnvBool(False)
-    # Supported by Kimi-K2.5 image and Cosmos3 V2V frame preprocessing.
+    # Supported by Kimi-K2.5 and native diffusion RGB input preprocessing.
     SGLANG_FORCE_CPU_IMAGE_PREPROCESSING = EnvBool(False)
     # For pre-tokenized (list[int]) multimodal prompts,
     # preserve the user's original tokens to avoid retokenization drift.
