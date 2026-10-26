@@ -194,7 +194,8 @@ def _m31_gfx950_moe_and_all_reduce(cfg: Any) -> None:
         or int(os.environ.get("ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16", 1)) == 0
     ):
         return
-    # the JIT build is bit-identical to sgl-kernel's, and faster at TP4
+    # the JIT build is faster at TP4; it matches sgl-kernel's bitwise at the level it runs,
+    # which for INT4 is INT8 below 64 MiB
     if not envs.SGLANG_ROCM_QUICK_ALL_REDUCE_JIT.is_set():
         envs.SGLANG_ROCM_QUICK_ALL_REDUCE_JIT.set(True)
     if envs.SGLANG_ROCM_QUICK_ALL_REDUCE_JIT.get():
