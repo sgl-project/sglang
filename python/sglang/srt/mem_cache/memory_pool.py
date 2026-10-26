@@ -392,6 +392,7 @@ class ReqToTokenPool:
     mamba_pool: Optional[MambaPool] = None
     mamba_allocator = None
     mamba_ckpt_pool = None
+    state: Optional[StateStorage] = None
 
     def __init__(
         self,
@@ -1628,17 +1629,6 @@ class HybridReqToTokenPool(ReqToTokenPool):
     def bind_state_routes(self, router: KVLayerRouter) -> None:
         self.state.bind_routes(router)
 
-    # For chunk prefill req, we do not need to allocate mamba cache,
-    # We could use allocated mamba cache instead.
-    def alloc(self, reqs: List[Req]) -> Optional[List[int]]:
-        fresh_req_rows = [req.kv.req_pool_idx is None for req in reqs]
-        select_index = super().alloc(reqs)
-        if select_index is None:
-            return None
-
-        self.state.acquire(self, reqs, select_index, fresh_req_rows)
-        return select_index
-
     def get_mamba_indices(self, req_indices: torch.Tensor) -> torch.Tensor:
         return self.req_index_to_mamba_index_mapping[req_indices]
 
@@ -1690,7 +1680,10 @@ class HybridReqToTokenPool(ReqToTokenPool):
         return req.kv.mamba_last_track_idx
 
     def _alloc_ping_pong_buffer(self, req: Req):
-        self.state.alloc_ping_pong_buffer(self, req)
+        assert self.state.alloc_ping_pong_buffer(self, req), (
+            "Not enough space for mamba ping pong idx, "
+            "try to increase --mamba-full-memory-ratio."
+        )
 
     def set_mamba_ping_pong_slot(self, req: Req, idx: int, value):
         """Update a ping-pong slot value and sync the device-side mapping.

@@ -20,6 +20,10 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
 
 
+class StateSlotsExhausted(RuntimeError):
+    """No state slot was left for a request that was admitted for one."""
+
+
 class StateStorage:
     """The state sub-pool's storage, its slot allocator and its layer map."""
 
@@ -111,15 +115,21 @@ class StateStorage:
 
         mamba_indices: list[torch.Tensor] = []
         mamba_ping_pong_track_buffers: list[torch.Tensor] = []
+        # What this call hands out, given back if a later request finds no slot.
+        given_state: list[Req] = []
+        given_tracking: list[Req] = []
         for req in reqs:
             if req.kv.holds_mamba:  # for radix cache / continuing chunked
                 pass
             else:
                 mid = self.slots.alloc(1)
-                assert mid is not None, (
-                    f"Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size. {mid=}, {self.pool.size=}, {self.slots.available_size()=}, {len(reqs)=}"
-                )
+                if mid is None:
+                    self._give_back(given_state, given_tracking)
+                    raise StateSlotsExhausted(
+                        f"Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size. {mid=}, {self.pool.size=}, {self.slots.available_size()=}, {len(reqs)=}"
+                    )
                 req.kv.mamba_pool_idx = mid[0]
+                given_state.append(req)
                 req.kv.mamba_needs_clear = True
                 # GDN ReplaySSM: a freshly (re)assigned slot starts an empty
                 # ring. write_pos=0 means "ring empty", so the decode kernel
@@ -130,7 +140,13 @@ class StateStorage:
             mamba_indices.append(req.kv.mamba_pool_idx)
             if table.enable_mamba_extra_buffer:
                 if req.kv.mamba_ping_pong_track_buffer is None:
-                    self.alloc_ping_pong_buffer(table, req)
+                    if not self.alloc_ping_pong_buffer(table, req):
+                        self._give_back(given_state, given_tracking)
+                        raise StateSlotsExhausted(
+                            "Not enough space for mamba ping pong idx, "
+                            "try to increase --mamba-full-memory-ratio."
+                        )
+                    given_tracking.append(req)
                 mamba_ping_pong_track_buffers.append(
                     req.kv.mamba_ping_pong_track_buffer
                 )
@@ -151,18 +167,17 @@ class StateStorage:
                 ping_pong_tensor
             )
 
-    def alloc_ping_pong_buffer(self, table, req: Req) -> None:
-        """Allocate the ping-pong track buffer for a new request.
+    def alloc_ping_pong_buffer(self, table, req: Req) -> bool:
+        """Allocate the ping-pong track buffer for a new request; False when
+        too few slots are left.
 
         Lazy mode allocates 1 slot with the second set to -1 (allocated
         on demand at track boundaries). Normal mode allocates all slots upfront.
         """
         n = table.mamba_initial_tracking_slots
         slots = self.slots.alloc(n)
-        assert slots is not None, (
-            "Not enough space for mamba ping pong idx, "
-            "try to increase --mamba-full-memory-ratio."
-        )
+        if slots is None:
+            return False
         buf = torch.full(
             (table.mamba_ping_pong_track_buffer_size,),
             -1,
@@ -181,6 +196,24 @@ class StateStorage:
             if table.enable_mamba_extra_buffer_lazy
             else table.get_mamba_ping_pong_other_idx(0)
         )
+        return True
+
+    def _give_back(self, given_state: List[Req], given_tracking: List[Req]) -> None:
+        """Undo a failed `acquire`: the state and tracking slots it handed out."""
+        for req in given_state:
+            self.slots.free(req.kv.mamba_pool_idx.unsqueeze(0))
+            req.kv.mamba_pool_idx = None
+            req.kv.mamba_needs_clear = False
+        for req in given_tracking:
+            buf = req.kv.mamba_ping_pong_track_buffer
+            for position, empty in enumerate(req.kv.mamba_ping_pong_empty):
+                if not empty:
+                    self.slots.free(buf[position : position + 1])
+            req.kv.mamba_ping_pong_track_buffer = None
+            req.kv.mamba_ping_pong_empty = None
+            req.kv.mamba_next_track_idx = None
+            req.kv.mamba_last_track_idx = None
+            req.kv.mamba_prev_track_seqlen = None
 
     def release(
         self,

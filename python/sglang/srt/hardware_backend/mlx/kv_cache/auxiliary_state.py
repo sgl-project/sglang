@@ -218,7 +218,12 @@ class MlxAuxiliaryStatePool:
 
 class MlxAuxiliaryStateStorage(StateStorage):
     """The auxiliary-state slots, as the radix cache's state component reaches
-    them through the token allocator. Release keeps the MLX table's rules."""
+    them through the token allocator. The MLX table binds a request's slot when
+    it binds the row, and release keeps the MLX table's rules."""
+
+    def acquire(self, table, reqs, rows, fresh_rows) -> None:
+        """Nothing left to bind: the MLX table's ``alloc`` gave each request
+        its auxiliary slot, or kept the one it holds, with its row."""
 
     def release(self, table, req, mamba_ping_pong_track_buffer_to_keep=None):
         table.free_mamba_cache(req, mamba_ping_pong_track_buffer_to_keep)

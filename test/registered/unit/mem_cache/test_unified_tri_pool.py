@@ -35,6 +35,7 @@ from sglang.srt.mem_cache.allocator.unified_sub_pool import (
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
 from sglang.srt.mem_cache.kv.alloc.pricing import float_fit
+from sglang.srt.mem_cache.kv.lifecycle import acquire
 from sglang.srt.mem_cache.layout.fused_draft import (
     DenseDraftRegion,
     DraftStateGeometry,
@@ -1225,7 +1226,7 @@ class TestTriFactorySizing(unittest.TestCase):
                 mapping = pool.req_index_to_mamba_ping_pong_track_buffer_mapping
                 allocator = pool.mamba_allocator
                 reqs = [SimpleNamespace(kv=ReqKvInfo()) for _ in range(3)]
-                rows = pool.alloc(reqs)
+                rows = acquire(pool, pool.state, reqs)
 
                 def buffers():
                     return [

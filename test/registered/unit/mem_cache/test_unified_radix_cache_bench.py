@@ -31,6 +31,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     TreeLock,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.kv.lifecycle import acquire
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components.base import ComponentType
@@ -258,7 +259,7 @@ def create_bench_cache(
             sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
         )
         _rid[0] += 1
-        req_to_token_pool.alloc([req])
+        acquire(req_to_token_pool, req_to_token_pool.state, [req])
         return req
 
     return tree, allocator, req_to_token_pool, make_req

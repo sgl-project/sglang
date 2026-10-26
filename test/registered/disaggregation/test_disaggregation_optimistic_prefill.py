@@ -27,6 +27,7 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.kv.lifecycle import acquire
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components.base import ComponentType
@@ -453,7 +454,7 @@ class TestOptimisticPrefillMambaRetryRelease(CustomTestCase):
             origin_input_ids=array("q", self.PROMPT),
             sampling_params=SamplingParams(max_new_tokens=1),
         )
-        req_to_token_pool.alloc([req])
+        acquire(req_to_token_pool, req_to_token_pool.state, [req])
         kv_indices = allocator.alloc(len(self.PROMPT))
         req_to_token_pool.write(
             (req.kv.req_pool_idx, slice(0, len(self.PROMPT))), kv_indices

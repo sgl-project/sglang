@@ -705,7 +705,7 @@ class MambaComponent(TreeComponent):
                 )
                 if insert_value_unused:
                     self._free_mamba_value(insert_params.mamba_value)
-                pool.free_mamba_cache(req)
+                self.cache.token_to_kv_pool_allocator.state.release(pool, req)
                 return
 
             if self.cache.enable_mamba_extra_buffer:
@@ -714,13 +714,13 @@ class MambaComponent(TreeComponent):
                     insert_params.mamba_keep_idx if insert_params is not None else None
                 )
                 keep_idx = prepared_keep_idx if mamba_value_inserted else None
-                pool.free_mamba_cache(
-                    req, mamba_ping_pong_track_buffer_to_keep=keep_idx
+                self.cache.token_to_kv_pool_allocator.state.release(
+                    pool, req, mamba_ping_pong_track_buffer_to_keep=keep_idx
                 )
                 return
 
             if not mamba_value_inserted:
-                pool.free_mamba_cache(req)
+                self.cache.token_to_kv_pool_allocator.state.release(pool, req)
         else:
             if insert_params.mamba_value is not None and (
                 insert_result is None or insert_result.mamba_exist

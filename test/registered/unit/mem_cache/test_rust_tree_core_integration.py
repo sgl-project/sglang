@@ -52,6 +52,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PoolTransferResult,
 )
+from sglang.srt.mem_cache.kv.lifecycle import acquire
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.rust_tree_core.adapter import (
@@ -5590,7 +5591,7 @@ def test_finished_request_prompt_priority_saturates_at_int64_max(priority):
     )
     req.output_ids = array("q", [4, 5])
     req.finished_reason = "finished"
-    (req.kv.req_pool_idx,) = req_to_token_pool.alloc([req])
+    (req.kv.req_pool_idx,) = acquire(req_to_token_pool, req_to_token_pool.state, [req])
     req.lock = cache.lock(cache.root_node_handle())
     indices = allocator.alloc(5)
     assert indices is not None

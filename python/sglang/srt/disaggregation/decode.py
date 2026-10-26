@@ -113,6 +113,7 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from sglang.srt.mem_cache.kv.lifecycle import acquire
 from sglang.srt.mem_cache.kv_cache_builder import decode_retraction_max_tokens
 from sglang.srt.mem_cache.memory_pool import (
     HybridReqToTokenPool,
@@ -1050,7 +1051,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 break
 
             if not ensure_mamba_capacity(
-                self.req_to_token_pool, [req], self.tree_cache
+                self.req_to_token_pool,
+                self.token_to_kv_pool_allocator.state,
+                [req],
+                self.tree_cache,
             ):
                 break
 
@@ -1490,7 +1494,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             # Reserve enough Mamba capacity for radix COW and tracking buffers
             # before prefix matching can bind state or lock cached entries.
             if not ensure_mamba_capacity(
-                self.req_to_token_pool, [decode_req.req], self.tree_cache
+                self.req_to_token_pool,
+                self.token_to_kv_pool_allocator.state,
+                [decode_req.req],
+                self.tree_cache,
             ):
                 break
 
@@ -2263,7 +2270,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if total_prefix_len is None:
             total_prefix_len = prefix_len
 
-        req_pool_indices = self.req_to_token_pool.alloc([req])
+        req_pool_indices = acquire(
+            self.req_to_token_pool, self.token_to_kv_pool_allocator.state, [req]
+        )
 
         assert req_pool_indices is not None, (
             "req_pool_indices is full! There is a bug in memory estimation."
