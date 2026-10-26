@@ -721,13 +721,18 @@ class AscendAttnBackend(AttentionBackend):
             metadata.seq_lens_cpu_list = local_seq_lens_cpu.tolist()
             if forward_batch.forward_mode.is_target_verify():
                 query_len = int(forward_batch.spec_info.draft_token_num)
-                metadata.dcp_spec_seq_lens = get_dcp_chain_spec_lens(
-                    global_kv_lens_cpu,
-                    query_len,
-                    self.dcp_size,
-                    self.dcp_rank,
-                    interleave_size=self.page_size,
-                ).to(device=self.device, dtype=torch.int32)
+                # Pinned Host storage keeps this async copy from waiting on NPU work.
+                metadata.dcp_spec_seq_lens = (
+                    get_dcp_chain_spec_lens(
+                        global_kv_lens_cpu,
+                        query_len,
+                        self.dcp_size,
+                        self.dcp_rank,
+                        interleave_size=self.page_size,
+                    )
+                    .pin_memory()
+                    .to(device=self.device, dtype=torch.int32, non_blocking=True)
+                )
                 # FIA checks S2 against the full paged capacity, not just valid KV.
                 required_mask_width = metadata.block_tables.shape[1] * self.page_size
                 metadata.dcp_mtp_attn_mask = build_mla_dcp_mtp_mask(
