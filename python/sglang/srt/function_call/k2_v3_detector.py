@@ -522,6 +522,14 @@ class K2V3Detector(BaseFormatDetector):
             # and JSON values have already been decoded with their true type.
             schema_type = schema.get("type")
             if "anyOf" in schema or "oneOf" in schema:
+                variants = [
+                    cls._resolve_local_ref(variant, root_schema)
+                    for variant in schema.get("anyOf") or schema.get("oneOf") or []
+                ]
+                non_null = [v for v in variants if not (v and v.get("type") == "null")]
+                # Optional[X] has one real branch, so this is not a guess.
+                if len(non_null) == 1 and non_null[0]:
+                    return infer_type_from_json_schema(non_null[0])
                 return None
             if (
                 isinstance(schema_type, list)
@@ -542,6 +550,9 @@ class K2V3Detector(BaseFormatDetector):
         inline_type: Optional[str] = None,
         from_text: bool,
     ) -> Any:
+        # An explicit null is a value, not text to coerce to the schema type.
+        if value is None or inline_type == "null":
+            return None
         target_type = cls._argument_type(tool_name, argument_name, tools) or inline_type
         if target_type == "any":
             return value
