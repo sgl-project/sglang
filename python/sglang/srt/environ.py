@@ -2056,12 +2056,12 @@ class Envs:
     SGLANG_MINIMAX_M3_FUSED_MOE_COMBINE = EnvBool(False)
 
     # MiniMax-M3 sparse-attention toggles for ROCm.
-    # Share one index top-k across every N sparse layers; 1 disables sharing.
-    # Changes which KV blocks the skip layers attend, so it applies on ROCm only
-    # (never under two-batch overlap); elsewhere the backend pins 1.
-    # 2 is the accuracy-safe default: higher values reuse staler selections
-    # in the skip layers.
-    SGLANG_MINIMAX_M3_INDEX_TOPK_FREQ = EnvInt(2)
+    # Share one index top-k across every N sparse layers; 1 (default) disables
+    # sharing so every sparse layer computes its own selection. Values > 1 are a
+    # lossy opt-in: skip layers attend KV blocks chosen by an earlier layer.
+    # Only honored on ROCm gfx95 without two-batch overlap; elsewhere the
+    # backend pins 1.
+    SGLANG_MINIMAX_M3_INDEX_TOPK_FREQ = EnvInt(1)
     # Opt-in gfx950 TP4 decode indexer context partitioning. Keeps the index
     # cache replicated; gathers Q and exchanges local top-k candidates.
     SGLANG_MINIMAX_M3_INDEXER_CP = EnvBool(False)
