@@ -4053,7 +4053,7 @@ class DeepseekV4AttnBackend(
     ):
         """One full top-k layer at an eager break of the prefill graph, over the live
         batch at any context length: writes the sparse indices the attention break
-        reads, and the candidate source its table for the captured consumers."""
+        reads and, for the candidate source, the table the captured consumers read."""
         indexer = layer.indexer
         real = forward_batch.global_num_token_non_padded_cpu
         if real is None:

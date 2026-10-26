@@ -222,11 +222,9 @@ class SparseTableBackend:
     def prefill_graph_table(
         self, layer_id: int, compress_ratio: int, num_rows: int, device: torch.device
     ) -> tuple:
-        """The candidate source's table over the graph's ``num_rows`` rows, as views
-        of the layer's buffers that `publish_prefill_graph` writes. Buckets share
-        them, sized by the largest: graphs replay one at a time, and DeepGEMM finds
-        the schedule's entries from its header, so bytes past a smaller bucket's
-        schedule are never read."""
+        """Views over ``num_rows`` rows of the layer's table buffers, which every
+        bucket shares: graphs replay one at a time, and DeepGEMM finds schedule
+        entries from its header, so a smaller bucket never reads past its own."""
         bufs = self._graph_table_bufs.get(layer_id)
         if bufs is None or bufs[0].shape[0] < num_rows:
             assert not torch.cuda.is_current_stream_capturing(), (
@@ -240,9 +238,8 @@ class SparseTableBackend:
                 (num_rows, self.topk_blocks), dtype=torch.int32, device=device
             )
             zeros = torch.zeros(num_rows, dtype=torch.int32, device=device)
-            # Sized by DeepGEMM itself on an empty table: the size follows the rows,
-            # topk_blocks, the q dtype (int8, the packed FP4 of quantize_index_q)
-            # and the SM count. The real page size reuses the real JIT kernel.
+            # DeepGEMM sizes the schedule by rows, topk_blocks, the q dtype (packed
+            # FP4 as int8) and SMs; the real page size reuses the real JIT kernel.
             schedule = build_sparse_indexer_schedule(
                 blocks,
                 zeros,
