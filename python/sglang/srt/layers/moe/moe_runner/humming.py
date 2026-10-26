@@ -838,7 +838,18 @@ def fused_experts_none_to_humming(
         gemm_type=get_standard_humming_moe_gemm_type(),
     )
 
-    runner_core = HummingRunnerCore(runner_config)
+    # ``humming_moe_runner_core_run`` resolves the runner through
+    # ``HummingRunnerCore.runner_cores[id(self)]`` and torch.compile bakes that
+    # id into the graph. A per-call core would be dropped right after this call
+    # (the registry is a WeakValueDictionary), so a replayed graph could miss
+    # the entry or resolve an unrelated runner, leaving ``layer`` unset. Keep
+    # one core per layer and bind the layer eagerly.
+    runner_core = getattr(quant_info.layer, "_humming_standard_runner_core", None)
+    if runner_core is None:
+        runner_core = HummingRunnerCore(runner_config)
+        runner_core.layer = quant_info.layer
+        quant_info.layer._humming_standard_runner_core = runner_core
+
     runner_output = runner_core.run(runner_input, quant_info, {})
 
     return StandardCombineInput(hidden_states=runner_output.hidden_states)
