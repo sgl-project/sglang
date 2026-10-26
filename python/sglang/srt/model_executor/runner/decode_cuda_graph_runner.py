@@ -774,13 +774,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
     @staticmethod
     def _forward_is_dp_local(model_runner) -> bool:
-        """The DSpark dense draft runs attn-TP-local (draft_tp_context): each
+        """The DFlash family dense draft runs attn-TP-local (draft_tp_context): each
         DP rank drafts independently with no cross-DP collective, so its
         hand-built batches carry no dp-global metadata and must key graphs by
         local batch size. Everything else keeps the dp-global padding path."""
         if not model_runner.is_draft_worker:
             return False
-        if not model_runner.spec_algorithm.is_dspark():
+        if not model_runner.spec_algorithm.is_dflash_family():
             return False
         from sglang.srt.speculative.dspark_components.dspark_config import (
             draft_is_deepseek_v4,
@@ -1167,6 +1167,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.capture_hidden_mode = get_required_capture_hidden_mode(
             self.capture_hidden_mode,
             spec_info,
+        )
+        self._capture_custom_mask = (
+            spec_info.custom_mask if spec_info is not None else None
         )
 
         if self.model_runner.lora_manager is not None:
@@ -1677,7 +1680,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             and forward_batch.forward_mode.is_idle()
             and forward_batch.spec_info is not None
         ):
-            forward_batch.spec_info.custom_mask = buffers.custom_mask
+            # Idle replay uses the same mask mode as capture.
+            forward_batch.spec_info.custom_mask = self._capture_custom_mask
 
         self._init_replay_attn_metadata(
             forward_batch,

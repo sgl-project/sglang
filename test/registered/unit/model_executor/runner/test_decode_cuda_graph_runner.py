@@ -35,6 +35,8 @@ from sglang.srt.model_executor.runner import decode_cuda_graph_runner as mod
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
 )
+from sglang.srt.runtime_context import get_context
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import profile_utils as putils
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -536,6 +538,103 @@ class TestReplayAttnMetadataWiring(CustomTestCase):
         glue = _RecordingGlue(captured_keys=[key])
         views, eager = self._replay(glue, raw_bs=1)
         self.assertEqual((glue.calls, eager), ([], views))
+
+
+class TestDPIdleReplay(CustomTestCase):
+    def _runner(self, algorithm, capture_mask):
+        runner = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
+        runner.model_runner = SimpleNamespace(
+            spec_algorithm=algorithm,
+            is_draft_worker=False,
+            hisparse_coordinator=None,
+        )
+        runner.buffers = SimpleNamespace(
+            custom_mask=(
+                torch.ones(64, dtype=torch.bool)
+                if capture_mask is None
+                else capture_mask
+            ),
+            num_token_non_padded=None,
+        )
+        runner._capture_custom_mask = capture_mask
+        runner.capture_forward_mode = mod.ForwardMode.TARGET_VERIFY
+        runner.capture_hidden_mode = mod.CaptureHiddenMode.FULL
+        runner.captured_req_width = 8
+        runner.capture_bs = [1, 2, 4, 8]
+        runner.max_bs = 8
+        runner.num_dp_ranks = 2
+        runner.require_mlp_tp_gather = True
+        runner.require_mlp_sync = True
+        runner.require_attn_tp_gather = False
+        runner.dllm_uses_input_embeds = False
+        runner.dllm_input_preparation = None
+        runner.ragged_verify_mode = False
+        runner.disable_padding = False
+        runner.enable_pdmux = False
+        runner.enable_two_batch_overlap = False
+        runner.is_encoder_decoder = False
+        runner.record_nolora_graph = False
+        runner.attention_graph_variants = None
+        runner._early_verify_metadata = None
+        runner._skips_prefilled_inputs = False
+        runner._draft_metadata_glue = False
+        runner._target_metadata_glue = False
+        runner.deepep_adapter = mock.Mock()
+        runner.buffer_registry = mock.Mock()
+        return runner
+
+    def test_idle_replay_preserves_capture_mask_and_remote_bucket(self):
+        """Idle replay must retain capture's mask mode and the active rank's bucket."""
+        for algorithm in (
+            SpeculativeAlgorithm.DFLASH,
+            SpeculativeAlgorithm.EAGLE,
+            SpeculativeAlgorithm.NGRAM,
+        ):
+            with self.subTest(algorithm=algorithm):
+                capture_mask = (
+                    None
+                    if algorithm == SpeculativeAlgorithm.DFLASH
+                    else torch.ones(64, dtype=torch.bool)
+                )
+                runner = self._runner(algorithm, capture_mask)
+                batch = SimpleNamespace(
+                    forward_mode=mod.ForwardMode.IDLE,
+                    batch_size=0,
+                    input_ids=torch.empty(0, dtype=torch.int64),
+                    input_embeds=None,
+                    replace_embeds=None,
+                    spec_info=SimpleNamespace(
+                        custom_mask=torch.empty(0, dtype=torch.bool),
+                        num_tokens_per_req=8,
+                    ),
+                    capture_hidden_mode=mod.CaptureHiddenMode.FULL,
+                    original_global_num_tokens_cpu=[0, 3],
+                    global_num_tokens_cpu=[0, 24],
+                    can_run_decode_cuda_graph=True,
+                    needs_forward_metadata_init=lambda: True,
+                )
+                self.assertTrue(runner.can_run_graph(batch))
+                with mock.patch.object(runner, "_init_replay_attn_metadata"):
+                    runner.load_batch(batch)
+                self.assertIs(batch.spec_info.custom_mask, capture_mask)
+                self.assertEqual((runner.raw_bs, runner.raw_num_token), (0, 0))
+                self.assertEqual(runner.bs, 4)
+                self.assertEqual(runner._replay_graph_key.size, 4)
+                self.assertEqual(runner._global_num_tokens_for_graph(32), [32, 32])
+
+    def test_dense_dflash_draft_uses_local_graph_counts(self):
+        """A DP-local dense draft has no global request counts to key its graphs."""
+        with get_context().override_server_args(speculative_draft_model_path=None):
+            for is_draft_worker, expected in ((True, True), (False, False)):
+                with self.subTest(is_draft_worker=is_draft_worker):
+                    model_runner = SimpleNamespace(
+                        spec_algorithm=SpeculativeAlgorithm.DFLASH,
+                        is_draft_worker=is_draft_worker,
+                    )
+                    self.assertEqual(
+                        DecodeCudaGraphRunner._forward_is_dp_local(model_runner),
+                        expected,
+                    )
 
 
 if __name__ == "__main__":

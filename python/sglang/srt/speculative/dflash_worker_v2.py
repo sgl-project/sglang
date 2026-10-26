@@ -715,15 +715,6 @@ class DFlashWorkerV2(BaseSpecWorker):
                     "device graph capture.",
                     type(current_platform).__name__,
                 )
-            if target_dp_enabled and capture_decode_cuda_graph:
-                # Keep the eager-draft policy for idle/unequal DP batches.
-                # The narrowed draft scope hides the target's DP flag.
-                capture_decode_cuda_graph = False
-                if self._target_tp_rank == 0:
-                    logger.warning(
-                        "Disable DFLASH draft cuda graph because dp attention "
-                        "is enabled (draft runs eager)."
-                    )
             if is_cuda() and capture_decode_cuda_graph:
                 available_mem = self._tp_sync.available_memory_gb(
                     SpecTpSyncSite.DFLASH_MEM,
@@ -2432,6 +2423,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
 
         if batch.forward_mode.is_idle():
+            can_run_cuda_graph = False
             # Under dp attention an idle DP rank must still run the target
             # verify forward (IDLE mode) so its cross-DP collectives stay in
             # lockstep with the active DP group; the draft block's
@@ -2447,17 +2439,13 @@ class DFlashWorkerV2(BaseSpecWorker):
                 idle_verify_forward_batch, _ = idle_verify_input.prepare_for_verify(
                     batch, self._target_worker, defer_metadata_init=True
                 )
-                # Force eager: the active ranks run eager verify when any DP
-                # rank is idle (see the idle-guard below); a graph-replaying
-                # idle rank would disagree with them on DP-gather segment
-                # offsets (padded bucket vs raw counts).
-                idle_verify_forward_batch.can_run_decode_cuda_graph = False
-                self._target_worker.forward_batch_generation(
+                target_out = self._target_worker.forward_batch_generation(
                     batch=None,
                     forward_batch=idle_verify_forward_batch,
                     is_verify=True,
                     skip_attn_backend_init=True if _is_npu else None,
                 )
+                can_run_cuda_graph = target_out.can_run_cuda_graph
             empty_ids = torch.empty((0,), dtype=torch.int64, device=self.device)
             empty_lens = torch.empty((0,), dtype=torch.int32, device=self.device)
             next_draft_input = self._make_next_draft_input_decode(
@@ -2471,7 +2459,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 next_token_ids=empty_ids,
                 accept_lens=empty_lens,
                 next_draft_input=next_draft_input,
-                can_run_cuda_graph=False,
+                can_run_cuda_graph=can_run_cuda_graph,
                 speculative_num_draft_tokens=int(self.block_size),
                 new_seq_lens=next_draft_input.new_seq_lens,
             )
@@ -2854,23 +2842,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         batch.seq_lens_cpu = seq_lens_cpu_backup
         batch.seq_lens_sum = seq_lens_sum_backup
-
-        # Idle-DP guard: an idle rank's eager verify contributes raw scheduler
-        # counts while a graph-replaying rank assumes the padded bucket, so
-        # their DP-gather segment offsets disagree. Fall back to eager verify
-        # whenever any DP rank is idle this round.
-        if (
-            get_parallel().attn_dp_enabled
-            and verify_forward_batch.original_global_num_tokens_cpu is not None
-            and min(verify_forward_batch.original_global_num_tokens_cpu) == 0
-        ):
-            verify_forward_batch.can_run_decode_cuda_graph = False
-
-        # Mixed-round guard: an extend rank's raw token counts disagree with
-        # the verify batch's spec-scaled counts on the DP-gather layout; run
-        # eager, symmetric with the idle guard above.
-        if get_parallel().attn_dp_enabled and batch.is_extend_in_batch:
-            verify_forward_batch.can_run_decode_cuda_graph = False
 
         target_out = self.target_worker.forward_batch_generation(
             batch=None,
