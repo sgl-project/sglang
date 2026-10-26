@@ -41,9 +41,9 @@ from sglang.multimodal_gen.registry import (
 )
 from sglang.multimodal_gen.runtime.models.dits import cosmos_dreams
 from sglang.multimodal_gen.runtime.models.dits.cosmos_dreams import (
+    PrefixKVHistory,
     build_cosmos_dreams_position_ids,
     interleave_action_vision_tokens,
-    PrefixKVHistory,
     null_action_token_slices,
     split_interleaved_action_vision_tokens,
 )
@@ -1667,7 +1667,10 @@ class TestCosmosDreamsPrefixBuffer(unittest.TestCase):
                 local_num_attention_heads=1,
                 local_num_key_value_heads=1,
                 head_dim=4,
-                to_qkv=lambda h: (torch.cat([h[..., :4], h[..., 4:], h[..., :4] * 0.5], -1), None),
+                to_qkv=lambda h: (
+                    torch.cat([h[..., :4], h[..., 4:], h[..., :4] * 0.5], -1),
+                    None,
+                ),
                 norm_q=None,
                 norm_k=None,
                 attn=lambda q, k, v: torch.nn.functional.scaled_dot_product_attention(

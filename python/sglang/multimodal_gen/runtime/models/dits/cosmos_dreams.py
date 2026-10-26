@@ -403,9 +403,7 @@ class PrefixKVHistory(Sequence):
         self._len = total
 
 
-def _prefix_kv(
-    text_kv: KVPair, history_kv: KVPair | None, chunk_len: int
-) -> KVPair:
+def _prefix_kv(text_kv: KVPair, history_kv: KVPair | None, chunk_len: int) -> KVPair:
     """``[text | history | chunk scratch]`` in one allocation and one copy of the prefix."""
     text_k, text_v = text_kv
     history_len = 0 if history_kv is None else history_kv[0].shape[1]
