@@ -223,6 +223,18 @@ class CustomAllReduceV2:
         self._capture_started = False
         self.disabled = False
 
+    def supports_push(self, *, nbytes: int, num_blocks: int) -> bool:
+        """Whether the push plane can hold a payload and its synchronization blocks.
+
+        This checks allocated capacity, not algorithm-selection thresholds or
+        tensor eligibility. Disabled communicators have no usable capacity.
+        """
+        return (
+            not self.disabled
+            and 0 < nbytes <= self.max_push_size
+            and 0 < num_blocks <= self._push_counter.numel()
+        )
+
     def reserve_push_capacity(self, nbytes: int) -> None:
         """Grow shared storage without changing AR dispatch or counter capacity.
 
