@@ -162,6 +162,24 @@ def _should_emit_normal_text_as_message(
     return True
 
 
+# The typed /v1/responses stream events validate against OpenAI SDK's narrower
+# ``Reasoning.effort`` literal (none is a request-side extension; xhigh/max
+# postdate it) -- echoing a tier outside this set kills the stream.
+ECHOABLE_REASONING_EFFORTS = frozenset({"minimal", "low", "medium", "high"})
+
+
+def _sanitize_response_dict(d: dict) -> dict:
+    """Mask fields the OpenAI SDK stream-event models would fail to validate.
+
+    ``tools`` passes through a narrower SDK Tool union (extended tool types
+    would raise), and ``reasoning.effort`` through the narrower literal above.
+    """
+    d["tools"] = []
+    if d["reasoning"]["effort"] not in ECHOABLE_REASONING_EFFORTS:
+        d["reasoning"]["effort"] = None
+    return d
+
+
 class OpenAIServingResponses(OpenAIServingChat):
     """Handler for /v1/responses requests"""
 
@@ -2180,13 +2198,6 @@ class OpenAIServingResponses(OpenAIServingChat):
             if isinstance(getattr(event, "item", None), ResponseOutputMessage):
                 payload["item"] = event.item.model_dump()
             return f"event: {event_type}\ndata: {orjson.dumps(payload).decode()}\n\n"
-
-        # The streaming Response* event models echo ``tools`` through a
-        # narrower OpenAI SDK Tool union; strip it to avoid pydantic
-        # validation failures on extended tool types.
-        def _sanitize_response_dict(d: dict) -> dict:
-            d["tools"] = []
-            return d
 
         initial_response = _sanitize_response_dict(
             ResponsesResponse.from_request(
