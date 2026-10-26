@@ -516,8 +516,9 @@ def _gluon_sparse_prefill_group(
             f"> cap {_MAX_SCRATCH_PAGES}"
         )
 
+    nvfp4 = isinstance(k_cache, Nvfp4Cache)
     # fp8 KV needs scale tensors: without them the kernel has no dequant mode.
-    if isinstance(k_cache, Nvfp4Cache) or k_cache.dtype == q.dtype:
+    if nvfp4 or k_cache.dtype == q.dtype:
         key_scale = value_scale = None
     else:
         key_scale = _kv_scale_tensor(k_scale, q.device)
@@ -525,7 +526,6 @@ def _gluon_sparse_prefill_group(
 
     # The pair kernel reads bf16 scratch; the decode kernel widens an fp8 one per tile.
     pair = _pair_prefill_module(q, k_cache)
-    nvfp4 = isinstance(k_cache, Nvfp4Cache)
     scratch_dtype = q.dtype if pair is not None or nvfp4 else k_cache.dtype
     # Gather the current layer's prefix and current chunk into SHUFFLE 5D views.
     k_cache, v_cache = _gather_context_to_shuffle(
