@@ -22,7 +22,7 @@ from typing import (
 import numpy as np
 import torch
 from PIL import Image
-from transformers import BaseImageProcessor
+from transformers import BaseImageProcessor, ProcessorMixin
 
 from sglang.srt import platforms
 from sglang.srt.managers.schedule_batch import (
@@ -211,6 +211,49 @@ def _tokenizer_of(processor):
     goes through here, so a clone cannot resolve differently from the original.
     """
     return processor.tokenizer if hasattr(processor, "tokenizer") else processor
+
+
+def _splits_kwargs_by_modality(processor) -> bool:
+    """Whether a flat call kwarg reaches every modality that accepts it.
+
+    Processors shipped with transformers split call kwargs per modality in
+    ``ProcessorMixin._merge_kwargs``, so a flat ``padding`` reaches the audio
+    feature extractor as well as the tokenizer. Remote-code and SGLang processors
+    may route kwargs their own way: SGLang's ``Qwen3ASRProcessor`` reads the text
+    options from the flat kwargs and hands ``audio_kwargs`` straight to its
+    feature extractor.
+    """
+    return isinstance(processor, ProcessorMixin) and type(
+        processor
+    ).__module__.startswith("transformers.")
+
+
+def _single_text_padding_kwargs(processor, kwargs: dict, has_audio: bool) -> dict:
+    """Return the processor kwargs with padding off for the one text.
+
+    The processor tokenizes a single text, so padding cannot change its ids.
+    Asking for padding still makes transformers reconfigure the backend
+    tokenizer: ``enable_padding`` here, then ``no_padding`` on the next plain
+    encode. That backend is shared with the threads that tokenize text requests,
+    and with fastokens>=0.3.3 reconfiguring it while one of them encodes
+    deadlocks the process. An explicit ``False`` also overrides processors that
+    pad text by default, such as Gemma 4's.
+
+    Audio keeps what the old flat ``padding=True`` gave it. Processors that split
+    kwargs by modality passed that value to their feature extractor as well, and
+    a flat kwarg cannot be off for text and on for audio, so they now get
+    ``padding`` per modality. For other processors it is unknown where a flat
+    ``padding`` goes, so with audio they still get ``padding=True``.
+    """
+    if not has_audio:
+        return {**kwargs, "padding": False}
+    if not _splits_kwargs_by_modality(processor):
+        return {**kwargs, "padding": True}
+    return {
+        **kwargs,
+        "text_kwargs": {**kwargs.get("text_kwargs", {}), "padding": False},
+        "audio_kwargs": {"padding": True, **kwargs.get("audio_kwargs", {})},
+    }
 
 
 def _forget_parent_executor_wakeups():
@@ -916,9 +959,10 @@ class BaseMultimodalProcessor(ABC):
         with self._temporary_fast_processor_cuda_pool(processor_device):
             result = processor.__call__(
                 text=[input_text],
-                padding=True,
                 return_tensors="pt",
-                **kwargs,
+                **_single_text_padding_kwargs(
+                    processor, kwargs, has_audio=bool(audios)
+                ),
             )
             # Deferred: the hash is computed on the GPU tensor first, and
             # _precompute_hashes_before_cpu_transfer moves it down afterwards.
