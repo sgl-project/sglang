@@ -63,6 +63,7 @@ from sglang.srt.layers.attention.dsv4.compressor_v2 import (
 )
 from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
     _rope_fq4,
+    fused_low_ratio_compress_supported,
     token_req_indices,
 )
 from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
@@ -303,10 +304,13 @@ def _low_ratio_source_projections(
         return
 
     if run_compressor and layer.compressor is not None:
-        kv, score = layer.compressor.project(x[:real])
-        put("kv", kv)
-        if score is not None:
-            put("score", score)
+        if layer.compressor.use_fused_gate:
+            put("kv_score", layer.compressor.project_fused(x[:real]))
+        else:
+            kv, score = layer.compressor.project(x[:real])
+            put("kv", kv)
+            if score is not None:
+                put("score", score)
     if run_indexer and layer.indexer is not None:
         # Only the captured consumers read these; a full top-k layer projects
         # once inside its eager break (_index_q_and_weights), so skip them there.
@@ -324,6 +328,16 @@ def _prefill_graph_full_topk(layer, x, q_lora, pos):
 
 _bcg_prefill_graph_full_topk = eager_on_graph(True)(_prefill_graph_full_topk)
 _bcg_low_ratio_source_projections = eager_on_graph(True)(_low_ratio_source_projections)
+
+
+def _first_rows(act, n: int):
+    """First ``n`` rows of ``act``, cut field by field for HIP's quantized activations
+    (``Mxfp8Activation``, ``Fp8GridActivation``), which refuse a slice."""
+    if isinstance(act, msgspec.Struct):
+        return msgspec.structs.replace(
+            act, **{k: getattr(act, k)[:n] for k in act.__struct_fields__}
+        )
+    return act[:n]
 
 
 def _as_int_list(values) -> Optional[List[int]]:
@@ -1022,11 +1036,6 @@ def _pad_rows(t: torch.Tensor, *, num_rows: int) -> torch.Tensor:
     return torch.nn.functional.pad(t, (0, num_rows - t.shape[0]))
 
 
-# The replayed context limit when the prefill graph's metadata is built at a fixed
-# width (no two-level candidates); the candidate window, 2,048 blocks of 8 tokens.
-_PREFILL_GRAPH_DEFAULT_MAX_SEQ_LEN = 16 * 1024
-
-
 def _prefill_graph_max_seq_len() -> Optional[int]:
     from sglang.srt.runtime_context import get_exec
 
@@ -1048,6 +1057,9 @@ class DSV4Metadata:
     # Shared by all low-ratio source layers; graph replay refreshes them live.
     low_ratio_req_indices: Optional[torch.Tensor] = None
     low_ratio_pos_i64: Optional[torch.Tensor] = None
+    # The prefill graph's int32 [2, request slots]: each request's first row and row
+    # count, for the captured ratio-2 compressor. Slots past the batch hold no rows.
+    low_ratio_extend_offsets: Optional[torch.Tensor] = None
     # Each low ratio's index-K slots (scoring.prefill_k_slots), gathered once by the
     # extend's metadata builder; the late-layer tail's metadata reads the same dict.
     low_ratio_k_slots: Optional[Dict[int, torch.Tensor]] = None
@@ -1100,6 +1112,10 @@ class DSV4Metadata:
         )
         maybe_copy_inplace(
             self.low_ratio_pos_i64, src=static_metadata.low_ratio_pos_i64
+        )
+        maybe_copy_inplace(
+            self.low_ratio_extend_offsets,
+            src=static_metadata.low_ratio_extend_offsets,
         )
         self.low_ratio_k_slots = static_metadata.low_ratio_k_slots
         self.low_ratio_index_plans = static_metadata.low_ratio_index_plans
@@ -1682,6 +1698,17 @@ class DeepseekV4AttnBackend(
             metadata.low_ratio_pos_i64 = core_attn_metadata.positions_casual.to(
                 torch.int64
             )
+            # One slot per request the bucket can hold. DP padding extends
+            # extend_seq_lens past the requests; those rows belong to no slot.
+            num_reqs = extend_start_loc.shape[0]
+            offsets = torch.zeros(
+                (2, min(self.req_to_token.shape[0], padded_num_tokens)),
+                dtype=torch.int32,
+                device=extend_seq_lens.device,
+            )
+            offsets[0, :num_reqs] = extend_start_loc
+            offsets[1, :num_reqs] = extend_seq_lens[:num_reqs]
+            metadata.low_ratio_extend_offsets = offsets
         return metadata
 
     @property
@@ -3146,6 +3173,13 @@ class DeepseekV4AttnBackend(
             max_seq_len_override=max_seq_len,
             use_prefill_cuda_graph=True,
         )
+        if self._prefill_graph_translates_swa_loc(self.forward_metadata):
+            # Every layer's store reads this buffer; replay refreshes it in place.
+            self.forward_metadata.core_attn_metadata.swa_out_cache_loc = (
+                self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                    forward_batch.out_cache_loc
+                ).to(torch.int32)
+            )
         self._activate_request_window()
         with_tail = (
             self.enable_decoder_swa_bounded_replay
@@ -3166,9 +3200,17 @@ class DeepseekV4AttnBackend(
                 )
         return self.forward_metadata
 
+    def _prefill_graph_translates_swa_loc(self, metadata: DSV4Metadata) -> bool:
+        return (
+            metadata.core_attn_metadata.swa_out_cache_loc is None
+            and self.token_to_kv_pool.request_window is None
+            and self.token_to_kv_pool.swa_req_ring_size is None
+        )
+
     def _prefill_graph_context_width(self, forward_batch: ForwardBatch) -> int:
-        """One context width for the full rows' and the late-layer tail's metadata."""
-        if self._prefill_graph_replays_any_context():
+        """One context width for the full rows' and the late-layer tail's metadata:
+        the live context, unless c4/c128 compress metadata is captured at a width."""
+        if not self.has_c4 and not self.has_c128:
             seq_lens_cpu = forward_batch.seq_lens_cpu
             if seq_lens_cpu is not None and len(seq_lens_cpu) > 0:
                 return int(seq_lens_cpu.max().item())
@@ -3211,13 +3253,14 @@ class DeepseekV4AttnBackend(
             bufs = {
                 "q": zeros(num_tokens, heads, dim, dtype=torch.bfloat16),
                 "w": zeros(num_tokens, heads, dtype=torch.bfloat16),
-                "kv": zeros(
-                    num_tokens,
-                    latent,
-                    dtype=torch.bfloat16 if ratio == 1 else torch.float32,
-                ),
             }
-            if ratio == 2:
+            if ratio == 1:
+                bufs["kv"] = zeros(num_tokens, latent, dtype=torch.bfloat16)
+            elif fused_low_ratio_compress_supported():
+                # The fused compressor reads | kv | score | rows.
+                bufs["kv_score"] = zeros(num_tokens, 2 * latent, dtype=torch.float32)
+            else:
+                bufs["kv"] = zeros(num_tokens, latent, dtype=torch.float32)
                 bufs["score"] = zeros(num_tokens, latent, dtype=torch.float32)
             # Keep the previous allocations alive: captured graphs still hold them.
             sets[ratio] = [bufs] + (have or [])
@@ -3244,6 +3287,12 @@ class DeepseekV4AttnBackend(
         )
         assert isinstance(capture_metadata, DSV4Metadata)
         capture_metadata.refresh_for_breakable_cuda_graph_replay_(static_metadata)
+        if self._prefill_graph_translates_swa_loc(static_metadata):
+            capture_metadata.core_attn_metadata.swa_out_cache_loc.copy_(
+                self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                    metadata_batch.out_cache_loc
+                )
+            )
         self.prefill_graph_replay_batch = forward_batch
         self.forward_metadata = capture_metadata
         self._activate_request_window()
@@ -3397,9 +3446,10 @@ class DeepseekV4AttnBackend(
             # extend past them; an eager break in the late-layer tail sees fewer, and
             # there extend_seq_lens still spans the whole extend.
             n = min(hoisted_pos.shape[0], positions.shape[0])
-            x, positions = x[:n], positions[:n]
-            if q_lora is not None:
-                q_lora = q_lora[:n]
+            if n < positions.shape[0]:
+                x, positions = _first_rows(x, n), positions[:n]
+                if q_lora is not None:
+                    q_lora = _first_rows(q_lora, n)
             req, pos = hoisted_req[:n], hoisted_pos[:n]
         if (
             forward_batch.forward_mode.is_extend()
@@ -3415,9 +3465,19 @@ class DeepseekV4AttnBackend(
                 layer, x, q_lora, pos, bufs, run_compressor, captured_index
             )
             if run_compressor and layer.compressor is not None:
-                self._low_ratio_compress_torch(
-                    layer, x, req, pos, projected=(bufs["kv"], bufs.get("score"))
-                )
+                if layer.compressor.use_fused_gate:
+                    self._low_ratio_compress_fused(
+                        layer,
+                        x,
+                        req,
+                        pos,
+                        projected=bufs["kv_score"],
+                        extend_offsets=meta.low_ratio_extend_offsets.unbind(),
+                    )
+                else:
+                    self._low_ratio_compress_torch(
+                        layer, x, req, pos, projected=(bufs["kv"], bufs.get("score"))
+                    )
             if run_indexer and layer.indexer is not None:
                 if captured_index:
                     # Captured: sparse scores of the published blocks only, so
@@ -3584,10 +3644,11 @@ class DeepseekV4AttnBackend(
         )
 
     def _low_ratio_compress_fused(
-        self, layer, x, req, pos, *, draft_len=1, extend_offsets=None
+        self, layer, x, req, pos, *, draft_len=1, extend_offsets=None, projected=None
     ) -> None:
         """Decode or target-verify; an extend batch passes ``extend_offsets``, the int32
-        (first row, row count) of each request."""
+        (first row, row count) of each request. ``projected`` is the compressor's
+        projection of ``x`` when the caller already has it."""
         from sglang.kernels.ops.attention.dsv4.fp4_indexer_rope import (
             index_k_norm_rope_pack_store,
         )
@@ -3616,7 +3677,7 @@ class DeepseekV4AttnBackend(
         if layer.compress_ratio == 1:
             # At ratio 1, c1_out_loc equals the int64 raw_out_loc supplied by the scheduler.
             latent = c1_decode_norm_rope_store(
-                compressor.wkv(x),
+                compressor.wkv(x) if projected is None else projected,
                 compressor.norm.weight.data,
                 pos,
                 core.raw_out_loc,
@@ -3632,7 +3693,7 @@ class DeepseekV4AttnBackend(
             # KVAndScore rows use | kv | score |, addressed as req * ring_size + pos % ring_size.
             state = pool.get_attention_compress_states(layer_id)
             args = (
-                compressor.project_fused(x),
+                compressor.project_fused(x) if projected is None else projected,
                 state.kv_score_buffer.kv_score,
                 compressor.norm.weight.data,
                 pos,
@@ -3974,23 +4035,6 @@ class DeepseekV4AttnBackend(
         if published is None:
             return
         self.forward_metadata.candidate_metadata = published
-
-    def _prefill_graph_replays_any_context(self) -> bool:
-        """Whether a prefill graph replay admits any context length: with two-level
-        candidates only c4/c128 compress metadata would be captured at a width."""
-        return self.low_ratio_prefill_graph and not self.has_c4 and not self.has_c128
-
-    @property
-    def prefill_cuda_graph_default_max_seq_len(self) -> Optional[int]:
-        """DeepSeek-V4.1's fixed metadata width without two-level candidates; prefill
-        context parallelism builds its own metadata and needs none."""
-        if (
-            self.low_ratios != (1, 2)
-            or get_parallel().attn_cp_size > 1
-            or self._prefill_graph_replays_any_context()
-        ):
-            return None
-        return _PREFILL_GRAPH_DEFAULT_MAX_SEQ_LEN
 
     def _prefill_graph_seq_limit(self) -> Optional[int]:
         """The replayed context limit: cuda_graph_config[prefill].max_seq_len when

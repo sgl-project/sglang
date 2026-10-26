@@ -96,6 +96,7 @@ def _queued_scheduler(req):
     scheduler.tree_cache = MagicMock()
     scheduler.beam_coordinator = MagicMock()
     scheduler.ipc_channels = MagicMock()
+    scheduler.rust_server = None
     scheduler.grammar_manager = MagicMock()
     scheduler.collect_inflight_reqs = lambda: set()
     return scheduler

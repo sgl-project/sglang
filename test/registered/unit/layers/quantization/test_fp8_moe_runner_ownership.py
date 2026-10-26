@@ -11,17 +11,33 @@ import math
 import sys
 import types
 import unittest
+from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.moe_runner.aiter import AiterQuantType
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
-from sglang.srt.layers.moe.utils import MoeRunnerBackend
+from sglang.srt.layers.moe.utils import (
+    MoeA2ABackend,
+    MoeRunnerBackend,
+    RoutingMethodType,
+)
 from sglang.srt.layers.quantization import fp8 as fp8_module
+from sglang.srt.layers.quantization import mxfp4_flashinfer_cutlass_moe as cutlass_mxfp4
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
-from sglang.srt.runtime_context import get_flags
+from sglang.srt.layers.quantization.modelopt_quant import (
+    HybridFp8NvFp4Config,
+    ModelOptFp4Config,
+)
+from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
+    Mxfp4FlashinferTrtllmMoEMethod,
+)
+from sglang.srt.layers.quantization.mxfp4_humming_moe import Mxfp4HummingMoEMethod
+from sglang.srt.layers.quantization.mxfp4_marlin_moe import Mxfp4MarlinMoEMethod
+from sglang.srt.runtime_context import get_context, get_flags, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -117,6 +133,158 @@ class TestFp8MoERunnerOwnership(CustomTestCase):
         self._run_post_load(method=method, layer=layer)
 
         self._assert_activation_params_absent(layer)
+
+
+class TestMxfp4MoEMethodContract(CustomTestCase):
+    def setUp(self):
+        self.stack = self.enterContext(ExitStack())
+        self.stack.enter_context(
+            get_context().override_server_args(model_path="dummy", device="cpu")
+        )
+        self.stack.enter_context(
+            get_flags().moe.override(a2a_backend=MoeA2ABackend.NONE)
+        )
+        self.stack.enter_context(
+            get_parallel().override(
+                tp_size=1,
+                tp_rank=0,
+                attn_tp_size=1,
+                attn_tp_rank=0,
+                moe_ep_size=1,
+                moe_ep_rank=0,
+                moe_tp_size=1,
+                moe_tp_rank=0,
+            )
+        )
+        # Keep real method selection, constructors and layer policy binding;
+        # replace expert storage and native runner construction with CPU fixtures.
+        adapters = (
+            cutlass_mxfp4.Mxfp4FlashinferCutlassMoEMethod,
+            Mxfp4FlashinferTrtllmMoEMethod,
+            Mxfp4HummingMoEMethod,
+            Mxfp4MarlinMoEMethod,
+        )
+        for adapter in adapters:
+            self.stack.enter_context(
+                patch.object(
+                    adapter, "create_weights", staticmethod(self._create_cpu_weights)
+                )
+            )
+        for module in (
+            "sglang.srt.layers.moe.moe_runner",
+            "sglang.srt.layers.moe.moe_runner.runner",
+        ):
+            self.stack.enter_context(
+                patch(f"{module}.MoeRunner", side_effect=self._make_runner)
+            )
+        self.stack.enter_context(
+            patch.object(cutlass_mxfp4, "is_flashinfer_available", return_value=True)
+        )
+        self.stack.enter_context(
+            patch.object(
+                Fp8MoEMethod,
+                "get_moe_routing_method_type",
+                side_effect=AssertionError("The borrowed FP8 loader owns no runner"),
+            )
+        )
+
+    @staticmethod
+    def _create_cpu_weights(layer, num_experts, **kwargs):
+        layer.w13_weight = torch.empty((num_experts, 1), device="cpu")
+
+    @staticmethod
+    def _make_runner(runner_backend, config):
+        return SimpleNamespace(runner_backend=runner_backend, config=config)
+
+    @staticmethod
+    def _fp4_expert_config():
+        return Fp8Config(
+            is_checkpoint_fp8_serialized=True,
+            weight_block_size=[128, 128],
+            is_fp4_experts=True,
+        )
+
+    def _check_construction(self, config, backend, platform, expected_type, prefix):
+        with (
+            get_flags().moe.override(runner_backend=backend),
+            patch.object(fp8_module, "get_platform", return_value=platform),
+            patch.object(cutlass_mxfp4, "get_platform", return_value=platform),
+        ):
+            for requested in (
+                None,
+                RoutingMethodType.Default,
+                RoutingMethodType.DeepSeekV3,
+            ):
+                with self.subTest(requested=requested):
+                    layer = FusedMoE(
+                        num_experts=2,
+                        hidden_size=128,
+                        intermediate_size=128,
+                        layer_id=0,
+                        top_k=1,
+                        quant_config=config,
+                        prefix=prefix,
+                        routing_method_type=requested,
+                    )
+                    self.assertIs(type(layer.quant_method), expected_type)
+                    self.assertIs(layer.routing_method_type, requested)
+                    self.assertIs(
+                        layer.moe_runner_config.routing_method_type, requested
+                    )
+                    self.assertEqual(layer.runner_backend, backend)
+                    self.assertIs(layer.quant_method._fp8.quant_config, config)
+                    self.assertFalse(layer.quant_method._fp8._owns_moe_runner)
+
+    def test_fp4_expert_adapters_preserve_routing_policy(self):
+        """Each selected MXFP4 adapter must construct without borrowing its FP8
+        loader's routing policy, including an explicit zero-valued policy."""
+        cases = (
+            (MoeRunnerBackend.MARLIN, False, False, Mxfp4MarlinMoEMethod),
+            (MoeRunnerBackend.HUMMING, False, False, Mxfp4HummingMoEMethod),
+            (
+                MoeRunnerBackend.FLASHINFER_MXFP4,
+                True,
+                False,
+                cutlass_mxfp4.Mxfp4FlashinferCutlassMoEMethod,
+            ),
+            (
+                MoeRunnerBackend.FLASHINFER_MXFP4,
+                False,
+                True,
+                cutlass_mxfp4.Mxfp4FlashinferCutlassMoEMethod,
+            ),
+            (
+                MoeRunnerBackend.FLASHINFER_MXFP4,
+                False,
+                False,
+                Mxfp4FlashinferTrtllmMoEMethod,
+            ),
+        )
+        for backend, sm90, sm120, expected_type in cases:
+            with self.subTest(backend=backend, sm90=sm90, sm120=sm120):
+                self._check_construction(
+                    config=self._fp4_expert_config(),
+                    backend=backend,
+                    platform=SimpleNamespace(is_sm90=sm90, is_sm120=sm120),
+                    expected_type=expected_type,
+                    prefix="model.layers.0.mlp.experts",
+                )
+
+    def test_hybrid_mtp_adapter_preserves_routing_policy(self):
+        """Excluded MXFP4 MTP experts retain the same construction contract as
+        adapters selected directly by Fp8Config."""
+        prefix = "model.mtp.experts"
+        config = HybridFp8NvFp4Config(
+            self._fp4_expert_config(),
+            ModelOptFp4Config(exclude_modules=[prefix]),
+        )
+        self._check_construction(
+            config=config,
+            backend=MoeRunnerBackend.FLASHINFER_MXFP4,
+            platform=SimpleNamespace(is_sm90=False, is_sm120=False),
+            expected_type=Mxfp4FlashinferTrtllmMoEMethod,
+            prefix=prefix,
+        )
 
 
 class TestFp8MoEAiterQuantInfo(CustomTestCase):
