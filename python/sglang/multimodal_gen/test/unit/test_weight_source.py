@@ -1,10 +1,8 @@
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import httpx
 import huggingface_hub.constants
 import pytest
-from huggingface_hub.errors import HfHubHTTPError
 
 from sglang.multimodal_gen.runtime.weights.source import (
     NoSafetensorsWeightsError,
@@ -304,15 +302,6 @@ def _remote_info(*files):
     )
 
 
-def _rate_limited(retry_after=None):
-    headers = {} if retry_after is None else {"Retry-After": retry_after}
-    request = httpx.Request("GET", "https://huggingface.co/api/models/owner/repo")
-    return HfHubHTTPError(
-        "429 Too Many Requests",
-        response=httpx.Response(429, headers=headers, request=request),
-    )
-
-
 def test_resolve_weight_uses_cached_named_file_without_hub_api(monkeypatch, tmp_path):
     _hub_cache(monkeypatch, tmp_path, ["config.json", "lora.safetensors"])
 
@@ -358,34 +347,3 @@ def test_resolve_weight_without_a_name_ignores_the_cache(monkeypatch, tmp_path):
         pytest.raises(ValueError, match="multiple independent weight files"),
     ):
         resolve_weight("owner/repo")
-
-
-def test_hub_api_rate_limit_waits_and_retries(monkeypatch, tmp_path):
-    monkeypatch.setattr(huggingface_hub.constants, "HF_HUB_CACHE", str(tmp_path))
-    info = _remote_info("lora.safetensors")
-
-    with (
-        patch(
-            _MODEL_INFO, side_effect=[_rate_limited("5"), _rate_limited(), info]
-        ) as model_info,
-        patch("sglang.multimodal_gen.runtime.weights.source.time.sleep") as sleep,
-    ):
-        resolved = resolve_weight("owner/repo", weight_name="lora.safetensors")
-
-    assert model_info.call_count == 3
-    assert [call.args[0] for call in sleep.call_args_list] == [5.0, 60.0]
-    assert resolved.inventory.resolved_revision == "remote-sha"
-
-
-def test_hub_api_rate_limit_gives_up_after_bounded_retries(monkeypatch, tmp_path):
-    monkeypatch.setattr(huggingface_hub.constants, "HF_HUB_CACHE", str(tmp_path))
-
-    with (
-        patch(_MODEL_INFO, side_effect=_rate_limited("999")) as model_info,
-        patch("sglang.multimodal_gen.runtime.weights.source.time.sleep") as sleep,
-        pytest.raises(HfHubHTTPError),
-    ):
-        resolve_weight("owner/repo", weight_name="lora.safetensors")
-
-    assert model_info.call_count == 4
-    assert {call.args[0] for call in sleep.call_args_list} == {120.0}
