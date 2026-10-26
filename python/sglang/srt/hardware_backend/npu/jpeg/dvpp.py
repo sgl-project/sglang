@@ -16,7 +16,7 @@ from PIL import Image, JpegImagePlugin
 
 
 class UnsupportedJPEG(ValueError):
-    """Valid media outside this deliberately narrow first prototype."""
+    """Valid media outside the supported NPU JPEG input contract."""
 
 
 class ACLFailure(RuntimeError):
@@ -77,23 +77,6 @@ class DeviceFrame:
     def __init__(self, decoder, ptr, size, info):
         self.decoder, self.ptr, self.size, self.info = decoder, ptr, size, info
 
-    def download(self):
-        import numpy as np
-
-        d = self.decoder
-        with d.lock:
-            d._activate()
-            if not self.ptr:
-                raise RuntimeError("frame is closed")
-            host = np.empty(self.info.nv12_bytes, dtype=np.uint8)
-            check(
-                d.acl.rt.memcpy(
-                    host.ctypes.data, host.nbytes, self.ptr, host.nbytes, 2
-                ),
-                "acl.rt.memcpy D2H",
-            )
-            return host
-
     def close(self):
         d = self.decoder
         with d.lock:
@@ -111,17 +94,9 @@ class DeviceFrame:
 
 
 class JPEGDecoder:
-    """One dedicated process, one explicit device, reusable stream/channel.
+    """Reuse a JPEGD stream/channel within the caller's initialized context."""
 
-    Do not fork after construction. No automatic device selection. No reset or
-    finalize: those are process-global operations which this component does not
-    own. The dedicated process releases ACL runtime state on normal exit. In
-    borrowed-context mode the caller retains ownership of the runtime/context.
-    """
-
-    def __init__(
-        self, device: int, *, width_alignment=128, borrow_current_context=False
-    ):
+    def __init__(self, device: int, *, width_alignment=128):
         if not isinstance(device, int) or isinstance(device, bool) or device < 0:
             raise ValueError("an explicit non-negative device ID is required")
         if width_alignment not in (64, 128):
@@ -133,27 +108,17 @@ class JPEGDecoder:
         self.context = self.stream = self.channel = None
         self.channel_created = False
         self.poisoned = False
-        self.owns_context = not borrow_current_context
-        # An already initialized process is an integration error, not silently
-        # accepted: lifecycle sharing with torch_npu is a separate next step.
-        if self.owns_context:
-            check(acl.init(), "acl.init (run this prototype in a fresh process)")
         try:
-            if self.owns_context:
-                check(acl.rt.set_device(device), "acl.rt.set_device")
-                self.context, ret = acl.rt.create_context(device)
-                check(ret, "acl.rt.create_context")
-            else:
-                current, ret = acl.rt.get_device()
-                check(ret, "acl.rt.get_device")
-                if current != device:
-                    raise ACLFailure(
-                        f"current context device {current} != requested {device}"
-                    )
-                self.context, ret = acl.rt.get_context()
-                check(ret, "acl.rt.get_context")
-                if not self.context:
-                    raise ACLFailure("caller has not initialized an ACL context")
+            current, ret = acl.rt.get_device()
+            check(ret, "acl.rt.get_device")
+            if current != device:
+                raise ACLFailure(
+                    f"current context device {current} != requested {device}"
+                )
+            self.context, ret = acl.rt.get_context()
+            check(ret, "acl.rt.get_context")
+            if not self.context:
+                raise ACLFailure("caller has not initialized an ACL context")
             self.stream, ret = acl.rt.create_stream()
             check(ret, "acl.rt.create_stream")
             self.channel = acl.media.dvpp_create_channel_desc()
@@ -291,8 +256,6 @@ class JPEGDecoder:
                 check(self.acl.rt.destroy_stream(self.stream), "destroy_stream")
                 self.stream = None
             if self.context is not None:
-                if self.owns_context:
-                    check(self.acl.rt.destroy_context(self.context), "destroy_context")
                 self.context = None
 
     def __enter__(self):
@@ -314,9 +277,7 @@ class TritonJPEGDecoder:
         torch.npu.set_device(self.device)
         # Force runtime initialization before borrowing its context.
         torch.empty(1, device=self.device)
-        self.decoder = JPEGDecoder(
-            device, width_alignment=width_alignment, borrow_current_context=True
-        )
+        self.decoder = JPEGDecoder(device, width_alignment=width_alignment)
 
     def decode(self, data: bytes):
         from sglang.srt.hardware_backend.npu.jpeg.nv12 import nv12_to_rgb_triton
