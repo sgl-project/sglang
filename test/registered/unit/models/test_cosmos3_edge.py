@@ -35,6 +35,9 @@ from sglang.srt.multimodal.processors.base_processor import (
     BaseMultiModalProcessorOutput,
     MultimodalSpecialTokens,
 )
+from sglang.srt.multimodal.transport.feature_transport import (
+    MultimodalFeatureTransport,
+)
 from sglang.srt.multimodal.processors.cosmos3_edge import (
     Cosmos3EdgeProcessor,
     _smart_resize,
@@ -262,6 +265,9 @@ def _processed_input_processor():
     )
     processor.mm_processor_executor = None
     processor.use_cuda_ipc = False
+    processor._feature_transport = MultimodalFeatureTransport(
+        "cpu", base_gpu_id=0, skip_mm_pool=True
+    )
     processor.precompute_hash_before_cpu_transfer = False
     processor.ATTR_NAME_TO_MODALITY = {
         "pixel_values": Modality.IMAGE,

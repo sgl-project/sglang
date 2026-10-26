@@ -8,7 +8,6 @@ import os
 import re
 import threading
 from abc import ABC, abstractmethod
-from contextlib import contextmanager
 from typing import (
     Any,
     Dict,
@@ -24,7 +23,6 @@ import torch
 from PIL import Image
 from transformers import BaseImageProcessor
 
-from sglang.srt import platforms
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
@@ -36,39 +34,31 @@ from sglang.srt.multimodal.cache import (
     PreprocessFingerprintProvider,
     build_processor_fingerprint,
 )
-from sglang.srt.multimodal.processors.executor import MultimodalProcessorExecutor
-from sglang.srt.multimodal.processors.hash_executor import MultimodalHashExecutor
-from sglang.srt.multimodal.transport.cuda_ipc import (
-    MM_FEATURE_CACHE_SIZE,
-    MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
-    CudaIpcTensorTransportProxy,
-    MmItemMemoryPool,
-    get_mm_feature_pool_size_per_worker,
+from sglang.srt.multimodal.multimodal_processor_mixin import (
+    MultimodalProcessorMixin,
+    _tokenizer_of,
 )
-from sglang.srt.multimodal.transport.memory_pool import get_mm_feature_consumer_count
+from sglang.srt.multimodal.processors.hash_executor import MultimodalHashExecutor
+from sglang.srt.multimodal.processors.processor_config import MultimodalProcessorConfig
+from sglang.srt.multimodal.serving_preprocessing import (
+    fast_image_processor_device,
+    preprocessing_competes_with_the_scheduler,
+    resolve_auto_mm_processor_worker_num,
+    resolve_hf_image_token_counts,
+)
+from sglang.srt.multimodal.transport.feature_transport import (
+    MultimodalFeatureTransport,
+    keeps_mm_features_on_device,
+    move_feature_to_cpu,
+)
 from sglang.srt.runtime_context import (
-    get_exec,
     get_mm,
     get_serving,
 )
-from sglang.srt.true_on_policy import is_true_on_policy_enabled
 from sglang.srt.utils import (
-    CLIENT_MEDIA_EXCEPTIONS,
-    configure_media_url_security,
     envs,
-    is_cpu,
-    is_npu,
-    is_xpu,
-    load_audio,
-    load_image,
-    load_video,
     logger,
-    smart_to_rgb,
 )
-
-_is_cpu = is_cpu()
-_is_npu = is_npu()
-_is_xpu = is_xpu()
 
 
 @dataclasses.dataclass
@@ -203,17 +193,6 @@ class MultimodalSpecialTokens:
         return self.combined_regex
 
 
-def _tokenizer_of(processor):
-    """The tokenizer reached from an HF processor.
-
-    Some processors (e.g. InternVL) are handed a tokenizer directly as their
-    ``_processor`` rather than one that wraps a tokenizer. Every path that
-    resolves a tokenizer -- construction and per-worker processor clones alike --
-    goes through here, so a clone cannot resolve differently from the original.
-    """
-    return processor.tokenizer if hasattr(processor, "tokenizer") else processor
-
-
 def _forget_parent_executor_wakeups():
     # A forked worker inherits the parent's executor wakeups, whose locks a parent
     # thread may hold at fork time; since Python 3.12.8 / 3.13.1 the worker's exit
@@ -221,13 +200,9 @@ def _forget_parent_executor_wakeups():
     concurrent.futures.process._threads_wakeups.clear()
 
 
-class BaseMultimodalProcessor(ABC):
+class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
     models = []
-    gpu_image_decode = True  # Enable GPU decoding by default
-    smart_rgb_conversion = False
-    video_preprocessing_device = None
     prefer_tokenized_input = False
-    precompute_hash_before_cpu_transfer = False
     # Set by processors that already build input_ids from the request's own
     # tokens, so the retokenize-avoidance rebuild below has nothing to add.
     preserve_processor_input_ids = False
@@ -235,51 +210,43 @@ class BaseMultimodalProcessor(ABC):
     # model that measured its own optimum assigns a number instead. See
     # `_resolve_auto_mm_processor_worker_num`.
     auto_mm_processor_worker_num = None
-    auto_mm_io_worker_num = 4
     # Models opt in by assigning a non-zero default. A user-provided server
     # argument overrides this value; zero disables storage and cache-key work.
     auto_mm_preprocess_cache_size_mb = 0
     # Artifact-based processors may keep their prompt/M-RoPE fast path even
     # when artifact retention is disabled.
     uses_media_artifacts_without_cache = False
-    # Processors opt out only when their preprocessing is not thread-safe. The
-    # worker pool gives each thread its own `copy.deepcopy` of the HF processor
-    # and injects it, and the single function it runs --
-    # `process_and_combine_mm_data` -- resolves that clone instead of
-    # `self._processor`, so isolation does not depend on the subclass.
-    supports_mm_processor_concurrency = True
 
     def __init__(
         self, hf_config, server_args, _processor, transport_mode, *args, **kwargs
     ):
-        self.hf_config = hf_config
-        self._processor = _processor
         self.server_args = server_args
         self.transport_mode = transport_mode
-        configure_media_url_security(
-            get_mm().allowed_media_domains,
-            get_mm().media_url_max_file_size_mb,
+        self._feature_transport = MultimodalFeatureTransport(
+            get_mm().mm_feature_transport,
+            base_gpu_id=server_args.base_gpu_id,
+            skip_mm_pool=kwargs.get("skip_mm_pool", False),
         )
-        configured_mm_feature_transport = get_mm().mm_feature_transport
-        self.mm_feature_transport = (
-            configured_mm_feature_transport
-            if configured_mm_feature_transport in ("cpu", "cuda_ipc", "cuda_vmm")
-            else "cpu"
-        )
-        self.use_cuda_ipc = self.mm_feature_transport == "cuda_ipc"
-        self.use_ipc_pool_handle_cache = (
-            self.use_cuda_ipc and envs.SGLANG_USE_IPC_POOL_HANDLE_CACHE.get()
-        )
-        self.image_processor_backend = get_mm().image_processor_backend
-        if get_mm().disable_fast_image_processor:
-            self.image_processor_backend = "pil"
-        self.disable_fast_image_processor = self.image_processor_backend == "pil"
+        # Model processors read these; PositionalEmbedsTransport reuses the pool.
+        self.mm_feature_transport = self._feature_transport.mm_feature_transport
+        self.use_cuda_ipc = self._feature_transport.use_cuda_ipc
+        self.cudaipc_mmfeature_pool = self._feature_transport.cudaipc_mmfeature_pool
         self.skip_tokenizer_init = get_serving().skip_tokenizer_init
 
-        mm_process_config = get_mm().mm_process_config
-        self.image_config = mm_process_config.get("image", {})
-        self.video_config = mm_process_config.get("video", {})
-        self.audio_config = mm_process_config.get("audio", {})
+        processor_config = MultimodalProcessorConfig(
+            image_processor_backend=get_mm().image_processor_backend,
+            disable_fast_image_processor=get_mm().disable_fast_image_processor,
+            mm_process_config=get_mm().mm_process_config,
+            mm_processor_worker_num=get_mm().mm_processor_worker_num,
+            mm_io_worker_num=get_mm().mm_io_worker_num,
+            allowed_media_domains=get_mm().allowed_media_domains,
+            media_url_max_file_size_mb=get_mm().media_url_max_file_size_mb,
+        )
+        MultimodalProcessorMixin._initialize_processor(
+            self, hf_config, _processor, processor_config=processor_config, **kwargs
+        )
+        self._cpu_executor_lock = threading.Lock()
+        self.cpu_executor = self._create_cpu_executor()
 
         # Each tokenizer worker is a separate process with its own CPU cache.
         # Split the requested service-wide budget so increasing worker count
@@ -315,83 +282,10 @@ class BaseMultimodalProcessor(ABC):
                 worker_cache_bytes // (1024 * 1024),
                 "trusted" if self.trust_mm_content_hashes else "verified",
             )
-
-        self._tokenizer = _tokenizer_of(self._processor)
-
-        # Same guard as in serving_chat.py against double BOS.
-        try:
-            self._tokenizer_auto_adds_specials = len(self._tokenizer.encode("")) > 0
-        except Exception:
-            self._tokenizer_auto_adds_specials = False
+        self.hash_executor = MultimodalHashExecutor()
 
         # FIXME: not accurate, model and image specific
         self.NUM_TOKEN_PER_FRAME = 330
-
-        requested_mm_io_worker_num = get_mm().mm_io_worker_num
-        env_mm_io_worker_num = os.environ.get("SGLANG_IO_WORKERS")
-        if requested_mm_io_worker_num:
-            self.mm_io_worker_num = requested_mm_io_worker_num
-            io_worker_source = "explicit"
-        elif env_mm_io_worker_num is not None:
-            self.mm_io_worker_num = int(env_mm_io_worker_num)
-            io_worker_source = "environment"
-        else:
-            self.mm_io_worker_num = self.auto_mm_io_worker_num
-            io_worker_source = "auto"
-        self.io_executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=self.mm_io_worker_num,
-            thread_name_prefix="sglang-mm-io",
-        )
-        self.hash_executor = MultimodalHashExecutor()
-        if self.mm_io_worker_num > 4:
-            logger.info(
-                "Multimodal data loading enabled with %d worker threads (%s).",
-                self.mm_io_worker_num,
-                io_worker_source,
-            )
-        skip_mm_pool = kwargs.get("skip_mm_pool", False)
-        requested_mm_processor_worker_num = get_mm().mm_processor_worker_num
-        self.mm_processor_worker_num = (
-            1
-            if skip_mm_pool
-            else requested_mm_processor_worker_num
-            or self._resolve_auto_mm_processor_worker_num()
-        )
-        if (
-            self.mm_processor_worker_num > 1
-            and not self.supports_mm_processor_concurrency
-        ):
-            logger.warning(
-                "Concurrent multimodal processing is not supported by %s; "
-                "using synchronous processing.",
-                type(self).__name__,
-            )
-            self.mm_processor_worker_num = 1
-        self.mm_processor_executor = None
-        if self.mm_processor_worker_num > 1:
-            try:
-                # A callable, not the object: subclasses finish customizing
-                # `_processor` after this returns, and the workers must clone it
-                # as the subclass left it.
-                self.mm_processor_executor = MultimodalProcessorExecutor(
-                    lambda: self._processor, self.mm_processor_worker_num
-                )
-            except Exception:
-                logger.warning(
-                    "Unable to clone the multimodal processor for concurrent "
-                    "workers; falling back to synchronous processing.",
-                    exc_info=True,
-                )
-                self.mm_processor_worker_num = 1
-        if self.mm_processor_executor is not None:
-            logger.info(
-                "Multimodal processor concurrency enabled with %d isolated "
-                "worker threads (%s).",
-                self.mm_processor_worker_num,
-                "auto" if requested_mm_processor_worker_num == 0 else "explicit",
-            )
-        self._cpu_executor_lock = threading.Lock()
-        self.cpu_executor = self._create_cpu_executor()
 
         # Mapping from attribute names to modality types
         self.ATTR_NAME_TO_MODALITY = {
@@ -428,45 +322,10 @@ class BaseMultimodalProcessor(ABC):
             # "precomputed_embeddings" - handled specially as it can be any modality
         }
 
-        # name of the feature filed
-        # TODO: pass from processors
-        self.FEATURE_NAMES = [
-            "pixel_values",
-            "pixel_values_videos",
-            "audio_features",
-            "input_features",
-        ]
-
-        if self.use_cuda_ipc and not skip_mm_pool:
-            # SGLANG_MM_FEATURE_CACHE_MB is the total pool budget across all
-            # tokenizer workers. Each worker gets an equal share so that adding
-            # workers doesn't multiply the GPU-side footprint.
-            worker_num = get_serving().tokenizer_worker_num
-            per_worker_pool_size = get_mm_feature_pool_size_per_worker(
-                MM_FEATURE_CACHE_SIZE, worker_num
-            )
-            total_pool_size = per_worker_pool_size * worker_num
-            logger.info(
-                "CUDA IPC multimodal feature pools reserve %.0f MiB total on "
-                "GPU %d (%.0f MiB per tokenizer worker × %d; configured "
-                "budget %.0f MiB).",
-                total_pool_size / (1024 * 1024),
-                self.server_args.base_gpu_id,
-                per_worker_pool_size / (1024 * 1024),
-                worker_num,
-                MM_FEATURE_CACHE_SIZE / (1024 * 1024),
-            )
-            self.cudaipc_mmfeature_pool = MmItemMemoryPool(
-                per_worker_pool_size,
-                MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
-                self.server_args.base_gpu_id,
-                get_mm_feature_consumer_count(),
-            )
-
     @property
     def keep_mm_features_on_device(self) -> bool:
         """Whether feature transport expects processor outputs to stay on GPU."""
-        return self.mm_feature_transport in ("cuda_ipc", "cuda_vmm")
+        return keeps_mm_features_on_device(self.mm_feature_transport)
 
     def preprocess_fingerprint_payload(self) -> dict[str, Any]:
         """Return every stable setting that can change a media artifact.
@@ -507,10 +366,8 @@ class BaseMultimodalProcessor(ABC):
         """Drop cached artifacts and stop every processor-side executor."""
         self.clear_preprocess_cache()
         self.hash_executor.shutdown()
-        self.io_executor.shutdown(wait=False, cancel_futures=True)
         self.cpu_executor.shutdown(wait=False, cancel_futures=True)
-        if self.mm_processor_executor is not None:
-            self.mm_processor_executor.shutdown()
+        super().shutdown()
 
     def _create_cpu_executor(self) -> concurrent.futures.ProcessPoolExecutor:
         start_method = "spawn" if self.mm_feature_transport == "cuda_vmm" else "fork"
@@ -736,123 +593,22 @@ class BaseMultimodalProcessor(ABC):
         return processor, _tokenizer_of(processor)
 
     def _preprocessing_competes_with_the_scheduler(self) -> bool:
-        """Whether image preprocessing contends with the serving accelerator.
-
-        The fast image processor runs inside the tokenizer process but may run on
-        the same accelerator as the scheduler. A second preprocessing worker there
-        adds device contention rather than CPU preprocessing parallelism.
-        """
-        if (
-            _is_cpu
-            or get_exec().deterministic.rl_on_policy_target is not None
-            or is_true_on_policy_enabled()
-        ):
-            return False
-        if self.disable_fast_image_processor:
-            return False
-        image_processor = getattr(self._processor, "image_processor", None)
-        if not isinstance(image_processor, BaseImageProcessor):
-            return False
-        if _is_xpu or _is_npu:
-            return True
-        platform = platforms.current_platform
-        return platform.is_cuda_alike()
+        return preprocessing_competes_with_the_scheduler(
+            self._processor,
+            disable_fast_image_processor=self.disable_fast_image_processor,
+        )
 
     def _resolve_auto_mm_processor_worker_num(self) -> int:
-        """The worker count to use when the user did not ask for one.
-
-        Two workers overlap preprocessing that runs on the CPU, where the second
-        thread is real parallelism: measured on Qwen2.5-VL with full-page images
-        at 32-way concurrency, 4.46 -> 6.08 req/s on H200 and 7.07 -> 8.76 on
-        GB300.
-
-        The GPU path is capped at one worker even when a model declares more.
-        A declaration records what its author measured on one platform and one
-        image shape; contending for the device the scheduler is serving from is a
-        property of the path itself, and it does not go away because a subclass
-        asked for concurrency. Qwen-VL declares two and is the model that
-        measures 9.30 -> 4.02 req/s on GB300 full-page images, so honouring the
-        declaration here would exempt exactly the case that regresses.
-        `--mm-processor-worker-num` still overrides this.
-        """
-        if self._preprocessing_competes_with_the_scheduler():
-            return 1
-        declared = self.auto_mm_processor_worker_num
-        return 2 if declared is None else declared
+        return resolve_auto_mm_processor_worker_num(
+            competes_with_the_scheduler=self._preprocessing_competes_with_the_scheduler(),
+            declared=self.auto_mm_processor_worker_num,
+        )
 
     def _fast_image_processor_device(self, processor) -> Optional[str]:
-        """The device for the fast image processor, or None to leave it unset.
-
-        Resolved from this processor's own ``server_args``: engines sharing a
-        tokenizer process each carry their own ``base_gpu_id``.
-        """
-        server_args = self.server_args
-        if (
-            _is_cpu
-            or get_exec().deterministic.rl_on_policy_target is not None
-            or is_true_on_policy_enabled()
-        ):
-            return "cpu"
-        if _is_xpu:
-            return "xpu"
-        if not _is_npu:
-            platform = platforms.current_platform
-            if not platform.is_cuda_alike():
-                return None
-            # Per-worker placement travels as a constructor argument, and
-            # this record is that argument.
-            return f"{platform.device_type}:{server_args.base_gpu_id}"
-        if processor.__class__.__name__ == "MiniMaxVLProcessor":
-            # MiniMax's image/video processors create 10-dim tensors during
-            # patch extraction, exceeding the Ascend 8-dim limit; patch them
-            # (same pattern as qwen-vl / GLM-4.6V) and run on NPU.
-            from sglang.srt.hardware_backend.npu.modules.minimax_m3_processor import (
-                npu_apply_minimax_m3_image_preprocess_patch,
-                npu_apply_minimax_m3_video_preprocess_patch,
-            )
-
-            npu_apply_minimax_m3_image_preprocess_patch(processor.image_processor)
-            if (
-                hasattr(processor, "video_processor")
-                and processor.video_processor is not None
-            ):
-                npu_apply_minimax_m3_video_preprocess_patch(processor.video_processor)
-            return "npu"
-        if processor.__class__.__name__ not in {"Glm4vProcessor", "Glm46VProcessor"}:
-            # For qwen-vl, the processor hits a reshape issue from the Ascend
-            # dims restriction.
-            from sglang.srt.hardware_backend.npu.modules.qwen_vl_processor import (
-                npu_apply_qwen_image_preprocess_patch,
-            )
-
-            npu_apply_qwen_image_preprocess_patch()
-            return "npu"
-        if processor.__class__.__name__ == "Glm46VProcessor":
-            from sglang.srt.hardware_backend.npu.modules.glm46v_processor import (
-                npu_apply_glm46v_image_preprocess_patch,
-            )
-
-            npu_apply_glm46v_image_preprocess_patch()
-            return "npu"
-        return None
-
-    @contextmanager
-    def _temporary_fast_processor_cuda_pool(self, device: Optional[str]):
-        """Release fast-processor CUDA temporaries after CPU feature transport."""
-        can_release = (
-            device is not None
-            and torch.device(device).type == "cuda"
-            and not self.keep_mm_features_on_device
-            and not self.precompute_hash_before_cpu_transfer
+        # Engines sharing a tokenizer process each carry their own base_gpu_id.
+        return fast_image_processor_device(
+            processor, base_gpu_id=self.server_args.base_gpu_id
         )
-        if not can_release:
-            yield
-            return
-
-        with torch.cuda.device(device):
-            pool = torch.cuda.MemPool()
-        with torch.cuda.use_mem_pool(pool, device=device):
-            yield
 
     def process_mm_data(
         self,
@@ -929,18 +685,7 @@ class BaseMultimodalProcessor(ABC):
                 return_tensors="pt",
                 **kwargs,
             )
-            # Deferred: the hash is computed on the GPU tensor first, and
-            # _precompute_hashes_before_cpu_transfer moves it down afterwards.
-            if (
-                not self.keep_mm_features_on_device
-                and not self.precompute_hash_before_cpu_transfer
-            ):
-                # move feature tensors to cpu
-                for feature_name in self.FEATURE_NAMES:
-                    if feature_name in result and isinstance(
-                        result[feature_name], torch.Tensor
-                    ):
-                        result[feature_name] = result[feature_name].to("cpu")
+            self._move_processor_output_to_cpu(result)
 
         return result
 
@@ -978,81 +723,6 @@ class BaseMultimodalProcessor(ABC):
         return estimated_frames_list
 
     @classmethod
-    def _load_single_item(
-        cls,
-        data,
-        modality: Modality,
-        frame_count_limit=None,
-        audio_sample_rate: Optional[int] = None,
-        discard_alpha_channel=True,
-    ):
-        """
-        Load a single multimodal data.
-
-        If data is processor_output or precomputed embedding, return directly.
-
-        Class method that can be pickled for multiprocessing
-        """
-        if cls._is_preprocessed_input(data):
-            return data
-        try:
-            if modality == Modality.IMAGE:
-                img, _ = load_image(data, cls.gpu_image_decode)
-                if isinstance(img, torch.Tensor):
-                    return img  # JPEG already decoded on GPU by nvJPEG
-                # PIL decodes lazily; do it here in the io worker so the decode
-                # doesn't run later on the event-loop thread.
-                if discard_alpha_channel:
-                    if cls.smart_rgb_conversion:
-                        return smart_to_rgb(img)
-                    if img.mode != "RGB":
-                        return img.convert("RGB")
-                img.load()
-                return img
-            elif modality == Modality.VIDEO:
-                return load_video(data, frame_count_limit)
-            elif modality == Modality.AUDIO:
-                return load_audio(data, audio_sample_rate)
-
-        except CLIENT_MEDIA_EXCEPTIONS as e:
-            data_str = str(data)
-            if len(data_str) > 100:
-                data_str = data_str[:100] + "..."
-            raise ValueError(f"Error while loading data {data_str}: {e}") from e
-        except Exception as e:
-            data_str = str(data)
-            if len(data_str) > 100:
-                data_str = data_str[:100] + "..."
-            raise RuntimeError(f"Error while loading data {data_str}: {e}") from e
-
-    @staticmethod
-    def _get_preprocessed_input_format(data):
-        """returns the detailed format if the provided data is already preprocessed.
-        returns none if the provided data is not preprocessed
-        """
-        if not isinstance(data, dict):
-            return None
-        data_format = data.get("format")
-        if isinstance(data_format, MultimodalInputFormat):
-            return data_format
-        if data_format in (
-            MultimodalInputFormat.PROCESSOR_OUTPUT.name,
-            "processor_output",
-        ):
-            return MultimodalInputFormat.PROCESSOR_OUTPUT
-        if data_format in (
-            MultimodalInputFormat.PRECOMPUTED_EMBEDDING.name,
-            "precomputed_embedding",
-        ):
-            return MultimodalInputFormat.PRECOMPUTED_EMBEDDING
-        return None
-
-    @classmethod
-    def _is_preprocessed_input(cls, data):
-        """returns if the data is already preprocessed (by the vlm processor)"""
-        return cls._get_preprocessed_input_format(data) is not None
-
-    @classmethod
     def _all_mm_data_is_preprocessed(cls, *data_lists):
         has_mm_data = False
         for data_list in data_lists:
@@ -1067,47 +737,6 @@ class BaseMultimodalProcessor(ABC):
                 if not cls._is_preprocessed_input(item):
                     return False
         return has_mm_data
-
-    def _submit_mm_data_loading_tasks_simple(
-        self,
-        data_list: Optional[list],
-        modality: Modality,
-        audio_sample_rate: Optional[int],
-        discard_alpha_channel: bool,
-    ) -> List[Tuple[Modality, int, concurrent.futures.Future]]:
-        """
-        Simple version: For one modal data submit IO load task.
-        Return:
-            List[(modality, index_in_that_modality, future)]
-        """
-        futures: List[Tuple[Modality, int, concurrent.futures.Future]] = []
-
-        if not data_list:
-            logger.debug(
-                "[_submit_mm_data_loading_tasks_simple] no data for modality=%s",
-                modality.name,
-            )
-            return futures
-
-        for idx, data in enumerate(data_list):
-            logger.debug(
-                "[_submit_mm_data_loading_tasks_simple] submit load task: "
-                "modality=%s, index=%d, data_type=%s",
-                modality.name,
-                idx,
-                type(data),
-            )
-            future = self.io_executor.submit(
-                self.__class__._load_single_item,
-                data,
-                modality,
-                None,  # frame_count_limit: no consider for fast path
-                audio_sample_rate,
-                discard_alpha_channel,
-            )
-            futures.append((modality, idx, future))
-
-        return futures
 
     def submit_data_loading_tasks(
         self,
@@ -1180,50 +809,6 @@ class BaseMultimodalProcessor(ABC):
                 pass
 
         return futures, task_info
-
-    @staticmethod
-    def _validate_one_modality(modality: Modality, data_list: Optional[list]):
-        if data_list is None:
-            return
-        if not isinstance(data_list, list):
-            raise TypeError(
-                f"{modality.name} must be a list or None, got {type(data_list)}"
-            )
-
-        formatted_indices = []
-        for idx, item in enumerate(data_list):
-            if BaseMultimodalProcessor._is_preprocessed_input(item):
-                formatted_indices.append(idx)
-
-        if formatted_indices:
-            if len(data_list) != 1:
-                raise ValueError(
-                    f"For {modality}, when providing a 'processor_output' or "
-                    f"'precomputed_embedding', you must pass exactly one item; "
-                    f"received {len(data_list)} items (formatted at indices {formatted_indices})."
-                )
-
-    @staticmethod
-    def validate_mm_data(
-        image_data: Optional[list] = None,
-        video_data: Optional[list] = None,
-        audio_data: Optional[list] = None,
-    ):
-        """
-        Validate multimodal input lists per modality.
-
-        Rule per modality (image/video/audio):
-        - Either the list has exactly one item and that single item is a dict with
-          format in {"processor_output", "precomputed_embedding"};
-        - Or, the list contains only "normal" items (i.e., does not include any
-          item whose format is one of the two above).
-
-        Empty or None lists are considered valid.
-        """
-
-        BaseMultimodalProcessor._validate_one_modality(Modality.IMAGE, image_data)
-        BaseMultimodalProcessor._validate_one_modality(Modality.VIDEO, video_data)
-        BaseMultimodalProcessor._validate_one_modality(Modality.AUDIO, audio_data)
 
     def _process_loaded_mm_data(self, modality, raw_data, result):
         images, videos, audios = [], [], []
@@ -1355,63 +940,12 @@ class BaseMultimodalProcessor(ABC):
             assert isinstance(prompt, str)
             prompt_str = prompt
 
-        futures: List[Tuple[Modality, int, concurrent.futures.Future]] = []
-
-        modalities_data = [
-            (image_data, Modality.IMAGE),
-            (video_data, Modality.VIDEO),
-            (audio_data, Modality.AUDIO),
-        ]
-
-        for data_list, modality in modalities_data:
-            futures.extend(
-                self._submit_mm_data_loading_tasks_simple(
-                    data_list, modality, audio_sample_rate, discard_alpha_channel
-                )
-            )
-
-        logger.debug("[load_mm_data(simple)] total futures submitted: %d", len(futures))
-
-        images: List[Any] = [None] * len(image_data) if image_data else []
-        videos: List[Any] = [None] * len(video_data) if video_data else []
-        audios: List[Any] = [None] * len(audio_data) if audio_data else []
-
-        for modality, idx, future in futures:
-            try:
-                result = await asyncio.wrap_future(future)
-            except ValueError as e:
-                logger.info(
-                    "[load_mm_data(simple)] invalid %s data at index=%d: %s",
-                    modality.name,
-                    idx,
-                    e,
-                )
-                raise ValueError(
-                    f"An exception occurred while loading {modality.name} data "
-                    f"at index {idx}: {e}"
-                ) from e
-            except Exception as e:
-                logger.exception(
-                    "[load_mm_data(simple)] error loading %s data at index=%d",
-                    modality.name,
-                    idx,
-                )
-                raise RuntimeError(
-                    f"An exception occurred while loading {modality.name} data at index {idx}: {e}"
-                )
-
-            if modality == Modality.IMAGE:
-                images[idx] = result
-            elif modality == Modality.VIDEO:
-                videos[idx] = result
-            elif modality == Modality.AUDIO:
-                audios[idx] = result
-
-        logger.debug(
-            "[load_mm_data(simple)] loaded counts: images=%d, videos=%d, audios=%d",
-            len(images),
-            len(videos),
-            len(audios),
+        images, videos, audios = await self._load_media_lists(
+            image_data,
+            video_data,
+            audio_data,
+            audio_sample_rate=audio_sample_rate,
+            discard_alpha_channel=discard_alpha_channel,
         )
 
         return BaseMultiModalProcessorOutput(
@@ -1717,40 +1251,16 @@ class BaseMultimodalProcessor(ABC):
             return input_ids.flatten().to(dtype=torch.long)
         return torch.tensor(input_ids, dtype=torch.long).flatten()
 
-    def _wrap_tensor_for_cuda_ipc(self, tensor: torch.Tensor):
-        """helper function to turn a tensor into a cuda-ipc tensor"""
-        if not tensor.is_cuda:
-            return tensor
-
-        proxy = self.cudaipc_mmfeature_pool.wrap_tensor(
-            tensor,
-            use_pool_handle_cache=self.use_ipc_pool_handle_cache,
-        )
-        return proxy if proxy is not None else tensor.cpu()
-
     @staticmethod
     def _move_feature_to_cpu(value):
-        if isinstance(value, torch.Tensor):
-            return value.cpu()
-        if isinstance(value, list):
-            return [BaseMultimodalProcessor._move_feature_to_cpu(v) for v in value]
-        if isinstance(value, tuple):
-            return tuple(BaseMultimodalProcessor._move_feature_to_cpu(v) for v in value)
-        return value
+        return move_feature_to_cpu(value)
 
     def _precompute_hashes_before_cpu_transfer(
         self, mm_items: List[MultimodalDataItem]
     ) -> None:
         if not self.precompute_hash_before_cpu_transfer:
             return
-
-        for item in mm_items:
-            item.set_pad_value()
-            if not self.keep_mm_features_on_device:
-                item.feature = self._move_feature_to_cpu(item.feature)
-                item.precomputed_embeddings = self._move_feature_to_cpu(
-                    item.precomputed_embeddings
-                )
+        self._feature_transport.precompute_hashes_before_cpu_transfer(mm_items)
 
     def resolve_image_token_counts(self, images: List) -> List[int]:
         """Per-image expanded token counts, computed without re-tokenizing.
@@ -1761,19 +1271,7 @@ class BaseMultimodalProcessor(ABC):
         does not implement it (e.g. Kimi) override this method.
 
         """
-        assert images is not None
-        image_sizes = [
-            (
-                tuple(image.shape[-2:])
-                if isinstance(image, torch.Tensor)
-                else (image.height, image.width)
-            )
-            for image in images
-        ]
-        num_image_tokens = self._processor._get_num_multimodal_tokens(
-            image_sizes=image_sizes
-        ).num_image_tokens
-        return [int(count) for count in num_image_tokens]
+        return resolve_hf_image_token_counts(self._processor, images)
 
     @staticmethod
     def _expand_input_ids(
@@ -2008,42 +1506,7 @@ class BaseMultimodalProcessor(ABC):
     def _prepare_mm_items_for_transport(
         self, mm_items: List[MultimodalDataItem]
     ) -> List[MultimodalDataItem]:
-        """Wrap final GPU features, rolling back every lease if one wrap fails."""
-        if not self.use_cuda_ipc:
-            return mm_items
-
-        # Pool misses fall back to plain CPU tensors. The scheduler copies out
-        # and releases each successful pool slice.
-        updates = []
-        try:
-            for item in mm_items:
-                fields = (
-                    ("feature", item.feature),
-                    ("precomputed_embeddings", item.precomputed_embeddings),
-                )
-                for field, tensor in fields:
-                    if not isinstance(tensor, torch.Tensor):
-                        continue
-                    wrapped = self._wrap_tensor_for_cuda_ipc(tensor)
-                    setattr(item, field, wrapped)
-                    updates.append((item, field, tensor, wrapped))
-        except BaseException as error:
-            rollback_errors = []
-            for item, field, tensor, wrapped in reversed(updates):
-                try:
-                    if isinstance(wrapped, CudaIpcTensorTransportProxy):
-                        self.cudaipc_mmfeature_pool.cancel_proxy(wrapped)
-                except BaseException as rollback_error:
-                    rollback_errors.append(rollback_error)
-                finally:
-                    setattr(item, field, tensor)
-            if rollback_errors:
-                error.add_note(
-                    f"{len(rollback_errors)} CUDA IPC rollback operation(s) also failed"
-                )
-                raise error from rollback_errors[0]
-            raise
-        return mm_items
+        return self._feature_transport.prepare_mm_items_for_transport(mm_items)
 
     async def process_and_combine_mm_data_async(
         self,

@@ -13,6 +13,9 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputFormat,
 )
 from sglang.srt.multimodal.processors.pixtral import PixtralProcessor
+from sglang.srt.multimodal.transport.feature_transport import (
+    MultimodalFeatureTransport,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -23,6 +26,9 @@ class TestPixtralProcessor(CustomTestCase):
     def _make_processor(self):
         processor = object.__new__(PixtralProcessor)
         processor.use_cuda_ipc = True
+        processor._feature_transport = MultimodalFeatureTransport(
+            "cuda_ipc", base_gpu_id=0, skip_mm_pool=True
+        )
         processor.image_size = 1024
         processor._effective_patch_size = 28
         processor._precompute_hashes_before_cpu_transfer = MagicMock()
@@ -32,7 +38,9 @@ class TestPixtralProcessor(CustomTestCase):
         """CUDA IPC dispatch must receive per-image tensors, not a bundled proxy."""
         processor = self._make_processor()
         proxies = [object(), object()]
-        processor._wrap_tensor_for_cuda_ipc = MagicMock(side_effect=proxies)
+        processor._feature_transport._wrap_tensor_for_cuda_ipc = MagicMock(
+            side_effect=proxies
+        )
 
         feature = torch.arange(8).reshape(2, 4)
         image_sizes = torch.tensor([[10, 20], [30, 40]])
@@ -69,7 +77,8 @@ class TestPixtralProcessor(CustomTestCase):
             torch.equal(items[1].model_specific_data["image_sizes"], image_sizes[1:])
         )
         wrapped_features = [
-            call.args[0] for call in processor._wrap_tensor_for_cuda_ipc.call_args_list
+            call.args[0]
+            for call in processor._feature_transport._wrap_tensor_for_cuda_ipc.call_args_list
         ]
         self.assertTrue(torch.equal(wrapped_features[0], feature[:1]))
         self.assertTrue(torch.equal(wrapped_features[1], feature[1:]))
@@ -78,7 +87,7 @@ class TestPixtralProcessor(CustomTestCase):
     def test_already_split_one_row_images_are_preserved(self):
         """Generic per-image splits must not be collapsed and re-sliced by Pixtral."""
         processor = self._make_processor()
-        processor._wrap_tensor_for_cuda_ipc = MagicMock(
+        processor._feature_transport._wrap_tensor_for_cuda_ipc = MagicMock(
             side_effect=[object(), object()]
         )
         bundled_item = MultimodalDataItem(
@@ -94,7 +103,8 @@ class TestPixtralProcessor(CustomTestCase):
         self.assertEqual(len(items), 2)
         self.assertEqual([item.offsets for item in items], [[(0, 0)], [(2, 2)]])
         wrapped_features = [
-            call.args[0] for call in processor._wrap_tensor_for_cuda_ipc.call_args_list
+            call.args[0]
+            for call in processor._feature_transport._wrap_tensor_for_cuda_ipc.call_args_list
         ]
         self.assertTrue(torch.equal(wrapped_features[0], bundled_item.feature[:1]))
         self.assertTrue(torch.equal(wrapped_features[1], bundled_item.feature[1:]))
