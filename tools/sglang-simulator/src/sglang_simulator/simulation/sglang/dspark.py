@@ -12,6 +12,7 @@ import json
 import math
 import time
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Protocol
 
 from sglang_simulator.time_predictor.base import PredictorError
@@ -55,6 +56,25 @@ def _canonical_object(value, label):
     if not isinstance(parsed, dict) or not parsed or value != canonical:
         _fail(f"{label} must be a nonempty canonical JSON object")
     return parsed
+
+
+def _read_canonical_budget(value, label):
+    budget = _canonical_object(value, label).get("max_new_tokens")
+    return budget if type(budget) is int else None
+
+
+@lru_cache(maxsize=32)
+def _cached_canonical_budget(value, label):
+    # Retain only immutable validation metadata, never the parsed object.
+    return _read_canonical_budget(value, label)
+
+
+def _canonical_budget(value, label):
+    # The bound limits retention only; larger or non-builtin inputs retain the
+    # original validation/error path without hashing user-defined objects.
+    if type(value) is str and type(label) is str and len(value) <= 1024 * 1024:
+        return _cached_canonical_budget(value, label)
+    return _read_canonical_budget(value, label)
 
 
 @dataclass(frozen=True)
@@ -110,13 +130,12 @@ class DSparkRequest:
             or self.output_tokens_before >= self.max_new_tokens
         ):
             _fail("DSPark request has inconsistent before-state")
-        recipe = _canonical_object(self.sampling_params_json, "sampling_params_json")
+        recipe_budget = _canonical_budget(
+            self.sampling_params_json, "sampling_params_json"
+        )
         if type(self.emits_output) is not bool:
             _fail("emits_output must reflect the native chunk completion flag")
-        if (
-            type(recipe.get("max_new_tokens")) is not int
-            or recipe["max_new_tokens"] != self.max_new_tokens
-        ):
+        if recipe_budget is None or recipe_budget != self.max_new_tokens:
             _fail("DSPark output budget differs from its full sampling recipe")
 
     @property
@@ -156,7 +175,7 @@ class DSparkGroup:
             _fail("DSPark group requests must be an immutable typed tuple")
         if (self.forward_mode == "IDLE") != (not self.requests):
             _fail("only an explicit idle group may have no local requests")
-        _canonical_object(self.execution_json, "execution_json")
+        _canonical_budget(self.execution_json, "execution_json")
 
 
 @dataclass(frozen=True)
@@ -179,7 +198,7 @@ class DSparkStep:
         ids = [request.rid for group in self.groups for request in group.requests]
         if len(set(ids)) != len(ids) or not ids:
             _fail("DSPark step requires unique live requests across all groups")
-        _canonical_object(self.runtime_profile_json, "runtime_profile_json")
+        _canonical_budget(self.runtime_profile_json, "runtime_profile_json")
 
     @property
     def requests(self):

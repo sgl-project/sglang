@@ -42,6 +42,12 @@ This representation does not implement a DP load balancer or establish measured
 support for these layouts. Heterogeneous prefill/verify phases require a separate
 source-specific coordination adapter.
 
+Repeated immutable before-work inputs reuse a bounded cache of successful
+canonical JSON validation and integer recipe budgets. The cache retains no
+parsed mutable objects, preserves the complete original serialized strings, and
+does not bypass per-request budget or before-state checks. Its size limits only
+retention; larger valid inputs still use the original validation path.
+
 The integration seam is an explicitly configured predictor with
 `supports_dspark = True` and a `dspark_runtime` object:
 
