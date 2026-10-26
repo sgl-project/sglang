@@ -4364,9 +4364,7 @@ class Scheduler(
             # attribute); every other model keeps the previous raise behavior.
             if (
                 "out of memory" not in str(e).lower()
-                or getattr(
-                    self.token_to_kv_pool_allocator, "c128_attn_allocator", None
-                )
+                or getattr(self.token_to_kv_pool_allocator, "c128_attn_allocator", None)
                 is None
             ):
                 raise

@@ -358,7 +358,10 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
 
     def c128_available_pages(self) -> int:
         """Currently free C128 pages (the unit `_has_c128_sidecar_capacity` judges in)."""
-        return self.c128_attn_allocator.available_size() // self.c128_attn_allocator.page_size
+        return (
+            self.c128_attn_allocator.available_size()
+            // self.c128_attn_allocator.page_size
+        )
 
     def _alloc_compressed_kv(
         self,
