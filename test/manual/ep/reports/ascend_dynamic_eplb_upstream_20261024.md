@@ -1,5 +1,11 @@
 # Ascend dynamic EPLB: community-port self-test
 
+> Scope update (2026-10-26): this report preserves results for the pinned
+> historical revisions below. The PR now uses upstream rebalance scheduling;
+> the automatic 64-step initial learning policy has been removed. Subsequent
+> code cleanup and this policy removal have not been hardware-tested, and the
+> throughput improvements below are not measurements of the latest PR revision.
+
 ## Source and validation scope
 
 Community base: `de7055f59645ebe03784b0980e1f222789f468a3`.

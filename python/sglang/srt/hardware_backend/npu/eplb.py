@@ -12,7 +12,11 @@
 # limitations under the License.
 # ==============================================================================
 
-"""Ascend EPLB communication, weight staging and draft-recording helpers."""
+"""Ascend EPLB adapters used by the shared recorder and weight updater.
+
+Non-NPU calls retain default communication and tensor allocation behavior.
+Import torch_npu only when an NPU operation actually needs it.
+"""
 
 import logging
 from functools import wraps
@@ -28,8 +32,12 @@ _group_world = None
 _device_group = None
 
 
-def get_eplb_device_group():
-    """Return a cached HCCL group with WORLD membership for NPU EPLB."""
+def get_eplb_device_group() -> dist.ProcessGroup | None:
+    """Return the NPU EPLB group, or None to use the default group elsewhere.
+
+    Creation is collective: all WORLD ranks must reach the first call in the
+    same order. Cache against WORLD identity to handle distributed reinit.
+    """
     global _group_world, _device_group
     if get_device().device != "npu" or not dist.is_initialized():
         return None
@@ -53,8 +61,12 @@ def get_eplb_device_group():
     return _device_group
 
 
-def execute_p2p_ops(ops):
-    """Complete one P2P batch, staging internal NPU views through ND buffers."""
+def execute_p2p_ops(ops: list[P2POp]) -> None:
+    """Wait for one P2P batch, then copy staged receives back to their targets.
+
+    The main updater already stages whole NZ layers. Keep this fallback for
+    callers of update_expert_weights_single_layer that pass internal views.
+    """
     staged_ops, receive_copies = [], []
     for op in ops:
         tensor = op.tensor
@@ -72,7 +84,7 @@ def execute_p2p_ops(ops):
         target.copy_(buffer)
 
 
-def needs_nd_staging(tensor):
+def needs_nd_staging(tensor: torch.Tensor) -> bool:
     """Internal NPU formats need ordinary buffers for expert-slot copies."""
     if tensor.device.type != "npu":
         return False
@@ -90,7 +102,8 @@ def filter_unchanged_layers(layer_ids, old_map, new_map, *, elastic_enabled):
     ]
 
 
-def create_temp_buffers(sample_tensors):
+def create_temp_buffers(sample_tensors: list[torch.Tensor]) -> list[torch.Tensor]:
+    """Allocate slot-copy buffers, using ordinary storage for internal NPU formats."""
     return [
         torch.empty(tensor.shape, dtype=tensor.dtype, device=tensor.device)
         if needs_nd_staging(tensor)
@@ -100,9 +113,14 @@ def create_temp_buffers(sample_tensors):
 
 
 class ExpertWeightStaging:
-    """Reuse one ND layer workspace and write back into original model storage."""
+    """Reuse one ND workspace across layers with matching weight shapes.
 
-    def __init__(self, sample_tensors):
+    load() prepares the tensors that the updater mutates; store() copies the
+    result into model storage without changing addresses held by captured graphs.
+    Ordinary weights pass through unchanged and need no extra workspace.
+    """
+
+    def __init__(self, sample_tensors: list[torch.Tensor]):
         # Per-expert NZ conversion can copy the whole backing tensor.
         self.buffers = (
             create_temp_buffers(sample_tensors)
@@ -110,14 +128,14 @@ class ExpertWeightStaging:
             else None
         )
 
-    def load(self, weights):
+    def load(self, weights: list[torch.Tensor]) -> list[torch.Tensor]:
         if self.buffers is None:
             return weights
         for buffer, weight in zip(self.buffers, weights, strict=True):
             buffer.copy_(weight)
         return self.buffers
 
-    def store(self, weights):
+    def store(self, weights: list[torch.Tensor]) -> None:
         if self.buffers is not None:
             for weight, buffer in zip(weights, self.buffers, strict=True):
                 weight.copy_(buffer)

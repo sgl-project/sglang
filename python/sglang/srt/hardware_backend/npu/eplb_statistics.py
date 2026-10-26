@@ -25,11 +25,27 @@ logger = logging.getLogger(__name__)
 
 
 class NpuExpertDistributionGatherer(distribution._SelectExpertsSinglePassGatherer):
+    """Buffer small forwards; count larger calls directly without dropping routes.
+
+    Capture fixes the buffer slices written by each graph. Replay restores the
+    graph's batching flag because Python routing hooks do not run on replay.
+    The recorder owns reset/collect around each recorded forward.
+    """
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        capacity = int(os.environ.get("SGLANG_NPU_EPLB_STATS_MAX_ROUTES", "96"))
+        capacity_env = "SGLANG_NPU_EPLB_STATS_MAX_ROUTES"
+        raw_capacity = os.environ.get(capacity_env, "96")
+        try:
+            capacity = int(raw_capacity)
+        except ValueError as error:
+            raise ValueError(
+                f"{capacity_env} must be an integer in [1, 65536], got {raw_capacity!r}"
+            ) from error
         if not 1 <= capacity <= 65536:
-            raise ValueError("Invalid batched statistics route capacity")
+            raise ValueError(f"{capacity_env} must be in [1, 65536], got {capacity}")
+        # Capacity counts routes, not tokens: 96 holds 16 tokens at top-k 6.
+        # It only selects the batching path; overflow still counts every route.
         # All captured graphs write to this shared buffer.
         self._batched_routes = torch.full(
             (self._data.shape[0], capacity),
@@ -42,15 +58,15 @@ class NpuExpertDistributionGatherer(distribution._SelectExpertsSinglePassGathere
         self._has_batched_routes = False
         logger.info("[NPU EPLB batch statistics] capacity=%d routes/layer", capacity)
 
-    def on_graph_capture_forward_start(self):
+    def on_graph_capture_forward_start(self) -> None:
         # Capture warmups bypass the normal reset. Reset offsets without
         # recording a buffer clear into the graph.
         self._route_offsets = [0] * len(self._route_offsets)
 
-    def get_graph_capture_state(self):
+    def get_graph_capture_state(self) -> bool:
         return any(self._route_offsets)
 
-    def on_graph_replay_forward_start(self, has_batched_routes):
+    def on_graph_replay_forward_start(self, has_batched_routes: bool) -> None:
         # Graph replay does not call the Python on_select_experts hook.
         self._has_batched_routes |= has_batched_routes
 
@@ -62,7 +78,7 @@ class NpuExpertDistributionGatherer(distribution._SelectExpertsSinglePassGathere
         self._batch_collected = False
         self._has_batched_routes = False
 
-    def on_select_experts(self, layer_idx, topk_ids):
+    def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor) -> None:
         count = topk_ids.numel()
         start = self._route_offsets[layer_idx]
         end = start + count
@@ -83,7 +99,8 @@ class NpuExpertDistributionGatherer(distribution._SelectExpertsSinglePassGathere
         return super().collect()
 
 
-def _get_npu_gatherers(recorder=None):
+def _get_npu_gatherers(recorder=None) -> dict[str, NpuExpertDistributionGatherer]:
+    """Keep access to the shared recorder's internal state in one adapter."""
     if recorder is None:
         recorder = distribution.get_global_expert_distribution_recorder()
     if (
@@ -103,7 +120,7 @@ def on_graph_capture_forward_start(recorder=None):
         gatherer.on_graph_capture_forward_start()
 
 
-def get_graph_capture_state(recorder=None):
+def get_graph_capture_state(recorder=None) -> dict[str, bool]:
     return {
         key: gatherer.get_graph_capture_state()
         for key, gatherer in _get_npu_gatherers(recorder).items()

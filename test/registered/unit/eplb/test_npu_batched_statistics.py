@@ -189,8 +189,11 @@ class TestNpuBatchedStatistics(unittest.TestCase):
         self.assertEqual(gatherer._batched_routes.data_ptr(), route_pointer)
 
     def test_capacity_validation(self):
-        for capacity in (0, 65537):
-            with self.subTest(capacity=capacity), self.assertRaises(ValueError):
+        for capacity in (0, 65537, "invalid"):
+            with (
+                self.subTest(capacity=capacity),
+                self.assertRaisesRegex(ValueError, "SGLANG_NPU_EPLB_STATS_MAX_ROUTES"),
+            ):
                 self.gatherer(capacity)
 
     def test_noop_capture_callback_is_safe(self):
