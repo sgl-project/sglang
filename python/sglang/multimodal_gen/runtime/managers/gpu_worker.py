@@ -632,9 +632,13 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
     def execute_forward_sequentially(self, batch: list[Req]) -> Iterator[OutputBatch]:
         """Yield grouped results after each request finishes its terminal stage."""
         assert self.pipeline is not None
-        request_gc.collect_after_warmup()
+        if not any(
+            req.is_warmup or req.extra.get("server_internal_prewarm") for req in batch
+        ):
+            request_gc.collect_after_warmup()
         results = self.pipeline.forward_batch_sequentially(batch, self.server_args)
         group_start_time = time.monotonic()
+        failed = False
 
         try:
             for req in batch:
@@ -669,10 +673,15 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                     request_gc.collect_after_warmup()
                 yield output_batch
                 del output_batch
+        except Exception:
+            failed = True
+            raise
         finally:
             close = getattr(results, "close", None)
             if close is not None:
                 close()
+            if failed:
+                request_gc.collect_after_warmup()
 
     def _collect_sequential_outputs(
         self,

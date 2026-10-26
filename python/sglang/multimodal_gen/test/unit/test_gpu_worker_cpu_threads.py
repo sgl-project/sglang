@@ -77,7 +77,10 @@ class TestRequestGarbageCollection(CustomTestCase):
         gc.set_threshold(2**31 - 1, 2**31 - 1, 2**31 - 1)
         worker = gpu_worker.GPUWorker.__new__(gpu_worker.GPUWorker)
         worker.server_args = SimpleNamespace(
-            pipeline_config=SimpleNamespace(supports_auto_residency=False)
+            pipeline_config=SimpleNamespace(
+                supports_auto_residency=False,
+                supports_sequential_multi_output_inference=lambda: False,
+            )
         )
         worker.is_output_rank = False
         worker._release_warmup_pool_before_serving = False
@@ -134,6 +137,50 @@ class TestRequestGarbageCollection(CustomTestCase):
                                 self.assertIs(output, req)
                         finally:
                             request_gc.collect_after_warmup()
+
+            for fail in (False, True):
+                with self.subTest(sequential=True, fail=fail):
+                    refs = []
+                    req = gpu_worker.Req(
+                        sampling_params=SamplingParams(), is_warmup=True
+                    )
+
+                    class Outputs:
+                        def __next__(self):
+                            if gc.isenabled():
+                                raise AssertionError("GC enabled during forward")
+                            if fail:
+                                raise RuntimeError("sequential warmup failure")
+                            return gpu_worker.OutputBatch()
+
+                        def close(self):
+                            # Only collection after close can reclaim this cycle.
+                            obj = Temporary()
+                            obj.cycle = obj
+                            refs.append(weakref.ref(obj))
+
+                    worker.pipeline = SimpleNamespace(
+                        forward_batch_sequentially=lambda *args: Outputs()
+                    )
+                    request_gc.mark_warmup()
+                    try:
+                        with patch.object(gc, "collect", wraps=gc.collect) as collect:
+                            if fail:
+                                with self.assertRaisesRegex(
+                                    RuntimeError, "sequential warmup failure"
+                                ):
+                                    list(worker.execute_forward_sequentially([req]))
+                            else:
+                                outputs = list(
+                                    worker.execute_forward_sequentially([req])
+                                )
+                                self.assertEqual(len(outputs), 1)
+                            self.assertEqual(collect.call_count, int(fail))
+                        self.assertEqual(len(refs), 1)
+                        self.assertEqual(refs[0]() is None, fail)
+                        self.assertTrue(gc.isenabled())
+                    finally:
+                        request_gc.collect_after_warmup()
 
     def test_overlap_restores_gc_only_after_last_thread(self):
         for first_to_finish in (0, 1):
