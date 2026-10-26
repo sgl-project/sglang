@@ -7,20 +7,26 @@ Mooncake 0.3.13 this relies on (probed against a live master):
 - ``put_batch`` returns one status for the whole call, and a failed call can leave some
   of its keys stored.
 - A put copies through the client's local buffer and fails at once (-600) when the
-  buffer has no room; it never waits. Reads come out of the same buffer and hold
-  their part of it for as long as their views live.
+  buffer has no room; it never waits.
+- ``get_into`` reads one part straight into memory registered with ``register_buffer``,
+  without the local buffer. It returns the bytes read; -704 for a missing part; -600
+  when the part is larger than the destination; or another negative code, such as -707
+  for a read that outlasted its lease. It releases the GIL while it waits.
 - A read leaves a lease on the key, and a remove without ``force`` fails (-706) while
   the lease lasts.
 """
 
 from __future__ import annotations
 
+import concurrent.futures
+import itertools
 import logging
 import threading
 import uuid
-from typing import Callable, Mapping, Sequence, Union
+from typing import Callable, Mapping, NoReturn, Sequence, Union
 
 import msgspec
+import numpy as np
 from mooncake.store import MooncakeDistributedStore, ReplicateConfig
 
 from radix_transfer_plugins.backend import StorageBackend
@@ -28,7 +34,12 @@ from radix_transfer_plugins.backend import StorageBackend
 logger = logging.getLogger(__name__)
 
 _LOCAL_BUFFER_FULL = -600
+# The same code from get_into: the stored part is larger than the destination.
+_BUFFER_TOO_SMALL = -600
 _OBJECT_NOT_FOUND = -704
+# Reads fetch one part per get_into call; this many calls in flight fill the gaps between
+# calls (4 matched one batch_get_into over RDMA), and more only share the same bandwidth.
+_READ_THREADS = 4
 
 _SIZE_UNITS = {
     "kb": 1024,
@@ -46,6 +57,7 @@ class MooncakeConfig(
     master_server_address: str
     local_hostname: str
     # Bytes, or a string such as "2gb"; bounds the bytes of puts in flight at once.
+    # Reads do not use it, so a client that only reads can set 0.
     local_buffer_size: Union[int, str]
     key_prefix: str
     protocol: str = "rdma"
@@ -111,26 +123,49 @@ class MooncakeBackend(StorageBackend):
         part_keys = [
             _part_key(key, name) for key, named in zip(keys, parts) for name, _ in named
         ]
-        handles = iter(self._store.batch_get_buffer(part_keys) if part_keys else [])
-        objects = []
-        for key, named in zip(keys, parts):
-            got = {}
-            for name, nbytes in named:
-                handle = next(handles)
-                if handle is None:
-                    raise KeyError(
-                        f"output store part not found: {_part_key(key, name)}"
+        sizes = [nbytes for named in parts for _, nbytes in named]
+        offsets = list(itertools.accumulate(sizes, initial=0))[:-1]
+        # One array for every part: one registration per read, and the caller owns it.
+        memory = np.empty(sum(sizes), dtype=np.uint8)
+        if part_keys:
+            self._read_into(memory, keys=part_keys, offsets=offsets, sizes=sizes)
+        views = (memoryview(memory[o : o + n]) for o, n in zip(offsets, sizes))
+        return [{name: next(views) for name, _ in named} for named in parts]
+
+    def _read_into(
+        self,
+        memory: np.ndarray,
+        *,
+        keys: Sequence[str],
+        offsets: Sequence[int],
+        sizes: Sequence[int],
+    ) -> None:
+        base = memory.ctypes.data
+        status = self._store.register_buffer(base, memory.nbytes)
+        if status != 0:
+            raise RuntimeError(
+                f"Mooncake register_buffer of {memory.nbytes} bytes failed: {status}"
+            )
+        try:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=min(_READ_THREADS, len(keys))
+            ) as pool:
+                results = list(
+                    pool.map(
+                        self._store.get_into, keys, [base + o for o in offsets], sizes
                     )
-                # Mooncake exports signed bytes; the view keeps the handle alive.
-                data = memoryview(handle).cast("B")
-                if data.nbytes != nbytes:
-                    raise ValueError(
-                        f"output store part {_part_key(key, name)} has {data.nbytes} bytes, "
-                        f"its ref says {nbytes}"
-                    )
-                got[name] = data
-            objects.append(got)
-        return objects
+                )
+        finally:
+            status = self._store.unregister_buffer(base)
+            if status != 0:
+                logger.error("Mooncake unregister_buffer failed: %s", status)
+        failed = [
+            (key, got, nbytes)
+            for key, got, nbytes in zip(keys, results, sizes)
+            if got != nbytes
+        ]
+        if failed:
+            _raise_failed_reads(failed)
 
     def delete_many(
         self, keys: Sequence[str], *, parts: Sequence[Sequence[str]]
@@ -207,6 +242,24 @@ def parse_size(value: Union[int, str]) -> int:
                 return int(float(text[: -len(suffix)]) * multiplier)
         return int(text)
     raise ValueError(f"invalid size {value!r}; use bytes or a string such as '2gb'")
+
+
+def _raise_failed_reads(failed: Sequence[tuple[str, int, int]]) -> NoReturn:
+    """``failed`` holds (key, get_into result, the size the ref says) of each failed read."""
+    for key, got, _ in failed:
+        if got == _OBJECT_NOT_FOUND:
+            raise KeyError(f"output store part not found: {key}")
+    for key, got, nbytes in failed:
+        if got >= 0 or got == _BUFFER_TOO_SMALL:
+            stored = got if got >= 0 else f"more than {nbytes}"
+            raise ValueError(
+                f"output store part {key} has {stored} bytes, its ref says {nbytes}"
+            )
+    key, got, _ = failed[0]
+    raise RuntimeError(
+        f"Mooncake could not read {len(failed)} of the stored parts, such as {key}: "
+        f"{got} (see the Mooncake log)"
+    )
 
 
 def _part_key(object_key: str, name: str) -> str:

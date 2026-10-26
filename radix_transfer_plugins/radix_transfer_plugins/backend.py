@@ -36,7 +36,12 @@ class StorageBackend(ABC):
     def get_many(
         self, keys: Sequence[str], *, parts: Sequence[Sequence[tuple[str, int]]]
     ) -> list[dict[str, memoryview]]:
-        """Read the named parts of each object; ``parts`` gives each part's size."""
+        """Read the named parts of each object into memory the caller then owns.
+
+        ``parts`` gives each part's size. Raises ``KeyError`` for a part that is not
+        stored, ``ValueError`` for one whose size differs, and ``RuntimeError`` for a
+        stored part that could not be read.
+        """
 
     @abstractmethod
     def delete_many(
