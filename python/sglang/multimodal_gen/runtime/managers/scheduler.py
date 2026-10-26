@@ -54,6 +54,7 @@ from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 from sglang.multimodal_gen.runtime.managers.pi05_segment_scheduler import (
     Pi05SegmentSchedulerMixin,
 )
+from sglang.multimodal_gen.runtime.managers.request_gc import request_gc
 from sglang.multimodal_gen.runtime.observability.metrics import DiffusionMetrics
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.request_utils import (
@@ -334,6 +335,13 @@ class Scheduler(
         """Dispatch generation requests, merging compatible requests when allowed."""
         reqs = self._normalize_generation_reqs(reqs)
         if self._async_output_save:
+            # continuous forward/save overlap must occasionally leave GC enabled
+            if request_gc.needs_collection_window() or any(
+                req.is_warmup or req.extra.get("server_internal_prewarm")
+                for req in reqs
+            ):
+                while self._inflight_finalizes:
+                    self._inflight_finalizes.popleft().result()
             # Reserve capacity before any forward allocates another output.
             # The single finalize worker completes futures in FIFO order.
             while len(self._inflight_finalizes) >= _MAX_INFLIGHT_FINALIZES:
@@ -821,6 +829,7 @@ class Scheduler(
             is_warmup_req(processed_req) and should_return_warmup_result(processed_req)
         )
 
+    @request_gc.defer()
     def return_result(
         self,
         output_batch: OutputBatch,
@@ -917,6 +926,7 @@ class Scheduler(
         )
         self._inflight_finalizes.append(future)
 
+    @request_gc.defer()
     def _finalize_and_reply(
         self,
         *,
