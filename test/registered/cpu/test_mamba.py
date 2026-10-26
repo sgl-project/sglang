@@ -157,6 +157,69 @@ def chunk_gated_delta_rule_update(
     return output, final_state
 
 
+def _chunk_factors(q, k, gate, beta, scale):
+    heads, tokens, _ = q.shape
+    aqk = torch.zeros(heads, tokens, tokens)
+    lower = torch.zeros_like(aqk)
+    for row in range(0, tokens, 16):
+        stop = min(row + 16, tokens)
+        decay = torch.exp2(gate[:, row:stop, None, :] - gate[:, None, row:stop, :])
+        keys = k[:, None, row:stop, :] * decay
+        aqk[:, row:stop, row:stop] = (q[:, row:stop, None, :] * keys).sum(-1) * scale
+        lower[:, row:stop, row:stop] = (k[:, row:stop, None, :] * keys).sum(-1)
+        anchor = gate[:, row : row + 1]
+        qg = (
+            (q[:, row:stop] * torch.exp2(gate[:, row:stop] - anchor)).bfloat16().float()
+        )
+        kg = (
+            (k[:, row:stop] * torch.exp2(gate[:, row:stop] - anchor)).bfloat16().float()
+        )
+        for col in range(0, row, 16):
+            other = (
+                (k[:, col : col + 16] * torch.exp2(anchor - gate[:, col : col + 16]))
+                .bfloat16()
+                .float()
+                .transpose(-1, -2)
+            )
+            aqk[:, row:stop, col : col + 16] = (qg @ other) * scale
+            lower[:, row:stop, col : col + 16] = kg @ other
+    lower = torch.tril(lower, diagonal=-1) * beta[..., None]
+    identity = torch.eye(tokens).expand(heads, -1, -1)
+    inverse = torch.linalg.solve_triangular(identity + lower, identity, upper=False)
+    return torch.tril(aqk), inverse
+
+
+def _torch_chunk_kda(query, key, value, gate, beta, state):
+    dtype, scale = query.dtype, query.shape[-1] ** -0.5
+    group = value.shape[1] // query.shape[1]
+    q, k = [
+        l2norm(x.float()).to(dtype).transpose(0, 1).float().repeat_interleave(group, 0)
+        for x in (query, key)
+    ]
+    v, gate, beta = [x.float().transpose(0, 1) for x in (value, gate, beta)]
+    output, snapshots = torch.empty_like(v), []
+    for start in range(0, query.shape[0], 64):
+        part = slice(start, start + 64)
+        qs, ks, vs, bs = [x[:, part] for x in (q, k, v, beta)]
+        gs = gate[:, part].cumsum(1) * 1.4426950216293335
+        snapshots.append(state.to(dtype))
+        aqk, inverse = _chunk_factors(qs, ks, gs, bs, scale)
+        aqk, inverse = [x.to(dtype).float() for x in (aqk, inverse)]
+        w = (
+            (inverse @ (ks * bs[..., None] * gs.exp2()).to(dtype).float())
+            .to(dtype)
+            .float()
+        )
+        u = (inverse @ (vs * bs[..., None]).to(dtype).float()).to(dtype).float()
+        rounded_state = state.to(dtype).float()
+        residual = (u - w @ rounded_state.transpose(-1, -2)).to(dtype).float()
+        qg = ((qs * scale).to(dtype).float() * gs.exp2()).to(dtype).float()
+        output[:, part] = qg @ rounded_state.transpose(-1, -2) + aqk @ residual
+        kg = (ks * (gs[:, -1:] - gs).exp2()).to(dtype).float()
+        state = state * gs[:, -1:].exp2() + residual.transpose(-1, -2) @ kg
+    return output.transpose(0, 1).to(dtype), state, torch.stack(snapshots)
+
+
 def torch_recurrent_gated_delta_rule(
     query,
     key,
@@ -328,6 +391,98 @@ def test_chunk_gated_delta_rule(B, T_PER_SEQ, HK, HV, K, V, POOL_SIZE):
         torch.testing.assert_close(
             initial_state[untouched_slots], initial_state_before[untouched_slots]
         )
+
+
+@pytest.mark.parametrize(
+    "dtype,dim,lower_bound",
+    [
+        (torch.bfloat16, 64, None),
+        (torch.bfloat16, 128, -5.0),
+        (torch.float16, 64, -5.0),
+        (torch.float16, 128, None),
+    ],
+)
+def test_chunk_kda(dtype, dim, lower_bound):
+    tokens, heads, value_heads = 146, 2, 4
+    q, k = [
+        torch.randn(1, tokens, heads, dim).to(dtype)
+        for _ in range(2)
+    ]
+    v = torch.randn(1, tokens, value_heads, dim).to(dtype) * 0.1
+    raw_gate = torch.randn(v.shape).to(dtype) * 0.35
+    beta = torch.randn(1, tokens, value_heads + 3).to(dtype)[
+        ..., :value_heads
+    ]
+    a_log = torch.randn(value_heads) * 0.2 - 1.2
+    bias = torch.randn(value_heads * dim) * 0.1
+    backing = torch.full((5, value_heads, dim, dim + 8), float("nan"))
+    state = backing[..., :dim]
+    state.copy_(torch.randn(state.shape) * 0.05)
+    before = state.clone()
+    cu = torch.tensor([0, 17, tokens], dtype=torch.int32)
+    slots = torch.tensor([3, 1], dtype=torch.int32)
+    track = torch.full((2, value_heads, dim, dim), float("nan"))
+    inputs = dict(
+        query=q,
+        key=k,
+        value=v,
+        g=raw_gate,
+        beta=beta,
+        initial_state=state,
+        cu_seqlens=cu,
+        initial_state_indices=slots,
+        A_log=a_log,
+        dt_bias=bias,
+        lower_bound=lower_bound,
+        beta_is_raw=True,
+        use_qk_l2norm_in_kernel=True,
+    )
+    output, returned, h = torch.ops.sgl_kernel.chunk_kda_cpu(
+        **inputs,
+        output_intermediate_states=True,
+        track_state=track,
+        track_chunk_idx=torch.tensor([-1, 1], dtype=torch.int32),
+    )
+    gate_input = raw_gate.float() + bias.view(1, 1, value_heads, dim)
+    a = a_log.exp().view(1, 1, value_heads, 1)
+    gate = (
+        -a * F.softplus(gate_input)
+        if lower_bound is None
+        else lower_bound * (a * gate_input).sigmoid()
+    )
+    expected_h = []
+    for seq, (start, stop) in enumerate(((0, 17), (17, tokens))):
+        expected_out, expected_state, snapshots = _torch_chunk_kda(
+            query=q[0, start:stop],
+            key=k[0, start:stop],
+            value=v[0, start:stop],
+            gate=gate[0, start:stop],
+            beta=beta[0, start:stop].float().sigmoid(),
+            state=before[slots[seq]],
+        )
+        torch.testing.assert_close(
+            output[0, start:stop], expected_out, atol=3e-4, rtol=5e-3
+        )
+        torch.testing.assert_close(
+            state[slots[seq]], expected_state, atol=3e-4, rtol=5e-3
+        )
+        expected_h.append(snapshots)
+    torch.testing.assert_close(h[0], torch.cat(expected_h), atol=3e-4, rtol=5e-3)
+    torch.testing.assert_close(returned, state, atol=0, rtol=0)
+    torch.testing.assert_close(state[[0, 2, 4]], before[[0, 2, 4]], atol=0, rtol=0)
+    assert torch.isnan(backing[..., dim:]).all() and torch.isnan(track[0]).all()
+    prefix = {
+        **inputs,
+        **{
+            name: inputs[name][:, 17:81]
+            for name in ("query", "key", "value", "g", "beta")
+        },
+        "initial_state": before.clone(),
+        "cu_seqlens": torch.tensor([0, 64], dtype=torch.int32),
+        "initial_state_indices": slots[1:],
+    }
+    _, prefix_state, _ = torch.ops.sgl_kernel.chunk_kda_cpu(**prefix)
+    torch.testing.assert_close(track[1], prefix_state[slots[1]], atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("dim", [6, 32])
