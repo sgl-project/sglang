@@ -242,7 +242,7 @@ class QuickAllReduce:
     def _init_flydsl_int4(self) -> None:
         """Create FlyDSL beside the HIP workspace when this GPU can run it.
         """
-        
+
         from aiter.ops.flydsl import QuickAllReduceInt4
 
         self._flydsl_int4 = QuickAllReduceInt4(
