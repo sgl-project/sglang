@@ -60,6 +60,7 @@ from sglang.srt.disaggregation.utils import (
     is_aborted,
     is_mla_backend,
     is_unadmitted_reject,
+    kv_layout_signature,
     poll_and_all_reduce_attn_cp_tp_group,
     poll_and_all_reduce_prefill_pp,
     prepare_abort,
@@ -238,8 +239,10 @@ class PrefillBootstrapQueue:
                     "supported by Mooncake."
                 )
         self.kv_manager = self._init_kv_manager()
+        self.kv_checksum_signature = 0
         if get_disagg().disaggregation_enable_kv_checksum:
             kv_args = self.kv_manager.kv_args
+            self.kv_checksum_signature = kv_layout_signature(kv_args)
             self.scheduler.kv_checksum_computer = KvChecksumComputer(
                 device=torch.device(f"cuda:{get_device().gpu_id}"),
                 kv_data_ptrs=kv_args.kv_data_ptrs,
@@ -737,6 +740,13 @@ class SchedulerDisaggregationPrefillMixin:
             )
         return enabled
 
+    def _war_barrier_is_coarse(self: Scheduler) -> bool:
+        # Same condition as Scheduler._apply_war_barrier's whole-forward fallback.
+        if not self._war_barrier_enabled:
+            return False
+        ev = self.model_worker.last_shared_read_runner.shared_read_done_event
+        return ev is None or envs.SGLANG_FORCE_COARSE_WAR_BARRIER.get()
+
     def _yield_gil_if_needed(self: Scheduler) -> None:
         if self.tp_size == 1:
             # No collective parks this thread at TP=1. A bounded sleep lets
@@ -764,6 +774,7 @@ class SchedulerDisaggregationPrefillMixin:
         # Keep the newer forward's sampling context across unfinished-result passes.
         batch = None
         batch_result = None
+        war_barrier_pending = False
 
         while True:
             if self.gracefully_exit:
@@ -811,7 +822,13 @@ class SchedulerDisaggregationPrefillMixin:
                     if self.enable_staging:
                         self.maybe_prefetch_staging_for_batch(batch)
                     batch_result = self.run_batch(batch)
-                    self._apply_war_barrier()
+                    if self._war_barrier_is_coarse():
+                        # Defer a whole-forward barrier past result processing: it and
+                        # the inflight queue mutate no request in this forward (a
+                        # continuing chunked one is only read).
+                        war_barrier_pending = True
+                    else:
+                        self._apply_war_barrier()
                     self.result_queue.append((batch.copy(), batch_result))
                 else:
                     batch_result = None
@@ -827,6 +844,9 @@ class SchedulerDisaggregationPrefillMixin:
                         )
                     ):
                         waiting_for_batch_result = True
+                        if war_barrier_pending:
+                            self._apply_war_barrier()
+                            war_barrier_pending = False
                         self._yield_gil_if_needed()
                         continue
                 # Process the oldest batch result.
@@ -837,6 +857,10 @@ class SchedulerDisaggregationPrefillMixin:
                 self.on_idle()
 
             self.process_disagg_prefill_inflight_queue()
+
+            if war_barrier_pending:
+                self._apply_war_barrier()
+                war_barrier_pending = False
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
@@ -1478,14 +1502,22 @@ class SchedulerDisaggregationPrefillMixin:
         computer: Optional[KvChecksumComputer] = self.kv_checksum_computer
         if last_chunk and computer is not None:
             if is_health_check_req(req):
-                value = 0
+                digest = signature = 0
             else:
                 if end_idx is None:
                     end_idx = min(req.extend_end, len(req.origin_input_ids))
-                page_indices_gpu = page_indices_for_request(self, req, end_idx)
-                state_indices = state_indices_for_request(self, req, end_idx)
-                value = computer.compute(page_indices_gpu, state_indices)
-            self.disagg_metadata_buffers.set_kv_checksum(req, value)
+                # Only the pages this prefill sends; decode digests the same
+                # range of its row, past the prefix it promised at bootstrap.
+                start_idx = req.disagg_decode_prefix_len
+                page_indices_gpu = page_indices_for_request(
+                    self, req, end_idx, start_idx=start_idx
+                )
+                state_indices = state_indices_for_request(
+                    self, req, end_idx, start_idx=start_idx
+                )
+                digest = computer.compute(page_indices_gpu, state_indices)
+                signature = self.disagg_prefill_bootstrap_queue.kv_checksum_signature
+            self.disagg_metadata_buffers.set_kv_checksum(req, digest, signature)
         self._send_kv_chunk(req, last_chunk=last_chunk, end_idx=end_idx)
 
     def _send_kv_chunk(
@@ -1697,18 +1729,43 @@ class SchedulerDisaggregationPrefillMixin:
                     raw_kv_indices
                 )
             )
-            page_indices = kv_to_page_indices(kv_indices, page_size)
-            segment_is_last = last_chunk and is_final_segment
-            if not req.disagg_kv_sender.should_send_kv_chunk(
-                len(page_indices), segment_is_last
+            sender = req.disagg_kv_sender
+            indices_event = None
+            if getattr(sender, "supports_host_tensor_indices", False) and not (
+                sender.kv_mgr.enable_all_cp_ranks_for_transfer
+                and not get_parallel().enable_dsa_cache_layer_split
             ):
+                # The schedule stream may wait on the in-flight forward; move the
+                # D2H wait to the transfer worker so scheduling can continue.
+                page_indices_dev = kv_indices[::page_size] // page_size
+                page_indices = torch.empty(
+                    page_indices_dev.shape,
+                    dtype=page_indices_dev.dtype,
+                    device="cpu",
+                    pin_memory=True,
+                )
+                page_indices.copy_(page_indices_dev, non_blocking=True)
+                indices_event = torch.cuda.Event()
+                indices_event.record(torch.cuda.current_stream())
+            else:
+                page_indices = kv_to_page_indices(kv_indices, page_size)
+            segment_is_last = last_chunk and is_final_segment
+            if not sender.should_send_kv_chunk(len(page_indices), segment_is_last):
                 continue
             send_state_indices = state_indices if segment_is_last else None
-            req.disagg_kv_sender.send(
-                page_indices,
-                send_state_indices,
-                num_kv_tokens=seg_end - seg_start,
-            )
+            if indices_event is not None:
+                sender.send(
+                    page_indices,
+                    send_state_indices,
+                    num_kv_tokens=seg_end - seg_start,
+                    indices_event=indices_event,
+                )
+            else:
+                sender.send(
+                    page_indices,
+                    send_state_indices,
+                    num_kv_tokens=seg_end - seg_start,
+                )
         req.start_send_idx = end_idx
         # A last chunk needs no entry: every `last_chunk=True` call site has
         # already put the request on `disagg_prefill_inflight_queue`.
@@ -1734,7 +1791,9 @@ class SchedulerDisaggregationPrefillMixin:
                 req._compute_max_prefix_len(len(req.full_untruncated_fill_ids)),
             )
         )
-        self._release_aborted_request(req)
+        # The request is requeued, not aborted: keep its multimodal inputs (the
+        # re-prefill embeds its image tokens again) and its streaming session.
+        self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
         # The checkpoint above already handed the prefill KV to the tree; the
         # request is not finished, so the release only frees the rest.
         release_kv_cache(req, self.tree_cache, checkpoint=False)

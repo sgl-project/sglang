@@ -5,10 +5,17 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from sglang.srt import rust_extensions
+from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.arg_groups.pd_disaggregation_hook import handle_pd_disaggregation
+from sglang.srt.disaggregation.base.conn import BaseKVBootstrapServer
+from sglang.srt.disaggregation.common.conn import CommonKVBootstrapServer
 from sglang.srt.entrypoints.engine import node_hosts_rust_server
+from sglang.srt.environ import envs
+from sglang.srt.managers import disagg_service
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.rust_server import config as rust_config
 from sglang.srt.rust_server import server as rust_server
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
@@ -44,6 +51,18 @@ def _scheduler_for_typed_config():
     "overrides,kwarg,expected",
     [
         ({}, "grpc_port", 50051),
+        ({"hicache_storage_backend": "file"}, "hicache_storage_backend", "file"),
+        (
+            {"hicache_storage_backend_extra_config": "{}"},
+            "hicache_storage_backend_extra_config",
+            "{}",
+        ),
+        (
+            {"hicache_storage_prefetch_policy": "timeout"},
+            "hicache_storage_prefetch_policy",
+            "timeout",
+        ),
+        ({"hicache_write_policy": "write_back"}, "hicache_write_policy", "write_back"),
         ({"smg_grpc_mode": True}, "grpc_port", None),
         ({"grpc_mode": True}, "grpc_port", None),
         ({"default_priority_value": 5}, "default_priority_value", None),
@@ -52,13 +71,25 @@ def _scheduler_for_typed_config():
             "default_priority_value",
             5,
         ),
+        ({}, "limit_mm_data_per_request", []),
+        (
+            {"limit_mm_data_per_request": {"video": 1, "image": 2}},
+            "limit_mm_data_per_request",
+            [("video", 1), ("image", 2)],
+        ),
     ],
     ids=[
         "native-grpc",
+        "hicache_storage_backend",
+        "hicache_storage_backend_extra_config",
+        "hicache_storage_prefetch_policy",
+        "hicache_write_policy",
         "legacy-smg",
         "deprecated-legacy-smg",
         "priority-off",
         "priority-on",
+        "mm-limits-unset",
+        "mm-limits-keep-order",
     ],
 )
 def test_typed_config_forwards_resolved_launch_fields(overrides, kwarg, expected):
@@ -78,9 +109,13 @@ def test_typed_config_forwards_resolved_launch_fields(overrides, kwarg, expected
         patch.object(rust_config, "compute_num_reserved_tokens", return_value=0),
         patch.object(rust_config, "_launch_server_info", return_value="{}"),
     ):
-        assert rust_config._build_server_args(scheduler) == "server-args"
+        assert (
+            rust_config._build_server_args(scheduler, default_max_new_tokens=None)
+            == "server-args"
+        )
 
     assert extension.ServerArgs.call_args.kwargs[kwarg] == expected
+    assert extension.ServerArgs.call_args.kwargs["default_max_new_tokens"] is None
     scheduler.get_init_info.assert_not_called()
     scheduler.kv_events_publisher.local_kv_event_sources.assert_called_once_with(16)
     deployment_info = json.loads(
@@ -125,24 +160,48 @@ def test_deployment_info_reports_listener_dp_rank(server_args, ranks, expected):
 
 
 @pytest.mark.parametrize("enable_metrics", [False, True])
-def test_typed_config_points_metrics_at_the_multiproc_dir(enable_metrics):
+def test_typed_config_carries_tokenizer_metrics(enable_metrics):
     extension = MagicMock()
     with (
-        get_context().override_server_args(enable_metrics=enable_metrics),
+        get_context().override_server_args(
+            enable_metrics=enable_metrics,
+            served_model_name="m",
+            enable_priority_scheduling=True,
+            extra_metric_labels={"cluster": "c"},
+            bucket_inter_token_latency=[0.001, 0.01],
+            generation_tokens_buckets=["custom", "10", "1"],
+        ),
         get_parallel().override(attn_dp_rank=0, dp_rank=None),
         patch.dict("os.environ", {"PROMETHEUS_MULTIPROC_DIR": "/tmp/prom"}),
         patch.object(rust_extensions, "load_rust_extension", return_value=extension),
         patch.object(rust_config, "compute_num_reserved_tokens", return_value=0),
         patch.object(rust_config, "_launch_server_info", return_value="{}"),
     ):
-        rust_config._build_server_args(_scheduler_for_typed_config())
+        rust_config._build_server_args(
+            _scheduler_for_typed_config(), default_max_new_tokens=None
+        )
 
     metrics = extension.ServerArgs.call_args.kwargs["metrics"]
-    if enable_metrics:
-        extension.MetricsConfig.assert_called_once_with(multiproc_dir="/tmp/prom")
-        assert metrics is extension.MetricsConfig.return_value
-    else:
+    if not enable_metrics:
         assert metrics is None
+        return
+    assert metrics is extension.MetricsConfig.return_value
+    extension.MetricsConfig.assert_called_once_with(
+        multiproc_dir="/tmp/prom",
+        labels={
+            "model_name": "m",
+            "engine_type": "unified",
+            "priority": "",
+            "cluster": "c",
+        },
+        priority_label=True,
+        bucket_time_to_first_token=None,
+        bucket_inter_token_latency=[0.001, 0.01],
+        bucket_e2e_request_latency=None,
+        # The default rule keeps the Rust side's defaults; others resolve here.
+        bucket_prompt_tokens=None,
+        bucket_generation_tokens=[1.0, 10.0],
+    )
 
 
 @pytest.mark.parametrize(
@@ -231,6 +290,81 @@ def test_scale_joiner_hosts_listener():
         ep_join_mode="scale",
     ):
         assert node_hosts_rust_server()
+
+
+class _HttpRegistry(CommonKVBootstrapServer):
+    def __init__(self, host, port):
+        raise AssertionError("the Rust server serves this registry")
+
+
+class _OwnBootstrapServer(BaseKVBootstrapServer):
+    def __init__(self, host, port):
+        self.address = (host, port)
+
+
+@pytest.mark.parametrize(
+    "server_class,bootstrap_port,expected",
+    [
+        (_HttpRegistry, 8998, 31000),
+        (_HttpRegistry, 31000, 31000),
+        (_HttpRegistry, 33000, ValueError),
+        (_OwnBootstrapServer, 8998, 8998),
+        (_OwnBootstrapServer, 33000, 33000),
+    ],
+    ids=[
+        "http-registry-default",
+        "http-registry-shared",
+        "http-registry-separate",
+        "backend-bootstrap-server-default",
+        "backend-bootstrap-server-separate",
+    ],
+)
+def test_rust_prefill_bootstrap_port_alias(server_class, bootstrap_port, expected):
+    args = ServerArgs(
+        model_path="dummy",
+        port=31000,
+        disaggregation_mode="prefill",
+        disaggregation_bootstrap_port=bootstrap_port,
+    )
+    with (
+        envs.SGLANG_RUST_SERVER.override(True),
+        patch.object(disagg_service, "get_kv_class", return_value=server_class),
+    ):
+        if expected is ValueError:
+            with pytest.raises(ValueError, match="conflicts with --port"):
+                handle_pd_disaggregation(args)
+            return
+        handle_pd_disaggregation(args)
+    assert resolving_view(args).disaggregation_bootstrap_port == expected
+
+
+@pytest.mark.parametrize(
+    "mode,server_class,starts",
+    [
+        ("prefill", _HttpRegistry, False),
+        ("prefill", _OwnBootstrapServer, True),
+        ("decode", _OwnBootstrapServer, False),
+    ],
+    ids=["http-registry", "backend-bootstrap-server", "decode"],
+)
+def test_rust_mode_starts_only_a_bootstrap_server_rust_cannot_serve(
+    mode, server_class, starts
+):
+    with (
+        get_context().override_server_args(
+            host="127.0.0.1",
+            disaggregation_mode=mode,
+            disaggregation_transfer_backend="nixl",
+            disaggregation_bootstrap_port=33000,
+        ),
+        patch.object(disagg_service, "get_kv_class", return_value=server_class),
+    ):
+        server = disagg_service.start_disagg_service_for_rust_server()
+
+    if starts:
+        assert server.address == ("127.0.0.1", 33000)
+    else:
+        assert server is None
 
 
 if __name__ == "__main__":

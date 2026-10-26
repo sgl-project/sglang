@@ -1027,6 +1027,7 @@ class TestTriFactorySizing(unittest.TestCase):
                             req_pool_idx=1,
                             mamba_pool_idx=live[0],
                             mamba_ping_pong_track_buffer=track,
+                            mamba_ping_pong_empty=[index == -1 for index in ids],
                         )
                     )
                     session = StreamingSession(SimpleNamespace(req_to_token_pool=pool))
@@ -1188,6 +1189,52 @@ class TestTriFactorySizing(unittest.TestCase):
                             )
                             allocator.free(retained)
                         self.assertEqual(allocator.available_size(), initial_available)
+
+    def test_ping_pong_mapping_mirrors_the_request_buffers(self):
+        from types import SimpleNamespace
+
+        from sglang.srt.managers.schedule_batch import (
+            ReqKvInfo,
+            _gather_mamba_track_indices,
+        )
+        from sglang.srt.runtime_context import get_parallel
+
+        for lazy in (False, True):
+            with self.subTest(lazy=lazy):
+                kw = self._factory_kwargs(
+                    enable_mamba_extra_buffer=True,
+                    enable_mamba_extra_buffer_lazy=lazy,
+                    disable_overlap_schedule=False,
+                    max_mamba_cache_size=16,
+                )
+                with get_parallel().override(attn_dcp_size=1):
+                    pool = init_unified_mamba_swa_pools(**kw).req_to_token_pool
+                mapping = pool.req_index_to_mamba_ping_pong_track_buffer_mapping
+                allocator = pool.mamba_allocator
+                reqs = [SimpleNamespace(kv=ReqKvInfo()) for _ in range(3)]
+                rows = pool.alloc(reqs)
+
+                def buffers():
+                    return [
+                        req.kv.mamba_ping_pong_track_buffer.tolist() for req in reqs
+                    ]
+
+                self.assertEqual(mapping[rows].tolist(), buffers())
+                # Every writer of a buffer entry rewrites the request's row.
+                pool.donate_mamba_ping_pong_slot(reqs[0], allocator.alloc(1))
+                pool.set_mamba_ping_pong_slot(reqs[1], 0, -1)
+                pool.set_mamba_ping_pong_slot(reqs[1], 1, allocator.alloc(1)[0])
+                self.assertEqual(mapping[rows].tolist(), buffers())
+                # The device gather returns what the per-request .item() read did.
+                positions = [0, 0, 1]
+                gathered = _gather_mamba_track_indices(
+                    mapping, torch.tensor(rows), torch.tensor(positions)
+                )
+                item_reads = [
+                    req.kv.mamba_ping_pong_track_buffer[pos].item()
+                    for req, pos in zip(reqs, positions)
+                ]
+                self.assertEqual(gathered.tolist(), item_reads)
 
     def test_budget_sizing_and_boot_signature(self):
         from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (

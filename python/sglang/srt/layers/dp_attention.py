@@ -34,9 +34,18 @@ from sglang.srt.runtime_context import (
     get_forward,
     get_parallel,
     get_resources,
+    get_spec,
     get_stream,
 )
-from sglang.srt.utils import get_bool_env_var, is_cpu, is_hip
+from sglang.srt.utils import get_bool_env_var, is_cpu, is_hip, is_xpu
+
+if is_xpu():
+    # custom_all_reduce_v2 imports tvm_ffi, absent on XPU; isinstance(x, ()) is False.
+    CustomAllReduceV2 = ()
+else:
+    from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
+        CustomAllReduceV2,
+    )
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -182,6 +191,9 @@ class DpPaddingMode(IntEnum):
                 return DpPaddingMode.MAX_LEN
             return DpPaddingMode.SUM_LEN
 
+        if _decode_sum_len_fits_custom_all_reduce(global_num_tokens):
+            return cls.SUM_LEN
+
         # we choose the mode that minimizes the communication cost
         # prefer MAX_LEN when communication cost is equal to enable symmetric memory
         max_len = max(global_num_tokens)
@@ -192,13 +204,43 @@ class DpPaddingMode(IntEnum):
             return cls.SUM_LEN
 
     @classmethod
-    def get_default_mode_in_cuda_graph(cls) -> DpPaddingMode:
+    def get_default_mode_in_cuda_graph(
+        cls, global_num_tokens: Optional[List[int]] = None
+    ) -> DpPaddingMode:
+        """``global_num_tokens``: a decode capture's per-rank token counts."""
         # TODO(kkhuang-amd): noqa, temporary work-around for rocm 7.0.0 alpha
         # it can be safely removed later, once RCCL fixed
-        if _USE_ROCM700A_WA:
+        if _USE_ROCM700A_WA or (
+            global_num_tokens is not None
+            and _decode_sum_len_fits_custom_all_reduce(global_num_tokens)
+        ):
             return cls.SUM_LEN
         else:
             return cls.MAX_LEN
+
+
+def _decode_sum_len_fits_custom_all_reduce(global_num_tokens: List[int]) -> bool:
+    """SUM_LEN gathers and combines DP decode rows with one TP all-reduce of the
+    summed buffer; take it while the custom all-reduce can hold that buffer.
+    A one-rank gather or a batch with an idle rank keeps the cost-based choice."""
+    from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+
+    if (
+        dp_gather_width() <= 1
+        or len(global_num_tokens) <= 1
+        or min(global_num_tokens) == 0
+        or not get_moe_a2a_backend().is_none()
+        or get_spec().speculative_algorithm is not None
+    ):
+        return False
+    comm = get_parallel().tp_group.ca_comm
+    dp = get_flags().dp
+    nbytes = sum(global_num_tokens) * dp.buffer_hidden_size * dp.buffer_dtype.itemsize
+    return (
+        isinstance(comm, CustomAllReduceV2)
+        and not comm.disabled
+        and nbytes <= comm.max_size
+    )
 
 
 class _DpGatheredBufferWrapper:
@@ -939,6 +981,13 @@ def _note_dp_gather_in_prefill_graph() -> None:
     dp = get_flags().dp
     if dp.capturing_prefill_graph:
         dp.prefill_graph_has_dp_gather = True
+
+
+def note_rank_barrier_in_prefill_graph() -> None:
+    """For breaks that capture graphs of their own behind TP-group barriers."""
+    dp = get_flags().dp
+    if dp.capturing_prefill_graph:
+        dp.prefill_graph_has_rank_barrier = True
 
 
 def _dp_gather(

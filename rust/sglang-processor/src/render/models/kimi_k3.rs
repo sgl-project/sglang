@@ -6,7 +6,7 @@ use dynamo_renderer::kimi_k3::KimiK3Formatter;
 use dynamo_renderer::{OAIChatLikeRequest, OAIPromptFormatter, RenderedPrompt};
 use serde_json::{Map, Value, json};
 
-use super::deepseek_v4::{engine_message, pydantic_bool, tool_arguments};
+use super::pydantic_dump::{engine_message, pydantic_bool, tool_arguments};
 use super::schema_types::normalize_json_schema_types;
 use crate::render::reasoning::{requested_effort, requested_thinking};
 
