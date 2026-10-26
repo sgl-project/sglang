@@ -167,6 +167,9 @@ class HostKVCache(abc.ABC):
     # Names this pool's page byte format in storage keys when it has one of its
     # own, so pages persisted in another format miss instead of loading.
     storage_format_tag: Optional[str] = None
+    # Page strides are multiples of this many bytes (get_storage_page_align); the
+    # bytes from a page's end up to the next multiple belong to that page.
+    storage_page_align = 1
 
     def __init__(
         self,

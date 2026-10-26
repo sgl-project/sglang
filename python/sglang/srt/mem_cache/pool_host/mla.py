@@ -31,6 +31,8 @@ from sglang.srt.mem_cache.pool_host.base import (
 )
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
+    alloc_padded_pages,
+    get_storage_page_align,
     make_kernel_ptr_table,
 )
 from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
@@ -126,6 +128,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             )
         self.dtype = buffer_info.dtype
         self.layout = layout
+        self.storage_page_align = get_storage_page_align(layout, allocator_type)
         self.kv_lora_rank = buffer_info.kv_lora_rank
         self.qk_rope_head_dim = buffer_info.qk_rope_head_dim
         # Existing builders explicitly resolve packed row width before construction.
@@ -428,8 +431,30 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             raise ValueError(f"Unsupported layout: {self.layout}")
         self.token_stride_size = self.kv_cache_dim * self.dtype.itemsize
         self.layout_dim = self.token_stride_size * self.layer_num
+        page_bytes = self.page_size * self.layout_dim
+        align = self.storage_page_align
+        self.page_stride_bytes = -(-page_bytes // align) * align
 
         alloc_func = ALLOC_MEMORY_FUNCS[self._transfer_device.type]
+        if self.page_stride_bytes != page_bytes:
+            logger.info(
+                "HiCache %s host pool: page stride %d bytes for %d-byte pages "
+                "(%.2f GB of padding) for the storage backend.",
+                self.pool_label,
+                self.page_stride_bytes,
+                page_bytes,
+                self.page_num * (self.page_stride_bytes - page_bytes) / 1e9,
+            )
+            return alloc_padded_pages(
+                alloc_func,
+                dims[1:],
+                self.page_num,
+                self.page_stride_bytes,
+                self.dtype,
+                device=self.device,
+                pin_memory=self.pin_memory,
+                allocator=self.allocator,
+            )
         buffer = alloc_func(
             dims,
             dtype=self.dtype,
@@ -1316,7 +1341,13 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     ptr_list.append(k_ptr)
             element_size = self.dtype.itemsize * self.page_size * self.kv_cache_dim
             element_size_list = [element_size] * len(ptr_list)
-        elif self.layout in ["page_first", "page_first_direct"]:
+        elif self.layout == "page_first_direct":
+            ptr_list = [
+                kv_buffer_data_ptr + index // self.page_size * self.page_stride_bytes
+                for index in page_starts
+            ]
+            element_size_list = [self.page_size * self.layout_dim] * len(ptr_list)
+        elif self.layout == "page_first":
             for index in page_starts:
                 k_ptr = (
                     kv_buffer_data_ptr
@@ -1339,17 +1370,10 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
 
         When O_DIRECT is used with any file-based NIXL backend, every data pointer
         passed to the kernel must be page-aligned.  In zero-copy mode the
-        pointer for KV page ``p`` is:
-
-            base_ptr + p * page_size * layer_num * kv_cache_dim * itemsize
-
-        For this to be page-aligned (given a page-aligned ``base_ptr``) the per-page
-        stride must itself be a multiple of the OS page size.
+        pointer for KV page ``p`` is ``base_ptr + p * page_stride_bytes``, so
+        both must be multiples of the OS page size.
         """
         if self.layout not in ("page_first", "page_first_direct"):
             return False
-        stride = (
-            self.page_size * self.layer_num * self.kv_cache_dim * self.dtype.itemsize
-        )
         base_aligned = self.kv_buffer.data_ptr() % page_size_bytes == 0
-        return base_aligned and stride % page_size_bytes == 0
+        return base_aligned and self.page_stride_bytes % page_size_bytes == 0

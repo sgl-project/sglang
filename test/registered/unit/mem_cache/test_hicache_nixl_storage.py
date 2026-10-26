@@ -4,6 +4,9 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=16, stage="base-b", runner_config="1-gpu-small")
 
+import ctypes
+import json
+import mmap
 import os
 import shutil
 import socket
@@ -22,7 +25,14 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
 )
+from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+from sglang.srt.mem_cache.pool_host.dsa import (
+    DSAIndexerPoolHost,
+    make_dsa_indexer_pool_decl,
+)
+from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.storage.nixl.hicache_nixl import HiCacheNixl
+from sglang.srt.runtime_context import get_context
 from sglang.test.test_utils import CustomTestCase
 
 # Stress tests are opt-in: CI never sets this; set locally to exercise them.
@@ -889,6 +899,228 @@ class TestNixlDirectIO(CustomTestCase):
             self.skipTest("NIXL not available")
         self.assertFalse(hicache.needs_page_alignment)
         self.assertFalse(hicache.file_manager.use_direct_io)
+
+
+class _ODirectDisk:
+    """Stands in for NIXL's POSIX plugin on an O_DIRECT filesystem: a transfer
+    whose address or length is not whole 4 KiB blocks is refused, as the kernel
+    refuses it (EINVAL); any other keeps its bytes by key."""
+
+    def __init__(self):
+        self.files: dict[str, bytes] = {}
+        self.refused: list[tuple[str, int, int]] = []
+
+    def transfer(self, keys, key_strs, host_buffers, direction):
+        results = []
+        for key, (addr, size) in zip(key_strs, host_buffers):
+            if addr % 4096 or size % 4096:
+                self.refused.append((key, addr, size))
+                results.append(False)
+            elif direction == "WRITE":
+                self.files[key] = ctypes.string_at(addr, size)
+                results.append(True)
+            elif len(self.files.get(key, b"")) >= size:
+                ctypes.memmove(addr, self.files[key], size)
+                results.append(True)
+            else:
+                results.append(False)
+        return results
+
+
+@unittest.skipUnless(hasattr(os, "O_DIRECT"), "O_DIRECT not available on this platform")
+class TestNixlDirectIOPages(CustomTestCase):
+    """Host pages that are not whole O_DIRECT blocks survive a round trip under
+    O_DIRECT: in place when the pool pads them (page_first_direct with NIXL),
+    otherwise through staging slots padded to whole blocks."""
+
+    PAGE_TOKENS = 64
+    LAYERS = 3
+    # Pages of 25,728 B (KV: bf16 rows of 61 + 6) and 25,344 B (DSA index keys),
+    # whole blocks of neither 512 B nor 4 KiB; both pad to 7 blocks.
+    PADDED_PAGE_BYTES = 7 * 4096
+    HOST_PAGES = 160  # more than the 128 staging slots
+
+    def setUp(self):
+        self.test_dir = "/tmp/test_nixl_direct_io"
+        os.makedirs(self.test_dir, exist_ok=True)
+        self.addCleanup(shutil.rmtree, self.test_dir, ignore_errors=True)
+        env = mock.patch.dict(os.environ, {"SGLANG_HICACHE_NIXL_USE_DIRECT_IO": "1"})
+        env.start()
+        self.addCleanup(env.stop)
+        # The L3 cleaner would delete the files at once on a disk past its watermark.
+        self.extra_config = {
+            "plugin": {"posix": {"active": True}},
+            "l3_cleaner_enabled": False,
+        }
+        try:
+            self.hicache = HiCacheNixl(
+                HiCacheStorageConfig(
+                    tp_rank=0,
+                    tp_size=1,
+                    pp_rank=0,
+                    pp_size=1,
+                    attn_cp_rank=0,
+                    attn_cp_size=1,
+                    is_mla_model=True,
+                    is_page_first_layout=True,
+                    model_name="test_model",
+                    enable_storage_metrics=False,
+                    extra_config=dict(self.extra_config),
+                ),
+                file_path=self.test_dir,
+            )
+        except ImportError:
+            self.skipTest("NIXL not available")
+        self.addCleanup(self.hicache.close)
+        self.assertTrue(self.hicache.needs_page_alignment)
+        self.disk = _ODirectDisk()
+        self.hicache._batch_xfer = self.disk.transfer
+
+    def _host_pools(self, allocator_type):
+        """An MLA KV host pool (v1 path) and its DSA indexer pool (v2 path)."""
+        device = MLATokenToKVPool(
+            size=self.PAGE_TOKENS * self.HOST_PAGES // 2,
+            page_size=self.PAGE_TOKENS,
+            dtype=torch.bfloat16,
+            kv_lora_rank=61,
+            qk_rope_head_dim=6,
+            layer_num=self.LAYERS,
+            device="cpu",
+            enable_memory_saver=False,
+        )
+        index_device = SimpleNamespace(
+            layer_num=self.LAYERS,
+            device="cpu",
+            layer_shard_enabled=False,
+            store_dtype=torch.bfloat16,
+            start_layer=0,
+            end_layer=self.LAYERS,
+            index_head_dim=128,
+            quant_block_size=128,
+            page_size=self.PAGE_TOKENS,
+            index_page_size=self.PAGE_TOKENS,
+            skip_topk_layers=[False] * self.LAYERS,
+            index_k_with_scale_buffer=[
+                torch.empty((4, self.PAGE_TOKENS * 132), dtype=torch.uint8)
+                for _ in range(self.LAYERS)
+            ],
+        )
+        with get_context().override_server_args(
+            hicache_storage_backend_extra_config=json.dumps(self.extra_config)
+        ):
+            kv = MLATokenToKVPoolHost(
+                device.get_device_pool_infos()[0].buffer_info,
+                host_to_device_ratio=2,
+                host_size=0,
+                page_size=self.PAGE_TOKENS,
+                layout="page_first_direct",
+                pin_memory=False,
+                allocator_type=allocator_type,
+                device_capacity_tokens=device.size,
+                start_layer=device.start_layer,
+                end_layer=device.end_layer,
+                target_layer_num=self.LAYERS,
+            )
+            self.addCleanup(kv.destroy)
+            indexer = DSAIndexerPoolHost(
+                make_dsa_indexer_pool_decl(index_device),
+                kv,
+                pin_memory=False,
+                allocator_type=allocator_type,
+            )
+            self.addCleanup(indexer.destroy)
+        self.hicache.register_mem_pool_host(kv)
+        self.hicache.register_mem_host_pool_v2(indexer, PoolName.INDEXER)
+        return kv, indexer
+
+    def _assert_stored(self, keys):
+        self.assertEqual(self.disk.refused, [])
+        self.assertEqual(
+            {len(data) for data in self.disk.files.values()}, {self.PADDED_PAGE_BYTES}
+        )
+
+    def _assert_round_trip(self, kv, indexer, pages):
+        """Store pages of random bytes from both pools, zero them, load them back."""
+        keys = [f"page-{p}" for p in pages]
+        starts = [p * self.PAGE_TOKENS for p in pages]
+        indices = torch.cat([torch.arange(s, s + self.PAGE_TOKENS) for s in starts])
+        index_transfer = PoolTransfer(
+            name=PoolName.INDEXER, keys=keys, host_indices=indices
+        )
+        generator = torch.Generator().manual_seed(0)
+        expected = {}
+        for host in (kv, indexer):
+            for start in starts:
+                page = host.get_dummy_flat_data_page()
+                raw = page.view(torch.uint8)
+                raw.copy_(
+                    torch.randint(
+                        0, 256, raw.shape, dtype=torch.uint8, generator=generator
+                    )
+                )
+                host.set_from_flat_data_page(start, page)
+                expected[host, start] = raw
+
+        stored = [True] * len(pages)
+        self.assertEqual(self.hicache.batch_set_v1(keys, indices), stored)
+        self.assertEqual(
+            self.hicache.batch_set_v2([index_transfer]), {PoolName.INDEXER: stored}
+        )
+        self._assert_stored(keys)
+
+        for host, start in expected:
+            host.set_from_flat_data_page(start, host.get_dummy_flat_data_page())
+        self.assertEqual(self.hicache.batch_get_v1(keys, indices), stored)
+        self.assertEqual(
+            self.hicache.batch_get_v2([index_transfer]), {PoolName.INDEXER: stored}
+        )
+        for (host, start), raw in expected.items():
+            got = host.get_data_page(start).view(torch.uint8)
+            self.assertTrue(
+                torch.equal(got, raw), f"{type(host).__name__} page at {start}"
+            )
+
+    def test_unpadded_pages_go_through_whole_block_staging_slots(self):
+        kv, indexer = self._host_pools(allocator_type="default")
+        self.assertFalse(self.hicache.is_zero_copy)
+        self.assertFalse(self.hicache._hybrid_pool_ctx[PoolName.INDEXER].is_zero_copy)
+        self._assert_round_trip(kv, indexer, pages=range(1, 129))
+
+    def test_padded_pages_move_in_place_in_any_batch_size(self):
+        kv, indexer = self._host_pools(allocator_type="nixl")
+        self.assertTrue(self.hicache.is_zero_copy)
+        self.assertTrue(self.hicache._hybrid_pool_ctx[PoolName.INDEXER].is_zero_copy)
+        self._assert_round_trip(kv, indexer, pages=range(1, self.HOST_PAGES + 1))
+
+
+class TestNixlDirectIOPagesOnDisk(TestNixlDirectIOPages):
+    """The same round trips through NIXL's POSIX plugin and real O_DIRECT files."""
+
+    def setUp(self):
+        super().setUp()
+        del self.hicache._batch_xfer
+        probe = os.path.join(self.test_dir, "o_direct_probe")
+        block = mmap.mmap(-1, 4096)
+        try:
+            fd = os.open(probe, os.O_CREAT | os.O_WRONLY | os.O_DIRECT, 0o644)
+            try:
+                os.write(fd, block)
+            finally:
+                os.close(fd)
+        except OSError as e:
+            self.skipTest(f"{self.test_dir} does not take O_DIRECT writes: {e}")
+        finally:
+            block.close()
+            if os.path.exists(probe):
+                os.unlink(probe)
+
+    def _assert_stored(self, keys):
+        sizes = {
+            os.path.getsize(os.path.join(root, name))
+            for root, _, names in os.walk(self.test_dir)
+            for name in names
+        }
+        self.assertEqual(sizes, {self.PADDED_PAGE_BYTES})
 
 
 class TestNixlFileLayout(CustomTestCase):

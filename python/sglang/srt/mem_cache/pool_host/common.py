@@ -140,6 +140,26 @@ def get_allocator_type() -> str:
     return backend or "default"
 
 
+def get_storage_page_align(layout: str, allocator_type: str) -> int:
+    """Bytes each host page's stride is rounded up to; 1 keeps pages packed.
+
+    The storage backend asks for it: NIXL under O_DIRECT moves a
+    ``page_first_direct`` page in place only if it starts on a block and spans
+    whole blocks.
+    """
+    if layout != "page_first_direct" or allocator_type != "nixl":
+        return 1
+    from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+        HybridCacheController,
+    )
+    from sglang.srt.mem_cache.storage.nixl.nixl_utils import host_page_align
+
+    extra_config = HybridCacheController.parse_storage_backend_extra_config(
+        get_memory().hicache_storage_backend_extra_config
+    )[0]
+    return host_page_align(extra_config)
+
+
 def _cuda_host_register(
     buffer: torch.Tensor, registration_granularity_bytes: int | None = None
 ) -> None:
@@ -392,6 +412,31 @@ def alloc_with_pin_memory_xpu(
             f"({n_bytes} bytes) returned a null pointer"
         )
     return buffer
+
+
+def alloc_padded_pages(
+    alloc_func,
+    page_dims: tuple,
+    page_num: int,
+    page_stride_bytes: int,
+    dtype: torch.dtype,
+    **kwargs,
+) -> torch.Tensor:
+    """Allocate a ``(page_num, *page_dims)`` view whose pages start
+    ``page_stride_bytes`` apart in one allocation (see get_storage_page_align)."""
+    assert page_stride_bytes % dtype.itemsize == 0
+    raw = alloc_func(
+        (page_num, page_stride_bytes // dtype.itemsize),
+        dtype=dtype,
+        registration_granularity_bytes=page_stride_bytes,
+        **kwargs,
+    )
+    pages = raw[:, : math.prod(page_dims)].unflatten(1, page_dims)
+    # destroy() unregisters the view it holds, so it needs the allocation's ranges.
+    registered_ranges = getattr(raw, _CUDA_HOST_REGISTERED_RANGES_ATTR, None)
+    if registered_ranges is not None:
+        setattr(pages, _CUDA_HOST_REGISTERED_RANGES_ATTR, registered_ranges)
+    return pages
 
 
 @lru_cache(maxsize=1)
