@@ -26,6 +26,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (  # isort: skip
 globally_suppress_loggers()
 
 from sglang.multimodal_gen import envs
+from sglang.multimodal_gen.configs.task_type import DataType
 from sglang.multimodal_gen.runtime.distributed import (
     get_replica_group,
     get_sp_group,
@@ -1020,9 +1021,11 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         if getattr(req, "return_frames", False):
             return True
         # Quantize a CUDA [B, C, T, H, W] video before the host copy instead of
-        # returning FP32. Latents, images and one-frame tensors keep their path.
+        # returning FP32. Other data types, latents, images and one-frame tensors
+        # keep their path.
         return (
-            not getattr(req, "enable_frame_interpolation", False)
+            req.data_type == DataType.VIDEO
+            and not getattr(req, "enable_frame_interpolation", False)
             and not getattr(req, "enable_upscaling", False)
             and isinstance(output, torch.Tensor)
             and output.is_cuda

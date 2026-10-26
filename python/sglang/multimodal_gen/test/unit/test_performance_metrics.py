@@ -8,6 +8,7 @@ import torch
 import sglang.multimodal_gen.runtime.managers.gpu_worker as gpu_worker_module
 import sglang.multimodal_gen.runtime.managers.memory_managers.component_manager as component_manager_module
 import sglang.multimodal_gen.runtime.utils.perf_logger as perf_logger_module
+from sglang.multimodal_gen.configs.task_type import DataType
 from sglang.multimodal_gen.runtime.disaggregation.orchestrator import (
     _deserialize_request_metrics,
 )
@@ -745,7 +746,10 @@ def test_log_request_summary_records_requested_tag(monkeypatch, tmp_path):
 
 def _frame_req(**overrides):
     values = dict(
-        return_frames=False, enable_frame_interpolation=False, enable_upscaling=False
+        data_type=DataType.VIDEO,
+        return_frames=False,
+        enable_frame_interpolation=False,
+        enable_upscaling=False,
     )
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -768,3 +772,5 @@ def test_default_return_quantizes_only_multiframe_cuda_video_on_the_worker():
     assert not decide(_frame_req(), torch.zeros(1, 3, 1, 4, 4, device="cuda"))
     assert not decide(_frame_req(enable_frame_interpolation=True), video)
     assert not decide(_frame_req(enable_upscaling=True), video)
+    for data_type in (DataType.IMAGE, DataType.MESH, DataType.ACTION):
+        assert not decide(_frame_req(data_type=data_type), video)
