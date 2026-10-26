@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 import logging
 import weakref
 from typing import TYPE_CHECKING, Dict, List, NamedTuple, Optional, Tuple, Union
@@ -650,7 +651,7 @@ class HiSparseCoordinator:
 
         self.write_staging_stream = device_module.Stream()
         self.decode_backup_stream = device_module.Stream()
-        self.ack_staging_queue: List[HiSparseAct] = []
+        self.ack_staging_queue: deque[HiSparseAct] = deque()
         self.decode_producer_stream = None
         self._backup_done_event = device_module.Event()
         self._has_pending_backup = False
@@ -1065,7 +1066,7 @@ class HiSparseCoordinator:
             )
         finish_count = int(queue_size.item())
         while finish_count > 0:
-            _, _, req = self.ack_staging_queue.pop(0)
+            _, _, req = self.ack_staging_queue.popleft()
             # prepare device buffer and update req
             self.alloc_device_buffer(req)
             self._skip_first_backup[req.kv.req_pool_idx] = True
@@ -1345,9 +1346,9 @@ class HiSparseCoordinator:
         but has not yet completed (i.e. req.hisparse_staging is True).
         """
         # Remove from staging queue
-        self.ack_staging_queue = [
+        self.ack_staging_queue = deque(
             act for act in self.ack_staging_queue if act.req is not req
-        ]
+        )
         # Wait for any in-flight staging DMA to complete before freeing
         self.write_staging_stream.synchronize()
 

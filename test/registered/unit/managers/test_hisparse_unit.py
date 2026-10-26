@@ -75,6 +75,88 @@ def _make_req(rid="test-req-0", origin_input_ids=None, output_ids=None):
     return req
 
 
+class TestHiSparseStagingQueueUnit(unittest.TestCase):
+    """CPU unit tests for HiSparseCoordinator FIFO staging queue operations."""
+
+    def test_collect_ready_reqs_and_abort_preserve_fifo_deque(self):
+        from collections import deque
+        from sglang.srt.managers.hisparse_coordinator import (
+            HiSparseAct,
+            HiSparseCoordinator,
+        )
+
+        coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
+        coordinator.tp_world_size = 1
+        coordinator.tp_group = None
+        coordinator._skip_first_backup = [False] * 4
+        allocated_reqs = []
+        coordinator.alloc_device_buffer = lambda req: allocated_reqs.append(req.rid)
+        coordinator.ack_staging_queue = deque()
+
+        req0 = _make_req("req-0")
+        req0.kv = SimpleNamespace(req_pool_idx=0)
+        req0.hisparse_staging = True
+        req1 = _make_req("req-1")
+        req1.kv = SimpleNamespace(req_pool_idx=1)
+        req1.hisparse_staging = True
+        req2 = _make_req("req-2")
+        req2.kv = SimpleNamespace(req_pool_idx=2)
+        req2.hisparse_staging = True
+
+        ev_ready = SimpleNamespace(query=lambda: True)
+        ev_pending = SimpleNamespace(query=lambda: False)
+
+        coordinator.ack_staging_queue.append(HiSparseAct(None, ev_ready, req0))
+        coordinator.ack_staging_queue.append(HiSparseAct(None, ev_ready, req1))
+        coordinator.ack_staging_queue.append(HiSparseAct(None, ev_pending, req2))
+
+        self.assertTrue(coordinator.has_ongoing_staging())
+        ready = coordinator.collect_ready_reqs()
+        self.assertEqual([r.rid for r in ready], ["req-0", "req-1"])
+        self.assertEqual(allocated_reqs, ["req-0", "req-1"])
+        self.assertFalse(req0.hisparse_staging)
+        self.assertFalse(req1.hisparse_staging)
+        self.assertTrue(req2.hisparse_staging)
+        self.assertTrue(coordinator._skip_first_backup[0])
+        self.assertTrue(coordinator._skip_first_backup[1])
+        self.assertFalse(coordinator._skip_first_backup[2])
+        self.assertIsInstance(coordinator.ack_staging_queue, deque)
+        self.assertEqual(len(coordinator.ack_staging_queue), 1)
+        self.assertIs(coordinator.ack_staging_queue[0].req, req2)
+
+        req3 = _make_req("req-3")
+        req3.kv = SimpleNamespace(req_pool_idx=3)
+        req3.hisparse_staging = True
+        coordinator.ack_staging_queue.append(HiSparseAct(None, ev_ready, req3))
+
+        req2.extend_end = 4
+        coordinator.write_staging_stream = SimpleNamespace(synchronize=lambda: None)
+        coordinator.req_to_token_pool = SimpleNamespace(
+            req_to_token=torch.zeros((4, 8), dtype=torch.int64)
+        )
+        coordinator.token_to_kv_pool_allocator = SimpleNamespace(
+            free_hisparse=lambda locs: None
+        )
+        coordinator.mem_pool_host = SimpleNamespace(
+            allocated_host_indices=lambda pool, idx, length: torch.empty(
+                0, dtype=torch.int64
+            ),
+            free=lambda indices: None,
+        )
+        coordinator.req_to_host_pool = torch.zeros((4, 8), dtype=torch.int64)
+        coordinator.req_to_host_pool_allocated_len = torch.zeros(4, dtype=torch.int64)
+        coordinator.spec_swap = SimpleNamespace(
+            free_unrotated_scratch=lambda idx: None
+        )
+
+        coordinator.abort_staging_request(req2)
+        self.assertIsInstance(coordinator.ack_staging_queue, deque)
+        self.assertFalse(req2.hisparse_staging)
+        ready_after_abort = coordinator.collect_ready_reqs()
+        self.assertEqual([r.rid for r in ready_after_abort], ["req-3"])
+        self.assertFalse(coordinator.has_ongoing_staging())
+
+
 class TestHiSparseUnit(unittest.TestCase):
     """Test class that builds a minimal HiSparse component stack."""
 
