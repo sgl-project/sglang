@@ -851,23 +851,19 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         positions: torch.Tensor,
         pool: DeepSeekV4TokenToKVPool,
     ) -> None:
-        kvs = self.project_commit_kv(main_hidden=main_hidden, pool=pool)
+        kvs = self.project_commit_kv(main_hidden=main_hidden)
         self.store_commit_kv(kvs=kvs, swa_loc=swa_loc, positions=positions, pool=pool)
 
-    def project_commit_kv(
-        self, *, main_hidden: torch.Tensor, pool: DeepSeekV4TokenToKVPool
-    ) -> List[torch.Tensor]:
+    def project_commit_kv(self, *, main_hidden: torch.Tensor) -> List[torch.Tensor]:
         """The context rows' per-stage KV, before norm / rope / store; reads no KV
         location, so it can run before the accept decides what is committed."""
         main_x = self.project_target_hidden(main_hidden)
         return CommitKvProj.execute(
             main_x=main_x,
             wkv_linears=[stage.self_attn.wkv for stage in self.stages],
-            # The FlashMLA writer reads an explicit KV row stride, so views are fine.
+            # Both KV writers read an explicit row stride, so views are fine.
             allow_strided_output=(
-                get_platform().is_blackwell
-                and not is_unified_kv_triton()
-                and not pool.uniform_fp8
+                get_platform().is_blackwell and not is_unified_kv_triton()
             ),
         )
 
