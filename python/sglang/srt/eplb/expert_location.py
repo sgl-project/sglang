@@ -616,11 +616,13 @@ def compute_logical_to_rank_dispatch_physical_map(
     ep_rank: int,
     seed: int = 42,
 ):
-
     r = random.Random(seed)
 
     device = logical_to_all_physical_map.device
-    logical_to_all_physical_map = logical_to_all_physical_map.cpu()
+    dtype = logical_to_all_physical_map.dtype
+    num_layers, num_logical_experts, _ = logical_to_all_physical_map.shape
+    # Convert once instead of indexing CPU tensors for every layer/expert pair.
+    physical_experts = logical_to_all_physical_map.cpu().tolist()
 
     num_local_gpu_physical_experts = num_physical_experts // ep_size
     prefer_same_node = _prefer_same_node_experts()
@@ -632,18 +634,22 @@ def compute_logical_to_rank_dispatch_physical_map(
         if num_gpus_per_node is not None
         else None
     )
-    num_layers, num_logical_experts, _ = logical_to_all_physical_map.shape
-    dtype = logical_to_all_physical_map.dtype
-
-    result_list = [
-        [[-1] * num_logical_experts for _ in range(num_layers)] for _ in range(ep_size)
-    ]
+    # Keep only this rank's result; preserve the global random-choice sequence.
+    ep_rank = range(ep_size)[ep_rank]
+    result_list = [[-1] * num_logical_experts for _ in range(num_layers)]
 
     for layer_id in range(num_layers):
         for logical_expert_id in range(num_logical_experts):
-            candidate_physical_expert_ids = _logical_to_all_physical_raw(
-                logical_to_all_physical_map, layer_id, logical_expert_id
-            )
+            candidate_physical_expert_ids = [
+                expert_id
+                for expert_id in physical_experts[layer_id][logical_expert_id]
+                if expert_id != -1
+            ]
+            if len(candidate_physical_expert_ids) == 1:
+                result_list[layer_id][logical_expert_id] = (
+                    candidate_physical_expert_ids[0]
+                )
+                continue
 
             remaining_ranks = []
             for moe_ep_rank in range(ep_size):
@@ -655,7 +661,8 @@ def compute_logical_to_rank_dispatch_physical_map(
                     num_local_node_physical_experts=num_local_node_physical_experts,
                 )
 
-                result_list[moe_ep_rank][layer_id][logical_expert_id] = val
+                if moe_ep_rank == ep_rank:
+                    result_list[layer_id][logical_expert_id] = val
                 if val == -1:
                     remaining_ranks.append(moe_ep_rank)
 
@@ -664,24 +671,13 @@ def compute_logical_to_rank_dispatch_physical_map(
                     candidate_physical_expert_ids, k=len(remaining_ranks), r=r
                 )
                 for moe_ep_rank, choice in zip(remaining_ranks, choices, strict=True):
-                    result_list[moe_ep_rank][layer_id][logical_expert_id] = choice
+                    if moe_ep_rank == ep_rank:
+                        result_list[layer_id][logical_expert_id] = choice
 
     logical_to_rank_dispatch_physical_map = torch.tensor(result_list, dtype=dtype)
     assert torch.all(logical_to_rank_dispatch_physical_map != -1)
 
-    return logical_to_rank_dispatch_physical_map[ep_rank, :, :].to(device)
-
-
-def _logical_to_all_physical_raw(
-    logical_to_all_physical_map, layer_id: int, logical_expert_id: int
-) -> List[int]:
-    return [
-        physical_expert_id
-        for physical_expert_id in logical_to_all_physical_map[
-            layer_id, logical_expert_id
-        ].tolist()
-        if physical_expert_id != -1
-    ]
+    return logical_to_rank_dispatch_physical_map.to(device)
 
 
 def _compute_gpu_id_of_physical_expert(

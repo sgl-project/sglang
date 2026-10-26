@@ -19,6 +19,7 @@ Import torch_npu only when an NPU operation actually needs it.
 """
 
 import logging
+import time
 from functools import wraps
 from typing import Callable
 
@@ -31,6 +32,7 @@ from sglang.srt.utils import is_npu
 logger = logging.getLogger(__name__)
 _group_world = None
 _device_group = None
+_warmed_device_group = None
 
 
 def get_eplb_device_group() -> dist.ProcessGroup | None:
@@ -60,6 +62,37 @@ def get_eplb_device_group() -> dist.ProcessGroup | None:
             "[NPU EPLB host group] world=%d buffer=32MiB", dist.get_world_size()
         )
     return _device_group
+
+
+def warmup_eplb_communication() -> None:
+    """Initialize statistics and all-peer migration channels before serving."""
+    global _warmed_device_group
+    group = get_eplb_device_group()
+    if group is None or group is _warmed_device_group:
+        return
+
+    start = time.perf_counter()
+    world_size = dist.get_world_size(group)
+    if world_size > 1:
+        rank = dist.get_rank()
+        send = torch.zeros(1, dtype=torch.int32, device="npu")
+        recv = torch.empty((world_size, 1), dtype=torch.int32, device="npu")
+        dist.all_reduce(send, group=group)
+        ops = []
+        for peer in range(world_size):
+            if peer != rank:
+                ops.append(dist.P2POp(dist.isend, send, peer, group=group))
+                ops.append(dist.P2POp(dist.irecv, recv[peer], peer, group=group))
+        for work in dist.batch_isend_irecv(ops):
+            work.wait()
+        # Retain the tiny buffers until communication has actually completed.
+        torch.npu.synchronize()
+    _warmed_device_group = group
+    logger.info(
+        "[NPU EPLB] communication warmup finished: ranks=%d time=%.3fs",
+        world_size,
+        time.perf_counter() - start,
+    )
 
 
 def prepare_expert_weight_update(

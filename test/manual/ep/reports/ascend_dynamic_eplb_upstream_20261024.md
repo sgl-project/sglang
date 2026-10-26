@@ -24,9 +24,21 @@ tensors return before creating a buffer view or issuing a copy.
 Graphs without buffered routes omit inactive capture flags, letting replay skip
 the statistics-state restoration hook.
 
-Eight production files differ from the base: four NPU files and the shared
-recorder, weight updater, ModelRunner, and prefill backend factory. The shared
+Nine production files differ from the base: four NPU files and the shared
+recorder, placement metadata, weight updater, ModelRunner, and prefill backend factory. The shared
 EPLB manager and decode graph runner are unchanged from the base.
+
+Static dispatch builds its CPU candidate lists once, retains only the current
+rank's result, and directly handles experts with one physical copy. Replicated
+experts retain the upstream choice order and random-number sequence. This adds
+no work to the GPU forward path.
+
+Non-elastic NPU EPLB warms the dedicated statistics and all-peer P2P channels
+during target recorder initialization. Tiny temporary buffers are synchronized
+before release. Completed warmups are cached by process-group identity; Elastic
+EP keeps its existing collective initialization order. This moves channel setup
+to startup rather than removing its cost, and does not change expert placement,
+rebalance intervals, or layer chunk defaults.
 
 NPU prefill capture temporarily uses direct route counting, so target graphs
 record count updates without depending on replay-time Python batching flags.
@@ -68,6 +80,18 @@ locally because the local Python has no PyTorch installation. A separate
 production-method extraction probe with simulated graph operations passed
 prefill replay counting, draft isolation, and policy restoration. This is not
 an actual NPU graph or full-package integration test.
+
+The static-dispatch optimization passed 3,936 real CPU PyTorch equivalence
+cases and 36 output/random-state comparisons. At synthetic 43-layer, 256-expert,
+272-slot layouts, median CPU function time changed from 116.1 to 14.1 ms and
+109.2 to 10.1 ms. This is not a serving throughput result.
+
+A standalone 16-rank Ascend 910C check with torch_npu 2.10.0.post6 validated
+communication warmup, payloads, and cached reuse: warmup took 2736.9 ms, and the
+first all-peer INT8 transfer in the prewarmed group took 2.30 ms versus 2175.0 ms
+in an independent cold group. No model was loaded or restarted for this check.
+An external packing prototype was slower including pack/unpack, so it was not
+adopted. Full-model startup integration and serving performance remain untested.
 
 Earlier migration tests and manual probes remain available in the
 [historical test tree](https://github.com/AkiYangDev/sglang/tree/46393a1ce8359fc226704702b14a157dfa77c7ee/test).

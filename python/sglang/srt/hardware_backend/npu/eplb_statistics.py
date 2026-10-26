@@ -21,7 +21,10 @@ from contextlib import contextmanager
 import torch
 
 from sglang.srt.eplb import expert_distribution as distribution
-from sglang.srt.hardware_backend.npu.eplb import get_eplb_device_group
+from sglang.srt.hardware_backend.npu.eplb import (
+    get_eplb_device_group,
+    warmup_eplb_communication,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +46,10 @@ class NpuExpertDistributionRecorder(distribution._ExpertDistributionRecorderReal
     """Reuse upstream recording while isolating NPU draft forward lifecycles."""
 
     def _create_accumulator(self, expert_location_metadata, rank):
+        moe = distribution.get_exec().moe
+        if moe.enable_eplb and not moe.elastic_ep_backend:
+            # Join/scale paths need their own collective initialization order.
+            warmup_eplb_communication()
         return distribution._Accumulator.get_class()(
             expert_location_metadata, rank, communication=NpuEplbCommunication()
         )
