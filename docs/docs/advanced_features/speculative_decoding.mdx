@@ -18,6 +18,7 @@ SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3,
 - [Multi Token Prediction](#multi-token-prediction)
 - [UNO decoding](#uno-decoding)
 - [DFlash Decoding](#dflash-decoding)
+  - [XPress refinement](#xpress-refinement)
 - [Standalone Speculative Decoding (Small Draft Model)](#standalone-speculative-decoding-small-draft-model)
 - [Speculative Decoding V2 (Overlap Scheduler)](#speculative-decoding-v2-overlap-scheduler)
 - [Ngram Speculative Decoding](#ngram-speculative-decoding)
@@ -34,6 +35,7 @@ SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3,
 - **Model is MTP-enabled**: Use **MTP via speculative decoding** (often with small `speculative_num_steps/topk/num_draft_tokens`, see the example section).
 - **You have a UNO adapter for the target model**: Use **UNO** with `--speculative-algorithm UNO` and `--uno-lora-path ...`.
 - **You have a DFlash draft checkpoint**: Use **DFLASH** with `--speculative-algorithm DFLASH` and `--speculative-draft-model-path ...`.
+- **You have an XPress draft checkpoint**: Use the DFLASH algorithm with that checkpoint; its refiner runs automatically.
 - **You have a smaller draft LLM**: Use **STANDALONE** (`--speculative-algorithm STANDALONE`).
 - **No extra model available**: Use **NGRAM** (`--speculative-algorithm NGRAM`, CUDA-only).
 
@@ -619,6 +621,29 @@ response = client.chat.completions.create(
 
 print(response.choices[0].message.content)
 ```
+
+### XPress refinement
+
+XPress adds a causal refiner to a DFlash draft. SGLang selects it when the draft
+config declares `Qwen3XPressModel` or `DFlashQwen3XPressModel`. Use the published
+Qwen3-8B checkpoint with its matching target on NVIDIA CUDA and tensor parallel
+size 1:
+
+```bash
+python3 -m sglang.launch_server \
+    --model-path Qwen/Qwen3-8B \
+    --tp 1 \
+    --speculative-algorithm DFLASH \
+    --speculative-draft-model-path UIUC-SSAIL/Qwen3-8B-XPress-b16 \
+    --speculative-num-draft-tokens 16
+```
+
+The checkpoint sets the number of Jacobi passes and the top-C candidate count;
+the defaults are six passes and 512 candidates. Set `xpress_topc: 0` in the
+draft config for full-vocabulary scoring. The refiner requires a dense target
+LM head, the same vocabulary size as the target, and the checkpoint's block
+size. It does not support ROCm, NPU, XPU or tensor parallel size above 1.
+As with DFlash, the target verifies the proposed tokens before committing them.
 
 ### DFlash and DFlash2 with DP attention
 
