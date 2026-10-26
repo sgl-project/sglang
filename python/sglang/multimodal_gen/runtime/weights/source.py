@@ -5,14 +5,20 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import Literal
 from urllib.parse import unquote, urlparse
 
-from huggingface_hub import HfApi, hf_hub_download
+from huggingface_hub import HfApi, hf_hub_download, snapshot_download
+from huggingface_hub.errors import HfHubHTTPError, LocalEntryNotFoundError
 from huggingface_hub.utils import validate_repo_id
+
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
 
 WeightSourceKind = Literal["local", "huggingface"]
 
@@ -26,6 +32,11 @@ _PRECISION_VARIANT_SUFFIX_RE = re.compile(
 _CANONICAL_SAFETENSORS_SUFFIX_RE = re.compile(
     r"^(?P<stem>.+?)(?:-\d+-of-\d+)?" r"(?P<suffix>\.safetensors(?:\.index\.json)?)$"
 )
+# The Hub meters API calls such as model_info() far more tightly than file
+# downloads, and the quota is shared by every process using the same token.
+_HUB_RATE_LIMIT_RETRIES = 3
+_HUB_RATE_LIMIT_DEFAULT_WAIT_S = 60.0
+_HUB_RATE_LIMIT_MAX_WAIT_S = 120.0
 
 
 @dataclass(frozen=True)
@@ -274,15 +285,77 @@ def resolve_weight_inventory(source: WeightSource) -> WeightInventory:
         )
 
     assert source.repo_id is not None
-    model_info = HfApi().model_info(
-        source.repo_id,
-        revision=source.revision,
-    )
+    model_info = _hub_model_info(source.repo_id, source.revision)
     files = tuple(sibling.rfilename for sibling in model_info.siblings)
     return WeightInventory(
         source=source,
         resolved_revision=model_info.sha,
         files=_filter_inventory_files(files, source),
+    )
+
+
+def _hub_model_info(repo_id: str, revision: str | None):
+    """Fetch repo metadata, waiting out a 429 for as long as the Hub asks."""
+    for attempt in range(_HUB_RATE_LIMIT_RETRIES):
+        try:
+            return HfApi().model_info(repo_id, revision=revision)
+        except HfHubHTTPError as error:
+            response = error.response
+            if response is None or response.status_code != 429:
+                raise
+            wait_s = _retry_after_seconds(response.headers.get("Retry-After"))
+            logger.warning(
+                "Hugging Face API rate limit hit for %s; retrying in %.0fs (%d/%d)",
+                repo_id,
+                wait_s,
+                attempt + 1,
+                _HUB_RATE_LIMIT_RETRIES,
+            )
+            time.sleep(wait_s)
+    return HfApi().model_info(repo_id, revision=revision)
+
+
+def _retry_after_seconds(header: str | None) -> float:
+    try:
+        wait_s = float(header)
+    except (TypeError, ValueError):
+        # Absent, or an HTTP date rather than a number of seconds.
+        wait_s = _HUB_RATE_LIMIT_DEFAULT_WAIT_S
+    return min(max(wait_s, 1.0), _HUB_RATE_LIMIT_MAX_WAIT_S)
+
+
+def _cached_hub_inventory(source: WeightSource) -> WeightInventory | None:
+    """List the locally cached snapshot of a Hub source without any network call.
+
+    Returns None when the revision is not cached. The listing holds only the
+    files downloaded so far, so callers must use it only to find a file they
+    name exactly, never to choose among candidates.
+    """
+    assert source.repo_id is not None
+    try:
+        snapshot = Path(
+            snapshot_download(
+                source.repo_id, revision=source.revision, local_files_only=True
+            )
+        )
+    except LocalEntryNotFoundError:
+        return None
+    # An empty refs file resolves to the snapshots/ parent instead of a revision.
+    if snapshot.parent.name != "snapshots":
+        return None
+    files = tuple(
+        path.relative_to(snapshot).as_posix()
+        for path in sorted(snapshot.rglob("*"))
+        if path.is_file()
+    )
+    try:
+        files = _filter_inventory_files(files, source)
+    except FileNotFoundError:
+        return None
+    return WeightInventory(
+        source=source,
+        resolved_revision=snapshot.name,
+        files=files,
     )
 
 
@@ -331,6 +404,24 @@ def resolve_weight(
 ) -> ResolvedWeight:
     """Resolve one weight file without downloading its tensor payload."""
     parsed_source = parse_weight_source(source, revision=revision)
+    if parsed_source.kind == "huggingface" and (
+        parsed_source.filename is not None or weight_name is not None
+    ):
+        # A named file already in the local cache needs no Hub API call.
+        cached = _cached_hub_inventory(parsed_source)
+        if cached is not None:
+            # A partial snapshot may lack the file, or hold only basename
+            # matches that hide an exact path elsewhere in the repo, so only an
+            # exact path skips the Hub.
+            try:
+                selected_file = select_weight_file(cached, weight_name)
+            except (FileNotFoundError, ValueError):
+                selected_file = None
+            if selected_file is not None and selected_file in (
+                parsed_source.filename,
+                weight_name,
+            ):
+                return ResolvedWeight(inventory=cached, selected_file=selected_file)
     inventory = resolve_weight_inventory(parsed_source)
     selected_file = select_weight_file(inventory, weight_name)
     return ResolvedWeight(
