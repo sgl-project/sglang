@@ -145,6 +145,48 @@ sglang serve                        \
 | Activations | BF16 (W4A16). Clamped swiglu (GPT-OSS) and plain SiLU are supported |
 | Expert parallelism | Not yet validated on this path |
 
+## Expert Parallelism with Mooncake EP
+
+BF16 MoE models can run with expert parallelism across the GPUs of one node
+through [Mooncake EP](https://github.com/kvcache-ai/Mooncake), which has a
+native SYCL implementation of its low-latency dispatch and combine. Peers
+exchange tokens over Level Zero IPC, with no MPI or ISHMEM.
+
+Mooncake's prebuilt wheels do not include XPU support, so build it from source
+with the oneAPI compiler, after installing its dependencies
+(`sudo bash dependencies.sh`):
+
+```bash
+git clone https://github.com/kvcache-ai/Mooncake.git && cd Mooncake
+source /opt/intel/oneapi/setvars.sh
+cmake -S . -B build-xpu -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx \
+  -DUSE_XPU=ON -DWITH_EP=ON -DUSE_CUDA=OFF -DWITH_STORE=OFF -DWITH_STORE_RUST=OFF
+cmake --build build-xpu -j
+cmake --install build-xpu --component python
+```
+
+Then launch with the Mooncake all-to-all backend:
+
+```bash
+sglang serve                         \
+    --model-path <MODEL_ID_OR_PATH>  \
+    --trust-remote-code              \
+    --device xpu                     \
+    --tp 4                           \
+    --ep-size 4                      \
+    --moe-a2a-backend mooncake       \
+    --attention-backend intel_xpu
+```
+
+**Requirements and limitations:**
+
+| Item | Status |
+|---|---|
+| Parallelism | Expert parallelism over the TP ranks of one node (`--ep-size` equal to `--tp`). DP attention, two- and single-batch overlap, elastic EP and multiple nodes are rejected at startup |
+| MoE weights | BF16 only; quantized MoE is rejected |
+| Dispatch mode | Low latency; `--deepep-mode auto` resolves to it |
+| GPUs | Validated on Intel Arc Pro B60 (Xe2 / BMG). The GPUs need peer-to-peer access, and the ranks must share a host and PID namespace |
+
 ## Benchmarking with Requests
 
 You can benchmark the performance via the `bench_serving` script.
