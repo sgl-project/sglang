@@ -306,6 +306,10 @@ def _is_mistral(ctx):
     )
 
 
+def _is_beam(ctx):
+    return ctx.has_text("<|channel|>") and ctx.has_text("<rfl:parameter")
+
+
 def _is_gpt_oss(ctx):
     return ctx.has_text("<|channel|>")
 
@@ -543,6 +547,7 @@ REASONING_PARSER_RULES = (
     DetectionRule(name="kimi", value="kimi", predicate=_is_kimi),
     DetectionRule(name="interns1", value="interns1", predicate=_is_interns1),
     DetectionRule(name="mistral", value="mistral", predicate=_is_mistral),
+    DetectionRule(name="beam", value="beam", predicate=_is_beam),
     DetectionRule(name="gpt_oss", value="gpt-oss", predicate=_is_gpt_oss),
     DetectionRule(name="kimi_k2", value="kimi_k2", predicate=_is_kimi_k2),
     DetectionRule(
@@ -587,6 +592,7 @@ TOOL_CALL_PARSER_RULES = (
     DetectionRule(name="k2_horizon", value="k2_horizon", predicate=_is_k2_v3),
     DetectionRule(name="apertus2509", value="apertus2509", predicate=_is_apertus2509),
     DetectionRule(name="gemma4", value="gemma4", predicate=_is_gemma4),
+    DetectionRule(name="beam", value="beam", predicate=_is_beam),
     DetectionRule(name="gpt_oss", value="gpt-oss", predicate=_is_gpt_oss),
     DetectionRule(name="kimi_k2", value="kimi_k2", predicate=_is_kimi_k2),
     DetectionRule(name="minimax_m3", value="minimax-m3", predicate=_is_minimax_m3),

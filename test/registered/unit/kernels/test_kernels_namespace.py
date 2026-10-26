@@ -252,6 +252,14 @@ def test_kimi_k3_kernels_are_inventoried_by_operator(op, backend, device):
     assert not K.capabilities_satisfied(spec.capabilities, _CPU)
 
 
+def test_router_gemv_is_inventoried_for_cuda_and_hip():
+    """CUDA serves FP32 gates and ROCm gfx950 BF16 gates through one Triton GEMV."""
+    spec = K.select_kernel("gemm.router_gemv", backend=KernelBackend.TRITON)
+    for platform in (_SM90, _HIP):
+        assert K.capabilities_satisfied(spec.capabilities, platform)
+    assert not K.capabilities_satisfied(spec.capabilities, _CPU)
+
+
 def _readme() -> str:
     return (Path(K.__file__).resolve().parent / "README.md").read_text()
 
