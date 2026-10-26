@@ -6376,6 +6376,12 @@ def run_scheduler_process(
             except Exception:
                 pass
     finally:
+        try:
+            from sglang.srt.model_executor.step_shape_log import flush_step_shape_log
+
+            flush_step_shape_log()
+        except Exception:
+            logger.exception("Failed to flush step-shape log")
         if scheduler is not None:
             # FPM has a background ZMQ publisher thread that needs explicit
             # teardown to flush queued metrics and close the socket cleanly.

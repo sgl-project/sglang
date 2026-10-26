@@ -350,9 +350,12 @@ class Envs:
     # ===================================================================
     SGLANG_LOG_GC = EnvBool(False)
     SGLANG_LOG_FORWARD_ITERS = EnvBool(False)
-    # off | summary | vector. Logs one parseable ModelRunner step shape on the
-    # primary attention rank; vector includes per-request N_Q and KV lengths.
+    # off | summary | vector. Both on modes buffer per-request N_Q and KV
+    # lengths for each ModelRunner step on the primary attention rank.
+    # The buffer is written once, at process exit, to SGLANG_LOG_STEP_SHAPES_PATH.
+    # Median and text are produced by the offline decoder.
     SGLANG_LOG_STEP_SHAPES = EnvStr("off")
+    SGLANG_LOG_STEP_SHAPES_PATH = EnvStr("")
     SGLANG_LOG_DECODE_GRAPH_KEY = EnvBool(False)
     SGLANG_LOG_MS = EnvBool(False)
     SGLANG_LOG_REQUEST_EXCEEDED_MS = EnvInt(-1)

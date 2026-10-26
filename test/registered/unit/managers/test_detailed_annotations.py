@@ -17,7 +17,6 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.step_span_utils import (
-    build_step_shape_log,
     detailed_annotations_enabled,
     set_detailed_annotations_enabled,
 )
@@ -27,13 +26,18 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class _CpuMirror:
-    """Minimal stand-in for the ``seq_lens_cpu`` tensor (only ``tolist`` used)."""
+    """Minimal stand-in for the ``seq_lens_cpu`` tensor."""
 
     def __init__(self, data):
         self._data = list(data)
 
     def tolist(self):
         return list(self._data)
+
+    def numpy(self):
+        import numpy as np
+
+        return np.asarray(self._data, dtype=np.int32)
 
 
 def _fb(
@@ -226,35 +230,80 @@ class TestStepSpanDetailedAnnotations(CustomTestCase):
             "step[VERIFY bs=2 forward_id=42]",
         )
 
-    def test_step_shape_summary_includes_kv_distribution(self):
+    def test_step_shape_binary_keeps_kv_distribution(self):
+        import os
+        import tempfile
+
+        from sglang.srt.model_executor.step_shape_log import (
+            StepShapeRecorder,
+            read_step_shape_records,
+        )
+
         fb = _fb(
             ForwardMode.TARGET_VERIFY,
             batch_size=3,
             seq_lens_cpu=[10, 20, 100],
             num_tokens_per_req=4,
         )
-        self.assertEqual(
-            build_step_shape_log(fb, forward_id=7),
-            "stage=TARGET_VERIFY bs=3 forward_id=7 "
-            "g_sq=12 g_sqsq=48 g_sqsk=520 g_sk=130 "
-            "g_qmin=4 g_qmed=4 g_qmax=4 "
-            "g_kmin=10 g_kmed=20 g_kmax=100",
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "shapes.bin")
+            recorder = StepShapeRecorder(path)
+            recorder.record(fb, is_draft_worker=False, forward_id=7)
+            self.assertEqual(recorder.buffered_bytes, 16 + 3 * 8)
+            recorder.flush()
+            recorder.flush()
+            records = read_step_shape_records(path)
+        self.assertEqual(len(records), 1)
+        record = records[0]
+        self.assertEqual(record.stage, "TARGET_VERIFY")
+        self.assertFalse(record.draft)
+        self.assertEqual(record.batch_size, 3)
+        self.assertEqual(record.forward_id, 7)
+        self.assertEqual(record.q.tolist(), [4, 4, 4])
+        self.assertEqual(record.k.tolist(), [10, 20, 100])
+        self.assertEqual(record.q_sum, 12)
+        self.assertEqual(record.k_sum, 130)
+        self.assertEqual(record.q_median, 4)
+        self.assertEqual(record.k_median, 20)
+        self.assertEqual(record.k_min, 10)
+        self.assertEqual(record.k_max, 100)
+
+    def test_step_shape_binary_preserves_extend_lengths(self):
+        import os
+        import tempfile
+
+        from sglang.srt.model_executor.step_shape_log import (
+            StepShapeRecorder,
+            read_step_shape_records,
         )
 
-    def test_step_shape_vector_preserves_request_lengths(self):
         fb = _fb(
             ForwardMode.EXTEND,
             batch_size=2,
             extend_seq_lens_cpu=[8, 4],
             extend_prefix_lens_cpu=[2, 6],
         )
-        self.assertEqual(
-            build_step_shape_log(fb, include_vectors=True),
-            "stage=EXTEND bs=2 "
-            "c_sq=12 c_sqsq=80 c_sqsk=120 c_sk=20 "
-            "c_qmin=4 c_qmed=6 c_qmax=8 "
-            "c_kmin=10 c_kmed=10 c_kmax=10 c_q=[8,4] c_k=[10,10]",
-        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "shapes.bin")
+            recorder = StepShapeRecorder(path)
+            recorder.record(fb, is_draft_worker=True, forward_id=3)
+            recorder.record(
+                _fb(ForwardMode.DECODE, batch_size=1, seq_lens_cpu=None),
+                is_draft_worker=False,
+                forward_id=4,
+            )
+            recorder.flush()
+            records = read_step_shape_records(path)
+        self.assertEqual(records[0].stage, "EXTEND")
+        self.assertTrue(records[0].draft)
+        self.assertEqual(records[0].q.tolist(), [8, 4])
+        self.assertEqual(records[0].k.tolist(), [10, 10])
+        self.assertEqual(records[0].q_median, 6)
+        self.assertEqual(records[0].k_median, 10)
+        self.assertEqual(records[1].stage, "DECODE")
+        self.assertEqual(records[1].batch_size, 0)
+        self.assertEqual(records[1].q.tolist(), [])
+        self.assertEqual(records[1].k_median, None)
 
 
 class TestStepSpanGating(CustomTestCase):
