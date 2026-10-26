@@ -683,6 +683,13 @@ class ServerArgs(DisaggServerArgsMixin):
     def broker_port(self) -> int:
         return self.port + 1
 
+    @property
+    def progress_endpoint(self) -> str | None:
+        # replica drivers send video progress here; ipc only reaches this node
+        if self.port is None or self.disagg_role != RoleType.MONOLITHIC:
+            return None
+        return f"ipc://{tempfile.gettempdir()}/sglang-diffusion-progress-{self.port}"
+
     def _adjust_path(self):
         expand_path_fields(self)
         self._adjust_save_paths()

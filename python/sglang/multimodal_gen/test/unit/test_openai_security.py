@@ -12,6 +12,7 @@ import pytest
 import torch
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
+from openai import AsyncOpenAI
 from starlette.datastructures import UploadFile
 
 from sglang.multimodal_gen.configs.pipeline_configs.hunyuan3d import (
@@ -36,6 +37,78 @@ from sglang.multimodal_gen.runtime.postprocess.bounded_cache import (
     cache_put,
 )
 from sglang.multimodal_gen.runtime.utils.image_io import ensure_path_within_root
+
+
+@pytest.mark.parametrize("api,kind", [(video_api, "video"), (mesh_api, "mesh")])
+def test_job_list_is_bounded_and_has_complete_cursor_metadata(monkeypatch, api, kind):
+    store = AsyncDictStore()
+    monkeypatch.setattr(api, f"{kind.upper()}_STORE", store)
+    jobs = [{"id": str(i), "created_at": i % 4} for i in range(45)]
+
+    async def populate():
+        for job in jobs:
+            await store.upsert(job["id"], job)
+
+    asyncio.run(populate())
+    app = FastAPI()
+    app.include_router(api.router)
+    endpoint = api.router.prefix
+    with TestClient(app) as client:
+        assert len(client.get(endpoint).json()["data"]) == 20
+        for order in ("asc", "desc"):
+            expected = sorted(
+                jobs, key=lambda item: item["created_at"], reverse=order == "desc"
+            )
+            ids = []
+            params = {"order": order, "limit": 7}
+            for start in range(0, len(jobs), 7):
+                page = client.get(endpoint, params=params).json()
+                page_ids = [job["id"] for job in page["data"]]
+                assert page_ids == [job["id"] for job in expected[start : start + 7]]
+                assert page["first_id"] == page_ids[0]
+                assert page["last_id"] == page_ids[-1]
+                assert page["has_more"] is (start + 7 < len(jobs))
+                ids.extend(page_ids)
+                params["after"] = page["last_id"]
+            assert len(ids) == len(set(ids)) == len(jobs)
+        empty = client.get(endpoint, params={"after": "missing"}).json()
+        assert empty == {
+            "object": "list",
+            "data": [],
+            "first_id": None,
+            "last_id": None,
+            "has_more": False,
+        }
+        for params in ({"limit": 0}, {"limit": 101}, {"order": "invalid"}):
+            assert client.get(endpoint, params=params).status_code == 422
+
+
+def test_openai_video_iterator_stops_at_the_last_nonempty_page(monkeypatch):
+    store = AsyncDictStore()
+    monkeypatch.setattr(video_api, "VIDEO_STORE", store)
+    app = FastAPI()
+    app.include_router(video_api.router)
+    requests = []
+
+    async def record_request(request):
+        requests.append(request)
+
+    async def run():
+        for i in range(21):
+            await store.upsert(str(i), {"id": str(i), "created_at": i})
+        async with AsyncOpenAI(
+            api_key="unused",
+            base_url="http://test/v1",
+            http_client=httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app),
+                event_hooks={"request": [record_request]},
+            ),
+        ) as client:
+            ids = [job.id async for job in client.videos.list(limit=7)]
+        assert ids == [str(i) for i in reversed(range(21))]
+        assert len(requests) == 3
+
+    asyncio.run(run())
 
 
 @pytest.mark.parametrize(
@@ -282,7 +355,7 @@ def test_rejected_mesh_preparation_does_not_create_a_queued_job(monkeypatch, tmp
             )
         assert response.status_code == 500
         assert rejected.is_set()
-        assert await store.list_page() == []
+        assert (await store.list_page())["data"] == []
 
     asyncio.run(run_test())
 
