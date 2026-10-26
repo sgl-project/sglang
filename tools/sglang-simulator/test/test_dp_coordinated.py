@@ -227,6 +227,58 @@ def receive(owners):
     )
 
 
+@pytest.mark.parametrize(
+    "kind", ["GetInternalStateReq", "ConfigureLoggingReq", "FreezeGCReq", "ShutdownReq"]
+)
+@pytest.mark.parametrize("second_rank_poll", [1, 3])
+def test_bootstrap_admin_applies_before_first_ready(
+    owners, monkeypatch, kind, second_rank_poll
+):
+    admin = type(kind, (), {})()
+    settle = owners.owner._settle
+    bootstrap_settles = []
+
+    def bounded_settle():
+        if owners.owner.clock.run_id is None:
+            # A second bootstrap wait would deadlock the server-info reply and
+            # the client which sends Ready only after receiving that reply.
+            assert not bootstrap_settles, "bootstrap ACK waited for Ready"
+            bootstrap_settles.append(True)
+        return settle()
+
+    monkeypatch.setattr(owners.owner, "_settle", bounded_settle)
+    owners.incoming.put(admin)
+    polls = [0, 0]
+
+    def native_receive(run):
+        def values():
+            polls[run.rank] += 1
+            if run.rank == 1 and polls[1] < second_rank_poll:
+                return []
+            return drain(owners.queues[run.rank])
+
+        return run.bridge.receive(values)
+
+    assert both(owners, native_receive) == [[admin], [admin]]
+    assert polls[1] >= second_rank_poll
+    assert bootstrap_settles == [True]
+    assert owners.owner._inflight is None
+    assert owners.owner.clock.run_id is None
+    assert owners.owner.clock.now_ns == 0
+    assert owners.events == [("dispatch", kind, None)]
+
+    monkeypatch.setattr(owners.owner, "_settle", settle)
+    # Native administration has returned on both ranks; ordinary coordinated
+    # admission still needs the unchanged first Ready and its matching payload.
+    owners.control.send(encode_message(Ready("run", 0, [Submit("after-admin")])))
+    request = TokenizedGenerateReqInput("after-admin", 1)
+    owners.incoming.put(request)
+    assert receive(owners) == [[], [request]]
+    assert owners.owner._delivered == {"after-admin": 1}
+    assert owners.owner.clock.run_id == "run"
+    assert not owners.failures
+
+
 def test_native_ingress_is_acknowledged_before_local_delivery(owners):
     owners.control.send(
         encode_message(Ready("run", 0, [Submit("a"), Submit("b")], next_wakeup_ns=100))

@@ -1057,7 +1057,9 @@ schedulers report through their actual CPU TP group; only the leader exchanges
 local IPC with that controller. Native routing retains the original dispatcher,
 explicit routed-DP requests, native load snapshots and budget algorithm, with
 its 20ms refresh cadence evaluated in virtual time. A dispatch generation is
-released only after both schedulers acknowledge actual receipt. One complete
+released only after both schedulers acknowledge actual receipt. Bootstrap
+administration reaches both native handlers before waiting for the first Ready,
+so a client can query server state before starting coordinated admission. One complete
 joint whole-worker result advances time once, and both native callbacks and
 accounting consumption precede global terminal delivery. Profile boundaries
 require both drained owners, combine request statistics using the existing

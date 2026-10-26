@@ -265,8 +265,15 @@ class DPCoordinatedController(CoordinatedScheduler):
                 "native load snapshots do not identify both actual DP ranks",
             )
             self._loads = loads
+            bootstrap_ingress = self.clock.run_id is None and self._inflight is not None
             self._ack_ingress()
-            if self._inflight is None and self._profile is None:
+            # Let both native handlers apply acknowledged bootstrap administration
+            # before waiting for the first Ready (which can depend on its reply).
+            if (
+                self._inflight is None
+                and self._profile is None
+                and not bootstrap_ingress
+            ):
                 with self._guard():
                     self._settle()
                     self._dispatch_pending()
