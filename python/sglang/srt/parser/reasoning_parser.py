@@ -2398,6 +2398,13 @@ class ReasoningParser:
         "xing4_0": Xing4_0Detector,
     }
 
+    @classmethod
+    def supports_field_continuation(cls, model_type: str) -> bool:
+        return cls.DetectorMap.get(model_type.lower()) in {
+            Qwen3Detector,
+            DeepSeekR1Detector,
+        }
+
     def __init__(
         self,
         model_type: Optional[str] = None,
@@ -2414,6 +2421,14 @@ class ReasoningParser:
         detector_class = self.DetectorMap.get(model_type.lower())
         if not detector_class:
             raise ValueError(f"Unsupported model type: {model_type}")
+
+        continuation_target = getattr(request, "continue_final_message", False)
+        if isinstance(
+            continuation_target, str
+        ) and not self.supports_field_continuation(model_type):
+            raise ValueError(
+                f"Reasoning parser {model_type!r} does not support field continuation."
+            )
 
         chat_template_kwargs = getattr(request, "chat_template_kwargs", None) or {}
 
@@ -2445,7 +2460,7 @@ class ReasoningParser:
         if (
             request is not None
             and isinstance(request, ChatCompletionRequest)
-            and request.continue_final_message
+            and request.continue_final_message is True
             and request.messages[-1].role == "assistant"
         ):
             kwargs["continue_final_message"] = True
@@ -2498,6 +2513,12 @@ class ReasoningParser:
                 )
 
         self.detector = detector_class(**kwargs)
+        if isinstance(continuation_target, str):
+            # The selected field, not the model default or literal tags in the
+            # prefill, determines where the generated suffix starts.
+            in_reasoning = continuation_target == "reasoning_content"
+            self.detector.force_reasoning = in_reasoning
+            self.detector._in_reasoning = in_reasoning
 
     def parse_non_stream(self, full_text: str) -> Tuple[Optional[str], Optional[str]]:
         """Non-streaming call: one-time parsing"""
