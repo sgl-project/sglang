@@ -22,9 +22,10 @@ class TestNPURadixEvictionPolicyConfig(CustomTestCase):
     ``--radix-eviction-policy-config '{"protected_threshold": 4}'`` and that
     the eviction path actually runs: the KV pool is capped small enough to be
     exhausted, so the eviction strategy's ``get_priority`` is exercised. A
-    prefix warmed to exactly ``protected_threshold`` hits survives, while a
-    prefix warmed to one hit below it is evicted, which proves the configured
-    threshold (4) drives eviction rather than the SLRU default (2).
+    prefix warmed several times reaches ``hit_count >= 4`` and survives, while
+    a prefix cached only once stays at ``hit_count == 2`` and is evicted; this
+    proves the configured threshold (4) -- not the SLRU default (2) -- drives
+    eviction.
 
     [Test Category] HiCache
     [Test Target] --radix-eviction-policy-config
@@ -106,9 +107,9 @@ class TestNPURadixEvictionPolicyConfig(CustomTestCase):
         return total
 
     def test_eviction_triggers_and_protected_prefix_survives(self):
-        # Phase 1: warm the shared prefix to exactly ``protected_threshold``
-        # hits so it sits right at the protection boundary (first request
-        # misses, the rest hit).
+        # Phase 1: warm the shared prefix enough that its hit_count reaches the
+        # protected segment (hit_count >= protected_threshold). The first
+        # request misses; every later one reuses the cached prefix.
         for i in range(self._PROTECTED_THRESHOLD):
             resp = self._generate(self._SHARED_PROMPT, 8)
             cached = int(resp["meta_info"]["cached_tokens"])
@@ -117,15 +118,19 @@ class TestNPURadixEvictionPolicyConfig(CustomTestCase):
             else:
                 self.assertGreater(cached, 0, "Shared prefix should be reused")
 
-        # Phase 2: warm a victim prefix to one hit below the threshold; it must
-        # stay unprotected and therefore be evicted under the configured value.
-        for i in range(self._PROTECTED_THRESHOLD - 1):
-            resp = self._generate(self._VICTIM_PROMPT, 8)
-            cached = int(resp["meta_info"]["cached_tokens"])
-            if i == 0:
-                self.assertEqual(cached, 0, "First victim request should not be cached")
-            else:
-                self.assertGreater(cached, 0, "Victim prefix should be reused")
+        # Phase 2: cache the victim prefix exactly once. A finished /generate
+        # request walks the tree twice (cache_unfinished_req on prefill, then
+        # cache_finished_req on release), each bumping hit_count, so a single
+        # miss already leaves hit_count == 2. Warming it any further would push
+        # hit_count to 4+ and put it in the protected segment, defeating the
+        # "just below the threshold" premise. One cache-only request keeps it
+        # at hit_count == 2 < protected_threshold, so it must be evicted.
+        resp = self._generate(self._VICTIM_PROMPT, 8)
+        self.assertEqual(
+            int(resp["meta_info"]["cached_tokens"]),
+            0,
+            "First victim request should not be cached",
+        )
 
         # Phase 3: flood the small KV pool with distinct long prompts until
         # eviction is forced (get_priority is consulted).
@@ -139,9 +144,9 @@ class TestNPURadixEvictionPolicyConfig(CustomTestCase):
             "Expected radix eviction when the KV pool is exhausted",
         )
 
-        # The victim (3 hits < threshold) must be evicted while the protected
-        # prefix (4 hits >= threshold) survives; this proves the configured
-        # threshold drives eviction, not the SLRU default of 2.
+        # The victim (2 hits < threshold) must be evicted while the protected
+        # prefix (>= 4 hits) survives; this proves the configured threshold (4)
+        # drives eviction, not the SLRU default of 2.
         victim = self._generate(self._VICTIM_PROMPT, 8)
         self.assertEqual(
             int(victim["meta_info"]["cached_tokens"]),
