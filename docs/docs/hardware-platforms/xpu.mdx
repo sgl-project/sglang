@@ -283,7 +283,37 @@ via `--cuda-graph-backend-prefill` or `--cuda-graph-config`.
 | Feature | Status |
 |---|---|
 | Two-batch overlap (`--enable-two-batch-overlap`) | Not yet supported |
-| Speculative decoding | Supported |
+| Speculative decoding | Supported, with the limits in [Speculative Decoding on Intel XPU](#speculative-decoding-on-intel-xpu) |
+
+## Speculative Decoding on Intel XPU
+
+XPU accepts `EAGLE`, `EAGLE3`, `NEXTN` (MTP), `STANDALONE`, `NGRAM`, `DFLASH` and
+`DSPARK`. XPU nightly CI covers `EAGLE`, `EAGLE3` and `DFLASH` with chain drafts
+(`--speculative-eagle-topk 1`) on the `triton` and `intel_xpu` attention backends.
+For example, the EAGLE3 setup that XPU nightly CI runs:
+
+```bash
+python -m sglang.launch_server \
+    --model-path meta-llama/Llama-3.1-8B-Instruct --device xpu \
+    --attention-backend intel_xpu \
+    --speculative-algorithm EAGLE3 \
+    --speculative-draft-model-path lmsys/sglang-EAGLE3-LLaMA3.1-Instruct-8B \
+    --speculative-num-steps 5 --speculative-eagle-topk 1 --speculative-num-draft-tokens 6
+```
+
+Limitations:
+
+- `--speculative-eagle-topk > 1` is not supported with `--attention-backend intel_xpu`.
+- `EAGLE`, `EAGLE3`, `NEXTN`, `STANDALONE`, `NGRAM` and `DFLASH` verify greedily: the
+  target's argmax is committed, so `temperature`, `top_p`, `top_k` and `min_p` have no
+  effect while speculative decoding is on. The server logs a warning the first time it
+  verifies a sampled request.
+- `--speculative-use-rejection-sampling` and `--speculative-use-block-verification` are
+  rejected on XPU.
+- With `--tp` greater than 1 and the XPU decode graph, `DSPARK` drafts are all rejected
+  ([#45034](https://github.com/sgl-project/sglang/issues/45034)). Run `DSPARK` without the
+  decode graph at `--tp` greater than 1.
+- Speculative decoding on DSA models (DeepSeek-V3.2, GLM-5) is not supported on XPU yet.
 
 ## Decode Context Parallel (DCP) on Intel XPU [Experimental]
 

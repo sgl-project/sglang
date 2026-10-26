@@ -172,6 +172,14 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
             f"(--speculative-algorithm {cfg.speculative_algorithm})"
         )
 
+    if cfg.speculative_use_rejection_sampling and cfg.device == "xpu":
+        # Speculative verify on XPU is greedy for every algorithm, so the flag
+        # would otherwise be accepted and silently ignored.
+        raise ValueError(
+            "--speculative-use-rejection-sampling is not supported on XPU; "
+            "speculative verify on XPU is greedy."
+        )
+
     if cfg.speculative_use_block_verification:
         if cfg.speculative_algorithm not in ("EAGLE", "EAGLE3", "DFLASH", "DSPARK"):
             raise ValueError(

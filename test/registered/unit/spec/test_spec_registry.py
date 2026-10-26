@@ -217,6 +217,7 @@ class TestServerArgsHook(_RegistryIsolated):
             moe_runner_backend="auto",
             speculative_algorithm="my_handle_args",
             speculative_use_block_verification=False,
+            speculative_use_rejection_sampling=False,
             decrypted_draft_config_file=None,
             trust_remote_code=False,
             speculative_draft_window_size=None,

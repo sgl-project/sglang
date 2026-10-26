@@ -82,6 +82,7 @@ from sglang.srt.models.deepseek_common.utils import (
 )
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 from sglang.srt.models.kimi_linear import KimiDeltaAttention
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_parallel,
     get_platform,
@@ -2053,7 +2054,7 @@ class BailingMoeV3ForCausalLM(nn.Module):
         del self.lm_head.weight
         self.model.word_embeddings.weight = embed
         self.lm_head.weight = head
-        torch.cuda.empty_cache()
+        current_platform.empty_cache()
 
 
 EntryClass = [

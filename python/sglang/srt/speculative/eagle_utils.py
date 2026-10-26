@@ -32,6 +32,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
     is_xpu,
+    print_warning_once,
 )
 from sglang.srt.utils.async_probe import maybe_detect_oob
 
@@ -645,6 +646,12 @@ def eagle_sample(
         is_xpu=_is_xpu,
         use_rejection_sampling=use_rejection_sampling,
     ):
+        if not sampling_info.is_all_greedy:
+            print_warning_once(
+                "Speculative verify falls back to the target argmax on this device: "
+                "temperature, top_p, top_k and min_p are ignored while speculative "
+                "decoding is on."
+            )
         target_predict = torch.argmax(next_token_logits, dim=-1)
         target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
         predict, accept_index, num_correct_drafts = verify_tree_greedy_func(

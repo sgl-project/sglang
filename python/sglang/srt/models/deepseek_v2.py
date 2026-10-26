@@ -208,6 +208,7 @@ from sglang.srt.models.deepseek_common.utils import (
     tiny_router_gemm_max_tokens,
 )
 from sglang.srt.multimodal.dsv41.vl_routing import vision_topk
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     LoRABatchLayout,
     attention_backends,
@@ -3444,8 +3445,8 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        current_platform.empty_cache()
+        current_platform.synchronize()
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
