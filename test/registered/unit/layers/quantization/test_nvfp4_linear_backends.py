@@ -85,8 +85,7 @@ def _make_merged_layer(n_half: int, k: int):
         params_dtype=torch.bfloat16,
         quant_config=quant_config,
         prefix="model.layers.0.mlp.gate_up_proj",
-        tp_rank=0,
-        tp_size=1,
+        parallel_group="replicated",
     ).cuda()
 
     # process_weights_after_loading collapses shard scale_2 with max() without

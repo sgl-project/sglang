@@ -281,8 +281,6 @@ class BenchmarkWorker:
         block_n = block_shape[0] if block_shape else 0
         block_k = block_shape[1] if block_shape else 0
         N = shard_intermediate_size // 2
-        if use_int4_w4a16:
-            N = N // 2
         op_config = get_moe_configs(
             num_experts,
             N,

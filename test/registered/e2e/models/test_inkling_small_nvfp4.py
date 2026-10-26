@@ -112,7 +112,6 @@ class TestInklingSmallNvfp4(CustomTestCase):
                 "--mem-fraction-static",
                 "0.85",
             ],
-            env={**os.environ, "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"},
         )
 
     @classmethod
@@ -134,7 +133,7 @@ class TestInklingSmallNvfp4(CustomTestCase):
                 num_questions=200,
                 max_new_tokens=512,
                 parallel=128,
-                host=f"http://{url.hostname}",
+                host=url.hostname,
                 port=int(url.port),
             )
         )
@@ -202,7 +201,6 @@ class TestInklingSmallNvfp4DsparkDeterministic(CustomTestCase):
                 "--speculative-draft-attention-backend",
                 "fa4",
             ],
-            env={**os.environ, "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"},
         )
 
     @classmethod
@@ -228,12 +226,11 @@ class TestInklingSmallNvfp4DsparkDeterministic(CustomTestCase):
         self._run(assert_logprobs_match_prefill_cache_hit)
 
     def test_input_output_logprobs_match_decode_cache_hit(self):
-        # Not every prompt: speculation commits up to block_size-1 tokens past
-        # max_new_tokens, and those reach the radix insert but not the returned
-        # output. For roughly one prompt in 32 that puts the request's only mamba
-        # checkpoint past the prefix a follow-up turn can reach, and its decode
-        # region is not reusable. Tighten to 0.99 once that is fixed.
-        self._run(assert_logprobs_match_decode_cache_hit, min_cache_hit_ratio=0.9)
+        # 0.99 is every prompt: the track interval above makes the reuse
+        # unconditional once the cache key stops carrying speculative overshoot,
+        # so a single miss is a state-reuse regression rather than a geometry
+        # coincidence.
+        self._run(assert_logprobs_match_decode_cache_hit, min_cache_hit_ratio=0.99)
 
 
 # The multi-turn branching harness, unlike the single-turn helpers above, replays
@@ -316,7 +313,6 @@ class TestInklingSmallNvfp4HiCacheDeterministic(CustomTestCase):
                 "4",
                 "--enable-deterministic-inference",
             ],
-            env={**os.environ, "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"},
         )
         cls.input_ids = get_input_ids(cls.model, num_samples=18, trust_remote_code=True)
 

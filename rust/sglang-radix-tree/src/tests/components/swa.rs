@@ -1,7 +1,290 @@
 use super::*;
-use crate::components::{FULL, MAMBA, SWA};
-use crate::test_utils::{accumulate_step, action_kinds};
+use crate::cache_action::{
+    BackupKV, FreeComponentHostSlot, FreeDeviceKV, FreeDeviceKVFullOnly, RebuildFullToSwaMapping,
+    RecoverSwaWithLockedFull, SwaRebuild, UpdatePendingBackupOnNodeSplit,
+};
+use crate::components::{ComponentSet, FULL, MAMBA, SWA};
+use crate::test_utils::{accumulate_step, action_kinds, expect_action, matched_device_indices};
 use crate::unified_tree_core::CacheInitParams;
+
+#[test]
+fn swa_window_ranges_coalesce_clip_and_stop_only_without_full() {
+    let mut tc = swa_core(8, 1);
+    let nodes: [_; 6] = chain(&mut tc);
+    let key = vec![1, 2, 3, 4, 5, 6];
+    for node in nodes {
+        tc.arena
+            .set_device_value(node, FULL, Tensor::from_slice(&[10i64]));
+    }
+    set_swa_device(&mut tc, nodes[2]);
+    set_swa_device(&mut tc, nodes[5]);
+    set_swa_host(&mut tc, nodes[1]);
+    assert_eq!(
+        tc.swa_tombstone_ranges(&key, Default::default(), 1, 6)
+            .unwrap(),
+        vec![(1, 2), (3, 5)]
+    );
+    let before = tc.arena.node(nodes[0]).last_access_counter;
+    assert_eq!(
+        tc.swa_tombstone_ranges(&key, Default::default(), 0, 5)
+            .unwrap(),
+        vec![(0, 2), (3, 5)]
+    );
+    assert_eq!(tc.arena.node(nodes[0]).last_access_counter, before);
+    assert_eq!(tc.arena.len(), 7);
+    let _ = tc.arena.take_device_value(nodes[4], FULL);
+    assert_eq!(
+        tc.swa_tombstone_ranges(&key, Default::default(), 0, 6)
+            .unwrap(),
+        vec![(0, 2), (3, 4)]
+    );
+    tc.arena
+        .set_host_value(nodes[4], FULL, Tensor::from_slice(&[10i64]));
+    assert_eq!(
+        tc.swa_tombstone_ranges(&key, Default::default(), 0, 6)
+            .unwrap(),
+        vec![(0, 2), (3, 5)]
+    );
+    assert!(
+        tc.swa_tombstone_ranges(&key, Default::default(), 2, 2)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        tc.swa_tombstone_ranges(&vec![9], Default::default(), 0, 1)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn swa_window_attach_splits_both_edges_preserving_full_and_pending_actions() {
+    let mut tc = swa_core(8, 2);
+    let key = vec![1, 2, 3, 4, 5, 6, 7, 8];
+    tc.insert(&insert_params_swa(
+        &key,
+        &[10, 11, 12, 13, 14, 15, 16, 17],
+        0,
+        8,
+    ));
+    let leaf = child_of(&tc, tc.arena.root(), &[1, 2]);
+    let leaf_id = tc.arena.node(leaf).id;
+    tc.arena.node_mut(leaf).write_through_pending_id = Some(91);
+    tc.arena.node_mut(leaf).load_back_pending_id = Some(92);
+    tc.arena.node_mut(leaf).rotation_base = Some(7);
+    tc.arena.node_mut(leaf).external_cache_stored = true;
+    let mut values = Tensor::from_slice(&[50i64, 51, 52, 53]);
+    let actions = tc
+        .attach_swa_window(&key, Default::default(), 2, 6, &values)
+        .unwrap();
+    assert_eq!(actions.len(), 2);
+    for action in &actions {
+        assert!(
+            matches!(action.as_any().downcast_ref::<UpdatePendingBackupOnNodeSplit>(), Some(UpdatePendingBackupOnNodeSplit { ack_id: Some(91), old_node_id, new_child_node_id, .. }) if *old_node_id == leaf_id && *new_child_node_id == leaf_id)
+        );
+    }
+    let head = child_of(&tc, tc.arena.root(), &[1, 2]);
+    let middle = child_of(&tc, head, &[3, 4]);
+    assert_eq!(child_of(&tc, middle, &[7, 8]), leaf);
+    for node in [head, middle, leaf] {
+        assert_eq!(tc.arena.node(node).rotation_base, Some(7));
+        assert_eq!(tc.arena.node(node).load_back_pending_id, Some(92));
+        assert_eq!(tc.arena.node(node).write_through_pending_id, Some(91));
+        assert!(tc.arena.node(node).external_cache_stored);
+    }
+    let full = Tensor::cat(
+        &[
+            tc.arena.device_value(head, FULL),
+            tc.arena.device_value(middle, FULL),
+            tc.arena.device_value(leaf, FULL),
+        ],
+        0,
+    );
+    assert!(full.equal(&Tensor::from_slice(&[10i64, 11, 12, 13, 14, 15, 16, 17])));
+    let _ = values.fill_(99);
+    assert!(
+        tc.arena
+            .device_value(middle, SWA)
+            .equal(&Tensor::from_slice(&[50i64, 51, 52, 53]))
+    );
+    assert_eq!(tc.swa_evictable_size(), 4);
+    assert_eq!(tc.swa_protected_size(), 0);
+    assert_eq!(
+        tc.swa_tombstone_ranges(&key, Default::default(), 0, 8)
+            .unwrap(),
+        vec![(0, 2), (6, 8)]
+    );
+}
+
+#[test]
+fn swa_window_attach_under_lock_restamps_lru_and_releases_accounting() {
+    let mut tc = swa_core(8, 1);
+    let key = vec![1, 2, 3, 4];
+    tc.insert(&insert_params_swa(&key, &[10, 11, 12, 13], 0, 4));
+    let leaf = child_of(&tc, tc.arena.root(), &[1]);
+    let leaf_id = tc.arena.node(leaf).id;
+    tc.arena
+        .set_host_value(leaf, SWA, Tensor::from_slice(&[20i64, 21, 22, 23]));
+    tc.host_lru_list_mut(SWA).insert_mru(leaf);
+    let receipt = tc.inc_lock_ref(leaf_id, ComponentSet::EMPTY).unwrap();
+    tc.attach_swa_window(
+        &key,
+        Default::default(),
+        1,
+        3,
+        &Tensor::from_slice(&[51i64, 52]),
+    )
+    .unwrap();
+    let head = child_of(&tc, tc.arena.root(), &[1]);
+    let middle = child_of(&tc, head, &[2]);
+    assert_eq!(tc.swa_protected_size(), 2);
+    assert_eq!(tc.swa_evictable_size(), 0);
+    assert!(tc.device_lru_list(SWA).in_list(Some(middle)));
+    assert!(!tc.host_lru_list(SWA).in_list(Some(middle)));
+    assert!(tc.host_lru_list(SWA).in_list(Some(head)));
+    assert!(tc.host_lru_list(SWA).in_list(Some(leaf)));
+    tc.dec_lock_ref(leaf_id, &receipt.to_dec_params(), false)
+        .unwrap();
+    assert_eq!(tc.swa_protected_size(), 0);
+    assert_eq!(tc.swa_evictable_size(), 2);
+    for node in [head, middle, leaf] {
+        assert_eq!(tc.arena.device_lock_ref(node, SWA), 0);
+        assert_eq!(tc.arena.device_lock_ref(node, FULL), 0);
+    }
+}
+
+#[test]
+fn swa_window_attach_rejects_incomplete_or_live_spans_before_mutation() {
+    let mut tc = swa_core(8, 1);
+    let key = vec![1, 2, 3, 4];
+    tc.insert(&insert_params_swa(&key, &[10, 11, 12, 13], 0, 4));
+    let leaf = child_of(&tc, tc.arena.root(), &[1]);
+    let (head, _) = tc.split_node_(leaf, 2);
+    tc.set_component_device_value_(leaf, SWA, Tensor::from_slice(&[52i64, 53]));
+    let count = tc.arena.len();
+    let error = tc
+        .attach_swa_window(
+            &key,
+            Default::default(),
+            1,
+            4,
+            &Tensor::from_slice(&[51i64, 52, 53]),
+        )
+        .err()
+        .unwrap();
+    assert!(error.contains("over live SWA"));
+    assert_eq!(tc.arena.len(), count);
+    assert!(!tc.arena.has_device_value(head, SWA));
+    assert_eq!(tc.swa_evictable_size(), 2);
+    let error = tc
+        .attach_swa_window(
+            &vec![1, 2, 9, 10],
+            Default::default(),
+            1,
+            4,
+            &Tensor::from_slice(&[51i64, 52, 53]),
+        )
+        .err()
+        .unwrap();
+    assert!(error.contains("covered 2"));
+    assert_eq!(tc.arena.len(), count);
+    assert!(!tc.arena.has_device_value(head, SWA));
+}
+
+#[test]
+fn swa_window_attach_validates_tensor_and_page_bounds_before_mutation() {
+    let mut tc = swa_core(8, 2);
+    let key = vec![1, 2, 3, 4];
+    tc.insert(&insert_params_swa(&key, &[10, 11, 12, 13], 0, 4));
+    for (start, end, values) in [
+        (1, 3, Tensor::from_slice(&[51i64, 52])),
+        (0, 4, Tensor::from_slice(&[51i64, 52])),
+        (
+            0,
+            4,
+            Tensor::from_slice(&[51i64, 52, 53, 54]).reshape([2, 2]),
+        ),
+        (0, 4, Tensor::from_slice(&[51f32, 52., 53., 54.])),
+        (4, 2, Tensor::from_slice(&[51i64, 52])),
+        (2, 6, Tensor::from_slice(&[51i64, 52, 53, 54])),
+    ] {
+        assert!(
+            tc.attach_swa_window(&key, Default::default(), start, end, &values)
+                .is_err()
+        );
+        assert_eq!(tc.arena.len(), 2);
+        assert_eq!(tc.swa_evictable_size(), 0);
+    }
+    assert!(
+        tc.attach_swa_window(
+            &key,
+            Default::default(),
+            0,
+            0,
+            &Tensor::from_slice::<i64>(&[])
+        )
+        .unwrap()
+        .is_empty()
+    );
+    let mut full_only: UnifiedTreeCore<Vec<i64>> =
+        UnifiedTreeCore::new(CacheInitParams::default(), vec![FULL]);
+    assert!(
+        full_only
+            .swa_tombstone_ranges(&key, Default::default(), 0, 4)
+            .is_err()
+    );
+    assert!(
+        full_only
+            .attach_swa_window(
+                &key,
+                Default::default(),
+                0,
+                4,
+                &Tensor::from_slice(&[51i64, 52, 53, 54])
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn swa_window_bigram_namespaces_preserve_atom_positions() {
+    let mut tc: UnifiedTreeCore<Vec<(i64, i64)>> = UnifiedTreeCore::new(
+        CacheInitParams {
+            page_size: 2,
+            ..swa_params_with_window(8)
+        },
+        vec![FULL, SWA],
+    );
+    let key = vec![(1, 2), (2, 3), (3, 4), (4, 5)];
+    let namespace = crate::node::KeyNamespaceRef::new(Some("adapter"), Some("tenant"));
+    let leaf = tc
+        .arena
+        .alloc_child_in_namespace(tc.arena.root(), key.clone(), 0, namespace)
+        .unwrap();
+    tc.arena
+        .set_device_value(leaf, FULL, Tensor::from_slice(&[10i64, 11, 12, 13]));
+    assert!(
+        tc.swa_tombstone_ranges(&key, Default::default(), 0, 4)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        tc.swa_tombstone_ranges(&key, namespace, 1, 3).unwrap(),
+        vec![(1, 3)]
+    );
+    tc.attach_swa_window(&key, namespace, 2, 4, &Tensor::from_slice(&[52i64, 53]))
+        .unwrap();
+    assert_eq!(
+        tc.swa_tombstone_ranges(&key, namespace, 0, 4).unwrap(),
+        vec![(0, 2)]
+    );
+    assert!(
+        tc.arena
+            .device_value(leaf, SWA)
+            .equal(&Tensor::from_slice(&[52i64, 53]))
+    );
+    assert_eq!(tc.arena.node(leaf).key, vec![(3, 4), (4, 5)]);
+}
 
 #[test]
 fn component_type_is_swa() {
@@ -172,7 +455,8 @@ fn store_swa_device(tc: &mut UnifiedTreeCore<Vec<i64>>, node: NodeIdx_) {
         tc.arena.node(node).id,
         SWA,
         Tensor::from_slice(&vec![0i64; len]),
-    );
+    )
+    .expect("live test node");
 }
 
 #[test]
@@ -251,19 +535,27 @@ fn match_validator_host_backed_nodes_extend_the_window() {
 }
 
 #[test]
-fn match_validator_hicache_accepts_live_or_backuped_swa_tombstones() {
-    let mut tc = swa_core(/* window = */ 2, /* page_size = */ 1);
-    tc.set_hicache_enabled();
-    let [live, backuped, dead] = chain(&mut tc);
-    tc.arena
-        .set_device_value(live, FULL, Tensor::from_slice(&[0i64]));
-    tc.arena
-        .set_host_value(backuped, FULL, Tensor::from_slice(&[0i64]));
-    let mut validator =
-        swa_component(2).create_match_validator(&tc, /* match_device_only = */ true);
-    assert!(validator(&tc, live));
-    assert!(validator(&tc, backuped));
-    assert!(!validator(&tc, dead));
+fn match_validator_request_ring_accepts_live_or_backuped_tombstones_without_a_tier_condition() {
+    for enable_hicache in [false, true] {
+        let params = CacheInitParams {
+            swa_req_ring: true,
+            enable_hicache,
+            ..swa_params_with_window(2)
+        };
+        let swa = SwaComponent::new(&params);
+        let mut tc = UnifiedTreeCore::new(params, vec![FULL, SWA]);
+        let [live, backuped, dead] = chain(&mut tc);
+        tc.arena
+            .set_device_value(live, FULL, Tensor::from_slice(&[0i64]));
+        tc.arena
+            .set_host_value(backuped, FULL, Tensor::from_slice(&[0i64]));
+        for device_only in [false, true] {
+            let mut validator = swa.create_match_validator(&tc, device_only);
+            assert!(validator(&tc, live));
+            assert!(validator(&tc, backuped));
+            assert!(!validator(&tc, dead));
+        }
+    }
 }
 
 #[test]
@@ -288,11 +580,9 @@ fn match_validator_hicache_with_a_host_pool_rejects_swa_tombstones() {
     let [live] = chain(&mut tc);
     tc.arena
         .set_device_value(live, FULL, Tensor::from_slice(&[0i64]));
-    // A wired host SWA pool means tombstones must gate the match again.
+    // A host pool cannot supply an SWA window whose nodes hold no host values.
     tc.set_has_swa_host_pool();
-    let swa = SwaComponent {
-        sliding_window_size: 2,
-    };
+    let swa = swa_component(2);
     let mut validator = <SwaComponent as TreeComponent<Vec<i64>>>::create_match_validator(
         &swa, &tc, /* match_device_only = */ true,
     );
@@ -300,19 +590,54 @@ fn match_validator_hicache_with_a_host_pool_rejects_swa_tombstones() {
 }
 
 #[test]
-fn match_validator_hicache_tombstone_acceptance_still_resets_the_window() {
+fn match_validator_request_ring_tombstone_acceptance_still_resets_the_window() {
     let mut tc = swa_core(/* window = */ 2, /* page_size = */ 1);
     tc.set_hicache_enabled();
     let [live, c] = chain(&mut tc);
     tc.arena
         .set_device_value(live, FULL, Tensor::from_slice(&[0i64]));
     set_swa_device(&mut tc, c);
-    let mut validator =
-        swa_component(2).create_match_validator(&tc, /* match_device_only = */ true);
+    let swa = SwaComponent::new(&CacheInitParams {
+        swa_req_ring: true,
+        ..swa_params_with_window(2)
+    });
+    let mut validator = swa.create_match_validator(&tc, /* match_device_only = */ true);
     // The accepted tombstone still zeroes the run: the next valued node
     // sits below the window.
     assert!(validator(&tc, live));
     assert!(!validator(&tc, c));
+}
+
+#[test]
+fn match_prefix_uses_request_ring_layout_instead_of_hicache_pool_presence() {
+    let key: Vec<i64> = (0..12).collect();
+    let values: Vec<i64> = (10..22).collect();
+    let prefix = key[..8].to_vec();
+    for (swa_req_ring, enable_hicache, has_swa_host_pool) in [
+        (false, false, false),
+        (true, false, false),
+        (false, true, false),
+        (false, true, true),
+        (true, true, false),
+    ] {
+        let mut tc = UnifiedTreeCore::new(
+            CacheInitParams {
+                swa_req_ring,
+                enable_hicache,
+                has_swa_host_pool,
+                ..swa_params_with_window(8)
+            },
+            vec![FULL, SWA],
+        );
+        tc.insert(&insert_params_swa(&key, &values, 0, 8));
+        let result = tc.match_prefix(&match_params(&prefix));
+        assert_eq!(result.full_kv_hit_length, 8);
+        let expected = if swa_req_ring { &values[..8] } else { &[] };
+        assert!(
+            matched_device_indices(&tc, &result).equal(&Tensor::from_slice(expected)),
+            "ring={swa_req_ring}, hicache={enable_hicache}, swa_host={has_swa_host_pool}"
+        );
+    }
 }
 
 // The SWA LRU order, MRU to LRU.
@@ -393,6 +718,7 @@ fn finalize(
     best: NodeIdx_,
     prior_swa_host_hit: usize,
 ) -> MatchResult {
+    let last_device_node_idx = tc.arena.root();
     swa.finalize_match_result_in_tree_core(
         tc,
         MatchResult {
@@ -400,6 +726,8 @@ fn finalize(
             swa_host_hit_length: prior_swa_host_hit,
             ..tc.empty_match_result()
         },
+        last_device_node_idx,
+        best,
         &MatchPrefixParams {
             key: &Vec::new(),
             namespace: Default::default(),
@@ -539,14 +867,17 @@ fn insert_params_swa<'k>(
     swa_evicted_seqlen: usize,
 ) -> InsertParams<'k, Vec<i64>> {
     InsertParams {
+        rotation_base: None,
         key,
         namespace: Default::default(),
         value: Tensor::from_slice(value),
         mamba_value: None,
         prev_prefix_len,
         swa_evicted_seqlen,
-        chunked: false,
+        swa_branching_seqlen: None,
+        inserted_len: 0,
         priority: 0,
+        session_id: None,
         track_adopted_ranges: false,
     }
 }
@@ -577,15 +908,13 @@ fn insert_new_leaf_in_window_emits_one_leaf_rebuild() {
     assert_eq!(result.prefix_len, 0);
     let root = tc.arena.root();
     let leaf = child_of(&tc, root, &[1]);
-    let [
-        CacheAction::SwaRebuild {
-            node_id,
-            source_value,
-        },
-    ] = result.cache_actions.as_slice()
-    else {
+    let [action] = result.cache_actions.as_slice() else {
         panic!("expected one SwaRebuild action");
     };
+    let SwaRebuild {
+        node_id,
+        source_value,
+    } = expect_action::<SwaRebuild>(action.as_ref());
     assert_eq!(*node_id, tc.arena.node(leaf).id);
     assert!(source_value.equal(&Tensor::from_slice(&[10i64, 11, 12])));
     // The rebuild is deferred to apply time: the leaf is still an SWA tombstone.
@@ -613,15 +942,13 @@ fn insert_new_leaf_straddling_the_boundary_splits_and_rebuilds_the_tail() {
             .device_value(parent, FULL)
             .equal(&Tensor::from_slice(&[10i64, 11]))
     );
-    let [
-        CacheAction::SwaRebuild {
-            node_id,
-            source_value,
-        },
-    ] = result.cache_actions.as_slice()
-    else {
+    let [action] = result.cache_actions.as_slice() else {
         panic!("expected one SwaRebuild action");
     };
+    let SwaRebuild {
+        node_id,
+        source_value,
+    } = expect_action::<SwaRebuild>(action.as_ref());
     assert_eq!(*node_id, tc.arena.node(child).id);
     assert!(source_value.equal(&Tensor::from_slice(&[12i64, 13])));
 }
@@ -657,19 +984,17 @@ fn insert_long_leaf_caps_the_window_and_rebuilds_the_older_prefix_first() {
     let tail = child_of(&tc, capped, &[5]);
     assert_eq!(tc.arena.node(capped).key, vec![1, 2, 3, 4]);
     assert_eq!(tc.arena.node(tail).key, vec![5, 6]);
-    let [
-        CacheAction::SwaRebuild {
-            node_id: first_id,
-            source_value: first_value,
-        },
-        CacheAction::SwaRebuild {
-            node_id: second_id,
-            source_value: second_value,
-        },
-    ] = result.cache_actions.as_slice()
-    else {
+    let [action0, action1] = result.cache_actions.as_slice() else {
         panic!("expected two SwaRebuild actions");
     };
+    let SwaRebuild {
+        node_id: first_id,
+        source_value: first_value,
+    } = expect_action::<SwaRebuild>(action0.as_ref());
+    let SwaRebuild {
+        node_id: second_id,
+        source_value: second_value,
+    } = expect_action::<SwaRebuild>(action1.as_ref());
     assert_eq!(*first_id, tc.arena.node(capped).id);
     assert!(first_value.equal(&Tensor::from_slice(&[10i64, 11, 12, 13])));
     assert_eq!(*second_id, tc.arena.node(tail).id);
@@ -704,12 +1029,14 @@ fn insert_overlap_with_live_swa_frees_the_whole_duplicate() {
         tc.arena.node(leaf).id,
         SWA,
         Tensor::from_slice(&[50i64, 51, 52]),
-    );
+    )
+    .expect("live test node");
     let result = tc.insert(&insert_params_swa(&vec![1, 2, 3], &[20, 21, 22], 0, 0));
     assert_eq!(result.prefix_len, 3);
-    let [CacheAction::FreeDeviceKV(freed)] = result.cache_actions.as_slice() else {
+    let [action] = result.cache_actions.as_slice() else {
         panic!("expected one FreeDeviceKV action");
     };
+    let FreeDeviceKV { indices: freed } = expect_action::<FreeDeviceKV>(action.as_ref());
     assert_eq!(freed.len(), 1);
     assert!(freed[0].equal(&Tensor::from_slice(&[20i64, 21, 22])));
     // The node keeps its original Full and SWA values.
@@ -732,6 +1059,7 @@ fn insert_overlap_recovers_a_tombstone_inside_the_window() {
     let root = tc.arena.root();
     let leaf = child_of(&tc, root, &[1]);
     let result = tc.insert(&InsertParams {
+        rotation_base: None,
         track_adopted_ranges: true,
         ..insert_params_swa(&vec![1, 2, 3], &[20, 21, 22], 0, 0)
     });
@@ -742,16 +1070,15 @@ fn insert_overlap_recovers_a_tombstone_inside_the_window() {
             .device_value(leaf, FULL)
             .equal(&Tensor::from_slice(&[20i64, 21, 22]))
     );
-    let [
-        CacheAction::FreeDeviceKVFullOnly(freed),
-        CacheAction::SwaRebuild {
-            node_id,
-            source_value,
-        },
-    ] = result.cache_actions.as_slice()
-    else {
+    let [action0, action1] = result.cache_actions.as_slice() else {
         panic!("expected FreeDeviceKVFullOnly then SwaRebuild");
     };
+    let FreeDeviceKVFullOnly { indices: freed } =
+        expect_action::<FreeDeviceKVFullOnly>(action0.as_ref());
+    let SwaRebuild {
+        node_id,
+        source_value,
+    } = expect_action::<SwaRebuild>(action1.as_ref());
     assert!(freed[0].equal(&Tensor::from_slice(&[10i64, 11, 12])));
     assert_eq!(*node_id, tc.arena.node(leaf).id);
     assert!(source_value.equal(&Tensor::from_slice(&[20i64, 21, 22])));
@@ -761,18 +1088,77 @@ fn insert_overlap_recovers_a_tombstone_inside_the_window() {
 }
 
 #[test]
-#[should_panic(expected = "tombstone Swa lock_ref should be 0, node")]
-fn insert_overlap_panics_on_a_locked_swa_tombstone() {
+fn insert_overlap_recovers_a_locked_swa_tombstone() {
     let mut tc = swa_core(/* window = */ 8, /* page_size = */ 1);
     tc.insert(&insert_params_swa(&vec![1, 2, 3], &[10, 11, 12], 0, 0));
     let root = tc.arena.root();
     let leaf = child_of(&tc, root, &[1]);
-    // The rebuild is deferred, so the leaf is still an SWA tombstone; a raw
-    // lock on it breaks the tombstones-are-unlocked contract.
+    // A segment lock may hold an SWA tombstone; the co-held FULL lock (the
+    // full >= swa protocol invariant) forces the Recover branch, so the
+    // locked full stays on the node.
     tc.arena
         .node_mut(leaf)
         .set_lock_ref_(ValueSlotIdx::device(SWA), 1);
-    tc.insert(&insert_params_swa(&vec![1, 2, 3], &[20, 21, 22], 0, 0));
+    tc.arena
+        .node_mut(leaf)
+        .set_lock_ref_(ValueSlotIdx::device(FULL), 1);
+    let result = tc.insert(&insert_params_swa(&vec![1, 2, 3], &[20, 21, 22], 0, 0));
+    assert!(
+        tc.arena
+            .device_value(leaf, FULL)
+            .equal(&Tensor::from_slice(&[10i64, 11, 12]))
+    );
+    assert!(result.cache_actions.iter().any(|action| matches!(
+        action.as_any().downcast_ref::<RecoverSwaWithLockedFull>(),
+        Some(RecoverSwaWithLockedFull { .. })
+    )));
+}
+
+#[test]
+fn insert_overlap_can_preserve_unlocked_full_ids() {
+    for window_start in [0, 2] {
+        let mut tc = swa_core(/* window = */ 8, /* page_size = */ 1);
+        let key = vec![1, 2, 3, 4];
+        tc.insert(&insert_params_swa(&key, &[10, 11, 12, 13], 0, 0));
+        let root = tc.arena.root();
+        let leaf = child_of(&tc, root, &[1]);
+        let original_id = tc.arena.node(leaf).id;
+        let params = insert_params_swa(&key, &[20, 21, 22, 23], 0, window_start);
+        let mut result = InsertResult {
+            adopted_ranges: Some(HashMap::new()),
+            ..Default::default()
+        };
+        let mut actions = Vec::new();
+        let consumed_from = swa_component(8).update_component_on_insert_overlap(
+            &mut tc,
+            leaf,
+            4,
+            0,
+            params.value.shallow_clone(),
+            &params,
+            true,
+            &mut result,
+            &mut actions,
+        );
+        assert_eq!(consumed_from, window_start);
+        assert_eq!(tc.arena.node(leaf).id, original_id);
+        assert_eq!(tc.arena.node(leaf).device_lock_ref(FULL), 0);
+        let [action] = actions.as_slice() else {
+            panic!("expected recovery with canonical FULL IDs");
+        };
+        let RecoverSwaWithLockedFull {
+            node_id,
+            kept_full,
+            incoming_full,
+        } = expect_action::<RecoverSwaWithLockedFull>(action.as_ref());
+        assert_eq!(*node_id, original_id);
+        assert!(kept_full.equal(&Tensor::from_slice(&[10i64, 11, 12, 13][window_start..])));
+        assert!(incoming_full.equal(&Tensor::from_slice(&[20i64, 21, 22, 23][window_start..])));
+        assert!(tc.arena.device_value(leaf, FULL).equal(kept_full));
+        let adopted = result.adopted_ranges.unwrap();
+        assert_eq!(adopted[&SWA], [(window_start, 4)]);
+        assert!(!adopted.contains_key(&FULL));
+    }
 }
 
 #[test]
@@ -785,6 +1171,7 @@ fn insert_overlap_with_a_locked_full_emits_the_recover_action() {
         .node_mut(leaf)
         .set_lock_ref_(ValueSlotIdx::device(FULL), 1);
     let result = tc.insert(&InsertParams {
+        rotation_base: None,
         track_adopted_ranges: true,
         ..insert_params_swa(&vec![1, 2, 3], &[20, 21, 22], 0, 0)
     });
@@ -794,16 +1181,14 @@ fn insert_overlap_with_a_locked_full_emits_the_recover_action() {
             .device_value(leaf, FULL)
             .equal(&Tensor::from_slice(&[10i64, 11, 12]))
     );
-    let [
-        CacheAction::RecoverSwaWithLockedFull {
-            node_id,
-            kept_full,
-            incoming_full,
-        },
-    ] = result.cache_actions.as_slice()
-    else {
+    let [action] = result.cache_actions.as_slice() else {
         panic!("expected one RecoverSwaWithLockedFull action");
     };
+    let RecoverSwaWithLockedFull {
+        node_id,
+        kept_full,
+        incoming_full,
+    } = expect_action::<RecoverSwaWithLockedFull>(action.as_ref());
     assert_eq!(*node_id, tc.arena.node(leaf).id);
     assert!(kept_full.equal(&Tensor::from_slice(&[10i64, 11, 12])));
     assert!(incoming_full.equal(&Tensor::from_slice(&[20i64, 21, 22])));
@@ -845,20 +1230,21 @@ fn insert_overlap_straddling_the_boundary_splits_and_recovers_the_tail() {
             .device_value(node, FULL)
             .equal(&Tensor::from_slice(&[22i64, 23]))
     );
-    let [
-        CacheAction::FreeDeviceKVFullOnly(old_tail),
-        CacheAction::SwaRebuild {
-            node_id,
-            source_value,
-        },
-        CacheAction::FreeDeviceKVFullOnly(duplicates),
-    ] = result.cache_actions.as_slice()
-    else {
+    let [action0, action1, action2] = result.cache_actions.as_slice() else {
         panic!(
             "expected FreeDeviceKVFullOnly, SwaRebuild, FreeDeviceKVFullOnly, got {:?}",
             action_kinds(&result.cache_actions)
         );
     };
+    let FreeDeviceKVFullOnly { indices: old_tail } =
+        expect_action::<FreeDeviceKVFullOnly>(action0.as_ref());
+    let SwaRebuild {
+        node_id,
+        source_value,
+    } = expect_action::<SwaRebuild>(action1.as_ref());
+    let FreeDeviceKVFullOnly {
+        indices: duplicates,
+    } = expect_action::<FreeDeviceKVFullOnly>(action2.as_ref());
     assert!(old_tail[0].equal(&Tensor::from_slice(&[12i64, 13])));
     assert_eq!(*node_id, tc.arena.node(node).id);
     assert!(source_value.equal(&Tensor::from_slice(&[22i64, 23])));
@@ -892,17 +1278,17 @@ fn insert_overlap_straddling_with_a_locked_full_defers_the_tail() {
             .device_value(node, FULL)
             .equal(&Tensor::from_slice(&[12i64, 13]))
     );
-    let [
-        CacheAction::RecoverSwaWithLockedFull {
-            node_id,
-            kept_full,
-            incoming_full,
-        },
-        CacheAction::FreeDeviceKVFullOnly(duplicates),
-    ] = result.cache_actions.as_slice()
-    else {
+    let [action0, action1] = result.cache_actions.as_slice() else {
         panic!("expected RecoverSwaWithLockedFull then FreeDeviceKVFullOnly");
     };
+    let RecoverSwaWithLockedFull {
+        node_id,
+        kept_full,
+        incoming_full,
+    } = expect_action::<RecoverSwaWithLockedFull>(action0.as_ref());
+    let FreeDeviceKVFullOnly {
+        indices: duplicates,
+    } = expect_action::<FreeDeviceKVFullOnly>(action1.as_ref());
     assert_eq!(*node_id, tc.arena.node(node).id);
     assert!(kept_full.equal(&Tensor::from_slice(&[12i64, 13])));
     assert!(incoming_full.equal(&Tensor::from_slice(&[22i64, 23])));
@@ -920,9 +1306,11 @@ fn insert_overlap_entirely_outside_the_window_is_all_duplicate() {
         /* prev_prefix_len = */ 0,
         /* swa_evicted_seqlen = */ 3,
     ));
-    let [CacheAction::FreeDeviceKVFullOnly(freed)] = result.cache_actions.as_slice() else {
+    let [action] = result.cache_actions.as_slice() else {
         panic!("expected one FreeDeviceKVFullOnly action");
     };
+    let FreeDeviceKVFullOnly { indices: freed } =
+        expect_action::<FreeDeviceKVFullOnly>(action.as_ref());
     assert!(freed[0].equal(&Tensor::from_slice(&[20i64, 21, 22])));
 }
 
@@ -957,7 +1345,8 @@ fn insert_overlap_boundary_at_the_node_start_recovers_the_whole_node() {
         tc.arena.node(a).id,
         SWA,
         Tensor::from_slice(&[50i64, 51, 52]),
-    );
+    )
+    .expect("live test node");
     // The boundary lands exactly on b's start: full recovery, no split.
     let result = tc.insert(&insert_params_swa(
         &vec![1, 2, 3, 4, 5],
@@ -971,20 +1360,21 @@ fn insert_overlap_boundary_at_the_node_start_recovers_the_whole_node() {
             .device_value(b, FULL)
             .equal(&Tensor::from_slice(&[23i64, 24]))
     );
-    let [
-        CacheAction::FreeDeviceKVFullOnly(duplicates),
-        CacheAction::FreeDeviceKVFullOnly(old_full),
-        CacheAction::SwaRebuild {
-            node_id,
-            source_value,
-        },
-    ] = result.cache_actions.as_slice()
-    else {
+    let [action0, action1, action2] = result.cache_actions.as_slice() else {
         panic!(
             "expected FreeDeviceKVFullOnly, FreeDeviceKVFullOnly, SwaRebuild, got {:?}",
             action_kinds(&result.cache_actions)
         );
     };
+    let FreeDeviceKVFullOnly {
+        indices: duplicates,
+    } = expect_action::<FreeDeviceKVFullOnly>(action0.as_ref());
+    let FreeDeviceKVFullOnly { indices: old_full } =
+        expect_action::<FreeDeviceKVFullOnly>(action1.as_ref());
+    let SwaRebuild {
+        node_id,
+        source_value,
+    } = expect_action::<SwaRebuild>(action2.as_ref());
     assert!(duplicates[0].equal(&Tensor::from_slice(&[20i64, 21, 22])));
     assert!(old_full[0].equal(&Tensor::from_slice(&[13i64, 14])));
     assert_eq!(*node_id, tc.arena.node(b).id);
@@ -1026,21 +1416,24 @@ fn insert_overlap_straddling_a_second_level_node_recovers_the_tail() {
             .device_value(b, FULL)
             .equal(&Tensor::from_slice(&[24i64]))
     );
-    let [
-        CacheAction::FreeDeviceKVFullOnly(duplicates_head),
-        CacheAction::FreeDeviceKVFullOnly(old_tail),
-        CacheAction::SwaRebuild {
-            node_id,
-            source_value,
-        },
-        CacheAction::FreeDeviceKVFullOnly(duplicates_tail),
-    ] = result.cache_actions.as_slice()
-    else {
+    let [action0, action1, action2, action3] = result.cache_actions.as_slice() else {
         panic!(
             "expected FreeDeviceKVFullOnly, FreeDeviceKVFullOnly, SwaRebuild, FreeDeviceKVFullOnly, got {:?}",
             action_kinds(&result.cache_actions)
         );
     };
+    let FreeDeviceKVFullOnly {
+        indices: duplicates_head,
+    } = expect_action::<FreeDeviceKVFullOnly>(action0.as_ref());
+    let FreeDeviceKVFullOnly { indices: old_tail } =
+        expect_action::<FreeDeviceKVFullOnly>(action1.as_ref());
+    let SwaRebuild {
+        node_id,
+        source_value,
+    } = expect_action::<SwaRebuild>(action2.as_ref());
+    let FreeDeviceKVFullOnly {
+        indices: duplicates_tail,
+    } = expect_action::<FreeDeviceKVFullOnly>(action3.as_ref());
     assert!(duplicates_head[0].equal(&Tensor::from_slice(&[20i64, 21, 22])));
     assert!(old_tail[0].equal(&Tensor::from_slice(&[14i64])));
     assert_eq!(*node_id, tc.arena.node(b).id);
@@ -1079,21 +1472,23 @@ fn insert_overlap_straddling_a_second_level_locked_node_defers_the_tail() {
             .device_value(b, FULL)
             .equal(&Tensor::from_slice(&[14i64]))
     );
-    let [
-        CacheAction::FreeDeviceKVFullOnly(duplicates_head),
-        CacheAction::RecoverSwaWithLockedFull {
-            node_id,
-            kept_full,
-            incoming_full,
-        },
-        CacheAction::FreeDeviceKVFullOnly(duplicates_tail),
-    ] = result.cache_actions.as_slice()
-    else {
+    let [action0, action1, action2] = result.cache_actions.as_slice() else {
         panic!(
             "expected FreeDeviceKVFullOnly, RecoverSwaWithLockedFull, FreeDeviceKVFullOnly, got {:?}",
             action_kinds(&result.cache_actions)
         );
     };
+    let FreeDeviceKVFullOnly {
+        indices: duplicates_head,
+    } = expect_action::<FreeDeviceKVFullOnly>(action0.as_ref());
+    let RecoverSwaWithLockedFull {
+        node_id,
+        kept_full,
+        incoming_full,
+    } = expect_action::<RecoverSwaWithLockedFull>(action1.as_ref());
+    let FreeDeviceKVFullOnly {
+        indices: duplicates_tail,
+    } = expect_action::<FreeDeviceKVFullOnly>(action2.as_ref());
     assert!(duplicates_head[0].equal(&Tensor::from_slice(&[20i64, 21, 22])));
     assert_eq!(*node_id, tc.arena.node(b).id);
     assert!(kept_full.equal(&Tensor::from_slice(&[14i64])));
@@ -1124,10 +1519,7 @@ fn insert_overlap_prev_prefix_strictly_inside_the_node_still_recovers() {
             .device_value(node, FULL)
             .equal(&Tensor::from_slice(&[20i64, 21, 22, 23]))
     );
-    assert!(result.cache_actions.iter().any(|action| matches!(
-        action,
-        CacheAction::SwaRebuild { node_id, .. } if *node_id == tc.arena.node(node).id
-    )));
+    assert!(result.cache_actions.iter().any(|action| matches!(action.as_any().downcast_ref::<SwaRebuild>(), Some(SwaRebuild { node_id, .. }) if *node_id == tc.arena.node(node).id)));
 }
 
 #[test]
@@ -1157,15 +1549,13 @@ fn reinsert_after_full_eviction_rebuilds_swa_from_the_fresh_kv() {
             .device_value(leaf, FULL)
             .equal(&Tensor::from_slice(&[20i64, 21, 22]))
     );
-    let [
-        CacheAction::SwaRebuild {
-            node_id,
-            source_value,
-        },
-    ] = result.cache_actions.as_slice()
-    else {
+    let [action] = result.cache_actions.as_slice() else {
         panic!("expected one SwaRebuild action");
     };
+    let SwaRebuild {
+        node_id,
+        source_value,
+    } = expect_action::<SwaRebuild>(action.as_ref());
     assert_eq!(*node_id, tc.arena.node(leaf).id);
     assert!(source_value.equal(&Tensor::from_slice(&[20i64, 21, 22])));
 }
@@ -1198,15 +1588,13 @@ fn reinsert_straddling_the_boundary_splits_before_the_rebuild() {
             .equal(&Tensor::from_slice(&[20i64, 21]))
     );
     assert!(!tc.arena.has_device_value(parent, SWA));
-    let [
-        CacheAction::SwaRebuild {
-            node_id,
-            source_value,
-        },
-    ] = result.cache_actions.as_slice()
-    else {
+    let [action] = result.cache_actions.as_slice() else {
         panic!("expected one SwaRebuild action");
     };
+    let SwaRebuild {
+        node_id,
+        source_value,
+    } = expect_action::<SwaRebuild>(action.as_ref());
     assert_eq!(*node_id, tc.arena.node(node).id);
     assert!(source_value.equal(&Tensor::from_slice(&[22i64, 23])));
 }
@@ -1247,15 +1635,9 @@ fn reinsert_straddling_the_boundary_at_a_second_level_node_splits_before_the_reb
             .equal(&Tensor::from_slice(&[24i64]))
     );
     assert!(!tc.arena.has_device_value(p, SWA));
-    assert!(result.cache_actions.iter().any(|action| matches!(
-        action,
-        CacheAction::SwaRebuild { node_id, source_value }
-            if *node_id == tc.arena.node(b).id && source_value.equal(&Tensor::from_slice(&[24i64]))
-    )));
-    assert!(!result.cache_actions.iter().any(|action| matches!(
-        action,
-        CacheAction::SwaRebuild { node_id, .. } if *node_id == tc.arena.node(p).id
-    )));
+    assert!(result.cache_actions.iter().any(|action| matches!(action.as_any().downcast_ref::<SwaRebuild>(), Some(SwaRebuild { node_id, source_value })
+            if *node_id == tc.arena.node(b).id && source_value.equal(&Tensor::from_slice(&[24i64])))));
+    assert!(!result.cache_actions.iter().any(|action| matches!(action.as_any().downcast_ref::<SwaRebuild>(), Some(SwaRebuild { node_id, .. }) if *node_id == tc.arena.node(p).id)));
 }
 
 #[test]
@@ -1285,7 +1667,8 @@ fn reinsert_with_live_swa_skips_recovery() {
         tc.arena.node(leaf).id,
         SWA,
         Tensor::from_slice(&[50i64, 51, 52]),
-    );
+    )
+    .expect("live test node");
     evict_full(&mut tc, leaf, /* remaining_size = */ 0);
     let result = tc.insert(&insert_params_swa(&vec![1, 2, 3], &[20, 21, 22], 0, 0));
     // The SWA value is already live: no rebuild is emitted.
@@ -1320,19 +1703,19 @@ fn reinsert_boundary_at_the_node_start_rebuilds_the_whole_node() {
         /* swa_evicted_seqlen = */ 3,
     ));
     assert_eq!(tc.arena.node(b).key, vec![4, 5]);
-    let [
-        CacheAction::FreeDeviceKVFullOnly(duplicates),
-        CacheAction::SwaRebuild {
-            node_id,
-            source_value,
-        },
-    ] = result.cache_actions.as_slice()
-    else {
+    let [action0, action1] = result.cache_actions.as_slice() else {
         panic!(
             "expected FreeDeviceKVFullOnly then SwaRebuild, got {:?}",
             action_kinds(&result.cache_actions)
         );
     };
+    let FreeDeviceKVFullOnly {
+        indices: duplicates,
+    } = expect_action::<FreeDeviceKVFullOnly>(action0.as_ref());
+    let SwaRebuild {
+        node_id,
+        source_value,
+    } = expect_action::<SwaRebuild>(action1.as_ref());
     assert!(duplicates[0].equal(&Tensor::from_slice(&[20i64, 21, 22])));
     assert_eq!(*node_id, tc.arena.node(b).id);
     assert!(source_value.equal(&Tensor::from_slice(&[23i64, 24])));
@@ -1353,7 +1736,8 @@ fn walk_split_redistributes_the_live_swa_value() {
         tc.arena.node(node).id,
         SWA,
         Tensor::from_slice(&[50i64, 51, 52, 53]),
-    );
+    )
+    .expect("live test node");
     let result = tc.insert(&insert_params_swa(&vec![1, 2, 9], &[20, 21, 29], 0, 0));
     assert_eq!(result.prefix_len, 2);
     let parent = child_of(&tc, root, &[1]);
@@ -1372,16 +1756,16 @@ fn walk_split_redistributes_the_live_swa_value() {
     );
     assert!(tc.device_lru_list(SWA).in_list(Some(parent)));
     assert!(tc.device_lru_list(SWA).in_list(Some(node)));
-    let [
-        CacheAction::FreeDeviceKV(duplicates),
-        CacheAction::SwaRebuild {
-            node_id,
-            source_value,
-        },
-    ] = result.cache_actions.as_slice()
-    else {
+    let [action0, action1] = result.cache_actions.as_slice() else {
         panic!("expected FreeDeviceKV then SwaRebuild");
     };
+    let FreeDeviceKV {
+        indices: duplicates,
+    } = expect_action::<FreeDeviceKV>(action0.as_ref());
+    let SwaRebuild {
+        node_id,
+        source_value,
+    } = expect_action::<SwaRebuild>(action1.as_ref());
     assert!(duplicates[0].equal(&Tensor::from_slice(&[20i64, 21])));
     assert_eq!(*node_id, tc.arena.node(leaf).id);
     assert!(source_value.equal(&Tensor::from_slice(&[29i64])));
@@ -1424,7 +1808,8 @@ fn redistribute_on_node_split_keeps_device_valued_sides_off_the_host_lru() {
         tc.arena.node(node).id,
         SWA,
         Tensor::from_slice(&[50i64, 51]),
-    );
+    )
+    .expect("live test node");
     tc.arena
         .set_host_value(node, SWA, Tensor::from_slice(&[70i64, 71]));
     tc.arena
@@ -1479,9 +1864,12 @@ fn acquire_lock_walks_until_the_window_fills_and_stamps_the_crossing_node() {
     assert_eq!(tc.arena.device_lock_ref(b, SWA), 1);
     assert_eq!(tc.arena.device_lock_ref(a, SWA), 0);
     // The walk fills the 2-atom window at b; b carries the first minted uuid.
-    assert_eq!(result.swa_uuid_for_lock, Some(2));
-    assert_eq!(result.swa_uuid_for_host_lock, None);
-    assert_eq!(node_swa_uuid(&tc, b), Some(2));
+    assert_eq!(
+        result.component_lock_uuids[&(SWA.idx() as u8)],
+        Some(100_000_000_000_001)
+    );
+    assert!(result.component_host_lock_uuids.is_empty());
+    assert_eq!(node_swa_uuid(&tc, b), Some(100_000_000_000_001));
     assert_eq!(node_swa_uuid(&tc, c), None);
     assert_eq!(tc.swa_evictable_size(), 1);
     assert_eq!(tc.swa_protected_size(), 2);
@@ -1532,8 +1920,11 @@ fn acquire_lock_overshooting_the_window_stops_at_the_crossing_node() {
     assert_eq!(tc.arena.device_lock_ref(c, SWA), 1);
     assert_eq!(tc.arena.device_lock_ref(b, SWA), 1);
     assert_eq!(tc.arena.device_lock_ref(a, SWA), 0);
-    assert_eq!(result.swa_uuid_for_lock, Some(2));
-    assert_eq!(node_swa_uuid(&tc, b), Some(2));
+    assert_eq!(
+        result.component_lock_uuids[&(SWA.idx() as u8)],
+        Some(100_000_000_000_001)
+    );
+    assert_eq!(node_swa_uuid(&tc, b), Some(100_000_000_000_001));
     assert_eq!(node_swa_uuid(&tc, a), None);
     assert_eq!(tc.swa_evictable_size(), 2);
     assert_eq!(tc.swa_protected_size(), 4);
@@ -1559,7 +1950,10 @@ fn acquire_lock_reuses_the_stamped_uuid_and_shifts_sizes_once() {
         IncLockRefResult::default(),
         /* lock_host = */ false,
     );
-    assert_eq!(second.swa_uuid_for_lock, first.swa_uuid_for_lock);
+    assert_eq!(
+        second.component_lock_uuids[&(SWA.idx() as u8)],
+        first.component_lock_uuids[&(SWA.idx() as u8)]
+    );
     assert_eq!(tc.arena.device_lock_ref(c, SWA), 2);
     assert_eq!(tc.arena.device_lock_ref(b, SWA), 2);
     assert_eq!(tc.swa_evictable_size(), 1);
@@ -1567,7 +1961,7 @@ fn acquire_lock_reuses_the_stamped_uuid_and_shifts_sizes_once() {
 }
 
 #[test]
-fn acquire_lock_skips_tombstones_and_records_them() {
+fn acquire_lock_counts_tombstones_toward_the_window() {
     let mut tc = swa_core(/* window = */ 2, /* page_size = */ 1);
     let [a, b, c] = chain(&mut tc);
     store_swa_device(&mut tc, a);
@@ -1578,14 +1972,16 @@ fn acquire_lock_skips_tombstones_and_records_them() {
         IncLockRefResult::default(),
         /* lock_host = */ false,
     );
-    // The valueless b is recorded and skipped; the window fills at a.
+    // The valueless b is counted too (no ledger move); position-based
+    // coverage fills the window at b, so a stays outside the segment.
     assert_eq!(tc.arena.device_lock_ref(c, SWA), 1);
-    assert_eq!(tc.arena.device_lock_ref(b, SWA), 0);
-    assert_eq!(tc.arena.device_lock_ref(a, SWA), 1);
-    assert_eq!(result.skip_lock_node_ids[&SWA].len(), 1);
-    assert!(result.skip_lock_node_ids[&SWA].contains(&tc.arena.node(b).id));
-    assert!(result.swa_uuid_for_lock.is_some());
-    assert_eq!(node_swa_uuid(&tc, a), result.swa_uuid_for_lock);
+    assert_eq!(tc.arena.device_lock_ref(b, SWA), 1);
+    assert_eq!(tc.arena.device_lock_ref(a, SWA), 0);
+    assert!(result.component_lock_uuids[&(SWA.idx() as u8)].is_some());
+    assert_eq!(
+        node_swa_uuid(&tc, b),
+        result.component_lock_uuids[&(SWA.idx() as u8)]
+    );
 }
 
 #[test]
@@ -1600,7 +1996,7 @@ fn acquire_lock_under_the_window_reaches_the_root_without_a_uuid() {
         IncLockRefResult::default(),
         /* lock_host = */ false,
     );
-    assert_eq!(result.swa_uuid_for_lock, None);
+    assert_eq!(result.component_lock_uuids[&(SWA.idx() as u8)], None);
     assert_eq!(tc.arena.device_lock_ref(a, SWA), 1);
     assert_eq!(tc.arena.device_lock_ref(b, SWA), 1);
     assert_eq!(tc.swa_evictable_size(), 0);
@@ -1614,11 +2010,16 @@ fn inc_lock_ref_runs_full_and_swa_walks_together() {
     store_swa_device(&mut tc, a);
     store_swa_device(&mut tc, b);
     store_swa_device(&mut tc, c);
-    let result = tc.inc_lock_ref(tc.arena.node(c).id);
-    // FULL sees a valueless path (skip segment only); SWA locks its window.
+    let result = tc
+        .inc_lock_ref(tc.arena.node(c).id, ComponentSet::EMPTY)
+        .expect("live test node");
+    // FULL counts its valueless bottom segment (no ledger move); SWA locks
+    // its window.
     assert_eq!(result.delta, Some(0));
-    assert_eq!(result.skip_lock_node_ids[&FULL].len(), 3);
-    assert!(result.swa_uuid_for_lock.is_some());
+    assert_eq!(tc.arena.device_lock_ref(c, FULL), 1);
+    assert_eq!(tc.arena.device_lock_ref(b, FULL), 1);
+    assert_eq!(tc.arena.device_lock_ref(a, FULL), 1);
+    assert!(result.component_lock_uuids[&(SWA.idx() as u8)].is_some());
     assert_eq!(tc.arena.device_lock_ref(c, SWA), 1);
     assert_eq!(tc.arena.device_lock_ref(b, SWA), 1);
     assert_eq!(tc.arena.device_lock_ref(a, SWA), 0);
@@ -1633,26 +2034,127 @@ fn inc_host_lock_ref_runs_full_and_swa_host_arms_together() {
     }
     tc.arena
         .set_host_value(c, FULL, Tensor::from_slice(&[0i64]));
-    let result = tc.inc_host_lock_ref(tc.arena.node(c).id);
+    let result = tc
+        .inc_host_lock_ref(tc.arena.node(c).id)
+        .expect("live test node");
     // FULL pins only the anchor; SWA walks its host window up to b.
     assert_eq!(tc.arena.host_lock_ref(c, FULL), 1);
     assert_eq!(tc.arena.host_lock_ref(b, FULL), 0);
     assert_eq!(tc.arena.host_lock_ref(c, SWA), 1);
     assert_eq!(tc.arena.host_lock_ref(b, SWA), 1);
     assert_eq!(tc.arena.host_lock_ref(a, SWA), 0);
-    assert!(result.swa_uuid_for_host_lock.is_some());
+    assert!(result.component_host_lock_uuids[&(SWA.idx() as u8)].is_some());
     // The release replays the acquire's uuid and unwinds both arms.
-    let params = DecLockRefParams {
-        swa_uuid_for_host_lock: result.swa_uuid_for_host_lock,
-        skip_lock_node_ids: result.skip_lock_node_ids,
-        ..Default::default()
-    };
-    tc.dec_host_lock_ref(tc.arena.node(c).id, Some(&params));
+    let params = result.to_dec_params();
+    tc.dec_host_lock_ref(tc.arena.node(c).id, &params)
+        .expect("live test node");
     assert_eq!(tc.arena.host_lock_ref(c, FULL), 0);
     assert_eq!(tc.arena.host_lock_ref(c, SWA), 0);
     assert_eq!(tc.arena.host_lock_ref(b, SWA), 0);
     // Only the dispatcher's final leaf-set pass sees the fully-unlocked anchor.
     assert!(tc.evictable_host_leaves.contains(c));
+}
+
+#[test]
+fn unanchored_receipts_are_rejected_before_any_release() {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    let mut tc = swa_core(/* window = */ 2, /* page_size = */ 1);
+    let [a, b, c] = chain(&mut tc);
+    for node in [a, b, c] {
+        store_swa_device(&mut tc, node);
+        set_swa_host(&mut tc, node);
+    }
+    tc.arena
+        .set_host_value(c, FULL, Tensor::from_slice(&[0i64]));
+    let leaf = tc.arena.node(c).id;
+    let device_lock = tc
+        .inc_lock_ref(leaf, ComponentSet::EMPTY)
+        .expect("live test node");
+    let host_lock = tc.inc_host_lock_ref(leaf).expect("live test node");
+    let unanchored = |lock: &IncLockRefResult| DecLockRefParams {
+        node_id: None,
+        ..lock.to_dec_params()
+    };
+    let lock_state = |tc: &UnifiedTreeCore<Vec<i64>>| {
+        let refs: Vec<_> = [a, b, c]
+            .into_iter()
+            .flat_map(|n| [FULL, SWA].map(|ct| (n, ct)))
+            .map(|(n, ct)| {
+                (
+                    tc.arena.device_lock_ref(n, ct),
+                    tc.arena.host_lock_ref(n, ct),
+                )
+            })
+            .collect();
+        let sizes = (
+            tc.protected_size(),
+            tc.swa_protected_size(),
+            tc.swa_evictable_size(),
+        );
+        (refs, sizes)
+    };
+    let before = lock_state(&tc);
+    let mut device_frees = HashMap::new();
+    let mut host_frees = HashMap::new();
+    let mut cache_actions = Vec::new();
+
+    assert!(
+        catch_unwind(AssertUnwindSafe(|| {
+            tc.dec_lock_ref(leaf, &unanchored(&device_lock), /* skip_swa = */ false)
+        }))
+        .is_err()
+    );
+    assert!(
+        catch_unwind(AssertUnwindSafe(|| {
+            tc.dec_host_lock_ref(leaf, &unanchored(&host_lock))
+        }))
+        .is_err()
+    );
+    assert!(
+        catch_unwind(AssertUnwindSafe(|| {
+            tc.dec_swa_lock_only(
+                leaf,
+                &unanchored(&device_lock),
+                &mut device_frees,
+                &mut host_frees,
+                &mut cache_actions,
+            )
+        }))
+        .is_err()
+    );
+    assert!(
+        catch_unwind(AssertUnwindSafe(|| {
+            tc.dec_window_lock_only(
+                leaf,
+                SWA,
+                &unanchored(&device_lock),
+                &mut device_frees,
+                &mut host_frees,
+                &mut cache_actions,
+            )
+        }))
+        .is_err()
+    );
+    assert_eq!(lock_state(&tc), before);
+    assert!(device_frees.is_empty() && host_frees.is_empty());
+    assert!(cache_actions.is_empty());
+
+    // The anchored receipts still release exactly what was acquired.
+    tc.dec_lock_ref(
+        leaf,
+        &device_lock.to_dec_params(),
+        /* skip_swa = */ false,
+    )
+    .expect("live test node");
+    tc.dec_host_lock_ref(leaf, &host_lock.to_dec_params())
+        .expect("live test node");
+    for node in [a, b, c] {
+        for ct in [FULL, SWA] {
+            assert_eq!(tc.arena.device_lock_ref(node, ct), 0);
+            assert_eq!(tc.arena.host_lock_ref(node, ct), 0);
+        }
+    }
 }
 
 #[test]
@@ -1663,20 +2165,20 @@ fn dec_host_lock_ref_with_the_inner_uuid_leaves_an_outer_window_pinned() {
         set_swa_host(&mut tc, node);
     }
     // Overlapping host windows: {c, b} stamps its uuid at b, {b, a} at a.
-    let inner = tc.inc_host_lock_ref(tc.arena.node(c).id);
-    tc.inc_host_lock_ref(tc.arena.node(b).id);
-    assert!(inner.swa_uuid_for_host_lock.is_some());
+    let inner = tc
+        .inc_host_lock_ref(tc.arena.node(c).id)
+        .expect("live test node");
+    tc.inc_host_lock_ref(tc.arena.node(b).id)
+        .expect("live test node");
+    assert!(inner.component_host_lock_uuids[&(SWA.idx() as u8)].is_some());
     assert_eq!(tc.arena.host_lock_ref(c, SWA), 1);
     assert_eq!(tc.arena.host_lock_ref(b, SWA), 2);
     assert_eq!(tc.arena.host_lock_ref(a, SWA), 1);
     // Releasing the inner window with its own uuid stops at b; the outer
     // window's lock above the boundary survives.
-    let params = DecLockRefParams {
-        swa_uuid_for_host_lock: inner.swa_uuid_for_host_lock,
-        skip_lock_node_ids: inner.skip_lock_node_ids,
-        ..Default::default()
-    };
-    tc.dec_host_lock_ref(tc.arena.node(c).id, Some(&params));
+    let params = inner.to_dec_params();
+    tc.dec_host_lock_ref(tc.arena.node(c).id, &params)
+        .expect("live test node");
     assert_eq!(tc.arena.host_lock_ref(c, SWA), 0);
     assert_eq!(tc.arena.host_lock_ref(b, SWA), 1);
     assert_eq!(tc.arena.host_lock_ref(a, SWA), 1);
@@ -1700,9 +2202,12 @@ fn acquire_host_lock_walks_until_the_window_fills_and_stamps_the_host_uuid() {
     assert_eq!(tc.arena.host_lock_ref(b, SWA), 1);
     assert_eq!(tc.arena.host_lock_ref(a, SWA), 0);
     // The window fills at b; b carries the host uuid and leaves the host LRU.
-    assert_eq!(result.swa_uuid_for_host_lock, Some(2));
-    assert_eq!(result.swa_uuid_for_lock, None);
-    assert_eq!(node_swa_host_uuid(&tc, b), Some(2));
+    assert_eq!(
+        result.component_host_lock_uuids[&(SWA.idx() as u8)],
+        Some(100_000_000_000_001)
+    );
+    assert!(result.component_lock_uuids.is_empty());
+    assert_eq!(node_swa_host_uuid(&tc, b), Some(100_000_000_000_001));
     assert_eq!(node_swa_host_uuid(&tc, c), None);
     assert!(!tc.host_lru_list(SWA).in_list(Some(c)));
     assert!(!tc.host_lru_list(SWA).in_list(Some(b)));
@@ -1733,14 +2238,17 @@ fn acquire_host_lock_reuses_the_stamped_uuid_and_skips_unlisted_nodes() {
         IncLockRefResult::default(),
         /* lock_host = */ true,
     );
-    assert_eq!(second.swa_uuid_for_host_lock, first.swa_uuid_for_host_lock);
+    assert_eq!(
+        second.component_host_lock_uuids[&(SWA.idx() as u8)],
+        first.component_host_lock_uuids[&(SWA.idx() as u8)]
+    );
     assert_eq!(tc.arena.host_lock_ref(c, SWA), 2);
     assert_eq!(tc.arena.host_lock_ref(b, SWA), 2);
     assert_eq!(tc.arena.host_lock_ref(a, SWA), 0);
 }
 
 #[test]
-fn acquire_host_lock_skips_host_tombstones_and_records_them() {
+fn acquire_host_lock_counts_host_tombstones_toward_the_window() {
     let mut tc = swa_core(/* window = */ 2, /* page_size = */ 1);
     let [a, b, c] = chain(&mut tc);
     set_swa_host(&mut tc, a);
@@ -1751,13 +2259,16 @@ fn acquire_host_lock_skips_host_tombstones_and_records_them() {
         IncLockRefResult::default(),
         /* lock_host = */ true,
     );
+    // The host-valueless b is counted too; position-based coverage fills
+    // the window at b, so a stays outside the segment.
     assert_eq!(tc.arena.host_lock_ref(c, SWA), 1);
-    assert_eq!(tc.arena.host_lock_ref(b, SWA), 0);
-    assert_eq!(tc.arena.host_lock_ref(a, SWA), 1);
-    assert_eq!(result.skip_lock_node_ids[&SWA].len(), 1);
-    assert!(result.skip_lock_node_ids[&SWA].contains(&tc.arena.node(b).id));
-    assert_eq!(node_swa_host_uuid(&tc, a), result.swa_uuid_for_host_lock);
-    assert!(result.swa_uuid_for_host_lock.is_some());
+    assert_eq!(tc.arena.host_lock_ref(b, SWA), 1);
+    assert_eq!(tc.arena.host_lock_ref(a, SWA), 0);
+    assert_eq!(
+        node_swa_host_uuid(&tc, b),
+        result.component_host_lock_uuids[&(SWA.idx() as u8)]
+    );
+    assert!(result.component_host_lock_uuids[&(SWA.idx() as u8)].is_some());
 }
 
 #[test]
@@ -1772,7 +2283,7 @@ fn acquire_host_lock_under_the_window_reaches_the_root_without_a_uuid() {
         IncLockRefResult::default(),
         /* lock_host = */ true,
     );
-    assert_eq!(result.swa_uuid_for_host_lock, None);
+    assert_eq!(result.component_host_lock_uuids[&(SWA.idx() as u8)], None);
     assert_eq!(tc.arena.host_lock_ref(a, SWA), 1);
     assert_eq!(tc.arena.host_lock_ref(b, SWA), 1);
 }
@@ -1830,8 +2341,11 @@ fn acquire_host_lock_stamps_the_host_tier_uuid_field_only() {
         /* lock_host = */ true,
     );
     // The boundary uuid lands on the host-tier field; the device field stays clear.
-    assert_eq!(result.swa_uuid_for_host_lock, Some(2));
-    assert_eq!(node_swa_host_uuid(&tc, b), Some(2));
+    assert_eq!(
+        result.component_host_lock_uuids[&(SWA.idx() as u8)],
+        Some(100_000_000_000_001)
+    );
+    assert_eq!(node_swa_host_uuid(&tc, b), Some(100_000_000_000_001));
     assert_eq!(node_swa_uuid(&tc, b), None);
     assert_eq!(node_swa_host_uuid(&tc, c), None);
     assert_eq!(node_swa_uuid(&tc, c), None);
@@ -1859,10 +2373,16 @@ fn device_and_host_lock_walks_mint_independent_uuids() {
         IncLockRefResult::default(),
         /* lock_host = */ true,
     );
-    assert_eq!(device.swa_uuid_for_lock, Some(2));
-    assert_eq!(host.swa_uuid_for_host_lock, Some(3));
-    assert_eq!(node_swa_uuid(&tc, b), Some(2));
-    assert_eq!(node_swa_host_uuid(&tc, b), Some(3));
+    assert_eq!(
+        device.component_lock_uuids[&(SWA.idx() as u8)],
+        Some(100_000_000_000_001)
+    );
+    assert_eq!(
+        host.component_host_lock_uuids[&(SWA.idx() as u8)],
+        Some(100_000_000_000_002)
+    );
+    assert_eq!(node_swa_uuid(&tc, b), Some(100_000_000_000_001));
+    assert_eq!(node_swa_host_uuid(&tc, b), Some(100_000_000_000_002));
 }
 
 #[test]
@@ -1888,7 +2408,8 @@ fn evict_component_device_frees_the_full_indices_and_tombstones_swa() {
         tc.arena.node(node).id,
         SWA,
         Tensor::from_slice(&[50i64, 51]),
-    );
+    )
+    .expect("live test node");
     let mut device_frees = HashMap::new();
     let mut host_frees = HashMap::new();
     let (freed, host_freed) = swa_component(4).evict_component(
@@ -1896,6 +2417,7 @@ fn evict_component_device_frees_the_full_indices_and_tombstones_swa() {
         node,
         &mut device_frees,
         &mut host_frees,
+        &mut Vec::new(),
         EvictLayer::Device,
     );
     assert_eq!((freed, host_freed), (2, 0));
@@ -1921,7 +2443,8 @@ fn evict_component_device_parks_a_remaining_host_value() {
         tc.arena.node(node).id,
         SWA,
         Tensor::from_slice(&[50i64, 51]),
-    );
+    )
+    .expect("live test node");
     set_swa_host(&mut tc, node);
     let mut device_frees = HashMap::new();
     let mut host_frees = HashMap::new();
@@ -1930,6 +2453,7 @@ fn evict_component_device_parks_a_remaining_host_value() {
         node,
         &mut device_frees,
         &mut host_frees,
+        &mut Vec::new(),
         EvictLayer::Device,
     );
     assert!(tc.arena.has_host_value(node, SWA));
@@ -1952,6 +2476,7 @@ fn evict_component_host_frees_and_delists_the_host_value() {
         node,
         &mut device_frees,
         &mut host_frees,
+        &mut Vec::new(),
         EvictLayer::Host,
     );
     assert_eq!((freed, host_freed), (0, 2));
@@ -1975,12 +2500,8 @@ fn release_lock_returns_the_window_to_evictable() {
         IncLockRefResult::default(),
         /* lock_host = */ false,
     );
-    let params = DecLockRefParams {
-        swa_uuid_for_lock: result.swa_uuid_for_lock,
-        swa_uuid_for_host_lock: result.swa_uuid_for_host_lock,
-        skip_lock_node_ids: result.skip_lock_node_ids,
-    };
-    swa.release_component_lock(&mut tc, c, Some(&params), /* lock_host = */ false);
+    let params = result.to_dec_params();
+    swa.release_component_lock(&mut tc, c, &params, /* lock_host = */ false);
     assert_eq!(tc.arena.device_lock_ref(c, SWA), 0);
     assert_eq!(tc.arena.device_lock_ref(b, SWA), 0);
     assert_eq!(tc.arena.device_lock_ref(a, SWA), 0);
@@ -2008,12 +2529,8 @@ fn release_lock_keeps_sizes_while_other_locks_remain() {
         IncLockRefResult::default(),
         /* lock_host = */ false,
     );
-    let params = DecLockRefParams {
-        swa_uuid_for_lock: first.swa_uuid_for_lock,
-        swa_uuid_for_host_lock: first.swa_uuid_for_host_lock,
-        skip_lock_node_ids: first.skip_lock_node_ids,
-    };
-    swa.release_component_lock(&mut tc, c, Some(&params), /* lock_host = */ false);
+    let params = first.to_dec_params();
+    swa.release_component_lock(&mut tc, c, &params, /* lock_host = */ false);
     assert_eq!(tc.arena.device_lock_ref(c, SWA), 1);
     assert_eq!(tc.arena.device_lock_ref(b, SWA), 1);
     assert_eq!(tc.swa_evictable_size(), 1);
@@ -2035,12 +2552,8 @@ fn release_lock_replays_the_tombstone_skips() {
     );
     // b gained a device value AFTER the acquire recorded it as a tombstone.
     store_swa_device(&mut tc, b);
-    let params = DecLockRefParams {
-        swa_uuid_for_lock: result.swa_uuid_for_lock,
-        swa_uuid_for_host_lock: result.swa_uuid_for_host_lock,
-        skip_lock_node_ids: result.skip_lock_node_ids,
-    };
-    swa.release_component_lock(&mut tc, c, Some(&params), /* lock_host = */ false);
+    let params = result.to_dec_params();
+    swa.release_component_lock(&mut tc, c, &params, /* lock_host = */ false);
     assert_eq!(tc.arena.device_lock_ref(c, SWA), 0);
     assert_eq!(tc.arena.device_lock_ref(b, SWA), 0);
     assert_eq!(tc.arena.device_lock_ref(a, SWA), 0);
@@ -2066,12 +2579,8 @@ fn release_lock_stops_at_the_window_uuid() {
     tc.arena
         .node_mut(a)
         .set_lock_ref_(ValueSlotIdx::device(SWA), 1);
-    let params = DecLockRefParams {
-        swa_uuid_for_lock: result.swa_uuid_for_lock,
-        swa_uuid_for_host_lock: result.swa_uuid_for_host_lock,
-        skip_lock_node_ids: result.skip_lock_node_ids,
-    };
-    swa.release_component_lock(&mut tc, c, Some(&params), /* lock_host = */ false);
+    let params = result.to_dec_params();
+    swa.release_component_lock(&mut tc, c, &params, /* lock_host = */ false);
     assert_eq!(tc.arena.device_lock_ref(c, SWA), 0);
     assert_eq!(tc.arena.device_lock_ref(b, SWA), 0);
     assert_eq!(tc.arena.device_lock_ref(a, SWA), 1);
@@ -2099,12 +2608,8 @@ fn release_host_lock_stops_at_the_host_uuid_boundary() {
         IncLockRefResult::default(),
         /* lock_host = */ true,
     );
-    let params = DecLockRefParams {
-        swa_uuid_for_lock: result.swa_uuid_for_lock,
-        swa_uuid_for_host_lock: result.swa_uuid_for_host_lock,
-        skip_lock_node_ids: result.skip_lock_node_ids,
-    };
-    swa.release_component_lock(&mut tc, c, Some(&params), /* lock_host = */ true);
+    let params = result.to_dec_params();
+    swa.release_component_lock(&mut tc, c, &params, /* lock_host = */ true);
     assert_eq!(tc.arena.host_lock_ref(c, SWA), 0);
     assert_eq!(tc.arena.host_lock_ref(b, SWA), 0);
     assert_eq!(tc.arena.host_lock_ref(a, SWA), 1);
@@ -2112,34 +2617,30 @@ fn release_host_lock_stops_at_the_host_uuid_boundary() {
 }
 
 #[test]
-fn release_lock_without_params_passes_over_an_unlocked_middle_node() {
+#[should_panic(expected = "SWA segment release hit lock_ref=0")]
+fn release_lock_without_the_boundary_uuid_dies_at_the_segment_edge() {
     let mut tc = swa_core(/* window = */ 1, /* page_size = */ 1);
-    let [a, b, c] = chain(&mut tc);
-    store_swa_device(&mut tc, a);
-    store_swa_device(&mut tc, b);
+    let [_a, _b, c] = chain(&mut tc);
     store_swa_device(&mut tc, c);
     let swa = swa_component(1);
-    // The 1-atom window locks only the acquired node: c and a, never b.
+    // The 1-atom window locks only the acquired node c.
     let _ = swa.acquire_component_lock(
         &mut tc,
         c,
         IncLockRefResult::default(),
         /* lock_host = */ false,
     );
-    let _ = swa.acquire_component_lock(
+    // An incorrect root boundary overshoots into unlocked territory
+    // and dies there instead of silently stealing whatever it crosses.
+    swa.release_component_lock(
         &mut tc,
-        a,
-        IncLockRefResult::default(),
+        c,
+        &DecLockRefParams {
+            component_lock_uuids: HashMap::from([(SWA.idx() as u8, None)]),
+            ..Default::default()
+        },
         /* lock_host = */ false,
     );
-    swa.release_component_lock(
-        &mut tc, c, /* params = */ None, /* lock_host = */ false,
-    );
-    assert_eq!(tc.arena.device_lock_ref(c, SWA), 0);
-    assert_eq!(tc.arena.device_lock_ref(b, SWA), 0);
-    assert_eq!(tc.arena.device_lock_ref(a, SWA), 0);
-    assert_eq!(tc.swa_evictable_size(), 3);
-    assert_eq!(tc.swa_protected_size(), 0);
 }
 
 #[test]
@@ -2157,12 +2658,8 @@ fn release_host_lock_reparks_tombstoned_host_nodes() {
         IncLockRefResult::default(),
         /* lock_host = */ true,
     );
-    let params = DecLockRefParams {
-        swa_uuid_for_lock: result.swa_uuid_for_lock,
-        swa_uuid_for_host_lock: result.swa_uuid_for_host_lock,
-        skip_lock_node_ids: result.skip_lock_node_ids,
-    };
-    swa.release_component_lock(&mut tc, c, Some(&params), /* lock_host = */ true);
+    let params = result.to_dec_params();
+    swa.release_component_lock(&mut tc, c, &params, /* lock_host = */ true);
     assert_eq!(tc.arena.host_lock_ref(c, SWA), 0);
     assert_eq!(tc.arena.host_lock_ref(b, SWA), 0);
     assert!(tc.host_lru_list(SWA).in_list(Some(c)));
@@ -2177,21 +2674,106 @@ fn inc_then_dec_lock_ref_roundtrips_with_dec_params() {
     store_swa_device(&mut tc, a);
     store_swa_device(&mut tc, b);
     store_swa_device(&mut tc, c);
-    let result = tc.inc_lock_ref(tc.arena.node(c).id);
-    let params = DecLockRefParams {
-        swa_uuid_for_lock: result.swa_uuid_for_lock,
-        swa_uuid_for_host_lock: result.swa_uuid_for_host_lock,
-        skip_lock_node_ids: result.skip_lock_node_ids,
-    };
-    tc.dec_lock_ref(
-        tc.arena.node(c).id,
-        Some(&params),
-        /* skip_swa = */ false,
-    );
+    let result = tc
+        .inc_lock_ref(tc.arena.node(c).id, ComponentSet::EMPTY)
+        .expect("live test node");
+    let params = result.to_dec_params();
+    tc.dec_lock_ref(tc.arena.node(c).id, &params, /* skip_swa = */ false)
+        .expect("live test node");
     assert_eq!(tc.arena.device_lock_ref(c, SWA), 0);
     assert_eq!(tc.arena.device_lock_ref(b, SWA), 0);
     assert_eq!(tc.swa_evictable_size(), 3);
     assert_eq!(tc.swa_protected_size(), 0);
+}
+
+#[test]
+fn dec_window_lock_only_preserves_full_and_mamba_locks() {
+    let (mut tc, [_, _, leaf]) = internal_swa_write_back_fixture(2, 1, true);
+    let receipt = tc.inc_lock_ref(leaf, ComponentSet::EMPTY).unwrap();
+    let idx = tc.arena.resolve(leaf).unwrap();
+    let mut params = receipt.to_dec_params();
+    let mut device_frees = HashMap::new();
+    let mut host_frees = HashMap::new();
+    assert_eq!(tc.component_protected_size(SWA), 2);
+    tc.dec_window_lock_only(
+        leaf,
+        SWA,
+        &params,
+        &mut device_frees,
+        &mut host_frees,
+        &mut Vec::new(),
+    )
+    .unwrap();
+    assert_eq!(tc.arena.device_lock_ref(idx, SWA), 0);
+    assert_eq!(tc.arena.device_lock_ref(idx, FULL), 1);
+    assert_eq!(tc.arena.device_lock_ref(idx, MAMBA), 1);
+    assert_eq!(tc.component_protected_size(SWA), 0);
+    assert_eq!(tc.component_protected_size(FULL), 3);
+    assert_eq!(tc.component_protected_size(MAMBA), 1);
+    assert!(device_frees.is_empty());
+    assert!(host_frees.is_empty());
+
+    // The later receipt skips only the window already released; Mamba must
+    // still be released together with Full.
+    params.skipped_lock_components.insert(SWA);
+    tc.dec_lock_ref(leaf, &params, false).unwrap();
+    assert_eq!(tc.component_protected_size(FULL), 0);
+    assert_eq!(tc.component_protected_size(MAMBA), 0);
+    tc.sanity_check(&[], &[]);
+}
+
+#[test]
+fn dec_window_lock_only_ignores_root_and_skipped_window() {
+    let (mut tc, [_, _, leaf]) = internal_swa_write_back_fixture(2, 1, true);
+    let mut device_frees = HashMap::new();
+    let mut host_frees = HashMap::new();
+    tc.dec_window_lock_only(
+        tc.arena.node(tc.arena.root()).id,
+        SWA,
+        &DecLockRefParams {
+            node_id: Some(tc.arena.node(tc.arena.root()).id),
+            ..Default::default()
+        },
+        &mut device_frees,
+        &mut host_frees,
+        &mut Vec::new(),
+    )
+    .unwrap();
+    let receipt = tc.inc_lock_ref(leaf, ComponentSet::of(SWA)).unwrap();
+    let params = receipt.to_dec_params();
+    assert!(!params.component_lock_uuids.contains_key(&(SWA.idx() as u8)));
+    tc.dec_window_lock_only(
+        leaf,
+        SWA,
+        &params,
+        &mut device_frees,
+        &mut host_frees,
+        &mut Vec::new(),
+    )
+    .unwrap();
+    assert_eq!(tc.component_protected_size(FULL), 3);
+    assert_eq!(tc.component_protected_size(MAMBA), 1);
+    assert_eq!(tc.component_protected_size(SWA), 0);
+    assert!(device_frees.is_empty());
+    assert!(host_frees.is_empty());
+    tc.dec_lock_ref(leaf, &params, false).unwrap();
+    tc.sanity_check(&[], &[]);
+}
+
+#[test]
+#[should_panic(expected = "lock receipt anchored on node")]
+fn dec_window_lock_only_checks_receipt_anchor_before_skipping() {
+    let (mut tc, [other, _, leaf]) = internal_swa_write_back_fixture(2, 1, true);
+    let receipt = tc.inc_lock_ref(leaf, ComponentSet::of(SWA)).unwrap();
+    tc.dec_window_lock_only(
+        other,
+        SWA,
+        &receipt.to_dec_params(),
+        &mut HashMap::new(),
+        &mut HashMap::new(),
+        &mut Vec::new(),
+    )
+    .unwrap();
 }
 
 #[test]
@@ -2206,15 +2788,19 @@ fn dec_swa_lock_only_releases_swa_while_full_stays_locked() {
     }
     // Fund FULL's evictable counter for its lock walk (raw slot sets skip it).
     tc.component_state_mut(FULL).evictable_size = 3;
-    let result = tc.inc_lock_ref(tc.arena.node(c).id);
+    let result = tc
+        .inc_lock_ref(tc.arena.node(c).id, ComponentSet::EMPTY)
+        .expect("live test node");
     let mut device_frees = HashMap::new();
     let mut host_frees = HashMap::new();
     tc.dec_swa_lock_only(
         tc.arena.node(c).id,
-        result.swa_uuid_for_lock,
+        &result.to_dec_params(),
         &mut device_frees,
         &mut host_frees,
-    );
+        &mut Vec::new(),
+    )
+    .expect("live test node");
     // SWA is early-released; the FULL locks on the path stay.
     assert_eq!(tc.arena.device_lock_ref(c, SWA), 0);
     assert_eq!(tc.arena.device_lock_ref(b, SWA), 0);
@@ -2237,20 +2823,26 @@ fn dec_swa_lock_only_evicts_a_fully_unlocked_device_leaf() {
             .set_device_value(node, FULL, Tensor::from_slice(&vec![9i64; len]));
     }
     let swa = swa_component(2);
+    let c_id = tc.arena.node(c).id;
     let result = swa.acquire_component_lock(
         &mut tc,
         c,
-        IncLockRefResult::default(),
+        IncLockRefResult {
+            node_id: Some(c_id),
+            ..Default::default()
+        },
         /* lock_host = */ false,
     );
     let mut device_frees = HashMap::new();
     let mut host_frees = HashMap::new();
     tc.dec_swa_lock_only(
         tc.arena.node(c).id,
-        result.swa_uuid_for_lock,
+        &result.to_dec_params(),
         &mut device_frees,
         &mut host_frees,
-    );
+        &mut Vec::new(),
+    )
+    .expect("live test node");
     // The fully unlocked leaf c is device-evicted on release; b keeps its
     // SWA value because its child still holds FULL KV.
     assert!(!tc.arena.has_device_value(c, SWA));
@@ -2269,10 +2861,16 @@ fn dec_swa_lock_only_is_a_noop_without_the_swa_component() {
     let mut host_frees = HashMap::new();
     tc.dec_swa_lock_only(
         tc.arena.node(root).id,
-        None,
+        &DecLockRefParams {
+            node_id: Some(tc.arena.node(root).id),
+            skipped_lock_components: ComponentSet::EMPTY,
+            ..Default::default()
+        },
         &mut device_frees,
         &mut host_frees,
-    );
+        &mut Vec::new(),
+    )
+    .expect("live test node");
     assert!(device_frees.is_empty());
 }
 
@@ -2297,9 +2895,13 @@ fn release_window_lock_breaks_on_a_tombstone_carrying_the_uuid() {
         &swa,
         &mut tc,
         c,
-        Some(99),
+        &DecLockRefParams {
+            component_lock_uuids: HashMap::from([(SWA.idx() as u8, Some(99))]),
+            ..Default::default()
+        },
         &mut device_frees,
         &mut host_frees,
+        &mut Vec::new(),
     );
     assert_eq!(tc.arena.device_lock_ref(c, SWA), 0);
     assert_eq!(tc.arena.device_lock_ref(a, SWA), 1);
@@ -2317,9 +2919,10 @@ fn release_window_lock_panics_on_a_non_swa_component() {
         &FullComponent,
         &mut tc,
         root,
-        None,
+        &DecLockRefParams::default(),
         &mut device_frees,
         &mut host_frees,
+        &mut Vec::new(),
     );
 }
 
@@ -2345,12 +2948,8 @@ fn release_lock_skip_set_leaves_a_relocked_tombstone_credited() {
         IncLockRefResult::default(),
         /* lock_host = */ false,
     );
-    let params = DecLockRefParams {
-        swa_uuid_for_lock: first.swa_uuid_for_lock,
-        swa_uuid_for_host_lock: first.swa_uuid_for_host_lock,
-        skip_lock_node_ids: first.skip_lock_node_ids,
-    };
-    swa.release_component_lock(&mut tc, c, Some(&params), /* lock_host = */ false);
+    let params = first.to_dec_params();
+    swa.release_component_lock(&mut tc, c, &params, /* lock_host = */ false);
     assert_eq!(tc.arena.device_lock_ref(c, SWA), 1);
     assert_eq!(tc.arena.device_lock_ref(b, SWA), 1);
     assert_eq!(tc.arena.device_lock_ref(a, SWA), 0);
@@ -2359,28 +2958,24 @@ fn release_lock_skip_set_leaves_a_relocked_tombstone_credited() {
 }
 
 #[test]
-fn release_lock_passes_over_uncredited_nodes_without_params() {
+#[should_panic(expected = "SWA segment release hit lock_ref=0")]
+fn double_release_with_one_receipt_dies_loud() {
     let mut tc = swa_core(/* window = */ 2, /* page_size = */ 1);
     let [a, b, c] = chain(&mut tc);
     store_swa_device(&mut tc, a);
     store_swa_device(&mut tc, b);
     store_swa_device(&mut tc, c);
     let swa = swa_component(2);
-    let _ = swa.acquire_component_lock(
+    let result = swa.acquire_component_lock(
         &mut tc,
         c,
         IncLockRefResult::default(),
         /* lock_host = */ false,
     );
-    // No params: the walk crosses the never-credited a up to the root.
-    swa.release_component_lock(
-        &mut tc, c, /* params = */ None, /* lock_host = */ false,
-    );
-    assert_eq!(tc.arena.device_lock_ref(c, SWA), 0);
-    assert_eq!(tc.arena.device_lock_ref(b, SWA), 0);
-    assert_eq!(tc.arena.device_lock_ref(a, SWA), 0);
-    assert_eq!(tc.swa_evictable_size(), 3);
-    assert_eq!(tc.swa_protected_size(), 0);
+    let params = result.to_dec_params();
+    swa.release_component_lock(&mut tc, c, &params, /* lock_host = */ false);
+    // Consuming the same receipt twice dies at the first unlocked node.
+    swa.release_component_lock(&mut tc, c, &params, /* lock_host = */ false);
 }
 
 #[test]
@@ -2391,26 +2986,35 @@ fn dec_swa_lock_only_releases_the_window_exactly_once() {
     store_swa_device(&mut tc, b);
     store_swa_device(&mut tc, c);
     let swa = swa_component(2);
+    let c_id = tc.arena.node(c).id;
     let first = swa.acquire_component_lock(
         &mut tc,
         c,
-        IncLockRefResult::default(),
+        IncLockRefResult {
+            node_id: Some(c_id),
+            ..Default::default()
+        },
         /* lock_host = */ false,
     );
     let _ = swa.acquire_component_lock(
         &mut tc,
         c,
-        IncLockRefResult::default(),
+        IncLockRefResult {
+            node_id: Some(c_id),
+            ..Default::default()
+        },
         /* lock_host = */ false,
     );
     let mut device_frees = HashMap::new();
     let mut host_frees = HashMap::new();
     tc.dec_swa_lock_only(
         tc.arena.node(c).id,
-        first.swa_uuid_for_lock,
+        &first.to_dec_params(),
         &mut device_frees,
         &mut host_frees,
-    );
+        &mut Vec::new(),
+    )
+    .expect("live test node");
     // The second window still holds the lock: refs drop to 1, sizes stay.
     assert_eq!(tc.arena.device_lock_ref(c, SWA), 1);
     assert_eq!(tc.arena.device_lock_ref(b, SWA), 1);
@@ -2418,10 +3022,12 @@ fn dec_swa_lock_only_releases_the_window_exactly_once() {
     assert_eq!(tc.swa_protected_size(), 2);
     tc.dec_swa_lock_only(
         tc.arena.node(c).id,
-        first.swa_uuid_for_lock,
+        &first.to_dec_params(),
         &mut device_frees,
         &mut host_frees,
-    );
+        &mut Vec::new(),
+    )
+    .expect("live test node");
     assert_eq!(tc.arena.device_lock_ref(c, SWA), 0);
     assert_eq!(tc.arena.device_lock_ref(b, SWA), 0);
     assert_eq!(tc.swa_evictable_size(), 3);
@@ -2437,10 +3043,14 @@ fn dec_swa_lock_only_leaves_out_of_window_swa_locks_alone() {
     store_swa_device(&mut tc, b);
     store_swa_device(&mut tc, c);
     let swa = swa_component(2);
+    let c_id = tc.arena.node(c).id;
     let result = swa.acquire_component_lock(
         &mut tc,
         c,
-        IncLockRefResult::default(),
+        IncLockRefResult {
+            node_id: Some(c_id),
+            ..Default::default()
+        },
         /* lock_host = */ false,
     );
     // A holds a lock beyond the window (e.g. another request's window).
@@ -2453,10 +3063,12 @@ fn dec_swa_lock_only_leaves_out_of_window_swa_locks_alone() {
     let mut host_frees = HashMap::new();
     tc.dec_swa_lock_only(
         tc.arena.node(c).id,
-        result.swa_uuid_for_lock,
+        &result.to_dec_params(),
         &mut device_frees,
         &mut host_frees,
-    );
+        &mut Vec::new(),
+    )
+    .expect("live test node");
     // Only the SWA window is released; a's out-of-window lock survives.
     assert_eq!(tc.arena.device_lock_ref(a, SWA), 1);
     assert_eq!(tc.arena.device_lock_ref(b, SWA), 0);
@@ -2465,7 +3077,8 @@ fn dec_swa_lock_only_leaves_out_of_window_swa_locks_alone() {
 }
 
 #[test]
-fn release_window_lock_passes_over_an_unlocked_valued_node() {
+#[should_panic(expected = "SWA window release hit lock_ref=0")]
+fn release_window_lock_without_the_uuid_dies_past_the_boundary() {
     let mut tc = swa_core(/* window = */ 2, /* page_size = */ 1);
     let [a, b, c] = chain(&mut tc);
     store_swa_device(&mut tc, a);
@@ -2480,11 +3093,19 @@ fn release_window_lock_passes_over_an_unlocked_valued_node() {
     );
     let mut device_frees = HashMap::new();
     let mut host_frees = HashMap::new();
-    // No uuid bound: the walk crosses the valued-but-unlocked a to the root.
-    swa.release_window_lock(&mut tc, c, None, &mut device_frees, &mut host_frees);
-    assert_eq!(tc.arena.device_lock_ref(c, SWA), 0);
-    assert_eq!(tc.arena.device_lock_ref(b, SWA), 0);
-    assert_eq!(tc.arena.device_lock_ref(a, SWA), 0);
+    // Without the boundary uuid the walk crosses the segment edge into the
+    // unlocked a and dies there instead of stealing.
+    swa.release_window_lock(
+        &mut tc,
+        c,
+        &DecLockRefParams {
+            component_lock_uuids: HashMap::from([(SWA.idx() as u8, None)]),
+            ..Default::default()
+        },
+        &mut device_frees,
+        &mut host_frees,
+        &mut Vec::new(),
+    );
 }
 
 #[test]
@@ -2494,7 +3115,7 @@ fn release_window_lock_passes_over_a_mid_chain_tombstone_without_a_uuid() {
     store_swa_device(&mut tc, a);
     store_swa_device(&mut tc, c);
     let swa = swa_component(100);
-    let _ = swa.acquire_component_lock(
+    let receipt = swa.acquire_component_lock(
         &mut tc,
         c,
         IncLockRefResult::default(),
@@ -2502,8 +3123,16 @@ fn release_window_lock_passes_over_a_mid_chain_tombstone_without_a_uuid() {
     );
     let mut device_frees = HashMap::new();
     let mut host_frees = HashMap::new();
-    // No uuid bound: the walk crosses the mid-chain tombstone b and releases a.
-    swa.release_window_lock(&mut tc, c, None, &mut device_frees, &mut host_frees);
+    // Walked-to-root acquire (window > chain): the uuid-less release counts
+    // back through the mid-chain tombstone b and releases a.
+    swa.release_window_lock(
+        &mut tc,
+        c,
+        &receipt.to_dec_params(),
+        &mut device_frees,
+        &mut host_frees,
+        &mut Vec::new(),
+    );
     assert_eq!(tc.arena.device_lock_ref(c, SWA), 0);
     assert_eq!(tc.arena.device_lock_ref(b, SWA), 0);
     assert_eq!(tc.arena.device_lock_ref(a, SWA), 0);
@@ -2526,12 +3155,8 @@ fn release_host_lock_does_not_repark_a_node_whose_host_value_was_taken() {
     // The host value moved out while the lock was held; the node has no
     // device value either, so the release has nothing to park.
     let _ = tc.arena.take_host_value(a, SWA);
-    let params = DecLockRefParams {
-        swa_uuid_for_lock: result.swa_uuid_for_lock,
-        swa_uuid_for_host_lock: result.swa_uuid_for_host_lock,
-        skip_lock_node_ids: result.skip_lock_node_ids,
-    };
-    swa.release_component_lock(&mut tc, a, Some(&params), /* lock_host = */ true);
+    let params = result.to_dec_params();
+    swa.release_component_lock(&mut tc, a, &params, /* lock_host = */ true);
     assert_eq!(tc.arena.host_lock_ref(a, SWA), 0);
     assert!(!tc.host_lru_list(SWA).in_list(Some(a)));
 }
@@ -2552,12 +3177,8 @@ fn release_host_lock_skips_reparking_device_valued_nodes() {
         IncLockRefResult::default(),
         /* lock_host = */ true,
     );
-    let params = DecLockRefParams {
-        swa_uuid_for_lock: result.swa_uuid_for_lock,
-        swa_uuid_for_host_lock: result.swa_uuid_for_host_lock,
-        skip_lock_node_ids: result.skip_lock_node_ids,
-    };
-    swa.release_component_lock(&mut tc, c, Some(&params), /* lock_host = */ true);
+    let params = result.to_dec_params();
+    swa.release_component_lock(&mut tc, c, &params, /* lock_host = */ true);
     // Device-valued nodes never re-park in the host LRU on host release.
     assert!(!tc.host_lru_list(SWA).in_list(Some(c)));
     assert!(!tc.host_lru_list(SWA).in_list(Some(b)));
@@ -2580,12 +3201,8 @@ fn release_host_lock_leaves_an_already_listed_node_listed() {
     );
     // Something re-listed b while the lock was held (e.g. a split re-park).
     tc.host_lru_list_mut(SWA).insert_mru(b);
-    let params = DecLockRefParams {
-        swa_uuid_for_lock: result.swa_uuid_for_lock,
-        swa_uuid_for_host_lock: result.swa_uuid_for_host_lock,
-        skip_lock_node_ids: result.skip_lock_node_ids,
-    };
-    swa.release_component_lock(&mut tc, c, Some(&params), /* lock_host = */ true);
+    let params = result.to_dec_params();
+    swa.release_component_lock(&mut tc, c, &params, /* lock_host = */ true);
     assert!(tc.host_lru_list(SWA).in_list(Some(b)));
     assert!(tc.host_lru_list(SWA).in_list(Some(c)));
     let _ = a;
@@ -2609,6 +3226,362 @@ fn swa_evict_chain(tc: &mut UnifiedTreeCore<Vec<i64>>) -> [NodeIdx_; 3] {
 
 fn swa_tracker() -> HashMap<ComponentType, usize> {
     HashMap::from([(FULL, 0), (SWA, 0)])
+}
+
+fn internal_swa_write_back_fixture(
+    window: usize,
+    page_size: usize,
+    with_mamba: bool,
+) -> (UnifiedTreeCore<Vec<i64>>, [NodeId; 3]) {
+    let mut tc = UnifiedTreeCore::new(
+        CacheInitParams {
+            page_size,
+            swa_sliding_window_size: Some(window),
+            mamba_cache_chunk_size: with_mamba.then_some(256),
+            enable_hicache: true,
+            has_swa_host_pool: true,
+            is_write_back: true,
+            ..Default::default()
+        },
+        if with_mamba {
+            vec![FULL, SWA, MAMBA]
+        } else {
+            vec![FULL, SWA]
+        },
+    );
+    let mut ids = [0; 3];
+    for (i, id) in ids.iter_mut().enumerate() {
+        let len = (i + 1) * page_size;
+        let key: Vec<_> = (1..=len as i64).collect();
+        let values: Vec<_> = (10..10 + len as i64).collect();
+        let mut params = insert_params_swa(&key, &values, 0, 0);
+        params.mamba_value = with_mamba.then(|| Tensor::from_slice(&[70 + i as i64]));
+        *id = tc.insert(&params).last_device_node_id.unwrap();
+        let idx = tc.arena.resolve(*id).unwrap();
+        store_swa_device(&mut tc, idx);
+    }
+    (tc, ids)
+}
+
+fn commit_internal_swa_backup(tc: &mut UnifiedTreeCore<Vec<i64>>, node_id: NodeId) {
+    let (full, mut transfers) = tc.build_backup_spec(node_id).unwrap();
+    let nodes = transfers[&SWA][0].nodes_to_load.clone().unwrap();
+    for transfer in transfers.values_mut().flatten() {
+        transfer.host_indices = Some(transfer.device_indices.as_ref().unwrap() + 1000);
+    }
+    tc.commit_backup(node_id, full + 1000, transfers).unwrap();
+    let nodes = tc.mark_write_through_pending(nodes, node_id).unwrap();
+    tc.finish_write_through(nodes, node_id).unwrap();
+}
+
+fn request_internal_swa_backup(tc: &mut UnifiedTreeCore<Vec<i64>>, node: NodeId, needed: usize) {
+    let (leaf, step) = tc.evict_device_next_node(SWA, &HashMap::new());
+    assert_eq!(leaf, None);
+    assert_eq!(step.swa_backup_node_id, Some(node));
+    assert_eq!(step.swa_backup_num_tokens, needed);
+    assert_eq!(step.mamba_backup_node_id, None);
+    assert!(step.tracker.is_empty());
+    assert!(step.device_frees.is_empty());
+    assert!(step.host_frees.is_empty());
+    assert_eq!(step.unbacked_tokens, 0);
+    assert!(
+        tc.arena
+            .has_device_value(tc.arena.resolve(node).unwrap(), SWA)
+    );
+}
+
+#[test]
+fn internal_swa_write_back_keeps_full_and_host_window_after_backup() {
+    let (mut tc, [a, b, c]) = internal_swa_write_back_fixture(2, 1, false);
+    tc.evict_device_start(SWA, 3);
+    request_internal_swa_backup(&mut tc, a, 1);
+    commit_internal_swa_backup(&mut tc, a);
+    let step = tc.finish_swa_state_eviction(a);
+    assert_eq!(step.tracker, HashMap::from([(SWA, 1)]));
+    assert!(step.device_frees[&SWA][0].equal(&Tensor::from_slice(&[10i64])));
+    assert_eq!(step.device_frees.len(), 1);
+    assert!(step.host_frees.is_empty());
+    assert_eq!(step.unbacked_tokens, 0);
+    let idx = tc.arena.resolve(a).unwrap();
+    let node = tc.arena.node(idx);
+    assert!(node.device_value(FULL).equal(&Tensor::from_slice(&[10i64])));
+    assert!(node.host_value(FULL).equal(&Tensor::from_slice(&[1010i64])));
+    assert!(node.host_value(SWA).equal(&Tensor::from_slice(&[1000i64])));
+    assert!(!node.has_device_value(SWA));
+    assert!(tc.host_lru_list(SWA).in_list(Some(idx)));
+    let matched = tc.match_prefix(&match_params(&vec![1]));
+    assert_eq!(matched.best_match_node_id, a);
+    assert_eq!(matched.swa_host_hit_length, 1);
+
+    // The next backup counts only B: A's SWA copy is already on host.
+    request_internal_swa_backup(&mut tc, b, 1);
+    tc.finish_swa_state_eviction(b);
+    let (leaf, step) = tc.evict_device_next_node(SWA, &HashMap::from([(SWA, 2)]));
+    assert_eq!(leaf, Some(c));
+    assert_eq!(step.swa_backup_node_id, None);
+    assert_eq!(step.swa_backup_num_tokens, 0);
+    tc.evict_device_end(SWA);
+    tc.sanity_check(&[], &[]);
+}
+
+#[test]
+fn internal_swa_failed_backup_still_frees_and_obeys_the_budget() {
+    let (mut tc, [a, b, _]) = internal_swa_write_back_fixture(2, 1, false);
+    tc.evict_device_start(SWA, 1);
+    request_internal_swa_backup(&mut tc, a, 1);
+    let step = tc.finish_swa_state_eviction(a);
+    assert_eq!(step.tracker, HashMap::from([(SWA, 1)]));
+    let node = tc.arena.node(tc.arena.resolve(a).unwrap());
+    assert!(node.has_device_value(FULL));
+    assert!(!node.has_device_value(SWA));
+    assert!(!node.has_host_value(SWA));
+    let (next, exhausted) = tc.evict_device_next_node(SWA, &step.tracker);
+    assert_eq!(next, None);
+    assert!(exhausted.tracker.is_empty());
+    assert_eq!(exhausted.swa_backup_node_id, None);
+    assert_eq!(exhausted.swa_backup_num_tokens, 0);
+    assert!(tc.arena.has_device_value(tc.arena.resolve(b).unwrap(), SWA));
+    tc.evict_device_end(SWA);
+    tc.sanity_check(&[], &[]);
+}
+
+#[test]
+fn internal_swa_backup_counts_the_collected_window_including_page_overshoot() {
+    for buffer_only in [false, true] {
+        // Two 2-token nodes cover a 3-token window. Buffer mode stages B alone.
+        let (mut tc, [a, b, c]) = internal_swa_write_back_fixture(3, 2, false);
+        tc.is_host_memory_buffer_only = buffer_only;
+        let a_idx = tc.arena.resolve(a).unwrap();
+        tc.device_lru_list_mut(SWA).reset_node_mru(a_idx);
+        tc.evict_device_start(SWA, 6);
+        let needed = if buffer_only { 2 } else { 4 };
+        request_internal_swa_backup(&mut tc, b, needed);
+        let (_, transfers) = tc.build_backup_spec(b).unwrap();
+        assert_eq!(
+            transfers[&SWA][0].device_indices.as_ref().unwrap().numel(),
+            needed
+        );
+        commit_internal_swa_backup(&mut tc, b);
+        assert_eq!(
+            tc.finish_swa_state_eviction(b).tracker,
+            HashMap::from([(SWA, 2)])
+        );
+        let a_node = tc.arena.node(a_idx);
+        assert!(a_node.has_device_value(SWA));
+        assert_eq!(a_node.has_host_value(SWA), !buffer_only);
+        let (next, _) = tc.evict_device_next_node(SWA, &HashMap::from([(SWA, 2)]));
+        assert_eq!(next, Some(c));
+        tc.evict_device_end(SWA);
+        tc.sanity_check(&[], &[]);
+    }
+}
+
+#[test]
+fn internal_swa_backup_guards_keep_the_existing_inline_tombstone() {
+    for guard in [
+        "no_hicache",
+        "write_through",
+        "no_swa_pool",
+        "full_host",
+        "swa_host",
+        "pending",
+    ] {
+        let (mut tc, [a, _, _]) = internal_swa_write_back_fixture(2, 1, false);
+        let idx = tc.arena.resolve(a).unwrap();
+        match guard {
+            "no_hicache" => tc.enable_hicache = false,
+            "write_through" => tc.is_write_back = false,
+            "no_swa_pool" => tc.has_swa_host_pool = false,
+            "full_host" => {
+                tc.commit_backup(a, Tensor::from_slice(&[100i64]), HashMap::new())
+                    .unwrap();
+                tc.mark_write_through_pending(vec![a], a).unwrap();
+                tc.finish_write_through(vec![a], a).unwrap();
+            }
+            "swa_host" => {
+                let (_, mut transfers) = tc.build_backup_spec(a).unwrap();
+                transfers.get_mut(&SWA).unwrap()[0].host_indices =
+                    Some(Tensor::from_slice(&[100i64]));
+                tc.commit_backup(a, Tensor::from_slice(&[] as &[i64]), transfers)
+                    .unwrap();
+            }
+            "pending" => tc.arena.node_mut(idx).write_through_pending_id = Some(a),
+            _ => unreachable!(),
+        }
+        tc.evict_device_start(SWA, 1);
+        let (next, step) = tc.evict_device_next_node(SWA, &HashMap::new());
+        assert_eq!(next, None, "{guard}");
+        assert_eq!(step.swa_backup_node_id, None, "{guard}");
+        assert_eq!(step.swa_backup_num_tokens, 0, "{guard}");
+        assert_eq!(step.tracker, HashMap::from([(SWA, 1)]), "{guard}");
+        assert!(tc.arena.has_device_value(idx, FULL));
+        assert!(!tc.arena.has_device_value(idx, SWA));
+        tc.arena.node_mut(idx).write_through_pending_id = None;
+        tc.evict_device_end(SWA);
+        tc.sanity_check(&[], &[]);
+    }
+}
+
+#[test]
+fn internal_swa_resume_preserves_new_request_and_dma_locks() {
+    for pending_backup in [false, true] {
+        let (mut tc, [a, b, _]) = internal_swa_write_back_fixture(2, 1, false);
+        tc.evict_device_start(SWA, 3);
+        request_internal_swa_backup(&mut tc, a, 1);
+        let idx = tc.arena.resolve(a).unwrap();
+        let swa = swa_component(2);
+        let lock = swa.acquire_component_lock(&mut tc, idx, IncLockRefResult::default(), false);
+        if pending_backup {
+            tc.arena.node_mut(idx).write_through_pending_id = Some(a);
+        }
+        let step = tc.finish_swa_state_eviction(a);
+        assert!(step.tracker.is_empty());
+        assert!(step.device_frees.is_empty());
+        assert!(tc.arena.has_device_value(idx, SWA));
+        tc.arena.node_mut(idx).write_through_pending_id = None;
+        swa.release_component_lock(&mut tc, idx, &lock.to_dec_params(), false);
+        request_internal_swa_backup(&mut tc, b, 2);
+        tc.evict_device_end(SWA);
+        tc.sanity_check(&[], &[]);
+    }
+}
+
+#[test]
+fn internal_swa_resume_ignores_other_components_pending_markers() {
+    for load_back in [false, true] {
+        let (mut tc, [a, _, c]) = internal_swa_write_back_fixture(2, 1, false);
+        tc.evict_device_start(SWA, 1);
+        request_internal_swa_backup(&mut tc, a, 1);
+        let idx = tc.arena.resolve(a).unwrap();
+        if load_back {
+            tc.arena.node_mut(idx).load_back_pending_id = Some(c);
+        } else {
+            tc.arena.node_mut(idx).write_through_pending_id = Some(c);
+        }
+        let step = tc.finish_swa_state_eviction(a);
+        assert_eq!(step.tracker, HashMap::from([(SWA, 1)]));
+        assert!(tc.arena.has_device_value(idx, FULL));
+        assert!(!tc.arena.has_device_value(idx, SWA));
+        let node = tc.arena.node_mut(idx);
+        assert_eq!(
+            if load_back {
+                node.load_back_pending_id
+            } else {
+                node.write_through_pending_id
+            },
+            Some(c)
+        );
+        node.load_back_pending_id = None;
+        node.write_through_pending_id = None;
+        tc.evict_device_end(SWA);
+        tc.sanity_check(&[], &[]);
+    }
+}
+
+#[test]
+fn internal_swa_resume_reselects_only_an_atomically_evictable_leaf() {
+    use crate::components::full::FullComponent;
+    for full_locked in [false, true] {
+        let (mut tc, [a, b, c]) = internal_swa_write_back_fixture(2, 1, false);
+        tc.evict_device_start(SWA, 1);
+        request_internal_swa_backup(&mut tc, a, 1);
+        tc.evict_device_leaf(c, false).unwrap();
+        tc.evict_device_leaf(b, false).unwrap();
+        let idx = tc.arena.resolve(a).unwrap();
+        if full_locked {
+            FullComponent.acquire_component_lock(&mut tc, idx, IncLockRefResult::default(), false);
+        }
+        let step = tc.finish_swa_state_eviction(a);
+        let (next, exhausted) = tc.evict_device_next_node(SWA, &step.tracker);
+        if full_locked {
+            // Full alone is pinned; SWA finishes rather than endlessly requeueing.
+            assert_eq!(step.tracker, HashMap::from([(SWA, 1)]));
+            assert_eq!(next, None);
+            assert!(!tc.arena.has_device_value(idx, SWA));
+            FullComponent.release_component_lock(&mut tc, idx, &DecLockRefParams::default(), false);
+        } else {
+            assert!(step.tracker.is_empty());
+            assert!(step.device_frees.is_empty());
+            assert_eq!(next, Some(a));
+            assert!(tc.arena.has_device_value(idx, SWA));
+        }
+        assert_eq!(exhausted.swa_backup_node_id, None);
+        assert!(tc.arena.has_device_value(idx, FULL));
+        tc.evict_device_end(SWA);
+        tc.sanity_check(&[], &[]);
+    }
+}
+
+#[test]
+fn internal_swa_resume_does_not_touch_a_recycled_node() {
+    let (mut tc, [a, b, c]) = internal_swa_write_back_fixture(2, 1, false);
+    tc.evict_device_start(SWA, 1);
+    request_internal_swa_backup(&mut tc, a, 1);
+    for id in [c, b, a] {
+        tc.evict_device_leaf(id, false).unwrap();
+    }
+    let replacement = tc
+        .insert(&insert_params_swa(&vec![9], &[90], 0, 0))
+        .last_device_node_id
+        .unwrap();
+    let idx = tc.arena.resolve(replacement).unwrap();
+    store_swa_device(&mut tc, idx);
+    assert!(tc.arena.resolve(a).is_err());
+    let step = tc.finish_swa_state_eviction(a);
+    assert!(step.tracker.is_empty());
+    assert!(step.device_frees.is_empty());
+    let (next, _) = tc.evict_device_next_node(SWA, &HashMap::new());
+    assert_eq!(next, Some(replacement));
+    assert!(tc.arena.has_device_value(idx, SWA));
+    tc.evict_device_end(SWA);
+    tc.sanity_check(&[], &[]);
+}
+
+#[test]
+fn internal_swa_pending_protocol_prevents_double_free_and_allows_abandonment() {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    let (mut tc, [a, b, _]) = internal_swa_write_back_fixture(2, 1, false);
+    tc.evict_device_start(SWA, 1);
+    request_internal_swa_backup(&mut tc, a, 1);
+    assert!(
+        catch_unwind(AssertUnwindSafe(
+            || tc.evict_device_next_node(SWA, &HashMap::new())
+        ))
+        .is_err()
+    );
+    assert!(catch_unwind(AssertUnwindSafe(|| tc.finish_swa_state_eviction(b))).is_err());
+    tc.evict_device_end(SWA);
+    assert!(tc.arena.has_device_value(tc.arena.resolve(a).unwrap(), SWA));
+    tc.evict_device_start(SWA, 1);
+    request_internal_swa_backup(&mut tc, a, 1);
+    assert_eq!(tc.finish_swa_state_eviction(a).tracker[&SWA], 1);
+    assert!(catch_unwind(AssertUnwindSafe(|| tc.finish_swa_state_eviction(a))).is_err());
+    tc.evict_device_end(SWA);
+    tc.sanity_check(&[], &[]);
+}
+
+#[test]
+fn internal_swa_write_back_preserves_host_mamba_before_device_cascade() {
+    for backup_succeeds in [false, true] {
+        let (mut tc, [a, _, _]) = internal_swa_write_back_fixture(2, 1, true);
+        tc.evict_device_start(SWA, 1);
+        request_internal_swa_backup(&mut tc, a, 1);
+        if backup_succeeds {
+            commit_internal_swa_backup(&mut tc, a);
+        }
+        let step = tc.finish_swa_state_eviction(a);
+        assert_eq!(step.tracker, HashMap::from([(SWA, 1), (MAMBA, 1)]));
+        assert!(step.device_frees[&MAMBA][0].equal(&Tensor::from_slice(&[70i64])));
+        assert!(!step.device_frees.contains_key(&FULL));
+        let node = tc.arena.node(tc.arena.resolve(a).unwrap());
+        assert!(node.has_device_value(FULL));
+        for ct in [SWA, MAMBA] {
+            assert!(!node.has_device_value(ct));
+            assert_eq!(node.has_host_value(ct), backup_succeeds);
+        }
+        tc.evict_device_end(SWA);
+        tc.sanity_check(&[], &[]);
+    }
 }
 
 #[test]
@@ -2835,11 +3808,13 @@ fn try_device_value_and_evictable_size_read_the_swa_slots() {
     store_swa_device(&mut tc, a);
     assert!(
         tc.get_component_device_value(tc.arena.node(a).id, SWA)
+            .expect("live test node")
             .unwrap()
             .equal(&Tensor::from_slice(&[0i64]))
     );
     assert!(
         tc.get_component_device_value(tc.arena.node(b).id, SWA)
+            .expect("live test node")
             .is_none()
     );
     assert_eq!(tc.evictable_size_(SWA), 1);
@@ -2855,6 +3830,61 @@ fn redistribute_on_node_split_moves_the_swa_uuid_to_the_parent() {
     let (parent, _) = tc.split_node_(node, /* split_len = */ 1);
     assert_eq!(node_swa_uuid(&tc, parent), Some(7));
     assert_eq!(node_swa_uuid(&tc, node), None);
+}
+
+#[test]
+fn redistribute_on_node_split_preserves_host_lock_state() {
+    let mut tc = swa_core(/* window = */ 4, /* page_size = */ 1);
+    tc.insert(&insert_params_swa(&vec![1, 2], &[10, 11], 0, 0));
+    let root = tc.arena.root();
+    let node = child_of(&tc, root, &[1]);
+    // A host-locked tombstone mid-IO: both halves must stay pinned and out
+    // of the host LRU, and the host boundary uuid moves to the parent.
+    tc.arena
+        .set_host_value(node, SWA, Tensor::from_slice(&[70i64, 71]));
+    tc.arena
+        .node_mut(node)
+        .set_lock_ref_(ValueSlotIdx::host(SWA), 1);
+    tc.arena.node_mut(node).swa_host_uuid = Some(9);
+    let (parent, _) = tc.split_node_(node, /* split_len = */ 1);
+    assert_eq!(tc.arena.host_lock_ref(parent, SWA), 1);
+    assert_eq!(tc.arena.host_lock_ref(node, SWA), 1);
+    assert_eq!(node_swa_host_uuid(&tc, parent), Some(9));
+    assert_eq!(node_swa_host_uuid(&tc, node), None);
+    assert!(!tc.host_lru_list(SWA).in_list(Some(parent)));
+    assert!(!tc.host_lru_list(SWA).in_list(Some(node)));
+}
+
+#[test]
+fn host_lock_receipt_releases_every_split_fragment() {
+    let mut tc = swa_core(/* window = */ 4, /* page_size = */ 1);
+    tc.insert(&insert_params_swa(
+        &vec![1, 2, 3, 4],
+        &[10, 11, 12, 13],
+        0,
+        0,
+    ));
+    let root = tc.arena.root();
+    let node = child_of(&tc, root, &[1]);
+    set_swa_host(&mut tc, node);
+
+    let node_handle = tc.arena.node(node).id;
+    let lock = tc.inc_host_lock_ref(node_handle).expect("live test node");
+    assert!(
+        lock.component_host_lock_uuids
+            .contains_key(&(SWA.idx() as u8))
+    );
+
+    let (parent, _) = tc.split_node_(node, /* split_len = */ 2);
+    assert_eq!(tc.arena.host_lock_ref(parent, SWA), 1);
+    assert_eq!(tc.arena.host_lock_ref(node, SWA), 1);
+
+    tc.dec_host_lock_ref(node_handle, &lock.to_dec_params())
+        .expect("live test node");
+    assert_eq!(tc.arena.host_lock_ref(parent, SWA), 0);
+    assert_eq!(tc.arena.host_lock_ref(node, SWA), 0);
+    assert!(tc.host_lru_list(SWA).in_list(Some(parent)));
+    assert!(tc.host_lru_list(SWA).in_list(Some(node)));
 }
 
 #[test]
@@ -2926,59 +3956,112 @@ fn new_leaf_after_a_cached_prefix_splits_at_the_leaf_relative_boundary() {
             .device_value(leaf, FULL)
             .equal(&Tensor::from_slice(&[24i64, 25]))
     );
-    assert!(result.cache_actions.iter().any(|action| matches!(
-        action,
-        CacheAction::SwaRebuild { node_id, source_value }
-            if *node_id == tc.arena.node(leaf).id && source_value.equal(&Tensor::from_slice(&[24i64, 25]))
-    )));
-    assert!(!result.cache_actions.iter().any(|action| matches!(
-        action,
-        CacheAction::SwaRebuild { node_id, .. } if *node_id == tc.arena.node(p).id
-    )));
+    assert!(result.cache_actions.iter().any(|action| matches!(action.as_any().downcast_ref::<SwaRebuild>(), Some(SwaRebuild { node_id, source_value })
+            if *node_id == tc.arena.node(leaf).id && source_value.equal(&Tensor::from_slice(&[24i64, 25])))));
+    assert!(!result.cache_actions.iter().any(|action| matches!(action.as_any().downcast_ref::<SwaRebuild>(), Some(SwaRebuild { node_id, .. }) if *node_id == tc.arena.node(p).id)));
 }
 
 #[test]
 fn new_leaf_boundary_split_and_window_cap_compose_in_one_commit() {
-    let mut tc = swa_core(/* window = */ 2, /* page_size = */ 1);
-    tc.insert(&insert_params_swa(&vec![1, 2], &[10, 11], 0, 0));
-    let root = tc.arena.root();
-    let a = child_of(&tc, root, &[1]);
-    let result = tc.insert(&insert_params_swa(
-        &vec![1, 2, 3, 4, 5, 6, 7],
-        &[20, 21, 22, 23, 24, 25, 26],
-        /* prev_prefix_len = */ 2,
-        /* swa_evicted_seqlen = */ 3,
-    ));
-    // Boundary split first ([3] tombstone), then the window cap splits the
-    // in-window run into [4, 5] + [6, 7], rebuilt older-prefix-first.
-    let p = child_of(&tc, a, &[3]);
-    let capped = child_of(&tc, p, &[4]);
-    let leaf = child_of(&tc, capped, &[6]);
-    assert_eq!(tc.arena.node(p).key, vec![3]);
-    assert_eq!(tc.arena.node(capped).key, vec![4, 5]);
-    assert_eq!(tc.arena.node(leaf).key, vec![6, 7]);
-    let rebuilds: Vec<NodeId> = result
-        .cache_actions
-        .iter()
-        .filter_map(|action| match action {
-            CacheAction::SwaRebuild { node_id, .. } => Some(*node_id),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(
-        rebuilds,
-        vec![tc.arena.node(capped).id, tc.arena.node(leaf).id]
-    );
-    assert!(result.cache_actions.iter().any(|action| matches!(
-        action,
-        CacheAction::SwaRebuild { node_id, source_value }
-            if *node_id == tc.arena.node(capped).id && source_value.equal(&Tensor::from_slice(&[23i64, 24]))
-    )));
-    assert!(result.cache_actions.iter().any(|action| matches!(
-        action,
-        CacheAction::SwaRebuild { node_id, source_value }
-            if *node_id == tc.arena.node(leaf).id && source_value.equal(&Tensor::from_slice(&[25i64, 26]))
-    )));
+    for buffer_only in [false, true] {
+        let mut tc = swa_core(/* window = */ 2, /* page_size = */ 1);
+        if buffer_only {
+            tc.set_host_memory_buffer_only();
+        }
+        tc.insert(&insert_params_swa(&vec![1, 2], &[10, 11], 0, 0));
+        let root = tc.arena.root();
+        let a = child_of(&tc, root, &[1]);
+        let result = tc.insert(&insert_params_swa(
+            &vec![1, 2, 3, 4, 5, 6, 7],
+            &[20, 21, 22, 23, 24, 25, 26],
+            /* prev_prefix_len = */ 2,
+            /* swa_evicted_seqlen = */ 3,
+        ));
+        // Boundary split first ([3] tombstone), then the window cap splits the
+        // in-window run into [4, 5] + [6, 7], rebuilt older-prefix-first.
+        let p = child_of(&tc, a, &[3]);
+        let capped = child_of(&tc, p, &[4]);
+        let leaf = child_of(&tc, capped, &[6]);
+        assert_eq!(tc.arena.node(p).key, vec![3]);
+        assert_eq!(tc.arena.node(capped).key, vec![4, 5]);
+        assert_eq!(tc.arena.node(leaf).key, vec![6, 7]);
+        let rebuilds: Vec<NodeId> = result
+            .cache_actions
+            .iter()
+            .filter_map(
+                |action| match action.as_any().downcast_ref::<SwaRebuild>() {
+                    Some(SwaRebuild { node_id, .. }) => Some(*node_id),
+                    _ => None,
+                },
+            )
+            .collect();
+        assert_eq!(
+            rebuilds,
+            vec![tc.arena.node(capped).id, tc.arena.node(leaf).id]
+        );
+        assert!(result.cache_actions.iter().any(|action| matches!(action.as_any().downcast_ref::<SwaRebuild>(), Some(SwaRebuild { node_id, source_value })
+                if *node_id == tc.arena.node(capped).id && source_value.equal(&Tensor::from_slice(&[23i64, 24])))));
+        assert!(result.cache_actions.iter().any(|action| matches!(action.as_any().downcast_ref::<SwaRebuild>(), Some(SwaRebuild { node_id, source_value })
+                if *node_id == tc.arena.node(leaf).id && source_value.equal(&Tensor::from_slice(&[25i64, 26])))));
+        let split_ids: Vec<NodeId> = result
+            .cache_actions
+            .iter()
+            .filter_map(|action| {
+                match action
+                    .as_any()
+                    .downcast_ref::<UpdatePendingBackupOnNodeSplit>()
+                {
+                    Some(UpdatePendingBackupOnNodeSplit {
+                        ack_id,
+                        old_node_id,
+                        new_node_id,
+                        new_child_node_id,
+                    }) => {
+                        assert_eq!(*ack_id, None);
+                        assert_eq!(*old_node_id, tc.arena.node(leaf).id);
+                        assert_eq!(*new_child_node_id, tc.arena.node(leaf).id);
+                        Some(*new_node_id)
+                    }
+                    _ => None,
+                }
+            })
+            .collect();
+        if buffer_only {
+            assert_eq!(
+                split_ids,
+                vec![tc.arena.node(p).id, tc.arena.node(capped).id]
+            );
+            let first_rebuild = result
+                .cache_actions
+                .iter()
+                .position(|action| {
+                    matches!(
+                        action.as_any().downcast_ref::<SwaRebuild>(),
+                        Some(SwaRebuild { .. })
+                    )
+                })
+                .unwrap();
+            assert_eq!(
+                result.cache_actions[..first_rebuild]
+                    .iter()
+                    .filter(|action| {
+                        matches!(
+                            action
+                                .as_any()
+                                .downcast_ref::<UpdatePendingBackupOnNodeSplit>(),
+                            Some(UpdatePendingBackupOnNodeSplit { .. })
+                        )
+                    })
+                    .count(),
+                2,
+            );
+        } else {
+            assert!(split_ids.is_empty());
+        }
+        for node in [p, capped, leaf] {
+            assert_eq!(tc.arena.node(node).write_through_pending_id, None);
+        }
+    }
 }
 
 #[test]
@@ -3009,7 +4092,7 @@ fn match_prefix_with_an_empty_key_on_a_swa_core_is_a_clean_miss() {
         key: &Vec::new(),
         namespace: Default::default(),
     });
-    assert_eq!(result.device_indices.size()[0], 0);
+    assert_eq!(result.device_prefix_len, 0);
     assert_eq!(result.swa_host_hit_length, 0);
     let root = tc.arena.root();
     assert_eq!(result.best_match_node_id, tc.arena.node(root).id);
@@ -3070,10 +4153,26 @@ fn window_cap_skips_a_page_misaligned_leaf() {
         )
         .unwrap();
     // split_at = 5 - 2 = 3 is not page-aligned: the cap is skipped.
-    let capped = swa_component(2).maybe_split_leaf_for_swa_lock_(&mut tc, leaf);
+    let mut actions = Vec::new();
+    let capped = swa_component(2).maybe_split_leaf_for_swa_lock_(&mut tc, leaf, &mut actions);
+    assert!(actions.is_empty());
     assert_eq!(capped, None);
     assert_eq!(tc.arena.node(leaf).key, vec![1, 2, 3, 4, 5]);
     assert_eq!(tc.arena.node(leaf).parent(), root);
+}
+
+#[test]
+#[should_panic(expected = "fresh SWA leaf cannot be write-through-pending")]
+fn window_cap_rejects_a_write_through_ack() {
+    let mut tc = swa_core(/* window = */ 2, /* page_size = */ 1);
+    tc.set_host_memory_buffer_only();
+    let root = tc.arena.root();
+    let leaf = tc
+        .arena
+        .alloc_child(root, vec![1, 2, 3, 4], 0, None)
+        .unwrap();
+    tc.arena.node_mut(leaf).write_through_pending_id = Some(91);
+    swa_component(2).maybe_split_leaf_for_swa_lock_(&mut tc, leaf, &mut Vec::new());
 }
 
 #[test]
@@ -3093,11 +4192,8 @@ fn new_leaf_with_the_boundary_above_its_start_skips_the_split() {
     // in-window and stays unsplit.
     let leaf = child_of(&tc, a, &[4]);
     assert_eq!(tc.arena.node(leaf).key, vec![4, 5]);
-    assert!(result.cache_actions.iter().any(|action| matches!(
-        action,
-        CacheAction::SwaRebuild { node_id, source_value }
-            if *node_id == tc.arena.node(leaf).id && source_value.equal(&Tensor::from_slice(&[23i64, 24]))
-    )));
+    assert!(result.cache_actions.iter().any(|action| matches!(action.as_any().downcast_ref::<SwaRebuild>(), Some(SwaRebuild { node_id, source_value })
+            if *node_id == tc.arena.node(leaf).id && source_value.equal(&Tensor::from_slice(&[23i64, 24])))));
 }
 
 #[test]
@@ -3131,20 +4227,21 @@ fn insert_overlap_straddling_with_a_partial_prev_prefix_recovers_the_tail() {
             .device_value(node, FULL)
             .equal(&Tensor::from_slice(&[22i64, 23]))
     );
-    let [
-        CacheAction::FreeDeviceKVFullOnly(old_tail),
-        CacheAction::SwaRebuild {
-            node_id,
-            source_value,
-        },
-        CacheAction::FreeDeviceKVFullOnly(duplicates),
-    ] = result.cache_actions.as_slice()
-    else {
+    let [action0, action1, action2] = result.cache_actions.as_slice() else {
         panic!(
             "expected FreeDeviceKVFullOnly, SwaRebuild, FreeDeviceKVFullOnly, got {:?}",
             action_kinds(&result.cache_actions)
         );
     };
+    let FreeDeviceKVFullOnly { indices: old_tail } =
+        expect_action::<FreeDeviceKVFullOnly>(action0.as_ref());
+    let SwaRebuild {
+        node_id,
+        source_value,
+    } = expect_action::<SwaRebuild>(action1.as_ref());
+    let FreeDeviceKVFullOnly {
+        indices: duplicates,
+    } = expect_action::<FreeDeviceKVFullOnly>(action2.as_ref());
     assert!(old_tail[0].equal(&Tensor::from_slice(&[12i64, 13])));
     assert_eq!(*node_id, tc.arena.node(node).id);
     assert!(source_value.equal(&Tensor::from_slice(&[22i64, 23])));
@@ -3178,11 +4275,8 @@ fn insert_overlap_straddling_recovers_across_page_two() {
             .device_value(node, FULL)
             .equal(&Tensor::from_slice(&[22i64, 23]))
     );
-    assert!(result.cache_actions.iter().any(|action| matches!(
-        action,
-        CacheAction::SwaRebuild { node_id, source_value }
-            if *node_id == tc.arena.node(node).id && source_value.equal(&Tensor::from_slice(&[22i64, 23]))
-    )));
+    assert!(result.cache_actions.iter().any(|action| matches!(action.as_any().downcast_ref::<SwaRebuild>(), Some(SwaRebuild { node_id, source_value })
+            if *node_id == tc.arena.node(node).id && source_value.equal(&Tensor::from_slice(&[22i64, 23])))));
 }
 
 #[test]
@@ -3216,15 +4310,9 @@ fn reinsert_straddling_recovers_across_page_two() {
             .device_value(node, FULL)
             .equal(&Tensor::from_slice(&[22i64, 23]))
     );
-    assert!(result.cache_actions.iter().any(|action| matches!(
-        action,
-        CacheAction::SwaRebuild { node_id, source_value }
-            if *node_id == tc.arena.node(node).id && source_value.equal(&Tensor::from_slice(&[22i64, 23]))
-    )));
-    assert!(!result.cache_actions.iter().any(|action| matches!(
-        action,
-        CacheAction::SwaRebuild { node_id, .. } if *node_id == tc.arena.node(parent).id
-    )));
+    assert!(result.cache_actions.iter().any(|action| matches!(action.as_any().downcast_ref::<SwaRebuild>(), Some(SwaRebuild { node_id, source_value })
+            if *node_id == tc.arena.node(node).id && source_value.equal(&Tensor::from_slice(&[22i64, 23])))));
+    assert!(!result.cache_actions.iter().any(|action| matches!(action.as_any().downcast_ref::<SwaRebuild>(), Some(SwaRebuild { node_id, .. }) if *node_id == tc.arena.node(parent).id)));
 }
 
 #[test]
@@ -3244,17 +4332,22 @@ fn reinsert_rejects_a_page_misaligned_boundary() {
 }
 
 #[test]
-#[should_panic(expected = "tombstone Swa lock_ref should be 0 on unevict")]
-fn reinsert_rejects_a_locked_tombstone() {
+fn reinsert_rebuilds_a_locked_tombstone() {
     let mut tc = swa_core(/* window = */ 8, /* page_size = */ 1);
     tc.insert(&insert_params_swa(&vec![1, 2], &[10, 11], 0, 0));
     let root = tc.arena.root();
     let node = child_of(&tc, root, &[1]);
     evict_full(&mut tc, node, /* remaining_size = */ 0);
+    // Segment locks count evicted nodes, so a locked tombstone is legal and
+    // the re-insert rebuilds its SWA from the fresh KV.
     tc.arena
         .node_mut(node)
         .set_lock_ref_(ValueSlotIdx::device(SWA), 1);
-    tc.insert(&insert_params_swa(&vec![1, 2], &[20, 21], 0, 0));
+    let result = tc.insert(&insert_params_swa(&vec![1, 2], &[20, 21], 0, 0));
+    assert!(result.cache_actions.iter().any(|action| matches!(
+        action.as_any().downcast_ref::<SwaRebuild>(),
+        Some(SwaRebuild { .. })
+    )));
 }
 
 fn set_full_host(tc: &mut UnifiedTreeCore<Vec<i64>>, node: NodeIdx_) {
@@ -3491,6 +4584,7 @@ fn backup_storage_transfers_carry_trailing_page_keys() {
             /* host_indices = */ None,
             /* token_ids = */ None,
             /* prefetch_tokens = */ 0,
+            /* staging_tokens = */ 0,
             /* last_hash = */ None,
         )
         .unwrap()
@@ -3521,6 +4615,7 @@ fn backup_storage_is_none_without_host_value_or_hashes() {
             /* host_indices = */ None,
             /* token_ids = */ None,
             /* prefetch_tokens = */ 0,
+            /* staging_tokens = */ 0,
             /* last_hash = */ None,
         )
     };
@@ -3542,7 +4637,7 @@ fn build_transfers_are_gated_off_until_the_swa_host_pool_is_wired() {
             .build_hicache_transfers(
                 &tc, a, phase, /* mamba_pool_idx = */ None, /* host_indices = */ None,
                 /* token_ids = */ None, /* prefetch_tokens = */ 0,
-                /* last_hash = */ None,
+                /* staging_tokens = */ 0, /* last_hash = */ None,
             )
             .unwrap();
         assert!(transfers.is_none());
@@ -3558,6 +4653,7 @@ fn build_transfers_are_gated_off_until_the_swa_host_pool_is_wired() {
             /* host_indices = */ None,
             /* token_ids = */ None,
             /* prefetch_tokens = */ 0,
+            /* staging_tokens = */ 0,
             /* last_hash = */ None,
         )
         .unwrap();
@@ -3567,6 +4663,7 @@ fn build_transfers_are_gated_off_until_the_swa_host_pool_is_wired() {
 #[test]
 fn backup_host_build_wraps_the_device_value_as_int64() {
     let mut tc = swa_core(/* window = */ 4, /* page_size = */ 1);
+    tc.set_has_swa_host_pool();
     let [a] = chain::<1>(&mut tc);
     tc.arena
         .set_device_value(a, SWA, Tensor::from_slice(&[5i32]));
@@ -3579,6 +4676,7 @@ fn backup_host_build_wraps_the_device_value_as_int64() {
             /* host_indices = */ None,
             /* token_ids = */ None,
             /* prefetch_tokens = */ 0,
+            /* staging_tokens = */ 0,
             /* last_hash = */ None,
         )
         .unwrap()
@@ -3590,12 +4688,16 @@ fn backup_host_build_wraps_the_device_value_as_int64() {
     assert_eq!(device_indices.kind(), Kind::Int64);
     assert!(device_indices.equal(&Tensor::from_slice(&[5i64])));
     assert!(xfer.host_indices.is_none());
-    assert!(xfer.nodes_to_load.is_none());
+    assert_eq!(
+        xfer.nodes_to_load.as_deref(),
+        Some(&[tc.arena.node(a).id][..])
+    );
 }
 
 #[test]
 fn backup_host_build_returns_none_for_a_tombstone() {
     let mut tc = swa_core(/* window = */ 4, /* page_size = */ 1);
+    tc.set_has_swa_host_pool();
     let [a] = chain::<1>(&mut tc);
     let transfers = swa_component(4)
         .build_hicache_transfers(
@@ -3606,6 +4708,7 @@ fn backup_host_build_returns_none_for_a_tombstone() {
             /* host_indices = */ None,
             /* token_ids = */ None,
             /* prefetch_tokens = */ 0,
+            /* staging_tokens = */ 0,
             /* last_hash = */ None,
         )
         .unwrap();
@@ -3615,17 +4718,19 @@ fn backup_host_build_returns_none_for_a_tombstone() {
 #[test]
 fn backup_spec_reads_the_swa_value_recovered_by_an_earlier_action() {
     let mut tc = swa_core(/* window = */ 4, /* page_size = */ 1);
+    tc.set_has_swa_host_pool();
     let [a] = chain::<1>(&mut tc);
     tc.arena
         .set_device_value(a, FULL, Tensor::from_slice(&[9i64]));
     let a_id = tc.arena.node(a).id;
     // The tombstone carries no SWA transfer into the backup spec.
-    let (_, xfers) = tc.build_backup_spec(a_id);
+    let (_, xfers) = tc.build_backup_spec(a_id).expect("live test node");
     assert!(xfers.is_empty());
     // The cache resolves the recover/rebuild action, then rebuilds the spec:
     // the deferred read now captures the freshly stored SWA value.
-    tc.set_component_device_value(a_id, SWA, Tensor::from_slice(&[50i64]));
-    let (_, xfers) = tc.build_backup_spec(a_id);
+    tc.set_component_device_value(a_id, SWA, Tensor::from_slice(&[50i64]))
+        .expect("live test node");
+    let (_, xfers) = tc.build_backup_spec(a_id).expect("live test node");
     let swa_xfer = &xfers[&SWA][0];
     assert!(
         swa_xfer
@@ -3654,6 +4759,7 @@ fn load_back_build_collects_host_only_nodes_within_the_window() {
             /* host_indices = */ None,
             /* token_ids = */ None,
             /* prefetch_tokens = */ 0,
+            /* staging_tokens = */ 0,
             /* last_hash = */ None,
         )
         .unwrap()
@@ -3694,6 +4800,7 @@ fn load_back_build_stops_at_the_window_boundary() {
             /* host_indices = */ None,
             /* token_ids = */ None,
             /* prefetch_tokens = */ 0,
+            /* staging_tokens = */ 0,
             /* last_hash = */ None,
         )
         .unwrap()
@@ -3727,6 +4834,7 @@ fn load_back_build_returns_none_when_the_window_is_on_device() {
             /* host_indices = */ None,
             /* token_ids = */ None,
             /* prefetch_tokens = */ 0,
+            /* staging_tokens = */ 0,
             /* last_hash = */ None,
         )
         .unwrap();
@@ -3746,6 +4854,7 @@ fn load_back_build_rejects_a_bare_window_node() {
             /* host_indices = */ None,
             /* token_ids = */ None,
             /* prefetch_tokens = */ 0,
+            /* staging_tokens = */ 0,
             /* last_hash = */ None,
         ),
         Err(TreeCoreRuntimeError::SwaLoadBackMissingValue { node_id })
@@ -3762,20 +4871,21 @@ fn fallible_load_back_boundaries_reject_a_bare_window_node() {
     let node_id = tc.arena.node(a).id;
 
     assert!(matches!(
-        tc.try_build_hicache_transfers(
+        tc.build_hicache_transfers(
             SWA,
             node_id,
             CacheTransferPhase::LoadBack,
             /* host_indices = */ None,
             /* token_ids = */ None,
             /* prefetch_tokens = */ 0,
+            /* staging_tokens = */ 0,
             /* last_hash = */ None,
         ),
         Err(TreeCoreRuntimeError::SwaLoadBackMissingValue { node_id: missing })
             if missing == node_id
     ));
     assert!(matches!(
-        tc.try_build_load_back_spec(node_id, /* req = */ None),
+        tc.build_load_back_spec(node_id, /* req = */ None),
         Err(TreeCoreRuntimeError::SwaLoadBackMissingValue { node_id: missing })
             if missing == node_id
     ));
@@ -3825,13 +4935,10 @@ fn load_back_commit_attaches_chunks_and_emits_the_rebuild_action() {
     assert!(tc.device_lru_list(SWA).in_list(Some(b)));
     assert_eq!(tc.swa_evictable_size(), 2);
     assert_eq!(cache_actions.len(), 1);
-    let CacheAction::RebuildFullToSwaMapping {
+    let RebuildFullToSwaMapping {
         full_indices,
         swa_indices,
-    } = &cache_actions[0]
-    else {
-        panic!("expected a RebuildFullToSwaMapping action");
-    };
+    } = expect_action::<RebuildFullToSwaMapping>(cache_actions[0].as_ref());
     assert_eq!(full_indices.len(), 2);
     assert!(full_indices[0].equal(&Tensor::from_slice(&[40i64])));
     assert!(full_indices[1].equal(&Tensor::from_slice(&[41i64])));
@@ -3891,26 +4998,47 @@ fn load_back_commit_asserts_the_loaded_length_matches_the_host_indices() {
 }
 
 #[test]
-fn backup_host_commit_sets_the_host_value_once() {
+fn backup_host_commit_sets_the_host_value() {
     let mut tc = swa_core(/* window = */ 4, /* page_size = */ 1);
     let [a] = chain::<1>(&mut tc);
+    set_swa_device(&mut tc, a);
+    commit_backup(&mut tc, a, &[30i64], /* nodes_to_load = */ None);
+    assert!(
+        tc.arena
+            .host_value(a, SWA)
+            .equal(&Tensor::from_slice(&[30i64]))
+    );
+}
+
+#[test]
+#[should_panic(expected = "is not device-only")]
+fn backup_host_commit_rejects_a_target_that_is_already_backed_up() {
+    let mut tc = swa_core(/* window = */ 4, /* page_size = */ 1);
+    let [a] = chain::<1>(&mut tc);
+    set_swa_device(&mut tc, a);
+    set_swa_host(&mut tc, a);
+    let a_id = tc.arena.node(a).id;
+    commit_backup(&mut tc, a, &[30i64], Some(vec![a_id]));
+}
+
+#[test]
+#[should_panic(expected = "is not device-only")]
+fn backup_host_commit_rejects_a_target_without_a_device_value() {
+    let mut tc = swa_core(/* window = */ 4, /* page_size = */ 1);
+    let [a] = chain::<1>(&mut tc);
+    let a_id = tc.arena.node(a).id;
+    commit_backup(&mut tc, a, &[30i64], Some(vec![a_id]));
+}
+
+#[test]
+fn backup_host_commit_without_offsets_attaches_the_whole_span_once() {
+    let mut tc = swa_core(/* window = */ 4, /* page_size = */ 1);
+    let [a] = chain::<1>(&mut tc);
+    // A hand-built transfer carries no offsets to scatter by, so the whole
+    // span attaches to this node and a repeat commit is a no-op.
     for host in [30i64, 31] {
-        let transfer = PoolTransfer {
-            name: PoolName::Swa,
-            host_indices: Some(Tensor::from_slice(&[host])),
-            ..Default::default()
-        };
-        swa_component(4).commit_hicache_transfer(
-            &mut tc,
-            a,
-            CacheTransferPhase::BackupHost,
-            vec![transfer],
-            &mut Vec::new(),
-            /* insert_result = */ None,
-            /* pool_storage_result = */ None,
-        );
+        commit_backup(&mut tc, a, &[host], /* nodes_to_load = */ None);
     }
-    // The second commit is a no-op: the first host value sticks.
     assert!(
         tc.arena
             .host_value(a, SWA)
@@ -3974,26 +5102,32 @@ fn commit_hicache_transfers_routes_to_the_component() {
         &mut cache_actions,
         /* insert_result = */ None,
         /* pool_storage_result = */ None,
-    );
+    )
+    .expect("live test node");
     assert_eq!(cache_actions.len(), 1);
 }
 
 #[test]
-fn prefetch_build_wraps_the_host_buffer_with_placeholder_keys() {
+fn prefetch_build_sizes_the_placeholder_keys_from_the_staging_tokens() {
     let tc = swa_core(/* window = */ 4, /* page_size = */ 1);
-    let transfers = swa_component(4)
-        .build_hicache_transfers(
-            &tc,
-            tc.arena.root(),
-            CacheTransferPhase::Prefetch,
-            /* mamba_pool_idx = */ None,
-            /* host_indices = */ Some(Tensor::from_slice(&[30i64, 31])),
-            /* token_ids = */ None,
-            /* prefetch_tokens = */ 0,
-            /* last_hash = */ None,
-        )
-        .unwrap()
-        .unwrap();
+    let build = |staging_tokens: usize| {
+        swa_component(4)
+            .build_hicache_transfers(
+                &tc,
+                tc.arena.root(),
+                CacheTransferPhase::Prefetch,
+                /* mamba_pool_idx = */ None,
+                /* host_indices = */ None,
+                /* token_ids = */ None,
+                /* prefetch_tokens = */ 0,
+                staging_tokens,
+                /* last_hash = */ None,
+            )
+            .unwrap()
+    };
+    // Staging is allocated once the hit is known: the build carries only the
+    // planned page count, never a host buffer.
+    let transfers = build(2).unwrap();
     assert_eq!(transfers.len(), 1);
     assert_eq!(
         transfers[0].keys,
@@ -4003,13 +5137,8 @@ fn prefetch_build_wraps_the_host_buffer_with_placeholder_keys() {
         ])
     );
     assert_eq!(transfers[0].hit_policy, PoolHitPolicy::TrailingPages);
-    assert!(
-        transfers[0]
-            .host_indices
-            .as_ref()
-            .unwrap()
-            .equal(&Tensor::from_slice(&[30i64, 31]))
-    );
+    assert!(transfers[0].host_indices.is_none());
+    assert!(build(0).is_none());
 }
 
 #[test]
@@ -4044,9 +5173,8 @@ fn prefetch_commit_drops_the_whole_window_when_underloaded() {
     );
     assert!(!tc.arena.node(a).has_host_value(SWA));
     assert_eq!(cache_actions.len(), 1);
-    let CacheAction::FreeComponentHostSlot { host_indices, .. } = &cache_actions[0] else {
-        panic!("expected a host free");
-    };
+    let FreeComponentHostSlot { host_indices, .. } =
+        expect_action::<FreeComponentHostSlot>(cache_actions[0].as_ref());
     assert!(host_indices[0].equal(&Tensor::from_slice(&[30i64, 31])));
 }
 
@@ -4075,9 +5203,8 @@ fn prefetch_commit_without_a_target_releases_the_whole_buffer() {
         Some(&storage_result),
     );
     assert_eq!(cache_actions.len(), 1);
-    let CacheAction::FreeComponentHostSlot { host_indices, .. } = &cache_actions[0] else {
-        panic!("expected a host free");
-    };
+    let FreeComponentHostSlot { host_indices, .. } =
+        expect_action::<FreeComponentHostSlot>(cache_actions[0].as_ref());
     assert!(host_indices[0].equal(&Tensor::from_slice(&[30i64, 31])));
 
     // An insert result without an inserted host node releases the same way.
@@ -4101,17 +5228,16 @@ fn prefetch_commit_without_a_target_releases_the_whole_buffer() {
         Some(&storage_result),
     );
     assert_eq!(cache_actions.len(), 1);
-    let CacheAction::FreeComponentHostSlot { host_indices, .. } = &cache_actions[0] else {
-        panic!("expected a host free");
-    };
+    let FreeComponentHostSlot { host_indices, .. } =
+        expect_action::<FreeComponentHostSlot>(cache_actions[0].as_ref());
     assert!(host_indices[0].equal(&Tensor::from_slice(&[30i64, 31])));
     assert!(!tc.arena.node(a).has_host_value(SWA));
 }
 
 #[test]
-fn prefetch_commit_releases_the_out_of_path_prefix() {
+fn prefetch_commit_releases_a_shortened_window_under_a_non_root_anchor() {
     // root -> a -> b -> c, one token each; anchor b, target c: the loaded
-    // window spans two tokens but the leaf->anchor path covers only c's one.
+    // window is missing its head and cannot be reused as a complete SWA window.
     let mut tc = swa_core(/* window = */ 4, /* page_size = */ 1);
     let [a, b, c] = chain::<3>(&mut tc);
     let mut cache_actions = Vec::new();
@@ -4137,21 +5263,14 @@ fn prefetch_commit_releases_the_out_of_path_prefix() {
         Some(&mut insert_result),
         Some(&storage_result),
     );
-    // c (on path) fills with the buffer tail; the out-of-path prefix releases.
-    assert!(
-        tc.arena
-            .node(c)
-            .host_value(SWA)
-            .equal(&Tensor::from_slice(&[31i64]))
-    );
+    assert!(!tc.arena.node(c).has_host_value(SWA));
     assert!(!tc.arena.node(b).has_host_value(SWA));
     assert!(!tc.arena.node(a).has_host_value(SWA));
-    assert!(tc.host_lru_list(SWA).in_list(Some(c)));
+    assert!(!tc.host_lru_list(SWA).in_list(Some(c)));
     assert_eq!(cache_actions.len(), 1);
-    let CacheAction::FreeComponentHostSlot { host_indices, .. } = &cache_actions[0] else {
-        panic!("expected a host free");
-    };
-    assert!(host_indices[0].equal(&Tensor::from_slice(&[30i64])));
+    let FreeComponentHostSlot { host_indices, .. } =
+        expect_action::<FreeComponentHostSlot>(cache_actions[0].as_ref());
+    assert!(host_indices[0].equal(&Tensor::from_slice(&[30i64, 31])));
 }
 
 #[test]
@@ -4200,9 +5319,8 @@ fn prefetch_commit_fills_tombstoned_nodes_and_releases_covered_ones() {
             .equal(&Tensor::from_slice(&[40i64]))
     );
     assert_eq!(cache_actions.len(), 1);
-    let CacheAction::FreeComponentHostSlot { host_indices, .. } = &cache_actions[0] else {
-        panic!("expected a host free");
-    };
+    let FreeComponentHostSlot { host_indices, .. } =
+        expect_action::<FreeComponentHostSlot>(cache_actions[0].as_ref());
     assert!(host_indices[0].equal(&Tensor::from_slice(&[31i64])));
 }
 
@@ -4259,13 +5377,10 @@ fn release_swa_host_queues_a_free_action_for_non_empty_indices() {
     let mut cache_actions = Vec::new();
     swa_component(4).release_swa_host_(Tensor::from_slice(&[7i64]), &mut cache_actions);
     assert_eq!(cache_actions.len(), 1);
-    let CacheAction::FreeComponentHostSlot {
+    let FreeComponentHostSlot {
         component_type,
         host_indices,
-    } = &cache_actions[0]
-    else {
-        panic!("expected a FreeComponentHostSlot action");
-    };
+    } = expect_action::<FreeComponentHostSlot>(cache_actions[0].as_ref());
     assert_eq!(*component_type, SWA);
     assert_eq!(host_indices.len(), 1);
     assert!(host_indices[0].equal(&Tensor::from_slice(&[7i64])));
@@ -4317,8 +5432,9 @@ fn build_load_back_spec_includes_the_swa_transfers() {
     set_full_host(&mut tc, n);
     tc.arena
         .set_host_value(n, SWA, Tensor::from_slice(&[30i64]));
-    let (kv_xfer, mut comp_xfers) =
-        tc.build_load_back_spec(tc.arena.node(n).id, /* req = */ None);
+    let (kv_xfer, mut comp_xfers) = tc
+        .build_load_back_spec(tc.arena.node(n).id, /* req = */ None)
+        .expect("live test node");
     assert_eq!(kv_xfer.nodes_to_load, Some(vec![tc.arena.node(n).id]));
     let swa_xfers = comp_xfers.get_mut(&SWA).unwrap();
     assert_eq!(swa_xfers.len(), 1);
@@ -4332,12 +5448,14 @@ fn build_load_back_spec_includes_the_swa_transfers() {
     assert_eq!(swa_xfers[0].nodes_to_load, Some(vec![tc.arena.node(n).id]));
     // The orchestrator fills each transfer's device side from the pool load.
     swa_xfers[0].device_indices = Some(Tensor::from_slice(&[60i64]));
-    let actions = tc.commit_load_back(
-        tc.arena.node(n).id,
-        Tensor::from_slice(&[50i64]),
-        kv_xfer,
-        comp_xfers,
-    );
+    let actions = tc
+        .commit_load_back(
+            tc.arena.node(n).id,
+            Tensor::from_slice(&[50i64]),
+            kv_xfer,
+            comp_xfers,
+        )
+        .expect("live test node");
     assert!(
         tc.arena
             .device_value(n, FULL)
@@ -4350,8 +5468,10 @@ fn build_load_back_spec_includes_the_swa_transfers() {
     );
     assert_eq!(actions.len(), 1);
     assert!(matches!(
-        actions[0],
-        CacheAction::RebuildFullToSwaMapping { .. }
+        (actions[0])
+            .as_any()
+            .downcast_ref::<RebuildFullToSwaMapping>(),
+        Some(RebuildFullToSwaMapping { .. })
     ));
 }
 
@@ -4383,7 +5503,8 @@ fn auxiliary_load_does_not_reuse_a_full_pending_pin() {
             ..Default::default()
         },
         HashMap::new(),
-    );
+    )
+    .expect("live test node");
     assert_eq!(tc.arena.node(shared).load_back_pending_id, Some(shared_id));
 
     let swa_xfer = PoolTransfer {
@@ -4403,7 +5524,8 @@ fn auxiliary_load_does_not_reuse_a_full_pending_pin() {
             ..Default::default()
         },
         HashMap::from([(SWA, vec![swa_xfer])]),
-    );
+    )
+    .expect("live test node");
 
     assert_eq!(tc.arena.node(shared).load_back_pending_id, Some(shared_id));
     assert_eq!(
@@ -4413,7 +5535,7 @@ fn auxiliary_load_does_not_reuse_a_full_pending_pin() {
 }
 
 #[test]
-fn swa_device_eviction_skips_a_load_back_pinned_node() {
+fn swa_device_eviction_preserves_a_locked_load_back_destination() {
     let mut tc: UnifiedTreeCore<Vec<i64>> = UnifiedTreeCore::new(
         CacheInitParams {
             is_write_back: true,
@@ -4426,30 +5548,37 @@ fn swa_device_eviction_skips_a_load_back_pinned_node() {
     let [n] = chain::<1>(&mut tc);
     set_full_host(&mut tc, n);
     set_swa_host(&mut tc, n);
-    let (kv_xfer, mut comp_xfers) =
-        tc.build_load_back_spec(tc.arena.node(n).id, /* req = */ None);
+    let (kv_xfer, mut comp_xfers) = tc
+        .build_load_back_spec(tc.arena.node(n).id, /* req = */ None)
+        .expect("live test node");
     comp_xfers.get_mut(&SWA).unwrap()[0].device_indices = Some(Tensor::from_slice(&[60i64]));
     tc.commit_load_back(
         tc.arena.node(n).id,
         Tensor::from_slice(&[50i64]),
         kv_xfer,
         comp_xfers,
-    );
-    // The pin alone keeps the in-flight SWA slice out of every eviction branch.
+    )
+    .expect("live test node");
+    let receipt = tc
+        .inc_lock_ref(tc.arena.node(n).id, ComponentSet::EMPTY)
+        .expect("live test node");
+    // The selected SWA destination is protected by its component lock.
     tc.evict_device_start(SWA, 4);
     let (next, _) = tc.evict_device_next_node(SWA, &HashMap::new());
     assert_eq!(next, None);
     tc.evict_device_end(SWA);
     assert!(tc.arena.has_device_value(n, SWA));
-    tc.finish_load_back(tc.arena.node(n).id);
+    tc.dec_lock_ref(tc.arena.node(n).id, &receipt.to_dec_params(), false)
+        .expect("live test node");
+    tc.finish_load_back(tc.arena.node(n).id)
+        .expect("live test node");
     tc.evict_device_start(SWA, 4);
     let (next, _) = tc.evict_device_next_node(SWA, &HashMap::new());
     assert_eq!(next, Some(tc.arena.node(n).id));
     tc.evict_device_end(SWA);
 }
 
-#[test]
-fn swa_host_eviction_skips_a_load_back_pinned_node() {
+fn check_swa_device_restored_during_full_load_back(pin_ancestor: bool) {
     let mut tc: UnifiedTreeCore<Vec<i64>> = UnifiedTreeCore::new(
         CacheInitParams {
             is_write_back: true,
@@ -4460,38 +5589,220 @@ fn swa_host_eviction_skips_a_load_back_pinned_node() {
         vec![FULL, SWA],
     );
     let [a, b] = chain::<2>(&mut tc);
-    set_full_host(&mut tc, a);
-    set_swa_host(&mut tc, a);
-    set_full_host(&mut tc, b);
-    set_swa_host(&mut tc, b);
-    tc.host_lru_list_mut(SWA).insert_mru(a);
-    let (kv_xfer, mut comp_xfers) =
-        tc.build_load_back_spec(tc.arena.node(b).id, /* req = */ None);
+    let [a_id, b_id] = [a, b].map(|idx| tc.arena.node(idx).id);
+    for (idx, swa) in [(a, 20i64), (b, 21)] {
+        set_full_host(&mut tc, idx);
+        tc.arena
+            .set_host_value(idx, SWA, Tensor::from_slice(&[swa]));
+        tc.host_lru_list_mut(SWA).insert_mru(idx);
+        tc.update_evictable_leaf_sets_(idx);
+    }
+    let release_params = |receipt: IncLockRefResult| receipt.to_dec_params();
+    let host_lock = release_params(tc.inc_host_lock_ref(b_id).unwrap());
+    let temporary_lock = release_params(tc.inc_lock_ref(b_id, ComponentSet::EMPTY).unwrap());
+    let (full, mut transfers) = tc.build_load_back_spec(b_id, None).unwrap();
+    assert_eq!(full.nodes_to_load, Some(vec![a_id, b_id]));
+    assert_eq!(transfers[&SWA][0].nodes_to_load, Some(vec![b_id]));
+    transfers.get_mut(&SWA).unwrap()[0].device_indices = Some(Tensor::from_slice(&[60i64]));
+    tc.dec_lock_ref(b_id, &temporary_lock, false).unwrap();
+    tc.commit_load_back(b_id, Tensor::from_slice(&[50i64, 51]), full, transfers)
+        .unwrap();
+    let pending_lock = release_params(tc.inc_lock_ref(b_id, ComponentSet::EMPTY).unwrap());
+    assert!(!tc.arena.has_device_value(a, SWA));
+
+    // A is outside the loaded SWA window. A new request emits the normal
+    // locked-Full repair action; resolve only its allocator/mapping boundary.
+    let inserted = tc.insert(&insert_params_swa(&vec![1], &[90], 0, 0));
+    let [action] = inserted.cache_actions.as_slice() else {
+        panic!("expected one RecoverSwaWithLockedFull action");
+    };
+    let RecoverSwaWithLockedFull {
+        node_id,
+        kept_full,
+        incoming_full,
+    } = expect_action::<RecoverSwaWithLockedFull>(action.as_ref());
+    assert_eq!(*node_id, a_id);
+    assert!(kept_full.equal(&Tensor::from_slice(&[50i64])));
+    assert!(incoming_full.equal(&Tensor::from_slice(&[90i64])));
+    tc.set_component_device_value(a_id, SWA, Tensor::from_slice(&[70i64]))
+        .unwrap();
+    assert!(tc.arena.node(a).is_load_back_pending());
+    assert_eq!(tc.arena.device_lock_ref(a, SWA), 0);
+    assert_eq!(tc.arena.device_lock_ref(b, SWA), 1);
+    let ancestor_lock =
+        pin_ancestor.then(|| release_params(tc.inc_lock_ref(a_id, ComponentSet::EMPTY).unwrap()));
+    let active: Vec<_> = ancestor_lock.iter().map(|_| (a_id as i64, a_id)).collect();
+    tc.sanity_check(&active, &[(b_id as i64, b_id)]);
+
+    tc.evict_device_start(SWA, 1);
+    let (next, step) = tc.evict_device_next_node(SWA, &HashMap::new());
+    tc.evict_device_end(SWA);
+    assert_eq!(next, None);
     assert_eq!(
-        comp_xfers.get(&SWA).unwrap()[0].nodes_to_load,
-        Some(vec![tc.arena.node(b).id])
+        step.tracker.get(&SWA).copied().unwrap_or(0),
+        usize::from(!pin_ancestor)
     );
-    comp_xfers.get_mut(&SWA).unwrap()[0].device_indices = Some(Tensor::from_slice(&[60i64]));
-    tc.commit_load_back(
-        tc.arena.node(b).id,
-        Tensor::from_slice(&[50i64, 51]),
-        kv_xfer,
-        comp_xfers,
+    assert!(step.host_frees.is_empty());
+    if pin_ancestor {
+        assert!(step.device_frees.is_empty());
+    } else {
+        assert_eq!(step.device_frees.len(), 1);
+        assert_eq!(step.device_frees[&SWA].len(), 1);
+        // free_swa resolves physical rows through the retained Full indices.
+        assert!(step.device_frees[&SWA][0].equal(&Tensor::from_slice(&[50i64])));
+    }
+    assert_eq!(tc.arena.has_device_value(a, SWA), pin_ancestor);
+    assert!(
+        tc.arena
+            .device_value(b, SWA)
+            .equal(&Tensor::from_slice(&[60i64]))
     );
+    assert!(
+        tc.arena
+            .device_value(a, FULL)
+            .equal(&Tensor::from_slice(&[50i64]))
+    );
+    assert!(
+        tc.arena
+            .device_value(b, FULL)
+            .equal(&Tensor::from_slice(&[51i64]))
+    );
+    tc.sanity_check(&active, &[(b_id as i64, b_id)]);
 
-    let result = tc.drive_host_eviction(SWA, /* num_tokens = */ 1);
-    assert_eq!(result.tracker[&SWA], 0);
-    assert!(result.host_frees.is_empty());
-    assert!(tc.arena.has_host_value(a, SWA));
-
-    tc.finish_load_back(tc.arena.node(b).id);
-    let result = tc.drive_host_eviction(SWA, /* num_tokens = */ 1);
-    assert_eq!(result.tracker[&SWA], 1);
-    assert_eq!(result.host_frees[&SWA].len(), 1);
-    // Write-back reclaims the loaded node's coexisting host duplicate first.
-    assert!(tc.arena.has_host_value(a, SWA));
-    assert!(!tc.arena.has_host_value(b, SWA));
+    tc.dec_lock_ref(b_id, &pending_lock, false).unwrap();
+    tc.dec_host_lock_ref(b_id, &host_lock).unwrap();
+    tc.finish_load_back(b_id).unwrap();
+    tc.evict_device_start(SWA, 1);
+    let (next, _) = tc.evict_device_next_node(SWA, &HashMap::new());
+    tc.evict_device_end(SWA);
+    assert_eq!(next, Some(b_id));
+    if let Some(params) = ancestor_lock {
+        tc.dec_lock_ref(a_id, &params, false).unwrap();
+    }
     tc.sanity_check(&[], &[]);
+}
+
+#[test]
+fn swa_device_eviction_reclaims_state_restored_during_full_load_back() {
+    check_swa_device_restored_during_full_load_back(false);
+}
+
+#[test]
+fn swa_device_eviction_preserves_pins_during_full_load_back() {
+    check_swa_device_restored_during_full_load_back(true);
+}
+
+fn check_swa_host_eviction_during_full_load_back(lock_ancestor_host: bool) {
+    let mut tc: UnifiedTreeCore<Vec<i64>> = UnifiedTreeCore::new(
+        CacheInitParams {
+            is_write_back: true,
+            enable_hicache: true,
+            has_swa_host_pool: true,
+            ..swa_params_with_window(1)
+        },
+        vec![FULL, SWA],
+    );
+    let [a, b] = chain::<2>(&mut tc);
+    let a_id = tc.arena.node(a).id;
+    let b_id = tc.arena.node(b).id;
+    set_full_host(&mut tc, a);
+    set_full_host(&mut tc, b);
+    tc.arena
+        .set_host_value(a, SWA, Tensor::from_slice(&[20i64]));
+    tc.arena
+        .set_host_value(b, SWA, Tensor::from_slice(&[21i64]));
+    tc.host_lru_list_mut(SWA).insert_mru(a);
+    tc.host_lru_list_mut(SWA).insert_mru(b);
+    tc.update_evictable_leaf_sets_(a);
+    tc.update_evictable_leaf_sets_(b);
+    let release_params = |receipt: IncLockRefResult| receipt.to_dec_params();
+    let ancestor_host_lock = lock_ancestor_host
+        .then(|| release_params(tc.inc_host_lock_ref(a_id).expect("live ancestor")));
+    let host_lock = release_params(tc.inc_host_lock_ref(b_id).expect("live anchor"));
+    let before_lock = release_params(
+        tc.inc_lock_ref(b_id, ComponentSet::EMPTY)
+            .expect("live anchor"),
+    );
+    let (kv_xfer, mut comp_xfers) = tc
+        .build_load_back_spec(b_id, /* req = */ None)
+        .expect("live anchor");
+    assert_eq!(kv_xfer.nodes_to_load, Some(vec![a_id, b_id]));
+    let swa_xfer = &mut comp_xfers.get_mut(&SWA).unwrap()[0];
+    // A contributes Full rows but lies outside B's trailing SWA window.
+    assert_eq!(swa_xfer.nodes_to_load, Some(vec![b_id]));
+    assert!(
+        swa_xfer
+            .host_indices
+            .as_ref()
+            .unwrap()
+            .equal(&Tensor::from_slice(&[21i64]))
+    );
+    swa_xfer.device_indices = Some(Tensor::from_slice(&[60i64]));
+    tc.dec_lock_ref(b_id, &before_lock, false)
+        .expect("live anchor");
+    tc.commit_load_back(b_id, Tensor::from_slice(&[50i64, 51]), kv_xfer, comp_xfers)
+        .expect("live anchor");
+    let pending_lock = release_params(
+        tc.inc_lock_ref(b_id, ComponentSet::EMPTY)
+            .expect("live anchor"),
+    );
+    assert!(tc.arena.node(a).is_load_back_pending());
+    assert!(tc.arena.node(b).is_load_back_pending());
+    assert_eq!(
+        tc.arena.host_lock_ref(a, SWA),
+        u32::from(lock_ancestor_host)
+    );
+    assert_eq!(tc.arena.host_lock_ref(b, SWA), 1);
+    tc.sanity_check(&[], &[(b_id as i64, b_id)]);
+
+    let result = tc.drive_host_eviction(SWA, /* num_tokens = */ 1);
+    assert_eq!(result.tracker[&SWA], usize::from(!lock_ancestor_host));
+    assert!(result.device_frees.is_empty());
+    if lock_ancestor_host {
+        assert!(result.host_frees.is_empty());
+    } else {
+        assert_eq!(result.host_frees.len(), 1);
+        assert!(result.host_frees[&SWA][0].equal(&Tensor::from_slice(&[20i64])));
+    }
+    assert_eq!(tc.arena.has_host_value(a, SWA), lock_ancestor_host);
+    assert!(tc.arena.has_host_value(b, SWA));
+    let full_pressure = tc.drive_host_eviction(FULL, 2);
+    assert_eq!(full_pressure.tracker[&FULL], 0);
+    assert!(full_pressure.host_frees.is_empty());
+    assert!(tc.arena.has_host_value(a, FULL));
+    assert!(tc.arena.has_host_value(b, FULL));
+    tc.sanity_check(&[], &[(b_id as i64, b_id)]);
+
+    tc.dec_lock_ref(b_id, &pending_lock, false)
+        .expect("live anchor");
+    tc.dec_host_lock_ref(b_id, &host_lock).expect("live anchor");
+    tc.finish_load_back(b_id).expect("live anchor");
+    if let Some(params) = ancestor_host_lock {
+        tc.dec_host_lock_ref(a_id, &params).expect("live ancestor");
+    }
+    let result = tc.drive_host_eviction(SWA, /* num_tokens = */ 1);
+    assert_eq!(result.tracker[&SWA], usize::from(lock_ancestor_host));
+    if lock_ancestor_host {
+        assert_eq!(result.host_frees[&SWA].len(), 1);
+        assert!(result.host_frees[&SWA][0].equal(&Tensor::from_slice(&[20i64])));
+    } else {
+        assert!(result.host_frees.is_empty());
+    }
+    assert!(!tc.arena.has_host_value(a, SWA));
+    assert!(tc.arena.has_host_value(b, SWA));
+    assert!(!tc.arena.node(a).is_load_back_pending());
+    assert!(!tc.arena.node(b).is_load_back_pending());
+    tc.sanity_check(&[], &[]);
+}
+
+#[test]
+fn swa_host_eviction_reclaims_outside_window_during_full_load_back() {
+    check_swa_host_eviction_during_full_load_back(false);
+}
+
+#[test]
+fn swa_host_eviction_preserves_locked_ancestor_during_full_load_back() {
+    check_swa_host_eviction_during_full_load_back(true);
 }
 
 #[test]
@@ -4511,21 +5822,28 @@ fn build_load_back_spec_degrades_to_empty_on_a_foreign_pin() {
     set_full_host(&mut tc, b);
     set_swa_host(&mut tc, b);
     // Anchor `a` models a Full-only load whose SWA slice remains host-only.
-    let (kv_xfer, _comp_xfers) =
-        tc.build_load_back_spec(tc.arena.node(a).id, /* req = */ None);
+    let (kv_xfer, _comp_xfers) = tc
+        .build_load_back_spec(tc.arena.node(a).id, /* req = */ None)
+        .expect("live test node");
     tc.commit_load_back(
         tc.arena.node(a).id,
         Tensor::from_slice(&[50i64]),
         kv_xfer,
         HashMap::new(),
-    );
+    )
+    .expect("live test node");
     // Anchor `b` must reject its SWA window because `a` has a foreign pin.
-    let (kv_xfer, comp_xfers) = tc.build_load_back_spec(tc.arena.node(b).id, /* req = */ None);
+    let (kv_xfer, comp_xfers) = tc
+        .build_load_back_spec(tc.arena.node(b).id, /* req = */ None)
+        .expect("live test node");
     assert_eq!(kv_xfer.host_indices.unwrap().numel(), 0);
     assert_eq!(kv_xfer.nodes_to_load, Some(vec![]));
     assert!(comp_xfers.is_empty());
-    tc.finish_load_back(tc.arena.node(a).id);
-    let (kv_xfer, comp_xfers) = tc.build_load_back_spec(tc.arena.node(b).id, /* req = */ None);
+    tc.finish_load_back(tc.arena.node(a).id)
+        .expect("live test node");
+    let (kv_xfer, comp_xfers) = tc
+        .build_load_back_spec(tc.arena.node(b).id, /* req = */ None)
+        .expect("live test node");
     assert_eq!(kv_xfer.nodes_to_load, Some(vec![tc.arena.node(b).id]));
     assert_eq!(
         comp_xfers.get(&SWA).unwrap()[0].nodes_to_load,
@@ -4534,7 +5852,7 @@ fn build_load_back_spec_degrades_to_empty_on_a_foreign_pin() {
 }
 
 #[test]
-fn host_drive_reclaims_swa_coexisting_host_values_when_the_host_lru_is_empty() {
+fn host_drive_preserves_swa_coexisting_host_values_when_the_host_lru_is_empty() {
     let mut tc: UnifiedTreeCore<Vec<i64>> = UnifiedTreeCore::new(
         CacheInitParams {
             is_write_back: true,
@@ -4551,7 +5869,8 @@ fn host_drive_reclaims_swa_coexisting_host_values_when_the_host_lru_is_empty() {
     let leaf_idx = child_of(&tc, parent_idx, &[3]);
     let (parent, leaf) = (tc.arena.node(parent_idx).id, tc.arena.node(leaf_idx).id);
     for (handle, slots) in [(parent, vec![30i64, 31]), (leaf, vec![32i64])] {
-        tc.set_component_device_value(handle, SWA, Tensor::from_slice(&slots));
+        tc.set_component_device_value(handle, SWA, Tensor::from_slice(&slots))
+            .expect("live test node");
     }
     for (handle, host) in [(parent, vec![20i64, 21]), (leaf, vec![22i64])] {
         let swa_xfer = PoolTransfer {
@@ -4563,7 +5882,10 @@ fn host_drive_reclaims_swa_coexisting_host_values_when_the_host_lru_is_empty() {
             handle,
             Tensor::from_slice(&host),
             HashMap::from([(SWA, vec![swa_xfer])]),
-        );
+        )
+        .expect("live test node");
+        tc.mark_write_through_pending(vec![handle], handle).unwrap();
+        tc.finish_write_through(vec![handle], handle).unwrap();
     }
     assert_eq!(tc.host_lru_list(SWA).len(), 0);
 
@@ -4575,8 +5897,10 @@ fn host_drive_reclaims_swa_coexisting_host_values_when_the_host_lru_is_empty() {
         &mut df,
         &mut hf,
     );
-    assert_eq!(tracker[&SWA], 2);
-    assert!(!tc.arena.node(parent_idx).has_host_value(SWA));
+    assert_eq!(tracker[&SWA], 0);
+    assert!(hf.is_empty());
+    assert!(df.is_empty());
+    assert!(tc.arena.node(parent_idx).has_host_value(SWA));
     assert!(tc.arena.node(parent_idx).has_device_value(SWA));
     assert!(tc.arena.node(parent_idx).has_host_value(FULL));
     assert!(tc.arena.node(leaf_idx).has_host_value(SWA));
@@ -4654,9 +5978,11 @@ fn write_through_offloads_a_boundary_split_leaf() {
     let backups: Vec<_> = result
         .cache_actions
         .iter()
-        .filter_map(|action| match action {
-            CacheAction::BackupKV(backup) => Some(backup.node_ids.clone()),
-            _ => None,
+        .filter_map(|action| {
+            action
+                .as_any()
+                .downcast_ref::<BackupKV>()
+                .map(|backup| backup.node_ids.clone())
         })
         .collect();
     assert_eq!(
@@ -4667,12 +5993,14 @@ fn write_through_offloads_a_boundary_split_leaf() {
         tc.arena.node(parent).id,
         Tensor::from_slice(&[100i64, 101]),
         HashMap::new(),
-    );
+    )
+    .expect("live test node");
     tc.commit_backup(
         tc.arena.node(leaf).id,
         Tensor::from_slice(&[102i64, 103]),
         HashMap::new(),
-    );
+    )
+    .expect("live test node");
     let mut tracker = swa_tracker();
     let (mut df, mut hf) = (HashMap::new(), HashMap::new());
     tc.evict_device_start(FULL, /* request_cnt = */ 100);
@@ -4680,7 +6008,9 @@ fn write_through_offloads_a_boundary_split_leaf() {
         let (next, step) = tc.evict_device_next_node(FULL, &tracker);
         accumulate_step(step, &mut tracker, &mut df, &mut hf);
         let Some(next) = next else { break };
-        let (backup, step) = tc.evict_device_leaf(next, /* is_write_back = */ false);
+        let (backup, step) = tc
+            .evict_device_leaf(next, /* is_write_back = */ false)
+            .expect("live test node");
         assert!(backup.is_none());
         accumulate_step(step, &mut tracker, &mut df, &mut hf);
     }
@@ -4693,10 +6023,12 @@ fn write_through_offloads_a_boundary_split_leaf() {
 }
 
 #[test]
-fn deep_swa_tree_survives_backup_evict_and_load_back_rounds() {
+fn deep_request_ring_tree_survives_full_backup_evict_and_load_back_rounds() {
     let mut tc: UnifiedTreeCore<Vec<i64>> = UnifiedTreeCore::new(
         CacheInitParams {
             enable_hicache: true,
+            // Only Full is backed up; the request rebuilds its SWA ring.
+            swa_req_ring: true,
             ..swa_params_with_window(4)
         },
         vec![FULL, SWA],
@@ -4722,12 +6054,13 @@ fn deep_swa_tree_survives_backup_evict_and_load_back_rounds() {
         let result = tc.insert(&insert_params_swa(&key, &kv, 0, swa_evicted_seqlen));
         // Apply the emitted rebuilds the way the cache would.
         for action in &result.cache_actions {
-            if let CacheAction::SwaRebuild {
+            if let Some(SwaRebuild {
                 node_id,
                 source_value,
-            } = action
+            }) = action.as_any().downcast_ref::<SwaRebuild>()
             {
-                tc.set_component_device_value(*node_id, SWA, source_value.copy());
+                tc.set_component_device_value(*node_id, SWA, source_value.copy())
+                    .expect("live test node");
             }
         }
         tc.sanity_check(&[], &[]);
@@ -4744,7 +6077,11 @@ fn deep_swa_tree_survives_backup_evict_and_load_back_rounds() {
             tc.arena.node(node).id,
             Tensor::from_slice(&vec![0i64; len]),
             HashMap::new(),
-        );
+        )
+        .expect("live test node");
+        let handle = tc.arena.node(node).id;
+        tc.mark_write_through_pending(vec![handle], handle).unwrap();
+        tc.finish_write_through(vec![handle], handle).unwrap();
     }
     tc.sanity_check(&[], &[]);
     // Stepwise eviction rounds: half the Full budget, then the whole SWA budget.
@@ -4757,7 +6094,9 @@ fn deep_swa_tree_survives_backup_evict_and_load_back_rounds() {
             let (leaf, step) = tc.evict_device_next_node(FULL, &tracker);
             accumulate_step(step, &mut tracker, &mut df, &mut hf);
             let Some(leaf) = leaf else { break };
-            let (_, step) = tc.evict_device_leaf(leaf, /* is_write_back = */ false);
+            let (_, step) = tc
+                .evict_device_leaf(leaf, /* is_write_back = */ false)
+                .expect("live test node");
             accumulate_step(step, &mut tracker, &mut df, &mut hf);
         }
         tc.evict_device_end(FULL);
@@ -4770,7 +6109,9 @@ fn deep_swa_tree_survives_backup_evict_and_load_back_rounds() {
                 let (leaf, step) = tc.evict_device_next_node(SWA, &tracker);
                 accumulate_step(step, &mut tracker, &mut df, &mut hf);
                 let Some(leaf) = leaf else { break };
-                let (_, step) = tc.evict_device_leaf(leaf, /* is_write_back = */ false);
+                let (_, step) = tc
+                    .evict_device_leaf(leaf, /* is_write_back = */ false)
+                    .expect("live test node");
                 accumulate_step(step, &mut tracker, &mut df, &mut hf);
             }
             tc.evict_device_end(SWA);
@@ -4781,29 +6122,34 @@ fn deep_swa_tree_survives_backup_evict_and_load_back_rounds() {
     // commit-then-lock sequence.
     for key in [vec![1i64, 2, 3, 4, 5, 6], vec![1i64, 2]] {
         let anchor = tc.match_prefix(&match_params(&key)).best_match_node_id;
-        if !tc.is_root(anchor) && tc.is_full_device_evicted(anchor) {
-            let (kv_xfer, comp_xfers) = tc.build_load_back_spec(anchor, /* req = */ None);
+        if !tc.is_root(anchor).expect("live test node")
+            && tc.is_full_device_evicted(anchor).expect("live test node")
+        {
+            let (kv_xfer, comp_xfers) = tc
+                .build_load_back_spec(anchor, /* req = */ None)
+                .expect("live test node");
             let loaded = kv_xfer.host_indices.as_ref().unwrap().numel();
-            let actions = tc.commit_load_back(
-                anchor,
-                Tensor::from_slice(&vec![0i64; loaded]),
-                kv_xfer,
-                comp_xfers,
-            );
+            let actions = tc
+                .commit_load_back(
+                    anchor,
+                    Tensor::from_slice(&vec![0i64; loaded]),
+                    kv_xfer,
+                    comp_xfers,
+                )
+                .expect("live test node");
             assert!(actions.is_empty());
-            let lock = tc.inc_lock_ref(anchor);
-            let params = DecLockRefParams {
-                swa_uuid_for_lock: lock.swa_uuid_for_lock,
-                swa_uuid_for_host_lock: lock.swa_uuid_for_host_lock,
-                skip_lock_node_ids: lock.skip_lock_node_ids,
-            };
-            tc.dec_lock_ref(anchor, Some(&params), /* skip_swa = */ false);
-            tc.finish_load_back(anchor);
+            let lock = tc
+                .inc_lock_ref(anchor, ComponentSet::EMPTY)
+                .expect("live test node");
+            let params = lock.to_dec_params();
+            tc.dec_lock_ref(anchor, &params, /* skip_swa = */ false)
+                .expect("live test node");
+            tc.finish_load_back(anchor).expect("live test node");
         }
         tc.sanity_check(&[], &[]);
     }
     let matched = tc.match_prefix(&match_params(&vec![1, 2, 3, 4, 5, 6]));
-    assert_eq!(matched.device_indices.numel(), 6);
+    assert_eq!(matched.device_prefix_len, 6);
     tc.sanity_check(&[], &[]);
 }
 
@@ -4823,20 +6169,19 @@ fn recovered_swa_span_evicts_before_the_window_leaf() {
     let prefix = child_of(&tc, root, &[1]);
     let leaf = child_of(&tc, prefix, &[9]);
     assert_eq!(tc.arena.node(prefix).key, vec![1, 2, 3, 4, 5, 6, 7, 8]);
-    let [
-        CacheAction::SwaRebuild {
-            node_id,
-            source_value,
-        },
-    ] = result.cache_actions.as_slice()
-    else {
+    let [action] = result.cache_actions.as_slice() else {
         panic!(
             "expected one SwaRebuild action, got {:?}",
             action_kinds(&result.cache_actions)
         );
     };
+    let SwaRebuild {
+        node_id,
+        source_value,
+    } = expect_action::<SwaRebuild>(action.as_ref());
     assert_eq!(*node_id, tc.arena.node(leaf).id);
-    tc.set_component_device_value(*node_id, SWA, source_value.copy());
+    tc.set_component_device_value(*node_id, SWA, source_value.copy())
+        .expect("live test node");
     assert!(!tc.arena.has_device_value(prefix, SWA));
 
     // The fully-in-window re-insert recovers the prefix at its walk barrier.
@@ -4849,24 +6194,24 @@ fn recovered_swa_span_evicts_before_the_window_leaf() {
         /* swa_evicted_seqlen = */ 0,
     ));
     assert!(step.result.is_none());
-    let [
-        CacheAction::FreeDeviceKVFullOnly(old_full),
-        CacheAction::SwaRebuild {
-            node_id,
-            source_value,
-        },
-    ] = step.actions.as_slice()
-    else {
+    let [action0, action1] = step.actions.as_slice() else {
         panic!(
             "expected FreeDeviceKVFullOnly then SwaRebuild, got {:?}",
             action_kinds(&step.actions)
         );
     };
+    let FreeDeviceKVFullOnly { indices: old_full } =
+        expect_action::<FreeDeviceKVFullOnly>(action0.as_ref());
+    let SwaRebuild {
+        node_id,
+        source_value,
+    } = expect_action::<SwaRebuild>(action1.as_ref());
     assert!(old_full[0].equal(&Tensor::from_slice(&[
         100i64, 101, 102, 103, 104, 105, 106, 107
     ])));
     assert_eq!(*node_id, tc.arena.node(prefix).id);
-    tc.set_component_device_value(*node_id, SWA, source_value.copy());
+    tc.set_component_device_value(*node_id, SWA, source_value.copy())
+        .expect("live test node");
     let done = tc.resume_insert();
     assert_eq!(
         done.result.expect("the resumed walk completes").prefix_len,
@@ -4891,4 +6236,443 @@ fn recovered_swa_span_evicts_before_the_window_leaf() {
     assert!(tc.arena.has_device_value(leaf, SWA));
     assert!(tc.arena.has_device_value(leaf, FULL));
     tc.sanity_check(&[], &[]);
+}
+
+#[test]
+fn aux_release_refreshes_the_leaf_set_whatever_the_release_order() {
+    let mut tc = swa_core(/* window = */ 1, /* page_size = */ 1);
+    tc.insert(&insert_params_swa(&vec![1], &[10], 0, 0));
+    let leaf = child_of(&tc, tc.arena.root(), &[1]);
+    store_swa_device(&mut tc, leaf);
+    assert!(tc.evictable_device_leaves.contains(leaf));
+    let result = tc
+        .inc_lock_ref(tc.arena.node(leaf).id, ComponentSet::EMPTY)
+        .expect("live test node");
+    assert!(!tc.evictable_device_leaves.contains(leaf));
+    let params = result.to_dec_params();
+    // Full first: its walk still sees the SWA lock, so the leaf stays out.
+    crate::components::FullComponent
+        .release_component_lock(&mut tc, leaf, &params, /* lock_host = */ false);
+    assert!(!tc.evictable_device_leaves.contains(leaf));
+    // The SWA release drops the last lock and must readmit the leaf itself.
+    swa_component(1).release_component_lock(&mut tc, leaf, &params, /* lock_host = */ false);
+    assert!(tc.evictable_device_leaves.contains(leaf));
+}
+
+#[test]
+#[should_panic(expected = "lock receipt anchored on node")]
+fn dec_lock_ref_rejects_a_receipt_from_another_node() {
+    let mut tc = swa_core(/* window = */ 2, /* page_size = */ 1);
+    let [a, _b, c] = chain(&mut tc);
+    store_swa_device(&mut tc, c);
+    let result = tc
+        .inc_lock_ref(tc.arena.node(c).id, ComponentSet::EMPTY)
+        .expect("live test node");
+    let params = result.to_dec_params();
+    // Same receipt, wrong anchor: the walk would otherwise release a's
+    // segment, which this holder never locked.
+    tc.dec_lock_ref(tc.arena.node(a).id, &params, /* skip_swa = */ false)
+        .expect("live test node");
+}
+
+#[test]
+#[should_panic(expected = "lock receipt anchored on node")]
+fn dec_host_lock_ref_rejects_a_receipt_from_another_node() {
+    let mut tc = swa_core(/* window = */ 2, /* page_size = */ 1);
+    let [a, _b, c] = chain(&mut tc);
+    set_swa_host(&mut tc, c);
+    tc.host_lru_list_mut(SWA).insert_mru(c);
+    let result = tc
+        .inc_host_lock_ref(tc.arena.node(c).id)
+        .expect("live test node");
+    let params = result.to_dec_params();
+    tc.dec_host_lock_ref(tc.arena.node(a).id, &params)
+        .expect("live test node");
+}
+
+#[test]
+fn receipt_anchor_follows_the_locked_node_through_a_split() {
+    let mut tc = swa_core(/* window = */ 1, /* page_size = */ 1);
+    tc.insert(&insert_params_swa(&vec![1, 2], &[10, 11], 0, 0));
+    let leaf = child_of(&tc, tc.arena.root(), &[1]);
+    store_swa_device(&mut tc, leaf);
+    let leaf_id = tc.arena.node(leaf).id;
+    let result = tc
+        .inc_lock_ref(leaf_id, ComponentSet::EMPTY)
+        .expect("live test node");
+    assert_eq!(result.node_id, Some(leaf_id));
+    // Diverge inside the node: the split keeps the id on the deeper half.
+    tc.insert(&insert_params_swa(&vec![1, 3], &[12, 13], 0, 0));
+    let params = result.to_dec_params();
+    tc.dec_lock_ref(leaf_id, &params, /* skip_swa = */ false)
+        .expect("live test node");
+    assert_eq!(
+        tc.arena
+            .device_lock_ref(tc.arena.resolve(leaf_id).expect("live test node"), SWA),
+        0
+    );
+}
+
+#[test]
+#[should_panic(expected = "swa_sliding_window_size must be positive")]
+fn new_panics_on_a_zero_sliding_window_size() {
+    SwaComponent::new(&swa_params_with_window(0));
+}
+
+// ==== SWA branching-point caching ====
+
+// A [Full, Swa] core with both the host tier and the SWA host pool wired.
+fn swa_hicache_core(window: usize, page_size: usize) -> UnifiedTreeCore<Vec<i64>> {
+    let mut tc = swa_core(window, page_size);
+    tc.set_hicache_enabled();
+    tc.set_has_swa_host_pool();
+    tc
+}
+
+fn set_swa_device_value(tc: &mut UnifiedTreeCore<Vec<i64>>, node: NodeIdx_, value: i64) {
+    tc.arena
+        .set_device_value(node, SWA, Tensor::from_slice(&[value]));
+}
+
+fn backup_transfers(
+    tc: &UnifiedTreeCore<Vec<i64>>,
+    window: usize,
+    node: NodeIdx_,
+) -> Option<Vec<PoolTransfer>> {
+    swa_component(window)
+        .build_hicache_transfers(
+            tc,
+            node,
+            CacheTransferPhase::BackupHost,
+            /* mamba_pool_idx = */ None,
+            /* host_indices = */ None,
+            /* token_ids = */ None,
+            /* prefetch_tokens = */ 0,
+            /* staging_tokens = */ 0,
+            /* last_hash = */ None,
+        )
+        .unwrap()
+}
+
+// The node ids one backup transfer covers, and the device indices it moves.
+fn backup_plan(
+    tc: &UnifiedTreeCore<Vec<i64>>,
+    window: usize,
+    node: NodeIdx_,
+) -> (Vec<NodeId>, Vec<i64>) {
+    let transfers = backup_transfers(tc, window, node).expect("a backup transfer");
+    assert_eq!(transfers.len(), 1);
+    let xfer = &transfers[0];
+    assert_eq!(xfer.name, PoolName::Swa);
+    let device_indices = xfer.device_indices.as_ref().expect("device indices");
+    assert_eq!(device_indices.kind(), Kind::Int64);
+    (
+        xfer.nodes_to_load.clone().expect("nodes_to_load"),
+        Vec::<i64>::try_from(device_indices).unwrap(),
+    )
+}
+
+fn commit_backup(
+    tc: &mut UnifiedTreeCore<Vec<i64>>,
+    node: NodeIdx_,
+    host_indices: &[i64],
+    nodes_to_load: Option<Vec<NodeId>>,
+) {
+    swa_component(4).commit_hicache_transfer(
+        tc,
+        node,
+        CacheTransferPhase::BackupHost,
+        vec![PoolTransfer {
+            name: PoolName::Swa,
+            host_indices: Some(Tensor::from_slice(host_indices)),
+            nodes_to_load,
+            ..Default::default()
+        }],
+        &mut Vec::new(),
+        /* insert_result = */ None,
+        /* pool_storage_result = */ None,
+    );
+}
+
+#[test]
+fn backup_host_build_covers_every_device_only_node_in_the_window() {
+    let mut tc = swa_hicache_core(/* window = */ 4, /* page_size = */ 1);
+    let [a, b, c] = chain::<3>(&mut tc);
+    for (node, value) in [(a, 10i64), (b, 11), (c, 12)] {
+        set_swa_device_value(&mut tc, node, value);
+    }
+    let (nodes, device_indices) = backup_plan(&tc, /* window = */ 4, c);
+    // Ancestors first, so the publish side links each store event to its parent.
+    let expected = [a, b, c].map(|node| tc.arena.node(node).id);
+    assert_eq!(nodes, expected.to_vec());
+    assert_eq!(device_indices, vec![10, 11, 12]);
+}
+
+#[test]
+fn backup_host_build_stops_at_a_node_another_ack_owns() {
+    let mut tc = swa_hicache_core(/* window = */ 4, /* page_size = */ 1);
+    let [a, b, c] = chain::<3>(&mut tc);
+    for (node, value) in [(a, 10i64), (b, 11), (c, 12)] {
+        set_swa_device_value(&mut tc, node, value);
+    }
+    let b_id = tc.arena.node(b).id;
+    tc.mark_write_through_pending(vec![b_id], /* ack_id = */ b_id)
+        .expect("live test node");
+
+    // `b`'s ack already owns `b` and everything above it, so this backup takes
+    // only what is left below it: two acks never claim the same node.
+    let (nodes, device_indices) = backup_plan(&tc, /* window = */ 4, c);
+    assert_eq!(nodes, vec![tc.arena.node(c).id]);
+    assert_eq!(device_indices, vec![12]);
+}
+
+#[test]
+fn backup_host_build_stops_at_the_sliding_window_edge() {
+    let mut tc = swa_hicache_core(/* window = */ 2, /* page_size = */ 1);
+    let [a, b, c] = chain::<3>(&mut tc);
+    for (node, value) in [(a, 10i64), (b, 11), (c, 12)] {
+        set_swa_device_value(&mut tc, node, value);
+    }
+    let (nodes, device_indices) = backup_plan(&tc, /* window = */ 2, c);
+    assert_eq!(nodes, vec![tc.arena.node(b).id, tc.arena.node(c).id]);
+    assert_eq!(device_indices, vec![11, 12]);
+}
+
+#[test]
+fn backup_host_build_walks_past_a_node_that_is_already_backed_up() {
+    let mut tc = swa_hicache_core(/* window = */ 4, /* page_size = */ 1);
+    let [a, b, c] = chain::<3>(&mut tc);
+    for (node, value) in [(a, 10i64), (b, 11), (c, 12)] {
+        set_swa_device_value(&mut tc, node, value);
+    }
+    set_swa_host(&mut tc, b);
+
+    // `b` is backed up already: it consumes window budget but is not re-sent,
+    // and the walk continues to the unbacked ancestor above it.
+    let (nodes, device_indices) = backup_plan(&tc, /* window = */ 4, c);
+    assert_eq!(nodes, vec![tc.arena.node(a).id, tc.arena.node(c).id]);
+    assert_eq!(device_indices, vec![10, 12]);
+}
+
+#[test]
+fn backup_host_build_is_none_without_an_swa_host_pool() {
+    let mut tc = swa_core(/* window = */ 4, /* page_size = */ 1);
+    let [a] = chain::<1>(&mut tc);
+    set_swa_device_value(&mut tc, a, 10);
+    assert!(backup_transfers(&tc, /* window = */ 4, a).is_none());
+}
+
+#[test]
+fn backup_host_commit_scatters_the_host_span_across_the_covered_nodes() {
+    let mut tc = swa_hicache_core(/* window = */ 4, /* page_size = */ 1);
+    // Spans 1 / 2 / 1: the scatter has to advance by each node's own length.
+    let mut parent = tc.arena.root();
+    let mut nodes = Vec::new();
+    for key in [vec![1i64], vec![2, 3], vec![4]] {
+        parent = tc
+            .arena
+            .alloc_child(
+                parent, key, /* priority = */ 0, /* extra_key = */ None,
+            )
+            .unwrap();
+        nodes.push(parent);
+    }
+    let [a, b, c] = [nodes[0], nodes[1], nodes[2]];
+    for (node, value) in [(a, vec![10i64]), (b, vec![11, 12]), (c, vec![13])] {
+        tc.arena
+            .set_device_value(node, SWA, Tensor::from_slice(&value));
+    }
+    let (ids, device_indices) = backup_plan(&tc, /* window = */ 4, c);
+    assert_eq!(device_indices, vec![10, 11, 12, 13]);
+    commit_backup(&mut tc, c, &[100i64, 101, 102, 103], Some(ids));
+
+    for (node, host) in [(a, vec![100i64]), (b, vec![101, 102]), (c, vec![103])] {
+        assert!(
+            tc.arena
+                .host_value(node, SWA)
+                .equal(&Tensor::from_slice(&host))
+        );
+    }
+}
+
+#[test]
+fn needs_incremental_backup_tracks_the_unbacked_window() {
+    let mut tc = swa_hicache_core(/* window = */ 4, /* page_size = */ 1);
+    let [a, b] = chain::<2>(&mut tc);
+    let swa = swa_component(4);
+    assert!(!TreeComponent::<Vec<i64>>::needs_incremental_backup(
+        &swa, &tc, b
+    ));
+
+    // A device-only ancestor is enough, even when the target itself is clean.
+    set_swa_device_value(&mut tc, a, 10);
+    set_swa_device_value(&mut tc, b, 11);
+    set_swa_host(&mut tc, b);
+    assert!(TreeComponent::<Vec<i64>>::needs_incremental_backup(
+        &swa, &tc, b
+    ));
+
+    set_swa_host(&mut tc, a);
+    assert!(!TreeComponent::<Vec<i64>>::needs_incremental_backup(
+        &swa, &tc, b
+    ));
+}
+
+#[test]
+fn buffer_mode_backup_window_is_the_target_alone_at_both_call_sites() {
+    // Cache mode walks the window: a host-only target still reaches the
+    // device-only ancestor above it. Buffer mode stages the target alone.
+    let mut tc = swa_hicache_core(/* window = */ 4, /* page_size = */ 1);
+    let [a, b] = chain::<2>(&mut tc);
+    set_swa_device_value(&mut tc, a, 10);
+    set_swa_host(&mut tc, b);
+    let swa = swa_component(4);
+    let a_id = tc.arena.node(a).id;
+    let b_id = tc.arena.node(b).id;
+
+    assert!(TreeComponent::<Vec<i64>>::needs_incremental_backup(
+        &swa, &tc, b
+    ));
+    assert_eq!(
+        backup_transfers(&tc, 4, b).unwrap()[0].nodes_to_load,
+        Some(vec![a_id])
+    );
+
+    tc.set_host_memory_buffer_only();
+    assert!(!TreeComponent::<Vec<i64>>::needs_incremental_backup(
+        &swa, &tc, b
+    ));
+    assert!(backup_transfers(&tc, 4, b).is_none());
+
+    // A device-resident target is staged by itself, whatever its ancestors hold.
+    set_swa_host(&mut tc, a);
+    set_swa_device_value(&mut tc, b, 11);
+    assert!(TreeComponent::<Vec<i64>>::needs_incremental_backup(
+        &swa, &tc, b
+    ));
+    assert_eq!(
+        backup_transfers(&tc, 4, b).unwrap()[0].nodes_to_load,
+        Some(vec![b_id])
+    );
+}
+
+#[test]
+fn write_back_reinsert_defers_swa_backup_while_write_through_publishes() {
+    let mut tc: UnifiedTreeCore<Vec<i64>> = UnifiedTreeCore::new(
+        CacheInitParams {
+            is_write_back: true,
+            enable_hicache: true,
+            has_swa_host_pool: true,
+            ..swa_params_with_window(4)
+        },
+        vec![FULL, SWA],
+    );
+    let key = vec![1, 2];
+    tc.insert(&insert_params_swa(&key, &[10, 11], 0, 0));
+    let leaf_idx = child_of(&tc, tc.arena.root(), &[1]);
+    let leaf = tc.arena.node(leaf_idx).id;
+    // The cache applied the SwaRebuild; Full is on host, SWA is still device-only.
+    store_swa_device(&mut tc, leaf_idx);
+    tc.commit_backup(leaf, Tensor::from_slice(&[100i64, 101]), HashMap::new())
+        .expect("live test node");
+
+    let result = tc.insert(&insert_params_swa(&key, &[20, 21], 0, 0));
+    assert!(
+        !result
+            .cache_actions
+            .iter()
+            .any(|action| action.as_any().is::<BackupKV>())
+    );
+
+    tc.is_write_back = false;
+    let result = tc.insert(&insert_params_swa(&key, &[20, 21], 0, 0));
+    let backups: Vec<_> = result
+        .cache_actions
+        .iter()
+        .filter_map(|action| {
+            action
+                .as_any()
+                .downcast_ref::<BackupKV>()
+                .map(|backup| backup.node_ids.clone())
+        })
+        .collect();
+    assert_eq!(backups, vec![vec![leaf]]);
+
+    let (full_device_indices, comp_xfers) = tc.build_backup_spec(leaf).expect("live test node");
+    assert_eq!(full_device_indices.numel(), 0);
+    assert_eq!(comp_xfers[&SWA][0].nodes_to_load, Some(vec![leaf]));
+}
+
+// Finalize an otherwise-empty match carrying the given Full-KV reach.
+fn finalize_branching(
+    tc: &UnifiedTreeCore<Vec<i64>>,
+    device_len: usize,
+    host_hit_length: usize,
+    full_kv_hit_length: usize,
+) -> Option<usize> {
+    swa_component(4)
+        .finalize_match_result_in_tree_core(
+            tc,
+            MatchResult {
+                device_prefix_len: device_len,
+                host_hit_length,
+                full_kv_hit_length,
+                ..tc.empty_match_result()
+            },
+            /* last_device_node_idx = */ tc.arena.root(),
+            /* best_match_node_idx = */ tc.arena.root(),
+            &MatchPrefixParams {
+                key: &Vec::new(),
+                namespace: Default::default(),
+            },
+            &[],
+            0,
+        )
+        .swa_branching_seqlen
+}
+
+#[test]
+fn match_reports_the_page_aligned_swa_branching_seqlen() {
+    let tc = swa_hicache_core(/* window = */ 4, /* page_size = */ 4);
+    // Full KV reaches 11 tokens, the SWA boundary only 2; 11 aligns down to 8.
+    assert_eq!(
+        finalize_branching(&tc, /* device = */ 2, /* host_hit = */ 0, 11),
+        Some(8)
+    );
+    // Host-loaded Full KV counts toward the boundary the branch must beat.
+    assert_eq!(
+        finalize_branching(&tc, /* device = */ 2, /* host_hit = */ 6, 11),
+        None
+    );
+}
+
+#[test]
+fn swa_branching_seqlen_is_none_when_no_aligned_page_lies_beyond_the_window() {
+    let tc = swa_hicache_core(/* window = */ 4, /* page_size = */ 4);
+    // Full KV reaches 3 tokens, which aligns down to 0: nothing to branch at.
+    assert_eq!(
+        finalize_branching(&tc, /* device = */ 0, /* host_hit = */ 0, 3),
+        None
+    );
+    // The aligned position must lie strictly beyond the boundary.
+    assert_eq!(
+        finalize_branching(&tc, /* device = */ 8, /* host_hit = */ 0, 11),
+        None
+    );
+}
+
+#[test]
+fn insert_reports_whether_it_reached_the_branch_boundary() {
+    for (branching_seqlen, expected) in [(Some(3), true), (Some(4), false), (None, false)] {
+        let mut tc = swa_hicache_core(/* window = */ 4, /* page_size = */ 1);
+        let result = tc.insert(&InsertParams {
+            rotation_base: None,
+            swa_branching_seqlen: branching_seqlen,
+            ..insert_params_swa(&vec![1, 2, 3], &[10, 11, 12], 0, 0)
+        });
+        assert_eq!(
+            result.swa_branch_inserted, expected,
+            "swa_branching_seqlen={branching_seqlen:?}"
+        );
+    }
 }

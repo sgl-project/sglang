@@ -11,6 +11,7 @@ length finish. Drives the real `Req.update_finish_state`; pure CPU."""
 
 import unittest
 from array import array
+from unittest import mock
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
@@ -23,6 +24,7 @@ from sglang.srt.managers.schedule_batch import (
     FINISH_MATCHED_TOKEN,
     Req,
 )
+from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -163,16 +165,6 @@ class TestPostEosBonusTokenIncident(CustomTestCase):
             vocab_size=VOCAB_SIZE,
         )
 
-    def test_eot_then_bonus_junk_within_cap_is_trimmed(self):
-        # Run [12, 200008, 2] with budget left. This case was correct even
-        # without the ordering fix: the EOS match trims the bonus junk.
-        req = self._eot_req([10, 11, 12, EOT_ID, POST_EOS_JUNK_ID], max_new_tokens=100)
-        req.update_finish_state(new_accepted_len=3)
-        self.assertTrue(req.finished())
-        self.assertIsInstance(req.finished_reason, FINISH_MATCHED_TOKEN)
-        self.assertEqual(req.finished_reason.matched, EOT_ID)
-        self.assertEqual(list(req.output_ids_through_stop), [10, 11, 12, EOT_ID])
-
     def test_eot_then_bonus_junk_crossing_cap_is_trimmed(self):
         # The incident: the same run crosses max_new_tokens in the step the EOS
         # lands. Without the fix the length check ran first and emitted
@@ -196,6 +188,27 @@ class TestPostEosBonusTokenIncident(CustomTestCase):
         self.assertIsInstance(req.finished_reason, FINISH_MATCHED_TOKEN)
         self.assertEqual(req.finished_len, 4)
         self.assertEqual(list(req.output_ids_through_stop), [10, 11, 12, EOT_ID])
+
+
+class TestSpecOvershootCacheLen(CustomTestCase):
+    def test_commit_past_stop_is_not_a_cache_key(self):
+        req = _make_req([10, 11, 12, EOS_ID, 20], max_new_tokens=100)
+        req.kv.kv_committed_len = len(req.origin_input_ids) + len(req.output_ids)
+        req.update_finish_state(new_accepted_len=5)
+        with get_context().override_server_args(strip_thinking_cache=False):
+            self.assertEqual(req.owned_kv_len(), 5)
+
+    def test_abort_stopless_keeps_committed_len(self):
+        """An abort keeps kv_committed_len; clamping trips the overalloc assert."""
+        req = _make_req([101, 102], max_new_tokens=10, vocab_size=10_000)
+        req.kv.kv_committed_len = 100
+        req.kv.kv_allocated_len = 100
+        with mock.patch("sglang.srt.managers.schedule_batch.get_parallel") as gp:
+            gp().tp_rank = 0
+            req.set_finish_with_abort("boom")
+        self.assertIsNone(req.finished_len)
+        with get_context().override_server_args(strip_thinking_cache=False):
+            self.assertEqual(req.owned_kv_len(), req.kv.kv_committed_len)
 
 
 if __name__ == "__main__":

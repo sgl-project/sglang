@@ -77,7 +77,7 @@ MI45X_DEEPSEEK_V4_FLASH_MODELS = [
             "deepseek-v4",
             "--chunked-prefill-size",
             "8192",
-            "--cuda-graph-max-bs",
+            "--cuda-graph-max-bs-decode",
             "256",
             "--max-running-requests",
             "256",

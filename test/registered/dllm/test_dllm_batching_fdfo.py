@@ -41,7 +41,7 @@ class TestBatchingFDFO(CustomTestCase):
             "--dllm-algorithm",
             "LowConfidence",
             "--dllm-fdfo",
-            "--cuda-graph-bs",
+            "--cuda-graph-bs-decode",
             "1",
             "2",
             "3",

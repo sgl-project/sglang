@@ -44,8 +44,8 @@ class TestReturnRoutedExperts(CustomTestCase):
     under DeepEP a2a + attn_tp_size > 1, across overlap/cuda-graph/radix
     optimisations.
 
-    Both servers run ``--tp 4 --dp 2 --enable-dp-attention --moe-a2a-backend
-    deepep`` so attn_tp_size=2 and the all-gather hot path in
+    Both servers run ``--tp 4 --attn-dp-size 2 --moe-a2a-backend deepep``
+    so attn_tp_size=2 and the all-gather hot path in
     RoutedExpertsCapturer.capture is hit on every step. Baseline disables
     overlap/cuda-graph/radix to give a deterministic ground truth; reference
     leaves them on. If the gather were skipping a rank or racing against the
@@ -59,9 +59,8 @@ class TestReturnRoutedExperts(CustomTestCase):
             "--enable-deterministic-inference",
             "--tp",
             4,
-            "--dp",
+            "--attn-dp-size",
             2,
-            "--enable-dp-attention",
             "--moe-a2a-backend",
             "deepep",
             # Force normal-mode dispatch: deepep auto routes decode through
@@ -196,7 +195,7 @@ class TestReturnRoutedExperts(CustomTestCase):
                 2,
                 "--enable-return-routed-experts",
                 "--disable-cuda-graph",
-                "--disable-piecewise-cuda-graph",
+                "--cuda-graph-backend-prefill=disabled",
                 *other_args,
             ],
         )

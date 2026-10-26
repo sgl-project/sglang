@@ -12,11 +12,11 @@ Recognized permission keys:
 
 | Key | Grants |
 | --- | --- |
-| `can_tag_run_ci_label` | `/tag-run-ci-label`, `/tag-and-rerun-ci` |
-| `can_rerun_failed_ci` | `/rerun-failed-ci`, `/tag-and-rerun-ci` |
-| `cooldown_interval_minutes` | rate limit in `pr-gate.yml`; `0` also grants `/rerun-test`, `/rerun-group` |
+| `can_tag_run_ci_label` | `/tag-run-ci-label`, `/tag-and-rerun-ci`, `/run-full-ci`, `/run-extra-ci` |
+| `can_rerun_failed_ci` | `/rerun-failed-ci`, `/tag-and-rerun-ci`, `/run-full-ci`, `/run-extra-ci` |
+| `cooldown_interval_minutes` | rate limit in `pr-gate.yml`; `0` also grants `/rerun-test`, `/rerun-group`, `/run-cpu-ci` |
 
-`/rerun-test` and `/rerun-group` are gated on the commenter alone: either
+`/rerun-test`, `/rerun-group` and `/run-cpu-ci` are gated on the commenter alone: either
 `cooldown_interval_minutes: 0`, or `write`/`admin` permission on the repo. Where
 the PR comes from makes no difference, and authoring it grants nothing.
 

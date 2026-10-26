@@ -161,12 +161,12 @@ class TorchNativeLoRABackend(BaseLoRABackend):
 
         return output_tensor
 
-    def init_cuda_graph_batch_info(
+    def init_decode_cuda_graph_batch_info(
         self,
         max_bs_in_cuda_graph: int,
         num_tokens_per_req: int,
     ):
-        with torch.device("cuda"):
+        with torch.device(self.device):
             self.cuda_graph_batch_info = TorchNativeLoRABatchInfo(
                 use_cuda_graph=True,
                 bs=max_bs_in_cuda_graph,

@@ -31,13 +31,13 @@ class TestQwen35(unittest.TestCase):
             "--tool-call-parser=qwen3_coder",
             "--mem-fraction-static=0.8",
         ]
-        dp_args = ["--dp=8", "--enable-dp-attention"]
+        dp_args = ["--attn-dp-size=8"]
         mtp_args = [
             "--speculative-algorithm=EAGLE",
             "--speculative-num-steps=3",
             "--speculative-eagle-topk=1",
             "--speculative-num-draft-tokens=4",
-            "--mamba-scheduler-strategy=extra_buffer",
+            "--mamba-radix-cache-strategy=extra_buffer",
         ]
 
         variants = [

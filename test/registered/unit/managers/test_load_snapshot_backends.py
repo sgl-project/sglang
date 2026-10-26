@@ -1,5 +1,6 @@
 """Unit tests for LoadSnapshot SHM and ZMQ backends."""
 
+import json
 import os
 import tempfile
 import time
@@ -7,16 +8,23 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.load_snapshot import (
+    DisaggregationMetrics,
     LoadSnapshot,
+    LoRAMetrics,
+    MemoryMetrics,
+    QueueMetrics,
     ShmLoadSnapshotReader,
     ShmLoadSnapshotWriter,
+    SpeculativeMetrics,
     ZmqLoadSnapshotWriter,
     ZmqShmLoadSnapshotReader,
     _zmq_addr_for,
     create_load_snapshot_reader,
     create_load_snapshot_writer,
     should_use_zmq,
+    snapshot_encoder,
     zmq_reader_owner,
 )
 from sglang.srt.runtime_context import get_context
@@ -263,7 +271,7 @@ class TestFactoryFunctions(CustomTestCase):
         self.addCleanup(override.restore)
 
     def test_shm_mode(self):
-        self._publish(enable_dp_attention=False, nnodes=1, dp_size=1)
+        self._publish(nnodes=1, dp_size=1)
         port_args = SimpleNamespace(instance_id="test_shm_factory")
         writer = create_load_snapshot_writer(port_args, dp_size=1, dp_rank=0)
         self.assertIsInstance(writer, ShmLoadSnapshotWriter)
@@ -278,7 +286,7 @@ class TestFactoryFunctions(CustomTestCase):
             os.unlink(path)
 
     def test_zmq_mode_via_env(self):
-        self._publish(enable_dp_attention=False, nnodes=1, dp_size=1)
+        self._publish(nnodes=1, dp_size=1)
         port_args = SimpleNamespace(instance_id="test_zmq_factory")
         os.environ["SGLANG_LOAD_SNAPSHOT_USE_ZMQ"] = "1"
         try:
@@ -292,7 +300,7 @@ class TestFactoryFunctions(CustomTestCase):
             del os.environ["SGLANG_LOAD_SNAPSHOT_USE_ZMQ"]
 
     def test_should_use_zmq_multinode_dp_attention(self):
-        self._publish(enable_dp_attention=True, nnodes=2, dp_size=2)
+        self._publish(attn_dp_size=2, nnodes=2)
         self.assertTrue(should_use_zmq())
 
 
@@ -304,10 +312,9 @@ class TestZmqReaderOwner(CustomTestCase):
     def _owners(self, **overrides):
         """Publish a config and return the callers that claim the socket."""
         fields = dict(
-            enable_dp_attention=True,
             nnodes=2,
             node_rank=0,
-            dp_size=1,
+            attn_dp_size=1,
             load_balance_method="round_robin",
             tokenizer_worker_num=1,
         )
@@ -320,38 +327,43 @@ class TestZmqReaderOwner(CustomTestCase):
             override.restore()
 
     def test_zmq_disabled_no_owner(self):
-        self.assertEqual(self._owners(enable_dp_attention=False, nnodes=1), set())
+        self.assertEqual(self._owners(nnodes=1), set())
 
     def test_non_zero_node_rank_no_owner(self):
         self.assertEqual(
-            self._owners(node_rank=1, dp_size=4, tokenizer_worker_num=8), set()
+            self._owners(node_rank=1, attn_dp_size=4, tokenizer_worker_num=8), set()
         )
 
     def test_tokenizer_manager_owns_when_dp1(self):
-        self.assertEqual(self._owners(dp_size=1), {"TokenizerManager"})
+        # A single DP rank runs zmq mode only when it is forced.
+        with envs.SGLANG_LOAD_SNAPSHOT_USE_ZMQ.override(True):
+            self.assertEqual(self._owners(attn_dp_size=1), {"TokenizerManager"})
 
     def test_multi_tokenizer_router_owns_in_multi_tokenizer_dp1(self):
-        self.assertEqual(
-            self._owners(dp_size=1, tokenizer_worker_num=8), {"MultiTokenizerRouter"}
-        )
+        with envs.SGLANG_LOAD_SNAPSHOT_USE_ZMQ.override(True):
+            self.assertEqual(
+                self._owners(attn_dp_size=1, tokenizer_worker_num=8),
+                {"MultiTokenizerRouter"},
+            )
 
     def test_multi_tokenizer_router_owns_in_multi_tokenizer_round_robin(self):
         self.assertEqual(
-            self._owners(dp_size=4, tokenizer_worker_num=8), {"MultiTokenizerRouter"}
+            self._owners(attn_dp_size=4, tokenizer_worker_num=8),
+            {"MultiTokenizerRouter"},
         )
 
     def test_data_parallel_controller_owns_load_aware(self):
         for method in ("total_tokens", "total_requests"):
             self.assertEqual(
                 self._owners(
-                    dp_size=4, tokenizer_worker_num=8, load_balance_method=method
+                    attn_dp_size=4, tokenizer_worker_num=8, load_balance_method=method
                 ),
                 {"DataParallelController"},
             )
 
     def test_tokenizer_manager_owns_dp4_round_robin(self):
         self.assertEqual(
-            self._owners(dp_size=4, tokenizer_worker_num=1), {"TokenizerManager"}
+            self._owners(attn_dp_size=4, tokenizer_worker_num=1), {"TokenizerManager"}
         )
 
     def test_the_controller_answers_within_its_audited_namespaces(self):
@@ -365,10 +377,9 @@ class TestZmqReaderOwner(CustomTestCase):
         import sglang.srt.runtime_context as rc
 
         fields = dict(
-            enable_dp_attention=True,
             nnodes=2,
             node_rank=0,
-            dp_size=4,
+            attn_dp_size=4,
             load_balance_method="total_tokens",
             tokenizer_worker_num=8,
         )
@@ -382,17 +393,19 @@ class TestZmqReaderOwner(CustomTestCase):
             self.assertTrue(zmq_reader_owner("DataParallelController"))
 
     def test_at_most_one_owner_across_configs(self):
-        for dp_size in (1, 4):
-            for tw in (1, 8):
-                for method in ("round_robin", "total_tokens", "total_requests"):
-                    for node_rank in (0, 1):
-                        owners = self._owners(
-                            dp_size=dp_size,
-                            tokenizer_worker_num=tw,
-                            load_balance_method=method,
-                            node_rank=node_rank,
-                        )
-                        self.assertLessEqual(len(owners), 1, owners)
+        # Forced zmq mode puts a single DP rank in the sweep too.
+        with envs.SGLANG_LOAD_SNAPSHOT_USE_ZMQ.override(True):
+            for attn_dp_size in (1, 4):
+                for tw in (1, 8):
+                    for method in ("round_robin", "total_tokens", "total_requests"):
+                        for node_rank in (0, 1):
+                            owners = self._owners(
+                                attn_dp_size=attn_dp_size,
+                                tokenizer_worker_num=tw,
+                                load_balance_method=method,
+                                node_rank=node_rank,
+                            )
+                            self.assertLessEqual(len(owners), 1, owners)
 
 
 class TestZmqAddr(CustomTestCase):
@@ -484,6 +497,76 @@ class TestEndToEndZmqSimulation(CustomTestCase):
             reader.close()
             if os.path.exists(shm_path):
                 os.unlink(shm_path)
+
+
+# The Rust frontend's `/v1/loads` (rust/sglang-server/src/api_server/http/loads.rs)
+# renders these snapshots from the same SHM bytes; its fixture must match Python.
+RUST_LOADS_FIXTURE = os.path.join(
+    os.path.dirname(__file__),
+    *[os.pardir] * 4,
+    "rust/sglang-server/testdata/load_snapshot.json",
+)
+
+
+def build_rust_loads_fixture() -> dict:
+    """Wire payloads for a full and a minimal rank, and what Python renders from
+    them. The values are arbitrary and pairwise distinct, so a field rendered
+    under the wrong name or in the wrong slot shows. Regenerate the fixture
+    with ``json.dump(build_rust_loads_fixture(), f, indent=2)`` after a
+    ``LoadSnapshot`` change, then update the Rust renderer."""
+    from sglang.srt.entrypoints.v1_loads import _format_loads_prometheus
+
+    full = LoadSnapshot(
+        timestamp=1.25,
+        dp_rank=0,
+        num_running_reqs=7,
+        num_waiting_reqs=3,
+        num_waiting_uncached_tokens=4096,
+        num_used_tokens=81920,
+        num_total_tokens=90112,
+        num_active_tokens=88000,
+        num_prealloc_ready_tokens=512,
+        max_total_num_tokens=1048576,
+        max_running_requests=256,
+        token_usage=0.078125,
+        gen_throughput=1234.5,
+        cache_hit_rate=0.625,
+        utilization=0.5,
+        total_prefill_uncached_tokens=987654321,
+        total_prefill_busy_us=123456789,
+        decode_moments=[100.0, 2.5, 0.125],
+        memory=MemoryMetrics(
+            weight_gb=60.5, kv_cache_gb=120.25, graph_gb=2.0, token_capacity=1048576
+        ),
+        speculative=SpeculativeMetrics(accept_length=3.5, accept_rate=0.75),
+        lora=LoRAMetrics(slots_used=1, slots_total=8, utilization=0.125),
+        disaggregation=DisaggregationMetrics(
+            mode="decode", decode_prealloc_queue_reqs=2, kv_transfer_speed_gb_s=12.5
+        ),
+        queues=QueueMetrics(
+            waiting=3, grammar=1, paused=0, retracted=2, prealloc_ready=4
+        ),
+    )
+    snapshots = [full, LoadSnapshot(dp_rank=1)]
+    includes = {"all": None, "core": {"core"}, "core,queues": {"core", "queues"}}
+    return {
+        "payloads": [snapshot_encoder.encode(s).hex() for s in snapshots],
+        "to_dict": {
+            name: [s.to_dict(include) for s in snapshots]
+            for name, include in includes.items()
+        },
+        "prometheus": {
+            name: _format_loads_prometheus(snapshots, include).body.decode()
+            for name, include in includes.items()
+        },
+    }
+
+
+class TestRustLoadsFixture(CustomTestCase):
+    def test_fixture_matches_python(self):
+        with open(RUST_LOADS_FIXTURE) as f:
+            fixture = json.load(f)
+        self.assertEqual(fixture, build_rust_loads_fixture())
 
 
 if __name__ == "__main__":

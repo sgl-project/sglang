@@ -39,7 +39,6 @@ annotation is equivalent to ``Arg(help=that_string)``.
 
 from __future__ import annotations
 
-import copy
 import dataclasses
 import functools
 import types
@@ -54,26 +53,14 @@ from typing import (
     get_type_hints,
 )
 
+import msgspec
+import msgspec.structs
+
 A = Annotated
 
 
-class _NoFallback:
-    """Sentinel for ``Arg.fallback``: this field declares none.
-
-    ``None`` cannot serve, because ``None`` is what a field *holds* when the
-    operator did not type it -- the state a fallback answers for.
-    """
-
-    def __repr__(self) -> str:  # pragma: no cover - debugging aid
-        return "<no fallback>"
-
-
-NO_FALLBACK = _NoFallback()
-
-
-@dataclasses.dataclass(frozen=True)
-class Arg:
-    """CLI argument metadata attached to a dataclass field via ``Annotated``."""
+class Arg(msgspec.Struct, frozen=True):
+    """CLI argument metadata attached to a field via ``Annotated``."""
 
     help: str = ""
     choices: list | None = None
@@ -85,102 +72,64 @@ class Arg:
     action: Any | None = None
     action_kwargs: dict | None = None
     const: Any | None = None
-    # When True, this field is skipped by add_cli_args_from_dataclass.
-    # Use for fields that have no CLI surface (e.g. injected via Python only).
+    # Skip automatic CLI registration.
     no_cli: bool = False
-    # When True, config resolution (model overrides and post-process passes)
-    # may decide this field: the declaration stash accepts the name, and
-    # `resolution_result` and the config bags answer with the decision. The
-    # field keeps what the operator passed.
+    # Allow resolution passes to declare a value for this field.
     resolvable: bool = False
-    # What the field means when nobody said anything -- the bottom of the read
-    # chain: override, decision, input, then this. Not the dataclass default,
-    # which stays `None` because that is how the record spells "not typed".
-    #
-    # Only a value fixed for the life of the configuration belongs here. One
-    # that depends on the machine, on another field, or on anything impure is a
-    # decision, and decisions stay in a hook where their order is visible.
-    fallback: Any = NO_FALLBACK
+    # Scalar fallback when neither resolution nor input supplies a value.
+    # Machine- or config-dependent defaults belong in resolution hooks.
+    fallback: Any = None
 
 
-@dataclasses.dataclass(frozen=True)
-class Derived:
-    """Metadata for a field the configuration implies, not one anyone types.
+_NO_DEFAULT = object()
 
-    The other half of a namespace. An ``Arg`` field is the operator's input and
-    is collected into ``ServerArgs``; a ``Derived`` field carries no annotation,
-    so it is not a dataclass field and never reaches the record -- which is
-    right, because it has no input to preserve and the record is what crosses a
-    process boundary.
 
-    ``fn`` names what computes it, as a dotted path resolved lazily so that a
-    declaration module stays free of runtime imports. Such a field is a pure
-    function of the published configuration, so it is computed once at
-    ``publish`` and stored as an ordinary bag leaf -- a plain attribute load,
-    which is what a read inside compiled model code needs.
+class Derived(msgspec.Struct, frozen=True):
+    """Metadata for namespace fields that are not CLI inputs or record fields.
 
-    Every declaration carries ``fn`` today, the parallel quotients included:
-    they are a function of the configured leaves, so they are computed at
-    publish like the rest. What is special about them is not how they are
-    computed but that a stamp can move one afterwards -- an elastic scale-up
-    restamps ``attn_dp_size`` -- which ``ParallelContext`` answers above the
-    published leaf.
+    ``fn`` is a lazily resolved dotted function path. It computes a value from
+    resolved configuration once at publication. Fields without ``fn``, such as
+    ranks and group handles, are set at runtime. Parallel overrides take
+    precedence over published values.
     """
 
     doc: str = ""
     fn: str = ""
+    # Default for runtime-only fields, e.g. ``gpu_id=None`` without a device.
+    # Fields without a default raise if read before initialization.
+    default: Any = _NO_DEFAULT
 
 
-@dataclasses.dataclass(frozen=True)
-class NS:
-    """Namespace-path marker for a ServerArgs field, attached alongside the
-    field's metadata in ``Annotated``:
+class NS(msgspec.Struct, frozen=True):
+    """Per-field namespace marker for records spanning multiple namespaces.
 
-        field: A[int, "help", NS("parallel")] = 1
-        field: A[str, Arg(help="…"), NS("exec.moe")] = "auto"
-
-    ``ServerArgs`` no longer uses it: its fields are declared in the
-    ``arg_groups/fields/`` classes, each of which carries the ``_NS_PATH`` it
-    stands for, so the module a declaration lives in *is* its namespace. What
-    is left for this marker is the case a class cannot express -- one ad-hoc
-    dataclass whose fields span several namespaces, which is what the
-    config-bag tests build."""
+    Example: ``field: A[int, "help", NS("parallel")] = 1``.
+    ServerArgs instead collects each namespace class's ``_NS_PATH``.
+    """
 
     path: str
 
 
 @functools.cache
 def namespace_of(cls) -> dict:
-    """``{field_name: dotted namespace path}``, read from the declaring class.
+    """Return ``{field: namespace}`` from collected metadata, class paths, or NS markers.
 
-    A field's namespace is where it is declared: each class in
-    ``arg_groups/fields/`` carries the ``_NS_PATH`` it stands for, and
-    ``ServerArgs`` composes them. Walking the MRO therefore answers "which
-    namespace owns this field" without a per-field marker -- the file the
-    declaration sits in is the marker.
-
-    A class that is not built that way -- an ad-hoc dataclass spanning several
-    namespaces, which is what the config-bag tests construct -- falls back to
-    the per-field ``NS`` marker. A field with neither is absent from the map
-    (the coverage lint flags them). Non-dataclass types yield an empty map.
+    Unmarked fields are omitted; non-record types yield an empty map.
     """
-    if not dataclasses.is_dataclass(cls):
+    if not is_record(cls):
         return {}
-    # An assembled record: the collector recorded who declared each field,
-    # because there are no base classes left to ask.
     out = dict(getattr(cls, "_NS_BY_FIELD", None) or {})
-    # A class that still inherits its namespaces: nearest declaration wins, so
-    # walk the MRO front to back and keep the first answer.
+    # Nearest namespace declaration wins.
     for base in cls.__mro__:
         path = base.__dict__.get("_NS_PATH")
         if path is None:
             continue
         for name in getattr(base, "__annotations__", {}):
             out.setdefault(name, path)
-    if len(out) == len(dataclasses.fields(cls)):
+    if len(out) == len(record_fields(cls)):
         return out
     hints = get_type_hints(cls, include_extras=True)
-    for field in dataclasses.fields(cls):
+    for field in record_fields(cls):
         if field.name in out:
             continue
         tp = hints.get(field.name, field.type)
@@ -195,9 +144,9 @@ def namespace_of(cls) -> dict:
 @functools.cache
 def field_names(cls) -> frozenset:
     """Names of ``cls`` dataclass fields — what a declaration may name."""
-    if not dataclasses.is_dataclass(cls):
+    if not is_record(cls):
         return frozenset()
-    return frozenset(field.name for field in dataclasses.fields(cls))
+    return frozenset(field.name for field in record_fields(cls))
 
 
 @functools.cache
@@ -207,11 +156,11 @@ def resolvable_fields(cls) -> frozenset:
 
     Non-dataclass types (e.g. mock config objects in tests) have no Arg
     metadata and yield an empty whitelist."""
-    if not dataclasses.is_dataclass(cls):
+    if not is_record(cls):
         return frozenset()
     hints = get_type_hints(cls, include_extras=True)
     names = set()
-    for field in dataclasses.fields(cls):
+    for field in record_fields(cls):
         _, arg = _unwrap_annotated(hints.get(field.name, field.type))
         if arg is not None and arg.resolvable:
             names.add(field.name)
@@ -220,43 +169,51 @@ def resolvable_fields(cls) -> frozenset:
 
 @functools.cache
 def fallbacks_of(cls) -> dict:
-    """``{field_name: value}`` for every field of ``cls`` that declares one.
-
-    Read the same way `resolvable_fields` reads its flag, so a fallback lives
-    beside the help text of the field it belongs to rather than in whatever
-    hook used to fill it in.
-    """
-    if not dataclasses.is_dataclass(cls):
+    """Return declared scalar fallbacks for fields whose input default is None."""
+    if not is_record(cls):
         return {}
     hints = get_type_hints(cls, include_extras=True)
     out = {}
-    for field in dataclasses.fields(cls):
+    for field in record_fields(cls):
         _, arg = _unwrap_annotated(hints.get(field.name, field.type))
-        if arg is not None and arg.fallback is not NO_FALLBACK:
+        if arg is not None and arg.fallback is not None:
+            # Reject shared mutable fallbacks and defaults that make the fallback unreachable.
+            assert not isinstance(arg.fallback, (list, dict, set)), (
+                f"{cls.__name__}.{field.name}: a mutable fallback would be "
+                "shared by every reader -- use a scalar"
+            )
+            assert field.default is None, (
+                f"{cls.__name__}.{field.name}: declares a fallback but defaults "
+                f"to {field.default!r}, so the fallback is unreachable"
+            )
             out[field.name] = arg.fallback
     return out
 
 
 def with_fallback(cls, name: str, value: Any) -> Any:
-    """``value``, or the declared fallback when nothing has answered.
+    """Apply a declared fallback when ``value`` is None.
 
-    `resolution_result` calls this as its last step -- the effective surface,
-    which the config bags and `/server_info` read through. Deliberately not the
-    views a pass reads *while deciding*: `model_overrides/inkling.py` branches
-    on `if cfg.swa_full_tokens_ratio is None`, and a fallback answering there
-    would make that branch dead. `test_declared_fallbacks.py` pins both halves.
-
-    A container fallback is copied, for the reason a dataclass spells this
-    `default_factory`.
+    Used by ``resolution_result``, but not mid-resolution views: handlers must
+    still distinguish unset inputs. Fallbacks must be immutable scalars.
     """
     if value is not None:
         return value
-    fallback = fallbacks_of(cls).get(name, NO_FALLBACK)
-    if fallback is NO_FALLBACK:
-        return value
-    if isinstance(fallback, (list, dict, set)):
-        return copy.deepcopy(fallback)
-    return fallback
+    return fallbacks_of(cls).get(name, value)
+
+
+def record_fields(cls):
+    """Return Struct or dataclass fields, or an empty tuple for other types."""
+    if isinstance(cls, type) and issubclass(cls, msgspec.Struct):
+        return msgspec.structs.fields(cls)
+    if dataclasses.is_dataclass(cls):
+        return dataclasses.fields(cls)
+    return ()
+
+
+def is_record(cls) -> bool:
+    """Whether ``cls`` declares fields the way a record does."""
+    target = cls if isinstance(cls, type) else type(cls)
+    return issubclass(target, msgspec.Struct) or dataclasses.is_dataclass(cls)
 
 
 # ---------------------------------------------------------------------------
@@ -319,10 +276,11 @@ def _infer_type_func(tp):
 
 
 def _field_default(field):
-    """Return the default value for a dataclass field, or _MISSING."""
-    if field.default is not _MISSING:
+    """Return a field default, normalizing Struct and dataclass missing sentinels."""
+    absent = (_MISSING, msgspec.NODEFAULT)
+    if field.default not in absent:
         return field.default
-    if field.default_factory is not _MISSING:
+    if field.default_factory not in absent:
         return field.default_factory()
     return _MISSING
 
@@ -352,7 +310,7 @@ def add_cli_args_from_dataclass(parser, cls, *, fields: list[str] | None = None)
     """
     hints = get_type_hints(cls, include_extras=True)
 
-    for field in dataclasses.fields(cls):
+    for field in record_fields(cls):
         if fields is not None and field.name not in fields:
             continue
 

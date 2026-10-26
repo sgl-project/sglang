@@ -17,6 +17,7 @@ import requests
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import (
+    register_amd_ci,
     register_cpu_ci,
     register_cuda_ci,
 )
@@ -29,6 +30,9 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=50, stage="base-b", runner_config="1-gpu-large")
+# Backend-specific: streaming tool-argument assembly is rebuilt from
+# incremental decode output, so ROCm chunk-boundary divergence surfaces here.
+register_amd_ci(est_time=140, suite="stage-b-test-1-gpu-small-amd")
 register_cpu_ci(est_time=54, suite="stage-b-test-cpu-intel")
 
 # System message to guide Llama3.2 to produce proper tool call format

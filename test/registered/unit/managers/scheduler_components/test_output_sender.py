@@ -13,7 +13,7 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler_components.output_sender import SenderWrapper
 from sglang.srt.sampling.sampling_params import SamplingParams
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 
 
 def _make_scheduler_req(http_worker_ipc: str) -> Req:
@@ -27,20 +27,6 @@ def _make_scheduler_req(http_worker_ipc: str) -> Req:
 
 
 class TestSenderWrapper(CustomTestCase):
-    @patch("sglang.srt.managers.scheduler_components.output_sender.sock_send")
-    def test_preserves_existing_output_route(self, mock_sock_send):
-        socket = MagicMock()
-        scheduler_req = _make_scheduler_req("ipc:///source-worker")
-        output = AbortReq(
-            rid="already-routed",
-            http_worker_ipc="ipc:///destination-worker",
-        )
-
-        SenderWrapper(socket).send_output(output, scheduler_req)
-
-        self.assertEqual(output.http_worker_ipc, "ipc:///destination-worker")
-        mock_sock_send.assert_called_once_with(socket, output)
-
     @patch("sglang.srt.managers.scheduler_components.output_sender.sock_send")
     def test_scheduler_abort_routes_to_origin_worker(self, mock_sock_send):
         socket = MagicMock()

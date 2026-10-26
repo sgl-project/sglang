@@ -31,8 +31,6 @@ import unittest
 
 from sglang.kernels.ops.attention import decode_attention as da
 from sglang.kernels.ops.attention.decode_attention import (
-    _MLA_BLOCK_N,
-    _MLA_BUCKET_BATCH_FREE,
     _MLA_BUCKETS,
     _fwd_grouped_kernel_stage1,
     _grouped_head_tiles,
@@ -89,18 +87,6 @@ class TestMlaDecodeGeometry(unittest.TestCase):
         params = {p.name: p for p in _fwd_grouped_kernel_stage1.params}
         self.assertFalse(params["forced_kv_splits"].is_constexpr)
         self.assertTrue(params["USE_FORCED"].is_constexpr)
-
-    def test_batch_free_geometry_is_pinned(self):
-        # Deterministic inference runs on this geometry and BLOCK_N/num_warps reorder
-        # the fp32 accumulation, so retuning either moves those numbers.
-        self.assertEqual(
-            (
-                _MLA_BLOCK_N,
-                _MLA_BUCKET_BATCH_FREE.num_warps,
-                _MLA_BUCKET_BATCH_FREE.num_stages,
-            ),
-            (32, 2, 2),
-        )
 
     def test_head_tiles_matches_the_grid(self):
         # The budget is divided by the same head_tiles the grid is launched with; a

@@ -105,6 +105,14 @@ class TestFlashInferSparseMLABackendGate(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "only flashinfer_sparse_mla"):
                     self._validate(prefill, decode)
 
+    def test_accepts_triton_sparse_mla_for_prefill(self):
+        # triton_sparse_mla is selectable for prefill on this platform while
+        # flashinfer stays the decode kernel; the allowlist widened for exactly
+        # that pair and no other, so a third backend must still be refused.
+        self.assertTrue(self._validate("triton_sparse_mla", "flashinfer_sparse_mla"))
+        with self.assertRaisesRegex(ValueError, "only flashinfer_sparse_mla"):
+            self._validate("triton_sparse_mla", "trtllm")
+
     def test_reports_unsupported_configuration(self):
         with self.assertRaises(ValueError) as error:
             self._validate(

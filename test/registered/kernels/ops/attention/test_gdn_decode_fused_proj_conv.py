@@ -14,7 +14,7 @@ from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
 from sglang.kernels.ops.mamba.causal_conv1d_triton import causal_conv1d_update
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=7, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=7, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 
 def _reference(
@@ -371,17 +371,12 @@ class TestGDNDecodeFusedProjectionConv1D(unittest.TestCase):
         ba = torch.empty(1, 4, device="cuda", dtype=torch.bfloat16)
         state = torch.empty(2, 64, 3, device="cuda", dtype=torch.bfloat16)
         weight = torch.empty(64, 4, device="cuda", dtype=torch.bfloat16)
-        indices = torch.zeros(1, device="cuda", dtype=torch.int32)
         eligible, reason = can_use_fused_qkvzba_causal_conv1d_update_contiguous(
             qkvz,
             ba,
             state,
             weight,
             None,
-            indices,
-            qkv_dim=64,
-            v_dim=32,
-            num_v_heads=2,
             activation="silu",
         )
         self.assertFalse(eligible)

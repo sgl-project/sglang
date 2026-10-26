@@ -7,8 +7,8 @@ eval's single-prompt requests, per-item list form via the batch test), the
 positional scheduler-wire PD block, the KV bootstrap registry served on the
 rust api listener, the PD warmup fan-out, and the fake-bootstrap health probe.
 
-The Rust server has no OpenAI endpoints, so everything (including the gsm8k
-eval) goes through ``/generate``.
+OpenAI chat and completions exercise the same KV transfer through the Rust
+HTTP handlers, including streaming and batched completions.
 
 Usage:
 python3 -m unittest test_disaggregation_rust_server.TestDisaggregationRustServer
@@ -56,7 +56,7 @@ class TestDisaggregationRustServer(PDDisaggregationServerBase):
         args = SimpleNamespace(
             base_url=self.lb_url,
             eval_name="gsm8k",
-            api="generate",  # the Rust server has no /v1/completions
+            api="generate",
             max_tokens=512,
             num_examples=64,
             num_threads=32,
@@ -146,6 +146,94 @@ class TestDisaggregationRustServer(PDDisaggregationServerBase):
         # prefill's list and leaves only what decode itself saw still yields a
         # non-empty list, so pin the exact length.
         self.assertEqual(len(meta["input_token_logprobs"]), meta["prompt_tokens"])
+
+    def test_openai_endpoints_via_lb(self):
+        """Router-injected bootstrap fields must survive both OpenAI handlers."""
+        for path, prompt in (
+            (
+                "/v1/chat/completions",
+                {
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": "What is the capital of France? Answer with only the city name.",
+                        }
+                    ]
+                },
+            ),
+            ("/v1/completions", {"prompt": "The capital of France is"}),
+        ):
+            for stream in (False, True):
+                with self.subTest(path=path, stream=stream):
+                    body = {
+                        "model": self.model,
+                        **prompt,
+                        "temperature": 0,
+                        "max_tokens": 16,
+                        "stream": stream,
+                    }
+                    with requests.post(
+                        self.lb_url + path,
+                        json=body,
+                        stream=stream,
+                        timeout=60,
+                    ) as response:
+                        self.assertEqual(response.status_code, 200, response.reason)
+                        if stream:
+                            text = ""
+                            finished = False
+                            for line in response.iter_lines(decode_unicode=True):
+                                if not line or not line.startswith("data:"):
+                                    continue
+                                payload = line[len("data:") :].strip()
+                                if payload == "[DONE]":
+                                    break
+                                chunk = json.loads(payload)
+                                self.assertNotIn("error", chunk, chunk)
+                                for choice in chunk["choices"]:
+                                    self.assertEqual(choice["index"], 0)
+                                    text += (
+                                        choice.get("delta", {}).get("content") or ""
+                                        if path == "/v1/chat/completions"
+                                        else choice.get("text") or ""
+                                    )
+                                    if choice.get("finish_reason") is not None:
+                                        finished = True
+                            self.assertTrue(finished)
+                        else:
+                            choices = response.json()["choices"]
+                            self.assertEqual([c["index"] for c in choices], [0])
+                            choice = choices[0]
+                            self.assertIsNotNone(choice["finish_reason"])
+                            text = (
+                                choice["message"]["content"]
+                                if path == "/v1/chat/completions"
+                                else choice["text"]
+                            )
+                        self.assertIn("paris", text.lower())
+
+    def test_batch_completions_via_lb(self):
+        """Per-prompt routing must survive batched completions."""
+        response = requests.post(
+            self.lb_url + "/v1/completions",
+            json={
+                "model": self.model,
+                "prompt": [
+                    "The capital of France is",
+                    "The capital of Japan is",
+                ],
+                "temperature": 0,
+                "max_tokens": 16,
+            },
+            timeout=60,
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        choices = response.json()["choices"]
+        self.assertEqual(len(choices), 2)
+        for index, (choice, city) in enumerate(zip(choices, ("paris", "tokyo"))):
+            self.assertEqual(choice["index"], index)
+            self.assertIn(city, choice["text"].lower(), choice)
+            self.assertIsNotNone(choice["finish_reason"])
 
     def test_missing_bootstrap_is_rejected(self):
         # Negative branch of the fake-bootstrap health probe: a /generate that

@@ -1,0 +1,76 @@
+name: Release Docker Images Nightly Miles ROCm10 (AMD)
+
+on:
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: "Build only this variant (all = every variant below)"
+        required: false
+        type: choice
+        options: [all, rocm10-mi35x, rocm10-mi30x]
+        default: all
+      miles_repo:
+        description: "Miles repository to build from (e.g. a fork, to test an unmerged docker/ change)"
+        required: false
+        type: string
+        default: radixark/miles
+      miles_ref:
+        description: "Miles branch, tag or commit to build from"
+        required: false
+        type: string
+        default: main
+  schedule:
+    - cron: "0 12 * * *"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.number || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: amd-docker-scale
+    environment: "prod"
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: ${{ fromJSON((inputs.variant && inputs.variant != 'all') && format('["{0}"]', inputs.variant) || '["rocm10-mi35x", "rocm10-mi30x"]') }}
+    steps:
+      - name: Checkout miles repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.miles_repo || 'radixark/miles' }}
+          ref: ${{ inputs.miles_ref || 'main' }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Record miles commit
+        run: echo "Building from ${{ inputs.miles_repo || 'radixark/miles' }}@${{ inputs.miles_ref || 'main' }} ($(git rev-parse HEAD))"
+
+      - name: Set date
+        run: echo "DATE=$(date +%Y%m%d)" >> $GITHUB_ENV
+
+      - name: Install docker/build.py dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-pip
+          python3 -m pip install --break-system-packages --quiet typer
+
+      - name: Build image via miles docker/build.py and tag with date
+        run: |
+          python3 docker/build.py --variant ${{ matrix.variant }} --image-tag custom --custom-tag miles
+          docker tag rocm/sgl-dev:miles-${{ matrix.variant }} rocm/sgl-dev:miles-${{ matrix.variant }}-${DATE}
+
+      - name: Login to Docker Hub (AMD)
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
+
+      - name: Push dated tag
+        run: docker push rocm/sgl-dev:miles-${{ matrix.variant }}-${DATE}
+
+      - name: Push the undated tag
+        run: docker push rocm/sgl-dev:miles-${{ matrix.variant }}

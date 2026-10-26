@@ -125,7 +125,7 @@ class TestDSparkMixedChunk(GSM8KMixin, CustomTestCase):
                 "0.7",
                 "--page-size",
                 "1",
-                "--disable-piecewise-cuda-graph",
+                "--cuda-graph-backend-prefill=disabled",
             ],
         )
 

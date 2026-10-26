@@ -4,8 +4,8 @@
 // Developed with MIT HAN Lab Kernel Design Agents:
 // https://github.com/mit-han-lab/kernel-design-agents
 //
-// This mirrors the LTX2 eager oracle: RMSNorm and split RoPE both run in
-// fp32, rounding to bf16 only once at the final attention input.
+// The original FP32 path rounds only at the final attention input. The
+// Hopper variant preserves the eager BF16 RMSNorm and cosine-product rounding.
 
 #pragma once
 
@@ -71,17 +71,29 @@ SGL_DEVICE float compute_rstd(
   return *s_rstd;
 }
 
+template <bool kRoundIntermediates>
 SGL_DEVICE float norm_value(float x, float weight, float rstd) {
-  return weight * (rstd * x);
+  const float value = weight * (rstd * x);
+  if constexpr (kRoundIntermediates) {
+    return __bfloat162float(__float2bfloat16_rn(value));
+  }
+  return value;
 }
 
+template <bool kRoundIntermediates>
 SGL_DEVICE void rope_pair(float x0, float x1, float cos, float sin, float& y0, float& y1) {
-  const float p0 = x0 * cos;
-  const float p1 = x1 * cos;
+  float p0 = x0 * cos;
+  float p1 = x1 * cos;
+  if constexpr (kRoundIntermediates) {
+    // Hopper eager stores the BF16 cosine product before its addcmul update.
+    p0 = __bfloat162float(__float2bfloat16_rn(p0));
+    p1 = __bfloat162float(__float2bfloat16_rn(p1));
+  }
   y0 = fmaf(-sin, x1, p0);
   y1 = fmaf(sin, x0, p1);
 }
 
+template <bool kRoundIntermediates, bool kVec>
 __global__ void ltx2_qknorm_split_rope_kernel(
     const bf16_t* __restrict__ x,
     const bf16_t* __restrict__ cos,
@@ -114,24 +126,72 @@ __global__ void ltx2_qknorm_split_rope_kernel(
   const float rstd = compute_rstd(xrow, hidden_size, eps, tid, lane, warp_id, warp_sum, &s_rstd);
 
   const int64_t num_pairs = num_heads * half_dim;
+  if constexpr (kVec) {
+    // 8 consecutive pairs per thread with 16-byte accesses; same per-element math
+    // and rounding as the scalar loop below
+    constexpr int kWidth = 8;
+    const int64_t num_vecs = num_pairs / kWidth;
+    for (int64_t vec = tid; vec < num_vecs; vec += kThreads) {
+      const int64_t pair = vec * kWidth;
+      const int64_t head = pair / half_dim;
+      const int64_t offset = pair - head * half_dim;
+      const int64_t idx0 = head * head_dim + offset;
+      const int64_t idx1 = idx0 + half_dim;
+      const int64_t cos_offset = batch * stride_cos_b + head * stride_cos_h + token * stride_cos_t + offset;
+      const int64_t sin_offset = batch * stride_sin_b + head * stride_sin_h + token * stride_sin_t + offset;
+      const uint4 xv0 = *reinterpret_cast<const uint4*>(xrow + idx0);
+      const uint4 xv1 = *reinterpret_cast<const uint4*>(xrow + idx1);
+      const uint4 wv0 = *reinterpret_cast<const uint4*>(weight + idx0);
+      const uint4 wv1 = *reinterpret_cast<const uint4*>(weight + idx1);
+      const uint4 cv = *reinterpret_cast<const uint4*>(cos + cos_offset);
+      const uint4 sv = *reinterpret_cast<const uint4*>(sin + sin_offset);
+      const bf16_t* x0 = reinterpret_cast<const bf16_t*>(&xv0);
+      const bf16_t* x1 = reinterpret_cast<const bf16_t*>(&xv1);
+      const bf16_t* w0 = reinterpret_cast<const bf16_t*>(&wv0);
+      const bf16_t* w1 = reinterpret_cast<const bf16_t*>(&wv1);
+      const bf16_t* cs = reinterpret_cast<const bf16_t*>(&cv);
+      const bf16_t* sn = reinterpret_cast<const bf16_t*>(&sv);
+      uint4 ov0;
+      uint4 ov1;
+      bf16_t* o0 = reinterpret_cast<bf16_t*>(&ov0);
+      bf16_t* o1 = reinterpret_cast<bf16_t*>(&ov1);
+#pragma unroll
+      for (int j = 0; j < kWidth; ++j) {
+        const float n0 = norm_value<kRoundIntermediates>(__bfloat162float(x0[j]), __bfloat162float(w0[j]), rstd);
+        const float n1 = norm_value<kRoundIntermediates>(__bfloat162float(x1[j]), __bfloat162float(w1[j]), rstd);
+        float y0;
+        float y1;
+        rope_pair<kRoundIntermediates>(n0, n1, __bfloat162float(cs[j]), __bfloat162float(sn[j]), y0, y1);
+        o0[j] = __float2bfloat16_rn(y0);
+        o1[j] = __float2bfloat16_rn(y1);
+      }
+      *reinterpret_cast<uint4*>(outrow + idx0) = ov0;
+      *reinterpret_cast<uint4*>(outrow + idx1) = ov1;
+    }
+    return;
+  }
   for (int64_t pair = tid; pair < num_pairs; pair += kThreads) {
     const int64_t head = pair / half_dim;
     const int64_t offset = pair - head * half_dim;
     const int64_t idx0 = head * head_dim + offset;
     const int64_t idx1 = idx0 + half_dim;
-    const float n0 = norm_value(__bfloat162float(xrow[idx0]), __bfloat162float(weight[idx0]), rstd);
-    const float n1 = norm_value(__bfloat162float(xrow[idx1]), __bfloat162float(weight[idx1]), rstd);
+    const float n0 =
+        norm_value<kRoundIntermediates>(__bfloat162float(xrow[idx0]), __bfloat162float(weight[idx0]), rstd);
+    const float n1 =
+        norm_value<kRoundIntermediates>(__bfloat162float(xrow[idx1]), __bfloat162float(weight[idx1]), rstd);
     const int64_t cos_offset = batch * stride_cos_b + head * stride_cos_h + token * stride_cos_t + offset;
     const int64_t sin_offset = batch * stride_sin_b + head * stride_sin_h + token * stride_sin_t + offset;
 
     float y0;
     float y1;
-    rope_pair(n0, n1, __bfloat162float(cos[cos_offset]), __bfloat162float(sin[sin_offset]), y0, y1);
+    rope_pair<kRoundIntermediates>(
+        n0, n1, __bfloat162float(cos[cos_offset]), __bfloat162float(sin[sin_offset]), y0, y1);
     outrow[idx0] = __float2bfloat16_rn(y0);
     outrow[idx1] = __float2bfloat16_rn(y1);
   }
 }
 
+template <bool kRoundIntermediates>
 inline void launch_one(
     const tvm::ffi::TensorView& x,
     const tvm::ffi::TensorView& cos,
@@ -154,8 +214,17 @@ inline void launch_one(
     return;
   }
   host::RuntimeCheck(num_rows <= static_cast<int64_t>(UINT32_MAX), "LTX2 QKNorm split-RoPE grid is too large");
+  // 16-byte accesses need 8-element aligned half-heads, cos/sin strides and bases
+  const int64_t half_dim = head_dim / 2;
+  const bool vec =
+      half_dim % 8 == 0 && stride_cos_b % 8 == 0 && stride_cos_h % 8 == 0 && stride_cos_t % 8 == 0 &&
+      stride_sin_b % 8 == 0 && stride_sin_h % 8 == 0 && stride_sin_t % 8 == 0 &&
+      reinterpret_cast<uintptr_t>(data_ptr(x)) % 16 == 0 && reinterpret_cast<uintptr_t>(data_ptr(cos)) % 16 == 0 &&
+      reinterpret_cast<uintptr_t>(data_ptr(sin)) % 16 == 0 && reinterpret_cast<uintptr_t>(data_ptr(weight)) % 16 == 0 &&
+      reinterpret_cast<uintptr_t>(mutable_data_ptr(out)) % 16 == 0;
   host::LaunchKernel(dim3(static_cast<uint32_t>(num_rows)), dim3(32, 4), device)(
-      ltx2_qknorm_split_rope_kernel,
+      vec ? ltx2_qknorm_split_rope_kernel<kRoundIntermediates, true>
+          : ltx2_qknorm_split_rope_kernel<kRoundIntermediates, false>,
       reinterpret_cast<const bf16_t*>(data_ptr(x)),
       reinterpret_cast<const bf16_t*>(data_ptr(cos)),
       reinterpret_cast<const bf16_t*>(data_ptr(sin)),
@@ -174,6 +243,7 @@ inline void launch_one(
 }
 
 struct LTX2QKNormSplitRopeKernel {
+  template <bool kRoundIntermediates>
   static void
   run(tvm::ffi::TensorView q_out,
       tvm::ffi::TensorView k_out,
@@ -233,7 +303,7 @@ struct LTX2QKNormSplitRopeKernel {
 
     const int64_t batch_size = batch.unwrap();
     const DLDevice dl_device = device.unwrap();
-    launch_one(
+    launch_one<kRoundIntermediates>(
         q,
         q_cos,
         q_sin,
@@ -251,7 +321,7 @@ struct LTX2QKNormSplitRopeKernel {
         q_sin.stride(1),
         q_sin.stride(2),
         dl_device);
-    launch_one(
+    launch_one<kRoundIntermediates>(
         k,
         k_cos,
         k_sin,
