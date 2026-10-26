@@ -2322,7 +2322,7 @@ async def _send_disaggregation_warmup_requests(
     async def send_request(session: aiohttp.ClientSession, dp_rank: int) -> int:
         json_data = {
             "sampling_params": {
-                "temperature": 0.0,
+                "top_k": 2,
                 "max_new_tokens": 8,
                 "ignore_eos": True,
             },
@@ -2399,7 +2399,7 @@ def _execute_server_warmup(server_args: ServerArgs):
     max_new_tokens = 8 if model_info["is_generation"] else 1
     json_data = {
         "sampling_params": {
-            "temperature": 0,
+            "top_k": 2,
             "max_new_tokens": max_new_tokens,
         },
     }
@@ -2440,7 +2440,7 @@ def _execute_server_warmup(server_args: ServerArgs):
             ],
             "max_tokens": max_new_tokens,
             "stream": False,
-            "temperature": 0.0,
+            "top_k": 2,
         }
     else:
         json_data["text"] = [
