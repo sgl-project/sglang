@@ -1367,7 +1367,8 @@ class SchedulerDisaggregationPrefillMixin:
         if req.finished_reason is None:
             req.finished_reason = FINISH_LENGTH(length=0)
         # unlock the tree
-        release_kv_cache(req, self.tree_cache, checkpoint=True)
+        if not get_disagg().dsv41_encoder_only_prefill or req.extend_end != 0:
+            release_kv_cache(req, self.tree_cache, checkpoint=True)
         self._release_aborted_request(req)
         if not isinstance(req.finished_reason, FINISH_ABORT):
             prepare_abort(

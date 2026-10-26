@@ -460,7 +460,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if self.enable_staging:
             self.transfer_queue._init_staging_handler(self.kv_manager)
 
-        if self._uses_paged_swa_capacity_limit():
+        if (
+            self.scheduler.tp_worker.is_hybrid_swa
+            and not self._uses_swa_tail_prealloc()
+        ):
             # Fallback for SWA allocators that still allocate the SWA pool at
             # full prompt length.
             self.max_total_num_tokens = min(
@@ -497,13 +500,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             and self.token_to_kv_pool_allocator.page_size > 1
             and hasattr(self.token_to_kv_pool_allocator, "alloc_extend_swa_tail")
         )
-
-    def _uses_paged_swa_capacity_limit(self) -> bool:
-        if not self.scheduler.tp_worker.is_hybrid_swa:
-            return False
-        if self._uses_swa_tail_prealloc():
-            return False
-        return getattr(self.token_to_kv_pool, "swa_kv_pool", None) is not None
 
     def _uses_swa_reservation(self) -> bool:
         return (
@@ -2702,8 +2698,12 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
         self._commit_hicache_local_restore_to_req(decode_req)
 
-        cache_only = get_disagg().dsv41_encoder_only_prefill and bool(
-            cached_tokens[CACHE_ONLY_METADATA_SLOT].item()
+        # Fake health/warmup transfers never receive metadata. Their reused
+        # slot may still describe a previous request's cache-only handoff.
+        cache_only = (
+            get_disagg().dsv41_encoder_only_prefill
+            and not _is_fake_transfer(decode_req.req)
+            and bool(cached_tokens[CACHE_ONLY_METADATA_SLOT].item())
         )
         decode_req.req.cached_tokens = cached_tokens[0].item()
         # Seed already_computed with the prefill-reported cache hit so decode
@@ -3570,8 +3570,6 @@ class SchedulerDisaggregationDecodeMixin:
                             f"{len(req.full_untruncated_fill_ids)} coverage={coverage}"
                         )
                     start = coverage
-                    row = self.req_to_token_pool.req_to_token[req.kv.req_pool_idx]
-                    req.prefix_indices = row[:start].clone()
                     req.prefix_len = start
                     # Transferred KV is already computed, not a Decode cache
                     # hit. Preserve both the count and tier breakdown from P,

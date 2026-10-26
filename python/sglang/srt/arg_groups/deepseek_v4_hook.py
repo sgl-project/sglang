@@ -85,7 +85,7 @@ def _validate_dsv41_encoder_only_ratio_layout(hf_config) -> None:
         or any(ratio != 0 for ratio in mtp_ratios)
     ):
         raise ValueError(
-            "--dsv41-encoder-only-prefill requires the official target-layer "
+            "--dsv41-encoder-only-prefill requires a target-layer "
             f"ratio-0/1/2 layout, layer {boundary} to be a global-cache producer, and "
             "bundled MTP layers to have ratio 0"
         )
@@ -364,7 +364,8 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 )
 
     if cfg.dsv41_encoder_only_prefill:
-        hf_config = model_config_of(server_args).hf_config
+        model_config = model_config_of(server_args)
+        hf_config = model_config.hf_config
         if getattr(hf_config, "vision_n_layers", 0) > 0 and not getattr(
             hf_config, "language_model_only", False
         ):
@@ -372,7 +373,7 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 "--dsv41-encoder-only-prefill currently requires a text-only "
                 "configuration; image inputs are not supported in this mode"
             )
-        if getattr(hf_config, "window_size", None) != DSV41_REPLAY_WINDOW:
+        if model_config.sliding_window_size != DSV41_REPLAY_WINDOW:
             raise ValueError(
                 "--dsv41-encoder-only-prefill requires "
                 f"window_size={DSV41_REPLAY_WINDOW}"
