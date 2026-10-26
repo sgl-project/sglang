@@ -443,6 +443,50 @@ python3 -m dynamo.sglang \
   </Accordion>
 </AccordionGroup>
 
+### MI355X deployment measured with SemiAnalysis InferenceX
+
+TP8·EP8 with DFlash V2 on 8× MI355X, measured in [SemiAnalysis InferenceX](https://inferencex.semianalysis.com/) at concurrency 1–64.
+
+- **Container image.** `lmsysorg/sglang-rocm:muse-spark-open-1020`.
+- **HiCache.** At concurrency 16 and above, add the HiCache flags below. `--hicache-size` is the host tier in GB per rank, so 253 GB needs about 2 TB of host memory across the eight ranks.
+
+```bash Command
+SGLANG_USE_AITER=1 \
+SGLANG_USE_AITER_UNIFIED_ATTN=1 \
+MUSE_MOE_BACKEND=flydsl \
+python -m sglang.launch_server \
+  --model-path amd/Muse-Spark-Open-816B-A42B-Quark-MXFP4 \
+  --tp-size 8 \
+  --ep-size 8 \
+  --attention-backend aiter \
+  --page-size 16 \
+  --kv-cache-dtype fp8_e4m3 \
+  --mem-fraction-static 0.85 \
+  --max-running-requests 128 \
+  --swa-full-tokens-ratio 0.2 \
+  --prefill-decode-interval 20 \
+  --scheduler-recv-interval 20 \
+  --tokenizer-worker-num 4 \
+  --speculative-algorithm DFLASH \
+  --speculative-draft-model-path RadixArk/Muse-Spark-Open-DFlash2 \
+  --speculative-draft-attention-backend triton \
+  --speculative-num-draft-tokens 8 \
+  --speculative-draft-window-size 2048 \
+  --reasoning-parser muse \
+  --tool-call-parser muse \
+  --watchdog-timeout 1800 \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+```bash HiCache (concurrency 16 and above)
+  --enable-hierarchical-cache \
+  --hicache-size 253 \
+  --hicache-write-policy write_through \
+  --hicache-io-backend kernel \
+  --hicache-mem-layout page_first
+```
+
 ## 1. Model introduction
 
 This cookbook provides deployment recipes for the Muse Spark Open 816B-A42B checkpoints:
