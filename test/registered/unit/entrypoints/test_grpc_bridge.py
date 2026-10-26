@@ -3,9 +3,14 @@ import enum
 import json
 import unittest
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 from sglang.srt.entrypoints.grpc_bridge import RuntimeHandle
-from sglang.srt.managers.tokenizer_manager import ServerStatus, TokenizerManager
+from sglang.srt.managers.tokenizer_manager import (
+    ServerStatus,
+    SignalHandler,
+    TokenizerManager,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -171,6 +176,46 @@ class TestEngineStateNotifications(CustomTestCase):
 
         self.assertEqual(self.notifications, 1)
         self.assertFalse(handle.health_check())
+
+
+class TestGrpcShutdown(unittest.IsolatedAsyncioTestCase):
+    async def test_shutdown_uses_configured_sigterm_handler_on_owner_loop(self):
+        loop = asyncio.get_running_loop()
+        active_requests = {"in-flight": object()}
+        manager = SimpleNamespace(gracefully_exit=False, rid_to_state=active_requests)
+
+        def sigterm():
+            self.assertIs(asyncio.get_running_loop(), loop)
+            SignalHandler(manager).sigterm_handler()
+
+        callback = Mock(side_effect=sigterm)
+        manager.signal_handler_class = Mock(
+            return_value=SimpleNamespace(sigterm_handler=callback)
+        )
+        handle = RuntimeHandle.__new__(RuntimeHandle)
+        handle.tokenizer_manager = manager
+        handle._event_loop = loop
+        results = await asyncio.gather(
+            *(asyncio.to_thread(handle.shutdown) for _ in range(8))
+        )
+        await asyncio.sleep(0)
+        self.assertEqual(results, [None] * 8)
+        self.assertEqual(callback.call_count, 8)
+        manager.signal_handler_class.assert_called_with(manager)
+        self.assertTrue(manager.gracefully_exit)
+        self.assertIs(manager.rid_to_state, active_requests)
+
+    async def test_shutdown_reports_unavailable_event_loop(self):
+        handle = RuntimeHandle.__new__(RuntimeHandle)
+        handle._event_loop = asyncio.new_event_loop()
+        try:
+            with self.assertRaises(RuntimeError):
+                handle.shutdown()
+            handle._event_loop.close()
+            with self.assertRaises(RuntimeError):
+                handle.shutdown()
+        finally:
+            handle._event_loop.close()
 
 
 if __name__ == "__main__":

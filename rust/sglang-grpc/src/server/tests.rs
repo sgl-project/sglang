@@ -149,6 +149,7 @@ async fn follower_metadata_server_exposes_only_server_info_and_shuts_down() {
         "HealthCheck",
         "FlushCache",
         "Abort",
+        "Shutdown",
     ] {
         client.ready().await.unwrap();
         let result: Result<tonic::Response<GetServerInfoResponse>, _> = client
