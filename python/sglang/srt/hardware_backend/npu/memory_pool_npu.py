@@ -786,6 +786,35 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
 
         self._finalize_allocation_log(size)
 
+    def move_kv_cache(self, tgt_loc, src_loc):
+        """Copy KV rows between slots.
+
+        Only the tree accept path needs this: it compacts the accepted path to
+        the front of each request's block, which the downstream chain-layout
+        code assumes. A chain draft accepts contiguously, so topk == 1 never
+        called it -- which is why this cache never had to implement the base
+        class's `kv_buffer` version.
+
+        MLA keeps one latent buffer per layer (K and V share it), plus the DSA
+        index keys, so all of them have to move together or the next iteration's
+        indexer reads stale keys at the compacted positions.
+        """
+        for k_cache in self.k_buffer:
+            k_cache[tgt_loc] = k_cache[src_loc]
+        for idx_cache in self.index_k_buffer:
+            idx_cache[tgt_loc] = idx_cache[src_loc]
+        for scales in (
+            getattr(self, "k_scale_buffer", None),
+            getattr(self, "index_k_scale_buffer", None),
+        ):
+            if scales is None:
+                continue
+            if torch.is_tensor(scales):
+                scales[tgt_loc] = scales[src_loc]
+            else:
+                for buf in scales:
+                    buf[tgt_loc] = buf[src_loc]
+
     def _mla_buffer_info(self):
         from sglang.srt.mem_cache.device_pool_info import MLABufferInfo
 
