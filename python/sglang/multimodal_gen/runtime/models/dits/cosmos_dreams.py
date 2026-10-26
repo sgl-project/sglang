@@ -204,8 +204,12 @@ def _joint_attention(
     cos_sin_cache: torch.Tensor,
     rope_positions: torch.Tensor,
     null_token_slices: list[slice],
+    chunk_in_prefix: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """One softmax over ``[prefix (text + history) | current chunk]``.
+
+    With ``chunk_in_prefix`` the prefix tensors already end in ``seq_len`` scratch
+    rows (see ``_prefix_kv``) that the chunk's K/V is written into, so no concat.
 
     Returns the attention output and the chunk's K (post-norm, post-RoPE) and V
     (null-action slots zeroed), which is exactly what history must store.
@@ -233,9 +237,14 @@ def _joint_attention(
     v = v.contiguous()
     for null_slice in null_token_slices:
         v[:, null_slice] = 0.0
-    out = attention.attn(
-        q, torch.cat([prefix_k, k], dim=1), torch.cat([prefix_v, v], dim=1)
-    )
+    if chunk_in_prefix:
+        prefix_k[:, -seq_len:] = k
+        prefix_v[:, -seq_len:] = v
+        out = attention.attn(q, prefix_k, prefix_v)
+    else:
+        out = attention.attn(
+            q, torch.cat([prefix_k, k], dim=1), torch.cat([prefix_v, v], dim=1)
+        )
     out, _ = attention.to_out(out.reshape(batch_size, seq_len, -1))
     return out, k, v
 
@@ -277,12 +286,139 @@ def project_actions(
     return projection(flat, domain_ids).reshape(1, tokens, hidden_size)
 
 
-def _prefix_kv(text_kv: KVPair, history_kv: KVPair | None) -> KVPair:
+class PrefixKVHistory(Sequence):
+    """Per-layer ``[text | history | chunk scratch]`` K/V buffers owned by one rollout.
+
+    Indexing yields the layer's committed-history ``(K, V)`` views, so it can stand
+    in for ``list[KVPair]`` anywhere history is only read. The transformer instead
+    attends to ``prefix(layer, chunk_len)``, which already holds text and history in
+    place and ends in scratch rows for the chunk, so a forward copies no history.
+    ``append`` writes committed K/V into the history slice in place.
+    """
+
+    def __init__(self, text_kv: Sequence[KVPair], *, capacity_tokens: int = 0) -> None:
+        self.text_kv = text_kv
+        self._text_len = text_kv[0][0].shape[1]
+        self._len = 0
+        self._k: list[torch.Tensor] = []
+        self._v: list[torch.Tensor] = []
+        for text_k, text_v in text_kv:
+            buf_k = text_k.new_empty(
+                (text_k.shape[0], self._text_len + capacity_tokens, *text_k.shape[2:])
+            )
+            buf_v = text_v.new_empty(buf_k.shape)
+            buf_k[:, : self._text_len] = text_k
+            buf_v[:, : self._text_len] = text_v
+            self._k.append(buf_k)
+            self._v.append(buf_v)
+
+    def __len__(self) -> int:
+        return len(self._k)
+
+    def __getitem__(self, layer_idx):
+        if isinstance(layer_idx, slice):
+            return [self[i] for i in range(*layer_idx.indices(len(self)))]
+        start = self._text_len
+        return (
+            self._k[layer_idx][:, start : start + self._len],
+            self._v[layer_idx][:, start : start + self._len],
+        )
+
+    @property
+    def history_len(self) -> int:
+        return self._len
+
+    def matches_text(self, text_kv: Sequence[KVPair]) -> bool:
+        return len(text_kv) == len(self._k) and all(
+            a[0] is b[0] and a[1] is b[1] for a, b in zip(self.text_kv, text_kv)
+        )
+
+    def _ensure(self, history_tokens: int) -> None:
+        """Make room for ``history_tokens`` rows after the text (amortized growth)."""
+        if self._text_len + history_tokens <= self._k[0].shape[1]:
+            return
+        rows = max(self._text_len + history_tokens, self._k[0].shape[1] * 3 // 2)
+        used = self._text_len + self._len
+        for i, (old_k, old_v) in enumerate(zip(self._k, self._v)):
+            shape = (old_k.shape[0], rows, *old_k.shape[2:])
+            new_k, new_v = old_k.new_empty(shape), old_v.new_empty(shape)
+            new_k[:, :used] = old_k[:, :used]
+            new_v[:, :used] = old_v[:, :used]
+            self._k[i], self._v[i] = new_k, new_v
+
+    def prefix(self, layer_idx: int, chunk_len: int) -> KVPair:
+        """``[text | history | chunk scratch]`` views, scratch rows left unwritten."""
+        self._ensure(self._len + chunk_len)
+        end = self._text_len + self._len + chunk_len
+        return self._k[layer_idx][:, :end], self._v[layer_idx][:, :end]
+
+    def append(
+        self,
+        current_kv: Sequence[KVPair],
+        *,
+        sink_tokens: int,
+        tail_tokens: int | None,
+    ) -> None:
+        """Commit ``current_kv``; with ``tail_tokens`` keep ``sink`` + latest ``tail`` rows."""
+        if len(current_kv) != len(self._k):
+            raise ValueError(
+                "Cosmos-Dreams K/V layer count changed within a rollout: "
+                f"history={len(self._k)}, current={len(current_kv)}."
+            )
+        old_len, new_len = self._len, current_kv[0][0].shape[1]
+        base = self._text_len
+        if tail_tokens is None or old_len + new_len <= sink_tokens + tail_tokens:
+            self._ensure(old_len + new_len)
+            for i, (new_k, new_v) in enumerate(current_kv):
+                self._k[i][:, base + old_len : base + old_len + new_len] = new_k
+                self._v[i][:, base + old_len : base + old_len + new_len] = new_v
+            self._len = old_len + new_len
+            return
+        total = sink_tokens + tail_tokens
+        self._ensure(total)
+        sink_from_old = min(sink_tokens, old_len)
+        tail_from_new = min(tail_tokens, new_len)
+        tail_from_old = tail_tokens - tail_from_new
+        for i, (new_k, new_v) in enumerate(current_kv):
+            for buf, new in ((self._k[i], new_k), (self._v[i], new_v)):
+                pieces: list[torch.Tensor] = []
+                if sink_from_old < sink_tokens:
+                    pieces.append(buf[:, base : base + sink_from_old].clone())
+                    pieces.append(new[:, : sink_tokens - sink_from_old])
+                else:
+                    pieces.append(None)  # sink rows stay where they are
+                if tail_from_old:
+                    pieces.append(
+                        buf[:, base + old_len - tail_from_old : base + old_len].clone()
+                    )
+                if tail_from_new:
+                    pieces.append(new[:, new_len - tail_from_new :])
+                at = base
+                for piece in pieces:
+                    if piece is None:
+                        at += sink_tokens
+                        continue
+                    buf[:, at : at + piece.shape[1]] = piece
+                    at += piece.shape[1]
+        self._len = total
+
+
+def _prefix_kv(
+    text_kv: KVPair, history_kv: KVPair | None, chunk_len: int
+) -> KVPair:
+    """``[text | history | chunk scratch]`` in one allocation and one copy of the prefix."""
     text_k, text_v = text_kv
-    if history_kv is None or history_kv[0].shape[1] == 0:
-        return text_k, text_v
-    history_k, history_v = history_kv
-    return torch.cat([text_k, history_k], dim=1), torch.cat([text_v, history_v], dim=1)
+    history_len = 0 if history_kv is None else history_kv[0].shape[1]
+    text_len = text_k.shape[1]
+    shape = (text_k.shape[0], text_len + history_len + chunk_len, *text_k.shape[2:])
+    buf_k = text_k.new_empty(shape)
+    buf_v = text_v.new_empty(shape)
+    buf_k[:, :text_len] = text_k
+    buf_v[:, :text_len] = text_v
+    if history_len:
+        buf_k[:, text_len : text_len + history_len] = history_kv[0]
+        buf_v[:, text_len : text_len + history_len] = history_kv[1]
+    return buf_k, buf_v
 
 
 class CosmosDreamsTransformer(Cosmos3OmniTransformer):
@@ -466,12 +602,19 @@ class CosmosDreamsTransformer(Cosmos3OmniTransformer):
             action_tokens_per_frame=action_count,
         )
 
+        owned_history = isinstance(
+            history_kv, PrefixKVHistory
+        ) and history_kv.matches_text(text_kv)
         current_kv: list[KVPair] = []
         for layer_idx, layer in enumerate(self.gen_layers):
-            prefix_k, prefix_v = _prefix_kv(
-                text_kv[layer_idx],
-                None if history_kv is None else history_kv[layer_idx],
-            )
+            if owned_history:
+                prefix_k, prefix_v = history_kv.prefix(layer_idx, hidden.shape[1])
+            else:
+                prefix_k, prefix_v = _prefix_kv(
+                    text_kv[layer_idx],
+                    None if history_kv is None else history_kv[layer_idx],
+                    hidden.shape[1],
+                )
             hidden, k, v = layer(
                 hidden,
                 prefix_k=prefix_k,
@@ -479,6 +622,7 @@ class CosmosDreamsTransformer(Cosmos3OmniTransformer):
                 cos_sin_cache=cos_sin_cache,
                 rope_positions=rope_positions,
                 null_token_slices=null_slices,
+                chunk_in_prefix=True,
             )
             current_kv.append((k, v))
 

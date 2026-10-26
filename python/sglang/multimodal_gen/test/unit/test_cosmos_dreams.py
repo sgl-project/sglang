@@ -43,6 +43,7 @@ from sglang.multimodal_gen.runtime.models.dits import cosmos_dreams
 from sglang.multimodal_gen.runtime.models.dits.cosmos_dreams import (
     build_cosmos_dreams_position_ids,
     interleave_action_vision_tokens,
+    PrefixKVHistory,
     null_action_token_slices,
     split_interleaved_action_vision_tokens,
 )
@@ -1574,6 +1575,128 @@ class TestCosmosDreamsPromptAndCanvas(unittest.TestCase):
         torch.testing.assert_close(
             fitted[:, 2:, :], fitted[:, 1:2, :].expand(-1, 6, -1)
         )
+
+
+class TestCosmosDreamsPrefixBuffer(unittest.TestCase):
+    """The rollout-owned buffer must be bitwise-identical to the concat path."""
+
+    LAYERS, HEADS, DIM, TEXT, TPF = 3, 2, 4, 5, 3
+
+    def _kv(self, tokens: int):
+        return [
+            (
+                torch.randn(1, tokens, self.HEADS, self.DIM),
+                torch.randn(1, tokens, self.HEADS, self.DIM),
+            )
+            for _ in range(self.LAYERS)
+        ]
+
+    def _assert_history_equal(self, buffer, history):
+        self.assertEqual(len(buffer), len(history))
+        for (bk, bv), (hk, hv) in zip(buffer, history):
+            self.assertTrue(torch.equal(bk, hk))
+            self.assertTrue(torch.equal(bv, hv))
+
+    def _check_rollout(self, *, sink_frames, window_frames, capacity=0):
+        torch.manual_seed(0)
+        text_kv = self._kv(self.TEXT)
+        buffer = PrefixKVHistory(text_kv, capacity_tokens=capacity)
+        history = None
+        for frames in (1, 1, 2, 1, 3, 1, 1, 2, 4, 1, 1):
+            new = self._kv(frames * self.TPF)
+            kwargs = dict(
+                tokens_per_frame=self.TPF,
+                sink_frames=sink_frames,
+                window_frames=window_frames,
+            )
+            history = append_kv_history(history, new, **kwargs)
+            append_kv_history(buffer, new, **kwargs)
+            self._assert_history_equal(buffer, history)
+            chunk = 2 * self.TPF
+            for layer, (pk, pv) in enumerate(
+                buffer.prefix(layer, chunk) for layer in range(self.LAYERS)
+            ):
+                hist_k, hist_v = history[layer]
+                self.assertTrue(
+                    torch.equal(pk[:, : self.TEXT], text_kv[layer][0])
+                    and torch.equal(pk[:, self.TEXT : -chunk], hist_k)
+                    and torch.equal(pv[:, self.TEXT : -chunk], hist_v)
+                )
+                self.assertEqual(pk.shape[1], self.TEXT + hist_k.shape[1] + chunk)
+
+    def test_full_history_matches_concat_append(self):
+        self._check_rollout(sink_frames=0, window_frames=None)
+
+    def test_full_history_grows_from_a_preallocated_capacity(self):
+        self._check_rollout(sink_frames=0, window_frames=None, capacity=4)
+
+    def test_sliding_window_matches_bounded_append(self):
+        self._check_rollout(sink_frames=0, window_frames=3)
+        self._check_rollout(sink_frames=0, window_frames=3, capacity=5 * self.TPF)
+
+    def test_sink_plus_window_matches_bounded_append(self):
+        self._check_rollout(sink_frames=1, window_frames=3)
+        self._check_rollout(sink_frames=2, window_frames=4, capacity=8 * self.TPF)
+
+    def test_initial_block_over_window_is_rejected(self):
+        buffer = PrefixKVHistory(self._kv(self.TEXT))
+        with self.assertRaisesRegex(ValueError, "exceeds the history window"):
+            append_kv_history(
+                buffer,
+                self._kv(5 * self.TPF),
+                tokens_per_frame=self.TPF,
+                sink_frames=0,
+                window_frames=3,
+            )
+
+    def test_text_identity_is_checked(self):
+        text_kv = self._kv(self.TEXT)
+        buffer = PrefixKVHistory(text_kv)
+        self.assertTrue(buffer.matches_text(text_kv))
+        self.assertFalse(buffer.matches_text(self._kv(self.TEXT)))
+
+    def test_joint_attention_matches_concat_path(self):
+        torch.manual_seed(1)
+        hidden = torch.randn(1, 6, 8)
+        hist_len = 7
+        prefix_k = torch.randn(1, self.TEXT + hist_len, 1, 4)
+        prefix_v = torch.randn(1, self.TEXT + hist_len, 1, 4)
+
+        def attention():
+            return SimpleNamespace(
+                local_num_attention_heads=1,
+                local_num_key_value_heads=1,
+                head_dim=4,
+                to_qkv=lambda h: (torch.cat([h[..., :4], h[..., 4:], h[..., :4] * 0.5], -1), None),
+                norm_q=None,
+                norm_k=None,
+                attn=lambda q, k, v: torch.nn.functional.scaled_dot_product_attention(
+                    q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+                ).transpose(1, 2),
+                to_out=lambda out: (out, None),
+            )
+
+        kwargs = dict(
+            cos_sin_cache=None, rope_positions=None, null_token_slices=[slice(0, 2)]
+        )
+        with mock.patch.object(
+            cosmos_dreams, "_apply_qwen3_qk_norm_rope", lambda q, k, *_: (q, k)
+        ):
+            ref = cosmos_dreams._joint_attention(
+                attention(), hidden, prefix_k=prefix_k, prefix_v=prefix_v, **kwargs
+            )
+            buf_k = torch.cat([prefix_k, torch.empty(1, 6, 1, 4)], 1)
+            buf_v = torch.cat([prefix_v, torch.empty(1, 6, 1, 4)], 1)
+            got = cosmos_dreams._joint_attention(
+                attention(),
+                hidden,
+                prefix_k=buf_k,
+                prefix_v=buf_v,
+                chunk_in_prefix=True,
+                **kwargs,
+            )
+        for a, b in zip(ref, got):
+            self.assertTrue(torch.equal(a, b))
 
 
 if __name__ == "__main__":

@@ -42,6 +42,7 @@ from sglang.multimodal_gen.runtime.models.dits.cosmos_dreams import (
     CosmosDreamsTransformer,
     HistoryKV,
     KVPair,
+    PrefixKVHistory,
 )
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
@@ -593,6 +594,26 @@ def append_kv_history(
                 "Cosmos-Dreams K/V must be matching tensors whose token length is a positive "
                 f"multiple of tokens_per_frame={tokens_per_frame}, got {tuple(key.shape)}."
             )
+    if isinstance(history, PrefixKVHistory):
+        if (
+            window_frames is not None
+            and history.history_len == 0
+            and any(
+                key.shape[1] > (sink_frames + window_frames) * tokens_per_frame
+                for key, _ in current_kv
+            )
+        ):
+            raise ValueError(
+                "The initial Cosmos-Dreams K/V block exceeds the history window."
+            )
+        history.append(
+            current_kv,
+            sink_tokens=sink_frames * tokens_per_frame,
+            tail_tokens=None
+            if window_frames is None
+            else window_frames * tokens_per_frame,
+        )
+        return history
     if history is None:
         if window_frames is not None and any(
             key.shape[1] > (sink_frames + window_frames) * tokens_per_frame
@@ -1625,6 +1646,16 @@ class CosmosDreamsRolloutStage(PipelineStage):
         read_history: HistoryKV | None = None,
     ) -> list[KVPair]:
         """Refresh one clean frame (timestep 0, no time embedding) and commit its K/V."""
+        if history is None:
+            # One rollout-owned [text | history | chunk] buffer replaces the
+            # per-step concats and the per-commit history re-allocation.
+            window = self.profile.window_frames
+            capacity = 0
+            if window is not None:
+                capacity = (
+                    self.profile.sink_frames + window + self.manifest.chunk_size
+                ) * context.tokens_per_frame
+            history = PrefixKVHistory(context.text_kv, capacity_tokens=capacity)
         return commit_clean_kv(
             self.transformer,
             latent,
