@@ -54,6 +54,7 @@ from sglang.benchmark.serving import (
     _EMBEDDING_BACKENDS,
     ASYNC_REQUEST_FUNCS,
     _finite_positive_float,
+    _validate_parsed_gsp_args,
     async_request_openai_embeddings,
     flush_server_cache,
 )
@@ -807,6 +808,7 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
         self.assertTrue(all(isinstance(row, DatasetRow) for row in rows))
 
     def test_speed_bench_sampler(self):
+        """Each row's prompt_len is the token count of its chat-templated prompt."""
         dataset_path = self._write_speed_bench_jsonl()
         args = make_args(
             dataset_name="speed-bench",
@@ -820,7 +822,24 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
         self.assertEqual(len(rows), 3)
         self.assertTrue(all(isinstance(row, DatasetRow) for row in rows))
         self.assertTrue(all(row.output_len == 512 for row in rows))
-        self.assertTrue(all(row.prompt_len > 0 for row in rows))
+
+        with open(dataset_path) as f:
+            source_prompts = [json.loads(line)["turns"][0] for line in f]
+        templated_lens = {
+            len(
+                self.tokenizer.encode(
+                    self.tokenizer.apply_chat_template(
+                        [{"role": "user", "content": text}],
+                        tokenize=False,
+                        add_generation_prompt=True,
+                    ),
+                    add_special_tokens=False,
+                )
+            )
+            for text in source_prompts
+        }
+        for row in rows:
+            self.assertIn(row.prompt_len, templated_lens)
 
     def test_speed_bench_category_filter(self):
         dataset_path = self._write_speed_bench_jsonl()
@@ -1033,6 +1052,66 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
         agentic_rows = get_dataset(agentic_args, self.tokenizer, model_id="dummy-model")
         self.assertEqual(len(agentic_rows), 2)
         self.assertTrue(all(isinstance(row, DatasetRow) for row in agentic_rows))
+
+    def test_gsp_token_ids_have_exact_lengths_and_statistics(self):
+        args = make_args(
+            tokenize_prompt=True,
+            gsp_system_prompt_len=8,
+            gsp_question_len=4,
+            gsp_range_ratio=1.0,
+            gsp_fast_prepare=True,
+            gsp_send_routing_key=True,
+        )
+        dataset = GeneratedSharedPrefixDataset.from_args(args)
+        with (
+            patch.object(self.tokenizer, "encode", side_effect=AssertionError),
+            patch.object(self.tokenizer, "decode", side_effect=AssertionError),
+            patch("builtins.print") as print_mock,
+        ):
+            rows = dataset.load(self.tokenizer)
+        self.assertTrue(rows)
+        for row in rows:
+            self.assertEqual(len(row.prompt), 12)
+            self.assertEqual(row.prompt_len, 12)
+            self.assertTrue(all(isinstance(token, int) for token in row.prompt))
+        printed = "\n".join(str(call.args[0]) for call in print_mock.call_args_list)
+        self.assertIn(f"Total input tokens: {12 * len(rows)}", printed)
+        self.assertIn("Average system prompt length: 8.0 tokens", printed)
+        self.assertIn("Average question length: 4.0 tokens", printed)
+
+    def test_gsp_token_ids_reject_multiple_turns(self):
+        parser = argparse.ArgumentParser()
+        with (
+            patch("sys.stderr", new_callable=io.StringIO) as stderr,
+            self.assertRaises(SystemExit) as error,
+        ):
+            _validate_parsed_gsp_args(
+                parser,
+                make_args(
+                    dataset_name="generated-shared-prefix",
+                    tokenize_prompt=True,
+                    gsp_num_turns=2,
+                ),
+            )
+        self.assertEqual(error.exception.code, 2)
+        self.assertIn("--gsp-num-turns=1", stderr.getvalue())
+        with self.assertRaisesRegex(ValueError, "--gsp-num-turns=1"):
+            GeneratedSharedPrefixDataset.from_args(
+                make_args(tokenize_prompt=True, gsp_num_turns=2)
+            )
+        with self.assertRaisesRegex(ValueError, "num_turns=1"):
+            sample_generated_shared_prefix_requests(
+                num_groups=2,
+                prompts_per_group=2,
+                system_prompt_len=8,
+                question_len=4,
+                output_len=2,
+                range_ratio=1.0,
+                tokenizer=self.tokenizer,
+                seed=42,
+                input_ids=True,
+                num_turns=2,
+            )
 
     def test_get_dataset_unknown_dataset(self):
         args = make_args(dataset_name="not-a-dataset")

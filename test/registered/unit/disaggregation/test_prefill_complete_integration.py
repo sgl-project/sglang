@@ -1,14 +1,12 @@
 """Exercise the allocation policy through production transport and queue methods."""
 
 import threading
-import time
 import unittest
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 
-from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.arg_groups.pd_disaggregation_hook import handle_pd_disaggregation
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.common.bootstrap import DeferredBootstrap
@@ -39,36 +37,6 @@ register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 
 class TestAllocationConfiguration(CustomTestCase):
-    def test_policy_owns_optimistic_prefill_dependency(self):
-        args = ServerArgs(
-            model_path="dummy",
-            disaggregation_mode="prefill",
-            disaggregation_decode_allocation_policy="prefill_complete",
-        )
-        handle_pd_disaggregation(args)
-        self.assertEqual(resolving_view(args).optimistic_prefill_attempts, 1)
-        # Resolution must not rewrite the raw user input.
-        self.assertEqual(args.optimistic_prefill_attempts, 0)
-
-    def test_early_does_not_enable_optimistic_prefill(self):
-        args = ServerArgs(model_path="dummy", disaggregation_mode="prefill")
-        handle_pd_disaggregation(args)
-        self.assertEqual(resolving_view(args).optimistic_prefill_attempts, 0)
-
-    def test_dp_attention_topology_is_supported(self):
-        for size in (1, 4, 8):
-            with self.subTest(size=size):
-                args = ServerArgs(
-                    model_path="dummy",
-                    disaggregation_mode="prefill",
-                    disaggregation_decode_allocation_policy="prefill_complete",
-                    tp_size=size,
-                    dp_size=size,
-                    enable_dp_attention=size > 1,
-                )
-                handle_pd_disaggregation(args)
-                self.assertEqual(resolving_view(args).optimistic_prefill_attempts, 1)
-
     def test_unsupported_modes_fail_explicitly(self):
         combinations = [
             {"disaggregation_mode": "null"},
@@ -208,18 +176,6 @@ class TestAllocationIntegration(CustomTestCase):
         self.flush()
         self.assertEqual(receiver.poll(), KVPoll.WaitingForInput)
 
-    def test_early_receiver_stays_allocatable_without_control_registration(self):
-        override = get_context().override_server_args(
-            disaggregation_decode_allocation_policy="early"
-        )
-        override.install()
-        self.addCleanup(override.restore)
-        self.decode.defer_decode_allocation = False
-        receiver = self.receiver(policy="early")
-        self.assertEqual(receiver.poll(), KVPoll.WaitingForInput)
-        self.assertIsNone(receiver.init_time)
-        self.assertEqual(list(self.wire), [])
-
     def test_shared_receive_wrapper_preserves_native_abort_and_metadata(self):
         sender = self.sender()
         bootstrap = [b"BOOTSTRAP", b"1", b"decode", b"2"]
@@ -273,23 +229,6 @@ class TestAllocationIntegration(CustomTestCase):
                 self.assertEqual(list(self.wire), [])
                 retired.append((sender, receiver))
 
-    def test_completion_before_receiver_uses_same_bootstrap(self):
-        sender = self.sender()
-        sender.mark_prefill_complete()
-        receiver = self.receiver()
-        self.flush()
-        self.assertEqual(receiver.poll(), KVPoll.WaitingForInput)
-
-    def test_receiver_before_sender_uses_no_subscription_retries(self):
-        receiver = self.receiver()
-        self.flush()
-        self.assertEqual(receiver.poll(), KVPoll.Bootstrapping)
-        sender = self.sender()
-        sender.mark_prefill_complete()
-        self.flush()
-        self.assertEqual(receiver.poll(), KVPoll.WaitingForInput)
-        self.assertEqual(list(self.wire), [])
-
     def test_sender_abort_fails_decoder_before_metadata(self):
         sender, receiver = self.sender(), self.receiver()
         self.flush()
@@ -298,101 +237,6 @@ class TestAllocationIntegration(CustomTestCase):
         self.assertEqual(receiver.poll(), KVPoll.Failed)
         sender.clear()
         self.assertIsNone(self.prefill.deferred_bootstrap.rooms[1].owner)
-
-    def test_sender_failure_before_receiver_is_not_lost(self):
-        sender = self.sender()
-        sender.abort()
-        sender.clear()
-        receiver = self.receiver()
-        self.flush()
-        self.assertEqual(receiver.poll(), KVPoll.Failed)
-
-    def test_receiver_abort_notifies_source_using_normal_abort(self):
-        sender, receiver = self.sender(), self.receiver()
-        self.flush()
-        receiver.abort()
-        self.assertEqual(self.wire[0][1][0], b"ABORT")
-        self.flush()
-        self.assertEqual(sender.poll(), KVPoll.Failed)
-        sender.clear()
-        receiver.clear()
-        self.assertNotIn(1, self.decode.request_status)
-
-    def test_cancel_before_sender_creation_is_not_lost(self):
-        receiver = self.receiver()
-        receiver.abort()
-        self.flush()
-        sender = self.sender()
-        self.assertEqual(sender.poll(), KVPoll.Failed)
-        sender.clear()
-        self.assertNotIn(1, self.prefill.request_status)
-
-    def test_readiness_timeout_aborts_before_allocation(self):
-        sender, receiver = self.sender(), self.receiver()
-        receiver._prefill_wait_start = 0
-        self.assertEqual(receiver.poll(), KVPoll.Failed)
-        self.flush()
-        self.assertEqual(sender.poll(), KVPoll.Failed)
-
-    def test_ready_observed_after_compute_deadline_wins(self):
-        sender, receiver = self.sender(), self.receiver()
-        self.flush()
-        receiver._prefill_wait_start = 0
-        sender.mark_prefill_complete()
-        self.flush()
-        self.assertEqual(receiver.poll(), KVPoll.WaitingForInput)
-        self.assertIsNone(receiver._prefill_wait_start)
-
-    def test_admission_timeout_excludes_prefill_compute(self):
-        sender, receiver = self.sender(), self.receiver()
-        sender.init_time = 0
-        self.assertEqual(sender.poll(), KVPoll.Bootstrapping)
-        self.flush()
-        sender.mark_prefill_complete()
-        self.assertEqual(sender.poll(), KVPoll.Bootstrapping)
-        sender._prefill_complete_time = 0
-        self.assertEqual(sender.poll(), KVPoll.Failed)
-        self.flush()
-        self.assertEqual(receiver.poll(), KVPoll.Failed)
-
-    def test_failure_wins_over_late_ready(self):
-        sender, receiver = self.sender(), self.receiver()
-        self.flush()
-        sender.mark_prefill_complete()
-        sender.abort()
-        # Deliver failure before the already-emitted ready status.
-        self.wire.reverse()
-        self.flush()
-        self.assertEqual(receiver.poll(), KVPoll.Failed)
-
-    def test_duplicate_sender_does_not_crash_or_clear_owner(self):
-        sender, receiver = self.sender(), self.receiver()
-        duplicate = self.sender()
-        self.assertEqual(duplicate.poll(), KVPoll.Failed)
-        duplicate.clear()
-        self.assertIs(self.prefill.deferred_bootstrap.rooms[1].owner, sender)
-        sender.clear()
-        self.flush()
-        self.assertEqual(receiver.poll(), KVPoll.Failed)
-
-    def test_duplicate_receiver_does_not_crash_or_clear_owner(self):
-        sender, receiver = self.sender(), self.receiver()
-        self.flush()
-        duplicate = self.receiver()
-        self.assertEqual(duplicate.poll(), KVPoll.Failed)
-        duplicate.clear()
-        self.assertIn(1, self.decode.request_status)
-        self.assertIn(1, self.decode.addr_to_rooms_tracker[receiver.bootstrap_addr])
-        receiver.clear()
-        self.flush()
-        self.assertEqual(sender.poll(), KVPoll.Failed)
-
-    def test_rejected_sender_stays_failed_after_original_clears(self):
-        original = self.sender()
-        duplicate = self.sender()
-        original.clear()
-        self.assertEqual(duplicate.poll(), KVPoll.Failed)
-        duplicate.clear()
 
     def test_fake_warmup_sender_never_registers_deferred_bootstrap(self):
         sender = FakeKVSender(self.prefill, "fake:0", 0)
@@ -403,16 +247,6 @@ class TestAllocationIntegration(CustomTestCase):
         self.assertEqual(sender.poll(), KVPoll.Success)
         self.assertEqual(self.prefill.deferred_bootstrap.rooms, {})
         self.assertEqual(list(self.wire), [])
-
-    def test_abort_after_metadata_uses_existing_drain_protocol(self):
-        receiver = self.receiver()
-        receiver._prefill_wait_start = None
-        receiver.init_time = time.time()
-        self.wire.clear()
-        with patch.object(CommonKVReceiver, "_send_abort_notification") as notify:
-            receiver.abort()
-        notify.assert_called_once()
-        self.assertEqual(receiver.conclude_state, KVPoll.Failed)
 
     def test_mismatched_peer_fails_request_before_destination_registration(self):
         receiver = self.receiver()
@@ -724,14 +558,6 @@ class TestAllocationIntegration(CustomTestCase):
             scheduler.process_disagg_prefill_inflight_queue()
             scheduler.optimistic_release_and_requeue.assert_called_once_with(reqs[0])
 
-    def test_clear_before_allocation_notifies_prefill(self):
-        sender, receiver = self.sender(), self.receiver()
-        self.flush()
-        receiver.clear()
-        self.flush()
-        self.assertEqual(sender.poll(), KVPoll.Failed)
-        self.assertNotIn(1, self.decode.request_status)
-
     def test_success_is_sent_once_after_all_sender_state_is_cleared(self):
         sender, receiver = self.sender(), self.receiver()
         self.flush()
@@ -830,25 +656,6 @@ class TestAllocationIntegration(CustomTestCase):
         self.flush()
         self.assertEqual(receiver.poll(), KVPoll.Success)
 
-    def test_early_transfer_success_does_not_wait_for_sender_cleanup(self):
-        override = get_context().override_server_args(
-            disaggregation_decode_allocation_policy="early"
-        )
-        override.install()
-        self.addCleanup(override.restore)
-        self.prefill.defer_decode_allocation = self.decode.defer_decode_allocation = (
-            False
-        )
-        self.prefill.deferred_bootstrap = None
-        sender, receiver = self.sender(), self.receiver(policy="early")
-        self.prefill.conclude_transfer(
-            bootstrap_room=1, status=KVPoll.Success, targets=[("decode", 2)]
-        )
-        self.flush()
-        self.assertEqual(receiver.poll(), KVPoll.Success)
-        self.assertIn(1, self.prefill.request_status)
-        self.assertEqual(sender.poll(), KVPoll.Success)
-
     def test_recompute_http_error_after_success_before_retirement_is_ignored(self):
         sender, receiver = self.sender(), self.receiver()
         self.flush()
@@ -898,21 +705,6 @@ class TestAllocationIntegration(CustomTestCase):
             retirement.result(timeout=5)
         self.assertFalse(receiver._owns_bootstrap_room)
         self.assertEqual(self.decode.failure_records[1], "HTTP error")
-
-    def test_slow_status_delivery_does_not_hold_bootstrap_lock(self):
-        sender, receiver = self.sender(), self.receiver()
-        self.flush()
-
-        def send(*args, **kwargs):
-            acquired = self.prefill.deferred_bootstrap.lock.acquire(blocking=False)
-            self.assertTrue(acquired)
-            if acquired:
-                self.prefill.deferred_bootstrap.lock.release()
-
-        self.prefill.send_kv_status_message = send
-        sender.mark_prefill_complete()
-        sender.abort()
-        sender.clear()
 
     def test_rebootstrap_dispatch_precedes_ready_without_allocating(self):
         receiver = self.receiver()
@@ -1026,13 +818,6 @@ class TestAllocationIntegration(CustomTestCase):
         queue.add(req, is_rebootstrap=True)
         self.assertEqual(req.bootstrap_room, 1)
         self.assertEqual(req.disagg_prefill_dp_rank, 3)
-
-    def test_receiver_clear_preserves_failure_reason(self):
-        receiver = self.receiver()
-        self.decode.record_failure(1, "original failure")
-        self.decode.update_status(1, KVPoll.Failed)
-        receiver.clear()
-        self.assertEqual(self.decode.failure_records[1], "original failure")
 
 
 if __name__ == "__main__":

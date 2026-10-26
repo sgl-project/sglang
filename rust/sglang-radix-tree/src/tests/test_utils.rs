@@ -35,21 +35,14 @@ pub(crate) fn accumulate_step(
     }
 }
 
-/// Short variant names for diagnosing an action sequence's shape.
-pub(crate) fn action_kinds(actions: &[CacheAction]) -> Vec<&'static str> {
-    actions
-        .iter()
-        .map(|action| match action {
-            CacheAction::FreeDeviceKV(_) => "FreeDeviceKV",
-            CacheAction::FreeDeviceKVFullOnly(_) => "FreeDeviceKVFullOnly",
-            CacheAction::BackupKV(_) => "BackupKV",
-            CacheAction::UpdatePendingBackupOnNodeSplit { .. } => "UpdatePendingBackupOnNodeSplit",
-            CacheAction::MambaEvictExcessPathStates { .. } => "MambaEvictExcessPathStates",
-            CacheAction::FreeComponentDeviceSlot { .. } => "FreeComponentDeviceSlot",
-            CacheAction::FreeComponentHostSlot { .. } => "FreeComponentHostSlot",
-            CacheAction::RebuildFullToSwaMapping { .. } => "RebuildFullToSwaMapping",
-            CacheAction::RecoverSwaWithLockedFull { .. } => "RecoverSwaWithLockedFull",
-            CacheAction::SwaRebuild { .. } => "SwaRebuild",
-        })
-        .collect()
+/// Tags for diagnosing an action sequence's shape.
+pub(crate) fn action_kinds(actions: &[Box<dyn CacheAction>]) -> Vec<&'static str> {
+    actions.iter().map(|action| action.tag()).collect()
+}
+
+pub(crate) fn expect_action<T: std::any::Any>(action: &dyn CacheAction) -> &T {
+    action
+        .as_any()
+        .downcast_ref::<T>()
+        .unwrap_or_else(|| panic!("expected {}, got {:?}", std::any::type_name::<T>(), action))
 }

@@ -205,7 +205,8 @@ class TestNvfp4MoeScaleLoading(CustomTestCase):
             torch.testing.assert_close(up_alpha, gate_alpha)
 
     def test_trtllm_post_load_activation_parameters(self):
-        """Beta adds one in dequantized up units; SiTU keeps its linear scale."""
+        """Beta adds one in dequantized up units and the shared clamp limit is L in
+        both halves' units without changing their weights; SiTU keeps its scale."""
         for activation in ("silu", "situ"):
             with (
                 self.subTest(activation=activation),
@@ -218,6 +219,10 @@ class TestNvfp4MoeScaleLoading(CustomTestCase):
             ):
                 layer = _nvfp4_loader_layer()
                 layer.w13_weight_scale_2.data.copy_(torch.tensor([[0.25, 1.0]]))
+                # TRT-LLM block-scale rows are [up, gate].
+                layer.w13_weight_scale.data.copy_(
+                    torch.tensor([2.0, 1.0]).repeat_interleave(64)[None, :, None]
+                )
                 config = layer.moe_runner_config
                 config.activation = activation
                 config.gemm1_alpha = 1.702 if activation == "silu" else 4.0
@@ -231,13 +236,21 @@ class TestNvfp4MoeScaleLoading(CustomTestCase):
                 torch.testing.assert_close(
                     layer.gemm1_alpha, torch.tensor([config.gemm1_alpha])
                 )
+                up_blocks, gate_blocks = layer.w13_weight_scale[0].float().chunk(2)
+                torch.testing.assert_close(
+                    up_blocks * layer.g1_alphas_up, torch.full((64, 4), 2.0 * 0.5)
+                )
+                torch.testing.assert_close(
+                    gate_blocks * layer.g1_alphas, torch.full((64, 4), 1.0 * 0.125)
+                )
                 if activation == "silu":
                     torch.testing.assert_close(
                         layer.gemm1_beta * layer.g1_alphas_up, torch.ones(1)
                     )
-                    torch.testing.assert_close(
-                        layer.gemm1_clamp_limit * layer.g1_alphas, torch.tensor([7.0])
-                    )
+                    for alphas in (layer.g1_alphas, layer.g1_alphas_up):
+                        torch.testing.assert_close(
+                            layer.gemm1_clamp_limit * alphas, torch.tensor([7.0])
+                        )
                 else:
                     self.assertFalse(hasattr(layer, "gemm1_clamp_limit"))
                     torch.testing.assert_close(layer.gemm1_beta, torch.tensor([25.0]))

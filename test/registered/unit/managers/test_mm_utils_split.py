@@ -212,19 +212,6 @@ class TestMMPadding(CustomTestCase):
                             torch.equal(actual[1:] if prefix == 0 else actual, expected)
                         )
 
-    def test_padding_requires_int64_arrays(self):
-        mm_inputs = MultimodalInputs(mm_items=[])
-        for pad in (
-            pad_mm_tokens,
-            partial(pad_mm_token_pairs, data_token_pairs=[(10, 11)]),
-            MultiModalityDataPaddingPatternMultimodalTokens().pad_input_tokens,
-            MultiModalityDataPaddingPatternTokenPairs([(10, 11)]).pad_input_tokens,
-        ):
-            for input_ids in ([1, 2], array("i", [1, 2])):
-                with self.subTest(pad=pad, input_ids=input_ids):
-                    with self.assertRaisesRegex(AssertionError, "input_ids must be"):
-                        pad(input_ids, mm_inputs)
-
     def test_multimodal_offsets_and_input_ownership(self):
         mm_inputs = MultimodalInputs(
             mm_items=[

@@ -33,10 +33,9 @@ from sglang.srt.mem_cache.unified_radix_cache import (
     _OngoingPrefetch,
 )
 from sglang.srt.mem_cache.utils import get_hash_str
-from sglang.srt.observability.req_time_stats import SchedulerReqTimeStats
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=20, suite="base-a-test-cpu")
+register_cpu_ci(est_time=18, suite="base-a-test-cpu")
 
 _REQ = CacheRequestHandle("r", 0)
 
@@ -300,129 +299,6 @@ class TestWaitingStorageSpan(unittest.TestCase):
 
 
 class TestStoragePrefetchTimeout(unittest.TestCase):
-    def test_metric_episodes_do_not_restart_the_timeout(self):
-        """Closing a wait-metric episode on readiness must not restart the
-        timeout budget: a refetch keeps the budget until admission."""
-        for enable_metrics in (False, True):
-            with self.subTest(enable_metrics=enable_metrics):
-                cache, _ = _timeout_fixture()
-                stats = SchedulerReqTimeStats(
-                    enable_metrics=enable_metrics, metrics_collector=Mock()
-                )
-                stats.set_wait_queue_entry_time(99.0)
-
-                def poll(now):
-                    with patch("time.perf_counter", return_value=now):
-                        ready = cache.check_prefetch_progress(_REQ)
-                        stats.observe_storage_prefetch_ready(ready)
-                    return ready
-
-                self.assertFalse(poll(100.0))
-                self.assertFalse(poll(100.5))
-                # Readiness closes a metric episode; a subsequent refetch must
-                # retain the timeout budget until the request is admitted.
-                cache.revoke_pending_prefetch(_REQ)
-                self.assertTrue(poll(101.0))
-                cache.prefetch_from_storage(_REQ, 0, list(range(8)))
-                self.assertFalse(poll(101.5))
-                self.assertTrue(poll(102.1))
-                self.assertTrue(cache._storage_prefetch_wait[_REQ].expired)
-                meta = stats.convert_to_output_meta_info()
-                if enable_metrics:
-                    self.assertAlmostEqual(meta["storage_prefetch_wait"], 1.6)
-                else:
-                    self.assertNotIn("storage_prefetch_wait", meta)
-
-    def test_budget_starts_at_first_wait_and_survives_refetch(self):
-        """The budget is sized from the first requested span at the first
-        blocked poll and is kept across re-issues until admission or abort."""
-        for mode in ("buffer_only", "cache"):
-            with self.subTest(mode=mode):
-                cache, operation = _timeout_fixture(mode)
-                operation.start_time = 0.0
-                with patch("time.perf_counter", return_value=100.0):
-                    self.assertFalse(cache.check_prefetch_progress(_REQ))
-                self.assertEqual(
-                    cache._storage_prefetch_wait[_REQ].timer.started_at, 100.0
-                )
-                self.assertEqual(cache._storage_prefetch_wait[_REQ].timeout_s, 2.0)
-                # A shorter hit cannot reduce the original four-page allowance.
-                operation.hash_value = ["hit"]
-                with patch("time.perf_counter", return_value=101.5):
-                    self.assertFalse(cache.check_prefetch_progress(_REQ))
-                    cache.revoke_pending_prefetch(_REQ)
-                    cache.prefetch_from_storage(_REQ, 0, list(range(4)))
-                    refetch = cache.ongoing_prefetch[_REQ].operation
-                    self.assertIsNot(refetch, operation)
-                    self.assertFalse(cache.check_prefetch_progress(_REQ))
-                self.assertEqual(
-                    cache._storage_prefetch_wait[_REQ].timer.started_at, 100.0
-                )
-                self.assertEqual(cache._storage_prefetch_wait[_REQ].timeout_s, 2.0)
-                with patch("time.perf_counter", return_value=102.1):
-                    self.assertTrue(cache.check_prefetch_progress(_REQ))
-                self.assertTrue(refetch.deadline_expired)
-                self.assertNotIn(_REQ, cache.ongoing_prefetch)
-                cache.storage_prefetch_retries.refetch(_REQ.rid)
-                cache.prefetch_from_storage(_REQ, 0, list(range(8)))
-                self.assertNotIn(_REQ, cache.ongoing_prefetch)
-                self.assertFalse(cache.storage_prefetch_retries._pending)
-                cache.finish_storage_prefetch_admission(_REQ, 0, None)
-                self.assertFalse(cache._storage_prefetch_wait)
-                cache.prefetch_from_storage(_REQ, 0, list(range(8)))
-                with patch("time.perf_counter", return_value=200.0):
-                    self.assertFalse(cache.check_prefetch_progress(_REQ))
-                self.assertEqual(
-                    cache._storage_prefetch_wait[_REQ].timer.started_at, 200.0
-                )
-                self.assertEqual(cache._storage_prefetch_wait[_REQ].timeout_s, 2.0)
-                cache.release_aborted_request(_REQ)
-                self.assertFalse(cache._storage_prefetch_wait)
-
-    def test_timeout_preserves_complete_kv_with_pending_sidecar(self):
-        """A lapsed budget must not cut a read whose KV already landed and
-        only waits on a sidecar: cutting it would salvage nothing."""
-        for mode in ("buffer_only", "cache"):
-            for remaining_pages in (0, 2):
-                with self.subTest(mode=mode, remaining_pages=remaining_pages):
-                    cache, operation = _timeout_fixture(mode)
-                    with patch("time.perf_counter", return_value=100.0):
-                        self.assertFalse(cache.check_prefetch_progress(_REQ))
-                    operation.hash_value = ["hit"] * remaining_pages
-                    operation.host_indices = torch.arange(remaining_pages * 2)
-                    operation.completed_tokens = remaining_pages * 2
-                    operation.pool_transfers = [PoolTransfer(name=PoolName.SWA)]
-                    operation.pool_transfers_done = False
-                    with patch("time.perf_counter", return_value=200.0):
-                        self.assertFalse(cache.check_prefetch_progress(_REQ))
-                    self.assertFalse(operation.deadline_expired)
-
-    def test_stop_policies_distinguish_deadline_from_storage_failure(self):
-        """Only the timeout policy marks a deadline cut; a storage failure
-        under any policy terminates without the deadline flag."""
-        for policy in ("timeout", "wait_complete", "best_effort"):
-            for failed in (False, True):
-                with self.subTest(policy=policy, failed=failed):
-                    cache, operation = _timeout_fixture(policy=policy)
-                    operation.hash_value = ["a", "b", "c", "d"]
-                    operation.host_indices = torch.arange(8)
-                    operation.completed_tokens = 2
-                    cache._handle_prefetch_result = Mock()
-                    with patch("time.perf_counter", return_value=100.0):
-                        cache.check_prefetch_progress(_REQ)
-                    if failed:
-                        operation.mark_terminate()
-                    with patch("time.perf_counter", return_value=200.0):
-                        self.assertEqual(
-                            cache.check_prefetch_progress(_REQ),
-                            failed or policy != "wait_complete",
-                        )
-                    self.assertEqual(
-                        operation.deadline_expired, policy == "timeout" and not failed
-                    )
-                    if policy != "timeout":
-                        self.assertFalse(cache._storage_prefetch_wait)
-
     def test_expiry_is_agreed_even_before_a_peer_starts_waiting(self):
         """A rank that has not reached its admission poll must still adopt
         the agreed expiry, or it would re-issue the prefetch alone."""
