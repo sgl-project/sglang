@@ -1215,10 +1215,13 @@ class EagleStepCudaGraphRunner:
                 {
                     "batch_size": step.batch_size,
                     "greedy": step.greedy,
+                    "need_top_k_sampling": key[2],
+                    "need_top_p_sampling": key[3],
+                    "need_min_p_sampling": key[4],
                     "constrained": step.constrained,
                     "memory_mb": round(step.memory_bytes / 2**20, 1),
                 }
-                for step in self._steps.values()
+                for key, step in self._steps.items()
             ],
             "max_batch_size": self.max_batch_size,
             "fallbacks": dict(self._fallbacks),

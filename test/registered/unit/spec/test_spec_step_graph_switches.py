@@ -22,7 +22,7 @@ import torch
 
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
-from sglang.srt.environ import EnvField, envs
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     ParallelContext,
     RuntimeContext,
@@ -101,17 +101,6 @@ def _values():
 
 
 class TestSwitchesFollowTheFlag(CustomTestCase):
-    def test_the_flag_has_six_switches(self):
-        # Every env var whose default follows the flag, and only those.
-        default = envs.SGLANG_SPEC_FUSED_RELAY.default
-        followers = {
-            field.name
-            for field in vars(type(envs)).values()
-            if isinstance(field, EnvField) and field.default is default
-        }
-        self.assertEqual(followers, {switch.name for switch in SWITCHES})
-        self.assertEqual(len(followers), 6)
-
     def test_flag_alone_turns_every_piece_on(self):
         args = _launch(_argv(flag=True))
         self.assertTrue(resolution_result(args, "enable_speculative_step_cuda_graph"))

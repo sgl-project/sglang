@@ -9,6 +9,7 @@ import tqdm
 
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.sampling.sampling_params import TOP_K_ALL, SamplingParams
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -89,12 +90,19 @@ def _step_graph_warmup_batch_sizes(internal_states: List[Dict[str, Any]]) -> Lis
 
 
 def _missing_batch_sizes(
-    internal_states: List[Dict[str, Any]], batch_sizes: List[int]
+    internal_states: List[Dict[str, Any]],
+    batch_sizes: List[int],
+    sampling_flags: Dict[str, bool],
 ) -> List[int]:
-    """The batch sizes some active runner has no captured key for."""
+    """Sizes missing an unconstrained key for the warmup's sampling mode."""
     missing = set()
     for _, stats in _active_step_cuda_graph_stats(internal_states):
-        captured = {key["batch_size"] for key in stats.get("captured_keys", ())}
+        captured = {
+            key["batch_size"]
+            for key in stats.get("captured_keys", ())
+            if not key["constrained"]
+            and all(key[name] == value for name, value in sampling_flags.items())
+        }
         missing.update(bs for bs in batch_sizes if bs not in captured)
     return sorted(missing)
 
@@ -119,7 +127,10 @@ async def _run_step_graph_warmup_batch(
 
 
 def _log_step_graph_warmup(
-    internal_states: List[Dict[str, Any]], batch_sizes: List[int], seconds: float
+    internal_states: List[Dict[str, Any]],
+    batch_sizes: List[int],
+    seconds: float,
+    sampling_flags: Dict[str, bool],
 ):
     active = _active_step_cuda_graph_stats(internal_states)
     for index, (_, stats) in enumerate(active):
@@ -138,11 +149,11 @@ def _log_step_graph_warmup(
                 for key in keys
             ),
         )
-    missing = _missing_batch_sizes(internal_states, batch_sizes)
+    missing = _missing_batch_sizes(internal_states, batch_sizes, sampling_flags)
     if missing:
         logger.warning(
             "Speculative step CUDA graph warm-up: no key captured for batch "
-            "size(s) %s; they are captured at first use.",
+            "size(s) %s with the default sampling; they are captured at first use.",
             missing,
         )
 
@@ -171,6 +182,15 @@ async def speculative_step_cuda_graph_warmup(
     sampling_params = default_chat_sampling_params(
         tokenizer_manager.model_config, _STEP_GRAPH_WARMUP_NEW_TOKENS
     )
+    effective_params = SamplingParams(
+        **{**(tokenizer_manager.preferred_sampling_params or {}), **sampling_params}
+    )
+    sampling_flags = {
+        "greedy": effective_params.top_k <= 1,
+        "need_top_k_sampling": effective_params.top_k != TOP_K_ALL,
+        "need_top_p_sampling": effective_params.top_p != 1.0,
+        "need_min_p_sampling": effective_params.min_p > 0.0,
+    }
     logger.info(
         "Speculative step CUDA graph warm-up with the default sampling: %s; "
         "batch sizes 1-%d.",
@@ -184,14 +204,16 @@ async def speculative_step_cuda_graph_warmup(
             tokenizer_manager, bs * num_dp_ranks, sampling_params
         )
     states = await tokenizer_manager.get_internal_state()
-    missing = _missing_batch_sizes(states, batch_sizes)
+    missing = _missing_batch_sizes(states, batch_sizes, sampling_flags)
     for bs in missing:
         await _run_step_graph_warmup_batch(
             tokenizer_manager, bs * num_dp_ranks, sampling_params
         )
     if missing:
         states = await tokenizer_manager.get_internal_state()
-    _log_step_graph_warmup(states, batch_sizes, time.perf_counter() - start)
+    _log_step_graph_warmup(
+        states, batch_sizes, time.perf_counter() - start, sampling_flags
+    )
 
 
 @warmup("whisper_autodetect")

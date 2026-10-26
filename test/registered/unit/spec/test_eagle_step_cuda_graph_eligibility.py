@@ -288,7 +288,7 @@ class TestMemoryRefusal(CustomTestCase):
 
     def test_the_need_follows_the_largest_captured_key(self):
         runner = _runner()
-        runner._steps[("other",)] = SimpleNamespace(
+        runner._steps[runner._key(_batch(), [])] = SimpleNamespace(
             memory_bytes=22 * self.MiB, batch_size=1, greedy=True, constrained=False
         )
         with (
@@ -467,6 +467,7 @@ class _FakeServer:
 
     def __init__(self, runner, max_running_requests, split=(), never=()):
         self.runner = runner
+        self.preferred_sampling_params = None
         self.max_running_requests = max_running_requests
         self.split, self.never = set(split), set(never)
         self.model_config = SimpleNamespace(
@@ -489,8 +490,15 @@ class _FakeServer:
             self.split.discard(bs)
         elif bs not in self.never:
             tokens_per_step = self.runner.worker.speculative_num_steps + 1
+            batch = _batch(bs)
+            (
+                batch.sampling_info.is_all_greedy,
+                batch.sampling_info.need_top_p_sampling,
+                batch.sampling_info.need_top_k_sampling,
+                batch.sampling_info.need_min_p_sampling,
+            ) = _key_flags(req.sampling_params)
             for _ in range(req.sampling_params["max_new_tokens"] // tokens_per_step):
-                self.runner.try_replay(_batch(bs))
+                self.runner.try_replay(batch)
         yield {}
 
 
@@ -499,6 +507,7 @@ class _FakeTokenizerManager:
 
     def __init__(self, states, generation_config):
         self.states = states
+        self.preferred_sampling_params = None
         self.model_config = SimpleNamespace(
             get_default_sampling_params=lambda: dict(generation_config)
         )
@@ -514,7 +523,15 @@ class _FakeTokenizerManager:
 
 def _active_state(max_running_requests, captured=()):
     keys = [
-        {"batch_size": bs, "greedy": False, "constrained": False, "memory_mb": 22.0}
+        {
+            "batch_size": bs,
+            "greedy": False,
+            "need_top_k_sampling": False,
+            "need_top_p_sampling": True,
+            "need_min_p_sampling": False,
+            "constrained": False,
+            "memory_mb": 22.0,
+        }
         for bs in captured
     ]
     return {
@@ -549,6 +566,23 @@ class TestStartupWarmup(CustomTestCase):
         "min_p": ({"min_p": 0.05}, (False, False, False, True)),
         "greedy": ({"temperature": 0.0}, (True, False, True, False)),
     }
+
+    def test_a_different_sampling_key_does_not_hide_a_missing_warmup_key(self):
+        for field, value in (
+            ("greedy", True),
+            ("constrained", True),
+            ("need_top_k_sampling", True),
+            ("need_top_p_sampling", False),
+            ("need_min_p_sampling", True),
+        ):
+            with self.subTest(field=field):
+                state = _active_state(1, captured=[1])
+                state["spec_step_cuda_graph"]["captured_keys"][0][field] = value
+                manager = _FakeTokenizerManager([state], {"top_p": 0.95})
+                with mock.patch.object(warmup_module.logger, "warning") as warning:
+                    requests = _warmup(manager)
+                self.assertEqual(len(requests), 2)
+                warning.assert_called_once()
 
     def test_warmup_sampling_matches_a_chat_request_without_sampling_fields(self):
         for name, (config, flags) in self.GENERATION_CONFIGS.items():
