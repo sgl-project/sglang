@@ -5,6 +5,7 @@ one request alone and among other requests, and compare its rows bit for bit.
 """
 
 import random
+import sys
 from unittest.mock import patch
 
 import pytest
@@ -152,3 +153,7 @@ def test_grid_batch_size():
     with patch.object(sparse_utils, "_is_deterministic_inference", return_value=False):
         assert sparse_utils.grid_batch_size(1) == 1
         assert sparse_utils.grid_batch_size(64) == 64
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
