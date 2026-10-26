@@ -281,6 +281,7 @@ class UnifiedCacheLinkerWrapper:
         self.pending_offloads: list[_PendingOffload] = []
 
         cache.tree_core.enable_external_cache_linker = True
+        self.saved_write_through_threshold = cache.write_through_threshold
         cache.write_through_threshold = 1
 
     @property
@@ -624,3 +625,5 @@ class UnifiedCacheLinkerWrapper:
         self.inflight_load_rids.clear()
         self.private_load_indices.clear()
         self._release_pending_offloads()
+        self.cache.tree_core.enable_external_cache_linker = False
+        self.cache.write_through_threshold = self.saved_write_through_threshold

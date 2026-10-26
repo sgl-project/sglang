@@ -15,6 +15,8 @@ from sglang.srt.managers.communicator import FanOutCommunicator
 from sglang.srt.managers.io_struct import (
     AddExternalCorpusReqInput,
     AddExternalCorpusReqOutput,
+    AttachCacheLinkerReqInput,
+    AttachCacheLinkerReqOutput,
     AttachHiCacheStorageReqInput,
     AttachHiCacheStorageReqOutput,
     BeginWeightUpdateReqInput,
@@ -27,6 +29,8 @@ from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     DestroyWeightsUpdateGroupReqInput,
     DestroyWeightsUpdateGroupReqOutput,
+    DetachCacheLinkerReqInput,
+    DetachCacheLinkerReqOutput,
     DetachHiCacheStorageReqInput,
     DetachHiCacheStorageReqOutput,
     DumperControlReqInput,
@@ -130,6 +134,8 @@ _COMMUNICATOR_SPECS = [
     ("remove_external_corpus", RemoveExternalCorpusReqOutput),
     ("list_external_corpora", ListExternalCorporaReqOutput),
     ("clear_hicache_storage", ClearHiCacheReqOutput),
+    ("attach_cache_linker", AttachCacheLinkerReqOutput),
+    ("detach_cache_linker", DetachCacheLinkerReqOutput),
     ("attach_hicache_storage", AttachHiCacheStorageReqOutput),
     ("detach_hicache_storage", DetachHiCacheStorageReqOutput),
     ("profile", ProfileReqOutput),
@@ -394,6 +400,38 @@ class TokenizerControlMixin:
                 hicache_storage_backend_extra_config=None,
             )
         return out
+
+    async def attach_cache_linker(
+        self: TokenizerManager, obj: AttachCacheLinkerReqInput
+    ) -> AttachCacheLinkerReqOutput:
+        self.auto_create_handle_loop()
+        results = await self.attach_cache_linker_communicator(obj)
+        success, message = FanOutCommunicator.merge_results(results)
+        # As with other fan-out admin operations, partial DP success requires
+        # explicit cleanup; update readback only when all schedulers succeeded.
+        if success:
+            self.record_config_updates(
+                "tokenizer.attach_cache_linker",
+                unified_cache_external_linker_backend=obj.backend,
+                unified_cache_external_linker_config=obj.config,
+            )
+        return AttachCacheLinkerReqOutput(success=success, message=message)
+
+    async def detach_cache_linker(
+        self: TokenizerManager,
+    ) -> DetachCacheLinkerReqOutput:
+        self.auto_create_handle_loop()
+        results = await self.detach_cache_linker_communicator(
+            DetachCacheLinkerReqInput()
+        )
+        success, message = FanOutCommunicator.merge_results(results)
+        if success:
+            self.record_config_updates(
+                "tokenizer.detach_cache_linker",
+                unified_cache_external_linker_backend=None,
+                unified_cache_external_linker_config=None,
+            )
+        return DetachCacheLinkerReqOutput(success=success, message=message)
 
     async def start_profile(
         self: TokenizerManager,

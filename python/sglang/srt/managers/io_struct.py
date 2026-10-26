@@ -1924,6 +1924,27 @@ class DetachHiCacheStorageReqOutput(BaseReq, kw_only=True):
     message: str = ""
 
 
+class AttachCacheLinkerReqInput(BaseReq, kw_only=True):
+    """Attach an external linker using its dedicated configuration schema."""
+
+    backend: str
+    config: Optional[Dict[str, Any]] = None
+
+
+class AttachCacheLinkerReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str = ""
+
+
+class DetachCacheLinkerReqInput(BaseReq, kw_only=True):
+    pass
+
+
+class DetachCacheLinkerReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str = ""
+
+
 class PauseGenerationReqInput(BaseReq, kw_only=True):
     """
     Note that the PauseGenerationRequests is only supported in SGLang Server.

@@ -131,3 +131,47 @@ Notes:
 - **Observability**:
   - After attach, `server_args.hicache_storage_backend*` is updated on both the tokenizer and scheduler sides
   - If metrics are enabled, attach will create a storage metrics collector in `UnifiedRadixCache` on demand
+
+## 5. Unified cache external linkers
+
+On a Linux server launched with `--enable-unified-cache-external-linker`, the dedicated
+`PUT/DELETE/GET /unified-cache/external-linker` endpoints detach and re-attach the direct external linker. The linker mode
+remains a launch-time setting; the server starts attached. Drain traffic before
+changing the attachment. Runtime changes are unavailable with
+`--enable-linker-mla-dedup`.
+
+Use `backend` (`mooncake`, `mori`, or `dynamic`) and `config` in the request. The config is a JSON object
+with the same schema as `--unified-cache-external-linker-config`. The HiCache endpoints and
+request schema remain separate; linker requests have no prefetch/write policies.
+
+For example, after launching with the Mooncake linker and `--admin-api-key`, set
+`ADMIN_API_KEY` to that key and detach before attaching another configuration:
+
+```bash
+curl --fail -X DELETE http://127.0.0.1:30000/unified-cache/external-linker \
+  -H "Authorization: Bearer ${ADMIN_API_KEY}"
+
+curl --fail -X PUT http://127.0.0.1:30000/unified-cache/external-linker \
+  -H "Authorization: Bearer ${ADMIN_API_KEY}" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "backend": "mooncake",
+    "config": {
+      "master_server_address": "127.0.0.1:50051",
+      "enable_group_semantics": true
+    }
+  }'
+```
+
+The Mooncake service must already be running at the supplied address, with its
+transport configured for your deployment. For `dynamic`, install the plugin on
+every worker and supply `linker`, `linker_module_path`, and optional
+`linker_extra_config` in the config object.
+
+Runtime attach uses only the supplied linker configuration; it does not inherit
+`--hicache-storage-backend-extra-config` or a previous attachment's configuration.
+The legacy flag remains a startup fallback for built-in linkers.
+`GET /unified-cache/external-linker` reports the linker backend and config; detach clears
+both. Detach preserves stored data. If cleanup fails on any participating attention
+rank, the schedulers terminate to avoid resuming with inconsistent attachments;
+restart the service before serving more requests.
