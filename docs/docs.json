@@ -1383,6 +1383,7 @@
                   {
                     "group": "MiniMax",
                     "pages": [
+                      "cookbook/autoregressive/MiniMax/MiniMax-M3.1",
                       "cookbook/autoregressive/MiniMax/MiniMax-M3",
                       "cookbook/autoregressive/MiniMax/MiniMax-M2.7",
                       "cookbook/autoregressive/MiniMax/MiniMax-M2",
@@ -1497,6 +1498,12 @@
                     ]
                   },
                   {
+                    "group": "Recursive",
+                    "pages": [
+                      "cookbook/autoregressive/Recursive/Flint"
+                    ]
+                  },
+                  {
                     "group": "Poolside",
                     "pages": [
                       "cookbook/autoregressive/Poolside/Laguna-S-2.1",
@@ -1516,6 +1523,12 @@
                     "group": "Cloudflare",
                     "pages": [
                       "cookbook/autoregressive/Cloudflare/clef"
+                    ]
+                  },
+                  {
+                    "group": "Kev",
+                    "pages": [
+                      "cookbook/autoregressive/Kev/kev"
                     ]
                   }
                 ]
@@ -1677,6 +1690,12 @@
                     "group": "SANA-WM",
                     "pages": [
                       "cookbook/diffusion/SANA-WM/SANA-WM"
+                    ]
+                  },
+                  {
+                    "group": "HY-Nomas",
+                    "pages": [
+                      "cookbook/diffusion/HY-Nomas/HY-Nomas"
                     ]
                   }
                 ]

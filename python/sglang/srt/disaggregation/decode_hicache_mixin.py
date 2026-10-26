@@ -58,6 +58,11 @@ class HiCacheRestoreResult(Enum):
     FAILED = "failed"
 
 
+def _bigram_boundary_tokens(tree_cache) -> int:
+    # An EAGLE tree keys N bigrams with N + 1 token ids; prefix lengths count bigrams.
+    return int(tree_cache.tree_core.is_eagle)
+
+
 class DecodeHiCachePreallocMixin:
     """HiCache hooks for ``DecodePreallocQueue``: issue prefetch + reserve tokens."""
 
@@ -112,7 +117,8 @@ class DecodeHiCachePreallocMixin:
     ) -> None:
         """Issue L3 storage prefetch after admission succeeds.
 
-        On failure, degrades to L2-only restore by clearing l3 fields.
+        Clears the L3 span unless the prefetch was taken, so prefill is never
+        promised tokens nothing will load.
         """
         if (
             prefix_match is None
@@ -122,27 +128,31 @@ class DecodeHiCachePreallocMixin:
             return
         try:
             matched_len = prefix_match.l1_prefix_len + prefix_match.l2_host_hit_length
-            suffix = req.origin_input_ids[
-                matched_len : matched_len + prefix_match.l3_storage_hit_length
-            ]
             last_hash = self.tree_cache.get_last_hash_value(prefix_match.last_host_node)
             prefix_keys = (
                 self.tree_cache.get_prefix_hash_values(prefix_match.last_host_node)
                 if self.tree_cache.hicache_storage_pass_prefix_keys
                 else None
             )
-            self.tree_cache.prefetch_from_storage(
+            # Same span as the prefill scheduler: the queried hit end, plus the
+            # bigram boundary token, with no second storage query.
+            ticketed = self.tree_cache.prefetch_from_storage(
                 req.cache_request_handle,
                 prefix_match.last_host_node,
-                suffix,
+                req.origin_input_ids[matched_len:],
                 last_hash,
                 prefix_keys,
+                matched_prefix_tokens=req.origin_input_ids[:matched_len],
                 extra_key=req.extra_key,
                 cache_salt=req.cache_salt,
+                storage_hit_end=matched_len + prefix_match.l3_storage_hit_length,
             )
             prefix_match.prefetch_registered = self.tree_cache.has_ongoing_prefetch(
                 req.cache_request_handle
             )
+            if not (prefix_match.prefetch_registered or ticketed):
+                # Declined (below prefetch_threshold or rate limited): nothing loads.
+                prefix_match.l3_storage_hit_length = 0
         except Exception as e:
             logger.warning(
                 "HiCache L3 prefetch failed for rid=%s: %s; falling back to L2-only LoadingBack",
@@ -211,12 +221,15 @@ class DecodeHiCacheTransferMixin:
             self.tree_cache.pop_prefetch_loaded_tokens(dr.req.cache_request_handle)
 
         # Re-match: req.last_node / prefix_len updated to current device state.
+        rematch_token_len = pm.decode_prefix_len + _bigram_boundary_tokens(
+            self.tree_cache
+        )
         rematch = match_kv_cache(
             dr.req,
             self.tree_cache,
             dr.req.origin_input_ids,
             cow_mamba=False,
-            max_prefix_len=pm.decode_prefix_len,
+            max_prefix_len=rematch_token_len,
         )
         loaded_len, restored_node = self.tree_cache.init_load_back(
             InitLoadBackParams(

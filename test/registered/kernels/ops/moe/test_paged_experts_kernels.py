@@ -105,6 +105,8 @@ class TestPagedExpertsKernels(CustomTestCase):
             torch.randint(0, 100, (E, 12), dtype=torch.int32).pin_memory(),
             torch.randn(E, dtype=torch.float32).pin_memory(),  # 4-byte rows
             torch.randn(E, 3, dtype=torch.float32).pin_memory(),  # 12-byte rows
+            torch.randn(E, dtype=torch.bfloat16).pin_memory(),  # 2-byte rows
+            torch.randn(E, 3, dtype=torch.bfloat16).pin_memory(),  # 6-byte rows
         ]
         gpus = [
             torch.zeros(K, *h.shape[1:], dtype=h.dtype, device="cuda") for h in hosts
@@ -161,7 +163,7 @@ def _gather_args(hosts, gpus):
         for v in (
             [paged_experts_host_device_pointer(h) for h in hosts],
             [g.data_ptr() for g in gpus],
-            [h[0].numel() * h.element_size() // 4 for h in hosts],
+            [h[0].numel() * h.element_size() for h in hosts],
         )
     ]
 

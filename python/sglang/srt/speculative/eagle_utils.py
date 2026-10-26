@@ -428,11 +428,9 @@ def _seeded_verify_coins(
     per-draft rejection coins; column draft_token_num drives the final
     fallback-sampling coin.
 
-    Scope: this seeds only the verify-side RNG. With rejection sampling the
-    draft workers still pick candidates via unseeded multinomial
-    (fast_sample in eagle_worker_v2), so that mode stays non-deterministic
-    until the draft RNG is seeded in a follow-up; top-k/greedy draft
-    selection is already deterministic.
+    Draft proposal draws use a separate domain-separated seeded stream in
+    ``fast_sample``. Keeping the streams separate preserves the independence
+    required by rejection sampling.
     """
     from sglang.kernels.ops.sampling.murmur_hash import murmur_hash32
 
@@ -877,6 +875,13 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
 
     cur_kv_lens_cpu = torch.tensor(cur_kv_lens, dtype=torch.int32, device="cpu")
     nxt_kv_lens_cpu = torch.tensor(nxt_kv_lens, dtype=torch.int32, device="cpu")
+
+    # Mirrorless opt-out: publish the host-side max of the page-aligned
+    # kv_allocated_len (>= committed + alloc reserve, so it upper-bounds
+    # every length attention can read next round) for the NPU backend's
+    # D2H-free block-table gather sizing.
+    if batch.seq_lens_cpu is None:
+        batch.max_seq_len_host = int(cur_kv_lens_cpu.max())
 
     # Fail fast if the page>1 + topk>1 draft over-allocation
     # (get_alloc_reserve_per_decode) outgrows the req_to_token row: the write below
