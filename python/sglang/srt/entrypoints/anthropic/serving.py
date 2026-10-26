@@ -1457,6 +1457,12 @@ class AnthropicServing:
                 tokenizer = self.openai_serving_chat.tokenizer_manager.tokenizer
                 input_tokens = len(tokenizer.encode(processed.prompt_ids))
 
+            # Reuse generation's public input boundary, excluding any
+            # model-owned assistant generation stub from the reported count.
+            input_tokens = self.openai_serving_chat._reported_prompt_tokens(
+                {"prompt_tokens": input_tokens}
+            )
+
             return JSONResponse(
                 content=AnthropicCountTokensResponse(
                     input_tokens=input_tokens
