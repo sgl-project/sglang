@@ -19,14 +19,14 @@ from sglang.test.ci.ci_register import (
 )
 
 try:
-    from sglang.kernels.ops.attention.fla import (
-        fused_sigmoid_gating_recurrent as recurrent_module,
-    )
-    from sglang.kernels.ops.attention.fla.fused_gdn_gating import fused_gdn_gating
     from sglang.kernels.ops.attention.fla.fused_recurrent import (
         fused_recurrent_gated_delta_rule_update,
     )
-    from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
+    from sglang.kernels.ops.attention.linear import (
+        fused_sigmoid_gating_recurrent as recurrent_module,
+    )
+    from sglang.kernels.ops.attention.linear.fused_gdn_gating import fused_gdn_gating
+    from sglang.kernels.ops.attention.linear.fused_sigmoid_gating_recurrent import (
         _select_recurrent_launch_config,
     )
 

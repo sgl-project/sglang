@@ -84,6 +84,32 @@ def _assert_nonneg_and_invalidate(
     buf[indices] = -1
 
 
+class FutureRelayBuffers:
+    """Seq-lens / bonus buffers a static verify graph scatters into; captured before
+    the FutureMap exists, which adopts them (SGLANG_OPT_DSV41_DSPARK_POST_FOLD)."""
+
+    def __init__(self, *, req_pool_size: int, device) -> None:
+        self.new_seq_lens = torch.empty(
+            (req_pool_size,), dtype=torch.int64, device=device
+        )
+        self.output_tokens = torch.empty(
+            (req_pool_size,), dtype=torch.int64, device=device
+        )
+        self.adopted = False
+        # The step's accept outputs the graph already scattered: publish / stash of
+        # these very tensors skip their scatter (strong refs, so ids never recycle).
+        self.published_seq_lens: Optional[torch.Tensor] = None
+        self.published_bonus: Optional[torch.Tensor] = None
+
+
+_offered_relay: Optional[FutureRelayBuffers] = None
+
+
+def offer_future_relay_buffers(relay: FutureRelayBuffers) -> None:
+    global _offered_relay
+    _offered_relay = relay
+
+
 def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
     """Materialize input_ids at forward entry. Two sources:
 
@@ -257,6 +283,8 @@ class FutureMap:
     publish/stash; next iter reads via resolve_forward_inputs / resolve_seq_lens_cpu.
     """
 
+    _relay = None
+
     def __init__(
         self,
         device: torch.device,
@@ -326,6 +354,21 @@ class FutureMap:
             req_pool_size=self.req_pool_size,
             pool=req_to_token_pool,
         )
+        self._relay: Optional[FutureRelayBuffers] = None
+        if (
+            _offered_relay is not None
+            and _offered_relay.new_seq_lens.shape[0] == self.req_pool_size
+        ):
+            self._adopt_relay(_offered_relay)
+
+    def _adopt_relay(self, relay: FutureRelayBuffers) -> None:
+        if _DEBUG_ASSERT:
+            relay.new_seq_lens.fill_(-1)
+            relay.output_tokens.fill_(-1)
+        self.new_seq_lens_buf = relay.new_seq_lens
+        self.output_tokens_buf = relay.output_tokens
+        relay.adopted = True
+        self._relay = relay
 
     def _maybe_init_forward_bufs(self, payload: RelayPayload) -> None:
         # Local import (see decide_needs_cpu_seq_lens): keep module-level deps leaf.
@@ -541,7 +584,9 @@ class FutureMap:
             int(x) for x in fresh_cpu.tolist()
         ]
 
-    def resolve_seq_lens_cpu(self, batch: ScheduleBatch) -> None:
+    def resolve_seq_lens_cpu(
+        self, batch: ScheduleBatch, stream_ordered: bool = False
+    ) -> None:
         # Lazy pull from new_seq_lens_buf for spec_v2 (accept_lens not known to
         # schedule). The CPU mirror is gated by needs_cpu_seq_lens; backends that
         # opt out take the GPU-only path below. A private D2H stream overlaps the copy.
@@ -552,7 +597,9 @@ class FutureMap:
         fi = draft_input.future_indices
         if fi is None:
             return
-        if self.publish_ready is not None:
+        if self.publish_ready is not None and stream_ordered:
+            self._publish_fresh = False
+        elif self.publish_ready is not None:
             if _DEBUG_ASSERT:
                 # Consume-once: every event wait must be re-armed by a fresh
                 # forward publish; a stale consume means a publish went missing.
@@ -608,7 +655,13 @@ class FutureMap:
         indices = future_indices
         if indices.shape[0] == 0:
             return  # DP idle
-        self.new_seq_lens_buf[indices] = new_seq_lens.to(self.new_seq_lens_buf.dtype)
+        relay = self._relay
+        if relay is not None and new_seq_lens is relay.published_seq_lens:
+            relay.published_seq_lens = None
+        else:
+            self.new_seq_lens_buf[indices] = new_seq_lens.to(
+                self.new_seq_lens_buf.dtype
+            )
         publish_confidence = self.needs_confidence_relay and confidence is not None
         if publish_confidence:
             self.confidence_relay.scatter(indices, confidence)
@@ -636,9 +689,13 @@ class FutureMap:
             return
         self._maybe_init_forward_bufs(payload)
         self._maybe_init_dsa_topk_indices_buf(payload)
-        self.output_tokens_buf[indices] = payload.bonus_tokens.to(
-            self.output_tokens_buf.dtype
-        )
+        relay = self._relay
+        if relay is not None and payload.bonus_tokens is relay.published_bonus:
+            relay.published_bonus = None
+        else:
+            self.output_tokens_buf[indices] = payload.bonus_tokens.to(
+                self.output_tokens_buf.dtype
+            )
 
         # Staging transitions refresh only the bonus token. Preserve top-k and
         # hidden state already published by the preceding target forward.

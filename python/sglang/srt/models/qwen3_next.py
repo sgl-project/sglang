@@ -806,11 +806,11 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
 
         if self.attn_output_gate:
             if _is_hip:
-                from sglang.kernels.ops.moe.triton_sigmoid_gate_mul import (
-                    sigmoid_gate_mul,
+                from sglang.kernels.ops.elementwise.elementwise import (
+                    fused_sigmoid_mul,
                 )
 
-                attn_output = sigmoid_gate_mul(attn_output, gate)
+                attn_output = fused_sigmoid_mul(attn_output, gate)
             else:
                 gate = torch.sigmoid(gate)
                 attn_output = attn_output * gate
