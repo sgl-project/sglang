@@ -109,10 +109,12 @@ def check_weightbridge_receiver_args(server_args: Any) -> None:
     cfg = resolving_view(server_args)
     if not cfg.enable_weightbridge_receiver:
         return
-    # One receiver per TP x PP rank; global rank 0 decides and relays every update.
-    if cfg.dp_size != 1 or cfg.attn_dp_size > 1:
+    # One receiver per TP x PP rank; global rank 0 decides and relays every update. Attention DP
+    # splits that one TP group, but separate replicas would each need their own receivers.
+    if cfg.dp_size != 1:
         raise ValueError(
-            "--enable-weightbridge-receiver does not support data parallelism"
+            "--enable-weightbridge-receiver does not support data-parallel replicas "
+            "(--dp-size > 1); attention DP (--attn-dp-size) is supported"
         )
     if cfg.disaggregation_mode != "null" or cfg.enable_pdmux:
         raise ValueError(
