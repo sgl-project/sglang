@@ -24,6 +24,7 @@ from sglang.srt.layers.attention.linear.utils import (
     resolve_linear_attn_backends,
 )
 from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
+from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -410,6 +411,78 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
             backend.init_forward_metadata(forward_batch)
 
         torch.testing.assert_close(metadata.conv_states_mask_indices, torch.tensor([7]))
+
+    def test_verify_capture_ignores_leftover_prefill_graph_metadata(self):
+        """Prefill capture must not redirect target verification away from its snapshots."""
+        backend = object.__new__(GDNAttnBackend)
+        backend.prefill_graph_metadata = sentinel.prefill_tables
+        backend.mis_metadata = None
+        backend.requires_contiguous_prefill_state = False
+        backend.verify_intermediate_state_indices = torch.tensor([0])
+        backend.kernel_dispatcher = SimpleNamespace(
+            target_verify_supports_strided_qkv=lambda parent: False,
+        )
+        state = MambaPool.SpeculativeState(
+            conv=[torch.empty(1, 3, 3)],
+            temporal=torch.empty(1, 1, 1, 1),
+            intermediate_ssm=torch.empty(1, 3, 1, 1, 1),
+            intermediate_conv_window=[torch.empty(1, 3, 3, 3)],
+        )
+        backend.req_to_token_pool = SimpleNamespace(size=1)
+        backend.state_pool = SimpleNamespace(mamba_cache=state, replayssm_is_kda=False)
+        backend.state_layer_cache = lambda layer_id: state
+        metadata = ForwardMetadata(
+            query_start_loc=torch.tensor([0, 3]),
+            mamba_cache_indices=torch.tensor([0]),
+        )
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            batch_size=1,
+            req_pool_indices=torch.tensor([0]),
+            spec_info=SimpleNamespace(draft_token_num=3),
+            ragged_verify_layout=None,
+        )
+        layer = SimpleNamespace(
+            layer_id=0, conv_weights=None, bias=None, activation="silu"
+        )
+        mixed = torch.empty(3, 3)
+        with (
+            patch.object(backend, "_replay_metadata", return_value=metadata),
+            patch.object(
+                gdn_backend,
+                "gdn_extend_in_graph",
+                return_value=sentinel.prefill_output,
+            ) as prefill,
+            patch.object(
+                gdn_backend,
+                "select_verify_intermediate_state_indices",
+                return_value=torch.tensor([0]),
+            ),
+            patch.object(
+                gdn_backend,
+                "causal_conv1d_update",
+                side_effect=RuntimeError("verify convolution reached"),
+            ) as verify_conv,
+        ):
+            self.assertIs(
+                backend.forward_extend(
+                    layer,
+                    SimpleNamespace(forward_mode=ForwardMode.EXTEND),
+                    mixed,
+                    mixed,
+                    mixed,
+                ),
+                sentinel.prefill_output,
+            )
+            backend.init_forward_metadata_out_graph(batch, in_capture=True)
+            with self.assertRaisesRegex(RuntimeError, "verify convolution reached"):
+                backend.forward_extend(layer, batch, mixed, mixed, mixed)
+
+        self.assertEqual(prefill.call_count, 1)
+        self.assertIs(
+            verify_conv.call_args.kwargs["intermediate_conv_window"],
+            state.intermediate_conv_window[0],
+        )
 
     def test_tree_verify_uses_triton_kernel(self):
         flashinfer_kernel = MagicMock(

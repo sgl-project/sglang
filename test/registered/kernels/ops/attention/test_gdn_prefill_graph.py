@@ -18,9 +18,7 @@ from sglang.srt.layers.attention.linear.gdn_backend import (
     GDNAttnBackend,
     GDNKernelDispatcher,
 )
-from sglang.srt.layers.attention.linear.gdn_prefill_graph import (
-    GDNPrefillGraphMetadata,
-)
+from sglang.srt.layers.attention.linear.kda_prefill_graph import KDAPrefillGraphMetadata
 from sglang.srt.layers.attention.linear.utils import LinearAttnKernelBackend
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace
 from sglang.srt.mem_cache.kv.router import STATE_PART, KVLayerRouter
@@ -162,7 +160,7 @@ class TestGDNPrefillGraph(CustomTestCase):
 
     def _fill(self, meta, batch):
         with patch(
-            "sglang.srt.layers.attention.linear.gdn_backend.mamba_cache_chunk_size",
+            "sglang.srt.layers.attention.hybrid_linear_attn_backend.mamba_cache_chunk_size",
             return_value=CHUNK,
         ):
             self.backend._fill_prefill_graph_metadata(
@@ -172,7 +170,7 @@ class TestGDNPrefillGraph(CustomTestCase):
             )
 
     def _capture(self):
-        meta = GDNPrefillGraphMetadata.allocate(
+        meta = KDAPrefillGraphMetadata.allocate(
             num_tokens=BUCKET,
             max_seqs_cap=MAX_SEQS,
             track=True,
@@ -236,6 +234,24 @@ class TestGDNPrefillGraph(CustomTestCase):
         self.assertTrue(bool((out[:, total:] == 0).all()), "padded rows not zeroed")
         self.assertTrue(torch.equal(self.conv_pool, ref_conv), "conv pool differs")
         self.assertTrue(torch.equal(self.ssm_pool, ref_ssm), "ssm pool differs")
+        if self.ssm_pool.dtype == torch.float32 and track:
+            for row, tracked_length in track.items():
+                if tracked_length % CHUNK:
+                    checkpoint = self.ssm_pool[NUM_SLOTS // 2 + row]
+                    self.assertFalse(
+                        torch.equal(checkpoint, checkpoint.bfloat16().float())
+                    )
+
+        self.backend.init_forward_metadata(batch)
+        eager_output = self.backend.forward_extend(
+            self.layer, batch, self.mixed[:total], self.a[:total], self.b[:total]
+        )
+        reference_output = ref_backend.forward_extend(
+            self.layer, ref_batch, self.mixed[:total], self.a[:total], self.b[:total]
+        )
+        self.assertTrue(torch.equal(eager_output, reference_output))
+        self.assertTrue(torch.equal(self.conv_pool, ref_conv))
+        self.assertTrue(torch.equal(self.ssm_pool, ref_ssm))
 
     def test_replays_match_eager(self):
         cases = [

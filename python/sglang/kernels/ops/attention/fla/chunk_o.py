@@ -66,6 +66,8 @@ def chunk_fwd_kernel_o(
             tl.load(cu_seqlens + i_n + 1).to(tl.int32),
         )
         T = eos - bos
+        if i_t * BT >= T:
+            return
         NT = tl.cdiv(T, BT)
     else:
         NT = tl.cdiv(T, BT)
