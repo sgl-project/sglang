@@ -12,7 +12,7 @@ from sglang.srt.layers.layer_boundary.row_transport import TransportRows
 from sglang.srt.models.deepseek_common import moe_transport
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 
 
 class TestOverlappedTransport(unittest.TestCase):
