@@ -102,6 +102,7 @@ from sglang.srt.models.mimo_audio import AudioEncoderMixin, MiMoAudioEncoderConf
 from sglang.srt.models.mimo_vl import MiMoVisionTransformer, MiMoVLVisionConfig
 from sglang.srt.models.utils import is_non_idle_and_non_empty
 from sglang.srt.multimodal.modality import Modality
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_exec,
     get_flags,
@@ -1830,8 +1831,8 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        current_platform.empty_cache()
+        current_platform.synchronize()
 
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
         if self.model is not None:

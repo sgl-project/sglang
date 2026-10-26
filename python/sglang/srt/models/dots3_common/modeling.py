@@ -116,6 +116,7 @@ from sglang.srt.models.deepseek_common.utils import tiny_router_gemm_max_tokens
 from sglang.srt.models.dots3_common.fp8 import per_token_group_quant_einsum_fp8
 from sglang.srt.models.utils import bind_or_assign
 from sglang.srt.multimodal.modality import Modality
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_device,
     get_exec,
@@ -2312,8 +2313,8 @@ class Dots3LanguageModelForCausalLM(nn.Module):
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        current_platform.empty_cache()
+        current_platform.synchronize()
 
     @staticmethod
     def sliding_layer_window_size(config):

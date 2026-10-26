@@ -60,6 +60,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.glm4 import Glm4Model
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_mm, get_parallel
 from sglang.srt.utils import is_npu
 
@@ -861,8 +862,8 @@ class Glm4vForConditionalGeneration(nn.Module):
         else:
             del self.lm_head.weight
             self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        current_platform.empty_cache()
+        current_platform.synchronize()
 
 
 EntryClass = [Glm4vForConditionalGeneration]
