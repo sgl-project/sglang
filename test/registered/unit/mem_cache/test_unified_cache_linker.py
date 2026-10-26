@@ -1,3 +1,4 @@
+import queue
 import sys
 import threading
 import unittest
@@ -5,19 +6,10 @@ from array import array
 from collections import defaultdict
 from dataclasses import replace
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call, patch
 
 import pytest
-import test_unified_radix_cache_unittest as shared_cache_suite
 import torch
-from test_unified_radix_cache_unittest import (
-    CacheConfig,
-    _device_lock_ref,
-    _device_value,
-    _InsertWalkSuite,
-    _node_children,
-    build_fixture,
-)
 
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
@@ -28,13 +20,17 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.hicache_storage import (
+    HiCacheStorageExtraInfo,
     PoolHitPolicy,
     PoolName,
     PoolTransfer,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
+    MooncakeDirectLinker,
+)
 from sglang.srt.mem_cache.unified_cache.cache_action import (
-    ReplaceWriteThroughOnNodeSplit,
+    UpdatePendingBackupOnNodeSplit,
 )
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.components.base import (
@@ -49,7 +45,20 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     UnifiedCacheLinkerWrapper,
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang.srt.runtime_context import get_disagg
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
+from sglang.test.kits.unified_radix_cache import fixtures as shared_cache_suite
+from sglang.test.kits.unified_radix_cache.config import (
+    CacheConfig,
+)
+from sglang.test.kits.unified_radix_cache.fixtures import (
+    build_fixture,
+    node_children,
+    node_device_lock_ref,
+    node_device_value,
+)
+from sglang.test.kits.unified_radix_cache.mixins import UnifiedRadixCacheFixtures
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 register_cuda_ci(est_time=100, stage="base-b", runner_config="1-gpu-small")
@@ -61,10 +70,12 @@ class _FakeLinker(UnifiedCacheLinker):
         self.restorable = []
         self.queued_loads = {}
         self.queued_offloads = []
+        self.offload_sessions = []
         self.load_landed = True
         self.completed_offloads = []
         self.reset_count = 0
         self.closed = False
+        self.pools = {}
 
     def lookup(self, rid, transfers):
         return list(self.restorable)
@@ -85,8 +96,9 @@ class _FakeLinker(UnifiedCacheLinker):
     def finish_layer_wise_loading(self, counter_index):
         return self.load_landed
 
-    def offload(self, transfers):
+    def offload(self, transfers, session_id=None):
         self.queued_offloads.append(list(transfers))
+        self.offload_sessions.append(session_id)
         return True
 
     def num_completed_offloads(self):
@@ -198,6 +210,7 @@ class _InMemoryUnifiedCacheLinker(UnifiedCacheLinker):
 
     def __init__(self, stored_keys=None):
         self.layer_done_counter = object()
+        self.pools = dict.fromkeys(PoolName)
         self.stored_keys = defaultdict(set) if stored_keys is None else stored_keys
         self.lookup_calls = []
         self.offload_calls = []
@@ -276,7 +289,7 @@ class _InMemoryUnifiedCacheLinker(UnifiedCacheLinker):
             self.queued_loads.pop(rid, None)
         return self.load_landed
 
-    def offload(self, transfers):
+    def offload(self, transfers, session_id=None):
         transfers = self._clone_transfers(transfers)
         self.offload_calls.append(transfers)
         self.pending_offloads.append(transfers)
@@ -308,19 +321,21 @@ class _TreeCoreBackendTestMixin:
     tree_core_backend = "python"
 
     def setUp(self):
-        previous = shared_cache_suite._TREE_CORE_TEST_BACKEND
+        previous = shared_cache_suite.TREE_CORE_TEST_BACKEND
         self.addCleanup(
             setattr,
             shared_cache_suite,
-            "_TREE_CORE_TEST_BACKEND",
+            "TREE_CORE_TEST_BACKEND",
             previous,
         )
-        shared_cache_suite._TREE_CORE_TEST_BACKEND = self.tree_core_backend
+        shared_cache_suite.TREE_CORE_TEST_BACKEND = self.tree_core_backend
         super().setUp()
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "cache fixtures need CUDA")
-class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalkSuite):
+class TestUnifiedCacheLinkerPythonBackend(
+    _TreeCoreBackendTestMixin, UnifiedRadixCacheFixtures, CustomTestCase
+):
     def _bind_loaded_request(self, cache, req_to_token_pool, req, tokens, loaded):
         """Leave ``req`` as admission does: loaded tail written, owned by ``req``."""
         req.kv.cache_protected_len = req.prefix_len
@@ -357,11 +372,15 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
         self.assertTrue(
             torch.equal(
                 kv_offload.device_indices,
-                _device_value(producer, inserted.last_device_node, ComponentType.FULL),
+                node_device_value(
+                    producer, inserted.last_device_node, ComponentType.FULL
+                ),
             )
         )
         self.assertEqual(
-            _device_lock_ref(producer, inserted.last_device_node, ComponentType.FULL),
+            node_device_lock_ref(
+                producer, inserted.last_device_node, ComponentType.FULL
+            ),
             1,
         )
         self.assertFalse(
@@ -378,7 +397,9 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
         producer_linker.complete_next_offload(True)
         producer.check_hicache_events()
         self.assertEqual(
-            _device_lock_ref(producer, inserted.last_device_node, ComponentType.FULL),
+            node_device_lock_ref(
+                producer, inserted.last_device_node, ComponentType.FULL
+            ),
             0,
         )
         self.assertTrue(
@@ -476,6 +497,34 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
         (kv_lookup,) = transfers
         self.assertEqual(kv_lookup.keys, kv_offload.keys[2:])
 
+    def test_decode_match_skips_linker_lookup(self):
+        cfg = CacheConfig(page_size=2, kv_size=64, max_context_len=64)
+        self.cfg = cfg
+        stored_keys = defaultdict(set)
+        producer, producer_allocator, producer_req_pool = build_fixture(cfg)
+        producer_linker = _InMemoryUnifiedCacheLinker(stored_keys)
+        producer.init_cache_linker(producer_linker)
+        tokens = list(range(1, 9))
+        self._insert(producer, producer_allocator, producer_req_pool, tokens)
+        producer_linker.complete_next_offload(True)
+        producer.check_hicache_events()
+
+        consumer, _, consumer_req_pool = build_fixture(cfg)
+        consumer_linker = _InMemoryUnifiedCacheLinker(stored_keys)
+        consumer.init_cache_linker(consumer_linker)
+        key = RadixKey(array("q", tokens))
+        with get_disagg().override(disaggregation_mode="decode"):
+            req = self._make_req(consumer_req_pool)
+            match = consumer.match_prefix(MatchPrefixParams(key=key, req=req))
+        self.assertEqual(match.host_hit_length, 0)
+        self.assertEqual(consumer_linker.lookup_calls, [])
+        self.assertFalse(consumer.linker.has_hit(req.rid))
+
+        req = self._make_req(consumer_req_pool)
+        match = consumer.match_prefix(MatchPrefixParams(key=key, req=req))
+        self.assertEqual(match.host_hit_length, len(tokens))
+        consumer.linker.release_request(req.rid)
+
     def test_failed_split_offload_retries_and_reset_releases_locks(self):
         cfg = CacheConfig(page_size=1, kv_size=64, max_context_len=64)
         self.cfg = cfg
@@ -490,8 +539,8 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
         original_keys = linker.offload_calls[0][0].keys
 
         self._insert(cache, allocator, req_to_token_pool, tokens[:2])
-        (parent,) = _node_children(cache, cache.root_node_handle())
-        (child,) = _node_children(cache, parent)
+        (parent,) = node_children(cache, cache.root_node_handle())
+        (child,) = node_children(cache, parent)
         self.assertEqual(child, original_node)
         self.assertEqual(
             cache.linker.pending_offloads[0].publish_node_ids, [parent, child]
@@ -506,7 +555,9 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
         for node_id in (parent, child):
             self.assertIsNone(cache.tree_core.get_write_through_pending_id(node_id))
             self.assertFalse(cache.tree_core.is_external_cache_stored(node_id))
-            self.assertEqual(_device_lock_ref(cache, node_id, ComponentType.FULL), 0)
+            self.assertEqual(
+                node_device_lock_ref(cache, node_id, ComponentType.FULL), 0
+            )
 
         self._insert(cache, allocator, req_to_token_pool, tokens)
         retry_calls = linker.offload_calls[1:]
@@ -521,7 +572,9 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
         for node_id in (parent, child):
             self.assertIsNone(cache.tree_core.get_write_through_pending_id(node_id))
             self.assertTrue(cache.tree_core.is_external_cache_stored(node_id))
-            self.assertEqual(_device_lock_ref(cache, node_id, ComponentType.FULL), 0)
+            self.assertEqual(
+                node_device_lock_ref(cache, node_id, ComponentType.FULL), 0
+            )
 
         self._insert(cache, allocator, req_to_token_pool, tokens)
         self.assertEqual(len(linker.offload_calls), 3)
@@ -532,12 +585,16 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
         self.assertEqual(
             cache.tree_core.get_write_through_pending_id(pending_node), pending_node
         )
-        self.assertEqual(_device_lock_ref(cache, pending_node, ComponentType.FULL), 1)
+        self.assertEqual(
+            node_device_lock_ref(cache, pending_node, ComponentType.FULL), 1
+        )
 
         cache.linker.reset()
         self.assertEqual(cache.linker.pending_offloads, [])
         self.assertIsNone(cache.tree_core.get_write_through_pending_id(pending_node))
-        self.assertEqual(_device_lock_ref(cache, pending_node, ComponentType.FULL), 0)
+        self.assertEqual(
+            node_device_lock_ref(cache, pending_node, ComponentType.FULL), 0
+        )
         cache.sanity_check()
         cache.reset()
         cache.sanity_check()
@@ -655,7 +712,9 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
             self.assertTrue(req.kv.is_kv_released)
             self.assertIsNone(req.lock)
             for component in (ComponentType.FULL, ComponentType.SWA):
-                self.assertEqual(_device_lock_ref(consumer, loaded_node, component), 0)
+                self.assertEqual(
+                    node_device_lock_ref(consumer, loaded_node, component), 0
+                )
             self.assertEqual((full_free(), swa_free()), (before[0] + 2, before[1] + 2))
             unpublished = consumer.match_prefix(
                 MatchPrefixParams(key=RadixKey(array("q", tokens[:4])))
@@ -691,7 +750,9 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
         self.assertTrue(
             torch.equal(
                 mamba_offload.device_indices,
-                _device_value(producer, inserted.last_device_node, ComponentType.MAMBA),
+                node_device_value(
+                    producer, inserted.last_device_node, ComponentType.MAMBA
+                ),
             )
         )
         for _ in producer_linker.offload_calls:
@@ -808,16 +869,16 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
 
 @unittest.skipUnless(torch.cuda.is_available(), "cache fixtures need CUDA")
 class TestUnifiedCacheLinkerTreeCorePythonBackend(
-    _TreeCoreBackendTestMixin, shared_cache_suite._InsertWalkSuite
+    _TreeCoreBackendTestMixin,
+    UnifiedRadixCacheFixtures,
+    CustomTestCase,
 ):
     """TreeCore linker contracts shared by the Python and Rust inspectors."""
 
     def test_builds_opaque_external_offload_transfers(self):
-        cfg = shared_cache_suite.CacheConfig(
-            page_size=2, kv_size=64, max_context_len=64
-        )
+        cfg = CacheConfig(page_size=2, kv_size=64, max_context_len=64)
         self.cfg = cfg
-        cache, allocator, req_to_token_pool = shared_cache_suite.build_fixture(cfg)
+        cache, allocator, req_to_token_pool = build_fixture(cfg)
         core = cache.tree_core
         core.enable_external_cache_linker = True
 
@@ -834,7 +895,7 @@ class TestUnifiedCacheLinkerTreeCorePythonBackend(
         self.assertTrue(
             torch.equal(
                 transfer.device_indices,
-                shared_cache_suite._device_value(cache, node_id, ComponentType.FULL),
+                node_device_value(cache, node_id, ComponentType.FULL),
             )
         )
 
@@ -851,11 +912,9 @@ class TestUnifiedCacheLinkerTreeCorePythonBackend(
         self.assertTrue(core.is_external_cache_stored(node_id))
 
     def test_external_state_updates_are_atomic_and_path_scoped(self):
-        cfg = shared_cache_suite.CacheConfig(
-            page_size=1, kv_size=64, max_context_len=64
-        )
+        cfg = CacheConfig(page_size=1, kv_size=64, max_context_len=64)
         self.cfg = cfg
-        cache, allocator, req_to_token_pool = shared_cache_suite.build_fixture(cfg)
+        cache, allocator, req_to_token_pool = build_fixture(cfg)
         core = cache.tree_core
         core.enable_external_cache_linker = True
 
@@ -923,11 +982,9 @@ class TestUnifiedCacheLinkerTreeCorePythonBackend(
         self.assertTrue(core.is_external_cache_stored(tail))
 
     def test_failed_offload_preserves_independently_confirmed_state(self):
-        cfg = shared_cache_suite.CacheConfig(
-            page_size=1, kv_size=64, max_context_len=64
-        )
+        cfg = CacheConfig(page_size=1, kv_size=64, max_context_len=64)
         self.cfg = cfg
-        cache, allocator, req_to_token_pool = shared_cache_suite.build_fixture(cfg)
+        cache, allocator, req_to_token_pool = build_fixture(cfg)
         core = cache.tree_core
         core.enable_external_cache_linker = True
 
@@ -1008,6 +1065,28 @@ def test_async_offload_pins_node_until_completion():
     assert not node.external_cache_stored
     assert node.write_through_pending_id is None
     assert unlocks == [(node_id, lock_params)]
+
+
+def test_offload_carries_the_inserting_session():
+    linker = _FakeLinker()
+    nodes = {
+        node_id: SimpleNamespace(
+            id=node_id, external_cache_stored=False, write_through_pending_id=None
+        )
+        for node_id in (7, 8)
+    }
+    cache = _cache_for_wrapper(
+        tree_core=_FakeExternalTreeCore(nodes),
+        inc_lock_ref=lambda node_id: SimpleNamespace(to_dec_params=lambda: None),
+        insert_session_id="session-a",
+    )
+    wrapper = UnifiedCacheLinkerWrapper(cache, linker)
+
+    wrapper.offload_nodes([7])
+    cache.insert_session_id = None
+    wrapper.offload_nodes([8])
+
+    assert linker.offload_sessions == ["session-a", None]
 
 
 def test_offload_skips_node_already_stored_by_tree_core():
@@ -1177,7 +1256,12 @@ def test_split_action_retargets_pending_external_offload():
     cache._replace_pending_write_through_node = lambda *args: calls.append(
         ("hicache", *args)
     )
-    action = ReplaceWriteThroughOnNodeSplit(
+    cache.components = {
+        ComponentType.FULL: SimpleNamespace(
+            apply_component_action=lambda action: calls.append(("full", action))
+        )
+    }
+    action = UpdatePendingBackupOnNodeSplit(
         ack_id=7,
         old_node_id=7,
         new_node_id=8,
@@ -1189,6 +1273,7 @@ def test_split_action_retargets_pending_external_offload():
     assert calls == [
         ("hicache", 7, 7, [8, 7]),
         ("linker", 7, 7, [8, 7]),
+        ("full", action),
     ]
 
 
@@ -1279,10 +1364,10 @@ def test_check_hicache_events_commits_common_rank_results():
 def test_swa_reuse_policy_tracks_layout_without_a_tier_condition(
     monkeypatch, swa_req_ring, enable_hicache
 ):
-    from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import env_gate
+    from sglang.srt.layers.attention.dsv4 import unified_kv_gate
 
     unified_kv = swa_req_ring is True
-    monkeypatch.setattr(env_gate, "is_unified_kv_triton", lambda: unified_kv)
+    monkeypatch.setattr(unified_kv_gate, "is_unified_kv_triton", lambda: unified_kv)
     component = SWAComponent.__new__(SWAComponent)
     component.sliding_window_size = 128
     component.gates_prefix_match = not unified_kv
@@ -1315,6 +1400,23 @@ def test_cache_without_swa_needs_no_reprefill():
     assert cache.swa_reprefill_tail_tokens() == 0
 
 
+@pytest.mark.parametrize("swa_stored", [True, False])
+def test_skip_swa_when_linker_store_lacks_swa(swa_stored):
+    """A store without SWA pages must tombstone restored tails, not mark them hit."""
+    linker = _FakeLinker()
+    if swa_stored:
+        linker.pools[PoolName.SWA] = object()
+    swa = object()
+    cache = _cache_for_wrapper(
+        components={ComponentType.SWA: swa},
+        _components_tuple=(swa,),
+        tree_components=(ComponentType.FULL, ComponentType.SWA),
+    )
+    wrapper = UnifiedCacheLinkerWrapper(cache, linker)
+    assert wrapper._skip_swa is (not swa_stored)
+    assert (swa in wrapper._components) is swa_stored
+
+
 @pytest.fixture
 def full_linker_component():
     def build_transfer(phase, node, keys):
@@ -1338,9 +1440,7 @@ def full_linker_component():
     )
 
 
-def test_linker_filters_request_relative_swa_from_lookup(
-    full_linker_component,
-):
+def test_linker_filters_unstored_swa_from_lookup(full_linker_component):
     full = full_linker_component
     swa = SWAComponent.__new__(SWAComponent)
     swa.build_external_linker_transfer = MagicMock(
@@ -1350,7 +1450,6 @@ def test_linker_filters_request_relative_swa_from_lookup(
     cache = _cache_for_wrapper(
         _components_tuple=(full, swa),
         components={ComponentType.FULL: full, ComponentType.SWA: swa},
-        token_to_kv_pool_allocator=_swa_allocator(True),
         tree_core=SimpleNamespace(enable_external_cache_linker=False, is_eagle=False),
         page_size=2,
         _all_reduce_attn_groups=lambda value, op: None,
@@ -1379,12 +1478,12 @@ def test_linker_filters_request_relative_swa_from_lookup(
     swa.build_external_linker_transfer.assert_not_called()
 
 
-@pytest.mark.parametrize("swa_req_ring", [False, True], ids=["paged", "request-ring"])
+@pytest.mark.parametrize("swa_stored", [True, False], ids=["stored", "unstored"])
 @pytest.mark.parametrize(
     "completion", [True, False, None], ids=["success", "failure", "reset"]
 )
 def test_offload_filters_tree_core_swa_transfers_and_preserves_lifecycle(
-    swa_req_ring, completion
+    swa_stored, completion
 ):
     node = SimpleNamespace(
         id=7, external_cache_stored=False, write_through_pending_id=None
@@ -1399,7 +1498,6 @@ def test_offload_filters_tree_core_swa_transfers_and_preserves_lifecycle(
     cache = _cache_for_wrapper(
         components={ComponentType.SWA: swa},
         _components_tuple=(swa,),
-        token_to_kv_pool_allocator=_swa_allocator(swa_req_ring),
         tree_core=core,
         inc_lock_ref=MagicMock(
             return_value=SimpleNamespace(to_dec_params=lambda: lock_params)
@@ -1407,10 +1505,12 @@ def test_offload_filters_tree_core_swa_transfers_and_preserves_lifecycle(
         dec_lock_ref=MagicMock(),
     )
     backend = _FakeLinker()
+    if swa_stored:
+        backend.pools[PoolName.SWA] = object()
     wrapper = UnifiedCacheLinkerWrapper(cache, backend)
 
     wrapper.offload_nodes([node.id, node.id])
-    expected = transfers[:1] if swa_req_ring else transfers
+    expected = transfers if swa_stored else transfers[:1]
     assert backend.queued_offloads == [expected]
     assert core.offload_transfers == transfers
     assert node.write_through_pending_id == node.id
@@ -1438,25 +1538,24 @@ def test_offload_filters_tree_core_swa_transfers_and_preserves_lifecycle(
 
 
 @pytest.mark.parametrize(
-    "swa_req_ring,previous_boundary,expected_boundary",
+    "swa_stored,previous_boundary,expected_boundary",
     [
-        pytest.param(True, None, 4, id="unified-tombstones"),
-        pytest.param(True, 8, 8, id="preserve-existing-boundary"),
-        pytest.param(False, None, 2, id="paged-prepare-boundary"),
-        pytest.param(None, None, 2, id="other-allocator-prepare-boundary"),
+        pytest.param(False, None, 4, id="unstored-tombstones"),
+        pytest.param(False, 8, 8, id="preserve-existing-boundary"),
+        pytest.param(True, None, 2, id="stored-prepare-boundary"),
     ],
 )
 @pytest.mark.parametrize("load_refused", [False, True], ids=["queued", "refused"])
 def test_linker_load_preserves_swa_boundaries(
     full_linker_component,
-    swa_req_ring,
+    swa_stored,
     previous_boundary,
     expected_boundary,
     load_refused,
 ):
     full = full_linker_component
     swa = SWAComponent.__new__(SWAComponent)
-    participates = not swa_req_ring
+    participates = swa_stored
 
     def prepare(phase, req, full_transfer, transfer, prefix_len, **kwargs):
         if phase == ExternalLinkerLoadPhase.PREPARE:
@@ -1476,11 +1575,12 @@ def test_linker_load_preserves_swa_boundaries(
         _components_tuple=(full, swa),
         page_size=2,
         components={ComponentType.FULL: full, ComponentType.SWA: swa},
-        token_to_kv_pool_allocator=_swa_allocator(swa_req_ring),
         insert=MagicMock(side_effect=AssertionError("the tail must stay private")),
     )
     backend = _FakeLinker()
     backend.load = MagicMock(return_value=not load_refused)
+    if swa_stored:
+        backend.pools[PoolName.SWA] = object()
     wrapper = UnifiedCacheLinkerWrapper(cache, backend)
     wrapper.hit_markers["rid"] = ExternalCacheHitMarker(
         tail_hashes=["a", "b"],
@@ -1527,6 +1627,57 @@ def test_linker_load_preserves_swa_boundaries(
     if not participates:
         swa.build_external_linker_transfer.assert_not_called()
         swa.update_external_linker_load.assert_not_called()
+
+
+class TestOffloadReadyEvents(CustomTestCase):
+    def _record(self, forward_stream):
+        device = MagicMock(name="device_module")
+        device.Event.side_effect = lambda: MagicMock(name="event")
+        linker = _FakeLinker()
+        linker.forward_stream = forward_stream
+        with patch(
+            "sglang.srt.mem_cache.unified_cache.unified_cache_linker.device_module",
+            device,
+        ):
+            return linker.record_offload_ready()
+
+    def test_offload_waits_on_the_forward_writing_the_pages(self):
+        forward_stream = MagicMock(name="forward_stream")
+        indices_ready, kv_written = self._record(forward_stream)
+        indices_ready.record.assert_called_once_with()
+        kv_written.record.assert_called_once_with(forward_stream)
+        # The offload thread waits; the forward stream's own order is untouched.
+        self.assertEqual(forward_stream.mock_calls, [])
+
+    def test_offload_without_a_forward_stream_waits_on_the_current_one(self):
+        (indices_ready,) = self._record(None)
+        indices_ready.record.assert_called_once_with()
+
+    def test_mooncake_offload_thread_waits_on_every_event(self):
+        linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+        order = MagicMock()
+        linker.storage = order.storage
+        order.storage.batch_set_v2.return_value = {}
+        linker.stats = {"offload": 1}
+        linker.offload_results = queue.Queue()
+        linker.offload_queue = queue.Queue()
+        linker.offload_queue.put(
+            (["transfer"], 1, [order.indices_ready, order.kv_written], "session-a")
+        )
+        linker.offload_queue.put(None)
+        linker.offload_thread_func()
+        self.assertEqual(
+            order.mock_calls,
+            [
+                call.indices_ready.synchronize(),
+                call.kv_written.synchronize(),
+                call.storage.batch_set_v2(
+                    ["transfer"],
+                    HiCacheStorageExtraInfo(extra_info={"session_id": "session-a"}),
+                ),
+            ],
+        )
+        self.assertTrue(linker.offload_results.get_nowait())
 
 
 if __name__ == "__main__":

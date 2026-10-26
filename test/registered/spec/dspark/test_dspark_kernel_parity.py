@@ -12,9 +12,7 @@ import unittest
 
 import torch
 
-from sglang.kernels.ops.attention import (
-    dsv4_attn_metadata_kernels as attn_metadata_kernels,
-)
+from sglang.kernels.ops.attention.dsv4 import attn_metadata_kernels
 from sglang.kernels.ops.speculative import ragged_verify_kernels
 from sglang.kernels.ops.speculative.dspark import (
     dspark_accept,

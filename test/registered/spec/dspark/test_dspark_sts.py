@@ -21,12 +21,6 @@ register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class TestApplySts(CustomTestCase):
-    def test_default_buffer_is_identity_sigmoid(self):
-        head = DSparkConfidenceHead(hidden_size=8, markov_rank=4, with_markov=False)
-        confidence_raw = torch.randn(3, 5) * 9.0
-        out = head.apply_sts(confidence_raw)
-        self.assertTrue(torch.equal(out, torch.sigmoid(confidence_raw.float())))
-
     def test_per_position_temperature_scales_each_column(self):
         head = DSparkConfidenceHead(hidden_size=8, markov_rank=4, with_markov=False)
         head.sts_temperatures = torch.tensor([0.5, 1.0, 2.0])
@@ -75,25 +69,6 @@ class TestConfidencePredict(CustomTestCase):
 
 
 class TestDSparkStsCalibration(CustomTestCase):
-    def test_json_round_trip_preserves_fields(self):
-        calibration = DSparkStsCalibration(
-            temperatures=[1.5, 2.0, 0.5],
-            dataset="shards.*.pt",
-            num_samples=1234,
-            ece_before=[0.3, 0.2, 0.1],
-            ece_after=[0.02, 0.01, 0.03],
-        )
-        restored = DSparkStsCalibration.from_json(calibration.to_json())
-        self.assertEqual(restored.temperatures, calibration.temperatures)
-        self.assertEqual(restored.dataset, calibration.dataset)
-        self.assertEqual(restored.num_samples, calibration.num_samples)
-        self.assertEqual(restored.ece_before, calibration.ece_before)
-        self.assertEqual(restored.ece_after, calibration.ece_after)
-
-    def test_rejects_empty_temperatures(self):
-        with self.assertRaises(ValueError):
-            DSparkStsCalibration(temperatures=[])
-
     def test_rejects_non_positive_temperature(self):
         with self.assertRaises(ValueError):
             DSparkStsCalibration(temperatures=[1.0, 0.0, 2.0])

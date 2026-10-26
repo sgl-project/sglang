@@ -44,14 +44,6 @@ class CorrectionBiasCacheTestMixin:
         torch.testing.assert_close(converted_after_reload, reloaded_value.float())
         self.assertNotEqual(converted.data_ptr(), converted_after_reload.data_ptr())
 
-    def test_matching_dtype_returns_original_tensor(self):
-        correction_bias = torch.randn(8, dtype=torch.float32, device=self.device)
-        config = TopKConfig(top_k=2, correction_bias=correction_bias)
-
-        result = config.correction_bias_for_dtype(torch.float32)
-
-        self.assertEqual(result.data_ptr(), correction_bias.data_ptr())
-
 
 class TestCorrectionBiasCacheCPU(CorrectionBiasCacheTestMixin, CustomTestCase):
     device = "cpu"

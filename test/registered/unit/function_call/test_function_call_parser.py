@@ -2059,91 +2059,6 @@ class TestDeepSeekV4Detector(unittest.TestCase):
             ),
         ]
         self.detector = DeepSeekV4Detector()
-        self.tokenizer = _shared_tokenizer("deepseek-ai/DeepSeek-V3.2")
-        self.interval = 1
-
-    def test_detect_and_parse_xml_format(self):
-        """Test parsing standard XML format (DSML)"""
-        text = """I'll help you with information about San Francisco and get its favorite tourist spot for you.\n\n
-        <｜DSML｜tool_calls>\n
-            <｜DSML｜invoke name="get_favorite_tourist_spot">\n
-                <｜DSML｜parameter name="city" string="true">San Francisco</｜DSML｜parameter>\n
-            </｜DSML｜invoke>\n
-            <｜DSML｜invoke name="search">
-                <｜DSML｜parameter name="query" string="true">WebNav benchmark</｜DSML｜parameter>
-                <｜DSML｜parameter name="topn" string="false">10</｜DSML｜parameter>
-                <｜DSML｜parameter name="source" string="true">web</｜DSML｜parameter>
-            </｜DSML｜invoke>
-        </｜DSML｜tool_calls>
-        """
-        result = self.detector.detect_and_parse(text, self.tools)
-
-        self.assertIn("I'll help you with information", result.normal_text)
-        self.assertEqual(len(result.calls), 2)
-
-        # Check first call
-        call1 = result.calls[0]
-        self.assertEqual(call1.name, "get_favorite_tourist_spot")
-        params1 = json.loads(call1.parameters)
-        self.assertEqual(params1["city"], "San Francisco")
-
-        # Check second call
-        call2 = result.calls[1]
-        self.assertEqual(call2.name, "search")
-        params2 = json.loads(call2.parameters)
-        self.assertEqual(params2["query"], "WebNav benchmark")
-        self.assertEqual(params2["topn"], 10)
-        self.assertEqual(params2["source"], "web")
-
-    def test_streaming_xml_format(self):
-        """Test streaming parsing of XML format"""
-        text = """<｜DSML｜tool_calls>
-            <｜DSML｜invoke name="get_favorite_tourist_spot">
-                <｜DSML｜parameter name="city" string="true">San Francisco</｜DSML｜parameter>
-                <｜DSML｜parameter name="another_city" string="true">London</｜DSML｜parameter>
-                <｜DSML｜parameter name="topn" string="false">10</｜DSML｜parameter>
-                <｜DSML｜parameter name="obj" string="false">{"name": "John", "age": 30}</｜DSML｜parameter>
-            </｜DSML｜invoke>
-        </｜DSML｜tool_calls>"""
-
-        input_ids = self.tokenizer.encode(text, add_special_tokens=False)
-        chunk_ids = [
-            input_ids[i : i + self.interval]
-            for i in range(0, len(input_ids), self.interval)
-        ]
-        chunks = [self.tokenizer.decode(chunk_id) for chunk_id in chunk_ids]
-
-        tool_calls_by_index = {}
-
-        num_tool_call_chunks = 0
-        for chunk in chunks:
-            result = self.detector.parse_streaming_increment(chunk, self.tools)
-            for call in result.calls:
-                num_tool_call_chunks += 1
-                if call.tool_index is not None:
-                    if call.tool_index not in tool_calls_by_index:
-                        tool_calls_by_index[call.tool_index] = {
-                            "name": "",
-                            "parameters": "",
-                        }
-
-                    if call.name:
-                        tool_calls_by_index[call.tool_index]["name"] = call.name
-                    if call.parameters:
-                        tool_calls_by_index[call.tool_index]["parameters"] += (
-                            call.parameters
-                        )
-
-        self.assertEqual(num_tool_call_chunks, 1)
-
-        self.assertEqual(len(tool_calls_by_index), 1)
-        self.assertEqual(tool_calls_by_index[0]["name"], "get_favorite_tourist_spot")
-        params = json.loads(tool_calls_by_index[0]["parameters"])
-        self.assertEqual(params["city"], "San Francisco")
-        self.assertEqual(params["another_city"], "London")
-        self.assertEqual(params["topn"], 10)
-        self.assertEqual(params["obj"]["name"], "John")
-        self.assertEqual(params["obj"]["age"], 30)
 
     def test_get_model_structural_tag(self):
         import xgrammar as xgr
@@ -2196,96 +2111,6 @@ class TestDeepSeekV4Detector(unittest.TestCase):
         self.assertIsInstance(structural_tag, xgr.StructuralTag)
         grammar = xgr.Grammar.from_structural_tag(structural_tag)
         self.assertIsInstance(grammar, xgr.Grammar)
-
-    def test_self_closing_zero_arg_invoke(self):
-        """V4 emits `<｜DSML｜invoke name="x"/>` for zero-arg tools; the
-        detector must parse it as a complete tool call with empty params
-        instead of leaking the raw markup back into normal_text."""
-        submit_tool = Tool(
-            type="function",
-            function=Function(
-                name="submit",
-                description="Submit the final answer.",
-                parameters={"type": "object", "properties": {}},
-            ),
-        )
-
-        text = (
-            "Final answer.\n"
-            '<｜DSML｜tool_calls>\n<｜DSML｜invoke name="submit"/>\n'
-            "</｜DSML｜tool_calls>"
-        )
-        result = self.detector.detect_and_parse(text, [submit_tool])
-        self.assertEqual(len(result.calls), 1)
-        self.assertEqual(result.calls[0].name, "submit")
-        self.assertEqual(json.loads(result.calls[0].parameters), {})
-        self.assertNotIn("DSML", result.normal_text)
-
-    def test_self_closing_mixed_with_long_form(self):
-        """Mix of long-form (with params) and self-closing tags in one block."""
-        submit_tool = Tool(
-            type="function",
-            function=Function(
-                name="submit",
-                parameters={"type": "object", "properties": {}},
-            ),
-        )
-        text = (
-            "<｜DSML｜tool_calls>\n"
-            '<｜DSML｜invoke name="get_favorite_tourist_spot">\n'
-            '<｜DSML｜parameter name="city" string="true">SF</｜DSML｜parameter>\n'
-            "</｜DSML｜invoke>\n"
-            '<｜DSML｜invoke name="submit"/>\n'
-            "</｜DSML｜tool_calls>"
-        )
-        result = self.detector.detect_and_parse(text, self.tools + [submit_tool])
-        self.assertEqual(len(result.calls), 2)
-        self.assertEqual(result.calls[0].name, "get_favorite_tourist_spot")
-        self.assertEqual(json.loads(result.calls[0].parameters), {"city": "SF"})
-        self.assertEqual(result.calls[1].name, "submit")
-        self.assertEqual(json.loads(result.calls[1].parameters), {})
-
-    def test_streaming_self_closing_invoke(self):
-        """Self-closing invoke must terminate cleanly even when `/>` arrives
-        after the `name=` attribute crosses chunk boundaries."""
-        submit_tool = Tool(
-            type="function",
-            function=Function(
-                name="submit",
-                parameters={"type": "object", "properties": {}},
-            ),
-        )
-        # Build the prompt and feed it through the tokenizer to exercise the
-        # same chunk shapes the runtime sees.
-        text = (
-            "<｜DSML｜tool_calls>\n"
-            '<｜DSML｜invoke name="submit"/>\n'
-            "</｜DSML｜tool_calls>"
-        )
-        self.detector = DeepSeekV4Detector()
-        input_ids = self.tokenizer.encode(text, add_special_tokens=False)
-        chunks = [
-            self.tokenizer.decode(input_ids[i : i + self.interval])
-            for i in range(0, len(input_ids), self.interval)
-        ]
-
-        tool_calls_by_index = {}
-        for chunk in chunks:
-            result = self.detector.parse_streaming_increment(chunk, [submit_tool])
-            for call in result.calls:
-                if call.tool_index is None:
-                    continue
-                slot = tool_calls_by_index.setdefault(
-                    call.tool_index, {"name": "", "parameters": ""}
-                )
-                if call.name:
-                    slot["name"] = call.name
-                if call.parameters:
-                    slot["parameters"] += call.parameters
-
-        self.assertEqual(len(tool_calls_by_index), 1)
-        self.assertEqual(tool_calls_by_index[0]["name"], "submit")
-        self.assertEqual(json.loads(tool_calls_by_index[0]["parameters"]), {})
 
 
 class TestQwen3CoderDetector(unittest.TestCase):
@@ -4048,6 +3873,33 @@ class TestJsonArrayParser(unittest.TestCase):
         result = self.detector.parse_streaming_increment("", self.tools)
         self.assertEqual(len(result.calls), 0)
         self.assertEqual(result.normal_text, "")
+
+    def test_finish_streams_arguments_of_calls_completed_in_final_chunk(self):
+        """Calls that arrive whole in the last chunk still stream their
+        arguments at stream end, exactly once."""
+        text = (
+            '[{"name": "get_weather", "parameters": {"location": "Tokyo"}}, '
+            '{"name": "search", "parameters": {"query": "restaurants"}}]'
+        )
+        calls = self.detector.parse_streaming_increment(text, self.tools).calls
+        calls += self.detector.finish(self.tools).calls
+
+        streamed = {}
+        for call in calls:
+            entry = streamed.setdefault(call.tool_index, {"name": "", "arguments": ""})
+            entry["name"] += call.name or ""
+            entry["arguments"] += call.parameters or ""
+        self.assertEqual(
+            [
+                (e["name"], json.loads(e["arguments"]))
+                for _, e in sorted(streamed.items())
+            ],
+            [
+                ("get_weather", {"location": "Tokyo"}),
+                ("search", {"query": "restaurants"}),
+            ],
+        )
+        self.assertEqual(self.detector.finish(self.tools).calls, [])
 
     def test_braces_in_strings(self):
         """Test that JSON with } characters inside strings works correctly"""

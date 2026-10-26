@@ -1191,6 +1191,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         controller.mem_pool_device = None
         controller.mem_pool_device_allocator = mock.Mock()
         controller.ack_write_queue = []
+        controller.write_fence_stream = None
         controller.move_hybrid_indices = mock.Mock(
             side_effect=AssertionError(
                 "write-back JIT kernel write should not move indices"
@@ -1226,6 +1227,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         controller.mem_pool_device = None
         controller.mem_pool_device_allocator = mock.Mock()
         controller.ack_write_queue = []
+        controller.write_fence_stream = None
         controller.move_hybrid_indices = mock.Mock(
             return_value=(op.host_indices, op.device_indices, op.pool_transfers)
         )
@@ -1284,6 +1286,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         controller.mem_pool_device = None
         controller.mem_pool_device_allocator = mock.Mock()
         controller.ack_write_queue = []
+        controller.write_fence_stream = None
         with mock.patch.object(transfer_module, "device_module", _FakeDeviceModule):
             controller.l2_transfer_engine = L2TransferEngine("kernel")
         return controller
@@ -1313,6 +1316,31 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         self.assertEqual(len(controller.ack_write_queue), 1)
         self.assertEqual(controller.ack_write_queue[0].node_ids, [1, 2])
         self.assertEqual(controller.ack_write_queue[0].num_tokens, 8)
+
+    def test_write_copy_waits_for_queued_forwards(self):
+        # Under overlap scheduling a finished request is cached while the next
+        # forward still writes its last token's KV; the D2H copy must start
+        # after that forward, or the host keeps a half-written token.
+        events = []
+
+        class RecordingStream:
+            def __init__(self, name):
+                self.name = name
+
+            def wait_stream(self, other):
+                events.append(f"{self.name} waits {other.name}")
+
+        controller = self._chain_write_controller(events)
+        controller.l2_transfer_engine.device_to_host_stream = RecordingStream("d2h")
+        controller.write_fence_stream = RecordingStream("forward")
+
+        with mock.patch.object(transfer_module, "device_module", _FakeDeviceModule):
+            controller.write(_indices(4, 8), node_id=1)
+
+        self.assertEqual(len(events), 2)
+        self.assertEqual(events[0], "d2h waits forward")
+        # Then the write's one copy, of the node's device slots.
+        self.assertEqual(events[1][1].tolist(), [4, 5, 6, 7])
 
     def test_hybrid_write_flushes_by_default(self):
         captured = []
@@ -1352,6 +1380,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         controller.mem_pool_device_allocator = mock.Mock()
         controller.device = "cuda"
         controller.ack_write_queue = []
+        controller.write_fence_stream = None
         controller.move_indices = mock.Mock(
             side_effect=AssertionError(
                 "write-back JIT kernel write should not move indices"
@@ -1389,6 +1418,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         controller.mem_pool_device_allocator = mock.Mock()
         controller.device = "cuda"
         controller.ack_write_queue = []
+        controller.write_fence_stream = None
         controller.move_indices = mock.Mock(
             return_value=(op.host_indices, op.device_indices)
         )
@@ -1397,6 +1427,68 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
 
         controller.move_indices.assert_called_once()
         self.assertEqual(captured["host_indices"].device.type, "cpu")
+
+
+class _IndexTensorStub:
+    """Stands in for an index tensor resident on ``device_type``; CPU CI has no xpu."""
+
+    def __init__(self, device_type: str):
+        self.device = torch.device(device_type)
+        self.is_cuda = device_type == "cuda"
+        self.recorded = []
+
+    def record_stream(self, stream):
+        self.recorded.append(stream)
+
+
+def _record_stream_transfer(host_indices, device_indices) -> L2Transfer:
+    return L2Transfer(
+        host_pool=None,
+        device_pool=None,
+        host_indices=host_indices,
+        device_indices=device_indices,
+    )
+
+
+class TestL2TransferRecordStream(CustomTestCase):
+    """XPU index tensors must be kept alive across an L2 copy, like CUDA ones."""
+
+    def test_xpu_indices_are_kept_alive(self):
+        host = _IndexTensorStub("cpu")
+        device = _IndexTensorStub("xpu")
+        stream = object()
+
+        L2TransferEngine._record_stream([_record_stream_transfer(host, device)], stream)
+
+        self.assertEqual(
+            device.recorded,
+            [stream],
+            "xpu index tensor was not pinned to the transfer stream; it can be "
+            "freed and reused while the copy is in flight",
+        )
+        self.assertEqual(
+            host.recorded, [], "record_stream is meaningless for a host tensor"
+        )
+
+    def test_cuda_indices_are_kept_alive(self):
+        host = _IndexTensorStub("cpu")
+        device = _IndexTensorStub("cuda")
+        stream = object()
+
+        L2TransferEngine._record_stream([_record_stream_transfer(host, device)], stream)
+
+        self.assertEqual(device.recorded, [stream])
+        self.assertEqual(host.recorded, [])
+
+    def test_other_accelerators_are_unchanged(self):
+        # "npu" needs torch_npu to parse; mps stands in for any other accelerator.
+        device = _IndexTensorStub("mps")
+
+        L2TransferEngine._record_stream(
+            [_record_stream_transfer(_IndexTensorStub("cpu"), device)], object()
+        )
+
+        self.assertEqual(device.recorded, [])
 
 
 if __name__ == "__main__":
