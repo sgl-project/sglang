@@ -1650,6 +1650,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 lora_id=obj.lora_id,
                 lora_name=obj.lora_path,
                 http_worker_ipc=obj.http_worker_ipc,
+                routing_key=obj.routing_key,
                 return_pooled_hidden_states=obj.return_pooled_hidden_states,
                 multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
                 token_indices_to_pool=obj.token_indices_to_pool,
