@@ -2343,7 +2343,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         part that cannot be reconstructed afterwards.
         """
         try:
-            return redact_watermark_secrets(
+            return self._redact_for_dump(
                 self.resolved_config_dict(self.server_args.resolved_dict())
             )
         except Exception as e:
@@ -2354,6 +2354,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if not get_exec().features.enable_watermark:
             return self.server_args
         return redact_watermark_secrets(self.server_args.resolved_dict())
+
+    def _redact_for_dump(self, data: Any) -> Any:
+        if not get_exec().features.enable_watermark:
+            return data
+        return redact_watermark_secrets(data)
+
+    def _launch_command_for_dump(self) -> str:
+        if not get_exec().features.enable_watermark:
+            return " ".join(sys.argv)
+        return redact_watermark_command_line(
+            sys.argv, self.server_args.watermark_config
+        )
 
     def resolved_config_dict(self, base: Dict[str, Any]) -> Dict[str, Any]:
         """``base`` (a serialized ``ServerArgs``) with the control-plane changes on top."""
@@ -3362,9 +3374,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         logger.info(log_message)
         to_dump_with_server_args = {
             "server_args": self._server_args_for_dump(),
-            "config_updates": redact_watermark_secrets(get_context().overrides_log()),
+            "config_updates": self._redact_for_dump(get_context().overrides_log()),
             "resolved_config": self._dump_config_snapshot(),
-            "requests": redact_watermark_secrets(data_list.copy()),
+            "requests": self._redact_for_dump(data_list.copy()),
         }
 
         def background_task():
@@ -3447,14 +3459,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 # Write the data to the file
                 data_to_dump_with_server_args = {
                     "server_args": self._server_args_for_dump(),
-                    "config_updates": redact_watermark_secrets(
+                    "config_updates": self._redact_for_dump(
                         get_context().overrides_log()
                     ),
                     "resolved_config": self._dump_config_snapshot(),
-                    "requests": redact_watermark_secrets(data_to_dump),
-                    "launch_command": redact_watermark_command_line(
-                        sys.argv, self.server_args.watermark_config
-                    ),
+                    "requests": self._redact_for_dump(data_to_dump),
+                    "launch_command": self._launch_command_for_dump(),
                 }
                 with open(filename, "wb") as f:
                     try:
