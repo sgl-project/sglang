@@ -8,7 +8,8 @@ export const MiniMaxM2Deployment = () => {
       items: [
         { id: 'mi300x', label: 'MI300X', default: true },
         { id: 'mi325x', label: 'MI325X', default: false },
-        { id: 'mi355x', label: 'MI355X', default: false }
+        { id: 'mi355x', label: 'MI355X', default: false },
+        { id: 'xeon', label: 'XEON', default: false }
       ]
     },
     modelname: {
@@ -54,11 +55,20 @@ export const MiniMaxM2Deployment = () => {
     };
 
     const modelName = `${modelFamily}/${modelMap[modelname]}`;
+    const isXeon = hardware === 'xeon';
 
     let cmd = 'sglang serve \\\n';
     cmd += `  --model-path ${modelName}`;
 
-    cmd += ` \\\n  --tp 4`;
+    if (isXeon) {
+      cmd += ` \\\n  --device cpu \\\n  --disable-overlap-schedule`;
+    }
+
+    cmd += ` \\\n  --tp ${isXeon ? 6 : 4}`;
+
+    if (isXeon) {
+      cmd += ` \\\n  --dtype bfloat16`;
+    }
 
     cmd += ` \\\n  --trust-remote-code`;
 

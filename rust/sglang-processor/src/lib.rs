@@ -6,12 +6,15 @@
 //! request types, sampling, validation, transport, and runtime.
 
 mod error;
+#[cfg(any(feature = "parser", feature = "openai"))]
+mod kimi_k3_format;
 mod model_files;
 #[cfg(feature = "openai")]
 pub mod openai;
 #[cfg(feature = "parser")]
 mod parser;
-#[cfg(any(feature = "parser", feature = "openai"))]
+#[cfg(any(feature = "parser", feature = "openai", feature = "render"))]
+#[cfg_attr(not(any(feature = "parser", feature = "openai")), allow(dead_code))]
 mod py;
 #[cfg(feature = "render")]
 mod render;
@@ -32,7 +35,7 @@ pub use parser::{
 };
 #[cfg(feature = "render")]
 pub use render::{
-    ChatFormatter, ChatFormatterOptions, DeepSeekV4Profile, OneOrMany, TemplateError,
+    ChatFormatter, ChatFormatterOptions, DeepSeekTokenizer, OneOrMany, TemplateArgs, TemplateError,
     ThinkingTemplates, load_chat_formatter, requested_effort, requested_thinking,
     select_chat_formatter,
 };
@@ -43,6 +46,8 @@ pub use tokenizer::{DynamoTokenizer, TextTokenizer, load_tokenizer};
 
 // Dynamo crates whose types appear in this crate's public API. Hosts use these
 // re-exports so their Dynamo versions always match the processor's.
+#[cfg(feature = "parser")]
+pub use dynamo_parsers;
 #[cfg(any(feature = "parser", feature = "render"))]
 pub use dynamo_protocols;
 #[cfg(feature = "render")]

@@ -251,6 +251,103 @@ def duplicate_pad_mm_input_ids(
     return padded_ids[:]
 
 
+def pad_mm_token_pairs(
+    input_ids: array,
+    mm_inputs: MultimodalInputs,
+    *,
+    data_token_pairs: Optional[List[Tuple[int, int]]],
+    data_start_token_ids: Optional[List[int]] = None,
+) -> array:
+    """Pad enclosed tokens without mutating input_ids; record item start offsets.
+
+    data_start_token_ids identifies new items, so slices can reuse an item's pad value.
+    By default, every start token begins a new item.
+    """
+    if data_start_token_ids is None:
+        data_start_token_ids = [s for s, _e in data_token_pairs]
+    assert_int64_array(input_ids, "input_ids")
+    pad_items = mm_inputs.mm_items
+    mm_inputs.data_offsets = []
+    if data_token_pairs is None:
+        data_token_pairs = [mm_inputs.im_start_id, mm_inputs.im_end_id]
+    if data_token_pairs is None:
+        print_warning_once(
+            "No data_token_pairs provided, RadixAttention might be influenced."
+        )
+        return input_ids
+    start_token_ids = {s for s, _e in data_token_pairs}
+    end_tokens_ids = {e for _s, e in data_token_pairs}
+
+    padded_ids = array("q")
+    last_idx = 0
+    data_idx = -1
+
+    start_indices = [i for i, x in enumerate(input_ids) if x in start_token_ids]
+    end_indices = [i for i, x in enumerate(input_ids) if x in end_tokens_ids]
+
+    if len(start_indices) != len(end_indices):
+        return input_ids
+
+    for start_idx, end_idx in zip(start_indices, end_indices):
+        padded_ids.extend(input_ids[last_idx : start_idx + 1])
+
+        if input_ids[start_idx] in data_start_token_ids:
+            data_idx += 1
+            mm_inputs.data_offsets += [start_idx]
+
+        if data_idx >= len(pad_items):
+            data_idx = len(pad_items) - 1
+
+        num_tokens = end_idx - start_idx - 1
+        if num_tokens > 0:
+            padded_ids.extend(pad_items[data_idx].padding_sequence(num_tokens))
+
+        last_idx = end_idx
+
+    padded_ids.extend(input_ids[last_idx:])
+
+    assert len(input_ids) == len(padded_ids), "Length validation fails"
+    return padded_ids
+
+
+def pad_mm_tokens(input_ids: array, mm_inputs: MultimodalInputs) -> array:
+    """Pad inclusive per-item offsets without mutating the input token array."""
+    assert_int64_array(input_ids, "input_ids")
+    if not input_ids or not mm_inputs.mm_items:
+        return input_ids
+
+    # as_tensor(array) walks and boxes every token. View a bulk copy instead,
+    # keeping the original request's unpadded token buffer unchanged.
+    padded_input_ids = input_ids[:]
+    input_ids_tensor = torch.frombuffer(padded_input_ids, dtype=torch.int64)
+
+    # Replace multimodal tokens using per-item offsets
+    items_by_modality = defaultdict(list)
+    for item in mm_inputs.mm_items:
+        items_by_modality[item.modality].append(item)
+
+    token_id_map = {
+        Modality.IMAGE: mm_inputs.im_token_id,
+        Modality.AUDIO: mm_inputs.audio_token_id,
+        Modality.VIDEO: mm_inputs.video_token_id,
+    }
+
+    for modality, items in items_by_modality.items():
+        token_id = token_id_map.get(modality)
+
+        if not items or token_id is None:
+            continue
+
+        for i, item in enumerate(items):
+            for offset in items[i].offsets:
+                input_ids_tensor[offset[0] : offset[1] + 1] = torch.as_tensor(
+                    item.padding_sequence(offset[1] - offset[0] + 1),
+                    dtype=input_ids_tensor.dtype,
+                )
+
+    return padded_input_ids
+
+
 class MultiModalityDataPaddingPattern:
     """
     Data tokens (like image tokens) often need special handling during padding
@@ -273,6 +370,8 @@ class MultiModalityDataPaddingPatternTokenPairs(MultiModalityDataPaddingPattern)
     The padded value in a region enclosed by a token pair with be the same one, as the MultimodalDataItem's pad value
 
     This strategy should be applied when data content is marked by start/end token pairs in the input sequence.
+
+    Kept for compatibility; new callers should use pad_mm_token_pairs.
     """
 
     def __init__(
@@ -295,56 +394,21 @@ class MultiModalityDataPaddingPatternTokenPairs(MultiModalityDataPaddingPattern)
         """
         This function will replace the data-tokens in between with pad_values accordingly
         """
-        assert_int64_array(input_ids, "input_ids")
-        pad_values = [item.pad_value for item in mm_inputs.mm_items]
         data_token_pairs = self.data_token_id_pairs
-        mm_inputs.data_offsets = []
-        if data_token_pairs is None:
-            data_token_pairs = [mm_inputs.im_start_id, mm_inputs.im_end_id]
-        if data_token_pairs is None:
-            print_warning_once(
-                "No data_token_pairs provided, RadixAttention might be influenced."
-            )
-            return input_ids
-        start_token_ids = {s for s, _e in data_token_pairs}
-        end_tokens_ids = {e for _s, e in data_token_pairs}
-
-        padded_ids = array("q")
-        last_idx = 0
-        data_idx = -1
-
-        start_indices = [i for i, x in enumerate(input_ids) if x in start_token_ids]
-        end_indices = [i for i, x in enumerate(input_ids) if x in end_tokens_ids]
-
-        if len(start_indices) != len(end_indices):
-            return input_ids
-
-        for start_idx, end_idx in zip(start_indices, end_indices):
-            padded_ids.extend(input_ids[last_idx : start_idx + 1])
-
-            if input_ids[start_idx] in self.data_start_token_ids:
-                data_idx += 1
-                mm_inputs.data_offsets += [start_idx]
-
-            if data_idx >= len(pad_values):
-                data_idx = len(pad_values) - 1
-
-            num_tokens = end_idx - start_idx - 1
-            pad_value = pad_values[data_idx]
-            if num_tokens > 0:
-                padded_ids.extend(array("q", [pad_value]) * num_tokens)
-
-            last_idx = end_idx
-
-        padded_ids.extend(input_ids[last_idx:])
-
-        assert len(input_ids) == len(padded_ids), "Length validation fails"
-        return padded_ids
+        data_start_token_ids = self.data_start_token_ids
+        return pad_mm_token_pairs(
+            input_ids,
+            mm_inputs,
+            data_token_pairs=data_token_pairs,
+            data_start_token_ids=data_start_token_ids,
+        )
 
 
 class MultiModalityDataPaddingPatternMultimodalTokens(MultiModalityDataPaddingPattern):
     """In this pattern, data tokens should be represented as repetitions of a single token
     e.g. <image><image>....<image>, or <audio><audio>...<audio>
+
+    Kept for compatibility; new callers should use pad_mm_tokens.
     """
 
     def pad_input_tokens(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
@@ -352,37 +416,7 @@ class MultiModalityDataPaddingPatternMultimodalTokens(MultiModalityDataPaddingPa
         Replaces multimodal tokens in input_ids with corresponding pad_values from mm_items.
         Each modality (image, audio, video) is handled separately based on its token_id.
         """
-        assert_int64_array(input_ids, "input_ids")
-        if not input_ids or not mm_inputs.mm_items:
-            return input_ids
-
-        # as_tensor(array) walks and boxes every token. View a bulk copy instead,
-        # keeping the original request's unpadded token buffer unchanged.
-        padded_input_ids = input_ids[:]
-        input_ids_tensor = torch.frombuffer(padded_input_ids, dtype=torch.int64)
-
-        # Replace multimodal tokens using per-item offsets
-        items_by_modality = defaultdict(list)
-        for item in mm_inputs.mm_items:
-            items_by_modality[item.modality].append(item)
-
-        token_id_map = {
-            Modality.IMAGE: mm_inputs.im_token_id,
-            Modality.AUDIO: mm_inputs.audio_token_id,
-            Modality.VIDEO: mm_inputs.video_token_id,
-        }
-
-        for modality, items in items_by_modality.items():
-            token_id = token_id_map.get(modality)
-
-            if not items or token_id is None:
-                continue
-
-            for i, item in enumerate(items):
-                for offset in items[i].offsets:
-                    input_ids_tensor[offset[0] : offset[1] + 1] = item.pad_value
-
-        return padded_input_ids
+        return pad_mm_tokens(input_ids, mm_inputs)
 
 
 # masked_scatter_ materializes the expanded [num_tokens, hidden] bool mask plus
@@ -461,7 +495,10 @@ def embed_mm_inputs(
             embedder = getattr(multimodal_model, f"get_{modality_id}_feature", None)
         if len(items) != 0:
             assert embedder is not None, f"no embedding method found for {modality}"
-            pad_values = [item.pad_value for item in items]
+            # Sorted for the searchsorted lookup in _get_multimodal_mask.
+            pad_values = sorted(
+                value for item in items for value in item.padding_values()
+            )
             if input_ids.device.type == "cuda":
                 # Pinned staging keeps the placeholder copy asynchronous on CUDA.
                 placeholder_cpu = torch.tensor(
@@ -1157,6 +1194,8 @@ def get_new_expanded_mm_items(original_mm_items):
                 # explicit None check, not `a or b`: the value is a multi-element
                 # tensor whose truthiness is ambiguous.)
                 image_grid_thw = item.model_specific_data.get("image_grid_thw")
+                if image_grid_thw is None:
+                    image_grid_thw = item.model_specific_data.get("grid_thws")
                 if image_grid_thw is None:
                     image_grid_thw = item.model_specific_data.get("image_grid_hws")
                 grid_len = _get_length(image_grid_thw)

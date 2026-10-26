@@ -7,6 +7,7 @@ from typing import Any, Callable, NamedTuple, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.pool_host.base import shared_host_layout_domains
 from sglang.srt.utils import get_device_module
 
@@ -153,7 +154,10 @@ class L2TransferEngine:
             transfers, self.host_to_device_stream, "host_to_device", start_event
         ) as (transfers, completion):
             primary = transfers[0] if transfers else None
+            delay_cycles = envs.SGLANG_TEST_HICACHE_H2D_DELAY_CYCLES.get()
             for layer_id in range(transfer_layer_id_max):
+                if delay_cycles:
+                    torch.cuda._sleep(delay_cycles)
                 for transfer in transfers:
                     local_layer_id = (
                         transfer.layer_mapper(layer_id)
@@ -193,5 +197,7 @@ class L2TransferEngine:
         # Keep temporary translated indices alive until the transfer completes.
         tensors.extend(resolved)
         for indices in tensors:
-            if indices is not None and indices.is_cuda:
+            if indices is not None and (
+                indices.is_cuda or indices.device.type == "xpu"
+            ):
                 indices.record_stream(stream)

@@ -2,7 +2,7 @@
 
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=16, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-small")
 
 import os
 import shutil
@@ -11,6 +11,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest import mock
 
@@ -632,6 +633,41 @@ class TestNixlUnified(CustomTestCase):
         ctx = self.hicache._hybrid_pool_ctx[PoolName.MAMBA]
         self.assertTrue(ctx.is_zero_copy)
         self.assertIs(ctx.host_pool, pool)
+
+    def test_mla_mamba_round_trip_keeps_each_tp_rank(self):
+        """MLA shares KV keys, but Mamba checkpoints must not overwrite another rank."""
+        for zero_copy in (False, True):
+            with self.subTest(zero_copy=zero_copy):
+                caches, pools, expected = [], [], []
+                transfer = PoolTransfer(
+                    name=PoolName.MAMBA,
+                    keys=[f"same_prefix_{zero_copy}"],
+                    host_indices=torch.tensor([0]),
+                )
+                for rank in range(2):
+                    config = replace(
+                        self.storage_config, tp_rank=rank, is_mla_model=True
+                    )
+                    cache = HiCacheNixl(storage_config=config, file_path=self.test_dir)
+                    self.addCleanup(cache.close)
+                    pool = MockHybridPool(expose_zero_copy=zero_copy)
+                    cache.register_mem_host_pool_v2(pool, PoolName.MAMBA)
+                    pool.temporal_buffer[0].fill_(rank + 11)
+                    pool.conv_buffer[0][0].fill_(rank + 21)
+                    expected.append(pool.get_data_page(0).clone())
+                    caches.append(cache)
+                    pools.append(pool)
+                    self.assertEqual(
+                        cache.batch_set_v2([transfer])[PoolName.MAMBA], [True]
+                    )
+
+                for cache, pool, page in zip(caches, pools, expected):
+                    pool.temporal_buffer.zero_()
+                    pool.conv_buffer[0].zero_()
+                    self.assertEqual(
+                        cache.batch_get_v2([transfer])[PoolName.MAMBA], [True]
+                    )
+                    self.assertTrue(torch.equal(pool.get_data_page(0), page))
 
     def test_register_mem_host_pool_v2_uses_persistent_bounce_otherwise(self):
         pool = MockHybridPool(expose_zero_copy=False)
