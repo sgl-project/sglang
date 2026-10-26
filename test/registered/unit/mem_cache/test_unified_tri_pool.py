@@ -1322,7 +1322,7 @@ class TestTriFactorySizing(unittest.TestCase):
         self.assertIs(clone.mamba_allocator, target.mamba_allocator)
         self.assertIs(clone.req_to_token, target.req_to_token)
         self.assertEqual(clone.mamba_map, {1: 0})
-        conv = clone.mamba2_layer_cache(1).conv[0]
+        conv = clone.mamba_pool.mamba2_layer_cache(clone.mamba_map[1]).conv[0]
         self.assertEqual(tuple(conv.shape), (target.mamba_pool.size + 1, 3, 8))
         draft_conv, _ = bundle.unified_memory_pool.build_draft_state_views("mamba")
         self.assertEqual(conv.data_ptr(), draft_conv[0][1].data_ptr())

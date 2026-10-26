@@ -586,12 +586,12 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
 
     def sconv_state(self, *, layer_id: int, stream: int) -> torch.Tensor:
         """``layer_id``'s conv state for one ``SconvType`` stream."""
-        pool_layer = self.req_to_token_pool.mamba2_layer_index(layer_id)
+        pool_layer = self.state_layer(layer_id).view_layer_id
         return self._mamba_cache.conv[stream][pool_layer]
 
     def sconv_intermediate_window(self, *, layer_id: int, stream: int) -> torch.Tensor:
         """One stream's per-draft-token conv windows. TARGET_VERIFY only."""
-        pool_layer = self.req_to_token_pool.mamba2_layer_index(layer_id)
+        pool_layer = self.state_layer(layer_id).view_layer_id
         return self._mamba_cache.intermediate_conv_window[stream][pool_layer]
 
 

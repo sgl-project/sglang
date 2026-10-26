@@ -99,6 +99,7 @@ from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import sanity_check_mm_pad_shift_value
 from sglang.srt.mem_cache import kv_cache_dtype
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.kv.router import STATE_PART
 from sglang.srt.mem_cache.kv_cache_configurator import (
     KVCacheConfigurator,
 )
@@ -1984,6 +1985,8 @@ class ModelRunner:
             else:
                 # mamba_pool is a pure PHYSICAL store; translate both COW slot ids.
                 state_ids = self.kv_index_translator.state_ids(pool.state_sub_pool)
+                # The copy reads every state layer of the source slot.
+                self.token_to_kv_pool.layer_router.wait_for_part(STATE_PART)
                 pool.copy_mamba_state(
                     state_ids.ids(forward_batch.mamba_cow_src_indices),
                     state_ids.ids(forward_batch.mamba_cow_dst_indices),

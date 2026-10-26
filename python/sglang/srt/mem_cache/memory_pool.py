@@ -68,7 +68,7 @@ from sglang.srt.mem_cache.allocation_sizing import get_mamba_tracking_slots
 from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
 from sglang.srt.mem_cache.index_key_cache import IndexKeyCache
 from sglang.srt.mem_cache.kv.memory.views import MHAKVView, MLAKVView
-from sglang.srt.mem_cache.kv.router import KVLayerRouter, PlainPoolRouter
+from sglang.srt.mem_cache.kv.router import STATE_PART, KVLayerRouter, PlainPoolRouter
 from sglang.srt.mem_cache.kv_loc_plan import IdSpace, IdSpaceKind
 from sglang.srt.mem_cache.kv_vmm_backing import KvVmmBufferOwner
 from sglang.srt.mem_cache.layout.token_major import (
@@ -1413,7 +1413,6 @@ class HybridReqToTokenPool(ReqToTokenPool):
         self.enable_mamba_extra_buffer_lazy = enable_mamba_extra_buffer_lazy
         self.enable_memory_saver = enable_memory_saver
         self.start_layer = start_layer if start_layer is not None else 0
-        self.layer_transfer_counter = None
         self.ple_window_cache = None
         self._init_mamba_pool(
             mamba_size=mamba_size,
@@ -1575,8 +1574,37 @@ class HybridReqToTokenPool(ReqToTokenPool):
             )
         return clone
 
-    def register_layer_transfer_counter(self, layer_transfer_counter: LayerDoneCounter):
-        self.layer_transfer_counter = layer_transfer_counter
+    def bind_state_routes(self, router: KVLayerRouter) -> None:
+        """Routes this table's state layers through the KV pool's router, which
+        owns the layer-wise load-back wait: the recurrent state, and the PLE
+        side states when the model has them. The N-gram context is read once
+        before the layer loop and restored with the first state layer, so it
+        is routed there."""
+        from sglang.srt.mem_cache.ple_state_pool import NGRAM_PART, SHORT_CONV_PART
+
+        router.bind_part(
+            sub_pool=self.state_sub_pool,
+            part=STATE_PART,
+            view=self.mamba_pool,
+            indices=self.mamba_map,
+        )
+        if self.short_conv_pool.enabled:
+            router.bind_part(
+                sub_pool=self.state_sub_pool,
+                part=SHORT_CONV_PART,
+                view=self.short_conv_pool,
+                indices=self.short_conv_pool.layer_map,
+                view_layer_ids={
+                    layer_id: layer_id for layer_id in self.short_conv_pool.layer_map
+                },
+            )
+        if self.ngram_pool.enabled:
+            router.bind_part(
+                sub_pool=self.state_sub_pool,
+                part=NGRAM_PART,
+                view=self.ngram_pool,
+                indices={min(self.mamba_map): 0} if self.mamba_map else {},
+            )
 
     # For chunk prefill req, we do not need to allocate mamba cache,
     # We could use allocated mamba cache instead.
@@ -1652,44 +1680,6 @@ class HybridReqToTokenPool(ReqToTokenPool):
         integrations outside sglang that call it (LMCache's sglang adapter)."""
         return mamba_indices
 
-    def mamba2_layer_index(self, layer_id: int) -> int:
-        """Pool-side index of ``layer_id``'s state, gated on its HiCache transfer.
-
-        For a caller that wants one specific state tensor: it indexes the pool
-        tensor itself instead of taking a ``State`` sliced over every field.
-        """
-        assert layer_id in self.mamba_map
-        if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-        return self.mamba_map[layer_id]
-
-    def mamba2_layer_cache(self, layer_id: int):
-        return self.mamba_pool.mamba2_layer_cache(self.mamba2_layer_index(layer_id))
-
-    def short_conv_layer_cache(self, layer_id: int) -> torch.Tensor:
-        if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-        return self.short_conv_pool.layer_cache(layer_id)
-
-    def short_conv_layer_intermediate_cache(
-        self, layer_id: int
-    ) -> Optional[torch.Tensor]:
-        return self.short_conv_pool.layer_intermediate_cache(layer_id)
-
-    def get_ngram_context(self, ngram_indices: torch.Tensor) -> torch.Tensor:
-        # Read once per forward, BEFORE the decoder-layer loop, so unlike
-        # short_conv_layer_cache it has no per-layer barrier of its own. The
-        # host tier restores side state on the first Mamba layer's transfer, so
-        # wait for that layer before reading the history.
-        if (
-            self.layer_transfer_counter is not None
-            and self.layer_transfer_counter.consumer_index >= 0
-            and self.mamba_map
-        ):
-            first_mamba_layer = min(self.mamba_map)
-            self.layer_transfer_counter.wait_until(first_mamba_layer - self.start_layer)
-        return self.ngram_pool.get_context(ngram_indices)
-
     def set_ngram_context(
         self, ngram_indices: torch.Tensor, context: torch.Tensor
     ) -> None:
@@ -1705,12 +1695,6 @@ class HybridReqToTokenPool(ReqToTokenPool):
     ) -> None:
         if src_index.numel() == 0:
             return
-        if (
-            self.layer_transfer_counter is not None
-            and self.layer_transfer_counter.consumer_index >= 0
-        ):
-            last_mamba_layer = max(self.mamba_map)
-            self.layer_transfer_counter.wait_until(last_mamba_layer - self.start_layer)
         self.mamba_pool.copy_from(src_index, dst_index)
 
     def get_speculative_mamba2_params_all_layers(self) -> MambaPool.SpeculativeState:
@@ -4483,8 +4467,8 @@ class HybridLinearKVPool(KVCache):
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
     def _build_layer_router(self) -> KVLayerRouter:
-        # Only the full-attention layers hold KV here; the recurrent state
-        # lives on the request pool.
+        # Only the full-attention layers hold KV here; the request table binds
+        # its state layers to this router (`bind_state_routes`).
         return KVLayerRouter.from_layer_maps(
             self,
             [

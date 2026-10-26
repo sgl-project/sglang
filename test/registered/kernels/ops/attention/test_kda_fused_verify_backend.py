@@ -132,9 +132,9 @@ class TestKDAFusedVerifyBackend(CustomTestCase):
         # Only the model/pool setup is a fixture. Verify, dispatch, ring fold and
         # conv rollback below all use the production backend and GPU kernels.
         backend = KDAAttnBackend.__new__(KDAAttnBackend)
+        backend.state_layer_cache = state.at_layer_idx
         backend.req_to_token_pool = SimpleNamespace(
             size=state.temporal.shape[1],
-            mamba2_layer_cache=state.at_layer_idx,
             get_speculative_mamba2_params_all_layers=lambda: state,
             mamba_pool=SimpleNamespace(replayssm_is_kda=ring),
         )

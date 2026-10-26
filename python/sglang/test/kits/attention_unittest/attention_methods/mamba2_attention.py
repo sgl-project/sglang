@@ -452,6 +452,7 @@ class MockMamba2ModelRunner(ModelRunner):
             enable_memory_saver=False,
             enable_alt_stream=False,
         )
+        self.req_to_token_pool.bind_state_routes(self.token_to_kv_pool.layer_router)
         # A static allocator: ids index the pools as they are.
         self.token_to_kv_pool_allocator = SimpleNamespace(
             page_size=case.page_size,
@@ -748,11 +749,11 @@ def build_mamba2_attention_fixture(
 
 
 def _ssm_states(fixture: Mamba2AttentionFixture) -> torch.Tensor:
-    return fixture.runner.req_to_token_pool.mamba2_layer_cache(0).temporal
+    return fixture.runner.req_to_token_pool.mamba_pool.mamba2_layer_cache(0).temporal
 
 
 def _conv_states(fixture: Mamba2AttentionFixture) -> torch.Tensor:
-    return fixture.runner.req_to_token_pool.mamba2_layer_cache(0).conv[0]
+    return fixture.runner.req_to_token_pool.mamba_pool.mamba2_layer_cache(0).conv[0]
 
 
 def _cache_indices(fixture: Mamba2AttentionFixture) -> torch.Tensor:

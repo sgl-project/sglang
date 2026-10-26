@@ -163,7 +163,7 @@ class TestApplyStackResult(unittest.TestCase):
         cache.components = {ct: MagicMock() for ct in component_types}
         return cache
 
-    def test_skips_req_to_token_counter_when_flag_false(self):
+    def test_state_reads_do_not_wait_when_the_stack_keeps_no_state(self):
         cache = self._fake_cache([FULL])
         kvcache = MagicMock()
         params = MagicMock()
@@ -172,15 +172,37 @@ class TestApplyStackResult(unittest.TestCase):
             cache_controller=MagicMock(),
             component_host_pools={FULL: MagicMock()},
             sidecars=[],
-            register_req_to_token_counter=False,
+            loads_state_layer_wise=False,
             pools_desc="KV",
         )
 
         _apply_stack_result(cache, kvcache, params, result)
 
         kvcache.register_layer_transfer_counter.assert_called_once()
-        params.req_to_token_pool.register_layer_transfer_counter.assert_not_called()
+        kvcache.layer_router.load_parts_layer_wise.assert_not_called()
         cache.register_sidecar_pool.assert_not_called()
+
+    def test_state_reads_wait_on_the_kv_counter_when_the_stack_loads_state(self):
+        cache = self._fake_cache([FULL])
+        kvcache = MagicMock()
+        params = MagicMock()
+        controller = MagicMock()
+        result = StackBuildResult(
+            host_pool_group=MagicMock(),
+            cache_controller=controller,
+            component_host_pools={FULL: MagicMock()},
+            sidecars=[],
+            loads_state_layer_wise=True,
+            pools_desc="KV + MAMBA",
+        )
+
+        _apply_stack_result(cache, kvcache, params, result)
+
+        # One owner: the counter goes on the KV pool alone.
+        kvcache.register_layer_transfer_counter.assert_called_once_with(
+            controller.layer_done_counter
+        )
+        kvcache.layer_router.load_parts_layer_wise.assert_called_once_with()
 
 
 if __name__ == "__main__":

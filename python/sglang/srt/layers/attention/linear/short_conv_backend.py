@@ -199,7 +199,7 @@ class ShortConvAttnBackend(MambaAttnBackendBase):
         ``forward_batch`` is accepted for interface parity with the unit-test
         mock and is not otherwise required here.
         """
-        layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer_id)
+        layer_cache = self.state_layer_cache(layer_id)
         md = self.forward_metadata
 
         # Slot indices are cached ONCE per step in init_forward_metadata /

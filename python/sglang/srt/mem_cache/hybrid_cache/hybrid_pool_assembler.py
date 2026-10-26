@@ -1870,9 +1870,9 @@ class StackBuildResult:
     cache_controller: HybridCacheController
     component_host_pools: dict[ComponentType, Any]
     sidecars: list[SidecarPoolSpec] = field(default_factory=list)
-    # Mamba state lives in req_to_token_pool, not in kvcache, so its
-    # layer_transfer_counter has to be wired separately.
-    register_req_to_token_counter: bool = False
+    # The stack restores Mamba state layer by layer too, so state reads wait
+    # on the KV pool's load-back counter as KV reads do.
+    loads_state_layer_wise: bool = False
     pools_desc: str = ""
     pool_declarations: Optional[tuple[HostPoolDecl, ...]] = None
 
@@ -2100,7 +2100,7 @@ class _MambaStrategy(StackStrategy):
                 else []
             ),
             pool_declarations=tuple(c.decl for c in config.pools),
-            register_req_to_token_counter=True,
+            loads_state_layer_wise=True,
             pools_desc=" + ".join(
                 [c.decl.pool_name.value.upper() for c in config.pools]
                 + ["MAMBA"]
@@ -2246,7 +2246,7 @@ class _MambaSwaStrategy(StackStrategy):
                 ComponentType.SWA: host_pool_group.get_pool(PoolName.SWA),
                 ComponentType.MAMBA: host_pool_group.get_pool(PoolName.MAMBA),
             },
-            register_req_to_token_counter=True,
+            loads_state_layer_wise=True,
             pools_desc="KV + SWA + MAMBA",
             sidecars=_mtp_swa_sidecar_specs(host_pool_group),
         )
@@ -2522,10 +2522,8 @@ def _apply_stack_result(
             draft_pool.register_layer_transfer_counter(
                 result.cache_controller.layer_done_counter
             )
-    if result.register_req_to_token_counter:
-        params.req_to_token_pool.register_layer_transfer_counter(
-            result.cache_controller.layer_done_counter
-        )
+    if result.loads_state_layer_wise:
+        kvcache.layer_router.load_parts_layer_wise()
 
     logger.info(
         "Attached hybrid pool stack to UnifiedRadixCache: pools=%s, transfer_layer_id_max=%s",

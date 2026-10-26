@@ -198,6 +198,7 @@ def create_unified_radix_cache(
             cache.cache_controller.layer_done_counter
         )
     elif get_memory().enable_unified_cache_external_linker:
+        from sglang.srt.mem_cache.hicache_storage import PoolName
         from sglang.srt.mem_cache.unified_cache.linker_factory import (
             create_unified_cache_linker,
             get_startup_linker_config,
@@ -216,6 +217,8 @@ def create_unified_radix_cache(
         counter = cache.linker.layer_done_counter
         kvcache = params.token_to_kv_pool_allocator.get_kvcache()
         kvcache.register_layer_transfer_counter(counter)
+        if PoolName.MAMBA in cache.linker.pools:
+            kvcache.layer_router.load_parts_layer_wise()
         ctx.tp_worker.register_hicache_layer_transfer_counter(counter)
     return cache
 

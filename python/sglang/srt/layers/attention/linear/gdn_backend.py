@@ -850,7 +850,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         if _is_hip and isinstance(mixed_qkv, torch.Tensor) and mixed_qkv.shape[0] == 0:
             return mixed_qkv.new_zeros((1, 0, layer.num_v_heads, layer.head_v_dim))
 
-        layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+        layer_cache = self.state_layer_cache(layer.layer_id)
         conv_states = layer_cache.conv[0]
         ssm_states = layer_cache.temporal
         query_start_loc = self.forward_metadata.query_start_loc
@@ -1218,7 +1218,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         retrieve_next_sibling = forward_metadata.retrieve_next_sibling
         retrieve_parent_token = forward_metadata.retrieve_parent_token
 
-        mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+        mamba_cache_params = self.state_layer_cache(layer.layer_id)
         conv_states = mamba_cache_params.conv[0]
         ssm_states = mamba_cache_params.temporal
         if self.mis_metadata is not None:

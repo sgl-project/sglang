@@ -477,6 +477,12 @@ class KVCacheConfigurator:
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
         )
+        if pools.req_to_token_pool.mamba_pool is not None:
+            # State reads go through the KV pool's router, which owns the
+            # layer-wise load-back wait.
+            pools.req_to_token_pool.bind_state_routes(
+                pools.token_to_kv_pool.layer_router
+            )
 
         swa_max_total_num_tokens = sizes.swa_max_total_num_tokens
         alloc = pools.token_to_kv_pool_allocator

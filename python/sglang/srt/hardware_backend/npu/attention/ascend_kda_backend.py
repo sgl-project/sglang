@@ -151,7 +151,7 @@ class AscendKDAAttnBackend(KDAAttnBackend):
     ):
         """Run KDA decode against the native channel-first Ascend cache."""
         assert isinstance(mixed_qkv, torch.Tensor)
-        layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+        layer_cache = self.state_layer_cache(layer.layer_id)
         conv_states = layer_cache.conv[0]
         ssm_states = layer_cache.temporal
         query_start_loc = self.forward_metadata.query_start_loc
@@ -241,7 +241,7 @@ class AscendKDAAttnBackend(KDAAttnBackend):
 
         query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
-        cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+        cache = self.state_layer_cache(layer.layer_id)
         conv_states = cache.conv[0]
         ssm_states = cache.temporal
 
@@ -343,7 +343,7 @@ class AscendKDAAttnBackend(KDAAttnBackend):
         query_start_loc = metadata.query_start_loc
         cache_indices = metadata.mamba_cache_indices
 
-        cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+        cache = self.state_layer_cache(layer.layer_id)
         intermediate_state = cache.intermediate_ssm
         if intermediate_state is None:
             raise RuntimeError(

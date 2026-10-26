@@ -34,6 +34,7 @@ from sglang.srt.layers.attention.mamba.replay_state_indices_validator import (
     validate_replay_state_indices_cpu,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.mem_cache.kv.router import STATE_PART, KVLayer
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -121,6 +122,16 @@ class MambaAttnBackendBase(AttentionBackend):
         # Constant (== 1) for mamba-like backends; hoisted so the replay path
         # skips the per-cycle method dispatch.
         self._graph_seq_len_fill_value = self.get_cuda_graph_seq_len_fill_value()
+
+    def state_layer(self, layer_id: int) -> KVLayer:
+        """The layer's recurrent-state route, once a layer-wise host load-back
+        has brought the layer in."""
+        return self.token_to_kv_pool.layer_router.read(layer_id, STATE_PART)
+
+    def state_layer_cache(self, layer_id: int):
+        """The layer's recurrent state, as the state pool slices it."""
+        state = self.state_layer(layer_id)
+        return state.view.mamba2_layer_cache(state.view_layer_id)
 
     def supports_prefill_graph_extend(self) -> bool:
         """Whether breakable prefill CUDA graphs can capture this backend's
@@ -1141,7 +1152,7 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
         use_triton_causal_conv = (
             use_triton_causal_conv or get_memory().enable_page_major_kv_layout
         )
-        layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer_id)
+        layer_cache = self.state_layer_cache(layer_id)
         mixer_out, intermediate_states, track_states = mixer.forward(
             hidden_states=hidden_states,
             output=output,
