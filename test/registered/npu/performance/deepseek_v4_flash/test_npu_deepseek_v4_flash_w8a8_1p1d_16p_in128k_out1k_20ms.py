@@ -250,6 +250,7 @@ class TestNPUDeepSeekV4FlashW8A81P1D16PIn128kOut1k20ms(
     pop_sglang_is_in_ci_for_gsp = True
     tpot = 20
     output_token_throughput = 60.304
+    ttft = 7
 
     def test_npu_deepseek_v4_flash_w8a8_1p1d_16p_in128k_out1k_20ms(self):
         """Run NPU performance test for DeepSeek-V4-Flash W8A8 1P+1D 16p in128k out1k."""
