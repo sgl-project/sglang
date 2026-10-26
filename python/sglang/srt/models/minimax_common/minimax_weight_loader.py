@@ -11,17 +11,13 @@ def quark_shared_experts_fusion_disable_reason(quant_config) -> Optional[str]:
     """Why a Quark checkpoint cannot fuse its shared expert into the routed MoE, or None."""
     if quant_config is None or quant_config.get_name() != "quark":
         return None
-    # Online MXFP4 requantization of a mixed-precision source keeps the
-    # shared experts in their serialized (FP8 / MXFP8) precision while
-    # the routed experts become MXFP4, so they cannot share one FusedMoE.
+    # online MXFP4 requantization keeps the shared experts in the source's FP8 / MXFP8
     if quant_config.excluded_fp8_config is not None:
         return (
             "Shared experts stay in the checkpoint's FP8 precision while "
             "routed experts are requantized to MXFP4."
         )
-    # A pre-quantized Quark checkpoint that lists the shared experts
-    # under layer_quant_config quantizes them differently from the
-    # global (routed-expert) MXFP4 scheme.
+    # a pre-quantized checkpoint may give its shared experts their own layer_quant_config
     layer_quant_config = quant_config.quant_config.get("layer_quant_config")
     for name, spec in (layer_quant_config or {}).items():
         if "shared_experts" not in name or not isinstance(spec, dict):

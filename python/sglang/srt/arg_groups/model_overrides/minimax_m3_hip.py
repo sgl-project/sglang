@@ -237,10 +237,8 @@ def _register_aiter_table(env: str, default_name: str, table: Path) -> None:
     if not origin:
         return
     default = Path(origin).resolve().parent / "configs" / default_name
-    # aiter's per-model tables under model_configs/ are left out on purpose:
-    # aiter refuses a merge that holds the same shape twice (other models share
-    # these TP4 shapes, and ours replaces its minimax_m3 rowwise table), and ours
-    # already covers every shape MiniMax serves.
+    # aiter's per-model model_configs/ tables are left out: aiter refuses a merge holding a
+    # shape twice, other models share these TP4 shapes, and ours covers every MiniMax shape
     files = [p for p in (default,) if p.is_file()] + [table]
     os.environ[env] = ":".join(str(p) for p in files)
     logger.info("MiniMax-M3: aiter %s tables %s", env, os.environ[env])

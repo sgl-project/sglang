@@ -967,9 +967,8 @@ class Envs:
     # Enabled by default for supported configurations; set to 0 to disable.
     SGLANG_M3_USE_AITER_FUSED_QKNORM = EnvBool(True)
     SGLANG_USE_AITER_AG = EnvBool(True)
-    # Quick all-reduce at TP4 on the JIT build (kernels/jit/csrc/distributed/quick_all_reduce/)
-    # instead of sgl-kernel's: INT4 runs INT8 below 64 MiB, each bitwise equal on the bf16 cast;
-    # groups it does not serve (other TP sizes and levels, no fp16 cast) keep sgl-kernel's
+    # Quick all-reduce at TP4 on the JIT build (quick_all_reduce_hip) instead of sgl-kernel's;
+    # INT4 runs INT8 below 64 MiB, and groups it does not serve keep sgl-kernel's
     SGLANG_ROCM_QUICK_ALL_REDUCE_JIT = EnvBool(False)
     # Use reduce_scatter (instead of all_reduce + dp_scatter) for the equal-chunk
     # MAX_LEN DP-MoE combine. Default ON for ROCm/HIP (uses the aiter custom

@@ -69,8 +69,8 @@ class BlockFp8CtxKvWriter:
 
     def __init__(self, model):
         self.model = model
-        # (the pool, weakly, so a new pool never takes a freed one's entry by id; its
-        # _BlockFp8CtxKv or None, whose meta holds the pool's buffer addresses)
+        # (weakref to the pool, its _BlockFp8CtxKv or None); meta holds the pool's buffer
+        # addresses, and the weakref keeps a new pool at a freed one's id from reusing them
         self._cache = None
 
     def reset(self) -> None:
