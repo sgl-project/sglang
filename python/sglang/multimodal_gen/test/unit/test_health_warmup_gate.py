@@ -5,6 +5,9 @@
 """
 
 import asyncio
+import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -12,21 +15,150 @@ from types import SimpleNamespace
 from unittest import mock
 from urllib.error import URLError
 
+import psutil
+import zmq.asyncio
+from fastapi import Response
+
+from sglang.multimodal_gen.runtime.disaggregation.orchestrator import DiffusionServer
 from sglang.multimodal_gen.runtime.entrypoints import http_server
 from sglang.multimodal_gen.runtime.entrypoints.http_server import (
     health,
     health_generate,
     liveness,
 )
+from sglang.multimodal_gen.runtime.scheduler_client import AsyncSchedulerClient
 from sglang.multimodal_gen.test.server.test_server_utils import ServerManager
 
 
 def _make_request(warmup_done) -> SimpleNamespace:
-    state = SimpleNamespace(server_warmup_done=warmup_done)
+    state = SimpleNamespace(
+        server_warmup_done=warmup_done,
+        worker_processes=[],
+        disagg_server=None,
+        broker_task=None,
+    )
     return SimpleNamespace(app=SimpleNamespace(state=state))
 
 
 class TestHealthWarmupGate(unittest.IsolatedAsyncioTestCase):
+    async def test_router_exit_fails_pending_requests_without_rpc_deadline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            endpoint = f"ipc://{directory}/frontend"
+            router = DiffusionServer(
+                frontend_endpoint=endpoint,
+                encoder_work_endpoints=[],
+                denoiser_work_endpoints=[f"ipc://{directory}/denoiser-work"],
+                decoder_work_endpoints=[],
+                encoder_result_endpoint=f"ipc://{directory}/encoder",
+                denoiser_result_endpoint=f"ipc://{directory}/denoiser",
+                decoder_result_endpoint=f"ipc://{directory}/decoder",
+            )
+            client = AsyncSchedulerClient()
+            client.context = zmq.asyncio.Context()
+            client.server_args = SimpleNamespace(scheduler_rpc_timeout=None)
+            request = _make_request(asyncio.Event())
+            request.app.state.server_warmup_done.set()
+            request.app.state.disagg_server = router
+            task = None
+            try:
+                router.start()
+                self.assertTrue(await asyncio.to_thread(router.wait_ready, 5))
+                with mock.patch.object(http_server, "async_scheduler_client", client):
+                    self.assertEqual(await health(request), {"status": "ok"})
+                    with mock.patch.object(
+                        router,
+                        "_handle_client_request",
+                        side_effect=RuntimeError("injected routing failure"),
+                    ):
+                        task = asyncio.create_task(
+                            client._forward_one(endpoint, {"method": "ping"}, None)
+                        )
+                        await asyncio.to_thread(router._thread.join, 5)
+                    self.assertFalse(router._thread.is_alive())
+                    self.assertEqual((await health(request)).status_code, 503)
+                    await asyncio.wait_for(http_server._monitor_backend(request.app), 5)
+                    with self.assertRaisesRegex(RuntimeError, "restart the server"):
+                        await asyncio.wait_for(task, 5)
+                    self.assertFalse(client._pending_requests)
+                    self.assertEqual(await liveness(), {"status": "ok"})
+            finally:
+                if task is not None:
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+                router.stop()
+                client.close()
+
+    async def test_exited_broker_is_unready(self):
+        client = AsyncSchedulerClient()
+        with zmq.Context() as context, context.socket(zmq.REP) as occupied:
+            port = occupied.bind_to_random_port("tcp://127.0.0.1")
+            args = SimpleNamespace(
+                enable_metrics=False,
+                warmup_mode="off",
+                progress_endpoint=None,
+                broker_port=port,
+                prompt_enhancer_config=None,
+                log_requests=False,
+                log_requests_level=0,
+                log_requests_format="text",
+                log_requests_target=None,
+                pipeline_config=mock.Mock(
+                    supports_action_endpoint=lambda: False,
+                    supports_openpi_endpoint=lambda: False,
+                ),
+            )
+            with mock.patch.object(http_server, "async_scheduler_client", client):
+                app = http_server.create_app(args)
+                async with http_server.lifespan(app):
+                    deadline = asyncio.get_running_loop().time() + 5
+                    while client.failure_reason is None:
+                        self.assertLess(asyncio.get_running_loop().time(), deadline)
+                        await asyncio.sleep(0.01)
+                    self.assertIn("broker", client.failure_reason)
+                    async with http_server.httpx.AsyncClient(
+                        transport=http_server.httpx.ASGITransport(app=app),
+                        base_url="http://test",
+                    ) as http:
+                        self.assertEqual((await http.get("/health")).status_code, 503)
+                        self.assertEqual((await http.get("/liveness")).status_code, 200)
+                        self.assertEqual(
+                            (await http.post("/v1/videos")).status_code, 503
+                        )
+                self.assertIsNone(client.context)
+
+    async def test_worker_monitor_rejects_posts_but_preserves_completed_results(self):
+        client = AsyncSchedulerClient()
+        args = SimpleNamespace(
+            enable_metrics=False,
+            pipeline_config=mock.Mock(
+                supports_action_endpoint=lambda: False,
+                supports_openpi_endpoint=lambda: False,
+            ),
+        )
+        with (
+            subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(60)"]
+            ) as worker,
+            mock.patch.object(http_server, "async_scheduler_client", client),
+        ):
+            app = http_server.create_app(args, worker_pids=(worker.pid,))
+            app.state.server_warmup_done = asyncio.Event()
+            app.state.server_warmup_done.set()
+            app.add_api_route("/completed", lambda: {"result": "saved"})
+            worker.kill()
+            worker.wait(timeout=5)
+            await asyncio.wait_for(http_server._monitor_backend(app), timeout=5)
+            async with http_server.httpx.AsyncClient(
+                transport=http_server.httpx.ASGITransport(app=app),
+                base_url="http://test",
+            ) as http:
+                self.assertEqual((await http.get("/health")).status_code, 503)
+                self.assertEqual((await http.get("/liveness")).status_code, 200)
+                self.assertEqual((await http.post("/v1/videos")).status_code, 503)
+                self.assertEqual(
+                    (await http.get("/completed")).json(), {"result": "saved"}
+                )
+
     async def test_liveness_returns_200_before_warmup(self):
         self.assertEqual(await liveness(), {"status": "ok"})
 
@@ -51,6 +183,65 @@ class TestHealthWarmupGate(unittest.IsolatedAsyncioTestCase):
         warmup_done.set()
         resp = await health_generate(_make_request(warmup_done))
         self.assertEqual(resp, {"status": "ok"})
+
+    @unittest.skipUnless(sys.platform == "linux", "requires waitid WNOWAIT")
+    async def test_exited_worker_is_unready_before_and_after_reaping(self):
+        """A dead replica must not remain ready just because warmup completed."""
+        warmup_done = asyncio.Event()
+        warmup_done.set()
+        request = _make_request(warmup_done)
+        with subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"]
+        ) as worker:
+            # Another live replica must not hide the dead one.
+            request.app.state.worker_processes = [
+                psutil.Process(os.getpid()),
+                psutil.Process(worker.pid),
+            ]
+            self.assertEqual(await health(request), {"status": "ok"})
+            worker.kill()
+            await asyncio.to_thread(
+                os.waitid, os.P_PID, worker.pid, os.WEXITED | os.WNOWAIT
+            )
+            for reaped in (False, True):
+                if reaped:
+                    worker.wait(timeout=5)
+                for endpoint in (health, health_generate):
+                    response = await endpoint(request)
+                    self.assertIsInstance(response, Response)
+                    self.assertEqual(response.status_code, 503)
+                self.assertEqual(await liveness(), {"status": "ok"})
+
+
+class TestRouteModelPrebuild(unittest.TestCase):
+    def _app(self):
+        from fastapi import APIRouter, FastAPI
+        from pydantic import BaseModel
+
+        class Body(BaseModel):
+            value: int
+
+        router = APIRouter()
+
+        @router.post("/thing")
+        async def thing(body: Body) -> Body:
+            return body
+
+        app = FastAPI()
+        app.include_router(router)
+        return app
+
+    def test_prebuild_resolves_route_models_before_the_first_request(self):
+        app = self._app()
+        self.assertIsNone(app.openapi_schema)
+        http_server.build_route_request_models(app)
+        self.assertIn("/thing", app.openapi_schema["paths"])
+
+    def test_prebuild_failure_does_not_break_startup(self):
+        app = self._app()
+        with mock.patch.object(app, "openapi", side_effect=RuntimeError("bad schema")):
+            http_server.build_route_request_models(app)
+        self.assertIsNone(app.openapi_schema)
 
 
 class _FakeResponse:

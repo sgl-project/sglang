@@ -12,7 +12,7 @@ import logging
 import uuid
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional, Union
 
-from fastapi import Request
+from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ValidationError
 
@@ -757,6 +757,15 @@ class AnthropicServing:
             )
         except asyncio.CancelledError:
             raise
+        except HTTPException as e:
+            logger.warning(
+                "Non-streaming request rejected: %s %s", e.status_code, e.detail
+            )
+            return self._error_response(
+                status_code=e.status_code,
+                error_type=ERROR_TYPE_MAP.get(e.status_code, "api_error"),
+                message=_scrub_error_message(str(e.detail), e.status_code),
+            )
         except Exception as e:
             logger.exception("Error processing Anthropic request: %s", e)
             return self._error_response(

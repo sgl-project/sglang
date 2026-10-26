@@ -10,6 +10,10 @@ This page focuses on optimal configuration and benchmark results for Qwen3-235B-
 On the A3 Series, each card has 2 dies, so `--tp-size` is twice the card count; see [Ascend NPU Reference](/docs/hardware-platforms/ascend-npus/reference/glossary#hardware) for details.
 </Note>
 
+<Warning>
+The optimal configurations on this page are validated with the image `quay.io/ascend/sglang:v0.5.18-cann9.0.0-a3`. Use exactly this version; later versions are not covered by this page and may introduce breaking changes.
+</Warning>
+
 ### Low Latency
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
@@ -175,7 +179,6 @@ export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=188416
 export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_NPU_FUSED_MOE_MODE=2
 export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=100
 export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
 
@@ -204,7 +207,8 @@ python3 -m sglang.launch_server \
     --speculative-num-draft-tokens 4 \
     --speculative-draft-model-quantization unquant \
     --tp 16 \
-    --attn-dp-size 16 \
+    --dp-size 16 \
+    --enable-dp-attention \
     --enable-dp-lm-head \
     --mem-fraction-static 0.8 \
     --cuda-graph-bs-decode 1 2 4 8 16 20 24 26 27 \

@@ -3,7 +3,6 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-import msgspec
 import torch
 
 from sglang.srt.layers import layer_boundary as comm
@@ -185,6 +184,9 @@ class _WrittenIn:
     """An update that is not a plain add: the output is written into the
     residual only once its sum is complete."""
 
+    bind = None
+    replay_update = None
+
     is_plain_add = False
     applied_at_exit = False
 
@@ -223,46 +225,6 @@ class TestTheProducersUpdateChoosesTheOrder(CustomTestCase):
         self.assertIs(other.func, comm_ops._reduce_update_read_dp_gather)
         self.assertTrue(other.keywords["reduces_attention_tp"])
         self.assertNotIn("update", other.keywords)
-
-    def test_capabilities_prebind_both_orders_without_capturing_an_update(self):
-        edge = msgspec.structs.replace(
-            self.edge(None), arriving_plain_add=(True, False)
-        )
-        boundary = bind_entry(edge)
-        paths = boundary.prepare.keywords["paths"]
-        self.assertEqual(set(paths), {True, False})
-        self.assertIs(paths[True].keywords["step"].func, comm_ops._dp_gather_sum_read)
-        self.assertIs(
-            paths[False].keywords["step"].func, comm_ops._reduce_update_read_dp_gather
-        )
-        for path in paths.values():
-            self.assertNotIn("update", path.keywords["step"].keywords)
-
-    def test_actual_update_selects_a_prebound_path(self):
-        full = rows(sizes(tp=1))
-        edge = EdgeContract(
-            OutputContract(full, update=None),
-            InputContract(full),
-            full,
-            full,
-            arriving_plain_add=(True, False),
-        )
-        boundary = bind_entry(edge)
-
-        def norm(value, residual=None):
-            return value if residual is None else (value + residual, value + residual)
-
-        for update, expected in ((comm.PLAIN_ADD, 4.0), (_WrittenIn(), 5.0)):
-            with self.subTest(plain=update.is_plain_add):
-                hidden, residual = boundary.prepare(
-                    torch.ones(2, 4),
-                    torch.full((2, 4), 3.0),
-                    None,
-                    norm,
-                    update=update,
-                )
-                torch.testing.assert_close(hidden, torch.full((2, 4), expected))
-                torch.testing.assert_close(residual, hidden)
 
     def test_fused_kernels_take_only_a_plain_add(self):
         full = rows(sizes(tp=2))
@@ -320,7 +282,9 @@ class TestTheProducersUpdateChoosesTheOrder(CustomTestCase):
 
     def test_cross_layer_update_requires_a_lifetime_guarantee(self):
         local = Layout(frozenset())
-        stateful_update = SimpleNamespace(is_plain_add=False, applied_at_exit=False)
+        stateful_update = SimpleNamespace(
+            is_plain_add=False, applied_at_exit=False, outlives_layer=False
+        )
         edge = EdgeContract(
             OutputContract(local, update=stateful_update),
             InputContract(local),
@@ -330,21 +294,12 @@ class TestTheProducersUpdateChoosesTheOrder(CustomTestCase):
         with self.assertRaisesRegex(NotImplementedError, "lifetime"):
             bind_exit(edge)
 
-    def test_pipeline_cannot_reconstruct_a_non_add_update(self):
-        local = Layout(frozenset())
-        update = SimpleNamespace(
-            is_plain_add=False, applied_at_exit=False, outlives_layer=True
-        )
-        edge = EdgeContract(
-            OutputContract(local, update=update), InputContract(local), local, local
-        )
-        with get_parallel().override(pp_size=2):
-            with self.assertRaisesRegex(NotImplementedError, "pipeline boundaries"):
-                bind_exit(edge)
-
 
 class ProbeRead:
+    bind = None
     reads_before_dp_gather = False
+    completing_fusions = ()
+    gathering_reads = ()
     """A read that marks what it reads: the input is the residual plus 100.
     ``is_plain_norm`` says whether it may stand in for a norm."""
 

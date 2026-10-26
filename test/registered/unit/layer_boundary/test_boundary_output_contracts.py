@@ -1,7 +1,6 @@
 """Numerical and interface coverage for boundary/graph integration regressions."""
 
 import unittest
-from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -10,21 +9,23 @@ import torch
 
 from sglang.srt.layers.layer_boundary import (
     PLAIN_ADD,
-    ProducerReduction,
     declare_attn,
     declare_ffn,
 )
 from sglang.srt.layers.layer_boundary import exit as exits
-from sglang.srt.layers.layer_boundary import (
-    make_stages,
+from sglang.srt.layers.layer_boundary import stage as stages
+from sglang.srt.layers.layer_boundary.contracts import (
+    BatchVariant,
+    ExitFacts,
+    StageKind,
 )
-from sglang.srt.layers.layer_boundary.contracts import BatchVariant
 from sglang.srt.layers.layer_boundary.fusions.cutedsl import CuteDSLFusion
 from sglang.srt.layers.layer_boundary.layout import SumGroup
-from sglang.srt.layers.layer_boundary.prepare import _dispatch_by_update
 from sglang.srt.layers.layer_boundary.residual import batch
+from sglang.srt.layers.layer_boundary.residual.add_norm import REPLACE_AT_EXIT
 from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.test.boundary_fixtures import build_stages
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.communicator_patch import patch_communicator
 
@@ -36,59 +37,76 @@ class TestBoundaryIntegrations(unittest.TestCase):
         parallel = fixture.parallel_of(attn_dp=2, attn_tp=2)
         rows = fixture.comm.Layout(frozenset())
         produced = fixture.comm.OutputContract(
-            rows, group=SumGroup.ATTN_TP, may_defer_to_next=True
+            rows, group=SumGroup.ATTN_TP, may_defer_to_next=True, update=PLAIN_ADD
         )
-        plan = SimpleNamespace(path_for=lambda _: SimpleNamespace(output=produced))
+        path = SimpleNamespace(output=produced)
+        plan = SimpleNamespace(finishes_directly=False, path_for=lambda _: path)
         boundary = exits.ExitPolicy(plan)
-        boundary._sum_deferral_allowed = lambda _: True
+        summed = Mock(side_effect=lambda value, *args, **kwargs: value * 2)
         with (
             fixture.planning(parallel),
             patch.object(exits, "is_dp_attention_enabled", return_value=True),
+            patch.object(exits, "sum_output", summed),
         ):
+            # Under attention DP a mixer completes its sum even where it could
+            # otherwise carry it to the next attention.
+            with patch.object(exits, "_sum_deferral_allowed", return_value=True):
+                path.exit = exits.exit_facts(
+                    StageKind.ATTENTION, plan, BatchVariant.ORDINARY, path
+                )
             stream = ResidualStream(torch.zeros(3, 4))
             result = exits.MixerExit(boundary, None, stream=stream)
-            self.assertFalse(result.skips_reduction)
             value = torch.ones(3, 4)
-            self.assertIs(result.finish(value), value)
+            torch.testing.assert_close(result.finish(value), value * 2)
+            self.assertEqual(summed.call_args.args[1], SumGroup.ATTN_TP)
             self.assertIsNone(stream.pending.owed)
 
-    def test_pipeline_preserves_declared_sum_for_one_receiver_completion(self):
-        parallel = fixture.parallel_of(
-            attn_dp=1, attn_tp=2, enable_attn_tp_input_scattered=True
-        )
-        with fixture.planning(parallel):
-            attn, _ = make_stages(
-                (declare_attn(), fixture.Norm()),
-                (declare_ffn(), fixture.Norm()),
-                previous=declare_ffn(),
-            )
-        attn.plan.path_for = lambda _: attn.plan.paths[BatchVariant.INPUT_SCATTERED]
-        fb = SimpleNamespace(residual_stream=ResidualStream(torch.full((4, 4), 3.0)))
-        hidden = fb.residual_stream.record(
-            torch.ones(4, 4), PLAIN_ADD, declared_sum=SumGroup.TP
-        )
-        wire = batch.to_pp(hidden, fb)
-        self.assertIsNone(fb.residual_stream)
-        torch.testing.assert_close(wire["hidden_states"], torch.ones(4, 4))
-        hidden = attn.from_pp(wire, fb)
-        reductions = []
+    def test_a_pipeline_handoff_carries_its_sum_completed(self):
+        # The pipeline sends each tensor as one slice per attention-TP rank and
+        # gathers the slices back, so the sender completes a declared sum; the
+        # next rank's entry takes the value as complete and only slices it.
+        calls = []
+
+        def all_reduce(value):
+            calls.append("AR")
+            return value * 2
 
         def reduce_scatter(value, residual):
-            reductions.append("RS")
+            calls.append("RS")
             return value.chunk(2)[0] * 2, residual.chunk(2)[0]
 
+        def slice_rows(value, residual):
+            calls.append("slice")
+            return value.chunk(2)[0], residual.chunk(2)[0]
+
+        parallel = fixture.parallel_of(
+            attn_dp=1,
+            attn_tp=2,
+            enable_attn_tp_input_scattered=True,
+            tp_group=SimpleNamespace(name="tp", ranks=[0, 1], all_reduce=all_reduce),
+        )
         with (
             fixture.planning(parallel),
             patch_communicator("tp_reduce_scatter", reduce_scatter),
+            patch_communicator("tp_slice", slice_rows),
         ):
-            # Rebind the path with the numerical collective stand-in.
-            attn, _ = make_stages(
+            attn, _ = build_stages(
                 (declare_attn(), fixture.Norm()),
                 (declare_ffn(), fixture.Norm()),
                 previous=declare_ffn(),
             )
             attn.plan.path_for = lambda _: attn.plan.paths[BatchVariant.INPUT_SCATTERED]
             attn.plan.qkv_latent_func = None
+            fb = SimpleNamespace(
+                residual_stream=ResidualStream(torch.full((4, 4), 3.0))
+            )
+            hidden = fb.residual_stream.record(
+                torch.ones(4, 4), PLAIN_ADD, declared_sum=SumGroup.TP
+            )
+            wire = batch.to_pp(hidden, fb)
+            self.assertIsNone(fb.residual_stream)
+            torch.testing.assert_close(wire["hidden_states"], torch.full((4, 4), 2.0))
+            hidden = attn.from_pp(wire, fb)
             entry = attn.entry(fb)
             hidden, residual = fb.residual_stream.input(hidden)
             output, _ = entry.prepare(
@@ -99,7 +117,8 @@ class TestBoundaryIntegrations(unittest.TestCase):
                 pending=fb.residual_stream.pending,
                 update=PLAIN_ADD,
             )
-        self.assertEqual(reductions, ["RS"])
+        self.assertEqual(calls, ["AR", "slice"])
+        # Norm: 2 * (h + r) on the slice, with h the completed sum.
         torch.testing.assert_close(output, torch.full((2, 4), 10.0))
 
     def test_terminal_finalize_requires_explicit_final_consumer(self):
@@ -122,7 +141,7 @@ class TestBoundaryIntegrations(unittest.TestCase):
                     return_value=parallel,
                 ),
             ):
-                _, ffn = make_stages(
+                _, ffn = build_stages(
                     (declare_attn(), fixture.Norm()),
                     (declare_ffn(sparse=True), fixture.Norm(), {"fusions": fusion}),
                     terminal=True,
@@ -133,17 +152,6 @@ class TestBoundaryIntegrations(unittest.TestCase):
                 ):
                     decision = ffn.exit(fb)
                 self.assertEqual(decision.defer_moe_finalize, accepted)
-
-    def test_absent_residual_uses_non_partial_update_path(self):
-        plain = Mock(side_effect=AssertionError("cannot add a missing residual"))
-        generic = Mock(return_value=("input", None))
-        self.assertEqual(
-            _dispatch_by_update(
-                None, None, None, None, paths={True: plain, False: generic}
-            ),
-            ("input", None),
-        )
-        plain.assert_not_called()
 
     def test_lora_or_shared_tp1_defers_only_when_fusion_is_eligible(self):
         group = object()
@@ -158,9 +166,6 @@ class TestBoundaryIntegrations(unittest.TestCase):
                         exits.envs.SGLANG_SHARED_EXPERT_TP1, "get", return_value=shared
                     ),
                     patch.object(exits, "_ffn_has_tokens", return_value=True),
-                    patch.object(
-                        exits, "post_experts_sum_is_one_all_reduce", return_value=False
-                    ),
                     patch.object(
                         exits,
                         "get_lora",
@@ -191,16 +196,92 @@ class TestBoundaryIntegrations(unittest.TestCase):
                     ),
                     patch.object(exits, "aiter_ar_fusion_applies", return_value=False),
                 ):
+                    facts = ExitFacts(
+                        single_sum=False, fused_consumer_sum=exits._fused_consumer_sum()
+                    )
                     self.assertEqual(
-                        exits._batch_allows_deferred_sum(fb),
+                        exits._batch_allows_deferred_sum(fb, facts),
                         enabled and (lora or shared),
                     )
 
-    def test_unsupported_producer_contracts_fail_at_declaration(self):
-        with self.assertRaises(ValueError):
-            declare_ffn(reduction=ProducerReduction.ALWAYS_PARTIAL)
-        with self.assertRaises(ValueError):
-            declare_attn(reduction=ProducerReduction.TAIL_AFTER_SUM)
+    def test_ffn_writing_the_next_stream_hands_on_a_complete_output(self):
+        # It has each part's sum completed (sum_part) before building the
+        # stream from the parts, so its exit owes no sum and never defers one.
+        for attn_dp in (1, 2):
+            with (
+                self.subTest(attn_dp=attn_dp),
+                fixture.planning(fixture.parallel_of(attn_dp=attn_dp, attn_tp=2)),
+            ):
+                for sparse in (False, True):
+                    _, ffn = build_stages(
+                        (declare_attn(), fixture.Norm()),
+                        (
+                            declare_ffn(sparse=sparse, update=REPLACE_AT_EXIT),
+                            fixture.Norm(),
+                        ),
+                        previous=declare_ffn(sparse=sparse, update=REPLACE_AT_EXIT),
+                    )
+                    for variant, path in ffn.plan.paths.items():
+                        self.assertIsNone(path.output.group, (sparse, variant))
+                        self.assertFalse(path.output.may_defer_to_next)
+
+    def test_an_ffn_that_completes_its_own_sum_owes_none(self):
+        # Its compute completes the sum, so the exit neither sums nor defers it,
+        # under DP and on an input-scattered batch too.
+        for attn_dp, scattered in ((1, False), (2, False), (1, True)):
+            parallel = fixture.parallel_of(
+                attn_dp=attn_dp,
+                attn_tp=2,
+                enable_attn_tp_input_scattered=scattered,
+            )
+            with (
+                self.subTest(attn_dp=attn_dp, input_scattered=scattered),
+                fixture.planning(parallel),
+            ):
+                for sparse in (False, True):
+                    stages = {
+                        complete: build_stages(
+                            (declare_attn(), fixture.Norm()),
+                            (
+                                declare_ffn(sparse=sparse, output_complete=complete),
+                                fixture.Norm(),
+                            ),
+                            previous=declare_ffn(sparse=sparse),
+                        )[1]
+                        for complete in (False, True)
+                    }
+                    owed = stages[False].plan.paths[BatchVariant.ORDINARY].output
+                    self.assertIsNotNone(owed.group, sparse)
+                    if scattered:
+                        self.assertIn(
+                            BatchVariant.INPUT_SCATTERED, stages[True].plan.paths
+                        )
+                    for variant, path in stages[True].plan.paths.items():
+                        self.assertIsNone(path.output.group, (sparse, variant))
+                        self.assertFalse(path.output.may_defer_to_next)
+                        self.assertFalse(path.output.may_reduce_scatter)
+
+    def test_only_an_ffn_writing_the_next_stream_sums_its_parts(self):
+        summed = Mock(side_effect=lambda value, *args, **kwargs: value * 2)
+        fb = SimpleNamespace()
+        with (
+            fixture.planning(fixture.parallel_of(attn_dp=1, attn_tp=2)),
+            patch.object(stages, "sum_output", summed),
+        ):
+            for update in (PLAIN_ADD, REPLACE_AT_EXIT):
+                _, ffn = build_stages(
+                    (declare_attn(), fixture.Norm()),
+                    (declare_ffn(update=update), fixture.Norm()),
+                )
+                if update is PLAIN_ADD:
+                    with self.assertRaises(RuntimeError):
+                        ffn.sum_part(torch.ones(2, 4), fb, SumGroup.TP)
+                    continue
+                part = ffn.sum_part(torch.ones(2, 4), fb, SumGroup.MOE_OUTPUT)
+        torch.testing.assert_close(part, torch.full((2, 4), 2.0))
+        summed.assert_called_once()
+        self.assertIs(summed.call_args.args[1], SumGroup.MOE_OUTPUT)
+        self.assertFalse(summed.call_args.kwargs["may_quantize"])
 
     def test_dense_decoder_forwards_capture_callback(self):
         from sglang.srt.models.llama4 import Llama4DecoderLayer
@@ -214,14 +295,13 @@ class TestBoundaryIntegrations(unittest.TestCase):
                     capture(hidden)
                 return hidden
 
-            output = SimpleNamespace(finish=lambda hidden: hidden)
             layer = SimpleNamespace(
                 attn_boundary=SimpleNamespace(
                     prepare=prepare, finish=lambda hidden, fb: hidden
                 ),
                 ffn_boundary=SimpleNamespace(
                     prepare=lambda hidden, fb, **kw: hidden,
-                    exit=lambda fb: nullcontext(output),
+                    finish=lambda hidden, fb: hidden,
                 ),
                 self_attn=lambda **kw: kw["hidden_states"],
                 mlp=lambda hidden, **kw: hidden,

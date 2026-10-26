@@ -20,14 +20,20 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.layers import layer_boundary as comm
-from sglang.srt.layers import layernorm_sp
 from sglang.srt.layers.layer_boundary import (
     SumGroup,
     TokenAxis,
+    append_stages,
 )
 from sglang.srt.layers.layer_boundary import boundary as comm_boundary
-from sglang.srt.layers.layer_boundary import construction as comm_layer
+from sglang.srt.layers.layer_boundary import (
+    declare_attn,
+    declare_ffn,
+)
 from sglang.srt.layers.layer_boundary import exit as comm_exit
+from sglang.srt.layers.layer_boundary import (
+    layer_stack,
+)
 from sglang.srt.layers.layer_boundary import layout as comm_layout
 from sglang.srt.layers.layer_boundary import ops as transport_ops
 from sglang.srt.layers.layer_boundary import prepare as comm_ops
@@ -45,17 +51,21 @@ from sglang.srt.layers.layer_boundary.ops import (
     update_attn_tp_gather_output,
 )
 from sglang.srt.layers.layer_boundary.residual import mhc as mhc_module
-from sglang.srt.layers.layer_boundary.residual.access import export_output
 from sglang.srt.layers.layer_boundary.residual.add_norm import (
     NORM_READOUT,
     PLAIN_RESIDUAL_OPS,
+    REPLACE_AT_EXIT,
 )
 from sglang.srt.layers.layer_boundary.residual.stream import OwedOutput, ResidualStream
 from sglang.srt.layers.moe import utils as moe_utils
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.runtime_context import get_forward
 from sglang.test.boundary_fixtures import (
+    Norm,
     finish_exit,
     make_test_stages,
+    parallel_of,
+    planning,
     postprocess_output,
     prepare_input,
 )
@@ -66,97 +76,6 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
 HIDDEN = 4
-
-
-def parallel_of(*, attn_dp, attn_tp, attn_cp=1, **overrides):
-    fields = dict(
-        tp_size=attn_dp * attn_cp * attn_tp,
-        tp_rank=0,
-        attn_dp_size=attn_dp,
-        attn_tp_size=attn_tp,
-        attn_tp_rank=0,
-        attn_cp_size=attn_cp,
-        attn_cp_rank=0,
-        moe_dense_tp_size=None,
-        enable_prefill_cp=False,
-        moe_ep_size=1,
-        moe_tp_size=attn_dp * attn_cp * attn_tp,
-        moe_dp_size=1,
-        dwdp_size=1,
-        attn_dp_enabled=attn_dp > 1,
-        enable_attn_tp_input_scattered=False,
-        tp_group=SimpleNamespace(
-            name="tp", ranks=list(range(attn_dp * attn_cp * attn_tp))
-        ),
-        attn_tp_group=SimpleNamespace(name="attn_tp", ranks=list(range(attn_tp))),
-        attn_cp_group=SimpleNamespace(name="attn_cp", ranks=list(range(attn_cp))),
-    )
-    fields.update(overrides)
-    return SimpleNamespace(**fields)
-
-
-@contextmanager
-def planning(
-    parallel,
-    *,
-    sp=False,
-    a2a=False,
-    dsa_cp=False,
-    boundary_reduction="rs+rsv",
-):
-    """What layer planning and communicator construction read, without the
-    process-wide parallel state. ``parallel`` may be a callable, for a
-    per-thread parallel state. ``dsa_cp``: the prefill CP is DSA's (MLA's is
-    the same to the communicator)."""
-    get_parallel = parallel if callable(parallel) else (lambda: parallel)
-
-    def moe_cp_gathers():
-        return get_parallel().attn_cp_size > get_parallel().moe_dp_size
-
-    with (
-        patch_communicator("get_parallel", get_parallel),
-        patch_communicator("is_dsa_enable_prefill_cp", lambda: dsa_cp),
-        patch_communicator("is_mla_cp_enabled", lambda: False),
-        patch_communicator(
-            "get_moe_cp_size",
-            lambda: get_parallel().attn_cp_size if moe_cp_gathers() else 1,
-        ),
-        patch.object(layernorm_sp, "layernorm_sp_enabled", lambda: sp),
-        patch_communicator(
-            "get_spec", lambda: SimpleNamespace(speculative_algorithm=None)
-        ),
-        patch_communicator(
-            "get_moe_a2a_backend",
-            lambda: SimpleNamespace(is_none=lambda: not a2a),
-        ),
-        patch_communicator("is_moe_input_scattered_across_dp_ranks", lambda: a2a),
-        patch_communicator("is_enable_moe_cp_allgather", moe_cp_gathers),
-        patch_communicator("get_lora", lambda: SimpleNamespace(enable_lora=False)),
-        # A MoE whose EP and TP sums merge: its output's group is the TP group.
-        patch_communicator(
-            "post_experts_reduction_group", lambda: get_parallel().tp_group
-        ),
-        # Planning asks whether a dense layer gathers for two-batch overlap.
-        patch_communicator(
-            "get_exec",
-            lambda: SimpleNamespace(
-                comm=SimpleNamespace(boundary_reduction=boundary_reduction),
-                overlap=SimpleNamespace(enable_two_batch_overlap=False),
-            ),
-        ),
-    ):
-        yield
-
-
-class Norm:
-    """add + norm stand-in: (2 * (h + r), h + r); one input: 2 * h."""
-
-    def __call__(self, x, residual=None, post_residual_addition=None):
-        assert post_residual_addition is None
-        if residual is None:
-            return x * 2
-        s = x + residual
-        return s * 2, s
 
 
 class FusableNorm(Norm):
@@ -368,7 +287,7 @@ class TestMhcOnTheDeclarations(CustomTestCase):
                 max_len, communicator.ffn.plan.output.plan.path_for(max_len)
             )
             self.assertTrue(
-                communicator.ffn.plan.output._skips_sum_for_reduce_scatter(
+                communicator.ffn.plan.output._sum_in_reduce_scatter(
                     communicator.ffn.plan.output.plan.path_for(max_len), step
                 )
             )
@@ -391,11 +310,15 @@ class TestMhcOnTheDeclarations(CustomTestCase):
         ):
             with self.subTest(name):
                 hc_post = MagicMock(side_effect=lambda h, r, h_res, h_post: h + r)
-                communicator = build_mhc(
-                    layer_case(1, 3),
-                    parallel,
-                    hc_post=hc_post,
-                )
+                # Whether the DP return is the reduce-scatterv is the configuration's.
+                with patch_communicator(
+                    "should_use_dp_reduce_scatterv", lambda: reduce_scatterv
+                ):
+                    communicator = build_mhc(
+                        layer_case(1, 3),
+                        parallel,
+                        hc_post=hc_post,
+                    )
                 communicator.mhc.h_res = communicator.mhc.h_post = torch.zeros(2)
                 forward_batch = SimpleNamespace(
                     dp_padding_mode=SimpleNamespace(is_max_len=lambda: is_max_len),
@@ -405,9 +328,6 @@ class TestMhcOnTheDeclarations(CustomTestCase):
                 to_local_tokens = MagicMock(side_effect=lambda step, fb, h: h[:2])
                 with (
                     planning(parallel),
-                    patch_communicator(
-                        "should_use_dp_reduce_scatterv", lambda: reduce_scatterv
-                    ),
                     patch_communicator("can_use_dp_reduce_scatter", lambda: True),
                     patch_communicator("_select_dp_reduce_scatter", choose),
                     patch_communicator("to_dp_local", to_local_tokens),
@@ -415,7 +335,9 @@ class TestMhcOnTheDeclarations(CustomTestCase):
                     with communicator.ffn.plan.output.ffn_exit(
                         forward_batch, stream=ResidualStream()
                     ) as ffn_exit:
-                        self.assertTrue(ffn_exit.mlp_reduce_scatter)
+                        # The reduce-scatter on the way back completes the sum;
+                        # the FFN never runs or skips it.
+                        self.assertFalse(get_forward().mlp_reduce_scatter)
                     hidden, residual = finish_exit(
                         ffn_exit, torch.ones(4, 4), torch.full((2, 4), 2.0)
                     )
@@ -572,15 +494,14 @@ class TestMhcOnTheDeclarations(CustomTestCase):
                 # The write-back consumes this layer's coefficients.
                 self.assertIsNone(communicator.mhc.h_res)
 
-    def test_a_gather_over_attention_cp_is_rejected(self):
+    def test_mhc_can_keep_its_residual_on_attention_cp_shards(self):
         # A MoE on the TP group under DSA prefill CP gathers its input over
-        # attention CP, which MHC has not been run with.
+        # attention CP while MHC retains its residual and coefficients locally.
         parallel = parallel_of(
             attn_dp=1, attn_tp=1, attn_cp=2, enable_prefill_cp=True, moe_dense_tp_size=1
         )
         facts = layer_case(1, 3, sparse=True, previous_sparse=False)
-        with self.assertRaises(NotImplementedError):
-            build_mhc(facts, parallel, dsa_cp=True)
+        build_mhc(facts, parallel, dsa_cp=True)
         # A dense layer on every rank computes on its own shard: nothing moves.
         facts = layer_case(1, 3, sparse=False, previous_sparse=False)
         build_mhc(facts, parallel, dsa_cp=True)
@@ -617,6 +538,18 @@ class TestMhcOnTheDeclarations(CustomTestCase):
         )
         parallel = parallel_of(
             attn_dp=1, attn_tp=2, attn_cp=2, moe_dp_size=2, moe_tp_size=2
+        )
+        build_mhc(
+            layer_case(1, 3, sparse=True, previous_sparse=True),
+            parallel,
+        )
+        # CP-TP group sharing (Qwen4-Exp) runs MHC on the MoE-CP gather.
+        parallel = parallel_of(
+            attn_dp=1,
+            attn_tp=1,
+            attn_cp=2,
+            enable_prefill_cp=True,
+            enable_cp_tp_group_sharing=True,
         )
         build_mhc(
             layer_case(1, 3, sparse=True, previous_sparse=True),
@@ -728,7 +661,7 @@ class TestTheAttentionOutputDecidesItsSum(CustomTestCase):
             TokenAxis.ATTN_CP: 1,
             TokenAxis.ATTN_TP: 2,
         }
-        steps, _ = comm_boundary._select_entry_step(
+        steps, *_ = comm_boundary._select_entry_step(
             produced,
             residual=comm.Layout.sharded_over(TokenAxis.ATTN_DP, axis_sizes=sizes),
             residual_to=comm.Layout.sharded_over(TokenAxis.ATTN_DP, axis_sizes=sizes),
@@ -811,7 +744,7 @@ class TestFusedKernelsTakeOnlyTheStepsTheyComplete(CustomTestCase):
             TokenAxis.ATTN_TP: 2,
         }
         attention = comm.Layout.sharded_over(TokenAxis.ATTN_DP, axis_sizes=sizes)
-        steps, _ = comm_boundary._select_entry_step(
+        steps, *_ = comm_boundary._select_entry_step(
             comm.OutputContract(attention, group=SumGroup.ATTN_TP, always_partial=True),
             residual=comm.Layout.sharded_over(TokenAxis.ATTN_DP, axis_sizes=sizes),
             residual_to=comm.Layout.sharded_over(TokenAxis.ATTN_DP, axis_sizes=sizes),
@@ -866,14 +799,10 @@ class TestTheSequenceParallelRegion(CustomTestCase):
                 ),
                 patch_communicator("is_dp_attention_enabled", lambda: False),
             ):
-                self.assertIs(
-                    communicator.ffn.plan.output._sum_deferral_allowed(
-                        communicator.ffn.plan.output.plan.path_for(
-                            SimpleNamespace(forward_mode=ForwardMode.DECODE)
-                        )
-                    ),
-                    not active,
+                steps = communicator.ffn.plan.path_for(
+                    SimpleNamespace(forward_mode=ForwardMode.DECODE)
                 )
+                self.assertIs(steps.exit.may_defer_sum, not active)
 
 
 class TestInputScatteredAttention(CustomTestCase):
@@ -899,7 +828,7 @@ class TestInputScatteredAttention(CustomTestCase):
             (False, comm_ops._reduce_update_read),
         ):
             with self.subTest(residual_joins_sum=joins):
-                steps, _ = comm_boundary._select_entry_step(
+                steps, *_ = comm_boundary._select_entry_step(
                     owed,
                     residual=local,
                     residual_to=attention,
@@ -918,7 +847,7 @@ class TestInputScatteredAttention(CustomTestCase):
         sizes = self.SIZES
         attention = comm.Layout.sharded_over(axis_sizes=sizes)
         local = comm.Layout(frozenset({TokenAxis.ATTN_TP}))
-        step, _ = comm_boundary._select_entry_step(
+        step, *_ = comm_boundary._select_entry_step(
             comm.OutputContract(attention),
             residual=attention,
             residual_to=local,
@@ -1012,12 +941,15 @@ class TestInputScatteredAttention(CustomTestCase):
             patch_communicator("get_parallel", lambda: parallel),
             patch_communicator(
                 "get_attn_tp_context",
-                lambda: SimpleNamespace(input_scattered=True),
+                lambda: SimpleNamespace(input_scattered=True, is_dsa=False),
             ),
             patch_communicator(
                 "get_forward",
                 lambda: SimpleNamespace(sp_active=False, attn_input_scattered=False),
             ),
+            # This attention has no QKV hook, so it takes every row of its
+            # input: the slice is gathered after the read.
+            patch_communicator("tp_gather", lambda h, fb: torch.cat([h, h])),
         ):
             hidden, residual = prepare_input(
                 communicator.attn,
@@ -1028,7 +960,7 @@ class TestInputScatteredAttention(CustomTestCase):
         self.assertEqual(scattered, [4])
         # Norm: (2 * (h + r), h + r) on the slice, with h the completed sum.
         torch.testing.assert_close(residual.residual, torch.full((2, HIDDEN), 5.0))
-        torch.testing.assert_close(hidden, torch.full((2, HIDDEN), 10.0))
+        torch.testing.assert_close(hidden, torch.full((4, HIDDEN), 10.0))
 
     def test_the_last_layer_completes_its_own_sum(self):
         parallel = parallel_of(
@@ -1122,7 +1054,7 @@ class TestPrefillCP(CustomTestCase):
                     patch_communicator("_batch_shards_over_cp", lambda fb: shards),
                 ):
                     self.assertIs(
-                        communicator.ffn.plan.output._skips_sum_for_reduce_scatter(
+                        communicator.ffn.plan.output._sum_in_reduce_scatter(
                             communicator.ffn.plan.output.plan.path_for(
                                 SimpleNamespace(forward_mode=ForwardMode.DECODE)
                             ),
@@ -1420,7 +1352,11 @@ class TestBranchRows(CustomTestCase):
             branch_output = branch.branch_output
             merge_branch = branch.merge_branch
 
-        moe = Communicator(branch_rows=lambda fb: (self.local, self.local, self.local))
+        moe = Communicator(
+            branch_rows=lambda fb: (self.local, self.local, self.local),
+            # The a2a combine already summed the MoE output.
+            path_for=lambda fb: SimpleNamespace(output=comm.OutputContract(self.local)),
+        )
         dense = Communicator(
             branch_rows=lambda fb: (self.full, self.attention, self.attention)
         )
@@ -1584,7 +1520,6 @@ class Flags:
     """The per-forward flags an FFN exit publishes, one set per rank."""
 
     def __init__(self):
-        self.fuse_mlp_allreduce = False
         self.mlp_reduce_scatter = False
         self.defer_moe_finalize = False
         self.sp_active = False
@@ -1642,6 +1577,12 @@ def running(*, reduce_scatterv, a2a=False, use_reduce_scatter=True):
         "attention_tensor_model_parallel_all_reduce": lambda x: (
             state().parallel.attn_tp_group.all_reduce(x)
         ),
+        "tensor_model_parallel_all_reduce": lambda x: (
+            state().parallel.tp_group.all_reduce(x)
+        ),
+        "sum_post_experts_output": lambda x: (
+            comm_layout.post_experts_reduction_group().all_reduce(x)
+        ),
         "get_global_dp_buffer": lambda g: torch.zeros(
             state().global_rows, HIDDEN, dtype=torch.double
         ),
@@ -1686,7 +1627,7 @@ def running(*, reduce_scatterv, a2a=False, use_reduce_scatter=True):
         # What the MoE declares its skipped reduction leaves, read in its module.
         for name, value in (
             ("get_parallel", lambda: state().parallel),
-            ("get_moe_a2a_backend", comm_layer.get_moe_a2a_backend),
+            ("get_moe_a2a_backend", comm_layout.get_moe_a2a_backend),
             (
                 "post_experts_output_is_complete",
                 replaced["post_experts_output_is_complete"],
@@ -1709,21 +1650,15 @@ def attention(x, state):
 
 
 def dense_mlp(x, state):
-    """A dense MLP on the TP group: 5 * x, reduced unless a published flag asks
-    it to leave the sum, as RowParallelLinear does."""
-    partial_sum = 5 * x * WEIGHTS[state.parallel.tp_size][state.parallel.tp_rank]
-    if state.flags.fuse_mlp_allreduce or state.flags.mlp_reduce_scatter:
-        return partial_sum
-    return state.parallel.tp_group.all_reduce(partial_sum)
+    """A dense MLP on the TP group: 5 * x, as this rank's partial sum; the
+    stage boundary completes it."""
+    return 5 * x * WEIGHTS[state.parallel.tp_size][state.parallel.tp_rank]
 
 
 def moe(x, state):
-    """A MoE block not dispatched per DP shard: 5 * x, reduced over the MoE
-    output's group unless a published flag asks it to leave the sum."""
-    partial_sum = 5 * x * WEIGHTS[state.parallel.tp_size][state.parallel.tp_rank]
-    if state.flags.fuse_mlp_allreduce or state.flags.mlp_reduce_scatter:
-        return partial_sum
-    return comm_layout.post_experts_reduction_group().all_reduce(partial_sum)
+    """A MoE block not dispatched per DP shard: 5 * x, as this rank's partial
+    sum over the MoE output's group; the stage boundary completes it."""
+    return 5 * x * WEIGHTS[state.parallel.tp_size][state.parallel.tp_rank]
 
 
 def reference(x):
@@ -1853,7 +1788,7 @@ class TestTwoLayers(CustomTestCase):
                         hidden = moe(hidden, s)
                 hidden, residual = finish_exit(ffn_exit, hidden, residual)
                 handed_on.append(type(hidden))
-            hidden, residual = export_output(hidden, residual, forward_batch)
+            hidden, residual = residual.export(hidden)
             # The last a2a layer folds the residual into its output.
             if residual is not None:
                 residual = residual[: s.rows]
@@ -1950,11 +1885,164 @@ class TestTwoLayers(CustomTestCase):
                     )
 
 
+class RecordingGroup(Group):
+    """A Group that also records which collective each call runs."""
+
+    def all_reduce(self, x):
+        state().ops.append("all_reduce")
+        return super().all_reduce(x)
+
+    def reduce_scatter_tensor(self, output, input):
+        state().ops.append("reduce_scatter")
+        return super().reduce_scatter_tensor(output, input)
+
+    def all_gather_into_tensor(self, output, input):
+        state().ops.append("all_gather")
+        return super().all_gather_into_tensor(output, input)
+
+
+class TestCompleteOutputsOnInputScatteredBatches(CustomTestCase):
+    """On an input-scattered batch an FFN that hands on a complete output, one
+    its compute summed or the next stream it wrote itself, gets no further
+    sum, at its exit or at the next attention's entry. The next attention
+    still keeps this rank's slice of the residual and takes every row of its
+    input, as after an FFN whose output owes its sum."""
+
+    ATTN_TP = 2
+    ROWS = 4
+
+    def run_ranks(self, output, *, reduction, qkv_hook):
+        tp = self.ATTN_TP
+        world = World(tp)
+        WORLD[0] = world
+        group = RecordingGroup(world, "tp", range(tp))
+        x = torch.arange(1.0, self.ROWS * HIDDEN + 1, dtype=torch.double)
+        x = x.reshape(self.ROWS, HIDDEN)
+        # Norm doubles; the attention is 3x and the FFN 5x of its input.
+        before_ffn = x + 3 * (2 * x)
+        after_ffn = 5 * (2 * before_ffn) + before_ffn
+        forward_batch = SimpleNamespace(
+            forward_mode=SimpleNamespace(
+                is_context_parallel_extend=lambda: False,
+                is_decode_or_idle=lambda: False,
+                is_extend=lambda: True,
+            ),
+            dp_padding_mode=SimpleNamespace(is_max_len=lambda: False),
+            global_dp_buffer_len=self.ROWS,
+            input_ids=torch.zeros(self.ROWS),
+        )
+        ffn_declaration = {
+            "summed by its compute": dict(output_complete=True),
+            "written at its exit": dict(update=REPLACE_AT_EXIT),
+            "owing its sum": {},
+        }[output]
+        states = [
+            SimpleNamespace(
+                rank=rank,
+                parallel=parallel_of(
+                    attn_dp=1,
+                    attn_tp=tp,
+                    tp_rank=rank,
+                    attn_tp_rank=rank,
+                    tp_group=group,
+                    attn_tp_group=group,
+                    enable_attn_tp_input_scattered=True,
+                ),
+                flags=Flags(),
+                calls=[],
+                ops=[],
+                attn_inputs=[],
+            )
+            for rank in range(tp)
+        ]
+        context = SimpleNamespace(
+            input_scattered=True,
+            is_dsa=False,
+            set_attn_inputs=lambda inputs: state().attn_inputs.append(inputs),
+        )
+
+        def ffn(hidden, s):
+            if output == "owing its sum":
+                return dense_mlp(hidden, s)
+            if output == "summed by its compute":
+                return 5 * hidden
+            # It adds the residual itself and writes the next stream.
+            return 5 * hidden + before_ffn
+
+        def build():
+            hook = {"qkv_latent_func": lambda h, fb: 11 * h} if qkv_hook else {}
+            with layer_stack():
+                attention_1, ffn_1 = append_stages(
+                    (declare_attn(), Norm()),
+                    (declare_ffn(**ffn_declaration), Norm()),
+                )
+                attention_2, _ = append_stages(
+                    (declare_attn(), Norm(), hook), (declare_ffn(), Norm())
+                )
+            return attention_1, ffn_1, attention_2
+
+        def forward(rank):
+            s = states[rank]
+            attention_1, ffn_1, attention_2 = stages[rank]
+            hidden, stream = prepare_input(
+                attention_1, x * WEIGHTS[tp][rank], None, forward_batch
+            )
+            hidden = stream.record(
+                attention(hidden, s),
+                comm.PLAIN_ADD,
+                declared_sum=ffn_1.entry(forward_batch).declared_sum,
+            )
+            hidden, stream = prepare_input(ffn_1, hidden, stream, forward_batch)
+            with ffn_1.plan.output.ffn_exit(
+                forward_batch, stream=ResidualStream()
+            ) as ffn_exit:
+                hidden = ffn(hidden, s)
+            computed = len(s.ops)
+            hidden, stream = finish_exit(ffn_exit, hidden, stream)
+            hidden, stream = prepare_input(attention_2, hidden, stream, forward_batch)
+            if qkv_hook:
+                hidden = s.attn_inputs[-1].fetch_qkv_latent()
+            return hidden, stream.residual, s.ops[computed:]
+
+        with (
+            running(reduce_scatterv=False, use_reduce_scatter=reduction == "rs"),
+            patch_communicator("get_attn_tp_context", lambda: context),
+        ):
+            stages = []
+            for s in states:
+                # Each rank binds its own stages; the stack is not shared
+                # between threads.
+                world.local.state = s
+                stages.append(build())
+            results, errors = world.run(states, forward)
+        for rank, error in enumerate(errors):
+            if error is not None:
+                raise AssertionError(f"rank {rank} raised") from error
+        rows = self.ROWS // tp
+        for rank, (hidden, residual, ops) in enumerate(results):
+            want = 2 * after_ffn * (11 if qkv_hook else 1)
+            torch.testing.assert_close(hidden, want, rtol=0, atol=0)
+            torch.testing.assert_close(
+                residual, after_ffn[rank * rows : (rank + 1) * rows], rtol=0, atol=0
+            )
+            sums = [op for op in ops if op != "all_gather"]
+            self.assertEqual(len(sums), output == "owing its sum", ops)
+
+    def test_a_complete_output_is_summed_no_further(self):
+        for output, reduction, qkv_hook in itertools.product(
+            ("summed by its compute", "written at its exit", "owing its sum"),
+            ("ar", "rs"),
+            (False, True),
+        ):
+            with self.subTest(output=output, reduction=reduction, qkv_hook=qkv_hook):
+                self.run_ranks(output, reduction=reduction, qkv_hook=qkv_hook)
+
+
 class TestTheFfnInputReduction(CustomTestCase):
     """With quantized communications a prefill reduces the FFN input quantized
     for a plain residual; MHC sums its streams in full precision."""
 
-    def test_only_a_plain_residual_reduces_quantized(self):
+    def test_only_an_update_that_allows_it_reduces_quantized(self):
         exec_ = SimpleNamespace(
             comm=SimpleNamespace(
                 enable_quant_communications=True, boundary_reduction="rs+rsv"
@@ -1963,11 +2051,13 @@ class TestTheFfnInputReduction(CustomTestCase):
         batch = SimpleNamespace(
             forward_mode=SimpleNamespace(is_decode_or_idle=lambda: False)
         )
-        for is_plain_add, reduction in ((True, "quant"), (False, "full")):
-            with self.subTest(is_plain_add=is_plain_add):
-                update = SimpleNamespace(is_plain_add=is_plain_add)
+        for update, reduction in (
+            (SimpleNamespace(quantized_sum=True), "quant"),
+            (SimpleNamespace(quantized_sum=False), "full"),
+        ):
+            with self.subTest(update=update):
                 read = SimpleNamespace(
-                    update_and_read=lambda update, h, r, norm: (h, r)
+                    update_and_read=lambda update, h, r, norm, **read_kwargs: (h, r)
                 )
                 calls = []
                 with (

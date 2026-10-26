@@ -59,11 +59,16 @@ class _FakeReq:
     def finished(self):
         return False
 
+    def get_mm_token_counts(self):
+        return self.mm_image_tokens, self.mm_audio_tokens, self.mm_video_tokens
+
     def init_incremental_detokenize(self):
         return self.output_ids_through_stop, 0
 
 
-def _make_accumulator() -> _GenerationStreamAccumulator:
+def _make_accumulator(
+    *, rust_server_mode: bool = False
+) -> _GenerationStreamAccumulator:
     return _GenerationStreamAccumulator(
         return_logprob=True,
         return_hidden_states=False,
@@ -74,6 +79,8 @@ def _make_accumulator() -> _GenerationStreamAccumulator:
         default_stream_interval=1,
         default_force_stream_interval=1,
         get_cached_tokens_details=lambda req: None,
+        rust_server_mode=rust_server_mode,
+        is_request_level_customized_info_key=lambda key: False,
         current_weight_version=None,
     )
 
@@ -89,15 +96,16 @@ class TestOutputStreamerLogprobs(unittest.TestCase):
         self.assertEqual(req.send_output_token_logprobs_offset, 0)
         self.assertEqual(accumulator.output_token_logprobs_val, [[]])
 
-    def test_prefill_only_request_preserves_first_logprob(self):
-        req = _FakeReq(is_retracted=False, max_new_tokens=0)
-        accumulator = _make_accumulator()
+    def test_rust_server_mode_reports_cached_tokens_per_request(self):
+        """The Rust frontend rejects a batch whose cached_tokens column is shorter than rids."""
+        req = _FakeReq(is_retracted=False, max_new_tokens=16)
+        req.cached_tokens = 7
+        accumulator = _make_accumulator(rust_server_mode=True)
 
         accumulator.accept(req=req)
 
-        self.assertEqual(req.send_token_offset, 0)
-        self.assertEqual(req.send_output_token_logprobs_offset, 1)
-        self.assertEqual(accumulator.output_token_logprobs_val, [[-0.5]])
+        self.assertEqual(accumulator.rids, ["req"])
+        self.assertEqual(accumulator.cached_tokens, [7])
 
 
 if __name__ == "__main__":

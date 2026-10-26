@@ -12,6 +12,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     CudaGraphConfig,
     PhaseConfig,
 )
+from sglang.srt.platforms.interface import PlatformCapabilities
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -37,7 +38,9 @@ class TestTorchReferenceConflictsWithDecodeGraph(CustomTestCase):
 
     def _patch_graph_support(self, supported: bool) -> None:
         patcher = mock.patch.object(
-            api.current_platform, "support_cuda_graph", return_value=supported
+            api.current_platform,
+            "capabilities",
+            PlatformCapabilities(graph_capture=supported),
         )
         patcher.start()
         self.addCleanup(patcher.stop)

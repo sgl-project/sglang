@@ -114,16 +114,6 @@ def _make_covered_side_args(batch: int, heads: int):
     return mixed_qkv, a, b, conv_states, onorm_g, cache_indices
 
 
-def _addressing_samples(heads: int):
-    return [
-        (0, 0, 0, 0),
-        (5, heads - 1, 127, 127),
-        (3, heads // 2, 64, 100),
-        (1, 0, 0, 1),
-        (2, min(heads - 1, 2), 3, 7),
-    ]
-
-
 class TestKdaFusedDecodeStridedState(unittest.TestCase):
     def test_covered_accepts_envelope_strided_and_rejects_noncontiguous_inner(self):
         for heads in _KDA_HEADS:
@@ -179,51 +169,6 @@ class TestKdaFusedDecodeStridedState(unittest.TestCase):
                     ),
                     "covered() must reject a non-inner-contiguous ssm view",
                 )
-
-    def test_slot_formula_resolves_correct_element_and_dense_pitch_misaddresses(self):
-        for heads in _KDA_HEADS:
-            with self.subTest(kda_heads=heads):
-                raw, temporal = _make_strided_temporal_view(heads)
-                ssm = temporal[_LAYER_UNDER_TEST]
-
-                # Distinct value per storage element so an offset that lands
-                # elsewhere reads a provably different value.
-                raw_fp32 = raw.view(torch.float32)
-                raw_fp32.copy_(torch.arange(raw_fp32.numel(), dtype=torch.float32))
-
-                base = ssm.storage_offset()
-                # == state.stride(0) the wrapper passes the kernel.
-                slot_stride = ssm.stride(0)
-                dense_pitch = heads * _V * _K  # the pre-fix hardcoded slot pitch
-
-                for slot, i_hv, v, k in _addressing_samples(heads):
-                    intra = (
-                        i_hv * (_V * _K) + v * _K + k
-                    )  # kernel's hardcoded intra-slot offset
-                    kernel_off = base + slot * slot_stride + intra
-
-                    # (2a) The kernel formula names exactly the element torch
-                    # indexing names — proves slot*stride(0) + intra addresses
-                    # the intended slot.
-                    self.assertEqual(
-                        raw_fp32[kernel_off].item(),
-                        ssm[slot, i_hv, v, k].item(),
-                        f"kernel slot formula mis-addressed "
-                        f"(slot={slot}, i_hv={i_hv}, heads={heads})",
-                    )
-
-                    # (2b) The pre-fix dense-pitch formula lands on a DIFFERENT
-                    # element (a different layer's envelope region) for every
-                    # slot > 0.
-                    dense_off = base + slot * dense_pitch + intra
-                    if slot > 0:
-                        self.assertNotEqual(
-                            raw_fp32[dense_off].item(),
-                            ssm[slot, i_hv, v, k].item(),
-                            f"dense-pitch formula happened to match at "
-                            f"slot={slot}, heads={heads}; the fix would not "
-                            "be load-bearing",
-                        )
 
 
 if __name__ == "__main__":

@@ -150,6 +150,14 @@ class TestDcpLogicalCapacity(CustomTestCase):
         self.assertEqual(runner.logical_max_total_num_tokens, 64)
         self.assertEqual(runner.effective_logical_max_total_num_tokens, 32)
 
+    def test_short_pool_warning_uses_served_capacity(self):
+        # dcp1 serves 690K < 1M and warns; dcp2 widens the same rows to 1.38M.
+        with self.assertLogs("sglang.srt.managers.tp_worker", "WARNING") as cm:
+            TpModelWorker.get_worker_info(self.make_worker(1))
+        self.assertIn(f"{PHYSICAL} tokens", cm.output[0])
+        with self.assertNoLogs("sglang.srt.managers.tp_worker", "WARNING"):
+            TpModelWorker.get_worker_info(self.make_worker(2))
+
 
 if __name__ == "__main__":
     unittest.main()

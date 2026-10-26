@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Tuple
 
 import torch
 
-from sglang.srt.layers.layer_boundary.ops import move_rows
+from sglang.srt.layers.layer_boundary.ops import move_rows, sum_output
 from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -53,9 +53,14 @@ def branch_input(
 def branch_output(
     plan: StagePlan, hidden_states: torch.Tensor, forward_batch: ForwardBatch
 ) -> torch.Tensor:
-    """This layer's complete FFN output as a branch's contribution, which
-    adds to the layer's output without writing the residual: moved to the
-    rows the layer hands on."""
+    """This layer's FFN output as a branch's contribution, which adds to the
+    layer's output without writing the residual: the sum it owes completed,
+    then moved to the rows the layer hands on."""
+    group = plan.path_for(forward_batch).output.group
+    if group is not None:
+        hidden_states = sum_output(
+            hidden_states, group, forward_batch, may_quantize=False
+        )
     rows, _, to = plan.branch_rows(forward_batch)
     return move_rows(hidden_states, rows, to, forward_batch)
 

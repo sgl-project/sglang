@@ -113,6 +113,29 @@ def test_greedy_path_breaks_ties_toward_the_lower_candidate_on_device():
     assert actual[:, 0].cpu().equal(tokens[:, 0, 0].cpu())
 
 
+@pytest.mark.parametrize("nan_rows", ["all", "mixed"])
+def test_greedy_path_matches_the_reference_on_nan_scores(nan_rows):
+    torch.manual_seed(5)
+    bs, slots, topk = 3, 6, 8
+    log_start = torch.randn(bs, topk, device="cuda")
+    log_pair = torch.randn(bs, slots - 1, topk, topk, device="cuda")
+    if nan_rows == "all":
+        log_start[0] = float("nan")
+        log_pair[0] = float("nan")
+    else:
+        log_pair[torch.rand_like(log_pair) < 0.3] = float("nan")
+    candidate_tokens = torch.arange(bs * slots * topk, device="cuda").view(
+        bs, slots, topk
+    )
+    state = _greedy_state(bs, slots, candidate_tokens.device)
+
+    tokens, q = lilicorr_sample_path(log_start, log_pair, candidate_tokens, **state)
+    ref_tokens, ref_q = _walk_reference(log_start, log_pair, candidate_tokens, **state)
+
+    assert torch.equal(tokens.cpu(), ref_tokens)
+    assert torch.equal(q.cpu(), ref_q)
+
+
 def _sampled_inputs(bs, slots, k, *, seed=0):
     torch.manual_seed(seed)
     return dict(

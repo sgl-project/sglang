@@ -224,8 +224,9 @@ class TestGraphPoolBorrow(CustomTestCase):
                 return_value=False,
             ),
             get_parallel().override(tp_group=tp_group),
-            patch(
-                "sglang.kernels.ops.speculative.sampling.tree_speculative_sampling_target_only",
+            patch.object(
+                eagle_utils,
+                "tree_speculative_sampling_target_only",
                 side_effect=fake_sampling,
             ),
         ):

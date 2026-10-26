@@ -19,8 +19,8 @@ FULL side's ids while it used to be sized by its own page count. A model with
 few full-attention layers and many sliding ones gives the id owner more pages,
 and the top of that id space then lands off the end of the swa table. On GPU
 the write is unchecked (`alloc_bind_inplace`'s `tl.store`), so the symptom
-surfaces later and elsewhere: a device-side index assert on the read in
-`_swa_write_loc_unified`, and a dead scheduler.
+surfaces later and elsewhere: a device-side index assert on a later read of
+the swa table, and a dead scheduler.
 
 The reachability of it is a KV-budget property, not just a model property: ids
 come off the front of the owner's free list and freed ids return to the back, so

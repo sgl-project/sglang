@@ -5,12 +5,17 @@ context length, GGUF detection, etc.) that don't require actual model files.
 """
 
 import inspect
+import io
 import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import numpy as np
+import torch
+from PIL import Image
 from transformers import PretrainedConfig
+from transformers.image_processing_backends import PilBackend
 from transformers.image_processing_utils import BaseImageProcessor
 
 import sglang.srt.utils.hf_transformers.processor as processor_utils
@@ -166,6 +171,38 @@ class TestImageProcessorKwargsPatch(CustomTestCase):
         self.assertEqual(first, {"images": "first", "accepted": True})
         self.assertEqual(second, {"images": "second", "accepted": False})
         self.assertEqual(signature.call_count, 1)
+
+
+class TestPilImageProcessorTensorPatch(CustomTestCase):
+    def test_grayscale_jpeg_tensor_matches_pil_rgb(self):
+        """A grayscale JPEG tensor should match the PIL RGB backend output."""
+        image = Image.new("L", (56, 56), 128)
+        encoded = io.BytesIO()
+        image.save(encoded, format="JPEG")
+        decoded = Image.open(io.BytesIO(encoded.getvalue()))
+        gray_tensor = torch.from_numpy(np.array(decoded)).unsqueeze(0)
+        self.assertEqual(gray_tensor.shape[0], 1)
+        backend = PilBackend()
+
+        actual = backend.process_image(gray_tensor, do_convert_rgb=True)
+        expected = backend.process_image(decoded.convert("RGB"), do_convert_rgb=True)
+
+        np.testing.assert_array_equal(actual, expected)
+
+    def test_rgb_conversion_flag_and_channel_layout(self):
+        """Only requested RGB conversion may expand a grayscale tensor."""
+        backend = PilBackend()
+        gray = torch.full((1, 16, 16), 128, dtype=torch.uint8)
+        self.assertEqual(
+            backend.process_image(gray, do_convert_rgb=False).shape, (1, 16, 16)
+        )
+        self.assertEqual(backend.process_image(gray, True).shape, (3, 16, 16))
+
+        rgb_hwc = torch.zeros((1, 16, 3), dtype=torch.uint8)
+        self.assertEqual(
+            backend.process_image(rgb_hwc, True, "channels_last").shape,
+            (3, 1, 16),
+        )
 
 
 # ---------------------------------------------------------------------------

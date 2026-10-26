@@ -281,13 +281,17 @@ class TestDPSpecPrefillCoordinationWorker(CustomTestCase):
                         hidden_states=object(), mm_input_embeds=None
                     ),
                     next_token_ids=object(),
+                    kv_loc_plan=None,
                 )
                 verify_input = object()
 
                 def record(phase, current):
                     self.assertTrue(current.dp_spec_prefill_coordination_applied)
                     counts = plan.phase_counts(phase)[0]
-                    if phase != "target" and worker._draft_worker.draft_owns_attention:
+                    if (
+                        phase != "target"
+                        and worker._draft_worker.parallel_layout.local_dp
+                    ):
                         counts = [counts[rank]]
                     self.assertEqual(current.global_num_tokens, counts)
                     self.assertFalse(current.can_run_decode_cuda_graph)
@@ -306,12 +310,12 @@ class TestDPSpecPrefillCoordinationWorker(CustomTestCase):
                         self.assertEqual(kwargs["grammar_barrier"], "grammar")
                     return result
 
-                def extend(current, *args):
+                def extend(current, *args, **kwargs):
                     record("draft_extend", current)
                     return object()
 
-                def draft_context(owns_attention):
-                    self.assertEqual(owns_attention, bool(rank % 2))
+                def draft_context(layout):
+                    self.assertEqual(layout.local_dp, bool(rank % 2))
                     return contextlib.nullcontext()
 
                 worker = object.__new__(EAGLEWorkerV2)
@@ -321,7 +325,7 @@ class TestDPSpecPrefillCoordinationWorker(CustomTestCase):
                 worker._target_worker = SimpleNamespace(forward_batch_generation=target)
                 worker._draft_worker = SimpleNamespace(
                     draft_runner=SimpleNamespace(),
-                    draft_owns_attention=bool(rank % 2),
+                    parallel_layout=SimpleNamespace(local_dp=bool(rank % 2)),
                     draft=draft,
                     _draft_extend_for_prefill=extend,
                     _draft_extend_for_decode=extend,

@@ -23,6 +23,7 @@ import torch
 
 from sglang.srt.managers.cache_controller import storage_model_name
 from sglang.srt.mem_cache.hicache_storage import HiCacheFile, HiCacheStorageConfig
+from sglang.srt.mem_cache.memory_pool_host import LogicalHostPool
 from sglang.srt.mem_cache.pool_host.base import HostKVCache
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
 from sglang.test.test_utils import CustomTestCase
@@ -49,6 +50,11 @@ class TestStorageModelName(CustomTestCase):
         pool = SimpleNamespace(storage_format_tag=None)
         self.assertEqual(storage_model_name("org/model", pool), "org/model")
         self.assertIsNone(storage_model_name(None, pool))
+
+    def test_logical_anchor_pool_keeps_the_model_name(self):
+        """A LogicalHostPool storage anchor keeps the untagged model name."""
+        pool = LogicalHostPool(size=4, page_size=2)
+        self.assertEqual(storage_model_name("org/model", pool), "org/model")
 
     def test_unified_pool_tags_the_model_name(self):
         tag = UnifiedPageEnvelopeHostPool.storage_format_tag
