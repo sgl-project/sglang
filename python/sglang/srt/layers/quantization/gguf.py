@@ -606,6 +606,10 @@ class GGUFMoEMethod(FusedMoEMethodBase):
         set_weight_attrs(w2_qweight_type, extra_weight_attrs)
         layer.register_parameter("w2_qweight_type", w2_qweight_type)
 
+    def preserves_input(self, layer: torch.nn.Module) -> bool:
+        # GGUF projections and the final expert sum allocate separate outputs.
+        return True
+
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):

@@ -860,6 +860,74 @@ class TestDeepseekMoeEpilogue(CustomTestCase):
                 self.assertEqual(calls, ["routed", "shared"])
                 torch.testing.assert_close(actual, x * 5.5)
 
+    def test_direct_quant_methods_preserve_capture_overlap(self):
+        """Direct kernels need their own input contract even without a named runner."""
+        from sglang.srt.layers.quantization.bitsandbytes import BitsAndBytesMoEMethod
+        from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+            CompressedTensorsFusedMoEMethod,
+        )
+        from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_w4a8_fp8_moe import (
+            CompressedTensorsW4AFP8MoE,
+        )
+        from sglang.srt.layers.quantization.gguf import GGUFConfig, GGUFMoEMethod
+        from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
+        from sglang.srt.model_executor.runner_utils.capture_mode import (
+            model_capture_mode,
+        )
+
+        config = SimpleNamespace(
+            target_scheme_map={
+                "Linear": {
+                    "weights": SimpleNamespace(
+                        num_bits=4, group_size=128, symmetric=True
+                    )
+                }
+            },
+            quant_format="pack-quantized",
+        )
+        cases = (
+            (W4AFp8MoEMethod(W4AFp8Config()), None, True),
+            (GGUFMoEMethod(GGUFConfig()), None, True),
+            (
+                CompressedTensorsFusedMoEMethod(config),
+                CompressedTensorsW4AFP8MoE(config, None, None),
+                True,
+            ),
+            # This direct method calls Triton with the inplace suggestion. Its
+            # weight loader needs bitsandbytes; runner selection does not.
+            (BitsAndBytesMoEMethod.__new__(BitsAndBytesMoEMethod), None, False),
+        )
+        x = torch.arange(1, 7, dtype=torch.float32).reshape(2, 3)
+        for method, scheme, preserves in cases:
+            with self.subTest(method=type(method).__name__):
+                moe = self._moe(inplace=True, backend=None)
+                experts = moe.experts
+                experts.quant_method = method
+                experts.scheme = scheme
+                experts.moe_runner_config = MoeRunnerConfig()
+                method.create_moe_runner(experts, experts.moe_runner_config)
+                experts.runner_backend = method.get_moe_runner_backend(experts)
+                self.assertIsNone(experts.runner_backend)
+                self.assertTrue(experts.moe_runner_config.inplace)
+                calls = []
+
+                def routed(hidden, *args, **kwargs):
+                    calls.append("routed")
+                    return hidden * 2.5 if preserves else hidden.mul_(2.5)
+
+                def shared(hidden, *args, **kwargs):
+                    calls.append("shared")
+                    return hidden * 3
+
+                experts.forward = routed
+                moe._forward_shared_experts = shared
+                with model_capture_mode():
+                    actual = moe(x.clone())
+                self.assertEqual(
+                    calls, ["routed", "shared"] if preserves else ["shared", "routed"]
+                )
+                torch.testing.assert_close(actual, x * 5.5)
+
     def test_lora_wrapped_experts_preserve_capture_dispatch(self):
         """Wrapping routed experts must retain capture overlap with shared experts."""
         from sglang.srt.layers.moe.moe_runner import runner

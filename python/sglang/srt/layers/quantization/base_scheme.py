@@ -61,6 +61,10 @@ class BaseMoEScheme(ABC):
 
     runner = None
 
+    def preserves_input(self, layer: torch.nn.Module) -> bool:
+        """Whether direct execution preserves its input even with inplace=True."""
+        return False
+
     def get_moe_runner_backend(self, layer):
         """Return the runner contract, or None for a direct standard/local-ID kernel."""
         return self.runner.runner_backend if self.runner is not None else None

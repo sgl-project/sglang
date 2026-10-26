@@ -633,7 +633,7 @@ class FusedMoE(torch.nn.Module):
 
     @property
     def preserves_input(self) -> bool:
-        """Whether the selected runner keeps its input live and unchanged."""
+        """Whether the selected implementation keeps its input live and unchanged."""
         backend = self.runner_backend
         if backend is not None:
             if backend.is_deep_gemm():
@@ -656,6 +656,8 @@ class FusedMoE(torch.nn.Module):
                 # These execution paths keep the original input separate from
                 # expert output, regardless of the layer's inplace suggestion.
                 return True
+        elif self.quant_method is not None and self.quant_method.preserves_input(self):
+            return True
         return not self.moe_runner_config.inplace
 
     @property

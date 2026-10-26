@@ -231,6 +231,10 @@ class CompressedTensorsW4AFP8MoE(CompressedTensorsMoEScheme):
 
         layer.is_w4afp8_converted = True
 
+    def preserves_input(self, layer: torch.nn.Module) -> bool:
+        # CUTLASS stages activations and allocates a separate final output.
+        return True
+
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):

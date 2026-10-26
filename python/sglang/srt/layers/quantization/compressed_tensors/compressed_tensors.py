@@ -1378,6 +1378,9 @@ class CompressedTensorsFusedMoEMethod(FusedMoEMethodBase):
     ):
         return layer.scheme.create_moe_runner(layer, moe_runner_config)
 
+    def preserves_input(self, layer: torch.nn.Module) -> bool:
+        return layer.scheme.preserves_input(layer)
+
     def get_moe_runner_backend(self, layer):
         return layer.scheme.get_moe_runner_backend(layer)
 
