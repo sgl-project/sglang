@@ -362,7 +362,9 @@ def _native_joint_source_from_binding(binding, runtime_profile_json, model_revis
         allocated_ref = binding["allocated"][allocated.index(allocation)]
         owner = by_rank[rank]
         _require(
-            owner["allocated_runtime_artifact"] == Path(allocated_ref["path"]).name
+            owner["allocated_runtime_artifact"]
+            == Path(allocated_ref["path"]).name
+            == f"allocated-runtime-pid-{owner['pid']}.json"
             and max(row["time_ns"] for row in startup if row["rank"] == rank)
             <= allocation["time_ns"]
             <= owner["time_ns"],
