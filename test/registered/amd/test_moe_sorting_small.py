@@ -252,6 +252,173 @@ def _reference(ids, w, num_experts, block_size):
     return sorted_ids, sorted_w, expert_ids
 
 
+@unittest.skipUnless(_gfx950(), "gfx950 (MI35x) only")
+class TestMoeSortingSmallExpertMask(CustomTestCase):
+    # MiMo-V2.6-Pro: 384 routed experts, top-8, hidden 6144, EP8 = 48 experts per rank
+    EP_E, EP_TOPK, EP_DIM, EP_SIZE = 384, 8, 6144, 8
+
+    setUpClass = TestMoeSortingSmall.__dict__["setUpClass"]
+    _routing = TestMoeSortingSmall._routing
+    _assert_same_sort = TestMoeSortingSmall._assert_same_sort
+
+    def _ep_mask(self, E, rank, ep_size):
+        mask = torch.zeros(E, dtype=torch.int32)
+        n = E // ep_size
+        mask[rank * n : (rank + 1) * n] = 1
+        return mask.to(self.dev)
+
+    def _random_mask(self, E, seed):
+        g = torch.Generator(device="cpu").manual_seed(seed)
+        return (torch.rand(E, generator=g) < 0.3).to(torch.int32).to(self.dev)
+
+    def _plain_routing(self, m, seed, E, topk):
+        g = torch.Generator(device="cpu").manual_seed(seed)
+        ids = torch.stack([torch.randperm(E, generator=g)[:topk] for _ in range(m)])
+        ids = ids.to(torch.int32).to(self.dev).contiguous()
+        return ids, torch.rand(m, topk, generator=g).to(self.dev)
+
+    def _sort_masked(self, fn, ids, w, bs, E, mask):
+        return fn(
+            ids,
+            w,
+            E,
+            self.EP_DIM,
+            torch.bfloat16,
+            bs,
+            expert_mask=mask,
+            num_local_tokens=None,
+            dispatch_policy=0,
+            use_opus=True,
+        )
+
+    def _masks(self, E):
+        return [(f"rank{r}", self._ep_mask(E, r, self.EP_SIZE)) for r in (0, 3, 7)] + [
+            ("random", self._random_mask(E, E))
+        ]
+
+    def test_masked_sort_matches_aiter(self):
+        E, topk = self.EP_E, self.EP_TOPK
+        for bs in (16, 32, 64):
+            for m in (1, 2, 3, 4, 5, 8, 12, 16, 24, 32):
+                ids, w = self._plain_routing(m, 100 + m, E, topk)
+                for name, mask in self._masks(E):
+                    self.assertTrue(
+                        self.S._small_sort_supported(ids, bs, mask, None, E),
+                        f"m={m} bs={bs} {name} not taken",
+                    )
+                    self._assert_same_sort(
+                        self._sort_masked(self.orig_sort, ids, w, bs, E, mask),
+                        self._sort_masked(
+                            self.fm._moe_sorting_impl, ids, w, bs, E, mask
+                        ),
+                        bs,
+                        f"E={E} m={m} bs={bs} {name}",
+                    )
+
+    def test_masked_sort_matches_aiter_with_shared_expert(self):
+        # DeepSeek-V4.1 shape: 385 = 384 routed + fused shared, every rank owns the shared slot
+        E, topk, bs = 385, 7, 32
+        for m in (2, 4, 5, 10, 36):
+            ids, w = self._routing(m, m, E, topk)
+            for r in (0, 5):
+                mask = self._ep_mask(E - 1, r, self.EP_SIZE)
+                mask = torch.cat(
+                    [mask, torch.ones(1, dtype=torch.int32, device=self.dev)]
+                )
+                self._assert_same_sort(
+                    self._sort_masked(self.orig_sort, ids, w, bs, E, mask),
+                    self._sort_masked(self.fm._moe_sorting_impl, ids, w, bs, E, mask),
+                    bs,
+                    f"E={E} m={m} rank{r}",
+                )
+
+    def test_masked_fused_mxfp8_quant_matches_aiter(self):
+        E, topk, dim, bs = self.EP_E, self.EP_TOPK, self.EP_DIM, 32
+        S = self.S
+        for m in (1, 2, 4, 8, 16, 32):
+            ids, w = self._plain_routing(m, 200 + m, E, topk)
+            x = torch.randn(m, dim, dtype=torch.bfloat16, device=self.dev)
+            for name, mask in self._masks(E):
+                sid, sw, _, nv, _ = self._sort_masked(
+                    self.orig_sort, ids, w, bs, E, mask
+                )
+                ref_q, ref_s = self.orig_quant(
+                    x,
+                    sorted_ids=sid,
+                    num_valid_ids=nv,
+                    token_num=m,
+                    topk=topk,
+                    block_size=bs,
+                    sorted_weights=sw,
+                    num_experts_upper_bound=E,
+                )
+                tok = S._pending_quant_input.set(x)
+                etok = S._emitted_quant.set(None)
+                try:
+                    psid = self._sort_masked(
+                        self.fm._moe_sorting_impl, ids, w, bs, E, mask
+                    )[0]
+                    emitted = S._emitted_quant.get()
+                finally:
+                    S._emitted_quant.reset(etok)
+                    S._pending_quant_input.reset(tok)
+                msg = f"E={E} m={m} {name}"
+                self.assertIsNotNone(emitted, msg)
+                real = sid[: int(nv[0])]
+                real = real[real != ((topk << 24) | m)]
+                if real.numel() == 0:
+                    continue
+                # fp8 rows of the tokens this rank computes
+                toks = torch.unique(real & 0xFFFFFF).long()
+                self.assertTrue(
+                    torch.equal(
+                        ref_q.view(torch.uint8)[toks],
+                        emitted[0].view(torch.uint8)[toks],
+                    ),
+                    msg,
+                )
+
+                # e8m0 bytes at each real sorted row: rows are matched by (slot, token)
+                def rows_of(s):
+                    s = s[: int(nv[0])]
+                    rows = torch.nonzero(s != ((topk << 24) | m)).flatten()
+                    order = torch.argsort(s[rows].long())
+                    return rows[order]
+
+                pad = (dim // 32 + 7) // 8 * 8
+                g = torch.arange(dim // 32, device=self.dev)
+
+                def scale_bytes(scales, rows):
+                    addr = (rows // 32) * pad * 32 + rows % 16 * 4 + rows % 32 // 16
+                    addr = addr[:, None] + (g // 8 * 256 + g % 4 * 64 + g % 8 // 4 * 2)
+                    return scales.view(torch.uint8).flatten()[addr.flatten()]
+
+                self.assertTrue(
+                    torch.equal(
+                        scale_bytes(ref_s, rows_of(sid)),
+                        scale_bytes(emitted[1], rows_of(psid)),
+                    ),
+                    f"{msg} scales",
+                )
+
+    def test_masked_gate(self):
+        E = self.EP_E
+        mask = self._ep_mask(E, 0, self.EP_SIZE)
+        for m in (1, 4, 8, 16, 32):
+            ids, _ = self._plain_routing(m, m, E, self.EP_TOPK)
+            self.assertTrue(self.S._small_sort_supported(ids, 32, mask, None, E), m)
+        ids, _ = self._plain_routing(33, 33, E, self.EP_TOPK)
+        self.assertFalse(self.S._small_sort_supported(ids, 32, mask, None, E))
+        # a mask that does not cover every expert id goes back to aiter
+        ids, _ = self._plain_routing(4, 4, E, self.EP_TOPK)
+        self.assertFalse(self.S._small_sort_supported(ids, 32, mask[:-1], None, E))
+        # 30 pairs at block 8 fit only the distributed kernel, which takes no mask
+        ids, _ = self._plain_routing(6, 6, 129, 5)
+        self.assertTrue(self.S._small_sort_supported(ids, 8, None, None, 129))
+        mask = self._ep_mask(129, 0, self.EP_SIZE)
+        self.assertFalse(self.S._small_sort_supported(ids, 8, mask, None, 129))
+
+
 @unittest.skipUnless(torch.cuda.is_available() and torch.version.hip, "ROCm only")
 class TestMoeSortingSmallNoQuant(CustomTestCase):
     """No-quant path of _run_small_sort (incl. the histogram + bitonic kernel for
