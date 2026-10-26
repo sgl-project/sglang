@@ -92,7 +92,6 @@ from sglang.srt.entrypoints.ollama.protocol import (
 )
 from sglang.srt.entrypoints.ollama.serving import OllamaServing
 from sglang.srt.entrypoints.openai.chat_encoding_adapters import native_text_parser
-from sglang.srt.entrypoints.openai.errors import openai_error
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     ClassifyRequest,
@@ -563,10 +562,13 @@ def _anthropic_validation_message(raw_errors) -> str:
     return text
 
 
-def _anthropic_error_response(*, status_code: int, error_type: str, message: str):
+def _anthropic_error_response(
+    *, status_code: int, error_type: str, message: str, headers=None
+):
     """Anthropic-format error envelope: {"type":"error","error":{"type":...,"message":...}}."""
     return ORJSONResponse(
         status_code=status_code,
+        headers=headers,
         content={
             "type": "error",
             "error": {"type": error_type, "message": message},
@@ -578,7 +580,8 @@ def _anthropic_error_response(*, status_code: int, error_type: str, message: str
 async def validation_exception_handler(request: Request, exc: HTTPException):
     """Enrich HTTP exception with status code and other details.
 
-    For OpenAI /v1 endpoints, emit the same error envelope as serving handlers.
+    For /v1/responses, emit OpenAI-style nested error envelope:
+    {"error": {"message": "...", "type": "...", "param": null, "code": <status>}}
     For /v1/messages, emit Anthropic-style envelope so SDK clients can parse it.
     """
     route_path = request.url.path.removeprefix(request.scope.get("root_path", ""))
@@ -607,11 +610,19 @@ async def validation_exception_handler(request: Request, exc: HTTPException):
             status_code=exc.status_code,
             error_type=anthropic_type,
             message=message,
+            headers=exc.headers,
         )
 
-    if route_path.startswith("/v1/") and route_path != "/v1/systemone":
+    # adjust fmt for responses api
+    if route_path.startswith("/v1/responses"):
+        nested_error = {
+            "message": exc.detail,
+            "type": HTTPStatus(exc.status_code).phrase,
+            "param": None,
+            "code": exc.status_code,
+        }
         return ORJSONResponse(
-            content=openai_error(str(exc.detail), exc.status_code),
+            content={"error": nested_error},
             status_code=exc.status_code,
             headers=exc.headers,
         )
@@ -622,7 +633,9 @@ async def validation_exception_handler(request: Request, exc: HTTPException):
         type=str(exc.status_code),
         code=exc.status_code,
     )
-    return ORJSONResponse(content=error.model_dump(), status_code=exc.status_code)
+    return ORJSONResponse(
+        content=error.model_dump(), status_code=exc.status_code, headers=exc.headers
+    )
 
 
 # Custom exception handlers to change validation error status codes
@@ -632,7 +645,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 
     For /v1/messages, emit Anthropic-style envelope and scrub the message so
     file paths or Python internals from the default ``str(exc)`` representation
-    never reach the client. For OpenAI /v1 endpoints, use the shared envelope. For
+    never reach the client. For /v1/responses, keep OpenAI-style. For
     /v1/systemone, keep the 422 detail list that the System One API documents.
     Otherwise use the legacy ErrorResponse shape.
     """
@@ -664,19 +677,15 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     else:
         message = exc_str
 
-    if route_path.startswith("/v1/"):
-        errors = exc.errors()
-        location = errors[0].get("loc", ()) if errors else ()
-        location = (
-            location[1:]
-            if location and location[0] in ("body", "query", "path")
-            else location
-        )
-        param = ".".join(str(part) for part in location) or None
-        return ORJSONResponse(
-            status_code=400,
-            content=openai_error(_anthropic_validation_message(errors), param=param),
-        )
+    if route_path.startswith("/v1/responses"):
+        # adapt specially, for v1/responses API only (notice the error key is different)
+        nested_error = {
+            "message": message,
+            "type": HTTPStatus.BAD_REQUEST.phrase,
+            "param": None,
+            "code": HTTPStatus.BAD_REQUEST.value,
+        }
+        return ORJSONResponse(status_code=400, content={"error": nested_error})
 
     err = ErrorResponse(
         message=message,
@@ -1195,6 +1204,25 @@ async def hicache_storage_backend_status():
             "hicache_write_policy",
         )
     }
+
+
+# example usage:
+# curl -s http://127.0.0.1:30000/get_hicache_l3_cache_layout
+@app.get("/get_hicache_l3_cache_layout")
+async def get_hicache_l3_cache_layout():
+    """Get the HiCache L3 (mooncake) object-key layout for external KV routers."""
+    from sglang.srt.mem_cache.hicache_storage import (
+        disabled_l3_layout,
+        merge_l3_layouts,
+    )
+
+    layouts = await _global_state.tokenizer_manager.get_hicache_l3_cache_layout()
+    merged = merge_l3_layouts(layouts)
+    if ((merged or {}).get("hicache_object_layout") or {}).get("pp_size", 1) > 1:
+        # Only pp rank 0 replies here; the startup info already merged every stage.
+        info = getattr(_global_state, "scheduler_info", None) or {}
+        merged = info.get("hicache_object_layout", merged)
+    return merged or disabled_l3_layout("No scheduler layout replies")
 
 
 @app.api_route("/start_profile", methods=["GET", "POST"])

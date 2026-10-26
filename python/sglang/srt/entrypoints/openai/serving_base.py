@@ -12,7 +12,6 @@ from fastapi import HTTPException, Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 
 from sglang.srt.entrypoints.openai.encoding_dsv32 import DS32EncodingError
-from sglang.srt.entrypoints.openai.errors import openai_error
 from sglang.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingRequest
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.observability.req_time_stats import monotonic_time
@@ -211,25 +210,33 @@ class OpenAIServingBase(ABC):
         err_type: str = "BadRequestError",
         status_code: int = 400,
         param: Optional[str] = None,
-        code: Optional[str] = None,
     ) -> ORJSONResponse:
         """Create an error response"""
         # TODO: remove fastapi dependency in openai and move response handling to the entrypoint
-        return ORJSONResponse(
-            content=openai_error(message, status_code, err_type, param, code),
-            status_code=status_code,
+        error = ErrorResponse(
+            object="error",
+            message=message,
+            type=err_type,
+            param=param,
+            code=status_code,
         )
+        return ORJSONResponse(content=error.model_dump(), status_code=status_code)
 
     def create_streaming_error_response(
         self,
         message: str,
         err_type: str = "BadRequestError",
         status_code: int = 400,
-        param: Optional[str] = None,
-        code: Optional[str] = None,
     ) -> str:
         """Create a streaming error response"""
-        return json.dumps(openai_error(message, status_code, err_type, param, code))
+        error = ErrorResponse(
+            object="error",
+            message=message,
+            type=err_type,
+            param=None,
+            code=status_code,
+        )
+        return json.dumps({"error": error.model_dump()})
 
     def extract_custom_labels(self, raw_request):
         if (

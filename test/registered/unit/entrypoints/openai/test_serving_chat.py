@@ -16,13 +16,19 @@ import json
 import unittest
 import uuid
 from http import HTTPStatus
+from types import SimpleNamespace
 from typing import Optional
 from unittest.mock import Mock, patch
 
 from fastapi import Request
+from tokenizers import Tokenizer as BackendTokenizer
+from tokenizers import models as tokenizer_models
+from tokenizers import pre_tokenizers
+from transformers import PreTrainedTokenizerFast
 from transformers.utils.chat_template_utils import _compile_jinja_template
 
 from sglang.srt.entrypoints.openai.chat_encoding import resolve_chat_encoding_spec
+from sglang.srt.entrypoints.openai.parallel_prompt_encode import encode_prompt_segments
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     Function,
@@ -31,6 +37,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolChoice,
     ToolChoiceFuncName,
 )
+from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.serving_chat import (
     OpenAIServingChat,
     normalize_tool_content,
@@ -42,6 +49,7 @@ from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.jinja_template_utils import (
     jinja_template_may_reorder_tool_results,
 )
+from sglang.srt.parser.python_chat_template import GLM53, install_python_chat_template
 from sglang.srt.parser.response_template import (
     GRAMMAR_AFTER_REASONING,
     GRAMMAR_FROM_START,
@@ -294,6 +302,18 @@ class TestChatTemplateCache(CustomTestCase):
             2,
         )
 
+    def test_cache_key_distinguishes_dict_key_order(self):
+        """A tool schema sent in a different key order must not reuse the other order's render."""
+        sorted_tools = [{"function": {"name": "f", "parameters": {"a": 1, "b": 2}}}]
+        sent_tools = [{"function": {"name": "f", "parameters": {"b": 2, "a": 1}}}]
+        self._render(tools=sorted_tools)
+        self._render(tools=sent_tools)
+
+        self.assertEqual(
+            self.tokenizer_manager.tokenizer.apply_chat_template.call_count,
+            2,
+        )
+
     def test_non_serializable_input_bypasses_cache(self):
         messages = [{"role": "user", "content": object()}]
         self._render(messages=messages)
@@ -305,6 +325,63 @@ class TestChatTemplateCache(CustomTestCase):
         )
         self.assertEqual(self.tokenizer_manager.tokenizer.encode.call_count, 2)
         self.tokenizer_manager.tokenizer.decode.assert_not_called()
+
+
+class TestPythonChatTemplateSegments(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(
+            ServerArgs(model_path="dummy", default_chat_template_kwargs=None),
+            role="tokenizer",
+        )
+        backend = BackendTokenizer(
+            tokenizer_models.WordLevel(vocab={"[UNK]": 0}, unk_token="[UNK]")
+        )
+        backend.pre_tokenizer = pre_tokenizers.Whitespace()
+        self.tokenizer = PreTrainedTokenizerFast(
+            tokenizer_object=backend, unk_token="[UNK]", eos_token="<|endoftext|>"
+        )
+        self.tokenizer.add_tokens(
+            ["hello", "[gMASK]", "<sop>", "<|system|>", "<|user|>", "<|assistant|>"]
+        )
+        install_python_chat_template(self.tokenizer, GLM53)
+        tokenizer_manager = _MockTokenizerManager()
+        tokenizer_manager.tokenizer = self.tokenizer
+        template_manager = _MockTemplateManager()
+        template_manager.python_chat_template = GLM53
+        self.chat = OpenAIServingChat(tokenizer_manager, template_manager)
+        self.messages = [{"role": "user", "content": "hello there"}]
+
+    def _render(self, template_kwargs):
+        return self.chat._render_and_encode_chat_template(
+            self.messages,
+            tools=None,
+            template_kwargs=template_kwargs,
+            encode_kwargs={},
+            use_cache=False,
+        )[0]
+
+    def test_template_variables_encode_the_rendered_segments(self):
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.encode_prompt_segments",
+            wraps=encode_prompt_segments,
+        ) as encode:
+            ids = self._render({"reasoning_effort": "low"})
+            # An apply_chat_template argument goes through apply_chat_template.
+            documents_ids = self._render(
+                {"reasoning_effort": "low", "documents": [{"title": "t", "text": "x"}]}
+            )
+        self.assertEqual(encode.call_count, 1)
+        rendered = self.tokenizer.apply_chat_template(
+            self.messages,
+            add_generation_prompt=True,
+            tokenize=False,
+            reasoning_effort="low",
+        )
+        self.assertEqual(ids, self.tokenizer.encode(rendered))
+        self.assertEqual(documents_ids, ids)
 
 
 class ServingChatTestCase(CustomTestCase):
@@ -357,6 +434,221 @@ class ServingChatTestCase(CustomTestCase):
 
         self.fastapi_request = Mock(spec=Request)
         self.fastapi_request.headers = {}
+
+    def test_undeclared_tools_run_the_tool_parser_only_for_the_m3_parser(self):
+        """With no tools declared the M3 model can still call a tool; only its parser runs anyway."""
+        user = [{"role": "user", "content": "Hi?"}]
+        undeclared = (
+            ChatCompletionRequest(model="x", messages=user),
+            ChatCompletionRequest(model="x", messages=user, tools=[]),
+        )
+        for request in undeclared:
+            self.assertFalse(self.chat._tool_call_parsing_active(request))
+
+        self.chat.tool_call_parser = "minimax-m3"
+        for request in undeclared:
+            self.assertTrue(self.chat._tool_call_parsing_active(request))
+        declared_none = ChatCompletionRequest(
+            model="x",
+            messages=user,
+            tools=[{"type": "function", "function": {"name": "lookup"}}],
+            tool_choice="none",
+        )
+        self.assertFalse(self.chat._tool_call_parsing_active(declared_none))
+
+    def test_m3_request_contract_rejects_what_the_template_cannot_honor(self):
+        """The M3 format check requires 400 for these; other models keep accepting them."""
+        weather = {"name": "get_weather", "arguments": "{}"}
+        calls = [
+            {"id": "call_1", "type": "function", "function": weather},
+            {"id": "call_2", "type": "function", "function": weather},
+        ]
+        user = {"role": "user", "content": "Hi?"}
+        cases = {
+            "thinking unknown": {"messages": [user], "thinking": {"type": "off"}},
+            "root not first": {
+                "messages": [user, {"role": "root", "content": "You are A."}]
+            },
+            "unanswered call": {
+                "messages": [
+                    user,
+                    {"role": "assistant", "content": None, "tool_calls": calls},
+                    {"role": "tool", "tool_call_id": "call_1", "content": "sunny"},
+                ]
+            },
+            "mismatched call id": {
+                "messages": [
+                    user,
+                    {"role": "assistant", "content": None, "tool_calls": calls[:1]},
+                    {"role": "tool", "tool_call_id": "call_9", "content": "sunny"},
+                ]
+            },
+        }
+        for is_m3 in (False, True):
+            self.chat.is_minimax_m3 = is_m3
+            for name, fields in cases.items():
+                with self.subTest(is_m3=is_m3, case=name):
+                    error = self.chat._validate_request(
+                        ChatCompletionRequest(model="x", **fields)
+                    )
+                    self.assertEqual(error is not None, is_m3)
+
+    def test_m3_request_contract_accepts_valid_requests(self):
+        """Disabled thinking, a trailing tool call, a leading root and answered calls
+        in any order are valid M3 requests."""
+        self.chat.is_minimax_m3 = True
+        weather = {"name": "get_weather", "arguments": "{}"}
+        calls = [
+            {"id": "call_1", "type": "function", "function": weather},
+            {"id": "call_2", "type": "function", "function": weather},
+        ]
+        user = {"role": "user", "content": "Hi?"}
+        for fields in (
+            {"messages": [user], "thinking": {"type": "disabled"}},
+            {
+                "messages": [
+                    user,
+                    {"role": "assistant", "content": None, "tool_calls": calls[:1]},
+                ]
+            },
+            {
+                "messages": [
+                    {"role": "root", "content": "You are A."},
+                    user,
+                    {"role": "assistant", "content": None, "tool_calls": calls},
+                    {"role": "tool", "tool_call_id": "call_2", "content": "rain"},
+                    {"role": "tool", "tool_call_id": "call_1", "content": "sunny"},
+                    {"role": "user", "content": "Thanks"},
+                ]
+            },
+        ):
+            with self.subTest(fields=fields):
+                request = ChatCompletionRequest(model="x", **fields)
+                self.assertIsNone(self.chat._validate_request(request))
+
+    def test_m3_thinking_mode_follows_request_intent(self):
+        """thinking outranks reasoning_effort, an effort only ever turns thinking off,
+        and values the template cannot use are dropped."""
+        from sglang.srt.entrypoints.openai.serving_chat import (
+            _normalize_minimax_m3_request,
+        )
+
+        user = [{"role": "user", "content": "Hi?"}]
+        for fields, mode, effort in (
+            ({"reasoning_effort": "high"}, None, "high"),
+            ({"reasoning_effort": "minimal"}, "disabled", None),
+            ({"reasoning_effort": "none"}, "disabled", None),
+            ({"reasoning_effort": 0.5}, None, None),
+            (
+                {"reasoning_effort": "high", "thinking": {"type": "adaptive"}},
+                "adaptive",
+                "high",
+            ),
+            (
+                {"reasoning_effort": "high", "thinking": {"type": "disabled"}},
+                "disabled",
+                None,
+            ),
+            (
+                {
+                    "reasoning_effort": "high",
+                    "chat_template_kwargs": {"thinking_mode": "adaptive"},
+                },
+                "adaptive",
+                "high",
+            ),
+        ):
+            request = ChatCompletionRequest(model="x", messages=user, **fields)
+            _normalize_minimax_m3_request(request)
+            with self.subTest(fields=fields):
+                self.assertEqual(
+                    request.chat_template_kwargs.get("thinking_mode"), mode
+                )
+                self.assertEqual(request.reasoning_effort, effort)
+
+    def test_m3_effort_from_template_kwargs_is_normalized(self):
+        """An effort sent in chat_template_kwargs or set by the server is normalized
+        like the top-level one, and a server default never overrides thinking the
+        request turned off."""
+        self.chat.is_minimax_m3 = True
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        user = [{"role": "user", "content": "Hi?"}]
+        enabled = {"thinking_mode": "enabled"}
+        # (request fields, server defaults, rendered effort, rendered thinking_mode):
+        # the request's own settings outrank the server defaults, which fill gaps.
+        cases = (
+            (
+                {"chat_template_kwargs": {"reasoning_effort": "none"}},
+                {},
+                None,
+                "disabled",
+            ),
+            ({}, {"reasoning_effort": "none"}, None, "disabled"),
+            ({"chat_template_kwargs": {"reasoning_effort": "high"}}, {}, "high", None),
+            ({"thinking": {"type": "disabled"}}, enabled, None, "disabled"),
+            ({"reasoning_effort": "none"}, enabled, None, "disabled"),
+            ({}, {**enabled, "reasoning_effort": "high"}, "high", "enabled"),
+        )
+        for fields, server_defaults, effort, mode in cases:
+            self.chat.default_chat_template_kwargs = server_defaults
+            request = ChatCompletionRequest(model="x", messages=user, **fields)
+            self.chat._convert_to_internal_request(request, self.fastapi_request)
+            kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
+            with self.subTest(fields=fields, server_defaults=server_defaults):
+                self.assertEqual(kwargs.get("reasoning_effort"), effort)
+                self.assertEqual(kwargs.get("thinking_mode"), mode)
+        self.chat.default_chat_template_kwargs = {}
+
+    def test_m3_tool_results_render_in_call_order(self):
+        """The M3 template pairs tool results by position, so results sent out of
+        order reach it in call order."""
+        self.chat.is_minimax_m3 = True
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        weather = {"name": "get_weather", "arguments": "{}"}
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {"role": "user", "content": "Weather?"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {"id": "call_1", "type": "function", "function": weather},
+                        {"id": "call_2", "type": "function", "function": weather},
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_2", "content": "rain"},
+                {"role": "tool", "tool_call_id": "call_1", "content": "sunny"},
+            ],
+        )
+        self.chat._process_messages(request, is_multimodal=False)
+        rendered = self.tm.tokenizer.apply_chat_template.call_args[0][0]
+        self.assertEqual(
+            [m["tool_call_id"] for m in rendered if m["role"] == "tool"],
+            ["call_1", "call_2"],
+        )
+
+    def test_root_message_tools_are_effective_tools(self):
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {
+                    "role": "root",
+                    "content": "You are A.",
+                    "tools": [{"type": "function", "function": {"name": "lookup"}}],
+                },
+                {"role": "user", "content": "Hi?"},
+            ],
+        )
+        self.assertEqual(
+            [tool.function.name for tool in self.chat._effective_tools(request)],
+            ["lookup"],
+        )
+        self.assertEqual(request.tool_choice, "auto")
 
     @staticmethod
     def _close_event_loops():
@@ -586,8 +878,8 @@ class ServingChatTestCase(CustomTestCase):
                 )
                 error = json.loads(response.body)
                 self.assertEqual(response.status_code, HTTPStatus.BAD_REQUEST)
-                self.assertEqual(error["error"]["type"], "invalid_request_error")
-                self.assertIn(media_type, error["error"]["message"])
+                self.assertEqual(error["type"], "BadRequestError")
+                self.assertIn(media_type, error["message"])
         self.tm.generate_request.assert_not_called()
 
     def test_media_validation_does_not_reject_supported_content(self):
@@ -3150,7 +3442,7 @@ class ServingChatTestCase(CustomTestCase):
     def test_streaming_abort_yields_error(self):
         """Test that an abort finish reason during streaming correctly yields an error and stops."""
         err_msg = "Aborted by scheduler"
-        err_code = HTTPStatus.INTERNAL_SERVER_ERROR.value
+        err_code = HTTPStatus.INTERNAL_SERVER_ERROR
 
         async def _mock_generate_abort():
             yield {
@@ -3217,8 +3509,7 @@ class ServingChatTestCase(CustomTestCase):
                 break
         self.assertIsNotNone(error_chunk_data, "Error chunk not found in stream")
         self.assertEqual(error_chunk_data["error"]["message"], err_msg)
-        self.assertIsNone(error_chunk_data["error"]["code"])
-        self.assertEqual(error_chunk_data["error"]["type"], "server_error")
+        self.assertEqual(error_chunk_data["error"]["code"], err_code.value)
 
         # Ensure the stream stops after the abort error
         # The last chunk should be "data: [DONE]\n\n"
@@ -3301,8 +3592,7 @@ class ServingChatTestCase(CustomTestCase):
 
         error_chunk_data = json.loads(chunks[0][len("data: ") :])
         self.assertEqual(error_chunk_data["error"]["message"], err_msg)
-        self.assertIsNone(error_chunk_data["error"]["code"])
-        self.assertEqual(error_chunk_data["error"]["type"], "server_error")
+        self.assertEqual(error_chunk_data["error"]["code"], err_code.value)
 
     def test_streaming_error_abort_still_finalizes_other_choices(self):
         """An error abort ends generation but still runs finalization, so a
@@ -5207,6 +5497,21 @@ class TestNormalizeToolContent(unittest.TestCase):
         self.assertEqual(result, "plain rich")
 
 
+class TestUsageReasoningTokens(CustomTestCase):
+    def test_reasoning_tokens_use_the_openai_field(self):
+        """OpenAI clients read reasoning tokens from usage.completion_tokens_details."""
+        from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
+
+        usage = UsageProcessor.calculate_token_usage(
+            prompt_tokens=5, completion_tokens=7, reasoning_tokens=3
+        )
+        self.assertEqual(usage.completion_tokens_details.reasoning_tokens, 3)
+        no_reasoning = UsageProcessor.calculate_token_usage(
+            prompt_tokens=5, completion_tokens=7
+        )
+        self.assertIsNone(no_reasoning.completion_tokens_details)
+
+
 class TestRequestChatTemplateTrustGate(CustomTestCase):
     def setUp(self):
         super().setUp()
@@ -5246,6 +5551,96 @@ class TestRequestChatTemplateTrustGate(CustomTestCase):
                         self._request(chat_template_kwargs=kwargs)
                     )
                 )
+
+
+class TestStreamingAbortStatus(CustomTestCase):
+    def _chunks(self, status):
+        finish = {"type": "abort", "message": "Aborted by scheduler"}
+        if status is not None:
+            finish["status_code"] = status
+
+        async def generate(*args):
+            yield {
+                "text": "",
+                "index": 0,
+                "meta_info": {
+                    "id": "abort-test",
+                    "prompt_tokens": 10,
+                    "completion_tokens": 0,
+                    "cached_tokens": 0,
+                    "finish_reason": finish,
+                },
+            }
+
+        async def no_content(**kwargs):
+            if False:
+                yield
+
+        chat = SimpleNamespace(
+            tokenizer_manager=SimpleNamespace(generate_request=generate),
+            chat_encoding_spec=None,
+            reasoning_parser=None,
+            _should_return_input_ids=lambda request: False,
+            _should_return_output_ids=lambda request: False,
+            _generate_stream_content=no_content,
+        )
+        chat._reported_prompt_tokens = (
+            OpenAIServingChat._reported_prompt_tokens.__get__(chat)
+        )
+        chat.create_streaming_error_response = (
+            OpenAIServingBase.create_streaming_error_response.__get__(chat)
+        )
+        request = ChatCompletionRequest(
+            messages=[{"role": "user", "content": "hi"}], stream=True
+        )
+
+        async def collect():
+            return [
+                chunk
+                async for chunk in OpenAIServingChat._generate_chat_stream(
+                    chat, object(), request, None
+                )
+            ]
+
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.get_serving",
+            return_value=SimpleNamespace(stream_response_default_include_usage=False),
+        ):
+            return asyncio.run(collect())
+
+    def test_integer_and_enum_error_aborts_keep_legacy_error_body(self):
+        for status, expected_type in (
+            (HTTPStatus.BAD_REQUEST, "BAD_REQUEST"),
+            (400, "BAD_REQUEST"),
+            (HTTPStatus.INTERNAL_SERVER_ERROR, "INTERNAL_SERVER_ERROR"),
+            (500, "INTERNAL_SERVER_ERROR"),
+            (499, "499"),
+            (599, "599"),
+        ):
+            with self.subTest(status=status, status_type=type(status).__name__):
+                chunks = self._chunks(status)
+                self.assertEqual(len(chunks), 2)
+                error = json.loads(chunks[0][len("data: ") :])["error"]
+                self.assertEqual(error["code"], int(status))
+                self.assertEqual(error["type"], expected_type)
+                self.assertEqual(error["message"], "Aborted by scheduler")
+                self.assertEqual(error["object"], "error")
+                self.assertEqual(chunks[-1], "data: [DONE]\n\n")
+
+    def test_graceful_and_non_error_aborts_remain_normal_finishes(self):
+        for status in (None, 200, "500"):
+            with self.subTest(status=status):
+                chunks = self._chunks(status)
+                data = [json.loads(chunk[len("data: ") :]) for chunk in chunks[:-1]]
+                self.assertFalse(any("error" in item for item in data))
+                self.assertTrue(
+                    any(
+                        choice.get("finish_reason") == "abort"
+                        for item in data
+                        for choice in item.get("choices", [])
+                    )
+                )
+                self.assertEqual(chunks[-1], "data: [DONE]\n\n")
 
 
 if __name__ == "__main__":
