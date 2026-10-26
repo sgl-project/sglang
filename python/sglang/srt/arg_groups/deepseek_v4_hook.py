@@ -213,7 +213,7 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
         assert cfg.tp_size <= 8, (
             "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
         )
-    supported_a2a_backends = ("none", "deepep", "megamoe", "mori")
+    supported_a2a_backends = ("none", "deepep", "megamoe", "mori", "ascend_ops")
     if cfg.moe_a2a_backend not in supported_a2a_backends:
         raise ValueError(
             f"DeepSeekV4 CP supports moe_a2a_backend in {supported_a2a_backends}, "
