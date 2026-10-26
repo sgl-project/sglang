@@ -2045,8 +2045,10 @@ class DFlashWorkerV2(BaseSpecWorker):
                         commit_lens,
                         k,
                         v,
-                        attn.attn.k_scale,
-                        attn.attn.v_scale,
+                        # a unit scale where the layer has none: the fused fp8 write (one
+                        # launch) instead of the eager clamp / cast / write fallback
+                        attn.attn.k_scale if attn.attn.k_scale is not None else 1.0,
+                        attn.attn.v_scale if attn.attn.v_scale is not None else 1.0,
                     )
                 return
 
@@ -2150,8 +2152,8 @@ class DFlashWorkerV2(BaseSpecWorker):
                     commit_lens,
                     cache_k,
                     cache_v,
-                    attn.k_scale,
-                    attn.v_scale,
+                    attn.k_scale if attn.k_scale is not None else 1.0,  # the fused fp8 write
+                    attn.v_scale if attn.v_scale is not None else 1.0,
                 )
             else:
                 token_to_kv_pool.layer_router.layer(attn.layer_id).store(
