@@ -99,7 +99,7 @@ impl DynamoTokenizer {
             load_tokenizer(Some(path), revision, false)?,
             load_tokenizer(Some(path), revision, true)?,
         );
-        tokenizer.bos = configured_bos(&tokenizer.with_specials, path, revision);
+        tokenizer.bos = configured_bos(&tokenizer.without_specials, path, revision);
         Ok(tokenizer)
     }
 
@@ -110,7 +110,8 @@ impl DynamoTokenizer {
 }
 
 /// `bos_token` from `tokenizer_config.json`, looked up as Python's `bos_token_id`;
-/// tiktoken has no vocab lookup, so it takes the last id of its special encoding.
+/// tiktoken has no vocab lookup, so it encodes the token as a special, which must
+/// give one id.
 fn configured_bos(
     tokenizer: &dynamo_tokenizers::Tokenizer,
     path: &str,
@@ -127,9 +128,10 @@ fn configured_bos(
     let ids = tokenizer
         .encode_segments(&[dynamo_tokenizers::EncodeSegment::new(bos, true)])
         .ok()?;
-    ids.token_ids()
-        .last()
-        .and_then(|&id| i32::try_from(id).ok())
+    match ids.token_ids() {
+        &[id] => i32::try_from(id).ok(),
+        _ => None,
+    }
 }
 
 impl TextTokenizer for DynamoTokenizer {
