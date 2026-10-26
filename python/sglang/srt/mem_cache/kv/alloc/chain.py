@@ -429,15 +429,6 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         cuda-graph buffer stability."""
         return self.full_attn_allocator.translate_kv_loc(loc, out=out)
 
-    def translate_loc_from_full_to_swa(
-        self,
-        kv_indices: torch.Tensor,
-        *,
-        out: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Window read path: virtual TOKEN ids -> window-physical TOKEN ids."""
-        return self.swa_attn_allocator.translate_kv_loc(kv_indices, out=out)
-
     @property
     def full_v2p_page_table(self) -> torch.Tensor:
         """Page-level virtual->physical table of the owner; kernels that build a

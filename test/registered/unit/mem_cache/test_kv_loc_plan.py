@@ -302,7 +302,7 @@ class TestKVLocPlan(CustomTestCase):
         real_build = kv_index_translator.build_kv_read_table
 
         swa_writes = []
-        real_swa_write = self.allocator.translate_loc_from_full_to_swa
+        real_swa_write = self.allocator.id_spaces()[_SWA].write
 
         def counting_write(ids, *a, **kw):
             writes.append(ids)

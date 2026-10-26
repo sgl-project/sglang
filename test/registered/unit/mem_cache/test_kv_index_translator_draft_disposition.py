@@ -221,7 +221,9 @@ class TestKVIndexTranslatorDraftDisposition(unittest.TestCase):
             )
         (draft_write, draft_read), (target_write, target_read) = views
         self.assertTrue(
-            torch.equal(draft_write, allocator.translate_loc_from_full_to_swa(v))
+            torch.equal(
+                draft_write, allocator.id_spaces()[IdSpaceKind.SLIDING_WINDOW].ids(v)
+            )
         )
         self.assertTrue(torch.equal(draft_write, target_write))
         self.assertTrue(torch.equal(draft_read, target_read))
@@ -282,7 +284,7 @@ class TestKVIndexTranslatorDraftDisposition(unittest.TestCase):
         dense_fb, target_fb = batch(), batch()
         dense.bind_own_plan(dense_fb)
         target.bind_own_plan(target_fb)
-        expected = allocator.translate_loc_from_full_to_swa(v)
+        expected = allocator.id_spaces()[IdSpaceKind.SLIDING_WINDOW].ids(v)
         self.assertTrue(torch.equal(window_ids(window, dense_fb.kv_loc_plan), expected))
         self.assertTrue(
             torch.equal(window_ids(target, target_fb.kv_loc_plan), expected)
