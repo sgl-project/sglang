@@ -1306,15 +1306,15 @@ def _attention_backend_platform_fallbacks(view: Any) -> dict:
 def _intel_xpu_page_constraint(view: Any) -> dict:
     prefill_backend, decode_backend = attention_backends_of(view)
     if "intel_xpu" in (prefill_backend, decode_backend):
-        # page_size 1 is a real kernel path, not a fallback: the flat page table
-        # reshapes the KV cache to (tokens, 1, heads, dim), and the strided
-        # page-table rewrite below is skipped. All-SWA models need it, since
-        # PureSWATokenToKVPoolAllocator is page_size 1 only.
-        supported_page_sizes = [1, 64, 128]
-        msg = "Intel XPU attention backend"
         if use_mla_backend(view):
-            supported_page_sizes.extend([16, 32])
-            msg = msg + " for MLA"
+            # sgl_kernel's mla_decode accepts only these; it has no page_size 1 path.
+            supported_page_sizes = [16, 32, 64, 128]
+            msg = "Intel XPU attention backend for MLA"
+        else:
+            # MHA page_size 1 goes through sgl_kernel's workaround (KV gather +
+            # non-paged varlen attention); the paged kernel accepts only 64/128.
+            supported_page_sizes = [1, 64, 128]
+            msg = "Intel XPU attention backend"
         if view.page_size not in supported_page_sizes:
             logger.warning(
                 f"{msg} only supports page_sizes of {supported_page_sizes}, changing page_size from {view.page_size} to 128."
