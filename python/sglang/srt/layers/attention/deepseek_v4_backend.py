@@ -2887,15 +2887,29 @@ class DeepseekV4AttnBackend(
                 # live inputs before attention. copy_ onto itself is a no-op.
                 core = captured_metadata.core_attn_metadata
                 dspark_swa_buffers = (core.swa_page_indices, core.swa_topk_lengths)
-            temp_metadata = self.init_forward_metadata_dspark_draft_block(
-                max_seq_len=chosen_max_seq_len,
-                req_pool_indices=req_pool_indices,
-                seq_lens=seq_lens,
-                seq_lens_cpu=seq_lens_cpu,
-                out_cache_loc=out_cache_loc_padded,
-                block_size=block_size,
-                dspark_swa_buffers=dspark_swa_buffers,
+            # The draft graph also rebuilds the trtllm tables from them (unless a
+            # request window keeps its SWA indices out of the graph).
+            self.trtllm_defer_tables = (
+                self.trtllm_attn
+                and dspark_swa_buffers is not None
+                and self.token_to_kv_pool.request_window is None
             )
+            try:
+                temp_metadata = self.init_forward_metadata_dspark_draft_block(
+                    max_seq_len=chosen_max_seq_len,
+                    req_pool_indices=req_pool_indices,
+                    seq_lens=seq_lens,
+                    seq_lens_cpu=seq_lens_cpu,
+                    out_cache_loc=out_cache_loc_padded,
+                    block_size=block_size,
+                    dspark_swa_buffers=dspark_swa_buffers,
+                )
+                if self.trtllm_defer_tables:
+                    temp_metadata.core_attn_metadata.trtllm_swa_lens = (
+                        core.trtllm_swa_lens
+                    )
+            finally:
+                self.trtllm_defer_tables = False
         elif bucket == _GraphBucket.TARGET_VERIFY:
             verify_bs = _get_target_verify_bs(forward_batch)
             ragged_layout = self._resolve_verify_layout(forward_batch, bs=bs)
