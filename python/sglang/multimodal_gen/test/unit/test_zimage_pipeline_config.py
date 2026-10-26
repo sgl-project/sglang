@@ -5,13 +5,80 @@ from unittest.mock import patch
 import torch
 
 from sglang.multimodal_gen.configs.pipeline_configs.zimage import ZImagePipelineConfig
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.configs.sample.zimage import (
+    ZImageSamplingParams,
+    ZImageTurboSamplingParams,
+)
 from sglang.multimodal_gen.runtime.models.dits.zimage import (
     ZImageRMSNorm,
     ZImageTransformer2DModel,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 
 
 class TestZImagePipelineConfig(unittest.TestCase):
+    def test_cfg_activation_and_default_negative_prompt(self):
+        for cls in (ZImageSamplingParams, ZImageTurboSamplingParams):
+            for scale in (0.0, 0.5, 1.0, 3.5):
+                for negative in (None, "", "avoid blur"):
+                    with self.subTest(cls=cls.__name__, scale=scale, negative=negative):
+                        req = Req(
+                            sampling_params=cls(
+                                guidance_scale=scale, negative_prompt=negative
+                            )
+                        )
+                        self.assertEqual(req.do_classifier_free_guidance, scale > 0)
+                        self.assertEqual(req.negative_prompt, negative or "")
+        self.assertFalse(
+            Req(sampling_params=ZImageTurboSamplingParams()).do_classifier_free_guidance
+        )
+
+    def test_standard_cfg_activation_is_unchanged(self):
+        self.assertTrue(
+            Req(
+                sampling_params=SamplingParams(guidance_scale=1.0),
+                do_classifier_free_guidance=True,
+            ).do_classifier_free_guidance
+        )
+        for scale, negative, true_scale, expected in (
+            (1.0, "", None, False),
+            (3.5, None, None, False),
+            (3.5, "", None, True),
+            (3.5, "", 1.0, False),
+            (1.0, "", 3.5, True),
+        ):
+            req = Req(
+                sampling_params=SamplingParams(
+                    guidance_scale=scale,
+                    negative_prompt=negative,
+                    true_cfg_scale=true_scale,
+                )
+            )
+            self.assertEqual(req.do_classifier_free_guidance, expected)
+
+    def test_cfg_matches_diffusers_fp32_arithmetic(self):
+        config = ZImagePipelineConfig()
+        pos = torch.tensor([0.1, 0.25, -0.75], dtype=torch.bfloat16)
+        neg = torch.tensor([-0.2, 0.5, 0.125], dtype=torch.bfloat16)
+        # emulate the native DiT's sign inversion from diffusers' raw predictions
+        for scale in (0.5, 1.0, 3.5):
+            batch = SimpleNamespace(cfg_normalization=False, guidance_rescale=0.0)
+            expected = -(pos.float() + scale * (pos.float() - neg.float()))
+            for parallel in (False, True):
+                actual = config.cfg_policy.combine(
+                    [-pos, -neg], batch, scale, config, cfg_parallel=parallel
+                )
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                self.assertEqual(actual.dtype, torch.float32)
+        torch.testing.assert_close(
+            config.cfg_policy.combine([-pos], batch, 0.0, config),
+            -pos,
+            rtol=0,
+            atol=0,
+        )
+        self.assertTrue(config.cfg_policy.parallel_uses_serial_arithmetic)
+
     def test_rmsnorm_native_formula(self) -> None:
         norm = ZImageRMSNorm(4, eps=1e-5)
         with torch.no_grad():

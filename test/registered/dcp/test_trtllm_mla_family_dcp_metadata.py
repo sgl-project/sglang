@@ -14,7 +14,6 @@ import torch
 
 from sglang.srt.layers.attention import trtllm_mla_backend as backend_module
 from sglang.srt.layers.attention.cutedsl_mla_backend import CuteDslMLABackend
-from sglang.srt.layers.attention.tokenspeed_mla_backend import TokenspeedMLABackend
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLABackend,
     TRTLLMMLADecodeMetadata,
@@ -25,7 +24,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=10, stage="base-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=12, stage="base-b", runner_config="4-gpu-b200")
 
 NUM_DRAFT_TOKENS = 8
 DCP_SIZE = 4
@@ -55,6 +54,7 @@ def _apply(backend, *, bs: int, seq_lens: torch.Tensor, forward_mode):
         patch.object(backend, "_fill_dcp_block_kv_indices") as fill,
     ):
         backend._apply_cuda_graph_metadata(
+            plan=None,  # DCP builds its own block table
             bs=bs,
             req_pool_indices=torch.arange(bs, dtype=torch.int32, device="cuda"),
             seq_lens=seq_lens,
@@ -108,7 +108,6 @@ class _DCPMetadataTests:
         heads, v_head_dim, n = 4, 512, 3 * NUM_DRAFT_TOKENS
         backend = object.__new__(self.backend_cls)
         backend.data_type = backend.q_data_type = torch.bfloat16
-        backend._decode_kernel_loc = None
 
         def real_path(*args, **kwargs):
             raise _RealVerifyPath
@@ -166,10 +165,6 @@ class _DCPMetadataTests:
 
 class TestTRTLLMMLADCPMetadata(_DCPMetadataTests, CustomTestCase):
     backend_cls = TRTLLMMLABackend
-
-
-class TestTokenspeedMLADCPMetadata(_DCPMetadataTests, CustomTestCase):
-    backend_cls = TokenspeedMLABackend
 
 
 class TestCuteDslMLADCPMetadata(_DCPMetadataTests, CustomTestCase):

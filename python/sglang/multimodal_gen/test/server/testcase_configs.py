@@ -29,12 +29,18 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
+from sglang.multimodal_gen.configs.sample.sampling_params import normalize_quality
 from sglang.multimodal_gen.registry import (
     get_model_info,
     get_pipeline_config_classes,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
+from sglang.multimodal_gen.test.test_utils import (
+    SGL_TEST_FILES_CI_DATA_REPO,
+    SGL_TEST_FILES_CI_DATA_REVISION,
+)
+from sglang.srt.environ import envs
 
 
 @dataclass
@@ -335,6 +341,9 @@ class DiffusionTestCase:
     perf_repeat_requests: int = 1
     perf_warmup_requests: int = 0
     run_consistency_check: bool = True
+    # Sent first after the server warmup and checked against its own golden: the
+    # request that inherits whatever state the warmup leaves behind.
+    lead_sampling_params: DiffusionSamplingParams | None = None
     run_component_accuracy_check: bool = True
     run_models_api_check: bool = True
     expected_model_id: str | None = None
@@ -343,6 +352,22 @@ class DiffusionTestCase:
     run_lora_dynamic_load_check: bool = False
     run_lora_dynamic_switch_check: bool = False
     run_multi_lora_api_check: bool = False
+    # Cached MiniMax goldens require its implicit-quality cache mode.
+    pin_consistency_quality: bool = True
+    # GT-free checks against other requests to the same server, same seed: the
+    # output must match the request at this quality level ...
+    reference_quality: str | None = None
+    # ... and must change once the server's LoRA adapter is deactivated
+    run_lora_effect_check: bool = False
+
+    def lead_case(self) -> DiffusionTestCase:
+        """The lead request as a case named "<id>_lead" (its golden's name)."""
+        return replace(
+            self,
+            id=f"{self.id}_lead",
+            sampling_params=self.lead_sampling_params,
+            lead_sampling_params=None,
+        )
 
     def __post_init__(self) -> None:
         if self.perf_repeat_requests < 1:
@@ -372,13 +397,40 @@ class DiffusionTestCase:
         # removes the pin.
         # Replaces rather than mutates: several cases share one module-level
         # sampling-params instance.
-        if self.run_consistency_check and "quality" not in self.sampling_params.extras:
+        cache_dit_requested = self.sampling_params.extras.get("enable_cache_dit")
+        if cache_dit_requested is None:
+            cache_dit_requested = self.server_args.enable_cache_dit or (
+                self.server_args.env_vars.get("SGLANG_CACHE_DIT_ENABLED", "").lower()
+                == "true"
+            )
+        # Cached goldens require the cached path; an explicit exact tier disables
+        # MiniMax-H3's environment-selected Cache-DiT configuration.
+        if (
+            self.run_consistency_check
+            and "quality" not in self.sampling_params.extras
+            and (self.pin_consistency_quality or not cache_dit_requested)
+        ):
             object.__setattr__(
                 self,
                 "sampling_params",
                 replace(
                     self.sampling_params,
                     extras={**self.sampling_params.extras, "quality": "exact"},
+                ),
+            )
+        # Warmup must run the request's level: a request below the server default
+        # unmounts the fusions warmup mounted, so its timed run is the first pass
+        # over an unwarmed path.
+        request_quality = self.sampling_params.extras.get("quality")
+        if request_quality is not None:
+            object.__setattr__(
+                self,
+                "server_args",
+                replace(
+                    self.server_args,
+                    extras=_with_warmup_quality(
+                        self.server_args.extras, normalize_quality(request_quality)
+                    ),
                 ),
             )
 
@@ -406,6 +458,17 @@ class DiffusionTestCase:
                 f"{self.id}: run_multi_lora_api_check requires lora_path and second_lora_path"
             )
 
+        if self.run_lora_effect_check and not (has_startup_lora or has_dynamic_lora):
+            raise ValueError(
+                f"{self.id}: run_lora_effect_check requires lora_path or dynamic_lora_path"
+            )
+
+
+# per-key-frame bounds in 0-255 levels: lossless-tier drift is ~1 level, a
+# full-strength LoRA moves tens; the 4x gap keeps a dropped delta out of "match"
+OUTPUT_MATCH_MAX_MEAN_ABS_DIFF = 3.0
+OUTPUT_MATCH_MIN_PSNR = 30.0
+OUTPUT_CHANGE_MIN_MEAN_ABS_DIFF = 12.0
 
 _REALTIME_MODEL_COMMON_EXTRAS = {
     "seed": 42,
@@ -694,16 +757,22 @@ MODELOPT_QWEN_IMAGE_2512_NVFP4_CI_sampling_params = replace(
     extras={"num_inference_steps": 50, "seed": 0},
 )
 
+# CI prefetches the input; standalone runs retain the release URL fallback.
+TI2I_QWEN_IMAGE_EDIT_INPUT = (
+    envs.SGLANG_TEST_TI2I_INPUT_IMAGE.get()
+    or "https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg"
+)
+
 MODELOPT_TI2I_CI_sampling_params = DiffusionSamplingParams(
     prompt="Convert 2D style to 3D style",
-    image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
+    image_path=TI2I_QWEN_IMAGE_EDIT_INPUT,
     output_size="512x512",
     extras={"num_inference_steps": 8, "seed": 0},
 )
 
 TI2I_sampling_params = DiffusionSamplingParams(
     prompt="Convert 2D style to 3D style",
-    image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
+    image_path=TI2I_QWEN_IMAGE_EDIT_INPUT,
 )
 
 MULTI_IMAGE_TI2I_sampling_params = DiffusionSamplingParams(
@@ -869,10 +938,81 @@ TURBOWAN_I2V_sampling_params = DiffusionSamplingParams(
     fps=4,
 )
 
+# Wan-Animate-2 inputs; they ship in the same ci-data-diffusion commit as the GT,
+# so the pinned revision must point at a commit that carries them.
+_WAN_2_2_ANIMATE_2_CI_INPUT_BASE = (
+    "https://raw.githubusercontent.com/"
+    f"{SGL_TEST_FILES_CI_DATA_REPO}/{SGL_TEST_FILES_CI_DATA_REVISION}/"
+    "diffusion-ci/inputs/wan_animate_2"
+)
+WAN_2_2_ANIMATE_2_14B_sampling_params = DiffusionSamplingParams(
+    prompt=(
+        "Character appearance description: a smiling young woman with shoulder-length "
+        "dark hair, a mustard-yellow knit sweater, blue jeans and white sneakers. "
+        "Background description: a plain light-gray studio backdrop."
+    ),
+    image_path=f"{_WAN_2_2_ANIMATE_2_CI_INPUT_BASE}/reference_short.jpg",
+    # The model reads `size` as an area budget and emits the 16-aligned canvas fitted to
+    # the reference aspect; 576x1024 (9:16, like the image) maps onto itself.
+    output_size="576x1024",
+    fps=16,
+    output_format="mp4",
+    # 24 driving frames at 16 fps pad to one 29-frame clip (get_padding_len),
+    # so the request denoises a single clip; output length follows the driving video.
+    extras={
+        "video_url": f"{_WAN_2_2_ANIMATE_2_CI_INPUT_BASE}/driving_video_short.mp4",
+        "clip_len": 37,
+        "num_inference_steps": 8,
+        "seed": 42,
+    },
+)
+
+# Distilled checkpoint: guidance is folded into the weights, so the request runs the
+# model's 10-step, guidance-1.0 recipe over the same inputs, canvas and clip length.
+WAN_2_2_ANIMATE_2_14B_DISTILLED_sampling_params = replace(
+    WAN_2_2_ANIMATE_2_14B_sampling_params,
+    extras={
+        **WAN_2_2_ANIMATE_2_14B_sampling_params.extras,
+        "num_inference_steps": 10,
+        "guidance_scale": 1.0,
+    },
+)
+
 HUNYUAN3D_SHAPE_sampling_params = DiffusionSamplingParams(
     prompt="",
     image_path="https://raw.githubusercontent.com/sgl-project/sgl-test-files/main/diffusion-ci/consistency_gt/1-gpu/hunyuan3d_2_0/hunyuan3d.png",
 )
+
+
+def _with_warmup_quality(extras: Sequence[str], quality: str) -> list[str]:
+    """Return ``extras`` with ``quality`` in ``--warmup-sampling-params``.
+
+    Merges into an existing JSON object and keeps a quality the case set itself.
+    """
+    option = "--warmup-sampling-params"
+
+    def with_quality(raw: str) -> str:
+        params = json.loads(raw)
+        params.setdefault("quality", quality)
+        return json.dumps(params)
+
+    merged: list[str] = []
+    found = False
+    for item in extras:
+        tokens = shlex.split(item)
+        changed = False
+        for index, token in enumerate(tokens):
+            if token.startswith(f"{option}="):
+                tokens[index] = f"{option}={with_quality(token[len(option) + 1 :])}"
+                changed = True
+            elif token == option and index + 1 < len(tokens):
+                tokens[index + 1] = with_quality(tokens[index + 1])
+                changed = True
+        merged.append(shlex.join(tokens) if changed else item)
+        found = found or changed
+    if not found:
+        merged.append(f"{option} {shlex.quote(json.dumps({'quality': quality}))}")
+    return merged
 
 
 def _get_extra_arg_value(extras: Sequence[str], option_name: str) -> str | None:
@@ -1023,6 +1163,7 @@ def _make_modelopt_ci_case(
     extras: list[str],
     env_vars: dict[str, str] | None = None,
     run_consistency_check: bool = False,
+    run_perf_check: bool = False,
 ) -> DiffusionTestCase:
     return DiffusionTestCase(
         case_id,
@@ -1033,7 +1174,7 @@ def _make_modelopt_ci_case(
             env_vars=env_vars or {},
         ),
         sampling_params,
-        run_perf_check=False,
+        run_perf_check=run_perf_check,
         run_consistency_check=run_consistency_check,
         run_component_accuracy_check=False,
     )

@@ -9,7 +9,11 @@ import torch
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, _resolve_fused_scale
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.kernels.prefix_valid import assert_prefix_commit, make_kv_cache
+from sglang.test.kernels.prefix_valid import (
+    assert_bytes_equal,
+    assert_prefix_commit,
+    make_kv_cache,
+)
 from sglang.test.test_utils import CustomTestCase
 
 # Preserve the original GPU lanes; the kernel file retains the other 25 seconds.
@@ -190,6 +194,49 @@ class TestPrefixValidFp8Pool(CustomTestCase):
                     pool.set_kv_buffer_prefix_valid(
                         layer, loc, lengths, k, v, k_scale, v_scale
                     )
+
+    def test_eager_fallback_saturates_overflow(self):
+        """Pin the saturation contract without going through the shared helper."""
+        # k_scale_float=None keeps _resolve_fused_scale at None, so this takes
+        # the eager writer rather than the fused kernel.
+        scale = torch.tensor(0.5, device=DEVICE)
+        layer = SimpleNamespace(
+            layer_id=0,
+            k_scale=scale,
+            v_scale=scale,
+            k_scale_float=None,
+            v_scale_float=None,
+        )
+        # Dividing by 0.5 pushes the first two well past the FP8 range; 1.0
+        # lands on 2.0, which is exact in both E4M3 formats.
+        values = (8192.0, -8192.0, float("nan"), 1.0)
+        limit = torch.finfo(fp8_dtype).max
+
+        pool = _make_pool(len(values), 6)
+        before = (pool.k_buffer[0].clone(), pool.v_buffer[0].clone())
+        loc = torch.tensor([[1, 4]], device=DEVICE)
+        lengths = torch.tensor([1], dtype=torch.int32, device=DEVICE)
+        rows = torch.tensor(values, dtype=torch.bfloat16, device=DEVICE).expand(
+            2, 1, -1
+        )
+        # The eager writer divides in place, so K and V need separate storage.
+        k, v = rows.clone(), rows.clone()
+
+        pool.set_kv_buffer_prefix_valid(layer, loc, lengths, k, v, scale, scale)
+
+        for label, buffer, original in (
+            ("K", pool.k_buffer[0], before[0]),
+            ("V", pool.v_buffer[0], before[1]),
+        ):
+            written = buffer.view(pool.dtype)[1, 0].float()
+            self.assertEqual(written[0].item(), limit, f"{label}: +overflow saturates")
+            self.assertEqual(written[1].item(), -limit, f"{label}: -overflow saturates")
+            self.assertTrue(torch.isnan(written[2]), f"{label}: NaN stays NaN")
+            self.assertEqual(written[3].item(), 2.0, f"{label}: in-range stays exact")
+            untouched = [slot for slot in range(buffer.shape[0]) if slot != 1]
+            assert_bytes_equal(
+                buffer[untouched], original[untouched], f"{label} uncommitted slots"
+            )
 
 
 class TestDflashFp8PrefixCommit(CustomTestCase):

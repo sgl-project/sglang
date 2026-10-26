@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import logging
 import time
@@ -37,6 +38,8 @@ from sglang.srt.managers.io_struct import (
     ExpertDistributionReqType,
     FlushCacheReqInput,
     FlushCacheReqOutput,
+    GetHiCacheL3LayoutReq,
+    GetHiCacheL3LayoutReqOutput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
     GetWeightsByNameReqInput,
@@ -134,6 +137,7 @@ _COMMUNICATOR_SPECS = [
     ("profile", ProfileReqOutput),
     ("get_internal_state", GetInternalStateReqOutput),
     ("set_internal_state", SetInternalStateReqOutput),
+    ("get_hicache_l3_cache_layout", GetHiCacheL3LayoutReqOutput),
     ("expert_distribution", ExpertDistributionReqOutput),
     ("begin_weight_update", BeginWeightUpdateReqOutput),
     ("end_weight_update", EndWeightUpdateReqOutput),
@@ -927,10 +931,19 @@ class TokenizerControlMixin:
                 new_role=obj.new_role,
                 safe_to_restore=True,
             )
-        results = await self.pd_role_switch_communicator(obj)
-        all_success = all(r.success for r in results)
+        # The caller must drain ingress and serialize role-switch requests.
+        # Check every DP worker before allowing any of them to tear down.
+        if get_parallel().num_dp_ranks > 1:
+            prepare_req = copy.copy(obj)
+            prepare_req.prepare_only = True
+            results = await self.pd_role_switch_communicator(prepare_req)
+            if results and all(r.success for r in results) and not obj.prepare_only:
+                results = await self.pd_role_switch_communicator(obj)
+        else:
+            results = await self.pd_role_switch_communicator(obj)
+        all_success = bool(results) and all(r.success for r in results)
         safe_to_restore = bool(results) and all(r.safe_to_restore for r in results)
-        if all_success:
+        if all_success and not obj.prepare_only:
             # Keep the tokenizer-manager's view of the role in sync so future
             # control ops and bootstrap routing behave consistently.
             self.record_config_updates(
@@ -938,6 +951,8 @@ class TokenizerControlMixin:
             )
             self.disaggregation_mode = DisaggregationMode(obj.new_role)
             msg = "ok"
+        elif all_success:
+            msg = "ready"
         else:
             # Surface only the failing workers' messages.
             msg = "; ".join(r.message for r in results if not r.success)
@@ -957,6 +972,16 @@ class TokenizerControlMixin:
         ] = await self.get_internal_state_communicator(req)
         # Many DP ranks
         return [res.internal_state for res in responses]
+
+    async def get_hicache_l3_cache_layout(
+        self: TokenizerManager,
+    ) -> List[Dict[Any, Any]]:
+        self.auto_create_handle_loop()
+        req = GetHiCacheL3LayoutReq()
+        responses: List[
+            GetHiCacheL3LayoutReqOutput
+        ] = await self.get_hicache_l3_cache_layout_communicator(req)
+        return [res.layout for res in responses]
 
     async def set_internal_state(
         self: TokenizerManager, obj: SetInternalStateReq
