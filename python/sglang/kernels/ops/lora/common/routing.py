@@ -50,18 +50,17 @@ def route_bucket_ids(
     # Invalid slots/groups map to -1. With one group per slot, any nonnegative
     # group folds into that slot; otherwise bound it to the bucket table.
     token_ids = pair_ids // WIDTH
-    slots = tl.load(token_slots_ptr + token_ids, mask=pair_mask, other=-1).to(tl.int32)
+    slots = tl.load(token_slots_ptr + token_ids, mask=pair_mask, other=-1)
     live = (slots >= 0) & (slots < MAX_LORAS)
+    slots = slots.to(tl.int32)
     if HAS_GROUPS:
-        groups = tl.load(group_ids_ptr + pair_ids, mask=pair_mask, other=-1).to(
-            tl.int32
-        )
+        groups = tl.load(group_ids_ptr + pair_ids, mask=pair_mask, other=-1)
         live = live & (groups >= 0)
         if GROUPS_PER_SLOT == 1:
             buckets = slots
         else:
             live = live & (groups < GROUPS_PER_SLOT)
-            buckets = slots * GROUPS_PER_SLOT + groups
+            buckets = slots * GROUPS_PER_SLOT + groups.to(tl.int32)
     else:
         buckets = slots
     return tl.where(live, buckets, -1)

@@ -147,6 +147,61 @@ class TestCosmos3ServingStep(unittest.TestCase):
             stage.forward(batch, server_args)
         torch.testing.assert_close(batch.latents, torch.ones_like(batch.latents))
 
+    def test_cfg_window_check_reads_host_timesteps(self):
+        """The per-step CFG window check reads a host copy of the schedule: a
+        device read per step blocks the host on that step's kernels."""
+
+        class DeviceReadForbidden(torch.Tensor):
+            def item(self):
+                raise AssertionError("device read inside the denoising loop")
+
+            # float(t) and `lo <= t <= hi` read the value without calling item()
+            __float__ = __bool__ = item
+
+        stage = cosmos3.Cosmos3DenoisingStage.__new__(cosmos3.Cosmos3DenoisingStage)
+        stage.scheduler = mock.Mock()
+        stage.scheduler.step.side_effect = lambda noise_pred, t, latents, **_: (
+            latents,
+        )
+        stage.transformer = mock.Mock()
+        stage._logged_parallel_config = True
+        stage.log_info = mock.Mock()
+        stage.progress_bar = lambda iterable, **kwargs: iterable
+        stage.use_declared_component = lambda **kwargs: nullcontext()
+        forward_batch_sizes = []
+
+        def run_transformer(**kwargs):
+            forward_batch_sizes.append(kwargs["latents"].shape[0])
+            return torch.zeros_like(kwargs["latents"])
+
+        stage._run_transformer = run_transformer
+        text = torch.ones(1, 2, dtype=torch.long)
+        sampling_params = SamplingParams(prompt="test", guidance_scale=6.0)
+        sampling_params.guidance_interval = (400.0, 1000.0)
+        batch = Req(
+            sampling_params=sampling_params,
+            latents=torch.ones(1, 1, 1, 1, 1),
+            timesteps=torch.tensor([999, 700, 400, 399, 100]).as_subclass(
+                DeviceReadForbidden
+            ),
+            extra={
+                "cond_text_ids": text,
+                "cond_text_mask": text,
+                "uncond_text_ids": text,
+                "uncond_text_mask": text,
+                "cond_text_seq_len": 2,
+                "uncond_text_seq_len": 2,
+                "video_shape": (1, 1, 1),
+            },
+        )
+        server_args = types.SimpleNamespace(
+            pipeline_config=None, enable_cfg_parallel=False
+        )
+        with mock.patch.object(cosmos3, "get_sp_world_size", return_value=1):
+            stage.forward(batch, server_args)
+        # batched CFG inside the [400, 1000] window, one cond forward outside it
+        self.assertEqual(forward_batch_sizes, [2, 2, 2, 1, 1])
+
 
 class _FusedParamModule(torch.nn.Module):
     """Diffusers-style q/k/v weights that map into one fused to_qkv param."""
