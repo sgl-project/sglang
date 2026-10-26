@@ -68,8 +68,14 @@ generation. Both sides must have identical state layouts and attention TP sizes.
 With `--disaggregation-enable-kv-checksum`, verification includes all three state
 components using their respective physical indices.
 
+For DeepSeek-V4.1-Flash, CPU-buffer transfers include compressed KV, indexer
+pages, sliding-window KV, and request-scoped compression state. The transfer
+uses the pool's registered region offsets and lengths, including separate
+regions within a shared backing tensor. KV checksum verification includes the
+sliding-window and compression state.
+
 It does not support speculative decoding, hybrid MLA layouts, other extra state
-components beyond Mamba/GDN and QSA, PLE embedding offload, HiCache,
+components beyond Mamba/GDN, QSA, and DeepSeek-V4 state, PLE embedding offload, HiCache,
 HiSparse, decode KV offload, decode host receive, GPU staging, or runtime PD role switching.
 Do not combine `--nixl-use-cpu-buffer` with `--enable-kv-cache-sharding`.
 Sharding produces noncontiguous send positions, while CPU-buffer transfers
@@ -86,9 +92,12 @@ On decode, this mode defaults `--disaggregation-decode-retraction-backup` to
 and compressed state when a decode request is retracted. An explicit `none`
 value is preserved. The `host_pool` backend is rejected because it allocates a
 CUDA-registered HiCache pool even when incoming KV uses CPU buffers.
+DeepSeek-V4 uses its existing prefill recomputation path for retracted text
+requests instead of a CPU KV backup. Retraction of multimodal requests is not
+supported by that path.
 
 Size the pool for concurrent requests: decode holds every received KV page for
-a request, together with its Mamba/GDN and QSA state when present, until GPU
+a request, together with its auxiliary state when present, until GPU
 restoration completes. Prefill holds each packed chunk until its NIXL transfer
 settles. Pool exhaustion fails the affected
 request instead of waiting for pool space. An aborted decode request

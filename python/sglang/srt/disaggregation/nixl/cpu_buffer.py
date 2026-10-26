@@ -93,19 +93,37 @@ class CpuReceiveRegion:
     release_requested: bool = False
 
 
-def page_views(buffers, pointers, item_lens):
+def page_views(
+    buffers, pointers, item_lens, data_lens=None, *, allow_trailing_padding=False
+):
     """Match physical KV page views to the existing wire descriptor order."""
-    by_ptr = {t.data_ptr(): t for t in buffers}
     views = []
-    for ptr, width in zip(pointers, item_lens, strict=True):
-        tensor = by_ptr.get(ptr)
+    if data_lens is None:
+        by_ptr = {t.data_ptr(): t for t in buffers}
+        data_lens = [by_ptr[p].nbytes if p in by_ptr else -1 for p in pointers]
+    for ptr, width, length in zip(pointers, item_lens, data_lens, strict=True):
+        tensor = next(
+            (t for t in buffers if t.data_ptr() <= ptr < t.data_ptr() + t.nbytes),
+            None,
+        )
         if tensor is None or not tensor.is_contiguous() or width <= 0:
             raise ValueError("CPU-buffer PD requires contiguous MHA/MLA KV buffers")
-        raw = tensor.view(torch.uint8).reshape(-1)
-        if raw.numel() % width:
+        offset = ptr - tensor.data_ptr()
+        if (
+            length < width
+            or offset + length > tensor.nbytes
+            or (length % width and not allow_trailing_padding)
+        ):
             raise ValueError(
-                "KV buffer size is not a multiple of its physical page size"
+                "Invalid CPU-buffer physical page region: "
+                f"offset={offset}, length={length}, item_bytes={width}, "
+                f"tensor_bytes={tensor.nbytes}"
             )
+        # Low-ratio DeepSeek indexers reserve an extra physical index page.
+        # It can be smaller than a logical transfer page; expose only complete
+        # transfer pages without permitting access outside the registered region.
+        length -= length % width
+        raw = tensor.view(torch.uint8).reshape(-1)[offset : offset + length]
         views.append(raw.view(-1, width))
     return views
 
@@ -171,6 +189,25 @@ class CpuBufferMixin:
     def set_cpu_kv_buffers(self, pool, *, restore_stream=None):
         self._cpu_restore_stream = restore_stream
         self._cpu_state_views = []
+        if hasattr(pool, "cpu_buffer_transfer_tensors"):
+            buffers = pool.cpu_buffer_transfer_tensors()
+            self._cpu_views = page_views(
+                buffers,
+                self.kv_args.kv_data_ptrs,
+                self.kv_args.kv_item_lens,
+                self.kv_args.kv_data_lens,
+                allow_trailing_padding=True,
+            )
+            for pointers, widths, lengths in zip(
+                self.kv_args.state_data_ptrs or [],
+                self.kv_args.state_item_lens or [],
+                self.kv_args.state_data_lens or [],
+                strict=True,
+            ):
+                self._cpu_state_views.append(
+                    page_views(buffers, pointers, widths, lengths)
+                )
+            return
         for state_type, pointers, widths in zip(
             self.kv_args.state_types or [],
             self.kv_args.state_data_ptrs or [],
@@ -276,9 +313,14 @@ class CpuBufferMixin:
             self.kv_args.state_types, groups, indices, strict=True
         ):
             ids = np.asarray(ids)
+            # Wire decoding turns an empty integer vector into [], for which
+            # NumPy infers float64. Even-length DeepSeek prefixes have no
+            # pending half-pair to transfer, so preserve that empty component.
+            if ids.ndim == 1 and ids.size == 0:
+                ids = ids.astype(np.int64)
             if ids.ndim != 1 or ids.dtype.kind not in "iu":
                 raise ValueError("CPU-buffer state indices must be integer vectors")
-            if state_type != StateType.QSA_COMPRESSED and len(ids) != 1:
+            if state_type in (StateType.MAMBA, StateType.QSA_PENDING) and len(ids) != 1:
                 raise ValueError("CPU-buffer slot state requires one physical slot")
             if len(ids) and (
                 np.min(ids) < 0

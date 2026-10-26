@@ -46,6 +46,62 @@ def _make_buf(size=4, *, kv_checksum_enabled=True, output_dsa_topk_indices_dim=0
     )
 
 
+class TestDeepSeekStateIndices(unittest.TestCase):
+    def test_swa_and_pending_pair_use_independent_indices(self):
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+
+        pool = object.__new__(DeepSeekV4TokenToKVPool)
+        pool.sliding_window = 4
+        pool.request_window = None
+        pool.get_state_buf_infos = Mock(return_value=([11, 12], [], []))
+        pool.get_unified_swa_ring_buf_infos = Mock(return_value=([], [], []))
+        pool.get_request_state_buf_infos = Mock(return_value=([13], [], []))
+        pool.request_state_transfer_indices = Mock(return_value=[5, 6])
+        allocator = SimpleNamespace(
+            page_size=2,
+            get_kvcache=lambda: pool,
+            translate_swa_indices_for_transfer=lambda ids: ids + 20,
+        )
+        scheduler = SimpleNamespace(
+            token_to_kv_pool_allocator=allocator,
+            req_to_token_pool=SimpleNamespace(req_to_token=torch.arange(32).view(4, 8)),
+        )
+        req = SimpleNamespace(kv=SimpleNamespace(req_pool_idx=1))
+        result = state_indices_for_request(scheduler, req, 7)
+        self.assertEqual(
+            [v.tolist() for v in result], [[15, 16, 17], [15, 16, 17], [5, 6]]
+        )
+        pool.request_state_transfer_indices.assert_called_once_with(1, 7)
+        pool.request_window = SimpleNamespace(page_indices=Mock(return_value=[4, 7, 9]))
+        result = state_indices_for_request(scheduler, req, 7)
+        self.assertEqual([v.tolist() for v in result], [[4, 7, 9], [4, 7, 9], [5, 6]])
+        pool.request_window.page_indices.assert_called_once_with(1, 2, 7)
+
+    def test_unified_ring_wrap_and_empty_pending_state(self):
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+
+        pool = object.__new__(DeepSeekV4TokenToKVPool)
+        pool.get_state_buf_infos = Mock(return_value=([], [], []))
+        pool.get_unified_swa_ring_buf_infos = Mock(return_value=([11, 12], [], []))
+        pool.get_request_state_buf_infos = Mock(return_value=([13], [], []))
+        pool.request_state_transfer_indices = Mock(return_value=[])
+        pool.unified_swa_window = 3
+        pool.unified_swa_ring_size = 4
+        scheduler = SimpleNamespace(
+            token_to_kv_pool_allocator=SimpleNamespace(
+                page_size=2, get_kvcache=lambda: pool
+            ),
+            req_to_token_pool=SimpleNamespace(req_to_token=torch.arange(32).view(4, 8)),
+        )
+        result = state_indices_for_request(
+            scheduler, SimpleNamespace(kv=SimpleNamespace(req_pool_idx=2)), 6
+        )
+        self.assertEqual([v.tolist() for v in result], [[11, 8, 9], [11, 8, 9], []])
+        self.assertTrue(
+            all(v.dtype == torch.int64 and v.is_contiguous() for v in result)
+        )
+
+
 class TestMetadataBuffers(unittest.TestCase):
     def test_extends_aux_with_kv_checksum(self):
         for sampling_mask in (False, True):

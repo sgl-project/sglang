@@ -35,9 +35,16 @@ class TestNixlCpuBufferTransfer(CustomTestCase):
     def test_real_qsa_chunked_transfer(self):
         self._roundtrip(with_qsa=True)
 
-    def _roundtrip(self, *, with_qsa):
+    def test_real_deepseek_chunked_transfer(self):
+        self._roundtrip(with_qsa=False, with_deepseek=True)
+
+    def test_real_deepseek_empty_pending_state(self):
+        self._roundtrip(with_qsa=False, with_deepseek=True, empty_deepseek_state=True)
+
+    def _roundtrip(self, *, with_qsa, with_deepseek=False, empty_deepseek_state=False):
         from nixl._api import nixl_agent, nixl_agent_config, nixl_thread_sync_t
 
+        with_state = with_qsa or with_deepseek
         device = os.environ.get("NIXL_TEST_DEVICE", "cuda")
         source = [
             torch.arange(512, device=device).to(torch.bfloat16).reshape(16, 32),
@@ -66,22 +73,37 @@ class TestNixlCpuBufferTransfer(CustomTestCase):
                     .reshape(16, 128)
                 ],
             ]
-            if with_qsa
+            if with_state
             else []
         )
         state_target = [[torch.zeros_like(t) for t in group] for group in state_source]
         state_types = (
             [StateType.MAMBA, StateType.QSA_PENDING, StateType.QSA_COMPRESSED]
-            if with_qsa
+            if with_state
             else []
         )
         state_widths = [[t[0].nbytes for t in group] for group in state_source]
         src_state_ids = (
-            [np.array([7]), np.array([3]), np.array([12, 5, 1, 9])] if with_qsa else []
+            [np.array([7]), np.array([3]), np.array([12, 5, 1, 9])]
+            if with_state
+            else []
         )
         dst_state_ids = (
-            [np.array([1]), np.array([8]), np.array([3, 10, 2, 6])] if with_qsa else []
+            [np.array([1]), np.array([8]), np.array([3, 10, 2, 6])]
+            if with_state
+            else []
         )
+        if with_deepseek:
+            state_types = [
+                StateType.SWA,
+                StateType.SWA_RING,
+                StateType.DSV4_REQUEST_STATE,
+            ]
+            src_state_ids = [np.array([7, 3]), np.array([12, 0, 1]), np.array([2, 5])]
+            dst_state_ids = [np.array([1, 8]), np.array([3, 4, 5]), np.array([9, 12])]
+            if empty_deepseek_state:
+                src_state_ids[-1] = np.empty(0, dtype=np.int32)
+                dst_state_ids[-1] = []  # As decoded from the bootstrap message.
         managers = []
         registrations = []
         for tensors, state_tensors in ((source, state_source), (target, state_target)):
@@ -151,7 +173,7 @@ class TestNixlCpuBufferTransfer(CustomTestCase):
                         time.monotonic(), deadline, "NIXL transfer timed out"
                     )
                     time.sleep(0.001)
-            if with_qsa:
+            if with_state:
                 sender._send_cpu_state(
                     req,
                     peer,
@@ -165,10 +187,10 @@ class TestNixlCpuBufferTransfer(CustomTestCase):
                         sender.agent.check_xfer_state(handles[-1]), "ERR"
                     )
                     self.assertLess(
-                        time.monotonic(), deadline, "QSA transfer timed out"
+                        time.monotonic(), deadline, "State transfer timed out"
                     )
                     time.sleep(0.001)
-            if with_qsa and device != "cpu":
+            if with_state and device != "cpu":
                 # Model a redundant forward still writing a recently freed slot.
                 # Warm copy kernels and temporary allocations so first-use
                 # initialization cannot accidentally drain the producer.
@@ -195,7 +217,7 @@ class TestNixlCpuBufferTransfer(CustomTestCase):
                     state_target[0][0].index_fill_(0, state_ids, 7)
                 receiver._cpu_restore_stream = producer
             receiver._finish_cpu_receive(7)
-            if with_qsa and device != "cpu":
+            if with_state and device != "cpu":
                 producer.synchronize()
             for sg, tg, si, di in zip(
                 state_source, state_target, src_state_ids, dst_state_ids
@@ -213,7 +235,7 @@ class TestNixlCpuBufferTransfer(CustomTestCase):
             sender._cpu_pool.reap(sender.agent)
             self.assertFalse(sender._cpu_pool._ranges)
             print(
-                f"NIXL CPU-buffer roundtrip passed: device={device}, qsa={with_qsa}, chunks=2, kv_bytes={len(src_ids) * sum(widths)}"
+                f"NIXL CPU-buffer roundtrip passed: device={device}, qsa={with_qsa}, deepseek={with_deepseek}, chunks=2, kv_bytes={len(src_ids) * sum(widths)}"
             )
         finally:
             # Keep backing tensors and registration descriptors alive until

@@ -427,6 +427,55 @@ class TestCpuBufferData(CustomTestCase):
                     self.assertTrue(torch.equal(original[src_ids], restored[dst_ids]))
                     self.assertEqual(torch.count_nonzero(restored[[1, 3, 4, 5, 7]]), 0)
 
+    def test_disjoint_regions_share_backing_without_overwrite(self):
+        source = torch.arange(96, dtype=torch.uint8).reshape(12, 8)
+        target = torch.full_like(source, 255)
+        # SWA rows and compressed pages occupy disjoint regions of one tensor.
+        src = page_views(
+            [source], [source.data_ptr(), source.data_ptr() + 32], [8, 16], [32, 64]
+        )
+        dst = page_views(
+            [target], [target.data_ptr(), target.data_ptr() + 32], [8, 16], [32, 64]
+        )
+        for src_view, dst_view, src_ids, dst_ids in (
+            (src[0], dst[0], [0, 2], [1, 3]),
+            (src[1], dst[1], [1, 3], [0, 2]),
+        ):
+            packed = torch.empty(len(src_ids) * src_view.shape[1], dtype=torch.uint8)
+            pack_pages([src_view], src_ids, packed)
+            scatter_pages([dst_view], dst_ids, packed)
+            self.assertTrue(torch.equal(src_view[src_ids], dst_view[dst_ids]))
+        self.assertTrue(torch.all(target[[0, 2, 6, 7, 10, 11]] == 255))
+
+    def test_physical_region_bounds(self):
+        tensor = torch.zeros(64, dtype=torch.uint8)
+        for offset, width, length in ((32, 8, 40), (0, 8, 63), (0, 0, 64), (0, 8, -8)):
+            with self.subTest(offset=offset, width=width, length=length):
+                with self.assertRaises(ValueError):
+                    page_views(
+                        [tensor], [tensor.data_ptr() + offset], [width], [length]
+                    )
+        with self.assertRaises(ValueError):
+            page_views([tensor], [tensor.data_ptr()], [8], [])
+
+    def test_indexer_tail_padding_is_not_addressable(self):
+        tensor = torch.arange(68, dtype=torch.uint8)
+        views = page_views(
+            [tensor], [tensor.data_ptr()], [8], [68], allow_trailing_padding=True
+        )
+        self.assertEqual(views[0].shape, (8, 8))
+        with self.assertRaises(ValueError):
+            pack_pages(views, [8], torch.empty(8, dtype=torch.uint8))
+        for length in (7, 72):
+            with self.subTest(length=length), self.assertRaises(ValueError):
+                page_views(
+                    [tensor],
+                    [tensor.data_ptr()],
+                    [8],
+                    [length],
+                    allow_trailing_padding=True,
+                )
+
     def test_invalid_ranges_fail_before_transfer(self):
         with self.assertRaises(ValueError):
             chunk_descriptors(100, 200, [8], 2, 3, 2)
@@ -873,6 +922,115 @@ class TestCpuBufferQsaState(CustomTestCase):
                     handle_offload_compatibility(args)
             else:
                 handle_offload_compatibility(args)
+
+
+class TestCpuBufferDeepSeekState(CustomTestCase):
+    def test_unified_fp8_compressed_regions_exclude_swa_ring(self):
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+
+        pool = object.__new__(DeepSeekV4TokenToKVPool)
+        pool._unified_kv = True
+        pool._unified_kv_fp8 = True
+        pool._stage_start, pool._stage_end = 0, 2
+        pool.compression_ratios = [2, 1]
+        pool.page_size = 4
+        pool.request_window = pool.swa_kv_pool = None
+        pool.compress_state_pools = pool.indexer_compress_state_pools = []
+        pool.kv_pools = {2: None, 1: None}
+        pool.index_pools = {}
+        kv = [torch.zeros((20, 8), dtype=torch.uint8) for _ in range(2)]
+        rope = [torch.zeros((20, 4), dtype=torch.uint8) for _ in range(2)]
+        pool.unified_kv_pool = SimpleNamespace(
+            swa_pages=4, kv_buffer=kv, kv_buffer_rope=rope
+        )
+        pointers, lengths, widths = pool.get_contiguous_buf_infos()
+        views = page_views(
+            pool.cpu_buffer_transfer_tensors(), pointers, widths, lengths
+        )
+        self.assertEqual(
+            [tuple(v.shape) for v in views], [(8, 16), (8, 8), (4, 32), (4, 16)]
+        )
+        for view in views:
+            view.fill_(7)
+        for tensor in kv + rope:
+            self.assertTrue(torch.all(tensor[:4] == 0))
+            self.assertTrue(torch.all(tensor[4:] == 7))
+        pointers, lengths, widths = pool.get_unified_swa_ring_buf_infos()
+        views = page_views(
+            pool.cpu_buffer_transfer_tensors(), pointers, widths, lengths
+        )
+        for view in views:
+            view.fill_(9)
+        for tensor in kv + rope:
+            self.assertTrue(torch.all(tensor[:4] == 9))
+            self.assertTrue(torch.all(tensor[4:] == 7))
+
+    def test_ratio_one_two_buffers_and_request_state(self):
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+
+        pool = object.__new__(DeepSeekV4TokenToKVPool)
+        pool._unified_kv = False
+        pool._unified_kv_fp8 = False
+        pool._stage_start, pool._stage_end = 0, 2
+        pool.compression_ratios = [2, 1]
+        pool.page_size = 4
+        pool.swa_page_size = 4
+        pool.request_window = None
+        pool.kv_pools = {
+            ratio: SimpleNamespace(
+                kv_buffer=[torch.arange(64, dtype=torch.uint8).view(8, 8)]
+            )
+            for ratio in (2, 1)
+        }
+        # One extra physical index page does not form a logical transfer page.
+        index = torch.arange(68, dtype=torch.uint8).view(17, 4)
+        pool.index_pools = {
+            1: SimpleNamespace(page_size=2, contiguous_page_row_buffers=lambda: [index])
+        }
+        pool.swa_kv_pool = SimpleNamespace(
+            page_size=2, kv_buffer=[torch.zeros((16, 4), dtype=torch.uint8)]
+        )
+        pending = torch.arange(128, dtype=torch.uint8).view(16, 8)
+        pool.compress_state_pools = [
+            SimpleNamespace(
+                request_scoped=True,
+                ratio=2,
+                ring_size=2,
+                kv_score_buffer=SimpleNamespace(kv_score=pending),
+            )
+        ]
+        pool.indexer_compress_state_pools = []
+        mgr = manager(2048)
+        ptrs, lengths, widths = pool.get_contiguous_buf_infos()
+        mgr.kv_args.kv_data_ptrs, mgr.kv_args.kv_data_lens, mgr.kv_args.kv_item_lens = (
+            ptrs,
+            lengths,
+            widths,
+        )
+        states = [pool.get_state_buf_infos(), pool.get_request_state_buf_infos()]
+        mgr.kv_args.state_types = [StateType.SWA, StateType.DSV4_REQUEST_STATE]
+        mgr.kv_args.state_data_ptrs = [v[0] for v in states]
+        mgr.kv_args.state_data_lens = [v[1] for v in states]
+        mgr.kv_args.state_item_lens = [v[2] for v in states]
+        mgr.set_cpu_kv_buffers(pool)
+        self.assertEqual([tuple(v.shape) for v in mgr._cpu_views], [(8, 8)] * 3)
+        self.assertEqual(tuple(mgr._cpu_state_views[0][0].shape), (8, 8))
+        self.assertEqual(tuple(mgr._cpu_state_views[1][0].shape), (8, 16))
+        for request_slots in ([], [3], [1, 4]):
+            ids = mgr._cpu_state_index(
+                [
+                    np.array([2, 4], dtype=np.int32),
+                    request_slots,  # Wire decoding loses the dtype of [].
+                ]
+            )
+            region = mgr._allocate_cpu_receive(19, np.array([1, 3]), 1, ids)
+            self.assertEqual(ids[1].dtype.kind, "i")
+            self.assertEqual(region.buffer.numel(), 48 + 16 + len(request_slots) * 16)
+            mgr._release_cpu_receive(19)
+        self.assertEqual(mgr._cpu_pool._ranges, {})
+        for invalid in ([1.0], [[1]], None):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                mgr._cpu_state_index([[2], invalid])
 
 
 if __name__ == "__main__":

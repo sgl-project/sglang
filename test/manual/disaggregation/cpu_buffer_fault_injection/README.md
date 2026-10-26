@@ -46,6 +46,14 @@ to succeed, no checksum mismatch, empty disaggregation queues, and zero pool
 handles before cleanup. This checks ownership after a posted write, rather than
 only failure before submission.
 
+Use the checkpoint's native chat format for recovery prompts when evaluating a
+chat model. For DeepSeek-V4.1, render messages with
+`sglang.srt.entrypoints.openai.encoding_dsv41.encode_messages(..., thinking_mode="chat")`,
+then tokenize with `add_special_tokens=False` and send the resulting `input_ids`
+to both workers. Check the answer as well as the HTTP status and finish reason.
+A bare completion prompt can produce an immediate EOS with an empty answer even
+when the transfer succeeds.
+
 Each process injects each fault kind once per lifetime. Restart the isolated
 servers to repeat a kind. A subsequent server launch without this directory on
 `PYTHONPATH` and without `SGLANG_CPU_FAULT_DIR` runs without instrumentation.
