@@ -3375,6 +3375,7 @@ class Scheduler(
                 new_input_tokens = req.full_untruncated_fill_ids[matched_len:match_end]
                 prefix_keys = (
                     tree_cache.get_prefix_hash_values(last_host_node)
+                    + tree_cache.get_hash_values(last_host_node)
                     if tree_cache.hicache_storage_pass_prefix_keys
                     else None
                 )
