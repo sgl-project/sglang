@@ -13,7 +13,9 @@ initial learning policy is not included.
 Before migrating a chunk, NPU validates corresponding tensor counts, shapes,
 dtypes, devices, and staging requirements. Ordinary tensors bypass ND staging;
 unchanged local placements still participate in sends but skip ND writeback.
-Workspaces are reused within a chunk and are not cached between rebalances.
+Receive buffers are reused within a chunk and are not cached between rebalances.
+ND staging retains each layer's conversion results directly. Writeback converts
+them to the destination format before copying into the original model storage.
 NPU target forwards skip the draft guard's device lookup, and empty route
 tensors return before creating a buffer view or issuing a copy.
 Graphs without buffered routes omit inactive capture flags, letting replay skip
@@ -30,19 +32,26 @@ EPLB manager and decode graph runner are unchanged from the base.
 | Source and call-chain review | Completed; this is not execution validation. |
 | Formatting and static checks during cleanup | Completed; no functional result is implied. |
 | CPU unit tests and GPU regression after migration refinements | Not run. |
-| NPU graph execution and HCCL weight migration after cleanup | Not run. |
+| NPU full decode graph regression after cleanup | Not run. |
+| HCCL migration with the new staging paths | Passed a 16-rank synthetic migration and reverse migration; full tensor values, original addresses, formats, ND scales, and unchanged local layouts checked. |
 | Full-model correctness, PD acceptance, and performance after cleanup | Not run. |
 
-These copy reductions follow from the implementation; their latency and peak
-memory effects have not been measured. Debug workspace bytes describe logical
-tensor storage and exclude allocator padding and caching. Graph-statistics hooks
+An isolated 30-round paired check on Ascend 910C with torch_npu 2.10.0.post6
+used the observed INT8 shapes `[17,4096,4096]` and `[17,2048,4096]` (408 MiB).
+Median device Event time was 2.083 -> 1.457 ms for load and 3.383 -> 2.201 ms
+for store. These are staging microbenchmark results, not serving throughput.
+Full-size values and destination addresses were checked. A direct preallocated
+format-cast overload was slower at these shapes and was not adopted.
+Debug workspace bytes describe planned logical tensor storage, excluding
+allocator padding/caching and transient format-conversion allocations. Graph-statistics hooks
 are wired to the NPU full decode backend; other graph modes are not validated.
 
 The added unit tests and manual probes have been moved out of this PR and
 remain available in the [historical test tree](https://github.com/AkiYangDev/sglang/tree/46393a1ce8359fc226704702b14a157dfa77c7ee/test).
 Only a one-line fixture adjustment remains in the existing NPU graph-backend
 test: its manually registered graph also receives an empty EPLB state.
-No new test cases are included, and no tests were executed for this cleanup.
+No new test files are included; the copy probes and 16-rank checks ran outside
+the PR. Earlier cleanup steps did not execute their archived tests.
 
 ## Historical evidence
 

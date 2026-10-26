@@ -75,7 +75,8 @@ def prepare_expert_weight_update(
     Validate the entire chunk before allocating workspaces or moving weights.
     The callable loads internal-format weights into ND storage, invokes the
     shared migration algorithm, and writes changed local slots back in place.
-    Workspaces live only for this chunk and are reused across compatible layers.
+    Receive buffers live only for this chunk and are reused across compatible layers.
+    ND staging keeps only the current layer's conversion results.
     """
     from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 
@@ -96,9 +97,11 @@ def prepare_expert_weight_update(
     staging = ExpertWeightStaging(sample)
     group = get_eplb_device_group()
     if logger.isEnabledFor(logging.DEBUG):
-        # Logical tensor bytes exclude allocator padding and cached memory.
+        # Planned logical bytes include lazy staging, not allocator padding/cache.
         workspace_bytes = sum(t.numel() * t.element_size() for t in temp_buffers) + sum(
-            t.numel() * t.element_size() for t in staging.buffers if t is not None
+            t.numel() * t.element_size()
+            for t, needed in zip(sample, staging._needs_staging, strict=True)
+            if needed
         )
         logger.debug(
             "[NPU EPLB] rank=%d layers=%d workspace_logical_bytes=%d",
@@ -181,7 +184,7 @@ def create_temp_buffers(sample_tensors: list[torch.Tensor]) -> list[torch.Tensor
 
 
 class ExpertWeightStaging:
-    """Reuse ND buffers for internal-format tensors in a validated layer chunk.
+    """Keep one layer's ND conversion results in a validated migration chunk.
 
     load() prepares the tensors that the updater mutates; store() copies the
     result into model storage without changing addresses held by captured graphs.
@@ -190,23 +193,31 @@ class ExpertWeightStaging:
 
     def __init__(self, sample_tensors: list[torch.Tensor]):
         # Per-expert NZ conversion can copy the whole backing tensor.
-        self.buffers: list[torch.Tensor | None] = [
-            torch.empty(tensor.shape, dtype=tensor.dtype, device=tensor.device)
-            if needs_nd_staging(tensor)
-            else None
-            for tensor in sample_tensors
-        ]
+        self._needs_staging = [needs_nd_staging(tensor) for tensor in sample_tensors]
+        self.buffers: list[torch.Tensor | None] = []
 
     def load(self, weights: list[torch.Tensor]) -> list[torch.Tensor]:
+        # Keep the conversion result; copy_ would add another ND-to-ND copy.
+        self.buffers.clear()
+        for weight, needed in zip(weights, self._needs_staging, strict=True):
+            self.buffers.append(
+                torch.ops.npu.npu_format_cast(weight, 2) if needed else None
+            )
         return [
-            buffer.copy_(weight) if buffer is not None else weight
+            buffer if buffer is not None else weight
             for buffer, weight in zip(self.buffers, weights, strict=True)
         ]
 
     def store(self, weights: list[torch.Tensor]) -> None:
         for weight, buffer in zip(weights, self.buffers, strict=True):
             if buffer is not None:
-                weight.copy_(buffer)
+                # A same-format copy preserves model storage without first
+                # converting the destination to ND and back.
+                weight.copy_(
+                    torch.ops.npu.npu_format_cast(
+                        buffer, torch.ops.npu.get_npu_format(weight)
+                    )
+                )
 
 
 def isolate_npu_draft_recording(forward):
