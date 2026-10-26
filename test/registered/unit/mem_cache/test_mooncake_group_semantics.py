@@ -7,6 +7,7 @@ import torch
 
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
+    HiCacheStorageExtraInfo,
     PoolName,
     PoolTransfer,
 )
@@ -23,6 +24,12 @@ class ReplicateConfigWithGroupIds:
 
 class ReplicateConfigWithoutGroupIds:
     __slots__ = ()
+
+
+class ReplicateConfigWithSessionIds:
+    def __init__(self):
+        self.group_ids = None
+        self.session_ids = None
 
 
 class ReplicateConfigWithClassGroupIdsAndRequiredInit:
@@ -622,6 +629,51 @@ class TestMooncakeGroupSemantics(CustomTestCase):
             call["args"][0].group_ids,
             ["sglang-hicache:tag_page0", "sglang-hicache:tag_page1"],
         )
+
+    def test_v2_put_attributes_keys_to_the_writing_session(self):
+        store, fake_store = _make_store(
+            enable_group_semantics=False,
+            replicate_config_cls=ReplicateConfigWithSessionIds,
+            is_mla_model=True,
+        )
+        store.register_mem_host_pool_v2(FakeMultiBufferPool(), PoolName.DEEPSEEK_V4_C4)
+
+        result = store.batch_set_v2(
+            [
+                PoolTransfer(
+                    name=PoolName.DEEPSEEK_V4_C4,
+                    keys=["page0", "page1"],
+                    host_indices=torch.tensor([0, 1]),
+                )
+            ],
+            HiCacheStorageExtraInfo(extra_info={"session_id": "session-a"}),
+        )
+
+        self.assertEqual(result[PoolName.DEEPSEEK_V4_C4], [True, True])
+        config = fake_store.batch_put_calls[0]["args"][0]
+        self.assertEqual(config.session_ids, ["session-a", "session-a"])
+
+    def test_v2_put_skips_session_ids_without_mooncake_support(self):
+        store, fake_store = _make_store(
+            enable_group_semantics=False,
+            replicate_config_cls=ReplicateConfigWithGroupIds,
+            is_mla_model=True,
+        )
+        store.register_mem_host_pool_v2(FakeIndexerPool(), PoolName.INDEXER)
+
+        result = store.batch_set_v2(
+            [
+                PoolTransfer(
+                    name=PoolName.INDEXER,
+                    keys=["page0"],
+                    host_indices=torch.tensor([0]),
+                )
+            ],
+            HiCacheStorageExtraInfo(extra_info={"session_id": "session-a"}),
+        )
+
+        self.assertEqual(result[PoolName.INDEXER], [True])
+        self.assertEqual(fake_store.batch_put_calls[0]["args"], ())
 
     def test_v2_multi_buffer_put_passes_group_ids(self):
         store, fake_store = _make_store(extra_backend_tag="tag", is_mla_model=True)
