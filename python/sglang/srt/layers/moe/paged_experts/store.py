@@ -43,24 +43,24 @@ class HostExpertStore:
             paged_experts_host_device_pointer,
         )
 
-        hosts, gpus, words = [], [], []
+        hosts, gpus, sizes = [], [], []
         for name, host in self.host.items():
             gpu = getattr(layer, name).data
             row_bytes = host[0].numel() * host.element_size()
             if row_bytes == 0:
                 continue  # e.g. GPTQ without act-order keeps empty g_idx tensors
-            if not (self.pin and gpu.is_contiguous() and row_bytes % 4 == 0):
+            if not (self.pin and gpu.is_contiguous() and row_bytes % 2 == 0):
                 raise RuntimeError(
-                    f"Paged experts: CUDA graphs need pinned, contiguous expert rows of whole "
-                    f"4-byte words; {name} has {row_bytes} bytes per expert, "
+                    f"Paged experts: CUDA graphs need pinned, contiguous expert rows of an "
+                    f"even size; {name} has {row_bytes} bytes per expert, "
                     f"pinned={host.is_pinned()}, contiguous={gpu.is_contiguous()}"
                 )
             hosts.append(paged_experts_host_device_pointer(host))
             gpus.append(gpu.data_ptr())
-            words.append(row_bytes // 4)
+            sizes.append(row_bytes)
         self._gather_args = [
             torch.tensor(v, dtype=torch.int64, device=gpu.device)
-            for v in (hosts, gpus, words)
+            for v in (hosts, gpus, sizes)
         ]
 
     def gather(self, src: torch.Tensor, dst: torch.Tensor, count: torch.Tensor) -> None:

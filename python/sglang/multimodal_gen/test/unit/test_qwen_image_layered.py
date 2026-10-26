@@ -1,11 +1,14 @@
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 import torch
 
+from sglang.multimodal_gen.configs.pipeline_configs import qwen_image as qwen_config
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
+    QwenImageEditPlusPipelineConfig,
     QwenImageLayeredPipelineConfig,
     QwenImagePipelineConfig,
 )
@@ -22,8 +25,14 @@ from sglang.multimodal_gen.runtime.entrypoints.diffusion_generator import DiffGe
 from sglang.multimodal_gen.runtime.entrypoints.utils import map_request_outputs
 from sglang.multimodal_gen.runtime.managers import gpu_worker
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
+from sglang.multimodal_gen.runtime.models.dits.qwen_image import (
+    _qwen_modulation_cache_key,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import DenoisingStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages import (
+    qwen_image_layered,
+)
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -266,6 +275,96 @@ class TestLayeredCFGOrder(CustomTestCase):
                 self.assertEqual(reduce.call_count, int(not same_order))
                 expected = neg + 7.0 * (pos - neg) if same_order else pos
                 self.assertTrue(torch.equal(result, expected))
+
+
+class TestQwenImageRequestConstants(unittest.TestCase):
+    def test_cfg_branches_share_additional_t_cond(self):
+        """Both branches pass one zero tensor, so the negative forward reuses
+        the positive forward's modulation instead of recomputing it per block."""
+        config = QwenImageLayeredPipelineConfig()
+        prompt = [torch.zeros(1, 5, 8)]
+        batch = Req(
+            sampling_params=SamplingParams(prompt="test"),
+            latents=torch.zeros(1, 4, 8),
+            height=32,
+            width=32,
+            prompt_embeds=prompt,
+            negative_prompt_embeds=prompt,
+        )
+        batch.img_shapes = [[(1, 1, 1), (1, 1, 1)]]
+        freqs = (torch.zeros(2, 4), torch.zeros(5, 4))
+        with (
+            patch.object(
+                QwenImageEditPlusPipelineConfig,
+                "get_freqs_cis",
+                return_value=(freqs, freqs),
+            ),
+            patch.object(qwen_config, "shard_rotary_emb_for_sp", lambda x: x),
+        ):
+            pos = config.prepare_pos_cond_kwargs(batch, "cpu", None, torch.bfloat16)
+            neg = config.prepare_neg_cond_kwargs(batch, "cpu", None, torch.bfloat16)
+
+        self.assertIs(pos["additional_t_cond"], neg["additional_t_cond"])
+        torch.testing.assert_close(
+            pos["additional_t_cond"], torch.tensor([0]), atol=0, rtol=0
+        )
+        timestep, hidden_states = torch.ones(1), torch.zeros(1, 4, 8)
+        with torch.no_grad():
+            pos_key, neg_key = (
+                _qwen_modulation_cache_key(
+                    timestep, kwargs["additional_t_cond"], hidden_states
+                )
+                for kwargs in (pos, neg)
+            )
+        self.assertTrue(pos_key.matches(neg_key))
+
+    def test_vae_latent_stats_are_uploaded_once(self):
+        """Edit encode and decode normalize with one upload per (device, dtype):
+        a per-request upload stalls the host on the VAE encode it follows."""
+        config = QwenImagePipelineConfig()
+        ac = config.vae_config.arch_config
+        # loaded from the checkpoint's VAE config
+        ac.latents_mean = [0.25 * i - 2.0 for i in range(ac.z_dim)]
+        ac.latents_std = [0.5 + 0.125 * i for i in range(ac.z_dim)]
+        device = torch.device("cpu")
+        first = config.get_decode_scale_and_shift(device, torch.bfloat16, None)
+        second = config.get_decode_scale_and_shift(device, torch.bfloat16, None)
+        std = torch.tensor(ac.latents_std).view(1, ac.z_dim, 1, 1, 1)
+        mean = torch.tensor(ac.latents_mean).view(1, ac.z_dim, 1, 1, 1)
+        torch.testing.assert_close(
+            first[0], 1.0 / std.to(torch.bfloat16), atol=0, rtol=0
+        )
+        torch.testing.assert_close(first[1], mean.to(torch.bfloat16), atol=0, rtol=0)
+        self.assertIs(first[0], second[0])
+        self.assertIs(first[1], second[1])
+
+    def test_condition_latents_reuse_uploaded_latent_stats(self):
+        stage = object.__new__(qwen_image_layered.QwenImageLayeredBeforeDenoisingStage)
+        stage.latent_channels = 4
+        stage.latent_stats = {}
+        stage.vae = Mock()
+        stage.vae.config.latents_mean = [0.1, -0.2, 0.3, -0.4]
+        stage.vae.config.latents_std = [1.5, 2.5, 0.5, 3.0]
+        stage.use_declared_component = Mock(return_value=nullcontext(stage.vae))
+        latent = torch.randn(
+            1, 4, 1, 2, 2, generator=torch.Generator().manual_seed(0)
+        ).bfloat16()
+        mean = torch.tensor(stage.vae.config.latents_mean).view(1, 4, 1, 1, 1)
+        std = torch.tensor(stage.vae.config.latents_std).view(1, 4, 1, 1, 1)
+        expected = (latent - mean.bfloat16()) / std.bfloat16()
+        stats = []
+        with (
+            patch.object(qwen_image_layered, "retrieve_latents", return_value=latent),
+            patch.object(
+                qwen_image_layered, "align_tensor_to_module_dtype", lambda x, _: x
+            ),
+        ):
+            for _ in range(2):
+                actual = stage._encode_vae_image(torch.zeros(1, 3, 1, 4, 4), None)
+                torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+                stats.append(stage.latent_stats[(latent.dtype, latent.device)])
+        # the second request normalizes with the first request's device tensors
+        self.assertIs(stats[0], stats[1])
 
 
 if __name__ == "__main__":
