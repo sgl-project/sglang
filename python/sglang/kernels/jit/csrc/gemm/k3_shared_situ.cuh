@@ -1,7 +1,7 @@
 // BS1 K3 shared gate/up projection with a SiTU epilogue.
 #pragma once
-#include "tiny_gemm.cuh"
 #include "../kimi_k3/situ_and_mul.cuh"
+#include "tiny_gemm.cuh"
 
 namespace sglang {
 
