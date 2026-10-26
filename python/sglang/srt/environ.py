@@ -810,6 +810,7 @@ class Envs:
     SGLANG_EXA_SEARCH_TYPE = EnvStr("auto")
     SGLANG_EXA_INCLUDE_HIGHLIGHTS = EnvBool(True)
     SGLANG_TOOL_STRICT_LEVEL = EnvInt(ToolStrictLevel.OFF)
+    SGLANG_ENABLE_RESPONSE_TEMPLATE_TURN_GRAMMAR = EnvBool(True)
 
     # ===================================================================
     # HiCache storage backends and mmap allocation
@@ -1003,6 +1004,9 @@ class Envs:
     # not compatible with runtime weight updates or EPLB expert rearrangement,
     # both of which assume the checkpoint's halves layout.
     SGLANG_OPT_FUSE_SWIGLU_INTERLEAVED = EnvBool(False)
+    # Opt in to Beam's SM103 BF16 TP4/EP1 single-token MoE GEMV.
+    # Requires SGLANG_OPT_FUSE_SWIGLU_INTERLEAVED.
+    SGLANG_OPT_BEAM_DECODE_GEMV = EnvBool(False)
     # Fuse the `residual_add + RMSNorm + zero-pad` triplet that appears
     # before the MoE block for models whose MoE input hidden_size must be
     # padded up to a stride (e.g. GPT-OSS MXFP4 needs pad to multiple of

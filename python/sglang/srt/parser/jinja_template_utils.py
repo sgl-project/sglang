@@ -180,6 +180,38 @@ def jinja_template_may_reorder_tool_results(chat_template: str) -> bool:
     return False
 
 
+def jinja_template_reads_reasoning_content(chat_template: str) -> bool:
+    if not isinstance(chat_template, str):
+        return False
+
+    jinja_ast = _try_extract_ast(chat_template)
+    if jinja_ast is None:
+        return False
+
+    def is_reasoning_content(node: jinja2.nodes.Node) -> bool:
+        return (
+            isinstance(node, jinja2.nodes.Const) and node.value == "reasoning_content"
+        )
+
+    return (
+        any(
+            node.attr == "reasoning_content"
+            for node in jinja_ast.find_all(jinja2.nodes.Getattr)
+        )
+        or any(
+            is_reasoning_content(node.arg)
+            for node in jinja_ast.find_all(jinja2.nodes.Getitem)
+        )
+        or any(
+            isinstance(call.node, jinja2.nodes.Getattr)
+            and call.node.attr == "get"
+            and call.args
+            and is_reasoning_content(call.args[0])
+            for call in jinja_ast.find_all(jinja2.nodes.Call)
+        )
+    )
+
+
 def process_content_for_template_format(
     msg_dict: dict,
     content_format: str,
