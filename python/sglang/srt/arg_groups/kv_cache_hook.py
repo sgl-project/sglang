@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Optional
+from typing import Any
 
 from sglang.srt.arg_groups.overrides import (
     attention_backends_of,
@@ -474,55 +474,13 @@ def handle_cache_compatibility(server_args: Any) -> None:
             )
 
 
-# Backends whose speculative verify id rails are translation-audited for
-# the unified pool.
-_SPEC_VERIFY_AUDITED_BACKENDS = frozenset(
-    {
-        "triton",
-        "trtllm_mla",
-        "cutedsl_mla",
-        "flashmla",
-        "flashinfer",
-        "fa3",
-    }
-)
-
-_SPEC_MHA_AUDITED_BACKENDS = frozenset({"triton", "flashinfer", "fa3", "trtllm_mha"})
-
 # The MHA backends that read through the KV-index translator on every path a
 # draft forward takes. A fused draft region holds dense K/V rows, so a fused
-# draft runs only on these.
-# FA4 carries translated draft ids, but speculative admission is audited
-# per algorithm below; currently only DSPARK is validated with FA4.
-TRANSLATED_MHA_RAILS = _SPEC_MHA_AUDITED_BACKENDS | {"fa4"}
-
-
-def _assert_spec_verify_backends(
-    server_args: Any, *, algorithm: str, allowed: Optional[frozenset] = None
-) -> None:
-    """Refuse target backends whose verify id rails are not translation-audited.
-
-    Only the target's prefill/decode pair is checked here: fusion declines for
-    a draft off the translated rails, and a private-pool draft indexes its own
-    pool by virtual id."""
-    if allowed is None:
-        allowed = _SPEC_VERIFY_AUDITED_BACKENDS
-    dcp_note = ""
-    if resolving_view(server_args).dcp_size > 1:
-        # flashinfer's spec verify gathers its CSR args with no DCP read
-        # translation (`translate_dcp_read_ids`); the MLA verify family builds
-        # its DCP block table itself.
-        allowed = allowed - {"flashinfer"}
-        dcp_note = " (flashinfer is excluded under --dcp-size > 1)"
-    backends = set(attention_backends_of(resolved_view(server_args)))
-    backends.discard(None)
-    assert backends <= allowed, (
-        f"--enable-unified-memory + {algorithm} requires spec-verify-audited "
-        f"attention backends {sorted(allowed)}{dcp_note} for both prefill "
-        f"and decode; got {sorted(backends)}. Other backends do "
-        "not translate speculative verify indices to the unified "
-        "pool's physical ids yet."
-    )
+# draft runs only on these. FA4 carries translated draft ids; of the fused
+# drafts only DSPARK's is validated on it.
+TRANSLATED_MHA_RAILS = frozenset({"triton", "flashinfer", "fa3", "trtllm_mha", "fa4"})
+# The rails a fused EAGLE/EAGLE3 draft is validated on.
+_EAGLE_DRAFT_RAILS = TRANSLATED_MHA_RAILS - {"fa4"}
 
 
 def handle_unified_memory_pool(server_args: Any) -> None:
@@ -612,43 +570,19 @@ def handle_unified_memory_pool(server_args: Any) -> None:
             "target (hybrid-SWA or a mamba hybrid): the draft's KV lives "
             "fused inside the target's sub-pool entries."
         )
-        # The target verifies on its own pages: the MLA family on an MLA host.
-        eagle_allowed = (
-            _SPEC_VERIFY_AUDITED_BACKENDS
-            if use_mla_backend(server_args)
-            else _SPEC_MHA_AUDITED_BACKENDS
-        )
-        eagle_backends = set(attention_backends_of(resolved_view(server_args)))
-        assert (
-            None not in eagle_backends
-            and eagle_backends
-            and eagle_backends <= eagle_allowed
-        ), (
-            "--enable-unified-memory + EAGLE/EAGLE3 requires the target on the "
-            f"spec-verify-audited attention backends {sorted(eagle_allowed)} "
-            f"(got {sorted(eagle_backends, key=str)})."
-        )
         # An unset draft backend inherits the target's pair.
         draft_backend = cfg.speculative_draft_attention_backend
-        draft_backends = {draft_backend} if draft_backend else eagle_backends
-        assert draft_backends <= _SPEC_MHA_AUDITED_BACKENDS, (
+        draft_backends = (
+            {draft_backend}
+            if draft_backend
+            else set(attention_backends_of(resolved_view(server_args)))
+        )
+        assert draft_backends <= _EAGLE_DRAFT_RAILS, (
             "--enable-unified-memory + EAGLE/EAGLE3 runs the draft on "
-            f"{sorted(draft_backends)}, but a fused draft is MHA-shaped and "
-            "reads its KV through the translated MHA rails "
-            f"{sorted(_SPEC_MHA_AUDITED_BACKENDS)}. "
+            f"{sorted(draft_backends, key=str)}, but a fused draft is MHA-shaped "
+            "and reads its KV through the translated MHA rails "
+            f"{sorted(_EAGLE_DRAFT_RAILS)}. "
             "Set --speculative-draft-attention-backend to one of them."
-        )
-    if cfg.speculative_algorithm == "DSPARK":
-        _assert_spec_verify_backends(
-            server_args,
-            algorithm="DSPARK",
-            allowed=_SPEC_VERIFY_AUDITED_BACKENDS | {"fa4"},
-        )
-    if cfg.speculative_algorithm == "DFLASH":
-        _assert_spec_verify_backends(
-            server_args,
-            algorithm="DFLASH",
-            allowed=_SPEC_MHA_AUDITED_BACKENDS,
         )
     assert not cfg.enable_two_batch_overlap, (
         "--enable-unified-memory does not support --enable-two-batch-overlap: "
@@ -758,6 +692,17 @@ def _validate_unified_memory_dcp(server_args: Any) -> None:
         "backends build their block table from raw (widened) req_to_token "
         "page ids and do not translate them through the unified pool's "
         "virtual->physical page table."
+    )
+    # flashinfer's speculative verify gathers its read ids without the DCP
+    # collapse (`translate_dcp_read_ids`); the MLA verify family builds its DCP
+    # block table itself.
+    assert not (
+        cfg.speculative_algorithm in ("DSPARK", "DFLASH") and "flashinfer" in backends
+    ), (
+        "--enable-unified-memory with decode context parallelism "
+        f"(--dcp-size > 1) and {cfg.speculative_algorithm} does not support "
+        "flashinfer: its speculative verify reads DCP-widened ids. Use "
+        "trtllm_mla or cutedsl_mla."
     )
 
 
