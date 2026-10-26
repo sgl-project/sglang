@@ -177,7 +177,7 @@ export const agentx = {
   },
   "args": [
    ["--enable-unified-cache-external-linker"],
-   ["--hicache-storage-backend-extra-config", "{\"enable_group_semantics\":true}"],
+   ["--unified-cache-external-linker-config", "{\"enable_group_semantics\":true}"],
    ["--unified-cache-external-linker-backend", "mooncake"]
   ],
   "env": {
@@ -1847,7 +1847,7 @@ export const agentx = {
         ["--enable-dp-lm-head"],
         ["--enable-unified-cache-external-linker"],
         ["--ep-size", "8"],
-        ["--hicache-storage-backend-extra-config", "{\"enable_group_semantics\":true}"],
+        ["--unified-cache-external-linker-config", "{\"enable_group_semantics\":true}"],
         ["--load-balance-method", "total_tokens"],
         ["--max-running-requests", "256"],
         ["--mem-fraction-static", "0.85"],

@@ -95,6 +95,7 @@ class TestHealthWarmupGate(unittest.IsolatedAsyncioTestCase):
             args = SimpleNamespace(
                 enable_metrics=False,
                 warmup_mode="off",
+                progress_endpoint=None,
                 broker_port=port,
                 prompt_enhancer_config=None,
                 log_requests=False,
