@@ -73,6 +73,10 @@ def test_update_weights_from_tensor(tp_size):
     )
 
 
+# Helper, not a case: pytest collects it by name and then wants a tp_size fixture.
+test_update_weights_from_tensor.__test__ = False
+
+
 class TestUpdateWeightsFromTensor(CustomTestCase):
     def test_update_weights_from_tensor(self):
         tp_sizes = [1, 2]

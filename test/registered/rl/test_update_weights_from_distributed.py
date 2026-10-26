@@ -733,6 +733,10 @@ def test_update_weights_from_distributed(
     get_device_module().empty_cache()
 
 
+# Helper, not a case: pytest collects it by name and then wants a tp_size fixture.
+test_update_weights_from_distributed.__test__ = False
+
+
 class TestUpdateWeightsFromDistributed(CustomTestCase):
     def test_update_weights_from_distributed(self):
 
