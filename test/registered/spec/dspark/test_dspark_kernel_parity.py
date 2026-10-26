@@ -130,14 +130,17 @@ def _case_accept_greedy_target_predict(tc):
     target_logits = torch.randn(bs * t, 200, device=DEVICE)
     predict = torch.argmax(target_logits, dim=-1)
     for cutoff in (None, _ri(1, t + 1, (bs,), torch.int32)):
-        for impl in ("torch", "triton"):
-            ref = getattr(dspark_accept.AcceptGreedy, impl)(
+        for impl in (
+            dspark_accept.AcceptGreedy.torch,
+            dspark_accept.AcceptGreedy.triton,
+        ):
+            ref = impl(
                 candidates=candidates,
                 target_logits=target_logits,
                 verify_num_draft_tokens=t,
                 cutoff_verify_lens=cutoff,
             )
-            got = getattr(dspark_accept.AcceptGreedy, impl)(
+            got = impl(
                 candidates=candidates,
                 target_logits=None,
                 verify_num_draft_tokens=t,
@@ -487,19 +490,18 @@ def _case_markov_step_bias(tc):
     # One kernel for the w1 gather and the w2 GEMV: within bf16 rounding of the
     # embedding + F.linear pair, for row counts across its row blocks, a vocab
     # with a ragged last tile, and a [bs, gamma] token block keeping its shape.
+    from sglang.kernels.ops.speculative.dspark.dspark_gfx950 import MarkovStepBias
+
     g = torch.Generator(device=DEVICE).manual_seed(21)
     vocab, rank = 5003, 256
     w1 = (torch.randn(vocab, rank, device=DEVICE, generator=g) * 0.5).to(torch.bfloat16)
     w2 = (torch.randn(vocab, rank, device=DEVICE, generator=g) * 0.02).to(
         torch.bfloat16
     )
-    from sglang.kernels.ops.speculative.dspark.dspark_gfx950 import MarkovStepBias
-
-    cls = MarkovStepBias
     for shape in ((1,), (5,), (48,), (130,), (3, 7)):
         tokens = _ri(0, vocab, shape, g=g)
-        got = cls.triton(token_ids=tokens, w1_weight=w1, w2_weight=w2)
-        ref = cls.torch(token_ids=tokens, w1_weight=w1, w2_weight=w2)
+        got = MarkovStepBias.triton(token_ids=tokens, w1_weight=w1, w2_weight=w2)
+        ref = MarkovStepBias.torch(token_ids=tokens, w1_weight=w1, w2_weight=w2)
         tc.assertEqual(got.shape, (*shape, vocab))
         exact = (w1[tokens].double() @ w2.double().t()).to(torch.bfloat16)
         for other in (ref, exact):
