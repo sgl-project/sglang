@@ -1360,6 +1360,28 @@ _MUSE_SPARK_TGV_M_RANGES = {
 }
 
 
+# Kimi-K3 (NVFP4 checkpoint, TP8) decode bf16 GEMMs and its DFLASH draft: TGV
+# M ranges from a dense M sweep (1..64, then every 8 to 384) on B300 under CUDA
+# graph with cold weights. TGV is within 2% of cuBLAS (and of the tiny GEMM)
+# over the whole range and >=3% faster on average; other M use cuBLAS.
+_K3_TGV_M_RANGES = {
+    (6016, 7168): (1, 104),  # merged MoE front (router | latent down | shared gate_up)
+    (7168, 3584): (1, 128),  # MoE latent up
+    (3584, 7168): (1, 136),  # MoE latent down (unfused fallback)
+    (7168, 768): (1, 128),  # shared down
+    (1536, 7168): (1, 384),  # shared gate_up (unfused fallback)
+    (896, 7168): (16, 320),  # router gate; the tiny GEMM covers M <= 8
+    (144, 7168): (200, 384),  # KDA [f_a | b]; the tiny GEMM covers M <= 36
+    (1536, 128): (2, 80),  # KDA f_b
+    (768, 7168): (25, 384),  # DFLASH draft
+    (7168, 512): (1, 128),  # DFLASH draft
+    (7168, 1792): (1, 120),  # DFLASH draft MLP down
+    (7168, 4224): (1, 128),  # DFLASH draft
+    (8448, 7168): (1, 128),  # DFLASH draft
+    (7168, 43008): (1, 128),  # DFLASH draft target-hidden fc
+}
+
+
 def use_cutedsl_bf16_gemm(m: int, n: int, k: int) -> bool:
     """TGV-vs-cuBLAS (``F.linear``) decision, CUPTI-measured on B300 under CUDA
     graph capture (cold L2). Conservative: ties and unmeasured regions fall
@@ -1371,7 +1393,7 @@ def use_cutedsl_bf16_gemm(m: int, n: int, k: int) -> bool:
         return False
     if k % 8 != 0:  # TMA requires 16B-aligned rows
         return False
-    m_range = _MUSE_SPARK_TGV_M_RANGES.get((n, k))
+    m_range = _MUSE_SPARK_TGV_M_RANGES.get((n, k)) or _K3_TGV_M_RANGES.get((n, k))
     if m_range is not None:
         return m_range[0] <= m <= m_range[1]
     if m <= 8 and (n, k) in _K3_TGV_WIN_SHAPES:

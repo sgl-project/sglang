@@ -9,12 +9,13 @@ if TYPE_CHECKING:
 
 _is_npu = is_npu()
 
-# (n, k) -> the largest num_tokens where the tiny GEMM still beats cuBLAS.
+# (n, k) -> the largest num_tokens where the tiny GEMM still beats cuBLAS and
+# TGV (dense M sweep on B300, CUDA graph, cold weights).
 # Doubles as the compile-time max_m: one kernel is built per m up to it.
 _K3_TINY_GEMM_MAX_TOKENS = {
-    (144, 7168): 16,
+    (144, 7168): 36,
     (896, 7168): 8,
-    (1536, 128): 12,
+    (1536, 128): 1,
 }
 
 
@@ -31,4 +32,12 @@ def kimi_k3_tiny_gemm(
     max_num_tokens = _K3_TINY_GEMM_MAX_TOKENS.get((n, k))
     if not _is_npu and max_num_tokens is not None and 0 < m <= max_num_tokens:
         return tiny_gemm_bf16(x, w, max_m=max_num_tokens)
+    if not _is_npu:
+        from sglang.srt.layers.quantization.unquant import get_bf16_gemm_backend
+
+        if get_bf16_gemm_backend().is_cutedsl():
+            from .cutedsl_bf16_gemm import cutedsl_bf16_gemm, use_cutedsl_bf16_gemm
+
+            if use_cutedsl_bf16_gemm(m, n, k):
+                return cutedsl_bf16_gemm(x, w)
     return torch.nn.functional.linear(x, w)
