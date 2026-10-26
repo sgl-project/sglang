@@ -109,7 +109,7 @@ from sglang.srt.rocm_muse_spark.sequence_parallel import (
     ulysses_enabled,
     ulysses_prepared,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_context, get_exec, get_parallel
 from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
@@ -1733,9 +1733,23 @@ def _prepare_prefill_fp8_projections(moe: MuseSpark1xMoE) -> None:
         )
 
 
+def _monokernel_backend() -> str | None:
+    if not get_context().is_config_namespace_published("exec"):
+        return None
+    return get_exec().kernel.monokernel_backend
+
+
 def _a4w4_keeps_native(experts: list) -> bool:
-    """Whether every MoE layer can hold the a4w4 copy beside the stored weights above the reserve on every TP rank;
-    otherwise each layer keeps only the preshuffled copy (TP4: about 103 GB per rank for the second copy)."""
+    """Whether the MoE layers keep the stored MXFP4 layout beside the a4w4 preshuffled copy. Compact A4 and a4w4
+    both read the preshuffled copy, so the stored one stays only for a monokernel backend (its expert kernels read
+    the stored layout) and only when it fits above the reserve on every TP rank. Dropping it frees the second copy
+    for the KV pool (TP8: about 52 GB per rank, TP4: about 103 GB)."""
+    if _monokernel_backend() is None:
+        logger.info(
+            "Muse MXFP4 experts: a4w4 preshuffled copy only (%d layers, no monokernel backend)",
+            len(experts),
+        )
+        return False
     free, _ = torch.cuda.mem_get_info()
     free += torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
     first = experts[0]
