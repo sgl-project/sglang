@@ -1335,11 +1335,11 @@ class Engram(nn.Module):
         hash_ids: torch.Tensor,
         forward_batch: Optional[ForwardBatch] = None,
         *,
-        input_ids: torch.Tensor,
+        input_ids: Optional[torch.Tensor] = None,
         cp_all_tokens: bool = False,
     ) -> torch.Tensor:
         """x [T, hc_mult, dim]; hash_ids [T, n_hash_cols] and input_ids [T] for this
-        layer."""
+        layer. Without input_ids, image rows are gated too: the caller keeps them."""
         # The lookup runs first even for an idle DP-attention batch: under DP
         # attention it is a collective every rank has to join.
         if (
