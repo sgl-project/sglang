@@ -88,8 +88,15 @@ class KvPoolView:
     """The running forward's KV pool, under the pool's own names: its layout and
     per-layer key buffers (a pool offers the ones of its kind)."""
 
-    def __init__(self, pool: Any):
+    def __init__(self, pool: Any, seal_cache: Optional[Callable] = None):
         self.pool = pool
+        self._seal_cache = seal_cache
+
+    def get_key_buffer(self, layer_id: int) -> torch.Tensor:
+        value = self.pool.get_key_buffer(layer_id)
+        if self._seal_cache is not None:
+            self._seal_cache(layer_id, value)
+        return value
 
     @property
     def uniform_fp8(self) -> bool:
@@ -126,10 +133,14 @@ class ForwardView:
     """The running forward's attention data, read from its attention backend; built
     at capture for a graph step, so its tensors are the ones the graph replays."""
 
-    def __init__(self, backend: Any):
+    def __init__(self, backend: Any, seal_cache: Optional[Callable] = None):
         self._backend = backend
         self.metadata = backend.forward_metadata
-        self.kv_pool = KvPoolView(backend.token_to_kv_pool)
+        self.kv_pool = KvPoolView(backend.token_to_kv_pool, seal_cache)
+
+    @property
+    def use_fused_topk(self) -> bool:
+        return bool(getattr(self._backend, "use_fused_topk", False))
 
     @property
     def trtllm_attn(self) -> bool:
@@ -164,12 +175,13 @@ class MegakernelBinding:
     def __init__(self, *, model: torch.nn.Module):
         self._model = model
         self._sealed: dict[str, tuple] = {}
+        self._cache_sources: dict[int, tuple] = {}
 
     def forward_view(self) -> ForwardView:
         """The view of the forward running now (a target step or a draft step)."""
         from sglang.srt.model_executor.forward_context import get_attn_backend
 
-        view = ForwardView(get_attn_backend())
+        view = ForwardView(get_attn_backend(), self._seal_cache)
         self._seal("kv_pool", view.kv_pool.pool)
         return view
 
@@ -193,6 +205,22 @@ class MegakernelBinding:
                     f"megakernel binding: {name} was reallocated after its first read"
                 )
 
+        for layer_id, identity in self._cache_sources.items():
+            value = self._current_pool().get_key_buffer(layer_id)
+            if _identity(value) != identity:
+                raise RuntimeError(
+                    f"megakernel binding: kv_cache[{layer_id}] was reallocated "
+                    "after its first read"
+                )
+
+    def _seal_cache(self, layer_id: int, value: torch.Tensor) -> None:
+        identity = _identity(value)
+        if self._cache_sources.setdefault(layer_id, identity) != identity:
+            raise RuntimeError(
+                f"megakernel binding: kv_cache[{layer_id}] was reallocated "
+                "after its first read"
+            )
+
     def _seal(self, name: str, value: Any) -> None:
         self._sealed.setdefault(name, _identity(value))
 
@@ -209,7 +237,7 @@ class MegakernelBinding:
 
 def _identity(value: Any) -> tuple:
     if isinstance(value, torch.Tensor):
-        return (value.data_ptr(), tuple(value.shape), value.dtype)
+        return (value.data_ptr(), tuple(value.shape), value.dtype, value.stride())
     return (id(value),)
 
 
