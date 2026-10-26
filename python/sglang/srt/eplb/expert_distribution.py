@@ -147,6 +147,12 @@ class ExpertDistributionRecorder(ABC):
             )
             "reason is that you are using a model that does not support expert distribution"
             "recording. Try setting `get_model_config_for_expert_location` in your model."
+            if get_device_namespace().device == "npu":
+                from sglang.srt.hardware_backend.npu.eplb_statistics import (
+                    NpuExpertDistributionRecorder,
+                )
+
+                return NpuExpertDistributionRecorder(expert_location_metadata, rank)
             return _ExpertDistributionRecorderReal(expert_location_metadata, rank)
         else:
             return _ExpertDistributionRecorderNoop()
@@ -245,10 +251,6 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
 
     @contextmanager
     def with_forward_pass(self, forward_pass_id: int, forward_batch: ForwardBatch):
-        # Draft forwards share this recorder but must not reset target counts.
-        if self._disable_all:
-            yield {}
-            return
         outputs = {}
         with self._current_forward_pass_id.with_value(forward_pass_id):
             self._on_forward_pass_start(forward_batch)
@@ -291,7 +293,7 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         self._on_hook("on_select_experts", topk_ids=topk_ids)
 
     def get_current_pass_count_buffer(self, layer_idx: int):
-        if self._disable_all or not self._recording or not self._record_current_pass:
+        if not self._recording or not self._record_current_pass:
             return None
         gatherer = self._single_pass_gatherers.get(_SINGLE_PASS_GATHERER_KEY_PRIMARY)
         if not isinstance(gatherer, _SelectExpertsSinglePassGatherer):

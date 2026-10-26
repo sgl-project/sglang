@@ -9,6 +9,9 @@ import torch
 
 from sglang.srt.eplb import expert_distribution as distribution
 from sglang.srt.hardware_backend.npu import eplb as npu_eplb
+from sglang.srt.hardware_backend.npu.eplb_statistics import (
+    NpuExpertDistributionRecorder,
+)
 from sglang.srt.runtime_context import publish
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -37,7 +40,8 @@ class TestDraftDistributionIsolation(unittest.TestCase):
         )
         npu_policy_patch.start()
         self.addCleanup(npu_policy_patch.stop)
-        self.recorder = distribution.ExpertDistributionRecorder.init_new(
+        # Use the NPU lifecycle with CPU tensors and the upstream test gatherer.
+        self.recorder = NpuExpertDistributionRecorder(
             SimpleNamespace(
                 num_layers=2, num_physical_experts=8, num_local_physical_experts=4
             ),

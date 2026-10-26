@@ -9,6 +9,7 @@ import torch
 from sglang.srt.eplb import expert_distribution as distribution
 from sglang.srt.hardware_backend.npu.eplb_statistics import (
     NpuExpertDistributionGatherer,
+    NpuExpertDistributionRecorder,
 )
 from sglang.srt.runtime_context import publish
 from sglang.srt.server_args import ServerArgs
@@ -52,6 +53,7 @@ class TestNpuExpertDistribution(unittest.TestCase):
 
     def recorder(self):
         result = distribution.ExpertDistributionRecorder.init_new(self.metadata, rank=1)
+        self.assertIs(type(result), NpuExpertDistributionRecorder)
         result.start_record()
         return result
 

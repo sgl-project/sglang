@@ -16,12 +16,27 @@
 
 import logging
 import os
+from contextlib import contextmanager
 
 import torch
 
 from sglang.srt.eplb import expert_distribution as distribution
 
 logger = logging.getLogger(__name__)
+
+
+class NpuExpertDistributionRecorder(distribution._ExpertDistributionRecorderReal):
+    """Reuse upstream recording while isolating NPU draft forward lifecycles."""
+
+    @contextmanager
+    def with_forward_pass(self, forward_pass_id, forward_batch):
+        # Draft runners share target statistics. Disabling hooks alone still
+        # lets the base lifecycle reset counts and append an empty draft pass.
+        if self._disable_all:
+            yield {}
+            return
+        with super().with_forward_pass(forward_pass_id, forward_batch) as outputs:
+            yield outputs
 
 
 class NpuExpertDistributionGatherer(distribution._SelectExpertsSinglePassGatherer):

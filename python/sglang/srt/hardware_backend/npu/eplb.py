@@ -146,7 +146,7 @@ def isolate_npu_draft_recording(forward):
 
     @wraps(forward)
     def wrapped(runner, *args, **kwargs):
-        if runner.is_draft_worker and get_device().device == "npu":
+        if get_device().device == "npu" and runner.is_draft_worker:
             from sglang.srt.eplb.expert_distribution import (
                 get_global_expert_distribution_recorder,
             )
