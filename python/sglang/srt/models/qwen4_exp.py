@@ -79,6 +79,9 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
     eager_on_graph,
     is_in_breakable_cuda_graph,
 )
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
+    _current_capture_var,
+)
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     get_tc_piecewise_forward_context,
 )
@@ -127,8 +130,8 @@ def _ple_table_is_fp8(
 
 @eager_on_graph(True)
 def _breakable_qsa_indexer(layer, hidden_states, positions, output):
-    """Writes the top-k into ``output``, the caller's rows of the layer's bridge;
-    the first run of a row count the bridge does not hold allocates it."""
+    """Writes the top-k into ``output``, the caller's rows of the layer's bridge,
+    or allocates a new bridge when ``output`` is None."""
     # Read the live batch on every replay of this eager break.
     forward_batch = get_tc_piecewise_forward_context().forward_batch
     topk = layer._compute_qsa_topk_indices_eager(
@@ -1836,13 +1839,20 @@ class Qwen4ExpAttentionDecoderLayer(
             output = (
                 bridges[0][:rows] if bridges and bridges[0].shape[0] >= rows else None
             )
+            # A capture records the bridge it is given; the warmup before it
+            # allocates one.
+            assert output is not None or _current_capture_var.get() is None, (
+                "qsa top-k bridge not allocated before capture"
+            )
             _breakable_qsa_indexer(
                 layer=self,
                 hidden_states=hidden_states,
                 positions=positions,
                 output=output,
             )
-            return bridges[0][:rows]
+            if output is None:  # first run: the break allocated the bridge
+                output = bridges[0][:rows]
+            return output
         return self._compute_qsa_topk_indices_eager(
             hidden_states=hidden_states,
             positions=positions,
