@@ -2889,6 +2889,7 @@ def update_sliding_window_buffer(
     token_mapping = (
         token_to_kv_pool.full_to_swa_index_mapping
         if token_to_kv_pool is not None
+        and not translator.is_translating
         and token_to_kv_pool.layer_router.sub_pool(IdSpaceKind.SLIDING_WINDOW)
         is not None
         else None

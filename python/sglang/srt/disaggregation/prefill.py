@@ -334,6 +334,7 @@ class PrefillBootstrapQueue:
             draft_token_to_kv_pool=draft_kv_pool,
             num_draft_entries=num_draft_entries,
             num_hidden_layers=self.scheduler.model_config.num_hidden_layers,
+            storage=storage,
         )
         if not self.is_mla_backend:
             kv_args.kv_head_num = self.token_to_kv_pool.head_num
@@ -1590,8 +1591,13 @@ class SchedulerDisaggregationPrefillMixin:
                 ]
 
             def _swa_payload():
-                kvcache = self.token_to_kv_pool_allocator.get_kvcache()
-                request_window = kvcache.request_window
+                allocator = self.token_to_kv_pool_allocator
+                kvcache = allocator.get_kvcache()
+                # A unified pool (one with transfer storage) keeps its window
+                # in a sub-pool, never in per-request window rows.
+                request_window = (
+                    None if allocator.storage is not None else kvcache.request_window
+                )
                 # Under encoder replay the scheduler is not hybrid SWA and keeps no
                 # window size; the pool holds it.
                 window_size = (

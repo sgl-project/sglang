@@ -25,12 +25,9 @@ class _MambaPool:
 
 class _Allocator:
     def __init__(self, carries_mamba: bool, state):
-        self._kv = type("_KV", (), {"cpu_copy_carries_mamba": carries_mamba})()
+        self.cpu_copy_carries_mamba = carries_mamba
         self.state = state
         self.loaded_kv = None
-
-    def get_kvcache(self):
-        return self._kv
 
     def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
         return "kv"

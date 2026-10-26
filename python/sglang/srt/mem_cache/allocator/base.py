@@ -239,6 +239,12 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     def get_kvcache(self):
         return self._kvcache
 
+    @property
+    def cpu_copy_carries_mamba(self) -> bool:
+        """Whether `get_cpu_copy` carries a request's recurrent state; else the
+        scheduler backs the state up on its own."""
+        return self._kvcache.cpu_copy_carries_mamba
+
     def get_all_free_pages(self):
         # Debug / invariant census; None when the pool has no page free list.
         if self.free_pages is None:

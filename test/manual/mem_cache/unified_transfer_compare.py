@@ -113,6 +113,9 @@ def pd_summary(bundle, total_layers: int) -> dict:
     else:
         kv = pd.get_kv_transfer_buf_infos(pool)
     pd.setup_state_kv_args(kv_args, pool, None, total_layers, **kwargs)
+    layer_id_kwargs = {}
+    if "storage" in inspect.signature(pd.build_kv_layer_ids).parameters:
+        layer_id_kwargs["storage"] = storage
     return {
         "kv": {"ptrs": _rel(kv[0], base), "lens": kv[1], "item_lens": kv[2]},
         "kv_layer_ids": pd.build_kv_layer_ids(
@@ -120,6 +123,7 @@ def pd_summary(bundle, total_layers: int) -> dict:
             draft_token_to_kv_pool=None,
             num_draft_entries=0,
             num_hidden_layers=total_layers,
+            **layer_id_kwargs,
         ),
         "state_types": [t.value for t in kv_args.state_types],
         "state_ptrs": [_rel(p, base) for p in kv_args.state_data_ptrs],
@@ -163,10 +167,17 @@ def _calls(cache, fn, arg):
 
 
 def _view_name(bundle, device_pool):
+    """Named as main's record names them: the owner's view `full_kv_pool`, the
+    window's `swa_kv_pool` (the attributes of main's pool classes)."""
     pool = bundle.token_to_kv_pool
     for name in ("full_kv_pool", "swa_kv_pool"):
         if getattr(pool, name, None) is device_pool:
             return name
+    router = getattr(pool, "layer_router", None)
+    for sub_pool, name in (("full", "full_kv_pool"), ("swa", "swa_kv_pool")):
+        if router is not None and router.sub_pool(sub_pool) is not None:
+            if router.view(sub_pool) is device_pool:
+                return name
     if device_pool is _state_pool(bundle):
         return "state_pool"
     return type(device_pool).__name__

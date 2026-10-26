@@ -8,7 +8,7 @@ import torch
 
 from sglang.kernels.kernel_api_logging import debug_kernel_api
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
+from sglang.srt.mem_cache.kv_loc_plan import IdSpace, IdSpaceKind
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.utils.common import is_npu
 
@@ -44,6 +44,21 @@ def resolve_window_kv_pool(model_runner: ModelRunner) -> Optional[KVCache]:
     if kvcache.layer_router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is not None:
         return kvcache
     return None
+
+
+def resolve_window_id_space(
+    model_runner: ModelRunner, window_pool: Optional[KVCache]
+) -> Optional[IdSpace]:
+    """How ``window_pool``'s window sub-pool names the iteration's slots: by
+    its allocator's tables when the allocator hands out virtual ids for that
+    pool (the unified pool's tables are its allocator's), else as the pool
+    maps them itself."""
+    if window_pool is None:
+        return None
+    allocator = model_runner.token_to_kv_pool_allocator
+    if allocator.hands_out_virtual_ids and allocator.get_kvcache() is window_pool:
+        return allocator.id_spaces().get(IdSpaceKind.SLIDING_WINDOW)
+    return window_pool.id_spaces().get(IdSpaceKind.SLIDING_WINDOW)
 
 
 class SharedReadEnds(Enum):

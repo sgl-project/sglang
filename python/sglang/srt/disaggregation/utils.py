@@ -1118,6 +1118,7 @@ def build_kv_layer_ids(
     draft_token_to_kv_pool,
     num_draft_entries: int,
     num_hidden_layers: int,
+    storage: Optional[KVStorage] = None,
 ) -> List[int]:
     """Global layer id for every entry in ``kv_args.kv_data_ptrs``.
 
@@ -1139,7 +1140,9 @@ def build_kv_layer_ids(
         and token_to_kv_pool.layer_router.wrapped_view() is None
     ):
         return []
-    layer_ids = token_to_kv_pool.get_kv_layer_ids()
+    # A unified pool (``storage``) registers its owner sub-pool as one
+    # whole-envelope entry: no per-layer entries to pair by id.
+    layer_ids = [] if storage is not None else token_to_kv_pool.get_kv_layer_ids()
     if draft_token_to_kv_pool is None:
         return layer_ids
 
