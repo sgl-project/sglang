@@ -157,11 +157,18 @@ pub(super) struct StreamState {
 impl StreamState {
     /// An engine error replaces the reply until the first chunk has been sent.
     pub(super) fn error(&mut self, error: GenerateStreamError) -> Result<Vec<String>, Reply> {
+        let (message, unary_type, event_type, code) = engine_error_parts(error);
         if !self.started {
-            return Err(engine_error_reply(error));
+            // Python's `/generate` streams a scheduler abort as a frame and
+            // sends only 400 error frames, so a 500 is a host's own failure:
+            // `handle_request`'s generic `InternalServerError`.
+            if code == 500 {
+                let message = format!("Internal server error: {message}");
+                return Err(error_reply(&message, "InternalServerError", code));
+            }
+            return Err(error_reply(&message, &unary_type, code));
         }
         self.failed = true;
-        let (message, _, event_type, code) = engine_error_parts(error);
         Ok(vec![stream_error_event(&message, event_type, code)])
     }
 

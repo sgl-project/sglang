@@ -25,7 +25,7 @@ use super::template::RenderedChat;
 use super::{AppState, ChatFormatter};
 use crate::api_server::core::CoreError;
 use crate::api_server::http::native_api::{
-    GenerateItem, RequestState, RequestTiming, drain_unary, generate_requests,
+    GenerateItem, RequestState, RequestTiming, drain_unary_frame, generate_requests,
     generation_event_stream_with,
 };
 use crate::message::config::ServerArgs;
@@ -197,7 +197,8 @@ pub(super) async fn chat(
     if state.server_args.enable_request_header_overrides
         && let Err(error) = apply_header_overrides(&mut generate, headers)
     {
-        return Some(error_response(StatusCode::BAD_REQUEST, &error));
+        // `apply_header_overrides` raises `HTTPException(400)`, typed by its status.
+        return Some(typed_error_response(StatusCode::BAD_REQUEST, "400", &error));
     }
     // Failures before the first frame answer unary even for a stream: Python
     // awaits the first chunk before it starts the stream.
@@ -221,24 +222,15 @@ pub(super) async fn chat(
         let drained = futures::future::try_join_all(calls.into_iter().map(
             |(mut call, request)| async move {
                 let rid = call.public_id().to_owned();
-                match drain_unary(&mut call, &rid, request).await {
-                    (StatusCode::OK, item) => Ok(item),
-                    failed => Err(failed),
-                }
+                drain_unary_frame(&mut call, &rid, request)
+                    .await
+                    .map(|frame| GenerateItem::Frame(Box::new(frame)))
             },
         ))
         .await;
         let items = match drained {
             Ok(items) => items,
-            Err((status, item)) => {
-                let message = match &item {
-                    GenerateItem::Error(failure) => {
-                        failure.error.as_ref().map(|e| e.message.clone())
-                    }
-                    GenerateItem::Frame(_) => None,
-                };
-                return Some(error_response(status, &message.unwrap_or_default()));
-            }
+            Err(error) => return Some(call_error_response(&error)),
         };
         // Every item is a frame: a failed one answered above.
         let output = items
@@ -422,11 +414,31 @@ fn python_error_frame(error: &CoreError, index: Option<u32>) -> String {
 /// `OpenAIServingBase.create_error_response`: a 400 is a `BadRequestError`;
 /// any other status is an `HTTPException`, typed by its status code.
 fn error_response(status: StatusCode, message: &str) -> Response {
-    let code = status.as_u16();
     let err_type = match status {
         StatusCode::BAD_REQUEST => "BadRequestError".to_owned(),
-        _ => code.to_string(),
+        _ => status.as_u16().to_string(),
     };
+    typed_error_response(status, &err_type, message)
+}
+
+/// `handle_request`'s answer to a call that failed before its first frame: a
+/// scheduler abort is the `HTTPException` the tokenizer manager raises, while a
+/// failure of this server's own is Python's generic exception.
+fn call_error_response(error: &CoreError) -> Response {
+    let status = error.http_status();
+    match error {
+        CoreError::RuntimeRejected { .. } => error_response(status, &error.to_string()),
+        _ if status == StatusCode::INTERNAL_SERVER_ERROR => typed_error_response(
+            status,
+            "InternalServerError",
+            &format!("Internal server error: {error}"),
+        ),
+        _ => error_response(status, &error.to_string()),
+    }
+}
+
+fn typed_error_response(status: StatusCode, err_type: &str, message: &str) -> Response {
+    let code = status.as_u16();
     let error = serde_json::json!({
         "object": "error",
         "message": message,
@@ -650,6 +662,8 @@ mod tests {
         assert_eq!(body_json(response).await["id"], "routed");
         let response = post("x-override-priority", "high").await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        // `HTTPException(400)`, typed by its status.
+        assert_eq!(body_json(response).await["type"], "400");
     }
 
     /// A failed choice answers at once, without waiting on an unfinished sibling.
@@ -671,7 +685,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
-    /// A scheduler failure keeps its 500, as Python's `HTTPException` does.
+    /// This server's own failure answers as Python's generic exception does.
     #[tokio::test]
     async fn failed_choice_keeps_its_status() {
         let body = json!({"model": "model", "messages": [{"role": "user", "content": "hi"}]});
@@ -681,15 +695,17 @@ mod tests {
         let value = body_json(response).await;
         assert_eq!(
             (value["type"].as_str(), value["code"].as_u64()),
-            (Some("500"), Some(500))
+            (Some("InternalServerError"), Some(500))
         );
+        let message = value["message"].as_str().unwrap();
         assert!(
-            value["message"].as_str().unwrap().contains("boom"),
+            message.starts_with("Internal server error: ") && message.contains("boom"),
             "{value}"
         );
     }
 
-    /// A streamed failure before the first frame keeps its status too.
+    /// A streamed failure before the first frame keeps its status too, typed
+    /// as Python's generic exception.
     #[tokio::test]
     async fn failed_stream_keeps_its_status() {
         let body = json!({
@@ -700,7 +716,7 @@ mod tests {
         let app = lowered_state(|_| ResponseItem::Error(Error::Internal("boom".into())));
         let response = post_json(app, "/v1/chat/completions", body).await;
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(body_json(response).await["type"], "500");
+        assert_eq!(body_json(response).await["type"], "InternalServerError");
     }
 
     /// A template's detected toggle decides reasoning before the parser's
@@ -794,7 +810,8 @@ mod tests {
         }
     }
 
-    /// A stream's internal failure before its first frame keeps its 500.
+    /// A stream's own failure before its first frame answers as Python's generic
+    /// exception does.
     #[tokio::test]
     async fn streamed_internal_error_keeps_its_status() {
         let app = lowered_state(|_| ResponseItem::Error(Error::Internal("boom".into())));
@@ -805,7 +822,14 @@ mod tests {
         let value = body_json(response).await;
         assert_eq!(
             (value["type"].as_str(), value["code"].as_u64()),
-            (Some("500"), Some(500))
+            (Some("InternalServerError"), Some(500))
+        );
+        assert!(
+            value["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("Internal server error: "),
+            "{value}"
         );
     }
 

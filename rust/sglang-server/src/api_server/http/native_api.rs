@@ -441,8 +441,23 @@ pub(super) enum GenerateItem {
 pub(super) async fn drain_unary(
     call: &mut CoreCall,
     rid_str: &str,
-    mut request: RequestState,
+    request: RequestState,
 ) -> (StatusCode, GenerateItem) {
+    match drain_unary_frame(call, rid_str, request).await {
+        Ok(frame) => (StatusCode::OK, GenerateItem::Frame(Box::new(frame))),
+        Err(error) => (
+            error.http_status(),
+            GenerateItem::Error(error.stream_error(None)),
+        ),
+    }
+}
+
+/// [`drain_unary`]'s terminal frame, or the error that failed the call.
+pub(super) async fn drain_unary_frame(
+    call: &mut CoreCall,
+    rid_str: &str,
+    mut request: RequestState,
+) -> Result<NativeFrame, CoreError> {
     let mut accumulated = CoreOutput::default();
     while let Some(item) = call.recv().await {
         match item {
@@ -454,25 +469,17 @@ pub(super) async fn drain_unary(
                 request.finish(&out);
                 accumulated.append_delta(&out);
                 let e2e_latency = Some(e2e_latency(&request.timing));
-                let frame = request.frame(accumulated.frame(rid_str, None, e2e_latency));
-                return (StatusCode::OK, GenerateItem::Frame(Box::new(frame)));
+                return Ok(request.frame(accumulated.frame(rid_str, None, e2e_latency)));
             }
             CoreEvent::Failed(error) => {
                 request.timing.finish();
-                return (
-                    error.http_status(),
-                    GenerateItem::Error(error.stream_error(None)),
-                );
+                return Err(error);
             }
         }
     }
     // Defensive fallback: CoreCall normally turns premature runtime
     // termination into a terminal Failed event before exposing stream end.
-    let truncated = CoreError::ResponseTruncated;
-    (
-        truncated.http_status(),
-        GenerateItem::Error(truncated.stream_error(None)),
-    )
+    Err(CoreError::ResponseTruncated)
 }
 
 /// Batch `/generate`: submit all sub-requests first (scheduler runs them together),
