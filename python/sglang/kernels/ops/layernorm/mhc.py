@@ -2547,6 +2547,7 @@ def hc_mix_stats_sinkhorn(
         NUM_SLICES=num_slices,
         ITERS=sinkhorn_iters,
         EPS=hc_eps,
+        part_mix_residual_ptr=None,
         num_warps=1,
     )
     return pre, post, comb
@@ -2681,6 +2682,7 @@ def hc_mix_stats_sinkhorn_bf16x3(
         NUM_SLICES=slices,
         ITERS=sinkhorn_iters,
         EPS=hc_eps,
+        part_mix_residual_ptr=None,
         num_warps=1,
     )
     return pre, post, comb
