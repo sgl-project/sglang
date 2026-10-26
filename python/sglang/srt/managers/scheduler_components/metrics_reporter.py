@@ -445,8 +445,13 @@ class SchedulerMetricsReporter:
             for req in batch.decoding_reqs or []:
                 decode_kv.add(req.seqlen)
         elif batch.forward_mode.is_decode():
-            for sl in batch.seq_lens_cpu:
-                decode_kv.add(int(sl))
+            # Sync-free spec-v2 lens leave decode batches without a host mirror.
+            if batch.seq_lens_cpu is None:
+                for req in batch.reqs:
+                    decode_kv.add(req.seqlen)
+            else:
+                for sl in batch.seq_lens_cpu:
+                    decode_kv.add(int(sl))
 
         return ScheduledRequestMetrics(
             num_prefill_requests=num_prefill_requests,

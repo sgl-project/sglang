@@ -770,6 +770,27 @@ class AiterAttnBackend(AttentionBackend):
             and self.head_dim == 64
             and self.num_head == 8 * self.num_kv_head
         )
+        # Read once by Scheduler.init_overlap (decide_needs_cpu_seq_lens). Under
+        # DFLASH a decode step reaches this backend only as TARGET_VERIFY, whose
+        # unified-verify metadata is built from device seq_lens and sized by
+        # max_context_len, so the FutureMap's per-step seq_lens D2H (on HIP a host
+        # Event.synchronize behind the previous step's accept) buys nothing; the
+        # DFLASH worker plans from its host reservation bound (nxt_kv_lens_cpu).
+        # Extend batches keep their scheduler-built host lengths either way.
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        if (
+            self.use_muse_attention_paths
+            and self._use_unified_verify
+            and self.dcp_world_size <= 1
+            and not get_schedule().enable_mixed_chunk
+            and not get_parallel().attn_dp_enabled
+            and SpeculativeAlgorithm.from_string(
+                get_spec().speculative_algorithm
+            ).is_dflash()
+            and get_bool_env_var("SGLANG_AITER_SYNC_FREE_VERIFY_LENS", "1")
+        ):
+            self.needs_cpu_seq_lens = False
         self.muse_reuse_extend_metadata = (
             self.use_muse_attention_paths
             and envs.SGLANG_MUSE_REUSE_EXTEND_METADATA.get()

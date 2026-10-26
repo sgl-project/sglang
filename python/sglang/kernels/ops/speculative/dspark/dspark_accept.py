@@ -17,6 +17,16 @@ from sglang.srt.speculative.dflash_utils import (
 )
 from sglang.srt.utils import is_npu
 
+try:
+    from sglang.kernels.ops.speculative.dspark.dspark_accept_split import (
+        chain_speculative_sampling_split,
+    )
+except ImportError:  # pragma: no cover - a tree without the split kernels
+    chain_speculative_sampling_split = None
+_SPLIT_ACCEPT = chain_speculative_sampling_split is not None and __import__("os").environ.get(
+    "SGLANG_DSPARK_SPLIT_ACCEPT", "1"
+) == "1"
+
 _is_npu = is_npu()
 
 if _is_npu:
@@ -103,7 +113,43 @@ def _accept_sampling_core(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     bs = candidates.shape[0]
     device = candidates.device
-    if not sampling_info.need_top_k_sampling and not sampling_info.need_top_p_sampling:
+    plain = not sampling_info.need_top_k_sampling and not sampling_info.need_top_p_sampling
+    if _SPLIT_ACCEPT and plain and not block_verification and not _is_npu and target_logits.is_cuda:
+        # the vocabulary split over CTAs (one CTA a request walks 202k twice otherwise:
+        # ~340 us a step at any batch size); the softmax is folded in
+        (
+            retrieve_index,
+            _retrieve_next_token,
+            _retrieve_next_sibling,
+            predicts,
+            accept_index,
+            accept_token_num,
+        ) = _get_or_create_chain_verify_buffers(
+            bs=bs,
+            draft_token_num=verify_num_draft_tokens,
+            device=device,
+        )
+        chain_speculative_sampling_split(
+            predicts=predicts,
+            accept_index=accept_index,
+            accept_token_num=accept_token_num,
+            candidates=candidates,
+            retrive_index=retrieve_index,
+            uniform_samples=torch.rand((bs, gamma), dtype=torch.float32, device=device),
+            uniform_samples_for_final_sampling=torch.rand((bs,), dtype=torch.float32, device=device),
+            target_logits=target_logits,
+            temperatures=sampling_info.temperatures,
+            draft_probs=draft_probs,
+        )
+        correct_len = accept_token_num
+        if cutoff_verify_lens is not None:
+            correct_len, cap_trim_lens = CapCorrectLen.execute(
+                correct_len=correct_len, verify_lens=cutoff_verify_lens
+            )
+        else:
+            cap_trim_lens = torch.zeros_like(correct_len)
+        return correct_len, cap_trim_lens, accept_index, predicts
+    if plain:
         target_probs = SoftmaxTemp.execute(
             logits=target_logits,
             temperatures=sampling_info.temperatures,

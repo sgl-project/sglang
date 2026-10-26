@@ -107,6 +107,8 @@ from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.dsv41_request_window import window_layout
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.monokernels.runtime import is_metadata_unread
+from sglang.srt.monokernels.spec import StepMetadata
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
@@ -907,6 +909,7 @@ class DeepseekV4HipRadixBackend(
         speculative_num_steps=0,
     ):
         super().__init__()
+        self.model_runner = model_runner
         self.device = torch.device(model_runner.device)
         self.max_context_len = model_runner.model_config.context_len
         head_dim = model_runner.model_config.head_dim
@@ -1767,6 +1770,11 @@ class DeepseekV4HipRadixBackend(
                         # Identity rows are not scored, so they need no schedule.
                         if not low_ratio_decode_rows_are_identity(
                             self, forward_batch, ratio
+                        )
+                        and not is_metadata_unread(
+                            self.model_runner.model,
+                            forward_batch,
+                            StepMetadata.LOW_RATIO_DECODE_SCHEDULE,
                         )
                     },
                     max_context_len=self.max_context_len,
