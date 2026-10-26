@@ -401,11 +401,10 @@ class TestMoriHiSparseTransfer(unittest.TestCase):
         receiver.bootstrap_infos = [{"is_dummy": False}]
         receiver.bootstrap_room = 9
         receiver.required_dst_info_num = 1
-        receiver.kv_mgr = SimpleNamespace(
-            local_ip="127.0.0.1",
-            rank_port=12345,
-            engine_desc=SimpleNamespace(key="engine"),
-        )
+        receiver.kv_mgr = object.__new__(MoriKVManager)
+        receiver.kv_mgr.local_ip = "127.0.0.1"
+        receiver.kv_mgr.rank_port = 12345
+        receiver.kv_mgr.engine_desc = SimpleNamespace(key="engine")
         socket = MagicMock()
         receiver._connect_to_bootstrap_server = MagicMock(
             return_value=(socket, threading.Lock())
@@ -427,11 +426,10 @@ class TestMoriHiSparseTransfer(unittest.TestCase):
         receiver.bootstrap_infos = [{"is_dummy": False}]
         receiver.bootstrap_room = 9
         receiver.required_dst_info_num = 1
-        receiver.kv_mgr = SimpleNamespace(
-            local_ip="127.0.0.1",
-            rank_port=12345,
-            engine_desc=SimpleNamespace(key="engine"),
-        )
+        receiver.kv_mgr = object.__new__(MoriKVManager)
+        receiver.kv_mgr.local_ip = "127.0.0.1"
+        receiver.kv_mgr.rank_port = 12345
+        receiver.kv_mgr.engine_desc = SimpleNamespace(key="engine")
         socket = MagicMock()
         receiver._connect_to_bootstrap_server = MagicMock(
             return_value=(socket, threading.Lock())

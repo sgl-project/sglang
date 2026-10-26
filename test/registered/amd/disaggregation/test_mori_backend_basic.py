@@ -93,9 +93,7 @@ class TestMoriDCP(unittest.TestCase):
     def test_pp_local_descriptors_map_by_layer(self):
         manager = object.__new__(mori_conn.MoriKVManager)
         manager.kv_mem_descs = ["src-17", "src-23"]
-        manager.kv_args = SimpleNamespace(
-            kv_layer_ids=[17, 23], kv_item_lens=[40, 40]
-        )
+        manager.kv_args = SimpleNamespace(kv_layer_ids=[17, 23], kv_item_lens=[40, 40])
         peer_info = SimpleNamespace(
             dst_kv_mem_descs=["dst-11", "dst-17", "dst-23"],
             dst_kv_layer_ids=[11, 17, 23],
@@ -110,12 +108,13 @@ class TestMoriDCP(unittest.TestCase):
 
     def test_tp_mismatch_requires_matching_token_geometry(self):
         manager = object.__new__(mori_conn.MoriKVManager)
+        manager.disaggregation_mode = DisaggregationMode.PREFILL
         manager.dcp_size = 1
         manager.dcp_rank = 0
         manager.is_mla_backend = True
         manager.is_hybrid_mla_backend = False
         manager.kv_args = SimpleNamespace(
-            page_size=64, kv_item_lens=[4096], num_draft_entries=0
+            page_size=64, kv_item_lens=[4096], num_draft_entries=0, aux_data_ptrs=[]
         )
         manager.decode_kv_args_table = {}
         manager.engine = Mock()

@@ -42,7 +42,7 @@ from sglang.test.separate_buffer_allocator_double import (
 )
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class TestDisaggregationPriorityQueueing(unittest.TestCase):
@@ -743,9 +743,7 @@ class TestDecodePreallocQueuePriority(CustomTestCase):
         queue.token_to_kv_pool = FakeDeepSeekV4TokenToKVPool()
         queue.token_to_kv_pool_allocator.page_size = 256
         queue.token_to_kv_pool_allocator.hisparse_page_size = 1
-        queue.token_to_kv_pool_allocator.hisparse_attn_allocator.available_size.return_value = (
-            100
-        )
+        queue.token_to_kv_pool_allocator.hisparse_attn_allocator.available_size.return_value = 100
         queue.token_to_kv_pool_allocator.translate_kv_indices_for_transfer.return_value = torch.tensor(
             [512, 768, 1024]
         )

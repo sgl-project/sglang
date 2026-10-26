@@ -106,15 +106,28 @@ def _load_tensor_parallel_weight(
     loaded_weight: torch.Tensor,
     tp_rank: int,
     shard_dim: int | None,
+    input_sizes: list[int] | None = None,
+    tp_size: int = 1,
 ) -> None:
     is_sharded_weight = getattr(param, "is_sharded_weight", False)
     param_data = param.data
     # Already-sharded checkpoints (e.g. bitsandbytes) must not be sliced twice.
     if shard_dim is not None and not is_sharded_weight:
-        shard_size = param_data.shape[shard_dim]
-        loaded_weight = loaded_weight.narrow(
-            shard_dim, tp_rank * shard_size, shard_size
-        )
+        if input_sizes is not None and tp_size > 1:
+            # checkpoint segments and TP input segments have different layouts;
+            # packed weights and block scales store fewer entries per segment
+            factor = divide(sum(input_sizes), loaded_weight.shape[shard_dim])
+            sizes = [divide(size, factor) for size in input_sizes]
+            shards = []
+            for segment in loaded_weight.split(sizes, dim=shard_dim):
+                size = divide(segment.shape[shard_dim], tp_size)
+                shards.append(segment.narrow(shard_dim, tp_rank * size, size))
+            loaded_weight = torch.cat(shards, dim=shard_dim)
+        else:
+            shard_size = param_data.shape[shard_dim]
+            loaded_weight = loaded_weight.narrow(
+                shard_dim, tp_rank * shard_size, shard_size
+            )
     # AutoFP8 scales can be stored as scalars rather than length-one tensors.
     if len(loaded_weight.shape) == 0:
         loaded_weight = loaded_weight.reshape(1)
@@ -1114,6 +1127,8 @@ class RowParallelLinear(LinearBase):
                        We skip adding bias but instead return it.
         params_dtype: Data type for the parameters.
         quant_config: Quantization configure.
+        input_sizes: Logical input segments sharded independently before
+                     concatenation. Requires input_is_parallel=True.
     """
 
     def __init__(
@@ -1128,11 +1143,20 @@ class RowParallelLinear(LinearBase):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         tp_group: dist.ProcessGroup = None,
+        input_sizes: list[int] | None = None,
     ):
         # Divide the weight matrix along the first dimension.
         self.tp_group = tp_group or get_tp_group()
         self.tp_rank = get_group_rank(self.tp_group)
         self.tp_size = get_group_size(self.tp_group)
+        self.input_sizes = input_sizes
+        if input_sizes is not None:
+            if not input_is_parallel or sum(input_sizes) != input_size:
+                raise ValueError(
+                    "input_sizes must sum to input_size and use parallel inputs"
+                )
+            for size in input_sizes:
+                divide(size, self.tp_size)
         self.input_size_per_partition = divide(input_size, self.tp_size)
         self.output_size_per_partition = output_size
         self.output_partition_sizes = [output_size]
@@ -1178,10 +1202,25 @@ class RowParallelLinear(LinearBase):
 
     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
         _load_tensor_parallel_weight(
-            param, loaded_weight, self.tp_rank, getattr(param, "input_dim", None)
+            param,
+            loaded_weight,
+            self.tp_rank,
+            getattr(param, "input_dim", None),
+            self.input_sizes,
+            self.tp_size,
         )
 
     def weight_loader_v2(self, param: BasevLLMParameter, loaded_weight: torch.Tensor):
+        if self.input_sizes is not None and isinstance(param, RowvLLMParameter):
+            _load_tensor_parallel_weight(
+                param,
+                loaded_weight,
+                self.tp_rank,
+                param.input_dim,
+                self.input_sizes,
+                self.tp_size,
+            )
+            return
         # Special case for loading scales off disk, which often do not
         # have a shape (such as in the case of AutoFP8).
         if len(loaded_weight.shape) == 0:

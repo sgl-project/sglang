@@ -28,7 +28,11 @@ from mori.io import (
     StatusCode,
 )
 
-from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll
+from sglang.srt.disaggregation.base.conn import (
+    KVArgs,
+    KVPoll,
+    KVTransferDestination,
+)
 from sglang.srt.disaggregation.common.conn import (
     ABORT_TAG,
     AbortNotification,
@@ -37,7 +41,6 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVManager,
     CommonKVReceiver,
     CommonKVSender,
-    KVTransferError,
 )
 from sglang.srt.disaggregation.common.utils import (
     AuxDataCodec,
@@ -974,6 +977,13 @@ class MoriKVManager(CommonKVManager):
                 return f"KV transfer failed: {status.Message()}"
         return "KV transfer failed due to unknown reason"
 
+    def prepare_send_state_indices(
+        self, state_indices: Optional[List]
+    ) -> Optional[List]:
+        if self._should_skip_cp_replicated_state_transfer():
+            return None
+        return _normalize_state_indices_per_component(state_indices)
+
     def add_transfer_request(
         self,
         bootstrap_room: int,
@@ -983,7 +993,10 @@ class MoriKVManager(CommonKVManager):
         aux_index: Optional[int] = None,
         state_indices: Optional[List] = None,
         num_kv_tokens: Optional[int] = None,
+        *,
         wait_event: Optional[object] = None,
+        indices_event: Optional[object] = None,
+        trace_ctx=None,
     ) -> None:
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last_chunk or (is_last_chunk and aux_index is not None)
@@ -1309,6 +1322,10 @@ class MoriKVManager(CommonKVManager):
                 dst_item_lens, register_info.dst_dcp_size
             )
         self.engine.register_remote_engine(register_info.engine_desc)
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            self.check_peer_aux_buffer_count(
+                engine_key, len(register_info.dst_aux_mem_descs)
+            )
         self.decode_kv_args_table[engine_key] = register_info
         logger.debug(
             "Registered decode peer %s (%s:%s)",
@@ -1392,7 +1409,9 @@ class MoriKVManager(CommonKVManager):
         ]
         return src_k_descs, src_v_descs, dst_k_descs, dst_v_descs, num_local_layers
 
-    def _get_mla_mem_desc_slices(self, peer_info: KVArgsRegisterInfo) -> tuple[
+    def _get_mla_mem_desc_slices(
+        self, peer_info: KVArgsRegisterInfo
+    ) -> tuple[
         List[List[MemoryDesc]],
         List[List[MemoryDesc]],
         List[str],
@@ -1558,8 +1577,7 @@ class MoriKVManager(CommonKVManager):
                 if start <= offset < end:
                     return index
             raise ValueError(
-                f"MoRI transfer offset {offset} exceeds registered size "
-                f"{spans[-1][1]}"
+                f"MoRI transfer offset {offset} exceeds registered size {spans[-1][1]}"
             )
 
         src_spans = descriptor_spans(src_group)
@@ -2026,7 +2044,11 @@ class MoriKVManager(CommonKVManager):
         dst_aux_index: int,
         room: int,
     ) -> List[TransferStatus]:
-        for i in range(len(self.kv_args.aux_data_ptrs)):
+        # Stop at the shorter list; see check_peer_aux_buffer_count.
+        num_bufs = min(
+            len(self.kv_args.aux_data_ptrs), len(peer_info.dst_aux_mem_descs)
+        )
+        for i in range(num_bufs):
             length = self.kv_args.aux_item_lens[i]
             src_addr = self.kv_args.aux_data_ptrs[i] + length * prefill_aux_index
             data = AuxDataCodec.serialize_data_from_buffer(src_addr, length)
@@ -2527,95 +2549,121 @@ class MoriKVManager(CommonKVManager):
 
         return result_statuses
 
+    def build_receiver_registration_message(self) -> List[bytes]:
+        engine_desc_blob = self.engine_desc.pack()
+        has_chunked_kv = any(len(group) > 1 for group in self.kv_mem_desc_groups)
+        # Old peers do not understand descriptor groups. Omit the legacy flat
+        # list when chunking is active so they fail closed instead of writing
+        # past the first registered chunk.
+        packed_kv_descs = (
+            b"" if has_chunked_kv else _pack_mem_desc_list(self.kv_mem_descs)
+        )
+        packed_kv_desc_groups = _pack_mem_desc_lists(self.kv_mem_desc_groups)
+        packed_aux_descs = _pack_mem_desc_list(self.aux_mem_descs)
+        packed_state_descs = _pack_mem_desc_lists(self.state_mem_descs)
+        gpu_id = str(self.kv_args.gpu_id).encode("ascii")
+        decode_tp_size = str(self.attn_tp_size).encode("ascii")
+        decode_tp_rank = str(self.kv_args.engine_rank).encode("ascii")
+        kv_item_len = str(self.kv_args.kv_item_lens[0]).encode("ascii")
+        packed_state_item_lens = pack_int_lists(self.kv_args.state_item_lens, "I")
+        packed_state_dim_per_tensor = pack_int_lists(
+            self.kv_args.state_dim_per_tensor, "I"
+        )
+        packed_state_layer_ids = pack_int_lists(self.kv_args.state_layer_ids, "I")
+        packed_kv_layer_ids = struct.pack(
+            f"<{len(self.kv_args.kv_layer_ids)}I",
+            *self.kv_args.kv_layer_ids,
+        )
+        dcp_size = str(self.dcp_size).encode("ascii")
+        dcp_rank = str(self.dcp_rank).encode("ascii")
+        packed_kv_mem_kinds = _pack_list(self.kv_args.kv_data_mem_kinds)
+        packed_kv_item_lens = _pack_list(self.kv_args.kv_item_lens)
+
+        return [
+            MORI_GUARD,
+            "None".encode("ascii"),
+            self.local_ip.encode("ascii"),
+            str(self.rank_port).encode("ascii"),
+            engine_desc_blob,
+            packed_kv_descs,
+            packed_aux_descs,
+            packed_state_descs,
+            gpu_id,
+            decode_tp_size,
+            decode_tp_rank,
+            kv_item_len,
+            packed_state_item_lens,
+            packed_state_dim_per_tensor,
+            dcp_size,
+            dcp_rank,
+            packed_state_layer_ids,
+            packed_kv_layer_ids,
+            # HiSparse fields, appended after the DCP fields: payload[17..19]
+            # once MORI_GUARD is stripped (see KVArgsRegisterInfo.from_zmq).
+            packed_kv_mem_kinds,
+            packed_kv_item_lens,
+            packed_kv_desc_groups,
+        ]
+
+    def build_receiver_metadata_message(
+        self,
+        *,
+        bootstrap_room: int,
+        required_dst_info_num: int,
+        kv_indices: npt.NDArray[np.int32],
+        aux_index: Optional[int],
+        state_indices: Optional[List],
+        decode_prefix_len: Optional[int],
+        is_dummy: bool,
+        device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
+        host_kv_indices: Optional[npt.NDArray[np.int32]] = None,
+    ) -> List[bytes]:
+        if device_kv_indices is not None:
+            raise NotImplementedError("MoRI does not use device_kv_indices")
+        if is_dummy:
+            kv_indices_bytes = aux_bytes = state_bytes = b""
+        else:
+            kv_indices_bytes = (
+                np.asarray(kv_indices, dtype=np.int32).tobytes()
+                if kv_indices.size
+                else b""
+            )
+            aux_bytes = str(aux_index).encode("ascii") if aux_index is not None else b""
+            normalized_state = _normalize_state_indices_per_component(state_indices)
+            state_bytes = (
+                _pack_state_indices(normalized_state)
+                if normalized_state is not None
+                else b""
+            )
+        decode_prefix_bytes = (
+            str(int(decode_prefix_len)).encode("ascii")
+            if decode_prefix_len is not None and decode_prefix_len > 0
+            else b""
+        )
+        message = [
+            MORI_GUARD,
+            str(bootstrap_room).encode("ascii"),
+            self.local_ip.encode("ascii"),
+            str(self.rank_port).encode("ascii"),
+            self.engine_desc.key.encode("ascii"),
+            kv_indices_bytes,
+            aux_bytes,
+            state_bytes,
+            str(required_dst_info_num).encode("ascii"),
+            decode_prefix_bytes,
+        ]
+        if host_kv_indices is not None:
+            # Parsed as TransferInfo.dst_host_kv_indices (payload[9] after the
+            # guard is stripped); omitted entirely for non-HiSparse requests.
+            message.append(
+                np.asarray(host_kv_indices, dtype=np.int32).tobytes()
+                if not is_dummy and host_kv_indices.size
+                else b""
+            )
+        return message
+
 
 class MoriKVSender(CommonKVSender):
-    def __init__(
-        self,
-        mgr: MoriKVManager,
-        bootstrap_addr: str,
-        bootstrap_room: int,
-        req_has_disagg_prefill_dp_rank: bool = False,
-    ):
-        super().__init__(
-            mgr,
-            bootstrap_addr,
-            bootstrap_room,
-            req_has_disagg_prefill_dp_rank,
-        )
-        self.conclude_state: Optional[KVPoll] = None
-        self.init_time = time.time()
-
-    def send(
-        self,
-        kv_indices: npt.NDArray[np.int32],
-        state_indices: Optional[List] = None,
-        num_kv_tokens: Optional[int] = None,
-    ):
-        kv_indices, index_slice, is_last_chunk, should_skip = (
-            self._prepare_send_indices(kv_indices, state_indices)
-        )
-        if should_skip:
-            return
-
-        transfer_state_indices = (
-            None
-            if self.kv_mgr._should_skip_cp_replicated_state_transfer()
-            else state_indices
-        )
-        normalized_state = (
-            _normalize_state_indices_per_component(transfer_state_indices)
-            if is_last_chunk
-            else None
-        )
-        self._record_transfer_indices(kv_indices, transfer_state_indices)
-        wait_event = getattr(self, "_early_send_wait_event", None)
-        self._early_send_wait_event = None
-
-        if not is_last_chunk:
-            self.kv_mgr.add_transfer_request(
-                self.bootstrap_room,
-                kv_indices,
-                index_slice,
-                False,
-                num_kv_tokens=num_kv_tokens,
-                wait_event=wait_event,
-            )
-        else:
-            self.kv_mgr.add_transfer_request(
-                self.bootstrap_room,
-                kv_indices,
-                index_slice,
-                True,
-                aux_index=self.aux_index,
-                state_indices=normalized_state,
-                num_kv_tokens=num_kv_tokens,
-                wait_event=wait_event,
-            )
-
-    def poll(self) -> KVPoll:
-        return self._poll_with_status(self.kv_mgr.check_status)
-
-    def poll_pp_consensus(self) -> KVPoll:
-        return self._poll_with_status(self.kv_mgr.check_status_pp_consensus)
-
-    def _poll_with_status(self, check_status) -> KVPoll:
-        if self.conclude_state is not None:
-            return self.conclude_state
-
-        if self.bootstrap_room not in self.kv_mgr.request_status:
-            self.conclude_state = KVPoll.Failed
-            return self.conclude_state
-
-        status = check_status(self.bootstrap_room)
-        if status == KVPoll.Bootstrapping:
-            timeout_result = self._check_bootstrap_timeout()
-            if timeout_result is not None:
-                self.conclude_state = timeout_result
-                return timeout_result
-        if status in (KVPoll.Success, KVPoll.Failed):
-            self.conclude_state = status
-        return status
-
     def clear(self) -> None:
         if self.kv_mgr.enable_deferred_decode_kv_release:
             with self.kv_mgr._abort_ack_lock:
@@ -2623,219 +2671,63 @@ class MoriKVSender(CommonKVSender):
         else:
             super().clear()
 
-    def failure_exception(self):
-        if self.conclude_state is None:
-            self.conclude_state = KVPoll.Failed
-
-        self.clear()
-
-        with self.kv_mgr.failure_lock:
-            failure_reason = self.kv_mgr.failure_records.pop(self.bootstrap_room, None)
-        is_propagated = failure_reason is None
-        if is_propagated:
-            failure_reason = "KV transfer failed"
-        raise KVTransferError(
-            self.bootstrap_room, failure_reason, is_from_another_rank=is_propagated
-        )
-
 
 class MoriKVReceiver(CommonKVReceiver):
-    def __init__(
-        self,
-        mgr: MoriKVManager,
-        bootstrap_addr: str,
-        bootstrap_room: Optional[int] = None,
-    ):
-        super().__init__(mgr, bootstrap_addr, bootstrap_room)
-        self.init_time: Optional[float] = None
-
-    def init(
-        self,
-        prefill_dp_rank: int,
-    ):
-        super().init(prefill_dp_rank)
-
-    def _register_kv_args(self) -> bool:
-        if self.bootstrap_infos is None:
-            return False
-        engine_desc_blob = self.kv_mgr.engine_desc.pack()
-        has_chunked_kv = any(len(group) > 1 for group in self.kv_mgr.kv_mem_desc_groups)
-        # Old peers do not understand descriptor groups. Omit the legacy flat
-        # list when chunking is active so they fail closed instead of writing
-        # past the first registered chunk.
-        packed_kv_descs = (
-            b"" if has_chunked_kv else _pack_mem_desc_list(self.kv_mgr.kv_mem_descs)
-        )
-        packed_kv_desc_groups = _pack_mem_desc_lists(self.kv_mgr.kv_mem_desc_groups)
-        packed_aux_descs = _pack_mem_desc_list(self.kv_mgr.aux_mem_descs)
-        packed_state_descs = _pack_mem_desc_lists(self.kv_mgr.state_mem_descs)
-        gpu_id = str(self.kv_mgr.kv_args.gpu_id).encode("ascii")
-        decode_tp_size = str(self.kv_mgr.attn_tp_size).encode("ascii")
-        decode_tp_rank = str(self.kv_mgr.kv_args.engine_rank).encode("ascii")
-        kv_item_len = str(self.kv_mgr.kv_args.kv_item_lens[0]).encode("ascii")
-        packed_state_item_lens = pack_int_lists(
-            self.kv_mgr.kv_args.state_item_lens, "I"
-        )
-        packed_state_dim_per_tensor = pack_int_lists(
-            self.kv_mgr.kv_args.state_dim_per_tensor, "I"
-        )
-        packed_state_layer_ids = pack_int_lists(
-            self.kv_mgr.kv_args.state_layer_ids, "I"
-        )
-        packed_kv_layer_ids = struct.pack(
-            f"<{len(self.kv_mgr.kv_args.kv_layer_ids)}I",
-            *self.kv_mgr.kv_args.kv_layer_ids,
-        )
-        dcp_size = str(self.kv_mgr.dcp_size).encode("ascii")
-        dcp_rank = str(self.kv_mgr.dcp_rank).encode("ascii")
-        packed_kv_mem_kinds = _pack_list(self.kv_mgr.kv_args.kv_data_mem_kinds)
-        packed_kv_item_lens = _pack_list(self.kv_mgr.kv_args.kv_item_lens)
-
-        for bootstrap_info in self.bootstrap_infos:
-            try:
-                sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
-                with lock:
-                    sock.send_multipart(
-                        [
-                            MORI_GUARD,
-                            "None".encode("ascii"),
-                            self.kv_mgr.local_ip.encode("ascii"),
-                            str(self.kv_mgr.rank_port).encode("ascii"),
-                            engine_desc_blob,
-                            packed_kv_descs,
-                            packed_aux_descs,
-                            packed_state_descs,
-                            gpu_id,
-                            decode_tp_size,
-                            decode_tp_rank,
-                            kv_item_len,
-                            packed_state_item_lens,
-                            packed_state_dim_per_tensor,
-                            dcp_size,
-                            dcp_rank,
-                            packed_state_layer_ids,
-                            packed_kv_layer_ids,
-                            packed_kv_mem_kinds,
-                            packed_kv_item_lens,
-                            packed_kv_desc_groups,
-                        ]
-                    )
-            except zmq.ZMQError:
-                self.kv_mgr.record_failure(
-                    self.bootstrap_room,
-                    f"_register_kv_args to prefill {bootstrap_info.get('rank_ip')}:{bootstrap_info.get('rank_port')} failed",
-                )
-                self.conclude_state = KVPoll.Failed
-                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
-                return False
-        return True
-
     def send_metadata(
         self,
         kv_indices: npt.NDArray[np.int32],
         aux_index: Optional[int] = None,
         state_indices: Optional[List] = None,
         decode_prefix_len: Optional[int] = None,
+        destination: KVTransferDestination = KVTransferDestination.DEVICE,
+        device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
         host_kv_indices: Optional[npt.NDArray[np.int32]] = None,
     ):
-        if self.bootstrap_infos is None or self.bootstrap_room is None:
+        # HiSparse publishes C4 host rows separately from the primary (logical
+        # device page) indices, so MoRI takes host_kv_indices rather than the
+        # device_kv_indices used by Mooncake.
+        if device_kv_indices is not None:
+            raise NotImplementedError(
+                "MoRI HiSparse transfer uses host_kv_indices, not device_kv_indices"
+            )
+        if host_kv_indices is None:
+            return super().send_metadata(
+                kv_indices,
+                aux_index,
+                state_indices,
+                decode_prefix_len,
+                destination=destination,
+            )
+        if self.bootstrap_infos is None:
+            self.kv_mgr.record_failure(
+                self.bootstrap_room,
+                f"Could not fetch prefill parallel info from bootstrap_addr: {self.bootstrap_addr}",
+            )
+            self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
             return
-
-        kv_indices_bytes = (
-            np.asarray(kv_indices, dtype=np.int32).tobytes() if kv_indices.size else b""
-        )
-        aux_bytes = str(aux_index).encode("ascii") if aux_index is not None else b""
-        normalized_state = _normalize_state_indices_per_component(state_indices)
-
-        decode_prefix_bytes = (
-            str(int(decode_prefix_len)).encode("ascii")
-            if decode_prefix_len is not None and decode_prefix_len > 0
-            else b""
-        )
-        host_kv_indices_bytes = (
-            np.asarray(host_kv_indices, dtype=np.int32).tobytes()
-            if host_kv_indices is not None and host_kv_indices.size
-            else b""
-        )
+        if destination != KVTransferDestination.DEVICE:
+            raise NotImplementedError("Host KV destinations are not supported")
 
         for bootstrap_info in self.bootstrap_infos:
-            is_dummy = bootstrap_info.get("is_dummy", False)
-            if not is_dummy and normalized_state is not None:
-                state_bytes = _pack_state_indices(normalized_state)
-            else:
-                state_bytes = b""
-            payload = [
-                MORI_GUARD,
-                str(self.bootstrap_room).encode("ascii"),
-                self.kv_mgr.local_ip.encode("ascii"),
-                str(self.kv_mgr.rank_port).encode("ascii"),
-                self.kv_mgr.engine_desc.key.encode("ascii"),
-                kv_indices_bytes if not is_dummy else b"",
-                aux_bytes if not is_dummy else b"",
-                state_bytes,
-                str(self.required_dst_info_num).encode("ascii"),
-                decode_prefix_bytes,
-            ]
-            if host_kv_indices is not None:
-                payload.append(host_kv_indices_bytes if not is_dummy else b"")
-            try:
-                sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
-                with lock:
-                    sock.send_multipart(payload)
-            except zmq.ZMQError:
+            message = self.kv_mgr.build_receiver_metadata_message(
+                bootstrap_room=self.bootstrap_room,
+                required_dst_info_num=self.required_dst_info_num,
+                kv_indices=kv_indices,
+                aux_index=aux_index,
+                state_indices=state_indices,
+                decode_prefix_len=decode_prefix_len,
+                is_dummy=bootstrap_info["is_dummy"],
+                host_kv_indices=host_kv_indices,
+            )
+            if not self._send_bootstrap_message(
+                bootstrap_info=bootstrap_info,
+                message=message,
+                operation="send_metadata",
+            ):
                 self.invalidate_cached_bootstrap_infos()
-                self.kv_mgr.record_failure(
-                    self.bootstrap_room,
-                    f"send_metadata to prefill {bootstrap_info.get('rank_ip')}:{bootstrap_info.get('rank_port')} failed",
-                )
-                self.conclude_state = KVPoll.Failed
-                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
                 return
+
         self.init_time = time.time()
-
-    def poll(self) -> KVPoll:
-        if self.conclude_state is not None:
-            return self.conclude_state
-
-        status = self.kv_mgr.check_status(self.bootstrap_room)
-        if status in (KVPoll.Success, KVPoll.Failed):
-            self.conclude_state = status
-            return status
-
-        if status == KVPoll.WaitingForInput:
-            timeout_result = self._check_waiting_timeout()
-            if timeout_result is not None:
-                return timeout_result
-
-        return status
-
-    def clear(self) -> None:
-        if self.bootstrap_room is None:
-            return
-        super().clear()
-
-    def failure_exception(self):
-        if self.conclude_state is None:
-            self.conclude_state = KVPoll.Failed
-
-        self.clear()
-        with self.kv_mgr.failure_lock:
-            failure_reason = self.kv_mgr.failure_records.pop(self.bootstrap_room, None)
-        is_propagated = failure_reason is None
-        if is_propagated:
-            failure_reason = "KV transfer failed"
-        raise KVTransferError(
-            self.bootstrap_room, failure_reason, is_from_another_rank=is_propagated
-        )
-
-    def abort(self):
-        if self.bootstrap_room is None:
-            return
-        bootstrap_room = self.bootstrap_room
-        super().abort()
-        self.clear()
-        with self.kv_mgr.failure_lock:
-            self.kv_mgr.failure_records.pop(bootstrap_room, None)
 
 
 class MoriKVBootstrapServer(CommonKVBootstrapServer):

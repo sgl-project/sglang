@@ -65,9 +65,14 @@ PER_COMMIT_SUITES = {
         # of CUDA extra-a tests fail on ROCm (missing flash_attn.cute/flash_ops
         # kernels, OOM, or accuracy regressions — e.g. gemma4-mtp-31b dips
         # below the gsm8k floor on the topk=3 leg) and stay CUDA-only for now.
+        # Tests that pass on ROCm but sit in CUDA's extra tier (basic_perf,
+        # torch.compile, LoRA/RL weight updates, ...) are registered here too
+        # rather than in the always-on stage-b/c suites.
         "extra-a-test-1-gpu-small-amd",
         "extra-a-test-1-gpu-large-amd",
         "extra-a-test-2-gpu-large-amd",
+        # extra-b: 4-GPU tests that CUDA runs in extra-b (4-gpu-h100/b200).
+        "extra-b-test-4-gpu-amd",
     ],
     HWBackend.MUSA: [],
     HWBackend.CUDA: [

@@ -1736,7 +1736,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             )
             self.unified_hisparse = True
 
-        index_k_page8 =_is_hip and envs.SGLANG_HIP_DSV41_INDEX_K_PAGE8.get()
+        index_k_page8 = _is_hip and envs.SGLANG_HIP_DSV41_INDEX_K_PAGE8.get()
         if index_k_page8:
             from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
                 aiter_has_fp4_rowgroup,
