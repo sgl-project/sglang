@@ -33,6 +33,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     DeltaMessage,
     Function,
     FunctionResponse,
+    TokenizeRequest,
     Tool,
     ToolCall,
     UsageInfo,
@@ -40,6 +41,61 @@ from sglang.srt.entrypoints.openai.protocol import (
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
+
+
+class TestFieldContinuation(unittest.TestCase):
+    def test_explicit_target_keeps_empty_fields_and_tokenize_contract(self):
+        for target in ("content", "reasoning_content"):
+            for prefix in ("", "partial"):
+                with self.subTest(target=target, prefix=prefix):
+                    messages = [{"role": "assistant", "content": "", target: prefix}]
+                    request = ChatCompletionRequest(
+                        messages=messages, continue_final_message=target
+                    )
+                    tokenization = TokenizeRequest(
+                        messages=messages, continue_final_message=target
+                    ).to_chat_completion_request()
+                    self.assertEqual(request.continue_final_message, target)
+                    self.assertEqual(tokenization.continue_final_message, target)
+                    self.assertEqual(getattr(request.messages[-1], target), prefix)
+
+    def test_explicit_target_rejects_missing_field_wrong_role_or_raw_ids(self):
+        for data in (
+            {"messages": [{"role": "user", "content": "x"}]},
+            {"messages": []},
+            {"messages": [{"role": "assistant", "content": None}]},
+            {
+                "messages": [
+                    {"role": "assistant", "content": [{"type": "text", "text": "x"}]}
+                ]
+            },
+            {"messages": [{"role": "assistant", "content": "x"}], "input_ids": [1]},
+        ):
+            with self.subTest(data=data), self.assertRaises(ValidationError):
+                ChatCompletionRequest(**data, continue_final_message="content")
+        with self.assertRaises(ValidationError):
+            ChatCompletionRequest(
+                messages=[{"role": "assistant", "content": "x"}],
+                continue_final_message="reasoning_content",
+            )
+        with self.assertRaises(ValidationError):
+            TokenizeRequest(prompt="x", continue_final_message="content")
+
+    def test_legacy_boolean_values_are_retained(self):
+        messages = [{"role": "assistant", "content": "prefix"}]
+        for value, expected in (
+            (True, True),
+            (False, False),
+            ("true", True),
+            (0, False),
+        ):
+            with self.subTest(value=value):
+                self.assertIs(
+                    ChatCompletionRequest(
+                        messages=messages, continue_final_message=value
+                    ).continue_final_message,
+                    expected,
+                )
 
 
 class TestCompletionRequest(unittest.TestCase):

@@ -804,6 +804,22 @@ ChatCompletionMessageParam = Union[
     ChatCompletionMessageGenericParam, ChatCompletionMessageUserParam
 ]
 
+ContinueFinalMessage: TypeAlias = Union[bool, Literal["content", "reasoning_content"]]
+
+
+def _validate_continuation_message(messages, target):
+    if not isinstance(target, str):
+        return
+    if not messages or messages[-1].role != "assistant":
+        raise ValueError(
+            "Field-specific continue_final_message requires a final assistant message."
+        )
+    if not isinstance(getattr(messages[-1], target, None), str):
+        raise ValueError(
+            f"continue_final_message={target!r} requires a string {target} field "
+            "in the final assistant message."
+        )
+
 
 class Function(BaseModel):
     """Function descriptions."""
@@ -1005,7 +1021,12 @@ class ChatCompletionRequest(PDRoutingFields):
     stop_regex: Optional[Union[str, List[str]]] = None
     no_stop_trim: bool = False
     ignore_eos: bool = False
-    continue_final_message: bool = False
+    continue_final_message: ContinueFinalMessage = Field(
+        default=False,
+        description="Continue the final assistant message. A field target, 'content' "
+        "or 'reasoning_content', delegates continuation rendering to the HF chat "
+        "template; booleans retain legacy behavior.",
+    )
     skip_special_tokens: bool = True
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
     session_id: Optional[str] = None
@@ -1061,6 +1082,15 @@ class ChatCompletionRequest(PDRoutingFields):
         "min_p": 0.0,
         "repetition_penalty": 1.0,
     }
+
+    @model_validator(mode="after")
+    def validate_continuation_message(self):
+        _validate_continuation_message(self.messages, self.continue_final_message)
+        if isinstance(self.continue_final_message, str) and self.input_ids is not None:
+            raise ValueError(
+                "Field-specific continue_final_message cannot be used with input_ids."
+            )
+        return self
 
     @model_validator(mode="before")
     @classmethod
@@ -1749,7 +1779,7 @@ class TokenizeRequest(BaseModel):
         Field(default=None, examples=["auto"])
     )
     reasoning_effort: ReasoningEffortType = None
-    continue_final_message: bool = False
+    continue_final_message: ContinueFinalMessage = False
     chat_template_kwargs: Optional[Dict] = None
     add_special_tokens: bool = Field(
         default=True,
@@ -1760,6 +1790,7 @@ class TokenizeRequest(BaseModel):
     def validate_tokenize_input(self) -> TokenizeRequest:
         if (self.prompt is None) == (self.messages is None):
             raise ValueError("Exactly one of 'prompt' or 'messages' must be provided.")
+        _validate_continuation_message(self.messages, self.continue_final_message)
         return self
 
     def to_chat_completion_request(self) -> ChatCompletionRequest:
@@ -1770,6 +1801,9 @@ class TokenizeRequest(BaseModel):
         extra = getattr(self, "__pydantic_extra__", None)
         if extra:
             data.update(extra)
+        if isinstance(self.continue_final_message, str):
+            # Tokenization renders input only; it never separates generated output.
+            data["separate_reasoning"] = False
         return ChatCompletionRequest.model_validate(data)
 
 

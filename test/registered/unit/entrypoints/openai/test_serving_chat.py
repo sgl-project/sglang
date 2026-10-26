@@ -15,12 +15,15 @@ import gc
 import json
 import unittest
 import uuid
+from collections import OrderedDict
 from http import HTTPStatus
+from types import SimpleNamespace
 from typing import Optional
 from unittest.mock import Mock, patch
 
 from fastapi import Request
 from tokenizers import Tokenizer as BackendTokenizer
+from tokenizers import decoders as tokenizer_decoders
 from tokenizers import models as tokenizer_models
 from tokenizers import pre_tokenizers
 from transformers import PreTrainedTokenizerFast
@@ -32,6 +35,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     Function,
     MessageProcessingResult,
+    TokenizeRequest,
     Tool,
     ToolChoice,
     ToolChoiceFuncName,
@@ -48,6 +52,7 @@ from sglang.srt.parser.jinja_template_utils import (
     jinja_template_may_reorder_tool_results,
 )
 from sglang.srt.parser.python_chat_template import GLM53, install_python_chat_template
+from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.parser.response_template import (
     GRAMMAR_AFTER_REASONING,
     GRAMMAR_FROM_START,
@@ -56,9 +61,7 @@ from sglang.srt.parser.response_template import (
 )
 from sglang.srt.parser.template_detection import ReasoningToggleConfig
 from sglang.srt.runtime_context import get_context, publish, reset_context
-from sglang.srt.sampling.sampling_params import (
-    REQUEST_REASONING_END_TOKEN_IDS_KEY,
-)
+from sglang.srt.sampling.sampling_params import REQUEST_REASONING_END_TOKEN_IDS_KEY
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_or_create_event_loop
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -380,6 +383,283 @@ class TestPythonChatTemplateSegments(CustomTestCase):
         )
         self.assertEqual(ids, self.tokenizer.encode(rendered))
         self.assertEqual(documents_ids, ids)
+
+
+class TestFieldContinuationRendering(CustomTestCase):
+    _TEMPLATE = """{%- for m in messages -%}
+{{- '<' + m.role + '>' -}}
+{%- if m.role == 'assistant' and m.reasoning_content is not none -%}
+{{- '<think>' + m.reasoning_content + '</think>' -}}
+{%- endif -%}
+{{- m.content or '' -}}{{- '</' + m.role + '>' -}}
+{%- endfor -%}
+{%- if add_generation_prompt -%}{{- '<assistant><think>' -}}{%- endif -%}"""
+
+    def _serving(self):
+        alphabet = sorted(pre_tokenizers.ByteLevel.alphabet())
+        backend = BackendTokenizer(
+            tokenizer_models.BPE({c: i for i, c in enumerate(alphabet)}, merges=[])
+        )
+        backend.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+        backend.decoder = tokenizer_decoders.ByteLevel()
+        tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend)
+        tokenizer.chat_template = self._TEMPLATE
+        serving = OpenAIServingChat.__new__(OpenAIServingChat)
+        serving.tokenizer_manager = SimpleNamespace(
+            tokenizer=tokenizer,
+            model_config=SimpleNamespace(is_multimodal=False),
+        )
+        serving.template_manager = SimpleNamespace(
+            chat_template_name=None,
+            jinja_template_content_format="string",
+            jinja_template_may_reorder_tool_results=False,
+            reasoning_config=None,
+            python_chat_template=object(),
+        )
+        serving.chat_encoding_spec = None
+        serving._encoding_adapter = None
+        serving.reasoning_parser = "qwen3"
+        serving.is_minimax_m3 = False
+        serving._tokenizer_auto_adds_specials = False
+        serving._prompt_text_round_trip_is_lossy = False
+        serving._chat_template_cache = OrderedDict()
+        return serving
+
+    def _request(self, target, **kwargs):
+        return ChatCompletionRequest(
+            messages=[
+                {"role": "user", "content": "question"},
+                {
+                    "role": "assistant",
+                    "reasoning_content": "prior reasoning",
+                    "content": "partial answer",
+                },
+            ],
+            continue_final_message=target,
+            **kwargs,
+        )
+
+    def test_full_messages_render_through_hf_for_both_targets_and_id_paths(self):
+        expected = {
+            "content": "<user>question</user><assistant><think>prior reasoning</think>partial answer",
+            "reasoning_content": "<user>question</user><assistant><think>prior reasoning",
+        }
+        cases = (
+            ("content", "partial answer", expected["content"]),
+            (
+                "content",
+                "",
+                "<user>question</user><assistant><think>prior reasoning</think>",
+            ),
+            ("reasoning_content", "partial answer", expected["reasoning_content"]),
+        )
+        for target, answer_prefix, expected_prompt in cases:
+            for lossy in (False, True):
+                with self.subTest(
+                    target=target, answer_prefix=answer_prefix, lossy=lossy
+                ):
+                    serving = self._serving()
+                    serving._prompt_text_round_trip_is_lossy = lossy
+                    request = self._request(target)
+                    request.messages[-1].content = answer_prefix
+                    before = request.model_dump()
+                    result = serving._apply_jinja_template(request, None, False)
+                    tokenizer = serving.tokenizer_manager.tokenizer
+                    direct = tokenizer.apply_chat_template(
+                        [m.model_dump() for m in request.messages],
+                        tokenize=True,
+                        add_generation_prompt=False,
+                        continue_final_message=target,
+                        return_dict=False,
+                    )
+                    self.assertEqual(result.prompt_ids, direct)
+                    self.assertEqual(
+                        tokenizer.decode(result.prompt_ids), expected_prompt
+                    )
+                    self.assertEqual(request.model_dump(), before)
+
+    def test_cache_key_distinguishes_field_targets(self):
+        serving = self._serving()
+        tokenizer = serving.tokenizer_manager.tokenizer
+        messages = [m.model_dump() for m in self._request("content").messages]
+        results = {}
+        with patch.object(
+            tokenizer, "apply_chat_template", wraps=tokenizer.apply_chat_template
+        ) as render:
+            for target in ("content", "reasoning_content", "content"):
+                results[target], _ = serving._render_and_encode_chat_template(
+                    messages,
+                    tools=None,
+                    template_kwargs={},
+                    encode_kwargs={},
+                    use_cache=True,
+                    continuation_target=target,
+                )
+            self.assertEqual(render.call_count, 2)
+        self.assertNotEqual(results["content"], results["reasoning_content"])
+        self.assertEqual(len(serving._chat_template_cache), 2)
+
+    def test_tokenize_continuation_needs_renderer_but_not_output_parser(self):
+        serving = self._serving()
+        serving.reasoning_parser = None
+        request = self._request("reasoning_content")
+        chat_request = TokenizeRequest(
+            messages=request.messages,
+            continue_final_message="reasoning_content",
+        ).to_chat_completion_request()
+        self.assertFalse(chat_request.separate_reasoning)
+        with (
+            patch(
+                f"{OpenAIServingChat.__module__}.get_serving",
+                return_value=SimpleNamespace(trust_request_chat_template=False),
+            ),
+            patch(
+                f"{OpenAIServingChat.__module__}.get_model",
+                return_value=SimpleNamespace(context_length=4096),
+            ),
+        ):
+            self.assertIsNone(serving._validate_request(chat_request))
+            self.assertIn("requires", serving._validate_request(request))
+        result = serving._apply_jinja_template(chat_request, None, False)
+        self.assertEqual(
+            serving.tokenizer_manager.tokenizer.decode(result.prompt_ids),
+            "<user>question</user><assistant><think>prior reasoning",
+        )
+        legacy = TokenizeRequest(
+            messages=request.messages, continue_final_message=True
+        ).to_chat_completion_request()
+        self.assertTrue(legacy.separate_reasoning)
+        serving.chat_encoding_spec = "kimi_k3"
+        self.assertIn(
+            "encoder is not supported", serving._validate_request(chat_request)
+        )
+
+    def test_explicit_target_cannot_be_overridden_by_template_kwargs(self):
+        serving = self._serving()
+        for kwargs in (
+            {"continue_final_message": "reasoning_content"},
+            {"add_generation_prompt": True},
+        ):
+            with (
+                self.subTest(kwargs=kwargs),
+                self.assertRaisesRegex(ValueError, "conflicts"),
+            ):
+                serving._apply_jinja_template(
+                    self._request("content", chat_template_kwargs=kwargs), None, False
+                )
+        result = serving._apply_jinja_template(
+            self._request(
+                "content",
+                chat_template_kwargs={
+                    "continue_final_message": "content",
+                    "add_generation_prompt": False,
+                },
+            ),
+            None,
+            False,
+        )
+        self.assertTrue(result.prompt_ids)
+
+    def test_unsupported_encoders_and_parsers_reject_before_rendering(self):
+        serving = self._serving()
+        for spec in _ALL_CHAT_ENCODING_SPECS:
+            with self.subTest(spec=spec):
+                serving.chat_encoding_spec = spec
+                with self.assertRaisesRegex(ValueError, "encoder is not supported"):
+                    serving._apply_jinja_template(self._request("content"), None, False)
+        serving.chat_encoding_spec = None
+        serving.reasoning_parser = "gpt-oss"
+        self.assertIn(
+            "does not support",
+            serving._validate_continuation_target(self._request("content")),
+        )
+        serving.reasoning_parser = None
+        self.assertIsNone(
+            serving._validate_continuation_target(self._request("content"))
+        )
+        self.assertIn(
+            "requires",
+            serving._validate_continuation_target(self._request("reasoning_content")),
+        )
+        self.assertIsNone(
+            serving._validate_continuation_target(
+                self._request("reasoning_content", separate_reasoning=False)
+            )
+        )
+        serving.template_manager.chat_template_name = "llama-3"
+        with self.assertRaisesRegex(ValueError, "encoder is not supported"):
+            serving._apply_conversation_template(self._request("content"), False)
+
+    def test_legacy_boolean_last_assistant_handling_is_unchanged(self):
+        serving = self._serving()
+        messages = [{"role": "assistant", "content": "prefix"}]
+        continued, prefix = serving._handle_last_assistant_message(
+            messages, self._request(True)
+        )
+        self.assertEqual((continued, prefix), ([], "prefix"))
+        ordinary, prefix = serving._handle_last_assistant_message(
+            messages, self._request(False)
+        )
+        self.assertEqual(
+            (ordinary, prefix), ([{"role": "user", "content": "prefix"}], None)
+        )
+
+
+class TestFieldContinuationParser(CustomTestCase):
+    def test_selected_field_overrides_defaults_and_previous_literal_tags(self):
+        for model_type in ("qwen3", "qwen3-thinking", "deepseek-r1"):
+            for target in ("content", "reasoning_content"):
+                with self.subTest(model_type=model_type, target=target):
+                    request = ChatCompletionRequest(
+                        messages=[
+                            {
+                                "role": "assistant",
+                                "reasoning_content": "unfinished reasoning",
+                                "content": "literal <think>prefix</think>",
+                            }
+                        ],
+                        continue_final_message=target,
+                    )
+                    parser = ReasoningParser(
+                        model_type, force_reasoning=True, request=request
+                    )
+                    text = (
+                        "suffix</think>answer"
+                        if target == "reasoning_content"
+                        else "suffix"
+                    )
+                    expected = (
+                        ("suffix", "answer")
+                        if target == "reasoning_content"
+                        else ("", "suffix")
+                    )
+                    reason, content = parser.parse_non_stream(text)
+                    self.assertEqual((reason or "", content or ""), expected)
+                    self.assertEqual(parser.detector.previous_content, "")
+
+    def test_reasoning_continuation_streams_only_new_suffix_across_split_close(self):
+        request = ChatCompletionRequest(
+            messages=[
+                {"role": "assistant", "reasoning_content": "old prefix", "content": ""}
+            ],
+            continue_final_message="reasoning_content",
+        )
+        for stream_reasoning in (False, True):
+            with self.subTest(stream_reasoning=stream_reasoning):
+                parser = ReasoningParser(
+                    "qwen3", stream_reasoning=stream_reasoning, request=request
+                )
+                chunks = [
+                    parser.parse_stream_chunk(text)
+                    for text in ("new suffix</thi", "nk>answer")
+                ]
+                chunks.append(parser.parse_stream_end())
+                self.assertEqual(
+                    "".join(reason or "" for reason, _ in chunks), "new suffix"
+                )
+                self.assertEqual(
+                    "".join(content or "" for _, content in chunks), "answer"
+                )
 
 
 class ServingChatTestCase(CustomTestCase):
