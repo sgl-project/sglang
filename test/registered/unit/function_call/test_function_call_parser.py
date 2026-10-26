@@ -1,5 +1,6 @@
 import functools
 import json
+import re
 import unittest
 import warnings
 
@@ -3520,6 +3521,53 @@ class TestGlm47MoeDetector(unittest.TestCase):
             self.assertIsNotNone(constraint)
             self.assertEqual("json_schema", constraint[0])
             _glm47_native_structural_tag_available.cache_clear()
+
+    def test_streaming_partial_match_same_as_regex(self):
+        # _match_partial_tool_call replaced this regex search on every chunk.
+        pattern = re.compile(
+            r"<tool_call>(.*?)(?:(<arg_key.*?))?(?:(</tool_call>)|$)", re.DOTALL
+        )
+        texts = [
+            "<tool_call>get_weather<arg_key>city</arg_key>"
+            "<arg_value>a < b </tool_ \n</arg_value></tool_call>\n",
+            "Sure.<tool_call> get_weather \n</tool_call><tool_call>x<arg_key",
+            "<tool_call>f</tool_call><arg_key>k</arg_key></tool_call>",
+            "<tool_call>f<arg_k\n<arg_key>k</arg_key>\n",
+        ]
+        for text in texts:
+            for end in range(len(text) + 1):
+                prefix = text[:end]
+                with self.subTest(prefix=prefix):
+                    m = pattern.search(prefix)
+                    expected = m and (
+                        m.group(1).strip(),
+                        m.group(2).strip() if m.group(2) else "",
+                        m.group(3) or "",
+                        m.end() if m.group(3) else -1,
+                    )
+                    self.assertEqual(
+                        self.detector._match_partial_tool_call(prefix), expected
+                    )
+
+    def test_streaming_long_value_with_tag_like_text(self):
+        value = "if a < b: print('</arg_ <tool_call> <arg_k')\n" * 200
+        text = (
+            "<tool_call>get_weather<arg_key>city</arg_key>"
+            f"<arg_value>{value}</arg_value>"
+            "<arg_key>date</arg_key><arg_value>2024-06-27</arg_value></tool_call>"
+        )
+        calls = []
+        for i in range(0, len(text), 3):
+            calls.extend(
+                self.detector.parse_streaming_increment(
+                    text[i : i + 3], self.tools
+                ).calls
+            )
+        self.assertEqual(calls[0].name, "get_weather")
+        self.assertEqual(
+            json.loads("".join(call.parameters for call in calls)),
+            {"city": value, "date": "2024-06-27"},
+        )
 
 
 class TestGlm47FullAssistantGrammar(unittest.TestCase):
