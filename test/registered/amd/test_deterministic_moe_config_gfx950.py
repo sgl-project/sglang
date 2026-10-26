@@ -5,6 +5,8 @@ exactly that: the same tokens through both configs, and the rows of a large batc
 (large-M config) against the same rows computed in small batches (small-M config).
 """
 
+import sys
+
 import pytest
 import torch
 
@@ -95,3 +97,7 @@ def test_small_and_large_m_configs_give_the_same_bits(
         rows = slice(start, start + n)
         part = _moe(x[rows], w1, w2, weights[rows], ids[rows], small_cfg)
         assert torch.equal(part, full_large[rows]), f"rows {start}:{start + n}"
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
