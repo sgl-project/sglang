@@ -1,15 +1,16 @@
-"""The unified pool's transfer surface: the external names and PD wire
-entries of its sub-pools, their layer routes, and the HiCache host stack
-built from the plan.
+"""The unified pool's transfer surface: external names, PD wire entries, regions,
+and the HiCache host stack built from the plan.
 
-The host stack is compared with the stacks the pool-class strategies built,
-which every L3 key written so far follows.
+The PD registration and the host stack are compared with what the pool
+classes chose (the per-class PD branches and HiCache strategies), which PD
+peers already running and every L3 key written so far follow.
 """
 
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from sglang.srt.disaggregation import utils as pd
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler as hpa
 from sglang.srt.mem_cache.hybrid_cache.host_pool_config import is_mla_pool
@@ -107,6 +108,45 @@ class TestPlanNames(CustomTestCase):
                             for layer_id in router.sub_pool(s.name).layer_ids
                         }
                     self.assertEqual(s.layer_indices, expected)
+
+
+def _kv_args_fields(kv_args):
+    return {
+        name: getattr(kv_args, name)
+        for name in (
+            "state_types",
+            "state_data_ptrs",
+            "state_data_lens",
+            "state_item_lens",
+            "state_dim_per_tensor",
+            "state_conv_shard_groups",
+            "state_slice_outer_counts",
+            "state_layer_ids",
+            "is_hybrid_mla_backend",
+            "swa_kv_cache_layout",
+            "mla_compression_ratios",
+        )
+    }
+
+
+class TestPdRegistration(CustomTestCase):
+    def test_plan_wire_matches_the_pool_class_branches(self):
+        for name in CHAINS:
+            with self.subTest(chain=name):
+                bundle = _bundle(name)
+                pool = bundle.token_to_kv_pool
+                allocator = bundle.token_to_kv_pool_allocator
+                state_pool = None if allocator.state is None else allocator.state.pool
+                by_plan, by_class = SimpleNamespace(), SimpleNamespace()
+                pd.setup_state_kv_args(
+                    by_plan, pool, None, 4, state_pool, storage=allocator.storage
+                )
+                pd.setup_state_kv_args(by_class, pool, None, 4, state_pool)
+                self.assertEqual(_kv_args_fields(by_plan), _kv_args_fields(by_class))
+                self.assertEqual(
+                    pd.get_kv_transfer_buf_infos(pool, allocator.storage),
+                    pd.get_kv_transfer_buf_infos(pool),
+                )
 
 
 class TestHostSizing(CustomTestCase):

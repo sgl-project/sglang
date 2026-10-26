@@ -635,8 +635,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if self.scheduler.enable_hisparse
             else self.token_to_kv_pool
         )
+        # HiSparse registers its host pool instead; unified memory refuses it.
+        storage = (
+            None
+            if self.scheduler.enable_hisparse
+            else self.token_to_kv_pool_allocator.storage
+        )
         kv_data_ptrs, kv_data_lens, kv_item_lens = get_kv_transfer_buf_infos(
-            transfer_kv_pool
+            transfer_kv_pool, storage
         )
         kv_data_mem_kinds = (
             ["DRAM"] * len(kv_data_ptrs)
@@ -692,6 +698,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.draft_token_to_kv_pool,
             total_kv_layers=self.scheduler.model_config.num_hidden_layers,
             state_pool=None if state is None else state.pool,
+            storage=storage,
         )
         if get_disagg().disaggregation_decode_host_receive_threshold < 1:
             pool = self.token_to_kv_pool
@@ -742,7 +749,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 self.host_swa_pool = group.get_pool(PoolName.SWA)
                 self.host_swa_reserved_tokens = min(
                     decode_retraction_max_tokens(
-                        self.req_to_token_pool, pool.swa_kv_pool
+                        self.req_to_token_pool,
+                        # The one state entry here is the window's.
+                        (
+                            pool.swa_kv_pool
+                            if storage is None
+                            else storage.view(storage.wire_entries()[0].sub_pool)
+                        ),
                     ),
                     ceil_align(
                         self.scheduler.sliding_window_size + pool.page_size - 1,
