@@ -26,6 +26,12 @@ const MAX_RECORDS: usize = 1 << 20;
 pub struct PendingPrefixes {
     ttl_ms: AtomicU64,
     hits: AtomicU64,
+    /// Max requests one stake may attract before it stops counting; 0 = no cap.
+    max_followers: AtomicU64,
+    /// Requests routed to a worker because of its pending stake.
+    followed: AtomicU64,
+    /// Lookups the cap left without any pending candidate.
+    capped: AtomicU64,
     /// Expiries are milliseconds since this, so a refresh is one atomic store.
     epoch: Instant,
     state: RwLock<State>,
@@ -36,6 +42,9 @@ impl Default for PendingPrefixes {
         Self {
             ttl_ms: AtomicU64::new(0),
             hits: AtomicU64::new(0),
+            max_followers: AtomicU64::new(0),
+            followed: AtomicU64::new(0),
+            capped: AtomicU64::new(0),
             epoch: Instant::now(),
             state: RwLock::default(),
         }
@@ -46,6 +55,8 @@ impl Default for PendingPrefixes {
 struct Owner {
     url: Arc<str>,
     expiry_ms: AtomicU64,
+    /// Requests this stake has already attracted (see `max_followers`).
+    followers: AtomicU64,
 }
 
 #[derive(Debug, Default)]
@@ -113,6 +124,50 @@ impl PendingPrefixes {
         self.hits.load(Ordering::Relaxed)
     }
 
+    /// Cap on requests one stake may attract; 0 disables the cap.
+    pub fn set_max_followers(&self, max: u64) {
+        self.max_followers.store(max, Ordering::Relaxed);
+    }
+
+    pub fn max_followers(&self) -> u64 {
+        self.max_followers.load(Ordering::Relaxed)
+    }
+
+    pub fn followed(&self) -> u64 {
+        self.followed.load(Ordering::Relaxed)
+    }
+
+    pub fn capped(&self) -> u64 {
+        self.capped.load(Ordering::Relaxed)
+    }
+
+    /// A request was routed to `url` because of its pending stake on
+    /// `hashes`: charge every live owner record of that stake one follower.
+    /// Once a record reaches the cap, [`Self::depths`] stops reporting the
+    /// stake: later requests are routed as if it did not exist, by their
+    /// confirmed matches (looked up first, always) or else by the load
+    /// policy, instead of piling onto one worker.
+    pub fn record_follow(&self, url: &str, hashes: &[i64]) {
+        if !self.is_enabled() || hashes.is_empty() {
+            return;
+        }
+        // Charge the DEEPEST record of the stake the request matched: the
+        // block that is specific to this prompt. The leading blocks (a shared
+        // system prompt, say) are owned by every stake on the worker, and
+        // charging them would cap every conversation on the worker at once.
+        let state = self.state.read();
+        let tail = hashes
+            .iter()
+            .map(|hash| state.owner(*hash, url))
+            .take_while(Option::is_some)
+            .last()
+            .flatten();
+        if let Some(owner) = tail {
+            owner.followers.fetch_add(1, Ordering::Relaxed);
+            self.followed.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     pub(crate) fn record_hit(&self) {
         self.hits.fetch_add(1, Ordering::Relaxed);
     }
@@ -160,6 +215,7 @@ impl PendingPrefixes {
                     owners.push(Owner {
                         url: Arc::clone(&url),
                         expiry_ms: AtomicU64::new(expiry),
+                        followers: AtomicU64::new(0),
                     });
                     state.fifo.push_back((expiry, hash, Arc::clone(&url)));
                 }
@@ -191,6 +247,7 @@ impl PendingPrefixes {
             return Vec::new();
         }
         let now_ms = self.millis(now);
+        let max_followers = self.max_followers();
         let state = self.state.read();
         let mut walking: Vec<(Arc<str>, usize)> = Vec::new();
         let mut done = Vec::new();
@@ -215,6 +272,24 @@ impl PendingPrefixes {
             }
         }
         done.extend(walking);
+        if max_followers == 0 {
+            return done;
+        }
+        // A stake at its follower cap is invisible. The cap lives on the
+        // deepest block the prompt matched (see `record_follow`), so a capped
+        // burst prefix hides only itself, not the worker's other stakes.
+        let before = done.len();
+        done.retain(|(url, depth)| {
+            state
+                .owner(hashes[depth - 1], url)
+                .is_none_or(|o| o.followers.load(Ordering::Relaxed) < max_followers)
+        });
+        // Counted only when the cap left the lookup with no pending candidate:
+        // that is the request the cap diverted to the confirmed tree or the
+        // load policy. A capped stake alongside a live one changes nothing.
+        if before > 0 && done.is_empty() {
+            self.capped.fetch_add(1, Ordering::Relaxed);
+        }
         done
     }
 }
@@ -236,6 +311,66 @@ mod tests {
         let pending = PendingPrefixes::default();
         pending.record("a", &[1, 2]);
         assert!(pending.depths(&[1, 2]).is_empty());
+    }
+
+    #[test]
+    fn follower_cap_hides_a_stake_and_counts_it() {
+        let pending = PendingPrefixes::default();
+        pending.enable(Duration::from_secs(60));
+        pending.set_max_followers(2);
+        pending.record("a", &[1, 2, 3]);
+        assert_eq!(sorted(pending.depths(&[1, 2, 3])), [("a".into(), 3)]);
+        pending.record_follow("a", &[1, 2, 3]);
+        assert_eq!(pending.followed(), 1);
+        assert_eq!(sorted(pending.depths(&[1, 2, 3])), [("a".into(), 3)]);
+        pending.record_follow("a", &[1, 2, 3, 4]);
+        assert_eq!(pending.followed(), 2);
+        // At the cap: the stake is invisible, and the lookup that lost its
+        // only candidate is counted.
+        assert!(pending.depths(&[1, 2, 3]).is_empty());
+        assert_eq!(pending.capped(), 1);
+        // Another worker's stake on the same prefix is unaffected, and a
+        // lookup it still serves is not counted as capped.
+        pending.record("b", &[1, 2]);
+        assert_eq!(sorted(pending.depths(&[1, 2, 3])), [("b".into(), 2)]);
+        assert_eq!(pending.capped(), 1);
+    }
+
+    #[test]
+    fn cap_is_charged_on_the_deepest_block_not_the_shared_prefix() {
+        let pending = PendingPrefixes::default();
+        pending.enable(Duration::from_secs(60));
+        pending.set_max_followers(2);
+        // Two conversations on "a" share blocks 1,2 (a system prompt).
+        pending.record("a", &[1, 2, 3]);
+        pending.record("a", &[1, 2, 9]);
+        // A burst on the first conversation's prefix reaches the cap...
+        pending.record_follow("a", &[1, 2, 3]);
+        pending.record_follow("a", &[1, 2, 3, 4]);
+        assert!(pending.depths(&[1, 2, 3]).is_empty());
+        // ...but the other conversation on the same worker is untouched,
+        // and so is a prompt that only shares the system prompt.
+        assert_eq!(sorted(pending.depths(&[1, 2, 9])), [("a".into(), 3)]);
+        assert_eq!(sorted(pending.depths(&[1, 2, 7])), [("a".into(), 2)]);
+        // A longer turn of the capped conversation matches past the capped
+        // block once its own tail is staked, so the conversation itself
+        // keeps following its stake.
+        pending.record("a", &[1, 2, 3, 4]);
+        assert_eq!(sorted(pending.depths(&[1, 2, 3, 4])), [("a".into(), 4)]);
+    }
+
+    #[test]
+    fn no_cap_by_default_and_follow_of_unknown_stake_is_free() {
+        let pending = PendingPrefixes::default();
+        pending.enable(Duration::from_secs(60));
+        pending.record("a", &[1, 2]);
+        for _ in 0..100 {
+            pending.record_follow("a", &[1, 2]);
+        }
+        assert_eq!(sorted(pending.depths(&[1, 2])), [("a".into(), 2)]);
+        pending.record_follow("zzz", &[1, 2]);
+        assert_eq!(pending.followed(), 100);
+        assert_eq!(pending.capped(), 0);
     }
 
     #[test]
