@@ -5460,15 +5460,14 @@ class Scheduler(
         if self.weightbridge_receiver is None:
             return
         was_paused = self._engine_paused
-        epoch = self.weightbridge_receiver.poll(
+        new_version = self.weightbridge_receiver.poll(
             quiesce=self._quiesce_for_weightbridge_update
         )
-        if epoch is None:
+        if new_version is None:
             return
         if not self.flush_cache():
             raise RuntimeError("WeightBridge update left requests holding stale KV")
-        # Epochs count updates from 0; the published version counts them from 1.
-        self.record_weight_version_change(new_version=str(epoch + 1))
+        self.record_weight_version_change(new_version=new_version)
         self._engine_paused = was_paused
         self.weightbridge_receiver.flush_profile_outputs()
 
