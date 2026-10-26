@@ -8,6 +8,7 @@ from unittest.mock import patch
 import torch
 
 import sglang.srt.models.deepseek_v4 as dsv4
+from sglang.srt.layers.engram import engram_gate
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
@@ -73,12 +74,16 @@ class TestDeepseekV41BCGMultimodal(CustomTestCase):
         image_id = 42
         ids = torch.tensor([7, image_id, 9])
         hidden = torch.arange(6, dtype=torch.float32).reshape(3, 1, 2)
+        kv = torch.ones(3, 4)
+        weight = torch.ones(1, 2)
 
         class Engram:
             layer_hash_index = 0
 
-            def __call__(self, residual, *args, **kwargs):
-                return residual + 10
+            def __call__(self, residual, *args, input_ids, **kwargs):
+                return engram_gate(
+                    residual, kv, weight, weight, 1e-6, 1e-6, input_ids, image_id
+                )
 
         layer = SimpleNamespace(
             engram=Engram(),
@@ -97,7 +102,8 @@ class TestDeepseekV41BCGMultimodal(CustomTestCase):
                 model_type="deepseek_v41", vision_n_layers=1, image_token_id=image_id
             ),
         )
-        expected = hidden + 10
+        expected = engram_gate(hidden, kv, weight, weight, 1e-6, 1e-6)
+        self.assertFalse(torch.equal(expected[1], hidden[1]))
         expected[1] = hidden[1]
         for contains_mm in (False, True):
             batch = SimpleNamespace(
