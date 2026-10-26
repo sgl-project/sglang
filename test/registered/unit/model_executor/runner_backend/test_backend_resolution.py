@@ -1,4 +1,4 @@
-"""CPU-only tests for decode graph backend resolution."""
+"""CPU-only tests for decode and prefill graph backend resolution."""
 
 import unittest
 from types import SimpleNamespace
@@ -21,12 +21,16 @@ def _make_graph_runner(*, device="custom"):
 def _make_exec_config(
     *,
     backend=Backend.FULL,
+    prefill_backend=Backend.BREAKABLE,
     enable_memory_saver=False,
     debug_cuda_graph=False,
 ):
     return SimpleNamespace(
         graph=SimpleNamespace(
-            cuda_graph_config=SimpleNamespace(decode=SimpleNamespace(backend=backend)),
+            cuda_graph_config=SimpleNamespace(
+                decode=SimpleNamespace(backend=backend),
+                prefill=SimpleNamespace(backend=prefill_backend),
+            ),
             debug_cuda_graph=debug_cuda_graph,
         ),
         features=SimpleNamespace(
@@ -162,6 +166,53 @@ class TestResolveDecodeBackend(CustomTestCase):
             enable_memory_saver=True,
             debug_eager=True,
         )
+
+
+class TestResolvePrefillBackendNPU(CustomTestCase):
+    def test_npu_breakable_resolves_to_npu_backend(self):
+        runner = _make_graph_runner(device="npu")
+        exec_config = _make_exec_config(
+            prefill_backend=Backend.BREAKABLE,
+            enable_memory_saver=True,
+            debug_cuda_graph=True,
+        )
+        expected_backend = object()
+        with (
+            mock.patch.object(backend_utils, "get_exec", return_value=exec_config),
+            mock.patch.object(
+                backend_utils,
+                "BreakableCudaGraphBackend",
+            ) as cuda_breakable_cls,
+            mock.patch(
+                "sglang.srt.hardware_backend.npu.graph_runner."
+                "breakable_npu_graph_backend.BreakableNPUGraphBackend",
+                return_value=expected_backend,
+            ) as npu_breakable_cls,
+        ):
+            actual_backend = backend_utils.resolve_prefill_backend(runner)
+
+        self.assertIs(actual_backend, expected_backend)
+        npu_breakable_cls.assert_called_once_with(
+            runner,
+            enable_memory_saver=True,
+            debug_eager=True,
+        )
+        cuda_breakable_cls.assert_not_called()
+
+    def test_npu_non_breakable_prefill_rejected(self):
+        # The NPU branch must reject 'full' instead of silently falling back
+        # to the CUDA FullCudaGraphBackend, whose capture would crash on NPU.
+        runner = _make_graph_runner(device="npu")
+        exec_config = _make_exec_config(prefill_backend=Backend.FULL)
+        with (
+            mock.patch.object(backend_utils, "get_exec", return_value=exec_config),
+            mock.patch.object(backend_utils, "FullCudaGraphBackend") as full_backend,
+        ):
+            with self.assertRaisesRegex(
+                ValueError, "NPU prefill graph only supports 'breakable'"
+            ):
+                backend_utils.resolve_prefill_backend(runner)
+            full_backend.assert_not_called()
 
 
 if __name__ == "__main__":
