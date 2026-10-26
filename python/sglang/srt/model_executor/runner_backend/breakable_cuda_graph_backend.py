@@ -163,7 +163,7 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
                 out_rows = self._output_rows(out, size)
                 self._copy_output_to_buffer(out, buffer, out_rows)
 
-        stored = self._slice_output(self._shared_output_buffer, out_rows)
+        stored = self._slice_output(buffer, out_rows)
         self._graphs[shape_key] = graph
         self._outputs[shape_key] = stored
         # CUDA graphs retain tensor addresses, not Python tensor lifetimes.
