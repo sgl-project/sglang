@@ -121,8 +121,7 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         if isinstance(self._decode_runner, DecodeCudaGraphRunner):
             return self._decode_update_attr_name()
         raise TypeError(
-            "Unsupported NPU graph update runner: "
-            f"{type(self._decode_runner).__name__}"
+            f"Unsupported NPU graph update runner: {type(self._decode_runner).__name__}"
         )
 
     def _decode_update_attr_name(self):
