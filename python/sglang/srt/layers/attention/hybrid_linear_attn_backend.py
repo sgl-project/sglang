@@ -1522,7 +1522,8 @@ class HybridLinearAttnBackend(AttentionBackend):
                 mamba_track_indices
             )
 
-        if src_indices_raw is not None:
+        # The primary backend's metadata can predate an AFD microbatch forward.
+        if req_pool_indices is not None:
             state_indices_tensor = self.linear_attn_backend._translate_mamba_indices(
                 self.linear_attn_backend.req_to_token_pool.get_mamba_indices(
                     req_pool_indices[:request_number]

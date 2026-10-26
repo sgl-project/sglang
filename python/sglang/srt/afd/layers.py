@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional
 
 import torch
@@ -94,6 +94,31 @@ def afd_shared_expert_sm_budget(handle: AFDDispatchHandle):
         else dispatcher.current_num_children
     )
     return compute_sm_budget(dispatcher.shared_expert_compute_num_sms(num_lanes))
+
+
+def run_afd_shared_experts_batch(pending, forward_shared_experts):
+    active = [i for i, item in enumerate(pending) if item.shared_input is not None]
+    if not active:
+        return pending
+
+    sizes = [pending[i].shared_input.shape[0] for i in active]
+    outputs = [None] * len(active)
+    if sum(sizes) > 0:
+        inputs = torch.cat([pending[i].shared_input for i in active], dim=0)
+        # The existing budget reserves every child lane, including empty
+        # children and lanes whose AG may already have completed.
+        with afd_shared_expert_sm_budget(pending[active[0]].handle):
+            output = forward_shared_experts(inputs)
+        outputs = output.split(sizes, dim=0)
+
+    result = list(pending)
+    for i, size, output in zip(active, sizes, outputs, strict=True):
+        result[i] = replace(
+            pending[i],
+            shared_output=output if size else None,
+            shared_input=None,
+        )
+    return result
 
 
 @eager_on_graph(True)

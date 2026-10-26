@@ -4,6 +4,7 @@ from unittest.mock import MagicMock, patch
 import torch
 
 import sglang.srt
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -11,6 +12,11 @@ register_cpu_ci(est_time=23, suite="base-a-test-cpu")
 
 
 class TestNgramMambaVerifyUpdate(CustomTestCase):
+    def setUp(self):
+        override = get_context().override_server_args(afd_role=None)
+        override.install()
+        self.addCleanup(override.restore)
+
     def _make_mock_target_worker(self):
         target_worker = MagicMock()
         target_worker.model_runner.model = MagicMock()
@@ -306,9 +312,7 @@ class TestDelayedMambaCommitBatchPairing(CustomTestCase):
                 default, req_rows, cache_indices >= 0, pool_size=64
             )
 
-        torch.testing.assert_close(
-            result, torch.tensor([17, 64, 31], dtype=torch.int32)
-        )
+        torch.testing.assert_close(result, torch.tensor([17, 0, 31], dtype=torch.int32))
 
 
 class TestMtpVerifyHookSignature(CustomTestCase):

@@ -949,11 +949,19 @@ class GDNAttnBackend(MambaAttnBackendBase):
             intermediate_conv_window_cache = (
                 mamba_cache_params.intermediate_conv_window[0]
             )
+            # Microbatches write disjoint positional rows of the parent batch.
+            intermediate_state_offset = (
+                forward_batch.tbo_parent_token_range[0]
+                // forward_batch.spec_info.draft_token_num
+                if forward_batch.tbo_parent_token_range is not None
+                else 0
+            )
             intermediate_state_indices = select_verify_intermediate_state_indices(
                 self.verify_intermediate_state_indices,
                 forward_batch.req_pool_indices,
                 cache_indices[: query_start_loc.shape[0] - 1] >= 0,
                 self.req_to_token_pool.size,
+                intermediate_state_offset=intermediate_state_offset,
             )
             mamba_pool = self.req_to_token_pool.mamba_pool
             use_replayssm_fold = (
@@ -1119,6 +1127,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     cache_steps=forward_batch.spec_info.draft_token_num,
                     retrieve_parent_token=retrieve_parent_token,
                     stable_rows=pp_spec_stable_rows_enabled(),
+                    intermediate_state_offset=intermediate_state_offset,
                 )
         else:
             g, beta = self._prefill_gates(layer, a, b)

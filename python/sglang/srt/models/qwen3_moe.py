@@ -19,7 +19,6 @@
 
 import logging
 import math
-from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, Dict, Iterable, List, Optional, Tuple, TypeVar
 
@@ -28,7 +27,6 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.afd.afd_config import is_afd_attn_moe_scattered
-from sglang.srt.afd.layers import AFDDispatchHandle
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
@@ -65,7 +63,7 @@ from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2_moe import Qwen2MoeMLP as Qwen3MoeMLP
-from sglang.srt.models.qwen2_moe import Qwen2MoeModel
+from sglang.srt.models.qwen2_moe import Qwen2MoeModel, QwenAFDMoEPending
 from sglang.srt.models.utils import (
     apply_qk_norm,
     create_fused_set_kv_buffer_arg,
@@ -114,11 +112,6 @@ _is_npu = is_npu()
 
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
-
-
-@dataclass(frozen=True)
-class _Qwen3AFDLayerPending:
-    handle: AFDDispatchHandle
 
 
 def compute_yarn_parameters(
@@ -319,9 +312,8 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         forward_batch: Optional[ForwardBatch] = None,
     ) -> torch.Tensor:
         if get_moe_a2a_backend().is_afd_attn():
-            if is_afd_attn_moe_scattered():
-                return self.forward_deepep(hidden_states, forward_batch)
-            return self.forward_normal(hidden_states)
+            topk_output = self._route_afd_experts(hidden_states, forward_batch)
+            return self.experts(hidden_states, topk_output)
 
         if self._use_mega_moe:
             return self._forward_mega_moe(hidden_states, forward_batch)
@@ -332,6 +324,37 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             return self.forward_normal(hidden_states)
         else:
             return self.forward_deepep(hidden_states, forward_batch)
+
+    def _route_afd_experts(
+        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
+    ):
+        if hidden_states.shape[0] == 0:
+            return self.topk.empty_topk_output(hidden_states.device)
+        router_logits, _ = self.gate(hidden_states)
+        scattered = is_afd_attn_moe_scattered()
+        return self.topk(
+            hidden_states,
+            router_logits,
+            num_token_non_padded=(
+                forward_batch.moe_num_token_non_padded() if scattered else None
+            ),
+            expert_location_dispatch_info=(
+                ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
+                if scattered
+                else None
+            ),
+        )
+
+    def launch_afd_experts(
+        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
+    ) -> QwenAFDMoEPending:
+        topk_output = self._route_afd_experts(hidden_states, forward_batch)
+        return QwenAFDMoEPending(
+            handle=self.experts.dispatch_afd(hidden_states, topk_output)
+        )
+
+    def finish_afd_experts(self, pending: QwenAFDMoEPending) -> torch.Tensor:
+        return self.experts.combine_afd(pending.handle)
 
     def get_moe_weights(self):
         return [
@@ -939,7 +962,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-    ) -> _Qwen3AFDLayerPending:
+    ) -> QwenAFDMoEPending:
         hidden_states = self.attn_boundary.prepare(hidden_states, forward_batch)
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
@@ -949,29 +972,14 @@ class Qwen3MoeDecoderLayer(nn.Module):
             )
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
-        if hidden_states.shape[0] != 0:
-            router_logits, _ = self.mlp.gate(hidden_states)
-            topk_output = self.mlp.topk(
-                hidden_states,
-                router_logits,
-                num_token_non_padded=(
-                    forward_batch.moe_num_token_non_padded()
-                    if is_afd_attn_moe_scattered()
-                    else None
-                ),
-            )
-        else:
-            topk_output = self.mlp.topk.empty_topk_output(hidden_states.device)
-        return _Qwen3AFDLayerPending(
-            handle=self.mlp.experts.dispatch_afd(hidden_states, topk_output),
-        )
+        return self.mlp.launch_afd_experts(hidden_states, forward_batch)
 
     def forward_afd_microbatch_finish(
         self,
-        pending: _Qwen3AFDLayerPending,
+        pending: QwenAFDMoEPending,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        hidden_states = self.mlp.experts.combine_afd(pending.handle)
+        hidden_states = self.mlp.finish_afd_experts(pending)
         return self.ffn_boundary.finish(hidden_states, forward_batch)
 
     def op_comm_prepare_attn(

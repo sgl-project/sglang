@@ -39,7 +39,11 @@ from sglang.srt.afd.ffn.scheduler import (
     _select_direct_union_sessions,
 )
 from sglang.srt.afd.layers import AFDMoELayer
-from sglang.srt.afd.microbatch_overlap import _build_afd_microbatch_child_replay_views
+from sglang.srt.afd.microbatch_overlap import (
+    AFDMicrobatchAttentionBackend,
+    _build_afd_microbatch_child_replay_views,
+    prepare_afd_microbatch_forward_batch,
+)
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.layers.compute_sm import get_compute_num_sms
 from sglang.srt.managers.scheduler_components.dp_attn import _update_gather_batch
@@ -47,7 +51,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     default_cuda_graph_config,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     build_replay_fb_view,
 )
@@ -55,6 +59,7 @@ from sglang.srt.runtime_context import get_context, get_disagg, get_parallel
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.eagle_info import EagleVerifyInput
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
@@ -237,7 +242,7 @@ class TestAFDDPMetadata(unittest.TestCase):
             kv_loc_plan=None,
             kv_loc_cols=None,
             max_seq_len_override=None,
-            mamba_track_indices=None,
+            mamba_track_indices=torch.arange(20, 25),
             lora_ids=None,
             can_run_decode_cuda_graph=True,
             spec_info=spec_info,
@@ -258,7 +263,7 @@ class TestAFDDPMetadata(unittest.TestCase):
                         forward_batch,
                         buffers=forward_batch,
                         bs=5,
-                        raw_bs=5,
+                        raw_bs=4,
                         num_tokens=15,
                         global_num_tokens_cpu=None,
                         seq_len_fill_value=1,
@@ -277,6 +282,11 @@ class TestAFDDPMetadata(unittest.TestCase):
                         end = start + size
                         child_spec = child.spec_info
                         self.assertEqual(child.batch_size, size)
+                        self.assertEqual(child.num_padding, max(0, end - 4))
+                        self.assertEqual(
+                            child.mamba_track_indices.tolist(),
+                            list(range(20 + start, 20 + end)),
+                        )
                         self.assertTrue(child.out_cache_loc_is_physical)
                         self.assertEqual(
                             child.input_ids.tolist(), list(range(start * 3, end * 3))
@@ -1542,6 +1552,129 @@ class TestAFDDirectUnion(unittest.TestCase):
         self.assertEqual(ForwardMode(prefill_plan.forward_mode), ForwardMode.EXTEND)
         self.assertEqual(prefill_msg.wire_capacity, 9)
         self.assertEqual(prefill_msg.tokens_per_rank, [9, 7, 0, 0, 3, 5])
+
+
+class TestAFDHybridState(CustomTestCase):
+    def setUp(self):
+        override = get_context().override_server_args(
+            afd_role="attn", afd_decode_num_microbatches=2
+        )
+        override.install()
+        self.addCleanup(override.restore)
+
+    def test_microbatches_keep_request_tracking_aligned(self):
+        batch = ForwardBatch(
+            forward_mode=ForwardMode.DECODE,
+            batch_size=5,
+            input_ids=torch.arange(5),
+            req_pool_indices=torch.tensor([7, 2, 8, 4, 6]),
+            seq_lens=torch.arange(10, 15),
+            seq_lens_sum=60,
+            seq_lens_cpu=torch.arange(10, 15),
+            out_cache_loc=torch.arange(5),
+            positions=torch.arange(5),
+            mamba_track_indices=torch.arange(20, 25),
+            mamba_track_mask=torch.tensor([True, False, True, False, True]),
+            mamba_track_seqlens=torch.arange(30, 35),
+            mamba_prefill_track_mask_cpu=[True, False, True, False, True],
+            mamba_track_seqlens_cpu=list(range(30, 35)),
+            global_num_tokens_cpu=[5],
+            global_num_tokens_gpu=torch.tensor([5]),
+            global_num_token_non_padded_cpu=5,
+        )
+        prepare_afd_microbatch_forward_batch(batch, 2)
+        for field in (
+            "req_pool_indices",
+            "mamba_track_indices",
+            "mamba_track_mask",
+            "mamba_track_seqlens",
+        ):
+            torch.testing.assert_close(
+                torch.cat(
+                    [getattr(child, field) for child in batch.afd_microbatch_children]
+                ),
+                getattr(batch, field),
+            )
+        second = batch.afd_microbatch_children[1]
+        self.assertEqual(second.mamba_prefill_track_mask_cpu, [False, True])
+        self.assertEqual(second.mamba_track_seqlens_cpu, [33, 34])
+
+    def test_mtp_commit_preserves_scratch_across_microbatches(self):
+        from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+            HybridLinearAttnBackend,
+        )
+        from sglang.srt.layers.attention.linear.utils import (
+            build_verify_intermediate_state_indices,
+            select_verify_intermediate_state_indices,
+        )
+
+        with (
+            patch("sglang.srt.utils.common.get_eager_max_batch_size", return_value=3),
+            patch(
+                "sglang.srt.utils.common.get_cuda_graph_max_batch_size", return_value=8
+            ),
+        ):
+            default_indices = build_verify_intermediate_state_indices(3, "cpu")
+        scratch = torch.zeros(4, 2)
+        for offset, rows, values in (
+            (0, [8, 5], [[80, 81], [50, 51]]),
+            (2, [7, 0], [[70, 71], [-1, -1]]),
+            (4, [0, 0], [[-1, -1], [-1, -1]]),
+        ):
+            rows = torch.tensor(rows)
+            indices = select_verify_intermediate_state_indices(
+                default_indices,
+                rows,
+                rows != 0,
+                pool_size=3,
+                intermediate_state_offset=offset,
+            )
+            scratch[indices.long()] = torch.tensor(values, dtype=scratch.dtype)
+        torch.testing.assert_close(
+            scratch, torch.tensor([[80, 81], [50, 51], [70, 71], [-1, -1.0]])
+        )
+
+        state = torch.zeros(9)
+        mapping = torch.tensor([0, 0, 0, 0, 0, 2, 0, 6, 4])
+        req_pool = SimpleNamespace(
+            get_mamba_indices=lambda rows: mapping[rows],
+            get_speculative_mamba2_params_all_layers=lambda: state,
+            mamba_pool=SimpleNamespace(),
+        )
+        primary = HybridLinearAttnBackend.__new__(HybridLinearAttnBackend)
+        primary.linear_attn_backend = SimpleNamespace(
+            req_to_token_pool=req_pool,
+            _translate_mamba_indices=lambda rows: rows,
+            forward_metadata=SimpleNamespace(mamba_cache_indices=torch.tensor([1])),
+            accept_lens_pool=None,
+        )
+        primary._update_ple_state_after_mtp_verify = lambda *args: None
+        wrapper = AFDMicrobatchAttentionBackend.__new__(AFDMicrobatchAttentionBackend)
+        wrapper.primary = primary
+
+        def scatter(destination, indices, steps, *args, src_indices_raw):
+            source_rows = (
+                torch.arange(steps.numel())
+                if src_indices_raw is None
+                else src_indices_raw
+            )
+            destination[indices] = scratch[source_rows, steps]
+
+        with patch(
+            "sglang.srt.layers.attention.hybrid_linear_attn_backend."
+            "scatter_mamba_states_after_mtp_verify",
+            side_effect=scatter,
+        ):
+            wrapper.update_mamba_state_after_mtp_verify(
+                torch.tensor([1, 0, 1]),
+                None,
+                None,
+                model=None,
+                req_pool_indices=torch.tensor([8, 5, 7]),
+            )
+        torch.testing.assert_close(
+            state, torch.tensor([0, 0, 50, 0, 81, 0, 71, 0, 0.0])
+        )
 
 
 if __name__ == "__main__":

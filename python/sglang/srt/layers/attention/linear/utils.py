@@ -109,26 +109,33 @@ def resolve_linear_attn_backends(
 
 
 def select_verify_intermediate_state_indices(
-    default_indices, req_pool_indices, valid, pool_size: int
+    default_indices,
+    req_pool_indices,
+    valid,
+    pool_size: int,
+    intermediate_state_offset: int = 0,
 ):
     if not pp_spec_stable_rows_enabled():
-        return default_indices
+        if default_indices is None:
+            return None
+        return default_indices[
+            intermediate_state_offset : intermediate_state_offset + valid.shape[0]
+        ]
 
     import torch
 
     req_rows = req_pool_indices[: valid.shape[0]]
-    return torch.where(valid, req_rows, torch.full_like(req_rows, pool_size)).to(
-        torch.int32
-    )
+    # Request rows are 1..pool_size; row 0 is reserved for padding.
+    return torch.where(valid, req_rows, torch.zeros_like(req_rows)).to(torch.int32)
 
 
 def build_verify_intermediate_state_indices(pool_size: int, device):
     """Per-request row index into the speculative intermediate scratch
     (`intermediate_ssm` / `intermediate_conv_window`) for the MTP /
-    target_verify path: request slot i owns scratch row i.
+    target_verify path: parent batch position i owns scratch row i.
 
     The scratch is allocated with one extra padding row (the `+1` in
-    MambaPool.SpeculativeState, index `pool_size`). Warmup and MLP-sync
+    MambaPool.SpeculativeState, index `pool_size`). Graph, warmup and MLP-sync
     batches can be padded past the pool capacity — under DP attention
     `get_eager_max_batch_size` ceil-aligns the eager warmup bs to attn_tp —
     and the verify kernels index this table positionally up to that padded
@@ -138,9 +145,16 @@ def build_verify_intermediate_state_indices(pool_size: int, device):
     """
     import torch
 
-    from sglang.srt.utils.common import get_eager_max_batch_size
+    from sglang.srt.utils.common import (
+        get_cuda_graph_max_batch_size,
+        get_eager_max_batch_size,
+    )
 
-    padded_bs = max(get_eager_max_batch_size(pool_size), pool_size)
+    padded_bs = max(
+        get_eager_max_batch_size(pool_size),
+        get_cuda_graph_max_batch_size(pool_size),
+        pool_size,
+    )
     indices = torch.arange(pool_size, dtype=torch.int32, device=device)
     if padded_bs > pool_size:
         indices = torch.cat(

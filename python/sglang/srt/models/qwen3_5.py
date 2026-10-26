@@ -32,6 +32,12 @@ from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
     qwen3_5_gdn_prefill_projection_views,
 )
 from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
+from sglang.srt.afd.afd_config import is_afd_attn_moe_scattered
+from sglang.srt.afd.microbatch_overlap import (
+    merge_afd_residual_streams,
+    run_afd_microbatch_wavefront,
+    split_afd_residual_stream,
+)
 
 # Configs
 from sglang.srt.configs.model_config import (
@@ -1176,17 +1182,16 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 ),
             )
 
-    def forward(
+    def _forward_attention(
         self,
         hidden_states: torch.Tensor,
-        **kwargs,
+        forward_batch: ForwardBatch,
+        captured_last_layer_outputs: Optional[AuxHiddenStateAccumulator] = None,
     ):
-        forward_batch = kwargs.get("forward_batch", None)
-
         hidden_states = self.attn_boundary.prepare(
             hidden_states,
             forward_batch,
-            capture_gathered=kwargs.get("captured_last_layer_outputs", None),
+            capture_gathered=captured_last_layer_outputs,
         )
 
         # fused AR+quant hands down a (fp8, scale) / (bf16, fp8, scale) tuple
@@ -1199,8 +1204,15 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
 
         # Fully Connected
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
-        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
+        return self.ffn_boundary.prepare(hidden_states, forward_batch)
 
+    def forward(self, hidden_states: torch.Tensor, **kwargs):
+        forward_batch = kwargs.get("forward_batch", None)
+        hidden_states = self._forward_attention(
+            hidden_states,
+            forward_batch,
+            kwargs.get("captured_last_layer_outputs", None),
+        )
         with self.ffn_boundary.exit(forward_batch) as ffn_exit:
             if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
                 hidden_states = self.mlp(
@@ -1210,6 +1222,23 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 )
             else:
                 hidden_states = self.mlp(hidden_states)
+        return ffn_exit.finish(hidden_states)
+
+    def forward_afd_microbatch_launch(
+        self, positions, hidden_states, forward_batch, captured_last_layer_outputs=None
+    ):
+        hidden_states = self._forward_attention(
+            hidden_states, forward_batch, captured_last_layer_outputs
+        )
+        return self.mlp.launch_afd_experts(
+            hidden_states,
+            forward_batch,
+            defer_shared_experts=is_afd_attn_moe_scattered(),
+        )
+
+    def forward_afd_microbatch_finish(self, pending, forward_batch):
+        with self.ffn_boundary.exit(forward_batch) as ffn_exit:
+            hidden_states = self.mlp.finish_afd_experts(pending)
         return ffn_exit.finish(hidden_states)
 
 
@@ -1585,13 +1614,12 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         output, _ = self.o_proj(attn_output)
         return output
 
-    def forward(
+    def _forward_attention(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         captured_last_layer_outputs: Optional[AuxHiddenStateAccumulator] = None,
-        **kwargs,
     ):
         hidden_states = self.attn_boundary.prepare(
             hidden_states,
@@ -1610,7 +1638,19 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
 
         # Fully Connected
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
-        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
+        return self.ffn_boundary.prepare(hidden_states, forward_batch)
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        captured_last_layer_outputs: Optional[AuxHiddenStateAccumulator] = None,
+        **kwargs,
+    ):
+        hidden_states = self._forward_attention(
+            positions, hidden_states, forward_batch, captured_last_layer_outputs
+        )
         with self.ffn_boundary.exit(forward_batch) as ffn_exit:
             if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
                 hidden_states = self.mlp(
@@ -1620,6 +1660,23 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 )
             else:
                 hidden_states = self.mlp(hidden_states)
+        return ffn_exit.finish(hidden_states)
+
+    def forward_afd_microbatch_launch(
+        self, positions, hidden_states, forward_batch, captured_last_layer_outputs=None
+    ):
+        hidden_states = self._forward_attention(
+            positions, hidden_states, forward_batch, captured_last_layer_outputs
+        )
+        return self.mlp.launch_afd_experts(
+            hidden_states,
+            forward_batch,
+            defer_shared_experts=is_afd_attn_moe_scattered(),
+        )
+
+    def forward_afd_microbatch_finish(self, pending, forward_batch):
+        with self.ffn_boundary.exit(forward_batch) as ffn_exit:
+            hidden_states = self.mlp.finish_afd_experts(pending)
         return ffn_exit.finish(hidden_states)
 
 
@@ -1841,6 +1898,58 @@ class Qwen3_5ForCausalLM(nn.Module):
     def end_layer(self) -> int:
         return self._end_layer
 
+    def _forward_afd_microbatch(
+        self, hidden_states, forward_batch, aux_hidden_states, input_deepstack_embeds
+    ):
+        child_states = split_afd_residual_stream(hidden_states, forward_batch)
+        child_captures = [AuxHiddenStateList() for _ in child_states]
+
+        def launch_child_layer(layer, child, hidden, child_index):
+            return layer.forward_afd_microbatch_launch(
+                child.positions,
+                hidden,
+                child,
+                captured_last_layer_outputs=(
+                    child_captures[child_index]
+                    if getattr(layer, "_is_layer_to_capture", False)
+                    else None
+                ),
+            )
+
+        def finish_child_layer(layer, child, pending, _child_index):
+            hidden = layer.forward_afd_microbatch_finish(pending, child)
+            if (
+                input_deepstack_embeds is not None
+                and input_deepstack_embeds.numel() > 0
+                and layer.layer_id < 3
+            ):
+                rows = slice(*child.tbo_parent_token_range)
+                sep = self.hidden_size * layer.layer_id
+                hidden = residual_batch.add_to_output(
+                    hidden,
+                    child,
+                    input_deepstack_embeds[rows, sep : sep + self.hidden_size],
+                )
+            return hidden
+
+        def after_launch_layer(layer, pending):
+            return layer.mlp.run_afd_shared_experts_batch(pending)
+
+        child_states = run_afd_microbatch_wavefront(
+            layers=self.layers,
+            start_layer=self.start_layer,
+            end_layer=self.end_layer,
+            forward_batch=forward_batch,
+            child_states=child_states,
+            launch_child_layer=launch_child_layer,
+            finish_child_layer=finish_child_layer,
+            after_launch_layer=after_launch_layer,
+        )
+        aux_hidden_states.extend(
+            torch.cat(captures) for captures in zip(*child_captures, strict=True)
+        )
+        return merge_afd_residual_streams(child_states, forward_batch)
+
     @torch.no_grad()
     def forward(
         self,
@@ -1875,8 +1984,15 @@ class Qwen3_5ForCausalLM(nn.Module):
             )
 
         aux_hidden_states = AuxHiddenStateList()
+        if forward_batch.can_run_afd_microbatch_overlap:
+            hidden_states = self._forward_afd_microbatch(
+                hidden_states, forward_batch, aux_hidden_states, input_deepstack_embeds
+            )
+            layer_range = ()
+        else:
+            layer_range = range(self.start_layer, self.end_layer)
         # Pass through decoder layers
-        for layer_idx in range(self.start_layer, self.end_layer):
+        for layer_idx in layer_range:
             layer = self.layers[layer_idx]
             with get_global_expert_distribution_recorder().with_current_layer(
                 layer_idx

@@ -287,83 +287,97 @@ class TestFlashInferGDNAlignment(unittest.TestCase):
         self.assertEqual(len(kernel._aligned_input_buffers), 0)
 
     def test_mtp_padded_capture_uses_stable_exact_batch_workspace_and_copies_back(self):
-        kernel = _make_kernel_without_flashinfer()
-        kernel.use_state_pool = True
-        captured_ptrs = []
+        for offset in (0, 4):
+            with self.subTest(offset=offset):
+                kernel = _make_kernel_without_flashinfer()
+                kernel.use_state_pool = True
+                captured_ptrs = []
 
-        def fake_mtp(**kwargs):
-            workspace = kwargs["intermediate_states_buffer"]
-            captured_ptrs.append(workspace.data_ptr())
-            self.assertEqual(workspace.shape[0], 8)
-            for row in range(workspace.shape[0]):
-                workspace[row].fill_(row + 1)
-            return torch.zeros_like(kwargs["v"]), None
+                def fake_mtp(**kwargs):
+                    workspace = kwargs["intermediate_states_buffer"]
+                    captured_ptrs.append(workspace.data_ptr())
+                    self.assertEqual(workspace.shape[0], 8)
+                    for row in range(workspace.shape[0]):
+                        workspace[row].fill_(row + 1)
+                    return torch.zeros_like(kwargs["v"]), None
 
-        kernel._mtp_fn = fake_mtp
-        workspace = torch.zeros((7, 2, 8, 4, 4), dtype=torch.bfloat16)
+                kernel._mtp_fn = fake_mtp
+                workspace = torch.zeros((offset + 7, 2, 8, 4, 4), dtype=torch.bfloat16)
 
-        def run_once():
-            return kernel.target_verify(
-                torch.zeros(8),
-                torch.zeros(8, dtype=torch.bfloat16),
-                torch.empty(1, 16, 1, 4, dtype=torch.bfloat16),
-                torch.empty(1, 16, 1, 4, dtype=torch.bfloat16),
-                torch.empty(1, 16, 8, 4, dtype=torch.bfloat16),
-                torch.empty(1, 16, 8, dtype=torch.bfloat16),
-                torch.empty(1, 16, 8, dtype=torch.bfloat16),
-                ssm_states=torch.zeros(8, 8, 4, 4, dtype=torch.bfloat16),
-                cache_indices=torch.zeros(8, dtype=torch.int32),
-                query_start_loc=torch.arange(0, 18, 2, dtype=torch.int32),
-                intermediate_states_buffer=workspace,
-                intermediate_state_indices=torch.arange(8, dtype=torch.int32),
-                cache_steps=2,
-                retrieve_parent_token=None,
-            )
+                def run_once():
+                    return kernel.target_verify(
+                        torch.zeros(8),
+                        torch.zeros(8, dtype=torch.bfloat16),
+                        torch.empty(1, 16, 1, 4, dtype=torch.bfloat16),
+                        torch.empty(1, 16, 1, 4, dtype=torch.bfloat16),
+                        torch.empty(1, 16, 8, 4, dtype=torch.bfloat16),
+                        torch.empty(1, 16, 8, dtype=torch.bfloat16),
+                        torch.empty(1, 16, 8, dtype=torch.bfloat16),
+                        ssm_states=torch.zeros(8, 8, 4, 4, dtype=torch.bfloat16),
+                        cache_indices=torch.zeros(8, dtype=torch.int32),
+                        query_start_loc=torch.arange(0, 18, 2, dtype=torch.int32),
+                        intermediate_states_buffer=workspace,
+                        intermediate_state_indices=torch.arange(
+                            offset, offset + 8, dtype=torch.int32
+                        ),
+                        cache_steps=2,
+                        retrieve_parent_token=None,
+                        intermediate_state_offset=offset,
+                    )
 
-        self.assertEqual(run_once().shape, (1, 16, 8, 4))
-        for row in range(workspace.shape[0]):
-            torch.testing.assert_close(
-                workspace[row], torch.full_like(workspace[row], row + 1)
-            )
-        self.assertEqual(len(kernel._verify_intermediate_buffers), 1)
+                self.assertEqual(run_once().shape, (1, 16, 8, 4))
+                torch.testing.assert_close(
+                    workspace[:offset], torch.zeros_like(workspace[:offset])
+                )
+                for row in range(offset, workspace.shape[0]):
+                    torch.testing.assert_close(
+                        workspace[row],
+                        torch.full_like(workspace[row], row - offset + 1),
+                    )
+                self.assertEqual(len(kernel._verify_intermediate_buffers), 1)
 
-        workspace.zero_()
-        run_once()
-        self.assertEqual(captured_ptrs[0], captured_ptrs[1])
-        self.assertEqual(len(kernel._verify_intermediate_buffers), 1)
+                workspace.zero_()
+                run_once()
+                self.assertEqual(captured_ptrs[0], captured_ptrs[1])
+                self.assertEqual(len(kernel._verify_intermediate_buffers), 1)
 
     def test_mtp_pool_sized_batch_keeps_zero_copy_fast_path(self):
         kernel = _make_kernel_without_flashinfer()
         kernel.use_state_pool = True
-        workspace = torch.zeros((7, 2, 8, 4, 4), dtype=torch.bfloat16)
-        captured = {}
+        workspace = torch.zeros((5, 2, 8, 4, 4), dtype=torch.bfloat16)
+        captured_ptrs = []
 
         def fake_mtp(**kwargs):
-            captured.update(kwargs)
+            child_workspace = kwargs["intermediate_states_buffer"]
+            captured_ptrs.append(child_workspace.data_ptr())
+            child_workspace.fill_(len(captured_ptrs))
             return torch.zeros_like(kwargs["v"]), None
 
         kernel._mtp_fn = fake_mtp
-        result = kernel.target_verify(
-            torch.zeros(8),
-            torch.zeros(8, dtype=torch.bfloat16),
-            torch.empty(1, 4, 1, 4, dtype=torch.bfloat16),
-            torch.empty(1, 4, 1, 4, dtype=torch.bfloat16),
-            torch.empty(1, 4, 8, 4, dtype=torch.bfloat16),
-            torch.empty(1, 4, 8, dtype=torch.bfloat16),
-            torch.empty(1, 4, 8, dtype=torch.bfloat16),
-            ssm_states=torch.zeros(7, 8, 4, 4, dtype=torch.bfloat16),
-            cache_indices=torch.zeros(2, dtype=torch.int32),
-            query_start_loc=torch.arange(0, 6, 2, dtype=torch.int32),
-            intermediate_states_buffer=workspace,
-            intermediate_state_indices=torch.arange(7, dtype=torch.int32),
-            cache_steps=2,
-            retrieve_parent_token=None,
-        )
+        for offset in (0, 2):
+            result = kernel.target_verify(
+                torch.zeros(8),
+                torch.zeros(8, dtype=torch.bfloat16),
+                torch.empty(1, 4, 1, 4, dtype=torch.bfloat16),
+                torch.empty(1, 4, 1, 4, dtype=torch.bfloat16),
+                torch.empty(1, 4, 8, 4, dtype=torch.bfloat16),
+                torch.empty(1, 4, 8, dtype=torch.bfloat16),
+                torch.empty(1, 4, 8, dtype=torch.bfloat16),
+                ssm_states=torch.zeros(7, 8, 4, 4, dtype=torch.bfloat16),
+                cache_indices=torch.zeros(2, dtype=torch.int32),
+                query_start_loc=torch.arange(0, 6, 2, dtype=torch.int32),
+                intermediate_states_buffer=workspace,
+                intermediate_state_indices=torch.arange(offset, offset + 2),
+                cache_steps=2,
+                retrieve_parent_token=None,
+                intermediate_state_offset=offset,
+            )
 
-        self.assertEqual(result.shape, (1, 4, 8, 4))
-        self.assertEqual(
-            captured["intermediate_states_buffer"].data_ptr(), workspace.data_ptr()
-        )
+            self.assertEqual(result.shape, (1, 4, 8, 4))
+            self.assertEqual(captured_ptrs[-1], workspace[offset].data_ptr())
+        torch.testing.assert_close(workspace[:2], torch.ones_like(workspace[:2]))
+        torch.testing.assert_close(workspace[2:4], torch.full_like(workspace[2:4], 2))
+        torch.testing.assert_close(workspace[4], torch.zeros_like(workspace[4]))
         self.assertEqual(len(kernel._verify_intermediate_buffers), 0)
 
     def test_mtp_padded_workspace_is_reused_across_sequential_layer_pools(self):

@@ -615,6 +615,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         cache_steps: int,
         retrieve_parent_token: torch.Tensor,
         stable_rows: bool = False,
+        intermediate_state_offset: int = 0,
         **kwargs,
     ) -> torch.Tensor:
         # MTP verify using FlashInfer gated_delta_rule_mtp kernel (SM90 + SM100+).
@@ -638,17 +639,21 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
                 "FlashInfer GDN MTP kernel requires a, b, A_log, dt_bias."
             )
 
-        intermediate_states_buffer_mtp = intermediate_states_buffer
+        positional_buffer = intermediate_states_buffer
+        if intermediate_states_buffer is not None and not stable_rows:
+            positional_buffer = intermediate_states_buffer[
+                intermediate_state_offset : intermediate_state_offset + batch_size
+            ]
+        intermediate_states_buffer_mtp = positional_buffer
         copy_verify_intermediate_back = False
-        if intermediate_states_buffer is not None and (
-            self.use_state_pool or stable_rows
-        ):
-            # FlashInfer writes positional rows; isolate them in exact-B scratch.
+        if intermediate_states_buffer is not None:
+            # Use the parent's positional slice directly when it holds exact B.
+            # Padded tiers and PP-stable rows still need separate scratch.
             (
                 intermediate_states_buffer_mtp,
                 copy_verify_intermediate_back,
             ) = self._prepare_verify_intermediate_buffer(
-                intermediate_states_buffer,
+                positional_buffer,
                 batch_size,
                 force_scratch=stable_rows,
             )
@@ -723,8 +728,8 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
                 intermediate_state_indices[:batch_size],
             )
         elif copy_verify_intermediate_back:
-            intermediate_states_buffer.copy_(
-                intermediate_states_buffer_mtp[: intermediate_states_buffer.shape[0]]
+            positional_buffer.copy_(
+                intermediate_states_buffer_mtp[: positional_buffer.shape[0]]
             )
 
         return output_fi.view(1, seq_len, num_v_heads, head_v_dim)

@@ -20,6 +20,7 @@
 
 import logging
 from contextlib import nullcontext
+from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -32,6 +33,11 @@ from sglang.kernels.ops.elementwise.elementwise import (
     fused_gate_sigmoid_mul_add,
 )
 from sglang.srt.afd.afd_config import is_afd_attn_moe_scattered
+from sglang.srt.afd.layers import (
+    AFDDispatchHandle,
+    afd_shared_expert_sm_budget,
+    run_afd_shared_experts_batch,
+)
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_stages
 from sglang.srt.distributed import (
     get_pp_indices,
@@ -63,7 +69,10 @@ from sglang.srt.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
-from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.logits_processor import (
+    LogitsProcessor,
+    get_in_autotune_dummy_run,
+)
 from sglang.srt.layers.moe import get_moe_a2a_backend, reduce_moe_output
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
@@ -122,6 +131,13 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+
+
+@dataclass(frozen=True)
+class QwenAFDMoEPending:
+    handle: AFDDispatchHandle
+    shared_output: Optional[torch.Tensor] = None
+    shared_input: Optional[torch.Tensor] = None
 
 
 def get_num_shared_experts(config: PretrainedConfig) -> int:
@@ -551,6 +567,86 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
         return shared_output
 
+    def _route_afd_experts(
+        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
+    ):
+        if hidden_states.shape[0] == 0:
+            return self.topk.empty_topk_output(hidden_states.device)
+        router_logits, _ = self.gate(hidden_states)
+        return self.topk(
+            hidden_states,
+            router_logits,
+            num_token_non_padded=(
+                forward_batch.moe_num_token_non_padded()
+                if is_afd_attn_moe_scattered()
+                else None
+            ),
+        )
+
+    def _merge_afd_experts(
+        self, routed_output: torch.Tensor, shared_output: Optional[torch.Tensor]
+    ) -> torch.Tensor:
+        if shared_output is not None:
+            routed_output.add_(shared_output)
+        if self.reduce_results:
+            routed_output = reduce_moe_output(routed_output)
+        return routed_output
+
+    def _forward_afd(
+        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
+    ) -> torch.Tensor:
+        if (
+            forward_batch is not None
+            and (
+                forward_batch.forward_mode.is_decode()
+                or forward_batch.forward_mode.is_target_verify()
+            )
+            and hidden_states.shape[0] > 0
+            and not get_in_autotune_dummy_run()
+        ):
+            return self.finish_afd_experts(
+                self.launch_afd_experts(hidden_states, forward_batch)
+            )
+
+        topk_output = self._route_afd_experts(hidden_states, forward_batch)
+        shared_output = (
+            self._forward_shared_experts(hidden_states)
+            if hidden_states.shape[0] > 0
+            else None
+        )
+        routed_output = self.experts(hidden_states, topk_output)
+        return self._merge_afd_experts(routed_output, shared_output)
+
+    def launch_afd_experts(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        *,
+        defer_shared_experts: bool = False,
+    ) -> QwenAFDMoEPending:
+        topk_output = self._route_afd_experts(hidden_states, forward_batch)
+        handle = self.experts.dispatch_afd(hidden_states, topk_output)
+        shared_output = None
+        shared_input = None
+        if self.shared_expert is not None:
+            if defer_shared_experts:
+                shared_input = hidden_states
+            elif hidden_states.shape[0] > 0:
+                with afd_shared_expert_sm_budget(handle):
+                    shared_output = self._forward_shared_experts(hidden_states)
+        return QwenAFDMoEPending(
+            handle=handle, shared_output=shared_output, shared_input=shared_input
+        )
+
+    def run_afd_shared_experts_batch(
+        self, pending: list[QwenAFDMoEPending]
+    ) -> list[QwenAFDMoEPending]:
+        return run_afd_shared_experts_batch(pending, self._forward_shared_experts)
+
+    def finish_afd_experts(self, pending: QwenAFDMoEPending) -> torch.Tensor:
+        routed_output = self.experts.combine_afd(pending.handle)
+        return self._merge_afd_experts(routed_output, pending.shared_output)
+
     def _forward_deepep(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch):
         trace_e2e = envs.SGLANG_TRACE_QWEN_MOE_DEEPEP_E2E.get()
 
@@ -824,6 +920,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         hidden_states = hidden_states.view(-1, hidden_dim)
         if defer_finalize and num_tokens == 0:
             raise RuntimeError("Qwen deferred finalize does not support M=0")
+
+        if get_moe_a2a_backend().is_afd_attn():
+            return self._forward_afd(hidden_states, forward_batch)
 
         if self._use_mega_moe:
             return self._forward_mega_moe(hidden_states, forward_batch)

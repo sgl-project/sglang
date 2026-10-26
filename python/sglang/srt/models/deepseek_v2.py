@@ -49,7 +49,11 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
     create_per_token_group_quant_fp8_output_scale,
 )
 from sglang.srt.afd.afd_config import is_afd_attn_moe_scattered
-from sglang.srt.afd.layers import AFDDispatchHandle, afd_shared_expert_sm_budget
+from sglang.srt.afd.layers import (
+    AFDDispatchHandle,
+    afd_shared_expert_sm_budget,
+    run_afd_shared_experts_batch,
+)
 from sglang.srt.batch_overlap.single_batch_overlap import SboFlags, compute_overlap_args
 from sglang.srt.batch_overlap.two_batch_overlap import (
     MaybeTboDeepEPDispatcher,
@@ -1043,28 +1047,7 @@ class DeepseekV2MoE(nn.Module):
     def run_afd_shared_experts_batch(
         self, pending: list[DeepseekAFDMoEPending]
     ) -> list[DeepseekAFDMoEPending]:
-        active = [i for i, item in enumerate(pending) if item.shared_input is not None]
-        if not active:
-            return pending
-
-        sizes = [pending[i].shared_input.shape[0] for i in active]
-        outputs = [None] * len(active)
-        if sum(sizes) > 0:
-            inputs = torch.cat([pending[i].shared_input for i in active], dim=0)
-            # The existing budget reserves every child lane, including empty
-            # children and lanes whose AG may already have completed.
-            with afd_shared_expert_sm_budget(pending[active[0]].handle):
-                output = self._forward_shared_experts(inputs)
-            outputs = output.split(sizes, dim=0)
-
-        result = list(pending)
-        for i, size, output in zip(active, sizes, outputs, strict=True):
-            result[i] = replace(
-                pending[i],
-                shared_output=output if size else None,
-                shared_input=None,
-            )
-        return result
+        return run_afd_shared_experts_batch(pending, self._forward_shared_experts)
 
     def finish_afd_experts(
         self,

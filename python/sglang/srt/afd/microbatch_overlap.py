@@ -45,6 +45,8 @@ _AFD_MICROBATCH_OVERLAP_SUPPORTED_MODEL_ARCHS = frozenset(
         "DeepseekV4ForCausalLM",
         "GlmMoeDsaForCausalLM",
         "Qwen3MoeForCausalLM",
+        "Qwen3_5MoeForCausalLM",
+        "Qwen3_5MoeForConditionalGeneration",
     }
 )
 
@@ -530,6 +532,19 @@ def _build_afd_microbatch_child_replay_views(
                     else None
                 ),
                 seq_lens_cpu=child_seq_lens_cpu,
+                num_padding=max(
+                    0,
+                    end_seq
+                    - max(
+                        start_seq,
+                        forward_batch.batch_size - forward_batch.num_padding,
+                    ),
+                ),
+                mamba_track_indices=(
+                    forward_batch.mamba_track_indices[start_seq:end_seq]
+                    if forward_batch.mamba_track_indices is not None
+                    else None
+                ),
                 encoder_lens=(
                     forward_batch.encoder_lens[start_seq:end_seq]
                     if forward_batch.encoder_lens is not None
