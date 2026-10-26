@@ -810,6 +810,7 @@ class Envs:
     SGLANG_EXA_SEARCH_TYPE = EnvStr("auto")
     SGLANG_EXA_INCLUDE_HIGHLIGHTS = EnvBool(True)
     SGLANG_TOOL_STRICT_LEVEL = EnvInt(ToolStrictLevel.OFF)
+    SGLANG_ENABLE_RESPONSE_TEMPLATE_TURN_GRAMMAR = EnvBool(True)
 
     # ===================================================================
     # HiCache storage backends and mmap allocation
@@ -1003,6 +1004,9 @@ class Envs:
     # not compatible with runtime weight updates or EPLB expert rearrangement,
     # both of which assume the checkpoint's halves layout.
     SGLANG_OPT_FUSE_SWIGLU_INTERLEAVED = EnvBool(False)
+    # Opt in to Beam's SM103 BF16 TP4/EP1 single-token MoE GEMV.
+    # Requires SGLANG_OPT_FUSE_SWIGLU_INTERLEAVED.
+    SGLANG_OPT_BEAM_DECODE_GEMV = EnvBool(False)
     # Fuse the `residual_add + RMSNorm + zero-pad` triplet that appears
     # before the MoE block for models whose MoE input hidden_size must be
     # padded up to a stride (e.g. GPT-OSS MXFP4 needs pad to multiple of
@@ -2030,11 +2034,18 @@ class Envs:
     # forces the pre-fp8 behavior (bf16 indexer + widening sparse path, bf16 q)
     # even when kv_cache_dtype fp8_e4m3 + trtllm_mha + SM100 would activate it.
     SGLANG_DISABLE_M3_FP8_ATTN_GEMM = EnvBool(False)
+    # Use the FP8 decode indexer instead of MSA-v1 Q8KV4 on the NVFP4 KV cache.
+    SGLANG_DISABLE_MSA_V1_Q8KV4 = EnvBool(False)
+    # Vision tokens per block in the ViT MLP and projector; <= 0 runs all at once.
+    SGLANG_MINIMAX_VIT_TOKEN_BLOCK = EnvInt(32768)
     # MiniMax-M3 sparse decode indexer: single JIT radix-select kernel replaces the 2-stage split-K Triton topk.
     SGLANG_OPT_USE_MINIMAX_DECODE_TOPK_RADIX = EnvBool(True)
     # Fused JIT store (minimax_store_kv_index) of main+index K/V instead of separate
     # set_*_buffer copies; falls back when main/index dtypes differ or non-CUDA.
     SGLANG_OPT_USE_MINIMAX_FUSED_KV_INDEX_STORE = EnvBool(True)
+    # Emit the main Q and index Q of the grouped QK norm/RoPE kernel directly as
+    # FP8, dropping the NVFP4 backend's two separate Q cast kernels.
+    SGLANG_OPT_USE_MINIMAX_FP8_Q_EPILOGUE = EnvBool(True)
     # MiniMax-M3 MXFP8 MoE experimental fusion toggles (default off; A/B only).
     SGLANG_MINIMAX_M3_FUSED_SWIGLU_MXFP8 = EnvBool(False)
     SGLANG_MINIMAX_M3_FUSED_MOE_COMBINE = EnvBool(False)

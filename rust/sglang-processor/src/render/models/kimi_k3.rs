@@ -8,6 +8,7 @@ use serde_json::{Map, Value, json};
 
 use super::pydantic_dump::{engine_message, pydantic_bool, tool_arguments};
 use super::schema_types::normalize_json_schema_types;
+use crate::render::RenderError;
 use crate::render::reasoning::{requested_effort, requested_thinking};
 
 const IMAGE_PLACEHOLDER: &str = "<|kimi_image_placeholder|>";
@@ -29,7 +30,7 @@ const TOKENIZER_ARGS: [&str; 8] = [
 pub(crate) fn render(
     mut request: Value,
     defaults: &HashMap<String, Value>,
-) -> Result<(RenderedPrompt, String), String> {
+) -> Result<(RenderedPrompt, String), RenderError> {
     let Some(Value::Array(messages)) = request.get_mut("messages").map(Value::take) else {
         return Err("messages must be an array".into());
     };
@@ -66,9 +67,9 @@ pub(crate) fn render(
     // Kimi's `apply_chat_template` and `build_chat_segments` take these as their
     // own arguments: SGLang truncates or pads the ids, or fails on a duplicate argument.
     if TOKENIZER_ARGS.iter().any(|arg| kwargs.contains_key(*arg)) {
-        return Err(
-            "Kimi K3 tokenizer arguments in chat_template_kwargs render on the engine".into(),
-        );
+        return Err(RenderError::Declined(
+            "Kimi K3 tokenizer arguments in chat_template_kwargs".into(),
+        ));
     }
     let thinking = kwargs
         .get("thinking")
@@ -92,7 +93,7 @@ pub(crate) fn render(
     };
     // `build_chat_segments` rejects other efforts; Dynamo cannot leave out a null one.
     if thinking && !supported(&thinking_effort) {
-        return Err(format!("unsupported thinking_effort {thinking_effort}"));
+        return Err(format!("unsupported thinking_effort {thinking_effort}").into());
     }
     // Dynamo drops whitespace-only reasoning, which SGLang renders.
     if thinking
@@ -103,7 +104,9 @@ pub(crate) fn render(
                     .is_some_and(|r| !r.is_empty() && r.trim().is_empty())
         })
     {
-        return Err("whitespace-only Kimi K3 reasoning renders on the engine".into());
+        return Err(RenderError::Declined(
+            "whitespace-only Kimi K3 reasoning".into(),
+        ));
     }
 
     let tools = match request["tools"].as_array() {
@@ -167,7 +170,9 @@ pub(crate) fn render(
         .chain(&encoder_input.response_format)
         .any(prints_unlike_python)
     {
-        return Err("Kimi K3 numbers serde_json prints unlike Python render on the engine".into());
+        return Err(RenderError::Declined(
+            "Kimi K3 numbers serde_json prints unlike Python".into(),
+        ));
     }
     // SGLang renders every declared tool, whatever the tool_choice.
     let prompt = KimiK3Formatter::new(false)
@@ -178,7 +183,7 @@ pub(crate) fn render(
 
 /// `_prepare_kimi_k3_messages` on one dumped message, after
 /// `normalize_assistant_tool_call_arguments(strict=False)`.
-fn prepare_message(mut message: Value) -> Result<Value, String> {
+fn prepare_message(mut message: Value) -> Result<Value, RenderError> {
     if let Some(parts) = message["content"].as_array_mut() {
         // Media expands into image tokens only on the engine.
         if parts.iter().any(|part| {
@@ -187,7 +192,7 @@ fn prepare_message(mut message: Value) -> Result<Value, String> {
                 Some("image_url" | "video_url" | "audio_url" | "input_audio")
             )
         }) {
-            return Err("Kimi K3 media renders on the engine".into());
+            return Err(RenderError::Declined("Kimi K3 media".into()));
         }
         parts.retain(|part| part["type"] == "text");
     }
@@ -205,7 +210,7 @@ fn prepare_message(mut message: Value) -> Result<Value, String> {
         }
         // SGLang's encoder and Dynamo parse other text differently.
         if arguments.as_str().is_some_and(|text| !text.is_empty()) {
-            return Err("non-object tool arguments render on the engine".into());
+            return Err(RenderError::Declined("non-object tool arguments".into()));
         }
         neutralize(arguments);
     }

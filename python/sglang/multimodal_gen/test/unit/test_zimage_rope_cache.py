@@ -31,7 +31,7 @@ def _expected_cache(table):
 
 
 @unittest.skipUnless(
-    current_platform.is_cuda() and torch.cuda.is_available(),
+    torch.cuda.is_available() and current_platform.is_cuda(),
     "the RoPE caches are CUDA-only",
 )
 class TestZImageRopeCache(unittest.TestCase):
