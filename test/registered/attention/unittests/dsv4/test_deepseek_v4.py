@@ -17,6 +17,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 import torch
+
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.attention_unittest.attention_methods.dsv4_attention import (  # noqa: E402
