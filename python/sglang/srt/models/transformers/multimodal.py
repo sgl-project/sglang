@@ -13,7 +13,7 @@ import torch
 from sglang.srt.configs.transformers_backend import (
     supports_transformers_multimodal_cache,
 )
-from sglang.srt.managers.mm_utils import MultiModalityDataPaddingPatternMultimodalTokens
+from sglang.srt.managers.mm_utils import pad_mm_tokens
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.utils import WeightsMapper
@@ -82,7 +82,6 @@ class MultiModalMixin:
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._mm_padding_pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         self._mm_cache_enabled = supports_transformers_multimodal_cache(self.config)
         if self._mm_cache_enabled and not type(self.model).__module__.startswith(
             f"transformers.models.{self.config.model_type}."
@@ -114,7 +113,7 @@ class MultiModalMixin:
 
     def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         if self._mm_cache_enabled:
-            return self._mm_padding_pattern.pad_input_tokens(input_ids, mm_inputs)
+            return pad_mm_tokens(input_ids, mm_inputs)
         return input_ids
 
     def _get_modality_encoder(self, modality_name: str):

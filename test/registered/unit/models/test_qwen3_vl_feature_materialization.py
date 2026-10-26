@@ -286,7 +286,7 @@ class TestQwen3VLFeatureMaterialization(CustomTestCase):
 
                 self.assertIs(output, encoded)
                 items[0].reconstruct.assert_not_called()
-                items[1].reconstruct.assert_called_once_with(0, ipc_consumer_count=8)
+                items[1].reconstruct.assert_called_once_with(0)
                 materialize.assert_called_once_with(
                     [items[1].feature], device=visual.device, dtype=visual.dtype
                 )

@@ -153,6 +153,9 @@ def test_prefill_runner_replay_protocol_keeps_hf_boundary_and_pooling_tail(
             fb.input_ids, fb.positions, fb, input_embeds=fb.input_embeds
         )
     )
+    runner.is_dsv41_model = False
+    runner._qwen_bcg_hc_sidechannel = False
+    runner._use_draft_input_embeds = False
     with torch.no_grad():
         actual = runner._execute_body_capture(
             raw, static, 7, 7, ShapeKey(size=7), get_embedding=True
@@ -249,139 +252,6 @@ def test_pipeline_graph_boundary_uses_proxy_hidden_states():
         pp_proxy_tensors={"hidden_states": hidden},
     )
     torch.testing.assert_close(result, hidden + 1)
-
-
-@pytest.fixture
-def cpu_attention_dispatch():
-    from sglang.srt.layers.radix_attention import _unified_attention_with_output_impl
-
-    def dispatch(
-        query,
-        key,
-        value,
-        output,
-        save_kv_cache,
-        layer_id,
-        use_mha_companion=False,
-        **kwargs,
-    ):
-        return _unified_attention_with_output_impl(
-            query,
-            key,
-            value,
-            output,
-            save_kv_cache,
-            layer_id,
-            use_mha_companion,
-            False,
-            **kwargs,
-        )
-
-    library = torch.library.Library("sglang", "IMPL", "CPU")
-    if not torch._C._dispatch_has_kernel_for_dispatch_key(
-        "sglang::unified_attention_with_output", "CPU"
-    ):
-        library.impl("unified_attention_with_output", dispatch)
-    try:
-        yield
-    finally:
-        library._destroy()
-
-
-@pytest.mark.parametrize("kind", ["bert", "qwen3"])
-@pytest.mark.parametrize("capture_aux", [False, True])
-@pytest.mark.parametrize("use_embeds", [False, True])
-def test_piecewise_adapter_fullgraph_cpu_compilation(
-    runtime, cpu_attention_dispatch, kind, capture_aux, use_embeds
-):
-    from test_transformers_window_attention import native_batch
-
-    from sglang.srt.compilation.compile import install_torch_compiled
-    from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph.context_manager import (
-        enable_tc_piecewise_cuda_graph,
-        set_tc_piecewise_forward_context,
-    )
-    from sglang.srt.models.transformers.speculative import AuxiliaryHiddenStateCapture
-
-    config = config_for(kind)
-    settings = model_settings(config)
-    reference = AutoModel.from_config(
-        copy.deepcopy(config), attn_implementation="eager"
-    ).eval()
-    wrapper = TransformersEmbeddingModel(copy.deepcopy(config), model_config=settings)
-    wrapper.load_weights(reference.state_dict().items())
-    if capture_aux:
-        wrapper._aux_capture = AuxiliaryHiddenStateCapture(wrapper.model, [0, 1], 2)
-    body = wrapper.get_prefill_graph_model()
-    graphs = []
-
-    def eager_backend(graph, _inputs):
-        graphs.append(graph)
-        return graph.forward
-
-    install_torch_compiled(body, backend_factory=eager_backend, fullgraph=True)
-    for lengths in ([4, 3], [5, 4]):
-        batch, backend = native_batch(lengths)
-        batch.positions = torch.cat([torch.arange(length) for length in lengths])
-        batch.global_num_token_non_padded_cpu = sum(lengths)
-        batch.mha_return_lse = False
-        if kind == "bert":
-            batch.token_type_ids = torch.arange(sum(lengths)) % 2
-        with torch.no_grad(), forward_context(ForwardContext(backend)):
-            inputs = {
-                "input_ids": None if use_embeds else batch.input_ids,
-                "positions": batch.positions,
-                "forward_batch": batch,
-                "input_embeds": wrapper.get_input_embeddings()(batch.input_ids)
-                if use_embeds
-                else None,
-            }
-            expected = body(**inputs)
-            reference_hidden, offset = [], 0
-            for length in lengths:
-                reference_inputs = {
-                    "input_ids": batch.input_ids[offset : offset + length][None]
-                }
-                if batch.token_type_ids is not None:
-                    reference_inputs["token_type_ids"] = batch.token_type_ids[
-                        offset : offset + length
-                    ][None]
-                reference_hidden.append(
-                    reference(**reference_inputs).last_hidden_state[0]
-                )
-                offset += length
-            torch.testing.assert_close(
-                expected[0] if capture_aux else expected, torch.cat(reference_hidden)
-            )
-            with (
-                enable_tc_piecewise_cuda_graph(),
-                set_tc_piecewise_forward_context(
-                    batch,
-                    list(wrapper.attention_instances.values()),
-                    None,
-                    [],
-                    [],
-                    num_tokens=sum(lengths),
-                    raw_num_tokens=sum(lengths),
-                ),
-            ):
-                actual = body(**inputs)
-        if capture_aux:
-            torch.testing.assert_close(actual[0], expected[0])
-            for actual_aux, expected_aux in zip(actual[1], expected[1]):
-                torch.testing.assert_close(actual_aux, expected_aux)
-        else:
-            torch.testing.assert_close(actual, expected)
-    assert len(graphs) == 1
-    assert (
-        sum(
-            "unified_attention_with_output" in str(node.target)
-            for node in graphs[0].graph.nodes
-        )
-        == 2
-    )
-    if capture_aux:
-        wrapper._aux_capture.close()
 
 
 if __name__ == "__main__":

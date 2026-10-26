@@ -10,9 +10,11 @@ from torch import nn
 from sglang.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
+    LinearParallelGroup,
     MergedColumnParallelLinear,
     QKVParallelLinear,
     ReplicatedLinear,
+    ReplicatedParallelGroup,
     RowParallelLinear,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -59,8 +61,7 @@ def replace_linear_class(
     quant_config: Optional[QuantizationConfig] = None,
     *,
     prefix: str = "",
-    tp_rank: Optional[int] = None,
-    tp_size: Optional[int] = None,
+    parallel_group: Optional[LinearParallelGroup] = None,
 ) -> Union[ColumnParallelLinear, RowParallelLinear, ReplicatedLinear]:
     if not isinstance(style, str):
         raise ValueError(f"Unsupported parallel style type {type(style)}, expected str")
@@ -72,12 +73,12 @@ def replace_linear_class(
         "rowwise_rep": (HFCompatibleRowParallelLinear, {"input_is_parallel": False}),
         "replicate": (HFCompatibleReplicatedLinear, {}),
     }[style]
-    if tp_rank is not None or tp_size is not None:
+    if parallel_group is not None:
         if style != "colwise":
             raise ValueError(
                 "Projection shard overrides require an ungathered column parallel layer"
             )
-        linear_kwargs.update(tp_rank=tp_rank, tp_size=tp_size)
+        linear_kwargs.update(parallel_group=parallel_group)
     return linear_class(
         input_size=linear.in_features,
         output_size=linear.out_features,
@@ -101,6 +102,9 @@ def _normalize_tp_style(style: str) -> Style:
         "packed_rowwise": "rowwise",
         "local_rowwise": "rowwise",
         "local_packed_rowwise": "rowwise",
+        # transformers' tied-embedding `base_model_tp_plan`s give the embedding this
+        # style; `replace_vocab_embed_class` shards it instead.
+        "embedding_rowwise": "replicate",
         "isolated": "replicate",
         "local": "replicate",
         "replicated_with_grad_allreduce": "replicate",
@@ -223,9 +227,11 @@ def get_attention_projection_shards(module, prefix, tp_plan):
                 None,
             )
             if style == "colwise":
+                # Consecutive ranks share one KV head; the group shrinks to kv_heads.
                 shards[path] = {
-                    "tp_rank": get_parallel().attn_tp_rank // (tp_size // kv_heads),
-                    "tp_size": kv_heads,
+                    "parallel_group": ReplicatedParallelGroup(
+                        "attn_tp", tp_size // kv_heads
+                    )
                 }
         return shards
     return {}

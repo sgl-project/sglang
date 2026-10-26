@@ -28,6 +28,7 @@ from sglang.srt.models.transformers.layers import (
 from sglang.srt.models.utils import AutoWeightsLoader
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.parallel_groups import parallel_scope
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
@@ -103,9 +104,7 @@ def test_qwen3_mlp_fusion_matches_original(shape):
 def test_qkv_tensor_parallel_replicates_kv_heads(rank):
     original = Qwen3Attention(_config(), layer_idx=0).eval()
     fused = copy.deepcopy(original)
-    with get_parallel().override(
-        tp_size=4, tp_rank=rank, attn_tp_size=4, attn_tp_rank=rank
-    ):
+    with parallel_scope(tp_size=4, tp_rank=rank, attn_tp_size=4, attn_tp_rank=rank):
         result = fuse_module(
             fused, "model", tp_plan={r"model\.(q_proj|k_proj|v_proj)": "colwise"}
         )
@@ -126,7 +125,7 @@ def test_qkv_tensor_parallel_replicates_kv_heads(rank):
 def test_gate_up_tensor_parallel_loads_independent_shards(rank):
     original = Qwen3MLP(_config()).eval()
     fused = copy.deepcopy(original)
-    with get_parallel().override(tp_size=2, tp_rank=rank):
+    with parallel_scope(tp_size=2, tp_rank=rank, attn_tp_size=2, attn_tp_rank=rank):
         result = fuse_module(
             fused, "model", tp_plan={r"model\.(gate_proj|up_proj)": "colwise"}
         )
@@ -378,9 +377,7 @@ def test_unfused_kv_projection_replicates_whole_heads(rank):
 
     original = Qwen3Attention(_config(), layer_idx=0)
     plan = {r"model\.(q_proj|k_proj|v_proj)": "colwise"}
-    with get_parallel().override(
-        tp_size=4, tp_rank=rank, attn_tp_size=4, attn_tp_rank=rank
-    ):
+    with parallel_scope(tp_size=4, tp_rank=rank, attn_tp_size=4, attn_tp_rank=rank):
         shards = get_attention_projection_shards(original, "model", plan)
         for name in ("k_proj", "v_proj"):
             projection = getattr(original, name)

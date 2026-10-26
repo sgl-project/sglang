@@ -32,6 +32,7 @@ _EXPORT_MODULES = {
     "ClassificationMixin": "pooling",
     "CausalMixin": "causal",
     "sglang_flash_attention_forward": "attention",
+    "_normalize_tp_style": "layers",
 }
 
 

@@ -23,10 +23,131 @@ from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+
+
+RESPONSE_TEMPLATE = {
+    "start_anchor": "<assistant>",
+    "fields": {
+        "content": {"content": "text"},
+        "tool_calls": {
+            "open_pattern": r"<call:(?P<name>\w+)>",
+            "close": "</call>",
+            "content": "json",
+            "repeats": True,
+            "transform": {
+                "type": "function",
+                "function": {
+                    "name": "{name}",
+                    "arguments": "{content}",
+                },
+            },
+        },
+    },
+}
 
 
 class NonHarmonyStreamTestCase(CustomTestCase):
+    def test_reasoning_content_part_lifecycle_matches_terminal_output(self):
+        for finish_reason, status, suffix in (
+            ({"type": "stop"}, "completed", "</think>answer"),
+            ({"type": "length"}, "incomplete", ""),
+            (
+                {"type": "abort", "status_code": 503, "message": "Worker unavailable"},
+                "failed",
+                "",
+            ),
+        ):
+            with self.subTest(status=status):
+                serving = make_serving()
+                serving.reasoning_parser = "deepseek-v41"
+                serving.tool_call_parser = None
+                request = ResponsesRequest(
+                    model="x", input="hi", stream=True, store=False
+                )
+                chunks = [engine_chunk("<think>wo"), engine_chunk("<think>work")]
+                terminal_chunk = engine_chunk("<think>work" + suffix, 4, finish=True)
+                terminal_chunk["meta_info"]["finish_reason"] = finish_reason
+                chunks.append(terminal_chunk)
+                events = StreamFixture(serving, request, require_reasoning=True).run(
+                    chunks
+                )
+                payloads = event_payloads(events)
+                self.assertEqual(payloads[-1]["type"], f"response.{status}")
+                output = payloads[-1]["response"]["output"]
+                reasoning = output[0]
+                self.assertEqual(reasoning["type"], "reasoning")
+                item_events = [
+                    p for p in payloads if p.get("item_id") == reasoning["id"]
+                ]
+                types = [p["type"] for p in item_events]
+                self.assertEqual(types[0], "response.content_part.added")
+                self.assertEqual(
+                    types[-2:],
+                    ["response.reasoning_text.done", "response.content_part.done"],
+                )
+                self.assertEqual(types.count("response.content_part.added"), 1)
+                self.assertEqual(types.count("response.content_part.done"), 1)
+                self.assertEqual(
+                    item_events[0]["part"], {"type": "reasoning_text", "text": ""}
+                )
+                self.assertEqual(item_events[-1]["part"], reasoning["content"][0])
+                self.assertEqual(item_events[-2]["text"], "work")
+                self.assertEqual(
+                    "".join(
+                        p["delta"]
+                        for p in item_events
+                        if p["type"] == "response.reasoning_text.delta"
+                    ),
+                    "work",
+                )
+                self.assertTrue(
+                    all(
+                        p["output_index"] == 0 and p["content_index"] == 0
+                        for p in item_events
+                    )
+                )
+                done = [
+                    p["item"]
+                    for p in payloads
+                    if p["type"] == "response.output_item.done"
+                ]
+                self.assertEqual(done, output)
+                self.assertEqual(
+                    [p["sequence_number"] for p in payloads], list(range(len(payloads)))
+                )
+
+    def test_reasoning_summary_keeps_its_own_part_events(self):
+        serving = make_serving()
+        serving.reasoning_parser = "deepseek-v41"
+        serving.tool_call_parser = None
+        request = ResponsesRequest(
+            model="x",
+            input="hi",
+            stream=True,
+            store=False,
+            reasoning={"summary": "auto"},
+        )
+        events = StreamFixture(serving, request, require_reasoning=True).run(
+            [engine_chunk("<think>work</think>answer", 4, finish=True)]
+        )
+        payloads = event_payloads(events)
+        reasoning = find_completed_event(events)["response"]["output"][0]
+        parts = [p for p in payloads if p.get("item_id") == reasoning["id"]]
+        self.assertEqual(
+            [p["type"] for p in parts],
+            [
+                "response.reasoning_summary_part.added",
+                "response.reasoning_summary_text.delta",
+                "response.reasoning_summary_text.done",
+                "response.reasoning_summary_part.done",
+            ],
+        )
+        self.assertEqual(parts[-1]["part"], reasoning["summary"][0])
+        self.assertEqual(
+            reasoning["content"], [{"type": "reasoning_text", "text": "work"}]
+        )
+
     def test_reasoning_parser_uses_processed_reasoning_state(self):
         serving = make_serving()
         serving.reasoning_parser = "deepseek-r1"
@@ -201,6 +322,44 @@ class NonHarmonyStreamTestCase(CustomTestCase):
             if payload.get("type") == "response.output_item.added"
         ]
         self.assertIn("function_call", added_kinds)
+
+    def test_truncated_response_template_call_is_incomplete_without_arguments(self):
+        serving = make_serving()
+        serving.reasoning_parser = None
+        serving.tool_call_parser = "response_template"
+        serving.tokenizer_manager.tokenizer.response_template = RESPONSE_TEMPLATE
+        request = ResponsesRequest(
+            model="x",
+            input="hi",
+            stream=True,
+            store=False,
+            tools=[
+                {
+                    "type": "function",
+                    "name": "get_weather",
+                    "parameters": {"type": "object"},
+                }
+            ],
+        )
+        request._response_parser_prefix = "<assistant>"
+        chunk = engine_chunk('<call:get_weather>{"city":', finish=True)
+        chunk["meta_info"]["finish_reason"] = {"type": "length"}
+
+        events = StreamFixture(serving, request).run([chunk])
+        payloads = event_payloads(events)
+        deltas = "".join(
+            payload["delta"]
+            for payload in payloads
+            if payload["type"] == "response.function_call_arguments.delta"
+        )
+        terminal = payloads[-1]
+
+        self.assertEqual(deltas, "")
+        self.assertEqual(terminal["type"], "response.incomplete")
+        self.assertEqual(terminal["response"]["status"], "incomplete")
+        self.assertEqual(terminal["response"]["output"][0]["name"], "get_weather")
+        self.assertEqual(terminal["response"]["output"][0]["arguments"], "")
+        self.assertEqual(terminal["response"]["output"][0]["status"], "incomplete")
 
     def test_required_native_parser_matches_full_response(self):
         serving = make_serving()

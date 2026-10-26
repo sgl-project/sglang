@@ -20,7 +20,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=180, stage="base-c", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=114, stage="base-c", runner_config="4-gpu-h100")
 
 
 class TestDPSpecPrefillCoordinationMixed(CustomTestCase):
@@ -65,9 +65,8 @@ class TestDPSpecPrefillCoordinationMixed(CustomTestCase):
                     DEFAULT_DRAFT_MODEL_EAGLE_DP_ATTN,
                     "--tp-size",
                     "2",
-                    "--dp-size",
+                    "--attn-dp-size",
                     "2",
-                    "--enable-dp-attention",
                     "--enable-dp-lm-head",
                     "--moe-dense-tp-size",
                     "1",

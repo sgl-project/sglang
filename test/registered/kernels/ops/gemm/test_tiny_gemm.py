@@ -32,6 +32,8 @@ TINY_GEMM_CASES = get_ci_test_range(
         (384, 7168, 1, torch.float32),
         (384, 7168, 4, torch.float32),
         (896, 7168, 8, torch.float32),
+        (144, 7168, 2, torch.float32),
+        (1536, 128, 7, torch.bfloat16),
         (1536, 128, 16, torch.bfloat16),
     ],
 )

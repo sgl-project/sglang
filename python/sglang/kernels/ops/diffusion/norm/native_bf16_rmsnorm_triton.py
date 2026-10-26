@@ -7,6 +7,8 @@ import torch
 import triton  # type: ignore
 import triton.language as tl  # type: ignore
 
+from sglang.kernels.ops.diffusion.common.fast_launch import replay_launches
+
 MAX_HIDDEN_SIZE = 8192
 
 
@@ -116,6 +118,7 @@ def _can_use_operand(
     )
 
 
+@replay_launches
 def rmsnorm_scale(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -155,6 +158,7 @@ def rmsnorm_scale(
     return out
 
 
+@replay_launches
 def rmsnorm_tanh_residual(
     x: torch.Tensor,
     gate: torch.Tensor,

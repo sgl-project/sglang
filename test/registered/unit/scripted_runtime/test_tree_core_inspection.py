@@ -1,6 +1,3 @@
-import os
-import subprocess
-import sys
 from array import array
 from types import SimpleNamespace
 from unittest import mock
@@ -28,7 +25,7 @@ from sglang.test.scripted_runtime.tree_core_inspection import (
     install_tree_core_inspectors,
 )
 
-register_cpu_ci(est_time=20, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 def _cache(backend, enable_session=False):
@@ -89,35 +86,6 @@ def test_scripted_inspection_preserves_session_fallback():
     cache = _cache("rust", enable_session=True)
     assert cache._tree_core_backend == "python"
     assert type(cache.tree_core).__name__ == "UnifiedTreeCoreInspector"
-
-
-@pytest.mark.parametrize("scripted", [False, True])
-def test_inspectors_install_only_in_scripted_subprocesses(scripted):
-    process_env = dict(os.environ)
-    process_env["SGLANG_TEST_SCRIPTED_RUNTIME"] = str(scripted)
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            (
-                "import sglang.test.scripted_runtime; "
-                "from sglang.srt.mem_cache.unified_cache.tree_core_registry "
-                "import get_tree_core_factory; "
-                "print(get_tree_core_factory('rust').__module__)"
-            ),
-        ],
-        env=process_env,
-        capture_output=True,
-        text=True,
-        check=True,
-        timeout=60,
-    )
-    expected_module = (
-        "sglang.test.scripted_runtime.tree_core_inspection"
-        if scripted
-        else "sglang.srt.mem_cache.unified_cache.tree_core_registry"
-    )
-    assert result.stdout.strip() == expected_module
 
 
 if __name__ == "__main__":

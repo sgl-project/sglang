@@ -2,15 +2,26 @@
 import base64
 import os
 import re
+from pathlib import Path
 
 
-def save_base64_image_to_path(base64_data: str, target_path: str) -> str:
+def ensure_path_within_root(target_path: str, root_dir: str) -> str:
+    root_path = Path(root_dir).resolve()
+    candidate = Path(target_path).resolve()
+    if root_path != candidate and root_path not in candidate.parents:
+        raise ValueError("Upload path escapes the uploads root")
+    return str(candidate)
+
+
+def save_base64_image_to_path(
+    base64_data: str, target_path: str, *, uploads_root: str | None = None
+) -> str:
     b64_format_hint = (
         "Failed to decode base64 image. "
         "Expected format: `data:[<media-type>];base64,<data>`"
     )
 
-    match = re.match(r"data:(.*?)(;base64)?,(.*)", base64_data)
+    match = re.match(r"data:([^,;\r\n]*)(;base64)?,((?s:.*))", base64_data)
     if not match:
         raise ValueError(b64_format_hint)
     media_type = match.group(1)
@@ -28,6 +39,8 @@ def save_base64_image_to_path(base64_data: str, target_path: str) -> str:
     else:
         ext = "jpg"
     target_path = f"{target_path}.{ext}"
+    if uploads_root is not None:
+        target_path = ensure_path_within_root(target_path, uploads_root)
     os.makedirs(os.path.dirname(target_path), exist_ok=True)
 
     try:

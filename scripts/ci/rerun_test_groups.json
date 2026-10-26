@@ -41,7 +41,6 @@
     "registered/unit/mem_cache/test_pp_prefetch_ticket.py",
     "registered/unit/mem_cache/test_rust_tree_core.py",
     "registered/unit/mem_cache/test_rust_tree_core_integration.py",
-    "registered/unit/mem_cache/test_rust_unified_radix_cache_unittest.py",
     "registered/unit/mem_cache/test_session_unified_radix_cache.py",
     "registered/unit/mem_cache/test_storage_prefetch_lifecycle.py",
     "registered/unit/mem_cache/test_swa_locked_full_recover_unified.py",
@@ -50,9 +49,15 @@
     "registered/unit/mem_cache/test_unified_hicache_regressions.py",
     "registered/unit/mem_cache/test_unified_hicache_strided_state.py",
     "registered/unit/mem_cache/test_unified_radix_allocation_eviction.py",
-    "registered/unit/mem_cache/test_unified_radix_cache_unittest.py",
     "registered/unit/mem_cache/test_unified_radix_hicache_dispatch.py",
-    "registered/unit/mem_cache/test_unified_radix_lock_ref.py"
+    "registered/unit/mem_cache/test_unified_radix_lock_ref.py",
+    "registered/unit/mem_cache/unified_radix_cache/test_unified_radix_cache_core.py",
+    "registered/unit/mem_cache/unified_radix_cache/test_unified_radix_cache_hicache.py",
+    "registered/unit/mem_cache/unified_radix_cache/test_unified_radix_cache_insert_walk.py",
+    "registered/unit/mem_cache/unified_radix_cache/test_unified_radix_cache_kv_events.py",
+    "registered/unit/mem_cache/unified_radix_cache/test_unified_radix_cache_load_back.py",
+    "registered/unit/mem_cache/unified_radix_cache/test_unified_radix_cache_rust.py",
+    "registered/unit/mem_cache/unified_radix_cache/test_unified_radix_cache_storage.py"
   ],
   "hisparse": [
     "registered/disaggregation/test_disaggregation_hisparse.py",
@@ -69,7 +74,6 @@
     "registered/unit/model_executor/test_hisparse_pool_configurator.py"
   ],
   "rust-server": [
-    "registered/rust/test_run_rust_tests.py",
     "registered/core/test_srt_endpoint.py",
     "registered/vlm/test_rust_native_mm_e2e.py",
     "registered/vlm/test_rust_native_mm_mmmu.py",

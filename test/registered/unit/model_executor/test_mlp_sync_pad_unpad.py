@@ -34,7 +34,7 @@ from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 def _mock_model_runner(seq_len_fill_value: int = 1) -> MagicMock:
@@ -115,7 +115,7 @@ class TestMlpSyncPadUnpad(CustomTestCase):
 
     def test_draft_graph_gate_has_an_independent_dp_vote(self):
         sync_info = MLPSyncBatchInfo(
-            dp_size=1,
+            num_dp_ranks=1,
             tp_size=1,
             cp_size=1,
             num_tokens=1,
@@ -238,6 +238,30 @@ class TestMlpSyncPadUnpad(CustomTestCase):
         # Seeded sampling asserts positions rows == sampled (real) rows.
         self.assertEqual(fb.positions.shape[0], fb.batch_size)
 
+    def test_tbo_decode_child_pads_its_requests_with_its_tokens(self):
+        """An extend child keeps its requests."""
+        for mode, bs in ((ForwardMode.DECODE, 2), (ForwardMode.EXTEND, 1)):
+            with self.subTest(mode=mode):
+                fb = ForwardBatch(
+                    forward_mode=mode,
+                    batch_size=1,
+                    input_ids=torch.tensor([11]),
+                    req_pool_indices=torch.tensor([5]),
+                    seq_lens=torch.tensor([7]),
+                    out_cache_loc=torch.tensor([3]),
+                    seq_lens_sum=7,
+                    positions=torch.tensor([6]),
+                    seq_lens_cpu=torch.tensor([7]),
+                )
+                fb.tbo_padded_len = 2
+                fb._pad_tbo_child_inputs(_mock_model_runner())
+
+                self.assertEqual(fb.input_ids.shape[0], 2)
+                self.assertEqual(fb.out_cache_loc.shape[0], 2)
+                self.assertEqual(fb.batch_size, bs)
+                self.assertEqual(fb.req_pool_indices.shape[0], bs)
+                self.assertEqual(fb.seq_lens.shape[0], bs)
+
     def test_extend_post_forward_unpads_positions(self):
         fb = ForwardBatch(
             forward_mode=ForwardMode.EXTEND,
@@ -306,8 +330,7 @@ class TestDraftScopeMlpSync(CustomTestCase):
     def setUp(self):
         override = get_context().override_server_args(
             tp_size=4,
-            dp_size=4,
-            enable_dp_attention=True,
+            attn_dp_size=4,
             cuda_graph_config=CudaGraphConfig(prefill=PhaseConfig(bs=[])),
         )
         override.install()

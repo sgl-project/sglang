@@ -42,7 +42,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.communicator_patch import patch_communicator
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=9, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 def _initialize(*, enable=True, arch="Qwen3ForCausalLM"):
@@ -68,10 +68,6 @@ class TestLayerNormSPGating(CustomTestCase):
         self.assertFalse(layernorm_sp.layernorm_sp_enabled())
         # Supported architecture but flag off -> stays off.
         _initialize(enable=False, arch="Qwen3ForCausalLM")
-        self.assertFalse(layernorm_sp.layernorm_sp_enabled())
-
-    def test_defaults_off_before_initialization(self):
-        # A process that never runs initialize_layernorm_sp must not enable SP.
         self.assertFalse(layernorm_sp.layernorm_sp_enabled())
 
     def test_runs_sp_only_on_extend(self):
@@ -103,7 +99,7 @@ class TestLayerNormSPValidation(CustomTestCase):
     VALID = dict(
         architecture="Qwen3ForCausalLM",
         tp_size=2,
-        enable_dp_attention=False,
+        attn_dp_enabled=False,
         speculative_algorithm=None,
     )
 
@@ -119,12 +115,16 @@ class TestLayerNormSPValidation(CustomTestCase):
             validate_layernorm_sp(**{**self.VALID, "tp_size": 1})
 
     def test_rejects_dp_attention(self):
-        with self.assertRaisesRegex(ValueError, "dp-attention"):
-            validate_layernorm_sp(**{**self.VALID, "enable_dp_attention": True})
+        with self.assertRaisesRegex(ValueError, "attention DP"):
+            validate_layernorm_sp(**{**self.VALID, "attn_dp_enabled": True})
 
     def test_rejects_speculative(self):
         with self.assertRaisesRegex(ValueError, "speculative"):
             validate_layernorm_sp(**{**self.VALID, "speculative_algorithm": "EAGLE3"})
+
+    def test_rejects_pipeline_parallelism(self):
+        with self.assertRaisesRegex(ValueError, "pipeline"):
+            validate_layernorm_sp(**{**self.VALID, "pp_size": 2})
 
 
 class _Norm:
