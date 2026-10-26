@@ -11,6 +11,21 @@ def attn_replica_size() -> int:
     return parallel.attn_tp_size * parallel.attn_cp_size
 
 
+def response_dp_rank() -> int | None:
+    """Return the controller's DP slot for response metadata.
+
+    Joining schedulers keep cohort-local DP ranks internally. The public rank
+    must include the join offset, like the controller's routed_dp_rank slots.
+    """
+    parallel = get_parallel()
+    rank = parallel.dp_rank
+    if rank is None or parallel.ep_join_rank_offset == 0:
+        return rank
+    return rank + physical_ep_rank_to_dp_rank(
+        parallel.ep_join_rank_offset, attn_replica_size()
+    )
+
+
 def validate_matching_attention_topology(
     *,
     primary_attn_tp_size: int,
