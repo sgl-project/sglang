@@ -1815,6 +1815,13 @@ class Envs:
     # of fp32 (the reference ranks bf16 scores); every consumer of those logits must take bf16.
     # Unset: bf16 on SM100 (with bf16 head weights), fp32 elsewhere.
     SGLANG_OPT_DSV41_BF16_INDEX_LOGITS = EnvBool(None)
+    # PD decode with --dsv41-encoder-only-prefill: while decode has work, run tail
+    # extends only on the first step of each period of this many ms, so one extend
+    # step runs several (a step's cost is mostly fixed) and DP ranks share it.
+    # Counted in forward steps of a nominal 20 ms (decode.DSV41_TAIL_HOLD_STEP_MS),
+    # so every rank decides alike. 0 runs waiting tails on the next step that
+    # alternates with decode.
+    SGLANG_DSV41_TAIL_HOLD_MS = EnvInt(0)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
     # gfx950 DeepSeek-V4.1 prefill: attend with aiter's OPUS sparse kernel over a bf16

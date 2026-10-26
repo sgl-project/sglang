@@ -454,6 +454,20 @@ def combine(
 ) -> torch.Tensor:
     """The sublayer's input: ``norm(sum_k pre[k] * R[k])``, short-circuited by
     whatever the previous post left in ``state.input``."""
+    return combine_input(hc.cfg, hc.norm, state, quantized)
+
+
+def combine_input(
+    cfg: HcConfig,
+    norm: RMSNorm,
+    state: HcState,
+    quantized: Optional[list] = None,
+) -> torch.Tensor:
+    """Collapse and normalize the previous state without predicting a new triplet.
+
+    Cache-only producer boundaries need this input but have no attention or
+    following sublayer, so they do not materialize mixing predictor weights.
+    """
     shortcut = state.input
     if isinstance(shortcut, HcQuantized):
         if quantized is not None:
@@ -461,18 +475,18 @@ def combine(
         return shortcut.rows
     if isinstance(shortcut, HcNormed):
         return shortcut.rows
-    return _combine(hc, state, quantized)
+    return _combine(cfg, norm, state, quantized)
 
 
 def _combine(
-    hc: HcSubLayer,
+    cfg: HcConfig,
+    norm: RMSNorm,
     state: HcState,
     quantized: Optional[list],
 ) -> torch.Tensor:
     """The combine computed from the residual's rows."""
     from sglang.kernels.ops.layernorm.mhc import mhc_combine
 
-    cfg, norm = hc.cfg, hc.norm
     x, apply_pre = state.residual, state.pre
     quantize = quantized is not None
     x_flat = x.flatten(1)

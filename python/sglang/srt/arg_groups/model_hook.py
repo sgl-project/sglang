@@ -472,12 +472,14 @@ def handle_model_specific_adjustments(server_args: Any):
     ]:
         from sglang.srt.arg_groups.deepseek_v4_hook import (
             validate_deepseek_v4_cp,
+            validate_deepseek_v41_encoder_only_prefill,
             validate_deepseek_v41_features,
         )
 
         # Before the CP validation: V4.1 rejects CP outright, the actionable message.
         validate_deepseek_v41_features(server_args)
         validate_deepseek_v4_cp(server_args)
+        validate_deepseek_v41_encoder_only_prefill(server_args)
 
         if get_platform().is_sm120:
             # FP8 wo_a stays opt-in on SM120: only recent DeepGEMM builds ship
@@ -1043,6 +1045,8 @@ def handle_model_capability_adjustments(server_args: Any):
         validate_deepseek_v41_encoder_replay_budget(server_args)
     elif cfg.enable_encoder_swa_bounded_replay:
         raise ValueError("--enable-encoder-swa-bounded-replay requires DeepSeek-V4.1")
+    elif cfg.dsv41_encoder_only_prefill:
+        raise ValueError("--dsv41-encoder-only-prefill requires DeepSeek-V4.1")
 
 
 def handle_mamba_radix_cache(server_args: Any, hf_config: Any):

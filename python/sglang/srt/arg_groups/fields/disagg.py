@@ -125,6 +125,13 @@ class Disagg(msgspec.Struct):
     optimistic_prefill_attempts: A[
         int, "Number of optimistic prefill forward passes that skip the bootstrap wait."
     ] = 0
+    dsv41_encoder_only_prefill: A[
+        bool,
+        "DeepSeek-V4.1 asymmetric PD; set on both servers. Prefill loads only the "
+        "encoder layers and processes all but the last sliding window of the "
+        "prompt; decode receives that KV plus the encoder SWA window, runs the "
+        "final window through the full model, and samples the first token.",
+    ] = False
 
     # -------------------------------------------------------------------------
     # Encode prefill disaggregation

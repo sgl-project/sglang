@@ -1128,6 +1128,9 @@ class Req(ReqDllmMixin):
         self.full_untruncated_fill_ids = array("q")
         # This round extends fill ids [prefix_len, extend_end).
         self.extend_end: Optional[int] = None
+        # PD decode with --dsv41-encoder-only-prefill: the prompt position where
+        # the transferred encoder prefix ends and this worker's extend begins.
+        self.dsv41_tail_start: Optional[int] = None
         self.dllm_initialized: bool = False
 
         self.session = session

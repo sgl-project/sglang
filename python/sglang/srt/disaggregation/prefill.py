@@ -52,6 +52,9 @@ from sglang.srt.disaggregation.utils import (
     TransferBackend,
     build_kv_layer_ids,
     build_staging_slot_metadata,
+    dsv41_encoder_only_prefill_enabled,
+    dsv41_encoder_only_unsupported,
+    dsv41_encoder_prefix_len,
     get_dsa_tail_state_indices,
     get_kv_class,
     get_kv_transfer_buf_infos,
@@ -519,12 +522,20 @@ class PrefillBootstrapQueue:
                 self.scheduler.attn_tp_cpu_group,
             )
 
+        encoder_only = dsv41_encoder_only_prefill_enabled()
         for i, (req, poll) in enumerate(zip(self.queue, polls)):
+            # An encoder-only prefill of a prompt within one window has nothing
+            # to compute; it only hands off once decode has bootstrapped.
+            empty_handoff = encoder_only and len(req.origin_input_ids) == 0
             if poll == KVPoll.Failed:
                 self.scheduler.handle_bootstrap_failure(req)
                 indices_to_remove.add(i)
             elif poll == KVPoll.Bootstrapping:
-                if not req.is_retracted and self.can_prefill_before_bootstrap(req):
+                if (
+                    not req.is_retracted
+                    and not empty_handoff
+                    and self.can_prefill_before_bootstrap(req)
+                ):
                     if not self.ensure_metadata_buffer(req):
                         continue  # no more metadata buffer
                     req.prefill_attempt_count += 1
@@ -541,8 +552,11 @@ class PrefillBootstrapQueue:
                     req.prefill_attempt_count += 1
                 elif not self.finalize_bootstrap(req):
                     continue
-                bootstrapped_reqs.append(req)
                 indices_to_remove.add(i)
+                if empty_handoff:
+                    self.scheduler.send_dsv41_empty_handoff(req)
+                    continue
+                bootstrapped_reqs.append(req)
                 req.time_stats.set_wait_queue_entry_time()
                 req.arrival_processed_tokens = self.scheduler.processed_tokens_counter
             else:
@@ -581,6 +595,33 @@ class SchedulerDisaggregationPrefillMixin:
             room = getattr(req, "bootstrap_room", None)
             if room is not None and room in kv_mgr.transfer_infos:
                 prefetch(room)
+
+    def prepare_dsv41_encoder_only_req(self: Scheduler, req: Req) -> bool:
+        """Shrink the prompt to the prefix the encoder-only prefill covers."""
+        unsupported = dsv41_encoder_only_unsupported(req)
+        if unsupported is not None:
+            prepare_abort(
+                req,
+                f"--dsv41-encoder-only-prefill does not support {unsupported}",
+                status_code=HTTPStatus.BAD_REQUEST,
+            )
+            self.output_streamer.stream_output([req], req.return_logprob)
+            return False
+        # Decode computes every logit, so prefill returns none.
+        req.return_logprob = False
+        prefix_len = dsv41_encoder_prefix_len(
+            len(req.origin_input_ids), self.model_config.sliding_window_size
+        )
+        req.origin_input_ids = req.origin_input_ids[:prefix_len]
+        return True
+
+    def send_dsv41_empty_handoff(self: Scheduler, req: Req) -> None:
+        """Hand off a prompt that fits in one window: decode runs all of it."""
+        self.disagg_prefill_inflight_queue.append(req)
+        self.disagg_metadata_buffers.set_buf(req)
+        state_types = self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types
+        empty = np.empty((0,), dtype=np.int32)
+        req.disagg_kv_sender.send(empty, [empty for _ in state_types], num_kv_tokens=0)
 
     def checkpoint_disagg_prefill(self: Scheduler, req: Req) -> None:
         cache = self.tree_cache
@@ -928,6 +969,7 @@ class SchedulerDisaggregationPrefillMixin:
                 )
         # Transfer kv for prefill completed requests and add it into disagg_prefill_inflight_queue
         next_token_ids = result.next_token_ids.tolist()
+        encoder_only = dsv41_encoder_only_prefill_enabled()
         self.batch_result_processor.move_logprobs_to_cpu(
             batch=batch,
             logits_output=logits_output,
@@ -989,8 +1031,11 @@ class SchedulerDisaggregationPrefillMixin:
                     advance_logprob_pt(i, req)
                     continue
 
-                req.output_ids.append(next_token_id)
-                if req.grammar is not None:
+                # An encoder-only prefill samples nothing: decode samples the
+                # first token, and runs the grammar on it, after its tail extend.
+                if not encoder_only:
+                    req.output_ids.append(next_token_id)
+                if req.grammar is not None and not encoder_only:
                     try:
                         req.grammar.accept_token(next_token_id)
                     except ValueError as e:
@@ -1202,8 +1247,9 @@ class SchedulerDisaggregationPrefillMixin:
                     self.batch_result_processor._maybe_collect_routed_experts(req)
                 if not isinstance(req.finished_reason, FINISH_ABORT):
                     req.finished_reason = FINISH_LENGTH(length=0)
-                # unlock the tree
-                release_kv_cache(req, self.tree_cache, checkpoint=True)
+                # unlock the tree; an empty encoder-only handoff never held KV
+                if not dsv41_encoder_only_prefill_enabled() or req.kv.holds_kv:
+                    release_kv_cache(req, self.tree_cache, checkpoint=True)
                 self.tree_cache.finish(
                     req.cache_request_handle, CacheRequestOutcome.SUCCESS
                 )
@@ -1279,8 +1325,9 @@ class SchedulerDisaggregationPrefillMixin:
         req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
         if req.finished_reason is None:
             req.finished_reason = FINISH_LENGTH(length=0)
-        # unlock the tree
-        release_kv_cache(req, self.tree_cache, checkpoint=True)
+        # unlock the tree; an empty encoder-only handoff never held KV
+        if not dsv41_encoder_only_prefill_enabled() or req.kv.holds_kv:
+            release_kv_cache(req, self.tree_cache, checkpoint=True)
         self._release_aborted_request(req)
         if not isinstance(req.finished_reason, FINISH_ABORT):
             prepare_abort(

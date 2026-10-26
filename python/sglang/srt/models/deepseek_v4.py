@@ -193,6 +193,7 @@ from sglang.srt.multimodal.deepseek_v41_image_processing import (
 )
 from sglang.srt.runtime_context import (
     get_device,
+    get_disagg,
     get_exec,
     get_forward,
     get_parallel,
@@ -294,6 +295,30 @@ DEEPSEEK_V4_STACKED_PARAMS_MAPPING: List[Tuple[str, str, int]] = [
     ("gate_up_proj", "gate_proj", 0),
     ("gate_up_proj", "up_proj", 1),
 ]
+
+
+def dsv41_encoder_only_prefill_weight_needed(name: str, boundary: int) -> bool:
+    """Whether a remapped checkpoint tensor belongs to the Prefill submodel."""
+    if name.startswith(
+        ("model.norm.", "model.hc_head_", "lm_head.", "mtp.", "model.mtp.")
+    ):
+        return False
+    layer_id = get_layer_id(name)
+    if layer_id is not None:
+        if layer_id < boundary:
+            return True
+        if layer_id > boundary:
+            return False
+        boundary_prefix = f"model.layers.{boundary}."
+        return name.startswith(
+            (
+                boundary_prefix + "input_layernorm.",
+                boundary_prefix + "self_attn.compressor.",
+                boundary_prefix + "self_attn.indexer.wk.",
+                boundary_prefix + "self_attn.indexer.k_norm.",
+            )
+        )
+    return True
 
 
 def _is_fused_mhc_post_pre_enabled_xpu() -> bool:
@@ -915,6 +940,9 @@ def deepseek_v4_write_tail_source_kv(layer, x, positions) -> None:
     # Like the sources above: the compressor syncs with the host.
     forward_batch = get_tc_piecewise_forward_context().forward_batch
     real_num_tokens = forward_batch.global_num_token_non_padded_cpu
+    if real_num_tokens == 0:
+        # An idle DP rank's padded batch has no live tail rows.
+        return
     get_attn_backend().write_tail_source_kv(
         layer=layer,
         x=x[:real_num_tokens],
@@ -3710,6 +3738,138 @@ DeepseekV4DecoderLayer = (
 )
 
 
+class DeepseekV41EncoderBoundaryAttention(nn.Module):
+    """Only the layer-20 producers needed by encoder-only Prefill.
+
+    The boundary does not execute attention. It projects the final ratio-1
+    Main-KV rows and derives the matching Indexer-K rows. Query/output
+    projections and the attention module are deliberately absent so their
+    checkpoint tensors never become resident.
+    """
+
+    def __init__(
+        self,
+        config: DeepSeekV4Config,
+        layer_id: int,
+        quant_config: Optional[QuantizationConfig],
+        prefix: str,
+    ) -> None:
+        super().__init__()
+        self.layer_id = layer_id
+        self.compress_ratio = config.compress_ratios[layer_id]
+        self.rope_head_dim = config.qk_rope_head_dim
+        if self.compress_ratio not in (1, 2):
+            raise ValueError("encoder-only boundary must be a ratio-1/2 Main-KV source")
+        self.compressor = DeepseekV41Compressor(
+            hidden_size=config.hidden_size,
+            head_dim=config.head_dim,
+            compress_ratio=self.compress_ratio,
+            eps=config.rms_norm_eps,
+        )
+        self.indexer = DeepseekV41Indexer(
+            config,
+            layer_id=layer_id,
+            head_dim=config.head_dim,
+            quant_config=quant_config,
+            prefix=add_prefix("indexer", prefix),
+            key_only=True,
+        )
+        from sglang.kernels.ops.attention.dsv4.rope import (
+            precompute_freqs_cis,
+        )
+
+        _, rope_scaling = get_rope_config(config)
+        scaling = dict(rope_scaling) if rope_scaling else {}
+        self.register_buffer(
+            "freqs_cis",
+            precompute_freqs_cis(
+                dim=config.qk_rope_head_dim,
+                seqlen=config.max_position_embeddings,
+                original_seq_len=scaling["original_max_position_embeddings"],
+                base=config.compress_rope_theta,
+                factor=scaling.get("factor", 1.0),
+                beta_fast=scaling.get("beta_fast", 32),
+                beta_slow=scaling.get("beta_slow", 1),
+            ),
+            persistent=False,
+        )
+
+    def accepts_mxfp8_swizzled_input(self) -> bool:
+        return False
+
+    def refresh_attn_sink_cache(self) -> None:
+        # Called for every layer after weight loading; the boundary runs no
+        # attention, so it holds no attention sink.
+        return None
+
+
+class DeepseekV41EncoderBoundaryLayer(DeepseekV4DecoderLayer):
+    """Minimal final Prefill layer: mHC pre-mix plus Main-KV/Indexer-K write."""
+
+    def __init__(
+        self,
+        config: DeepSeekV4Config,
+        layer_id: int,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+        hc_stats_stream: Optional[torch.cuda.Stream] = None,
+    ) -> None:
+        nn.Module.__init__(self)
+        self.hc_stats_stream = hc_stats_stream
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.layer_id = layer_id
+        self.self_attn = DeepseekV41EncoderBoundaryAttention(
+            config=config,
+            layer_id=layer_id,
+            quant_config=quant_config,
+            prefix=add_prefix("self_attn", prefix),
+        )
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.hc_mult = config.hc_mult
+        self.hc_sinkhorn_iters = config.hc_sinkhorn_iters
+        self.hc_eps = config.hc_eps
+        self.rms_norm_eps = config.rms_norm_eps
+        self.hc_pre_from_prev_sublayer = config.hc_pre_from_prev_sublayer
+        self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
+        self.engram = None
+        self.attn_hc = None
+        self._next_layer = None
+        self.hc_cfg = mhc.HcConfig(
+            mult=config.hc_mult,
+            sinkhorn_iters=config.hc_sinkhorn_iters,
+            eps=config.hc_eps,
+            rms_eps=config.rms_norm_eps,
+            hidden=config.hidden_size,
+            pre_from_prev=config.hc_pre_from_prev_sublayer,
+            cp_prefill=self.dsa_enable_prefill_cp,
+        )
+
+    def refresh_mhc_norm_weight_cache(self) -> None:
+        self._input_layernorm_weight_bf16 = (
+            self.input_layernorm.weight.data.bfloat16().contiguous()
+        )
+
+    def write_global_cache_only(
+        self,
+        positions: torch.Tensor,
+        state: mhc.HcState,
+        forward_batch: ForwardBatch,
+    ) -> None:
+        """Consume the previous mHC state and write only Main-KV/Indexer-K."""
+        state = state.materialized(self.hc_cfg)
+        x = mhc.combine_input(self.hc_cfg, self.input_layernorm, state)
+        get_attn_backend().forward_low_ratio_sources(
+            layer=self.self_attn,
+            x=x,
+            q_lora=None,
+            positions=positions,
+            forward_batch=forward_batch,
+            run_compressor=True,
+            run_indexer=False,
+        )
+
+
 class DeepseekV4Model(nn.Module):
     fall_back_to_pt_during_load = False
     # Class-level default for instances built without running __init__.
@@ -3725,6 +3885,13 @@ class DeepseekV4Model(nn.Module):
         self.config = config
         self.pp_group = get_parallel().pp_group
         self.hidden_size = config.hidden_size
+        self.encoder_only_prefill = (
+            get_disagg().dsv41_encoder_only_prefill
+            and get_disagg().disaggregation_mode == "prefill"
+        )
+        self.encoder_only_boundary_layer = (
+            max(config.kv_source_layer_ids) if self.encoder_only_prefill else None
+        )
         if self.pp_group.is_first_rank:
             embedding_quant_config = (
                 quant_config
@@ -3779,9 +3946,20 @@ class DeepseekV4Model(nn.Module):
             else None
         )
         self.engram_layout = EngramLayout.from_config(config)
-        self.layers, self.start_layer, self.end_layer = make_pp_layers(
-            config.num_hidden_layers,
-            lambda idx, prefix: DeepseekV4DecoderLayer(
+
+        def make_layer(idx: int, prefix: str) -> nn.Module:
+            if self.encoder_only_boundary_layer is not None:
+                if idx > self.encoder_only_boundary_layer:
+                    return PPMissingLayer()
+                if idx == self.encoder_only_boundary_layer:
+                    return DeepseekV41EncoderBoundaryLayer(
+                        config=config,
+                        layer_id=idx,
+                        quant_config=quant_config,
+                        prefix=prefix,
+                        hc_stats_stream=self.hc_stats_stream,
+                    )
+            return DeepseekV4DecoderLayer(
                 config=config,
                 layer_id=idx,
                 quant_config=quant_config,
@@ -3790,14 +3968,20 @@ class DeepseekV4Model(nn.Module):
                 engram_layout=self.engram_layout,
                 hc_stats_stream=self.hc_stats_stream,
                 moe_routed_quant_stream=self.moe_routed_quant_stream,
-            ),
+            )
+
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
+            config.num_hidden_layers,
+            make_layer,
             prefix=add_prefix("layers", prefix),
             final_read=hc_boundary.FinalRead() if _is_cuda else None,
             stage_facts=functools.partial(hc_boundary.stages, config)
             if _is_cuda
             else None,
         )
-        if self.pp_group.is_last_rank:
+        if self.encoder_only_boundary_layer is not None:
+            self.end_layer = self.encoder_only_boundary_layer + 1
+        if self.pp_group.is_last_rank and not self.encoder_only_prefill:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer()
@@ -3807,7 +3991,11 @@ class DeepseekV4Model(nn.Module):
         self.norm_eps = config.rms_norm_eps
         self.hc_pre_from_prev_sublayer = config.hc_pre_from_prev_sublayer
         self.hc_head_fn = self.hc_head_base = self.hc_head_scale = None
-        if self.pp_group.is_last_rank and not self.hc_pre_from_prev_sublayer:
+        if (
+            self.pp_group.is_last_rank
+            and not self.encoder_only_prefill
+            and not self.hc_pre_from_prev_sublayer
+        ):
             (
                 self.hc_head_fn,
                 self.hc_head_base,
@@ -4174,6 +4362,15 @@ class DeepseekV4Model(nn.Module):
                     aux = tail.rows(aux)
                 mhc_stream_mean(aux, out=dspark_aux_hidden_states.slot(aux[:, 0]))
                 del aux
+            if i == self.encoder_only_boundary_layer:
+                if _is_cuda:
+                    state = hc_boundary.materialize(hidden_states, forward_batch)
+                self.layers[i].write_global_cache_only(
+                    positions=positions,
+                    state=state,
+                    forward_batch=forward_batch,
+                )
+                return None, None, None
             ctx = (
                 nullcontext()
                 if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
@@ -4353,7 +4550,7 @@ class DeepseekV4Model(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: Optional[torch.Tensor],
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
-    ) -> Union[torch.Tensor, PPProxyTensors]:
+    ) -> Optional[Union[torch.Tensor, PPProxyTensors]]:
         if not _is_cuda:
             return self._forward_impl(
                 input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
@@ -4376,7 +4573,7 @@ class DeepseekV4Model(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: Optional[torch.Tensor],
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
-    ) -> Union[torch.Tensor, PPProxyTensors]:
+    ) -> Optional[Union[torch.Tensor, PPProxyTensors]]:
         if self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
@@ -4464,6 +4661,8 @@ class DeepseekV4Model(nn.Module):
                 capture_dspark,
                 dspark_aux_hidden_states,
             )
+            if hidden_states is None:
+                return None
         elif run_tbo:
             # Two-batch-overlap prefill (EP / mori). Cross-layer mHC fusion is
             # disabled here (each layer self-contained), so no trailing hc_post.
@@ -4622,11 +4821,16 @@ class DeepseekV4ForCausalLM(nn.Module):
         self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
         self.wo_a_fp8 = wo_a_fp8_gemm_enabled(quant_config)
+        self.encoder_only_prefill = (
+            get_disagg().dsv41_encoder_only_prefill
+            and get_disagg().disaggregation_mode == "prefill"
+        )
         # The weight loader reads this after the build.
         self.num_fused_shared_experts = get_num_fused_shared_experts()
         self.vision = None
         if (
-            config.model_type == "deepseek_v41"
+            not self.encoder_only_prefill
+            and config.model_type == "deepseek_v41"
             and config.vision_n_layers > 0
             and not getattr(config, "language_model_only", False)
         ):
@@ -4653,7 +4857,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             config, quant_config, prefix=add_prefix("model", prefix)
         )
         self.pp_group = get_parallel().pp_group
-        if self.pp_group.is_last_rank:
+        if self.pp_group.is_last_rank and not self.encoder_only_prefill:
             if self.pp_group.world_size == 1 and config.tie_word_embeddings:
                 self.lm_head = self.model.embed_tokens
             else:
@@ -4675,7 +4879,8 @@ class DeepseekV4ForCausalLM(nn.Module):
                 layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
                 for layer_id in range(self.model.start_layer, self.model.end_layer)
                 if isinstance(
-                    self.model.layers[layer_id].mlp, deepseek_v2.DeepseekV2MoE
+                    getattr(self.model.layers[layer_id], "mlp", None),
+                    deepseek_v2.DeepseekV2MoE,
                 )
             }
         )
@@ -4688,6 +4893,20 @@ class DeepseekV4ForCausalLM(nn.Module):
         # mid-serving (RL refit sends many partial batches); the prewarm and
         # its barrier must only run on the first (startup) load.
         self._mhc_prewarmed_at_load = False
+        if self.encoder_only_prefill:
+            resident_bytes = sum(
+                param.numel() * param.element_size() for param in self.parameters()
+            )
+            log_info_on_rank0(
+                logger,
+                "DeepSeek-V4.1 encoder-only Prefill materialized weights: "
+                f"full_layers=[{self.model.start_layer}, "
+                f"{self.model.encoder_only_boundary_layer}), "
+                f"boundary_layer={self.model.encoder_only_boundary_layer} "
+                "(mHC pre-mix + Main-KV/Indexer-K producers only), "
+                "final_norm=False, lm_head=False, dspark=False, "
+                f"parameter_bytes={resident_bytes}",
+            )
 
     @torch.inference_mode()
     def wants_prefill_autotune(self) -> bool:
@@ -4892,6 +5111,8 @@ class DeepseekV4ForCausalLM(nn.Module):
             hidden_states = self.model.forward(
                 input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
             )
+        if hidden_states is None:
+            return None
         if not self.pp_group.is_last_rank:
             return hidden_states
 
@@ -4965,6 +5186,8 @@ class DeepseekV4ForCausalLM(nn.Module):
             ]
         for layer in layers:
             attn = layer.self_attn
+            if not hasattr(attn, "wo_a"):
+                continue
             G = attn.n_local_groups
             R = attn.o_lora_rank
             D = attn.wo_a.weight.shape[1]
@@ -5201,6 +5424,7 @@ class DeepseekV4ForCausalLM(nn.Module):
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
+        encoder_only_skipped = 0
 
         if is_nextn:
             if hasattr(self.config, "num_nextn_predict_layers"):
@@ -5213,6 +5437,26 @@ class DeepseekV4ForCausalLM(nn.Module):
                 )
             else:
                 raise ValueError("num_nextn_predict_layers is not in the config")
+
+        if self.encoder_only_prefill:
+            boundary = self.model.encoder_only_boundary_layer
+            assert boundary is not None
+            unfiltered_weights = weights
+
+            def encoder_weights_only():
+                nonlocal encoder_only_skipped
+                for name, loaded_weight in unfiltered_weights:
+                    remapped = self.remap_weight_name_to_dpsk_hf_format(
+                        name,
+                        is_nextn=is_nextn,
+                        num_hidden_layers=self.config.num_hidden_layers,
+                    )
+                    if dsv41_encoder_only_prefill_weight_needed(remapped, boundary):
+                        yield name, loaded_weight
+                    else:
+                        encoder_only_skipped += 1
+
+            weights = encoder_weights_only()
 
         # Must mirror MQALayer.__init__'s `quantize_wo_a`: dequantizing wo_a here
         # while the layer allocated an FP8 parameter (or vice versa) fails the
@@ -5558,6 +5802,13 @@ class DeepseekV4ForCausalLM(nn.Module):
                 "Skipped checkpoint tensors not wired yet: "
                 + ", ".join(f"{k}={v}" for k, v in sorted(skipped_by_group.items())),
             )
+        if encoder_only_skipped:
+            log_info_on_rank0(
+                logger,
+                "DeepSeek-V4.1 encoder-only Prefill skipped "
+                f"{encoder_only_skipped} checkpoint tensors outside the resident "
+                "submodel.",
+            )
         unloaded_params = params_dict.keys() - loaded_params
 
         skipped_checking_patterns = [
@@ -5594,9 +5845,17 @@ class DeepseekV4ForCausalLM(nn.Module):
             self._prewarm_mhc_kernels()
 
     def get_embed_and_head(self):
+        if self.encoder_only_prefill:
+            raise AttributeError(
+                "get_embed_and_head() is not available on encoder-only Prefill"
+            )
         return self.model.embed_tokens.weight, self.lm_head.weight
 
     def set_embed_and_head(self, embed, head):
+        if self.encoder_only_prefill:
+            raise AttributeError(
+                "set_embed_and_head() is not available on encoder-only Prefill"
+            )
         del self.model.embed_tokens.weight
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed

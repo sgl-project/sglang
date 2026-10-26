@@ -16,7 +16,7 @@ from sglang.srt.arg_groups.overrides import (
     run_post_process_pass,
 )
 from sglang.srt.environ import envs
-from sglang.srt.model_executor.cuda_graph_config import Backend
+from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
 from sglang.srt.utils.common import is_gfx95_supported, is_npu
 
@@ -246,6 +246,99 @@ def validate_deepseek_v41_encoder_replay_budget(server_args: ServerArgs) -> None
             "encoder SWA replay requires --max-running-requests > 0 and at least "
             f"{min_chunk} chunked prefill tokens per attention DP rank (128 replay "
             "tokens plus one page)"
+        )
+
+
+def validate_deepseek_v41_encoder_only_prefill(server_args: ServerArgs) -> None:
+    """Validate the asymmetric PD split; runs after decoder replay is resolved."""
+    cfg = resolving_view(server_args)
+    if not cfg.dsv41_encoder_only_prefill:
+        return
+    hf_config = model_config_of(server_args).hf_config
+    if hf_config.model_type != "deepseek_v41":
+        raise ValueError("--dsv41-encoder-only-prefill requires DeepSeek-V4.1")
+    kv_sources = tuple(hf_config.kv_source_layer_ids)
+    boundary = max(kv_sources)
+    # An even split leaves no pending compressor state only up to ratio 2; a
+    # c4 or c128 layer would need its partial block transferred.
+    target_ratios = hf_config.compress_ratios[: hf_config.num_hidden_layers]
+    if any(ratio not in (0, 1, 2) for ratio in target_ratios):
+        raise ValueError(
+            "--dsv41-encoder-only-prefill requires compression ratios 0, 1 and 2 only"
+        )
+    if (
+        hf_config.compress_ratios[boundary] not in (1, 2)
+        or boundary not in hf_config.index_source_layer_ids
+        or boundary in hf_config.engram_layer_ids
+        or not hf_config.hc_pre_from_prev_sublayer
+    ):
+        raise ValueError(
+            "--dsv41-encoder-only-prefill requires the last KV source layer to own "
+            "ratio-1/2 Main-KV and Indexer-K, not to be an Engram layer, and the "
+            "shifted mHC topology"
+        )
+    is_decode = cfg.disaggregation_mode == "decode"
+    incompatible = (
+        ("modes other than PD prefill/decode", cfg.disaggregation_mode == "null"),
+        (
+            "transfer backends other than Mooncake",
+            cfg.disaggregation_transfer_backend != "mooncake",
+        ),
+        # Prefill has no lm_head; decode drafts from its own tail extend.
+        (
+            "speculative decoding on prefill",
+            not is_decode and cfg.speculative_algorithm is not None,
+        ),
+        ("pipeline parallelism", cfg.pp_size != 1),
+        (
+            "context parallelism",
+            cfg.enable_prefill_cp or cfg.attn_cp_size != 1 or cfg.dcp_size != 1,
+        ),
+        (
+            "prefill CUDA graphs on prefill",
+            not is_decode and cfg.cuda_graph_config.prefill.backend != Backend.DISABLED,
+        ),
+        ("mixed prefill/decode", cfg.enable_mixed_chunk),
+        ("LoRA", cfg.enable_lora),
+        ("decode radix cache", cfg.disaggregation_decode_enable_radix_cache),
+        ("decode KV offload", cfg.disaggregation_decode_enable_offload_kvcache),
+        ("KV checksums", cfg.disaggregation_enable_kv_checksum),
+        # Decode runs the final window with layers from the last KV source on
+        # floored at the window start, the same numerics as collocated replay.
+        (
+            "decode without decoder SWA bounded replay",
+            is_decode and not cfg.enable_decoder_swa_bounded_replay,
+        ),
+    )
+    for feature, enabled in incompatible:
+        if enabled:
+            raise ValueError(f"--dsv41-encoder-only-prefill does not support {feature}")
+    if not is_decode:
+        # Prefill stops at the last KV source and never runs the decoder layers.
+        declare_resolution(
+            server_args,
+            "validate_deepseek_v41_encoder_only_prefill",
+            enable_decoder_swa_bounded_replay=False,
+        )
+        return
+    # Decode runs each request's last window as an extend over its whole context.
+    # The breakable prefill graph replays it at any length: under the split the
+    # ratio-1/2 indexer runs as an eager break, so no candidate window bounds it.
+    # The DeepSeek-V4 default (disabled, for c4 capture memory) doesn't apply:
+    # V4.1 has no c4 layers.
+    locked = getattr(server_args, "_cuda_graph_config_locked", set())
+    changes = {}
+    if (Phase.PREFILL, "backend") not in locked:
+        changes["backend"] = Backend.BREAKABLE
+    if (Phase.PREFILL, "max_seq_len") not in locked:
+        changes["max_seq_len"] = model_config_of(server_args).context_len
+    if changes:
+        declare_resolution(
+            server_args,
+            "validate_deepseek_v41_encoder_only_prefill",
+            cuda_graph_config=with_phase(
+                cfg.cuda_graph_config, Phase.PREFILL, **changes
+            ),
         )
 
 

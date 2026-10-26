@@ -82,6 +82,7 @@ from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
     DecodeTransferQueue,
     SchedulerDisaggregationDecodeMixin,
+    release_decode_kv_cache,
 )
 from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
     DecodeKVCacheOffloadManager,
@@ -1527,9 +1528,11 @@ class Scheduler(
                 transfer_backend=self.transfer_backend,
             )
 
+        # Encoder-only prefill sends no draft state; decode's tail extend fills it.
         draft_token_to_kv_pool = (
             self.draft_worker.primary_draft_kv_pool
             if self.draft_worker is not None
+            and not get_disagg().dsv41_encoder_only_prefill
             else None
         )
 
@@ -3469,6 +3472,10 @@ class Scheduler(
             req.time_stats.set_wait_queue_entry_time()
             req.arrival_processed_tokens = self.processed_tokens_counter
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
+            if get_disagg().dsv41_encoder_only_prefill and not (
+                self.prepare_dsv41_encoder_only_req(req)
+            ):
+                return
             self._prefetch_kvcache(req)
             self.disagg_prefill_bootstrap_queue.add(
                 req, self.model_config.num_key_value_heads
@@ -5634,7 +5641,7 @@ class Scheduler(
                     self.hisparse_coordinator.request_finished(req)
                 if req.finished_reason is None:
                     req.finished_reason = FINISH_ABORT()
-                release_kv_cache(req, self.tree_cache, checkpoint=True)
+                release_decode_kv_cache(req, self.tree_cache, checkpoint=True)
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 self.release_aborted_prefill_waiting_req(req)
 

@@ -2228,6 +2228,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             if hasattr(self, "output_cache_loc_backup"):
                 self.out_cache_loc = self.output_cache_loc_backup
 
+        elif logits_output is None:
+            # The model stops before the head (encoder-only PD prefill).
+            return
         elif self.forward_mode.is_decode() or self.forward_mode.is_idle():
             logits_output.next_token_logits = logits_output.next_token_logits[:bs]
             if logits_output.hidden_states is not None:

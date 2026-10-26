@@ -27,6 +27,7 @@ from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
+    get_context,
     get_disagg,
     get_spec,
 )
@@ -372,6 +373,9 @@ def poll_and_all_reduce_with_staging(
 # Metadata Buffers
 #########################
 
+# cached_tokens slot carrying the prompt length an encoder-only prefill covered.
+DSV41_PREFIX_LEN_SLOT = 7
+
 
 class ReqToMetadataIdxAllocator:
     """A memory pool that maps a request to its first output token location."""
@@ -582,12 +586,19 @@ class MetadataBuffers:
         )
 
     def set_buf(self, req: Req):
-
-        self.output_ids[req.metadata_buffer_index][0] = req.output_ids[0]
+        # An encoder-only prefill samples no handoff token.
+        self.output_ids[req.metadata_buffer_index][0] = (
+            req.output_ids[0] if req.output_ids else 0
+        )
         # The cached_tokens buffer is (size, 16); slots 0-3 hold cached token
         # counts and slots 4-6 are reused for multimodal prompt token counts
-        # (slots 7-15 remain spare). This avoids adding new RDMA buffers.
-        # Slot map: 0=cached 1=device 2=host 3=storage 4=image 5=audio 6=video.
+        # (slots 8-15 remain spare). This avoids adding new RDMA buffers.
+        # Slot map: 0=cached 1=device 2=host 3=storage 4=image 5=audio 6=video
+        # 7=DeepSeek-V4.1 encoder-only prefix length.
+        if dsv41_encoder_only_prefill_enabled():
+            self.cached_tokens[req.metadata_buffer_index][DSV41_PREFIX_LEN_SLOT] = len(
+                req.origin_input_ids
+            )
         self.cached_tokens[req.metadata_buffer_index][0] = req.cached_tokens
         self.cached_tokens[req.metadata_buffer_index][1] = req.cached_tokens_device
         self.cached_tokens[req.metadata_buffer_index][2] = req.cached_tokens_host
@@ -1531,7 +1542,14 @@ def setup_state_kv_args(
             *token_to_kv_pool.get_dense_kv_state_buf_infos(),
         )
     elif hasattr(token_to_kv_pool, "get_state_buf_infos"):
-        data_ptrs, data_lens, item_lens = token_to_kv_pool.get_state_buf_infos()
+        if dsv41_encoder_only_prefill_enabled():
+            # Decode floors the layers from the last KV source on at its tail
+            # start, so only the encoder layers' SWA is ever read.
+            data_ptrs, data_lens, item_lens = token_to_kv_pool.get_state_buf_infos(
+                swa_layer_end=max(token_to_kv_pool.kv_source_layers)
+            )
+        else:
+            data_ptrs, data_lens, item_lens = token_to_kv_pool.get_state_buf_infos()
 
         # DeepSeekV4TokenToKVPool inherits BaseSWAKVPool; its heterogeneous
         # state list is described per-entry via get_state_buf_infos.
@@ -1575,7 +1593,12 @@ def setup_state_kv_args(
                         ring_lens,
                         ring_item_lens,
                     )
-            if hasattr(token_to_kv_pool, "get_request_state_buf_infos"):
+            # An encoder-only split leaves no request-scoped state; see
+            # dsv41_encoder_prefix_len.
+            if (
+                hasattr(token_to_kv_pool, "get_request_state_buf_infos")
+                and not dsv41_encoder_only_prefill_enabled()
+            ):
                 c128_ptrs, c128_lens, c128_item_lens = (
                     token_to_kv_pool.get_request_state_buf_infos()
                 )
@@ -1885,7 +1908,11 @@ def setup_state_kv_args(
 def get_dsv41_spec_layout(kv_args: KVArgs) -> Optional[dict]:
     """Describe the positional transfer layout without pool capacities or pointers."""
     ratios = getattr(kv_args, "mla_compression_ratios", None) or []
-    if 2 not in ratios or str(get_spec().speculative_algorithm).upper() != "DSPARK":
+    if (
+        2 not in ratios
+        or str(get_spec().speculative_algorithm).upper() != "DSPARK"
+        or dsv41_encoder_only_prefill_enabled()
+    ):
         return None
 
     from sglang.srt.disaggregation.base.conn import StateType
@@ -1911,6 +1938,53 @@ def get_pd_kv_layout(token_to_kv_pool) -> Optional[str]:
 
     if isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool):
         return token_to_kv_pool.pd_kv_layout()
+    return None
+
+
+def dsv41_encoder_only_prefill_enabled() -> bool:
+    """--dsv41-encoder-only-prefill. False where no disagg config is published:
+    the PD queues and helpers also run outside a server (unit tests build them
+    directly), and the split's request fields exist only on a split server."""
+    return (
+        get_context().is_config_namespace_published("disagg")
+        and get_disagg().dsv41_encoder_only_prefill
+    )
+
+
+def dsv41_encoder_prefix_len(prompt_len: int, window: int) -> int:
+    """Prompt tokens a DeepSeek-V4.1 encoder-only prefill covers.
+
+    Decode runs the final window through the full model on top of this prefix,
+    reading its transferred encoder SWA, so the split matches collocated
+    decoder SWA bounded replay. The prefix is even, so no ratio-2 compressor
+    holds a pending half-pair: no request-scoped state crosses, and the peers'
+    pair rings may differ in size (decode's grows with speculative decoding).
+    """
+    return max(0, prompt_len - window) // 2 * 2
+
+
+def dsv41_encoder_only_unsupported(req: Req) -> Optional[str]:
+    """What a request asks for that an encoder-only split cannot serve, if anything.
+
+    Prefill and decode both reject with this, so neither waits on a peer that
+    already turned the request away.
+    """
+    if req.multimodal_inputs is not None:
+        return "multimodal prompts"
+    if req.input_embeds is not None or req.positional_embed_overrides is not None:
+        return "input embeddings"
+    # The prefix only reaches the last KV source: no prompt logits, hidden
+    # states or decoder-layer routing exist for it.
+    if req.return_logprob and 0 <= req.logprob_start_len < len(req.origin_input_ids):
+        return "prompt logprobs"
+    if req.return_hidden_states:
+        return "hidden states"
+    if req.return_routed_experts:
+        return "routed experts"
+    if req.return_indexer_topk:
+        return "indexer top-k"
+    if req.return_sampling_mask:
+        return "sampling masks"
     return None
 
 
