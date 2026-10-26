@@ -39,7 +39,7 @@ _M31_TUNED_GEMM_TABLES = (
     ),
     # bf16 GEMMs outside the layers, M <= 1024 (lm_head 50016 x 6144, DSpark fc
     # 1536 x 30720): hipBLASLt / FlyDSL where >= 3% faster than F.linear with cold
-    # weights. The hipBLASLt indices fit this image only.
+    # weights. Its hipBLASLt solution indices are ROCm 7.2's; ROCm 10's hipBLASLt rejects them.
     (
         "AITER_CONFIG_GEMM_BF16",
         "bf16_tuned_gemm.csv",
