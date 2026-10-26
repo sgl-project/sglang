@@ -493,6 +493,7 @@ class IpcA2AMultiState:
         replicated=(None, None, None),
         replicated_first: bool = True,
         attend_into=None,
+        fill_all=None,
     ):
         """Ulysses attention with the head exchange pipelined against it.
 
@@ -525,6 +526,10 @@ class IpcA2AMultiState:
         go straight into its own receive slot, and v always moves straight
         from ``v``. It is only called once the call is known to pipeline.
 
+        ``fill_all(blocks)`` is ``fill`` given every block at once, as a list of
+        ``(head_start, head_count, q_dst, k_dst)`` (for a norm over all heads of a row,
+        which one pass over q and k then writes everywhere).
+
         ``attend_into(q, k, v, out)``, when given, writes what ``attend``
         returns into ``out`` (any token stride); with ``out=None`` it only says
         whether it serves those inputs. Each group then attends straight into a
@@ -541,6 +546,7 @@ class IpcA2AMultiState:
         pool released, so that call never holds both at once.
         """
         world, r = self.world, self.rank
+        filled = fill is not None or fill_all is not None
         squeeze = q.dim() == 3
         if squeeze:
             q, k, v = q[None], k[None], v[None]
@@ -555,11 +561,11 @@ class IpcA2AMultiState:
             tuple(None if t is None else t.shape for t in replicated),
             replicated_first,
             groups,
-            fill is not None,
+            filled,
         )
         if shapes not in self.plans:
             self.plans[shapes] = self._plan(
-                q, k, v, replicated, replicated_first, groups, fill is not None
+                q, k, v, replicated, replicated_first, groups, filled
             )
         plan = self.plans[shapes]
         if plan is None:
@@ -568,7 +574,7 @@ class IpcA2AMultiState:
 
         # each token's heads of one group must be one contiguous run to move
         # with a pitched copy
-        copied = [v] if fill is not None else [q, k, v]
+        copied = [v] if filled else [q, k, v]
         copied += [t for t in replicated if t is not None]
         if not all(t.stride(-1) == 1 and t.stride(-2) == head_dim for t in copied):
             return None
@@ -592,7 +598,7 @@ class IpcA2AMultiState:
             esz = q.element_size()
             held = 0 if pool is None else pool.nbytes(esz)
             need = (sizes[0] + sizes[1]) * esz
-            if fill is not None:
+            if filled:
                 need += plan.world * groups * slots.send_numel * esz
             if auto and not self._fits_on_every_rank(need, reclaimable=held):
                 logger.info(
@@ -689,14 +695,27 @@ class IpcA2AMultiState:
         # my own rows of every group, here and in one pass per part: a same-device
         # copy runs on the SMs, so on the copy stream it would wait out the
         # previous group's attention and hold up the peer sends queued behind it
-        for part in (2,) if fill is not None else range(3):
+        for part in (2,) if filled else range(3):
             copy_head_groups(*own_rows_views(part))
         for g in range(groups):
             for part in range(3):
                 place_replicated(main, part, g)
         placed = main.record_event()
         own, sent = [], []
-        if fill is not None:
+        if fill_all is not None:
+            own_rows = lambda part, g: slots.slot(pool, r, g, part)[
+                0, my_shard_row[part] : my_shard_row[part] + s_local
+            ]
+            hg = plan.group_heads(0)
+            blocks = []
+            for g in range(groups):
+                for p in peers:
+                    qk = slots.send_block(pool, p, g)
+                    blocks.append((start(p, g, 0), hg, qk[0], qk[1]))
+                blocks.append((start(r, g, 0), hg, own_rows(0, g), own_rows(1, g)))
+            fill_all(blocks)
+            sent = own = [main.record_event()] * groups
+        elif fill is not None:
             # group by group: the peers' blocks first, so their copies start
             # while this rank fills its own block straight into its slot
             own_rows = lambda part, g: slots.slot(pool, r, g, part)[
@@ -715,10 +734,10 @@ class IpcA2AMultiState:
             for g in range(groups):
                 for p in peers:
                     send_rows(cin, 2, p, g)
-                    if fill is None:
+                    if not filled:
                         send_rows(cin, 0, p, g)
                         send_rows(cin, 1, p, g)
-                if fill is not None:
+                if filled:
                     cin.wait_event(sent[g])
                     chunk = s_local * row_bytes[0]
                     for p in peers:
@@ -775,7 +794,7 @@ class IpcA2AMultiState:
         done = []
         for g in range(groups):
             stream = self.pipe_group_streams[g]
-            stream.wait_event(own[g] if fill is not None else placed)
+            stream.wait_event(own[g] if filled else placed)
             with torch.cuda.stream(stream):
                 for p in peers:
                     mem.wait(stream, pool.fin_ptr[r] + 4 * p, base + g + 1)
@@ -1059,6 +1078,7 @@ def ulysses_pipelined_attention(
     replicated=(None, None, None),
     replicated_first: bool = True,
     attend_into=None,
+    fill_all=None,
 ):
     """Pipelined Ulysses attention over the copy-engine transport, or None
     when the Ulysses group cannot use it (the caller keeps its NCCL path).
@@ -1080,4 +1100,5 @@ def ulysses_pipelined_attention(
         replicated=replicated,
         replicated_first=replicated_first,
         attend_into=attend_into,
+        fill_all=fill_all,
     )
