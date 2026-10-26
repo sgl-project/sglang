@@ -7,16 +7,17 @@
 // blocks.
 //
 // Roles (384 threads):
-//   warp 8   claimer + Q/weights TMA + drain of math WG1 rows
+//   warp 8   claimer + Q/weights TMA (+ drain of math WG1 rows, > 16K keys)
 //   warp 9   KV TMA (sample tiles via the strided map, then the scan tiles)
 //   warp 10  UMMA issuer
-//   warp 11  linear-term rows + drain of math WG0 rows
+//   warp 11  drain of math WG0 rows (> 16K keys), idle otherwise
 //   warps 0-7 math: sample histogram -> gate -> scan/emit -> selection
 // A block whose candidate count leaves [K, 16384] pauses the role loops; the
 // CTA rescans it exactly (fallback.cuh) and resumes the loops with freshly
 // initialised barriers.
-// Only the global candidate slab path (KVS = 3) is vendored; PR #60618's
-// resident kernel and shared-memory candidate path (KVS = 2) are not.
+// "<= 16K" / "> 16K" below name the two scan paths after their original key
+// ranges: candidates in shared memory (KVS = 2, now up to kSmemPathMaxKeys)
+// and the global candidate slab (KVS = 3).
 #pragma once
 #include <algorithm>
 #include <cstdint>
@@ -47,14 +48,29 @@ using namespace deep_gemm;
 using TBar = cutlass::arch::ClusterTransactionBarrier;
 
 constexpr unsigned kTerm = 0xffffffffu, kPause = 0xfffffffeu;
+// Selection scratch starts after Q + weights so the next block's Q can land
+// during selection.
+constexpr unsigned kSelBase = 33792;
+constexpr unsigned kScratchS =
+    8192;  // per-warp selection scratch (<= 16K keys)
+constexpr unsigned kCandCap = 3072;
+constexpr unsigned kCandExt = 8u * kCandCap + 256u;
 constexpr unsigned kQBytes = 8 * 32 * 128, kKVBytes = 256 * 128,
                    kWBytes = 8 * 32 * 4;
 
 template <unsigned KVS>
-struct PStorage;
-// Rebalanced scan: the 16 linear-term rows of each math warpgroup bracket Q,
-// so WG0's N=144 UMMA reads B = [lin WG0 | Q rows 0..127] (D = [lin | heads])
-// and WG1's reads B = [Q rows 128..255 | lin WG1] (D = [heads | lin]).
+struct PStorage {
+  alignas(1024) cutlass::float_e4m3_t q[kQBytes];
+  alignas(128) float weights[8 * 32];
+  alignas(1024) cutlass::float_e4m3_t kv[KVS][kKVBytes];
+  // <= 16K: the per-key scales have their own ring, twice as deep as the KV
+  // stages (see BarIdx::sf_full).
+  alignas(128) float sf_kv[2 * KVS][256];
+};
+// > 16K keys (rebalanced scan): the 16 linear-term rows of each math
+// warpgroup bracket Q, so WG0's N=144 UMMA reads B = [lin WG0 | Q rows 0..127]
+// (D = [lin | heads]) and WG1's reads B = [Q rows 128..255 | lin WG1] (D =
+// [heads | lin]).
 template <>
 struct PStorage<3> {
   alignas(1024) uint8_t lin_lo[16 * 128];
@@ -68,8 +84,10 @@ struct PStorage<3> {
 static_assert(offsetof(PStorage<3>, q) == 16 * 128 &&
                   offsetof(PStorage<3>, lin_hi) == 16 * 128 + kQBytes,
               "lin rows must bracket Q");
-// Selection scratch starts after lin + Q + lin + weights + row scales (the
-// next block's linear term is written during this block's selection).
+static_assert(offsetof(PStorage<2>, kv) == kSelBase,
+              "selection scratch base (<= 16K)");
+// > 16K: selection scratch starts after lin + Q + lin + weights + row scales
+// (the next block's linear term is written during this block's selection).
 constexpr unsigned kSelBase3 = offsetof(PStorage<3>, kv);
 
 // q'_r = sum_h (w_rh / 2) q_rh, split into 4 FP8 e4m3 terms: terms 0,1 scale
@@ -152,14 +170,12 @@ __device__ __forceinline__ void compute_lin_rows(PStorage<3>& sm,
   }
 }
 
-// The only top-k this build instantiates (fused_persist::kTopK below).
-constexpr unsigned kShortKeys = 2048;
 // Gate: the k-th largest sample (k = count * target / visible, count = the
 // histogram total) of one row from its 4096-bin histogram (bins of the sample
 // minus the row reference `ref`, 16-bit counters two per word); one warp per
 // row. The gate is ref + the lower edge of the bin holding the k-th sample (a
 // lower bound of it). -inf when the row sees at most `target` keys or has no
-// samples; +inf when it sees at most top-k keys.
+// samples.
 __device__ __forceinline__ unsigned sample_pair_total(unsigned v) {
   return (v & 0xffffu) + (v >> 16);
 }
@@ -169,10 +185,7 @@ __device__ __noinline__ void finish_sample_histogram(const unsigned* hist,
                                                      unsigned target, float ref,
                                                      unsigned lane) {
   if (visible <= target) {
-    // Rows that see at most top-k keys (padding rows past the end included)
-    // are written directly (write_short) and need no candidates: a +inf gate
-    // keeps them out of the any-pass vote.
-    if (lane == 0) *gate = visible <= kShortKeys ? CUDART_INF_F : -CUDART_INF_F;
+    if (lane == 0) *gate = -CUDART_INF_F;
     __syncwarp();
     return;
   }
@@ -226,7 +239,7 @@ __device__ __noinline__ void finish_sample_histogram(const unsigned* hist,
   __syncwarp();
 }
 
-// Candidate staging: per (bank, math warp, row) a compacted list of the
+// > 16K candidate staging: per (bank, math warp, row) a compacted list of the
 // interval's passing keys. Record = top 24 bits of the ordered fp32 score code
 // << 8 | (half index in the interval) << 5 | lane, so an interval spans at most
 // kStageCap / 64 tiles and a list can never overflow (64 keys per warp-tile).
@@ -250,8 +263,8 @@ struct ClaimEntry {
 // Barrier words (static shared, never aliased with data).
 template <unsigned KVS>
 struct BarIdx {
-  // 3 per-warpgroup TMEM slots + the linear-term barrier.
-  static constexpr unsigned NT = 3;
+  // > 16K (KVS == 3): 3 per-warpgroup TMEM slots + the linear-term barrier.
+  static constexpr unsigned NT = KVS == 3 ? 3 : 2;
   static constexpr unsigned full_q = 0, empty_q = 1, full_kv = 2,
                             empty_kv = 2 + KVS, full_tmem = 2 + 2 * KVS,
                             empty_tmem = full_tmem + NT,
@@ -259,7 +272,8 @@ struct BarIdx {
                             claim_empty = claim_full + 2,
                             sel_done = claim_empty + 2, h_full = sel_done + 1,
                             h_empty = h_full + 16, full_lin = h_empty + 16,
-                            total = full_lin + 1;
+                            sf_full = full_lin + (KVS == 3 ? 1 : 0),
+                            total = sf_full + (KVS == 3 ? 0 : 2 * KVS);
 };
 
 __device__ __forceinline__ void mbar_inval(const void* b) {
@@ -307,13 +321,12 @@ __device__ __forceinline__ void store_staged(uint16_t* __restrict__ vals,
                                            record >> 8, physical);
 }
 
-// Self-drain, out of line: stores this warp's staged records of the last
+// > 16K self-drain, out of line: stores this warp's staged records of the last
 // handoff interval (recs = recs[bank][warp], [4][kStageCap]; n0..n3 are
-// warp-uniform): one shared-memory atomic per row (cnt_s: the warpgroup's 4
-// per-row candidate counters), coalesced stores.
+// warp-uniform): one atomic per row, coalesced stores.
 __device__ __noinline__ void self_drain_last(
     const uint32_t* __restrict__ recs, unsigned n0, unsigned n1, unsigned n2,
-    unsigned n3, unsigned* cnt_s, unsigned rbase, uint32_t warp_kv,
+    unsigned n3, int* __restrict__ counts, unsigned rbase, uint32_t warp_kv,
     unsigned flush_base, int64_t row_delta, uint16_t* __restrict__ vals,
     int32_t* __restrict__ indices) {
   constexpr uint32_t kCap = 16384;
@@ -322,7 +335,7 @@ __device__ __noinline__ void self_drain_last(
       lane == 0 ? n0
                 : (lane == 1 ? n1 : (lane == 2 ? n2 : (lane == 3 ? n3 : 0u)));
   unsigned start = 0;
-  if (n) start = atomicAdd(cnt_s + lane, n);
+  if (n) start = atomicAdd(counts + rbase + lane, n);
 #pragma unroll 1
   for (unsigned row = 0; row < 4; ++row) {
     const unsigned nr = __shfl_sync(0xffffffffu, n, row),
@@ -341,85 +354,33 @@ __device__ __noinline__ void self_drain_last(
 }
 
 // Drain of one interval of the 4 math warps p0..p0+3 (one warpgroup, rows
-// row_base..row_base+3; slab row of row x: x + row_delta; kv_base: the block's
-// first key). Per row one shared-memory atomic on the warpgroup's per-row
-// counter (totals[0..3]) reserves one contiguous slab range for the row's 4
-// lists (warp order). Lanes 8r..8r+7 then store row r's records, 8 consecutive
-// slots per step: a lane finds its list with 3 compares against its row's
-// list ends and selects of per-list constants (branch-free; no shuffle or
-// atomic inside the steps; one loop for the 4 rows). skip: the last interval,
-// self-drained by the warps.
-__device__ __forceinline__ void ho_drain4(
-    PStageData& d, TBar* hfull, TBar* hempty, unsigned p0, unsigned epoch,
-    unsigned row_base, unsigned* totals, unsigned cap, bool skip,
-    uint16_t* __restrict__ vals, int32_t* __restrict__ indices,
-    int64_t row_delta, unsigned kv_base) {
+// row_base..row_base+3): one atomic round trip for the 16 (warp, row) lists,
+// then coalesced stores. skip: the last interval, self-drained by the warps.
+template <class Store>
+__device__ __forceinline__ void ho_drain4(PStageData& d, TBar* hfull,
+                                          TBar* hempty, unsigned p0,
+                                          unsigned epoch, unsigned row_base,
+                                          int* totals, unsigned cap, bool skip,
+                                          Store store) {
   const unsigned lane = threadIdx.x & 31, bank = epoch & 1;
 #pragma unroll
   for (unsigned p = 0; p < 4; ++p)
     hfull[bank * 8 + p0 + p].wait((epoch >> 1) & 1);
   __syncwarp();
   if (!skip) {
-    // lane l < 16: list (warp p0 + l % 4, row l / 4); incl: inclusive prefix
-    // of the counts within the row (lane 4r + 3: the row total).
-    const unsigned n = lane < 16 ? d.cnt[bank][p0 + lane % 4][lane / 4] : 0u;
-    unsigned incl = n;
-    {
-      unsigned u = __shfl_up_sync(0xffffffffu, incl, 1);
-      if (lane & 3) incl += u;
-      u = __shfl_up_sync(0xffffffffu, incl, 2);
-      if (lane & 2) incl += u;
-    }
-    unsigned rstart = 0;
-    if ((lane & 3) == 3 && lane < 16 && incl)
-      rstart = atomicAdd(totals + lane / 4, incl);
-    // Row-local index h of list (p, r) -> record recs[h + rdelta]
-    // (recs = recs[bank][p0], lists at (p * 4 + r) * kStageCap).
-    const unsigned rdelta =
-        ((lane % 4) * 4 + lane / 4) * kStageCap - (incl - n);
-    const unsigned r = lane / 8, src = 4 * r;  // this lane's row
-    const unsigned e1 = __shfl_sync(0xffffffffu, incl, src),
-                   e2 = __shfl_sync(0xffffffffu, incl, src + 1),
-                   e3 = __shfl_sync(0xffffffffu, incl, src + 2),
-                   nr = __shfl_sync(0xffffffffu, incl, src + 3),
-                   sr = __shfl_sync(0xffffffffu, rstart, src + 3),
-                   d0 = __shfl_sync(0xffffffffu, rdelta, src),
-                   d1 = __shfl_sync(0xffffffffu, rdelta, src + 1),
-                   d2 = __shfl_sync(0xffffffffu, rdelta, src + 2),
-                   d3 = __shfl_sync(0xffffffffu, rdelta, src + 3);
-    const unsigned lim = min(nr, cap - min(sr, cap));  // slots < cap
-    const unsigned steps = __reduce_max_sync(0xffffffffu, lim);
-    // Key of a record of warp p0 + p: kb_p + (half << 7) + lane, kb_p =
-    // kv_base + 32 p + 256 * (the interval's first tile).
-    const unsigned kb0 = kv_base + d.bases[bank][p0] * 256u;
-    const uint32_t* const recs = &d.recs[bank][p0][0][0];
-    const uint64_t roff =
-        static_cast<uint64_t>(int64_t(row_base + r) + row_delta) * cap + sr;
-    // 64-bit slab pointers of this lane's row (one IMAD.WIDE per record and
-    // array).
-    const uint64_t vrow = reinterpret_cast<uint64_t>(vals + roff);
-    const uint64_t irow = reinterpret_cast<uint64_t>(indices + roff);
-#pragma unroll 2
-    for (unsigned h = lane & 7; h < steps; h += 8) {
-      // Branch-free: out-of-range lanes compute on a clamped index and do not
-      // store (predicated st.global.cg).
-      const bool ok = h < lim;
-      const unsigned hc = ok ? h : 0u;
-      const bool b1 = hc >= e1, b2 = hc >= e2, b3 = hc >= e3;
-      const unsigned dd = b3 ? d3 : (b2 ? d2 : (b1 ? d1 : d0));
-      const unsigned kb = kb0 + (b3 ? 96u : (b2 ? 64u : (b1 ? 32u : 0u)));
-      const uint32_t rec = recs[hc + dd];
-      // = store_staged: value = code bits 0-15, index = key (< 2^20) | code
-      // bits 16-23 << 20.
-      const uint32_t key = kb + ((rec << 2) & 0x380u) + (rec & 31u);
-      const uint32_t idx = key | ((rec >> 4) & 0x0ff00000u);
-      asm volatile(
-          "{\n\t.reg .pred q;\n\tsetp.ne.u32 q, %0, 0;\n\t"
-          "@q st.global.cg.u16 [%1], %2;\n\t"
-          "@q st.global.cg.u32 [%3], %4;\n\t}" ::"r"(uint32_t(ok)),
-          "l"(vrow + uint64_t(hc) * 2u), "h"(static_cast<uint16_t>(rec >> 8)),
-          "l"(irow + uint64_t(hc) * 4u), "r"(idx)
-          : "memory");
+    // lane q < 16: list (warp p0 + q / 4, row q % 4)
+    const unsigned n = lane < 16 ? d.cnt[bank][p0 + lane / 4][lane % 4] : 0u;
+    unsigned start = 0;
+    if (n) start = atomicAdd(totals + row_base + lane % 4, n);
+#pragma unroll 1
+    for (unsigned q = 0; q < 16; ++q) {
+      const unsigned nq = __shfl_sync(0xffffffffu, n, q);
+      if (nq == 0) continue;
+      const unsigned sq = __shfl_sync(0xffffffffu, start, q);
+      const unsigned p = p0 + q / 4, row = q % 4, base = d.bases[bank][p];
+      for (unsigned j = lane; j < nq; j += 32)
+        if (sq + j < cap)
+          store(row_base + row, sq + j, d.recs[bank][p][row][j], base, p);
     }
   }
   __syncwarp();
@@ -427,10 +388,7 @@ __device__ __forceinline__ void ho_drain4(
   for (unsigned p = 0; p < 4; ++p) hempty[bank * 8 + p0 + p].arrive();
 }
 
-// kStream: the streaming selection (row_select.cuh select_stream_row) instead
-// of the staged one; a separate instantiation, so the scan code of the
-// long-context instantiation is unaffected.
-template <unsigned Interval, unsigned KVS, unsigned TopK, bool kStream = false>
+template <unsigned Interval, unsigned KVS, unsigned TopK>
 __global__ __launch_bounds__(384, 1) void fused_mqa_topk_fp8_prefill_kernel(
     unsigned rows, unsigned keys, const unsigned* starts_g,
     const unsigned* ends_g, uint16_t* vals, int* indices, int* counts,
@@ -443,32 +401,36 @@ __global__ __launch_bounds__(384, 1) void fused_mqa_topk_fp8_prefill_kernel(
     const __grid_constant__ cute::TmaDescriptor tw, bool relative,
     const int* out_offsets, unsigned nblocks, unsigned* counter,
     int* defer_next, PageTable paged) {
-  // The exact rescan (dense_scan.cuh) expects this 224 / 56 register split.
-  constexpr uint32_t kMathRegs = 224, kSpecRegs = 168 * 3 - 2 * kMathRegs;
+  constexpr bool kSmem =
+      KVS == 2;  // "<= 16K": shared candidates, direct emission
+  constexpr uint32_t kMathRegs = kSmem ? 232 : 224,
+                     kSpecRegs = 168 * 3 - 2 * kMathRegs;
   constexpr uint32_t kCandGlobalCap = 16384;
   using St = PStorage<KVS>;
   using B = BarIdx<KVS>;
-  // Compile-time: a runtime top-k costs ~0.5% in the scan (codegen).
+  // Compile-time: a runtime top-k costs ~0.5% in the > 16K scan (codegen).
   constexpr unsigned topk = TopK;
-  static_assert(topk == kShortKeys, "short-row gate assumes the build top-k");
-  // Rebalanced scan: linear term on the tensor core, per-warpgroup N=144 MMAs.
-  static_assert(KVS == 3, "rebalanced scan needs the 3-KV-stage lin layout");
+  // > 16K keys: rebalanced scan (linear term on the tensor core, per-warpgroup
+  // N=144 MMAs).
+  constexpr bool kLin = !kSmem;
+  static_assert(kLin == (KVS == 3),
+                "rebalanced scan needs the 3-KV-stage lin layout");
   constexpr uint32_t kSlotCols =
       160;  // 4 rows x 32 heads + 16 linear-term columns
-  constexpr unsigned kSelB = kSelBase3;
+  constexpr unsigned kSelB = KVS == 3 ? kSelBase3 : kSelBase;
   extern __shared__ __align__(1024) uint8_t smem_buffer[];
   auto& sm = *reinterpret_cast<St*>(smem_buffer);
   uint8_t* const region = smem_buffer + sizeof(St);
   auto& stream = *reinterpret_cast<SampleShared*>(region);
   auto& sdata = *reinterpret_cast<PStageData*>(region);
-  static_assert(Interval * 64 <= kStageCap,
+  static_assert(kSmem || Interval * 64 <= kStageCap,
                 "an interval must fit the staging lists");
 
   __shared__ alignas(8) uint64_t bar_words[B::total];
   __shared__ uint32_t tmem_ptr;
   __shared__ ClaimEntry entries[2];
   __shared__ float gate_s[8];
-  __shared__ unsigned row_count[8];
+  __shared__ unsigned row_count[8], pool_cnt[8];
   __shared__ unsigned sel_recover, sel_staged, sel_short, row_offset[9];
   __shared__ unsigned defer_head, unsafe_s, pause_req, epoch_kind;
 
@@ -476,8 +438,16 @@ __global__ __launch_bounds__(384, 1) void fused_mqa_topk_fp8_prefill_kernel(
   TBar& full_q = bars[B::full_q];
   TBar& empty_q = bars[B::empty_q];
   TBar* const full_kv = bars + B::full_kv;
-  // The 32 producer lanes stage the sample scales, so each arrives on full_kv.
-  constexpr unsigned kFullKvArrivals = 32;
+  // > 16K the 32 producer lanes stage the sample scales, so each arrives on
+  // full_kv.
+  constexpr unsigned kFullKvArrivals = KVS == 3 ? 32 : 1;
+  // <= 16K: the MMA warp frees each KV stage once its MMAs complete, and the
+  // per-key scales arrive through a separate ring (2 * KVS deep, sf_full), so
+  // the math warps never wait on or release KV stages. The producer leads the
+  // MMA by <= KVS tiles and the MMA leads the math warps by <= 1 tile (2 TMEM
+  // stages), so a scale stage is never overwritten while being read.
+  constexpr bool kRel = KVS == 2;
+  TBar* const sf_full = bars + B::sf_full;
   TBar* const empty_kv = bars + B::empty_kv;
   TBar* const full_tmem = bars + B::full_tmem;
   TBar* const empty_tmem = bars + B::empty_tmem;
@@ -486,11 +456,12 @@ __global__ __launch_bounds__(384, 1) void fused_mqa_topk_fp8_prefill_kernel(
   TBar& sel_done = bars[B::sel_done];
   TBar* const h_full = bars + B::h_full;
   TBar* const h_empty = bars + B::h_empty;
-  TBar* const full_lin = bars + B::full_lin;
+  TBar* const full_lin = bars + B::full_lin;  // > 16K only
 
   const unsigned warp_idx = cutlass::canonical_warp_idx_sync();
   const unsigned lane = ptx::get_lane_idx();
-  constexpr unsigned kClaimConsumers = 11;  // warps 9, 10, 11, 0-7
+  constexpr unsigned kClaimConsumers =
+      kSmem ? 10 : 11;  // warps 9, 10, 0-7 (+11)
 
   if (warp_idx == 8 && lane == 0) {
     cute::prefetch_tma_descriptor(&tq);
@@ -507,7 +478,7 @@ __global__ __launch_bounds__(384, 1) void fused_mqa_topk_fp8_prefill_kernel(
   // block needs the exact rescan (kPause); rare blocks are then rescanned with
   // the fallback core and the loops resume with freshly initialised barriers.
   // The first epoch is emitted outside any loop (nesting the role loops in an
-  // epoch loop costs ~1.5 percent in the scan: uniform address math is
+  // epoch loop costs ~1.5 percent in the >16K scan: uniform address math is
   // rematerialised every tile). Later epochs only run after a recovery pause.
   __shared__ unsigned row_bounds[2][8];
   __shared__ unsigned fslot;
@@ -532,25 +503,23 @@ __global__ __launch_bounds__(384, 1) void fused_mqa_topk_fp8_prefill_kernel(
   }
 }
 
-// ---------------- host: launch configuration ----------------
+// ---------------- host: launch configuration (> kResidentKeys keys)
+// ----------------
 // The only top-k this build instantiates (GLM-5.2's indexer).
 constexpr unsigned kTopK = 2048;
 using PersistentKernel =
-    decltype(&fused_mqa_topk_fp8_prefill_kernel<4, 3, kTopK>);
+    decltype(&fused_mqa_topk_fp8_prefill_kernel<4, 2, kTopK>);
 
-// Fewest keys launched: the gates below are tuned and tested above 20480 keys
-// only (PR #60618's paths for fewer keys are not vendored).
-constexpr unsigned kMinKeys = 20481;
+// Shared-memory candidate path limit (uint16 key indices: <= 65536 keys): the
+// crossover with the global-slab path (B200, GLM-5.2 layers 0-14 real dumps and
+// captures, in-process A/B: the slab path wins from ~22K keys on).
+constexpr unsigned kSmemPathMaxKeys = 20480;
 // Global slab: handoff interval of 4 tiles (the staging lists hold one
-// interval's worst case). Up to kStreamMaxKeys keys the streaming selection
-// instantiation: its selection is cheaper, which matters most for short
-// contexts (B200, GLM-5.2 layers 0-14 real dumps and captures: it wins by
-// 1-12% up to 128K keys; from ~192-256K on, the long-context instantiation's
-// scan is faster on most layers).
-constexpr unsigned kStreamMaxKeys = 196608;
+// interval's worst case).
 inline PersistentKernel persistent_kernel(unsigned keys) {
-  if (keys <= kStreamMaxKeys)
-    return fused_mqa_topk_fp8_prefill_kernel<4, 3, kTopK, true>;
+  if (keys <= 8192) return fused_mqa_topk_fp8_prefill_kernel<4, 2, kTopK>;
+  if (keys <= kSmemPathMaxKeys)
+    return fused_mqa_topk_fp8_prefill_kernel<8, 2, kTopK>;
   return fused_mqa_topk_fp8_prefill_kernel<4, 3, kTopK>;
 }
 
@@ -623,10 +592,10 @@ struct LaunchConfig {
 // limit on the current device, cached) and the gate sample for `keys` keys
 // (top-kTopK rows).
 inline cudaError_t launch_config(unsigned keys, LaunchConfig& c) {
-  if (keys < kMinKeys) return cudaErrorInvalidValue;
   // The gate aims for `target` candidates per row and sizes the sample so its
   // quantile rank is `rank` (count error ~1/sqrt(rank)); a row whose count
-  // falls below the top-k is rescanned exactly.
+  // falls below the top-k is rescanned exactly. On the shared-memory path the
+  // candidates live in shared memory (cap kCandCap, see below for the rank).
   // Above 128K the sample is clamped to 16-48 tiles (rank ~48 at 1M keys): a
   // sample tile costs about two scan tiles. A rescan runs as the last work of
   // its CTA (one 8-row block at 1M keys costs ~1/3 of the call), so the slab
@@ -636,14 +605,19 @@ inline cudaError_t launch_config(unsigned keys, LaunchConfig& c) {
   struct Gate {
     unsigned target, rank;
   };
-  constexpr Gate kGates[4] = {
-      // <= 32K     <= 64K      <= 128K     > 128K
-      {2816, 128}, {3328, 64}, {3584, 64}, {4096, 64}};
-  const bool long_ctx = keys > 131072;
-  const Gate gate = kGates[keys <= 32768   ? 0
-                           : keys <= 65536 ? 1
-                           : !long_ctx     ? 2
-                                           : 3];
+  constexpr Gate kGates[5] = {
+      // smem path  <= 32K        <= 64K       <= 128K      > 128K
+      {2560, 100}, {2816, 128}, {3328, 64}, {3584, 64}, {4096, 64}};
+  const bool small = keys <= kSmemPathMaxKeys, long_ctx = keys > 131072;
+  Gate gate = kGates[small             ? 0
+                     : keys <= 32768   ? 1
+                     : keys <= 65536   ? 2
+                     : !long_ctx       ? 3
+                                       : 4];
+  // Shared-memory path: candidates must land in [2048, 3072] (+-20% of the
+  // target); rank 100 (count noise ~10%, correlated across rows) leaves rows
+  // < 2048 (exact rescans) or > 3072 (spills).
+  if (small && keys > 8192) gate.rank = keys <= 16384 ? 192 : 256;
   c.sample_target = gate.target;
   const unsigned rank = gate.rank;
   const unsigned rank_tiles = std::max(
@@ -665,23 +639,26 @@ inline cudaError_t launch_config(unsigned keys, LaunchConfig& c) {
   // core's layout.
   constexpr int kFallbackSmem =
       int(sizeof(fused_mqa_dense::SharedStorage) + sizeof(FallbackShared));
+  constexpr int kSmallSmem = int(sizeof(PStorage<2>) + kCandExt * 5u);
   constexpr int kLongSmem = int(
       sizeof(PStorage<3>) + std::max(sizeof(PStageData), sizeof(SampleShared)));
-  // streaming selection scratch past Q + weights (checked below at run time)
-  constexpr int kStreamSmem =
-      int(kSelBase3) + int(8 * row_select::kStreamWords * 4);
+  static_assert(sizeof(SampleShared) <= kCandExt * 5u,
+                "sample state must fit the candidate region");
   constexpr int kMaxSmem = 232448;  // sm_100 opt-in limit per block
-  // The staged selection may use everything past Q + weights, up to the
-  // opt-in limit.
-  int static_bytes = 0;
-  if (const cudaError_t e =
-          static_smem(reinterpret_cast<const void*>(c.kernel), static_bytes);
-      e != cudaSuccess)
-    return e;
-  c.smem = std::max(kFallbackSmem, kMaxSmem - static_bytes);
-  if (c.smem < std::max(kLongSmem, kStreamSmem))
-    return cudaErrorInvalidConfiguration;
-  c.phase_bytes = unsigned(c.smem) - kSelBase3;
+  if (small) {
+    c.smem = std::max(kSmallSmem, kFallbackSmem);
+  } else {
+    // Global candidate slab: the staged selection may use everything past
+    // Q + weights, up to the opt-in limit.
+    int static_bytes = 0;
+    if (const cudaError_t e =
+            static_smem(reinterpret_cast<const void*>(c.kernel), static_bytes);
+        e != cudaSuccess)
+      return e;
+    c.smem = std::max(kFallbackSmem, kMaxSmem - static_bytes);
+    if (c.smem < kLongSmem) return cudaErrorInvalidConfiguration;
+  }
+  c.phase_bytes = unsigned(c.smem) - (small ? kSelBase : kSelBase3);
   return opt_in_smem(reinterpret_cast<const void*>(c.kernel), c.smem);
 }
 

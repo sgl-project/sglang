@@ -129,14 +129,13 @@ def _assert_contract(out, batch, scores, *, method, page_table, transformed=True
     assert_topk_matches_reference(out, batch, scores, out_offsets=offsets)
 
 
-# Scaled down to keep the fp32 oracle small, but not below the op's minimum keys;
-# they differ per transform so that a swapped or shared bound shows. Every chunk
-# stays below MQA_LOGITS_STATIC_SKIP_ELEMS logits: the stub indexer has no budget.
-_BOUNDS = {RAGGED: (28672, 192), PAGED: (22528, 96)}
+# Scaled-down bounds keep the fp32 oracle small; they differ per transform so
+# that a swapped or shared bound shows.
+_BOUNDS = {RAGGED: (16384, 256), PAGED: (8192, 128)}
 
 
 @unittest.skipUnless(
-    fused_mqa_topk.is_fused_mqa_topk_supported(), "requires CUDA SM100"
+    fused_mqa_topk.is_fused_mqa_topk_supported(), "requires CUDA SM100 or SM103"
 )
 @patch.object(dsa_indexer, "_FUSED_MQA_TOPK_MIN_KEYS_RAGGED", _BOUNDS[RAGGED][0])
 @patch.object(dsa_indexer, "_FUSED_MQA_TOPK_MIN_ROWS_RAGGED", _BOUNDS[RAGGED][1])
@@ -148,7 +147,7 @@ class TestFusedMqaTopkDispatch(CustomTestCase):
         # keys than top-k. The fused RAGGED transform rebases onto the flattened
         # KV, the fused PAGED one maps through the page table row of the row's
         # request; the unfused top-k leaves both row-relative for the backend.
-        seq_lens, extend_lens = [30000, 3000, 1100], [64, 48, 96]
+        seq_lens, extend_lens = [20000, 3000, 1100], [96, 64, 128]
         batch = _batch(seq_lens, extend_lens, seed=7)
         page_table = make_page_table(seq_lens, seed=7)
         scores = reference_scores(batch)
@@ -192,12 +191,12 @@ class TestFusedMqaTopkDispatch(CustomTestCase):
     def test_each_transform_keeps_chunks_below_its_bounds_dense(self):
         (ragged_keys, ragged_rows), (paged_keys, paged_rows) = _BOUNDS.values()
         # Above the PAGED bounds, below the RAGGED keys bound.
-        between = ([26000, 3000], [64, 64])
+        between = ([12000, 3000], [96, 96])
         for method, seq_lens, extend_lens, fused in (
-            (RAGGED, [ragged_keys - 1, 3000], [128, 96], False),
-            (RAGGED, [30000], [ragged_rows - 1], False),
-            (PAGED, [paged_keys - 1, 3000], [128, 96], False),
-            (PAGED, [30000], [paged_rows - 1], False),
+            (RAGGED, [ragged_keys - 1, 3000], [192, 128], False),
+            (RAGGED, [20000], [ragged_rows - 1], False),
+            (PAGED, [paged_keys - 1, 3000], [192, 128], False),
+            (PAGED, [20000], [paged_rows - 1], False),
             (RAGGED, *between, False),
             (PAGED, *between, True),
         ):

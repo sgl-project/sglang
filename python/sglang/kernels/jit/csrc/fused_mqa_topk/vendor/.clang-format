@@ -1,5 +1,5 @@
 # Vendored from vllm-project/vllm (PR #60618) and vllm-project/DeepGEMM; keep
-# the sources unformatted so they stay diff-comparable with upstream.
+# the sources byte-comparable with upstream so re-syncing stays a plain copy.
 # See ../README.md.
 DisableFormat: true
 SortIncludes: Never

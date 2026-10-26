@@ -2,8 +2,8 @@
 // Copyright (c) 2025 DeepSeek
 // Dense FP8 MQA scoring of one 8-row block over its whole KV range: DeepGEMM's
 // SM100 MQA logits pipeline (contiguous KV, 32 heads, D = 128) with the logits
-// store replaced by a per-score policy. Used by the persistent kernel's exact
-// recovery rescan.
+// store replaced by a per-score policy. Used by the <= 4K resident kernel and
+// by the persistent kernel's exact recovery rescan.
 //
 // Roles (384 threads): warps 0-7 reduce the 32 heads (4 rows per warpgroup),
 // warp 8 loads Q and the weights, warp 9 the KV tiles and their scales, warp 10
@@ -45,10 +45,10 @@ using SharedStorage = fused_mqa_dg::MQALogitsSharedStorage<
     kNumHeads, kHeadDim, false, BLOCK_Q, SPLIT_KV, 1, kNumKVStages,
     kNumTmemStages, cutlass::float_e4m3_t, float>;
 
-// Scheduler of the single block `q_block` (a deferred block of the persistent
-// kernel): its rows end with the block, so the grid stride never yields a
-// second block (over all `rows` it would also score q_block + 4096 once
-// rows > 32768).
+// Scheduler of the single block `q_block` (the resident CTA's block, or a
+// deferred block of the persistent kernel): its rows end with the block, so
+// the grid stride never yields a second block (over all `rows` it would also
+// score q_block + 4096 once rows > 32768).
 CUTLASS_DEVICE Scheduler block_scheduler(uint32_t q_block, uint32_t rows,
                                          uint32_t keys, const uint32_t* starts,
                                          const uint32_t* ends) {
