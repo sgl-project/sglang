@@ -8,7 +8,6 @@ use serde_json::Value;
 use super::legacy::{
     LegacyFormatter, builtin_template, infer_legacy_template_from_model_path, parse_legacy_template,
 };
-use super::template::concatenates_text_parts;
 use super::thinking::ThinkingTemplates;
 use super::{
     ChatFormatter, TemplateError, is_glm53, is_minimax_m3, is_qwen38, prints_arguments_as_xml,
@@ -143,9 +142,6 @@ impl ChatFormatter {
             || config["chat_template"].as_str().is_some_and(is_minimax_m3),
             |model_type| model_type == "minimax_m3_vl",
         );
-        let content_parts = config["chat_template"]
-            .as_str()
-            .is_some_and(takes_content_parts);
         let qwen38 = config["chat_template"].as_str().filter(|t| is_qwen38(t));
         let thinking = ThinkingTemplates::from_config(config);
         let mut render_config = config.clone();
@@ -188,10 +184,8 @@ impl ChatFormatter {
             }
         } else {
             Self::HuggingFace {
-                concatenates_text_parts: content_parts && concatenates_text_parts(&formatter),
                 formatter,
                 thinking,
-                content_parts,
             }
         })
     }
