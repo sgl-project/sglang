@@ -1380,9 +1380,12 @@ class TestPrefillAdder(CustomTestCase):
                 return delivered, req.last_node
 
             self.mock_tree_cache.init_load_back.side_effect = load_back
-            verdict = adder.add_one_req(
-                req, has_chunked_req=False, truncation_align_size=None
-            )
+            with patch.object(
+                adder, "_kv_shard_reserve_scratch", side_effect=AssertionError
+            ):
+                verdict = adder.add_one_req(
+                    req, has_chunked_req=False, truncation_align_size=None
+                )
             return verdict, list(adder.can_run_list), req
 
         # Promise kept: only the 8-token tail is prefilled, which fits.
