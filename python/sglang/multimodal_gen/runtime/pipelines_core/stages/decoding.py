@@ -106,6 +106,17 @@ def _to_unit_range(image: torch.Tensor) -> torch.Tensor:
     return (image / 2 + 0.5).clamp(0, 1)
 
 
+def rollout_output_without_decode(batch: Req) -> OutputBatch:
+    """The rollout trajectory alone, for a request with ``rollout_return_generated_output=False``."""
+    return OutputBatch(
+        trajectory_timesteps=batch.trajectory_timesteps,
+        trajectory_latents=batch.trajectory_latents,
+        rollout_trajectory_data=batch.rollout_trajectory_data,
+        metrics=batch.metrics,
+        usage=batch.usage,
+    )
+
+
 class DecodingStage(PipelineStage):
     """
     Stage for decoding latent representations into pixel space.
@@ -398,6 +409,8 @@ class DecodingStage(PipelineStage):
         trajectory latents for visualization purposes.
 
         """
+        if not batch.rollout_return_generated_output:
+            return rollout_output_without_decode(batch)
         # load vae if not already loaded (used for memory constrained devices)
         self.load_model()
 
