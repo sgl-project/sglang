@@ -1,6 +1,6 @@
-"""GLM DSA/MTP P/D transfer and CPU HiCache reload on 8 B300 GPUs.
+"""GLM DSA/MTP P/D transfer and CPU HiCache reload on 4 GB300 GPUs.
 
-P uses CP4 page sharding; D receives ordinary, complete caches. Independent
+P uses CP2 page sharding; D receives ordinary, complete caches. Independent
 prompts exceed P's logical GPU capacity while fitting in L2. The final repeat
 must report a host hit, advance the H2D counter and match the device-hit answer.
 """
@@ -19,10 +19,10 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
 
-register_cuda_ci(est_time=600, stage="extra-b", runner_config="8-gpu-b300")
+register_cuda_ci(est_time=600, stage="base-c", runner_config="4-gpu-gb300")
 
 PAGE_SIZE = 64
-PREFILL_POOL_TOKENS = 4096  # Per rank: CP4 has 16384 logical GPU slots.
+PREFILL_POOL_TOKENS = 4096  # Per rank: CP2 has 8192 logical GPU slots.
 PRESSURE_TOKENS = 6144
 FILLER = "The grass is green. The sky is blue. Here we go, there and back again. "
 COMMON_ARGS = [
@@ -56,11 +56,11 @@ COMMON_ARGS = [
 ]
 
 
-@unittest.skipUnless(torch.cuda.device_count() >= 8, "requires 8 CUDA GPUs")
+@unittest.skipUnless(torch.cuda.device_count() >= 4, "requires 4 CUDA GPUs")
 class TestGLM52PDShardedHiCache(PDDisaggregationServerBase):
     model = "nvidia/GLM-5.2-NVFP4"
-    prefill_tp_size = decode_tp_size = 4
-    decode_base_gpu_id = 4
+    prefill_tp_size = decode_tp_size = 2
+    decode_base_gpu_id = 2
     extra_prefill_env = {
         "SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND": "python",
         "SGLANG_DISAGG_STAGING_BUFFER": "0",
@@ -70,7 +70,7 @@ class TestGLM52PDShardedHiCache(PDDisaggregationServerBase):
         "--enable-kv-cache-sharding",
         "--enable-prefill-cp",
         "--attn-cp-size",
-        "4",
+        "2",
         "--cp-strategy",
         "interleave",
         "--chunked-prefill-size",
@@ -171,9 +171,9 @@ class TestGLM52PDShardedHiCache(PDDisaggregationServerBase):
         self.assertGreaterEqual(warm_cache["device"], cached_prefix)
         self.assertEqual(warm_cache["host"], 0)
 
-        # 4 * 6144 > CP4's 16384 device slots. Including the target, these
+        # 2 * 6144 > CP2's 8192 device slots. Including the target, these
         # unrelated prefixes still fit in its 4x larger CPU cache.
-        for i in range(4):
+        for i in range(2):
             prefix = self.tokenizer.encode(
                 f"Unrelated document {i}: ", add_special_tokens=False
             )
