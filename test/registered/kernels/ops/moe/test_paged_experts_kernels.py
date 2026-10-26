@@ -144,6 +144,28 @@ class TestPagedExpertsKernels(CustomTestCase):
         self.assertTrue(torch.equal(gpu[2].cpu(), host[5]))
         self.assertTrue(torch.equal(gpu[0].cpu(), host[63]))
 
+    def test_store_unregisters_its_pages_once_the_last_tensor_is_freed(self):
+        """The pinned pages stay registered while any tensor on them lives (here a slice that
+        outlives the store and its tensor), and are unregistered once the last one is freed."""
+        import gc
+        from types import SimpleNamespace
+
+        from sglang.srt.layers.moe.paged_experts.store import HostExpertStore
+
+        gpu = torch.zeros(K, 3, 1000, dtype=torch.bfloat16, device="cuda")
+        store = HostExpertStore(SimpleNamespace(w=gpu), ["w"], num_experts=E)
+        ptr = store.host["w"].data_ptr()
+        expert = store.host["w"][5]
+        gpu[0].copy_(expert, non_blocking=True)  # a read still queued when it is freed
+        del store
+        gc.collect()
+        self.assertTrue(expert.is_pinned())
+
+        del expert
+        gc.collect()
+        # Unregistering again must fail: the pages are no longer registered.
+        self.assertNotEqual(int(torch.cuda.cudart().cudaHostUnregister(ptr)), 0)
+
     def test_graph_replays_decide_on_new_routing(self):
         """A captured decide + gather plans and pages each replay's routing, not the routing
         seen at capture."""
