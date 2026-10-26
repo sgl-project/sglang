@@ -234,9 +234,9 @@ class TestQuickAllReduceBf16Range(CustomTestCase):
         "the JIT quick all-reduce is built and validated on four or more gfx950 GPUs",
     )
     def test_jit_matches_sgl_kernel(self):
-        """The JIT copy restructures the two-shot for latency; on bf16 cast to fp16 it must
-        reduce bit-identically to sgl-kernel's at the level it runs (INT8 below 64 MiB when
-        asked for INT4) and refuse any level but INT4 and INT8."""
+        """On bf16 cast to fp16 the JIT build must reduce bit-identically to sgl-kernel's at
+        the level it runs (INT8 below 64 MiB when asked for INT4) and refuse any level but
+        INT4 and INT8."""
         _spawn(self, _run_jit_bitwise_test, 4, "QuickReduce JIT bitwise test")
 
     @unittest.skipUnless(
@@ -244,9 +244,8 @@ class TestQuickAllReduceBf16Range(CustomTestCase):
         "the JIT quick all-reduce is built and validated on four or more gfx950 GPUs",
     )
     def test_jit_falls_back_to_sgl_kernel(self):
-        """SGLANG_ROCM_QUICK_ALL_REDUCE_JIT replaces every group's quick all-reduce; a group
-        the JIT build does not serve (TP2, INT6, no bf16 -> fp16 cast) must run sgl-kernel's
-        instead of raising at its first all-reduce."""
+        """The JIT module stands in for every group's quick all-reduce, so a group it does not
+        serve (TP2, INT6, no bf16 -> fp16 cast) must run sgl-kernel's instead of raising."""
         for world_size in (2, 4):
             _spawn(
                 self,

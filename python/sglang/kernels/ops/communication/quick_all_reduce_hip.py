@@ -1,8 +1,10 @@
-"""ROCm quick all-reduce at TP4 as a JIT module: sgl-kernel's qr_* calls on a two-shot kernel
-restructured for latency (kernels/jit/csrc/distributed/quick_all_reduce/). It keeps the buffer
-layout, flag protocol and arithmetic, so on bf16 cast to fp16 it matches sgl-kernel's outputs
-bitwise. Asked for INT4, it runs the all-reduces below 64 MiB in INT8. A group it does not serve
-(another world size or level, no bf16 -> fp16 cast) gets sgl-kernel's quick all-reduce instead."""
+"""JIT build of sgl-kernel's ROCm quick all-reduce `qr_*` calls, for INT4 and INT8 at TP4.
+
+The two-shot kernel (kernels/jit/csrc/distributed/quick_all_reduce/) is restructured for latency
+but keeps sgl-kernel's buffer sizes, flags and arithmetic, so on bf16 cast to fp16 its outputs
+match bitwise. Asked for INT4, it runs the all-reduces below 64 MiB in INT8. A group it does not
+serve (another world size or level, no bf16 -> fp16 cast) gets sgl-kernel's quick all-reduce.
+"""
 
 import os
 from typing import Optional
@@ -59,8 +61,8 @@ _SGL_KERNEL_HANDLES: set[int] = set()
 
 
 def jit_serves(world_size: int) -> bool:
-    """Whether the JIT build serves the quick all-reduce QuickAllReduce sets up for a group
-    of world_size from the environment (its level and the bf16 -> fp16 cast)."""
+    """Whether the JIT build serves a `world_size` group at the quantization level and
+    bf16 -> fp16 cast that `QuickAllReduce` reads from the environment."""
     return (
         world_size == 4
         and os.environ.get("ROCM_QUICK_REDUCE_QUANTIZATION", "NONE") in ("INT4", "INT8")
