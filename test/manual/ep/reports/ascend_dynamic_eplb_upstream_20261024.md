@@ -1,6 +1,6 @@
 # Ascend dynamic EPLB: validation scope
 
-Status as of 2026-10-26, for code and tests at
+Status as of 2026-10-26. Production code is unchanged from
 `4fa073523c5f1113375fac08242cbe99571f1cf8`.
 Community base: `de7055f59645ebe03784b0980e1f222789f468a3`.
 
@@ -25,11 +25,11 @@ EPLB manager and decode graph runner are unchanged from the base.
 | NPU graph execution and HCCL weight migration after cleanup | Not run. |
 | Full-model correctness, PD acceptance, and performance after cleanup | Not run. |
 
-Existing tests cover route counting, padding, overflow, capture/replay state,
-draft isolation, communication-group selection, and weight registration.
-The manual migration and online-loop scripts remain available. Their presence
-does not establish that this revision passes them. No tests were added or
-executed for this documentation cleanup.
+The added unit tests and manual probes have been moved out of this PR and
+remain available in the [historical test tree](https://github.com/AkiYangDev/sglang/tree/46393a1ce8359fc226704702b14a157dfa77c7ee/test).
+Only a one-line fixture adjustment remains in the existing NPU graph-backend
+test: its manually registered graph also receives an empty EPLB state.
+No new test cases are included, and no tests were executed for this cleanup.
 
 ## Historical evidence
 
