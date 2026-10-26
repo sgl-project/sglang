@@ -1033,11 +1033,6 @@ class HiCacheController:
         op = CacheOperation.merge_ops(self.load_queue)
         host_indices, device_indices, pool_transfers = self._move_op_indices(op)
         self.load_queue.clear()
-        # Resolving a sharded transfer can enqueue index gathers/copies on the
-        # producer stream. Include those operations in the load-stream fence.
-        transfers = self._l2_load_transfers(
-            host_indices, device_indices, pool_transfers
-        )
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()
 
@@ -1050,7 +1045,7 @@ class HiCacheController:
             )
 
         completion = self.l2_transfer_engine.submit_host_to_device(
-            transfers,
+            self._l2_load_transfers(host_indices, device_indices, pool_transfers),
             start_event=producer_event.start_event,
             on_layer_done=producer_event.complete,
             transfer_layer_id_max=self.transfer_layer_id_max,

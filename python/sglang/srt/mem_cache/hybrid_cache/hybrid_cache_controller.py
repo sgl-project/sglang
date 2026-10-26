@@ -845,10 +845,6 @@ class HybridCacheController(BaseHiCacheController):
     def _move_op_indices(
         self, op: CacheOperation
     ) -> tuple[torch.Tensor, torch.Tensor, Optional[list[PoolTransfer]]]:
-        if self.is_kv_sharded:
-            # Queued loads and direct retraction transfers both resolve at the
-            # L2 boundary. Keep the mirrored tree/queue indices logical until then.
-            return op.host_indices, op.device_indices, op.pool_transfers
         return self.move_hybrid_indices(op)
 
     def _move_write_operation(
@@ -856,7 +852,7 @@ class HybridCacheController(BaseHiCacheController):
     ) -> tuple[torch.Tensor, torch.Tensor, Optional[list[PoolTransfer]]]:
         host_group = self.mem_pool_host
         if self.is_kv_sharded:
-            return op.host_indices, op.device_indices, op.pool_transfers
+            return self.move_hybrid_indices(op, write_back_jit=True)
         if self.io_backend != "kernel" or host_group.layout != "page_first":
             return self.move_hybrid_indices(op)
         if not host_group.supports_per_pool_backup_indices:
@@ -871,16 +867,7 @@ class HybridCacheController(BaseHiCacheController):
         host_indices: torch.Tensor,
         device_indices: torch.Tensor,
         pool_transfers: Optional[list[PoolTransfer]] = None,
-        *,
-        write_back_jit: bool = True,
     ) -> list[L2Transfer]:
-        if self.is_kv_sharded:
-            return self._kv_shard_l2_transfers(
-                host_indices,
-                device_indices,
-                pool_transfers,
-                write_back_jit=write_back_jit,
-            )
         anchor = self.mem_pool_host.anchor_entry
         transfers = []
         if host_indices.numel() > 0:
@@ -911,61 +898,13 @@ class HybridCacheController(BaseHiCacheController):
             )
         return transfers
 
-    def _kv_shard_l2_transfers(
-        self,
-        host_indices: torch.Tensor,
-        device_indices: torch.Tensor,
-        pool_transfers: Optional[list[PoolTransfer]],
-        *,
-        write_back_jit: bool,
-    ) -> list[L2Transfer]:
-        """Resolve logical transfers to this rank's physical rows once per pair."""
-        anchor = self.mem_pool_host.anchor_entry
-        pools = [(anchor, host_indices, device_indices)] if host_indices.numel() else []
-        for transfer in pool_transfers or []:
-            if transfer.host_indices is None or transfer.device_indices is None:
-                raise ValueError(f"Unresolved L2 transfer for {transfer.name}.")
-            pools.append(
-                (
-                    self.mem_pool_host.entry_map[transfer.name],
-                    transfer.host_indices,
-                    transfer.device_indices,
-                )
-            )
-        local_indices = {}
-        transfers = []
-        for entry, host, device in pools:
-            # Target/draft indexers may reuse the anchor's logical index tensors.
-            key = (id(host), id(device))
-            if key not in local_indices:
-                local_indices[key] = anchor.host_pool.owned_rows(host, device)
-            host, device = local_indices[key]
-            if host.numel() == 0:
-                continue
-            host, device = self._move_pool_indices(
-                entry.host_pool, host, device, write_back_jit=write_back_jit
-            )
-            transfers.append(
-                L2Transfer(
-                    host_pool=entry.host_pool,
-                    device_pool=entry.device_pool,
-                    host_indices=host,
-                    device_indices=device,
-                    layer_mapper=entry.layer_mapper,
-                )
-            )
-        # Empty owners still submit an operation and publish completion/ACKs.
-        return transfers
-
     def _l2_load_transfers(
         self,
         host_indices: torch.Tensor,
         device_indices: torch.Tensor,
         pool_transfers: Optional[list[PoolTransfer]] = None,
     ) -> list[L2Transfer]:
-        transfers = self._l2_transfers(
-            host_indices, device_indices, pool_transfers, write_back_jit=False
-        )
+        transfers = self._l2_transfers(host_indices, device_indices, pool_transfers)
         transfers_by_entry = {
             (id(t.host_pool), id(t.device_pool)): t for t in transfers
         }
@@ -1585,6 +1524,8 @@ class HybridCacheController(BaseHiCacheController):
     def move_hybrid_indices(
         self, operation: CacheOperation, *, write_back_jit: bool = False
     ) -> tuple[torch.Tensor, torch.Tensor, Optional[list[PoolTransfer]]]:
+        if self.is_kv_sharded:
+            return self._move_kv_shard_indices(operation, write_back_jit=write_back_jit)
         host_indices, device_indices = self._move_pool_indices(
             self.mem_pool_host.anchor_entry.host_pool,
             operation.host_indices,
@@ -1611,6 +1552,48 @@ class HybridCacheController(BaseHiCacheController):
                         device_indices=transfer_device_indices,
                     )
                 )
+        return host_indices, device_indices, resolved_pool_transfers
+
+    def _move_kv_shard_indices(
+        self, operation: CacheOperation, *, write_back_jit: bool
+    ) -> tuple[torch.Tensor, torch.Tensor, Optional[list[PoolTransfer]]]:
+        """Prepare owner-local indices without changing tree/queue-owned state."""
+        anchor = self.mem_pool_host.anchor_entry.host_pool
+        local_indices = {}
+
+        def prepare(host_pool, host, device):
+            # KV-derived indexers use the anchor's ownership, even though their
+            # native host pools do not carry a placement of their own.
+            key = (id(host), id(device))
+            if key not in local_indices:
+                local_indices[key] = anchor.owned_rows(host, device)
+            host, device = local_indices[key]
+            if host.numel() == 0:
+                return host, device
+            return self._move_pool_indices(
+                host_pool, host, device, write_back_jit=write_back_jit
+            )
+
+        host_indices, device_indices = prepare(
+            anchor, operation.host_indices, operation.device_indices
+        )
+        resolved_pool_transfers = None
+        if operation.pool_transfers:
+            resolved_pool_transfers = []
+            for transfer in operation.pool_transfers:
+                if transfer.host_indices is None or transfer.device_indices is None:
+                    raise ValueError(f"Unresolved L2 transfer for {transfer.name}.")
+                host, device = prepare(
+                    self.mem_pool_host.entry_map[transfer.name].host_pool,
+                    transfer.host_indices,
+                    transfer.device_indices,
+                )
+                if host.numel() == 0:
+                    continue
+                resolved_pool_transfers.append(
+                    replace(transfer, host_indices=host, device_indices=device)
+                )
+        # An empty owner still submits an empty operation and publishes its ACK.
         return host_indices, device_indices, resolved_pool_transfers
 
     def _page_transfer(self, operation: PrefetchOperation) -> bool:

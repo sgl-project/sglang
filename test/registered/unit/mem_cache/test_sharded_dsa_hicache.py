@@ -49,8 +49,13 @@ class TestShardedDSAHiCache(unittest.TestCase):
             start_event=start, finish_event=object(), timing_enabled=False
         )
 
-        def resolve(*args):
-            events.append("resolve")
+        def prepare(op):
+            events.append("prepare")
+            return op.host_indices[:16], op.device_indices[:16], None
+
+        def describe(host, device, pool_transfers):
+            events.append("describe")
+            self.assertEqual((host.numel(), device.numel()), (16, 16))
             return transfers
 
         def submit(actual, **kwargs):
@@ -65,8 +70,8 @@ class TestShardedDSAHiCache(unittest.TestCase):
             layer_done_counter=SimpleNamespace(
                 update_producer=lambda: 0, events=[producer]
             ),
-            _move_op_indices=lambda op: (op.host_indices, op.device_indices, None),
-            _l2_load_transfers=resolve,
+            _move_op_indices=prepare,
+            _l2_load_transfers=describe,
             load_fence_stream=None,
             l2_transfer_engine=SimpleNamespace(submit_host_to_device=submit),
             transfer_layer_id_max=3,
@@ -75,7 +80,8 @@ class TestShardedDSAHiCache(unittest.TestCase):
             _transfer_num_bytes=lambda op: 0,
         )
         self.assertEqual(HiCacheController.start_loading(cc), 0)
-        self.assertEqual(events, ["resolve", "fence", "submit"])
+        self.assertEqual(events, ["prepare", "fence", "describe", "submit"])
+        self.assertEqual(cc.ack_load_queue[0].num_tokens, 64)
         self.assertIs(cc.ack_load_queue[0].finish_event, completion.finish_event)
 
 

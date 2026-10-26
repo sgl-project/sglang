@@ -79,6 +79,14 @@ def _send_state(mgr, peer, src_pages, dst_pages):
 
 
 class TestDSAShardedPDTransfer(unittest.TestCase):
+    def setUp(self):
+        override = patch(
+            "sglang.srt.disaggregation.mooncake.conn.get_parallel",
+            return_value=SimpleNamespace(enable_kv_cache_sharding=True),
+        )
+        override.start()
+        self.addCleanup(override.stop)
+
     def test_fragmented_pages_preserve_every_target_and_draft_byte(self):
         # A full indexer page includes its packed K region AND scale region.
         # Random bytes encode layer, logical page and byte offset independently.
@@ -134,6 +142,17 @@ class TestDSAShardedPDTransfer(unittest.TestCase):
                     _send_state(mgr, peer, src_pages, dst_pages)
                 self.assertEqual(mgr.blocks, [])
                 self.assertTrue(np.all(dst[0] == 0xA5))
+
+    def test_disabled_sharding_keeps_all_source_pages(self):
+        src = [np.full((8, _INDEX_PAGE_BYTES), 0x19, dtype=np.uint8)]
+        dst = [np.full_like(src[0], 0xA5)]
+        mgr, peer = _manager(0, 4, src, dst)
+        with patch(
+            "sglang.srt.disaggregation.mooncake.conn.get_parallel",
+            return_value=SimpleNamespace(enable_kv_cache_sharding=False),
+        ):
+            self.assertEqual(_send_state(mgr, peer, [1, 3], [4, 6]), 0)
+        np.testing.assert_array_equal(dst[0][[4, 6]], src[0][[1, 3]])
 
     def test_chunked_kv_delta_does_not_filter_away_full_prefix_indexer_state(self):
         # Decode cached two prefix pages. Latent transfer contains only the

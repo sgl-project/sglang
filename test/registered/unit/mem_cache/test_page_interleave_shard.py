@@ -83,6 +83,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import _evict_until_allocatable
+from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
@@ -1088,13 +1089,13 @@ class TestShardedAllocationEviction(CustomTestCase):
         self.assertEqual(allocator.class_free_page_counts(), [1, 2, 4, 4])
         return tree, allocator
 
-    def test_direct_allocation_eviction_retries_and_counts_all_victims(self):
+    def test_direct_allocation_eviction_reaches_target_and_counts_all_victims(self):
         tree, allocator = self._cache_with_imbalanced_classes()
         initial_available = allocator.available_size()
         self.assertEqual(initial_available, GS)
 
         # The shortfall is smaller than the initial free capacity: treating
-        # it as the absolute target would incorrectly skip the retry.
+        # it as the absolute target would incorrectly skip eviction.
         result = tree.evict_for_alloc(EvictParams(num_tokens=PS))
 
         self.assertGreaterEqual(allocator.available_size(), initial_available + PS)
@@ -2052,10 +2053,38 @@ class TestOwnedRows(CustomTestCase):
         controller = HybridCacheController.__new__(HybridCacheController)
         controller.is_kv_sharded = True
         entry = SimpleNamespace(host_pool=pool, device_pool=object(), layer_mapper=None)
-        controller.mem_pool_host = SimpleNamespace(anchor_entry=entry)
+        indexer = SimpleNamespace(
+            host_pool=SimpleNamespace(can_use_write_back_jit=False),
+            device_pool=object(),
+            layer_mapper=None,
+        )
+        controller.mem_pool_host = SimpleNamespace(
+            anchor_entry=entry, entry_map={PoolName.INDEXER: indexer}
+        )
         controller.move_indices = lambda h, d: (h, d)
-        (transfer,) = controller._l2_transfers(host, device, write_back_jit=False)
+        sidecar = PoolTransfer(
+            name=PoolName.INDEXER,
+            host_indices=host,
+            device_indices=device,
+            indices_from_pool=PoolName.KV,
+        )
+        operation = SimpleNamespace(
+            host_indices=host, device_indices=device, pool_transfers=[sidecar]
+        )
+        with unittest.mock.patch.object(
+            pool, "owned_rows", wraps=pool.owned_rows
+        ) as resolve:
+            prepared = controller._move_op_indices(operation)
+            resolve.assert_called_once()
+        transfer, indexer_transfer = controller._l2_transfers(*prepared)
         h_rows, d_rows = transfer.host_indices, transfer.device_indices
+        self.assertIs(operation.host_indices, host)
+        self.assertIs(operation.device_indices, device)
+        self.assertIs(sidecar.host_indices, host)
+        self.assertIs(sidecar.device_indices, device)
+        self.assertIsNot(prepared[2][0], sidecar)
+        self.assertTrue(torch.equal(indexer_transfer.host_indices, h_rows))
+        self.assertTrue(torch.equal(indexer_transfer.device_indices, d_rows))
         expected = pool.owned_rows(host_indices=host, device_indices=device)
         self.assertTrue(torch.equal(h_rows, expected[0]))
         self.assertTrue(torch.equal(d_rows, expected[1]))
