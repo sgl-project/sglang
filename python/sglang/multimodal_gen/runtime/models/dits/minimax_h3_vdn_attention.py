@@ -588,12 +588,18 @@ def _hybrid_attention_core_bcg(
     linear_out: torch.Tensor | None,
     **kwargs,
 ) -> None:
-    softmax_result, linear_result = _minimax_h3_hybrid_attention_core_impl(
-        *args, **kwargs
-    )
-    softmax_out.copy_(softmax_result)
-    if linear_out is not None:
-        linear_out.copy_(linear_result)
+    results = _minimax_h3_hybrid_attention_core_impl(*args, **kwargs)
+    for dst, src in zip((softmax_out, linear_out), results, strict=True):
+        if dst is None and src is None:
+            continue
+        # copy_ would broadcast a mispredicted shape or cast a dtype silently.
+        assert (
+            dst is not None
+            and src is not None
+            and dst.shape == src.shape
+            and dst.dtype == src.dtype
+        ), "VDN-H3 hybrid attention output mispredicted"
+        dst.copy_(src)
 
 
 def prepare_hybrid_attention_metadata(

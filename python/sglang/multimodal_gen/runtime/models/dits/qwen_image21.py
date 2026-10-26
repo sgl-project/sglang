@@ -249,11 +249,14 @@ def attend_past_prefix_pad(attn, q, k, v, prefix_pad, out):
     # kernel exactly the eager K/V, so padded replays stay bit-exact. Calls the
     # impl like USPAttention does without SP, since its forward is a break too
     rows = prefix_pad.get()
-    out.copy_(
-        attn.attn_impl.forward(
-            q, k[:, rows:], v[:, rows:], get_forward_context().attn_metadata
-        )
+    result = attn.attn_impl.forward(
+        q, k[:, rows:], v[:, rows:], get_forward_context().attn_metadata
     )
+    # copy_ would broadcast a mispredicted shape or cast a dtype silently.
+    assert out.shape == result.shape and out.dtype == result.dtype, (
+        "Qwen-Image 2.1 prefix-pad attention output mispredicted"
+    )
+    out.copy_(result)
 
 
 def cat_outputs(outputs, dim=0):

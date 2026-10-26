@@ -954,7 +954,12 @@ def _minimax_h3_attention_core_impl(
 
 @eager_on_graph
 def _minimax_h3_attention_core_bcg(*args, out: torch.Tensor, **kwargs) -> None:
-    out.copy_(_minimax_h3_attention_core_impl(*args, **kwargs))
+    result = _minimax_h3_attention_core_impl(*args, **kwargs)
+    # copy_ would broadcast a mispredicted shape or cast a dtype silently.
+    assert out.shape == result.shape and out.dtype == result.dtype, (
+        "MiniMax-H3 attention output mispredicted"
+    )
+    out.copy_(result)
 
 
 class MiniMaxH3Attention(nn.Module):
@@ -2632,8 +2637,6 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
     def _embed(
         self,
         *,
-        embeddings: torch.Tensor,
-        t_emb: torch.Tensor,
         x: torch.Tensor,
         audio_x: torch.Tensor,
         text_embeddings_selected: torch.Tensor,
@@ -2648,6 +2651,8 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
         device: torch.device,
         refined_prompt_embeds_length: int | torch.Tensor | None = None,
         local_embedding_layout: dict[str, torch.Tensor | int] | None = None,
+        embeddings: torch.Tensor,
+        t_emb: torch.Tensor,
     ) -> None:
         """Build embeddings for one contiguous block-stack row shard.
 
@@ -2773,7 +2778,12 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
                 audio_embed.to(_BF16_DTYPE),
             )
 
-        t_emb.copy_(self._time_embedding(unique_timesteps))
+        time_embedding = self._time_embedding(unique_timesteps)
+        # copy_ would broadcast a mispredicted shape or cast a dtype silently.
+        assert (
+            t_emb.shape == time_embedding.shape and t_emb.dtype == time_embedding.dtype
+        ), "MiniMax-H3 t_emb mispredicted"
+        t_emb.copy_(time_embedding)
 
     def forward(self, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
         """Packed inference forward.
@@ -2930,8 +2940,6 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
             dtype=_FP32_DTYPE,
         )
         self._embed(
-            embeddings=decoder_input,
-            t_emb=t_emb,
             x=x,
             audio_x=audio_x,
             text_embeddings_selected=text_selected,
@@ -2946,6 +2954,8 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
             device=device,
             refined_prompt_embeds_length=kwargs.get("refined_prompt_embeds_length"),
             local_embedding_layout=kwargs.get("local_embedding_layout"),
+            embeddings=decoder_input,
+            t_emb=t_emb,
         )
         self.release_mps_non_layer_weights(*_MPS_EMBED_WEIGHT_PREFIXES)
         # request-step AdaLN input shared by all blocks
