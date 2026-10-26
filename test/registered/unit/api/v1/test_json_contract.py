@@ -131,8 +131,7 @@ class TestGenerateRequest(CustomTestCase):
             {
                 "text": "hi",
                 "priority": 3,
-                "session_id": "s",
-                "custom_logit_processor": "x",
+                "conversation_id": "ignored",
             }
         )
         self.assertEqual(req.text, "hi")

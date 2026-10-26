@@ -6,7 +6,13 @@ PLUGIN_KEYS, which core/generator.py pops before building ServerArgs. Checks tha
 need the resolved model live in core/preflight.py.
 """
 
-PLUGIN_KEYS = ("model_type", "cache_mode", "cache_dit_params", "int8_kernel")
+PLUGIN_KEYS = (
+    "model_type",
+    "cache_mode",
+    "cache_dit_params",
+    "int8_kernel",
+    "worker_patches",
+)
 
 # Display names -> SGLang backend names; the rest are passed through unchanged.
 _ATTENTION_IDS = {
@@ -91,6 +97,16 @@ _FIELDS = {
     ),
     "resident_layers": _field("memory", "INT", 0, "Kept on GPU.", min=0),
     "prefetch_layers": _field("memory", "INT", 0, "Prefetched; 0 means 1.", min=0),
+    # Append fields to preserve positional widget values in existing workflows.
+    "alignment_mode": _field(
+        "basic",
+        ["default", "comfyui"],
+        "default",
+        "comfyui matches native ComfyUI arithmetic (currently H3 only): single GPU, "
+        "resident BF16, eager, no LoRA/quantization/cache. Auto attention uses "
+        "torch_sdpa; incompatible explicit settings are rejected. Changing mode "
+        "reloads the worker.",
+    ),
 }
 
 
@@ -131,6 +147,12 @@ class SGLDOptions:
             options["dit_layerwise_resident_layers"] = v["resident_layers"]
             options["dit_offload_prefetch_size"] = v["prefetch_layers"]
         backend = v["attention_backend"]
+        if v["alignment_mode"] == "comfyui":
+            options["worker_patches"] = ["h3_comfyui_v1"]
+            if backend == "auto":
+                backend = "torch_sdpa"
+        elif v["alignment_mode"] != "default":
+            raise ValueError(f"Unknown alignment_mode: {v['alignment_mode']}")
         if backend != "auto":
             options["attention_backend"] = _ATTENTION_IDS.get(backend, backend)
         if v["attention_backend_config"].strip():

@@ -61,16 +61,22 @@ impl Checkpoint {
         }
     }
 
-    /// The prompt ids SGLang encodes: the rendered prompt, then the
-    /// `continue_final_message` prefix without its BOS.
+    /// The prompt ids SGLang encodes: the formatter's own ids when it encodes
+    /// requests, else the rendered prompt, then the `continue_final_message`
+    /// prefix without its BOS.
     fn render(&self, request: &Value, settings: &OpenAiSettings) -> Option<Vec<u32>> {
-        let defaults = settings
+        let defaults: HashMap<String, Value> = settings
             .default_chat_template_kwargs
             .clone()
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        if let Some(ids) = self.formatter.encode_request(request.clone(), &defaults) {
+            return ids.ok();
+        }
         let (prompt, prefix) = self
             .formatter
-            .render_request(request.clone(), &defaults.into_iter().collect())
+            .render_request(request.clone(), &defaults)
             .ok()?;
         let ids = |text: &str| self.tokenizer.encode(text).unwrap().token_ids().to_vec();
         let bos = ids("").first().copied();
@@ -148,8 +154,13 @@ fn check_case(
         (Err(reason), _) => return Err(format!("unsupported: {reason:?}")),
         (Ok(lowered), _) => lowered,
     };
-    let generate = without_defaults(generate, fixture, &case["endpoint"]);
-    if generate != case["generate"] {
+    let generate = without_defaults(
+        serde_json::to_value(generate).unwrap(),
+        fixture,
+        &case["endpoint"],
+    );
+    let expected = without_defaults(case["generate"].clone(), fixture, &case["endpoint"]);
+    if generate != expected {
         return Err(format!("/generate body differs:\n{generate:#}"));
     }
     if case["lower_only"].as_bool() == Some(true) {
@@ -256,6 +267,19 @@ fn without_defaults(body: Value, fixture: &Value, endpoint: &Value) -> Value {
         unreachable!()
     };
     fields.retain(|name, value| fixture["generate_defaults"].get(name) != Some(value));
+    // Text-only chat lowering can omit these values: Python normalizes them
+    // to the same behavior. Keep nondefault values visible to the comparison.
+    if endpoint == "chat" {
+        for (name, default) in [
+            ("logprob_start_len", json!(-1)),
+            ("return_sampling_mask", json!(false)),
+            ("modalities", json!([])),
+        ] {
+            if fields.get(name) == Some(&default) {
+                fields.remove(name);
+            }
+        }
+    }
     let sampling_defaults = &fixture["sampling_defaults"][endpoint.as_str().unwrap()];
     if let Some(Value::Object(params)) = fields.get_mut("sampling_params") {
         params.retain(|name, value| sampling_defaults.get(name) != Some(value));
