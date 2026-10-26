@@ -67,6 +67,32 @@ def test_reuse_tables_pass_through_but_distinct_duplicates_raise():
         )
 
 
+def test_shared_kv_layers_keep_distinct_graph_entries():
+    from sglang.srt.layers.radix_attention import RadixAttention
+
+    owner = RadixAttention(4, 16, 1.0, 2, layer_id=0)
+    shared = RadixAttention(4, 16, 1.0, 2, layer_id=0, graph_layer_id=1)
+    attention, companions = index_attention_layers_by_global_id(
+        [owner, shared], [None, None]
+    )
+    assert attention == [owner, shared]
+    assert companions == [None, None]
+    assert shared.layer_id == owner.layer_id == 0
+
+    duplicate = RadixAttention(4, 16, 1.0, 2, layer_id=0)
+    with pytest.raises(ValueError, match="duplicate attention layer_id: 0"):
+        index_attention_layers_by_global_id([owner, duplicate], [None, None])
+
+
+def test_graph_id_tracks_cache_id_when_no_execution_id_is_set():
+    from sglang.srt.layers.radix_attention import RadixAttention
+
+    attention = RadixAttention(4, 16, 1.0, 2, layer_id=0)
+    attention.layer_id = 3
+    indexed, _ = index_attention_layers_by_global_id([attention], [None])
+    assert indexed == [None, None, None, attention]
+
+
 def test_draft_startup_preserves_runner_local_capture_sizes(monkeypatch, caplog):
     """Startup must not reject local draft buckets using global TP alignment."""
     from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
