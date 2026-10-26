@@ -16,9 +16,9 @@ from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
     UnifiedMambaSWATokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.allocator.unified_sub_pool import MultiEndedAllocator
+from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
 from sglang.srt.mem_cache.unified_memory_pool import (
     MambaSubPoolSpec,
-    MHASubPoolSpec,
     MLASubPoolSpec,
     UnifiedKVPool,
     UnifiedMHATokenToKVPool,
