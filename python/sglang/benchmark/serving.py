@@ -730,8 +730,8 @@ async def async_request_sglang_generate(
         output = RequestFuncOutput.init_new(request_func_input)
 
         generated_text = ""
-        output_len = request_func_input.output_len
-        ttft = 0.0
+        output_len = None
+        ttft = None
         st = time.perf_counter()
         output.start_time = st
         most_recent_timestamp = st
@@ -765,9 +765,6 @@ async def async_request_sglang_generate(
                                     "spec_accept_length"
                                 ]
 
-                            # NOTE: Some completion API might have a last
-                            # usage summary response without a token so we
-                            # want to check a token was generated
                             _record_server_prompt_len(data, output)
 
                             if getattr(args, "cache_report", False):
@@ -777,28 +774,43 @@ async def async_request_sglang_generate(
                                     "cached_tokens_details"
                                 )
 
-                            if "text" in data and data["text"]:
-                                timestamp = time.perf_counter()
+                            if data.get("text"):
                                 generated_text = data["text"]
-                                output_len = data["meta_info"]["completion_tokens"]
+
+                            # Special tokens can produce empty text. Read the
+                            # actual count even on text-free usage summaries.
+                            completion_tokens = _meta_info.get("completion_tokens")
+                            if completion_tokens is not None:
+                                output_len = completion_tokens
+
+                            # Only new tokens in a generation event advance the
+                            # timeline; duplicate and usage-only chunks do not.
+                            if (
+                                completion_tokens is not None
+                                and completion_tokens > last_output_len
+                                and ("text" in data or "output_ids" in data)
+                            ):
+                                timestamp = time.perf_counter()
 
                                 # First token
-                                if ttft == 0.0:
-                                    ttft = time.perf_counter() - st
+                                if ttft is None:
+                                    ttft = timestamp - st
                                     output.ttft = ttft
 
                                 # Decoding phase
                                 else:
-                                    num_new_tokens = output_len - last_output_len
-                                    if num_new_tokens == 0:
-                                        continue
+                                    num_new_tokens = completion_tokens - last_output_len
                                     chunk_gap = timestamp - most_recent_timestamp
                                     adjust_itl = chunk_gap / num_new_tokens
                                     output.itl.extend([adjust_itl] * num_new_tokens)
 
                                 most_recent_timestamp = timestamp
-                                last_output_len = output_len
+                                last_output_len = completion_tokens
 
+                    if output_len is None:
+                        raise ValueError(
+                            "Response did not include meta_info.completion_tokens"
+                        )
                     output.generated_text = generated_text
                     output.success = True
                     output.latency = latency
@@ -1149,6 +1161,7 @@ def calculate_metrics(
     ttfts: List[float] = []
     e2e_latencies: List[float] = []
     retokenized_itls: List[float] = []
+    unmeasured_ttfts = 0
 
     use_retokenized_itl = (
         accept_length is not None
@@ -1168,8 +1181,14 @@ def calculate_metrics(
                 total_input += input_requests[i].prompt_len
                 total_input_text += input_requests[i].text_prompt_len
                 total_input_vision += input_requests[i].vision_prompt_len
-            if output_len > 1:
-                tpots.append((outputs[i].latency - outputs[i].ttft) / (output_len - 1))
+            if outputs[i].ttft > 0:
+                ttfts.append(outputs[i].ttft)
+                if output_len > 1:
+                    tpots.append(
+                        (outputs[i].latency - outputs[i].ttft) / (output_len - 1)
+                    )
+            elif output_len > 0:
+                unmeasured_ttfts += 1
             if use_retokenized_itl:
                 for k, itl in enumerate(outputs[i].itl):
                     num_tokens = len(
@@ -1181,14 +1200,20 @@ def calculate_metrics(
                     retokenized_itls.extend([adjusted_itl] * num_tokens)
             else:
                 itls += outputs[i].itl
-            ttfts.append(outputs[i].ttft)
-
             e2e_latencies.append(outputs[i].latency)
 
             completed += 1
         else:
             output_lens.append(0)
             retokenized_output_lens.append(0)
+
+    if unmeasured_ttfts:
+        warnings.warn(
+            f"{unmeasured_ttfts} successful requests had no first-token measurement. "
+            "Excluding them from TTFT, TPOT, and the per-token timeline; "
+            "request counts and aggregate throughput still include them.",
+            stacklevel=2,
+        )
 
     if completed == 0:
         warnings.warn(
@@ -1215,11 +1240,12 @@ def calculate_metrics(
             if not output.success:
                 continue
 
-            token_times = [output.start_time + output.ttft]
-            current_time = token_times[0]
-            for itl_value in output.itl:
-                current_time += itl_value
-                token_times.append(current_time)
+            token_times = [output.start_time + output.ttft] if output.ttft > 0 else []
+            if token_times:
+                current_time = token_times[0]
+                for itl_value in output.itl:
+                    current_time += itl_value
+                    token_times.append(current_time)
 
             for token_time in token_times:
                 second_bucket = int(token_time - min_start_time)
