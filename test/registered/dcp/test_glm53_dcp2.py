@@ -7,7 +7,7 @@ from sglang.test.server_fixtures.dsa_mtp_fixture import (
     DsaMtpServerBase,
 )
 
-register_cuda_ci(est_time=600, stage="extra-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=365, stage="extra-b", runner_config="4-gpu-b200")
 
 
 class TestGLM53NVFP4DCP2MTP(DsaMtpServerBase, DsaMtpEvalConfigDefaults, GSM8KMixin):

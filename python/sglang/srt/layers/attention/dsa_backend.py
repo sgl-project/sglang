@@ -3831,9 +3831,14 @@ class DeepseekSparseAttnBackend(
         if self.kv_cache_dtype == torch.float8_e4m3fn:
             # For FP8 path, we quantize the query and rope parts and merge them into a single tensor
             # Note: rope application in deepseek_v2.py:forward_absorb_prepare is skipped for FP8 decode path of this trtllm_mla backend
-            assert q_rope is not None, "For FP8 path q_rope should not be None."
             assert k_rope is not None, "For FP8 path k_rope should not be None."
-            if cos_sin_cache is None:
+            if q_rope is None:
+                # CP overlap prepares fused RoPE/FP8 Q/K before the indexer.
+                # Q is already merged and KV already replicated.
+                assert cos_sin_cache is None
+                assert q.dtype == k.dtype == k_rope.dtype == torch.float8_e4m3fn
+                assert q.shape[-1] == self.kv_lora_rank + self.qk_rope_head_dim
+            elif cos_sin_cache is None:
                 q, k, k_rope = mla_quantize_for_fp8_no_rope(
                     q,
                     q_rope,
@@ -3965,6 +3970,10 @@ class DeepseekSparseAttnBackend(
         kv = kv_cache.view(-1, 1, self.physical_page_size, self.kv_cache_dim)
         block_tables = page_table_1.unsqueeze(1)
         seq_lens = metadata.cache_seqlens_int32 if seq_lens is None else seq_lens
+        if is_prefill:
+            # CP graph metadata includes the physical shard's padding; its
+            # eager attention bridge can narrow Q to the live local rows.
+            seq_lens = seq_lens[:batch_size]
 
         attention_kwargs = dict(
             kv_cache=kv,

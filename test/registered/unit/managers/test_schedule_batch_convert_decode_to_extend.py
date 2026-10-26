@@ -26,7 +26,7 @@ from sglang.srt.model_executor.encoder_swa_replay import (  # noqa: E402
     folded_replay_rows,
 )
 
-register_cpu_ci(est_time=8, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class _FakeReq:

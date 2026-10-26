@@ -248,28 +248,12 @@ class OneDRotaryEmbedding(torch.nn.Module):
         return freqs_cos, freqs_sin
 
     def forward(self, pos: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Calculates 1D rotary embeddings for the given positions.
+        """Calculates 1D rotary embeddings for the given positions.
 
-        This method converts the input tensor to a hashable representation
-        and calls a cached helper method to perform the computation.
+        Not cached by value: building the key reads the positions back to the
+        host, which waits for the device.
         """
-        pos_tuple = tuple(pos.tolist())
-        device_str = str(pos.device)
-        return self._forward_cached(pos_tuple, device_str)
-
-    @functools.lru_cache(maxsize=16)
-    def _forward_cached(
-        self, pos_tuple: tuple, device_str: str
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        The core implementation that computes 1D rotary embeddings.
-        This method is wrapped by an LRU cache.
-        """
-        device = torch.device(device_str)
-        pos = torch.as_tensor(pos_tuple, dtype=self.dtype, device=device)
-        freqs_cos, freqs_sin = self.build_freqs_outer(pos, device)
-        return freqs_cos, freqs_sin
+        return self.build_freqs_outer(pos.to(self.dtype), pos.device)
 
 
 class NDRotaryEmbedding(torch.nn.Module):
