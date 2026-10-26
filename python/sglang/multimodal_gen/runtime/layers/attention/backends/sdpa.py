@@ -22,6 +22,8 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
+# Ordered by preference, which only takes effect with ``set_priority=True``;
+# without it this is the set PyTorch already picks from, so the flag was inert.
 _PYTORCH_DEFAULT_CUDA_SDP_BACKENDS = [
     SDPBackend.CUDNN_ATTENTION,
     SDPBackend.FLASH_ATTENTION,
@@ -30,6 +32,17 @@ _PYTORCH_DEFAULT_CUDA_SDP_BACKENDS = [
 ]
 
 _MPS_VARLEN_QUERY_CHUNK_SIZE = 128
+
+
+def torch_default_sdpa_backends():
+    """Reference SDPA with a stable cuDNN-first preference and fallback set.
+
+    The CUDA platform disables cuDNN SDPA process-wide (diffusers#9704). Modules
+    opt back in locally. Priority must be explicit: restoring another SDPA
+    context can move disabled backends to the end of the ambient priority list,
+    otherwise changing reference outputs after the first DiT forward.
+    """
+    return sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS, set_priority=True)
 
 
 class SDPABackend(AttentionBackend):
@@ -152,7 +165,9 @@ class SDPAImpl(AttentionImpl):
         ):
             # Keep the existing Flash SDPA arithmetic while consuming all
             # packed windows in one call, including ragged and empty windows.
-            return torch_varlen_attn(
+            # Call the Flash op directly: from torch 2.14, varlen_attn silently
+            # routes sm90/sm100 to cuDNN, which changes outputs versus the Flash path.
+            output, *_ = torch.ops.aten._flash_attention_forward(
                 query,
                 key,
                 value,
@@ -160,14 +175,38 @@ class SDPAImpl(AttentionImpl):
                 cu_seqlens,
                 max_seqlen,
                 max_seqlen,
+                0.0,
+                self.causal,
+                return_debug_mask=False,
                 scale=self.softmax_scale,
-                window_size=(-1, 0) if self.causal else (-1, -1),
+                window_size_left=-1,
+                window_size_right=0 if self.causal else -1,
             )
+            return output
         bounds = (
             cu_seqlens_host
             if cu_seqlens_host is not None
             else tuple(int(item) for item in cu_seqlens.tolist())
         )
+        lengths = {stop - start for start, stop in zip(bounds[:-1], bounds[1:])}
+        covers_query = bounds[0] == 0 and bounds[-1] == query.shape[0]
+        if (
+            type(self) is not SDPAImpl
+            and query.device.type != "mps"
+            and covers_query
+            and len(lengths) == 1
+            and 0 not in lengths
+        ):
+            # Subclasses (cuDNN SDPA) never take the native varlen op above, so
+            # equal segments (e.g. packed CFG pairs) run as one batch instead.
+            segments = len(bounds) - 1
+            output = self.forward(
+                query.reshape(segments, -1, *query.shape[1:]),
+                key.reshape(segments, -1, *key.shape[1:]),
+                value.reshape(segments, -1, *value.shape[1:]),
+                None,
+            )
+            return output.reshape(query.shape)
         output = torch.empty_like(query)
         for start, stop in zip(bounds[:-1], bounds[1:]):
             if start == stop:
@@ -217,6 +256,20 @@ class CudnnSDPAImpl(SDPAImpl):
         return nullcontext()
 
 
+# B300/sm_103 self-attention at head_dim 128 from this many tokens runs faster on
+# FA4 (hardware exp2) than on cuDNN under a sustained, power-capped load: 1.5-2%
+# from 16K to 75.6K tokens; at 8K and below the two are even
+_SM103_FA4_MIN_SELF_ATTN_TOKENS = 16384
+
+
+def _prefers_fa4_on_sm103(query: torch.Tensor, key: torch.Tensor) -> bool:
+    return (
+        query.shape[-1] == 128
+        and query.shape[1] == key.shape[1]
+        and query.shape[1] >= _SM103_FA4_MIN_SELF_ATTN_TOKENS
+    )
+
+
 class DynamicCudnnSDPABackend(SDPABackend):
     @staticmethod
     def get_enum() -> AttentionBackendEnum:
@@ -245,9 +298,11 @@ class DynamicCudnnSDPAImpl(SDPAImpl):
 
         self.causal = causal
         self.head_size = head_size
-        self._is_sm100 = (
-            torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10
+        capability = (
+            torch.cuda.get_device_capability() if torch.cuda.is_available() else None
         )
+        self._is_sm100 = capability is not None and capability[0] == 10
+        self._is_sm103 = capability == (10, 3)
         # Set once cuDNN SDPA raised for this layer; permanently pins the
         # fail-safe FA path so we do not retry a failing kernel every step.
         self._cudnn_failed = False
@@ -283,14 +338,32 @@ class DynamicCudnnSDPAImpl(SDPAImpl):
             return False
         if query.shape[2] != key.shape[2]:
             return False
+        if self._is_sm103 and _prefers_fa4_on_sm103(query, key):
+            return False
         if self._is_sm100:
             # B200/sm_100: cuDNN SDPA measured 1.25-1.5x faster than FA4 CuTe
             # for dense non-causal diffusion attention, both self-attn
-            # (Sq == Skv, up to S=506K) and cross-attn (Skv = text len).
-            return True
+            # (Sq == Skv, up to S=506K) and cross-attn (Skv = text len). A side
+            # shorter than one 128-row tile while the other is not drops cuDNN to
+            # an sm80 kernel that FA4 beats 2-3x (B300, 126 x 1536 tokens:
+            # 24.9 vs 12.1 us)
+            short_side, long_side = sorted((query.shape[1], key.shape[1]))
+            return short_side >= 128 or long_side < 128
         if query.shape[1] != key.shape[1]:
             return False
         return query.shape[-1] == 64 and query.shape[1] == 1024 and query.shape[0] >= 4
+
+    def forward_into(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        out: torch.Tensor | None,
+        attn_metadata: AttentionMetadata,
+    ) -> bool:
+        if self._use_cudnn_sdpa(query, key, value):
+            return False
+        return self.fa_impl.forward_into(query, key, value, out, attn_metadata)
 
     def forward(
         self,

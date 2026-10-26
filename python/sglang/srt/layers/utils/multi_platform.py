@@ -8,8 +8,9 @@ platform dispatch (``forward_cuda`` / ``forward_hip`` / ``forward_npu`` /
 and the torch.compile enter/leave protocol.
 
 In-repo code must subclass ``BaseFusedOp`` directly. This alias exists only so
-out-of-tree platform plugins and external users keep importing from the old
-path while they migrate; it will be removed in a future release.
+out-of-tree platform plugins and external users keep importing from
+``sglang.srt.layers.utils.multi_platform`` while they migrate; it will be
+removed in a future release.
 """
 
 import warnings

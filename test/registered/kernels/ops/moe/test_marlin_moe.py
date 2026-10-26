@@ -1,6 +1,6 @@
 import itertools
 import unittest
-from typing import Optional
+from typing import Callable, Optional
 
 import torch
 from sgl_kernel.scalar_type import scalar_types
@@ -32,6 +32,7 @@ def torch_experts(
     expert_map: Optional[torch.Tensor] = None,
     quant_dtype: Optional[torch.dtype] = None,
     apply_router_weights_on_input: bool = False,
+    activation: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
 ) -> torch.Tensor:
     assert (
         global_num_experts == -1
@@ -63,7 +64,7 @@ def torch_experts(
         if mask.sum():
             if quant_dtype is None:
                 tmp1 = a[mask] @ w1[i].transpose(0, 1)
-                tmp2 = SiluAndMul()(tmp1)
+                tmp2 = (activation or SiluAndMul())(tmp1)
                 out[mask] = tmp2 @ w2[i].transpose(0, 1)
 
     if apply_router_weights_on_input:
@@ -84,11 +85,19 @@ def torch_moe(
     topk: int,
     global_num_experts: int = -1,
     expert_map: Optional[torch.Tensor] = None,
+    activation: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
 ) -> torch.Tensor:
     score = torch.softmax(score, dim=-1, dtype=torch.float32)
     topk_weight, topk_ids = torch.topk(score, topk)
     return torch_experts(
-        a, w1, w2, topk_weight, topk_ids, global_num_experts, expert_map
+        a,
+        w1,
+        w2,
+        topk_weight,
+        topk_ids,
+        global_num_experts,
+        expert_map,
+        activation=activation,
     )
 
 
@@ -321,6 +330,77 @@ class TestFusedMarlinMoe(CustomTestCase):
                     is_k_full=is_k_full,
                 )
 
+                torch.testing.assert_close(
+                    marlin_output, torch_output, atol=5e-2, rtol=0
+                )
+
+    def test_fused_marlin_moe_gpt_oss_activation(self):
+        """With gemm1_alpha and clamp_limit, the first GEMM's [gate | up] halves go
+        through gate * sigmoid(alpha * gate) * (up + 1), gate clamped above and up
+        clamped both ways, into the buffer the second GEMM reads."""
+        alpha, limit = 1.702, 7.0
+        e, topk, n, k, group_size = 4, 2, 128, 256, 128
+        quant_type = scalar_types.uint4b8
+
+        def gpt_oss(x: torch.Tensor) -> torch.Tensor:
+            gate = x[:, :n].float().clamp(max=limit)
+            up = x[:, n:].float().clamp(min=-limit, max=limit)
+            return (gate * torch.sigmoid(alpha * gate) * (up + 1)).to(x.dtype)
+
+        def quantize(w):
+            refs, qweights, scales = [], [], []
+            for i in range(w.shape[0]):
+                ref, qweight, scale, _, _, _ = marlin_quantize(
+                    w[i].transpose(1, 0),
+                    quant_type,
+                    group_size,
+                    False,
+                    torch.randperm(w.shape[2]),
+                )
+                refs.append(ref.T)
+                qweights.append(qweight)
+                scales.append(scale)
+            return (
+                stack_and_dev(refs),
+                stack_and_dev(qweights).contiguous(),
+                stack_and_dev(scales),
+            )
+
+        for m, dtype in itertools.product((1, 123), (torch.half, torch.bfloat16)):
+            with self.subTest(m=m, dtype=dtype):
+                torch.manual_seed(0)
+                a = torch.randn((m, k), device="cuda", dtype=dtype) / 10
+                w1 = torch.randn((e, 2 * n, k), device="cuda", dtype=dtype) / 20
+                w2 = torch.randn((e, k, n), device="cuda", dtype=dtype) / 20
+                w_ref1, qweight1, scales1 = quantize(w1)
+                w_ref2, qweight2, scales2 = quantize(w2)
+                score = torch.randn((m, e), device="cuda", dtype=dtype)
+                from sglang.srt.layers.moe.topk import fused_topk_torch_native
+
+                topk_weights, topk_ids = fused_topk_torch_native(a, score, topk, False)
+                torch_output = torch_moe(
+                    a,
+                    w_ref1,
+                    w_ref2,
+                    score,
+                    topk,
+                    global_num_experts=e,
+                    activation=gpt_oss,
+                )
+                marlin_output = fused_marlin_moe(
+                    a,
+                    qweight1,
+                    qweight2,
+                    scales1,
+                    scales2,
+                    score,
+                    topk_weights,
+                    topk_ids,
+                    global_num_experts=e,
+                    num_bits=4,
+                    clamp_limit=limit,
+                    gemm1_alpha=alpha,
+                )
                 torch.testing.assert_close(
                     marlin_output, torch_output, atol=5e-2, rtol=0
                 )

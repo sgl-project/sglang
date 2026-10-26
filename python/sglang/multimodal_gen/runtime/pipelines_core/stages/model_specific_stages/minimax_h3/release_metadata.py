@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 from typing import Any, Mapping
 
 from sglang.multimodal_gen import envs
+from sglang.multimodal_gen.configs.sample.minimax_h3 import MiniMaxH3SamplingParams
 from sglang.multimodal_gen.configs.sample.sampling_params import QUALITY_LEVELS
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
@@ -51,6 +53,11 @@ class MiniMaxH3ReleaseMetadata:
     task_aliases: Mapping[str, str]
     video_sigma_shift: float
     audio_sigma_shift: float
+    # trained DMD rungs of a distilled release, unshifted; None keeps the uniform grid
+    dmd_denoising_steps: tuple[int, ...] | None = None
+    # PDD release: fused per-step output heads, relative to the model dir,
+    # with pdd_config.json beside them
+    pdd_fused_heads: str | None = None
 
     @classmethod
     def from_model_index(
@@ -91,6 +98,32 @@ class MiniMaxH3ReleaseMetadata:
                 "model_index.json._minimax_h3.sigma_shift_scales requires numeric "
                 "video and audio values"
             ) from exc
+        dmd_steps = raw.get("dmd_denoising_steps")
+        if dmd_steps is not None:
+            if (
+                not isinstance(dmd_steps, list)
+                or not dmd_steps
+                or any(
+                    type(step) is not int or not 0 < step <= 1000 for step in dmd_steps
+                )
+                or any(left <= right for left, right in zip(dmd_steps, dmd_steps[1:]))
+            ):
+                raise ValueError(
+                    "model_index.json._minimax_h3.dmd_denoising_steps must be "
+                    "strictly decreasing integers in (0, 1000]"
+                )
+            dmd_steps = tuple(dmd_steps)
+        pdd_fused_heads = raw.get("pdd_fused_heads")
+        if pdd_fused_heads is not None and (
+            not isinstance(pdd_fused_heads, str)
+            or not pdd_fused_heads.endswith(".safetensors")
+            or os.path.isabs(pdd_fused_heads)
+            or ".." in pdd_fused_heads.split("/")
+        ):
+            raise ValueError(
+                "model_index.json._minimax_h3.pdd_fused_heads must be a relative "
+                ".safetensors path inside the model directory"
+            )
         metadata = cls(
             schema_version=1,
             partition=partition,
@@ -98,6 +131,8 @@ class MiniMaxH3ReleaseMetadata:
             task_aliases=dict(aliases),
             video_sigma_shift=video_sigma,
             audio_sigma_shift=audio_sigma,
+            dmd_denoising_steps=dmd_steps,
+            pdd_fused_heads=pdd_fused_heads,
         )
         for task in metadata.tasks:
             if canonical_minimax_h3_task(task) != task:
@@ -151,21 +186,19 @@ class MiniMaxH3PartitionAdmissionStage(PipelineStage):
         if not isinstance(task, str) or not task.strip():
             raise ValueError("MiniMax H3 request task must be a non-empty string")
         self.metadata.canonical_task(task)
-        if batch.num_inference_steps < 2:
-            raise ValueError(
-                "MiniMax H3 requires num_inference_steps >= 2 because its "
-                "video/audio sigma schedules include both interval endpoints"
-            )
+        min_steps = MiniMaxH3SamplingParams.min_num_inference_steps
+        if batch.num_inference_steps < min_steps:
+            raise ValueError(f"MiniMax H3 requires num_inference_steps >= {min_steps}")
         gpu_plans = envs.SGLANG_DIFFUSION_MINIMAX_H3_ADALN_GPU_PLANS
         if (
             server_args.minimax_h3_adaln_online
-            and batch.num_inference_steps - 1 > gpu_plans
+            and batch.num_inference_steps > gpu_plans
         ):
             # Fail here, before the encode stages spend GPU time on a request
             # whose AdaLN rebuild is guaranteed to overflow the slab.
             raise ValueError(
                 f"num_inference_steps={batch.num_inference_steps} needs up to "
-                f"{batch.num_inference_steps - 1} AdaLN plans but the online "
+                f"{batch.num_inference_steps} AdaLN plans but the online "
                 f"slab holds {gpu_plans}; raise "
                 "SGLANG_DIFFUSION_MINIMAX_H3_ADALN_GPU_PLANS"
             )

@@ -87,6 +87,19 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         # LMCache rebuilds lookup keys from tokens, so any L1 node is valid.
         return True
 
+    def prefix_device_indices(self, req: Req) -> torch.Tensor:
+        # match_prefix may append loaded slots not yet published to the tree,
+        # so the path alone can be shorter than the prefix.
+        path = self.path_device_indices(req.last_node)
+        indices = path[: req.prefix_len]
+        missing = req.prefix_len - len(indices)
+        if missing > 0:
+            load = self._external_flows[req.rid].load
+            skip = max(len(indices) - load.local_hit_tokens, 0)
+            indices = torch.cat([indices, load.device_indices[skip : skip + missing]])
+        assert len(indices) == req.prefix_len, (req.rid, len(indices), req.prefix_len)
+        return indices
+
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         """Report LMCache hits through host fields until GPU slots are ready."""
         requested_key_len = len(params.key)
@@ -115,7 +128,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             return result
 
         total_hit = min(flow.total_hit, requested_key_len, len(flow.key))
-        local_hit = len(result.device_indices)
+        local_hit = result.device_prefix_len
         skip = 0
         if flow.load is not None and not flow.prefix_published:
             # Track private slots shadowed by a concurrent tree insertion.
@@ -151,7 +164,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         # Reuse an already submitted H2D load on the next admission attempt.
         suffix = flow.load.device_indices[skip : skip + max(total_hit - local_hit, 0)]
         return result._replace(
-            device_indices=torch.cat([result.device_indices, suffix]),
+            device_prefix_len=local_hit + len(suffix),
             last_host_node=result.last_device_node,
             best_match_node=result.last_device_node,
             host_hit_length=0,
@@ -218,7 +231,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                 return False
             latest = super().match_prefix(MatchPrefixParams(key=flow.key))
             local_hit = torch.tensor(
-                [len(latest.device_indices)], dtype=torch.int64, device="cpu"
+                [latest.device_prefix_len], dtype=torch.int64, device="cpu"
             )
             self.lmcache_connector.parallel_all_reduce(
                 local_hit, torch.distributed.ReduceOp.MIN
@@ -248,24 +261,18 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
 
         return True
 
-    def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
-        self._publish_external_loaded_prefix(req, token_ids_len=len(req.get_fill_ids()))
-        super().cache_unfinished_req(req, chunked=chunked, **kwargs)
-        self._retire_loaded_flow(req.rid)
-        self._submit_store(req, req.get_fill_ids())
-
-    def on_release(self, req: Req, *, inserted: bool) -> None:
-        super().on_release(req, inserted=inserted)
-        if not inserted:
+    def on_release(self, req: Req, *, checkpointed: bool) -> None:
+        super().on_release(req, checkpointed=checkpointed)
+        if not checkpointed:
             self.release_aborted_request(req.cache_request_handle)
 
-    def insert_req(self, req: Req, *, up_to: int, **kwargs) -> None:
+    def checkpoint(self, req: Req, *, up_to: int, **kwargs) -> None:
         self._publish_external_loaded_prefix(req, token_ids_len=up_to)
-        super().insert_req(req, up_to=up_to, **kwargs)
+        super().checkpoint(req, up_to=up_to, **kwargs)
         self._retire_loaded_flow(req.rid)
-        token_ids = (req.origin_input_ids + req.output_ids)[:up_to]
-        self._submit_store(req, token_ids)
-        self._request_session_finish(req.rid)
+        self._submit_store(req, req.full_untruncated_fill_ids[:up_to])
+        if req.finished():
+            self._request_session_finish(req.rid)
 
     def check_hicache_events(self) -> None:
         """Poll LMCache retrieve/store futures at the scheduler safe point."""
@@ -346,22 +353,16 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             flow.retire_requested = True
         self._request_session_finish(rid)
 
-    def init_load_back(self, params: InitLoadBackParams) -> tuple[torch.Tensor, NodeId]:
+    def init_load_back(self, params: InitLoadBackParams) -> tuple[int, NodeId]:
         req = params.req
         if req is None:
-            return (
-                self.tree_core.empty_match_result.device_indices,
-                params.best_match_node,
-            )
+            return 0, params.best_match_node
         flow = self._external_flows.get(req.rid)
         if flow is None or flow.total_hit is None or flow.load is not None:
-            return (
-                self.tree_core.empty_match_result.device_indices,
-                params.best_match_node,
-            )
+            return 0, params.best_match_node
 
-        device_indices = self._start_external_load(flow, req)
-        if device_indices is None:
+        loaded_len = self._start_external_load(flow, req)
+        if loaded_len is None:
             req.storage_hit_length = 0
             req.host_hit_length = 0
             req.swa_host_hit_length = 0
@@ -372,11 +373,8 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             )
             # Retire the unloaded flow to release its lookup locks.
             self._retire_loaded_flow(req.rid)
-            return (
-                self.tree_core.empty_match_result.device_indices,
-                params.best_match_node,
-            )
-        return device_indices, params.best_match_node
+            return 0, params.best_match_node
+        return loaded_len, params.best_match_node
 
     def ready_to_load_host_cache(self) -> int:
         # H2D is submitted in init_load_back to preserve prefill fallback.
@@ -523,14 +521,14 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
 
     def _start_external_load(
         self, flow: LMCacheExternalFlow, req: Req
-    ) -> Optional[torch.Tensor]:
+    ) -> Optional[int]:
         assert flow.total_hit is not None
         assert flow.local_hit_tokens is not None
         local_hit = flow.local_hit_tokens
         latest = super().match_prefix(MatchPrefixParams(key=flow.key[:local_hit]))
         total_hit = min(flow.total_hit, len(flow.key))
         if total_hit <= local_hit:
-            return self.tree_core.empty_match_result.device_indices
+            return 0
 
         # Pin the common L1 boundary before allocation can trigger eviction.
         flow.anchor_node = latest.last_device_node
@@ -635,7 +633,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             )
             flow.load = None
             return None
-        return device_indices[flow.loaded_skip_tokens :]
+        return len(device_indices) - flow.loaded_skip_tokens
 
     def _release_flow_anchor(self, flow: LMCacheExternalFlow) -> None:
         assert (flow.anchor_node is None) == (flow.anchor_lock is None), (
@@ -811,7 +809,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                 mamba_value=checkpoint,
                 prev_prefix_len=prev_prefix_len,
                 component_evicted_seqlens=req.kv.component_evicted_seqlens.copy(),
-                chunked=True,
+                inserted_len=len(key),
                 priority=req.priority or 0,
             )
         )
@@ -825,32 +823,23 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         matched = super().match_prefix(
             MatchPrefixParams(key=key, req=req, cow_mamba=False)
         )
-        if len(matched.device_indices) < total_hit:
+        if matched.device_prefix_len < total_hit:
             raise RuntimeError(
                 "LMCache loaded prefix was inserted but is not reusable across "
-                f"all UnifiedRadixCache components: {len(matched.device_indices)}"
+                f"all UnifiedRadixCache components: {matched.device_prefix_len}"
                 f"/{total_hit} tokens for request {req.rid}"
             )
-        canonical = matched.device_indices[:total_hit]
+        canonical = self.path_device_indices(matched.last_device_node)[:total_hit]
         self.req_to_token_pool.write(
             (req.kv.req_pool_idx, slice(prev_prefix_len, total_hit)),
             canonical[prev_prefix_len:],
         )
 
         # Move the request lock to the published boundary.
-        if req.last_node is not None:
-            self._dec_req_lock(req)
-        lock_result = self.inc_lock_ref(matched.last_device_node)
-        if total_hit < token_ids_len:
-            req.prefix_indices = torch.cat(
-                [canonical, kv_indices[total_hit:].to(dtype=torch.int64, copy=True)]
-            )
-        else:
-            req.prefix_indices = canonical
+        self.unlock(req.lock)
+        req.lock = self.lock(matched.last_device_node)
         req.kv.cache_protected_len = total_hit
         req.last_node = matched.last_device_node
-        req.lock_receipt = lock_result.to_dec_params()
-        req.swa_prefix_lock_released = False
         flow.request_mamba_value = None
         flow.allocated_request_mamba_for_load = False
         flow.load_req = None
@@ -874,7 +863,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         matched = super().match_prefix(MatchPrefixParams(key=key))
         # Store the currently resident SWA prefix; later callbacks may extend it.
         resident_len = torch.tensor(
-            [min(len(matched.device_indices), len(key))],
+            [min(matched.device_prefix_len, len(key))],
             dtype=torch.int64,
             device="cpu",
         )
@@ -908,7 +897,9 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             key = key[:resident_len]
             # Re-match so the lock and Mamba state use the shortened boundary.
             matched = super().match_prefix(MatchPrefixParams(key=key))
-        store_indices = matched.device_indices[store_start : len(key)]
+        store_indices = self.path_device_indices(matched.last_device_node)[
+            store_start : len(key)
+        ]
         if len(store_indices) != len(key) - store_start:
             logger.debug(
                 "LMCache store skipped for %s: store indices length: %d, "

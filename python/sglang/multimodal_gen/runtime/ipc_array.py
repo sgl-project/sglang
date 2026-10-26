@@ -4,7 +4,11 @@
 from __future__ import annotations
 
 import os
+import re
+import shutil
 import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -17,6 +21,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 _MIN_FILE_REF_BYTES = 32 << 20
+_REQUEST_PREFIX = "sgldiffusion-request-"
 
 
 @dataclass
@@ -52,9 +57,39 @@ def is_local_endpoint(endpoint: str) -> bool:
     )
 
 
-def spill_large_arrays_to_file_refs(value: Any) -> Any:
+@contextmanager
+def array_ipc_request(endpoint: str) -> Iterator[bytes | None]:
+    """Own reply files until this RPC completes, fails, or is cancelled."""
+    root = _array_ipc_dir() if is_local_endpoint(endpoint) else None
+    if root is None:
+        yield None
+        return
+    try:
+        directory = tempfile.mkdtemp(prefix=_REQUEST_PREFIX, dir=root)
+    except OSError:
+        # no shared-memory space: keep the normal inline transport available
+        yield None
+        return
+    try:
+        # a local REQ socket advertises its scratch directory in its routing id
+        yield Path(directory).name.encode("ascii")
+    finally:
+        # retire the path before deleting: a late producer must not recreate
+        # files while cleanup walks the directory
+        retired = directory + ".closed"
+        os.rename(directory, retired)
+        shutil.rmtree(retired)
+
+
+def spill_large_arrays_to_file_refs(value: Any, identity: bytes | None) -> Any:
     directory = _array_ipc_dir()
-    if directory is None:
+    if directory is None or identity is None:
+        return value
+    # identities from other clients are opaque; never interpret them as paths
+    if not re.fullmatch(rb"sgldiffusion-request-[a-z0-9_]+", identity):
+        return value
+    directory = os.path.join(directory, identity.decode("ascii"))
+    if not os.path.isdir(directory):
         return value
     return _spill_large_arrays_to_file_refs(value, directory)
 
@@ -66,17 +101,21 @@ def _spill_large_arrays_to_file_refs(value: Any, directory: str) -> Any:
         # only spill if the array size is above the threshold. if not, it's not worth it
         try:
             return _spill_array(value, directory)
+        except FileNotFoundError:
+            return value
         except OSError:
             logger.warning_once(
-                f"Spilling an array to {directory} failed; sending it inline."
+                "Spilling an array to shared memory failed; sending it inline."
             )
             return value
     if _is_large_tensor(value):
         try:
             return _spill_tensor(value, directory)
+        except FileNotFoundError:
+            return value
         except OSError:
             logger.warning_once(
-                f"Spilling a tensor to {directory} failed; sending it inline."
+                "Spilling a tensor to shared memory failed; sending it inline."
             )
             return value
     if isinstance(value, list):

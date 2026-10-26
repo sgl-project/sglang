@@ -138,8 +138,6 @@ class QuarkInt4Fp8MoEMethod(FusedMoEMethodBase):
 
         self.online_quant_progress_bar = self.quant_config.online_quant_progress_bar
 
-        self.tp_rank = get_parallel().tp_rank
-
         if not _is_hip:
             raise NotImplementedError(
                 "The quark_int4fp8_moe online quantization scheme is only supported on AMD GPUs."
@@ -170,12 +168,12 @@ class QuarkInt4Fp8MoEMethod(FusedMoEMethodBase):
                 if shard_id in ["w1", "w3"]:
                     shard_dim = 0
                     loaded_weight = loaded_weight.narrow(
-                        shard_dim, shard_size * self.tp_rank, shard_size
+                        shard_dim, shard_size * layer.moe_tp_rank, shard_size
                     )
                 else:
                     shard_dim = 1
                     loaded_weight = loaded_weight.narrow(
-                        shard_dim, shard_size * self.tp_rank, shard_size
+                        shard_dim, shard_size * layer.moe_tp_rank, shard_size
                     )
 
             # We want to run online quantization on-device for speed purposes.

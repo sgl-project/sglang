@@ -9,6 +9,7 @@ from pydantic import BaseModel, ConfigDict
 
 from sglang.srt.managers.mm_utils import tensor_hash
 from sglang.srt.mem_cache.storage.mmap.mmap_allocator import alloc_mmap
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.weight_checker_comparator import (
     CHUNK_NUMEL,
@@ -205,7 +206,7 @@ class WeightChecker:
     def _compute_checksum(
         self, skip_tensor_list: Optional[List[str]] = None, *, role: str
     ) -> Dict:
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         start = time.perf_counter()
 
         quantized_set = _build_quantized_set(self._get_model())
@@ -222,7 +223,7 @@ class WeightChecker:
 
         overall = overall_checksum(checksums)
 
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         elapsed = time.perf_counter() - start
         logger.info(
             f"[WeightChecker] checksum computed for {len(checksums)} tensors in {elapsed:.3f}s"

@@ -16,7 +16,6 @@ import torch
 import torch.nn.functional as F
 from fastapi import HTTPException
 from PIL import Image
-from torchcodec.decoders import AudioDecoder
 from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import (
     Qwen2_5_VLVisionConfig,
 )
@@ -33,6 +32,7 @@ from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
 from sglang.srt.multimodal.processors.mimo_audio import (
+    AudioDecoder,
     AudioInput,
     MiMoAudioPipeline,
 )
@@ -214,8 +214,16 @@ class Content:
                 )
 
 
-_QWEN2VL_PIXEL_MEAN = torch.Tensor([123.675, 116.28, 103.53]).view(-1, 1, 1)
-_QWEN2VL_PIXEL_STD = torch.Tensor([58.395, 57.12, 57.375]).view(-1, 1, 1)
+# OPENAI_CLIP stats, matching Qwen2VLImageProcessor (preprocessor_config.json
+# image_mean/image_std with do_rescale 1/255). Kept in 0-255 space because
+# standardize_batch sees un-rescaled PIL tensors. ImageNet values were wrong
+# for MiMo-VL and scrambled colors.
+_QWEN2VL_PIXEL_MEAN = (
+    torch.Tensor([0.48145466, 0.4578275, 0.40821073]).view(-1, 1, 1) * 255.0
+)
+_QWEN2VL_PIXEL_STD = (
+    torch.Tensor([0.26862954, 0.26130258, 0.27577711]).view(-1, 1, 1) * 255.0
+)
 _mean_std_cache = {}
 
 
@@ -452,6 +460,11 @@ class MiMoProcessor:
 
     @staticmethod
     def has_audio_track(path_or_data) -> bool:
+        if AudioDecoder is None:
+            raise ValueError(
+                "torchcodec is required to detect audio tracks in video inputs; "
+                "install torchcodec and its FFmpeg dependencies."
+            )
         # Never hand a client-supplied URL to ffprobe: its internal HTTP client
         # would bypass the shared domain and redirect policy. Resolve it through
         # the guarded downloader first, then probe the resulting bytes in-process.

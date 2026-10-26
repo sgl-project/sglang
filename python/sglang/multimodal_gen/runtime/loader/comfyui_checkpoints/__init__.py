@@ -9,6 +9,7 @@ from sglang.multimodal_gen.runtime.loader.comfyui_checkpoints import (  # noqa: 
     flux,
     minimax_h3,
     qwen_image,
+    qwen_image21,
     zimage,
 )
 from sglang.multimodal_gen.runtime.loader.comfyui_checkpoints.spec import (

@@ -66,7 +66,7 @@ def _make_backend(runner):
     backend._memory_saver_adapter = None
     backend._cuda_graph_runner = runner
     backend._device_module = runner.device_module
-    backend._tp_group = runner.model_runner.tp_group
+    backend._tp_group = SimpleNamespace(barrier=mock.Mock(name="barrier"))
     return backend
 
 
@@ -75,10 +75,8 @@ def _make_runner(*, enable_profile, profiler, num_tokens_per_bs=1, mode_name="DE
         synchronize=mock.Mock(name="synchronize"),
         graph=mock.Mock(name="graph", side_effect=lambda **kw: _FakeGraphCtx()),
     )
-    tp_group = SimpleNamespace(barrier=mock.Mock(name="barrier"))
     runner = SimpleNamespace(
         device_module=device_module,
-        model_runner=SimpleNamespace(tp_group=tp_group),
         num_tokens_per_bs=num_tokens_per_bs,
         capture_forward_mode=SimpleNamespace(name=mode_name),
         enable_profile_cuda_graph=enable_profile,
@@ -136,6 +134,60 @@ class TestCaptureOneNoProfiling(CustomTestCase):
         self.assertEqual(small.shape, (2, 2))
         self.assertEqual(large.data_ptr(), small.data_ptr())
         self.assertEqual(backend._output_buffer.shape, (4, 2))
+
+    def test_prefill_tuple_outputs_share_one_output_storage(self):
+        # A model whose forward returns a tuple of row-major tensors shares one
+        # buffer per leaf, and a later output that does not match the buffer's
+        # structure keeps its own storage without disturbing the shared views.
+        runner = _make_runner(enable_profile=False, profiler=None, mode_name="EXTEND")
+        backend = _make_backend(runner)
+        backend._reuse_output_buffer = True
+
+        large_out = (torch.ones((4, 2)), torch.ones((4, 3)))
+        small_out = (torch.full((2, 2), 2.0), torch.full((2, 3), 3.0))
+        plain_out = torch.full((1, 2), 7.0)
+        outputs = iter([large_out] * 3 + [small_out] * 3 + [plain_out] * 3)
+        with mock.patch("torch.cuda.CUDAGraph", side_effect=["G4", "G2", "G1"]):
+            backend.capture_one(ShapeKey(size=4), lambda: next(outputs))
+            backend.capture_one(ShapeKey(size=2), lambda: next(outputs))
+            backend.capture_one(ShapeKey(size=1), lambda: next(outputs))
+
+        large = backend._outputs[ShapeKey(size=4)]
+        small = backend._outputs[ShapeKey(size=2)]
+        self.assertIsInstance(large, tuple)
+        self.assertIsInstance(small, tuple)
+        self.assertEqual([t.shape for t in large], [(4, 2), (4, 3)])
+        self.assertEqual([t.shape for t in small], [(2, 2), (2, 3)])
+        for large_leaf, small_leaf, buffer_leaf in zip(
+            large, small, backend._output_buffer
+        ):
+            self.assertEqual(large_leaf.data_ptr(), small_leaf.data_ptr())
+            self.assertEqual(large_leaf.data_ptr(), buffer_leaf.data_ptr())
+        self.assertTrue(torch.equal(small[0], small_out[0]))
+        self.assertTrue(torch.equal(small[1], small_out[1]))
+        # The plain tensor does not fit a tuple buffer: it is kept as-is and
+        # sharing is switched off for the rest of the capture.
+        self.assertIs(backend._outputs[ShapeKey(size=1)], plain_out)
+        self.assertFalse(backend._reuse_output_buffer)
+
+    def test_prefill_tuple_with_scalar_leaf_keeps_independent_storage(self):
+        # A zero-dim leaf has no leading row axis to share, so the whole tuple
+        # keeps independent storage instead of allocating a partial buffer.
+        runner = _make_runner(enable_profile=False, profiler=None, mode_name="EXTEND")
+        backend = _make_backend(runner)
+        backend._reuse_output_buffer = True
+
+        first_out = (torch.ones((4, 2)), torch.tensor(0.0))
+        second_out = (torch.ones((2, 2)), torch.tensor(1.0))
+        outputs = iter([first_out] * 3 + [second_out] * 3)
+        with mock.patch("torch.cuda.CUDAGraph", side_effect=["G4", "G2"]):
+            backend.capture_one(ShapeKey(size=4), lambda: next(outputs))
+            backend.capture_one(ShapeKey(size=2), lambda: next(outputs))
+
+        self.assertIsNone(backend._output_buffer)
+        self.assertFalse(backend._reuse_output_buffer)
+        self.assertIs(backend._outputs[ShapeKey(size=4)], first_out)
+        self.assertIs(backend._outputs[ShapeKey(size=2)], second_out)
 
     def test_enable_flag_set_but_no_profiler_attr_does_not_step(self):
         # The runner advertises the flag but never created a profiler; the

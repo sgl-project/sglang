@@ -215,9 +215,9 @@ jobs:
           NEW_BRANCH: ${{ steps.cherry_pick.outputs.new_branch }}
         run: |
           if [[ -n "$SOURCE_PR" ]]; then
-            CHERRY_PICK_TITLE="[Cherry-pick to ${TARGET_BRANCH}] ${PR_TITLE} (${SOURCE_PR})"
+            CHERRY_PICK_TITLE="[Chore] release: Cherry-pick ${PR_TITLE} to ${TARGET_BRANCH} (${SOURCE_PR})"
           else
-            CHERRY_PICK_TITLE="[Cherry-pick to ${TARGET_BRANCH}] ${PR_TITLE} (${SHORT_SHA})"
+            CHERRY_PICK_TITLE="[Chore] release: Cherry-pick ${PR_TITLE} to ${TARGET_BRANCH} (${SHORT_SHA})"
           fi
 
           BODY="Cherry-pick of commit \`${FULL_SHA}\` to \`${TARGET_BRANCH}\`."$'\n\n'

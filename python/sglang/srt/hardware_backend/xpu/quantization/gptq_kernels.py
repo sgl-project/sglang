@@ -15,7 +15,6 @@ from sglang.srt.hardware_backend.xpu.quantization.int4pack_utils import (
     xpu_int4pack_mm,
 )
 from sglang.srt.layers.quantization.utils import replace_parameter
-from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -62,7 +61,14 @@ class GPTQXPULinearKernel:
             sorted_g = g_idx[act_perm].to(torch.int64)
             blocks = sorted_g.view(-1, group_size)
             if not torch.equal(blocks, blocks[:, :1].expand_as(blocks)):
-                tp_size = get_parallel().tp_size
+                from sglang.srt.layers.linear import LinearBase
+
+                if isinstance(layer, LinearBase):
+                    tp_size = (
+                        layer.tp_group.world_size if layer.tp_group is not None else 1
+                    )
+                else:
+                    tp_size = layer.tp_size
                 tp_hint = (
                     f" Got tp_size={tp_size}; please use --tp-size 1."
                     if tp_size > 1

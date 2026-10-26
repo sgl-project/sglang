@@ -90,16 +90,36 @@ For the full Docker setup and other installation methods, please refer to the [o
 
 For SGLang CPU installation, please refer to the [CPU version installation guide](../../../docs/hardware-platforms/cpu_server#installation).
 
+On Ascend NPUs (Atlas 800I A3), follow [SGLang installation with NPU support](/docs/hardware-platforms/ascend-npus/getting-started/installation) and the [Ascend NPU quickstart](/docs/hardware-platforms/ascend-npus/getting-started/quick_start) to select a compatible container image and host driver. The A3 recipes below require the Ascend software stack; the CUDA image above does not provide it.
+
 ## 3. Model Deployment
 
 This section provides deployment configurations optimized for different hardware platforms and use cases.
 
 ### 3.1 Basic Configuration
 
-**Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform and capabilities.
+**Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform and capabilities, including Ascend NPU (Atlas 800I A3) scenarios.
 
 
 <Qwen36Deployment />
+
+### RTX Spark: 35B-A3B NVFP4
+
+Select **RTX Spark** in the generator above to use the single-node, single-GPU recipe for
+[nvidia/Qwen3.6-35B-A3B-NVFP4](https://huggingface.co/nvidia/Qwen3.6-35B-A3B-NVFP4)
+on [NVIDIA RTX Spark](https://www.nvidia.com/en-us/products/rtx-spark/), which
+pairs a Blackwell RTX GPU with a Grace CPU and offers up to 128GB of unified
+memory. The contributor tested this command on SGLang `main`. The recipe uses
+the FlashInfer CUTLASS MoE runner,
+`extra_buffer` Mamba radix caching, and a static memory fraction of `0.8`.
+Speculative decoding is not enabled.
+
+The contributor reported **75 output tokens/s for a single request** on SGLang
+`main`. The exact commit, OS/runtime, memory configuration, input/output lengths,
+and timing method were not provided. This is a reported generation speed, not
+an input-plus-output throughput measurement or a measured P50 TPOT. The Docker
+selector uses the nightly `dev` fallback; that image was not the reported test
+environment.
 
 ### 3.2 Configuration Tips
 
@@ -112,15 +132,16 @@ This section provides deployment configurations optimized for different hardware
 - **CUDA IPC Transport**: Add `SGLANG_USE_CUDA_IPC_TRANSPORT=1` as an environment variable to use CUDA IPC for transferring multimodal features, significantly improving TTFT (Time To First Token). Note: this consumes additional memory proportional to image size, so you may need to lower `--mem-fraction-static` or `--max-running-requests`.
 - **Multimodal Attention Backend**: Use `--mm-attention-backend fa3` on H100/H200 for better vision performance, or `--mm-attention-backend fa4` on B200/B300.
 - For processing large images or videos, you may need to lower `--mem-fraction-static` to leave room for image feature tensors.
-- Hardware requirements:
+- **Ascend NPU (Atlas 800I A3):** Each card has 2 dies, so `--tp-size` is twice the card count (1 card → `--tp-size 2`). Add `--attention-backend ascend --device npu` and `--mamba-ssm-dtype bfloat16`, run speculative decoding with the built-in MTP weights via `--speculative-algorithm NEXTN`. See [Deploying on Ascend NPUs](#ascend-npu-deployment) below.
+- Hardware requirements for the GPU recipes:
     - **35B-A3B BF16**: ~70GB for weights. TP=1 fits on all supported hardware.
     - **35B-A3B FP8**: ~35GB for weights. TP=1 fits on all supported hardware.
-    - **35B-A3B NVFP4**: ~23GB for weights. TP=1 fits on B200/B300.
+    - **35B-A3B NVFP4**: ~23GB for weights. TP=1 fits on B200/B300 and RTX Spark.
     - **27B BF16**: ~54GB for weights. TP=1 fits on all supported hardware.
     - **27B FP8**: ~27GB for weights. TP=1 fits on all supported hardware.
     - **27B NVFP4**: ~22GB for weights. TP=1 fits on B200/B300.
 
-All Qwen3.6 variants (MoE 35B-A3B and Dense 27B) fit on a single supported GPU. NVFP4 is available on B200/B300:
+All Qwen3.6 variants (MoE 35B-A3B and Dense 27B) fit on a single supported GPU. The table below covers B200/B300 NVFP4; the 35B-A3B RTX Spark recipe is provided above:
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <thead>
@@ -166,6 +187,156 @@ All Qwen3.6 variants (MoE 35B-A3B and Dense 27B) fit on a single supported GPU. 
 
 
 - **Xeon CPU service configuration:** Please refer to the `Notes` part in the serving engine launching section in [the SGLang CPU server document](../../../docs/hardware-platforms/cpu_server#launch-of-the-serving-engine) to better understand how to configure the arguments, especially for TP (tensor parallel) and NUMA binding settings.
+
+<a id="ascend-npu-deployment" title="Referenced by the configuration tips above. Verify before removing."></a>
+
+### 3.3 Deploying on Ascend NPUs (Atlas 800I A3)
+
+The Ascend model tutorials document support for [Qwen3.6-27B](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/qwen3_6_27b) and [Qwen3.6-35B-A3B](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/qwen3_6_35b_a3b) starting with SGLang v0.5.16. The generator provides a baseline for single-node deployment with prefill and decode on the same node (PD mixed mode). Use the complete scenario recipes below for workload-specific tuning.
+
+Launch a compatible container using the [Ascend NPU quickstart](/docs/hardware-platforms/ascend-npus/getting-started/quick_start), including its driver, firmware, and runtime mounts, then run the generated `sglang serve` command inside it. Select the device IDs for your cards: one A3 card exposes two dies. For example, a 1-card deployment using dies 0 and 1 needs `--device /dev/davinci0 --device /dev/davinci1`, together with the management devices and mounts in the quickstart.
+
+**Weights:** BF16 checkpoints are available from [Qwen](https://huggingface.co/Qwen) and mirrored on ModelScope. To download from ModelScope, install the `modelscope` Python package and set `SGLANG_USE_MODELSCOPE=1`. Alternatively, pre-download the weights and set `--model-path` to their local directory.
+
+The generator offers the following card counts. Weight sizes exclude KV cache, Mamba state, and runtime buffers; choose capacity and concurrency for your workload.
+
+<table>
+  <thead>
+    <tr>
+      <th>Model</th>
+      <th>Checkpoint</th>
+      <th>Weights</th>
+      <th>1 card (TP 2)</th>
+      <th>2 cards (TP 4)</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Qwen3.6-27B</td>
+      <td><a href="https://huggingface.co/Qwen/Qwen3.6-27B">Qwen/Qwen3.6-27B</a></td>
+      <td>~54 GB (BF16)</td>
+      <td>Available</td>
+      <td>Available</td>
+    </tr>
+    <tr>
+      <td>Qwen3.6-35B-A3B</td>
+      <td><a href="https://huggingface.co/Qwen/Qwen3.6-35B-A3B">Qwen/Qwen3.6-35B-A3B</a></td>
+      <td>~70 GB (BF16)</td>
+      <td>Available</td>
+      <td>Available</td>
+    </tr>
+  </tbody>
+</table>
+
+**Published scenario references (PD mixed, single node):**
+
+The TPOT values below are reproduced from the linked Ascend best-practice pages. They describe those pages' full configurations and workloads, not measurements of the generator's baseline command. Follow each scenario's host tuning, environment variables, launch flags, and benchmark command when reproducing it.
+
+<table>
+  <thead>
+    <tr>
+      <th>Model</th>
+      <th>Cards</th>
+      <th>Quantization</th>
+      <th>Dataset</th>
+      <th>Source TPOT</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Qwen3.6-27B</td>
+      <td>1</td>
+      <td>BF16</td>
+      <td><a href="/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_6_27b#qwen3-6-27b-1p-in1024x1024-30-out1024-50ms">1024x1024 (30)+1024</a></td>
+      <td>50ms</td>
+    </tr>
+    <tr>
+      <td>Qwen3.6-27B</td>
+      <td>1</td>
+      <td>BF16</td>
+      <td><a href="/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_6_27b#qwen3-6-27b-1p-in1080p-30-out256-50ms">1080p_30+256</a></td>
+      <td>50ms</td>
+    </tr>
+    <tr>
+      <td>Qwen3.6-27B</td>
+      <td>1</td>
+      <td>BF16</td>
+      <td><a href="/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_6_27b#qwen3-6-27b-1p-in64k-out1k-prefix90-50ms">64k+1k (90% prefix cache hit rate)</a></td>
+      <td>50ms</td>
+    </tr>
+    <tr>
+      <td>Qwen3.6-35B-A3B</td>
+      <td>1</td>
+      <td>BF16</td>
+      <td><a href="/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_6_35b_a3b#qwen3-6-35b-a3b-1p-in254k-out1k-16-1ms">254k+1k</a></td>
+      <td>16.1ms</td>
+    </tr>
+    <tr>
+      <td>Qwen3.6-35B-A3B</td>
+      <td>1</td>
+      <td>BF16</td>
+      <td><a href="/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_6_35b_a3b#qwen3-6-35b-a3b-1p-in3k5-out1k5-50ms">3.5k+1.5k</a></td>
+      <td>50ms</td>
+    </tr>
+    <tr>
+      <td>Qwen3.6-35B-A3B</td>
+      <td>1</td>
+      <td>BF16</td>
+      <td><a href="/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_6_35b_a3b#qwen3-6-35b-a3b-1p-in64k-out1k-50ms">64k+1k</a></td>
+      <td>50ms</td>
+    </tr>
+    <tr>
+      <td>Qwen3.6-35B-A3B</td>
+      <td>1</td>
+      <td>BF16</td>
+      <td><a href="/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_6_35b_a3b#qwen3-6-35b-a3b-1p-in64k-out1k-prefix90-50ms">64k+1k (90% prefix cache hit rate)</a></td>
+      <td>50ms</td>
+    </tr>
+    <tr>
+      <td>Qwen3.6-35B-A3B</td>
+      <td>1</td>
+      <td>BF16</td>
+      <td><a href="/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_6_35b_a3b#qwen3-6-35b-a3b-1p-in128k-out1k-50ms">128k+1k</a></td>
+      <td>50ms</td>
+    </tr>
+    <tr>
+      <td>Qwen3.6-35B-A3B</td>
+      <td>1</td>
+      <td>BF16</td>
+      <td><a href="/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_6_35b_a3b#qwen3-6-35b-a3b-1p-in128k-out1k-prefix90-50ms">128k+1k (90% prefix cache hit rate)</a></td>
+      <td>50ms</td>
+    </tr>
+    <tr>
+      <td>Qwen3.6-35B-A3B</td>
+      <td>1</td>
+      <td>BF16</td>
+      <td><a href="/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_6_35b_a3b#qwen3-6-35b-a3b-1p-in1024x1024-30-out1024-50ms">1024x1024 (30)+1024</a></td>
+      <td>50ms</td>
+    </tr>
+    <tr>
+      <td>Qwen3.6-35B-A3B</td>
+      <td>1</td>
+      <td>BF16</td>
+      <td><a href="/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_6_35b_a3b#qwen3-6-35b-a3b-1p-in1080p-30-out256-50ms">1080p_30+256</a></td>
+      <td>50ms</td>
+    </tr>
+    <tr>
+      <td>Qwen3.6-35B-A3B</td>
+      <td>2</td>
+      <td>BF16</td>
+      <td><a href="/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_6_35b_a3b#qwen3-6-35b-a3b-2p-in984k-out1k-40-91ms">984k+1k</a></td>
+      <td>40.91ms</td>
+    </tr>
+  </tbody>
+</table>
+
+See the [27B best practices](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_6_27b) and [35B-A3B best practices](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_6_35b_a3b) for the full scenario lists.
+
+<Note>
+- Multimodal serving on A3 additionally enables `--enable-multimodal --mm-attention-backend ascend_attn`; see the image-input best-practice scenarios for the full flag set.
+- The generator leaves the NPU Mamba cache strategy to the installed SGLang version. Ascend prefix-cache recipes use `--mamba-radix-cache-strategy extra_buffer`; copy the complete matching recipe when enabling prefix caching.
+- Use a version-matched Ascend stack and check output quality with the [accuracy evaluation guide](/docs/hardware-platforms/ascend-npus/evaluation/accuracy_evaluation) before [performance testing](/docs/hardware-platforms/ascend-npus/evaluation/performance_testing). Successful checkpoint loading alone does not establish generation accuracy.
+</Note>
 
 ## 4. Model Invocation
 

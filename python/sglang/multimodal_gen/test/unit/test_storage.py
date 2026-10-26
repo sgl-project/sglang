@@ -5,13 +5,18 @@ Tests verify file upload, cleanup, URL generation, and error handling.
 """
 
 import asyncio
-import importlib
 import os
+import sys
+import threading
+from contextlib import suppress
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 
 import pytest
 
 import sglang.multimodal_gen.runtime.entrypoints.openai.storage as storage_mod
+from sglang.multimodal_gen.runtime.entrypoints.openai import image_api, video_api
 from sglang.multimodal_gen.runtime.entrypoints.openai.storage import CloudStorage
 
 
@@ -188,45 +193,122 @@ def test_content_type_detection(tmp_path):
         assert called["content_type"] == expected_type
 
 
-# requires moto and boto3
-has_moto = (
-    importlib.util.find_spec("moto") is not None
-    and importlib.util.find_spec("boto3") is not None
-)
+def test_env_configured_storage_uploads_and_cleans_up(tmp_path, monkeypatch):
+    """CloudStorage() builds its boto3 client from the SGLANG_S3_* env vars."""
+    monkeypatch.setenv("SGLANG_CLOUD_STORAGE_TYPE", "S3")
+    monkeypatch.setenv("SGLANG_S3_BUCKET_NAME", "integration-test")
+    monkeypatch.setenv("SGLANG_S3_REGION_NAME", "us-east-1")
+    monkeypatch.setenv("SGLANG_S3_ACCESS_KEY_ID", "key-id")
+    monkeypatch.setenv("SGLANG_S3_SECRET_ACCESS_KEY", "secret")
+    monkeypatch.delenv("SGLANG_S3_ENDPOINT_URL", raising=False)
+    uploads = []
+    client_kwargs = {}
+
+    def fake_client(service, **kwargs):
+        client_kwargs.update(kwargs, service=service)
+        return SimpleNamespace(
+            upload_file=lambda *args, **kw: uploads.append((args, kw))
+        )
+
+    monkeypatch.setitem(sys.modules, "boto3", SimpleNamespace(client=fake_client))
+
+    storage = CloudStorage()
+    assert storage.is_enabled()
+    assert client_kwargs == {
+        "service": "s3",
+        "aws_access_key_id": "key-id",
+        "aws_secret_access_key": "secret",
+        "endpoint_url": None,
+        "region_name": "us-east-1",
+    }
+
+    file_path = _create_temp_file(tmp_path, "integration.png", b"test_data")
+    url = asyncio.run(storage.upload_and_cleanup(file_path))
+
+    assert url == (
+        "https://integration-test.s3.us-east-1.amazonaws.com/integration.png"
+    )
+    assert not os.path.exists(file_path)
+    assert uploads == [
+        (
+            (file_path, "integration-test", "integration.png"),
+            {"ExtraArgs": {"ContentType": "image/png"}},
+        )
+    ]
 
 
-@pytest.mark.skipif(not has_moto, reason="moto/boto3 not installed")
-def test_integration_with_moto(tmp_path):
-    """Integration test using moto to mock real S3 service."""
-    import boto3
-    from moto import mock_aws
+@pytest.mark.parametrize("kind", ["single", "images", "videos"])
+@pytest.mark.parametrize("upload_fails", [False, True])
+def test_cancelled_upload_finishes_reading_before_request_cleanup(
+    tmp_path, monkeypatch, kind, upload_fails
+):
+    """Cancellation must not delete files still read by one or more SDK threads."""
+    monkeypatch.delenv("SGLANG_CLOUD_STORAGE_TYPE", raising=False)
+    storage = CloudStorage()
+    storage.enabled = True
+    storage.bucket_name = "test"
+    storage.endpoint_url = "https://s3.example.com"
+    storage.region_name = None
+    monkeypatch.setattr(image_api, "cloud_storage", storage)
+    monkeypatch.setattr(video_api, "cloud_storage", storage)
+    count = 1 if kind == "single" else 2
+    release = [threading.Event() for _ in range(count)]
+    read = []
 
-    os.environ["SGLANG_CLOUD_STORAGE_TYPE"] = "s3"
-    os.environ["SGLANG_S3_BUCKET_NAME"] = "integration-test"
-    os.environ["SGLANG_S3_REGION_NAME"] = "us-east-1"
+    async def run_test():
+        loop = asyncio.get_running_loop()
+        started = [asyncio.Event() for _ in range(count)]
+        finished = [asyncio.Event() for _ in range(count)]
 
-    with mock_aws():
-        s3 = boto3.client("s3", region_name="us-east-1")
-        s3.create_bucket(Bucket="integration-test")
+        def upload(local_path, bucket, key, **kwargs):
+            index = int(Path(local_path).stem)
+            loop.call_soon_threadsafe(started[index].set)
+            assert release[index].wait(10)
+            try:
+                read.append(Path(local_path).read_bytes())
+                if upload_fails:
+                    raise OSError("storage unavailable")
+            finally:
+                loop.call_soon_threadsafe(finished[index].set)
 
-        storage = CloudStorage()
-        assert storage.is_enabled()
+        storage.client = SimpleNamespace(upload_file=upload)
 
-        file_path = _create_temp_file(tmp_path, "integration.png", b"test_data")
+        async def request():
+            with TemporaryDirectory(dir=tmp_path) as directory:
+                paths = [Path(directory) / f"{i}.mp4" for i in range(count)]
+                for path in paths:
+                    path.write_bytes(b"media")
+                paths = [str(path) for path in paths]
+                if kind == "single":
+                    await storage.upload_and_cleanup(paths[0])
+                elif kind == "images":
+                    await image_api._upload_and_cleanup_images(paths)
+                else:
+                    await video_api._upload_and_cleanup_videos(paths)
 
-        url = asyncio.run(storage.upload_and_cleanup(file_path))
+        task = asyncio.create_task(request())
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*(event.wait() for event in started)), timeout=10
+            )
+            for _ in range(2):
+                task.cancel()
+                for _ in range(5):
+                    await asyncio.sleep(0)
+                assert not task.done(), "cleanup raced with the active upload"
+            if count > 1:
+                release[0].set()
+                await asyncio.wait_for(finished[0].wait(), timeout=10)
+                for _ in range(10):
+                    await asyncio.sleep(0)
+                assert not task.done(), "cleanup did not wait for every output"
+        finally:
+            for event in release:
+                event.set()
+            with suppress(asyncio.CancelledError):
+                await task
+        assert task.cancelled()
+        assert read == [b"media"] * count
+        assert not list(tmp_path.iterdir())
 
-        assert url is not None
-        assert "integration-test" in url
-        assert "integration.png" in url
-        assert not os.path.exists(file_path)
-
-        obj = s3.get_object(Bucket="integration-test", Key="integration.png")
-        assert obj["Body"].read() == b"test_data"
-
-    for key in [
-        "SGLANG_CLOUD_STORAGE_TYPE",
-        "SGLANG_S3_BUCKET_NAME",
-        "SGLANG_S3_REGION_NAME",
-    ]:
-        os.environ.pop(key, None)
+    asyncio.run(run_test())

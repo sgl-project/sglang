@@ -65,34 +65,22 @@ def vdn_delta_factors(
     transition = torch.empty_like(A)
     injection = torch.empty_like(B)
     module = _jit_vdn_delta_factors_module()
-    module.vdn_delta_factors(
-        transition.view(-1, HEAD_DIM, HEAD_DIM),
-        injection.view(-1, HEAD_DIM, HEAD_DIM),
-        A.view(-1, HEAD_DIM, HEAD_DIM),
-        B.view(-1, HEAD_DIM, HEAD_DIM),
-        alpha.view(-1, HEAD_DIM),
-    )
+    module.vdn_delta_factors(transition, injection, A, B, alpha)
     return transition, injection
 
 
+@torch.compiler.assume_constant_result
+@cache_once
 def can_use_vdn_delta_factors(
-    A: torch.Tensor, B: torch.Tensor, alpha: torch.Tensor
+    device: torch.device, dtype: torch.dtype, head_dim: int
 ) -> bool:
+    """The register inverse is specialized to FP32, 128-wide heads on SM80+."""
     return (
-        A.is_cuda
-        and A.dtype is torch.float32
-        and B.dtype is torch.float32
-        and alpha.dtype is torch.float32
-        and A.device == B.device == alpha.device
-        and A.dim() >= 2
-        and A.shape[-1] == HEAD_DIM
-        and A.shape[-2] == HEAD_DIM
-        and B.shape == A.shape
-        and alpha.shape == A.shape[:-1]
-        and A.is_contiguous()
-        and B.is_contiguous()
-        and alpha.is_contiguous()
-        and torch.cuda.get_device_capability(A.device)[0] >= 8
+        device.type == "cuda"
+        and not torch.version.hip
+        and dtype is torch.float32
+        and head_dim == HEAD_DIM
+        and torch.cuda.get_device_capability(device)[0] >= 8
     )
 
 

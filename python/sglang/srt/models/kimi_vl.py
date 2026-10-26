@@ -59,8 +59,8 @@ from sglang.srt.layers.activation import QuickGELU
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
+    pad_mm_tokens,
 )
 from sglang.srt.managers.schedule_batch import (
     Modality,
@@ -120,14 +120,27 @@ def _language_model_config(config: KimiVLConfig):
     return text_config
 
 
+def _fused_moe_text_config(hf_config):
+    """Return the nested fusable MoE config, or None for other branches."""
+    return None if hf_config.encoder_only else _language_model_config(hf_config)
+
+
 class KimiVLForConditionalGeneration(nn.Module):
     @staticmethod
     def shared_experts_fusion_disable_reason(hf_config, quant_config):
-        if hf_config.encoder_only:
+        text_config = _fused_moe_text_config(hf_config)
+        if text_config is None:
             return None
         return DeepseekV2ForCausalLM.shared_experts_fusion_disable_reason(
-            _language_model_config(hf_config), quant_config
+            text_config, quant_config
         )
+
+    @staticmethod
+    def num_fusable_shared_experts(hf_config) -> int:
+        text_config = _fused_moe_text_config(hf_config)
+        if text_config is None:
+            return 0
+        return DeepseekV2ForCausalLM.num_fusable_shared_experts(text_config)
 
     def __init__(
         self,
@@ -194,8 +207,7 @@ class KimiVLForConditionalGeneration(nn.Module):
         return res
 
     def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
-        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
-        return pattern.pad_input_tokens(input_ids, mm_inputs)
+        return pad_mm_tokens(input_ids, mm_inputs)
 
     def forward(
         self,

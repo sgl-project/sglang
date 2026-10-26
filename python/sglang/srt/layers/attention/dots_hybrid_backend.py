@@ -158,6 +158,10 @@ class DotsSWAMLAAttnBackend(AttentionBackend):
         return self.backend.verify_mask
 
     def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
+        # An eager prefill may rebuild metadata from the live tables in its first
+        # layer when DP padding changes the batch.
+        if fm.is_extend_without_speculative():
+            return SharedReadEnds.UNKNOWN
         return self.backend.shared_read_ends(fm)
 
     def draft_extend_metadata_captured_in_graph(self) -> bool:

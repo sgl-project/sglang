@@ -47,7 +47,9 @@ def _shrink(arch) -> None:
     arch.guidance_embeds = True
 
 
-def _write_comfyui_flux_checkpoint(path: str, config: FluxConfig) -> dict:
+def _write_comfyui_flux_checkpoint(
+    path: str, config: FluxConfig, with_guidance: bool = True
+) -> dict:
     """Write a checkpoint using ComfyUI's parameter names and fused layouts."""
     arch = config.arch_config
     hidden = arch.num_attention_heads * arch.attention_head_dim
@@ -93,11 +95,10 @@ def _write_comfyui_flux_checkpoint(path: str, config: FluxConfig) -> dict:
         put(f"single_blocks.{b}.modulation.lin.weight", 3 * hidden, hidden)
         put(f"single_blocks.{b}.modulation.lin.bias", 3 * hidden)
 
-    for stem, in_dim in (
-        ("time_in", 256),
-        ("vector_in", arch.pooled_projection_dim),
-        ("guidance_in", 256),
-    ):
+    stems = [("time_in", 256), ("vector_in", arch.pooled_projection_dim)]
+    if with_guidance:
+        stems.append(("guidance_in", 256))
+    for stem, in_dim in stems:
         put(f"{stem}.in_layer.weight", hidden, in_dim)
         put(f"{stem}.in_layer.bias", hidden)
         put(f"{stem}.out_layer.weight", hidden, hidden)
@@ -203,3 +204,101 @@ def test_adaln_modulation_scale_and_shift_are_swapped(comfyui_flux_pipeline):
     half = source.shape[0] // 2
     # ComfyUI emits [shift, scale]; AdaLayerNormContinuous expects [scale, shift].
     assert torch.equal(actual, torch.cat([source[half:], source[:half]], dim=0))
+
+
+def test_comfyui_flux_guidance_embeds_follows_checkpoint_keys():
+    """FLUX.1-schnell checkpoints have no guidance_in.* tensors; the loader must
+    not force guidance_embeds=True for them, or the model ends up with a
+    guidance embedder that the checkpoint can never populate."""
+    spec = get_comfyui_checkpoint_spec("FluxPipeline")
+
+    for with_guidance in (True, False):
+        tmpdir = tempfile.mkdtemp(prefix="comfyui_flux_guidance_")
+        checkpoint = os.path.join(tmpdir, "flux_comfyui.safetensors")
+
+        seed_config = FluxConfig()
+        _shrink(seed_config.arch_config)
+        _write_comfyui_flux_checkpoint(checkpoint, seed_config, with_guidance)
+
+        server_args = ServerArgs.from_kwargs(
+            model_path=checkpoint,
+            pipeline_class_name="FluxPipeline",
+            comfyui_mode=True,
+            num_gpus=1,
+        )
+        _shrink(server_args.pipeline_config.dit_config.arch_config)
+
+        dit_config = spec.build_dit_config(server_args)
+        assert dit_config.arch_config.guidance_embeds is with_guidance
+
+
+def test_comfyui_flux_schnell_checkpoint_loads_without_guidance_embedder():
+    """Regression test for the ComfyUI-mode loader always assuming
+    guidance_embeds=True: a FLUX.1-schnell-shaped checkpoint (no guidance_in.*
+    tensors) must load on its own, not just dev-shaped ones."""
+    _ensure_single_process_parallel_runtime()
+
+    from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+    from sglang.multimodal_gen.runtime.loader.fsdp_load import maybe_load_fsdp_model
+    from sglang.multimodal_gen.runtime.loader.weight_utils import (
+        safetensors_weights_iterator,
+    )
+    from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
+
+    spec = get_comfyui_checkpoint_spec("FluxPipeline")
+
+    tmpdir = tempfile.mkdtemp(prefix="comfyui_flux_schnell_")
+    checkpoint = os.path.join(tmpdir, "flux_comfyui.safetensors")
+
+    seed_config = FluxConfig()
+    _shrink(seed_config.arch_config)
+    _write_comfyui_flux_checkpoint(checkpoint, seed_config, with_guidance=False)
+
+    server_args = ServerArgs.from_kwargs(
+        model_path=checkpoint,
+        pipeline_class_name="FluxPipeline",
+        comfyui_mode=True,
+        num_gpus=1,
+    )
+    _shrink(server_args.pipeline_config.dit_config.arch_config)
+    set_global_server_args(server_args)
+
+    dit_config = spec.build_dit_config(server_args)
+    mapping = dict(spec.param_names_mapping)
+    if spec.inherit_config_mapping:
+        mapping = {**(dit_config.arch_config.param_names_mapping or {}), **mapping}
+    dit_config.arch_config.param_names_mapping = mapping
+
+    model_cls, _ = ModelRegistry.resolve_model_cls(spec.dit_cls_name)
+    weights_iterator = spec.convert_weights(
+        safetensors_weights_iterator([checkpoint]), dit_config
+    )
+
+    original_mapping = model_cls.param_names_mapping
+    model_cls.param_names_mapping = mapping
+    try:
+        model = maybe_load_fsdp_model(
+            model_cls=model_cls,
+            init_params={"config": dit_config, "hf_config": {}},
+            weight_dir_list=[checkpoint],
+            device=get_local_torch_device(),
+            hsdp_replicate_dim=1,
+            hsdp_shard_dim=1,
+            component_starts_on_cpu=True,
+            pin_cpu_memory=False,
+            fsdp_inference=False,
+            param_dtype=torch.bfloat16,
+            reduce_dtype=torch.float32,
+            output_dtype=None,
+            strict=spec.strict,
+            weights_iterator=weights_iterator,
+        )
+    finally:
+        model_cls.param_names_mapping = original_mapping
+
+    unloaded = [name for name, p in model.named_parameters() if p.is_meta]
+    assert not unloaded, f"parameters never received checkpoint weights: {unloaded[:5]}"
+    assert not any(
+        name.startswith("time_text_embed.guidance_embedder")
+        for name, _ in model.named_parameters()
+    )

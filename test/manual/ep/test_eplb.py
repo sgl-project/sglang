@@ -60,9 +60,8 @@ class _BaseTestDynamicEPLB(CustomTestCase):
                     "--trust-remote-code",
                     "--tp",
                     "2",
-                    "--dp",
+                    "--attn-dp-size",
                     "2",
-                    "--enable-dp-attention",
                     *get_a2a_backend_args(),
                     "--disable-cuda-graph",
                     "--enable-eplb",
@@ -117,11 +116,10 @@ class TestStaticEPLB(CustomTestCase):
                 model_path=DEFAULT_MLA_MODEL_NAME_FOR_TEST,
                 trust_remote_code=True,
                 ep_num_redundant_experts=4,
-                enable_dp_attention=True,
                 disable_cuda_graph=True,
                 expert_distribution_recorder_mode="stat",
                 tp_size=2,
-                dp_size=2,
+                attn_dp_size=2,
                 log_level="info",
             )
             engine_kwargs.update(get_a2a_backend_kwargs())

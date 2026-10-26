@@ -1,10 +1,12 @@
 import torch
-from diffusers.utils.torch_utils import randn_tensor
 
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import is_ltx23_native_variant
 from sglang.multimodal_gen.runtime.distributed import (
     get_decode_parallel_world_size,
     model_parallel_is_initialized,
+)
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_cfg_sequence_parallel_group,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
@@ -23,6 +25,10 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+
+# stage-2 video tokens per rank from which Ulysses over the CFG ranks runs stage 2
+# faster than the main rank alone (LTX-2, 2xH200 eager: +10% at 1920, -7% at 2304)
+CFG_SP_MIN_TOKENS_PER_RANK = 2304
 
 
 class LTX2AVDenoisingStage(LTX2DenoisingStage):
@@ -108,12 +114,6 @@ class LTX2AVDenoisingStage(LTX2DenoisingStage):
 
 
 class LTX2RefinementStage(LTX2AVDenoisingStage):
-    def default_workload_iterations(
-        self, batch: Req, num_inference_steps: int
-    ) -> int | None:
-        # the refiner runs its distilled sigma schedule regardless of the request's steps
-        return max(1, len(self.distilled_sigmas) - 1)
-
     """Stage-2 refinement wrapper that re-noises distilled LTX latents once."""
 
     def __init__(
@@ -155,8 +155,9 @@ class LTX2RefinementStage(LTX2AVDenoisingStage):
 
     @property
     def parallelism_type(self) -> StageParallelismType:
-        # Stage 2 is distilled and always runs with CFG disabled, so non-main
-        # CFG ranks only need the result when the decoder will use all ranks.
+        # stage 2 is distilled and runs without CFG, so under CFG parallel the
+        # main rank runs it and sends the result only when the decoder uses
+        # every rank
         if self.server_args.enable_cfg_parallel:
             if (
                 model_parallel_is_initialized()
@@ -168,29 +169,17 @@ class LTX2RefinementStage(LTX2AVDenoisingStage):
             return StageParallelismType.MAIN_RANK_ONLY
         return StageParallelismType.REPLICATED
 
-    @staticmethod
-    def _randn_like_with_batch_generators(
-        reference_tensor: torch.Tensor, batch: Req
-    ) -> torch.Tensor:
-        generator = getattr(batch, "generator", None)
-        if isinstance(generator, list):
-            bsz = int(reference_tensor.shape[0])
-            valid_generators = [g for g in generator if isinstance(g, torch.Generator)]
-            if len(valid_generators) == 1:
-                generator = valid_generators[0]
-            elif len(valid_generators) >= bsz:
-                generator = valid_generators[:bsz]
-            else:
-                generator = None
-        elif not isinstance(generator, torch.Generator):
-            generator = None
-
-        return randn_tensor(
-            reference_tensor.shape,
-            generator=generator,
-            device=reference_tensor.device,
-            dtype=reference_tensor.dtype,
-        )
+    def parallelism_type_for(self, batch: Req | list[Req]) -> StageParallelismType:
+        # stage 1 leaves the same latents on every CFG rank, so pure-CFG ranks
+        # can shard stage 2 as one Ulysses group once it is long enough
+        cfg_sp_group = get_cfg_sequence_parallel_group()
+        if self.server_args.enable_cfg_parallel and cfg_sp_group is not None:
+            reqs = batch if isinstance(batch, list) else [batch]
+            # packed stage-2 video latents [B, S, C], the same shape on every rank
+            tokens = min(req.latents.shape[1] for req in reqs)
+            if tokens // cfg_sp_group.world_size >= CFG_SP_MIN_TOKENS_PER_RANK:
+                return StageParallelismType.SEQUENCE_PARALLEL_OVER_CFG_RANKS
+        return self.parallelism_type
 
     @staticmethod
     def _reset_stage2_generators(batch: Req) -> None:

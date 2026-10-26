@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+from functools import lru_cache
 
 import torch
 from diffusers.image_processor import VaeImageProcessor
@@ -15,6 +16,14 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
+
+
+@lru_cache(maxsize=4)
+def _decode_scale_and_shift(latents_mean, latents_std, channels, device, dtype):
+    # uploaded once per (device, dtype): a per-request upload blocks the host
+    mean = torch.tensor(latents_mean).reshape(1, channels, 1, 1).to(device, dtype)
+    std = torch.tensor(latents_std).reshape(1, channels, 1, 1).to(device, dtype)
+    return 1.0 / std, mean
 
 
 @dataclass
@@ -99,17 +108,13 @@ class GlmImagePipelineConfig(SpatialImagePipelineConfig):
         return kwargs
 
     def get_decode_scale_and_shift(self, device, dtype, vae):
-        latents_mean = (
-            torch.tensor(self.vae_config.latents_mean)
-            .reshape(1, self.vae_config.latent_channels, 1, 1)
-            .to(device, dtype)
+        return _decode_scale_and_shift(
+            tuple(self.vae_config.latents_mean),
+            tuple(self.vae_config.latents_std),
+            self.vae_config.latent_channels,
+            device,
+            dtype,
         )
-        latents_std = (
-            torch.tensor(self.vae_config.latents_std)
-            .reshape(1, self.vae_config.latent_channels, 1, 1)
-            .to(device, dtype)
-        )
-        return 1.0 / latents_std, latents_mean
 
     def post_denoising_loop(self, latents, batch):
         if getattr(batch, "kv_caches", None) is not None:

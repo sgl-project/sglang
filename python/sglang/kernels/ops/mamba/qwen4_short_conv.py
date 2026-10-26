@@ -4,7 +4,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.ops.elementwise.qwen4_gate import _round_bf16_to_fp32
+from sglang.kernels.numerics import round_bf16_to_fp32
 
 _QWEN4_MAX_SHORT_CONV_STATE_LEN = 16
 
@@ -216,7 +216,7 @@ def _qwen4_verify_conv_finish_kernel(
     conv = tl.load(
         conv_ptr + (req * CHANNELS + channel) * WIDTH + step, mask, other=0
     ).to(tl.float32)
-    activated = _round_bf16_to_fp32(conv * tl.sigmoid(conv))
+    activated = round_bf16_to_fp32(conv * tl.sigmoid(conv))
     residual = tl.load(residual_ptr + offsets, mask, other=0).to(tl.float32)
     valid = tl.load(valid_ptr + token, mask, other=0)
     tl.store(output_ptr + offsets, tl.where(valid, activated + residual, 0), mask)

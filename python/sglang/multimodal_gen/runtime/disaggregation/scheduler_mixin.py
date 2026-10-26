@@ -17,6 +17,7 @@ import pickle
 import queue
 import threading
 import time
+from enum import Enum
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -164,9 +165,6 @@ _SAMPLING_PARAMS_EXCLUDE_FIELDS = frozenset(
     }
 )
 
-# Receivers reconstruct base SamplingParams, so only base defaults can be omitted.
-_BASE_SAMPLING_PARAM_FIELDS = {f.name: f for f in dataclasses.fields(SamplingParams)}
-
 
 def _is_tensor_like(value) -> bool:
     if isinstance(value, torch.Tensor):
@@ -177,20 +175,16 @@ def _is_tensor_like(value) -> bool:
 
 
 def _to_json_serializable(value):
+    if isinstance(value, Enum):
+        return value.name
     if isinstance(value, (torch.Tensor, np.ndarray)):
         return value.tolist()
     if isinstance(value, np.generic):
         return value.item()
+    if isinstance(value, dict):
+        return {key: _to_json_serializable(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
-        converted = []
-        for item in value:
-            if isinstance(item, (torch.Tensor, np.ndarray)):
-                converted.append(item.tolist())
-            elif isinstance(item, np.generic):
-                converted.append(item.item())
-            else:
-                converted.append(item)
-        return converted
+        return [_to_json_serializable(item) for item in value]
     return value
 
 
@@ -300,12 +294,8 @@ def extract_transfer_fields(req) -> tuple[dict, dict]:
 
     sp = getattr(req, "sampling_params", None)
     if sp is not None:
-        # Forward every non-default, JSON-safe SamplingParams field, not a
-        # narrow whitelist. Previously only a handful of fields were carried
-        # across roles, which silently dropped per-request config like
-        # Qwen-Image's true_cfg_scale (and any future feature added to
-        # SamplingParams). Using a field-walk keeps the disagg boundary
-        # feature-complete without needing to edit this list.
+        # Preserve request values even when they equal a base-class default:
+        # receivers use the model's sampling subclass, whose defaults can differ.
         for f in dataclasses.fields(sp):
             name = f.name
             if name in _SAMPLING_PARAMS_EXCLUDE_FIELDS:
@@ -316,9 +306,6 @@ def extract_transfer_fields(req) -> tuple[dict, dict]:
                 continue
             value = getattr(sp, name, None)
             if value is None:
-                continue
-            base_field = _BASE_SAMPLING_PARAM_FIELDS.get(name)
-            if base_field is not None and _is_default(value, base_field):
                 continue
             try:
                 scalar_fields[name] = _to_json_serializable(value)
@@ -430,9 +417,8 @@ class SchedulerDisaggMixin:
         from sglang.multimodal_gen.runtime.disaggregation.metrics import DisaggMetrics
 
         self._disagg_role = server_args.disagg_role
-        self._disagg_timeout_s = float(getattr(server_args, "disagg_timeout", 600))
+        self._disagg_sampling_params_cls = SamplingParams
         self._disagg_metrics = None
-        self._disagg_mode = getattr(server_args, "disagg_mode", False)
         self._pool_work_pull = None
         self._pool_result_push = None
         self._transfer_manager = None
@@ -444,6 +430,11 @@ class SchedulerDisaggMixin:
         self._recv_prefetch_thread = None
 
         if self._disagg_role != RoleType.MONOLITHIC:
+            from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
+                resolve_sampling_params_cls,
+            )
+
+            self._disagg_sampling_params_cls = resolve_sampling_params_cls(server_args)
             self._disagg_metrics = DisaggMetrics(role=self._disagg_role.value)
             device = torch.device(f"{current_platform.device_type}:{local_rank}")
             self._transfer_stream = torch.get_device_module().Stream(device=device)
@@ -548,7 +539,7 @@ class SchedulerDisaggMixin:
         # Pre-allocate receive slots for receivers (denoiser/decoder)
         self._preallocated_slots: dict[int, object] = {}
         preallocated_slot_info = []
-        if self._disagg_role in (RoleType.DENOISER, RoleType.DECODER):
+        if self._disagg_role.is_transfer_receiver:
             capacity = getattr(sa, "disagg_prealloc_slots", 2)
             typical_size = 64 * 1024 * 1024  # 64 MiB per slot
             for i in range(capacity):
@@ -592,7 +583,7 @@ class SchedulerDisaggMixin:
         )
 
         # RDMA push thread for sender roles (encoder/denoiser)
-        if self._disagg_role in (RoleType.ENCODER, RoleType.DENOISER):
+        if self._disagg_role != RoleType.DECODER:
             self._rdma_push_queue = queue.Queue(maxsize=4)
             self._rdma_push_zmq, _ = get_zmq_socket(
                 self.context,
@@ -614,7 +605,7 @@ class SchedulerDisaggMixin:
         # Recv prefetch thread for receiver roles (denoiser/decoder)
         # Rank 0 only (bg thread does ZMQ recv + load; multi-rank gets
         # scalar fields via broadcast_pyobj from the main thread).
-        if self._disagg_role in (RoleType.DENOISER, RoleType.DECODER):
+        if self._disagg_role.is_transfer_receiver:
             self._compute_ready_queue = queue.Queue(maxsize=4)
             self._recv_prefetch_thread = threading.Thread(
                 target=self._recv_prefetch_loop,
@@ -978,8 +969,8 @@ class SchedulerDisaggMixin:
                     if self._disagg_role == RoleType.DENOISER:
                         _init_disagg_request_scheduler(self, req)
                     # Run compute
-                    if self._disagg_role == RoleType.DENOISER:
-                        self._disagg_denoiser_compute(req, request_id)
+                    if self._disagg_role in (RoleType.DENOISER, RoleType.IMAGE_ENCODER):
+                        self._disagg_forward_and_stage(req, request_id)
                     elif self._disagg_role == RoleType.DECODER:
                         self._disagg_decoder_compute(req, request_id)
 
@@ -1117,11 +1108,7 @@ class SchedulerDisaggMixin:
             return
 
         # Non-rank-0 receiver in multi-rank → broadcast-based loop
-        if (
-            not is_rank0
-            and is_multi_rank
-            and self._disagg_role in (RoleType.DENOISER, RoleType.DECODER)
-        ):
+        if not is_rank0 and is_multi_rank and self._disagg_role.is_transfer_receiver:
             self._disagg_non_rank0_event_loop()
             return
 
@@ -1138,7 +1125,7 @@ class SchedulerDisaggMixin:
                     else:
                         # Non-rank-0: only participate in transfer_ready compute
                         self._handle_transfer_non_rank0(frames)
-                elif self._disagg_role == RoleType.ENCODER:
+                elif self._disagg_role.is_input_encoder:
                     self._disagg_encoder_step(
                         send_tensors,
                         frames=frames,
@@ -1374,8 +1361,8 @@ class SchedulerDisaggMixin:
             self._broadcast_req_to_all_ranks(req)
 
         # 7. Run compute
-        if self._disagg_role == RoleType.DENOISER:
-            self._disagg_denoiser_compute(req, request_id)
+        if self._disagg_role in (RoleType.DENOISER, RoleType.IMAGE_ENCODER):
+            self._disagg_forward_and_stage(req, request_id)
         elif self._disagg_role == RoleType.DECODER:
             self._disagg_decoder_compute(req, request_id)
 
@@ -1395,8 +1382,11 @@ class SchedulerDisaggMixin:
         and the prefetch non-rank-0 loop
         (:meth:`_disagg_non_rank0_event_loop`).
         """
-        if self._disagg_role == RoleType.DENOISER:
-            if not self._is_glm_distributed_mode():
+        if self._disagg_role in (RoleType.DENOISER, RoleType.IMAGE_ENCODER):
+            if (
+                self._disagg_role == RoleType.DENOISER
+                and not self._is_glm_distributed_mode()
+            ):
                 _init_disagg_request_scheduler(self, req)
 
             with self._disagg_trace_dispatch(req):
@@ -1430,13 +1420,17 @@ class SchedulerDisaggMixin:
                 object.__setattr__(req, f.name, f.default)
             elif f.default_factory is not dataclasses.MISSING:
                 object.__setattr__(req, f.name, f.default_factory())
-        # Ensure sampling_params is not None so __getattr__ delegation works
-        object.__setattr__(req, "sampling_params", SamplingParams())
+        # Keep model-specific defaults and request hooks on every role.
+        params_cls = (
+            self._disagg_sampling_params_cls if self is not None else SamplingParams
+        )
+        object.__setattr__(req, "sampling_params", params_cls())
         restore_extra_tensors(req.extra, tensors, scalar_fields)
         # Restore _extra_* prefixed fields into req.extra dict
         extra_keys = [k for k in scalar_fields if k.startswith("_extra_")]
         for key in extra_keys:
             req.extra[key[len("_extra_") :]] = scalar_fields.pop(key)
+        req.sampling_params._explicit_fields = set(req.extra.get("explicit_fields", ()))
         for key, value in scalar_fields.items():
             setattr(req, key, value)
         # Set tensor fields
@@ -1489,13 +1483,13 @@ class SchedulerDisaggMixin:
         with trace_slice(ctx, DiffStage.SCHEDULER_DISPATCH, thread_finish_flag=True):
             yield
 
-    def _disagg_denoiser_compute(self: Scheduler, req: Req, request_id: str) -> None:
-        """Run denoiser compute in transfer mode, then stage output for decoder.
+    def _disagg_forward_and_stage(self: Scheduler, req: Req, request_id: str) -> None:
+        """Run an intermediate role and stage its output for the next worker.
 
         Note: Scheduler timestep init is done in _handle_transfer_ready
         to overlap with tensor loading.
         """
-        # Run denoising
+        # Run this role's stages.
         start_time = time.monotonic()
         with self._disagg_trace_dispatch(req):
             result = self.worker.execute_forward([req], return_req=True)
@@ -1523,7 +1517,7 @@ class SchedulerDisaggMixin:
         if staged is None:
             done_msg = TransferDoneMsg(
                 request_id=request_id,
-                error="Failed to stage denoiser output for decoder",
+                error=f"Failed to stage {self._disagg_role.value} output",
             )
             self._pool_result_push.send_multipart(encode_transfer_msg(done_msg))
             if self._disagg_metrics:
@@ -1532,9 +1526,11 @@ class SchedulerDisaggMixin:
 
         # 2. Build done_data dict while staging runs (CPU work, overlapped)
         done_data = {
-            "msg_type": "transfer_done",
+            "msg_type": "transfer_staged"
+            if self._disagg_role == RoleType.IMAGE_ENCODER
+            else "transfer_done",
             "request_id": request_id,
-            "staged_for_decoder": True,
+            "staged_for_decoder": self._disagg_role == RoleType.DENOISER,
             "session_id": self._transfer_manager.session_id,
             "pool_ptr": self._transfer_manager.pool_data_ptr,
             "slot_offset": staged.slot.offset if staged.slot else 0,
@@ -1555,7 +1551,8 @@ class SchedulerDisaggMixin:
             self._disagg_metrics.record_request_complete(request_id)
 
         logger.debug(
-            "Transfer DENOISER: processed %s in %.2f s, staged for decoder",
+            "Transfer %s: processed %s in %.2f s, staged for the next role",
+            self._disagg_role.value,
             request_id,
             duration_s,
         )
@@ -1572,7 +1569,9 @@ class SchedulerDisaggMixin:
         self: Scheduler, req: Req, request_id: str
     ) -> None:
         """Run local preparation, DiT, and VAE, then return decoded pixels."""
+        # the head owns image encoding and persistence; this hop carries tensors
         req.save_output = False
+        req.return_file_paths_only = False
         start_time = time.monotonic()
         with self._disagg_trace_dispatch(req):
             if (
@@ -1622,7 +1621,7 @@ class SchedulerDisaggMixin:
         """Run decoder compute in transfer mode, send result to DS.
 
         Decoder result is sent as raw ZMQ multipart frames (same format as
-        relay mode) so DiffusionServer handles it via _handle_decoder_result_frames
+        relay mode) so DiffusionServer uses its decoder result handler
         without hex/JSON overhead.
         """
 
@@ -1649,7 +1648,7 @@ class SchedulerDisaggMixin:
         duration_s = time.monotonic() - start_time
 
         # Send result as raw ZMQ frames (no TRANSFER_MAGIC prefix).
-        # DiffusionServer will route it through _handle_decoder_result_frames,
+        # DiffusionServer will route it through its decoder result handler,
         # the same path as relay mode.
         tensor_fields = {}
         scalar_fields = {"request_id": request_id}

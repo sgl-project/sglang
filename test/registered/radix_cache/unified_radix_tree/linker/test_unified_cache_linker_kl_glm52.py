@@ -60,7 +60,7 @@ class TestGLM52UnifiedCacheLinkerKL(UnifiedRadixTreeTestMixin, CustomTestCase):
                     "1",
                     "--enable-cache-report",
                     "--enable-unified-cache-external-linker",
-                    "--hicache-storage-backend-extra-config",
+                    "--unified-cache-external-linker-config",
                     json.dumps({"enable_group_semantics": True}),
                 ],
                 env=unified_radix_tree_server_env(

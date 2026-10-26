@@ -8,6 +8,7 @@ import triton.language as tl
 
 from sglang.srt.utils import is_gfx95_supported
 
+from ..common.tile_ptr import tile_ptrs_2d
 from ..common.utils import (
     _bitonic_merge,
     _sort_ids_ascending,
@@ -151,24 +152,31 @@ def _flash_attn_fwd_with_block_score_kernel(
         return
     block_num = (seq_len + block_size - 1) // block_size
     # init qkv pointer
-    q_ptrs = tl.make_block_ptr(
-        base=q_ptr + seq_start * stride_q_n + pid_h * stride_q_h,
-        shape=(q_len, qk_head_dim),
-        strides=(stride_q_n, stride_q_d),
-        offsets=(pid_q * BLOCK_SIZE_Q, 0),
-        block_shape=(BLOCK_SIZE_Q, BLOCK_SIZE_KD),
-        order=(1, 0),
+    q_ptrs, q_ptrs_mask = tile_ptrs_2d(
+        q_ptr + seq_start * stride_q_n + pid_h * stride_q_h,
+        q_len,
+        qk_head_dim,
+        stride_q_n,
+        stride_q_d,
+        pid_q * BLOCK_SIZE_Q,
+        0,
+        BLOCK_SIZE_Q,
+        BLOCK_SIZE_KD,
     )
-    s_ptrs = tl.make_block_ptr(
-        base=score_ptr + seq_start * stride_s_q + pid_h * stride_s_h,
-        shape=(q_len, block_num),
-        strides=(stride_s_q, stride_s_k),
-        offsets=(pid_q * BLOCK_SIZE_Q, 0),
-        block_shape=(BLOCK_SIZE_Q, BLOCKS_PER_K_BLOCK),
-        order=(1, 0),
+    s_ptrs_col = 0
+    s_ptrs, s_ptrs_mask = tile_ptrs_2d(
+        score_ptr + seq_start * stride_s_q + pid_h * stride_s_h,
+        q_len,
+        block_num,
+        stride_s_q,
+        stride_s_k,
+        pid_q * BLOCK_SIZE_Q,
+        s_ptrs_col,
+        BLOCK_SIZE_Q,
+        BLOCKS_PER_K_BLOCK,
     )
     # load q
-    q = tl.load(q_ptrs, boundary_check=(0, 1), padding_option="zero")
+    q = tl.load(q_ptrs, mask=q_ptrs_mask, other=0.0)
     if HAS_SINK:
         off_d = tl.arange(0, BLOCK_SIZE_KD)
         sink = tl.load(
@@ -257,7 +265,7 @@ def _flash_attn_fwd_with_block_score_kernel(
             noise = tl.clamp(noise, min=1e-9, max=1 - 1e-9)  # avoid log(0)
             noise = -tl.log(-tl.log(noise)) * 1.4426950409
             score += noise
-        tl.store(s_ptrs, score.to(score_ptr.dtype.element_ty), boundary_check=(0, 1))
+        tl.store(s_ptrs, score.to(score_ptr.dtype.element_ty), mask=s_ptrs_mask)
         if not DISABLE_INDEX_VALUE:
             # compute m_ij and l_ij
             m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
@@ -285,20 +293,34 @@ def _flash_attn_fwd_with_block_score_kernel(
             m_i = m_ij
             lse_i = m_ij + tl.log2(tl.exp2(lse_i - m_ij) + l_ij)
         # update ptrs
-        s_ptrs = tl.advance(s_ptrs, (0, BLOCKS_PER_K_BLOCK))
+        s_ptrs_col = s_ptrs_col + BLOCKS_PER_K_BLOCK
+        s_ptrs, s_ptrs_mask = tile_ptrs_2d(
+            score_ptr + seq_start * stride_s_q + pid_h * stride_s_h,
+            q_len,
+            block_num,
+            stride_s_q,
+            stride_s_k,
+            pid_q * BLOCK_SIZE_Q,
+            s_ptrs_col,
+            BLOCK_SIZE_Q,
+            BLOCKS_PER_K_BLOCK,
+        )
     if not DISABLE_INDEX_VALUE:
         # final scale
         acc_o = acc_o * tl.exp2(m_i - lse_i)[:, None]
         # save output
-        o_ptrs = tl.make_block_ptr(
-            base=o_ptr + seq_start * stride_o_n + pid_h * stride_o_h,
-            shape=(q_len, v_head_dim),
-            strides=(stride_o_n, stride_o_d),
-            offsets=(pid_q * BLOCK_SIZE_Q, 0),
-            block_shape=(BLOCK_SIZE_Q, BLOCK_SIZE_VD),
-            order=(1, 0),
+        o_ptrs, o_ptrs_mask = tile_ptrs_2d(
+            o_ptr + seq_start * stride_o_n + pid_h * stride_o_h,
+            q_len,
+            v_head_dim,
+            stride_o_n,
+            stride_o_d,
+            pid_q * BLOCK_SIZE_Q,
+            0,
+            BLOCK_SIZE_Q,
+            BLOCK_SIZE_VD,
         )
-        tl.store(o_ptrs, acc_o.to(o_ptr.dtype.element_ty), boundary_check=(0, 1))
+        tl.store(o_ptrs, acc_o.to(o_ptr.dtype.element_ty), mask=o_ptrs_mask)
 
 
 @triton.heuristics({"BLOCK_SIZE_T": lambda args: triton.next_power_of_2(args["topk"])})
@@ -507,15 +529,18 @@ def _index_block_score_only_kernel(
         return
     sid = (tl.load(slot_ids + pid_b).to(tl.int64) + max_slots) % max_slots
 
-    q_ptrs = tl.make_block_ptr(
-        base=q_ptr + seq_start * stride_q_n + pid_h * stride_q_h,
-        shape=(q_len, qk_head_dim),
-        strides=(stride_q_n, stride_q_d),
-        offsets=(pid_q * BLOCK_SIZE_Q, 0),
-        block_shape=(BLOCK_SIZE_Q, BLOCK_SIZE_KD),
-        order=(1, 0),
+    q_ptrs, q_ptrs_mask = tile_ptrs_2d(
+        q_ptr + seq_start * stride_q_n + pid_h * stride_q_h,
+        q_len,
+        qk_head_dim,
+        stride_q_n,
+        stride_q_d,
+        pid_q * BLOCK_SIZE_Q,
+        0,
+        BLOCK_SIZE_Q,
+        BLOCK_SIZE_KD,
     )
-    q = tl.load(q_ptrs, boundary_check=(0, 1), padding_option="zero")
+    q = tl.load(q_ptrs, mask=q_ptrs_mask, other=0.0)
 
     off_q = tl.arange(0, BLOCK_SIZE_Q) + pid_q * BLOCK_SIZE_Q + prefix_len
     off_k = tl.arange(0, block_size)

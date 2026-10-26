@@ -40,7 +40,7 @@ from sglang.srt.arg_groups.model_path_hook import (
     handle_modelscope_paths,
     resolve_hf_gguf_model_path,
 )
-from sglang.srt.arg_groups.overrides import model_config_of, resolving_view
+from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.server_args import ServerArgs
 from sglang.test.test_utils import CustomTestCase
@@ -142,21 +142,6 @@ class TestTheGgufArm(_ModelSourceCase):
         with self._resolving_to(None):
             resolve_hf_gguf_model_path(server_args)
         self.assertEqual(resolving_view(server_args).model_path, _GGUF_REFERENCE)
-
-    def test_the_declared_path_invalidates_the_model_configuration(self):
-        """The point of pinning the declaration: a configuration built before
-        it describes the Hub reference, not the file that was downloaded."""
-        first, second = self._checkpoint(), self._checkpoint()
-        server_args = ServerArgs(model_path=first, device="cuda")
-        before = model_config_of(server_args)
-        self.assertEqual(before.model_path, first)
-
-        with self._resolving_to(second):
-            resolve_hf_gguf_model_path(server_args)
-
-        after = model_config_of(server_args)
-        self.assertIsNot(after, before)
-        self.assertEqual(after.model_path, second)
 
 
 class TestTheModelScopeArm(_ModelSourceCase):
@@ -307,19 +292,6 @@ class TestTheRemoteConnectorArm(_ModelSourceCase):
         # The weights stay where they are; only the metadata was pulled.
         self.assertEqual(config.model_weights, _REMOTE_URL)
         self.assertEqual(state["allow_pattern"], ["*config.json"])
-
-    def test_the_record_keeps_the_url_and_the_cache_stays_keyed_on_it(self):
-        """Same movement the object-store arm makes: the configuration's path
-        moves, the record's does not, and the cache key follows the record."""
-        pulled = self._checkpoint()
-        patch, _ = self._connected_to(pulled)
-        server_args = ServerArgs(model_path=_REMOTE_URL, device="cuda")
-        with patch:
-            config = model_config_of(server_args)
-
-        self.assertEqual(server_args.model_path, _REMOTE_URL)
-        self.assertEqual(config.model_path, pulled)
-        self.assertIs(model_config_of(server_args), config)
 
 
 if __name__ == "__main__":

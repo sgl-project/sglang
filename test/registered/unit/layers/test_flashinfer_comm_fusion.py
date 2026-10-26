@@ -535,5 +535,58 @@ class TestTagGroupsForFlashInferAllReduceOnly(CustomTestCase):
         self.assertIsNone(moe_tp._fi_workspace_hint)
 
 
+class TestMnnvlCliqueGate(CustomTestCase):
+    """MNNVL fusion must be declined when a cross-node group is not one clique."""
+
+    def setUp(self):
+        self._saved = fusion._flashinfer_allreduce_unavailable
+        fusion._flashinfer_allreduce_unavailable = False
+
+    def tearDown(self):
+        fusion._flashinfer_allreduce_unavailable = self._saved
+
+    def _initialize(self, manager, one_clique, **kw):
+        fake_comm = _FakeFlashInferComm()
+        create = MagicMock(side_effect=fake_comm.create_allreduce_fusion_workspace)
+        clique = MagicMock(return_value=one_clique)
+        with (
+            patch.object(fusion, "_flashinfer_comm", fake_comm),
+            patch.object(fusion, "_create_allreduce_fusion_workspace", create),
+            patch.object(
+                fusion, "_preflight_check_workspace_memory", return_value=True
+            ),
+            patch.object(
+                fusion, "in_the_same_node_as", return_value=[True] * 4 + [False] * 4
+            ),
+            patch.object(fusion, "is_one_nvlink_clique", clique),
+            patch.object(torch.cuda, "current_device", return_value=0),
+        ):
+            manager.initialize(
+                world_size=8,
+                rank=0,
+                max_token_num=8,
+                hidden_dim=4096,
+                backend="mnnvl",
+                group=MagicMock(),
+                **kw,
+            )
+        return create, clique
+
+    def test_declines_when_not_one_clique(self):
+        manager = fusion.FlashInferWorkspaceManager()
+        with self.assertLogs(fusion.logger, level="WARNING") as logs:
+            create, _ = self._initialize(manager, one_clique=False)
+        create.assert_not_called()
+        self.assertFalse(manager.initialized)
+        self.assertTrue(fusion.is_flashinfer_allreduce_unavailable())
+        self.assertIn("NVLink clique", "\n".join(logs.output))
+
+    def test_proceeds_when_one_clique(self):
+        manager = fusion.FlashInferWorkspaceManager()
+        create, _ = self._initialize(manager, one_clique=True)
+        create.assert_called_once()
+        self.assertTrue(manager.initialized)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -43,6 +43,13 @@ class LTX2SamplingParams(SamplingParams):
         "inconsistent tone, cinematic oversaturation, stylized filters, or AI artifacts."
     )
 
+    def prepare_synthetic_warmup_request_for_queue(
+        self, req: Any, server_args: Any
+    ) -> None:
+        # BCG must capture the same CFG/STG/modality branches and LoRA phase
+        # strengths as real requests, including LTX-2.3 and HQ overrides.
+        self.apply_request_extra(req)
+
 
 @dataclasses.dataclass
 class LTX23SamplingParams(LTX2SamplingParams):

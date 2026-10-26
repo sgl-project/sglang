@@ -1,6 +1,7 @@
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
+#include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/utils.cuh>
 
 #include <tvm/ffi/container/tensor.h>
@@ -15,9 +16,8 @@
 // critical path, and it cannot be hoisted out because the schedule depends on
 // the per-request `topk_length` of the step being replayed.
 //
-// This kernel produces the same output bit for bit; the shared-memory layout
-// matches FlashMLA's exactly because the idle-tail fill below reads one entry
-// past `first_block_idx_shared`, as FlashMLA does.
+// This kernel produces the same output bit for bit as the legacy scheduler in
+// sgl-flash-mla 1.0.0, idle-tail partitions included.
 
 namespace sglang {
 
@@ -179,9 +179,8 @@ __global__ void __launch_bounds__(kBlockSize) flashmla_sched_meta_kernel(__grid_
     const int lb_last = last_block_idx_shared[b - 1];
     const int sk_last = seqlens_k_shared[b - 1];
     const int end_block_idx = (sk_last == 0) ? 0 : lb_last + 1;
-    // FlashMLA reads first_block_idx_shared[batch_size] for these, one past the
-    // end of that array, which aliases last_block_idx_shared[0].
-    const int begin_block_idx = last_block_idx_shared[0];
+    // `now_block` is 0 once every request is consumed.
+    const int begin_block_idx = 0;
     const int is_last_req_splitted = (end_block_idx != lb_last + 1) && (sk_last != 0);
     for (int i = first_idle_part_shared + threadIdx.x; i < p.num_sm_parts; i += kBlockSize) {
       int* meta = out_shared + i * kMetaInts;
@@ -270,6 +269,9 @@ void flashmla_sched_meta(
 
   const std::size_t smem = sizeof(int) * static_cast<std::size_t>(b * 5 + 1 + num_sm_parts * kMetaInts);
   RuntimeCheck(smem <= 48 * 1024, "schedule does not fit in shared memory: ", smem, " bytes");
+  // The kernel also has static shared memory. Opt in so schedules near
+  // 48 KiB do not exceed the default combined static + dynamic limit.
+  runtime::set_max_dynamic_smem_per_device<flashmla_sched_meta_kernel>(device_.unwrap(), 48 * 1024);
   LaunchKernel(1, kBlockSize, device_.unwrap(), smem)(flashmla_sched_meta_kernel, p);
 }
 

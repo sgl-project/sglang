@@ -17,6 +17,7 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
 from sglang.multimodal_gen.runtime.entrypoints.cli.cli_types import CLISubcommand
 from sglang.multimodal_gen.runtime.entrypoints.cli.utils import (
     RaiseNotImplementedAction,
+    add_resolved_pipeline_config_cli_args,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import GenerationResult
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -83,6 +84,7 @@ def add_multimodal_gen_generate_args(parser: argparse.ArgumentParser):
 
     parser = ServerArgs.add_cli_args(parser)
     parser = SamplingParams.add_cli_args(parser)
+    add_resolved_pipeline_config_cli_args(parser)
 
     parser.add_argument(
         "--text-encoder-configs",
@@ -202,11 +204,13 @@ def generate_cmd(args: argparse.Namespace, unknown_args: list[str] | None = None
     generator = DiffGenerator.from_pretrained(
         model_path=server_args.model_path, server_args=server_args, local_mode=True
     )
+    try:
+        results = generator.generate(sampling_params_kwargs=sampling_params_kwargs)
 
-    results = generator.generate(sampling_params_kwargs=sampling_params_kwargs)
-
-    prompt = sampling_params_kwargs.get("prompt")
-    maybe_dump_performance(args, server_args, prompt, results)
+        prompt = sampling_params_kwargs.get("prompt")
+        maybe_dump_performance(args, server_args, prompt, results)
+    finally:
+        generator.shutdown()
 
 
 class GenerateSubcommand(CLISubcommand):
@@ -215,16 +219,6 @@ class GenerateSubcommand(CLISubcommand):
     def __init__(self) -> None:
         self.name = "generate"
         super().__init__()
-        self.init_arg_names = self._get_init_arg_names()
-        self.generation_arg_names = self._get_generation_arg_names()
-
-    def _get_init_arg_names(self) -> list[str]:
-        """Get names of arguments for DiffGenerator initialization"""
-        return ["num_gpus", "tp_size", "sp_size", "model_path"]
-
-    def _get_generation_arg_names(self) -> list[str]:
-        """Get names of arguments for generate_video method"""
-        return [field.name for field in dataclasses.fields(SamplingParams)]
 
     def cmd(
         self, args: argparse.Namespace, unknown_args: list[str] | None = None

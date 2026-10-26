@@ -3,9 +3,10 @@
 import asyncio
 import base64
 import contextlib
+import io
 import os
 import time
-from typing import Any, List, Optional
+from typing import List, Optional
 
 from fastapi import (
     APIRouter,
@@ -19,6 +20,7 @@ from fastapi import (
 )
 from fastapi.responses import FileResponse
 from PIL import Image
+from pydantic import Json
 
 from sglang.multimodal_gen.configs.sample.glmimage import GlmImageSamplingParams
 from sglang.multimodal_gen.configs.sample.sampling_params import (
@@ -40,11 +42,13 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     add_common_data_to_response,
     build_sampling_params,
     choose_output_image_ext,
-    get_sampling_request_extra_fields,
     merge_image_input_list,
     process_generation_batch,
     request_extra_value,
+    request_field_value,
+    request_model_kwargs,
     resolve_sampling_params_cls,
+    sanitize_upload_filename,
     save_image_to_path,
     temp_dir_if_disabled,
 )
@@ -55,31 +59,6 @@ from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.srt.observability.trace import extract_trace_headers
 
 router = APIRouter(prefix="/v1/images", tags=["images"])
-
-
-def _get_extra_field(request, field_name):
-    return request_extra_value(request, field_name)
-
-
-def _get_request_field_or_extra(request, field_name):
-    value = getattr(request, field_name, None)
-    if value is not None:
-        return value
-    return _get_extra_field(request, field_name)
-
-
-def _image_request_model_kwargs(
-    request: ImageGenerationsRequest,
-    sampling_params_cls: type[SamplingParams],
-) -> dict[str, Any]:
-    """Extract fields owned and declared by the active model contract."""
-
-    kwargs = {}
-    for field_name in get_sampling_request_extra_fields(sampling_params_cls, "image"):
-        value = _get_extra_field(request, field_name)
-        if value is not None:
-            kwargs[field_name] = value
-    return kwargs
 
 
 def _runtime_sampling_quality(quality: str | None) -> str | None:
@@ -95,19 +74,20 @@ def _resolve_image_output_format(
     return sampling_params_cls.default_image_output_format()
 
 
-def _read_b64_for_paths(paths: list[str]) -> list[str]:
-    """Read and base64-encode each file. Must be called before cloud upload deletes them."""
-    result = []
-    for path in paths:
-        with open(path, "rb") as f:
-            result.append(base64.b64encode(f.read()).decode("utf-8"))
-    return result
+def _b64_encode_images(images: list[bytes]) -> list[str]:
+    return [base64.b64encode(image).decode("utf-8") for image in images]
 
 
 async def _upload_and_cleanup_images(paths: list[str]) -> list[str | None]:
-    return await asyncio.gather(
-        *(cloud_storage.upload_and_cleanup(path) for path in paths)
+    results = await asyncio.gather(
+        *(cloud_storage.upload_and_cleanup(path) for path in paths),
+        return_exceptions=True,
     )
+    # join every upload before a cancellation or failure permits directory cleanup
+    for result in results:
+        if isinstance(result, BaseException):
+            raise result
+    return results
 
 
 def _fallback_image_urls(
@@ -120,6 +100,22 @@ def _fallback_image_urls(
     return [
         f"/v1/images/{request_id}/content?variant={idx}" for idx in range(num_outputs)
     ]
+
+
+_SUPPORTED_RESPONSE_FORMATS = ("url", "b64_json")
+
+
+def _raise_if_url_response_undeliverable(resp_format: str, is_persistent: bool) -> None:
+    """Reject unusable response formats before generating."""
+    if resp_format not in _SUPPORTED_RESPONSE_FORMATS:
+        raise HTTPException(
+            status_code=400, detail=f"response_format={resp_format} is not supported"
+        )
+    if resp_format == "url" and not is_persistent and not cloud_storage.is_enabled():
+        raise HTTPException(
+            status_code=400,
+            detail="response_format='url' requires cloud storage to be configured.",
+        )
 
 
 def _select_image_variant_path(item: dict, variant: str | None) -> str | None:
@@ -187,7 +183,7 @@ def _build_image_response_kwargs(
 ) -> dict:
     """Build ImageResponse data list.
 
-    For b64_json: uses pre-read b64_list (call _read_b64_for_paths first).
+    For b64_json: uses b64_list, the base64 of the returned image bytes.
     For url: uses cloud_url or fallback_url.
     file_path is omitted when is_persistent=False to avoid exposing stale temp paths.
     """
@@ -230,6 +226,10 @@ def _build_image_response_kwargs(
             )
 
         if len(data) != len(save_file_path_list):
+            if cloud_storage.is_enabled():
+                raise HTTPException(
+                    status_code=502, detail="Cloud storage upload failed."
+                )
             raise HTTPException(
                 status_code=400,
                 detail="response_format='url' requires cloud storage to be configured.",
@@ -248,15 +248,15 @@ def _build_image_response_kwargs(
 
 
 def _get_response_resize(
-    sampling_params: SamplingParams, output_path: str | None = None
+    sampling_params: SamplingParams, output_image_bytes: bytes | None = None
 ) -> str | None:
     """Return a generated GLM-Image output's actual size as WIDTHxHEIGHT."""
     if not isinstance(sampling_params, GlmImageSamplingParams):
         return None
 
-    if output_path is not None:
+    if output_image_bytes is not None:
         try:
-            with Image.open(output_path) as output_image:
+            with Image.open(io.BytesIO(output_image_bytes)) as output_image:
                 width, height = output_image.size
             return f"{width}x{height}"
         except (OSError, ValueError):
@@ -271,6 +271,14 @@ def _get_response_resize(
     return f"{width}x{height}"
 
 
+def _build_request_sampling_params(request_id: str, **kwargs):
+    # Request validation errors are client errors, as in the video API.
+    try:
+        return build_sampling_params(request_id, **kwargs)
+    except (TypeError, ValueError) as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+
 @router.post("/generations", response_model=ImageResponse)
 async def generations(
     request: ImageGenerationsRequest,
@@ -279,17 +287,30 @@ async def generations(
     request_id = generate_request_id()
     server_args = get_global_server_args()
     sampling_params_cls = resolve_sampling_params_cls(server_args)
-    model_kwargs = _image_request_model_kwargs(request, sampling_params_cls)
+    model_kwargs = request_model_kwargs(request, sampling_params_cls, "image")
     output_format = _resolve_image_output_format(
         request.output_format, sampling_params_cls
+    )
+    response_format = request.response_format
+    if "response_format" not in request.model_fields_set:
+        response_format = (
+            sampling_params_cls.default_image_response_format() or response_format
+        )
+    resp_format = (response_format or "b64_json").lower()
+    _raise_if_url_response_undeliverable(
+        resp_format, server_args.output_path is not None
     )
     ext = choose_output_image_ext(output_format, request.background)
     prompt = await maybe_enhance_prompt(
         raw_request, request.prompt, enabled=request.enhance_prompt, task="image"
     )
 
+    # responses carry the encoded bytes; files are written only to persist or upload them
+    write_output_files = (
+        server_args.output_path is not None or cloud_storage.is_enabled()
+    )
     with temp_dir_if_disabled(server_args.output_path) as output_dir:
-        sampling = build_sampling_params(
+        sampling = _build_request_sampling_params(
             request_id,
             prompt=prompt,
             task_type=request.task_type,
@@ -300,6 +321,8 @@ async def generations(
             num_outputs_per_prompt=max(1, min(int(request.n or 1), 10)),
             output_file_name=f"{request_id}.{ext}",
             output_path=output_dir,
+            save_output=write_output_files,
+            return_image_bytes=True,
             num_frames=1,
             seed=request.seed,
             generator_device=request.generator_device,
@@ -307,24 +330,16 @@ async def generations(
             guidance_scale=request.guidance_scale,
             true_cfg_scale=request.true_cfg_scale,
             negative_prompt=request.negative_prompt,
-            max_sequence_length=(
-                request.max_sequence_length
-                if request.max_sequence_length is not None
-                else _get_extra_field(request, "max_sequence_length")
-            ),
-            flow_shift=(
-                request.flow_shift
-                if request.flow_shift is not None
-                else _get_extra_field(request, "flow_shift")
-            ),
+            max_sequence_length=request_field_value(request, "max_sequence_length"),
+            flow_shift=request_field_value(request, "flow_shift"),
             enable_teacache=request.enable_teacache,
-            enable_cache_dit=_get_extra_field(request, "enable_cache_dit"),
-            cache_dit_params=_get_extra_field(request, "cache_dit_params"),
-            cfg_gate_step=_get_extra_field(request, "cfg_gate_step"),
-            attention_backend_override=_get_extra_field(
+            enable_cache_dit=request_extra_value(request, "enable_cache_dit"),
+            cache_dit_params=request_extra_value(request, "cache_dit_params"),
+            cfg_gate_step=request_extra_value(request, "cfg_gate_step"),
+            attention_backend_override=request_extra_value(
                 request, "attention_backend_override"
             ),
-            skip_softmax_params=_get_extra_field(request, "skip_softmax_params"),
+            skip_softmax_params=request_extra_value(request, "skip_softmax_params"),
             quality=_runtime_sampling_quality(request.quality),
             output_compression=request.output_compression,
             output_quality=request.output_quality,
@@ -333,11 +348,12 @@ async def generations(
             upscaling_model_path=request.upscaling_model_path,
             upscaling_scale=request.upscaling_scale,
             perf_dump_path=request.perf_dump_path,
-            progressive_mode=_get_request_field_or_extra(request, "progressive_mode"),
-            progressive_levels=_get_request_field_or_extra(
-                request, "progressive_levels"
-            ),
-            progressive_delta=_get_request_field_or_extra(request, "progressive_delta"),
+            profile=request.profile,
+            num_profiled_timesteps=request.num_profiled_timesteps,
+            profile_all_stages=request.profile_all_stages,
+            progressive_mode=request_field_value(request, "progressive_mode"),
+            progressive_levels=request_field_value(request, "progressive_levels"),
+            progressive_delta=request_field_value(request, "progressive_delta"),
             **model_kwargs,
         )
         trace_headers = extract_trace_headers(raw_request.headers)
@@ -354,17 +370,10 @@ async def generations(
             async_scheduler_client, batch
         )
         save_file_path = save_file_path_list[0]
-        response_resize = _get_response_resize(sampling, save_file_path)
-        response_format = request.response_format
-        if "response_format" not in request.model_fields_set:
-            response_format = (
-                sampling_params_cls.default_image_response_format() or response_format
-            )
-        resp_format = (response_format or "b64_json").lower()
+        response_resize = _get_response_resize(sampling, result.output_image_bytes[0])
 
-        # read b64 before cloud upload may delete the local file
         b64_list = (
-            _read_b64_for_paths(save_file_path_list)
+            _b64_encode_images(result.output_image_bytes)
             if resp_format == "b64_json"
             else None
         )
@@ -439,16 +448,25 @@ async def edits(
     output_quality: Optional[str] = Form("default"),
     output_compression: Optional[int] = Form(None),
     enable_teacache: Optional[bool] = Form(False),
+    enable_cache_dit: Optional[bool] = Form(None),
+    cache_dit_params: Optional[Json[dict]] = Form(None),
     enable_upscaling: Optional[bool] = Form(False),
     upscaling_model_path: Optional[str] = Form(None),
     upscaling_scale: Optional[int] = Form(4),
     perf_dump_path: Optional[str] = Form(None),
+    profile: Optional[bool] = Form(False),
+    num_profiled_timesteps: Optional[int] = Form(None),
+    profile_all_stages: Optional[bool] = Form(False),
     num_frames: int = Form(1),
 ):
     request_id = generate_request_id()
     server_args = get_global_server_args()
     sampling_params_cls = resolve_sampling_params_cls(server_args)
     output_format = _resolve_image_output_format(output_format, sampling_params_cls)
+    resp_format = (response_format or "b64_json").lower()
+    _raise_if_url_response_undeliverable(
+        resp_format, server_args.output_path is not None
+    )
     # Resolve images from either `image` or `image[]` (OpenAI SDK sends `image[]` when list is provided)
     images = image or image_array
     urls = url or url_array
@@ -470,10 +488,12 @@ async def edits(
         try:
             for idx, img in enumerate(image_list):
                 filename = img.filename if hasattr(img, "filename") else f"image_{idx}"
+                safe_name = sanitize_upload_filename(filename, f"image_{idx}")
                 input_path = await save_image_to_path(
                     img,
-                    os.path.join(uploads_dir, f"{request_id}_{idx}_{filename}"),
+                    os.path.join(uploads_dir, f"{request_id}_{idx}_{safe_name}"),
                     prefer_remote_source=server_args.input_save_path is None,
+                    uploads_root=uploads_dir,
                 )
                 input_paths.append(input_path)
         except Exception as e:
@@ -483,6 +503,10 @@ async def edits(
             )
 
         ext = choose_output_image_ext(output_format, background)
+        # responses carry the encoded bytes; files are written only to persist or upload them
+        write_output_files = (
+            server_args.output_path is not None or cloud_storage.is_enabled()
+        )
         prompt = await maybe_enhance_prompt(
             raw_request,
             prompt,
@@ -490,7 +514,7 @@ async def edits(
             task="image_edit",
             image_paths=input_paths,
         )
-        sampling = build_sampling_params(
+        sampling = _build_request_sampling_params(
             request_id,
             prompt=prompt,
             task_type=task_type,
@@ -499,6 +523,8 @@ async def edits(
             num_outputs_per_prompt=max(1, min(int(n or 1), 10)),
             output_file_name=f"{request_id}.{ext}",
             output_path=output_dir,
+            save_output=write_output_files,
+            return_image_bytes=True,
             image_path=input_paths,
             seed=seed,
             generator_device=generator_device,
@@ -507,6 +533,8 @@ async def edits(
             true_cfg_scale=true_cfg_scale,
             num_inference_steps=num_inference_steps,
             enable_teacache=enable_teacache,
+            enable_cache_dit=enable_cache_dit,
+            cache_dit_params=cache_dit_params,
             num_frames=num_frames,
             quality=_runtime_sampling_quality(quality),
             output_compression=output_compression,
@@ -515,6 +543,9 @@ async def edits(
             upscaling_model_path=upscaling_model_path,
             upscaling_scale=upscaling_scale,
             perf_dump_path=perf_dump_path,
+            profile=profile,
+            num_profiled_timesteps=num_profiled_timesteps,
+            profile_all_stages=profile_all_stages,
         )
         trace_headers = extract_trace_headers(raw_request.headers)
         batch = prepare_request(
@@ -526,12 +557,10 @@ async def edits(
             async_scheduler_client, batch
         )
         save_file_path = save_file_path_list[0]
-        response_resize = _get_response_resize(sampling, save_file_path)
-        resp_format = (response_format or "b64_json").lower()
+        response_resize = _get_response_resize(sampling, result.output_image_bytes[0])
 
-        # read b64 before cloud upload may delete the local file
         b64_list = (
-            _read_b64_for_paths(save_file_path_list)
+            _b64_encode_images(result.output_image_bytes)
             if resp_format == "b64_json"
             else None
         )

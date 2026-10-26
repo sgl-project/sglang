@@ -8,6 +8,9 @@ from typing import cast
 
 from sglang.multimodal_gen.apps.webui import run_sgl_diffusion_webui
 from sglang.multimodal_gen.runtime.entrypoints.cli.cli_types import CLISubcommand
+from sglang.multimodal_gen.runtime.entrypoints.cli.utils import (
+    add_resolved_pipeline_config_cli_args,
+)
 from sglang.multimodal_gen.runtime.launch_server import (
     dispatch_launch,
 )
@@ -24,7 +27,9 @@ def add_multimodal_gen_serve_args(parser: argparse.ArgumentParser):
         required=False,
         help="Read CLI options from a config JSON or YAML file.",
     )
-    return ServerArgs.add_cli_args(parser)
+    parser = ServerArgs.add_cli_args(parser)
+    add_resolved_pipeline_config_cli_args(parser)
+    return parser
 
 
 def execute_serve_cmd(args: argparse.Namespace, unknown_args: list[str] | None = None):

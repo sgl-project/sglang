@@ -1,0 +1,56 @@
+name: PR Title
+
+on:
+  pull_request_target:
+    types: [opened, edited, synchronize, reopened, ready_for_review]
+
+permissions:
+  pull-requests: read
+
+concurrency:
+  group: pr-title-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  check-pr-title:
+    name: Check PR title
+    runs-on: ubuntu-latest
+    steps:
+      # Read metadata only; never check out or execute code from the PR.
+      - name: Validate PR title
+        uses: actions/github-script@v8
+        with:
+          script: |
+            // Fetch the current title so reruns also reflect title edits.
+            const { data: pr } = await github.rest.pulls.get({
+              ...context.repo,
+              pull_number: context.issue.number,
+            });
+            const types = ['Feat', 'Fix', 'Refactor', 'Perf', 'Doc', 'Test', 'CI', 'Chore'];
+            const pattern = new RegExp(
+              String.raw`^\[(${types.join('|')})\] (?:\[([A-Za-z0-9][A-Za-z0-9._+-]*)\] )?` +
+              String.raw`[A-Za-z0-9]+(?:[._/-][A-Za-z0-9]+)*: \S(?:[^\r\n]*\S)?$`
+            );
+            const match = pattern.exec(pr.title);
+            const hardware = match?.[2];
+            // Hardware is uppercase except for these four canonical brand spellings.
+            const brands = ['Intel', 'Apple', 'Huawei', 'Ascend'];
+            const brand = brands.find(name => name.toLowerCase() === hardware?.toLowerCase());
+            const validHardware = !hardware || hardware === (brand || hardware.toUpperCase());
+            // Preserve GitHub's generated revert titles, including legacy originals.
+            const isRevert = /^Revert "\S(?:[^\r\n]*\S)?"$/.test(pr.title);
+            if ((!(match && validHardware) && !isRevert) || pr.title !== pr.title.trim()) {
+              core.setFailed(
+                'PR title must use "[Type] scope: title" or "[Type] [Hardware] scope: title". ' +
+                `Type must be one of: ${types.join(', ')}. ` +
+                'Scope is required and may be any module or model name, with unrestricted letter case ' +
+                '(letters, numbers, dots, underscores, slashes, or hyphens). ' +
+                'Hardware is optional; use a single tag without spaces. Use uppercase hardware tags (AMD, NVIDIA, NPU, MI300X), except for exactly these four spellings: Intel, Apple, Huawei, Ascend. ' +
+                'Reverts must use GitHub\'s default format: Revert "original title". ' +
+                'Use one space between fields and after the colon, with a non-empty title ' +
+                'and no leading or trailing whitespace. ' +
+                'Examples: "[Fix] attention: Fix KV cache indexing", ' +
+                '"[Feat] qwen3: Add model support", ' +
+                '"[Perf] [AMD] flash-attn: Optimize decode performance".'
+              );
+            }

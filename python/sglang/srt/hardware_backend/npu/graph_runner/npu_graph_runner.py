@@ -283,7 +283,7 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
                 # Refresh the static DP token buffers bound by the captured
                 # graph (stale values misalign dp-gather segments across
                 # ranks); mirror the capture-side uniform
-                # [padded_num_tokens] * dp_size.
+                # [padded_num_tokens] * num_dp_ranks.
                 if self.require_mlp_tp_gather:
                     _padded_num_tokens = bs * self.captured_req_width
                     self.buffers.global_num_tokens_gpu.fill_(_padded_num_tokens)
@@ -391,17 +391,30 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
                     # recompute and double-add here.
                     seq_lens = list(_meta_list)
                 else:
-                    # Wrapper backends (e.g. hybrid linear attention) keep
-                    # forward_metadata only on their children, so it stays
-                    # None here; fall back to the pre-DFlash computation.
-                    seq_lens_cpu = (
-                        forward_batch.seq_lens.cpu() + self.captured_req_width
-                    )
+                    # Hybrid attention wrappers may not expose replay metadata.
+                    # Prefer the live CPU mirror to avoid a blocking D2H copy;
+                    # fall back to device lengths when the mirror is unavailable.
+                    if forward_batch.seq_lens_cpu is not None:
+                        seq_lens_cpu = (
+                            forward_batch.seq_lens_cpu[: self.raw_bs]
+                            + self.captured_req_width
+                        )
+                    else:
+                        seq_lens_cpu = (
+                            forward_batch.seq_lens.cpu() + self.captured_req_width
+                        )
                     seq_lens = seq_lens_cpu.tolist() + [0] * (self.bs - self.raw_bs)
             else:
-                seq_lens = forward_batch.seq_lens.cpu().tolist() + [0] * (
-                    self.bs - self.raw_bs
-                )
+                # Reuse the live CPU mirror when available to avoid
+                # a blocking D2H copy.
+                if forward_batch.seq_lens_cpu is not None:
+                    seq_lens = forward_batch.seq_lens_cpu[: self.raw_bs].tolist() + [
+                        0
+                    ] * (self.bs - self.raw_bs)
+                else:
+                    seq_lens = forward_batch.seq_lens.cpu().tolist() + [0] * (
+                        self.bs - self.raw_bs
+                    )
             output = self.backend.replay_with_input_update(
                 graph_key,
                 seq_lens=seq_lens,

@@ -190,7 +190,7 @@ def get_jitter_engine(
     engine_kwargs.setdefault("schedule_conservativeness", 0.05)
 
     if (
-        engine_kwargs.get("enable_dp_attention")
+        engine_kwargs.get("attn_dp_size", 1) > 1
         and "dist_init_addr" not in engine_kwargs
     ):
         import portpicker

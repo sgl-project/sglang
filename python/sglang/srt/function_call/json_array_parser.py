@@ -42,6 +42,18 @@ class JsonArrayParser(BaseFormatDetector):
         """
         return super().parse_streaming_increment(new_text, tools)
 
+    def finish(self, tools: List[Tool]) -> StreamingParseResult:
+        # An increment sends a call's name before its arguments, so drain the
+        # arguments of calls that arrived whole in the last chunk.
+        normal_text, calls = "", []
+        while True:
+            result = self.parse_streaming_increment("", tools)
+            normal_text += result.normal_text
+            progress = [call for call in result.calls if call.name or call.parameters]
+            if not progress:
+                return StreamingParseResult(normal_text=normal_text, calls=calls)
+            calls.extend(progress)
+
     def structure_info(self) -> callable:
         """
         Return a function that creates StructureInfo for constrained generation.

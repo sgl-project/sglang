@@ -2,6 +2,7 @@ import os
 import signal
 import socket
 import subprocess
+import tempfile
 import time
 
 import requests
@@ -39,6 +40,7 @@ class MooncakeTestServices:
         self.metadata_process = None
         self.master_process = None
         self.store_process = None
+        self._log_paths: dict[str, str] = {}
 
     @staticmethod
     def _default_device(protocol: str) -> str:
@@ -51,26 +53,29 @@ class MooncakeTestServices:
 
     def start(self):
         self.metadata_process = self._launch(
+            "metadata service",
             [
                 "python3",
                 "-m",
                 "mooncake.http_metadata_server",
                 "--port",
                 str(self.metadata_port),
-            ]
+            ],
         )
         try:
             self.master_process = self._launch(
+                "master service",
                 [
                     "mooncake_master",
                     "--port",
                     str(self.master_port),
                     "--metrics_port",
                     str(self.master_metrics_port),
-                ]
+                ],
             )
             self._wait_for_core_services()
             self.store_process = self._launch(
+                "store service",
                 [
                     "mooncake_client",
                     f"--host={self.local_hostname}",
@@ -123,15 +128,19 @@ class MooncakeTestServices:
                 return float(line.split()[1])
         raise AssertionError(f"{name} is missing from Mooncake master metrics")
 
-    @staticmethod
-    def _launch(command, env=None):
-        return subprocess.Popen(
-            command,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.STDOUT,
-            preexec_fn=os.setsid,
-            env=env,
+    def _launch(self, name: str, command, env=None):
+        log = tempfile.NamedTemporaryFile(
+            prefix=f"mooncake-{name.split()[0]}-", suffix=".log", delete=False
         )
+        self._log_paths[name] = log.name
+        with log:
+            return subprocess.Popen(
+                command,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                preexec_fn=os.setsid,
+                env=env,
+            )
 
     def _wait_for_core_services(self, timeout: int = 30):
         deadline = time.monotonic() + timeout
@@ -164,11 +173,15 @@ class MooncakeTestServices:
                 time.sleep(1)
         raise TimeoutError("Timed out waiting for Mooncake store")
 
-    @staticmethod
-    def _raise_if_exited(process, name: str):
+    def _raise_if_exited(self, process, name: str):
         returncode = process.poll()
-        if returncode is not None:
-            raise RuntimeError(f"Mooncake {name} exited with code {returncode}")
+        if returncode is None:
+            return
+        with open(self._log_paths[name], errors="replace") as f:
+            tail = "".join(f.readlines()[-30:])
+        raise RuntimeError(
+            f"Mooncake {name} exited with code {returncode}; log tail:\n{tail}"
+        )
 
     @staticmethod
     def _stop_process_group(process):

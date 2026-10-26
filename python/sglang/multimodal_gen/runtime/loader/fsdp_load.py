@@ -28,6 +28,9 @@ from torch.nn.modules.module import _IncompatibleKeys
 from sglang.multimodal_gen.configs.models.fsdp import is_module_list_entry_in
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
+    MergedColumnParallelLinear,
+    MergedReplicatedLinear,
+    QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
     UnquantizedLinearMethod,
@@ -110,6 +113,16 @@ def _can_assign_tensor_without_copy(
     """Return whether a TP=1 linear loader would only copy this tensor."""
     weight_loader = actual_param.__dict__.get("weight_loader")
     if not isinstance(weight_loader, MethodType):
+        return False
+    # subclasses may transform weights even when shapes and dtypes match
+    if weight_loader.__func__ not in (
+        ReplicatedLinear.weight_loader,
+        MergedReplicatedLinear.weight_loader,
+        ColumnParallelLinear.weight_loader,
+        MergedColumnParallelLinear.weight_loader,
+        QKVParallelLinear.weight_loader,
+        RowParallelLinear.weight_loader,
+    ):
         return False
 
     owner = weight_loader.__self__

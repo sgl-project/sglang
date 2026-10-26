@@ -31,8 +31,12 @@ if TYPE_CHECKING:
 
 
 class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
+    # Both expert paths below are SM100-only. A subclass that supplies its own
+    # non-Blackwell path clears this and owns the platform decision itself.
+    requires_blackwell = True
+
     def __init__(self):
-        if not get_platform().is_blackwell:
+        if self.requires_blackwell and not get_platform().is_blackwell:
             raise ValueError(
                 "Current platform does not support NVFP4"
                 " quantization. Please use Blackwell and"
@@ -368,10 +372,6 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
                 swiglu_alpha=swiglu_alpha,
                 swiglu_beta=swiglu_beta,
                 swiglu_limit=swiglu_limit,
-                moe_ep_size=layer.moe_ep_size,
-                moe_ep_rank=layer.moe_ep_rank,
-                moe_tp_size=layer.moe_tp_size,
-                moe_tp_rank=layer.moe_tp_rank,
                 apply_routed_scaling_factor=False,
             )
             return self.runner.run(dispatch_output, quant_info)

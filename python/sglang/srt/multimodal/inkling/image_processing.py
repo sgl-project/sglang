@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import io
 import math
 from typing import List, Optional, Union
@@ -16,6 +17,9 @@ IMAGE_MEAN = np.array([0.48145466, 0.4578275, 0.40821073], dtype=np.float32)
 IMAGE_STD = np.array([0.26862954, 0.2613026, 0.2757771], dtype=np.float32)
 PAD_RAW_VALUE = np.float32(-1.0 / 255.0)
 PAD_NORM = (np.full((3,), PAD_RAW_VALUE, dtype=np.float32) - IMAGE_MEAN) / IMAGE_STD
+
+# Anything else (EMFILE, ENOSPC, EACCES, ...) is a server-side fault, not a bad path.
+_EXPECTED_PATH_ERRNOS = {errno.ENOENT, errno.ENOTDIR, errno.EISDIR, errno.ENAMETOOLONG}
 
 
 def _validate_image_rescale(
@@ -86,8 +90,19 @@ def _load_image_bytes(image) -> bytes:
                 "upstream (e.g. via SGLang load_mm_data) before preprocessing."
             )
         path = image[len("file://") :] if image.startswith("file://") else image
-        with open(path, "rb") as f:
-            return f.read()
+        try:
+            with open(path, "rb") as f:
+                return f.read()
+        except OSError as e:
+            if e.errno not in _EXPECTED_PATH_ERRNOS:
+                raise
+            path_str = path
+            if len(path_str) > 100:
+                path_str = path_str[:100] + "..."
+            # str(e) re-embeds the full, untruncated path; use e.strerror instead.
+            raise ValueError(
+                f"Could not read image from path {path_str}: {e.strerror}"
+            ) from e
 
     from PIL import Image
 
@@ -153,7 +168,10 @@ def _encode_image_bytes(
 
     from PIL import Image
 
-    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    try:
+        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    except (OSError, SyntaxError) as e:
+        raise ValueError(f"Could not decode image: {e}") from e
     scaled_size = _scaled_image_dimensions(
         *image.size,
         rescale_image_frac=rescale_image_frac,

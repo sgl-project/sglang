@@ -27,6 +27,36 @@ def _jit_rotary_embedding_module() -> Module:
 
 
 @cache_once
+def _jit_rope_scale_store_module() -> Module:
+    return load_jit(
+        "bf16_rope_scale_store",
+        cuda_files=["elementwise/pos_enc.cuh"],
+        cuda_wrappers=[("run", "BF16RopeScaleStoreKernel::run")],
+        extra_cuda_cflags=["--ftz=false"],
+    )
+
+
+@register_custom_op(
+    op_name="bf16_rope_scale_store",
+    mutates_args=["query", "key_cache", "value_cache"],
+)
+def bf16_rope_scale_store(
+    qkv: torch.Tensor,
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    cos_sin: torch.Tensor,
+    positions: torch.Tensor,
+    locations: torch.Tensor,
+    value_scale: float,
+) -> None:
+    """NeoX RoPE on packed BF16 QKV, with contiguous Q and scaled V cache writes."""
+    _jit_rope_scale_store_module().run(
+        qkv, query, key_cache, value_cache, cos_sin, positions, locations, value_scale
+    )
+
+
+@cache_once
 def _jit_fused_rope_module(
     is_neox: bool, rope_dim: int, dtype: torch.dtype, q_dtype: torch.dtype
 ) -> Module:

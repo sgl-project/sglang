@@ -7,12 +7,6 @@ from dataclasses import dataclass
 
 
 @dataclass
-class _RequestTiming:
-    start_time: float
-    stage_start: float = 0.0
-
-
-@dataclass
 class RoleStats:
     role: str
     requests_completed: int = 0
@@ -54,7 +48,7 @@ class DisaggMetrics:
         self._failed = 0
         self._timed_out = 0
 
-        self._in_flight: dict[str, _RequestTiming] = {}
+        self._in_flight: dict[str, float] = {}
 
         self._last_latency = 0.0
         self._max_latency = 0.0
@@ -71,14 +65,14 @@ class DisaggMetrics:
 
     def record_request_start(self, request_id: str) -> None:
         with self._lock:
-            self._in_flight[request_id] = _RequestTiming(start_time=time.monotonic())
+            self._in_flight[request_id] = time.monotonic()
 
     def record_request_complete(self, request_id: str) -> None:
         now = time.monotonic()
         with self._lock:
-            timing = self._in_flight.pop(request_id, None)
-            if timing is not None:
-                latency = now - timing.start_time
+            start_time = self._in_flight.pop(request_id, None)
+            if start_time is not None:
+                latency = now - start_time
                 self._last_latency = latency
                 self._max_latency = max(self._max_latency, latency)
                 self._total_latency += latency

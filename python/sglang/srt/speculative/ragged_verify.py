@@ -302,25 +302,3 @@ def compute_uniform_extend_lengths(
         num_tokens=num_tokens,
         extend_start_loc=None,
     )
-
-
-def compute_ragged_extend_lengths(
-    *,
-    seq_lens: torch.Tensor,
-    seq_lens_cpu: List[int],
-    ragged_layout: RaggedVerifyLayout,
-) -> VerifyExtendLengths:
-    extend_seq_lens_cpu = list(ragged_layout.verify_lens_cpu)
-    seq_lens_extended = seq_lens + ragged_layout.verify_lens
-    seq_lens_cpu_extended = [
-        raw + length for raw, length in zip(seq_lens_cpu, extend_seq_lens_cpu)
-    ]
-    num_tokens = ragged_layout.total_verify_tokens
-    extend_start_loc = ragged_layout.extend_start_loc
-    return VerifyExtendLengths(
-        seq_lens_extended=seq_lens_extended,
-        seq_lens_cpu_extended=seq_lens_cpu_extended,
-        extend_seq_lens_cpu=extend_seq_lens_cpu,
-        num_tokens=num_tokens,
-        extend_start_loc=extend_start_loc,
-    )

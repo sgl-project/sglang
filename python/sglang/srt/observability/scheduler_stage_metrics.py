@@ -51,6 +51,15 @@ SCHEDULER_STAGE_CATEGORIES = (
 )
 _SCHEDULER_STAGE_CATEGORY_SET = frozenset(SCHEDULER_STAGE_CATEGORIES)
 
+FORWARD_OVERLAP_FULL = "full"
+FORWARD_OVERLAP_PARTIAL = "partial"
+FORWARD_OVERLAP_NONE = "none"
+FORWARD_OVERLAP_CATEGORIES = (
+    FORWARD_OVERLAP_FULL,
+    FORWARD_OVERLAP_PARTIAL,
+    FORWARD_OVERLAP_NONE,
+)
+
 
 @dataclass(slots=True)
 class SchedulerStageMetricsRecorder:
@@ -60,19 +69,31 @@ class SchedulerStageMetricsRecorder:
     assigned to ``other``. Summing all categories therefore recovers elapsed
     scheduler-loop wall time. Active torch profilers receive matching
     ``scheduler.<stage>`` ranges without requiring Python stacks.
+
+    Forward overlap is sampled at each exclusive span's endpoints: ``full`` when
+    both observe active forward, ``partial`` when only one does, ``none`` otherwise
+    (including unavailable timing). ``full`` can span a GPU gap, and ``none`` can
+    span an entire forward; these labels do not measure overlapped/exposed seconds.
     """
 
     enabled: bool
+    query_forward_active: Callable[[], bool] | None = None
     _current_stage: str = SCHEDULER_STAGE_OTHER
     _trace_stage: str | None = None
     _last_wall_ns: int | None = None
-    _wall_ns: dict[str, int] = field(default_factory=lambda: defaultdict(int))
+    _last_forward_active: bool = False
+    _wall_ns: dict[tuple[str, str], int] = field(
+        default_factory=lambda: defaultdict(int)
+    )
 
     def start(self, wall_ns: int) -> None:
         if not self.enabled:
             return
         self._current_stage = SCHEDULER_STAGE_OTHER
         self._last_wall_ns = wall_ns
+        self._last_forward_active = (
+            self.query_forward_active() if self.query_forward_active else False
+        )
         self._wall_ns.clear()
 
     def enter(self, stage: str) -> str | None:
@@ -115,7 +136,7 @@ class SchedulerStageMetricsRecorder:
                 self._trace_stage = previous_trace_stage
             self.exit(previous_stage)
 
-    def drain(self, wall_ns: int) -> dict[str, int]:
+    def drain(self, wall_ns: int) -> dict[tuple[str, str], int]:
         if not self.enabled or self._last_wall_ns is None:
             return {}
         self._sample(wall_ns)
@@ -125,8 +146,18 @@ class SchedulerStageMetricsRecorder:
 
     def _sample(self, wall_ns: int) -> None:
         assert self._last_wall_ns is not None
-        self._wall_ns[self._current_stage] += wall_ns - self._last_wall_ns
+        forward_active = (
+            self.query_forward_active() if self.query_forward_active else False
+        )
+        if self._last_forward_active and forward_active:
+            overlap = FORWARD_OVERLAP_FULL
+        elif self._last_forward_active or forward_active:
+            overlap = FORWARD_OVERLAP_PARTIAL
+        else:
+            overlap = FORWARD_OVERLAP_NONE
+        self._wall_ns[self._current_stage, overlap] += wall_ns - self._last_wall_ns
         self._last_wall_ns = wall_ns
+        self._last_forward_active = forward_active
 
 
 _F = TypeVar("_F", bound=Callable)

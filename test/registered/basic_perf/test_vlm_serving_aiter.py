@@ -6,7 +6,7 @@ from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.kits.vlm_perf_kit import check_vlm_serving_perf
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=300, suite="stage-b-test-1-gpu-small-amd")
+register_amd_ci(est_time=300, suite="extra-a-test-1-gpu-large-amd")
 
 
 class TestVLMServingAiter(CustomTestCase):

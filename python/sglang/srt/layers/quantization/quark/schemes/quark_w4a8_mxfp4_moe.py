@@ -261,8 +261,23 @@ class QuarkW4A8MXFp4MoE(QuarkMoEScheme):
         gate/up-interleaved layout consumed by aiter's triton ``moe_gemm_a8w4``
         (no CK/ASM shuffle)."""
         from sglang.srt.layers.moe.fused_moe_triton.aiter_mxfp4_w4a8_moe import (
+            build_ep_expert_map,
             prepare_w4a8_gfx1250_weights,
         )
+
+        self.ep_expert_map = None
+        self.num_local_experts = layer.w13_weight.shape[0]
+        if getattr(layer, "moe_ep_size", 1) > 1:
+            if getattr(layer, "num_fused_shared_experts", 0):
+                raise NotImplementedError(
+                    "gfx1250 W4A8 MoE does not support fused shared experts with EP."
+                )
+            self.ep_expert_map = build_ep_expert_map(
+                num_experts=layer.num_experts,
+                num_local_experts=self.num_local_experts,
+                ep_rank=layer._expert_storage_rank,
+                device=layer.w13_weight.device,
+            )
 
         (
             w13_weight,
@@ -458,6 +473,8 @@ class QuarkW4A8MXFp4MoE(QuarkMoEScheme):
                 gemm1_limit=limit,
                 renormalize=True,
                 apply_router_weight_on_input=cfg.apply_router_weight_on_input,
+                expert_map=self.ep_expert_map,
+                num_local_experts=self.num_local_experts,
             )
             return StandardCombineInput(hidden_states=output)
 

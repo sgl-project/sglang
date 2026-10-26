@@ -170,10 +170,15 @@ def set_default_server_args(args: "ServerArgs"):
         disable_custom_all_reduce=True,
     )
 
-    # handles hierarchical cache / decode-offload configs
+    # Backup-only decode retraction also builds a HiCache host pool. The
+    # inferred backend is resolved later, once the device KV pool exists.
     if (
         cfg.enable_hierarchical_cache
         or cfg.disaggregation_decode_enable_offload_kvcache
+        or (
+            cfg.disaggregation_mode == "decode"
+            and cfg.disaggregation_decode_retraction_backup in (None, "host_pool")
+        )
     ):
         declare_resolution(
             args,

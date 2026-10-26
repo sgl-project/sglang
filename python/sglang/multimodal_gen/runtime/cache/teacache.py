@@ -263,6 +263,7 @@ class TeaCacheMixin:
         from sglang.multimodal_gen.runtime.managers.forward_context import (
             get_forward_context,
         )
+        from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 
         forward_context = get_forward_context()
         forward_batch = forward_context.forward_batch
@@ -282,9 +283,11 @@ class TeaCacheMixin:
         num_inference_steps = forward_batch.num_inference_steps
         do_cfg = forward_batch.do_classifier_free_guidance
         is_cfg_negative = forward_batch.is_cfg_negative
+        is_cfg_parallel = bool(get_global_server_args().enable_cfg_parallel)
 
-        # Reset at first timestep
-        if current_timestep == 0 and not self.is_cfg_negative:
+        # Serial CFG resets once before the positive branch. CFG-parallel ranks
+        # each own a model instance and must reset their local state.
+        if current_timestep == 0 and (is_cfg_parallel or not is_cfg_negative):
             self.reset_teacache_state()
 
         return TeaCacheContext(

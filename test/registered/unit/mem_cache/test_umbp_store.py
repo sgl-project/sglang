@@ -36,6 +36,8 @@ class MockStorageConfig:
 class MockHostKVCache:
     """Mock HostKVCache that simulates page_first layout with real buffers."""
 
+    stores_page_envelope = False
+
     def __init__(self, num_pages=4, page_size=1, element_size=1024):
         self.layout = "page_first"
         self.page_size = page_size
@@ -91,6 +93,7 @@ class MockLogicalHostPool:
     layout = "page_first"
     page_size = 1
     kv_buffer = None
+    stores_page_envelope = False
 
 
 class MockHybridSidePool:

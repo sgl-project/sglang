@@ -29,6 +29,10 @@ class Flux3ArchConfig(DiTArchConfig):
     axes_dim: tuple[int, ...] = (32, 32, 32, 32)
     theta: int = 10000
     mlp_ratio: float = 3.0
+    # Streams that get an output head; None means every stream.
+    out_modes: list[str] | None = None
+    # A flow map also embeds the time each step jumps to (``ref_time_in``).
+    flow_map: bool = False
 
     # Exported policies prefix the DiT tensors with ``dit.``; every block's
     # q/k/v/mlp_in projections are fused into one ``qkv_mlp`` weight.
@@ -51,7 +55,15 @@ class Flux3ArchConfig(DiTArchConfig):
             raise ValueError("hidden_size must be divisible by num_attention_heads")
         if sum(self.axes_dim) != self.hidden_size // self.num_attention_heads:
             raise ValueError("axes_dim must sum to the attention head dim")
-        self.num_channels_latents = self.in_channels.get("video", 0)
+        if self.out_modes is not None:
+            unknown = set(self.out_modes) - set(self.in_channels)
+            if unknown:
+                raise ValueError(
+                    f"out_modes names undeclared streams: {sorted(unknown)}"
+                )
+        # The first stream of the sequence is the generated latent.
+        first = next(iter(self.sequence.values()), None)
+        self.num_channels_latents = self.in_channels.get(first, 0)
 
     def with_streams(self, extra: dict[str, int]) -> "Flux3ArchConfig":
         """Declare additional streams ``name -> channels`` (appended to the sequence)."""

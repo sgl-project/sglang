@@ -28,6 +28,7 @@
 #include <sgl_kernel/utils.h>
 
 #include <sgl_kernel/mbarrier.cuh>
+#include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/utils.cuh>
 #include <sgl_kernel/warp.cuh>
 
@@ -130,7 +131,7 @@ inline constexpr uint32_t kHicacheTmaMaxMapRowBytes = 256 * 8;
 
 // Rows per chunk: largest power of two that fits the stage, so chunks never
 // straddle a (power-of-two) page and a page run stays one bulk op.
-__host__ __device__ constexpr uint32_t hicache_tma_rows_per_chunk(uint32_t stage_bytes, uint32_t row_bytes) {
+SGL_DEVICE_HOST constexpr uint32_t hicache_tma_rows_per_chunk(uint32_t stage_bytes, uint32_t row_bytes) {
   uint32_t rows = 1;
   while (rows * 2 <= stage_bytes / row_bytes && rows * 2 <= kHicacheTmaMaxRows)
     rows *= 2;
@@ -438,16 +439,12 @@ struct HiCacheTmaKernel {
         (params.has_v ? 2u : 1u) * params.num_layers * div_ceil(params.length, rows_per_chunk(params.row_bytes));
     constexpr std::size_t kSmemBytes = sizeof(Smem);
 
-    static const bool attr_set = [] {
-      for (auto fn : {kernel<int32_t>, kernel<int64_t>}) {
-        RuntimeDeviceCheck(
-            cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kSmemBytes)));
-      }
-      return true;
-    }();
-    (void)attr_set;
-    LaunchKernel(std::min(chunks, kBlockQuota), kThreads, device, kSmemBytes)(
-        use_int32 ? kernel<int32_t> : kernel<int64_t>, params);
+    runtime::init_per_device(device, [=] {
+      runtime::set_max_dynamic_smem(kernel<int32_t>, kSmemBytes);
+      runtime::set_max_dynamic_smem(kernel<int64_t>, kSmemBytes);
+    });
+    const auto fn = use_int32 ? kernel<int32_t> : kernel<int64_t>;
+    LaunchKernel(std::min(chunks, kBlockQuota), kThreads, device, kSmemBytes)(fn, params);
   }
 
   // Cache operand viewed as [-1, D] rows; binds row dim, stride and dtype.

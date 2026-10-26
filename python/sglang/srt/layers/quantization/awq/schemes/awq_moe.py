@@ -133,6 +133,9 @@ class AWQMoEScheme(AWQMoESchemeBase):
         self.moe_runner_config = moe_runner_config
         self.kernel.runner = MoeRunner(MoeRunnerBackend.MARLIN, moe_runner_config)
 
+    def get_moe_runner_backend(self, layer):
+        return self.kernel.runner.runner_backend
+
     def apply_weights(
         self,
         layer: torch.nn.Module,
@@ -167,6 +170,9 @@ class AWQAscendMoEScheme(AWQMoEScheme):
         if backend.is_auto():
             backend = MoeRunnerBackend.ASCEND
         self.runner = MoeRunner(backend, moe_runner_config)
+
+    def get_moe_runner_backend(self, layer):
+        return self.runner.runner_backend
 
     def apply_weights(
         self,

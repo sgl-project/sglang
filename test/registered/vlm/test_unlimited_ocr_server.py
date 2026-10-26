@@ -15,6 +15,8 @@ class TestUnlimitedOCRServer(TestOpenAIMLLMServerBase):
     model = "baidu/Unlimited-OCR"
     trust_remote_code = False
     extra_args = [
+        # Pin the revision before the 2026-10-14 HF update renamed model_type.
+        "--revision=07dea832e22aefee32ad281d4b80551282e1c168",
         "--attention-backend=fa3",
         "--page-size=1",
         "--context-length=4096",

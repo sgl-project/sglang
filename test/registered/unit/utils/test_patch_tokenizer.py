@@ -5,6 +5,7 @@ from contextlib import contextmanager
 from transformers import AutoTokenizer
 
 from sglang.srt.utils.patch_tokenizer import (
+    _PadPaddingSideShim,
     _SpecialTokensCachePatcher,
     decode_without_hf_kwargs,
     unpatch_tokenizer,
@@ -164,6 +165,113 @@ class TestPatchTokenizerUnitTest(unittest.TestCase):
             "a<special>b",
         )
         self.assertEqual(tokenizer.decode_calls, [[1, 2], [1, 99, 2]])
+
+
+class TestPadPaddingSideShimUnitTest(unittest.TestCase):
+    def test_patch_unpatch_restores_original(self):
+        tokenizer = _FakeStaleTokenizer()
+        cls = type(tokenizer)
+        original_pad = cls._pad
+
+        _PadPaddingSideShim.patch(tokenizer)
+        self.addCleanup(unpatch_tokenizer, tokenizer)
+        self.assertTrue(getattr(cls, "_sglang_pad_padding_side_patched", False))
+        self.assertIsNot(cls._pad, original_pad)
+
+        unpatch_tokenizer(tokenizer)
+        self.assertFalse(getattr(cls, "_sglang_pad_padding_side_patched", False))
+        self.assertIs(cls._pad, original_pad)
+
+    def test_double_patch_is_idempotent(self):
+        tokenizer = _FakeStaleTokenizer()
+        cls = type(tokenizer)
+
+        _PadPaddingSideShim.patch(tokenizer)
+        self.addCleanup(unpatch_tokenizer, tokenizer)
+        patched_once = cls._pad
+        _PadPaddingSideShim.patch(tokenizer)
+
+        self.assertIs(cls._pad, patched_once)
+        self.assertTrue(getattr(cls, "_sglang_pad_padding_side_patched", False))
+
+    def test_patch_applies_to_all_instances_of_the_class(self):
+        tokenizer_a = _FakeStaleTokenizer(padding_side="left")
+        tokenizer_b = _FakeStaleTokenizer(padding_side="right")
+        self.assertIs(type(tokenizer_a), type(tokenizer_b))
+
+        _PadPaddingSideShim.patch(tokenizer_a)
+        try:
+            self.assertTrue(
+                getattr(type(tokenizer_b), "_sglang_pad_padding_side_patched", False)
+            )
+
+            tokenizer_a._pad({"input_ids": [1]})
+            tokenizer_b._pad({"input_ids": [2]})
+
+            self.assertEqual(tokenizer_a.pad_calls[-1][1], "left")
+            self.assertEqual(tokenizer_b.pad_calls[-1][1], "right")
+        finally:
+            unpatch_tokenizer(tokenizer_a)
+
+    def test_per_call_padding_side_override_applied_and_restored(self):
+        tokenizer = _FakeStaleTokenizer(padding_side="right")
+        _PadPaddingSideShim.patch(tokenizer)
+        try:
+            tokenizer._pad({"input_ids": [1]}, padding_side="left")
+            self.assertEqual(tokenizer.pad_calls[-1][1], "left")
+            self.assertEqual(tokenizer.padding_side, "right")
+        finally:
+            unpatch_tokenizer(tokenizer)
+
+    def test_padding_side_override_matching_default_is_noop(self):
+        tokenizer = _FakeStaleTokenizer(padding_side="right")
+        _PadPaddingSideShim.patch(tokenizer)
+        try:
+            tokenizer._pad({"input_ids": [1]}, padding_side="right")
+            self.assertEqual(tokenizer.pad_calls[-1][1], "right")
+            self.assertEqual(tokenizer.padding_side, "right")
+        finally:
+            unpatch_tokenizer(tokenizer)
+
+    def test_none_padding_side_passes_through(self):
+        tokenizer = _FakeStaleTokenizer(padding_side="right")
+        _PadPaddingSideShim.patch(tokenizer)
+        try:
+            tokenizer._pad({"input_ids": [1]})
+            self.assertEqual(tokenizer.pad_calls[-1][1], "right")
+        finally:
+            unpatch_tokenizer(tokenizer)
+
+    def test_padding_side_restored_after_pad_raises(self):
+        tokenizer = _FakeRaisingTokenizer(padding_side="right")
+        _PadPaddingSideShim.patch(tokenizer)
+        try:
+            with self.assertRaises(RuntimeError):
+                tokenizer._pad(padding_side="left")
+            self.assertEqual(tokenizer.padding_side, "right")
+        finally:
+            unpatch_tokenizer(tokenizer)
+
+
+class _FakeStaleTokenizer:
+    """Stand-in for a custom remote-code tokenizer whose _pad() predates
+    transformers forwarding padding_side -- no padding_side param, no **kwargs."""
+
+    def __init__(self, padding_side="right"):
+        self.padding_side = padding_side
+        self.pad_calls = []
+
+    def _pad(self, encoded_inputs, max_length=None):
+        self.pad_calls.append((encoded_inputs, self.padding_side))
+        return encoded_inputs
+
+
+class _FakeRaisingTokenizer:
+    def __init__(self, padding_side="right"):
+        self.padding_side = padding_side
+
+    def _pad(self, *args, **kwargs):
+        raise RuntimeError("boom")
 
 
 def _get_class_attr_ids(cls):

@@ -13,8 +13,8 @@ from sglang.srt.configs.deepseekvl2 import (
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
+    pad_mm_tokens,
 )
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -156,16 +156,29 @@ class DeepseekVL2MlpProjector(nn.Module):
         return x
 
 
+def _fused_moe_text_config(hf_config):
+    """Return the nested fusable MoE config, or None for other branches."""
+    language_config = hf_config.language_config
+    return language_config if language_config.use_mla else None
+
+
 class DeepseekVL2ForCausalLM(nn.Module):
     @staticmethod
     def shared_experts_fusion_disable_reason(hf_config, quant_config):
-        language_config = hf_config.language_config
-        if not language_config.use_mla:
+        text_config = _fused_moe_text_config(hf_config)
+        if text_config is None:
             return None
         # The language model is built without a quantization config.
         return DeepseekV2ForCausalLM.shared_experts_fusion_disable_reason(
-            language_config, None
+            text_config, None
         )
+
+    @staticmethod
+    def num_fusable_shared_experts(hf_config) -> int:
+        text_config = _fused_moe_text_config(hf_config)
+        if text_config is None:
+            return 0
+        return DeepseekV2ForCausalLM.num_fusable_shared_experts(text_config)
 
     def __init__(
         self,
@@ -264,8 +277,7 @@ class DeepseekVL2ForCausalLM(nn.Module):
                 weights_loader(param, loaded_weight)
 
     def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
-        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
-        return pattern.pad_input_tokens(input_ids, mm_inputs)
+        return pad_mm_tokens(input_ids, mm_inputs)
 
     def get_image_feature(self, items: List[MultimodalDataItem]):
 

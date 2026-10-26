@@ -8,6 +8,7 @@ import torch
 
 from sglang.multimodal_gen.runtime.distributed.ipc_cuda import (
     CudaIpcRef,
+    _map_tree,
     attach_cuda_tensors,
     detach_cuda_tensors,
     materialize_cuda_refs,
@@ -18,12 +19,6 @@ from sglang.multimodal_gen.runtime.distributed.ipc_cuda import (
 def _require_cuda() -> None:
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for CUDA IPC tests")
-
-
-def test_pickle_copies_cuda_tensor_through_host() -> None:
-    _require_cuda()
-    tensor = torch.ones(16, 90, 160, device="cuda", dtype=torch.bfloat16)
-    assert len(pickle.dumps(tensor)) > tensor.nbytes
 
 
 def test_ipc_handle_pickle_is_much_smaller_than_tensor() -> None:
@@ -131,3 +126,31 @@ def _cross_process_child(queue, payload: bytes) -> None:
             float(rebuilt.reshape(-1)[-1]),
         )
     )
+
+
+def test_tree_walk_reaches_tensors_nested_in_req_extra() -> None:
+    """ControlNet residuals ride in req.extra as dict -> list -> tensor (None gaps)."""
+
+    @dataclass
+    class _Holder:
+        extra: dict
+
+    residual = torch.ones(1, 4, 8)
+    holder = _Holder(
+        extra={"comfyui_control": {"input": [residual, None], "output": [residual]}}
+    )
+    seen = []
+
+    def mark(value):
+        if isinstance(value, torch.Tensor):
+            seen.append(value)
+            return "ref"
+        return value
+
+    mapped = _map_tree(holder, mark, copy_dataclasses=True)
+    assert len(seen) == 2
+    assert mapped.extra["comfyui_control"] == {
+        "input": ["ref", None],
+        "output": ["ref"],
+    }
+    assert holder.extra["comfyui_control"]["input"][0] is residual

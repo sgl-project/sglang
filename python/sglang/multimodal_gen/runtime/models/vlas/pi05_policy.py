@@ -124,6 +124,7 @@ class Pi05PolicyModel(nn.Module):
         device: torch.device,
         dtype: torch.dtype,
         manifest: Pi05CheckpointManifest,
+        quantization_config: dict | None = None,
     ):
         super().__init__()
         self.config = config
@@ -151,6 +152,37 @@ class Pi05PolicyModel(nn.Module):
                 runtime_role=self.runtime_role,
                 prefix_tensor_parallel=prefix_tensor_parallel,
             )
+        self._fp8_projection_names = []
+        if quantization_config is not None:
+            from sglang.multimodal_gen.runtime.vla.pi05_quantization import (
+                replace_projections,
+                validate_quantization_config,
+            )
+
+            components = validate_quantization_config(quantization_config)
+            if (
+                self.runtime_role != "all"
+                or prefix_tensor_parallel
+                or (
+                    model_parallel_is_initialized()
+                    and get_sequence_parallel_world_size() > 1
+                )
+                or any(
+                    value
+                    for key, value in vars(config).items()
+                    if key.startswith("offload_") and not key.endswith("empty_cache")
+                )
+                or device.type != "cuda"
+                or current_platform.is_rocm()
+                or torch.cuda.get_device_capability(device) < (8, 9)
+                or dtype != torch.bfloat16
+            ):
+                raise ValueError(
+                    "Pi0.5 ModelOpt FP8 requires single-GPU resident BF16 inference"
+                )
+            self._fp8_projection_names = replace_projections(
+                self.core_model, components, quantized=True
+            )
         self.core_model.eval()
         if device.type == "cuda":
             if self._use_componentwise_empty_init():
@@ -167,6 +199,12 @@ class Pi05PolicyModel(nn.Module):
             self._load_weights()
             self.core_model.to(device)
             self._set_prefix_output_device()
+        if self._fp8_projection_names:
+            from sglang.multimodal_gen.runtime.vla.pi05_quantization import (
+                finalize_fp8_weights,
+            )
+
+            finalize_fp8_weights(self.core_model, self._fp8_projection_names)
         if self.runtime_role != "all":
             logger.info("Pi05 split runtime role on rank: %s", self.runtime_role)
         self.action_expert = Pi05ActionExpert(config, self.core_model)
@@ -444,6 +482,11 @@ class Pi05PolicyModel(nn.Module):
             allow_patterns=["*.json", "*.model", "*.safetensors", "*.txt"],
         )
         cls._apply_checkpoint_config(local_path, config)
+        config_path = Path(local_path) / "config.json"
+        quantization_config = None
+        if config_path.exists():
+            with config_path.open(encoding="utf-8") as f:
+                quantization_config = json.load(f).get("quantization_config")
         device = torch.device(current_platform.device_type)
         dtype = dtype or cls._dtype_from_config(config.materialize_dtype)
         manifest = cls._inspect_checkpoint(local_path, config)
@@ -459,6 +502,7 @@ class Pi05PolicyModel(nn.Module):
             device=device,
             dtype=dtype,
             manifest=manifest,
+            quantization_config=quantization_config,
         )
 
     @staticmethod
@@ -775,6 +819,13 @@ class Pi05PolicyModel(nn.Module):
                     unexpected += 1
                     continue
                 target_key, shard_id = target_weight
+                if target_key.endswith(".weight") and target_key[:-7] in getattr(
+                    self, "_fp8_projection_names", []
+                ):
+                    if shard_id is not None or tensor.dtype != torch.float8_e4m3fn:
+                        raise ValueError(
+                            "Pi0.5 FP8 requires fused E4M3 checkpoint weights"
+                        )
                 target = self._target_tensor_for_key(
                     target_key,
                     target_state,

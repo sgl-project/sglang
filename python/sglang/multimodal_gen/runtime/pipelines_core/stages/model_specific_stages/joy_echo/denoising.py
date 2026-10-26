@@ -34,6 +34,14 @@ class JoyEchoDMDDenoisingStage(LTX2AVDenoisingStage):
         server_args: ServerArgs,
     ) -> LTX2DenoisingContext:
         ctx = super()._prepare_denoising_loop(batch, server_args)
+        # fp32 host and device copies of the sigma schedule; steps read the host one
+        sigmas = ctx.scheduler.sigmas
+        if not isinstance(sigmas, torch.Tensor):
+            raise ValueError("Expected scheduler.sigmas to be a tensor for JoyEcho.")
+        ctx.extra["joy_echo_sigmas"] = (
+            sigmas.to(device="cpu", dtype=torch.float32),
+            sigmas.to(device=ctx.latents.device, dtype=torch.float32),
+        )
         if get_sp_world_size() <= 1:
             return ctx
         # JoyEcho DMD: shard video on time, replicate full audio on every rank.
@@ -98,6 +106,7 @@ class JoyEchoDMDDenoisingStage(LTX2AVDenoisingStage):
             seq_len=seq_v,
             batch_size=batch_size,
             key="sp_video_valid_token_count",
+            has_padding=batch.sp_video_has_padding,
             device=model_inputs.latent_model_input.device,
         )
         video_coords = server_args.pipeline_config.prepare_video_rope_coords_for_sp(
@@ -129,6 +138,7 @@ class JoyEchoDMDDenoisingStage(LTX2AVDenoisingStage):
                 seq_len=seq_a,
                 batch_size=batch_size,
                 key="sp_audio_valid_token_count",
+                has_padding=batch.sp_audio_has_padding,
                 device=model_inputs.audio_latent_model_input.device,
             )
             audio_coords = server_args.pipeline_config.prepare_audio_rope_coords_for_sp(
@@ -293,6 +303,58 @@ class JoyEchoDMDDenoisingStage(LTX2AVDenoisingStage):
         if not memory_info:
             return model_inputs, {}
 
+        # the memory prefix, its masks and RoPE coords are fixed for the loop
+        key = (
+            int(model_inputs.latent_model_input.shape[1]),
+            int(model_inputs.audio_latent_model_input.shape[1]),
+            step_model,
+        )
+        cached = ctx.extra.get("joy_echo_memory_prefix")
+        if cached is None or cached[0] != key:
+            cached = (
+                key,
+                self._build_memory_prefix(
+                    model_inputs, batch, ctx, server_args, step_model, memory_info
+                ),
+            )
+            ctx.extra["joy_echo_memory_prefix"] = cached
+        memory_video, memory_audio, memory_inputs, memory_meta = cached[1]
+        return (
+            LTX2ModelInputs(
+                latent_model_input=torch.cat(
+                    [memory_video, model_inputs.latent_model_input], dim=1
+                ),
+                audio_latent_model_input=torch.cat(
+                    [memory_audio, model_inputs.audio_latent_model_input], dim=1
+                ),
+                timestep_video=self._apply_memory_prefix_to_timestep(
+                    model_inputs.timestep_video,
+                    memory_seq_len=memory_meta["memory_video_len"],
+                    target_seq_len=key[0],
+                ),
+                timestep_audio=self._apply_memory_prefix_to_timestep(
+                    model_inputs.timestep_audio,
+                    memory_seq_len=memory_meta["memory_audio_len"],
+                    target_seq_len=key[1],
+                ),
+                prompt_timestep_video=model_inputs.prompt_timestep_video,
+                prompt_timestep_audio=model_inputs.prompt_timestep_audio,
+                **memory_inputs,
+            ),
+            memory_meta,
+        )
+
+    def _build_memory_prefix(
+        self,
+        model_inputs: LTX2ModelInputs,
+        batch: Req,
+        ctx: LTX2DenoisingContext,
+        server_args: ServerArgs,
+        step_model,
+        memory_info: dict,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict, dict]:
+        """Step-independent memory inputs: the video/audio prefixes, the remaining
+        LTX2ModelInputs fields (masks, RoPE coords) and the DiT memory kwargs."""
         memory_video = memory_info["memory_video_packed"].to(
             device=model_inputs.latent_model_input.device,
             dtype=model_inputs.latent_model_input.dtype,
@@ -317,22 +379,8 @@ class JoyEchoDMDDenoisingStage(LTX2AVDenoisingStage):
         else:
             num_memory_slots = memory_video_len // tokens_per_latent_frame
 
-        latent_model_input = torch.cat([memory_video, target_video], dim=1)
-        audio_latent_model_input = torch.cat([memory_audio, target_audio], dim=1)
-
-        timestep_video = self._apply_memory_prefix_to_timestep(
-            model_inputs.timestep_video,
-            memory_seq_len=memory_video_len,
-            target_seq_len=target_video_len,
-        )
-        timestep_audio = self._apply_memory_prefix_to_timestep(
-            model_inputs.timestep_audio,
-            memory_seq_len=memory_audio_len,
-            target_seq_len=target_audio_len,
-        )
-
-        device = latent_model_input.device
-        batch_size = int(latent_model_input.shape[0])
+        device = target_video.device
+        batch_size = int(target_video.shape[0])
 
         sp_world_size = get_sp_world_size()
         sp_on = sp_world_size > 1 and batch.did_sp_shard_latents
@@ -422,16 +470,12 @@ class JoyEchoDMDDenoisingStage(LTX2AVDenoisingStage):
         )
 
         return (
-            LTX2ModelInputs(
-                latent_model_input=latent_model_input,
-                audio_latent_model_input=audio_latent_model_input,
+            memory_video,
+            memory_audio,
+            dict(
                 audio_num_frames_latent=memory_audio_len + target_audio_len,
                 video_coords=video_coords,
                 audio_coords=audio_coords,
-                timestep_video=timestep_video,
-                timestep_audio=timestep_audio,
-                prompt_timestep_video=model_inputs.prompt_timestep_video,
-                prompt_timestep_audio=model_inputs.prompt_timestep_audio,
                 video_self_attention_mask=video_self_attention_mask,
                 audio_self_attention_mask=audio_self_attention_mask,
                 a2v_cross_attention_mask=a2v_mask,
@@ -458,18 +502,11 @@ class JoyEchoDMDDenoisingStage(LTX2AVDenoisingStage):
         if ctx.audio_scheduler is None:
             raise ValueError("JoyEcho audio scheduler was not prepared.")
 
-        sigmas = ctx.scheduler.sigmas
-        if not isinstance(sigmas, torch.Tensor):
-            raise ValueError("Expected scheduler.sigmas to be a tensor for JoyEcho.")
-
-        sigma = sigmas[step.step_index].to(
-            device=ctx.latents.device, dtype=torch.float32
-        )
-        sigma_next = sigmas[step.step_index + 1].to(
-            device=ctx.latents.device, dtype=torch.float32
-        )
-        sigma_val = float(sigma.item())
-        sigma_next_val = float(sigma_next.item())
+        sigmas_host, sigmas_device = ctx.extra["joy_echo_sigmas"]
+        sigma = sigmas_device[step.step_index]
+        sigma_next = sigmas_device[step.step_index + 1]
+        sigma_val = float(sigmas_host[step.step_index])
+        sigma_next_val = float(sigmas_host[step.step_index + 1])
 
         model_inputs = self._prepare_ltx2_model_inputs(
             ctx, step, batch, server_args, sigma
