@@ -105,6 +105,21 @@ def check_watermark_server_args(server_args: Any) -> None:
         raise ValueError("--enable-watermark is not supported with SGLANG_RUST_SERVER")
 
 
+def check_weightbridge_receiver_args(server_args: Any) -> None:
+    cfg = resolving_view(server_args)
+    if not cfg.enable_weightbridge_receiver:
+        return
+    # The receiver counts one worker per TP rank under a single-node rank0 hub.
+    if cfg.pp_size != 1 or cfg.dp_size != 1 or cfg.nnodes != 1:
+        raise ValueError(
+            "--enable-weightbridge-receiver supports a single-node engine with pp_size == dp_size == 1"
+        )
+    if cfg.disaggregation_mode != "null":
+        raise ValueError(
+            "--enable-weightbridge-receiver does not support PD disaggregation"
+        )
+
+
 def validate_response_store(server_args: Any) -> None:
     cfg = resolving_view(server_args)
     if cfg.enable_response_store and cfg.disaggregation_mode != "null":
@@ -376,6 +391,8 @@ def check_server_args(server_args: Any):
         )
 
     check_watermark_server_args(server_args)
+
+    check_weightbridge_receiver_args(server_args)
 
     check_load_publish_args(server_args)
 

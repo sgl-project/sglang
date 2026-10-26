@@ -65,6 +65,16 @@ class ExecFeatures(msgspec.Struct):
         bool,
         "Save draft model weights to CPU memory during release_weights_occupation and resume_weights_occupation",
     ] = False
+    enable_weightbridge_receiver: A[
+        bool,
+        "Receive trainer weight updates through WeightBridge (requires the wbridge package): every TP rank "
+        "builds a receiver at startup and polls it from the scheduler loop, so updates need no HTTP request.",
+    ] = False
+    weightbridge_pause_mode: A[
+        Literal["retract", "abort"],
+        "How a WeightBridge update clears in-flight requests before writing weights: 'retract' requeues them "
+        "to recompute under the new weights, 'abort' finishes them with an abort.",
+    ] = "retract"
     enable_custom_logit_processor: A[
         bool,
         "Enable users to pass custom logit processors to the server (disabled by default for security)",
