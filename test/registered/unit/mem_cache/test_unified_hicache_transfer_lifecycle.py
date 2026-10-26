@@ -67,13 +67,17 @@ FULL, SWA = ComponentType.FULL, ComponentType.SWA
 
 
 def _python_inspector(params, components):
-    from unified_tree_core_inspector import UnifiedTreeCoreInspector
+    from sglang.test.kits.unified_radix_cache.unified_tree_core_inspector import (
+        UnifiedTreeCoreInspector,
+    )
 
     return UnifiedTreeCoreInspector(params, components)
 
 
 def _rust_inspector(params, _components):
-    from rust_unified_tree_core_inspector import RustUnifiedTreeCoreInspector
+    from sglang.test.kits.unified_radix_cache.rust_unified_tree_core_inspector import (
+        RustUnifiedTreeCoreInspector,
+    )
 
     return RustUnifiedTreeCoreInspector(params)
 
@@ -194,12 +198,15 @@ class TestPhysicalReservation(_ConfigCase):
         # The node being loaded: its FULL rows are resident, SWA is tombstoned.
         target = allocator.alloc(2 * PAGE)
         allocator.free_swa(target)
-        allocator.free(gap)
 
+        # The reservation takes the only free SWA rows, at the band's end.
         reserved = swa.alloc_physical(2 * PAGE)
         # Stand in for the H2D copy into the reserved rows.
         rows.swa[reserved] = rows.markers(300, 2 * PAGE)
         allocator.set_full_to_swa_mapping(target, reserved)
+        # An interior hole left after the reservation: once the load is queued,
+        # compaction relocates the reserved rows into it.
+        allocator.free(gap)
 
         moves = []
         _record_moves(allocator, moves)

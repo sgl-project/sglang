@@ -257,7 +257,7 @@ class TestDSAAttentionBackendCorrectness(CustomTestCase):
     # FP8 + `flashmla_sparse` prefill + EXTEND + non-empty prefix is the
     # only combo that hits `TopkTransformMethod.RAGGED`
     # (`get_topk_transform_method`), which exercises
-    # `dequantize_k_cache_paged` and the `topk_indices_offset` shift —
+    # `dequantize_k_cache_paged_dsa` and the `topk_indices_offset` shift —
     # paths that the BF16 default suite never reaches.
     FP8_PREFILL_RAGGED_CASE = DSAAttentionCase(
         name="dsa_sparse_fp8_prefill_ragged_topk",

@@ -4,6 +4,8 @@ from typing import Any, Optional
 import msgspec
 import torch
 
+from sglang.srt.utils.common import async_h2d, is_pin_memory_available
+
 
 class FoldedExtend(msgspec.Struct, frozen=True):
     """An extend batch whose prefix hits start at their replay start."""
@@ -12,7 +14,6 @@ class FoldedExtend(msgspec.Struct, frozen=True):
     keep_rows: torch.Tensor  # [original rows] int64, folded-row index of each
     scheduled_row: torch.Tensor  # [folded rows] int64, original row, -1 if replayed
     row_floor: torch.Tensor  # [folded rows] int64
-    compress_skip: torch.Tensor  # [bs] int32, leading replay rows per request
     replay_lens: list[int]  # [bs] leading replay rows per request
     num_rows: int
 
@@ -29,11 +30,23 @@ def fold_encoder_swa_replay(worker, batch) -> Optional[FoldedExtend]:
     return _fold_batch(batch=batch, runner=runner, rows=rows)
 
 
+def resets_swa_window(req) -> bool:
+    """Whether this step starts the request's SWA window: a new request slot or a
+    retraction. The prefill budget and `encoder_swa_reset` both read this."""
+    return req.kv.req_pool_idx is None or req.is_retracted
+
+
+def replay_len(prefix_len: int) -> int:
+    """Cached tokens replayed in front of a hit's extend: the last SWA window.
+    The prefill budget, the MLP-sync row count and the fold all read this."""
+    return min(prefix_len, 128)
+
+
 def folded_replay_rows(batch) -> int:
     if not batch.forward_mode.is_extend_without_speculative():
         return 0
     return sum(
-        min(end, 128)
+        replay_len(end)
         for reset, end in zip(batch.encoder_swa_reset, batch.prefix_lens)
         if reset
     )
@@ -41,19 +54,21 @@ def folded_replay_rows(batch) -> int:
 
 def apply_folded_extend(folded: FoldedExtend, forward_batch) -> None:
     forward_batch.encoder_swa_row_floor = folded.row_floor
-    forward_batch.encoder_swa_compress_skip = folded.compress_skip
     forward_batch.encoder_swa_compress_rows = folded.keep_rows
 
 
-def drop_folded_rows(*, logits_output, folded: FoldedExtend) -> None:
+def drop_folded_rows(
+    *, logits_output, folded: FoldedExtend, tail_lens: Optional[list[int]] = None
+) -> None:
     """Hand downstream consumers (the DSpark draft) only the original extend rows."""
     hidden = logits_output.hidden_states
     token_indices = logits_output.hidden_states_token_indices
     if token_indices is not None:
         # Decoder-SWA tail rows index the folded extend; keep those on original rows.
         keep = _tail_rows_on_original(
-            folded=folded, num_tail_rows=token_indices.shape[0]
-        ).to(token_indices.device, non_blocking=True)
+            folded=folded, tail_lens=tail_lens, num_tail_rows=token_indices.shape[0]
+        )
+        keep = _to_device(keep, token_indices.device)
         logits_output.hidden_states_token_indices = folded.scheduled_row[
             token_indices[keep]
         ]
@@ -64,13 +79,11 @@ def drop_folded_rows(*, logits_output, folded: FoldedExtend) -> None:
         logits_output.hidden_states = hidden[folded.keep_rows]
 
 
-def _tail_rows_on_original(*, folded: FoldedExtend, num_tail_rows: int):
-    # Each request's tail is its last SWA_WINDOW folded rows; replay rows lead it.
-    from sglang.srt.layers.attention.deepseek_v4_backend import SWA_WINDOW
-
+def _tail_rows_on_original(
+    *, folded: FoldedExtend, tail_lens: list[int], num_tail_rows: int
+):
     keep, off = [], 0
-    for n, r in zip(folded.batch.extend_lens, folded.replay_lens):
-        tail = min(SWA_WINDOW, n)
+    for n, r, tail in zip(folded.batch.extend_lens, folded.replay_lens, tail_lens):
         keep.append(torch.arange(off + max(0, tail - (n - r)), off + tail))
         off += tail
     assert off == num_tail_rows, (off, num_tail_rows)
@@ -90,6 +103,7 @@ def run_encoder_swa_replay(worker, batch):
     rows = _reset_windows_and_collect_hits(batch=batch, window=window)
     if not rows:
         return
+    assert batch.engram_staged_rows is None, "staged engram rows need a folded replay"
     # One forward replays every hitting request; each request's window is
     # floored at its own start, so the result matches per-request replays.
     replay = _build_replay_batch(batch=batch, runner=runner, rows=rows)
@@ -116,7 +130,7 @@ def _reset_windows_and_collect_hits(*, batch, window):
             raise ValueError(
                 "encoder SWA replay requires an even cached-prefix boundary"
             )
-        rows.append((i, max(0, end - 128), end))
+        rows.append((i, end - replay_len(end), end))
     return rows
 
 
@@ -175,9 +189,9 @@ def _engram_history(*, reqs, starts, runner):
     n = hasher.max_ngram_size - 1
     hist = []
     for r, s in zip(reqs, starts):
-        ids = list(r.full_untruncated_fill_ids[max(0, s - n) : s])
-        hist.append([0] * (n - len(ids)) + ids)
-    return torch.tensor(hist, dtype=torch.int32, device=runner.device)
+        ids = r.full_untruncated_fill_ids[max(0, s - n) : s]
+        hist.append(hasher.history_row(ids))
+    return async_h2d(hist, dtype=torch.int32, device=runner.device)
 
 
 def _fold_batch(*, batch, runner, rows) -> FoldedExtend:
@@ -190,16 +204,16 @@ def _fold_batch(*, batch, runner, rows) -> FoldedExtend:
     pre = [p - r for p, r in zip(batch.prefix_lens, replay)]
     new_ext = [x + r for x, r in zip(ext, replay)]
     req_to_token = runner.req_to_token_pool.req_to_token
+    slots = batch.req_pool_indices_cpu.tolist()
     ids, locs, keep, cpu_ids = [], [], [], []
     off = fold_off = 0
     for i, req in enumerate(batch.reqs):
         r, n = replay[i], ext[i]
         if r:
             head = list(req.full_untruncated_fill_ids[pre[i] : pre[i] + r])
-            ids.append(torch.tensor(head, dtype=batch.input_ids.dtype, device=device))
-            locs.append(
-                req_to_token[batch.req_pool_indices[i], pre[i] : pre[i] + r].long()
-            )
+            head_ids = async_h2d(head, dtype=batch.input_ids.dtype, device=device)
+            ids.append(head_ids)
+            locs.append(req_to_token[slots[i], pre[i] : pre[i] + r].long())
             cpu_ids.append(torch.tensor(head, dtype=torch.int64))
         ids.append(batch.input_ids[off : off + n])
         locs.append(batch.out_cache_loc[off : off + n].long())
@@ -235,17 +249,23 @@ def _fold_batch(*, batch, runner, rows) -> FoldedExtend:
     keep_rows = torch.cat(keep)
     scheduled_row = torch.full((fold_off,), -1, dtype=torch.int64)
     scheduled_row[keep_rows] = torch.arange(keep_rows.shape[0])
+    keep_rows = _to_device(keep_rows, device)
+    scheduled_row = _to_device(scheduled_row, device)
+    row_floor = _to_device(row_floor, device)
     return FoldedExtend(
         batch=folded,
-        keep_rows=keep_rows.to(device, non_blocking=True),
-        scheduled_row=scheduled_row.to(device, non_blocking=True),
-        row_floor=row_floor.to(device, non_blocking=True),
-        compress_skip=torch.tensor(replay, dtype=torch.int32).to(
-            device, non_blocking=True
-        ),
+        keep_rows=keep_rows,
+        scheduled_row=scheduled_row,
+        row_floor=row_floor,
         replay_lens=replay,
         num_rows=fold_off,
     )
+
+
+def _to_device(t: torch.Tensor, device) -> torch.Tensor:
+    # A pageable host tensor's copy waits for the stream even with non_blocking.
+    pin = is_pin_memory_available(device)
+    return (t.pin_memory() if pin else t).to(device, non_blocking=pin)
 
 
 def _set_execution_counts(*, batch, scheduled) -> None:

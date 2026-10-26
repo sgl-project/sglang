@@ -40,6 +40,33 @@ from sglang.srt.utils.common import (
 logger = logging.getLogger(__name__)
 
 
+def _flashinfer_a2a_topology_is_supported(
+    *,
+    architecture: str | None,
+    tp_size: int,
+    ep_size: int,
+    attn_dp_size: int,
+    attn_dp_enabled: bool,
+    enable_layernorm_sp: bool,
+) -> bool:
+    """Return whether FlashInfer A2A has a rank-uniform source geometry.
+
+    The ordinary path obtains that geometry from DP attention. Muse prefill
+    sequence parallelism instead assigns one uniform sequence shard to every
+    TP/EP rank, so its dedicated dispatch/combine lifecycle can safely use the
+    same TP4/EP4 or TP8/EP8 process group without enabling DP attention.
+    """
+    if attn_dp_enabled and attn_dp_size == tp_size:
+        return True
+    return (
+        architecture == "MuseSparkForConditionalGeneration"
+        and enable_layernorm_sp
+        and not attn_dp_enabled
+        and attn_dp_size == 1
+        and (tp_size, ep_size) in ((4, 4), (8, 8))
+    )
+
+
 def handle_moe_kernel_config(server_args: Any):
     # The quantization-driven runner resolutions moved to the pipeline
     # (arg_groups/overrides.py: _moe_runner_backend_quant_constraints);
@@ -114,9 +141,10 @@ def handle_moe_kernel_config(server_args: Any):
             "modelopt_fp4",
             "modelopt_mixed",
             "nvfp4_online",
+            "minimax_m3_nvfp4",
             None,
         ], (
-            f"Invalid quantization '{view.quantization}'. \nFlashInfer TRTLLM routed MOE supports only: 'fp8', 'mxfp8', 'modelopt_fp4', 'modelopt_mixed', 'nvfp4_online', or bfloat16 (None)."
+            f"Invalid quantization '{view.quantization}'. \nFlashInfer TRTLLM routed MOE supports only: 'fp8', 'mxfp8', 'modelopt_fp4', 'modelopt_mixed', 'nvfp4_online', 'minimax_m3_nvfp4', or bfloat16 (None)."
         )
 
     # The runner-driven shared-experts fusion disables moved to the
@@ -440,8 +468,20 @@ def handle_a2a_moe(server_args: Any):
         )
 
     if a2a_now == "flashinfer":
-        assert attn_dp_enabled_of(cfg) and cfg.attn_dp_size == cfg.tp_size, (
-            "Flashinfer MoE A2A is only supported with --attn-dp-size equal to --tp-size"
+        view = resolved_view(server_args)
+        architectures = model_config_of(server_args).hf_config.architectures
+        architecture = architectures[0] if architectures else None
+        assert _flashinfer_a2a_topology_is_supported(
+            architecture=architecture,
+            tp_size=cfg.tp_size,
+            ep_size=view.ep_size,
+            attn_dp_size=cfg.attn_dp_size,
+            attn_dp_enabled=attn_dp_enabled_of(cfg),
+            enable_layernorm_sp=view.enable_layernorm_sp,
+        ), (
+            "Flashinfer MoE A2A requires --attn-dp-size equal to --tp-size, "
+            "except for Muse Spark TP4/EP4 or TP8/EP8 prefill "
+            "sequence parallelism."
         )
         if cfg.deepep_mode != "auto":
             logger.warning("--deepep-mode is ignored for Flashinfer MoE A2A")

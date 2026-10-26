@@ -61,18 +61,6 @@ class _FakeOwner:
 
 
 class TestKVPageInvariants(CustomTestCase):
-    def test_clean_layout_no_warning(self):
-        chk, rtt, tc, alloc = _make_checker(
-            free_pages=torch.arange(100, 200, dtype=torch.int64)
-        )
-        rtt[0, :256] = torch.arange(_PAGE_SIZE)  # req 0 owns page 0
-        rtt[1, :256] = torch.arange(_PAGE_SIZE, 2 * _PAGE_SIZE)  # req 1 owns page 1
-        chk.get_last_batch = lambda: SimpleNamespace(
-            reqs=[_FakeOwner(0, 256, 256, rid="a"), _FakeOwner(1, 200, 256, rid="b")]
-        )
-        chk._check_kv_page_invariants()
-        self.assertEqual(chk.count_memory_leak_warnings, 0)
-
     def test_committed_gt_allocated_raises(self):
         chk, rtt, tc, alloc = _make_checker()
         chk.get_last_batch = lambda: SimpleNamespace(

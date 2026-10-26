@@ -32,6 +32,7 @@ import msgspec.structs
 from sglang.srt.arg_groups.validation_hook import check_load_publish_args
 from sglang.srt.entrypoints import http_server
 from sglang.srt.entrypoints.grpc_bridge import RuntimeHandle
+from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.runtime_context import publish, reset_context
@@ -206,6 +207,28 @@ class TestServerInfoTransportParity(CustomTestCase):
                 load.return_value.start_metadata_server.assert_called_once_with(
                     host="127.0.0.1", port=50051, server_info_json=leader_json
                 )
+
+    def test_rust_server_followers_skip_runtime_metadata_server(self):
+        """A follower node hosting a Rust listener must not bind grpc_port a
+        second time; that node's KV publishers are served by the listener."""
+        with (
+            envs.SGLANG_RUST_SERVER.override(True),
+            patch.object(
+                common,
+                "get_serving",
+                return_value=SimpleNamespace(
+                    host="127.0.0.1",
+                    grpc_port=50051,
+                    smg_grpc_mode=False,
+                    grpc_mode=False,
+                ),
+            ),
+            patch("sglang.srt.rust_extensions.load_rust_extension") as load,
+        ):
+            self.assertIsNone(
+                common.start_follower_grpc_server(ServerArgs(model_path="dummy"), {})
+            )
+        load.return_value.start_metadata_server.assert_not_called()
 
 
 class TestServerInfoKvEventsField(CustomTestCase):

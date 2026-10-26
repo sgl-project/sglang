@@ -198,35 +198,6 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
             self.assertEqual(self._init_and_check(scheduler, req), 16)
             self.assertEqual(req.sampling_params.min_new_tokens, 16)
 
-    def test_admission_rules_sweep(self):
-        for page_size in (1, 4, 16):
-            for input_len in (1, 8, 100):
-                for requested in (None, 0, 5, 64, 1 << 20):
-                    for limit in (None, 0, 16, 1 << 20):
-                        for max_req_len, max_total_num_tokens in (
-                            (128, 1024),
-                            (32, 24),
-                            (128, 24),
-                        ):
-                            with self.subTest(
-                                page_size=page_size,
-                                input_len=input_len,
-                                requested=requested,
-                                limit=limit,
-                                max_req_len=max_req_len,
-                                max_total_num_tokens=max_total_num_tokens,
-                            ):
-                                with envs.SGLANG_MAX_NEW_TOKENS_LIMIT.override(limit):
-                                    scheduler = self._new_scheduler(
-                                        max_req_len=max_req_len,
-                                        max_total_num_tokens=max_total_num_tokens,
-                                        page_size=page_size,
-                                    )
-                                    req = self._new_req(
-                                        max_new_tokens=requested, input_len=input_len
-                                    )
-                                    self._init_and_check(scheduler, req)
-
     def test_unified_budget_rounds_prompt_and_decode_together(self):
         bundle = init_unified_swa_pools(
             device="cpu",

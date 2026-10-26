@@ -12,19 +12,21 @@
 # limitations under the License.
 # ==============================================================================
 
-"""Module-scan regressions in LoRAManager.init_lora_modules."""
+"""LoRA attachment and target-validation contracts."""
 
 import sys
 import types
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.lora import lora_manager as lora_manager_module
+from sglang.srt.lora.lora_config import LoRAConfig
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -199,6 +201,70 @@ class TestShouldApplyLoRAGate(CustomTestCase):
         with patch.object(manager, "set_lora_module", side_effect=lambda name, _: name):
             with self.assertRaisesRegex(ValueError, "meta_mlp routed banks"):
                 manager.init_lora_modules()
+
+
+class TestTargetValidation(CustomTestCase):
+    """init_state rejects unsupported targets before any module is wrapped."""
+
+    @staticmethod
+    def _manager(adapter_targets=None):
+        manager = LoRAManager.__new__(LoRAManager)
+        modules = [("model.layers.0.experts", FusedMoE.__new__(FusedMoE))]
+        manager.base_model = SimpleNamespace(named_modules=lambda: modules)
+        manager.configs = {}
+        if adapter_targets is not None:
+            manager.configs["adapter"] = LoRAConfig.from_dict(
+                {"target_modules": adapter_targets, "r": 8, "lora_alpha": 8}
+            )
+        manager.lora_refs = {
+            "adapter": SimpleNamespace(lora_name="adapter", lora_path="/unused")
+        }
+        manager.init_lora_adapters = Mock()
+        manager.lora_backend = Mock()
+        manager.init_lora_modules = Mock()
+        manager.init_memory_pool = Mock()
+        manager.lora_added_tokens_size = None
+        return manager
+
+    @staticmethod
+    def _replicated_q():
+        return patch.object(
+            lora_manager_module,
+            "get_parallel",
+            return_value=SimpleNamespace(dcp_replicate_q_proj=True),
+        )
+
+    def test_normalized_q_target_rejects_replication_before_attachment(self):
+        """Explicit and adapter-inferred q_proj targets hit the same check."""
+        explicit = self._manager()
+        inferred = self._manager("all-linear")
+        inferred.base_model.named_modules().append(
+            ("model.layers.0.q_proj", ReplicatedLinear.__new__(ReplicatedLinear))
+        )
+        for manager, kwargs in (
+            (explicit, dict(target_modules={"q_proj"})),
+            (inferred, dict(lora_paths=[object()])),
+        ):
+            with (
+                self.subTest(**kwargs),
+                self._replicated_q(),
+                self.assertRaisesRegex(ValueError, "Replicated-Q"),
+            ):
+                manager.init_state(max_lora_rank=8, **kwargs)
+            self.assertIn("qkv_proj", manager.target_modules)
+            manager.init_lora_modules.assert_not_called()
+            manager.init_memory_pool.assert_not_called()
+
+    def test_indexer_target_requires_unfused_projection(self):
+        manager = self._manager()
+        manager.base_model.named_modules().append(
+            (
+                "model.layers.0.self_attn.indexer",
+                SimpleNamespace(use_dsa_indexer_fusion=True),
+            )
+        )
+        with self.assertRaisesRegex(ValueError, "DSA indexer Q/K fusion"):
+            manager.init_lora_shapes(max_lora_rank=8, target_modules={"wk"})
 
 
 if __name__ == "__main__":

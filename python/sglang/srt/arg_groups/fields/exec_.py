@@ -43,12 +43,14 @@ class ExecFeatures(msgspec.Struct):
         "If set, the LM head outputs (logits) are in FP32.",
     ] = False
     enable_tf32_matmul: A[
-        bool,
+        Optional[bool],
         Arg(
-            help="Enable float32 matmuls to use TensorFloat32 precision for better performance (via torch.set_float32_matmul_precision). CUDA only.",
+            help="Enable float32 matmuls to use TensorFloat32 precision for better performance (via torch.set_float32_matmul_precision). CUDA only. Defaults to the model's preference, otherwise disabled.",
+            action=argparse.BooleanOptionalAction,
             resolvable=True,
+            fallback=False,
         ),
-    ] = False
+    ] = None
 
     # -------------------------------------------------------------------------
     # Misc runtime features
@@ -137,9 +139,10 @@ class ExecFeatures(msgspec.Struct):
         Optional[bool],
         Arg(
             help="Enable DeepSeek-V4.1 decoder SWA bounded replay. Defaults on "
-            "for supported configurations. Use --no-enable-decoder-swa-bounded-replay "
-            "to retain full prefill or request prompt logprobs. "
-            "Not numerically equivalent to full prefill.",
+            "for supported configurations. Not numerically equivalent to full "
+            "prefill; requests for prompt logprobs compute every prompt row. Use "
+            "--no-enable-decoder-swa-bounded-replay to retain full prefill, e.g. "
+            "for RL rollouts whose logprobs must match the trainer.",
             action=argparse.BooleanOptionalAction,
             resolvable=True,
         ),
@@ -189,10 +192,14 @@ class ExecKernel(msgspec.Struct):
         Optional[bool],
         "Enable Lean (Work-Centric) Attention decode kernel for long-context serving. When None (default), uses auto-gate that activates Lean for long contexts and falls back to standard kernel for short contexts. Set to True to force enable, False to force disable.",
     ] = None
-    monokernel_backend: A[
-        Optional[str],
-        "Select a registered monokernel backend, e.g. amd from sgl-amd-mono. Supported decode and verify steps use persistent kernels; other steps use the standard forward. An unsupported startup configuration raises an error listing the reasons. Experimental feature.",
-    ] = None
+    enable_nvidia_megakernel: A[
+        bool,
+        "Enable the NVIDIA megakernel from the sgl-nvidia-mega package. Supported decode and verify steps use its fused kernels; other steps use the standard forward. An unsupported startup configuration raises an error listing the reasons. Experimental feature.",
+    ] = False
+    enable_amd_monokernel: A[
+        bool,
+        "Enable the AMD monokernels from the sgl-amd-mono package. Supported decode and verify steps use persistent kernels; other steps use the standard forward. An unsupported startup configuration raises an error listing the reasons. Experimental feature.",
+    ] = False
     prefill_attention_backend: A[
         Optional[str],
         Arg(
@@ -359,8 +366,7 @@ class ExecKernel(msgspec.Struct):
         Arg(
             help=(
                 "FlashInfer custom-op identifiers to skip during autotuning. "
-                "Skipped ops use FlashInfer's heuristic fallback. SGLang "
-                "temporarily skips mxfp8_gemm by default due to an IMA."
+                "Skipped ops use FlashInfer's heuristic fallback."
             ),
             nargs="+",
         ),
@@ -382,8 +388,16 @@ class ExecKernel(msgspec.Struct):
         bool, "Not using ragged prefill wrapper when running flashinfer mla"
     ] = False
     enable_fused_qk_norm_rope: A[
-        bool, "Enable fused qk normalization and rope rotary embedding."
-    ] = False
+        Optional[bool],
+        Arg(
+            help="Fuse q/k normalization and rope rotary embedding into one "
+            "kernel. By default this is enabled on XPU and disabled elsewhere. "
+            "Pass --enable-fused-qk-norm-rope or --no-enable-fused-qk-norm-rope "
+            "to force it either way.",
+            action=argparse.BooleanOptionalAction,
+            resolvable=True,
+        ),
+    ] = None
     enable_precise_embedding_interpolation: A[
         bool,
         "Enable corner alignment for resize of embeddings grid to ensure more accurate(but slower) evaluation of interpolated embedding values.",
@@ -942,8 +956,25 @@ class ExecMoe(msgspec.Struct):
     ] = False
     enforce_shared_experts_fusion: A[
         bool,
-        "Enforce shared experts fusion even when it would normally be disabled (e.g. under DeepEP). Mutually exclusive with --disable-shared-experts-fusion.",
+        "Enforce shared experts fusion even when it would normally be disabled (e.g. under DeepEP). On a Quark MXFP4 Qwen3.5/Qwen3.8 checkpoint that excludes its shared expert from quantization, this also quantizes that shared expert to MXFP4 while loading so it can be fused, which runs its weights and its input activations at MXFP4 where the standalone path ran in BF16 - validate accuracy before using it. Mutually exclusive with --disable-shared-experts-fusion.",
     ] = False
+
+    # -------------------------------------------------------------------------
+    # Paged experts
+    # -------------------------------------------------------------------------
+    enable_paged_experts: A[
+        bool,
+        "Keep only --paged-experts-num-resident routed experts per MoE layer on the GPU and page "
+        "the rest from pinned host memory on demand. Single GPU; the experts must run on the "
+        "triton or Marlin MoE runner (supported quantizations: see the Paged Experts docs). "
+        "Decode CUDA graphs (full backend) are captured up to K // top_k requests; prefill "
+        "graphs must be breakable or disabled.",
+    ] = False
+    paged_experts_num_resident: A[
+        Optional[int],
+        "Number of routed experts per MoE layer kept resident on the GPU. Required with "
+        "--enable-paged-experts; at least the router's top-k.",
+    ] = None
 
     # -------------------------------------------------------------------------
     # Ktransformers/AMX expert parallelism

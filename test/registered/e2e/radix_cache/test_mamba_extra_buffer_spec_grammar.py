@@ -88,7 +88,10 @@ class TestMambaExtraBufferSpecGrammar(CustomTestCase):
         return response.json()
 
     def _flush_cache(self):
-        requests.post(self.base_url + "/flush_cache", timeout=60).raise_for_status()
+        # A generation response can arrive before the scheduler becomes idle.
+        requests.post(
+            self.base_url + "/flush_cache", params={"timeout": 30}, timeout=60
+        ).raise_for_status()
 
     def _constrained(self, input_ids):
         result = self._generate(

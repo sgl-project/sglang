@@ -112,6 +112,12 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     run_hook(handle_model_source_paths, server_args)
 
+    # Model-arch environment defaults; must precede handle_gpu_memory_settings,
+    # whose heuristic reads the post-capture KV sizing switch.
+    from sglang.srt.arg_groups.muse_spark_hook import apply_muse_spark_env_defaults
+
+    apply_muse_spark_env_defaults(server_args)
+
     run_hook(handle_multimodal, server_args)
     run_hook(handle_ssl_validation, server_args)
     run_hook(handle_asr_validation, server_args)
@@ -343,9 +349,16 @@ def run_resolution_pipeline(server_args: Any) -> None:
     run_hook(handle_model_capability_adjustments, server_args)
 
     # needs the resolved CUDA-graph, attention-backend and speculative settings
-    from sglang.srt.monokernels.guards import handle_monokernel
+    from sglang.srt.kernel_plugins.amd.binding import (
+        handle_amd_monokernel,
+    )
+    from sglang.srt.kernel_plugins.nvidia.binding import (
+        handle_nvidia_megakernel,
+    )
 
-    run_hook(handle_monokernel, server_args)
+    # first, so a server with both kernel flags gets every reason in one error
+    run_hook(handle_nvidia_megakernel, server_args)
+    run_hook(handle_amd_monokernel, server_args)
 
     finalize_cuda_graph_prefill_max_context(server_args)
 

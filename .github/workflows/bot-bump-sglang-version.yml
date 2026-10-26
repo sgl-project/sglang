@@ -26,11 +26,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
-
-      - name: Install Python dependencies
-        run: |
-          pip install tomli
+          python-version: '3.12'
 
       - name: Configure Git and branch
         id: set_output

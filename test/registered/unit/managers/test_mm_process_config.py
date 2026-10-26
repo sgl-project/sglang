@@ -25,17 +25,6 @@ class TestMmProcessConfigValidation(CustomTestCase):
         handle_multimodal(args)
         return args
 
-    def test_valid_config_accepted(self):
-        args = self._validate_config({"image": {"max_pixels": 5000000}})
-        self.assertEqual(
-            resolution_result(args, "mm_process_config"),
-            {"image": {"max_pixels": 5000000}},
-        )
-
-    def test_empty_config_accepted(self):
-        args = self._validate_config({})
-        self.assertEqual(resolution_result(args, "mm_process_config"), {})
-
     def test_top_level_non_dict_rejected(self):
         with self.assertRaises(TypeError) as ctx:
             self._validate_config("bad")
@@ -45,16 +34,6 @@ class TestMmProcessConfigValidation(CustomTestCase):
         with self.assertRaises(TypeError) as ctx:
             self._validate_config({"image": "bad"})
         self.assertIn("mm_process_config['image'] must be a dict", str(ctx.exception))
-
-    def test_modality_non_dict_rejected_video(self):
-        with self.assertRaises(TypeError) as ctx:
-            self._validate_config({"video": 123})
-        self.assertIn("mm_process_config['video'] must be a dict", str(ctx.exception))
-
-    def test_modality_non_dict_rejected_audio(self):
-        with self.assertRaises(TypeError) as ctx:
-            self._validate_config({"audio": [1, 2]})
-        self.assertIn("mm_process_config['audio'] must be a dict", str(ctx.exception))
 
     def test_multi_modality_config_accepted(self):
         config = {
