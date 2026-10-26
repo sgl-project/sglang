@@ -39,7 +39,6 @@ import torch
 import torch.distributed
 
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.npu.eplb import get_eplb_device_group
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_EXPERT_DISPATCH,
@@ -54,7 +53,11 @@ from sglang.srt.runtime_context import (
     logs_expert_balancedness_to_server_log,
     reports_expert_balancedness,
 )
-from sglang.srt.utils import Withable, get_device, get_int_env_var
+from sglang.srt.utils import Withable, get_device, get_int_env_var, is_npu
+
+_is_npu = is_npu()
+if _is_npu:
+    from sglang.srt.hardware_backend.npu.eplb import get_eplb_device_group
 
 if TYPE_CHECKING:
     from sglang.srt.eplb.expert_location import ExpertLocationMetadata
@@ -147,7 +150,7 @@ class ExpertDistributionRecorder(ABC):
             )
             "reason is that you are using a model that does not support expert distribution"
             "recording. Try setting `get_model_config_for_expert_location` in your model."
-            if get_device_namespace().device == "npu":
+            if _is_npu:
                 from sglang.srt.hardware_backend.npu.eplb_statistics import (
                     NpuExpertDistributionRecorder,
                 )
@@ -417,7 +420,7 @@ class _SinglePassGatherer(ABC):
                 raise NotImplementedError
 
         if get_exec().moe.moe_a2a_backend == "deepep":
-            if get_device_namespace().device == "npu":
+            if _is_npu:
                 from sglang.srt.hardware_backend.npu.eplb_statistics import (
                     NpuExpertDistributionGatherer,
                 )
@@ -842,7 +845,7 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
             gpu_physical_count,
             dst=0,
             op=torch.distributed.ReduceOp.SUM,
-            group=get_eplb_device_group(),
+            group=get_eplb_device_group() if _is_npu else None,
         )
 
         if self._rank == 0:
@@ -1012,7 +1015,7 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
         torch.distributed.all_reduce(
             logical_count_of_buffered_step,
             op=torch.distributed.ReduceOp.SUM,
-            group=get_eplb_device_group(),
+            group=get_eplb_device_group() if _is_npu else None,
         )
 
         output = dict(
@@ -1047,14 +1050,16 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             avg_rate_tensor = torch.tensor(
                 [average_utilization_rate_over_window],
                 dtype=torch.float32,
-                device=get_device_namespace().device,
+                device=get_device_namespace().device if _is_npu else "cuda",
             )
         else:
             avg_rate_tensor = torch.empty(
-                1, dtype=torch.float32, device=get_device_namespace().device
+                1,
+                dtype=torch.float32,
+                device=get_device_namespace().device if _is_npu else "cuda",
             )
         torch.distributed.broadcast(
-            avg_rate_tensor, src=0, group=get_eplb_device_group()
+            avg_rate_tensor, src=0, group=get_eplb_device_group() if _is_npu else None
         )
         return avg_rate_tensor.item()
 

@@ -26,6 +26,7 @@ import torch.distributed as dist
 from torch.distributed import P2POp
 
 from sglang.srt.runtime_context import get_device
+from sglang.srt.utils import is_npu
 
 logger = logging.getLogger(__name__)
 _group_world = None
@@ -143,6 +144,9 @@ class ExpertWeightStaging:
 
 def isolate_npu_draft_recording(forward):
     """Keep target EPLB statistics untouched throughout an NPU draft operation."""
+    # Preserve the original method on other devices, with no forward-time wrapper.
+    if not is_npu():
+        return forward
 
     @wraps(forward)
     def wrapped(runner, *args, **kwargs):

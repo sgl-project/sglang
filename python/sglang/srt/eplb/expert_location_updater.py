@@ -26,15 +26,23 @@ from sglang.srt.eplb.expert_location import (
     ExpertLocationMetadata,
     get_global_expert_location_metadata,
 )
-from sglang.srt.hardware_backend.npu.eplb import (
-    ExpertWeightStaging,
-    create_temp_buffers,
-    execute_p2p_ops,
-    filter_unchanged_layers,
-    get_eplb_device_group,
-)
 from sglang.srt.runtime_context import get_device
-from sglang.srt.utils import get_bool_env_var
+from sglang.srt.utils import get_bool_env_var, is_npu
+
+_is_npu = is_npu()
+if _is_npu:
+    from sglang.srt.hardware_backend.npu.eplb import (
+        ExpertWeightStaging,
+        create_temp_buffers,
+        execute_p2p_ops,
+        filter_unchanged_layers,
+        get_eplb_device_group,
+    )
+else:
+
+    def create_temp_buffers(sample_tensors):
+        return [torch.empty_like(tensor) for tensor in sample_tensors]
+
 
 logger = logging.getLogger(__name__)
 
@@ -152,18 +160,20 @@ def _update_expert_weights_raw(
 ):
     log_metrics = get_bool_env_var("SGLANG_EXPERT_LOCATION_UPDATER_LOG_METRICS")
 
-    update_layer_ids = filter_unchanged_layers(
-        update_layer_ids,
-        old_expert_location_metadata.physical_to_logical_map_cpu,
-        new_expert_location_metadata.physical_to_logical_map_cpu,
-        elastic_enabled=ElasticEPStateManager.instance() is not None,
-    )
+    if _is_npu:
+        update_layer_ids = filter_unchanged_layers(
+            update_layer_ids,
+            old_expert_location_metadata.physical_to_logical_map_cpu,
+            new_expert_location_metadata.physical_to_logical_map_cpu,
+            elastic_enabled=ElasticEPStateManager.instance() is not None,
+        )
     if not update_layer_ids:
         return {}
 
     sample_tensors = routed_experts_weights_of_layer[update_layer_ids[0]]
     temp_buffers = create_temp_buffers(sample_tensors)
-    weight_staging = ExpertWeightStaging(sample_tensors)
+    if _is_npu:
+        weight_staging = ExpertWeightStaging(sample_tensors)
 
     world_size = torch.distributed.get_world_size()
     num_local_physical_experts = old_expert_location_metadata.num_local_physical_experts
@@ -175,7 +185,9 @@ def _update_expert_weights_raw(
         missing_logical_experts_info: List[int] = []
         model_weights = routed_experts_weights_of_layer[layer_id]
         update_expert_weights_single_layer(
-            routed_experts_weights=weight_staging.load(model_weights),
+            routed_experts_weights=(
+                weight_staging.load(model_weights) if _is_npu else model_weights
+            ),
             temp_buffers=temp_buffers,
             old_physical_to_logical_map=old_expert_location_metadata.physical_to_logical_map_cpu[
                 layer_id
@@ -190,7 +202,8 @@ def _update_expert_weights_raw(
             missing_logical_experts_info=missing_logical_experts_info,
             log_metrics=log_metrics,
         )
-        weight_staging.store(model_weights)
+        if _is_npu:
+            weight_staging.store(model_weights)
         if len(missing_logical_experts_info) > 0:
             missing_logical_experts_by_layers[layer_id] = missing_logical_experts_info
     return missing_logical_experts_by_layers
@@ -215,7 +228,7 @@ def update_expert_weights_single_layer(
     ), f"{num_local_physical_experts=} {[x.shape for x in routed_experts_weights]=}"
     assert isinstance(old_physical_to_logical_map, list)
     assert isinstance(new_physical_to_logical_map, list)
-    p2p_group = get_eplb_device_group()
+    p2p_group = get_eplb_device_group() if _is_npu else None
 
     if _LOG_INPUT:
         logger.info(
@@ -517,7 +530,12 @@ def update_expert_weights_single_layer(
                 if eid in ops_by_expert:
                     batch_ops.extend(ops_by_expert[eid])
             if batch_ops:
-                execute_p2p_ops(batch_ops)
+                if _is_npu:
+                    execute_p2p_ops(batch_ops)
+                else:
+                    reqs = torch.distributed.batch_isend_irecv(batch_ops)
+                    for req in reqs:
+                        req.wait()
 
     def _execute_buffer2weight_copies(buffer2weight_copy_infos):
         for (
