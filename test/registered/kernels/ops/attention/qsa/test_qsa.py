@@ -1042,6 +1042,98 @@ class _ForwardMode:
         return self.decode
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_qsa_prefill_mqa_inputs_gather_all_compressed_keys_at_once(dtype):
+    """One launch packs every request's complete compressed keys, byte-equal
+    to the per-request index_select it replaces, without a host sync when the
+    host lengths are known."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 9):
+        pytest.skip("FP8-capable CUDA GPU required")
+    torch.manual_seed(11)
+    page, lengths = 64, [131, 3, 4096 + 7, 64, 257]
+    max_len = max(lengths)
+    pages_per_request = -(-max_len // page)
+    pages = torch.randperm(len(lengths) * pages_per_request * 2)[
+        : len(lengths) * pages_per_request
+    ].reshape(len(lengths), pages_per_request, 1)
+    # Page-aligned token slots, as the QSA allocator hands them out.
+    token_slot_table = (
+        (pages * page + torch.arange(page)).reshape(len(lengths), -1)[:, :max_len]
+    ).to(device="cuda", dtype=torch.int32)
+    capacity = int(token_slot_table.max()) // COMPRESS_RATIO + 1
+    compressed = torch.randn(capacity, 1, 128, device="cuda").to(dtype)
+    pool = SimpleNamespace(
+        get_qsa_compressed_k_buffer=lambda layer_id: compressed,
+        qsa_index_kv_heads=1,
+        qsa_index_head_dim=128,
+    )
+    rows = torch.repeat_interleave(torch.arange(len(lengths)), 2).to(torch.int32)
+    positions = torch.tensor(
+        [p for n in lengths for p in (n - 2, n - 1)], device="cuda"
+    )
+    metadata = QSAIndexerMetadata(
+        sequence_lengths=torch.tensor(lengths, dtype=torch.int32, device="cuda"),
+        token_to_batch_idx=rows.cuda(),
+        token_slot_table=token_slot_table,
+        out_cache_loc=torch.empty(0, dtype=torch.int32, device="cuda"),
+        token_to_kv_pool=pool,
+        compress_ratio=COMPRESS_RATIO,
+        block_topk=BLOCK_TOPK,
+        prefill_sequence_lengths_cpu=tuple(lengths),
+    )
+    metadata.get_prefill_mqa_inputs(0, positions)  # compile outside the check
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        keys, starts, ends, _ = metadata.get_prefill_mqa_inputs(0, positions)
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    expected = torch.cat(
+        [
+            compressed.index_select(
+                0,
+                token_slot_table[i, : (n // COMPRESS_RATIO) * COMPRESS_RATIO].long()[
+                    ::COMPRESS_RATIO
+                ]
+                // COMPRESS_RATIO,
+            )
+            for i, n in enumerate(lengths)
+        ]
+    )
+    assert keys.dtype == dtype
+    assert torch.equal(keys.view(torch.uint8), expected.view(torch.uint8))
+    blocks = [n // COMPRESS_RATIO for n in lengths]
+    cu = [0, *accumulate(blocks)]
+    assert starts.tolist() == [cu[i] for i in rows.tolist()]
+    assert ends.tolist() == [
+        cu[i] + min((p + 1) // COMPRESS_RATIO, blocks[i])
+        for i, p in zip(rows.tolist(), positions.tolist())
+    ]
+
+
+def test_qsa_extend_metadata_carries_host_sequence_lengths():
+    runner, pool, req_pool = _make_qsa_runner_and_pool()
+    backend = QwenSparseAttnBackend(runner)
+    forward_batch = SimpleNamespace(
+        token_to_kv_pool=pool,
+        req_to_token_pool=req_pool,
+        req_pool_indices=torch.tensor([1, 2], dtype=torch.int32),
+        seq_lens=torch.tensor([8, 6], dtype=torch.int32),
+        seq_lens_cpu=torch.tensor([8, 6], dtype=torch.int32),
+        forward_mode=ForwardMode.EXTEND,
+        extend_seq_lens=torch.tensor([4, 6], dtype=torch.int32),
+        extend_prefix_lens=torch.tensor([4, 0], dtype=torch.int32),
+        positions=torch.tensor([4, 5, 6, 7, 0, 1, 2, 3, 4, 5]),
+        mrope_positions=None,
+        input_ids=torch.zeros(10, dtype=torch.int32),
+        out_cache_loc=torch.arange(10, dtype=torch.int32),
+        _original_forward_mode=None,
+    )
+    backend.init_forward_metadata(forward_batch)
+    indexer = backend.forward_metadata.indexer_metadata
+    assert indexer.prefill_sequence_lengths_cpu == (8, 6)
+
+
 def test_qsa_row_ranges_do_not_cross_sequences():
     sequence_lengths = torch.tensor([10, 7], dtype=torch.int32)
     query_positions = torch.tensor([8, 9, 4, 6], dtype=torch.int32)

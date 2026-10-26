@@ -30,13 +30,12 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
-from sglang.srt.layers.cp.base import get_cp_strategy
+from sglang.srt.layers.cp.base import CPAttentionBackendKind, get_cp_strategy
 from sglang.srt.layers.dcp.layout import (
     get_dcp_chain_spec_lens,
     get_dcp_lens,
 )
 from sglang.srt.layers.radix_attention import AttentionType
-from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_kv_cache
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -48,7 +47,6 @@ from sglang.srt.runtime_context import (
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.utils import (
     get_bool_env_var,
-    get_current_device_stream_fast,
     next_power_of_2,
 )
 
@@ -290,29 +288,25 @@ def _cp_allgather_and_save_kv_npu(
         if not layer.is_cross_attention
         else forward_batch.encoder_out_cache_loc
     )
-    # Save original trailing shapes for reshape after gather.
-    k_tail = k.shape[1:]  # (tp_k_head_num, qk_head_dim)
-    v_tail = v.shape[1:]  # (tp_v_head_num, v_head_dim)
+    # CP v2: all-gather the rank-local K/V through the active CP strategy and
+    # write the full sequence to the KV pool. Same contract as the
+    # `cp_active` branch of flashattention_backend.
+    cp_strategy = get_cp_strategy()
+    if cp_strategy is None or cp_strategy.cp_size <= 1:
+        token_to_kv_pool.set_kv_buffer(
+            layer,
+            KVWriteLoc(cache_loc, swa_loc),
+            k,
+            v,
+        )
+        return
 
-    # Flatten trailing dims then concat → one all-gather instead of two.
-    # Works for GQA where tp_k_head_num != tp_v_head_num.
-    k_flat = k.contiguous().reshape(k.shape[0], -1)  # [S_local, k_feat]
-    v_flat = v.contiguous().reshape(v.shape[0], -1)  # [S_local, v_feat]
-    k_feat_size = k_flat.shape[-1]
-    kv_flat = torch.cat([k_flat, v_flat], dim=-1)  # [S_local, k_feat + v_feat]
-
-    kv_full = cp_all_gather_rerange_kv_cache(
-        kv_flat, cp_size, forward_batch, get_current_device_stream_fast()
-    )  # [S_full, k_feat + v_feat]
-
-    key_cache_full = kv_full[..., :k_feat_size].reshape(-1, *k_tail)
-    value_cache_full = kv_full[..., k_feat_size:].reshape(-1, *v_tail)
-
-    token_to_kv_pool.set_kv_buffer(
+    cp_strategy.materialize_full_kv(
+        forward_batch,
         layer,
-        KVWriteLoc(cache_loc, swa_loc),
-        key_cache_full,
-        value_cache_full,
+        k,
+        v,
+        swa_loc=swa_loc,
     )
 
 
@@ -423,10 +417,15 @@ class AscendAttnBackend(AttentionBackend):
         )
 
         if not envs.SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS.get():
-            assert not self.is_hybrid_swa, (
-                "Hybrid swa is not supply with `needs_cpu_seq_lens=False`."
-            )
-            self.needs_cpu_seq_lens = False
+            # FIA host IntArrays consume the CPU mirror; keep it on instead of
+            # crashing later. Hybrid SWA is allowed through for dsv4 experiments.
+            if self.use_fia:
+                logger.warning(
+                    "SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS=0 is ignored: "
+                    "host-bound attention paths present; keeping the mirror."
+                )
+            else:
+                self.needs_cpu_seq_lens = False
 
         # head num padding
         self.padding_size_list = [1, 2, 4, 8, 16, 32, 64, 128]
@@ -529,12 +528,16 @@ class AscendAttnBackend(AttentionBackend):
             spec_info=forward_batch.spec_info,
             out_cache_loc=forward_batch.out_cache_loc,
             origin_out_cache_loc=getattr(forward_batch, "origin_out_cache_loc", None),
+            max_seq_len_host=getattr(forward_batch, "max_seq_len_host", None),
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
         self.forward_metadata = ForwardMetadata()
-        if self.needs_cpu_seq_lens:
+        # Data-driven branch: take the CPU-mirror path whenever the mirror is
+        # present, instead of statically gating on needs_cpu_seq_lens. When the
+        # mirror is absent (true mirrorless), fall through to the else branch.
+        if forward_batch.seq_lens_cpu is not None:
             seq_lens_max = forward_batch.seq_lens.max()
             if forward_batch.forward_mode.is_target_verify():
                 if (
@@ -600,7 +603,7 @@ class AscendAttnBackend(AttentionBackend):
                 self.device
             ).int()
 
-        if self.needs_cpu_seq_lens:
+        if forward_batch.seq_lens_cpu is not None:
             self.forward_metadata.seq_lens_cpu_int = forward_batch.seq_lens_cpu.int()
         # In graph mode (see _init_cuda_graph_metadata) seq_lens_cpu_int stays
         # None so forward_mtp binds seq_lens_cpu_list instead: graph.update can
@@ -615,7 +618,9 @@ class AscendAttnBackend(AttentionBackend):
 
         if forward_batch.forward_mode.is_target_verify():
             spec_algorithm = forward_batch.spec_algorithm
-            if spec_algorithm is None or not spec_algorithm.is_dflash_family():
+            if (
+                spec_algorithm is None or not spec_algorithm.is_dflash_family()
+            ) and self.forward_metadata.seq_lens_cpu_int is not None:
                 self.forward_metadata.seq_lens_cpu_int += int(
                     forward_batch.spec_info.draft_token_num
                 )
@@ -623,7 +628,14 @@ class AscendAttnBackend(AttentionBackend):
             forward_batch.forward_mode.is_decode_or_idle()
             and forward_batch.spec_info is not None
         ):
-            self.forward_metadata.seq_lens_cpu_int += self.speculative_step_id + 1
+            if self.forward_metadata.seq_lens_cpu_int is not None:
+                self.forward_metadata.seq_lens_cpu_int += self.speculative_step_id + 1
+            else:
+                # Mirrorless decode: apply the draft offset to the device
+                # lengths consumed by _npu_paged_attention instead.
+                self.forward_metadata.seq_lens = (
+                    self.forward_metadata.seq_lens + self.speculative_step_id + 1
+                )
 
         # Set actual_seq_lengths_q from the pre-pad batch size so that the DSA
         # indexer reads a value consistent with actual_seq_lengths_kv /
@@ -918,6 +930,7 @@ class AscendAttnBackend(AttentionBackend):
         spec_info: Optional[SpecInput],
         out_cache_loc: Optional[torch.Tensor] = None,
         origin_out_cache_loc: Optional[torch.Tensor] = None,
+        max_seq_len_host: Optional[int] = None,
     ):
         """Shared capture+replay body for the cuda-graph init path.
 
@@ -932,7 +945,7 @@ class AscendAttnBackend(AttentionBackend):
             self.cuda_graph_swa_out_cache_loc[:n].copy_(
                 self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc)
             )
-        if self.needs_cpu_seq_lens:
+        if seq_lens_cpu is not None:
             # Compute the host-side KV lengths visible to this attention step. Target
             # verify adds the draft block except for DFlash, whose seq_lens_cpu already
             # includes it; speculative decode adds tokens through the current draft step.
@@ -987,6 +1000,24 @@ class AscendAttnBackend(AttentionBackend):
                 // self.page_size
             )
 
+            metadata.block_tables[:bs, max_seq_pages:].fill_(0)
+        elif max_seq_len_host is not None:
+            # Mirrorless replay (e.g. DSA models): the scheduler publishes the
+            # host-side max of the page-aligned allocated seq lens (>= committed
+            # + alloc reserve, so it upper-bounds every readable length). Apply
+            # the same speculative offsets as the mirror branch above.
+            if forward_mode.is_target_verify() and not _is_dflash_verify(spec_info):
+                max_len = max_seq_len_host + self.speculative_num_draft_tokens
+            elif forward_mode.is_decode_or_idle() and spec_info is not None:
+                max_len = max_seq_len_host + self.speculative_step_id + 1
+            else:
+                # draft-extend (and any other spec mode) sees base + draft block
+                max_len = max_seq_len_host + self.speculative_num_draft_tokens
+            max_seq_pages = (max_len + self.page_size - 1) // self.page_size
+            metadata.block_tables[:bs, :max_seq_pages].copy_(
+                self.req_to_token[req_pool_indices[:bs], 0 : max_len : self.page_size]
+                // self.page_size
+            )
             metadata.block_tables[:bs, max_seq_pages:].fill_(0)
         else:
             total_pages = min(
@@ -1380,70 +1411,51 @@ class AscendAttnBackend(AttentionBackend):
         The KV cache must already contain the full gathered sequence
         (written by _cp_allgather_and_save_kv_npu before this call).
 
-        Args:
-            q:            Query tensor, shape [total_q_tokens, tp_q_head_num * qk_head_dim]
-            k_cache:      Full key cache from token_to_kv_pool
-            v_cache:      Full value cache from token_to_kv_pool
-            layer:        RadixAttention layer
-            forward_batch: ForwardBatch with attn_cp_metadata populated
-
-        Returns:
-            attn_output [total_q_tokens, tp_q_head_num * v_head_dim]
+        Token slicing into the prev/next zigzag chunks, pad-row trimming and
+        pad-row re-appending are owned by the CP-v2 strategy
+        (``ZigzagCPStrategy.run_attention``); this backend only supplies the FIA
+        computation closure. ``attention_backend`` is borrowed from
+        ``CPAttentionBackendKind.FLASH_ATTENTION`` because FIA uses the same
+        two-call (prev + next) dispatch convention.
         """
-        cp_meta = forward_batch.attn_cp_metadata
 
-        # Local tokens are laid out [all_seqs_prev, all_seqs_next]; split at
-        # total_q_prev_tokens rather than the midpoint to support bs > 1.
-        split = cp_meta.total_q_prev_tokens
-        q_prev = (
-            q[:split].contiguous().reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
-        )
-        q_next = (
-            q[split:].contiguous().reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
-        )
+        def _fia_cp_attn(q_chunk, cu_seqlens_q_cp, cache_seqlens_cp, max_seqlen_q_cp):
+            # The strategy passes cu_seqlens_q (with a leading 0) and plain KV
+            # lengths as int32 tensors; FIA wants cumulative query lengths
+            # (no leading 0) and KV lengths as Python lists.
+            k_cache_paged = k_cache.view(
+                -1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim
+            )
+            v_cache_paged = v_cache.view(
+                -1, self.page_size, layer.tp_v_head_num * layer.v_head_dim
+            )
+            return torch_npu.npu_fused_infer_attention_score(
+                query=q_chunk.contiguous(),
+                key=k_cache_paged,
+                value=v_cache_paged,
+                block_table=self.forward_metadata.block_tables,
+                block_size=self.page_size,
+                num_heads=layer.tp_q_head_num,
+                num_key_value_heads=layer.tp_k_head_num,
+                input_layout="TND",
+                atten_mask=self.fia_mask,
+                sparse_mode=3,
+                next_tokens=0,
+                scale=layer.scaling,
+                actual_seq_lengths=cu_seqlens_q_cp[1:].tolist(),
+                actual_seq_lengths_kv=cache_seqlens_cp.tolist(),
+            )[0]
 
-        k_cache_paged = k_cache.view(
-            -1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim
+        cp_strategy = get_cp_strategy()
+        assert cp_strategy is not None
+        q_cp = q.contiguous().view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        attn_out = cp_strategy.run_attention(
+            q_cp,
+            forward_batch,
+            self.device,
+            _fia_cp_attn,
+            attention_backend=CPAttentionBackendKind.FLASH_ATTENTION,
         )
-        v_cache_paged = v_cache.view(
-            -1, self.page_size, layer.tp_v_head_num * layer.v_head_dim
-        )
-
-        attn_out_prev, _ = torch.ops.npu.npu_fused_infer_attention_score(
-            q_prev,
-            k_cache_paged,
-            v_cache_paged,
-            block_table=self.forward_metadata.block_tables,
-            block_size=self.page_size,
-            num_heads=layer.tp_q_head_num,
-            num_key_value_heads=layer.tp_k_head_num,
-            input_layout="TND",
-            atten_mask=self.fia_mask,
-            sparse_mode=3,
-            next_tokens=0,
-            scale=layer.scaling,
-            actual_seq_lengths=np.cumsum(cp_meta.actual_seq_q_prev_list).tolist(),
-            actual_seq_lengths_kv=cp_meta.kv_len_prev_list,
-        )
-
-        attn_out_next, _ = torch.ops.npu.npu_fused_infer_attention_score(
-            q_next,
-            k_cache_paged,
-            v_cache_paged,
-            block_table=self.forward_metadata.block_tables,
-            block_size=self.page_size,
-            num_heads=layer.tp_q_head_num,
-            num_key_value_heads=layer.tp_k_head_num,
-            input_layout="TND",
-            atten_mask=self.fia_mask,
-            sparse_mode=3,
-            next_tokens=0,
-            scale=layer.scaling,
-            actual_seq_lengths=np.cumsum(cp_meta.actual_seq_q_next_list).tolist(),
-            actual_seq_lengths_kv=cp_meta.kv_len_next_list,
-        )
-
-        attn_out = torch.cat([attn_out_prev, attn_out_next], dim=0)
         return attn_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def forward_sparse(
@@ -3303,7 +3315,13 @@ class AscendAttnBackend(AttentionBackend):
                         num_kv_heads=layer.tp_k_head_num,
                         scale_value=layer.scaling,
                         block_table=self.forward_metadata.block_tables,
-                        context_lens=self.forward_metadata.seq_lens_cpu_int,
+                        context_lens=(
+                            self.forward_metadata.seq_lens_cpu_int
+                            if self.forward_metadata.seq_lens_cpu_int is not None
+                            # Mirrorless decode: device lengths (draft offset
+                            # applied in init_forward_metadata).
+                            else self.forward_metadata.seq_lens
+                        ),
                         out=attn_output,
                     )
                 else:

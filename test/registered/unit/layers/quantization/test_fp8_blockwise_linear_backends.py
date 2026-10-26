@@ -193,6 +193,46 @@ class TestFp8BlockwiseLinearBackends(_LinearBackendCheck):
         self._run("deep_gemm")
 
     @unittest.skipUnless(
+        get_device_sm() in (100, 103), "Packed block-FP8 scales on SM100"
+    )
+    def test_deep_gemm_prequantized(self):
+        """Packed activations must skip requantization and preserve the GEMM result."""
+        torch.manual_seed(9)
+        with mock.patch.object(
+            fp8_utils, "FP8_GEMM_RUNNER_BACKEND", Fp8GemmRunnerBackend.DEEP_GEMM
+        ):
+            for m, n, k in FP8_BLOCK_SHAPES:
+                with self.subTest(shape=(m, n, k)):
+                    layer, _ = self._build_layer(n, k)
+                    layer.quant_method.process_weights_after_loading(layer)
+                    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+                    q, s = fp8_utils.sglang_per_token_group_quant_fp8(
+                        x,
+                        128,
+                        column_major_scales=True,
+                        scale_tma_aligned=True,
+                        scale_ue8m0=True,
+                    )
+                    expected, _ = layer(x)
+                    actual, _ = layer((q, s))
+                    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                    linear = fp8_utils.deepgemm_w8a8_block_fp8_linear_with_fallback
+                    for bad_scale in (s.new_empty(s.shape), s[:, :-1], s.cpu()):
+                        with self.assertRaisesRegex(ValueError, "packed UE8M0"):
+                            linear(
+                                q,
+                                layer.weight,
+                                [128, 128],
+                                layer.weight_scale_inv,
+                                bad_scale,
+                            )
+                    # This shape normally takes Triton, which cannot read packed A scales.
+                    with self.assertRaisesRegex(ValueError, "packed UE8M0"):
+                        linear(
+                            q, layer.weight[:65], [128, 128], layer.weight_scale_inv, s
+                        )
+
+    @unittest.skipUnless(
         get_device_sm() == 90, "SM90 UE8M0 activation-scale regression"
     )
     def test_deep_gemm_ue8m0_activation_scales(self):
