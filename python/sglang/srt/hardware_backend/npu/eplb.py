@@ -14,6 +14,7 @@
 
 """Ascend EPLB communication, weight staging and initial scheduling helpers."""
 
+import contextlib
 import logging
 
 import torch
@@ -140,3 +141,14 @@ class ExpertWeightStaging:
         if self.buffers is not None:
             for weight, buffer in zip(weights, self.buffers, strict=True):
                 weight.copy_(buffer)
+
+
+def expert_distribution_recording_context(is_draft_worker):
+    """Only NPU draft forwards/captures must disable the target EPLB recorder."""
+    if is_draft_worker and get_device().device == "npu":
+        from sglang.srt.eplb.expert_distribution import (
+            get_global_expert_distribution_recorder,
+        )
+
+        return get_global_expert_distribution_recorder().disable_this_region()
+    return contextlib.nullcontext()

@@ -96,12 +96,20 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
     ) -> None:
         import torch_npu  # noqa: F401  (verifies NPU availability)
 
+        from sglang.srt.hardware_backend.npu.eplb_statistics import (
+            on_graph_capture_forward_start,
+        )
+
+        def run_once():
+            on_graph_capture_forward_start()
+            return forward_fn()
+
         # Two warmups so kernels are loaded and one-time setup is paid before capture.
         # post_warmup_hook lets the attention backend reset state that warmup mutated.
         for _ in range(2):
             self._device_module.synchronize()
             self._tp_group.barrier()
-            forward_fn()
+            run_once()
             if post_warmup_hook is not None:
                 post_warmup_hook()
 
@@ -133,7 +141,7 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
                 auto_dispatch_capture=True,
             ),
         ):
-            out = forward_fn()
+            out = run_once()
 
         self._graphs[shape_key] = graph
         self._outputs[shape_key] = out

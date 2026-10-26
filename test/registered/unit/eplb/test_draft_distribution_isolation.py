@@ -8,6 +8,7 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.eplb import expert_distribution as distribution
+from sglang.srt.hardware_backend.npu import eplb as npu_eplb
 from sglang.srt.runtime_context import publish
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -31,6 +32,11 @@ class TestDraftDistributionIsolation(unittest.TestCase):
         device_patch = patch.object(distribution, "get_device", return_value="cpu")
         device_patch.start()
         self.addCleanup(device_patch.stop)
+        npu_policy_patch = patch.object(
+            npu_eplb, "get_device", return_value=SimpleNamespace(device="npu")
+        )
+        npu_policy_patch.start()
+        self.addCleanup(npu_policy_patch.stop)
         self.recorder = distribution.ExpertDistributionRecorder.init_new(
             SimpleNamespace(
                 num_layers=2, num_physical_experts=8, num_local_physical_experts=4
@@ -84,9 +90,6 @@ class TestDraftDistributionIsolation(unittest.TestCase):
             graph_memory_usage=None,
             graph_time_usage=None,
             eager_runner=None,
-        )
-        runner._expert_distribution_recording_context = lambda: (
-            module.ModelRunner._expert_distribution_recording_context(runner)
         )
         return module, runner
 

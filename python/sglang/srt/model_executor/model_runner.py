@@ -76,6 +76,7 @@ from sglang.srt.eplb.expert_location import (
     set_global_expert_location_metadata,
 )
 from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
+from sglang.srt.hardware_backend.npu.eplb import expert_distribution_recording_context
 from sglang.srt.kv_canary.api import install_canary
 from sglang.srt.kv_canary.runner.canary_manager import context_tuple
 from sglang.srt.kv_canary.token_oracle.install import install_token_oracle_from_env
@@ -1186,7 +1187,7 @@ class ModelRunner:
         )
         if is_scale_joiner:
             self._validate_elastic_cuda_graph_recapture()
-        with self._expert_distribution_recording_context():
+        with expert_distribution_recording_context(self.is_draft_worker):
             capture = capture_cuda_graphs(
                 model_runner=self,
                 capture_decode_cuda_graph=(
@@ -1600,16 +1601,9 @@ class ModelRunner:
         """Return the model layers used by prefill CUDA graph execution."""
         return compute_attention_and_moe_layers(layer_model)
 
-    def _expert_distribution_recording_context(self):
-        # EPLB moves target weights only; draft forwards and graph captures must
-        # not write to the target's statistics.
-        if self.is_draft_worker:
-            return get_global_expert_distribution_recorder().disable_this_region()
-        return contextlib.nullcontext()
-
     def init_decode_cuda_graph(self):
         self.decode_cuda_graph_runner = None
-        with self._expert_distribution_recording_context():
+        with expert_distribution_recording_context(self.is_draft_worker):
             capture = capture_decode_graph(model_runner=self)
         self.decode_cuda_graph_runner = capture.runner
         self.graph_memory_usage = replace_graph_memory_usage(
@@ -1683,7 +1677,7 @@ class ModelRunner:
 
     def init_prefill_cuda_graph(self, force_for_draft_worker: bool = False):
         self.prefill_cuda_graph_runner = None
-        with self._expert_distribution_recording_context():
+        with expert_distribution_recording_context(self.is_draft_worker):
             capture = capture_prefill_graph(
                 model_runner=self,
                 eager_runner=self.eager_runner,
@@ -1859,7 +1853,7 @@ class ModelRunner:
         with (
             canary_ctx,
             step_span_ctx,
-            self._expert_distribution_recording_context(),
+            expert_distribution_recording_context(self.is_draft_worker),
             get_global_expert_distribution_recorder().with_forward_pass(
                 self.forward_pass_id,
                 forward_batch,
