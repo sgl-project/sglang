@@ -136,8 +136,45 @@ def test_prepared_nvfp4_matches_routed_moe(m, do_finalize, normalized):
         torch.testing.assert_close(actual, _run_reference(kwargs), atol=1e-5, rtol=1e-5)
 
 
+@pytest.mark.skipif(
+    not prepared_routing_sm_supported(), reason="Requires native SiTU expert kernels"
+)
+@pytest.mark.parametrize(
+    "m,do_finalize", [(1, False), (8, False), (8, True)], ids=["m1", "m8", "m8-final"]
+)
+def test_prepared_nvfp4_fresh_buffers_each_call(m, do_finalize):
+    """The cached body workspace must not pin the first call's activation,
+    scale, routing or output buffers: every call here uses new tensors."""
+    from types import SimpleNamespace
+
+    from sglang.kernels.ops.moe.trtllm_prepared_fp4 import try_prepared_k3_nvfp4
+
+    torch.manual_seed(404 + m)
+    owner = SimpleNamespace()
+    base = _moe_kwargs(m, do_finalize)
+    for shared in (False, True, False, True, False):
+        kwargs = dict(
+            base,
+            hidden_states=torch.randint_like(base["hidden_states"], 0, 256),
+            hidden_states_scale=torch.full_like(
+                base["hidden_states_scale"].view(torch.uint8),
+                120 + (2 if shared else 0),
+            ).view(torch.float8_e4m3fn),
+            output=torch.empty_like(base["output"]),
+            topk_ids=_routing(m, shared, True),
+        )
+        expected = _run_reference(dict(kwargs))
+        result = try_prepared_k3_nvfp4(owner, **kwargs)
+        assert result is not None
+        actual = _moe_output(kwargs, result).clone()
+        torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+
+
 if __name__ == "__main__":
     for normalized in (True, False):
         for case in [(1, False), (8, False), (8, True)]:
             test_prepared_nvfp4_matches_routed_moe(*case, normalized)
             print("ok", case, "normalized" if normalized else "scaled")
+    for case in [(1, False), (8, False), (8, True)]:
+        test_prepared_nvfp4_fresh_buffers_each_call(*case)
+        print("ok fresh-buffers", case)
