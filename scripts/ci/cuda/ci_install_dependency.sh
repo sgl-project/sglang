@@ -857,6 +857,39 @@ install_extra_deps() {
     mark_step_done "${FUNCNAME[0]}"
 }
 
+install_msa() {
+    # MiniMax MSA sparse-attention kernels: MiniMax-M3.1 imports them at startup on
+    # Blackwell. Same commit and layout as docker/Dockerfile.cu134; editable because
+    # prefill JIT-compiles against its CUTLASS submodule.
+    if [ "$IS_BLACKWELL" != "1" ]; then
+        mark_step_done "${FUNCNAME[0]}"
+        return
+    fi
+    local msa_commit msa_dir
+    msa_commit=$(sed -n 's/^ARG MSA_COMMIT=\([0-9a-f]\{40\}\)$/\1/p' "${REPO_ROOT}/docker/Dockerfile.cu134")
+    if [ -z "$msa_commit" ]; then
+        echo "FATAL: no MSA_COMMIT default in docker/Dockerfile.cu134"
+        exit 1
+    fi
+    msa_dir="${HOME}/.cache/sglang-ci/minimax-msa/${msa_commit}"
+    if [ ! -f "${msa_dir}/.complete" ]; then
+        rm -rf "$msa_dir"
+        git init -q "$msa_dir"
+        git -C "$msa_dir" remote add origin https://github.com/MiniMax-AI/MSA.git
+        _git_with_github_auth git -C "$msa_dir" fetch -q --depth 1 origin "$msa_commit"
+        git -C "$msa_dir" checkout -q --detach FETCH_HEAD
+        _git_with_github_auth git -C "$msa_dir" submodule update -q --init --recursive
+        touch "${msa_dir}/.complete"
+    fi
+    $PIP_CMD install --no-deps -e "$msa_dir" $PIP_INSTALL_SUFFIX
+    if [ -f "${msa_dir}/integrations/sglang/pyproject.toml" ]; then
+        $PIP_CMD install --no-deps -e "${msa_dir}/integrations/sglang" $PIP_INSTALL_SUFFIX
+    fi
+    python3 -c "import inference, msa_v1; print(f'MSA {inference.__file__}')"
+
+    mark_step_done "${FUNCNAME[0]}"
+}
+
 prepare_runner() {
     bash "${SCRIPT_DIR}/prepare_runner.sh"
 
@@ -974,6 +1007,7 @@ main() {
     download_flashinfer_cache
     stabilize_flashinfer_jit_paths
     install_extra_deps
+    install_msa
     install_nccl
     prepare_runner
     setup_ld_library_path
