@@ -1,15 +1,12 @@
 """When a MoE block all-reduces its own output, and why it does not."""
 
-import ast
 import contextlib
 import types
 import unittest
-from pathlib import Path
 from unittest.mock import patch
 
 import torch
 
-import sglang
 from sglang.srt.layers.moe import utils as moe_utils
 from sglang.srt.layers.moe.utils import (
     post_experts_output_is_complete,
@@ -21,8 +18,6 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
-
-MODELS_DIR = Path(sglang.__file__).resolve().parent / "srt" / "models"
 
 
 def a2a(name=None):
@@ -82,10 +77,6 @@ class TestReduceMoeOutput(CustomTestCase):
             count, output = self.all_reduces()
         self.assertEqual(count, 1)
         torch.testing.assert_close(output, torch.full((2, 3), 2.0))
-
-    def test_single_rank_has_nothing_to_sum(self):
-        with moe_config(tp_size=1):
-            self.assertEqual(self.all_reduces()[0], 0)
 
     def test_a_later_step_owns_the_sum(self):
         for flags, config in (
@@ -166,84 +157,180 @@ class TestReplicatedMoeOutput(CustomTestCase):
 
 class TestModelsWithExplicitDpCompletion(CustomTestCase):
     def test_direct_dp_exits_publish_their_selected_sum(self):
-        # Execute the real orchestration methods without constructing weights.
-        # DeepSeek V4 owns its DP exit instead of using a stage boundary.
-        import __future__
-
-        filename, method = "deepseek_v4.py", "_run_moe_ffn_dp_sync"
-        path = MODELS_DIR / filename
-        node = next(
-            n
-            for n in ast.walk(ast.parse(path.read_text()))
-            if isinstance(n, ast.FunctionDef) and n.name == method
+        from sglang.srt.layers import dp_attention
+        from sglang.srt.layers.layer_boundary.layout import Layout, SumGroup, TokenAxis
+        from sglang.srt.layers.layer_boundary.residual.add_norm import PLAIN_ADD
+        from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
+        from sglang.srt.layers.layer_boundary.row_transport import (
+            TransportExit,
+            TransportRows,
         )
-        for use_rsv in (False, True):
-            with self.subTest(model=filename, reduce_scatterv=use_rsv):
-                trace = []
+        from sglang.srt.models import deepseek_v4
+        from sglang.srt.models import deepseek_v4_boundary as boundary
+        from sglang.srt.models.deepseek_common import moe_transport
 
-                def rsv(value, *, output, sizes):
-                    trace.append("RSv")
-                    output.copy_(value[:2] * 2)
+        for non_cuda in (False, True):
+            for use_rsv in (False, True):
+                with self.subTest(non_cuda=non_cuda, reduce_scatterv=use_rsv):
+                    trace = []
 
-                def scatter(output, value, batch):
-                    trace.append("slice")
-                    output.copy_(value[:2])
+                    def rsv(value, *, output, sizes):
+                        trace.append("RSv")
+                        output.copy_(value[:2] * 2)
 
-                group = types.SimpleNamespace(reduce_scatterv=rsv)
-                parallel = types.SimpleNamespace(
-                    attn_dp_size=2, attn_tp_size=1, tp_size=2, tp_group=group
-                )
-                namespace = dict(
-                    torch=torch,
-                    get_forward=get_forward,
-                    get_parallel=lambda: parallel,
-                    get_moe_a2a_backend=lambda: a2a(),
-                    should_use_dp_reduce_scatterv=lambda: use_rsv,
-                    is_dp_gatherv_active=lambda: False,
-                    is_cp_active=lambda batch: False,
-                    envs=types.SimpleNamespace(
-                        SGLANG_DP_USE_REDUCE_SCATTER=types.SimpleNamespace(
-                            get=lambda: False
+                    def scatter(output, value, batch):
+                        trace.append("slice")
+                        output.copy_(value[:2])
+
+                    def reduce(value):
+                        self.assertFalse(get_forward().mlp_reduce_scatter)
+                        trace.append("AR")
+                        return value * 2
+
+                    def compute(value, batch, **kwargs):
+                        self.assertEqual(get_forward().mlp_reduce_scatter, use_rsv)
+                        return reduce(value) if non_cuda and not use_rsv else value
+
+                    group = types.SimpleNamespace(reduce_scatterv=rsv)
+                    parallel = types.SimpleNamespace(
+                        attn_dp_size=2, attn_tp_size=1, tp_size=2, tp_group=group
+                    )
+                    model = types.SimpleNamespace(
+                        dsa_enable_prefill_cp=False,
+                        boundary_mhc_fusions=False,
+                        config=types.SimpleNamespace(model_type="deepseek_v4"),
+                        mlp=compute,
+                    )
+                    batch = types.SimpleNamespace(
+                        dp_padding_mode=types.SimpleNamespace(is_max_len=lambda: True)
+                    )
+                    rows = TransportRows(
+                        Layout(frozenset({TokenAxis.ATTN_DP})),
+                        Layout(frozenset()),
+                        Layout(frozenset({TokenAxis.ATTN_DP})),
+                        SumGroup.MOE_OUTPUT,
+                    )
+                    with contextlib.ExitStack() as patches:
+                        patches.enter_context(
+                            get_forward().scoped(mlp_reduce_scatter=False)
                         )
-                    ),
-                    _SHARED_EXPERT_LOCAL=False,
-                    _is_hip=False,
-                    nullcontext=contextlib.nullcontext,
-                    get_global_dp_buffer=lambda g: torch.empty(4, 3),
-                    get_local_dp_buffer=lambda g: torch.empty(2, 3),
-                    get_dp_global_num_tokens=lambda: [2, 2],
-                    dp_gather_replicate=lambda output, value, batch: output.fill_(1),
-                    dp_scatter=scatter,
-                )
-                exec(
-                    compile(
-                        ast.Module(body=[node], type_ignores=[]),
-                        str(path),
-                        "exec",
-                        flags=__future__.annotations.compiler_flag,
-                    ),
-                    namespace,
-                )
-                model = types.SimpleNamespace(
-                    dsa_enable_prefill_cp=False,
-                    mlp=lambda value, batch, **kwargs: reduce_moe_output(value),
-                )
-                batch = types.SimpleNamespace(
-                    dp_padding_mode=types.SimpleNamespace(is_max_len=lambda: True)
-                )
-                kwargs = dict(input_ids=None, input_ids_global=None)
-                with (
-                    moe_config(),
-                    get_forward().scoped(mlp_reduce_scatter=False),
-                    patch(
-                        "sglang.srt.distributed.communication_op.tensor_model_parallel_all_reduce",
-                        side_effect=lambda value: trace.append("AR") or value * 2,
-                    ),
-                ):
-                    output = namespace[method](model, torch.ones(2, 3), batch, **kwargs)
-                    self.assertFalse(get_forward().mlp_reduce_scatter)
-                self.assertEqual(trace, ["RSv"] if use_rsv else ["AR", "slice"])
-                torch.testing.assert_close(output, torch.full((2, 3), 2.0))
+                        for module in (moe_transport, boundary):
+                            patches.enter_context(
+                                patch.object(
+                                    module, "get_parallel", return_value=parallel
+                                )
+                            )
+                        for context in (
+                            patch.object(
+                                moe_transport, "get_moe_a2a_backend", return_value=a2a()
+                            ),
+                            patch.object(moe_transport, "SHARED_EXPERT_LOCAL", False),
+                            patch.object(
+                                moe_transport, "is_cp_active", return_value=False
+                            ),
+                            patch.object(
+                                moe_transport,
+                                "is_dp_gatherv_active",
+                                return_value=False,
+                            ),
+                            patch.object(
+                                moe_transport,
+                                "should_use_dp_reduce_scatterv",
+                                return_value=use_rsv,
+                            ),
+                            patch.object(
+                                moe_transport,
+                                "get_global_dp_buffer",
+                                side_effect=lambda g: torch.empty(4, 3),
+                            ),
+                            patch.object(
+                                moe_transport,
+                                "get_local_dp_buffer",
+                                side_effect=lambda g: torch.empty(2, 3),
+                            ),
+                            patch.object(
+                                moe_transport,
+                                "get_dp_global_num_tokens",
+                                return_value=[2, 2],
+                            ),
+                            patch.object(
+                                moe_transport,
+                                "dp_gather_replicate",
+                                side_effect=lambda out, value, batch: out.fill_(1),
+                            ),
+                            patch.object(
+                                moe_transport, "dp_scatter", side_effect=scatter
+                            ),
+                            patch(
+                                "sglang.srt.layers.moe.should_use_dp_reduce_scatterv",
+                                return_value=use_rsv,
+                            ),
+                            deepseek_v4.envs.SGLANG_DP_USE_REDUCE_SCATTER.override(
+                                False
+                            ),
+                            patch.object(
+                                dp_attention, "is_dp_gatherv_active", return_value=False
+                            ),
+                            patch.object(
+                                dp_attention,
+                                "get_global_dp_buffer",
+                                side_effect=lambda g: torch.empty(4, 3),
+                            ),
+                            patch.object(
+                                dp_attention,
+                                "get_local_dp_buffer",
+                                side_effect=lambda g: torch.empty(2, 3),
+                            ),
+                            patch.object(
+                                dp_attention,
+                                "get_dp_global_num_tokens",
+                                return_value=[2, 2],
+                            ),
+                            patch.object(
+                                dp_attention, "dp_scatter", side_effect=scatter
+                            ),
+                            patch(
+                                "sglang.srt.layers.moe.post_experts_all_reduce",
+                                side_effect=reduce,
+                            ),
+                        ):
+                            patches.enter_context(context)
+                        if non_cuda:
+                            output = (
+                                deepseek_v4.NonCudaDecoderMixin._run_moe_ffn_dp_sync(
+                                    model,
+                                    torch.ones(2, 3),
+                                    batch,
+                                    input_ids=None,
+                                    input_ids_global=None,
+                                )
+                            )
+                        else:
+                            transport = boundary.MoeTransport(
+                                model,
+                                torch.ones(2, 3),
+                                batch,
+                                boundary.LayerCall(None),
+                                rows,
+                            )
+                            stage = types.SimpleNamespace(
+                                plan=types.SimpleNamespace(
+                                    path_for=lambda b: types.SimpleNamespace(
+                                        output=types.SimpleNamespace(update=PLAIN_ADD),
+                                        exit=types.SimpleNamespace(
+                                            writes_residual=False
+                                        ),
+                                    )
+                                )
+                            )
+                            batch.residual_stream = ResidualStream(torch.ones(2, 3))
+                            batch.residual_stream.transport = (stage, transport)
+                            with TransportExit(stage, batch) as completion:
+                                value = model.mlp(transport.input, batch)
+                                output = completion.finish(value)
+                        self.assertFalse(get_forward().mlp_reduce_scatter)
+                    self.assertEqual(trace, ["RSv"] if use_rsv else ["AR", "slice"])
+                    torch.testing.assert_close(output, torch.full((2, 3), 2.0))
 
 
 if __name__ == "__main__":

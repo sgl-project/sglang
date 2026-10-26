@@ -7,6 +7,7 @@ drained.
 
 import unittest
 from array import array
+from unittest.mock import MagicMock
 
 import torch
 
@@ -19,6 +20,10 @@ from sglang.srt.managers.schedule_batch import (  # noqa: E402
     ForwardMode,
     Req,
     ScheduleBatch,
+)
+from sglang.srt.model_executor.encoder_swa_replay import (  # noqa: E402
+    _reset_windows_and_collect_hits,
+    folded_replay_rows,
 )
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
@@ -101,6 +106,26 @@ class TestConvertDecodeToExtendGeometry(CustomTestCase):
         self.assertEqual(len(batch.seq_lens_cpu), len(seq_lens) + 3)
         self.assertEqual(len(batch.prefix_lens), len(batch.reqs))
         self._assert_geometry(batch, seq_lens)
+
+    def test_stale_encoder_swa_resets_fold_no_rows(self):
+        """The running batch keeps its prefill-time encoder SWA reset list; a
+        converted decode must not fold replay rows the DP vote did not count,
+        reset live windows, or trip the odd-prefix check."""
+        reqs = [_FakeReq(num_prompt_tokens=6, num_output_tokens=1) for _ in range(2)]
+        batch = ScheduleBatch(reqs=reqs)
+        batch.forward_mode = ForwardMode.DECODE
+        batch.enable_overlap = True
+        batch.seq_lens_cpu = torch.tensor([8, 97], dtype=torch.int64)
+        batch.req_pool_indices = torch.tensor([3, 4])
+        # Left by the prefill that placed the first request.
+        batch.encoder_swa_reset = [True]
+        batch.convert_decode_to_extend()
+
+        self.assertEqual(folded_replay_rows(batch), 0)
+        window = MagicMock()
+        rows = _reset_windows_and_collect_hits(batch=batch, window=window)
+        self.assertEqual(rows, [])
+        window.reset.assert_not_called()
 
     def test_short_seq_lens_fails_loudly(self):
         """A row/req divergence the slice cannot explain must raise, not

@@ -11,7 +11,6 @@ from collections import defaultdict
 from unittest import mock
 
 import torch
-from test_unified_radix_cache_unittest import CacheConfig, UnifiedRadixCacheSuite
 
 from sglang.srt.mem_cache.unified_cache.cache_action import MambaEvictExcessPathStates
 from sglang.srt.mem_cache.unified_cache.components.base import (
@@ -23,6 +22,10 @@ from sglang.srt.mem_cache.unified_cache.components.mamba import (
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedLRUList, UnifiedTreeNode
 from sglang.srt.server_args import ServerArgs
+from sglang.test.kits.unified_radix_cache.config import (
+    CacheConfig,
+)
+from sglang.test.kits.unified_radix_cache.mixins import UnifiedRadixCacheFixtures
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -57,7 +60,9 @@ class _FakeTreeCore:
             self, node, component, *args, **kwargs
         )
 
-    def _cascade_evict(self, node, component, tracker, device_frees, host_frees):
+    def _cascade_evict(
+        self, node, component, tracker, device_frees, host_frees, cache_actions
+    ):
         self.cascaded.append(node)
 
 
@@ -106,7 +111,11 @@ class TestMambaPathStateCap(unittest.TestCase):
 
         device_frees = defaultdict(list)
         host_frees = defaultdict(list)
-        component._evict_excess_path_states(nodes[-1], device_frees, host_frees)
+        cache_actions = []
+        component._evict_excess_path_states(
+            nodes[-1], device_frees, host_frees, cache_actions
+        )
+        self.assertEqual(cache_actions, [])
 
         self.assertEqual(core.evicted, [nodes[0]])
         self.assertEqual(core.cascaded, [nodes[0]])
@@ -134,7 +143,11 @@ class TestMambaPathStateCap(unittest.TestCase):
 
         device_frees = defaultdict(list)
         host_frees = defaultdict(list)
-        component._evict_excess_path_states(nodes[-1], device_frees, host_frees)
+        cache_actions = []
+        component._evict_excess_path_states(
+            nodes[-1], device_frees, host_frees, cache_actions
+        )
+        self.assertEqual(cache_actions, [])
 
         self.assertEqual(core.evicted, [nodes[2]])
         self.assertIsNotNone(nodes[0].component_data[ComponentType.MAMBA].value)
@@ -149,7 +162,11 @@ class TestMambaPathStateCap(unittest.TestCase):
 
         device_frees = defaultdict(list)
         host_frees = defaultdict(list)
-        component._evict_excess_path_states(nodes[-1], device_frees, host_frees)
+        cache_actions = []
+        component._evict_excess_path_states(
+            nodes[-1], device_frees, host_frees, cache_actions
+        )
+        self.assertEqual(cache_actions, [])
 
         self.assertIsNone(mamba_data.value)
         self.assertIsNotNone(mamba_data.host_value)
@@ -160,7 +177,11 @@ class TestMambaPathStateCap(unittest.TestCase):
 
         device_frees = defaultdict(list)
         host_frees = defaultdict(list)
-        component._evict_excess_path_states(nodes[-1], device_frees, host_frees)
+        cache_actions = []
+        component._evict_excess_path_states(
+            nodes[-1], device_frees, host_frees, cache_actions
+        )
+        self.assertEqual(cache_actions, [])
 
         self.assertEqual(dict(device_frees), {})
         self.assertEqual(core.evicted, [])
@@ -173,18 +194,10 @@ class TestMambaPathStateCap(unittest.TestCase):
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "mamba pool fixtures need CUDA")
-class TestMambaPathCapWriteThroughOrdering(CustomTestCase):
-    """CI-active write-through/path-cap ordering regressions (the unified radix
-    cache unittest module is temporarily gated off on trunk)."""
+class TestMambaPathCapWriteThroughOrdering(UnifiedRadixCacheFixtures, CustomTestCase):
+    """Write-through backup ordering regressions under the Mamba path-state cap."""
 
     cfg = CacheConfig(components=(ComponentType.FULL, ComponentType.MAMBA))
-    _rid = 0
-    # Borrow the fixture helpers without inheriting the full gated suite.
-    _make_req = UnifiedRadixCacheSuite._make_req
-    _alloc = UnifiedRadixCacheSuite._alloc
-    _insert = UnifiedRadixCacheSuite._insert
-    _init_hicache = UnifiedRadixCacheSuite._init_hicache
-    _build_hicache_fixture = UnifiedRadixCacheSuite._build_hicache_fixture
 
     def test_write_through_backup_survives_mamba_path_cap(self):
         cache, allocator, req_to_token_pool = self._build_hicache_fixture()
@@ -303,9 +316,8 @@ class TestMambaPathCapWriteThroughOrdering(CustomTestCase):
         self.assertIsNotNone(ancestor_cd.value)
         self.assertIsNone(ancestor_cd.host_value)
 
-    def test_cap_walk_failure_still_drains_collected_frees(self):
-        """A cap walk that raises mid-eviction must still free the tombstoned
-        slots it already collected (the pre-split inline frees could not leak)."""
+    def test_cap_walk_failure_still_drains_frees_and_actions(self):
+        """A failed cap walk drains collected frees before its actions."""
         cache, allocator, req_to_token_pool = self._build_hicache_fixture()
         mamba_comp = cache.components[ComponentType.MAMBA]
 
@@ -317,12 +329,36 @@ class TestMambaPathCapWriteThroughOrdering(CustomTestCase):
 
         mamba_comp.mamba_max_states_per_path = 1
         available = req_to_token_pool.mamba_allocator.available_size()
-        with mock.patch.object(
-            cache.tree_core, "_cascade_evict", side_effect=RuntimeError("boom")
+        action = mock.sentinel.eviction_action
+
+        def fail_after_action(*args, **kwargs):
+            kwargs["cache_actions"].append(action)
+            raise RuntimeError("boom")
+
+        applied_actions = []
+        apply_cache_action = cache._apply_cache_action
+
+        def check_action_after_free(received):
+            if received is action:
+                self.assertEqual(
+                    req_to_token_pool.mamba_allocator.available_size(), available + 1
+                )
+                applied_actions.append(received)
+            else:
+                apply_cache_action(received)
+
+        with (
+            mock.patch.object(
+                cache.tree_core, "_cascade_evict", side_effect=fail_after_action
+            ),
+            mock.patch.object(
+                cache, "_apply_cache_action", side_effect=check_action_after_free
+            ),
         ):
-            with self.assertRaises(RuntimeError):
+            with self.assertRaisesRegex(RuntimeError, "boom"):
                 mamba_comp.apply_component_action(MambaEvictExcessPathStates(leaf.id))
 
+        self.assertEqual(applied_actions, [action])
         self.assertIsNone(ancestor.component_data[ComponentType.MAMBA].value)
         self.assertEqual(
             req_to_token_pool.mamba_allocator.available_size(), available + 1

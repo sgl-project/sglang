@@ -7,10 +7,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from sglang.kernels.ops.attention.deepseek_v4_rope import (
-    apply_rotary_emb_triton,
-    precompute_freqs_cis,
-)
 from sglang.kernels.ops.attention.dsv4 import (
     CompressorDecodePlan,
     compress_norm_rope_store,
@@ -20,13 +16,20 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
     finish_paged_indexer_topk,
     fp4_index_logits_decode,
     fp4_index_logits_paged,
-    quantize_fp4_indexer_tensor,
-    store_fp4_index_k_cache,
 )
+from sglang.kernels.ops.attention.dsv4.rope import (
+    apply_rotary_emb_triton,
+    precompute_freqs_cis,
+)
+from sglang.kernels.ops.kvcache.dsv4_fp4_index_k_cache import store_fp4_index_k_cache
 from sglang.srt.utils import get_device, is_xpu
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.kernels.deepseek_v4.common import (
+    quantize_fp4_indexer_ref,
+    store_fp4_index_cache_ref,
+)
 
-register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=50, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 _is_xpu = is_xpu()
 if _is_xpu:
@@ -36,194 +39,8 @@ else:
 
 HEAD_DIM = 128
 FP4_DIM = HEAD_DIM // 2
-GROUP_SIZE = 32
-SCALE_GROUPS = HEAD_DIM // GROUP_SIZE
 SCALE_BYTES = 4
 PAGE_SIZE = 64
-E2M1_MAX = 6.0
-
-
-def _ceil_ue8m0_exp_ref(x: torch.Tensor) -> torch.Tensor:
-    bits = x.to(torch.float32).contiguous().view(torch.int32)
-    exp = (bits >> 23) & 0xFF
-    mantissa = bits & 0x7FFFFF
-    exp = exp + (mantissa != 0).to(torch.int32)
-    return exp.clamp(1, 254)
-
-
-def _fp4_e2m1_code_ref(x: torch.Tensor) -> torch.Tensor:
-    ax = torch.minimum(x.abs(), torch.tensor(E2M1_MAX, device=x.device))
-    idx = torch.zeros_like(ax, dtype=torch.uint8)
-    for threshold in (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0):
-        idx += (ax > threshold).to(torch.uint8)
-    sign = ((x < 0) & (idx != 0)).to(torch.uint8) * 8
-    return idx | sign
-
-
-def _ref_quantize_fp4_indexer(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    x = x.contiguous().view(-1, HEAD_DIM).float()
-    groups = x.view(-1, SCALE_GROUPS, GROUP_SIZE)
-    scale_raw = (groups.abs().amax(dim=-1) / E2M1_MAX).clamp_min(1.0e-4)
-    scale_exp = _ceil_ue8m0_exp_ref(scale_raw)
-    scale = (scale_exp << 23).contiguous().view(torch.float32)
-
-    scaled = (groups / scale.unsqueeze(-1)).view(-1, HEAD_DIM)
-    code = _fp4_e2m1_code_ref(scaled)
-    packed = (code[:, 0::2].to(torch.int16) | (code[:, 1::2].to(torch.int16) << 4)).to(
-        torch.uint8
-    )
-
-    packed_sf = scale_exp[:, 0].clone()
-    for group_id in range(1, SCALE_GROUPS):
-        packed_sf |= scale_exp[:, group_id] << (8 * group_id)
-    return packed, packed_sf
-
-
-def _ref_store_fp4_index_cache(
-    x_fp4: torch.Tensor,
-    x_sf: torch.Tensor,
-    loc: torch.Tensor,
-    num_pages: int,
-) -> torch.Tensor:
-    expected = torch.zeros(
-        num_pages,
-        PAGE_SIZE * (FP4_DIM + SCALE_BYTES),
-        device=x_fp4.device,
-        dtype=torch.uint8,
-    )
-    sf_shifts = torch.arange(0, 32, 8, device=x_fp4.device, dtype=torch.int32)
-    for token_id in range(x_fp4.shape[0]):
-        cache_loc = int(loc[token_id].item())
-        page = cache_loc // PAGE_SIZE
-        offset = cache_loc % PAGE_SIZE
-        expected[page, offset * FP4_DIM : (offset + 1) * FP4_DIM] = x_fp4[token_id]
-        sf_start = PAGE_SIZE * FP4_DIM + offset * SCALE_BYTES
-        expected[page, sf_start : sf_start + SCALE_BYTES] = (
-            (x_sf[token_id] >> sf_shifts) & 0xFF
-        ).to(torch.uint8)
-    return expected
-
-
-@pytest.mark.parametrize("num_tokens", [1, 7, 96])
-def test_quantize_fp4_indexer_tensor(num_tokens: int) -> None:
-    torch.manual_seed(num_tokens)
-    x = torch.randn(num_tokens, HEAD_DIM, device=get_device(), dtype=torch.bfloat16)
-    x[0, :8] = torch.tensor(
-        [-8.0, -6.0, -3.0, -1.5, 0.0, 0.5, 2.0, 8.0],
-        device=get_device(),
-        dtype=torch.bfloat16,
-    )
-
-    x_fp4, x_sf = quantize_fp4_indexer_tensor(x)
-    ref_fp4, ref_sf = _ref_quantize_fp4_indexer(x)
-
-    torch.testing.assert_close(x_fp4.view(torch.uint8), ref_fp4)
-    torch.testing.assert_close(x_sf, ref_sf)
-
-
-@pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10,
-    reason="Vectorized prefill dispatch targets Blackwell",
-)
-@pytest.mark.parametrize("rows", [4096, 4097, 16384, 524288])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("rne", [False, True])
-@pytest.mark.parametrize("strided", [False, True])
-def test_prefill_quantization_matches_single_row_and_replay(rows, dtype, rne, strided):
-    from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
-        _quantize_fp4_indexer_kernel,
-    )
-
-    x = torch.randn(rows, 256 if strided else 128, device="cuda", dtype=dtype)
-    if strided:
-        x = x[:, ::2]
-
-    def reference():
-        q = torch.empty(rows, 64, device="cuda", dtype=torch.int8)
-        sf = torch.empty(rows, device="cuda", dtype=torch.int32)
-        _quantize_fp4_indexer_kernel[(rows,)](
-            x.contiguous(),
-            q,
-            sf,
-            BLOCK_N=128,
-            GROUP_N=32,
-            RNE=rne,
-        )
-        return q, sf
-
-    for _ in range(3):
-        quantize_fp4_indexer_tensor(x, rne)
-        reference()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        actual = quantize_fp4_indexer_tensor(x, rne)
-    boundaries = torch.tensor(
-        [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0, 6.0], device="cuda", dtype=dtype
-    )
-    for scale in (0.0, 1e-6, 1.0, 1e3):
-        x.normal_().mul_(scale)
-        x[:2] = boundaries.repeat(16)
-        x[1].neg_()
-        graph.replay()
-        for a, b in zip(actual, reference()):
-            assert torch.equal(a, b)
-
-
-@pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10,
-    reason="Vectorized prefill dispatch targets Blackwell",
-)
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("rne", [False, True])
-def test_prefill_quantization_nonfinite_group_replay(dtype, rne):
-    from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
-        _quantize_fp4_indexer_kernel,
-    )
-
-    rows = 4097  # Also exercise the final partial CTA.
-    x = torch.randn(rows, HEAD_DIM, device="cuda", dtype=dtype)
-    expected = (
-        torch.empty(rows, FP4_DIM, device="cuda", dtype=torch.int8),
-        torch.empty(rows, device="cuda", dtype=torch.int32),
-    )
-    for _ in range(3):
-        quantize_fp4_indexer_tensor(x, rne)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        actual = quantize_fp4_indexer_tensor(x, rne)
-    for value in (float("inf"), float("-inf"), float("nan"), 0.0):
-        x.normal_()
-        x[:, 0] = value
-        x[:, 32:64] = value
-        x[-1, 96:] = value
-        graph.replay()
-        _quantize_fp4_indexer_kernel[(rows,)](
-            x, *expected, BLOCK_N=HEAD_DIM, GROUP_N=GROUP_SIZE, RNE=rne
-        )
-        for a, b in zip(actual, expected):
-            assert torch.equal(a, b)
-
-
-@pytest.mark.parametrize("num_tokens", [1, 16, 96])
-def test_fp4_index_cache_store_layout(num_tokens: int) -> None:
-    torch.manual_seed(num_tokens)
-    num_pages = max(1, (num_tokens + PAGE_SIZE - 1) // PAGE_SIZE)
-    x = torch.randn(num_tokens, HEAD_DIM, device=get_device(), dtype=torch.bfloat16)
-    loc = torch.randperm(num_pages * PAGE_SIZE, device=get_device())[:num_tokens].to(
-        torch.int64
-    )
-    cache = torch.zeros(
-        num_pages,
-        PAGE_SIZE * (FP4_DIM + SCALE_BYTES),
-        device=get_device(),
-        dtype=torch.uint8,
-    )
-
-    store_fp4_index_k_cache(x, cache, loc, page_size=PAGE_SIZE)
-
-    ref_fp4, ref_sf = _ref_quantize_fp4_indexer(x)
-    expected = _ref_store_fp4_index_cache(ref_fp4, ref_sf, loc, num_pages)
-    torch.testing.assert_close(cache, expected)
 
 
 @pytest.mark.parametrize("num_tokens", [1, 16, 96])
@@ -277,9 +94,9 @@ def test_fp4_fused_norm_rope_store_layout(num_tokens: int) -> None:
     rope_out[..., 1] = rope[..., 0] * freqs[..., 1] + rope[..., 1] * freqs[..., 0]
     ref[:, 64:] = rope_out.reshape(num_tokens, 64)
     ref = hadamard_transform(ref.contiguous(), scale=HEAD_DIM**-0.5)
-    ref_fp4, ref_sf = _ref_quantize_fp4_indexer(ref)
+    ref_fp4, ref_sf = quantize_fp4_indexer_ref(ref)
 
-    expected = _ref_store_fp4_index_cache(
+    expected = store_fp4_index_cache_ref(
         ref_fp4,
         ref_sf,
         loc.to(torch.int64),
@@ -316,7 +133,7 @@ def test_fp4_fused_q_indexer_rope_hadamard_quant(batch_size: int) -> None:
     ref = q.clone()
     apply_rotary_emb_triton(ref[..., -rope_dim:], freqs_cis, positions=positions)
     ref = hadamard_transform(ref.contiguous(), scale=HEAD_DIM**-0.5)
-    ref_fp4, ref_sf = _ref_quantize_fp4_indexer(ref.view(-1, HEAD_DIM))
+    ref_fp4, ref_sf = quantize_fp4_indexer_ref(ref.view(-1, HEAD_DIM))
     ref_fp4 = ref_fp4.view(batch_size, num_heads, FP4_DIM)
     ref_sf = ref_sf.view(batch_size, num_heads)
 
@@ -615,6 +432,14 @@ def test_hopper_indexer_backends_replay(ratio):
     req_table[:, : width * ratio : ratio] = (slots[::6] * ratio).int()
     positions = (lens * ratio - 1).clamp_min(0)
     pool = SimpleNamespace(get_index_k_with_scale_buffer=lambda layer: table)
+    # A unit page keeps the per-row table valid under the shuffled slots below.
+    page_table = torch.empty((batch, capacity), device=q.device, dtype=torch.int32)
+    page_table.copy_(req_table[req.long(), ::ratio] // ratio)
+    metadata = SimpleNamespace(
+        max_compressed_seq_len=capacity,
+        page_table=page_table,
+        compressed_page_size=1,
+    )
     indexer = SimpleNamespace(
         queries=lambda q, freqs: q, head_weights=lambda x: x, index_topk=topk
     )
@@ -626,7 +451,7 @@ def test_hopper_indexer_backends_replay(ratio):
         x=weights,
         positions=positions,
         req_rows=req,
-        paged_metadata=SimpleNamespace(max_compressed_seq_len=capacity),
+        paged_metadata=metadata,
         is_verify=True,
     )
     kwargs = dict(
@@ -636,14 +461,14 @@ def test_hopper_indexer_backends_replay(ratio):
     candidates = DenseBlocksBackend(
         **kwargs, candidate_topk_blocks=4, candidate_block_size=8
     )
+    # DeepSelect fills a full top-k buffer of exactly live rows by topk, as at
+    # runtime; the candidate paths also clear padded rows and columns.
     outputs = [
         SimpleNamespace(
-            page_indices=torch.empty(
-                (batch + 1, topk + 8), device=q.device, dtype=torch.int32
-            ),
+            page_indices=torch.empty(shape, device=q.device, dtype=torch.int32),
             raw_indices=None,
         )
-        for _ in range(3)
+        for shape in ((batch, topk), (batch + 1, topk + 8), (batch + 1, topk + 8))
     ]
     decode_inputs = [
         DecodeInputs(
@@ -686,6 +511,7 @@ def test_hopper_indexer_backends_replay(ratio):
         positions.copy_(lens * ratio - 1)
         req.copy_(req.roll(1))
         req_table[:, : width * ratio : ratio] = (slots[::6].roll(step, 1) * ratio).int()
+        page_table.copy_(req_table[req.long(), ::ratio] // ratio)
         q.neg_()
         for scores in captured_scores:
             scores.fill_(torch.inf)
@@ -741,7 +567,7 @@ def test_hopper_indexer_backends_replay(ratio):
                     expected_raw = torch.full_like(out.raw_indices[row], -1)
                     expected_raw[:count] = selected.sort().values.int()
                     torch.testing.assert_close(out.raw_indices[row], expected_raw)
-        for out in outputs:
+        for out in outputs[1:]:
             assert (out.page_indices[batch] == -1).all().item()
             if out.raw_indices is not None:
                 assert (out.raw_indices[batch] == -1).all().item()

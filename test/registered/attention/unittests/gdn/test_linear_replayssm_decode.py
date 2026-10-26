@@ -1,6 +1,6 @@
 """Correctness test for the buffered output-only linear-attention decode kernel
 (ReplaySSM Part A), implemented in
-``python/sglang/srt/layers/attention/fla/fused_recurrent_linear_replayssm.py``.
+``python/sglang/kernels/ops/attention/linear/fused_recurrent_linear_replayssm.py``.
 
 One kernel, two gate granularities (selected by ``is_kda``):
   * GDN (``is_kda=False``): per-head SCALAR gate. Ground truth =
@@ -98,7 +98,7 @@ class TestLinearReplaySSMDecode(CustomTestCase):
             fused_recurrent_gated_delta_rule_packed_decode,
             fused_recurrent_kda_packed_decode,
         )
-        from sglang.kernels.ops.attention.fla.fused_recurrent_linear_replayssm import (
+        from sglang.kernels.ops.attention.linear.fused_recurrent_linear_replayssm import (
             fused_recurrent_linear_replayssm_decode,
         )
 

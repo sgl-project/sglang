@@ -53,6 +53,10 @@ class TestEagle3ParityXPU(SpecParityKit, _Eagle3ParityBase):
     # EAGLE3 + full CUDA-graph decode capture on XPU takes >600s from cold on
     # Arc-class GPUs; the 600s default trips a spurious launch timeout here.
     server_launch_timeout = 1800
+    # XPU captures target-verify, draft-decode and draft-extend full graphs;
+    # at 0.80 the 2.25 GiB draft-extend attn_logits buffer OOMs at capture,
+    # and 0.75 leaves too little for the first prefill.
+    mem_fraction_static = 0.70
 
 
 if __name__ == "__main__":

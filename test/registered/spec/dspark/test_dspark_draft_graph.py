@@ -1,5 +1,5 @@
 import unittest
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest import mock
 
 import torch
@@ -7,7 +7,11 @@ import torch
 from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
     MarkovGreedyStep,
 )
-from sglang.srt.models.dspark import VanillaMarkov
+from sglang.srt.models.dspark import (
+    DSparkConfidenceHead,
+    DSparkDraftMixin,
+    VanillaMarkov,
+)
 from sglang.srt.speculative.dspark_components.dspark_draft import (
     DraftNoise,
     draft_markov_block,
@@ -127,9 +131,15 @@ class TestDraftMarkovBlockGraph(CustomTestCase):
         weight = torch.randn(VOCAB, 64, device=DEVICE).to(torch.bfloat16)
         model = SimpleNamespace(
             markov_head=head,
+            confidence_head=DSparkConfidenceHead(hidden_size=64, markov_rank=RANK).to(
+                DEVICE
+            ),
             sample_from_anchor=True,
             lm_head=SimpleNamespace(org_vocab_size=VOCAB, weight=weight),
-            compute_base_logits=lambda hidden: (hidden @ weight.T, None),
+            compute_base_logits=lambda hidden: (hidden @ weight.T, hidden),
+        )
+        model.compute_confidence = MethodType(
+            DSparkDraftMixin.compute_confidence, model
         )
         tp_sync = SimpleNamespace(sync=lambda site, value: value)
         noise = DraftNoise(
@@ -179,6 +189,14 @@ class TestDraftMarkovBlockGraph(CustomTestCase):
         )
         self.assertTrue(torch.equal(sampler.step_logits[:BS], eager.corrected_logits))
         self.assertEqual(noise.offset.item(), eager_noise.offset.item())
+        # Folded steps carry the confidence the eager proposal computes.
+        confidence, confidence_raw = model.compute_confidence(
+            anchor_tokens=input_ids.view(BS, GAMMA)[:, 0],
+            draft_tokens=eager.draft_tokens,
+            confidence_features=hidden,
+        )
+        self.assertTrue(torch.equal(sampler.confidence_out[:BS], confidence))
+        self.assertTrue(torch.equal(sampler.confidence_raw_out[:BS], confidence_raw))
 
 
 if __name__ == "__main__":

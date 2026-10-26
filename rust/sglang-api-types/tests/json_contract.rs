@@ -84,10 +84,9 @@ fn sampling_denies_unknown_keys() {
 /// pinned in message/request.rs).
 #[test]
 fn generate_request_ignores_unknown_keys() {
-    let req: GenerateRequest = serde_json::from_str(
-        r#"{"text": "hi", "priority": 3, "session_id": "s", "custom_logit_processor": "x"}"#,
-    )
-    .unwrap();
+    let req: GenerateRequest =
+        serde_json::from_str(r#"{"text": "hi", "priority": 3, "conversation_id": "ignored"}"#)
+            .unwrap();
     assert!(matches!(
         req.text,
         Some(StringOrList {
@@ -247,13 +246,15 @@ fn generate_response_matches_frame_value_shape() {
             prompt_tokens: 5,
             completion_tokens: 2,
             finish_reason: None,
+            cached_tokens: 3,
             ..Default::default()
         }),
         index: None,
+        prompt_token_ids: None,
     };
     assert_eq!(
         serde_json::to_string(&frame).unwrap(),
-        r#"{"text":"ok","meta_info":{"id":"client-rid","prompt_tokens":5,"completion_tokens":2,"finish_reason":null},"output_ids":[7,8]}"#
+        r#"{"text":"ok","meta_info":{"id":"client-rid","prompt_tokens":5,"completion_tokens":2,"finish_reason":null,"cached_tokens":3,"reasoning_tokens":0},"output_ids":[7,8]}"#
     );
 }
 

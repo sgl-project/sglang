@@ -286,7 +286,7 @@ def test_communicator_publishes_layout_at_each_transition(
 def test_manager_uses_current_dp_cuda_graph_eligibility(can_run_decode_cuda_graph):
     manager = LoRAManager.__new__(LoRAManager)
     manager.attn_dp_enabled = True
-    manager.max_bs_in_cuda_graph = 4
+    manager.max_bs_in_decode_cuda_graph = 4
     tokens = torch.zeros(2, dtype=torch.int64)
     forward_batch = ForwardBatch(
         forward_mode=ForwardMode.DECODE,

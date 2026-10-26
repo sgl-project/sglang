@@ -38,7 +38,9 @@ def _make_processor(case, server_mode: str = "full") -> SchedulerBatchResultProc
         disaggregation_mode=None,
         enable_overlap=False,
         enable_overlap_mlx=False,
-        model_config=SimpleNamespace(think_end_ids=None),
+        model_config=SimpleNamespace(
+            think_end_ids=None, self_opened_think_start_ids=None
+        ),
         token_to_kv_pool_allocator=Mock(),
         tree_cache=None,
         hisparse_coordinator=None,
@@ -169,6 +171,7 @@ class _PrefillReq:
         self.require_reasoning = False
         self.customized_info = None
         self.beam_group = None
+        self.discard_output_reason = None
 
     def finished(self):
         return False

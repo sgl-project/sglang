@@ -526,6 +526,7 @@ def test_pdmux_split_prefill_schedules_auxiliary_output_copy():
     scheduler.is_generation = True
     scheduler.enable_overlap = False
     scheduler.enable_pdmux = True
+    scheduler.enable_unified_cache_external_linker = False
     scheduler.tp_worker = SimpleNamespace(
         forward_batch_split_prefill=Mock(return_value=result)
     )
@@ -576,6 +577,7 @@ def test_disaggregated_prefill_consumes_auxiliary_output_after_commit():
         finished_len=None,
         to_finish=None,
         finished_reason=None,
+        discard_output_reason=None,
         inflight_middle_chunks=0,
         pending_bootstrap=False,
         return_logprob=False,
