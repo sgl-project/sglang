@@ -400,7 +400,9 @@ class ZImageAttention(nn.Module):
                 freqs_complex=rope_freqs_complex,
                 is_neox=False,
                 positions=rope_positions,
-                allow_inplace=False,
+                # CUDA keeps main's unfused path here; ROCm/XPU get their in-place
+                # qk-norm(+RoPE) kernels back, as main's no-cache branch allowed.
+                allow_inplace=self.enable_zimage_qk_fusion and not _is_cuda,
             )
         else:
             if fused_qk is not None:

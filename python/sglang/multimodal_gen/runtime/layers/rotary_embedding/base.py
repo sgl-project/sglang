@@ -330,6 +330,14 @@ class RotaryEmbedding(CustomOp):
             positions=positions,
         )
 
+    # flashinfer is imported only on CUDA, so forward_cuda would end in its bf16
+    # eager fallback here; native keeps triton / fp32 math.
+    def forward_hip(self, *args, **kwargs):
+        return self.forward_native(*args, **kwargs)
+
+    def forward_musa(self, *args, **kwargs):
+        return self.forward_native(*args, **kwargs)
+
     def forward_xpu(self, *args, **kwargs):
         return self.forward_native(*args, **kwargs)
 
