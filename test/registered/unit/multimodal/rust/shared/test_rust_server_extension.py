@@ -300,26 +300,37 @@ class TestRustServerExtension(CustomTestCase):
             ],
         )
 
-    def test_gather_server_endpoints_rejects_a_loopback_host_across_nodes(self):
-        """A multi-node launch whose listener address only this machine can
-        reach fails before the collective, on every rank."""
-        all_gather_object = Mock()
-        parallel = SimpleNamespace(
-            nnodes=2,
-            world_group=SimpleNamespace(all_gather_object=all_gather_object),
-        )
-        for host in ("127.0.0.1", "localhost", "::1", "[::1]"):
+    def test_gather_server_endpoints_warns_on_an_unreachable_loopback_host(self):
+        """A multi-node launch whose listener is loopback warns, naming the
+        host and rendezvous address, unless the nodes rendezvous on loopback
+        too (several nodes emulated on one machine), and still gathers."""
+        all_gather_object = Mock(return_value=[None, None])
+        for dist_init_addr, warns in (
+            ("10.0.0.1:5000", True),
+            ("127.0.0.1:5000", False),
+            ("[::1]:5000", False),
+            (None, True),
+        ):
+            parallel = SimpleNamespace(
+                nnodes=2,
+                dist_init_addr=dist_init_addr,
+                world_group=SimpleNamespace(all_gather_object=all_gather_object),
+            )
             with (
                 patch.object(server_module, "get_parallel", return_value=parallel),
                 patch.object(
                     server_module,
                     "get_serving",
-                    return_value=SimpleNamespace(host=host, port=30000),
+                    return_value=SimpleNamespace(host="127.0.0.1", port=30000),
                 ),
+                patch.object(server_module.logger, "warning") as warning,
             ):
-                with self.assertRaisesRegex(ValueError, "not reachable"):
-                    RustServer.gather_server_endpoints(hosts_listener=False)
-        all_gather_object.assert_not_called()
+                RustServer.gather_server_endpoints(hosts_listener=False)
+            self.assertEqual(warning.called, warns, dist_init_addr)
+            if warns:
+                self.assertIn("127.0.0.1", warning.call_args.args[1])
+                self.assertEqual(warning.call_args.args[3], dist_init_addr)
+        self.assertEqual(all_gather_object.call_count, 4)
 
     def test_scheduler_aborts_reach_the_rust_egress(self):
         """An abort the scheduler sends outside the output stream becomes a

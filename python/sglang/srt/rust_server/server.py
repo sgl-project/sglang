@@ -68,6 +68,16 @@ def _is_loopback(host: str) -> bool:
         return False  # a hostname; assume it resolves beyond this machine
 
 
+def _rendezvous_is_loopback(dist_init_addr: Optional[str]) -> bool:
+    """Whether every node rendezvoused on this machine (nodes emulated locally)."""
+    if not dist_init_addr:
+        return False
+    try:
+        return _is_loopback(NetworkAddress.parse(dist_init_addr).host)
+    except ValueError:
+        return False
+
+
 class RustServer:
     """Owns the embedded multi-threaded Rust server (``sglang_server.Server``).
 
@@ -183,14 +193,19 @@ class RustServer:
             # An unspecified bind address is not reachable from another
             # node; advertise the address the interfaces answer on.
             host = get_local_ip_auto(fallback="127.0.0.1")
-        # Checked on every rank, before the collective, so a bad host fails
-        # the whole launch instead of parking the other ranks in the gather.
+        # Nodes that rendezvous on loopback share this machine, so a loopback
+        # listener reaches them; otherwise it is a likely misconfiguration.
         if get_parallel().nnodes > 1 and _is_loopback(host):
-            raise ValueError(
-                f"SGLANG_RUST_SERVER: listener address {host!r} is not reachable "
-                f"from the other {get_parallel().nnodes - 1} node(s), so control "
-                "requests cannot fan out; launch with a routable --host"
-            )
+            dist_init_addr = get_parallel().dist_init_addr
+            if not _rendezvous_is_loopback(dist_init_addr):
+                logger.warning(
+                    "SGLANG_RUST_SERVER: this rank listens on loopback %r but the "
+                    "%d nodes rendezvous at %r; a node on another machine cannot "
+                    "reach this rank's control endpoint",
+                    host,
+                    get_parallel().nnodes,
+                    dist_init_addr,
+                )
         config = None
         if hosts_listener:
             port = get_serving().port + cls._port_offset()
