@@ -11,6 +11,7 @@ import weakref
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.numa_memory import check_numa_memory_capacity
 
 logger = logging.getLogger(__name__)
 
@@ -122,6 +123,7 @@ def alloc_mmap(dims: tuple, dtype: torch.dtype) -> torch.Tensor:
     # works correctly in tests.
     hugepage_size = (envs.SGLANG_HUGEPAGE_SIZE.get() or "").strip().upper()
     n_bytes = math.prod(dims) * torch.empty([], dtype=dtype).element_size()
+    check_numa_memory_capacity(n_bytes)
 
     if hugepage_size == "":
         page_size, extra_flags = mmap.PAGESIZE, 0
@@ -177,6 +179,7 @@ def alloc_shm(dims: tuple, dtype: torch.dtype) -> tuple[torch.Tensor, int, mmap.
     """
     hugepage_size = (envs.SGLANG_HUGEPAGE_SIZE.get() or "").strip().upper()
     n_bytes = math.prod(dims) * torch.empty([], dtype=dtype).element_size()
+    check_numa_memory_capacity(n_bytes)
 
     # Note: hugepages are not directly supported with /dev/shm mmap files
     # without mounting hugetlbfs there, so we fall back to plain page size.

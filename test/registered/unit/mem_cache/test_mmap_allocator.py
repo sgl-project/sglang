@@ -14,9 +14,11 @@ import unittest.mock
 
 import torch
 
+from sglang.srt.mem_cache import numa_memory
 from sglang.srt.mem_cache.pool_host.common import ShmHostTensorAllocator
-from sglang.srt.mem_cache.storage.mmap import alloc_shm
+from sglang.srt.mem_cache.storage.mmap import alloc_shm, mmap_allocator
 from sglang.srt.mem_cache.storage.mmap.mmap_allocator import _mmap_prefaulted
+from sglang.test.test_utils import CustomTestCase
 
 
 class TestMmapAllocator(unittest.TestCase):
@@ -81,6 +83,83 @@ class TestMmapAllocator(unittest.TestCase):
         with self.assertRaises(AssertionError) as ctx:
             allocator.allocate((2, 2), torch.float32, device="cuda")
         self.assertIn("only supports CPU allocations", str(ctx.exception))
+
+
+class TestNumaAllocationGuard(CustomTestCase):
+    def test_rejects_oversized_mapping_before_allocator_entry(self):
+        # The synthetic limit is 32 KiB. Even a regression requests only 36 KiB;
+        # sentinels additionally prevent mmap/hugepage/SHM allocation.
+        for allocate in (mmap_allocator.alloc_mmap, mmap_allocator.alloc_shm):
+            for hugepages in ("", "2MB", "1GB"):
+                with (
+                    self.subTest(allocator=allocate.__name__, hugepages=hugepages),
+                    unittest.mock.patch.object(
+                        numa_memory, "_numa_memory_capacity", return_value=([2], 32768)
+                    ),
+                    unittest.mock.patch.object(
+                        mmap_allocator.envs.SGLANG_HUGEPAGE_SIZE,
+                        "get",
+                        return_value=hugepages,
+                    ),
+                    unittest.mock.patch.object(
+                        mmap_allocator,
+                        "_mmap_prefaulted",
+                        side_effect=AssertionError("reached mmap"),
+                    ) as plain,
+                    unittest.mock.patch.object(
+                        mmap_allocator,
+                        "_alloc_hugepage",
+                        side_effect=AssertionError("reached hugepage mmap"),
+                    ) as huge,
+                    unittest.mock.patch.object(
+                        mmap_allocator.os,
+                        "memfd_create",
+                        side_effect=AssertionError("reached SHM allocation"),
+                        create=True,
+                    ) as shm,
+                ):
+                    with self.assertRaisesRegex(ValueError, "permitted NUMA nodes"):
+                        allocate((9, 1024), torch.float32)
+                    plain.assert_not_called()
+                    huge.assert_not_called()
+                    shm.assert_not_called()
+
+    def test_small_mapping_still_allocates(self):
+        with (
+            unittest.mock.patch.object(
+                numa_memory, "_numa_memory_capacity", return_value=([2], 32768)
+            ),
+            unittest.mock.patch.object(
+                mmap_allocator.envs.SGLANG_HUGEPAGE_SIZE, "get", return_value=""
+            ),
+        ):
+            tensor = mmap_allocator.alloc_mmap((1024,), torch.float32)
+            tensor.fill_(7)
+            self.assertEqual(tensor.sum().item(), 7168)
+            tensor, fd, mm = mmap_allocator.alloc_shm((1024,), torch.float32)
+            try:
+                tensor.fill_(7)
+                self.assertEqual(tensor.sum().item(), 7168)
+            finally:
+                del tensor
+                mm.close()
+                os.close(fd)
+
+    def test_hugepage_rounding_does_not_reject_plain_page_fallback(self):
+        with (
+            unittest.mock.patch.object(
+                numa_memory, "_numa_memory_capacity", return_value=([2], 32768)
+            ),
+            unittest.mock.patch.object(
+                mmap_allocator.envs.SGLANG_HUGEPAGE_SIZE, "get", return_value="1GB"
+            ),
+            unittest.mock.patch.object(
+                mmap_allocator, "_alloc_hugepage", side_effect=OSError("no hugepages")
+            ) as huge,
+        ):
+            tensor = mmap_allocator.alloc_mmap((1024,), torch.float32)
+            self.assertEqual(tensor.numel(), 1024)
+            huge.assert_called_once()
 
 
 if __name__ == "__main__":
