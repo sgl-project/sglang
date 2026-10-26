@@ -12,6 +12,8 @@ from typing import TYPE_CHECKING, Optional, Sequence
 
 import msgspec
 
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+
 # Tree node id -- the node handle used outside the TreeCore. The concrete tree
 # node is a TreeCore-internal type.
 NodeId = int
@@ -21,7 +23,7 @@ class BaseEvictionResult(msgspec.Struct):
     """Base of the eviction step results: the component-keyed device/host
     values the step freed, for the Controller to drain right after the call
     returns, plus `tracker` -- the step's per-component evicted counts for the
-    Controller to accumulate."""
+    Controller to accumulate. Free the values, then drain cache actions."""
 
     device_frees: dict[ComponentType, list[torch.Tensor]] = msgspec.field(
         default_factory=lambda: defaultdict(list)
@@ -32,12 +34,15 @@ class BaseEvictionResult(msgspec.Struct):
     tracker: dict[ComponentType, int] = msgspec.field(
         default_factory=lambda: defaultdict(int)
     )
+    cache_actions: list[CacheAction | ComponentAction] = msgspec.field(
+        default_factory=list
+    )
 
     def __del__(self) -> None:
-        # Drop tripwire: every returned value must be drained before disposal.
-        assert not self.device_frees and not self.host_frees, (
-            "BaseEvictionResult dropped with undrained values"
-        )
+        # Drop tripwire: every returned resource must be drained before disposal.
+        assert (
+            not self.device_frees and not self.host_frees and not self.cache_actions
+        ), "BaseEvictionResult dropped with undrained resources"
 
 
 class EvictDeviceNextNodeResult(BaseEvictionResult):
@@ -45,12 +50,18 @@ class EvictDeviceNextNodeResult(BaseEvictionResult):
 
     ``node_id`` selects a leaf for the Controller to evict. ``made_progress``
     also covers an internal tombstone that returned no leaf, distinguishing it
-    from true walk exhaustion.
+    from true walk exhaustion. ``mamba_backup_node_id`` and
+    ``swa_backup_node_id`` pause an internal eviction until the Controller
+    finishes its best-effort host backup. ``swa_backup_num_tokens`` includes
+    all unbacked SWA segments in the backup window, not just the victim.
     """
 
     node_id: Optional[NodeId] = None
     made_progress: bool = False
     unbacked_tokens: int = 0
+    mamba_backup_node_id: Optional[NodeId] = None
+    swa_backup_node_id: Optional[NodeId] = None
+    swa_backup_num_tokens: int = 0
 
 
 class EvictDeviceLeafResult(BaseEvictionResult):
@@ -98,6 +109,19 @@ class BufferBackupState(msgspec.Struct, frozen=True):
     parent_last_hash: Optional[str]
 
 
+class TreePathNodeInfo(msgspec.Struct, frozen=True):
+    """A node's key span on its root-to-node path."""
+
+    node_id: NodeId
+    parent_id: NodeId
+    # Half-open offsets from the root, in tokens (bigrams for bigram trees).
+    path_start: int
+    path_end: int
+    # Logical FULL device indices; None when the value is absent.
+    full_value_len: Optional[int]
+    num_children: int
+
+
 class InsertStepResult(msgspec.Struct, frozen=True):
     """One step of a resumable insert: the Controller executes ``actions``, then
     resumes while ``result`` is None; ``result`` is set on the final step."""
@@ -120,7 +144,11 @@ if TYPE_CHECKING:
         MatchResult,
     )
     from sglang.srt.mem_cache.events import KVCacheEventRecorder
-    from sglang.srt.mem_cache.hicache_storage import PoolTransfer, PoolTransferResult
+    from sglang.srt.mem_cache.hicache_storage import (
+        PoolName,
+        PoolTransfer,
+        PoolTransferResult,
+    )
     from sglang.srt.mem_cache.radix_cache import RadixKey
     from sglang.srt.mem_cache.unified_cache.cache_action import (
         BackupKV,
@@ -129,7 +157,6 @@ if TYPE_CHECKING:
     )
     from sglang.srt.mem_cache.unified_cache.components import (
         CacheTransferPhase,
-        ComponentType,
     )
     from sglang.srt.mem_cache.unified_cache.unified_tree_core import (
         StorageBackupSpec,
@@ -174,6 +201,14 @@ class UnifiedTreeCoreInterface(ABC):
         its tree node.
 
         TODO(Jialin): Remove after the Unified Radix Cache split.
+        """
+        ...
+
+    @abstractmethod
+    def is_write_through_compatible(self) -> bool:
+        """Whether current host ownership satisfies write-through invariants.
+
+        Read-only; the caller must have drained in-flight cache operations.
         """
         ...
 
@@ -253,6 +288,17 @@ class UnifiedTreeCoreInterface(ABC):
         ...
 
     @abstractmethod
+    def collect_path_info(
+        self, end_node_ids: Sequence[NodeId]
+    ) -> tuple[tuple[TreePathNodeInfo, ...], ...]:
+        """Copy root-to-node paths, excluding roots, in input order.
+
+        Roots produce empty paths; missing handles raise KeyError. Callers must
+        serialize with tree mutations; native backends hold one lock per batch.
+        """
+        ...
+
+    @abstractmethod
     def inc_lock_ref(
         self, node_id: NodeId, skip_lock_components: Sequence[ComponentType] = ()
     ) -> IncLockRefResult:
@@ -282,6 +328,15 @@ class UnifiedTreeCoreInterface(ABC):
         counts; the result carries the freed slots."""
         ...
 
+    def dec_window_lock_only(
+        self,
+        node_id: NodeId,
+        component_type: ComponentType,
+        params: DecLockRefParams,
+    ) -> DecSwaLockOnlyResult:
+        """Release one window's receipt without releasing peer components."""
+        raise NotImplementedError("This tree core does not support independent windows")
+
     # ==== Device eviction (driven step-wise by the Controller's evict()) ====
 
     @abstractmethod
@@ -308,6 +363,24 @@ class UnifiedTreeCoreInterface(ABC):
     ) -> EvictDeviceLeafResult:
         """Evict a leaf's device value; the result carries a BackupKV when a
         D->H backup must run (write_back) before the node can be demoted."""
+        ...
+
+    @abstractmethod
+    def finish_mamba_state_eviction(self, node_id: NodeId) -> EvictDeviceNextNodeResult:
+        """Resume the pending internal Mamba eviction after its backup attempt.
+
+        The controller must finish any submitted D->H transfer before calling.
+        A failed allocation still permits eviction to make device space.
+        """
+        ...
+
+    @abstractmethod
+    def finish_swa_state_eviction(self, node_id: NodeId) -> EvictDeviceNextNodeResult:
+        """Resume the pending internal SWA eviction after its backup attempt.
+
+        The controller must finish any submitted D->H transfer before calling.
+        A failed allocation still permits eviction to make device space.
+        """
         ...
 
     @abstractmethod
@@ -349,6 +422,23 @@ class UnifiedTreeCoreInterface(ABC):
         """Evictable token count for one component (0 if the component is absent)."""
         ...
 
+    def component_protected_size(self, component_type: ComponentType) -> int:
+        """Protected token count for one component (0 if absent)."""
+        raise NotImplementedError("This tree core does not expose per-component sizes")
+
+    @abstractmethod
+    def adjust_component_size(
+        self, node_id: NodeId, component_type: ComponentType, delta: int
+    ) -> None:
+        """Adjust protected/evictable tokens after the component backing changes.
+
+        Roots and nodes without device values are no-ops. Missing handles raise
+        KeyError; disabled components raise ValueError.
+        Negative totals raise ValueError without updating the count. Rust also
+        rejects fixed-width overflow; Python integers are unbounded.
+        """
+        ...
+
     @abstractmethod
     def full_evictable_size(self) -> int: ...
 
@@ -388,7 +478,7 @@ class UnifiedTreeCoreInterface(ABC):
 
     @abstractmethod
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
-        """Match a key against the tree; returns device indices + boundary NodeIds."""
+        """Match a key; returns the device prefix length + boundary NodeIds."""
         ...
 
     @abstractmethod
@@ -413,7 +503,7 @@ class UnifiedTreeCoreInterface(ABC):
     @property
     @abstractmethod
     def empty_match_result(self) -> MatchResult:
-        """A shared empty MatchResult (empty device indices + boundary NodeIds)."""
+        """A shared empty MatchResult (zero device prefix + boundary NodeIds)."""
         ...
 
     @abstractmethod
@@ -461,9 +551,11 @@ class UnifiedTreeCoreInterface(ABC):
         tail_node_id: NodeId,
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
+        cache_actions: list[CacheAction | ComponentAction],
     ) -> None:
         """Evict shallow Mamba device checkpoints beyond the per-path cap on the
-        tail's root path, collecting freed values into the caller's dicts."""
+        tail's root path, collecting freed values and actions into the caller's
+        buffers. The caller frees values, then drains actions, even on error."""
         ...
 
     # ==== HiCache ====
@@ -495,6 +587,20 @@ class UnifiedTreeCoreInterface(ABC):
     ) -> tuple[torch.Tensor, dict[ComponentType, list[PoolTransfer]]]:
         """Read a node's device->host backup spec (device value + transfers) now."""
         ...
+
+    def buffer_backup_pool_keys(
+        self, node_id: NodeId, hash_values: list[str]
+    ) -> dict[ComponentType, dict[PoolName, list[str]]]:
+        """Per component, the storage keys per pool a buffer-mode backup of
+        the node writes (``TreeComponent.buffer_backup_keys``); Rust cores name none."""
+        return {}
+
+    def build_backup_kv_action(self, node_id: NodeId) -> BackupKV:
+        """The write-through backup action for a node and its unstored
+        ancestors; only component-requested buffer backups need it."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not expose build_backup_kv_action"
+        )
 
     @abstractmethod
     def build_storage_backup_spec(
@@ -627,6 +733,34 @@ class UnifiedTreeCoreInterface(ABC):
     def finish_write_through(self, node_ids: list[NodeId], ack_id: int) -> None:
         """Clear the write-through-pending mark (when it matches ack_id) and record the
         host store event for each acked node."""
+        ...
+
+    @abstractmethod
+    def swa_tombstone_ranges(
+        self,
+        key: RadixKey,
+        start: int,
+        end: int,
+        component_type: ComponentType = ComponentType.SWA,
+    ) -> list[tuple[int, int]]:
+        """Return maximal missing SWA ranges within the matched [start, end) span."""
+        ...
+
+    @abstractmethod
+    def attach_swa_window(
+        self,
+        key: RadixKey,
+        window_start: int,
+        window_end: int,
+        swa_values: torch.Tensor,
+        component_type: ComponentType = ComponentType.SWA,
+    ) -> list[CacheAction | ComponentAction]:
+        """Attach a loaded SWA window to tombstoned spans, returning split actions.
+
+        The shared pipeline supplies page-aligned logical token offsets and
+        int64 values on the core's device. The entire span must be matched and
+        tombstoned before publication.
+        """
         ...
 
     @abstractmethod

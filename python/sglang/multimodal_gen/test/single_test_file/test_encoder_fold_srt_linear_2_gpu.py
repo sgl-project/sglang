@@ -25,6 +25,9 @@ def _worker() -> int:
         init_distributed_environment,
         initialize_model_parallel,
     )
+    from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+        use_tensor_parallel_group,
+    )
     from sglang.multimodal_gen.runtime.models.encoders.base import (
         EncoderTensorParallelMixin,
     )
@@ -51,14 +54,14 @@ def _worker() -> int:
         def __init__(self):
             super().__init__()
             self.bind_encoder_tp_group(get_world_group())
-            self.proj = RowParallelLinear(
-                input_size=8,
-                output_size=6,
-                bias=False,
-                tp_rank=rank,
-                tp_size=world_size,
-                params_dtype=torch.float32,
-            )
+            with use_tensor_parallel_group(get_world_group()):
+                self.proj = RowParallelLinear(
+                    input_size=8,
+                    output_size=6,
+                    bias=False,
+                    parallel_group="tp",
+                    params_dtype=torch.float32,
+                )
 
         def forward(self, inputs: torch.Tensor) -> torch.Tensor:
             local_inputs = inputs.chunk(world_size, dim=-1)[rank].contiguous()

@@ -125,7 +125,7 @@ dsv4pro-fp4-mi355x-sglang:
 #   * -dp8ep8     : DP-attention 8 + narrow within-node EP8
 #   * -dp8ep8-mtp : DP8 + narrow EP8 + EAGLE MTP
 # launch_mi355x.sh reads expert-/data-parallel-size and the `mtp:` section to
-# append --ep-size / --enable-dp-attention --dp-size / --speculative-* flags.
+# append --ep-size / --attn-dp-size / --speculative-* flags.
 
 dsv4flash-fp8-mi355x-mtp-sglang:
   model: sgl-project/DeepSeek-V4-Flash-FP8
@@ -636,3 +636,19 @@ glm52-fp4-mi355x-ep16-mtp-sglang:
       search-space:
         - conc-list: [1, 8, 16, 32, 64, 128, 256]
           config_file: scripts/ci/slurm/recipes/mi355x-fp4/glm52/1k1k/2p1d-ep16-mtp.yaml
+
+dsv4flash-fp4-mi355x-mooncake-sglang:
+  model: deepseek-ai/DeepSeek-V4-Flash
+  model-prefix: dsv4flash
+  model_path: /it-share/model_coverage/models--deepseek-ai--DeepSeek-V4-Flash
+  runner: mi355x
+  precision: fp4
+  framework: sglang
+  multinode: true
+  disagg: true
+  seq-len-configs:
+    - isl: 1024
+      osl: 1024
+      search-space:
+        - conc-list: [1, 8, 16, 32, 64, 128, 256]
+          config_file: scripts/ci/slurm/recipes/mi355x-fp4/dsv4flash/1k1k/1p1d-mooncake.yaml

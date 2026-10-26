@@ -15,6 +15,9 @@ The CI pipeline runs in three sequential stages: **A** (pre-flight, ~3 min) → 
 - `manual/`: Non-CI tests for local debugging or special setups.
 - `run_suite.py`: CI runner — scans `registered/` recursively.
 
+`test/srt/` is retired. Put CI tests under `registered/` and local-only tests
+under `manual/`; lint rejects files in the retired directory.
+
 The system supports both [unittest](https://docs.python.org/3/library/unittest.html) and [pytest](https://docs.pytest.org/en/stable/). The launcher runs `python filename.py -f` with **failfast enabled by default**.
 
 Make sure your file ends with **exactly** one of:
@@ -137,7 +140,7 @@ This README mostly describes the NVIDIA GPU CI pipeline. Other hardware backends
 - Each test file should take < 500 seconds; split if longer.
 - Each GitHub Actions job should take < 30 minutes; split if longer.
 - If tests are too slow for per-commit, consider nightly suites.
-- New GSM8K or MMLU accuracy checks should use sgl-eval (`run_eval(..., api="sgl_eval")` or `sgl-eval run`) instead of adding another dataset or evaluator copy.
+- New GSM8K or MMLU accuracy checks should use sgl-eval (`sglang.test.sgl_eval_utils.run_sgl_eval` or `sgl-eval run`) instead of adding another dataset or evaluator copy.
 
 ## Other Notes
 

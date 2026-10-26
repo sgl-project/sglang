@@ -15,6 +15,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::message::request::{Request, RequestKind};
+use crate::message::response::ResponseItem;
 use crate::message::types::TokenIds;
 use crate::runtime::Runnable;
 use crate::tokenizer_manager::wiring::TmEvent;
@@ -28,7 +29,7 @@ pub trait TextTokenizer: Send + Sync {
     /// The special tokens this tokenizer auto-prepends on every `encode` —
     /// Python's `encode("")` probe (`serving_chat._tokenizer_auto_adds_specials`).
     /// Empty when it adds none (tiktoken backends, no BOS/EOS post-processor).
-    fn auto_specials(&self) -> Vec<i32> {
+    fn auto_specials(&self) -> Vec<i64> {
         Vec::new()
     }
 }
@@ -127,16 +128,27 @@ impl TextTokenizer for DynamoTokenizer {
             .inner
             .encode(text)
             .map_err(|e| Error::Tokenize(e.to_string()))?;
-        // Vocab ids are non-negative and fit in i32.
-        Ok(encoding.token_ids().iter().map(|&id| id as i32).collect())
+        // Widened once here, in the parallel pool: the scheduler's `array("q")`
+        // is int64, and the ids move into their ring buffer untouched from here.
+        Ok(encoding
+            .token_ids()
+            .iter()
+            .map(|&id| i64::from(id))
+            .collect())
     }
 
     /// The post-processor prepends exactly what `encode("")` returns, so the
     /// probe is the same prefix [`strip_auto_specials`] removes.
-    fn auto_specials(&self) -> Vec<i32> {
+    fn auto_specials(&self) -> Vec<i64> {
         self.inner
             .encode("")
-            .map(|encoding| encoding.token_ids().iter().map(|&id| id as i32).collect())
+            .map(|encoding| {
+                encoding
+                    .token_ids()
+                    .iter()
+                    .map(|&id| i64::from(id))
+                    .collect()
+            })
             .unwrap_or_default()
     }
 }
@@ -145,7 +157,7 @@ impl TextTokenizer for DynamoTokenizer {
 /// `add_special_tokens=false` encode would have produced, without a second
 /// tokenizer instance (the post-processor always prepends the same prefix, so
 /// a template-rendered copy of those tokens is preserved).
-fn strip_auto_specials(mut ids: Vec<i32>, auto_specials: &[i32]) -> Vec<i32> {
+fn strip_auto_specials(mut ids: Vec<i64>, auto_specials: &[i64]) -> Vec<i64> {
     if ids.starts_with(auto_specials) {
         ids.drain(..auto_specials.len());
     }
@@ -163,7 +175,7 @@ pub struct TokenizerWorker {
     rx: flume::Receiver<Request>,
     tm: flume::Sender<TmEvent>,
     tokenizer: Arc<dyn TextTokenizer>,
-    auto_specials: Vec<i32>,
+    auto_specials: Vec<i64>,
 }
 
 impl TokenizerWorker {
@@ -182,16 +194,48 @@ impl TokenizerWorker {
     }
 }
 
+impl TokenizerWorker {
+    /// `RequestKind::Tokenize`: Python's `tokenizer.encode(text,
+    /// add_special_tokens=...)`. An empty text is not an error here, unlike a
+    /// generate prompt: it encodes to just the auto-added specials.
+    fn tokenize(&self, text: &str, add_special_tokens: bool) -> Result<TokenIds, Error> {
+        let ids = if text.is_empty() {
+            self.auto_specials.clone()
+        } else {
+            self.tokenizer.encode(text)?
+        };
+        Ok(if add_special_tokens {
+            ids
+        } else {
+            strip_auto_specials(ids, &self.auto_specials)
+        })
+    }
+}
+
 impl Runnable for TokenizerWorker {
     fn run(self) {
         while let Ok(mut req) = self.rx.recv() {
-            // The tokenizer pool only ever receives generate requests. Encode,
-            // then advance the FSM: `TokenizeDone` on success (→ PreSendValidating).
-            let event = {
-                let RequestKind::Generate(g) = &mut req.kind else {
-                    tracing::error!("tokenizer pool received a non-generate request");
-                    continue;
+            // A tokenize request is answered here, through its own sink: it is
+            // not registered with a detok shard and does not return to intake.
+            if let RequestKind::Tokenize {
+                text,
+                add_special_tokens,
+            } = &req.kind
+            {
+                let item = match self.tokenize(text, *add_special_tokens) {
+                    Ok(ids) => ResponseItem::TokenIds(ids),
+                    Err(err) => ResponseItem::Error(err),
                 };
+                let _ = req.sink.try_send(item); // client may be gone
+                continue;
+            }
+            // Every other request is a generate request. Encode,
+            // then advance the FSM: `TokenizeDone` on success (-> PreSendValidating,
+            // or -> Encoding for a multimodal prompt; the state's `then` says which).
+            // A request is never dropped here: a kind this pool cannot serve
+            // goes back as `Failed`, so intake rejects it and releases its
+            // tracking entry instead of leaving the client hung.
+            let event = if let RequestKind::Generate(g) = &mut req.kind {
                 // Size the scheduler's stop-match window in TOKENS, as Python's
                 // `normalize(tokenizer)` does.
                 let stop_tokens = g
@@ -217,6 +261,11 @@ impl Runnable for TokenizerWorker {
                     }
                     Err(err) => Event::Error(err),
                 }
+            } else {
+                tracing::error!(rid = %req.rid, "tokenizer pool received a non-generate request");
+                Event::Error(Error::Internal(
+                    "non-generate request in the tokenizer pool".into(),
+                ))
             };
             let _ = req.state.apply(event);
             if self.tm.send(TmEvent::Tokenized(req)).is_err() {
@@ -233,7 +282,7 @@ mod tests {
     use crate::message::request::{GenerateRequest, RequestKind};
     use crate::message::response::ResponseSink;
     use crate::message::sampling::SamplingParams;
-    use crate::utils::fsm::RequestState;
+    use crate::utils::fsm::{AfterTokenize, RequestState};
     use tokio::sync::mpsc;
 
     /// One token per whitespace-separated word, so a stop's token count differs
@@ -241,7 +290,7 @@ mod tests {
     struct WordTokenizer;
     impl TextTokenizer for WordTokenizer {
         fn encode(&self, text: &str) -> Result<TokenIds, Error> {
-            Ok(text.split_whitespace().map(|_| 1i32).collect())
+            Ok(text.split_whitespace().map(|_| 1i64).collect())
         }
     }
 
@@ -267,7 +316,9 @@ mod tests {
         req_tx
             .send(Request {
                 rid: "1".into(),
-                state: RequestState::Tokenizing,
+                state: RequestState::Tokenizing {
+                    then: AfterTokenize::PreSend,
+                },
                 sink: ResponseSink::Local(sink_tx),
                 kind: RequestKind::Generate(Box::new(GenerateRequest {
                     rid: "1".into(),
@@ -293,6 +344,41 @@ mod tests {
         );
     }
 
+    /// A kind the pool cannot serve is returned `Failed`, never dropped:
+    /// intake still holds its sink registration and pool-tracking entry.
+    #[test]
+    fn non_generate_request_is_returned_failed_not_dropped() {
+        let (req_tx, req_rx) = flume::unbounded::<Request>();
+        let (tm_tx, tm_rx) = flume::unbounded::<TmEvent>();
+        let (sink_tx, _sink_rx) = mpsc::channel(4);
+        req_tx
+            .send(Request {
+                rid: "2".into(),
+                state: RequestState::Tokenizing {
+                    then: AfterTokenize::PreSend,
+                },
+                sink: ResponseSink::Local(sink_tx),
+                kind: RequestKind::Detokenize {
+                    token_ids: vec![1, 2],
+                    skip_special_tokens: true,
+                },
+            })
+            .expect("send");
+        drop(req_tx);
+
+        TokenizerWorker::new(req_rx, tm_tx, Arc::new(WordTokenizer)).run();
+
+        let TmEvent::Tokenized(req) = tm_rx.try_recv().expect("returned, not dropped") else {
+            panic!("expected Tokenized");
+        };
+        assert_eq!(req.rid.as_str(), "2");
+        assert!(
+            matches!(req.state, RequestState::Failed(Error::Internal(_))),
+            "{:?}",
+            req.state
+        );
+    }
+
     /// The strip reproduces `add_special_tokens=false`: one leading run of
     /// auto-added specials is removed, a template-rendered copy is kept, and
     /// tokenizers with no auto specials (empty probe) are untouched.
@@ -309,9 +395,9 @@ mod tests {
     struct MarkedTokenizer;
     impl TextTokenizer for MarkedTokenizer {
         fn encode(&self, text: &str) -> Result<TokenIds, Error> {
-            Ok(vec![0, text.len() as i32])
+            Ok(vec![0, text.len() as i64])
         }
-        fn auto_specials(&self) -> Vec<i32> {
+        fn auto_specials(&self) -> Vec<i64> {
             vec![0]
         }
     }
@@ -327,7 +413,9 @@ mod tests {
             req_tx
                 .send(Request {
                     rid: "1".into(),
-                    state: RequestState::Tokenizing,
+                    state: RequestState::Tokenizing {
+                        then: AfterTokenize::PreSend,
+                    },
                     sink: ResponseSink::Local(tokio::sync::mpsc::channel(4).0),
                     kind: RequestKind::Generate(Box::new(GenerateRequest {
                         rid: "1".into(),
@@ -349,5 +437,40 @@ mod tests {
         };
         assert_eq!(run(false), vec![0, 2], "plain text prompts keep specials");
         assert_eq!(run(true), vec![2], "rendered prompts lose the auto BOS");
+    }
+
+    /// A tokenize request is answered through its own sink and never returns
+    /// to intake. `add_special_tokens` keeps or strips the auto specials, and
+    /// an empty text encodes to just those specials, as Python's
+    /// `encode("")` does.
+    #[test]
+    fn tokenize_answers_through_the_sink_without_returning_to_intake() {
+        let run = |text: &str, add_special_tokens: bool| {
+            let (req_tx, req_rx) = flume::unbounded::<Request>();
+            let (tm_tx, tm_rx) = flume::unbounded::<TmEvent>();
+            let (sink_tx, mut sink_rx) = tokio::sync::mpsc::channel(4);
+            req_tx
+                .send(Request {
+                    rid: "t".into(),
+                    state: RequestState::Queued,
+                    sink: ResponseSink::Local(sink_tx),
+                    kind: RequestKind::Tokenize {
+                        text: text.into(),
+                        add_special_tokens,
+                    },
+                })
+                .expect("send");
+            drop(req_tx);
+            TokenizerWorker::new(req_rx, tm_tx, Arc::new(MarkedTokenizer)).run();
+            assert!(tm_rx.try_recv().is_err(), "answered here, not by intake");
+            match sink_rx.try_recv() {
+                Ok(ResponseItem::TokenIds(ids)) => ids,
+                other => panic!("expected token ids, got {other:?}"),
+            }
+        };
+        assert_eq!(run("hi", true /* add_special_tokens */), vec![0, 2]);
+        assert_eq!(run("hi", false /* add_special_tokens */), vec![2]);
+        assert_eq!(run("", true /* add_special_tokens */), vec![0]);
+        assert_eq!(run("", false /* add_special_tokens */), Vec::<i64>::new());
     }
 }

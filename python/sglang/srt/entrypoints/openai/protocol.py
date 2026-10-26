@@ -52,12 +52,16 @@ from openai.types.responses.response import ToolChoice
 from openai.types.responses.response_format_text_json_schema_config import (
     ResponseFormatTextJSONSchemaConfig,
 )
+from openai.types.responses.response_function_tool_call_param import (
+    ResponseFunctionToolCallParam,
+)
 from openai.types.shared.response_format_json_object import ResponseFormatJSONObject
 from pydantic import (
     AfterValidator,
     BaseModel,
     ConfigDict,
     Field,
+    PrivateAttr,
     StrictBool,
     field_serializer,
     field_validator,
@@ -206,6 +210,12 @@ class PromptTokensDetails(BaseModel):
         return data
 
 
+class CompletionTokensDetails(BaseModel):
+    """Details about completion tokens."""
+
+    reasoning_tokens: int = 0
+
+
 class UsageInfo(BaseModel):
     prompt_tokens: int = 0
     total_tokens: int = 0
@@ -213,6 +223,8 @@ class UsageInfo(BaseModel):
     # Used to return cached tokens info when --enable-cache-report is set
     prompt_tokens_details: Optional[PromptTokensDetails] = None
     reasoning_tokens: Optional[int] = 0
+    # The OpenAI location of reasoning_tokens; set only when there are some.
+    completion_tokens_details: Optional[CompletionTokensDetails] = None
 
 
 class StreamOptions(BaseModel):
@@ -331,7 +343,24 @@ def _migrate_deprecated_dp_rank(values: dict) -> dict:
     return values
 
 
-class CompletionRequest(BaseModel):
+class PDRoutingFields(BaseModel):
+    """PD and DP routing fields a router may inject into a request."""
+
+    # For PD disaggregation
+    bootstrap_host: Optional[Union[List[str], str]] = None
+    bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
+    bootstrap_room: Optional[Union[List[int], int]] = None
+
+    # For DP routing -- external router assigns a specific DP worker
+    routed_dp_rank: Optional[int] = None
+    # For PD disagg -- hint telling decode which prefill DP worker has the KV cache
+    disagg_prefill_dp_rank: Optional[int] = None
+
+    def pd_routing_kwargs(self) -> Dict[str, Any]:
+        return {name: getattr(self, name) for name in PDRoutingFields.model_fields}
+
+
+class CompletionRequest(PDRoutingFields):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/completions/create
     model: str = Field(
@@ -381,18 +410,19 @@ class CompletionRequest(BaseModel):
     response_format: Optional[Union[ResponseFormat, StructuralTagResponseFormat]] = None
     custom_params: Optional[Dict] = None
     custom_logit_processor: Optional[str] = None
+    watermark: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Per-request watermark settings: enabled, key, and context_window. "
+            "A key implicitly enables watermarking."
+        ),
+    )
 
     images_config: Optional[Dict] = None
+    # Per-request processor overrides; only MiniCPM-V 4.7 reads them (downsample_mode,
+    # max_slice_nums), flattening images_/videos_kwargs into one request-wide profile.
+    mm_processor_kwargs: Optional[Dict] = None
 
-    # For PD disaggregation
-    bootstrap_host: Optional[Union[List[str], str]] = None
-    bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
-    bootstrap_room: Optional[Union[List[int], int]] = None
-
-    # For DP routing — external router assigns a specific DP worker
-    routed_dp_rank: Optional[int] = None
-    # For PD disagg — hint telling decode which prefill DP worker has the KV cache
-    disagg_prefill_dp_rank: Optional[int] = None
     # Deprecated: use routed_dp_rank instead
     data_parallel_rank: Optional[int] = None
 
@@ -574,7 +604,13 @@ class ChatCompletionMessageContentImageURL(BaseModel):
     detail: Optional[Literal["auto", "low", "high"]] = "auto"
     max_dynamic_patch: Optional[int] = None
     min_dynamic_patch: Optional[int] = None
+    max_long_side_pixel: Optional[int] = None
     content_hash: Optional[str] = None
+
+    @field_validator("detail", mode="before")
+    @classmethod
+    def _default_detail_is_auto(cls, value: Any) -> Any:
+        return "auto" if value == "default" else value
 
     @field_validator("content_hash")
     @classmethod
@@ -588,10 +624,11 @@ class ChatCompletionMessageContentVideoURL(BaseModel):
     url: str
     max_dynamic_patch: Optional[int] = None
     min_dynamic_patch: Optional[int] = None
-    fps: Optional[float] = None
-    max_frames: Optional[int] = None
-    max_tokens_per_frame: Optional[int] = None
-    max_image_tokens: Optional[int] = None
+    fps: Optional[float] = Field(default=None, gt=0, allow_inf_nan=False)
+    max_frames: Optional[int] = Field(default=None, gt=0)
+    max_tokens_per_frame: Optional[int] = Field(default=None, gt=0)
+    max_image_tokens: Optional[int] = Field(default=None, gt=0)
+    max_long_side_pixel: Optional[int] = None
 
 
 class ChatCompletionMessageContentAudioURL(BaseModel):
@@ -707,7 +744,7 @@ class ToolCall(BaseModel):
 
 
 _GenericMessageRole = Literal[
-    "system", "assistant", "tool", "function", "developer", "latest_reminder"
+    "system", "assistant", "tool", "function", "developer", "latest_reminder", "root"
 ]
 _GENERIC_MESSAGE_ROLES: Tuple[str, ...] = get_args(_GenericMessageRole)
 
@@ -723,6 +760,8 @@ class ChatCompletionMessageGenericParam(BaseModel):
     reasoning_content: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
     tools: Optional[List[Tool]] = Field(default=None, examples=[None])
+    # DeepSeek API prefix completion: continue this final assistant message.
+    prefix: Optional[bool] = None
 
     @field_validator("role", mode="before")
     @classmethod
@@ -772,14 +811,31 @@ class Function(BaseModel):
     description: Optional[str] = Field(default=None, examples=[None])
     name: str
     parameters: Optional[object] = None
-    strict: bool = False
+    strict: Optional[bool] = None
     defer_loading: Optional[bool] = None
+    key_order: List[str] = Field(default_factory=list, exclude=True)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _capture_key_order(cls, data):
+        if isinstance(data, dict):
+            data = dict(data)
+            data["key_order"] = list(data.keys())
+        return data
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
+        # Chat templates render the tool schema as given; do not inject fields
+        # the client left out or reorder the ones it sent.
         data = handler(self)
         if self.defer_loading is None:
             data.pop("defer_loading", None)
+        if self.strict is None:
+            data.pop("strict", None)
+        order = self.key_order
+        if order:
+            rest = [k for k in data if k not in order]
+            data = {k: data[k] for k in order + rest if k in data}
         return data
 
 
@@ -816,9 +872,10 @@ class ToolChoice(BaseModel):
 
 
 # OpenAI-spec string tiers for reasoning effort (current Responses/Chat API):
-# none/minimal/low/medium/high/xhigh/max. Used as-is by /v1/responses.
+# none/minimal/low/medium/high/xhigh/max, plus DeepSeek's ultra. Used as-is by
+# /v1/responses.
 ReasoningEffortTier = Literal[
-    "none", "minimal", "low", "medium", "high", "xhigh", "max"
+    "none", "minimal", "low", "medium", "high", "xhigh", "ultra", "max"
 ]
 # The typed /v1/responses stream events validate against OpenAI's narrower
 # ``Reasoning.effort``; echoing a tier outside this set kills the stream.
@@ -841,13 +898,17 @@ def _has_message_level_tools(messages: Any) -> bool:
     return any(
         isinstance(message, dict)
         and isinstance(message.get("role"), str)
-        and message["role"].lower() in ("system", "developer")
+        and message["role"].lower() in ("root", "system", "developer")
         and bool(message.get("tools"))
         for message in messages
     )
 
 
-class ChatCompletionRequest(BaseModel):
+class ChatCompletionRequest(PDRoutingFields):
+    _response_parser_prefix: str = PrivateAttr(default="")
+    _response_parser_grammar_start: Optional[str] = PrivateAttr(default=None)
+    _response_parser_json_response_format: bool = PrivateAttr(default=False)
+
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/chat/create
     messages: List[ChatCompletionMessageParam]
@@ -880,6 +941,10 @@ class ChatCompletionRequest(BaseModel):
     top_p: Optional[float] = None
     user: Optional[str] = None
     tools: Optional[List[Tool]] = Field(default=None, examples=[None])
+    # Set by /v1/responses when the request has namespace tools: the chat template
+    # renders these, while ``tools`` (flattened to ``<namespace>.<function>``) still
+    # drives tool-call parsing.
+    _template_tools: Optional[List[Dict[str, Any]]] = PrivateAttr(default=None)
     tool_choice: Union[ToolChoice, Literal["auto", "required", "none"]] = Field(
         default="auto", examples=["none"]
     )  # noqa
@@ -896,10 +961,15 @@ class ChatCompletionRequest(BaseModel):
     return_output_ids_in_sglext: bool = False
     return_sampling_mask: bool = False
     sampling_logprobs_mode: Optional[Literal["selected", "support"]] = None
+    # Flat output top logprobs in choices[].meta_info (requires return_meta_info);
+    # choices[].logprobs top_logprobs are then empty.
+    return_flat_raw_output_top_logprobs: bool = False
+    # Base64 by default on chat, unlike /generate; false returns plain JSON lists.
+    return_flat_raw_top_logprobs_b64: bool = True
     reasoning_effort: ReasoningEffortType = Field(
         default=None,
         description="Constrains effort on reasoning for reasoning models. "
-        "Accepts string levels ('none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max') or a "
+        "Accepts string levels ('none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'ultra', 'max') or a "
         "float in [0.0, 0.99] for fine-grained control. "
         "'none' disables reasoning entirely, 'low' is the least effort, 'high' is the most effort. "
         "Reducing reasoning effort can result in faster responses and fewer tokens used on reasoning "
@@ -908,6 +978,11 @@ class ChatCompletionRequest(BaseModel):
         "'max' is an sglang extension to the OpenAI schema for "
         "models that expose a maximum-effort tier above 'high'; models that don't "
         "support it treat it the same as 'high'.",
+    )
+    thinking: Optional[Any] = Field(
+        default=None,
+        description="Thinking config such as {'type': 'adaptive'}; read only by "
+        "models whose chat template defines a thinking mode, ignored otherwise.",
     )
     task: Optional[
         Literal["action", "query", "authority", "domain", "title", "read_url"]
@@ -946,10 +1021,20 @@ class ChatCompletionRequest(BaseModel):
 
     images_config: Optional[Dict] = None
     video_config: Optional[Dict] = None
+    # Per-request processor overrides; only MiniCPM-V 4.7 reads them (downsample_mode,
+    # max_slice_nums), flattening images_/videos_kwargs into one request-wide profile.
+    mm_processor_kwargs: Optional[Dict] = None
 
     # Custom logit processor for advanced sampling control
     custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None
     custom_params: Optional[Dict] = None
+    watermark: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Per-request watermark settings: enabled, key, and context_window. "
+            "A key implicitly enables watermarking."
+        ),
+    )
 
     # Pre-computed prompt token IDs: when provided, bypasses chat template
     # tokenization entirely.  Messages are still used to derive stop tokens
@@ -965,15 +1050,6 @@ class ChatCompletionRequest(BaseModel):
     # Priority for the request
     priority: Optional[int] = None
 
-    # For PD disaggregation
-    bootstrap_host: Optional[Union[List[str], str]] = None
-    bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
-    bootstrap_room: Optional[Union[List[int], int]] = None
-
-    # For DP routing — external router assigns a specific DP worker
-    routed_dp_rank: Optional[int] = None
-    # For PD disagg — hint telling decode which prefill DP worker has the KV cache
-    disagg_prefill_dp_rank: Optional[int] = None
     # Deprecated: use routed_dp_rank instead
     data_parallel_rank: Optional[int] = None
 
@@ -1027,6 +1103,7 @@ class ChatCompletionRequest(BaseModel):
                 "medium",
                 "high",
                 "xhigh",
+                "ultra",
                 "max",
             }:
                 values["reasoning_effort"] = effort
@@ -1150,6 +1227,7 @@ class ChatCompletionRequest(BaseModel):
             "custom_params": self.custom_params,
             "sampling_seed": self.seed,
             "spaces_between_special_tokens": spaces_between_special_tokens,
+            "watermark": self.watermark,
         }
 
         if self.response_format and self.response_format.type == "json_schema":
@@ -1212,6 +1290,13 @@ class ChatMessage(BaseModel):
     content: Optional[str] = None
     reasoning_content: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        if self.tool_calls is None:
+            data.pop("tool_calls", None)
+        return data
 
 
 class ChatCompletionResponseChoice(BaseModel):
@@ -1286,6 +1371,13 @@ class ChatCompletionResponseStreamChoice(BaseModel):
         ]
     ] = None
     matched_stop: Union[None, int, str] = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        if self.delta.tool_calls is None:
+            data["delta"].pop("tool_calls", None)
+        return data
 
 
 class ChatCompletionStreamResponse(BaseModel):
@@ -1408,10 +1500,11 @@ class ScoringRequest(BaseModel):
     item_first: bool = False
     return_pooled_hidden_states: bool = False
 
-    # Setwise readout (SequenceClassification-only): when set, the head is pooled
-    # AT every occurrence of this token in each `query + item` sequence instead of
-    # the last token, and `scores` is returned nested (one `[Nᵢ x num_labels]`
-    # matrix per item). --enable-mis fuses items; otherwise each is scored alone.
+    # Setwise readout: when set, the readout is taken AT every occurrence of this
+    # token in each `query + item` sequence instead of the last token, and `scores`
+    # is returned nested (one `[Nᵢ x num_labels]` matrix per item). SeqCls pools the
+    # head there; CausalLM reads label-token logprobs there. Both support batched
+    # and --enable-mis.
     score_extraction_token: Optional[str] = None
 
     model: str = DEFAULT_MODEL_NAME
@@ -1472,6 +1565,21 @@ DecisionText = Union[str, Dict[str, Any], List[Any]]
 RequiredDecisionText = Annotated[DecisionText, AfterValidator(_nonblank_decision_text)]
 
 
+def _to_image_url(
+    image: Union[ChatCompletionMessageContentImageURL, str],
+) -> ChatCompletionMessageContentImageURL:
+    if isinstance(image, str):
+        return ChatCompletionMessageContentImageURL(url=image)
+    return image
+
+
+# An image arrives as the chat image URL object or as its url alone, such as a
+# data URI or base64 bytes. A url alone is converted to the object as it validates.
+DecisionImage = Annotated[
+    Union[ChatCompletionMessageContentImageURL, str], AfterValidator(_to_image_url)
+]
+
+
 class DecisionOption(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -1527,6 +1635,7 @@ class DecisionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     input: RequiredDecisionText
+    images: List[DecisionImage] = Field(default_factory=list)
     questions: List[DecisionQuestion] = Field(min_length=1)
     # Scales option probabilities only, not label_mass.
     temperature: float = Field(default=1.0, gt=0, allow_inf_nan=False)
@@ -1710,7 +1819,7 @@ class ResponseReasoningParam(BaseModel):
         default="medium",
         description="Constrains effort on reasoning for reasoning models. "
         "Accepts the OpenAI string tiers "
-        "('none','minimal','low','medium','high','xhigh','max').",
+        "('none','minimal','low','medium','high','xhigh','ultra','max').",
     )
     summary: Optional[Literal["auto", "concise", "detailed"]] = Field(
         default=None,
@@ -1746,6 +1855,7 @@ class ResponseTool(BaseModel):
     strict: bool = False
     # Inner schemas for ``namespace`` tools.
     tools: Optional[List[Dict[str, Any]]] = None
+    defer_loading: Optional[bool] = None
     # Input format of a ``custom`` tool: {"type": "text"} or
     # {"type": "grammar", "syntax": ..., "definition": ...}.
     format: Optional[Dict[str, Any]] = None
@@ -1761,12 +1871,18 @@ class ResponseInputMessageParam(EasyInputMessageParam, total=False):
     phase: Optional[Literal["commentary", "final_answer"]]
 
 
+class ResponseFunctionCallInputParam(ResponseFunctionToolCallParam, total=False):
+    # Set when the call targets a member of a ``namespace`` tool.
+    namespace: str
+
+
 class ResponseOutputMessage(OpenAIResponseOutputMessage):
     phase: Optional[Literal["commentary", "final_answer"]] = None
 
 
 ResponseInputOutputItem: TypeAlias = Union[
     ResponseInputMessageParam,
+    ResponseFunctionCallInputParam,
     ResponseOutputMessage,
     ResponseInputItemParam,
     "ResponseReasoningItem",
@@ -1774,8 +1890,12 @@ ResponseInputOutputItem: TypeAlias = Union[
 ]
 
 
-class ResponsesRequest(BaseModel):
+class ResponsesRequest(PDRoutingFields):
     """Request body for v1/responses endpoint."""
+
+    _response_parser_prefix: str = PrivateAttr(default="")
+    _response_parser_grammar_start: Optional[str] = PrivateAttr(default=None)
+    _response_parser_json_response_format: bool = PrivateAttr(default=False)
 
     # Core OpenAI API fields (ordered by official documentation)
     background: Optional[bool] = False
@@ -1830,15 +1950,6 @@ class ResponsesRequest(BaseModel):
         default=None, description="Cache salt for request caching"
     )
 
-    # For PD disaggregation
-    bootstrap_host: Optional[Union[List[str], str]] = None
-    bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
-    bootstrap_room: Optional[Union[List[int], int]] = None
-
-    # For DP routing — external router assigns a specific DP worker
-    routed_dp_rank: Optional[int] = None
-    # For PD disagg — hint telling decode which prefill DP worker has the KV cache
-    disagg_prefill_dp_rank: Optional[int] = None
     # Deprecated: use routed_dp_rank instead
     data_parallel_rank: Optional[int] = None
 
@@ -1983,23 +2094,32 @@ class ResponsesRequest(BaseModel):
 
     def to_sampling_params(
         self,
-        default_max_tokens: int,
+        default_max_tokens: Optional[int] = None,
         default_params: Optional[Dict] = None,
         stop: Optional[Union[str, List[str]]] = None,
         tool_call_constraint: Optional[ToolCallConstraint] = None,
     ) -> Dict[str, Any]:
-        """Convert to sampling parameters for generation."""
+        """Convert to sampling parameters for generation.
+
+        ``default_max_tokens`` may be ``None``: when neither it nor
+        ``max_output_tokens`` is set, ``max_new_tokens`` is left ``None`` so the
+        scheduler clamps the budget against the real (post-expansion) input
+        length, matching the Chat Completions path. See issue #29287.
+        """
         if default_params is None:
             default_params = {}
 
         # Use max_output_tokens if available, otherwise use max_tokens for backwards compatibility
         if self.max_output_tokens is not None:
-            max_tokens = min(self.max_output_tokens, default_max_tokens)
+            max_tokens = self.max_output_tokens
+            if default_max_tokens is not None:
+                max_tokens = min(max_tokens, default_max_tokens)
         else:
             max_tokens = default_max_tokens
 
         # Headroom for BOS/EOS the engine appends on top of prompt+budget.
-        max_tokens -= 2
+        if max_tokens is not None:
+            max_tokens -= 2
 
         temperature = self.temperature
         if temperature is None:
@@ -2266,6 +2386,7 @@ class MessageProcessingResult:
     skip_special_tokens: bool = True
     require_reasoning: bool = False
     reasoning_end_token_ids: Optional[List[int]] = None
+    uses_response_template: bool = False
 
 
 class ToolCallProcessingResult(NamedTuple):
@@ -2285,6 +2406,7 @@ class ResponseReasoningTextContent(BaseModel):
 
 ResponseInputOutputItem: TypeAlias = Union[
     ResponseInputMessageParam,
+    ResponseFunctionCallInputParam,
     ResponseOutputMessage,
     ResponseInputItemParam,
     "ResponseReasoningItem",

@@ -13,6 +13,7 @@ from sglang.srt.constants import MIS_DELIMITER_TOKEN_ID
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.runtime_context import get_exec, get_memory, get_schedule, get_serving
+from sglang.srt.utils import ImageData
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +50,7 @@ class TokenizerManagerScoreMixin:
         request: Optional[Any] = None,
         temperature: float = 1.0,
         return_token_logprobs: bool = False,
+        image_data: Optional[List[List[ImageData]]] = None,
     ) -> ScoreResult:
         """
         Score probabilities of specified token IDs after each *full prompt*.
@@ -69,6 +71,7 @@ class TokenizerManagerScoreMixin:
                 request=request,
                 temperature=temperature,
                 return_token_logprobs=return_token_logprobs,
+                image_data=image_data,
             )
 
         # Tokenized prompts
@@ -82,6 +85,7 @@ class TokenizerManagerScoreMixin:
                 request=request,
                 temperature=temperature,
                 return_token_logprobs=return_token_logprobs,
+                image_data=image_data,
             )
 
         raise ValueError("Invalid prompts type for score_prompts.")
@@ -258,25 +262,61 @@ class TokenizerManagerScoreMixin:
         results: Any,
         per_item_anchor_counts: List[int],
         apply_softmax: bool,
+        label_token_ids: Optional[List[List[int]]] = None,
+        temperature: float = 1.0,
         return_pooled_hidden_states: bool = False,
     ) -> ScoreResult:
         """Process a fused multi-item score-extraction request (``--enable-mis``).
 
-        The fused sequence returns one ``[ΣNᵢ, num_labels]`` matrix of every
-        anchor's logits in item order; split it back into one ``[Nᵢ, num_labels]``
-        matrix per item using per_item_anchor_counts.
+        The fused sequence yields every anchor's scores in item order (a
+        ``[ΣNᵢ, num_labels]`` embedding for SequenceClassification, or per-anchor
+        label-token logprobs for CausalLM); split it back into one
+        ``[Nᵢ, num_labels]`` matrix per item using per_item_anchor_counts.
         """
         single_result = results[0] if isinstance(results, list) else results
         meta_info = single_result.get("meta_info", {})
         request_id = meta_info.get("id", "<unknown>")
         prompt_tokens = meta_info.get("prompt_tokens", 0)
+        total_anchors = sum(per_item_anchor_counts)
+
+        if self.is_generation:
+            # CausalLM: per-anchor label-token logprobs in item order; item i's
+            # anchors use item i's candidate labels (label_token_ids[i]).
+            anchor_logprobs = meta_info.get("input_token_ids_logprobs", [])
+            if not anchor_logprobs:
+                raise ValueError(
+                    f"input_token_ids_logprobs not found in the result for "
+                    f"request {request_id}."
+                )
+            if len(anchor_logprobs) != total_anchors:
+                raise RuntimeError(
+                    f"Expected {total_anchors} anchor rows across "
+                    f"{len(per_item_anchor_counts)} items, but got "
+                    f"{len(anchor_logprobs)}. Request ID: {request_id}"
+                )
+            scores = []
+            offset = 0
+            for labels, count in zip(label_token_ids, per_item_anchor_counts):
+                scores.append(
+                    [
+                        self._convert_logprobs_to_scores(
+                            self._extract_logprobs_for_tokens(
+                                anchor_logprobs[offset + j], labels
+                            ),
+                            labels,
+                            apply_softmax,
+                            temperature,
+                        )
+                        for j in range(count)
+                    ]
+                )
+                offset += count
+            return ScoreResult(scores=scores, prompt_tokens=prompt_tokens)
 
         embedding = single_result.get("embedding")
         if embedding is None:
             raise ValueError("Embedding not found in the result.")
-
         rows = self._multi_position_score_rows(embedding, apply_softmax)
-        total_anchors = sum(per_item_anchor_counts)
         if len(rows) != total_anchors:
             raise RuntimeError(
                 f"Expected {total_anchors} anchor rows across "
@@ -332,19 +372,38 @@ class TokenizerManagerScoreMixin:
         is_generation = self.is_generation
         if is_generation:
             for result, labels in zip(results, label_token_ids):
-                # For single-item scoring, logprobs are in output_token_ids_logprobs
-                output_logprobs = result["meta_info"].get(
-                    "output_token_ids_logprobs", []
-                )
-                prompt_tokens += result["meta_info"].get("prompt_tokens", 0)
+                meta = result["meta_info"]
+                prompt_tokens += meta.get("prompt_tokens", 0)
 
+                if per_item_matrix:
+                    # Setwise: label-token logprobs were read AT each anchor
+                    # position; one row per anchor, grouped as one item's matrix.
+                    anchor_logprobs = meta.get("input_token_ids_logprobs", [])
+                    if not anchor_logprobs:
+                        raise RuntimeError(
+                            f"input_token_ids_logprobs is empty for request "
+                            f"{meta.get('id', '<unknown>')}."
+                        )
+                    item_matrix = [
+                        self._convert_logprobs_to_scores(
+                            self._extract_logprobs_for_tokens(pos_logprobs, labels),
+                            labels,
+                            apply_softmax,
+                            temperature,
+                        )
+                        for pos_logprobs in anchor_logprobs
+                    ]
+                    scores.append(item_matrix)
+                    continue
+
+                # Pointwise: logprobs are in output_token_ids_logprobs (last position)
+                output_logprobs = meta.get("output_token_ids_logprobs", [])
                 if not output_logprobs or len(output_logprobs) == 0:
                     raise RuntimeError(
                         f"output_logprobs is empty for request "
-                        f"{result['meta_info'].get('id', '<unknown>')}."
+                        f"{meta.get('id', '<unknown>')}."
                     )
 
-                # Extract logprobs for the first (and only) position
                 logprobs = self._extract_logprobs_for_tokens(output_logprobs[0], labels)
                 score_list = self._convert_logprobs_to_scores(
                     logprobs, labels, apply_softmax, temperature
@@ -420,6 +479,18 @@ class TokenizerManagerScoreMixin:
             )
         return embeds, positions
 
+    def _placeholder_positions(
+        self,
+        token_ids: List[int],
+        embed_override_token_id: int,
+        position_offset: int = 0,
+    ) -> List[int]:
+        return [
+            idx + position_offset
+            for idx, tok in enumerate(token_ids)
+            if tok == embed_override_token_id
+        ]
+
     def _resolve_embed_overrides_for_request(
         self,
         query: List[int],
@@ -464,12 +535,24 @@ class TokenizerManagerScoreMixin:
         embed_override_token_id: Optional[int],
         query_embed_overrides: Optional[List[torch.Tensor]],
         item_embed_overrides: Optional[List[Optional[List[torch.Tensor]]]],
+        stacked_query_item_embed_overrides: Optional[
+            List[Optional[torch.Tensor]]
+        ] = None,
     ) -> Tuple[None, List[List[int]], Optional[list], Optional[List[int]]]:
         """Build input_ids and resolve embed overrides for token-ID inputs.
 
         Multi-item-scoring and single-item modes differ only in how input_ids
         are assembled and what position offset each item gets.
         """
+        if stacked_query_item_embed_overrides is not None:
+            return self._build_token_id_inputs_stacked(
+                query,
+                items,
+                use_multi_item_scoring,
+                embed_override_token_id,
+                stacked_query_item_embed_overrides,
+            )
+
         # Both query and items are token IDs
         has_embeds = (
             query_embed_overrides is not None or item_embed_overrides is not None
@@ -564,6 +647,63 @@ class TokenizerManagerScoreMixin:
                 None,
             )
 
+    def _build_token_id_inputs_stacked(
+        self,
+        query: List[int],
+        items: List[List[int]],
+        use_multi_item_scoring: bool,
+        embed_override_token_id: int,
+        stacked_query_item_embed_overrides: List[Optional[torch.Tensor]],
+    ) -> Tuple[None, List[List[int]], Optional[list], Optional[List[int]]]:
+        """On the single-item path each item's tensor holds the query rows, then its own."""
+        if use_multi_item_scoring:
+            delimiter_token_id = MIS_DELIMITER_TOKEN_ID
+            combined_input_ids, delimiter_indices = (
+                self._build_multi_item_token_sequence(query, items, delimiter_token_id)
+            )
+            input_ids = [combined_input_ids]
+
+            embeds = stacked_query_item_embed_overrides[0]
+            if embeds is None:
+                return None, input_ids, None, delimiter_indices
+
+            positions = self._placeholder_positions(query, embed_override_token_id)
+            current_offset = len(query) + 1  # +1 for first delimiter
+            for item in items:
+                positions.extend(
+                    self._placeholder_positions(
+                        item, embed_override_token_id, current_offset
+                    )
+                )
+                current_offset += len(item) + 1  # +1 for delimiter
+
+            pe = [PositionalEmbeds(embeds=embeds, positions=positions)]
+            return None, input_ids, pe, delimiter_indices
+
+        input_ids = [query + item for item in items]
+        q_positions = self._placeholder_positions(query, embed_override_token_id)
+
+        positional_embed_overrides: List[Optional[PositionalEmbeds]] = []
+        any_overrides = False
+        for item, embeds in zip(items, stacked_query_item_embed_overrides):
+            if embeds is None:
+                positional_embed_overrides.append(None)
+                continue
+            i_positions = self._placeholder_positions(
+                item, embed_override_token_id, len(query)
+            )
+            positional_embed_overrides.append(
+                PositionalEmbeds(embeds=embeds, positions=q_positions + i_positions)
+            )
+            any_overrides = True
+
+        return (
+            None,
+            input_ids,
+            positional_embed_overrides if any_overrides else None,
+            None,
+        )
+
     # ------------------------------------------------------------------
     # Multi-position pooling readout (setwise scoring)
     # ------------------------------------------------------------------
@@ -592,29 +732,26 @@ class TokenizerManagerScoreMixin:
         is_generation: bool,
         item_first: bool,
     ) -> None:
-        """Validate that multi-position pooling readout is applicable.
+        """Validate that setwise pooling readout is applicable.
 
-        Supported only by SequenceClassification models whose forward routes the
-        head through ``score_and_pool`` (per-position pooling, in
-        ``is_score_and_pool_model``). Generation, cross-encoder, reward, and
-        embedding models pool a single vector and are rejected here before
-        inference. Requires radix cache and chunked prefill off and no auto-truncate,
-        since pooling positions are full-prompt coordinates.
+        SequenceClassification models must route the head through
+        ``score_and_pool`` (per-position pooling, in ``is_score_and_pool_model``);
+        cross-encoder, reward, and embedding models pool a single vector and are
+        rejected. CausalLM (generation) models read label-token logprobs at each
+        anchor via the LM head and are supported in both the batched and fused
+        (``--enable-mis``) paths. Requires radix cache and chunked prefill off and
+        no auto-truncate, since pooling positions are full-prompt coordinates.
         """
-        if is_generation:
-            raise ValueError(
-                "score_extraction_token_id is only supported for "
-                "SequenceClassification models, not generation (CausalLM) models."
-            )
-        architectures = self.model_config.hf_config.architectures or []
-        if not is_score_and_pool_model(architectures):
-            raise ValueError(
-                "score_extraction_token_id is only supported for "
-                "SequenceClassification models that pool the head per position "
-                "(score_and_pool); model architecture(s) "
-                f"{architectures} do not (cross-encoder, reward, and embedding "
-                "models pool a single vector and ignore the readout positions)."
-            )
+        if not is_generation:
+            architectures = self.model_config.hf_config.architectures or []
+            if not is_score_and_pool_model(architectures):
+                raise ValueError(
+                    "score_extraction_token_id is only supported for "
+                    "SequenceClassification models that pool the head per position "
+                    "(score_and_pool); model architecture(s) "
+                    f"{architectures} do not (cross-encoder, reward, and embedding "
+                    "models pool a single vector and ignore the readout positions)."
+                )
         if item_first:
             raise ValueError(
                 "item_first is not supported with score_extraction_token_id."
@@ -762,11 +899,15 @@ class TokenizerManagerScoreMixin:
         embed_override_token_id: Optional[int] = None,
         query_embed_overrides: Optional[List[torch.Tensor]] = None,
         item_embed_overrides: Optional[List[Optional[List[torch.Tensor]]]] = None,
+        stacked_query_item_embed_overrides: Optional[
+            List[Optional[torch.Tensor]]
+        ] = None,
         request: Optional[Any] = None,
         return_pooled_hidden_states: bool = False,
         score_extraction_token_id: Optional[int] = None,
         temperature: float = 1.0,
         return_token_logprobs: bool = False,
+        image_data: Optional[List[List[ImageData]]] = None,
     ) -> ScoreResult:
         """
         Score the probability of specified token IDs appearing after the given (query + item) pair.
@@ -786,15 +927,18 @@ class TokenizerManagerScoreMixin:
         - Generation (CausalLM): Requires label_token_ids; returns logprob-based scores.
         - SequenceClassification: label_token_ids is optional; returns pooled class logits.
 
-        Setwise scoring (SequenceClassification-only) is expressed via
-        score_extraction_token_id: when set, the head is pooled AT every occurrence
-        of this token in each ``query + item`` sequence instead of the last token,
-        and ``scores`` is returned nested (one ``[Nᵢ x num_labels]`` matrix per
-        item). With ``--enable-mis`` the items are fused into one multi-item
-        sequence; otherwise each item is scored independently in one batch.
+        Setwise scoring is expressed via score_extraction_token_id: when set, the
+        readout is taken AT every occurrence of this token in each ``query + item``
+        sequence instead of the last token, and ``scores`` is returned nested (one
+        ``[Nᵢ x num_labels]`` matrix per item). SequenceClassification pools the
+        head at those positions; CausalLM reads label-token logprobs there. Both
+        support the batched and fused (``--enable-mis``) paths.
 
         return_pooled_hidden_states is only supported for non-generation models
         (SequenceClassification, RewardModel); raises ValueError for CausalLM.
+
+        stacked_query_item_embed_overrides replaces query_/item_embed_overrides with one
+        [N, hidden] tensor per sequence (per item, or one under --enable-mis), query rows first.
         """
         is_generation = self.is_generation
 
@@ -853,20 +997,43 @@ class TokenizerManagerScoreMixin:
             query = [] if items_are_token_ids else ""
 
         has_embeds = (
-            query_embed_overrides is not None or item_embed_overrides is not None
+            query_embed_overrides is not None
+            or item_embed_overrides is not None
+            or stacked_query_item_embed_overrides is not None
         )
         if has_embeds and embed_override_token_id is None:
             raise ValueError(
-                "embed_override_token_id is required when query_embed_overrides "
-                "or item_embed_overrides are supplied."
+                "embed_override_token_id is required when query_embed_overrides, "
+                "item_embed_overrides, or stacked_query_item_embed_overrides are supplied."
             )
         if item_first and has_embeds:
             raise ValueError("item_first is not supported when embeddings are supplied")
+        if stacked_query_item_embed_overrides is not None and (
+            query_embed_overrides is not None or item_embed_overrides is not None
+        ):
+            raise ValueError(
+                "stacked_query_item_embed_overrides is mutually exclusive with "
+                "query_embed_overrides / item_embed_overrides."
+            )
         if item_embed_overrides is not None and len(item_embed_overrides) != len(items):
             raise ValueError(
                 f"item_embed_overrides length ({len(item_embed_overrides)}) "
                 f"must match items length ({len(items)})."
             )
+        if stacked_query_item_embed_overrides is not None:
+            if isinstance(query, str) or isinstance(items, str):
+                raise ValueError(
+                    "stacked_query_item_embed_overrides requires token-id query/items, "
+                    "not str."
+                )
+            expected = 1 if get_exec().features.enable_mis else len(items)
+            if len(stacked_query_item_embed_overrides) != expected:
+                raise ValueError(
+                    f"stacked_query_item_embed_overrides length "
+                    f"({len(stacked_query_item_embed_overrides)}) must be {expected} "
+                    f"(1 for multi-item scoring, else len(items))."
+                )
+
         # Check if multi-item scoring is enabled
         use_multi_item_scoring = get_exec().features.enable_mis
 
@@ -874,6 +1041,15 @@ class TokenizerManagerScoreMixin:
         use_score_extraction = score_extraction_token_id is not None
         if use_score_extraction:
             self._validate_score_extraction(is_generation, item_first)
+        if image_data is not None and (
+            not is_generation
+            or use_multi_item_scoring
+            or use_score_extraction
+            or has_embeds
+        ):
+            raise ValueError(
+                "image_data requires pointwise generation scoring without embedding overrides"
+            )
 
         input_ids = None
         text_prompts = None
@@ -929,6 +1105,7 @@ class TokenizerManagerScoreMixin:
                     embed_override_token_id,
                     query_embed_overrides,
                     item_embed_overrides,
+                    stacked_query_item_embed_overrides,
                 )
             )
         elif (
@@ -959,6 +1136,7 @@ class TokenizerManagerScoreMixin:
                     embed_override_token_id,
                     query_embed_overrides,
                     item_embed_overrides,
+                    stacked_query_item_embed_overrides,
                 )
             )
         else:
@@ -1014,14 +1192,19 @@ class TokenizerManagerScoreMixin:
             batch_request = GenerateReqInput(
                 text=text_prompts,
                 input_ids=input_ids,
+                image_data=image_data,
                 token_ids_logprob=request_labels,
                 return_logprob=True,
-                # Set logprob_start_len=0 for multi-item scoring since we want logprobs at all delimiter positions
-                logprob_start_len=0 if use_multi_item_scoring else -1,
+                # logprob_start_len=0 so input-position logprobs are computed:
+                # multi-item scoring reads them at delimiters, setwise at anchors.
+                logprob_start_len=(
+                    0 if (use_multi_item_scoring or use_score_extraction) else -1
+                ),
                 stream=False,
                 sampling_params={"max_new_tokens": 0},
                 positional_embed_overrides=positional_embed_overrides,
                 multi_item_delimiter_indices=mis_delimiter_indices,
+                token_indices_to_pool=token_indices_to_pool,
             )
         else:
             batch_request = EmbeddingReqInput(
@@ -1037,13 +1220,15 @@ class TokenizerManagerScoreMixin:
 
         if use_multi_item_scoring and use_score_extraction:
             # Multi-item setwise: the items were fused into one sequence and the
-            # head pooled at every anchor. Split the flat [ΣNᵢ, num_labels] result
-            # back into one matrix per item (nested scores).
+            # readout taken at every anchor. Split the flat [ΣNᵢ, num_labels]
+            # result back into one matrix per item (nested scores).
             return self._process_multi_item_extraction_results(
                 results,
                 per_item_anchor_counts,
                 apply_softmax,
-                return_pooled_hidden_states,
+                label_token_ids=label_token_ids,
+                temperature=temperature,
+                return_pooled_hidden_states=return_pooled_hidden_states,
             )
         elif use_multi_item_scoring:
             # Multi-item scoring: extract scores from input_token_ids_logprobs or embedding

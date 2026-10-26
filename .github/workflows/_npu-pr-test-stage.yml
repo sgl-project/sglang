@@ -50,10 +50,10 @@ on:
         description: 'If true, delegate test execution to scripts/ci/npu/precise-test/run_tests_with_coverage.sh instead of running via run_suite.py directly'
         type: boolean
         default: false
-      upload_test_logs:
-        description: 'If true, upload the test logs as a GitHub Actions artifact (only enabled by pr-test-npu)'
-        type: boolean
-        default: false
+      only_tests:
+        description: 'Coverage-recommended test files for this suite (one repo-relative path per line, from recommend-tests-from-coverage). Empty = run the full suite.'
+        type: string
+        default: ''
       github-token:
         description: 'GitHub token for API calls'
         type: string
@@ -70,6 +70,7 @@ env:
 
 jobs:
   run:
+    name: ${{ inputs.use_coverage_runner && inputs.self_name || 'run' }} (${{ matrix.partition }})
     runs-on: ${{ inputs.runner_config }}
     container:
       image: ${{ inputs.image }}
@@ -177,7 +178,7 @@ jobs:
                 return false;
               }
               // multimodal-gen NPU tests should not cascade fast-fail to perf/accuracy stages.
-              if (baseName === 'multimodal-gen-test-1-npu-a3' || baseName === 'multimodal-gen-test-2-npu-a3') {
+              if (baseName === 'multimodal-gen-test-1-npu-a3' || baseName === 'multimodal-gen-test-4-npu-a3') {
                 core.info(`[health-check] Filtered out multimodal-gen NPU job: ${j.name}`);
                 return false;
               }
@@ -241,6 +242,7 @@ jobs:
         env:
           CONTINUE_ON_ERROR_FLAG: ${{ inputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
           TEST_LOG_DIR: /tmp/test-logs
+          ONLY_TESTS: ${{ inputs.only_tests }}
         shell: bash
         run: |
           # Fail fast on any command error, undefined variable, or pipe failure.
@@ -284,6 +286,16 @@ jobs:
             NIGHTLY_FLAG="--nightly --continue-on-error"
           fi
 
+          # Precision-test mode: run only the coverage-recommended files for
+          # this suite. The bucketed list comes from recommend-tests-from-
+          # coverage; empty input keeps the full-suite behavior.
+          ONLY_FILE_ARGS=""
+          if [ -n "${ONLY_TESTS}" ]; then
+            printf '%s\n' "${ONLY_TESTS}" > /tmp/precision_tests.txt
+            ONLY_FILE_ARGS="--only-file-list /tmp/precision_tests.txt"
+            echo "Precision mode: running $(wc -l < /tmp/precision_tests.txt) recommended file(s)"
+          fi
+
           # Optional: delegate execution to scripts/ci/npu/precise-test/run_tests_with_coverage.sh when the
           # caller sets use_coverage_runner=true. list_tests.py (same directory) enumerates the
           # selected test files; the original run_suite.py execution below is preserved
@@ -308,13 +320,4 @@ jobs:
             --auto-partition-id ${{ matrix.partition }} \
             --auto-partition-size ${{ fromJson(inputs.partitions).size }} \
             ${{ inputs.timeout_per_file && format('--timeout-per-file {0}', inputs.timeout_per_file) || '' }} \
-            $NIGHTLY_FLAG $CONTINUE_ON_ERROR_FLAG 2>&1 | tee "${LOG_FILE}"
-
-      - name: Upload test logs
-        if: always() && inputs.use_coverage_runner != true && inputs.upload_test_logs == true
-        uses: actions/upload-artifact@v7
-        with:
-          name: selected-test-logs-${{ inputs.self_name }}-part${{ matrix.partition }}
-          path: /tmp/test-logs/
-          if-no-files-found: ignore
-          retention-days: 14
+            $ONLY_FILE_ARGS $NIGHTLY_FLAG $CONTINUE_ON_ERROR_FLAG 2>&1 | tee "${LOG_FILE}"
