@@ -327,6 +327,20 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 </tbody>
 </table>
 
+## Native gRPC health
+
+When you use `SGLANG_RUST_SERVER=1` with `--grpc-port` (or `SGLANG_GRPC_PORT`), each native Rust inference listener exposes `grpc.health.v1.Health/Check` and `Watch` on its gRPC endpoint. This applies to `sglang.api.v1` listeners, not legacy SMG or Python metadata endpoints.
+
+Use `sglang.api.v1.SglangService` or the empty string as the request's `service`. Both report the same listener-local snapshot. Unknown names return `NOT_FOUND` from Check or `SERVICE_UNKNOWN` from Watch without starting probes.
+
+`SERVING` means startup readiness completed and the core observed scheduler output activity during a synthetic one-token probe. Other requests' output can satisfy it. Probes have scheduling and compute cost; this does not certify spare capacity, model quality, or every rank or node.
+
+Known-service clients share one in-flight probe future. Completed results are cached for 5 seconds. Check uses a fresh result or waits for a refresh. A new Watch initially reports `NOT_SERVING` if the cache is stale; established watches retain their status during refresh and receive status changes. Without known-service demand, monitoring stops.
+
+[`SGLANG_HEALTH_CHECK_TIMEOUT`](/docs/references/environment_variables) bounds the entire standard probe, including submission (default 20 seconds). An unready core, error, or timeout reports `NOT_SERVING`; zero disables probe submission. An established Watch can retain old `SERVING` for 5 seconds plus this timeout, with additional runtime scheduling delay.
+
+The existing custom `SglangService/HealthCheck` remains unchanged and uses a separate probe budget. Listener shutdown cancels monitoring; final `NOT_SERVING` delivery is best-effort. Cancellation requests backend cleanup, but does not prove model work has drained or change request admission.
+
 ## Quantization and data type
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>

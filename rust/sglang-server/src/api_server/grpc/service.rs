@@ -45,6 +45,12 @@ pub(crate) struct GrpcService {
 }
 
 impl GrpcService {
+    pub(super) fn standard_health(
+        &self,
+    ) -> (super::health::StandardHealth, super::health::MonitorGuard) {
+        super::health::StandardHealth::new(self.core.clone(), self.config.health_timeout)
+    }
+
     pub(crate) fn new(
         core: CoreHandle,
         server_args: &ServerArgs,

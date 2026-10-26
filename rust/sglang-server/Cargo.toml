@@ -61,9 +61,11 @@ sha2 = "0.10"
 # naturally while the crate keeps its own artifact name in the shared target/.
 sglang_mm = { package = "sglang-mm", path = "../sglang-mm", default-features = false }
 tonic = { workspace = true }
+tonic-health = "0.14.6"
 tokio-stream = { workspace = true }
 sglang_api_types = { package = "sglang-api-types", path = "../sglang-api-types" }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 # `Router::oneshot` for handler-level router tests.
 tower = { version = "0.5", features = ["util"] }

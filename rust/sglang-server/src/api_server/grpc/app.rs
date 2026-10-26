@@ -7,6 +7,7 @@
 
 use sglang_api_types::api::v1::sglang_service_server::SglangServiceServer;
 use tokio_stream::wrappers::TcpListenerStream;
+use tonic_health::pb::health_server::HealthServer;
 
 use super::service::GrpcService;
 
@@ -58,12 +59,14 @@ pub(crate) async fn serve(
         }
     };
     let incoming = TcpListenerStream::new(listener);
+    let (health, monitor) = service.standard_health();
     let max_message_size = max_message_size();
     let service = SglangServiceServer::new(service)
         .max_decoding_message_size(max_message_size)
         .max_encoding_message_size(max_message_size);
     let serve = tonic::transport::Server::builder()
         .add_service(service)
+        .add_service(HealthServer::new(health))
         .serve_with_incoming(incoming);
 
     if let Some(addr) = addr {
@@ -79,4 +82,5 @@ pub(crate) async fn serve(
             tracing::info!("shutdown: stopping gRPC accepts; API runtime teardown cancels in-flight RPCs");
         }
     }
+    monitor.stop().await;
 }
