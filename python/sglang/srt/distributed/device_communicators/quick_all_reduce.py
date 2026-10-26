@@ -379,6 +379,9 @@ _QUICK_REDUCE_ENV_ALIASES = {
 # Codecs served by the bundled INT8 codec. AITER has no INT8 codec, and
 # released AITER FP8 returns NaN for near-zero blocks with FP16 kernels.
 _BUNDLED_INT8_CODECS = ("INT8", "FP8")
+# INT4 stays on the bundled communicator. FlyDSL or the HIP kernel is chosen
+# later, per payload.
+_BUNDLED_INT4_CODECS = ("INT4",)
 
 
 def _configure_aiter_quickreduce_env() -> None:
@@ -448,7 +451,7 @@ def create_quick_allreduce(
             )
             _configure_bundled_int8_env()
             return _QuickAllReduceAdapter(QuickAllReduce(group=group, device=device))
-        if codec == "INT4":
+        if codec in _BUNDLED_INT4_CODECS:
             logger.info("Using bundled QuickAllReduce INT4 codec")
             _configure_bundled_int4_env()
             return _QuickAllReduceAdapter(QuickAllReduce(group=group, device=device))
