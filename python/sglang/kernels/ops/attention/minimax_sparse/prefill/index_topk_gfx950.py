@@ -144,9 +144,8 @@ def _index_topk_partial_kernel(
     kv_head = pid_h // gqa_group_size
     strides = (stride_k_page, stride_k_s, stride_sc_page, stride_sc_s)
 
-    # At 64 rows per warp a sub-tile reduces to its row maxima at once, which keeps the
-    # kernel within two waves' registers; at 32 rows the elementwise running max is
-    # cheaper.
+    # At 64 rows per warp a sub-tile reduces to its row maxima at once, to fit two waves'
+    # registers; at 32 rows the elementwise running max is cheaper.
     ROW_MAX: gl.constexpr = BLOCK_M // num_warps > 32
     MMA_DTYPE: gl.constexpr = gl.float16 if K_FP4 else q_ptr.dtype.element_ty
     # A lane loads 16 contiguous bytes of a token row: fp8 dims or NVFP4 u16.

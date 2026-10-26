@@ -666,7 +666,7 @@ class VerifyMLA:
             BLOCK_N=self.block_n,
             SLIDING_WINDOW_SIZE=sliding_window_size,
             num_warps=self.num_warps,
-            # Measured on gfx950 for the M3.1 draft window: 13-26% faster.
+            # Measured on gfx950 for the M3.1 draft window.
             num_stages=2 if self.windowed else 1,
             **_AMD_LAUNCH_KWARGS,
         )

@@ -584,7 +584,7 @@ _CASES = [
     ("padded_to_bucket", _case_padded_to_bucket),
     ("page_table_positions", _case_page_table_positions),
     ("qo_indptr", _case_qo_indptr),
-    # gfx950's step-bias kernel; CUDA never runs it
+    # gfx950-only DSpark kernels; CUDA never runs them
     *(
         [
             ("markov_step_bias", _case_markov_step_bias),

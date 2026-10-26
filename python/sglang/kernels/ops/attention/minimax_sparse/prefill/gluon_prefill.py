@@ -47,12 +47,12 @@ PAGES_PER_BLOCK = SPARSE_BLOCK_SIZE // GLUON_PAGE_SIZE
 HEAD_DIM = 128
 # aiter's fp8 on gfx950, the only arch that dispatches here (gfx942 would be e4m3fnuz).
 _FP8_KV_DTYPE = torch.float8_e4m3fn
-# Scratch grows in 1024-page steps (16 KiB/page/buffer at bf16 -> 16 MiB granularity).
+# Scratch grows in 1024-page steps (16 KiB/page/buffer -> 16 MiB granularity).
 _SCRATCH_GROW_PAGES = 1024
 _PAGE_ELEMS = HEAD_DIM * GLUON_PAGE_SIZE
 
-# 512 MiB per buffer at bf16, 256 MiB at fp8 (~2.1M context tokens per forward); past it
-# an NVFP4 batch runs in request groups, others fall back to Triton (reads the pool in place).
+# 512 MiB per buffer at bf16 (~2.1M context tokens per forward); past it an NVFP4 batch
+# runs in request groups, others fall back to Triton (reads the pool in place).
 _MAX_SCRATCH_PAGES = (512 * 1024 * 1024) // (_PAGE_ELEMS * 2)
 
 
