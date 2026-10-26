@@ -419,7 +419,9 @@ def checkpoint_bytes(model_path: str) -> int:
 
 _DIT_SUBFOLDER = "transformer"
 _DIT_SINGLE_FILE = "diffusion_pytorch_model.safetensors"
-_FLOAT_DTYPES = frozenset({"F64", "F32", "F16", "BF16"})
+_FLOAT_DTYPE_BYTES = {"F64": 8, "F32": 4, "F16": 2, "BF16": 2}
+_FLOAT_DTYPES = frozenset(_FLOAT_DTYPE_BYTES)
+_UNSIZED_WEIGHT_SUFFIXES = (".bin", ".pt", ".pth", ".ckpt", ".gguf")
 
 
 def _index_shard_names(index_path: str) -> list[str]:
@@ -505,6 +507,59 @@ def dit_parameter_count(
     if not counts or not counts.keys() <= _FLOAT_DTYPES:
         return None
     return sum(counts.values())
+
+
+def checkpoint_component_sizes(
+    model_path: str, *, subfolder: str | None, revision: str | None
+) -> dict[str, tuple[int, int]] | None:
+    """(parameter count, stored bytes) of each model_index.json component of a
+    locally cached Diffusers checkpoint, from safetensors headers.
+
+    Weightless components (tokenizers, schedulers) are left out. None when any
+    component cannot be sized from local float safetensors (not cached, missing
+    shards, other formats, quantized weights).
+    """
+    try:
+        model_path = os.path.expanduser(model_path)
+        if os.path.isdir(model_path):
+            root = model_path
+        elif os.path.exists(model_path) or envs.SGLANG_USE_MODELSCOPE.get():
+            return None
+        else:
+            root = snapshot_download(
+                repo_id=model_path,
+                revision=revision,
+                allow_patterns=["*model_index.json"],
+                local_files_only=True,
+            )
+        if subfolder:
+            root = os.path.join(root, subfolder)
+        with open(os.path.join(root, "model_index.json")) as f:
+            components = [
+                name
+                for name, spec in json.load(f).items()
+                if isinstance(spec, list) and spec[0] is not None
+            ]
+        sizes = {}
+        for name in components:
+            folder = os.path.join(root, name)
+            # a component folder not yet downloaded raises here
+            files = os.listdir(folder)
+            if not any(file.endswith(".safetensors") for file in files):
+                if any(file.endswith(_UNSIZED_WEIGHT_SUFFIXES) for file in files):
+                    return None
+                continue
+            counts = _local_dit_parameter_counts(folder)
+            if not counts or not counts.keys() <= _FLOAT_DTYPES:
+                return None
+            sizes[name] = (
+                sum(counts.values()),
+                sum(n * _FLOAT_DTYPE_BYTES[dtype] for dtype, n in counts.items()),
+            )
+        return sizes
+    except Exception as exc:
+        logger.debug("Could not size the checkpoint of %s: %s", model_path, exc)
+        return None
 
 
 def keep_checkpoint_mapped(*, weight_bytes: int, component: str) -> bool:
