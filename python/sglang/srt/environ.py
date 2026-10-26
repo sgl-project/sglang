@@ -1547,6 +1547,9 @@ class Envs:
     SGLANG_OPT_FUSED_KDA_VERIFY = EnvBool(False)
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
+    # Let a bidirectional (non-causal) DFLASH draft run on trtllm_mha via its
+    # ENCODER_ONLY target-verify path (the path DSPARK drafts use).
+    SGLANG_DFLASH_TRTLLM_MHA_BIDIRECTIONAL = EnvBool(False)
     SGLANG_ENABLE_LILICORR_SAMPLING = EnvBool(False)
     SGLANG_LILICORR_REQUIRE_SAMPLING = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")

@@ -895,7 +895,10 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
             and set(layer_types) == {"sliding_attention"}
         )
         all_causal = getattr(draft_text_config, "is_causal", False) is True
-        if not (all_sliding or all_causal):
+        # trtllm_mha serves ENCODER_ONLY (bidirectional) target-verify drafts by
+        # expanding the window into single-token decode rows, as DSPARK uses.
+        bidirectional_ok = envs.SGLANG_DFLASH_TRTLLM_MHA_BIDIRECTIONAL.get()
+        if not (all_sliding or all_causal or bidirectional_ok):
             fallback_backend = get_fallback_backend()
             # Preserve the CUDA FA4 path without overriding out-of-tree defaults.
             if not current_platform.is_out_of_tree() and get_platform().is_sm100:

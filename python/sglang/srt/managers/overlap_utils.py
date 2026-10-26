@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional, Sequence
 
@@ -13,6 +14,8 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.utils import is_cuda, is_hip, is_npu
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -46,9 +49,14 @@ def decide_needs_cpu_seq_lens(
         return True
     # Skip unset slots (e.g. draft_extend_attn_backend on some spec configs);
     # missing flag -> True so undeclared backends stay on the legacy path.
-    return any(
-        getattr(b, "needs_cpu_seq_lens", True) for b in attn_backends if b is not None
-    )
+    flags = [
+        (type(b).__name__, getattr(b, "needs_cpu_seq_lens", True))
+        for b in attn_backends
+        if b is not None
+    ]
+    result = any(flag for _, flag in flags)
+    logger.info("needs_cpu_seq_lens=%s from %s", result, flags)
+    return result
 
 
 def decide_needs_confidence_relay() -> bool:
