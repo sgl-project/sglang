@@ -100,7 +100,7 @@ class HummingMoeQuantInfo(MoeQuantInfo):
     layer: torch.nn.Module
 
 
-@register_custom_op()
+@register_custom_op(out_shape="hidden_states")
 def humming_moe_runner_core_run(
     moe_runner_id: int,
     gemm_type: str,
