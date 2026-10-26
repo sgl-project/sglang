@@ -411,7 +411,6 @@ class PrefillBootstrapQueue:
             bootstrap_room=req.bootstrap_room,
             req_has_disagg_prefill_dp_rank=req.disagg_prefill_dp_rank is not None,
         )
-        self._process_req(req)
         req.pending_bootstrap = True
         return True
 
@@ -473,12 +472,6 @@ class PrefillBootstrapQueue:
             self.scheduler.output_streamer.stream_output([req], req.return_logprob)
             return True
         return False
-
-    def _process_req(self, req: Req) -> None:
-        """
-        Set max_new_tokens = 1, so PrefillAdder memory estimation is accurate
-        """
-        req.sampling_params.max_new_tokens = 1
 
     def can_prefill_before_bootstrap(self, req: Req) -> bool:
         """Check eligibility; pause and metadata admission stay in the shared queue."""

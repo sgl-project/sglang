@@ -2692,6 +2692,11 @@ class Scheduler(
             if req.sampling_params.max_new_tokens is not None
             else 1 << 30
         )
+        # PD prefill never decodes: budget one token so PrefillAdder does not
+        # reserve the full decode length. Idempotent under the PP relay, which
+        # re-runs this on the already-overridden value downstream.
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            max_new_tokens = 1
         if self.max_new_tokens_limit is not None and self.max_new_tokens_limit > 0:
             if max_new_tokens > self.max_new_tokens_limit:
                 logger.warning(
