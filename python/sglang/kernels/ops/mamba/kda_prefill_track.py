@@ -34,6 +34,7 @@ def _kda_track_conv_window_kernel(
     num_tokens,  # [1] int32 logical tokens of the batch
     stride_pool_slot,
     stride_pool_row,
+    stride_pool_feature,
     stride_x_token,
     dim,
     STATE_LEN: tl.constexpr,
@@ -53,7 +54,10 @@ def _kda_track_conv_window_kernel(
         t = tl.minimum(tl.maximum(start + j, 0), total - 1).to(tl.int64)
         val = tl.load(x + t * stride_x_token + offs, mask=mask)
         tl.store(
-            conv_pool + dst * stride_pool_slot + j * stride_pool_row + offs,
+            conv_pool
+            + dst * stride_pool_slot
+            + j * stride_pool_row
+            + offs * stride_pool_feature,
             val.to(conv_pool.dtype.element_ty),
             mask=mask,
         )
@@ -104,7 +108,7 @@ def kda_track_conv_window(
     every tracked row ``r``; the grid depends only on the row bound."""
     rows = track_mode.shape[0]
     state_len, dim = conv_pool.shape[-2], conv_pool.shape[-1]
-    assert x.shape[-1] == dim and x.stride(-1) == 1 and conv_pool.stride(-1) == 1
+    assert x.shape[-1] == dim and x.stride(-1) == 1
     block_d = 1024
     _kda_track_conv_window_kernel[(rows, triton.cdiv(dim, block_d))](
         conv_pool,
@@ -115,6 +119,7 @@ def kda_track_conv_window(
         num_tokens,
         conv_pool.stride(0),
         conv_pool.stride(1),
+        conv_pool.stride(2),
         x.stride(0),
         dim,
         STATE_LEN=state_len,

@@ -152,7 +152,7 @@ class TestKDAPrefillGraph(CustomTestCase):
 
     def _fill(self, meta, batch):
         with patch(
-            "sglang.srt.layers.attention.linear.kda_backend.mamba_cache_chunk_size",
+            "sglang.srt.layers.attention.hybrid_linear_attn_backend.mamba_cache_chunk_size",
             return_value=CHUNK,
         ):
             self.backend._fill_prefill_graph_metadata(
