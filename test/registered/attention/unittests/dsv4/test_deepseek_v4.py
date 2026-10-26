@@ -721,7 +721,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             )
         )
 
-    def test_trtllm_semaphore_capacity_covers_configured_query_rows(self):
+    def test_trtllm_counter_capacity_covers_configured_query_rows(self):
         from sglang.srt.layers.attention import deepseek_v4_trtllm_backend as trtllm
 
         schedule = SimpleNamespace(max_prefill_tokens=16384, max_running_requests=256)
@@ -739,11 +739,6 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             # Decode rows = requests x draft tokens dominate.
             schedule.max_running_requests = 8192
             self.assertEqual(trtllm._trtllm_query_row_capacity(model_runner), 32768)
-
-        with mock.patch.object(trtllm, "_trtllm_semaphore_rows", 64):
-            trtllm._check_trtllm_query_rows(64)
-            with self.assertRaisesRegex(RuntimeError, "exceeds the persistent"):
-                trtllm._check_trtllm_query_rows(65)
 
     def test_sparse_prefill_kv_buffer_reuses_and_grows(self):
         from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
@@ -809,6 +804,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             core_attn_metadata=core, late_layer_tail=None
         )
         backend.trtllm_workspace_buffer = torch.empty(1, dtype=torch.int8)
+        backend.trtllm_counter_buffer = torch.empty(1, dtype=torch.uint8)
         backend.trtllm_graph_output_buffer = torch.full((8, 2, 512), 7.0)
         backend.trtllm_eager_output_buffer = None
         backend._padded_output_zeroed = None
@@ -829,17 +825,9 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         )
         q = torch.empty((8, 2, 512), dtype=torch.float8_e4m3fn)
 
-        # The semaphore-capacity guard reads a module global set only by the real __init__;
-        # this backend is hand-built.
-        with (
-            mock.patch(
-                "sglang.srt.layers.attention.deepseek_v4_trtllm_backend._trtllm_semaphore_rows",
-                64,
-            ),
-            mock.patch(
-                "sglang.srt.layers.attention.deepseek_v4_trtllm_backend.trtllm_batch_decode_sparse_mla_dsv4",
-                side_effect=fake_attention,
-            ),
+        with mock.patch(
+            "sglang.srt.layers.attention.deepseek_v4_trtllm_backend.trtllm_batch_decode_sparse_mla_dsv4",
+            side_effect=fake_attention,
         ):
             output = backend._forward_trtllm_prefill(
                 q=q,

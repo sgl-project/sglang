@@ -9,10 +9,6 @@ import unittest
 import torch
 from flashinfer.mla import trtllm_batch_decode_sparse_mla_dsv4
 
-from sglang.srt.layers.attention.deepseek_v4_trtllm_backend import (
-    _install_persistent_trtllm_semaphores,
-)
-
 
 @unittest.skipUnless(
     torch.cuda.is_available()
@@ -22,7 +18,6 @@ from sglang.srt.layers.attention.deepseek_v4_trtllm_backend import (
 class TestTrtllmPrefill(unittest.TestCase):
     def test_prefill_reference_and_dispatch(self):
         torch.manual_seed(41603)
-        _install_persistent_trtllm_semaphores(8192)
         device = "cuda"
         dtype = torch.float8_e4m3fn
         heads, dim, topk = 16, 512, 2176
