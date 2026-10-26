@@ -140,8 +140,9 @@ impl ThinkingTemplates {
 fn detect_thinking_policy(template: &str) -> ThinkingPolicy {
     if template.contains("<|channel|>")
         || ((!template.contains("enable_thinking") && !template.contains("thinking"))
-            && (template.contains(r"<|im_start|>assistant\n<think>\n")
-                || template.contains("<|im_start|>assistant\n<think>\n")))
+            // `force_reasoning_pattern` matches the escaped `\n` a Jinja string
+            // literal spells, not a newline in the template's own text.
+            && template.contains(r"<|im_start|>assistant\n<think>\n"))
     {
         return ThinkingPolicy::Always;
     }
@@ -381,6 +382,20 @@ mod tests {
         );
         assert_eq!(
             detect_thinking_policy("{% if enable_thinking %}think{% endif %}"),
+            ThinkingPolicy::Unknown
+        );
+    }
+
+    /// Only the escaped `\n` of a Jinja string literal forces reasoning, as
+    /// Python's `force_reasoning_pattern` regex has it.
+    #[test]
+    fn forced_think_matches_only_the_escaped_newline() {
+        assert_eq!(
+            detect_thinking_policy(r"{{ '<|im_start|>assistant\n<think>\n' }}"),
+            ThinkingPolicy::Always
+        );
+        assert_eq!(
+            detect_thinking_policy("<|im_start|>assistant\n<think>\n"),
             ThinkingPolicy::Unknown
         );
     }
