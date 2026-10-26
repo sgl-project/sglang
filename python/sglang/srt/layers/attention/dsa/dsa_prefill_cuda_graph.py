@@ -172,3 +172,47 @@ def pcg_dsa_indexer_prefill_split(
 
 
 bcg_dsa_indexer_prefill_split = eager_on_graph(True)(pcg_dsa_indexer_prefill_split)
+
+
+def dsa_indexer_prefill_topk_split(
+    layer_id: int,
+    q_fp8: torch.Tensor,
+    weights: torch.Tensor,
+    topk_result: torch.Tensor,
+) -> None:
+    # Eager top-k of the BCG prefill indexer whose Q/K prep and index-K store
+    # were captured over every bucket row (q_fp8 / weights padded to the
+    # bucket). Logits are sized by the batch's ragged KV, so this stays a break;
+    # it fills the real rows of the static topk_result.
+    forward_context = get_tc_piecewise_forward_context()
+    forward_batch = forward_context.forward_batch
+    indexer = forward_context.dsa_indexers[layer_id]
+    metadata = get_attn_backend().get_indexer_metadata(layer_id, forward_batch)
+    if indexer._should_skip_logits_computation(forward_batch):
+        # Every key is selected (kv_len <= top-k): the top-k kernel's fast path
+        # turns zero logits into the identity selection.
+        seq_lens_expanded = metadata.get_seqlens_expanded()
+        dummy_logits = torch.zeros(
+            seq_lens_expanded.shape[0],
+            indexer.index_topk,
+            dtype=torch.float32,
+            device=q_fp8.device,
+        )
+        raw_topk_result = metadata.topk_transform(dummy_logits, indexer.index_topk)
+        topk_result[: raw_topk_result.shape[0]] = raw_topk_result
+        return
+    num_tokens = forward_batch.extend_num_tokens
+    indexer._get_topk_ragged(
+        False,
+        forward_batch,
+        layer_id,
+        q_fp8[:num_tokens],
+        weights[:num_tokens],
+        metadata,
+        topk_result,
+    )
+
+
+bcg_dsa_indexer_prefill_topk_split = eager_on_graph(True)(
+    dsa_indexer_prefill_topk_split
+)

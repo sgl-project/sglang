@@ -14,7 +14,10 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.dsa.utils import is_graph_dsa_split_op_surface
-from sglang.srt.layers.attention.dsa_backend import prepare_kv_for_attention
+from sglang.srt.layers.attention.dsa_backend import (
+    DeepseekSparseAttnBackend,
+    prepare_kv_for_attention,
+)
 from sglang.srt.layers.attention.graph_utils import padded_extend_real_tokens
 from sglang.srt.layers.cp.interleave import (
     DSAInterleaveCPIndexerOverlap,
@@ -192,6 +195,28 @@ class DeepseekMLAForwardMixin:
         if self.current_attention_backend not in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
             return False
         return True
+
+    def _dsa_prefill_attention_in_graph_backend(
+        self: DeepseekV2AttentionMLA,
+        forward_batch: ForwardBatch,
+        topk_indices: Optional[torch.Tensor],
+        extra_args: dict,
+    ) -> Optional[DeepseekSparseAttnBackend]:
+        """The DSA backend when the bmm + attention split op can instead be
+        recorded in the breakable prefill CUDA graph (fused RoPE + FP8 path
+        only), else None."""
+        if topk_indices is None or extra_args.get("cos_sin_cache") is None:
+            return None
+        if extra_args.get("llama_4_scaling") is not None or "attn_sink" in extra_args:
+            return None
+        backend = get_attn_backend()
+        if not isinstance(backend, DeepseekSparseAttnBackend):
+            return None
+        if not backend.can_run_prefill_attention_in_graph(
+            forward_batch, num_rows=topk_indices.shape[0]
+        ):
+            return None
+        return backend
 
     def _split_q_nope_pe(
         self: DeepseekV2AttentionMLA,
@@ -733,7 +758,32 @@ class DeepseekMLAForwardMixin:
                     is_neox=self.rotary_emb.is_neox_style,
                     llama_4_scaling=llama_4_scaling,
                 )
-            if fusion_plan is not None:
+            graph_attn_backend = (
+                self._dsa_prefill_attention_in_graph_backend(
+                    forward_batch, topk_indices, extra_args
+                )
+                if fusion_plan is not None
+                else None
+            )
+            if graph_attn_backend is not None:
+                torch.bmm(
+                    fusion_plan.q_nope_t, self.w_kc, out=fusion_plan.q_nope_out_buf
+                )
+                graph_attn_backend.forward_prefill_in_graph(
+                    layer=self.attn_mqa,
+                    q_nope=q_nope_out,
+                    q_rope=q_pe,
+                    k_nope=k_nope,
+                    k_rope=k_pe,
+                    topk_indices=topk_indices,
+                    positions=forward_batch.positions,
+                    out_cache_loc=forward_batch.out_cache_loc,
+                    cos_sin_cache=extra_args["cos_sin_cache"],
+                    is_neox=extra_args["is_neox"],
+                    out=fusion_plan.attn_output_buf,
+                )
+                attn_output = fusion_plan.attn_output_buf
+            elif fusion_plan is not None:
                 self._eager_bmm_attention(
                     fusion_plan.q_nope_t,
                     self.w_kc,

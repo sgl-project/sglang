@@ -27,6 +27,7 @@ from sglang.srt.layers.attention.dsa.dsa_prefill_cuda_graph import (
     GRAPH_WEIGHTS_PROJ_LORA_ERROR,
     _is_in_piecewise_or_breakable_cuda_graph,
     bcg_dsa_indexer_prefill_split,
+    bcg_dsa_indexer_prefill_topk_split,
     pcg_dsa_indexer_prefill_split,
 )
 from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
@@ -842,6 +843,26 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             page_table_64=page_table_64,
             rows=rows,
         )
+
+    def _prefill_prep_in_graph(
+        self, forward_batch: ForwardBatch, num_rows: int
+    ) -> bool:
+        # Same gate as the captured prefill attention, whose padded-row
+        # conventions (zero-padded out_cache_loc, dummy slot 0) this relies on.
+        from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
+
+        if not (
+            self.use_dsa_indexer_fusion
+            and envs.SGLANG_ENABLE_DSA_PREFILL_INDEXER_PREP_IN_CUDA_GRAPH.get()
+            and not self._aiter_fused_fp8_active(forward_batch)
+            and not self.dsa_enable_prefill_cp
+            and not hasattr(get_token_to_kv_pool(), "_is_layer_owned")
+        ):
+            return False
+        backend = get_attn_backend()
+        return isinstance(
+            backend, DeepseekSparseAttnBackend
+        ) and backend.can_run_prefill_attention_in_graph(forward_batch, num_rows)
 
     def _should_skip_logits_computation(self, forward_batch: ForwardBatch) -> bool:
         # topk_transform selects every valid page slot when kv_len <= index_topk;
@@ -2048,22 +2069,47 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 topk_result = torch.empty(
                     (0, self.index_topk), device=x_meta.device, dtype=torch.int32
                 )
-            graph_dispatch_fn = (
-                bcg_dsa_indexer_prefill_split
-                if is_in_breakable_cuda_graph()
-                else pcg_dsa_indexer_prefill_split
-            )
-            # ROCm aiter fused RMSNorm+quant hands over (x, x_s[, x_bf16]).
-            x_parts = x if isinstance(x, tuple) else (x,)
-            graph_dispatch_fn(
-                layer_id=layer_id,
-                x=x_parts[0],
-                q_lora=q_lora,
-                positions=positions,
-                topk_result=topk_result,
-                x_s=x_parts[1] if len(x_parts) > 1 else None,
-                x_bf16=x_parts[2] if len(x_parts) > 2 else None,
-            )
+            if (
+                return_indices
+                and not isinstance(x, tuple)
+                and self._prefill_prep_in_graph(forward_batch, num_rows=x.shape[0])
+            ):
+                # Row-wise Q/K prep and index-K store over every bucket row
+                # (padded rows store to the dummy slot); only logits + top-k break.
+                # CUDA hands over plain bf16 x; the ROCm (x, x_s[, x_bf16]) tuple
+                # takes the whole-indexer split below.
+                q_fp8, weights = self._fused_q_prepare_and_store(
+                    x,
+                    q_lora,
+                    positions,
+                    forward_batch,
+                    layer_id,
+                    act_quant,
+                    enable_dual_stream=False,
+                )
+                bcg_dsa_indexer_prefill_topk_split(
+                    layer_id=layer_id,
+                    q_fp8=q_fp8,
+                    weights=weights,
+                    topk_result=topk_result,
+                )
+            else:
+                graph_dispatch_fn = (
+                    bcg_dsa_indexer_prefill_split
+                    if is_in_breakable_cuda_graph()
+                    else pcg_dsa_indexer_prefill_split
+                )
+                # ROCm aiter fused RMSNorm+quant hands over (x, x_s[, x_bf16]).
+                x_parts = x if isinstance(x, tuple) else (x,)
+                graph_dispatch_fn(
+                    layer_id=layer_id,
+                    x=x_parts[0],
+                    q_lora=q_lora,
+                    positions=positions,
+                    topk_result=topk_result,
+                    x_s=x_parts[1] if len(x_parts) > 1 else None,
+                    x_bf16=x_parts[2] if len(x_parts) > 2 else None,
+                )
             result = _broadcast_indexer_topk_from_rank0(
                 topk_result if return_indices else None
             )

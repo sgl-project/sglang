@@ -1566,6 +1566,9 @@ class Envs:
     # than the graph saves (e.g. DeepEP MoE workspace captured at full dispatch
     # capacity).
     SGLANG_DISABLE_DRAFT_EXTEND_CUDA_GRAPH = EnvBool(False)
+    # DeepSeek-family NextN (MTP) drafts: the draft extend after each target
+    # prefill chunk replays the breakable prefill CUDA graph instead of eager.
+    SGLANG_ENABLE_NEXTN_DRAFT_PREFILL_CUDA_GRAPH = EnvBool(True)
     # Use the split-KV (flash-decode) kernel for EAGLE target-verify on the
     # Triton backend (ROCm). Only active at speculative topk == 1; falls back to
     # extend_attention_fwd for unsupported cases or when set false (e.g. for
@@ -1962,6 +1965,12 @@ class Envs:
     SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC = EnvBool(False)
     SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK = EnvStr(None)
     SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvInt(2048)
+    # Capture DSA prefill attention (k_b bmm, RoPE + FP8, KV write, TRT-LLM sparse
+    # MLA) in the breakable prefill CUDA graph instead of an eager break.
+    SGLANG_ENABLE_DSA_PREFILL_ATTN_IN_CUDA_GRAPH = EnvBool(True)
+    # With the above: also capture the indexer's Q/K prep and index-K store;
+    # only its logits + top-k stay an eager break.
+    SGLANG_ENABLE_DSA_PREFILL_INDEXER_PREP_IN_CUDA_GRAPH = EnvBool(True)
     SGLANG_DSA_HIP_DISABLE_PRESHUFFLE = EnvBool(False)
     SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
