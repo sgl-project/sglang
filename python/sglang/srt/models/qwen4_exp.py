@@ -130,8 +130,8 @@ def _ple_table_is_fp8(
 
 @eager_on_graph(True)
 def _breakable_qsa_indexer(layer, hidden_states, positions, output):
-    """Writes the top-k into ``output``, the caller's rows of the layer's bridge,
-    or allocates a new bridge when ``output`` is None."""
+    """Writes the top-k into ``output``, the caller's rows of the layer's bridge;
+    allocates a new bridge when ``output`` is None."""
     # Read the live batch on every replay of this eager break.
     forward_batch = get_tc_piecewise_forward_context().forward_batch
     topk = layer._compute_qsa_topk_indices_eager(
@@ -187,8 +187,9 @@ class _PLEBatch(msgspec.Struct, frozen=True):
 
 
 class _BreakablePLEBatch:
-    """The caller's holder of the live batch's PLE layout, refilled by the break
-    at every replay for the PLE breaks after it."""
+    """The live batch's PLE layout for the PLE breaks of one forward. A capture
+    records this holder, and ``_breakable_prepare_ple_batch`` refills it at every
+    replay."""
 
     def __init__(self):
         self.batch: Optional[_PLEBatch] = None
@@ -1815,7 +1816,7 @@ class Qwen4ExpAttentionDecoderLayer(
         from sglang.srt.layers.attention.qsa.glue import build_qsa_indexer
 
         self.is_qsa = is_qwen_qsa(config)
-        # Newest first: the prefill graphs' top-k rows, shared by every bucket.
+        # The prefill graphs' top-k bridges, newest first. Buckets share the newest.
         self._qsa_prefill_topk_bridges: list = []
         if self.is_qsa:
             self.indexer = build_qsa_indexer(
