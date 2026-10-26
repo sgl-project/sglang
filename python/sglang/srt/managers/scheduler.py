@@ -5489,6 +5489,9 @@ class Scheduler(
         if self.is_fully_idle(ignore_waiting=self._engine_paused):
             self.cur_batch_for_debug = None
             self.last_batch = None
+            # Paused, retracted requests may still hold nodes of the tree being reset.
+            for req in self.waiting_queue:
+                req.release_mm_prefix_hold(self.tree_cache)
             self.tree_cache.reset()
             self.req_to_token_pool.clear()
             self.token_to_kv_pool_allocator.clear()
