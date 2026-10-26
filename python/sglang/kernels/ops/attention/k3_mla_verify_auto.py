@@ -9,7 +9,6 @@ so this is CUDA-graph safe.
 
 from __future__ import annotations
 
-import functools
 from typing import Optional
 
 import torch
@@ -17,7 +16,7 @@ import triton
 import triton.language as tl
 
 # gfx950-only module, imported lazily by the backend.
-from aiter.ops.triton.gluon.mla_gluon import _mla_gluon  # noqa: E402
+from aiter.ops.triton.gluon.mla_gluon import mla_gluon  # noqa: E402
 
 from sglang.kernels.ops.attention.k3_mla_verify_common import (
     _HAS_GLUON,
@@ -31,7 +30,6 @@ from sglang.kernels.ops.attention.k3_mla_verify_common import (
     default_num_splits,
 )
 
-_GLUON_BLOCK_H = 16
 _GLUON_BLOCK_N = 128
 _INT32_MAX = 2**31 - 1
 
@@ -153,11 +151,6 @@ def _k3_auto_reduce(
         tl.store(O + o_off + offs_d, go.to(O.dtype.element_ty))
 
 
-def gluon_num_splits(bs: int, qlen: int, num_heads: int) -> int:
-    """aiter mla_gluon bh16bn128 split budget (256 workgroups)."""
-    return max(1, 256 // (bs * qlen * triton.cdiv(num_heads, _GLUON_BLOCK_H)))
-
-
 def k3_mla_verify_auto(
     q: torch.Tensor,
     kv_buffer: torch.Tensor,
@@ -210,26 +203,8 @@ def k3_mla_verify_auto(
     dev = q.device
     rows = num_heads * qlen
 
-    # Gluon (bh16bn128) operands / partials
-    g_ns = gluon_num_splits(bs, qlen, num_heads)
     q4 = q.view(bs, qlen, num_heads, D)
-    q_nope = q4[..., :v_head_dim]
-    q_pe = q4[..., v_head_dim:]
     o4 = out.view(bs, qlen, num_heads, v_head_dim)
-    if g_ns == 1:  # Gluon stores the final output directly
-        g_logits = o4.view(bs, qlen, num_heads, 1, v_head_dim)
-        g_lse = None
-        g_ml = (0, 0, 0, 0)
-    else:
-        g_logits = torch.empty(
-            (bs, qlen, num_heads, g_ns, v_head_dim), dtype=out.dtype, device=dev
-        )
-        g_lse = torch.empty(
-            (bs, qlen, num_heads, g_ns), dtype=torch.float32, device=dev
-        )
-        g_ml = g_lse.stride()
-    g_sl = g_logits.stride()[:4]
-    g_within_2gb = kv.shape[0] * kv.stride(0) * kv.element_size() <= 0x80000000
 
     # v2 operands / partials
     min_chunk = _SPLIT_MIN_CHUNK
@@ -239,66 +214,32 @@ def k3_mla_verify_auto(
         (bs, nsplit, rows, v_head_dim), dtype=torch.bfloat16, device=dev
     )
     lse_part = torch.empty((bs, nsplit, rows), dtype=torch.float32, device=dev)
-    sel_p2 = max(256, triton.next_power_of_2(bs + 2))
 
-    # ---------------- 1. Gluon stage 1 with the regime prologue
+    # ---------------- 1. Gluon stage 1 with on-device kernel selection
     sel = torch.empty((bs + 2,), dtype=torch.int32, device=dev)
     flag = sel[bs + 1 :]
-    _mla_gluon[(bs, g_ns, triton.cdiv(num_heads, _GLUON_BLOCK_H) * qlen)](
-        q_nope,
-        q_pe,
+    g_logits, g_lse = mla_gluon(
+        q4[..., :v_head_dim],
+        q4[..., v_head_dim:],
         kv,
-        kv,
+        o4,
         kv_indices,
         kv_indptr,
-        g_logits,
-        _dummy_f32(dev),
         sm_scale,
-        kv_scale_float,
-        q_nope.stride(0),
-        q_nope.stride(1),
-        q_nope.stride(2),
-        q_pe.stride(0),
-        q_pe.stride(1),
-        q_pe.stride(2),
-        kv.stride(0),
-        kv.stride(0),
-        0,
-        g_sl[0],
-        g_sl[1],
-        g_sl[2],
-        g_sl[3],
-        g_lse,
-        g_ml[0],
-        g_ml[1],
-        g_ml[2],
-        g_ml[3],
-        None,
-        0,
-        0,
-        0,
-        BLOCK_H=_GLUON_BLOCK_H,
-        BLOCK_N=_GLUON_BLOCK_N,
-        NUM_KV_SPLITS=g_ns,
-        PAGE_SIZE=1,
-        HEAD_DIM_CKV=v_head_dim,
-        HEAD_DIM_KPE=D - v_head_dim,
-        KV_PE_OFFSET=v_head_dim,
-        USE_2D_VIEW=False,
-        WITHIN_2GB=g_within_2gb,
-        NUM_XCDS=1,
-        NHEAD=num_heads,
-        REGIME="bh16bn128",
-        RETURN_LSE=False,
-        QLEN=qlen,
-        HAS_PE=True,
-        HAS_ATTN_SINK=False,
-        Sel_buf=sel,
-        sel_bs=bs,
+        kv_pe_offset=v_head_dim,
+        use_2d_view=False,
+        kv_scale=kv_scale_float,
+        sel_buf=sel,
         sel_thresh=thresh,
-        SEL_P2=sel_p2,
-        REGIME_SEL=True,
+        skip_reduce=True,
     )
+    if g_lse is None:  # one split: Gluon stored the final output directly
+        g_logits = o4.view(bs, qlen, num_heads, 1, v_head_dim)
+        g_ml = (0, 0, 0, 0)
+    else:
+        g_ml = g_lse.stride()
+    g_ns = g_logits.shape[3]
+    g_sl = g_logits.stride()[:4]
     # ---------------- 2. HK / v2 / v3 stage 1 on sel (all-empty in the Gluon regime)
     from sglang.kernels.ops.attention.k3_mla_verify_hk import (
         PART8_MIN_SPLITS,
@@ -377,8 +318,3 @@ def k3_mla_verify_auto(
         num_warps=4 if nsplit >= 64 else 2,
     )
     return out
-
-
-@functools.lru_cache(maxsize=8)
-def _dummy_f32(device):
-    return torch.empty(1, dtype=torch.float32, device=device)
