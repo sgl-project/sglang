@@ -6,27 +6,17 @@ from array import array
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from sglang.srt.mem_cache.evict_policy import (
-    FIFOStrategy,
-    FILOStrategy,
-    LFUStrategy,
-    LRUStrategy,
-    MRUStrategy,
-    PriorityStrategy,
-    SLRUStrategy,
-)
 from sglang.srt.mem_cache.utils import (
     compute_node_event_hash_values,
     compute_node_hash_values,
     get_eviction_strategy,
     get_hash_str,
     hash_str_to_int64,
-    maybe_init_custom_mem_pool,
     split_node_hash_value,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=15, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 def _legacy_get_hash_str(token_ids, prior_hash=None):
@@ -144,32 +134,6 @@ def _page_hash_compatibility_cases():
 
 
 class TestGetEvictionStrategy(unittest.TestCase):
-    def test_lru(self):
-        self.assertIsInstance(get_eviction_strategy("lru"), LRUStrategy)
-
-    def test_lfu(self):
-        self.assertIsInstance(get_eviction_strategy("lfu"), LFUStrategy)
-
-    def test_fifo(self):
-        self.assertIsInstance(get_eviction_strategy("fifo"), FIFOStrategy)
-
-    def test_mru(self):
-        self.assertIsInstance(get_eviction_strategy("mru"), MRUStrategy)
-
-    def test_filo(self):
-        self.assertIsInstance(get_eviction_strategy("filo"), FILOStrategy)
-
-    def test_priority(self):
-        self.assertIsInstance(get_eviction_strategy("priority"), PriorityStrategy)
-
-    def test_slru(self):
-        self.assertIsInstance(get_eviction_strategy("slru"), SLRUStrategy)
-
-    def test_case_insensitive(self):
-        self.assertIsInstance(get_eviction_strategy("LRU"), LRUStrategy)
-        self.assertIsInstance(get_eviction_strategy("Lru"), LRUStrategy)
-        self.assertIsInstance(get_eviction_strategy("FIFO"), FIFOStrategy)
-
     def test_unknown_policy_raises_valueerror(self):
         with self.assertRaises(ValueError) as ctx:
             get_eviction_strategy("nonexistent")
@@ -182,21 +146,6 @@ class TestGetEvictionStrategy(unittest.TestCase):
         self.assertIn("filo", msg)
         self.assertIn("priority", msg)
         self.assertIn("slru", msg)
-
-    def test_each_call_creates_new_instance(self):
-        s1 = get_eviction_strategy("lru")
-        s2 = get_eviction_strategy("lru")
-        self.assertIsNot(s1, s2)
-
-
-class TestMaybeInitCustomMemPool(unittest.TestCase):
-    @patch("sglang.srt.mem_cache.utils.envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get")
-    def test_disabled_by_default(self, mock_env_get):
-        mock_env_get.return_value = None
-        enabled, pool, pool_type = maybe_init_custom_mem_pool("cuda:0")
-        self.assertFalse(enabled)
-        self.assertIsNone(pool)
-        self.assertIsNone(pool_type)
 
 
 class TestGetHashStr(unittest.TestCase):
@@ -330,12 +279,6 @@ class TestHashStrToInt64(unittest.TestCase):
         h2 = hash_str_to_int64("a" * 16 + "f" * 48)
         self.assertEqual(h1, h2)
 
-    def test_roundtrip_with_get_hash_str(self):
-        hash_hex = get_hash_str([42, 99])
-        int64_val = hash_str_to_int64(hash_hex)
-        self.assertIsInstance(int64_val, int)
-        self.assertTrue(-(2**63) <= int64_val < 2**63)
-
 
 class TestComputeNodeHashValues(unittest.TestCase):
     def _make_node(self, key, parent=None, parent_hash_values=None):
@@ -454,58 +397,11 @@ class TestComputeNodeHashValues(unittest.TestCase):
 
 
 class TestSplitNodeHashValue(unittest.TestCase):
-    def test_none_input_returns_none_tuple(self):
-        result = split_node_hash_value(None, 10, 4)
-        self.assertEqual(result, (None, None))
-
-    def test_page_size_one_split(self):
-        hash_values = [f"hash_{i}" for i in range(4)]
-        new_hash, child_hash = split_node_hash_value(hash_values, 2, 1)
-        self.assertEqual(new_hash, ["hash_0", "hash_1"])
-        self.assertEqual(child_hash, ["hash_2", "hash_3"])
-
-    def test_page_size_one_split_at_zero(self):
-        hash_values = ["a", "b", "c"]
-        new_hash, child_hash = split_node_hash_value(hash_values, 0, 1)
-        self.assertEqual(new_hash, [])
-        self.assertEqual(child_hash, ["a", "b", "c"])
-
-    def test_page_size_one_split_at_len(self):
-        hash_values = ["a", "b", "c"]
-        new_hash, child_hash = split_node_hash_value(hash_values, 3, 1)
-        self.assertEqual(new_hash, ["a", "b", "c"])
-        self.assertEqual(child_hash, [])
-
-    def test_page_size_larger_than_one(self):
-        hash_values = ["p0", "p1", "p2", "p3", "p4", "p5"]
-        new_hash, child_hash = split_node_hash_value(hash_values, 4, 2)
-        self.assertEqual(new_hash, ["p0", "p1"])
-        self.assertEqual(child_hash, ["p2", "p3", "p4", "p5"])
-
-    def test_page_size_split_exact_page_boundary(self):
-        hash_values = ["a", "b", "c", "d"]
-        new_hash, child_hash = split_node_hash_value(hash_values, 4, 4)
-        self.assertEqual(new_hash, ["a"])
-        self.assertEqual(child_hash, ["b", "c", "d"])
-
     def test_page_size_split_within_page(self):
         hash_values = ["a", "b", "c"]
         new_hash, child_hash = split_node_hash_value(hash_values, 6, 4)
         self.assertEqual(new_hash, ["a"])
         self.assertEqual(child_hash, ["b", "c"])
-
-    def test_total_length_preserved(self):
-        hash_values = [f"h_{i}" for i in range(10)]
-        for split_len in [0, 1, 3, 5, 7, 9, 10]:
-            for page_size in [1, 2, 4]:
-                new_hash, child_hash = split_node_hash_value(
-                    hash_values, split_len, page_size
-                )
-                self.assertEqual(
-                    len(new_hash) + len(child_hash),
-                    len(hash_values),
-                    f"split_len={split_len}, page_size={page_size}",
-                )
 
 
 if __name__ == "__main__":

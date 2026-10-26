@@ -47,6 +47,7 @@ _TRITON_KERNELS = [
     ("pad", "unpad_draft_extend_output"),
     ("pad", "seqlens_expand_triton"),
     ("position", "compute_position_triton"),
+    ("table_qk_norm_rope", "table_qk_norm_rope_"),
     ("dsv4.attn_metadata_kernels", "expand_prefill_causally"),
     ("dsv4.attn_metadata_kernels", "build_page_table_positions"),
     ("dsv4.attn_metadata_kernels", "build_causal_swa_page_indices"),
@@ -391,6 +392,13 @@ register_kernel(
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.attention.gemma_qkv_norm_rope:gemma_qkv_norm_rope",
         capabilities=CUDA_ONLY,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="attention.update_msa_v1_decode_plan",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.attention.msa_v1.decode_plan:update_msa_v1_decode_plan",
     )
 )
 

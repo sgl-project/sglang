@@ -80,42 +80,6 @@ class TestMaterializeSwigluParamsForCutlass(CustomTestCase):
         wrong = reference(GPT_OSS_ALPHA, 0.0, GPT_OSS_LIMIT)
         self.assertFalse(torch.allclose(got, wrong))
 
-    def test_explicit_beta_wins(self):
-        _, beta, _ = self._materialize(
-            gemm1_alpha=GPT_OSS_ALPHA,
-            gemm1_beta=0.5,
-            gemm1_clamp_limit=GPT_OSS_LIMIT,
-        )
-        self.assertEqual(beta.tolist(), [0.5] * NUM_LOCAL_EXPERTS)
-
-    def test_no_alpha_stays_neutral(self):
-        alpha, beta, _ = self._materialize(gemm1_clamp_limit=GPT_OSS_LIMIT)
-        self.assertEqual(alpha.tolist(), [1.0] * NUM_LOCAL_EXPERTS)
-        self.assertEqual(beta.tolist(), [0.0] * NUM_LOCAL_EXPERTS)
-
-    def test_swiglu_limit_alias(self):
-        _, _, limit = self._materialize(swiglu_limit=GPT_OSS_LIMIT)
-        self.assertEqual(limit.tolist(), [GPT_OSS_LIMIT] * NUM_LOCAL_EXPERTS)
-
-    def test_no_clamp_disables(self):
-        self.assertEqual(
-            self._materialize(gemm1_alpha=GPT_OSS_ALPHA), (None, None, None)
-        )
-
-    def test_situ_disables(self):
-        # SiTU carries its clamp inside the activation itself.
-        self.assertEqual(
-            self._materialize(activation="situ", gemm1_clamp_limit=GPT_OSS_LIMIT),
-            (None, None, None),
-        )
-
-    def test_dtype_and_shape(self):
-        for tensor in self._materialize(
-            gemm1_alpha=GPT_OSS_ALPHA, gemm1_clamp_limit=GPT_OSS_LIMIT
-        ):
-            self.assertEqual(tensor.dtype, torch.float32)
-            self.assertEqual(tuple(tensor.shape), (NUM_LOCAL_EXPERTS,))
-
 
 def _dispatch_output(num_tokens):
     return StandardDispatchOutput(

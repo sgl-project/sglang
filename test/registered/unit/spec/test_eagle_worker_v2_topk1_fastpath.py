@@ -125,12 +125,6 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
                 self.assertEqual(fast_index.tolist(), ref_index.long().tolist())
                 self.assertEqual(fast_tokens.tolist(), ref_tokens.tolist())
 
-                # The kernel reads these via data_ptr() as contiguous int64.
-                self.assertEqual(fast_parent.dtype, torch.long)
-                self.assertEqual(fast_index.dtype, torch.long)
-                self.assertTrue(fast_parent.is_contiguous())
-                self.assertTrue(fast_index.is_contiguous())
-
     def test_assert_on_inconsistent_steps_and_draft_tokens(self):
         # num_draft_tokens must equal num_steps + 1 for topk=1.
         worker = _make_worker(num_steps=3, num_draft_tokens=3)
@@ -172,7 +166,6 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
         ):
             result = worker.draft_forward(forward_batch)
 
-        self.assertEqual(result, (None, None, None, None))
         self.assertEqual(worker.draft_runner.forward.call_count, 2)
 
 

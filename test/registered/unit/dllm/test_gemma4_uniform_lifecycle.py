@@ -387,6 +387,7 @@ class TestGemma4RequestValidation(unittest.TestCase):
         scheduler.output_streamer = Mock()
         sender = Mock()
         scheduler.ipc_channels = SimpleNamespace(send_to_tokenizer=sender)
+        scheduler.rust_server = None
         recv_req = MagicMock(
             session_params=None,
             session_id=None,

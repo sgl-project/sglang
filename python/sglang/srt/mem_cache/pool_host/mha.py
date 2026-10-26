@@ -254,7 +254,7 @@ class MHATokenToKVPoolHost(HostKVCache):
             # transfer kernels address the fused buffer directly instead.
             self.k_data_refs = []
             self.v_data_refs = []
-        elif self.layout == "page_first":
+        elif self.layout in ("page_first", "page_first_direct"):
             # Transpose [page, layer, ...] -> [layer, page, ...] to get per-layer views
             # This swaps strides without copying data
             k_transposed = self.k_buffer.transpose(0, 1)

@@ -12,6 +12,7 @@ from sglang.srt.models.dspark import (
 )
 from sglang.srt.speculative.dspark_components import dspark_draft_sampler as ds
 from sglang.srt.speculative.dspark_components.dspark_draft import (
+    DraftBlockProposer,
     DraftNoise,
     sample_draft_block,
 )
@@ -197,6 +198,45 @@ class TestMegakernelDraftSampler(CustomTestCase):
             sampler(torch.ones(BS * GAMMA, HIDDEN), input_ids)
         stock.assert_called_once()
         self.assertTrue(sampler.out[: BS * GAMMA].eq(7).all())
+
+
+class TestDraftParamsRestage(CustomTestCase):
+    def test_the_draft_params_are_restaged_only_when_their_inputs_change(self):
+        """The draft graph's sampling params are copied from the batch's temperature /
+        top-k tensors; a step whose sampler, bs and tensors are the ones last staged
+        skips the copy, and any change (a rebound tensor after filter / merge, a new
+        bs, another sampler) restages."""
+
+        proposer = SimpleNamespace(
+            _staged_params_key=None,
+            num_staged_params_skips=0,
+            num_staged_params_calls=0,
+        )
+        staged = []
+        sampler = SimpleNamespace(
+            stage_sampling_params=lambda **kw: staged.append(
+                (kw["bs"], kw["sampling_info"])
+            )
+        )
+        info = SimpleNamespace(temperatures=torch.ones(4), top_ks=torch.ones(4))
+
+        def stage(sampler, bs, sampling_info):
+            DraftBlockProposer._stage_sampling_params(
+                proposer, sampler, bs=bs, sampling_info=sampling_info
+            )
+
+        stage(sampler, 4, info)
+        stage(sampler, 4, info)  # unchanged: skipped
+        info.temperatures = info.temperatures[:3]  # rebound, as filter_batch does
+        stage(sampler, 3, info)
+        stage(sampler, 2, info)  # another bs
+        other = SimpleNamespace(stage_sampling_params=sampler.stage_sampling_params)
+        stage(other, 2, info)  # another sampler
+        stage(other, 2, None)
+        stage(other, 2, None)  # no sampling info twice: skipped
+        self.assertEqual([bs for bs, _ in staged], [4, 3, 2, 2, 2])
+        self.assertEqual(proposer.num_staged_params_skips, 2)
+        self.assertEqual(proposer.num_staged_params_calls, 7)
 
 
 if __name__ == "__main__":

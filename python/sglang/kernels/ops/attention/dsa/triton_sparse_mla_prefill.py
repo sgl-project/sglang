@@ -7,7 +7,7 @@ rather than into the grid, the online softmax stays in registers, and ``V`` is
 read as ``kv[:, :d_v]``, so there are no partials and no merge pass.
 ``dsa/triton_sparse_mla.py`` is the gfx950-only FP8 sibling of this bf16 module.
 
-Interface matches ``sgl_kernel.flash_mla.flash_mla_sparse_fwd``::
+Interface matches ``sglang.kernels.ops.attention.flash_mla_interface.flash_mla_sparse_fwd``::
 
     q       [T, H, 576] bf16    (absorbed MLA: 512 nope + 64 rope)
     kv      [S, 576]    bf16    (V is kv[:, :512])
