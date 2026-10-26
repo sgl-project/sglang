@@ -142,7 +142,7 @@ def handle_multimodal(server_args: Any):
                 f"mm_process_config must be a dict, "
                 f"but got {type(cfg.mm_process_config)}"
             )
-        for key in ("image", "video", "audio"):
+        for key in ("image", "video", "audio", "processor_class_attributes"):
             if key in cfg.mm_process_config and not isinstance(
                 cfg.mm_process_config[key], dict
             ):

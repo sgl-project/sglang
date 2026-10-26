@@ -18,6 +18,7 @@ TokenSpaceProcessor.process(media, IDs)
   processor_output / precomputed_embedding source -> ValueError
   bare source instead of a list -> TypeError
   strategy loading options -> loader class attributes and load kwargs
+  mm_process_config processor_class_attributes -> overrides them; unknown names -> ValueError
   CUDA initialized on rank device d -> IO threads set device d; serving keeps cuda:0
 
 get_mm_processor -> TokenSpaceSGLangProcessor
@@ -327,6 +328,40 @@ class TestTokenSpaceProcessor(unittest.TestCase):
         load.assert_awaited_once_with(
             ["image"], None, None, audio_sample_rate=24000, discard_alpha_channel=False
         )
+
+    def test_mm_process_config_overrides_loader_class_attributes(self):
+        """A deployment moves video decoding to CPU without touching the strategy."""
+
+        def build(mm_process_config):
+            processor = TokenSpaceProcessor.for_strategy(_ImageWidthStrategy)(
+                None,
+                _bare_tokenizer(),
+                processor_config=MultimodalProcessorConfig(
+                    mm_processor_worker_num=1, mm_process_config=mm_process_config
+                ),
+            )
+            self.addCleanup(processor.shutdown)
+            return processor
+
+        default = build({})
+        cpu = build(
+            {"processor_class_attributes": {"video_preprocessing_device": "cpu"}}
+        )
+        self.assertIsNone(type(default).video_preprocessing_device)
+        self.assertIsInstance(cpu, type(default))
+        # The loader reads the class, so the override must reach it there.
+        for processor, use_gpu in ((default, True), (cpu, False)):
+            with patch(
+                "sglang.srt.multimodal.multimodal_processor_mixin.load_video"
+            ) as load_video:
+                type(processor)._load_single_item("clip.mp4", Modality.VIDEO)
+            load_video.assert_called_once_with("clip.mp4", use_gpu=use_gpu)
+        for name in ("not_an_attribute", "process", "_io_thread_initializer"):
+            with (
+                self.subTest(name=name),
+                self.assertRaisesRegex(ValueError, "not a class attribute"),
+            ):
+                build({"processor_class_attributes": {name: "cpu"}})
 
 
 # Class attributes the media loader and worker pools read.

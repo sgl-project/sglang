@@ -42,6 +42,19 @@ class TokenSpaceProcessor(MultimodalProcessorMixin):
             },
         )
 
+    def __new__(cls, hf_config, processor, *, processor_config=None, **kwargs):
+        # mm_process_config["processor_class_attributes"] overrides the loader's class
+        # attributes (e.g. video_preprocessing_device) over the strategy's own.
+        overrides = _processor_class_attribute_overrides(cls, processor_config)
+        if overrides:
+            cls = cls._with_class_attributes(tuple(sorted(overrides.items())))
+        return super().__new__(cls)
+
+    @classmethod
+    @functools.cache
+    def _with_class_attributes(cls, attributes):
+        return type(cls.__name__, (cls,), dict(attributes))
+
     def __init__(
         self,
         hf_config,
@@ -269,3 +282,26 @@ class TokenSpaceProcessor(MultimodalProcessorMixin):
                 output["mrope_positions"] = mrope_positions
                 output["mrope_position_delta"] = mrope_position_delta
         return output if package_output is None else package_output(output)
+
+
+PROCESSOR_CLASS_ATTRIBUTES_KEY = "processor_class_attributes"
+
+
+def _processor_class_attribute_overrides(processor_class, processor_config) -> dict:
+    """mm_process_config["processor_class_attributes"], checked against the class."""
+    if processor_config is None:
+        return {}
+    overrides = processor_config.mm_process_config.get(
+        PROCESSOR_CLASS_ATTRIBUTES_KEY, {}
+    )
+    for name in overrides:
+        if (
+            name.startswith("_")
+            or not hasattr(processor_class, name)
+            or callable(getattr(processor_class, name))
+        ):
+            raise ValueError(
+                f"mm_process_config['{PROCESSOR_CLASS_ATTRIBUTES_KEY}']: {name!r} is "
+                f"not a class attribute of {processor_class.__name__}"
+            )
+    return overrides
