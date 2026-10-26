@@ -252,7 +252,7 @@ class TestReadRailTranslatesAtProduction(CustomTestCase):
         recorded = {}
 
         class _RecordingLeafPool:
-            def get_mla_kv_buffer(self, layer, loc, dst_dtype):
+            def get_mla_kv_buffer(self, layer, loc, dst_dtype, layer_id_override):
                 recorded["loc"] = loc
                 return None, None
 
