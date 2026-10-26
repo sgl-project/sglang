@@ -113,13 +113,12 @@ def resolve_hicache_dcp_compatibility(server_args: Any):
     cfg = resolving_view(server_args)
     if cfg.dcp_size <= 1 or not cfg.enable_hierarchical_cache:
         return
-    if cfg.hicache_storage_backend is not None:
+    if (
+        cfg.hicache_storage_backend is not None
+        and cfg.hicache_host_memory_mode == "buffer_only"
+    ):
         raise NotImplementedError(
-            "--hicache-storage-backend (L3) with --dcp-size > 1 is not "
-            "supported yet: under DCP each rank holds a distinct "
-            "interleaved MLA KV shard, so the rank-0-only replicated-MLA "
-            "backup and the storage keys must become dcp_rank-aware "
-            "first. Run HiCache+DCP with L1/L2 only."
+            "HiCache L3 with DCP does not support buffer_only host memory."
         )
     if cfg.speculative_algorithm not in (None, "DSPARK"):
         raise NotImplementedError(
@@ -144,7 +143,7 @@ def resolve_hicache_dcp_compatibility(server_args: Any):
             "MHA host pool has none."
         )
     logger.info(
-        "HiCache + DCP enabled (L1/L2 only): host pool uses widened "
+        "HiCache + DCP enabled: host pool uses widened "
         "logical slot accounting with per-rank physical translation at "
         "the transfer boundary (dcp_size=%d).",
         cfg.dcp_size,
@@ -179,6 +178,10 @@ def resolve_layout_io_compatibility(server_args: Any):
 
 def resolve_storage_layout_compatibility(server_args: Any):
     cfg = resolving_view(server_args)
+    if cfg.hicache_storage_backend == "mooncake" and cfg.dcp_size > 1:
+        # DCP MLA pages support Mooncake multi-buffer transfers. Keep startup
+        # and runtime attachment on the same requested host layout.
+        return
     if (
         cfg.hicache_storage_backend not in ("mooncake", "npu_memcache")
         or cfg.hicache_mem_layout != "layer_first"
