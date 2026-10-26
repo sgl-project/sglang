@@ -19,27 +19,27 @@ The optimal configurations on this page are validated with the image `quay.io/as
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | TTFT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| MiMo-V2-Flash | Ascend A3 Series Products | 12 | PD Disaggregation | 16k+1k | 20ms | - | W8A8 INT8 | [Optimal Configuration](#mimo-v2-flash-1p1d-12p-in16k-out1k-tpot-20ms) |
-| MiMo-V2-Flash | Ascend A3 Series Products | 12 | PD Disaggregation | 32k+1k | 20ms | - | W8A8 INT8 | [Optimal Configuration](#mimo-v2-flash-1p1d-12p-in32k-out1k-tpot-20ms) |
+| MiMo-V2-Flash | Ascend A3 Series Products | 16 | PD Disaggregation | 16k+1k | 20ms | - | W8A8 INT8 | [Optimal Configuration](#mimo-v2-flash-1p1d-16p-in16k-out1k-tpot-20ms) |
+| MiMo-V2-Flash | Ascend A3 Series Products | 16 | PD Disaggregation | 32k+1k | 20ms | - | W8A8 INT8 | [Optimal Configuration](#mimo-v2-flash-1p1d-16p-in32k-out1k-tpot-20ms) |
 
 ### High Throughput
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | TTFT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| MiMo-V2-Flash | Ascend A3 Series Products | 12 | PD Disaggregation | 16k+1 | - | 5s | W8A8 INT8 | [Optimal Configuration](#mimo-v2-flash-1p1d-12p-in16k-out1-ttft-5s) |
-| MiMo-V2-Flash | Ascend A3 Series Products | 12 | PD Disaggregation | 32k+1 | - | 5s | W8A8 INT8 | [Optimal Configuration](#mimo-v2-flash-1p1d-12p-in32k-out1-ttft-5s) |
+| MiMo-V2-Flash | Ascend A3 Series Products | 16 | PD Disaggregation | 16k+1 | - | 5s | W8A8 INT8 | [Optimal Configuration](#mimo-v2-flash-1p1d-16p-in16k-out1-ttft-5s) |
+| MiMo-V2-Flash | Ascend A3 Series Products | 16 | PD Disaggregation | 32k+1 | - | 5s | W8A8 INT8 | [Optimal Configuration](#mimo-v2-flash-1p1d-16p-in32k-out1-ttft-5s) |
 
 ## Optimal Configuration
 
 <a id="pd-disaggregation" title="Referenced by external docs. Verify before removing."></a>
 
-### MiMo-V2-Flash 1P1D 12P IN16K OUT1 TTFT 5s
+### MiMo-V2-Flash 1P1D 16P IN16K OUT1 TTFT 5s
 
 **Model**: MiMo-V2-Flash
 
 **Hardware**: Ascend A3 Series Products
 
-**Cards**: 12
+**Cards**: 16
 
 **Deploy Mode**: PD Disaggregation
 
@@ -216,13 +216,13 @@ python -m sglang.bench_serving \
     --seed 1
 ```
 
-### MiMo-V2-Flash 1P1D 12P IN16K OUT1K TPOT 20ms
+### MiMo-V2-Flash 1P1D 16P IN16K OUT1K TPOT 20ms
 
 **Model**: MiMo-V2-Flash
 
 **Hardware**: Ascend A3 Series Products
 
-**Cards**: 12
+**Cards**: 16
 
 **Deploy Mode**: PD Disaggregation
 
@@ -399,13 +399,13 @@ python -m sglang.bench_serving \
     --seed 1
 ```
 
-### MiMo-V2-Flash 1P1D 12P IN32K OUT1 TTFT 5s
+### MiMo-V2-Flash 1P1D 16P IN32K OUT1 TTFT 5s
 
 **Model**: MiMo-V2-Flash
 
 **Hardware**: Ascend A3 Series Products
 
-**Cards**: 12
+**Cards**: 16
 
 **Deploy Mode**: PD Disaggregation
 
@@ -582,13 +582,13 @@ python -m sglang.bench_serving \
     --seed 1
 ```
 
-### MiMo-V2-Flash 1P1D 12P IN32K OUT1K TPOT 20ms
+### MiMo-V2-Flash 1P1D 16P IN32K OUT1K TPOT 20ms
 
 **Model**: MiMo-V2-Flash
 
 **Hardware**: Ascend A3 Series Products
 
-**Cards**: 12
+**Cards**: 16
 
 **Deploy Mode**: PD Disaggregation
 
