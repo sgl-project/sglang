@@ -532,11 +532,20 @@ class HybridCacheController(BaseHiCacheController):
         host_indices = self.mem_pool_host.alloc(len(device_indices), reclaim=reclaim)
         if host_indices is None:
             return None
-        pool_transfers = self.mem_pool_host.resolve_host_transfers(
-            extra_pools,
-            primary_device_indices=device_indices,
-            primary_host_indices=host_indices,
-        )
+        try:
+            pool_transfers = self.mem_pool_host.resolve_host_transfers(
+                extra_pools,
+                primary_device_indices=device_indices,
+                primary_host_indices=host_indices,
+            )
+        except BaseException as error:
+            # No operation or DMA owns these slots until all pools resolve.
+            # The side-pool resolver rolls back its own allocations.
+            try:
+                self.mem_pool_host.free(host_indices)
+            except BaseException as cleanup_error:
+                raise error from cleanup_error
+            raise
         if pool_transfers is None and extra_pools:
             self.mem_pool_host.free(host_indices)
             return None

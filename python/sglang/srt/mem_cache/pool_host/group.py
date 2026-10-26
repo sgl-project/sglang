@@ -209,54 +209,72 @@ class HostPoolGroup:
         derived_transfers: list[PoolTransfer] = []
 
         def rollback() -> None:
-            for transfer, indices in allocated:
-                self.free(indices, pool=transfer.name)
+            error = None
+            while allocated:
+                transfer, indices = allocated.pop()
                 transfer.host_indices = None
+                try:
+                    self.free(indices, pool=transfer.name)
+                except BaseException as cleanup_error:
+                    # Drain the remaining allocations without retrying this one.
+                    if error is None:
+                        error = cleanup_error
+            if error is not None:
+                raise error
 
-        # Reclaiming one pool can evict another's slots. Keep allocation order
-        # identical across TP ranks even when transfers come from a Rust HashMap.
-        for transfer in sorted(transfers, key=lambda transfer: transfer.name):
-            if transfer.indices_from_pool is not None:
-                derived_transfers.append(transfer)
-                continue
-            if transfer.host_indices is not None or transfer.device_indices is None:
-                continue
-            entry = self.entry_map.get(transfer.name)
-            if entry is None:
-                continue
-            indices = self.alloc(
-                len(transfer.device_indices),
-                pool=transfer.name,
-                reclaim=entry.host_evict_fn,
-            )
-            if indices is None:
-                rollback()
-                return None
-            transfer.host_indices = indices
-            allocated.append((transfer, indices))
+        try:
+            # Reclaiming one pool can evict another's slots. Keep allocation order
+            # identical across TP ranks even when transfers come from a Rust HashMap.
+            for transfer in sorted(transfers, key=lambda transfer: transfer.name):
+                if transfer.indices_from_pool is not None:
+                    derived_transfers.append(transfer)
+                    continue
+                if transfer.host_indices is not None or transfer.device_indices is None:
+                    continue
+                entry = self.entry_map.get(transfer.name)
+                if entry is None:
+                    continue
+                indices = self.alloc(
+                    len(transfer.device_indices),
+                    pool=transfer.name,
+                    reclaim=entry.host_evict_fn,
+                )
+                if indices is None:
+                    rollback()
+                    return None
+                transfer.host_indices = indices
+                allocated.append((transfer, indices))
 
-        for transfer in derived_transfers:
-            if transfer.indices_from_pool == self.anchor_entry.name:
-                transfer.host_indices = primary_host_indices
+            for transfer in derived_transfers:
+                if transfer.indices_from_pool == self.anchor_entry.name:
+                    transfer.host_indices = primary_host_indices
+                    if transfer.device_indices is None:
+                        transfer.device_indices = primary_device_indices
+                    continue
+
+                source = next(
+                    (
+                        candidate
+                        for candidate in transfers
+                        if candidate.indices_from_pool is None
+                        and candidate.name == transfer.indices_from_pool
+                    ),
+                    None,
+                )
+                if source is None:
+                    rollback()
+                    return None
+                transfer.host_indices = source.host_indices
                 if transfer.device_indices is None:
-                    transfer.device_indices = primary_device_indices
-                continue
-
-            source = next(
-                (
-                    candidate
-                    for candidate in transfers
-                    if candidate.indices_from_pool is None
-                    and candidate.name == transfer.indices_from_pool
-                ),
-                None,
-            )
-            if source is None:
+                    transfer.device_indices = source.device_indices
+        except BaseException as error:
+            # Allocation/reclaim callbacks may raise instead of returning None.
+            # Nothing has been submitted to DMA at this transaction boundary.
+            try:
                 rollback()
-                return None
-            transfer.host_indices = source.host_indices
-            if transfer.device_indices is None:
-                transfer.device_indices = source.device_indices
+            except BaseException as cleanup_error:
+                raise error from cleanup_error
+            raise
         return transfers
 
     def release_transfers(self, transfers: list[PoolTransfer] | None) -> int:
