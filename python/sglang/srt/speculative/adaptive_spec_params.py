@@ -17,6 +17,7 @@ from sglang.srt.arg_groups.overrides import (
     resolving_view,
 )
 from sglang.srt.runtime_context import attn_dp_enabled_of
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import log_info_on_rank0
 
 if TYPE_CHECKING:
@@ -61,6 +62,15 @@ def adaptive_unsupported_reason(server_args: ServerArgs) -> str | None:
         return (
             f"speculative_algorithm={cfg.speculative_algorithm} "
             "(only EAGLE/EAGLE3 are supported)"
+        )
+    platform_worker_cls = SpeculativeAlgorithm.from_string(
+        cfg.speculative_algorithm
+    ).get_platform_worker_cls()
+    if platform_worker_cls is not None:
+        return (
+            f"the platform serves {cfg.speculative_algorithm} with "
+            f"{platform_worker_cls.__name__} (only the built-in worker "
+            "implements adaptive)"
         )
     if cfg.speculative_eagle_topk is not None and cfg.speculative_eagle_topk != 1:
         return (

@@ -10,13 +10,8 @@ import sys
 
 from transformers.utils.hub import cached_file
 
-from sglang.srt.entrypoints.openai import encoding_dsv4
-from sglang.srt.entrypoints.openai.chat_encoding import (
-    resolve_dsv4_reasoning_effort_profile,
-)
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 from sglang.srt.entrypoints.openai.serving_chat import (
-    ThinkingMode,
     normalize_assistant_tool_call_arguments,
     normalize_tool_content,
 )
@@ -35,7 +30,6 @@ MODELS = {
     "gpt-oss-20b": "openai/gpt-oss-20b",
     "glm-5.2": "zai-org/GLM-5.2-FP8",
     "minimax-m3": "MiniMaxAI/MiniMax-M3",
-    "deepseek-v4-flash": "deepseek-ai/DeepSeek-V4-Flash",
 }
 
 LONG = "Résumé of the plan: " + "第一步，收集数据。Then we iterate. " * 8
@@ -93,23 +87,6 @@ def engine_messages(request, content_format):
 
 def engine_prompt_ids(model_id, tok, request):
     """Mirror `_apply_jinja_template` for a text-only request without tools."""
-    snapshot = snapshot_dir(model_id)
-    model_type = json.load(open(snapshot / "config.json")).get("model_type")
-    if model_type == "deepseek_v4":
-        messages = engine_messages(request, "string")
-        if messages[0]["role"] != "system":
-            messages.insert(0, {"role": "system", "content": ""})
-        thinking = (request.chat_template_kwargs or {}).get("thinking", False)
-        text = encoding_dsv4.encode_messages(
-            messages,
-            thinking_mode=ThinkingMode.THINKING if thinking else ThinkingMode.CHAT,
-            reasoning_effort=None,
-            reasoning_effort_profile=resolve_dsv4_reasoning_effort_profile(
-                model_path=str(snapshot)
-            ),
-        )
-        return tok.encode(text)
-
     template = tok.chat_template
     if not isinstance(template, str):
         raise RuntimeError(f"{model_id}: named template dict is not supported here")
