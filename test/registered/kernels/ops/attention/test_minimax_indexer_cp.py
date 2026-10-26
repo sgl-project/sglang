@@ -162,3 +162,9 @@ def test_chain_verify_rows_match_paged_native_selector(world):
         assert torch.equal(sharded, native), (
             f"rank {rank}: {(sharded != native).any(-1).sum()} rows differ"
         )
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v", "-s"]))
