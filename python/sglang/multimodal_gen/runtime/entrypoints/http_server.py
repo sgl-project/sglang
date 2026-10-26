@@ -28,6 +28,9 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.realtime import (
     realtime_video_api,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import build_sampling_params
+from sglang.multimodal_gen.runtime.entrypoints.openai.video_progress import (
+    run_progress_listener,
+)
 from sglang.multimodal_gen.runtime.entrypoints.post_training import (
     rollout_api,
     weights_api,
@@ -144,6 +147,12 @@ async def lifespan(app: FastAPI):
     broker_task = asyncio.create_task(run_zeromq_broker(server_args))
     app.state.broker_task = broker_task
     backend_monitor = asyncio.create_task(_monitor_backend(app))
+    # 3. Receive per-step progress of video jobs from the replica drivers
+    progress_task = None
+    if server_args.progress_endpoint is not None:
+        progress_task = asyncio.create_task(
+            run_progress_listener(server_args.progress_endpoint)
+        )
     warmup_task = None
     if server_args.warmup_mode == "server":
         warmup_task = asyncio.create_task(
@@ -180,6 +189,10 @@ async def lifespan(app: FastAPI):
             pass
         except Exception:
             logger.exception("Offline request broker failed")
+        if progress_task is not None:
+            progress_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await progress_task
         async_scheduler_client.close()
 
 
