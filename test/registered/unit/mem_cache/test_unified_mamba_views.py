@@ -48,11 +48,9 @@ def _make_pool(
 ):
     """Minimal 2-sub-pool ``UnifiedKVPool`` sized to hold >= ``want_slots``
     Mamba slots; returns ``(pool, mamba_spec)``."""
-    from sglang.srt.mem_cache.unified_memory_pool import (
-        MambaSubPoolSpec,
-        MHASubPoolSpec,
-        UnifiedKVPool,
-    )
+    from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
+    from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
+    from sglang.srt.mem_cache.unified_memory_pool import UnifiedKVPool
 
     mamba_spec = MambaSubPoolSpec(
         name="mamba",

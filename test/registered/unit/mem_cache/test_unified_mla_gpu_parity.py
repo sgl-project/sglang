@@ -54,10 +54,10 @@ def _marked(loc: torch.Tensor):
 
 
 def _make_pools(ps: int, n_tokens: int = 4096):
+    from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec
+    from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
     from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
     from sglang.srt.mem_cache.unified_memory_pool import (
-        MambaSubPoolSpec,
-        MLASubPoolSpec,
         UnifiedKVPool,
         UnifiedMLATokenToKVPool,
     )
