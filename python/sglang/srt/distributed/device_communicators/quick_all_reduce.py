@@ -428,9 +428,9 @@ def create_quick_allreduce(
     """Create the configured QuickReduce communicator.
 
     AITER is opt-in through ``SGLANG_USE_AITER``. INT8 and FP8 requests run
-    on the bundled INT8 codec. On gfx95, an available FlyDSL INT4 backend
-    keeps the bundled communicator because it owns that dispatch; other INT4
-    requests use AITER QuickAllReduce.
+    on the bundled INT8 codec. INT4 stays on the bundled communicator too:
+    FlyDSL or the HIP kernel is chosen later, per payload. Other codecs use
+    AITER QuickAllReduce.
     Constructor failures intentionally propagate: distributed initialization
     may already have exchanged resources, so silently creating a second
     communicator is unsafe.
@@ -448,8 +448,8 @@ def create_quick_allreduce(
             )
             _configure_bundled_int8_env()
             return _QuickAllReduceAdapter(QuickAllReduce(group=group, device=device))
-        if codec == "INT4" and _flydsl_int4_available():
-            logger.info("Using bundled QuickAllReduce INT4 codec with FlyDSL")
+        if codec == "INT4":
+            logger.info("Using bundled QuickAllReduce INT4 codec")
             _configure_bundled_int4_env()
             return _QuickAllReduceAdapter(QuickAllReduce(group=group, device=device))
         _configure_aiter_quickreduce_env()

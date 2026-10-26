@@ -144,7 +144,7 @@ def test_fp8_request_uses_bundled_int8_codec(monkeypatch, codec_env):
     assert environ["ROCM_QUICK_REDUCE_MAX_SIZE_BYTES_MB"] == "256"
 
 
-def test_explicit_aiter_codec_overrides_legacy_int8(monkeypatch):
+def test_int4_request_keeps_bundled_codec(monkeypatch):
     _install_fake_backends(monkeypatch, _OutOfTreeQuickAllReduce)
     monkeypatch.setenv("ROCM_QUICK_REDUCE_QUANTIZATION", "INT8")
     monkeypatch.setenv("AITER_QUICK_REDUCE_QUANTIZATION", "INT4")
@@ -153,9 +153,9 @@ def test_explicit_aiter_codec_overrides_legacy_int8(monkeypatch):
         group=object(), device="cpu"
     )
 
-    assert isinstance(adapter._communicator, _OutOfTreeQuickAllReduce)
+    assert isinstance(adapter._communicator, _BundledQuickAllReduce)
     assert (
-        quick_all_reduce_module.os.environ["AITER_QUICK_REDUCE_QUANTIZATION"] == "INT4"
+        quick_all_reduce_module.os.environ["ROCM_QUICK_REDUCE_QUANTIZATION"] == "INT4"
     )
 
 
