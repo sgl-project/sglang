@@ -10,11 +10,6 @@ from array import array
 from collections import defaultdict
 
 import torch
-from test_unified_radix_cache_unittest import (
-    CacheConfig,
-    UnifiedRadixCacheSuite,
-    build_fixture,
-)
 
 from sglang.srt.arg_groups.kv_cache_hook import handle_cache_compatibility
 from sglang.srt.mem_cache.base_prefix_cache import InsertParams, MatchPrefixParams
@@ -24,6 +19,9 @@ from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedLRUList, UnifiedTreeNode
 from sglang.srt.server_args import ServerArgs
+from sglang.test.kits.unified_radix_cache.config import CacheConfig
+from sglang.test.kits.unified_radix_cache.fixtures import build_fixture
+from sglang.test.kits.unified_radix_cache.mixins import UnifiedRadixCacheFixtures
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -54,7 +52,9 @@ class _FakeTreeCore:
             self, node, component, *args, **kwargs
         )
 
-    def _cascade_evict(self, node, component, tracker, device_frees, host_frees):
+    def _cascade_evict(
+        self, node, component, tracker, device_frees, host_frees, cache_actions
+    ):
         pass
 
 
@@ -88,7 +88,11 @@ def _build_chain(cap, length=4):
 
 def _trim(component, tail):
     device_frees = defaultdict(list)
-    component._evict_excess_path_states(tail, device_frees, defaultdict(list))
+    cache_actions = []
+    component._evict_excess_path_states(
+        tail, device_frees, defaultdict(list), cache_actions
+    )
+    assert cache_actions == []
     return device_frees
 
 
@@ -125,14 +129,11 @@ class TestSWAPathWindowCap(unittest.TestCase):
         self.assertEqual(core.component_evictable_size_[ComponentType.SWA], 2)
 
 
-class _SWAPathCapFixtureBase:
+class _SWAPathCapFixtureBase(UnifiedRadixCacheFixtures):
     cfg = CacheConfig(
         components=(ComponentType.FULL, ComponentType.SWA), sliding_window_size=4
     )
     tree_core_backend: str
-    _rid = 0
-    _alloc = UnifiedRadixCacheSuite._alloc
-    _init_hicache = UnifiedRadixCacheSuite._init_hicache
 
     def _build(self, cap):
         return build_fixture(

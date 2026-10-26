@@ -13,6 +13,7 @@ from torch import nn
 
 from sglang.kernels.ops.speculative.dflash import selector_walk_triton
 from sglang.kernels.ops.speculative.lilicorr import lilicorr_topk_lse
+from sglang.srt.configs.draft_parallel import DraftParallelSpec, DraftTPExecution
 from sglang.srt.configs.laguna import normalize_gating
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
 from sglang.srt.layers.activation import SiluAndMul
@@ -189,6 +190,11 @@ def _get_dflash_layer_attention_params(
     )
 
 
+_ROPE_DIM_SUPERSEDED_KEYS = frozenset(
+    {"rope_dim", "partial_rotary_factor", "mrope_section", "mrope_interleaved"}
+)
+
+
 class DFlashAttention(nn.Module):
     def __init__(
         self, config, layer_id: int, quant_config=None, prefix: str = ""
@@ -242,6 +248,18 @@ class DFlashAttention(nn.Module):
         self.k_norm = RMSNorm(head_dim, eps=rms_norm_eps)
 
         rope_theta, rope_scaling = get_rope_config(config)
+        rotary_dim = head_dim
+        partial_rotary_factor = float(getattr(config, "partial_rotary_factor", 1.0))
+        if rope_scaling is not None and "rope_dim" in rope_scaling:
+            # An explicit rope_dim is the trained rotary width (HF Qwen3 ignores the
+            # copied target partial/M-RoPE fields); drafts only see 1-D positions.
+            rotary_dim = int(rope_scaling["rope_dim"])
+            partial_rotary_factor = 1.0
+            rope_scaling = {
+                k: v
+                for k, v in rope_scaling.items()
+                if k not in _ROPE_DIM_SUPERSEDED_KEYS
+            }
         rope_is_neox_style = bool(
             getattr(
                 config, "rope_is_neox_style", getattr(config, "is_neox_style", True)
@@ -250,12 +268,12 @@ class DFlashAttention(nn.Module):
         max_position_embeddings = int(getattr(config, "max_position_embeddings", 32768))
         self.rotary_emb = get_rope(
             head_dim,
-            rotary_dim=head_dim,
+            rotary_dim=rotary_dim,
             max_position=max_position_embeddings,
             base=rope_theta,
             rope_scaling=rope_scaling,
             is_neox_style=rope_is_neox_style,
-            partial_rotary_factor=float(getattr(config, "partial_rotary_factor", 1.0)),
+            partial_rotary_factor=partial_rotary_factor,
         )
 
         self.scaling = head_dim**-0.5
@@ -352,7 +370,9 @@ class DFlashAttention(nn.Module):
         if _is_npu:
             q, k, v = self.forward_prepare_npu(positions, hidden_states)
         elif self.use_table_qk_norm_rope and qkv.dtype == torch.bfloat16:
-            from sglang.srt.speculative.dflash_utils import table_qk_norm_rope_
+            from sglang.kernels.ops.attention.table_qk_norm_rope import (
+                table_qk_norm_rope_,
+            )
 
             table_qk_norm_rope_(
                 qkv,
@@ -624,6 +644,8 @@ class DFlashDraftModel(nn.Module):
       - `fc.weight`, `hidden_norm.weight` for projecting target context features
       - `norm.weight` for final normalization
     """
+
+    draft_parallel_spec = DraftParallelSpec(tp_execution=DraftTPExecution.SINGLE_GROUP)
 
     decoder_layer_cls = DFlashDecoderLayer
     supports_fused_context_kv = True

@@ -17,6 +17,7 @@ from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     SchedulerPoolStatsObserver,
 )
+from sglang.srt.managers.utils import allocate_distinct_stream
 from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
@@ -701,6 +702,71 @@ class TestDecodeRetractionBackup(CustomTestCase):
                 env.allocator.free(received_indices)
                 env.req_to_token_pool.free(req)
                 env.allocator.free(pressure)
+
+    @patch("torch.distributed.get_world_size", return_value=1)
+    def test_resumed_restore_lands_after_the_inflight_forward(self, _world_size):
+        """A request that finished last step can still have its forward in flight,
+        writing slots that a resumed request is given; the restore must land after
+        that write, or the stale write replaces the restored KV."""
+        env = self._build_cache(
+            hicache_ratio=2.0, shared_receive=True, draft_mode=HiCacheDraftMode.NONE
+        )
+        queue, _ = self._receive_queue(env)
+        engine = env.cache.cache_controller.l2_transfer_engine
+        # Pool streams can alias; an alias of the copy streams would order the race.
+        avoid = (engine.host_to_device_stream, engine.device_to_host_stream)
+        forward_stream = allocate_distinct_stream(torch.cuda, avoid)
+        queue.scheduler.enable_overlap = True
+        queue.scheduler.forward_stream = forward_stream
+        queue.scheduler.schedule_stream = allocate_distinct_stream(
+            torch.cuda, (*avoid, forward_stream)
+        )
+        buffers = (*env.target_pool.k_buffer, *env.target_pool.v_buffer)
+
+        def resume_behind_forward(forward_cycles):
+            req, source_indices = self._admit_req(env, self.num_tokens)
+            for buffer in buffers:
+                buffer[source_indices] = 7
+            req.kv.retraction_backup = env.cache.backup_kv_cache(req)
+            req.is_retracted = True
+            env.allocator.free(source_indices)
+            # Slots a finished request held, which its in-flight forward still writes.
+            reused = env.allocator.alloc(self.num_tokens)
+            for buffer in buffers:
+                buffer[reused] = 0
+            torch.cuda.synchronize()
+            with torch.cuda.stream(queue.scheduler.forward_stream):
+                torch.cuda._sleep(forward_cycles)
+                # index_fill_ keeps the host free; a scalar setitem would sync on it.
+                for buffer in buffers:
+                    buffer.index_fill_(0, reused, -1)
+
+            def pre_alloc(resumed):
+                env.req_to_token_pool.write(
+                    (resumed.kv.req_pool_idx, slice(0, self.num_tokens)), reused
+                )
+
+            queue.retracted_queue = [req]
+            with (
+                patch.object(queue, "_uses_swa_reservation", return_value=False),
+                patch.object(queue, "_allocatable_token_budgets", return_value=1 << 20),
+                patch.object(queue, "_prealloc_required_tokens", return_value=(0, 0)),
+                patch.object(queue, "_prealloc_reservation_fits", return_value=True),
+                patch.object(queue, "_pre_alloc", side_effect=pre_alloc),
+                torch.cuda.stream(queue.scheduler.schedule_stream),
+            ):
+                self.assertEqual(queue.resume_retracted_reqs(), [req])
+            torch.cuda.synchronize()
+            restored = [buffer[reused].clone() for buffer in buffers]
+            env.allocator.free(reused)
+            env.req_to_token_pool.free(req)
+            return restored
+
+        # CUDA lazy loading syncs the device on a kernel's first launch, which
+        # would order the race by accident; a first pass loads every kernel.
+        resume_behind_forward(forward_cycles=1)
+        for values in resume_behind_forward(forward_cycles=1 << 30):
+            self.assertTrue(torch.all(values == 7))
 
     @patch("torch.distributed.get_world_size", return_value=1)
     def test_host_receive_merges_existing_radix_prefix_after_restore(self, _world_size):

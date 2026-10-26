@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-from collections import defaultdict
 from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     EvictParams,
@@ -45,6 +43,9 @@ from sglang.srt.mem_cache.unified_cache.components.base import (
     PreparePrefetchResult,
     TreeComponent,
     next_component_uuid,
+)
+from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
+    BaseEvictionResult,
 )
 
 if TYPE_CHECKING:
@@ -91,7 +92,10 @@ class SWAComponent(TreeComponent):
 
         super().__init__(cache, params)
         self._session_leaf_covered_len: dict[str, dict[UnifiedTreeNode, int]] = {}
-        self.sliding_window_size = params.sliding_window_size
+        # This is the tree's required history, including widened draft reads;
+        # it does not change the model's attention window.
+        self.sliding_window_size = params.swa_retain_window
+        self.gates_prefix_match = params.swa_gates_prefix_match
         self.full_window_pages = (
             self.sliding_window_size + params.page_size - 1
         ) // params.page_size
@@ -361,10 +365,7 @@ class SWAComponent(TreeComponent):
         sliding_window_size = self.sliding_window_size
         ct = self.component_type
         state = {"len": float("inf")}
-
-        # A per-request SWA ring is not stored in tree nodes, so its bookkeeping
-        # must not gate prefix matching.
-        swa_req_ring = is_swa_req_ring(self.cache.token_to_kv_pool_allocator)
+        gates_prefix_match = self.gates_prefix_match
 
         def validator(node: UnifiedTreeNode) -> bool:
             cd = node.component_data[ct]
@@ -372,7 +373,7 @@ class SWAComponent(TreeComponent):
             # — load_back will restore SWA from host before use.
             if cd.value is None and (match_device_only or cd.host_value is None):
                 state["len"] = 0
-                if swa_req_ring and (node.backuped or not node.evicted):
+                if not gates_prefix_match and (node.backuped or not node.evicted):
                     return True
                 return False
             state["len"] += len(node.key)
@@ -529,7 +530,11 @@ class SWAComponent(TreeComponent):
             )
             if live_start is None:
                 continue
-            parent = self._maybe_split_leaf_for_swa_lock(fragment) if cap_leaf else None
+            parent = (
+                self._maybe_split_leaf_for_swa_lock(fragment, cache_actions)
+                if cap_leaf
+                else None
+            )
             # Older fragments publish first so the tail remains more-MRU.
             if parent is not None:
                 self._publish_window(node=parent, cache_actions=cache_actions)
@@ -602,18 +607,22 @@ class SWAComponent(TreeComponent):
         tail: UnifiedTreeNode,
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
+        cache_actions: list[CacheAction | ComponentAction],
     ) -> None:
         self._evict_path_states_beyond_cap(
             tail,
             self.swa_max_states_per_path,
             device_frees,
             host_frees,
+            cache_actions,
             # A repeat of the tail matches up to one page short of its end.
             protected_tail_tokens=self.sliding_window_size + self.tree_core.page_size,
         )
 
     def _maybe_split_leaf_for_swa_lock(
-        self, leaf: UnifiedTreeNode
+        self,
+        leaf: UnifiedTreeNode,
+        cache_actions: list[CacheAction | ComponentAction],
     ) -> Optional[UnifiedTreeNode]:
         """Cap a fresh in-window SWA leaf at one page-aligned window so locking it pins
         only one window of SWA pool, not the whole (long chunked-prefill) leaf; return
@@ -636,7 +645,11 @@ class SWAComponent(TreeComponent):
             return None
 
         new_parent, action = self.tree_core._split_node(leaf.key, leaf, split_at)
-        assert action is None, "fresh SWA leaf cannot be write-through-pending"
+        assert action is None or action.ack_id is None, (
+            "fresh SWA leaf cannot be write-through-pending"
+        )
+        if action is not None:
+            cache_actions.append(action)
         return new_parent
 
     def redistribute_on_node_split(
@@ -712,6 +725,7 @@ class SWAComponent(TreeComponent):
         node: UnifiedTreeNode,
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
+        cache_actions: list[CacheAction | ComponentAction],
         target: EvictLayer = EvictLayer.DEVICE,
     ) -> tuple[int, int]:
         ct = self.component_type
@@ -727,7 +741,7 @@ class SWAComponent(TreeComponent):
             device_frees[self.component_type].append(
                 node.component_data[BASE_COMPONENT_TYPE].value
             )
-            freed = len(cd.value)
+            freed = self.reclaimable_value_len(node)
             self.tree_core.component_evictable_size_[ct] -= freed
             cd.value = None
 
@@ -771,6 +785,7 @@ class SWAComponent(TreeComponent):
         tracker: dict[ComponentType, int],
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
+        cache_actions: list[CacheAction | ComponentAction],
     ) -> NodeId | InternalStateBackup | None:
         """Advance one device-eviction step and return a leaf, if selected.
 
@@ -840,9 +855,15 @@ class SWAComponent(TreeComponent):
             tracker=tracker,
             device_frees=device_frees,
             host_frees=host_frees,
+            cache_actions=cache_actions,
         )
         self.tree_core._cascade_evict(
-            x, self, tracker, device_frees=device_frees, host_frees=host_frees
+            x,
+            self,
+            tracker,
+            device_frees=device_frees,
+            host_frees=host_frees,
+            cache_actions=cache_actions,
         )
         if enabled:
             self._evict_device_cursor = lru.cursor_next()
@@ -892,7 +913,7 @@ class SWAComponent(TreeComponent):
                     if lru.in_list(cur):
                         lru.remove_node(cur)
                 else:
-                    key_len = len(value)
+                    key_len = self.reclaimable_value_len(cur)
                     self.tree_core.component_evictable_size_[ct] -= key_len
                     self.tree_core.component_protected_size_[ct] += key_len
             if lock_host:
@@ -941,7 +962,7 @@ class SWAComponent(TreeComponent):
                         if not host_lru.in_list(cur):
                             host_lru.insert_mru(cur)
                 else:
-                    key_len = len(value)
+                    key_len = self.reclaimable_value_len(cur)
                     self.tree_core.component_evictable_size_[ct] += key_len
                     self.tree_core.component_protected_size_[ct] -= key_len
             if lock_host:
@@ -963,6 +984,7 @@ class SWAComponent(TreeComponent):
         swa_uuid_for_lock: Optional[int],
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
+        cache_actions: list[CacheAction | ComponentAction],
     ) -> None:
         """Early-release the SWA lock along [node, swa_uuid_for_lock]; this
         method touches only SWA state. The wrapping ``dec_swa_lock_only`` also
@@ -986,7 +1008,7 @@ class SWAComponent(TreeComponent):
             if cd.lock_ref == 0:
                 self.tree_core._update_evictable_leaf_sets(cur)
             if cd.lock_ref == 0 and cd.value is not None:
-                value_len = len(cd.value)
+                value_len = self.reclaimable_value_len(cur)
                 self.tree_core.component_protected_size_[ct] -= value_len
                 self.tree_core.component_evictable_size_[ct] += value_len
                 if self.tree_core._is_device_leaf(cur):
@@ -996,6 +1018,7 @@ class SWAComponent(TreeComponent):
                         target=EvictLayer.DEVICE,
                         device_frees=device_frees,
                         host_frees=host_frees,
+                        cache_actions=cache_actions,
                     )
 
             if swa_uuid_for_lock and cd.metadata.get("uuid") == swa_uuid_for_lock:
@@ -1504,6 +1527,7 @@ class SWAComponent(TreeComponent):
         tracker: dict[ComponentType, int],
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
+        cache_actions: list[CacheAction | ComponentAction],
     ) -> None:
         """Evict SWA host resources.
         Internal nodes: private tombstone (free SWA host only).
@@ -1523,7 +1547,9 @@ class SWAComponent(TreeComponent):
             if x in self.tree_core.evictable_host_leaves and (
                 not enabled or self._can_evict_leaf_atomically(x)
             ):
-                self.tree_core._evict_host_leaf(x, tracker, device_frees, host_frees)
+                self.tree_core._evict_host_leaf(
+                    x, tracker, device_frees, host_frees, cache_actions=cache_actions
+                )
             else:
                 assert cd.host_value is not None
                 self.tree_core._evict_component_and_detach_lru(
@@ -1533,6 +1559,7 @@ class SWAComponent(TreeComponent):
                     tracker=tracker,
                     device_frees=device_frees,
                     host_frees=host_frees,
+                    cache_actions=cache_actions,
                 )
                 self.tree_core._cascade_evict(
                     x,
@@ -1541,6 +1568,7 @@ class SWAComponent(TreeComponent):
                     device_frees=device_frees,
                     host_frees=host_frees,
                     target=EvictLayer.HOST,
+                    cache_actions=cache_actions,
                 )
             if enabled:
                 x = host_lru.cursor_next(host_lock=True)
@@ -1558,15 +1586,18 @@ class SWAComponent(TreeComponent):
     def apply_component_action(self, action: ComponentAction) -> None:
         alloc = self.cache.token_to_kv_pool_allocator
         if isinstance(action, EvictExcessPathStates):
-            device_frees: dict[ComponentType, list[torch.Tensor]] = defaultdict(list)
-            host_frees: dict[ComponentType, list[torch.Tensor]] = defaultdict(list)
+            result = BaseEvictionResult()
             # The walk runs behind the tree-core interface (Rust runs it natively).
             try:
                 self.tree_core.evict_excess_path_states(
-                    action.tail_node_id, self.component_type, device_frees, host_frees
+                    action.tail_node_id,
+                    self.component_type,
+                    result.device_frees,
+                    result.host_frees,
+                    result.cache_actions,
                 )
             finally:
-                self.cache._free_values(device_frees, host_frees)
+                self.cache._apply_eviction_result(result)
             return
         if isinstance(action, FreeComponentDeviceSlot):
             for indices in action.indices:

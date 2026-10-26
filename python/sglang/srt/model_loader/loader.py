@@ -41,13 +41,15 @@ import numpy as np
 import torch
 
 from sglang.srt.constants import GIB_BYTES
+from sglang.srt.kernel_plugins.amd.binding import (
+    monokernel_weights_iterator,
+)
 from sglang.srt.model_loader.post_load import stage_module_for_post_load
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
     get_remote_instance_transfer_engine_info_per_rank,
     register_memory_region,
 )
-from sglang.srt.monokernels.runtime import monokernel_weights_iterator
 from sglang.srt.runtime_context import (
     get_exec,
     get_model,
@@ -84,14 +86,16 @@ from sglang.srt.distributed import (
     model_parallel_is_initialized,
 )
 from sglang.srt.layers.layer_boundary.stage import check_stage_producers
+from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
 from sglang.srt.layers.moe.utils import (
-    install_shared_experts_fusion_decision,
+    resolve_shared_experts_config,
 )
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     trigger_transferring_weights_request,
 )
@@ -137,7 +141,6 @@ from sglang.srt.utils import (
     rank0_log,
     set_weight_attrs,
 )
-from sglang.srt.utils.common import temp_set_env
 
 if TYPE_CHECKING:
     from sglang.srt.configs.device_config import DeviceConfig
@@ -286,11 +289,7 @@ def _initialize_model(
 ) -> nn.Module:
     """Initialize a model with the given configurations."""
     model_class, _ = get_model_architecture(model_config)
-    # Decide the shared-experts-fusion question here, once per runner, before any
-    # layer exists: this is the only place a model class is instantiated, and it
-    # is the last point that still knows both the checkpoint's quantization and
-    # (through the build scope) whether this runner is a draft.
-    install_shared_experts_fusion_decision(
+    shared_experts = resolve_shared_experts_config(
         model_class, model_config.hf_config, quant_config
     )
     kwargs = {
@@ -306,8 +305,10 @@ def _initialize_model(
     if load_config.draft_model_idx is not None:
         kwargs["draft_model_idx"] = load_config.draft_model_idx
 
-    model = model_class(**kwargs)
-    check_stage_producers(model)
+    with get_model().override(shared_experts=shared_experts):
+        model = model_class(**kwargs)
+        check_stage_producers(model)
+    model.shared_experts_config = shared_experts
     return model
 
 
@@ -1059,22 +1060,10 @@ class DefaultModelLoader(BaseModelLoader):
             )
 
         weights = monokernel_weights_iterator(model=model, weights=weights)
-        if is_nvfp4_online or is_modelopt_fp4_online:
-            # Scope exact FP4 quantization math to load-time conversion only;
-            # restore the original environment before serving starts.
-            with temp_set_env(
-                FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH="1",
-                FLASHINFER_NVFP4_4OVER6="1",
-                FLASHINFER_NVFP4_4OVER6_E4M3_USE_256="0",
-                FLASHINFER_NVFP4_4OVER6_ERR_MODE="MSE",
-                FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH="1",
-            ):
-                model.load_weights(weights)
-            if target_device.type == "cuda":
-                torch.cuda.synchronize()
-                torch.cuda.empty_cache()
-        else:
-            model.load_weights(weights)
+        model.load_weights(weights)
+        if (is_nvfp4_online or is_modelopt_fp4_online) and target_device.type == "cuda":
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
 
         # Used in tests to verify memory savings when using online quantization.
         if is_cuda_alike():
@@ -1508,7 +1497,7 @@ class DummyModelLoader(BaseModelLoader):
         device_config: DeviceConfig,
     ) -> nn.Module:
 
-        if get_bool_env_var("SGL_CPU_QUANTIZATION"):
+        if envs.SGLANG_CPU_QUANTIZATION.get():
             return load_model_with_cpu_quantization(
                 self, model_config=model_config, device_config=device_config
             )
@@ -2062,14 +2051,8 @@ class PreshardedModelLoader(DefaultModelLoader):
     @staticmethod
     def _rebind_parameter_aliases(model: nn.Module) -> None:
         for _, module in model.named_modules():
-            gemma_w = getattr(module, "gemma_weight", None)
-            weight = getattr(module, "weight", None)
-            if (
-                isinstance(gemma_w, torch.Tensor)
-                and isinstance(weight, torch.nn.Parameter)
-                and gemma_w.shape == weight.shape
-            ):
-                torch.add(weight.data, 1.0, out=gemma_w)
+            if isinstance(module, GemmaRMSNorm):
+                module.refresh_gemma_weight()
 
             attn = getattr(module, "attn", None)
             conv1d = getattr(module, "conv1d", None)
@@ -2082,13 +2065,8 @@ class PreshardedModelLoader(DefaultModelLoader):
             if conv1d is None:
                 continue
             cweight = getattr(conv1d, "weight", None)
-            if cweight is not None and hasattr(attn, "conv_weights"):
-                if cweight.dim() == 3 and cweight.size(1) == 1:
-                    attn.conv_weights = cweight.view(cweight.size(0), cweight.size(2))
-                else:
-                    attn.conv_weights = (
-                        cweight.squeeze() if cweight.dim() > 2 else cweight
-                    )
+            if cweight is not None and isinstance(attn, RadixLinearAttention):
+                attn.refresh_conv_weights(cweight)
             if hasattr(conv1d, "bias") and hasattr(attn, "bias"):
                 attn.bias = conv1d.bias
 

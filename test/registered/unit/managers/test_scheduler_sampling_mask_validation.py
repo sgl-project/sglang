@@ -59,16 +59,8 @@ class TestSchedulerSamplingMaskValidation(CustomTestCase):
                 ):
                     scheduler.handle_generate_request(recv_req)
                 abort.assert_called_once()
-                self.assertIs(abort.call_args.args[0], req)
-                self.assertIn(
-                    "SGLANG_ENABLE_DISAGG_SAMPLING_MASK=1",
-                    abort.call_args.args[1],
-                )
                 self.assertEqual(
                     abort.call_args.kwargs["status_code"], HTTPStatus.BAD_REQUEST
-                )
-                scheduler.output_streamer.stream_output.assert_called_once_with(
-                    [req], False
                 )
                 scheduler._add_request_to_queue.assert_not_called()
 

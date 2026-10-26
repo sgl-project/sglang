@@ -772,6 +772,8 @@ class SchedulerBatchResultProcessor:
         assert result.next_token_ids.is_cpu
         assert result.accept_lens.is_cpu
 
+        self.metrics_reporter.snapshot_spec_decode_metrics(batch, result)
+
         next_token_ids = result.next_token_ids.tolist()
         accept_lens = result.accept_lens.tolist()
         stride = _get_speculative_output_stride(result)
@@ -1400,6 +1402,7 @@ class SchedulerBatchResultProcessor:
                 and lookahead == 1
                 and known_mamba_boundary
                 and req.kv.mamba_next_track_idx == req.kv.mamba_last_track_idx
+                and req.kv.mamba_untracked_decode_batch_idx != req.decode_batch_idx
             ):
                 req.mamba_lazy_checkpoint = False
 
@@ -1422,6 +1425,9 @@ class SchedulerBatchResultProcessor:
             self.decode_offload_manager.offload_kv_cache(req)
 
         if req.finished():
+            if not self._mamba_can_cache_finished_req(req, result, i):
+                req.skip_radix_cache_insert = True
+
             # isinstance narrowing: create_worker may also return plain
             # TpModelWorker-based drafts, which carry no spec-worker hooks.
             if isinstance(self.draft_worker, BaseSpecWorker):
@@ -1455,12 +1461,41 @@ class SchedulerBatchResultProcessor:
 
         self._maybe_collect_customized_info(i, req, logits_output)
 
+    def _mamba_can_cache_finished_req(
+        self, req: Req, result: GenerationBatchResult, i: int
+    ) -> bool:
+        if (
+            result.num_correct_drafts_per_req_cpu is None
+            or req.kv.mamba_ping_pong_track_buffer is not None
+            or not self.tree_cache.supports_mamba()
+        ):
+            return True
+
+        # no_buffer donates the live state, which cannot be shortened with the key.
+        if req.owned_kv_len() != req.kv.kv_committed_len:
+            return False
+
+        retained = result.grammar_retained_tokens
+        if retained is None or retained[i] is None:
+            return True
+
+        num_verified = (
+            result.num_correct_drafts_per_req_cpu[i]
+            + result.num_non_draft_tokens_per_req
+        )
+        return len(retained[i]) == num_verified
+
     def _maybe_update_reasoning_tokens(
         self,
         req: Req,
         next_token_id: Union[int, List[int]],
     ):
         if not req.require_reasoning:
+            think_start_ids = self.model_config.self_opened_think_start_ids
+            if think_start_ids:
+                req.update_self_opened_reasoning_tokens(
+                    next_token_id, think_start_ids, self.model_config.think_end_ids
+                )
             return
         think_end_ids = self.model_config.think_end_ids
         if req._think_end_matcher is None:
@@ -1560,9 +1595,9 @@ class SchedulerBatchResultProcessor:
             other_idx = 1 - req.kv.mamba_next_track_idx
             # Recompute the in-flight verify's plan (kv_committed_len is
             # frozen since its prepare, so the recompute is exact).
-            keep_may_be_written_in_flight = req.kv.mamba_ping_pong_track_buffer[
+            keep_may_be_written_in_flight = req.kv.mamba_ping_pong_empty[
                 other_idx
-            ].item() == -1 and mamba_lazy_spec_in_window(
+            ] and mamba_lazy_spec_in_window(
                 req,
                 mamba_track_grid(self.tree_cache.page_size),
                 max_speculative_num_draft_tokens(),
@@ -1647,9 +1682,8 @@ class SchedulerBatchResultProcessor:
         req.kv.mamba_last_track_idx = track_idx
         req.kv.mamba_next_track_idx = track_idx
         other_idx = 1 - track_idx
-        other_val = req.kv.mamba_ping_pong_track_buffer[other_idx].item()
-        if other_val != -1:
-            pool = batch.req_to_token_pool
+        pool = batch.req_to_token_pool
+        if not req.kv.mamba_ping_pong_empty[other_idx]:
             pool.mamba_allocator.free(
                 req.kv.mamba_ping_pong_track_buffer[other_idx].unsqueeze(0)
             )

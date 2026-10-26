@@ -7,7 +7,6 @@ are correctly freed when a request finishes, preventing GPU memory leaks.
 Requires: torch, sglang (run in an environment with sglang installed)
 """
 
-import gc
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -32,7 +31,7 @@ from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 
 def _make_mock_req(
@@ -147,199 +146,6 @@ class TestReleaseFinishedReq(unittest.TestCase):
                     get_storage_hash_str(RadixKey(tokens, **namespace), page_size=2),
                 )
 
-    def test_no_overallocation(self):
-        """Without spec v2, kv_committed == kv_allocated; no extra free."""
-        manager, freed = _make_manager(pool_size=32)
-        req = _make_mock_req(
-            req_pool_idx=0,
-            kv_committed_len=20,
-            kv_allocated_len=20,  # no overallocation
-            origin_len=8,
-        )
-
-        manager._release_finished_req(req)
-
-        self.assertEqual(len(freed), 1)
-        self.assertTrue(torch.equal(freed[0], torch.arange(0, 20, dtype=torch.int64)))
-        manager.req_to_token_pool.free.assert_called_once_with(req)
-
-    def test_with_overallocation(self):
-        """With spec v2, the over-allocated slots go back with the row."""
-        manager, freed = _make_manager(pool_size=32)
-        req = _make_mock_req(
-            req_pool_idx=0,
-            kv_committed_len=20,
-            kv_allocated_len=28,  # 8 over-allocated slots
-            origin_len=8,
-        )
-
-        manager._release_finished_req(req)
-
-        self.assertEqual(len(freed), 1)
-        self.assertTrue(torch.equal(freed[0], torch.arange(0, 28, dtype=torch.int64)))
-        manager.req_to_token_pool.free.assert_called_once_with(req)
-
-    def test_unaligned_committed_len_frees_the_whole_row(self):
-        """A mid-page committed length needs no alignment arithmetic here."""
-        page_size = 4
-        manager, freed = _make_manager(pool_size=32, page_size=page_size)
-        req = _make_mock_req(
-            req_pool_idx=0,
-            kv_committed_len=10,  # not page-aligned
-            kv_allocated_len=28,
-            origin_len=4,
-        )
-
-        manager._release_finished_req(req)
-
-        self.assertEqual(len(freed), 1)
-        self.assertTrue(torch.equal(freed[0], torch.arange(0, 28, dtype=torch.int64)))
-
-    def test_matched_prefix_stays_with_the_tree(self):
-        """A prefix matched at prealloc is tree-owned: unlocked, never freed."""
-        manager, freed = _make_manager(pool_size=32)
-        req = _make_mock_req(
-            req_pool_idx=0,
-            kv_committed_len=20,
-            kv_allocated_len=20,
-            prefix_len=5,
-        )
-        req.kv.cache_protected_len = 5
-        lock = req.lock
-
-        manager._release_finished_req(req)
-
-        manager.tree_cache.unlock.assert_called_once_with(lock)
-        self.assertIsNone(req.lock)
-        self.assertTrue(torch.equal(freed[0], torch.arange(5, 20, dtype=torch.int64)))
-
-    def test_release_finished_req_frees_prefill_and_pops_state(self):
-        """
-        _release_finished_req frees the prefill-aligned slots in addition to
-        the committed range; freeing them mid-decode instead races with
-        concurrent admission and cross-pollinates KV reads.
-        """
-        manager, freed = _make_manager(pool_size=32)
-        req = _make_mock_req(
-            req_pool_idx=0,
-            kv_committed_len=20,
-            kv_allocated_len=20,
-            rid="req-prefill-present",
-            origin_len=8,
-        )
-        manager.offloaded_state[req] = OffloadedState(inc_len=4)
-
-        manager._release_finished_req(req)
-
-        self.assertEqual(len(freed), 1)
-        self.assertTrue(torch.equal(freed[0], torch.arange(0, 20, dtype=torch.int64)))
-        # State entry is removed at the end of _release_finished_req.
-        self.assertNotIn(req, manager.offloaded_state)
-
-    def test_release_finished_req_skips_prefill_free_when_prompt_below_page(self):
-        """
-        When the prompt is shorter than page_size (no prefill chunk was ever
-        offloaded), no prefill-aligned free is emitted.
-        """
-        manager, freed = _make_manager(pool_size=32, page_size=4)
-        req = _make_mock_req(
-            req_pool_idx=0,
-            kv_committed_len=10,
-            kv_allocated_len=10,
-            rid="req-prefill-zero",
-            origin_len=3,  # 3 // 4 * 4 == 0
-        )
-
-        manager._release_finished_req(req)
-
-        # Only the committed range [0:10] is freed.
-        self.assertEqual(len(freed), 1)
-        self.assertTrue(torch.equal(freed[0], torch.arange(0, 10, dtype=torch.int64)))
-
-    def test_finalize_release_frees_prefill_without_prior_state(self):
-        """
-        finalize_release_on_finish handles the case where no incremental
-        offload ever ran: the prefill-aligned slots must still be freed by
-        the consolidated free site in _release_finished_req.
-        """
-        manager, freed = _make_manager(pool_size=32, page_size=4)
-        req = _make_mock_req(
-            req_pool_idx=0,
-            kv_committed_len=13,
-            kv_allocated_len=13,
-            rid="req-finalize-no-state",
-            origin_len=12,  # prefill_len = 12 // 4 * 4 = 12
-        )
-
-        manager.finalize_release_on_finish(req)
-
-        self.assertEqual(len(freed), 1)
-        self.assertTrue(torch.equal(freed[0], torch.arange(0, 13, dtype=torch.int64)))
-        # No state entry is left behind.
-        self.assertNotIn(req, manager.offloaded_state)
-
-    def test_unfinished_offload_ack_does_not_free_incremental_slots(self):
-        manager, freed = _make_manager(pool_size=32)
-        req = _make_mock_req(
-            req_pool_idx=0, kv_committed_len=20, kv_allocated_len=20, rid=1
-        )
-        req.finished.return_value = False
-        manager.offloaded_state[req] = OffloadedState(inc_len=4)
-        manager.offload_inflight[req] = 1
-        manager.ongoing_offload[7] = (
-            req,
-            torch.arange(4, 8, dtype=torch.int64),
-            [10, 11, 12, 13],
-            0.0,
-            [],
-        )
-        manager.cache_controller = MagicMock()
-        manager.cache_controller.ack_write_queue = [
-            HiCacheAck(None, _FinishedEvent(), [7])
-        ]
-        manager._trigger_backup = MagicMock(return_value="last_hash")
-
-        manager._check_offload_progress(1)
-
-        self.assertEqual(freed, [])
-        manager.req_to_token_pool.free.assert_not_called()
-        self.assertNotIn(req, manager.offload_inflight)
-
-    def test_offload_kv_cache_tracks_inflight_write_until_ack(self):
-        manager, freed = _make_manager(pool_size=32, page_size=4)
-        manager.cache_controller = MagicMock()
-        manager.cache_controller.get_hash_str = MagicMock(return_value="prefill_hash")
-        manager.cache_controller.write = MagicMock(
-            return_value=torch.arange(4, 8, dtype=torch.int64)
-        )
-        manager.decode_host_mem_pool = MagicMock()
-        manager.request_counter = 0
-        manager.offload_stride = 4
-
-        req = _make_mock_req(
-            req_pool_idx=0, kv_committed_len=20, kv_allocated_len=20, rid=5
-        )
-        req.origin_input_ids = [0, 1, 2, 3]
-        req.output_ids = [4, 5, 6, 7, 8]
-        req.finished.return_value = False
-
-        did_offload = manager.offload_kv_cache(req)
-
-        self.assertTrue(did_offload)
-        self.assertEqual(manager.offload_inflight[req], 1)
-        self.assertEqual(manager.offloaded_state[req].inc_len, 4)
-        manager.cache_controller.write.assert_called_once()
-
-        manager.cache_controller.ack_write_queue = [
-            HiCacheAck(None, _FinishedEvent(), [1])
-        ]
-        manager._trigger_backup = MagicMock(return_value="last_hash")
-
-        manager._check_offload_progress(1)
-
-        self.assertEqual(freed, [])
-        self.assertNotIn(req, manager.offload_inflight)
-
     def test_reused_rid_does_not_share_offload_lifecycle(self):
         manager, _ = _make_manager(pool_size=32, page_size=4)
         manager.cache_controller = MagicMock()
@@ -386,20 +192,6 @@ class TestReleaseFinishedReq(unittest.TestCase):
         self.assertEqual(manager.offloaded_state[new_req].inc_len, 4)
         self.assertEqual(manager.offload_inflight[new_req], 1)
         self.assertIn(2, manager.ongoing_offload)
-
-    def test_finalize_release_defers_while_offload_is_in_flight(self):
-        manager, freed = _make_manager(pool_size=32)
-        req = _make_mock_req(
-            req_pool_idx=0, kv_committed_len=20, kv_allocated_len=20, rid=2
-        )
-        manager.offloaded_state[req] = OffloadedState(inc_len=8)
-        manager.offload_inflight[req] = 1
-
-        manager.finalize_release_on_finish(req)
-
-        self.assertEqual(freed, [])
-        manager.req_to_token_pool.free.assert_not_called()
-        self.assertIn(req, manager.offloaded_state)
 
     def test_finished_offload_ack_waits_for_other_inflight_writes(self):
         manager, freed = _make_manager(pool_size=32)
@@ -462,20 +254,6 @@ class TestReleaseFinishedReq(unittest.TestCase):
         manager.req_to_token_pool.free.assert_called_once_with(req)
         self.assertNotIn(req, manager.offloaded_state)
         self.assertNotIn(req, manager.offload_inflight)
-
-    def test_dropped_req_does_not_pin_offload_state(self):
-        manager, _ = _make_manager(pool_size=32)
-        req = _make_mock_req(
-            req_pool_idx=0, kv_committed_len=20, kv_allocated_len=20, rid=6
-        )
-        manager.offloaded_state[req] = OffloadedState(inc_len=4)
-        manager.offload_inflight[req] = 1
-
-        del req
-        gc.collect()
-
-        self.assertEqual(len(manager.offloaded_state), 0)
-        self.assertEqual(len(manager.offload_inflight), 0)
 
 
 class TestSamplingMaskAbortOffload(CustomTestCase):

@@ -188,8 +188,15 @@ def alloc_paged_token_slots_extend(
     # availability floor must cover every request's ceil(K_i/N) rounding,
     # matching the N*ps per-request admission reserve).
     allocator = tree_cache.token_to_kv_pool_allocator
-    num_tokens = extend_num_tokens + len(seq_lens_cpu) * (
-        allocator.page_size * page_interleave_shard_size(allocator)
+    shard_size = page_interleave_shard_size(allocator)
+    conservative_num_tokens = extend_num_tokens + len(seq_lens_cpu) * (
+        allocator.page_size * shard_size
+    )
+    num_tokens = allocator.get_extend_allocation_demand(
+        prefix_lens_cpu,
+        seq_lens_cpu,
+        conservative_num_tokens=conservative_num_tokens,
+        shard_size=shard_size,
     )
     evict_from_tree_cache(tree_cache, num_tokens)
 
@@ -348,7 +355,7 @@ def _alloc_page_size(batch: ScheduleBatch) -> int:
     # the real allocator's page_size there. Elsewhere the two are equal --
     # including under KV sharding, which widens the index space but keeps the
     # allocator page at the physical page.
-    if (_is_hip or _is_cuda or _is_xpu) and get_parallel().dcp_enabled:
+    if (_is_hip or _is_cuda or _is_xpu or _is_npu) and get_parallel().dcp_enabled:
         return batch.tree_cache.token_to_kv_pool_allocator.page_size
     return batch.tree_cache.page_size
 

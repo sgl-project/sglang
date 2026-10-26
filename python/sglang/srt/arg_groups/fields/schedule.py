@@ -60,6 +60,10 @@ class Schedule(msgspec.Struct):
             resolvable=True,
         ),
     ] = None
+    prefill_decode_interval_min_bs: A[
+        int,
+        "Apply --prefill-decode-interval only while the running batch holds at least this many requests. Below it, prefill is admitted every round so the batch fills quickly. In data-parallel attention mode, each rank compares its own running batch. Set to 0 to always apply the interval.",
+    ] = 0
     enable_dynamic_chunking: A[
         bool,
         "Enable dynamic chunk size adjustment for pipeline parallelism. When enabled, chunk sizes are dynamically calculated based on fitted function to maintain consistent execution time across chunks.",

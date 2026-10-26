@@ -235,6 +235,7 @@ def _moe_stub(rank, *, dual, shared_tp1):
         _fuse_shared_experts_inside_sbo=False,
         num_fused_shared_experts=0,
         routed_scaling_factor=1.0,
+        routed_scaling_factor_fused_in_topk=True,
         experts=experts,
         gate=gate,
         alt_stream=torch.cuda.Stream(),
@@ -390,7 +391,9 @@ def _engram_table(rows):
         envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.override(False),
         torch.device("cuda"),
     ):
-        embed = EngramEmbedding(rows, 128, layer_id=1)
+        # One hash column per rank, so TP4 takes the column-aligned split.
+        bounds = tuple(rows * c // 4 for c in range(5))
+        embed = EngramEmbedding(rows, 128, layer_id=1, column_bounds=bounds)
     embed.weight.weight_loader(embed.weight, weight)
     embed.scale.weight_loader(embed.scale, scale.view(torch.float8_e8m0fnu))
     embed.finish_load(label="test")
