@@ -22,8 +22,10 @@ class TestFusedMoeBlockFp8Scales(CustomTestCase):
         torch.manual_seed(0)
         m, n, k = 19, 256, 256
         block_m, group_n, group_k = 32, 128, 128
-        a = torch.randn(m, k, device="cuda").to(torch.float8_e4m3fn)
-        b = torch.randn(1, n, k, device="cuda").to(torch.float8_e4m3fn)
+        # Small integers keep the FP8 dot exact under Hopper's fast accumulation.
+        a = torch.randint(-2, 3, (m, k), device="cuda").float()
+        b = torch.randint(-2, 3, (1, n, k), device="cuda").float()
+        a, b = a.to(torch.float8_e4m3fn), b.to(torch.float8_e4m3fn)
         a_scale = torch.rand(m, k // group_k, device="cuda") + 0.1
         b_scale = torch.rand(1, n // group_n, k // group_k, device="cuda") + 0.1
         weights = torch.rand(m, 1, device="cuda")
