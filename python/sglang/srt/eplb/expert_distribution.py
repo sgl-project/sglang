@@ -151,15 +151,6 @@ class ExpertDistributionRecorder(ABC):
         else:
             return _ExpertDistributionRecorderNoop()
 
-    def on_graph_capture_forward_start(self):
-        pass
-
-    def get_graph_capture_state(self):
-        return {}
-
-    def on_graph_replay_forward_start(self, state):
-        pass
-
     @contextmanager
     def with_current_layer(self, layer_idx):
         yield
@@ -245,29 +236,6 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
                 f"expert_balancedness_report_mode={get_exec().moe.expert_balancedness_report_mode}"
             )
             self.start_record()
-
-    def on_graph_capture_forward_start(self):
-        if self._disable_all:
-            return
-        for gatherer in self._single_pass_gatherers.values():
-            gatherer.on_graph_capture_forward_start()
-
-    def get_graph_capture_state(self):
-        if self._disable_all:
-            return {}
-        return {
-            key: state
-            for key, gatherer in self._single_pass_gatherers.items()
-            if (state := gatherer.get_graph_capture_state()) is not None
-        }
-
-    def on_graph_replay_forward_start(self, state):
-        if self._disable_all:
-            return
-        for key, gatherer_state in state.items():
-            self._single_pass_gatherers[key].on_graph_replay_forward_start(
-                gatherer_state
-            )
 
     def with_current_layer(self, layer_idx):
         return self._current_layer_idx.with_value(layer_idx)
@@ -473,15 +441,6 @@ class _SinglePassGatherer(ABC):
     def __init__(self, expert_location_metadata: ExpertLocationMetadata, rank: int):
         self._expert_location_metadata = expert_location_metadata
         self._rank = rank
-
-    def on_graph_capture_forward_start(self):
-        pass
-
-    def get_graph_capture_state(self):
-        return None
-
-    def on_graph_replay_forward_start(self, state):
-        pass
 
     def on_forward_pass_start(self, forward_batch: ForwardBatch):
         pass

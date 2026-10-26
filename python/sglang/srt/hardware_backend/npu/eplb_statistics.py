@@ -19,12 +19,12 @@ import os
 
 import torch
 
-from sglang.srt.eplb.expert_distribution import _SelectExpertsSinglePassGatherer
+from sglang.srt.eplb import expert_distribution as distribution
 
 logger = logging.getLogger(__name__)
 
 
-class NpuExpertDistributionGatherer(_SelectExpertsSinglePassGatherer):
+class NpuExpertDistributionGatherer(distribution._SelectExpertsSinglePassGatherer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         capacity = int(os.environ.get("SGLANG_NPU_EPLB_STATS_MAX_ROUTES", "96"))
@@ -81,3 +81,38 @@ class NpuExpertDistributionGatherer(_SelectExpertsSinglePassGatherer):
             self._data.scatter_add_(1, ids.masked_fill(~mask, 0).long(), mask.int())
             self._batch_collected = True
         return super().collect()
+
+
+def _get_npu_gatherers(recorder=None):
+    if recorder is None:
+        recorder = distribution.get_global_expert_distribution_recorder()
+    if (
+        not isinstance(recorder, distribution._ExpertDistributionRecorderReal)
+        or recorder._disable_all
+    ):
+        return {}
+    return {
+        key: gatherer
+        for key, gatherer in recorder._single_pass_gatherers.items()
+        if isinstance(gatherer, NpuExpertDistributionGatherer)
+    }
+
+
+def on_graph_capture_forward_start(recorder=None):
+    for gatherer in _get_npu_gatherers(recorder).values():
+        gatherer.on_graph_capture_forward_start()
+
+
+def get_graph_capture_state(recorder=None):
+    return {
+        key: gatherer.get_graph_capture_state()
+        for key, gatherer in _get_npu_gatherers(recorder).items()
+    }
+
+
+def on_graph_replay_forward_start(state, recorder=None):
+    gatherers = _get_npu_gatherers(recorder)
+    if not gatherers:
+        return
+    for key, gatherer_state in state.items():
+        gatherers[key].on_graph_replay_forward_start(gatherer_state)

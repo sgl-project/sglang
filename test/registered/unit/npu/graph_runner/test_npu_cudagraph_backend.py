@@ -6,7 +6,7 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.eplb import expert_distribution as distribution
+from sglang.srt.hardware_backend.npu import eplb_statistics
 from sglang.srt.hardware_backend.npu.graph_runner import npu_cudagraph_backend as mod
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.runtime_context import get_parallel
@@ -39,16 +39,15 @@ class TestNPUCudaGraphBackend(unittest.TestCase):
         backend._outputs[shape_key] = "output"
         backend._eplb_capture_states[shape_key] = {"primary": True}
 
-        recorder = mock.Mock()
         events = []
-        recorder.on_graph_replay_forward_start.side_effect = lambda state: (
-            events.append("statistics")
+        prepare_statistics = mock.Mock(
+            side_effect=lambda state: events.append("statistics")
         )
         graph.replay.side_effect = lambda: events.append("replay")
         with mock.patch.object(
-            distribution,
-            "get_global_expert_distribution_recorder",
-            return_value=recorder,
+            eplb_statistics,
+            "on_graph_replay_forward_start",
+            prepare_statistics,
         ):
             output = backend.replay_with_input_update(
                 shape_key,
@@ -56,9 +55,7 @@ class TestNPUCudaGraphBackend(unittest.TestCase):
                 attr_name="seq_lens",
                 attr_type=torch.empty(0),
             )
-        recorder.on_graph_replay_forward_start.assert_called_once_with(
-            {"primary": True}
-        )
+        prepare_statistics.assert_called_once_with({"primary": True})
         self.assertEqual(events, ["statistics", "replay"])
 
         runner.device_module.set_device.assert_called_once_with(3)

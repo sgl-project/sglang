@@ -1404,12 +1404,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
             def run_once():
                 if get_device().device == "npu":
-                    from sglang.srt.eplb.expert_distribution import (
-                        get_global_expert_distribution_recorder,
+                    from sglang.srt.hardware_backend.npu.eplb_statistics import (
+                        on_graph_capture_forward_start,
                     )
 
-                    recorder = get_global_expert_distribution_recorder()
-                    recorder.on_graph_capture_forward_start()
+                    on_graph_capture_forward_start()
                 # Debug replay retains this callback beyond the capture scope.
                 with forward_context(
                     ForwardContext(attn_backend=attn_backend),

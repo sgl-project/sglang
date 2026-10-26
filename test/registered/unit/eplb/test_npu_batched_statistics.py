@@ -8,6 +8,7 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.eplb import expert_distribution as distribution
+from sglang.srt.hardware_backend.npu import eplb_statistics
 from sglang.srt.hardware_backend.npu.eplb_statistics import (
     NpuExpertDistributionGatherer,
 )
@@ -101,10 +102,12 @@ class TestNpuBatchedStatistics(unittest.TestCase):
             "large": [(1, torch.arange(18) % 8)],
         }
         for key, routes in calls.items():
-            recorder.on_graph_capture_forward_start()
+            eplb_statistics.on_graph_capture_forward_start(recorder)
             for layer, ids in routes:
                 gatherer.on_select_experts(layer, ids)
-            backend._eplb_capture_states[key] = recorder.get_graph_capture_state()
+            backend._eplb_capture_states[key] = eplb_statistics.get_graph_capture_state(
+                recorder
+            )
 
             def replay(routes=routes):
                 # Emulate captured tensor writes without executing Python hooks.
@@ -143,8 +146,10 @@ class TestNpuBatchedStatistics(unittest.TestCase):
             )
             gatherer.reset()
             with recorder.disable_this_region():
-                self.assertEqual(recorder.get_graph_capture_state(), {})
-                recorder.on_graph_replay_forward_start({"primary": True})
+                self.assertEqual(eplb_statistics.get_graph_capture_state(recorder), {})
+                eplb_statistics.on_graph_replay_forward_start(
+                    {"primary": True}, recorder
+                )
             self.assertFalse(gatherer._has_batched_routes)
 
     def test_generated_sequences_match_independent_histogram(self):
@@ -189,7 +194,9 @@ class TestNpuBatchedStatistics(unittest.TestCase):
                 self.gatherer(capacity)
 
     def test_noop_capture_callback_is_safe(self):
-        distribution._ExpertDistributionRecorderNoop().on_graph_capture_forward_start()
+        eplb_statistics.on_graph_capture_forward_start(
+            distribution._ExpertDistributionRecorderNoop()
+        )
 
 
 if __name__ == "__main__":

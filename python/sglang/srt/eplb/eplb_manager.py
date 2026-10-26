@@ -73,14 +73,6 @@ class EPLBManager:
         self._initial_rebalance_iterations = get_initial_rebalance_iterations(
             self._rebalance_num_iterations
         )
-        if self._initial_rebalance_iterations is not None:
-            logger.info(
-                "[NPU EPLB initial learning] first=%d steady=%d window=%d",
-                self._initial_rebalance_iterations,
-                self._rebalance_num_iterations,
-                get_exec().moe.expert_distribution_recorder_buffer_size,
-            )
-
         self._main_generator = self._entrypoint()
 
     def on_forward_pass_end(self):
@@ -109,7 +101,7 @@ class EPLBManager:
             # Do not repeat the initial period if rebalance() skips this round.
             self._initial_rebalance_iterations = None
             if initial is not None:
-                logger.info("[NPU EPLB initial learning] initial period complete")
+                logger.info("[EPLBManager] initial learning period complete")
             yield from self.rebalance()
 
     def rebalance(self):

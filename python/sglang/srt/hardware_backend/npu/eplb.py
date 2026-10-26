@@ -91,6 +91,11 @@ def get_initial_rebalance_iterations(steady_iterations):
         and moe.elastic_ep_backend is None
         and steady_iterations > 64
     ):
+        logger.info(
+            "[NPU EPLB initial learning] first=64 steady=%d window=%d",
+            steady_iterations,
+            moe.expert_distribution_recorder_buffer_size,
+        )
         return 64
     return None
 

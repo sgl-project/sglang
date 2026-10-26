@@ -137,13 +137,11 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
 
         self._graphs[shape_key] = graph
         self._outputs[shape_key] = out
-        from sglang.srt.eplb.expert_distribution import (
-            get_global_expert_distribution_recorder,
+        from sglang.srt.hardware_backend.npu.eplb_statistics import (
+            get_graph_capture_state,
         )
 
-        self._eplb_capture_states[shape_key] = (
-            get_global_expert_distribution_recorder().get_graph_capture_state()
-        )
+        self._eplb_capture_states[shape_key] = get_graph_capture_state()
 
     def can_run(self, forward_batch: ForwardBatch, shape_key: ShapeKey) -> bool:
         return shape_key in self._graphs
@@ -166,11 +164,11 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         state = self._eplb_capture_states[shape_key]
         if not state:
             return
-        from sglang.srt.eplb.expert_distribution import (
-            get_global_expert_distribution_recorder,
+        from sglang.srt.hardware_backend.npu.eplb_statistics import (
+            on_graph_replay_forward_start,
         )
 
-        get_global_expert_distribution_recorder().on_graph_replay_forward_start(state)
+        on_graph_replay_forward_start(state)
 
     def replay_with_input_update(
         self,
