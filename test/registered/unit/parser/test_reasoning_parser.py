@@ -24,7 +24,7 @@ from sglang.srt.parser.reasoning_parser_names import REASONING_PARSER_NAMES
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class TestBaseReasoningFormatDetector(CustomTestCase):
@@ -1183,6 +1183,18 @@ class TestMiniMaxM3Detector(CustomTestCase):
     def test_plain_reply_untouched(self):
         result = self._detector().detect_and_parse("Just a normal answer.")
         self.assertEqual(result.normal_text, "Just a normal answer.")
+
+    def test_only_m3_declares_a_self_opened_think_start(self):
+        tokenizer = type(
+            "Tok", (), {"encode": lambda self, text, add_special_tokens: [len(text)]}
+        )()
+        self.assertEqual(
+            self._detector().get_self_opened_think_start_token_ids(tokenizer),
+            [len("<mm:think>")],
+        )
+        self.assertIsNone(
+            Qwen3Detector().get_self_opened_think_start_token_ids(tokenizer)
+        )
 
     def test_real_reasoning_block_non_stream(self):
         result = self._detector().detect_and_parse(
