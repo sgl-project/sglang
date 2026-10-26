@@ -5,6 +5,17 @@ import triton.language as tl
 
 
 @triton.jit
+def _row_offset(loc, col, PAGE, DATA, DATA_STRIDE, SCALE_BASE, SCALE_STRIDE):
+    # Byte `col` of token `loc`'s data-then-scales, from its page start; padding is untouched.
+    slot = loc % PAGE
+    return tl.where(
+        col < DATA,
+        slot * DATA_STRIDE + col,
+        SCALE_BASE + slot * SCALE_STRIDE + col - DATA,
+    )
+
+
+@triton.jit
 def _copy_packed_rows(
     src,
     dst,
@@ -17,23 +28,20 @@ def _copy_packed_rows(
     PAGE: tl.constexpr,
     DATA: tl.constexpr,
     SCALE: tl.constexpr,
+    DATA_STRIDE: tl.constexpr,
+    SCALE_BASE: tl.constexpr,
+    SCALE_STRIDE: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     row = tl.program_id(0)
     source = tl.load(src_loc + row * SRC_LOC_STRIDE).to(tl.int64)
     target = tl.load(dst_loc + row * DST_LOC_STRIDE).to(tl.int64)
     col = tl.arange(0, BLOCK)
-    # Each page contains all data rows, followed by all scale rows. Its
-    # physical stride may also contain alignment padding, which is untouched.
-    source_offset = tl.where(
-        col < DATA,
-        (source % PAGE) * DATA + col,
-        PAGE * DATA + (source % PAGE) * SCALE + col - DATA,
+    source_offset = _row_offset(
+        source, col, PAGE, DATA, DATA_STRIDE, SCALE_BASE, SCALE_STRIDE
     )
-    target_offset = tl.where(
-        col < DATA,
-        (target % PAGE) * DATA + col,
-        PAGE * DATA + (target % PAGE) * SCALE + col - DATA,
+    target_offset = _row_offset(
+        target, col, PAGE, DATA, DATA_STRIDE, SCALE_BASE, SCALE_STRIDE
     )
     value = tl.load(
         src + source // PAGE * SRC_STRIDE + source_offset,
@@ -60,6 +68,7 @@ def copy_packed_rows(src, dst, src_loc, dst_loc, *, page_size, layout):
         page_size,
         layout.data_bytes,
         layout.scale_bytes,
+        *layout.row_addressing(page_size),
         triton.next_power_of_2(layout.bytes_per_token),
         num_warps=4,
     )
@@ -80,6 +89,9 @@ def _commit_packed_rows(
     CAPACITY: tl.constexpr,
     DATA: tl.constexpr,
     SCALE: tl.constexpr,
+    DATA_STRIDE: tl.constexpr,
+    SCALE_BASE: tl.constexpr,
+    SCALE_STRIDE: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     row = tl.program_id(0)
@@ -89,15 +101,11 @@ def _commit_packed_rows(
         position = tl.load(pos + row).to(tl.int64)
         target = tl.load(req + row).to(tl.int64) * CAPACITY + position % CAPACITY
         col = tl.arange(0, BLOCK)
-        source_offset = tl.where(
-            col < DATA,
-            (source % PAGE) * DATA + col,
-            PAGE * DATA + (source % PAGE) * SCALE + col - DATA,
+        source_offset = _row_offset(
+            source, col, PAGE, DATA, DATA_STRIDE, SCALE_BASE, SCALE_STRIDE
         )
-        target_offset = tl.where(
-            col < DATA,
-            (target % PAGE) * DATA + col,
-            PAGE * DATA + (target % PAGE) * SCALE + col - DATA,
+        target_offset = _row_offset(
+            target, col, PAGE, DATA, DATA_STRIDE, SCALE_BASE, SCALE_STRIDE
         )
         value = tl.load(
             src + source // PAGE * SRC_STRIDE + source_offset,
@@ -127,6 +135,7 @@ def commit_packed_rows(src, dst, tags, window, *, page_size, capacity, layout):
         capacity,
         layout.data_bytes,
         layout.scale_bytes,
+        *layout.row_addressing(page_size),
         triton.next_power_of_2(layout.bytes_per_token),
         num_warps=4,
     )

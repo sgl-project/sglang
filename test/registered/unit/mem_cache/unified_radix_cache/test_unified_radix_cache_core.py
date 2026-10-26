@@ -1,6 +1,7 @@
 import unittest
 from array import array
 from dataclasses import replace
+from types import SimpleNamespace
 from unittest import mock
 
 import torch
@@ -14,6 +15,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     InsertParams,
     MatchPrefixParams,
+    MatchResult,
     TreeLock,
     zero_match_result,
 )
@@ -28,6 +30,7 @@ from sglang.srt.mem_cache.memory_pool import (
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.cache_action import (
+    FreeDeviceKV,
     RecoverSWAWithLockedFull,
     UpdatePendingBackupOnNodeSplit,
 )
@@ -47,8 +50,11 @@ from sglang.srt.mem_cache.unified_radix_cache import (
 )
 from sglang.srt.runtime_context import (
     get_serving,
+    publish,
+    reset_context,
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.unified_radix_cache.config import (
     CacheConfig,
@@ -1971,6 +1977,81 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
         self.assertFalse(result.cache_actions)
         cache._apply_cache_actions(result.cache_actions)
         self.assertEqual(cache._apply_cache_action.call_count, 2)
+
+    def test_match_completion_follows_actions_and_preserves_component_order(self):
+        # Match completion reads the disaggregation role from the config bags.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="scheduler")
+        cache = object.__new__(UnifiedRadixCache)
+        cache.disable = False
+        cache.session = mock.Mock()
+        cache.session.try_match_prefix.return_value = None
+        cache.tree_core = mock.Mock()
+        order = mock.Mock()
+        cache.linker = order.linker
+        cache.token_to_kv_pool_allocator = order.allocator
+        cache.components = {
+            ComponentType.SWA: order.swa,
+            ComponentType.FULL: order.full,
+            ComponentType.MAMBA: order.mamba,
+        }
+
+        def complete_match(params, result):
+            return UnifiedRadixCache._finalize_match_result(cache, params, finalized)
+
+        order.complete.side_effect = complete_match
+        cache._finalize_match_result = order.complete
+        indices = torch.tensor([4, 5])
+        for names in (("swa", "full", "mamba"), ("mamba", "swa", "full")):
+            cache._components_tuple = tuple(getattr(order, name) for name in names)
+            for req in (SimpleNamespace(rid="first"), SimpleNamespace(rid="second")):
+                with self.subTest(components=names, req=req.rid):
+                    order.reset_mock()
+                    params = MatchPrefixParams(
+                        key=RadixKey(array("q", [1, 2])), req=req
+                    )
+                    split = UpdatePendingBackupOnNodeSplit(None, 1, 2, 1)
+                    result = MatchResult(
+                        indices.numel(),
+                        1,
+                        1,
+                        1,
+                        cache_actions=[split, FreeDeviceKV([indices])],
+                        last_visited_node_id=1,
+                        full_device_match_len=1,
+                    )
+                    finalized = result._replace(device_prefix_len=1)
+                    cache.tree_core.match_prefix.return_value = result
+                    for component in cache.components.values():
+                        component.finalize_match_result_in_cache.return_value = (
+                            finalized
+                        )
+                    order.linker.match.return_value = finalized
+
+                    self.assertIs(cache.match_prefix(params), finalized)
+                    expected = [
+                        mock.call.full.apply_component_action(split),
+                        mock.call.allocator.free_segment(indices, start_pos=0),
+                        mock.call.complete(params, result),
+                    ]
+                    expected.extend(
+                        getattr(mock.call, name).finalize_match_result_in_cache(
+                            params, finalized
+                        )
+                        for name in names
+                    )
+                    expected.append(mock.call.linker.match(params.key, req, finalized))
+                    self.assertEqual(order.mock_calls, expected)
+                    received = order.complete.call_args.args
+                    self.assertIs(received[0], params)
+                    self.assertIs(received[0].req, req)
+                    self.assertIs(received[1], result)
+                    self.assertEqual(finalized.last_visited_node_id, 1)
+                    self.assertEqual(finalized.full_device_match_len, 1)
+                    self.assertEqual(result.cache_actions, [])
+                    cache._apply_cache_actions(result.cache_actions)
+                    self.assertEqual(order.mock_calls, expected)
 
     def test_chained_replace_write_through_requires_list_order(self):
         # A pending node split twice in one walk emits two chained Replaces:

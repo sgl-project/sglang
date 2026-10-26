@@ -126,12 +126,76 @@ class TestNativeMoeRoutingPolicy(CustomTestCase):
             quant_config=self.quant_config,
         )
 
+    def _implicit_bailing_policy(
+        self, kind, *, grouped=True, bias=True, renormalize=True, block_routing=False
+    ):
+        from sglang.srt.models.bailing_moe_linear import BailingMoE as LinearBailingMoE
+        from sglang.srt.models.bailing_moe_v3 import BailingMoE
+        from sglang.srt.models.llada2 import LLaDA2MoeSparseMoeBlock
+
+        factory = {
+            "v3": BailingMoE,
+            "linear": LinearBailingMoE,
+            "llada2": LLaDA2MoeSparseMoeBlock,
+        }[kind]
+        config = SimpleNamespace(
+            num_experts=8,
+            num_experts_per_tok=2,
+            num_shared_experts=None if kind == "llada2" else 0,
+            hidden_size=4,
+            moe_intermediate_size=128,
+            hidden_act="silu",
+            n_group=2 if grouped else 0,
+            topk_group=1 if grouped else 0,
+            norm_topk_prob=renormalize,
+            routed_scaling_factor=2.5,
+            moe_router_enable_expert_bias=bias,
+            score_function="sigmoid" if bias else "softmax",
+            expert_capacity=4 if block_routing else None,
+            block_size=2,
+        )
+        result = factory(config=config, layer_id=0, quant_config=self.quant_config)
+        if bias:
+            result.gate.expert_bias.data.copy_(self.bias)
+        return result
+
+    def test_implicit_fp8_policies_reach_the_actual_model_bindings(self):
+        """Existing FP8 defaults remain native only for equivalent model routers."""
+        for kind in ("v3", "linear", "llada2"):
+            with self.subTest(kind=kind):
+                block = self._implicit_bailing_policy(kind)
+                output = self._native_output(block)
+                scores = self.logits[:, 4:6].sigmoid()
+                weights = scores / scores.sum(-1, keepdim=True) * 2.5
+                torch.testing.assert_close(
+                    output,
+                    self._weighted_experts(torch.tensor([[4, 5]]), weights, output),
+                )
+            for grouped, bias, renormalize in (
+                (False, False, True),
+                (True, False, True),
+                (True, True, False),
+            ):
+                with self.subTest(
+                    kind=kind, grouped=grouped, bias=bias, renormalize=renormalize
+                ):
+                    block = self._implicit_bailing_policy(
+                        kind, grouped=grouped, bias=bias, renormalize=renormalize
+                    )
+                    self.assertEqual(
+                        block.topk.topk_config.output_format, TopKOutputFormat.STANDARD
+                    )
+        with self.assertRaisesRegex(
+            ValueError, "block routing does not support.*flashinfer_trtllm"
+        ):
+            self._implicit_bailing_policy("llada2", block_routing=True)
+
     @staticmethod
     def _weighted_experts(ids, weights, hidden_states):
         values = ids.float() + 1
         return (values * weights).sum(dim=-1, keepdim=True).expand_as(hidden_states)
 
-    def _native_output(self, block):
+    def _native_output(self, block, *, block_quant=True):
         from sglang.srt.layers.moe.moe_runner import flashinfer_trtllm
 
         hidden_states = torch.ones((1, 4))
@@ -142,10 +206,15 @@ class TestNativeMoeRoutingPolicy(CustomTestCase):
         policy = block.experts.routing_method_type
         self.assertEqual(block.experts.moe_runner_config.routing_method_type, policy)
 
-        def native_kernel(*, routing_logits, routing_method_type, output, **kwargs):
+        def native_kernel(
+            *, routing_logits, routing_method_type, output=None, **kwargs
+        ):
             self.assertEqual(routing_method_type, policy)
+            if not block_quant:
+                self.assertEqual(routing_logits.dtype, torch.bfloat16)
+                self.assertFalse(kwargs["use_routing_scales_on_input"])
             if routing_method_type == RoutingMethodType.DeepSeekV3:
-                scores = routing_logits.sigmoid()
+                scores = routing_logits.float().sigmoid()
                 choices = scores + kwargs["routing_bias"]
                 group_scores = choices.reshape(1, 2, 4).topk(2, dim=-1).values.sum(-1)
                 selected = group_scores.argmax(-1).item()
@@ -153,15 +222,18 @@ class TestNativeMoeRoutingPolicy(CustomTestCase):
                 ids = ids + selected * 4
                 weights = scores.gather(1, ids)
             elif routing_method_type == RoutingMethodType.SigmoidRenorm:
-                weights, ids = routing_logits.sigmoid().topk(2)
+                weights, ids = routing_logits.float().sigmoid().topk(2)
             else:
                 self.assertEqual(
                     routing_method_type, RoutingMethodType.RenormalizeNaive
                 )
-                weights, ids = routing_logits.softmax(-1).topk(2)
+                weights, ids = routing_logits.float().softmax(-1).topk(2)
             weights = weights / weights.sum(-1, keepdim=True)
             weights = weights * kwargs["routed_scaling_factor"]
-            output.copy_(self._weighted_experts(ids, weights, hidden_states))
+            result = self._weighted_experts(ids, weights, hidden_states)
+            if output is None:
+                return result.to(torch.bfloat16)
+            output.copy_(result)
 
         quant_info = flashinfer_trtllm.FlashInferTrtllmFp8MoeQuantInfo(
             w13_weight=torch.empty(8, 256, 4),
@@ -171,10 +243,14 @@ class TestNativeMoeRoutingPolicy(CustomTestCase):
             local_num_experts=8,
             intermediate_size=128,
             routing_method_type=policy,
-            block_quant=True,
+            block_quant=block_quant,
             weight_block_k=128,
             w13_weight_scale_inv=torch.ones(8, 2, 1),
             w2_weight_scale_inv=torch.ones(8, 1, 1),
+            w13_input_scale=torch.ones(1),
+            output1_scales_scalar=torch.ones(8),
+            output1_scales_gate_scalar=torch.ones(8),
+            output2_scales_scalar=torch.ones(8),
         )
         provider = ModuleType("flashinfer.fused_moe")
         provider.Fp8QuantizationType = SimpleNamespace(MxFp8=1, DeepSeekFp8=0)
@@ -190,12 +266,33 @@ class TestNativeMoeRoutingPolicy(CustomTestCase):
                 "trtllm_fp8_block_scale_moe_out_wrapper",
                 side_effect=native_kernel,
             ),
+            patch.object(
+                flashinfer_trtllm,
+                "scaled_fp8_quant",
+                return_value=(hidden_states, torch.ones(1)),
+            ),
+            patch.object(
+                flashinfer_trtllm,
+                "trtllm_fp8_per_tensor_scale_moe_wrapper",
+                side_effect=native_kernel,
+            ),
         ):
             return flashinfer_trtllm.fused_experts_none_to_flashinfer_trtllm_fp8(
                 StandardDispatchOutput(hidden_states, None, routing),
                 quant_info,
                 block.experts.moe_runner_config,
             ).hidden_states
+
+    def test_unpadded_per_tensor_fp8_keeps_the_logits_policy_and_scale(self):
+        """The routed adapter must not alter an admitted logits-only invocation."""
+        block = self._implicit_bailing_policy("v3")
+        output = self._native_output(block, block_quant=False)
+        scores = self.logits[:, 4:6].sigmoid()
+        weights = scores / scores.sum(-1, keepdim=True) * 2.5
+        expected = self._weighted_experts(torch.tensor([[4, 5]]), weights, output).to(
+            torch.bfloat16
+        )
+        torch.testing.assert_close(output, expected, rtol=0, atol=0)
 
     def test_mimo_grouped_bias_retains_native_selection_and_weights(self):
         """Equivalent grouped routing must not incur materialized dispatch."""
