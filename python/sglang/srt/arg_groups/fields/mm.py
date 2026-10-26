@@ -69,7 +69,9 @@ class Mm(msgspec.Struct):
     mm_process_config: A[
         Optional[Dict[str, Any]],
         Arg(
-            help="Multimodal preprocessing config, a json config contains keys: `image`, `video`, `audio`",
+            help="Multimodal preprocessing config, a json config contains keys: `image`, `video`, `audio`, "
+            "and `processor_class_attributes`, which overrides the token-space processor's class attributes "
+            '(e.g. `{"video_preprocessing_device": "cpu"}`)',
             type_parser=json.loads,
         ),
     ] = None
