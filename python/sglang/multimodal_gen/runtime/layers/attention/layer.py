@@ -2410,13 +2410,20 @@ def _make_breakable_attention_forward(forward_method):
     """
 
     @eager_on_graph
-    def bcg_forward(self, out, *args, **kwargs):
+    def bcg_forward(self, *args, out, **kwargs):
         result = forward_method(self, *args, **kwargs)
         outs, results = (out, result) if isinstance(out, tuple) else ((out,), (result,))
         for dst, src in zip(outs, results, strict=True):
-            assert (dst is None) == (src is None), "BCG attention output mispredicted"
-            if dst is not None:
-                dst.copy_(src)
+            if dst is None and src is None:
+                continue
+            # copy_ would broadcast a mispredicted shape or cast a dtype silently.
+            assert (
+                dst is not None
+                and src is not None
+                and dst.shape == src.shape
+                and dst.dtype == src.dtype
+            ), "BCG attention output mispredicted"
+            dst.copy_(src)
 
     @functools.wraps(forward_method)
     def forward(self, *args, **kwargs):
@@ -2436,7 +2443,7 @@ def _make_breakable_attention_forward(forward_method):
             )
             if not capture_dense:
                 out = self._new_bcg_output(*args, **kwargs)
-                bcg_forward(self, out, *args, **kwargs)
+                bcg_forward(self, *args, **kwargs, out=out)
                 return out
         return forward_method(self, *args, **kwargs)
 
