@@ -1,7 +1,7 @@
 """Restore ``tl.make_block_ptr`` / ``tl.advance`` on Triton builds that removed them.
 
-The FLA and MiniMax sparse attention kernels use block pointers, which
-triton-lang/triton#10833 (Triton 3.9) removed. On such builds this rebuilds them
+The FLA kernels use block pointers, which triton-lang/triton#10833 (Triton 3.9)
+removed. On such builds this rebuilds them
 on plain pointer loads and stores, the same way Triton 3.8 lowered them. Older
 Triton is left untouched.
 """
