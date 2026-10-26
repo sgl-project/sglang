@@ -24,6 +24,10 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_fia_nz,
     is_mla_preprocess_enabled,
 )
+from sglang.srt.hardware_backend.npu.attention.spec_step_geometry import (
+    draft_step_kv_offset,
+    draft_step_query_lens,
+)
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     get_sparsity_driven_kv_offload_sparse_context_len,
     is_sparsity_driven_kv_offload_enabled,
@@ -311,14 +315,26 @@ def _cp_allgather_and_save_kv_npu(
 
 
 class AscendAttnBackend(AttentionBackend):
-    def __init__(self, model_runner: ModelRunner, speculative_step_id: int = 0):
+    def __init__(
+        self,
+        model_runner: ModelRunner,
+        speculative_step_id: int = 0,
+        speculative_topk: int = 1,
+    ):
         super().__init__()
         self.forward_metadata = None
         self.device = model_runner.device
         self.is_draft_worker = model_runner.is_draft_worker
         self.speculative_step_id = speculative_step_id
+        # Tree width of the draft. One draft step writes `speculative_topk` KV
+        # slots per request, so a step's live window and its query split both
+        # scale with it; at topk == 1 these reduce to the chain values.
+        self.speculative_topk = max(1, int(speculative_topk))
+        self.speculative_step_offset = draft_step_kv_offset(
+            speculative_step_id, self.speculative_topk
+        )
         self.speculative_step_offset_npu = torch.tensor(
-            speculative_step_id + 1, device="npu"
+            self.speculative_step_offset, device="npu"
         )
         self.page_size = model_runner.page_size
         self.model_dtype = model_runner.model_config.dtype
@@ -553,7 +569,7 @@ class AscendAttnBackend(AttentionBackend):
                 and forward_batch.spec_info is not None
             ):
                 seq_lens_max = forward_batch.seq_lens.max()
-                seq_lens_max += self.speculative_step_id + 1
+                seq_lens_max += self.speculative_step_offset
             else:
                 seq_lens_max = forward_batch.seq_lens.max()
             self.forward_metadata.block_tables = (
@@ -617,7 +633,7 @@ class AscendAttnBackend(AttentionBackend):
             forward_batch.forward_mode.is_decode_or_idle()
             and forward_batch.spec_info is not None
         ):
-            self.forward_metadata.seq_lens_cpu_int += self.speculative_step_id + 1
+            self.forward_metadata.seq_lens_cpu_int += self.speculative_step_offset
 
         # Set actual_seq_lengths_q from the pre-pad batch size so that the DSA
         # indexer reads a value consistent with actual_seq_lengths_kv /
@@ -643,8 +659,13 @@ class AscendAttnBackend(AttentionBackend):
                 device=self.device,
             )
         elif forward_batch.forward_mode.is_decode_or_idle():
+            # One query per request for plain decode; speculative_topk rows
+            # per request during a draft step, because every tree candidate is
+            # its own TND query row.
             self.forward_metadata.actual_seq_lengths_q = torch.tensor(
-                [1 + i for i in range(forward_batch.seq_lens.shape[0])],
+                draft_step_query_lens(
+                    forward_batch.seq_lens.shape[0], self.speculative_topk
+                ),
                 dtype=torch.int32,
                 device=self.device,
             )
@@ -860,8 +881,10 @@ class AscendAttnBackend(AttentionBackend):
                 device=seq_lens.device,
             )
         else:
+            # Same as the eager path: a draft step contributes one query row per
+            # tree candidate, plain decode one per request.
             metadata.actual_seq_lengths_q = torch.tensor(
-                [1 + i for i in range(bs)],
+                draft_step_query_lens(bs, self.speculative_topk),
                 dtype=torch.int32,
                 device=seq_lens.device,
             )
@@ -937,7 +960,7 @@ class AscendAttnBackend(AttentionBackend):
                 )
             elif forward_mode.is_decode_or_idle() and spec_info is not None:
                 attention_kv_lens_cpu = (
-                    attention_kv_lens_cpu + self.speculative_step_id + 1
+                    attention_kv_lens_cpu + self.speculative_step_offset
                 )
             max_len = attention_kv_lens_cpu.max().item()
             max_seq_pages = (max_len + self.page_size - 1) // self.page_size
@@ -3516,7 +3539,11 @@ class AscendAttnMultiStepDraftBackend:
         self.attn_backends = []
         for step_id in range(self.speculative_num_steps):
             self.attn_backends.append(
-                AscendAttnBackend(model_runner, speculative_step_id=step_id)
+                AscendAttnBackend(
+                    model_runner,
+                    speculative_step_id=step_id,
+                    speculative_topk=topk,
+                )
             )
         self.needs_cpu_seq_lens = any(b.needs_cpu_seq_lens for b in self.attn_backends)
 

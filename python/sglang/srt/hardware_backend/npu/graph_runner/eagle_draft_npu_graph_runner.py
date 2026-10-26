@@ -23,6 +23,9 @@ from sglang.srt.configs.model_config import (
     is_deepseek_dsa,
     is_deepseek_v4,
 )
+from sglang.srt.hardware_backend.npu.attention.spec_step_geometry import (
+    draft_step_kv_offset,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
@@ -91,9 +94,11 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
         hf_config = self.model_runner.model_config.hf_config
         if not (is_deepseek_dsa(hf_config) or is_deepseek_v4(hf_config)):
             seq_lens_for_each_draft_step = []
+            topk = max(1, int(self.topk or 1))
             for speculative_step_id in range(self.speculative_num_steps - 1):
                 seq_lens_cpu = (
-                    forward_batch.seq_lens_cpu[: self.raw_bs] + speculative_step_id + 1
+                    forward_batch.seq_lens_cpu[: self.raw_bs]
+                    + draft_step_kv_offset(speculative_step_id, topk)
                 )
                 seq_lens = seq_lens_cpu.tolist() + [0] * (self.bs - self.raw_bs)
                 seq_lens_for_each_draft_step.append(seq_lens)
