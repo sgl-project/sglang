@@ -21,8 +21,28 @@ from contextlib import nullcontext
 import torch
 
 from sglang.srt.eplb import expert_distribution as distribution
+from sglang.srt.hardware_backend.npu.eplb import get_eplb_device_group
 
 logger = logging.getLogger(__name__)
+
+
+class _NpuAccumulatorMixin:
+    # Resolve lazily so distributed initialization and WORLD replacement remain valid.
+    @property
+    def _eplb_group(self):
+        return get_eplb_device_group()
+
+    @property
+    def _utilization_device(self):
+        return distribution.get_device_namespace().device
+
+
+class NpuStatAccumulator(_NpuAccumulatorMixin, distribution._StatAccumulator):
+    pass
+
+
+class NpuDetailAccumulator(_NpuAccumulatorMixin, distribution._DetailAccumulator):
+    pass
 
 
 class NpuExpertDistributionRecorder(distribution._ExpertDistributionRecorderReal):

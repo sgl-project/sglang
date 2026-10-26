@@ -1,6 +1,7 @@
 # Ascend dynamic EPLB: validation scope
 
-Status as of 2026-10-26, after isolating NPU adapters from CUDA execution.
+Status as of 2026-10-26, after consolidating NPU adapters at factories and
+the migration entry point.
 Community base: `de7055f59645ebe03784b0980e1f222789f468a3`.
 
 ## Implementation scope
@@ -16,11 +17,11 @@ EPLB manager and decode graph runner are unchanged from the base.
 
 ## Validation status
 
-| Check | Status after GPU-path isolation |
+| Check | Status after adapter consolidation |
 | --- | --- |
 | Source and call-chain review | Completed; this is not execution validation. |
 | Formatting and static checks during cleanup | Completed; no functional result is implied. |
-| CPU unit tests and GPU regression after GPU-path isolation | Not run. |
+| CPU unit tests and GPU regression after adapter consolidation | Not run. |
 | NPU graph execution and HCCL weight migration after cleanup | Not run. |
 | Full-model correctness, PD acceptance, and performance after cleanup | Not run. |
 
@@ -37,6 +38,6 @@ retain earlier source identities, CPU/NPU results, performance tables,
 screenshots, and failure records. The report's references to "current source"
 describe those historical revisions, not this PR head.
 
-Those runs preceded subsequent cleanup, GPU-path isolation, and removal of the
+Those runs preceded subsequent cleanup, adapter consolidation, and removal of the
 initial learning policy. They are not validation of this implementation, and
 no throughput gain or full-model accuracy result is claimed for it.

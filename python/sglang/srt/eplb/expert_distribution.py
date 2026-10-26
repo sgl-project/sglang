@@ -56,8 +56,6 @@ from sglang.srt.runtime_context import (
 from sglang.srt.utils import Withable, get_device, get_int_env_var, is_npu
 
 _is_npu = is_npu()
-if _is_npu:
-    from sglang.srt.hardware_backend.npu.eplb import get_eplb_device_group
 
 if TYPE_CHECKING:
     from sglang.srt.eplb.expert_location import ExpertLocationMetadata
@@ -754,11 +752,20 @@ class _Accumulator(ABC):
 
     @staticmethod
     def get_class() -> Type[_Accumulator]:
+        if _is_npu:
+            from sglang.srt.hardware_backend.npu.eplb_statistics import (
+                NpuDetailAccumulator,
+                NpuStatAccumulator,
+            )
+
+            stat_cls, detail_cls = NpuStatAccumulator, NpuDetailAccumulator
+        else:
+            stat_cls, detail_cls = _StatAccumulator, _DetailAccumulator
         return {
-            "stat": _StatAccumulator,
-            "stat_approx": _StatAccumulator,
-            "per_pass": _DetailAccumulator,
-            "per_token": _DetailAccumulator,
+            "stat": stat_cls,
+            "stat_approx": stat_cls,
+            "per_pass": detail_cls,
+            "per_token": detail_cls,
         }[get_exec().moe.expert_distribution_recorder_mode]
 
     def __init__(
@@ -792,6 +799,9 @@ class _Accumulator(ABC):
 
 
 class _UtilizationRateAccumulatorMixin(_Accumulator):
+    _eplb_group = None
+    _utilization_device = "cuda"
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
@@ -845,7 +855,7 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
             gpu_physical_count,
             dst=0,
             op=torch.distributed.ReduceOp.SUM,
-            group=get_eplb_device_group() if _is_npu else None,
+            group=self._eplb_group,
         )
 
         if self._rank == 0:
@@ -1015,7 +1025,7 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
         torch.distributed.all_reduce(
             logical_count_of_buffered_step,
             op=torch.distributed.ReduceOp.SUM,
-            group=get_eplb_device_group() if _is_npu else None,
+            group=self._eplb_group,
         )
 
         output = dict(
@@ -1050,17 +1060,15 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             avg_rate_tensor = torch.tensor(
                 [average_utilization_rate_over_window],
                 dtype=torch.float32,
-                device=get_device_namespace().device if _is_npu else "cuda",
+                device=self._utilization_device,
             )
         else:
             avg_rate_tensor = torch.empty(
                 1,
                 dtype=torch.float32,
-                device=get_device_namespace().device if _is_npu else "cuda",
+                device=self._utilization_device,
             )
-        torch.distributed.broadcast(
-            avg_rate_tensor, src=0, group=get_eplb_device_group() if _is_npu else None
-        )
+        torch.distributed.broadcast(avg_rate_tensor, src=0, group=self._eplb_group)
         return avg_rate_tensor.item()
 
 

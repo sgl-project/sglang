@@ -23,7 +23,6 @@ from functools import wraps
 
 import torch
 import torch.distributed as dist
-from torch.distributed import P2POp
 
 from sglang.srt.runtime_context import get_device
 from sglang.srt.utils import is_npu
@@ -62,27 +61,35 @@ def get_eplb_device_group() -> dist.ProcessGroup | None:
     return _device_group
 
 
-def execute_p2p_ops(ops: list[P2POp]) -> None:
-    """Wait for one P2P batch, then copy staged receives back to their targets.
+def prepare_expert_weight_update(weights_by_layer, layer_ids, old_map, new_map, update):
+    """Prepare one NPU migration chunk while reusing the shared slot algorithm."""
+    from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 
-    The main updater already stages whole NZ layers. Keep this fallback for
-    callers of update_expert_weights_single_layer that pass internal views.
-    """
-    staged_ops, receive_copies = [], []
-    for op in ops:
-        tensor = op.tensor
-        if needs_nd_staging(tensor):
-            buffer = torch.empty(tensor.shape, dtype=tensor.dtype, device=tensor.device)
-            if op.op == torch.distributed.isend:
-                buffer.copy_(tensor)
-            else:
-                receive_copies.append((tensor, buffer))
-            op = P2POp(op.op, buffer, op.peer, op.group, op.tag)
-        staged_ops.append(op)
-    for request in dist.batch_isend_irecv(staged_ops):
-        request.wait()
-    for target, buffer in receive_copies:
-        target.copy_(buffer)
+    if ElasticEPStateManager.instance() is None:
+        # A rank with unchanged local slots may still need to send to another rank.
+        layer_ids = [
+            layer
+            for layer in layer_ids
+            if not torch.equal(old_map[layer], new_map[layer])
+        ]
+    if not layer_ids:
+        return layer_ids, None, None
+
+    sample = weights_by_layer[layer_ids[0]]
+    temp_buffers = create_temp_buffers(sample)
+    staging = ExpertWeightStaging(sample)
+    group = get_eplb_device_group()
+
+    def update_layer(*, routed_experts_weights, **kwargs):
+        result = update(
+            routed_experts_weights=staging.load(routed_experts_weights),
+            group=group,
+            **kwargs,
+        )
+        staging.store(routed_experts_weights)
+        return result
+
+    return layer_ids, temp_buffers, update_layer
 
 
 def needs_nd_staging(tensor: torch.Tensor) -> bool:
@@ -92,15 +99,6 @@ def needs_nd_staging(tensor: torch.Tensor) -> bool:
     import torch_npu
 
     return torch_npu.get_npu_format(tensor) not in (0, 2)
-
-
-def filter_unchanged_layers(layer_ids, old_map, new_map, *, elastic_enabled):
-    if get_device().device != "npu" or elastic_enabled:
-        return layer_ids
-    # Check global maps: an unchanged local rank may still be a sender.
-    return [
-        layer for layer in layer_ids if not torch.equal(old_map[layer], new_map[layer])
-    ]
 
 
 def create_temp_buffers(sample_tensors: list[torch.Tensor]) -> list[torch.Tensor]:
