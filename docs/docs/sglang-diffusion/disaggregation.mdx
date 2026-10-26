@@ -437,6 +437,22 @@ pip install mooncake-transfer-engine
 
 Decoder results (final output) flow back through DiffusionServer as raw ZMQ frames to the HTTP client.
 
+### Failure Isolation
+
+The head rejects malformed scheduler requests and duplicate active request IDs
+without replacing the original request. Each scheduler message carries one
+request; use concurrent API calls for independent requests, or `n` for multiple
+outputs from one request.
+
+Tensor decoding errors fail only the associated request when its ID can be
+recovered. Results without an identifiable request are logged and discarded;
+affected requests still rely on `--disagg-timeout`. Reported worker errors release
+their scheduling capacity and reserved receive slots so later requests can run.
+
+Keep scheduler and worker ports on a trusted private network. This error handling
+does not make the pickle-based scheduler protocol safe for untrusted clients, or
+provide durable jobs and transparent recovery after a head restart.
+
 ### RDMA Flags
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>

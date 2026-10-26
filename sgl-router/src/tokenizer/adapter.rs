@@ -469,6 +469,18 @@ impl ModelFiles {
             .map(|text| serde_json::from_str(&text).with_context(|| format!("parse {file}")))
             .transpose()
     }
+
+    /// The text of the tokenizer [`load`] builds from: `source` itself when it
+    /// names a local file (whatever it is called), otherwise the HF repo's
+    /// `tokenizer.json`; `None` when the repo ships none.
+    pub fn tokenizer_text(&self) -> Result<Option<String>> {
+        if Path::new(&self.source).is_file() {
+            return std::fs::read_to_string(&self.source)
+                .with_context(|| format!("read {}", self.source))
+                .map(Some);
+        }
+        self.text("tokenizer.json")
+    }
 }
 
 pub fn encode(t: &Tokenizer, text: &str) -> Result<Vec<u32>> {
@@ -537,6 +549,28 @@ mod model_files_tests {
         let files = ModelFiles::open(tokenizer.to_str().unwrap());
         let error = files.json("config.json").unwrap_err();
         assert!(error.to_string().contains("config.json"));
+    }
+
+    /// The tokenizer text is the file `source` names, however it is called,
+    /// never a differently named sibling.
+    #[test]
+    fn tokenizer_text_follows_the_source_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let named = dir.path().join("tiny_tokenizer.json");
+        let sibling = dir.path().join("tokenizer.json");
+        std::fs::write(&named, r#"{"named":true}"#).unwrap();
+        std::fs::write(&sibling, r#"{"sibling":true}"#).unwrap();
+
+        let files = ModelFiles::open(named.to_str().unwrap());
+        assert_eq!(
+            files.tokenizer_text().unwrap().as_deref(),
+            Some(r#"{"named":true}"#)
+        );
+        let files = ModelFiles::open(sibling.to_str().unwrap());
+        assert_eq!(
+            files.tokenizer_text().unwrap().as_deref(),
+            Some(r#"{"sibling":true}"#)
+        );
     }
 }
 

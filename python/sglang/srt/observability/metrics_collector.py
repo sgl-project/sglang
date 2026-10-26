@@ -168,6 +168,9 @@ class SchedulerStats:
     # HiCache metrics
     hicache_host_used_tokens: int = 0
     hicache_host_total_tokens: int = 0
+    # Host Mamba state pool of hybrid-SSM models; stays 0/0 when there is none.
+    hicache_host_mamba_used_states: int = 0
+    hicache_host_mamba_total_states: int = 0
 
     # Streaming session metrics
     num_streaming_sessions: int = 0
@@ -773,6 +776,18 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             self.hicache_host_total_tokens = Gauge(
                 name="sglang:hicache_host_total_tokens",
                 documentation="Total capacity of the host KV cache in tokens.",
+                labelnames=labels.keys(),
+                multiprocess_mode="mostrecent",
+            )
+            self.hicache_host_mamba_used_states = Gauge(
+                name="sglang:hicache_host_mamba_used_states",
+                documentation="Number of state slots currently used in the host Mamba cache (hybrid-SSM models only).",
+                labelnames=labels.keys(),
+                multiprocess_mode="mostrecent",
+            )
+            self.hicache_host_mamba_total_states = Gauge(
+                name="sglang:hicache_host_mamba_total_states",
+                documentation="Total capacity of the host Mamba cache in state slots (hybrid-SSM models only).",
                 labelnames=labels.keys(),
                 multiprocess_mode="mostrecent",
             )
@@ -1719,6 +1734,17 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             self._log_gauge(
                 self.hicache_host_total_tokens, stats.hicache_host_total_tokens
             )
+            # Non-hybrid models have no host Mamba pool; skip the series rather
+            # than exporting a permanent 0/0.
+            if stats.hicache_host_mamba_total_states > 0:
+                self._log_gauge(
+                    self.hicache_host_mamba_used_states,
+                    stats.hicache_host_mamba_used_states,
+                )
+                self._log_gauge(
+                    self.hicache_host_mamba_total_states,
+                    stats.hicache_host_mamba_total_states,
+                )
 
         # Streaming session metrics
         if self.enable_streaming_session:
@@ -1773,6 +1799,24 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self._log_gauge(
             self.startup_available_gpu_memory_gb, startup_available_gpu_memory_gb
         )
+
+
+def tokenizer_metric_labels() -> Dict[str, str]:
+    """The labels on every ``TokenizerMetricsCollector`` metric. The priority
+    and custom labels start empty; each request fills them in."""
+    labels = {
+        "model_name": get_serving().served_model_name,
+        "engine_type": DisaggregationMode.to_engine_type(
+            get_disagg().disaggregation_mode
+        ),
+    }
+    if get_schedule().enable_priority_scheduling:
+        labels["priority"] = ""
+    for label in get_observability().tokenizer_metrics_allowed_custom_labels or ():
+        labels[label] = ""
+    if get_observability().extra_metric_labels:
+        labels.update(get_observability().extra_metric_labels)
+    return labels
 
 
 class TokenizerMetricsCollector(_StatLoggerDIMixin):
