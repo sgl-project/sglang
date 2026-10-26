@@ -70,16 +70,31 @@ def _worker(mode):
             if mode == "sp":
                 for skip in ((), (0,), (1,)):
                     expected = reference(x, timestep, text, skip_layers=skip)
+                    pipeline = MOSSImagePipelineConfig(dit_config=config)
+                    stage = object.__new__(MOSSImageDenoisingStage)
+                    stage.server_args = SimpleNamespace(pipeline_config=pipeline)
+                    batch = SimpleNamespace(latents=x, image_latent=None)
+                    stage._preprocess_sp_latents(batch, stage.server_args)
+                    assert batch.latents is x
+                    assert not batch.did_sp_shard_latents
                     prepared = candidate.prepare_conditioning(
-                        text, None, 2, 3, torch.float32, batch_samples=True
+                        text,
+                        None,
+                        *batch.latents.shape[-2:],
+                        torch.float32,
+                        batch_samples=True,
                     )
                     actual = candidate(
-                        x,
+                        batch.latents,
                         timestep,
                         text,
                         prepared_conditioning=prepared,
                         skip_layers=skip,
                     )
+                    actual, trajectory = stage._postprocess_sp_latents(
+                        batch, actual, None
+                    )
+                    assert trajectory is None
                     torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
             else:
                 pipeline = MOSSImagePipelineConfig(dit_config=config)
