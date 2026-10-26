@@ -472,12 +472,6 @@ class FlashAttentionForwardSm100:
             self.load_warp_ids = (14, 15)
             self.empty_warp_ids = ()
 
-        self.tmem_alloc_warp_ids = (
-            self.mma_warp_id,
-            *self.softmax0_warp_ids,
-            *self.softmax1_warp_ids,
-            *self.correction_warp_ids,
-        )
         if self.use_correction_warps_for_epi:
             self.empty_warp_ids = self.empty_warp_ids + self.epilogue_warp_ids
             self.epilogue_warp_ids = self.correction_warp_ids
@@ -1762,7 +1756,15 @@ class FlashAttentionForwardSm100:
 
         tmem_alloc_barrier = pipeline.NamedBarrier(
             barrier_id=int(NamedBarrierFwdSm100.TmemPtr),
-            num_threads=cute.arch.WARP_SIZE * len(self.tmem_alloc_warp_ids),
+            num_threads=cute.arch.WARP_SIZE
+            * len(
+                (
+                    self.mma_warp_id,
+                    *self.softmax0_warp_ids,
+                    *self.softmax1_warp_ids,
+                    *self.correction_warp_ids,
+                )
+            ),
         )
         # Tensor memory dealloc barrier init
         tmem = cutlass.utils.TmemAllocator(
@@ -2230,11 +2232,11 @@ class FlashAttentionForwardSm100:
         # ///////////////////////////////////////////////////////////////////////////////
         #  MMA
         # ///////////////////////////////////////////////////////////////////////////////
-        tmem.allocate(cute.arch.get_max_tmem_alloc_cols("sm_100"))
-        if warp_idx in self.tmem_alloc_warp_ids:
-            tmem.wait_for_alloc()
         if warp_idx == self.mma_warp_id:
             cute.arch.setmaxregister_decrease(self.num_regs_other)
+            # Alloc tensor memory buffer
+            tmem.allocate(cute.arch.get_max_tmem_alloc_cols("sm_100"))
+            tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(self.qk_acc_dtype)
             self.mma(
                 tiled_mma_qk,
@@ -2301,6 +2303,8 @@ class FlashAttentionForwardSm100:
         ) or (const_expr(self.q_stage == 1) and warp_idx <= self.softmax0_warp_ids[-1]):
             # increase register after decreasing
             cute.arch.setmaxregister_increase(self.num_regs_softmax)
+            # sync with mma warp before retrieving tmem ptr
+            tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(self.qk_acc_dtype)
             softmax_loop = partial(
                 self.softmax_loop,
@@ -2356,6 +2360,8 @@ class FlashAttentionForwardSm100:
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx >= self.correction_warp_ids[0] and warp_idx < self.mma_warp_id:
             cute.arch.setmaxregister_decrease(self.num_regs_correction)
+            # sync with mma warp before retrieving tmem ptr
+            tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(self.qk_acc_dtype)
             self.correction_loop(
                 thr_mma_qk,
@@ -4793,7 +4799,6 @@ class FlashAttentionForwardSm100:
                     else:
                         row_max = None
                     pipeline_sm_stats.consumer_release_w_index(stage)
-                    sink_rescale = Float32(1.0)
                     if const_expr(learnable_sink is not None):
                         LOG2_E = math.log2(math.e)
                         sink_val = learnable_sink_val[stage]
@@ -4803,22 +4808,18 @@ class FlashAttentionForwardSm100:
                                 row_max = sink_val * (LOG2_E / softmax_scale_log2_eff)
                                 row_sum = max_offset_scale
                             else:
-                                old_max_log2 = row_max * softmax_scale_log2_eff
-                                new_max_log2 = max(old_max_log2, sink_val * LOG2_E)
-                                sink_rescale = cute.math.exp2(
-                                    old_max_log2 - new_max_log2, fastmath=True
-                                )
-                                row_sum = row_sum * sink_rescale + cute.math.exp2(
-                                    sink_val * LOG2_E - new_max_log2 + max_offset,
+                                row_sum += cute.math.exp2(
+                                    sink_val * LOG2_E
+                                    - row_max * softmax_scale_log2_eff
+                                    + max_offset,
                                     fastmath=True,
                                 )
-                                row_max = new_max_log2 / softmax_scale_log2_eff
                     acc_O_mn_row_is_zero_or_nan = row_sum == 0.0 or row_sum != row_sum
                     stats[stage] = (row_sum, row_max, acc_O_mn_row_is_zero_or_nan)
                     scale = cute.arch.rcp_approx(
                         row_sum if not acc_O_mn_row_is_zero_or_nan else 1.0
                     )
-                    scale = scale * sink_rescale * v_descale
+                    scale = scale * v_descale
                     # Wait for the last O to be ready from the MMA warp
                     pipeline_o_acc.consumer_wait_w_index_phase(
                         stage, o_corr_consumer_phase
