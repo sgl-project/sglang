@@ -35,7 +35,7 @@ _AUTO_BACKEND = (
 
 _IS_CUDA = is_cuda()
 _DEVICE_SM = get_device_sm()
-# Measured on GB300 against the bf16 small-M path: the W8A16 kernel is at least as fast up to 16 tokens.
+# The kernel's limit: two 8-token MMA tiles.
 _FP8_MAX_TOKENS = 16
 # (N, K) of the block-FP8 self_attn projections served by the W8A16 kernel (GLM-5.2 TP4 shards, incl. indexer wq_b).
 _FP8_SMALL_M_SHAPES = frozenset(

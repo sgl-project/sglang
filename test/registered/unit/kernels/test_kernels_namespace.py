@@ -21,6 +21,7 @@ register_cpu_ci(est_time=26, suite="base-a-test-cpu")
 _CPU = PlatformInfo(device_type="cpu")
 _SM90 = PlatformInfo(device_type="cuda", cuda_arch_major=9, cuda_arch_minor=0)
 _SM100 = PlatformInfo(device_type="cuda", cuda_arch_major=10, cuda_arch_minor=0)
+_SM103 = PlatformInfo(device_type="cuda", cuda_arch_major=10, cuda_arch_minor=3)
 _HIP = PlatformInfo(device_type="hip")
 _MUSA = PlatformInfo(device_type="musa")
 
@@ -86,6 +87,16 @@ def test_unknown_op_or_backend_raises():
 )
 def test_qwen_qkv_registry_accepts_hopper(platform, eligible):
     spec = K.select_kernel("diffusion.qwen_qkv_epilogue")
+    assert spec.backend is KernelBackend.JIT
+    assert K.capabilities_satisfied(spec.capabilities, platform) is eligible
+
+
+@pytest.mark.parametrize(
+    "platform, eligible",
+    [(_SM103, True), (_SM100, False), (_SM90, False), (_CPU, False), (_HIP, False)],
+)
+def test_fused_a_gemm_fp8_registry_is_sm103_only(platform, eligible):
+    spec = K.select_kernel("gemm.dsv3_fused_a_gemm_fp8")
     assert spec.backend is KernelBackend.JIT
     assert K.capabilities_satisfied(spec.capabilities, platform) is eligible
 

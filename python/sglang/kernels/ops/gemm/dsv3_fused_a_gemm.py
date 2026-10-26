@@ -144,8 +144,8 @@ def dsv3_fused_a_gemm_fp8(
     """Compute ``input[M,K] @ dequant(weight[N,K]).T``; BF16 input/output.
 
     FP8 weights are widened exactly in registers; K=128 FP32 partial sums are scaled
-    per block. On the FP16-operand shapes the BF16 activations are converted in
-    registers and must stay within +-65504.
+    per block. On the FP16-operand shapes the BF16 activations are converted to FP16
+    in registers: exact for 2^-17 <= |x| <= 65504, saturated above that.
 
     Requires contiguous CUDA tensors, M in [1,16], K divisible by 128, and N
     divisible by 16. Weight is E4M3FN. Scales are either FP32

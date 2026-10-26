@@ -205,11 +205,6 @@ register_kernel(
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.gemm.dsv3_fused_a_gemm:dsv3_fused_a_gemm_fp8",
         capabilities=_SM103,
-        format_signature=FormatSignature(
-            supported_dtypes=("bfloat16", "float8_e4m3fn"),
-            description="Small-M W8A16 GEMM with 128x128 FP32 or packed UE8M0 weight scales",
-        ),
-        description="FP8 checkpoint fused-A GEMM with BF16 activations and FP32 accumulation.",
     )
 )
 register_kernel(

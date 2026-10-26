@@ -19,8 +19,7 @@ from sglang.kernels.ops.gemm.dsv3_fused_a_gemm import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=40, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_cuda_ci(est_time=60, stage="base-c", runner_config="4-gpu-gb300")
 
 # hd_in must be a multiple of 256; 2048/6144/7168 cover the real fused-A shapes
@@ -54,9 +53,13 @@ def test_dsv3_fused_a_gemm(num_tokens, hd_in, hd_out):
 
 
 @pytest.fixture
-def cuda_sm103():
+def cuda_device():
     if not torch.cuda.is_available() or is_hip_runtime():
         pytest.skip("CUDA required")
+
+
+@pytest.fixture
+def cuda_sm103(cuda_device):
     arch = get_jit_cuda_arch()
     if (arch.major, arch.minor) != (10, 3):
         pytest.skip("SM103 (GB300) required")
@@ -217,7 +220,7 @@ def test_fp8_fused_a_gemm_rejects_m(m):
 
 
 @pytest.fixture
-def fp8_projection(cuda_sm103, monkeypatch):
+def fp8_projection(cuda_device, monkeypatch):
     from types import SimpleNamespace
 
     from sglang.kernels.ops.gemm import fused_a_gemm as dispatch
@@ -325,6 +328,7 @@ def test_fp8_small_m_linear_declines(fp8_projection, case):
     assert fp8_small_m_linear(fp8_projection, x) is None
 
 
+@pytest.mark.usefixtures("cuda_sm103")
 def test_fp8_small_m_apply_after_weight_loading(fp8_projection):
     method = fp8_projection.quant_method
     assert not method.small_m_w8a16

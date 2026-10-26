@@ -20,35 +20,34 @@ constexpr uint32_t kMaxSplit = 8;
 struct Config {
   uint32_t warps;
   uint32_t split;
-  uint32_t batch;
   uint32_t row_tiles;
   bool f16;
   uint32_t min_ctas;  // __launch_bounds__ minimum CTAs per SM: caps registers so that every CTA of the grid is resident
-  bool pdl;           // PDL launch: the grid starts while the previous kernel finishes
+  bool pdl;
 };
 
 // Weight rows per mma tile.
 constexpr uint32_t kFeatures = 16;
 
-// Fallback for shapes without a measured entry: long-K projections want few warps per CTA plus a cluster
+// Fallback for shapes without a tuned entry: long-K projections want few warps per CTA plus a cluster
 // K-split; short-K ones want one K block per warp and no split.
 constexpr Config default_config(uint32_t k_blocks) {
   if (k_blocks >= 32) {
     const uint32_t split = k_blocks / 8 < kMaxSplit ? k_blocks / 8 : kMaxSplit;
-    return {4, split, 1, 1, false, 1, true};
+    return {4, split, 1, false, 1, true};
   }
-  return {k_blocks, 1, 1, 1, false, 1, true};
+  return {k_blocks, 1, 1, false, 1, true};
 }
 
-// Measured on GB300 (cold L2, CUDA graph) for the GLM-5.2 TP4 shard shapes; tokens is 8 for M<=8 and 16 for M
-// in 9..16. min_ctas = ceil(CTAs / 152 SMs): the register cap that keeps the whole grid resident in one wave.
+// Configs for the GLM-5.2 TP4 shard shapes; tokens is 8 for M<=8 and 16 for M in 9..16.
+// min_ctas = ceil(CTAs / 152 SMs): the register cap that keeps the whole grid resident in one wave.
 constexpr Config tuned_config(uint32_t n, uint32_t k_blocks, uint32_t tokens) {
-  if (n == 2624 && k_blocks == 48) return {8, 3, 1, 2, true, 2, true};   // fused qkv_a
-  if (n == 4096 && k_blocks == 16) return {16, 1, 1, 1, true, 2, true};  // q_b, indexer wq_b
+  if (n == 2624 && k_blocks == 48) return {8, 3, 2, true, 2, true};   // fused qkv_a
+  if (n == 4096 && k_blocks == 16) return {16, 1, 1, true, 2, true};  // q_b, indexer wq_b
   // o_proj: 16 tokens leave too few registers for 2 row tiles per CTA. No PDL launch: behind the cuBLAS BMM that
-  // feeds it, an early start measured ~4 us slower in the decode graph.
+  // feeds it, an early start makes the kernel slower.
   if (n == 6144 && k_blocks == 32) {
-    return tokens > 8 ? Config{8, 1, 1, 1, true, 3, false} : Config{8, 2, 1, 2, true, 3, false};
+    return tokens > 8 ? Config{8, 1, 1, true, 3, false} : Config{8, 2, 2, true, 3, false};
   }
   return default_config(k_blocks);
 }
@@ -88,8 +87,8 @@ SGL_DEVICE void dequant(uint32_t w, uint32_t& lo, uint32_t& hi) {
   hi = widen(__byte_perm(w, 0, 0x3424));
 }
 
-// FP16 operands (Config::f16): hardware E4M3 -> FP16 is exact, and so is BF16 -> FP16 within +-65504 (larger
-// activations saturate).
+// FP16 operands (Config::f16): hardware E4M3 -> FP16 is exact, and so is BF16 -> FP16 for 2^-17 <= |x| <= 65504
+// (smaller activations lose low bits to FP16 subnormals, larger ones saturate).
 SGL_DEVICE void mma_f16(float (&c)[4], const uint32_t (&a)[4], const uint32_t (&b)[2]) {
   asm volatile(
       "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
@@ -390,7 +389,6 @@ template <
     uint32_t kTokens,
     uint32_t kWarps,
     uint32_t kSplit,
-    uint32_t kBatch,
     uint32_t kRowTiles,
     bool kF16,
     bool kPacked,
@@ -429,30 +427,16 @@ __global__ __launch_bounds__(kWarps * 32, kMinCtas) __cluster_dims__(kSplit, 1, 
   uint32_t base = first_base;
 #pragma unroll 1
   do {
-    Stage<kRowTiles, kTiles> stage[kBatch];
+    Stage<kRowTiles, kTiles> stage;
     if (base == first_base) {
       device::PDLWaitPrimary<kUsePDL>();
     }
-#pragma unroll
-    for (uint32_t u = 0; u < kBatch; ++u) {
-      const uint32_t kb = base + u * kSplit * kWarps;
-      if (kb < kBlocks) {
-        a_loader.load(stage[u], kb);
-        b_loader.load(stage[u], kb);
-      }
-    }
-#pragma unroll
-    for (uint32_t u = 0; u < kBatch; ++u) {
-      const uint32_t kb = base + u * kSplit * kWarps;
-      if (kb < kBlocks) {
-        mma_computer.accumulate(stage[u]);
-      }
-    }
-    base += kSplit * kWarps * kBatch;
+    a_loader.load(stage, base);
+    b_loader.load(stage, base);
+    mma_computer.accumulate(stage);
+    base += kSplit * kWarps;
   } while (base < kBlocks);
   mma_computer.epi(out, n, m);
-  // The dependent's griddepcontrol.wait only covers writes issued before this trigger, so it must follow the output
-  // stores.
   device::PDLTriggerSecondary<kUsePDL>();
 }
 
@@ -507,7 +491,6 @@ struct DSV3FusedAGemmFP8Kernel {
           kTokens,
           kConfig.warps,
           kConfig.split,
-          kConfig.batch,
           kConfig.row_tiles,
           kConfig.f16,
           kPacked,

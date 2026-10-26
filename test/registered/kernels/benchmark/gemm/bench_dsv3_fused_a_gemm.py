@@ -24,7 +24,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.utils import is_in_ci
 
 register_cuda_ci(
-    est_time=42, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
+    est_time=12, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
 )
 
 IS_CI = is_in_ci()
