@@ -112,6 +112,7 @@ class MHATokenToKVPoolFP4Host(MHATokenToKVPoolHost):
         write_back_staging: tuple[torch.Tensor, torch.Tensor] | None = None,
         pool_label: str = "kv",
         head_group_num: int = 1,
+        host_token_capacity: int | None = None,
     ):
         if layout != "page_first":
             raise NotImplementedError("NVFP4 host transfers support only page_first")
@@ -191,6 +192,7 @@ class MHATokenToKVPoolFP4Host(MHATokenToKVPoolHost):
             write_back_staging=write_back_staging,
             pool_label=pool_label,
             head_group_num=head_group_num,
+            host_token_capacity=host_token_capacity,
         )
         if not self.can_use_jit or not self.can_use_write_back_jit:
             raise NotImplementedError(
