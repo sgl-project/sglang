@@ -528,6 +528,17 @@ class ExecMamba(msgspec.Struct):
         doc="Whether the hybrid-mamba radix cache keeps its extra state "
         "buffer: the radix cache is on and the strategy asks for one.",
     )
+    enable_mamba_decode_tracking = Derived(
+        fn="sglang.srt.arg_groups.model_override_base.mamba_decode_tracking_of",
+        doc="Whether decode records reusable Mamba checkpoints.",
+    )
+    disable_mamba_decode_tracking: A[
+        bool,
+        Arg(
+            help="Skip decode checkpoint tracking. The caller owns prompt checkpoint publication.",
+            no_cli=True,
+        ),
+    ] = False
     decode_state_free_radix = Derived(
         fn="sglang.srt.arg_groups.model_override_base.decode_state_free_radix_of",
         doc="Whether a PD decode server's radix cache holds FULL KV only and "

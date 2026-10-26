@@ -1749,7 +1749,11 @@ class SchedulerBatchResultProcessor:
         ):
             return
 
-        lazy = get_exec().mamba.enable_mamba_extra_buffer_lazy
+        mamba = get_exec().mamba
+        if mamba.disable_mamba_decode_tracking:
+            return
+
+        lazy = mamba.enable_mamba_extra_buffer_lazy
         if known_boundary:
             self._mamba_assert_committed_len_lookahead(req)
             track_seqlen = req.kv.kv_committed_len
