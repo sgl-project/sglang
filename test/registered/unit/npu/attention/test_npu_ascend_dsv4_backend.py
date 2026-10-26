@@ -721,9 +721,7 @@ class TestArch35SparseAttentionDispatch(unittest.TestCase):
         with patch("torch.ops.npu", MagicMock(), create=True) as npu_ops:
             metadata_op, attention_op = _sparse_attn_ops(is_dspark=True)
 
-        self.assertIs(
-            metadata_op, npu_ops.kv_quant_sparse_attn_sharedkv_metadata_host
-        )
+        self.assertIs(metadata_op, npu_ops.kv_quant_sparse_attn_sharedkv_metadata_host)
         self.assertIs(attention_op, npu_ops.kv_quant_sparse_attn_sharedkv)
 
     @patch(_ARCH35_PATCH_TARGET, return_value=False)
