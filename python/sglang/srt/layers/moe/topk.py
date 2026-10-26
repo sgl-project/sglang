@@ -227,7 +227,7 @@ if _is_cuda:
 
 if _is_cuda or _is_hip or _is_xpu:
     if _is_xpu:
-        # XPU has no tvm_ffi, so the CUDA JIT topk_sigmoid isn't reachable;
+        # The JIT topk_sigmoid/topk_softmax are CUDA sources and can't build on XPU;
         # use the AOT symbols from sgl_kernel directly. topk_sigmoid was aligned
         # with the post-#28715 CUDA signature in sgl-kernel-xpu#285.
         from sgl_kernel import topk_sigmoid, topk_softmax
