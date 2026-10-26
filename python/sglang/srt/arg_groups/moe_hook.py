@@ -307,14 +307,14 @@ def handle_a2a_moe(server_args: Any):
 
     resolved = resolved_view(server_args)
     a2a_backend = resolved.moe_a2a_backend
-    draft_a2a_backend = cfg.speculative_moe_a2a_backend
-    ascend_ops_selected = (
-        a2a_backend == "ascend_ops" or draft_a2a_backend == "ascend_ops"
-    )
-    ascend_ops_config = cfg.ascend_ops_config
-    if ascend_ops_config is not None and not ascend_ops_selected:
+    draft_a2a_backend = resolved.speculative_moe_a2a_backend
+    main_uses_ascend_ops = a2a_backend == "ascend_ops"
+    draft_uses_ascend_ops = draft_a2a_backend == "ascend_ops"
+    ascend_ops_selected = main_uses_ascend_ops or draft_uses_ascend_ops
+    moe_ascend_ops_config = cfg.moe_ascend_ops_config
+    if moe_ascend_ops_config is not None and not ascend_ops_selected:
         raise ValueError(
-            "--ascend-ops-config requires the main or speculative MoE backend "
+            "--moe-ascend-ops-config requires the main or speculative MoE backend "
             f"to be ascend_ops; got main={a2a_backend!r}, "
             f"draft={draft_a2a_backend!r}."
         )
@@ -325,12 +325,12 @@ def handle_a2a_moe(server_args: Any):
                 "for both the main and speculative draft model."
             )
         try:
-            parsed_ascend_ops_config = AscendOpsConfig.from_json_str(
-                ascend_ops_config
+            parsed_moe_ascend_ops_config = AscendOpsConfig.from_json_str(
+                moe_ascend_ops_config
             )
         except ValueError as exc:
             raise ValueError(
-                "Invalid --ascend-ops-config for ascend_ops MoE backend: "
+                "Invalid --moe-ascend-ops-config for ascend_ops MoE backend: "
                 f"{exc}"
             ) from exc
         logger.info(
@@ -338,10 +338,10 @@ def handle_a2a_moe(server_args: Any):
             "prefill=%s, decode=%s, low_latency comm_alg dispatch=%r combine=%r.",
             a2a_backend == "ascend_ops",
             draft_a2a_backend == "ascend_ops",
-            parsed_ascend_ops_config.prefill,
-            parsed_ascend_ops_config.decode,
-            parsed_ascend_ops_config.ll_dispatch_alg,
-            parsed_ascend_ops_config.ll_combine_alg,
+            parsed_moe_ascend_ops_config.prefill,
+            parsed_moe_ascend_ops_config.decode,
+            parsed_moe_ascend_ops_config.ll_dispatch_alg,
+            parsed_moe_ascend_ops_config.ll_combine_alg,
         )
     if cfg.enable_waterfill:
         declare_resolution(
@@ -677,18 +677,27 @@ def validate_deepep_v2_speculative_draft(server_args: Any) -> None:
 
 
 def validate_ascend_ops_speculative_draft(server_args: Any) -> None:
-    """Validate Ascend Ops when selected explicitly or inherited by the draft."""
+    """Validate Ascend Ops and keep target/draft backend selection consistent."""
     view = resolved_view(server_args)
+    main_backend = view.moe_a2a_backend
     draft_backend = view.speculative_moe_a2a_backend
     if draft_backend is None and view.speculative_algorithm:
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
         algorithm = SpeculativeAlgorithm.from_string(view.speculative_algorithm)
         if not algorithm.is_ngram():
-            draft_backend = view.moe_a2a_backend
+            draft_backend = main_backend
     if draft_backend == "ascend_ops" and not get_platform().is_npu:
         raise ValueError(
             "--speculative-moe-a2a-backend ascend_ops is only supported on NPU."
+        )
+    if draft_backend is not None and (
+        (main_backend == "ascend_ops") != (draft_backend == "ascend_ops")
+    ):
+        raise ValueError(
+            "The main and speculative draft MoE backends must both use "
+            "ascend_ops or both use another backend; got "
+            f"main={main_backend!r}, draft={draft_backend!r}."
         )
 
 

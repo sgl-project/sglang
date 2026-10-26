@@ -620,13 +620,13 @@ def post_permute_ascend_to_ascend_ops(
     from sglang.srt.layers.moe.token_dispatcher.ascend_ops import (
         AscendOpsCombineInput,
         _AllGatherState,
-        _AllToAllState,
+        _AllToAllVState,
     )
 
     state = running_state.pop("ascend_ops_forward_state", None)
     if state is None:
         raise RuntimeError("Ascend Ops dispatch output is missing forward state")
-    if isinstance(state, _AllToAllState):
+    if isinstance(state, _AllToAllVState):
         local_expanded_row_idx = state.local_expanded_row_idx
         if local_expanded_row_idx is None:
             raise RuntimeError("alltoallv forward state is missing local row map")

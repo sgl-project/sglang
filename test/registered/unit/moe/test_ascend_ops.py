@@ -14,7 +14,7 @@ from sglang.srt.layers.moe.token_dispatcher.ascend_ops import (
     AscendOpsCombineInput,
     AscendOpsDispatcher,
     _AllGatherState,
-    _AllToAllState,
+    _AllToAllVState,
     _MC2State,
 )
 from sglang.srt.layers.moe.utils import AscendOpsConfig, DispatcherOutputDtype
@@ -99,7 +99,7 @@ class TestAscendOpsDispatcherContracts(CustomTestCase):
         states = (
             (_AllGatherState(None, [1], torch.bfloat16), "allgather"),
             (
-                _AllToAllState(
+                _AllToAllVState(
                     None,
                     [1],
                     [1],

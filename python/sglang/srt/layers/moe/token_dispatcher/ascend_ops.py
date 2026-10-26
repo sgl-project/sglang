@@ -122,7 +122,7 @@ class _AllGatherState:
 
 
 @dataclass
-class _AllToAllState:
+class _AllToAllVState:
     group: Any
     input_splits: list[int]
     output_splits: list[int]
@@ -133,7 +133,7 @@ class _AllToAllState:
     local_expanded_row_idx: Optional[torch.Tensor] = None
 
 
-AscendOpsForwardState = _MC2State | _AllGatherState | _AllToAllState
+AscendOpsForwardState = _MC2State | _AllGatherState | _AllToAllVState
 
 
 class AscendOpsDispatcher(BaseDispatcher):
@@ -142,10 +142,10 @@ class AscendOpsDispatcher(BaseDispatcher):
     def __init__(
         self,
         moe_runner_config: MoeRunnerConfig,
-        ascend_ops_config: Optional[AscendOpsConfig] = None,
+        moe_ascend_ops_config: Optional[AscendOpsConfig] = None,
     ) -> None:
         super().__init__()
-        self.ascend_ops_config = ascend_ops_config or AscendOpsConfig()
+        self.moe_ascend_ops_config = moe_ascend_ops_config or AscendOpsConfig()
         parallel = get_parallel()
         self.tp_group = parallel.tp_group.device_group
         self.attn_tp_size = parallel.attn_tp_size
@@ -160,7 +160,7 @@ class AscendOpsDispatcher(BaseDispatcher):
         self.quant_config: Optional[dict] = None
         self._ep_comm_name: Optional[str] = None
         self._pad_buffers: dict[tuple, tuple] = {}
-        if self.ascend_ops_config.prefill == "allgather":
+        if self.moe_ascend_ops_config.prefill == "allgather":
             if not (
                 parallel.tp_size == parallel.moe_ep_size
                 and parallel.attn_cp_size == 1
@@ -182,7 +182,7 @@ class AscendOpsDispatcher(BaseDispatcher):
     ) -> DispatchOutput:
         topk_weights, topk_ids, _ = topk_output
         if get_is_extend_in_batch():
-            if self.ascend_ops_config.prefill == "allgather":
+            if self.moe_ascend_ops_config.prefill == "allgather":
                 return self._dispatch_allgather(
                     hidden_states, topk_weights, topk_ids, self.tp_group
                 )
@@ -203,7 +203,7 @@ class AscendOpsDispatcher(BaseDispatcher):
         state = combine_input.forward_state
         if isinstance(state, _AllGatherState):
             return self._combine_allgather(combine_input.hidden_states, state)
-        if isinstance(state, _AllToAllState):
+        if isinstance(state, _AllToAllVState):
             return self._combine_alltoallv(combine_input.hidden_states, state)
         if isinstance(state, _MC2State):
             return self._combine_mc2(combine_input.hidden_states, state)
@@ -213,11 +213,12 @@ class AscendOpsDispatcher(BaseDispatcher):
 
     def _dispatch_low_latency(self, hidden_states, topk_weights, topk_ids):
         num_tokens = hidden_states.shape[0]
-        pad_bs = envs.SGLANG_ASCEND_OPS_DECODE_PAD_BS.get()
+        pad_bs = envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
         if pad_bs and num_tokens > pad_bs:
             raise ValueError(
                 f"ascend_ops decode got {num_tokens} tokens on this rank but "
-                f"SGLANG_ASCEND_OPS_DECODE_PAD_BS pads the batch to {pad_bs}; "
+                "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK limits the "
+                f"padded batch to {pad_bs}; "
                 "raise it or lower the decode batch size."
             )
         return self._dispatch_mc2(
@@ -273,7 +274,7 @@ class AscendOpsDispatcher(BaseDispatcher):
             quant_mode=quant_mode,
             global_bs=0,
             expert_token_nums_type=1,
-            comm_alg=self.ascend_ops_config.ll_dispatch_alg,
+            comm_alg=self.moe_ascend_ops_config.ll_dispatch_alg,
             **mxfp8_args,
         )
 
@@ -373,7 +374,7 @@ class AscendOpsDispatcher(BaseDispatcher):
             expand_scales=state.expand_scales,
             global_bs=0,
             comm_quant_mode=0,
-            comm_alg=self.ascend_ops_config.ll_combine_alg,
+            comm_alg=self.moe_ascend_ops_config.ll_combine_alg,
         )
 
         return combined[: state.num_tokens]
@@ -611,7 +612,7 @@ class AscendOpsDispatcher(BaseDispatcher):
             routed.hidden_states, output_splits, input_splits, group
         )
 
-        state = _AllToAllState(
+        state = _AllToAllVState(
             group=group,
             input_splits=input_splits,
             output_splits=output_splits,
@@ -634,7 +635,7 @@ class AscendOpsDispatcher(BaseDispatcher):
         )
 
     def _combine_alltoallv(
-        self, local_output: torch.Tensor, state: _AllToAllState
+        self, local_output: torch.Tensor, state: _AllToAllVState
     ) -> torch.Tensor:
         """Reverse AllToAllV and apply source-side router weights."""
         source_order = self._alltoall_single(

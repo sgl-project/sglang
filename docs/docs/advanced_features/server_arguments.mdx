@@ -1650,7 +1650,7 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--speculative-moe-a2a-backend`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>MOE A2A backend for EAGLE speculative decoding, see `--moe-a2a-backend` for options. Same as moe a2a backend if unset. The experimental `ascend_ops` backend is supported on Ascend NPU and uses `--ascend-ops-config`.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>MOE A2A backend for EAGLE speculative decoding, see `--moe-a2a-backend` for options. Same as moe a2a backend if unset. The experimental `ascend_ops` backend is supported on Ascend NPU and uses `--moe-ascend-ops-config`.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>none</code>, <code>deepep</code>, <code>mooncake</code>, <code>nixl</code>, <code>mori</code>, <code>ascend_fuseep</code>, <code>flashinfer</code>, <code>megamoe</code>, <code>pplx</code>, <code>ascend_ops</code></td>
     </tr>
@@ -1931,8 +1931,8 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: str</td>
     </tr>
         <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--ascend-ops-config`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>JSON configuration for the experimental `ascend_ops` MoE backend on the main or speculative draft model. `prefill` accepts `allgather` or `alltoallv` (default `alltoallv`); `decode` accepts `low_latency` or `fused_op` (default `low_latency`). Requires the main or speculative backend to be `ascend_ops` on an Ascend NPU. Example: `--moe-a2a-backend deepep --speculative-moe-a2a-backend ascend_ops --ascend-ops-config '{"prefill":"allgather","decode":"low_latency"}'`.</td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--moe-ascend-ops-config`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>JSON configuration for the experimental `ascend_ops` MoE backend on the main or speculative draft model. `prefill` accepts `allgather` or `alltoallv` (default `alltoallv`); `decode` accepts `low_latency` or `fused_op` (default `low_latency`). Requires both the main and speculative backends to be `ascend_ops` when a speculative draft model is enabled; the backend is supported on an Ascend NPU. Example: `--moe-a2a-backend ascend_ops --speculative-moe-a2a-backend ascend_ops --moe-ascend-ops-config '{"prefill":"allgather","decode":"low_latency"}'`.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: JSON str</td>
     </tr>
