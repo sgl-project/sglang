@@ -149,15 +149,17 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         ):
             self._precarve.mint()
             if self._debug_eager:
-                # The whole forward is one eager break that writes the output
-                # buffer; the warmup output has the captured rows.
+                # The whole forward runs as one eager break that writes the
+                # output buffer.
+                # The warmup ran the same forward, so its output gives the
+                # captured rows.
                 out_rows = self._output_rows(warmup_out, size)
 
                 @eager_on_graph
-                def forward_into_buffer() -> None:
-                    self._copy_output_to_buffer(forward_fn(), buffer, out_rows)
+                def forward_into_buffer(output_buffer: Any) -> None:
+                    self._copy_output_to_buffer(forward_fn(), output_buffer, out_rows)
 
-                forward_into_buffer()
+                forward_into_buffer(buffer)
             else:
                 out = forward_fn()
                 out_rows = self._output_rows(out, size)
