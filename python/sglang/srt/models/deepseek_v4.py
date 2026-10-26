@@ -155,6 +155,7 @@ from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
 from sglang.srt.models.deepseek_common.decoder_swa_bounded_replay import (
     enter_late_layer_dp,
     exit_late_layer_dp,
+    gather_late_layer_ids,
     late_layer_dp_counts,
 )
 from sglang.srt.models.deepseek_common.moe_transport import (
@@ -3489,15 +3490,6 @@ class DeepseekV4DecoderLayerBase(nn.Module):
         )
 
 
-def _gather_late_layer_ids(
-    input_ids: torch.Tensor, counts: List[int], forward_batch: ForwardBatch
-) -> torch.Tensor:
-    # Re-gather the compact tail IDs in the late-layer MoE layout.
-    gathered = input_ids.new_empty((sum(counts), 1))
-    dp_gather_replicate(gathered, input_ids[:, None].clone(), forward_batch)
-    return gathered.squeeze(-1)
-
-
 def _scatter_tail_rows(
     tail: LateLayerTail, rows: torch.Tensor, num_tokens: int
 ) -> torch.Tensor:
@@ -4084,7 +4076,6 @@ class DeepseekV4Model(nn.Module):
                         residual, pre, aux = (
                             self.decoder_replay_tail.run_in_prefill_graph(
                                 state=state,
-                                positions=positions,
                                 input_ids=input_ids,
                                 input_ids_global=input_ids_global,
                                 capture_dspark=capture_dspark,
@@ -4103,6 +4094,22 @@ class DeepseekV4Model(nn.Module):
                         return residual, pre, tail
                 else:
                     saved_full = attn_backend.enter_late_layer_tail(forward_batch)
+                if use_tail_graph:
+                    residual, pre, aux = self.decoder_replay_tail.run_on_batch(
+                        tail,
+                        state=state,
+                        input_ids=input_ids,
+                        input_ids_global=input_ids_global,
+                        forward_batch=forward_batch,
+                        capture_dspark=capture_dspark,
+                        dp_rows=tail_graph_dp_rows,
+                        use_graph=True,
+                    )
+                    if capture_dspark:
+                        dspark_aux_hidden_states.extend(aux)
+                    residual_batch.clear(forward_batch)
+                    attn_backend.exit_late_layer_tail(saved_full, forward_batch)
+                    return residual, pre, tail
                 state = state.take_rows(tail.rows)
                 if _is_cuda:
                     hidden_states = residual_batch.set_written(state, forward_batch)
@@ -4114,21 +4121,6 @@ class DeepseekV4Model(nn.Module):
                 positions = tail.positions
                 if hash_ids is not None:
                     hash_ids = tail.rows(hash_ids)
-                if use_tail_graph:
-                    residual, pre, aux = self.decoder_replay_tail.run(
-                        state=state,
-                        positions=positions,
-                        input_ids=input_ids,
-                        input_ids_global=input_ids_global,
-                        forward_batch=forward_batch,
-                        capture_dspark=capture_dspark,
-                        dp_rows=tail_graph_dp_rows,
-                    )
-                    if capture_dspark:
-                        dspark_aux_hidden_states.extend(aux)
-                    residual_batch.clear(forward_batch)
-                    attn_backend.exit_late_layer_tail(saved_full, forward_batch)
-                    return residual, pre, tail
             if use_tail_graph and tail is None and i == self.late_layer_start:
                 residual, pre, aux = self.decoder_replay_tail.run_idle(
                     state=state,
@@ -4148,7 +4140,7 @@ class DeepseekV4Model(nn.Module):
                 if get_moe_a2a_backend().is_none():
                     # Full-prefill IDs are not indexed by this rank's tail rows.
                     input_ids_global = (
-                        _gather_late_layer_ids(input_ids, late_dp_counts, forward_batch)
+                        gather_late_layer_ids(input_ids, late_dp_counts, forward_batch)
                         if self.late_layer_vl_routing
                         else None
                     )

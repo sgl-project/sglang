@@ -5,7 +5,11 @@ from typing import TYPE_CHECKING, List, Optional
 import torch
 
 from sglang.srt.distributed.utils import all_gather_single
-from sglang.srt.layers.dp_attention import DpPaddingMode, set_dp_buffer_len_from_batch
+from sglang.srt.layers.dp_attention import (
+    DpPaddingMode,
+    dp_gather_replicate,
+    set_dp_buffer_len_from_batch,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.common import async_h2d
 
@@ -116,3 +120,12 @@ def exit_late_layer_dp(forward_batch: ForwardBatch, saved: tuple) -> None:
         fb.num_token_non_padded,
     ) = saved
     set_dp_buffer_len_from_batch(fb)
+
+
+def gather_late_layer_ids(
+    input_ids: torch.Tensor, counts: List[int], forward_batch: ForwardBatch
+) -> torch.Tensor:
+    # Re-gather the compact tail IDs in the late-layer MoE layout.
+    gathered = input_ids.new_empty((sum(counts), 1))
+    dp_gather_replicate(gathered, input_ids[:, None].clone(), forward_batch)
+    return gathered.squeeze(-1)

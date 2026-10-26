@@ -47,6 +47,7 @@ from sglang.srt.model_executor.forward_context import (
 from sglang.srt.model_executor.runner.row_bucket_graph_runner import (
     RowBucketGraphRunner,
 )
+from sglang.srt.models.deepseek_v4_mhc import HcState
 from sglang.srt.runtime_context import get_flags, get_parallel
 from sglang.test.communicator_patch import patch_communicator
 from sglang.test.test_utils import CustomTestCase
@@ -570,15 +571,13 @@ class TestDecoderReplayTailMoeBound(CustomTestCase):
                 batch, tail = self._batch_and_tail(sharded, local, glob, alias)
                 original_global = batch.global_num_token_non_padded
                 output = torch.tensor([11])
-                tail_layers = SimpleNamespace(
-                    runner=SimpleNamespace(warm=True, bucket_rows=lambda n: 8),
-                    _can_capture_moe_bound=(
-                        replay_tail.DecoderReplayTail._can_capture_moe_bound
-                    ),
-                    run=Mock(return_value=(output, None, [])),
-                    _run_layers_eagerly=Mock(return_value=(output, None, [])),
-                    _write_bridge=Mock(),
+                tail_layers = replay_tail.DecoderReplayTail.__new__(
+                    replay_tail.DecoderReplayTail
                 )
+                tail_layers.runner = SimpleNamespace(warm=True, bucket_rows=lambda n: 8)
+                tail_layers.run = Mock(return_value=(output, None, []))
+                tail_layers._run_layers_eagerly = Mock(return_value=(output, None, []))
+                tail_layers._write_bridge = Mock()
                 backend = SimpleNamespace(
                     forward_metadata=SimpleNamespace(late_layer_tail=tail),
                     exit_late_layer_tail=Mock(),
@@ -599,7 +598,7 @@ class TestDecoderReplayTailMoeBound(CustomTestCase):
                 ):
                     replay_tail._tail_layers_in_prefill_graph(
                         tail_layers,
-                        lambda tensors: tensors,
+                        lambda tensors: HcState(tensors[0]),
                         False,
                         4,
                         None,
@@ -607,7 +606,6 @@ class TestDecoderReplayTailMoeBound(CustomTestCase):
                         (False, False),
                         None,
                         [torch.zeros(4, 1)],
-                        torch.arange(4),
                         batch.input_ids,
                         batch.input_ids,
                     )
