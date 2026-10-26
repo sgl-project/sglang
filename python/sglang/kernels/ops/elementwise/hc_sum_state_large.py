@@ -232,15 +232,28 @@ class LargeTSumHCShell:
             else None,
         )
 
-    def _validate(self, state, buffers):
-        if not isinstance(state, HCSumState) or not isinstance(
-            buffers, HCLargeSumBuffers
-        ):
-            raise ValueError("explicit HCSumState / HCLargeSumBuffers required")
-        w = self.weights
+    def _validate_input(self, state):
+        if not isinstance(state, HCSumState):
+            raise ValueError("explicit HCSumState required")
         t = self._residual_shape(state.residual)
         if 0 < t <= 24:
             raise ValueError("use the existing small-T shell for T<=24")
+        sums = state.sum_sq
+        if (
+            sums.shape != (t, 4)
+            or sums.dtype != torch.float32
+            or sums.device != self.weights.matrix.device
+            or not sums.is_contiguous()
+            or sums.data_ptr() % 32
+        ):
+            raise ValueError("large-T input statistics metadata mismatch")
+        return t
+
+    def _validate(self, state, buffers):
+        if not isinstance(buffers, HCLargeSumBuffers):
+            raise ValueError("explicit HCLargeSumBuffers required")
+        t = self._validate_input(state)
+        w = self.weights
         specs = (
             (state.residual, (t, 4 * w.hidden_size), w.matrix.dtype),
             (state.sum_sq, (t, 4), torch.float32),
@@ -258,7 +271,7 @@ class LargeTSumHCShell:
             specs += (
                 (buffers.partial_sums, (t, 4, PARTIALS_PER_BRANCH), torch.float32),
             )
-        for tensor, shape, dtype in specs:
+        for tensor, shape, dtype in specs[2:]:
             if (
                 tensor.shape != shape
                 or tensor.dtype != dtype
@@ -279,7 +292,18 @@ class LargeTSumHCShell:
         return t
 
     def mix(self, state, buffers):
-        t = self._validate(state, buffers)
+        self._validate(state, buffers)
+        return self._mix(state, buffers)
+
+    def _mix_allocated(self, state):
+        # Fresh outputs are module-owned; only the input state is external.
+        rows = self._validate_input(state)
+        buffers = self.allocate_buffers(rows)
+        mixed, _ = self._mix(state, buffers)
+        return mixed, buffers
+
+    def _mix(self, state, buffers):
+        t = state.residual.shape[0]
         if not t:
             return buffers.mixed, buffers.alpha
         w = self.weights

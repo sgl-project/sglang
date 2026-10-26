@@ -384,7 +384,6 @@ class TestGatedResidualOps(CustomTestCase):
         ):
             residual = state.slice_residual_attn_tp(context.state.residual)
         sliced = state.sum_context
-        self.assertTrue(sliced.sliced)
         self.assertIs(residual, sliced.state.residual)
         for actual, original in (
             (residual, context.state.residual),

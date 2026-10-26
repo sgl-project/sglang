@@ -103,13 +103,34 @@ class SmallTSumHCShell:
             else None,
         )
 
-    def _validate(self, state, buffers):
-        if not isinstance(state, HCSumState) or not isinstance(buffers, HCSumBuffers):
-            raise ValueError("explicit HCSumState / HCSumBuffers required")
+    def _validate_input(self, state):
+        if not isinstance(state, HCSumState):
+            raise ValueError("explicit HCSumState required")
         w = self.weights
         t, h = _validate_state(state.residual, w.hc_count, self.eps)
-        if h != w.hidden_size:
-            raise ValueError("state hidden size differs from prepared weights")
+        if (
+            h != w.hidden_size
+            or state.residual.dtype != w.down_inject.dtype
+            or state.residual.device != w.down_inject.device
+        ):
+            raise ValueError("state residual must match prepared weights")
+        sums = state.sum_sq
+        if (
+            sums.shape != (t, 4)
+            or sums.dtype != torch.float32
+            or sums.device != w.down_inject.device
+            or not sums.is_contiguous()
+            or sums.data_ptr() % 32
+        ):
+            raise ValueError("sum-state input statistics metadata mismatch")
+        return t
+
+    def _validate(self, state, buffers):
+        if not isinstance(buffers, HCSumBuffers):
+            raise ValueError("explicit HCSumBuffers required")
+        t = self._validate_input(state)
+        w = self.weights
+        h = w.hidden_size
         specs = (
             (state.residual, (t, 4 * h), w.down_inject.dtype),
             (state.sum_sq, (t, 4), torch.float32),
@@ -124,7 +145,7 @@ class SmallTSumHCShell:
             specs += (
                 (buffers.partial_sums, (t, 4, PARTIALS_PER_BRANCH), torch.float32),
             )
-        for tensor, shape, dtype in specs:
+        for tensor, shape, dtype in specs[2:]:
             if (
                 tensor.shape != shape
                 or tensor.dtype != dtype
@@ -150,6 +171,16 @@ class SmallTSumHCShell:
 
     def mix(self, state, buffers):
         self._validate(state, buffers)
+        return self._mix(state, buffers)
+
+    def _mix_allocated(self, state):
+        # Fresh outputs are module-owned; only the input state is external.
+        rows = self._validate_input(state)
+        buffers = self.allocate_buffers(rows)
+        mixed, _ = self._mix(state, buffers)
+        return mixed, buffers
+
+    def _mix(self, state, buffers):
         # Both projections read CURRENT sums. Only Up clears NEXT sums.
         return hc_mix_raw(
             state.residual,

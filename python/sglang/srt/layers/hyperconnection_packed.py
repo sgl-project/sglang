@@ -29,7 +29,6 @@ class _HCSumContext:
         self.operator = operator
         self.state = state
         self.buffers = buffers
-        self.sliced = False
 
     def slice_rows(self, rank, size):
         def split(tensor):
@@ -52,16 +51,13 @@ class _HCSumContext:
                 else None
             ),
         )
-        context = _HCSumContext(self.operator, state, buffers)
-        context.sliced = True
-        return context
+        return _HCSumContext(self.operator, state, buffers)
 
     def combine(self, block_output):
-        if not self.sliced:
-            return self.operator.combine(self.state, self.buffers, block_output)
         from sglang.kernels.ops.elementwise.hc_apply_sum import hc_apply_sum
 
-        # Projections already ran on the full rows; only Apply follows this slice.
+        # Mix owns the output storage. Apply validates the new core output,
+        # including the 16-byte-aligned statistics of an odd-row TP slice.
         hc_apply_sum(
             block_output,
             self.state.residual,
@@ -144,8 +140,7 @@ class PackedGatedResidual(GatedResidual):
             )
         operator = self._sum_operators[int(residual.shape[0] > 24)]
         state = hyper_input if is_state else operator.bootstrap(residual)
-        buffers = operator.allocate_buffers(residual.shape[0])
-        mixed, _ = operator.mix(state, buffers)
+        mixed, buffers = operator._mix_allocated(state)
         return mixed, _HCSumContext(operator, state, buffers)
 
     def mix_prepared(self, residual, prepared_input=None):

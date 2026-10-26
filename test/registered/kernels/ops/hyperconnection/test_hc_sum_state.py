@@ -466,6 +466,64 @@ class TestHCSumState(CustomTestCase):
                         torch.testing.assert_close(residual, saved, rtol=0, atol=0)
 
     @torch.no_grad()
+    def test_internal_buffers_keep_external_input_guards(self):
+        """Internally allocated outputs do not make external sums/core trusted."""
+        h, lowrank, dtype = 512, 64, torch.bfloat16
+        layer = _layer(h, lowrank, dtype)
+        layer.load_state_dict(_checkpoint(h, lowrank, dtype))
+        for t in (24, 25):
+            residual = self.tensor((t, 4 * h), dtype)
+            state = _bootstrap_sum_state(layer, residual)
+            misaligned = torch.empty((t * 4 + 4,), device="cuda", dtype=torch.float32)
+            for invalid in (
+                state.sum_sq.to(dtype),
+                state.sum_sq[:, :3],
+                misaligned[4:].view(t, 4),
+            ):
+                with self.subTest(t=t, shape=invalid.shape, dtype=invalid.dtype):
+                    with self.assertRaisesRegex(ValueError, "statistics metadata"):
+                        layer.mix(state._replace(sum_sq=invalid))
+
+            mixed, context = layer.mix(state)
+            for invalid in (mixed.float(), mixed[:, :-1]):
+                with self.subTest(
+                    t=t, core_shape=invalid.shape, core_dtype=invalid.dtype
+                ):
+                    with self.assertRaisesRegex(ValueError, "block_output"):
+                        layer.combine(invalid, context)
+            output = layer.combine(mixed, context)
+            self.check_apply(context, mixed, output)
+
+    @torch.no_grad()
+    def test_caller_buffers_keep_weight_alias_and_metadata_guards(self):
+        """An output view into packed weights must fail before any writable launch."""
+        h, lowrank, dtype = 512, 64, torch.bfloat16
+        layer = _layer(h, lowrank, dtype)
+        layer.load_state_dict(_checkpoint(h, lowrank, dtype))
+        for t in (24, 25):
+            state = _bootstrap_sum_state(layer, self.tensor((t, 4 * h), dtype))
+            operator = layer._sum_operators[int(t > 24)]
+            buffers = operator.allocate_buffers(t)
+            weight_output = layer._hc_packed_down.view(-1)[: t * 4 * h].view(t, 4 * h)
+            invalid = buffers._replace(
+                output=buffers.output._replace(residual=weight_output)
+            )
+            with self.subTest(t=t):
+                with self.assertRaisesRegex(ValueError, "alias"):
+                    operator.mix(state, invalid)
+                with self.assertRaisesRegex(ValueError, "alias"):
+                    operator.combine(state, invalid, buffers.mixed)
+                with self.assertRaisesRegex(ValueError, "metadata"):
+                    operator.mix(state, buffers._replace(mixed=buffers.mixed.float()))
+                partials = (
+                    None
+                    if operator.deterministic
+                    else torch.empty((t, 4, 10), device="cuda", dtype=torch.float32)
+                )
+                with self.assertRaisesRegex(ValueError, "deterministic mode"):
+                    operator.mix(state, buffers._replace(partial_sums=partials))
+
+    @torch.no_grad()
     def test_state_handoff_invalidation_and_final_mix(self):
         h, lowrank, dtype = 512, 64, torch.bfloat16
         checkpoint = _checkpoint(h, lowrank, dtype)
