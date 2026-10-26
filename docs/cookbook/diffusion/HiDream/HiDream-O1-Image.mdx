@@ -1,0 +1,99 @@
+---
+title: HiDream-O1-Image
+description: Serve HiDream-O1-Image Dev-2604, Dev, and Full checkpoints with SGLang Diffusion.
+metatags:
+    description: "Run HiDream-ai/HiDream-O1-Image checkpoints (Dev-2604, Dev, Full) with SGLang Diffusion."
+---
+
+import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
+
+<DiffusionModelTags tags={["image", "text-to-image", "editing", "flow matching", "NPU"]} />
+
+## 1. Model Introduction
+
+[HiDream-O1-Image](https://huggingface.co/HiDream-ai/HiDream-O1-Image) is a
+unified VLM diffusion model: a Qwen3-VL backbone handles text encoding, vision
+encoding, and pixel-space denoising in a single forward pass, with no separate
+text encoder or VAE.
+
+One pipeline serves three checkpoints. The variant is detected from the
+served model path and each variant resolves its sampling recipe
+automatically, following the official README checkpoint table. Explicit
+request fields override the recipe.
+
+| Model ID | Weights | Scheduler | Steps | Guidance | Noise (start -> end, clip) |
+| --- | --- | --- | --- | --- | --- |
+| `hidream-ai/HiDream-O1-Image-Dev-2604` | fp32 | flash | 28 | 0.0 | 8.0 -> 8.0, clip 8.0 |
+| `hidream-ai/HiDream-O1-Image-Dev` | bf16 | flash | 28 | 0.0 | 7.5 -> 7.5, clip 2.5 |
+| `hidream-ai/HiDream-O1-Image` (Full) | bf16 | UniPC | 50 | 5.0 | none (z-init scale 8.0) |
+
+Dev-2604 loads fp32 weights (about 2x the memory and latency of bf16).
+Latents and autocast compute stay bf16 for every variant, matching the
+official pipeline; NPU attention kernels require bf16/fp16 activations, so
+fp32 weights are never run without the bf16 autocast.
+
+## 2. Installation
+
+Follow the [SGLang Diffusion installation guide](/docs/sglang-diffusion/installation).
+
+## 3. Serve HiDream-O1-Image
+
+```bash Command
+sglang serve \
+  --model-path HiDream-ai/HiDream-O1-Image-Dev-2604 \
+  --port 30000
+```
+
+## 4. Generate and edit
+
+Text-to-image:
+
+```python Python
+import requests
+
+base_url = "http://127.0.0.1:30000"
+response = requests.post(
+    f"{base_url}/v1/images/generations",
+    json={
+        "prompt": (
+            "A red teapot on a windowsill, morning light, shallow depth "
+            "of field"
+        ),
+        "size": "2048x2048",
+        "seed": 42,
+    },
+    timeout=300,
+)
+response.raise_for_status()
+```
+
+Image editing (reference image plus instruction):
+
+```python Python
+response = requests.post(
+    f"{base_url}/v1/images/edits",
+    files={"image": open("reference.png", "rb")},
+    data={
+        "prompt": "Replace the background with a night city skyline",
+        "seed": 42,
+    },
+    timeout=600,
+)
+response.raise_for_status()
+```
+
+## 5. Request constraints
+
+- Resolution snaps to the closest supported preset (2048x2048 up to
+  3104x1312, multiples of 32). For a single-reference edit,
+  `keep_original_aspect=true` sizes the target from the reference instead.
+- Editing with exactly one reference image uses the flow_match scheduler on
+  Dev checkpoints; the Full model always uses UniPC.
+- Generation is deterministic per request: the seed fixes the initial noise
+  and every random draw. The distilled Dev checkpoints are sensitive to the
+  draw; if an edit comes out flat or uncolored, re-roll the seed or use the
+  Full model, which the official README recommends for editing.
+- Short prompts under-condition the model and can produce uncolored line
+  art. The official workflow refines prompts with the Prompt Agent; connect
+  `--prompt-enhancer-config` and set `enhance_prompt=true` (text-to-image
+  only). See [Prompt enhancement](/docs/sglang-diffusion/models_with_pe).

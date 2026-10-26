@@ -129,6 +129,15 @@ export const DiffusionModelCatalog = ({ category }) => {
       note: "Resolved by the GLM-Image family detector.",
     },
     {
+      name: "HiDream-O1-Image",
+      modelIds: [
+        "hidream-ai/HiDream-O1-Image-Dev-2604",
+        "hidream-ai/HiDream-O1-Image-Dev",
+        "hidream-ai/HiDream-O1-Image",
+      ],
+      cookbook: "/cookbook/diffusion/HiDream/HiDream-O1-Image",
+    },
+    {
       name: "Hunyuan3D 2",
       modelIds: ["tencent/Hunyuan3D-2"],
     },
