@@ -219,8 +219,9 @@ def is_host_cpu_arm64() -> bool:
 
 @lru_cache(maxsize=1)
 def is_cpu() -> bool:
-    is_host_cpu_supported = is_host_cpu_x86() or is_host_cpu_arm64()
-    return os.getenv("SGLANG_USE_CPU_ENGINE", "0") == "1" and is_host_cpu_supported
+    if os.getenv("SGLANG_USE_CPU_ENGINE", "0") != "1":
+        return False
+    return is_host_cpu_x86() or is_host_cpu_arm64()
 
 
 @lru_cache(maxsize=1)
