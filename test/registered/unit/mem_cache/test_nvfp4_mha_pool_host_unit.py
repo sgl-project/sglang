@@ -300,3 +300,40 @@ def test_scale_memory_accounting_and_l3_rejection():
     assert host.get_size_per_token() == (32 + 32) * 2 * 4 + (8 * 4 // 4) * 4
     with pytest.raises(NotImplementedError):
         host.get_data_page(0)
+
+
+@pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize("host_token_capacity,expected_tokens", [(None, 112), (80, 80)])
+def test_host_token_capacity_sizes_payload_and_all_scale_buffers(
+    native, host_token_capacity, expected_tokens
+):
+    target, draft0, draft1 = info(native=native), info(1, native), info(1, native)
+
+    def init_transfer_views(host, *args):
+        # Keep real host capacity and allocations; skip device transfer setup.
+        host.can_use_jit = host.can_use_write_back_jit = True
+        host.staging_page_capacity = 2
+
+    with (
+        patch.object(
+            MHATokenToKVPoolHost,
+            "_initialize_transfer_views",
+            new=init_transfer_views,
+        ),
+        patch.object(mha_fp4, "can_use_write_back_jit_kernel", return_value=True),
+    ):
+        host = make_constructor(
+            target, (draft0, draft1), host_token_capacity=host_token_capacity
+        )
+    try:
+        assert host.size == expected_tokens
+        assert host.page_num == expected_tokens // 16
+        assert host.kv_buffer.shape == (2, expected_tokens, 4, 2, 32)
+        total_bytes = host.kv_buffer.numel() * host.kv_buffer.element_size()
+        for name in host._scale_names:
+            scales = getattr(host, f"_scale_host_{name}")
+            assert scales.shape == (expected_tokens // 16, 4, 128)
+            total_bytes += scales.numel() * scales.element_size()
+        assert total_bytes == expected_tokens * host.get_size_per_token()
+    finally:
+        host.destroy()
