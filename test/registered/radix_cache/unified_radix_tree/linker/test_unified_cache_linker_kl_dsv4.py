@@ -67,13 +67,12 @@ class TestDeepSeekV4FlashUnifiedCacheLinkerKL(
                     "1",
                     "--enable-cache-report",
                     "--enable-unified-cache-external-linker",
-                    "--hicache-storage-backend-extra-config",
+                    "--unified-cache-external-linker-config",
                     json.dumps({"enable_group_semantics": True}),
                 ],
                 env={
                     **cls.mooncake.server_env(),
                     "SGLANG_DSV4_FP4_EXPERTS": "0",
-                    "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",
                 },
             )
             cls.input_ids = get_input_ids(cls.model, num_samples=18)

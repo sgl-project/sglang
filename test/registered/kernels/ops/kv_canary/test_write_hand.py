@@ -796,6 +796,33 @@ class TestRealKvHash:
             real_kv_hash_mode=mode,
         )
 
+    @pytest.mark.parametrize("page_size", [1, 4])
+    def test_strided_real_kv_source_byte_equal(self, page_size: int) -> None:
+        """A strided source (``stride(0) > shape[1]``) folds the same hash as its packed copy.
+
+        The reference folds a contiguous clone; the CUDA kernel folds the strided view, whose
+        rows are followed by bytes it does not own. They agree only if the kernel steps rows
+        by ``stride(0)``.
+        """
+        sources_cuda = make_real_kv_sources(
+            count=2,
+            page_size=page_size,
+            row_gap=48,
+            device=_DEVICE,
+            fill_strategy="random_bytes",
+        )
+        assert all(s.tensor.stride(0) > s.tensor.shape[1] for s in sources_cuda)
+        sources_ref = clone_real_kv_sources(sources_cuda)
+
+        _run_write(
+            buf_pair=self.buf_pair,
+            input_ids=[10, 20, 30],
+            positions=[0, 1, 2],
+            out_cache_loc=[1, 6, 11],
+            real_kv_sources_pair=(sources_cuda, sources_ref),
+            real_kv_hash_mode=consts.RealKvHashMode.ALL,
+        )
+
     @pytest.mark.parametrize("count", [1, 2, 3, 4])
     def test_real_kv_sources_fold_1_to_4(self, count: int) -> None:
         """Folding ``count`` sources sequentially → CUDA matches ref for every count in {1..4}."""

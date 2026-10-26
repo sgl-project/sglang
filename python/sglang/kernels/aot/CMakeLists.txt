@@ -20,7 +20,8 @@ set(GITHUB_ARTIFACTORY "github.com" CACHE STRING "GitHub mirror URL")
 find_package(Python COMPONENTS Interpreter Development.Module ${SKBUILD_SABI_COMPONENT} REQUIRED)
 
 # CXX
-set(SGL_KERNEL_CXX_STANDARD "17" CACHE STRING "C++ standard used for host and CUDA compilation")
+# Torch 2.14 headers reject anything below C++20 with a hard #error.
+set(SGL_KERNEL_CXX_STANDARD "20" CACHE STRING "C++ standard used for host and CUDA compilation")
 set(CMAKE_CXX_STANDARD ${SGL_KERNEL_CXX_STANDARD})
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3")
 
@@ -66,8 +67,8 @@ FetchContent_Populate(repo-fmt)
 # Triton kernel
 FetchContent_Declare(
     repo-triton
-    URL      https://${GITHUB_ARTIFACTORY}/triton-lang/triton/archive/v3.7.1.tar.gz
-    URL_HASH SHA256=7d998625d1035ac496d06a81117727647169422ee67b8889609f06fd5367c491
+    URL      https://${GITHUB_ARTIFACTORY}/triton-lang/triton/archive/v3.8.0.tar.gz
+    URL_HASH SHA256=d50981f98bf61a5ce21d2a0c6ac067c20b7f741acf3bee4b8370edc3b63fd337
 )
 FetchContent_Populate(repo-triton)
 
@@ -295,10 +296,6 @@ set(SOURCES
     "csrc/moe/prepare_moe_input.cu"
 
     "csrc/quantization/gguf/gguf_kernel.cu"
-    "csrc/speculative/eagle_utils.cu"
-    "csrc/speculative/ngram_utils.cu"
-    "csrc/speculative/packbit.cu"
-    "csrc/speculative/speculative_sampling.cu"
 
     "${repo-flashinfer_SOURCE_DIR}/csrc/norm.cu"
     "${repo-flashinfer_SOURCE_DIR}/csrc/renorm.cu"

@@ -10,7 +10,7 @@ from sglang.test.server_fixtures.dsa_mtp_fixture import (
 
 register_cuda_ci(
     est_time=400,
-    stage="base-c",
+    stage="nightly",
     runner_config="8-gpu-h200",
 )
 
@@ -20,7 +20,7 @@ class TestGLM52DPMTP(
 ):
     model = "zai-org/GLM-5.2-FP8"
     mem_fraction_static = 0.88
-    enable_dp_attention = True
+    attn_dp_size = 8
     bs_1_speed_thres = 70
 
 

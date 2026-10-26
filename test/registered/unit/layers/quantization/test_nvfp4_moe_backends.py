@@ -12,7 +12,7 @@ import torch
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
 from sglang.srt.runtime_context import get_context, get_flags, get_parallel
-from sglang.srt.utils import get_device_sm
+from sglang.srt.utils import get_device_sm, round_up
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.layer_ut_utils import assert_output_close, init_single_process_dist
 from sglang.test.quant_ref_utils import (
@@ -35,7 +35,7 @@ class TestNvFp4MoeBackends(CustomTestCase):
         init_single_process_dist(master_port=29631)
         torch.set_default_device("cuda")
 
-    def _run_backend(self, backend: str):
+    def _run_backend(self, backend: str, intermediate_size: int = I):
         from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
         from sglang.srt.layers.moe.topk import TopKConfig, select_experts
 
@@ -58,7 +58,7 @@ class TestNvFp4MoeBackends(CustomTestCase):
             layer = FusedMoE(
                 num_experts=E,
                 hidden_size=H,
-                intermediate_size=I,
+                intermediate_size=intermediate_size,
                 layer_id=0,
                 top_k=TOPK,
                 params_dtype=torch.bfloat16,
@@ -69,14 +69,24 @@ class TestNvFp4MoeBackends(CustomTestCase):
             # Checkpoint-format shards through the real weight_loader;
             # gate/up placement stays the loader's job.
             refs = {
-                "w1": torch.zeros(E, I, H, dtype=torch.float32, device="cuda"),
-                "w3": torch.zeros(E, I, H, dtype=torch.float32, device="cuda"),
-                "w2": torch.zeros(E, H, I, dtype=torch.float32, device="cuda"),
+                "w1": torch.zeros(
+                    E, intermediate_size, H, dtype=torch.float32, device="cuda"
+                ),
+                "w3": torch.zeros(
+                    E, intermediate_size, H, dtype=torch.float32, device="cuda"
+                ),
+                "w2": torch.zeros(
+                    E, H, intermediate_size, dtype=torch.float32, device="cuda"
+                ),
             }
             act_scale = 1.0 / (FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX)
             for e in range(E):
                 for shard_id in ("w1", "w3", "w2"):
-                    rows, cols = (I, H) if shard_id in ("w1", "w3") else (H, I)
+                    rows, cols = (
+                        (intermediate_size, H)
+                        if shard_id in ("w1", "w3")
+                        else (H, intermediate_size)
+                    )
                     w = (
                         torch.randn(rows, cols, dtype=torch.bfloat16, device="cuda")
                         / 10
@@ -96,6 +106,21 @@ class TestNvFp4MoeBackends(CustomTestCase):
                         )
                     refs[shard_id][e] = w_dequant
             layer.quant_method.process_weights_after_loading(layer)
+            if backend == "flashinfer_trtllm":
+                expected_intermediate = round_up(intermediate_size, 64)
+                self.assertEqual(
+                    layer.intermediate_size_per_partition, expected_intermediate
+                )
+                self.assertEqual(
+                    layer.moe_runner_config.intermediate_size_per_partition,
+                    expected_intermediate,
+                )
+                self.assertEqual(
+                    layer.w13_weight.shape, (E, 2 * expected_intermediate, H // 2)
+                )
+                self.assertEqual(
+                    layer.w2_weight.shape, (E, H, expected_intermediate // 2)
+                )
 
             x = torch.randn(M, H, dtype=torch.bfloat16, device="cuda") / 10
             router_logits = torch.randn(M, E, dtype=torch.float32, device="cuda")
@@ -148,6 +173,12 @@ class TestNvFp4MoeBackends(CustomTestCase):
 
     def test_flashinfer_trtllm(self):
         self._run_backend("flashinfer_trtllm")
+
+    def test_flashinfer_trtllm_intermediate_alignment(self):
+        """Gated NVFP4 keeps 64-aligned expert widths without padding to 128."""
+        for intermediate_size in (160, 192, 256):
+            with self.subTest(intermediate_size=intermediate_size):
+                self._run_backend("flashinfer_trtllm", intermediate_size)
 
     def test_flashinfer_cutedsl(self):
         self._run_backend("flashinfer_cutedsl")

@@ -9,11 +9,13 @@
 #include <sgl_kernel/warp.cuh>
 
 #include <sgl_kernel/deepseek_v4/fp8_utils.cuh>
+#include <sgl_kernel/deepseek_v4/kv_layout.cuh>
 
 #include <tvm/ffi/container/tensor.h>
 
 #include <bit>
 #include <cstdint>
+#include <type_traits>
 
 namespace sglang {
 
@@ -78,7 +80,7 @@ struct FusedQNormRopeParams {
   float eps;
 };
 
-template <typename DType, int64_t kHeadDim, int64_t kRopeDim, typename PosT, bool kUsePDL>
+template <typename DType, int64_t kHeadDim, int64_t kRopeDim, typename PosT, bool kUsePDL, bool kApplyNorm>
 Q_KERNEL void fused_q_norm_rope(const __grid_constant__ FusedQNormRopeParams params) {
   using namespace device;
 
@@ -127,24 +129,26 @@ Q_KERNEL void fused_q_norm_rope(const __grid_constant__ FusedQNormRopeParams par
 
   const auto freq = mem_freq.load(params.freqs_cis + position * kRopeDim);
 
-  float sum_of_squares = 0.0f;
+  if constexpr (kApplyNorm) {
+    float sum_of_squares = 0.0f;
 #pragma unroll
-  for (int i = 0; i < kLocalSize; ++i) {
+    for (int i = 0; i < kLocalSize; ++i) {
 #pragma unroll
-    for (int j = 0; j < kVecSize; ++j) {
-      const auto x = cast<float>(input_vec[i][j]);
-      sum_of_squares += x * x;
+      for (int j = 0; j < kVecSize; ++j) {
+        const auto x = cast<float>(input_vec[i][j]);
+        sum_of_squares += x * x;
+      }
     }
-  }
-  sum_of_squares = warp::reduce_sum(sum_of_squares);
-  const auto norm_factor = math::rsqrt(sum_of_squares / kHeadDim + params.eps);
+    sum_of_squares = warp::reduce_sum(sum_of_squares);
+    const auto norm_factor = math::rsqrt(sum_of_squares / kHeadDim + params.eps);
 
 #pragma unroll
-  for (int i = 0; i < kLocalSize; ++i) {
+    for (int i = 0; i < kLocalSize; ++i) {
 #pragma unroll
-    for (int j = 0; j < kVecSize; ++j) {
-      const auto x = cast<float>(input_vec[i][j]);
-      input_vec[i][j] = cast<DType>(x * norm_factor);
+      for (int j = 0; j < kVecSize; ++j) {
+        const auto x = cast<float>(input_vec[i][j]);
+        input_vec[i][j] = cast<DType>(x * norm_factor);
+      }
     }
   }
 
@@ -170,17 +174,34 @@ Q_KERNEL void fused_q_norm_rope(const __grid_constant__ FusedQNormRopeParams par
   const auto elem = mem_elem.load(s_rope[warp_id]);
   const auto [x_real, x_imag] = cast<fp32x2_t>(elem);
   const auto [freq_real, freq_imag] = freq;
-  const fp32x2_t rotated = {
-      x_real * freq_real - x_imag * freq_imag,
-      x_real * freq_imag + x_imag * freq_real,
-  };
+#ifdef USE_ROCM
+  // gfx950 batched RoPE rounds the sine product, then one fma with the cosine. Only the
+  // kApplyNorm = false specialization replaces a kernel that rounded that way, so only it
+  // matches it; the norm path keeps the order it has always had.
+  constexpr bool kBatchedRopeOrder = !kApplyNorm;
+#else
+  constexpr bool kBatchedRopeOrder = false;
+#endif
+  fp32x2_t rotated;
+  if constexpr (kBatchedRopeOrder) {
+    rotated = {
+        fmaf(x_real, freq_real, -__fmul_rn(x_imag, freq_imag)),
+        fmaf(x_imag, freq_real, __fmul_rn(x_real, freq_imag)),
+    };
+  } else {
+    rotated = {
+        x_real * freq_real - x_imag * freq_imag,
+        x_real * freq_imag + x_imag * freq_real,
+    };
+  }
   mem_elem.store(output_ptr + (kHeadDim - kRopeDim), cast<DType2>(rotated));
 }
 
-template <typename DType, int64_t kHeadDim, int64_t kRopeDim, bool kUsePDL>
+// kApplyNorm = false only rotates the rope tail while copying Q into a (padded) output.
+template <typename DType, int64_t kHeadDim, int64_t kRopeDim, bool kApplyNorm, bool kUsePDL>
 struct FusedQNormRopeKernel {
   template <typename PosT>
-  static constexpr auto kernel = fused_q_norm_rope<DType, kHeadDim, kRopeDim, PosT, kUsePDL>;
+  static constexpr auto kernel = fused_q_norm_rope<DType, kHeadDim, kRopeDim, PosT, kUsePDL, kApplyNorm>;
 
   static void forward(
       const tvm::ffi::TensorView q_input,
@@ -257,15 +278,34 @@ struct FusedKNormRopeFlashMLAParams {
   int64_t kv_stride_batch;
   uint32_t batch_size;
   float eps;
+  // kRopeQ (ROCm): (B, num_q_heads, kHeadDim) DType; the trailing kRopeDim of every head
+  // are rotated in place with this token's frequencies by the same launch.
+  void* __restrict__ q = nullptr;
+  int64_t q_stride_batch = 0;
+  int64_t q_stride_head = 0;
+  uint32_t num_q_heads = 0;
 };
 
-template <typename DType, int64_t kHeadDim, int64_t kRopeDim, typename PosT, int32_t kPageBits, bool kUsePDL>
+// The V4.1 K RoPE with its fma pinned, so the two K kernels below round it the same way.
+SGL_DEVICE fp32x2_t v41_rope_pair(float x_real, float x_imag, float freq_real, float freq_imag) {
+  return {fmaf(x_real, freq_real, -(x_imag * freq_imag)), fmaf(x_real, freq_imag, x_imag * freq_real)};
+}
+
+template <
+    typename DType,
+    int64_t kHeadDim,
+    int64_t kRopeDim,
+    typename PosT,
+    int32_t kPageBits,
+    deepseek_v4::KVLayout kLayout,
+    bool kUsePDL,
+    bool kRopeQ = false>
 K_KERNEL void fused_k_norm_rope_flashmla(const __grid_constant__ FusedKNormRopeFlashMLAParams params) {
   using namespace device;
 
   constexpr int64_t kVecSize = 2;
   constexpr uint32_t kRopeWarp = kFusedKNumWarps - 1;
-  constexpr int64_t kPageBytes = host::div_ceil(584ll << kPageBits, 576) * 576;
+  using Paged = deepseek_v4::PagedKV<kLayout, kPageBits>;
   static_assert(kHeadDim == kFusedKBlockSize * kVecSize);
   static_assert(kRopeDim == kWarpThreads * kVecSize);
   static_assert(kHeadDim - kRopeDim == kRopeWarp * kWarpThreads * kVecSize);
@@ -280,10 +320,10 @@ K_KERNEL void fused_k_norm_rope_flashmla(const __grid_constant__ FusedKNormRopeF
 
   const auto input_ptr = static_cast<const DType*>(params.kv) + work_id * params.kv_stride_batch;
   const auto position = static_cast<int32_t>(static_cast<const PosT*>(params.positions)[work_id]);
-  const auto out_loc = params.out_loc[work_id];
   const auto freqs_cis = params.freqs_cis + position * kRopeDim;
 
   PDLWaitPrimary<kUsePDL>();
+  const auto out_loc = params.out_loc[work_id];
   Float2 data, freq;
 
   // part 1: norm. Each thread owns one 2-elem pack (the `tx`-th).
@@ -300,7 +340,7 @@ K_KERNEL void fused_k_norm_rope_flashmla(const __grid_constant__ FusedKNormRopeF
 #pragma unroll
     for (int i = 0; i < kVecSize; ++i) {
       const auto x = cast<float>(input_vec[i]);
-      sum_of_squares += x * x;
+      sum_of_squares = fmaf(x, x, sum_of_squares);
     }
     const auto warp_sum = warp::reduce_sum(sum_of_squares);
     if (lane_id == 0) partial_sums[warp_id] = warp_sum;
@@ -319,16 +359,57 @@ K_KERNEL void fused_k_norm_rope_flashmla(const __grid_constant__ FusedKNormRopeF
     }
   }
 
+  // Before the out_loc check: a row without a KV slot still ropes its query heads.
+  if constexpr (kRopeQ) {
+    // Query rope, pair j of head h at q[h * stride + kHeadDim - kRopeDim + 2j]: the cross product
+    // is rounded, then one fma with the cosine, so the bf16 result is bitwise the Triton flat
+    // rope kernel's on gfx950.
+    static_assert(std::is_same_v<DType, bf16_t>, "the in-place query rope reads q as bf16 pairs");
+    constexpr uint32_t kPairsPerHead = kRopeDim / 2;
+    const auto q_row = static_cast<DType*>(params.q) + work_id * params.q_stride_batch + (kHeadDim - kRopeDim);
+    const auto n_pairs = params.num_q_heads * kPairsPerHead;
+    for (uint32_t p = tx; p < n_pairs; p += kFusedKBlockSize) {
+      const auto head = p / kPairsPerHead;
+      const auto pair = p % kPairsPerHead;
+      auto* ptr = reinterpret_cast<bf16x2_t*>(q_row + head * params.q_stride_head) + pair;
+      const auto qv = cast<fp32x2_t>(*ptr);
+      const auto cos_v = freqs_cis[2 * pair];
+      const auto sin_v = freqs_cis[2 * pair + 1];
+      const float rot_real = -__fmul_rn(qv.y, sin_v);
+      const float rot_imag = __fmul_rn(qv.x, sin_v);
+      const float out_real = fmaf(qv.x, cos_v, rot_real);
+      const float out_imag = fmaf(qv.y, cos_v, rot_imag);
+      *ptr = cast<bf16x2_t>(fp32x2_t{out_real, out_imag});
+    }
+  }
+
   // A negative out_loc marks a slot with no KV write target (e.g. the -1
   // sentinel from the full->SWA translation for out-of-window tokens or
   // padded rows); skip the row instead of writing out of bounds. Checked
   // here, not at the load, so the out_loc prefetch overlaps the norm above.
   if (out_loc < 0) return;
 
-  const int32_t page = out_loc >> kPageBits;
-  const int32_t offset = out_loc & ((1 << kPageBits) - 1);
-  const auto page_ptr = params.kvcache + page * kPageBytes;
-  const auto value_ptr = page_ptr + offset * 576;
+  const auto row = Paged::row(params.kvcache, out_loc);
+
+  if constexpr (kLayout != deepseek_v4::KVLayout::V4) {
+    // V4.1 layouts: every dim is quantized, one scale per 32 (fp8) or 16 (fp4) values. The
+    // reference rotates in bf16, so round the normed values, rotate, round again, then quantize.
+    using Packed = packed_t<DType>;
+    PDLTriggerSecondary<kUsePDL>();
+
+    auto rounded = cast<fp32x2_t>(cast<Packed>(fp32x2_t{data[0], data[1]}));
+    if (warp_id == kRopeWarp) {
+      const auto x_real = rounded.x;
+      const auto x_imag = rounded.y;
+      const auto freq_real = freq[0];
+      const auto freq_imag = freq[1];
+      rounded = cast<fp32x2_t>(cast<Packed>(v41_rope_pair(x_real, x_imag, freq_real, freq_imag)));
+    }
+    const float v[2] = {rounded.x, rounded.y};
+    return deepseek_v4::v41::store_row<kLayout>(row.data, row.scale, tx, v);
+  }
+
+  const auto value_ptr = row.data;
 
   PDLTriggerSecondary<kUsePDL>();
 
@@ -351,22 +432,157 @@ K_KERNEL void fused_k_norm_rope_flashmla(const __grid_constant__ FusedKNormRopeF
     const auto scale_ue8m0 = cast_to_ue8m0(scale_raw);
     const auto inv_scale = inv_scale_ue8m0(scale_ue8m0);
     const auto result = pack_fp8(x * inv_scale, y * inv_scale);
-    const auto scale_ptr = page_ptr + (576 << kPageBits) + offset * 8;
+    const auto scale_ptr = row.scale;
     reinterpret_cast<fp8x2_e4m3_t*>(value_ptr)[tx] = result;
     if (lane_id == 0) static_cast<uint8_t*>(scale_ptr)[warp_id] = scale_ue8m0;
   }
 }
 
-template <typename DType, int64_t kHeadDim, int64_t kRopeDim, uint32_t kPageSize, bool kUsePDL>
+// The sum of squares is added in the order of `fused_k_norm_rope_flashmla` (its thread t is
+// pair t % 8 of lane t / 8 here), so both kernels write bitwise-equal rows.
+constexpr uint32_t kFusedKV41WarpsPerCTA = 4;
+// Below this many tokens the block-per-token kernel is as fast (decode, short prefill).
+constexpr uint32_t kFusedKV41MinTokens = 2048;
+
+// HIP's __shfl_xor_sync traps if a masked lane has returned, and a returned warp idles half a wave64
+SGL_DEVICE float shfl_xor_in_warp(float value, uint32_t lane_mask) {
+#ifndef USE_ROCM
+  return __shfl_xor_sync(0xffffffffu, value, lane_mask);
+#else
+  return __shfl_xor(value, lane_mask);
+#endif
+}
+
+template <
+    typename DType,
+    int64_t kHeadDim,
+    int64_t kRopeDim,
+    typename PosT,
+    int32_t kPageBits,
+    deepseek_v4::KVLayout kLayout,
+    bool kUsePDL>
+__global__ __launch_bounds__(kFusedKV41WarpsPerCTA* device::kWarpThreads) void fused_k_norm_rope_flashmla_v41(
+    const __grid_constant__ FusedKNormRopeFlashMLAParams params) {
+  using namespace device;
+
+  constexpr uint32_t kPerLane = kHeadDim / kWarpThreads;
+  constexpr uint32_t kPairs = kPerLane / 2;
+  constexpr uint32_t kRopeLane = (kHeadDim - kRopeDim) / kPerLane;
+  static_assert(kLayout != deepseek_v4::KVLayout::V4);
+  static_assert(kHeadDim == 512 && kRopeDim == 64 && kFusedKBlockSize == kWarpThreads * kPairs);
+  using Paged = deepseek_v4::PagedKV<kLayout, kPageBits>;
+  using Packed = packed_t<DType>;
+  using Half = AlignedVector<DType, kPerLane / 2>;
+  using Freq = AlignedVector<float, 4>;
+
+  const auto lane_id = threadIdx.x % kWarpThreads;
+  const auto work_id = blockIdx.x * kFusedKV41WarpsPerCTA + threadIdx.x / kWarpThreads;
+  if (work_id >= params.batch_size) return;
+
+  const auto input_ptr = static_cast<const DType*>(params.kv) + work_id * params.kv_stride_batch;
+  const auto position = static_cast<int32_t>(static_cast<const PosT*>(params.positions)[work_id]);
+
+  PDLWaitPrimary<kUsePDL>();
+  const auto out_loc = params.out_loc[work_id];
+
+  Half input_vec[2], weight_vec[2];
+  Freq freq[kPerLane / 4];
+#pragma unroll
+  for (uint32_t h = 0; h < 2; ++h) {
+    input_vec[h].load(input_ptr, 2 * lane_id + h);
+    weight_vec[h].load(params.kv_weight, 2 * lane_id + h);
+  }
+  if (lane_id >= kRopeLane) {
+    const auto freqs_cis = params.freqs_cis + position * kRopeDim + (lane_id - kRopeLane) * kPerLane;
+#pragma unroll
+    for (uint32_t f = 0; f < kPerLane / 4; ++f)
+      freq[f].load(freqs_cis, f);
+  }
+
+  float x[kPerLane], sums[kPairs];
+#pragma unroll
+  for (uint32_t i = 0; i < kPerLane; ++i)
+    x[i] = cast<float>(input_vec[i / (kPerLane / 2)][i % (kPerLane / 2)]);
+#pragma unroll
+  for (uint32_t p = 0; p < kPairs; ++p) {
+    float sum_of_squares = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+      const auto v = x[2 * p + i];
+      sum_of_squares = fmaf(v, v, sum_of_squares);
+    }
+    sums[p] = sum_of_squares;
+  }
+  // The reference tree: in-warp masks 16, 8 (lane bits 1, 0 here), then 4, 2, 1 (the pair),
+  // then across its warps masks 4, 2, 1 (lane bits 4, 3, 2).
+#pragma unroll
+  for (uint32_t mask = 2; mask >= 1; mask >>= 1) {
+#pragma unroll
+    for (uint32_t p = 0; p < kPairs; ++p)
+      sums[p] += shfl_xor_in_warp(sums[p], mask);
+  }
+#pragma unroll
+  for (uint32_t half = kPairs / 2; half >= 1; half >>= 1) {
+#pragma unroll
+    for (uint32_t p = 0; p < half; ++p)
+      sums[p] += sums[p + half];
+  }
+  float sum_of_squares = sums[0];
+#pragma unroll
+  for (uint32_t mask = 16; mask >= 4; mask >>= 1)
+    sum_of_squares += shfl_xor_in_warp(sum_of_squares, mask);
+  const auto norm_factor = math::rsqrt(sum_of_squares / kHeadDim + params.eps);
+
+  // As in the reference: round the normed values, rotate the RoPE tail, round again.
+  float v[kPerLane];
+#pragma unroll
+  for (uint32_t p = 0; p < kPairs; ++p) {
+    float data[2];
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+      const auto w = cast<float>(weight_vec[(2 * p + i) / (kPerLane / 2)][(2 * p + i) % (kPerLane / 2)]);
+      data[i] = x[2 * p + i] * norm_factor * w;
+    }
+    auto rounded = cast<fp32x2_t>(cast<Packed>(fp32x2_t{data[0], data[1]}));
+    if (lane_id >= kRopeLane) {
+      const auto x_real = rounded.x;
+      const auto x_imag = rounded.y;
+      const auto freq_real = freq[p / 2][2 * (p % 2)];
+      const auto freq_imag = freq[p / 2][2 * (p % 2) + 1];
+      rounded = cast<fp32x2_t>(cast<Packed>(v41_rope_pair(x_real, x_imag, freq_real, freq_imag)));
+    }
+    v[2 * p] = rounded.x;
+    v[2 * p + 1] = rounded.y;
+  }
+
+  // Warp-uniform: one token per warp, so the store's lane reductions see a full warp.
+  if (out_loc < 0) return;
+  PDLTriggerSecondary<kUsePDL>();
+  const auto row = Paged::row(params.kvcache, out_loc);
+  deepseek_v4::v41::store_row<kLayout>(row.data, row.scale, lane_id, v);
+}
+
+template <
+    typename DType,
+    int64_t kHeadDim,
+    int64_t kRopeDim,
+    uint32_t kPageSize,
+    deepseek_v4::KVLayout kLayout,
+    bool kUsePDL>
 struct FusedKNormRopeFlashMLAKernel {
   static constexpr int32_t kLogPageSize = std::countr_zero(kPageSize);
-  static constexpr int64_t kPageBytes = host::div_ceil(584 * kPageSize, 576) * 576;
+  static constexpr int64_t kPageBytes = deepseek_v4::kv_page_bytes<kLayout>(kPageSize);
+  static_assert(kLayout != deepseek_v4::KVLayout::V4 || kPageBytes == host::div_ceil(584 * kPageSize, 576) * 576);
   static_assert(std::has_single_bit(kPageSize), "kPageSize must be a power of 2");
   static_assert(1 << kLogPageSize == kPageSize);
   static_assert(kHeadDim == 512 && kRopeDim == 64, "FlashMLA layout requires (512, 64)");
 
+  template <typename PosT, bool kRopeQ>
+  static constexpr auto kernel =
+      fused_k_norm_rope_flashmla<DType, kHeadDim, kRopeDim, PosT, kLogPageSize, kLayout, kUsePDL, kRopeQ>;
   template <typename PosT>
-  static constexpr auto kernel = fused_k_norm_rope_flashmla<DType, kHeadDim, kRopeDim, PosT, kLogPageSize, kUsePDL>;
+  static constexpr auto kernel_v41 =
+      fused_k_norm_rope_flashmla_v41<DType, kHeadDim, kRopeDim, PosT, kLogPageSize, kLayout, kUsePDL>;
 
   static void forward(
       const tvm::ffi::TensorView kv,
@@ -376,6 +592,33 @@ struct FusedKNormRopeFlashMLAKernel {
       const tvm::ffi::TensorView out_loc,
       const tvm::ffi::TensorView kvcache,
       float eps) {
+    forward_impl<false>(kv, kv_weight, freqs_cis, positions, out_loc, kvcache, eps, nullptr);
+  }
+
+  /// `forward` with the same tokens' query heads `q` (B, H, kHeadDim) roped in place (ROCm).
+  static void forward_with_q(
+      const tvm::ffi::TensorView kv,
+      const tvm::ffi::TensorView kv_weight,
+      const tvm::ffi::TensorView freqs_cis,
+      const tvm::ffi::TensorView positions,
+      const tvm::ffi::TensorView out_loc,
+      const tvm::ffi::TensorView kvcache,
+      float eps,
+      const tvm::ffi::TensorView q) {
+    forward_impl<true>(kv, kv_weight, freqs_cis, positions, out_loc, kvcache, eps, &q);
+  }
+
+ private:
+  template <bool kRopeQ>
+  static void forward_impl(
+      const tvm::ffi::TensorView kv,
+      const tvm::ffi::TensorView kv_weight,
+      const tvm::ffi::TensorView freqs_cis,
+      const tvm::ffi::TensorView positions,
+      const tvm::ffi::TensorView out_loc,
+      const tvm::ffi::TensorView kvcache,
+      float eps,
+      const tvm::ffi::TensorView* q) {
     using namespace host;
 
     auto B = SymbolicSize{"batch_size"};
@@ -413,7 +656,7 @@ struct FusedKNormRopeFlashMLAKernel {
     const auto batch_size = static_cast<uint32_t>(B.unwrap());
     if (batch_size == 0) return;
 
-    const auto params = FusedKNormRopeFlashMLAParams{
+    auto params = FusedKNormRopeFlashMLAParams{
         .kv = kv.data_ptr(),
         .kv_weight = kv_weight.data_ptr(),
         .freqs_cis = static_cast<const float*>(freqs_cis.data_ptr()),
@@ -424,8 +667,31 @@ struct FusedKNormRopeFlashMLAKernel {
         .batch_size = batch_size,
         .eps = eps,
     };
-    const auto k_int32 = kernel<int32_t>;
-    const auto k_int64 = kernel<int64_t>;
+    if constexpr (kRopeQ) {
+      auto H = SymbolicSize{"num_q_heads"};
+      TensorMatcher({B, H, kHeadDim})  //
+          .with_strides({-1, -1, 1})
+          .with_dtype<DType>()
+          .with_device(device_)
+          .verify(*q);
+      // The rope pairs are read and written as 4-byte packs.
+      RuntimeCheck(q->stride(1) % 2 == 0 && q->stride(0) % 2 == 0, "q strides must be even");
+      params.q = q->data_ptr();
+      params.q_stride_batch = q->stride(0);
+      params.q_stride_head = q->stride(1);
+      params.num_q_heads = static_cast<uint32_t>(H.unwrap());
+    }
+    if constexpr (kLayout != deepseek_v4::KVLayout::V4 && !kRopeQ) {
+      if (batch_size >= kFusedKV41MinTokens) {
+        const auto k = pos_dtype.is_type<int32_t>() ? kernel_v41<int32_t> : kernel_v41<int64_t>;
+        LaunchKernel(
+            div_ceil(batch_size, kFusedKV41WarpsPerCTA), kFusedKV41WarpsPerCTA * device::kWarpThreads, device_.unwrap())
+            .enable_pdl(kUsePDL)(k, params);
+        return;
+      }
+    }
+    const auto k_int32 = kernel<int32_t, kRopeQ>;
+    const auto k_int64 = kernel<int64_t, kRopeQ>;
     const auto k = pos_dtype.is_type<int32_t>() ? k_int32 : k_int64;
     LaunchKernel(batch_size, kFusedKBlockSize, device_.unwrap())  //
         .enable_pdl(kUsePDL)(k, params);
@@ -880,5 +1146,8 @@ struct FusedQIndexerRopeHadamardFp4QuantKernel {
     LaunchKernel(num_blocks, kFusedQBlockSize, device_.unwrap()).enable_pdl(kUsePDL)(k, params);
   }
 };
+
+// The JIT module names and wrappers spell the layouts as bare enumerators.
+using enum deepseek_v4::KVLayout;
 
 }  // namespace sglang

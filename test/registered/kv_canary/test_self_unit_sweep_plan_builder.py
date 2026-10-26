@@ -8,8 +8,8 @@ from sglang.srt.kv_canary.sweep_plan_builder import build_verify_plan_radix_swee
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kv_canary.fixtures import (
     DEFAULT_DEVICE,
-    make_radix_cache,
     make_req_to_token_pool,
+    make_unified_radix_chain,
 )
 from sglang.test.test_utils import CustomTestCase
 
@@ -23,7 +23,7 @@ class TestSelfUnitSweepPlanBuilder(CustomTestCase):
 
     def test_build_verify_plan_radix_sweep(self) -> None:
         """Verify radix sweep verify plans include cached slot chains."""
-        empty_cache = make_radix_cache([[]], device=self.device)
+        empty_cache = make_unified_radix_chain([], device=self.device)
         empty_cache.req_to_token_pool = make_req_to_token_pool(self.device)
         empty_out = build_verify_plan_radix_sweep(
             radix_cache=empty_cache,
@@ -32,7 +32,7 @@ class TestSelfUnitSweepPlanBuilder(CustomTestCase):
         )
         self.assertEqual(int(empty_out.verify_num_valid.item()), 0)
 
-        cache = make_radix_cache([[], [100, 101, 102]], device=self.device)
+        cache = make_unified_radix_chain([[100, 101, 102]], device=self.device)
         cache.req_to_token_pool = make_req_to_token_pool(self.device)
         out = build_verify_plan_radix_sweep(
             radix_cache=cache,
@@ -49,7 +49,7 @@ class TestSelfUnitSweepPlanBuilder(CustomTestCase):
 
     def test_radix_held_slot_still_swept(self) -> None:
         """Verify held radix slots are still included in sweep plans."""
-        cache = make_radix_cache([[], [42, 43, 44]], device=self.device)
+        cache = make_unified_radix_chain([[42, 43, 44]], device=self.device)
         cache.req_to_token_pool = make_req_to_token_pool(self.device)
         out = build_verify_plan_radix_sweep(
             radix_cache=cache,
@@ -64,7 +64,7 @@ class TestSelfUnitSweepPlanBuilder(CustomTestCase):
 
     def test_truly_free_slot_not_swept(self) -> None:
         """Verify free radix slots are excluded from sweep plans."""
-        empty_cache = make_radix_cache([[]], device=self.device)
+        empty_cache = make_unified_radix_chain([], device=self.device)
         empty_cache.req_to_token_pool = make_req_to_token_pool(self.device)
         out = build_verify_plan_radix_sweep(
             radix_cache=empty_cache,
@@ -75,7 +75,7 @@ class TestSelfUnitSweepPlanBuilder(CustomTestCase):
 
     def test_swa_translate_preserves_evicted_as_padding_sentinel(self) -> None:
         """Evicted (LUT=0) slots stay in the plan as the padding sentinel; the kernel does the skipping."""
-        cache = make_radix_cache([[], [100, 101, 102]], device=self.device)
+        cache = make_unified_radix_chain([[100, 101, 102]], device=self.device)
         cache.req_to_token_pool = make_req_to_token_pool(self.device)
 
         lut = torch.zeros(200, dtype=torch.int64, device=self.device)

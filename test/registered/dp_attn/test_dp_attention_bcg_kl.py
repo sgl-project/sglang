@@ -220,9 +220,8 @@ class _DPAttentionPrefillCudaGraphKLMixin:
                 "--trust-remote-code",
                 "--tp",
                 "2",
-                "--dp",
+                "--attn-dp-size",
                 "2",
-                "--enable-dp-attention",
                 "--enable-deterministic-inference",
                 "--attention-backend",
                 cls.attention_backend,
@@ -287,7 +286,7 @@ class _DPAttentionPrefillCudaGraphKLMixin:
     def test_prefill_and_decode_cache_hit_kl_is_zero(self):
         server_info = requests.get(self.base_url + "/server_info", timeout=30).json()
         self.assertFalse(server_info["disable_radix_cache"])
-        self.assertTrue(server_info["enable_dp_attention"])
+        self.assertEqual(server_info["attn_dp_size"], 2)
         self.assertTrue(server_info["enable_deterministic_inference"])
         self.assertEqual(server_info["attention_backend"], self.attention_backend)
         self.assertEqual(

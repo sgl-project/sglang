@@ -5,8 +5,17 @@ import torch
 from torch import nn
 from transformers import Exaone4Config
 
-from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.layer_boundary import (
+    append_stages,
+    declare_attn,
+    declare_ffn,
+)
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
+from sglang.srt.layers.layer_boundary.residual.post_norm import (
+    PLAIN_READOUT,
+    PostNormAdd,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -29,7 +38,7 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix, make_layers
+from sglang.srt.utils import add_prefix, make_pp_layers
 from sglang.utils import get_exception_traceback, logger
 
 
@@ -65,6 +74,7 @@ class Exaone4GatedMLP(nn.Module):
             hidden_size,
             bias=bias,
             quant_config=quant_config,
+            reduce_results=False,
             prefix=add_prefix("down_proj", prefix),
         )
         if hidden_act != "silu":
@@ -102,9 +112,6 @@ class Exaone4Attention(nn.Module):
         self.hidden_size = hidden_size
         tp_size = get_parallel().tp_size
 
-        attn_tp_rank = get_parallel().attn_tp_rank
-        attn_tp_size = get_parallel().attn_tp_size
-
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size
@@ -134,8 +141,7 @@ class Exaone4Attention(nn.Module):
             bias=bias,
             quant_config=quant_config,
             prefix=add_prefix("qkv_proj", prefix),
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
         )
 
         self.o_proj = RowParallelLinear(
@@ -143,9 +149,9 @@ class Exaone4Attention(nn.Module):
             output_size=hidden_size,
             bias=bias_o_proj,
             quant_config=quant_config,
+            reduce_results=False,
             prefix=add_prefix("o_proj", prefix),
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
         )
 
         is_neox_style = True
@@ -234,9 +240,6 @@ class Exaone4DecoderLayer(nn.Module):
 
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
 
-        self.attn_tp_size = get_parallel().attn_tp_size
-        self.attn_tp_rank = get_parallel().attn_tp_rank
-
         self.self_attn = Exaone4Attention(
             config=config,
             hidden_size=self.hidden_size,
@@ -264,39 +267,60 @@ class Exaone4DecoderLayer(nn.Module):
         self.post_feedforward_layernorm = RMSNorm(
             self.hidden_size, eps=config.rms_norm_eps
         )
+        attn, ffn = self.stage_facts(
+            config,
+            layer_id,
+            post_attention_layernorm=self.post_attention_layernorm,
+            post_feedforward_layernorm=self.post_feedforward_layernorm,
+        )
+        self.attn_boundary, self.ffn_boundary = append_stages((attn, None), (ffn, None))
+
+    @staticmethod
+    def stage_facts(
+        config: Exaone4Config,
+        layer_id: int,
+        *,
+        post_attention_layernorm=None,
+        post_feedforward_layernorm=None,
+    ):
+        """The stages an EXAONE 4.0 layer declares, from the config alone: the
+        model's shared declaration function, which the layer declares with
+        too (see make_layers). The output norms are what the updates add."""
+        # Post-LN: each stage reads the residual as it is, and its output is
+        # normalized before it is added. The layer writes the FFN's itself.
+        ffn_update = PostNormAdd(post_feedforward_layernorm, applied_at_exit=True)
+        return (
+            declare_attn(
+                read=PLAIN_READOUT,
+                update=PostNormAdd(post_attention_layernorm),
+            ),
+            declare_ffn(
+                sparse=False,
+                next_layer_sparse=False,
+                read=PLAIN_READOUT,
+                update=ffn_update,
+            ),
+        )
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        residual: Optional[torch.Tensor],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-
-        if residual is None:
-            residual = hidden_states
-
+    ) -> torch.Tensor:
         # Self Attention
+        hidden_states = self.attn_boundary.prepare(hidden_states, forward_batch)
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
         )
 
-        # Use post-LN
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = hidden_states + residual
-        residual = hidden_states
-
         # Fully Connected
+        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
         hidden_states = self.mlp(hidden_states)
-
-        # Use post-LN
-        hidden_states = self.post_feedforward_layernorm(hidden_states)
-        hidden_states = hidden_states + residual
-        residual = hidden_states
-
-        return hidden_states, residual
+        return self.ffn_boundary.finish(hidden_states, forward_batch)
 
 
 class Exaone4Model(nn.Module):
@@ -310,7 +334,7 @@ class Exaone4Model(nn.Module):
         self.config = config
         self.quant_config = quant_config
         self.vocab_size = config.vocab_size
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
@@ -321,7 +345,7 @@ class Exaone4Model(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
-        self.layers, self.start_layer, self.end_layer = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             lambda idx, prefix: Exaone4DecoderLayer(
                 config=config,
@@ -329,9 +353,8 @@ class Exaone4Model(nn.Module):
                 layer_id=idx,
                 prefix=prefix,
             ),
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
             prefix=add_prefix("layers", prefix),
+            stage_facts=lambda idx: Exaone4DecoderLayer.stage_facts(config, idx),
         )
         if self.pp_group.is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -354,30 +377,18 @@ class Exaone4Model(nn.Module):
                 hidden_states = self.get_input_embeddings(input_ids)
             else:
                 hidden_states = input_embeds
-            residual = None
+            residual_batch.start(forward_batch)
         else:
             assert pp_proxy_tensors is not None
-            hidden_states = pp_proxy_tensors["hidden_states"]
-            residual = pp_proxy_tensors["residual"]
+            hidden_states = self.layers[self.start_layer].attn_boundary.from_pp(
+                pp_proxy_tensors, forward_batch
+            )
 
-        for i in range(len(self.layers)):
-            layer = self.layers[i]
-            hidden_states, residual = layer(
-                positions,
-                hidden_states,
-                forward_batch,
-                residual,
-            )
+        for i in range(self.start_layer, self.end_layer):
+            hidden_states = self.layers[i](positions, hidden_states, forward_batch)
         if not self.pp_group.is_last_rank:
-            return PPProxyTensors(
-                {
-                    "hidden_states": hidden_states,
-                    "residual": residual,
-                }
-            )
-        else:
-            hidden_states = self.norm(hidden_states)
-        return hidden_states
+            return residual_batch.to_pp(hidden_states, forward_batch)
+        return residual_batch.final_norm(hidden_states, forward_batch, self.norm)
 
 
 class Exaone4ForCausalLM(nn.Module):
@@ -423,14 +434,14 @@ class Exaone4ForCausalLM(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
         self.quant_config = quant_config
 
         self.model = self._init_model(config, quant_config, add_prefix("model", prefix))
         # Exaone-4.0 32B set tie_word_embeddins to False
         # Exaone-4.0 1.2B set tie_word_embeddins to True
-        if config.tie_word_embeddings:
+        if config.tie_word_embeddings and self.pp_group.world_size == 1:
             self.lm_head = self.model.embed_tokens
         else:
             self.lm_head = ParallelLMHead(
@@ -498,6 +509,7 @@ class Exaone4ForCausalLM(nn.Module):
         start, end = split_interval
         # embed
         if start == 0:
+            residual_batch.start(forward_batch)
             if input_embeds is None:
                 forward_batch.hidden_states = self.model.embed_tokens(input_ids)
             else:
@@ -505,19 +517,17 @@ class Exaone4ForCausalLM(nn.Module):
         # decoder layer
         for i in range(start, end):
             layer = self.model.layers[i]
-            forward_batch.hidden_states, forward_batch.residual = layer(
+            forward_batch.hidden_states = layer(
                 positions,
                 forward_batch.hidden_states,
                 forward_batch,
-                forward_batch.residual,
             )
 
         if end == self.model.config.num_hidden_layers:
             # norm
-            hidden_states, _ = self.model.norm(
-                forward_batch.hidden_states, forward_batch.residual
+            forward_batch.hidden_states = residual_batch.final_norm(
+                forward_batch.hidden_states, forward_batch, self.model.norm
             )
-            forward_batch.hidden_states = hidden_states
             # logits process
             result = self.logits_processor(
                 input_ids, forward_batch.hidden_states, self.lm_head, forward_batch
@@ -571,6 +581,15 @@ class Exaone4ForCausalLM(nn.Module):
                 continue
             if self.config.tie_word_embeddings and "lm_head.weight" in name:
                 continue
+            if (
+                name == "model.embed_tokens.weight"
+                and self.config.tie_word_embeddings
+                and self.pp_group.world_size > 1
+            ):
+                if self.pp_group.is_last_rank:
+                    name = "lm_head.weight"
+                elif not self.pp_group.is_first_rank:
+                    continue
             # Handle FP8 kv-scale remapping
             if "scale" in name:
                 name = maybe_remap_kv_scale_name(name, params_dict)

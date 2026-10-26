@@ -207,9 +207,8 @@ class TestServerUpdateWeightsFromDiskMXFP8(UpdateWeightsFromDiskBase, CustomTest
             "other_args": (
                 "--tp-size",
                 "4",
-                "--dp-size",
+                "--attn-dp-size",
                 "4",
-                "--enable-dp-attention",
                 "--fp8-gemm-backend",
                 "flashinfer_trtllm",
                 "--moe-runner-backend",
@@ -286,9 +285,8 @@ class TestServerUpdateWeightsFromDiskNVFP4W4A16CuteDSL(
             "other_args": (
                 "--tp-size",
                 "4",
-                "--dp-size",
+                "--attn-dp-size",
                 "4",
-                "--enable-dp-attention",
                 "--ep-size",
                 "4",
                 "--fp4-gemm-backend",
@@ -296,6 +294,39 @@ class TestServerUpdateWeightsFromDiskNVFP4W4A16CuteDSL(
                 "--moe-runner-backend",
                 "flashinfer_cutedsl",
                 "--enable-deterministic-inference",
+            ),
+        },
+    )
+
+
+class TestServerUpdateWeightsFromDiskNVFP4W4A16MegaMoE(
+    UpdateWeightsFromDiskBase, CustomTestCase
+):
+    model = "nvidia/Qwen3-30B-A3B-NVFP4"
+    decode_payload = {**UpdateWeightsFromDiskBase.decode_payload, "routed_dp_rank": 0}
+    launch_env = {
+        "SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16": "1",
+        "SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE": "0",
+        "SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION": "0",
+    }
+    backend_test_suites = (
+        {
+            "name": "flashinfer_megamoe_nvfp4_w4a16",
+            "other_args": (
+                "--dtype",
+                "bfloat16",
+                "--tp-size",
+                "4",
+                "--attn-dp-size",
+                "4",
+                "--ep-size",
+                "4",
+                "--fp4-gemm-backend",
+                "flashinfer_cutedsl",
+                "--moe-runner-backend",
+                "flashinfer_megamoe",
+                "--moe-a2a-backend",
+                "flashinfer_megamoe",
             ),
         },
     )

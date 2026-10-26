@@ -25,8 +25,6 @@ SGLang offers multiple installation methods. You can choose the most suitable in
 
 Please refer to the [official SGLang installation guide](../../../docs/get-started/install) for installation instructions.
 
-For SGLang CPU installation, please refer to the [CPU version installation guide](../../../docs/hardware-platforms/cpu_server#installation).
-
 ## 3.Model Deployment
 
 This section provides deployment configurations optimized for different hardware platforms and use cases.
@@ -640,8 +638,12 @@ Max ITL (ms):                            621.42
 - **Benchmark Command:**
 
 ```shell Command
-python3 -m sglang.test.few_shot_gsm8k --num-questions 200 --port 8000
+sgl-eval run gsm8k \
+  --base-url http://127.0.0.1:8000/v1 \
+  --num-examples 200
 ```
+
+The command above uses sgl-eval. Historical scores from other harnesses are not directly comparable; rerun this command for a matching result.
 
 - **Results**:
 

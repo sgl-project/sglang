@@ -122,12 +122,6 @@ class TestServerArgsAnnotatedCli(CustomTestCase):
         self.assertEqual(sa.deepep_mode, "low_latency")
         self.assertEqual(sa.elastic_ep_backend, "none")
 
-    def test_image_processor_backend_choices(self):
-        for backend in ("auto", "torchvision", "pil"):
-            with self.subTest(backend=backend):
-                sa = self._parse(["--image-processor-backend", backend])
-                self.assertEqual(sa.image_processor_backend, backend)
-
     def test_startup_weight_load_mode(self):
         """The startup loading mode keeps serial as the safe default."""
         serial = self._parse([])
@@ -174,7 +168,7 @@ class TestServerArgsAnnotatedCli(CustomTestCase):
             return sa.disable_cuda_graph, config.decode.backend, config.prefill.backend
 
         # Not a literal: the prefill default is BREAKABLE on CUDA and
-        # TC_PIECEWISE elsewhere, and this file runs on the CPU runner.
+        # disabled elsewhere, and this file runs on the CPU runner.
         self.assertEqual(backends([]), (False, Backend.FULL, default_prefill_backend()))
         self.assertEqual(
             backends(["--disable-cuda-graph"]),
@@ -184,9 +178,10 @@ class TestServerArgsAnnotatedCli(CustomTestCase):
     def test_each_deprecation_shape_does_its_job(self):
         """The four `Deprecated*Action` shapes, on a throwaway parser.
 
-        Only `DeprecatedStoreTrueAction` has a registration in `ServerArgs`
-        today (`--disable-cuda-graph`, covered above). The other three are kept
-        for the next flag that needs them, which makes this the only thing
+        Only `DeprecatedStoreTrueAction` has registrations in `ServerArgs`
+        today (`--disable-cuda-graph`, covered above, and
+        `--enable-dp-attention`). The other three are kept for the next flag
+        that needs them, which makes this the only thing
         standing between them and silent rot -- and it doubles as the worked
         example of which shape to reach for.
         """
