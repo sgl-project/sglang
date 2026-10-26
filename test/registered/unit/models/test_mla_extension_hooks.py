@@ -30,7 +30,7 @@ def test_prepare_dispatches_hooks_and_preserves_index_reuse(
     query = torch.randn(rows, heads, rank + rope).to(torch.bfloat16)
     positions = torch.arange(rows)
     hidden = torch.randn(rows, 8)
-    batch = SimpleNamespace(forward_mode=mode)
+    batch = SimpleNamespace(forward_mode=mode, attn_cp_metadata=None)
     previous = torch.tensor([[0, 1], [0, 2], [1, 2]])
     indices = torch.tensor([[1, 0], [2, 0], [2, 1]])
     rotary = Mock(side_effect=lambda pos, q, k: (q + 10, k + 20))
