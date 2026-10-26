@@ -14,11 +14,12 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
 from sglang.srt.mem_cache.page_interleave_pool import PageInterleaveDSATokenToKVPool
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
-class TestShardedDSAHiCache(unittest.TestCase):
+class TestShardedDSAHiCache(CustomTestCase):
     def test_draft_gather_binds_same_final_controller_counter(self):
         target = PageInterleaveDSATokenToKVPool.__new__(PageInterleaveDSATokenToKVPool)
         draft = PageInterleaveDSATokenToKVPool.__new__(PageInterleaveDSATokenToKVPool)

@@ -14,6 +14,7 @@ import numpy as np
 from sglang.srt.disaggregation.base.conn import KVPoll, KVTransferMetric, StateType
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager, MooncakeKVSender
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -78,8 +79,9 @@ def _send_state(mgr, peer, src_pages, dst_pages):
         )
 
 
-class TestDSAShardedPDTransfer(unittest.TestCase):
+class TestDSAShardedPDTransfer(CustomTestCase):
     def setUp(self):
+        super().setUp()
         override = patch(
             "sglang.srt.disaggregation.mooncake.conn.get_parallel",
             return_value=SimpleNamespace(enable_kv_cache_sharding=True),

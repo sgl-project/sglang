@@ -25,6 +25,13 @@ PAGE_SIZE = 64
 PREFILL_POOL_TOKENS = 4096  # Per rank: CP2 has 8192 logical GPU slots.
 PRESSURE_TOKENS = 6144
 FILLER = "The grass is green. The sky is blue. Here we go, there and back again. "
+# Both workers run on one host. Use CUDA IPC for ordinary CUDA allocations;
+# fabric NVLink cannot import them on GB300 runners without a visible HCA.
+MOONCAKE_ENV = {
+    "MC_INTRANODE_NVLINK": "true",
+    "SGLANG_MOONCAKE_CUSTOM_MEM_POOL": "INTRA_NODE_NVLINK",
+    "SGLANG_DISAGG_STAGING_BUFFER": "0",
+}
 COMMON_ARGS = [
     "--page-size",
     "64",
@@ -62,10 +69,10 @@ class TestGLM52PDShardedHiCache(PDDisaggregationServerBase):
     prefill_tp_size = decode_tp_size = 2
     decode_base_gpu_id = 2
     extra_prefill_env = {
+        **MOONCAKE_ENV,
         "SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND": "python",
-        "SGLANG_DISAGG_STAGING_BUFFER": "0",
     }
-    extra_decode_env = {"SGLANG_DISAGG_STAGING_BUFFER": "0"}
+    extra_decode_env = dict(MOONCAKE_ENV)
     extra_prefill_args = COMMON_ARGS + [
         "--enable-kv-cache-sharding",
         "--enable-prefill-cp",
