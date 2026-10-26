@@ -500,6 +500,12 @@ class DSANPUIndexerMixin:
         prefix_lens = (
             actual_seq_lengths_kv.to(device=q.device, dtype=torch.int32) - n
         )
+        # actual_seq_lengths_kv is padded to the batch bucket, while the verify
+        # mask only carries blocks for the real requests (bs = rows / N). Keeping
+        # the padding rows makes the expected mask size over-count by N*N each.
+        bs_verify = total // n
+        if prefix_lens.numel() > bs_verify:
+            prefix_lens = prefix_lens[:bs_verify]
         if prefix_lens.numel() and int(prefix_lens.min()) < 0:
             raise ValueError(
                 "prefix length underflow: KV length smaller than the draft block"
