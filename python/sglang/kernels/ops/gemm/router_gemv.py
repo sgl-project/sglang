@@ -363,8 +363,8 @@ def router_gemv_partials_swiglu(
     transpose_scale: bool = False,
 ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """(router_gemv_partials(x, w), swiglu_oai_fp8(gate_up, alpha, limit, group_size,
-    transpose_scale)) in one launch, bitwise: both are latency-bound and come from the same
-    layer input (the MoE layer's router and its shared expert). Caller guards with
+    transpose_scale)) in one launch, bitwise equal to the two calls: both are latency-bound
+    and come from the same MoE layer input (router and shared expert). Caller guards with
     router_gemv_partials_supported()."""
     m, k = x.shape
     n = w.shape[0]
