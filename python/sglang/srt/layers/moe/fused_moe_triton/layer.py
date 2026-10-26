@@ -912,7 +912,7 @@ class FusedMoE(torch.nn.Module):
         is_quark = self.quant_config.get_name() == "quark"
         if (
             is_quark
-            and "weight_scale_inv" in weight_name
+            and "weight_scale" in weight_name
             and loaded_weight.dtype == torch.uint8
         ):
             loaded_weight = loaded_weight.view(torch.float8_e8m0fnu)
@@ -921,25 +921,26 @@ class FusedMoE(torch.nn.Module):
             and "scale" not in weight_name
             and loaded_weight.dtype == torch.float8_e4m3fn
         )
-        is_scale = "weight_scale_inv" in weight_name and loaded_weight.dtype in (
-            torch.float8_e8m0fnu,
-            torch.float32,
+        # Quark names the shared-expert scale weight_scale. Other FP8 formats
+        # use weight_scale_inv.
+        is_scale = (
+            (
+                "weight_scale_inv" in weight_name
+                or (is_quark and "weight_scale" in weight_name)
+            )
+            and loaded_weight.dtype in (torch.float8_e8m0fnu, torch.float32)
         )
         if not is_weight and not is_scale:
             return False
 
-        weight_param = self.w2_weight if shard_id == "w2" else self.w13_weight
-        # Quark calls this w2_weight_scale. The *_weight_scale_inv name still
-        # wins when the layer has it, which is the FP8 and ModelOpt path.
-        if shard_id == "w2":
-            scale_name = "w2_weight_scale_inv"
-            quark_scale_name = "w2_weight_scale"
-        else:
-            scale_name = "w13_weight_scale_inv"
-            quark_scale_name = "w13_weight_scale"
-        scale_param = getattr(self, scale_name, None)
-        if scale_param is None:
-            scale_param = getattr(self, quark_scale_name if is_quark else scale_name)
+        # FP8 and ModelOpt use *_weight_scale_inv. Quark uses *_weight_scale
+        # only when the inv name is absent.
+        prefix = "w2" if shard_id == "w2" else "w13"
+        weight_param = getattr(self, f"{prefix}_weight")
+        scale_name = f"{prefix}_weight_scale_inv"
+        if is_quark and not hasattr(self, scale_name):
+            scale_name = f"{prefix}_weight_scale"
+        scale_param = getattr(self, scale_name)
         if param is not weight_param and param is not scale_param:
             return False
 
