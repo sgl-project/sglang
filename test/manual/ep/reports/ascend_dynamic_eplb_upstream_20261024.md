@@ -13,6 +13,9 @@ initial learning policy is not included.
 Before migrating a chunk, NPU validates corresponding tensor counts, shapes,
 dtypes, devices, and staging requirements. Ordinary tensors bypass ND staging;
 unchanged local placements still participate in sends but skip ND writeback.
+Outside Elastic EP, a rank also skips staging and migration when its local
+placement is unchanged and no changed destination requests a local expert.
+Communication group initialization still precedes this per-rank early return.
 Receive buffers are reused within a chunk and are not cached between rebalances.
 ND staging retains each layer's conversion results directly. Writeback converts
 them to the destination format before copying into the original model storage.
@@ -31,10 +34,16 @@ EPLB manager and decode graph runner are unchanged from the base.
 | --- | --- |
 | Source and call-chain review | Completed; this is not execution validation. |
 | Formatting and static checks during cleanup | Completed; no functional result is implied. |
-| CPU unit tests and GPU regression after migration refinements | Not run. |
+| CPU unit suite and GPU regression after migration refinements | Not run. |
 | NPU full decode graph regression after cleanup | Not run. |
-| HCCL migration with the new staging paths | Passed a 16-rank synthetic migration and reverse migration; full tensor values, original addresses, formats, ND scales, and unchanged local layouts checked. |
+| HCCL migration with the new staging paths | Passed a 16-rank synthetic migration and reverse migration before the idle-rank guard; values, addresses, formats, ND scales, and unchanged local layouts checked. |
 | Full-model correctness, PD acceptance, and performance after cleanup | Not run. |
+
+The idle-rank guard passed an external CPU check against the unchanged shared
+migration planner across 18,370 rank cases. Values, addresses, and send/receive
+lists matched, including unchanged local senders and bypassing the guard for
+Elastic EP. Transport and group creation were mocked; this is not NPU/HCCL or
+service validation of the guard.
 
 An isolated 30-round paired check on Ascend 910C with torch_npu 2.10.0.post6
 used the observed INT8 shapes `[17,4096,4096]` and `[17,2048,4096]` (408 MiB).

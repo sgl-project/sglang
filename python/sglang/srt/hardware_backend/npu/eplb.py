@@ -80,7 +80,8 @@ def prepare_expert_weight_update(
     """
     from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 
-    if ElasticEPStateManager.instance() is None:
+    elastic_ep_enabled = ElasticEPStateManager.instance() is not None
+    if not elastic_ep_enabled:
         # A rank with unchanged local slots may still need to send to another rank.
         layer_ids = [
             layer
@@ -113,10 +114,18 @@ def prepare_expert_weight_update(
     def update_layer(*, routed_experts_weights: list[torch.Tensor], **kwargs) -> object:
         start = kwargs["rank"] * kwargs["num_local_physical_experts"]
         end = start + kwargs["num_local_physical_experts"]
-        local_changed = (
-            kwargs["old_physical_to_logical_map"][start:end]
-            != kwargs["new_physical_to_logical_map"][start:end]
-        )
+        old_placement = kwargs["old_physical_to_logical_map"]
+        new_placement = kwargs["new_physical_to_logical_map"]
+        local_changed = old_placement[start:end] != new_placement[start:end]
+        if not local_changed and not elastic_ep_enabled:
+            # Any outgoing expert must appear in a changed destination slot.
+            # Keep possible senders; only skip ranks with provably no work.
+            local_experts = set(old_placement[start:end])
+            if not any(
+                old != new and new in local_experts
+                for old, new in zip(old_placement, new_placement, strict=True)
+            ):
+                return
         result = update_single_layer(
             routed_experts_weights=staging.load(routed_experts_weights),
             group=group,
