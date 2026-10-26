@@ -665,8 +665,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             num_draft_entries=num_draft_entries,
             num_hidden_layers=self.scheduler.model_config.num_hidden_layers,
         )
-        if self.transfer_backend == TransferBackend.NIXL:
-            kv_args.kv_data_mem_kinds = kv_data_mem_kinds
+        kv_args.kv_data_mem_kinds = kv_data_mem_kinds
         kv_args.page_size = self.token_to_kv_pool.page_size
 
         kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (
@@ -1794,30 +1793,67 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 and not _is_fake_transfer(decode_req.req)
             ):
                 # alloc_logical_only() already allocated the shared logical pages
-                # used by the indexer and draft KV. These device buffers do not
-                # use target sparse physical slots; carry logical page IDs beside
-                # the independently allocated target host page IDs.
+                # used by the indexer, C128 KV and draft KV. These device
+                # buffers do not use target sparse physical slots; carry logical
+                # page IDs beside the independently allocated target host page
+                # IDs. req_to_token can hold virtual ids under
+                # MultiEndedAllocator, while PD writes physical buffer offsets;
+                # resolve the current physical locations before page conversion.
                 full_kv_indices = self.req_to_token_pool.req_to_token[
                     decode_req.req.kv.req_pool_idx,
                     prefix_len:origin_input_len,
                 ]
+                full_kv_indices = (
+                    self.token_to_kv_pool_allocator.translate_kv_indices_for_transfer(
+                        full_kv_indices
+                    )
+                )
                 device_page_indices = kv_to_page_indices(
                     full_kv_indices,
                     page_size,
                 ).astype(np.int32)
-                if self.transfer_backend != TransferBackend.MOONCAKE:
+                if self.transfer_backend not in (
+                    TransferBackend.MOONCAKE,
+                    TransferBackend.MORI,
+                ):
                     raise NotImplementedError(
                         "HiSparse device-only PD transfer currently requires the "
-                        "Mooncake backend"
+                        "Mooncake or MoRI backend"
                     )
             metadata_kwargs = {"decode_prefix_len": total_prefix_len}
+            primary_page_indices = None
             if device_page_indices is not None:
-                metadata_kwargs["device_kv_indices"] = device_page_indices
+                if self.transfer_backend == TransferBackend.MORI:
+                    if not isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool):
+                        raise NotImplementedError(
+                            "MoRI HiSparse device-only PD transfer is only "
+                            "supported for DeepSeek-V4 KV pools"
+                        )
+                    # MoRI tracks source-aligned logical/device pages as the
+                    # primary destination index space. C4 host rows can be
+                    # more granular in unified-KV mode (64 compressed rows per
+                    # logical page), so carry them separately without changing
+                    # the sender's expected logical page count.
+                    if self.scheduler.hisparse_coordinator.mem_pool_host.layer_num > 0:
+                        metadata_kwargs["host_kv_indices"] = (
+                            self._transfer_page_indices(
+                                decode_req, kv_indices, kv_transfer_page_size
+                            )
+                        )
+                    primary_page_indices = device_page_indices
+                else:
+                    if getattr(self.token_to_kv_pool, "unified_hisparse", False):
+                        raise NotImplementedError(
+                            "Unified-KV DSV4 HiSparse PD transfer requires MoRI: "
+                            "Mooncake does not support row-granular host destinations"
+                        )
+                    metadata_kwargs["device_kv_indices"] = device_page_indices
             self._send_kv_metadata(
                 decode_req,
                 kv_indices,
                 kv_transfer_page_size,
                 state_indices,
+                page_indices=primary_page_indices,
                 **metadata_kwargs,
             )
             num_device_preallocated += 1
@@ -1842,13 +1878,24 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         return preallocated_reqs, failed_reqs
 
     def _send_kv_metadata(
-        self, decode_req, kv_indices, page_size, state_indices=None, **metadata_kwargs
+        self,
+        decode_req,
+        kv_indices,
+        page_size,
+        state_indices=None,
+        page_indices=None,
+        **metadata_kwargs,
     ) -> None:
+        # page_indices overrides the pages derived from kv_indices (MoRI HiSparse
+        # publishes device pages as the primary index space).
         decode_req.metadata_buffer_index = (
             self.req_to_metadata_buffer_idx_allocator.alloc()
         )
         assert decode_req.metadata_buffer_index is not None
-        page_indices = self._transfer_page_indices(decode_req, kv_indices, page_size)
+        if page_indices is None:
+            page_indices = self._transfer_page_indices(
+                decode_req, kv_indices, page_size
+            )
         if (
             metadata_kwargs.get("destination") != KVTransferDestination.HOST
             and self.transfer_queue.enable_staging

@@ -186,6 +186,7 @@ class TestReceiverControlMessages(CustomTestCase):
             key="mori-peer", pack=lambda: b"engine-desc"
         )
         manager.kv_mem_descs = [SimpleNamespace(pack=lambda: b"kv-desc")]
+        manager.kv_mem_desc_groups = [manager.kv_mem_descs]
         manager.aux_mem_descs = [SimpleNamespace(pack=lambda: b"aux-desc")]
         manager.state_mem_descs = [[SimpleNamespace(pack=lambda: b"state-desc")]]
         manager.engine = SimpleNamespace(get_session_id=lambda: "mooncake-peer")
@@ -284,6 +285,10 @@ class TestReceiverControlMessages(CustomTestCase):
                 b"0",
                 state_layer,
                 layer,
+                # HiSparse fields appended after the DCP fields.
+                msgspec.msgpack.encode(["VRAM"]),
+                msgspec.msgpack.encode([16]),
+                msgspec.msgpack.encode([[b"kv-desc"]]),
             ],
         }
         for backend in self.backends:

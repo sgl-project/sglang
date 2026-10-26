@@ -69,6 +69,9 @@ class KVArgs:
     host_state_data_ptrs: Optional[List[List[int]]] = None
     host_state_data_lens: Optional[List[List[int]]] = None
     host_state_item_lens: Optional[List[List[int]]] = None
+    # Per-pointer memory kind ("VRAM" / "DRAM") of kv_data_ptrs; None means
+    # the backend should assume all-VRAM.
+    kv_data_mem_kinds: Optional[List[str]] = None
     aux_data_ptrs: List[int]
     aux_data_lens: List[int]
     aux_item_lens: List[int]

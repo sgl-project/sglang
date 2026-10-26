@@ -11,15 +11,30 @@ import mmap
 import os
 import unittest
 import unittest.mock
+from unittest.mock import patch
 
 import torch
 
 from sglang.srt.mem_cache.pool_host.common import ShmHostTensorAllocator
-from sglang.srt.mem_cache.storage.mmap import alloc_shm
+from sglang.srt.mem_cache.storage.mmap import alloc_mmap, alloc_shm
 from sglang.srt.mem_cache.storage.mmap.mmap_allocator import _mmap_prefaulted
 
 
 class TestMmapAllocator(unittest.TestCase):
+    @patch(
+        "sglang.srt.mem_cache.storage.mmap.mmap_allocator._alloc_hugepage",
+        side_effect=OSError(12, "Cannot allocate memory"),
+    )
+    def test_alloc_mmap_strict_hugepage_failure_is_fatal(self, _mock_alloc):
+        from sglang.srt.environ import envs
+
+        with (
+            envs.SGLANG_HUGEPAGE_SIZE.override("2MB"),
+            envs.SGLANG_HUGEPAGE_STRICT.override(True),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "cannot be honored"):
+                alloc_mmap((2, 2), torch.float32)
+
     def _assert_resident(self, mm, alloc_bytes):
         # mincore() reports per-page residency, so the invariant is checked
         # rather than inferred from the flags that were passed.

@@ -17,7 +17,10 @@ from sglang.srt.disaggregation.prefill import (  # noqa: E402
     PrefillBootstrapQueue,
     SchedulerDisaggregationPrefillMixin,
 )
-from sglang.srt.disaggregation.utils import DisaggregationMode  # noqa: E402
+from sglang.srt.disaggregation.utils import (  # noqa: E402
+    DisaggregationMode,
+    TransferBackend,
+)
 from sglang.srt.environ import envs  # noqa: E402
 from sglang.srt.lora.lora_manager import LoRAManager  # noqa: E402
 from sglang.srt.managers.io_struct import AbortReq  # noqa: E402
@@ -717,6 +720,53 @@ class TestDecodePreallocQueuePriority(CustomTestCase):
                 self.assertEqual(preallocated, [decode_req] if fits else [])
                 self.assertEqual(queue.queue, [] if fits else [decode_req])
                 self.assertEqual(failed, [])
+
+    def test_hisparse_mori_publishes_device_pages_and_host_rows(self):
+        class FakeDeepSeekV4TokenToKVPool:
+            unified_hisparse = True
+
+        decode_req = self._new_decode_req("hisparse", 0)
+        decode_req.req.bootstrap_host = "127.0.0.1"
+        decode_req.req.bootstrap_room = 7
+        queue = self._new_queue([decode_req])
+        queue.transfer_backend = TransferBackend.MORI
+        queue.scheduler.enable_hisparse = True
+        queue.scheduler.enable_decode_hicache = False
+        queue.scheduler.hisparse_coordinator.padded_buffer_size = 1
+        queue.scheduler.hisparse_coordinator.spec_swap.scratch_capacity = 0
+        queue.scheduler.hisparse_coordinator.mem_pool_host.layer_num = 1
+        queue._uses_swa_tail_prealloc = MagicMock(return_value=False)
+        queue._allocatable_token_budgets = MagicMock(return_value=1000)
+        queue._hicache_pending_restore_tokens = MagicMock(return_value=0)
+        queue._pre_alloc.side_effect = None
+        queue._pre_alloc.return_value = torch.tensor([100, 101, 102])
+        queue.token_to_kv_pool = FakeDeepSeekV4TokenToKVPool()
+        queue.token_to_kv_pool_allocator.page_size = 256
+        queue.token_to_kv_pool_allocator.hisparse_page_size = 1
+        queue.token_to_kv_pool_allocator.hisparse_attn_allocator.available_size.return_value = 100
+        queue.token_to_kv_pool_allocator.translate_kv_indices_for_transfer.return_value = torch.tensor(
+            [512, 768, 1024]
+        )
+
+        with patch(
+            "sglang.srt.disaggregation.decode.DeepSeekV4TokenToKVPool",
+            FakeDeepSeekV4TokenToKVPool,
+        ):
+            preallocated, failed = queue.pop_preallocated()
+
+        self.assertEqual(preallocated, [decode_req])
+        self.assertEqual(failed, [])
+        args = decode_req.kv_receiver.send_metadata.call_args.args
+        kwargs = decode_req.kv_receiver.send_metadata.call_args.kwargs
+        # Three token slots occupy one 256-token logical page. Translation must
+        # happen before page conversion, yielding physical page 2.
+        np.testing.assert_array_equal(args[0], np.array([2], dtype=np.int32))
+        np.testing.assert_array_equal(
+            kwargs["host_kv_indices"],
+            np.array([100, 101, 102], dtype=np.int32),
+        )
+        self.assertNotIn("device_kv_indices", kwargs)
+        queue.token_to_kv_pool_allocator.translate_kv_indices_for_transfer.assert_called_once()
 
 
 class TestDecodePreallocQueueRebootstrapPayload(unittest.TestCase):

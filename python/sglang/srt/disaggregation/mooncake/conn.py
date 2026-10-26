@@ -2596,6 +2596,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                     "supported by PD DCP relayout"
                                 )
                             chunked_dst_kv_indice = req.dst_kv_indices
+                            chunked_dst_device_kv_indice = None
                         else:
                             chunked_dst_kv_indice = req.dst_kv_indices[
                                 kv_chunk.index_slice

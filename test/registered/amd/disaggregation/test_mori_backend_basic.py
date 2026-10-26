@@ -93,15 +93,18 @@ class TestMoriDCP(unittest.TestCase):
     def test_pp_local_descriptors_map_by_layer(self):
         manager = object.__new__(mori_conn.MoriKVManager)
         manager.kv_mem_descs = ["src-17", "src-23"]
-        manager.kv_args = SimpleNamespace(kv_layer_ids=[17, 23])
-
-        src, dst, count = manager._get_mla_mem_desc_slices(
-            ["dst-11", "dst-17", "dst-23"], [11, 17, 23]
+        manager.kv_args = SimpleNamespace(kv_layer_ids=[17, 23], kv_item_lens=[40, 40])
+        peer_info = SimpleNamespace(
+            dst_kv_mem_descs=["dst-11", "dst-17", "dst-23"],
+            dst_kv_layer_ids=[11, 17, 23],
         )
 
-        self.assertEqual(src, ["src-17", "src-23"])
-        self.assertEqual(dst, ["dst-17", "dst-23"])
-        self.assertEqual(count, 2)
+        src, dst, kinds, item_lens = manager._get_mla_mem_desc_slices(peer_info)
+
+        self.assertEqual(src, [["src-17"], ["src-23"]])
+        self.assertEqual(dst, [["dst-17"], ["dst-23"]])
+        self.assertEqual(kinds, ["VRAM", "VRAM"])
+        self.assertEqual(item_lens, [40, 40])
 
     def test_tp_mismatch_requires_matching_token_geometry(self):
         manager = object.__new__(mori_conn.MoriKVManager)

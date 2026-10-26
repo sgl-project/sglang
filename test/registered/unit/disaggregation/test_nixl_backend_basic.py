@@ -104,6 +104,8 @@ class TestNixlBackendInitialization(CustomTestCase):
         )
         mgr = object.__new__(NixlKVManager)
         mgr.kv_args = args
+        if getattr(args, "kv_data_mem_kinds", None) is None:
+            args.kv_data_mem_kinds = ["VRAM"] * len(getattr(args, "kv_data_ptrs", []))
         mgr.disaggregation_mode = mode
         mgr.enable_deferred_decode_kv_release = False
         mgr.pp_size = mgr.attn_cp_size = mgr.dcp_size = 1

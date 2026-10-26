@@ -333,6 +333,7 @@ class PrefillBootstrapQueue:
             num_draft_entries=num_draft_entries,
             num_hidden_layers=self.scheduler.model_config.num_hidden_layers,
         )
+        kv_args.kv_data_mem_kinds = ["VRAM"] * len(kv_data_ptrs)
         if not self.is_mla_backend:
             kv_args.kv_head_num = self.token_to_kv_pool.head_num
             kv_args.total_kv_head_num = (
