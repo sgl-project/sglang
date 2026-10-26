@@ -506,5 +506,129 @@ def test_causal_conv1d_rejects_non_bool_has_initial_state(bad_dtype):
         )
 
 
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("width", [2, 3, 4])
+@pytest.mark.parametrize("mode", ["decode", "chain", "tree"])
+def test_triton_update_state_dtype(state_dtype, width, mode):
+    """Exercise each Triton update branch; fused chain verify cannot cover trees."""
+    from sglang.kernels.ops.mamba.causal_conv1d_triton import causal_conv1d_update
+
+    torch.manual_seed(42)
+    batch, dim, tokens = 2, 128, 1 if mode == "decode" else 5
+    x = torch.randn(batch, tokens, dim, device="cuda", dtype=torch.bfloat16).transpose(
+        1, 2
+    )
+    state = torch.randn(
+        batch, width - 1, dim, device="cuda", dtype=state_dtype
+    ).transpose(1, 2)
+    initial = state.clone()
+    weight = torch.randn(dim, width, device="cuda", dtype=torch.bfloat16)
+    scratch = torch.empty(
+        batch, tokens, width - 1, dim, device="cuda", dtype=state_dtype
+    ).transpose(2, 3)
+    # Root 0 has children 1 and 3; they have children 2 and 4 respectively.
+    parents = (
+        [0, 0, 1, 0, 3] if mode == "tree" else [max(0, i - 1) for i in range(tokens)]
+    )
+    next_token = torch.tensor(
+        [[1, 2, -1, 4, -1]] * batch, device="cuda", dtype=torch.int32
+    )
+    sibling = torch.tensor(
+        [[-1, 3, -1, -1, -1]] * batch, device="cuda", dtype=torch.int32
+    )
+    retrieved = torch.full_like(next_token, -99)
+    out = causal_conv1d_update(
+        x,
+        state,
+        weight,
+        activation="silu",
+        conv_state_indices=torch.arange(batch, device="cuda", dtype=torch.int32),
+        intermediate_state_indices=torch.arange(
+            batch, device="cuda", dtype=torch.int32
+        ),
+        intermediate_conv_window=scratch if mode != "decode" else None,
+        retrieve_next_token=next_token if mode == "tree" else None,
+        retrieve_next_sibling=sibling if mode == "tree" else None,
+        retrieve_parent_token=retrieved if mode == "tree" else None,
+        validate_data=True,
+    )
+    windows = []
+    expected = []
+    for i, parent in enumerate(parents):
+        history = initial if i == 0 else windows[parent]
+        window = torch.cat([history, x[:, :, i : i + 1].to(state_dtype)], dim=-1)
+        # The kernel multiplies in operand dtype before accumulating in FP32.
+        terms = window * weight.unsqueeze(0)
+        acc = terms[:, :, -1].float()
+        for j in range(width - 2, -1, -1):
+            acc = acc + terms[:, :, j].float()
+        expected.append(F.silu(acc).to(x.dtype))
+        windows.append(window[:, :, 1:])
+    torch.testing.assert_close(
+        out, torch.stack(expected, dim=-1), atol=0.03125, rtol=0.01
+    )
+    if mode != "decode":
+        torch.testing.assert_close(scratch, torch.stack(windows, dim=1), atol=0, rtol=0)
+    else:
+        torch.testing.assert_close(state, windows[-1], atol=0, rtol=0)
+    if mode == "tree":
+        assert torch.equal(
+            retrieved, torch.tensor([parents] * batch, device="cuda", dtype=torch.int32)
+        )
+
+
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("width", [2, 3, 4])
+@pytest.mark.parametrize("seqlen", [1, 8, 257])
+def test_triton_prefill_state_dtype(state_dtype, width, seqlen):
+    """Cover short-window stitching, chunk boundaries, and cold/warm cache writes."""
+    from sglang.kernels.ops.mamba.causal_conv1d_triton import causal_conv1d_fn
+
+    torch.manual_seed(43)
+    dim = 128
+    x = torch.randn(2 * seqlen, dim, device="cuda", dtype=torch.bfloat16).T
+    weight = torch.randn(dim, width, device="cuda", dtype=x.dtype)
+    state = torch.randn(3, width - 1, dim, device="cuda", dtype=state_dtype).transpose(
+        1, 2
+    )
+    initial = state.clone()
+    # One cold and one warm sequence, with a non-identity cache mapping.
+    indices = torch.tensor([2, 0], device="cuda", dtype=torch.int32)
+    out = causal_conv1d_fn(
+        x,
+        weight,
+        None,
+        state,
+        query_start_loc=torch.tensor(
+            [0, seqlen, 2 * seqlen], device="cuda", dtype=torch.int32
+        ),
+        seq_lens_cpu=[seqlen, seqlen],
+        cache_indices=indices,
+        has_initial_state=torch.tensor([False, True], device="cuda"),
+        validate_data=True,
+    )
+    for i, slot in enumerate([2, 0]):
+        history = torch.zeros_like(initial[slot]) if i == 0 else initial[slot]
+        seq = x[:, i * seqlen : (i + 1) * seqlen]
+        window = torch.cat([history.to(x.dtype), seq], dim=-1)
+        expected = (
+            F.silu(
+                F.conv1d(
+                    window.float().unsqueeze(0), weight.float().unsqueeze(1), groups=dim
+                )
+            )
+            .squeeze(0)
+            .to(x.dtype)
+        )
+        torch.testing.assert_close(
+            out[:, i * seqlen : (i + 1) * seqlen], expected, atol=0.03125, rtol=0.01
+        )
+        expected_state = torch.cat([history, seq.to(state_dtype)], dim=-1)[
+            :, -(width - 1) :
+        ]
+        torch.testing.assert_close(state[slot], expected_state, atol=0, rtol=0)
+    torch.testing.assert_close(state[1], initial[1], atol=0, rtol=0)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))

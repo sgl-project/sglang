@@ -869,7 +869,9 @@ def _causal_conv1d_update_kernel(
 
             _idx_token = idx_token
             x_ptrs_1d = x_base_1d + _idx_token * stride_x_token  # [BLOCK_N]
-            matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
+            matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d).to(
+                conv_state_ptr.dtype.element_ty
+            )
             # convolution operation: itself * wcol[-1] + parent * wcol[-2] + grand-parent * wcol[-3] + ...
             for j in tl.static_range(KERNEL_WIDTH):
                 if KERNEL_WIDTH == 2:
@@ -920,7 +922,9 @@ def _causal_conv1d_update_kernel(
                         tl.where(idx_tokens == _idx_token, parent_idx_tokens, 0)
                     )
                     x_ptrs_1d = x_base_1d + _idx_token * stride_x_token  # [BLOCK_N]
-                    matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
+                    matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d).to(
+                        conv_state_ptr.dtype.element_ty
+                    )
                 else:
                     # no parent within the current chunk, load from prev conv state: col[-1] (idx 0's parent), col[-2] (idx 0's grand parent), ...
                     if KERNEL_WIDTH == 2:
