@@ -13,13 +13,9 @@ from sglang.kernels.ops.diffusion import (
     FUSED_LINEAR_GELU,
     NVFP4_BIAS_GELU,
     BitExactFusionGate,
-    can_use_fused_rmsnorm_interleaved_rope,
     can_use_linear_gelu,
     fused_linear_gelu_tanh,
-    fused_rmsnorm_interleaved_rope_,
-    fused_rmsnorm_interleaved_rope_into_blocks,
     fused_temb_table_slices,
-    rmsnorm_interleaved_rope_block_cols,
     tensors_equal,
 )
 from sglang.multimodal_gen.configs.models.dits import WanVideoConfig
@@ -82,7 +78,21 @@ from sglang.multimodal_gen.runtime.platforms import (
 from sglang.multimodal_gen.runtime.platforms.aiter import USE_AITER
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, is_device_stream_capturing
+
+if current_platform.is_xpu():
+    # CuTe DSL (cutlass) is unavailable on XPU; use the unfused q/k norm path.
+    can_use_fused_rmsnorm_interleaved_rope = lambda *args, **kwargs: False
+    fused_rmsnorm_interleaved_rope_ = None
+    fused_rmsnorm_interleaved_rope_into_blocks = None
+    rmsnorm_interleaved_rope_block_cols = None
+else:
+    from sglang.kernels.ops.diffusion import (
+        can_use_fused_rmsnorm_interleaved_rope,
+        fused_rmsnorm_interleaved_rope_,
+        fused_rmsnorm_interleaved_rope_into_blocks,
+        rmsnorm_interleaved_rope_block_cols,
+    )
 
 logger = init_logger(__name__)
 _is_cuda = current_platform.is_cuda()
@@ -1433,7 +1443,7 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             or not isinstance(source, torch.Tensor)
             or self.layerwise_offload_managers
             or torch.compiler.is_compiling()
-            or torch.cuda.is_current_stream_capturing()
+            or is_device_stream_capturing(context.device)
             or not self._plain_blocks()
             or not all(
                 type(block.attn2) is WanT2VCrossAttention
