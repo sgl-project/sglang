@@ -566,7 +566,14 @@ def log_generation_timer(
             timer.duration,
         )
     except Exception as e:
-        if request_idx is not None:
+        # request_cancel imports this module
+        from sglang.multimodal_gen.runtime.managers.request_cancel import (
+            RequestCancelledError,
+        )
+
+        if isinstance(e, RequestCancelledError):
+            logger.info("Stopped generation: %s", e)
+        elif request_idx is not None:
             logger.error(
                 "Failed to generate output for prompt %d: %s",
                 request_idx,

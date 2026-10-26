@@ -418,8 +418,15 @@ An accepted job continues after the submitting client disconnects. For a bounded
 scheduler wait, set `--scheduler-rpc-timeout` in seconds; it includes queue time
 and generation. A timeout marks the job failed but does not cancel GPU work.
 Retrying creates another job, so clients should retain and poll the returned ID.
-Deleting a job removes its API record, but does not cancel GPU work or remove
-generated files. Manage output retention separately.
+
+`DELETE /v1/videos/&#123;video_id&#125;` removes the API record and cancels the
+generation: a queued job does not start, and a running job stops after its
+current denoising step, on each rank of its replica. The stages that follow
+denoising, such as decoding, do not run. A job that shares a dynamic batch with
+other jobs runs to the end, unless each job of the batch is deleted. Cancellation
+is best effort and has the same deployment limits as progress updates.
+Deleting a job does not remove files that were already generated. Manage output
+retention separately.
 
 **Python Example:**
 

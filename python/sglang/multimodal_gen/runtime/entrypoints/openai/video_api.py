@@ -52,6 +52,9 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     save_image_to_path,
     temp_dir_if_disabled,
 )
+from sglang.multimodal_gen.runtime.entrypoints.openai.video_cancel import (
+    publish_cancel,
+)
 from sglang.multimodal_gen.runtime.entrypoints.openai.video_progress import (
     VIDEO_PROGRESS,
 )
@@ -458,6 +461,10 @@ async def _dispatch_job_async(
         update_fields.update(final_media_fields)
         await VIDEO_STORE.update_fields(job_id, update_fields)
     except Exception as e:
+        if await VIDEO_STORE.get(job_id) is None:
+            # DELETE removed the job and stopped its generation
+            logger.info("Video job %s was deleted: %s", job_id, e)
+            return
         logger.exception("Video job %s failed", job_id)
         await VIDEO_STORE.update_fields(
             job_id,
@@ -760,6 +767,7 @@ async def create_video(
                 external_trace_header=trace_headers,
             )
             batch.report_progress = True
+            batch.cancellable = True
             resources.push_async_callback(_cleanup_video_request, batch)
             # Add diffusers_kwargs if provided.
             if req.diffusers_kwargs:
@@ -839,12 +847,16 @@ async def retrieve_video(video_id: str = Path(...)):
     return VideoResponse(**job)
 
 
-# TODO: support aborting a job.
 @router.delete("/{video_id}", response_model=VideoResponse)
 async def delete_video(video_id: str = Path(...)):
     job = await VIDEO_STORE.pop(video_id)
     if not job:
         raise HTTPException(status_code=404, detail="Video not found")
+    task = _VIDEO_JOB_TASKS.get(video_id)
+    if task is not None and not task.done():
+        # a queued job does not start; a running job stops after its current
+        # denoising step
+        publish_cancel(video_id)
     # Mark as deleted in response semantics
     job["status"] = "deleted"
     return VideoResponse(**job)

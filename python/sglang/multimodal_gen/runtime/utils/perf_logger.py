@@ -345,6 +345,14 @@ class StageProfiler:
         execution_time_s = time.perf_counter() - self.start_time
 
         if exc_type:
+            # request_cancel imports the logging utilities
+            from sglang.multimodal_gen.runtime.managers.request_cancel import (
+                RequestCancelledError,
+            )
+
+            # each rank stops a cancelled request; the worker logs it once
+            if issubclass(exc_type, RequestCancelledError):
+                return False
             self.logger.error(
                 "[%s] Error during execution after %.4f ms: %s",
                 self.stage_name,

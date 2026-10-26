@@ -58,6 +58,7 @@ from sglang.multimodal_gen.runtime.managers.progress_reporter import (
     get_progress_reporter,
     init_progress_reporter,
 )
+from sglang.multimodal_gen.runtime.managers.request_cancel import init_request_cancel
 from sglang.multimodal_gen.runtime.managers.request_gc import request_gc
 from sglang.multimodal_gen.runtime.observability.metrics import DiffusionMetrics
 from sglang.multimodal_gen.runtime.pipelines_core import Req
@@ -173,6 +174,13 @@ class Scheduler(
                 )
         else:
             self.receiver = None
+        if server_args.cancel_endpoint is not None:
+            # every rank takes part in each stop decision; only the driver
+            # receives the cancelled request ids
+            init_request_cancel(
+                endpoint=server_args.cancel_endpoint,
+                context=self.context if self.receiver is not None else None,
+            )
         from sglang.multimodal_gen.runtime.platforms import current_platform
 
         Exec_worker = CPUWorker if current_platform.is_cpu() else GPUWorker
@@ -1103,6 +1111,11 @@ class Scheduler(
             if req.report_progress and req.request_id is not None
         ]
         merged_req.report_progress = bool(merged_req.merged_request_ids)
+        # the batch stops only when each member is cancelled, so the ids must
+        # name each member
+        merged_req.cancellable = all(req.cancellable for req in reqs) and len(
+            merged_req.merged_request_ids
+        ) == len(reqs)
         merged_req.request_id = f"dynamic_batch::{merged_req.request_id}"
 
         return merged_req

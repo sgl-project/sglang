@@ -71,6 +71,10 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
 from sglang.multimodal_gen.runtime.managers.memory_managers.memory_occupation_controller import (
     MemoryOccupationController,
 )
+from sglang.multimodal_gen.runtime.managers.request_cancel import (
+    RequestCancelledError,
+    raise_if_cancelled,
+)
 from sglang.multimodal_gen.runtime.managers.request_gc import request_gc
 from sglang.multimodal_gen.runtime.observability.metrics import (
     DiffusionMetrics,
@@ -665,6 +669,8 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                     error_context=f"grouped request {req.request_id}",
                     execution_start_time=group_start_time,
                     propagate_forward_errors=True,
+                    # a skipped request would leave its output to the next one
+                    check_cancelled=False,
                 )
                 assert isinstance(output_batch, OutputBatch)
                 if warming_up and (
@@ -725,10 +731,12 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         execution_start_time: float | None = None,
         propagate_forward_errors: bool = False,
         defer_finalize: bool = False,
+        check_cancelled: bool = True,
     ) -> OutputBatch | Req:
         """
         Args:
             forward_fn: the actual forward function for reqs
+            check_cancelled: skip the forward when the client cancelled log_reqs
         """
         output_batch = None
         forward_failed = False
@@ -790,6 +798,8 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
 
             for item in log_reqs:
                 item.log(server_args=self.server_args)
+            if check_cancelled:
+                raise_if_cancelled(log_reqs)
             with ExitStack() as stack:
                 for item in log_reqs:
                     stack.enter_context(
@@ -837,6 +847,15 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                     output_metrics=output_metrics,
                     deferred=False,
                 )
+        except RequestCancelledError as e:
+            if propagate_forward_errors and forward_failed:
+                raise
+            # every rank of the replica stops at the same step, so it stays in sync
+            logger.info("Stopped %s: %s", error_context, e)
+            if output_batch is None:
+                output_batch = OutputBatch()
+            output_batch.error = str(e)
+            output_batch.cancelled = True
         except Exception as e:
             if (
                 forward_failed
