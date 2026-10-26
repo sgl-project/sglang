@@ -31,8 +31,8 @@ import unittest
 import torch
 
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
+from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
 from sglang.srt.mem_cache.unified_memory_pool import (
-    MambaSubPoolSpec,
     UnifiedKVPool,
     _check_bs1_feasibility_floor,
     _reserved_floor_bytes,

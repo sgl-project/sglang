@@ -486,7 +486,7 @@ class TestWriteIds(CustomTestCase):
         from sglang.srt.mem_cache.allocator.unified_mamba import (
             UnifiedMambaTokenToKVPoolAllocator,
         )
-        from sglang.srt.mem_cache.unified_memory_pool import MambaSubPoolSpec
+        from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
         from sglang.srt.runtime_context import get_parallel
 
         for dcp_size in (1, 2, 4):

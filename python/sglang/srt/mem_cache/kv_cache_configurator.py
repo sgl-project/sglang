@@ -1292,7 +1292,7 @@ class KVCacheConfigurator:
         return builders[sub_pool_name](region).entry_bytes()
 
     def _mamba_host_spec(self, region):
-        from sglang.srt.mem_cache.unified_memory_pool import MambaSubPoolSpec
+        from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
 
         assert self.mambaish_config is not None, (
             "only a mamba-ish host builds a mamba sub-pool"
