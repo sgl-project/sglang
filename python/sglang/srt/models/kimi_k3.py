@@ -1918,15 +1918,23 @@ class KimiK3DeltaAttention(nn.Module):
         unfused chain. Called once from load_weights (after all weights are
         loaded, before cuda graph capture)."""
         if _is_hip:
-            from sglang.kernels.ops.attention import kda_fused_decode_aiter_hip
+            from sglang.kernels.ops.attention import (
+                kda_fused_decode_aiter_hip,
+                kda_fused_decode_gfx950,
+            )
 
             layer = self.attn
             w = layer.conv_weights
             f_b_weight = self.f_b_proj.weight
-            backend = os.environ.get("SGLANG_ROCM_K3_KDA_FUSED_BACKEND", "").lower()
-            backend_available = (
-                backend == "aiter"
-                and kda_fused_decode_aiter_hip.available(f_b_weight.device)
+            backend = os.environ.get(
+                "SGLANG_ROCM_K3_KDA_FUSED_BACKEND", "gfx950"
+            ).lower()
+            fused_ops = {
+                "aiter": kda_fused_decode_aiter_hip,
+                "gfx950": kda_fused_decode_gfx950,
+            }.get(backend)
+            backend_available = fused_ops is not None and fused_ops.available(
+                f_b_weight.device
             )
             if (
                 backend_available
@@ -1952,7 +1960,7 @@ class KimiK3DeltaAttention(nn.Module):
                     float(self.o_norm.eps),
                     a_log,
                 )
-                kda_fused_decode_aiter_hip.warmup(
+                fused_ops.warmup(
                     f_b_weight=f_b_weight,
                     conv_weight=w,
                     A_log=a_log,
@@ -1962,6 +1970,7 @@ class KimiK3DeltaAttention(nn.Module):
                     norm_eps=float(self.o_norm.eps),
                 )
                 layer._k3_hip_fused_decode_backend = backend
+                layer._k3_hip_fused_decode_ops = fused_ops
                 self._kda_hip_fused_decode_ready = True
             return
         layer = self.attn
