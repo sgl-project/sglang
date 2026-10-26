@@ -234,13 +234,12 @@ def _register_aiter_table(env: str, default_name: str, table: Path) -> None:
     if os.environ.get(env) or not table.is_file():
         return
     spec = importlib.util.find_spec("aiter")
-    origin = getattr(spec, "origin", None) if spec is not None else None
-    if not origin:
+    if spec is None or not spec.origin:
         return
-    default = Path(origin).resolve().parent / "configs" / default_name
+    default = Path(spec.origin).resolve().parent / "configs" / default_name
     # aiter's per-model model_configs/ tables are left out: aiter refuses a merge holding a
     # shape twice, other models share these TP4 shapes, and ours covers every MiniMax shape
-    files = [p for p in (default,) if p.is_file()] + [table]
+    files = [default, table] if default.is_file() else [table]
     os.environ[env] = ":".join(str(p) for p in files)
     logger.info("MiniMax-M3: aiter %s tables %s", env, os.environ[env])
 
