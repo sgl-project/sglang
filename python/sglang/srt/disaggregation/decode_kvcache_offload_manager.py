@@ -82,16 +82,14 @@ class DecodeKVCacheOffloadManager:
 
         self.kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
         if isinstance(self.kv_cache, UnifiedSWAKVPool):
-            full_mapping = {
-                gid: lid
-                for gid, (lid, is_swa) in self.kv_cache.layers_mapping.items()
-                if not is_swa
-            }
-            swa_mapping = {
-                gid: lid
-                for gid, (lid, is_swa) in self.kv_cache.layers_mapping.items()
-                if is_swa
-            }
+            router = self.kv_cache.layer_router
+            full_mapping, swa_mapping = (
+                {
+                    layer_id: router.route(layer_id).index
+                    for layer_id in router.sub_pool(name).layer_ids
+                }
+                for name in (IdSpaceKind.FULL, IdSpaceKind.SLIDING_WINDOW)
+            )
             params = CacheInitParams(
                 disable=False,
                 req_to_token_pool=self.req_to_token_pool,

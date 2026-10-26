@@ -24,6 +24,7 @@ from sglang.kernels.ops.attention.trtllm_mha_graph_metadata import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
+from sglang.srt.mem_cache.kv.router import KVLayerRouter
 from sglang.srt.mem_cache.kv_loc_plan import IdSpace, IdSpaceKind
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -47,7 +48,9 @@ def make_xqa_backend(monkeypatch):
     monkeypatch.setattr(
         trtllm_mha_backend.FlashInferAttnBackend, "__init__", parent_init
     )
-    monkeypatch.setattr(TRTLLMHAAttnBackend, "_resolve_swa_kv_pool", lambda *args: None)
+    monkeypatch.setattr(
+        trtllm_mha_backend, "resolve_window_kv_pool", lambda *args: None
+    )
     monkeypatch.setattr(trtllm_mha_backend, "DEFAULT_WORKSPACE_SIZE_MB", 1)
     monkeypatch.setattr(
         trtllm_mha_backend, "get_buffer", lambda name, factory: factory()
@@ -1067,10 +1070,11 @@ def test_swa_cache_write_uses_metadata_slot_snapshot():
         raise AssertionError("cache writes must not read the live SWA mapping")
 
     backend = TRTLLMHAAttnBackend.__new__(TRTLLMHAAttnBackend)
-    backend._swa_kv_pool = SimpleNamespace(
-        layers_mapping={1: (0, True)},
-        translate_loc_from_full_to_swa=translate_live_mapping,
+    swa_pool = SimpleNamespace(translate_loc_from_full_to_swa=translate_live_mapping)
+    swa_pool.layer_router = KVLayerRouter.from_layer_maps(
+        swa_pool, [(IdSpaceKind.SLIDING_WINDOW, None, {1: 0})]
     )
+    backend._swa_kv_pool = swa_pool
     backend.forward_metadata = SimpleNamespace(swa_out_cache_loc=snapshot)
     forward_batch = SimpleNamespace(out_cache_loc=torch.tensor([3], dtype=torch.int64))
 

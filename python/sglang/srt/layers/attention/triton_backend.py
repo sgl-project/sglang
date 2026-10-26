@@ -30,10 +30,8 @@ from sglang.srt.layers.dcp import (
     get_dcp_lens,
 )
 from sglang.srt.layers.radix_attention import AttentionType
-from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
-from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -219,7 +217,11 @@ class TritonAttnBackend(AttentionBackend):
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.token_to_kv_pool_allocator = model_runner.token_to_kv_pool_allocator
-        self.use_sliding_window_kv_pool = isinstance(self.token_to_kv_pool, SWAKVPool)
+        # Window layers read and write the window sub-pool's ids.
+        self.use_sliding_window_kv_pool = (
+            self.token_to_kv_pool.layer_router.sub_pool(IdSpaceKind.SLIDING_WINDOW)
+            is not None
+        )
         # Lets the Triton wrappers specialize on PAGE_SIZE; page_size=1 is
         # byte-identical to the slot-based envelope.
         self.page_size = getattr(model_runner, "page_size", 1) or 1
@@ -1700,7 +1702,11 @@ class TritonAttnBackend(AttentionBackend):
         if k is None and v is None:
             pool = self.token_to_kv_pool
             cache_loc = forward_batch.out_cache_loc
-            if isinstance(pool, SWAKVPool) and pool.layers_mapping[layer.layer_id][1]:
+            if (
+                self.use_sliding_window_kv_pool
+                and pool.layer_router.route(layer.layer_id).sub_pool
+                == IdSpaceKind.SLIDING_WINDOW
+            ):
                 assert self.forward_metadata.swa_out_cache_loc is not None, (
                     "window-layer read-back before the metadata carried a "
                     "sliding-window write loc"
@@ -2200,8 +2206,9 @@ class TritonAttnBackend(AttentionBackend):
         if (
             layer.sliding_window_size is not None
             and layer.sliding_window_size > -1
-            and isinstance(pool, SWAKVPool)
-            and pool.layers_mapping[layer.layer_id][1]
+            and self.use_sliding_window_kv_pool
+            and pool.layer_router.route(layer.layer_id).sub_pool
+            == IdSpaceKind.SLIDING_WINDOW
         ):
             extend_kv_indices = self.forward_metadata.swa_out_cache_loc
             assert extend_kv_indices is not None, (
@@ -2881,7 +2888,9 @@ def update_sliding_window_buffer(
     window_kv_start_idx = seq_lens - window_kv_lens
     token_mapping = (
         token_to_kv_pool.full_to_swa_index_mapping
-        if isinstance(token_to_kv_pool, SWAKVPool)
+        if token_to_kv_pool is not None
+        and token_to_kv_pool.layer_router.sub_pool(IdSpaceKind.SLIDING_WINDOW)
+        is not None
         else None
     )
     translated = translator.pack_read_stream(
@@ -2894,7 +2903,7 @@ def update_sliding_window_buffer(
         kind=translator.window_kv_kind,
         token_mapping=token_mapping,
     )
-    if not translated and isinstance(token_to_kv_pool, BaseSWAKVPool):
+    if not translated and translator.space(IdSpaceKind.SLIDING_WINDOW) is not None:
         kv_last_index = window_kv_indptr[-1]
         window_kv_indices[:kv_last_index] = translator.ids_in(
             IdSpaceKind.SLIDING_WINDOW, window_kv_indices[:kv_last_index]

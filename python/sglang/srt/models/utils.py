@@ -32,8 +32,8 @@ from sglang.kernels.ops.layernorm.norm import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
 from sglang.srt.mem_cache.layout.paged_view import paged_kv_view
-from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.model_executor.runner import get_is_capture_mode
@@ -297,7 +297,7 @@ def enable_fused_set_kv_buffer(forward_batch: ForwardBatch):
     return (
         _is_cuda
         and pool.dtype == torch.bfloat16
-        and not isinstance(pool, SWAKVPool)
+        and pool.layer_router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is None
         and not is_cp_active(forward_batch)
         and getattr(forward_batch, "dcp_kv_mask", None) is None
     ) or (_is_hip and getattr(forward_batch, "dcp_kv_mask", None) is None)
@@ -332,7 +332,8 @@ def create_fused_set_kv_buffer_arg(
         # out_cache_loc, matching the CUDA path (which never fuses the hybrid pool).
         full_to_swa = (
             token_to_kv_pool.full_to_swa_index_mapping
-            if isinstance(token_to_kv_pool, SWAKVPool)
+            if token_to_kv_pool.layer_router.sub_pool(IdSpaceKind.SLIDING_WINDOW)
+            is not None
             else None
         )
         slot_mapping_swa = (
