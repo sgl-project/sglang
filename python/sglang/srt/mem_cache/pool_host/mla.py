@@ -1140,12 +1140,20 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         else:
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
+    def _storage_page_index(self, index: int) -> int:
+        if self.dcp_size == 1:
+            return index
+        index = int(index)
+        if index < 0 or index % self.logical_page_size != 0:
+            raise ValueError(
+                "DCP L3 page start must be a nonnegative logical page boundary."
+            )
+        if index + self.logical_page_size > self.logical_size:
+            raise IndexError("DCP L3 page is outside the host pool.")
+        return index // self.dcp_size
+
     def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
-        assert self.dcp_size == 1, (
-            "HiCache L3 storage paths are not yet DCP-aware (per-rank shards "
-            "need dcp_rank-scoped keys); --hicache-storage-backend with "
-            "--dcp-size > 1 should have been rejected at server start."
-        )
+        index = self._storage_page_index(index)
         if self.layout == "layer_first":
             data_page = self.kv_buffer[:, index : index + self.page_size, :, :]
         elif self.layout == "page_first":
@@ -1173,6 +1181,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         ).flatten()
 
     def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
+        index = self._storage_page_index(index)
         if self.layout == "layer_first":
             self.kv_buffer[:, index : index + self.page_size, :, :] = data_page.reshape(
                 self.layer_num,
@@ -1200,10 +1209,12 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             raise ValueError(f"Unsupported layout: {self.layout}")
 
     def get_page_buffer_meta(self, indices):
-        """
-        meta data for zero copy
-        """
-        assert len(indices) % self.page_size == 0
+        """Return local buffer pointers and byte sizes for logical storage pages."""
+        if self.dcp_size > 1 and self.layout == "page_first_kv_split":
+            raise NotImplementedError(
+                "DCP L3 zero-copy storage does not support split KV buffers."
+            )
+        assert len(indices) % self.logical_page_size == 0
         ptr_list = []
         kv_buffer_data_ptr = self.kv_buffer.data_ptr()
         indices = indices.tolist()
@@ -1289,25 +1300,27 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 if scale_buffer_data_ptr is not None:
                     element_size_list.append(scale_element_size)
             return ptr_list, element_size_list
+        # Each logical page maps to one physical page in this rank's buffer.
+        page_starts = [
+            self._storage_page_index(index)
+            for index in indices[:: self.logical_page_size]
+        ]
         if self.layout == "layer_first":
-            for index in range(0, len(indices), self.page_size):
+            for index in page_starts:
                 for layer_id in range(self.layer_num):
                     k_ptr = (
                         kv_buffer_data_ptr
-                        + indices[index] * self.kv_cache_dim * self.dtype.itemsize
+                        + index * self.kv_cache_dim * self.dtype.itemsize
                         + layer_id * self.size * self.kv_cache_dim * self.dtype.itemsize
                     )
                     ptr_list.append(k_ptr)
             element_size = self.dtype.itemsize * self.page_size * self.kv_cache_dim
             element_size_list = [element_size] * len(ptr_list)
         elif self.layout in ["page_first", "page_first_direct"]:
-            for index in range(0, len(indices), self.page_size):
+            for index in page_starts:
                 k_ptr = (
                     kv_buffer_data_ptr
-                    + indices[index]
-                    * self.layer_num
-                    * self.kv_cache_dim
-                    * self.dtype.itemsize
+                    + index * self.layer_num * self.kv_cache_dim * self.dtype.itemsize
                 )
                 ptr_list.append(k_ptr)
             element_size = (
