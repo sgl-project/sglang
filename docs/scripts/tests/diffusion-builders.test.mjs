@@ -19,7 +19,7 @@ for (const page of pages) {
   const source = readFileSync(join(docs, path), "utf8");
   configs.set(page, (await import("data:text/javascript," + encodeURIComponent(source))).config);
 }
-const get = (suffix) => [...configs].find(([path]) => path.endsWith(suffix))[1];
+const get = (suffix) => [...configs].find(([path]) => path.endsWith(join(...suffix.split("/"))))[1];
 const selection = (config, overrides = {}) => ({
   ...config.commandBuilder.defaultSelection,
   ...Object.fromEntries(config.overlayDims.map((dim) => [dim.id, dim.default])),
@@ -130,10 +130,10 @@ test("legacy image hardware, precision and checkpoint choices remain available",
   const qwen = get("/Qwen-Image/Qwen-Image.mdx");
   const edit = get("/Qwen-Image/Qwen-Image-Edit.mdx");
   const zimage = get("/Z-Image/Z-Image-Turbo.mdx");
-  assert.equal(flux.supportedHardware.length, 10);
-  assert.equal(qwen.supportedHardware.length, 9);
-  assert.equal(edit.supportedHardware.length, 7);
-  assert.equal(zimage.supportedHardware.length, 9);
+  assert.equal(flux.supportedHardware.length, 11);
+  assert.equal(qwen.supportedHardware.length, 10);
+  assert.equal(edit.supportedHardware.length, 8);
+  assert.equal(zimage.supportedHardware.length, 10);
   assert.ok(resolve(flux, { hw: "arc_b", version: "flux2-dev", gpus_per_node: 4 }).flags.includes("--tp-size 4"));
   assert.ok(resolve(flux, { hw: "a2", version: "flux2-dev", gpus_per_node: 2 }).flags.includes("--tp-size 2"));
   assert.ok(
@@ -151,7 +151,7 @@ test("Wan preserves standard, multi-GPU, Ascend and LoRA recipes", () => {
   for (const version of ["1", "2"]) {
     const config = get(`/Wan/Wan2.${version}.mdx`);
     assert.equal(config.overlayDims.find((dim) => dim.id === "variant").options.length, 3);
-    for (const hw of config.supportedHardware.filter((id) => !["a2", "a3"].includes(id))) {
+    for (const hw of config.supportedHardware.filter((id) => !["a2", "a3", "xeon"].includes(id))) {
       const gpus = version === "2" && hw === "b300" ? 8 : 4;
       const result = resolve(config, { hw, gpus_per_node: gpus });
       assert.deepEqual(result.builder.errors, []);

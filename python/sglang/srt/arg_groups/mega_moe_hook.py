@@ -68,16 +68,17 @@ def mega_moe_needs_token_budget(
     model_arch: str, hf_quant_config: dict, quantization: str | None
 ) -> bool:
     # NVFP4 experts are repacked into the mega layout at load: no fallback.
-    nvfp4_experts = quantization == "modelopt_fp4" or "FP4" in str(
-        hf_quant_config.get("quant_algo", "")
-    )
+    nvfp4_experts = quantization in (
+        "modelopt_fp4",
+        "minimax_m3_nvfp4",
+    ) or "FP4" in str(hf_quant_config.get("quant_algo", ""))
     return model_arch in MEGA_MOE_NO_FALLBACK_ARCHS or nvfp4_experts
 
 
 def validate_mega_moe_token_budget_for_model(server_args: ServerArgs) -> None:
     # Runs after speculative resolution so the decode / verify bound is final.
     cfg = resolving_view(server_args)
-    if cfg.moe_a2a_backend != "megamoe":
+    if cfg.moe_a2a_backend != "megamoe" or cfg.encoder_only:
         return
     validate_flydsl_decode_capacity(server_args)
     if parse_connector_type(cfg.model_path) == ConnectorType.INSTANCE:

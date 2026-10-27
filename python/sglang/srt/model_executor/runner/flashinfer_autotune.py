@@ -137,7 +137,7 @@ def should_run_flashinfer_autotune(
         resolve_mxfp8_dense_gemm_backend,
     )
 
-    if model_quantization == "mxfp8":
+    if model_quantization == "mxfp8" or model_quantization == "minimax_m3_nvfp4":
         fp8_gemm_needs_autotune = resolve_mxfp8_dense_gemm_backend().is_flashinfer()
     elif model_quantization in ("modelopt", "modelopt_fp8", "modelopt_mixed"):
         fp8_gemm_needs_autotune = flashinfer_per_tensor_fp8_supported()
@@ -175,6 +175,8 @@ def flashinfer_autotune_cache_path(model_runner: ModelRunner) -> Path:
         str(get_parallel().moe_ep_size),
         str(mr.model_config.hf_config.__class__.__name__),
     ]
+    # Retune caches created before FlashInfer's default tactic joined the race.
+    model_key_parts.append("candidate_selection=v2_default")
     # A different skip policy must not reuse previously tuned tactics.
     skip_ops = get_flashinfer_autotune_skip_ops(mr)
     model_key_parts.append("skip_ops=" + ",".join(sorted(skip_ops)))
