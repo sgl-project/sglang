@@ -34,11 +34,12 @@ from sglang.test.test_utils import (
 )
 
 # Full GLM-5.3 weights require the same runner as the existing B200 recipe.
-register_cuda_ci(est_time=1200, stage="extra-b", runner_config="4-gpu-b200")
+# Provisional wall time including startup; calibrate with the B200 CI timing.
+register_cuda_ci(est_time=600, stage="extra-b", runner_config="4-gpu-b200")
 
 MODEL_PATH = "zai-org/GLM-5.3-Flash"
 TRACK_INTERVAL = 256
-DELAY_CYCLES = 500_000_000
+DELAY_CYCLES = 50_000_000
 MAX_TOTAL_TOKENS = 8192
 MAX_NEW_TOKENS = 512
 # The original NVFP4 slow-load experiment measured mean KL 0.007733 with
