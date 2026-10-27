@@ -118,7 +118,8 @@ def pcg_dsa_indexer_prefill_split(
     # Fused path stores K (no-Hadamard) and computes q_fp8 + head gate in the
     # fused kernels, sliced to the unpadded count. Single stream: the split op is
     # captured, so the dual-stream overlap is disabled.
-    if indexer.use_dsa_indexer_fusion:
+    in_cp = forward_batch.attn_cp_metadata is not None
+    if indexer.use_dsa_indexer_fusion and not in_cp:
         q_fp8, weights = indexer._fused_q_prepare_and_store(
             x,
             q_lora,
@@ -140,7 +141,7 @@ def pcg_dsa_indexer_prefill_split(
         )
         return
 
-    query, key, _ = indexer._get_q_k_bf16(
+    query, key, weights_raw = indexer._get_q_k_bf16(
         q_lora,
         x,
         positions,
@@ -149,22 +150,33 @@ def pcg_dsa_indexer_prefill_split(
     )
     q_fp8, q_scale = act_quant(query, indexer.block_size, indexer.scale_fmt)
     # Reuse the compiled head-gate util shared with the eager path.
-    weights = indexer._get_logits_head_gate(x, q_scale)
+    weights = (  # same head-gate choice as the eager CP branch
+        indexer._scale_head_gates(weights_raw, q_scale)
+        if indexer.use_dsa_indexer_fusion
+        else indexer._get_logits_head_gate(x, q_scale)
+    )
     # Store K cache + ragged top-k, sliced to the unpadded count and writing into
     # the static padded topk_result buffer (the graph contract). Mirrors the eager
     # path's store + _get_topk_ragged.
+    # Under CP the key comes back gathered in global order, so it is sliced
+    # like the non-CP path. BCG replay hands over the bucket-sized static
+    # out_cache_loc and a gathered key whose padding sits at the tail; only
+    # the live rows are stored.
+    n_store = extend_num_tokens
+    if in_cp:
+        n_store = min(n_store, key.shape[0], forward_batch.out_cache_loc.shape[0])
     indexer._store_index_k_cache(
         forward_batch=forward_batch,
         layer_id=layer_id,
-        key=key[:extend_num_tokens],
+        key=key[:n_store],
         act_quant=act_quant,
-        out_cache_loc=forward_batch.out_cache_loc[:extend_num_tokens],
+        out_cache_loc=forward_batch.out_cache_loc[:n_store],
     )
     indexer._get_topk_ragged(
         False,
         forward_batch,
         layer_id,
-        q_fp8[:extend_num_tokens],
+        q_fp8 if in_cp else q_fp8[:extend_num_tokens],
         weights,
         metadata,
         topk_result,
