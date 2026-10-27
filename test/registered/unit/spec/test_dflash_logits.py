@@ -83,15 +83,6 @@ def test_selector_rejects_a_quantized_target_lm_head():
         DFlash2DraftModel.compute_candidates(model, torch.randn(2, 4))
 
 
-def _flashinfer_contract_topk(scores, k, sorted=False, deterministic=False):
-    """Stand-in for flashinfer.top_k pinning its call contract: contiguous
-    input (its CHECK_INPUT) and the explicit sorted/deterministic flags
-    _radix_topk relies on (the real kernel defaults both to False)."""
-    assert scores.is_contiguous()
-    assert sorted and deterministic
-    return torch.topk(scores, k, dim=-1)
-
-
 class _FakeQuantMethod:
     """Projects through a captured dense weight, asserting the packed-head
     call contract (packed dtype, no bias). The padded tail comes out as
@@ -119,8 +110,8 @@ def test_selector_projects_a_quantized_target_lm_head_through_its_quant_method(
 ):
     """Packed head weights must be projected through their quantization method,
     with the padded-vocab tail masked out of the top-k on contiguous logits:
-    flashinfer's radix top-k rejects non-contiguous input, so a plain crop view
-    would fail at capture on any padded vocab."""
+    flashinfer's radix top-k only reads dense rows, so a plain crop view would
+    be copied on any padded vocab."""
     torch.manual_seed(0)
     hidden = torch.randn(2, 4)
     dense_weight = torch.randn(6, 4)
@@ -140,9 +131,6 @@ def test_selector_projects_a_quantized_target_lm_head_through_its_quant_method(
     monkeypatch.setattr(
         "sglang.srt.models.dflash.get_parallel",
         lambda: SimpleNamespace(tp_size=1),
-    )
-    monkeypatch.setattr(
-        "sglang.srt.models.dflash._flashinfer_top_k", _flashinfer_contract_topk
     )
 
     candidate_ids, unary_logits = DFlash2DraftModel.compute_candidates(model, hidden)
@@ -198,9 +186,6 @@ def test_selector_gathers_global_candidates_across_vocab_shards(monkeypatch):
     )
     monkeypatch.setattr(
         "sglang.srt.models.dflash.tensor_model_parallel_all_gather", fake_all_gather
-    )
-    monkeypatch.setattr(
-        "sglang.srt.models.dflash._flashinfer_top_k", _flashinfer_contract_topk
     )
 
     candidate_ids, unary_logits = DFlash2DraftModel.compute_candidates(model, hidden)
