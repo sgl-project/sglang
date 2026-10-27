@@ -95,13 +95,20 @@ MHC_TILE_M16_MAX_M = 1024
 _MHC_PROBE_HIDDEN = 7168
 _MHC_PROBE_MS = (80, 144, 192, 320, 384, 640)
 
-APPLIED, UPSTREAM, SUPERSEDED, MISSING = "applied", "upstream", "superseded", "missing"
+APPLIED, UPSTREAM, SUPERSEDED, MISSING, ADDED = (
+    "applied",
+    "upstream",
+    "superseded",
+    "missing",
+    "added",
+)
 
 
 @dataclass
 class IntreeReport:
     """Per-item outcome: applied / upstream (aiter has the PR) / superseded (aiter
-    changed it differently) / missing (aiter no longer has the shape or file)."""
+    changed it differently) / missing (aiter no longer has the shape or file) / added
+    (a shape aiter has no row for)."""
 
     csv_rows: Dict[str, int] = field(default_factory=dict)
     csv_file: Optional[str] = None
@@ -122,54 +129,67 @@ def _env_on(name: str) -> bool:
 # ---------------------------------------------------------------- CSV rows
 
 
-def _norm_kernel(row) -> tuple:
-    def as_int(v):
-        try:
-            return int(float(v))
-        except (TypeError, ValueError):
-            return v
-
-    return (
-        str(row["libtype"]),
-        as_int(row["kernelId"]),
-        as_int(row["splitK"]),
-        str(row["kernelName"]),
-    )
+def _norm(v):
+    # a column with a missing value reads back as float: 256 and 256.0 are one key
+    try:
+        return int(float(v))
+    except (TypeError, ValueError):
+        return str(v).strip()
 
 
-def apply_bpreshuffle_rows(table, intree):
-    """Replace rows of ``table`` (aiter's resolved table) by the in-tree rows.
+def _norm_kernel(row, kernel_cols=_KERNEL_COLS) -> tuple:
+    return tuple(_norm(row[c]) for c in kernel_cols)
 
-    A row is replaced only when aiter's row for the same key still selects the
-    recorded pre-PR kernel. Returns ``(new_table, {status: count})``; the key set
-    of ``table`` is never changed.
+
+def apply_intree_rows(table, intree, key_cols=_KEY_COLS, kernel_cols=_KERNEL_COLS):
+    """Apply the in-tree rows to ``table`` (aiter's resolved table).
+
+    A row with ``base_*`` columns replaces aiter's row for the same key only while that
+    row still selects the recorded kernel. A row without them adds a shape aiter has no
+    row for, and yields to any row aiter has. Returns ``(new_table, {status: count})``;
+    a key never appears twice, which aiter refuses to load.
     """
-    stats = {APPLIED: 0, UPSTREAM: 0, SUPERSEDED: 0, MISSING: 0}
-    if any(c not in table.columns for c in _KEY_COLS + _KERNEL_COLS):
+    stats = {APPLIED: 0, UPSTREAM: 0, SUPERSEDED: 0, MISSING: 0, ADDED: 0}
+    if any(c not in table.columns for c in [*key_cols, *kernel_cols]):
         stats[MISSING] = len(intree)
         return table, stats
     table = table.copy()
     index = {}
-    for i, key in enumerate(
-        zip(*(table[c].astype(str).str.strip() for c in _KEY_COLS))
-    ):
+    for i, key in enumerate(zip(*(table[c].map(_norm) for c in key_cols))):
         index.setdefault(key, []).append(table.index[i])
     shared = [c for c in table.columns if c in intree.columns]
+    base_cols = ["base_" + c for c in kernel_cols]
+    has_base = all(c in intree.columns for c in base_cols)
+    added = []
     for _, row in intree.iterrows():
-        key = tuple(str(row[c]).strip() for c in _KEY_COLS)
+        key = tuple(_norm(row[c]) for c in key_cols)
+        replaces = has_base and not row[base_cols].isna().any()
         hits = index.get(key, [])
+        if not hits and not replaces:
+            added.append(row[shared])
+            index[key] = []  # a second in-tree row for this key counts as missing
+            stats[ADDED] += 1
+            continue
         if len(hits) != 1:
             stats[MISSING] += 1
             continue
-        current = _norm_kernel(table.loc[hits[0]])
-        if current == _norm_kernel(row):
+        current = _norm_kernel(table.loc[hits[0]], kernel_cols)
+        if current == _norm_kernel(row, kernel_cols):
             stats[UPSTREAM] += 1
-        elif current == _norm_kernel({c: row["base_" + c] for c in _KERNEL_COLS}):
+        elif replaces and current == _norm_kernel(
+            {c: row["base_" + c] for c in kernel_cols}, kernel_cols
+        ):
             for c in shared:
                 table.at[hits[0], c] = row[c]
             stats[APPLIED] += 1
         else:
             stats[SUPERSEDED] += 1
+    if added:
+        import pandas as pd
+
+        table = pd.concat([table, pd.DataFrame(added)], ignore_index=True)[
+            table.columns
+        ]
     return table, stats
 
 
@@ -186,40 +206,79 @@ def _write_atomic(df, out_dir: str, stem: str) -> str:
     return path
 
 
-def install_bpreshuffle_rows(report: IntreeReport, out_dir: Optional[str] = None):
+def intree_out_dir() -> str:
+    return os.path.join(tempfile.gettempdir(), f"sglang_aiter_intree_{os.getuid()}")
+
+
+@dataclass(frozen=True)
+class IntreeTable:
+    """An aiter tuned-config table that in-tree rows patch: aiter's variable for it, the
+    ``AITER_CONFIGS`` attribute that resolves it, the in-tree CSV, the merged file's name
+    stem, and the table's key and kernel columns."""
+
+    env: str
+    attr: str
+    csv: str
+    stem: str
+    key_cols: tuple
+    kernel_cols: tuple
+
+
+def install_intree_table(spec: IntreeTable, out_dir: Optional[str] = None):
+    """Hand aiter its resolved ``spec`` table with the in-tree rows applied, as a single
+    file through ``spec.env`` (a single path skips aiter's merge). Returns
+    ``({status: count}, the file aiter reads)``."""
     import pandas as pd
     from aiter.jit.core import AITER_CONFIGS
 
-    out_dir = out_dir or os.path.join(
-        tempfile.gettempdir(), f"sglang_aiter_intree_{os.getuid()}"
+    out_dir = out_dir or intree_out_dir()
+    base = getattr(AITER_CONFIGS, spec.attr)
+    table, stats = apply_intree_rows(
+        pd.read_csv(base),
+        pd.read_csv(spec.csv),
+        list(spec.key_cols),
+        list(spec.kernel_cols),
     )
-    base = AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE
-    intree = pd.read_csv(INTREE_BPRESHUFFLE_CSV)
-    table, stats = apply_bpreshuffle_rows(pd.read_csv(base), intree)
-    report.csv_rows = stats
-    if os.path.dirname(os.path.abspath(base)) == os.path.abspath(out_dir):
-        # env inherited from a parent process that already installed the rows
-        report.notes.append(f"{BPRESHUFFLE_ENV} already points at in-tree table")
-    if stats[APPLIED] == 0:
-        report.csv_file = base
-        return
-    path = _write_atomic(table, out_dir, "a8w8_blockscale_bpreshuffle_tuned_gemm")
-    prev = os.environ.get(BPRESHUFFLE_ENV)
-    os.environ[BPRESHUFFLE_ENV] = path
+    if stats[APPLIED] + stats[ADDED] == 0:
+        return stats, base
+    path = _write_atomic(table, out_dir, spec.stem)
+    prev = os.environ.get(spec.env)
+    os.environ[spec.env] = path
     # get_config_file is lru-cached; drop a resolution made before the env change.
     cache_clear = getattr(type(AITER_CONFIGS).get_config_file, "cache_clear", None)
     if cache_clear is not None:
         cache_clear()
-    resolved = AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE
+    resolved = getattr(AITER_CONFIGS, spec.attr)
     if resolved != path:
         if prev is None:
-            os.environ.pop(BPRESHUFFLE_ENV, None)
+            os.environ.pop(spec.env, None)
         else:
-            os.environ[BPRESHUFFLE_ENV] = prev
+            os.environ[spec.env] = prev
         if cache_clear is not None:
             cache_clear()
         raise RuntimeError(f"aiter resolved {resolved}, expected {path}")
-    report.csv_file = path
+    return stats, path
+
+
+_DSV4_BPRESHUFFLE = IntreeTable(
+    env=BPRESHUFFLE_ENV,
+    attr="AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE",
+    csv=INTREE_BPRESHUFFLE_CSV,
+    stem="a8w8_blockscale_bpreshuffle_tuned_gemm",
+    key_cols=tuple(_KEY_COLS),
+    kernel_cols=tuple(_KERNEL_COLS),
+)
+
+
+def install_bpreshuffle_rows(report: IntreeReport, out_dir: Optional[str] = None):
+    from aiter.jit.core import AITER_CONFIGS
+
+    out_dir = out_dir or intree_out_dir()
+    base = AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE
+    if os.path.dirname(os.path.abspath(base)) == os.path.abspath(out_dir):
+        # env inherited from a parent process that already installed the rows
+        report.notes.append(f"{BPRESHUFFLE_ENV} already points at in-tree table")
+    report.csv_rows, report.csv_file = install_intree_table(_DSV4_BPRESHUFFLE, out_dir)
 
 
 # ---------------------------------------------------------------- Triton JSON
