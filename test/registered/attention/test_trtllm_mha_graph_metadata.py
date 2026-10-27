@@ -28,7 +28,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 
 # trtllm_mha kernels are sm100-only; run this kernel-unit test on Blackwell.
-register_cuda_ci(est_time=16, stage="base-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=14, stage="base-b", runner_config="4-gpu-b200")
 
 DEVICE = "cuda"
 PAGE_SIZE = 128
@@ -83,6 +83,7 @@ def make_xqa_backend(monkeypatch):
             device="cpu",
             max_running_requests=4,
             model=SimpleNamespace(modules=lambda: []),
+            is_draft_worker=False,
         )
         return TRTLLMHAAttnBackend(runner)
 
@@ -308,8 +309,9 @@ def test_fmha_v2_prefill_copies_only_the_batch_pages(
     page_table = torch.full((2, 4), 1 << 20, dtype=torch.int32)
     for row, pages in enumerate(row_pages):
         page_table[row, : len(pages)] = torch.tensor(pages)
-    k = torch.randn(pool_pages * page_size, heads, head_dim).to(torch.bfloat16)
-    v = torch.randn_like(k)
+    # V before K in one buffer: never the fused-halves layout fmha_v2 reads
+    # without a copy, so the prefill takes the copy path.
+    v, k = torch.randn(2, pool_pages * page_size, heads, head_dim).to(torch.bfloat16)
     backend.token_to_kv_pool = SimpleNamespace(get_kv_buffer=lambda _: (k, v))
 
     backend.kv_index_translator = SimpleNamespace(

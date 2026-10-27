@@ -15,7 +15,7 @@ from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=15, stage="extra-a", runner_config="1-gpu-small")
+register_cuda_ci(est_time=13, stage="extra-a", runner_config="1-gpu-small")
 
 
 class TestHiCacheIndexDomains(unittest.TestCase):
@@ -146,7 +146,8 @@ class TestTransferStreamOrdering(unittest.TestCase):
         start.record()
 
         def translate(indices):
-            self.assertEqual(torch.cuda.current_stream(), engine.host_to_device_stream)
+            # Translation runs on the index stream, never behind queued copies.
+            self.assertEqual(torch.cuda.current_stream(), engine.index_stream)
             torch.cuda._sleep(20_000_000)
             resolved.copy_(indices + 100)
             return resolved

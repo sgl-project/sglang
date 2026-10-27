@@ -2,8 +2,9 @@ import json
 import os
 import tempfile
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 import torch.nn.functional as F
@@ -17,6 +18,8 @@ from sglang.multimodal_gen.configs.models.encoders.ideogram import (
     Ideogram4TextEncoderConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.ideogram import (
+    LATENT_SCALE,
+    LATENT_SHIFT,
     Ideogram4DistilledPipelineConfig,
     Ideogram4PipelineConfig,
 )
@@ -133,6 +136,9 @@ class DummyTokenizer:
 
 
 class FakeIdeogramTransformer(torch.nn.Module):
+    def project_llm_features(self, llm_features, indicator):
+        return llm_features
+
     def forward(self, *, x, **kwargs):
         return torch.zeros_like(x)
 
@@ -1570,6 +1576,7 @@ class TestIdeogram4(unittest.TestCase):
                     ),
                     "ideogram4_neg_attn_mask_meta": None,
                     "ideogram4_neg_llm_features": torch.zeros(1, 2, 8, device=device),
+                    "ideogram4_llm_cond": {},
                 },
             )
             step = DenoisingStepState(
@@ -1582,7 +1589,7 @@ class TestIdeogram4(unittest.TestCase):
                 attn_metadata=None,
             )
 
-            def fake_run(current_model, call_kwargs):
+            def fake_run(current_model, call_kwargs, *_):
                 if current_model is transformer:
                     out = torch.zeros(1, 5, 128, device=device)
                     out[:, 1:3] = 4.0
@@ -1659,6 +1666,97 @@ class TestIdeogram4(unittest.TestCase):
                 stage._build_inputs(["11"], 128, 256, args)
         finally:
             set_global_server_args(prev_args)
+
+
+def _tiny_ideogram_dit():
+    config = Ideogram4DistilledDiTConfig()
+    for key, value in dict(
+        adaln_dim=16,
+        attention_head_dim=16,
+        in_channels=8,
+        intermediate_size=32,
+        llm_features_dim=24,
+        mrope_section=(4, 2, 2),
+        num_attention_heads=2,
+        num_layers=2,
+    ).items():
+        setattr(config.arch_config, key, value)
+    with patch(
+        "sglang.multimodal_gen.runtime.layers.attention.layer.get_ring_parallel_world_size",
+        return_value=1,
+    ):
+        model = Ideogram4Transformer2DModel(config, {})
+    generator = torch.Generator().manual_seed(0)
+    with torch.no_grad():
+        for param in model.parameters():
+            param.copy_(0.2 * torch.randn(param.shape, generator=generator))
+    model.post_load_weights()
+    return model.to(torch.bfloat16)
+
+
+def test_llm_conditioning_is_projected_once_per_branch(request):
+    """The masked LLM projection (a K=53248 GEMM at full size) is request-constant:
+    the stage projects it on a branch's first step and reuses it bitwise."""
+    request.getfixturevalue("single_process_model_parallel")
+    set_global_server_args(_fake_server_args())
+    model = _tiny_ideogram_dit()
+    generator = torch.Generator().manual_seed(1)
+    indicator = torch.tensor([[LLM_TOKEN_INDICATOR] * 3 + [OUTPUT_IMAGE_INDICATOR] * 4])
+    inputs = dict(
+        llm_features=torch.randn(1, 7, 24, generator=generator),
+        position_ids=torch.arange(7).view(1, 7, 1).expand(1, 7, 3),
+        segment_ids=torch.ones(1, 7, dtype=torch.long),
+        indicator=indicator,
+    )
+    steps = [
+        (torch.randn(1, 7, 8, generator=generator), torch.tensor([value]))
+        for value in (0.9, 0.5, 0.1)
+    ]
+    stage = object.__new__(Ideogram4DenoisingStage)
+    stage._maybe_get_bcg_runner = lambda current_model: None
+    cache = {}
+    with torch.no_grad(), set_forward_context(current_timestep=0, attn_metadata=None):
+        expected = [model(x=x, t=t, **inputs) for x, t in steps]
+        with patch.object(
+            model, "project_llm_features", wraps=model.project_llm_features
+        ) as project:
+            actual = [
+                stage._run_ideogram_transformer(
+                    model, dict(inputs, x=x, t=t), cache, "positive"
+                )
+                for x, t in steps
+            ]
+    assert project.call_count == 1
+    for out, reference in zip(actual, expected):
+        torch.testing.assert_close(out, reference, atol=0, rtol=0)
+
+    # BCG replays pad the raw features with the sequence, so they pass through
+    stage._maybe_get_bcg_runner = lambda current_model: object()
+    stage._bcg_run = Mock(return_value=expected[0])
+    call_kwargs = dict(inputs, x=steps[0][0], t=steps[0][1])
+    stage._run_ideogram_transformer(model, call_kwargs, {}, "positive")
+    assert stage._bcg_run.call_args.args[1] is call_kwargs
+
+
+def test_decode_reuses_uploaded_latent_constants():
+    stage = Ideogram4DecodingStage(vae=FakeIdeogramVAE())
+    stage.use_declared_component = lambda **kwargs: nullcontext(stage.vae)
+    args = _fake_server_args()
+    latents = torch.randn(1, 4, 128, generator=torch.Generator().manual_seed(0))
+    stats = []
+    for _ in range(2):
+        batch = Req(sampling_params=Ideogram4SamplingParams(prompt="x"))
+        batch.latents = latents
+        batch.extra["ideogram4"] = {"grid_h": 2, "grid_w": 2}
+        output = stage.forward(batch, args).output
+        stats.append(stage.latent_stats[(latents.dtype, get_local_torch_device())])
+    scale, shift = (torch.tensor(v) for v in (LATENT_SCALE, LATENT_SHIFT))
+    z = (latents * scale + shift).view(1, 2, 2, 2, 2, 32)
+    z = z.permute(0, 5, 1, 3, 2, 4).reshape(1, 32, 4, 4)[:, :3]
+    expected = (z.to(torch.bfloat16) / 2 + 0.5).clamp(0, 1)
+    torch.testing.assert_close(output.cpu(), expected, atol=0, rtol=0)
+    # the second request scales with the first request's device tensors
+    assert stats[0] is stats[1]
 
 
 if __name__ == "__main__":

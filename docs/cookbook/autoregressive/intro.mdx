@@ -94,7 +94,7 @@ metatags:
   <Card
     title="LiquidAI"
     mode="card"
-    href="/cookbook/autoregressive/LiquidAI/LFM2.5"
+    href="/cookbook/autoregressive/LiquidAI/LFM3"
     img="/cards/logos/liquidai.png"
   />
   <Card
