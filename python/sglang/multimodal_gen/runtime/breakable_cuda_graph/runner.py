@@ -64,17 +64,6 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-def _env_float(name: str, default: float) -> float:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    try:
-        return float(raw)
-    except ValueError:
-        logger.warning("[BCG] ignoring invalid float %s=%r", name, raw)
-        return default
-
-
 def _map_tensors(obj, fn):
     """Rebuild ``obj`` applying ``fn`` to every tensor leaf, recursing into
     list/tuple/dict containers; everything else passes through unchanged."""
