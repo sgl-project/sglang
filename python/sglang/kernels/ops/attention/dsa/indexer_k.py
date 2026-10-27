@@ -8,7 +8,7 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
-from sglang.kernels.ops.attention.fused_store_index_cache import index_k_scale_fmt
+from sglang.kernels.ops.kvcache.dsa_fused_store_index_cache import index_k_scale_fmt
 
 _CUDA_FILE = "deepseek_v32/indexer_k.cuh"
 
