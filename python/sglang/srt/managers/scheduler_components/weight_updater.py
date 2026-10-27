@@ -140,7 +140,7 @@ class SchedulerWeightUpdaterManager:
         with self._observe_weight_load("disk"):
             success, message = True, "Succeeded to update model weights."
             target_updated = False
-            for role, runner in self._select_runners():
+            for role, runner in self._select_runners(recv_req.selector):
                 success, message = runner.weight_updater.update_weights_from_disk(
                     recv_req.model_path,
                     recv_req.load_format,

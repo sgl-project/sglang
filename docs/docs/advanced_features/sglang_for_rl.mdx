@@ -204,6 +204,12 @@ This path trades some I/O overhead for simplicity and flexibility. It integrates
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`True`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: bool</td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`selector`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Which model runners to reload under speculative decoding. Use `"target"` to keep a separate draft model's weights.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`"all"`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`"target"`, `"draft"`, `"all"`</td>
+    </tr>
   </tbody>
 </table>
 
@@ -246,7 +252,7 @@ This path trades some I/O overhead for simplicity and flexibility. It integrates
   </tbody>
 </table>
 
-**Python Engine API:** `engine.update_weights_from_disk(model_path, load_format=None)`
+**Python Engine API:** `engine.update_weights_from_disk(model_path, load_format=None, selector="all")`
 
 **Diffusion engine (SGLang-Diffusion):** The diffusion engine exposes the same `POST /update_weights_from_disk` endpoint with the following behavior:
 

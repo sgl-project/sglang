@@ -251,6 +251,30 @@ class TestWeightUpdateSession(_WeightUpdaterManagerTestBase):
         target.weight_updater.load_weights_from_distributed.assert_called_once()
         draft.weight_updater.load_weights_from_distributed.assert_not_called()
 
+    def test_disk_update_target_only_selector_skips_draft(self):
+        """selector="target" must not load the target checkpoint into the draft."""
+        target, draft = _runner(), _runner()
+
+        output = self._manager(target, draft).update_weights_from_disk(
+            _request(selector="target")
+        )
+
+        self.assertTrue(output.success)
+        target.weight_updater.update_weights_from_disk.assert_called_once()
+        draft.weight_updater.update_weights_from_disk.assert_not_called()
+
+    def test_disk_update_draft_only_selector_skips_target(self):
+        """selector="draft" reloads only the draft and leaves the target alone."""
+        target, draft = _runner(), _runner()
+
+        output = self._manager(target, draft).update_weights_from_disk(
+            _request(selector="draft")
+        )
+
+        self.assertTrue(output.success)
+        target.weight_updater.update_weights_from_disk.assert_not_called()
+        draft.weight_updater.update_weights_from_disk.assert_called_once()
+
     def test_end_runs_post_load_on_both_when_load_was_bypassed(self):
         """A P2P/RDMA session never calls load_weights, so end must run post_load_weights."""
         target, draft = _runner(), _runner()

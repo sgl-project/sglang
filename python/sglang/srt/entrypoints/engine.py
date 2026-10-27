@@ -1701,16 +1701,19 @@ class Engine(EngineScoreMixin, EngineBase):
         self,
         model_path: str,
         load_format: Optional[str] = None,
+        selector: str = "all",
     ):
         """Update the weights from disk inplace without re-launching the engine.
 
         This method allows updating the model weights from disk without restarting
         the engine. It can be used to load a different model or update weights with
-        new training.
+        new training. Pass selector="target" to leave a separate draft model
+        (e.g. a DFLASH or EAGLE3 draft) untouched.
         """
         obj = UpdateWeightFromDiskReqInput(
             model_path=model_path,
             load_format=load_format,
+            selector=selector,
         )
 
         return self.loop.run_until_complete(
