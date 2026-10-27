@@ -999,6 +999,13 @@ class Envs:
     # instead of a torch gather of num_tokens * topk bf16 rows. Needs
     # SGLANG_GFX1250_W4A8_BACKEND=triton; expert parallelism keeps the torch gather.
     SGLANG_GFX1250_W4A8_KERNEL_GATHER = EnvBool(False)
+    # gfx1250 GPT-OSS W4A8 MoE: one weight copy in FlyDSL's layout (dims padded to 256).
+    # Batches of at least SGLANG_GFX1250_W4A8_FLYDSL_MIN_TOKENS tokens run aiter.fused_moe
+    # (FlyDSL a8w4, MXFP8 activations); smaller ones run the gluon moe_gemm_a8w4 over a
+    # zero-copy view of the same weights (dims rounded up to 128). Off: the path above,
+    # unchanged.
+    SGLANG_GFX1250_W4A8_FLYDSL = EnvBool(False)
+    SGLANG_GFX1250_W4A8_FLYDSL_MIN_TOKENS = EnvInt(16)
     # aiter opus moe_sorting dispatch policy (0 auto, 1 oneshot, 2 multi-phase). Auto picks
     # oneshot below ~24 tokens, which on gfx950 costs 11-16 us vs 6-7 us for multi-phase at
     # E=385 / 129; outputs are identical and multi-phase is never slower up to 16384 tokens.

@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Optional
 
 import torch
@@ -39,6 +40,24 @@ if _KERNEL_GATHER and _BACKEND != "triton":
         "SGLANG_GFX1250_W4A8_KERNEL_GATHER=1 needs SGLANG_GFX1250_W4A8_BACKEND=triton: "
         "the gluon kernel gathers with TDM, which does not compile on gfx1250"
     )
+
+FLYDSL_ENABLED = envs.SGLANG_GFX1250_W4A8_FLYDSL.get()
+FLYDSL_MIN_TOKENS = envs.SGLANG_GFX1250_W4A8_FLYDSL_MIN_TOKENS.get()
+if FLYDSL_ENABLED and _KERNEL_GATHER:
+    raise ValueError(
+        "SGLANG_GFX1250_W4A8_FLYDSL=1 runs small batches on the gluon kernel over "
+        "preshuffled weights: SGLANG_GFX1250_W4A8_KERNEL_GATHER must be off"
+    )
+# FlyDSL's a8w4 MoE wants hidden and intermediate dims in multiples of 256
+# (GPT-OSS 2880 -> 3072; TP2 intermediate 1440 -> 1536).
+_FLYDSL_DIM_ALIGN = 256
+# The gluon kernel's GFX1250_SCALE (n32k4) scales hold K in chunks of 4 e8m0 groups
+# (128 elements), and its scale descriptor ends at cdiv(K, 32) groups: with
+# K = 2880 the last chunk's columns fall outside it and read as 0 (scale 2^-127).
+# So the gluon path runs on K rounded up to 128 (2880 -> 2944, zero activations
+# against zero weights), and GEMM 1 on N = 2 * that, so GEMM 2's K follows.
+_GLUON_K_ALIGN = 128
+_E8M0_ONE = 127
 
 
 def _import_aiter_w4a8():
@@ -227,12 +246,18 @@ def aiter_w4a8_gfx1250_forward(
     apply_router_weight_on_input: bool = False,
     expert_map: Optional[torch.Tensor] = None,
     num_local_experts: Optional[int] = None,
+    backend: Optional[str] = _BACKEND,
+    preshuffled: bool = False,
+    swizzle_mx_scale: Optional[str] = None,
+    pad_hidden_to: Optional[int] = None,
 ) -> torch.Tensor:
     """MXFP4 W4A8 GPT-OSS MoE forward for gfx1250 via aiter triton
     ``moe_gemm_a8w4``.
 
     ``w*`` / ``w*_scale`` / ``w*_bias`` must already be in the
-    ``moe_gemm_a8w4`` layout produced by :func:`prepare_w4a8_gfx1250_weights`.
+    ``moe_gemm_a8w4`` layout produced by :func:`prepare_w4a8_gfx1250_weights`,
+    or (``preshuffled=True``, gluon, ``swizzle_mx_scale="GFX1250_SCALE"``) the
+    views of FlyDSL's weights made by :func:`prepare_w4a8_gfx1250_flydsl_weights`.
     ``a13_scale`` / ``a2_scale`` are the static per-tensor FP8 activation scales
     for gate_up_proj and down_proj respectively.
     """
@@ -248,6 +273,10 @@ def aiter_w4a8_gfx1250_forward(
 
     if hidden_states.shape[0] == 0:
         return hidden_states.new_empty(hidden_states.shape)
+    if pad_hidden_to and pad_hidden_to > hidden_states.shape[-1]:
+        hidden_states = torch.nn.functional.pad(
+            hidden_states, (0, pad_hidden_to - hidden_states.shape[-1])
+        )
 
     if expert_map is not None:
         routing_data, gather_idx, scatter_idx, gate_valid = _ep_routing(
@@ -268,7 +297,12 @@ def aiter_w4a8_gfx1250_forward(
         gate_valid = None
     gammas = routing_data.gate_scal
 
-    if _KERNEL_GATHER and expert_map is None and not apply_router_weight_on_input:
+    if (
+        _KERNEL_GATHER
+        and not preshuffled
+        and expert_map is None
+        and not apply_router_weight_on_input
+    ):
         # Downcast the num_tokens rows, and let GEMM 1 gather them: cheaper than
         # gathering then downcasting num_tokens * topk bf16 rows.
         x_fp8 = downcast_to_static_fp8(hidden_states, a13_scale)
@@ -303,12 +337,13 @@ def aiter_w4a8_gfx1250_forward(
         gather_indx=gemm1_gather,
         scatter_indx=None,
         gammas=None,
-        swizzle_mx_scale=None,
+        swizzle_mx_scale=swizzle_mx_scale,
         out_dtype=x_fp8.dtype,
         apply_swiglu=True,
         alpha=gemm1_alpha,
         limit=gemm1_limit,
-        backend=_BACKEND,
+        preshuffled=preshuffled,
+        backend=backend,
     )
 
     # GEMM2: down projection, scatter back to token order and apply the router
@@ -325,10 +360,184 @@ def aiter_w4a8_gfx1250_forward(
         gather_indx=None,
         scatter_indx=scatter_idx,
         gammas=None if apply_router_weight_on_input else gammas,
-        swizzle_mx_scale=None,
+        swizzle_mx_scale=swizzle_mx_scale,
         out_dtype=torch.bfloat16,
         gate_valid=gate_valid,
-        backend=_BACKEND,
+        preshuffled=preshuffled,
+        backend=backend,
     )
 
     return intermediate_cache3.contiguous()
+
+
+@dataclass
+class FlydslW4A8Weights:
+    """GPT-OSS W4A8 MoE weights in FlyDSL's layout, plus zero-copy gluon views.
+
+    FlyDSL (``aiter.fused_moe``, ``gate_mode=INTERLEAVE``): gate/up rows
+    interleaved, dims zero-padded to 256, ``moe_shuffle_weight`` /
+    ``moe_shuffle_scale`` (n32k4) layouts, padded scales = e8m0 1.0.
+    Gluon (``moe_gemm_a8w4``, ``preshuffled=True``, ``GFX1250_SCALE``): the same
+    storage through ``moe_weight_decode_view``, cut to dims rounded up to 128
+    (``_GLUON_K_ALIGN``): GEMM 1 to N = 2 * I_g, GEMM 2 to the real hidden N;
+    the kernel takes K from the activations (hidden padded to ``gluon_hidden``,
+    the intermediate to I_g by GEMM 1's zero rows).
+    """
+
+    hidden_size: int
+    hidden_size_padded: int
+    gluon_hidden: int
+    w13: torch.Tensor  # [E, 2*I_pad, H_pad // 2] uint8, shuffled
+    w13_scale: torch.Tensor  # [E, 2*I_pad // 32, H_pad // 32 * 32] uint8 (n32k4)
+    w13_bias: torch.Tensor  # [E, 2*I_pad] fp32, gate/up interleaved
+    w2: torch.Tensor  # [E, H_pad, I_pad // 2] uint8, shuffled
+    w2_scale: torch.Tensor  # [E, H_pad // 32, I_pad // 32 * 32] uint8 (n32k4)
+    w2_bias: torch.Tensor  # [E, H_pad] fp32
+    gluon_w13: torch.Tensor
+    gluon_w13_scale: torch.Tensor
+    gluon_w13_bias: torch.Tensor
+    gluon_w2: torch.Tensor
+    gluon_w2_scale: torch.Tensor
+    gluon_w2_bias: torch.Tensor
+
+
+def _pad_dim(t: torch.Tensor, dim: int, size: int, value) -> torch.Tensor:
+    if t.shape[dim] == size:
+        return t
+    pad_shape = list(t.shape)
+    pad_shape[dim] = size - t.shape[dim]
+    return torch.cat([t, t.new_full(pad_shape, value)], dim=dim)
+
+
+def prepare_w4a8_gfx1250_flydsl_weights(
+    w13_weight: torch.Tensor,
+    w13_weight_scale: torch.Tensor,
+    w13_weight_bias: torch.Tensor,
+    w2_weight: torch.Tensor,
+    w2_weight_scale: torch.Tensor,
+    w2_weight_bias: torch.Tensor,
+) -> FlydslW4A8Weights:
+    """SGLang's loaded Quark W4A8 MoE buffers (layout as in
+    :func:`prepare_w4a8_gfx1250_weights`, gate/up SEPARATED) -> one copy in
+    FlyDSL's layout, with the gluon views over it."""
+    from aiter.ops.shuffle import moe_shuffle_scale, moe_shuffle_weight
+    from aiter.ops.triton.utils.shuffle import moe_weight_decode_view
+
+    num_experts, hidden, half_inter = w2_weight.shape
+    inter = half_inter * 2
+    hidden_pad = -(-hidden // _FLYDSL_DIM_ALIGN) * _FLYDSL_DIM_ALIGN
+    inter_pad = -(-inter // _FLYDSL_DIM_ALIGN) * _FLYDSL_DIM_ALIGN
+    inter_g = -(-inter // _GLUON_K_ALIGN) * _GLUON_K_ALIGN
+
+    # GEMM1 [E, (gate|up), I, K]: pad I in each half and K, then interleave the
+    # gate/up rows (moe_shuffle_* do it with is_guinterleave=True, gate_up=True).
+    w13 = w13_weight.view(num_experts, 2, inter, hidden // 2)
+    w13 = _pad_dim(_pad_dim(w13, 2, inter_pad, 0), 3, hidden_pad // 2, 0)
+    w13 = moe_shuffle_weight(
+        w13.reshape(num_experts, 2 * inter_pad, hidden_pad // 2),
+        num_experts,
+        is_guinterleave=True,
+        gate_up=True,
+    )
+    w13_scale = w13_weight_scale.view(num_experts, 2, inter, hidden // 32)
+    w13_scale = _pad_dim(
+        _pad_dim(w13_scale, 2, inter_pad, _E8M0_ONE), 3, hidden_pad // 32, _E8M0_ONE
+    )
+    w13_scale = moe_shuffle_scale(
+        w13_scale.reshape(num_experts, 2 * inter_pad, hidden_pad // 32),
+        num_experts,
+        is_guinterleave=True,
+        gate_up=True,
+    ).contiguous()
+    w13_bias = _pad_dim(w13_weight_bias.view(num_experts, 2, inter), 2, inter_pad, 0)
+    w13_bias = (
+        w13_bias.transpose(1, 2)
+        .reshape(num_experts, 2 * inter_pad)
+        .float()
+        .contiguous()
+    )
+
+    # GEMM2 [E, H, I]: pad N (hidden) and K (intermediate).
+    w2 = _pad_dim(_pad_dim(w2_weight, 1, hidden_pad, 0), 2, inter_pad // 2, 0)
+    w2 = moe_shuffle_weight(w2.contiguous(), num_experts)
+    w2_scale = _pad_dim(
+        _pad_dim(w2_weight_scale, 1, hidden_pad, _E8M0_ONE),
+        2,
+        inter_pad // 32,
+        _E8M0_ONE,
+    )
+    w2_scale = moe_shuffle_scale(w2_scale.contiguous(), num_experts).contiguous()
+    w2_bias = _pad_dim(w2_weight_bias, 1, hidden_pad, 0).float().contiguous()
+
+    # Gluon views: (E, K_pad * 16, N // 16) weights, (E, K_scale_pad * 32, N // 32)
+    # scales (moe_gemm_a8w4 transposes them back), cut to the first N rows: GEMM 1
+    # 2 * inter_g (gate/up interleaved, so real rows first, then zero rows), GEMM 2
+    # the real hidden.
+    return FlydslW4A8Weights(
+        hidden_size=hidden,
+        hidden_size_padded=hidden_pad,
+        gluon_hidden=-(-hidden // _GLUON_K_ALIGN) * _GLUON_K_ALIGN,
+        w13=w13,
+        w13_scale=w13_scale,
+        w13_bias=w13_bias,
+        w2=w2,
+        w2_scale=w2_scale,
+        w2_bias=w2_bias,
+        gluon_w13=moe_weight_decode_view(w13)[:, :, : 2 * inter_g // 16],
+        gluon_w13_scale=w13_scale.view(num_experts, 2 * inter_pad // 32, -1).transpose(
+            1, 2
+        )[:, :, : 2 * inter_g // 32],
+        gluon_w13_bias=w13_bias[:, : 2 * inter_g],
+        gluon_w2=moe_weight_decode_view(w2)[:, :, : hidden // 16],
+        gluon_w2_scale=w2_scale.view(num_experts, hidden_pad // 32, -1).transpose(1, 2)[
+            :, :, : hidden // 32
+        ],
+        gluon_w2_bias=w2_bias[:, :hidden],
+    )
+
+
+def aiter_w4a8_gfx1250_flydsl_forward(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    topk: int,
+    weights: FlydslW4A8Weights,
+    gemm1_limit: float,
+    renormalize: bool = True,
+) -> torch.Tensor:
+    """GPT-OSS W4A8 MoE through aiter.fused_moe's FlyDSL a8w4 (gfx1250 grouped
+    GEMM; MXFP8 activations quantized per 1x32 by FlyDSL itself). Routing as
+    the triton path's: top-k of the logits, softmax over them (renormalize)."""
+    from aiter import ActivationType, QuantType, dtypes
+    from aiter.fused_moe import GateMode, fused_moe
+
+    if hidden_states.shape[0] == 0:
+        return hidden_states.new_empty(hidden_states.shape)
+    if renormalize:
+        vals, topk_ids = torch.topk(router_logits, topk, dim=-1)
+        topk_weights = torch.softmax(vals.float(), dim=-1)
+    else:
+        probs = torch.softmax(router_logits.float(), dim=-1)
+        topk_weights, topk_ids = torch.topk(probs, topk, dim=-1)
+    x = hidden_states
+    pad = weights.hidden_size_padded - weights.hidden_size
+    if pad:
+        x = torch.nn.functional.pad(x, (0, pad))
+    out = fused_moe(
+        x,
+        weights.w13,
+        weights.w2,
+        topk_weights.to(torch.bfloat16),
+        topk_ids.to(torch.int32),
+        activation=ActivationType.Swiglu,
+        quant_type=QuantType.per_1x32,
+        w1_scale=weights.w13_scale,
+        w2_scale=weights.w2_scale,
+        bias1=weights.w13_bias,
+        bias2=weights.w2_bias,
+        swiglu_limit=gemm1_limit,
+        gate_mode=GateMode.INTERLEAVE.value,
+        quant_dtype_a=dtypes.fp8,
+    )
+    if pad:
+        out = out[:, : weights.hidden_size]
+    return out.contiguous()
