@@ -118,6 +118,8 @@ ONE_NPU_CASES: list[DiffusionTestCase] = [
             extras=EXTRAS_DISABLE_WARMUP,
         ),
         # Pins the sampling contract the Ascend GT image is recorded with.
+        # CANN RMSNorm/RoPE keep the reference math but not bit-identical
+        # rounding, so these cases request the lossless tier, not exact.
         replace(
             T2I_sampling_params,
             output_size="1024x1024",
@@ -126,7 +128,7 @@ ONE_NPU_CASES: list[DiffusionTestCase] = [
                 "num_inference_steps": 40,
                 "guidance_scale": 1,
                 "seed": 42,
-                "quality": "exact",
+                "quality": "lossless",
             },
         ),
         # Enabled together with the NPU GT pin once the GT-gen workflow has
@@ -173,7 +175,7 @@ ONE_NPU_CASES: list[DiffusionTestCase] = [
                 "num_inference_steps": 40,
                 "guidance_scale": 1,
                 "seed": 42,
-                "quality": "exact",
+                "quality": "lossless",
             },
         ),
         run_consistency_check=False,
@@ -195,7 +197,7 @@ ONE_NPU_CASES: list[DiffusionTestCase] = [
                 "num_inference_steps": 40,
                 "guidance_scale": 1,
                 "seed": 42,
-                "quality": "exact",
+                "quality": "lossless",
                 "background": "transparent",
             },
         ),
@@ -219,7 +221,7 @@ ONE_NPU_CASES: list[DiffusionTestCase] = [
                 "num_inference_steps": 40,
                 "guidance_scale": 1,
                 "seed": 42,
-                "quality": "exact",
+                "quality": "lossless",
             },
         ),
         run_consistency_check=False,
@@ -240,7 +242,7 @@ ONE_NPU_CASES: list[DiffusionTestCase] = [
                 "num_inference_steps": 40,
                 "guidance_scale": 1,
                 "seed": 42,
-                "quality": "exact",
+                "quality": "lossless",
             },
         ),
         run_consistency_check=False,

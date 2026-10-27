@@ -140,7 +140,12 @@ def build_layout(image_slots, image_shapes, axes_dims, device):
     )
 
 
+# cos/sin expanded from the current forward's rope slices; reset at forward start/end.
 _NPU_ROPE_COS_SIN_CACHE = {}
+
+
+def _reset_npu_rope_cos_sin_cache():
+    _NPU_ROPE_COS_SIN_CACHE.clear()
 
 
 def _npu_rope_cos_sin(rope, dtype):
@@ -1133,6 +1138,7 @@ class QwenImage21Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin
         if prefix_caches is None:
             prefix_caches = [[None] * self.num_layers for _ in layouts]
         prefix_states, ropes = [], []
+        _reset_npu_rope_cos_sin_cache()
         for sample, layout in enumerate(layouts):
             prefix = None
             if not prefix_caches[sample][0]:
@@ -1164,6 +1170,7 @@ class QwenImage21Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin
                 prefix_pad,
             )
         output = self.proj_out(self.norm_out(images, temb))
+        _reset_npu_rope_cos_sin_cache()
         if sp > 1:
             output = sequence_model_parallel_all_gather(output, dim=1)
         return output
