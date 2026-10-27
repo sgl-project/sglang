@@ -44,6 +44,9 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
 )
+from sglang.srt.model_executor.model_runner_components.weight_updater import (
+    _unsupported_derived_weight_cache_error,
+)
 from sglang.srt.runtime_context import get_model, get_parallel
 from sglang.srt.utils.weight_checker import overall_checksum
 
@@ -314,7 +317,14 @@ class SchedulerWeightUpdaterManager:
                 message="a weight-update session is already open; "
                 "call end_weight_update() first",
             )
-        for _, runner in self._select_runners(recv_req.selector):
+        runners = self._select_runners(recv_req.selector)
+        # Preflight every selected runner before restoring any packed weights or
+        # admitting external P2P/RDMA writes into the update session.
+        for _, runner in runners:
+            error = _unsupported_derived_weight_cache_error(runner.model)
+            if error is not None:
+                return BeginWeightUpdateReqOutput(success=False, message=error)
+        for _, runner in runners:
             runner.weight_updater.begin_weight_update()
         self._session = _WeightUpdateSession(selector=recv_req.selector)
         torch.distributed.barrier(group=self.tp_cpu_group)

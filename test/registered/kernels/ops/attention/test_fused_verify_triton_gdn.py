@@ -186,6 +186,46 @@ def test_fused_gdn_mtp_precision(N: int, T: int):
 
 
 @pytest.mark.skipif(not KERNELS_AVAILABLE, reason="Kernel not available")
+@pytest.mark.parametrize("N,T", [(1, 7), (3, 16)])
+def test_tree_verify_matches_reference_with_strided_parent_indices(N, T):
+    H, HV, K, V = 2, 4, 32, 32
+    A_log, dt_bias, a, b, q, k, v, state, indices, cu_seqlens = _make_tensors(
+        N, T, H, HV, K, V
+    )
+    parents = torch.full((N, 2 * T), -1, device="cuda", dtype=torch.int32)[:, ::2]
+    steps = torch.arange(T, device="cuda")
+    parents.copy_((torch.rand(N, T, device="cuda") * steps).to(torch.int32))
+    parents[:, 0] = -1
+    outputs, states = [], []
+    for update in (run_reference, run_fused_mtp):
+        scratch = torch.full((N, T, HV, V, K), float("nan"), device="cuda")
+        initial = state.clone()
+        outputs.append(
+            update(
+                A_log,
+                dt_bias,
+                q,
+                k,
+                v,
+                a,
+                b,
+                initial,
+                indices,
+                cu_seqlens,
+                disable_state_update=True,
+                intermediate_states_buffer=scratch,
+                intermediate_state_indices=indices,
+                cache_steps=T,
+                retrieve_parent_token=parents,
+            )
+        )
+        states.append(scratch)
+        torch.testing.assert_close(initial, state, rtol=0, atol=0)
+    torch.testing.assert_close(outputs[0], outputs[1], rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(states[0], states[1], rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.skipif(not KERNELS_AVAILABLE, reason="Kernel not available")
 @pytest.mark.parametrize("N", [1, 3, 16])
 def test_qwen35_tp4_fused_gdn_mtp_precision(N: int):
     """Exercise the gfx950 TP4 launch shape against the reference path."""

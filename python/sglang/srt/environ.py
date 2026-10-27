@@ -1489,8 +1489,9 @@ class Envs:
     # avoiding a second blocking readback after generating the same indptr.
     SGLANG_OPT_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)
     SGLANG_OPT_FLASHINFER_VERIFY_HOST_PLAN = EnvBool(False)
-    # Capture FA3 top-k target-verify metadata construction in the target graph;
-    # replay only stages the dynamic tree mask into a stable backend buffer.
+    # UBTree target only: capture supported FA3 verify metadata in the target
+    # graph and reuse its scheduler metadata across MHA layers. Ignored by
+    # other speculative algorithms, draft workers and unsupported layouts.
     SGLANG_OPT_FA3_VERIFY_METADATA_IN_GRAPH = EnvBool(False)
     SGLANG_OPT_FUSED_KDA_VERIFY = EnvBool(False)
     # Use compact tree-only visibility with UBTree's FA3 target verification.

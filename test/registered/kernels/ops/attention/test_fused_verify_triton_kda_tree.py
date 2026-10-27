@@ -444,6 +444,15 @@ def test_tree_conv_raw_commit_matches_full_window(
 @pytest.mark.parametrize("width", [32, 49])
 def test_factorized_tree_cuda_graph_replay_reads_new_inputs(width):
     """Factorized tree paths must remain address-stable and replay-safe."""
+    from types import SimpleNamespace
+
+    from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+        MambaAttnBackendBase,
+    )
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from sglang.srt.runtime_context import get_context
+    from sglang.srt.speculative.ubtree_info import create_ubtree_verify_input
+
     torch.manual_seed(width * 1000 + 49)
     device = "cuda"
     batch_size = 1
@@ -472,7 +481,40 @@ def test_factorized_tree_cuda_graph_replay_reads_new_inputs(width):
     a = torch.randn_like(q)
     b = torch.randn(1, width, num_heads, dtype=torch.bfloat16, device=device)
 
-    def run(query_factors, value_factors):
+    runner = SimpleNamespace(
+        device=device,
+        server_args=SimpleNamespace(enable_mis=False),
+        is_draft_worker=False,
+        req_to_token_pool=SimpleNamespace(
+            get_mamba_indices=lambda requests: requests.to(torch.int32).clone(),
+            translate_mamba_indices=lambda slots: slots,
+        ),
+        token_to_kv_pool=None,
+    )
+    with get_context().override_server_args(
+        speculative_algorithm="UBTREE",
+        speculative_eagle_topk=2,
+        speculative_dflash_block_size=5,
+    ):
+        backend = MambaAttnBackendBase(runner)
+        backend.init_cuda_graph_state(1, width)
+        spec = create_ubtree_verify_input(None, width)
+    spec.retrieve_parent_token = parents
+    spec.tree_depths = depths
+    spec.retrieve_next_token = torch.zeros_like(parents)
+    spec.retrieve_next_sibling = torch.full_like(parents, -1)
+    batch = SimpleNamespace(
+        batch_size=1,
+        req_pool_indices=indices,
+        forward_mode=ForwardMode.TARGET_VERIFY,
+        spec_info=spec,
+        seq_lens_cpu=None,
+    )
+    backend.init_forward_metadata_out_graph(batch, in_capture=True)
+    metadata = backend.forward_metadata
+    depth_pointer = metadata.tree_depths.data_ptr()
+
+    def run(query_factors, value_factors, *, eager=False):
         return fused_sigmoid_gating_delta_rule_update(
             A_log=A_log,
             a=a,
@@ -492,8 +534,10 @@ def test_factorized_tree_cuda_graph_replay_reads_new_inputs(width):
             intermediate_states_buffer=None,
             intermediate_state_indices=indices,
             cache_steps=width,
-            retrieve_parent_token=parents,
-            tree_depths=depths,
+            retrieve_parent_token=(
+                spec.retrieve_parent_token if eager else metadata.retrieve_parent_token
+            ),
+            tree_depths=spec.tree_depths if eager else metadata.tree_depths,
             tree_max_depth=5,
             tree_query_factors=query_factors,
             tree_value_factors=value_factors,
@@ -513,14 +557,28 @@ def test_factorized_tree_cuda_graph_replay_reads_new_inputs(width):
     with torch.cuda.graph(graph):
         graph_out = run(graph_query_factors, graph_value_factors)
 
-    # Change every recurrent input in place; replay must consume the new values,
-    # not constants or stale factors from capture.
-    for tensor in (q, k, v, a, b):
-        tensor.copy_(torch.randn_like(tensor))
-    graph.replay()
-    replay_out = graph_out.clone()
-
     ref_query_factors = torch.empty_like(graph_query_factors)
     ref_value_factors = torch.empty_like(graph_value_factors)
-    eager_out = run(ref_query_factors, ref_value_factors)
-    torch.testing.assert_close(replay_out, eager_out, rtol=0, atol=0)
+    # Replace proposal tensors as well as changing recurrent inputs. Refresh via
+    # both public paths: replay preparation and the post-draft plan-stream fixup.
+    # Eager uses the live proposal, so stale captured topology cannot pass.
+    for fanout in (3, 4):
+        new_parents = [-1] + [(i - 1) // fanout for i in range(1, width)]
+        new_depths = [0] * width
+        for i in range(1, width):
+            new_depths[i] = new_depths[new_parents[i]] + 1
+        spec.retrieve_parent_token = torch.tensor(
+            [new_parents], dtype=torch.int32, device=device
+        )
+        spec.tree_depths = torch.tensor([new_depths], dtype=torch.int32, device=device)
+        for tensor in (q, k, v, a, b):
+            tensor.copy_(torch.randn_like(tensor))
+        if fanout == 3:
+            backend.init_forward_metadata_out_graph(batch)
+        else:
+            backend.update_verify_buffers_to_fill_after_draft(spec, 1)
+        assert backend.forward_metadata.tree_depths.data_ptr() == depth_pointer
+        graph.replay()
+        replay_out = graph_out.clone()
+        eager_out = run(ref_query_factors, ref_value_factors, eager=True)
+        torch.testing.assert_close(replay_out, eager_out, rtol=0, atol=0)

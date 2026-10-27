@@ -1056,11 +1056,12 @@ def causal_conv1d_update(
     retrieve_next_token: Optional[torch.Tensor] = None,
     retrieve_next_sibling: Optional[torch.Tensor] = None,
     retrieve_parent_token: Optional[torch.Tensor] = None,
-    direct_parent: bool = False,
-    save_tree_raw_only: bool = False,
     pad_slot_id: int = PAD_SLOT_ID,
     metadata=None,
     validate_data=False,
+    *,
+    direct_parent: bool = False,
+    save_tree_raw_only: bool = False,
 ):
     """
     x: (batch, dim) or (batch, dim, seqlen)

@@ -1,9 +1,9 @@
 ---
 title: "Speculative Decoding"
 metatags:
-    description: "SGLang speculative decoding: EAGLE-2/EAGLE-3, MTP, UNO, DFLASH, draft model configuration, and overlap-scheduler guidance."
+    description: "SGLang speculative decoding: EAGLE-2/EAGLE-3, MTP, UNO, DFLASH, UBTREE, draft model configuration, and overlap-scheduler guidance."
 ---
-SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3, MTP, UNO, DFLASH, classic draft-model decoding, and an NGRAM-based variant. Our implementation aims to maximize speed and efficiency and is considered to be among the fastest in open-source LLM engines.
+SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3, MTP, UNO, DFLASH, UBTREE, classic draft-model decoding, and an NGRAM-based variant. Our implementation aims to maximize speed and efficiency and is considered to be among the fastest in open-source LLM engines.
 
 ## Summary
 
@@ -18,6 +18,7 @@ SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3,
 - [Multi Token Prediction](#multi-token-prediction)
 - [UNO decoding](#uno-decoding)
 - [DFlash Decoding](#dflash-decoding)
+- [UBTree decoding](#ubtree-decoding)
 - [Standalone Speculative Decoding (Small Draft Model)](#standalone-speculative-decoding-small-draft-model)
 - [Speculative Decoding V2 (Overlap Scheduler)](#speculative-decoding-v2-overlap-scheduler)
 - [Ngram Speculative Decoding](#ngram-speculative-decoding)
@@ -551,6 +552,42 @@ print(response.choices[0].message.content)
 
 ---
 
+## UBTree decoding
+
+UBTree adds a trained tree selector to a DFlash draft model. The current integration supports Ling3 (`BailingMoeV3ForCausalLM`) targets on NVIDIA CUDA, with FA3 attention, one running request, and greedy decoding. Use a UBTree draft export trained for the exact target checkpoint; a plain DFlash checkpoint does not contain the required selector weights.
+
+Set `LING_TARGET` and `UBTREE_DRAFT` to your paired checkpoint paths, then launch:
+
+```bash
+SGLANG_PLUGINS=none python -m sglang.launch_server \
+    --model-path "$LING_TARGET" \
+    --speculative-draft-model-path "$UBTREE_DRAFT" \
+    --speculative-algorithm UBTREE \
+    --speculative-num-draft-tokens 49 \
+    --speculative-draft-attention-backend fa3 \
+    --speculative-draft-model-quantization unquant \
+    --attention-backend fa3 \
+    --linear-attn-verify-backend triton \
+    --page-size 1 \
+    --max-running-requests 1 \
+    --cuda-graph-backend-decode full \
+    --cuda-graph-backend-prefill disabled \
+    --cuda-graph-bs-decode 1 \
+    --disable-cuda-graph-padding \
+    --dtype bfloat16 \
+    --trust-remote-code
+```
+
+`--speculative-num-draft-tokens` selects 32 or 49 target verification nodes, including the root, and must fit the exported tree budget. The draft block size comes from the checkpoint. `--speculative-eagle-topk` is an internal tree-metadata setting for UBTree and does not tune proposal breadth.
+
+Send requests with `temperature=0` or `top_k=1`. Sampling, grammar constraints, logprobs, custom logits processors, sampling penalties, `min_new_tokens>0`, logit bias, watermarking, and hidden-state or sampling-mask outputs are rejected. Strict thinking, PD disaggregation/role switching, unified memory, PP>1, DP>1, and DP attention are unsupported.
+
+The target LM head must use dense FP16, BF16, or FP32 weights. Target-embedding-MLP selectors also require dense target embeddings. This restriction concerns the head and embeddings, rather than the dtype of MoE experts. Helion KDA verify cannot use UBTree's compact state; select Triton. The `nv_cutedsl` verify setting also dispatches Ling tree verification to Triton.
+
+Online target/draft weight updates are rejected when a target-embedding-MLP selector is bound, because its factor caches depend on both models. Restart with the new checkpoint pair. Lookup selectors do not impose this cache restriction.
+
+The full draft/proposal CUDA Graph is captured lazily on its first decode use. Default server warmup may trigger this capture; standard target Graph startup statistics do not include the lazy draft capture. Warm up decode before measuring steady-state throughput. Greedy decoding does not imply bitwise logit or token parity with a separately executed autoregressive baseline.
+
 ## DFlash Decoding
 
 SGLang also supports **DFLASH** speculative decoding using a dedicated draft model checkpoint. Compared with EAGLE-style tree verification, DFLASH verifies a linear draft block and is configured around a block size / draft window. This path is useful when the target model has a matching DFlash draft checkpoint, such as `meta-llama/Llama-3.1-8B-Instruct` with `z-lab/LLaMA3.1-8B-Instruct-DFlash-UltraChat`.
@@ -904,7 +941,7 @@ Below is a comprehensive list of all speculative decoding parameters available i
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--speculative-algorithm</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>str</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>None</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Algorithm to use: <code>UNO</code>, <code>DFLASH</code>, <code>EAGLE</code>, <code>EAGLE3</code>, <code>STANDALONE</code>, <code>NGRAM</code>, <code>NEXTN</code> (alias of <code>EAGLE</code>)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Algorithm to use: <code>UNO</code>, <code>DFLASH</code>, <code>UBTREE</code>, <code>EAGLE</code>, <code>EAGLE3</code>, <code>STANDALONE</code>, <code>NGRAM</code>, <code>NEXTN</code> (alias of <code>EAGLE</code>)</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--speculative-draft-model-path</code></td>

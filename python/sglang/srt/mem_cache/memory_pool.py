@@ -72,6 +72,7 @@ from sglang.srt.mem_cache.layout.token_major import (
     build_mamba_entry_views,
     mamba_entry_bytes,
 )
+from sglang.srt.mem_cache.ubtree_state import use_ubtree_factorized_kda
 from sglang.srt.mem_cache.utils import (
     get_mla_kv_buffer_triton,
     maybe_init_custom_mem_pool,
@@ -681,15 +682,12 @@ class MambaPool:
         self.replayssm_spec_fold = bool(
             enable_linear_replayssm_spec and cache_params.is_kda
         )
-        self.factorized_kda_tree = bool(
-            enable_ubtree_factorized_kda
-            and spec_state_size == 1
-            and not _is_npu
-            and not _is_cpu
-            and cache_params.is_kda
-            and speculative_eagle_topk is not None
-            and speculative_eagle_topk > 1
-            and speculative_num_draft_tokens in (32, 49)
+        self.factorized_kda_tree = use_ubtree_factorized_kda(
+            enabled=enable_ubtree_factorized_kda,
+            cache_params=cache_params,
+            spec_state_size=spec_state_size,
+            speculative_num_draft_tokens=speculative_num_draft_tokens,
+            speculative_eagle_topk=speculative_eagle_topk,
         )
         _replayssm_on = enable_linear_replayssm or enable_linear_replayssm_spec
 
@@ -1451,7 +1449,6 @@ class HybridReqToTokenPool(ReqToTokenPool):
         self.start_layer = start_layer if start_layer is not None else 0
         self.layer_transfer_counter = None
         self.ple_window_cache = None
-        self.enable_ubtree_factorized_kda = enable_ubtree_factorized_kda
         self._init_mamba_pool(
             mamba_size=mamba_size,
             mamba_spec_state_size=mamba_spec_state_size,
@@ -1469,6 +1466,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             short_conv_state_shape=short_conv_state_shape,
             ngram_context_len=ngram_context_len,
             ngram_eos_token_id=ngram_eos_token_id,
+            enable_ubtree_factorized_kda=enable_ubtree_factorized_kda,
         )
 
     def _init_mamba_pool(
@@ -1489,6 +1487,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         short_conv_state_shape: Optional[Tuple[int, int]] = None,
         ngram_context_len: int = 0,
         ngram_eos_token_id: int = 0,
+        enable_ubtree_factorized_kda: bool = False,
     ):
         self.mamba_pool = self.mamba_pool_cls(
             size=mamba_size,
@@ -1503,7 +1502,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             linear_replayssm_cache_len=linear_replayssm_cache_len,
             envelope_layout=mamba_envelope_layout,
             enable_linear_replayssm_spec=enable_linear_replayssm_spec,
-            enable_ubtree_factorized_kda=self.enable_ubtree_factorized_kda,
+            enable_ubtree_factorized_kda=enable_ubtree_factorized_kda,
         )
         self.mamba_allocator = MambaSlotAllocator(
             size=mamba_size,

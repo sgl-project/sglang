@@ -3,14 +3,99 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
 from sglang.srt.mem_cache.kv_loc_plan import IdSpace, IdSpaceKind
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-small")
+
+
+class TestUBTreeMetadataGraphCapability(CustomTestCase):
+    def _backend(self, **overrides):
+        backend = FlashAttentionBackend.__new__(FlashAttentionBackend)
+        for name, value in dict(
+            is_draft_runner=False,
+            skip_prefill=False,
+            fa_impl_ver=3,
+            topk=2,
+            speculative_num_draft_tokens=32,
+            page_size=1,
+            use_mla=False,
+            has_swa=False,
+            local_attn_builder=None,
+            is_encoder_decoder=False,
+            kv_index_translator=SimpleNamespace(is_translating=False),
+            _kv_shard_pool=None,
+            _disable_scheduler_metadata_precompute=False,
+        ).items():
+            setattr(backend, name, overrides.get(name, value))
+        return backend
+
+    def test_only_supported_ubtree_target_can_enable(self):
+        with envs.SGLANG_OPT_FA3_VERIFY_METADATA_IN_GRAPH.override(True):
+            for algorithm in (None, "EAGLE", "EAGLE3", "DFLASH", "UBTREE"):
+                with self.subTest(algorithm=algorithm):
+                    with get_context().override_server_args(
+                        speculative_algorithm=algorithm
+                    ):
+                        self.assertEqual(
+                            self._backend()._can_enable_ubtree_verify_metadata_graph(),
+                            algorithm == "UBTREE",
+                        )
+            with get_context().override_server_args(speculative_algorithm="UBTREE"):
+                for field, value in (
+                    ("is_draft_runner", True),
+                    ("skip_prefill", True),
+                    ("fa_impl_ver", 4),
+                    ("topk", 1),
+                    ("speculative_num_draft_tokens", 17),
+                    ("page_size", 128),
+                    ("use_mla", True),
+                    ("has_swa", True),
+                    ("local_attn_builder", object()),
+                    ("is_encoder_decoder", True),
+                    ("kv_index_translator", SimpleNamespace(is_translating=True)),
+                    ("_kv_shard_pool", object()),
+                    ("_disable_scheduler_metadata_precompute", True),
+                ):
+                    with self.subTest(field=field):
+                        self.assertFalse(
+                            self._backend(
+                                **{field: value}
+                            )._can_enable_ubtree_verify_metadata_graph()
+                        )
+                self.assertTrue(
+                    self._backend(
+                        speculative_num_draft_tokens=49
+                    )._can_enable_ubtree_verify_metadata_graph()
+                )
+
+    def test_flag_is_required_and_only_verify_uses_the_frozen_capability(self):
+        with get_context().override_server_args(speculative_algorithm="UBTREE"):
+            with envs.SGLANG_OPT_FA3_VERIFY_METADATA_IN_GRAPH.override(False):
+                self.assertFalse(
+                    self._backend()._can_enable_ubtree_verify_metadata_graph()
+                )
+            backend = self._backend()
+            with envs.SGLANG_OPT_FA3_VERIFY_METADATA_IN_GRAPH.override(True):
+                backend._ubtree_verify_metadata_in_graph = (
+                    backend._can_enable_ubtree_verify_metadata_graph()
+                )
+            # Capture/replay cannot switch policies after an env override ends.
+            for mode in (
+                ForwardMode.DECODE,
+                ForwardMode.EXTEND,
+                ForwardMode.DRAFT_EXTEND_V2,
+            ):
+                self.assertFalse(backend._capture_ubtree_verify_metadata(mode))
+            self.assertTrue(
+                backend._capture_ubtree_verify_metadata(ForwardMode.TARGET_VERIFY)
+            )
 
 
 class TestFlashAttentionGraphMetadata(CustomTestCase):

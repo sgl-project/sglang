@@ -445,6 +445,13 @@ def _handle_ubtree(server_args: ServerArgs) -> None:
     from sglang.srt.utils.hf_transformers_utils import get_config
 
     cfg = resolving_view(server_args)
+    # ROCm also uses torch's "cuda" device type. UBTree requires the NVIDIA
+    # implementation of FA3 and its CUDA-specific state/graph kernels.
+    if not current_platform.is_cuda():
+        raise ValueError(
+            "UBTREE currently supports NVIDIA CUDA GPUs only; "
+            f"got platform {current_platform.device_name!r}."
+        )
     if cfg.speculative_draft_model_path is None:
         raise ValueError("UBTREE requires --speculative-draft-model-path")
     if attn_dp_enabled_of(cfg):

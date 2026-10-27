@@ -258,6 +258,36 @@ class UBTreeSelector(nn.Module):
         if self.tied_token_factorizer is not None:
             self.tied_token_factorizer.materialize_cache(target_embedding_weight)
 
+    def bind_target_embedding(self, embedding_module: nn.Module, *, device) -> None:
+        """Build the serving cache and declare its online-update constraint."""
+        if self.tied_token_factorizer is None:
+            return
+        weight = getattr(embedding_module, "weight", None)
+        if weight is None:
+            raise RuntimeError("UBTREE requires target input embeddings with weights")
+        from sglang.srt.speculative.dflash_utils import is_dense_head_weight
+
+        if not is_dense_head_weight(weight):
+            raise ValueError("UBTREE requires dense FP16/BF16/FP32 target embeddings")
+        if (
+            int(getattr(embedding_module, "tp_size", 1)) == 1
+            and int(weight.shape[0]) >= self.vocab_size
+        ):
+            self.materialize_cache(weight[: self.vocab_size])
+        elif hasattr(embedding_module, "shard_indices"):
+            self.materialize_cache_from_vocab_parallel_embedding(embedding_module)
+        else:
+            self.materialize_cache_from_embedding(embedding_module, device=device)
+
+        # Both target embeddings and draft factorizer weights feed these caches.
+        # The updater checks nested modules before modifying either model.
+        reason = (
+            "UBTREE target-embedding-MLP selector caches do not support online "
+            "weight updates. Restart the server with the new target/draft weights."
+        )
+        self._derived_weight_cache_error = reason
+        embedding_module._derived_weight_cache_error = reason
+
     def materialize_cache_from_embedding(
         self,
         embedding_module: nn.Module,

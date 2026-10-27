@@ -4,6 +4,7 @@
 
 """UBTree proposal, verify metadata, and cache-commit CUDA Graph regressions."""
 
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -52,6 +53,186 @@ def _lookup_config():
         "target_embedding_dim": 0,
     }
     return config
+
+
+def _make_fa3_verify_backend(width, algorithm, enabled):
+    from sglang.srt.configs.model_config import AttentionArch
+    from sglang.srt.environ import envs
+    from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
+    from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
+    from sglang.srt.runtime_context import get_context, get_parallel
+
+    pool = SimpleNamespace(
+        req_to_token=torch.arange(3 * 256, device="cuda").reshape(3, 256)
+    )
+    kv_pool = SimpleNamespace()
+    runner = SimpleNamespace(
+        sliding_window_size=None,
+        model_config=SimpleNamespace(
+            is_encoder_decoder=False,
+            context_len=256,
+            attention_arch=AttentionArch.MHA,
+            is_local_attention_model=False,
+            head_dim=64,
+            hf_text_config=SimpleNamespace(num_attention_heads=4),
+            get_num_kv_heads=lambda _: 2,
+        ),
+        device="cuda",
+        req_to_token_pool=pool,
+        token_to_kv_pool=kv_pool,
+        kv_cache_dtype=torch.bfloat16,
+        kv_cache_dtype_str="bfloat16",
+        page_size=1,
+        is_draft_worker=False,
+        kv_index_translator=KVIndexTranslator(
+            req_to_token=pool.req_to_token,
+            token_to_kv_pool_allocator=SimpleNamespace(),
+            token_to_kv_pool=kv_pool,
+            page_size=1,
+            device="cuda",
+        ),
+    )
+    with (
+        get_context().override_server_args(
+            speculative_algorithm=algorithm,
+            speculative_num_draft_tokens=width,
+            speculative_eagle_topk=2,
+        ),
+        get_parallel().override(attn_tp_size=1),
+        envs.SGLANG_OPT_FA3_VERIFY_METADATA_IN_GRAPH.override(enabled),
+    ):
+        backend = FlashAttentionBackend(runner)
+        backend.init_cuda_graph_state(1, width)
+    return backend
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="FA3 requires CUDA")
+@pytest.mark.parametrize("width", [32, 49])
+@pytest.mark.parametrize(
+    "algorithm,enabled", [("UBTREE", True), ("UBTREE", False), ("EAGLE", True)]
+)
+def test_fa3_verify_metadata_graph_isolated_and_refreshes_live_inputs(
+    width, algorithm, enabled
+):
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from sglang.srt.speculative.eagle_utils import TreeMaskMode
+
+    backend = _make_fa3_verify_backend(width, algorithm, enabled)
+    optimized = algorithm == "UBTREE" and enabled
+    assert backend._ubtree_verify_metadata_in_graph == optimized
+    q = torch.randn(width, 4, 64, dtype=torch.bfloat16, device="cuda")
+    k = torch.randn(3 * 256, 1, 2, 64, dtype=torch.bfloat16, device="cuda")
+    v = torch.randn_like(k)
+    mode = TreeMaskMode.QLEN_ONLY if algorithm == "UBTREE" else TreeMaskMode.FULL_MASK
+    spec = SimpleNamespace(
+        tree_mask_mode=mode, positions=torch.arange(width, device="cuda")
+    )
+    batch = SimpleNamespace(
+        forward_mode=ForwardMode.TARGET_VERIFY,
+        batch_size=1,
+        req_pool_indices=torch.tensor([1], device="cuda"),
+        seq_lens=torch.tensor([4], device="cuda"),
+        seq_lens_cpu=None,
+        encoder_lens=None,
+        spec_info=spec,
+        positions=spec.positions,
+        out_cache_loc=None,
+        kv_loc_plan=None,
+    )
+
+    def stage_mask(visible, length):
+        if mode == TreeMaskMode.FULL_MASK:
+            visible = torch.cat(
+                (torch.ones(width, length, dtype=torch.bool, device="cuda"), visible),
+                dim=1,
+            )
+        spec.custom_mask = visible.flatten().clone()
+
+    visible = torch.ones(width, width, dtype=torch.bool, device="cuda").tril()
+    stage_mask(visible, 4)
+    backend.init_forward_metadata_out_graph(batch, in_capture=True)
+    backend.init_forward_metadata_out_graph(batch)
+
+    def attend(use_precomputed):
+        results = []
+        for metadata in (
+            backend.forward_metadata,
+            backend.forward_metadata_spec_decode_expand,
+        ):
+            result = backend.flash_attn_with_kvcache(
+                q=q,
+                k_cache=k,
+                v_cache=v,
+                page_table=metadata.page_table,
+                cache_seqlens=metadata.cache_seqlens_int32,
+                cu_seqlens_q=metadata.cu_seqlens_q,
+                cu_seqlens_k_new=metadata.cu_seqlens_k,
+                max_seqlen_q=metadata.max_seq_len_q,
+                softmax_scale=64**-0.5,
+                causal=False,
+                return_softmax_lse=True,
+                num_splits=backend.num_splits,
+                scheduler_metadata=metadata.scheduler_metadata
+                if use_precomputed
+                else None,
+            )
+            results.extend(result[:2])
+        return results
+
+    def run():
+        backend.init_forward_metadata_in_graph(batch)
+        return attend(optimized)
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        run()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        captured = run()
+    prefix = backend.forward_metadata
+    suffix = backend.forward_metadata_spec_decode_expand
+    metadata_pointers = (prefix.page_table.data_ptr(), suffix.page_table.data_ptr())
+    scheduler_pointers = tuple(
+        m.scheduler_metadata.data_ptr() if optimized else None for m in (prefix, suffix)
+    )
+    for iteration, (row, length) in enumerate(((2, 13), (1, 2), (2, 193))):
+        batch.req_pool_indices.fill_(row)
+        batch.seq_lens.fill_(length)
+        q.copy_(torch.randn_like(q))
+        if iteration == 1:
+            backend.req_to_token[1].copy_(backend.req_to_token[1].flip(0))
+        visible = torch.eye(width, dtype=torch.bool, device="cuda")
+        visible[:, 0] = True
+        if iteration == 2:
+            visible = torch.ones_like(visible).tril()
+        stage_mask(visible, length)
+        backend.init_forward_metadata_out_graph(batch)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert metadata_pointers == (
+            prefix.page_table.data_ptr(),
+            suffix.page_table.data_ptr(),
+        )
+        assert prefix.cache_seqlens_int32.item() == length
+        torch.testing.assert_close(
+            prefix.page_table[0, :length].long(), backend.req_to_token[row, :length]
+        )
+        torch.testing.assert_close(suffix.cache_seqlens_int32, visible.sum(1).int())
+        columns = torch.arange(width, device="cuda").expand(width, -1)
+        order = torch.where(visible, columns, columns + width).argsort(dim=1)
+        slots = backend.req_to_token[row, length : length + width].expand(width, -1)
+        torch.testing.assert_close(suffix.page_table.long(), slots.gather(1, order))
+        for i, metadata in enumerate((prefix, suffix)):
+            if optimized:
+                assert metadata.scheduler_metadata.data_ptr() == scheduler_pointers[i]
+            else:
+                assert metadata.scheduler_metadata is None
+        # Compare both FA3 cascade legs with the ordinary per-call scheduler.
+        expected = attend(False)
+        for actual, reference in zip(captured, expected):
+            torch.testing.assert_close(actual, reference, rtol=2e-2, atol=2e-2)
 
 
 def _make_selector_graph_components(device):
@@ -112,6 +293,83 @@ def test_proposal_tail_replays_changing_inputs_exactly():
         graph.replay()
         torch.cuda.synchronize()
         _assert_tree_batches_equal(actual, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA Graph requires CUDA")
+def test_full_draft_graph_refreshes_replaced_request_tensors(monkeypatch):
+    from sglang.kernels.ops.speculative.ubtree import (
+        prepare_draft_commit_metadata,
+    )
+    from sglang.srt.speculative.ubtree_components import draft_graph
+
+    # No collectives in this small backbone. Keep the real CUDA capture/replay
+    # and production runner, replacing only the distributed stream context.
+    @contextmanager
+    def capture_context(stream):
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            yield SimpleNamespace(stream=stream)
+
+    monkeypatch.setattr(draft_graph, "graph_capture", capture_context)
+
+    class Layer(torch.nn.Module):
+        def forward(self, positions, hidden, batch, residual):
+            values = positions + batch.seq_lens[0] + batch.req_pool_indices[0]
+            return hidden + values[:, None], None
+
+    embedding = torch.nn.Embedding(17, 8, device="cuda")
+    model = SimpleNamespace(layers=[Layer()], norm=torch.nn.Identity())
+    backend = SimpleNamespace(
+        init_forward_metadata_in_graph=lambda *args: None,
+        init_forward_metadata_out_graph=lambda *args, **kwargs: None,
+    )
+    runner = draft_graph.UBTreeDraftSegmentGraphRunner(
+        model=model,
+        input_embedding=embedding,
+        attn_backend=backend,
+        batch_sizes=[1],
+        block_size=4,
+        hidden_size=8,
+        device="cuda",
+    )
+    req_to_token = torch.arange(4 * 64, device="cuda").view(4, 64)
+    tail_positions = torch.empty((1, 4), dtype=torch.int64, device="cuda")
+    tail_cache_locs = torch.empty_like(tail_positions)
+
+    def tail(output, input_ids, batch):
+        prepare_draft_commit_metadata(
+            seq_lens=batch.seq_lens,
+            req_pool_indices=batch.req_pool_indices,
+            req_to_token=req_to_token,
+            positions_out=tail_positions,
+            cache_loc_out=tail_cache_locs,
+        )
+        return tail_positions, tail_cache_locs
+
+    runner.attach_capture_tail(tail)
+    batches = []
+    for seq_len, req_index in ((5, 1), (11, 2), (3, 1)):
+        # Retain the previous tensors so new inputs cannot reuse their addresses.
+        batch = SimpleNamespace(
+            batch_size=1,
+            seq_lens=torch.tensor([seq_len], dtype=torch.int32, device="cuda"),
+            req_pool_indices=torch.tensor(
+                [req_index], dtype=torch.int32, device="cuda"
+            ),
+            out_cache_loc=torch.arange(4, device="cuda") + seq_len,
+            mark_forward_metadata_ready=lambda: None,
+        )
+        batches.append(batch)
+        tokens = torch.arange(4, device="cuda")
+        positions = torch.arange(4, device="cuda") + seq_len
+        actual = runner(input_ids=tokens, positions=positions, forward_batch=batch)
+        torch.cuda.synchronize()
+        expected = embedding(tokens) + (positions + seq_len + req_index)[:, None]
+        torch.testing.assert_close(actual.hidden_states, expected, rtol=0, atol=0)
+        torch.testing.assert_close(tail_positions, positions[None, :])
+        torch.testing.assert_close(
+            tail_cache_locs, req_to_token[req_index, positions][None, :]
+        )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

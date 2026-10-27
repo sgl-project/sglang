@@ -4,9 +4,11 @@
 
 """UBTree configuration, selector, and tree topology contracts."""
 
+import inspect
 import unittest
 from dataclasses import replace
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -33,6 +35,55 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+
+class TestUBTreeKernelCompatibility(CustomTestCase):
+    def test_shared_kernels_preserve_legacy_positional_arguments(self):
+        from sglang.kernels.ops.attention.linear.fused_sigmoid_gating_recurrent import (
+            fused_sigmoid_gating_delta_rule_update,
+        )
+        from sglang.kernels.ops.mamba.causal_conv1d_triton import causal_conv1d_update
+
+        # These are the pre-UBTree positional call contracts. Supplying the tail
+        # positionally must still bind to padding / ReplaySSM, not tree options.
+        contracts = (
+            (
+                causal_conv1d_update,
+                "x conv_state weight bias activation cache_seqlens conv_state_indices "
+                "num_accept_tokens intermediate_conv_window intermediate_state_indices "
+                "retrieve_next_token retrieve_next_sibling retrieve_parent_token "
+                "pad_slot_id metadata validate_data",
+                {"direct_parent": True, "save_tree_raw_only": True},
+            ),
+            (
+                fused_sigmoid_gating_delta_rule_update,
+                "A_log a dt_bias softplus_beta softplus_threshold q k v b "
+                "initial_state_source initial_state_indices scale use_qk_l2norm_in_kernel "
+                "cu_seqlens is_kda lower_bound disable_state_update "
+                "intermediate_states_buffer intermediate_state_indices cache_steps "
+                "retrieve_parent_token cache_ring replayssm_rawv replayssm_rawk "
+                "replayssm_g replayssm_beta match_cutedsl_decode",
+                {"tree_depths": object(), "force_factorized_tree": True},
+            ),
+        )
+        for function, names, tree_args in contracts:
+            with self.subTest(function=function.__name__):
+                names = names.split()
+                values = [object() for _ in names]
+                signature = inspect.signature(function)
+                bound = signature.bind(*values, **tree_args)
+                for name, value in zip(names, values):
+                    self.assertIs(bound.arguments[name], value)
+                for name, value in tree_args.items():
+                    self.assertIs(bound.arguments[name], value)
+                positional = [
+                    name
+                    for name, parameter in signature.parameters.items()
+                    if parameter.kind == inspect.Parameter.POSITIONAL_OR_KEYWORD
+                ]
+                self.assertEqual(positional, names)
+                with self.assertRaises(TypeError):
+                    signature.bind(*values, object())
 
 
 def _config():
@@ -337,6 +388,9 @@ class TestUBTreeRuntimeConfig(CustomTestCase):
             pp_size=1,
             dp_size=1,
             max_running_requests=1,
+            disaggregation_mode="null",
+            enable_pd_role_switch=False,
+            linear_attn_verify_backend=None,
             enable_strict_thinking=False,
             speculative_draft_window_size=None,
             speculative_draft_sink_size=None,
@@ -362,6 +416,12 @@ class TestUBTreeRuntimeConfig(CustomTestCase):
             ("pp_size", 2),
             ("dp_size", 2),
             ("max_running_requests", 2),
+            ("disaggregation_mode", "decode"),
+            ("disaggregation_mode", "prefill"),
+            ("enable_pd_role_switch", True),
+            ("linear_attn_verify_backend", "helion"),
+            ("linear_attn_verify_backend", "flashinfer"),
+            ("enable_strict_thinking", True),
             ("page_size", 16),
             ("disable_cuda_graph_padding", False),
             ("speculative_adaptive", True),
@@ -372,6 +432,13 @@ class TestUBTreeRuntimeConfig(CustomTestCase):
                 validate_runtime_config(
                     SimpleNamespace(**(vars(cfg) | {field: value})), ("fa3",)
                 )
+        for backend in ("triton", "nv_cutedsl"):
+            validate_runtime_config(
+                SimpleNamespace(
+                    **(vars(cfg) | {"linear_attn_verify_backend": backend})
+                ),
+                ("fa3",),
+            )
 
 
 class TestUBTreeRequestValidation(CustomTestCase):
@@ -410,6 +477,143 @@ class TestUBTreeRequestValidation(CustomTestCase):
                     return_sampling_mask=field == "return_sampling_mask",
                 )
                 self.assertIn(field, validate_ubtree_request(req))
+
+    def test_greedy_normalization_and_unsupported_sampling_options(self):
+        for params in ({"temperature": 0}, {"temperature": 0.8, "top_k": 1}):
+            req = self._request(sampling_params=SamplingParams(**params))
+            self.assertIsNone(validate_ubtree_request(req))
+        for params, message in [
+            ({"temperature": 0.8, "top_k": 10}, "greedy"),
+            ({"json_schema": '{"type":"object"}'}, "grammar"),
+            ({"regex": "[a-z]+"}, "grammar"),
+            ({"ebnf": 'root ::= "hello"'}, "grammar"),
+            ({"frequency_penalty": 0.1}, "penalties"),
+            ({"presence_penalty": 0.1}, "penalties"),
+            ({"repetition_penalty": 1.1}, "penalties"),
+            ({"min_new_tokens": 1}, "min_new_tokens"),
+            ({"logit_bias": {1: 1.0}}, "logit_bias"),
+        ]:
+            with self.subTest(params=params):
+                req = self._request(
+                    sampling_params=SamplingParams(**({"temperature": 0} | params))
+                )
+                self.assertIn(message, validate_ubtree_request(req))
+        self.assertIn(
+            "return_logprob",
+            validate_ubtree_request(self._request(return_logprob=True)),
+        )
+        self.assertIn(
+            "grammar", validate_ubtree_request(self._request(grammar=object()))
+        )
+
+
+class TestUBTreeLoading(CustomTestCase):
+    @staticmethod
+    def _model(config):
+        from sglang.srt.models.ubtree import Qwen3UBTreeModel
+
+        # Exercise the actual inherited loader with a small selector, without
+        # constructing distributed attention or downloading a checkpoint.
+        model = Qwen3UBTreeModel.__new__(Qwen3UBTreeModel)
+        torch.nn.Module.__init__(model)
+        model.projector_type = "linear"
+        model.ubtree_selector = UBTreeSelector(config)
+        model._ubtree_selector_loaded = False
+        return model
+
+    def test_initial_load_requires_every_selector_parameter(self):
+        for config in (_config(), _lookup_config()):
+            source = self._model(config)
+            weights = [
+                (name, torch.ones_like(p)) for name, p in source.named_parameters()
+            ]
+            for missing, _ in weights:
+                with self.subTest(
+                    layout=config.ubtree_config["token_factorizer"], missing=missing
+                ):
+                    model = self._model(config)
+                    with self.assertRaisesRegex(ValueError, missing):
+                        model.load_weights(
+                            (name, value) for name, value in weights if name != missing
+                        )
+                    self.assertFalse(model._ubtree_selector_loaded)
+            for prefix in ("", "model."):
+                model = self._model(config)
+                model.load_weights((prefix + name, value) for name, value in weights)
+                for name, p in model.named_parameters():
+                    torch.testing.assert_close(p, torch.ones_like(p))
+                # A successful initial load must not turn subsequent partial
+                # updates into a false missing-checkpoint error.
+                name, value = weights[0]
+                model.load_weights([(name, value * 2)])
+                torch.testing.assert_close(
+                    dict(model.named_parameters())[name], value * 2
+                )
+
+    def test_quantized_head_is_rejected_before_matmul(self):
+        for dtype in (torch.float8_e4m3fn, torch.int8):
+            with (
+                self.subTest(dtype=dtype),
+                patch("torch.nn.functional.linear") as linear,
+            ):
+                with self.assertRaisesRegex(ValueError, "dense FP16/BF16/FP32"):
+                    vocab_parallel_topk(
+                        torch.ones(1, 8),
+                        SimpleNamespace(weight=torch.ones((17, 8)).to(dtype)),
+                        k=3,
+                        vocab_size=17,
+                    )
+                linear.assert_not_called()
+
+    def test_bound_selector_rejects_target_and_draft_weight_updates(self):
+        from sglang.srt.model_executor.model_runner_components.weight_updater import (
+            WeightUpdater,
+        )
+        from sglang.srt.runtime_context import get_context
+
+        selector = UBTreeSelector(_config())
+        embedding = torch.nn.Embedding(17, 8)
+        selector.bind_target_embedding(embedding, device="cpu")
+        for model in (selector, embedding):
+            original = {
+                name: p.detach().clone() for name, p in model.named_parameters()
+            }
+            updater = WeightUpdater(
+                tp_rank=0,
+                device="cpu",
+                gpu_id=0,
+                model_config=None,
+                custom_weight_loaders={},
+                get_model=lambda: model,
+                update_model_fields=lambda **kwargs: None,
+                recapture_cuda_graph=lambda: None,
+                get_model_runner=lambda: None,
+            )
+            updates = [
+                (name, torch.zeros_like(p)) for name, p in model.named_parameters()
+            ]
+            with get_context().override_server_args(weight_cache_mode="off"):
+                results = [
+                    updater.update_weights_from_disk("unused", "auto"),
+                    updater.update_weights_from_tensor(updates, load_format="direct"),
+                    updater.update_weights_from_tensor(
+                        {}, load_format="flattened_bucket"
+                    ),
+                    updater.load_weights_from_distributed(updates),
+                    updater.update_weights_from_ipc(None),
+                ]
+            for success, message in results:
+                self.assertFalse(success)
+                self.assertIn("UBTREE", message)
+            for name, p in model.named_parameters():
+                torch.testing.assert_close(p, original[name])
+
+    def test_lookup_selector_does_not_restrict_target_updates(self):
+        selector = UBTreeSelector(_lookup_config())
+        embedding = torch.nn.Embedding(17, 8)
+        selector.bind_target_embedding(embedding, device="cpu")
+        self.assertFalse(hasattr(selector, "_derived_weight_cache_error"))
+        self.assertFalse(hasattr(embedding, "_derived_weight_cache_error"))
 
 
 if __name__ == "__main__":

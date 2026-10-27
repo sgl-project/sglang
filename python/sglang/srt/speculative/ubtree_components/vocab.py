@@ -10,6 +10,20 @@ import torch
 import torch.nn.functional as F
 
 
+def validate_ubtree_lm_head(lm_head) -> torch.Tensor:
+    from sglang.srt.speculative.dflash_utils import is_dense_head_weight
+
+    weight = getattr(lm_head, "weight", None)
+    if weight is None:
+        raise RuntimeError("UBTREE requires a target lm_head with a weight tensor")
+    if not is_dense_head_weight(weight):
+        raise ValueError(
+            "UBTREE requires a dense FP16/BF16/FP32 target lm_head; "
+            f"got {weight.dtype}. Quantized target lm_head is unsupported."
+        )
+    return weight
+
+
 def vocab_parallel_topk(
     hidden_states: torch.Tensor,
     lm_head,
@@ -24,11 +38,7 @@ def vocab_parallel_topk(
         raise ValueError("UBTree LM-head input must be rank 2")
     if k <= 0 or k > int(vocab_size):
         raise ValueError(f"invalid UBTree candidate_k={k} for vocab={vocab_size}")
-    weight = getattr(lm_head, "weight", None)
-    if weight is None:
-        raise RuntimeError("UBTREE requires a target lm_head with a weight tensor")
-    if not torch.is_floating_point(weight):
-        raise ValueError("UBTREE does not support a quantized target lm_head")
+    weight = validate_ubtree_lm_head(lm_head)
     hidden = (
         hidden_states
         if hidden_states.dtype == weight.dtype

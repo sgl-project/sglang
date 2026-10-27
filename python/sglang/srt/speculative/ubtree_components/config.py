@@ -129,6 +129,15 @@ def validate_runtime_config(cfg, target_backends: tuple[str, ...]) -> None:
         raise ValueError("UBTREE currently requires --pp-size 1 and --dp-size 1")
     if cfg.max_running_requests != 1:
         raise ValueError("UBTREE currently requires --max-running-requests 1")
+    if cfg.disaggregation_mode != "null" or cfg.enable_pd_role_switch:
+        raise ValueError("UBTREE does not support PD disaggregation or role switching")
+    # nv_cutedsl dispatches Ling KDA tree verify to Triton. Helion only supports
+    # per-node state snapshots, not UBTree's compact factor caches.
+    if cfg.linear_attn_verify_backend not in (None, "triton", "nv_cutedsl"):
+        raise ValueError(
+            "UBTREE factorized KDA verification requires "
+            "--linear-attn-verify-backend triton (nv_cutedsl also falls back to Triton)"
+        )
     if cfg.enable_strict_thinking:
         raise ValueError(
             "UBTREE does not support --enable-strict-thinking because it requires "

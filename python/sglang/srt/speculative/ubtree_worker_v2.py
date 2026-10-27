@@ -42,6 +42,7 @@ from sglang.srt.speculative.ubtree_components.tree import (
 from sglang.srt.speculative.ubtree_components.tree_graph import (
     build_ubtree_proposal,
 )
+from sglang.srt.speculative.ubtree_components.vocab import validate_ubtree_lm_head
 from sglang.srt.speculative.ubtree_info import UBTreeVerifyInput
 
 logger = logging.getLogger(__name__)
@@ -100,26 +101,11 @@ class UBTreeWorkerV2(DFlashWorkerV2):
                 "UBTREE draft checkpoint must use a registered UBTree architecture"
             )
         target_model = self.target_worker.model_runner.model
+        validate_ubtree_lm_head(target_model.lm_head)
         if selector.tied_token_factorizer is not None:
-            target_embedding = target_model.get_input_embeddings()
-            vocab_size = int(self.target_worker.model_runner.model_config.vocab_size)
-            embedding_weight = getattr(target_embedding, "weight", None)
-            if embedding_weight is None:
-                raise RuntimeError(
-                    "UBTREE requires target input embeddings with weights"
-                )
-            embedding_tp_size = int(getattr(target_embedding, "tp_size", 1))
-            if embedding_tp_size == 1 and int(embedding_weight.shape[0]) >= vocab_size:
-                selector.materialize_cache(embedding_weight[:vocab_size])
-            elif hasattr(target_embedding, "shard_indices"):
-                selector.materialize_cache_from_vocab_parallel_embedding(
-                    target_embedding,
-                )
-            else:
-                selector.materialize_cache_from_embedding(
-                    target_embedding,
-                    device=self.device,
-                )
+            selector.bind_target_embedding(
+                target_model.get_input_embeddings(), device=self.device
+            )
         self._proposal = partial(
             build_ubtree_proposal,
             config=self.ubtree_config,

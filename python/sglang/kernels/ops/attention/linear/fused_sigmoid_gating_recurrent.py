@@ -274,8 +274,15 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
 
     # Preload tree attention data if needed
     if HAS_EAGLE_TREE_CUSTOM_ATTN_MASK:
-        retrieve_parent_token_base = retrieve_parent_token_ptr + (
-            i_n * stride_retrieve_parent_token_seq
+        token_indices = tl.arange(0, NP2_T)
+        mask_retrieve = token_indices < T
+        retrieve_parent_token_base = (
+            retrieve_parent_token_ptr
+            + (i_n * stride_retrieve_parent_token_seq)
+            + token_indices * stride_retrieve_parent_token_token
+        )
+        parent_idx_tokens = tl.load(
+            retrieve_parent_token_base, mask=mask_retrieve, other=0
         )
 
     # Prepare intermediate state cache index if enabled. int64: the buffer is
@@ -291,9 +298,8 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         if HAS_EAGLE_TREE_CUSTOM_ATTN_MASK:
             # step_idx == 0 uses b_h from USE_INITIAL_STATE
             if step_idx != 0 and cache_idx >= 0:
-                parent_step_idx = tl.load(
-                    retrieve_parent_token_base
-                    + step_idx * stride_retrieve_parent_token_token
+                parent_step_idx = tl.sum(
+                    tl.where(token_indices == step_idx, parent_idx_tokens, 0)
                 )
                 step_offset = parent_step_idx * HV * K * V
                 cache_ptr = (
@@ -876,11 +882,6 @@ def fused_sigmoid_gating_delta_rule_update(
     intermediate_state_indices: Optional[torch.Tensor] = None,
     cache_steps: Optional[int] = None,
     retrieve_parent_token: Optional[torch.Tensor] = None,
-    tree_depths: Optional[torch.Tensor] = None,
-    tree_max_depth: int = 0,
-    tree_query_factors: Optional[torch.Tensor] = None,
-    tree_value_factors: Optional[torch.Tensor] = None,
-    force_factorized_tree: bool = False,
     # fused ReplaySSM ring-write (spec verify). When cache_ring, each draft step
     # stores pre-norm k / raw v / gate / beta into these per-slot rings,
     # replacing the eager ring-write. Off by default -> decode unchanged.
@@ -895,6 +896,12 @@ def fused_sigmoid_gating_delta_rule_update(
     # decays and updates through FMA, and a BF16 state pool is rounded after
     # every token.
     match_cutedsl_decode: bool = False,
+    *,
+    tree_depths: Optional[torch.Tensor] = None,
+    tree_max_depth: int = 0,
+    tree_query_factors: Optional[torch.Tensor] = None,
+    tree_value_factors: Optional[torch.Tensor] = None,
+    force_factorized_tree: bool = False,
     factor_cache_indices: Optional[torch.Tensor] = None,
     factor_num_warps: Optional[int] = None,
     factor_num_stages: int = 2,

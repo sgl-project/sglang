@@ -202,6 +202,7 @@ class FlashAttentionBackend(AttentionBackend):
     # Set from the pool type in __init__; the class default keeps the extend
     # metadata guard readable on instances built with __new__ (test stubs).
     _kv_shard_pool: Optional[PageInterleaveKVPoolMixin] = None
+    _ubtree_verify_metadata_in_graph: bool = False
 
     # Chunked-prefix attention reads the stable ForwardBatch cu-seqlens and
     # KV-index buffers directly, so it needs no backend-private replay state.
@@ -428,6 +429,34 @@ class FlashAttentionBackend(AttentionBackend):
         self._disable_scheduler_metadata_precompute = (
             _should_disable_scheduler_metadata_precompute()
         )
+        # Freeze the capability before capture so all metadata paths agree even
+        # if an environment override changes later. Draft workers share config
+        # with the target, but must never inherit this target-only optimization.
+        self._ubtree_verify_metadata_in_graph = (
+            self._can_enable_ubtree_verify_metadata_graph()
+        )
+
+    def _can_enable_ubtree_verify_metadata_graph(self) -> bool:
+        return (
+            envs.SGLANG_OPT_FA3_VERIFY_METADATA_IN_GRAPH.get()
+            and get_spec().speculative_algorithm == "UBTREE"
+            and not self.is_draft_runner
+            and not self.skip_prefill
+            and self.fa_impl_ver == 3
+            and self.topk > 1
+            and self.speculative_num_draft_tokens in (32, 49)
+            and self.page_size == 1
+            and not self.use_mla
+            and not self.has_swa
+            and self.local_attn_builder is None
+            and not self.is_encoder_decoder
+            and not self.kv_index_translator.is_translating
+            and self._kv_shard_pool is None
+            and not self._disable_scheduler_metadata_precompute
+        )
+
+    def _capture_ubtree_verify_metadata(self, forward_mode: ForwardMode) -> bool:
+        return self._ubtree_verify_metadata_in_graph and forward_mode.is_target_verify()
 
     def _maybe_init_local_attn_builder(
         self, model_runner: ModelRunner
@@ -455,26 +484,22 @@ class FlashAttentionBackend(AttentionBackend):
             ),
         )
 
-    def _compute_scheduler_metadata_for(
-        self,
-        *,
-        batch_size,
-        max_seq_len_q,
-        max_seq_len_k,
-        cache_seqlens,
-        cu_seqlens_q,
-        cu_seqlens_k_new=None,
-        page_size=None,
-        causal,
+    def _compute_scheduler_metadata(
+        self, batch_size, max_seq_len_k, cache_seqlens, cu_seqlens_q
     ):
-        """Compute reusable FA3 tile scheduling metadata for one attention leg."""
+        """Compute FA3 scheduler metadata for decode.
+
+        Returns the scheduler_metadata tensor, or None if not applicable.
+        """
         if self._get_scheduler_metadata is None or self.use_mla:
             return None
         if self._disable_scheduler_metadata_precompute:
             return None
+        # Always use window_size=(-1, -1) because scheduler_metadata is only
+        # consumed by non-SWA layers (SWA layers skip it in forward_decode).
         return self._get_scheduler_metadata(
             batch_size=batch_size,
-            max_seqlen_q=max_seq_len_q,
+            max_seqlen_q=1,
             max_seqlen_k=max_seq_len_k,
             num_heads=self.num_attention_heads,
             num_heads_k=self.num_kv_heads,
@@ -482,25 +507,10 @@ class FlashAttentionBackend(AttentionBackend):
             cache_seqlens=cache_seqlens,
             qkv_dtype=self.kv_cache_dtype,
             cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k_new=cu_seqlens_k_new,
-            page_size=self.page_size if page_size is None else page_size,
-            causal=causal,
+            page_size=self.page_size,
+            causal=True,
             has_softcap=self.has_softcap,
             num_splits=self.num_splits,
-        )
-
-    def _compute_scheduler_metadata(
-        self, batch_size, max_seq_len_k, cache_seqlens, cu_seqlens_q
-    ):
-        """Compute FA3 scheduler metadata for normal decode."""
-        # Always use window_size=(-1, -1): SWA layers do not consume this buffer.
-        return self._compute_scheduler_metadata_for(
-            batch_size=batch_size,
-            max_seq_len_q=1,
-            max_seq_len_k=max_seq_len_k,
-            cache_seqlens=cache_seqlens,
-            cu_seqlens_q=cu_seqlens_q,
-            causal=True,
         )
 
     def validate_elastic_cuda_graph_recapture(self) -> None:
@@ -508,6 +518,27 @@ class FlashAttentionBackend(AttentionBackend):
             raise ValueError(
                 "Elastic EP CUDA graph recapture with MLA requires FlashAttention 3."
             )
+
+    def _compute_ubtree_verify_scheduler_metadata(
+        self, metadata: FlashAttentionMetadata, *, batch_size: int, max_seq_len_k: int
+    ):
+        """FA3 scheduling for one UBTree cascade leg, shared by all MHA layers."""
+        return self._get_scheduler_metadata(
+            batch_size=batch_size,
+            max_seqlen_q=metadata.max_seq_len_q,
+            max_seqlen_k=max_seq_len_k,
+            num_heads=self.num_attention_heads,
+            num_heads_k=self.num_kv_heads,
+            headdim=self.head_dim,
+            cache_seqlens=metadata.cache_seqlens_int32,
+            qkv_dtype=self.kv_cache_dtype,
+            cu_seqlens_q=metadata.cu_seqlens_q,
+            cu_seqlens_k_new=metadata.cu_seqlens_k,
+            page_size=1,
+            causal=False,
+            has_softcap=self.has_softcap,
+            num_splits=self.num_splits,
+        )
 
     def _mxfp8_sf_kwargs(self, layer, forward_batch, q_descale=None):
         """Block-scaled UE8M0 scale factors for the FA4 MXFP8 attention path.
@@ -564,27 +595,16 @@ class FlashAttentionBackend(AttentionBackend):
                 zero_tail=True,
             )
             return
-        # Keep target tree-verify metadata on the target CUDA Graph critical
-        # path. The graph reads runner-owned seq/request buffers and the
-        # backend-owned verify-mask buffer, all of which have stable addresses
-        # and are refreshed before replay.
-        if (
-            envs.SGLANG_OPT_FA3_VERIFY_METADATA_IN_GRAPH.get()
-            and forward_batch.forward_mode.is_target_verify()
-            and self.topk > 1
-        ):
+        if self._capture_ubtree_verify_metadata(forward_batch.forward_mode):
+            assert forward_batch.batch_size == 1
+            assert _is_qlen_only_tree_mask(forward_batch.spec_info)
             assert self._verify_mask is not None
+            # Capture stable request/length inputs and the backend-owned mask.
+            # Replay stages the live proposal mask before this graph runs.
             graph_spec_info = SimpleNamespace(
                 custom_mask=self._verify_mask.buffer,
-                # Only numel() is consumed by the metadata builder.  The graph
-                # bucket always processes its full captured request width;
-                # padded rows are not consumed by the model output.
                 positions=forward_batch.positions,
-                tree_mask_mode=getattr(
-                    forward_batch.spec_info,
-                    "tree_mask_mode",
-                    TreeMaskMode.FULL_MASK,
-                ),
+                tree_mask_mode=TreeMaskMode.QLEN_ONLY,
             )
             self._apply_cuda_graph_metadata(
                 plan=forward_batch.kv_loc_plan,
@@ -595,10 +615,9 @@ class FlashAttentionBackend(AttentionBackend):
                 forward_mode=forward_batch.forward_mode,
                 spec_info=graph_spec_info,
                 seq_lens_cpu=None,
-                out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
+                out_cache_loc=forward_batch.out_cache_loc,
             )
             return
-
         # Single-CG has no Python between steps, so one capturable kernel updates
         # the persistent metadata.
         if not forward_batch.forward_mode.is_draft_extend_v2():
@@ -833,28 +852,18 @@ class FlashAttentionBackend(AttentionBackend):
                 # sees num_tokens_per_req (not 1) for all replays of this graph.
                 self.forward_metadata.max_seq_len_q = num_tokens // bs
         else:
-            if (
-                envs.SGLANG_OPT_FA3_VERIFY_METADATA_IN_GRAPH.get()
-                and forward_mode.is_target_verify()
-                and self.topk > 1
-            ):
-                # Data-dependent metadata is rebuilt by the first nodes of the
-                # captured target graph.  Only bind the already-captured views
-                # here; launching the op chain on the proposal→target seam
-                # would duplicate the work and preserve the host-side gap.
-                verify_key = bs
-                self.forward_metadata = self.target_verify_metadata_topk_normal[
-                    verify_key
-                ]
+            if self._capture_ubtree_verify_metadata(forward_mode):
+                assert bs == 1
+                assert _is_qlen_only_tree_mask(spec_info)
+                self.forward_metadata = self.target_verify_metadata_topk_normal[bs]
                 self.forward_metadata_spec_decode_expand = (
-                    self.target_verify_metadata_topk_expand[verify_key]
+                    self.target_verify_metadata_topk_expand[bs]
                 )
                 source_mask = spec_info.custom_mask
                 target_mask = self._verify_mask.buffer
                 if source_mask.data_ptr() != target_mask.data_ptr():
                     target_mask[: source_mask.numel()].copy_(source_mask)
                 return
-
             # A stale non-None seq_lens_cpu buffer would under-size max_seq_pages
             # (stale page-table rows -> OOB); force None under sync-free.
             self._apply_cuda_graph_metadata(
@@ -1920,7 +1929,11 @@ class FlashAttentionBackend(AttentionBackend):
                     num_splits=self.num_splits,
                     out=_fa_out,
                     ver=self.fa_impl_ver,
-                    scheduler_metadata=metadata.scheduler_metadata,
+                    **(
+                        {"scheduler_metadata": metadata.scheduler_metadata}
+                        if self._ubtree_verify_metadata_in_graph and use_cascade_attn
+                        else {}
+                    ),
                     **kwargs,
                 )
 
@@ -1978,8 +1991,12 @@ class FlashAttentionBackend(AttentionBackend):
                     return_softmax_lse=True,
                     num_splits=self.num_splits,
                     ver=self.fa_impl_ver,
-                    scheduler_metadata=(
-                        self.forward_metadata_spec_decode_expand.scheduler_metadata
+                    **(
+                        {
+                            "scheduler_metadata": self.forward_metadata_spec_decode_expand.scheduler_metadata
+                        }
+                        if self._ubtree_verify_metadata_in_graph
+                        else {}
                     ),
                     **kwargs,
                 )
@@ -2148,7 +2165,6 @@ class FlashAttentionBackend(AttentionBackend):
                         return_softmax_lse=use_cascade_attn,
                         num_splits=self.num_splits,
                         ver=self.fa_impl_ver,
-                        scheduler_metadata=metadata.scheduler_metadata,
                     )
                     if use_cascade_attn:
                         o, softmax_lse, *rest = result
@@ -2172,9 +2188,6 @@ class FlashAttentionBackend(AttentionBackend):
                                 return_softmax_lse=True,
                                 num_splits=self.num_splits,
                                 ver=self.fa_impl_ver,
-                                scheduler_metadata=(
-                                    self.forward_metadata_spec_decode_expand.scheduler_metadata
-                                ),
                             )
                         )
                         o, _ = merge_state_v2_wrapper(
@@ -3397,35 +3410,20 @@ class FlashAttentionBackend(AttentionBackend):
                     )
                 )
 
-                # The two cascade-attention legs have identical geometry for
-                # every full-attention layer. Build FA3 scheduling metadata once
-                # at the graph head and reuse it across layers instead of running
-                # prepare_varlen_num_blocks twice per layer.
-                if (
-                    envs.SGLANG_OPT_FA3_VERIFY_METADATA_IN_GRAPH.get()
-                    and not self.has_swa
-                ):
-                    metadata.scheduler_metadata = self._compute_scheduler_metadata_for(
-                        batch_size=bs,
-                        max_seq_len_q=verify_width,
-                        max_seq_len_k=self.max_context_len,
-                        cache_seqlens=metadata.cache_seqlens_int32,
-                        cu_seqlens_q=metadata.cu_seqlens_q,
-                        cu_seqlens_k_new=metadata.cu_seqlens_k,
-                        causal=False,
-                    )
-                    metadata_expand.scheduler_metadata = (
-                        self._compute_scheduler_metadata_for(
-                            batch_size=bs * verify_width,
-                            max_seq_len_q=1,
-                            max_seq_len_k=verify_width,
-                            cache_seqlens=metadata_expand.cache_seqlens_int32,
-                            cu_seqlens_q=metadata_expand.cu_seqlens_q,
-                            cu_seqlens_k_new=metadata_expand.cu_seqlens_k,
-                            page_size=1,
-                            causal=False,
+                if self._capture_ubtree_verify_metadata(forward_mode):
+                    metadata.scheduler_metadata = (
+                        self._compute_ubtree_verify_scheduler_metadata(
+                            metadata, batch_size=bs, max_seq_len_k=self.max_context_len
                         )
                     )
+                    metadata_expand.scheduler_metadata = (
+                        self._compute_ubtree_verify_scheduler_metadata(
+                            metadata_expand,
+                            batch_size=bs * verify_width,
+                            max_seq_len_k=verify_width,
+                        )
+                    )
+
                 if self.has_swa:
                     metadata_swa = self.target_verify_metadata_topk_swa[verify_key]
                     self._init_sliding_window_attn_spec_metadata(

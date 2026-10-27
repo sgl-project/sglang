@@ -111,7 +111,13 @@ class MambaAttnBackendBase(AttentionBackend):
         self.retrieve_next_token_list = []
         self.retrieve_next_sibling_list = []
         self.retrieve_parent_token_list = []
-        self.tree_depth_list = []
+        # Only the UBTree target consumes per-node depths. Allocate its static
+        # buffers before capture; ordinary hybrid and draft backends need none.
+        self.tree_depth_list = (
+            []
+            if get_spec().speculative_algorithm == "UBTREE" and not self.is_draft_worker
+            else None
+        )
         self.cached_cuda_graph_decode_query_start_loc: torch.Tensor = None
         self.cached_cuda_graph_verify_query_start_loc: torch.Tensor = None
         self.conv_states_shape: tuple[int, int] = None
@@ -437,7 +443,7 @@ class MambaAttnBackendBase(AttentionBackend):
                 direct_parent
             )
             live_depths = getattr(spec_info, "tree_depths", None)
-            if live_depths is not None:
+            if self.tree_depth_list is not None and live_depths is not None:
                 self.tree_depth_list[cuda_graph_bs - 1][:bs_without_pad].copy_(
                     live_depths
                 )
@@ -686,11 +692,12 @@ class MambaAttnBackendBase(AttentionBackend):
                     (i + 1, draft_token_num), dtype=torch.int32, device=self.device
                 )
             )
-            self.tree_depth_list.append(
-                torch.zeros(
-                    (i + 1, draft_token_num), dtype=torch.int32, device=self.device
+            if self.tree_depth_list is not None:
+                self.tree_depth_list.append(
+                    torch.zeros(
+                        (i + 1, draft_token_num), dtype=torch.int32, device=self.device
+                    )
                 )
-            )
         self.cached_cuda_graph_decode_query_start_loc = torch.arange(
             0, max_bs + 1, dtype=torch.int32, device=self.device
         )
@@ -770,7 +777,11 @@ class MambaAttnBackendBase(AttentionBackend):
                 retrieve_next_token=self.retrieve_next_token_list[bs - 1],
                 retrieve_next_sibling=self.retrieve_next_sibling_list[bs - 1],
                 retrieve_parent_token=self.retrieve_parent_token_list[bs - 1],
-                tree_depths=self.tree_depth_list[bs - 1],
+                tree_depths=(
+                    self.tree_depth_list[bs - 1]
+                    if self.tree_depth_list is not None
+                    else None
+                ),
                 tree_max_depth=int(getattr(spec_info, "max_tree_depth", 0)),
                 has_direct_parent=bool(getattr(spec_info, "uses_direct_parent", False)),
                 replayssm_write_pos=replayssm_write_pos,
@@ -969,7 +980,7 @@ class MambaAttnBackendBase(AttentionBackend):
                         direct_parent
                     )
                     live_depths = getattr(spec_info, "tree_depths", None)
-                    if live_depths is not None:
+                    if self.tree_depth_list is not None and live_depths is not None:
                         self.tree_depth_list[bs - 1][:bs_without_pad].copy_(live_depths)
             return ForwardMetadata(
                 query_start_loc=qsl_buf,
@@ -978,7 +989,11 @@ class MambaAttnBackendBase(AttentionBackend):
                 retrieve_next_token=self.retrieve_next_token_list[bs - 1],
                 retrieve_next_sibling=self.retrieve_next_sibling_list[bs - 1],
                 retrieve_parent_token=self.retrieve_parent_token_list[bs - 1],
-                tree_depths=self.tree_depth_list[bs - 1],
+                tree_depths=(
+                    self.tree_depth_list[bs - 1]
+                    if self.tree_depth_list is not None
+                    else None
+                ),
                 tree_max_depth=int(getattr(spec_info, "max_tree_depth", 0)),
                 has_direct_parent=bool(getattr(spec_info, "uses_direct_parent", False)),
                 replayssm_write_pos=replayssm_write_pos,

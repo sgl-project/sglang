@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Iterable, Optional, Tuple
 
 import torch
 
@@ -20,7 +20,33 @@ class Qwen3UBTreeModel(DFlashDraftModel):
         parse_ubtree_config(config)
         super().__init__(config, quant_config=quant_config, prefix=prefix)
         self.ubtree_selector = UBTreeSelector(config)
+        self._ubtree_selector_loaded = False
         self._ubtree_segment_graph_runner = None
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        # The shared DFlash loader intentionally ignores unknown checkpoint keys.
+        # Require the trained selector on the initial load, while allowing later
+        # partial updates for selector layouts without materialized caches.
+        loaded_selector = set()
+
+        def track_selector_weights():
+            for name, weight in weights:
+                loaded_selector.add(name.removeprefix("model."))
+                yield name, weight
+
+        super().load_weights(track_selector_weights())
+        if not self._ubtree_selector_loaded:
+            required = {
+                f"ubtree_selector.{name}"
+                for name, _ in self.ubtree_selector.named_parameters()
+            }
+            missing = required - loaded_selector
+            if missing:
+                raise ValueError(
+                    "UBTree checkpoint is missing required selector weights: "
+                    f"{sorted(missing)}"
+                )
+            self._ubtree_selector_loaded = True
 
     def attach_segment_graph_runner(self, runner) -> None:
         self._ubtree_segment_graph_runner = runner

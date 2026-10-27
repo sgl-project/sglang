@@ -2,6 +2,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import torch
+
 from sglang.srt.managers.io_struct import (
     BeginWeightUpdateReqInput,
     EndWeightUpdateReqInput,
@@ -80,6 +82,7 @@ class TestSchedulerRecordWeightVersionChange(CustomTestCase):
 
 def _runner(result=(True, "ok")):
     runner = Mock()
+    runner.model = torch.nn.Module()
     for method in (
         "update_weights_from_disk",
         "update_weights_from_tensor",
@@ -300,6 +303,17 @@ class TestWeightUpdateSession(_WeightUpdaterManagerTestBase):
         self.assertFalse(output.success)
         self.assertIn("already open", output.message)
         target.weight_updater.begin_weight_update.assert_not_called()
+
+    def test_begin_checks_all_derived_caches_before_restoring_any_runner(self):
+        target, draft = _runner(), _runner()
+        draft.model._derived_weight_cache_error = "selector caches require restart"
+        manager = self._manager(target, draft, session=False)
+        output = manager.begin_weight_update(BeginWeightUpdateReqInput())
+        self.assertFalse(output.success)
+        self.assertIn("selector caches", output.message)
+        self.assertIsNone(manager._session)
+        target.weight_updater.begin_weight_update.assert_not_called()
+        draft.weight_updater.begin_weight_update.assert_not_called()
 
     def test_end_without_session_is_rejected(self):
         """Finalizing runners begin never restored would repack weights twice."""
