@@ -45,6 +45,7 @@ from sglang.srt.distributed.parallel_state import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.dcp import get_mla_dcp_backend
+from sglang.srt.layers.dcp.layout import get_dcp_lens
 from sglang.srt.model_executor.runner import DecodeCudaGraphRunner
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     build_replay_fb_view,
@@ -379,13 +380,18 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
             or is_deepseek_v4(self.model_runner.model_config.hf_config)
         ):
             if mla_dcp_graph:
-                seq_lens = get_mla_dcp_backend(
-                    self._replay_attn_backend()
-                ).get_mla_dcp_graph_lengths(
-                    forward_batch.seq_lens,
-                    forward_batch.forward_mode,
-                    bs=self.bs,
-                    query_len=self.captured_req_width,
+                mla_backend = get_mla_dcp_backend(self._replay_attn_backend())
+                seq_lens_cpu = forward_batch.seq_lens.cpu()
+                if forward_batch.forward_mode.is_target_verify():
+                    seq_lens_cpu = seq_lens_cpu + self.captured_req_width
+                local_seq_lens = get_dcp_lens(
+                    seq_lens_cpu,
+                    mla_backend.dcp_size,
+                    mla_backend.dcp_rank,
+                    interleave_size=mla_backend.page_size,
+                )
+                seq_lens = local_seq_lens.tolist() + [0] * (
+                    self.bs - local_seq_lens.numel()
                 )
             elif forward_batch.forward_mode.is_target_verify():
                 # Only DFlash refreshes forward_metadata.seq_lens_cpu_list at

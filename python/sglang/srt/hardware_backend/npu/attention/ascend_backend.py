@@ -484,29 +484,6 @@ class AscendAttnBackend(AttentionBackend):
             return not dsa_use_prefill_cp(forward_batch) and not mode.is_idle()
         return self.use_mla and (mode.is_decode() or mode.is_target_verify())
 
-    def get_mla_dcp_graph_lengths(
-        self,
-        seq_lens: torch.Tensor,
-        forward_mode: ForwardMode,
-        *,
-        bs: int,
-        query_len: int,
-        spec_info: Optional[SpecInput] = None,
-    ) -> list[int]:
-        """Build capture/replay FIA Host lengths from global prefix lengths."""
-        seq_lens_cpu = seq_lens.cpu()
-        if forward_mode.is_target_verify():
-            seq_lens_cpu = seq_lens_cpu + query_len
-        elif forward_mode.is_decode_or_idle() and spec_info is not None:
-            seq_lens_cpu = seq_lens_cpu + self.speculative_step_id + 1
-        local_seq_lens = get_dcp_lens(
-            seq_lens_cpu,
-            self.dcp_size,
-            self.dcp_rank,
-            interleave_size=self.page_size,
-        )
-        return local_seq_lens.tolist() + [0] * (bs - local_seq_lens.numel())
-
     def _get_kv_lens_and_block_tables(
         self,
         kv_lens_cpu: torch.Tensor,
@@ -991,12 +968,19 @@ class AscendAttnBackend(AttentionBackend):
             num_tokens = out_cache_loc.shape[0]
             metadata.swa_out_cache_loc = self.cuda_graph_swa_out_cache_loc[:num_tokens]
         if self.dense_mla_dcp_target:
-            metadata.seq_lens_cpu_list = self.get_mla_dcp_graph_lengths(
-                prefix_lens_cpu,
-                forward_mode,
-                bs=bs,
-                query_len=self.speculative_num_draft_tokens,
-                spec_info=spec_info,
+            seq_lens_cpu = prefix_lens_cpu.cpu()
+            if forward_mode.is_target_verify():
+                seq_lens_cpu = seq_lens_cpu + self.speculative_num_draft_tokens
+            elif forward_mode.is_decode_or_idle() and spec_info is not None:
+                seq_lens_cpu = seq_lens_cpu + self.speculative_step_id + 1
+            local_seq_lens = get_dcp_lens(
+                seq_lens_cpu,
+                self.dcp_size,
+                self.dcp_rank,
+                interleave_size=self.page_size,
+            )
+            metadata.seq_lens_cpu_list = local_seq_lens.tolist() + [0] * (
+                bs - local_seq_lens.numel()
             )
         else:
             metadata.seq_lens_cpu_list = seq_lens.cpu().int().tolist()
