@@ -18,10 +18,14 @@ if _is_cuda_alike:
 
 if _is_cuda:
     from sglang.kernels.ops.activation.activation import silu_and_mul
+    from sglang.kernels.ops.moe.cutlass_prepare_moe_input import (
+        cutlass_prepare_moe_input,
+    )
 else:
     from sgl_kernel import silu_and_mul
 
 from sglang.kernels.ops.moe.ep_moe_kernels import (
+    compute_cutlass_w4a8_moe_input_scale,
     cutlass_w4_run_moe_ep_preproess,
     deepep_ll_get_cutlass_w4a8_moe_mm_data,
     deepep_permute_triton_kernel,
@@ -34,10 +38,7 @@ from sglang.kernels.ops.moe.ep_moe_kernels import (
     silu_mul_dynamic_tensorwise_quant_for_cutlass_moe,
     silu_mul_static_tensorwise_quant_for_cutlass_moe,
 )
-from sglang.kernels.ops.quantization.per_tensor_quant_fp8 import (
-    per_tensor_absmax_fp8,
-    per_tensor_quant_fp8,
-)
+from sglang.kernels.ops.quantization.per_tensor_quant_fp8 import per_tensor_quant_fp8
 
 
 def cutlass_w4a8_moe(
@@ -85,6 +86,7 @@ def cutlass_w4a8_moe(
         Shape: [num_experts, N // 512, K * 4]
     - topk_weights (torch.Tensor): The weights of each token->expert mapping.
     - topk_ids (torch.Tensor): The ids of each token->expert mapping.
+        Noncontiguous IDs are materialized once for the native flat-pointer consumers.
     - a_strides1 (torch.Tensor): The input strides of the first grouped gemm.
     - b_strides1 (torch.Tensor): The weights strides of the first grouped gemm.
     - c_strides1 (torch.Tensor): The output strides of the first grouped gemm.
@@ -126,28 +128,48 @@ def cutlass_w4a8_moe(
     if apply_router_weight_on_input:
         assert topk == 1, "apply_router_weight_on_input is only implemented for topk=1"
 
-    device = a.device
-    # Both graph padding and nonlocal routes use -1, including without EP.
-    topk_ids = torch.where(topk_ids == -1, num_local_experts, topk_ids)
+    # Native expert counts and reorder kernels read contiguous int32 IDs.
+    topk_ids = topk_ids.contiguous()
 
-    src2dst = cutlass_w4_run_moe_ep_preproess(
-        topk_ids,
-    )
+    device = a.device
+    if a1_scale is None:
+        a1_scale = torch.full(
+            (1,),
+            1e-10 / torch.finfo(torch.float8_e4m3fn).max,
+            dtype=torch.float32,
+            device=device,
+        )
+        compute_cutlass_w4a8_moe_input_scale(
+            input=a,
+            topk_ids=topk_ids,
+            output_s=a1_scale,
+            num_local_experts=num_local_experts,
+        )
+
+    if _is_cuda:
+        a_map = torch.empty(topk_ids.numel(), dtype=torch.int32, device=device)
+        c_map = torch.empty(topk_ids.numel(), dtype=torch.int32, device=device)
+        cutlass_prepare_moe_input(
+            topk_ids,
+            expert_offsets,
+            problem_sizes1,
+            problem_sizes2,
+            a_map,
+            c_map,
+            num_local_experts,
+            n,
+            k,
+            transpose_problem_sizes=True,
+        )
+        src2dst = c_map
+    else:
+        src2dst = cutlass_w4_run_moe_ep_preproess(topk_ids)
 
     gateup_input = torch.empty(
         (m * topk, k),
         device=device,
         dtype=torch.float8_e4m3fn,
     )
-
-    # TODO: fuse per_tensor_absmax_fp8 and pre_reorder_for_cutlass_moe
-    if a1_scale is None:
-        a1_scale = torch.zeros(1, dtype=torch.float32, device=device)
-        # Inactive rows must not change the quantization of live expert inputs.
-        inactive_rows = (topk_ids == num_local_experts).all(dim=-1, keepdim=True)
-        scale_input = a.masked_fill(inactive_rows, 0.0)
-        per_tensor_absmax_fp8(scale_input, a1_scale)
-        a1_scale.clamp_(min=1e-10 / torch.finfo(torch.float8_e4m3fn).max)
 
     pre_reorder_for_cutlass_moe(
         a,
@@ -161,22 +183,20 @@ def cutlass_w4a8_moe(
         k,
     )
 
-    # NOTE: a_map and c_map are not used in the get_cutlass_w4a8_moe_mm_data kernel,
-    # they are kept to allow for a quick switch of the permutation logic
-    # from the current triton kernel implementation to the cutlass-based one if needed.
-    a_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
-    c_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
-    get_cutlass_w4a8_moe_mm_data(
-        topk_ids,
-        expert_offsets,
-        problem_sizes1,
-        problem_sizes2,
-        a_map,
-        c_map,
-        num_local_experts,
-        n,
-        k,
-    )
+    if not _is_cuda:
+        a_map = torch.empty(topk_ids.numel(), dtype=torch.int32, device=device)
+        c_map = torch.empty(topk_ids.numel(), dtype=torch.int32, device=device)
+        get_cutlass_w4a8_moe_mm_data(
+            topk_ids,
+            expert_offsets,
+            problem_sizes1,
+            problem_sizes2,
+            a_map,
+            c_map,
+            num_local_experts,
+            n,
+            k,
+        )
 
     c1 = torch.empty((m * topk, n * 2), device=device, dtype=torch.bfloat16)
     c2 = torch.empty((m * topk, k), device=device, dtype=torch.bfloat16)
