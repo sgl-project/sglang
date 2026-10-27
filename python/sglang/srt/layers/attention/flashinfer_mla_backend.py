@@ -27,6 +27,7 @@ import torch
 from sglang.kernels.ops.attention.utils import assert_buffer_fits
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.merge_state import lse_base2_to_natural
 from sglang.srt.layers.dcp import (
     DecodeContextParallelMetadata,
     update_local_kv_lens_for_dcp,
@@ -206,7 +207,7 @@ class FlashInferMhaChunkKVRunner:
                 sm_scale=layer.scaling,
                 logits_soft_cap=logits_soft_cap,
             )
-        return o
+        return lse_base2_to_natural(o)
 
 
 class FlashInferMLAAttnBackend(AttentionBackend):
