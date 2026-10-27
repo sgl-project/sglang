@@ -115,6 +115,14 @@ sglang:spec_num_steps{model_name="meta-llama/Llama-3.1-8B-Instruct"} 3.0
 sglang:spec_num_draft_tokens{model_name="meta-llama/Llama-3.1-8B-Instruct"} 4.0
 ```
 
+## Effective request capacity
+
+`sglang:max_running_requests_effective` reports the scheduler's effective maximum number of running requests per DP worker, after runtime limits such as the Mamba state-cache cap. It is set at startup when you enable metrics. Unlike `--max-running-requests`, which is the requested limit, this gauge reports the value also exposed as `internal_states[*].effective_max_running_requests_per_dp` in `/server_info`.
+
+For example, if you request 32 running requests but the state cache caps the worker at 9, the gauge reports 9. Compare it with `sglang:num_running_reqs` and `sglang:num_queue_reqs` when interpreting a concurrency sweep.
+
+The gauge retains the scheduler's rank labels. When collecting metrics from all schedulers, select one TP/PP representative per DP worker before summing workers; summing replicated rank series double-counts capacity.
+
 ## Request-level time per output token (TPOT)
 
 `sglang:request_time_per_output_token_seconds` records TPOT once per successfully finished request:

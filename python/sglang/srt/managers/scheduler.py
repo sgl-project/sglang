@@ -1296,6 +1296,7 @@ class Scheduler(
             ),
             # TODO: max_running_requests_under_SLO has no setter — dead chain.
             max_running_requests_under_SLO=None,
+            max_running_requests_effective=self.max_running_requests,
             page_size=self.page_size,
             num_pages=self.max_total_num_tokens
             // self.token_to_kv_pool_allocator.page_size,

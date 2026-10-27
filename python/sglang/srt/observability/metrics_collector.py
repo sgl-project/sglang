@@ -1316,6 +1316,12 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             labelnames=list(labels.keys()) + ["phase"],
             multiprocess_mode="mostrecent",
         )
+        self.max_running_requests_effective = Gauge(
+            name="sglang:max_running_requests_effective",
+            documentation="Effective maximum number of running requests per DP worker.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
         self.max_running_requests_under_SLO = Gauge(
             name="sglang:max_running_requests_under_SLO",
             documentation="The maximum number of running requests under SLO.",
@@ -1778,12 +1784,17 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         num_pages: int,
         context_len: int,
         startup_available_gpu_memory_gb: float,
+        max_running_requests_effective: Optional[int] = None,
     ) -> None:
         self._log_gauge(self.max_total_num_tokens, max_total_num_tokens)
         if max_total_num_tokens_swa is not None:
             self._log_gauge(self.max_total_num_tokens_swa, max_total_num_tokens_swa)
         self._log_gauge(self.weight_memory_usage_gb, weight_memory_usage_gb)
         self._log_gauge(self.kv_cache_memory_usage_gb, kv_cache_memory_usage_gb)
+        if max_running_requests_effective is not None:
+            self._log_gauge(
+                self.max_running_requests_effective, max_running_requests_effective
+            )
         for phase, memory_usage_gb in graph_memory_usage_gb.items():
             self.graph_memory_usage_gb.labels(
                 **self.labels,
