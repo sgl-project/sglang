@@ -1,6 +1,4 @@
 import sys
-from types import SimpleNamespace
-from unittest.mock import patch
 
 import pytest
 import sgl_kernel  # noqa: F401
