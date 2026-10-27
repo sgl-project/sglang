@@ -35,6 +35,7 @@ def _qk_norm_rope_kv_kernel(
     NQ: tl.constexpr,
     NK: tl.constexpr,
     HALF: tl.constexpr,
+    PAGE: tl.constexpr,
 ):
     m = tl.program_id(0)
     h = tl.program_id(1)
@@ -76,11 +77,21 @@ def _qk_norm_rope_kv_kernel(
     else:
         kh = h - NQ
         slot = tl.load(loc_ptr + m).to(tl.int64)
-        kdst = k_buf_ptr + slot * kv_stride_slot + kh * kv_stride_head
+        if PAGE == 0:
+            kdst = k_buf_ptr + slot * kv_stride_slot + kh * kv_stride_head
+            k_off_lo = offs
+            k_off_hi = HALF + offs
+        else:
+            # SHUFFLE 5D K [blocks, NK, D // 16, PAGE, 16] (fp8, 16 elements per vector).
+            blk = slot // PAGE
+            pin = slot % PAGE
+            kdst = k_buf_ptr + blk * (NK * D * PAGE) + kh * (D * PAGE) + pin * 16
+            k_off_lo = (offs // 16) * (PAGE * 16) + offs % 16
+            k_off_hi = ((HALF + offs) // 16) * (PAGE * 16) + (HALF + offs) % 16
         k_lo = (out_lo.to(tl.float32) * inv_k_scale).to(act).to(tl.float32)
         k_hi = (out_hi.to(tl.float32) * inv_k_scale).to(act).to(tl.float32)
-        tl.store(kdst + offs, k_lo.to(tl.float8e4nv).to(tl.uint8, bitcast=True))
-        tl.store(kdst + HALF + offs, k_hi.to(tl.float8e4nv).to(tl.uint8, bitcast=True))
+        tl.store(kdst + k_off_lo, k_lo.to(tl.float8e4nv).to(tl.uint8, bitcast=True))
+        tl.store(kdst + k_off_hi, k_hi.to(tl.float8e4nv).to(tl.uint8, bitcast=True))
         vsrc = row + (NQ + NK + kh) * D
         v_lo = (
             (tl.load(vsrc + offs).to(tl.float32) * inv_v_scale).to(act).to(tl.float32)
@@ -90,9 +101,23 @@ def _qk_norm_rope_kv_kernel(
             .to(act)
             .to(tl.float32)
         )
-        vdst = v_buf_ptr + slot * kv_stride_slot + kh * kv_stride_head
-        tl.store(vdst + offs, v_lo.to(tl.float8e4nv).to(tl.uint8, bitcast=True))
-        tl.store(vdst + HALF + offs, v_hi.to(tl.float8e4nv).to(tl.uint8, bitcast=True))
+        if PAGE == 0:
+            vdst = v_buf_ptr + slot * kv_stride_slot + kh * kv_stride_head
+            v_off_lo = offs
+            v_off_hi = HALF + offs
+        else:
+            # SHUFFLE 5D V [blocks, NK, PAGE // 16, D, 16].
+            vdst = (
+                v_buf_ptr
+                + blk * (NK * PAGE * D)
+                + kh * (PAGE * D)
+                + (pin // 16) * (D * 16)
+                + pin % 16
+            )
+            v_off_lo = offs * 16
+            v_off_hi = (HALF + offs) * 16
+        tl.store(vdst + v_off_lo, v_lo.to(tl.float8e4nv).to(tl.uint8, bitcast=True))
+        tl.store(vdst + v_off_hi, v_hi.to(tl.float8e4nv).to(tl.uint8, bitcast=True))
 
 
 def qk_norm_rope_kv_store(
@@ -111,12 +136,14 @@ def qk_norm_rope_kv_store(
     num_kv_heads: int,
     head_dim: int,
 ) -> torch.Tensor:
-    """qkv [M, (NQ + 2 NK) * D] bf16 (row stride may exceed the width); k_buf/v_buf [slots, NK, D] uint8
-    holding fp8 e4m3fn bytes. Returns q [M, NQ * D] (normed + rotated)."""
+    """qkv [M, (NQ + 2 NK) * D] bf16 (row stride may exceed the width); k_buf/v_buf uint8 holding fp8
+    e4m3fn bytes, either NHD [slots, NK, D] or SHUFFLE 5D (K [blocks, NK, D // 16, page, 16], V [blocks, NK,
+    page // 16, D, 16]). Returns q [M, NQ * D] (normed + rotated)."""
     m = qkv.shape[0]
     q_out = torch.empty((m, num_q_heads * head_dim), dtype=qkv.dtype, device=qkv.device)
     if m == 0:
         return q_out
+    page = k_buf.shape[3] if k_buf.dim() == 5 else 0
     _qk_norm_rope_kv_kernel[(m, num_q_heads + num_kv_heads)](
         qkv,
         qkv.stride(0),
@@ -128,8 +155,8 @@ def qk_norm_rope_kv_store(
         q_out,
         k_buf,
         v_buf,
-        k_buf.stride(0),
-        k_buf.stride(1),
+        0 if page else k_buf.stride(0),
+        0 if page else k_buf.stride(1),
         loc,
         eps,
         1.0 / k_scale,
@@ -137,6 +164,7 @@ def qk_norm_rope_kv_store(
         NQ=num_q_heads,
         NK=num_kv_heads,
         HALF=head_dim // 2,
+        PAGE=page,
         num_warps=4,  # same reduction tree as the aiter rmsnorm kernel (default 4 warps)
     )
     return q_out

@@ -461,18 +461,21 @@ class LagunaAttention(nn.Module):
 def _fp8_kv_store_target(
     *, layer: RadixAttention, forward_batch: ForwardBatch
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-    """(k_buf, v_buf, loc) a fused decode writer scatters into, mirroring the triton backend's
-    set_kv_buffer routing; None whenever that routing is not a plain fp8 NHD MHA pool."""
+    """(k_buf, v_buf, loc) a fused decode writer scatters into, mirroring the triton / aiter backends'
+    set_kv_buffer routing; None whenever that routing is not a plain fp8 NHD / SHUFFLE 5D MHA pool."""
+    from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
     from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
     from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
     from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
     backend = get_attn_backend()
-    if (
-        not isinstance(backend, TritonAttnBackend)
-        or backend.use_mla
-        or backend.dcp_size > 1
-    ):
+    if isinstance(backend, TritonAttnBackend):
+        dcp = backend.dcp_size
+    elif isinstance(backend, AiterAttnBackend):
+        dcp = backend.dcp_world_size
+    else:
+        return None
+    if backend.use_mla or dcp > 1:
         return None
     pool = backend.token_to_kv_pool
     loc = forward_batch.out_cache_loc
@@ -487,7 +490,7 @@ def _fp8_kv_store_target(
     # Subclasses (e.g. page-major) and non-NHD layouts write through different buffer views.
     if (
         type(pool) is not MHATokenToKVPool
-        or pool.kv_cache_layout != "nhd"
+        or pool.kv_cache_layout not in ("nhd", "vectorized_5d")
         or loc is None
         or pool.use_hnd
         or pool.is_quantized_kv_cache
