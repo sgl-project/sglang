@@ -193,6 +193,18 @@ class TestRequestContextMechanism(unittest.TestCase):
         store.set_request_context(request_id="r")
         store.clear_request_context()
 
+    def test_request_context_noop_when_store_attribute_is_absent(self):
+        store = MooncakeBaseStore.__new__(MooncakeBaseStore)
+
+        # Partially initialized stores may bypass __init__ in unit tests for
+        # pure key-layout paths; request context must not turn that into an
+        # AttributeError before those paths are reached.
+        with store.request_context(request_id="r"):
+            pass
+        store.set_request_context(request_id="r")
+        store.clear_request_context()
+        self.assertFalse(store._has_request_context_support)
+
     def test_request_context_noop_on_legacy_wheel(self):
         binding = _LegacyBinding()
         store = _make_base_store(binding)

@@ -365,9 +365,12 @@ class MooncakeBaseStore:
         """Check if the installed MooncakeDistributedStore supports request context propagation.
 
         Result is cached on first access since the installed Mooncake
-        version is fixed for the lifetime of the process.
+        version is fixed for the lifetime of the process. Storage methods are
+        sometimes exercised on partially built instances in unit tests, so a
+        missing ``store`` is treated as *no support* rather than an error.
         """
-        return hasattr(type(self.store), "set_request_context")
+        store = getattr(self, "store", None)
+        return store is not None and hasattr(type(store), "set_request_context")
 
     def set_request_context(
         self,
@@ -395,11 +398,12 @@ class MooncakeBaseStore:
             caller_role: Caller's thread role, e.g. prefetch / backup. Which
                 thread within the client. always-on, independent of tracing.
         """
-        if self.store is None:
+        store = getattr(self, "store", None)
+        if store is None:
             return
         if not self._has_request_context_support:
             return
-        self.store.set_request_context(
+        store.set_request_context(
             request_id=request_id,
             trace_id=trace_id,
             span_id=span_id,
@@ -410,11 +414,12 @@ class MooncakeBaseStore:
 
     def clear_request_context(self):
         """Clear the per-request context on the calling thread."""
-        if self.store is None:
+        store = getattr(self, "store", None)
+        if store is None:
             return
         if not self._has_request_context_support:
             return
-        self.store.clear_request_context()
+        store.clear_request_context()
 
     @contextlib.contextmanager
     def request_context(
