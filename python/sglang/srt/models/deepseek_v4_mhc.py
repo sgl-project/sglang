@@ -22,6 +22,7 @@ TODO: move dsv4 MHC into the same abstraction
 
 from __future__ import annotations
 
+import functools
 from typing import Any, Callable, NamedTuple, Optional, Tuple, TypeAlias, Union
 
 import msgspec
@@ -638,22 +639,25 @@ def _can_use_mega_mhc(cfg: HcConfig) -> bool:
     )
 
 
-def _can_use_decode_post_combine(
-    cfg: HcConfig, y: torch.Tensor, residual: torch.Tensor, coefficients: HcTriplet
-) -> bool:
-    from sglang.kernels.ops.layernorm.mhc_post_combine_norm_decode import MAX_ROWS
-
+@functools.cache
+def _decode_post_combine_supported(cfg: HcConfig) -> bool:
     return (
         get_platform().is_blackwell
         and cfg.pre_from_prev
         and cfg.mult == 4
         and cfg.hidden == 5120
         and not cfg.cp_prefill
-        and 0 < y.shape[0] <= MAX_ROWS
-        and y.dtype == residual.dtype == torch.bfloat16
-        and y.is_contiguous()
-        and residual.is_contiguous()
-        and all(t.dtype == torch.float32 and t.is_contiguous() for t in coefficients)
+    )
+
+
+def _can_use_decode_post_combine(cfg: HcConfig, rows: int) -> bool:
+    from sglang.kernels.ops.layernorm.mhc_post_combine_norm_decode import MAX_ROWS
+    from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+
+    return (
+        0 < rows <= MAX_ROWS
+        and _decode_post_combine_supported(cfg)
+        and not is_batch_invariant_mode_enabled()
     )
 
 
@@ -704,7 +708,7 @@ def _post_fusion(
         next is not None
         and next.norm_fusable
         and envs.SGLANG_OPT_DSV41_MHC_POST_COMBINE_DECODE.get()
-        and _can_use_decode_post_combine(cfg, y, residual, coefficients)
+        and _can_use_decode_post_combine(cfg, y.shape[0])
     ):
         from sglang.kernels.ops.layernorm.mhc_post_combine_norm_decode import (
             mhc_post_combine_norm_decode,
