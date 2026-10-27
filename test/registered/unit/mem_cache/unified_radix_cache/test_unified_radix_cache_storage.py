@@ -33,9 +33,6 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransferResult,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.unified_cache.cache_action import (
-    FreeComponentHostSlot,
-)
 from sglang.srt.mem_cache.unified_cache.components.base import (
     CacheTransferPhase,
     ComponentType,
@@ -394,6 +391,53 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         self.assertTrue(torch.equal(loaded_k, expected_k))
         self.assertTrue(torch.equal(loaded_v, expected_v))
         cons.sanity_check()
+
+    @requires_hicache
+    @requires(
+        lambda cfg: not cfg.has_mamba,
+        "mamba L3 prefetch is out of scope for this unit fixture",
+    )
+    def test_hicache_l3_prefetch_attaches_a_sub_window_suffix_under_a_device_anchor(
+        self,
+    ):
+        """A stored continuation of a prefix that a write-back tree holds only on
+        device restores under that unbacked mid-tree anchor, even when it is
+        shorter than the sliding window: the window head is the anchor path's
+        own SWA."""
+        storage_dir = self._make_storage_dir()
+        base = self._make_seq(1, 2)
+        seq = base + self._make_seq(500, 2)
+        self._l3_produce(storage_dir, seq)
+
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        self._init_hicache(
+            cache,
+            write_policy="write_back",
+            storage_backend="file",
+            storage_dir=storage_dir,
+            prefetch_threshold=1,
+        )
+        self._insert(cache, allocator, req_to_token_pool, base)
+        anchor = match_prefix(cache, base).last_device_node
+        self.assertFalse(cache.is_backuped(anchor))
+        last_hash = cache.get_last_hash_value(anchor)
+        self.assertIsNotNone(last_hash)
+
+        req_id = CacheRequestHandle("device-anchor-req", 0)
+        cache.prefetch_from_storage(
+            req_id,
+            anchor,
+            array("q", seq[len(base) :]),
+            last_hash,
+            None,
+            matched_prefix_tokens=array("q", base),
+        )
+        self._run_prefetch_to_completion(cache, req_id)
+
+        m = match_prefix(cache, seq)
+        self.assertEqual(m.device_prefix_len, len(base))
+        self.assertEqual(m.host_hit_length, len(seq) - len(base))
+        cache.sanity_check()
 
     @requires_hicache
     @requires(
@@ -2100,141 +2144,118 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         self.assertEqual(self._host_avail_sizes(cons), avail0)
         cons.sanity_check()
 
+    def _stage_buffer_mid_tree_hit(self, storage_dir, suffix_pages):
+        """A buffer-mode consumer holding one window on device, with a staged
+        L3 hit for the next ``suffix_pages`` pages."""
+        sw_pages = self.cfg.sliding_window_size // self.cfg.page_size
+        seq_a = self._make_seq(1, sw_pages)
+        seq_ab = seq_a + self._make_seq(900, suffix_pages)
+        self._produce_buffer_l3(storage_dir, seq_ab)
+        cons, alloc, rtp = self._build_buffer_hicache_fixture(storage_dir)
+        self._insert(cons, alloc, rtp, seq_a)
+        anchor = match_prefix(cons, seq_a).last_device_node
+        req_id = CacheRequestHandle(f"mid-tree-{suffix_pages}", 0)
+        cons.prefetch_from_storage(
+            req_id,
+            anchor,
+            array("q", seq_ab[len(seq_a) :]),
+            cons.get_last_hash_value(anchor),
+            None,
+            matched_prefix_tokens=list(seq_a),
+        )
+        self._pump_hicache_until(
+            cons,
+            lambda: (
+                cons.check_prefetch_progress(req_id)
+                and cons.buffer_pipeline.has_staged(req_id)
+            ),
+            "mid-tree prefetch did not stage",
+        )
+        return cons, req_id, seq_a, seq_ab
+
     @requires_hicache
     @requires_swa
-    def test_buffer_only_swa_window_semantics(self):
+    def test_buffer_only_hit_restores_a_window_shorter_than_full(self):
+        """At the root a hit shorter than a window is the sequence's whole SWA;
+        under a device anchor a window shorter than full takes its head from the
+        anchor path's own SWA."""
         window = self.cfg.sliding_window_size
-        if window <= self.cfg.page_size:
-            self.skipTest("window fits in one page")
-        sw_pages = (window + self.cfg.page_size - 1) // self.cfg.page_size
+        if window <= self.cfg.page_size or window % self.cfg.page_size:
+            self.skipTest("needs a window of two or more whole pages")
+        sw_pages = window // self.cfg.page_size
         storage_dir = self._make_storage_dir()
 
-        # A root-anchored sub-window request is declined before querying.
-        seq = self._make_seq(1, sw_pages - 1)
-        self._produce_buffer_l3(storage_dir, seq, marker=5)
-        cons, _, _ = self._build_buffer_hicache_fixture(storage_dir)
-        self.assertEqual(cons.prefetch_threshold, sw_pages * self.cfg.page_size)
-        self.assertEqual(
-            cons.cache_controller.prefetch_threshold, cons.prefetch_threshold
-        )
-        avail = self._host_avail_sizes(cons)
-        cons.prefetch_from_storage(
-            CacheRequestHandle("short-req", 0),
-            cons.root_node_handle(),
-            array("q", seq),
-            None,
-            None,
-        )
-        self.assertNotIn(CacheRequestHandle("short-req", 0), cons.ongoing_prefetch)
-        self.assertEqual(cons._prefetch_outcome_stats["declined_too_short"], 1)
-        self.assertEqual(cons._prefetch_outcome_stats["issued"], 0)
-        self.assertEqual(self._host_avail_sizes(cons), avail)
-        cons.sanity_check()
-
-        # Mid-tree uses the same threshold; an exact window is accepted.
-        if sw_pages >= 2:
-            seq_a = self._make_seq(1, max(2, sw_pages))
-            seq_ab = seq_a + self._make_seq(900, sw_pages)
-            self._produce_buffer_l3(storage_dir, seq_ab, marker=14)
-            cons2, cons2_alloc, cons2_rtp = self._build_buffer_hicache_fixture(
-                storage_dir
-            )
-            avail2 = self._host_avail_sizes(cons2)
-            self._insert(cons2, cons2_alloc, cons2_rtp, seq_a)
-            m = match_prefix(cons2, seq_a)
-            last_hash = cons2.get_last_hash_value(m.last_device_node)
-            cons2.prefetch_from_storage(
-                CacheRequestHandle("subwin-req", 0),
-                m.last_device_node,
-                array("q", seq_ab[len(seq_a) : -self.cfg.page_size]),
-                last_hash,
-                None,
-                matched_prefix_tokens=list(seq_a),
-            )
-            self.assertNotIn(
-                CacheRequestHandle("subwin-req", 0), cons2.ongoing_prefetch
-            )
-            self.assertEqual(cons2._prefetch_outcome_stats["declined_too_short"], 1)
-            # A declined span issues no lookup, so it must not spend the
-            # re-issue budget on polls.
-            self.assertNotIn("subwin-req", cons2.storage_prefetch_retries._pending)
-
-            cons2.prefetch_from_storage(
-                CacheRequestHandle("window-req", 0),
-                m.last_device_node,
-                array("q", seq_ab[len(seq_a) :]),
-                last_hash,
-                None,
-                matched_prefix_tokens=list(seq_a),
+        with self.subTest(anchor="root"):
+            seq = self._make_seq(5000, sw_pages - 1)
+            self._produce_buffer_l3(storage_dir, seq)
+            cons, _, _ = self._build_buffer_hicache_fixture(storage_dir)
+            req_id = CacheRequestHandle("root", 0)
+            cons.prefetch_from_storage(
+                req_id, cons.root_node_handle(), array("q", seq), None, None
             )
             self._pump_hicache_until(
-                cons2,
+                cons,
                 lambda: (
-                    cons2.check_prefetch_progress(CacheRequestHandle("window-req", 0))
-                    and cons2.buffer_pipeline.has_staged(
-                        CacheRequestHandle("window-req", 0)
-                    )
+                    cons.check_prefetch_progress(req_id)
+                    and cons.buffer_pipeline.has_staged(req_id)
                 ),
-                "whole-window mid-tree prefetch did not stage",
+                "root prefetch did not stage",
             )
-            self.assertTrue(
-                any(
-                    t.name == PoolName.SWA
-                    for t in cons2.buffer_pipeline.staged_prefetches[
-                        CacheRequestHandle("window-req", 0)
-                    ].aux_xfers
-                ),
-                "mid-tree fetch degraded to KV-only",
-            )
-            spliced = self._consume_staged_prefetch(
-                cons2,
-                CacheRequestHandle("window-req", 0),
-            )
-            self.assertEqual(int(spliced.numel()), len(seq_ab) - len(seq_a))
-            self.assertEqual(
-                len(
-                    cons2.path_device_indices(
-                        match_prefix(cons2, seq_ab).last_device_node
-                    )
-                ),
-                len(seq_ab),
-            )
-            self.assertEqual(self._host_avail_sizes(cons2), avail2)
-            cons2.sanity_check()
+            spliced = self._consume_staged_prefetch(cons, req_id)
+            self.assertEqual(int(spliced.numel()), len(seq))
+            self.assertEqual(match_prefix(cons, seq).device_prefix_len, len(seq))
+            cons.sanity_check()
 
-        # An accepted request with a sub-window L3 hit is also declined.
-        full = self._make_seq(6000, sw_pages + 1)
-        stored = full[: (sw_pages - 1) * self.cfg.page_size]
-        self._produce_buffer_l3(storage_dir, stored, marker=6)
-        cons3, _, _ = self._build_buffer_hicache_fixture(storage_dir)
-        avail3 = self._host_avail_sizes(cons3)
-        cons3.prefetch_from_storage(
-            CacheRequestHandle("partial-req", 0),
-            cons3.root_node_handle(),
-            array("q", full),
-            None,
-            None,
+        for suffix_pages in (sw_pages - 1, sw_pages):
+            with self.subTest(anchor="mid-tree", suffix_pages=suffix_pages):
+                cons, req_id, _, seq_ab = self._stage_buffer_mid_tree_hit(
+                    storage_dir, suffix_pages
+                )
+                staged = cons.buffer_pipeline.staged_prefetches[req_id]
+                self.assertEqual(
+                    sum(
+                        len(t.host_indices)
+                        for t in staged.aux_xfers
+                        if t.name == PoolName.SWA and t.host_indices is not None
+                    ),
+                    suffix_pages * self.cfg.page_size,
+                )
+                spliced = self._consume_staged_prefetch(cons, req_id)
+                self.assertEqual(
+                    int(spliced.numel()), suffix_pages * self.cfg.page_size
+                )
+                self.assertEqual(
+                    match_prefix(cons, seq_ab).device_prefix_len, len(seq_ab)
+                )
+                cons.sanity_check()
+
+    @requires_hicache
+    @requires_swa
+    def test_buffer_only_sub_window_hit_refetches_when_its_window_head_is_evicted(
+        self,
+    ):
+        """A staged hold pins FULL only, so the anchor path's SWA can go while a
+        sub-window hit waits; admission then refetches instead of splicing a
+        window without its head."""
+        window = self.cfg.sliding_window_size
+        if window <= self.cfg.page_size or window % self.cfg.page_size:
+            self.skipTest("needs a window of two or more whole pages")
+        sw_pages = window // self.cfg.page_size
+        cons, req_id, seq_a, _ = self._stage_buffer_mid_tree_hit(
+            self._make_storage_dir(), sw_pages - 1
         )
-        operation = cons3.ongoing_prefetch[
-            CacheRequestHandle("partial-req", 0)
-        ].operation
-        self._run_prefetch_to_completion(cons3, CacheRequestHandle("partial-req", 0))
-        cons3.drain_storage_control_queues()
-        self.assertEqual(operation.storage_hit_count, len(stored))
-        self.assertEqual(
-            len(
-                cons3.path_device_indices(match_prefix(cons3, stored).last_device_node)
-            ),
-            0,
-            "sub-window hit should not be loaded",
-        )
-        self.assertEqual(cons3._prefetch_outcome_stats["issued"], 1)
-        self.assertEqual(cons3._prefetch_outcome_stats["revoked_insufficient"], 1)
-        self.assertFalse(
-            cons3.buffer_pipeline.has_staged(CacheRequestHandle("partial-req", 0))
-        )
-        self.assertEqual(self._host_avail_sizes(cons3), avail3)
-        cons3.sanity_check()
+        cons.evict(EvictParams(num_tokens=0, swa_num_tokens=len(seq_a)))
+        staged = cons.buffer_pipeline.staged_prefetches[req_id]
+        req = self._make_req(cons.req_to_token_pool)
+        req.rid = req_id.rid
+        req.cache_request_handle = req_id
+        req.prefix_len = match_prefix(cons, staged.key_tokens).device_prefix_len
+        self.assertLess(req.prefix_len, len(seq_a))
+
+        self.assertFalse(cons.buffer_pipeline.prepare_staged_prefetch(req))
+        self.assertFalse(cons.buffer_pipeline.has_staged(req_id))
+        self.assertIsNone(req.staged_prefetch_plan)
+        cons.sanity_check()
 
     def test_tp_swa_prefetch_dropped_when_peer_misses(self):
         setup = self._setup_swa_tp_prefetch()
@@ -2401,7 +2422,7 @@ class TestUnifiedTreeCoreSWAPrefetchBackends(UnifiedRadixCacheFixtures, CustomTe
         components=(ComponentType.FULL, ComponentType.SWA), sliding_window_size=4
     )
 
-    def test_mid_tree_shortened_swa_prefetch_is_released(self):
+    def test_mid_tree_sub_window_swa_prefetch_is_attached(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         prefix = [1, 2]
         self._insert(cache, allocator, req_to_token_pool, prefix)
@@ -2438,14 +2459,15 @@ class TestUnifiedTreeCoreSWAPrefetchBackends(UnifiedRadixCacheFixtures, CustomTe
             ),
         )
 
-        self.assertIsNone(
-            node_host_value(cache, insert_result.inserted_host_node, ComponentType.SWA)
+        self.assertTrue(
+            torch.equal(
+                node_host_value(
+                    cache, insert_result.inserted_host_node, ComponentType.SWA
+                ),
+                swa_host_indices,
+            )
         )
-        self.assertEqual(len(actions), 1)
-        self.assertIsInstance(actions[0], FreeComponentHostSlot)
-        self.assertEqual(actions[0].component_type, ComponentType.SWA)
-        self.assertEqual(len(actions[0].host_indices), 1)
-        self.assertTrue(torch.equal(actions[0].host_indices[0], swa_host_indices))
+        self.assertEqual(actions, [])
 
 
 class TestPrefetchCommitOrdering(CustomTestCase):

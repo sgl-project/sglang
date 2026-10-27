@@ -1082,20 +1082,7 @@ class SWAComponent(TreeComponent):
         # unified_kv keeps SWA as a device-only ring -- nothing to prefetch into.
         if self._swa_kv_pool_host is None:
             return PreparePrefetchResult()
-        sw_pages = self.full_window_pages
-        if sw_pages == 0:
-            return PreparePrefetchResult()
-        prefetch_pages = prefetch_tokens // self.cache.page_size
-        if prefetch_pages >= sw_pages:
-            num_pages = sw_pages
-        elif prefetch_pages > 0 and self.tree_core.is_root(node_id):
-            # At root the sequence is shorter than the window, so its whole
-            # SWA is the window -- complete, not a partial fetch.
-            num_pages = prefetch_pages
-        else:
-            # Mid-tree short span: the window head would have to come from the
-            # device prefix, which the match validator does not promise.
-            return PreparePrefetchResult()
+        num_pages = min(prefetch_tokens // self.cache.page_size, self.full_window_pages)
         return PreparePrefetchResult(staging_tokens=num_pages * self.cache.page_size)
 
     def alloc_prefetch_staging(self, num_tokens: int) -> Optional[torch.Tensor]:
@@ -1421,7 +1408,7 @@ class SWAComponent(TreeComponent):
     ) -> None:
         """Fill the prefetched SWA window onto the leaf→anchor path.
 
-        All-or-nothing over one full window: ``loaded_pages`` is the cross-rank
+        All-or-nothing over the staged window: ``loaded_pages`` is the cross-rank
         MIN, so ``loaded_pages < window_pages`` drops the whole window (keeps the
         tree identical across TP ranks). Otherwise map the buffer to token range
         ``[loaded_start, total_len)`` and walk leaf→anchor, filling SWA
@@ -1446,13 +1433,6 @@ class SWAComponent(TreeComponent):
             and insert_result.inserted_host_node is not None
             else None
         )
-        if anchor is not self.tree_core.root_node:
-            # Cache-mode graft commit only (buffer fills never reach here):
-            # a hit-shrunk window mid-tree is missing its head — drop it.
-            # Root anchors are complete windows of their own.
-            if window_require_pages < self.full_window_pages:
-                self._release_swa_host(host_indices, cache_actions)
-                return
         if (
             target is None
             or window_require_pages == 0

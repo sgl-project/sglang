@@ -222,7 +222,7 @@ impl SwaComponent {
 
     /// Fill the prefetched SWA window onto the leaf→anchor path.
     ///
-    /// All-or-nothing over one full window: `loaded_pages` is the cross-rank
+    /// All-or-nothing over the staged window: `loaded_pages` is the cross-rank
     /// MIN, so `loaded_pages < window_pages` drops the whole window (keeps the
     /// tree identical across TP ranks). Otherwise map the buffer to token range
     /// `[loaded_start, total_len)` and walk leaf→anchor, filling SWA
@@ -267,15 +267,6 @@ impl SwaComponent {
             }
             return;
         };
-        // Cache-mode graft commit only (buffer fills never reach here):
-        // a hit-shrunk window mid-tree is missing its head, so drop it.
-        // Root anchors are complete windows of their own.
-        if node_id != tree_core.arena.root()
-            && window_require_pages < self.sliding_window_size.div_ceil(page_size)
-        {
-            self.release_swa_host_(host_indices.shallow_clone(), cache_actions);
-            return;
-        }
         if window_require_pages == 0 || loaded_pages < window_require_pages {
             self.release_swa_host_(host_indices.shallow_clone(), cache_actions);
             return;

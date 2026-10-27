@@ -511,11 +511,6 @@ class UnifiedRadixCache(BasePrefixCache):
                 storage_extra_config.setdefault(
                     "file_storage_path", server_args.file_storage_path
                 )
-        storage_prefetch_threshold = (
-            self._storage_attachment.resolve_prefetch_threshold(
-                storage_prefetch_threshold
-            )
-        )
 
         attach_hybrid_pool_to_unified_cache(
             self,

@@ -1502,6 +1502,19 @@ class BufferModePipeline:
             )
             self._refetch_staged(f)
             return False
+        head_end = self._window_head_end(f)
+        if joint_len < head_end:
+            # Only the joint match vouches that the head is still resident: the
+            # hold pins FULL, not SWA.
+            logger.warning(
+                "HiCache staged prefetch deferred req=%s reason=window_head "
+                "joint=%d head_end=%d",
+                req.rid,
+                joint_len,
+                head_end,
+            )
+            self._refetch_staged(f)
+            return False
         self._set_request_device_prefix(req, key, matched_len, node_id)
         plan = self._build_staged_prefetch_plan(f, key, matched_len)
         if plan is None:
@@ -1517,6 +1530,19 @@ class BufferModePipeline:
         req.host_hit_is_storage = True
         req.staged_prefetch_plan = plan
         return True
+
+    def _window_head_end(self, f: _StagedPrefetch) -> int:
+        span_end = f.matched_len + f.num_tokens
+        head_end = 0
+        for component in self._swa_components():
+            staged_tokens = sum(
+                len(t.host_indices)
+                for t in f.aux_xfers
+                if t.name == component.pool_name and t.host_indices is not None
+            )
+            if 0 < staged_tokens < component.full_window_pages * self._cache.page_size:
+                head_end = max(head_end, span_end - staged_tokens)
+        return head_end
 
     def _set_request_device_prefix(
         self, req: Req, key: RadixKey, matched_len: int, node_id: NodeId
