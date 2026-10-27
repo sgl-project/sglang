@@ -441,8 +441,23 @@ pub(super) enum GenerateItem {
 pub(super) async fn drain_unary(
     call: &mut CoreCall,
     rid_str: &str,
-    mut request: RequestState,
+    request: RequestState,
 ) -> (StatusCode, GenerateItem) {
+    match drain_unary_frame(call, rid_str, request).await {
+        Ok(frame) => (StatusCode::OK, GenerateItem::Frame(Box::new(frame))),
+        Err(error) => (
+            error.http_status(),
+            GenerateItem::Error(error.stream_error(None)),
+        ),
+    }
+}
+
+/// [`drain_unary`]'s terminal frame, or the error that failed the call.
+pub(super) async fn drain_unary_frame(
+    call: &mut CoreCall,
+    rid_str: &str,
+    mut request: RequestState,
+) -> Result<NativeFrame, CoreError> {
     let mut accumulated = CoreOutput::default();
     while let Some(item) = call.recv().await {
         match item {
@@ -454,25 +469,17 @@ pub(super) async fn drain_unary(
                 request.finish(&out);
                 accumulated.append_delta(&out);
                 let e2e_latency = Some(e2e_latency(&request.timing));
-                let frame = request.frame(accumulated.frame(rid_str, None, e2e_latency));
-                return (StatusCode::OK, GenerateItem::Frame(Box::new(frame)));
+                return Ok(request.frame(accumulated.frame(rid_str, None, e2e_latency)));
             }
             CoreEvent::Failed(error) => {
                 request.timing.finish();
-                return (
-                    error.http_status(),
-                    GenerateItem::Error(error.stream_error(None)),
-                );
+                return Err(error);
             }
         }
     }
     // Defensive fallback: CoreCall normally turns premature runtime
     // termination into a terminal Failed event before exposing stream end.
-    let truncated = CoreError::ResponseTruncated;
-    (
-        truncated.http_status(),
-        GenerateItem::Error(truncated.stream_error(None)),
-    )
+    Err(CoreError::ResponseTruncated)
 }
 
 /// Batch `/generate`: submit all sub-requests first (scheduler runs them together),
@@ -529,6 +536,18 @@ pub(super) fn generation_event_stream(
     calls: Vec<(CoreCall, RequestState)>,
     incremental: bool,
     with_index: bool,
+) -> impl futures::Stream<Item = String> {
+    generation_event_stream_with(calls, incremental, with_index, |error, index| {
+        json_string(&error.stream_error(index))
+    })
+}
+
+/// [`generation_event_stream`], writing a failed call's frame with `error_frame`.
+pub(super) fn generation_event_stream_with(
+    calls: Vec<(CoreCall, RequestState)>,
+    incremental: bool,
+    with_index: bool,
+    error_frame: impl Fn(&CoreError, Option<u32>) -> String,
 ) -> impl futures::Stream<Item = String> {
     async_stream::stream! {
         use futures::StreamExt;
@@ -592,7 +611,7 @@ pub(super) fn generation_event_stream(
             }
 
             if let Some(error) = failed {
-                yield json_string(&error.stream_error(idx(i)));
+                yield error_frame(&error, idx(i));
             } else if let Some(out) = terminal {
                 // The final frame carries the full cumulative state, so any
                 // coalesced non-terminal frames are moot.
